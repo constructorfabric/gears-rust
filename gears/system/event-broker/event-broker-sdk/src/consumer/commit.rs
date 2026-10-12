@@ -12,10 +12,15 @@ use crate::sequence::Sequence;
 /// (`TxCommitHandle<LocalDbOffsetManager>`).
 #[cfg(feature = "db")]
 pub struct TxCommitHandle<OM: super::CommitOffsetInTx> {
+    /// Partition the delivered batch was read from.
     pub(crate) partition: u32,
+    /// Offsets of the delivered batch, in delivery order.
     pub(crate) batch_offsets: Vec<Sequence>,
+    /// Offset store that writes into the caller's transaction.
     pub(crate) offset_manager: std::sync::Arc<OM>,
+    /// Consumer group whose offset is committed.
     pub(crate) group: crate::ids::ConsumerGroupId,
+    /// Topic whose offset is committed.
     pub(crate) topic: crate::ids::TopicId,
     /// Offset successfully written inside the user transaction.
     pub(crate) committed_offset: std::sync::Arc<std::sync::Mutex<Option<Sequence>>>,
@@ -32,6 +37,7 @@ pub(crate) struct TxCommitHandleParts<OM: super::CommitOffsetInTx> {
 
 #[cfg(feature = "db")]
 impl<OM: super::CommitOffsetInTx> TxCommitHandle<OM> {
+    /// Assembles a handle from the runtime-provided parts.
     pub(crate) fn new(parts: TxCommitHandleParts<OM>) -> Self {
         Self {
             partition: parts.partition,

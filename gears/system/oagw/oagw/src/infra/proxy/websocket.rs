@@ -297,8 +297,11 @@ pub(crate) enum TunnelEnd {
 pub(crate) enum RelayOutcome {
     /// Either side ended the tunnel; carries the byte tallies.
     Closed {
+        /// Bytes relayed from the client to the upstream.
         to_upstream: u64,
+        /// Bytes relayed from the upstream to the client.
         to_client: u64,
+        /// Which side ended the tunnel.
         ended_by: TunnelEnd,
     },
     /// No bytes moved in either direction within the idle timeout.
@@ -469,10 +472,15 @@ async fn announce_close(
 /// through the response extensions, so the Axum handler can bridge the
 /// client's upgraded connection to the Pingora-managed upstream tunnel.
 pub(crate) struct WebSocketBridgeIo {
+    /// In-memory stream connected to the Pingora-managed upstream tunnel.
     pub io: tokio::io::DuplexStream,
+    /// Bytes already read from the upstream beyond the 101 response head.
     pub leftover: Bytes,
+    /// Close the tunnel when no bytes flow for this long.
     pub idle_timeout: Duration,
+    /// Time allowed for the close handshake before forcing shutdown.
     pub close_timeout: Duration,
+    /// Signals graceful server shutdown to the relay.
     pub shutdown_rx: watch::Receiver<bool>,
     /// Metrics port used to track session lifetime. May be `None` in tests
     /// that don't exercise metrics — the bridge still runs, just without
@@ -517,10 +525,15 @@ impl Drop for WsSessionGuard {
 
 /// Wrapper that satisfies `Clone + Send + Sync + 'static` required by
 /// `http::Extensions::insert`. The inner value is taken once by the handler.
+/// Shared handle holding the bridge IO until the handler takes it.
 #[derive(Clone)]
-pub(crate) struct WebSocketBridgeHandle(pub Arc<Mutex<Option<WebSocketBridgeIo>>>);
+pub(crate) struct WebSocketBridgeHandle(
+    /// Bridge IO slot; `None` once the handler has taken it.
+    pub Arc<Mutex<Option<WebSocketBridgeIo>>>,
+);
 
 impl WebSocketBridgeHandle {
+    /// Wrap the bridge IO in a shareable handle.
     pub fn new(bridge: WebSocketBridgeIo) -> Self {
         Self(Arc::new(Mutex::new(Some(bridge))))
     }

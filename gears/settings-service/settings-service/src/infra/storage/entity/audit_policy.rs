@@ -23,6 +23,7 @@ pub struct Model {
     pub updated_at: OffsetDateTime,
 }
 
+/// Relations of the `audit_policy` entity (none).
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
 pub enum Relation {}
 

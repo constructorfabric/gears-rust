@@ -1,8 +1,7 @@
 //! Repository for the `idempotency_keys` table.
 //!
-//! Provides insert-or-fetch semantics: on the first call with a given key the
-//! record is inserted; on a retry the stored record is returned unchanged.
-//! All queries are scoped by `(tenant_id, owner_kind, owner_id, key)`.
+//! Insert-or-fetch: the first call stores the record, a retry gets it back unchanged.
+//! Queries are keyed by `(tenant_id, owner_kind, owner_id, key)`.
 
 use sea_orm::{ColumnTrait, Condition, EntityTrait, QueryFilter, Set};
 use time::OffsetDateTime;
@@ -12,7 +11,6 @@ use uuid::Uuid;
 
 use crate::domain::error::DomainError;
 use crate::domain::idempotency::IdempotencyRecord;
-use crate::infra::storage::db::db_err;
 use crate::infra::storage::entity::idempotency_key::{ActiveModel, Column, Entity, Model};
 use crate::infra::storage::store::IdempotencyInsert;
 
@@ -49,26 +47,16 @@ impl IdempotencyRepo {
             .scope_with(&AccessScope::allow_all())
             .one(conn)
             .await
-            .map_err(db_err)?;
+            .map_err(DomainError::from)?;
         Ok(found.map(record_from_model))
     }
 
-    /// Insert an idempotency record, replacing any prior row for the same key.
+    /// Insert an idempotency record, first deleting an **expired** row for the same key.
     ///
-    /// This runs inside the same transaction as the file creation it records,
-    /// so a committed create always leaves a replay record behind. A stale
-    /// **expired** row for the same key is deleted first (its TTL lapsed, so the
-    /// new request legitimately supersedes it — a bare insert would collide with
-    /// the leftover primary key). Every failure is propagated — never swallowed —
-    /// so the surrounding transaction rolls back rather than reporting success
-    /// with no persisted record. A live-key conflict from a concurrent create
-    /// racing the same key therefore also rolls that creation back; the client
-    /// retries and replays the winner's record via [`get`] instead of creating a
-    /// second file.
-    ///
-    /// Takes the bundled [`IdempotencyInsert`] plus the two fields it does not
-    /// carry (`file_id`, produced by the caller's create-file flow, and `now`)
-    /// instead of a long positional-argument list.
+    /// Runs in the same transaction as the file creation it records. Failures
+    /// propagate so the transaction rolls back; a live-key conflict from a racing
+    /// create rolls that creation back and the client retries and replays the
+    /// winner's record via `get`.
     pub async fn insert<C: DBRunner>(
         &self,
         conn: &C,
@@ -76,11 +64,8 @@ impl IdempotencyRepo {
         file_id: Uuid,
         now: OffsetDateTime,
     ) -> Result<(), DomainError> {
-        // Remove only a lapsed row for this key first (insert-or-replace on an
-        // expired PK). A still-live row is deliberately left in place: if a
-        // concurrent create already committed a fresh row for this key, our
-        // insert below then hits the primary key and rolls this creation back —
-        // exactly the behaviour that stops a duplicate file from being created.
+        // Only a lapsed row is removed; a live row stays so the insert below hits the
+        // PK and rolls back, preventing a duplicate file.
         Entity::delete_many()
             .filter(
                 Condition::all()
@@ -94,7 +79,7 @@ impl IdempotencyRepo {
             .scope_with(&AccessScope::allow_all())
             .exec(conn)
             .await
-            .map_err(db_err)?;
+            .map_err(DomainError::from)?;
 
         let am = ActiveModel {
             tenant_id: Set(idem.tenant_id),
@@ -112,16 +97,13 @@ impl IdempotencyRepo {
         };
         secure_insert::<Entity>(am, &AccessScope::allow_all(), conn)
             .await
-            .map_err(db_err)?;
+            .map_err(DomainError::from)?;
         Ok(())
     }
 
     /// Bulk-delete all rows whose `expires_at` is at or before `now`.
     ///
-    /// Called by the cleanup sweep (P2 remediation 1.9) so the
-    /// `idempotency_keys` table doesn't grow unboundedly — previously only a
-    /// lapsed row *for the same key* was ever removed (in [`Self::insert`]),
-    /// never a table-wide sweep. Returns the number of rows removed.
+    /// Used by the cleanup sweep; returns the number of rows removed.
     pub async fn delete_expired<C: DBRunner>(
         &self,
         conn: &C,
@@ -133,7 +115,7 @@ impl IdempotencyRepo {
             .scope_with(&AccessScope::allow_all())
             .exec(conn)
             .await
-            .map_err(db_err)?;
+            .map_err(DomainError::from)?;
         Ok(res.rows_affected)
     }
 }

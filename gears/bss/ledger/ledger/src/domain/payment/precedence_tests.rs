@@ -1,4 +1,17 @@
 use super::*;
+
+/// Preserve the original USD scale-2 economic fixtures, expressed in major units.
+fn fixture(value: i64) -> PostedMoney {
+    PostedMoney::try_new(
+        Decimal::new(value, 2),
+        bss_ledger_sdk::CurrencySpec::try_new("USD".to_owned(), 2).unwrap(),
+    )
+    .unwrap()
+}
+fn expected(value: i64) -> Decimal {
+    Decimal::new(value, 2)
+}
+
 use time::OffsetDateTime;
 
 fn ts(y: i32, m: u32, d: u32) -> OffsetDateTime {
@@ -8,7 +21,7 @@ fn ts(y: i32, m: u32, d: u32) -> OffsetDateTime {
 fn cand(id: &str, open: i64, at: Option<OffsetDateTime>) -> Candidate {
     Candidate {
         invoice_id: id.to_owned(),
-        open_minor: open,
+        open: fixture(open),
         original_posted_at: at,
     }
 }
@@ -21,7 +34,7 @@ fn orders_by_date_then_invoice_id_with_none_last() {
         cand("A", 100, Some(ts(2026, 2, 1))),
         cand("C", 100, Some(ts(2026, 1, 1))),
     ];
-    let out = oldest_first(&cands, 300, None);
+    let out = oldest_first(&cands, &fixture(300), None).unwrap();
     let order: Vec<&str> = out.iter().map(|a| a.invoice_id.as_str()).collect();
     assert_eq!(order, ["C", "A", "B"]);
 }
@@ -33,20 +46,20 @@ fn fills_min_of_remaining_and_open() {
         cand("A", 300, Some(ts(2026, 1, 1))),
         cand("B", 999, Some(ts(2026, 2, 1))),
     ];
-    let out = oldest_first(&cands, 500, None);
+    let out = oldest_first(&cands, &fixture(500), None).unwrap();
     assert_eq!(out.len(), 2);
     assert_eq!(
         out[0],
         Allocated {
             invoice_id: "A".to_owned(),
-            amount_minor: 300
+            amount: fixture(300)
         }
     );
     assert_eq!(
         out[1],
         Allocated {
             invoice_id: "B".to_owned(),
-            amount_minor: 200
+            amount: fixture(200)
         }
     );
 }
@@ -59,20 +72,20 @@ fn lump_below_sum_open_stops_midway() {
         cand("B", 100, Some(ts(2026, 2, 1))),
         cand("C", 100, Some(ts(2026, 3, 1))),
     ];
-    let out = oldest_first(&cands, 150, None);
+    let out = oldest_first(&cands, &fixture(150), None).unwrap();
     assert_eq!(out.len(), 2);
     assert_eq!(
         out[0],
         Allocated {
             invoice_id: "A".to_owned(),
-            amount_minor: 100
+            amount: fixture(100)
         }
     );
     assert_eq!(
         out[1],
         Allocated {
             invoice_id: "B".to_owned(),
-            amount_minor: 50
+            amount: fixture(50)
         }
     );
 }
@@ -85,12 +98,12 @@ fn lump_above_sum_open_fills_all_no_negative() {
         cand("A", 100, Some(ts(2026, 1, 1))),
         cand("B", 200, Some(ts(2026, 2, 1))),
     ];
-    let out = oldest_first(&cands, 1000, None);
+    let out = oldest_first(&cands, &fixture(1000), None).unwrap();
     assert_eq!(out.len(), 2);
-    assert_eq!(out[0].amount_minor, 100);
-    assert_eq!(out[1].amount_minor, 200);
-    let total: i64 = out.iter().map(|a| a.amount_minor).sum();
-    assert_eq!(total, 300);
+    assert_eq!(out[0].amount.amount(), expected(100));
+    assert_eq!(out[1].amount.amount(), expected(200));
+    let total: Decimal = out.iter().map(|a| a.amount.amount()).sum();
+    assert_eq!(total, expected(300));
 }
 
 #[test]
@@ -102,7 +115,7 @@ fn hint_moves_candidate_to_front() {
         cand("B", 100, Some(ts(2026, 2, 1))),
         cand("C", 100, Some(ts(2026, 3, 1))),
     ];
-    let out = oldest_first(&cands, 100, Some("C"));
+    let out = oldest_first(&cands, &fixture(100), Some("C")).unwrap();
     assert_eq!(out.len(), 1);
     assert_eq!(out[0].invoice_id, "C");
 }
@@ -114,7 +127,7 @@ fn hint_not_in_candidates_is_ignored() {
         cand("A", 100, Some(ts(2026, 1, 1))),
         cand("B", 100, Some(ts(2026, 2, 1))),
     ];
-    let out = oldest_first(&cands, 100, Some("ZZZ"));
+    let out = oldest_first(&cands, &fixture(100), Some("ZZZ")).unwrap();
     assert_eq!(out.len(), 1);
     assert_eq!(out[0].invoice_id, "A");
 }
@@ -126,7 +139,7 @@ fn ties_break_on_smaller_invoice_id_first() {
         cand("B", 100, Some(ts(2026, 1, 1))),
         cand("A", 100, Some(ts(2026, 1, 1))),
     ];
-    let out = oldest_first(&cands, 200, None);
+    let out = oldest_first(&cands, &fixture(200), None).unwrap();
     let order: Vec<&str> = out.iter().map(|a| a.invoice_id.as_str()).collect();
     assert_eq!(order, ["A", "B"]);
 }
@@ -139,15 +152,15 @@ fn zero_and_negative_open_are_skipped() {
         cand("B", -5, Some(ts(2026, 2, 1))),
         cand("C", 100, Some(ts(2026, 3, 1))),
     ];
-    let out = oldest_first(&cands, 100, None);
+    let out = oldest_first(&cands, &fixture(100), None).unwrap();
     assert_eq!(out.len(), 1);
     assert_eq!(out[0].invoice_id, "C");
-    assert_eq!(out[0].amount_minor, 100);
+    assert_eq!(out[0].amount.amount(), expected(100));
 }
 
 #[test]
 fn empty_candidates_yields_empty() {
-    let out = oldest_first(&[], 1000, None);
+    let out = oldest_first(&[], &fixture(1000), None).unwrap();
     assert!(out.is_empty());
 }
 
@@ -160,7 +173,7 @@ fn highest_amount_orders_by_open_desc_then_invoice_id() {
         cand("B", 300, Some(ts(2026, 2, 1))),
         cand("C", 200, Some(ts(2026, 3, 1))),
     ];
-    let out = highest_amount_first(&cands, 600, None);
+    let out = highest_amount_first(&cands, &fixture(600), None).unwrap();
     let order: Vec<&str> = out.iter().map(|a| a.invoice_id.as_str()).collect();
     assert_eq!(order, ["B", "C", "A"]);
 }
@@ -172,7 +185,7 @@ fn highest_amount_ties_break_on_smaller_invoice_id_first() {
         cand("B", 100, Some(ts(2026, 1, 1))),
         cand("A", 100, Some(ts(2026, 2, 1))),
     ];
-    let out = highest_amount_first(&cands, 200, None);
+    let out = highest_amount_first(&cands, &fixture(200), None).unwrap();
     let order: Vec<&str> = out.iter().map(|a| a.invoice_id.as_str()).collect();
     assert_eq!(order, ["A", "B"]);
 }
@@ -184,7 +197,7 @@ fn highest_amount_hint_moves_candidate_to_front() {
         cand("A", 100, Some(ts(2026, 1, 1))),
         cand("B", 300, Some(ts(2026, 2, 1))),
     ];
-    let out = highest_amount_first(&cands, 100, Some("A"));
+    let out = highest_amount_first(&cands, &fixture(100), Some("A")).unwrap();
     assert_eq!(out.len(), 1);
     assert_eq!(out[0].invoice_id, "A");
 }
@@ -196,7 +209,7 @@ fn highest_amount_hint_not_in_candidates_is_ignored() {
         cand("A", 100, Some(ts(2026, 1, 1))),
         cand("B", 300, Some(ts(2026, 2, 1))),
     ];
-    let out = highest_amount_first(&cands, 100, Some("ZZZ"));
+    let out = highest_amount_first(&cands, &fixture(100), Some("ZZZ")).unwrap();
     assert_eq!(out.len(), 1);
     assert_eq!(out[0].invoice_id, "B");
 }
@@ -209,11 +222,11 @@ fn highest_amount_fill_and_leftover_match_oldest_total() {
         cand("A", 100, Some(ts(2026, 1, 1))),
         cand("B", 200, Some(ts(2026, 2, 1))),
     ];
-    let oldest = oldest_first(&cands, 1000, None);
-    let highest = highest_amount_first(&cands, 1000, None);
-    let sum = |v: &[Allocated]| v.iter().map(|a| a.amount_minor).sum::<i64>();
+    let oldest = oldest_first(&cands, &fixture(1000), None).unwrap();
+    let highest = highest_amount_first(&cands, &fixture(1000), None).unwrap();
+    let sum = |v: &[Allocated]| v.iter().map(|a| a.amount.amount()).sum::<Decimal>();
     assert_eq!(sum(&oldest), sum(&highest));
-    assert_eq!(sum(&highest), 300); // leftover 700 is implicit, not returned
+    assert_eq!(sum(&highest), expected(300)); // leftover 700 is implicit, not returned
 }
 
 #[test]
@@ -224,20 +237,20 @@ fn highest_amount_stops_at_remaining_zero() {
         cand("B", 300, Some(ts(2026, 2, 1))),
         cand("C", 100, Some(ts(2026, 3, 1))),
     ];
-    let out = highest_amount_first(&cands, 350, None);
+    let out = highest_amount_first(&cands, &fixture(350), None).unwrap();
     assert_eq!(out.len(), 2);
     assert_eq!(
         out[0],
         Allocated {
             invoice_id: "B".to_owned(),
-            amount_minor: 300
+            amount: fixture(300)
         }
     );
     assert_eq!(
         out[1],
         Allocated {
             invoice_id: "A".to_owned(),
-            amount_minor: 50
+            amount: fixture(50)
         }
     );
 }
@@ -250,15 +263,15 @@ fn highest_amount_zero_and_negative_open_are_skipped() {
         cand("B", -5, Some(ts(2026, 2, 1))),
         cand("C", 100, Some(ts(2026, 3, 1))),
     ];
-    let out = highest_amount_first(&cands, 100, None);
+    let out = highest_amount_first(&cands, &fixture(100), None).unwrap();
     assert_eq!(out.len(), 1);
     assert_eq!(out[0].invoice_id, "C");
-    assert_eq!(out[0].amount_minor, 100);
+    assert_eq!(out[0].amount.amount(), expected(100));
 }
 
 #[test]
 fn highest_amount_empty_candidates_yields_empty() {
-    let out = highest_amount_first(&[], 1000, None);
+    let out = highest_amount_first(&[], &fixture(1000), None).unwrap();
     assert!(out.is_empty());
 }
 
@@ -269,7 +282,7 @@ fn select_split_dispatches_to_oldest_first() {
         cand("A", 100, Some(ts(2026, 1, 1))),
         cand("B", 300, Some(ts(2026, 2, 1))),
     ];
-    let out = select_split(&cands, 100, None, PrecedenceStrategy::OldestFirst);
+    let out = select_split(&cands, &fixture(100), None, PrecedenceStrategy::OldestFirst).unwrap();
     assert_eq!(out.len(), 1);
     assert_eq!(out[0].invoice_id, "A");
 }
@@ -281,7 +294,13 @@ fn select_split_dispatches_to_highest_amount_first() {
         cand("A", 100, Some(ts(2026, 1, 1))),
         cand("B", 300, Some(ts(2026, 2, 1))),
     ];
-    let out = select_split(&cands, 100, None, PrecedenceStrategy::HighestAmountFirst);
+    let out = select_split(
+        &cands,
+        &fixture(100),
+        None,
+        PrecedenceStrategy::HighestAmountFirst,
+    )
+    .unwrap();
     assert_eq!(out.len(), 1);
     assert_eq!(out[0].invoice_id, "B");
 }

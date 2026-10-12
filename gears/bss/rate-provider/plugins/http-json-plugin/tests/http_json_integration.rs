@@ -341,3 +341,56 @@ async fn provider_id_reports_the_configured_id_not_a_hardcoded_one() {
         "every served rate must carry the same id the source reports"
     );
 }
+
+#[tokio::test]
+async fn fetch_preserves_original_numeric_token_precision() {
+    let body = r#"{"date":"2026-07-21T00:00:00Z","rates":{"EUR":{"value":1.123456789123456789123456789},"GBP":{"value":0.0000001}}}"#;
+    let (url, _server) = spawn_body_server(body).await;
+    let p = provider(url, Auth::None {});
+    let rates = p
+        .fetch_latest(&SecurityContext::anonymous(), &[], "req")
+        .await
+        .unwrap();
+    assert_eq!(
+        rates
+            .iter()
+            .find(|r| r.quote == "EUR")
+            .unwrap()
+            .rate
+            .to_string(),
+        "1.123456789123456789123456789"
+    );
+    assert_eq!(
+        rates
+            .iter()
+            .find(|r| r.quote == "GBP")
+            .unwrap()
+            .rate
+            .to_string(),
+        "0.0000001"
+    );
+}
+
+#[tokio::test]
+async fn fetch_expands_numeric_exponent_tokens_but_not_string_ones() {
+    // Python's `json` writes small floats in exponent form. A numeric token is
+    // expanded exactly on the real fetch path; the same text as a string is a
+    // provider string and is refused (the entry is skipped, the rest served).
+    let body = r#"{"date":"2026-07-21T00:00:00Z","rates":{"EUR":{"value":3.6e-06},"GBP":{"value":"3.6e-06"},"JPY":{"value":1.5E+2}}}"#;
+    let (url, _server) = spawn_body_server(body).await;
+    let p = provider(url, Auth::None {});
+    let rates = p
+        .fetch_latest(&SecurityContext::anonymous(), &[], "req")
+        .await
+        .unwrap();
+    let rate_of = |quote: &str| {
+        rates
+            .iter()
+            .find(|rate| rate.quote == quote)
+            .map(|rate| rate.rate.to_string())
+    };
+    assert_eq!(rate_of("EUR").as_deref(), Some("0.0000036"));
+    assert_eq!(rate_of("JPY").as_deref(), Some("150"));
+    assert_eq!(rate_of("GBP"), None, "a string exponent is not expanded");
+    assert_eq!(rates.len(), 2);
+}

@@ -7,7 +7,7 @@
 //! - **`DISPUTE_PHASE_QUEUED`** — the same for a `CHARGEBACK` queue row (an
 //!   out-of-order `won`/`lost` awaiting its `opened`).
 //! - **`AGED_UNALLOCATED`** — an `unallocated_balance` grain still holding cash
-//!   (`balance_minor > 0`) whose OLDEST contributing `UNALLOCATED` journal line
+//!   (`balance > 0`) whose OLDEST contributing `UNALLOCATED` journal line
 //!   posted longer ago than the threshold (unapplied receipts nobody allocated).
 //!
 //! Unlike the hard `TieOutJob` invariants (which are `Critical`), aged alarms are
@@ -24,7 +24,7 @@
 //! `UNALLOCATED` lines by the unallocated grain `(payer, account, currency)`
 //! (mirroring `BalanceProjector::derive_grains`), and takes the MIN post time per
 //! grain. A grain is flagged iff that min age exceeds the threshold AND the cache
-//! `balance_minor > 0` (cash still parked). No migration.
+//! `balance > 0` (cash still parked). No migration.
 //!
 //! ## System-context / cross-tenant (mirrors `TieOutJob` + `QueueApplierJob`)
 //! The aged-queue scan reads the UNSCOPED cross-tenant candidate feed
@@ -40,6 +40,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
+use bss_ledger_sdk::PostedMoney;
 use sea_orm::{ColumnTrait, Condition, EntityTrait};
 use time::Duration;
 use toolkit_db::secure::{AccessScope, SecureEntityExt};
@@ -55,8 +56,66 @@ use crate::infra::exception::ExceptionRouter;
 use crate::infra::storage::entity::{
     account_balance, journal_entry, journal_line, refund, tax_subbalance, unallocated_balance,
 };
+use crate::infra::storage::money_text::decode_money;
 use crate::infra::storage::repo::PendingQueueRepo;
 use time::OffsetDateTime;
+
+/// Where a stored amount was read from, for the corrupt-text diagnostic.
+struct StoredAt<'a> {
+    tenant_id: Uuid,
+    table: &'static str,
+    grain: std::fmt::Arguments<'a>,
+}
+
+/// Decode a cached balance; a corrupt stored amount is logged with the tenant,
+/// table and grain and skipped by the aging detectors (the tie-out surfaces it
+/// as a variance).
+fn cached_balance(
+    text: &str,
+    currency: &str,
+    currency_scale: i16,
+    at: &StoredAt<'_>,
+) -> Option<PostedMoney> {
+    match decode_money(text, currency, currency_scale) {
+        Ok(money) => Some(money),
+        Err(e) => {
+            tracing::error!(
+                target: "bss-ledger",
+                tenant_id = %at.tenant_id,
+                table = at.table,
+                grain = %at.grain,
+                currency,
+                error = %e,
+                "bss-ledger: aged-alarms: corrupt stored balance text; grain skipped"
+            );
+            None
+        }
+    }
+}
+
+/// One `v1` alarm item (`expected_minor = 0`) for a validated posting, in the
+/// posting's own currency. The amount follows the one saturating policy of
+/// [`crate::infra::v1_payload`]; a saturated amount is logged with the tenant,
+/// the item id and `what`, so the grain whose figure the payload cannot carry
+/// can be found.
+fn alarm_item(
+    tenant_id: Uuid,
+    id: String,
+    money: &PostedMoney,
+    what: &'static str,
+) -> AffectedItem {
+    let actual_minor = crate::infra::v1_payload::v1_minor_units_for(
+        money,
+        "actual_minor",
+        &format_args!("aged alarm {what} item {id} tenant {tenant_id}"),
+    );
+    AffectedItem {
+        id,
+        currency: money.currency().code().to_owned(),
+        expected_minor: 0,
+        actual_minor,
+    }
+}
 
 /// The allocation deferred-apply queue flow this job ages — the
 /// `PAYMENT_ALLOCATE` literal (kept in lockstep with `SourceDocType::PaymentAllocate`
@@ -137,7 +196,7 @@ pub struct AgedUnallocatedGrain {
     /// Grain currency.
     pub currency: String,
     /// Cached parked balance (`> 0`).
-    pub balance_minor: i64,
+    pub balance: PostedMoney,
     /// Age of the oldest contributing `UNALLOCATED` line in whole seconds.
     pub age_secs: i64,
 }
@@ -153,7 +212,7 @@ pub struct AgedRefundClearingGrain {
     /// Grain currency.
     pub currency: String,
     /// Cached open clearing balance (`> 0`).
-    pub balance_minor: i64,
+    pub balance: PostedMoney,
     /// Age of the oldest contributing `REFUND_CLEARING` line in whole seconds.
     pub age_secs: i64,
     /// `true` once the grain has aged past the 14-day PAGE threshold (the
@@ -171,8 +230,8 @@ pub struct Stage1OrphanRefund {
     pub psp_refund_id: String,
     /// Grain currency.
     pub currency: String,
-    /// The stuck stage-1 amount in minor units.
-    pub amount_minor: i64,
+    /// The stuck stage-1 amount.
+    pub amount: PostedMoney,
     /// Age of the stage-1 `refund` row in whole seconds.
     pub age_secs: i64,
 }
@@ -192,11 +251,9 @@ pub struct NegativeTaxGrain {
     pub tax_jurisdiction: String,
     /// The (closed, prior) filing period that is negative (`YYYYMM`).
     pub tax_filing_period: String,
-    /// The negative cached tax balance in minor units (`< 0`).
-    pub balance_minor: i64,
-    /// Grain currency. The `tax_subbalance` cache carries no currency column, so
-    /// this is always empty (the defect has no single currency — mirrors the
-    /// other multi-/no-currency alarms).
+    /// The negative cached tax balance (`< 0`).
+    pub balance: PostedMoney,
+    /// Grain currency.
     pub currency: String,
 }
 
@@ -216,7 +273,7 @@ pub struct AgedAlarmJob {
     db: DBProvider<DbError>,
     publisher: Arc<LedgerEventPublisher>,
     /// Metrics sink (Group F): the refund-clearing balance/age gauges
-    /// (`ledger_refund_clearing_balance_minor` / `_aged_seconds`) and the
+    /// (`ledger_refund_clearing_aged_seconds`) and the
     /// stage-1-orphan counter (`ledger_stage1_refund_orphan_total`, design §9).
     /// Defaults to the no-op so the queue/unallocated families need no metrics.
     metrics: Arc<dyn crate::domain::ports::metrics::LedgerMetricsPort>,
@@ -368,7 +425,7 @@ impl AgedAlarmJob {
 
     /// Scan every tenant's `UNALLOCATED` journal lines + `unallocated_balance`
     /// cache and flag grains whose oldest contributing line is older than
-    /// `threshold` AND whose cached `balance_minor > 0`. Per-tenant failures are
+    /// `threshold` AND whose cached `balance > 0`. Per-tenant failures are
     /// isolated (logged, the pass continues).
     ///
     /// # Errors
@@ -383,10 +440,16 @@ impl AgedAlarmJob {
         // per-tenant loop opens its own.
         let tenant_ids: BTreeSet<Uuid> = {
             let conn = self.db.conn()?;
+            // Canonical decimal text: positive ⇔ not `"0"` and no leading sign
+            // (an exact text predicate, never a numeric cast of money text).
             let cache = unallocated_balance::Entity::find()
                 .secure()
                 .scope_with(&AccessScope::allow_all())
-                .filter(Condition::all().add(unallocated_balance::Column::BalanceMinor.gt(0)))
+                .filter(
+                    Condition::all()
+                        .add(unallocated_balance::Column::Balance.ne("0"))
+                        .add(unallocated_balance::Column::Balance.not_like("-%")),
+                )
                 .all(&conn)
                 .await
                 .map_err(|e| anyhow::anyhow!("aged-alarms: enumerate unallocated tenants: {e}"))?;
@@ -458,7 +521,7 @@ impl AgedAlarmJob {
 
     /// Scan every tenant's open `REFUND_CLEARING` balances (Group F, design §4.4):
     /// flag a grain whose oldest contributing `REFUND_CLEARING` line is older than
-    /// the 7-day WARN threshold AND whose cached `balance_minor > 0` (the clearing
+    /// the 7-day WARN threshold AND whose cached `balance > 0` (the clearing
     /// is still open). Grains older than the 14-day PAGE threshold are marked
     /// `paged` (the `STUCK_REFUND_CLEARING` close-blocking escalation). Enumerates
     /// tenants from `account_balance` (UNSCOPED `allow_all`), re-reads each scoped;
@@ -479,7 +542,9 @@ impl AgedAlarmJob {
                 .filter(
                     Condition::all()
                         .add(account_balance::Column::AccountClass.eq(CLASS_REFUND_CLEARING))
-                        .add(account_balance::Column::BalanceMinor.gt(0)),
+                        // Positive canonical text: not `"0"`, no leading sign.
+                        .add(account_balance::Column::Balance.ne("0"))
+                        .add(account_balance::Column::Balance.not_like("-%")),
                 )
                 .all(&conn)
                 .await
@@ -653,11 +718,13 @@ impl AgedAlarmJob {
             );
             let affected = grains
                 .iter()
-                .map(|g| AffectedItem {
-                    id: format!("account={}/age_secs={}", g.account_id, g.age_secs),
-                    currency: g.currency.clone(),
-                    expected_minor: 0,
-                    actual_minor: g.balance_minor,
+                .map(|g| {
+                    alarm_item(
+                        tenant_id,
+                        format!("account={}/age_secs={}", g.account_id, g.age_secs),
+                        &g.balance,
+                        "refund-clearing balance",
+                    )
                 })
                 .take(MAX_AFFECTED)
                 .collect();
@@ -686,11 +753,13 @@ impl AgedAlarmJob {
             );
             let affected = grains
                 .iter()
-                .map(|g| AffectedItem {
-                    id: format!("account={}/age_secs={}", g.account_id, g.age_secs),
-                    currency: g.currency.clone(),
-                    expected_minor: 0,
-                    actual_minor: g.balance_minor,
+                .map(|g| {
+                    alarm_item(
+                        tenant_id,
+                        format!("account={}/age_secs={}", g.account_id, g.age_secs),
+                        &g.balance,
+                        "refund-clearing balance",
+                    )
                 })
                 .take(MAX_AFFECTED)
                 .collect();
@@ -744,11 +813,13 @@ impl AgedAlarmJob {
             );
             let affected = items
                 .iter()
-                .map(|o| AffectedItem {
-                    id: format!("psp_refund:{}/age_secs={}", o.psp_refund_id, o.age_secs),
-                    currency: o.currency.clone(),
-                    expected_minor: 0,
-                    actual_minor: o.amount_minor,
+                .map(|o| {
+                    alarm_item(
+                        tenant_id,
+                        format!("psp_refund:{}/age_secs={}", o.psp_refund_id, o.age_secs),
+                        &o.amount,
+                        "stage-1 refund amount",
+                    )
                 })
                 .take(MAX_AFFECTED)
                 .collect();
@@ -765,11 +836,11 @@ impl AgedAlarmJob {
 
     /// Scan every tenant's `tax_subbalance` cache (Group 2, design §4.5 / AC #17)
     /// for grains that went negative BEYOND their filing window: read all rows
-    /// with `balance_minor < 0` (UNSCOPED `allow_all`, system context — mirrors the
+    /// with `balance < 0` (UNSCOPED `allow_all`, system context — mirrors the
     /// other cross-tenant enumerations), then filter IN RUST to those whose
     /// `tax_filing_period` is strictly earlier than the current `YYYYMM` filing
     /// period (an in-window negative is a legitimate reversal and is NOT flagged).
-    /// The grain is self-contained (`balance_minor` + jurisdiction + filing-period),
+    /// The grain is self-contained (`balance` + jurisdiction + filing-period),
     /// so no journal age computation is needed — unlike the refund-clearing /
     /// unallocated scans, "beyond window" is a pure string comparison.
     ///
@@ -784,22 +855,40 @@ impl AgedAlarmJob {
         let rows = tax_subbalance::Entity::find()
             .secure()
             .scope_with(&AccessScope::allow_all())
-            .filter(Condition::all().add(tax_subbalance::Column::BalanceMinor.lt(0)))
+            // Negative canonical text carries a leading `-` (an exact text
+            // predicate, never a numeric cast of money text).
+            .filter(Condition::all().add(tax_subbalance::Column::Balance.like("-%")))
             .all(&conn)
             .await
             .map_err(|e| anyhow::anyhow!("aged-alarms: read tax_subbalance: {e}"))?;
         Ok(rows
             .into_iter()
             .filter(|r| is_beyond_filing_window(&r.tax_filing_period, &current_period))
-            .map(|r| NegativeTaxGrain {
-                tenant_id: r.tenant_id,
-                account_id: r.account_id,
-                tax_jurisdiction: r.tax_jurisdiction,
-                tax_filing_period: r.tax_filing_period,
-                balance_minor: r.balance_minor,
-                // `tax_subbalance` has no currency column (the defect has no single
-                // currency) — empty, like the other multi-/no-currency alarms.
-                currency: String::new(),
+            .filter_map(|r| {
+                let balance = cached_balance(
+                    &r.balance,
+                    &r.currency,
+                    r.currency_scale,
+                    &StoredAt {
+                        tenant_id: r.tenant_id,
+                        table: "tax_subbalance",
+                        grain: format_args!(
+                            "account={}/jurisdiction={}/filing={}",
+                            r.account_id, r.tax_jurisdiction, r.tax_filing_period
+                        ),
+                    },
+                )?;
+                balance
+                    .amount()
+                    .is_sign_negative()
+                    .then_some(NegativeTaxGrain {
+                        tenant_id: r.tenant_id,
+                        account_id: r.account_id,
+                        tax_jurisdiction: r.tax_jurisdiction,
+                        tax_filing_period: r.tax_filing_period,
+                        balance,
+                        currency: r.currency,
+                    })
             })
             .collect())
     }
@@ -811,28 +900,30 @@ impl AgedAlarmJob {
     /// negative persists.
     async fn emit_negative_tax_alarms(&self, grains: &[NegativeTaxGrain]) {
         for g in grains {
+            let balance_text = bss_ledger_sdk::canonical_decimal(g.balance.amount());
             let detail = format!(
-                "tax_subbalance negative beyond filing window: jurisdiction={} filing_period={} balance_minor={}",
-                g.tax_jurisdiction, g.tax_filing_period, g.balance_minor
+                "tax_subbalance negative beyond filing window: jurisdiction={} filing_period={} balance={} {}",
+                g.tax_jurisdiction, g.tax_filing_period, balance_text, g.currency
             );
             tracing::error!(
                 tenant_id = %g.tenant_id,
                 account_id = %g.account_id,
                 jurisdiction = %g.tax_jurisdiction,
                 filing_period = %g.tax_filing_period,
-                balance_minor = g.balance_minor,
+                balance = %balance_text,
+                currency = %g.currency,
                 "bss-ledger: tax sub-balance negative beyond its filing window — \
                  NEGATIVE_TAX_SUBBALANCE (Revenue Assurance must reconcile)"
             );
-            let affected = vec![AffectedItem {
-                id: format!(
+            let affected = vec![alarm_item(
+                g.tenant_id,
+                format!(
                     "account:{}/jurisdiction:{}/filing:{}",
                     g.account_id, g.tax_jurisdiction, g.tax_filing_period
                 ),
-                currency: g.currency.clone(),
-                expected_minor: 0,
-                actual_minor: g.balance_minor,
-            }];
+                &g.balance,
+                "negative tax sub-balance",
+            )];
             self.emit_with_severity(
                 g.tenant_id,
                 AlarmCategory::NegativeTaxSubbalance,
@@ -927,16 +1018,18 @@ impl AgedAlarmJob {
             );
             let affected = grains
                 .iter()
-                .map(|g| AffectedItem {
-                    id: format!(
-                        "payer={}/account={}/age_secs={}",
-                        g.payer_tenant_id, g.account_id, g.age_secs
-                    ),
-                    currency: g.currency.clone(),
+                .map(|g| {
                     // expected=0 (no target), actual=the parked balance still sat
                     // in the pool (what an operator must get allocated/returned).
-                    expected_minor: 0,
-                    actual_minor: g.balance_minor,
+                    alarm_item(
+                        tenant_id,
+                        format!(
+                            "payer={}/account={}/age_secs={}",
+                            g.payer_tenant_id, g.account_id, g.age_secs
+                        ),
+                        &g.balance,
+                        "unallocated balance",
+                    )
                 })
                 .take(MAX_AFFECTED)
                 .collect();
@@ -974,7 +1067,7 @@ impl AgedAlarmJob {
 /// Pure aged-unallocated detector (factored out so it is unit-testable without a
 /// database): fold the `UNALLOCATED` lines into a per-grain MIN post time using
 /// the `entry_id -> posted_at_utc` map, then flag a grain iff its oldest line is
-/// older than `cutoff` AND the cache holds `balance_minor > 0`. The grain key
+/// older than `cutoff` AND the cache holds `balance > 0`. The grain key
 /// `(payer_tenant_id, account_id, currency)` mirrors
 /// `BalanceProjector::derive_grains`' unallocated grain.
 fn aged_grains(
@@ -1009,11 +1102,26 @@ fn aged_grains(
             .or_insert(ts);
     }
 
-    // Flag a parked cache grain (`balance_minor > 0`) whose oldest line is aged.
+    // Flag a parked cache grain (`balance > 0`) whose oldest line is aged.
     cache
         .iter()
-        .filter(|c| c.balance_minor > 0)
         .filter_map(|c| {
+            let balance = cached_balance(
+                &c.balance,
+                &c.currency,
+                c.currency_scale,
+                &StoredAt {
+                    tenant_id: c.tenant_id,
+                    table: "unallocated_balance",
+                    grain: format_args!(
+                        "payer={}/account={}/currency={}",
+                        c.payer_tenant_id, c.account_id, c.currency
+                    ),
+                },
+            )?;
+            if !balance.amount().is_sign_positive() || balance.amount().is_zero() {
+                return None;
+            }
             let key = (c.payer_tenant_id, c.account_id, c.currency.clone());
             let oldest_ts = *oldest.get(&key)?;
             (oldest_ts < cutoff).then(|| AgedUnallocatedGrain {
@@ -1021,7 +1129,7 @@ fn aged_grains(
                 payer_tenant_id: c.payer_tenant_id,
                 account_id: c.account_id,
                 currency: c.currency.clone(),
-                balance_minor: c.balance_minor,
+                balance,
                 age_secs: (now - oldest_ts).whole_seconds(),
             })
         })
@@ -1032,7 +1140,7 @@ fn aged_grains(
 /// without a database, mirroring [`aged_grains`]): fold the `REFUND_CLEARING`
 /// lines into a per-account MIN post time via the `entry_id -> posted_at_utc` map,
 /// then flag an `account_balance` `REFUND_CLEARING` grain iff its oldest line is
-/// older than `warn_cutoff` AND the cache holds `balance_minor > 0`. A grain whose
+/// older than `warn_cutoff` AND the cache holds `balance > 0`. A grain whose
 /// oldest line is also older than `page_cutoff` is marked `paged` (the
 /// `STUCK_REFUND_CLEARING` 14-day escalation). Feeds the §9 balance/age gauges per
 /// grain via `metrics` (a side effect kept here so the live + test paths agree).
@@ -1073,21 +1181,32 @@ fn aged_refund_clearing_grains(
 
     cache
         .iter()
-        .filter(|c| c.balance_minor > 0)
         .filter_map(|c| {
+            let balance = cached_balance(
+                &c.balance,
+                &c.currency,
+                c.currency_scale,
+                &StoredAt {
+                    tenant_id: c.tenant_id,
+                    table: "account_balance",
+                    grain: format_args!("account={}/currency={}", c.account_id, c.currency),
+                },
+            )?;
+            if !balance.amount().is_sign_positive() || balance.amount().is_zero() {
+                return None;
+            }
             let key = (c.account_id, c.currency.clone());
             let oldest_ts = *oldest.get(&key)?;
-            // Feed the §9 gauges for every OPEN grain (not just aged ones): the
-            // balance + its current age, by tenant.
+            // Feed the §9 age gauge for every OPEN grain (not just aged ones), by
+            // tenant. (The balance gauge is money and has no metric port.)
             let age_secs = (now - oldest_ts).whole_seconds();
-            metrics.refund_clearing_balance_minor(c.tenant_id, c.balance_minor);
             #[allow(clippy::cast_precision_loss)]
             metrics.refund_clearing_aged_seconds(c.tenant_id, age_secs as f64);
             (oldest_ts < warn_cutoff).then(|| AgedRefundClearingGrain {
                 tenant_id: c.tenant_id,
                 account_id: c.account_id,
                 currency: c.currency.clone(),
-                balance_minor: c.balance_minor,
+                balance,
                 age_secs,
                 paged: oldest_ts < page_cutoff,
             })
@@ -1130,11 +1249,21 @@ fn stage1_orphans(
             if advanced || stage1.created_at_utc >= cutoff {
                 return None;
             }
+            let amount = cached_balance(
+                &stage1.amount,
+                &stage1.currency,
+                stage1.currency_scale,
+                &StoredAt {
+                    tenant_id,
+                    table: "refund",
+                    grain: format_args!("psp_refund={}", stage1.psp_refund_id),
+                },
+            )?;
             Some(Stage1OrphanRefund {
                 tenant_id,
                 psp_refund_id: stage1.psp_refund_id.clone(),
                 currency: stage1.currency.clone(),
-                amount_minor: stage1.amount_minor,
+                amount,
                 age_secs: (now - stage1.created_at_utc).whole_seconds(),
             })
         })
@@ -1144,3 +1273,7 @@ fn stage1_orphans(
 #[cfg(test)]
 #[path = "aged_alarms_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "aged_alarms_balance_tests.rs"]
+mod balance_tests;

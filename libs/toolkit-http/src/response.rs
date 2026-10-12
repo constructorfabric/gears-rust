@@ -150,7 +150,9 @@ impl http_body::Body for LimitedBody {
 /// All body reads enforce the configured `max_body_size` limit.
 #[derive(Debug)]
 pub struct HttpResponse {
+    /// The underlying HTTP response.
     pub(crate) inner: Response<ResponseBody>,
+    /// Maximum number of body bytes that may be read into memory.
     pub(crate) max_body_size: usize,
 }
 

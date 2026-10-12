@@ -1,19 +1,18 @@
 //! Public model types for the file-storage gear.
 //!
-//! Contract-layer types only — no `serde`, no HTTP, no `utoipa`. REST DTOs live
-//! in the impl crate under `api/rest/`. These are the transport-agnostic domain
-//! types other gears and the impl layers share.
+//! Transport-agnostic types only — no `serde`, HTTP or `utoipa`; REST DTOs live in
+//! the gear crate under `api/rest/`.
 
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-/// Immutable identity of a logical file (PRD: `File ID`).
+/// Immutable identity of a logical file.
 pub type FileId = Uuid;
 
-/// Identity of one immutable content blob of a file (PRD: `Version ID`).
+/// Identity of one immutable content blob of a file.
 pub type VersionId = Uuid;
 
-/// The principal that owns a file (PRD `cpt-cf-file-storage-fr-file-ownership`).
+/// The principal that owns a file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OwnerKind {
     /// A platform user.
@@ -43,7 +42,7 @@ impl OwnerKind {
     }
 }
 
-/// Lifecycle of a content version (PRD: `pending` → `available`).
+/// Lifecycle of a content version (`pending` → `available`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VersionStatus {
     /// Pre-registered, bytes may be uploading; not yet bindable as current.
@@ -103,15 +102,10 @@ pub struct FileVersion {
     pub size: i64,
     pub hash_algorithm: String,
     pub hash_value: Vec<u8>,
-    /// ADR-0006 content-hash mode discriminator: `"whole-sha256"` (the
-    /// default for every version written before ADR-0006, and for every
-    /// non-multipart upload) or `"multipart-composite-sha256"`. Together
-    /// with `hash_value` this is the sole ground truth for "how do I verify
-    /// this version": for `whole-sha256`, `hash_value` is `sha256(bytes)`;
-    /// for `multipart-composite-sha256`, `hash_value` is `sha256(manifest)`.
+    /// ADR-0006 hash mode: `"whole-sha256"` (`hash_value` is `sha256(bytes)`; every
+    /// non-multipart upload) or `"multipart-composite-sha256"` (`sha256(manifest)`).
     pub hash_mode: String,
-    /// Number of parts for a `multipart-composite-sha256` version; `None`
-    /// for `whole-sha256`.
+    /// Part count for `multipart-composite-sha256`; `None` for `whole-sha256`.
     pub part_count: Option<i32>,
     pub status: VersionStatus,
     pub is_current: bool,
@@ -141,15 +135,14 @@ pub struct NewFile {
     pub custom_metadata: Vec<CustomMetadataEntry>,
 }
 
-/// Mandatory owner filter for listing (PRD `cpt-cf-file-storage-fr-list-files`).
+/// Mandatory owner filter for listing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OwnerFilter {
     pub owner_kind: OwnerKind,
     pub owner_id: Uuid,
 }
 
-/// A parsed HTTP `Range` request over a content blob of known length
-/// (PRD `cpt-cf-file-storage-fr-range-requests`).
+/// A parsed HTTP `Range` request over a content blob of known length.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ByteRange {
     /// `bytes=start-end` (both inclusive).

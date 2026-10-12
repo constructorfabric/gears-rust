@@ -8,6 +8,7 @@
 //! every operation below can run in a transaction when its caller needs one.
 
 use toolkit_db::secure::DBRunner;
+use toolkit_macros::domain_model;
 use toolkit_security::SecurityContext;
 
 use crate::audit::{AuditOperation, AuditRecord, AuditSink, AuditValue, ImageClass};
@@ -24,6 +25,7 @@ use crate::domain::precondition::{self, ETag};
 /// The two always travel together — an audit record needs both, and splitting
 /// them across parameters invites a call site that supplies one and forgets the
 /// other.
+#[domain_model]
 #[derive(Clone, Copy)]
 pub struct Actor<'a> {
     /// The authenticated caller.
@@ -49,6 +51,7 @@ fn snapshot(category: &Category) -> serde_json::Value {
 }
 
 /// Category create, read, update and delete.
+#[domain_model]
 pub struct CategoryService<R, S> {
     repo: R,
     sink: S,

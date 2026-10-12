@@ -8,7 +8,7 @@
 //! `dispute_id:cycle:phase`) on one opened `CASH_HOLD` dispute must land EXACTLY
 //! ONE ledger effect — the `(tenant, CHARGEBACK, business_id)` dedup admits one
 //! winner; the loser replays the winner's finalized entry. The forfeiture posts
-//! once and `clawed_back_minor` is NEVER double-counted (no double clawback).
+//! once and `clawed_back` is NEVER double-counted (no double clawback).
 //! Mirrors `postgres_payment_concurrency.rs`'s `retry_on_serialization` +
 //! `tokio::join!` shape (and `postgres_payments::allocate_replay_makes_no_
 //! duplicate_rows`, the same-key racing-claim pattern).
@@ -31,7 +31,6 @@ use std::sync::Arc;
 
 use bss_ledger::domain::error::DomainError;
 use bss_ledger::domain::model::{AccountRow, CurrencyScaleRow};
-use bss_ledger::domain::money::DEFAULT_PLAUSIBLE_MAX_MAJOR;
 use bss_ledger::domain::payment::chargeback::{DisputePhase, FundsAtOpen};
 use bss_ledger::domain::payment::settlement::SettlementInput;
 use bss_ledger::domain::ports::metrics::NoopLedgerMetrics;
@@ -43,7 +42,8 @@ use bss_ledger::infra::payment::settle::SettlementService;
 use bss_ledger::infra::storage::migrations::Migrator;
 use bss_ledger::infra::storage::repo::PaymentRepo;
 use bss_ledger::infra::storage::repo::ReferenceRepo;
-use bss_ledger_sdk::{AccountClass, Side};
+use bss_ledger_sdk::{AccountClass, CurrencySpec, PostedMoney, Side, canonical_decimal};
+use rust_decimal::Decimal;
 use sea_orm::{ConnectionTrait, Database, Statement};
 use sea_orm_migration::MigratorTrait;
 use testcontainers_modules::postgres::Postgres;
@@ -56,6 +56,21 @@ use uuid::Uuid;
 
 fn pg(sql: impl Into<String>) -> Statement {
     Statement::from_string(sea_orm::DatabaseBackend::Postgres, sql.into())
+}
+
+/// The USD@2 currency spec every fixture here posts in.
+fn usd_spec() -> CurrencySpec {
+    CurrencySpec::try_new("USD".to_owned(), 2).unwrap()
+}
+
+/// A USD scale-2 posting from a cent count (`1234` ⇒ `12.34`).
+fn usd(cents: i64) -> PostedMoney {
+    PostedMoney::try_new(Decimal::new(cents, 2), usd_spec()).unwrap()
+}
+
+/// The canonical stored text of a USD cent count (`970` ⇒ `"9.7"`).
+fn text(cents: i64) -> String {
+    canonical_decimal(Decimal::new(cents, 2))
 }
 
 /// Boot a container, migrate on a raw connection, and return a `bss`-search-path
@@ -122,8 +137,7 @@ async fn setup_seller(raw: &sea_orm::DatabaseConnection, provider: &DBProvider<D
         .upsert_currency_scale(CurrencyScaleRow {
             tenant_id: s.tenant,
             currency: "USD".to_owned(),
-            minor_units: 2,
-            plausible_max_major: DEFAULT_PLAUSIBLE_MAX_MAJOR,
+            currency_scale: 2,
             source: "iso".to_owned(),
         })
         .await
@@ -171,7 +185,7 @@ fn chargeback_svc(provider: &DBProvider<DbError>) -> ChargebackService {
 }
 
 /// Settle `gross` (fee 0) for `payment_id` — funds CASH_CLEARING + seeds the
-/// settlement counter (`settled_minor = gross`) the clawback cap nets against.
+/// settlement counter (`settled = gross`) the clawback cap nets against.
 async fn settle(provider: &DBProvider<DbError>, s: &Seller, payment_id: &str, gross: i64) {
     SettlementService::new(
         provider.clone(),
@@ -185,9 +199,9 @@ async fn settle(provider: &DBProvider<DbError>, s: &Seller, payment_id: &str, gr
             tenant_id: s.tenant,
             payer_tenant_id: s.payer,
             payment_id: payment_id.to_owned(),
-            gross_minor: gross,
-            fee_minor: 0,
-            currency: "USD".to_owned(),
+            gross: usd(gross),
+
+            fee: usd(0),
             effective_at: None,
         },
     )
@@ -216,20 +230,20 @@ where
     op().await
 }
 
-/// Read a chart account's cached `balance_minor` (or `None` if never posted to).
+/// Read a chart account's cached canonical `balance` text (or `None` if never posted to).
 async fn account_balance(
     raw: &sea_orm::DatabaseConnection,
     s: &Seller,
     account: Uuid,
-) -> Option<i64> {
+) -> Option<String> {
     raw.query_one_raw(pg(format!(
-        "SELECT balance_minor FROM bss.ledger_account_balance \
+        "SELECT balance FROM bss.ledger_account_balance \
          WHERE tenant_id='{}' AND account_id='{}' AND currency='USD'",
         s.tenant, account
     )))
     .await
     .unwrap()
-    .map(|r| r.try_get_by_index::<i64>(0).unwrap())
+    .map(|r| r.try_get_by_index::<String>(0).unwrap())
 }
 
 /// Chargeback #D-1: two concurrent records of the SAME `lost` phase on ONE
@@ -239,7 +253,7 @@ async fn account_balance(
 /// `(tenant, CHARGEBACK, business_id)` dedup admits one winner and the loser
 /// replays the winner's finalized entry (the client retries a projector-level
 /// 40001 via `retry_on_serialization`). The forfeiture posts once
-/// (DISPUTE_LOSS_EXPENSE = 1000, DISPUTE_HOLD = 0) and `clawed_back_minor` is
+/// (DISPUTE_LOSS_EXPENSE = 10.00, DISPUTE_HOLD = 0) and `clawed_back` is
 /// NEVER double-counted (it lands at EXACTLY the disputed 1000 — no double
 /// clawback). Mirrors `postgres_payments::allocate_replay_makes_no_duplicate_
 /// rows`.
@@ -267,8 +281,7 @@ async fn concurrent_lost_on_one_dispute_claws_back_once() {
                 cycle: 1,
                 phase: DisputePhase::Opened,
                 funds_at_open: FundsAtOpen::Withheld,
-                disputed_amount_minor: 1000,
-                currency: "USD".to_owned(),
+                disputed_amount: usd(1000),
                 effective_at: None,
             },
         )
@@ -286,8 +299,7 @@ async fn concurrent_lost_on_one_dispute_claws_back_once() {
         cycle: 1,
         phase: DisputePhase::Lost,
         funds_at_open: FundsAtOpen::Withheld,
-        disputed_amount_minor: 1000,
-        currency: "USD".to_owned(),
+        disputed_amount: usd(1000),
         effective_at: None,
     };
 
@@ -322,15 +334,15 @@ async fn concurrent_lost_on_one_dispute_claws_back_once() {
     );
 
     // INVARIANT: the forfeiture posted EXACTLY once — DISPUTE_LOSS_EXPENSE = 1000,
-    // DISPUTE_HOLD emptied — and `clawed_back_minor` was not double-counted.
+    // DISPUTE_HOLD emptied — and `clawed_back` was not double-counted.
     assert_eq!(
         account_balance(&raw, &s, s.dispute_loss).await,
-        Some(1000),
+        Some(text(1000)),
         "the forfeiture booked exactly once into DISPUTE_LOSS_EXPENSE"
     );
     assert_eq!(
         account_balance(&raw, &s, s.dispute_hold).await,
-        Some(0),
+        Some(text(0)),
         "the hold is emptied exactly once"
     );
 
@@ -340,15 +352,16 @@ async fn concurrent_lost_on_one_dispute_claws_back_once() {
         .unwrap()
         .expect("settlement row present");
     assert_eq!(
-        row.clawed_back_minor, 1000,
-        "clawed_back_minor reflects exactly one clawback (1000), never doubled"
+        row.clawed_back,
+        usd(1000),
+        "clawed_back reflects exactly one clawback (10.00), never doubled"
     );
     assert!(
-        row.refunded_minor + row.clawed_back_minor <= row.settled_minor,
+        row.refunded.amount() + row.clawed_back.amount() <= row.settled.amount(),
         "the total money-out cap held: refunded ({}) + clawed ({}) <= settled ({})",
-        row.refunded_minor,
-        row.clawed_back_minor,
-        row.settled_minor
+        row.refunded.amount(),
+        row.clawed_back.amount(),
+        row.settled.amount()
     );
 
     // The dispute resolved to LOST (advanced once).
@@ -400,8 +413,7 @@ async fn concurrent_won_and_lost_resolves_one_outcome() {
                 cycle: 1,
                 phase: DisputePhase::Opened,
                 funds_at_open: FundsAtOpen::Withheld,
-                disputed_amount_minor: 1000,
-                currency: "USD".to_owned(),
+                disputed_amount: usd(1000),
                 effective_at: None,
             },
         )
@@ -418,8 +430,7 @@ async fn concurrent_won_and_lost_resolves_one_outcome() {
         cycle: 1,
         phase: DisputePhase::Won,
         funds_at_open: FundsAtOpen::Withheld,
-        disputed_amount_minor: 1000,
-        currency: "USD".to_owned(),
+        disputed_amount: usd(1000),
         effective_at: None,
     };
     let lost_req = || ChargebackRequest {
@@ -431,8 +442,7 @@ async fn concurrent_won_and_lost_resolves_one_outcome() {
         cycle: 1,
         phase: DisputePhase::Lost,
         funds_at_open: FundsAtOpen::Withheld,
-        disputed_amount_minor: 1000,
-        currency: "USD".to_owned(),
+        disputed_amount: usd(1000),
         effective_at: None,
     };
 
@@ -482,7 +492,7 @@ async fn concurrent_won_and_lost_resolves_one_outcome() {
     );
     assert_eq!(
         account_balance(&raw, &s, s.dispute_hold).await,
-        Some(0),
+        Some(text(0)),
         "DISPUTE_HOLD drained by the single applied outcome"
     );
     // The clawback counter reflects the winner: 0 on a won, the full 1000 on a lost.
@@ -493,7 +503,8 @@ async fn concurrent_won_and_lost_resolves_one_outcome() {
         .unwrap()
         .expect("settlement row present");
     assert_eq!(
-        row.clawed_back_minor, want_clawed,
-        "clawed_back reflects the single winning outcome (won=>0, lost=>1000)"
+        row.clawed_back,
+        usd(want_clawed),
+        "clawed_back reflects the single winning outcome (won=>0, lost=>10.00)"
     );
 }

@@ -24,12 +24,14 @@ pub struct Model {
     pub account_id: Uuid,
     #[sea_orm(primary_key, auto_increment = false)]
     pub currency: String,
+    pub currency_scale: i16,
     #[sea_orm(primary_key, auto_increment = false)]
     pub credit_grant_event_type: String,
     pub first_granted_at: Option<OffsetDateTime>,
-    pub balance_minor: i64,
-    pub functional_balance_minor: Option<i64>,
+    pub balance: String,
+    pub functional_balance: Option<String>,
     pub functional_currency: Option<String>,
+    pub functional_currency_scale: Option<i16>,
     pub last_entry_seq: Option<i64>,
     pub version: i64,
 }

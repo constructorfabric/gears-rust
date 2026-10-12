@@ -13,6 +13,7 @@ pub mod repo;
 pub mod service;
 
 use std::sync::Arc;
+use toolkit_macros::domain_model;
 
 use async_trait::async_trait;
 use time::OffsetDateTime;
@@ -47,6 +48,7 @@ pub use service::{AccessActor, AccessReadout, AccessService};
 /// an integrity error on the read, not a row read as some default access, and
 /// an unknown value in a mutation is refused `400`. The spellings are pinned
 /// by a test.
+#[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum TenantAccess {
     /// Read and set its own override: the default, represented by no row.
@@ -81,6 +83,7 @@ impl TenantAccess {
 }
 
 /// One stored restriction row.
+#[domain_model]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Restriction {
     /// Row identity.
@@ -100,6 +103,7 @@ pub struct Restriction {
 }
 
 /// What a set supplies.
+#[domain_model]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RestrictionDraft {
     /// The declaration.
@@ -113,6 +117,7 @@ pub struct RestrictionDraft {
 }
 
 /// A tenant's effective access for one setting, and where it comes from.
+#[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EffectiveAccess {
     /// The strictest access on the chain.

@@ -1,4 +1,4 @@
-//! `SeaORM` entity for `bss.ledger_currency_scale_registry` (per-tenant minor units).
+//! `SeaORM` entity for `bss.ledger_currency_scale_registry` (per-tenant currency scale).
 
 use sea_orm::entity::prelude::*;
 use toolkit_db_macros::Scopable;
@@ -12,8 +12,7 @@ pub struct Model {
     pub tenant_id: Uuid,
     #[sea_orm(primary_key, auto_increment = false)]
     pub currency: String,
-    pub minor_units: i16,
-    pub plausible_max_major: i64,
+    pub currency_scale: i16,
     pub source: String,
 }
 

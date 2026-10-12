@@ -53,6 +53,7 @@ const GENERIC_IMAGE_TYPE: &str = "GenericImage";
 const POINTER: &str =
     "Database images must come from libs/test-containers (see docs/TESTING.md 4.4).";
 
+/// Runs the pins check and returns the process exit code.
 pub fn check(args: &[String]) -> ExitCode {
     if let Some(flag) = args.first() {
         eprintln!("error: unexpected argument `{flag}`");
@@ -139,8 +140,11 @@ fn tracked_rust_files() -> Result<Vec<String>, String> {
 /// One offending call.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Violation {
+    /// 1-based line of the offending call.
     pub line: usize,
+    /// 1-based column of the offending call.
     pub column: usize,
+    /// Name of the rule that was violated.
     pub rule: String,
 }
 

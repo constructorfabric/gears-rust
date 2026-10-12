@@ -59,8 +59,11 @@ pub type BufferedService = Buffer<Request<Full<Bytes>>, ServiceFuture>;
 /// ```
 #[derive(Clone)]
 pub struct HttpClient {
+    /// Buffered middleware stack that executes requests.
     pub(crate) service: BufferedService,
+    /// Maximum response body size in bytes accepted by this client.
     pub(crate) max_body_size: usize,
+    /// Transport security policy the client was built with.
     pub(crate) transport_security: TransportSecurity,
 }
 

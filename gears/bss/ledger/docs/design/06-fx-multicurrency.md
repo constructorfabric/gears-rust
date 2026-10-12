@@ -114,7 +114,7 @@ Inherits Slice 1 C1–C4 + A1–A6 (A4 money type applies per currency), Slices 
 
 ### 1.7 Naming & Design-Introduced Names
 
-Reuses the PRD glossary and **inherits engine mechanics from the Foundation** (see 01-repository-foundation.md §Component Model): `PostingService`, append-only journal + strict line-negation reversal, `IdempotencyGate`, `MoneyModule` (banker's rounding, fixed-precision minor units, residual-cent rules), `BalanceProjector`, `FiscalPeriodGuard`, leaf-partition commit trigger, total fixed lock order, `TieOutJob`. The **Foundation owns the dual-column (transaction + functional) schema natively** — `functional_amount_minor` / `functional_currency` on `journal_line` and the `functional_*` columns on the shared balance caches, plus the dual-column commit-trigger check and the relaxed `amount_minor` CHECK for functional-only lines. **This feature populates them and owns** `rate_snapshot` + the `journal_line.rate_snapshot_ref` FK. Not restated.
+Reuses the PRD glossary and **inherits engine mechanics from the Foundation** (see 01-repository-foundation.md §Component Model): `PostingService`, append-only journal + strict line-negation reversal, `IdempotencyGate`, money model (validated major-unit decimals, exact arithmetic, HALF_EVEN only at declared points, residual-increment rules), `BalanceProjector`, `FiscalPeriodGuard`, leaf-partition commit trigger, total fixed lock order, `TieOutJob`. The **Foundation owns the dual-column (transaction + functional) schema natively** — `functional_amount` / `functional_currency` / `functional_currency_scale` on `journal_line` and the `functional_*` columns on the shared balance caches, plus the dual-column commit-trigger check and the relaxed `amount` CHECK for functional-only lines. **This feature populates them and owns** `rate_snapshot` + the `journal_line.rate_snapshot_ref` FK. Not restated.
 
 **Canonical slice numbering:** 1 posting-engine-core, 2 payments-allocation, 3 adjustments-notes-refunds, 4 asc606-recognition, **5 fx-multicurrency (this feature)**, 6 audit-immutability-observability, 7 reconciliation-export, 8 other. `FX_GAIN_LOSS` and `FX_UNREALIZED` (`account_class`) and `FX_REVALUATION | FX_REVAL_REVERSAL` (`source_doc_type` / idempotency `flow`) are **Foundation-declared**; this feature only **uses** them.
 
@@ -122,9 +122,10 @@ Design-introduced names (Slice 5):
 
 | Name | Meaning |
 |------|---------|
-| **Transaction (document) currency** | Currency of the invoice / payment / refund (`journal_line.amount_minor` / `currency`). |
-| **Functional currency** | Reporting currency of the **legal entity** (`journal_line.functional_amount_minor` / `functional_currency` at the locked rate). |
-| **Functional-only line** | A line with `amount_minor = 0` and `functional_amount_minor > 0` — used for `FX_GAIN_LOSS` and the functional residual plug; it participates **only** in the functional-balance check. |
+| **Transaction (document) currency** | Currency of the invoice / payment / refund (`journal_line.amount` / `currency` / `currency_scale`). |
+| **Functional currency** | Reporting currency of the **legal entity** (`journal_line.functional_amount` / `functional_currency` / `functional_currency_scale` at the locked rate). |
+| **Functional-only line** | A line with `amount = 0` and `functional_amount > 0` — used for `FX_GAIN_LOSS` and the functional residual plug; it participates **only** in the functional-balance check. |
+| **Rate** | A positive decimal in quote (functional) major units per base (transaction) major unit, kept with all its published digits (`0.047` is valid); never scaled to micro-units. |
 | `rate_snapshot` | Immutable record of a locked FX rate: `rate_id`, provider, base/quote, rate, `as_of`, `stale` flag, fallback order. |
 | `FX_GAIN_LOSS` / `FX_UNREALIZED` | Realized-FX class (sign-by-role) / unrealized-revaluation contra class (reverses next period). |
 
@@ -156,7 +157,7 @@ flowchart TB
         REVAL["UnrealizedRevaluationRun (optional)"]
         RS["RateSource (provider list + fallback + staleness)"]
     end
-    DB[("PostgreSQL<br/>+ rate_snapshot; journal_line functional cols; caches functional_balance_minor")]
+    DB[("PostgreSQL<br/>+ rate_snapshot; journal_line functional cols; caches functional_balance")]
     RS --> RL
     RL --> S1
     FXP2 --> S1
@@ -200,11 +201,11 @@ FX is mostly internal — it attaches to the existing posting flows of Slices 1�
 
 **Success Scenarios**:
 - An immutable rate snapshot is read by `rateId` (deterministic, auditor-reproducible: provider, `as_of`, `fallback_order`, `stale` flag, triangulation method where applicable)
-- Balances are read in functional valuation from the `functional_balance_minor` cache
+- Balances are read in functional valuation from the `functional_balance` cache
 
 **Steps**:
 1. [ ] - `p2` - API: GET /v1/ledger/fx/rate-snapshots/{rateId} — read the immutable snapshot (read-only reference) - `inst-fxinq-snapshot`
-2. [ ] - `p2` - API: GET /v1/ledger/balances?valuation=functional — cache read from `functional_balance_minor` - `inst-fxinq-balances`
+2. [ ] - `p2` - API: GET /v1/ledger/balances?valuation=functional — cache read from `functional_balance` (returned as `MoneyDto` with the functional currency and scale) - `inst-fxinq-balances`
 3. [ ] - `p2` - **RETURN** 200 (snapshot / functional balances) - `inst-fxinq-return`
 
 ## 3. Processes / Business Logic (CDSL)
@@ -214,15 +215,15 @@ FX is mostly internal — it attaches to the existing posting flows of Slices 1�
 - [ ] `p1` - **ID**: `cpt-cf-bss-ledger-algo-rate-snapshot`
 
 **Input**: a posting flow (S1/S2/S3/S5/S6) entry + the legal-entity functional currency
-**Output**: `rate_snapshot_ref` + `functional_amount_minor` stamped on every line at the locked rate
+**Output**: `rate_snapshot_ref` + `functional_amount` (with `functional_currency` / `functional_currency_scale`) stamped on every line at the locked rate
 
 **Steps**:
-1. [ ] - `p1` - `RateLocker` snapshots a rate and stamps `rate_snapshot_ref` + `functional_amount_minor` per the lock policy in effect; **no silent re-pick** at render/reconciliation without a new business event that re-locks (PRD). **One functional rate per entry** for the base translation - `inst-rl-lock`
+1. [ ] - `p1` - `RateLocker` snapshots a rate and stamps `rate_snapshot_ref` + `functional_amount` per the lock policy in effect; **no silent re-pick** at render/reconciliation without a new business event that re-locks (PRD). **One functional rate per entry** for the base translation - `inst-rl-lock`
 2. [ ] - `p1` - **S1 invoice post:** rate in effect at post - `inst-rl-s1`
 3. [ ] - `p1` - **S2 settlement / allocation:** lock on settle. On allocation that **closes** a position, **no new base rate is locked** — each closing account is relieved at its **own carried functional value** and the net difference posts to `FX_GAIN_LOSS` (→ realized FX, `cpt-cf-bss-ledger-algo-fx-realized-gain-loss`) - `inst-rl-s2`
 4. [ ] - `p1` - **S6 recognition:** does **NOT** re-lock — schedule currency = as posted (Slice 4); FX on recognition is a **translation**, not a new realized event, unless a documented catch-up posts a new JE - `inst-rl-s6`
 5. [ ] - `p1` - **Tax jurisdiction rate.** Tax is translated at the **entry** functional rate (one rate per entry). **IF** a jurisdiction mandates a different tax-FX rate, that difference routes to a **separate documented JE**, never mixed into one balanced entry at two rates - `inst-rl-tax`
-6. [ ] - `p1` - Functional translation uses the Slice 1 `MoneyModule` (banker's rounding; +4 compute decimals not retained) - `inst-rl-money`
+6. [ ] - `p1` - **Declared rounding point.** Functional translation is `translate_amount(source, rate, target)` (`domain/fx/translate.rs`): the exact product `amount × rate` (the rate keeps every published digit) rounded once, HALF_EVEN, at the functional currency's stored scale (`EUR 100.00 × 1.0875 → USD 108.75`; `JPY 1000 × 0.0091 → EUR 9.10`). No intermediate decimals exist to retain or truncate; a result outside the money bounds is a named error, never a truncated value - `inst-rl-money`
 
 ### Rate Source, Staleness and Fallback
 
@@ -249,12 +250,12 @@ FX is mostly internal — it attaches to the existing posting flows of Slices 1�
 **Output**: an entry that balances in **both** columns, enforced by the Foundation dual-column commit trigger
 
 **Steps**:
-1. [ ] - `p1` - Every entry MUST balance in **both** columns. The **Foundation's** leaf-partition commit trigger natively enforces **two** assertions (dual-column): (1) **Transaction balance** — `SUM(DR.amount_minor) = SUM(CR.amount_minor)` per `(currency, currency_scale)`, **over lines that carry a transaction amount** (`amount_minor > 0`), unchanged from Slice 1; (2) **Functional balance** — `SUM(DR.functional_amount_minor) = SUM(CR.functional_amount_minor)` exactly, **over all lines** (including functional-only lines) - `inst-dual-checks`
-2. [ ] - `p1` - **Functional-only lines** (`FX_GAIN_LOSS`, the functional residual plug) carry `amount_minor = 0` and `functional_amount_minor > 0`; they are excluded from check (1) and included in check (2). The **Foundation's** `amount_minor` CHECK is natively the relaxed form `CHECK (amount_minor > 0 OR (amount_minor = 0 AND functional_amount_minor > 0))` - `inst-dual-fonly`
-3. [ ] - `p1` - **Functional rounding residual.** Per-line translation (`amount_minor × rate`, banker's rounding) can leave a per-entry functional residual even when the transaction column is exact. A **single deterministic plug** carries it: the residual (|residual| ≤ lines − 1 minor units) attaches to the entry's **anchor line** (AR for AR-anchored entries) or to a single capped `FX_GAIN_LOSS`/rounding line, so check (2) closes **by construction** rather than failing. (This is the FX extension of Slice 1 `MoneyModule` residual-cent determinism.) - `inst-dual-residual`
+1. [ ] - `p1` - Every entry MUST balance in **both** columns. The **Foundation's** leaf-partition commit trigger natively enforces **two** assertions (dual-column): (1) **Transaction balance** — `SUM(DR.amount) = SUM(CR.amount)` (as exact `numeric` over canonical text) per `(currency, currency_scale)`, **over lines that carry a transaction amount** (`amount > 0`), unchanged from Slice 1; (2) **Functional balance** — `SUM(DR.functional_amount) = SUM(CR.functional_amount)` exactly, **over all lines** (including functional-only lines) - `inst-dual-checks`
+2. [ ] - `p1` - **Functional-only lines** (`FX_GAIN_LOSS`, the functional residual plug) carry `amount = 0` and `functional_amount > 0`; they are excluded from check (1) and included in check (2). The **Foundation's** `amount` CHECK is natively the relaxed form `CHECK (amount > 0 OR (amount = 0 AND functional_amount IS NOT NULL))` - `inst-dual-fonly`
+3. [ ] - `p1` - **Functional rounding residual.** Per-line translation (exact `amount × rate`, one HALF_EVEN rounding at the functional scale) can leave a per-entry functional residual even when the transaction column is exact. A **single deterministic plug** carries it (`translate_entry`, `domain/fx/translate.rs`): the exact residual (|residual| ≤ lines − 1 posting increments of the functional currency) is computed in exact arithmetic and attached to the entry's **anchor line** (AR for AR-anchored entries) or to a single capped `FX_GAIN_LOSS`/rounding line, so check (2) closes **by construction** rather than failing; a residual that would drive the anchor non-positive is a named error. (This is the FX extension of the Foundation's residual-increment determinism.) - `inst-dual-residual`
 4. [ ] - `p1` - The Slice 1 "exact, no tolerance **at commit**" rule holds on both columns. Rounding-only variance on the functional column is absorbed into the inherited daily `TieOutJob` tolerance (extended to the functional column); **FX-consistency-vs-external-rate** variance is a separate Slice 7 reconciliation control - `inst-dual-tieout`
-5. [ ] - `p1` - **Reversal of functional-only lines.** Strict line-negation ("same account, flipped side, positive amount") is extended for the relaxed CHECK: a functional-only line (`amount_minor = 0`, `functional_amount_minor > 0`) reverses as a functional-only line with the **side flipped, `amount_minor` still 0, and the same positive `functional_amount_minor`** (carrying the original `rate_snapshot_ref` — no re-lock). Both commit checks hold by construction: the reversal's transaction-column groups mirror the original's, and its functional column nets the original's - `inst-dual-reversal`
-6. [ ] - `p1` - `BalanceProjector` maintains `functional_balance_minor` + `functional_currency` on the shared caches in the same transaction, locking the **same rows** in the canonical order (**no new lock-order rank**) - `inst-dual-projector`
+5. [ ] - `p1` - **Reversal of functional-only lines.** Strict line-negation ("same account, flipped side, positive amount") is extended for the relaxed CHECK: a functional-only line (`amount = 0`, `functional_amount > 0`) reverses as a functional-only line with the **side flipped, `amount` still 0, and the same positive `functional_amount`** at the stored functional currency and scale (carrying the original `rate_snapshot_ref` — no re-lock, no re-translation). Both commit checks hold by construction: the reversal's transaction-column groups mirror the original's, and its functional column nets the original's - `inst-dual-reversal`
+6. [ ] - `p1` - `BalanceProjector` maintains `functional_balance` + `functional_currency` + `functional_currency_scale` on the shared caches in the same transaction, locking the **same rows** in the canonical order (**no new lock-order rank**) - `inst-dual-projector`
 
 ### Realized FX Gain/Loss
 
@@ -266,7 +267,7 @@ FX is mostly internal — it attaches to the existing posting flows of Slices 1�
 **Steps**:
 1. [ ] - `p1` - **Realized FX MUST post** on receipt, settlement, allocation, refund, or chargeback when the document and functional currency differ (PRD). **Normative rule:** realized FX closes the **functional** balance of **every** account whose **transaction** balance reaches zero on the close, each valued at **that account's own carried (locked) functional value**; the **net** difference posts to a single `FX_GAIN_LOSS` functional-only line so the functional column balances - `inst-rfx-rule`
 2. [ ] - `p1` - **IF** a **partial** close (e.g. allocate 60 of 120 EUR): compute realized FX **pro-rata on the closed portion** (the relieved fraction valued at its carried rate vs the closing value); a full close is the special case where the whole position is relieved - `inst-rfx-partial`
-3. [ ] - `p1` - **Carried-value source, normative:** read the carried functional value of a position from its balance-cache grain — per-invoice AR from `ar_invoice_balance`; the Unallocated pool from `unallocated_balance`; the wallet sub-grain from `reusable_credit_subbalance` (Slice 2) — each carrying `functional_balance_minor`. Value a partial relief **pro-rata at the grain's weighted-average carried rate** (`functional_balance_minor / balance_minor` at relief time, banker's rounding via `MoneyModule`); decrement the relieved functional amount from the grain in the same transaction - `inst-rfx-carried`
+3. [ ] - `p1` - **Carried-value source, normative:** read the carried functional value of a position from its balance-cache grain — per-invoice AR from `ar_invoice_balance`; the Unallocated pool from `unallocated_balance`; the wallet sub-grain from `reusable_credit_subbalance` (Slice 2) — each carrying `functional_balance`. Value a partial relief **pro-rata at the grain's weighted-average carried rate**: **declared rounding point** `carried_functional × relieved ÷ carried_transaction`, an exact ratio rounded once HALF_EVEN at the functional scale (`domain/fx/realized.rs::carried_relief`; a full close returns the carried functional unchanged; an AR grain with no functional balance uses its transaction balance as functional); decrement the relieved functional amount from the grain in the same transaction - `inst-rfx-carried`
 4. [ ] - `p1` - **(/ S5-minor) Lot-relief is an accounting policy, ratified deliberately:** **weighted-average (WAC)** is chosen over **FIFO** / **specific-lot** because it is **deterministic** from the cache grain (no per-lot tracking, no `journal_line` rescan). This is a conscious accounting-policy choice — to be confirmed acceptable to the target jurisdictions/auditors — **not** an implementation detail; switching method would change reported gain/loss. Rescanning `journal_line` per allocation and any cross-grain (e.g. cross-payer) averaging are **forbidden** — they produce a different gain/loss - `inst-rfx-wac`
 5. [ ] - `p1` - Chargeback Lost/Won/Partial closes (Slice 2 ChargebackHandler) invoke `RealizedFxPoster` identically to allocation when document ≠ functional currency - `inst-rfx-chargeback`
 6. [ ] - `p1` - The realized-FX line is part of the **same atomic entry** as the originating close (no separate dedup; governed by the originating flow's idempotency key) - `inst-rfx-atomic`
@@ -279,7 +280,7 @@ S1 (post) at 1.10:   DR AR 120 EUR (=132.00 USD); CR Revenue 100 EUR (=110.00 US
                      (This is also Example B's two-step structure extended with per-step FX locks.)
 S2 settle at 1.08:   DR Cash 120 EUR (=129.60 USD) / CR Unallocated 120 EUR (=129.60 USD).
                      Unallocated carried at 129.60 USD
-                     (unallocated_balance.functional_balance_minor for the grain).
+                     (unallocated_balance.functional_balance for the grain).
 S2 allocate:         transaction legs DR Unallocated 120 EUR / CR AR 120 EUR (balanced in EUR).
                      Each account is relieved at ITS OWN carried functional value, read from its
                      cache grain: DR Unallocated 129.60 USD (closes Unallocated to 0),
@@ -304,8 +305,8 @@ The original PRD Example C was illustrative and booked only the AR-leg 3.60 (omi
 **Steps**:
 1. [ ] - `p1` - **Default-on for Mode B** tenants (BSS = ledger of record) with open multi-currency AR; **off for Mode A**, where the ERP GL revalues (F2, — ASC 830/IAS 21 requires period-end remeasurement in whatever ledger produces the reporting balances) - `inst-ureval-mode`
 2. [ ] - `p1` - When active, revalue **all foreign-currency monetary positions** at the period-end rate into a dedicated entry `DR/CR FX_UNREALIZED` (a contra class, sign-by-role) vs each position's functional balance — **never** a silent recompute of S1 - `inst-ureval-post`
-3. [ ] - `p1` - **(🔄)** `revaluation_scope` enumerates the covered grains **`{AR, UNALLOCATED, REUSABLE_CREDIT}`** — open AR **and** the Slice 2 monetary caches `unallocated_balance` + `reusable_credit_subbalance` (both carry `functional_balance_minor`; both are monetary — owed back to / held for the customer), so a foreign-currency prepayment or wallet held across a period boundary is remeasured too (ASC 830 / IAS 21 remeasures **all** monetary items). **`CONTRACT_LIABILITY` is deliberately excluded** — it is **non-monetary** (a deferred performance obligation), which ASC 830/IAS 21 does not remeasure - `inst-ureval-scope`
-4. [ ] - `p1` - Compose the revaluation entry of **functional-only** lines (`amount_minor = 0`): it adjusts the functional column only and passes transaction-balance check (1) trivially (zero in-scope lines) - `inst-ureval-fonly`
+3. [ ] - `p1` - **(🔄)** `revaluation_scope` enumerates the covered grains **`{AR, UNALLOCATED, REUSABLE_CREDIT}`** — open AR **and** the Slice 2 monetary caches `unallocated_balance` + `reusable_credit_subbalance` (both carry `functional_balance`; both are monetary — owed back to / held for the customer), so a foreign-currency prepayment or wallet held across a period boundary is remeasured too (ASC 830 / IAS 21 remeasures **all** monetary items). **`CONTRACT_LIABILITY` is deliberately excluded** — it is **non-monetary** (a deferred performance obligation), which ASC 830/IAS 21 does not remeasure - `inst-ureval-scope`
+4. [ ] - `p1` - Compose the revaluation entry of **functional-only** lines (`amount = 0`): it adjusts the functional column only and passes transaction-balance check (1) trivially (zero in-scope lines) - `inst-ureval-fonly`
 5. [ ] - `p1` - **Idempotency** per `(tenant, period_id, revaluation_scope)` (the `runId` is a retry token **within** that key, not the dedup key); `flow = FX_REVALUATION`, `business_id = period_id:scope` - `inst-ureval-idem`
 6. [ ] - `p1` - **Reversal** is **not** a strict line-negation: it is a fresh **first-of-next-period** JE with its own `source_doc_type = FX_REVAL_REVERSAL`, posting in the next **OPEN** period, **idempotent per `(tenant, FX_REVAL_REVERSAL, period_id:scope)`** of the original revaluation period (mirroring the run key) — so it is exempt from the once-per-entry and closed-period constraints and posts cleanly (at most once) after close. Only **realized** FX is permanent - `inst-ureval-reversal`
 
@@ -340,13 +341,13 @@ FX is mostly internal (attached to existing posts). New surfaces:
 |--------|------|---------|-------------|
 | `POST` | `/v1/ledger/fx/revaluation-runs` | Trigger an optional unrealized revaluation for a period. | per `(tenant, period_id, revaluation_scope)`; `runId` is a retry token |
 | `GET` | `/v1/ledger/fx/rate-snapshots/{rateId}` | Read an immutable rate snapshot. | — |
-| `GET` | `/v1/ledger/balances?valuation=functional` | Read balances in functional currency (from `functional_balance_minor` cache). | cache read |
+| `GET` | `/v1/ledger/balances?valuation=functional` | Read balances in functional currency (from the `functional_balance` cache, as `MoneyDto`). | cache read |
 
 **Problem responses (RFC 9457):** `FX_RATE_UNAVAILABLE` (409 — all providers unreachable, no allowed stale fallback), `FX_RATE_STALE_NOT_ALLOWED` (422 — stale rate where tenant forbids fallback). Posting flows otherwise return their own slice's codes; an FX line is part of the same entry.
 
 ## 6. Data Model
 
-This feature owns **`rate_snapshot`** and the `journal_line.rate_snapshot_ref` FK; it **populates** the Foundation-owned functional columns (`functional_amount_minor`/`functional_currency` on `journal_line`, `functional_*` on the caches) and posts the Foundation-declared `FX_GAIN_LOSS`/`FX_UNREALIZED` classes. Tenant-scoped RLS (C1).
+This feature owns **`rate_snapshot`** and the `journal_line.rate_snapshot_ref` FK; it **populates** the Foundation-owned functional columns (`functional_amount`/`functional_currency`/`functional_currency_scale` on `journal_line`, `functional_*` on the caches) and posts the Foundation-declared `FX_GAIN_LOSS`/`FX_UNREALIZED` classes. Tenant-scoped RLS (C1).
 
 **`rate_snapshot`** (PK `rate_id`; `UNIQUE (tenant_id, base_currency, quote_currency, provider, as_of, fallback_order)`; **immutable**):
 
@@ -355,8 +356,10 @@ This feature owns **`rate_snapshot`** and the `journal_line.rate_snapshot_ref` F
 | `rate_id` | `uuid` | PK |
 | `tenant_id` | `uuid` | RLS scope |
 | `base_currency` | `char` | |
+| `base_currency_scale` | `smallint` | stored scale of the base (transaction) currency at lock time |
 | `quote_currency` | `char` | |
-| `rate_micro` | `bigint` | rate at fixed precision |
+| `quote_currency_scale` | `smallint` | stored scale of the quote (functional) currency at lock time |
+| `rate` | `text` (canonical decimal) | quote major units per base major unit, every published digit kept (`CHECK rate > 0`); previously an integer micro-rate |
 | `as_of` | `timestamptz` | rate timestamp; drives staleness |
 | `provider` | `string` | chosen provider (F1 list) |
 | `stale` | `bool` | `true` only for tenant-allowed last-good fallback |
@@ -366,28 +369,28 @@ This feature owns **`rate_snapshot`** and the `journal_line.rate_snapshot_ref` F
 
 | Column | Type | Notes |
 |--------|------|-------|
-| `amount_minor` | `bigint` | transaction; 0 for functional-only lines |
-| `currency` | `char` | transaction (document) currency |
-| `functional_amount_minor` | `bigint` | **ACTIVATED** by this feature (Foundation-owned column) |
-| `functional_currency` | `char` | **ADDED** (Foundation-owned column) |
+| `amount` | `text` (canonical decimal, major units) | transaction; `0` for functional-only lines |
+| `currency` / `currency_scale` | `char` / `smallint` | transaction (document) currency and stored scale |
+| `functional_amount` | `text` (canonical decimal, major units) | **ACTIVATED** by this feature (Foundation-owned column) |
+| `functional_currency` / `functional_currency_scale` | `char` / `smallint` | **ADDED** (Foundation-owned columns); all three functional columns are NULL together or set together |
 | `rate_snapshot_ref` | `uuid` | **ADDED by this feature**, FK `rate_snapshot` |
 
 **Balance-cache FX columns** (Slice 1/2 cache rows — `account_balance`, `ar_invoice_balance`, `ar_payer_balance`, `unallocated_balance`, `reusable_credit_subbalance`):
 
 | Column | Type | Notes |
 |--------|------|-------|
-| `balance_minor` | `bigint` | transaction (Slice 1/2) |
-| `functional_balance_minor` | `bigint` | **ADDED** (Foundation-owned) — each position cache grain carries its own **carried functional value**; realized FX reads it from the grain — never by rescanning `journal_line`, never by a cross-payer average |
-| `functional_currency` | `char` | **ADDED** (Foundation-owned) |
+| `balance` | `text` (canonical decimal, major units) | transaction (Slice 1/2) |
+| `functional_balance` | `text` (canonical decimal, major units) | **ADDED** (Foundation-owned) — each position cache grain carries its own **carried functional value**; realized FX reads it from the grain — never by rescanning `journal_line`, never by a cross-payer average |
+| `functional_currency` / `functional_currency_scale` | `char` / `smallint` | **ADDED** (Foundation-owned) |
 
 Key constraints:
 
 - `rate_snapshot` **immutability enforced** like Slice 1: `REVOKE UPDATE, DELETE … FROM <app_role>` + `BEFORE UPDATE/DELETE` trigger that RAISEs (a revision can only INSERT a new row). A stale fallback reuses the original rate `as_of` (staleness measured from `as_of`).
-- **The Foundation commit trigger (dual-column, native, on every leaf partition):** check (1) transaction balance per `(currency, currency_scale)` over `amount_minor > 0` lines; check (2) functional balance over all lines; both exact (no commit tolerance).
-- `journal_line` `CHECK` relaxed: `amount_minor > 0 OR (amount_minor = 0 AND functional_amount_minor > 0)` (permits functional-only FX/residual lines).
-- `functional_balance_minor` + `functional_currency` are **Foundation-owned columns** on the shared caches; maintained by `BalanceProjector` in the same txn (same rows → **no new lock-order rank**); `TieOutJob` recomputes the functional column from `journal_line.functional_amount_minor`. Realized FX relieves a position grain pro-rata at its **weighted-average carried rate**. **(/ S5-minor) Grain caveat:** these functional columns sit on a cache grain **without `legal_entity_id`** — correct only under the v1 default of **one legal entity per tenant**. A multi-legal-entity tenant would mix two functional currencies in one cache row; **`legal_entity_id` MUST enter the functional cache grain** before multi-legal-entity is enabled.
+- **The Foundation commit trigger (dual-column, native, on every leaf partition):** check (1) transaction balance per `(currency, currency_scale)` over `amount > 0` lines; check (2) functional balance over all lines; both exact (`numeric` over canonical text, no commit tolerance).
+- `journal_line` `CHECK` relaxed: `amount > 0 OR (amount = 0 AND functional_amount IS NOT NULL)` (permits functional-only FX/residual lines).
+- `functional_balance` + `functional_currency` + `functional_currency_scale` are **Foundation-owned columns** on the shared caches; maintained by `BalanceProjector` in the same txn (same rows → **no new lock-order rank**); `TieOutJob` recomputes the functional column from `journal_line.functional_amount` with exact sums. Realized FX relieves a position grain pro-rata at its **weighted-average carried rate**. **(/ S5-minor) Grain caveat:** these functional columns sit on a cache grain **without `legal_entity_id`** — correct only under the v1 default of **one legal entity per tenant**. A multi-legal-entity tenant would mix two functional currencies in one cache row; **`legal_entity_id` MUST enter the functional cache grain** before multi-legal-entity is enabled.
 - `FX_GAIN_LOSS` (sign-by-role, not NO-negative) and `FX_UNREALIZED` (contra, reverses next period) are **Foundation-declared** `account_class` literals; `FX_REVALUATION | FX_REVAL_REVERSAL` are **Foundation-declared** `source_doc_type`/`flow` values. Revaluation `business_id = period_id:scope`.
-- Functional translation uses the Slice 1 `MoneyModule` (banker's rounding; +4 compute decimals not retained); the per-entry functional residual is a single deterministic plug line.
+- Functional translation is the exact product `amount × rate` rounded once, HALF_EVEN, at the functional scale (`translate_amount`); the per-entry functional residual is a single deterministic plug line computed in exact arithmetic. These are the only rounding points of this slice.
 - **Tax payable MAY go negative** per `(jurisdiction, filing-period)` (Slice 3 sub-grain guard); tax posted in transaction currency per `TaxBreakdown`, translated at the entry rate.
 
 ## 7. Events & Alarms
@@ -400,14 +403,14 @@ Success FX is part of the originating flow's outbox event (no separate event for
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-ledger-dod-fx-functional-translation`
 
-The system **MUST** stamp every journal line of every posting flow (S1/S2/S3/S5/S6) with `functional_amount_minor`, `functional_currency`, and `rate_snapshot_ref` at the locked rate, balance every entry in both columns via the Foundation dual-column commit trigger, carry the per-entry functional rounding residual on a single deterministic plug line, and reverse functional-only lines side-flipped with the original `rate_snapshot_ref`.
+The system **MUST** stamp every journal line of every posting flow (S1/S2/S3/S5/S6) with `functional_amount`, `functional_currency`, `functional_currency_scale` and `rate_snapshot_ref` at the locked rate, balance every entry in both columns via the Foundation dual-column commit trigger, carry the per-entry functional rounding residual on a single deterministic plug line, and reverse functional-only lines side-flipped with the original `rate_snapshot_ref`.
 
 **Implements**:
 - `cpt-cf-bss-ledger-algo-fx-dual-currency-balance`
 - `cpt-cf-bss-ledger-algo-rate-snapshot`
 
 **Touches**:
-- DB: `journal_line` (functional columns + `rate_snapshot_ref`), `account_balance`/`ar_invoice_balance`/`ar_payer_balance`/`unallocated_balance`/`reusable_credit_subbalance` (`functional_balance_minor`)
+- DB: `journal_line` (functional columns + `rate_snapshot_ref`), `account_balance`/`ar_invoice_balance`/`ar_payer_balance`/`unallocated_balance`/`reusable_credit_subbalance` (`functional_balance`)
 - Entities: `JournalLine`, `RateSnapshot`
 
 ### Rate Snapshot Store and Lock Points
@@ -511,7 +514,7 @@ The system **MUST** run the Mode-B period-end revaluation over the monetary grai
 
 - [ ] `p2` - **ID**: `cpt-cf-bss-ledger-dod-fx-inquiry`
 
-The system **MUST** expose the immutable rate-snapshot read and the functional-valuation balance read (from the `functional_balance_minor` cache).
+The system **MUST** expose the immutable rate-snapshot read (the `rate` as a decimal string) and the functional-valuation balance read (from the `functional_balance` cache, as `MoneyDto`).
 
 **Implements**:
 - `cpt-cf-bss-ledger-flow-fx-inquiry`
@@ -532,7 +535,7 @@ Unit:
 Integration (testcontainers):
 
 - [ ] An EUR invoice under USD functional posts a balanced entry in **both** columns (the Foundation's dual-column commit trigger)
-- [ ] A functional-only `FX_GAIN_LOSS` line passes the relaxed `amount_minor` CHECK and balances the functional column
+- [ ] A functional-only `FX_GAIN_LOSS` line passes the relaxed `amount` CHECK and balances the functional column; EUR ↔ JPY translation rounds once at the target scale (`0` for JPY, `2` for EUR) and never at the rate
 - [ ] A full cross-currency settle→allocate closes **both** AR and Unallocated functional balances to **zero** with a 2.40 FX line
 - [ ] Provider-unreachable at S1 **blocks** (`FX_RATE_UNAVAILABLE`) unless tenant allows a `stale=true` snapshot; secondary-provider live rate does **not** block (stale=false)
 - [ ] A later provider rate revision does **not** alter a prior posting; `rate_snapshot` UPDATE/DELETE rejected
@@ -557,8 +560,8 @@ NFR verification:
 
 - **Performance / NFR mapping**: Inherits Slice 1 targets (e.g. write p95 ≤ 500 ms — the Foundation NFR mapping). Slice-5-specific: missing FX snapshot **blocks** the post (Critical); stale-allowed is Warn; stale-not-allowed blocks (422) (AC #18). FX adds at most one functional-only line per entry → negligible latency impact on the inherited write-p95 target. Traces to `cpt-cf-bss-ledger-nfr-posting-performance`.
 - **Security & AuthZ**: Inherits Slice 1: RLS, append-only, PII-minimized events. Triggering revaluation runs requires the finance scope; rate snapshots are read-only references. The ledger trusts the provider feed's authenticity (provider auth is upstream/ops).
-- **Observability / Feature metrics**: `ledger_fx_realized_minor{functional_currency}`, `ledger_fx_snapshot_missing_total`, `ledger_fx_snapshot_stale_allowed_total`, `ledger_fx_snapshot_stale_blocked_total`, `ledger_fx_revaluation_duration_seconds` (— aligned with the `revaluation_completed` event rename), `ledger_fx_provider_fallback_total{provider}`, `ledger_fx_rate_sync_ticks_total` (the sync-job liveness heartbeat — alerted on absence of ticks, never on errors), `ledger_fx_rate_sync_duration_seconds` (whole-pass latency, alerted against the configured tick interval — see the `FxRateSyncStalled` / `FxRateSyncNeverRan` / `FxRateSyncOverrunning` definitions under the rate-source DoD in §8). Thresholds wire to the NFR mapping + the snapshot alarms.
-- **Risks & deferred work**: **FX provider** — **ratified 2026-06-10: ECB primary, PSP/bank feed fallback**; the snapshot/lock/realized-FX mechanics are stable. The **Foundation's dual-column commit trigger** (functional balance, two checks) + the relaxed `amount_minor` CHECK are Foundation-owned (native, on every leaf partition); this feature posts functional-only lines that exercise them; covered by integration tests. **Deferred:** FX consistency reconciliation vs external rates + ERP FX export → Slice 7; pricing-side FX/rate-lock → Catalog; cross-currency conversion event → deferred post-MVP.
+- **Observability / Feature metrics**: `ledger_fx_realized_total{functional_currency, direction}` (a count of realized postings, no monetary magnitude), `ledger_fx_snapshot_missing_total`, `ledger_fx_snapshot_stale_allowed_total`, `ledger_fx_snapshot_stale_blocked_total`, `ledger_fx_revaluation_duration_seconds` (— aligned with the `revaluation_completed` event rename), `ledger_fx_provider_fallback_total{provider}`, `ledger_fx_rate_sync_ticks_total` (the sync-job liveness heartbeat — alerted on absence of ticks, never on errors), `ledger_fx_rate_sync_duration_seconds` (whole-pass latency, alerted against the configured tick interval — see the `FxRateSyncStalled` / `FxRateSyncNeverRan` / `FxRateSyncOverrunning` definitions under the rate-source DoD in §8). Thresholds wire to the NFR mapping + the snapshot alarms.
+- **Risks & deferred work**: **FX provider** — **ratified 2026-06-10: ECB primary, PSP/bank feed fallback**; the snapshot/lock/realized-FX mechanics are stable. The **Foundation's dual-column commit trigger** (functional balance, two checks) + the relaxed `amount` CHECK are Foundation-owned (native, on every leaf partition); this feature posts functional-only lines that exercise them; covered by integration tests. **Deferred:** FX consistency reconciliation vs external rates + ERP FX export → Slice 7; pricing-side FX/rate-lock → Catalog; cross-currency conversion event → deferred post-MVP.
 - **Needs discussion** (inherits Slices 1–4 open items; slice-specific):
 
 | Item | Decision (default) | Status | Owner |

@@ -12,6 +12,7 @@ use gts::GtsIdPattern;
 use serde::ser::SerializeSeq;
 use serde::{Deserialize, Deserializer, Serializer};
 
+/// Serializes a list of GTS id patterns as a sequence of their raw pattern strings.
 pub(crate) fn serialize<S>(patterns: &[GtsIdPattern], serializer: S) -> Result<S::Ok, S::Error>
 where
     S: Serializer,
@@ -23,6 +24,7 @@ where
     seq.end()
 }
 
+/// Deserializes a sequence of strings into GTS id patterns, failing on the first invalid pattern.
 pub(crate) fn deserialize<'de, D>(deserializer: D) -> Result<Vec<GtsIdPattern>, D::Error>
 where
     D: Deserializer<'de>,

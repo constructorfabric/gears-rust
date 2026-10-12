@@ -22,8 +22,10 @@
 //! [`DomainError::Validation`]; it does not restate the mapping.
 
 use crate::field;
+use toolkit_macros::domain_model;
 
 /// A failure raised inside the gear.
+#[domain_model]
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum DomainError {

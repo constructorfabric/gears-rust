@@ -1,7 +1,5 @@
-//! In-memory storage backend — a real backend *type* for tests and ephemeral
-//! deployments. Content lives in a `Mutex<HashMap>` keyed by path.
-//!
-//! P2-M3: implements multipart upload natively (`multipart_native: true`).
+//! In-memory (non-durable) storage backend for tests and ephemeral deployments, with native
+//! multipart upload.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
@@ -11,6 +9,8 @@ use bytes::Bytes;
 use futures::StreamExt;
 use futures::stream::BoxStream;
 use uuid::Uuid;
+
+use file_storage_sdk::ByteRange;
 
 use crate::domain::error::DomainError;
 use crate::infra::content::hash;
@@ -27,7 +27,7 @@ type MultipartMap = HashMap<String, (String, BTreeMap<u32, Bytes>)>;
 pub struct InMemoryBackend {
     id: String,
     blobs: Mutex<HashMap<String, Bytes>>,
-    /// In-progress multipart state: handle → (path, parts in order)
+    /// In-progress multipart state: handle -> (path, parts in order).
     multipart: Mutex<MultipartMap>,
 }
 
@@ -63,11 +63,8 @@ impl StorageBackend for InMemoryBackend {
     fn capabilities(&self) -> BackendCapabilities {
         BackendCapabilities {
             multipart_native: true,
-            range_native: false,
-            // Intentionally left on the `BackendCapabilities::default()`
-            // value of `false`: content lives only in process memory and is
-            // lost on restart/crash, so `migrate_backend` must treat this as
-            // non-durable.
+            range_native: true,
+            // `durable` stays `false`: content is lost on restart.
             ..BackendCapabilities::default()
         }
     }
@@ -77,11 +74,7 @@ impl StorageBackend for InMemoryBackend {
         Ok(())
     }
 
-    /// Collecting into a `Bytes` buffer is acceptable here: this backend is
-    /// explicitly non-durable, in-process storage for tests/dev deployments,
-    /// not a memory-DoS surface worth hardening. The override exists so the
-    /// shared backend contract tests (`local_fs_put_stream_*` and friends)
-    /// can run identically against every backend, not just `LocalFsBackend`.
+    /// Buffers the stream: acceptable for non-durable test/dev storage.
     async fn put_stream(
         &self,
         path: &str,
@@ -109,17 +102,30 @@ impl StorageBackend for InMemoryBackend {
             .ok_or_else(|| DomainError::backend(&self.id, format!("blob not found: {path}")))
     }
 
-    /// Yields the stored `Bytes` as a single chunk: this backend is
-    /// explicitly non-durable, in-process storage for tests/dev deployments,
-    /// not a memory-DoS surface worth hardening — the override exists so the
-    /// shared backend contract tests can run identically against every
-    /// backend, not just `LocalFsBackend`/`S3Backend`.
+    /// Yields the stored `Bytes` as a single chunk.
     async fn get_stream(
         &self,
         path: &str,
     ) -> Result<BoxStream<'_, std::io::Result<Bytes>>, DomainError> {
         let bytes = self.get(path).await?;
         Ok(Box::pin(futures::stream::once(async move { Ok(bytes) })))
+    }
+
+    async fn get_range(&self, path: &str, range: ByteRange) -> Result<Bytes, DomainError> {
+        let full = self.get(path).await?;
+        let total = full.len() as u64;
+        match range.resolve(total) {
+            Some((start, end)) => {
+                let s = usize::try_from(start).unwrap_or(usize::MAX);
+                let e = usize::try_from(end).unwrap_or(usize::MAX);
+                Ok(full.slice(s..=e.min(full.len().saturating_sub(1))))
+            }
+            None => Err(DomainError::validation("range", "unsatisfiable byte range")),
+        }
+    }
+
+    async fn size(&self, path: &str) -> Result<u64, DomainError> {
+        Ok(self.get(path).await?.len() as u64)
     }
 
     async fn delete(&self, path: &str) -> Result<(), DomainError> {
@@ -146,9 +152,7 @@ impl StorageBackend for InMemoryBackend {
         _part_offset: u64,
         data: Bytes,
     ) -> Result<(String, Vec<u8>), DomainError> {
-        // @cpt-begin:cpt-cf-file-storage-flow-multipart-upload-part:p1:inst-part-hash
         let hash_bytes = hash::sha256(&data);
-        // @cpt-end:cpt-cf-file-storage-flow-multipart-upload-part:p1:inst-part-hash
         let etag = hex::encode(&hash_bytes);
 
         let mut mp = self.lock_multipart()?;
@@ -177,12 +181,8 @@ impl StorageBackend for InMemoryBackend {
                 )
             })?
         };
-        // Assemble parts in ascending part_number order (BTreeMap iterates
-        // sorted) into the blob store so `get` returns the whole object. The
-        // stored **hash** is no longer derived from these assembled bytes —
-        // per ADR-0006 mode 2 it is the offset-manifest root built from the
-        // per-part digests the caller already collected, so completing a
-        // multipart upload never rehashes the assembled object.
+        // Assemble in ascending part_number order (BTreeMap). The hash is the manifest root
+        // built from the caller's per-part digests, not rehashed from these bytes.
         let mut assembled = Vec::new();
         for (_, part_data) in parts_map {
             assembled.extend_from_slice(&part_data);
@@ -190,7 +190,6 @@ impl StorageBackend for InMemoryBackend {
         self.lock_blobs()?
             .insert(final_path, Bytes::from(assembled));
 
-        // @cpt-cf-file-storage-algo-content-hash-modes-build-manifest
         build_manifest_and_root(parts)
     }
 
@@ -199,9 +198,6 @@ impl StorageBackend for InMemoryBackend {
         Ok(())
     }
 
-    /// Returns all blob paths currently in the store.
-    ///
-    /// @cpt-cf-file-storage-fr-orphan-reconciliation
     async fn list_paths(&self) -> Result<Vec<String>, DomainError> {
         let paths = self.lock_blobs()?.keys().cloned().collect();
         Ok(paths)

@@ -49,7 +49,6 @@ use axum::http::{Request, StatusCode, header};
 use bss_ledger::api::rest::payments::{ApiState, router};
 use bss_ledger::domain::instant::to_naive_date;
 use bss_ledger::domain::model::{AccountRow, CurrencyScaleRow, NewEntry, NewLine};
-use bss_ledger::domain::money::DEFAULT_PLAUSIBLE_MAX_MAJOR;
 use bss_ledger::domain::payment::precedence::DEFAULT_PRECEDENCE_POLICY;
 use bss_ledger::domain::payment::settlement::SettlementInput;
 use bss_ledger::domain::ports::metrics::NoopLedgerMetrics;
@@ -82,6 +81,29 @@ use toolkit_gts::gts_id;
 use toolkit_security::{PlatformSecurityContext, SecurityContext};
 use tower::ServiceExt;
 use uuid::Uuid;
+
+/// A USD scale-2 posting from a cent count (`1234` ⇒ `12.34`).
+fn usd_cents(minor: i64) -> bss_ledger_sdk::PostedMoney {
+    bss_ledger_sdk::PostedMoney::try_new(
+        rust_decimal::Decimal::new(minor, 2),
+        bss_ledger_sdk::CurrencySpec::try_new("USD".to_owned(), 2).unwrap(),
+    )
+    .unwrap()
+}
+
+/// The wire form of a scale-2 cent count in `currency`.
+fn money_json(minor: i64, currency: &str) -> serde_json::Value {
+    serde_json::json!({
+        "amount": bss_ledger_sdk::canonical_decimal(rust_decimal::Decimal::new(minor, 2)),
+        "currency": currency,
+        "currency_scale": 2
+    })
+}
+
+/// The wire form of a USD scale-2 cent count.
+fn usd_json(minor: i64) -> serde_json::Value {
+    money_json(minor, "USD")
+}
 
 fn pg(sql: impl Into<String>) -> Statement {
     Statement::from_string(sea_orm::DatabaseBackend::Postgres, sql.into())
@@ -142,13 +164,13 @@ impl LedgerClientV1 for RealPaymentClient {
         req: SettlePayment,
     ) -> Result<PostingRef, CanonicalError> {
         let scope = AccessScope::for_tenant(req.tenant_id);
+        let (gross, fee) = req.amounts.into_parts();
         let input = SettlementInput {
             tenant_id: req.tenant_id,
             payer_tenant_id: req.payer_tenant_id,
             payment_id: req.payment_id,
-            gross_minor: req.gross_minor,
-            fee_minor: req.fee_minor,
-            currency: req.currency,
+            gross,
+            fee,
             effective_at: req.effective_at,
         };
         self.settle_svc()
@@ -168,8 +190,7 @@ impl LedgerClientV1 for RealPaymentClient {
             payer_tenant_id: req.payer_tenant_id,
             payment_id: req.payment_id,
             psp_return_id: req.psp_return_id,
-            amount_minor: req.amount_minor,
-            currency: req.currency,
+            amount: req.money,
             effective_at: req.effective_at,
         };
         self.return_svc()
@@ -192,13 +213,12 @@ impl LedgerClientV1 for RealPaymentClient {
         req: AllocatePayment,
     ) -> Result<AllocateOutcome, CanonicalError> {
         let scope = AccessScope::for_tenant(req.tenant_id);
-        let currency = req.currency.clone();
         let caller_splits = req.splits.map(|splits| {
             splits
                 .into_iter()
                 .map(|s| bss_ledger::domain::payment::precedence::Allocated {
                     invoice_id: s.invoice_id,
-                    amount_minor: s.amount_minor,
+                    amount: s.money,
                 })
                 .collect()
         });
@@ -207,8 +227,7 @@ impl LedgerClientV1 for RealPaymentClient {
             payer_tenant_id: req.payer_tenant_id,
             payment_id: req.payment_id,
             allocation_id: req.allocation_id,
-            lump_minor: req.lump_minor,
-            currency: req.currency,
+            lump: req.lump,
             hint_invoice_id: req.hint_invoice_id,
             caller_splits,
         };
@@ -230,8 +249,7 @@ impl LedgerClientV1 for RealPaymentClient {
                     .into_iter()
                     .map(|s| AllocationView {
                         invoice_id: s.invoice_id,
-                        amount_minor: s.amount_minor,
-                        currency: currency.clone(),
+                        money: s.amount,
                         allocated_at_utc: OffsetDateTime::now_utc(),
                         precedence_policy_ref: policy_ref.clone(),
                     })
@@ -266,8 +284,7 @@ impl LedgerClientV1 for RealPaymentClient {
             .into_iter()
             .map(|m| AllocationView {
                 invoice_id: m.invoice_id,
-                amount_minor: m.amount_minor,
-                currency: m.currency,
+                money: m.amount,
                 allocated_at_utc: m.allocated_at_utc,
                 precedence_policy_ref: m.precedence_policy_ref,
             })
@@ -282,14 +299,40 @@ impl LedgerClientV1 for RealPaymentClient {
         currency: String,
     ) -> Result<UnallocatedView, CanonicalError> {
         let scope = AccessScope::for_tenant(tenant_id);
-        let balance_minor = PaymentRepo::new(self.provider.clone())
+        let stored = PaymentRepo::new(self.provider.clone())
             .read_unallocated(&scope, tenant_id, payer_tenant_id, &currency)
             .await
             .map_err(|e| CanonicalError::internal(format!("read unallocated: {e}")).create())?;
+        // An absent pool is a zero at the registry-resolved scale, and an
+        // unprovisioned currency is a 400, exactly as `LocalClient` answers.
+        let balance = if let Some(balance) = stored {
+            balance
+        } else {
+            let resolver = bss_ledger::infra::currency_scale::CurrencyScaleResolver::new(
+                ReferenceRepo::new(self.provider.clone()),
+            );
+            let scale = resolver
+                .resolve(&scope, tenant_id, &currency)
+                .await
+                .map_err(|e| match e {
+                    bss_ledger::domain::money::ScaleError::UnknownCurrencyScale(c) => {
+                        CanonicalError::from(
+                            bss_ledger::domain::error::DomainError::InvalidRequest(format!(
+                                "currency {c} is not provisioned for tenant {tenant_id}"
+                            )),
+                        )
+                    }
+                    other => CanonicalError::internal(format!("currency scale resolve: {other}"))
+                        .create(),
+                })?;
+            let spec = bss_ledger_sdk::CurrencySpec::try_new(currency, scale)
+                .map_err(|e| CanonicalError::internal(format!("spec: {e}")).create())?;
+            bss_ledger_sdk::PostedMoney::try_new(rust_decimal::Decimal::ZERO, spec)
+                .map_err(|e| CanonicalError::internal(format!("zero: {e}")).create())?
+        };
         Ok(UnallocatedView {
             payer_tenant_id,
-            currency,
-            balance_minor,
+            balance,
         })
     }
 
@@ -308,7 +351,7 @@ impl LedgerClientV1 for RealPaymentClient {
         _ctx: &SecurityContext,
         _tenant_id: Uuid,
         _account_id: Uuid,
-    ) -> Result<Option<i64>, CanonicalError> {
+    ) -> Result<Option<bss_ledger_sdk::PostedMoney>, CanonicalError> {
         unimplemented!("not exercised by the payment router tests")
     }
 
@@ -539,8 +582,7 @@ async fn setup_seller(raw: &sea_orm::DatabaseConnection, provider: &DBProvider<D
         .upsert_currency_scale(CurrencyScaleRow {
             tenant_id: s.tenant,
             currency: "USD".to_owned(),
-            minor_units: 2,
-            plausible_max_major: DEFAULT_PLAUSIBLE_MAX_MAJOR,
+            currency_scale: 2,
             source: "iso".to_owned(),
         })
         .await
@@ -584,15 +626,12 @@ fn ar_line(s: &Seller, invoice_id: &str, amount: i64) -> NewLine {
         account_class: AccountClass::Ar,
         gl_code: None,
         side: Side::Debit,
-        amount_minor: amount,
-        currency: "USD".to_owned(),
-        currency_scale: 2,
+        money: usd_cents(amount),
         invoice_id: Some(invoice_id.to_owned()),
         due_date: Some(NaiveDate::from_ymd_opt(2026, 12, 1).unwrap()),
         revenue_stream: None,
         mapping_status: MappingStatus::Resolved,
-        functional_amount_minor: None,
-        functional_currency: None,
+        functional_money: None,
         tax_jurisdiction: None,
         tax_filing_period: None,
         tax_rate_ref: None,
@@ -617,15 +656,12 @@ fn psp_credit_line(s: &Seller, amount: i64) -> NewLine {
         account_class: AccountClass::PspFeeExpense,
         gl_code: None,
         side: Side::Credit,
-        amount_minor: amount,
-        currency: "USD".to_owned(),
-        currency_scale: 2,
+        money: usd_cents(amount),
         invoice_id: None,
         due_date: None,
         revenue_stream: None,
         mapping_status: MappingStatus::Resolved,
-        functional_amount_minor: None,
-        functional_currency: None,
+        functional_money: None,
         tax_jurisdiction: None,
         tax_filing_period: None,
         tax_rate_ref: None,
@@ -707,10 +743,8 @@ fn settle_body(s: &Seller, payment_id: &str, gross: i64, fee: i64) -> serde_json
         "tenant_id": s.tenant,
         "payer_tenant_id": s.payer,
         "payment_id": payment_id,
-        "gross_minor": gross,
-        "fee_minor": fee,
-        "currency": "USD",
-        "scale": 2
+        "gross": usd_json(gross),
+        "fee": usd_json(fee)
     })
 }
 
@@ -719,9 +753,7 @@ fn allocate_body(s: &Seller, lump: i64, currency: &str) -> serde_json::Value {
         "tenant_id": s.tenant,
         "payer_tenant_id": s.payer,
         "allocation_id": Uuid::now_v7(),
-        "lump_minor": lump,
-        "currency": currency,
-        "scale": 2
+        "lump": money_json(lump, currency)
     })
 }
 
@@ -730,9 +762,7 @@ fn return_body(s: &Seller, psp_return_id: &str, amount: i64) -> serde_json::Valu
         "tenant_id": s.tenant,
         "payer_tenant_id": s.payer,
         "psp_return_id": psp_return_id,
-        "amount_minor": amount,
-        "currency": "USD",
-        "scale": 2
+        "money": usd_json(amount)
     })
 }
 
@@ -828,7 +858,7 @@ async fn settle_payment_returns_201_then_200_on_replay() {
         repo.read_unallocated(&AccessScope::for_tenant(s.tenant), s.tenant, s.payer, "USD")
             .await
             .unwrap(),
-        1000
+        Some(usd_cents(1000))
     );
 }
 
@@ -854,9 +884,8 @@ async fn allocate_payment_returns_201_with_computed_splits() {
             tenant_id: s.tenant,
             payer_tenant_id: s.payer,
             payment_id: "PAY-ALLOC-REST".to_owned(),
-            gross_minor: 1000,
-            fee_minor: 0,
-            currency: "USD".to_owned(),
+            gross: usd_cents(1000),
+            fee: usd_cents(0),
             effective_at: None,
         },
     )
@@ -894,9 +923,9 @@ async fn allocate_payment_returns_201_with_computed_splits() {
         .expect("allocations array");
     assert_eq!(allocs.len(), 2, "two splits");
     assert_eq!(allocs[0]["invoice_id"], serde_json::json!("INV-A"));
-    assert_eq!(allocs[0]["amount_minor"], serde_json::json!(300));
+    assert_eq!(allocs[0]["money"], usd_json(300));
     assert_eq!(allocs[1]["invoice_id"], serde_json::json!("INV-B"));
-    assert_eq!(allocs[1]["amount_minor"], serde_json::json!(200));
+    assert_eq!(allocs[1]["money"], usd_json(200));
     assert_eq!(
         allocs[0]["precedence_policy_ref"],
         serde_json::json!(DEFAULT_PRECEDENCE_POLICY)
@@ -926,9 +955,8 @@ async fn allocate_over_cap_returns_409_exceeds_settled() {
         tenant_id: s.tenant,
         payer_tenant_id: s.payer,
         payment_id: pid.to_owned(),
-        gross_minor: gross,
-        fee_minor: 0,
-        currency: "USD".to_owned(),
+        gross: usd_cents(gross),
+        fee: usd_cents(0),
         effective_at: None,
     };
     settle
@@ -991,9 +1019,8 @@ async fn allocate_currency_mismatch_returns_400() {
             tenant_id: s.tenant,
             payer_tenant_id: s.payer,
             payment_id: "PAY-CCY-1".to_owned(),
-            gross_minor: 1000,
-            fee_minor: 0,
-            currency: "USD".to_owned(),
+            gross: usd_cents(1000),
+            fee: usd_cents(0),
             effective_at: None,
         },
     )
@@ -1041,9 +1068,8 @@ async fn caller_split_over_open_returns_400_split_invalid() {
             tenant_id: s.tenant,
             payer_tenant_id: s.payer,
             payment_id: "PAY-CS-REST".to_owned(),
-            gross_minor: 1000,
-            fee_minor: 0,
-            currency: "USD".to_owned(),
+            gross: usd_cents(1000),
+            fee: usd_cents(0),
             effective_at: None,
         },
     )
@@ -1063,10 +1089,8 @@ async fn caller_split_over_open_returns_400_split_invalid() {
         "tenant_id": s.tenant,
         "payer_tenant_id": s.payer,
         "allocation_id": Uuid::now_v7(),
-        "lump_minor": 1000,
-        "currency": "USD",
-        "scale": 2,
-        "splits": [{ "invoice_id": "INV-A", "amount_minor": 400 }]
+        "lump": usd_json(1000),
+        "splits": [{ "invoice_id": "INV-A", "money": usd_json(400) }]
     });
     let (status, problem) = send(
         router_with_db(provider.clone()).layer(axum::Extension(ctx)),
@@ -1115,9 +1139,8 @@ async fn list_allocations_and_read_unallocated() {
             tenant_id: s.tenant,
             payer_tenant_id: s.payer,
             payment_id: "PAY-LIST-1".to_owned(),
-            gross_minor: 1000,
-            fee_minor: 0,
-            currency: "USD".to_owned(),
+            gross: usd_cents(1000),
+            fee: usd_cents(0),
             effective_at: None,
         },
     )
@@ -1162,9 +1185,9 @@ async fn list_allocations_and_read_unallocated() {
     assert_eq!(allocs.len(), 2, "two recorded splits");
     // Ordered by invoice_id (repo `order_by InvoiceId Asc`).
     assert_eq!(allocs[0]["invoice_id"], serde_json::json!("INV-A"));
-    assert_eq!(allocs[0]["amount_minor"], serde_json::json!(300));
+    assert_eq!(allocs[0]["money"], usd_json(300));
     assert_eq!(allocs[1]["invoice_id"], serde_json::json!("INV-B"));
-    assert_eq!(allocs[1]["amount_minor"], serde_json::json!(200));
+    assert_eq!(allocs[1]["money"], usd_json(200));
 
     // The pool drained by exactly the allocated total (1000 - 500 = 500 left).
     let (status, pool) = send(
@@ -1182,8 +1205,41 @@ async fn list_allocations_and_read_unallocated() {
         pool["payer_tenant_id"],
         serde_json::json!(s.payer.to_string())
     );
-    assert_eq!(pool["currency"], serde_json::json!("USD"));
-    assert_eq!(pool["balance_minor"], serde_json::json!(500));
+    assert_eq!(pool["balance"], usd_json(500));
+}
+
+/// `GET /balances/unallocated` for a payer with no pool in the currency: a zero
+/// at the registry-resolved scale for a provisioned or ISO currency, a 400 for
+/// a currency with no scale.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn read_unallocated_of_an_absent_pool_and_an_unprovisioned_currency() {
+    let (_c, raw, provider) = boot().await;
+    let s = setup_seller(&raw, &provider).await;
+    let ctx = authed_context();
+    let read = |currency: &'static str| {
+        let router = router_with_db(provider.clone()).layer(axum::Extension(ctx.clone()));
+        let uri = format!(
+            "/bss-ledger/v1/balances/unallocated?tenant_id={}&payer_tenant_id={}&currency={currency}",
+            s.tenant, s.payer
+        );
+        async move { send(router, "GET", &uri, None).await }
+    };
+    for (currency, scale) in [("USD", 2), ("EUR", 2), ("JPY", 0)] {
+        let (status, pool) = read(currency).await;
+        assert_eq!(status, StatusCode::OK, "{currency}: {pool}");
+        assert_eq!(
+            pool["balance"],
+            serde_json::json!({"amount": "0", "currency": currency, "currency_scale": scale}),
+            "{currency}: an absent pool is a zero at its own scale"
+        );
+    }
+    let (status, problem) = read("QQQ").await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "an unprovisioned non-ISO currency is the caller's error: {problem}"
+    );
 }
 
 /// A settle whose body `tenant_id` is OUTSIDE the caller's authorized scope (the
@@ -1203,10 +1259,8 @@ async fn settle_into_foreign_tenant_is_denied_403() {
         "tenant_id": foreign,
         "payer_tenant_id": s.payer,
         "payment_id": "PAY-FOREIGN",
-        "gross_minor": 1000,
-        "fee_minor": 0,
-        "currency": "USD",
-        "scale": 2
+        "gross": usd_json(1000),
+        "fee": usd_json(0)
     });
     let (status, problem) = send(
         router_with_db(provider.clone()).layer(axum::Extension(ctx)),
@@ -1260,9 +1314,7 @@ async fn allocate_unsettled_returns_202_queued() {
         "tenant_id": s.tenant,
         "payer_tenant_id": s.payer,
         "allocation_id": allocation_id,
-        "lump_minor": 300,
-        "currency": "USD",
-        "scale": 2
+        "lump": usd_json(300)
     });
 
     let (status, queued) = send(
@@ -1374,6 +1426,6 @@ async fn return_payment_returns_201_then_200_on_replay() {
         repo.read_unallocated(&AccessScope::for_tenant(s.tenant), s.tenant, s.payer, "USD")
             .await
             .unwrap(),
-        600
+        Some(usd_cents(600))
     );
 }

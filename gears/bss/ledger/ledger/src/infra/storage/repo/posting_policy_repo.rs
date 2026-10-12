@@ -3,12 +3,12 @@
 //! (latest `effective_from <= at`, highest `version` on a tie) and append a new
 //! effective-dated version. Mirrors `PaymentRepo::read_effective_policy`
 //! (precedence) + `ApprovalRepo::insert_policy_row` (dual-control). Tenant-scoped
-//! via `SecureORM` (SQL-level BOLA); out-of-txn on a fresh scoped connection (the
-//! policy is admin-plane, never the hot money path).
+//! via `SecureORM` (SQL-level BOLA). Posting selects its authoritative policy
+//! on the supplied transaction runner; standalone reads use a fresh connection.
 
 use sea_orm::ActiveValue::Set;
 use sea_orm::{ColumnTrait, Condition, EntityTrait, Order};
-use toolkit_db::secure::{AccessScope, SecureEntityExt, SecureInsertExt};
+use toolkit_db::secure::{AccessScope, DBRunner, SecureEntityExt, SecureInsertExt};
 use toolkit_db::{DBProvider, DbError};
 use uuid::Uuid;
 
@@ -50,6 +50,20 @@ impl PostingPolicyRepo {
             .db
             .conn()
             .map_err(|e| RepoError::Db(format!("conn: {e}")))?;
+        self.read_effective_policy_in(&conn, scope, tenant, at)
+            .await
+    }
+
+    /// Resolve the effective policy on the authoritative posting attempt runner.
+    /// # Errors
+    /// Returns typed contention or corrupt policy/storage failures.
+    pub async fn read_effective_policy_in<R: DBRunner>(
+        &self,
+        runner: &R,
+        scope: &AccessScope,
+        tenant: Uuid,
+        at: OffsetDateTime,
+    ) -> Result<PostingPolicy, RepoError> {
         let row = posting_policy::Entity::find()
             .secure()
             .scope_with(scope)
@@ -60,9 +74,9 @@ impl PostingPolicyRepo {
             )
             .order_by(posting_policy::Column::EffectiveFrom, Order::Desc)
             .order_by(posting_policy::Column::Version, Order::Desc)
-            .one(&conn)
+            .one(runner)
             .await
-            .map_err(|e| RepoError::Db(format!("read posting policy: {e}")))?;
+            .map_err(|e| crate::infra::posting::retry::scope_to_repo(e, self.db.db().backend()))?;
         let Some(row) = row else {
             return Ok(PostingPolicy::default());
         };

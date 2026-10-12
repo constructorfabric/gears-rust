@@ -162,16 +162,13 @@ pub trait LedgerMetricsPort: Send + Sync + 'static {
     /// `RecognitionRunService::trigger` pass (release the period's due segments)
     /// took (design §9). Unlabelled: a run covers one `(tenant, period)`.
     fn recognition_run_duration(&self, secs: f64);
-    /// Increment the recognized-revenue counter by `amount_minor` for one
-    /// released segment, labelled by `revenue_stream`
-    /// (`ledger_revenue_recognized_minor{stream}`, design §9) — the minor-unit
-    /// amount moved `CONTRACT_LIABILITY → REVENUE` this release. The stream label
-    /// is the schedule's revenue stream (bounded cardinality — a closed set per
-    /// deployment).
-    fn revenue_recognized_minor(&self, amount_minor: i64, revenue_stream: &str);
+    /// Count one fresh successful recognition release, by bounded revenue stream
+    /// (`ledger_revenue_recognized_total{stream}`). Counts releases, not money.
+    /// The caller must skip idempotent replays.
+    fn revenue_recognized(&self, revenue_stream: &str);
     /// Increment the over-recognition counter
     /// (`ledger_over_recognition_total`, design §9) — one release rejected by the
-    /// per-schedule `recognized_minor <= total_deferred_minor` cap CHECK. Paired
+    /// per-schedule recognized amount must not exceed the deferred amount cap. Paired
     /// with the `OVER_RECOGNITION` invariant alarm.
     fn over_recognition(&self);
     /// Increment the recognition-double-credit counter
@@ -269,11 +266,11 @@ pub trait LedgerMetricsPort: Send + Sync + 'static {
     /// `REFUND_CLEARING` to a documented loss line + wrote a secured-audit record.
     /// Unlabelled (a rare governed event). Paired with the secured-audit append.
     fn refund_unknown_final(&self);
-    /// Record the current open `REFUND_CLEARING` balance for a tenant
-    /// (`ledger_refund_clearing_balance_minor{tenant}` gauge, Slice 3 §9) — the
-    /// summed unsettled clearing the `AgedAlarmJob` observes each tick. Rises as
-    /// stage-1 refunds initiate, falls as they settle / reverse / are disposed.
-    fn refund_clearing_balance_minor(&self, tenant: Uuid, balance_minor: i64);
+    /// Record the number of positive/open clearing grains for a tenant
+    /// (`ledger_refund_clearing_open_grains{tenant}`). Counts grains, not money.
+    /// The caller records once per complete tenant scan, including zero when
+    /// cleared; financial selection and aggregation belong to the caller.
+    fn refund_clearing_open_grains(&self, tenant: Uuid, count: u64);
     /// Record the age (seconds) of the oldest open `REFUND_CLEARING` balance for a
     /// tenant (`ledger_refund_clearing_aged_seconds{tenant}` gauge, Slice 3 §9) —
     /// the worst-case clearing latency the aging alarm thresholds (7d/14d) gate.
@@ -294,15 +291,11 @@ pub trait LedgerMetricsPort: Send + Sync + 'static {
     /// that fell to a lower-priority provider. `provider` is the resolved provider
     /// id (bounded cardinality — the configured `provider_order`).
     fn fx_provider_fallback(&self, provider: &str);
-    /// Increment the realized-FX counter by `amount_minor` (Slice 5 Phase 2 / §9):
-    /// `ledger_fx_realized_minor{functional_currency,direction}` — the functional
-    /// magnitude of a net `FX_GAIN_LOSS` line posted on a cross-currency allocation
-    /// close. `amount_minor` is the non-negative magnitude; `direction` (`"gain"` /
-    /// `"loss"`) carries the sign-by-role (the spec names `{functional_currency}`;
-    /// the `direction` label makes a realized gain distinguishable from a loss in
-    /// the one monotonic counter). Both labels are bounded cardinality (the
-    /// functional currency is per-tenant; direction is a two-value closed set).
-    fn fx_realized_minor(&self, amount_minor: i64, functional_currency: &str, direction: &str);
+    /// Count one fresh posted nonzero FX realization
+    /// (`ledger_fx_realized_total{functional_currency,direction}`). Counts
+    /// gain/loss postings, not money. The caller chooses bounded `gain`/`loss`
+    /// from the accounting side and skips absent lines and idempotent replays.
+    fn fx_realized(&self, functional_currency: &str, direction: &str);
     /// Increment the FX rate-sync heartbeat: `ledger_fx_rate_sync_ticks_total` —
     /// one `RateSyncJob` scheduler tick *started*.
     ///
@@ -340,13 +333,15 @@ pub trait LedgerMetricsPort: Send + Sync + 'static {
     fn fx_rate_sync_duration(&self, secs: f64);
 
     // ── Slice 7 Phase 3 reconciliation ─────────────────────────────────────────
-    /// Record the signed variance (minor units) observed by one reconciliation
-    /// check run, labelled by `check_type`
-    /// (`ledger_reconciliation_variance_minor{check_type}`, design §9 / spec §3.5
-    /// J4). A gauge: each run records its own signed observed value (a tie-out can
-    /// be positive or negative). `check_type` is the closed reconciliation-check
-    /// kind (bounded cardinality — a fixed set of control feeds).
-    fn reconciliation_variance_minor(&self, check_type: &str, variance_minor: i64);
+    /// Record the number of nonzero monetary currency buckets, by check type
+    /// (`ledger_reconciliation_money_variance_currencies{check_type}`). Counts
+    /// currencies, not signed variance or money. The caller must count each
+    /// currency separately without cross-currency netting; record zero on clear.
+    fn reconciliation_money_variance_currencies(&self, check_type: &str, count: u64);
+    /// Record missing invoice completeness count
+    /// (`ledger_reconciliation_missing_invoices`). Separate from monetary
+    /// currency buckets; record zero when no invoice is missing.
+    fn reconciliation_missing_invoices(&self, count: u64);
     /// Increment the reconciliation-run counter for one check pass, labelled by
     /// `check_type` (`ledger_reconciliation_runs_total{check_type}`, design §9 /
     /// spec §3.5 J4) — one increment per reconciliation check executed.
@@ -411,7 +406,7 @@ impl LedgerMetricsPort for NoopLedgerMetrics {
     fn suspense_pending(&self, _: Uuid, _: i64, _: f64) {}
     fn invariant_alarm(&self, _: &str, _: &str) {}
     fn recognition_run_duration(&self, _: f64) {}
-    fn revenue_recognized_minor(&self, _: i64, _: &str) {}
+    fn revenue_recognized(&self, _: &str) {}
     fn over_recognition(&self) {}
     fn recognition_double_credit(&self) {}
     fn recognition_period_queue_depth(&self, _: i64) {}
@@ -432,15 +427,16 @@ impl LedgerMetricsPort for NoopLedgerMetrics {
     fn refund(&self, _: &str, _: &str) {}
     fn refund_quarantine_depth(&self, _: i64) {}
     fn refund_unknown_final(&self) {}
-    fn refund_clearing_balance_minor(&self, _: Uuid, _: i64) {}
+    fn refund_clearing_open_grains(&self, _: Uuid, _: u64) {}
     fn refund_clearing_aged_seconds(&self, _: Uuid, _: f64) {}
     fn stage1_refund_orphan(&self) {}
     fn fx_revaluation_duration(&self, _: f64) {}
     fn fx_provider_fallback(&self, _: &str) {}
-    fn fx_realized_minor(&self, _: i64, _: &str, _: &str) {}
+    fn fx_realized(&self, _: &str, _: &str) {}
     fn fx_rate_sync_ticked(&self) {}
     fn fx_rate_sync_duration(&self, _: f64) {}
-    fn reconciliation_variance_minor(&self, _: &str, _: i64) {}
+    fn reconciliation_money_variance_currencies(&self, _: &str, _: u64) {}
+    fn reconciliation_missing_invoices(&self, _: u64) {}
     fn reconciliation_run(&self, _: &str) {}
     fn reconciliation_out_of_tolerance(&self, _: &str) {}
     fn reconciliation_retired_tenants(&self, _: &str, _: i64) {}
@@ -507,7 +503,7 @@ mod tests {
         m.suspense_pending(t, 3, 10.0);
         m.invariant_alarm("TAMPER_VERIFY_FAILED", "critical");
         m.recognition_run_duration(0.1);
-        m.revenue_recognized_minor(100, "subscription");
+        m.revenue_recognized("subscription");
         m.over_recognition();
         m.recognition_double_credit();
         m.recognition_period_queue_depth(2);
@@ -529,14 +525,16 @@ mod tests {
         m.refund("initiated", "A_UNALLOCATED");
         m.refund_quarantine_depth(0);
         m.refund_unknown_final();
-        m.refund_clearing_balance_minor(t, 1_000);
+        m.refund_clearing_open_grains(t, 2);
         m.refund_clearing_aged_seconds(t, 3_600.0);
         m.stage1_refund_orphan();
         m.fx_revaluation_duration(1.5);
         m.fx_provider_fallback("ecb");
-        m.fx_realized_minor(240, "USD", "loss");
+        m.fx_realized("USD", "loss");
         m.fx_rate_sync_ticked();
         m.fx_rate_sync_duration(0.8);
+        m.reconciliation_money_variance_currencies("ar_subledger_vs_gl", 2);
+        m.reconciliation_missing_invoices(3);
     }
 
     // `NoopLedgerMetrics` is the trait's safe default — usable behind the
@@ -545,6 +543,6 @@ mod tests {
     fn noop_metrics_is_usable_as_dyn_port() {
         let m: std::sync::Arc<dyn LedgerMetricsPort> = std::sync::Arc::new(NoopLedgerMetrics);
         m.invoice_post(PostResult::Rejected, PostFlow::Chargeback);
-        m.fx_realized_minor(0, "EUR", "gain");
+        m.fx_realized("EUR", "gain");
     }
 }

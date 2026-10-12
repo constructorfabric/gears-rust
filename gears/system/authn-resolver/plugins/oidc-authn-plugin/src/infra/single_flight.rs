@@ -7,7 +7,9 @@ use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
 use tokio::sync::Mutex;
 
+/// Per-key gate that serializes concurrent callers; reference-counted so the owning map can drop it once the last holder releases it.
 pub struct SingleFlightGate {
+    /// Held by the caller doing the underlying work while other callers for the same key wait.
     pub mutex: Mutex<()>,
     leases: AtomicUsize,
 }
@@ -33,6 +35,7 @@ impl SingleFlightGate {
     }
 }
 
+/// Acquires the per-key gate, creating it if absent, and discards the leadership flag.
 pub fn single_flight_gate(
     in_flight: &DashMap<String, Arc<SingleFlightGate>>,
     key: &str,
@@ -64,6 +67,7 @@ pub fn single_flight_gate_with_leadership(
     }
 }
 
+/// Releases a lease on `gate` and removes it from `in_flight` once no holders remain.
 pub fn release_single_flight_gate(
     in_flight: &DashMap<String, Arc<SingleFlightGate>>,
     key: &str,

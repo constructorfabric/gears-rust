@@ -254,6 +254,7 @@ pub fn validate_type_change(references: u32) -> Result<(), DomainError> {
 ///
 /// `next` is absent, or it carries both the lifecycle and the date. A stored pair that sets only
 /// one of them is a corrupt row, refused before this value is built.
+#[toolkit_macros::domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LifecycleHead {
     pub lifecycle: Lifecycle,

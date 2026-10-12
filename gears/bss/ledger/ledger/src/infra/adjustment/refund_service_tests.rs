@@ -6,10 +6,20 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use bss_ledger_sdk::AccountClass;
+use bss_ledger_sdk::{AccountClass, CurrencySpec, PostedMoney};
+use rust_decimal::Decimal;
 
 use super::*;
 use crate::domain::adjustment::refund::build_refund_legs;
+
+/// `cents` minor units of USD (scale 2) as validated major-unit money.
+fn usd(cents: i64) -> PostedMoney {
+    PostedMoney::try_new(
+        Decimal::new(cents, 2),
+        CurrencySpec::try_new("USD".to_owned(), 2).unwrap(),
+    )
+    .unwrap()
+}
 
 fn stage1_req(pattern: RefundPattern, amount: i64) -> RefundRequest {
     let invoice_id = match pattern {
@@ -25,19 +35,18 @@ fn stage1_req(pattern: RefundPattern, amount: i64) -> RefundRequest {
         pattern,
         payment_id: "pay-1".to_owned(),
         invoice_id,
-        currency: "USD".to_owned(),
-        amount_minor: amount,
+        amount: usd(amount),
         two_stage: true,
         relates_to_refund_id: None,
         direction: RefundDirection::Outbound,
     }
 }
 
-fn sum_side(plan: &RefundLegPlan, side: Side) -> i64 {
+fn sum_side(plan: &RefundLegPlan, side: Side) -> Decimal {
     plan.legs
         .iter()
         .filter(|l| l.side == side)
-        .map(|l| l.amount_minor)
+        .map(|l| l.amount.amount())
         .sum()
 }
 
@@ -53,7 +62,7 @@ fn invert_plan_flips_sides_and_stays_balanced() {
         assert_eq!(reversed.legs.len(), stage1.legs.len());
         for (orig, rev) in stage1.legs.iter().zip(reversed.legs.iter()) {
             assert_eq!(rev.account_class, orig.account_class, "class preserved");
-            assert_eq!(rev.amount_minor, orig.amount_minor, "amount preserved");
+            assert_eq!(rev.amount, orig.amount, "amount preserved");
             assert_ne!(rev.side, orig.side, "side flipped");
         }
 
@@ -111,42 +120,29 @@ fn refund_cap_targets_match_pattern() {
     );
 }
 
-/// The `unknown_final` disposition PARKS the stuck `REFUND_CLEARING` on SUSPENSE:
-/// a BALANCED two-leg plan `DR REFUND_CLEARING (open amount) · CR SUSPENSE`,
-/// draining the guarded clearing balance to zero (the DR cancels the stage-1
-/// `CR REFUND_CLEARING`). This mirrors the
-/// plan `post_unknown_final` builds inline (kept in lockstep here so the
-/// park-account choice + balance are unit-asserted without a DB).
+/// The `unknown_final` disposition PARKS the stuck `REFUND_CLEARING` on SUSPENSE
+/// with the plan `post_unknown_final` posts (`unknown_final_park_plan`): a
+/// BALANCED two-leg plan `DR REFUND_CLEARING · CR SUSPENSE` sized at the stage-1
+/// open amount it is given (not a request amount), draining the guarded clearing.
 #[test]
 fn unknown_final_park_clearing_plan_is_balanced_and_drains_clearing() {
-    let amount = 750;
-    let plan = RefundLegPlan {
-        legs: vec![
-            PlannedLeg {
-                account_class: AccountClass::RefundClearing,
-                side: Side::Debit,
-                amount_minor: amount,
-                revenue_stream: None,
-            },
-            PlannedLeg {
-                account_class: UNKNOWN_FINAL_PARK_CLASS,
-                side: Side::Credit,
-                amount_minor: amount,
-                revenue_stream: None,
-            },
-        ],
-        clearing_state: CLEARING_STATE_SETTLED,
-    };
-    // Balanced (Σ DR == Σ CR) and exactly two legs.
+    // A stage-1 open amount unlike any request figure, at a non-2 scale.
+    let open = PostedMoney::try_new(
+        rust_decimal::Decimal::new(7_505, 3),
+        bss_ledger_sdk::CurrencySpec::try_new("KWD".to_owned(), 3).unwrap(),
+    )
+    .unwrap();
+    let plan = unknown_final_park_plan(&open);
     assert_eq!(plan.legs.len(), 2);
-    assert_eq!(sum_side(&plan, Side::Debit), sum_side(&plan, Side::Credit));
-    // The DR DRAINS the guarded REFUND_CLEARING (toward zero); the CR PARKS the
-    // amount on SUSPENSE pending reconciliation (not a premature loss/gain).
     let dr = plan.legs.iter().find(|l| l.side == Side::Debit).unwrap();
     let cr = plan.legs.iter().find(|l| l.side == Side::Credit).unwrap();
+    // The DR DRAINS the guarded REFUND_CLEARING; the CR PARKS on SUSPENSE (not a
+    // premature loss/gain); both carry exactly the stage-1 open amount.
     assert_eq!(dr.account_class, AccountClass::RefundClearing);
     assert_eq!(cr.account_class, AccountClass::Suspense);
-    assert_eq!(cr.account_class, UNKNOWN_FINAL_PARK_CLASS);
+    assert_eq!(dr.amount, open);
+    assert_eq!(cr.amount, open);
+    assert!(dr.revenue_stream.is_none() && cr.revenue_stream.is_none());
     // The disposition drains REFUND_CLEARING off the live account → SETTLED.
     assert_eq!(plan.clearing_state, CLEARING_STATE_SETTLED);
 }
@@ -165,14 +161,17 @@ fn unknown_final_audit_payload_is_pii_clean_and_shaped() {
     let payload = unknown_final_audit_payload(
         &req,
         crate::domain::adjustment::refund::CLEARING_STATE_PENDING,
-        900,
+        &usd(900),
     );
 
     assert_eq!(payload["disposition"], "REFUND_UNKNOWN_FINAL");
     assert_eq!(payload["before"]["clearing_state"], "PENDING");
-    assert_eq!(payload["before"]["refund_clearing_open_minor"], 900);
-    assert_eq!(payload["after"]["refund_clearing_open_minor"], 0);
-    assert_eq!(payload["after"]["parked_minor"], 900);
+    // Canonical decimal text (`9.00` → `"9"`), never a JSON number.
+    assert_eq!(payload["currency"], "USD");
+    assert_eq!(payload["currency_scale"], 2);
+    assert_eq!(payload["before"]["refund_clearing_open"], "9");
+    assert_eq!(payload["after"]["refund_clearing_open"], "0");
+    assert_eq!(payload["after"]["parked"], "9");
     assert_eq!(payload["after"]["park_account_class"], "SUSPENSE");
     assert_eq!(payload["after"]["clearing_state"], CLEARING_STATE_SETTLED);
     assert_eq!(REASON_REFUND_UNKNOWN_FINAL, "REFUND_UNKNOWN_FINAL");
@@ -188,6 +187,7 @@ fn unknown_final_audit_payload_is_pii_clean_and_shaped() {
             "after",
             "before",
             "currency",
+            "currency_scale",
             "disposition",
             "pattern",
             "payment_id",
@@ -195,4 +195,51 @@ fn unknown_final_audit_payload_is_pii_clean_and_shaped() {
             "refund_id",
         ]
     );
+}
+
+fn settlement(settled: PostedMoney) -> SettlementState {
+    let zero = PostedMoney::try_new(Decimal::ZERO, settled.currency().clone()).unwrap();
+    SettlementState {
+        tenant_id: Uuid::now_v7(),
+        payment_id: "pay-1".to_owned(),
+        version: 1,
+        settled,
+        fee: zero.clone(),
+        allocated: zero.clone(),
+        refunded: zero.clone(),
+        refunded_unallocated: zero.clone(),
+        clawed_back: zero,
+    }
+}
+
+/// A refund in the settlement's currency but at another stored scale is a named
+/// `InconsistentScale` (checked before any cap or post), distinct from a
+/// different code (`CurrencyMismatch`); the same spec passes.
+#[test]
+fn refund_origin_spec_check_names_scale_and_code_mismatches() {
+    let req = stage1_req(RefundPattern::AUnallocated, 500);
+    let usd3 = PostedMoney::try_new(
+        Decimal::new(10_000, 3),
+        CurrencySpec::try_new("USD".to_owned(), 3).unwrap(),
+    )
+    .unwrap();
+    match origin_spec_check(&req, &settlement(usd3)) {
+        Err(DomainError::InconsistentScale(detail)) => {
+            assert!(
+                detail.contains("scale 2") && detail.contains("scale 3"),
+                "{detail}"
+            );
+        }
+        other => panic!("expected InconsistentScale, got {other:?}"),
+    }
+    let eur = PostedMoney::try_new(
+        Decimal::new(10_000, 2),
+        CurrencySpec::try_new("EUR".to_owned(), 2).unwrap(),
+    )
+    .unwrap();
+    assert!(matches!(
+        origin_spec_check(&req, &settlement(eur)),
+        Err(DomainError::CurrencyMismatch(_))
+    ));
+    assert!(origin_spec_check(&req, &settlement(usd(10_000))).is_ok());
 }

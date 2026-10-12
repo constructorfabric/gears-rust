@@ -9,6 +9,7 @@
 //! (returns `None` ⇒ the completeness check is inert until the feed lands; design §0
 //! decision 3), mirroring [`crate::UnconfiguredRateProviderV1`].
 
+use crate::PostedMoney;
 use async_trait::async_trait;
 use uuid::Uuid;
 
@@ -29,8 +30,84 @@ pub struct IssuedInvoiceManifest {
     pub invoice_ids: Vec<String>,
     /// Control total: count of issued invoices (`== invoice_ids.len()` on a consistent feed).
     pub count: u64,
-    /// Control total: summed gross amount in minor units.
-    pub gross_total_minor: i64,
+    /// Exact gross totals, one per currency, sorted by currency code. An empty
+    /// manifest may have no totals.
+    pub gross_totals: GrossTotals,
+}
+
+/// A manifest's per-currency control totals were rejected.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum GrossTotalsError {
+    /// Two totals name the same currency code (at any scale): one bucket per
+    /// currency is the comparison contract.
+    #[error("gross_totals repeats currency {0}")]
+    DuplicateCurrency(String),
+}
+
+/// Per-currency control totals: at most one per currency code (whatever its
+/// scale), kept sorted by code. Both rules hold by construction.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GrossTotals(Vec<PostedMoney>);
+
+impl GrossTotals {
+    /// Sort `totals` by currency code and reject a repeated code.
+    ///
+    /// # Errors
+    /// [`GrossTotalsError::DuplicateCurrency`] when two totals name the same
+    /// currency code, even with different scales.
+    pub fn try_new(mut totals: Vec<PostedMoney>) -> Result<Self, GrossTotalsError> {
+        totals.sort_by(|a, b| a.currency().code().cmp(b.currency().code()));
+        if let Some(pair) = totals
+            .windows(2)
+            .find(|pair| pair[0].currency().code() == pair[1].currency().code())
+        {
+            return Err(GrossTotalsError::DuplicateCurrency(
+                pair[0].currency().code().to_owned(),
+            ));
+        }
+        Ok(Self(totals))
+    }
+
+    /// The totals, sorted by currency code.
+    #[must_use]
+    pub fn as_slice(&self) -> &[PostedMoney] {
+        &self.0
+    }
+
+    /// The total for `currency`, if the manifest carries one.
+    #[must_use]
+    pub fn get(&self, currency: &str) -> Option<&PostedMoney> {
+        self.0
+            .binary_search_by(|total| total.currency().code().cmp(currency))
+            .ok()
+            .map(|index| &self.0[index])
+    }
+
+    /// Iterate the totals in currency-code order.
+    pub fn iter(&self) -> std::slice::Iter<'_, PostedMoney> {
+        self.0.iter()
+    }
+
+    /// The number of currencies.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Whether the manifest carries no totals.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl<'a> IntoIterator for &'a GrossTotals {
+    type Item = &'a PostedMoney;
+    type IntoIter = std::slice::Iter<'a, PostedMoney>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter()
+    }
 }
 
 /// Read port for the issued-invoice manifest (call-driven; the ledger never pulls a
@@ -66,3 +143,7 @@ impl IssuedInvoiceManifestV1 for UnconfiguredIssuedInvoiceManifestV1 {
         Ok(None)
     }
 }
+
+#[cfg(test)]
+#[path = "issued_invoice_manifest_tests.rs"]
+mod tests;

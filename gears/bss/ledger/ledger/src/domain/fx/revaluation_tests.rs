@@ -7,17 +7,25 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use super::*;
+use bss_ledger_sdk::money::CurrencySpec;
+fn money(minor: i64) -> PostedMoney {
+    PostedMoney::try_new(
+        Decimal::from_i128_with_scale(i128::from(minor), 2),
+        CurrencySpec::try_new("USD".into(), 2).unwrap(),
+    )
+    .unwrap()
+}
 
 /// A `RevaluationPosition` literal.
 fn pos(
     normal_side: Side,
-    carried_functional_minor: i64,
-    remeasured_functional_minor: i64,
+    carried_functional: i64,
+    remeasured_functional: i64,
 ) -> RevaluationPosition {
     RevaluationPosition {
         normal_side,
-        carried_functional_minor,
-        remeasured_functional_minor,
+        carried_functional: money(carried_functional),
+        remeasured_functional: money(remeasured_functional),
     }
 }
 
@@ -25,18 +33,34 @@ fn pos(
 /// the `FX_UNREALIZED` line) == Σ CR. This is the invariant `remeasure` must
 /// guarantee by construction (the whole entry is functional-only).
 fn assert_functional_balances(r: &Revaluation) {
-    let mut dr: i128 = 0;
-    let mut cr: i128 = 0;
+    let mut dr = ExactAmount::from_decimal(Decimal::ZERO);
+    let mut cr = ExactAmount::from_decimal(Decimal::ZERO);
     for line in r.grain_lines.iter().flatten() {
         match line.side {
-            Side::Debit => dr += i128::from(line.functional_minor),
-            Side::Credit => cr += i128::from(line.functional_minor),
+            Side::Debit => {
+                dr = dr
+                    .checked_add(&ExactAmount::from_decimal(line.functional.amount()))
+                    .unwrap();
+            }
+            Side::Credit => {
+                cr = cr
+                    .checked_add(&ExactAmount::from_decimal(line.functional.amount()))
+                    .unwrap();
+            }
         }
     }
-    if let Some(fx) = r.fx_unrealized {
+    if let Some(fx) = &r.fx_unrealized {
         match fx.side {
-            Side::Debit => dr += i128::from(fx.functional_minor),
-            Side::Credit => cr += i128::from(fx.functional_minor),
+            Side::Debit => {
+                dr = dr
+                    .checked_add(&ExactAmount::from_decimal(fx.functional.amount()))
+                    .unwrap();
+            }
+            Side::Credit => {
+                cr = cr
+                    .checked_add(&ExactAmount::from_decimal(fx.functional.amount()))
+                    .unwrap();
+            }
         }
     }
     assert_eq!(dr, cr, "functional column must balance (DR == CR)");
@@ -53,14 +77,14 @@ fn asset_ar_rate_fall_books_unrealized_loss() {
         r.grain_lines,
         vec![Some(RevaluationLine {
             side: Side::Credit,
-            functional_minor: 600,
+            functional: money(600),
         })]
     );
     assert_eq!(
         r.fx_unrealized,
         Some(RevaluationLine {
             side: Side::Debit,
-            functional_minor: 600,
+            functional: money(600),
         }),
         "net 6.00 USD unrealized LOSS on the DR side"
     );
@@ -77,14 +101,14 @@ fn asset_ar_rate_rise_books_unrealized_gain() {
         r.grain_lines,
         vec![Some(RevaluationLine {
             side: Side::Debit,
-            functional_minor: 600,
+            functional: money(600),
         })]
     );
     assert_eq!(
         r.fx_unrealized,
         Some(RevaluationLine {
             side: Side::Credit,
-            functional_minor: 600,
+            functional: money(600),
         }),
         "net 6.00 USD unrealized GAIN on the CR side"
     );
@@ -102,14 +126,14 @@ fn liability_unallocated_rate_rise_books_unrealized_loss() {
         r.grain_lines,
         vec![Some(RevaluationLine {
             side: Side::Credit,
-            functional_minor: 540,
+            functional: money(540),
         })]
     );
     assert_eq!(
         r.fx_unrealized,
         Some(RevaluationLine {
             side: Side::Debit,
-            functional_minor: 540,
+            functional: money(540),
         }),
         "net 5.40 USD unrealized LOSS (liability grew)"
     );
@@ -127,14 +151,14 @@ fn liability_reusable_credit_rate_fall_books_unrealized_gain() {
         r.grain_lines,
         vec![Some(RevaluationLine {
             side: Side::Debit,
-            functional_minor: 1_000,
+            functional: money(1_000),
         })]
     );
     assert_eq!(
         r.fx_unrealized,
         Some(RevaluationLine {
             side: Side::Credit,
-            functional_minor: 1_000,
+            functional: money(1_000),
         }),
         "net 10.00 USD unrealized GAIN (liability shrank)"
     );
@@ -168,11 +192,11 @@ fn multi_grain_same_scope_nets_to_one_fx_line() {
         vec![
             Some(RevaluationLine {
                 side: Side::Credit,
-                functional_minor: 1_000,
+                functional: money(1_000),
             }),
             Some(RevaluationLine {
                 side: Side::Debit,
-                functional_minor: 3_000,
+                functional: money(3_000),
             }),
         ]
     );
@@ -180,7 +204,7 @@ fn multi_grain_same_scope_nets_to_one_fx_line() {
         r.fx_unrealized,
         Some(RevaluationLine {
             side: Side::Credit,
-            functional_minor: 2_000,
+            functional: money(2_000),
         }),
         "net 20.00 USD unrealized GAIN"
     );
@@ -189,9 +213,10 @@ fn multi_grain_same_scope_nets_to_one_fx_line() {
 
 #[test]
 fn mixed_grains_that_cancel_emit_no_fx_line() {
-    // Two AR grains whose moves cancel exactly: +5.00 and −5.00 → net 0, but the
-    // per-grain legs still post (carrying values do move) and the entry still
-    // balances without an FX line.
+    // Two AR grains whose moves cancel exactly: +5.00 and −5.00 → net 0. The
+    // remeasurement still reports both grain movements and they balance without
+    // an FX line; whether they are posted is the run's decision
+    // (`revaluation_run` currently posts nothing when there is no net FX line).
     let positions = [
         pos(Side::Debit, 10_000, 10_500),
         pos(Side::Debit, 8_000, 7_500),
@@ -202,18 +227,18 @@ fn mixed_grains_that_cancel_emit_no_fx_line() {
         vec![
             Some(RevaluationLine {
                 side: Side::Debit,
-                functional_minor: 500,
+                functional: money(500),
             }),
             Some(RevaluationLine {
                 side: Side::Credit,
-                functional_minor: 500,
+                functional: money(500),
             }),
         ]
     );
     assert_eq!(r.fx_unrealized, None, "legs cancel → no FX line");
     assert!(
-        r.is_empty(),
-        "is_empty keys off the FX line (nothing net to post)"
+        !r.is_empty(),
+        "the remeasurement reports nonzero grain movements even when their net cancels"
     );
     assert_functional_balances(&r);
 }
@@ -262,5 +287,64 @@ fn scope_normal_side_and_token() {
             RevaluationScope::Unallocated,
             RevaluationScope::ReusableCredit
         ]
+    );
+}
+
+#[test]
+fn mismatched_functional_metadata_rejected_even_on_zero_movements() {
+    let mut positions = [pos(Side::Debit, 0, 0), pos(Side::Debit, 0, 0)];
+    positions[1].remeasured_functional = PostedMoney::try_new(
+        Decimal::ZERO,
+        CurrencySpec::try_new("USD".into(), 3).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        remeasure(&positions),
+        Err(RevaluationError::Exact(ExactError::Money(
+            bss_ledger_sdk::money::MoneyError::ScaleMismatch
+        )))
+    );
+    positions[1].remeasured_functional = PostedMoney::try_new(
+        Decimal::ZERO,
+        CurrencySpec::try_new("EUR".into(), 2).unwrap(),
+    )
+    .unwrap();
+    positions[1].carried_functional = positions[1].remeasured_functional.clone();
+    assert_eq!(
+        remeasure(&positions),
+        Err(RevaluationError::Exact(ExactError::Money(
+            bss_ledger_sdk::money::MoneyError::CurrencyMismatch
+        )))
+    );
+}
+
+#[test]
+fn wide_grain_movements_cancel_without_intermediate_money_bound() {
+    let currency = CurrencySpec::try_new("USD".into(), 0).unwrap();
+    let huge = PostedMoney::try_new(
+        Decimal::from_str_exact("9999999999999999999999999999").unwrap(),
+        currency.clone(),
+    )
+    .unwrap();
+    let zero = PostedMoney::try_new(Decimal::ZERO, currency).unwrap();
+    let up = RevaluationPosition {
+        normal_side: Side::Debit,
+        carried_functional: zero.clone(),
+        remeasured_functional: huge.clone(),
+    };
+    let down = RevaluationPosition {
+        normal_side: Side::Debit,
+        carried_functional: huge,
+        remeasured_functional: zero,
+    };
+    let r = remeasure(&[up.clone(), up.clone(), down.clone(), down]).unwrap();
+    assert!(!r.is_empty());
+    assert_eq!(r.fx_unrealized, None);
+    assert_functional_balances(&r);
+    assert_eq!(
+        remeasure(&[up.clone(), up]),
+        Err(RevaluationError::Exact(ExactError::Money(
+            bss_ledger_sdk::money::MoneyError::AmountOutOfRange
+        )))
     );
 }

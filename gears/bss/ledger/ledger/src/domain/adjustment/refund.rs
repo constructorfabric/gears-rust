@@ -48,7 +48,11 @@
 //! `invoice_id` whose AR it restores; Pattern A must NOT carry one (its money never
 //! reached an invoice).
 
+#[cfg(test)]
+use crate::domain::exact_money::sum_posted;
+use bss_ledger_sdk::money::PostedMoney;
 use bss_ledger_sdk::{AccountClass, Side};
+use rust_decimal::Decimal;
 use toolkit_macros::domain_model;
 use uuid::Uuid;
 
@@ -134,8 +138,8 @@ pub enum RefundPattern {
 ///
 /// - [`Self::Clawback`] — the PSP returned the disbursed cash to the merchant (a
 ///   refund was undone). It DECREMENTS the origin payment's money-out counters
-///   (`payment_settlement.refunded_minor`, + `refunded_unallocated_minor` for a
-///   Pattern-A origin / `payment_allocation_refund.refunded_minor` for Pattern B)
+///   (`payment_settlement.refunded`, + `refunded_unallocated` for a
+///   Pattern-A origin / `payment_allocation_refund.refunded` for Pattern B)
 ///   so the total money-out cap reflects the NET refunded, and its
 ///   `REFUND_CLEARING` leg drains in the OPPOSITE direction to an outbound refund.
 ///   The **canonical default** for a refund-of-refund (design D8): when the PSP
@@ -218,8 +222,8 @@ impl RefundPattern {
 }
 
 /// One refund request — the pure inputs the handler resolves from the REST DTO
-/// (Group G) before reading any ledger state. Amounts are `i64` minor units;
-/// `amount_minor` is the cash to return (`>= 0`). `payment_id` + `currency` resolve
+/// (Group G) before reading any ledger state. Amounts are major-unit `PostedMoney` values;
+/// `amount` is the cash to return (`>= 0`). `payment_id` + `currency` resolve
 /// the origin `payment_settlement` (both patterns, D7); `invoice_id` is the AR the
 /// refund restores (Pattern B only — `None` for A).
 #[domain_model]
@@ -256,11 +260,8 @@ pub struct RefundRequest {
     /// (`B_RESTORE_AR`), MUST be `None` for Pattern A (its money never reached an
     /// invoice). Enforced by [`validate_shape`].
     pub invoice_id: Option<String>,
-    /// ISO-4217 currency of the refund (all legs share it; MUST match the origin
-    /// settlement's currency — the handler validates it).
-    pub currency: String,
-    /// The cash to return, in minor units (`>= 0`).
-    pub amount_minor: i64,
+    /// The cash to return, in major units (`>= 0`).
+    pub amount: PostedMoney,
     /// `true` ⇒ the conservative two-stage shape (stage-1 `… · CR REFUND_CLEARING`,
     /// stage-2 `DR REFUND_CLEARING · CR CASH_CLEARING`); `false` ⇒ the single-step
     /// shape (D1 — `… · CR CASH_CLEARING` in one `initiated` post, no clearing leg),
@@ -309,10 +310,10 @@ pub struct PlannedLeg {
     pub account_class: AccountClass,
     /// DR / CR.
     pub side: Side,
-    /// The leg amount in minor units (`> 0`; zero-amount legs are never emitted —
+    /// The leg amount in major units (`> 0`; zero-amount legs are never emitted —
     /// inherited S1 / AC #4 rejects a zero placeholder line, and the handler
     /// guards a zero-amount refund up-front).
-    pub amount_minor: i64,
+    pub amount: PostedMoney,
     /// Always `None` for a refund (every refund class is stream-less); present for
     /// shape-parity with the note leg plans.
     pub revenue_stream: Option<String>,
@@ -347,7 +348,7 @@ pub const CLEARING_STATE_REVERSED: &str = "REVERSED";
 /// Validate a refund request's amounts + the pattern/phase/invoice shape (design
 /// §4.4). Pure shape checks the handler does not own:
 ///
-/// - `amount_minor >= 0` (a zero refund is a benign no-op the handler rejects
+/// - `amount >= 0` (a zero refund is a benign no-op the handler rejects
 ///   up-front before the empty-entry engine check — out of this gate);
 /// - Pattern B (`B_RESTORE_AR`) REQUIRES a non-empty `invoice_id` (the AR it
 ///   restores); Pattern A (`A_UNALLOCATED`) MUST NOT carry one (its money never
@@ -369,10 +370,10 @@ pub const CLEARING_STATE_REVERSED: &str = "REVERSED";
 /// phase/`two_stage` combination, or a `Clawback` missing its
 /// `relates_to_refund_id`.
 pub fn validate_shape(req: &RefundRequest) -> Result<(), DomainError> {
-    if req.amount_minor < 0 {
+    if req.amount.amount() < Decimal::ZERO {
         return Err(DomainError::AmountOutOfRange(format!(
-            "refund amount_minor must be >= 0, got {}",
-            req.amount_minor
+            "refund amount must be >= 0, got {}",
+            req.amount.amount()
         )));
     }
     // A claw-back direction is meaningless without the prior refund it claws back
@@ -455,7 +456,7 @@ pub fn validate_shape(req: &RefundRequest) -> Result<(), DomainError> {
 ///
 /// NEVER emits a `CONTRACT_LIABILITY` leg (design §4.4) and never touches Revenue /
 /// Contra. The plan is balanced by construction (the single DR equals the single
-/// CR, both `amount_minor`), asserted before returning.
+/// CR, both `amount`), asserted before returning.
 ///
 /// A terminal phase (`Rejected` / `Voided` / `UnknownFinal`) has no Group-B posting
 /// shape — the stage-1 reversal (Group E) and the unknown-final disposition (Group
@@ -469,7 +470,8 @@ pub fn validate_shape(req: &RefundRequest) -> Result<(), DomainError> {
 /// constructed plan does not balance (an invariant breach — the assertion guards a
 /// silent unbalanced post).
 pub fn build_refund_legs(req: &RefundRequest) -> Result<RefundLegPlan, DomainError> {
-    let amount = req.amount_minor;
+    validate_shape(req)?;
+    let amount = req.amount.clone();
     // The OUTBOUND (cash-out) `(debit_class, credit_class, clearing_state)` by the
     // routing matrix. A claw-back uses the SAME accounts but inverts each leg's
     // side below (cash flows the opposite way). A zero-amount refund still routes
@@ -524,17 +526,17 @@ pub fn build_refund_legs(req: &RefundRequest) -> Result<RefundLegPlan, DomainErr
     };
 
     let mut legs: Vec<PlannedLeg> = Vec::with_capacity(2);
-    if amount > 0 {
+    if amount.amount() > Decimal::ZERO {
         legs.push(PlannedLeg {
             account_class: debit_class,
             side: Side::Debit,
-            amount_minor: amount,
+            amount: amount.clone(),
             revenue_stream: None,
         });
         legs.push(PlannedLeg {
             account_class: credit_class,
             side: Side::Credit,
-            amount_minor: amount,
+            amount: amount.clone(),
             revenue_stream: None,
         });
     }
@@ -542,22 +544,6 @@ pub fn build_refund_legs(req: &RefundRequest) -> Result<RefundLegPlan, DomainErr
     // Balance invariant (Σ DR == Σ CR). Both legs are `amount`, one DR one CR, so a
     // non-zero refund always balances; a zero refund emits no legs (the handler
     // rejects zero up-front — the engine rejects an empty entry).
-    let dr: i64 = legs
-        .iter()
-        .filter(|l| l.side == Side::Debit)
-        .map(|l| l.amount_minor)
-        .sum();
-    let cr: i64 = legs
-        .iter()
-        .filter(|l| l.side == Side::Credit)
-        .map(|l| l.amount_minor)
-        .sum();
-    debug_assert_eq!(dr, cr, "refund leg plan must balance");
-    if dr != cr {
-        return Err(DomainError::Internal(format!(
-            "refund leg plan does not balance (DR {dr} != CR {cr})"
-        )));
-    }
     // A refund leg must NEVER debit CONTRACT_LIABILITY (design §4.4 — the
     // unreleased-deferred restatement rides a paired credit note, not the refund).
     // The routing matrix above can structurally never produce one; this debug

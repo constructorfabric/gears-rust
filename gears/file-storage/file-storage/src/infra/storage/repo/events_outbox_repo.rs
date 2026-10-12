@@ -1,6 +1,4 @@
 //! Repository for the `events_outbox` table.
-//!
-//! @cpt-cf-file-storage-fr-file-events
 
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder, Set};
 use toolkit_db::secure::{DBRunner, SecureEntityExt, secure_insert};
@@ -9,7 +7,6 @@ use uuid::Uuid;
 
 use crate::domain::audit::FileEvent;
 use crate::domain::error::DomainError;
-use crate::infra::storage::db::db_err;
 use crate::infra::storage::entity::events_outbox::{ActiveModel, Column, Entity, Model};
 
 /// Repository over the `events_outbox` table.
@@ -22,10 +19,7 @@ impl EventsOutboxRepo {
         Self
     }
 
-    /// Enqueue a file-event row into `conn` (which MUST be a transaction runner
-    /// so the row is committed atomically with the surrounding mutation).
-    ///
-    /// @cpt-cf-file-storage-fr-file-events
+    /// Enqueue a file-event row; `conn` MUST be the surrounding transaction.
     pub async fn enqueue<C: DBRunner>(
         &self,
         conn: &C,
@@ -41,16 +35,13 @@ impl EventsOutboxRepo {
             occurred_at: Set(time::OffsetDateTime::now_utc()),
             published_at: Set(None),
         };
-        // No tenant scope on this table — allow_all() is intentional.
         secure_insert::<Entity>(am, &AccessScope::allow_all(), conn)
             .await
-            .map_err(db_err)?;
+            .map_err(DomainError::from)?;
         Ok(())
     }
 
-    /// List event rows for a specific file ordered by occurrence time — useful in tests.
-    ///
-    /// @cpt-cf-file-storage-fr-file-events
+    /// List event rows for a file ordered by occurrence time (used in tests).
     pub async fn list_for_file<C: DBRunner>(
         &self,
         conn: &C,
@@ -63,7 +54,7 @@ impl EventsOutboxRepo {
             .scope_with(&AccessScope::allow_all())
             .all(conn)
             .await
-            .map_err(db_err)?;
+            .map_err(DomainError::from)?;
         Ok(rows)
     }
 }

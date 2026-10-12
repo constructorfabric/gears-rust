@@ -12,46 +12,26 @@ use crate::infra::backend::BackendCapabilities;
 use crate::infra::backend::BackendRegistry;
 use crate::infra::storage::Store;
 
-// ── backend migration (P2-M4) ──────────────────────────────────────────────────
-
 impl FileService {
-    /// Relocate a non-versioned file's content from one backend to another
-    /// without changing its identity (`file_id`, ownership, metadata, content
-    /// hash).
+    /// Relocate a non-versioned file's content to another backend, keeping its identity.
     ///
-    /// Steps:
-    /// 1. Verify the file has exactly 1 version (non-versioned files only).
-    /// 2. Read the blob from the source backend.
-    /// 3. Write the blob to the destination backend at the canonical path.
-    /// 4. Verify the content hash matches the stored version hash (SHA-256).
-    /// 5. Transactionally update `backend_id` + `backend_path` and emit a
-    ///    `BackendMigrate` audit row.
-    /// 6. Best-effort delete the source blob (orphan cleanup if this fails).
-    ///
-    /// Returns `Ok(())` when the file already lives on the target backend
-    /// (no-op), or after the migration completes successfully.
-    ///
-    /// @cpt-cf-file-storage-fr-backend-migration
-    /// @cpt-dod:cpt-cf-file-storage-dod-backend-migration-endpoint:p1
-    // @cpt-begin:cpt-cf-file-storage-flow-backend-migration:p1:inst-migrate-request
+    /// Reads the blob, verifies its content hash, writes it to the destination, then
+    /// rebinds `backend_id`/`backend_path` and audits in one transaction; the source blob
+    /// is deleted best-effort (left as an orphan if that fails). No-op when the file is
+    /// already on the target backend.
     pub async fn migrate_backend(
         &self,
         ctx: &SecurityContext,
         file_id: Uuid,
         target_backend_id: &str,
     ) -> Result<(), DomainError> {
-        // @cpt-end:cpt-cf-file-storage-flow-backend-migration:p1:inst-migrate-request
-        // @cpt-begin:cpt-cf-file-storage-flow-backend-migration:p1:inst-migrate-authz
         let prefetch = Self::tenant_scope(ctx);
         let file = self.store.require_file(&prefetch, file_id).await?;
         let _scope = self
             .authorizer
             .authorize(ctx, actions::WRITE, &file.gts_file_type, Some(file_id))
             .await?;
-        // @cpt-end:cpt-cf-file-storage-flow-backend-migration:p1:inst-migrate-authz
 
-        // Only non-versioned files (exactly 1 version) may be migrated.
-        // @cpt-begin:cpt-cf-file-storage-flow-backend-migration:p1:inst-migrate-single-version-check
         let versions = self.store.list_versions(file_id).await?;
         if versions.len() != 1 {
             return Err(DomainError::versioned_file_migration_not_supported(file_id));
@@ -59,30 +39,21 @@ impl FileService {
 
         let version = &versions[0];
 
-        // The version must be in the `available` state.
         if version.status != file_storage_sdk::VersionStatus::Available {
             return Err(DomainError::conflict(
                 "cannot migrate a version whose upload has not been finalized",
             ));
         }
-        // @cpt-end:cpt-cf-file-storage-flow-backend-migration:p1:inst-migrate-single-version-check
 
-        // No-op if already on the target backend.
-        // @cpt-begin:cpt-cf-file-storage-flow-backend-migration:p1:inst-migrate-noop
         if version.backend_id == target_backend_id {
             return Ok(());
         }
-        // @cpt-end:cpt-cf-file-storage-flow-backend-migration:p1:inst-migrate-noop
 
         let source = self.backends.get(&version.backend_id)?;
         let dest = self.backends.get(target_backend_id)?;
 
-        // Migrating content onto a non-durable backend (e.g. a dev/test
-        // `memory` backend) risks silent data loss on the next restart. An
-        // ordinary WRITE-authorized caller may not do this implicitly — it
+        // A non-durable destination (e.g. `memory`) risks data loss on restart, so it
         // requires the elevated admin-policy scope.
-        // @cpt-begin:cpt-cf-file-storage-flow-backend-migration:p1:inst-migrate-nondurable-gate
-        // @cpt-dod:cpt-cf-file-storage-dod-backend-migration-durability-gate:p2
         if !dest.capabilities().durable {
             self.authorizer
                 .authorize(
@@ -93,24 +64,11 @@ impl FileService {
                 )
                 .await?;
         }
-        // @cpt-end:cpt-cf-file-storage-flow-backend-migration:p1:inst-migrate-nondurable-gate
 
-        // Read the blob from the source backend.
-        // @cpt-begin:cpt-cf-file-storage-flow-backend-migration:p1:inst-migrate-read-source
         let bytes = source.get(&version.backend_path).await?;
-        // @cpt-end:cpt-cf-file-storage-flow-backend-migration:p1:inst-migrate-read-source
 
-        // Verify content hash before writing to destination — mode-aware
-        // (ADR-0006). For `whole-sha256` this is the unchanged whole-object
-        // re-hash. For `multipart-composite-sha256` it fetches the version's
-        // `version_hash_manifest` row and verifies from the object bytes +
-        // that manifest ALONE (split-rehash-rebuild-compare), with no
-        // dependency on `multipart_upload_parts` still existing — the manifest
-        // is the durable, self-contained record.
-        // Hash computation stays in `Store` (which already owns the SHA-256
-        // allow-list import), so `FileService` needs no direct `hash` edge.
-        // @cpt-begin:cpt-cf-file-storage-flow-backend-migration:p1:inst-migrate-verify
-        // @cpt-begin:cpt-cf-file-storage-algo-backend-migration-verify:p1:inst-verify-migrate-parse-mode
+        // Verify the content hash before writing to the destination. For multipart-composite
+        // versions this uses the durable `version_hash_manifest` row, not the part rows.
         let hash_mode = crate::infra::content::hash_mode::HashMode::parse(&version.hash_mode)
             .ok_or_else(|| {
                 DomainError::database(format!(
@@ -118,13 +76,8 @@ impl FileService {
                     version.version_id, version.hash_mode
                 ))
             })?;
-        // @cpt-end:cpt-cf-file-storage-algo-backend-migration-verify:p1:inst-verify-migrate-parse-mode
         let manifest = match hash_mode {
-            // @cpt-begin:cpt-cf-file-storage-algo-backend-migration-verify:p1:inst-verify-migrate-whole
             crate::infra::content::hash_mode::HashMode::WholeSha256 => None,
-            // @cpt-end:cpt-cf-file-storage-algo-backend-migration-verify:p1:inst-verify-migrate-whole
-            // @cpt-begin:cpt-cf-file-storage-algo-backend-migration-verify:p1:inst-verify-migrate-fetch-manifest
-            // @cpt-begin:cpt-cf-file-storage-algo-backend-migration-verify:p1:inst-verify-migrate-no-parts-dependency
             crate::infra::content::hash_mode::HashMode::MultipartCompositeSha256 => {
                 Some(self.store.get_version_manifest(version.version_id).await?.ok_or_else(
                     || {
@@ -135,27 +88,14 @@ impl FileService {
                     },
                 )?)
             }
-            // @cpt-end:cpt-cf-file-storage-algo-backend-migration-verify:p1:inst-verify-migrate-no-parts-dependency
-            // @cpt-end:cpt-cf-file-storage-algo-backend-migration-verify:p1:inst-verify-migrate-fetch-manifest
         };
-        // @cpt-begin:cpt-cf-file-storage-algo-backend-migration-verify:p1:inst-verify-migrate-shared-algo
-        // @cpt-begin:cpt-cf-file-storage-algo-backend-migration-verify:p1:inst-verify-migrate-return
         Store::verify_content_hash(&bytes, hash_mode, &version.hash_value, manifest.as_deref())?;
-        // @cpt-end:cpt-cf-file-storage-algo-backend-migration-verify:p1:inst-verify-migrate-return
-        // @cpt-end:cpt-cf-file-storage-algo-backend-migration-verify:p1:inst-verify-migrate-shared-algo
-        // @cpt-end:cpt-cf-file-storage-flow-backend-migration:p1:inst-migrate-verify
 
-        // Write to the destination at the canonical path.
-        // @cpt-begin:cpt-cf-file-storage-flow-backend-migration:p1:inst-migrate-write-dest
         let dest_path = Self::backend_path(file_id, version.version_id);
         dest.put(&dest_path, bytes).await?;
-        // @cpt-end:cpt-cf-file-storage-flow-backend-migration:p1:inst-migrate-write-dest
 
-        // Transactionally update the version row and emit the audit row. The
-        // CAS predicate is the pre-migration snapshot captured above (before
-        // the source read / destination write), so a concurrent migration
-        // that already moved the pointer is detected rather than silently
-        // overwritten.
+        // The CAS predicate is the pre-migration snapshot, so a concurrent migration that
+        // already moved the pointer is detected rather than overwritten.
         let audit = Self::audit_ok(
             ctx,
             Some(file_id),
@@ -166,7 +106,6 @@ impl FileService {
                 "version_id": version.version_id,
             }),
         );
-        // @cpt-begin:cpt-cf-file-storage-flow-backend-migration:p1:inst-migrate-cas-rebind
         let updated = self
             .store
             .rebind_version_backend(
@@ -179,68 +118,42 @@ impl FileService {
                 audit,
             )
             .await?;
-        // @cpt-end:cpt-cf-file-storage-flow-backend-migration:p1:inst-migrate-cas-rebind
         if !updated {
-            // The CAS lost: either the version is gone, or a concurrent
-            // migration already moved the pointer away from the snapshot we
-            // started from. Re-fetch to tell these apart — the destination
-            // blob we just wrote may or may not be safe to clean up depending
-            // on which case this is.
-            // @cpt-begin:cpt-cf-file-storage-flow-backend-migration:p1:inst-migrate-cas-race
-            // @cpt-begin:cpt-cf-file-storage-algo-backend-migration-race-resolve:p1:inst-race-refetch
+            // CAS lost: the version is gone or a concurrent migration moved the pointer.
+            // Re-fetch to decide whether our destination blob is safe to delete.
             let current = self.store.get_version(file_id, version.version_id).await?;
-            // @cpt-end:cpt-cf-file-storage-algo-backend-migration-race-resolve:p1:inst-race-refetch
             return match current {
-                // @cpt-begin:cpt-cf-file-storage-algo-backend-migration-race-resolve:p1:inst-race-gone
                 None => {
-                    // Version gone: the blob we wrote is genuinely orphaned.
+                    // Version gone: our blob is orphaned.
                     self.best_effort_blob_delete(dest.id(), &dest_path).await;
                     Err(DomainError::version_not_found(file_id, version.version_id))
                 }
-                // @cpt-end:cpt-cf-file-storage-algo-backend-migration-race-resolve:p1:inst-race-gone
-                // @cpt-begin:cpt-cf-file-storage-algo-backend-migration-race-resolve:p1:inst-race-same-target-winner
                 Some(now)
                     if now.backend_id == target_backend_id && now.backend_path == dest_path =>
                 {
-                    // A concurrent migration to the SAME target already
-                    // committed this exact pointer as the live one (dest_path
-                    // is deterministic, so racers to the same backend collide
-                    // on the same path). Treat as a successful no-op and, above
-                    // all, do NOT delete the destination blob -- it is the
-                    // winner's live content, not ours to clean up.
+                    // A concurrent migration to the same target committed this exact pointer
+                    // (`dest_path` is deterministic): success, and do NOT delete the blob,
+                    // it is the winner's live content.
                     Ok(())
                 }
-                // @cpt-end:cpt-cf-file-storage-algo-backend-migration-race-resolve:p1:inst-race-same-target-winner
-                // @cpt-begin:cpt-cf-file-storage-algo-backend-migration-race-resolve:p1:inst-race-different-winner
                 Some(now) => {
-                    // A different concurrent migration won. Our destination
-                    // write is not the live pointer, so it is safe to clean up
-                    // -- guarded by the belt-and-suspenders check below in
-                    // case the live pointer ever coincides with it for some
-                    // other reason.
+                    // A different migration won; our blob is not live, so clean it up
+                    // (guarded in case the live pointer coincides with it).
                     if !(now.backend_id == dest.id() && now.backend_path == dest_path) {
                         self.best_effort_blob_delete(dest.id(), &dest_path).await;
                     }
                     Err(DomainError::conflict(
                         "concurrent backend migration in progress",
                     ))
-                } // @cpt-end:cpt-cf-file-storage-algo-backend-migration-race-resolve:p1:inst-race-different-winner
+                }
             };
-            // @cpt-end:cpt-cf-file-storage-flow-backend-migration:p1:inst-migrate-cas-race
         }
 
-        // Best-effort delete the source blob.
-        // @cpt-begin:cpt-cf-file-storage-flow-backend-migration:p1:inst-migrate-cleanup-source
         self.best_effort_blob_delete(source.id(), &version.backend_path)
             .await;
-        // @cpt-end:cpt-cf-file-storage-flow-backend-migration:p1:inst-migrate-cleanup-source
 
-        // @cpt-begin:cpt-cf-file-storage-flow-backend-migration:p1:inst-migrate-return
         Ok(())
-        // @cpt-end:cpt-cf-file-storage-flow-backend-migration:p1:inst-migrate-return
     }
-
-    // ── backends discovery ────────────────────────────────────────────────────
 
     /// `GET /storages`: configured backends and their capabilities.
     #[must_use]
@@ -254,8 +167,6 @@ impl FileService {
         Ok((b.id().to_owned(), b.capabilities()))
     }
 }
-
-// ── DataPlanePort implementation ──────────────────────────────────────────────
 
 #[async_trait::async_trait]
 impl DataPlanePort for FileService {

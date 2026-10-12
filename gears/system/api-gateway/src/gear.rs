@@ -70,45 +70,46 @@ use crate::web;
 	lifecycle(entry = "serve", stop_timeout = "30s", await_ready)
 )]
 pub struct ApiGateway {
-    // Lock-free config using arc-swap for read-mostly access
+    /// Lock-free config using arc-swap for read-mostly access
     pub(crate) config: ArcSwap<ApiGatewayConfig>,
-    // OpenAPI registry for operations and schemas
+    /// `OpenAPI` registry for operations and schemas
     pub(crate) openapi_registry: Arc<OpenApiRegistryImpl>,
-    // Built router cache for zero-lock hot path access
+    /// Built router cache for zero-lock hot path access
     pub(crate) router_cache: RouterCache<axum::Router>,
-    // Store the finalized router from REST phase for serving
+    /// Store the finalized router from REST phase for serving
     pub(crate) final_router: Mutex<Option<axum::Router>>,
-    // AuthN Resolver client (resolved during init, None when auth_disabled)
+    /// `AuthN` Resolver client (resolved during init, `None` when `auth_disabled`)
     pub(crate) authn_client: Mutex<Option<Arc<dyn AuthNResolverClient>>>,
-    // Inbound platform-plane authenticator (built in init from
-    // `config.internal_auth`, None in Profile 1). When present, the stack layers
-    // `internal_auth_middleware` ahead of the tenant plane so co-hosted internal
-    // routes get a validated `PlatformSecurityContext` (`cpt-cf-adr-two-plane-auth`).
+    /// Inbound platform-plane authenticator (built in init from
+    /// `config.internal_auth`, None in Profile 1). When present, the stack layers
+    /// `internal_auth_middleware` ahead of the tenant plane so co-hosted internal
+    /// routes get a validated `PlatformSecurityContext` (`cpt-cf-adr-two-plane-auth`).
     pub(crate) internal_authenticator: Mutex<Option<DynInternalAuthenticator>>,
-    // Readiness registry, set once from `rest_prepare`; `OnceLock` = lock-free reads.
+    /// Readiness registry, set once from `rest_prepare`; `OnceLock` = lock-free reads.
     pub(crate) healthcheck_registry: OnceLock<Arc<toolkit::RestHealthcheckRegistry>>,
-    // Built-once standalone health router. Served on the separate health listener in
-    // `separate`/`both` mode and merged onto the main router in `main`/`both` mode. Cached
-    // so repeat `health_router()`/`build_health_router()` calls are cheap.
+    /// Built-once standalone health router. Served on the separate health listener in
+    /// `separate`/`both` mode and merged onto the main router in `main`/`both` mode. Cached
+    /// so repeat `health_router()`/`build_health_router()` calls are cheap.
     pub(crate) health_router: OnceLock<axum::Router>,
-    // Pending throttling keyed-store pruner from the last middleware build;
-    // consumed by `serve` to spawn a prune task bound to the lifecycle token.
+    /// Pending throttling keyed-store pruner from the last middleware build;
+    /// consumed by `serve` to spawn a prune task bound to the lifecycle token.
     pub(crate) throttle_key_pruner: Mutex<Option<middleware::throttling::ThrottleKeyPruner>>,
 
-    // Duplicate detection (per (method, path) and per handler id)
+    /// Duplicate detection by (method, path).
     pub(crate) registered_routes: DashMap<(Method, String), ()>,
+    /// Duplicate detection by handler id.
     pub(crate) registered_handlers: DashMap<String, ()>,
 
-    // Reverse-proxy route table (embedded edge). Populated by the directory-sync
-    // task and read by the Forwarder fallback; empty/unused when
-    // `gateway_proxy` is disabled.
+    /// Reverse-proxy route table (embedded edge). Populated by the directory-sync
+    /// task and read by the Forwarder fallback; empty/unused when
+    /// `gateway_proxy` is disabled.
     pub(crate) proxy_registry: Arc<toolkit_gateway::ProxyRegistry>,
 
-    // Base URL other pods use to reach this gateway, published once the main
-    // listener binds (from `serve`). Read by the runtime's directory-register
-    // phase (via `ApiGatewayCapability::bound_endpoint`) to advertise in-process
-    // REST providers. Write-once/read-many, so `OnceLock` (lock-free reads),
-    // matching `healthcheck_registry`/`health_router`; unset until the server binds.
+    /// Base URL other pods use to reach this gateway, published once the main
+    /// listener binds (from `serve`). Read by the runtime's directory-register
+    /// phase (via `ApiGatewayCapability::bound_endpoint`) to advertise in-process
+    /// REST providers. Write-once/read-many, so `OnceLock` (lock-free reads),
+    /// matching `healthcheck_registry`/`health_router`; unset until the server binds.
     pub(crate) bound_endpoint: OnceLock<String>,
 }
 

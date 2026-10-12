@@ -29,6 +29,7 @@
 //! network call and read **no** snapshot tables — those are deferred (design
 //! §13 / I-6).
 
+use bss_ledger_sdk::money::PostedMoney;
 use toolkit_macros::domain_model;
 
 use crate::domain::error::DomainError;
@@ -46,16 +47,10 @@ pub struct RecognitionContext<'a> {
     /// The invoice's fiscal `period_id` (`YYYYMM`) — the default first segment
     /// period for a `STRAIGHT_LINE` schedule whose `first_period_id` is `None`.
     pub invoice_period_id: &'a str,
-    /// This item's ex-tax amount in minor units (the whole-amount that defers /
-    /// recognizes). Must be `>= 0`.
-    pub item_amount_minor_ex_tax: i64,
-    /// The invoice's gross total in minor units — the denominator of the R4
-    /// immaterial-one-shot exemption (`<= 1% of invoice total`).
-    pub invoice_total_minor: i64,
-    /// The item's ISO currency (stamped on the schedule; the R4 100-USD-equiv leg
-    /// is evaluated against it — v1 treats the minor amount as USD-equivalent,
-    /// see [`super::builder`]).
-    pub currency: &'a str,
+    /// This item's nonnegative ex-tax posting with its stored currency spec.
+    pub item_amount_ex_tax: &'a PostedMoney,
+    /// The invoice's gross posting; must share the item's currency and stored scale.
+    pub invoice_total: &'a PostedMoney,
     /// The item's revenue stream (one schedule per stream, §4.5).
     pub revenue_stream: &'a str,
 }

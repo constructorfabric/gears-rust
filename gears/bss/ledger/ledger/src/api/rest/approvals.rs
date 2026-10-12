@@ -24,12 +24,16 @@ use uuid::Uuid;
 use crate::api::rest::auth_context::require_authenticated;
 use crate::api::rest::canonical_json::CanonicalJson;
 use crate::api::rest::dto::DualControlPolicyView;
+use crate::api::rest::dto::parse_money;
 use crate::api::rest::error::authz_error_to_canonical;
+use crate::api::rest::money::MoneyDto;
 use crate::domain::approval::intent::ApprovalIntent;
 use crate::domain::error::DomainError;
 use crate::domain::instant::rfc3339;
 use crate::infra::approval::service::ApprovalService;
-use crate::infra::storage::entity::{dual_control_approval, dual_control_comment};
+use crate::infra::approval::stored_intent::decode_client_intent;
+use crate::infra::storage::entity::dual_control_comment;
+use crate::infra::storage::repo::approval_repo::ApprovalRow;
 use time::OffsetDateTime;
 
 /// `OpenAPI` tag applied to the approval operations.
@@ -66,11 +70,14 @@ pub struct ApprovalDto {
     // string the `date-time` schema promises and `prepared_at` beside it emits.
     #[serde(with = "rfc3339")]
     pub expires_at: OffsetDateTime,
-    pub amount_usd_eq_minor: Option<i64>,
+    /// The governed magnitude the D2 threshold was compared against, in the
+    /// operation's own currency and stored scale; `null` for a kind with no
+    /// monetary facts (period reopen, payer closure).
+    pub amount: Option<MoneyDto>,
 }
 
-impl From<dual_control_approval::Model> for ApprovalDto {
-    fn from(m: dual_control_approval::Model) -> Self {
+impl From<ApprovalRow> for ApprovalDto {
+    fn from(m: ApprovalRow) -> Self {
         Self {
             approval_id: m.approval_id,
             kind: m.kind,
@@ -83,7 +90,7 @@ impl From<dual_control_approval::Model> for ApprovalDto {
             approved_by: m.approved_by,
             decided_at: m.decided_at,
             expires_at: m.expires_at,
-            amount_usd_eq_minor: m.amount_usd_eq_minor,
+            amount: m.amount.as_ref().map(MoneyDto::from),
         }
     }
 }
@@ -157,10 +164,12 @@ pub struct ListQuery {
 
 /// A new dual-control threshold policy version to write (DC8). `effective_from`
 /// defaults to now when omitted; out-of-range D2/A6/TTL is rejected (409, no clamp).
+/// `d2_thresholds` carries one threshold per currency (each with its stored
+/// scale); a currency with no entry resolves the symbolic platform default.
 #[derive(Debug, Clone)]
 #[toolkit_macros::api_dto(request)]
 pub struct SetDualControlPolicyRequest {
-    pub d2_threshold_minor: i64,
+    pub d2_thresholds: Vec<MoneyDto>,
     pub a6_backdating_biz_days: i32,
     pub pending_ttl_seconds: i64,
     #[serde(default, with = "rfc3339::option")]
@@ -175,7 +184,7 @@ pub struct DualControlPolicyResponse {
     pub version: i64,
     #[serde(with = "rfc3339")]
     pub effective_from: OffsetDateTime,
-    pub d2_threshold_minor: i64,
+    pub d2_thresholds: Vec<MoneyDto>,
     pub a6_backdating_biz_days: i32,
     pub pending_ttl_seconds: i64,
 }
@@ -577,12 +586,19 @@ async fn set_policy(
     let ctx = require_authenticated(extension_ctx)?;
     let scope = policy_scope(&enforcer, &ctx).await?;
     let effective_from = body.effective_from.unwrap_or_else(OffsetDateTime::now_utc);
+    // Validate (never round) each per-currency threshold at the boundary; the
+    // service rejects a repeated currency and an out-of-range value (409).
+    let d2_thresholds = body
+        .d2_thresholds
+        .into_iter()
+        .map(|m| parse_money("d2_thresholds", m))
+        .collect::<Result<Vec<_>, _>>()?;
     let version = state
         .service
         .set_policy(
             &ctx,
             &scope,
-            body.d2_threshold_minor,
+            d2_thresholds.clone(),
             body.a6_backdating_biz_days,
             body.pending_ttl_seconds,
             effective_from,
@@ -593,7 +609,7 @@ async fn set_policy(
         Json(DualControlPolicyResponse {
             version,
             effective_from,
-            d2_threshold_minor: body.d2_threshold_minor,
+            d2_thresholds: d2_thresholds.iter().map(MoneyDto::from).collect(),
             a6_backdating_biz_days: body.a6_backdating_biz_days,
             pending_ttl_seconds: body.pending_ttl_seconds,
         }),
@@ -712,11 +728,9 @@ async fn resubmit(
     // resolves the read plane, and `ApprovalService::resubmit` enforces
     // `actor == prepared_by`, so an approver who is not the preparer is rejected.
     let (scope, _) = approval_access(&enforcer, &ctx).await?;
-    let intent: ApprovalIntent = serde_json::from_value(body.intent).map_err(|e| {
-        CanonicalError::from(DomainError::InvalidRequest(format!(
-            "resubmit intent is not a valid approval intent: {e}"
-        )))
-    })?;
+    // The wire intent is the same tagged JSON the approval row persists; the
+    // codec validates (never rounds) any money inside it.
+    let intent: ApprovalIntent = decode_client_intent(body.intent).map_err(CanonicalError::from)?;
     // The threshold snapshot is recomputed inside `resubmit` (DC17) against the
     // edited intent + the policy in force — the handler no longer fabricates one.
     state
@@ -836,7 +850,7 @@ mod dto_wire_tests {
             approved_by: None,
             decided_at: Some(at),
             expires_at: at,
-            amount_usd_eq_minor: None,
+            amount: None,
         };
         let json = serde_json::to_value(&dto).expect("serialize");
         for field in ["prepared_at", "decided_at", "expires_at"] {

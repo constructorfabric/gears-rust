@@ -16,8 +16,8 @@ use chrono::Datelike;
 use uuid::Uuid;
 
 use super::canonical::{
-    digest32, put, put_i32, put_i64, put_none, put_opt_i64, put_opt_str, put_opt_uuid, put_str,
-    put_uuid,
+    digest32, put, put_i32, put_i64, put_money, put_none, put_opt_money, put_opt_str, put_opt_uuid,
+    put_str, put_uuid,
 };
 use crate::domain::instant::timestamp_micros;
 use crate::domain::model::{NewEntry, NewLine};
@@ -72,11 +72,8 @@ pub fn chain_row_hash(entry: &NewEntry, lines: &[NewLine], prev_hash: &[u8; 32])
         put_str(&mut buf, l.account_class.as_str());
         put_opt_str(&mut buf, l.gl_code.as_deref());
         put_str(&mut buf, l.side.as_str());
-        put_i64(&mut buf, l.amount_minor);
-        put_str(&mut buf, &l.currency);
-        put(&mut buf, &[l.currency_scale]);
-        put_opt_i64(&mut buf, l.functional_amount_minor);
-        put_opt_str(&mut buf, l.functional_currency.as_deref());
+        put_money(&mut buf, &l.money);
+        put_opt_money(&mut buf, l.functional_money.as_ref());
         put_uuid(&mut buf, l.payer_tenant_id);
         put_opt_uuid(&mut buf, l.seller_tenant_id);
         put_opt_uuid(&mut buf, l.resource_tenant_id);

@@ -21,18 +21,25 @@
 //! payload — rather than adding a `sha2` dependency.
 
 use aws_lc_rs::digest::{SHA256, digest as sha256};
+use bss_ledger_sdk::money::{MoneyError, PostedMoney};
 use bss_ledger_sdk::{AccountClass, EntryView, PostEntry, PostLine, Side, SourceDocType};
 use toolkit_macros::domain_model;
 use uuid::Uuid;
 
+use crate::domain::error::DomainError;
+use crate::domain::posting::is_functional_only;
+
 /// Why a reversal could not be built.
 #[domain_model]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum ReversalError {
     /// The supplied original is itself a `REVERSAL` — reversing a reversal is
     /// forbidden (correct forward by re-posting, never stack reversals).
     #[error("cannot reverse an entry that is itself a reversal")]
     CannotReverseReversal,
+    /// Header currency or stored line scales disagree.
+    #[error(transparent)]
+    Money(#[from] MoneyError),
     /// The original carries a `REUSABLE_CREDIT` line whose
     /// `credit_grant_event_type` the read-back `LineView` does not expose, so a
     /// faithful reversal cannot be reconstructed (it would violate the DB
@@ -84,6 +91,13 @@ pub fn build_reversal(
     {
         return Err(ReversalError::CreditGrantNotReconstructible);
     }
+    validate_money(
+        &original.entry_currency,
+        original
+            .lines
+            .iter()
+            .map(|l| (&l.money, l.functional_money.as_ref())),
+    )?;
     let entry_id = Uuid::now_v7();
     let lines = original.lines.iter().map(flip_line).collect();
 
@@ -110,7 +124,10 @@ pub fn build_reversal(
 /// original (the reversal cleared it; this re-books it correctly).
 ///
 /// `correction_id` is [`correction_id`]`(original.entry_id, reversal_entry_id)`.
-#[must_use]
+///
+/// # Errors
+/// [`ReversalError::Money`] when a corrected line's currency metadata disagrees with the
+/// original entry currency.
 #[allow(clippy::too_many_arguments)] // each is a distinct, non-confusable field
 pub fn build_mapping_correction(
     original: &EntryView,
@@ -121,9 +138,15 @@ pub fn build_mapping_correction(
     posted_by_actor_id: Uuid,
     correlation_id: Uuid,
     corrected_lines: Vec<PostLine>,
-) -> PostEntry {
+) -> Result<PostEntry, ReversalError> {
+    validate_money(
+        &original.entry_currency,
+        corrected_lines
+            .iter()
+            .map(|l| (&l.money, l.functional_money.as_ref())),
+    )?;
     let correction = correction_id(original.entry_id, reversal_entry_id);
-    PostEntry {
+    Ok(PostEntry {
         entry_id: Uuid::now_v7(),
         tenant_id: original.tenant_id,
         period_id: into_period_id,
@@ -138,7 +161,7 @@ pub fn build_mapping_correction(
         reverses_entry_id: Some(reversal_entry_id),
         reverses_period_id: Some(original.period_id.clone()),
         lines: corrected_lines,
-    }
+    })
 }
 
 /// Stable correction id for a `(original, reversal)` entry pair: the hex SHA-256
@@ -172,19 +195,17 @@ fn flip_line(line: &bss_ledger_sdk::LineView) -> PostLine {
         account_class: line.account_class,
         gl_code: line.gl_code.clone(),
         side: flip(line.side),
-        amount_minor: line.amount_minor,
-        currency: line.currency.clone(),
+        money: line.money.clone(),
         invoice_id: line.invoice_id.clone(),
         due_date: line.due_date,
         revenue_stream: line.revenue_stream.clone(),
         mapping_status: line.mapping_status,
         // Reverse at the ORIGINAL locked rate: copy the original line's functional
-        // translation (kept positive, like `amount_minor`); the flipped DR/CR side
+        // translation (kept positive, like `money`); the flipped DR/CR side
         // makes the functional delta net the original to zero. NO re-lock (spec
         // §4.2 F-8c) — a reversal must not synthesize FX gain/loss. Cross-currency
         // lines carry a functional value; single-currency lines carry `None`.
-        functional_amount_minor: line.functional_amount_minor,
-        functional_currency: line.functional_currency.clone(),
+        functional_money: line.functional_money.clone(),
         tax_jurisdiction: line.tax_jurisdiction.clone(),
         tax_filing_period: line.tax_filing_period.clone(),
         tax_rate_ref: None,
@@ -195,9 +216,85 @@ fn flip_line(line: &bss_ledger_sdk::LineView) -> PostLine {
         po_allocation_group: None,
         credit_grant_event_type: None,
         // Preserve the AR sub-class so a reversal nets the original disputed
-        // delta on the same `ar_invoice_balance` sub-grain (`disputed_minor`).
+        // delta on the same `ar_invoice_balance` sub-grain (disputed balance).
         ar_status: line.ar_status.clone(),
     }
+}
+
+/// The governed magnitude of reversing `original` (its dual-control comparand):
+/// the exact debit total in the entry currency. A functional-only line in
+/// another currency carries no transaction value and is left out, by the same
+/// classification [`build_reversal`] validates with.
+///
+/// `None` when no debit line carries transaction value.
+///
+/// # Errors
+/// [`DomainError::Internal`] naming the entry when its stored lines disagree with
+/// its header (another currency, two scales) or their debit total is not
+/// representable: stored history the caller cannot fix, the same category
+/// `build_reversal`'s stored money disagreement maps to.
+pub fn reverse_governed_amount(original: &EntryView) -> Result<Option<PostedMoney>, DomainError> {
+    let stored = |detail: String| {
+        DomainError::Internal(format!(
+            "stored entry {} money metadata is inconsistent: {detail}",
+            original.entry_id
+        ))
+    };
+    let header = original.entry_currency.as_str();
+    validate_money(
+        header,
+        original
+            .lines
+            .iter()
+            .map(|l| (&l.money, l.functional_money.as_ref())),
+    )
+    .map_err(|e| stored(e.to_string()))?;
+    let mut debits = original.lines.iter().filter(|l| {
+        l.side == Side::Debit
+            && !foreign_functional_only(header, &l.money, l.functional_money.as_ref())
+    });
+    let Some(first) = debits.next() else {
+        return Ok(None);
+    };
+    crate::domain::exact_money::sum_posted(
+        std::iter::once(&first.money).chain(debits.map(|l| &l.money)),
+        first.money.currency(),
+    )
+    .map(Some)
+    .map_err(|e| stored(e.to_string()))
+}
+
+/// A functional-only line ([`is_functional_only`]) in a currency other than the
+/// entry's `header`: the posting engine admits it, it carries no transaction
+/// value, and its own scale belongs to that other currency.
+fn foreign_functional_only(
+    header: &str,
+    money: &PostedMoney,
+    functional_money: Option<&PostedMoney>,
+) -> bool {
+    is_functional_only(money, functional_money) && money.currency().code() != header
+}
+
+/// Check transaction metadata against the header before building a copied entry.
+/// Each item is a line's transaction money and its functional money.
+fn validate_money<'a>(
+    header: &str,
+    lines: impl Iterator<Item = (&'a PostedMoney, Option<&'a PostedMoney>)>,
+) -> Result<(), MoneyError> {
+    let mut scale = None;
+    for (value, functional) in lines {
+        if foreign_functional_only(header, value, functional) {
+            continue;
+        }
+        if value.currency().code() != header {
+            return Err(MoneyError::CurrencyMismatch);
+        }
+        if scale.is_some_and(|stored| stored != value.currency().scale()) {
+            return Err(MoneyError::ScaleMismatch);
+        }
+        scale = Some(value.currency().scale());
+    }
+    Ok(())
 }
 
 /// The opposite posting side.
@@ -211,3 +308,7 @@ const fn flip(side: Side) -> Side {
 #[cfg(test)]
 #[path = "reversal_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "reversal_governed_tests.rs"]
+mod governed_tests;

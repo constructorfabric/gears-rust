@@ -246,133 +246,160 @@ async fn release_sync_lock(lock: toolkit_db::DbLockGuard, owner: &str, name: &st
     }
 }
 
+/// Database provider handle the service uses for transactions and queries.
 pub(crate) type DbProvider = toolkit_db::DBProvider<toolkit_db::DbError>;
 
+/// Authorization resource type `github_mirror.repo` (the mirrored repo).
 pub(crate) const REPO_RESOURCE: ResourceType = ResourceType::from_static(
     "github_mirror.repo",
     &[pep_properties::OWNER_TENANT_ID, pep_properties::RESOURCE_ID],
 );
 
+/// Authorization resource type `github_mirror.issue` (the mirrored issue).
 pub(crate) const ISSUE_RESOURCE: ResourceType = ResourceType::from_static(
     "github_mirror.issue",
     &[pep_properties::OWNER_TENANT_ID, pep_properties::RESOURCE_ID],
 );
 
+/// Authorization resource type `github_mirror.pull_request` (the mirrored pull request).
 pub(crate) const PULL_REQUEST_RESOURCE: ResourceType = ResourceType::from_static(
     "github_mirror.pull_request",
     &[pep_properties::OWNER_TENANT_ID, pep_properties::RESOURCE_ID],
 );
 
+/// Authorization resource type `github_mirror.commit` (the mirrored commit).
 pub(crate) const COMMIT_RESOURCE: ResourceType = ResourceType::from_static(
     "github_mirror.commit",
     &[pep_properties::OWNER_TENANT_ID, pep_properties::RESOURCE_ID],
 );
 
+/// Authorization resource type `github_mirror.comment` (the mirrored comment).
 pub(crate) const COMMENT_RESOURCE: ResourceType = ResourceType::from_static(
     "github_mirror.comment",
     &[pep_properties::OWNER_TENANT_ID, pep_properties::RESOURCE_ID],
 );
 
+/// Authorization resource type `github_mirror.review_comment` (the mirrored review comment).
 pub(crate) const REVIEW_COMMENT_RESOURCE: ResourceType = ResourceType::from_static(
     "github_mirror.review_comment",
     &[pep_properties::OWNER_TENANT_ID, pep_properties::RESOURCE_ID],
 );
 
+/// Authorization resource type `github_mirror.review` (the mirrored review).
 pub(crate) const REVIEW_RESOURCE: ResourceType = ResourceType::from_static(
     "github_mirror.review",
     &[pep_properties::OWNER_TENANT_ID, pep_properties::RESOURCE_ID],
 );
 
+/// Authorization resource type `github_mirror.label` (the mirrored label).
 pub(crate) const LABEL_RESOURCE: ResourceType = ResourceType::from_static(
     "github_mirror.label",
     &[pep_properties::OWNER_TENANT_ID, pep_properties::RESOURCE_ID],
 );
 
+/// Authorization resource type `github_mirror.milestone` (the mirrored milestone).
 pub(crate) const MILESTONE_RESOURCE: ResourceType = ResourceType::from_static(
     "github_mirror.milestone",
     &[pep_properties::OWNER_TENANT_ID, pep_properties::RESOURCE_ID],
 );
 
+/// Authorization resource type `github_mirror.release` (the mirrored release).
 pub(crate) const RELEASE_RESOURCE: ResourceType = ResourceType::from_static(
     "github_mirror.release",
     &[pep_properties::OWNER_TENANT_ID, pep_properties::RESOURCE_ID],
 );
 
+/// Authorization resource type `github_mirror.branch` (the mirrored branch).
 pub(crate) const BRANCH_RESOURCE: ResourceType = ResourceType::from_static(
     "github_mirror.branch",
     &[pep_properties::OWNER_TENANT_ID, pep_properties::RESOURCE_ID],
 );
 
+/// Authorization resource type `github_mirror.contributor` (the mirrored contributor).
 pub(crate) const CONTRIBUTOR_RESOURCE: ResourceType = ResourceType::from_static(
     "github_mirror.contributor",
     &[pep_properties::OWNER_TENANT_ID, pep_properties::RESOURCE_ID],
 );
 
+/// Authorization resource type `github_mirror.workflow_run` (the mirrored workflow run).
 pub(crate) const WORKFLOW_RUN_RESOURCE: ResourceType = ResourceType::from_static(
     "github_mirror.workflow_run",
     &[pep_properties::OWNER_TENANT_ID, pep_properties::RESOURCE_ID],
 );
 
+/// Authorization resource type `github_mirror.pull_request_file` (the mirrored pull request file).
 pub(crate) const PULL_REQUEST_FILE_RESOURCE: ResourceType = ResourceType::from_static(
     "github_mirror.pull_request_file",
     &[pep_properties::OWNER_TENANT_ID, pep_properties::RESOURCE_ID],
 );
 
+/// Authorization resource type `github_mirror.tag` (the mirrored tag).
 pub(crate) const TAG_RESOURCE: ResourceType = ResourceType::from_static(
     "github_mirror.tag",
     &[pep_properties::OWNER_TENANT_ID, pep_properties::RESOURCE_ID],
 );
 
+/// Authorization resource type `github_mirror.commit_file` (the mirrored commit file).
 pub(crate) const COMMIT_FILE_RESOURCE: ResourceType = ResourceType::from_static(
     "github_mirror.commit_file",
     &[pep_properties::OWNER_TENANT_ID, pep_properties::RESOURCE_ID],
 );
 
+/// Authorization resource type `github_mirror.review_thread` (the mirrored review thread).
 pub(crate) const REVIEW_THREAD_RESOURCE: ResourceType = ResourceType::from_static(
     "github_mirror.review_thread",
     &[pep_properties::OWNER_TENANT_ID, pep_properties::RESOURCE_ID],
 );
 
+/// Authorization resource type `github_mirror.commit_comment` (the mirrored commit comment).
 pub(crate) const COMMIT_COMMENT_RESOURCE: ResourceType = ResourceType::from_static(
     "github_mirror.commit_comment",
     &[pep_properties::OWNER_TENANT_ID, pep_properties::RESOURCE_ID],
 );
 
+/// Authorization resource type `github_mirror.issue_event` (the mirrored issue event).
 pub(crate) const ISSUE_EVENT_RESOURCE: ResourceType = ResourceType::from_static(
     "github_mirror.issue_event",
     &[pep_properties::OWNER_TENANT_ID, pep_properties::RESOURCE_ID],
 );
 
+/// Authorization resource type `github_mirror.deployment` (the mirrored deployment).
 pub(crate) const DEPLOYMENT_RESOURCE: ResourceType = ResourceType::from_static(
     "github_mirror.deployment",
     &[pep_properties::OWNER_TENANT_ID, pep_properties::RESOURCE_ID],
 );
 
+/// Authorization resource type `github_mirror.pull_request_commit` (the mirrored pull request commit).
 pub(crate) const PULL_REQUEST_COMMIT_RESOURCE: ResourceType = ResourceType::from_static(
     "github_mirror.pull_request_commit",
     &[pep_properties::OWNER_TENANT_ID, pep_properties::RESOURCE_ID],
 );
 
+/// Authorization resource type `github_mirror.commit_status` (the mirrored commit status).
 pub(crate) const COMMIT_STATUS_RESOURCE: ResourceType = ResourceType::from_static(
     "github_mirror.commit_status",
     &[pep_properties::OWNER_TENANT_ID, pep_properties::RESOURCE_ID],
 );
 
+/// Authorization resource type `github_mirror.workflow_job` (the mirrored workflow job).
 pub(crate) const WORKFLOW_JOB_RESOURCE: ResourceType = ResourceType::from_static(
     "github_mirror.workflow_job",
     &[pep_properties::OWNER_TENANT_ID, pep_properties::RESOURCE_ID],
 );
 
+/// Authorization resource type `github_mirror.issue_reaction` (the mirrored issue reaction).
 pub(crate) const ISSUE_REACTION_RESOURCE: ResourceType = ResourceType::from_static(
     "github_mirror.issue_reaction",
     &[pep_properties::OWNER_TENANT_ID, pep_properties::RESOURCE_ID],
 );
 
+/// Authorization resource type `github_mirror.check_run` (the mirrored check run).
 pub(crate) const CHECK_RUN_RESOURCE: ResourceType = ResourceType::from_static(
     "github_mirror.check_run",
     &[pep_properties::OWNER_TENANT_ID, pep_properties::RESOURCE_ID],
 );
 
+/// Authorization resource type `github_mirror.issue_timeline` (the mirrored issue timeline).
 pub(crate) const ISSUE_TIMELINE_RESOURCE: ResourceType = ResourceType::from_static(
     "github_mirror.issue_timeline",
     &[pep_properties::OWNER_TENANT_ID, pep_properties::RESOURCE_ID],
@@ -392,6 +419,8 @@ const HEARTBEAT_SECS: u64 = 2;
 /// keep its lock.
 const ABANDONED_AFTER_SECS: i64 = 300;
 
+/// How often this process refreshes its `gm_active_syncs` rows, so another
+/// process's start-up sweep sees them as alive.
 pub(crate) const ACTIVE_SYNC_TOUCH_EVERY: std::time::Duration = std::time::Duration::from_mins(1);
 
 const TAKE_ACTIVE_SYNC_ATTEMPTS: usize = 3;
@@ -406,6 +435,8 @@ const SESSION_WRITE_ATTEMPTS: u32 = 3;
 
 const SESSION_WRITE_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
 
+/// How long after start-up the interrupted-session sweep runs a second time,
+/// once a process that died just before this one has gone stale.
 pub(crate) const SWEEP_AGAIN_AFTER: std::time::Duration =
     std::time::Duration::from_secs(ABANDONED_AFTER_SECS.unsigned_abs() + HEARTBEAT_SECS);
 
@@ -421,6 +452,7 @@ const RESUME_LIMIT: usize = SYNC_QUEUE_DEPTH;
 /// While the phases run, `RepoPhaseRunner` publishes the phase-weighted
 /// estimate into this atomic after every task it finishes; the milestones
 /// below only cover what happens after the runner returns.
+#[domain_model]
 #[derive(Debug)]
 pub struct SyncProgress {
     percent: Arc<AtomicU8>,
@@ -482,18 +514,21 @@ pub(crate) const SYNC_QUEUE_DEPTH: usize = 64;
 /// The status is read rather than assumed, because a request that collapsed
 /// into a run already going is handed that run's session, which may have left
 /// `queued` some time ago.
+#[domain_model]
 #[derive(Debug, Default)]
 pub struct ResumeOutcome {
     pub session_ids: Vec<Uuid>,
     pub refused: Vec<RefusedResume>,
 }
 
+#[domain_model]
 #[derive(Debug)]
 pub struct RefusedResume {
     pub repository: String,
     pub error: DomainError,
 }
 
+#[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct QueuedSync {
     pub session_id: Uuid,
@@ -506,6 +541,7 @@ pub struct QueuedSync {
 /// The caller's [`SecurityContext`] travels with the job because the work
 /// outlives the request that asked for it, and every write it makes is still
 /// tenant-scoped through the same policy enforcer.
+#[domain_model]
 #[derive(Debug)]
 pub struct SyncJob {
     pub session_id: Uuid,
@@ -526,26 +562,35 @@ pub struct SyncJob {
         dead_code,
         reason = "held for its drop: a job that goes away, run or not, gives its claim back"
     )]
+    /// The repository's active-sync claim, released when the job is dropped.
     pub(crate) claim: Option<ClaimRelease>,
 }
 
+/// Authorization resource type `github_mirror.repo_sync_status` (the mirrored repo sync status).
 pub(crate) const REPO_SYNC_STATUS_RESOURCE: ResourceType = ResourceType::from_static(
     "github_mirror.repo_sync_status",
     &[pep_properties::OWNER_TENANT_ID, pep_properties::RESOURCE_ID],
 );
 
+/// Authorization resource type `github_mirror.sync_session` (the mirrored sync session).
 pub(crate) const SYNC_SESSION_RESOURCE: ResourceType = ResourceType::from_static(
     "github_mirror.sync_session",
     &[pep_properties::OWNER_TENANT_ID, pep_properties::RESOURCE_ID],
 );
 
+/// Authorization resource type `github_mirror.sync` (the mirrored sync).
 pub(crate) const SYNC_RESOURCE: ResourceType =
     ResourceType::from_static("github_mirror.sync", &[pep_properties::OWNER_TENANT_ID]);
 
+/// Action names used when authorizing operations against the mirror's resource types.
 pub(crate) mod actions {
+    /// Action for listing mirrored resources.
     pub const LIST: &str = "list";
+    /// Action for upserting mirrored resources (used by the sync path).
     pub const UPSERT: &str = "upsert";
+    /// Action for triggering a repository sync.
     pub const SYNC: &str = "sync";
+    /// Action for reading a single mirrored resource.
     pub const GET: &str = "get";
 }
 
@@ -631,6 +676,9 @@ enum PreparedSync {
     },
 }
 
+/// A repository's `gm_active_syncs` claim, deleted in the background when
+/// this guard is dropped.
+#[domain_model]
 pub(crate) struct ClaimRelease {
     active_syncs: Arc<dyn ActiveSyncRepository>,
     scope: AccessScope,
@@ -677,11 +725,13 @@ mod gate {
     use std::sync::Arc;
 
     use tokio::sync::{Mutex, MutexGuard};
+    use toolkit_macros::domain_model;
 
     use super::InFlightKey;
 
     type Gates = Arc<std::sync::Mutex<HashMap<InFlightKey, Arc<Mutex<()>>>>>;
 
+    #[domain_model]
     #[derive(Clone, Default)]
     pub(super) struct ClaimGates(Gates);
 
@@ -707,6 +757,7 @@ mod gate {
 
     /// What a request holds while it decides whether one repository already has a
     /// sync in flight.
+    #[domain_model]
     pub(super) struct GateLease {
         gates: Gates,
         key: InFlightKey,
@@ -4266,6 +4317,10 @@ impl Service {
         }))
     }
 
+    /// Refresh every `gm_active_syncs` row this process holds.
+    ///
+    /// # Errors
+    /// `Database` when the rows cannot be updated.
     pub(crate) async fn touch_active_syncs(&self) -> Result<(), DomainError> {
         self.active_syncs
             .touch(&AccessScope::allow_all(), self.instance_id, &now_rfc3339())

@@ -7,7 +7,7 @@
 //! - a credit note posts DR `CONTRA_REVENUE`, DR `CONTRACT_LIABILITY` (deferred),
 //!   and DR `TAX_PAYABLE` against CR `AR`, **never touching the posted invoice
 //!   rows**, and in the SAME txn **reduces the owning schedule's
-//!   `total_deferred_minor`** (so a later S6 run cannot re-recognize it);
+//!   `total_deferred`** (so a later S6 run cannot re-recognize it);
 //! - the `invoice_exposure` headroom CHECK **blocks an over-cap** credit note
 //!   (`CreditNoteExceedsHeadroom` → `CREDIT_NOTE_EXCEEDS_HEADROOM`);
 //! - a **goodwill** credit debits `GOODWILL` (not `CONTRA_REVENUE`) and touches no
@@ -38,7 +38,6 @@ use bss_ledger::domain::adjustment::credit_note::CreditNoteRequest;
 use bss_ledger::domain::error::DomainError;
 use bss_ledger::domain::invoice::builder::{InvoiceItem, PostedInvoice, TaxBreakdown};
 use bss_ledger::domain::model::{AccountRow, CurrencyScaleRow};
-use bss_ledger::domain::money::DEFAULT_PLAUSIBLE_MAX_MAJOR;
 use bss_ledger::domain::recognition::input::{RecognitionInput, RecognitionTiming};
 use bss_ledger::infra::adjustment::credit_note_service::CreditNoteHandler;
 use bss_ledger::infra::events::publisher::LedgerEventPublisher;
@@ -59,6 +58,33 @@ use uuid::Uuid;
 
 fn pg(sql: impl Into<String>) -> Statement {
     Statement::from_string(sea_orm::DatabaseBackend::Postgres, sql.into())
+}
+
+/// A USD scale-2 posting from a cent count (`1234` ⇒ `12.34`): the old
+/// minor-unit fixtures expressed as validated major-unit money.
+fn usd_cents(minor: i64) -> bss_ledger_sdk::PostedMoney {
+    bss_ledger_sdk::PostedMoney::try_new(
+        rust_decimal::Decimal::new(minor, 2),
+        bss_ledger_sdk::CurrencySpec::try_new("USD".to_owned(), 2).unwrap(),
+    )
+    .unwrap()
+}
+
+/// Validated USD scale-2 money from canonical stored text (`"12.34"`).
+fn usd_text(text: &str) -> bss_ledger_sdk::PostedMoney {
+    bss_ledger_sdk::PostedMoney::try_new(
+        bss_ledger_sdk::parse_decimal(text).unwrap(),
+        bss_ledger_sdk::CurrencySpec::try_new("USD".to_owned(), 2).unwrap(),
+    )
+    .unwrap()
+}
+
+/// Read one canonical decimal TEXT money column as USD scale-2 money.
+async fn scalar_money(conn: &DatabaseConnection, sql: &str) -> Option<bss_ledger_sdk::PostedMoney> {
+    conn.query_one_raw(pg(sql.to_owned()))
+        .await
+        .unwrap()
+        .map(|r| usd_text(&r.try_get_by_index::<String>(0).unwrap()))
 }
 
 async fn scalar_i64(conn: &DatabaseConnection, sql: &str) -> Option<i64> {
@@ -136,8 +162,7 @@ async fn setup(url: &str) -> (DatabaseConnection, DBProvider<DbError>, Seller) {
         .upsert_currency_scale(CurrencyScaleRow {
             tenant_id: s.tenant,
             currency: "USD".to_owned(),
-            minor_units: 2,
-            plausible_max_major: DEFAULT_PLAUSIBLE_MAX_MAJOR,
+            currency_scale: 2,
             source: "iso".to_owned(),
         })
         .await
@@ -225,9 +250,8 @@ async fn setup(url: &str) -> (DatabaseConnection, DBProvider<DbError>, Seller) {
 /// `invoice_item_ref` a deferred line requires.
 fn recognized_item(amount: i64, periods: u32, item_ref: &str) -> InvoiceItem {
     InvoiceItem {
-        amount_minor_ex_tax: amount,
-        deferred_minor: 0,
-        currency: "USD".to_owned(),
+        amount_ex_tax: usd_cents(amount),
+        deferred: usd_cents(0),
         revenue_stream: "subscription".to_owned(),
         catalog_class: Some(AccountClass::Revenue),
         contract_class: None,
@@ -287,11 +311,15 @@ fn credit_handler(provider: &DBProvider<DbError>) -> CreditNoteHandler {
     )
 }
 
-async fn bal(raw: &DatabaseConnection, s: &Seller, account: Uuid) -> Option<i64> {
-    scalar_i64(
+async fn bal(
+    raw: &DatabaseConnection,
+    s: &Seller,
+    account: Uuid,
+) -> Option<bss_ledger_sdk::PostedMoney> {
+    scalar_money(
         raw,
         &format!(
-            "SELECT balance_minor FROM bss.ledger_account_balance \
+            "SELECT balance FROM bss.ledger_account_balance \
              WHERE tenant_id='{}' AND account_id='{}' AND currency='USD'",
             s.tenant, account
         ),
@@ -299,11 +327,15 @@ async fn bal(raw: &DatabaseConnection, s: &Seller, account: Uuid) -> Option<i64>
     .await
 }
 
-async fn total_deferred(raw: &DatabaseConnection, s: &Seller, invoice_id: &str) -> Option<i64> {
-    scalar_i64(
+async fn total_deferred(
+    raw: &DatabaseConnection,
+    s: &Seller,
+    invoice_id: &str,
+) -> Option<bss_ledger_sdk::PostedMoney> {
+    scalar_money(
         raw,
         &format!(
-            "SELECT total_deferred_minor FROM bss.ledger_recognition_schedule \
+            "SELECT total_deferred FROM bss.ledger_recognition_schedule \
              WHERE tenant_id='{}' AND source_invoice_id='{invoice_id}'",
             s.tenant
         ),
@@ -320,7 +352,7 @@ async fn total_deferred(raw: &DatabaseConnection, s: &Seller, invoice_id: &str) 
 // needs the `tax_subbalance` read path wired into this harness first.
 
 /// A baseline non-goodwill credit-note request against `inv`'s `item-1` /
-/// `subscription` stream.
+/// `subscription` stream. Amounts are cent counts (`300` ⇒ `3.00` USD).
 fn credit_req(
     s: &Seller,
     credit_note_id: &str,
@@ -337,11 +369,10 @@ fn credit_req(
         origin_invoice_item_ref: Some("item-1".to_owned()),
         po_allocation_group: Some("grp-1".to_owned()),
         revenue_stream: "subscription".to_owned(),
-        currency: "USD".to_owned(),
-        amount_minor,
-        tax_minor,
+        amount: usd_cents(amount_minor),
+        tax_amount: usd_cents(tax_minor),
         tax: Vec::new(),
-        requested_deferred_minor,
+        requested_deferred: usd_cents(requested_deferred_minor),
         reason_code: "CUSTOMER_GOODWILL".to_owned(),
         goodwill: false,
     }
@@ -404,9 +435,15 @@ async fn deferred_credit_note_reduces_cl_ar_and_schedule_total() {
         .post_invoice(&ctx, &scope, &inv, true)
         .await
         .expect("deferred invoice posts");
-    assert_eq!(bal(&raw, &s, s.ar).await, Some(1200));
-    assert_eq!(bal(&raw, &s, s.contract_liability).await, Some(1200));
-    assert_eq!(total_deferred(&raw, &s, "INV-DEF").await, Some(1200));
+    assert_eq!(bal(&raw, &s, s.ar).await, Some(usd_cents(1200)));
+    assert_eq!(
+        bal(&raw, &s, s.contract_liability).await,
+        Some(usd_cents(1200))
+    );
+    assert_eq!(
+        total_deferred(&raw, &s, "INV-DEF").await,
+        Some(usd_cents(1200))
+    );
 
     // Credit 300 (ex-tax, no tax) entirely against the deferred balance.
     let req = credit_req(&s, "CN-1", "INV-DEF", 300, 0, 300);
@@ -420,41 +457,55 @@ async fn deferred_credit_note_reduces_cl_ar_and_schedule_total() {
     // re-recognize the 300). CONTRA_REVENUE untouched (no recognized part).
     assert_eq!(
         bal(&raw, &s, s.contract_liability).await,
-        Some(900),
+        Some(usd_cents(900)),
         "CONTRACT_LIABILITY reduced by the deferred credit"
     );
-    assert_eq!(bal(&raw, &s, s.ar).await, Some(900), "AR reduced incl. tax");
+    assert_eq!(
+        bal(&raw, &s, s.ar).await,
+        Some(usd_cents(900)),
+        "AR reduced incl. tax"
+    );
     assert_eq!(
         total_deferred(&raw, &s, "INV-DEF").await,
-        Some(900),
+        Some(usd_cents(900)),
         "schedule total_deferred reduced — S6 cannot re-recognize the credited-back 300"
     );
     assert!(
-        matches!(bal(&raw, &s, s.contra_revenue).await, None | Some(0)),
+        bal(&raw, &s, s.contra_revenue)
+            .await
+            .is_none_or(|m| m.amount().is_zero()),
         "no recognized part ⇒ no CONTRA_REVENUE"
     );
 
     // The headroom row is seeded (= posted AR 1200) with the running credit total.
-    let original = scalar_i64(
+    let original = scalar_money(
         &raw,
         &format!(
-            "SELECT original_total_minor FROM bss.ledger_invoice_exposure \
+            "SELECT original_total FROM bss.ledger_invoice_exposure \
              WHERE tenant_id='{}' AND invoice_id='INV-DEF'",
             s.tenant
         ),
     )
     .await;
-    assert_eq!(original, Some(1200), "headroom seeded = posted AR");
-    let credit_total = scalar_i64(
+    assert_eq!(
+        original,
+        Some(usd_cents(1200)),
+        "headroom seeded = posted AR"
+    );
+    let credit_total = scalar_money(
         &raw,
         &format!(
-            "SELECT credit_note_total_minor FROM bss.ledger_invoice_exposure \
+            "SELECT credit_note_total FROM bss.ledger_invoice_exposure \
              WHERE tenant_id='{}' AND invoice_id='INV-DEF'",
             s.tenant
         ),
     )
     .await;
-    assert_eq!(credit_total, Some(300), "running credit-note total bumped");
+    assert_eq!(
+        credit_total,
+        Some(usd_cents(300)),
+        "running credit-note total bumped"
+    );
 }
 
 #[tokio::test]
@@ -494,16 +545,20 @@ async fn headroom_check_blocks_over_cap_credit_note() {
         "expected CreditNoteExceedsHeadroom, got {err:?}"
     );
     // The running credit total stayed at 700 (the over-cap note rolled back).
-    let credit_total = scalar_i64(
+    let credit_total = scalar_money(
         &raw,
         &format!(
-            "SELECT credit_note_total_minor FROM bss.ledger_invoice_exposure \
+            "SELECT credit_note_total FROM bss.ledger_invoice_exposure \
              WHERE tenant_id='{}' AND invoice_id='INV-CAP'",
             s.tenant
         ),
     )
     .await;
-    assert_eq!(credit_total, Some(700), "over-cap note rolled back");
+    assert_eq!(
+        credit_total,
+        Some(usd_cents(700)),
+        "over-cap note rolled back"
+    );
 }
 
 #[tokio::test]
@@ -534,16 +589,18 @@ async fn goodwill_credit_uses_goodwill_class_not_contra() {
 
     assert_eq!(
         bal(&raw, &s, s.goodwill).await,
-        Some(200),
+        Some(usd_cents(200)),
         "GOODWILL debited"
     );
     assert!(
-        matches!(bal(&raw, &s, s.contra_revenue).await, None | Some(0)),
+        bal(&raw, &s, s.contra_revenue)
+            .await
+            .is_none_or(|m| m.amount().is_zero()),
         "goodwill never uses CONTRA_REVENUE"
     );
     assert_eq!(
         bal(&raw, &s, s.ar).await,
-        Some(800),
+        Some(usd_cents(800)),
         "AR reduced by goodwill"
     );
 }
@@ -570,7 +627,7 @@ async fn paid_invoice_credit_seeds_reusable_credit_wallet() {
     // Drain open AR to 0 directly in the cache (test shortcut — the open-AR read is
     // what gates the AR-vs-wallet split; a real payment would net it the same).
     raw.execute_raw(pg(format!(
-        "UPDATE bss.ledger_ar_invoice_balance SET balance_minor = 0 \
+        "UPDATE bss.ledger_ar_invoice_balance SET balance = '0' \
          WHERE tenant_id='{}' AND invoice_id='INV-PAID'",
         s.tenant
     )))
@@ -590,21 +647,25 @@ async fn paid_invoice_credit_seeds_reusable_credit_wallet() {
 
     assert_eq!(
         bal(&raw, &s, s.reusable_credit).await,
-        Some(300),
+        Some(usd_cents(300)),
         "remainder beyond open AR seeds REUSABLE_CREDIT"
     );
     // The wallet sub-grain is seeded under credit_grant_event_type = CREDIT_NOTE.
-    let wallet = scalar_i64(
+    let wallet = scalar_money(
         &raw,
         &format!(
-            "SELECT balance_minor FROM bss.ledger_reusable_credit_subbalance \
+            "SELECT balance FROM bss.ledger_reusable_credit_subbalance \
              WHERE tenant_id='{}' AND payer_tenant_id='{}' AND currency='USD' \
                AND credit_grant_event_type='CREDIT_NOTE'",
             s.tenant, s.payer
         ),
     )
     .await;
-    assert_eq!(wallet, Some(300), "reusable_credit_subbalance seeded (K-2)");
+    assert_eq!(
+        wallet,
+        Some(usd_cents(300)),
+        "reusable_credit_subbalance seeded (K-2)"
+    );
 }
 
 #[tokio::test]
@@ -630,9 +691,15 @@ async fn mixed_credit_note_books_both_contra_and_cl() {
         .post_invoice(&ctx, &scope, &inv, true)
         .await
         .expect("deferred invoice posts");
-    assert_eq!(bal(&raw, &s, s.ar).await, Some(1200));
-    assert_eq!(bal(&raw, &s, s.contract_liability).await, Some(1200));
-    assert_eq!(total_deferred(&raw, &s, "INV-MIX").await, Some(1200));
+    assert_eq!(bal(&raw, &s, s.ar).await, Some(usd_cents(1200)));
+    assert_eq!(
+        bal(&raw, &s, s.contract_liability).await,
+        Some(usd_cents(1200))
+    );
+    assert_eq!(
+        total_deferred(&raw, &s, "INV-MIX").await,
+        Some(usd_cents(1200))
+    );
 
     // Credit 300 ex-tax, of which only 100 is requested deferred ⇒ recognized part
     // = 300 − 100 = 200 (DR CONTRA_REVENUE 200), deferred part = 100 (DR
@@ -650,24 +717,24 @@ async fn mixed_credit_note_books_both_contra_and_cl() {
     // CONTRACT_LIABILITY net down by 100 (1200 − 100). AR net down by the full 300.
     assert_eq!(
         bal(&raw, &s, s.contra_revenue).await,
-        Some(200),
+        Some(usd_cents(200)),
         "the recognized part debits CONTRA_REVENUE"
     );
     assert_eq!(
         bal(&raw, &s, s.contract_liability).await,
-        Some(1100),
+        Some(usd_cents(1100)),
         "the deferred part reduces CONTRACT_LIABILITY (1200 − 100)"
     );
     assert_eq!(
         bal(&raw, &s, s.ar).await,
-        Some(900),
+        Some(usd_cents(900)),
         "AR reduced by the full credited 300 (200 recognized + 100 deferred)"
     );
     // Only the deferred 100 reduces the schedule (the recognized 200 was never
     // deferred, so it does not touch total_deferred — S6 can't re-recognize the 100).
     assert_eq!(
         total_deferred(&raw, &s, "INV-MIX").await,
-        Some(1100),
+        Some(usd_cents(1100)),
         "schedule total_deferred reduced by the deferred part only (1200 − 100)"
     );
 }
@@ -699,7 +766,7 @@ async fn goodwill_credit_over_open_ar_is_rejected() {
         .await
         .expect("invoice posts");
     raw.execute_raw(pg(format!(
-        "UPDATE bss.ledger_ar_invoice_balance SET balance_minor = 200 \
+        "UPDATE bss.ledger_ar_invoice_balance SET balance = '2' \
          WHERE tenant_id='{}' AND invoice_id='INV-GWO'",
         s.tenant
     )))
@@ -710,7 +777,7 @@ async fn goodwill_credit_over_open_ar_is_rejected() {
     // raw shortcut must touch both, else the post-rejection assertion `bal(s.ar) ==
     // 200` sees the untouched 1000 from the invoice post.
     raw.execute_raw(pg(format!(
-        "UPDATE bss.ledger_account_balance SET balance_minor = 200 \
+        "UPDATE bss.ledger_account_balance SET balance = '2' \
          WHERE tenant_id='{}' AND account_id='{}' AND currency='USD'",
         s.tenant, s.ar
     )))
@@ -735,11 +802,13 @@ async fn goodwill_credit_over_open_ar_is_rejected() {
     // debited, no wallet sub-grain seeded, no credit_note row persisted.
     assert_eq!(
         bal(&raw, &s, s.ar).await,
-        Some(200),
+        Some(usd_cents(200)),
         "AR untouched by the rejected goodwill credit"
     );
     assert!(
-        matches!(bal(&raw, &s, s.goodwill).await, None | Some(0)),
+        bal(&raw, &s, s.goodwill)
+            .await
+            .is_none_or(|m| m.amount().is_zero()),
         "GOODWILL never debited"
     );
     assert_eq!(

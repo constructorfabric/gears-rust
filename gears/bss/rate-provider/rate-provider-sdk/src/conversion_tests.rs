@@ -1,124 +1,113 @@
-//! Golden-vector + edge tests for the exact-decimal `rate_micro` conversion.
+//! Exact positive provider quote regression vectors and contract bounds.
 
+use super::parse_rate;
 use bss_ledger_sdk::RateProviderError;
 
-use super::rate_to_micro;
-
 #[test]
-fn typical_ecb_rate() {
-    // 1.0856 * 1e6 = 1_085_600 exactly.
-    assert_eq!(rate_to_micro("1.0856").unwrap(), 1_085_600);
+fn preserves_provider_precision_regression() {
+    for text in [
+        "1.123456789",
+        "0.0000001",
+        "0.0000015",
+        "0.0000025",
+        "0.0000035",
+        "1.0856",
+        "160.85",
+    ] {
+        assert_eq!(parse_rate(text).unwrap().to_string(), text);
+    }
 }
 
 #[test]
-fn banker_rounding_half_to_even() {
-    // 0.0000015 * 1e6 = 1.5 -> nearest even = 2.
-    assert_eq!(rate_to_micro("0.0000015").unwrap(), 2);
-    // 0.0000025 * 1e6 = 2.5 -> nearest even = 2.
-    assert_eq!(rate_to_micro("0.0000025").unwrap(), 2);
-    // 0.0000035 * 1e6 = 3.5 -> nearest even = 4.
-    assert_eq!(rate_to_micro("0.0000035").unwrap(), 4);
-}
-
-#[test]
-fn deterministic_repeat() {
+fn positive_bounds_are_shared_with_money_parser() {
+    for text in [
+        "9999999999999999999999999999",
+        "0.0000000000000000000000000001",
+        "9223372036854.775808",
+        "100000000000000000000000",
+    ] {
+        assert_eq!(parse_rate(text).unwrap().to_string(), text);
+    }
     assert_eq!(
-        rate_to_micro("160.85").unwrap(),
-        rate_to_micro("160.85").unwrap()
+        parse_rate("1.123456789000").unwrap().to_string(),
+        "1.123456789"
     );
-    assert_eq!(rate_to_micro("160.85").unwrap(), 160_850_000);
-}
-
-#[test]
-fn non_numeric_is_internal_error() {
-    assert!(matches!(
-        rate_to_micro("abc"),
-        Err(RateProviderError::Internal(_))
-    ));
-}
-
-#[test]
-fn overflow_is_internal_error() {
-    assert!(matches!(
-        rate_to_micro("100000000000000"),
-        Err(RateProviderError::Internal(_))
-    ));
-}
-
-#[test]
-fn zero_rate_is_internal_error() {
-    // A corrupted or empty feed value must not convert "successfully" to zero.
-    assert!(matches!(
-        rate_to_micro("0"),
-        Err(RateProviderError::Internal(_))
-    ));
-    assert!(matches!(
-        rate_to_micro("0.000000"),
-        Err(RateProviderError::Internal(_))
-    ));
-}
-
-#[test]
-fn negative_rate_is_internal_error() {
-    assert!(matches!(
-        rate_to_micro("-1.5"),
-        Err(RateProviderError::Internal(_))
-    ));
-}
-
-#[test]
-fn negative_banker_rounding_result_is_internal_error() {
-    // -0.0000025 * 1e6 = -2.5 -> nearest even = -2: rounded correctly, still
-    // rejected as non-positive.
-    assert!(matches!(
-        rate_to_micro("-0.0000025"),
-        Err(RateProviderError::Internal(_))
-    ));
-}
-
-#[test]
-fn exact_i64_max_boundary_converts_exactly() {
-    // i64::MAX = 9_223_372_036_854_775_807; this rate scales to exactly that.
-    assert_eq!(rate_to_micro("9223372036854.775807").unwrap(), i64::MAX);
-}
-
-#[test]
-fn one_micro_past_i64_max_is_internal_error() {
-    assert!(matches!(
-        rate_to_micro("9223372036854.775808"),
-        Err(RateProviderError::Internal(_))
-    ));
-}
-
-#[test]
-fn exact_i64_min_magnitude_negative_rate_is_internal_error() {
-    // The magnitude fits i64 exactly, so this is rejected as non-positive rather
-    // than as an overflow.
-    assert!(matches!(
-        rate_to_micro("-9223372036854.775808"),
-        Err(RateProviderError::Internal(_))
-    ));
-}
-
-#[test]
-fn one_micro_past_i64_min_is_internal_error() {
-    // This one overflows i64 outright, on top of being negative.
-    assert!(matches!(
-        rate_to_micro("-9223372036854.775809"),
-        Err(RateProviderError::Internal(_))
-    ));
-}
-
-#[test]
-fn a_rate_too_large_to_scale_fails_at_the_scaling_step() {
-    // A distinct failure from the i64 cases above: 1e23 parses as an exact
-    // `Decimal`, but 1e23 * 1e6 exceeds `Decimal::MAX` (~7.9e28), so the
-    // multiplication itself has nowhere to put the result and never reaches the
-    // i64 conversion. Asserting the message is what separates the two paths —
-    // both are `Internal`, so `matches!` alone cannot tell them apart.
-    let err = rate_to_micro("100000000000000000000000").unwrap_err();
-    assert!(
-        err.to_string().contains("overflows when scaled to micro"),
-        "expected the scaling-overflow error, got: {err}"
+    assert_eq!(
+        parse_rate("1.00000000000000000000000000000")
+            .unwrap()
+            .to_string(),
+        "1"
     );
+}
+
+#[test]
+fn rejects_invalid_nonpositive_and_out_of_contract_quotes() {
+    for text in [
+        "abc",
+        "NaN",
+        "Infinity",
+        "0",
+        "0.000000",
+        "-0",
+        "-1.5",
+        "-0.0000001",
+        "1e-7",
+        "",
+        "10000000000000000000000000000",
+        "1.0000000000000000000000000001",
+        "0.00000000000000000000000000001",
+    ] {
+        assert!(
+            matches!(parse_rate(text), Err(RateProviderError::Internal(_))),
+            "accepted {text}"
+        );
+    }
+    assert!(parse_rate(&format!("1.{}", "0".repeat(63))).is_err());
+}
+
+#[test]
+fn preserves_legacy_exact_parser_lexical_forms() {
+    for (text, expected) in [
+        (" 1.123456789 ", "1.123456789"),
+        ("\t+01.123456789\n", "1.123456789"),
+        ("000.0000001", "0.0000001"),
+        (".125", "0.125"),
+        ("1.", "1"),
+        ("1_234.5_6", "1234.56"),
+    ] {
+        // Assert these are accepted by the previous provider exact parser.
+        let legacy = rust_decimal::Decimal::from_str_exact(text.trim()).unwrap();
+        assert_eq!(legacy.normalize().to_string(), expected);
+        assert_eq!(parse_rate(text).unwrap().to_string(), expected);
+    }
+}
+
+#[test]
+fn lexical_normalization_does_not_bypass_bounds_or_positivity() {
+    for text in [
+        " +000 ",
+        " -.0000001 ",
+        " +10000000000000000000000000000 ",
+        " +01.0000000000000000000000000001 ",
+    ] {
+        assert!(parse_rate(text).is_err(), "accepted {text}");
+    }
+    assert!(parse_rate(&format!("{}1", " ".repeat(64))).is_err());
+}
+
+#[test]
+fn a_quote_at_the_64_byte_limit_is_accepted_and_errors_name_the_text() {
+    let at_limit = format!("1.{}", "0".repeat(62));
+    assert_eq!(at_limit.len(), 64);
+    assert_eq!(parse_rate(&at_limit).unwrap(), rust_decimal::Decimal::ONE);
+    let padded = format!(" 1.{}", "0".repeat(61));
+    assert_eq!(padded.len(), 64);
+    assert_eq!(parse_rate(&padded).unwrap(), rust_decimal::Decimal::ONE);
+    assert!(parse_rate(&format!("{at_limit}0")).is_err(), "65 bytes");
+    for text in ["abc", "-1.5", "0"] {
+        let Err(RateProviderError::Internal(message)) = parse_rate(text) else {
+            panic!("{text:?} must be refused");
+        };
+        assert!(message.contains(&format!("{text:?}")), "{message}");
+    }
 }

@@ -11,12 +11,14 @@
 //! is a row in the registry, and reading that row is the store's job.
 
 use crate::domain::error::DomainError;
+use toolkit_macros::domain_model;
 
 /// The family whose nodes carry a source namespace. Owned nodes have none,
 /// and phantoms are the gear's own until they are materialized.
 const REFERENCE: &str = "reference";
 
 /// What a node's type and payload say about the namespace it is written under.
+#[domain_model]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Namespaced<'a> {
     /// A reference node, writing under this namespace.
@@ -65,6 +67,7 @@ pub fn namespace_of<'a>(
 }
 
 /// What the store should do about one namespaced write.
+#[domain_model]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Claim {
     /// Nobody holds it: the writer takes it. An unclaimed namespace is claimed

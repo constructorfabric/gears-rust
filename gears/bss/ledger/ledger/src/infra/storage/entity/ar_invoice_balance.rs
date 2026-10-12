@@ -24,15 +24,17 @@ pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
     pub invoice_id: String,
     pub currency: String,
-    pub balance_minor: i64,
-    /// Disputed sub-portion of the open AR (`0 <= disputed_minor <= balance_minor`).
-    /// `balance_minor` stays the FULL open AR through a dispute reclass
+    pub currency_scale: i16,
+    pub balance: String,
+    /// Disputed sub-portion of the open AR (`0 <= disputed <= balance`).
+    /// `balance` stays the FULL open AR through a dispute reclass
     /// (AR-class-neutral); this carries the disputed slice. The per-invoice
-    /// `ar_status` flag is DERIVED: `DISPUTED` iff `disputed_minor == balance_minor`
-    /// (with `balance_minor > 0`), else `ACTIVE`.
-    pub disputed_minor: i64,
-    pub functional_balance_minor: Option<i64>,
+    /// `ar_status` flag is DERIVED: `DISPUTED` iff `disputed == balance`
+    /// (with `balance > 0`), else `ACTIVE`.
+    pub disputed: String,
+    pub functional_balance: Option<String>,
     pub functional_currency: Option<String>,
+    pub functional_currency_scale: Option<i16>,
     pub original_posted_at: Option<OffsetDateTime>,
     pub due_date: Option<NaiveDate>,
     pub last_entry_seq: Option<i64>,

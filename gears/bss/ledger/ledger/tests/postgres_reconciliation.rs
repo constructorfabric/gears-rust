@@ -39,9 +39,9 @@ use bss_ledger::infra::reconciliation::{
 use bss_ledger::infra::storage::migrations::Migrator;
 use bss_ledger::infra::tenant_lifecycle::{RegistryLifecycle, TenantLifecycleReader};
 use bss_ledger_sdk::{
-    BillRunFinishedV1, IssuedInvoiceManifest, IssuedInvoiceManifestV1, PspSettlementFeedV1,
-    PspSettlementReport, UnconfiguredBillRunFinishedV1, UnconfiguredIssuedInvoiceManifestV1,
-    UnconfiguredPspSettlementFeedV1,
+    BillRunFinishedV1, CurrencySpec, GrossTotals, IssuedInvoiceManifest, IssuedInvoiceManifestV1,
+    PostedMoney, PspSettlementFeedV1, PspSettlementReport, UnconfiguredBillRunFinishedV1,
+    UnconfiguredIssuedInvoiceManifestV1, UnconfiguredPspSettlementFeedV1, canonical_decimal,
 };
 use sea_orm::{ConnectionTrait, Database, DatabaseConnection, Statement};
 use sea_orm_migration::MigratorTrait;
@@ -56,6 +56,21 @@ const PERIOD2: &str = "202607";
 
 fn pg(sql: impl Into<String>) -> Statement {
     Statement::from_string(sea_orm::DatabaseBackend::Postgres, sql.into())
+}
+
+/// A USD scale-2 posting from a cent count (`1000` ⇒ `10.00`): the old
+/// minor-unit fixtures expressed as validated major-unit money.
+fn usd_cents(minor: i64) -> PostedMoney {
+    PostedMoney::try_new(
+        rust_decimal::Decimal::new(minor, 2),
+        CurrencySpec::try_new("USD".to_owned(), 2).unwrap(),
+    )
+    .unwrap()
+}
+
+/// The canonical stored TEXT of a cent count (`1000` ⇒ `"10"`, `60` ⇒ `"0.6"`).
+fn cents_text(minor: i64) -> String {
+    canonical_decimal(rust_decimal::Decimal::new(minor, 2))
 }
 
 /// Boot + migrate; seed ONE OPEN fiscal period for `tenant` (LE = tenant). Returns the
@@ -128,9 +143,10 @@ async fn seed_invoice_post(
         txn.execute_raw(pg(format!(
             "INSERT INTO bss.ledger_journal_line \
                 (line_id, entry_id, tenant_id, period_id, payer_tenant_id, account_id, \
-                 account_class, side, amount_minor, currency, currency_scale, mapping_status) \
+                 account_class, side, amount, currency, currency_scale, mapping_status) \
              VALUES ('{line_id}','{entry_id}','{tenant}','{PERIOD}','{tenant}','{account}', \
-                 'AR','{side}',1000,'USD',2,'RESOLVED')"
+                 'AR','{side}','{amount}','USD',2,'RESOLVED')",
+            amount = cents_text(1000)
         )))
         .await
         .unwrap();
@@ -166,12 +182,13 @@ async fn seed_payment_settle(
     for (class, side) in [("CASH_CLEARING", "DR"), ("UNALLOCATED", "CR")] {
         let line_id = Uuid::now_v7();
         let nil = Uuid::nil();
+        let amount = cents_text(gross);
         txn.execute_raw(pg(format!(
             "INSERT INTO bss.ledger_journal_line \
                 (line_id, entry_id, tenant_id, period_id, payer_tenant_id, account_id, \
-                 account_class, side, amount_minor, currency, currency_scale, mapping_status) \
+                 account_class, side, amount, currency, currency_scale, mapping_status) \
              VALUES ('{line_id}','{entry_id}','{tenant}','{period}','{tenant}','{nil}', \
-                 '{class}','{side}',{gross},'USD',2,'RESOLVED')"
+                 '{class}','{side}','{amount}','USD',2,'RESOLVED')"
         )))
         .await
         .unwrap();
@@ -343,12 +360,13 @@ async fn k1_ar_variance_opens_recon_mismatch_and_blocks_close() {
     let (raw, provider, tenant) = boot(&url).await;
 
     // A stray `account_balance` cache row with no journal → the recompute disagrees
-    // with the cache (computed 0 ≠ cached 50_000): an out-of-tolerance tie-out variance.
+    // with the cache (computed 0 ≠ cached 500.00): an out-of-tolerance tie-out variance.
     let account = Uuid::now_v7();
     raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_account_balance \
-            (tenant_id, account_id, currency, account_class, normal_side, balance_minor, version) \
-         VALUES ('{tenant}','{account}','USD','AR','DR', 50000, 1)"
+            (tenant_id, account_id, currency, currency_scale, account_class, normal_side, balance, version) \
+         VALUES ('{tenant}','{account}','USD',2,'AR','DR','{balance}', 1)",
+        balance = cents_text(50_000)
     )))
     .await
     .unwrap();
@@ -416,7 +434,7 @@ async fn k2_missed_posting_blocks_then_idempotent_repost_clears() {
         IssuedInvoiceManifest {
             invoice_ids: vec!["inv-1".to_owned(), "inv-2".to_owned()],
             count: 2,
-            gross_total_minor: 2000,
+            gross_totals: GrossTotals::try_new(vec![usd_cents(2000)]).unwrap(),
         },
     );
     let config = ReconConfig {
@@ -515,8 +533,7 @@ async fn k3_psp_variance_opens_exception() {
         PERIOD,
         PspSettlementReport {
             report_id: "rpt-1".to_owned(),
-            settled_minor: 100,
-            currency: "USD".to_owned(),
+            settled: usd_cents(100),
         },
     );
     let fw = framework(provider, Arc::clone(&feeds), ReconConfig::default());
@@ -578,8 +595,7 @@ async fn k6_psp_check_is_period_scoped() {
         PERIOD2,
         PspSettlementReport {
             report_id: "rpt-p2".to_owned(),
-            settled_minor: 60,
-            currency: "USD".to_owned(),
+            settled: usd_cents(60),
         },
     );
     let fw = framework(provider, Arc::clone(&feeds), ReconConfig::default());
@@ -832,6 +848,8 @@ async fn k5b_unconfigured_psp_check_is_inert() {
 
 /// Seed one finalized `reconciliation_run` row directly, bypassing the framework —
 /// the backlog a retired tenant accumulated before the lifecycle gate existed.
+/// `variance_minor` is a USD cent count; `0` stores the check's typed zero (no
+/// currency bucket), anything else one USD@2 bucket in the stored money shape.
 async fn seed_recon_run(
     raw: &DatabaseConnection,
     tenant: Uuid,
@@ -840,10 +858,22 @@ async fn seed_recon_run(
     within_tolerance: bool,
 ) -> Uuid {
     let run_id = Uuid::now_v7();
+    let variance = if variance_minor == 0 {
+        serde_json::json!({ "kind": "money", "by_currency": [] })
+    } else {
+        serde_json::json!({
+            "kind": "money",
+            "by_currency": [{
+                "amount": cents_text(variance_minor),
+                "currency": "USD",
+                "currency_scale": 2,
+            }],
+        })
+    };
     raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_reconciliation_run \
-            (tenant_id, run_id, period_id, check_type, variance_minor, within_tolerance, status) \
-         VALUES ('{tenant}','{run_id}','{PERIOD}','{CHECK_AR_DERIVED}',{variance_minor},{within_tolerance},'{status}')"
+            (tenant_id, run_id, period_id, check_type, variance, within_tolerance, status) \
+         VALUES ('{tenant}','{run_id}','{PERIOD}','{CHECK_AR_DERIVED}','{variance}',{within_tolerance},'{status}')"
     )))
     .await
     .unwrap();

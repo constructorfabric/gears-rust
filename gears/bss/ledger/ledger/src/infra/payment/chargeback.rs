@@ -42,8 +42,11 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use bss_ledger_sdk::{AccountClass, PostEntry, PostLine, PostingRef, SourceDocType};
+use bss_ledger_sdk::{
+    AccountClass, PostEntry, PostLine, PostedMoney, PostingRef, SourceDocType, canonical_decimal,
+};
 use chrono::Datelike;
+use rust_decimal::Decimal;
 use sea_orm::DbErr;
 use toolkit_db::secure::{AccessScope, DbTx};
 use toolkit_db::{DBProvider, DbError};
@@ -51,6 +54,7 @@ use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
 use crate::domain::error::DomainError;
+use crate::domain::exact_money::{ExactAmount, map_exact_error, matching_spec, zero_posted};
 use crate::domain::fx::realized::carried_relief;
 use crate::domain::instant::to_naive_date;
 use crate::domain::model::{NewEntry, NewLine};
@@ -58,8 +62,8 @@ use crate::domain::payment::chargeback::{
     ChargebackInput, DisputePhase, DisputeVariant, FundsAtOpen, build_chargeback_entry,
     clawed_back_on_post,
 };
+use crate::domain::payment::dispute_state::check_transition;
 use crate::domain::ports::metrics::{LedgerMetricsPort, PostFlow, PostResult};
-use crate::infra::currency_scale::CurrencyScaleResolver;
 use crate::infra::events::publisher::LedgerEventPublisher;
 use crate::infra::exception::ExceptionRouter;
 use crate::infra::payment::sidecar::{ChargebackDisputeOp, ChargebackSidecar};
@@ -69,6 +73,8 @@ use crate::infra::posting::idempotency::{
 };
 use crate::infra::posting::service::{PostSidecar, PostingService};
 use crate::infra::storage::entity::pending_event_queue;
+use crate::infra::storage::money_text::StoredMoney;
+use crate::infra::storage::repo::dispute_repo::DisputeState;
 use crate::infra::storage::repo::{
     DisputeRepo, NewQueueRow, PaymentRepo, PendingQueueRepo, ReferenceRepo,
 };
@@ -112,8 +118,7 @@ pub struct ChargebackRequest {
     /// The funds-movement fact (card rails withheld vs invoice/ACH not moved) —
     /// the LEDGER reads it at `opened` to choose the variant.
     pub funds_at_open: FundsAtOpen,
-    pub disputed_amount_minor: i64,
-    pub currency: String,
+    pub disputed_amount: PostedMoney,
     pub effective_at: Option<OffsetDateTime>,
 }
 
@@ -175,8 +180,7 @@ pub struct QueuedDisputePayload {
     /// The funds-fact wire literal (`withheld` / `not_moved`). Recorded for
     /// completeness; on apply the variant is read from the now-present dispute row.
     pub funds_at_open: String,
-    pub disputed_amount_minor: i64,
-    pub currency: String,
+    pub disputed_amount: StoredMoney,
 }
 
 impl QueuedDisputePayload {
@@ -192,8 +196,7 @@ impl QueuedDisputePayload {
             cycle: req.cycle,
             phase: req.phase.as_str().to_owned(),
             funds_at_open: req.funds_at_open.as_str().to_owned(),
-            disputed_amount_minor: req.disputed_amount_minor,
-            currency: req.currency.clone(),
+            disputed_amount: StoredMoney::from(&req.disputed_amount),
         }
     }
 
@@ -225,8 +228,9 @@ impl QueuedDisputePayload {
             cycle: self.cycle,
             phase,
             funds_at_open,
-            disputed_amount_minor: self.disputed_amount_minor,
-            currency: self.currency,
+            disputed_amount: PostedMoney::try_from(self.disputed_amount).map_err(|e| {
+                DomainError::Internal(format!("queued dispute payload amount: {e}"))
+            })?,
             // A queued phase is applied at drain time; the period is stamped then
             // (no original instant is carried on the queue payload), mirroring how
             // a queued allocation re-derives at apply time.
@@ -279,7 +283,6 @@ pub struct DrainReport {
 pub struct ChargebackService {
     posting: PostingService,
     reference: ReferenceRepo,
-    resolver: CurrencyScaleResolver,
     dispute_repo: DisputeRepo,
     // The payment counter repo: the out-of-txn dedup short-circuit
     // (`lookup_finalized_post`) AND the net cash-leg read (`settled − fee`, Model
@@ -317,14 +320,12 @@ impl ChargebackService {
     ) -> Self {
         let posting = PostingService::new(db.clone(), Arc::clone(&publisher));
         let reference = ReferenceRepo::new(db.clone());
-        let resolver = CurrencyScaleResolver::new(ReferenceRepo::new(db.clone()));
         let dispute_repo = DisputeRepo::new(db.clone());
         let payment_repo = PaymentRepo::new(db.clone());
         let pending_queue = PendingQueueRepo::new(db.clone());
         Self {
             posting,
             reference,
-            resolver,
             dispute_repo,
             payment_repo,
             pending_queue,
@@ -451,7 +452,8 @@ impl ChargebackService {
         let existing = self
             .dispute_repo
             .read_dispute(scope, req.tenant_id, &req.dispute_id)
-            .await?;
+            .await
+            .map_err(|e| DomainError::Internal(format!("read dispute: {e}")))?;
 
         // 2. Out-of-order (§4.7): a `won`/`lost` whose dispute has NO prior row
         //    (no `opened` landed yet) MUST NOT post a partial outcome — enqueue it
@@ -478,28 +480,23 @@ impl ChargebackService {
         ctx: &SecurityContext,
         scope: &AccessScope,
         req: &ChargebackRequest,
-        existing: Option<&crate::infra::storage::entity::dispute::Model>,
+        existing: Option<&DisputeState>,
     ) -> Result<PostingRef, DomainError> {
         // 3. Variant selection + transition guard.
         let variant = match req.phase {
             DisputePhase::Opened => {
-                guard_open_transition(existing, &req.dispute_id)?;
+                guard_transition(existing, req)?;
                 req.funds_at_open.variant()
             }
             DisputePhase::Won | DisputePhase::Lost => {
+                guard_transition(existing, req)?;
                 let row = existing.ok_or_else(|| {
                     DomainError::InvalidDisputeTransition(format!(
                         "dispute {} has no opened cycle to resolve",
                         req.dispute_id
                     ))
                 })?;
-                guard_outcome_transition(row, &req.dispute_id)?;
-                DisputeVariant::parse(&row.variant).ok_or_else(|| {
-                    DomainError::Internal(format!(
-                        "ledger_dispute {} carries an unknown variant {:?}",
-                        req.dispute_id, row.variant
-                    ))
-                })?
+                row.variant
             }
             DisputePhase::Partial => {
                 return Err(DomainError::InvalidDisputeTransition(format!(
@@ -517,9 +514,8 @@ impl ChargebackService {
             cycle: req.cycle,
             phase: req.phase,
             variant,
-            disputed_amount_minor: req.disputed_amount_minor,
+            disputed_amount: req.disputed_amount.clone(),
             invoice_id: req.invoice_id.clone(),
-            currency: req.currency.clone(),
             effective_at: req.effective_at,
         };
 
@@ -542,19 +538,22 @@ impl ChargebackService {
             (DisputeVariant::CashHold, DisputePhase::Opened) => {
                 self.read_net(scope, &input).await?
             }
-            (DisputeVariant::CashHold, DisputePhase::Won | DisputePhase::Lost) => {
+            (DisputeVariant::CashHold, DisputePhase::Won | DisputePhase::Lost) => match existing {
+                Some(row) => row.cash_hold.clone(),
                 // `existing` is `Some` on any outcome (the transition guard above
-                // rejects a missing opened cycle); fall back to `0` defensively.
-                existing.map_or(0, |row| row.cash_hold_minor)
-            }
+                // rejects a missing opened cycle); fall back to zero defensively.
+                None => zero_posted(&input.disputed_amount)?,
+            },
             // AR_RECLASS (any phase) has no cash leg; `partial` is rejected above.
-            (DisputeVariant::ArReclass, _) | (_, DisputePhase::Partial) => 0,
+            (DisputeVariant::ArReclass, _) | (_, DisputePhase::Partial) => {
+                zero_posted(&input.disputed_amount)?
+            }
         };
         // The cash parked in `DISPUTE_HOLD` at open (`min(disputed, net)`, Model
         // N) — persisted by the sidecar's `Open` write so the outcome branch can
         // size off it. On an outcome `net` already IS the stored hold, so the
         // `min` is a no-op there; only the `opened` write records a fresh value.
-        let cash_hold_minor = net.min(input.disputed_amount_minor);
+        let cash_hold = min_posted(&net, &input.disputed_amount)?;
 
         // 5. `CHARGEBACK_ON_REFUNDED` pre-check: a `lost` cash-out whose clawback
         //    cannot fit under the total money-out cap because the payment was
@@ -563,15 +562,15 @@ impl ChargebackService {
         //    cap CHECK is the authoritative backstop; this pre-check turns the
         //    specific already-refunded case into its own signal rather than a
         //    generic `ChargebackExceedsSettled`.
-        let clawed_back = clawed_back_on_post(&input, net);
-        if clawed_back > 0 {
-            self.guard_not_on_refunded(scope, &input, clawed_back)
+        let clawed_back = clawed_back_on_post(&input, &net)?;
+        if clawed_back.amount() > Decimal::ZERO {
+            self.guard_not_on_refunded(scope, &input, &clawed_back)
                 .await?;
         }
 
         // 6. Build the balanced entry (validates amount > 0 + the AR-reclass
         //    invoice_id; rejects partial), then overwrite the placeholder header.
-        let mut entry = build_chargeback_entry(&input, net)?;
+        let mut entry = build_chargeback_entry(&input, &net)?;
         overwrite_header(&mut entry, ctx, req.effective_at);
 
         // 7. Bind each line's real chart account_id.
@@ -581,7 +580,7 @@ impl ChargebackService {
                     "no provisioned account for class {} / stream {:?} / currency {}",
                     line.account_class.as_str(),
                     line.revenue_stream,
-                    line.currency
+                    line.money.currency().code()
                 ))
             })?;
         }
@@ -602,7 +601,7 @@ impl ChargebackService {
         let op = match req.phase {
             DisputePhase::Won | DisputePhase::Lost => ChargebackDisputeOp::Advance {
                 last_phase: req.phase,
-                clawed_back_minor: clawed_back,
+                clawed_back,
             },
             // `opened` seeds/re-opens the row; `partial` is rejected earlier in the
             // builder and is mapped defensively to Open so a future flag-flip can't
@@ -613,12 +612,13 @@ impl ChargebackService {
             tenant: req.tenant_id,
             dispute_id: req.dispute_id.clone(),
             payment_id: req.payment_id.clone(),
-            currency: req.currency.clone(),
             variant,
             cycle: req.cycle,
-            disputed_amount_minor: req.disputed_amount_minor,
-            cash_hold_minor,
+            disputed_amount: req.disputed_amount.clone(),
+            cash_hold,
             op,
+            dispute: self.dispute_repo.clone(),
+            payment: self.payment_repo.clone(),
             publisher: Arc::clone(&self.publisher),
             ctx: ctx.clone(),
         });
@@ -835,7 +835,8 @@ impl ChargebackService {
         let existing = self
             .dispute_repo
             .read_dispute(scope, req.tenant_id, &req.dispute_id)
-            .await?;
+            .await
+            .map_err(|e| DomainError::Internal(format!("read dispute: {e}")))?;
         if existing.is_none() {
             return Ok(ApplyOutcome::NotReady);
         }
@@ -864,25 +865,20 @@ impl ChargebackService {
         ctx: &SecurityContext,
         scope: &AccessScope,
         req: &ChargebackRequest,
-        existing: Option<&crate::infra::storage::entity::dispute::Model>,
+        existing: Option<&DisputeState>,
         business_id: &str,
     ) -> Result<PostingRef, DomainError> {
         // Guard + variant (re-evaluated at apply time).
         let variant = match req.phase {
             DisputePhase::Won | DisputePhase::Lost => {
+                guard_transition(existing, req)?;
                 let row = existing.ok_or_else(|| {
                     DomainError::InvalidDisputeTransition(format!(
                         "dispute {} has no opened cycle to resolve",
                         req.dispute_id
                     ))
                 })?;
-                guard_outcome_transition(row, &req.dispute_id)?;
-                DisputeVariant::parse(&row.variant).ok_or_else(|| {
-                    DomainError::Internal(format!(
-                        "ledger_dispute {} carries an unknown variant {:?}",
-                        req.dispute_id, row.variant
-                    ))
-                })?
+                row.variant
             }
             // Only `won`/`lost` are ever queued (intake guards this); anything
             // else here is an invariant breach.
@@ -902,9 +898,8 @@ impl ChargebackService {
             cycle: req.cycle,
             phase: req.phase,
             variant,
-            disputed_amount_minor: req.disputed_amount_minor,
+            disputed_amount: req.disputed_amount.clone(),
             invoice_id: req.invoice_id.clone(),
-            currency: req.currency.clone(),
             effective_at: req.effective_at,
         };
 
@@ -917,18 +912,21 @@ impl ChargebackService {
         // for the stranded-hold bug applies to the queued path too). AR_RECLASS
         // has no cash leg ⇒ `0`. `existing` is `Some` here (guarded above).
         let net = match input.variant {
-            DisputeVariant::CashHold => existing.map_or(0, |row| row.cash_hold_minor),
-            DisputeVariant::ArReclass => 0,
+            DisputeVariant::CashHold => match existing {
+                Some(row) => row.cash_hold.clone(),
+                None => zero_posted(&input.disputed_amount)?,
+            },
+            DisputeVariant::ArReclass => zero_posted(&input.disputed_amount)?,
         };
         // The hold size for the sidecar row (no-op `min` on an outcome, where
         // `net` already is the stored hold); the `Advance` op does not rewrite it.
-        let cash_hold_minor = net.min(input.disputed_amount_minor);
-        let clawed_back = clawed_back_on_post(&input, net);
-        if clawed_back > 0 {
-            self.guard_not_on_refunded(scope, &input, clawed_back)
+        let cash_hold = min_posted(&net, &input.disputed_amount)?;
+        let clawed_back = clawed_back_on_post(&input, &net)?;
+        if clawed_back.amount() > Decimal::ZERO {
+            self.guard_not_on_refunded(scope, &input, &clawed_back)
                 .await?;
         }
-        let mut entry = build_chargeback_entry(&input, net)?;
+        let mut entry = build_chargeback_entry(&input, &net)?;
         overwrite_header(&mut entry, ctx, req.effective_at);
         for line in &mut entry.lines {
             line.account_id = resolve_line(&chart, line).ok_or_else(|| {
@@ -936,7 +934,7 @@ impl ChargebackService {
                     "no provisioned account for class {} / stream {:?} / currency {}",
                     line.account_class.as_str(),
                     line.revenue_stream,
-                    line.currency
+                    line.money.currency().code()
                 ))
             })?;
         }
@@ -950,15 +948,16 @@ impl ChargebackService {
                 tenant: req.tenant_id,
                 dispute_id: req.dispute_id.clone(),
                 payment_id: req.payment_id.clone(),
-                currency: req.currency.clone(),
                 variant,
                 cycle: req.cycle,
-                disputed_amount_minor: req.disputed_amount_minor,
-                cash_hold_minor,
+                disputed_amount: req.disputed_amount.clone(),
+                cash_hold,
                 op: ChargebackDisputeOp::Advance {
                     last_phase: req.phase,
-                    clawed_back_minor: clawed_back,
+                    clawed_back,
                 },
+                dispute: self.dispute_repo.clone(),
+                payment: self.payment_repo.clone(),
                 publisher: Arc::clone(&self.publisher),
                 ctx: ctx.clone(),
             },
@@ -966,7 +965,7 @@ impl ChargebackService {
             business_id: business_id.to_owned(),
             tenant: req.tenant_id,
         });
-        let (new_entry, new_lines) = self.to_engine_inputs(scope, entry).await?;
+        let (new_entry, new_lines) = self.to_engine_inputs(entry).await?;
         let posting = self
             .posting
             .post_queued_apply(ctx, scope, new_entry, new_lines, Some(sidecar))
@@ -1100,7 +1099,7 @@ impl ChargebackService {
         &self,
         scope: &AccessScope,
         input: &ChargebackInput,
-    ) -> Result<i64, DomainError> {
+    ) -> Result<PostedMoney, DomainError> {
         let settlement = self
             .payment_repo
             .read_settlement(scope, input.tenant_id, &input.payment_id)
@@ -1119,13 +1118,8 @@ impl ChargebackService {
         // mismatch (mistyped or malicious — e.g. a USD payment disputed as EUR)
         // would post foreign legs against the original payment — reject before
         // sizing (mirrors `AllocateService`'s settlement-currency gate).
-        if settlement.currency != input.currency {
-            return Err(DomainError::CurrencyMismatch(format!(
-                "chargeback currency {} != settled currency {} for payment {}",
-                input.currency, settlement.currency, input.payment_id
-            )));
-        }
-        Ok(settlement.settled_minor - settlement.fee_minor)
+        settled_spec_check(input, &settlement.settled)?;
+        crate::domain::exact_money::subtract_posted(&settlement.settled, &settlement.fee)
     }
 
     /// `CHARGEBACK_ON_REFUNDED` pre-check: a `lost` cash-out (`clawed_back > 0`)
@@ -1142,7 +1136,7 @@ impl ChargebackService {
         &self,
         scope: &AccessScope,
         input: &ChargebackInput,
-        clawed_back: i64,
+        clawed_back: &PostedMoney,
     ) -> Result<(), DomainError> {
         let Some(settlement) = self
             .payment_repo
@@ -1152,34 +1146,27 @@ impl ChargebackService {
         else {
             return Ok(());
         };
-        // Widen to i128 for the cap sum: three i64 minor-unit totals could
-        // overflow at the extreme. The DB cap CHECK is the authoritative backstop,
-        // but this pre-check must not panic (debug) or wrap (release) before the
-        // post ever reaches it.
-        let total_out = i128::from(settlement.refunded_minor)
-            + i128::from(settlement.clawed_back_minor)
-            + i128::from(clawed_back);
-        let fits = total_out <= i128::from(settlement.settled_minor);
-        if !fits && settlement.refunded_minor > 0 {
+        let fits = clawback_fits(&settlement, clawed_back)?;
+        if !fits && settlement.refunded.amount() > Decimal::ZERO {
             tracing::warn!(
                 tenant_id = %input.tenant_id,
                 payment_id = %input.payment_id,
                 dispute_id = %input.dispute_id,
-                refunded_minor = settlement.refunded_minor,
-                settled_minor = settlement.settled_minor,
-                clawed_back,
+                refunded = %settlement.refunded.amount(),
+                settled = %settlement.settled.amount(),
+                clawed_back = %clawed_back.amount(),
                 "bss-ledger: chargeback lost on an already-refunded payment — routed to \
                  exception stub (full exception_queue is Slice 7)"
             );
-            // Slice 7 Phase 2: ADDITIVE close-blocking exception row beside the log +
-            // the rejection below. Keyed `(dispute_id, payment_id)`; fire-and-forget.
             if let Some(ex) = &self.exceptions {
                 let detail = serde_json::json!({
                     "dispute_id": input.dispute_id,
                     "payment_id": input.payment_id,
-                    "clawed_back_minor": clawed_back,
-                    "refunded_minor": settlement.refunded_minor,
-                    "settled_minor": settlement.settled_minor,
+                    "currency": settlement.settled.currency().code(),
+                    "currency_scale": settlement.settled.currency().scale(),
+                    "clawed_back": canonical_decimal(clawed_back.amount()),
+                    "refunded": canonical_decimal(settlement.refunded.amount()),
+                    "settled": canonical_decimal(settlement.settled.amount()),
                 });
                 ex.route(
                     input.tenant_id,
@@ -1194,61 +1181,26 @@ impl ChargebackService {
                  (refunded={}, clawed={}, settled={})",
                 input.dispute_id,
                 input.payment_id,
-                clawed_back,
-                settlement.refunded_minor,
-                settlement.clawed_back_minor,
-                settlement.settled_minor
+                clawed_back.amount(),
+                settlement.refunded.amount(),
+                settlement.clawed_back.amount(),
+                settlement.settled.amount()
             )));
         }
         Ok(())
     }
 
-    /// Stamp functional **carry-forward** onto a cross-currency chargeback entry
-    /// (Slice 5 F3, design §3.5 — chargeback close). A dispute phase reclassifies a
-    /// position WITHOUT locking a new rate: `CASH_HOLD` moves cash
-    /// `CASH_CLEARING ↔ DISPUTE_HOLD` (and `DISPUTE_HOLD → DISPUTE_LOSS` on a lost
-    /// forfeit); `AR_RECLASS` moves the receivable `ACTIVE ↔ DISPUTED` at one grain
-    /// (and `DISPUTED → DISPUTE_LOSS` on a lost write-off). The functional cost
-    /// basis of the grain it CLOSES therefore carries forward to the counter-leg
-    /// unchanged — realized FX is recognised only at a cash in/out point (settle
-    /// S2 / refund S3), never on an internal reclassification.
-    ///
-    /// Reads the carried `(functional, transaction)` value of the grain the phase
-    /// closes and stamps EVERY line's functional at that grain's WAC pro-rata
-    /// ([`carried_relief`]):
-    /// - `CASH_HOLD` `opened` → `CASH_CLEARING`; `won`/`lost` → `DISPUTE_HOLD`
-    ///   (`account_balance`, found by the closing leg's bound `account_id`);
-    /// - `AR_RECLASS` (any) → the disputed AR invoice (`ar_invoice_balance`).
-    ///
-    /// Every chargeback entry is two legs of EQUAL transaction amount, so both legs
-    /// get the SAME functional → the entry's functional column nets to zero (NO
-    /// `FX_GAIN_LOSS` line) while the closing grain's functional decrements by
-    /// exactly its pro-rata carried value (a full close → 0), keeping the
-    /// functional column in lockstep with `balance_minor` under the dual-column
-    /// commit trigger.
-    ///
-    /// No-op (leaves functional NULL — byte-green single-currency path) when the
-    /// closing grain carries no functional balance (design decision 8) OR when the
-    /// relieved amount exceeds the grain's balance (an over-relief the projector
-    /// rejects with `NegativeBalance`; skipping lets that cleaner rejection surface,
-    /// mirroring allocate F1's pool-underflow guard).
-    ///
-    /// # Errors
-    /// [`DomainError::Internal`] on a carried-read fault, a missing closing leg, or
-    /// a [`carried_relief`] misuse (a malformed grain value — an internal
-    /// invariant breach).
     async fn apply_fx_carry_forward(
         &self,
         scope: &AccessScope,
         input: &ChargebackInput,
         entry: &mut PostEntry,
     ) -> Result<(), DomainError> {
-        // Read the carried (transaction, functional) value of the grain this phase
-        // CLOSES (the position whose functional cost basis carries forward).
+        let currency = input.disputed_amount.currency().code();
+        // The carried (transaction, functional) value of the grain this phase
+        // relieves, read with its stored metadata.
         let carried = match input.variant {
             DisputeVariant::ArReclass => {
-                // The disputed AR invoice grain. invoice_id is guaranteed present
-                // (the builder rejects an AR_RECLASS without it before this runs).
                 let invoice_id = input.invoice_id.as_deref().ok_or_else(|| {
                     DomainError::Internal(
                         "chargeback FX: AR_RECLASS entry has no invoice_id".to_owned(),
@@ -1260,16 +1212,13 @@ impl ChargebackService {
                         input.tenant_id,
                         input.payer_tenant_id,
                         invoice_id,
-                        &input.currency,
+                        currency,
                     )
                     .await
                     .map_err(|e| DomainError::Internal(format!("read ar invoice carried: {e}")))?
+                    .map(|c| (c.balance, c.functional_balance))
             }
             DisputeVariant::CashHold => {
-                // The cash grain this phase relieves: CASH_CLEARING at `opened`
-                // (cash leaves clearing into the hold), DISPUTE_HOLD at
-                // `won`/`lost` (the hold is released / forfeited). `partial` is
-                // rejected in the builder; map it to DISPUTE_HOLD defensively.
                 let closing_class = match input.phase {
                     DisputePhase::Opened => AccountClass::CashClearing,
                     DisputePhase::Won | DisputePhase::Lost | DisputePhase::Partial => {
@@ -1288,46 +1237,38 @@ impl ChargebackService {
                         ))
                     })?;
                 self.payment_repo
-                    .read_account_carried(scope, input.tenant_id, account_id, &input.currency)
+                    .read_account_carried(scope, input.tenant_id, account_id, currency)
                     .await
                     .map_err(|e| DomainError::Internal(format!("read account carried: {e}")))?
+                    .map(|c| (c.balance, c.functional_balance))
             }
         };
 
-        // Cross-currency detect (design decision 8): the closing grain carries a
-        // functional balance. NULL ⇒ single-currency close: leave functional NULL.
-        let (Some(carried_functional), Some(functional_ccy)) = (
-            carried.functional_balance_minor,
-            carried.functional_currency,
-        ) else {
+        // An absent grain or a NULL functional ⇒ single-currency: leave functional NULL.
+        let Some((balance, Some(carried_functional))) = carried else {
             return Ok(());
         };
 
-        // The closing leg's relieved transaction amount (every chargeback leg
-        // shares the amount, so the first line's amount is it). A non-positive
-        // carried balance or an over-relief ⇒ skip carry-forward so the projector's
-        // NegativeBalance surfaces (the close never posts cleanly either way).
-        let relieved = entry.lines.first().map_or(0, |l| l.amount_minor);
-        if carried.balance_minor <= 0 || relieved > carried.balance_minor {
+        // Every leg of a chargeback phase moves the same amount; the first line's
+        // amount is the relieved amount. The grain's stored spec must match before
+        // any comparison. A non-positive carried balance or an over-relief ⇒ skip
+        // carry-forward so the projector's NegativeBalance surfaces.
+        let Some(relieved) = entry.lines.first().map(|l| l.money.clone()) else {
+            return Ok(());
+        };
+        matching_spec(&balance, &relieved)?;
+        if balance.amount() <= Decimal::ZERO || relieved.amount() > balance.amount() {
             return Ok(());
         }
 
-        // Stamp every line's functional at the grain's WAC pro-rata of its OWN
-        // amount. All legs share the amount, so both get the same value → the
-        // functional column nets to zero (carry-forward; no FX line) and the
-        // closing grain decrements by exactly its pro-rata carried functional.
         for line in &mut entry.lines {
-            let func = carried_relief(carried_functional, carried.balance_minor, line.amount_minor)
+            let func = carried_relief(&carried_functional, &balance, &line.money)
                 .map_err(|e| DomainError::Internal(format!("chargeback FX carry-forward: {e}")))?;
-            line.functional_amount_minor = Some(func);
-            line.functional_currency = Some(functional_ccy.clone());
+            line.functional_money = Some(func);
         }
         Ok(())
     }
 
-    /// Map an already-account-bound [`PostEntry`] to the engine's
-    /// `NewEntry`/`NewLine`, resolving each line's scale, and post INLINE with the
-    /// chargeback sidecar.
     async fn post_bound(
         &self,
         ctx: &SecurityContext,
@@ -1335,7 +1276,7 @@ impl ChargebackService {
         entry: PostEntry,
         sidecar: Arc<dyn PostSidecar>,
     ) -> Result<PostingRef, DomainError> {
-        let (new_entry, new_lines) = self.to_engine_inputs(scope, entry).await?;
+        let (new_entry, new_lines) = self.to_engine_inputs(entry).await?;
         self.posting
             .post(ctx, scope, new_entry, new_lines, Some(sidecar))
             .await
@@ -1346,7 +1287,6 @@ impl ChargebackService {
     /// and deferred-apply post paths.
     async fn to_engine_inputs(
         &self,
-        scope: &AccessScope,
         entry: PostEntry,
     ) -> Result<(NewEntry, Vec<NewLine>), DomainError> {
         let new_entry = NewEntry {
@@ -1373,12 +1313,7 @@ impl ChargebackService {
         };
         let mut new_lines: Vec<NewLine> = Vec::with_capacity(entry.lines.len());
         for line in entry.lines {
-            let scale = self
-                .resolver
-                .resolve(scope, entry.tenant_id, &line.currency)
-                .await
-                .map_err(|e| DomainError::Internal(format!("currency scale resolve: {e}")))?;
-            new_lines.push(new_line(line, scale));
+            new_lines.push(new_line(line));
         }
         Ok((new_entry, new_lines))
     }
@@ -1406,42 +1341,25 @@ impl ChargebackService {
     }
 }
 
-/// Guard the `∅ → opened` / `{won,lost} → opened` transition (design §2): an
-/// `opened` is valid only when the dispute has no row yet, or its prior cycle
-/// already ended (`last_phase` is a terminal `WON`/`LOST`). An `opened` on a
-/// dispute whose `last_phase` is still `OPENED` (or `PARTIAL`) is an illegal
-/// re-open and is rejected.
-fn guard_open_transition(
-    existing: Option<&crate::infra::storage::entity::dispute::Model>,
-    dispute_id: &str,
+/// Guard a phase against the dispute's current state (read outside the
+/// posting transaction) with the one dispute state machine
+/// ([`check_transition`], design §2): `∅ → opened` at cycle 1,
+/// `{won,lost} → opened` at the next cycle for the same payment, and
+/// `opened → {won,lost}` at the open cycle. The repository write re-checks the
+/// same rules on the row it reads inside the transaction, so a race between
+/// this read and the post is still refused.
+fn guard_transition(
+    existing: Option<&DisputeState>,
+    req: &ChargebackRequest,
 ) -> Result<(), DomainError> {
-    let Some(row) = existing else {
-        return Ok(());
-    };
-    match DisputePhase::parse(&row.last_phase) {
-        Some(DisputePhase::Won | DisputePhase::Lost) => Ok(()),
-        _ => Err(DomainError::InvalidDisputeTransition(format!(
-            "dispute {dispute_id} is already {} — cannot open a new cycle until it is won/lost",
-            row.last_phase
-        ))),
-    }
-}
-
-/// Guard the `opened → {won,lost}` transition (design §2): an outcome is valid
-/// only when the dispute's current `last_phase` is `OPENED`. A `won`/`lost` on a
-/// dispute that already resolved (`WON`/`LOST`) or was never opened is an illegal
-/// transition.
-fn guard_outcome_transition(
-    row: &crate::infra::storage::entity::dispute::Model,
-    dispute_id: &str,
-) -> Result<(), DomainError> {
-    match DisputePhase::parse(&row.last_phase) {
-        Some(DisputePhase::Opened) => Ok(()),
-        _ => Err(DomainError::InvalidDisputeTransition(format!(
-            "dispute {dispute_id} is {} — only an OPENED dispute can be won/lost",
-            row.last_phase
-        ))),
-    }
+    check_transition(
+        &req.dispute_id,
+        existing.map(DisputeState::observed),
+        &req.payment_id,
+        req.phase,
+        req.cycle,
+    )
+    .map_err(|e| DomainError::InvalidDisputeTransition(e.to_string()))
 }
 
 /// Overwrite the placeholder header fields the pure builder emits (mirrors
@@ -1467,14 +1385,49 @@ fn overwrite_header(
 fn resolve_line(chart: &ChartIndex, line: &PostLine) -> Option<Uuid> {
     chart.resolve(
         line.account_class,
-        &line.currency,
+        line.money.currency().code(),
         line.revenue_stream.as_deref(),
     )
 }
 
 /// Map one SDK [`PostLine`] + its resolved scale to the engine's [`NewLine`]
 /// (mirrors `settlement_return::new_line`).
-fn new_line(line: PostLine, scale: u8) -> NewLine {
+/// The chargeback must carry the settlement's stored currency AND scale: a
+/// mismatch is a named rejection, never an implicit conversion.
+fn settled_spec_check(input: &ChargebackInput, settled: &PostedMoney) -> Result<(), DomainError> {
+    let request = input.disputed_amount.currency();
+    let origin = settled.currency();
+    if request.code() != origin.code() {
+        return Err(DomainError::CurrencyMismatch(format!(
+            "chargeback currency {} != settled currency {} for payment {}",
+            request.code(),
+            origin.code(),
+            input.payment_id
+        )));
+    }
+    if request.scale() != origin.scale() {
+        return Err(DomainError::InconsistentScale(format!(
+            "chargeback currency scale {} != settled scale {} for payment {}",
+            request.scale(),
+            origin.scale(),
+            input.payment_id
+        )));
+    }
+    Ok(())
+}
+
+/// `min(a, b)` on exact values after the specs are checked (the held cash is
+/// `min(disputed, net)`, Model N).
+fn min_posted(a: &PostedMoney, b: &PostedMoney) -> Result<PostedMoney, DomainError> {
+    matching_spec(a, b)?;
+    Ok(if b.amount() < a.amount() {
+        b.clone()
+    } else {
+        a.clone()
+    })
+}
+
+fn new_line(line: PostLine) -> NewLine {
     NewLine {
         line_id: line.line_id,
         payer_tenant_id: line.payer_tenant_id,
@@ -1484,15 +1437,12 @@ fn new_line(line: PostLine, scale: u8) -> NewLine {
         account_class: line.account_class,
         gl_code: line.gl_code,
         side: line.side,
-        amount_minor: line.amount_minor,
-        currency: line.currency,
-        currency_scale: scale,
+        money: line.money,
         invoice_id: line.invoice_id,
         due_date: line.due_date,
         revenue_stream: line.revenue_stream,
         mapping_status: line.mapping_status,
-        functional_amount_minor: line.functional_amount_minor,
-        functional_currency: line.functional_currency,
+        functional_money: line.functional_money,
         tax_jurisdiction: line.tax_jurisdiction,
         tax_filing_period: line.tax_filing_period,
         tax_rate_ref: line.tax_rate_ref,
@@ -1583,3 +1533,28 @@ impl PostSidecar for QueuedChargebackApplySidecar {
         Ok(())
     }
 }
+
+/// Does this clawback fit the money-out cap, `refunded + clawed_back(stored) +
+/// clawed_back(this) <= settled`? Exact values, after the stored specs are
+/// checked against the request's; reaching the cap exactly fits.
+///
+/// # Errors
+/// A currency or scale mismatch between the settlement and the clawback, or an
+/// exact-arithmetic budget breach.
+fn clawback_fits(
+    settlement: &crate::infra::storage::repo::payment_repo::SettlementState,
+    clawed_back: &PostedMoney,
+) -> Result<bool, DomainError> {
+    matching_spec(&settlement.settled, clawed_back)?;
+    matching_spec(&settlement.settled, &settlement.refunded)?;
+    matching_spec(&settlement.settled, &settlement.clawed_back)?;
+    let total_out = ExactAmount::from_decimal(settlement.refunded.amount())
+        .checked_add(&ExactAmount::from_decimal(settlement.clawed_back.amount()))
+        .and_then(|v| v.checked_add(&ExactAmount::from_decimal(clawed_back.amount())))
+        .map_err(map_exact_error)?;
+    Ok(total_out <= ExactAmount::from_decimal(settlement.settled.amount()))
+}
+
+#[cfg(test)]
+#[path = "chargeback_cap_tests.rs"]
+mod cap_tests;

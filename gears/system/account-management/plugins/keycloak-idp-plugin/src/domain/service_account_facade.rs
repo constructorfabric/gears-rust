@@ -32,6 +32,7 @@ use crate::domain::ports::metrics::{
 };
 use crate::domain::ports::purge::TenantAccountPurgeHook;
 
+/// Prefix of the Keycloak `clientId` of every service-account client created by this plugin.
 pub const SP_CLIENT_ID_PREFIX: &str = "svc";
 const NAME_MAX_LEN: usize = 40;
 /// Page size for the owned-client walk in [`ServiceAccountFacade::list_owned_reps`].
@@ -172,6 +173,7 @@ fn owner_matches(rep: &SaClientRep, tenant_id: Uuid) -> bool {
     attr_value_matches(attrs.get(PROVISIONING_TENANT_ID_ATTR), &target)
 }
 
+/// Keycloak-backed service-account operations (create / list / rotate / revoke / purge).
 #[domain_model]
 pub struct ServiceAccountFacade {
     cfg: ServiceAccountConfig,

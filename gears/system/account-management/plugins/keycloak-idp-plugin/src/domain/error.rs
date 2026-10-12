@@ -90,6 +90,8 @@ pub fn redact_secrets(body: &str) -> String {
     kv_re().replace_all(&s, "$1=<redacted>").into_owned()
 }
 
+/// Typed failure taxonomy of the Keycloak `IdP` plugin; each variant is mapped
+/// at the plugin boundary onto the matching AM SDK failure type.
 #[domain_model]
 #[derive(Debug, Error)]
 pub enum PluginError {
@@ -99,43 +101,70 @@ pub enum PluginError {
     /// `body_first_2kb` is verbatim-truncated.
     #[error("kc:{method} {path_template} -> {status}: {body_first_2kb}")]
     KcRest {
+        /// HTTP method of the failed Admin REST call.
         method: &'static str,
+        /// Request path template with literal `{realm}` / `{tenant_id}` placeholders.
         path_template: String,
+        /// Response status (or transport/timeout classification).
         status: KcStatusKind,
+        /// Response body, truncated to the first 2 KiB.
         body_first_2kb: String,
     },
+    /// Reading the bootstrap credentials from the credential store failed.
     #[error("internal:CredStoreReader: {detail}")]
-    CredStoreRead { detail: String },
+    CredStoreRead {
+        /// Failure detail from the credential store reader.
+        detail: String,
+    },
+    /// Persisted provisioning metadata could not be decoded.
     #[error("internal:MetadataCodec: {0}")]
     MetadataDecode(#[from] crate::domain::metadata_codec::DecodeError),
+    /// Plugin configuration or post-KC state is invalid.
     #[error("internal:Config: {detail}")]
-    Config { detail: String },
+    Config {
+        /// Description of the configuration problem.
+        detail: String,
+    },
     /// Caller-supplied `provisioning_metadata` rejected by `parse_input`
     /// BEFORE any KC call (e.g. created+explicit-realm, shared with no
     /// parent metadata, bad mode/realm shape). Distinct from `Config` —
     /// which is also emitted post-KC — so it can map to a clean 400.
     #[error("provisioning input rejected: {detail}")]
-    ProvisionInputRejected { detail: String },
+    ProvisionInputRejected {
+        /// Why the provisioning input was rejected.
+        detail: String,
+    },
     /// Bootstrap admin lacks `view-realm` / `query-groups` on the target realm.
     /// Phase 15 boundary translates this to `IdpProvisionFailure::UnsupportedOperation`
     /// per DESIGN "API Contracts". The detail string is the runbook key the
     /// operator searches for.
     #[error("bootstrap admin lacks view-realm/query-groups in {realm} - see Phase 0 IaC checklist")]
-    BootstrapPermsMissing { realm: String },
+    BootstrapPermsMissing {
+        /// Realm in which the bootstrap admin lacks permissions.
+        realm: String,
+    },
 
     /// `mode = created` requested but the target realm already exists in
     /// Keycloak. Validation rejection — NO IdP-side state was created.
     /// Phase 15 boundary maps this to
     /// [`IdpProvisionFailure::CleanFailure`] per DESIGN "API Contracts".
     #[error("mode = created but realm '{realm}' already exists")]
-    CreatedRealmExists { realm: String },
+    CreatedRealmExists {
+        /// Name of the already-existing realm.
+        realm: String,
+    },
 
     /// A realm-create request returned an uncertain response, but the
     /// reconciliation probe then returned 404 and proved that no realm was
     /// retained. Phase 15 maps this to [`IdpProvisionFailure::CleanFailure`],
     /// allowing the caller to retry instead of invoking the ambiguity runbook.
     #[error("realm '{realm}' was not retained after failed create; retry is safe: {detail}")]
-    RealmCreateNotRetained { realm: String, detail: String },
+    RealmCreateNotRetained {
+        /// Name of the realm that was proven absent.
+        realm: String,
+        /// Detail of the original failed create.
+        detail: String,
+    },
 
     /// Ambiguous Created-mode failure — Keycloak (or `OpenBao`) side effects
     /// may or may not be in place. Phase 15 boundary maps this to
@@ -145,7 +174,9 @@ pub enum PluginError {
     /// (PRD "Risks", orphaned-resource-after-lost-response row) can prioritise cleanup.
     #[error("{stage}: {detail}")]
     AmbiguousCreated {
+        /// Saga step that failed.
         stage: AmbiguousStage,
+        /// Failure detail (redacted body).
         detail: String,
     },
 
@@ -154,19 +185,28 @@ pub enum PluginError {
     /// [`IdpDeprovisionFailure::NotFound`] which AM treats as a
     /// success-equivalent on the hard-delete pipeline.
     #[error("deprovision target not found in realm '{realm_name}'")]
-    DeprovisionNotFound { realm_name: String },
+    DeprovisionNotFound {
+        /// Name of the realm that was already absent.
+        realm_name: String,
+    },
 
     /// Transient failure during deprovision (5xx / transport / timeout).
     /// Phase 15 boundary maps to [`IdpDeprovisionFailure::Retryable`]; the
     /// row is deferred to the next reaper / retention tick.
     #[error("deprovision retryable: {detail}")]
-    DeprovisionRetryable { detail: String },
+    DeprovisionRetryable {
+        /// Transient failure detail.
+        detail: String,
+    },
 
     /// Operator-must-intervene deprovision failure — e.g. malformed
     /// persisted metadata or other irrecoverable state. Phase 15 boundary
     /// maps to [`IdpDeprovisionFailure::Terminal`].
     #[error("deprovision terminal: {detail}")]
-    DeprovisionTerminal { detail: String },
+    DeprovisionTerminal {
+        /// Terminal failure detail for the operator.
+        detail: String,
+    },
 
     /// User-op payload was rejected by KC (400/422 that is not a
     /// recognised password-policy reject: invalid email format,
@@ -176,7 +216,10 @@ pub enum PluginError {
     /// Uniqueness conflicts never land here: every KC 409 rides
     /// [`Self::UserOpDuplicate`].
     #[error("user op rejected: {detail}")]
-    UserOpRejected { detail: String },
+    UserOpRejected {
+        /// Why Keycloak rejected the payload.
+        detail: String,
+    },
 
     /// User-op hit a KC uniqueness collision — ANY 409 from
     /// user-create (the status is the machine signal; on that endpoint
@@ -188,7 +231,9 @@ pub enum PluginError {
     /// in KC can degrade the field token, never the status.
     #[error("user op duplicate {field:?}: {detail}")]
     UserOpDuplicate {
+        /// Colliding field, as far as attributable from Keycloak's message.
         field: account_management_sdk::IdpUserDuplicateField,
+        /// Keycloak error detail.
         detail: String,
     },
 
@@ -199,20 +244,29 @@ pub enum PluginError {
     /// Previously this fell through the non-409 catch-all
     /// into `UserOpUnavailable` and mis-surfaced as a retryable 503.
     #[error("user op password policy: {detail}")]
-    UserOpPasswordPolicy { detail: String },
+    UserOpPasswordPolicy {
+        /// Password-policy violation message from Keycloak.
+        detail: String,
+    },
 
     /// User-op failed at transport / 5xx / timeout. Phase 15 boundary
     /// maps to [`IdpUserOperationFailure::Unavailable`] per DESIGN "API Contracts"
     /// — AM surfaces `idp_unavailable` and does NOT serve a fallback
     /// projection.
     #[error("user op unavailable: {detail}")]
-    UserOpUnavailable { detail: String },
+    UserOpUnavailable {
+        /// Transport / 5xx / timeout detail.
+        detail: String,
+    },
 
     /// User-op was explicitly declined by the provider (read-only /
     /// legacy profile). Phase 15 boundary maps to
     /// [`IdpUserOperationFailure::UnsupportedOperation`] per DESIGN "API Contracts".
     #[error("user op unsupported: {detail}")]
-    UserOpUnsupported { detail: String },
+    UserOpUnsupported {
+        /// Why the operation is unsupported.
+        detail: String,
+    },
 
     /// The target user is absent from the bound realm, OR its stored
     /// `tenant_id` attribute does not match the requesting tenant. The
@@ -225,7 +279,10 @@ pub enum PluginError {
     /// `Ok(())` for idempotency — an update against a missing user is a
     /// genuine 404: there is no state in which the patch was applied.
     #[error("user op not found: {detail}")]
-    UserOpNotFound { detail: String },
+    UserOpNotFound {
+        /// Detail on the missing user (not disclosing cross-tenant existence).
+        detail: String,
+    },
 
     /// KC refused to write one or more attributes because they are
     /// provider-managed and not overridable (read-only user-profile
@@ -249,7 +306,9 @@ pub enum PluginError {
         fields.iter().map(|f| f.as_field_token()).collect::<Vec<_>>().join(", ")
     )]
     UserOpFieldNotWritable {
+        /// Full, non-empty set of refused provider-managed attributes.
         fields: Vec<account_management_sdk::IdpUserAttribute>,
+        /// Keycloak error detail.
         detail: String,
     },
 
@@ -258,20 +317,28 @@ pub enum PluginError {
     /// Boundary maps this to service-account-sdk's `InvalidInput`.
     #[error("sa invalid input: {detail}")]
     SaInvalidInput {
+        /// Why the request was rejected.
         detail: String,
+        /// Offending request field, when attributable.
         field: Option<String>,
     },
     /// Service-account client absent, or not owned by the addressed
     /// tenant (ownership-attribute mismatch is NOT revealed separately).
     /// Boundary maps this to service-account-sdk's `NotFound`.
     #[error("sa not found: {detail}")]
-    SaNotFound { detail: String },
+    SaNotFound {
+        /// Detail on the missing service-account client.
+        detail: String,
+    },
     /// Service-account create refused before any KC mutation because the
     /// tenant already owns `per_tenant_quota` clients. Not permanent: it
     /// clears once the tenant revokes one. Boundary maps this to
     /// service-account-sdk's `QuotaExceeded` (AM: 429).
     #[error("sa quota exceeded: {detail}")]
-    SaQuotaExceeded { detail: String },
+    SaQuotaExceeded {
+        /// Detail on the exceeded quota.
+        detail: String,
+    },
 }
 
 /// Stable `failure_variant` label string for the `keycloak_idp_plugin_failure_total`
@@ -319,10 +386,16 @@ pub const AMBIG_PREFIX: &str = "ambig:";
 #[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AmbiguousStage {
+    /// Realm create outcome unknown. Wire detail: `ambig:kc_realm_create`.
     KcRealmCreate,
+    /// Client create outcome unknown. Wire detail: `ambig:kc_client_create`.
     KcClientCreate,
+    /// Service-role mapping outcome unknown. Wire detail: `ambig:kc_role_mapping`.
     KcRoleMapping,
+    /// Client secret read outcome unknown. Wire detail: `ambig:kc_client_secret_read`.
     KcClientSecretRead,
+    /// `OpenBao` put failed after Keycloak side effects succeeded.
+    /// Wire detail: `ambig:openbao_put_after_kc_success`.
     OpenBaoPutAfterKcSuccess,
     /// Saga exceeded `provision_timeout_ms`. Wire detail: `ambig:timeout`.
     Timeout,
@@ -366,11 +439,15 @@ impl std::fmt::Display for AmbiguousStage {
     }
 }
 
+/// Classification of a Keycloak call outcome used in [`PluginError::KcRest`].
 #[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KcStatusKind {
+    /// Keycloak answered with this HTTP status code.
     Http(u16),
+    /// Transport-level failure (connect, TLS, reset) before any status.
     Transport,
+    /// The request timed out.
     Timeout,
 }
 

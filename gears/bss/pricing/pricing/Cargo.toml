@@ -29,6 +29,7 @@ bss-products-sdk = { workspace = true }
 bss-approval = { workspace = true }
 # D-518: weak ETag and 304 on the plan and book list reads.
 bss-rest = { workspace = true }
+bss-money = { workspace = true, features = ["serde"] }
 # D-490: the approvals inbox's source port, which this gear implements over its own doors.
 bss-approvals-sdk = { workspace = true }
 # D-490: the inbox's votes go through this gear's own vote doors as a request (`oneshot`).

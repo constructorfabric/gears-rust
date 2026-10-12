@@ -97,6 +97,7 @@ pub mod secure;
 #[cfg(feature = "test-support")]
 pub mod test_support;
 
+/// Internal provider that hands out database handles.
 mod db_provider;
 
 // Internal gears

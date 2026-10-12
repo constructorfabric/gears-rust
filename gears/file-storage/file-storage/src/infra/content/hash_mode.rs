@@ -1,23 +1,13 @@
 //! Content-hash modes (ADR-0006): `HashMode`, `ManifestEntry`, `Manifest`.
 //!
-//! Per ADR-0006 / `content-hash-modes.md`, there are exactly **two**
-//! content-hash modes, both SHA-256, distinguished only by upload path:
+//! Both modes are SHA-256: `whole-sha256` is `sha256(object bytes)` with no manifest;
+//! `multipart-composite-sha256` is `root = sha256(manifest)`, where `manifest` is a canonical
+//! text encoding of every part's byte offset and `sha256(part_bytes)`, in ascending order.
 //!
-//! 1. `whole-sha256` — plain `sha256(whole object bytes)`. No manifest.
-//! 2. `multipart-composite-sha256` — `root = sha256(manifest)`, where
-//!    `manifest` is a canonical text encoding of every part's byte offset
-//!    and `sha256(part_bytes)`, in ascending order.
+//! This module is the only place the manifest wire format is produced or parsed, so every
+//! backend and verifier derives the same `root`.
 //!
-//! This module owns the manifest's canonical wire-format grammar (§3 of
-//! `content-hash-modes.md`) — the single, shared place this encoding is
-//! produced or parsed. Every backend's `complete_multipart` and every
-//! verifier (client, `Store::verify_content_hash`, `migrate_backend`) goes
-//! through [`Manifest::to_wire_string`]/[`Manifest::from_wire_string`] rather
-//! than hand-rolling the format, so a subtle divergence (uppercase hex,
-//! trailing comma, wrong offset encoding) can never silently produce a
-//! different `root` per call site.
-//!
-//! Grammar (normative, `content-hash-modes.md` §3):
+//! Grammar (normative):
 //! ```text
 //! manifest    = version "," part *("," part)
 //! version     = "v1"
@@ -25,15 +15,11 @@
 //! offset      = "0" / (nonzero-digit *digit)      ; decimal, no leading zeros
 //! digest      = 64(hex-lower)                     ; sha256(part_bytes), lowercase
 //! ```
-//!
-//! @cpt-dod:cpt-cf-file-storage-dod-content-hash-modes-groundwork:p2
 
 use crate::domain::error::DomainError;
 use crate::infra::content::hash;
 
-/// One of the two shipped hash modes; carried end-to-end from the multipart
-/// plan through to the stored version row. `hash_algorithm` is not part of
-/// this enum — it is always SHA-256 for both modes.
+/// One of the two hash modes, carried from the multipart plan to the stored version row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HashMode {
     WholeSha256,
@@ -66,31 +52,27 @@ impl HashMode {
     }
 }
 
-/// One manifest entry: a part's start offset within the assembled object,
-/// plus its SHA-256 digest.
+/// One manifest entry: a part's start offset in the assembled object and its SHA-256 digest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ManifestEntry {
     pub offset: u64,
     pub digest: [u8; 32],
 }
 
-/// An ordered, canonically-encodable manifest (§3 grammar). Entries are
-/// always in strictly ascending offset order, first offset `0` — enforced by
-/// every constructor ([`Manifest::new`], [`Manifest::from_wire_string`]).
+/// An ordered manifest. Entries are in strictly ascending offset order starting at `0`,
+/// enforced by every constructor.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Manifest(Vec<ManifestEntry>);
 
-/// The manifest format-version token (§3 rule 1). Not a hash-algorithm or
-/// part-count field — a future incompatible grammar change would use a
-/// different token (`v2`, ...).
+/// The manifest format-version token; an incompatible grammar change would use a new one.
 const VERSION_PREFIX: &str = "v1";
 
 impl Manifest {
-    /// Build a manifest from an ordered, non-empty slice of entries.
+    /// Build a manifest from ordered entries.
     ///
     /// # Errors
-    /// Returns a validation error if `entries` is empty, the first entry's
-    /// offset is not `0`, or offsets are not strictly ascending.
+    /// Validation error if `entries` is empty, does not start at offset `0`, or is not
+    /// strictly ascending.
     pub fn new(entries: Vec<ManifestEntry>) -> Result<Self, DomainError> {
         if entries.is_empty() {
             return Err(DomainError::validation(
@@ -127,45 +109,34 @@ impl Manifest {
         self.0.len()
     }
 
-    /// A manifest is never empty by construction (see [`Self::new`]); this
-    /// exists solely to satisfy `clippy::len_without_is_empty`.
+    /// Always `false` (a manifest is non-empty by construction); satisfies clippy.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
 
-    /// Serialize per §3's exact grammar:
-    /// `v1,{offset_0}:{hex(digest_0)},{offset_1}:{hex(digest_1)},…` — no
-    /// trailing delimiter, no whitespace, lowercase hex, no leading zeros on
-    /// offsets. This is the **single** place manifest text is produced; every
-    /// backend and verifier must call this rather than hand-rolling the
-    /// format.
+    /// Serialize to `v1,{offset_0}:{hex(digest_0)},...`: no trailing delimiter or whitespace,
+    /// lowercase hex, no leading zeros on offsets.
     #[must_use]
-    // @cpt-begin:cpt-cf-file-storage-algo-content-hash-modes-build-manifest:p1:inst-buildmanifest-concat
     pub fn to_wire_string(&self) -> String {
-        // Pre-size: "v1" + per-entry ",{offset}:{64 hex chars}" (offsets are
-        // realistically well under 20 decimal digits).
+        // "v1" + per-entry ",{offset}:{64 hex chars}".
         let mut s = String::with_capacity(VERSION_PREFIX.len() + self.0.len() * 90);
         s.push_str(VERSION_PREFIX);
         for entry in &self.0 {
             s.push(',');
-            // @cpt-begin:cpt-cf-file-storage-algo-content-hash-modes-build-manifest:p1:inst-buildmanifest-serialize-entry
             s.push_str(itoa_u64(entry.offset).as_str());
             s.push(':');
             s.push_str(&hex::encode(entry.digest));
-            // @cpt-end:cpt-cf-file-storage-algo-content-hash-modes-build-manifest:p1:inst-buildmanifest-serialize-entry
         }
         s
     }
-    // @cpt-end:cpt-cf-file-storage-algo-content-hash-modes-build-manifest:p1:inst-buildmanifest-concat
 
-    /// Parse a manifest string per §3's exact grammar, rejecting any
-    /// deviation: unrecognized version prefix, malformed/missing delimiters,
-    /// non-decimal or leading-zero offsets, digests that are not exactly 64
-    /// lowercase hex characters, non-ascending offsets, or an empty part list.
+    /// Parse a manifest string, rejecting any deviation from the grammar (unknown version,
+    /// bad delimiters, non-canonical offsets, digests not 64 lowercase hex, non-ascending
+    /// offsets, empty part list).
     ///
     /// # Errors
-    /// Returns a validation error describing the first rule violated.
+    /// Validation error describing the first rule violated.
     pub fn from_wire_string(s: &str) -> Result<Self, DomainError> {
         let err = |msg: &'static str| DomainError::validation("manifest", msg);
 
@@ -211,19 +182,14 @@ impl Manifest {
         Self::new(entries)
     }
 
-    /// Compute `root = sha256(to_wire_string())` — the value stored as the
-    /// version's `hash_value` for `multipart-composite-sha256` versions.
+    /// `root = sha256(to_wire_string())`, stored as the version's `hash_value`.
     #[must_use]
-    // @cpt-begin:cpt-cf-file-storage-algo-content-hash-modes-build-manifest:p1:inst-buildmanifest-root
     pub fn root(&self) -> [u8; 32] {
         hash::digest_to_array(hash::sha256(self.to_wire_string().as_bytes()))
     }
-    // @cpt-end:cpt-cf-file-storage-algo-content-hash-modes-build-manifest:p1:inst-buildmanifest-root
 }
 
-/// Format a `u64` as a plain decimal `String` with no leading zeros (`"0"`
-/// for zero itself) — equivalent to `value.to_string()`, named to keep the
-/// intent obvious at the `to_wire_string` call site.
+/// Plain decimal `String` without leading zeros.
 fn itoa_u64(value: u64) -> String {
     value.to_string()
 }

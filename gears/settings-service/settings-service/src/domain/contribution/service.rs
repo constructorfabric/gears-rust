@@ -2,6 +2,7 @@
 //! The reconcile itself, one declaration at a time.
 
 use std::sync::Arc;
+use toolkit_macros::domain_model;
 
 use serde_json::Value;
 use settings_service_sdk::SettingKey;
@@ -25,6 +26,7 @@ use crate::domain::validation::TypeValidator;
 use crate::domain::value::{ValueDraft, ValueRepository};
 
 /// What one declaration's reconcile did.
+#[domain_model]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
     /// A higher major inserted, the predecessor's values carried across and
@@ -45,6 +47,7 @@ pub enum Outcome {
 }
 
 /// Why one item did not reconcile.
+#[domain_model]
 #[derive(Debug)]
 pub enum ItemError {
     /// The declaration was refused; the rest of the set is unaffected.
@@ -72,6 +75,7 @@ fn refused(code: &'static str, message: impl Into<String>) -> ItemError {
 }
 
 /// The reconciler.
+#[domain_model]
 pub struct ContributionService<D, Cat, V, S> {
     declarations: D,
     categories: Cat,

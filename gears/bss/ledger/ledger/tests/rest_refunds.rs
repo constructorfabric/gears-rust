@@ -57,7 +57,6 @@ use bss_ledger::config::{FxConfig, RecognitionConfig};
 use bss_ledger::domain::approval::intent::ApprovalIntent;
 use bss_ledger::domain::error::DomainError;
 use bss_ledger::domain::model::{AccountRow, CurrencyScaleRow};
-use bss_ledger::domain::money::DEFAULT_PLAUSIBLE_MAX_MAJOR;
 use bss_ledger::domain::payment::settlement::SettlementInput;
 use bss_ledger::domain::ports::metrics::{LedgerMetricsPort, NoopLedgerMetrics};
 use bss_ledger::infra::adjustment::credit_note_service::CreditNoteHandler;
@@ -82,6 +81,29 @@ use toolkit_gts::gts_id;
 use toolkit_security::{PlatformSecurityContext, SecurityContext};
 use tower::ServiceExt;
 use uuid::Uuid;
+
+/// A USD scale-2 posting from a cent count (`1234` ⇒ `12.34`).
+fn usd_cents(minor: i64) -> bss_ledger_sdk::PostedMoney {
+    bss_ledger_sdk::PostedMoney::try_new(
+        rust_decimal::Decimal::new(minor, 2),
+        bss_ledger_sdk::CurrencySpec::try_new("USD".to_owned(), 2).unwrap(),
+    )
+    .unwrap()
+}
+
+/// The wire form of a scale-2 cent count in `currency`.
+fn money_json(minor: i64, currency: &str) -> serde_json::Value {
+    serde_json::json!({
+        "amount": bss_ledger_sdk::canonical_decimal(rust_decimal::Decimal::new(minor, 2)),
+        "currency": currency,
+        "currency_scale": 2
+    })
+}
+
+/// The wire form of a USD scale-2 cent count.
+fn usd_json(minor: i64) -> serde_json::Value {
+    money_json(minor, "USD")
+}
 
 fn pg(sql: impl Into<String>) -> Statement {
     Statement::from_string(sea_orm::DatabaseBackend::Postgres, sql.into())
@@ -247,8 +269,7 @@ async fn boot() -> (
         .upsert_currency_scale(CurrencyScaleRow {
             tenant_id: s.tenant,
             currency: "USD".to_owned(),
-            minor_units: 2,
-            plausible_max_major: DEFAULT_PLAUSIBLE_MAX_MAJOR,
+            currency_scale: 2,
             source: "iso".to_owned(),
         })
         .await
@@ -354,9 +375,8 @@ async fn settle(provider: &DBProvider<DbError>, s: &Seller, payment_id: &str, gr
             tenant_id: s.tenant,
             payer_tenant_id: s.payer,
             payment_id: payment_id.to_owned(),
-            gross_minor: gross,
-            fee_minor: 0,
-            currency: "USD".to_owned(),
+            gross: usd_cents(gross),
+            fee: usd_cents(0),
             effective_at: None,
         },
     )
@@ -370,9 +390,8 @@ async fn post_invoice(provider: &DBProvider<DbError>, s: &Seller, invoice_id: &s
     use bss_ledger::domain::invoice::builder::{InvoiceItem, PostedInvoice, TaxBreakdown};
     use bss_ledger::domain::recognition::input::{RecognitionInput, RecognitionTiming};
     let item = InvoiceItem {
-        amount_minor_ex_tax: amount,
-        deferred_minor: 0,
-        currency: "USD".to_owned(),
+        amount_ex_tax: usd_cents(amount),
+        deferred: usd_cents(0),
         revenue_stream: "subscription".to_owned(),
         catalog_class: Some(AccountClass::Revenue),
         contract_class: None,
@@ -486,9 +505,7 @@ fn refund_body(
         "phase": "initiated",
         "pattern": "A_UNALLOCATED",
         "payment_id": payment_id,
-        "currency": "USD",
-        "amount_minor": amount_minor,
-        "scale": 2,
+        "amount": usd_json(amount_minor),
         "two_stage": false
     })
 }
@@ -624,12 +641,10 @@ async fn refund_with_credit_note_posts_both_201() {
             "origin_invoice_item_ref": "item-1",
             "po_allocation_group": "grp-1",
             "revenue_stream": "subscription",
-            "currency": "USD",
-            "scale": 2,
-            "amount_minor": 300,
-            "tax_minor": 0,
+            "amount": usd_json(300),
+            "tax_amount": usd_json(0),
             "tax": [],
-            "requested_deferred_minor": 300,
+            "requested_deferred": usd_json(300),
             "reason_code": "CUSTOMER_GOODWILL"
         }
     });
@@ -681,7 +696,7 @@ async fn get_refund_returns_record_and_clearing_state() {
     assert_eq!(resp["psp_refund_id"], serde_json::json!("PSP-G"));
     assert_eq!(resp["pattern"], serde_json::json!("A_UNALLOCATED"));
     assert_eq!(resp["clearing_state"], serde_json::json!("PENDING"));
-    assert_eq!(resp["amount_minor"], serde_json::json!(250));
+    assert_eq!(resp["amount"], usd_json(250));
 }
 
 /// `GET …/refunds/{id}` for an unknown refund → 404 (no existence leak).

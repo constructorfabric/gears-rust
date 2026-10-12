@@ -103,6 +103,7 @@ pub struct StreamQuery {
     pub subscription_id: Uuid,
 }
 
+/// Wire shape of one event delivered in an `Event` frame.
 #[derive(Debug)]
 #[toolkit_macros::api_dto(response)]
 pub(crate) struct EventPayloadDto {
@@ -142,6 +143,7 @@ impl From<Event> for EventPayloadDto {
     }
 }
 
+/// Wire shape of a partition position: committed offset and last examined sequence.
 #[derive(Debug)]
 #[toolkit_macros::api_dto(response)]
 pub(crate) struct PositionDto {
@@ -159,19 +161,30 @@ pub(crate) struct PositionDto {
 #[toolkit_macros::api_dto(response)]
 #[serde(tag = "kind")]
 pub(crate) enum FrameDto {
+    /// A delivered event.
     Event {
+        /// The event being delivered.
         payload: Box<EventPayloadDto>,
     },
+    /// Keep-alive frame sent when no events are flowing.
     Heartbeat {
+        /// Server time at which the heartbeat was emitted.
         at: DateTime<Utc>,
     },
+    /// The member's partition assignment changed.
     Topology {
+        /// Group topology version this assignment belongs to.
         topology_version: i64,
+        /// Partitions now assigned to this member, with their positions.
         assigned: Vec<PositionDto>,
     },
+    /// Terminal control frame ending the stream.
     Control {
+        /// Machine-readable control code.
         code: &'static str,
+        /// Positions to resume from.
         positions: Vec<PositionDto>,
+        /// Optional human-readable explanation.
         #[serde(skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
     },

@@ -57,6 +57,7 @@ impl CredStoreGear {
         clippy::redundant_pub_crate,
         reason = "module-private serve entry-point invoked by the toolkit runtime"
     )]
+    /// Lifecycle entry point: requires `init` to have populated the service, signals readiness, then runs the periodic reaper tick until `cancel` fires.
     pub(crate) async fn serve(
         self: Arc<Self>,
         cancel: CancellationToken,

@@ -40,7 +40,6 @@ fn max_url_ttl_can_be_overridden() {
 
 #[test]
 fn rejects_unknown_fields() {
-    // deny_unknown_fields guards against silently-ignored config typos.
     let json = r#"{"max_url_ttl_secs": 60, "unexpected": true}"#;
     assert!(
         serde_json::from_str::<FileStorageConfig>(json).is_err(),
@@ -48,47 +47,29 @@ fn rejects_unknown_fields() {
     );
 }
 
-#[test]
-fn validate_rejects_zero_sweep_interval_when_sweep_enabled() {
-    // A zero interval with the sweep on would spin the background loop tight.
-    let cfg = FileStorageConfig {
-        // Isolate this test to the sweep-interval check, not the (unrelated)
-        // signing-key-seed guard added later.
-        require_signing_key_seed: false,
-        sweep_interval_secs: 0,
-        enable_background_sweep: true,
+/// Config with the mandatory internal secret set, so a test isolates the check it targets.
+fn cfg_with_secret() -> FileStorageConfig {
+    FileStorageConfig {
+        finalize_internal_secret: Some(SecretString::new("test-internal-secret")),
         ..FileStorageConfig::default()
-    };
-    assert!(
-        cfg.validate().is_err(),
-        "sweep_interval_secs == 0 must be rejected when the sweep is enabled"
-    );
+    }
 }
 
 #[test]
-fn validate_accepts_positive_sweep_interval_when_sweep_enabled() {
-    let cfg = FileStorageConfig {
-        require_signing_key_seed: false,
-        sweep_interval_secs: 60,
-        enable_background_sweep: true,
-        ..FileStorageConfig::default()
-    };
-    assert!(
-        cfg.validate().is_ok(),
-        "a positive sweep interval must pass validation"
-    );
-}
-
-#[test]
-fn validate_ignores_zero_sweep_interval_when_sweep_disabled() {
-    // With the sweep off the interval is unused, so it need not be constrained.
-    let cfg = FileStorageConfig {
-        require_signing_key_seed: false,
-        sweep_interval_secs: 0,
-        enable_background_sweep: false,
-        ..FileStorageConfig::default()
-    };
-    assert!(cfg.validate().is_ok());
+fn removed_background_sweep_keys_are_rejected() {
+    // The background sweep keys were removed; deny_unknown_fields rejects them.
+    for key in [
+        "enable_background_sweep",
+        "sweep_interval_secs",
+        "orphan_grace_secs",
+        "require_finalize_internal_secret",
+    ] {
+        let json = format!(r#"{{"{key}": 1}}"#);
+        assert!(
+            serde_json::from_str::<FileStorageConfig>(&json).is_err(),
+            "{key} must be rejected as an unknown field"
+        );
+    }
 }
 
 #[test]
@@ -96,7 +77,7 @@ fn validate_rejects_missing_signing_key_seed_when_required_flag_set() {
     let cfg = FileStorageConfig {
         signing_key_seed: None,
         require_signing_key_seed: true,
-        ..FileStorageConfig::default()
+        ..cfg_with_secret()
     };
     assert!(
         cfg.validate().is_err(),
@@ -109,7 +90,7 @@ fn validate_allows_missing_signing_key_seed_when_required_flag_unset() {
     let cfg = FileStorageConfig {
         signing_key_seed: None,
         require_signing_key_seed: false,
-        ..FileStorageConfig::default()
+        ..cfg_with_secret()
     };
     assert!(
         cfg.validate().is_ok(),
@@ -123,14 +104,13 @@ fn validate_allows_present_signing_key_seed_when_required_flag_set() {
     let cfg = FileStorageConfig {
         signing_key_seed: Some(SecretString::new(SEED)),
         require_signing_key_seed: true,
-        ..FileStorageConfig::default()
+        ..cfg_with_secret()
     };
     assert!(
         cfg.validate().is_ok(),
         "a present signing_key_seed must pass validation even when required"
     );
 
-    // Redaction proof: the raw seed must not appear in Debug output.
     let cfg_debug = format!("{cfg:?}");
     assert!(
         !cfg_debug.contains(SEED),
@@ -147,61 +127,42 @@ fn default_require_signing_key_seed_is_true() {
 }
 
 #[test]
-fn require_finalize_internal_secret_without_secret_fails_validate() {
-    // Mirrors `validate_rejects_missing_signing_key_seed_when_required_flag_set`:
-    // a missing shared secret with the require flag set must fail fast
-    // instead of silently downgrading to the token-only trust model for the
-    // finalize/report-part s2s callbacks (P2 0.1 remaining).
+fn missing_finalize_internal_secret_fails_validate() {
+    // The s2s finalize/report-part callbacks require the internal credential;
+    // finalize trusts the size/hash the sidecar reports on them.
     let cfg = FileStorageConfig {
         require_signing_key_seed: false,
         finalize_internal_secret: None,
-        require_finalize_internal_secret: true,
         ..FileStorageConfig::default()
     };
+    let err = cfg.validate().unwrap_err().to_string();
+    assert!(err.contains("finalize_internal_secret"), "{err}");
+    assert!(err.contains("FS_SIDECAR_INTERNAL_TOKEN"), "{err}");
+
+    let empty = FileStorageConfig {
+        finalize_internal_secret: Some(SecretString::new("")),
+        ..cfg
+    };
     assert!(
-        cfg.validate().is_err(),
-        "a missing finalize_internal_secret must be rejected when \
-         require_finalize_internal_secret is true"
+        empty.validate().is_err(),
+        "an empty secret must be rejected"
     );
 }
 
 #[test]
-fn require_finalize_internal_secret_with_secret_passes_validate() {
+fn present_finalize_internal_secret_passes_validate_and_is_redacted() {
     const SECRET: &str = "interim-shared-secret";
     let cfg = FileStorageConfig {
         require_signing_key_seed: false,
         finalize_internal_secret: Some(SecretString::new(SECRET)),
-        require_finalize_internal_secret: true,
         ..FileStorageConfig::default()
     };
-    assert!(
-        cfg.validate().is_ok(),
-        "a present finalize_internal_secret must pass validation even when required"
-    );
+    assert!(cfg.validate().is_ok());
 
-    // Redaction proof: the raw secret must not appear in Debug output.
     let cfg_debug = format!("{cfg:?}");
     assert!(
         !cfg_debug.contains(SECRET),
         "FileStorageConfig's Debug output must never contain the raw finalize_internal_secret: {cfg_debug}"
-    );
-}
-
-#[test]
-fn default_require_finalize_internal_secret_is_false() {
-    assert!(
-        !FileStorageConfig::default().require_finalize_internal_secret,
-        "require_finalize_internal_secret must default to false so existing deployments \
-         and not-yet-redeployed sidecars keep working"
-    );
-}
-
-#[test]
-fn default_enable_background_sweep_is_true() {
-    assert!(
-        FileStorageConfig::default().enable_background_sweep,
-        "enable_background_sweep must default to true; deployments that need \
-         deterministic behavior (tests, some e2e profiles) must opt out explicitly"
     );
 }
 
@@ -218,9 +179,7 @@ fn serde_round_trip_preserves_value() {
 
 #[test]
 fn config_s3_backends_serde_round_trip() {
-    // P2 1.7.3 config wiring: `s3_backends` must serde round-trip faithfully,
-    // and `secret_access_key` must never leak through `FileStorageConfig`'s
-    // (or `S3BackendConfig`'s own) `Debug` output.
+    // `s3_backends` round-trips through serde; `secret_access_key` never leaks via `Debug`.
     const SECRET: &str = "super-secret-value-do-not-print-me";
 
     let original = FileStorageConfig {
@@ -255,8 +214,6 @@ fn config_s3_backends_serde_round_trip() {
     );
     assert!(entry.path_style);
 
-    // Redaction proof: the raw secret must not appear anywhere in either
-    // struct's `Debug` output.
     let cfg_debug = format!("{back:?}");
     assert!(
         !cfg_debug.contains(SECRET),
@@ -281,9 +238,7 @@ fn config_s3_backends_defaults_to_empty() {
 
 #[test]
 fn config_default_backend_id_defaults_to_none() {
-    // P2 1.7 Stage 6: an existing config without `default_backend_id` must
-    // keep parsing and keep `local-fs` as the implicit default (enforced by
-    // `gear.rs::build_backend_registry` falling back to `LOCAL_FS_ID`).
+    // A config without `default_backend_id` keeps `local-fs` as the implicit default.
     let cfg: FileStorageConfig = serde_json::from_str("{}").unwrap();
     assert_eq!(cfg.default_backend_id, None);
 }

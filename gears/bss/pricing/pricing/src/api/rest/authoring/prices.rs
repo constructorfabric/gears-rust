@@ -26,7 +26,6 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use rust_decimal::Decimal;
-use std::str::FromStr;
 use time::OffsetDateTime;
 use toolkit_canonical_errors::CanonicalError;
 use toolkit_db::secure::{AccessScope, DBRunner};
@@ -61,10 +60,16 @@ fn parse_eligibility(text: &str) -> Result<Eligibility, DoorError> {
     text.parse()
         .map_err(|_| support::invalid("eligibility", "ELIGIBILITY_INVALID").into())
 }
+/// The value keeps the caller's spelling (`30.00` stays `30.00`), but it must also
+/// pass the shared parser the stored row is read back with, so the door never
+/// stores a value the read path would refuse.
 fn parse_min_fee(text: Option<&str>) -> Result<Option<Decimal>, DoorError> {
     text.map(|s| {
-        Decimal::from_str(s.trim())
-            .map_err(|_| support::invalid("min_fee", "MIN_FEE_INVALID").into())
+        let s = s.trim();
+        bss_money::parse_decimal(s)
+            .ok()
+            .and_then(|_| s.parse::<Decimal>().ok())
+            .ok_or_else(|| support::invalid("min_fee", "MIN_FEE_INVALID").into())
     })
     .transpose()
 }

@@ -9,6 +9,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
+use toolkit_macros::domain_model;
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -70,6 +71,7 @@ enum PoolEvent {
 /// The counterpart of the reference implementation's `RepoPhaseRunner`, one
 /// level up: that one runs the phases of a single repository, this one runs
 /// whole repositories.
+#[domain_model]
 pub struct SyncPoolRunner {
     service: Arc<Service>,
     /// Jobs as `enqueue_sync` posted them.

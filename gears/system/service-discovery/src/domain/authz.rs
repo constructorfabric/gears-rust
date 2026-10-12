@@ -15,6 +15,7 @@ use toolkit_security::PlatformIdentity;
 /// Kubernetes namespaces / SPIFFE trust domains a per-gear identity must belong
 /// to (empty disables the respective qualifier check — see
 /// [`registration_authorized`]).
+#[toolkit::domain_model]
 #[derive(Debug, Default, Clone)]
 pub struct RegistrationPolicy {
     /// Peer names permitted to act on any gear's registration.
@@ -31,6 +32,7 @@ pub struct RegistrationPolicy {
 /// Surfaced in the denial log so an operator can tell a name mismatch from a
 /// namespace / trust-domain that isn't allowlisted — the latter is silent by
 /// default (an empty allowlist skips the check) and the likeliest cause.
+#[toolkit::domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DenyReason {
     /// The name is neither the gear's own name nor a `trusted_registrars` entry.

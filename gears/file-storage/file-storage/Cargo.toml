@@ -9,6 +9,7 @@ repository.workspace = true
 readme = "README.md"
 keywords = ["constructorfabric", "cf-gears", "file-storage"]
 categories = ["web-programming"]
+metadata.docs.rs.all-features = true
 # `src/bin/` also holds `sidecar_tests.rs`, the sidecar's out-of-line unit-test
 # module (required by the `de1101_tests_in_separate_files` repo lint — see
 # `#[path = "sidecar_tests.rs"] mod tests;` at the bottom of `sidecar.rs`).

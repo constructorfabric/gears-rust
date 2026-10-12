@@ -10,9 +10,9 @@ use super::super::statements::OutboxStatements;
 use super::super::store::OutboxStore;
 use super::super::strategy::{ProcessContext, ProcessingStrategy};
 use super::super::subscription::TraceMailbox;
-use super::super::taskward::{Directive, WorkerAction};
 use super::super::types::OutboxError;
 use crate::Db;
+use toolkit_taskward::{Directive, WorkerAction};
 
 /// Report emitted by a processor execution cycle.
 #[derive(Debug, Clone)]

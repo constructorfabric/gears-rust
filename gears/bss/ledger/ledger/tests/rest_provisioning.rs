@@ -90,7 +90,7 @@ impl LedgerClientV1 for StubClient {
         _ctx: &toolkit_security::SecurityContext,
         _tenant_id: Uuid,
         _account_id: Uuid,
-    ) -> Result<Option<i64>, CanonicalError> {
+    ) -> Result<Option<bss_ledger_sdk::PostedMoney>, CanonicalError> {
         unimplemented!("not exercised by the provisioning router tests")
     }
 
@@ -393,7 +393,7 @@ fn valid_body() -> serde_json::Value {
             }
         ],
         "currency_scales": [
-            { "currency": "XBT", "minor_units": 8, "source": "TENANT" }
+            { "currency": "XBT", "currency_scale": 8, "source": "TENANT" }
         ],
         "fiscal_calendar": {
             "timezone": "UTC",

@@ -33,11 +33,17 @@ use crate::api::rest::error::domain_error_to_problem;
 
 const INTERNAL_PREFIX: &str = "x-oagw-internal-";
 
+/// Internal header carrying the upstream ID to the Pingora peer selection.
 pub(crate) const H_UPSTREAM_ID: &str = "x-oagw-internal-upstream-id";
+/// Internal header carrying the selected endpoint host.
 pub(crate) const H_ENDPOINT_HOST: &str = "x-oagw-internal-endpoint-host";
+/// Internal header carrying the selected endpoint port.
 pub(crate) const H_ENDPOINT_PORT: &str = "x-oagw-internal-endpoint-port";
+/// Internal header carrying the selected endpoint scheme.
 pub(crate) const H_ENDPOINT_SCHEME: &str = "x-oagw-internal-endpoint-scheme";
+/// Internal header carrying the instance URI of the request.
 pub(crate) const H_INSTANCE_URI: &str = "x-oagw-internal-instance-uri";
+/// Internal header carrying the pre-resolved socket address, if any.
 pub(crate) const H_RESOLVED_ADDR: &str = "x-oagw-internal-resolved-addr";
 
 use super::HOP_BY_HOP_HEADERS;
@@ -129,6 +135,7 @@ impl ProtocolVersionCache {
 // PingoraProxy — ProxyHttp implementation (D3)
 // ---------------------------------------------------------------------------
 
+/// Pingora `ProxyHttp` implementation that forwards requests to upstream endpoints.
 pub struct PingoraProxy {
     connect_timeout: Duration,
     read_timeout: Duration,
@@ -142,6 +149,7 @@ pub struct PingoraProxy {
 }
 
 impl PingoraProxy {
+    /// Create the proxy with connect/read timeouts, ALPN cache TTL and SSRF guard.
     pub fn new(
         connect_timeout: Duration,
         read_timeout: Duration,
@@ -363,6 +371,7 @@ pub struct PingoraEndpointSelector {
 }
 
 impl PingoraEndpointSelector {
+    /// Create a selector with an empty per-upstream cache.
     pub fn new(ssrf_guard: Arc<SsrfGuard>) -> Self {
         Self {
             cache: DashMap::new(),
@@ -476,6 +485,7 @@ impl EndpointSelector for PingoraEndpointSelector {
 // Per-request context (D3)
 // ---------------------------------------------------------------------------
 
+/// Per-request state threaded through the Pingora proxy phases.
 pub struct ProxyCtx {
     endpoint: Endpoint,
     instance_uri: String,

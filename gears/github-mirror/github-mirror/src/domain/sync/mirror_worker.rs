@@ -15,6 +15,7 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use async_trait::async_trait;
 use chrono::Utc;
 use github_mirror_sdk::{CountDrift, SyncSummary};
+use toolkit_macros::domain_model;
 use toolkit_security::AccessScope;
 use uuid::Uuid;
 
@@ -33,6 +34,7 @@ use crate::domain::repo::{
 };
 use crate::domain::scope::{CollectionMode, ScopeConfig};
 
+#[domain_model]
 #[derive(Debug, Clone, Default)]
 pub struct SweptEnd {
     pub page1_etag: Option<String>,
@@ -44,6 +46,7 @@ pub struct SweptEnd {
 /// `repo_id` is learned by Discovery and read by every later task; the
 /// completeness flags and the summary are accumulated as tasks finish and
 /// read by the service once the run is over.
+#[domain_model]
 pub struct RunState {
     pub session_id: Uuid,
     pub scope: AccessScope,
@@ -228,6 +231,7 @@ impl RunState {
 }
 
 /// The worker behind every task of one repository sync.
+#[domain_model]
 pub struct MirrorWorker {
     github: Arc<dyn GithubPort>,
     writer: Arc<dyn SyncWriter>,

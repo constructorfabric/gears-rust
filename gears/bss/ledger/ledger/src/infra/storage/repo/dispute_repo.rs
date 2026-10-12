@@ -1,40 +1,56 @@
-//! `DisputeRepo` — the chargeback dispute current-state table
-//! (`bss.ledger_dispute`), keyed by `(tenant_id, dispute_id)`.
-//!
-//! The **write** (`dispute_upsert` — seed on `opened`; `dispute_advance` —
-//! advance `last_phase`/`cycle` on a `won`/`lost`/re-open, Group C) runs inside
-//! the passed-in posting transaction (the in-txn sidecar, decision M), mirroring
-//! [`PaymentRepo`](super::PaymentRepo)'s `seed_settlement` / `add_allocated`
-//! shape: a scoped insert via `.secure().scope_with_model`, a scoped
-//! `update_many` via `.secure().scope_with`. The dispute row is **lock rank 0**
-//! — taken BEFORE the rank-1 `ledger_payment_settlement` write, keeping the lock
-//! order acyclic.
-//!
-//! The **read** (`read_dispute`) takes the PDP-compiled `AccessScope` and runs
-//! out-of-txn through `.secure().scope_with(scope)` (SQL-level BOLA — a foreign
-//! tenant yields no row); the service uses it for the pre-read that selects the
-//! variant + validates the transition before opening the post transaction.
-
-use sea_orm::ExprTrait;
+//! Exact dispute current state. Writes run on the caller's transaction, at lock
+//! rank zero (before settlement). Every conflict must abort the whole attempt.
+use bss_ledger_sdk::PostedMoney;
+use rust_decimal::Decimal;
 use sea_orm::sea_query::Expr;
 use sea_orm::{ActiveValue::Set, ColumnTrait, Condition, EntityTrait};
 use toolkit_db::odata::sea_orm_filter::{LimitCfg, paginate_odata};
 use toolkit_db::secure::{
-    AccessScope, DbTx, SecureEntityExt, SecureInsertExt, SecureOnConflict, SecureUpdateExt,
+    AccessScope, DBRunner, DbTx, SecureEntityExt, SecureInsertExt, SecureUpdateExt,
 };
 use toolkit_db::{DBProvider, DbError};
 use toolkit_odata::{ODataQuery, Page, SortDir};
 use uuid::Uuid;
 
-use crate::domain::error::DomainError;
 use crate::domain::model::RepoError;
-use crate::domain::payment::chargeback::{DisputePhase, DisputeVariant};
+use crate::domain::payment::dispute_state::{
+    DisputePhase, DisputeTransitionError, DisputeVariant, ObservedDispute, check_open,
+    check_outcome,
+};
+use crate::infra::posting::retry::{db_to_repo, insert_to_repo, scope_to_repo};
 use crate::infra::storage::entity::dispute;
+use crate::infra::storage::money_text::{decode_money, encode_amount};
 use crate::infra::storage::odata_mapping::DisputeODataMapper;
 use crate::infra::storage::repo::journal_repo::{
     OdataPageError, map_odata_err, query_with_default_order,
 };
 use crate::odata::DisputeFilterField;
+
+/// A validated snapshot carrying the row's original currency and scale.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DisputeState {
+    pub tenant_id: Uuid,
+    pub dispute_id: String,
+    pub payment_id: String,
+    pub variant: DisputeVariant,
+    pub last_phase: DisputePhase,
+    pub cycle: i32,
+    pub disputed_amount: PostedMoney,
+    pub cash_hold: PostedMoney,
+    pub version: i64,
+}
+
+impl DisputeState {
+    /// The state the dispute state machine checks a transition against.
+    #[must_use]
+    pub fn observed(&self) -> ObservedDispute<'_> {
+        ObservedDispute {
+            payment_id: &self.payment_id,
+            last_phase: self.last_phase,
+            cycle: self.cycle,
+        }
+    }
+}
 
 /// SeaORM-backed dispute current-state repository.
 #[derive(Clone)]
@@ -43,226 +59,331 @@ pub struct DisputeRepo {
 }
 
 impl DisputeRepo {
+    /// Bind the configured backend for real driver error classification.
     #[must_use]
     pub fn new(db: DBProvider<DbError>) -> Self {
         Self { db }
     }
 
-    // --- In-txn writes (called by the chargeback post sidecar) ---
-
-    /// Upsert the `ledger_dispute` row for an `opened` dispute
-    /// (`last_phase = OPENED`, the chosen `variant`, `cycle`,
-    /// `disputed_amount_minor`, and the `cash_hold_minor` held at open). On a
-    /// **fresh** dispute this seeds the row; on a
-    /// **re-open** (a new cycle after a prior `won`/`lost`, allowed by the
-    /// service's transition guard) the `(tenant, dispute_id)` PK already exists,
-    /// so `ON CONFLICT DO UPDATE` advances it to the new cycle's OPENED state
-    /// (variant / cycle / disputed re-set, `version + 1`). A same-`(dispute,
-    /// cycle, phase)` replay never reaches here — the engine's idempotency gate
-    /// short-circuits before the sidecar.
+    /// Open cycle one, or reopen a terminal WON/LOST row at the next cycle: the
+    /// domain state machine ([`check_open`]) judges the in-transaction row, and
+    /// the write is a CAS on that row's observed phase, cycle and version.
+    /// Payment identity and money metadata cannot change; the new opening fact
+    /// selects its variant. No independent retry occurs.
     ///
     /// # Errors
-    /// [`RepoError::Db`] on a scope or storage failure.
-    #[allow(clippy::too_many_arguments)] // a wide row seed; grouping into a struct adds churn
+    /// [`RepoError::DisputeNotOpen`] when the state machine refuses the opening (the
+    /// payment identity changes, a reopen does not follow a WON/LOST row at the next
+    /// cycle, or a first opening is not cycle 1);
+    /// [`RepoError::Money`] when the amounts disagree on currency metadata;
+    /// [`RepoError::MoneyOutCapExceeded`] unless `0 <= cash_hold <= disputed_amount`;
+    /// [`RepoError::Conflict`] when the observed row changed underneath, a concurrent insert
+    /// won the key, or on classified database contention; [`RepoError::Db`] on a scope or
+    /// storage failure; [`RepoError::InvalidStoredMoney`] when the stored row is malformed.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one opening fact: transaction, scope, dispute identity, cycle and both amounts"
+    )]
     pub async fn dispute_upsert(
+        &self,
         txn: &DbTx<'_>,
         scope: &AccessScope,
         tenant: Uuid,
         dispute_id: &str,
         payment_id: &str,
-        currency: &str,
         variant: DisputeVariant,
         cycle: i32,
-        disputed_amount_minor: i64,
-        cash_hold_minor: i64,
+        disputed_amount: &PostedMoney,
+        cash_hold: &PostedMoney,
+    ) -> Result<(), RepoError> {
+        let previous = self.read_dispute_in(txn, scope, tenant, dispute_id).await?;
+        check_open(
+            dispute_id,
+            previous.as_ref().map(DisputeState::observed),
+            payment_id,
+            cycle,
+        )
+        .map_err(transition_error)?;
+        let next = DisputeState {
+            tenant_id: tenant,
+            dispute_id: dispute_id.into(),
+            payment_id: payment_id.into(),
+            variant,
+            last_phase: DisputePhase::Opened,
+            cycle,
+            disputed_amount: disputed_amount.clone(),
+            cash_hold: cash_hold.clone(),
+            version: 0,
+        };
+        if let Some(previous) = previous {
+            matching(&previous.disputed_amount, disputed_amount)?;
+            matching(disputed_amount, cash_hold)?;
+            validate_amounts(disputed_amount, cash_hold)?;
+            self.replace_observed(txn, scope, &previous, &next).await
+        } else {
+            matching(disputed_amount, cash_hold)?;
+            validate_amounts(disputed_amount, cash_hold)?;
+            self.insert_open(txn, scope, &next).await
+        }
+    }
+
+    /// Plain intended-key insert. A real concurrent insertion aborts this attempt.
+    async fn insert_open(
+        &self,
+        txn: &DbTx<'_>,
+        scope: &AccessScope,
+        row: &DisputeState,
     ) -> Result<(), RepoError> {
         let am = dispute::ActiveModel {
-            tenant_id: Set(tenant),
-            dispute_id: Set(dispute_id.to_owned()),
-            payment_id: Set(payment_id.to_owned()),
-            currency: Set(currency.to_owned()),
-            variant: Set(variant.as_str().to_owned()),
-            last_phase: Set(DisputePhase::Opened.as_str().to_owned()),
-            cycle: Set(cycle),
-            disputed_amount_minor: Set(disputed_amount_minor),
-            cash_hold_minor: Set(cash_hold_minor),
+            tenant_id: Set(row.tenant_id),
+            dispute_id: Set(row.dispute_id.clone()),
+            payment_id: Set(row.payment_id.clone()),
+            currency: Set(row.disputed_amount.currency().code().into()),
+            currency_scale: Set(i16::from(row.disputed_amount.currency().scale())),
+            variant: Set(row.variant.as_str().into()),
+            last_phase: Set(row.last_phase.as_str().into()),
+            cycle: Set(row.cycle),
+            disputed_amount: Set(encode_amount(&row.disputed_amount)),
+            cash_hold: Set(encode_amount(&row.cash_hold)),
             version: Set(0),
         };
-        // Re-open (won/lost → opened, new cycle) lands on the existing PK: net the
-        // row forward to the new cycle's OPENED state rather than colliding.
-        let on_conflict = SecureOnConflict::<dispute::Entity>::columns([
-            dispute::Column::TenantId,
-            dispute::Column::DisputeId,
-        ])
-        .value(dispute::Column::Variant, Expr::value(variant.as_str()))
-        .and_then(|oc| {
-            oc.value(
-                dispute::Column::LastPhase,
-                Expr::value(DisputePhase::Opened.as_str()),
-            )
-        })
-        .and_then(|oc| oc.value(dispute::Column::Cycle, Expr::value(cycle)))
-        .and_then(|oc| {
-            oc.value(
-                dispute::Column::DisputedAmountMinor,
-                Expr::value(disputed_amount_minor),
-            )
-        })
-        .and_then(|oc| oc.value(dispute::Column::CashHoldMinor, Expr::value(cash_hold_minor)))
-        .and_then(|oc| {
-            oc.value(
-                dispute::Column::Version,
-                Expr::col((dispute::Entity, dispute::Column::Version)).add(1),
-            )
-        })
-        .map_err(|e| RepoError::Db(format!("ledger_dispute on_conflict: {e}")))?;
         dispute::Entity::insert(am.clone())
             .secure()
             .scope_with_model(scope, &am)
-            .map_err(|e| RepoError::Db(format!("ledger_dispute scope: {e}")))?
-            .on_conflict(on_conflict)
-            .exec_with_returning(txn)
+            .map_err(|e| scope_to_repo(e, self.db.db().backend()))?
+            .exec(txn)
             .await
-            .map_err(|e| RepoError::Db(format!("upsert ledger_dispute: {e}")))?;
+            .map_err(|e| insert_to_repo(e, self.db.db().backend()))?;
         Ok(())
     }
 
-    /// Advance an `OPENED` dispute to its `won`/`lost` outcome (`last_phase`,
-    /// re-stating `cycle` + `disputed_amount_minor`), bumping `version`. A scoped
-    /// UPDATE matched on `(tenant, dispute_id, last_phase = OPENED, cycle)`.
-    ///
-    /// The `(last_phase = OPENED, cycle)` predicate is the **in-txn race/stale
-    /// backstop**, not redundant with the caller's out-of-txn transition guard:
-    /// two different outcomes for the same dispute (a `won` and a `lost`, distinct
-    /// dedup keys) can both clear that guard, and a `(tenant, dispute_id)`-only
-    /// UPDATE would let the second writer overwrite the already-resolved row and
-    /// commit a second journal entry. Matching on the OPENED phase + the exact
-    /// cycle makes the loser — and any stale-cycle outcome — touch 0 rows and be
-    /// rejected as an invalid transition. SSI + retry serialize the writers; this
-    /// predicate decides the loser's fate cleanly.
-    ///
-    /// Re-open (`won`/`lost` → `opened`, a new cycle) does NOT come here — it
-    /// lands on [`Self::dispute_upsert`]'s `ON CONFLICT` path. Only the outcome
-    /// advance calls this, so the same-cycle match never blocks a legitimate
-    /// re-open.
+    /// Resolve the observed OPENED cycle, retaining its stored hold even if a
+    /// settlement return has since reduced the payment's net cash. The domain
+    /// state machine ([`check_outcome`]) judges the in-transaction row; the write
+    /// is a CAS on that row's observed phase, cycle and version.
     ///
     /// # Errors
-    /// [`RepoError::DisputeNotOpen`] when no `OPENED` row matched the requested
-    /// cycle (a concurrent resolve or a stale outcome); [`RepoError::Db`] on any
-    /// other scope / storage failure.
+    /// [`RepoError::DisputeNotOpen`] when the state machine refuses the outcome (no
+    /// dispute exists, the stored row is not OPENED at `cycle`, or `last_phase` is
+    /// not an outcome); [`RepoError::Money`] when `disputed_amount`
+    /// disagrees with the stored currency metadata; [`RepoError::MoneyOutCapExceeded`] when the
+    /// outcome amount drops below the stored hold; [`RepoError::Conflict`] when the observed
+    /// state / version changed underneath, or on classified database contention;
+    /// [`RepoError::Db`] on a scope or storage failure; [`RepoError::InvalidStoredMoney`] when
+    /// the stored row is malformed.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one outcome fact: transaction, scope, dispute identity, phase, cycle and amount"
+    )]
     pub async fn dispute_advance(
+        &self,
         txn: &DbTx<'_>,
         scope: &AccessScope,
         tenant: Uuid,
         dispute_id: &str,
         last_phase: DisputePhase,
         cycle: i32,
-        disputed_amount_minor: i64,
+        disputed_amount: &PostedMoney,
     ) -> Result<(), RepoError> {
+        let previous = self.read_dispute_in(txn, scope, tenant, dispute_id).await?;
+        check_outcome(
+            dispute_id,
+            previous.as_ref().map(DisputeState::observed),
+            last_phase,
+            cycle,
+        )
+        .map_err(transition_error)?;
+        let Some(previous) = previous else {
+            // `check_outcome` refuses a missing dispute; kept total, never a panic.
+            return Err(RepoError::DisputeNotOpen(format!(
+                "dispute {dispute_id} is missing"
+            )));
+        };
+        matching(&previous.disputed_amount, disputed_amount)?;
+        validate_amounts(disputed_amount, &previous.cash_hold)?;
+        let next = DisputeState {
+            last_phase,
+            disputed_amount: disputed_amount.clone(),
+            ..previous.clone()
+        };
+        self.replace_observed(txn, scope, &previous, &next).await
+    }
+
+    /// Literal CAS using observed phase, cycle and version. A miss after a valid
+    /// read is contention, never a synthetic database error or phase rejection.
+    async fn replace_observed(
+        &self,
+        txn: &DbTx<'_>,
+        scope: &AccessScope,
+        previous: &DisputeState,
+        next: &DisputeState,
+    ) -> Result<(), RepoError> {
+        let version = previous
+            .version
+            .checked_add(1)
+            .ok_or_else(|| RepoError::Db("dispute version exhausted".into()))?;
         let result = dispute::Entity::update_many()
             .secure()
             .scope_with(scope)
-            .col_expr(dispute::Column::LastPhase, Expr::value(last_phase.as_str()))
-            .col_expr(dispute::Column::Cycle, Expr::value(cycle))
+            .col_expr(dispute::Column::Variant, Expr::value(next.variant.as_str()))
             .col_expr(
-                dispute::Column::DisputedAmountMinor,
-                Expr::value(disputed_amount_minor),
+                dispute::Column::LastPhase,
+                Expr::value(next.last_phase.as_str()),
+            )
+            .col_expr(dispute::Column::Cycle, Expr::value(next.cycle))
+            .col_expr(
+                dispute::Column::DisputedAmount,
+                Expr::value(encode_amount(&next.disputed_amount)),
             )
             .col_expr(
-                dispute::Column::Version,
-                Expr::col((dispute::Entity, dispute::Column::Version)).add(1),
+                dispute::Column::CashHold,
+                Expr::value(encode_amount(&next.cash_hold)),
             )
-            // Only advance the row STILL `OPENED` at THIS cycle: the in-txn
-            // backstop for a concurrent outcome race (a `won` + a `lost` both
-            // clearing the out-of-txn guard) and for a stale-cycle outcome — the
-            // loser / stale request matches 0 rows instead of overwriting an
-            // already-resolved dispute with a second committed entry.
+            .col_expr(dispute::Column::Version, Expr::value(version))
             .filter(
-                Condition::all()
-                    .add(dispute::Column::TenantId.eq(tenant))
-                    .add(dispute::Column::DisputeId.eq(dispute_id))
-                    .add(dispute::Column::LastPhase.eq(DisputePhase::Opened.as_str()))
-                    .add(dispute::Column::Cycle.eq(cycle)),
+                key(previous.tenant_id, &previous.dispute_id)
+                    .add(dispute::Column::Version.eq(previous.version))
+                    .add(dispute::Column::LastPhase.eq(previous.last_phase.as_str()))
+                    .add(dispute::Column::Cycle.eq(previous.cycle)),
             )
             .exec(txn)
             .await
-            .map_err(|e| RepoError::Db(format!("advance ledger_dispute: {e}")))?;
-        if result.rows_affected == 0 {
-            // No `OPENED` row at this cycle: the dispute was concurrently resolved
-            // (a `won`/`lost` race) or the outcome targets a stale cycle. A
-            // non-retryable invalid transition, not an infra fault.
-            return Err(RepoError::DisputeNotOpen(format!(
-                "ledger_dispute ({tenant}, {dispute_id}) is not OPENED at cycle {cycle} \
-                 — already resolved or stale outcome"
-            )));
+            .map_err(|e| scope_to_repo(e, self.db.db().backend()))?;
+        if result.rows_affected != 1 {
+            return Err(RepoError::Conflict("stale dispute state/version".into()));
         }
         Ok(())
     }
 
-    // --- Out-of-txn read (PDP In-scoped; SQL-level BOLA) ---
-
-    /// Read the `ledger_dispute` row for `(tenant, dispute_id)` (the current
-    /// variant + cycle + last phase), or `None` when the dispute was never
-    /// opened. SQL-level BOLA: a foreign tenant yields no row.
+    /// Scoped read on the caller's financial snapshot, using stored metadata.
     ///
     /// # Errors
-    /// [`DomainError::Internal`] on a scope or storage failure.
+    /// [`RepoError::Db`] on a scope or storage failure; [`RepoError::Conflict`] on classified
+    /// database contention. [`RepoError::InvalidStoredMoney`] when a stored amount is malformed
+    /// or off its currency contract.
+    pub async fn read_dispute_in<R: DBRunner>(
+        &self,
+        runner: &R,
+        scope: &AccessScope,
+        tenant: Uuid,
+        dispute_id: &str,
+    ) -> Result<Option<DisputeState>, RepoError> {
+        dispute::Entity::find()
+            .secure()
+            .scope_with(scope)
+            .filter(key(tenant, dispute_id))
+            .one(runner)
+            .await
+            .map_err(|e| scope_to_repo(e, self.db.db().backend()))?
+            .map(decode)
+            .transpose()
+    }
+    /// Standalone twin of the caller-runner read.
+    ///
+    /// # Errors
+    /// [`RepoError::Db`] when no connection can be acquired or on a scope / storage failure;
+    /// [`RepoError::Conflict`] on classified database contention.
+    /// [`RepoError::InvalidStoredMoney`] when a stored amount is malformed or off its currency
+    /// contract.
     pub async fn read_dispute(
         &self,
         scope: &AccessScope,
         tenant: Uuid,
         dispute_id: &str,
-    ) -> Result<Option<dispute::Model>, DomainError> {
+    ) -> Result<Option<DisputeState>, RepoError> {
         let conn = self
             .db
             .conn()
-            .map_err(|e| DomainError::Internal(format!("conn: {e}")))?;
-        let row = dispute::Entity::find()
+            .map_err(|e| db_to_repo(e, self.db.db().backend()))?;
+        self.read_dispute_in(&conn, scope, tenant, dispute_id).await
+    }
+
+    /// Read an OPENED dispute for the payment. The schema does not guarantee one
+    /// such row per payment; this preserves the existing existence-read contract.
+    ///
+    /// # Errors
+    /// [`RepoError::Db`] on a scope or storage failure; [`RepoError::Conflict`] on classified
+    /// database contention. [`RepoError::InvalidStoredMoney`] when a stored amount is malformed
+    /// or off its currency contract.
+    pub async fn read_open_dispute_for_payment_in<R: DBRunner>(
+        &self,
+        runner: &R,
+        scope: &AccessScope,
+        tenant: Uuid,
+        payment_id: &str,
+    ) -> Result<Option<DisputeState>, RepoError> {
+        dispute::Entity::find()
             .secure()
             .scope_with(scope)
             .filter(
                 Condition::all()
                     .add(dispute::Column::TenantId.eq(tenant))
-                    .add(dispute::Column::DisputeId.eq(dispute_id)),
+                    .add(dispute::Column::PaymentId.eq(payment_id))
+                    .add(dispute::Column::LastPhase.eq(DisputePhase::Opened.as_str())),
             )
-            .one(&conn)
+            .one(runner)
             .await
-            .map_err(|e| DomainError::Internal(format!("read ledger_dispute: {e}")))?;
-        Ok(row)
+            .map_err(|e| scope_to_repo(e, self.db.db().backend()))?
+            .map(decode)
+            .transpose()
     }
-
-    /// List the `ledger_dispute` current-state rows for `tenant` under `scope`,
-    /// cursor-paginated via the canonical `query` (`$filter` over `payment_id` /
-    /// `last_phase` / `variant`, `$orderby` / `limit` / `cursor`). The tenant
-    /// predicate is pre-applied to the secured select; the user `$filter` is
-    /// additive over it (SQL-level BOLA — a foreign value still ANDs the scope, so a
-    /// cross-tenant dispute never leaks). A bare list defaults to `dispute_id ASC`.
-    /// The `GET /disputes` read-surface source; out-of-txn on a fresh scoped
-    /// connection. Mirrors `AdjustmentRepo::list_refunds`.
+    /// Standalone twin of the caller-runner open-dispute read.
     ///
     /// # Errors
-    /// [`OdataPageError::Db`] on a storage / connection failure;
-    /// [`OdataPageError::Odata`] on a malformed `$filter` / `$orderby` / cursor
-    /// (the caller projects it to a canonical 400).
+    /// [`RepoError::Db`] when no connection can be acquired or on a scope / storage failure;
+    /// [`RepoError::Conflict`] on classified database contention.
+    /// [`RepoError::InvalidStoredMoney`] when a stored amount is malformed or off its currency
+    /// contract.
+    pub async fn read_open_dispute_for_payment(
+        &self,
+        scope: &AccessScope,
+        tenant: Uuid,
+        payment_id: &str,
+    ) -> Result<Option<DisputeState>, RepoError> {
+        let conn = self
+            .db
+            .conn()
+            .map_err(|e| db_to_repo(e, self.db.db().backend()))?;
+        self.read_open_dispute_for_payment_in(&conn, scope, tenant, payment_id)
+            .await
+    }
+
+    /// Typed OData page preserving nonmonetary filters, ordering and cursors.
+    ///
+    /// # Errors
+    /// [`OdataPageError::Db`] on a storage / connection failure; [`OdataPageError::Odata`] on a
+    /// malformed `$filter` / `$orderby` / cursor (the caller projects it to a canonical 400).
     pub async fn list_disputes(
         &self,
         scope: &AccessScope,
         tenant: Uuid,
         query: &ODataQuery,
-    ) -> Result<Page<dispute::Model>, OdataPageError> {
+    ) -> Result<Page<DisputeState>, OdataPageError> {
         let conn = self
             .db
             .conn()
-            .map_err(|e| OdataPageError::Db(format!("conn: {e}")))?;
-        // Pre-apply the tenant predicate to the secured select; the user `$filter`
-        // is applied additively by `paginate_odata` (it never replaces this scope —
-        // BOLA preserved).
-        let base_select = dispute::Entity::find()
+            .map_err(|e| OdataPageError::Db(e.to_string()))?;
+        self.list_disputes_in(&conn, scope, tenant, query).await
+    }
+    /// Paginate on a caller runner and decode every returned monetary row.
+    ///
+    /// # Errors
+    /// [`OdataPageError::Db`] on a storage failure or when a stored amount is malformed;
+    /// [`OdataPageError::Odata`] on a malformed `$filter` / `$orderby` / cursor (the caller
+    /// projects it to a canonical 400).
+    pub async fn list_disputes_in<R: DBRunner>(
+        &self,
+        runner: &R,
+        scope: &AccessScope,
+        tenant: Uuid,
+        query: &ODataQuery,
+    ) -> Result<Page<DisputeState>, OdataPageError> {
+        let base = dispute::Entity::find()
             .secure()
             .scope_with(scope)
-            .filter(Condition::all().add(dispute::Column::TenantId.eq(tenant)));
+            .filter(dispute::Column::TenantId.eq(tenant).into());
         let query = query_with_default_order(query, "dispute_id");
-        paginate_odata::<
+        let page = paginate_odata::<
             DisputeFilterField,
             DisputeODataMapper,
             dispute::Entity,
@@ -270,8 +391,8 @@ impl DisputeRepo {
             _,
             _,
         >(
-            base_select,
-            &conn,
+            base,
+            runner,
             &query,
             ("dispute_id", SortDir::Asc),
             LimitCfg {
@@ -281,51 +402,73 @@ impl DisputeRepo {
             |m| m,
         )
         .await
-        .map_err(map_odata_err)
-    }
-
-    /// Read the OPEN (non-terminal) dispute on a PAYMENT, if any — the refund
-    /// dispute-hold pre-read (Z5-2, design §5). A dispute is OPEN exactly while its
-    /// `last_phase == OPENED`; the `won`/`lost` outcomes are terminal (the row stays
-    /// at the latest cycle's outcome until a re-open seeds a new `OPENED` cycle). A
-    /// refund MUST NOT move cash on a payment with an OPEN dispute (the disputed
-    /// funds are sub judice — held in `DISPUTE_HOLD` for `CASH_HOLD`, or reclassed
-    /// `DISPUTED` for `AR_RECLASS`), so the handler holds the cash leg until the
-    /// dispute resolves.
-    ///
-    /// Keyed on `(tenant, payment_id, last_phase = OPENED)` (NOT `dispute_id` —
-    /// the refund knows only the payment it unwinds). At most one OPEN dispute per
-    /// `(tenant, payment_id)` exists at a time: a cycle must resolve (`won`/`lost`)
-    /// before the same payment's dispute re-opens (the `opened` transition guard
-    /// rejects an `opened` on a still-`OPENED` row), so an `OPENED` row is unique
-    /// per payment. Returns the row (its `dispute_id` / `cycle` drive the held
-    /// payload + the hold drain's re-read), or `None` when the payment has no open
-    /// dispute. SQL-level BOLA: a foreign tenant yields no row.
-    ///
-    /// # Errors
-    /// [`DomainError::Internal`] on a scope or storage failure.
-    pub async fn read_open_dispute_for_payment(
-        &self,
-        scope: &AccessScope,
-        tenant: Uuid,
-        payment_id: &str,
-    ) -> Result<Option<dispute::Model>, DomainError> {
-        let conn = self
-            .db
-            .conn()
-            .map_err(|e| DomainError::Internal(format!("conn: {e}")))?;
-        let row = dispute::Entity::find()
-            .secure()
-            .scope_with(scope)
-            .filter(
-                Condition::all()
-                    .add(dispute::Column::TenantId.eq(tenant))
-                    .add(dispute::Column::PaymentId.eq(payment_id))
-                    .add(dispute::Column::LastPhase.eq(DisputePhase::Opened.as_str())),
-            )
-            .one(&conn)
-            .await
-            .map_err(|e| DomainError::Internal(format!("read open dispute for payment: {e}")))?;
-        Ok(row)
+        .map_err(map_odata_err)?;
+        let items = page
+            .items
+            .into_iter()
+            .map(decode)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| OdataPageError::Db(e.to_string()))?;
+        Ok(Page::new(items, page.page_info))
     }
 }
+
+/// Preserve the actual composite business key without adding a money axis.
+fn key(tenant: Uuid, dispute_id: &str) -> Condition {
+    Condition::all()
+        .add(dispute::Column::TenantId.eq(tenant))
+        .add(dispute::Column::DisputeId.eq(dispute_id))
+}
+/// A refused transition aborts the attempt as a dispute-state rejection.
+fn transition_error(error: DisputeTransitionError) -> RepoError {
+    RepoError::DisputeNotOpen(error.to_string())
+}
+/// Compare metadata even for zero values.
+fn matching(left: &PostedMoney, right: &PostedMoney) -> Result<(), RepoError> {
+    Ok(left.currency().ensure_same(right.currency())?)
+}
+/// Comparisons are exact on the validated decimal carrier; no sums or narrowing.
+fn validate_amounts(amount: &PostedMoney, hold: &PostedMoney) -> Result<(), RepoError> {
+    if amount.amount() < Decimal::ZERO
+        || hold.amount() < Decimal::ZERO
+        || hold.amount() > amount.amount()
+    {
+        return Err(RepoError::MoneyOutCapExceeded(
+            "dispute requires 0 <= cash_hold <= disputed_amount".into(),
+        ));
+    }
+    Ok(())
+}
+/// Validate every stored field before exposing a business snapshot.
+fn decode(row: dispute::Model) -> Result<DisputeState, RepoError> {
+    let disputed_amount = decode_money(&row.disputed_amount, &row.currency, row.currency_scale)?;
+    let cash_hold = decode_money(&row.cash_hold, &row.currency, row.currency_scale)?;
+    validate_amounts(&disputed_amount, &cash_hold)
+        .map_err(|e| RepoError::InvalidStoredMoney(e.to_string()))?;
+    let invalid =
+        || RepoError::InvalidStoredMoney("invalid dispute phase/variant/cycle/version".into());
+    let variant = DisputeVariant::parse(&row.variant).ok_or_else(invalid)?;
+    let last_phase = DisputePhase::parse(&row.last_phase).ok_or_else(invalid)?;
+    if row.cycle < 1 || row.version < 0 {
+        return Err(invalid());
+    }
+    Ok(DisputeState {
+        tenant_id: row.tenant_id,
+        dispute_id: row.dispute_id,
+        payment_id: row.payment_id,
+        variant,
+        last_phase,
+        cycle: row.cycle,
+        disputed_amount,
+        cash_hold,
+        version: row.version,
+    })
+}
+
+#[cfg(test)]
+#[path = "dispute_repo/tests.rs"]
+mod tests;
+
+#[cfg(test)]
+#[path = "dispute_repo_detail_tests.rs"]
+mod detail_tests;

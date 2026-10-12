@@ -39,7 +39,7 @@ const PG_UP_STATEMENTS: &[&str] = &[
         revision             integer       NOT NULL DEFAULT 0,
         business_key         varchar(256)  NOT NULL,
         intent               jsonb         NOT NULL,
-        amount_usd_eq_minor  bigint,
+        amount                      text CHECK (bss.ledger_decimal_valid(amount, currency_scale)),
         threshold_snapshot   jsonb         NOT NULL,
         reason_code          varchar(128)  NOT NULL,
         prepared_by          uuid          NOT NULL,
@@ -48,6 +48,8 @@ const PG_UP_STATEMENTS: &[&str] = &[
         decided_at           timestamptz,
         correlation_id       uuid          NOT NULL,
         expires_at           timestamptz   NOT NULL,
+        currency                    varchar(16),
+        currency_scale              smallint CHECK (currency_scale BETWEEN 0 AND 28),
         PRIMARY KEY (approval_id),
         CONSTRAINT chk_ledger_approval_kind CHECK (kind IN
             ('REVERSE','MATERIAL_BACKDATING','CREDIT_GRANT','CHARGEBACK_LOSS','PAYER_CLOSURE','PERIOD_REOPEN','RECOGNITION_SCHEDULE_CHANGE','REFUND','MANUAL_ADJUSTMENT','CREDIT_NOTE','DEBIT_NOTE')),
@@ -55,7 +57,8 @@ const PG_UP_STATEMENTS: &[&str] = &[
             ('PENDING','APPROVING','APPROVED','REJECTED','NEEDS_REWORK','CANCELLED','EXPIRED')),
         CONSTRAINT chk_ledger_approval_revision_nonneg CHECK (revision >= 0),
         CONSTRAINT chk_ledger_approval_approver_distinct
-            CHECK (approved_by IS NULL OR approved_by <> prepared_by)
+            CHECK (approved_by IS NULL OR approved_by <> prepared_by),
+        CONSTRAINT chk_approval_money_metadata CHECK ((amount IS NULL) = (currency IS NULL) AND (amount IS NULL) = (currency_scale IS NULL))
     )",
     // The one-live idempotency guard (DC13) ALSO covers the transient `APPROVING`
     // latch (H2): while an approve is executing the mutation, the slot stays held
@@ -72,17 +75,24 @@ const PG_UP_STATEMENTS: &[&str] = &[
         tenant_id              uuid         NOT NULL,
         version                bigint       NOT NULL,
         effective_from         timestamptz  NOT NULL,
-        d2_threshold_minor     bigint       NOT NULL,
         a6_backdating_biz_days integer      NOT NULL,
         pending_ttl_seconds    bigint       NOT NULL,
         created_at_utc         timestamptz  NOT NULL,
         PRIMARY KEY (tenant_id, version),
         CONSTRAINT chk_ledger_dcpolicy_version_nonneg CHECK (version >= 0),
-        CONSTRAINT chk_ledger_dcpolicy_d2_range
-            CHECK (d2_threshold_minor BETWEEN 10000 AND 100000000),
         CONSTRAINT chk_ledger_dcpolicy_a6_range
             CHECK (a6_backdating_biz_days BETWEEN 1 AND 30),
         CONSTRAINT chk_ledger_dcpolicy_ttl_pos CHECK (pending_ttl_seconds > 0)
+    )",
+    "CREATE TABLE bss.ledger_dual_control_policy_threshold (
+        tenant_id uuid NOT NULL,
+        version                bigint NOT NULL,
+        currency                    varchar(16) NOT NULL,
+        currency_scale              smallint NOT NULL CHECK (currency_scale BETWEEN 0 AND 28),
+        amount                      text NOT NULL CHECK (bss.ledger_decimal_valid(amount, currency_scale)),
+        PRIMARY KEY (tenant_id, version, currency),
+        FOREIGN KEY (tenant_id, version) REFERENCES bss.ledger_dual_control_policy (tenant_id, version),
+        CONSTRAINT chk_ledger_dcpolicy_d2_range CHECK (amount::numeric BETWEEN 10000::numeric / power(10::numeric, currency_scale) AND 100000000::numeric / power(10::numeric, currency_scale))
     )",
     "CREATE INDEX ix_ledger_dcpolicy_effective
         ON bss.ledger_dual_control_policy (tenant_id, effective_from)",
@@ -110,10 +120,15 @@ const PG_UP_STATEMENTS: &[&str] = &[
     "CREATE TRIGGER trg_ledger_approval_comment_append_only
         BEFORE UPDATE OR DELETE ON bss.ledger_approval_comment
         FOR EACH ROW EXECUTE FUNCTION bss.reject_mutation()",
+    "CREATE TRIGGER trg_dcpolicy_append_only BEFORE UPDATE OR DELETE ON bss.ledger_dual_control_policy
+        FOR EACH ROW EXECUTE FUNCTION bss.reject_mutation()",
+    "CREATE TRIGGER trg_dcpolicy_threshold_append_only BEFORE UPDATE OR DELETE ON bss.ledger_dual_control_policy_threshold
+        FOR EACH ROW EXECUTE FUNCTION bss.reject_mutation()",
 ];
 
 const PG_DOWN_STATEMENTS: &[&str] = &[
     "DROP TABLE IF EXISTS bss.ledger_approval_comment",
+    "DROP TABLE IF EXISTS bss.ledger_dual_control_policy_threshold",
     "DROP TABLE IF EXISTS bss.ledger_dual_control_policy",
     "DROP TABLE IF EXISTS bss.ledger_approval",
 ];
@@ -125,14 +140,14 @@ const PG_DOWN_STATEMENTS: &[&str] = &[
 
 const SQLITE_UP_STATEMENTS: &[&str] = &[
     "CREATE TABLE ledger_approval (
-        approval_id          text          NOT NULL,
-        tenant_id            text          NOT NULL,
+        approval_id   text          NOT NULL,
+        tenant_id     text          NOT NULL,
         kind                 varchar(32)   NOT NULL,
         state                varchar(16)   NOT NULL,
         revision             integer       NOT NULL DEFAULT 0,
         business_key         varchar(256)  NOT NULL,
         intent               text          NOT NULL,
-        amount_usd_eq_minor  bigint,
+        amount                      text CHECK (length(amount) BETWEEN 1 AND 31),
         threshold_snapshot   text          NOT NULL,
         reason_code          varchar(128)  NOT NULL,
         prepared_by          text          NOT NULL,
@@ -141,6 +156,8 @@ const SQLITE_UP_STATEMENTS: &[&str] = &[
         decided_at           text,
         correlation_id       text          NOT NULL,
         expires_at           text          NOT NULL,
+        currency                    varchar(16),
+        currency_scale              smallint CHECK (currency_scale BETWEEN 0 AND 28),
         PRIMARY KEY (approval_id),
         CONSTRAINT chk_ledger_approval_kind CHECK (kind IN
             ('REVERSE','MATERIAL_BACKDATING','CREDIT_GRANT','CHARGEBACK_LOSS','PAYER_CLOSURE','PERIOD_REOPEN','RECOGNITION_SCHEDULE_CHANGE','REFUND','MANUAL_ADJUSTMENT','CREDIT_NOTE','DEBIT_NOTE')),
@@ -148,7 +165,8 @@ const SQLITE_UP_STATEMENTS: &[&str] = &[
             ('PENDING','APPROVING','APPROVED','REJECTED','NEEDS_REWORK','CANCELLED','EXPIRED')),
         CONSTRAINT chk_ledger_approval_revision_nonneg CHECK (revision >= 0),
         CONSTRAINT chk_ledger_approval_approver_distinct
-            CHECK (approved_by IS NULL OR approved_by <> prepared_by)
+            CHECK (approved_by IS NULL OR approved_by <> prepared_by),
+        CONSTRAINT chk_approval_money_metadata CHECK ((amount IS NULL) = (currency IS NULL) AND (amount IS NULL) = (currency_scale IS NULL))
     )",
     "CREATE UNIQUE INDEX uq_ledger_approval_active
         ON ledger_approval (tenant_id, kind, business_key)
@@ -159,20 +177,26 @@ const SQLITE_UP_STATEMENTS: &[&str] = &[
         ON ledger_approval (tenant_id, expires_at)
         WHERE state IN ('PENDING','NEEDS_REWORK')",
     "CREATE TABLE ledger_dual_control_policy (
-        tenant_id              text         NOT NULL,
+        tenant_id     text         NOT NULL,
         version                bigint       NOT NULL,
         effective_from         text         NOT NULL,
-        d2_threshold_minor     bigint       NOT NULL,
         a6_backdating_biz_days integer      NOT NULL,
         pending_ttl_seconds    bigint       NOT NULL,
         created_at_utc         text         NOT NULL,
         PRIMARY KEY (tenant_id, version),
         CONSTRAINT chk_ledger_dcpolicy_version_nonneg CHECK (version >= 0),
-        CONSTRAINT chk_ledger_dcpolicy_d2_range
-            CHECK (d2_threshold_minor BETWEEN 10000 AND 100000000),
         CONSTRAINT chk_ledger_dcpolicy_a6_range
             CHECK (a6_backdating_biz_days BETWEEN 1 AND 30),
         CONSTRAINT chk_ledger_dcpolicy_ttl_pos CHECK (pending_ttl_seconds > 0)
+    )",
+    "CREATE TABLE ledger_dual_control_policy_threshold (
+        tenant_id     text NOT NULL,
+        version                bigint NOT NULL,
+        currency                    varchar(16) NOT NULL,
+        currency_scale              smallint NOT NULL CHECK (currency_scale BETWEEN 0 AND 28),
+        amount                      text NOT NULL CHECK (length(amount) BETWEEN 1 AND 31 AND substr(amount, 1, 1) <> '-' AND amount <> '0'),
+        PRIMARY KEY (tenant_id, version, currency),
+        FOREIGN KEY (tenant_id, version) REFERENCES ledger_dual_control_policy (tenant_id, version)
     )",
     "CREATE INDEX ix_ledger_dcpolicy_effective
         ON ledger_dual_control_policy (tenant_id, effective_from)",
@@ -194,6 +218,7 @@ const SQLITE_UP_STATEMENTS: &[&str] = &[
 
 const SQLITE_DOWN_STATEMENTS: &[&str] = &[
     "DROP TABLE IF EXISTS ledger_approval_comment",
+    "DROP TABLE IF EXISTS ledger_dual_control_policy_threshold",
     "DROP TABLE IF EXISTS ledger_dual_control_policy",
     "DROP TABLE IF EXISTS ledger_approval",
 ];

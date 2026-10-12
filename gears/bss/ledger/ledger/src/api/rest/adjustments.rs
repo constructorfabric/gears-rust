@@ -80,6 +80,7 @@ use crate::api::rest::error::{
     authz_error_to_canonical, credit_note_not_found, debit_note_not_found,
     invoice_exposure_not_found,
 };
+use crate::api::rest::money::MoneyDto;
 use crate::api::rest::odata_list::{list_seller_tenant, reject_non_odata_list_params};
 use crate::infra::adjustment::credit_note_service::CreditNoteHandler;
 use crate::infra::adjustment::debit_note_service::DebitNoteHandler;
@@ -136,7 +137,7 @@ pub fn router(state: Arc<ApiState>, openapi: &dyn OpenApiRegistry) -> Router {
              rows and, in the SAME txn, reduces the owning recognition schedule's \
              deferred total (so a later S6 run cannot re-recognize the credited- \
              back amount) and bumps the invoice's credit-note headroom counter. \
-             `requested_deferred_minor` is the split INTENT (how much targets the \
+             `requested_deferred` is the split INTENT (how much targets the \
              deferred balance). Idempotent on `credit_note_id`: a re-post returns \
              the prior posting reference (200) instead of a new one (201). Rejected \
              when the recognized-vs-deferred split is indeterminable \
@@ -178,7 +179,7 @@ pub fn router(state: Arc<ApiState>, openapi: &dyn OpenApiRegistry) -> Router {
              named by the body's `tenant_id` — a DIRECT split mirroring the \
              invoice-post (DR AR incl-tax / CR REVENUE recognized-now / CR \
              CONTRACT_LIABILITY deferred per PO / CR TAX_PAYABLE). When the note \
-             defers (`deferred_minor > 0`) it builds the releasing recognition \
+             defers (`deferred > 0`) it builds the releasing recognition \
              schedule in the SAME txn (D4 — the `recognition` spec is required) so \
              a later S6 run can release it, and it RAISES the invoice's headroom \
              (`debit_note_total += amount`), widening the room for later credit \
@@ -650,28 +651,28 @@ async fn get_invoice_exposure(
     // The SEPARATE true remaining open AR (the `CR AR` cap). Scoped by the same
     // gate; an invoice with no open AR reads 0 (a fully-paid / fully-credited
     // invoice still has a headroom row).
+    let spec = exposure.original_total.currency().clone();
     let open_ar = state
         .exposure_repo
-        .read_open_ar_for_invoice_out_of_txn(&scope, tenant_id, &invoice_id)
+        .read_open_ar_for_invoice_out_of_txn(&scope, tenant_id, &invoice_id, &spec)
         .await
         .map_err(|e| crate::domain::error::DomainError::Internal(format!("read open AR: {e}")))?;
 
     // Remaining headroom = original + debit − credit (the slack in the AC #24
-    // CHECK), floored at 0 (the CHECK guarantees `credit <= original + debit`, so
-    // this never goes negative; the saturating sub is defensive).
-    let remaining_headroom_minor = exposure
-        .original_total_minor
-        .saturating_add(exposure.debit_note_total_minor)
-        .saturating_sub(exposure.credit_note_total_minor)
-        .max(0);
+    // CHECK), the same domain rule the credit-note cap applies, so the read and
+    // the cap can never report different headroom for one row.
+    let remaining_headroom = crate::domain::adjustment::credit_note::remaining_headroom(
+        &exposure.original_total,
+        &exposure.debit_note_total,
+        &exposure.credit_note_total,
+    )?;
     Ok(Json(InvoiceExposureResponse {
         invoice_id: exposure.invoice_id,
-        currency: exposure.currency,
-        original_total_minor: exposure.original_total_minor,
-        debit_note_total_minor: exposure.debit_note_total_minor,
-        credit_note_total_minor: exposure.credit_note_total_minor,
-        remaining_headroom_minor,
-        open_ar_minor: open_ar,
+        original_total: MoneyDto::from(&exposure.original_total),
+        debit_note_total: MoneyDto::from(&exposure.debit_note_total),
+        credit_note_total: MoneyDto::from(&exposure.credit_note_total),
+        remaining_headroom: MoneyDto::from(&remaining_headroom),
+        open_ar: MoneyDto::from(&open_ar),
     }))
 }
 

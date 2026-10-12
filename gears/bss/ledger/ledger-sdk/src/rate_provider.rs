@@ -1,6 +1,6 @@
 //! The FX rate-provider plugin contract (`RateProviderV1`).
 //!
-//! A cross-gear, GTS-versioned SDK trait (`gts.cf.bss.ledger.rate-provider.v1`,
+//! A cross-gear, versioned Rust SDK trait (
 //! mirroring [`crate::LedgerClientV1`]): an external adapter-gear (ECB primary /
 //! PSP-bank fallback) implements it and registers an `Arc<dyn RateProviderV1>` in
 //! the `ClientHub`; a ledger-side `RateSyncJob` pulls `fetch_latest` into the
@@ -9,6 +9,7 @@
 //! is a fail-safe no-op (the store stays empty → FX-needing posts block).
 
 use async_trait::async_trait;
+use rust_decimal::Decimal;
 use time::OffsetDateTime;
 use toolkit_security::SecurityContext;
 
@@ -19,14 +20,13 @@ pub struct CurrencyPair {
     pub quote: String,
 }
 
-/// A rate as published by a provider at a point in time. `rate_micro` is the
-/// fixed-precision multiplier (functional per unit transaction × 1e6). `as_of`
-/// drives the ledger's staleness rule.
+/// A positive decimal quote in quote major units per base major unit.
+/// `as_of` drives the ledger's staleness rule.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProviderRate {
     pub base: String,
     pub quote: String,
-    pub rate_micro: i64,
+    pub rate: Decimal,
     pub as_of: OffsetDateTime,
     /// The concrete upstream that published THIS rate (`"ecb"`, `"bank-x"`, …),
     /// stamped by the serving source itself.

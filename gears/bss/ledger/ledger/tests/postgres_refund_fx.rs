@@ -7,7 +7,7 @@
 //! basis carries forward and each stage's functional column nets to ZERO — there
 //! is **no realized FX_GAIN_LOSS line** (true EUR→USD realization is Slice-7
 //! reconciliation, owner decision 2026-06-28). These tests prove the carry-forward
-//! keeps each relieved grain's functional column in lockstep with `balance_minor`:
+//! keeps each relieved grain's functional column in lockstep with `balance`:
 //!
 //! - `pattern_a_two_stage_refund_carries_functional_forward_no_fx`: settle 120 EUR
 //!   @ 1.08 (UNALLOCATED + CASH_CLEARING each carry 129.60 USD); a Pattern-A refund
@@ -38,7 +38,6 @@ use bss_ledger::domain::adjustment::refund::{RefundDirection, RefundRequest};
 use bss_ledger::domain::adjustment::refund::{RefundPattern, RefundPhase};
 use bss_ledger::domain::error::DomainError;
 use bss_ledger::domain::model::{AccountRow, CurrencyScaleRow};
-use bss_ledger::domain::money::DEFAULT_PLAUSIBLE_MAX_MAJOR;
 use bss_ledger::domain::payment::settlement::SettlementInput;
 use bss_ledger::domain::ports::metrics::NoopLedgerMetrics;
 use bss_ledger::infra::adjustment::refund_service::RefundHandler;
@@ -49,6 +48,8 @@ use bss_ledger::infra::payment::settle::SettlementService;
 use bss_ledger::infra::storage::migrations::Migrator;
 use bss_ledger::infra::storage::repo::{FxRepo, NewFxRate, ReferenceRepo};
 use bss_ledger_sdk::AccountClass;
+use bss_ledger_sdk::{CurrencySpec, PostedMoney};
+use rust_decimal::Decimal;
 use sea_orm::{ConnectionTrait, Database, DatabaseConnection, Statement};
 use sea_orm_migration::MigratorTrait;
 use testcontainers_modules::postgres::Postgres;
@@ -68,6 +69,41 @@ async fn scalar_i64(conn: &DatabaseConnection, sql: &str) -> Option<i64> {
         .await
         .unwrap()
         .map(|r| r.try_get_by_index::<i64>(0).unwrap())
+}
+
+/// A scale-2 posting in `code` from a cent count (`12_000` ⇒ `120`).
+fn money(cents: i64, code: &str) -> PostedMoney {
+    PostedMoney::try_new(
+        Decimal::new(cents, 2),
+        CurrencySpec::try_new(code.to_owned(), 2).unwrap(),
+    )
+    .unwrap()
+}
+
+/// An EUR@2 posting from a cent count.
+fn eur(cents: i64) -> PostedMoney {
+    money(cents, "EUR")
+}
+
+/// A canonical stored-amount expectation (`"129.6"`, `"0"`).
+#[allow(clippy::unnecessary_wraps)] // compared directly with `scalar_text`'s `Option`
+fn txt(canonical: &str) -> Option<String> {
+    Some(canonical.to_owned())
+}
+
+/// Read one stored canonical decimal text column (`None` when no row).
+async fn scalar_text(conn: &DatabaseConnection, sql: &str) -> Option<String> {
+    conn.query_one_raw(pg(sql.to_owned()))
+        .await
+        .unwrap()
+        .map(|r| r.try_get_by_index::<String>(0).unwrap())
+}
+
+/// Read one computed numeric column as an exact decimal (`None` when no row).
+async fn scalar_numeric(conn: &DatabaseConnection, sql: &str) -> Option<Decimal> {
+    scalar_text(conn, sql)
+        .await
+        .map(|t| Decimal::from_str_exact(&t).unwrap().normalize())
 }
 
 fn account(
@@ -153,8 +189,7 @@ async fn setup_and_settle(
             .upsert_currency_scale(CurrencyScaleRow {
                 tenant_id: c.tenant,
                 currency: ccy.to_owned(),
-                minor_units: 2,
-                plausible_max_major: DEFAULT_PLAUSIBLE_MAX_MAJOR,
+                currency_scale: 2,
                 source: "iso".to_owned(),
             })
             .await
@@ -201,7 +236,7 @@ async fn setup_and_settle(
             base_currency: "EUR".to_owned(),
             quote_currency: "USD".to_owned(),
             provider: "ecb".to_owned(),
-            rate_micro: 1_080_000,
+            rate: Decimal::new(108, 2),
             as_of: now,
             fallback_order: 0,
         })
@@ -222,9 +257,8 @@ async fn setup_and_settle(
             tenant_id: c.tenant,
             payer_tenant_id: c.payer,
             payment_id: payment_id.to_owned(),
-            gross_minor: gross,
-            fee_minor: 0,
-            currency: "EUR".to_owned(),
+            gross: eur(gross),
+            fee: eur(0),
             effective_at: None,
         },
     )
@@ -234,12 +268,16 @@ async fn setup_and_settle(
     (container, raw, provider, c)
 }
 
-async fn acct(raw: &DatabaseConnection, tenant: Uuid, account: Uuid) -> (Option<i64>, Option<i64>) {
-    let bal = scalar_i64(raw, &format!(
-        "SELECT balance_minor FROM bss.ledger_account_balance WHERE tenant_id='{tenant}' AND account_id='{account}'"
+async fn acct(
+    raw: &DatabaseConnection,
+    tenant: Uuid,
+    account: Uuid,
+) -> (Option<String>, Option<String>) {
+    let bal = scalar_text(raw, &format!(
+        "SELECT balance FROM bss.ledger_account_balance WHERE tenant_id='{tenant}' AND account_id='{account}'"
     )).await;
-    let func = scalar_i64(raw, &format!(
-        "SELECT functional_balance_minor FROM bss.ledger_account_balance WHERE tenant_id='{tenant}' AND account_id='{account}'"
+    let func = scalar_text(raw, &format!(
+        "SELECT functional_balance FROM bss.ledger_account_balance WHERE tenant_id='{tenant}' AND account_id='{account}'"
     )).await;
     (bal, func)
 }
@@ -248,19 +286,23 @@ async fn unalloc(
     raw: &DatabaseConnection,
     tenant: Uuid,
     payer: Uuid,
-) -> (Option<i64>, Option<i64>) {
-    let bal = scalar_i64(raw, &format!(
-        "SELECT balance_minor FROM bss.ledger_unallocated_balance WHERE tenant_id='{tenant}' AND payer_tenant_id='{payer}'"
+) -> (Option<String>, Option<String>) {
+    let bal = scalar_text(raw, &format!(
+        "SELECT balance FROM bss.ledger_unallocated_balance WHERE tenant_id='{tenant}' AND payer_tenant_id='{payer}'"
     )).await;
-    let func = scalar_i64(raw, &format!(
-        "SELECT functional_balance_minor FROM bss.ledger_unallocated_balance WHERE tenant_id='{tenant}' AND payer_tenant_id='{payer}'"
+    let func = scalar_text(raw, &format!(
+        "SELECT functional_balance FROM bss.ledger_unallocated_balance WHERE tenant_id='{tenant}' AND payer_tenant_id='{payer}'"
     )).await;
     (bal, func)
 }
 
-async fn entry_functional_net(raw: &DatabaseConnection, tenant: Uuid, entry: Uuid) -> Option<i64> {
-    scalar_i64(raw, &format!(
-        "SELECT COALESCE(SUM(CASE WHEN side='DR' THEN functional_amount_minor ELSE -functional_amount_minor END),0)::bigint \
+async fn entry_functional_net(
+    raw: &DatabaseConnection,
+    tenant: Uuid,
+    entry: Uuid,
+) -> Option<Decimal> {
+    scalar_numeric(raw, &format!(
+        "SELECT COALESCE(SUM(CASE WHEN side='DR' THEN functional_amount::numeric ELSE -(functional_amount::numeric) END),0)::text \
          FROM bss.ledger_journal_line WHERE tenant_id='{tenant}' AND entry_id='{entry}'"
     )).await
 }
@@ -291,8 +333,7 @@ fn refund_req(
         pattern: RefundPattern::AUnallocated,
         payment_id: payment_id.to_owned(),
         invoice_id: None,
-        currency: "EUR".to_owned(),
-        amount_minor: amount,
+        amount: eur(amount),
         two_stage,
         relates_to_refund_id: None,
         direction: RefundDirection::Outbound,
@@ -310,11 +351,11 @@ async fn pattern_a_two_stage_refund_carries_functional_forward_no_fx() {
     // Settle landed UNALLOCATED + CASH_CLEARING at 120.00 EUR / 129.60 USD each.
     assert_eq!(
         unalloc(&raw, chart.tenant, chart.payer).await,
-        (Some(12_000), Some(12_960))
+        (txt("120"), txt("129.6"))
     );
     assert_eq!(
         acct(&raw, chart.tenant, chart.cash).await,
-        (Some(12_000), Some(12_960))
+        (txt("120"), txt("129.6"))
     );
 
     // initiated: DR UNALLOCATED 12000 / CR REFUND_CLEARING 12000 — the 129.60 USD
@@ -336,17 +377,17 @@ async fn pattern_a_two_stage_refund_carries_functional_forward_no_fx() {
         .expect("initiated refund must post");
     assert_eq!(
         entry_functional_net(&raw, chart.tenant, initiated.entry_id).await,
-        Some(0),
+        Some(Decimal::ZERO),
         "initiated entry functional balances (carry-forward, no FX)"
     );
     assert_eq!(
         unalloc(&raw, chart.tenant, chart.payer).await,
-        (Some(0), Some(0)),
+        (txt("0"), txt("0")),
         "UNALLOCATED drained to (0, 0) — basis left"
     );
     assert_eq!(
         acct(&raw, chart.tenant, chart.refund_clearing).await,
-        (Some(12_000), Some(12_960)),
+        (txt("120"), txt("129.6")),
         "REFUND_CLEARING carries the 129.60 USD basis forward"
     );
 
@@ -368,17 +409,17 @@ async fn pattern_a_two_stage_refund_carries_functional_forward_no_fx() {
         .expect("confirmed refund must post");
     assert_eq!(
         entry_functional_net(&raw, chart.tenant, confirmed.entry_id).await,
-        Some(0),
+        Some(Decimal::ZERO),
         "confirmed entry functional balances (carry-forward, no FX)"
     );
     assert_eq!(
         acct(&raw, chart.tenant, chart.refund_clearing).await,
-        (Some(0), Some(0)),
+        (txt("0"), txt("0")),
         "REFUND_CLEARING drained to (0, 0)"
     );
     assert_eq!(
         acct(&raw, chart.tenant, chart.cash).await,
-        (Some(0), Some(0)),
+        (txt("0"), txt("0")),
         "CASH_CLEARING drained to (0, 0) — the full settle→refund round-trip nets to zero in both columns"
     );
 
@@ -417,17 +458,17 @@ async fn pattern_a_single_step_refund_carries_functional_forward_no_fx() {
         .expect("single-step refund must post");
     assert_eq!(
         entry_functional_net(&raw, chart.tenant, posted.entry_id).await,
-        Some(0),
+        Some(Decimal::ZERO),
         "single-step entry functional balances (carry-forward, no FX)"
     );
     assert_eq!(
         unalloc(&raw, chart.tenant, chart.payer).await,
-        (Some(0), Some(0)),
+        (txt("0"), txt("0")),
         "UNALLOCATED drained to (0, 0)"
     );
     assert_eq!(
         acct(&raw, chart.tenant, chart.cash).await,
-        (Some(0), Some(0)),
+        (txt("0"), txt("0")),
         "CASH_CLEARING drained to (0, 0) in both columns"
     );
     assert_eq!(
@@ -460,8 +501,7 @@ async fn cross_currency_clawback_is_rejected_not_silently_drifted() {
         pattern: RefundPattern::AUnallocated,
         payment_id: "PAY-RF-CB".to_owned(),
         invoice_id: None,
-        currency: "EUR".to_owned(),
-        amount_minor: 12_000,
+        amount: eur(12_000),
         two_stage: false,
         // A claw-back references a prior refund (refund-of-refund); the link + the
         // Clawback direction make `is_clawback()` true.
@@ -481,7 +521,7 @@ async fn cross_currency_clawback_is_rejected_not_silently_drifted() {
     // reject fired BEFORE any ledger effect — no silent drift).
     assert_eq!(
         unalloc(&raw, chart.tenant, chart.payer).await,
-        (Some(12_000), Some(12_960)),
+        (txt("120"), txt("129.6")),
         "UNALLOCATED untouched — the claw-back was rejected before posting"
     );
 }

@@ -686,15 +686,17 @@ mod ceiling_tests {
     /// to the end.
     #[test]
     fn a_scan_at_the_ceiling_proceeds() {
-        assert!(within_ceiling("gts.acme.gs._.thing.v1~", 1_000, CEILING).is_ok());
-        assert!(within_ceiling("gts.acme.gs._.thing.v1~", 1, CEILING).is_ok());
+        assert!(
+            within_ceiling(toolkit_gts::gts_id!("acme.gs._.thing.v1~"), 1_000, CEILING).is_ok()
+        );
+        assert!(within_ceiling(toolkit_gts::gts_id!("acme.gs._.thing.v1~"), 1, CEILING).is_ok());
     }
 
     /// One row past it is the refusal admission would have raised, naming
     /// the count that was actually read and the key that bounds it.
     #[test]
     fn a_scan_past_the_ceiling_is_refused_with_the_count_and_the_key() {
-        let refused = within_ceiling("gts.acme.gs._.thing.v1~", 1_001, CEILING)
+        let refused = within_ceiling(toolkit_gts::gts_id!("acme.gs._.thing.v1~"), 1_001, CEILING)
             .expect_err("one row past the ceiling is past it");
         let GraphStoreError::LimitExceeded { what } = refused else {
             panic!("a ceiling is a limit, got {refused:?}");

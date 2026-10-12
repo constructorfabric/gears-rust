@@ -44,6 +44,7 @@ pub struct ProducerBuilder<
 }
 
 impl ProducerBuilder {
+    /// Creates a builder with no broker, context or identity set.
     pub(crate) fn new() -> Self {
         Self {
             broker: None,

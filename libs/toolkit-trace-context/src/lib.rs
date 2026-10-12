@@ -147,6 +147,8 @@ fn is_valid_flags(s: &str) -> bool {
     is_lowercase_hex(s, 2)
 }
 
+/// OpenTelemetry-backed propagation: continues and injects W3C Trace Context
+/// through the process-global text-map propagator.
 #[cfg(feature = "otel")]
 mod imp {
     use super::parse_trace_id;
@@ -217,6 +219,8 @@ mod imp {
     }
 }
 
+/// Fallback propagation without OpenTelemetry: records the inbound trace id
+/// for log correlation; injection is a no-op.
 #[cfg(not(feature = "otel"))]
 mod imp {
     use super::parse_trace_id;

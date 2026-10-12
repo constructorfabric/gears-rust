@@ -220,7 +220,7 @@ impl CommercialReason {
         }
     }
 }
-#[toolkit_canonical_errors::resource_error("gts.cf.bss.pricing.acceptance.v1~")]
+#[toolkit_canonical_errors::resource_error(gts_id!("cf.bss.pricing.acceptance.v1~"))]
 struct CommercialResource;
 impl From<CommercialReason> for toolkit_canonical_errors::CanonicalError {
     fn from(reason: CommercialReason) -> Self {
@@ -443,6 +443,7 @@ pub fn sellability_v1_ir() -> toolkit_contract::ir::contract::ContractIr {
         ],
     )
 }
+/// Builds a `bss-pricing` v1 contract IR from `(method, input, output, is_command)` tuples.
 pub(crate) fn commercial_ir(
     name: &str,
     methods: &[(&str, &str, &str, bool)],

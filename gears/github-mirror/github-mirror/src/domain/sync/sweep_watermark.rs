@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use chrono::{DateTime, Duration, Utc};
+use toolkit_macros::domain_model;
 use toolkit_security::AccessScope;
 use uuid::Uuid;
 
@@ -73,6 +74,7 @@ pub fn high_water(seen: &[&str], threshold: Option<DateTime<Utc>>) -> Option<Dat
 /// What a sweep needs before it walks: the instant below which an entity is
 /// too old to be worth looking at, and the validator page one carried last
 /// time so an unchanged listing can stop before page two.
+#[domain_model]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SweepStart {
     pub updated_after: Option<DateTime<Utc>>,
@@ -80,6 +82,7 @@ pub struct SweepStart {
     pub last_head_sha: Option<String>,
 }
 
+#[domain_model]
 pub struct SweepWatermark {
     watermark_store: Arc<dyn SyncWatermarkRepository>,
 }

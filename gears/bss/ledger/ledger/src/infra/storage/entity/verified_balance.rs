@@ -30,6 +30,8 @@ pub const GRAIN_REUSABLE_CREDIT: &str = "reusable_credit";
     no_type
 )]
 pub struct Model {
+    pub currency: String,
+    pub currency_scale: i16,
     #[sea_orm(primary_key, auto_increment = false)]
     pub tenant_id: Uuid,
     /// Cache discriminator — one of the `GRAIN_*` constants.
@@ -39,8 +41,9 @@ pub struct Model {
     /// (e.g. `account_id|currency`), so the verify compares like-for-like.
     #[sea_orm(primary_key, auto_increment = false)]
     pub grain_key: String,
-    /// Cumulative verified balance through `through_period`, in minor units.
-    pub verified_balance_minor: i64,
+    /// Cumulative verified balance through `through_period`, in canonical major units.
+    pub verified_balance: String,
+    pub version: i64,
     /// The last closed period this baseline is verified through.
     pub through_period: String,
     /// Max in-period `created_seq` covered by this baseline (the incremental

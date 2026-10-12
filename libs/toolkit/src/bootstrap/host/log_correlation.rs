@@ -39,6 +39,7 @@ pub struct TraceIdJson<T> {
 }
 
 impl<T> TraceIdJson<T> {
+    /// Wraps a JSON formatter, injecting the trace id into events when `enabled` is true.
     pub const fn new(inner: Format<Json, T>, enabled: bool) -> Self {
         Self { inner, enabled }
     }

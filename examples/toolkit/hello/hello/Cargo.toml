@@ -24,6 +24,8 @@ default = []
 oop_module = ["dep:tokio", "dep:clap", "dep:mimalloc", "toolkit/bootstrap"]
 # Kubernetes TokenReview platform-plane auth.
 k8s-auth = ["toolkit/k8s-auth"]
+# OpenTelemetry runtime tracing and metrics.
+otel = ["toolkit/otel"]
 
 [dependencies]
 # ToolKit

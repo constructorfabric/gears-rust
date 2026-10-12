@@ -23,6 +23,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
+use toolkit_macros::domain_model;
 
 use uuid::Uuid;
 
@@ -54,6 +55,7 @@ struct Store {
 /// What a read captures before it goes to the database and hands back with
 /// the value it resolved: the invalidations that had touched its key and its
 /// scope by then. Opaque, compared for equality only.
+#[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Generation {
     key: u64,
@@ -117,6 +119,7 @@ impl Store {
 /// capacity; other components reference them rather than defining their own.
 // @cpt-dod:cpt-cf-settings-service-dod-value-resolution-cache:p1
 // @cpt-dod:cpt-cf-settings-service-dod-value-resolution-cache-ttl:p1
+#[domain_model]
 pub struct EffectiveCache {
     ttl: Duration,
     max_entries: usize,

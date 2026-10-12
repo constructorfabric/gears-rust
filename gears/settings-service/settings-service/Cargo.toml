@@ -73,6 +73,7 @@ base64 = { workspace = true }
 secrecy = { workspace = true }
 toolkit-security = { workspace = true }
 toolkit-macros = { workspace = true }
+toolkit-gts = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }

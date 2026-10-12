@@ -10,6 +10,7 @@ use toolkit_canonical_errors::CanonicalError;
 use super::error;
 
 /// What one source answered for an id.
+#[toolkit_macros::domain_model]
 pub enum SourceGet {
     /// This source holds the unit.
     Found(Box<InboxUnit>),
@@ -24,6 +25,7 @@ pub enum SourceGet {
 }
 
 /// The inbox's decision after every source has answered.
+#[toolkit_macros::domain_model]
 pub enum Resolved {
     /// Exactly one source holds the unit.
     Found {

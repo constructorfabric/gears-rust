@@ -7,6 +7,33 @@
 use super::*;
 use crate::domain::instant::from_unix;
 
+/// A USD scale-2 wire money value.
+fn money(amount: &str) -> MoneyDto {
+    money_in(amount, "USD", 2)
+}
+
+fn money_in(amount: &str, currency: &str, currency_scale: u8) -> MoneyDto {
+    MoneyDto {
+        amount: amount.to_owned(),
+        currency: currency.to_owned(),
+        currency_scale,
+    }
+}
+
+/// A validated USD scale-2 posting.
+fn usd(amount: &str) -> PostedMoney {
+    PostedMoney::try_new(
+        parse_decimal(amount).expect("decimal"),
+        CurrencySpec::try_new("USD".to_owned(), 2).expect("spec"),
+    )
+    .expect("posting")
+}
+
+/// A USD scale-2 wire money value as JSON.
+fn money_json(amount: &str) -> serde_json::Value {
+    serde_json::json!({ "amount": amount, "currency": "USD", "currency_scale": 2 })
+}
+
 /// A valid `snake_case` `POST /journal-entries` body deserializes into the
 /// request DTO and `into_domain` yields the expected `PostedInvoice`.
 #[test]
@@ -23,8 +50,7 @@ fn post_invoice_body_deserializes_and_lowers_to_domain() {
         "period_id": "202606",
         "items": [
             {
-                "amount_minor_ex_tax": 1000,
-                "currency": "USD",
+                "amount_ex_tax": money_json("10.00"),
                 "revenue_stream": "subscription",
                 "catalog_class": "REVENUE",
                 "gl_code": "4000"
@@ -32,8 +58,7 @@ fn post_invoice_body_deserializes_and_lowers_to_domain() {
         ],
         "tax": [
             {
-                "amount_minor": 200,
-                "currency": "USD",
+                "amount": money_json("2"),
                 "tax_jurisdiction": "US-CA",
                 "tax_filing_period": "2026Q2"
             }
@@ -58,7 +83,11 @@ fn post_invoice_body_deserializes_and_lowers_to_domain() {
     assert_eq!(inv.payer_tenant_id, payer);
     assert_eq!(inv.period_id, "202606");
     assert_eq!(inv.items.len(), 1);
-    assert_eq!(inv.items[0].amount_minor_ex_tax, 1000);
+    assert_eq!(
+        inv.items[0].amount_ex_tax,
+        usd("10"),
+        "validated, never rounded"
+    );
     assert_eq!(inv.items[0].revenue_stream, "subscription");
     assert_eq!(
         inv.items[0].catalog_class,
@@ -67,18 +96,17 @@ fn post_invoice_body_deserializes_and_lowers_to_domain() {
     );
     assert!(inv.items[0].contract_class.is_none());
     assert_eq!(inv.tax.len(), 1);
-    assert_eq!(inv.tax[0].amount_minor, 200);
+    assert_eq!(inv.tax[0].amount, usd("2"));
     assert_eq!(inv.tax[0].tax_jurisdiction, "US-CA");
-    // Gross is derived downstream; assert the helper agrees (1000 + 200).
-    assert_eq!(inv.gross_minor(), 1200);
+    // Gross is derived downstream; assert the helper agrees (10 + 2), exactly.
+    assert_eq!(inv.gross().expect("gross"), usd("12"));
 }
 
 /// A contract-class override is parsed and wins precedence at mapping time.
 #[test]
 fn invoice_item_contract_class_override_parses() {
     let dto = InvoiceItemDto {
-        amount_minor_ex_tax: 500,
-        currency: "USD".to_owned(),
+        amount_ex_tax: money("5.00"),
         revenue_stream: "usage".to_owned(),
         catalog_class: Some("REVENUE".to_owned()),
         contract_class: Some("CONTRA_REVENUE".to_owned()),
@@ -99,8 +127,7 @@ fn invoice_item_contract_class_override_parses() {
 #[test]
 fn invoice_item_without_mapping_is_valid() {
     let dto = InvoiceItemDto {
-        amount_minor_ex_tax: 500,
-        currency: "USD".to_owned(),
+        amount_ex_tax: money("5.00"),
         revenue_stream: "usage".to_owned(),
         catalog_class: None,
         contract_class: None,
@@ -123,8 +150,7 @@ fn invoice_item_without_mapping_is_valid() {
 #[test]
 fn invoice_item_bad_account_class_is_invalid_request() {
     let dto = InvoiceItemDto {
-        amount_minor_ex_tax: 100,
-        currency: "USD".to_owned(),
+        amount_ex_tax: money("1.00"),
         revenue_stream: "subscription".to_owned(),
         catalog_class: Some("NOT_A_CLASS".to_owned()),
         contract_class: None,
@@ -150,8 +176,7 @@ fn invoice_item_bad_account_class_is_invalid_request() {
 #[test]
 fn invoice_item_negative_amount_is_invalid_request() {
     let dto = InvoiceItemDto {
-        amount_minor_ex_tax: -1,
-        currency: "USD".to_owned(),
+        amount_ex_tax: money("-0.01"),
         revenue_stream: "subscription".to_owned(),
         catalog_class: None,
         contract_class: None,
@@ -180,8 +205,7 @@ fn mapping_correction_corrected_items_lower_to_domain() {
         period_id: None,
         effective_at: None,
         corrected_items: vec![InvoiceItemDto {
-            amount_minor_ex_tax: 1000,
-            currency: "USD".to_owned(),
+            amount_ex_tax: money("10.00"),
             revenue_stream: "subscription".to_owned(),
             catalog_class: Some("REVENUE".to_owned()),
             contract_class: None,
@@ -201,12 +225,11 @@ fn mapping_correction_corrected_items_lower_to_domain() {
 // ── Slice 4: the optional recognition block ──────────────────────────────────
 
 /// An item WITHOUT a `recognition` block lowers to `recognition: None` +
-/// `deferred_minor: 0` — the unchanged Variant-A default.
+/// a zero `deferred` — the unchanged Variant-A default.
 #[test]
 fn invoice_item_without_recognition_defaults_to_no_deferral() {
     let body = serde_json::json!({
-        "amount_minor_ex_tax": 1000,
-        "currency": "USD",
+        "amount_ex_tax": money_json("10.00"),
         "revenue_stream": "subscription",
         "catalog_class": "REVENUE"
     });
@@ -215,8 +238,9 @@ fn invoice_item_without_recognition_defaults_to_no_deferral() {
     let item = dto.into_domain().expect("valid item");
     assert!(item.recognition.is_none(), "absent recognition ⇒ None");
     assert_eq!(
-        item.deferred_minor, 0,
-        "deferred is always seeded 0 at the DTO"
+        item.deferred,
+        usd("0"),
+        "deferred is always seeded zero (in the item's currency and scale) at the DTO"
     );
 }
 
@@ -225,8 +249,7 @@ fn invoice_item_without_recognition_defaults_to_no_deferral() {
 #[test]
 fn invoice_item_straight_line_recognition_lowers_to_domain() {
     let body = serde_json::json!({
-        "amount_minor_ex_tax": 1200,
-        "currency": "USD",
+        "amount_ex_tax": money_json("12.00"),
         "revenue_stream": "subscription",
         "catalog_class": "REVENUE",
         "recognition": {
@@ -255,7 +278,8 @@ fn invoice_item_straight_line_recognition_lowers_to_domain() {
     assert_eq!(rec.po_allocation_group.as_deref(), Some("grp-1"));
     assert!(!rec.multi_po, "multi_po defaults to false when omitted");
     assert_eq!(
-        item.deferred_minor, 0,
+        item.deferred,
+        usd("0"),
         "the DTO never carries the deferred amount"
     );
 }
@@ -265,8 +289,7 @@ fn invoice_item_straight_line_recognition_lowers_to_domain() {
 #[test]
 fn invoice_item_point_in_time_recognition_lowers_to_domain() {
     let body = serde_json::json!({
-        "amount_minor_ex_tax": 500,
-        "currency": "USD",
+        "amount_ex_tax": money_json("5.00"),
         "revenue_stream": "usage",
         "catalog_class": "REVENUE",
         "recognition": { "policy_ref": "policy.pit.v1", "timing": "point_in_time" }
@@ -283,8 +306,7 @@ fn invoice_item_point_in_time_recognition_lowers_to_domain() {
 #[test]
 fn invoice_item_straight_line_without_periods_is_invalid_request() {
     let body = serde_json::json!({
-        "amount_minor_ex_tax": 1200,
-        "currency": "USD",
+        "amount_ex_tax": money_json("12.00"),
         "revenue_stream": "subscription",
         "catalog_class": "REVENUE",
         "recognition": { "policy_ref": "p", "timing": "straight_line" }
@@ -301,8 +323,7 @@ fn invoice_item_straight_line_without_periods_is_invalid_request() {
 #[test]
 fn invoice_item_unknown_timing_is_invalid_request() {
     let body = serde_json::json!({
-        "amount_minor_ex_tax": 100,
-        "currency": "USD",
+        "amount_ex_tax": money_json("1.00"),
         "revenue_stream": "subscription",
         "catalog_class": "REVENUE",
         "recognition": { "policy_ref": "p", "timing": "milestone" }
@@ -329,8 +350,8 @@ fn mixed_currency_invoice_is_invalid_request() {
         "effective_at": "2026-06-01",
         "period_id": "202606",
         "items": [
-            {"amount_minor_ex_tax": 1000, "currency": "USD", "revenue_stream": "subscription"},
-            {"amount_minor_ex_tax": 500, "currency": "EUR", "revenue_stream": "usage"}
+            {"amount_ex_tax": money_json("10.00"), "revenue_stream": "subscription"},
+            {"amount_ex_tax": {"amount": "5.00", "currency": "EUR", "currency_scale": 2}, "revenue_stream": "usage"}
         ],
         "tax": [],
         "correlation_id": actor
@@ -352,8 +373,7 @@ fn mixed_currency_invoice_is_invalid_request() {
 #[test]
 fn invoice_item_invalid_currency_is_invalid_request() {
     let dto = InvoiceItemDto {
-        amount_minor_ex_tax: 100,
-        currency: "NOT-A-CURRENCY".to_owned(), // > 10 chars ⇒ over the code cap
+        amount_ex_tax: money_in("1.00", "NOT-A-CURRENCY", 2), // `-` is not a code byte
         revenue_stream: "subscription".to_owned(),
         catalog_class: None,
         contract_class: None,
@@ -456,9 +476,7 @@ fn allocate_body_without_splits_lowers_with_none() {
         "tenant_id": tenant,
         "payer_tenant_id": payer,
         "allocation_id": uuid::Uuid::now_v7(),
-        "lump_minor": 500,
-        "currency": "USD",
-        "scale": 2
+        "lump": money_json("5.00")
     });
     let dto: AllocatePaymentRequest =
         serde_json::from_value(body).expect("snake_case body must deserialize");
@@ -479,12 +497,10 @@ fn allocate_body_with_splits_lowers_to_sdk_split() {
         "tenant_id": tenant,
         "payer_tenant_id": payer,
         "allocation_id": uuid::Uuid::now_v7(),
-        "lump_minor": 500,
-        "currency": "USD",
-        "scale": 2,
+        "lump": money_json("5.00"),
         "splits": [
-            { "invoice_id": "INV-B", "amount_minor": 300 },
-            { "invoice_id": "INV-A", "amount_minor": 200 }
+            { "invoice_id": "INV-B", "money": money_json("3.00") },
+            { "invoice_id": "INV-A", "money": money_json("2.00") }
         ]
     });
     let dto: AllocatePaymentRequest =
@@ -495,9 +511,104 @@ fn allocate_body_with_splits_lowers_to_sdk_split() {
     let splits = sdk.splits.expect("splits present");
     assert_eq!(splits.len(), 2);
     assert_eq!(splits[0].invoice_id, "INV-B");
-    assert_eq!(splits[0].amount_minor, 300);
+    assert_eq!(splits[0].money, usd("3"));
     assert_eq!(splits[1].invoice_id, "INV-A");
-    assert_eq!(splits[1].amount_minor, 200);
+    assert_eq!(splits[1].money, usd("2"));
+}
+
+/// A split whose currency (or scale) differs from the lump is a named mismatch
+/// error at the boundary — never an implicit conversion.
+#[test]
+fn allocate_split_currency_mismatch_is_named_error() {
+    let tenant = uuid::uuid!("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee");
+    let body = serde_json::json!({
+        "tenant_id": tenant,
+        "payer_tenant_id": tenant,
+        "allocation_id": uuid::Uuid::now_v7(),
+        "lump": money_json("5.00"),
+        "splits": [
+            { "invoice_id": "INV-B", "money": {"amount": "3.00", "currency": "EUR", "currency_scale": 2} }
+        ]
+    });
+    let dto: AllocatePaymentRequest = serde_json::from_value(body).expect("deserialize");
+    let err = dto
+        .into_sdk("PAY-1".to_owned())
+        .expect_err("a foreign-currency split must reject");
+    assert!(
+        matches!(err, DomainError::CurrencyMismatch(_)),
+        "got {err:?}"
+    );
+
+    let body = serde_json::json!({
+        "tenant_id": tenant,
+        "payer_tenant_id": tenant,
+        "allocation_id": uuid::Uuid::now_v7(),
+        "lump": money_json("5.00"),
+        "splits": [
+            { "invoice_id": "INV-B", "money": {"amount": "3.00", "currency": "USD", "currency_scale": 3} }
+        ]
+    });
+    let dto: AllocatePaymentRequest = serde_json::from_value(body).expect("deserialize");
+    let err = dto
+        .into_sdk("PAY-1".to_owned())
+        .expect_err("a different stored scale must reject");
+    assert!(
+        matches!(err, DomainError::InconsistentScale(_)),
+        "got {err:?}"
+    );
+}
+
+/// A return's `money` is lowered exactly: the wire text keeps its stored
+/// currency metadata and a fractional trailing zero is accepted without changing
+/// the value, while a wire amount finer than the declared scale is the named
+/// increment error carrying the field path (not a generic invalid request).
+#[test]
+fn return_money_lowers_exactly_and_names_the_field_on_a_bad_increment() {
+    let body = |amount: &str| {
+        serde_json::json!({
+            "tenant_id": uuid::Uuid::now_v7(),
+            "payer_tenant_id": uuid::Uuid::now_v7(),
+            "psp_return_id": "RET-1",
+            "money": money_json(amount)
+        })
+    };
+    let ret: ReturnPaymentRequest = serde_json::from_value(body("1.50")).expect("deserialize");
+    let cmd = ret.into_sdk("PAY-1".to_owned()).expect("lowers");
+    assert_eq!(cmd.money, usd("1.5"));
+    assert_eq!(cmd.money.currency().scale(), 2);
+
+    let ret: ReturnPaymentRequest = serde_json::from_value(body("1.505")).expect("deserialize");
+    match ret.into_sdk("PAY-1".to_owned()) {
+        Err(DomainError::InvalidPostingIncrement(detail)) => {
+            assert!(detail.starts_with("money:"), "{detail}");
+        }
+        other => panic!("expected InvalidPostingIncrement, got {other:?}"),
+    }
+}
+
+/// The wire-field money mapping and the domain money mapping are one table: for
+/// every `MoneyError` both produce the same `DomainError` variant, and the wire
+/// form names the field in its detail.
+#[test]
+fn money_field_error_and_domain_mapping_agree_for_every_variant() {
+    for error in [
+        MoneyError::InvalidDecimal,
+        MoneyError::InvalidCurrency,
+        MoneyError::ScaleOutOfRange,
+        MoneyError::AmountOutOfRange,
+        MoneyError::InvalidPostingIncrement,
+        MoneyError::CurrencyMismatch,
+        MoneyError::ScaleMismatch,
+    ] {
+        let wire = money_field_error("gross", error.clone());
+        let domain = crate::domain::exact_money::map_money_error(error.clone());
+        assert_eq!(
+            std::mem::discriminant(&wire),
+            std::mem::discriminant(&domain),
+            "{error:?}: {wire:?} vs {domain:?}"
+        );
+        assert!(format!("{wire:?}").contains("gross:"), "{wire:?}");
+    }
 }
 
 /// An over-long business id is rejected at the DTO boundary as a clean
@@ -515,9 +626,7 @@ fn over_long_business_id_is_rejected_at_the_boundary() {
         "tenant_id": tenant,
         "payer_tenant_id": payer,
         "psp_return_id": "RET-1",
-        "amount_minor": 100,
-        "currency": "USD",
-        "scale": 2
+        "money": money_json("1.00")
     }))
     .expect("body deserializes");
     assert!(
@@ -533,9 +642,7 @@ fn over_long_business_id_is_rejected_at_the_boundary() {
         "tenant_id": tenant,
         "payer_tenant_id": payer,
         "psp_return_id": too_long,
-        "amount_minor": 100,
-        "currency": "USD",
-        "scale": 2
+        "money": money_json("1.00")
     }))
     .expect("body deserializes");
     assert!(
@@ -551,9 +658,7 @@ fn over_long_business_id_is_rejected_at_the_boundary() {
         "tenant_id": tenant,
         "payer_tenant_id": payer,
         "psp_return_id": "",
-        "amount_minor": 100,
-        "currency": "USD",
-        "scale": 2
+        "money": money_json("1.00")
     }))
     .expect("body deserializes");
     assert!(
@@ -578,8 +683,8 @@ fn credit_application_grant_body_lowers_to_sdk_grant() {
         "payer_tenant_id": payer,
         "credit_application_id": "CA-1",
         "currency": "USD",
-        "scale": 2,
-        "amount_minor": 1500,
+        "currency_scale": 2,
+        "money": money_json("15.00"),
         "credit_grant_event_type": "PROMO"
     });
     let dto: CreditApplicationRequest =
@@ -591,7 +696,7 @@ fn credit_application_grant_body_lowers_to_sdk_grant() {
     assert_eq!(g.tenant_id, tenant, "tenant = body tenant_id");
     assert_eq!(g.payer_tenant_id, payer);
     assert_eq!(g.credit_application_id, "CA-1");
-    assert_eq!(g.amount_minor, 1500);
+    assert_eq!(g.money, usd("15"));
     assert_eq!(g.credit_grant_event_type, "PROMO");
 }
 
@@ -608,10 +713,10 @@ fn credit_application_apply_body_lowers_to_sdk_apply() {
         "payer_tenant_id": payer,
         "credit_application_id": "CA-2",
         "currency": "USD",
-        "scale": 2,
+        "currency_scale": 2,
         "targets": [
-            { "invoice_id": "INV-B", "amount_minor": 300 },
-            { "invoice_id": "INV-A", "amount_minor": 200 }
+            { "invoice_id": "INV-B", "money": money_json("3.00") },
+            { "invoice_id": "INV-A", "money": money_json("2.00") }
         ]
     });
     let dto: CreditApplicationRequest =
@@ -623,12 +728,14 @@ fn credit_application_apply_body_lowers_to_sdk_apply() {
     assert_eq!(a.credit_application_id, "CA-2");
     assert_eq!(a.targets.len(), 2);
     assert_eq!(a.targets[0].invoice_id, "INV-B");
-    assert_eq!(a.targets[0].amount_minor, 300);
+    assert_eq!(a.targets[0].money, usd("3"));
     assert_eq!(a.targets[1].invoice_id, "INV-A");
-    assert_eq!(a.targets[1].amount_minor, 200);
+    assert_eq!(a.targets[1].money, usd("2"));
+    assert_eq!(a.currency.code(), "USD");
+    assert_eq!(a.currency.scale(), 2);
 }
 
-/// A `grant` missing `amount_minor` is rejected `400 InvalidArgument` in
+/// A `grant` missing `money` is rejected `400 InvalidArgument` in
 /// `into_sdk` (the kind-specific shape is validated at the boundary, not deep in
 /// the post path).
 #[test]
@@ -641,19 +748,59 @@ fn credit_application_grant_missing_amount_is_invalid() {
         "payer_tenant_id": payer,
         "credit_application_id": "CA-3",
         "currency": "USD",
-        "scale": 2,
+        "currency_scale": 2,
         "credit_grant_event_type": "PROMO"
     });
     let dto: CreditApplicationRequest =
         serde_json::from_value(body).expect("snake_case body must deserialize");
     let err = dto
         .into_sdk()
-        .expect_err("a grant without amount_minor must reject");
+        .expect_err("a grant without money must reject");
     assert_eq!(
         err.status_code(),
         400,
         "expected a 400 InvalidArgument, got {err:?}"
     );
+}
+
+/// A grant whose `money` disagrees with the declared `currency` /
+/// `currency_scale` is a named 400 from the lowering the credit handler now runs
+/// before its dual-control gate (so an over-threshold mismatch never parks a
+/// PENDING approval): another code is `CURRENCY_MISMATCH`, another scale of the
+/// same code is `CURRENCY_SCALE_MISMATCH`.
+#[test]
+fn credit_application_grant_money_must_match_the_declared_pair() {
+    let body = |money: serde_json::Value| {
+        serde_json::json!({
+            "kind": "grant",
+            "tenant_id": uuid::Uuid::now_v7(),
+            "payer_tenant_id": uuid::Uuid::now_v7(),
+            "credit_application_id": "CA-9",
+            "currency": "USD",
+            "currency_scale": 2,
+            "money": money,
+            "credit_grant_event_type": "PROMO"
+        })
+    };
+    for (money, reason) in [
+        (
+            serde_json::json!({"amount": "5000", "currency": "EUR", "currency_scale": 2}),
+            "CURRENCY_MISMATCH",
+        ),
+        (
+            serde_json::json!({"amount": "5000", "currency": "USD", "currency_scale": 3}),
+            "CURRENCY_SCALE_MISMATCH",
+        ),
+    ] {
+        let dto: CreditApplicationRequest = serde_json::from_value(body(money)).unwrap();
+        let err = dto
+            .into_sdk()
+            .expect_err("mismatched grant money must reject");
+        assert_eq!(err.status_code(), 400);
+        let text =
+            serde_json::to_string(&toolkit::api::canonical_prelude::Problem::from(err)).unwrap();
+        assert!(text.contains(reason), "{reason}: {text}");
+    }
 }
 
 /// An apply with an empty `targets` is rejected `400 InvalidArgument` (an empty
@@ -668,7 +815,7 @@ fn credit_application_apply_empty_targets_is_invalid() {
         "payer_tenant_id": payer,
         "credit_application_id": "CA-4",
         "currency": "USD",
-        "scale": 2,
+        "currency_scale": 2,
         "targets": []
     });
     let dto: CreditApplicationRequest =
@@ -690,7 +837,7 @@ fn credit_application_unknown_kind_is_invalid() {
         "payer_tenant_id": payer,
         "credit_application_id": "CA-5",
         "currency": "USD",
-        "scale": 2
+        "currency_scale": 2
     });
     let dto: CreditApplicationRequest =
         serde_json::from_value(body).expect("snake_case body must deserialize");
@@ -708,8 +855,8 @@ fn change_schedule_replace_body_lowers_to_sdk() {
         "action": "replace",
         "treatment": "prospective",
         "new_segments": [
-            { "period_id": "202607", "amount_minor": 300 },
-            { "period_id": "202608", "amount_minor": 500 }
+            { "period_id": "202607", "money": money_json("3.00") },
+            { "period_id": "202608", "money": money_json("5.00") }
         ]
     });
     let dto: ChangeRecognitionScheduleRequest =
@@ -726,8 +873,8 @@ fn change_schedule_replace_body_lowers_to_sdk() {
     let segs = cmd.new_segments.expect("replace carries segments");
     assert_eq!(segs.len(), 2);
     assert_eq!(segs[0].period_id, "202607");
-    assert_eq!(segs[0].amount_minor, 300);
-    assert_eq!(segs[1].amount_minor, 500);
+    assert_eq!(segs[0].money, usd("3"));
+    assert_eq!(segs[1].money, usd("5"));
 }
 
 /// A `cancel` change body lowers with `new_segments = None`.
@@ -809,9 +956,8 @@ fn recognition_schedule_list_response_is_header_only() {
             status: "ACTIVE".to_owned(),
             version: 0,
             revenue_stream: "support".to_owned(),
-            currency: "USD".to_owned(),
-            total_deferred_minor: 1200,
-            recognized_minor: 100,
+            total_deferred: money("12"),
+            recognized: money("1"),
             source_invoice_id: "INV-9".to_owned(),
             source_invoice_item_ref: "ITEM-9".to_owned(),
             po_allocation_group: None,
@@ -832,9 +978,12 @@ fn recognition_schedule_list_response_is_header_only() {
     assert_eq!(row["status"], serde_json::json!("ACTIVE"));
     assert_eq!(row["version"], serde_json::json!(0));
     assert_eq!(row["revenue_stream"], serde_json::json!("support"));
-    assert_eq!(row["currency"], serde_json::json!("USD"));
-    assert_eq!(row["total_deferred_minor"], serde_json::json!(1200));
-    assert_eq!(row["recognized_minor"], serde_json::json!(100));
+    assert_eq!(
+        row["total_deferred"],
+        serde_json::json!({ "amount": "12", "currency": "USD", "currency_scale": 2 })
+    );
+    assert_eq!(row["recognized"]["amount"], serde_json::json!("1"));
+    assert_eq!(row["recognized"]["currency"], serde_json::json!("USD"));
     assert_eq!(row["source_invoice_id"], serde_json::json!("INV-9"));
     assert_eq!(row["source_invoice_item_ref"], serde_json::json!("ITEM-9"));
     assert_eq!(row["policy_ref"], serde_json::json!("pol-1"));
@@ -855,21 +1004,22 @@ fn recognition_schedule_list_response_is_header_only() {
     );
 }
 
-// ── Read-surface view `From<Model>` mappings (refund / notes / dispute /
-// recognition-run / settlement / entry-header / payer-state) ─────────────────────
+// ── Read-surface view mappings (refund / notes / dispute / recognition-run /
+// settlement / entry-header / payer-state) ───────────────────────────────────
 //
-// Each test builds the full entity `Model` with a DISTINCT sentinel per field,
-// converts via `View::from(model)`, and asserts every view field equals the
-// source. The EXCLUDED columns (`tenant_id`, the optimistic-`version` counter,
-// the entry hash-chain internals, …) are simply not present on the view — the
-// struct literal compiles without reading them, which is the implicit guard that
-// they stay off the wire.
+// Each test builds the full decoded repository view with a DISTINCT sentinel
+// per field, converts via `View::from(row)`, and asserts every view field equals
+// the source. The EXCLUDED columns (`tenant_id`, the optimistic-`version`
+// counter, the entry hash-chain internals, …) are simply not present on the view
+// — the struct literal compiles without reading them, which is the implicit
+// guard that they stay off the wire. Money renders as canonical decimal text
+// with its currency and stored scale.
 
-/// `RefundView::from(refund::Model)` maps every surfaced field; the entity's
-/// `tenant_id` / `created_at_utc` / `version` are intentionally NOT on the view.
+/// `RefundView::from(adjustment_repo::RefundView)` maps every surfaced field;
+/// the row's `tenant_id` / `created_at_utc` / `version` are NOT on the view.
 #[test]
 fn refund_view_from_model_maps_all_fields() {
-    let model = crate::infra::storage::entity::refund::Model {
+    let model = crate::infra::storage::repo::adjustment_repo::RefundView {
         tenant_id: uuid::uuid!("11111111-1111-1111-1111-111111111111"),
         refund_id: "RFND-1".to_owned(),
         psp_refund_id: "PSP-RFND-1".to_owned(),
@@ -877,8 +1027,7 @@ fn refund_view_from_model_maps_all_fields() {
         pattern: "A_UNALLOCATED".to_owned(),
         payment_id: "PAY-1".to_owned(),
         invoice_id: Some("INV-1".to_owned()),
-        currency: "USD".to_owned(),
-        amount_minor: 1234,
+        amount: usd("12.34"),
         clearing_state: "SETTLED".to_owned(),
         relates_to_refund_id: Some("RFND-0".to_owned()),
         reverses_entry_id: Some(uuid::uuid!("22222222-2222-2222-2222-222222222222")),
@@ -892,8 +1041,7 @@ fn refund_view_from_model_maps_all_fields() {
     assert_eq!(view.pattern, "A_UNALLOCATED");
     assert_eq!(view.payment_id, "PAY-1");
     assert_eq!(view.invoice_id.as_deref(), Some("INV-1"));
-    assert_eq!(view.currency, "USD");
-    assert_eq!(view.amount_minor, 1234);
+    assert_eq!(view.amount, money("12.34"));
     assert_eq!(view.clearing_state, "SETTLED");
     assert_eq!(view.relates_to_refund_id.as_deref(), Some("RFND-0"));
     assert_eq!(
@@ -902,21 +1050,20 @@ fn refund_view_from_model_maps_all_fields() {
     );
 }
 
-/// `CreditNoteView::from(credit_note::Model)` maps every surfaced field
-/// (including `created_at_utc`); the entity's `tenant_id` is NOT on the view.
+/// `CreditNoteView::from(adjustment_repo::CreditNoteView)` maps every surfaced
+/// field (including `created_at_utc`); the row's `tenant_id` is NOT on the view.
 #[test]
 fn credit_note_view_from_model_maps_all_fields() {
     let created = from_unix(1_700_000_002, 0).expect("ts");
-    let model = crate::infra::storage::entity::credit_note::Model {
+    let model = crate::infra::storage::repo::adjustment_repo::CreditNoteView {
         tenant_id: uuid::uuid!("11111111-1111-1111-1111-111111111111"),
         credit_note_id: "CN-1".to_owned(),
         origin_invoice_id: "INV-1".to_owned(),
         origin_invoice_item_ref: Some("ITEM-1".to_owned()),
         revenue_stream: "subscription".to_owned(),
-        currency: "USD".to_owned(),
-        amount_minor: 5000,
-        recognized_part_minor: 3000,
-        deferred_part_minor: 1500,
+        amount: usd("50"),
+        recognized_part: usd("30"),
+        deferred_part: usd("15"),
         split_basis_ref: Some("SCH-1".to_owned()),
         reason_code: "GOODWILL".to_owned(),
         created_at_utc: created,
@@ -926,67 +1073,70 @@ fn credit_note_view_from_model_maps_all_fields() {
     assert_eq!(view.origin_invoice_id, "INV-1");
     assert_eq!(view.origin_invoice_item_ref.as_deref(), Some("ITEM-1"));
     assert_eq!(view.revenue_stream, "subscription");
-    assert_eq!(view.currency, "USD");
-    assert_eq!(view.amount_minor, 5000);
-    assert_eq!(view.recognized_part_minor, 3000);
-    assert_eq!(view.deferred_part_minor, 1500);
+    assert_eq!(view.amount, money("50"));
+    assert_eq!(view.recognized_part, money("30"));
+    assert_eq!(view.deferred_part, money("15"));
     assert_eq!(view.split_basis_ref.as_deref(), Some("SCH-1"));
     assert_eq!(view.reason_code, "GOODWILL");
     assert_eq!(view.created_at_utc, created);
 }
 
-/// `DebitNoteView::from(debit_note::Model)` maps every surfaced field; the entity's
-/// `tenant_id` is NOT on the view. The debit note is leaner than the credit note
-/// (no `revenue_stream` / `reason_code` / item ref).
+/// `DebitNoteView::from(adjustment_repo::DebitNoteView)` maps every surfaced
+/// field; the row's `tenant_id` is NOT on the view. The debit note is leaner
+/// than the credit note (no `revenue_stream` / `reason_code` / item ref).
 #[test]
 fn debit_note_view_from_model_maps_all_fields() {
     let created = from_unix(1_700_000_003, 0).expect("ts");
-    let model = crate::infra::storage::entity::debit_note::Model {
+    let eur = |amount: &str| {
+        PostedMoney::try_new(
+            parse_decimal(amount).expect("decimal"),
+            CurrencySpec::try_new("EUR".to_owned(), 2).expect("spec"),
+        )
+        .expect("posting")
+    };
+    let model = crate::infra::storage::repo::adjustment_repo::DebitNoteView {
         tenant_id: uuid::uuid!("11111111-1111-1111-1111-111111111111"),
         debit_note_id: "DN-1".to_owned(),
         origin_invoice_id: "INV-2".to_owned(),
-        currency: "EUR".to_owned(),
-        amount_minor: 9000,
-        recognized_part_minor: 6000,
-        deferred_part_minor: 2500,
+        amount: eur("90"),
+        recognized_part: eur("60"),
+        deferred_part: eur("25"),
         created_at_utc: created,
     };
     let view = DebitNoteView::from(model);
     assert_eq!(view.debit_note_id, "DN-1");
     assert_eq!(view.origin_invoice_id, "INV-2");
-    assert_eq!(view.currency, "EUR");
-    assert_eq!(view.amount_minor, 9000);
-    assert_eq!(view.recognized_part_minor, 6000);
-    assert_eq!(view.deferred_part_minor, 2500);
+    assert_eq!(view.amount, money_in("90", "EUR", 2));
+    assert_eq!(view.recognized_part, money_in("60", "EUR", 2));
+    assert_eq!(view.deferred_part, money_in("25", "EUR", 2));
     assert_eq!(view.created_at_utc, created);
 }
 
-/// `DisputeView::from(dispute::Model)` maps every surfaced field; the entity's
+/// `DisputeView::from(DisputeState)` maps every surfaced field; the row's
 /// `tenant_id` / `version` (the optimistic-concurrency counter) are NOT on the
 /// view.
 #[test]
 fn dispute_view_from_model_maps_all_fields() {
-    let model = crate::infra::storage::entity::dispute::Model {
+    use crate::domain::payment::dispute_state::{DisputePhase, DisputeVariant};
+    let model = crate::infra::storage::repo::dispute_repo::DisputeState {
         tenant_id: uuid::uuid!("11111111-1111-1111-1111-111111111111"),
         dispute_id: "DSP-1".to_owned(),
         payment_id: "PAY-1".to_owned(),
-        currency: "USD".to_owned(),
-        variant: "CASH_HOLD".to_owned(),
-        last_phase: "OPENED".to_owned(),
+        variant: DisputeVariant::CashHold,
+        last_phase: DisputePhase::Opened,
         cycle: 2,
-        disputed_amount_minor: 4200,
-        cash_hold_minor: 4000,
+        disputed_amount: usd("42"),
+        cash_hold: usd("40"),
         version: 9,
     };
     let view = DisputeView::from(model);
     assert_eq!(view.dispute_id, "DSP-1");
     assert_eq!(view.payment_id, "PAY-1");
-    assert_eq!(view.currency, "USD");
-    assert_eq!(view.variant, "CASH_HOLD");
-    assert_eq!(view.last_phase, "OPENED");
+    assert_eq!(view.variant, DisputeVariant::CashHold.as_str());
+    assert_eq!(view.last_phase, DisputePhase::Opened.as_str());
     assert_eq!(view.cycle, 2);
-    assert_eq!(view.disputed_amount_minor, 4200);
-    assert_eq!(view.cash_hold_minor, 4000);
+    assert_eq!(view.disputed_amount, money("42"));
+    assert_eq!(view.cash_hold, money("40"));
 }
 
 /// `RecognitionRunView::from(recognition_run::Model)` maps every surfaced field;
@@ -1009,32 +1159,30 @@ fn recognition_run_view_from_model_maps_all_fields() {
     assert_eq!(view.started_at_utc, started);
 }
 
-/// `SettlementView::from(payment_settlement::Model)` maps every surfaced counter;
-/// the entity's `tenant_id` / `version` (the optimistic-concurrency counter) are
-/// NOT on the view.
+/// `SettlementView::from(SettlementState)` maps every surfaced counter; the
+/// row's `tenant_id` / `version` (the optimistic-concurrency counter) are NOT on
+/// the view.
 #[test]
 fn settlement_view_from_model_maps_all_fields() {
-    let model = crate::infra::storage::entity::payment_settlement::Model {
+    let model = crate::infra::storage::repo::payment_repo::SettlementState {
         tenant_id: uuid::uuid!("11111111-1111-1111-1111-111111111111"),
         payment_id: "PAY-1".to_owned(),
-        currency: "USD".to_owned(),
-        settled_minor: 10_000,
-        fee_minor: 300,
-        allocated_minor: 6000,
-        refunded_minor: 1500,
-        refunded_unallocated_minor: 500,
-        clawed_back_minor: 200,
         version: 11,
+        settled: usd("100"),
+        fee: usd("3"),
+        allocated: usd("60"),
+        refunded: usd("15"),
+        refunded_unallocated: usd("5"),
+        clawed_back: usd("2"),
     };
     let view = SettlementView::from(model);
     assert_eq!(view.payment_id, "PAY-1");
-    assert_eq!(view.currency, "USD");
-    assert_eq!(view.settled_minor, 10_000);
-    assert_eq!(view.fee_minor, 300);
-    assert_eq!(view.allocated_minor, 6000);
-    assert_eq!(view.refunded_minor, 1500);
-    assert_eq!(view.refunded_unallocated_minor, 500);
-    assert_eq!(view.clawed_back_minor, 200);
+    assert_eq!(view.settled, money("100"));
+    assert_eq!(view.fee, money("3"));
+    assert_eq!(view.allocated, money("60"));
+    assert_eq!(view.refunded, money("15"));
+    assert_eq!(view.refunded_unallocated, money("5"));
+    assert_eq!(view.clawed_back, money("2"));
 }
 
 /// `EntryHeaderView::from(journal_entry::Model)` maps the surfaced header dims;
@@ -1114,13 +1262,15 @@ fn dual_control_policy_view_from_configured_version() {
     let view = DualControlPolicyView::from_effective(Some(PolicyVersion {
         effective_from: eff,
         version: 3,
-        policy: DualControlPolicy {
-            d2_threshold_minor: 250_000,
-            a6_backdating_biz_days: 7,
-            pending_ttl_seconds: 3_600,
-        },
+        policy: DualControlPolicy::try_new(
+            crate::domain::approval::policy::D2Thresholds::try_new(vec![usd("2500")]).unwrap(),
+            7,
+            3_600,
+        )
+        .unwrap(),
     }));
-    assert_eq!(view.d2_threshold_minor, 250_000);
+    assert_eq!(view.d2_thresholds, vec![money("2500")]);
+    assert_eq!(view.d2_default_rule, D2_DEFAULT_RULE);
     assert_eq!(view.a6_backdating_biz_days, 7);
     assert_eq!(view.pending_ttl_seconds, 3_600);
     assert_eq!(view.effective_from, Some(eff));
@@ -1134,9 +1284,13 @@ fn dual_control_policy_view_from_configured_version() {
 fn dual_control_policy_view_from_none_yields_platform_defaults() {
     let view = DualControlPolicyView::from_effective(None);
     let d = DualControlPolicy::DEFAULT;
-    assert_eq!(view.d2_threshold_minor, d.d2_threshold_minor);
-    assert_eq!(view.a6_backdating_biz_days, d.a6_backdating_biz_days);
-    assert_eq!(view.pending_ttl_seconds, d.pending_ttl_seconds);
+    assert!(
+        view.d2_thresholds.is_empty() && d.d2_thresholds().is_empty(),
+        "the platform default carries no per-currency override"
+    );
+    assert_eq!(view.d2_default_rule, D2_DEFAULT_RULE);
+    assert_eq!(view.a6_backdating_biz_days, d.a6_backdating_biz_days());
+    assert_eq!(view.pending_ttl_seconds, d.pending_ttl_seconds());
     assert_eq!(view.effective_from, None);
     assert_eq!(view.version, None);
     assert!(view.is_default);
@@ -1145,13 +1299,13 @@ fn dual_control_policy_view_from_none_yields_platform_defaults() {
 // ── FX rate ingest validation (Slice 5) ──────────────────────────────────────
 
 /// A `snake_case` `POST /fx/rates` body (`fallback_order` omitted).
-fn fx_ingest_body(base: &str, quote: &str, provider: &str, rate_micro: i64) -> serde_json::Value {
+fn fx_ingest_body(base: &str, quote: &str, provider: &str, rate: &str) -> serde_json::Value {
     serde_json::json!({
         "tenant_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
         "base_currency": base,
         "quote_currency": quote,
         "provider": provider,
-        "rate_micro": rate_micro,
+        "rate": rate,
         "as_of": "2026-06-27T00:00:00Z",
     })
 }
@@ -1159,15 +1313,45 @@ fn fx_ingest_body(base: &str, quote: &str, provider: &str, rate_micro: i64) -> s
 #[test]
 fn fx_ingest_valid_body_validates_and_defaults_fallback_order() {
     let req: FxRateIngestRequest =
-        serde_json::from_value(fx_ingest_body("EUR", "USD", "ecb", 1_100_000)).unwrap();
-    assert_eq!(req.validate().unwrap(), 0, "fallback_order defaults to 0");
+        serde_json::from_value(fx_ingest_body("EUR", "USD", "ecb", "1.1")).unwrap();
+    let (rate, fallback_order) = req.validate().unwrap();
+    assert_eq!(fallback_order, 0, "fallback_order defaults to 0");
+    assert_eq!(
+        rate,
+        parse_decimal("1.1").unwrap(),
+        "the quote's digits are kept exactly"
+    );
+}
+
+#[test]
+fn fx_ingest_keeps_every_quote_digit() {
+    let req: FxRateIngestRequest =
+        serde_json::from_value(fx_ingest_body("EUR", "USD", "ecb", "1.123456789")).unwrap();
+    let (rate, _) = req.validate().unwrap();
+    assert_eq!(
+        canonical_decimal(rate),
+        "1.123456789",
+        "no micro-rate rounding"
+    );
+}
+
+#[test]
+fn fx_ingest_rejects_malformed_rate() {
+    for bad in ["abc", "1e3", "", "1.5.2"] {
+        let req: FxRateIngestRequest =
+            serde_json::from_value(fx_ingest_body("EUR", "USD", "ecb", bad)).unwrap();
+        assert!(
+            matches!(req.validate(), Err(DomainError::InvalidRequest(_))),
+            "{bad:?} must reject"
+        );
+    }
 }
 
 #[test]
 fn fx_ingest_rejects_identity_pair() {
     // base == quote is a no-op rate the lock-time short-circuit never reads.
     let req: FxRateIngestRequest =
-        serde_json::from_value(fx_ingest_body("USD", "USD", "ecb", 1_000_000)).unwrap();
+        serde_json::from_value(fx_ingest_body("USD", "USD", "ecb", "1")).unwrap();
     assert!(matches!(
         req.validate(),
         Err(DomainError::InvalidRequest(_))
@@ -1177,13 +1361,13 @@ fn fx_ingest_rejects_identity_pair() {
 #[test]
 fn fx_ingest_rejects_non_positive_rate() {
     let zero: FxRateIngestRequest =
-        serde_json::from_value(fx_ingest_body("EUR", "USD", "ecb", 0)).unwrap();
+        serde_json::from_value(fx_ingest_body("EUR", "USD", "ecb", "0")).unwrap();
     assert!(matches!(
         zero.validate(),
         Err(DomainError::InvalidRequest(_))
     ));
     let negative: FxRateIngestRequest =
-        serde_json::from_value(fx_ingest_body("EUR", "USD", "ecb", -5)).unwrap();
+        serde_json::from_value(fx_ingest_body("EUR", "USD", "ecb", "-5")).unwrap();
     assert!(matches!(
         negative.validate(),
         Err(DomainError::InvalidRequest(_))
@@ -1193,34 +1377,167 @@ fn fx_ingest_rejects_non_positive_rate() {
 #[test]
 fn fx_ingest_rejects_empty_currency_and_provider() {
     let bad_ccy: FxRateIngestRequest =
-        serde_json::from_value(fx_ingest_body("", "USD", "ecb", 1_000_000)).unwrap();
+        serde_json::from_value(fx_ingest_body("", "USD", "ecb", "1")).unwrap();
     assert!(matches!(
         bad_ccy.validate(),
         Err(DomainError::InvalidRequest(_))
     ));
     let bad_provider: FxRateIngestRequest =
-        serde_json::from_value(fx_ingest_body("EUR", "USD", "", 1_000_000)).unwrap();
+        serde_json::from_value(fx_ingest_body("EUR", "USD", "", "1")).unwrap();
     assert!(matches!(
         bad_provider.validate(),
         Err(DomainError::InvalidRequest(_))
     ));
 }
 
+/// The ingest admits exactly the codes the rate store accepts: a lowercase,
+/// punctuated or over-long code is a 400 at the boundary, never a repository
+/// 500; a 16-character alphanumeric (non-ISO) code is admitted.
+#[test]
+fn fx_ingest_currency_codes_follow_the_store_allowlist() {
+    for bad in ["usd", "US-D", "U SD", "ABCDEFGHIJKLMNOPQ"] {
+        for (base, quote) in [(bad, "USD"), ("EUR", bad)] {
+            let req: FxRateIngestRequest =
+                serde_json::from_value(fx_ingest_body(base, quote, "ecb", "1.1")).unwrap();
+            assert!(
+                matches!(req.validate(), Err(DomainError::InvalidRequest(_))),
+                "{base}/{quote} must reject"
+            );
+        }
+    }
+    let req: FxRateIngestRequest =
+        serde_json::from_value(fx_ingest_body("ABCDEFGHIJKLMNO1", "USD", "ecb", "1.1")).unwrap();
+    assert!(req.validate().is_ok());
+}
+
 #[test]
 fn fx_ingest_passes_explicit_fallback_order_through() {
-    let mut body = fx_ingest_body("EUR", "USD", "ecb", 1_100_000);
+    let mut body = fx_ingest_body("EUR", "USD", "ecb", "1.1");
     body["fallback_order"] = serde_json::json!(2);
     let req: FxRateIngestRequest = serde_json::from_value(body).unwrap();
-    assert_eq!(req.validate().unwrap(), 2);
+    assert_eq!(req.validate().unwrap().1, 2);
 }
 
 #[test]
 fn fx_ingest_rejects_negative_fallback_order() {
-    let mut body = fx_ingest_body("EUR", "USD", "ecb", 1_100_000);
+    let mut body = fx_ingest_body("EUR", "USD", "ecb", "1.1");
     body["fallback_order"] = serde_json::json!(-1);
     let req: FxRateIngestRequest = serde_json::from_value(body).unwrap();
     assert!(matches!(
         req.validate(),
         Err(DomainError::InvalidRequest(_))
     ));
+}
+
+/// The FX snapshot read maps every stored field, with distinct base/quote
+/// scales (JPY 0 / USD 2) so a swap of the two `u8` scales cannot pass, and the
+/// fractional rate rendered as canonical decimal text.
+#[test]
+fn fx_rate_snapshot_response_maps_all_fields() {
+    use crate::infra::storage::repo::fx_repo::{NewRateSnapshot, RateSnapshotRow};
+    let rate_id = uuid::Uuid::now_v7();
+    let tenant_id = uuid::Uuid::now_v7();
+    let as_of = from_unix(1_782_000_000, 0).unwrap();
+    let row = RateSnapshotRow {
+        rate_id,
+        quote: NewRateSnapshot {
+            tenant_id,
+            base_currency: CurrencySpec::try_new("JPY".to_owned(), 0).unwrap(),
+            quote_currency: CurrencySpec::try_new("USD".to_owned(), 2).unwrap(),
+            rate: parse_decimal("1.0875").unwrap(),
+            as_of,
+            provider: "ecb".to_owned(),
+            stale: true,
+            fallback_order: 3,
+            triangulated_via: Some("EUR".to_owned()),
+        },
+    };
+    let view = FxRateSnapshotResponse::from(row);
+    assert_eq!(view.rate_id, rate_id);
+    assert_eq!(view.tenant_id, tenant_id);
+    assert_eq!(view.base_currency, "JPY");
+    assert_eq!(view.base_currency_scale, 0);
+    assert_eq!(view.quote_currency, "USD");
+    assert_eq!(view.quote_currency_scale, 2);
+    assert_eq!(view.rate, "1.0875");
+    assert_eq!(view.as_of, as_of);
+    assert_eq!(view.provider, "ecb");
+    assert!(view.stale);
+    assert_eq!(view.fallback_order, 3);
+    assert_eq!(view.triangulated_via.as_deref(), Some("EUR"));
+}
+
+/// A settle body lowers its gross and fee into one `SettledAmounts` pair; a fee
+/// in another currency or scale is refused at the boundary, named `fee`.
+#[test]
+fn settle_payment_pairs_gross_and_fee_in_one_currency() {
+    let tenant = uuid::Uuid::now_v7();
+    let body = |fee: serde_json::Value| -> SettlePaymentRequest {
+        serde_json::from_value(serde_json::json!({
+            "tenant_id": tenant,
+            "payer_tenant_id": tenant,
+            "payment_id": "PAY-1",
+            "gross": money_json("10.00"),
+            "fee": fee,
+        }))
+        .expect("deserialize")
+    };
+
+    let sdk = body(money_json("0.30")).into_sdk().expect("lowers");
+    assert_eq!(sdk.amounts.gross(), &usd("10.00"));
+    assert_eq!(sdk.amounts.fee(), &usd("0.30"));
+
+    let err = body(serde_json::json!({"amount": "0.30", "currency": "EUR", "currency_scale": 2}))
+        .into_sdk()
+        .expect_err("a fee in another currency must reject");
+    assert!(
+        matches!(&err, DomainError::CurrencyMismatch(d) if d.starts_with("fee:")),
+        "got {err:?}"
+    );
+    let err = body(serde_json::json!({"amount": "0.30", "currency": "USD", "currency_scale": 3}))
+        .into_sdk()
+        .expect_err("a fee at another scale must reject");
+    assert!(
+        matches!(&err, DomainError::InconsistentScale(d) if d.starts_with("fee:")),
+        "got {err:?}"
+    );
+}
+
+/// A provisioning body's currency scale lowers into a validated `CurrencySpec`;
+/// a scale above 28 never reaches the SDK request.
+#[test]
+fn provisioning_currency_scale_lowers_to_a_currency_spec() {
+    let body = |scale: u8| -> ProvisioningRequestDto {
+        serde_json::from_value(serde_json::json!({
+            "tenant_id": uuid::Uuid::now_v7(),
+            "accounts": [],
+            "currency_scales": [{"currency": "QQQ", "currency_scale": scale}],
+            "fiscal_calendar": {"timezone": "UTC", "granularity": "MONTH", "fy_start": 1},
+        }))
+        .expect("deserialize")
+    };
+    let req = body(4).into_request().expect("lowers");
+    assert_eq!(req.currency_scales.len(), 1);
+    assert_eq!(req.currency_scales[0].currency.code(), "QQQ");
+    assert_eq!(req.currency_scales[0].currency.scale(), 4);
+    assert!(matches!(
+        body(29).into_request(),
+        Err(DomainError::ScaleOutOfRange(_))
+    ));
+}
+
+/// The aging response keeps its `currency` field, read from the bucket's money.
+#[test]
+fn aging_bucket_currency_comes_from_its_amount() {
+    let payer = uuid::Uuid::now_v7();
+    let dto = AgingBucketDto::from(AgingBucket {
+        payer_tenant_id: payer,
+        bucket: "1-30".to_owned(),
+        amount: usd("12.50"),
+    });
+    let json = serde_json::to_value(&dto).expect("serialize");
+    assert_eq!(json["currency"], "USD");
+    assert_eq!(json["amount"]["currency"], "USD");
+    assert_eq!(json["amount"]["amount"], "12.5");
+    assert_eq!(json["bucket"], "1-30");
 }

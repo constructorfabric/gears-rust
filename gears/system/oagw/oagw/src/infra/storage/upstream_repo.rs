@@ -15,6 +15,7 @@ pub struct InMemoryUpstreamRepo {
 }
 
 impl InMemoryUpstreamRepo {
+    /// Create an empty repository.
     #[must_use]
     pub fn new() -> Self {
         Self {

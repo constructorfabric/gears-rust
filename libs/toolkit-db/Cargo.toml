@@ -112,6 +112,7 @@ sqlx = { workspace = true, optional = true }
 # Unconditional: the transactional outbox pipeline is always compiled in.
 tokio-util = { workspace = true }
 futures-util = { workspace = true }
+toolkit-taskward = { workspace = true }
 
 [[example]]
 name = "outbox_transactional"
@@ -140,12 +141,8 @@ harness = false
 # The bench body compile-errors out if no backend is present.
 required-features = ["_any-backend"]
 
-[[bench]]
-name = "worker_overhead"
-harness = false
-required-features = ["_any-backend"]
-
 [dev-dependencies]
+toolkit-gts = { workspace = true }
 strum = { workspace = true }
 criterion = { workspace = true, features = ["html_reports"] }
 tempfile = { workspace = true }

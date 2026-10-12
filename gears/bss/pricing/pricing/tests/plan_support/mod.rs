@@ -88,9 +88,6 @@ pub struct Catalog {
     /// Opt-in: a `release` waits this many milliseconds before it answers (a slow Products).
     /// Zero (the default) answers at once.
     pub stall_releases_ms: AtomicU64,
-    /// Opt-in, once: the next `reserve` first runs this SQL on this database (DSN, statement), to
-    /// change a row while a door's drive is between its transactions.
-    pub on_reserve_sql: Mutex<Option<(String, String)>>,
 }
 impl Catalog {
     /// Arm the dated reads (see `versions`) and add one published version of a declared SKU.
@@ -270,13 +267,6 @@ impl ReferenceRegistryV1 for Catalog {
         self.reference_denied(ctx)?;
         if self.down.load(Ordering::SeqCst) {
             return Err(Self::unavailable());
-        }
-        let hook = self.on_reserve_sql.lock().unwrap().take();
-        if let Some((dsn, sql)) = hook {
-            use sea_orm::{ConnectionTrait, Database};
-            let db = Database::connect(dsn.as_str()).await.unwrap();
-            db.execute_unprepared(&sql).await.unwrap();
-            db.close().await.unwrap();
         }
         self.reserve_kinds.lock().unwrap().push(kind);
         let mut refs = self.refs.lock().unwrap();

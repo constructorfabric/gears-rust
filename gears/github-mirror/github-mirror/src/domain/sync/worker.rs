@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
+use toolkit_macros::domain_model;
 
 use super::queue::TaskQueue;
 use super::task::{ExtractionTask, TaskKind};
@@ -16,6 +17,7 @@ use crate::domain::error::DomainError;
 
 /// Shared context passed to every [`Worker::execute`] invocation: the queue
 /// (so a worker can enqueue follow-up tasks) and the run's cancellation token.
+#[domain_model]
 #[derive(Clone)]
 pub struct WorkerContext {
     pub queue: Arc<TaskQueue>,
@@ -39,6 +41,7 @@ pub trait Worker: Send + Sync {
 
 /// Routes tasks to the first [`Worker`] that claims them, in registration
 /// order.
+#[domain_model]
 #[derive(Default)]
 pub struct WorkerDispatcher {
     workers: Vec<Arc<dyn Worker>>,

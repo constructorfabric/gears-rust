@@ -6,6 +6,7 @@
 //! Set, clear, read and list restrictions.
 
 use std::sync::Arc;
+use toolkit_macros::domain_model;
 
 use serde_json::json;
 use settings_service_sdk::SettingKey;
@@ -26,6 +27,7 @@ use crate::domain::precondition::{self, ETag};
 use crate::domain::resolution::{EffectiveCache, TenantHierarchy};
 
 /// Who is acting.
+#[domain_model]
 #[derive(Debug, Clone)]
 pub struct AccessActor {
     /// The authenticated caller.
@@ -40,6 +42,7 @@ pub struct AccessActor {
 }
 
 /// What a read of one pair returns.
+#[domain_model]
 #[derive(Debug, Clone)]
 pub struct AccessReadout {
     /// The declaration.
@@ -55,6 +58,7 @@ pub struct AccessReadout {
 }
 
 /// The service.
+#[domain_model]
 pub struct AccessService<D, A, S> {
     declarations: D,
     access: A,

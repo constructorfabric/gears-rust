@@ -1,16 +1,11 @@
 //! Pluggable signature provider (ADR-0004 "FIPS posture").
 //!
-//! The token codec ([`super::Issuer`] / [`super::Verifier`]) MUST call this
-//! abstraction and **never** a crypto crate directly, so the signing primitive
-//! — and, in a FIPS deployment, the validated module backing it — is
-//! replaceable without touching the codec, claim-set, or the rest of the
-//! design. This is the binding constraint from ADR-0004: no dependency may
-//! hard-wire a non-FIPS algorithm at the crate boundary.
+//! The token codec MUST call this abstraction and never a crypto crate directly, so the
+//! signing primitive (and, in a FIPS deployment, the validated module behind it) is
+//! replaceable without touching the codec.
 //!
-//! P1 ships [`Ed25519Provider`] (Ed25519 via `ring`). Ed25519 is FIPS 186-5
-//! approved; a FIPS deployment swaps this impl for one backed by a validated
-//! module (e.g. `rustls-corecrypto-provider`, or an ECDSA P-256 alternative) by
-//! implementing the same traits — the token stays opaque and the codec unchanged.
+//! `Ed25519Provider` (Ed25519 via `ring`, FIPS 186-5 approved) is the default; a FIPS
+//! deployment can implement the same traits over a validated module.
 
 use std::sync::Arc;
 
@@ -36,15 +31,14 @@ pub trait SignatureVerifier: Send + Sync {
     fn verify(&self, message: &[u8], signature: &[u8]) -> Result<(), DomainError>;
 }
 
-/// Default P1 provider: Ed25519 via `ring`. Behind the trait so the algorithm
-/// and backing module are replaceable (ADR-0004).
+/// Default provider: Ed25519 via `ring`.
 pub struct Ed25519Provider {
     key_pair: Ed25519KeyPair,
     public_key: Vec<u8>,
 }
 
 impl Ed25519Provider {
-    /// Generate a fresh static keypair (P1 uses one keypair, no rotation).
+    /// Generate a fresh static keypair (no rotation).
     pub fn generate() -> Result<Self, DomainError> {
         let rng = SystemRandom::new();
         let pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng)
@@ -58,9 +52,7 @@ impl Ed25519Provider {
         })
     }
 
-    /// Construct from a configured 32-byte Ed25519 seed, so the keypair (and
-    /// therefore the public key the sidecar verifies against) is **stable across
-    /// restarts** rather than regenerated on every boot.
+    /// Construct from a 32-byte Ed25519 seed, so the keypair is stable across restarts.
     pub fn from_seed(seed: &[u8]) -> Result<Self, DomainError> {
         let key_pair = Ed25519KeyPair::from_seed_unchecked(seed).map_err(|_| {
             DomainError::token_invalid("invalid Ed25519 signing seed (expected 32 bytes)")
@@ -87,7 +79,7 @@ impl SignatureProvider for Ed25519Provider {
     }
 }
 
-/// Verifier for [`Ed25519Provider`]-minted tokens (public key only).
+/// Verifier for `Ed25519Provider`-minted tokens (public key only).
 pub struct Ed25519Verifier {
     public_key: Vec<u8>,
 }

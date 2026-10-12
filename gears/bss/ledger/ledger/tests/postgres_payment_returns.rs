@@ -2,18 +2,18 @@
 //! Group A + Group D Model N): `SettlementReturnService` posts the symmetric
 //! reverse of settle — `DR UNALLOCATED amount / CR CASH_CLEARING (amount −
 //! fee_share) / CR PSP_FEE_EXPENSE fee_share` — and decrements BOTH the original
-//! payment's `settled_minor` and `fee_minor` in the same txn. Ignored by default;
+//! payment's `settled` and `fee` in the same txn. Ignored by default;
 //! run with
 //! `cargo test -p cf-gears-bss-ledger --test postgres_payment_returns -- --ignored`.
 //!
-//! Covers: (a) a return after a settle decrements `settled_minor` and drains the
+//! Covers: (a) a return after a settle decrements `settled` and drains the
 //! pool by the returned amount; (b) a re-posted return (same `psp_return_id`)
-//! replays idempotently — `settled_minor` decrements exactly once; (c) a return
+//! replays idempotently — `settled` decrements exactly once; (c) a return
 //! exceeding the still-returnable settled amount trips the per-payment cap CHECK
 //! and surfaces as `SettlementReturnOverAllocated`, leaving the row untouched;
 //! (d) a fee-bearing FULL return reverses CASH_CLEARING by the NET and
-//! PSP_FEE_EXPENSE by the fee (Model N), zeroing both `settled_minor` and
-//! `fee_minor`.
+//! PSP_FEE_EXPENSE by the fee (Model N), zeroing both `settled` and
+//! `fee`.
 
 #![allow(
     clippy::non_ascii_literal,
@@ -29,7 +29,6 @@ use std::sync::Arc;
 
 use bss_ledger::domain::error::DomainError;
 use bss_ledger::domain::model::{AccountRow, CurrencyScaleRow};
-use bss_ledger::domain::money::DEFAULT_PLAUSIBLE_MAX_MAJOR;
 use bss_ledger::domain::payment::settlement::SettlementInput;
 use bss_ledger::domain::payment::settlement_return::SettlementReturnInput;
 use bss_ledger::domain::ports::metrics::NoopLedgerMetrics;
@@ -38,7 +37,8 @@ use bss_ledger::infra::payment::settle::SettlementService;
 use bss_ledger::infra::payment::settlement_return::SettlementReturnService;
 use bss_ledger::infra::storage::migrations::Migrator;
 use bss_ledger::infra::storage::repo::{PaymentRepo, ReferenceRepo};
-use bss_ledger_sdk::{AccountClass, Side};
+use bss_ledger_sdk::{AccountClass, CurrencySpec, PostedMoney, Side, canonical_decimal};
+use rust_decimal::Decimal;
 use sea_orm::{ConnectionTrait, Database, Statement};
 use sea_orm_migration::MigratorTrait;
 use testcontainers_modules::postgres::Postgres;
@@ -51,6 +51,21 @@ use uuid::Uuid;
 
 fn pg(sql: impl Into<String>) -> Statement {
     Statement::from_string(sea_orm::DatabaseBackend::Postgres, sql.into())
+}
+
+/// The USD@2 currency spec every fixture here posts in.
+fn usd_spec() -> CurrencySpec {
+    CurrencySpec::try_new("USD".to_owned(), 2).unwrap()
+}
+
+/// A USD scale-2 posting from a cent count (`1234` ⇒ `12.34`).
+fn usd(cents: i64) -> PostedMoney {
+    PostedMoney::try_new(Decimal::new(cents, 2), usd_spec()).unwrap()
+}
+
+/// The canonical stored text of a USD cent count (`970` ⇒ `"9.7"`).
+fn text(cents: i64) -> String {
+    canonical_decimal(Decimal::new(cents, 2))
 }
 
 /// Boot a container, migrate on a raw connection, and return a `bss`-search-path
@@ -115,8 +130,7 @@ async fn setup_seller(raw: &sea_orm::DatabaseConnection, provider: &DBProvider<D
         .upsert_currency_scale(CurrencyScaleRow {
             tenant_id: s.tenant,
             currency: "USD".to_owned(),
-            minor_units: 2,
-            plausible_max_major: DEFAULT_PLAUSIBLE_MAX_MAJOR,
+            currency_scale: 2,
             source: "iso".to_owned(),
         })
         .await
@@ -150,20 +164,20 @@ async fn setup_seller(raw: &sea_orm::DatabaseConnection, provider: &DBProvider<D
     s
 }
 
-/// Read an account's cached `balance_minor` (USD), or `None` when no row exists.
+/// Read an account's cached canonical `balance` text (USD), or `None` when no row exists.
 async fn account_balance(
     raw: &sea_orm::DatabaseConnection,
     s: &Seller,
     account: Uuid,
-) -> Option<i64> {
+) -> Option<String> {
     raw.query_one_raw(pg(format!(
-        "SELECT balance_minor FROM bss.ledger_account_balance \
+        "SELECT balance FROM bss.ledger_account_balance \
          WHERE tenant_id='{}' AND account_id='{}' AND currency='USD'",
         s.tenant, account
     )))
     .await
     .unwrap()
-    .map(|r| r.try_get_by_index::<i64>(0).unwrap())
+    .map(|r| r.try_get_by_index::<String>(0).unwrap())
 }
 
 fn settle_svc(provider: &DBProvider<DbError>) -> SettlementService {
@@ -190,7 +204,7 @@ async fn settle(provider: &DBProvider<DbError>, s: &Seller, payment_id: &str, gr
 /// Settle `gross` with a PSP `fee` (Model N): `settle` posts `DR CASH_CLEARING
 /// (gross − fee) · DR PSP_FEE_EXPENSE (fee) · CR UNALLOCATED (gross)`, so
 /// `CASH_CLEARING` holds only **net**; the counter row is seeded
-/// `settled_minor = gross`, `fee_minor = fee`.
+/// `settled = gross`, `fee = fee`.
 async fn settle_with_fee(
     provider: &DBProvider<DbError>,
     s: &Seller,
@@ -206,9 +220,9 @@ async fn settle_with_fee(
                 tenant_id: s.tenant,
                 payer_tenant_id: s.payer,
                 payment_id: payment_id.to_owned(),
-                gross_minor: gross,
-                fee_minor: fee,
-                currency: "USD".to_owned(),
+                gross: usd(gross),
+
+                fee: usd(fee),
                 effective_at: None,
             },
         )
@@ -227,13 +241,12 @@ fn return_input(
         payer_tenant_id: s.payer,
         payment_id: payment_id.to_owned(),
         psp_return_id: psp_return_id.to_owned(),
-        amount_minor: amount,
-        currency: "USD".to_owned(),
+        amount: usd(amount),
         effective_at: None,
     }
 }
 
-/// A return after a settle decrements `settled_minor` and drains the pool by the
+/// A return after a settle decrements `settled` and drains the pool by the
 /// returned amount (settle 1000, return 400 ⇒ settled 600, pool 600).
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
@@ -258,18 +271,18 @@ async fn return_decrements_settled_and_pool() {
         .await
         .unwrap()
         .expect("settlement row present");
-    assert_eq!(row.settled_minor, 600, "settled decremented by the return");
+    assert_eq!(row.settled, usd(600), "settled decremented by the return");
     assert_eq!(
         repo.read_unallocated(&scope, s.tenant, s.payer, "USD")
             .await
             .unwrap(),
-        600,
+        Some(usd(600)),
         "pool drained by the returned amount"
     );
 }
 
 /// A re-posted return (same `psp_return_id`) replays idempotently — the second
-/// call returns `replayed = true` and `settled_minor` decrements exactly once.
+/// call returns `replayed = true` and `settled` decrements exactly once.
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn return_replay_is_idempotent() {
@@ -309,14 +322,14 @@ async fn return_replay_is_idempotent() {
         .await
         .unwrap()
         .expect("settlement row present");
-    assert_eq!(row.settled_minor, 600, "decrement applied once, not twice");
+    assert_eq!(row.settled, usd(600), "decrement applied once, not twice");
 }
 
 /// A return exceeding a payment's OWN settled amount trips the per-payment cap
 /// CHECK and surfaces as `SettlementReturnOverAllocated`. A second settlement
 /// funds the SHARED unallocated pool so the 1500 return of PAY-3 does not
 /// underflow it (which would raise `NegativeBalance` first) — isolating PAY-3's
-/// `settled_minor` cap (you can't claw back more than this payment settled).
+/// `settled` cap (you can't claw back more than this payment settled).
 /// Mirrors `rest_payments::allocate_over_cap`. The row is left untouched (the
 /// whole post rolled back).
 #[tokio::test]
@@ -343,14 +356,15 @@ async fn return_exceeding_settled_is_rejected() {
         "expected SettlementReturnOverAllocated, got {err:?}"
     );
 
-    // The rejected return rolled back: settled_minor is still the full 1000.
+    // The rejected return rolled back: settled is still the full 1000.
     let row = PaymentRepo::new(provider.clone())
         .read_settlement(&scope, s.tenant, "PAY-3")
         .await
         .unwrap()
         .expect("settlement row present");
     assert_eq!(
-        row.settled_minor, 1000,
+        row.settled,
+        usd(1000),
         "rejected return left the row untouched"
     );
 }
@@ -361,7 +375,7 @@ async fn return_exceeding_settled_is_rejected() {
 /// symmetrically: `DR UNALLOCATED 100 · CR CASH_CLEARING 97 · CR PSP_FEE_EXPENSE
 /// 3` ⇒ CASH_CLEARING drained by the NET 97 (97 → 0, NOT by the gross 100, which
 /// would underflow the guarded clearing), PSP_FEE_EXPENSE reversed by 3 (3 → 0),
-/// the pool emptied, and BOTH `settled_minor` and `fee_minor` zeroed.
+/// the pool emptied, and BOTH `settled` and `fee` zeroed.
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn fee_bearing_full_return_reverses_net_and_fee() {
@@ -373,12 +387,12 @@ async fn fee_bearing_full_return_reverses_net_and_fee() {
     settle_with_fee(&provider, &s, "PAY-FEE", 100, 3).await;
     assert_eq!(
         account_balance(&raw, &s, s.cash).await,
-        Some(97),
+        Some(text(97)),
         "settle lands NET 97 in CASH_CLEARING"
     );
     assert_eq!(
         account_balance(&raw, &s, s.psp_fee).await,
-        Some(3),
+        Some(text(3)),
         "the 3 fee is expensed to PSP_FEE_EXPENSE"
     );
 
@@ -395,13 +409,13 @@ async fn fee_bearing_full_return_reverses_net_and_fee() {
     // CASH_CLEARING reversed by the NET 97 (→ 0), not the gross 100.
     assert_eq!(
         account_balance(&raw, &s, s.cash).await,
-        Some(0),
+        Some(text(0)),
         "CASH_CLEARING reversed by the net 97 (97 → 0)"
     );
     // PSP_FEE_EXPENSE reversed by the full fee 3 (→ 0).
     assert_eq!(
         account_balance(&raw, &s, s.psp_fee).await,
-        Some(0),
+        Some(text(0)),
         "PSP_FEE_EXPENSE reversed by the fee 3 (3 → 0)"
     );
     // The pool is emptied (gross 100 in at settle, 100 out at return).
@@ -410,7 +424,7 @@ async fn fee_bearing_full_return_reverses_net_and_fee() {
             .read_unallocated(&scope, s.tenant, s.payer, "USD")
             .await
             .unwrap(),
-        0,
+        Some(usd(0)),
         "the unallocated pool is emptied by the full return"
     );
     // BOTH counters zeroed (settled 100 → 0, fee 3 → 0).
@@ -419,10 +433,11 @@ async fn fee_bearing_full_return_reverses_net_and_fee() {
         .await
         .unwrap()
         .expect("settlement row present");
-    assert_eq!(row.settled_minor, 0, "settled_minor zeroed by the return");
+    assert_eq!(row.settled, usd(0), "settled zeroed by the return");
     assert_eq!(
-        row.fee_minor, 0,
-        "fee_minor zeroed by the proportional fee reverse"
+        row.fee,
+        usd(0),
+        "fee zeroed by the proportional fee reverse"
     );
 }
 
@@ -449,8 +464,12 @@ async fn return_in_wrong_currency_is_rejected() {
                 payer_tenant_id: s.payer,
                 payment_id: "PAY-XC".to_owned(),
                 psp_return_id: "RET-XC".to_owned(),
-                amount_minor: 400,
-                currency: "EUR".to_owned(), // != settled USD
+                // != settled USD
+                amount: PostedMoney::try_new(
+                    Decimal::new(400, 2),
+                    CurrencySpec::try_new("EUR".to_owned(), 2).unwrap(),
+                )
+                .unwrap(),
                 effective_at: None,
             },
         )
@@ -468,7 +487,8 @@ async fn return_in_wrong_currency_is_rejected() {
         .unwrap()
         .expect("settlement row present");
     assert_eq!(
-        row.settled_minor, 1000,
+        row.settled,
+        usd(1000),
         "a rejected return decrements nothing"
     );
 }

@@ -1250,7 +1250,7 @@ mod tests {
     #[test]
     fn each_pass_is_bounded_by_its_own_ceiling_and_names_it() {
         let migration = row_ceiling(
-            "gts.acme.gs._.thing.v1~",
+            toolkit_gts::gts_id!("acme.gs._.thing.v1~"),
             40_000,
             limits().bound(evolution::Decision::Migrate),
         )
@@ -1268,7 +1268,7 @@ mod tests {
         // The same size is well inside the read-only pass.
         assert!(
             row_ceiling(
-                "gts.acme.gs._.thing.v1~",
+                toolkit_gts::gts_id!("acme.gs._.thing.v1~"),
                 40_000,
                 limits().bound(evolution::Decision::Revalidate),
             )
@@ -1277,7 +1277,7 @@ mod tests {
         );
 
         let revalidation = row_ceiling(
-            "gts.acme.gs._.thing.v1~",
+            toolkit_gts::gts_id!("acme.gs._.thing.v1~"),
             250_000,
             limits().bound(evolution::Decision::Revalidate),
         )

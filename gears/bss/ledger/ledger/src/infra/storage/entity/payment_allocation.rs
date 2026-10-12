@@ -23,8 +23,9 @@ pub struct Model {
     pub invoice_id: String,
     pub payer_tenant_id: Uuid,
     pub payment_id: String,
-    pub amount_minor: i64,
+    pub amount: String,
     pub currency: String,
+    pub currency_scale: i16,
     pub precedence_policy_ref: String,
     pub allocated_at_utc: OffsetDateTime,
 }

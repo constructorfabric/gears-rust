@@ -1,8 +1,7 @@
 //! Repository for `multipart_uploads` and `multipart_upload_parts`.
 //!
-//! No tenant isolation at the entity level (no `tenant_id` column) —
-//! all queries use `AccessScope::allow_all()`. The tenant boundary is
-//! enforced through the parent `files` row before a session is created.
+//! No `tenant_id` column, so all queries use `AccessScope::allow_all()`; the tenant
+//! boundary is enforced through the parent `files` row before a session is created.
 
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder, Set};
 use time::OffsetDateTime;
@@ -14,7 +13,6 @@ use uuid::Uuid;
 
 use crate::domain::error::DomainError;
 use crate::domain::multipart::{MultipartPart, MultipartUploadSession, MultipartUploadState};
-use crate::infra::storage::db::db_err;
 use crate::infra::storage::entity::multipart_upload::{
     ActiveModel as UploadActiveModel, Column as UploadColumn, Entity as UploadEntity,
     Model as UploadModel,
@@ -65,10 +63,9 @@ impl MultipartRepo {
             created_at: Set(now),
             expires_at: Set(expires_at),
         };
-        // No tenant scope on this table — allow_all() is correct here.
         secure_insert::<UploadEntity>(am, &AccessScope::allow_all(), conn)
             .await
-            .map_err(db_err)?;
+            .map_err(DomainError::from)?;
         Ok(())
     }
 
@@ -84,23 +81,16 @@ impl MultipartRepo {
             .scope_with(&AccessScope::allow_all())
             .one(conn)
             .await
-            .map_err(db_err)?;
+            .map_err(DomainError::from)?;
         found.map(session_from_model).transpose()
     }
 
-    /// Compare-and-set the `state` of a multipart upload session: transition to
-    /// `new_state` only if the row is currently in `expected_state`. Returns
-    /// `true` if a row matched and was updated, `false` on a stale transition
-    /// (e.g. a `complete`/`abort` race where another writer already moved it).
+    /// Compare-and-set the session `state`: transitions only if currently
+    /// `expected_state`. Returns `false` on a stale transition (e.g. a
+    /// `complete`/`abort` race).
     ///
-    /// `mime_validated`, when `Some`, is set in the **same** UPDATE statement
-    /// (P2 remediation item 1.10) — used by the `in_progress` → `completed`
-    /// transition to flip `mime_validated` to `true` alongside the state
-    /// change, since `complete_multipart_upload` only reaches this call after
-    /// the assembled object's content has already been sniffed and validated
-    /// against the declared MIME type. The `in_progress` → `aborted`
-    /// transition passes `None` — an aborted upload's content was never
-    /// validated.
+    /// `mime_validated`, when `Some`, is set in the same UPDATE (`complete` passes
+    /// `true` after sniffing; `abort` passes `None`).
     pub async fn update_state<C: DBRunner>(
         &self,
         conn: &C,
@@ -125,31 +115,15 @@ impl MultipartRepo {
             .scope_with(&AccessScope::allow_all())
             .exec(conn)
             .await
-            .map_err(db_err)?;
+            .map_err(DomainError::from)?;
         Ok(res.rows_affected > 0)
     }
 
-    /// Force-set a session's `expires_at`, unconditionally.
+    /// Force-set a session's `expires_at`. **Test-support only; do not call in
+    /// production.**
     ///
-    /// **Test-support only; do not call in production.** Production code
-    /// never mutates `expires_at` after a session is created — calling this
-    /// bypasses that invariant. This exists so unit tests can
-    /// deterministically simulate "time passing" on an already-created
-    /// (possibly already-completed) session without a real sleep or
-    /// concurrency, per the unit-testing doctrine (P2 0.3 --
-    /// `sweep_after_complete_wins_does_not_delete_bound_version` in
-    /// `cleanup_test.rs` backdates a session's `expires_at` *after* a
-    /// successful `complete_multipart_upload`, which the P2 0.3 step-3
-    /// defense-in-depth check would otherwise reject if the session were
-    /// built with a past `expires_at` from the start).
-    ///
-    /// `#[doc(hidden)]` rather than a `test-support` Cargo feature: this
-    /// method is called from the external integration-test crate
-    /// `tests/cleanup_test.rs`, so `#[cfg(test)]` alone would not reach it,
-    /// and gating it behind a non-default feature would make the standard
-    /// `cargo test -p cf-gears-file-storage` command fail to compile that
-    /// test (or silently skip it via `required-features`) unless every
-    /// caller — including CI — also passed `--features test-support`.
+    /// `#[doc(hidden)]` rather than a feature or `#[cfg(test)]` because it is used by
+    /// the external integration-test crate and a feature would break plain `cargo test`.
     #[doc(hidden)]
     pub async fn set_expires_at<C: DBRunner>(
         &self,
@@ -165,7 +139,7 @@ impl MultipartRepo {
             .scope_with(&AccessScope::allow_all())
             .exec(conn)
             .await
-            .map_err(db_err)?;
+            .map_err(DomainError::from)?;
         Ok(())
     }
 
@@ -182,7 +156,6 @@ impl MultipartRepo {
         size: i64,
         now: OffsetDateTime,
     ) -> Result<(), DomainError> {
-        // Delete existing row with the same PK first (insert-or-replace semantics).
         PartEntity::delete_many()
             .filter(
                 sea_orm::Condition::all()
@@ -193,7 +166,7 @@ impl MultipartRepo {
             .scope_with(&AccessScope::allow_all())
             .exec(conn)
             .await
-            .map_err(db_err)?;
+            .map_err(DomainError::from)?;
 
         let am = PartActiveModel {
             upload_id: Set(upload_id),
@@ -205,7 +178,7 @@ impl MultipartRepo {
         };
         secure_insert::<PartEntity>(am, &AccessScope::allow_all(), conn)
             .await
-            .map_err(db_err)?;
+            .map_err(DomainError::from)?;
         Ok(())
     }
 
@@ -222,14 +195,11 @@ impl MultipartRepo {
             .scope_with(&AccessScope::allow_all())
             .all(conn)
             .await
-            .map_err(db_err)?;
+            .map_err(DomainError::from)?;
         rows.into_iter().map(part_from_model).collect()
     }
 
-    /// List all `in_progress` upload sessions whose `expires_at` is before `now`.
-    /// Used by the orphan-reconciliation sweep to clean up stale sessions.
-    ///
-    /// @cpt-cf-file-storage-fr-orphan-reconciliation
+    /// List `in_progress` sessions whose `expires_at` is before `now` (for the sweep).
     pub async fn list_expired<C: DBRunner>(
         &self,
         conn: &C,
@@ -246,21 +216,15 @@ impl MultipartRepo {
             .scope_with(&AccessScope::allow_all())
             .all(conn)
             .await
-            .map_err(db_err)?;
+            .map_err(DomainError::from)?;
         rows.into_iter().map(session_from_model).collect()
     }
 
-    /// Whether `file_id` has at least one `in_progress` multipart upload
-    /// session, regardless of its `expires_at`.
+    /// Whether `file_id` has an `in_progress` session, regardless of `expires_at`.
     ///
-    /// Used by the P2 2.8 orphan-file-reconciliation guard: a file's pending
-    /// version can look "abandoned" to [`Self::list_expired`]'s sibling sweep
-    /// step (`sweep_abandoned_pending`, keyed only on the version's age) even
-    /// while it is the live target of a *not-yet-expired* multipart session --
-    /// deleting the parent `files` row in that window would `ON DELETE
-    /// CASCADE` the still-`in_progress` session out from under the upload.
-    ///
-    /// @cpt-cf-file-storage-fr-orphan-reconciliation
+    /// Guards orphan-file reconciliation: a pending version keyed only on age can look
+    /// abandoned while a not-yet-expired session uses it, and deleting the `files`
+    /// row would cascade the session away.
     pub async fn has_in_progress_for_file<C: DBRunner>(
         &self,
         conn: &C,
@@ -276,7 +240,7 @@ impl MultipartRepo {
             .scope_with(&AccessScope::allow_all())
             .count(conn)
             .await
-            .map_err(db_err)?;
+            .map_err(DomainError::from)?;
         Ok(count > 0)
     }
 }

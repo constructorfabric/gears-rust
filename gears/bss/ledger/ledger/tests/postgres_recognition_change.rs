@@ -39,7 +39,6 @@ use bss_ledger::config::{FxConfig, RecognitionConfig};
 use bss_ledger::domain::error::DomainError;
 use bss_ledger::domain::invoice::builder::{InvoiceItem, PostedInvoice, TaxBreakdown};
 use bss_ledger::domain::model::{AccountRow, CurrencyScaleRow};
-use bss_ledger::domain::money::DEFAULT_PLAUSIBLE_MAX_MAJOR;
 use bss_ledger::domain::recognition::input::{RecognitionInput, RecognitionTiming};
 use bss_ledger::infra::events::publisher::LedgerEventPublisher;
 use bss_ledger::infra::invoice_post::InvoicePostService;
@@ -60,6 +59,33 @@ use uuid::Uuid;
 
 fn pg(sql: impl Into<String>) -> Statement {
     Statement::from_string(sea_orm::DatabaseBackend::Postgres, sql.into())
+}
+
+/// A USD scale-2 posting from a cent count (`1234` ⇒ `12.34`): the old
+/// minor-unit fixtures expressed as validated major-unit money.
+fn usd_cents(minor: i64) -> bss_ledger_sdk::PostedMoney {
+    bss_ledger_sdk::PostedMoney::try_new(
+        rust_decimal::Decimal::new(minor, 2),
+        bss_ledger_sdk::CurrencySpec::try_new("USD".to_owned(), 2).unwrap(),
+    )
+    .unwrap()
+}
+
+/// Validated USD scale-2 money from canonical stored text (`"12.34"`).
+fn usd_text(text: &str) -> bss_ledger_sdk::PostedMoney {
+    bss_ledger_sdk::PostedMoney::try_new(
+        bss_ledger_sdk::parse_decimal(text).unwrap(),
+        bss_ledger_sdk::CurrencySpec::try_new("USD".to_owned(), 2).unwrap(),
+    )
+    .unwrap()
+}
+
+/// Read one canonical decimal TEXT money column as USD scale-2 money.
+async fn scalar_money(conn: &DatabaseConnection, sql: &str) -> Option<bss_ledger_sdk::PostedMoney> {
+    conn.query_one_raw(pg(sql.to_owned()))
+        .await
+        .unwrap()
+        .map(|r| usd_text(&r.try_get_by_index::<String>(0).unwrap()))
 }
 
 async fn scalar_i64(conn: &DatabaseConnection, sql: &str) -> Option<i64> {
@@ -151,8 +177,7 @@ async fn setup(url: &str) -> (DatabaseConnection, DBProvider<DbError>, Seller) {
         .upsert_currency_scale(CurrencyScaleRow {
             tenant_id: s.tenant,
             currency: "USD".to_owned(),
-            minor_units: 2,
-            plausible_max_major: DEFAULT_PLAUSIBLE_MAX_MAJOR,
+            currency_scale: 2,
             source: "iso".to_owned(),
         })
         .await
@@ -197,9 +222,8 @@ async fn setup(url: &str) -> (DatabaseConnection, DBProvider<DbError>, Seller) {
 
 fn recognized_item(amount: i64, periods: u32, first_period: &str, item_ref: &str) -> InvoiceItem {
     InvoiceItem {
-        amount_minor_ex_tax: amount,
-        deferred_minor: 0,
-        currency: "USD".to_owned(),
+        amount_ex_tax: usd_cents(amount),
+        deferred: usd_cents(0),
         revenue_stream: "subscription".to_owned(),
         catalog_class: Some(AccountClass::Revenue),
         contract_class: None,
@@ -263,11 +287,15 @@ fn change_svc(provider: &DBProvider<DbError>) -> RecognitionChangeService {
     RecognitionChangeService::new(provider.clone(), Arc::new(LedgerEventPublisher::noop()))
 }
 
-async fn bal(raw: &DatabaseConnection, s: &Seller, account: Uuid) -> Option<i64> {
-    scalar_i64(
+async fn bal(
+    raw: &DatabaseConnection,
+    s: &Seller,
+    account: Uuid,
+) -> Option<bss_ledger_sdk::PostedMoney> {
+    scalar_money(
         raw,
         &format!(
-            "SELECT balance_minor FROM bss.ledger_account_balance \
+            "SELECT balance FROM bss.ledger_account_balance \
              WHERE tenant_id='{}' AND account_id='{}' AND currency='USD'",
             s.tenant, account
         ),
@@ -301,11 +329,15 @@ async fn schedule_status(raw: &DatabaseConnection, s: &Seller, schedule: &str) -
     .await
 }
 
-async fn total_deferred(raw: &DatabaseConnection, s: &Seller, schedule: &str) -> Option<i64> {
-    scalar_i64(
+async fn total_deferred(
+    raw: &DatabaseConnection,
+    s: &Seller,
+    schedule: &str,
+) -> Option<bss_ledger_sdk::PostedMoney> {
+    scalar_money(
         raw,
         &format!(
-            "SELECT total_deferred_minor FROM bss.ledger_recognition_schedule \
+            "SELECT total_deferred FROM bss.ledger_recognition_schedule \
              WHERE tenant_id='{}' AND schedule_id='{schedule}'",
             s.tenant
         ),
@@ -356,10 +388,11 @@ async fn active_schedule_count(raw: &DatabaseConnection, s: &Seller, invoice_id:
     .await
 }
 
+/// A change segment of `amount` cents (`1000` ⇒ `10.00` USD).
 fn seg(period_id: &str, amount: i64) -> ChangeSegment {
     ChangeSegment {
         period_id: period_id.to_owned(),
-        amount_minor: amount,
+        money: usd_cents(amount),
     }
 }
 
@@ -392,7 +425,7 @@ async fn replace_prospective_re_plans_remaining_and_old_segments_do_not_release(
     let old = active_schedule_id(&raw, &s, "INV-RPL").await;
     assert_eq!(
         bal(&raw, &s, s.contract_liability).await,
-        Some(1200),
+        Some(usd_cents(1200)),
         "fully deferred"
     );
 
@@ -407,12 +440,12 @@ async fn replace_prospective_re_plans_remaining_and_old_segments_do_not_release(
     );
     assert_eq!(
         bal(&raw, &s, s.contract_liability).await,
-        Some(800),
+        Some(usd_cents(800)),
         "remaining deferred"
     );
     assert_eq!(
         bal(&raw, &s, s.revenue).await,
-        Some(400),
+        Some(usd_cents(400)),
         "period 1 recognized"
     );
 
@@ -454,7 +487,7 @@ async fn replace_prospective_re_plans_remaining_and_old_segments_do_not_release(
     );
     assert_eq!(
         total_deferred(&raw, &s, &new_id).await,
-        Some(800),
+        Some(usd_cents(800)),
         "remaining re-planned"
     );
     assert_eq!(
@@ -478,12 +511,12 @@ async fn replace_prospective_re_plans_remaining_and_old_segments_do_not_release(
     // No compensating entry: CL + Revenue unchanged by the replace itself.
     assert_eq!(
         bal(&raw, &s, s.contract_liability).await,
-        Some(800),
+        Some(usd_cents(800)),
         "CL unchanged by replace"
     );
     assert_eq!(
         bal(&raw, &s, s.revenue).await,
-        Some(400),
+        Some(usd_cents(400)),
         "Revenue unchanged by replace"
     );
 
@@ -516,12 +549,12 @@ async fn replace_prospective_re_plans_remaining_and_old_segments_do_not_release(
     // Books: CL fully drained (800 released), Revenue == 1200 total (400 + 800).
     assert_eq!(
         bal(&raw, &s, s.contract_liability).await,
-        Some(0),
+        Some(usd_cents(0)),
         "CL drained via the new schedule"
     );
     assert_eq!(
         bal(&raw, &s, s.revenue).await,
-        Some(1200),
+        Some(usd_cents(1200)),
         "all recognized, none double"
     );
 }
@@ -550,7 +583,7 @@ async fn cancel_marks_cancelled_and_later_run_releases_nothing() {
     let sched = active_schedule_id(&raw, &s, "INV-CXL").await;
     assert_eq!(
         bal(&raw, &s, s.contract_liability).await,
-        Some(600),
+        Some(usd_cents(600)),
         "deferred"
     );
 
@@ -579,7 +612,7 @@ async fn cancel_marks_cancelled_and_later_run_releases_nothing() {
     );
     assert_eq!(
         bal(&raw, &s, s.contract_liability).await,
-        Some(600),
+        Some(usd_cents(600)),
         "remainder stays as CL"
     );
 
@@ -595,7 +628,7 @@ async fn cancel_marks_cancelled_and_later_run_releases_nothing() {
     );
     assert_eq!(
         bal(&raw, &s, s.contract_liability).await,
-        Some(600),
+        Some(usd_cents(600)),
         "still deferred"
     );
     assert_eq!(bal(&raw, &s, s.revenue).await, None, "nothing recognized");

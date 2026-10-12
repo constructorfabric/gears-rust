@@ -11,8 +11,10 @@ use crate::{DbError, DbHandle, Result};
 /// Database connection options using typed sqlx `ConnectOptions`.
 #[derive(Debug, Clone)]
 pub(crate) enum DbConnectOptions {
+    /// Connect options for a SQLite database.
     #[cfg(feature = "sqlite")]
     Sqlite(sqlx::sqlite::SqliteConnectOptions),
+    /// Connect options for a PostgreSQL database.
     #[cfg(feature = "pg")]
     Postgres(sqlx::postgres::PgConnectOptions),
     #[cfg(feature = "mysql")]

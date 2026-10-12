@@ -129,6 +129,7 @@ impl SyncScope {
 ///
 /// These are fetched once per issue or pull request and dominate the API-call
 /// cost of a sync, so the useful default is the open working set.
+#[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CollectionMode {
@@ -177,6 +178,7 @@ impl CollectionMode {
 ///
 /// Independent of [`SyncScope`]: that decides whether issues are mirrored at
 /// all, this decides whether each mirrored issue also costs a reactions call.
+#[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CollectionScope {

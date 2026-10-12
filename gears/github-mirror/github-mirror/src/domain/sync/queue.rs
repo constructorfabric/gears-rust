@@ -23,6 +23,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use chrono::{DateTime, Utc};
 use strum::IntoEnumIterator as _;
+use toolkit_macros::domain_model;
 use uuid::Uuid;
 
 use super::task::{ExtractionTask, Lane, NewTask, RunIdentity, TaskKind, TaskPhase, TaskStatus};
@@ -113,6 +114,7 @@ impl Inner {
 
 /// In-memory pull-based task queue. Cheaply cloneable: the indexed state is
 /// shared behind an `Arc<Mutex<_>>`.
+#[domain_model]
 #[derive(Debug, Clone, Default)]
 pub struct TaskQueue {
     inner: Arc<Mutex<Inner>>,

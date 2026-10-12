@@ -131,8 +131,8 @@ Design-introduced names (Slice 3):
 
 | Name | Meaning |
 |------|---------|
-| `invoice_exposure` | Per-invoice guarded counter `(tenant, invoice_id, original_total_minor, debit_note_total_minor, credit_note_total_minor)` with `CHECK (credit_note_total_minor ≤ original_total_minor + debit_note_total_minor)` — the **headroom cap** serialization point (AC #24). |
-| `payment_allocation_refund` | Per-`(payment, invoice)` guarded counter `(tenant, payment_id, invoice_id, allocated_minor, refunded_minor)` with `CHECK (refunded_minor ≤ allocated_minor)` — the **per-invoice refund cap** serialization point (AC #6, PRD). Created + `allocated_minor`-maintained by **Slice 2's AllocationHandler at allocation time** (migration moved to Slice 2); this feature adds the `refunded_minor` consumption + `CHECK`s. A refund against a `(payment, invoice)` pair with no counter row simply means "nothing allocated" → `REFUND_EXCEEDS_ALLOCATED`. |
+| `invoice_exposure` | Per-invoice guarded counter `(tenant, invoice_id, currency, currency_scale, original_total, debit_note_total, credit_note_total)` — canonical decimal text in major units — with `CHECK (credit_note_total ≤ original_total + debit_note_total)` — the **headroom cap** serialization point (AC #24). |
+| `payment_allocation_refund` | Per-`(payment, invoice)` guarded counter `(tenant, payment_id, invoice_id, currency, currency_scale, allocated, refunded)` with `CHECK (refunded ≤ allocated)` — the **per-invoice refund cap** serialization point (AC #6, PRD). Created + `allocated`-maintained by **Slice 2's AllocationHandler at allocation time** (migration moved to Slice 2); this feature adds the `refunded` consumption + `CHECK`s. A refund against a `(payment, invoice)` pair with no counter row simply means "nothing allocated" → `REFUND_EXCEEDS_ALLOCATED`. |
 | `credit_note` / `debit_note` | Records linking a note to its originating posted invoice + the recognized/deferred split basis. |
 | `refund` | Ledger record of an approved refund: PSP refund id, **mandatory origin `payment_id` + `currency` — both patterns**, phase (incl. terminal `unknown_final`), pattern (A/B), amounts, clearing state, optional forward link. |
 
@@ -210,7 +210,7 @@ All handlers (and governed manual postings via `GOV`) post **through** the inher
 6. [ ] - `p1` - Algorithm: enforce the headroom/cumulative cap via `cpt-cf-bss-ledger-algo-credit-note-headroom-cap`; **IF** over cap **RETURN** 422 `CREDIT_NOTE_EXCEEDS_HEADROOM` - `inst-cn-headroom`
 7. [ ] - `p1` - Compose the compensating entry (strict posting shape; zero-amount Contract-liability placeholder lines are **rejected** at post-time validation, inherited S1 / AC #4): DR `CONTRA_REVENUE` (reduce recognized revenue, ex-tax) · DR `CONTRACT_LIABILITY` (reduce unreleased deferred, ex-tax) · DR `TAX_PAYABLE` (reverse tax) · CR `AR` (incl. tax, up to current open AR) · CR `REUSABLE_CREDIT` (remainder beyond open AR on a paid invoice, `credit_grant_event_type = CREDIT_NOTE`) - `inst-cn-compose`
 8. [ ] - `p1` - **IF** AR-only goodwill (no revenue restatement): debit `GOODWILL` (D3) instead — MUST NOT use `CONTRA_REVENUE` when no recognized revenue is reduced; not bad-debt; bounded by the `ar_invoice_balance` NO-negative floor (a goodwill credit exceeding open AR is **rejected**, never walleted) - `inst-cn-goodwill`
-9. [ ] - `p1` - Same ACID txn under the unified lock order: post via `PostingService`; reduce the owning `recognition_schedule` (deferred portion); update `invoice_exposure.credit_note_total_minor`; seed the wallet sub-grain (`reusable_credit_subbalance`, Slice 2) for any `REUSABLE_CREDIT` remainder - `inst-cn-txn`
+9. [ ] - `p1` - Same ACID txn under the unified lock order: post via `PostingService`; reduce the owning `recognition_schedule` (deferred portion); update `invoice_exposure.credit_note_total` (exact decimal add, version-guarded); seed the wallet sub-grain (`reusable_credit_subbalance`, Slice 2) for any `REUSABLE_CREDIT` remainder - `inst-cn-txn`
 10. [ ] - `p1` - DB: insert the `credit_note` row (amounts, recognized/deferred parts, `split_basis_ref`, `reason_code`) — **never** change posted invoice rows (compensating only) - `inst-cn-record`
 11. [ ] - `p1` - Outbox: `billing.ledger.credit_note.posted` - `inst-cn-event`
 12. [ ] - `p1` - **RETURN** 201 Created (credit note + entry reference) - `inst-cn-return`
@@ -236,7 +236,7 @@ All handlers (and governed manual postings via `GOV`) post **through** the inher
 4. [ ] - `p1` - Validate posted tax evidence: MUST carry `TaxBreakdown` → `TAX_PAYABLE`, never recomputed - `inst-dn-tax`
 5. [ ] - `p1` - Compose the direct split (mirrors S1; no zero-placeholder CL line; if fully recognized, no CL line): DR `AR` (incl. tax) · CR `REVENUE` (recognized at post) · CR `CONTRACT_LIABILITY` (deferred per PO, if any) · CR `TAX_PAYABLE` - `inst-dn-compose`
 6. [ ] - `p1` - **IF** a deferred CL credit exists: trigger the Slice 4 `ScheduleBuilder` **in the same atomic unit (D4)** so the new deferred balance is immediately recognizable (no stuck liability) - `inst-dn-schedule`
-7. [ ] - `p1` - Same ACID txn: post via `PostingService` (balanced-or-rollback; **never** change posted rows); raise the headroom: `invoice_exposure.debit_note_total_minor += amount` - `inst-dn-txn`
+7. [ ] - `p1` - Same ACID txn: post via `PostingService` (balanced-or-rollback; **never** change posted rows); raise the headroom: `invoice_exposure.debit_note_total += amount` (exact decimal add, version-guarded) - `inst-dn-txn`
 8. [ ] - `p1` - DB: insert the `debit_note` row; Outbox: `billing.ledger.debit_note.posted` - `inst-dn-record`
 9. [ ] - `p1` - **RETURN** 201 Created - `inst-dn-return`
 
@@ -259,7 +259,7 @@ All handlers (and governed manual postings via `GOV`) post **through** the inher
 - Refund before the original payment → 202 Accepted with body status token `refund-quarantined` (never posted)
 
 **Steps**:
-1. [ ] - `p1` - API: POST /v1/ledger/refunds (body: `psp_refund_id`, `phase`, `pattern` (A_UNALLOCATED | B_RESTORE_AR), **mandatory** origin `payment_id` + `currency` — both patterns, `invoice_id` (required for Pattern B), `amount_minor`, optional `relates_to_refund_id`) - `inst-rf-api`
+1. [ ] - `p1` - API: POST /v1/ledger/refunds (body: `psp_refund_id`, `phase`, `pattern` (A_UNALLOCATED | B_RESTORE_AR), **mandatory** origin `payment_id` + `currency` — both patterns, `invoice_id` (required for Pattern B), `amount` as `MoneyDto` `{amount, currency, currency_scale}` in major units, optional `relates_to_refund_id`) - `inst-rf-api`
 2. [ ] - `p1` - Idempotency: claim `(tenant, REFUND, psp_refund_id:phase)` — `business_id = psp_refund_id:phase`, single string in the Slice 1 `(tenant_id, flow, business_id)` PK (shape unchanged) - `inst-rf-idem`
 3. [ ] - `p1` - **IF** the origin payment is unresolvable (refund before the original payment): quarantine via `cpt-cf-bss-ledger-algo-refund-quarantine`; **RETURN** 202 Accepted, body token `refund-quarantined` + correlation handle (no SCREAMING_SNAKE code on a 202) - `inst-rf-quarantine`
 4. [ ] - `p1` - **IF** amount ≥ the D2 dual-control threshold **AND** no approval **RETURN** 409 `DUAL_CONTROL_REQUIRED` (USD-equivalent comparison per D2) - `inst-rf-dual-control`
@@ -340,8 +340,8 @@ All handlers (and governed manual postings via `GOV`) post **through** the inher
 1. [ ] - `p1` - Derive the split (`RecognizedDeferredSplitter`) from the targeted posted invoice item, PO/allocation group, and **recognition-schedule state** (Slice 4) at the credit-note effective time - `inst-split-derive`
 2. [ ] - `p1` - **IF** the split is ambiguous: **RETURN** block — RFC 9457 code `CREDIT_NOTE_SPLIT_AMBIGUOUS` + an `exception_queue` row of type `SPLIT_AMBIGUOUS` (Slice 7), **no silent pro-rata** (PRD) - `inst-split-ambiguous`
 3. [ ] - `p1` - **FOR EACH** revenue stream on a multi-stream invoice item: split the deferred reduction **per revenue_stream** so each `CONTRACT_LIABILITY` debit (and the schedule it reduces) keeps the **same stream** as the line it reduces (Slice 4 one-schedule-per-stream); **IF** the per-stream split is indeterminable, **block-on-ambiguous** - `inst-split-stream`
-4. [ ] - `p1` - **Schedule reduction (critical).** When the credit note debits `CONTRACT_LIABILITY` for a deferred portion, in the **same ACID txn** **reduce the owning `recognition_schedule`**: decrement `total_deferred_minor` over the **not-yet-released remainder** (mirroring Slice 4 re-version semantics — already-released segments are never recomputed), or mark the schedule `REPLACED`/versioned. This guarantees a later S6 run cannot re-recognize the credited-back amount (remaining releasable = reduced Contract liability for that obligation) - `inst-split-schedule`
-5. [ ] - `p1` - Bound the deferred-portion debit by the schedule's remaining releasable amount (`total_deferred_minor − recognized_minor`); Slice 4's `recognized_minor ≤ total_deferred_minor` `CHECK` — now also written by S3 under the lock order — is the authoritative guard against over-reducing an in-flight schedule. `recognition_schedule`/`recognition_segment` are acquired in the shared lock order. *(Slice 4 lists S3 credit notes as an authorized prospective-reduction trigger.)* - `inst-split-bound`
+4. [ ] - `p1` - **Schedule reduction (critical).** When the credit note debits `CONTRACT_LIABILITY` for a deferred portion, in the **same ACID txn** **reduce the owning `recognition_schedule`**: decrement `total_deferred` over the **not-yet-released remainder** (mirroring Slice 4 re-version semantics — already-released segments are never recomputed), or mark the schedule `REPLACED`/versioned. This guarantees a later S6 run cannot re-recognize the credited-back amount (remaining releasable = reduced Contract liability for that obligation) - `inst-split-schedule`
+5. [ ] - `p1` - Bound the deferred-portion debit by the schedule's remaining releasable amount (`total_deferred − recognized`, exact); Slice 4's `recognized ≤ total_deferred` `CHECK` — now also written by S3 under the lock order — is the authoritative guard against over-reducing an in-flight schedule. `recognition_schedule`/`recognition_segment` are acquired in the shared lock order. *(Slice 4 lists S3 credit notes as an authorized prospective-reduction trigger.)* - `inst-split-bound`
 6. [ ] - `p1` - **RETURN** the split + record `split_basis_ref` (PO/allocation group + schedule state at effective time) on the `credit_note` row - `inst-split-return`
 
 ### Credit-Note Headroom Cap
@@ -352,8 +352,8 @@ All handlers (and governed manual postings via `GOV`) post **through** the inher
 **Output**: cap consumed under the lock order, or `CREDIT_NOTE_EXCEEDS_HEADROOM`
 
 **Steps**:
-1. [ ] - `p1` - DB: seed `invoice_exposure.original_total_minor` **at first touch** = the invoice's posted AR (incl. tax) read from `journal_line`, via `INSERT … ON CONFLICT DO UPDATE` (Slice 1 first-touch upsert, so concurrent creators serialize, no duplicate-key) - `inst-cap-seed`
-2. [ ] - `p1` - Enforce (AC #24): new credit note (incl. tax) ≤ `original_total + Σ S4 debit notes − Σ prior credit notes` — the DB `CHECK (credit_note_total_minor ≤ original_total_minor + debit_note_total_minor)` on the locked `invoice_exposure` row, under the lock order (never handler-only) - `inst-cap-check`
+1. [ ] - `p1` - DB: seed `invoice_exposure.original_total` **at first touch** = the invoice's posted AR (incl. tax) read from `journal_line` and summed exactly (`sum_posted`), stored as canonical decimal text with the invoice's `currency_scale`; a concurrent first-touch insert is a conflict that retries the transaction, no duplicate-key - `inst-cap-seed`
+2. [ ] - `p1` - Enforce (AC #24): new credit note (incl. tax) ≤ `original_total + Σ S4 debit notes − Σ prior credit notes` (exact decimals, same currency and stored scale) — the DB `CHECK (credit_note_total ≤ original_total + debit_note_total)` (as `::numeric` on PostgreSQL) on the version-guarded `invoice_exposure` row, under the lock order (never handler-only) - `inst-cap-check`
 3. [ ] - `p1` - **IF** over cap **RETURN** `CREDIT_NOTE_EXCEEDS_HEADROOM` (422) — routes via goodwill/non-revenue or out-of-scope, never silently through S3 - `inst-cap-reject`
 4. [ ] - `p1` - The cap is unchanged by the split credit leg — it bounds total credit-note exposure regardless of the AR/wallet leg split. **Ratified 2026-06-15:** remainder → wallet (`REUSABLE_CREDIT`); converting it to **cash** is a **separate S5 withdrawal on the customer's request, never automatic** (needs-discussion D9) - `inst-cap-k2`
 
@@ -367,9 +367,9 @@ All handlers (and governed manual postings via `GOV`) post **through** the inher
 **Steps**:
 1. [ ] - `p1` - Resolve the origin `payment_settlement` row from the **mandatory** `payment_id` + `currency` (PSP refunds always reference an origin transaction; confirmation pending, needs-discussion D7) - `inst-rcap-resolve`
 2. [ ] - `p1` - At **stage-1 initiation**, under the rank-1 `payment_settlement` row lock with `CHECK`s evaluated post-delta (caps enforced **before** money leaves): - `inst-rcap-stage1`
-   1. [ ] - `p1` - **Both patterns**: increment `refunded_minor` — total money-out cap `CHECK (refunded_minor + clawed_back_minor ≤ settled_minor)` (`clawed_back_minor` maintained by Slice 2's ChargebackHandler) - `inst-rcap-both`
-   2. [ ] - `p1` - **Pattern A**: additionally increment `refunded_unallocated_minor` — spendable headroom `CHECK (allocated_minor + refunded_unallocated_minor ≤ settled_minor)` (a refunded payment's cash can never also be allocated) - `inst-rcap-a`
-   3. [ ] - `p1` - **Pattern B**: additionally increment the per-`(payment,invoice)` counter `payment_allocation_refund.refunded_minor` (`CHECK ≤ allocated_minor`); a missing counter row means "nothing allocated" → `REFUND_EXCEEDS_ALLOCATED` - `inst-rcap-b`
+   1. [ ] - `p1` - **Both patterns**: increment `refunded` — total money-out cap `CHECK (refunded + clawed_back ≤ settled)` (`clawed_back` maintained by Slice 2's ChargebackHandler); a refund whose currency or stored scale differs from the settlement's is rejected (`InconsistentScale`), never rescaled - `inst-rcap-both`
+   2. [ ] - `p1` - **Pattern A**: additionally increment `refunded_unallocated` — spendable headroom `CHECK (allocated + refunded_unallocated ≤ settled)` (a refunded payment's cash can never also be allocated) - `inst-rcap-a`
+   3. [ ] - `p1` - **Pattern B**: additionally increment the per-`(payment,invoice)` counter `payment_allocation_refund.refunded` (`CHECK ≤ allocated`); a missing counter row means "nothing allocated" → `REFUND_EXCEEDS_ALLOCATED` - `inst-rcap-b`
 3. [ ] - `p1` - A **stage-1 reversal** (PSP `rejected`/`voided`) **decrements** the same counters in the same txn that line-negates stage-1 and clears `REFUND_CLEARING` - `inst-rcap-reversal`
 4. [ ] - `p1` - Counters are maintained via the Foundation `applyCounterDelta` primitive — no DDL on the Slice-2-owned tables - `inst-rcap-primitive`
 
@@ -381,10 +381,10 @@ All handlers (and governed manual postings via `GOV`) post **through** the inher
 **Output**: money-out counter effect **set by economic direction, not the lifecycle template** (🔄)
 
 **Steps**:
-1. [ ] - `p1` - **IF** claw-back (canonical, money returns to the merchant): **decrement** the origin `payment_settlement.refunded_minor` (and `refunded_unallocated_minor` for a Pattern-A origin; `payment_allocation_refund.refunded_minor` for Pattern-B) under the rank-1 lock, in the posting txn, so the total money-out cap (`refunded_minor + clawed_back_minor ≤ settled_minor`) reflects **net** refunded and a legitimate claw-back never spuriously trips it; `REFUND_CLEARING` drains in the reverse direction - `inst-rofr-clawback`
+1. [ ] - `p1` - **IF** claw-back (canonical, money returns to the merchant): **decrement** the origin `payment_settlement.refunded` (and `refunded_unallocated` for a Pattern-A origin; `payment_allocation_refund.refunded` for Pattern-B) under the rank-1 lock, in the posting txn, so the total money-out cap (`refunded + clawed_back ≤ settled`) reflects **net** refunded and a legitimate claw-back never spuriously trips it; `REFUND_CLEARING` drains in the reverse direction - `inst-rofr-clawback`
 2. [ ] - `p1` - **IF** additional outbound refund (money leaves again): **increment** as a normal stage-1 refund, subject to the same cap - `inst-rofr-outbound`
-3. [ ] - `p1` - **Out-of-order / excess claw-back (deferred, never hard-fail).** **IF** the decrement **would take a money-out counter below zero** — the PSP claw-back event arrives **before/without** its matching prior outbound-refund stage-1 (so `refunded_minor`/`refunded_unallocated_minor`/`payment_allocation_refund.refunded_minor` has not yet been incremented), or claws back **more than was refunded** — MUST **NOT** apply the decrement and MUST **NOT** hard-abort the post on the `CHECK (… ≥ 0)`. **Defer** via the existing out-of-order mechanism: persist the payload in Slice 2's `pending_event_queue` and **retry** once the matching outbound-refund stage-1 lands and the decrement no longer underflows - `inst-rofr-underflow`
-4. [ ] - `p1` - **IF** a claw-back never reconciles past the aging threshold: **escalate to the `exception_queue`** (Slice 7; additive type `CLAWBACK_UNDERFLOW`) + Finance/Revenue-Assurance alert — never auto-posted, never silently dropped. This mirrors how Slice 2 defers out-of-order money-out events (e.g. `CHARGEBACK_ON_REFUNDED`) rather than aborting. The `CHECK (refunded_minor ≥ 0)` **remains as defense-in-depth** — it should never fire in normal flow precisely because an underflowing claw-back is **deferred, not applied** - `inst-rofr-escalate`
+3. [ ] - `p1` - **Out-of-order / excess claw-back (deferred, never hard-fail).** **IF** the decrement **would take a money-out counter below zero** — the PSP claw-back event arrives **before/without** its matching prior outbound-refund stage-1 (so `refunded`/`refunded_unallocated`/`payment_allocation_refund.refunded` has not yet been incremented — a missing `payment_allocation_refund` row counts as refunded `0`), or claws back **more than was refunded** — MUST **NOT** apply the decrement and MUST **NOT** hard-abort the post on the `CHECK (… ≥ 0)`. **Defer** via the existing out-of-order mechanism: persist the payload in Slice 2's `pending_event_queue` and **retry** once the matching outbound-refund stage-1 lands and the decrement no longer underflows - `inst-rofr-underflow`
+4. [ ] - `p1` - **IF** a claw-back never reconciles past the aging threshold: **escalate to the `exception_queue`** (Slice 7; additive type `CLAWBACK_UNDERFLOW`) + Finance/Revenue-Assurance alert — never auto-posted, never silently dropped. This mirrors how Slice 2 defers out-of-order money-out events (e.g. `CHARGEBACK_ON_REFUNDED`) rather than aborting. The `CHECK (refunded ≥ 0)` **remains as defense-in-depth** — it should never fire in normal flow precisely because an underflowing claw-back is **deferred, not applied** - `inst-rofr-escalate`
 5. [ ] - `p1` - **Open (needs-discussion D8):** which of the two the PSP's refund-of-refund event represents is ⏳ to be confirmed with Payments; the canonical default is **claw-back/decrement** - `inst-rofr-open`
 
 ### Tax and Revenue-Adjustment Routing
@@ -447,9 +447,9 @@ Routing table:
 **Output**: all guarded counters enforced by DB `CHECK` on a locked row (never handler-only), acquired in the single global lock order
 
 **Guarded counters**:
-1. [ ] - `p1` - **Credit-note headroom:** `invoice_exposure.credit_note_total_minor ≤ original_total_minor + debit_note_total_minor` (AC #24); `original_total_minor` seeded at first touch via `INSERT … ON CONFLICT DO UPDATE` - `inst-lock-headroom`
-2. [ ] - `p1` - **Aggregate money-out:** on `payment_settlement` — `allocated_minor + refunded_unallocated_minor ≤ settled_minor` (Pattern-A spendable headroom) **and** `refunded_minor + clawed_back_minor ≤ settled_minor` (total money-out; `clawed_back_minor` per Slice 2) - `inst-lock-moneyout`
-3. [ ] - `p1` - **Per-`(payment,invoice)` refund:** `payment_allocation_refund.refunded_minor ≤ allocated_minor` (AC #6 — the dedicated counter; `payment_allocation` itself stays INSERT-only) - `inst-lock-perinvoice`
+1. [ ] - `p1` - **Credit-note headroom:** `invoice_exposure.credit_note_total ≤ original_total + debit_note_total` (AC #24); `original_total` seeded at first touch (insert, then version-guarded updates) - `inst-lock-headroom`
+2. [ ] - `p1` - **Aggregate money-out:** on `payment_settlement` — `allocated + refunded_unallocated ≤ settled` (Pattern-A spendable headroom) **and** `refunded + clawed_back ≤ settled` (total money-out; `clawed_back` per Slice 2) - `inst-lock-moneyout`
+3. [ ] - `p1` - **Per-`(payment,invoice)` refund:** `payment_allocation_refund.refunded ≤ allocated` (AC #6 — the dedicated counter; `payment_allocation` itself stays INSERT-only) - `inst-lock-perinvoice`
 4. [ ] - `p1` - **AR floor for goodwill:** the Slice 1 `ar_invoice_balance` NO-negative `CHECK` (goodwill + S3 cannot jointly over-reduce AR); the headroom GET reflects true remaining AR - `inst-lock-arfloor`
 
 **Lock order & out-of-order**:
@@ -486,7 +486,7 @@ Routing table:
 
 ## 5. API Surface
 
-REST per `rest-api-design`, behind the inbound API gateway; money as `{amountMinor, currency, scale}`. The inherited AC #19 contract applies to all Slice 3 flows (`CREDIT_NOTE`/`DEBIT_NOTE`/`REFUND`/`MANUAL_ADJUSTMENT`): same key + identical payload → prior reference; same key + **conflicting** payload → hard-error + **secured-audit capture**.
+REST per `rest-api-design`, behind the inbound API gateway; money as `MoneyDto` `{amount, currency, currency_scale}` (decimal string in major units; a JSON number is rejected). The inherited AC #19 contract applies to all Slice 3 flows (`CREDIT_NOTE`/`DEBIT_NOTE`/`REFUND`/`MANUAL_ADJUSTMENT`): same key + identical payload → prior reference; same key + **conflicting** payload → hard-error + **secured-audit capture**.
 
 | Method | Path | Purpose | Idempotency |
 |--------|------|---------|-------------|
@@ -502,7 +502,7 @@ REST per `rest-api-design`, behind the inbound API gateway; money as `{amountMin
 
 ## 6. Data Model
 
-Adds `invoice_exposure`, `credit_note`, `debit_note`, `refund` (Slice-3-owned tables). The money-out counters it consumes — `refunded_minor` + `refunded_unallocated_minor` on `payment_settlement`, `refunded_minor` on `payment_allocation_refund` — are **declared by Slice 2** (Slice 2 owns those tables + `allocated_minor`/`clawed_back_minor` maintenance); Slice 3 **maintains** the refund counters via the Foundation `applyCounterDelta` primitive and adds **no DDL** to Slice 2's tables. Tenant-scoped RLS (C1).
+Adds `invoice_exposure`, `credit_note`, `debit_note`, `refund` (Slice-3-owned tables). The money-out counters it consumes — `refunded` + `refunded_unallocated` on `payment_settlement`, `refunded` on `payment_allocation_refund` — are **declared by Slice 2** (Slice 2 owns those tables + `allocated`/`clawed_back` maintenance); all are canonical decimal text at the row's stored `currency_scale`; Slice 3 **maintains** the refund counters via the Foundation `applyCounterDelta` primitive and adds **no DDL** to Slice 2's tables. Tenant-scoped RLS (C1).
 
 **`invoice_exposure`** (PK `(tenant_id, invoice_id)`):
 
@@ -511,19 +511,22 @@ Adds `invoice_exposure`, `credit_note`, `debit_note`, `refund` (Slice-3-owned ta
 | `tenant_id` | `uuid` | PK part; RLS scope |
 | `invoice_id` | `string` | PK part |
 | `currency` | `char` | |
-| `original_total_minor` | `bigint` | seeded at first touch = posted AR incl. tax (from `journal_line`, `INSERT … ON CONFLICT DO UPDATE`) |
-| `debit_note_total_minor` | `bigint` | raised by each S4 debit note |
-| `credit_note_total_minor` | `bigint` | `CHECK (credit_note_total_minor ≤ original_total_minor + debit_note_total_minor)` — the headroom cap (AC #24) |
+| `currency_scale` | `smallint` | stored posting scale of the three totals |
+| `original_total` | `text` (canonical decimal, major units) | seeded at first touch = posted AR incl. tax (exact sum from `journal_line`) |
+| `debit_note_total` | `text` (canonical decimal) | raised by each S4 debit note |
+| `credit_note_total` | `text` (canonical decimal) | `CHECK (credit_note_total ≤ original_total + debit_note_total)` — the headroom cap (AC #24) |
+| `version` | `bigint` | conditional-update guard |
 
-**`payment_allocation_refund`** (PK `(tenant_id, payment_id, invoice_id)`; created + `allocated_minor`-maintained by Slice 2's AllocationHandler):
+**`payment_allocation_refund`** (PK `(tenant_id, payment_id, invoice_id)`; created + `allocated`-maintained by Slice 2's AllocationHandler):
 
 | Column | Type | Notes |
 |--------|------|-------|
 | `tenant_id` | `uuid` | PK part |
 | `payment_id` | `string` | PK part |
 | `invoice_id` | `string` | PK part |
-| `allocated_minor` | `bigint` | maintained by Slice 2 at allocation time |
-| `refunded_minor` | `bigint` | `CHECK (refunded_minor ≤ allocated_minor)` **and** `CHECK (refunded_minor ≥ 0)` (defense-in-depth against double / out-of-order decrement); incremented at refund stage-1, decremented on stage-1 reversal |
+| `currency` / `currency_scale` | `char` / `smallint` | stored money metadata |
+| `allocated` | `text` (canonical decimal) | maintained by Slice 2 at allocation time |
+| `refunded` | `text` (canonical decimal) | `CHECK (refunded ≤ allocated)` **and** `CHECK (refunded ≥ 0)` (defense-in-depth against double / out-of-order decrement); incremented at refund stage-1, decremented on stage-1 reversal |
 
 **`credit_note`**:
 
@@ -535,9 +538,10 @@ Adds `invoice_exposure`, `credit_note`, `debit_note`, `refund` (Slice-3-owned ta
 | `origin_invoice_item_ref` | `string` | |
 | `revenue_stream` | `enum` | matches the line(s) it reduces |
 | `currency` | `char` | |
-| `amount_minor` | `bigint` | incl. tax |
-| `recognized_part_minor` | `bigint` | |
-| `deferred_part_minor` | `bigint` | |
+| `currency_scale` | `smallint` | |
+| `amount` | `text` (canonical decimal, major units) | incl. tax |
+| `recognized_part` | `text` (canonical decimal) | |
+| `deferred_part` | `text` (canonical decimal) | `amount = recognized_part + deferred_part`, exact |
 | `split_basis_ref` | `string` | PO/allocation group + schedule state at effective time |
 | `reason_code` | `string` | |
 
@@ -549,9 +553,10 @@ Adds `invoice_exposure`, `credit_note`, `debit_note`, `refund` (Slice-3-owned ta
 | `tenant_id` | `uuid` | |
 | `origin_invoice_id` | `string` | |
 | `currency` | `char` | |
-| `amount_minor` | `bigint` | incl. tax |
-| `recognized_part_minor` | `bigint` | |
-| `deferred_part_minor` | `bigint` | |
+| `currency_scale` | `smallint` | |
+| `amount` | `text` (canonical decimal, major units) | incl. tax |
+| `recognized_part` | `text` (canonical decimal) | |
+| `deferred_part` | `text` (canonical decimal) | |
 
 **`refund`** (`UNIQUE (tenant_id, psp_refund_id, phase)`; `business_id = psp_refund_id:phase`):
 
@@ -565,15 +570,16 @@ Adds `invoice_exposure`, `credit_note`, `debit_note`, `refund` (Slice-3-owned ta
 | `payment_id` | `string` | **MANDATORY both patterns** — origin payment; `NOT NULL` |
 | `invoice_id` | `string` | null for Pattern A; required for Pattern B |
 | `currency` | `char` | **MANDATORY both patterns**; `NOT NULL` |
-| `amount_minor` | `bigint` | |
+| `currency_scale` | `smallint` | stored scale; must equal the origin payment's |
+| `amount` | `text` (canonical decimal, major units) | |
 | `clearing_state` | `enum` | `PENDING \| SETTLED \| REVERSED` |
 | `relates_to_refund_id` | `uuid` | refund-of-refund forward link; counter effect by economic direction — claw-back decrements |
 | `reverses_entry_id` | `uuid` | ONLY for PSP-rejected stage-1 line-negation; distinct from `relates_to_refund_id` |
 
 Key constraints (beyond the column tables):
 
-- `payment_settlement` `CHECK (allocated_minor + refunded_unallocated_minor ≤ settled_minor)`, `CHECK (refunded_minor + clawed_back_minor ≤ settled_minor)`, `CHECK (refunded_minor ≥ 0)`, `CHECK (refunded_unallocated_minor ≥ 0)`; existing Slice 2 `CHECK`s stay; same stage-1-increment / reversal-decrement lifecycle (`clawed_back_minor` maintained by Slice 2). The `≥ 0` CHECKs are defense-in-depth: an underflowing claw-back/decrement is **deferred**, so these never fire in normal flow.
-- `REFUND_CLEARING` is **credit-normal** and is part of the **Foundation's no-negative `account_balance` guarded set** — the Foundation declares the full set `CHECK (account_class NOT IN ('AR','CASH_CLEARING','UNALLOCATED','CONTRACT_LIABILITY','DISPUTE_HOLD','REFUND_CLEARING') OR balance_minor >= 0)` from the start, so there is **no cross-slice `ALTER`** and no guard-drop risk. Slice 3 only **posts to** the class via the Foundation API. `REUSABLE_CREDIT` stays **out** of the set (sub-grain-guarded). `REFUND_CLEARING` must drain to exactly zero and never go negative (stage-1 `CR` → stage-2 `DR`); aged unsettled balances alarm.
+- `payment_settlement` `CHECK (allocated + refunded_unallocated ≤ settled)`, `CHECK (refunded + clawed_back ≤ settled)`, `CHECK (refunded ≥ 0)`, `CHECK (refunded_unallocated ≥ 0)` (all as `::numeric` over canonical text on PostgreSQL); existing Slice 2 `CHECK`s stay; same stage-1-increment / reversal-decrement lifecycle (`clawed_back` maintained by Slice 2). The `≥ 0` CHECKs are defense-in-depth: an underflowing claw-back/decrement is **deferred**, so these never fire in normal flow.
+- `REFUND_CLEARING` is **credit-normal** and is part of the **Foundation's no-negative `account_balance` guarded set** — the Foundation declares the full set `CHECK (account_class NOT IN ('AR','CASH_CLEARING','UNALLOCATED','CONTRACT_LIABILITY','DISPUTE_HOLD','REFUND_CLEARING') OR balance >= 0)` from the start, so there is **no cross-slice `ALTER`** and no guard-drop risk. Slice 3 only **posts to** the class via the Foundation API. `REUSABLE_CREDIT` stays **out** of the set (sub-grain-guarded). `REFUND_CLEARING` must drain to exactly zero and never go negative (stage-1 `CR` → stage-2 `DR`); aged unsettled balances alarm.
 - `source_doc_type` / `flow` values `CREDIT_NOTE | DEBIT_NOTE | REFUND | MANUAL_ADJUSTMENT` (·) and `account_class` literals `CONTRA_REVENUE | REFUND_CLEARING | GOODWILL` are **Foundation-declared**; Slice 3 uses them (additive C2 enum: `CONTRA_REVENUE` debit-normal, `REFUND_CLEARING` credit-normal liability, `GOODWILL` non-revenue debit).
 - **Unified lock order**: `recognition_schedule`/`recognition_segment` (shared with Slice 4) then `invoice_exposure` then `payment_allocation_refund`, appended after the shared balance caches — disjoint ranks, single global order.
 - **No posted-invoice mutation:** all adjustments are new compensating entries (inherited append-only).
@@ -747,7 +753,7 @@ NFR verification:
 
 - **Performance / NFR mapping**: Inherits Slice 1 targets (B2 resolved 2026-06-10 via B11 — PRD draft committed as v1 SLOs, gated by the B3 load test; B3 remains open). Slice-3-specific: note/refund posts are single balanced entries (write p95 ≤ 500 ms); **negative-tax-subbalance (AC #17)**, refund-clearing aging, and stage-1-orphan are MUST-alarm (PRD § Observability). Availability/immutability inherited. Traces to `cpt-cf-bss-ledger-nfr-posting-performance`, `cpt-cf-bss-ledger-nfr-availability`.
 - **Security & AuthZ**: Inherits Slice 1: RLS, append-only, PII-minimized events. Credit/debit notes, refunds, and governed manual adjustments require the billing-poster scope; refunds/notes above the D2 threshold and all governed manual postings require **dual-control** (segregation of duties); every manual posting carries reason code + actor (AC #14) and is constrained to the allow-listed account set. The ledger trusts Payments-module refund-approval provenance.
-- **Observability / Feature metrics**: `ledger_credit_note_total` / `_blocked_total{reason}`, `ledger_debit_note_total`, `ledger_refund_total{phase,pattern}`, `ledger_refund_clearing_balance_minor` (gauge), `ledger_refund_clearing_aged_seconds`, `ledger_stage1_refund_orphan_total`, `ledger_refund_unknown_final_total`, `ledger_credit_note_headroom_reject_total`, `ledger_refund_quarantine_depth`, `ledger_negative_tax_subbalance_total`, `ledger_attempted_writeoff_total`. Thresholds wire to the NFR mapping + the alarms.
+- **Observability / Feature metrics**: `ledger_credit_note_total` / `_blocked_total{reason}`, `ledger_debit_note_total`, `ledger_refund_total{phase,pattern}`, `ledger_refund_clearing_open_grains` (gauge, a count — no monetary magnitude), `ledger_refund_clearing_aged_seconds`, `ledger_stage1_refund_orphan_total`, `ledger_refund_unknown_final_total`, `ledger_credit_note_headroom_reject_total`, `ledger_refund_quarantine_depth`, `ledger_negative_tax_subbalance_total`, `ledger_attempted_writeoff_total`. Thresholds wire to the NFR mapping + the alarms.
 - **Risks & deferred work**: **Recognized/deferred split + schedule reduction** depends on Slice 4 schedule state being current at credit-note time; block-on-ambiguous is the safety net. **Hot rows** `invoice_exposure` (per invoice), `payment_settlement` / `payment_allocation_refund` (per payment) mirror earlier slices' contention; same load-test obligation (B3). **Deferred:** bad-debt/write-off/recovery (separate PRD); FX on cross-currency refunds (Slice 5 — [fx-multicurrency](./06-fx-multicurrency.md)); ERP export + jurisdiction net-presentation + S3+S5-pairing reconciliation (Slice 7).
 - **Needs discussion** (inherits Slices 1/2/4 open items; slice-specific):
 
@@ -758,7 +764,7 @@ NFR verification:
 | Goodwill/AR-only class + AR floor | non-revenue `GOODWILL`; AR floor = `ar_invoice_balance` CHECK | ✅ Accepted default | — |
 | S4 deferred → schedule-build hook | S4 deferral triggers Slice 4 ScheduleBuilder in same txn | ✅ Accepted default | — |
 | Refund-clearing aging threshold | tenant-policy window; default **7 days → Warn, 14 days → Page**; the same thresholds raise `STUCK_REFUND_CLEARING` | ✅ Ratified 2026-06-10 | Finance |
-| `payment_allocation_refund` ownership | Slice 2 creates + maintains `allocated_minor` at allocation time; this feature consumes | ✅ Proposed default | — |
+| `payment_allocation_refund` ownership | Slice 2 creates + maintains `allocated` at allocation time; this feature consumes | ✅ Proposed default | — |
 | Manual-adjustments API | `POST /v1/ledger/manual-adjustments`, allow-listed classes, dual-control, idempotent per adjustment id | ✅ Proposed default | — |
 | Origin payment ref on money-out events | `payment_id` + `currency` mandatory on every refund — confirm PSP/bank refund/return events always carry the origin payment reference | ⏳ Confirm with Payments | Payments team |
 | Refund-of-refund semantic | counter effect by economic direction — **canonical default = claw-back → decrement** money-out; additional-outbound increments. Confirm which the PSP refund-of-refund event represents | ⏳ Confirm with Payments | Payments team |

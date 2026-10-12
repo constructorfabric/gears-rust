@@ -95,7 +95,7 @@ Success criteria: every money-out path (allocation, refund, chargeback, return) 
 ### 1.4 References
 
 - **PRD**: [PRD.md](../PRD.md) — § Posting rules S2, § Balances, § Allocation precedence, § Chargebacks, § Edge cases (CreditApplication), § Money, AC #5/#7/#10/#25
-- **Design**: [01-repository-foundation.md](./01-repository-foundation.md) — Foundation engine (per-entry ACID PostingService, append-only journal + strict line-negation reversal, IdempotencyGate + 3-column `idempotency_dedup (tenant_id, flow, business_id)` PK, MoneyModule banker's rounding + residual-cent rules, BalanceProjector upsert + conditional no-negative CHECK, FiscalPeriodGuard, leaf-partition balance/zero-sum commit trigger, total fixed lock order, multi-tenant per-line scoping, daily TieOutJob, outbox relay). Not restated here; RFC 2119 keywords are normative.
+- **Design**: [01-repository-foundation.md](./01-repository-foundation.md) — Foundation engine (per-entry ACID PostingService, append-only journal + strict line-negation reversal, IdempotencyGate + 3-column `idempotency_dedup (tenant_id, flow, business_id)` PK, money model (validated major-unit decimals, exact arithmetic, HALF_EVEN only at declared points, residual-increment rules), BalanceProjector version-guarded update + conditional no-negative CHECK, FiscalPeriodGuard, leaf-partition balance/zero-sum commit trigger, total fixed lock order, multi-tenant per-line scoping, daily TieOutJob, outbox relay). Not restated here; RFC 2119 keywords are normative.
 - **Dependencies**: Foundation engine / posting-engine-core (slice 1) upstream; Payments module (PSP) upstream. Downstream: adjustments-notes-refunds (slice 3, reuses `payment_allocation` + the per-(payment,invoice) cap), reconciliation-export (slice 7, Payments↔PSP and unallocated visibility).
 
 **Canonical slice numbering** (decomposition order, used throughout): 1 posting-engine-core, **2 payments-allocation (this feature)**, 3 adjustments-notes-refunds, 4 asc606-recognition, 5 fx-multicurrency, 6 audit-immutability-observability, 7 reconciliation-export, 8 other. PRD posting-rule labels (S1…S6) are a **separate** axis from slice numbers.
@@ -108,9 +108,9 @@ Design-introduced names (this feature):
 
 | Name | Meaning |
 |------|---------|
-| `payment_settlement` | Per-payment guarded counter `(tenant, payment_id, settled_minor, allocated_minor, refunded_minor, refunded_unallocated_minor, clawed_back_minor)` — the **DB serialization point** for every per-payment money-out cap (allocations, refunds, clawbacks, returns); CHECKs in §9.1. |
+| `payment_settlement` | Per-payment guarded counter `(tenant, payment_id, currency, currency_scale, settled, fee, allocated, refunded, refunded_unallocated, clawed_back)` — canonical decimal text in major units, the **DB serialization point** for every per-payment money-out cap (allocations, refunds, clawbacks, returns); CHECKs in §9.1. |
 | `payment_allocation` | Ledger record of an N:M Invoice↔Payment allocation the ledger **computed**; drives per-invoice AR reduction + the per-`(payment,invoice)` cap reused by refunds (slice 3). |
-| `payment_allocation_refund` | Per-`(payment, invoice)` guarded counter `(tenant, payment_id, invoice_id, allocated_minor, refunded_minor)` — **created and incremented here at allocation time** (`allocated_minor += amount` in the same ACID txn, multiple allocations to one pair aggregate); slice 3 adds the `refunded_minor` side + its `CHECK (refunded_minor ≤ allocated_minor)` consumption. Migration owned by this feature. |
+| `payment_allocation_refund` | Per-`(payment, invoice)` guarded counter `(tenant, payment_id, invoice_id, currency, currency_scale, allocated, refunded)` — **created and incremented here at allocation time** (`allocated += amount`, exact decimal add in the same ACID txn, multiple allocations to one pair aggregate); slice 3 adds the `refunded` side + its `CHECK (refunded ≤ allocated)` consumption. Migration owned by this feature. |
 | `unallocated_balance` | Derived cache of **Unallocated cash** per `(tenant, payer, currency)`. |
 | `reusable_credit_subbalance` | Derived cache of **Reusable customer credit** per `(tenant, payer, currency, credit_grant_event_type)` — the per-event-type sub-balance the PRD mandates. |
 | `pending_event_queue` | Durable store of queued/quarantined work items — allocation-before-settlement, out-of-order dispute phases, dispute-held refund stage-2, slice 3 refund quarantine. **Owned by this feature; used by slices 2 and 3.** |
@@ -138,11 +138,11 @@ Design-introduced names (this feature):
 - out-of-order allocation-before-settlement & chargeback-phase queueing (§ Out-of-order)
 - Payments↔PSP reconciliation visibility (§ Reconciliation flows)
 - aged unallocated/clearing-queue alarm (§ Observability)
-- money residual-cent for multi-invoice allocation
+- money residual increment for multi-invoice allocation (`allocate(lump, weights, Residual::Largest)`, HALF_EVEN per share)
 
 **Idempotency flows:** settle (per PSP txn id), allocate (per allocation id), chargeback (per `(tenant, dispute_id:cycle:phase)`), settlement return (per PSP return id), credit-apply (per CreditApplication id).
 
-**Consumed upstream facts:** `PaymentSettled` (`pspTransactionId`, amount, payer, currency, **optional `feeMinor`** — PSP per-transaction fee withheld); **allocation intent** (`paymentId`, lump `amount`, payer, currency, **optional** customer-instructed `invoiceId` hint — **no candidate set from Payments**; the ledger derives the candidate open invoices from its **own** `ar_invoice_balance` (oldest-first default) and computes the per-invoice split, Mode A / P5 minimal form, 🔄 2026-06-15); dispute events (`disputeId`, `cycle` — dispute cycle number, starts at 1, increments on re-open, `phase ∈ {opened, won, lost, partial}`, amount); `SettlementReturned` (bank/ACH/SEPA return: `pspReturnId`, origin `pspTransactionId`, amount); `CreditApplication` (`creditApplicationId`, type, amount, payer/invoice). The ledger does **not** verify PSP webhooks (Payments owns that). **(Ingestion model — README):** all the above are **call-driven** — Payments (or its adapter) calls the §8 REST endpoints; the ledger consumes **no** inbound bus on the post path (C3). "Events" here name the upstream fact, not a subscription. **Settlement-event contract gate.** The field list above **is** the ratified **ledger-side** settlement consumer contract; the **other side is owned by Payments** and is a **pre-build gate** — Payments MUST confirm it emits exactly these facts (especially `feeMinor` for, the **PSP funds-movement fact** for the dispute-open variant, `cycle`, `pspReturnId`, and the refund `(pspRefundId, phase)` lifecycle) before this feature is built. Tracked in PRD § Deferred to future scope → Cross-team contract gates.
+**Consumed upstream facts:** `PaymentSettled` (`pspTransactionId`, `gross` money, payer, **`fee`** money — PSP per-transaction fee withheld, `0` when none); **allocation intent** (`paymentId`, lump `amount`, payer, currency, **optional** customer-instructed `invoiceId` hint — **no candidate set from Payments**; the ledger derives the candidate open invoices from its **own** `ar_invoice_balance` (oldest-first default) and computes the per-invoice split, Mode A / P5 minimal form, 🔄 2026-06-15); dispute events (`disputeId`, `cycle` — dispute cycle number, starts at 1, increments on re-open, `phase ∈ {opened, won, lost, partial}`, amount); `SettlementReturned` (bank/ACH/SEPA return: `pspReturnId`, origin `pspTransactionId`, amount); `CreditApplication` (`creditApplicationId`, type, amount, payer/invoice). The ledger does **not** verify PSP webhooks (Payments owns that). **(Ingestion model — README):** all the above are **call-driven** — Payments (or its adapter) calls the §8 REST endpoints; the ledger consumes **no** inbound bus on the post path (C3). "Events" here name the upstream fact, not a subscription. **Settlement-event contract gate.** The field list above **is** the ratified **ledger-side** settlement consumer contract; the **other side is owned by Payments** and is a **pre-build gate** — Payments MUST confirm it emits exactly these facts (especially the `fee` money for the settlement split, the **PSP funds-movement fact** for the dispute-open variant, `cycle`, `pspReturnId`, and the refund `(pspRefundId, phase)` lifecycle) before this feature is built. Tracked in PRD § Deferred to future scope → Cross-team contract gates.
 
 **Constraints and assumptions** (inherits Foundation constraints C1–C4 and assumptions A1–A6, incl. B2/B3 open NFR items). Feature-specific:
 
@@ -150,7 +150,7 @@ Design-introduced names (this feature):
 |---|-------|----------------------|--------|
 | P1 | Unallocated-pool modeling | **Single** Unallocated bucket + **per-event-type sub-balances** (`credit_grant_event_type`), preserving the unallocated-vs-reusable-credit split. PRD "suspense/unapplied pool" prose = `UNALLOCATED` only. | PRD |
 | P2 | Dispute-opened segregation | **Variant driven by the PSP funds-movement fact, not tenant policy:** PSP **withholds funds at open** (card rails) → **cash-hold mandatory** (to the additive `DISPUTE_HOLD` class) so `CASH_CLEARING` ties to the PSP balance; PSP **does not move funds at open** (invoice/ACH) → **within-AR reclassification** (`ACTIVE→DISPUTED`), AR-class-neutral. won/lost/partial branch on which variant was posted. Original payment JEs never edited. | PRD |
-| P3 | Atomic settle-and-apply shortcut | Single-entry `DR Cash / CR AR` shortcut allowed **only** with PSP/tenant-guaranteed atomic settle+apply, no residual unallocated. The shortcut MUST still **seed `payment_settlement`** in the same txn (`settled_minor = allocated_minor = amount`, other counters 0) — otherwise a later refund/chargeback/return on that payment has no `settled_minor` to cap against. Invariant: **no AR-reducing money movement without a `payment_settlement` row.** | PRD |
+| P3 | Atomic settle-and-apply shortcut | Single-entry `DR Cash / CR AR` shortcut allowed **only** with PSP/tenant-guaranteed atomic settle+apply, no residual unallocated. The shortcut MUST still **seed `payment_settlement`** in the same txn (`settled = allocated = amount`, other counters 0) — otherwise a later refund/chargeback/return on that payment has no `settled` to cap against. Invariant: **no AR-reducing money movement without a `payment_settlement` row.** | PRD |
 | P4 | Statutory allocation-rule registry | **Deferred — out of v1 scope.** The customer-instructed override (precedence step 2) is the B2B compliance path; a data-driven jurisdiction→rule registry is a post-MVP extension, added only if Legal names a market whose payers a statutory regime binds. | PRD |
 | P5 | Allocation split ownership | **Mode A (minimal form, 🔄 2026-06-15)**: the ledger **derives the candidate open invoices from its own `ar_invoice_balance`** (oldest-first default) and **computes** the per-invoice split via precedence, writing `payment_allocation` rows. The consumed event carries the **settlement** (amount/payer/currency) **+ an optional customer-instructed hint** — **not** a candidate set from Payments and **not** pre-split rows. | PRD AC #25 |
 | P6 | Tenant-hierarchy payment delegation | **In scope.** `payer_tenant_id` arrives **already resolved** on the consumed settlement event per the payer-resolution rule (payer = nearest `self_managed` ancestor-or-self of `resource_tenant`; `self_managed` = billing boundary); one payer per entry; allocation runs at that payer's grain. The ledger does **not** resolve payer from the tree — resolution is upstream. **Deferred:** ledger-side re-validation guard (Variant C); settlement transfer / payout / summary invoice. | PRD § Multi-tenant |
@@ -165,7 +165,7 @@ All handlers post **through** the Foundation `PostingService` (one ACID txn per 
 
 **Actor**: `cpt-cf-bss-ledger-actor-payments-psp`
 
-On `PaymentSettled`, post Pattern A — funds land in **Unallocated cash**, **not** AR; receipt alone MUST NOT move AR — and create/seed the `payment_settlement` counter (`settled_minor`; all other counters `= 0`). Posting legs:
+On `PaymentSettled`, post Pattern A — funds land in **Unallocated cash**, **not** AR; receipt alone MUST NOT move AR — and create/seed the `payment_settlement` counter (`settled`, `fee`; all other counters `= 0`). Posting legs:
 
 | Line | Side | Account class |
 |------|------|---------------|
@@ -173,22 +173,22 @@ On `PaymentSettled`, post Pattern A — funds land in **Unallocated cash**, **no
 | PSP fee withheld (if any) | DR | `PSP_FEE_EXPENSE` |
 | Unallocated cash — **gross** settled | CR | `UNALLOCATED` |
 
-**PSP fee.** When `PaymentSettled` carries a per-transaction `feeMinor`, the entry splits as above: DR `CASH_CLEARING` **net**, DR `PSP_FEE_EXPENSE` fee, CR `UNALLOCATED` **gross** — so `CASH_CLEARING` ties to the **net** bank deposit while the payer is relieved at **gross** (the fee never reduces AR). **(🔄 2026-06-15)** In v1 the fee is borne by the **merchant tenant — hardcoded, no config** (all lines share its payer-tenant scope, so zero-sum holds). "Platform absorbs the fee" is a **future feature** (not built in v1): it breaks per-tenant zero-sum → needs a separate platform-scope entry, and would only ship with a Finance/Product decision (and could then become a per-tenant/per-plan config). With **no** `feeMinor` (PSP settles gross / invoices fees monthly), the entry is the original two-line shape and the fee posts as its own entry when charged. The Payments↔PSP reconciliation (slice 7) ties at the **net** payout, the fee leg accounting for gross − net. **Note:** the ledger has **no "must not operate at a loss" invariant** — P&L is not a posting constraint; only **account balances** carry the no-negative rule.
+**PSP fee.** When `PaymentSettled` carries a non-zero per-transaction `fee` (same currency and scale as `gross`, `fee <= gross`), the entry splits as above: DR `CASH_CLEARING` **net**, DR `PSP_FEE_EXPENSE` fee, CR `UNALLOCATED` **gross** — so `CASH_CLEARING` ties to the **net** bank deposit while the payer is relieved at **gross** (the fee never reduces AR). **(🔄 2026-06-15)** In v1 the fee is borne by the **merchant tenant — hardcoded, no config** (all lines share its payer-tenant scope, so zero-sum holds). "Platform absorbs the fee" is a **future feature** (not built in v1): it breaks per-tenant zero-sum → needs a separate platform-scope entry, and would only ship with a Finance/Product decision (and could then become a per-tenant/per-plan config). With a zero `fee` (PSP settles gross / invoices fees monthly), the entry is the original two-line shape and the fee posts as its own entry when charged. The Payments↔PSP reconciliation (slice 7) ties at the **net** payout, the fee leg accounting for gross − net. **Note:** the ledger has **no "must not operate at a loss" invariant** — P&L is not a posting constraint; only **account balances** carry the no-negative rule.
 
 **Success Scenarios**:
 - Payment settles; funds land in `UNALLOCATED` at gross; `payment_settlement` counter seeded; `unallocated_balance` upserted
-- Settlement with `feeMinor` posts the three-leg split; `CASH_CLEARING` ties to net deposit
+- Settlement with a non-zero `fee` posts the three-leg split; `CASH_CLEARING` ties to net deposit
 
 **Error Scenarios**:
 - Replay of the same `pspTransactionId` returns the prior posting reference (Foundation AC #19), no duplicate entry
 
 **Steps**:
-1. [ ] - `p1` - Payments module calls API: POST /v1/ledger/payments (body: pspTransactionId, {amountMinor, currency, scale}, resolved payer_tenant_id per P6, optional feeMinor) - `inst-set-api`
+1. [ ] - `p1` - Payments module calls API: POST /v1/ledger/payments (body: `payment_id`, `gross` and `fee` as `MoneyDto` `{amount, currency, currency_scale}` in major units, resolved `payer_tenant_id` per P6; the scale is validated against the provisioned currency, never rescaled) - `inst-set-api`
 2. [ ] - `p1` - Claim idempotency: `idempotency_dedup (tenant, PAYMENT_SETTLE, pspTransactionId)` via Foundation IdempotencyGate - `inst-set-idem`
 3. [ ] - `p1` - **IF** replay: **RETURN** prior posting reference (AC #19) - `inst-set-replay`
-4. [ ] - `p1` - **IF** feeMinor present: build three-leg entry (DR `CASH_CLEARING` net, DR `PSP_FEE_EXPENSE` fee, CR `UNALLOCATED` gross); **ELSE** two-leg (DR `CASH_CLEARING` / CR `UNALLOCATED` gross) - `inst-set-legs`
+4. [ ] - `p1` - **IF** `fee` is non-zero: build three-leg entry (DR `CASH_CLEARING` net = `gross − fee`, exact; DR `PSP_FEE_EXPENSE` fee, CR `UNALLOCATED` gross); **ELSE** two-leg (DR `CASH_CLEARING` / CR `UNALLOCATED` gross) - `inst-set-legs`
 5. [ ] - `p1` - Post one balanced entry through the Foundation PostingService (ACID txn, extended lock order §3) - `inst-set-post`
-6. [ ] - `p1` - DB: In the same txn, seed `payment_settlement` (`settled_minor` = gross; all other counters = 0) - `inst-set-seed`
+6. [ ] - `p1` - DB: In the same txn, seed `payment_settlement` (`settled` = gross, `fee` = fee; all other counters = 0) - `inst-set-seed`
 7. [ ] - `p1` - DB: Upsert `unallocated_balance` += **gross** amount via BalanceProjector - `inst-set-upsert`
 8. [ ] - `p1` - Emit `billing.ledger.payment.settled` via the Foundation outbox (§10) - `inst-set-event`
 9. [ ] - `p1` - **RETURN** 201 posting reference - `inst-set-return`
@@ -199,23 +199,23 @@ On `PaymentSettled`, post Pattern A — funds land in **Unallocated cash**, **no
 
 **Actor**: `cpt-cf-bss-ledger-actor-payments-psp`
 
-**(normative).** A bank/ACH/SEPA return of a settled payment posts flow `SETTLEMENT_RETURN` (idempotent per `(tenant, SETTLEMENT_RETURN, pspReturnId)`; `source_doc_type = SETTLEMENT_RETURN`): DR `UNALLOCATED` / CR `CASH_CLEARING`, clawing back from the payer's Unallocated pool **first**, and decrements `payment_settlement.settled_minor` in the same txn under the rank-1 row lock.
+**(normative).** A bank/ACH/SEPA return of a settled payment posts flow `SETTLEMENT_RETURN` (idempotent per `(tenant, SETTLEMENT_RETURN, pspReturnId)`; `source_doc_type = SETTLEMENT_RETURN`): DR `UNALLOCATED` / CR `CASH_CLEARING`, clawing back from the payer's Unallocated pool **first**, and decrements `payment_settlement.settled` in the same txn under the rank-1 row lock. When the original settlement carried a fee, the return also reverses the proportional fee share (DR `UNALLOCATED` amount / CR `CASH_CLEARING` amount − fee share / CR `PSP_FEE_EXPENSE` fee share) and decrements `payment_settlement.fee` by it. **Declared rounding point:** `fee_share = fee × amount ÷ settled` is an exact ratio rounded once, HALF_EVEN, at the settlement's stored scale (previously integer floor division).
 
 **Success Scenarios**:
-- Return posts, unallocated pool clawed back, `settled_minor` decremented
+- Return posts, unallocated pool clawed back, `settled` (and the fee share of `fee`) decremented
 
 **Error Scenarios**:
-- `allocated_minor` exceeds the remaining settled amount → MUST NOT auto-post; routes to the **exception queue** (slice 7; additive type `SETTLEMENT_RETURN_OVER_ALLOCATED`) for explicit de-allocation/chargeback handling
+- `allocated` exceeds the remaining settled amount → MUST NOT auto-post; routes to the **exception queue** (slice 7; additive type `SETTLEMENT_RETURN_OVER_ALLOCATED`) for explicit de-allocation/chargeback handling
 - Return would drive `CASH_CLEARING` negative (funds already swept) → reuses the chargeback-cash-negative pattern (balanced documented-loss line to `DISPUTE_LOSS_EXPENSE` + alarm)
 
 **Steps**:
 1. [ ] - `p1` - Payments module calls API: POST /v1/ledger/payments/{paymentId}/returns (body: pspReturnId, origin pspTransactionId, amount) - `inst-ret-api`
 2. [ ] - `p1` - Claim idempotency: `idempotency_dedup (tenant, SETTLEMENT_RETURN, pspReturnId)`; **IF** replay **RETURN** prior reference - `inst-ret-idem`
 3. [ ] - `p1` - DB: Lock the `payment_settlement` row (rank-1 counter row within the extended lock order) - `inst-ret-lock`
-4. [ ] - `p1` - **IF** `allocated_minor` > remaining settled amount after the return: **RETURN** route to exception queue (`SETTLEMENT_RETURN_OVER_ALLOCATED`) — never auto-post - `inst-ret-overalloc`
+4. [ ] - `p1` - **IF** `allocated` > remaining settled amount after the return: **RETURN** route to exception queue (`SETTLEMENT_RETURN_OVER_ALLOCATED`) — never auto-post - `inst-ret-overalloc`
 5. [ ] - `p1` - Post balanced entry DR `UNALLOCATED` / CR `CASH_CLEARING` (claw back from the payer's Unallocated pool first) - `inst-ret-post`
 6. [ ] - `p1` - **IF** the entry would drive `CASH_CLEARING` negative: post the balanced documented-loss line (`DISPUTE_LOSS_EXPENSE`) and raise the chargeback-cash-negative alarm instead of a negative Cash balance - `inst-ret-negcash`
-7. [ ] - `p1` - DB: Decrement `payment_settlement.settled_minor` in the same txn - `inst-ret-decrement`
+7. [ ] - `p1` - DB: Decrement `payment_settlement.settled` (and `fee` by the fee share) in the same txn - `inst-ret-decrement`
 8. [ ] - `p1` - Emit `billing.ledger.settlement.returned` (§10) - `inst-ret-event`
 9. [ ] - `p1` - **RETURN** 201 posting reference - `inst-ret-return`
 
@@ -232,9 +232,9 @@ Computes the per-invoice split (Mode A, `cpt-cf-bss-ledger-algo-allocation-mode-
 | Unallocated cash | DR | `UNALLOCATED` |
 | AR (per invoice) | CR | `AR` |
 
-In the same ACID txn the handler increments `payment_settlement.allocated_minor` by the allocated total; the `CHECK (allocated_minor ≤ settled_minor)` row is the **serialization point** that makes concurrent allocates of the same payment safe even when the payer's pooled `unallocated_balance` is positive from **other** payments (over-cap → `ALLOCATION_EXCEEDS_SETTLED`). Spendable headroom additionally nets Pattern-A refunds: `CHECK (allocated_minor + refunded_unallocated_minor ≤ settled_minor)` — cash already refunded from the pool cannot be allocated (same error). Open AR per invoice reduces only by its allocated amount; **one allocate writes N `payment_allocation` rows — one per invoice** (per-row key `(tenant_id, allocation_id, invoice_id)`), request-idempotent per `allocationId` via `idempotency_dedup (tenant, PAYMENT_ALLOCATE, allocationId)` (replay returns the prior reference, no duplicate rows). The handler also upserts `payment_allocation_refund (tenant, payment_id, invoice_id).allocated_minor += <per-invoice amount>` in the same txn (lock rank per slice 3's unified order), so the slice 3 refund cap always reads an authoritative, race-free counter — never a seed-by-sum at first refund.
+In the same ACID txn the handler increments `payment_settlement.allocated` by the allocated total (exact decimal add); the `CHECK (allocated ≤ settled)` row is the **serialization point** that makes concurrent allocates of the same payment safe even when the payer's pooled `unallocated_balance` is positive from **other** payments (over-cap → `ALLOCATION_EXCEEDS_SETTLED`). Spendable headroom additionally nets Pattern-A refunds: `CHECK (allocated + refunded_unallocated ≤ settled)` — cash already refunded from the pool cannot be allocated (same error). Open AR per invoice reduces only by its allocated amount; **one allocate writes N `payment_allocation` rows — one per invoice** (per-row key `(tenant_id, allocation_id, invoice_id)`), request-idempotent per `allocationId` via `idempotency_dedup (tenant, PAYMENT_ALLOCATE, allocationId)` (replay returns the prior reference, no duplicate rows). The handler also upserts `payment_allocation_refund (tenant, payment_id, invoice_id).allocated += <per-invoice amount>` in the same txn (lock rank per slice 3's unified order), so the slice 3 refund cap always reads an authoritative, race-free counter — never a seed-by-sum at first refund.
 
-**Currency match (normative).** MVP allocation requires `settlement.currency == invoice.currency` (and the entry stays single-transaction-currency); a mismatch rejects with `ALLOCATION_CURRENCY_MISMATCH` (400 — a malformed request, not a balance cap; Slice 2 review #1/#5) — the PRD's "lock on alloc to invoices in another currency" path is **not silently supported**. Cross-currency application requires a future designed conversion event (two same-currency balanced legs + an FX bridge, slice 5 extension; §11.2 P7). The **multi-invoice allocation residual cent attaches to the largest open invoice** (Foundation `MoneyModule`, PRD). Overpayment remainder stays in `unallocated_balance` — **no silent relabel** to reusable credit (needs the wallet grant flow). Narrow single-entry shortcut only under P3 — and even the shortcut seeds `payment_settlement` (`settled_minor = allocated_minor` in the same txn) so refund/chargeback/return caps still apply.
+**Currency match (normative).** MVP allocation requires `settlement.currency == invoice.currency` (and the entry stays single-transaction-currency); a mismatch rejects with `ALLOCATION_CURRENCY_MISMATCH` (400 — a malformed request, not a balance cap; Slice 2 review #1/#5) — the PRD's "lock on alloc to invoices in another currency" path is **not silently supported**. Cross-currency application requires a future designed conversion event (two same-currency balanced legs + an FX bridge, slice 5 extension; §11.2 P7). The **multi-invoice allocation residual increment attaches to the largest open invoice** (`allocate(..., Residual::Largest)`: exact proportional shares rounded once HALF_EVEN at the lump's scale, PRD). A split whose currency matches but whose scale differs from the settlement's stored scale is rejected with `ALLOCATION_CURRENCY_MISMATCH`. Overpayment remainder stays in `unallocated_balance` — **no silent relabel** to reusable credit (needs the wallet grant flow). Narrow single-entry shortcut only under P3 — and even the shortcut seeds `payment_settlement` (`settled = allocated` in the same txn) so refund/chargeback/return caps still apply.
 
 **Bounds (working default, PM confirmed — §11.2 P10).** One allocation transaction **touches** at most **500 invoices** — the bound is on the invoices the split actually pays (each is a posted `AR` leg), NOT on the payer's open-invoice backlog, which is read-only and uncapped. So a payer with thousands of open invoices whose payment reaches only a few of them allocates in one transaction; the ceiling exists to keep the posted entry under the Foundation engine's 1,000-line limit. The cap is configurable (`payments.max_invoices_per_allocation`, default 500, bounded `1..=998` at boot — never past the line ceiling). A split that would touch more than the cap (a lump large enough to pay > cap invoices at once) is today rejected `ALLOCATION_TOO_LARGE`; processing it as **chunked continuations under the same `allocationId`** (deterministic precedence order, one ACID txn per chunk, idempotency row finalizing on the last chunk) is a tracked follow-up. Referenced by the §6/§7 load tests.
 
@@ -253,12 +253,12 @@ In the same ACID txn the handler increments `payment_settlement.allocated_minor`
 3. [ ] - `p1` - **IF** no matching `payment_settlement` row (allocation before settlement): queue in `pending_event_queue` and **RETURN** 202 `allocation-queued` + correlation handle - `inst-alloc-queue`
 4. [ ] - `p1` - **IF** settlement.currency != invoice.currency: **RETURN** 400 `ALLOCATION_CURRENCY_MISMATCH` - `inst-alloc-currency`
 5. [ ] - `p1` - DB: Derive candidate open invoices from the ledger's **own** `ar_invoice_balance` (oldest-first default; Mode A / P5) - `inst-alloc-candidates`
-6. [ ] - `p1` - Algorithm: compute per-invoice split using `cpt-cf-bss-ledger-algo-allocation-mode-a` (residual cent → largest open invoice) - `inst-alloc-split`
+6. [ ] - `p1` - Algorithm: compute per-invoice split using `cpt-cf-bss-ledger-algo-allocation-mode-a` (residual increment → largest open invoice) - `inst-alloc-split`
 7. [ ] - `p1` - Enforce the touched-invoice bound on the COMPUTED split (invoices receiving a positive amount), not the candidate read: **IF** the split touches > `payments.max_invoices_per_allocation` (default 500) invoices **RETURN** `ALLOCATION_TOO_LARGE`. Processing such a split as chunked continuations under the same `allocationId` (one ACID txn per chunk, deterministic precedence order, idempotency row finalizing on the last chunk) is a tracked follow-up - `inst-alloc-chunk`
 8. [ ] - `p1` - Post one balanced entry per txn: DR `UNALLOCATED` / CR `AR` per invoice, through the Foundation PostingService - `inst-alloc-post`
-9. [ ] - `p1` - DB: In the same txn, increment `payment_settlement.allocated_minor`; **IF** `CHECK (allocated_minor + refunded_unallocated_minor ≤ settled_minor)` fails **RETURN** 409 `ALLOCATION_EXCEEDS_SETTLED` - `inst-alloc-cap`
+9. [ ] - `p1` - DB: In the same txn, increment `payment_settlement.allocated`; **IF** `CHECK (allocated + refunded_unallocated ≤ settled)` fails **RETURN** 409 `ALLOCATION_EXCEEDS_SETTLED` - `inst-alloc-cap`
 10. [ ] - `p1` - DB: In the same txn, insert N `payment_allocation` rows (one per invoice, key `(tenant_id, allocation_id, invoice_id)`), stamping `precedence_policy_ref` - `inst-alloc-rows`
-11. [ ] - `p1` - DB: In the same txn, upsert `payment_allocation_refund.allocated_minor += per-invoice amount` per `(tenant, payment_id, invoice_id)` - `inst-alloc-refundcap`
+11. [ ] - `p1` - DB: In the same txn, upsert `payment_allocation_refund.allocated += per-invoice amount` per `(tenant, payment_id, invoice_id)` - `inst-alloc-refundcap`
 12. [ ] - `p1` - Emit `billing.ledger.payment.allocated` (§10) - `inst-alloc-event`
 13. [ ] - `p1` - **RETURN** 201 posting reference (per-invoice split) - `inst-alloc-return`
 
@@ -281,7 +281,7 @@ Records posting + reconciliation linkage only; idempotent per `(tenant, dispute_
 
 Revenue is unchanged unless an S3 note applies (slice 3). **Negative-Cash interaction:** a clawback that would drive `CASH_CLEARING` below zero (funds already swept) MUST NOT silently post and MUST NOT be hard-rejected losing the dispute outcome — it posts a balanced **documented-loss** line to the named class **`DISPUTE_LOSS_EXPENSE`** (minor — debit-normal expense, additive per C2; **not** the `SUSPENSE` mapping class) and routes to the dedicated **chargeback-cash-negative** alarm (§10, same routing to Revenue Assurance as AC #17 violations) so the outcome is recorded without a negative Cash balance. The dispute-**opened** reclass is **excluded** from the AR tie-out roll-up delta (AR-class-neutral, AC #7). **(minor — partial dispute)** A **partial** chargeback disputes only part of an invoice, but `ar_status` on `ar_invoice_balance` is one enum per invoice. To avoid overstating the disputed amount: the reclassification moves **only the disputed sub-amount** between the invoice's AR `ACTIVE`/`DISPUTED` sub-class balances (same balanced AR-class-neutral move, scoped to the disputed minor amount); the invoice-level `ar_status` flag flips to `DISPUTED` only when the **full** open AR is disputed, otherwise it stays `ACTIVE` alongside a non-zero `DISPUTED` sub-balance. Disputed-amount reporting reads the sub-balance, not the flag.
 
-**Refund interaction (normative).** `lost`/cash-out outcomes increment `payment_settlement.clawed_back_minor` in the posting txn under the rank-1 lock; the total money-out cap `CHECK (refunded_minor + clawed_back_minor ≤ settled_minor)` blocks paying out the same settlement twice. An **open** dispute on a payment **holds that payment's refund stage-2** in `pending_event_queue` (slice 3 consults the dispute state before posting). A `lost` outcome on an **already-refunded** payment MUST NOT auto-post — it routes to the exception queue (slice 7; additive type `CHARGEBACK_ON_REFUNDED`) for manual disposition.
+**Refund interaction (normative).** `lost`/cash-out outcomes increment `payment_settlement.clawed_back` in the posting txn under the rank-1 lock; the total money-out cap `CHECK (refunded + clawed_back ≤ settled)` blocks paying out the same settlement twice. An **open** dispute on a payment **holds that payment's refund stage-2** in `pending_event_queue` (slice 3 consults the dispute state before posting). A `lost` outcome on an **already-refunded** payment MUST NOT auto-post — it routes to the exception queue (slice 7; additive type `CHARGEBACK_ON_REFUNDED`) for manual disposition.
 
 **Success Scenarios**:
 - `opened` posts the variant selected by the PSP funds-movement fact; `won`/`lost`/`partial` branch on the recorded variant
@@ -298,7 +298,7 @@ Revenue is unchanged unless an S3 note applies (slice 3). **Negative-Cash intera
 3. [ ] - `p1` - **IF** prerequisite phase missing (e.g. won/lost before opened): queue via `cpt-cf-bss-ledger-algo-payment-out-of-order-queueing` and **RETURN** 202 `dispute-phase-queued` + alert - `inst-cb-ooo`
 4. [ ] - `p1` - **IF** phase == opened: select variant from the PSP funds-movement fact — funds withheld → cash-hold (`CASH_CLEARING → DISPUTE_HOLD`); funds not moved → AR-reclass (`ACTIVE→DISPUTED`, AR-class-neutral, scoped to the disputed sub-amount for partial disputes) - `inst-cb-opened`
 5. [ ] - `p1` - **IF** phase ∈ {won, lost, partial}: post the balanced outcome entry per the phase/variant table above - `inst-cb-outcome`
-6. [ ] - `p1` - **IF** phase == lost or cash-out: DB: increment `payment_settlement.clawed_back_minor` in the posting txn under the rank-1 lock; enforce `CHECK (refunded_minor + clawed_back_minor ≤ settled_minor)` - `inst-cb-clawback`
+6. [ ] - `p1` - **IF** phase == lost or cash-out: DB: increment `payment_settlement.clawed_back` in the posting txn under the rank-1 lock; enforce `CHECK (refunded + clawed_back ≤ settled)` - `inst-cb-clawback`
 7. [ ] - `p1` - **IF** payment already refunded: **RETURN** route to exception queue (`CHARGEBACK_ON_REFUNDED`) — never auto-post - `inst-cb-refunded`
 8. [ ] - `p1` - **IF** clawback would drive `CASH_CLEARING` negative: post balanced documented-loss line to `DISPUTE_LOSS_EXPENSE` + raise chargeback-cash-negative alarm - `inst-cb-negcash`
 9. [ ] - `p1` - Emit `billing.ledger.dispute.recorded` (`cycle`, `phase`) (§10) - `inst-cb-event`
@@ -377,13 +377,13 @@ The ledger computes the order/split (Mode A, P5; AC #25):
 
 **Policy versioning (normative).** The tenant precedence strategy is an **effective-dated version**; the version in effect at allocation time is stamped on every `payment_allocation` row as `precedence_policy_ref` (the slice 4 pinned-ref pattern). A policy change never rewrites past splits — re-runs reproduce them from the stamped version. (A future statutory registry, if added per, versions the same way.)
 
-**Policy/decision boundary (normative).** Allocation has two separable concerns: **(a) the decision** — given a lump + open invoices, which invoice gets how much; and **(b) the recording** — posting `DR Unallocated / CR AR` per invoice under the money-out caps / no-negative / residual-cent. **(b) is core ledger duty and stays here.** Mode A keeps the *default* decision (oldest-first + tenant overrides) inline as a ratified convenience (P5), but the decision is an **externalizable seam**: (1) **statutory appropriation rules MUST NEVER live in the ledger** — when the registry arrives it is an **external AR-policy / cash-application component** that reads open-AR from a ledger projection and issues an **explicit per-invoice split**, which the ledger only **validates** (caps/no-negative/`payment_settlement`) and records; (2) **Mode B** (the caller sends a pre-computed split, ledger validates) is the documented escape hatch the design weighed — `POST …/allocations` MAY accept a caller-computed split, validated identically, so jurisdiction-specific law never touches the append-only posting path.
+**Policy/decision boundary (normative).** Allocation has two separable concerns: **(a) the decision** — given a lump + open invoices, which invoice gets how much; and **(b) the recording** — posting `DR Unallocated / CR AR` per invoice under the money-out caps / no-negative / residual-increment. **(b) is core ledger duty and stays here.** Mode A keeps the *default* decision (oldest-first + tenant overrides) inline as a ratified convenience (P5), but the decision is an **externalizable seam**: (1) **statutory appropriation rules MUST NEVER live in the ledger** — when the registry arrives it is an **external AR-policy / cash-application component** that reads open-AR from a ledger projection and issues an **explicit per-invoice split**, which the ledger only **validates** (caps/no-negative/`payment_settlement`) and records; (2) **Mode B** (the caller sends a pre-computed split, ledger validates) is the documented escape hatch the design weighed — `POST …/allocations` MAY accept a caller-computed split, validated identically, so jurisdiction-specific law never touches the append-only posting path.
 
 **Steps**:
 1. [ ] - `p1` - Resolve the effective-dated tenant precedence policy version at allocation time - `inst-prec-policy`
 2. [ ] - `p1` - **IF** customer-instructed hint present: apply it as the step-2 override; **ELSE IF** tenant override configured (highest-amount-first / tax-jurisdiction / contract priority): apply it; **ELSE** default oldest posting date first, ties by smallest `invoice_id` - `inst-prec-order`
 3. [ ] - `p1` - **FOR EACH** invoice in precedence order: assign min(remaining lump, invoice open AR); stop at zero remainder - `inst-prec-assign`
-4. [ ] - `p1` - Attach the multi-invoice residual cent to the **largest open invoice** (Foundation MoneyModule, PRD) - `inst-prec-residual`
+4. [ ] - `p1` - Attach the multi-invoice residual increment to the **largest open invoice** (`Residual::Largest`, ties to the lowest index; PRD) - `inst-prec-residual`
 5. [ ] - `p1` - Stamp `precedence_policy_ref` on every produced row - `inst-prec-stamp`
 6. [ ] - `p1` - **RETURN** deterministic split (reproducible from the stamped policy version) - `inst-prec-return`
 
@@ -394,12 +394,12 @@ The ledger computes the order/split (Mode A, P5; AC #25):
 **Input**: any money-out posting (allocation, refund stage-1, chargeback clawback, settlement return) referencing a payment
 **Output**: capped, serialized counter update or a 409 cap error / exception-queue routing
 
-**(— normative).** `payment_settlement` is the single DB serialization point for **all** per-payment money-out: `allocated_minor` (allocation), `refunded_minor` + `refunded_unallocated_minor` (refund stage-1 increments — slice 3), `clawed_back_minor` (chargeback lost/cash-out), and the `settled_minor` decrement on settlement return. Refund rows (slice 3) carry **mandatory** `payment_id` + `currency` for **both** patterns, so every money-out finds its counter row. **Invariant:** **no AR-reducing money movement may post without a `payment_settlement` row** — every settlement path (Pattern A **and** the P3 atomic shortcut) seeds it, so the serialization point always exists for later refund/chargeback/return caps.
+**(— normative).** `payment_settlement` is the single DB serialization point for **all** per-payment money-out: `allocated` (allocation), `refunded` + `refunded_unallocated` (refund stage-1 increments — slice 3), `clawed_back` (chargeback lost/cash-out), and the `settled` (plus fee share of `fee`) decrement on settlement return. Every counter is canonical decimal text at the payment's stored `currency_scale`; a delta in another currency or scale is rejected (`InconsistentScale`), never rescaled. Refund rows (slice 3) carry **mandatory** `payment_id` + `currency` for **both** patterns, so every money-out finds its counter row. **Invariant:** **no AR-reducing money movement may post without a `payment_settlement` row** — every settlement path (Pattern A **and** the P3 atomic shortcut) seeds it, so the serialization point always exists for later refund/chargeback/return caps.
 
 **Steps**:
 1. [ ] - `p1` - DB: Lock the `payment_settlement` row for the payment (rank-1 counter within the extended lock order; balance grains first — §3 lock order) - `inst-cap-lock`
-2. [ ] - `p1` - Apply the counter delta for the flow (allocated_minor / refunded_minor / refunded_unallocated_minor / clawed_back_minor / settled_minor decrement) in the posting txn - `inst-cap-delta`
-3. [ ] - `p1` - Enforce CHECKs post-delta: `allocated_minor ≤ settled_minor`; `allocated_minor + refunded_unallocated_minor ≤ settled_minor`; `refunded_minor + clawed_back_minor ≤ settled_minor`; `refunded_minor ≤ settled_minor`; `refunded_unallocated_minor ≥ 0`; `clawed_back_minor ≥ 0` - `inst-cap-checks`
+2. [ ] - `p1` - Apply the counter delta for the flow (allocated / refunded / refunded_unallocated / clawed_back / settled decrement) in the posting txn: read the row, add exactly, update conditionally on `version` - `inst-cap-delta`
+3. [ ] - `p1` - Enforce CHECKs post-delta (PostgreSQL casts the validated text to `numeric`): `allocated ≤ settled`; `allocated + refunded_unallocated ≤ settled`; `fee ≤ settled`; `refunded + clawed_back ≤ settled`; `refunded ≤ settled`; `refunded_unallocated ≥ 0`; `clawed_back ≥ 0` - `inst-cap-checks`
 4. [ ] - `p1` - **IF** a CHECK fails: **RETURN** the flow's cap error (409, e.g. `ALLOCATION_EXCEEDS_SETTLED`) or route to the exception queue where the flow mandates it (over-allocated return, chargeback-on-refunded) - `inst-cap-fail`
 5. [ ] - `p1` - **RETURN** committed counter state (journal + counters commit or roll back together) - `inst-cap-return`
 
@@ -469,7 +469,7 @@ The ledger computes the order/split (Mode A, P5; AC #25):
 
 **Transitions**:
 1. [ ] - `p1` - **FROM** opened **TO** won **WHEN** Payments reports phase=won for the cycle (release `DISPUTE_HOLD → CASH_CLEARING` or reclassify `DISPUTED→ACTIVE` per the recorded opened variant) - `inst-st-dc-won`
-2. [ ] - `p1` - **FROM** opened **TO** lost **WHEN** Payments reports phase=lost (clawback + `clawed_back_minor` increment; documented-loss line if Cash would go negative) - `inst-st-dc-lost`
+2. [ ] - `p1` - **FROM** opened **TO** lost **WHEN** Payments reports phase=lost (clawback + `clawed_back` increment; documented-loss line if Cash would go negative) - `inst-st-dc-lost`
 3. [ ] - `p1` - **FROM** opened **TO** partial **WHEN** Payments reports phase=partial (balanced JEs netting to the PSP outcome) - `inst-st-dc-partial`
 4. [ ] - `p1` - **FROM** won (cycle N) **TO** opened (cycle N+1) **WHEN** the dispute re-opens — the phase machine is re-entrant per cycle; each `(dispute_id:cycle:phase)` is idempotent independently - `inst-st-dc-reopen`
 5. [ ] - `p1` - Out-of-order phase arrival (won/lost before opened) does not transition — it queues (`cpt-cf-bss-ledger-state-payment-pending-event`) - `inst-st-dc-ooo`
@@ -492,7 +492,7 @@ The ledger computes the order/split (Mode A, P5; AC #25):
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-ledger-dod-payments-allocation-settlement`
 
-The system **MUST** post Pattern A on `PaymentSettled` (funds to `UNALLOCATED`, never AR), split the PSP fee to `PSP_FEE_EXPENSE` when `feeMinor` is present (net Cash / gross Unallocated), seed the `payment_settlement` counter in the same transaction, and upsert `unallocated_balance` — idempotent per `(tenant, PAYMENT_SETTLE, pspTransactionId)`.
+The system **MUST** post Pattern A on `PaymentSettled` (funds to `UNALLOCATED`, never AR), split the PSP fee to `PSP_FEE_EXPENSE` when `fee` is non-zero (net Cash / gross Unallocated), seed the `payment_settlement` counter in the same transaction, and upsert `unallocated_balance` — idempotent per `(tenant, PAYMENT_SETTLE, pspTransactionId)`.
 
 **Implements**:
 - `cpt-cf-bss-ledger-flow-payment-settlement`
@@ -507,7 +507,7 @@ The system **MUST** post Pattern A on `PaymentSettled` (funds to `UNALLOCATED`, 
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-ledger-dod-payments-allocation-settlement-return`
 
-The system **MUST** post `SETTLEMENT_RETURN` (DR `UNALLOCATED` / CR `CASH_CLEARING`) idempotent per `(tenant, SETTLEMENT_RETURN, pspReturnId)`, decrement `settled_minor` under the rank-1 lock, route over-allocated returns to the exception queue (`SETTLEMENT_RETURN_OVER_ALLOCATED`) instead of auto-posting, and reuse the documented-loss pattern for negative-Cash returns.
+The system **MUST** post `SETTLEMENT_RETURN` (DR `UNALLOCATED` / CR `CASH_CLEARING`) idempotent per `(tenant, SETTLEMENT_RETURN, pspReturnId)`, decrement `settled` (and the HALF_EVEN fee share of `fee`) under the rank-1 lock, route over-allocated returns to the exception queue (`SETTLEMENT_RETURN_OVER_ALLOCATED`) instead of auto-posting, and reuse the documented-loss pattern for negative-Cash returns.
 
 **Implements**:
 - `cpt-cf-bss-ledger-flow-payment-settlement-return`
@@ -522,7 +522,7 @@ The system **MUST** post `SETTLEMENT_RETURN` (DR `UNALLOCATED` / CR `CASH_CLEARI
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-ledger-dod-payments-allocation-allocation`
 
-The system **MUST** derive candidate open invoices from its own `ar_invoice_balance`, compute the split via the precedence algorithm (default oldest-first, tenant overrides, statutory registry deferred), post DR `UNALLOCATED` / CR `AR` per invoice, enforce the per-payment caps at the `payment_settlement` row, write N `payment_allocation` rows stamped with `precedence_policy_ref`, upsert `payment_allocation_refund`, reject cross-currency allocation (400), attach the residual cent to the largest open invoice, bound the number of invoices ONE allocation may touch by `payments.max_invoices_per_allocation` (default 500; a larger split → `ALLOCATION_TOO_LARGE`, with chunked continuations under one `allocationId` a tracked follow-up), and keep overpayment remainders unallocated.
+The system **MUST** derive candidate open invoices from its own `ar_invoice_balance`, compute the split via the precedence algorithm (default oldest-first, tenant overrides, statutory registry deferred), post DR `UNALLOCATED` / CR `AR` per invoice, enforce the per-payment caps at the `payment_settlement` row, write N `payment_allocation` rows stamped with `precedence_policy_ref`, upsert `payment_allocation_refund`, reject cross-currency or cross-scale allocation (400), attach the residual increment to the largest open invoice, bound the number of invoices ONE allocation may touch by `payments.max_invoices_per_allocation` (default 500; a larger split → `ALLOCATION_TOO_LARGE`, with chunked continuations under one `allocationId` a tracked follow-up), and keep overpayment remainders unallocated.
 
 **Implements**:
 - `cpt-cf-bss-ledger-flow-payment-allocation`
@@ -538,7 +538,7 @@ The system **MUST** derive candidate open invoices from its own `ar_invoice_bala
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-ledger-dod-payments-allocation-chargeback`
 
-The system **MUST** record chargeback phases idempotent per `(tenant, dispute_id:cycle:phase)`, select the opened variant from the PSP funds-movement fact (cash-hold to `DISPUTE_HOLD` vs AR-reclass `ACTIVE→DISPUTED`), branch outcomes on the recorded variant, keep the opened reclass AR-class-neutral and out of the tie-out roll-up, scope partial disputes to the disputed sub-amount, increment `clawed_back_minor` on lost/cash-out under the total money-out cap, hold open-dispute refund stage-2 in the queue, route lost-on-refunded to the exception queue, and post the `DISPUTE_LOSS_EXPENSE` documented-loss line + alarm instead of negative Cash.
+The system **MUST** record chargeback phases idempotent per `(tenant, dispute_id:cycle:phase)`, select the opened variant from the PSP funds-movement fact (cash-hold to `DISPUTE_HOLD` vs AR-reclass `ACTIVE→DISPUTED`), branch outcomes on the recorded variant, keep the opened reclass AR-class-neutral and out of the tie-out roll-up, scope partial disputes to the disputed sub-amount, increment `clawed_back` on lost/cash-out under the total money-out cap, hold open-dispute refund stage-2 in the queue, route lost-on-refunded to the exception queue, and post the `DISPUTE_LOSS_EXPENSE` documented-loss line + alarm instead of negative Cash.
 
 **Implements**:
 - `cpt-cf-bss-ledger-flow-payment-chargeback-phase`
@@ -601,7 +601,7 @@ Testing is a **delta over the Foundation testing architecture** (same level stru
 **Unit:**
 
 - [ ] Allocation precedence: default + tie-break, tenant overrides incl. customer-instructed (statutory registry deferred)
-- [ ] Multi-invoice residual cent → largest open invoice
+- [ ] Multi-invoice residual increment → largest open invoice (`1.00` over three equal invoices at scale 2 → `0.34`, `0.33`, `0.33` with the residual on the largest, lowest index on ties)
 - [ ] Wallet two-shape builders + sub-grain consumption order; cap math
 
 **Integration (testcontainers):**
@@ -614,7 +614,7 @@ Testing is a **delta over the Foundation testing architecture** (same level stru
 - [ ] Chargeback-opened is AR-class-neutral (tie-out roll-up unchanged); `ar_status` reclass posts new lines (no `journal_line` UPDATE)
 - [ ] Chargeback-lost never drives `CASH_CLEARING` negative (routes to alarm + balanced loss line)
 - [ ] Combined money-out cap: full refund stage-1 then chargeback `lost` on the same payment → second blocked/exception
-- [ ] Settlement return decrements `settled_minor`; a return with `allocated_minor` over the remainder routes to the exception queue, never auto-posts
+- [ ] Settlement return decrements `settled` and the HALF_EVEN fee share; a return with `allocated` over the remainder routes to the exception queue, never auto-posts
 - [ ] Dispute cycle 2 posts `opened` after cycle-1 `won`
 - [ ] A >500-invoice allocation chunks under one `allocationId`
 - [ ] Queued items survive restart via `pending_event_queue`
@@ -645,7 +645,7 @@ Testing is a **delta over the Foundation testing architecture** (same level stru
 
 - **Performance**: Inherits Foundation targets — B2 resolved 2026-06-10 via B11 (PRD draft committed as v1 SLOs, gated by the B3 load test); B3 remains open (§11.2). Feature-specific: settle/allocate/credit posts are single-balanced-entry writes (p95 ≤ 500 ms target); hot rows are `payment_settlement` (per payment) and `unallocated_balance` (per payer) — same contention profile + mitigation as the Foundation `ar_payer_balance`. Load tests run at the ≤ 500 invoices/allocation-txn bound. Aged-unallocated and aged-queue ages MUST alarm.
 - **Security**: Inherits Foundation RLS. **Tenancy axis & delegation.** The RLS/owner axis is `tenant_id` (= the **resolved payer** per the rule, P6); `payer_tenant_id`/`resource_tenant_id` on `payment_allocation` are **descriptive** dimensions, not the RLS key. **Payment delegation is intra-payer-tenant:** because AR is consolidated onto the resolved payer **at posting time** (direct-to-payer), a parent settling/allocating a managed child's consumption operates entirely within `tenant_id = payer` — **flat RLS is correct for it**, no cross-tenant access. Cross-tenant *reads* (a parent reading a self-managed child's own ledger) are the separate path served by the Variant B subtree-RLS — **ACTIVE in MVP (Slice 6, decision 2.B):** middleware resolves `app.subtree_ids` per request (`BarrierMode::Respect`), so a parent reads its own Respect-subtree; cross-barrier reads stay elevated. No-mixed-payer/legal-entity per entry; append-only; PII-minimized events. Posting payments/disputes/credit requires the billing-poster scope; high-value credit grants and chargeback-loss postings follow dual-control per policy (thresholds are effective-dated policy versions). The ledger trusts Payments-module event provenance (PSP verification upstream, C4).
-- **Observability**: Metrics: `ledger_payment_settle_total`, `ledger_settlement_return_total`, `ledger_allocation_total`, `ledger_unallocated_balance_minor` (gauge, by tenant), `ledger_aged_unallocated_seconds`, `ledger_dispute_recorded_total{phase}`, `ledger_chargeback_cash_negative_total`, `ledger_credit_apply_total` / `ledger_credit_apply_rejected_total{reason}`, `ledger_allocation_queue_depth`, `ledger_dispute_phase_queue_depth`. Thresholds wire to the NFR targets and the aged-queue + chargeback alarms.
+- **Observability**: Metrics: `ledger_payment_settle_total`, `ledger_settlement_return_total`, `ledger_allocation_total`, `ledger_aged_unallocated_seconds`, `ledger_dispute_recorded_total{phase}`, `ledger_chargeback_cash_negative_total`, `ledger_credit_apply_total` / `ledger_credit_apply_rejected_total{reason}`, `ledger_allocation_queue_depth`, `ledger_dispute_phase_queue_depth`. Thresholds wire to the NFR targets and the aged-queue + chargeback alarms.
 - **Data**: All new tables tenant-scoped with RLS (C1); full schemas in §9.
 - **Compliance**: Single-bucket unallocated pool is compliant only with per-event-type sub-balance tracking + the sub-grain guard (P1); statutory allocation compliance path is the customer-instructed override.
 
@@ -653,7 +653,7 @@ Testing is a **delta over the Foundation testing architecture** (same level stru
 
 ### 8.1 Endpoints
 
-REST per `rest-api-design`, behind the inbound API gateway; money as `{amountMinor, currency, scale}`. Mutating posts idempotent on the listed business key.
+REST per `rest-api-design`, behind the inbound API gateway; money as `MoneyDto` `{amount, currency, currency_scale}` (decimal string in major units; a JSON number is rejected). Mutating posts idempotent on the listed business key.
 
 | Method | Path | Purpose | Idempotency |
 |--------|------|---------|-------------|
@@ -697,13 +697,16 @@ The per-payment money-out serialization point.
 | `tenant_id` | uuid | PK part |
 | `payment_id` | string | PK part; PSP settlement id |
 | `currency` | char | |
-| `settled_minor` | bigint | decremented by `SETTLEMENT_RETURN` |
-| `allocated_minor` | bigint | incremented by allocation |
-| `refunded_minor` | bigint | refund stage-1, slice 3 |
-| `refunded_unallocated_minor` | bigint | Pattern-A refund stage-1, slice 3 |
-| `clawed_back_minor` | bigint | chargeback lost or cash-out, this feature |
+| `currency_scale` | smallint | stored posting scale (0–28) of every money column in the row |
+| `settled` | text (canonical decimal, major units) | decremented by `SETTLEMENT_RETURN` |
+| `fee` | text (canonical decimal) | PSP fee withheld at settlement; decremented by the fee share on return |
+| `allocated` | text (canonical decimal) | incremented by allocation |
+| `refunded` | text (canonical decimal) | refund stage-1, slice 3 |
+| `refunded_unallocated` | text (canonical decimal) | Pattern-A refund stage-1, slice 3 |
+| `clawed_back` | text (canonical decimal) | chargeback lost or cash-out, this feature |
+| `version` | bigint | conditional-update guard; a stale read retries the transaction |
 
-PK `(tenant_id, payment_id)`. CHECKs: `allocated_minor <= settled_minor` (existing, stays); `allocated_minor + refunded_unallocated_minor <= settled_minor` (Pattern-A spendable headroom); `refunded_minor + clawed_back_minor <= settled_minor` (total money-out cap); `refunded_minor <= settled_minor` (kept — incremented by slice 3 stage-1, decremented by its stage-1 reversal); `refunded_unallocated_minor >= 0`; `clawed_back_minor >= 0`.
+PK `(tenant_id, payment_id)`. Every money column has `CHECK (bss.ledger_decimal_valid(col, currency_scale))` on PostgreSQL. CHECKs (as `::numeric` on PostgreSQL): `allocated <= settled` (existing, stays); `allocated + refunded_unallocated <= settled` (Pattern-A spendable headroom); `fee <= settled`; `refunded + clawed_back <= settled` (total money-out cap); `refunded <= settled` (kept — incremented by slice 3 stage-1, decremented by its stage-1 reversal); `refunded_unallocated >= 0`; `clawed_back >= 0`.
 
 ### 9.2 payment_allocation
 
@@ -714,8 +717,9 @@ PK `(tenant_id, payment_id)`. CHECKs: `allocated_minor <= settled_minor` (existi
 | `payer_tenant_id` | uuid | descriptive dimension, not the RLS key |
 | `payment_id` | string | |
 | `invoice_id` | string | |
-| `amount_minor` | bigint | |
+| `amount` | text (canonical decimal, major units) | `CHECK (amount > 0)` |
 | `currency` | char | |
+| `currency_scale` | smallint | |
 | `precedence_policy_ref` | string | policy version that produced the split |
 | `allocated_at_utc` | timestamptz | |
 
@@ -730,8 +734,9 @@ PK `(tenant_id, payment_id)`. CHECKs: `allocated_minor <= settled_minor` (existi
 | `tenant_id` | uuid | PK part |
 | `payment_id` | string | PK part |
 | `invoice_id` | string | PK part |
-| `allocated_minor` | bigint | incremented by AllocationHandler in the allocation txn (first-touch upsert) |
-| `refunded_minor` | bigint | defaults 0; consumed by slice 3, which adds the `CHECK (refunded_minor ≤ allocated_minor)` usage |
+| `currency` / `currency_scale` | char / smallint | stored money metadata |
+| `allocated` | text (canonical decimal) | incremented by AllocationHandler in the allocation txn (first-touch insert, then version-guarded update) |
+| `refunded` | text (canonical decimal) | defaults `'0'`; consumed by slice 3, which adds the `CHECK (refunded ≤ allocated)` usage |
 
 PK `(tenant_id, payment_id, invoice_id)`. Its lock rank is the **last** rank in the unified order (after `invoice_exposure`, per slice 3) — this feature acquiring it last is consistent because it never locks the recognition/exposure tables.
 
@@ -742,7 +747,10 @@ PK `(tenant_id, payment_id, invoice_id)`. Its lock rank is the **last** rank in 
 | `tenant_id` | uuid | |
 | `payer_tenant_id` | uuid | |
 | `currency` | char | |
-| `balance_minor` | bigint | credit-normal; `CHECK (balance_minor >= 0)` — NO negative |
+| `currency_scale` | smallint | |
+| `balance` | text (canonical decimal, major units) | credit-normal; `CHECK (balance >= 0)` — NO negative |
+| `functional_balance` / `functional_currency` / `functional_currency_scale` | text / char / smallint | carried functional value (Slice 5) |
+| `version` | bigint | conditional-update guard |
 
 ### 9.5 reusable_credit_subbalance
 
@@ -752,7 +760,9 @@ PK `(tenant_id, payment_id, invoice_id)`. Its lock rank is the **last** rank in 
 | `payer_tenant_id` | uuid | |
 | `currency` | char | |
 | `credit_grant_event_type` | string | per-event-type sub-grain the PRD mandates |
-| `balance_minor` | bigint | `CHECK (balance_minor >= 0)` at the `(currency, event_type)` sub-grain — NO negative |
+| `currency_scale` | smallint | |
+| `balance` | text (canonical decimal, major units) | `CHECK (balance >= 0)` at the `(currency, event_type)` sub-grain — NO negative |
+| `version` | bigint | conditional-update guard |
 
 ### 9.6 pending_event_queue
 
@@ -805,7 +815,7 @@ Inherits Foundation open items — B2 resolved 2026-06-10 via B11 (PRD draft com
 | Atomic settle-and-apply shortcut | allowed only when atomic, no residual | ✅ Accepted default | — |
 | Statutory allocation-rule registry | jurisdiction rules override tenant strategy; registry per Design | 🔄 **Amended 2026-06-11: statutory registry deferred — out of v1 scope.** Customer-instructed override is the B2B compliance path; registry added post-MVP only if Legal names a market whose payers a statutory regime binds. Platform default order = **oldest invoice first** stays. (Supersedes the 2026-06-10 "UK CCA only" ratification.) | Legal + PM |
 | Allocation split ownership | **Mode A minimal (🔄 2026-06-15)** — ledger derives candidates from its **own** `ar_invoice_balance` (oldest-first) and computes the split via precedence; event carries **settlement + optional customer-instructed hint** (no candidate set from Payments) | ✅ Ratified 2026-06-10, refined 2026-06-15; remaining **action** (not a design blocker): confirm the settlement-event contract (lump + optional hint) with the Payments module at S2 start | PM + Architecture |
-| `payment_allocation_refund` ownership | created + `allocated_minor` maintained **here** at allocation time; slice 3 consumes | ✅ Proposed default | — |
+| `payment_allocation_refund` ownership | created + `allocated` maintained **here** at allocation time; slice 3 consumes | ✅ Proposed default | — |
 | Cross-currency allocation | **MVP rejects** (`ALLOCATION_CURRENCY_MISMATCH`); future: designed conversion event with FX bridge (slice 5 extension) — PRD "lock on alloc in another currency" deferred, not silently dropped | ✅ **Confirmed 2026-06-17 (@vstudzinskyi, decision 5.A): MVP rejects; cross-currency deferred to slice 5** | PM + Architecture |
 | Origin payment reference on money-out events | refund/return rows carry **mandatory** `payment_id` + `currency` for both patterns — assumes every PSP/bank refund/return event references the origin payment | ⏳ Pending — confirm with Payments | Payments team |
 | `DISPUTE_HOLD` + `DISPUTE_LOSS_EXPENSE` account classes | chargeback cash-hold parks in `DISPUTE_HOLD`; negative-Cash clawback documented-loss posts to `DISPUTE_LOSS_EXPENSE` | ✅ **Names accepted 2026-06-17 (@vstudzinskyi, decision 4)**; ⏳ Finance to confirm GL **treatment/mapping** | Finance |

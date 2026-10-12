@@ -41,6 +41,7 @@ fn streaming_idents(method: &RestMethodModel) -> Option<(Type, Type)> {
     }
 }
 
+/// Expands a parsed `#[rest_contract]` projection into the cleaned trait, client, routes and REST binding function.
 pub fn generate(model: &RestContractModel) -> TokenStream {
     if let Some(err) = check_path_placeholders(model) {
         return err;

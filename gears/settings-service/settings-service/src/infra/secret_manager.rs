@@ -64,7 +64,7 @@ const FIRST_PARTY_TOKEN_SCOPE: &str = "*";
 /// grant — is what makes the lookup meet. The interactive vocabulary this gear
 /// reads on the way *in* is a separate matter; see
 /// [`crate::domain::stepup::INTERACTIVE_SUBJECT_TYPES`].
-const STORE_SUBJECT_TYPE: &str = "gts.cf.core.security.subject_service.v1~";
+const STORE_SUBJECT_TYPE: &str = toolkit_gts::gts_id!("cf.core.security.subject_service.v1~");
 
 /// The Secret Manager bound to `credstore`.
 // @cpt-dod:cpt-cf-settings-service-dod-secret-values-manager:p1

@@ -1,14 +1,3 @@
-//! End-to-end write-path enforcement tests (P2-M2) against a real temp-file
-//! `SQLite` DB, the in-memory backend, the tenant-only authorizer, and (where
-//! relevant) a mock `QuotaClient`. These prove the effective policy + quota
-//! gates actually bite on the control-plane write path:
-//!
-//! - disallowed declared mime → reject
-//! - oversized finalize → reject
-//! - metadata over-limit → reject (create + update)
-//! - quota exceeded → reject (create + version creation) when a client is wired
-//! - permissive when no policy configured (P1 behaviour preserved)
-
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::doc_markdown)]
 
 use std::sync::Arc;
@@ -40,8 +29,6 @@ use file_storage_sdk::{CustomMetadataEntry, CustomMetadataPatch, NewFile, OwnerK
 
 const GTS: &str = gts_id!("cf.fstorage.file.type.v1~x.test.file.type.v1~");
 
-/// A mock quota client that denies once the cumulative requested bytes exceed a
-/// cap. Each `check_storage_quota` call counts as a request of `additional_bytes`.
 struct CappedQuota {
     cap: u64,
     seen: AtomicU64,
@@ -76,7 +63,6 @@ impl QuotaClient for CappedQuota {
     }
 }
 
-/// A quota client that always fails (to verify fail-closed behaviour).
 struct ErroringQuota;
 
 #[async_trait]
@@ -165,14 +151,11 @@ fn new_file(owner: Uuid, mime: &str) -> NewFile {
     }
 }
 
-// ── allowed-types-policy ────────────────────────────────────────────────────
-
 #[tokio::test]
 async fn create_file_with_disallowed_mime_is_rejected() {
     let (svc, psvc, _dp, _store) = build_service(None).await;
     let ctx = ctx(Uuid::now_v7());
 
-    // Tenant policy allows only image/*.
     psvc.set_policy(
         &ctx,
         PolicyScope::Tenant,
@@ -185,7 +168,6 @@ async fn create_file_with_disallowed_mime_is_rejected() {
     .await
     .unwrap();
 
-    // text/plain is not allowed → reject.
     let err = svc
         .create_file(&ctx, new_file(Uuid::now_v7(), "text/plain"), None)
         .await
@@ -195,13 +177,10 @@ async fn create_file_with_disallowed_mime_is_rejected() {
         "got {err:?}"
     );
 
-    // image/png matches image/* → allowed.
     svc.create_file(&ctx, new_file(Uuid::now_v7(), "image/png"), None)
         .await
         .expect("image/png should be allowed");
 }
-
-// ── size-limits-policy ──────────────────────────────────────────────────────
 
 #[tokio::test]
 async fn finalize_oversized_upload_is_rejected() {
@@ -209,7 +188,6 @@ async fn finalize_oversized_upload_is_rejected() {
     let ctx = ctx(Uuid::now_v7());
     let owner = Uuid::now_v7();
 
-    // Tenant policy: global 10-byte cap.
     psvc.set_policy(
         &ctx,
         PolicyScope::Tenant,
@@ -230,7 +208,6 @@ async fn finalize_oversized_upload_is_rejected() {
         .await
         .unwrap();
 
-    // Finalize a 100-byte upload → exceeds the 10-byte policy ceiling.
     let err = svc
         .finalize_upload(&ctx, t.file_id, t.version_id, 100, vec![0u8; 32])
         .await
@@ -246,10 +223,6 @@ async fn finalize_oversized_upload_is_rejected() {
         "got {err:?}"
     );
 
-    // A 5-byte finalize is within the ceiling. `finalize_upload` now
-    // re-verifies the claimed size/hash against the real backend blob, so the
-    // 5 bytes must actually be written first (`dp.put_content` does the
-    // backend `put` + `finalize_upload` in one call, matching production).
     dp.put_content(
         &ctx,
         t.file_id,
@@ -261,15 +234,7 @@ async fn finalize_oversized_upload_is_rejected() {
     .expect("5 bytes within 10-byte cap");
 }
 
-// ── negative-size / malformed-hash-hex (P2 2.6) ─────────────────────────────
-//
-// Both were previously backstopped only by DB `CHECK` constraints
-// (`file_versions.size >= 0`), so an obviously-invalid claim surfaced as a raw
-// `DomainError::Database` -> 500 instead of a 400. `finalize_upload` /
-// `finalize_upload_by_token` now reject `size < 0` on entry, before any
-// policy/backend lookup or the P2 0.1 read-back; `handlers::finalize_version`
-// now rejects a `hash_hex` that doesn't decode to exactly 32 bytes (SHA-256).
-
+/// Rejected on entry; otherwise the DB `CHECK (size >= 0)` would surface as a 500.
 #[tokio::test]
 async fn finalize_negative_size_is_rejected_with_400_not_500() {
     let (svc, _psvc, _dp, store) = build_service(None).await;
@@ -281,9 +246,6 @@ async fn finalize_negative_size_is_rejected_with_400_not_500() {
         .await
         .unwrap();
 
-    // `size: -1` must be rejected by the new entry guard, not by the
-    // `file_versions` `CHECK (size >= 0)` constraint several steps later
-    // (which would surface as `DomainError::Database` -> 500).
     let err = svc
         .finalize_upload(&ctx, t.file_id, t.version_id, -1, vec![0u8; 32])
         .await
@@ -293,8 +255,6 @@ async fn finalize_negative_size_is_rejected_with_400_not_500() {
         "got {err:?}"
     );
 
-    // Secondary artifact: the version row must be untouched (still pending,
-    // size/hash never written) -- the guard fires before any store call.
     let version = store
         .get_version(t.file_id, t.version_id)
         .await
@@ -303,7 +263,6 @@ async fn finalize_negative_size_is_rejected_with_400_not_500() {
     assert_eq!(version.status, file_storage_sdk::VersionStatus::Pending);
     assert_eq!(version.size, 0);
 
-    // Identical guard on the token-authenticated sibling.
     let claims = file_storage::infra::signed_url::Claims {
         op: file_storage::infra::signed_url::Op::Put,
         file_id: t.file_id,
@@ -335,16 +294,8 @@ async fn finalize_negative_size_is_rejected_with_400_not_500() {
     assert_eq!(version.size, 0);
 }
 
-/// Drive `handlers::finalize_version` through a minimal real `axum::Router`
-/// (mirrors the pattern used in `multipart_test.rs`'s
-/// `multipart_complete_uses_reported_parts_not_empty_list`) with a `hash_hex`
-/// of the given decoded byte length, returning the response status and body
-/// text.
-///
-/// The length check lives only in the handler (per the plan's step 3: the
-/// service methods' only real callers always compute a genuine 32-byte
-/// SHA-256 digest), so exercising it means going through the HTTP boundary
-/// rather than calling `finalize_upload`/`finalize_upload_by_token` directly.
+/// Drives `handlers::finalize_version` through a real `axum::Router`: the hash length check
+/// lives only in the handler.
 async fn finalize_via_router_with_hash_len(hash_byte_len: usize) -> (StatusCode, String) {
     use axum::Router;
     use axum::body::Body;
@@ -393,10 +344,9 @@ async fn finalize_via_router_with_hash_len(hash_byte_len: usize) -> (StatusCode,
         + "fs-token=".len();
     let token = ticket.upload_url[token_start..].to_owned();
 
-    // P2 0.1 remaining: `finalize_version` now also requires a `FinalizeAuth`
-    // extension. `None` reproduces this test's pre-existing behavior (no
-    // internal-secret gate configured, token-only trust model).
-    let finalize_auth = Arc::new(handlers::FinalizeAuth::new(None));
+    let finalize_auth = Arc::new(handlers::FinalizeAuth::new(
+        "test-internal-secret".to_owned(),
+    ));
 
     let router = Router::new()
         .route(
@@ -420,6 +370,7 @@ async fn finalize_via_router_with_hash_len(hash_byte_len: usize) -> (StatusCode,
         .uri(uri)
         .header("content-type", "application/json")
         .header("x-fs-token", token)
+        .header("x-fs-internal-token", "test-internal-secret")
         .body(Body::from(serde_json::to_vec(&body).unwrap()))
         .unwrap();
 
@@ -434,7 +385,6 @@ async fn finalize_via_router_with_hash_len(hash_byte_len: usize) -> (StatusCode,
 
 #[tokio::test]
 async fn finalize_truncated_hash_hex_is_rejected() {
-    // 16 bytes: valid hex, but not the 32 bytes a SHA-256 digest decodes to.
     let (status, body) = finalize_via_router_with_hash_len(16).await;
     assert_eq!(
         status,
@@ -449,7 +399,6 @@ async fn finalize_truncated_hash_hex_is_rejected() {
 
 #[tokio::test]
 async fn finalize_oversized_hash_hex_is_rejected() {
-    // 48 bytes: valid hex, too long for a 32-byte SHA-256 digest.
     let (status, body) = finalize_via_router_with_hash_len(48).await;
     assert_eq!(
         status,
@@ -462,19 +411,8 @@ async fn finalize_oversized_hash_hex_is_rejected() {
     );
 }
 
-// ── malformed If-Match-Metadata (P2 2.10) ───────────────────────────────────
-//
-// `handlers::update_metadata` used to collapse an unparseable
-// `If-Match-Metadata` header to `None` via `.and_then(..).ok()`, which made
-// the patch apply unconditionally -- exactly the clients that tried to use
-// optimistic concurrency got silently downgraded to "no CAS at all" instead
-// of a `400`. The handler now parses the header only when present, and a
-// parse failure is a validation error.
-
-/// Drive `handlers::update_metadata` through a minimal real `axum::Router`
-/// (same pattern as `finalize_via_router_with_hash_len`), optionally setting
-/// an `If-Match-Metadata` header, and return the response status and body
-/// text.
+/// Drives `handlers::update_metadata` through a real `axum::Router` with an optional
+/// `If-Match-Metadata` header.
 async fn update_metadata_via_router(if_match_header: Option<&str>) -> (StatusCode, String) {
     use axum::Router;
     use axum::body::Body;
@@ -522,6 +460,7 @@ async fn update_metadata_via_router(if_match_header: Option<&str>) -> (StatusCod
     (status, text)
 }
 
+/// A present-but-unparseable header must be a validation error, not silently treated as no CAS.
 #[tokio::test]
 async fn patch_metadata_malformed_if_match_returns_400() {
     let (status, body) = update_metadata_via_router(Some("not-a-number")).await;
@@ -538,9 +477,6 @@ async fn patch_metadata_malformed_if_match_returns_400() {
 
 #[tokio::test]
 async fn patch_metadata_absent_if_match_applies_unconditionally() {
-    // Positive control: no header at all must still succeed (unconditional
-    // patch remains valid -- only a *present-but-unparseable* header is
-    // rejected).
     let (status, body) = update_metadata_via_router(None).await;
     assert_eq!(
         status,
@@ -549,16 +485,9 @@ async fn patch_metadata_absent_if_match_applies_unconditionally() {
     );
 }
 
+/// Stale and malformed headers both map to HTTP 400; they differ by the violation payload.
 #[tokio::test]
 async fn patch_metadata_stale_if_match_returns_conflict() {
-    // Existing CAS behaviour lock-in: a well-formed but stale version must
-    // still be rejected via `DomainError::PreconditionFailed`, distinct from
-    // the malformed-header `DomainError::Validation` case above. Per the 2.5
-    // canonical-error-mapping guardrail (`error_mapping_test.rs`), both
-    // variants happen to resolve to HTTP 400 -- there is no built-in 412 in
-    // this taxonomy -- so the two are told apart by the response body's
-    // violation payload (`IF_MATCH`/"revision changed" vs. the
-    // `if-match-metadata` field violation used above), not by status code.
     let (status, body) = update_metadata_via_router(Some("999999")).await;
     assert_eq!(
         status,
@@ -577,9 +506,6 @@ async fn patch_metadata_stale_if_match_returns_conflict() {
 
 #[tokio::test]
 async fn create_file_bakes_max_size_into_upload_url() {
-    // When a policy caps size, the signed URL carries the constraint so the
-    // sidecar enforces mid-stream. We can't decode the opaque token here, but
-    // the URL must still be issued (the gate did not reject create).
     let (svc, psvc, _dp, _store) = build_service(None).await;
     let ctx = ctx(Uuid::now_v7());
     psvc.set_policy(
@@ -602,8 +528,6 @@ async fn create_file_bakes_max_size_into_upload_url() {
         .unwrap();
     assert!(t.upload_url.contains("fs-token="));
 }
-
-// ── metadata-limits ─────────────────────────────────────────────────────────
 
 #[tokio::test]
 async fn create_file_with_too_many_metadata_pairs_is_rejected() {
@@ -661,7 +585,6 @@ async fn update_metadata_over_limit_is_rejected_on_resulting_total() {
     .await
     .unwrap();
 
-    // Create with one entry (within the limit).
     let mut nf = new_file(Uuid::now_v7(), "text/plain");
     nf.custom_metadata = vec![CustomMetadataEntry {
         key: "a".to_owned(),
@@ -669,7 +592,6 @@ async fn update_metadata_over_limit_is_rejected_on_resulting_total() {
     }];
     let t = svc.create_file(&ctx, nf, None).await.unwrap();
 
-    // Patch adds two more keys → resulting total of 3 pairs > 2 → reject.
     let patch = CustomMetadataPatch {
         entries: vec![
             ("b".to_owned(), Some("2".to_owned())),
@@ -685,7 +607,6 @@ async fn update_metadata_over_limit_is_rejected_on_resulting_total() {
         "got {err:?}"
     );
 
-    // Patch that replaces the existing key keeps the total at 1 → allowed.
     let patch_ok = CustomMetadataPatch {
         entries: vec![("a".to_owned(), Some("9".to_owned()))],
     };
@@ -694,12 +615,9 @@ async fn update_metadata_over_limit_is_rejected_on_resulting_total() {
         .expect("replacing an existing key stays within the limit");
 }
 
-// ── storage-quota ───────────────────────────────────────────────────────────
-
+/// Quota cap 10 bytes, policy size cap 100: the create preflight of 100 busts the quota.
 #[tokio::test]
 async fn quota_exceeded_rejects_create_when_client_present() {
-    // Cap of 10 bytes; the policy caps size at 100, so each create preflights
-    // 100 bytes → the first create busts the 10-byte quota.
     let quota: Arc<dyn QuotaClient> = Arc::new(CappedQuota::new(10));
     let (svc, psvc, _dp, _store) = build_service(Some(quota)).await;
     let ctx = ctx(Uuid::now_v7());
@@ -728,11 +646,9 @@ async fn quota_exceeded_rejects_create_when_client_present() {
     );
 }
 
+/// Quota cap 100, size cap 60: create preflights 60, `presign_version` another 60 (120 > 100).
 #[tokio::test]
 async fn quota_gates_version_creation_not_just_first_upload() {
-    // Cap of 100 bytes; policy caps size at 60. First create preflights 60
-    // (allowed, total 60). presign_version preflights another 60 (total 120 >
-    // 100) → version creation is denied, proving quota covers overwrites too.
     let quota: Arc<dyn QuotaClient> = Arc::new(CappedQuota::new(100));
     let (svc, psvc, _dp, _store) = build_service(Some(quota)).await;
     let ctx = ctx(Uuid::now_v7());
@@ -769,7 +685,6 @@ async fn quota_client_error_fails_closed() {
     let (svc, _psvc, _dp, _store) = build_service(Some(quota)).await;
     let ctx = ctx(Uuid::now_v7());
 
-    // No policy configured, but the quota client errors → fail closed (deny).
     let err = svc
         .create_file(&ctx, new_file(Uuid::now_v7(), "text/plain"), None)
         .await
@@ -780,14 +695,12 @@ async fn quota_client_error_fails_closed() {
     );
 }
 
-// ── permissive when no policy ───────────────────────────────────────────────
-
+/// `dp.put_content` does the backend `put` and `finalize_upload` in one call.
 #[tokio::test]
 async fn no_policy_and_no_quota_is_fully_permissive() {
     let (svc, _psvc, dp, _store) = build_service(None).await;
     let ctx = ctx(Uuid::now_v7());
 
-    // Any mime, any size finalize, any metadata — all accepted.
     let mut nf = new_file(Uuid::now_v7(), "application/x-anything");
     nf.custom_metadata = (0..50)
         .map(|i| CustomMetadataEntry {
@@ -800,11 +713,6 @@ async fn no_policy_and_no_quota_is_fully_permissive() {
         .await
         .expect("permissive create");
 
-    // `finalize_upload` now re-verifies the claimed size/hash against the
-    // real backend blob, so the large upload must actually be written first
-    // (`dp.put_content` does the backend `put` + `finalize_upload` in one
-    // call, matching production) — the policy-permissiveness assertion is
-    // that no size cap rejects a 10MB upload absent a configured policy.
     let big = Bytes::from(vec![0u8; 10_000_000]);
     dp.put_content(&ctx, t.file_id, t.version_id, "application/x-anything", big)
         .await

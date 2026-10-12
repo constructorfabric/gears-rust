@@ -53,6 +53,7 @@ fn log_and_translate_sa_failure(op: SaOp, e: &PluginError) {
     }
 }
 
+/// Translate a [`PluginError`] into the SDK-level [`IdpServiceAccountFailure`] at the plugin boundary.
 #[must_use]
 pub fn translate_sa_failure(e: PluginError) -> IdpServiceAccountFailure {
     match e {

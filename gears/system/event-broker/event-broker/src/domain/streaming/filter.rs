@@ -11,6 +11,7 @@
 //! constructed), so a malformed pattern never reaches a subscription.
 
 use std::collections::HashMap;
+use toolkit::domain_model;
 
 use gts::{GtsId, GtsIdPattern};
 use uuid::Uuid;
@@ -44,6 +45,7 @@ struct CompiledInterest {
 }
 
 /// A subscription's interests, compiled and indexed by topic.
+#[domain_model]
 #[derive(Debug)]
 pub struct InterestFilter {
     /// Keyed by the topic's string form, because that is what an event carries

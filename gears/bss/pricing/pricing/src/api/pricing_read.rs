@@ -168,7 +168,7 @@ fn corrupt(detail: impl Into<String>) -> CanonicalError {
     CanonicalError::internal(detail).create()
 }
 fn amount(price_id: Uuid, value: &str) -> Result<Decimal, CanonicalError> {
-    Decimal::from_str_exact(value)
+    bss_money::parse_decimal(value)
         .ok()
         .filter(|v| *v >= Decimal::ZERO)
         .ok_or_else(|| corrupt(format!("price {price_id}: invalid stored amount {value}")))
@@ -397,3 +397,7 @@ pub(crate) fn project_resolution(s: &ReadSnapshot) -> Result<ResolvedBindings, C
         cells,
     })
 }
+
+#[cfg(test)]
+#[path = "pricing_read_amount_tests.rs"]
+mod amount_tests;

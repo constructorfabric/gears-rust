@@ -1,20 +1,4 @@
-//! Tests for P2 remediation 1.12 — usage-accounting symmetry.
-//!
-//! Before this remediation, `report_usage` was only ever called on DEBIT
-//! paths (`create_file`'s `+1 file / 0 bytes`, `delete_file_inner`'s
-//! `-bytes / -1 file`, `transfer_ownership`'s `±bytes`) -- stored bytes were
-//! never credited anywhere, so a real usage collector's running total would
-//! drift to zero/negative over time. These tests pin the fix: bytes are
-//! credited on finalize (single-part *and* multipart), debited on
-//! non-current-version delete, and cleanup-driven deletions report their
-//! deltas too -- so a full create -> upload -> delete cycle nets to zero.
-//!
-//! Uses a capturing fake [`UsageReporter`] (same newtype-fake approach as
-//! `enforce_test.rs`'s `CappedQuota`/`ErroringQuota`), wired into
-//! `FileService`, `MultipartService`, and `CleanupEngine` so every
-//! `report_usage` call site in this remediation is exercised.
-//!
-//! @cpt-cf-file-storage-fr-usage-reporting
+//! Usage accounting: bytes credited on finalize, debited on delete; a lifecycle nets to zero.
 
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::doc_markdown)]
 
@@ -49,11 +33,7 @@ use file_storage_sdk::{NewFile, OwnerKind};
 
 const GTS: &str = gts_id!("cf.fstorage.file.type.v1~x.usage_test.file.type.v1~");
 
-// ── fake usage reporter ─────────────────────────────────────────────────────
-
-/// Capturing fake `UsageReporter` -- records every delta it is handed, in
-/// call order, behind a `tokio::sync::Mutex` (report calls are made from a
-/// `tokio::spawn`ed fire-and-forget task, so the lock must be async-safe).
+/// Capturing fake `UsageReporter`; records deltas in call order.
 #[derive(Default)]
 struct FakeUsageReporter {
     deltas: tokio::sync::Mutex<Vec<UsageDelta>>,
@@ -72,10 +52,7 @@ impl UsageReporter for FakeUsageReporter {
     }
 }
 
-/// `report_usage` is fire-and-forget (`tokio::spawn`), so a captured delta
-/// may not be visible to the test task immediately after the call that
-/// triggers it returns. Poll with a short interval instead of a single fixed
-/// sleep -- fast on the common case, bounded (~1s) on a slow CI runner.
+/// `report_usage` is fire-and-forget, so poll briefly (bounded ~1s) for a captured delta.
 async fn wait_for_reports(fake: &FakeUsageReporter, at_least: usize) -> Vec<UsageDelta> {
     for _ in 0..200 {
         let snap = fake.snapshot().await;
@@ -86,8 +63,6 @@ async fn wait_for_reports(fake: &FakeUsageReporter, at_least: usize) -> Vec<Usag
     }
     fake.snapshot().await
 }
-
-// ── test harness ─────────────────────────────────────────────────────────────
 
 async fn build_db() -> Arc<DBProvider<DbError>> {
     let mut path = std::env::temp_dir();
@@ -105,10 +80,8 @@ async fn build_db() -> Arc<DBProvider<DbError>> {
     Arc::new(DBProvider::new(db))
 }
 
-/// Build `FileService`, `MultipartService`, `DataPlaneService`, the raw
-/// `Store`, and a `CleanupEngine`, ALL wired to report through the same
-/// `fake` reporter -- so every `report_usage` call site added by this
-/// remediation is reachable from a single harness.
+/// Wires `FileService`, `MultipartService`, `DataPlaneService`, `Store` and `CleanupEngine`
+/// to one fake reporter.
 async fn build_all(
     fake: Arc<FakeUsageReporter>,
 ) -> (
@@ -191,14 +164,8 @@ fn new_file(owner: Uuid) -> NewFile {
     }
 }
 
-/// Drive a full multipart happy path (initiate -> one part -> complete),
-/// simulating the sidecar the way `multipart_test.rs` does: write the part
-/// directly via the backend's native multipart API, then persist the part
-/// row via `MultipartStore::upsert_multipart_part` (bypassing the
-/// token-authenticated `report_part` callback, which isn't the focus here).
-/// Returns `(upload_id, version_id, size)`, where `size` is the uploaded
-/// part's declared byte length (`declared_size`, as an `i64`) — `file_id` is
-/// an input, not part of the return value.
+/// Drive initiate -> one part -> complete, writing the part via the native backend API and
+/// persisting it with `upsert_multipart_part`. Returns `(upload_id, version_id, size)`.
 async fn drive_multipart_upload(
     msvc: &MultipartService,
     multipart_store: &Arc<dyn MultipartStore>,
@@ -256,8 +223,6 @@ async fn drive_multipart_upload(
     )
 }
 
-// ── 1. finalize credits bytes ────────────────────────────────────────────────
-
 #[tokio::test]
 async fn finalize_reports_positive_byte_delta() {
     let fake = Arc::new(FakeUsageReporter::default());
@@ -268,9 +233,7 @@ async fn finalize_reports_positive_byte_delta() {
 
     let ticket = svc.create_file(&ctx, new_file(owner), None).await.unwrap();
 
-    // `create_file` reports `+1 file / 0 bytes` -- confirms the pre-state
-    // (0.12's premise) so the finalize credit below is proven to be the
-    // *only* source of the byte delta, not a double-count.
+    // `create_file` reports `+1 file / 0 bytes`, so finalize is the only byte credit.
     let after_create = wait_for_reports(&fake, 1).await;
     assert_eq!(after_create.len(), 1);
     assert_eq!(after_create[0].bytes_delta, 0, "create must report 0 bytes");
@@ -303,14 +266,7 @@ async fn finalize_reports_positive_byte_delta() {
     assert_eq!(credit.owner_id, owner);
 }
 
-/// Same credit, exercised through the token-authenticated
-/// `finalize_upload_by_token` sidecar-callback path (`DataPlaneService::put_content`
-/// drives the user-context `finalize_upload` instead -- see its doc comment
-/// -- so this test constructs `Claims` directly and writes the blob straight
-/// to the backend, the way `enforce_test.rs`'s
-/// `finalize_negative_size_is_rejected_with_400_not_500` exercises the same
-/// entry point). Pins that both finalize call sites added by this
-/// remediation report the credit, not just the user-context one.
+/// Same credit via the token-authenticated `finalize_upload_by_token` path (builds `Claims`).
 #[tokio::test]
 async fn finalize_by_token_reports_positive_byte_delta() {
     let fake = Arc::new(FakeUsageReporter::default());
@@ -356,8 +312,6 @@ async fn finalize_by_token_reports_positive_byte_delta() {
     assert_eq!(deltas[1].owner_id, owner);
 }
 
-// ── 2. multipart complete credits bytes ──────────────────────────────────────
-
 #[tokio::test]
 async fn multipart_complete_reports_byte_delta() {
     let fake = Arc::new(FakeUsageReporter::default());
@@ -397,8 +351,6 @@ async fn multipart_complete_reports_byte_delta() {
     assert_eq!(credit.owner_id, owner);
 }
 
-// ── 3. delete_version debits the non-current version's bytes ────────────────
-
 #[tokio::test]
 async fn delete_version_reports_negative_byte_delta() {
     let fake = Arc::new(FakeUsageReporter::default());
@@ -422,8 +374,7 @@ async fn delete_version_reports_negative_byte_delta() {
         .await
         .unwrap();
 
-    // Add a second version and bind it as current, so v1 becomes deletable
-    // (delete_version rejects deleting the current version).
+    // Second version bound as current, so v1 is deletable.
     let v2 = svc.presign_version(&ctx, ticket.file_id).await.unwrap();
     dp.put_content(
         &ctx,
@@ -440,8 +391,7 @@ async fn delete_version_reports_negative_byte_delta() {
         .await
         .unwrap();
 
-    // Reports so far: create (+1/0), finalize v1 (+bytes), finalize v2 (+bytes) = 3.
-    // `bind` never calls `report_usage`.
+    // Reports: create, finalize v1, finalize v2 = 3 (`bind` reports nothing).
     wait_for_reports(&fake, 3).await;
 
     svc.delete_version(&ctx, ticket.file_id, ticket.version_id)
@@ -459,8 +409,6 @@ async fn delete_version_reports_negative_byte_delta() {
     assert_eq!(debit.tenant_id, tenant);
     assert_eq!(debit.owner_id, owner);
 }
-
-// ── 4. cleanup sweep reports deltas for deleted files ───────────────────────
 
 #[tokio::test]
 async fn sweep_reports_deltas_for_deleted_files() {
@@ -485,11 +433,9 @@ async fn sweep_reports_deltas_for_deleted_files() {
         .await
         .unwrap();
 
-    // create + finalize reports must already be in.
     wait_for_reports(&fake, 2).await;
 
-    // Tenant-wide age rule with max_age_days = 0 -- expires immediately
-    // (mirrors `cleanup_test.rs::retention_expired_file_is_deleted_by_sweep`).
+    // Tenant-wide age rule with max_age_days = 0 expires immediately.
     store
         .insert_retention_rule(
             &AccessScope::allow_all(),
@@ -525,8 +471,6 @@ async fn sweep_reports_deltas_for_deleted_files() {
     assert_eq!(debit.owner_id, owner);
 }
 
-// ── 5. invariant: a full lifecycle nets to zero ─────────────────────────────
-
 #[tokio::test]
 async fn usage_deltas_sum_to_zero_over_create_upload_delete() {
     let fake = Arc::new(FakeUsageReporter::default());
@@ -556,7 +500,6 @@ async fn usage_deltas_sum_to_zero_over_create_upload_delete() {
         .await
         .unwrap();
 
-    // create (+1/0), finalize (+bytes/0), delete_file (-bytes/-1) = 3 reports.
     let deltas = wait_for_reports(&fake, 3).await;
     assert_eq!(deltas.len(), 3);
 

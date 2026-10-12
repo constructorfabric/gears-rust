@@ -23,9 +23,7 @@ fn line(account: Uuid, class: AccountClass, side: Side, amount: i64) -> LineView
         account_class: class,
         gl_code: None,
         side,
-        amount_minor: amount,
-        currency: "USD".to_owned(),
-        currency_scale: 2,
+        money: money(amount),
         invoice_id: Some("INV-1".to_owned()),
         due_date: Some(naive(2026, 7, 1)),
         revenue_stream: if class == AccountClass::Revenue {
@@ -34,8 +32,7 @@ fn line(account: Uuid, class: AccountClass, side: Side, amount: i64) -> LineView
             None
         },
         mapping_status: MappingStatus::Resolved,
-        functional_amount_minor: None,
-        functional_currency: None,
+        functional_money: None,
         tax_jurisdiction: None,
         tax_filing_period: None,
         ar_status: None,
@@ -52,8 +49,13 @@ fn fx_line(
     functional: i64,
 ) -> LineView {
     LineView {
-        functional_amount_minor: Some(functional),
-        functional_currency: Some("EUR".to_owned()),
+        functional_money: Some(
+            PostedMoney::try_new(
+                Decimal::new(functional, 2),
+                CurrencySpec::try_new("EUR".to_owned(), 2).unwrap(),
+            )
+            .unwrap(),
+        ),
         ..line(account, class, side, amount)
     }
 }
@@ -124,8 +126,11 @@ fn reversal_flips_sides_keeps_amounts_positive_and_sets_reverses() {
     assert_eq!(reversal.lines.len(), original.lines.len());
     for (orig, rev) in original.lines.iter().zip(reversal.lines.iter()) {
         assert_eq!(rev.account_id, orig.account_id, "same account");
-        assert_eq!(rev.amount_minor, orig.amount_minor, "amount unchanged");
-        assert!(rev.amount_minor > 0, "reversal amount stays positive");
+        assert_eq!(rev.money, orig.money, "amount unchanged");
+        assert!(
+            rev.money.amount() > Decimal::ZERO,
+            "reversal amount stays positive"
+        );
         let flipped = match orig.side {
             Side::Debit => Side::Credit,
             Side::Credit => Side::Debit,
@@ -134,15 +139,15 @@ fn reversal_flips_sides_keeps_amounts_positive_and_sets_reverses() {
     }
 
     // The reversal nets to zero on its own (DR 1000 + DR 200 / CR 1200).
-    let net: i128 = reversal
+    let net: Decimal = reversal
         .lines
         .iter()
         .map(|l| match l.side {
-            Side::Debit => i128::from(l.amount_minor),
-            Side::Credit => -i128::from(l.amount_minor),
+            Side::Debit => l.money.amount(),
+            Side::Credit => -l.money.amount(),
         })
         .sum();
-    assert_eq!(net, 0, "the reversal is itself balanced");
+    assert_eq!(net, Decimal::ZERO, "the reversal is itself balanced");
 }
 
 #[test]
@@ -174,11 +179,11 @@ fn reversal_carries_functional_forward_and_nets_to_zero() {
     // Every leg carries the ORIGINAL functional (positive) + currency, side flipped.
     for (orig, rev) in original.lines.iter().zip(reversal.lines.iter()) {
         assert_eq!(
-            rev.functional_amount_minor, orig.functional_amount_minor,
+            rev.functional_money, orig.functional_money,
             "functional carried at the original rate (positive, unchanged)"
         );
         assert_eq!(
-            rev.functional_currency.as_deref(),
+            rev.functional_money.as_ref().map(|m| m.currency().code()),
             Some("EUR"),
             "functional currency carried"
         );
@@ -186,21 +191,26 @@ fn reversal_carries_functional_forward_and_nets_to_zero() {
 
     // Functional column nets to zero (DR 900 + DR 180 / CR 1080) — no drift, no
     // synthesized FX gain/loss.
-    let func_net: i128 = reversal
+    let func_net: Decimal = reversal
         .lines
         .iter()
         .map(|l| {
-            let f = i128::from(
-                l.functional_amount_minor
-                    .expect("cross-ccy leg carries functional"),
-            );
+            let f = l
+                .functional_money
+                .as_ref()
+                .expect("cross-ccy leg carries functional")
+                .amount();
             match l.side {
                 Side::Debit => f,
                 Side::Credit => -f,
             }
         })
         .sum();
-    assert_eq!(func_net, 0, "the reversal's functional column is balanced");
+    assert_eq!(
+        func_net,
+        Decimal::ZERO,
+        "the reversal's functional column is balanced"
+    );
 }
 
 #[test]
@@ -286,7 +296,8 @@ fn mapping_correction_keys_on_invoice_and_correction_id() {
         Uuid::now_v7(),
         Uuid::now_v7(),
         Vec::new(),
-    );
+    )
+    .unwrap();
     assert_eq!(corrected.source_doc_type, SourceDocType::MappingCorrection);
     assert_eq!(
         corrected.source_business_id,
@@ -298,4 +309,152 @@ fn mapping_correction_keys_on_invoice_and_correction_id() {
         Some(reversal_entry_id),
         "the correction points back at the reversal it follows"
     );
+}
+
+use bss_ledger_sdk::money::{CurrencySpec, PostedMoney};
+use rust_decimal::Decimal;
+
+/// Preserve these legacy scale-2 fixture economics as explicit major-unit money.
+fn money(cents: i64) -> PostedMoney {
+    PostedMoney::try_new(
+        Decimal::new(cents, 2),
+        CurrencySpec::try_new("USD".to_owned(), 2).unwrap(),
+    )
+    .unwrap()
+}
+
+#[test]
+fn reversal_copies_distinct_stored_specs_and_exact_values() {
+    let mut original = original_invoice();
+    for l in &mut original.lines {
+        l.money = PostedMoney::try_new(
+            l.money.amount(),
+            CurrencySpec::try_new("USD".to_owned(), 3).unwrap(),
+        )
+        .unwrap();
+        l.functional_money = Some(
+            PostedMoney::try_new(
+                l.money.amount() * Decimal::new(9, 1),
+                CurrencySpec::try_new("EUR".to_owned(), 4).unwrap(),
+            )
+            .unwrap(),
+        );
+    }
+    let reversed = build_reversal(
+        &original,
+        "202607".to_owned(),
+        naive(2026, 7, 2),
+        Uuid::now_v7(),
+        Uuid::now_v7(),
+    )
+    .unwrap();
+    for (stored, copied) in original.lines.iter().zip(&reversed.lines) {
+        assert_eq!(copied.money, stored.money);
+        assert_eq!(copied.functional_money, stored.functional_money);
+        assert_eq!(copied.money.currency().scale(), 3);
+        assert_eq!(
+            copied.functional_money.as_ref().unwrap().currency().scale(),
+            4
+        );
+        assert_eq!(copied.side, flip(stored.side));
+    }
+}
+
+#[test]
+fn reversal_rejects_header_code_or_transaction_scale_conflict() {
+    let mut original = original_invoice();
+    original.entry_currency = "EUR".to_owned();
+    assert_eq!(
+        build_reversal(
+            &original,
+            "202607".to_owned(),
+            naive(2026, 7, 2),
+            Uuid::now_v7(),
+            Uuid::now_v7()
+        )
+        .unwrap_err(),
+        ReversalError::Money(MoneyError::CurrencyMismatch)
+    );
+    original.entry_currency = "USD".to_owned();
+    original.lines[0].money = PostedMoney::try_new(
+        Decimal::new(1200, 2),
+        CurrencySpec::try_new("USD".to_owned(), 3).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        build_reversal(
+            &original,
+            "202607".to_owned(),
+            naive(2026, 7, 2),
+            Uuid::now_v7(),
+            Uuid::now_v7()
+        )
+        .unwrap_err(),
+        ReversalError::Money(MoneyError::ScaleMismatch)
+    );
+}
+
+#[test]
+fn mapping_correction_rejects_money_that_conflicts_with_header() {
+    let original = original_invoice();
+    let mut corrected = flip_line(&original.lines[0]);
+    corrected.money = PostedMoney::try_new(
+        corrected.money.amount(),
+        CurrencySpec::try_new("EUR".to_owned(), 2).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        build_mapping_correction(
+            &original,
+            Uuid::now_v7(),
+            "INV-1",
+            "202607".to_owned(),
+            naive(2026, 7, 2),
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            vec![corrected]
+        )
+        .unwrap_err(),
+        ReversalError::Money(MoneyError::CurrencyMismatch)
+    );
+}
+
+#[test]
+fn reversal_admits_functional_only_lines_in_another_currency() {
+    // FX revaluation posts zero-amount lines in the functional currency next to
+    // the entry currency; the posting engine admits them, so a reversal must too.
+    let mut original = original_invoice();
+    let eur = |cents: i64| {
+        PostedMoney::try_new(
+            Decimal::new(cents, 2),
+            CurrencySpec::try_new("EUR".to_owned(), 2).unwrap(),
+        )
+        .unwrap()
+    };
+    let mut functional_only = line(Uuid::now_v7(), AccountClass::Ar, Side::Debit, 0);
+    functional_only.money = eur(0);
+    functional_only.functional_money = Some(eur(500));
+    original.lines.push(functional_only);
+    let reversal = build_reversal(
+        &original,
+        "202607".to_owned(),
+        naive(2026, 7, 1),
+        Uuid::now_v7(),
+        Uuid::now_v7(),
+    )
+    .unwrap();
+    assert_eq!(reversal.lines.len(), original.lines.len());
+    // A non-zero line in another currency is still refused.
+    let mut foreign = original_invoice();
+    foreign.lines[0].money = eur(1200);
+    assert!(matches!(
+        build_reversal(
+            &foreign,
+            "202607".to_owned(),
+            naive(2026, 7, 1),
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+        ),
+        Err(ReversalError::Money(MoneyError::CurrencyMismatch))
+    ));
 }

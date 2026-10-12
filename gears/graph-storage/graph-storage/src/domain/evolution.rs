@@ -35,11 +35,13 @@ use graph_storage_sdk::models::{EffectiveTraits, SchemaDiagnostic, TraitChange, 
 use gts::schema_evolution::CompatibilityVerdict;
 use gts::store::GtsStore;
 use serde_json::Value;
+use toolkit_macros::domain_model;
 
 use crate::domain::error::DomainError;
 
 /// Both directional verdicts of one comparison, with the evidence for the one
 /// that gates admission.
+#[domain_model]
 #[derive(Clone, Debug)]
 pub struct Comparison {
     /// `Valid(old) ⊆ Valid(new)` — the direction ADR-0003 enforces.
@@ -65,6 +67,7 @@ impl Comparison {
 }
 
 /// What the gear does with a candidate, given the request's options.
+#[domain_model]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Decision {
     /// Admit without reading a row: the schemas prove inclusion.
@@ -83,6 +86,7 @@ pub enum Decision {
 ///
 /// Ordered by strength, and exclusive: a migration subsumes re-validation,
 /// since it validates the rows it has just changed.
+#[domain_model]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Offered {
     /// Nothing: decide from the schemas or refuse.
@@ -94,6 +98,7 @@ pub enum Offered {
 }
 
 /// What the request asked for, as the decision's actual inputs.
+#[domain_model]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Asked {
     /// `options.on_existing == Update`.
@@ -337,7 +342,7 @@ mod tests {
 
     fn chain() -> Vec<(String, Value)> {
         vec![(
-            "gts.acme.gs._.evolution_base.v1~".to_owned(),
+            toolkit_gts::gts_id!("acme.gs._.evolution_base.v1~").to_owned(),
             json!({
                 "$id": "gts://gts.acme.gs._.evolution_base.v1~",
                 "$schema": "http://json-schema.org/draft-07/schema#",
@@ -564,7 +569,7 @@ mod tests {
     #[test]
     fn a_refusal_names_the_offending_locations() {
         let reason = refusal_reason(
-            "gts.acme.gs._.evolution_base.v1~acme.gs._.thing.v1~",
+            toolkit_gts::gts_id!("acme.gs._.evolution_base.v1~acme.gs._.thing.v1~"),
             TypeChangeState::Incompatible,
             &[
                 SchemaDiagnostic {

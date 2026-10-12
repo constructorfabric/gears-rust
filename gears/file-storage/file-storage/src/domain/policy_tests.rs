@@ -1,8 +1,4 @@
-//! Unit tests for `PolicyResolver` and `PolicyBody` serde round-trips.
-
 use super::*;
-
-// ── helper builders ────────────────────────────────────────────────────────────
 
 fn body_unrestricted() -> PolicyBody {
     PolicyBody::default()
@@ -36,8 +32,6 @@ fn body_with_meta_limits(max_pairs: u32, max_key_len: u32, max_value_len: u32) -
         ..PolicyBody::default()
     }
 }
-
-// ── allowed mime types ─────────────────────────────────────────────────────────
 
 #[test]
 fn resolve_both_unrestricted_returns_none() {
@@ -76,10 +70,7 @@ fn resolve_user_restricted_tenant_unrestricted_returns_user_set() {
 
 #[test]
 fn resolve_intersection_of_mime_types() {
-    // Tenant allows image/* and video/mp4; user allows image/jpeg and video/mp4.
-    // The intersection must resolve to the NARROWER pattern: image/* ∩ image/jpeg
-    // = image/jpeg (NOT image/*, which would keep admitting image/png once the
-    // list is enforced as an allow-list), and video/mp4 is an exact match.
+    // image/* and image/jpeg must resolve to the narrower image/jpeg, not image/*.
     let tenant = body_with_mimes(&["image/*", "video/mp4"]);
     let user = body_with_mimes(&["image/jpeg", "video/mp4"]);
     let ep = PolicyResolver::resolve(Some(&tenant), Some(&user));
@@ -103,8 +94,6 @@ fn resolve_disjoint_mime_types_gives_empty_intersection() {
     let mimes = ep.allowed_mime_types.expect("should be restricted");
     assert!(mimes.is_empty(), "disjoint sets -> nothing allowed");
 }
-
-// ── size limits ────────────────────────────────────────────────────────────────
 
 #[test]
 fn resolve_takes_smallest_global_size_limit() {
@@ -175,8 +164,7 @@ fn resolve_per_mime_overrides_merged_most_restrictive() {
 
 #[test]
 fn resolve_per_mime_specific_is_tightened_by_covering_wildcard() {
-    // A broader wildcard cap must tighten the more-specific entry it covers,
-    // otherwise the most-specific-match consumer would ignore the stricter cap.
+    // A broader wildcard cap must tighten the more-specific entry it covers.
     let mut tenant = PolicyBody::default();
     tenant.size_limits.per_mime = vec![MimeSizeOverride {
         mime: "image/*".to_owned(),
@@ -198,7 +186,6 @@ fn resolve_per_mime_specific_is_tightened_by_covering_wildcard() {
         png.max_bytes, 10_000_000,
         "image/png must be capped by the covering image/* wildcard (10MB), not its own 50MB"
     );
-    // The wildcard entry itself is retained for other image subtypes.
     let wildcard = ep
         .per_mime_max_bytes
         .iter()
@@ -207,18 +194,13 @@ fn resolve_per_mime_specific_is_tightened_by_covering_wildcard() {
     assert_eq!(wildcard.max_bytes, 10_000_000);
 }
 
-// ── metadata limits ────────────────────────────────────────────────────────────
-
 #[test]
 fn resolve_metadata_limits_takes_most_restrictive_per_field() {
     let tenant = body_with_meta_limits(50, 128, 512);
     let user = body_with_meta_limits(20, 256, 256);
     let ep = PolicyResolver::resolve(Some(&tenant), Some(&user));
-    // max_pairs: min(50, 20) = 20
     assert_eq!(ep.metadata_limits.max_pairs, Some(20));
-    // max_key_len: min(128, 256) = 128
     assert_eq!(ep.metadata_limits.max_key_len, Some(128));
-    // max_value_len: min(512, 256) = 256
     assert_eq!(ep.metadata_limits.max_value_len, Some(256));
 }
 
@@ -230,8 +212,6 @@ fn resolve_metadata_limits_none_plus_some_returns_some() {
     assert_eq!(ep.metadata_limits.max_pairs, Some(100));
     assert_eq!(ep.metadata_limits.max_key_len, Some(64));
 }
-
-// ── only-one-level present ─────────────────────────────────────────────────────
 
 #[test]
 fn resolve_only_tenant_policy_present() {
@@ -260,8 +240,6 @@ fn resolve_only_user_policy_present() {
     assert_eq!(ep.max_bytes, Some(5 * 1024 * 1024));
     assert!(ep.allowed_mime_types.is_none());
 }
-
-// ── serde round-trips ──────────────────────────────────────────────────────────
 
 #[test]
 fn policy_body_serde_round_trip() {
@@ -308,12 +286,9 @@ fn retention_rule_body_serde_round_trip() {
 fn empty_policy_body_serializes_to_valid_json() {
     let body = PolicyBody::default();
     let json = serde_json::to_string(&body).expect("serialize");
-    // Must be valid JSON; empty vecs are preserved.
     let parsed: serde_json::Value = serde_json::from_str(&json).expect("must be valid JSON");
     assert!(parsed.is_object());
 }
-
-// ── mime_allowed ──────────────────────────────────────────────────────────────
 
 #[test]
 fn mime_allowed_exact_match() {
@@ -339,25 +314,18 @@ fn mime_allowed_wildcard_does_not_match_different_type() {
     ));
 }
 
-/// A stored pattern without a `/` (e.g. `"image"`) must NOT act as a wildcard
-/// that matches any `image/…` subtype. Only well-formed `"type/*"` patterns
-/// are wildcards. (An exact match `"image"` == `"image"` is still accepted by
-/// the exact-match branch, which is correct and intentional.)
+/// A stored pattern without `/` (e.g. `"image"`) must not act as a wildcard for `image/...`.
 #[test]
 fn mime_allowed_malformed_pattern_without_slash_never_matches_as_wildcard() {
-    // `"image"` stored as an allowed pattern must not match `"image/jpeg"`.
     assert!(!PolicyResolver::mime_allowed(
         "image/jpeg",
         &["image".to_owned()]
     ));
-    // Likewise `"text"` must not match `"text/plain"`.
     assert!(!PolicyResolver::mime_allowed(
         "text/plain",
         &["text".to_owned()]
     ));
 }
-
-// ── PolicyScope / RetentionScope parse round-trips ─────────────────────────────
 
 #[test]
 fn policy_scope_parse_roundtrip() {

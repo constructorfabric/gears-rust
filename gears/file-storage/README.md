@@ -76,8 +76,9 @@ Built on top of the control plane and sidecar above, FileStorage also provides:
 - **Policy engine** — allowed-types / size / custom-metadata-limit policies, resolved at tenant and user scope
   (`GET`/`PUT /policy`, `GET /policy/effective`). See
   [docs/features/policy-engine.md](docs/features/policy-engine.md).
-- **Retention rules + background cleanup sweep** — per-tenant retention rules (`/retention-rules`) plus a background
-  process that prunes expired files and reconciles orphaned backend objects. See
+- **Retention rules + cleanup engine (not enforced yet)** — per-tenant retention rules (`/retention-rules`) plus a
+  cleanup engine that prunes expired files and reconciles orphaned backend objects. The gear runs no background
+  worker, so nothing is enforced until a separate cleanup job calls the engine. See
   [docs/features/retention-cleanup.md](docs/features/retention-cleanup.md).
 - **Idempotent create** — `POST /files` is safe to retry.
 - **Audit outbox** — a transactional outbox recording write operations (create, finalize, bind, metadata update,
@@ -118,9 +119,9 @@ Built on top of the control plane and sidecar above, FileStorage also provides:
   is blocked on a Quota Enforcement SDK: `gears/system/quota-enforcement/` is docs-only (PRD/DESIGN/ADRs, no Rust
   crate) — there is no real client to wire in. Usage reporting is further along: a `usage-collector-sdk` crate
   exists, though `usage_reporter` is likewise wired as `None` pending its own integration.
-- **Multipart uploads trust the caller-reported per-part hash.** Single-shot uploads re-derive
-  size/hash/MIME from a real backend read-back at finalize time, so a forged claim cannot corrupt
-  stored metadata. Multipart uploads have no equivalent: `report_part` persists the caller-supplied
+- **Uploads trust the sidecar-reported hash.** Single-shot finalize checks the size against the stored
+  object and reads only a MIME prefix; it persists the hash the sidecar reported (the callback requires the
+  mandatory `finalize_internal_secret`). Multipart: `report_part` persists the reported
   per-part hash after only a length/size check, and `complete` builds the composite hash from those
   stored hashes with no re-read of the assembled object. See
   [ADR-0003](docs/ADR/0003-cpt-cf-file-storage-adr-sidecar-data-plane.md)'s "Known gap" note for the
@@ -142,5 +143,6 @@ cargo test  -p cf-gears-file-storage -p cf-gears-file-storage-sdk
 # adds a rotation-window set of additional keys), FS_SIDECAR_BACKEND_ROOT,
 # FS_SIDECAR_CONTROL_URL (control-plane base URL for the finalize/report-part
 # callbacks -- without it, uploads default to http://localhost:8080 and stay
-# `pending` forever against any other control-plane address)
+# `pending` forever against any other control-plane address), and the REQUIRED
+# FS_SIDECAR_INTERNAL_TOKEN (must equal the control plane's finalize_internal_secret)
 ```

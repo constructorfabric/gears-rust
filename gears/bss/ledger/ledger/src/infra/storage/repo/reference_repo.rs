@@ -2,11 +2,13 @@
 //! (currency-scale registry, chart of accounts). Tenant isolation runs
 //! through the `SecureORM` layer; P1 reads take an explicit `AccessScope`.
 
+use bss_ledger_sdk::CurrencySpec;
 use sea_orm::sea_query::OnConflict;
 use sea_orm::{ActiveValue::Set, ColumnTrait, Condition, EntityTrait};
 use toolkit_db::odata::sea_orm_filter::{LimitCfg, paginate_odata};
 use toolkit_db::secure::{
-    AccessScope, DbTx, ScopeError, SecureEntityExt, SecureInsertExt, TxConfig, secure_insert,
+    AccessScope, DBRunner, DbTx, ScopeError, SecureEntityExt, SecureInsertExt, TxConfig,
+    secure_insert,
 };
 use toolkit_db::{DBProvider, DbError};
 use toolkit_odata::{ODataQuery, Page, SortDir};
@@ -15,11 +17,11 @@ use uuid::Uuid;
 use crate::domain::model::{
     AccountRow, CurrencyScaleRow, FiscalCalendarRow, FiscalPeriodRow, RepoError,
 };
-use crate::domain::money::scale_fits_headroom;
 use crate::infra::storage::entity::{
     currency_scale_registry, fiscal_calendar, fiscal_period, journal_line, tenant_account,
     tenant_posting_lock,
 };
+use crate::infra::storage::money_text::decode_currency;
 use crate::infra::storage::odata_mapping::AccountInfoODataMapper;
 use crate::infra::storage::repo::journal_repo::{
     OdataPageError, map_odata_err, query_with_default_order,
@@ -47,7 +49,7 @@ impl ReferenceRepo {
     }
 
     /// Insert or update a currency-scale registry row keyed by
-    /// `(tenant_id, currency)`. Rejects an out-of-headroom scale at
+    /// `(tenant_id, currency)`. Rejects an unsupported scale at
     /// registration (`ScaleOutOfRange`) and a changed scale once postings
     /// exist for the currency (`CurrencyScaleLocked`, architecture I-1);
     /// the same scale is an idempotent no-op.
@@ -56,9 +58,10 @@ impl ReferenceRepo {
     /// [`RepoError::ScaleOutOfRange`] / [`RepoError::CurrencyScaleLocked`]
     /// per the guards above, or [`RepoError::Db`] on a storage failure.
     pub async fn upsert_currency_scale(&self, row: CurrencyScaleRow) -> Result<(), RepoError> {
-        if !scale_fits_headroom(row.minor_units, row.plausible_max_major) {
+        if row.currency_scale > 28 {
             return Err(RepoError::ScaleOutOfRange(row.currency));
         }
+        CurrencySpec::try_new(row.currency.clone(), row.currency_scale)?;
         // ONE `SERIALIZABLE` transaction so the scale-immutability check-then-act
         // is atomic: the `posted?` probe and a concurrent first posting for the
         // currency form a read-write conflict under Postgres SSI, so a post that
@@ -78,9 +81,10 @@ impl ReferenceRepo {
         match result {
             Ok(ScaleUpsertResult::Done) => Ok(()),
             Ok(ScaleUpsertResult::Locked) => Err(RepoError::CurrencyScaleLocked(currency)),
-            Err(db_err) => Err(RepoError::Db(format!(
-                "upsert currency_scale txn: {db_err}"
-            ))),
+            Err(db_err) => Err(crate::infra::posting::retry::db_to_repo(
+                db_err,
+                self.db.db().backend(),
+            )),
         }
     }
 
@@ -99,6 +103,21 @@ impl ReferenceRepo {
             .db
             .conn()
             .map_err(|e| RepoError::Db(format!("conn: {e}")))?;
+        self.find_currency_scale_in(&conn, scope, tenant_id, currency)
+            .await
+    }
+
+    /// Read currency metadata on the caller's snapshot, including a posting transaction.
+    ///
+    /// # Errors
+    /// Returns a repository error for database access or corrupt stored metadata.
+    pub async fn find_currency_scale_in<R: DBRunner>(
+        &self,
+        runner: &R,
+        scope: &AccessScope,
+        tenant_id: Uuid,
+        currency: &str,
+    ) -> Result<Option<CurrencyScaleRow>, RepoError> {
         let row = currency_scale_registry::Entity::find()
             .secure()
             .scope_with(scope)
@@ -107,16 +126,19 @@ impl ReferenceRepo {
                     .add(currency_scale_registry::Column::TenantId.eq(tenant_id))
                     .add(currency_scale_registry::Column::Currency.eq(currency)),
             )
-            .one(&conn)
+            .one(runner)
             .await
-            .map_err(|e| RepoError::Db(format!("find currency_scale: {e}")))?;
-        Ok(row.map(|m| CurrencyScaleRow {
-            tenant_id: m.tenant_id,
-            currency: m.currency,
-            minor_units: m.minor_units,
-            plausible_max_major: m.plausible_max_major,
-            source: m.source,
-        }))
+            .map_err(|e| crate::infra::posting::retry::scope_to_repo(e, self.db.db().backend()))?;
+        row.map(|m| {
+            let spec = decode_currency(&m.currency, m.currency_scale)?;
+            Ok(CurrencyScaleRow {
+                tenant_id: m.tenant_id,
+                currency: m.currency,
+                currency_scale: spec.scale(),
+                source: m.source,
+            })
+        })
+        .transpose()
     }
 
     /// Insert a chart-of-accounts row.
@@ -145,18 +167,13 @@ impl ReferenceRepo {
 
         secure_insert::<tenant_account::Entity>(am, &scope, &conn)
             .await
-            .map_err(|e| RepoError::Db(format!("insert tenant_account: {e}")))?;
+            .map_err(|e| crate::infra::posting::retry::scope_to_repo(e, self.db.db().backend()))?;
         Ok(())
     }
 
-    /// Read a chart-of-accounts row by id under the supplied scope.
-    /// Whether the tenant's posting kill-switch (`tenant_posting_lock`) is
-    /// currently held (design §3.2 PostingService pre-transaction gate). A
-    /// missing row means never locked (the table is written only when a lock is
-    /// set / cleared), so absence reads as `false`. Read on its own connection
-    /// BEFORE the post transaction, mirroring the account-lifecycle pre-check:
-    /// tolerable that a lock set CONCURRENTLY (after this read, before COMMIT) is
-    /// not caught, since termination is a rare admin op.
+    /// Whether the tenant's posting kill-switch is held. A missing row means
+    /// unlocked. Posting uses the runner-bound sibling to pin this value in
+    /// each serializable attempt; this wrapper serves standalone readers.
     ///
     /// # Errors
     /// [`RepoError::Db`] on a connection or query failure.
@@ -168,14 +185,27 @@ impl ReferenceRepo {
         let conn = self
             .db
             .conn()
-            .map_err(|e| RepoError::Db(format!("conn: {e}")))?;
+            .map_err(|e| crate::infra::posting::retry::db_to_repo(e, self.db.db().backend()))?;
+        self.is_tenant_posting_locked_in(&conn, scope, tenant_id)
+            .await
+    }
+
+    /// Read on the caller's snapshot, preserving access scope and contention.
+    /// # Errors
+    /// Returns a repository error on storage or scope failure.
+    pub async fn is_tenant_posting_locked_in<R: DBRunner>(
+        &self,
+        runner: &R,
+        scope: &AccessScope,
+        tenant_id: Uuid,
+    ) -> Result<bool, RepoError> {
         let row = tenant_posting_lock::Entity::find()
             .secure()
             .scope_with(scope)
             .filter(Condition::all().add(tenant_posting_lock::Column::TenantId.eq(tenant_id)))
-            .one(&conn)
+            .one(runner)
             .await
-            .map_err(|e| RepoError::Db(format!("find tenant_posting_lock: {e}")))?;
+            .map_err(|e| crate::infra::posting::retry::scope_to_repo(e, self.db.db().backend()))?;
         Ok(row.is_some_and(|m| m.locked))
     }
 
@@ -192,14 +222,26 @@ impl ReferenceRepo {
         let conn = self
             .db
             .conn()
-            .map_err(|e| RepoError::Db(format!("conn: {e}")))?;
+            .map_err(|e| crate::infra::posting::retry::db_to_repo(e, self.db.db().backend()))?;
+        self.find_account_in(&conn, scope, account_id).await
+    }
+
+    /// Read on the caller's snapshot, preserving access scope and contention.
+    /// # Errors
+    /// Returns a repository error on storage or scope failure.
+    pub async fn find_account_in<R: DBRunner>(
+        &self,
+        runner: &R,
+        scope: &AccessScope,
+        account_id: Uuid,
+    ) -> Result<Option<AccountRow>, RepoError> {
         let row = tenant_account::Entity::find()
             .secure()
             .scope_with(scope)
             .filter(Condition::all().add(tenant_account::Column::AccountId.eq(account_id)))
-            .one(&conn)
+            .one(runner)
             .await
-            .map_err(|e| RepoError::Db(format!("find tenant_account: {e}")))?;
+            .map_err(|e| crate::infra::posting::retry::scope_to_repo(e, self.db.db().backend()))?;
         Ok(row.map(|m| AccountRow {
             account_id: m.account_id,
             tenant_id: m.tenant_id,
@@ -230,13 +272,27 @@ impl ReferenceRepo {
             .db
             .conn()
             .map_err(|e| RepoError::Db(format!("conn: {e}")))?;
+        self.all_accounts_in(&conn, scope, tenant_id).await
+    }
+
+    /// Read the authoritative chart on the caller's operation runner.
+    ///
+    /// # Errors
+    /// [`RepoError::Db`] on a scope or storage failure; [`RepoError::Conflict`] on classified
+    /// database contention.
+    pub async fn all_accounts_in<R: DBRunner>(
+        &self,
+        runner: &R,
+        scope: &AccessScope,
+        tenant_id: Uuid,
+    ) -> Result<Vec<tenant_account::Model>, RepoError> {
         tenant_account::Entity::find()
             .secure()
             .scope_with(scope)
             .filter(Condition::all().add(tenant_account::Column::TenantId.eq(tenant_id)))
-            .all(&conn)
+            .all(runner)
             .await
-            .map_err(|e| RepoError::Db(format!("all_accounts: {e}")))
+            .map_err(|e| crate::infra::posting::retry::scope_to_repo(e, self.db.db().backend()))
     }
 
     /// List the chart-of-accounts rows for a tenant under `scope`, cursor-
@@ -307,7 +363,7 @@ impl ReferenceRepo {
             .scope_with(&AccessScope::allow_all())
             .all(&conn)
             .await
-            .map_err(|e| RepoError::Db(format!("list fiscal_calendar: {e}")))?;
+            .map_err(|e| crate::infra::posting::retry::scope_to_repo(e, self.db.db().backend()))?;
         Ok(rows
             .into_iter()
             .map(|m| FiscalCalendarRow {
@@ -339,13 +395,25 @@ impl ReferenceRepo {
             .db
             .conn()
             .map_err(|e| RepoError::Db(format!("conn: {e}")))?;
+        self.functional_currency_in(&conn, scope, tenant_id).await
+    }
+
+    /// Read the configured functional currency on the authoritative attempt runner.
+    /// # Errors
+    /// Returns typed contention or storage failures.
+    pub async fn functional_currency_in<R: DBRunner>(
+        &self,
+        runner: &R,
+        scope: &AccessScope,
+        tenant_id: Uuid,
+    ) -> Result<Option<String>, RepoError> {
         let row = fiscal_calendar::Entity::find()
             .secure()
             .scope_with(scope)
             .filter(Condition::all().add(fiscal_calendar::Column::TenantId.eq(tenant_id)))
-            .one(&conn)
+            .one(runner)
             .await
-            .map_err(|e| RepoError::Db(format!("find fiscal_calendar functional_currency: {e}")))?;
+            .map_err(|e| crate::infra::posting::retry::scope_to_repo(e, self.db.db().backend()))?;
         Ok(row.and_then(|m| m.functional_currency))
     }
 
@@ -392,7 +460,7 @@ impl ReferenceRepo {
             .filter(condition)
             .one(txn)
             .await
-            .map_err(|e| RepoError::Db(format!("find tenant_account by key: {e}")))?;
+            .map_err(|e| crate::infra::posting::retry::scope_to_repo(e, self.db.db().backend()))?;
         Ok(row.map(|m| m.account_id))
     }
 
@@ -438,27 +506,41 @@ impl ReferenceRepo {
         };
         secure_insert::<tenant_account::Entity>(am, &scope, txn)
             .await
-            .map_err(|e| RepoError::Db(format!("insert tenant_account: {e}")))?;
+            .map_err(|e| crate::infra::posting::retry::scope_to_repo(e, self.db.db().backend()))?;
         Ok((new_id, true))
     }
 
     /// Insert a currency-scale registry row if absent (keyed on
     /// `(tenant_id, currency)`), running on the supplied transaction. Validates
-    /// headroom before any write. Returns `true` when a new row was inserted,
+    /// metadata before any write. Returns `true` when a new row was inserted,
     /// `false` when one already existed (no-op — the existing scale is left
-    /// untouched; scale-immutability is `upsert_currency_scale`'s concern).
+    /// untouched). A first registration is refused when the tenant's journal
+    /// lines visible to `txn` carry the currency, as transaction or functional
+    /// money, under another scale: provisioning a scale that disagrees with
+    /// posted history fails rather than re-scaling it.
+    ///
+    /// The check and the insert take no lock. At the default READ COMMITTED
+    /// isolation they guard committed history only: a posting that resolved the
+    /// ISO default scale and has not committed yet is not seen, so both can
+    /// commit. A caller that must also exclude that in-flight posting runs `txn`
+    /// SERIALIZABLE, as [`Self::upsert_currency_scale`], provisioning and the
+    /// posting path do, so the registry-read / journal-write cycle aborts one side.
     ///
     /// # Errors
-    /// [`RepoError::ScaleOutOfRange`] when the scale exceeds `i64` headroom, or
-    /// [`RepoError::Db`] on a storage failure.
+    /// [`RepoError::ScaleOutOfRange`] when the scale exceeds 28;
+    /// [`RepoError::Money`] when the currency code is malformed;
+    /// [`RepoError::CurrencyScaleLocked`] when posted lines carry the currency under
+    /// another scale; [`RepoError::Conflict`] on a concurrent first registration or
+    /// classified database contention; [`RepoError::Db`] on any other storage failure.
     pub async fn insert_currency_scale_if_absent_txn(
         &self,
         txn: &DbTx<'_>,
         row: CurrencyScaleRow,
     ) -> Result<bool, RepoError> {
-        if !scale_fits_headroom(row.minor_units, row.plausible_max_major) {
+        if row.currency_scale > 28 {
             return Err(RepoError::ScaleOutOfRange(row.currency));
         }
+        CurrencySpec::try_new(row.currency.clone(), row.currency_scale)?;
         let scope = AccessScope::for_tenant(row.tenant_id);
         let existing = currency_scale_registry::Entity::find()
             .secure()
@@ -470,25 +552,32 @@ impl ReferenceRepo {
             )
             .one(txn)
             .await
-            .map_err(|e| RepoError::Db(format!("find currency_scale: {e}")))?;
+            .map_err(|e| crate::infra::posting::retry::scope_to_repo(e, self.db.db().backend()))?;
         if existing.is_some() {
             return Ok(false);
         }
 
+        if currency_scale_is_locked(txn, &scope, &row, None)
+            .await
+            .map_err(|error| {
+                crate::infra::posting::retry::db_to_repo(error, self.db.db().backend())
+            })?
+        {
+            return Err(RepoError::CurrencyScaleLocked(row.currency));
+        }
         let am = currency_scale_registry::ActiveModel {
             tenant_id: Set(row.tenant_id),
             currency: Set(row.currency),
-            minor_units: Set(row.minor_units),
-            plausible_max_major: Set(row.plausible_max_major),
+            currency_scale: Set(i16::from(row.currency_scale)),
             source: Set(row.source),
         };
         currency_scale_registry::Entity::insert(am.clone())
             .secure()
             .scope_with_model(&scope, &am)
-            .map_err(|e| RepoError::Db(format!("insert currency_scale scope: {e}")))?
+            .map_err(|e| crate::infra::posting::retry::scope_to_repo(e, self.db.db().backend()))?
             .exec(txn)
             .await
-            .map_err(|e| RepoError::Db(format!("insert currency_scale: {e}")))?;
+            .map_err(|e| crate::infra::posting::retry::insert_to_repo(e, self.db.db().backend()))?;
         Ok(true)
     }
 
@@ -515,7 +604,7 @@ impl ReferenceRepo {
             )
             .one(txn)
             .await
-            .map_err(|e| RepoError::Db(format!("find fiscal_calendar: {e}")))?;
+            .map_err(|e| crate::infra::posting::retry::scope_to_repo(e, self.db.db().backend()))?;
         if existing.is_some() {
             return Ok(false);
         }
@@ -531,10 +620,10 @@ impl ReferenceRepo {
         fiscal_calendar::Entity::insert(am.clone())
             .secure()
             .scope_with_model(&scope, &am)
-            .map_err(|e| RepoError::Db(format!("insert fiscal_calendar scope: {e}")))?
+            .map_err(|e| crate::infra::posting::retry::scope_to_repo(e, self.db.db().backend()))?
             .exec(txn)
             .await
-            .map_err(|e| RepoError::Db(format!("insert fiscal_calendar: {e}")))?;
+            .map_err(|e| crate::infra::posting::retry::scope_to_repo(e, self.db.db().backend()))?;
         Ok(true)
     }
 
@@ -562,7 +651,7 @@ impl ReferenceRepo {
             )
             .one(txn)
             .await
-            .map_err(|e| RepoError::Db(format!("find fiscal_period: {e}")))?;
+            .map_err(|e| crate::infra::posting::retry::scope_to_repo(e, self.db.db().backend()))?;
         if existing.is_some() {
             return Ok(false);
         }
@@ -577,10 +666,10 @@ impl ReferenceRepo {
         fiscal_period::Entity::insert(am.clone())
             .secure()
             .scope_with_model(&scope, &am)
-            .map_err(|e| RepoError::Db(format!("insert fiscal_period scope: {e}")))?
+            .map_err(|e| crate::infra::posting::retry::scope_to_repo(e, self.db.db().backend()))?
             .exec(txn)
             .await
-            .map_err(|e| RepoError::Db(format!("insert fiscal_period: {e}")))?;
+            .map_err(|e| crate::infra::posting::retry::scope_to_repo(e, self.db.db().backend()))?;
         Ok(true)
     }
 }
@@ -613,30 +702,14 @@ async fn upsert_currency_scale_in_txn(
         .await
         .map_err(scope_to_db)?;
 
-    if let Some(existing) = existing
-        && existing.minor_units != row.minor_units
-    {
-        let posted = journal_line::Entity::find()
-            .secure()
-            .scope_with(&scope)
-            .filter(
-                Condition::all()
-                    .add(journal_line::Column::TenantId.eq(row.tenant_id))
-                    .add(journal_line::Column::Currency.eq(row.currency.clone())),
-            )
-            .one(txn)
-            .await
-            .map_err(scope_to_db)?;
-        if posted.is_some() {
-            return Ok(ScaleUpsertResult::Locked);
-        }
+    if currency_scale_is_locked(txn, &scope, &row, existing.map(|r| r.currency_scale)).await? {
+        return Ok(ScaleUpsertResult::Locked);
     }
 
     let am = currency_scale_registry::ActiveModel {
         tenant_id: Set(row.tenant_id),
         currency: Set(row.currency.clone()),
-        minor_units: Set(row.minor_units),
-        plausible_max_major: Set(row.plausible_max_major),
+        currency_scale: Set(i16::from(row.currency_scale)),
         source: Set(row.source.clone()),
     };
     let on_conflict = OnConflict::columns([
@@ -644,8 +717,7 @@ async fn upsert_currency_scale_in_txn(
         currency_scale_registry::Column::Currency,
     ])
     .update_columns([
-        currency_scale_registry::Column::MinorUnits,
-        currency_scale_registry::Column::PlausibleMaxMajor,
+        currency_scale_registry::Column::CurrencyScale,
         currency_scale_registry::Column::Source,
     ])
     .to_owned();
@@ -658,6 +730,40 @@ async fn upsert_currency_scale_in_txn(
         .await
         .map_err(scope_to_db)?;
     Ok(ScaleUpsertResult::Done)
+}
+
+/// Check both historical money columns, even before the first explicit registry row.
+async fn currency_scale_is_locked(
+    txn: &DbTx<'_>,
+    scope: &AccessScope,
+    row: &CurrencyScaleRow,
+    existing_scale: Option<i16>,
+) -> Result<bool, DbError> {
+    let new_scale = i16::from(row.currency_scale);
+    let mut transaction =
+        Condition::all().add(journal_line::Column::Currency.eq(row.currency.clone()));
+    let mut functional =
+        Condition::all().add(journal_line::Column::FunctionalCurrency.eq(row.currency.clone()));
+    if existing_scale.is_none_or(|scale| scale == new_scale) {
+        transaction = transaction.add(journal_line::Column::CurrencyScale.ne(new_scale));
+        functional = functional.add(
+            Condition::any()
+                .add(journal_line::Column::FunctionalCurrencyScale.ne(new_scale))
+                .add(journal_line::Column::FunctionalCurrencyScale.is_null()),
+        );
+    }
+    Ok(journal_line::Entity::find()
+        .secure()
+        .scope_with(scope)
+        .filter(
+            Condition::all()
+                .add(journal_line::Column::TenantId.eq(row.tenant_id))
+                .add(Condition::any().add(transaction).add(functional)),
+        )
+        .one(txn)
+        .await
+        .map_err(scope_to_db)?
+        .is_some())
 }
 
 fn as_db_err(e: &DbError) -> Option<&sea_orm::DbErr> {
@@ -673,3 +779,7 @@ fn scope_to_db(e: ScopeError) -> DbError {
         other => DbError::Other(anyhow::anyhow!("scope: {other}")),
     }
 }
+
+#[cfg(test)]
+#[path = "reference_repo_scale_lock_tests.rs"]
+mod scale_lock_tests;

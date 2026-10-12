@@ -1486,6 +1486,7 @@ pub(crate) struct LockManager {
 }
 
 impl LockManager {
+    /// Creates a file-backed lock manager scoped to the given database scope identifier.
     #[must_use]
     #[cfg_attr(not(any(feature = "sqlite", test)), allow(dead_code))]
     pub fn file(database_scope: u64) -> Self {
@@ -1602,12 +1603,14 @@ impl LockManager {
         }
     }
 
+    /// Returns the database scope identifier this manager locks within.
     #[must_use]
     #[allow(dead_code)] // diagnostics / tests
     pub fn database_scope(&self) -> u64 {
         self.database_scope
     }
 
+    /// Returns the unique identifier of this lock manager instance.
     #[must_use]
     #[allow(dead_code)] // diagnostics / tests
     pub fn instance_id(&self) -> u64 {

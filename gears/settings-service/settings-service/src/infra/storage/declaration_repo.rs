@@ -36,6 +36,7 @@ const DECLARATION_LIMIT_CFG: LimitCfg = LimitCfg {
 /// Persistence for declarations.
 pub struct DeclarationRepo;
 
+/// Converts a stored declaration row to the domain type.
 pub(crate) fn to_domain(model: declaration::Model) -> Declaration {
     Declaration {
         id: model.id,

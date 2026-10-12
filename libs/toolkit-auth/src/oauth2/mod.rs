@@ -6,10 +6,12 @@
 pub mod auto_refresh;
 pub mod builder_ext;
 pub mod config;
+/// OIDC discovery: resolves the token endpoint from an issuer URL.
 pub(crate) mod discovery;
 pub mod error;
 pub mod fetch;
 pub mod layer;
+/// Token source implementations that perform the actual token requests.
 pub(crate) mod source;
 pub mod token;
 pub(crate) mod token_watcher;

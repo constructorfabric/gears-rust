@@ -109,6 +109,7 @@ pub struct ProducerOutboxDiagnostics {
 }
 
 impl ProducerOutboxEnvelope {
+    /// Wraps `event` with its routing and producer metadata for the outbox.
     pub(crate) fn from_event(
         event: Event,
         topic: String,
@@ -297,6 +298,7 @@ pub struct ProducerOutboxQueue {
 }
 
 impl ProducerOutboxQueue {
+    /// Creates a queue over `producer`; fails on a blank queue name.
     pub(crate) fn new(
         producer: DbProducer,
         queue: String,

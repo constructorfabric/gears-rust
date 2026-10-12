@@ -101,3 +101,23 @@ pub async fn load_chart(
         (r.account_class, r.currency, r.revenue_stream, r.account_id)
     })))
 }
+
+/// Load the chart on the same runner as the financial decision.
+///
+/// # Errors
+/// The posting-transport [`DomainError`] when the scoped account read fails (an infrastructure
+/// fault or database contention).
+pub async fn load_chart_in<R: toolkit_db::secure::DBRunner>(
+    reference: &ReferenceRepo,
+    runner: &R,
+    scope: &AccessScope,
+    tenant: Uuid,
+) -> Result<ChartIndex, DomainError> {
+    let rows = reference
+        .all_accounts_in(runner, scope, tenant)
+        .await
+        .map_err(super::error_transport::repo_to_domain)?;
+    Ok(ChartIndex::from_rows(rows.into_iter().map(|r| {
+        (r.account_class, r.currency, r.revenue_stream, r.account_id)
+    })))
+}

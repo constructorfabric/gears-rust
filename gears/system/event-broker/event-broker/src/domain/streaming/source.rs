@@ -9,6 +9,7 @@
 //! attach point, and it works at assignment scope rather than per partition.
 
 use std::sync::Arc;
+use toolkit::domain_model;
 
 use tokio::sync::Notify;
 use toolkit_gts::GtsInstanceId;
@@ -38,6 +39,7 @@ pub trait ReaderAttacher: Send + Sync {
 
 /// One partition of one topic - the unit every read, resident span, and reader
 /// registration is scoped to.
+#[domain_model]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct PartitionKey {
     pub topic: GtsInstanceId,

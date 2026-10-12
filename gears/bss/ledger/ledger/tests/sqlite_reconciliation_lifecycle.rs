@@ -21,6 +21,7 @@ use async_trait::async_trait;
 use bss_ledger::config::ReconConfig;
 use bss_ledger::domain::model::{NewEntry, NewLine};
 use bss_ledger::domain::ports::metrics::NoopLedgerMetrics;
+use bss_ledger::domain::reconciliation::ReconciliationVariance;
 use bss_ledger::infra::control_feed::InProcessControlFeeds;
 use bss_ledger::infra::events::publisher::LedgerEventPublisher;
 use bss_ledger::infra::exception::ExceptionRouter;
@@ -39,6 +40,16 @@ use toolkit_db::migration_runner::run_migrations_for_testing;
 use toolkit_db::secure::AccessScope;
 use toolkit_db::{ConnectOpts, DBProvider, DbError, connect_db};
 use uuid::Uuid;
+
+/// A USD scale-2 posting from a cent count (`1234` ⇒ `12.34`): the old
+/// minor-unit fixtures expressed as validated major-unit money.
+fn usd_cents(minor: i64) -> bss_ledger_sdk::PostedMoney {
+    bss_ledger_sdk::PostedMoney::try_new(
+        rust_decimal::Decimal::new(minor, 2),
+        bss_ledger_sdk::CurrencySpec::try_new("USD".to_owned(), 2).unwrap(),
+    )
+    .unwrap()
+}
 
 /// What the registry double answers for every candidate.
 enum Answer {
@@ -107,15 +118,12 @@ async fn post_entry(provider: &DBProvider<DbError>, tenant: Uuid) {
         account_class,
         gl_code: None,
         side,
-        amount_minor: 1000,
-        currency: "USD".to_owned(),
-        currency_scale: 2,
+        money: usd_cents(1000),
         invoice_id: Some("inv-1".to_owned()),
         due_date: None,
         revenue_stream: None,
         mapping_status: MappingStatus::Resolved,
-        functional_amount_minor: None,
-        functional_currency: None,
+        functional_money: None,
         tax_jurisdiction: None,
         tax_filing_period: None,
         tax_rate_ref: None,
@@ -147,25 +155,21 @@ async fn post_entry(provider: &DBProvider<DbError>, tenant: Uuid) {
 /// Seed one uneventful finalized run for `tenant` — the backlog the purge reclaims.
 async fn seed_uneventful_run(provider: &DBProvider<DbError>, tenant: Uuid) -> Uuid {
     let run_id = Uuid::now_v7();
+    let runs = ReconciliationRunRepo::new(provider.clone());
     provider
         .transaction(move |txn| {
             Box::pin(async move {
                 let scope = AccessScope::for_tenant(tenant);
-                ReconciliationRunRepo::start(
-                    txn,
-                    &scope,
-                    tenant,
-                    run_id,
-                    "202609",
-                    CHECK_AR_DERIVED,
-                )
-                .await
-                .map_err(|e| DbError::Other(anyhow::anyhow!("{e}")))?;
-                ReconciliationRunRepo::finalize(
-                    txn, &scope, tenant, run_id, "DONE", 0, true, None, None,
-                )
-                .await
-                .map_err(|e| DbError::Other(anyhow::anyhow!("{e}")))
+                runs.start(txn, &scope, tenant, run_id, "202609", CHECK_AR_DERIVED)
+                    .await
+                    .map_err(|e| DbError::Other(anyhow::anyhow!("{e}")))?;
+                // An uneventful run records the check's typed zero: no currency bucket.
+                let zero = ReconciliationVariance::Money {
+                    by_currency: Vec::new(),
+                };
+                runs.finalize(txn, &scope, tenant, run_id, "DONE", &zero, true, None, None)
+                    .await
+                    .map_err(|e| DbError::Other(anyhow::anyhow!("{e}")))
             })
         })
         .await

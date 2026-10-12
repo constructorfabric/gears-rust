@@ -1420,6 +1420,7 @@ service discovery state. Persistent state (if needed for multi-host P2) will be 
 ```
 deploy/
   helm/
+    update-helm-deps.sh                # Resolves toolkit-common for every gear chart + umbrella
     toolkit-common/                    # Library chart (type: library)
       Chart.yaml
       templates/
@@ -1427,6 +1428,8 @@ deploy/
         _deployment.tpl               # Standard ToolKit Deployment
         _service.tpl                  # ClusterIP Service
         _configmap.tpl                # Gear config as ConfigMap
+        _secret.tpl                   # Optional Secrets from values.secrets[]
+        _rbac.tpl                     # TokenReview (auth-delegator) ClusterRoleBinding
         _ingress.tpl                  # Optional Ingress resource
         _hpa.tpl                      # Optional HorizontalPodAutoscaler
         _pdb.tpl                      # Optional PodDisruptionBudget
@@ -1434,25 +1437,23 @@ deploy/
         _serviceaccount.tpl           # Optional ServiceAccount
     toolkit-platform/                  # Umbrella chart (type: application)
       Chart.yaml                      # Dependencies: all unit charts (conditional)
-      values.yaml                     # Global defaults
-      values-minimal.yaml             # Flight Control control plane only
-      values-production.yaml          # All gears, resource limits, HPA, PDB
-      values-dev.yaml                 # All gears, minimal resources, debug logging
-      templates/
-        NOTES.txt                     # Post-install instructions
+      values.yaml                     # Minimal deployment
+      values-dev.yaml                 # Full dev deployment
 
-gears/<group>/<name>/
-  chart/
-    Chart.yaml                        # type: application, depends on toolkit-common
+<gear-source-dir>/                    # Path to the gear source directory
+  deploy/helm/<name>/
+    Chart.yaml
     values.yaml                       # Gear-specific defaults
-    values.schema.json                # JSON Schema for values validation
     templates/
       deployment.yaml                 # {{ include "toolkit-common.deployment" . }}
       service.yaml                    # {{ include "toolkit-common.service" . }}
       configmap.yaml                  # {{ include "toolkit-common.configmap" . }}
-      ingress.yaml                    # {{ include "toolkit-common.ingress" . }}
-      _gear-specific.yaml           # Any gear-specific resources (CRDs, Jobs, etc.)
+      serviceaccount.yaml             # {{ include "toolkit-common.serviceAccount" . }}
 ```
+
+The `toolkit-common` dependency is referenced from each gear chart via a relative
+`file://` path to `deploy/helm/toolkit-common`, resolved by `deploy/helm/update-helm-deps.sh`.
+
 
 #### Library Chart — `toolkit-common`
 
@@ -1485,25 +1486,25 @@ The umbrella chart declares each deployable unit's chart as a conditional depend
 dependencies:
   - name: flight-control          # composed control-plane pod (directory + edge + authn)
     version: "0.1.x"
-    repository: "file://../../../apps/cf-gears-flight-control/chart"
+    repository: "file://../../../apps/cf-gears-flight-control/deploy/helm/flight-control"
     condition: flight-control.enabled
-  # ... one chart per OoP gear/unit
+  # ... one chart per OoP gear/unit, each under its source dir's deploy/helm/<name>
 ```
 
 **Preset values files** provide tested combinations:
 
-| Preset                   | Enabled units                 | Resources      | Autoscaling | Use case                   |
-|--------------------------|-------------------------------|----------------|-------------|----------------------------|
-| `values-minimal.yaml`    | flight-control (control plane)| Low            | Off         | Quick start, CI, demo      |
-| `values-production.yaml` | All                           | Tuned per unit | HPA + PDB   | Production deployment      |
-| `values-dev.yaml`        | All                           | Minimal        | Off         | Local k8s (minikube, kind) |
+| Preset            | Enabled units                  | Use case                   |
+|-------------------|--------------------------------|----------------------------|
+| `values.yaml`     | flight-control only            | Control-plane smoke test    |
+| `values-dev.yaml` | All demo gears                 | Local development cluster   |
+
+There is no production preset yet. The current image/config defaults include development authentication and must not be used as a production profile.
 
 **User installation**:
 
 ```bash
 # Minimal platform
-helm install my-platform oci://ghcr.io/constructorfabric/charts/toolkit-platform \
-  -f values-minimal.yaml
+helm install my-platform oci://ghcr.io/constructorfabric/charts/toolkit-platform
 
 # Custom overrides
 helm install my-platform oci://ghcr.io/constructorfabric/charts/toolkit-platform \
@@ -1586,7 +1587,7 @@ Every parameter is documented with `# --` comment annotations (compatible with `
 
 ```
 chart change detected
-  → helm dependency build (resolve toolkit-common)
+  → helm dependency update (resolve toolkit-common)
   → helm lint
   → helm template (dry-run render)
   → helm package → push to OCI registry (ghcr.io/constructorfabric/charts/<name>)

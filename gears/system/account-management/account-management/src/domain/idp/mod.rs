@@ -100,13 +100,20 @@ pub(crate) fn redact_provider_detail(detail: &str) -> (u64, usize) {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub(crate) enum RedactedProvisionFailure {
+    /// Provisioning outcome is ambiguous; the provider detail is redacted to a digest and length.
     #[error(
         "idp provision ambiguous outcome (provider detail redacted; digest=0x{digest:016x} len={len})"
     )]
-    Ambiguous { digest: u64, len: usize },
+    Ambiguous {
+        /// Digest of the redacted provider detail, for trace correlation.
+        digest: u64,
+        /// Byte length of the redacted provider detail.
+        len: usize,
+    },
 }
 
 impl RedactedProvisionFailure {
+    /// Build an [`Self::Ambiguous`] failure from the digest and length of the redacted provider detail.
     pub(crate) const fn ambiguous(digest: u64, len: usize) -> Self {
         Self::Ambiguous { digest, len }
     }
@@ -132,6 +139,7 @@ impl RedactedProvisionFailure {
 ///   message (provider detail kept private — see
 ///   `infra::canonical_mapping`).
 pub(crate) trait ProvisionFailureExt {
+    /// Convert this failure into a [`DomainError`] scoped to `tenant_id`.
     fn into_domain_error(self, tenant_id: Uuid) -> DomainError;
 }
 
@@ -305,6 +313,7 @@ impl ProvisionFailureExt for IdpProvisionFailure {
 /// to raw provider responses via the digest + length emitted on the
 /// `am.idp` `tracing::warn!` line.
 pub(crate) trait UserOperationFailureExt {
+    /// Convert this failure into a [`DomainError`] scoped to `tenant_id`.
     fn into_domain_error(self, tenant_id: Uuid) -> DomainError;
 }
 
@@ -650,6 +659,7 @@ fn log_service_account_failure(err: &IdpServiceAccountFailure, tenant_id: Uuid) 
 /// where the provider reporting `NotFound` is a contract violation
 /// rather than a real miss.
 pub(crate) trait ServiceAccountFailureExt {
+    /// Convert this failure into a [`DomainError`] for `tenant_id` and the named `resource`.
     fn into_domain_error(self, tenant_id: Uuid, resource: &str) -> DomainError;
 
     /// Map a failure from the non-retaining list operation. Provider

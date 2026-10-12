@@ -78,6 +78,7 @@ pub struct UnitStore {
 
 /// Committed Type Schema content retained for baseline comparison in the same
 /// snapshot. Only `extra_roots` are retained, avoiding copies of the full closure.
+#[toolkit::domain_model]
 #[derive(Clone, Debug)]
 pub struct CommittedSchema {
     pub revision_no: i32,

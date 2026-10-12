@@ -103,3 +103,31 @@ fn the_order_roster_carries_the_same_kinds_as_its_filter_twin() {
         );
     }
 }
+
+#[test]
+fn monetary_fields_are_not_filterable_or_orderable_as_text() {
+    use toolkit_odata::filter::FilterField;
+    for field in [
+        "amount",
+        "amount_minor",
+        "balance",
+        "balance_minor",
+        "functional_amount",
+        "functional_balance",
+        "money.amount",
+        "balance.amount",
+    ] {
+        assert!(
+            super::JournalLineFilterField::from_name(field).is_none(),
+            "{field}"
+        );
+        assert!(
+            super::JournalLineOrderField::from_name(field).is_none(),
+            "{field}"
+        );
+        assert!(
+            super::BalanceFilterField::from_name(field).is_none(),
+            "{field}"
+        );
+    }
+}

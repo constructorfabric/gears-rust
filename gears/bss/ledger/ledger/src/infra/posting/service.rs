@@ -1,28 +1,26 @@
-//! `PostingService` — the transactional posting engine. One ACID
-//! transaction per entry runs the full sequence: idempotency claim → insert
-//! balanced lines → fiscal-period gate → account lifecycle + `normal_side`
-//! lookup → balance projection → finalize → COMMIT. Pure structural
-//! invariants (`validate_balanced_entry`) and the line-count ceiling are
-//! checked BEFORE the transaction opens, so a malformed request never takes
-//! a write lock.
+//! Transactional decimal posting engine. Each serializable attempt validates
+//! structure, clock, tenant lock and accounts, then claims dedup, validates fresh
+//! currency metadata, checks freeze/period/policy, inserts and projects, runs the
+//! sidecar, seals the chain, finalizes dedup and calls the parked publisher.
+//! All database-dependent reads use the supplied transaction. External alarms
+//! are emitted by the retry-owning wrapper, outside the transaction body.
 //!
 //! ## Error handling across the transaction boundary
 //!
-//! [`DBProvider::transaction`] fixes the closure error type to
-//! [`DbError`], yet a business rejection discovered AFTER a write (e.g. a
+//! Legacy in-transaction helpers use [`DbError`], yet a business rejection
+//! discovered AFTER a write (e.g. a
 //! negative balance after the journal insert) MUST roll the transaction
-//! back. The closure therefore encodes a business [`DomainError`] into a
+//! back. Those helpers encode a business [`DomainError`] into a
 //! sentinel [`DbError::Sea`] (`DbErr::Custom`) and returns `Err`, forcing a
-//! rollback; once `transaction()` returns, the sentinel is decoded back into
-//! the original [`DomainError`]. A `DbError` WITHOUT the sentinel prefix is a
-//! genuine infrastructure fault and surfaces as [`DomainError::Internal`].
+//! rollback. The typed retry boundary decodes sentinels before classifying
+//! real driver contention. Explicit concurrency conflicts and driver contention
+//! consume one shared budget of three whole-transaction attempts.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use bss_ledger_sdk::{PostingRef, Side};
-use sea_orm::DbErr;
-use toolkit_db::secure::{AccessScope, DbTx, TxConfig};
+use toolkit_db::secure::{AccessScope, DbTx};
 use toolkit_db::{DBProvider, DbError};
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
@@ -46,23 +44,9 @@ use time::OffsetDateTime;
 /// Maximum number of lines a single entry may carry.
 const MAX_LINES: usize = 1000;
 
-/// Record-separator framing a sentinel-encoded business error inside a
-/// `DbErr::Custom` payload: `LEDGER_POST_ERR␟<CODE>␟<message>`.
-const SENTINEL_TAG: &str = "LEDGER_POST_ERR";
-/// Unit-separator used inside the sentinel payload.
-const SENTINEL_SEP: char = '\u{1f}';
-
-/// Retry-extractor for the `SERIALIZABLE` post: a wrapped `DbErr` so a
-/// serialization failure (surfaced at a statement or COMMIT) is recognised as
-/// retryable contention. The business-rejection sentinel is a `DbErr::Custom`,
-/// which the contention classifier treats as NON-retryable — so only genuine
-/// conflicts retry, business rejections propagate immediately.
-fn as_db_err(e: &DbError) -> Option<&sea_orm::DbErr> {
-    match e {
-        DbError::Sea(db_err) => Some(db_err),
-        _ => None,
-    }
-}
+use super::error_transport::scale_error_to_domain;
+pub(crate) use super::error_transport::{business, decode_business_error, infra, repo_to_db};
+use super::retry::{AttemptError, RetryOp, retry_transaction_for};
 
 /// The facts a finalized fresh post exposes to its in-transaction sidecar:
 /// the new entry id and its DB-generated sequence. Passed by reference so the
@@ -81,7 +65,7 @@ pub struct PostedFacts {
 /// transaction, so they commit atomically with the entry or roll back with it.
 ///
 /// An `Err(DomainError)` rolls the whole post back; the engine encodes it as a
-/// non-retryable business sentinel so it surfaces to the caller unchanged.
+/// business sentinel; ConcurrentModification is decoded as retryable contention.
 /// Threaded as `Arc<dyn PostSidecar>` (not `&dyn`) because the retry closure is
 /// `FnMut` and must `Clone` its inputs across attempts.
 #[async_trait::async_trait]
@@ -89,8 +73,7 @@ pub trait PostSidecar: Send + Sync {
     /// Run the sidecar's in-transaction writes against the posted facts.
     ///
     /// # Errors
-    /// A [`DomainError`] rolls the post back (encoded as a non-retryable
-    /// business rejection).
+    /// A [`DomainError`] rolls the post back. Only ConcurrentModification retries.
     async fn run(
         &self,
         txn: &DbTx<'_>,
@@ -158,7 +141,7 @@ enum ClaimMode {
 /// (`ClaimSpec::fresh()` / `::fresh_with_request_hash(h)` / `::queued_apply()`)
 /// and keeps `run_post` to a tidy arity.
 #[derive(Clone)]
-struct ClaimSpec {
+pub(crate) struct ClaimSpec {
     mode: ClaimMode,
     /// `Fresh` only: a request-based hash to key the claim on instead of the
     /// entry-derived `payload_hash`. `None` ⇒ derive from the entry (the
@@ -168,7 +151,7 @@ struct ClaimSpec {
 
 impl ClaimSpec {
     /// Inline post keyed on the entry-derived payload hash (today's `post()`).
-    fn fresh() -> Self {
+    pub(crate) fn fresh() -> Self {
         Self {
             mode: ClaimMode::Fresh,
             payload_hash_override: None,
@@ -176,7 +159,7 @@ impl ClaimSpec {
     }
 
     /// Inline post keyed on an externally-computed REQUEST hash.
-    fn fresh_with_request_hash(request_hash: String) -> Self {
+    pub(crate) fn fresh_with_request_hash(request_hash: String) -> Self {
         Self {
             mode: ClaimMode::Fresh,
             payload_hash_override: Some(request_hash),
@@ -184,12 +167,19 @@ impl ClaimSpec {
     }
 
     /// Deferred apply of a row already claimed `QUEUED` at intake.
-    fn queued_apply() -> Self {
+    pub(crate) fn queued_apply() -> Self {
         Self {
             mode: ClaimMode::QueuedApply,
             payload_hash_override: None,
         }
     }
+}
+
+/// Private provenance; stored money is only built from scoped journal rows.
+#[derive(Clone, Copy)]
+enum MoneyOrigin {
+    Current,
+    StoredReversal,
 }
 
 /// Outcome of the in-transaction posting body, carried out of the closure on
@@ -214,6 +204,7 @@ impl PostingService {
     ) -> Self {
         let journal = JournalRepo::new(db.clone());
         let reference = ReferenceRepo::new(db.clone());
+        let projector = BalanceProjector::new(db.db().backend());
         Self {
             db,
             journal,
@@ -222,7 +213,7 @@ impl PostingService {
             freeze: crate::infra::posting::freeze::TamperFreezeGuard::new(),
             period: FiscalPeriodGuard::new(),
             policy: crate::infra::policy_version::PolicyVersionGuard::new(),
-            projector: BalanceProjector::new(),
+            projector,
             chain: ChainSealer::new(),
             publisher,
         }
@@ -317,7 +308,7 @@ impl PostingService {
 
     /// Shared driver behind [`Self::post`] / [`Self::post_with_request_hash`]
     /// (`Fresh`) and [`Self::post_queued_apply`] (`QueuedApply`): the pre-txn
-    /// validation + `normal_side` load + the SERIALIZABLE retry transaction + the
+    /// SERIALIZABLE retry transaction (including validation and account reads) + the
     /// out-of-band invariant alarm. The modes differ only in the [`ClaimSpec`]:
     /// its [`ClaimMode`] is threaded into the in-txn body's step 1, and its
     /// optional request-hash override keys a `Fresh` claim (`None` reproduces the
@@ -331,45 +322,6 @@ impl PostingService {
         sidecar: Option<Arc<dyn PostSidecar>>,
         claim: ClaimSpec,
     ) -> Result<PostingRef, DomainError> {
-        // --- PRE-TRANSACTION (fail fast, no writes) ---
-        let facts: Vec<LineFacts> = lines
-            .iter()
-            .map(|l| LineFacts {
-                side: l.side,
-                amount_minor: l.amount_minor,
-                currency: l.currency.clone(),
-                currency_scale: l.currency_scale,
-                payer_tenant_id: l.payer_tenant_id,
-                functional_amount_minor: l.functional_amount_minor,
-            })
-            .collect();
-        if let Err(v) = validate_balanced_entry(&entry.entry_currency, &facts) {
-            return Err(v.into());
-        }
-        if lines.len() > MAX_LINES {
-            return Err(DomainError::EntryTooLarge(format!(
-                "entry has {} lines (max {MAX_LINES})",
-                lines.len()
-            )));
-        }
-
-        // Pre-transaction gate: tenant-termination kill switch (design §3.2). A
-        // held `tenant_posting_lock` refuses every post for the tenant with
-        // `TENANT_POSTING_LOCKED`, before any write. Read on its own connection
-        // (like the account-lifecycle pre-check below); a lock set CONCURRENTLY
-        // is not caught here, tolerable for a rare admin op.
-        if self
-            .reference
-            .is_tenant_posting_locked(scope, entry.tenant_id)
-            .await
-            .map_err(|e| decode_post_error(&repo_to_db(e)))?
-        {
-            return Err(DomainError::TenantPostingLocked(format!(
-                "tenant {} is posting-locked",
-                entry.tenant_id
-            )));
-        }
-
         // Pre-transaction gate: clock-skew guard (design §3.2 FiscalPeriodGuard).
         // Skew beyond ±24 h between the post's `posted_at_utc` and the server
         // wall clock is quarantined (`CLOCK_SKEW_QUARANTINE`), re-submittable via
@@ -415,24 +367,13 @@ impl PostingService {
             }
         }
 
-        // Account lifecycle + normal_sides are read BEFORE the transaction:
-        // the repos open their own (non-transactional) connection, which
-        // Postgres forbids inside an active transaction. A closed account fails
-        // fast here with no writes. ACCEPTED LIMITATION: this read is outside the
-        // serializable snapshot, so an account closed CONCURRENTLY (after this
-        // read, before COMMIT) is not detected — unlike the in-txn period gate.
-        // Tolerable: account close is a rare admin op and `normal_side` is
-        // immutable; an in-txn account re-pin is a tracked follow-up.
-        let normal_sides = self
-            .load_normal_sides(scope, &lines)
-            .await
-            .map_err(|e| decode_post_error(&e))?;
-
         // Capture alarm-scope fields before `entry`/`lines` move into the
         // closure (same reason `ctx` is cloned below) — used out-of-band on
         // the Err path; internal ids only, no PII.
         let alarm_tenant = entry.tenant_id;
         let alarm_flow = entry.source_doc_type.as_str().to_owned();
+        // The retry logs name the flow and tenant of this post.
+        let op = RetryOp::new(entry.source_doc_type.as_str(), Some(entry.tenant_id));
         let alarm_business = entry.source_business_id.clone();
 
         // --- TRANSACTION ---
@@ -448,61 +389,31 @@ impl PostingService {
         // retries here — close can never certify a period this entry lands in.
         // The body is `FnMut` (re-clones its inputs per attempt); the post is
         // idempotent across attempts (the dedup claim re-runs from a fresh txn).
-        // Business rejections carry a non-retryable sentinel `DbErr`, so only
-        // genuine contention retries.
-        let result = self
-            .db
-            .db()
-            .transaction_with_retry(TxConfig::serializable(), as_db_err, move |txn| {
-                let svc = svc.clone();
-                let ctx_txn = ctx_txn.clone();
-                let scope = scope.clone();
-                let entry = entry.clone();
-                let lines = lines.clone();
-                let normal_sides = normal_sides.clone();
-                // `Arc<dyn PostSidecar>` is cheap to clone per attempt; the
-                // sidecar's writes re-run from a fresh txn on a retry, mirroring
-                // the idempotent post body.
-                let sidecar = sidecar.clone();
-                // `ClaimSpec` is re-cloned per attempt (like `entry`/`lines`),
-                // since the retry body is `FnMut` and it carries an owned hash.
-                let claim = claim.clone();
-                Box::pin(async move {
-                    svc.post_in_txn(
-                        &ctx_txn,
-                        txn,
-                        &scope,
-                        entry,
-                        lines,
-                        normal_sides,
-                        sidecar,
-                        claim,
-                    )
+        // Sentinels are decoded before driver classification. Only explicit
+        // application conflicts and genuine driver contention retry.
+        let result = retry_transaction_for(&self.db.db(), op, move |txn| {
+            let svc = svc.clone();
+            let ctx_txn = ctx_txn.clone();
+            let scope = scope.clone();
+            let entry = entry.clone();
+            let lines = lines.clone();
+            // `Arc<dyn PostSidecar>` is cheap to clone per attempt; the
+            // sidecar's writes re-run from a fresh txn on a retry, mirroring
+            // the idempotent post body.
+            let sidecar = sidecar.clone();
+            // `ClaimSpec` is re-cloned per attempt (like `entry`/`lines`),
+            // since the retry body is `FnMut` and it carries an owned hash.
+            let claim = claim.clone();
+            Box::pin(async move {
+                svc.post_once(&ctx_txn, txn, &scope, entry, lines, sidecar, claim)
                     .await
-                })
             })
-            .await;
+        })
+        .await;
 
         match result {
-            Ok(PostOutcome::Posted {
-                entry_id,
-                created_seq,
-            }) => Ok(PostingRef {
-                entry_id,
-                created_seq,
-                replayed: false,
-            }),
-            Ok(PostOutcome::Replay { entry_id }) => Ok(PostingRef {
-                // A replay carries the prior, finalized entry id (the in-txn
-                // body only yields Replay once it has confirmed the dedup row
-                // is POSTED with a real id — never the nil UUID). The sequence
-                // is not re-read here; replay callers key on the id.
-                entry_id,
-                created_seq: 0,
-                replayed: true,
-            }),
-            Err(db_err) => {
-                let err = decode_post_error(&db_err);
+            Ok(reference) => Ok(reference),
+            Err(err) => {
                 // Out-of-band invariant alarm: fire-and-forget on a separate
                 // committed connection, so it survives the rolled-back post and
                 // never changes the error returned to the caller.
@@ -527,9 +438,186 @@ impl PostingService {
         }
     }
 
-    /// The in-transaction posting body. Business rejections are encoded as a
-    /// sentinel `DbError` so the closure error type stays `DbError` while
-    /// still forcing a rollback.
+    /// Complete fresh-input posting attempt. Call only inside `retry_transaction_for`;
+    /// rebuild all financial state on that same runner before invoking this method.
+    /// This method never retries or emits external alarms. Callers own post-attempt
+    /// alarm emission and must propagate every error to roll back the transaction.
+    /// # Errors
+    /// Returns typed business, storage or contention errors.
+    pub(crate) async fn post_once(
+        &self,
+        ctx: &SecurityContext,
+        txn: &DbTx<'_>,
+        scope: &AccessScope,
+        entry: NewEntry,
+        lines: Vec<NewLine>,
+        sidecar: Option<Arc<dyn PostSidecar>>,
+        claim: ClaimSpec,
+    ) -> Result<PostingRef, AttemptError> {
+        if entry.source_doc_type == bss_ledger_sdk::SourceDocType::Reversal {
+            return Err(DomainError::InvalidRequest(
+                "reversals must use post_reversal_once with stored journal facts".to_owned(),
+            )
+            .into());
+        }
+        self.prepare_attempt(txn, scope, &entry, &lines).await?;
+        let normal_sides = self.load_normal_sides(txn, scope, &lines).await?;
+        let result = self
+            .post_in_txn(
+                ctx,
+                txn,
+                scope,
+                entry,
+                lines,
+                normal_sides,
+                sidecar,
+                claim,
+                MoneyOrigin::Current,
+            )
+            .await?;
+        Ok(match result {
+            PostOutcome::Posted {
+                entry_id,
+                created_seq,
+            } => PostingRef {
+                entry_id,
+                created_seq,
+                replayed: false,
+            },
+            PostOutcome::Replay { entry_id } => PostingRef {
+                entry_id,
+                created_seq: 0,
+                replayed: true,
+            },
+        })
+    }
+
+    /// Reverse stored journal lines on this transaction's snapshot. Callers supply
+    /// only a header with both original references; they cannot supply historical
+    /// money. Values, metadata and pinned evidence are decoded from storage, and
+    /// only sides and line identifiers change. Never resolve the current registry.
+    /// # Errors
+    /// Missing/corrupt history, ordinary posting gates or retryable contention.
+    pub(crate) async fn post_reversal_once(
+        &self,
+        ctx: &SecurityContext,
+        txn: &DbTx<'_>,
+        scope: &AccessScope,
+        mut entry: NewEntry,
+        sidecar: Option<Arc<dyn PostSidecar>>,
+        claim: ClaimSpec,
+    ) -> Result<PostingRef, AttemptError> {
+        let original = entry.reverses_entry_id.ok_or_else(|| {
+            DomainError::InvalidRequest("reversal requires original entry".to_owned())
+        })?;
+        let period = entry.reverses_period_id.as_ref().ok_or_else(|| {
+            DomainError::InvalidRequest("reversal requires original period".to_owned())
+        })?;
+        let (rate_snapshot, mut lines) = self
+            .journal
+            .read_lines_to_reverse_in(txn, scope, entry.tenant_id, original, period)
+            .await?;
+        if lines.is_empty() {
+            return Err(
+                DomainError::InvalidRequest("original entry has no lines".to_owned()).into(),
+            );
+        }
+        entry.rate_snapshot_ref = rate_snapshot;
+        for line in &mut lines {
+            line.line_id = Uuid::now_v7();
+            line.side = match line.side {
+                Side::Debit => Side::Credit,
+                Side::Credit => Side::Debit,
+            };
+        }
+        self.prepare_attempt(txn, scope, &entry, &lines).await?;
+        let normal_sides = self.load_normal_sides(txn, scope, &lines).await?;
+        let result = self
+            .post_in_txn(
+                ctx,
+                txn,
+                scope,
+                entry,
+                lines,
+                normal_sides,
+                sidecar,
+                claim,
+                MoneyOrigin::StoredReversal,
+            )
+            .await?;
+        Ok(match result {
+            PostOutcome::Posted {
+                entry_id,
+                created_seq,
+            } => PostingRef {
+                entry_id,
+                created_seq,
+                replayed: false,
+            },
+            PostOutcome::Replay { entry_id } => PostingRef {
+                entry_id,
+                created_seq: 0,
+                replayed: true,
+            },
+        })
+    }
+
+    /// Enforce structural, clock and tenant gates on every attempt.
+    async fn prepare_attempt(
+        &self,
+        txn: &DbTx<'_>,
+        scope: &AccessScope,
+        entry: &NewEntry,
+        lines: &[NewLine],
+    ) -> Result<(), DbError> {
+        // Structural validation before the first write in this attempt.
+        let facts: Vec<LineFacts> = lines
+            .iter()
+            .map(|l| LineFacts {
+                side: l.side,
+                money: l.money.clone(),
+                payer_tenant_id: l.payer_tenant_id,
+                functional_money: l.functional_money.clone(),
+            })
+            .collect();
+        if let Err(v) = validate_balanced_entry(&entry.entry_currency, &facts) {
+            return Err(business(v.into()));
+        }
+        if lines.len() > MAX_LINES {
+            return Err(business(DomainError::EntryTooLarge(format!(
+                "entry has {} lines (max {MAX_LINES})",
+                lines.len()
+            ))));
+        }
+
+        // The tenant lock is read in the same serializable snapshot as posting.
+        if self
+            .reference
+            .is_tenant_posting_locked_in(txn, scope, entry.tenant_id)
+            .await
+            .map_err(repo_to_db)?
+        {
+            return Err(business(DomainError::TenantPostingLocked(format!(
+                "tenant {} is posting-locked",
+                entry.tenant_id
+            ))));
+        }
+
+        if matches!(
+            crate::infra::posting::period::classify_clock_skew(
+                entry.posted_at_utc,
+                OffsetDateTime::now_utc()
+            ),
+            crate::infra::posting::period::ClockSkewVerdict::Reject
+        ) {
+            return Err(business(DomainError::ClockSkewQuarantine(
+                "posting clock skew exceeds 24 hours".to_owned(),
+            )));
+        }
+        Ok(())
+    }
+
+    /// Shared checked posting tail. Every error must abort the caller transaction.
     // Threads the post's distinct inputs (entry / lines / normal_sides / sidecar)
     // through the serializable retry closure; the claim mode + request-hash are
     // bundled into `ClaimSpec`, so this stays just over the lint's arg ceiling.
@@ -544,6 +632,7 @@ impl PostingService {
         normal_sides: HashMap<uuid::Uuid, Side>,
         sidecar: Option<Arc<dyn PostSidecar>>,
         claim: ClaimSpec,
+        money_origin: MoneyOrigin,
     ) -> Result<PostOutcome, DbError> {
         let ClaimSpec {
             mode: claim_mode,
@@ -644,7 +733,36 @@ impl PostingService {
             }
         }
 
-        // 2b. Tamper-freeze gate (fail fast, BEFORE any write): if the integrity
+        if matches!(money_origin, MoneyOrigin::Current) {
+            let resolver =
+                crate::infra::currency_scale::CurrencyScaleResolver::new(self.reference.clone());
+            // An entry carries one or two currencies: resolve each code once per
+            // attempt and check every line (and functional amount) against it.
+            let mut scale_by_code: HashMap<String, u8> = HashMap::new();
+            for line in &lines {
+                for money in std::iter::once(&line.money).chain(line.functional_money.iter()) {
+                    let code = money.currency().code();
+                    let scale = if let Some(scale) = scale_by_code.get(code) {
+                        *scale
+                    } else {
+                        let scale = resolver
+                            .resolve_in(txn, scope, entry.tenant_id, code)
+                            .await
+                            .map_err(|e| business(scale_error_to_domain(e)))?;
+                        scale_by_code.insert(code.to_owned(), scale);
+                        scale
+                    };
+                    if scale != money.currency().scale() {
+                        return Err(business(DomainError::InconsistentScale(format!(
+                            "{} scale differs from current registry",
+                            money.currency().code()
+                        ))));
+                    }
+                }
+            }
+        }
+
+        // 2b. Tamper-freeze gate (before journal insertion): if the integrity
         // verifier froze this scope (a broken tamper-evidence chain), reject a
         // FRESH post into it with `TamperVerificationFailed` before the
         // append-only insert takes write locks. A replay returned above, so it
@@ -652,7 +770,7 @@ impl PostingService {
         // freeze/post pair conflicts under SSI like the period gate.
         self.freeze.check(txn, scope, tenant, &period_id).await?;
 
-        // 3. Fiscal-period gate (fail fast, BEFORE any write): a post into a
+        // 3. Fiscal-period gate (before journal insertion): a post into a
         // CLOSED/absent period is rejected here, before the append-only insert
         // takes write locks on journal_entry/journal_line. pin_open reads the
         // period row in-txn, so the post/close SSI conflict is unchanged.
@@ -667,7 +785,7 @@ impl PostingService {
                     "fiscal period is closed or absent".to_owned(),
                 )));
             }
-            Err(PeriodError::Db(e)) => return Err(infra(format!("period guard: {e}"))),
+            Err(PeriodError::Db(e)) => return Err(e),
         }
 
         // Keep clones for the projector (the insert consumes the originals).
@@ -762,6 +880,33 @@ impl PostingService {
         // entry, or a publish failure rolls the whole post back via `infra`.
         // Non-replay path only — a replay (either mode) returns above without
         // publishing (the entry was already announced on its first post).
+        // The parked `v1` payload keeps its integer minor-unit fields. Each line goes
+        // through the one saturating policy (`infra::v1_payload`): exact when it fits
+        // `i64`, otherwise saturated and logged with the entry and tenant, never a
+        // reason to refuse the posting.
+        let lines = {
+            let entity = format_args!(
+                "entry {} tenant {} ({} {})",
+                entry_ref.entry_id,
+                entry_for_proj.tenant_id,
+                entry_for_proj.source_doc_type.as_str(),
+                entry_for_proj.source_business_id
+            );
+            lines_for_proj
+                .iter()
+                .map(|l| LedgerLineSummary {
+                    account_class: l.account_class.as_str().to_owned(),
+                    side: l.side.as_str().to_owned(),
+                    amount_minor: crate::infra::v1_payload::v1_minor_units_for(
+                        &l.money,
+                        "lines.amount_minor",
+                        &entity,
+                    ),
+                    currency: l.money.currency().code().to_owned(),
+                    currency_scale: l.money.currency().scale(),
+                })
+                .collect()
+        };
         let posted_event = LedgerEntryPosted {
             entry_id: entry_ref.entry_id,
             tenant_id: entry_for_proj.tenant_id,
@@ -771,16 +916,7 @@ impl PostingService {
             source_business_id: entry_for_proj.source_business_id.clone(),
             posted_at_utc: entry_for_proj.posted_at_utc,
             created_seq: entry_ref.created_seq,
-            lines: lines_for_proj
-                .iter()
-                .map(|l| LedgerLineSummary {
-                    account_class: l.account_class.as_str().to_owned(),
-                    side: l.side.as_str().to_owned(),
-                    amount_minor: l.amount_minor,
-                    currency: l.currency.clone(),
-                    currency_scale: l.currency_scale,
-                })
-                .collect(),
+            lines,
         };
         self.publisher
             .publish_entry_posted(ctx, txn, posted_event)
@@ -799,6 +935,7 @@ impl PostingService {
     /// error.
     async fn load_normal_sides(
         &self,
+        txn: &DbTx<'_>,
         scope: &AccessScope,
         lines: &[NewLine],
     ) -> Result<HashMap<uuid::Uuid, Side>, DbError> {
@@ -809,7 +946,7 @@ impl PostingService {
             }
             let account = self
                 .reference
-                .find_account(scope, line.account_id)
+                .find_account_in(txn, scope, line.account_id)
                 .await
                 .map_err(repo_to_db)?;
             let Some(account) = account else {
@@ -840,32 +977,18 @@ impl PostingService {
     }
 }
 
-/// Map a [`RepoError`](crate::domain::model::RepoError) into the sentinel
-/// `DbError`: a repo db/row failure is an infrastructure fault; a
-/// scale-locked / out-of-range rejection maps to its domain variant.
-pub(crate) fn repo_to_db(e: crate::domain::model::RepoError) -> DbError {
-    use crate::domain::model::RepoError;
-    match e {
-        RepoError::CurrencyScaleLocked(c) => business(DomainError::CurrencyScaleLocked(format!(
-            "currency scale locked: {c}"
-        ))),
-        // A wrong per-line scale changes the implied magnitude → out-of-range
-        // (wire `AMOUNT_OUT_OF_RANGE`), preserving the prior posting contract.
-        RepoError::ScaleOutOfRange(c) => business(DomainError::AmountOutOfRange(format!(
-            "scale out of range: {c}"
-        ))),
-        other => infra(other.to_string()),
-    }
-}
-
 /// Map a [`ProjectError`] into the sentinel `DbError`.
 fn project_to_db(e: ProjectError) -> DbError {
     match e {
+        ProjectError::Repo(e) => repo_to_db(e),
+        ProjectError::Conflict => business(DomainError::ConcurrentModification(
+            "cache version changed".to_owned(),
+        )),
         ProjectError::NegativeBalance {
             account_id,
-            balance_minor,
+            balance,
         } => business(DomainError::NegativeBalance(format!(
-            "balance for account {account_id} would go negative ({balance_minor})"
+            "balance for account {account_id} would go negative ({balance})"
         ))),
         // Should not happen — every account's side is loaded in step 5.
         ProjectError::MissingNormalSide(id) => business(DomainError::AccountClosed(format!(
@@ -876,76 +999,15 @@ fn project_to_db(e: ProjectError) -> DbError {
         ProjectError::MissingCreditEventType(id) => business(DomainError::Internal(format!(
             "REUSABLE_CREDIT line {id} missing credit_grant_event_type"
         ))),
-        // A coalesced money delta overflowed i64 — a clean amount-class rejection
-        // (422), not a 500: surface as the business error the adjustments path
-        // already uses for out-of-range amounts.
-        ProjectError::Overflow {
-            account_id,
-            currency,
-            field,
-        } => business(DomainError::AmountOutOfRange(format!(
-            "coalesced money delta overflowed i64 for account {account_id} ({currency}, {field})"
-        ))),
         ProjectError::Db(e) => infra(format!("projector: {e}")),
+        ProjectError::Arithmetic(e) => infra(format!("projector: {e}")),
     }
-}
-
-/// Encode a business [`DomainError`] as a sentinel `DbError` so the transaction
-/// closure (whose error type is fixed to `DbError`) rolls back yet preserves
-/// the rejection for decoding after `transaction()` returns. The payload is a
-/// `DbErr::Custom`, which the contention classifier treats as NON-retryable —
-/// so a business rejection propagates immediately and is never retried.
-pub(crate) fn business(err: DomainError) -> DbError {
-    let (tag, detail) = domain_parts(err);
-    DbError::Sea(DbErr::Custom(format!(
-        "{SENTINEL_TAG}{SENTINEL_SEP}{tag}{SENTINEL_SEP}{detail}"
-    )))
-}
-
-/// Encode an internal (infrastructure) failure as a non-sentinel `DbError`.
-pub(crate) fn infra(message: impl Into<String>) -> DbError {
-    DbError::Sea(DbErr::Custom(message.into()))
-}
-
-/// Decode a `DbError` returned from a `transaction_with_retry` back into a
-/// [`DomainError`]: a sentinel-tagged `DbErr::Custom` (written by [`business`])
-/// yields the original business rejection; any other `DbError` is an
-/// infrastructure fault ([`DomainError::Internal`]). Shared by service paths
-/// that run their own sentinel-carrying transaction (e.g. the audit-surface
-/// cross-tenant elevation txn) and need the post path's decode semantics.
-pub(crate) fn decode_business_error(db_err: &DbError) -> DomainError {
-    decode_post_error(db_err)
-}
-
-/// Decode a `DbError` returned from `transaction()` back into a [`DomainError`]:
-/// a sentinel-tagged `DbErr::Custom` yields the original business rejection; any
-/// other `DbError` is an infrastructure fault ([`DomainError::Internal`]).
-fn decode_post_error(db_err: &DbError) -> DomainError {
-    if let DbError::Sea(DbErr::Custom(payload)) = db_err
-        && let Some(rest) = payload.strip_prefix(&format!("{SENTINEL_TAG}{SENTINEL_SEP}"))
-        && let Some((tag, detail)) = rest.split_once(SENTINEL_SEP)
-    {
-        return domain_from_parts(tag, detail.to_owned());
-    }
-    // A concurrent wallet over-draw that slips past the app-level pre-check trips
-    // the DB no-negative CHECK on reusable_credit_subbalance; surface it as the
-    // clean CreditExceedsWallet (→409) rather than an opaque Internal (500). No
-    // money is lost (the CHECK held); only the wire surface is corrected.
-    if db_err
-        .to_string()
-        .contains("chk_reusable_credit_subbalance_no_negative")
-    {
-        return DomainError::CreditExceedsWallet(
-            "concurrent wallet over-draw rejected by the no-negative guard".to_owned(),
-        );
-    }
-    DomainError::Internal(db_err.to_string())
 }
 
 /// Map a decoded [`DomainError`] to its out-of-band invariant alarm
 /// (category, severity, wire code), or `None` for ordinary client rejections
 /// that raise no alarm.
-fn alarm_for(err: &DomainError) -> Option<(AlarmCategory, AlarmSeverity, &'static str)> {
+pub(crate) fn alarm_for(err: &DomainError) -> Option<(AlarmCategory, AlarmSeverity, &'static str)> {
     // Only the (category, wire code) pair is named per variant; the severity is
     // ALWAYS taken from the normative §4.7 catalog (`alarm_catalog::severity`) so
     // the emitter can never drift from it (e.g. an idempotency-key collision is
@@ -974,182 +1036,38 @@ fn alarm_for(err: &DomainError) -> Option<(AlarmCategory, AlarmSeverity, &'stati
     ))
 }
 
-/// Split a [`DomainError`] into a stable per-variant tag + its detail for the
-/// sentinel round-trip. Exhaustive, so a new variant forces a tag here; the
-/// tags are internal to the post txn (encoded and decoded in this module only).
-fn domain_parts(err: DomainError) -> (&'static str, String) {
-    use DomainError as D;
-    match err {
-        D::Unbalanced(d) => ("Unbalanced", d),
-        D::Empty(d) => ("Empty", d),
-        D::MixedPayer(d) => ("MixedPayer", d),
-        D::MissingPayer(d) => ("MissingPayer", d),
-        D::MixedLegalEntity(d) => ("MixedLegalEntity", d),
-        D::InconsistentScale(d) => ("InconsistentScale", d),
-        D::AmountOutOfRange(d) => ("AmountOutOfRange", d),
-        D::EntryTooLarge(d) => ("EntryTooLarge", d),
-        D::InvalidRequest(d) => ("InvalidRequest", d),
-        D::ScaleOutOfRange(d) => ("ScaleOutOfRange", d),
-        D::CreditResidualUndisposed(d) => ("CreditResidualUndisposed", d),
-        D::MoneyOutCapExceeded(d) => ("MoneyOutCapExceeded", d),
-        D::AllocationTooLarge(d) => ("AllocationTooLarge", d),
-        D::AllocationCurrencyMismatch(d) => ("AllocationCurrencyMismatch", d),
-        D::CurrencyMismatch(d) => ("CurrencyMismatch", d),
-        // FX rate errors are raised pre-post (rate-lock); listed for the
-        // exhaustive-match contract only (they never ride the sentinel).
-        D::FxRateUnavailable(d) => ("FxRateUnavailable", d),
-        D::FxRateStaleNotAllowed(d) => ("FxRateStaleNotAllowed", d),
-        D::AllocationSplitInvalid(d) => ("AllocationSplitInvalid", d),
-        D::GrantExceedsUnallocated(d) => ("GrantExceedsUnallocated", d),
-        D::CreditExceedsOpenAr(d) => ("CreditExceedsOpenAr", d),
-        D::CreditExceedsWallet(d) => ("CreditExceedsWallet", d),
-        D::ScheduleTooLong(d) => ("ScheduleTooLong", d),
-        D::SspSnapshotRequired(d) => ("SspSnapshotRequired", d),
-        D::MissingPoAllocationGroup(d) => ("MissingPoAllocationGroup", d),
-        D::RecognitionPolicyConflict(d) => ("RecognitionPolicyConflict", d),
-        D::CreditNoteSplitAmbiguous(d) => ("CreditNoteSplitAmbiguous", d),
-        D::CreditNoteExceedsHeadroom(d) => ("CreditNoteExceedsHeadroom", d),
-        // The refund cap CHECKs fire INSIDE the post txn (the RefundPostSidecar's
-        // counter increments), so these ride the sentinel to surface to the caller.
-        D::RefundExceedsSettled(d) => ("RefundExceedsSettled", d),
-        D::RefundExceedsAllocated(d) => ("RefundExceedsAllocated", d),
-        D::ModificationTreatmentReview(d) => ("ModificationTreatmentReview", d),
-        D::RecognitionWithoutInvoiceLink(d) => ("RecognitionWithoutInvoiceLink", d),
-        D::PiiInMetadataValue(d) => ("PiiInMetadataValue", d),
-        D::MissingInvestigationReason(d) => ("MissingInvestigationReason", d),
-        D::CrossTenantAccessDenied(d) => ("CrossTenantAccessDenied", d),
-        // Governed manual adjustment rejected by the §4.6 governor (allow-list /
-        // write-off guard). Decided BEFORE the post (the handler runs `govern`
-        // out-of-txn), so it never actually rides the sentinel — listed for the
-        // exhaustive match contract.
-        D::ManualAdjustmentNotAllowed(d) => ("ManualAdjustmentNotAllowed", d),
-        D::PeriodClosed(d) => ("PeriodClosed", d),
-        D::AccountClosed(d) => ("AccountClosed", d),
-        D::PayerClosed(d) => ("PayerClosed", d),
-        D::AccountMappingMissing(d) => ("AccountMappingMissing", d),
-        D::NegativeBalance(d) => ("NegativeBalance", d),
-        D::SettlementReturnOverAllocated(d) => ("SettlementReturnOverAllocated", d),
-        D::InvalidDisputeTransition(d) => ("InvalidDisputeTransition", d),
-        D::ChargebackExceedsSettled(d) => ("ChargebackExceedsSettled", d),
-        D::ChargebackOnRefunded(d) => ("ChargebackOnRefunded", d),
-        D::ClockSkewQuarantine(d) => ("ClockSkewQuarantine", d),
-        D::PeriodNotOpen(d) => ("PeriodNotOpen", d),
-        D::PeriodCloseBlocked(d) => ("PeriodCloseBlocked", d),
-        D::PeriodCloseInProgress(d) => ("PeriodCloseInProgress", d),
-        D::IdempotencyConflict(d) => ("IdempotencyConflict", d),
-        D::CurrencyScaleLocked(d) => ("CurrencyScaleLocked", d),
-        D::OverRecognition(d) => ("OverRecognition", d),
-        // Group E: a claw-back whose money-out decrement would underflow is raised
-        // by the refund post sidecar and MUST round-trip unchanged (the handler
-        // matches on it to DEFER the claw-back to the queue, not hard-fail).
-        D::RefundClawbackDeferred(d) => ("RefundClawbackDeferred", d),
-        // Cross-currency unsupported-op reject (Slice 5): guarded BEFORE the post
-        // (claw-back in the refund handler, mapping-correction in the REST handler),
-        // so it never rides the sentinel — listed for the exhaustive match contract.
-        D::FxOperationUnsupported(d) => ("FxOperationUnsupported", d),
-        // The dispute-hold gate runs OUT-OF-TXN in the refund handler BEFORE the
-        // post (the open dispute is read out-of-txn), so it never actually rides the
-        // sentinel; listed for the exhaustive match contract (Z5-2).
-        D::RefundDisputeHeld(d) => ("RefundDisputeHeld", d),
-        D::DualControlRequired(d) => ("DualControlRequired", d),
-        D::SelfApprovalForbidden(d) => ("SelfApprovalForbidden", d),
-        D::ApprovalNotActionable(d) => ("ApprovalNotActionable", d),
-        D::DualControlPolicyOutOfRange(d) => ("DualControlPolicyOutOfRange", d),
-        D::TamperVerificationFailed(d) => ("TamperVerificationFailed", d),
-        D::PolicyVersionViolation(d) => ("PolicyVersionViolation", d),
-        D::TenantPostingLocked(d) => ("TenantPostingLocked", d),
-        D::PeriodNotFound(d) => ("PeriodNotFound", d),
-        D::ApprovalNotFound(d) => ("ApprovalNotFound", d),
-        D::PayerPiiNotFound(d) => ("PayerPiiNotFound", d),
-        // Guarded in the credit/debit-note handlers BEFORE the post, so it never
-        // actually rides the sentinel — listed for the exhaustive match contract.
-        D::NoteInvoiceNotFound(d) => ("NoteInvoiceNotFound", d),
-        // Likewise guarded in the refund handler BEFORE the post (the origin
-        // settlement is resolved out-of-txn); listed for the exhaustive contract.
-        D::RefundOriginNotFound(d) => ("RefundOriginNotFound", d),
-        D::Internal(d) => ("Internal", d),
-    }
-}
-
-/// Reconstruct a [`DomainError`] from a sentinel tag + detail; an unrecognised
-/// tag degrades to [`DomainError::Internal`] (never silently dropped).
-fn domain_from_parts(tag: &str, detail: String) -> DomainError {
-    use DomainError as D;
-    match tag {
-        "Unbalanced" => D::Unbalanced(detail),
-        "Empty" => D::Empty(detail),
-        "MixedPayer" => D::MixedPayer(detail),
-        "MissingPayer" => D::MissingPayer(detail),
-        "MixedLegalEntity" => D::MixedLegalEntity(detail),
-        "InconsistentScale" => D::InconsistentScale(detail),
-        "AmountOutOfRange" => D::AmountOutOfRange(detail),
-        "EntryTooLarge" => D::EntryTooLarge(detail),
-        "InvalidRequest" => D::InvalidRequest(detail),
-        "ScaleOutOfRange" => D::ScaleOutOfRange(detail),
-        "CreditResidualUndisposed" => D::CreditResidualUndisposed(detail),
-        "MoneyOutCapExceeded" => D::MoneyOutCapExceeded(detail),
-        "AllocationTooLarge" => D::AllocationTooLarge(detail),
-        "AllocationCurrencyMismatch" => D::AllocationCurrencyMismatch(detail),
-        "CurrencyMismatch" => D::CurrencyMismatch(detail),
-        "FxRateUnavailable" => D::FxRateUnavailable(detail),
-        "FxRateStaleNotAllowed" => D::FxRateStaleNotAllowed(detail),
-        "AllocationSplitInvalid" => D::AllocationSplitInvalid(detail),
-        "GrantExceedsUnallocated" => D::GrantExceedsUnallocated(detail),
-        "CreditExceedsOpenAr" => D::CreditExceedsOpenAr(detail),
-        "CreditExceedsWallet" => D::CreditExceedsWallet(detail),
-        "ScheduleTooLong" => D::ScheduleTooLong(detail),
-        "SspSnapshotRequired" => D::SspSnapshotRequired(detail),
-        "MissingPoAllocationGroup" => D::MissingPoAllocationGroup(detail),
-        "RecognitionPolicyConflict" => D::RecognitionPolicyConflict(detail),
-        "CreditNoteSplitAmbiguous" => D::CreditNoteSplitAmbiguous(detail),
-        "CreditNoteExceedsHeadroom" => D::CreditNoteExceedsHeadroom(detail),
-        "RefundExceedsSettled" => D::RefundExceedsSettled(detail),
-        "RefundExceedsAllocated" => D::RefundExceedsAllocated(detail),
-        "ModificationTreatmentReview" => D::ModificationTreatmentReview(detail),
-        "RecognitionWithoutInvoiceLink" => D::RecognitionWithoutInvoiceLink(detail),
-        "PiiInMetadataValue" => D::PiiInMetadataValue(detail),
-        "MissingInvestigationReason" => D::MissingInvestigationReason(detail),
-        "CrossTenantAccessDenied" => D::CrossTenantAccessDenied(detail),
-        "PeriodClosed" => D::PeriodClosed(detail),
-        "AccountClosed" => D::AccountClosed(detail),
-        "PayerClosed" => D::PayerClosed(detail),
-        "AccountMappingMissing" => D::AccountMappingMissing(detail),
-        "NegativeBalance" => D::NegativeBalance(detail),
-        "SettlementReturnOverAllocated" => D::SettlementReturnOverAllocated(detail),
-        "InvalidDisputeTransition" => D::InvalidDisputeTransition(detail),
-        "ChargebackExceedsSettled" => D::ChargebackExceedsSettled(detail),
-        "ChargebackOnRefunded" => D::ChargebackOnRefunded(detail),
-        "ClockSkewQuarantine" => D::ClockSkewQuarantine(detail),
-        "PeriodNotOpen" => D::PeriodNotOpen(detail),
-        "PeriodCloseBlocked" => D::PeriodCloseBlocked(detail),
-        "PeriodCloseInProgress" => D::PeriodCloseInProgress(detail),
-        "IdempotencyConflict" => D::IdempotencyConflict(detail),
-        "CurrencyScaleLocked" => D::CurrencyScaleLocked(detail),
-        "OverRecognition" => D::OverRecognition(detail),
-        "RefundClawbackDeferred" => D::RefundClawbackDeferred(detail),
-        "FxOperationUnsupported" => D::FxOperationUnsupported(detail),
-        "RefundDisputeHeld" => D::RefundDisputeHeld(detail),
-        "DualControlRequired" => D::DualControlRequired(detail),
-        "SelfApprovalForbidden" => D::SelfApprovalForbidden(detail),
-        "ApprovalNotActionable" => D::ApprovalNotActionable(detail),
-        "DualControlPolicyOutOfRange" => D::DualControlPolicyOutOfRange(detail),
-        "TamperVerificationFailed" => D::TamperVerificationFailed(detail),
-        "PolicyVersionViolation" => D::PolicyVersionViolation(detail),
-        "TenantPostingLocked" => D::TenantPostingLocked(detail),
-        "PeriodNotFound" => D::PeriodNotFound(detail),
-        "ApprovalNotFound" => D::ApprovalNotFound(detail),
-        "PayerPiiNotFound" => D::PayerPiiNotFound(detail),
-        "NoteInvoiceNotFound" => D::NoteInvoiceNotFound(detail),
-        "RefundOriginNotFound" => D::RefundOriginNotFound(detail),
-        "ManualAdjustmentNotAllowed" => D::ManualAdjustmentNotAllowed(detail),
-        _ => D::Internal(detail),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::{AlarmSeverity, DomainError, alarm_for};
     use crate::infra::events::alarm_catalog;
+
+    /// Explicit corruption mapping must preserve the other repository policies.
+    #[test]
+    fn repository_error_mapping_preserves_existing_policies() {
+        use super::{decode_business_error, repo_to_db};
+        use crate::domain::model::RepoError;
+
+        assert!(matches!(
+            decode_business_error(&repo_to_db(RepoError::CurrencyScaleLocked(
+                "EUR".to_owned()
+            ))),
+            DomainError::CurrencyScaleLocked(_)
+        ));
+        assert!(matches!(
+            decode_business_error(&repo_to_db(RepoError::ScaleOutOfRange("EUR".to_owned()))),
+            DomainError::AmountOutOfRange(_)
+        ));
+        assert!(matches!(
+            decode_business_error(&repo_to_db(RepoError::Db(
+                "chk_reusable_credit_subbalance_no_negative".to_owned()
+            ))),
+            DomainError::Internal(_)
+        ));
+        assert!(matches!(
+            decode_business_error(&repo_to_db(RepoError::RowVanished("row".to_owned()))),
+            DomainError::Internal(_)
+        ));
+    }
 
     /// The emitter MUST take its severity from the normative §4.7 catalog. An
     /// idempotency-key collision is Critical per AC #19 — the regression guard
@@ -1188,3 +1106,15 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "service_decimal_tests.rs"]
+pub(crate) mod decimal_tests;
+
+#[cfg(test)]
+#[path = "service_reversal_tests.rs"]
+mod reversal_tests;
+
+#[cfg(test)]
+#[path = "service_scale_cache_tests.rs"]
+mod scale_cache_tests;

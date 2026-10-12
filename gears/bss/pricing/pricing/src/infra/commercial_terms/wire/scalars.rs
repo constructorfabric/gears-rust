@@ -38,21 +38,8 @@ pub(super) mod instant {
         Ok(v)
     }
 }
-pub(super) mod decimal {
-    use rust_decimal::Decimal;
-    use serde::{Deserialize, Deserializer, Serializer, de::Error as _};
-    pub fn serialize<S: Serializer>(v: &Decimal, s: S) -> Result<S::Ok, S::Error> {
-        s.serialize_str(&v.normalize().to_string())
-    }
-    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Decimal, D::Error> {
-        let s = String::deserialize(d)?;
-        let v = Decimal::from_str_exact(&s).map_err(D::Error::custom)?;
-        if v.normalize().to_string() != s {
-            return Err(D::Error::custom("noncanonical exact decimal"));
-        }
-        Ok(v)
-    }
-}
+pub(super) use bss_money::serde_text as decimal;
+pub(super) use bss_money::serde_text::option as decimal_option;
 pub(super) mod integer {
     use serde::{Deserialize, Deserializer, Serializer, de::Error as _};
     pub fn serialize<T: std::fmt::Display, S: Serializer>(v: &T, s: S) -> Result<S::Ok, S::Error> {
@@ -95,18 +82,6 @@ pub(super) mod date {
             return Err(D::Error::custom("noncanonical date"));
         }
         Ok(v)
-    }
-}
-pub(super) mod decimal_option {
-    use rust_decimal::Decimal;
-    use serde::{Deserialize, Deserializer, Serializer};
-    #[derive(serde::Serialize, serde::Deserialize)]
-    struct Exact(#[serde(with = "super::decimal")] Decimal);
-    pub fn serialize<S: Serializer>(v: &Option<Decimal>, s: S) -> Result<S::Ok, S::Error> {
-        serde::Serialize::serialize(&v.map(Exact), s)
-    }
-    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Decimal>, D::Error> {
-        Ok(Option::<Exact>::deserialize(d)?.map(|v| v.0))
     }
 }
 pub(super) mod date_option {

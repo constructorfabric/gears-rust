@@ -345,11 +345,17 @@ pub(crate) mod pep {
     /// through the PEP gate because they run under
     /// [`super::ConversionScope::system_sweep`].
     pub mod actions {
+        /// Action name for creating a conversion request.
         pub const REQUEST: &str = "request";
+        /// Action name for cancelling a conversion request.
         pub const CANCEL: &str = "cancel";
+        /// Action name for rejecting an inbound conversion request.
         pub const REJECT: &str = "reject";
+        /// Action name for approving an inbound conversion request.
         pub const APPROVE: &str = "approve";
+        /// Action name for listing conversion requests the caller initiated.
         pub const LIST_OWN: &str = "list_own";
+        /// Action name for listing conversion requests addressed to the caller.
         pub const LIST_INBOUND: &str = "list_inbound";
 
         /// Every action in this vocabulary — see the note on the user

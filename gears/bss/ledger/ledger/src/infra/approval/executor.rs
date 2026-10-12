@@ -33,10 +33,6 @@ use crate::infra::period_close::PeriodCloseService;
 use crate::infra::storage::repo::PayerStateRepo;
 use time::OffsetDateTime;
 
-/// Default advisory currency scale passed on replayed commands; the ledger
-/// resolves the authoritative per-line scale from the provisioned currency config.
-const ADVISORY_SCALE: u8 = 2;
-
 /// Dispatches an approved intent to the real mutation surface.
 pub struct LedgerApprovalExecutor {
     client: Arc<dyn LedgerClientV1>,
@@ -162,9 +158,7 @@ impl ApprovalExecutor for LedgerApprovalExecutor {
                     tenant_id: i.tenant_id,
                     payer_tenant_id: i.payer_tenant_id,
                     credit_application_id: i.credit_application_id.clone(),
-                    currency: i.currency.clone(),
-                    scale: ADVISORY_SCALE,
-                    amount_minor: i.amount_minor,
+                    money: i.amount.clone(),
                     credit_grant_event_type: event_type,
                 });
                 self.client
@@ -185,9 +179,7 @@ impl ApprovalExecutor for LedgerApprovalExecutor {
                     cycle: i.cycle,
                     phase: DisputePhase::Lost.as_str().to_owned(),
                     funds_at_open: i.funds_at_open.clone(),
-                    disputed_amount_minor: i.disputed_amount_minor,
-                    currency: i.currency.clone(),
-                    scale: ADVISORY_SCALE,
+                    disputed_amount: i.disputed_amount.clone(),
                     effective_at: None,
                 };
                 self.client
@@ -250,7 +242,7 @@ impl ApprovalExecutor for LedgerApprovalExecutor {
                         segs.iter()
                             .map(|s| ChangeSegment {
                                 period_id: s.period_id.clone(),
-                                amount_minor: s.amount_minor,
+                                money: s.amount.clone(),
                             })
                             .collect()
                     }),
@@ -349,3 +341,7 @@ impl ApprovalExecutor for LedgerApprovalExecutor {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "executor_replay_tests.rs"]
+mod replay_tests;

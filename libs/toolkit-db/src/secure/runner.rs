@@ -22,7 +22,9 @@ mod sealed {
 /// Downstream crates must never see or name `ConnectionTrait`, `DatabaseConnection`, or
 /// `DatabaseTransaction`. This bridge is crate-only.
 pub enum SeaOrmRunner<'a> {
+    /// Executor backed by a database connection.
     Conn(&'a sea_orm::DatabaseConnection),
+    /// Executor backed by an open transaction.
     Tx(&'a sea_orm::DatabaseTransaction),
 }
 
@@ -58,6 +60,7 @@ impl<'a> SeaOrmRunner<'a> {
 
 /// Internal-only bridge to `SeaORM`'s executor types.
 pub trait DBRunnerInternal: sealed::Sealed + Send + Sync {
+    /// Returns the underlying `SeaORM` executor for this runner.
     fn as_seaorm(&self) -> SeaOrmRunner<'_>;
 }
 

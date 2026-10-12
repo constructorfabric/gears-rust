@@ -21,12 +21,17 @@ pub mod v1;
 
 pub type ConcreteService = Service;
 
+/// `OpenAPI` tag shared by all mirror operations.
 pub(crate) const API_TAG: &str = "GitHub Mirror";
+/// Query-parameter description for `page`.
 pub(crate) const PAGE_DOC: &str = "Page number of the results to fetch (GitHub-style)";
+/// Query-parameter description for `per_page`.
 pub(crate) const PER_PAGE_DOC: &str = "The number of results per page (max 100)";
+/// Query-parameter description for the `state` filter.
 pub(crate) const STATE_DOC: &str =
     "Filter by state: `open` (GitHub's default when omitted), `closed`, or `all`";
 
+/// License-feature marker applied to every mirror route (maps to the global base license feature).
 pub(crate) struct License;
 
 impl AsRef<str> for License {

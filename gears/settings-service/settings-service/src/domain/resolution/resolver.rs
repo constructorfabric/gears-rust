@@ -3,6 +3,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use toolkit_macros::domain_model;
 
 use serde_json::Value;
 use settings_service_sdk::{EffectiveSource, SettingKey};
@@ -26,6 +27,7 @@ use crate::domain::value::{StoredValue, ValueRepository};
 ///
 /// The chain is fetched at most once and only when a cascading declaration
 /// needs it: a `global` or `local` setting never asks the tenant resolver.
+#[domain_model]
 pub struct Ancestry {
     root: Uuid,
     tenant: Uuid,
@@ -86,6 +88,7 @@ struct Walk {
 }
 
 /// One descendant's value, as a walk over a subtree resolved it.
+#[domain_model]
 #[derive(Debug, Clone, PartialEq)]
 pub struct SubtreeValue {
     /// The descendant.
@@ -106,6 +109,7 @@ pub struct SubtreeValue {
 // @cpt-dod:cpt-cf-settings-service-dod-value-resolution-defaults:p1
 // @cpt-dod:cpt-cf-settings-service-dod-value-resolution-fallthrough:p1
 // @cpt-dod:cpt-cf-settings-service-dod-value-resolution-outcomes:p1
+#[domain_model]
 pub struct ValueResolver<D, V, A> {
     declarations: D,
     values: V,

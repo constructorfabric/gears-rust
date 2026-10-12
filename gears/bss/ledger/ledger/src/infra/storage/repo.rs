@@ -24,7 +24,7 @@ pub use approval_repo::{ApprovalRepo, NewPendingApproval, NewPolicyVersion};
 pub use chain_state_repo::{ChainStateRepo, TipRow};
 pub use dispute_repo::DisputeRepo;
 pub use exception_queue_repo::ExceptionQueueRepo;
-pub use fx_repo::{FxRepo, NewFxRate, NewRateSnapshot};
+pub use fx_repo::{FxRateRow, FxRepo, NewFxRate, NewRateSnapshot, RateSnapshotRow};
 pub use fx_revaluation_mode_repo::FxRevaluationModeRepo;
 pub use fx_revaluation_run_repo::FxRevaluationRunRepo;
 pub use journal_repo::JournalRepo;

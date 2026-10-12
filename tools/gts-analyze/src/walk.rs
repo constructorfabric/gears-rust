@@ -56,6 +56,7 @@ pub struct Walker {
 }
 
 impl Walker {
+    /// Creates a walker over `root` with the given test and docs filters.
     pub fn new(root: PathBuf, include_tests: bool, skip_docs: bool) -> Self {
         Self {
             root,
@@ -64,6 +65,7 @@ impl Walker {
         }
     }
 
+    /// Yields `(absolute, root-relative)` paths of every scannable file that passes the skip rules.
     pub fn iter(&self) -> impl Iterator<Item = (PathBuf, PathBuf)> {
         let root = self.root.clone();
         let include_tests = self.include_tests;

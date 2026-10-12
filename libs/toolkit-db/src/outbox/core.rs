@@ -84,6 +84,7 @@ impl Outbox {
         Self::new_with_backend(config, DbBackend::Sqlite)
     }
 
+    /// Creates an outbox core for the given config and database backend, precomputing its SQL statements.
     #[must_use]
     pub(crate) fn new_with_backend(config: OutboxConfig, backend: DbBackend) -> Self {
         let statements = Arc::new(OutboxStatements::new(backend, &config.tables));

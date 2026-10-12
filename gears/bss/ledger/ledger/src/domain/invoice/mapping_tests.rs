@@ -6,9 +6,8 @@ use crate::domain::invoice::builder::InvoiceItem;
 /// An item with the two mapping inputs set; everything else fixed.
 fn item(catalog: Option<AccountClass>, contract: Option<AccountClass>) -> InvoiceItem {
     InvoiceItem {
-        amount_minor_ex_tax: 1000,
-        deferred_minor: 0,
-        currency: "USD".to_owned(),
+        amount_ex_tax: money(1000),
+        deferred: money(0),
         revenue_stream: "subscription".to_owned(),
         catalog_class: catalog,
         contract_class: contract,
@@ -60,4 +59,16 @@ fn miss_routes_to_suspense_pending() {
     assert_eq!(m.mapping_status, MappingStatus::Pending);
     // The Catalog gl_code is still carried through for the operator's context.
     assert_eq!(m.gl_code.as_deref(), Some("4000"));
+}
+
+use bss_ledger_sdk::money::{CurrencySpec, PostedMoney};
+use rust_decimal::Decimal;
+
+/// Preserve these legacy scale-2 fixture economics as explicit major-unit money.
+fn money(cents: i64) -> PostedMoney {
+    PostedMoney::try_new(
+        Decimal::new(cents, 2),
+        CurrencySpec::try_new("USD".to_owned(), 2).unwrap(),
+    )
+    .unwrap()
 }

@@ -1,25 +1,54 @@
-//! `ReconciliationRunRepo` — the reconciliation-run table
-//! (`bss.ledger_reconciliation_run`), keyed by `(tenant_id, run_id)`. The
-//! framework `start`s a RUNNING row then `finalize`s it with the variance;
-//! an out-of-tolerance run feeds an `exception_queue` row + the close gate
-//! (Slice 7, design §4.3).
-
-use sea_orm::sea_query::Expr;
-use sea_orm::{ActiveValue::Set, ColumnTrait, Condition, EntityTrait, QuerySelect};
+//! Scoped typed reconciliation diagnostics and conservative bounded deletion.
+use crate::domain::model::RepoError;
+use crate::domain::reconciliation::ReconciliationVariance;
+use crate::domain::status::{RECON_RUN_STATUS_DONE, RECON_RUN_STATUS_RUNNING};
+use crate::infra::posting::retry::{db_to_repo, scope_to_repo};
+use crate::infra::storage::entity::reconciliation_run::{self, Column as C};
+use sea_orm::sea_query::{Alias, Expr};
+use sea_orm::{
+    ActiveValue::Set, ColumnTrait, Condition, EntityTrait, ExprTrait, QueryOrder, QuerySelect,
+};
 use serde_json::Value as JsonValue;
+use time::OffsetDateTime;
 use toolkit_db::secure::{
-    AccessScope, DbTx, SecureDeleteExt, SecureEntityExt, SecureInsertExt, SecureUpdateExt,
+    AccessScope, DBRunner, DbTx, SecureDeleteExt, SecureEntityExt, SecureInsertExt, SecureUpdateExt,
 };
 use toolkit_db::{DBProvider, DbError};
 use uuid::Uuid;
+#[path = "reconciliation_variance.rs"]
+mod variance;
 
-use crate::domain::error::DomainError;
-use crate::domain::model::RepoError;
-use crate::domain::status::{RECON_RUN_STATUS_DONE, RECON_RUN_STATUS_RUNNING};
-use crate::infra::storage::entity::reconciliation_run;
-use time::OffsetDateTime;
+/// A complete validated diagnostic record.
+#[derive(Clone, Debug)]
+pub struct ReconciliationRunView {
+    pub tenant_id: Uuid,
+    pub run_id: Uuid,
+    pub period_id: String,
+    pub check_type: String,
+    pub variance: ReconciliationVariance,
+    pub within_tolerance: bool,
+    pub status: String,
+    pub watermark: Option<i64>,
+    pub detail: Option<JsonValue>,
+    pub at_utc: OffsetDateTime,
+}
 
-/// SeaORM-backed reconciliation-run repository.
+/// Raw JSON text prevents malformed SQLite JSON from aborting a purge scan.
+#[derive(Debug, sea_orm::FromQueryResult)]
+struct StoredRun {
+    tenant_id: Uuid,
+    run_id: Uuid,
+    period_id: String,
+    check_type: String,
+    variance: String,
+    within_tolerance: bool,
+    status: String,
+    watermark: Option<i64>,
+    detail: Option<String>,
+    at_utc: OffsetDateTime,
+}
+
+/// The caller owns transaction retries; no diagnostic version schema is needed.
 #[derive(Clone)]
 pub struct ReconciliationRunRepo {
     db: DBProvider<DbError>,
@@ -32,11 +61,14 @@ impl ReconciliationRunRepo {
         Self { db }
     }
 
-    /// Create a RUNNING reconciliation-run row.
+    /// Insert RUNNING with the check's typed zero. Duplicate run identity is an error.
     ///
     /// # Errors
-    /// Returns [`RepoError::Db`] if scope validation or insertion fails.
+    /// The variance codec's [`RepoError`] when `check_type` is unknown or its typed zero cannot
+    /// be encoded; [`RepoError::Db`] on a scope or storage failure (a duplicate run identity
+    /// included); [`RepoError::Conflict`] on classified database contention.
     pub async fn start(
+        &self,
         txn: &DbTx<'_>,
         scope: &AccessScope,
         tenant: Uuid,
@@ -44,12 +76,13 @@ impl ReconciliationRunRepo {
         period_id: &str,
         check_type: &str,
     ) -> Result<(), RepoError> {
+        let zero = variance::zero(check_type)?;
         let am = reconciliation_run::ActiveModel {
             tenant_id: Set(tenant),
             run_id: Set(run_id),
             period_id: Set(period_id.to_owned()),
             check_type: Set(check_type.to_owned()),
-            variance_minor: Set(0),
+            variance: Set(variance::encode(check_type, &zero)?),
             within_tolerance: Set(true),
             status: Set(RECON_RUN_STATUS_RUNNING.to_owned()),
             watermark: Set(None),
@@ -59,118 +92,116 @@ impl ReconciliationRunRepo {
         reconciliation_run::Entity::insert(am.clone())
             .secure()
             .scope_with_model(scope, &am)
-            .map_err(|e| RepoError::Db(format!("ledger_reconciliation_run scope: {e}")))?
-            .exec_with_returning(txn)
+            .map_err(|e| scope_to_repo(e, self.db.db().backend()))?
+            .exec(txn)
             .await
-            .map_err(|e| RepoError::Db(format!("insert ledger_reconciliation_run: {e}")))?;
+            .map_err(|e| scope_to_repo(e, self.db.db().backend()))?;
         Ok(())
     }
 
-    /// Finalize a run with its variance result.
+    /// Replace diagnostics after validating both existing and new evidence.
+    /// A stale observation conflicts and must abort the caller's whole attempt.
     ///
     /// # Errors
-    /// Returns [`RepoError::Db`] if the scoped update fails.
+    /// [`RepoError::InvalidRequest`] when `status` is not a valid run status or the run does
+    /// not exist; the variance codec's [`RepoError`] when the stored or new variance is
+    /// malformed; [`RepoError::InvalidStoredMoney`] when the stored run fails validation;
+    /// [`RepoError::Conflict`] when the observed row changed underneath, or on classified
+    /// database contention; [`RepoError::Db`] on a scope or storage failure.
     #[allow(
         clippy::too_many_arguments,
-        reason = "a finalized run records its full variance result in one write"
+        reason = "one atomic diagnostic replacement"
     )]
     pub async fn finalize(
+        &self,
         txn: &DbTx<'_>,
         scope: &AccessScope,
         tenant: Uuid,
         run_id: Uuid,
         status: &str,
-        variance_minor: i64,
+        result: &ReconciliationVariance,
         within_tolerance: bool,
         watermark: Option<i64>,
         detail: Option<JsonValue>,
     ) -> Result<(), RepoError> {
-        reconciliation_run::Entity::update_many()
+        validate_status(status).map_err(RepoError::InvalidRequest)?;
+        let old = self
+            .stored(txn, scope, key(tenant, run_id), 1)
+            .await?
+            .pop()
+            .ok_or_else(|| RepoError::InvalidRequest("reconciliation run not found".into()))?;
+        decode(&old)?;
+        let encoded = variance::encode(&old.check_type, result)?;
+        let changed = reconciliation_run::Entity::update_many()
             .secure()
             .scope_with(scope)
-            .col_expr(reconciliation_run::Column::Status, Expr::value(status))
-            .col_expr(
-                reconciliation_run::Column::VarianceMinor,
-                Expr::value(variance_minor),
-            )
-            .col_expr(
-                reconciliation_run::Column::WithinTolerance,
-                Expr::value(within_tolerance),
-            )
-            .col_expr(
-                reconciliation_run::Column::Watermark,
-                Expr::value(watermark),
-            )
-            .col_expr(reconciliation_run::Column::Detail, Expr::value(detail))
-            .filter(
-                Condition::all()
-                    .add(reconciliation_run::Column::TenantId.eq(tenant))
-                    .add(reconciliation_run::Column::RunId.eq(run_id)),
-            )
+            .col_expr(C::Status, Expr::value(status))
+            .col_expr(C::Variance, Expr::value(encoded))
+            .col_expr(C::WithinTolerance, Expr::value(within_tolerance))
+            .col_expr(C::Watermark, Expr::value(watermark))
+            .col_expr(C::Detail, Expr::value(detail))
+            .filter(observed(&old))
             .exec(txn)
             .await
-            .map_err(|e| RepoError::Db(format!("finalize ledger_reconciliation_run: {e}")))?;
+            .map_err(|e| scope_to_repo(e, self.db.db().backend()))?;
+        if changed.rows_affected != 1 {
+            return Err(RepoError::Conflict("reconciliation run changed".into()));
+        }
         Ok(())
     }
 
-    /// Read a run (out-of-txn). SQL-level BOLA: a foreign tenant yields no row.
+    /// Standalone typed read, sharing the strict caller-runner decoder.
     ///
     /// # Errors
-    /// Returns [`DomainError::Internal`] if acquiring a connection or reading
-    /// the run fails.
+    /// [`RepoError::Db`] when no connection can be acquired or on a scope / storage failure;
+    /// [`RepoError::Conflict`] on classified database contention;
+    /// [`RepoError::InvalidStoredMoney`] (or the variance codec's [`RepoError`]) when the
+    /// stored run is malformed.
     pub async fn read(
         &self,
         scope: &AccessScope,
         tenant: Uuid,
         run_id: Uuid,
-    ) -> Result<Option<reconciliation_run::Model>, DomainError> {
+    ) -> Result<Option<ReconciliationRunView>, RepoError> {
         let conn = self
             .db
             .conn()
-            .map_err(|e| DomainError::Internal(format!("conn: {e}")))?;
-        let row = reconciliation_run::Entity::find()
-            .secure()
-            .scope_with(scope)
-            .filter(
-                Condition::all()
-                    .add(reconciliation_run::Column::TenantId.eq(tenant))
-                    .add(reconciliation_run::Column::RunId.eq(run_id)),
-            )
-            .one(&conn)
-            .await
-            .map_err(|e| DomainError::Internal(format!("read ledger_reconciliation_run: {e}")))?;
-        Ok(row)
+            .map_err(|e| db_to_repo(e, self.db.db().backend()))?;
+        self.read_in(&conn, scope, tenant, run_id).await
     }
 
-    /// Delete up to `limit` **uneventful** runs of ONE tenant — finalized
-    /// (`DONE`) runs that came back within tolerance AND recorded a zero
-    /// variance. Returns the number of rows actually deleted, so the caller
-    /// can tell a drained tenant (`< limit`) from one with more to give.
-    ///
-    /// Used by the reconciliation tick to reclaim the runs it accumulated for
-    /// tenants the platform registry reports as soft-deleted. Two properties
-    /// make this safe to run on a multi-GB table:
-    ///
-    /// * **Evidence is never deleted.** A run that recorded any variance (even
-    ///   one inside the rounding budget), breached tolerance, or never
-    ///   finalized (`RUNNING` / `FAILED`) is kept whatever the tenant's
-    ///   lifecycle. The predicate is applied to the batch selection AND again
-    ///   to the delete itself, so a row that stopped qualifying in between is
-    ///   not taken.
-    /// * **No sequential scan.** The delete is scoped to a single tenant, so it
-    ///   rides the `(tenant_id, run_id)` primary key. (The table has no index
-    ///   on `at_utc`, which is exactly why an age-based purge would have to
-    ///   scan the whole heap instead.)
+    /// Read inside a caller's transaction without a registry or implicit repair.
     ///
     /// # Errors
-    /// Returns [`RepoError::Db`] if acquiring a connection, selecting the batch,
-    /// or the scoped delete fails.
-    pub async fn purge_uneventful_runs(&self, tenant: Uuid, limit: u64) -> Result<u64, RepoError> {
-        #[derive(Debug, sea_orm::FromQueryResult)]
-        struct RunIdRow {
-            run_id: Uuid,
-        }
+    /// [`RepoError::Db`] on a scope or storage failure; [`RepoError::Conflict`] on classified
+    /// database contention; [`RepoError::InvalidStoredMoney`] (or the variance codec's
+    /// [`RepoError`]) when the stored run is malformed.
+    pub async fn read_in<R: DBRunner>(
+        &self,
+        runner: &R,
+        scope: &AccessScope,
+        tenant: Uuid,
+        run_id: Uuid,
+    ) -> Result<Option<ReconciliationRunView>, RepoError> {
+        self.stored(runner, scope, key(tenant, run_id), 1)
+            .await?
+            .pop()
+            .as_ref()
+            .map(decode)
+            .transpose()
+    }
 
+    /// Delete at most `limit` validated zero DONE runs within tolerance.
+    /// Traverse stable scoped key batches past preserved evidence. Memory and deletion
+    /// are bounded; scanning work can cover the tenant's entire preserved history.
+    /// Structural failures are retained by their existing `within_tolerance=false` contract.
+    /// A stored run that does not decode is retained, skipped and logged at `warn`; it never
+    /// fails the purge.
+    ///
+    /// # Errors
+    /// [`RepoError::Db`] when no connection can be acquired, or when selecting a batch or the
+    /// scoped delete fails; [`RepoError::Conflict`] on classified database contention.
+    pub async fn purge_uneventful_runs(&self, tenant: Uuid, limit: u64) -> Result<u64, RepoError> {
         if limit == 0 {
             return Ok(0);
         }
@@ -178,44 +209,198 @@ impl ReconciliationRunRepo {
         let conn = self
             .db
             .conn()
-            .map_err(|e| RepoError::Db(format!("conn: {e}")))?;
+            .map_err(|e| db_to_repo(e, self.db.db().backend()))?;
+        let mut cursor = None;
+        let mut deleted = 0;
+        loop {
+            let mut condition = eligible().add(C::TenantId.eq(tenant));
+            if let Some(id) = cursor {
+                condition = condition.add(C::RunId.gt(id));
+            }
+            let batch = self.stored(&conn, &scope, condition, 128).await?;
+            let Some(last) = batch.last() else {
+                break;
+            };
+            cursor = Some(last.run_id);
+            let room = usize::try_from(limit - deleted).unwrap_or(usize::MAX);
+            let zero: Vec<&StoredRun> = batch
+                .iter()
+                .filter(|row| observed_zero(row))
+                .take(room)
+                .collect();
+            deleted += self.delete_observed(&conn, &scope, &zero).await?;
+            if deleted >= limit {
+                return Ok(deleted);
+            }
+        }
+        Ok(deleted)
+    }
 
-        // Pick the batch first, then delete it by key. Postgres has no
-        // `DELETE … LIMIT`, and an unbounded per-tenant delete would be
-        // unbounded WAL for a tenant that happens to hold millions of rows.
-        let batch = reconciliation_run::Entity::find()
-            .secure()
-            .scope_with(&scope)
-            .filter(uneventful())
-            .project_all(&conn, |q| {
-                q.select_only()
-                    .column(reconciliation_run::Column::RunId)
-                    .limit(limit)
-                    .into_model::<RunIdRow>()
-            })
-            .await
-            .map_err(|e| RepoError::Db(format!("select purgeable reconciliation runs: {e}")))?;
-        if batch.is_empty() {
+    /// Single-row form of the page delete: recheck the typed zero, then delete
+    /// under the row's observed evidence. The evidence-guard tests drive it.
+    #[cfg(test)]
+    async fn delete_observed_zero<R: DBRunner>(
+        &self,
+        runner: &R,
+        scope: &AccessScope,
+        row: &StoredRun,
+    ) -> Result<u64, RepoError> {
+        if !observed_zero(row) {
             return Ok(0);
         }
+        self.delete_observed(runner, scope, &[row]).await
+    }
 
-        let run_ids: Vec<Uuid> = batch.into_iter().map(|r| r.run_id).collect();
+    /// One delete for a page of validated zero runs, each guarded by all of its
+    /// observed evidence, so a run changed since the read is kept.
+    async fn delete_observed<R: DBRunner>(
+        &self,
+        runner: &R,
+        scope: &AccessScope,
+        rows: &[&StoredRun],
+    ) -> Result<u64, RepoError> {
+        if rows.is_empty() {
+            return Ok(0);
+        }
+        let any_observed = rows
+            .iter()
+            .fold(Condition::any(), |any, row| any.add(observed(row)));
         let deleted = reconciliation_run::Entity::delete_many()
             .secure()
-            .scope_with(&scope)
-            .filter(uneventful().add(reconciliation_run::Column::RunId.is_in(run_ids)))
-            .exec(&conn)
+            .scope_with(scope)
+            .filter(eligible().add(any_observed))
+            .exec(runner)
             .await
-            .map_err(|e| RepoError::Db(format!("purge ledger_reconciliation_run: {e}")))?;
+            .map_err(|e| scope_to_repo(e, self.db.db().backend()))?;
         Ok(deleted.rows_affected)
+    }
+
+    /// JSON-to-text is portable and only transports evidence; it performs no money arithmetic.
+    async fn stored<R: DBRunner>(
+        &self,
+        runner: &R,
+        scope: &AccessScope,
+        condition: Condition,
+        limit: u64,
+    ) -> Result<Vec<StoredRun>, RepoError> {
+        reconciliation_run::Entity::find()
+            .secure()
+            .scope_with(scope)
+            .filter(condition)
+            .project_all(runner, |q| {
+                q.select_only()
+                    .columns([
+                        C::TenantId,
+                        C::RunId,
+                        C::PeriodId,
+                        C::CheckType,
+                        C::WithinTolerance,
+                        C::Status,
+                        C::Watermark,
+                        C::AtUtc,
+                    ])
+                    .expr_as(
+                        Expr::col(C::Variance).cast_as(Alias::new("text")),
+                        "variance",
+                    )
+                    .expr_as(Expr::col(C::Detail).cast_as(Alias::new("text")), "detail")
+                    .order_by_asc(C::RunId)
+                    .limit(limit)
+                    .into_model::<StoredRun>()
+            })
+            .await
+            .map_err(|e| scope_to_repo(e, self.db.db().backend()))
     }
 }
 
-/// The purge eligibility predicate: a finalized run that found nothing — `DONE`,
-/// within tolerance, and a zero variance. Everything else is evidence.
-fn uneventful() -> Condition {
-    Condition::all()
-        .add(reconciliation_run::Column::Status.eq(RECON_RUN_STATUS_DONE))
-        .add(reconciliation_run::Column::WithinTolerance.eq(true))
-        .add(reconciliation_run::Column::VarianceMinor.eq(0))
+/// Recheck exact typed zero in Rust. A run that does not decode is evidence:
+/// it is kept and logged, never deleted and never a purge failure.
+fn observed_zero(row: &StoredRun) -> bool {
+    match decode(row) {
+        Ok(view) => {
+            view.status == RECON_RUN_STATUS_DONE && view.within_tolerance && view.variance.is_zero()
+        }
+        Err(error) => {
+            tracing::warn!(
+                tenant_id = %row.tenant_id,
+                run_id = %row.run_id,
+                check_type = %row.check_type,
+                error = %error,
+                "reconciliation purge: stored run does not decode; retained"
+            );
+            false
+        }
+    }
 }
+/// Only nonmoney selection predicates. Typed zero is checked in Rust.
+fn eligible() -> Condition {
+    Condition::all()
+        .add(C::Status.eq(RECON_RUN_STATUS_DONE))
+        .add(C::WithinTolerance.eq(true))
+}
+/// Tenant and diagnostic identity.
+fn key(tenant: Uuid, run_id: Uuid) -> Condition {
+    Condition::all()
+        .add(C::TenantId.eq(tenant))
+        .add(C::RunId.eq(run_id))
+}
+/// Guard even changed detail/metadata, with null-safe optional comparisons.
+fn observed(row: &StoredRun) -> Condition {
+    let condition = key(row.tenant_id, row.run_id)
+        .add(C::PeriodId.eq(&row.period_id))
+        .add(C::CheckType.eq(&row.check_type))
+        .add(C::Status.eq(&row.status))
+        .add(C::WithinTolerance.eq(row.within_tolerance))
+        .add(C::AtUtc.eq(row.at_utc))
+        .add(
+            Expr::col(C::Variance)
+                .cast_as(Alias::new("text"))
+                .eq(row.variance.clone()),
+        );
+    let condition = match row.watermark {
+        Some(v) => condition.add(C::Watermark.eq(v)),
+        None => condition.add(C::Watermark.is_null()),
+    };
+    match &row.detail {
+        Some(v) => condition.add(
+            Expr::col(C::Detail)
+                .cast_as(Alias::new("text"))
+                .eq(v.clone()),
+        ),
+        None => condition.add(C::Detail.is_null()),
+    }
+}
+/// Keep the existing diagnostic status set.
+fn validate_status(status: &str) -> Result<(), String> {
+    match status {
+        RECON_RUN_STATUS_RUNNING | RECON_RUN_STATUS_DONE | "FAILED" => Ok(()),
+        _ => Err("unknown reconciliation status".into()),
+    }
+}
+/// Read validation applies to the complete stored record before use or replacement.
+fn decode(row: &StoredRun) -> Result<ReconciliationRunView, RepoError> {
+    validate_status(&row.status).map_err(RepoError::InvalidStoredMoney)?;
+    let variance = variance::decode(&row.check_type, &row.variance)?;
+    let detail = row
+        .detail
+        .as_deref()
+        .map(serde_json::from_str)
+        .transpose()
+        .map_err(|e| RepoError::InvalidStoredMoney(format!("reconciliation detail: {e}")))?;
+    Ok(ReconciliationRunView {
+        tenant_id: row.tenant_id,
+        run_id: row.run_id,
+        period_id: row.period_id.clone(),
+        check_type: row.check_type.clone(),
+        variance,
+        within_tolerance: row.within_tolerance,
+        status: row.status.clone(),
+        watermark: row.watermark,
+        detail,
+        at_utc: row.at_utc,
+    })
+}
+
+#[cfg(test)]
+#[path = "reconciliation_run_repo_tests.rs"]
+mod tests;

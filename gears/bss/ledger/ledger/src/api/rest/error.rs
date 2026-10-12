@@ -237,9 +237,41 @@ pub(crate) fn reversal_error_to_canonical(
                 "CANNOT_REVERSE_CREDIT_GRANT",
             )
             .create(),
+        // A corrected line disagrees with the original's currency metadata:
+        // caller input, the same named money violation the wire parse would raise.
+        ReversalError::Money(e) => money_error_to_canonical(e),
     }
+}
+
+/// Map a [`ReversalError`] raised while copying a **stored** original
+/// (`build_reversal`). The two business refusals stay 400s, but a money
+/// disagreement there is stored history disagreeing with itself (header
+/// currency vs line scales), which the caller cannot fix: it is an invariant
+/// failure (500, diagnostic kept server-side), never a field violation.
+pub(crate) fn stored_reversal_error_to_canonical(
+    err: crate::domain::invoice::reversal::ReversalError,
+) -> CanonicalError {
+    use crate::domain::invoice::reversal::ReversalError;
+    match err {
+        ReversalError::Money(e) => {
+            CanonicalError::from(crate::domain::error::DomainError::Internal(format!(
+                "stored entry money metadata is inconsistent: {e}"
+            )))
+        }
+        other => reversal_error_to_canonical(other),
+    }
+}
+
+/// Map a money violation through the gear's one `MoneyError` table, so a
+/// reversal reports it with the same wire code as every other endpoint.
+pub(crate) fn money_error_to_canonical(err: bss_ledger_sdk::MoneyError) -> CanonicalError {
+    CanonicalError::from(crate::domain::exact_money::map_money_error(err))
 }
 
 #[cfg(test)]
 #[path = "error_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "error_money_tests.rs"]
+mod money_tests;

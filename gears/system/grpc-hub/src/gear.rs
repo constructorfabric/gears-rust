@@ -124,7 +124,9 @@ impl Default for GrpcHubConfig {
 /// Configuration for the listen address
 #[derive(Clone)]
 pub(crate) enum ListenConfig {
+    /// Listen on a TCP socket address.
     Tcp(SocketAddr),
+    /// Listen on a Unix domain socket at this path.
     #[cfg(unix)]
     Uds(PathBuf),
     #[cfg(windows)]
@@ -253,11 +255,17 @@ fn validate_exempt_method(entry: &str) -> anyhow::Result<()> {
     lifecycle(entry = "serve", await_ready)
 )]
 pub struct GrpcHub {
+    /// Address the gRPC server listens on; replaceable until the server starts.
     pub(crate) listen_cfg: RwLock<ListenConfig>,
+    /// Host and optional port advertised to peers, set once during init.
     pub(crate) advertise_addr: OnceLock<(String, Option<u16>)>,
+    /// Store of gRPC service installers collected from other gears, set once during init.
     pub(crate) installer_store: OnceLock<Arc<GrpcInstallerStore>>,
+    /// Client hub used to resolve dependencies, set once during init.
     pub(crate) client_hub: OnceLock<Arc<ClientHub>>,
+    /// Unique identifier of this hub instance, set once during init.
     pub(crate) instance_id: OnceLock<String>,
+    /// Endpoint the server actually bound to, published once `serve` is listening.
     pub(crate) bound_endpoint: RwLock<Option<String>>,
     /// Platform-plane middleware applied to every served gRPC RPC; a
     /// pass-through layer when `internal_auth` is unset.
@@ -727,6 +735,7 @@ impl GrpcHub {
         Ok(())
     }
 
+    /// Runs the gRPC server until `cancel` fires, signalling `ready` once the listener is bound.
     pub(crate) async fn serve(
         self: Arc<Self>,
         cancel: CancellationToken,
