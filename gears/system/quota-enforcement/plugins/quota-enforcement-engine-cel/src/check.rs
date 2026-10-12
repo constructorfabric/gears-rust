@@ -28,14 +28,19 @@ pub enum Kind {
     /// of a free-form object. The field is reachable so `has()` can see it,
     /// and every operation on it is refused at save time.
     Unknown,
+    /// JSON `null`.
     Null,
+    /// A boolean.
     Bool,
+    /// A 64-bit signed integer.
     Int,
     /// An integer or `null`: the shape of a Quota's `cap` and `remaining`, and
     /// of `type: ["integer", "null"]`. Integer operators accept it; evaluation
     /// refuses the `null`.
     OptionalInt,
+    /// A string.
     String,
+    /// A list whose items all have this shape.
     List(Box<Shape>),
     /// A record whose keys are all known statically.
     Object(BTreeMap<String, Shape>),
@@ -48,11 +53,14 @@ pub enum Kind {
 /// it can take.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Shape {
+    /// The static kind.
     pub kind: Kind,
+    /// The values it can take, when known; `None` means any value of the kind.
     pub domain: Option<Vec<Value>>,
 }
 
 impl Shape {
+    /// A shape of `kind` with no fixed domain.
     pub fn new(kind: Kind) -> Self {
         Self { kind, domain: None }
     }
@@ -65,6 +73,7 @@ impl Shape {
         }
     }
 
+    /// A list of `item`s.
     pub fn list(item: Self) -> Self {
         Self::new(Kind::List(Box::new(item)))
     }
@@ -81,10 +90,12 @@ pub fn at(source: &str, offset: usize, message: &str) -> EngineConfigError {
     }
 }
 
+/// A save-time error pinned to where `node` starts in `source`.
 pub fn diagnostic(source: &str, node: &SpannedExpr, message: &str) -> EngineConfigError {
     at(source, node.span.start, message)
 }
 
+/// A save-time error with no position in the source.
 pub fn config_error(message: &str) -> EngineConfigError {
     EngineConfigError {
         message: message.into(),
@@ -481,8 +492,11 @@ fn deny_record(source: &str, node: &SpannedExpr, deny: &Shape) -> Result<(), Eng
 
 /// One pass over an expression against one metric's environment.
 pub struct Checker<'a> {
+    /// The operator's expression source, for diagnostics.
     pub source: &'a str,
+    /// The shapes of the variables in scope.
     pub variables: BTreeMap<String, Shape>,
+    /// Nodes visited so far, against the size limit.
     pub nodes: usize,
     /// Which environment inputs the expression read.
     pub inputs: EnvironmentInputs,

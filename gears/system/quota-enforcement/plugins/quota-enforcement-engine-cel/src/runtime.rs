@@ -18,6 +18,7 @@ pub const MAX_ITEMS: usize = 1024;
 /// Deepest nesting one value may reach.
 pub const MAX_DEPTH: usize = 48;
 
+/// An evaluation-time type error.
 pub fn error(message: &str) -> EngineError {
     EngineError::TypeError(message.into())
 }
@@ -141,7 +142,9 @@ fn arithmetic(op: BinaryOp, left: &Value, right: &Value) -> Result<Value, Engine
 
 /// One evaluation: the meter it charges and the variables in scope.
 pub struct Runtime {
+    /// The cost meter this evaluation charges.
     pub meter: EvaluationMeter,
+    /// The variables in scope, by name.
     pub variables: BTreeMap<String, Value>,
 }
 

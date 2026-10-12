@@ -77,6 +77,7 @@ pub struct PolicyRuntimeLimits {
 }
 
 /// References shared by a policy operation; neither transport can bypass admission.
+#[domain_model]
 pub struct PolicyManagement<'a> {
     /// Operator admission boundary.
     pub admission: &'a Admission,

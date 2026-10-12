@@ -20,6 +20,7 @@ use crate::domain::error::DomainError;
 use crate::domain::tokens;
 
 /// Whether a request field was present, and with what.
+#[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Presence<T> {
     /// The key was not in the request.

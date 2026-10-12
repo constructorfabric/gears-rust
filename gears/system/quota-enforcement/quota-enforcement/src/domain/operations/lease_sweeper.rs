@@ -46,6 +46,7 @@ pub struct LeaseSweepReport {
 /// The leader-only lease reclamation task.
 // @cpt-algo:cpt-cf-quota-enforcement-algo-lease-sweep:p1
 // @cpt-dod:cpt-cf-quota-enforcement-dod-lease-sweeper:p1
+#[domain_model]
 pub struct LeaseSweeper {
     storage: Arc<dyn QuotaEnforcementStoragePluginV1>,
     classifications: Arc<MetricClassifications>,

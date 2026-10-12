@@ -22,6 +22,7 @@ use quota_enforcement_sdk::{
 use serde::Serialize;
 use serde_json::Value;
 use time::OffsetDateTime;
+use toolkit_macros::domain_model;
 
 use super::idempotency::{IdempotencyCache, ReplayRecord};
 use crate::domain::admission::{Admission, AdmissionTarget};
@@ -38,6 +39,7 @@ use crate::domain::tokens;
 /// A bundle of borrows rather than a constructor: the field list is the
 /// dependency list, and it stays under the argument limit that a `new` would
 /// breach.
+#[domain_model]
 pub struct Operations<'a> {
     /// The PEP boundary, for the operations that name a Quota rather than an
     /// attribution.

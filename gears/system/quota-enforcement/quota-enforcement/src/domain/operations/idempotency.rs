@@ -55,6 +55,7 @@ struct Cache {
 }
 
 /// Bounded, least-recently-used cache of recent replay records.
+#[domain_model]
 pub struct IdempotencyCache {
     cache: Mutex<Cache>,
     ttl: time::Duration,

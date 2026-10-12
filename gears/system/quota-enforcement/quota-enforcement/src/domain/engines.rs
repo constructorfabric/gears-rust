@@ -299,6 +299,7 @@ pub fn evaluate_prepared(
 /// that version outside any transaction, publishes it, and calls again. The
 /// number of preparations one operation may trigger is bounded by
 /// configuration, so a version that cannot be compiled cannot spin.
+#[domain_model]
 pub struct PreparedEvaluation<'a> {
     engines: Arc<EngineRegistry>,
     artifacts: Arc<PolicyArtifactCache>,

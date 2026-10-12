@@ -48,6 +48,7 @@ pub struct RetentionTiming {
 // @cpt-algo:cpt-cf-quota-enforcement-algo-retention-sweep:p1
 // @cpt-state:cpt-cf-quota-enforcement-state-idempotency-record:p1
 // @cpt-dod:cpt-cf-quota-enforcement-dod-retention-sweeper:p1
+#[domain_model]
 pub struct RetentionSweeper {
     storage: Arc<dyn QuotaEnforcementStoragePluginV1>,
     metrics: Arc<dyn QeMetrics>,
