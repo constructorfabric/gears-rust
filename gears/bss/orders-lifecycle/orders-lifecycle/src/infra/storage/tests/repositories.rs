@@ -132,6 +132,15 @@ async fn complete_proposed_insert_validates_all_axes_and_or_paths() -> anyhow::R
     ]);
     assert!(repo::validate_order(&order(1), &branches).is_err());
     assert!(repo::validate_order(&order(1), &AccessScope::deny_all()).is_err());
+    // A path naming another order refuses a model whose three axes all match.
+    let other_order = scoped(vec![
+        ScopeFilter::eq("id", u(1)),
+        ScopeFilter::eq("resource_tenant_id", u(10)),
+        ScopeFilter::eq("seller_tenant_id", u(20)),
+        ScopeFilter::eq("payer_tenant_id", u(30)),
+    ]);
+    assert!(repo::validate_order(&order(1), &other_order).is_ok());
+    assert!(repo::validate_order(&order(2), &other_order).is_err());
     create(&db, 1).await?;
     let failed: anyhow::Result<()> = db
         .transaction_ref_mapped(|tx| {

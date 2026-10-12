@@ -8,8 +8,6 @@ const NEEDLE: &str = concat!("allow", "_all(");
 const PERMITTED: &[&str] = &[
     // The runtime read-only DiscoveryScope constructor.
     "orders-lifecycle/src/infra/maintenance/scope.rs",
-    // The S1-03 capability prototype's identical constructor (test-only).
-    "orders-lifecycle/tests/capability_support/capabilities.rs",
 ];
 
 fn root() -> PathBuf {

@@ -65,6 +65,25 @@ async fn every_table_has_expected_role_isolation_and_append_only_defenses() -> a
                     .is_err()
             );
         }
+        // Private evidence is unreadable outside its roles: business sees none of it, and the
+        // verifier reads only the audit trail.
+        let private: &[&str] = match role {
+            "business" => &[
+                "bss_orders__transition_audit",
+                "bss_orders__idempotency",
+                "bss_orders__read_access_log",
+            ],
+            "verifier" => &["bss_orders__idempotency", "bss_orders__read_access_log"],
+            _ => &[],
+        };
+        for table in private {
+            assert!(
+                raw.execute_unprepared(&format!("SELECT * FROM {table}"))
+                    .await
+                    .is_err(),
+                "{role} SELECT {table}"
+            );
+        }
         if [
             "business",
             "discovery",

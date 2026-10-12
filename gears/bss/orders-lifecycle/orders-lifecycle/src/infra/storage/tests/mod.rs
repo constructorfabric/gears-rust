@@ -7,7 +7,6 @@ use toolkit_db::{ConnectOpts, Db, connect_db};
 use uuid::Uuid;
 
 /// The shared Orders container start (bounded port-publication retry and TCP readiness).
-#[path = "../../../../tests/capability_support/pg_container.rs"]
 #[allow(
     clippy::duplicate_mod,
     reason = "test-only harness file shared by private test modules that cannot reach each other"

@@ -478,6 +478,8 @@ async fn service_and_workflow_decisions_require_finite_ids_in_every_path() {
             ok
         );
     }
+    // A deny-all scope names no order IDs, so it is never a finite set.
+    assert!(!super::finite_order_ids(&AccessScope::deny_all()));
     // A human tenant-scoped read path is valid without an ID restriction.
     let pdp = ScriptedPdp::new(move |_| Some(allow(vec![path(vec![eq(ST, u(20))])])));
     assert!(

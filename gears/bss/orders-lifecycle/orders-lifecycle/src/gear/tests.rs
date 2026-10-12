@@ -10,7 +10,7 @@ use toolkit::contracts::{DatabaseCapability, RestApiCapability};
 use toolkit_security::{PlatformSecurityContext, SecurityContext};
 use uuid::Uuid;
 /// The shared Orders container start (bounded port-publication retry and TCP readiness).
-#[path = "../../tests/capability_support/pg_container.rs"]
+#[path = "../infra/storage/tests/pg_container.rs"]
 #[allow(
     clippy::duplicate_mod,
     reason = "test-only harness file shared by private test modules that cannot reach each other"

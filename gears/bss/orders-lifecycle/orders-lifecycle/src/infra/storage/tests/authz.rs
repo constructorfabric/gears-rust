@@ -33,7 +33,8 @@ fn with(mut rule: serde_json::Value, key: &str, value: serde_json::Value) -> ser
 
 // Subjects (tenant in parentheses): customer C 102 (10), same-tenant C2 103 (10), partner P
 // 101 (10), delegated-only partner D 109 (60), seller S 104 (20), payer reader R 105 (30),
-// Workflow W 106 (99, service), misconfigured service M 107 (99), member-only U 108 (10).
+// Workflow W 106 (99, service), misconfigured service M 107 (99), member-only U 108 (10),
+// two-path reader T 110 (10).
 fn policy(accepted_proofs: &[&str]) -> serde_json::Value {
     let delegation = json!({"proof_property": "delegation_proof_ref", "accepted": accepted_proofs});
     let mut rules = vec![
@@ -86,6 +87,15 @@ fn policy(accepted_proofs: &[&str]) -> serde_json::Value {
             107,
             &["read"],
             &[&[("seller_tenant_id", &[20])]],
+        ),
+        rule(
+            "two-complete-paths",
+            110,
+            &["read"],
+            &[
+                &[("resource_tenant_id", &[10]), ("seller_tenant_id", &[20])],
+                &[("resource_tenant_id", &[11]), ("seller_tenant_id", &[21])],
+            ],
         ),
     ];
     if !accepted_proofs.is_empty() {
@@ -226,6 +236,9 @@ async fn actor_axis_matrix_on_real_provider_and_postgres() -> anyhow::Result<()>
         visible(&runtime, &pep, &service(106, 99)).await,
         Ok(vec![1])
     );
+    // Each OR path applies whole in SQL: O2 (11,20) takes its resource from the second path and
+    // its seller from the first, and is not visible.
+    assert_eq!(visible(&runtime, &pep, &user(110, 10)).await, Ok(vec![1]));
     // A tenant-only service grant is insufficient: integration failure, never a broad read.
     assert_eq!(
         visible(&runtime, &pep, &service(107, 99)).await,

@@ -1,5 +1,5 @@
-//! The one Orders PostgreSQL test-container start, shared by every Orders harness (integration
-//! tests via `capability_support`, crate tests via `#[path]`).
+//! The one Orders PostgreSQL test-container start, shared by the storage and gear crate tests
+//! (the gear tests include it via `#[path]`).
 //!
 //! Docker Desktop under parallel load shows three start-up faults, all observed in this suite:
 //! `start()` returns before 5432/tcp is published (transient), a running container never gets its
