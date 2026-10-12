@@ -28,10 +28,39 @@ use crate::domain::capture::{self, DraftGuardFacts, WorkingMember};
 use crate::domain::contributions::{AggregateContribution, DraftHeaderEdit};
 use crate::domain::idempotency::StoredResponse;
 use crate::infra::engine::{
-    ChildDocuments, CreateRequest, DocumentWriter, Engine, Preparation, PreparationView,
-    PrepareError, Prepared, TransitionRequest,
+    ChildDocuments, CreateRequest, DocumentWriter, Engine, EngineOutcome, OutcomeKind, Preparation,
+    PreparationView, PrepareError, Prepared, TransitionRequest,
 };
 use crate::infra::storage::entity::draft_content;
+
+/// A settled write as the caller sees it: the stored response, exactly as stored, and whether
+/// this call replayed it. The flag is never stored; the REST adapter renders it as
+/// `Idempotency-Replayed: true`.
+#[derive(Debug, Clone)]
+pub struct Settled {
+    pub response: StoredResponse,
+    pub replayed: bool,
+}
+impl Settled {
+    fn from_outcome(outcome: EngineOutcome) -> Self {
+        let replayed = matches!(outcome.kind, OutcomeKind::Replayed { .. });
+        Self {
+            response: outcome.response,
+            replayed,
+        }
+    }
+}
+impl std::ops::Deref for Settled {
+    type Target = StoredResponse;
+    fn deref(&self) -> &StoredResponse {
+        &self.response
+    }
+}
+impl From<Settled> for StoredResponse {
+    fn from(settled: Settled) -> Self {
+        settled.response
+    }
+}
 
 /// The configured capture bounds (DESIGN 02 §3.7: static per-gear configuration).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,7 +115,7 @@ impl CaptureService {
         caller: &Caller,
         request: CreateOrder,
         meta: &CreateMeta,
-    ) -> Result<StoredResponse, OrdersError> {
+    ) -> Result<Settled, OrdersError> {
         let engine = self.engine()?;
         let document = fingerprint_document(&request)?;
         let create = CreateRequest {
@@ -103,7 +132,7 @@ impl CaptureService {
             correlation_id: meta.correlation_id,
         };
         let outcome = engine.create(caller, create, &CreatePreparation).await?;
-        Ok(outcome.response)
+        Ok(Settled::from_outcome(outcome))
     }
 
     /// Edit the header. Fields alone select the trigger; no state is read to choose it.
@@ -117,7 +146,7 @@ impl CaptureService {
         order_id: Uuid,
         patch: HeaderPatch,
         meta: &WriteMeta,
-    ) -> Result<StoredResponse, OrdersError> {
+    ) -> Result<Settled, OrdersError> {
         patch.validate().map_err(|_| invalid())?;
         let engine = self.engine()?;
         let selection =
@@ -166,7 +195,7 @@ impl CaptureService {
         order_id: Uuid,
         line: AddLine,
         meta: &WriteMeta,
-    ) -> Result<StoredResponse, OrdersError> {
+    ) -> Result<Settled, OrdersError> {
         line.validate().map_err(|_| invalid())?;
         let engine = self.engine()?;
         let document = fingerprint_document(&json!({"line": line}))?;
@@ -199,7 +228,7 @@ impl CaptureService {
         line_id: Uuid,
         patch: LinePatch,
         meta: &WriteMeta,
-    ) -> Result<StoredResponse, OrdersError> {
+    ) -> Result<Settled, OrdersError> {
         patch.validate().map_err(|_| invalid())?;
         let engine = self.engine()?;
         let selection =
@@ -239,7 +268,7 @@ impl CaptureService {
         order_id: Uuid,
         line_id: Uuid,
         meta: &WriteMeta,
-    ) -> Result<StoredResponse, OrdersError> {
+    ) -> Result<Settled, OrdersError> {
         let engine = self.engine()?;
         let document = json!({"line_id": line_id});
         let preparation = DraftPreparation {
@@ -270,7 +299,7 @@ impl CaptureService {
         proposed: Option<ArrangementDelta>,
         meta: &WriteMeta,
         preparation: &DraftPreparation,
-    ) -> Result<StoredResponse, OrdersError> {
+    ) -> Result<Settled, OrdersError> {
         let request = TransitionRequest {
             order_id,
             trigger: Trigger::DraftMutate,
@@ -286,7 +315,7 @@ impl CaptureService {
             execution: None,
         };
         let outcome = engine.transition(caller, request, preparation).await?;
-        Ok(outcome.response)
+        Ok(Settled::from_outcome(outcome))
     }
 }
 
@@ -579,8 +608,9 @@ impl LocalOrdersClient {
 /// # Errors
 /// The settled refusal, or an integration failure for an undecodable stored body.
 pub fn sdk_result<T: serde::de::DeserializeOwned>(
-    response: StoredResponse,
+    response: impl Into<StoredResponse>,
 ) -> Result<T, OrdersError> {
+    let response = response.into();
     if (200..300).contains(&response.status) {
         return serde_json::from_value(response.body).map_err(|_| OrdersError::Integration);
     }

@@ -1602,6 +1602,16 @@
       "title": "Aborted"
     },
     {
+      "reason": "precondition-failed",
+      "error_domain": "orders-lifecycle.v1",
+      "error_code": "PRECONDITION_FAILED",
+      "canonical_category": "FailedPrecondition",
+      "http_status": 412,
+      "gts_registry_key": "gts.cf.bss.orders.err.v1~cf.bss.orders.precondition_failed.v1~",
+      "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~",
+      "title": "Failed precondition"
+    },
+    {
       "reason": "idempotency-mismatch",
       "error_domain": "orders-lifecycle.v1",
       "error_code": "IDEMPOTENCY_MISMATCH",

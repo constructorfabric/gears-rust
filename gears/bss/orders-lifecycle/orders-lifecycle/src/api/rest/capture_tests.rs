@@ -1,6 +1,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 use super::*;
 use crate::api::rest::dto;
+use crate::domain::idempotency::StoredResponse;
 use bss_orders_lifecycle_sdk::authoring::{
     AuthoredTerm, BillingCycle, CalendarDate, Category, Currency, DraftLine, OrderHeader,
     OrderView, SelectedItem, VersionSummary,
@@ -265,10 +266,22 @@ fn stored_outcomes_render_verbatim_with_semantic_headers() {
         None,
     )
     .unwrap();
-    let out = render(response);
+    let first = Settled {
+        response,
+        replayed: false,
+    };
+    let out = render(first.clone());
     assert_eq!(out.status(), StatusCode::CREATED);
     assert_eq!(out.headers()["etag"], "\"1\"");
     assert_eq!(out.headers()["location"], "/x");
+    assert!(!out.headers().contains_key("idempotency-replayed"));
+    // A replay renders the same stored response plus the replay marker.
+    let out = render(Settled {
+        replayed: true,
+        ..first
+    });
+    assert_eq!(out.status(), StatusCode::CREATED);
+    assert_eq!(out.headers()["idempotency-replayed"], "true");
     let refused = StoredResponse::new(
         409,
         json!({"error_code": "LINE_CAP_EXCEEDED"}),
@@ -276,8 +289,12 @@ fn stored_outcomes_render_verbatim_with_semantic_headers() {
         None,
     )
     .unwrap();
-    let out = render(refused);
+    let out = render(Settled {
+        response: refused,
+        replayed: true,
+    });
     assert_eq!(out.status(), StatusCode::CONFLICT);
+    assert_eq!(out.headers()["idempotency-replayed"], "true");
     assert_eq!(out.headers()["content-type"], "application/problem+json");
     // A missing expected version is 428 with the canonical Orders code.
     let out = refuse(OrdersError::Refused(Reason::ExpectedVersionRequired));

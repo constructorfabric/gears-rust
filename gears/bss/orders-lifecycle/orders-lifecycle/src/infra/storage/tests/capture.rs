@@ -11,7 +11,7 @@ use crate::authz::test_pdp::{RulesProvider, ScriptedPdp, pep, user, with_proof};
 use crate::domain::audit::{ActorIdentities, AdminTextKey, Principal, ServiceRole};
 use crate::domain::idempotency::{LeaseDuration, StoredResponse};
 use crate::infra::broker::BoundProducer;
-use crate::infra::capture::{CaptureService, CaptureSettings, WriteMeta, sdk_result};
+use crate::infra::capture::{CaptureService, CaptureSettings, Settled, WriteMeta, sdk_result};
 use crate::infra::engine::{Engine, EngineParts, Registries};
 use arc_swap::ArcSwapOption;
 use bss_orders_lifecycle_sdk::OrdersError;
@@ -226,11 +226,13 @@ pub(super) fn limiter() -> Arc<crate::api::rest::throttle::PerOrderLimiter> {
     )
 }
 
-pub(super) fn view(r: StoredResponse) -> OrderView {
+pub(super) fn view(r: impl Into<StoredResponse>) -> OrderView {
+    let r = r.into();
     assert_eq!(r.status, 201, "{:?}", r.body);
     sdk_result(r).unwrap()
 }
-pub(super) fn result(r: StoredResponse) -> TransitionResult {
+pub(super) fn result(r: impl Into<StoredResponse>) -> TransitionResult {
+    let r = r.into();
     assert_eq!(r.status, 200, "{:?}", r.body);
     sdk_result(r).unwrap()
 }
@@ -308,7 +310,11 @@ async fn create_commits_an_empty_draft_with_trusted_evidence_and_replays_it() {
         .create(&buyer(), new_order(Category::NewSale), &create_meta("c-1"))
         .await
         .unwrap();
-    assert_eq!(replay, first);
+    assert_eq!(replay.response, first.response);
+    assert!(
+        replay.replayed && !first.replayed,
+        "only the replay is marked"
+    );
     assert_eq!(t.n("SELECT count(*) AS n FROM bss_orders__order").await, 1);
     assert_eq!(t.audits(id).await, 1);
     // A different key creates a second draft with a distinct seller-unique number; a supplied
@@ -436,7 +442,11 @@ async fn authoring_keeps_stable_line_identities_and_increments_only_the_draft_re
         )
         .await
         .unwrap();
-    assert_eq!(replay, first);
+    assert_eq!(replay.response, first.response);
+    assert!(
+        replay.replayed && !first.replayed,
+        "only the replay is marked"
+    );
     assert_eq!(
         t.n(&format!(
             "SELECT count(*) AS n FROM bss_orders__draft_content WHERE order_id='{id}'"
@@ -595,7 +605,7 @@ async fn structural_and_field_refusals_follow_the_declared_precedence() {
     );
     let before = t.order_row(id).await;
     let audits = t.audits(id).await;
-    let mut cases: Vec<(&str, Reason, StoredResponse)> = Vec::new();
+    let mut cases: Vec<(&str, Reason, Settled)> = Vec::new();
     // Mixed currency on insert.
     cases.push((
         "currency",
@@ -732,7 +742,11 @@ async fn structural_and_field_refusals_follow_the_declared_precedence() {
         .add_line(&buyer(), id, line("USD", None), &write("x-1", 1, Some(1)))
         .await
         .unwrap();
-    assert_eq!(replay, cases[0].2);
+    assert_eq!(replay.response, cases[0].2.response);
+    assert!(
+        replay.replayed,
+        "a settled refusal replays marked (ADR-0005, D-212)"
+    );
 }
 
 #[tokio::test]
@@ -907,7 +921,8 @@ async fn header_and_axis_edits_are_written_by_the_engine_under_complete_authoriz
         .patch_order(&buyer(), id, axes(), &write("h-3", 1, Some(2)))
         .await
         .unwrap();
-    assert_eq!(replay, committed);
+    assert_eq!(replay.response, committed.response);
+    assert!(replay.replayed && !committed.replayed);
     assert_eq!(t.audits(id).await, audits);
     let row = t.order_row(id).await;
     assert_eq!(
@@ -1122,6 +1137,9 @@ async fn the_mounted_routes_carry_engine_outcomes_on_the_wire() {
     .await;
     assert_eq!((replay.0, &replay.2), (201, &first.2));
     assert_eq!(replay.1["location"], first.1["location"]);
+    // Only the replay is marked (DNA REST §8); the stored response itself is unchanged.
+    assert!(!first.1.contains_key("idempotency-replayed"));
+    assert_eq!(replay.1["idempotency-replayed"], "true");
     // An actor override in the body is a boundary refusal that touches no registry row.
     let registry = t.registry().await;
     let mut forged = create.clone();
@@ -1191,7 +1209,8 @@ async fn the_mounted_routes_carry_engine_outcomes_on_the_wire() {
     )
     .await;
     assert_eq!((edited.0, &edited.2["draft_revision"]), (200, &json!(2)));
-    // A stale If-Match is the engine's version conflict, not a boundary refusal.
+    // A stale If-Match is the engine's settled precondition failure (412), not a boundary
+    // refusal; the body names the current version and draft revision.
     let stale = http(
         &router,
         "PATCH",
@@ -1201,8 +1220,12 @@ async fn the_mounted_routes_carry_engine_outcomes_on_the_wire() {
     )
     .await;
     assert_eq!(
-        (stale.0, &stale.2["error_code"]),
-        (409, &json!("VERSION_CONFLICT"))
+        (stale.0, &stale.2["error_code"], &stale.2["status"]),
+        (412, &json!("PRECONDITION_FAILED"), &json!(412))
+    );
+    assert_eq!(
+        stale.2["context"]["data"],
+        json!({"current_version": 1, "draft_revision": 2})
     );
     // Administrative-only PATCH: 503 Problem, nothing recorded.
     let registry = t.registry().await;

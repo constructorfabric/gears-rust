@@ -11,7 +11,8 @@ use crate::authz::{
     Arrangement, AuthorizationFacts, Caller, CollectionScope, Prefetch, ProposedAuthorization,
     TargetAuthorization,
 };
-use bss_orders_lifecycle_sdk::catalog::Reason;
+use crate::domain::state_table::is_workflow_class;
+use bss_orders_lifecycle_sdk::catalog::{Reason, Trigger};
 use sea_orm::EntityTrait;
 use toolkit_db::Db;
 use toolkit_db::secure::{DBRunner, ScopeError, SecureEntityExt, SecureInsertExt, TxConfig};
@@ -103,12 +104,20 @@ pub struct StaleAuthorization {
     current_version: i32,
 }
 impl StaleAuthorization {
-    /// `version-conflict` where the caller's expected version is safely observable as stale,
-    /// otherwise `authorization-context-changed` (409) without new target facts.
+    /// A stale expected version where it is safely observable: `precondition-failed` (412) for
+    /// a public trigger's `If-Match`, `version-conflict` for a workflow-class trigger (the
+    /// Workflow seam's contract). Otherwise `authorization-context-changed` (409) without new
+    /// target facts.
     #[must_use]
-    pub fn reason(self, expected_version: Option<i32>) -> Reason {
+    pub fn reason(self, expected_version: Option<i32>, trigger: Trigger) -> Reason {
         match expected_version {
-            Some(expected) if expected != self.current_version => Reason::VersionConflict,
+            Some(expected) if expected != self.current_version => {
+                if is_workflow_class(trigger) {
+                    Reason::VersionConflict
+                } else {
+                    Reason::PreconditionFailed
+                }
+            }
             _ => Reason::AuthorizationContextChanged,
         }
     }

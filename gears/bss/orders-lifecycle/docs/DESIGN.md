@@ -898,7 +898,8 @@ The order aggregate and its append-only version chain; the declarative state-mac
 its guards, terminal set, hold/resume mapping and expiry eligibility; guard evaluation and
 ordering; the idempotency registry and its non-success outcomes; the optimistic version
 check and its `version-conflict` refusal — the single registered name D-38 consolidated the
-`stale-version` variants into; the append-only transition audit; the typed event contract and the
+`stale-version` variants into, except that a public trigger's stale `If-Match` is refused
+`precondition-failed` (412, D-212); the append-only transition audit; the typed event contract and the
 one-producer-message-per-event-declaring-transition rule; the registry of machine-readable business reasons; and the retention purge of the three bounded-retention stores (D-185).
 
 ##### Responsibility boundaries
@@ -3116,8 +3117,8 @@ the version chain; it exposes no guard state and no idempotency content.
 
 **Error surface**: every refusal carries a registered machine-readable reason and maps to an
 RFC 9457 `application/problem+json` response at the wire edge, with no internal diagnostics in
-the body. The engine contributes `not-admissible`, `version-conflict`, `idempotency-mismatch`,
-`still-processing`, `authorization-context-changed`, `expected-version-required` and
+the body. The engine contributes `not-admissible`, `version-conflict`, `precondition-failed`,
+`idempotency-mismatch`, `still-processing`, `authorization-context-changed`, `expected-version-required` and
 `request-invalid`; slices contribute the rest.
 No slice may register a second name for these conditions. Refusal reasons are **derived GTS
 error types** used as registry keys, not RFC 9457 `type` URIs. The wire `type`, status and title
@@ -4326,8 +4327,9 @@ no idempotency record, because `expected_version` is part of the §4.2 request f
 request lacking it has no fingerprint to compare; it is not one of the seven refusal classes
 above, exactly as `page-size-exceeded` is input validation rather than an access decision
 ([08 §3.6](features/08-read-and-authz.md#contract-08-3-6)). Create has no existing version and is unaffected (§3.6 *Create Transition*). A
-present, well-formed expected version that differs from the current one remains the engine's
-`version-conflict`.
+present, well-formed expected version that differs from the current one is the engine's
+`precondition-failed` (412) for a public trigger and `version-conflict` for a workflow-class
+trigger; a stale draft revision stays `version-conflict` (409) (D-212).
 
 
 <!-- /contract -->
@@ -4930,6 +4932,7 @@ the Orders error base; their identifiers end in `~`. They are registry keys, **n
 gts.cf.bss.orders.err.v1~                                    -- abstract error base
 gts.cf.bss.orders.err.v1~cf.bss.orders.not_admissible.v1~
 gts.cf.bss.orders.err.v1~cf.bss.orders.version_conflict.v1~
+gts.cf.bss.orders.err.v1~cf.bss.orders.precondition_failed.v1~
 gts.cf.bss.orders.err.v1~cf.bss.orders.authorization_context_changed.v1~
 gts.cf.bss.orders.err.v1~cf.bss.orders.order_in_flight_for_key.v1~
 ```
@@ -4963,6 +4966,7 @@ pairs distinguish Orders reasons from similarly named failures in other gears.
 |-------------------|--------------|--------------------|------|
 | `not-admissible` | `NOT_ADMISSIBLE` | FailedPrecondition | 400 |
 | `version-conflict` | `VERSION_CONFLICT` | Aborted | 409 |
+| `precondition-failed` | `PRECONDITION_FAILED` | FailedPrecondition | 412 |
 | `idempotency-mismatch` | `IDEMPOTENCY_MISMATCH` | AlreadyExists | 409 |
 | `still-processing` | `STILL_PROCESSING` | Aborted | 409 |
 | `authorization-context-changed` | `AUTHORIZATION_CONTEXT_CHANGED` | Aborted | 409 |

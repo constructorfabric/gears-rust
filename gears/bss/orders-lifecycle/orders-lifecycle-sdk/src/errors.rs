@@ -59,13 +59,16 @@ impl OrdersError {
                     }
                     _ => m.reason,
                 };
-                Problem::contract_error(
+                let mut problem = Problem::contract_error(
                     m.category,
                     m.code,
                     "orders-lifecycle.v1",
                     detail,
                     serde_json::json!({}),
-                )
+                );
+                // A registered status may differ from the category default (428, 412).
+                problem.status = Some(m.http_status);
+                problem
             }
             Self::Unavailable => Problem::from(CanonicalError::service_unavailable().create()),
             Self::Integration => Problem::from(

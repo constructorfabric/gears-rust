@@ -127,8 +127,16 @@ pub enum DraftRevisions {
 pub enum EngineRefusal {
     /// Step 11: no row for `(state, trigger)`.
     NotAdmissible { state: OrderState, trigger: Trigger },
-    /// Step 10.1 / 12: names the current version and, for draft operations, revision.
+    /// Step 10.1 / 12: names the current version and, for draft operations, revision. A stale
+    /// draft revision, or a stale version on a workflow-class trigger (the Workflow seam's
+    /// contract), is a conflict.
     VersionConflict {
+        current_version: i32,
+        draft_revision: Option<i64>,
+    },
+    /// Step 12 for a public trigger: the caller's `If-Match` is not the current version (REST
+    /// 412). Names the same facts as [`Self::VersionConflict`].
+    PreconditionFailed {
         current_version: i32,
         draft_revision: Option<i64>,
     },
@@ -141,6 +149,7 @@ impl EngineRefusal {
         match self {
             Self::NotAdmissible { .. } => Reason::NotAdmissible,
             Self::VersionConflict { .. } => Reason::VersionConflict,
+            Self::PreconditionFailed { .. } => Reason::PreconditionFailed,
             Self::ResumeTargetMissing => Reason::ResumeTargetMissing,
         }
     }
@@ -224,9 +233,10 @@ pub fn admit<'t>(
     if uses_draft_revisions(trigger) != matches!(revisions, DraftRevisions::Draft { .. }) {
         return Err(DecisionError::DraftRevisions);
     }
+    let draft_revision = uses_draft_revisions(trigger).then_some(locked.draft_revision);
     let version_conflict = EngineRefusal::VersionConflict {
         current_version: locked.current_version,
-        draft_revision: uses_draft_revisions(trigger).then_some(locked.draft_revision),
+        draft_revision,
     };
     if is_workflow_class(trigger) && expected_version != locked.current_version {
         return Ok(Err(version_conflict));
@@ -238,7 +248,10 @@ pub fn admit<'t>(
         }));
     };
     if expected_version != locked.current_version {
-        return Ok(Err(version_conflict));
+        return Ok(Err(EngineRefusal::PreconditionFailed {
+            current_version: locked.current_version,
+            draft_revision,
+        }));
     }
     if let DraftRevisions::Draft { client, prepared } = revisions
         && (client != Some(locked.draft_revision) || prepared != locked.draft_revision)

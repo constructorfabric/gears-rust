@@ -6,7 +6,7 @@ use crate::authz::{
     Action, Arrangement, AuthzFailure, Caller, Pep, Prefetch, ProofDenial, TargetAuthorization,
 };
 use crate::infra::storage::scoped::{self, AuthorizedLock, AuthorizedRead};
-use bss_orders_lifecycle_sdk::catalog::Reason;
+use bss_orders_lifecycle_sdk::catalog::{Reason, Trigger};
 use serde_json::json;
 
 const ORDER_RT: &str = "gts.cf.bss.orders.order.v1~";
@@ -424,7 +424,11 @@ async fn old_new_arrangement_payer_use_and_stale_facts() -> anyhow::Result<()> {
         .transaction_ref_mapped(move |tx| {
             Box::pin(async move {
                 anyhow::Ok(match scoped::lock_authorized(tx, &stale).await? {
-                    AuthorizedLock::Stale(s) => Some((s.reason(Some(1)), s.reason(Some(2)))),
+                    AuthorizedLock::Stale(s) => Some((
+                        s.reason(Some(1), Trigger::DraftMutate),
+                        s.reason(Some(2), Trigger::DraftMutate),
+                        s.reason(Some(2), Trigger::ReflectApprovalGranted),
+                    )),
                     _ => None,
                 })
             })
@@ -432,7 +436,11 @@ async fn old_new_arrangement_payer_use_and_stale_facts() -> anyhow::Result<()> {
         .await?;
     assert_eq!(
         outcome,
-        Some((Reason::AuthorizationContextChanged, Reason::VersionConflict))
+        Some((
+            Reason::AuthorizationContextChanged,
+            Reason::PreconditionFailed,
+            Reason::VersionConflict
+        ))
     );
     assert_eq!(registry(&pg).await, registry_before);
     assert_eq!(row(&pg, 1).await, order_before);
@@ -822,7 +830,7 @@ async fn concurrent_axis_change_blocks_then_conflicts_without_mutation() -> anyh
         .transaction_ref_mapped(move |tx| {
             Box::pin(async move {
                 anyhow::Ok(match scoped::lock_authorized(tx, &stale).await? {
-                    AuthorizedLock::Stale(s) => Some(s.reason(None)),
+                    AuthorizedLock::Stale(s) => Some(s.reason(None, Trigger::DraftMutate)),
                     AuthorizedLock::AccessLost => None,
                     AuthorizedLock::Locked(_) => anyhow::bail!("stale facts were locked"),
                 })

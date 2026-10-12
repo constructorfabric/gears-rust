@@ -38,13 +38,17 @@ use super::dto::{
     OrdersRemoveLine, OrdersTransitionResult,
 };
 use super::throttle::{PerOrderLimiter, caller_write_throttling, rejection_response};
-use crate::domain::idempotency::StoredResponse;
-use crate::infra::capture::{CaptureService, WriteMeta};
+use crate::infra::capture::{CaptureService, Settled, WriteMeta};
 
 const IDEMPOTENCY_KEY: &str = "idempotency-key";
 const IF_MATCH: &str = "if-match";
+const IDEMPOTENCY_REPLAYED: &str = "idempotency-replayed";
 const EXPECTED_DRAFT_REVISION: &str = "expected_draft_revision";
 const TAG: &str = "Orders Lifecycle";
+/// 412 for every existing-order write: a stale `If-Match` is settled and audited, kept apart from
+/// the 409 draft-revision conflict.
+const STALE_IF_MATCH: &str =
+    "PRECONDITION_FAILED: If-Match is not the current version (names current_version)";
 
 fn invalid() -> OrdersError {
     OrdersError::Refused(Reason::RequestInvalid)
@@ -130,7 +134,10 @@ fn write_meta(headers: &HeaderMap) -> Result<CallMeta, OrdersError> {
     })
 }
 
-fn render(response: StoredResponse) -> Response {
+/// The stored response exactly as stored; a replay additionally carries
+/// `Idempotency-Replayed: true` (DNA REST §8), a settled refusal included (ADR-0005, D-212).
+fn render(settled: Settled) -> Response {
+    let Settled { response, replayed } = settled;
     let status = StatusCode::from_u16(response.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     let problem = !status.is_success();
     let mut out = (status, axum::Json(response.body)).into_response();
@@ -149,6 +156,9 @@ fn render(response: StoredResponse) -> Response {
             HeaderValue::from_static("application/problem+json"),
         );
     }
+    if replayed {
+        headers.insert(IDEMPOTENCY_REPLAYED, HeaderValue::from_static("true"));
+    }
     out
 }
 
@@ -156,7 +166,7 @@ fn refuse(error: OrdersError) -> Response {
     super::problem(error).into_response()
 }
 
-fn outcome(result: Result<StoredResponse, OrdersError>) -> Response {
+fn outcome(result: Result<Settled, OrdersError>) -> Response {
     match result {
         Ok(response) => render(response),
         Err(error) => refuse(error),
@@ -166,14 +176,15 @@ fn outcome(result: Result<StoredResponse, OrdersError>) -> Response {
 /// `Location` of a created order, from the public request path: under a gateway `prefix_path`
 /// the router is nested, and only the original URI still carries the prefix. Added at render
 /// time, so a replay gets the same header as the first response.
-fn with_location(mut response: StoredResponse, collection_path: &str) -> StoredResponse {
+fn with_location(mut settled: Settled, collection_path: &str) -> Settled {
+    let response = &mut settled.response;
     if response.status == StatusCode::CREATED.as_u16()
         && let Some(order_id) = response.body["order"]["order_id"].as_str()
     {
         let location = format!("{}/{order_id}", collection_path.trim_end_matches('/'));
         response.headers.insert("location".to_owned(), location);
     }
-    response
+    settled
 }
 
 async fn create_order(
@@ -388,6 +399,7 @@ pub fn router(
         .json_response_with_schema::<OrdersTransitionResult>(openapi, StatusCode::OK, "Committed")
         .response_header(etag())
         .standard_errors(openapi)
+        .problem_response(openapi, StatusCode::PRECONDITION_FAILED, STALE_IF_MATCH)
         .error_429(openapi)
         .error_503(openapi)
         .register(router, openapi);
@@ -397,7 +409,8 @@ pub fn router(
         .description(
             "Adds one working-set line with a server-reserved line_id, retaining dates, term and \
              cycle exactly as authored. Refusals include NOT_ADMISSIBLE outside draft, \
-             VERSION_CONFLICT for a missing or stale expected_draft_revision, CURRENCY_MIXED and \
+             VERSION_CONFLICT for a missing or stale expected_draft_revision, PRECONDITION_FAILED \
+             (412) for a stale If-Match, CURRENCY_MIXED and \
              LINE_CAP_EXCEEDED.",
         )
         .tag(TAG)
@@ -413,6 +426,7 @@ pub fn router(
         .json_response_with_schema::<OrdersTransitionResult>(openapi, StatusCode::OK, "Committed")
         .response_header(etag())
         .standard_errors(openapi)
+        .problem_response(openapi, StatusCode::PRECONDITION_FAILED, STALE_IF_MATCH)
         .error_429(openapi)
         .error_503(openapi)
         .register(router, openapi);
@@ -443,6 +457,7 @@ pub fn router(
             )
             .response_header(etag())
             .standard_errors(openapi)
+            .problem_response(openapi, StatusCode::PRECONDITION_FAILED, STALE_IF_MATCH)
             .error_429(openapi)
             .error_503(openapi)
             .register(router, openapi);
@@ -473,6 +488,7 @@ pub fn router(
             )
             .response_header(etag())
             .standard_errors(openapi)
+            .problem_response(openapi, StatusCode::PRECONDITION_FAILED, STALE_IF_MATCH)
             .error_429(openapi)
             .error_503(openapi)
             .register(router, openapi);

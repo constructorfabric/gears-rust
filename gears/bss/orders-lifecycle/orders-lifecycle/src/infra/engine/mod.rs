@@ -817,7 +817,7 @@ impl Engine {
                         AuthorizedLock::Locked(locked) => *locked,
                         AuthorizedLock::Stale(stale) => {
                             return Ok(DurableOutcome::Conflict(
-                                stale.reason(Some(expected_version)),
+                                stale.reason(Some(expected_version), trigger),
                             ));
                         }
                         AuthorizedLock::AccessLost => {
@@ -1044,7 +1044,7 @@ impl Engine {
                         match scoped::lock_authorized(tx, &target).await? {
                             AuthorizedLock::Locked(locked) => locked.row().clone(),
                             AuthorizedLock::Stale(stale) => {
-                                return Ok(Err(stale.reason(None)));
+                                return Ok(Err(stale.reason(None, trigger)));
                             }
                             AuthorizedLock::AccessLost => return Ok(Err(Reason::OrderNotFound)),
                         }
@@ -1566,13 +1566,16 @@ fn refusal_response(
     assessment: Option<Value>,
 ) -> Result<StoredResponse, Abort> {
     let m = reason.mapping();
-    let problem = toolkit_canonical_errors::Problem::contract_error(
+    let mut problem = toolkit_canonical_errors::Problem::contract_error(
         m.category,
         m.code,
         ERROR_DOMAIN,
         m.reason,
         data,
     );
+    // The body names the registered wire status, which may differ from the category default
+    // (`precondition-failed` is a failed precondition answered 412).
+    problem.status = Some(m.http_status);
     Ok(StoredResponse::new(
         m.http_status,
         json_value(&problem)?,
@@ -1830,7 +1833,9 @@ async fn lock<'a>(
     match &attempt.target {
         TargetLock::Authorized(target) => Ok(match scoped::lock_authorized(tx, target).await? {
             AuthorizedLock::Locked(locked) => Ok(*locked),
-            AuthorizedLock::Stale(stale) => Err(stale.reason(Some(attempt.expected_version))),
+            AuthorizedLock::Stale(stale) => {
+                Err(stale.reason(Some(attempt.expected_version), attempt.trigger))
+            }
             AuthorizedLock::AccessLost => Err(Reason::OrderNotFound),
         }),
         TargetLock::Internal(target) => {
@@ -1938,6 +1943,10 @@ async fn existing_body<'a>(
                     "trigger": trigger_token(trigger),
                 }),
                 transition::EngineRefusal::VersionConflict {
+                    current_version,
+                    draft_revision,
+                }
+                | transition::EngineRefusal::PreconditionFailed {
                     current_version,
                     draft_revision,
                 } => match draft_revision {

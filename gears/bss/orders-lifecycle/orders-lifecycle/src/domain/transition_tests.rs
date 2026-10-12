@@ -98,10 +98,11 @@ fn ordinary_triggers_check_admissibility_before_version() {
         );
     }
     let f = facts(S::Submitted);
+    // A public trigger's stale expected version is its failed `If-Match` precondition.
     let r = admit(&table, Trigger::Hold, &f, 1, DraftRevisions::NotApplicable).unwrap();
     assert_eq!(
         r.unwrap_err(),
-        EngineRefusal::VersionConflict {
+        EngineRefusal::PreconditionFailed {
             current_version: 2,
             draft_revision: None
         }
@@ -274,7 +275,7 @@ fn unresolvable_inputs_never_mask_earlier_refusals_and_precluded_is_not_unresolv
     .unwrap();
     assert!(matches!(
         d,
-        Decision::Engine(EngineRefusal::VersionConflict { .. })
+        Decision::Engine(EngineRefusal::PreconditionFailed { .. })
     ));
     // Precluded: the cap fails, the gate inputs were skipped: the cap reason, never a 503.
     let precluded = registry

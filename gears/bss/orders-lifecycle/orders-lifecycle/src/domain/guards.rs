@@ -455,9 +455,11 @@ pub const GUARDS: &[GuardDecl] = &[
 
 /// Reasons the engine itself returns (DESIGN §3.3 *Error surface*); no slice may register a
 /// second name for these conditions, nor return them from a guard.
-pub const ENGINE_REASONS: [Reason; 9] = [
+pub const ENGINE_REASONS: [Reason; 10] = [
     Reason::NotAdmissible,
     Reason::VersionConflict,
+    // A public trigger's stale `If-Match` (REST 412); draft revisions stay `version-conflict`.
+    Reason::PreconditionFailed,
     Reason::IdempotencyMismatch,
     Reason::StillProcessing,
     Reason::AuthorizationContextChanged,

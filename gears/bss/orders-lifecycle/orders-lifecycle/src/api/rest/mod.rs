@@ -167,14 +167,8 @@ pub struct SubmitBody {
     pub expected_draft_revision: DraftRevision,
 }
 
-/// Apply the Orders HTTP status exception without reclassifying the canonical error.
+/// The Problem for an Orders error; a registered refusal carries its catalog wire status.
 #[must_use]
 pub fn problem(error: OrdersError) -> Problem {
-    let mut result = error.into_problem();
-    if result.error_domain.as_deref() == Some("orders-lifecycle.v1")
-        && result.error_code.as_deref() == Some("EXPECTED_VERSION_REQUIRED")
-    {
-        result.status = Some(428);
-    }
-    result
+    error.into_problem()
 }

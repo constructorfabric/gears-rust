@@ -184,6 +184,9 @@ def test_retry_and_conflict_wire_behavior(env: OrdersEnv, buyer: Buyer):
     replay = api.post(lines, json=body, headers=write_headers(1, key))
     assert replay.status_code == 200 and replay.json() == first.json()
     assert replay.headers["etag"] == first.headers["etag"]
+    # Only the replay is marked; the stored response is returned unchanged.
+    assert "idempotency-replayed" not in first.headers
+    assert replay.headers["idempotency-replayed"] == "true"
 
     # Same key, changed payload: the canonical mismatch problem; nothing new is written.
     mismatch = api.post(lines, json=line_body(0, currency="USD"), headers=write_headers(1, key))
@@ -195,6 +198,13 @@ def test_retry_and_conflict_wire_behavior(env: OrdersEnv, buyer: Buyer):
     body_s = problem(stale, 409, "VERSION_CONFLICT")
     assert body_s["context"]["data"]["draft_revision"] == 1
 
+    # A stale If-Match: the settled 412 precondition failure naming the current version, kept
+    # separate from the draft-revision conflict above.
+    stale_version = api.post(lines, json=line_body(1), headers=write_headers(2))
+    body_v = problem(stale_version, 412, "PRECONDITION_FAILED")
+    assert body_v["status"] == 412
+    assert body_v["context"]["data"] == {"current_version": 1, "draft_revision": 1}
+
     # A missing If-Match is the pre-authorization 428 with the canonical code.
     missing = api.post(lines, json=line_body(1), headers={"Idempotency-Key": new_key()})
     problem(missing, 428, "EXPECTED_VERSION_REQUIRED")
@@ -202,12 +212,12 @@ def test_retry_and_conflict_wire_behavior(env: OrdersEnv, buyer: Buyer):
     assert env.count(
         f"SELECT count(*) FROM bss_orders__draft_content WHERE order_id = '{order_id}'"
     ) == 1
-    # Both the committed write and the settled conflict are audited; the mismatch and the 428
-    # are not committed transitions.
+    # The committed write and both settled refusals are audited; the mismatch and the 428 are
+    # not committed transitions.
     assert env.count(
         f"SELECT count(*) FROM bss_orders__transition_audit WHERE order_id = '{order_id}'"
         " AND sequence IS NOT NULL"
-    ) == 2
+    ) == 3
 
 
 # ── Coherent authorized inspection ─────────────────────────────────────────

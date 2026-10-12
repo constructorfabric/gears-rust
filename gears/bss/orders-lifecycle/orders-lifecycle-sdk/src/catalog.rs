@@ -214,6 +214,9 @@ pub enum Reason {
     /// `version-conflict`.
     #[serde(rename = "version-conflict")]
     VersionConflict,
+    /// `precondition-failed`.
+    #[serde(rename = "precondition-failed")]
+    PreconditionFailed,
     /// `idempotency-mismatch`.
     #[serde(rename = "idempotency-mismatch")]
     IdempotencyMismatch,
@@ -481,6 +484,7 @@ impl Reason {
     pub const ALL: &'static [Self] = &[
         Self::NotAdmissible,
         Self::VersionConflict,
+        Self::PreconditionFailed,
         Self::IdempotencyMismatch,
         Self::StillProcessing,
         Self::AuthorizationContextChanged,
@@ -601,6 +605,13 @@ const REASON_MAPPINGS: &[ReasonMapping] = &[
         gts_id: gts_id!("cf.bss.orders.err.v1~cf.bss.orders.version_conflict.v1~"),
         category: ProblemCategory::Aborted,
         http_status: 409,
+    },
+    ReasonMapping {
+        reason: "precondition-failed",
+        code: "PRECONDITION_FAILED",
+        gts_id: gts_id!("cf.bss.orders.err.v1~cf.bss.orders.precondition_failed.v1~"),
+        category: ProblemCategory::FailedPrecondition,
+        http_status: 412,
     },
     ReasonMapping {
         reason: "idempotency-mismatch",
