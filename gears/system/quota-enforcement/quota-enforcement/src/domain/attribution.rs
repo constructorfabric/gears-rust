@@ -75,6 +75,7 @@ pub struct AdmittedEvaluation {
 /// The ingress step over the PEP boundary and the published catalogue.
 // @cpt-dod:cpt-cf-quota-enforcement-dod-ingress-validation:p1
 // @cpt-dod:cpt-cf-quota-enforcement-dod-subject-resolution:p1
+#[domain_model]
 pub struct Attribution<'a> {
     admission: &'a Admission,
     catalog: &'a ProjectionContractCatalog,
@@ -424,6 +425,7 @@ impl<'a> Attribution<'a> {
         Ok(resource.projection)
     }
 
+    /// Validate `document` against `contract`, recording and logging a violation.
     fn validate_envelope(
         &self,
         site: &Site<'_>,
@@ -470,6 +472,7 @@ impl<'a> Attribution<'a> {
         )
     }
 
+    /// Reject an absent required object before the PDP.
     fn reject_missing(
         &self,
         site: &Site<'_>,
@@ -479,6 +482,7 @@ impl<'a> Attribution<'a> {
         self.record_shape(site, field, reason, "", ValidationReason::MetadataMissing)
     }
 
+    /// Record, log and build a malformed-attribution rejection.
     fn record_shape(
         &self,
         site: &Site<'_>,

@@ -35,6 +35,7 @@ pub fn parse_metric_under_base(text: &str) -> Option<MetricId> {
 }
 
 /// A resolved contract schema compiled for validation.
+#[domain_model]
 pub struct CompiledContract {
     type_id: GtsTypeId,
     validator: Validator,
@@ -117,6 +118,7 @@ struct GtsRefKeyword {
 }
 
 impl GtsRefKeyword {
+    /// Build the keyword from its declared `x-gts-ref` pattern.
     fn compile<'a>(
         root: &Value,
         _parent: &'a Map<String, Value>,
@@ -168,6 +170,7 @@ impl GtsRefKeyword {
         )
     }
 
+    /// Whether a string value is a GTS id matching the pattern; non-strings pass.
     fn matches(&self, instance: &Value) -> bool {
         match instance.as_str() {
             Some(text) => GtsId::try_new(text).is_ok_and(|id| id.matches_pattern(&self.pattern)),

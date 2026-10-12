@@ -39,6 +39,7 @@ pub struct CatalogConfig {
 }
 
 /// Runs the consistency set over a registry and produces the catalogue.
+#[domain_model]
 pub struct CatalogBuilder<'a> {
     registry: &'a dyn ContractRegistry,
     metrics: &'a dyn QeMetrics,
@@ -378,6 +379,7 @@ impl<'a> CatalogBuilder<'a> {
         })
     }
 
+    /// Compile a registered schema, rejecting one that does not compile.
     fn compile(&self, registered: &RegisteredType) -> Result<CompiledContract, DomainError> {
         CompiledContract::compile(registered.id.clone(), registered.schema.clone()).map_err(|e| {
             self.reject(

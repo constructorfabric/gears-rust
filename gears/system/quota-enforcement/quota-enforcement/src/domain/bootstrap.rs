@@ -183,6 +183,7 @@ impl Bootstrap {
         }
     }
 
+    /// Run the bootstrap steps, naming the dependency that failed.
     // @cpt-algo:cpt-cf-quota-enforcement-algo-engine-bootstrap-seed:p1
     async fn run_steps(&self) -> Result<Bound, (Dependency, DomainError)> {
         // @cpt-begin:cpt-cf-quota-enforcement-algo-engine-bootstrap-seed:p1:inst-ebs-register

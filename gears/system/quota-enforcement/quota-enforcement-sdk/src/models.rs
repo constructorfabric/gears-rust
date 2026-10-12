@@ -795,6 +795,7 @@ fn user_segment() -> &'static str {
     &SCOPE_USER[SCOPE_TYPE.len()..]
 }
 
+/// The instance segment of the tenant scope id, after the scope type.
 fn tenant_segment() -> &'static str {
     &SCOPE_TENANT[SCOPE_TYPE.len()..]
 }

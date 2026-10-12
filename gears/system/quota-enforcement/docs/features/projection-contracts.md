@@ -173,7 +173,7 @@ only; the Quota write itself is owned by the quota-lifecycle feature)
 4. [x] - `p1` - Verify every admitted metric reference resolves to a registered instance of the metric base; a narrowed `x-gts-ref` is a pattern-level prefix match only, so QE owns both checks - `inst-cat-metric`
 5. [x] - `p1` - Read each projection's registry-validated effective `scope` trait, compare the `GtsInstanceId` values directly, and reject any `(metric, scope)` pair admitted by two configured projections; scope is never inferred from the type-id name segment - `inst-cat-unique`
 6. [x] - `p1` - Resolve exactly one request contract per admitted metric and verify its attached constraint contract is registered, concrete, and derived from the constraint base - `inst-cat-contract-pair`
-7. [x] - `p1` - **IF** the configured catalogue is incompatible with any active Quota or Policy - `inst-cat-compat-if`
+7. [x] - `p1` - **IF** the configured catalogue is incompatible with any active Quota, read as the distinct `(metric, projection_type)` pairs the storage contract reports (`read_active_projection_bindings`) - `inst-cat-compat-if`
    1. [x] - `p1` - Fail gear bootstrap; increment `contract_validation_failures_total` with the `bootstrap` surface where emission completes before process exit; the current projection version stays active and no activation procedure exists in P1 - `inst-cat-compat`
 8. [x] - `p1` - **IF** any consistency check fails - `inst-cat-fail-if`
    1. [x] - `p1` - Fail gear bootstrap and serve nothing; increment `contract_validation_failures_total` with the `bootstrap` surface where emission completes before process exit; this step extends `cpt-cf-quota-enforcement-flow-gear-bootstrap` from the foundation feature - `inst-cat-fail`
@@ -400,6 +400,13 @@ NOT** appear as label values; permitted dimensions are the closed `surface` and 
 
 ## 7. Additional Context (optional)
 
+- **Compatibility is split**: the active-Quota check is complete against the storage contract
+  (`QuotaEnforcementStoragePluginV1::read_active_projection_bindings()`, the distinct `(metric, projection_type)`
+  pairs of active Quotas) and verified against the in-memory storage double; the storage plugin's database query and
+  its integration tests are tracked by the quota-lifecycle feature. Policy compatibility is tracked by the
+  resolution-policy-engine feature, since a Policy version carries no contract reference yet. Until both land, the
+  `ProjectionContractCatalog` state machine, `cpt-cf-quota-enforcement-dod-projection-catalog`, and the feature
+  status stay open.
 - **ADR dependency**: the primary decision record, `cpt-cf-quota-enforcement-adr-projection-contracts` (ADR-0007), has
   status accepted. This document restates only what the feature needs; the ADR stays the authority on the
   contract shapes.

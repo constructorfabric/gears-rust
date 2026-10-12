@@ -122,6 +122,7 @@ pub fn check_projection_reference(
     // @cpt-end:cpt-cf-quota-enforcement-algo-catalog-membership:p1:inst-mem-pass
 }
 
+/// Count and log a rejected projection reference.
 fn record(
     metrics: &dyn QeMetrics,
     surface: ValidationSurface,
@@ -138,6 +139,7 @@ fn record(
     );
 }
 
+/// Record a rejected projection reference and build its error.
 fn invalid(
     metrics: &dyn QeMetrics,
     surface: ValidationSurface,

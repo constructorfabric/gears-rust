@@ -165,6 +165,7 @@ fn resolve(
     })
 }
 
+/// Whether a registered schema is marked `x-gts-abstract`.
 fn is_abstract(raw: &Value) -> bool {
     raw.get("x-gts-abstract") == Some(&Value::Bool(true))
 }
@@ -239,6 +240,7 @@ fn unavailable(what: &str, err: &CanonicalError) -> DomainError {
     DomainError::TypesRegistryUnavailable(format!("types registry `{what}` failed: {err}"))
 }
 
+/// The error for a registry call that missed its deadline.
 fn timed_out(what: &str, deadline: Duration) -> DomainError {
     DomainError::TypesRegistryUnavailable(format!(
         "types registry did not answer `{what}` within {deadline:?}"

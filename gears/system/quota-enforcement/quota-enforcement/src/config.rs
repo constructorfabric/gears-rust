@@ -240,6 +240,7 @@ impl CatalogSection {
         Self::validate_list("resource_projections", &self.resource_projections)
     }
 
+    /// Reject an entry that is not a GTS type id or is listed twice.
     fn validate_list(field: &str, ids: &[String]) -> anyhow::Result<()> {
         for (index, id) in ids.iter().enumerate() {
             GtsTypeId::try_new(id).map_err(|e| {
