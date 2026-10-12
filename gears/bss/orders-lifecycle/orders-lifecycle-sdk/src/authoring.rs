@@ -174,10 +174,10 @@ impl AuthoredTerm {
 /// floating point; 03 §4.3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(transparent)]
-pub struct Quantity(#[serde(with = "scalars::decimal")] Decimal);
+pub struct Quantity(#[serde(with = "bss_money::serde_text")] Decimal);
 impl<'de> Deserialize<'de> for Quantity {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        let value = scalars::decimal::deserialize(d)?;
+        let value = bss_money::serde_text::deserialize(d)?;
         Self::new(value).map_err(serde::de::Error::custom)
     }
 }

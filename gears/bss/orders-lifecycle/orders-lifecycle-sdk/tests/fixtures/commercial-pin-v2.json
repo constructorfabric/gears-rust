@@ -81,7 +81,7 @@
           "currency": "EUR",
           "model": {
             "kind": "flat",
-            "amount": "1.2300"
+            "amount": "1.23"
           },
           "minimum_fee": null,
           "effective_from": "2026-09-01",
@@ -121,7 +121,7 @@
           "currency": "EUR",
           "model": {
             "kind": "per_unit",
-            "unit_amount": "2.500"
+            "unit_amount": "2.5"
           },
           "minimum_fee": null,
           "effective_from": "2026-09-01",
@@ -166,12 +166,12 @@
             "kind": "volume",
             "tiers": [
               {
-                "up_to": "100.00",
-                "rate": "0.0470"
+                "up_to": "100",
+                "rate": "0.047"
               },
               {
                 "up_to": null,
-                "rate": "0.0250"
+                "rate": "0.025"
               }
             ]
           },

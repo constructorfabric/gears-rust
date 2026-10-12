@@ -380,15 +380,16 @@ fn term_columns_preserve_intent_and_calendar_units() {
 
 #[test]
 fn authored_values_are_bounded_structurally() {
-    // Zero/negative quantities and zero terms are boundary-invalid; different cycles are fine.
-    for quantity in ["0", "-1", "-0.5"] {
+    // Zero/negative quantities, noncanonical decimal text (D-213) and zero terms are
+    // boundary-invalid; different cycles are fine.
+    for quantity in ["0", "-1", "-0.5", "12.500", "01", "1."] {
         let item = serde_json::json!({"item_id": Uuid::nil(), "quantity": quantity});
         assert!(
             serde_json::from_value::<SelectedItem>(item).is_err(),
             "{quantity}"
         );
     }
-    for quantity in ["1", "0.25", "12.500"] {
+    for quantity in ["1", "0.25", "12.5"] {
         let item = serde_json::json!({"item_id": Uuid::nil(), "quantity": quantity});
         assert!(
             serde_json::from_value::<SelectedItem>(item).is_ok(),

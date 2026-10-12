@@ -2184,6 +2184,7 @@ name = "cf-gears-bss-orders-lifecycle-sdk"
 version = "0.0.0"
 dependencies = [
  "async-trait",
+ "cf-gears-bss-money",
  "cf-gears-bss-pricing-sdk",
  "cf-gears-toolkit-canonical-errors",
  "cf-gears-toolkit-gts",

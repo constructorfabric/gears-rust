@@ -51,7 +51,7 @@ pub(super) struct NewSaleQueryDef {
     plan_revision_id: Uuid,
     #[serde(with = "vec_binding_selection")]
     selections: Vec<BindingSelection>,
-    #[serde(with = "crate::commercial::scalars::decimal")]
+    #[serde(with = "bss_money::serde_text")]
     quantity: Decimal,
     #[serde(with = "MarketDef")]
     market: Market,
@@ -89,9 +89,9 @@ pub(super) struct AcceptanceReceiptDef {
 #[derive(Serialize, Deserialize)]
 #[serde(remote = "bss_pricing_sdk::read::Tier", deny_unknown_fields)]
 pub(super) struct TierDef {
-    #[serde(with = "option_decimal")]
+    #[serde(with = "bss_money::serde_text::option")]
     up_to: Option<Decimal>,
-    #[serde(with = "crate::commercial::scalars::decimal")]
+    #[serde(with = "bss_money::serde_text")]
     rate: Decimal,
 }
 #[derive(Serialize, Deserialize)]
@@ -104,7 +104,7 @@ pub(super) struct ImmutablePriceDef {
     currency: String,
     #[serde(with = "PriceModelDef")]
     model: PriceModel,
-    #[serde(with = "option_decimal")]
+    #[serde(with = "bss_money::serde_text::option")]
     minimum_fee: Option<Decimal>,
     #[serde(with = "crate::commercial::scalars::date")]
     effective_from: Date,
@@ -243,11 +243,11 @@ pub(super) enum TermDef {
 )]
 pub(super) enum PriceModelDef {
     Flat {
-        #[serde(with = "crate::commercial::scalars::decimal")]
+        #[serde(with = "bss_money::serde_text")]
         amount: Decimal,
     },
     PerUnit {
-        #[serde(with = "crate::commercial::scalars::decimal")]
+        #[serde(with = "bss_money::serde_text")]
         unit_amount: Decimal,
     },
     Volume {
@@ -259,9 +259,9 @@ pub(super) enum PriceModelDef {
         tiers: Vec<Tier>,
     },
     Package {
-        #[serde(with = "crate::commercial::scalars::decimal")]
+        #[serde(with = "bss_money::serde_text")]
         package_size: Decimal,
-        #[serde(with = "crate::commercial::scalars::decimal")]
+        #[serde(with = "bss_money::serde_text")]
         package_price: Decimal,
     },
 }
@@ -447,23 +447,6 @@ mod vec_accepted_binding {
             .into_iter()
             .map(|v| v.0)
             .collect())
-    }
-}
-mod option_decimal {
-    use super::{Decimal, Deserialize, Serialize};
-    #[derive(Serialize, Deserialize)]
-    struct Value(#[serde(with = "crate::commercial::scalars::decimal")] Decimal);
-    #[allow(clippy::ref_option, clippy::trivially_copy_pass_by_ref)] // Serde with-hook signature.
-    pub fn serialize<S: serde::Serializer>(
-        value: &Option<Decimal>,
-        serializer: S,
-    ) -> Result<S::Ok, S::Error> {
-        (*value).map(Value).serialize(serializer)
-    }
-    pub fn deserialize<'de, D: serde::Deserializer<'de>>(
-        deserializer: D,
-    ) -> Result<Option<Decimal>, D::Error> {
-        Ok(Option::<Value>::deserialize(deserializer)?.map(|v| v.0))
     }
 }
 mod option_date {

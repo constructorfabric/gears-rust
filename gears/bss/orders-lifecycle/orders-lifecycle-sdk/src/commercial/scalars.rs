@@ -27,21 +27,6 @@ macro_rules! integer {
 integer!(unsigned, u64);
 integer!(signed, i64);
 
-pub mod decimal {
-    use super::*;
-    use rust_decimal::Decimal;
-    pub fn serialize<S: Serializer>(v: &Decimal, s: S) -> Result<S::Ok, S::Error> {
-        s.serialize_str(&v.to_string())
-    }
-    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Decimal, D::Error> {
-        let text = String::deserialize(d)?;
-        let value = Decimal::from_str_exact(&text).map_err(D::Error::custom)?;
-        if value.to_string() != text {
-            return Err(D::Error::custom("noncanonical or lossy decimal"));
-        }
-        Ok(value)
-    }
-}
 pub mod digest {
     use super::*;
     pub fn serialize<S: Serializer>(v: &[u8; 32], s: S) -> Result<S::Ok, S::Error> {

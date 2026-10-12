@@ -271,7 +271,8 @@ fn native_variants_remain_lossless_without_claiming_sale_eligibility() {
     let original = OrderPin::decode(GOLDEN.as_bytes()).unwrap();
     for (index, model) in [
         PriceModel::Flat {
-            amount: Decimal::MAX,
+            // The largest amount `bss_money` carries: a 28-digit coefficient.
+            amount: Decimal::from_str_exact("9999999999999999999999999999").unwrap(),
         },
         PriceModel::PerUnit {
             unit_amount: Decimal::from_str_exact("0.0000000000000000000000000001").unwrap(),
@@ -360,13 +361,14 @@ fn native_variants_remain_lossless_without_claiming_sale_eligibility() {
         .unwrap();
         let result = OrderPin::decode(&pin.encode().unwrap()).unwrap();
         assert_eq!(result.receipt(), &receipt, "native model {index}");
+        // Canonical `bss_money` text (D-213): `10.000` is carried and read back as `10`.
         assert_eq!(
             result.receipt().bindings[2]
                 .price
                 .minimum_fee
                 .unwrap()
                 .scale(),
-            3
+            0
         );
     }
 }
