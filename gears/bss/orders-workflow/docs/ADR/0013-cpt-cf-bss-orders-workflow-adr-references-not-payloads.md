@@ -152,7 +152,7 @@ reach. Concretely:
   > from the list below, and "line items" stays.
 * **What may never cross**: totals, the TCV, prices, currencies or any field of the accepted
   `OrderPin` (plan revision, selected items, chain bindings, price ids, the activation deadline);
-  plan-revision, item or SKU references; line items or line counts; approver identities and any
+  plan-revision, item or SKU references; line items (line counts are the accepted cardinality residual above, D-131, D-210); approver identities and any
   `subject_id`; buyer or seller identity, and any tenant axis beyond `resource_tenant_id`
   (`seller_tenant_id` included); payment-authorization identifiers or instrument data; subscription
   identifiers and transition-request identifiers (they stay in the intent record and the sweep's

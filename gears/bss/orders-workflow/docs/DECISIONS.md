@@ -228,6 +228,7 @@
   - [D-207 (M) Phase 1 is a canonical process with four seller-policy settings; customization stays in the owning gears](#d-207-m-phase-1-is-a-canonical-process-with-four-seller-policy-settings-customization-stays-in-the-owning-gears)
   - [D-208 (H) Lifecycle's merged design D-179…D-186 is received: forced failure, overdue owner, resource-tenant tuple, consumer contract](#d-208-h-lifecycles-merged-design-d-179d-186-is-received-forced-failure-overdue-owner-resource-tenant-tuple-consumer-contract)
   - [D-209 (H) Subscriptions' answers in PR #5131 are received: resubmit-then-void, no caller start instant, composition by reference](#d-209-h-subscriptions-answers-in-pr-5131-are-received-resubmit-then-void-no-caller-start-instant-composition-by-reference)
+  - [D-210 (M) Four review findings closed: receipt ordinal, publish fence at readiness, 90-day review interval, line counts](#d-210-m-four-review-findings-closed-receipt-ordinal-publish-fence-at-readiness-90-day-review-interval-line-counts)
 - [Open Questions](#open-questions)
   - [Q-01: Which durable-execution substrate backs the process — the OSS Workflow Engine or a BSS-local mechanism?](#q-01-which-durable-execution-substrate-backs-the-process--the-oss-workflow-engine-or-a-bss-local-mechanism)
   - [Q-02: The Generic Approval escalation threshold — the one PRD-deferred numeric value this design deliberately leaves unset](#q-02-the-generic-approval-escalation-threshold--the-one-prd-deferred-numeric-value-this-design-deliberately-leaves-unset)
@@ -1320,6 +1321,8 @@ the sweep the load spike it exists to recover from.
 ### D-53: A non-pausable `max_process_lifetime` of 90 days bounds every process, independently of order state
 
 **Amended by D-70 and D-82 (2026-09-24).** The lifetime ceiling is a top-level definition `wait` arm, never cancelled by a hold; on expiry it calls `raise-overdue-escalation` and `park`, and the park is allowed from `suspended`.
+
+**Amended by D-210 (2026-10-12).** The 90 days are a **mandatory human review interval**, not a maximum lifetime: the first ceiling fires 90 days after process start, and each operator unpark of a lifetime-ceiling park starts the next 90-day round (D-121). The ceiling is still never cancelled by a hold or a resume and still never terminates an order; what it bounds is how long an order can stay non-terminal without a person deciding it should continue.
 
 **Accepted.**
 
@@ -6442,6 +6445,27 @@ own ask require.
 §4.1; `design/06-saga-and-compensation.md` §3.3, §3.6, §4.6, §4.8; `UPSTREAM_REQS.md` §2.1, §4 item 21;
 D-195, D-200, D-202.
 
+### D-210 (M) Four review findings closed: receipt ordinal, publish fence at readiness, 90-day review interval, line counts
+
+**Accepted (2026-10-12).** *(answers four PR #4787 review threads; amends D-53, ADR-0011, ADR-0012, ADR-0013)*
+
+**Decision**: (1) ADR-0011's attempt-id stand-in carries the receipt ordinal the step envelope
+appends (`design/01` §3.3), so the ADR matches the normative text. (2) The publish fence is a
+readiness precondition: the gear does not report ready on the `platform` definition source unless
+the registry enforces the pre-publish validation hook or restricts publishing to the publish job's
+identity (`design/01` §3.8, ADR-0012, UPSTREAM_REQS §2.9 readiness gate); until then it runs on the
+`code` source. (3) D-53's 90 days are a mandatory human review interval: each unpark of a
+lifetime-ceiling park starts the next 90-day round (D-121), as the design already does; the ceiling
+never terminates an order. (4) ADR-0013's never-cross list says "line items", completing the strike
+of "line counts" that its residual note and D-131 record.
+
+**Rationale**: each was a document disagreeing with the normative design or with itself; only (2)
+adds a requirement, and it closes a window in which an unvalidated definition could be published
+while the gear reports ready.
+
+**Propagated**: `ADR/0011`, `ADR/0012`, `ADR/0013` (amendment notes); `design/01-foundation.md` §3.8;
+`design/08-hold-and-cancel.md` §2.2; `UPSTREAM_REQS.md` §2.9; D-53.
+
 ## Open Questions
 
 ### Q-01: Which durable-execution substrate backs the process — the OSS Workflow Engine or a BSS-local mechanism?
@@ -6789,6 +6813,7 @@ register relies on is cited to a serverless-runtime file and line or registered 
 | D-207 | cross-cutting (customization scope, 2026-10-05) | `PRD.md` §5.3, §12; `UPSTREAM_REQS.md` §2.9, §4 |
 | D-208 | cross-cutting (Lifecycle D-179…D-186 received, 2026-10-05) | `PRD.md` §6.1, §6.3, §12; `design/02`, `design/06`, `design/10`; `UPSTREAM_REQS.md` §2.1, §2.4, §4 |
 | D-209 | 05 Provisioning intents, 06 Saga (Subscriptions #5131 received, 2026-10-12) | `PRD.md` §6.3, §9.2, §13; `design/05`, `design/06`; `UPSTREAM_REQS.md` §2.1, §4 |
+| D-210 | cross-cutting (review findings, 2026-10-12) | `ADR/0011`, `ADR/0012`, `ADR/0013`; `design/01`, `design/08`; `UPSTREAM_REQS.md` §2.9 |
 | D-200–D-205 | cross-cutting (Seam Atlas alignment, 2026-10-02) | `UPSTREAM_REQS.md` §2.1, §2.2, §2.4, §2.5, §4; `PRD.md` §9.1, §13, §15, §16; `design/05` §3.3; `design/06` §4.8 |
 | D-05–D-08 | 02 Triggers and start | `design/02-triggers-and-start.md` |
 | D-09–D-14 | 03 Approval execution | `design/03-approval-execution.md` |
@@ -6968,6 +6993,7 @@ register relies on is cited to a serverless-runtime file and line or registered 
 | D-207 | M Canonical process, four seller-policy settings; customization in owning gears; Q-10 answered; cohort binding required | `PRD.md` §5.3, §12; `UPSTREAM_REQS.md` §2.9, §4 item 19 |
 | D-208 | H Lifecycle D-179…D-186 received: forced-failure trigger and unwind, overdue owner, resource-tenant tuple, consumer contract and corpus | `PRD.md` §6.1, §6.3, §12; `design/02` §4.8; `design/06` §4.9; `design/10`; `UPSTREAM_REQS.md` §2.1, §2.4, §4 item 20 |
 | D-209 | H Subscriptions #5131 received: resubmit-then-void replaces `settle_create`, no caller start instant, composition by reference, withdrawal, `order_compensation` | `PRD.md` §6.3, §9.2, §13; `design/05`; `design/06`; `UPSTREAM_REQS.md` §2.1, §4 item 21 |
+| D-210 | M Receipt ordinal in ADR-0011; publish fence at readiness; D-53 as a 90-day review interval; ADR-0013 line counts | `ADR/0011`–`0013`; `design/01` §3.8; `design/08` §2.2; `UPSTREAM_REQS.md` §2.9 |
 
-Highest decision number used: **D-209**; highest question number: **Q-14**. Numbering is one continuous sequence across the whole
+Highest decision number used: **D-210**; highest question number: **Q-14**. Numbering is one continuous sequence across the whole
 register; there are no parts.

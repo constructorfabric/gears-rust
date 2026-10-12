@@ -204,7 +204,8 @@ the overdue window (slice 07), which only runs once the order is in fulfillment,
 is cycling in `pending_approval`.
 
 The backstop is the unconditional **`max_process_lifetime` of 90 days** (`DECISIONS.md` D-53,
-**Accepted**), which is now the literal `P90D` `wait` of the top-level
+**Accepted**, as amended by D-210: a **mandatory human review every 90 days**, not a hard end of
+the process), which is now the literal `P90D` `wait` of the top-level
 `lifetimeCeiling` branch of
 [`10 §3.6` (a)](./10-process-definition.md#a-start-and-approval), outside every stage fork, so no
 hold arm can cancel it and no resume can re-arm it; on completion the definition enters the
@@ -212,7 +213,10 @@ ceiling stage of [`10 §3.6` (d)](./10-process-definition.md#d-cancel), which ca
 `raise-overdue-escalation` with `escalationKind: lifetime-ceiling` and `park` with
 `parkReason: lifetime-ceiling` ([`01 §4.2`](./01-foundation.md#42-five-distinct-bounds-two-owners)).
 After an operator unpark the process resumes the stage and checkpoint the ceiling interrupted
-under a fresh `P90D` ceiling of the re-entered `lifetime` fork. A ceiling that fires during an
+under a fresh `P90D` ceiling of the re-entered `lifetime` fork: each unpark is the operator's
+recorded decision to continue, and it starts the next 90-day review round (D-121), so an order
+non-terminal for longer is reviewed by a person at least once per quarter rather than ended by a
+timer (D-210). A ceiling that fires during an
 unwind does not park (there is no `compensating → parked` edge, `01 §3.7`); the unwind continues
 under the fresh ceiling.
 There is deliberately **no cap on the number of hold/resume cycles** and no cap on total held

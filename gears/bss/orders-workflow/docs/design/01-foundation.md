@@ -2314,7 +2314,13 @@ deployable, and it hosts no workflow worker — the definition runs on the platf
 plugin workers ([serverless-runtime DESIGN §1.4.4](../../../../serverless-runtime/docs/DESIGN.md#144-gear-lifecycle)).
 **Readiness** of this gear now includes the platform engine: the gear **MUST NOT** report ready
 until the registered definition version it expects to bind new instances to resolves in the
-platform function registry and the platform invocation API answers; while the platform has no
+platform function registry and the platform invocation API answers, **and** the registry enforces
+the publish fence: either the pre-publish validation hook calls this gear's rules before a version
+of `order_process` is published, or publishing and the `deprecate`, `disable`, `archive` and
+`delete` transitions are restricted to the identity of this gear's definition publish job
+(`../UPSTREAM_REQS.md` §2.9 `…-upreq-serverless-runtime-definition-versioning-validation-hook`
+items (1) and (5); ADR-0012; decision D-210) — without one of them a version the job did not
+validate could be published and only the run-time guards would catch it; while the platform has no
 code (`10 §1`), that check is the readiness gate ADR-0011 names, and the gear is not ready for the
 `platform` definition source. The operation registry load (§3.7 `owf_step_operation`), GTS type
 registration (§3.4), the topic instance of §4.7 and the producer registration remain readiness preconditions, and so does the

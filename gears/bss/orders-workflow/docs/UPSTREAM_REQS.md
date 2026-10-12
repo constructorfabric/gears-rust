@@ -972,7 +972,10 @@ readiness (`design/01-foundation.md` §3.8, D-192).
 serverless-runtime **MUST** deliver its host, the Function Registry, the Invocation and Event
 Trigger APIs and the Temporal plugin to a state this gear can report ready against: the registered
 definition version this gear binds new instances to resolves in the registry and the invocation
-API answers (`design/01-foundation.md` §3.8). The suspension window is not asked: the Workflow
+API answers (`design/01-foundation.md` §3.8), and the registry enforces the publish fence — the
+pre-publish validation hook or the restriction of publishing to this gear's publish job, items (1)
+and (5) of `…-upreq-serverless-runtime-definition-versioning-validation-hook` (D-210). The
+suspension window is not asked: the Workflow
 callable declares `workflow_traits.max_suspension_days: 90` (`design/10-process-definition.md`
 §3.1), the required field of the platform schema whose default is 30
 ([DESIGN_GTS_SCHEMAS.md](../../../serverless-runtime/docs/DESIGN_GTS_SCHEMAS.md) lines 520–529),

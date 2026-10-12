@@ -133,6 +133,10 @@ and audit grade. Concretely:
   > **Amended 2026-09-26 by D-102**: the platform asserts no `attempt_id` on the call today, so
   > `owf_step_log` records the definition-derived stand-in `$workflow.id + ":" + $task.reference`
   > until it does, which is an upstream ask (`design/01-foundation.md` §3.3 *Attempt identity*).
+  > **Amended 2026-10-12 by D-210**: the step envelope appends the key's receipt ordinal
+  > (`owf_step_log.receipt_ordinal`) to that stand-in, because one task can produce several receipts
+  > under one key; the recorded value is `$workflow.id + ":" + $task.reference + ":" + receipt_ordinal`
+  > (`design/01-foundation.md` §3.3 *Attempt identity*, §3.7).
 * **Timers, retry policy, waits and signals are the platform's.** `owf_durable_timer`,
   `owf_retry_state` and slice 08's `owf_timer_pause` are removed. The per-task retry policy (the
   DSL's `use.retries` policy referenced from a `try`'s `catch.retry`, Serverless Workflow DSL

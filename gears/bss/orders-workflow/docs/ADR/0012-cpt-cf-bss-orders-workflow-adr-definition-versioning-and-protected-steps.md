@@ -215,6 +215,11 @@ rather than one task, fails closed before a definition can be executed, and stil
   DESIGN.md line 762) and is raised as an upstream ask — and (b) in a CI conformance test in this
   gear's repository over the canonical definitions that `design/10-process-definition.md` names.
   Until (a) exists, (b) plus the publish role below is the fence at publish time.
+
+  > **Amended 2026-10-12 by D-210**: that interim fence is now a readiness precondition. The gear
+  > does not report ready on the `platform` definition source unless the registry enforces either
+  > (a) or the restriction of publishing to the publish job's identity (`design/01-foundation.md`
+  > §3.8); until then it runs on the `code` source.
 * **Run-time guards inside protected operations, regardless of the fence.** Every `protected`
   operation checks its own precondition in this gear's record before acting and refuses with a
   catalogue reason if it does not hold — `dispatch-wave2-activate` refuses without a frozen plan
