@@ -7,6 +7,7 @@
 //! any drift between a row's event declaration and the event's declared source rows. An edge
 //! that is not a row cannot be taken; the engine never infers one.
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use toolkit_macros::domain_model;
 
 use bss_orders_lifecycle_sdk::catalog::{EventKind, OrderState, Trigger};
 use serde::de::DeserializeOwned;
@@ -14,6 +15,7 @@ use serde::de::DeserializeOwned;
 use super::idempotency::WORKFLOW_CLASS;
 
 /// Versioning behaviour of a row (§4.3): `append` rows create a commercial version.
+#[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Versioning {
     Append,
@@ -23,6 +25,7 @@ pub enum Versioning {
 /// Declared actor class of a row. `Authorized` rows are governed by the permission matrix
 /// alone; the actor class grants nothing (08 §4.3) but a declared class must match the
 /// configured identity of the caller (rows 6 and 24 `system`, rows 28 and 29 `user`).
+#[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ActorRule {
     Authorized,
@@ -32,6 +35,7 @@ pub enum ActorRule {
 
 /// Target of a row: a fixed state, the outgoing state (self-loop), or the stored pre-hold state
 /// (row 22 only).
+#[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Target {
     State(OrderState),
@@ -40,6 +44,7 @@ pub enum Target {
 }
 
 /// Source-row number, 1..=29.
+#[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RowId(u8);
 impl RowId {
@@ -60,6 +65,7 @@ impl std::fmt::Display for RowId {
 }
 
 /// One declared row, in registered tokens. `from` is empty only for create (from nothing).
+#[domain_model]
 #[derive(Debug, Clone, Copy)]
 pub struct RowDecl {
     pub row: u8,
@@ -380,6 +386,7 @@ pub const FORBIDDEN_EDGES: [(&str, &str); 4] = [
 ];
 
 /// A compiled, validated row.
+#[domain_model]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Row {
     pub id: RowId,
@@ -413,6 +420,7 @@ impl Row {
 }
 
 /// Startup rejection of an invalid declaration set.
+#[domain_model]
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum TableError {
     #[error("row numbers must be exactly 1..=29 in order (found {0})")]
@@ -443,6 +451,7 @@ pub enum TableError {
 }
 
 /// The compiled state table and its expanded lookup keys.
+#[domain_model]
 #[derive(Debug, Clone)]
 pub struct StateTable {
     rows: Vec<Row>,

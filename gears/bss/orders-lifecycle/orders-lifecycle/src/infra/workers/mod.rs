@@ -192,23 +192,16 @@ impl ExecutionRecovery for RecoveryUnavailable {
 /// The last pass result per worker (readiness detail and tests); metrics carry the history.
 #[derive(Debug, Default)]
 pub struct WorkerStatus {
-    last: std::sync::Mutex<std::collections::HashMap<WorkerKind, PassResult>>,
+    last: parking_lot::Mutex<std::collections::HashMap<WorkerKind, PassResult>>,
 }
 impl WorkerStatus {
     fn record(&self, kind: WorkerKind, result: PassResult) {
-        self.last
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(kind, result);
+        self.last.lock().insert(kind, result);
     }
     /// The last result of one worker, if it has run.
     #[must_use]
     pub fn last(&self, kind: WorkerKind) -> Option<PassResult> {
-        self.last
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&kind)
-            .copied()
+        self.last.lock().get(&kind).copied()
     }
 }
 

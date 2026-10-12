@@ -803,7 +803,7 @@ impl Engine {
         let lease = inner.lease;
         let presented = request.execution;
         let expected_version = request.expected_version;
-        let started = Arc::new(std::sync::Mutex::new(Some(start)));
+        let started = Arc::new(parking_lot::Mutex::new(Some(start)));
         let (tgt, k, f, p) = (target.clone(), key.clone(), fingerprint.clone(), principal);
         let (who, trigger, correlation) = (caller.clone(), request.trigger, request.correlation_id);
         let outcome = inner
@@ -864,7 +864,6 @@ impl Engine {
                     }
                     let start = started
                         .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .take()
                         .ok_or(Abort::Integration("durable start consumed"))?;
                     let (execution, frozen) = match start {

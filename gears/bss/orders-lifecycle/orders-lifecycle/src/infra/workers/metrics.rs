@@ -2,7 +2,7 @@
 //! purge/cleanup counts and backlogs, recovery backlog, integrity findings, checkpoint and
 //! verification coverage ages. Instruments live on the process meter under
 //! `bss-orders-lifecycle`; the trait keeps the passes testable with a recording sink.
-use std::sync::Mutex;
+use parking_lot::Mutex;
 use std::time::Duration;
 
 use opentelemetry::KeyValue;
@@ -485,16 +485,10 @@ impl RecordingMetrics {
     /// Never: the lock is only poisoned by a panicking recorder.
     #[must_use]
     pub fn observations(&self) -> Vec<Observation> {
-        self.observations
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
+        self.observations.lock().clone()
     }
     fn record(&self, observation: Observation) {
-        self.observations
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(observation);
+        self.observations.lock().push(observation);
     }
 }
 impl WorkerMetrics for RecordingMetrics {

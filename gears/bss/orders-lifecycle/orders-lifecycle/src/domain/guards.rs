@@ -15,6 +15,7 @@
 //! declaration together with its contract, never around the engine.
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
+use toolkit_macros::domain_model;
 
 use bss_orders_lifecycle_sdk::catalog::Reason;
 use serde::de::DeserializeOwned;
@@ -23,6 +24,7 @@ use super::state_table::{RowId, StateTable};
 
 /// An external guard input resolved before the transaction (Foundation §3.6 step 2), with the
 /// registered reasons its unavailability may carry (step 3).
+#[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum InputPort {
     /// Identity operation: tenant-axis validity and the payer's commercial profile (03 step 2).
@@ -63,6 +65,7 @@ impl InputPort {
 }
 
 /// One declared guard: unique name, owning package, rows, refusal reasons (tokens) and inputs.
+#[domain_model]
 #[derive(Debug, Clone, Copy)]
 pub struct GuardDecl {
     pub name: &'static str,
@@ -494,6 +497,7 @@ pub const NON_GUARD_REASONS: [Reason; 14] = [
 pub const PREVIEW_ONLY_REASONS: [Reason; 1] = [Reason::IndicativeTaxUnavailable];
 
 /// A compiled guard specification.
+#[domain_model]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GuardSpec {
     pub name: &'static str,
@@ -513,6 +517,7 @@ impl GuardSpec {
     }
 }
 
+#[domain_model]
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum GuardRegistryError {
     #[error("guard `{0}` is declared twice")]
@@ -536,6 +541,7 @@ pub enum GuardRegistryError {
 }
 
 /// Compiled per-row guard sets in registration order.
+#[domain_model]
 #[derive(Debug, Clone)]
 pub struct GuardRegistry {
     by_row: BTreeMap<RowId, Vec<Arc<GuardSpec>>>,

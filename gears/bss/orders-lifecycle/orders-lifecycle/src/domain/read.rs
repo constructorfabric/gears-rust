@@ -14,6 +14,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use bss_orders_lifecycle_sdk::catalog::Reason;
 use bss_orders_lifecycle_sdk::reads::{Cursor, OrderFilters, PageSize};
 use serde::{Deserialize, Serialize};
+use toolkit_macros::domain_model;
 use toolkit_security::access_scope::{AccessScope, ScopeFilter, ScopeValue};
 use uuid::Uuid;
 
@@ -21,6 +22,7 @@ use uuid::Uuid;
 const CURSOR_VERSION: u8 = 1;
 
 /// The paged collections delivered by the early S6-01 subset, each with its immutable sort.
+#[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Collection {
@@ -55,6 +57,7 @@ pub const GET_OPERATION: &str = "get";
 /// The keyset position of the last returned row: its creation instant in microseconds since
 /// the Unix epoch (the stored `timestamptz` precision, preserved exactly) and its identity
 /// tiebreaker (binary UUID order).
+#[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Position {
@@ -84,6 +87,7 @@ impl Position {
 }
 
 /// A pure-rule failure.
+#[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum ReadRuleError {
     /// The token fails §2.2's structure, version, precision or request binding (D-139).
@@ -96,6 +100,7 @@ pub enum ReadRuleError {
 
 /// What a token binds to (08 §2.2): the endpoint, the parent order where the collection has one,
 /// the authenticated principal and tenant, the normalized filters and the sort.
+#[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CursorBinding<'a> {
     pub collection: Collection,
@@ -255,6 +260,7 @@ pub fn confined_to_subject(scope: &AccessScope, subject_tenant_id: Uuid) -> bool
 }
 
 /// The served-log decision of 08 §4.4.
+#[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServedLog {
     /// Append a served row before disclosure; its failure is `read-store-unavailable`.
@@ -291,6 +297,7 @@ pub fn collection_log(proof_supplied: bool, confined: bool) -> ServedLog {
 }
 
 /// The outcome column of an access-log row.
+#[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AccessOutcome {
     Served,
@@ -308,6 +315,7 @@ impl AccessOutcome {
 
 /// A refused row's reason columns: the public reason and, for a targeted delegation-proof
 /// denial hidden behind `order-not-found`, the operational-only classified detail (D-141).
+#[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Refusal {
     pub reason: Reason,
@@ -330,6 +338,7 @@ impl Refusal {
 
 /// The requested and resolved target columns of an order-scoped row (08 §3.7): the requested
 /// identifier is always kept; the foreign-key column is set only where the aggregate exists.
+#[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Target {
     pub requested_order_ref: Uuid,

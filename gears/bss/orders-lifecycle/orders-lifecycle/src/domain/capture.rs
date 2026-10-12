@@ -5,6 +5,7 @@
 //! price or total (02 §4.1); its only guards are the structural ones below, which the engine runs
 //! in registration order after authorization, idempotency, admissibility and both revisions.
 use std::sync::Arc;
+use toolkit_macros::domain_model;
 
 use bss_orders_lifecycle_sdk::authoring::{
     AuthoredTerm, BillingCycle, Category, HeaderPatch, LinePatch,
@@ -113,6 +114,7 @@ pub fn check_wire_classification(fields: &FieldClassification) -> Result<(), Str
 }
 
 /// One working-set member as the coherent draft snapshot holds it.
+#[domain_model]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkingMember {
     pub line_id: Uuid,
@@ -122,6 +124,7 @@ pub struct WorkingMember {
 /// The facts the row-2 capture guards decide on: the request's own classification facts and the
 /// coherent draft snapshot the engine verifies against its lock (prepared revision = locked
 /// revision, OL-4), so the snapshot is the locked working set when the guards run.
+#[domain_model]
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(
     clippy::struct_excessive_bools,

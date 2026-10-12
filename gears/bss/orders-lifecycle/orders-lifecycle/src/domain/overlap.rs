@@ -9,6 +9,7 @@
 //! count or enforce Subscriptions' configurable concurrent-subscription cardinality (§6.1(f),
 //! predicate 7) and never hold, release or reconcile receiver capacity (D-182, D-198).
 use std::collections::BTreeSet;
+use toolkit_macros::domain_model;
 
 use bss_orders_lifecycle_sdk::catalog::{OrderState, Reason, Trigger};
 use uuid::Uuid;
@@ -30,6 +31,7 @@ pub fn is_terminal(state: OrderState) -> bool {
 /// The only rows whose contribution carries resolved overlap keys (step 17.2).
 pub const ACQUIRING_TRIGGERS: [Trigger; 2] = [Trigger::Submit, Trigger::Amendment];
 
+#[domain_model]
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ClaimRuleError {
     #[error("overlap scope key must be non-empty owner text without NUL")]
@@ -51,6 +53,7 @@ pub enum ClaimRuleError {
 /// Stored exactly as received: no trimming, case folding or derivation. Only values
 /// PostgreSQL `text` cannot hold, or an empty key that would never identify a product, are
 /// refused before they reach storage.
+#[domain_model]
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct OverlapScopeKey(String);
 impl OverlapScopeKey {
@@ -72,6 +75,7 @@ impl TryFrom<String> for OverlapScopeKey {
 /// Full claim identity. Field order makes the derived `Ord` the normative total order: payer
 /// UUID bytes, then resource-tenant UUID bytes, then overlap-key bytes (`Uuid` compares its 16
 /// bytes; `String` compares UTF-8 bytes, independent of any database collation).
+#[domain_model]
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ClaimTuple {
     pub payer_tenant_id: Uuid,
@@ -81,6 +85,7 @@ pub struct ClaimTuple {
 
 /// Distinct proposed tuples of one submit/amendment: the proposed version's payer and the
 /// order's own resource tenant (D-179). Duplicate line keys collapse to one offered claim.
+#[domain_model]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProposedClaims {
     payer_tenant_id: Uuid,
@@ -127,6 +132,7 @@ impl ProposedClaims {
 }
 
 /// What step 17 does for one transition.
+#[domain_model]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClaimDirective {
     /// 17.1: the effective target is terminal; release every live claim of this order.
@@ -169,6 +175,7 @@ impl ClaimDirective {
 }
 
 /// One live claim this order holds on entry.
+#[domain_model]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HeldClaim {
     pub claim_id: Uuid,
@@ -176,6 +183,7 @@ pub struct HeldClaim {
 }
 
 /// Step 17.3 partition of held versus proposed full tuples.
+#[domain_model]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClaimPlan {
     /// Held tuples that are also proposed; never re-offered.
@@ -221,6 +229,7 @@ pub fn plan(held: &[HeldClaim], proposed: &ProposedClaims) -> Result<ClaimPlan, 
 
 /// A missing tuple another order holds live. `visible_holder` names that order only when the
 /// caller's read scope can see it (D-179: never name an order the caller cannot read).
+#[domain_model]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlockedTuple {
     pub tuple: ClaimTuple,
@@ -229,6 +238,7 @@ pub struct BlockedTuple {
 
 /// Authoritative step-17.5 collision. Provisional claims are already released by exact ID and
 /// every claim held on entry is unchanged.
+#[domain_model]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OverlapConflict {
     /// Blocked tuples in the normative total order (never empty).
@@ -255,6 +265,7 @@ impl OverlapConflict {
 /// Authoritative predicate-9 verdict the Stage 3 diagnostic writer persists in place of the
 /// advisory pre-check. Gate-outcome row construction (run metadata, mapping version) remains
 /// the Stage 3 assessment owner's; S2-07 supplies only the authoritative replacement.
+#[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PredicateNineReplacement<'a> {
     pub reason: Reason,
@@ -262,6 +273,7 @@ pub struct PredicateNineReplacement<'a> {
 }
 
 /// Committed result of a newly acquired claim.
+#[domain_model]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AcquiredClaim {
     pub claim_id: Uuid,
@@ -269,6 +281,7 @@ pub struct AcquiredClaim {
 }
 
 /// Step-17 outcome. Every variant except `Conflict` continues to step 18.
+#[domain_model]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClaimOutcome {
     /// 17.1: these live claims were released at database time.

@@ -6,6 +6,7 @@
 //! the row and the contribution, and refuses a contribution the row does not declare. The
 //! transaction adapter persists exactly the planned post-state under the aggregate lock.
 use std::collections::{BTreeMap, BTreeSet};
+use toolkit_macros::domain_model;
 
 use bss_orders_lifecycle_sdk::catalog::{OrderState, Trigger};
 use serde_json::Value;
@@ -19,6 +20,7 @@ use super::state_table::{Row, RowId, is_terminal};
 // Field classification (D-62, D-118, D-119, D-145)
 
 /// The class of one authored field. Every authored field has exactly one.
+#[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum FieldClass {
     /// Immutable from `submitted`; a change appends a version and re-runs the gate.
@@ -30,6 +32,7 @@ pub enum FieldClass {
 }
 
 /// Where an authored field lives.
+#[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum FieldScope {
     Order,
@@ -95,6 +98,7 @@ pub const FIELD_CLASSES: &[(FieldScope, &str, FieldClass)] = &[
     (FieldScope::Line, "internal_notes", Administrative),
 ];
 
+#[domain_model]
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum FieldClassError {
     #[error("authored field {0:?}/{1} is unclassified")]
@@ -108,12 +112,14 @@ pub enum FieldClassError {
 }
 
 /// The compiled classification.
+#[domain_model]
 #[derive(Debug, Clone)]
 pub struct FieldClassification {
     classes: BTreeMap<(FieldScope, &'static str), FieldClass>,
 }
 
 /// What a request's named fields select (one request, one trigger).
+#[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Selection {
     pub trigger: Trigger,
@@ -197,6 +203,7 @@ impl FieldClassification {
 // Locked aggregate facts and contributions
 
 /// The aggregate's business facts as read under the row lock (never caller input).
+#[domain_model]
 #[derive(Debug, Clone, PartialEq)]
 pub struct AggregateFacts {
     pub order_id: Uuid,
@@ -221,6 +228,7 @@ pub struct AggregateFacts {
 }
 
 /// The proposed commercial version of a versioning row (D-188 reserved candidate).
+#[domain_model]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VersionContribution {
     /// The candidate reserved by the D-188 attempt; never `current + 1` by assumption.
@@ -238,6 +246,7 @@ pub struct VersionContribution {
 /// writes them to the aggregate under its lock"). The resource/payer axes travel separately as the
 /// PEP-authorized proposed arrangement (08 §4.3) and the seller never changes (D-119). `None`
 /// leaves a value as locked; `Some(None)` clears the nullable contract reference.
+#[domain_model]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DraftHeaderEdit {
     pub category: Option<String>,
@@ -259,6 +268,7 @@ impl DraftHeaderEdit {
 /// The aggregate contribution a row declares (Foundation *Step 19 aggregate contribution
 /// mapping*). Child documents (lines, totals, acceptance, reflections, grants, gate outcomes,
 /// admin rows) travel separately through the engine's child-document writer.
+#[domain_model]
 #[derive(Debug, Clone, PartialEq)]
 pub enum AggregateContribution {
     /// Rows without an aggregate field contribution.
@@ -280,6 +290,7 @@ pub enum AggregateContribution {
 }
 
 /// The contribution kind each row declares (step 19 mapping); every other row declares none.
+#[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContributionKind {
     None,
@@ -321,6 +332,7 @@ pub fn declared_kind(row: RowId) -> ContributionKind {
 
 /// Contract violation between a row and its contribution: an infrastructure abort, never a
 /// business refusal.
+#[domain_model]
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ContributionError {
     #[error("{0} requires a different aggregate contribution")]
@@ -338,6 +350,7 @@ pub enum ContributionError {
 }
 
 /// How the transition treats `pre_hold_state` (§3.6 step 20.2-20.3).
+#[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PreHold {
     Keep,
@@ -346,6 +359,7 @@ pub enum PreHold {
 }
 
 /// The complete planned aggregate change (steps 14-21; step 19's field mapping).
+#[domain_model]
 #[derive(Debug, Clone, PartialEq)]
 #[expect(
     clippy::struct_excessive_bools,

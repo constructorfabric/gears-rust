@@ -6,6 +6,7 @@
 //! UTC date, and validates that basis against the engine's single transition timestamp. Nothing
 //! here reads current policy for an admitted line: its stored triple and snapshot are final.
 use std::collections::BTreeMap;
+use toolkit_macros::domain_model;
 
 use bss_orders_lifecycle_sdk::authoring::CalendarDate;
 use bss_orders_lifecycle_sdk::catalog::Reason;
@@ -20,6 +21,7 @@ use super::transition::{GuardSubject, GuardVerdict};
 pub const PLATFORM_DEFAULT_POLICY_ID: Uuid = Uuid::from_u128(0x121);
 
 /// Which row governed a snapshot: the resource tenant's own row or the platform default.
+#[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PolicyScope {
@@ -28,6 +30,7 @@ pub enum PolicyScope {
 }
 
 /// One stored `orders_date_policy` row, as read (storage-neutral).
+#[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PolicyRow {
     pub policy_id: Uuid,
@@ -39,6 +42,7 @@ pub struct PolicyRow {
 
 /// Why no effective policy could be snapshotted. Either fails the date guard; neither invents
 /// permissive switches (02 §4.2).
+#[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum PolicyFault {
     #[error("the platform default date policy is missing")]
@@ -49,6 +53,7 @@ pub enum PolicyFault {
 
 /// The effective policy snapshot (D-121): both switches, the source row's scope and identity
 /// and its revision. Stored verbatim as `orders_order_line.date_policy_switch_state`.
+#[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DatePolicySnapshot {
@@ -133,6 +138,7 @@ impl DatePolicySnapshot {
 
 /// One line's three calendar fields as supplied: authored draft values, or for an amendment the
 /// carried-forward resolved values, which remain values unless the delta changes them (02 §4.2).
+#[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct SuppliedDates {
     pub contract_effective: Option<Date>,
@@ -141,6 +147,7 @@ pub struct SuppliedDates {
 }
 
 /// One of the three line date fields.
+#[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DateField {
@@ -150,6 +157,7 @@ pub enum DateField {
 }
 
 /// Where a resolved value came from. Only `TransitionDate` depends on the proposed UTC date.
+#[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DateSource {
@@ -162,6 +170,7 @@ pub enum DateSource {
 }
 
 /// A resolved field: its value and origin.
+#[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ResolvedDate {
@@ -178,6 +187,7 @@ impl ResolvedDate {
 /// A line's resolved triple. The acceptance due date is a calendar field, never recorded assent,
 /// and the service-activation date carries no billing implication (02 §4.2): neither converts to
 /// anything else here.
+#[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LineDates {
@@ -196,6 +206,7 @@ impl LineDates {
 
 /// One line's cascade outcome: the resolved triple, or every policy-required field that was not
 /// supplied. A default never satisfies a requirement.
+#[domain_model]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "outcome")]
 pub enum LineResolution {
@@ -270,6 +281,7 @@ pub fn utc_date(instant: OffsetDateTime) -> Date {
 /// proposed UTC date chosen before any date-dependent external call and every line's cascade.
 /// Dependent predicates and evaluations receive exactly these dates; the engine validates the
 /// proposed date against its transition timestamp; admission stores the triple and snapshot.
+#[domain_model]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DateBasis {
@@ -284,6 +296,7 @@ pub struct DateBasis {
 }
 
 /// A frozen basis that does not decode or is internally inconsistent.
+#[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[error("the frozen date basis is invalid")]
 pub struct InvalidBasis;

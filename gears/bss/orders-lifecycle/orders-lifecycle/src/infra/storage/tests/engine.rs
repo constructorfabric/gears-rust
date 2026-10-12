@@ -1441,17 +1441,17 @@ struct FailAt {
     kill_before_commit: Option<(DatabaseConnection, Uuid)>,
     hits: AtomicUsize,
     /// Every boundary the attempt reached, in order: nothing may follow the injected one.
-    visited: std::sync::Mutex<Vec<FaultPoint>>,
+    visited: parking_lot::Mutex<Vec<FaultPoint>>,
 }
 impl FailAt {
     fn visited(&self) -> Vec<FaultPoint> {
-        self.visited.lock().unwrap().clone()
+        self.visited.lock().clone()
     }
 }
 #[async_trait]
 impl FaultHook for FailAt {
     async fn at(&self, point: FaultPoint, tx: &DbTx<'_>) -> Result<(), Abort> {
-        self.visited.lock().unwrap().push(point);
+        self.visited.lock().push(point);
         if point != self.point {
             return Ok(());
         }
@@ -1473,7 +1473,7 @@ fn fail_at(point: FaultPoint) -> Arc<FailAt> {
         point,
         kill_before_commit: None,
         hits: AtomicUsize::new(0),
-        visited: std::sync::Mutex::new(Vec::new()),
+        visited: parking_lot::Mutex::new(Vec::new()),
     })
 }
 
@@ -1712,7 +1712,7 @@ async fn commit_rejection_is_internal_and_a_lost_acknowledgement_is_unknown() {
         point: FaultPoint::Settle,
         kill_before_commit: Some((t.env.pg.raw.clone(), order2)),
         hits: AtomicUsize::new(0),
-        visited: std::sync::Mutex::new(Vec::new()),
+        visited: parking_lot::Mutex::new(Vec::new()),
     });
     let engine = t.engine(&[]);
     let err = engine

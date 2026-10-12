@@ -11,9 +11,10 @@
 //! (`gears/bss/pricing/pricing/src/infra/events.rs`, D-455), without its interim holding queue:
 //! an [`EventSink`] exists only once the real producer is bound ([`super::broker`]).
 use event_broker_sdk::{EventBrokerError, ProducerOutbox};
+use parking_lot::Mutex;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::Arc;
 use toolkit_db::outbox::Wake;
 use toolkit_db::secure::TxConfig;
 
@@ -161,8 +162,8 @@ impl TxEvents {
             pending: Arc::new(Mutex::new(Pending::default())),
         }
     }
-    fn lock(&self) -> std::sync::MutexGuard<'_, Pending> {
-        self.pending.lock().unwrap_or_else(PoisonError::into_inner)
+    fn lock(&self) -> parking_lot::MutexGuard<'_, Pending> {
+        self.pending.lock()
     }
     fn take(&self) -> Option<Wake> {
         let mut pending = self.lock();

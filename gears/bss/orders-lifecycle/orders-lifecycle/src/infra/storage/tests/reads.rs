@@ -245,23 +245,23 @@ fn instant(value: &Value) -> time::OffsetDateTime {
 /// actually raised its instrument.
 #[derive(Default)]
 struct RecordingSignals {
-    log_failures: std::sync::Mutex<Vec<AccessOutcome>>,
-    refusals: std::sync::Mutex<Vec<(Reason, Option<ProofDenial>)>>,
+    log_failures: parking_lot::Mutex<Vec<AccessOutcome>>,
+    refusals: parking_lot::Mutex<Vec<(Reason, Option<ProofDenial>)>>,
 }
 impl RecordingSignals {
     fn log_failures(&self) -> Vec<AccessOutcome> {
-        self.log_failures.lock().unwrap().clone()
+        self.log_failures.lock().clone()
     }
     fn refusals(&self) -> Vec<(Reason, Option<ProofDenial>)> {
-        self.refusals.lock().unwrap().clone()
+        self.refusals.lock().clone()
     }
 }
 impl ReadSignals for RecordingSignals {
     fn access_log_write_failed(&self, outcome: AccessOutcome) {
-        self.log_failures.lock().unwrap().push(outcome);
+        self.log_failures.lock().push(outcome);
     }
     fn refused(&self, reason: Reason, proof: Option<ProofDenial>) {
-        self.refusals.lock().unwrap().push((reason, proof));
+        self.refusals.lock().push((reason, proof));
     }
 }
 fn list_all() -> ListOrders {

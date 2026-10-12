@@ -12,6 +12,7 @@ use bss_orders_lifecycle_sdk::catalog::{OrderState, Reason, Trigger};
 use bss_orders_lifecycle_sdk::models::{DelegationProofRef, IdempotencyKey};
 use serde_json::Value;
 use time::OffsetDateTime;
+use toolkit_macros::domain_model;
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
@@ -39,6 +40,7 @@ const REFUSED: &str = "refused";
 const FORCE_FAIL_TRIGGER: &str = "force-fail-unreconciled";
 
 /// Audit row encoding version; not the order version.
+#[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HashVersion {
     /// D-99, frozen: no `caller_reason`, no observation.
@@ -81,6 +83,7 @@ impl HashVersion {
 }
 
 /// Encoding, shape or minimization failure. A writer never stores a row that fails any of these.
+#[domain_model]
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum AuditError {
     #[error("unsupported audit hash version {0}")]
@@ -213,6 +216,7 @@ fn sha256(bytes: &[u8]) -> Digest {
 // Stored row and its encodings
 
 /// D-201 closed object `{audit_sequence, state, version}` observed under the aggregate lock.
+#[domain_model]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ForceRequestObservation {
     pub audit_sequence: i64,
@@ -261,6 +265,7 @@ impl ForceRequestObservation {
 ///
 /// The encoder destructures this record exhaustively, so a new evidence field cannot silently
 /// escape integrity coverage (DESIGN §4.4, Pricing precedent).
+#[domain_model]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuditRow {
     pub hash_version: i16,
@@ -595,6 +600,7 @@ pub fn check_shape(row: &AuditRow) -> Result<(), AuditError> {
 // Verification
 
 /// Explicit verification finding; never repaired or rehashed.
+#[domain_model]
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum VerifyError {
     #[error("audit {audit_id}: unsupported hash version {version}")]
@@ -638,6 +644,7 @@ pub fn verify_entry(row: &AuditRow, stored_entry_hash: &[u8]) -> Result<Digest, 
 }
 
 /// Verified committed chain position.
+#[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ChainHead {
     pub sequence: i64,
@@ -648,6 +655,7 @@ pub struct ChainHead {
 ///
 /// The namespace comes from the immutable aggregate field, never today's resource tenant.
 /// Refusals are outside the committed chain and are not accepted here.
+#[domain_model]
 #[derive(Debug, Clone)]
 pub struct ChainVerifier {
     audit_tenant_id: Uuid,
@@ -719,6 +727,7 @@ impl ChainVerifier {
 // Checkpoint roll-up encoding (D-100). The checkpoint worker and its reconciliation are S2-11.
 
 /// One checkpoint header as stored (`checkpoint_hash` excluded).
+#[domain_model]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CheckpointHeader {
     pub format_version: i16,
@@ -729,6 +738,7 @@ pub struct CheckpointHeader {
     pub prev_checkpoint_hash: Vec<u8>,
 }
 /// One expected order-chain head.
+#[domain_model]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CheckpointMember {
     pub order_id: Uuid,
@@ -807,6 +817,7 @@ pub fn checkpoint_hash(
 /// each member as it is streamed in ascending binary `order_id` order, so a namespace of any size
 /// is hashed in bounded memory. The bytes are exactly [`checkpoint_preimage`]'s; `finish`
 /// refuses a member count that differs from the header, exactly as the slice form does.
+#[domain_model]
 pub struct CheckpointDigest {
     context: digest::Context,
     expected: i64,
@@ -911,6 +922,7 @@ impl CheckpointDigest {
 // Actor identity (D-96/D-103/D-115)
 
 /// The closed actor class; grants nothing.
+#[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuditActorClass {
     /// The configured Orders worker actor.
@@ -932,6 +944,7 @@ impl AuditActorClass {
 }
 
 /// A configured service role (D-115).
+#[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ServiceRole {
@@ -941,6 +954,7 @@ pub enum ServiceRole {
 }
 
 /// An authenticated principal tuple; matched on both subject and subject tenant.
+#[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Principal {
     pub subject_id: Uuid,
@@ -949,6 +963,7 @@ pub struct Principal {
 
 /// Configured identities the actor class is derived from; never from the PDP path, the
 /// permission column or caller input.
+#[domain_model]
 #[derive(Debug, Clone)]
 pub struct ActorIdentities {
     system: Option<Principal>,
@@ -1017,6 +1032,7 @@ impl ActorIdentities {
 }
 
 /// The trusted actor of one attempt: opaque subject UUID, home tenant and class.
+#[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AuditActor {
     principal: Principal,
@@ -1110,6 +1126,7 @@ pub fn validate_caller_reason(text: &str) -> Result<(), AuditError> {
 }
 
 /// The closed administrative-field allowlist (`orders_order_admin`/`orders_order_line_admin`).
+#[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AdminAttribute {
     ExternalReference,
@@ -1171,6 +1188,7 @@ pub const MAX_ADMIN_TEXT_KEY_BYTES: usize = 1024;
 pub const MAX_ADMIN_TEXT_KEY_ID_CHARS: usize = 64;
 
 /// Why a configured administrative-text key is refused at startup. Never carries key material.
+#[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum AdminTextKeyError {
     #[error("key_id must be 1..=64 characters of ASCII letters, digits, '.', '_' or '-'")]
@@ -1181,6 +1199,7 @@ pub enum AdminTextKeyError {
 
 /// The keyed minimization secret for `display_label`/`internal_notes` (D-204, amending D-96's
 /// interim). Built once at startup from required configuration; `Debug` prints only the key ID.
+#[domain_model]
 pub struct AdminTextKey {
     key_id: String,
     key: hmac::Key,
@@ -1245,6 +1264,7 @@ pub fn minimized_text_digest(key: &AdminTextKey, value: &str) -> String {
 }
 
 /// One administrative field target.
+#[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AdminField {
     Order(AdminAttribute),
@@ -1267,6 +1287,7 @@ impl AdminField {
 }
 
 /// One changed administrative value, before minimization.
+#[domain_model]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AdminChange {
     pub field: AdminField,
@@ -1278,6 +1299,7 @@ pub struct AdminChange {
 // Writer row shapes
 
 /// The trigger recorded on an audit row: a public trigger or the D-201 internal writer token.
+#[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuditTrigger {
     Public(Trigger),
@@ -1323,6 +1345,7 @@ fn caller_reason_rule(trigger: AuditTrigger) -> Option<bool> {
 }
 
 /// Facts of the resolved aggregate, read from the locked row only.
+#[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OrderFacts {
     pub order_id: Uuid,
@@ -1337,6 +1360,7 @@ pub struct OrderFacts {
 }
 
 /// Trusted per-attempt evidence common to every row the attempt writes.
+#[domain_model]
 #[derive(Debug, Clone)]
 pub struct AttemptEvidence {
     actor: AuditActor,
@@ -1347,6 +1371,7 @@ pub struct AttemptEvidence {
 }
 
 /// A committed entry awaiting its sequence and predecessor under the aggregate lock.
+#[domain_model]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingCommitted {
     row: AuditRow,
@@ -1372,6 +1397,7 @@ impl PendingCommitted {
 }
 
 /// A complete row and the digest of exactly those values; only constructible by sealing.
+#[domain_model]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SealedAudit {
     row: AuditRow,

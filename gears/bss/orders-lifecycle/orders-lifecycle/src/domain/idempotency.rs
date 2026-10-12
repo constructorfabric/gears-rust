@@ -6,6 +6,7 @@
 //! (commercial attempts) and D-198 (staged receiver controls). Pure rules only; the locked
 //! transactional gate is `infra::storage::repo::idempotency`.
 use std::collections::BTreeMap;
+use toolkit_macros::domain_model;
 
 use bss_orders_lifecycle_sdk::catalog::{Reason, Trigger};
 use bss_orders_lifecycle_sdk::models::IdempotencyKey;
@@ -41,6 +42,7 @@ pub const REPLACE_FULFILLMENT_GRANT: &str = "replace-fulfillment-grant";
 
 /// Registry operation: the engine-entering transition the key scopes. The stored token is the
 /// trigger token, which is also the operation recorded by D-188 attempts and D-198 controls.
+#[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RegistryOperation {
     Trigger(Trigger),
@@ -82,6 +84,7 @@ pub fn trigger_token(trigger: Trigger) -> String {
     }
 }
 
+#[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RetentionClass {
     Ordinary,
@@ -99,6 +102,7 @@ impl RetentionClass {
 }
 
 /// Positive finite lease (`idempotency_lease_duration`); no implicit default.
+#[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LeaseDuration(Duration);
 impl LeaseDuration {
@@ -118,6 +122,7 @@ impl LeaseDuration {
 
 /// Stable authorized principal: the platform-asserted subject tenant and subject identifier.
 /// Never session/token/`jti`/proof/replica/transport identity (Foundation §4.2).
+#[domain_model]
 #[derive(Clone, PartialEq, Eq)]
 pub struct PrincipalScope(String);
 impl PrincipalScope {
@@ -146,6 +151,7 @@ impl std::fmt::Debug for PrincipalScope {
 }
 
 /// `(operation, principal_scope, idempotency_key)`: the complete registry identity.
+#[domain_model]
 #[derive(Clone, Debug)]
 pub struct RegistryKey {
     operation: RegistryOperation,
@@ -181,6 +187,7 @@ impl RegistryKey {
 }
 
 /// Request target: the create sentinel or a resolved order with its expected version.
+#[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FingerprintTarget {
     Create,
@@ -191,12 +198,14 @@ pub enum FingerprintTarget {
 }
 /// `expected_draft_revision` for draft writes/submit, otherwise the not-applicable sentinel
 /// (including a `draft-mutate` request that omits it, D-147).
+#[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DraftRevisionInput {
     Expected(i64),
     NotApplicable,
 }
 /// The three tenant axes in force for the request.
+#[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[expect(
     clippy::struct_field_names,
@@ -210,6 +219,7 @@ pub struct FingerprintAxes {
 
 /// Exactly the Foundation §4.2 input set. Correlation, request instant, transport headers,
 /// principal/key and server-assigned values have no field here and cannot enter the hash.
+#[domain_model]
 #[derive(Debug, Clone)]
 pub struct FingerprintInput<'a> {
     /// Public catalog operation identifier.
@@ -347,6 +357,7 @@ fn canonical(value: &Value) -> Result<String, RegistryRuleError> {
 }
 
 /// Stored as a hash, never as the payload: the registry holds no commercial content.
+#[domain_model]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Fingerprint(String);
 impl Fingerprint {
@@ -357,6 +368,7 @@ impl Fingerprint {
 }
 
 /// Persisted execution identity plus live ownership fence (D-188/D-198).
+#[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExecutionOwner {
     pub execution_id: Uuid,
@@ -378,6 +390,7 @@ pub fn next_fence(current: i64) -> Result<i64, RegistryRuleError> {
 }
 
 /// The locked record facts the gate classifies.
+#[domain_model]
 #[derive(Debug, Clone, Copy)]
 pub struct RecordView<'a> {
     pub fingerprint: &'a str,
@@ -390,6 +403,7 @@ pub struct RecordView<'a> {
 }
 
 /// Common transactional gate decision (Foundation §3.6 table), evaluated at fresh DB time.
+#[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GateDecision {
     /// Retention elapsed (and, for an in-flight record, its lease): the expired record may be
@@ -441,6 +455,7 @@ pub fn classify(
 
 /// Settled response snapshot `formatVersion = 1`: status, public body, semantic headers and
 /// the assessment result where gate evaluation was reached. Never transport credentials.
+#[domain_model]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct StoredResponse {
@@ -518,6 +533,7 @@ impl StoredResponse {
 }
 
 /// Settlement of an owned record. Only the owner may settle; the snapshot is immutable after.
+#[domain_model]
 #[derive(Debug, Clone)]
 pub enum Settlement {
     /// `order_id` is required for create and must equal the bound target otherwise.
@@ -533,6 +549,7 @@ pub enum Settlement {
     },
 }
 
+#[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum RegistryRuleError {
     #[error("idempotency lease must be a positive finite duration")]

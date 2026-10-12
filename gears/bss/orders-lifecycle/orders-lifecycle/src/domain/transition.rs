@@ -11,6 +11,7 @@
 //! registered.
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
+use toolkit_macros::domain_model;
 
 use bss_orders_lifecycle_sdk::catalog::{OrderState, Reason, Trigger};
 use time::OffsetDateTime;
@@ -21,6 +22,7 @@ use super::guards::{GuardRegistry, GuardSpec, InputPort};
 use super::state_table::{Row, StateTable, Target, is_workflow_class};
 
 /// Resolution state of one declared input (Foundation §3.6 steps 2-3; D-113).
+#[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputState {
     Resolved,
@@ -32,6 +34,7 @@ pub enum InputState {
 }
 
 /// The request's input resolutions, one per declared port of the row.
+#[domain_model]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Inputs(BTreeMap<InputPort, InputState>);
 impl Inputs {
@@ -56,6 +59,7 @@ impl Inputs {
 /// What a guard sees: the row, the locked aggregate (for create, the proposed initial facts:
 /// no aggregate exists), the single transition timestamp and the resolved inputs. The slice
 /// predicate closes over its own validated contribution.
+#[domain_model]
 pub struct GuardSubject<'a> {
     pub row: &'a Row,
     pub locked: &'a AggregateFacts,
@@ -67,6 +71,7 @@ pub struct GuardSubject<'a> {
     pub administrative: &'a [AdminChange],
 }
 
+#[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GuardVerdict {
     Pass,
@@ -87,6 +92,7 @@ where
 }
 
 /// The slice's predicates for this request, by registered guard name.
+#[domain_model]
 #[derive(Clone, Default)]
 pub struct GuardBindings(BTreeMap<&'static str, Arc<dyn GuardPredicate>>);
 impl GuardBindings {
@@ -111,6 +117,7 @@ impl std::fmt::Debug for GuardBindings {
 
 /// Client and prepared draft revisions (OL-4, D-147). Draft writes and submit carry both;
 /// every other trigger carries none.
+#[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DraftRevisions {
     NotApplicable,
@@ -123,6 +130,7 @@ pub enum DraftRevisions {
 }
 
 /// An engine-owned refusal decided before the slice guards (steps 10-12, 15).
+#[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EngineRefusal {
     /// Step 11: no row for `(state, trigger)`.
@@ -156,6 +164,7 @@ impl EngineRefusal {
 }
 
 /// Outcome of the decision procedure for an owned new execution.
+#[domain_model]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Decision<'t> {
     Engine(EngineRefusal),
@@ -177,6 +186,7 @@ pub enum Decision<'t> {
 }
 
 /// A request/registry contract violation: an infrastructure abort (fail closed).
+#[domain_model]
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum DecisionError {
     #[error("guard `{0}` has no bound predicate")]

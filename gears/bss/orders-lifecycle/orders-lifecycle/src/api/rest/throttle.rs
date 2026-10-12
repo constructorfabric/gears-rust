@@ -19,8 +19,9 @@
 //! Both are request limiters: every request to a bound operation counts, admitted or refused,
 //! so legitimate retries count too. Neither applies to the local SDK, which is in-process
 //! traffic rather than gateway traffic, nor to reads, which do not enter the engine.
+use parking_lot::Mutex;
 use std::num::NonZeroU32;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use axum::http::{HeaderValue, StatusCode, header};
@@ -211,10 +212,7 @@ impl<C: Clock> PerOrderLimiter<C> {
     /// Reclaim fully replenished keys, at most once per [`PRUNE_INTERVAL`].
     fn prune_if_due(&self) {
         let now = self.limiter.clock().now();
-        let mut last = self
-            .last_prune
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut last = self.last_prune.lock();
         let due = last.is_none_or(|at| now.duration_since(at) >= Nanos::from(PRUNE_INTERVAL));
         if due {
             *last = Some(now);
