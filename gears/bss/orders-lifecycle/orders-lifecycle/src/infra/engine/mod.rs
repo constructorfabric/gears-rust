@@ -1765,13 +1765,9 @@ async fn create_aggregate<'a>(
         return Err(Abort::Integration("create is event-less"));
     }
     let body = json_value(&created_view(&inserted)?)?;
-    let headers = BTreeMap::from([
-        ("etag".to_owned(), "\"1\"".to_owned()),
-        (
-            "location".to_owned(),
-            format!("/bss-orders-lifecycle/v1/orders/{order_id}"),
-        ),
-    ]);
+    // `Location` is not stored: only the REST adapter knows the public path (a gateway prefix
+    // included), and it adds the header to the first response and every replay alike.
+    let headers = BTreeMap::from([("etag".to_owned(), "\"1\"".to_owned())]);
     let response = StoredResponse::new(201, body, headers, None)?;
     owned
         .settle(Settlement::Success {

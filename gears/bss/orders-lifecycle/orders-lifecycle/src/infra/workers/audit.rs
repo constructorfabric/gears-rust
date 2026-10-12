@@ -708,6 +708,7 @@ pub async fn verify_slice(
                 }
                 let page = namespace_orders_page(tx, &target, next.after, limit).await?;
                 let mut orders = 0;
+                let mut last_checked = None;
                 for order in &page {
                     if cancel.is_cancelled() {
                         return Err(WorkerError::Cancelled);
@@ -722,12 +723,16 @@ pub async fn verify_slice(
                     )
                     .await?;
                     orders += 1;
+                    last_checked = Some(order.order_id);
                     if findings.len() >= MAX_FINDINGS {
                         break;
                     }
                 }
-                let completed_pass = (page.len() as u64) < limit;
-                next.after = page.last().map(|o| o.order_id);
+                // The findings bound may stop the slice mid-page: resume after the last order
+                // actually checked, and complete the pass only once its final page is covered.
+                let stopped_early = orders < page.len() as u64;
+                let completed_pass = (page.len() as u64) < limit && !stopped_early;
+                next.after = last_checked;
                 if completed_pass {
                     next = VerifyCursor {
                         after: None,

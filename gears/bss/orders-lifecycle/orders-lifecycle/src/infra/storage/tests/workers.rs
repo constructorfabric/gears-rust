@@ -1004,6 +1004,43 @@ async fn checkpoints_reconcile_namespaces_and_detect_every_tamper_and_removal_ca
     Ok(())
 }
 
+/// The findings bound stops a slice mid-page: the next slice resumes after the last order it
+/// actually checked, and the pass completes only once every order has been verified.
+#[tokio::test]
+async fn a_findings_bounded_slice_resumes_after_the_last_checked_order() -> anyhow::Result<()> {
+    let pg = Pg::new().await?;
+    let (runtime, _) = pg.role("runtime").await?;
+    for id in 1..=100 {
+        create_audited_in(&runtime, id, 10).await?;
+    }
+    // Orders 1-70 each carry one broken chain: more than the 64-finding bound of one slice.
+    privileged(&pg, &format!(
+        "UPDATE bss_orders__transition_audit SET actor='00000000-0000-0000-0000-0000000000ee' WHERE sequence=1 AND order_id BETWEEN '{}' AND '{}'",
+        u(1), u(70)
+    )).await?;
+    let connections = class_connections(&pg).await?;
+    let verifier_db = connections.get(RoleClass::Verifier).unwrap().clone();
+    let target = namespace_target(&verifier_db, 10).await?;
+    let cancel = CancellationToken::new();
+    let mut cursor = VerifyCursor::default();
+
+    let first = verify_slice(&verifier_db, &target, &mut cursor, 100, &cancel).await?;
+    assert_eq!(
+        (first.orders, first.findings.len(), first.completed_pass),
+        (64, 64, false)
+    );
+    assert!(cursor.coverage_age().is_none(), "the pass is not complete");
+
+    let second = verify_slice(&verifier_db, &target, &mut cursor, 100, &cancel).await?;
+    assert_eq!(
+        (second.orders, second.findings.len(), second.completed_pass),
+        (36, 6, true),
+        "orders 65-100 are checked, none skipped"
+    );
+    assert!(cursor.coverage_age().is_some());
+    Ok(())
+}
+
 /// Startup attestation (DESIGN "database privilege is runtime-owned"): a class connection
 /// must hold exactly its role's privileges. A connection on the wrong restricted login lacks a
 /// granted statement; a superuser connection holds an ungranted one; an unresolved secret
@@ -1052,6 +1089,28 @@ async fn privilege_census_refuses_misprovisioned_class_connections() -> anyhow::
     assert!(
         !error.contains("fixture"),
         "no credential in the message: {error}"
+    );
+    // Swapped checkpoint and verifier logins: both read the same tables, so only the append
+    // right tells them apart. Each swapped class refuses startup on its own.
+    let swapped_checkpoint =
+        std::collections::BTreeMap::from([(RoleClass::Checkpoint, dsn("test_verifier"))]);
+    let error = WorkerConnections::connect(&swapped_checkpoint, opts.clone())
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("`checkpoint`") && error.contains("lacks") && error.contains("insert"),
+        "{error}"
+    );
+    let swapped_verifier =
+        std::collections::BTreeMap::from([(RoleClass::Verifier, dsn("test_checkpoint"))]);
+    let error = WorkerConnections::connect(&swapped_verifier, opts.clone())
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("`verifier`") && error.contains("outside") && error.contains("insert"),
+        "{error}"
     );
     // Over-privileged login: the superuser as verifier can delete audit rows.
     let excess = std::collections::BTreeMap::from([(

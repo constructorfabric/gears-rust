@@ -139,6 +139,9 @@ impl<'a, T: TransactionRunner> LockedOrder<'a, T> {
             self.tx,
         )
         .await?;
+        // A moved arrangement may leave the old scope; later writes in this transaction (the
+        // audit counter) address the row through the scope that authorized its new facts.
+        self.scope = proposed_scope.clone();
         self.row = proposed;
         Ok(())
     }

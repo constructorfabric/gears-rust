@@ -13,7 +13,8 @@
 //! attested lock session (`lock_route`).
 use std::collections::BTreeMap;
 
-use sea_orm::EntityTrait;
+use sea_orm::sea_query::Expr;
+use sea_orm::{EntityTrait, QuerySelect};
 use secrecy::{ExposeSecret, SecretString};
 use toolkit_db::secure::{SecureDeleteExt, SecureEntityExt};
 use toolkit_db::{ConnectOpts, Db};
@@ -235,6 +236,8 @@ enum Probe {
     DeleteIdempotency,
     DeleteAudit,
     DeleteCheckpoint,
+    InsertCheckpoint,
+    InsertCheckpointMember,
 }
 impl Probe {
     fn name(self) -> &'static str {
@@ -247,6 +250,10 @@ impl Probe {
             Self::DeleteIdempotency => "delete bss_orders__idempotency (zero rows)",
             Self::DeleteAudit => "delete bss_orders__transition_audit (zero rows)",
             Self::DeleteCheckpoint => "delete bss_orders__audit_checkpoint (zero rows)",
+            Self::InsertCheckpoint => "insert bss_orders__audit_checkpoint (privilege)",
+            Self::InsertCheckpointMember => {
+                "insert bss_orders__audit_checkpoint_member (privilege)"
+            }
         }
     }
 }
@@ -291,6 +298,9 @@ fn probes(class: RoleClass) -> &'static [(Probe, Expectation)] {
             (Probe::SelectCheckpointMember, Allowed),
             (Probe::DeleteAudit, Denied),
             (Probe::DeleteCheckpoint, Denied),
+            // Reads match the checkpoint class; only the append right tells the two apart.
+            (Probe::InsertCheckpoint, Denied),
+            (Probe::InsertCheckpointMember, Denied),
         ],
         RoleClass::Checkpoint => &[
             (Probe::SelectOrder, Allowed),
@@ -299,7 +309,42 @@ fn probes(class: RoleClass) -> &'static [(Probe, Expectation)] {
             (Probe::SelectCheckpointMember, Allowed),
             (Probe::DeleteCheckpoint, Denied),
             (Probe::DeleteIdempotency, Denied),
+            (Probe::InsertCheckpoint, Allowed),
+            (Probe::InsertCheckpointMember, Allowed),
         ],
+    }
+}
+
+/// The session role's INSERT right on `table`, asked of PostgreSQL directly: an append cannot be
+/// attempted without writing evidence, so `has_table_privilege` is read through a secured,
+/// count-anchored projection (one row even when the scope matches nothing). A missing right is
+/// reported as the driver would report a refused statement.
+async fn insert_privilege(
+    tx: &toolkit_db::DbTx<'_>,
+    table: &'static str,
+    scope: &AccessScope,
+) -> anyhow::Result<()> {
+    #[derive(Debug, sea_orm::FromQueryResult)]
+    struct Privilege {
+        allowed: bool,
+    }
+    let rows = entity::audit_checkpoint::Entity::find()
+        .secure()
+        .scope_with(scope)
+        .project_all(tx, |q| {
+            q.select_only()
+                .column_as(
+                    Expr::cust(format!("has_table_privilege('{table}', 'INSERT')")),
+                    "allowed",
+                )
+                .column_as(Expr::cust("count(*)"), "n")
+                .into_model::<Privilege>()
+        })
+        .await?;
+    match rows.first() {
+        Some(row) if row.allowed => Ok(()),
+        Some(_) => Err(anyhow::anyhow!("permission denied for table {table}")),
+        None => Err(anyhow::anyhow!("privilege check returned no row")),
     }
 }
 
@@ -366,6 +411,13 @@ async fn run_probe(db: &Db, probe: Probe) -> ProbeOutcome {
                             .secure()
                             .scope_with(&nil_tenant)
                             .exec(tx)
+                            .await?;
+                    }
+                    Probe::InsertCheckpoint => {
+                        insert_privilege(tx, "bss_orders__audit_checkpoint", &nil_tenant).await?;
+                    }
+                    Probe::InsertCheckpointMember => {
+                        insert_privilege(tx, "bss_orders__audit_checkpoint_member", &nil_tenant)
                             .await?;
                     }
                 }

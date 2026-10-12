@@ -267,10 +267,8 @@ async fn create_commits_an_empty_draft_with_trusted_evidence_and_replays_it() {
     assert_eq!(first.headers["etag"], "\"1\"");
     let v = view(first.clone());
     let id = v.order.order_id;
-    assert_eq!(
-        first.headers["location"],
-        format!("/bss-orders-lifecycle/v1/orders/{id}")
-    );
+    // `Location` depends on the public path, so the REST adapter adds it; it is never stored.
+    assert!(!first.headers.contains_key("location"));
     assert_eq!(i64::from(v.version.version), 1);
     assert_eq!(v.draft_revision.map(i64::from), Some(0));
     assert!(v.lines.is_empty());
@@ -940,6 +938,119 @@ async fn header_and_axis_edits_are_written_by_the_engine_under_complete_authoriz
     assert!(matches!(denied, OrdersError::Refused(_)), "{denied:?}");
     assert_eq!(t.registry().await, registry);
     assert_eq!(t.order_row(id).await, row);
+}
+
+/// Resource tenants 10 and 11 granted by separate rules: each decision is constrained to one
+/// tenant, so no single scope sees the order both before and after the move.
+fn split_tenant_policy() -> Value {
+    let rule = |id: &str, tenant: u128| {
+        json!({
+            "id": id, "subject": {"id": s(u(BUYER.0))}, "resource_type": ORDER_RT,
+            "actions": ["create", "write", "edit", "read"],
+            "paths": [{"predicates": [{"property": "resource_tenant_id",
+                "values": [s(u(tenant))]}]}],
+            "payer_use": {"property": "payer_tenant_id", "values": [s(u(30))]},
+        })
+    };
+    json!({"vendor": "constructorfabric", "priority": 10, "policy_revision": "split-tenants",
+        "rules": [rule("tenant-a", 10), rule("tenant-b", 11)]})
+}
+
+#[tokio::test]
+async fn a_draft_moves_between_tenants_granted_by_separate_rules() {
+    let t = T::new().await;
+    let svc = T::service_with(
+        t.engine(RulesProvider::from_policy(split_tenant_policy())),
+        200,
+    );
+    let id = create(&t, &svc, "c-1").await;
+    let audits = t.audits(id).await;
+    // The engine writes the moved row under the tenant-B decision; the audit append that
+    // follows in the same transaction must use that scope too, not the tenant-A one.
+    let r = result(
+        svc.patch_order(
+            &buyer(),
+            id,
+            HeaderPatch {
+                resource_tenant_id: Some(u(11)),
+                ..HeaderPatch::default()
+            },
+            &write("move-1", 1, Some(0)),
+        )
+        .await
+        .unwrap(),
+    );
+    assert_eq!(revision(&r), 1);
+    let row = t.order_row(id).await;
+    assert_eq!(row["resource_tenant_id"], json!(s(u(11))));
+    assert_eq!(row["audit_tenant_id"], json!(s(u(10))));
+    assert_eq!(t.audits(id).await, audits + 1);
+    // The order is now edited under the tenant-B rule alone.
+    result(
+        svc.patch_order(
+            &buyer(),
+            id,
+            HeaderPatch {
+                contract_id: Some(Some(u(77))),
+                ..HeaderPatch::default()
+            },
+            &write("move-2", 1, Some(1)),
+        )
+        .await
+        .unwrap(),
+    );
+    // Without the tenant-B rule the move is refused and nothing is written.
+    let only_a = json!({"vendor": "constructorfabric", "priority": 10, "policy_revision": "a-only",
+        "rules": [split_tenant_policy()["rules"][0].clone()]});
+    let a_only = T::service_with(t.engine(RulesProvider::from_policy(only_a)), 200);
+    let other = create(&t, &a_only, "c-2").await;
+    let before = t.order_row(other).await;
+    let denied = a_only
+        .patch_order(
+            &buyer(),
+            other,
+            HeaderPatch {
+                resource_tenant_id: Some(u(11)),
+                ..HeaderPatch::default()
+            },
+            &write("move-3", 1, Some(0)),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(denied, OrdersError::Refused(_)), "{denied:?}");
+    assert_eq!(t.order_row(other).await, before);
+}
+
+/// Under a gateway `prefix_path` the routes are nested: `Location` keeps the prefix on the first
+/// response and on a replay, and it resolves to the created order.
+#[tokio::test]
+async fn location_keeps_the_gateway_prefix_on_create_and_replay() {
+    let t = T::new().await;
+    let svc = Arc::new(t.service());
+    let openapi = toolkit::api::OpenApiRegistryImpl::new();
+    let gear = crate::api::rest::capture::router(Arc::clone(&svc), limiter(), &openapi).merge(
+        crate::api::rest::read::router(Arc::new(t.reads()), &openapi),
+    );
+    // The gateway nests every gear router under its `prefix_path`.
+    let gateway = axum::Router::new()
+        .nest("/cf", gear)
+        .layer(axum::Extension(buyer().ctx().clone()));
+    let json_ct = ("content-type", "application/json");
+    let create = json!({"resource_tenant_id": u(10), "payer_tenant_id": u(30),
+                        "seller_tenant_id": u(20), "category": Category::NEW_SALE});
+    let headers = [json_ct, ("idempotency-key", "prefixed")];
+    let path = "/cf/bss-orders-lifecycle/v1/orders";
+    let first = http(&gateway, "POST", path, &headers, Some(create.clone())).await;
+    assert_eq!(first.0, 201, "{:?}", first.2);
+    let id = first.2["order"]["order_id"].as_str().unwrap().to_owned();
+    let location = format!("{path}/{id}");
+    assert_eq!(first.1["location"], location.as_str());
+    let replay = http(&gateway, "POST", path, &headers, Some(create)).await;
+    assert_eq!((replay.0, &replay.2), (201, &first.2));
+    assert_eq!(replay.1["location"], location.as_str());
+    let read = http(&gateway, "GET", &location, &[], None).await;
+    assert_eq!(read.0, 200, "{:?}", read.2);
+    assert_eq!(read.2["order"]["order_id"], json!(id));
 }
 
 /// One in-process HTTP exchange through the mounted router (not the S2-12 live E2E).

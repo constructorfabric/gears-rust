@@ -14,6 +14,7 @@
 use std::sync::Arc;
 
 use axum::body::Bytes;
+use axum::extract::OriginalUri;
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Router};
@@ -162,9 +163,23 @@ fn outcome(result: Result<StoredResponse, OrdersError>) -> Response {
     }
 }
 
+/// `Location` of a created order, from the public request path: under a gateway `prefix_path`
+/// the router is nested, and only the original URI still carries the prefix. Added at render
+/// time, so a replay gets the same header as the first response.
+fn with_location(mut response: StoredResponse, collection_path: &str) -> StoredResponse {
+    if response.status == StatusCode::CREATED.as_u16()
+        && let Some(order_id) = response.body["order"]["order_id"].as_str()
+    {
+        let location = format!("{}/{order_id}", collection_path.trim_end_matches('/'));
+        response.headers.insert("location".to_owned(), location);
+    }
+    response
+}
+
 async fn create_order(
     Extension(service): Extension<Arc<CaptureService>>,
     Extension(ctx): Extension<SecurityContext>,
+    OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
@@ -180,7 +195,10 @@ async fn create_order(
         let caller = crate::authz::Caller::new(ctx, delegation_proof_ref);
         service.create(&caller, request, &meta).await
     };
-    outcome(run.await)
+    outcome(
+        run.await
+            .map(|response| with_location(response, uri.path())),
+    )
 }
 
 async fn patch_order(
