@@ -27,7 +27,7 @@
   - [4.3 Concurrent and late triggers (normative)](#43-concurrent-and-late-triggers-normative)
   - [4.4 Compensation cannot exceed the step's declared action](#44-compensation-cannot-exceed-the-steps-declared-action)
   - [4.5 The unilateral window is fence-visible](#45-the-unilateral-window-is-fence-visible)
-  - [4.6 Upstream dependency disclosed, not resolved: `SUB-O1`](#46-upstream-dependency-disclosed-not-resolved-sub-o1)
+  - [4.6 Upstream dependency answered: `SUB-O1`](#46-upstream-dependency-answered-sub-o1)
   - [4.7 Constraints this slice places on the definition](#47-constraints-this-slice-places-on-the-definition)
   - [4.8 The failure reason is resolved from the record and mapped (normative)](#48-the-failure-reason-is-resolved-from-the-record-and-mapped-normative)
   - [4.9 Every Lifecycle answer to `report-outcome` (normative)](#49-every-lifecycle-answer-to-report-outcome-normative)
@@ -645,8 +645,9 @@ the version, slice 05), whether at-sale facts had been emitted, and
 `no_active_subscription_remains = true`. `report-outcome` builds it from
 `owf_compensation_record` and `owf_cancellation_fence` inside Orders; it never crosses the engine
 boundary. The Lifecycle endpoints are marked `unstable` deliberately: the activated-cancel leg's
-cancellation-reason value is unspecifiable until `SUB-O1` lands (§4.6), so the payload of the
-compensating intent underneath these reports is not yet fixed.
+cancellation reason is `order_compensation` (§4.6), answered in Subscriptions PR #5131, which is
+still open, so the payload of the compensating intent underneath these reports is fixed only once
+it merges.
 
 ### 3.4 Internal Dependencies
 
@@ -888,13 +889,16 @@ discovery path. Step 4's subject set
 includes override-attached subscriptions; enumerating intents alone would make step 5 answer
 "none remain" from an incomplete record.
 
-**Upstream dependency disclosed, not resolved: `SUB-O12`.** Step 3 would supersede an accepted
-in-flight intent with `SUB-O12` — cancel/void of an accepted transition request — never a second
-submit. `SUB-O12` is carried in `UPSTREAM_REQS.md` as **UNASKED**; no Subscriptions contract
-exposes it. Until it lands, step 3 can only wait for the accepted intent to reach a terminal
-outcome, which extends the fence to the sweep floor (30 reads or 23 h) in the worst case. The
-wait is the definition's pass loop; this slice does not invent a second-submit workaround, which
-the caller-side duplicate protocol forbids.
+**Upstream dependency answered, pending merge: `SUB-O12`.** Step 3 supersedes an accepted
+in-flight intent with its **withdrawal** — never a second submit. Subscriptions PR #5131
+(`fr-intent-protocol` item 2) adopts it: a request accepted but not yet applied is withdrawn by its
+submitter and ends `failed` with reason `withdrawn`; where an OSS work order is already outstanding
+the request terminates only after that work order is cancelled with a compensating deprovision;
+an applied request cannot be withdrawn and is handled by the compensation walk instead. Step 3
+therefore records a `withdrawn` outcome like any other terminal failure of the intent. Until #5131
+merges, step 3 keeps its fallback — wait for the accepted intent to reach a terminal outcome, at
+worst the sweep floor (30 reads or 23 h) — and never invents a second-submit workaround, which the
+caller-side duplicate protocol forbids (decision D-209).
 
 ### 3.7 Database schemas & tables
 
@@ -1122,19 +1126,20 @@ The window rule of §4.2 is enforced by fence step 2: an intent that was accepte
 in the identified set and cannot be skipped by step 3; a task holding only a draft is reached by
 the walk's single draft-void leg.
 
-### 4.6 Upstream dependency disclosed, not resolved: `SUB-O1`
+### 4.6 Upstream dependency answered: `SUB-O1`
 
-The activated-cancel leg needs a cancellation reason value that is neither an early-termination
-reason nor a plan-change supersession reason — reusing either would misattribute a termination fee
-or credit, or misrepresent the compensation as a customer-driven plan change. The canonical
-Subscriptions register (`gears/bss/subscriptions/docs/SEAMS.md`) carries this ask as `SUB-O1`,
-marked **critical** there and **unagreed**. Reason values ride event payloads consumers key on, so
-adding one after Billing has consumed the contract is a breaking change. Until `SUB-O1` lands, the
-activated-cancel leg's cancellation-reason value is **unspecifiable from this side**; this design
-names the requirement and defers the value. Consuming address for this disclosure:
-`gears/bss/orders-workflow/docs/design/06-saga-and-compensation.md` §4.6; relevant to the
-open-questions register in [`../DECISIONS.md`](../DECISIONS.md) alongside the `SUB-O5` and
-`SUB-O11`-`SUB-O14` disclosures carried in [`../UPSTREAM_REQS.md`](../UPSTREAM_REQS.md) §2.1.
+The activated-cancel leg needs a cancellation reason that is neither an early-termination reason
+nor a plan-change supersession reason — reusing either would misattribute a termination fee or
+credit, or misrepresent the compensation as a customer-driven plan change. The canonical
+Subscriptions register carries this ask as `SUB-O1`, marked **critical**. Subscriptions PR #5131
+(`fr-cancel-reasons`, still open) answers it: the closed, versioned reason set gains
+**`order_compensation`**, used only by the order path to roll back a subscription activated by an
+order whose fulfillment then failed, and outside the early-termination class, so it derives
+neither an early-termination fee nor an unused-portion credit. The activated-cancel leg sends that
+value. A one-time fact already emitted at activation stays posted; its reversal is a Billing-chain
+artifact the compensation cancel triggers, which this gear never waits on (§2.1). Before activation
+the leg is the draft void, which needs no reason. Until #5131 merges, the value is agreed but not
+yet canonical (decision D-209).
 
 ### 4.7 Constraints this slice places on the definition
 
@@ -1173,6 +1178,7 @@ is fragment (c)'s manual-task reason and never reaches the fence (decisions D-11
 | A plan task resolved `exhausted` for a plan that could not freeze because the expected-fulfillment instant is at or after the version's accepted-binding deadline (`04 §3.6`, `planState = binding-expired`) | `order-binding-expired` | `order-binding-expired` (decision D-194; Lifecycle `06 §4.4` lists it) |
 | A settled `re-check-pre-activation` abort on an elapsed accepted-binding deadline (`04 §3.6`) | `order-binding-expired` | `order-binding-expired` |
 | The wave-2 guard's `bindingExpired: true` answer (`05 §3.6` `inst-pi-wave2-guard`), or a wave-2 line Subscriptions refused on the accepted-binding comparison or for lost SKU protection (Lifecycle D-162, D-164; the closed refusal kind is the cause on the intent row) — in both cases after any line may already be `activated`, so the fence voids the drafts and cancels the activated lines first and reports only with `no_active_subscription_remains = true`; never a pre-activation abort once a line is active | `order-binding-expired` (the line's own `wave2-activation-failed` stays on the task) | `order-binding-expired` |
+| A wave-2 line whose activation Subscriptions refused as a market divergence — the payer's commercial profile at activation no longer matches the currency and region the line was priced in (Subscriptions PR #5131 `fr-order-originated-create` item 6) | `wave2-activation-failed` | `market-divergence` (the same reason as the re-check's own abort, raised by the receiver after it; decision D-209) |
 | A settled `re-check-pre-activation` abort | `overlap-collision` | `overlap-collision` |
 | — | `market-divergence` | `market-divergence` |
 | — the occupancy port's defer ladder exhausted | `overlap-read-unevaluable` | `overlap-presence-unevaluable` |

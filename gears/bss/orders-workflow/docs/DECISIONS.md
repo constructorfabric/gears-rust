@@ -227,6 +227,7 @@
   - [D-206 (L) The plan is frozen before begin-fulfillment; the PRD states one normative ordering](#d-206-l-the-plan-is-frozen-before-begin-fulfillment-the-prd-states-one-normative-ordering)
   - [D-207 (M) Phase 1 is a canonical process with four seller-policy settings; customization stays in the owning gears](#d-207-m-phase-1-is-a-canonical-process-with-four-seller-policy-settings-customization-stays-in-the-owning-gears)
   - [D-208 (H) Lifecycle's merged design D-179…D-186 is received: forced failure, overdue owner, resource-tenant tuple, consumer contract](#d-208-h-lifecycles-merged-design-d-179d-186-is-received-forced-failure-overdue-owner-resource-tenant-tuple-consumer-contract)
+  - [D-209 (H) Subscriptions' answers in PR #5131 are received: resubmit-then-void, no caller start instant, composition by reference](#d-209-h-subscriptions-answers-in-pr-5131-are-received-resubmit-then-void-no-caller-start-instant-composition-by-reference)
 - [Open Questions](#open-questions)
   - [Q-01: Which durable-execution substrate backs the process — the OSS Workflow Engine or a BSS-local mechanism?](#q-01-which-durable-execution-substrate-backs-the-process--the-oss-workflow-engine-or-a-bss-local-mechanism)
   - [Q-02: The Generic Approval escalation threshold — the one PRD-deferred numeric value this design deliberately leaves unset](#q-02-the-generic-approval-escalation-threshold--the-one-prd-deferred-numeric-value-this-design-deliberately-leaves-unset)
@@ -6072,6 +6073,10 @@ rebuilt drafts. ADR-0013 is untouched — the tuple is a reference.
 `design/06-saga-and-compensation.md` §3.3; `design/04-fulfillment-plan.md` §2.1; `DESIGN.md` §3.1;
 `UPSTREAM_REQS.md` §2.1 (`SUB-O5`, `SUB-O10`, `SUB-O11`, `SUB-O13`, *PriceBook provisioning amendment*); Q-08.
 
+**Amended by D-209 (2026-10-12)**: the activation intent no longer carries the start instant of
+item (2). Subscriptions PR #5131 stamps the start at the `activate` commit and refuses a
+caller-supplied one (`SUB-O10` as reshaped).
+
 ### D-196 (H) Acquisition lines are independent: the dependency graph, its Catalog source and the `blocked-upstream` outcome are withdrawn
 
 **Accepted (2026-09-30).** *(supersedes D-16; amends D-77, D-92, D-105, D-110, `ADR/0004` and `ADR/0005` as amended)*
@@ -6202,6 +6207,9 @@ Orders gears present Subscriptions with one name and one payload.
 **Propagated**: `design/05-provisioning-intents.md` §3.3 (inbound events); `UPSTREAM_REQS.md` §2.1
 (`…-upreq-identity-envelope-echo`); Seam Atlas ticket T12.
 
+**Amended by D-209 (2026-10-12)**: Subscriptions PR #5131 adopts the echo (`SUB-O16`) but names no
+outcome event and no failure twin; the name stays this gear's ask.
+
 ### D-201 (M) This gear mints `payment_auth_request_ref` from its intent key family; the Payments owner stays open
 
 **Accepted (2026-10-02).** *(closes the minting half of Q-06; the Payments owner half stays open)*
@@ -6237,6 +6245,10 @@ acknowledged failed and attaching a subscription to a settled order (Lifecycle f
 
 **Propagated**: `design/05-provisioning-intents.md` §3.3 (`reconcile-intent`); `UPSTREAM_REQS.md`
 §2.1 (`…-upreq-settle-create`, new).
+
+**Superseded by D-209 (2026-10-12)**: Subscriptions PR #5131 provides no `settle_create`. A timed-out
+create is settled by resubmitting it under the same key and voiding the draft if it is not needed;
+the ask is withdrawn and replaced by `…-upreq-create-dedup-lifetime`.
 
 ### D-203 (H) Lifecycle's alignment D-169…D-178 is received; the §2.4 asks and the §2.5 hand-off close as stated
 
@@ -6395,6 +6407,40 @@ compensation path and one manual-task family rather than adding a reason.
 `design/10-process-definition.md` §2.1, §3.6 (b), (f); `design/09-read-and-authz.md`; `DESIGN.md`;
 `design/README.md`; `ADR/0011`, `ADR/0012` (amendment notes); `UPSTREAM_REQS.md` §2.1, §2.4, §4
 item 20; D-193, D-205.
+
+### D-209 (H) Subscriptions' answers in PR #5131 are received: resubmit-then-void, no caller start instant, composition by reference
+
+**Accepted (2026-10-12).** *(reciprocal of Subscriptions PR #5131, open; amends D-195, D-200, D-202)*
+
+**Decision**: Subscriptions PR #5131 (`fr-order-originated-create`, `fr-cancel-reasons`,
+`fr-intent-protocol`, `nfr-intent-seam-budget`, `contract-orders-intents`; `SEAMS.md` §I) answers
+this gear's asks, and this gear adopts the answers, pending that PR's merge. (1) `SUB-O1`: the
+activated-cancel leg sends `order_compensation`. (2) `SUB-O2`, `SUB-O3`, `SUB-O5`, `SUB-O14`: no
+change on this side. (3) `SUB-O10` reshaped: an activation intent carries no start instant; the
+start is stamped at the `activate` commit, and this gear's barrier keeps it unbackdated by
+dispatching only at expected fulfillment time. (4) `SUB-O11` reshaped: a same-key resubmit returns
+the existing request and its status. (5) **Resubmit-then-void replaces `settle_create`**: a
+timed-out create is resubmitted under the same key, so a late original is absorbed as a duplicate
+and the line holds exactly one known draft, which the ordinary draft-void removes if unneeded; this
+holds while Subscriptions de-duplicates the key, so `…-upreq-create-dedup-lifetime` asks for at least
+30 days. (6) `SUB-O12`: the cancellation fence supersedes an accepted intent with its withdrawal,
+recorded as a `withdrawn` failure. (7) `SUB-O13` adopted, with the residual that the order-identity
+lookup lacks `intentKind` and `wave_attempt`. (8) `SUB-O16` adopted; the outcome event's name and
+failure twin stay open (D-200). (9) A Subscriptions `market-divergence` refusal at activation maps to
+`wave2-activation-failed` / `market-divergence`. (10) **Composition by reference**: the line's
+add-ons, term, auto-renewal flag and co-term date are not copied into the intent; Subscriptions
+resolves them at `create` from the referenced order version (`…-upreq-create-composition-by-reference`).
+(11) The occupancy key's resource-tenant dimension (Lifecycle D-179) is asked to be confirmed
+(`…-upreq-occupancy-resource-tenant`). The Lifecycle-side items #5131 defers to "the Orders PR" (the
+co-term date on the order line) are Lifecycle's and are not taken here.
+
+**Rationale**: resubmit-then-void uses only what Subscriptions has agreed and narrows the residual
+risk to one stated lifetime; references keep one copy of the composition, as ADR-0013 and Lifecycle's
+own ask require.
+
+**Propagated**: `PRD.md` §6.3, §9.2, §12, §13; `design/05-provisioning-intents.md` §2.2, §3.3, §3.6,
+§4.1; `design/06-saga-and-compensation.md` §3.3, §3.6, §4.6, §4.8; `UPSTREAM_REQS.md` §2.1, §4 item 21;
+D-195, D-200, D-202.
 
 ## Open Questions
 
@@ -6742,6 +6788,7 @@ register relies on is cited to a serverless-runtime file and line or registered 
 | D-206 | 04 Fulfillment plan (PRD alignment, 2026-10-05) | `PRD.md` §6.3, §9.1, UC-002, §17.1 |
 | D-207 | cross-cutting (customization scope, 2026-10-05) | `PRD.md` §5.3, §12; `UPSTREAM_REQS.md` §2.9, §4 |
 | D-208 | cross-cutting (Lifecycle D-179…D-186 received, 2026-10-05) | `PRD.md` §6.1, §6.3, §12; `design/02`, `design/06`, `design/10`; `UPSTREAM_REQS.md` §2.1, §2.4, §4 |
+| D-209 | 05 Provisioning intents, 06 Saga (Subscriptions #5131 received, 2026-10-12) | `PRD.md` §6.3, §9.2, §13; `design/05`, `design/06`; `UPSTREAM_REQS.md` §2.1, §4 |
 | D-200–D-205 | cross-cutting (Seam Atlas alignment, 2026-10-02) | `UPSTREAM_REQS.md` §2.1, §2.2, §2.4, §2.5, §4; `PRD.md` §9.1, §13, §15, §16; `design/05` §3.3; `design/06` §4.8 |
 | D-05–D-08 | 02 Triggers and start | `design/02-triggers-and-start.md` |
 | D-09–D-14 | 03 Approval execution | `design/03-approval-execution.md` |
@@ -6920,6 +6967,7 @@ register relies on is cited to a serverless-runtime file and line or registered 
 | D-206 | L Plan frozen before begin-fulfillment; PRD UC-002, §6.3, §9.1, §17.1 aligned; binding expiry is a plan-level task | `PRD.md` §6.3, §9.1, UC-002, §17.1 |
 | D-207 | M Canonical process, four seller-policy settings; customization in owning gears; Q-10 answered; cohort binding required | `PRD.md` §5.3, §12; `UPSTREAM_REQS.md` §2.9, §4 item 19 |
 | D-208 | H Lifecycle D-179…D-186 received: forced-failure trigger and unwind, overdue owner, resource-tenant tuple, consumer contract and corpus | `PRD.md` §6.1, §6.3, §12; `design/02` §4.8; `design/06` §4.9; `design/10`; `UPSTREAM_REQS.md` §2.1, §2.4, §4 item 20 |
+| D-209 | H Subscriptions #5131 received: resubmit-then-void replaces `settle_create`, no caller start instant, composition by reference, withdrawal, `order_compensation` | `PRD.md` §6.3, §9.2, §13; `design/05`; `design/06`; `UPSTREAM_REQS.md` §2.1, §4 item 21 |
 
-Highest decision number used: **D-208**; highest question number: **Q-14**. Numbering is one continuous sequence across the whole
+Highest decision number used: **D-209**; highest question number: **Q-14**. Numbering is one continuous sequence across the whole
 register; there are no parts.

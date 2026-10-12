@@ -92,7 +92,27 @@ Since 2026-10-02 the sibling Lifecycle register co-signs the provisioning-intent
 and its `…-upreq-compensation-cancel-reason` names the `CancelReason::OrderCompensation` value;
 Subscriptions therefore receives one list from the two Orders gears (DECISIONS D-200…D-205).
 
-#### Overlap-presence read (inherited, unagreed)
+**Answered in Subscriptions PR #5131 (open; recorded 2026-10-12, D-209).** The Subscriptions PRD
+revision in PR #5131 registers this gear's asks in its `SEAMS.md` §I and answers most of them. Its
+answers are agreed here but are not canonical until that PR merges:
+
+| Ask | #5131's answer | This gear |
+|-----|----------------|-----------|
+| `SUB-O1` compensation cancel reason | `order_compensation` in a closed, versioned set, outside the early-termination class (`fr-cancel-reasons`) | Sends it on the activated-cancel leg (`design/06` §4.6) |
+| `SUB-O2` order reference and create key | Optional order reference persisted and echoed; caller-derived key from order, version, line and wave | No change: this gear's key also carries kind and wave attempt, which the opaque key admits |
+| `SUB-O3` draft then activate | Kept as an external two-phase contract | No change |
+| `SUB-O5` overlap occupancy | Batched `(activeCount, maxConcurrentActive, provenance)` per payer and key; atomic enforcement at entry into `active` | No change; the resource-tenant dimension of Lifecycle D-179 rides inside the key (see the ask below) |
+| `SUB-O10` start instant | **Reshaped:** the start is stamped at the `activate` commit and never supplied by the caller | Sends no start instant (`design/05` §2.2); the ask below is withdrawn |
+| `SUB-O11` in-flight signal | **Reshaped:** a same-key resubmit returns the existing request and its status; a different request is rejected `transition_in_flight` | Adopted as the duplicate signal and as the basis of resubmit-then-void |
+| `SUB-O12` withdrawal | A request accepted but not applied is withdrawn and ends `failed` with reason `withdrawn` | Step 3 of the cancellation fence (`design/06` §3.6) |
+| `SUB-O13` status read | By request id, or by order, version, line and wave, after the key ages out | Adopted; the order-identity lookup lacks `intentKind` and `wave_attempt`, a residual |
+| `SUB-O14` correlation propagation | Adopted | No change |
+| `SUB-O15` latency budget | Adopted; values set at the NFR workshop | Step deadlines stay on the §7.1 baselines until then |
+| `SUB-O16` identity echo | Adopted on every confirmation and failure | The outcome event's name and failure twin stay open |
+| `settle_create` (D-202) | Not provided | Withdrawn: resubmit under the same key, then void (D-209); replaced by the de-duplication lifetime ask below |
+| Add-ons, term, auto-renewal, co-term at `create` | "MUST arrive with `create`" | Read as resolved at `create` from the order version the intent references; clarification asked below |
+
+#### Overlap-presence read (inherited; answered in #5131)
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-upreq-overlap-presence-read`
 
@@ -126,7 +146,7 @@ subscription state; the check is only partially evaluable without it.
 - **Source**: `gears/bss/subscriptions/docs/SEAMS.md` §I (`SUB-O5`); consumed by PRD §6.1
   (Fulfillment Plan Construction, pre-activation abort) and `DESIGN.md` fulfillment-plan slice.
 
-#### Compensation cancellation reason (inherited, critical, unagreed)
+#### Compensation cancellation reason (inherited, critical; answered in #5131)
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-upreq-compensation-cancel-reason`
 
@@ -150,10 +170,12 @@ enum and its ETF/credit scoping are owned by Subscriptions.
 - **Note**: reason values ride event payloads and downstream consumers key on them, so adding a
   value after Billing consumes the contract is a **breaking** change — this is the ask materially
   cheaper now than later.
+- **Answered (D-209)**: Subscriptions PR #5131 adds `order_compensation` to the closed reason set,
+  outside the early-termination class (`fr-cancel-reasons`). Pending merge.
 - **Source**: `gears/bss/subscriptions/docs/SEAMS.md` §I (`SUB-O1`); consumed by PRD §6.4
   (cancellation fencing / compensation) and the activated-cancel leg of the fulfillment design.
 
-#### Explicit subscription start instant (raised by sibling Lifecycle design, unagreed)
+#### Explicit subscription start instant (withdrawn: answered by reshaping in #5131)
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-upreq-explicit-start-instant`
 
@@ -178,8 +200,13 @@ Subscriptions would compute internally (Lifecycle `…-upreq-subscription-start-
   dates unenforceable from the order side.
 - **Source**: `gears/bss/orders-lifecycle/docs/UPSTREAM_REQS.md` §2.1
   (`upreq-subscription-start-instant`, `SUB-O10`); consumed by PRD §6.1/§6.2 wave-2 activation.
+- **Withdrawn (D-209)**: Subscriptions PR #5131 reshapes `SUB-O10`: the start is `serviceActivatedAt`,
+  stamped at the `activate` commit, and never taken from the order or the caller. That meets the
+  intent without a caller-supplied instant, because this gear dispatches activation only at expected
+  fulfillment time; this gear therefore sends no start instant. Lifecycle's own
+  `upreq-subscription-start-instant` is Lifecycle's to close.
 
-#### `SUB-O11` — machine-readable in-flight rejection (UNASKED)
+#### `SUB-O11` — machine-readable in-flight rejection (answered in #5131, reshaped)
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-upreq-in-flight-rejection`
 
@@ -201,12 +228,13 @@ acknowledgement (`design/06-saga-and-compensation.md` §4.8).
 - **Consequence if it does not land**: the caller-side duplicate protocol (PRD §6.3) cannot reliably
   distinguish an in-flight duplicate from a genuine submission failure, forcing the sweep-based
   status read (`SUB-O13`) to carry the entire disambiguation burden with no fast-path signal.
-- **Agreement status**: **UNASKED** — this identifier has never existed in `SEAMS.md` at any
-  number; it is not registered-and-unagreed, it has simply never been raised upstream.
+- **Agreement status**: answered in Subscriptions PR #5131 (`fr-intent-protocol` item 1), reshaped: a
+  same-key resubmit returns the existing request and its status; a different request is rejected
+  `transition_in_flight`. Pending merge (D-209).
 - **Source**: replaces the PRD's local `SUB-O6` (§13 Dependencies, §6.3 retry/duplicate protocol).
   Raised against `gears/bss/subscriptions/docs/SEAMS.md`, which has no such entry today.
 
-#### `SUB-O12` — cancel/void of an accepted transition request (UNASKED)
+#### `SUB-O12` — withdrawal of an accepted transition request (answered in #5131)
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-upreq-cancel-accepted-transition`
 
@@ -219,11 +247,13 @@ request, usable as the superseding action for that intent instead of a second su
 - **Consequence if it does not land**: an accepted in-flight intent that needs to be abandoned
   (e.g., on order cancellation or amendment) has no supported path other than waiting for it to
   reach a terminal outcome on its own, which can stall compensation and cancellation fencing.
-- **Agreement status**: **UNASKED** — never registered upstream at any number.
+- **Agreement status**: answered in Subscriptions PR #5131 (`fr-intent-protocol` item 2): a request
+  accepted but not applied is withdrawn and ends `failed` with reason `withdrawn`; an outstanding OSS
+  work order is cancelled with a compensating deprovision first. Pending merge (D-209).
 - **Source**: replaces the PRD's local `SUB-O7` (§6.3 retry/duplicate protocol, §6.4 cancellation
   fencing). Raised against `gears/bss/subscriptions/docs/SEAMS.md`, which has no such entry today.
 
-#### `SUB-O13` — status-read of a non-terminal intent (UNASKED)
+#### `SUB-O13` — status-read of a non-terminal intent (answered in #5131)
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-upreq-nonterminal-status-read`
 
@@ -248,12 +278,14 @@ completion this gear records as `activated`; `oss_unconfirmed` is a failure this
 - **Consequence if it does not land**: the sweep cannot drive aged-out intents to a terminal
   confirmation or failure by lookup, so unresolved intents can only be resolved by resubmission
   (which risks duplication) or by parking indefinitely.
-- **Agreement status**: **UNASKED** — never registered upstream at any number.
+- **Agreement status**: answered in Subscriptions PR #5131 (`fr-intent-protocol` item 3), by request
+  id or by order, version, line and wave, after the key ages out. **Residual**: that order-identity
+  tuple lacks `intentKind` and `wave_attempt`, so this gear looks up by request id first. Pending merge (D-209).
 - **Source**: replaces the PRD's local `SUB-O8` (§Intent Reconciliation Sweep, §6.3 caller-side
   duplicate protocol). Raised against `gears/bss/subscriptions/docs/SEAMS.md`, which has no such
   entry today.
 
-#### `SUB-O14` — `correlationId` propagation toward Policy Engine / OSS (UNASKED)
+#### `SUB-O14` — `correlationId` propagation toward Policy Engine / OSS (answered in #5131)
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-upreq-settle-create`
 
@@ -269,8 +301,10 @@ delayed create from committing after the order was acknowledged failed.
   key aged out and attaches a subscription to a settled order (Lifecycle fixture F12; the Seam
   Atlas states that a status read alone is not proof).
 - **Co-signed (2026-10-02)**: Lifecycle `cpt-cf-bss-orders-lifecycle-upreq-settle-create`.
-- **Agreement status**: **UNASKED** (new at `SUB-O13`'s number as its extension; Subscriptions slice
-  01 has only the dedup key today).
+- **Agreement status**: **withdrawn (D-209).** Subscriptions PR #5131 provides no settlement operation;
+  this gear settles a timed-out create by resubmitting it under the same key and voiding the draft
+  if it is not needed (`design/05` §3.3), and asks instead for the de-duplication lifetime below.
+  Lifecycle's co-signed `cpt-cf-bss-orders-lifecycle-upreq-settle-create` is Lifecycle's to close.
 - **Source**: `DECISIONS.md` D-202. Raised against `gears/bss/subscriptions/docs/SEAMS.md`.
 
 - [ ] `p2` - **ID**: `cpt-cf-bss-orders-workflow-upreq-correlation-propagation`
@@ -285,18 +319,62 @@ end-to-end.
 - **Consequence if it does not land**: an end-to-end trace of a single fulfillment attempt stops at
   the Subscriptions seam; diagnosing a failure inside the Policy Engine or OSS legs cannot be
   correlated back to the originating process instance without a manual join.
-- **Agreement status**: **UNASKED** — never registered upstream at any number.
+- **Agreement status**: answered in Subscriptions PR #5131 (`fr-intent-protocol` item 5). Pending merge (D-209).
 - **Source**: replaces the PRD's local `SUB-O9` (§13 Dependencies, §6.3). Raised against
   `gears/bss/subscriptions/docs/SEAMS.md`, which has no such entry today.
+
+#### Create de-duplication lifetime (new, D-209)
+
+- [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-upreq-create-dedup-lifetime`
+
+Subscriptions **MUST** de-duplicate a `create` on its caller-supplied key for at least **30 days**,
+this gear's intent-key lifetime. This gear settles a timed-out create by resubmitting it under the
+same key and voiding the draft if the order no longer needs it (`design/05` §3.3, D-209); a delayed
+original that lands after the key stopped de-duplicating would create a second draft that nothing
+tracks.
+
+- **Rationale**: replaces `…-upreq-settle-create`, which Subscriptions PR #5131 does not provide; the
+  same-key resubmit it does provide (`SUB-O11`) is deterministic only within the de-duplication
+  lifetime, which #5131 does not state.
+- **Agreement status**: new; to be raised on Subscriptions PR #5131 or its successor.
+- **Source**: `DECISIONS.md` D-209.
+
+#### Composition, term and co-term resolved from the referenced order version (new, D-209)
+
+- [ ] `p2` - **ID**: `cpt-cf-bss-orders-workflow-upreq-create-composition-by-reference`
+
+Subscriptions PR #5131 requires the line's add-ons to "arrive with `create`" and lets `create` carry
+a term, an auto-renewal flag and a co-term date taken from the order line. This gear asks that, on
+the order path, these **arrive by reference**: Subscriptions resolves them at `create`, in the same
+commit, from the order version the intent's source tuple names, read through Lifecycle's
+`get_version` — the way it already resolves the accepted composition and price bindings (D-195,
+Lifecycle `…-upreq-workflow-pricebook-contracts`). This gear never copies them into the intent
+(ADR-0013).
+
+- **Rationale**: one copy of the composition; no divergence between the order version and an intent payload.
+- **Agreement status**: new clarification of #5131 `fr-order-originated-create` items 4 and `fr-term-source`.
+- **Source**: `DECISIONS.md` D-209.
+
+#### Resource tenant inside the occupancy key (new, D-209)
+
+- [ ] `p2` - **ID**: `cpt-cf-bss-orders-workflow-upreq-occupancy-resource-tenant`
+
+Subscriptions PR #5131 keys occupancy by `(payerTenantId, overlapScopeKey)`. Lifecycle D-179 needs
+the resource tenant as a default dimension of that key, so a partner's orders for different
+customers never share an answer. This gear asks Subscriptions to confirm that `overlapScopeKey`
+carries it.
+
+- **Agreement status**: new; co-signs Lifecycle D-179's amendment of `SUB-O5`.
+- **Source**: `DECISIONS.md` D-208, D-209.
 
 #### Translation table (PRD-local numbers → renumbered asks)
 
 | Old PRD number (local, colliding/unregistered) | New number (this register) | Meaning | Status |
 |---|---|---|---|
-| `SUB-O6` (PRD-local: in-flight rejection) | `SUB-O11` | Machine-readable in-flight rejection | UNASKED |
-| `SUB-O7` | `SUB-O12` | Cancel/void of an accepted transition request | UNASKED |
-| `SUB-O8` | `SUB-O13` | Status-read of a non-terminal intent | UNASKED |
-| `SUB-O9` | `SUB-O14` | `correlationId` propagation toward Policy Engine / OSS | UNASKED |
+| `SUB-O6` (PRD-local: in-flight rejection) | `SUB-O11` | Machine-readable in-flight rejection | Answered in #5131 (reshaped) |
+| `SUB-O7` | `SUB-O12` | Withdrawal of an accepted transition request | Answered in #5131 |
+| `SUB-O8` | `SUB-O13` | Status-read of a non-terminal intent | Answered in #5131 |
+| `SUB-O9` | `SUB-O14` | `correlationId` propagation toward Policy Engine / OSS | Answered in #5131 |
 
 Note: `SUB-O6` in `SEAMS.md` (canonical) means **atomic multi-subscription submission is cheaper
 than the deferral assumed** (MED, joint Orders/Subscriptions, reopening `SUB-D-04`/`SUB-C2`) — an
@@ -306,6 +384,9 @@ here only to make the double meaning explicit and to confirm the collision is fu
 the renumbering above.
 
 #### What the design cannot do until `SUB-O11`–`SUB-O14` land
+
+> **Amended 2026-10-12 by D-209**: Subscriptions PR #5131 answers all four (table at the head of
+> this section). Once it merges, this subsection is history; until then its fallbacks stay in force.
 
 All four are **UNASKED** — never raised upstream at any number, not merely unagreed. Stated once,
 plainly, so no slice has to restate it and no reader of a single slice concludes the mechanism
@@ -334,7 +415,7 @@ orderLineId)`, which is also the **accepted-binding reference** — Subscription
 composition (plan revision, selected items, chain bindings, activation deadline) through Lifecycle's
 authorized immutable-version read `get_version` and verifies it at activation by comparison with
 its own signup resolve (Lifecycle D-162); no pin, price, item or amount crosses from this gear;
-the **explicit start intent** (`SUB-O10`); the **tenant axes**; the process **`correlationId`**
+no start instant (`SUB-O10` as reshaped, D-209); the **tenant axes**; the process **`correlationId`**
 (`SUB-O14`); the order and line **external references** snapshotted at the first handoff and
 reused on every retry (Lifecycle D-168); and the **unchanged intent key**
 `{tenant}:{orderId}:{orderVersion}:{orderLineId}:{wave}:{kind}[:{attempt}]` — a line-only key
@@ -343,7 +424,7 @@ client key)` deduplication; `activate` carries the draft id, its expected versio
 source tuple. `SUB-O1` (`order_compensation` reason), `SUB-O2` (order reference on create) and
 `SUB-O5` keep their canonical numbers; nothing here re-numbers them.
 
-#### `SUB-O15` — latency and throughput budget for the provisioning seam (UNASKED)
+#### `SUB-O15` — latency and throughput budget for the provisioning seam (answered in #5131, values open)
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-upreq-provisioning-latency-budget`
 
@@ -361,12 +442,12 @@ exceeded.
   into failed lines, manual tasks and compensations, because the only bound available is the
   self-imposed step deadline; there is no basis to distinguish "the downstream is within its
   objective and we budgeted wrongly" from "the downstream is failing its objective".
-- **Agreement status**: **UNASKED** — no latency, throughput or rate-limit ask exists in
-  `SEAMS.md` or anywhere in this register today.
+- **Agreement status**: answered in Subscriptions PR #5131 (`nfr-intent-seam-budget`); the values are
+  set at its NFR workshop. Pending merge (D-209).
 - **Source**: PRD §7 (fulfillment SLA), §6.3 (provisioning intents). Raised against
   `gears/bss/subscriptions/docs/SEAMS.md`, which has no such entry.
 
-#### `SUB-O16` — echo the identity envelope on every confirmation (UNASKED)
+#### `SUB-O16` — echo the identity envelope on every confirmation (answered in #5131; event name open)
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-upreq-identity-envelope-echo`
 
@@ -390,7 +471,9 @@ lookup, and so a callback that echoes nothing this gear issued is rejectable as 
   order_line_id }, wave, kind, wave_attempt, correlation_id, transition, outcome: applied | failed
   { reason_code } | oss_unconfirmed }`, the twin of `SubscriptionActivated`; this gear's two listen
   arms are its outcomes. Co-signed by Lifecycle `cpt-cf-bss-orders-lifecycle-upreq-transition-outcome-echo`.
-- **Agreement status**: **UNASKED** — never registered upstream at any number.
+- **Agreement status**: answered in Subscriptions PR #5131 (`fr-intent-protocol` item 4). **Still open**:
+  #5131 names no outcome event and no failure twin, so the event name of D-200 stays this gear's ask.
+  Pending merge (D-209).
 - **Source**: PRD §6.3 (provisioning-intent confirmations), §9.1 (actor authenticity). Raised
   against `gears/bss/subscriptions/docs/SEAMS.md`, which has no such entry.
 
@@ -1581,6 +1664,13 @@ it would shorten (D-105).
    event to Lifecycle's consumer contract with the `orders-events` corpus as the sign-off gate, and
    carry acceptance criteria 15b and 15c. Applied to the PRD on 2026-10-05.
 
+21. **§6.3, §9.2 and §13 — Subscriptions' answers in PR #5131 (D-209).** The PRD **MUST** use the
+   renumbered asks `SUB-O11`…`SUB-O14` throughout, name the withdrawal of an accepted request as the
+   superseding action, state that an activation intent carries no start instant and that the line's
+   add-ons, term, auto-renewal and co-term date are resolved by Subscriptions from the referenced
+   order version, and point the provisioning contract at Subscriptions' `contract-orders-intents`.
+   Applied to the PRD on 2026-10-12.
+
 ## 5. Traceability
 
 - **PRD**: [`./PRD.md`](./PRD.md) — §6.1 (Fulfillment Plan Construction), §6.2 (Approval
@@ -1601,7 +1691,7 @@ it would shorten (D-105).
   authorization, §2.8); `ADR/0011`, `ADR/0012`, `ADR/0013` and `DECISIONS.md` D-65…D-157, Q-10…Q-13
   (serverless-runtime, §2.9); `DECISIONS.md` D-110 (the `failure_reason` coverage ask, §2.4);
   D-91 and Q-08 (the overlap read's fail-closed reason, §2.1); D-97 as amended (no further
-  Subscriptions ask, §2.1); D-72, D-65, D-105 as amended, D-134 and D-140 (PRD amendments 11–14, §4); D-207 (customization scope, PRD amendment 19 and the §2.9 trigger version-selection ask); D-208 (Lifecycle D-179…D-186 received, §2.1, §2.4, PRD amendment 20)
+  Subscriptions ask, §2.1); D-72, D-65, D-105 as amended, D-134 and D-140 (PRD amendments 11–14, §4); D-207 (customization scope, PRD amendment 19 and the §2.9 trigger version-selection ask); D-208 (Lifecycle D-179…D-186 received, §2.1, §2.4, PRD amendment 20); D-209 (Subscriptions PR #5131 answers, §2.1, PRD amendment 21)
 - **Platform register**: serverless-runtime has no upstream-requirements register; §2.9 cites its
   [DESIGN.md](../../../serverless-runtime/docs/DESIGN.md), [PRD.md](../../../serverless-runtime/docs/PRD.md),
   [NEXT_ADR_SCOPE.md](../../../serverless-runtime/docs/NEXT_ADR_SCOPE.md) and ADR-0004/0005 by line
