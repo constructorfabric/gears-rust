@@ -584,6 +584,7 @@ impl<'a> QuotaManagement<'a> {
 }
 
 /// A create that passed every check before storage.
+#[domain_model]
 pub(super) struct PreparedCreate {
     /// The draft as storage takes it, constraint contract included.
     pub(super) draft: QuotaDraft,
@@ -596,6 +597,7 @@ pub(super) struct PreparedCreate {
 }
 
 /// An update that passed every check before storage.
+#[domain_model]
 pub(super) struct PreparedUpdate {
     /// The patch as storage takes it.
     pub(super) patch: QuotaPatch,
