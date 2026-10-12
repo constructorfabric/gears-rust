@@ -36,21 +36,17 @@
     "ListOrders": {
       "required_fields": [],
       "optional_fields": [
-        "page_size",
+        "limit",
         "cursor",
-        "state",
-        "created_from",
-        "created_to",
-        "state_entered_before",
-        "contract_id"
+        "$filter"
       ],
       "additional_fields": false,
-      "semantics": "Selected query names for existing filters only: created_from inclusive, created_to exclusive, state_entered_before inclusive (has remained in current state since that instant or earlier); state exact; contract_id exact. Fixed collection-specific sorts, no client-selected sort."
+      "semantics": "Shared list format (DNA REST PAGINATION.md, D-212): limit, cursor and an OData $filter over the existing design filters only, joined by and, each at most once: state eq (exact), created_at ge (inclusive), created_at lt (exclusive), state_entered_at le (has remained in current state since that instant or earlier), contract_id eq (exact). Fixed collection-specific sorts, no client-selected sort ($orderby refused)."
     },
     "VersionList": {
       "required_fields": [],
       "optional_fields": [
-        "page_size",
+        "limit",
         "cursor"
       ],
       "additional_fields": false,
@@ -59,7 +55,7 @@
     "LineList": {
       "required_fields": [],
       "optional_fields": [
-        "page_size",
+        "limit",
         "cursor"
       ],
       "additional_fields": false,
@@ -68,7 +64,7 @@
     "AcceptanceList": {
       "required_fields": [],
       "optional_fields": [
-        "page_size",
+        "limit",
         "cursor"
       ],
       "additional_fields": false,
@@ -77,7 +73,7 @@
     "AuditList": {
       "required_fields": [],
       "optional_fields": [
-        "page_size",
+        "limit",
         "cursor"
       ],
       "additional_fields": false,
@@ -307,64 +303,64 @@
     },
     "OrderPage": {
       "required_fields": [
-        "orders"
+        "items",
+        "page_info"
       ],
       "optional_fields": [
-        "next_cursor",
         "current_version",
         "current_acceptance"
       ],
       "additional_fields": false,
-      "semantics": "Authorized keyset page, 1–200/default 50; current acceptance/absence and history share a consistent read."
+      "semantics": "Authorized keyset page of orders as items, page_info {next_cursor, prev_cursor (always absent: forward only), limit} (D-212), 1–200/default 50; current acceptance/absence and history share a consistent read."
     },
     "VersionPage": {
       "required_fields": [
-        "versions"
+        "items",
+        "page_info"
       ],
       "optional_fields": [
-        "next_cursor",
         "current_version",
         "current_acceptance"
       ],
       "additional_fields": false,
-      "semantics": "Authorized keyset page, 1–200/default 50; current acceptance/absence and history share a consistent read."
+      "semantics": "Authorized keyset page of versions as items, page_info {next_cursor, prev_cursor (always absent: forward only), limit} (D-212), 1–200/default 50; current acceptance/absence and history share a consistent read."
     },
     "LinePage": {
       "required_fields": [
-        "lines"
+        "items",
+        "page_info"
       ],
       "optional_fields": [
-        "next_cursor",
         "current_version",
         "draft_revision",
         "current_acceptance"
       ],
       "additional_fields": false,
-      "semantics": "Authorized keyset page, 1–200/default 50; current acceptance/absence and history share a consistent read."
+      "semantics": "Authorized keyset page of lines as items, page_info {next_cursor, prev_cursor (always absent: forward only), limit} (D-212), 1–200/default 50; current acceptance/absence and history share a consistent read."
     },
     "AcceptancePage": {
       "required_fields": [
-        "acceptances"
+        "items",
+        "page_info"
       ],
       "optional_fields": [
-        "next_cursor",
         "current_version",
         "current_acceptance"
       ],
       "additional_fields": false,
-      "semantics": "Authorized keyset page, 1–200/default 50; current acceptance/absence and history share a consistent read."
+      "semantics": "Authorized keyset page of acceptances as items, page_info {next_cursor, prev_cursor (always absent: forward only), limit} (D-212), 1–200/default 50; current acceptance/absence and history share a consistent read."
     },
     "AuditPage": {
       "required_fields": [
-        "audit"
+        "items",
+        "page_info"
       ],
       "optional_fields": [
-        "next_cursor",
         "current_version",
         "current_acceptance"
       ],
       "additional_fields": false,
-      "semantics": "Authorized keyset page, 1–200/default 50; current acceptance/absence and history share a consistent read."
+      "semantics": "Authorized keyset page of audit as items, page_info {next_cursor, prev_cursor (always absent: forward only), limit} (D-212), 1–200/default 50; current acceptance/absence and history share a consistent read."
     }
   },
   "field_classes": {

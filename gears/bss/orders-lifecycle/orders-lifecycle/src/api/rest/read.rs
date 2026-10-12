@@ -1,8 +1,11 @@
 //! The three early S6-01 read routes (08 §3.3; S1-02 catalog `get`, `list`, `list_lines`):
 //! `GET /orders/{orderId}`, `GET /orders` and `GET /orders/{orderId}/lines`.
 //!
-//! Boundary order: `X-Delegation-Proof-Ref` (`request-invalid`, D-202) → `page_size`
-//! (`page-size-exceeded`) → filters and unknown query names (`filter-invalid`) → `cursor`
+//! The query is the shared list format (DNA REST `PAGINATION.md`, D-212): `limit`, `cursor` and,
+//! on the order list, an `OData` `$filter`; a page answers `items` and `page_info`.
+//!
+//! Boundary order: `X-Delegation-Proof-Ref` (`request-invalid`, D-202) → `limit`
+//! (`page-size-exceeded`) → `$filter` and unknown query names (`filter-invalid`) → `cursor`
 //! (`cursor-invalid`, D-139). All of these precede the access decision and append no
 //! access-log row (08 §3.6 common read wrapper item 1). Each handler then enters the shared
 //! [`ReadService`], which the local SDK uses too. Successful per-order reads carry the current
@@ -19,10 +22,10 @@ use bss_orders_lifecycle_sdk::catalog::{OrderState, Reason};
 use bss_orders_lifecycle_sdk::models::OrderVersion;
 use bss_orders_lifecycle_sdk::reads::{Cursor, LineList, ListOrders, OrderFilters, PageSize};
 use serde::Serialize;
-use time::format_description::well_known::Rfc3339;
 use toolkit::api::OpenApiRegistry;
 use toolkit::api::operation_builder::{OperationBuilder, ResponseHeaderSpec, ResponseHeaderType};
 use toolkit::api::rest::extract::Path;
+use toolkit_odata::filter::{FilterNode, FilterOp, ODataValue, parse_odata_filter};
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
@@ -31,16 +34,26 @@ use crate::authz::Caller;
 use crate::infra::read::{self, ReadService};
 
 const TAG: &str = "Orders Lifecycle";
-const PAGE_SIZE: &str = "page_size";
+const LIMIT: &str = "limit";
 const CURSOR: &str = "cursor";
-/// The S1-02 order-list filter names (CONTRACTS.md), in documentation order.
-const FILTERS: [&str; 5] = [
-    "state",
-    "created_from",
-    "created_to",
-    "state_entered_before",
-    "contract_id",
-];
+const FILTER: &str = "$filter";
+
+/// The order list's `$filter` fields (D-212). The supported terms are exactly the existing design
+/// filters: `state eq`, `created_at ge` (inclusive) and `created_at lt` (exclusive),
+/// `state_entered_at le` (in the current state since that instant or earlier) and
+/// `contract_id eq`, each at most once and joined only by `and`.
+#[derive(toolkit_odata_macros::ODataFilterable)]
+#[allow(dead_code, reason = "the derive reads the fields' filter kinds only")]
+struct OrderList {
+    #[odata(filter(kind = "String"))]
+    state: String,
+    #[odata(filter(kind = "DateTimeUtc"))]
+    created_at: String,
+    #[odata(filter(kind = "DateTimeUtc"))]
+    state_entered_at: String,
+    #[odata(filter(kind = "Uuid"))]
+    contract_id: Uuid,
+}
 
 fn refused(reason: Reason) -> OrdersError {
     OrdersError::Refused(reason)
@@ -67,13 +80,13 @@ fn query(uri: &Uri) -> Result<Query, OrdersError> {
     Ok(Query { values, repeated })
 }
 
-/// Step 1: `page_size` is an unsigned decimal integer in 1–200; anything else, including a
-/// repeated name, is `page-size-exceeded` (the S1-02 oracle's rule for a non-integer value).
-fn page_size(query: &Query) -> Result<Option<PageSize>, OrdersError> {
-    if query.repeated.iter().any(|name| name == PAGE_SIZE) {
+/// Step 1: `limit` is an unsigned decimal integer in 1–200; anything else, including a repeated
+/// name, is `page-size-exceeded` (the S1-02 oracle's rule for a non-integer value).
+fn limit(query: &Query) -> Result<Option<PageSize>, OrdersError> {
+    if query.repeated.iter().any(|name| name == LIMIT) {
         return Err(refused(Reason::PageSizeExceeded));
     }
-    let Some(text) = query.values.get(PAGE_SIZE) else {
+    let Some(text) = query.values.get(LIMIT) else {
         return Ok(None);
     };
     if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
@@ -85,46 +98,95 @@ fn page_size(query: &Query) -> Result<Option<PageSize>, OrdersError> {
     read::page_size(Some(value))
 }
 
-fn instant(text: &str) -> Result<time::OffsetDateTime, OrdersError> {
-    time::OffsetDateTime::parse(text, &Rfc3339).map_err(|_| refused(Reason::FilterInvalid))
+/// The `and`-joined terms of a filter; any other connective (`or`, `not`) is unsupported.
+fn conjuncts(
+    node: FilterNode<OrderListFilterField>,
+    out: &mut Vec<FilterNode<OrderListFilterField>>,
+) -> Result<(), OrdersError> {
+    match node {
+        FilterNode::Composite {
+            op: FilterOp::And,
+            children,
+        } => children
+            .into_iter()
+            .try_for_each(|child| conjuncts(child, out)),
+        FilterNode::Binary { .. } => {
+            out.push(node);
+            Ok(())
+        }
+        _ => Err(refused(Reason::FilterInvalid)),
+    }
 }
 
-/// Step 2 (order list): every query name is `page_size`, `cursor` or a supported filter, each at
-/// most once, with a well-formed value; `state` is a registered state token.
+/// An `OData` `DateTimeOffset` literal as the exact instant (nanoseconds are kept).
+fn instant(value: &ODataValue) -> Result<time::OffsetDateTime, OrdersError> {
+    let ODataValue::DateTime(at) = value else {
+        return Err(refused(Reason::FilterInvalid));
+    };
+    let nanos =
+        i128::from(at.timestamp()) * 1_000_000_000 + i128::from(at.timestamp_subsec_nanos());
+    time::OffsetDateTime::from_unix_timestamp_nanos(nanos)
+        .map_err(|_| refused(Reason::FilterInvalid))
+}
+
+/// Set a filter once; a second term for the same filter is `filter-invalid`.
+fn once<T>(slot: &mut Option<T>, value: T) -> Result<(), OrdersError> {
+    if slot.replace(value).is_some() {
+        return Err(refused(Reason::FilterInvalid));
+    }
+    Ok(())
+}
+
+/// Step 2 (order list): every query name is `limit`, `cursor` or `$filter`, each at most once;
+/// the filter parses with the platform `OData` parser and lowers term by term to the design
+/// filters. An unsupported field, operator, connective or value is `filter-invalid`.
 fn order_filters(query: &Query) -> Result<OrderFilters, OrdersError> {
     let invalid = || refused(Reason::FilterInvalid);
-    for name in query.values.keys() {
-        if name != PAGE_SIZE && name != CURSOR && !FILTERS.contains(&name.as_str()) {
-            return Err(invalid());
-        }
-    }
     if query
-        .repeated
-        .iter()
-        .any(|name| FILTERS.contains(&name.as_str()))
+        .values
+        .keys()
+        .any(|name| name != LIMIT && name != CURSOR && name != FILTER)
+        || query.repeated.iter().any(|name| name == FILTER)
     {
         return Err(invalid());
     }
-    let get = |name: &str| query.values.get(name).map(String::as_str);
-    let state = get("state")
-        .map(|token| {
-            serde_json::from_value::<OrderState>(serde_json::Value::String(token.to_owned()))
-                .map_err(|_| invalid())
-        })
-        .transpose()?;
-    let created_from = get("created_from").map(instant).transpose()?;
-    let created_to = get("created_to").map(instant).transpose()?;
-    let state_entered_before = get("state_entered_before").map(instant).transpose()?;
-    let contract_id = get("contract_id")
-        .map(|text| Uuid::try_parse(text).map_err(|_| invalid()))
-        .transpose()?;
-    Ok(OrderFilters {
-        state,
-        created_from,
-        created_to,
-        state_entered_before,
-        contract_id,
-    })
+    let mut filters = OrderFilters::default();
+    let Some(raw) = query.values.get(FILTER) else {
+        return Ok(filters);
+    };
+    if raw.len() > toolkit::api::odata::MAX_FILTER_LEN {
+        return Err(invalid());
+    }
+    let node = parse_odata_filter::<OrderListFilterField>(raw).map_err(|_| invalid())?;
+    let mut terms = Vec::new();
+    conjuncts(node, &mut terms)?;
+    for term in terms {
+        let FilterNode::Binary { field, op, value } = term else {
+            return Err(invalid());
+        };
+        match (field, op, &value) {
+            (OrderListFilterField::State, FilterOp::Eq, ODataValue::String(token)) => {
+                let state =
+                    serde_json::from_value::<OrderState>(serde_json::Value::String(token.clone()))
+                        .map_err(|_| invalid())?;
+                once(&mut filters.state, state)?;
+            }
+            (OrderListFilterField::CreatedAt, FilterOp::Ge, _) => {
+                once(&mut filters.created_from, instant(&value)?)?;
+            }
+            (OrderListFilterField::CreatedAt, FilterOp::Lt, _) => {
+                once(&mut filters.created_to, instant(&value)?)?;
+            }
+            (OrderListFilterField::StateEnteredAt, FilterOp::Le, _) => {
+                once(&mut filters.state_entered_before, instant(&value)?)?;
+            }
+            (OrderListFilterField::ContractId, FilterOp::Eq, ODataValue::Uuid(id)) => {
+                once(&mut filters.contract_id, *id)?;
+            }
+            _ => return Err(invalid()),
+        }
+    }
+    Ok(filters)
 }
 
 /// Step 2 (line list): the collection takes no filters, so any other name is `filter-invalid`.
@@ -132,7 +194,7 @@ fn no_filters(query: &Query) -> Result<(), OrdersError> {
     if query
         .values
         .keys()
-        .any(|name| name != PAGE_SIZE && name != CURSOR)
+        .any(|name| name != LIMIT && name != CURSOR)
     {
         return Err(refused(Reason::FilterInvalid));
     }
@@ -155,12 +217,12 @@ fn cursor(query: &Query) -> Result<Option<Cursor>, OrdersError> {
 /// The validated order-list request, in the flow's order.
 fn list_request(uri: &Uri) -> Result<ListOrders, OrdersError> {
     let query = query(uri)?;
-    let page_size = page_size(&query)?;
+    let limit = limit(&query)?;
     let filters = order_filters(&query)?;
     let cursor = cursor(&query)?;
     Ok(ListOrders {
         filters,
-        page_size,
+        limit,
         cursor,
     })
 }
@@ -168,10 +230,10 @@ fn list_request(uri: &Uri) -> Result<ListOrders, OrdersError> {
 /// The validated line-list request, in the flow's order.
 fn line_request(uri: &Uri) -> Result<LineList, OrdersError> {
     let query = query(uri)?;
-    let page_size = page_size(&query)?;
+    let limit = limit(&query)?;
     no_filters(&query)?;
     let cursor = cursor(&query)?;
-    Ok(LineList { page_size, cursor })
+    Ok(LineList { limit, cursor })
 }
 
 fn etag_value(version: OrderVersion) -> HeaderValue {
@@ -249,8 +311,12 @@ fn etag() -> ResponseHeaderSpec {
     )
 }
 
-const PAGE_SIZE_DOC: &str =
-    "Page size 1-200 (default 50); outside the range is 400 PAGE_SIZE_EXCEEDED";
+const LIMIT_DOC: &str = "Page size 1-200 (default 50); outside the range is 400 PAGE_SIZE_EXCEEDED";
+const FILTER_DOC: &str = "OData filter joined by `and` only, each term at most once: `state eq \
+                          'draft'` (a registered state token), `created_at ge <instant>` \
+                          (inclusive), `created_at lt <instant>` (exclusive), `state_entered_at \
+                          le <instant>` (in the current state since that instant or earlier), \
+                          `contract_id eq <uuid>`. Anything else is 400 FILTER_INVALID";
 const CURSOR_DOC: &str = "Opaque continuation from the previous page's next_cursor; a token \
                           failing structure, version, precision or its binding to this request \
                           is 400 CURSOR_INVALID";
@@ -291,39 +357,18 @@ pub fn router(service: Arc<ReadService>, openapi: &dyn OpenApiRegistry) -> Route
         .description(
             "One authorized keyset page in (created_at, order_id) order, scoped by the \
                  caller's PDP relationship (customer resource tenant, seller, current payer or an \
-                 explicit service order set) in SQL. Filters: state (exact), created_from \
-                 (inclusive), created_to (exclusive), state_entered_before (inclusive: in the \
-                 current state since that instant or earlier), contract_id (exact); an unknown \
-                 name or malformed value is 400 FILTER_INVALID. Untargeted denials are 403 \
+                 explicit service order set) in SQL, answered as items and page_info. $filter \
+                 supports the terms listed on the parameter; an unknown query name, sort or \
+                 malformed value is 400 FILTER_INVALID. Untargeted denials are 403 \
                  DELEGATION_PROOF_REQUIRED / DELEGATION_PROOF_INVALID / \
                  OPERATION_NOT_PERMITTED_FOR_ACTOR.",
         )
         .tag(TAG)
         .authenticated()
         .no_license_required()
-        .query_param_typed(PAGE_SIZE, false, PAGE_SIZE_DOC, "integer")
+        .query_param_typed(LIMIT, false, LIMIT_DOC, "integer")
         .query_param(CURSOR, false, CURSOR_DOC)
-        .query_param(
-            "state",
-            false,
-            "Exact registered state token (for example draft)",
-        )
-        .query_param(
-            "created_from",
-            false,
-            "RFC 3339 instant, inclusive lower bound on created_at",
-        )
-        .query_param(
-            "created_to",
-            false,
-            "RFC 3339 instant, exclusive upper bound on created_at",
-        )
-        .query_param(
-            "state_entered_before",
-            false,
-            "RFC 3339 instant: in the current state since that instant or earlier (inclusive)",
-        )
-        .query_param("contract_id", false, "Exact contract identity")
+        .query_param(FILTER, false, FILTER_DOC)
         .param(super::delegation_proof_param())
         .handler(list_orders)
         .json_response_with_schema::<OrdersOrderPage>(openapi, StatusCode::OK, "Authorized page")
@@ -345,7 +390,7 @@ pub fn router(service: Arc<ReadService>, openapi: &dyn OpenApiRegistry) -> Route
         .authenticated()
         .no_license_required()
         .path_param("orderId", "Order identity")
-        .query_param_typed(PAGE_SIZE, false, PAGE_SIZE_DOC, "integer")
+        .query_param_typed(LIMIT, false, LIMIT_DOC, "integer")
         .query_param(CURSOR, false, CURSOR_DOC)
         .param(super::delegation_proof_param())
         .handler(list_lines)

@@ -23,8 +23,12 @@ serde_json = { workspace = true }
 aws-lc-rs = { workspace = true }
 # Opaque continuation tokens (08 §2.2, D-139), following the Approvals cursor precedent.
 base64 = { workspace = true }
-# Read query-string decoding at the REST boundary (filters, page_size, cursor).
+# Read query-string decoding at the REST boundary (`$filter`, limit, cursor).
 serde_urlencoded = { workspace = true }
+# The shared list format (D-212): the platform `$filter` parser over a derived field enum, as the
+# ledger's collection GETs.
+toolkit-odata = { workspace = true }
+toolkit-odata-macros = { workspace = true }
 secrecy = { workspace = true }
 uuid = { workspace = true }
 tokio = { workspace = true }

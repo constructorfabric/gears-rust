@@ -40,7 +40,7 @@ use bss_orders_lifecycle_sdk::authoring::{
 use bss_orders_lifecycle_sdk::catalog::{OrderState, Reason};
 use bss_orders_lifecycle_sdk::models::{DraftRevision, OrderVersion};
 use bss_orders_lifecycle_sdk::reads::{
-    Cursor, LineList, LinePage, ListOrders, OrderPage, OrderSummary, PageSize,
+    Cursor, LineList, LinePage, ListOrders, OrderPage, OrderSummary, PageInfo, PageSize,
 };
 use opentelemetry::KeyValue;
 use opentelemetry::metrics::Counter;
@@ -240,7 +240,7 @@ impl ReadService {
         request: &ListOrders,
     ) -> Result<OrderPage, OrdersError> {
         Self::check_proof(caller)?;
-        let page_size = request.page_size.unwrap_or_default();
+        let page_size = request.limit.unwrap_or_default();
         let hash = read::filters_hash(&request.filters);
         let binding = CursorBinding {
             collection: Collection::Orders,
@@ -304,8 +304,8 @@ impl ReadService {
                 .await?;
         }
         Ok(OrderPage {
-            orders,
-            next_cursor,
+            items: orders,
+            page_info: PageInfo::forward(next_cursor, page_size),
         })
     }
 
@@ -321,7 +321,7 @@ impl ReadService {
         request: &LineList,
     ) -> Result<LinePage, OrdersError> {
         Self::check_proof(caller)?;
-        let page_size = request.page_size.unwrap_or_default();
+        let page_size = request.limit.unwrap_or_default();
         let hash = read::no_filters_hash();
         let binding = CursorBinding {
             collection: Collection::Lines,
@@ -355,8 +355,8 @@ impl ReadService {
         )?;
         let lines = compose_lines(&identities, &snapshot.drafts)?;
         let page = LinePage {
-            lines,
-            next_cursor,
+            items: lines,
+            page_info: PageInfo::forward(next_cursor, page_size),
             current_version: version_of(snapshot.row.current_version)?,
             draft_revision: draft_revision(&snapshot.row)?,
         };

@@ -212,12 +212,12 @@ def test_retry_and_conflict_wire_behavior(env: OrdersEnv, buyer: Buyer):
     assert env.count(
         f"SELECT count(*) FROM bss_orders__draft_content WHERE order_id = '{order_id}'"
     ) == 1
-    # The committed write and both settled refusals are audited; the mismatch and the 428 are
-    # not committed transitions.
+    # Both the committed write and the settled conflict are audited; the mismatch and the 428
+    # are not committed transitions. The settled 412 adds no chained entry either.
     assert env.count(
         f"SELECT count(*) FROM bss_orders__transition_audit WHERE order_id = '{order_id}'"
         " AND sequence IS NOT NULL"
-    ) == 3
+    ) == 2
 
 
 # ── Coherent authorized inspection ─────────────────────────────────────────
@@ -248,21 +248,32 @@ def test_reads_compose_from_the_store_page_in_sql_and_log_before_disclosure(env:
     )
     assert ok.status_code == 200, ok.text
 
-    page1 = api.get(f"{path}/lines", params={"page_size": 2})
+    # The shared list format (D-212): limit, cursor, items and page_info.
+    page1 = api.get(f"{path}/lines", params={"limit": 2})
     assert page1.status_code == 200, page1.text
-    assert [line["line_id"] for line in page1.json()["lines"]] == ids[:2]
-    assert page1.json()["current_version"] == 1 and page1.json().get("next_cursor")
-    page2 = api.get(f"{path}/lines", params={"page_size": 2, "cursor": page1.json()["next_cursor"]})
+    assert [line["line_id"] for line in page1.json()["items"]] == ids[:2]
+    info1 = page1.json()["page_info"]
+    assert page1.json()["current_version"] == 1 and info1.get("next_cursor") and info1["limit"] == 2
+    page2 = api.get(f"{path}/lines", params={"limit": 2, "cursor": info1["next_cursor"]})
     assert page2.status_code == 200
-    assert [line["line_id"] for line in page2.json()["lines"]] == ids[2:]
-    assert page2.json().get("next_cursor") is None
+    assert [line["line_id"] for line in page2.json()["items"]] == ids[2:]
+    assert page2.json()["page_info"].get("next_cursor") is None
 
-    listing = api.get(f"{API}/orders", params={"page_size": 200})
+    listing = api.get(
+        f"{API}/orders", params={"limit": 200, "$filter": "state eq 'draft'"}
+    )
     assert listing.status_code == 200, listing.text
-    assert any(o["order"]["order_id"] == order_id for o in listing.json()["orders"])
-    assert all(o["order"]["resource_tenant_id"] == RESOURCE_TENANT for o in listing.json()["orders"])
+    assert any(o["order"]["order_id"] == order_id for o in listing.json()["items"])
+    assert all(o["order"]["resource_tenant_id"] == RESOURCE_TENANT for o in listing.json()["items"])
+    assert all(o["order"]["state"] == "draft" for o in listing.json()["items"])
 
-    problem(api.get(f"{API}/orders", params={"page_size": 0}), 400, "PAGE_SIZE_EXCEEDED")
+    problem(api.get(f"{API}/orders", params={"limit": 0}), 400, "PAGE_SIZE_EXCEEDED")
+    problem(api.get(f"{API}/orders", params={"page_size": 5}), 400, "FILTER_INVALID")
+    problem(
+        api.get(f"{API}/orders", params={"$filter": "state eq 'draft' or state eq 'submitted'"}),
+        400,
+        "FILTER_INVALID",
+    )
     problem(api.get(f"{API}/orders", params={"cursor": "not-a-token"}), 400, "CURSOR_INVALID")
 
     # An own-tenant read without a proof logs nothing (08 §4.4); the seller's direct
@@ -349,7 +360,7 @@ def test_service_principals_need_finite_explicit_constraints(env: OrdersEnv, buy
     problem(workflow.get(path), 404, "ORDER_NOT_FOUND")
     listing = workflow.get(f"{API}/orders")
     assert listing.status_code == 200, listing.text
-    assert listing.json()["orders"] == []
+    assert listing.json()["items"] == []
     # A service principal whose policy has no finite order-ID path is an integration failure:
     # fail closed, sanitized, never a grant.
     tenant_only = env.client("subscriptions")

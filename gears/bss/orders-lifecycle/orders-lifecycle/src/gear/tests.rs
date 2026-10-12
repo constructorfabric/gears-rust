@@ -557,7 +557,7 @@ async fn postgres_boot_registers_unavailable_sdk_and_shutdown_is_cooperative() -
         response.status(),
         axum::http::StatusCode::SERVICE_UNAVAILABLE
     );
-    let request = axum::http::Request::get("/bss-orders-lifecycle/v1/orders?page_size=0")
+    let request = axum::http::Request::get("/bss-orders-lifecycle/v1/orders?limit=0")
         .body(axum::body::Body::empty())?;
     let response = tower::ServiceExt::oneshot(
         router.clone().layer(axum::Extension(caller.clone())),

@@ -239,7 +239,7 @@ wrapper, including order detail/list, version detail/list, lines, acceptance and
 sequences below specialize it, never exempt a surface from its checks.
 
 1. Validate filters and the cursor token before the access decision and before storage access.
-   Every collection (orders, versions, lines, acceptance history and audit) defaults to 50, rejects page_size outside
+   Every collection (orders, versions, lines, acceptance history and audit) defaults to 50, rejects a `limit` outside
    1–200 with `page-size-exceeded`, and queries at most limit+1 scoped rows using §2.2's cursor.
    A cursor that fails §2.2's cursor contract — structure, supported version, precision, or its
    binding to endpoint, parent order, principal, normalized filters and sort — returns
@@ -365,10 +365,10 @@ returned here (D-141).
 
 **Algorithm: List Orders**
 
-Input: security_context, filters, page_size, cursor
+Input: security_context, `$filter`, limit, cursor (the shared list format, D-212)
 Output: a page of order summaries, or a registered refusal
 
-1. [ ] - `p1` - **IF** page_size exceeds the configured maximum: **RETURN** page-size-exceeded refusal. This is input validation, not an access decision, so it appends no access-log row — logging it would let an unauthenticated-shaped caller drive one durable write per malformed request - `inst-lo-if-page-too-large`
+1. [ ] - `p1` - **IF** limit is outside 1–200 or not an unsigned decimal integer: **RETURN** page-size-exceeded refusal. This is input validation, not an access decision, so it appends no access-log row — logging it would let an unauthenticated-shaped caller drive one durable write per malformed request - `inst-lo-if-page-too-large`
 2. [ ] - `p1` - **IF** a filter names an unsupported field or value: **RETURN** filter-invalid refusal; input validation, so no access-log row - `inst-lo-if-filter-invalid`
 3. [ ] - `p1` - **IF** a cursor is supplied and fails §2.2's cursor contract — structure, supported version, precision, or its binding to this endpoint, the authenticated principal, the step 2 normalized filters and the sort: **RETURN** cursor-invalid refusal (D-139); input validation, so no access-log row - `inst-lo-if-cursor-invalid`
 4. [ ] - `p1` - Request `order × read` without a target ID through PolicyEnforcer, requiring constraints and carrying the caller's supplied delegation proof reference as request context, on every page request; this request is untargeted, so under the common wrapper's item 2 denial mapping a PDP delegation-proof denial returns the reason item 3 classifies, `delegation-proof-required` or `delegation-proof-invalid` (D-141), and any other denial `operation-not-permitted-for-actor` (D-114); no follow-up decision is made. PDP unavailability is not a denial: it returns §3.5's sanitized 503 - `inst-lo-resolve-scope`

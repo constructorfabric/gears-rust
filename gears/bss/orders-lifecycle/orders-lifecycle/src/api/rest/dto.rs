@@ -280,14 +280,26 @@ pub struct OrdersOrderSummary {
     pub draft_revision: Option<i64>,
 }
 
+/// Page metadata in the shared list format (DNA REST `PAGINATION.md`, D-212).
+#[toolkit_macros::api_dto(request, response)]
+#[serde(deny_unknown_fields)]
+pub struct OrdersPageInfo {
+    /// Opaque continuation; present only when another authorized row followed the page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+    /// Always absent: reads page forward only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prev_cursor: Option<String>,
+    /// The effective page size (1-200).
+    pub limit: u64,
+}
+
 /// One authorized keyset page of orders in `(created_at, order_id)` order.
 #[toolkit_macros::api_dto(request, response)]
 #[serde(deny_unknown_fields)]
 pub struct OrdersOrderPage {
-    pub orders: Vec<OrdersOrderSummary>,
-    /// Opaque continuation; present only when another authorized row followed the page.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub next_cursor: Option<String>,
+    pub items: Vec<OrdersOrderSummary>,
+    pub page_info: OrdersPageInfo,
 }
 
 /// One authorized keyset page of an order's current (draft working) lines in
@@ -296,9 +308,8 @@ pub struct OrdersOrderPage {
 #[toolkit_macros::api_dto(request, response)]
 #[serde(deny_unknown_fields)]
 pub struct OrdersLinePage {
-    pub lines: Vec<OrdersDraftLine>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub next_cursor: Option<String>,
+    pub items: Vec<OrdersDraftLine>,
+    pub page_info: OrdersPageInfo,
     pub current_version: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub draft_revision: Option<i64>,

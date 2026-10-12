@@ -9696,8 +9696,8 @@ ordering from the table above.
   it in the collection's declared order — for the audit read, rows where `created_at > t` or
   (`created_at = t` and `audit_id > id`); for the version list, `version` below the last one
   returned, and likewise `accepted_version` for the acceptance history. Preserve stored microseconds and UUID binary comparison exactly; never round cursor
-  timestamps to milliseconds or use textual UUID collation. Read up to page_size + 1 authorized
-  rows; return at most page_size and emit a next cursor from the last returned row only when the
+  timestamps to milliseconds or use textual UUID collation. Read up to limit + 1 authorized
+  rows; return at most limit and emit a next cursor from the last returned row only when the
   extra row exists. Existing default 50 and maximum 200 apply. No cursor/empty continuation means
   no further rows in that page's read, not that no future rows can arrive.
 * **Cursor is position, not authority.** Use an opaque versioned token containing the tuple and
@@ -9876,9 +9876,10 @@ service-principal check for the workflow-only operations is specified in
 | `GET` | `/bss-orders-lifecycle/v1/orders/{orderId}/audit` | The transition audit trail, including refused attempts; **paged**, because ADR-0005 makes it grow with request traffic | unstable |
 
 **Delivered draft reads (D-210).** `GET /orders/{orderId}`, `GET /orders` and `GET /orders/{orderId}/lines`
-are delivered for `draft` orders with the S1-02 query names, the `OrderPage`/`OrderSummary`/`LinePage`
-shapes (a line page of a draft also carries `draft_revision`), the boundary order proof header →
-`page_size` → filters → `cursor`, and a fail-closed `unavailable` answer for the undelivered
+are delivered for `draft` orders in the shared list format (D-212: `limit`, `cursor`, an OData
+`$filter` on the order list, `items` plus `page_info`), the `OrderSummary` element and a line page
+that also carries `current_version` and `draft_revision`, the boundary order proof header →
+`limit` → `$filter` → `cursor`, and a fail-closed `unavailable` answer for the undelivered
 committed-version composition; D-210 records those bindings.
 
 **Reasons contributed to the registry**: order-not-found (returned in preference to a

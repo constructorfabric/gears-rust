@@ -546,7 +546,7 @@
         "operation": "list",
         "meta": {},
         "body": {
-          "page_size": 0
+          "limit": 0
         }
       },
       "expected": "page-size-exceeded"
@@ -558,7 +558,7 @@
         "operation": "list",
         "meta": {},
         "body": {
-          "page_size": 200
+          "limit": 200
         }
       },
       "expected": "boundary-pass"
@@ -570,7 +570,7 @@
         "operation": "list",
         "meta": {},
         "body": {
-          "page_size": 201
+          "limit": 201
         }
       },
       "expected": "page-size-exceeded"
@@ -812,6 +812,18 @@
         "http_status": 409,
         "error_domain": "orders-lifecycle.v1",
         "error_code": "VERSION_CONFLICT"
+      }
+    },
+    {
+      "id": "P-precondition-failed",
+      "kind": "problem",
+      "reason": "precondition-failed",
+      "expected": {
+        "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~",
+        "title": "Failed precondition",
+        "http_status": 412,
+        "error_domain": "orders-lifecycle.v1",
+        "error_code": "PRECONDITION_FAILED"
       }
     },
     {

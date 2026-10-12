@@ -2,10 +2,11 @@
 //! `ListOrders`, `OrderPage`, `LineList`, `LinePage`). Early S6-01 draft subset with S6-04
 //! access logging.
 //!
-//! Every collection is paged (08 §2.2): `page_size` defaults to 50 and is bounded 1–200; the
-//! continuation `cursor` is an opaque versioned token that is position only, never authority
-//! (D-139). Filters bind the existing design filters under the S1-02 query names; clients cannot
-//! select a sort. A read carries no expected version or idempotency key; the only call metadata
+//! Every collection is paged (08 §2.2) in the shared list format (DNA REST `PAGINATION.md`,
+//! D-212): `limit` defaults to 50 and is bounded 1–200; the continuation `cursor` is an opaque
+//! versioned token that is position only, never authority (D-139); a page is `items` plus
+//! `page_info`. Over REST the order-list filters are an `OData` `$filter` lowered to
+//! [`OrderFilters`]; clients cannot select a sort. A read carries no expected version or idempotency key; the only call metadata
 //! is the supplied delegation proof reference, forwarded unvalidated to the PDP and recorded as
 //! *supplied* on the access log (08 §4.4, D-202).
 use crate::authoring::{DraftLine, OrderHeader};
@@ -101,10 +102,11 @@ pub struct ReadMeta {
     pub delegation_proof_ref: Option<DelegationProofRef>,
 }
 
-/// Order-list filters under the S1-02 query names (CONTRACTS.md): `state` exact,
-/// `created_from` inclusive, `created_to` exclusive, `state_entered_before` inclusive
-/// (continuously in the current state since that instant or earlier), `contract_id` exact.
-/// Timestamps are RFC 3339 instants; stored microseconds are compared exactly.
+/// Order-list filters: `state` exact, `created_from` inclusive, `created_to` exclusive,
+/// `state_entered_before` inclusive (continuously in the current state since that instant or
+/// earlier), `contract_id` exact. Over REST they are the `OData` `$filter` terms `state eq`,
+/// `created_at ge`, `created_at lt`, `state_entered_at le` and `contract_id eq` joined by `and`
+/// (D-212). Timestamps are RFC 3339 instants; stored microseconds are compared exactly.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OrderFilters {
@@ -137,14 +139,15 @@ pub struct OrderFilters {
 pub struct ListOrders {
     pub filters: OrderFilters,
     /// Absent means the default of 50.
-    pub page_size: Option<PageSize>,
+    pub limit: Option<PageSize>,
     pub cursor: Option<Cursor>,
 }
 
 /// The per-order line-list request (`models.json` `LineList`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LineList {
-    pub page_size: Option<PageSize>,
+    /// Absent means the default of 50.
+    pub limit: Option<PageSize>,
     pub cursor: Option<Cursor>,
 }
 
@@ -159,14 +162,37 @@ pub struct OrderSummary {
     pub draft_revision: Option<DraftRevision>,
 }
 
+/// Page metadata in the shared list format. `next_cursor` is present only when another
+/// authorized row followed the page; reads are forward-only, so `prev_cursor` is always absent;
+/// `limit` is the effective page size.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PageInfo {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<Cursor>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prev_cursor: Option<Cursor>,
+    pub limit: PageSize,
+}
+impl PageInfo {
+    /// A forward page of `limit` rows, continued by `next_cursor` when more rows follow.
+    #[must_use]
+    pub fn forward(next_cursor: Option<Cursor>, limit: PageSize) -> Self {
+        Self {
+            next_cursor,
+            prev_cursor: None,
+            limit,
+        }
+    }
+}
+
 /// One authorized keyset page of orders in `(created_at, order_id)` order (`models.json`
-/// `OrderPage`). `next_cursor` is present only when another authorized row followed the page.
+/// `OrderPage`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OrderPage {
-    pub orders: Vec<OrderSummary>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub next_cursor: Option<Cursor>,
+    pub items: Vec<OrderSummary>,
+    pub page_info: PageInfo,
 }
 
 /// One authorized keyset page of an order's current lines in `(created_at, line_id)` order of
@@ -176,9 +202,8 @@ pub struct OrderPage {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LinePage {
-    pub lines: Vec<DraftLine>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub next_cursor: Option<Cursor>,
+    pub items: Vec<DraftLine>,
+    pub page_info: PageInfo,
     pub current_version: OrderVersion,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub draft_revision: Option<DraftRevision>,

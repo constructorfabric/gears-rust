@@ -270,7 +270,7 @@ fn list_all() -> ListOrders {
 fn page(page_size: u64, cursor: Option<Cursor>) -> ListOrders {
     ListOrders {
         filters: OrderFilters::default(),
-        page_size: Some(PageSize::try_from(page_size).unwrap()),
+        limit: Some(PageSize::try_from(page_size).unwrap()),
         cursor,
     }
 }
@@ -328,10 +328,10 @@ async fn line_pages_follow_identity_order_and_a_cursor_survives_the_removed_memb
     let r = R::new().await;
     let (id, lines) = r.draft("p", 3).await;
     let lines_of = |page: &bss_orders_lifecycle_sdk::reads::LinePage| {
-        page.lines.iter().map(|l| l.line_id).collect::<Vec<_>>()
+        page.items.iter().map(|l| l.line_id).collect::<Vec<_>>()
     };
     let request = |page_size: u64, cursor: Option<Cursor>| LineList {
-        page_size: Some(PageSize::try_from(page_size).unwrap()),
+        limit: Some(PageSize::try_from(page_size).unwrap()),
         cursor,
     };
     // Page size 2 then the cursor: no duplicate, no skip, no cursor after the last member.
@@ -343,14 +343,18 @@ async fn line_pages_follow_identity_order_and_a_cursor_survives_the_removed_memb
     assert_eq!(lines_of(&first), lines[..2]);
     assert_eq!(i64::from(first.current_version), 1);
     assert_eq!(first.draft_revision.map(i64::from), Some(5));
-    let token = first.next_cursor.clone().expect("a third line follows");
+    let token = first
+        .page_info
+        .next_cursor
+        .clone()
+        .expect("a third line follows");
     let second = r
         .reads
         .list_lines(&buyer(), id, &request(2, Some(token)))
         .await
         .unwrap();
     assert_eq!(lines_of(&second), lines[2..]);
-    assert!(second.next_cursor.is_none());
+    assert!(second.page_info.next_cursor.is_none());
     // A cursor survives the removal of the member that issued it: the continuation is strictly
     // after the encoded position, and the removed identity is not a current line.
     let one = r
@@ -358,7 +362,7 @@ async fn line_pages_follow_identity_order_and_a_cursor_survives_the_removed_memb
         .list_lines(&buyer(), id, &request(1, None))
         .await
         .unwrap();
-    assert_eq!(one.lines[0].line_id, lines[0]);
+    assert_eq!(one.items[0].line_id, lines[0]);
     result(
         r.capture
             .remove_line(&buyer(), id, lines[0], &write("p-rm0", 1, Some(5)))
@@ -367,10 +371,10 @@ async fn line_pages_follow_identity_order_and_a_cursor_survives_the_removed_memb
     );
     let continued = r
         .reads
-        .list_lines(&buyer(), id, &request(1, one.next_cursor))
+        .list_lines(&buyer(), id, &request(1, one.page_info.next_cursor))
         .await
         .unwrap();
-    assert_eq!(continued.lines[0].line_id, lines[1]);
+    assert_eq!(continued.items[0].line_id, lines[1]);
     assert_eq!(continued.draft_revision.map(i64::from), Some(6));
     let fresh = r
         .reads
@@ -391,7 +395,7 @@ async fn line_pages_follow_identity_order_and_a_cursor_survives_the_removed_memb
         remaining,
         "the two remaining members fill the page exactly"
     );
-    assert!(exact.next_cursor.is_none());
+    assert!(exact.page_info.next_cursor.is_none());
     assert_eq!(r.log_count().await, 0, "own-tenant line pages log nothing");
 }
 
@@ -408,16 +412,17 @@ async fn line_tokens_bind_principal_parent_and_collection() {
             &buyer(),
             id,
             &LineList {
-                page_size: Some(PageSize::try_from(2).unwrap()),
+                limit: Some(PageSize::try_from(2).unwrap()),
                 cursor: None,
             },
         )
         .await
         .unwrap()
+        .page_info
         .next_cursor
         .expect("a third line follows");
     let replay = |cursor: Cursor| LineList {
-        page_size: None,
+        limit: None,
         cursor: Some(cursor),
     };
     let other = r
@@ -727,12 +732,12 @@ async fn the_order_list_pages_the_scoped_set_in_sql_and_logs_by_effective_scope(
     loop {
         let page: OrderPage = r.reads.list(&buyer(), &page(2, cursor)).await.unwrap();
         pages += 1;
-        seen.extend(page.orders.iter().map(|o| o.order.order_id));
-        for summary in &page.orders {
+        seen.extend(page.items.iter().map(|o| o.order.order_id));
+        for summary in &page.items {
             assert_eq!(i64::from(summary.current_version), 1);
             assert_eq!(summary.draft_revision.map(i64::from), Some(0));
         }
-        match page.next_cursor {
+        match page.page_info.next_cursor {
             Some(next) => cursor = Some(next),
             None => break,
         }
@@ -758,10 +763,10 @@ async fn the_order_list_pages_the_scoped_set_in_sql_and_logs_by_effective_scope(
     // including an empty page under a filter that matches nothing.
     let confined = user(CONFINED.0, CONFINED.1);
     let page_c = r.reads.list(&confined, &page(200, None)).await.unwrap();
-    assert_eq!(page_c.orders.len(), 6);
+    assert_eq!(page_c.items.len(), 6);
     assert!(
         page_c
-            .orders
+            .items
             .iter()
             .all(|o| o.order.resource_tenant_id == u(10))
     );
@@ -774,13 +779,13 @@ async fn the_order_list_pages_the_scoped_set_in_sql_and_logs_by_effective_scope(
                     contract_id: Some(u(0xc0)),
                     ..OrderFilters::default()
                 },
-                page_size: None,
+                limit: None,
                 cursor: None,
             },
         )
         .await
         .unwrap();
-    assert!(none.orders.is_empty() && none.next_cursor.is_none());
+    assert!(none.items.is_empty() && none.page_info.next_cursor.is_none());
     assert_eq!(r.log_count().await, 0, "a confined collection never logs");
     // A proof on the confined reader's allowed request logs anyway.
     r.reads
@@ -796,13 +801,13 @@ async fn the_order_list_pages_the_scoped_set_in_sql_and_logs_by_effective_scope(
         .list(&user(SELLER.0, SELLER.1), &page(200, None))
         .await
         .unwrap();
-    assert_eq!(seller_page.orders.len(), 7);
+    assert_eq!(seller_page.items.len(), 7);
     let empty = r
         .reads
         .list(&user(OTHER_SELLER.0, OTHER_SELLER.1), &list_all())
         .await
         .unwrap();
-    assert!(empty.orders.is_empty());
+    assert!(empty.items.is_empty());
     assert_eq!(r.log_count().await, 2);
     // The payer reader sees payer-30 rows; the member-only user is refused untargeted.
     let payer_page = r
@@ -810,7 +815,7 @@ async fn the_order_list_pages_the_scoped_set_in_sql_and_logs_by_effective_scope(
         .list(&user(PAYER.0, PAYER.1), &page(200, None))
         .await
         .unwrap();
-    assert_eq!(payer_page.orders.len(), 7);
+    assert_eq!(payer_page.items.len(), 7);
     r.clear_logs().await;
     let denied = r
         .reads
@@ -871,7 +876,7 @@ async fn list_filters_cursors_and_service_scopes_are_applied_in_sql() {
                     state_entered_before: Some(fixture_at),
                     contract_id: None,
                 },
-                page_size: Some(PageSize::try_from(2).unwrap()),
+                limit: Some(PageSize::try_from(2).unwrap()),
                 cursor: None,
             },
         )
@@ -879,7 +884,7 @@ async fn list_filters_cursors_and_service_scopes_are_applied_in_sql() {
         .unwrap();
     assert_eq!(
         filtered
-            .orders
+            .items
             .iter()
             .map(|o| o.order.order_id)
             .collect::<Vec<_>>(),
@@ -897,20 +902,20 @@ async fn list_filters_cursors_and_service_scopes_are_applied_in_sql() {
                     state_entered_before: Some(fixture_at),
                     contract_id: None,
                 },
-                page_size: Some(PageSize::try_from(2).unwrap()),
-                cursor: filtered.next_cursor.clone(),
+                limit: Some(PageSize::try_from(2).unwrap()),
+                cursor: filtered.page_info.next_cursor.clone(),
             },
         )
         .await
         .unwrap();
     assert_eq!(
-        rest.orders
+        rest.items
             .iter()
             .map(|o| o.order.order_id)
             .collect::<Vec<_>>(),
         vec![u(3)]
     );
-    assert!(rest.next_cursor.is_none());
+    assert!(rest.page_info.next_cursor.is_none());
     let exclusive = r
         .reads
         .list(
@@ -920,13 +925,13 @@ async fn list_filters_cursors_and_service_scopes_are_applied_in_sql() {
                     created_to: Some(fixture_at),
                     ..OrderFilters::default()
                 },
-                page_size: None,
+                limit: None,
                 cursor: None,
             },
         )
         .await
         .unwrap();
-    assert!(exclusive.orders.is_empty(), "created_to is exclusive");
+    assert!(exclusive.items.is_empty(), "created_to is exclusive");
     let by_contract = r
         .reads
         .list(
@@ -936,13 +941,13 @@ async fn list_filters_cursors_and_service_scopes_are_applied_in_sql() {
                     contract_id: Some(u(0xc0)),
                     ..OrderFilters::default()
                 },
-                page_size: None,
+                limit: None,
                 cursor: None,
             },
         )
         .await
         .unwrap();
-    assert!(by_contract.orders.is_empty());
+    assert!(by_contract.items.is_empty());
     let other_state = r
         .reads
         .list(
@@ -952,15 +957,15 @@ async fn list_filters_cursors_and_service_scopes_are_applied_in_sql() {
                     state: Some(OrderState::Submitted),
                     ..OrderFilters::default()
                 },
-                page_size: None,
+                limit: None,
                 cursor: None,
             },
         )
         .await
         .unwrap();
-    assert!(other_state.orders.is_empty());
+    assert!(other_state.items.is_empty());
     // Tokens are bound to the principal and to the normalized filters.
-    let token = filtered.next_cursor.unwrap();
+    let token = filtered.page_info.next_cursor.unwrap();
     let as_seller = r
         .reads
         .list(&user(SELLER.0, SELLER.1), &page(2, Some(token.clone())))
@@ -1023,7 +1028,7 @@ async fn service_principals_read_only_their_finite_order_ids() {
     let wf_page = rules.list(&workflow, &list_all()).await.unwrap();
     assert_eq!(
         wf_page
-            .orders
+            .items
             .iter()
             .map(|o| o.order.order_id)
             .collect::<Vec<_>>(),
@@ -1052,7 +1057,7 @@ async fn service_principals_read_only_their_finite_order_ids() {
     let scoped = finite.list(&workflow, &list_all()).await.unwrap();
     assert_eq!(
         scoped
-            .orders
+            .items
             .iter()
             .map(|o| o.order.order_id)
             .collect::<Vec<_>>(),
@@ -1197,45 +1202,43 @@ async fn the_mounted_read_routes_carry_etag_pages_and_problems_on_the_wire() {
     assert!(detail.2.get("resolved_total").is_none());
     assert!(detail.2.get("draftRevision").is_none());
     // Line page: ETag, snake_case, page walk through next_cursor.
-    let first = http(
-        &router,
-        "GET",
-        &format!("{order}/lines?page_size=1"),
-        &[],
-        None,
-    )
-    .await;
+    let first = http(&router, "GET", &format!("{order}/lines?limit=1"), &[], None).await;
     assert_eq!(first.0, 200, "{:?}", first.2);
     assert_eq!(first.1["etag"], "\"1\"");
     assert_eq!(first.2["current_version"], json!(1));
     assert_eq!(first.2["draft_revision"], json!(4));
-    assert_eq!(first.2["lines"][0]["line_id"], json!(s(lines[0])));
-    let token = first.2["next_cursor"].as_str().unwrap().to_owned();
+    assert_eq!(first.2["items"][0]["line_id"], json!(s(lines[0])));
+    assert_eq!(first.2["page_info"]["limit"], json!(1));
+    let token = first.2["page_info"]["next_cursor"]
+        .as_str()
+        .unwrap()
+        .to_owned();
     let second = http(
         &router,
         "GET",
-        &format!("{order}/lines?page_size=1&cursor={token}"),
+        &format!("{order}/lines?limit=1&cursor={token}"),
         &[],
         None,
     )
     .await;
     assert_eq!(second.0, 200);
-    assert_eq!(second.2["lines"][0]["line_id"], json!(s(lines[1])));
-    assert!(second.2.get("next_cursor").is_none());
+    assert_eq!(second.2["items"][0]["line_id"], json!(s(lines[1])));
+    assert!(second.2["page_info"].get("next_cursor").is_none());
+    assert!(second.2["page_info"].get("prev_cursor").is_none());
     // The order list with filters and a page walk.
     let list = http(
         &router,
         "GET",
-        "/bss-orders-lifecycle/v1/orders?state=draft&page_size=1",
+        "/bss-orders-lifecycle/v1/orders?%24filter=state%20eq%20%27draft%27&limit=1",
         &[],
         None,
     )
     .await;
     assert_eq!(list.0, 200, "{:?}", list.2);
-    assert_eq!(list.2["orders"][0]["order"]["order_id"], json!(s(id)));
-    assert_eq!(list.2["orders"][0]["current_version"], json!(1));
+    assert_eq!(list.2["items"][0]["order"]["order_id"], json!(s(id)));
+    assert_eq!(list.2["items"][0]["current_version"], json!(1));
     assert!(list.1.get("etag").is_none(), "the list carries no ETag");
-    assert!(list.2.get("next_cursor").is_none());
+    assert_eq!(list.2["page_info"], json!({"limit": 1}));
     r.clear_logs().await;
     // Input validation precedence, each a problem+json refusal with no access-log row.
     let expect = |path: &str, status: u16, code: &str| {
@@ -1252,34 +1255,36 @@ async fn the_mounted_read_routes_carry_etag_pages_and_problems_on_the_wire() {
     };
     for bad in ["0", "201", "abc", "-1", "+5", "1.5", ""] {
         expect(
-            &format!("/bss-orders-lifecycle/v1/orders?page_size={bad}"),
+            &format!("/bss-orders-lifecycle/v1/orders?limit={bad}"),
             400,
             "PAGE_SIZE_EXCEEDED",
         )
         .await;
     }
     expect(
-        "/bss-orders-lifecycle/v1/orders?page_size=1&page_size=2",
+        "/bss-orders-lifecycle/v1/orders?limit=1&limit=2",
         400,
         "PAGE_SIZE_EXCEEDED",
     )
     .await;
     // Page size is checked before filters, filters before the cursor.
     expect(
-        "/bss-orders-lifecycle/v1/orders?page_size=500&bogus=1&cursor=x",
+        "/bss-orders-lifecycle/v1/orders?limit=500&bogus=1&cursor=x",
         400,
         "PAGE_SIZE_EXCEEDED",
     )
     .await;
     for bad in [
         "bogus=1",
-        "state=bogus",
-        "state=draft&state=draft",
-        "created_from=yesterday",
-        "created_to=2026-13-01T00:00:00Z",
-        "state_entered_before=2026-01-01",
-        "contract_id=not-a-uuid",
-        "sort=created_at",
+        "page_size=1",
+        "state=draft",
+        "%24filter=state%20eq%20%27bogus%27",
+        "%24filter=state%20eq%20%27draft%27%20or%20state%20eq%20%27submitted%27",
+        "%24filter=created_at%20ge%20yesterday",
+        "%24filter=created_at%20lt%202026-13-01T00:00:00Z",
+        "%24filter=state_entered_at%20le%202026-01-01",
+        "%24filter=contract_id%20eq%20not-a-uuid",
+        "%24orderby=created_at",
     ] {
         expect(
             &format!("/bss-orders-lifecycle/v1/orders?{bad}&cursor=x"),
@@ -1302,13 +1307,13 @@ async fn the_mounted_read_routes_carry_etag_pages_and_problems_on_the_wire() {
         "CURSOR_INVALID",
     )
     .await;
-    expect(&format!("{order}/lines?state=draft"), 400, "FILTER_INVALID").await;
     expect(
-        &format!("{order}/lines?page_size=0"),
+        &format!("{order}/lines?%24filter=state%20eq%20%27draft%27"),
         400,
-        "PAGE_SIZE_EXCEEDED",
+        "FILTER_INVALID",
     )
     .await;
+    expect(&format!("{order}/lines?limit=0"), 400, "PAGE_SIZE_EXCEEDED").await;
     expect(&format!("{order}/lines?cursor=zzz"), 400, "CURSOR_INVALID").await;
     assert_eq!(r.log_count().await, 0, "input validation appends no row");
     // Missing and hidden targets: 404 ORDER_NOT_FOUND, logged refused.
@@ -1392,15 +1397,15 @@ async fn sdk_reads_match_the_service_and_undelivered_compositions_fail_closed() 
         .list(buyer().ctx(), list_all(), meta(None))
         .await
         .unwrap();
-    assert_eq!(page.orders.len(), 1);
-    assert_eq!(page.orders[0].order.order_id, id);
+    assert_eq!(page.items.len(), 1);
+    assert_eq!(page.items[0].order.order_id, id);
     let line_page = sdk
         .list_lines(buyer().ctx(), id, LineList::default(), meta(None))
         .await
         .unwrap();
     assert_eq!(
         line_page
-            .lines
+            .items
             .iter()
             .map(|l| l.line_id)
             .collect::<Vec<_>>(),
@@ -1427,8 +1432,8 @@ async fn sdk_reads_match_the_service_and_undelivered_compositions_fail_closed() 
         .list(buyer().ctx(), list_all(), meta(None))
         .await
         .unwrap();
-    assert_eq!(summaries.orders[0].order.state, OrderState::Submitted);
-    assert_eq!(summaries.orders[0].draft_revision, None);
+    assert_eq!(summaries.items[0].order.state, OrderState::Submitted);
+    assert_eq!(summaries.items[0].draft_revision, None);
     let before = r.log_count().await;
     assert!(matches!(
         sdk.list_lines(buyer().ctx(), id, LineList::default(), meta(None))
@@ -1554,8 +1559,8 @@ async fn undelivered_compositions_answer_the_documented_unavailable_problem_on_t
     assert_eq!(r.log_count().await, 0, "nothing disclosed, nothing logged");
     let list = http(&router, "GET", "/bss-orders-lifecycle/v1/orders", &[], None).await;
     assert_eq!(list.0, 200, "{:?}", list.2);
-    assert_eq!(list.2["orders"][0]["order"]["order_id"], json!(s(id)));
-    assert_eq!(list.2["orders"][0]["order"]["state"], json!("submitted"));
-    assert_eq!(list.2["orders"][0]["current_version"], json!(1));
-    assert!(list.2["orders"][0].get("draft_revision").is_none());
+    assert_eq!(list.2["items"][0]["order"]["order_id"], json!(s(id)));
+    assert_eq!(list.2["items"][0]["order"]["state"], json!("submitted"));
+    assert_eq!(list.2["items"][0]["current_version"], json!(1));
+    assert!(list.2["items"][0].get("draft_revision").is_none());
 }
