@@ -352,8 +352,13 @@ pub fn violation_of(err: &DbErr) -> Option<ConstraintViolation> {
 /// chose for it.
 ///
 /// So: a code that names a condition is the final answer, yes or no. A code
-/// that names none still leaves `sql_err()` its turn. After that the code
-/// decides how far the text may be trusted: a code in the constraint class
+/// that names none still leaves `sql_err()` its turn, and what `sql_err()`
+/// classifies is final in the same way: a classification of another kind is a
+/// "no", not leave to read the text. `MySQL` reports every constraint refusal
+/// as `23000` and `sql_err()` tells them apart by vendor number, while the
+/// message echoes the constraint's name, so a foreign key named `totally not a
+/// duplicate key issue` would otherwise read as a unique violation. After that
+/// the code decides how far the text may be trusted: a code in the constraint class
 /// (`23xxx`, or `SQLITE_CONSTRAINT` and its extensions) has already said
 /// "a constraint refused this", and the text may say *which* -- that is a
 /// `MySQL` vendor number `sql_err()` lacks, or a `SQLite` constraint code the
@@ -368,7 +373,7 @@ pub fn violation_of(err: &DbErr) -> Option<ConstraintViolation> {
 fn classifies_as(
     err: &sea_orm::DbErr,
     violation: ConstraintViolation,
-    sea_orm_says: impl FnOnce() -> bool,
+    sea_orm_says: impl FnOnce(&sea_orm::SqlErr) -> bool,
     message_says: impl FnOnce(&str) -> bool,
 ) -> bool {
     // The driver named a condition: that is the answer, either way.
@@ -376,8 +381,9 @@ fn classifies_as(
         return named == violation;
     }
 
-    if sea_orm_says() {
-        return true;
+    // `SeaORM` classified it: that is the answer too, either way.
+    if let Some(classified) = err.sql_err() {
+        return sea_orm_says(&classified);
     }
 
     if let Some(code) = driver_code(err) {
@@ -450,12 +456,7 @@ pub fn is_unique_violation(err: &sea_orm::DbErr) -> bool {
     classifies_as(
         err,
         ConstraintViolation::Unique,
-        || {
-            matches!(
-                err.sql_err(),
-                Some(sea_orm::SqlErr::UniqueConstraintViolation(_))
-            )
-        },
+        |classified| matches!(classified, sea_orm::SqlErr::UniqueConstraintViolation(_)),
         |msg| {
             msg.contains("unique constraint")
                 || msg.contains("duplicate key")
@@ -494,10 +495,10 @@ pub fn is_foreign_key_violation(err: &sea_orm::DbErr) -> bool {
     classifies_as(
         err,
         ConstraintViolation::ForeignKey,
-        || {
+        |classified| {
             matches!(
-                err.sql_err(),
-                Some(sea_orm::SqlErr::ForeignKeyConstraintViolation(_))
+                classified,
+                sea_orm::SqlErr::ForeignKeyConstraintViolation(_)
             )
         },
         |msg| {
