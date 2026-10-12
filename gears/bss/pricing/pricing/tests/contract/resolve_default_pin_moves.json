@@ -1,0 +1,304 @@
+{
+  "golden": "resolve_default_pin_moves",
+  "proves": "D-420 rule 4 (owner 2026-09-26): a value pinned to a default-chain price moves to its own chain once the own price in force is `all` and started after the pin (us, from 2026-10-01); a `new` own price does not move it (apac); before the own price starts both stay on the default. D-420 rule 2's date bound: the default's later `all` successor (from 2027-01-01) is not walked to, so apac stays on the default, not on its own `new` price",
+  "exchanges": [
+    {
+      "case": "us and apac pinned to the default on 2026-09-15",
+      "caller": "the tenant",
+      "request": "GET /bss-pricing/v1/resolve?plan_revision_id=<revision:pro-2>&date=2026-09-15&item_id=<item:pro-2/storage>&pins=<price:storage-default>:us,<price:storage-default>:apac",
+      "status": 200,
+      "body": {
+        "plan_revision_id": "<revision:pro-2>",
+        "plan_id": "<plan:pro>",
+        "rev_no": 2,
+        "state": "published",
+        "book_id": "<book:eur>",
+        "currency": "EUR",
+        "currency_minor_digits": 2,
+        "rounding_policy": "half_even",
+        "date": "2026-09-15",
+        "items": [
+          {
+            "usage_rating_policy": null,
+            "item_id": "<item:pro-2/storage>",
+            "sku_id": "<sku:storage>",
+            "price_book_entry_id": "<entry:storage>",
+            "charge_kind": "usage",
+            "period": null,
+            "model": "per_unit",
+            "sku_version": {
+              "published_version": 1,
+              "effective_from": "2026-01-01"
+            },
+            "invoice_line_template": {
+              "value": "{sku} ({dimension}) in {unit}",
+              "source": "tenant"
+            },
+            "gl_code": {
+              "value": "9000",
+              "source": "tenant"
+            },
+            "tax_category": {
+              "value": "reduced",
+              "source": "sku"
+            },
+            "billing_timing": {
+              "value": "arrears",
+              "source": "tenant"
+            },
+            "meter": {
+              "usage_type_ref": "gts.cf.core.uc.usage_record.v1~cf.test.usage.storage.v1",
+              "unit": "GB"
+            },
+            "chains": [
+              {
+                "dim_value": null,
+                "uncovered": false,
+                "binding": {
+                  "price_id": "<price:storage-default>",
+                  "dim_used": null,
+                  "pinned_from": null,
+                  "price": {
+                    "rate": "0.10"
+                  },
+                  "min_fee": "5.00",
+                  "eligibility": "all",
+                  "effective_from": "2026-01-01",
+                  "effective_to": "2027-01-01",
+                  "temporary_until": null,
+                  "ends_on": null,
+                  "keep_for_bound": false
+                }
+              },
+              {
+                "dim_value": "eu",
+                "uncovered": false,
+                "binding": {
+                  "price_id": "<price:storage-eu>",
+                  "dim_used": "eu",
+                  "pinned_from": null,
+                  "price": {
+                    "rate": "0.08"
+                  },
+                  "min_fee": null,
+                  "eligibility": "all",
+                  "effective_from": "2026-01-01",
+                  "effective_to": null,
+                  "temporary_until": null,
+                  "ends_on": null,
+                  "keep_for_bound": false
+                }
+              },
+              {
+                "dim_value": "us",
+                "uncovered": false,
+                "binding": {
+                  "price_id": "<price:storage-default>",
+                  "dim_used": null,
+                  "pinned_from": "<price:storage-default>",
+                  "price": {
+                    "rate": "0.10"
+                  },
+                  "min_fee": "5.00",
+                  "eligibility": "all",
+                  "effective_from": "2026-01-01",
+                  "effective_to": "2027-01-01",
+                  "temporary_until": null,
+                  "ends_on": null,
+                  "keep_for_bound": false
+                }
+              },
+              {
+                "dim_value": "apac",
+                "uncovered": false,
+                "binding": {
+                  "price_id": "<price:storage-default>",
+                  "dim_used": null,
+                  "pinned_from": "<price:storage-default>",
+                  "price": {
+                    "rate": "0.10"
+                  },
+                  "min_fee": "5.00",
+                  "eligibility": "all",
+                  "effective_from": "2026-01-01",
+                  "effective_to": "2027-01-01",
+                  "temporary_until": null,
+                  "ends_on": null,
+                  "keep_for_bound": false
+                }
+              },
+              {
+                "dim_value": "latam",
+                "uncovered": false,
+                "binding": {
+                  "price_id": "<price:storage-latam-temp>",
+                  "dim_used": "latam",
+                  "pinned_from": null,
+                  "price": {
+                    "rate": "0.05"
+                  },
+                  "min_fee": null,
+                  "eligibility": "all",
+                  "effective_from": "2026-09-01",
+                  "effective_to": "2026-09-20",
+                  "temporary_until": "2026-09-20",
+                  "ends_on": "2026-09-20",
+                  "keep_for_bound": false
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "case": "us and apac pinned to the default on 2026-10-05",
+      "caller": "the tenant",
+      "request": "GET /bss-pricing/v1/resolve?plan_revision_id=<revision:pro-2>&date=2026-10-05&item_id=<item:pro-2/storage>&pins=<price:storage-default>:us,<price:storage-default>:apac",
+      "status": 200,
+      "body": {
+        "plan_revision_id": "<revision:pro-2>",
+        "plan_id": "<plan:pro>",
+        "rev_no": 2,
+        "state": "published",
+        "book_id": "<book:eur>",
+        "currency": "EUR",
+        "currency_minor_digits": 2,
+        "rounding_policy": "half_even",
+        "date": "2026-10-05",
+        "items": [
+          {
+            "usage_rating_policy": null,
+            "item_id": "<item:pro-2/storage>",
+            "sku_id": "<sku:storage>",
+            "price_book_entry_id": "<entry:storage>",
+            "charge_kind": "usage",
+            "period": null,
+            "model": "per_unit",
+            "sku_version": {
+              "published_version": 1,
+              "effective_from": "2026-01-01"
+            },
+            "invoice_line_template": {
+              "value": "{sku} ({dimension}) in {unit}",
+              "source": "tenant"
+            },
+            "gl_code": {
+              "value": "9000",
+              "source": "tenant"
+            },
+            "tax_category": {
+              "value": "reduced",
+              "source": "sku"
+            },
+            "billing_timing": {
+              "value": "arrears",
+              "source": "tenant"
+            },
+            "meter": {
+              "usage_type_ref": "gts.cf.core.uc.usage_record.v1~cf.test.usage.storage.v1",
+              "unit": "GB"
+            },
+            "chains": [
+              {
+                "dim_value": null,
+                "uncovered": false,
+                "binding": {
+                  "price_id": "<price:storage-default>",
+                  "dim_used": null,
+                  "pinned_from": null,
+                  "price": {
+                    "rate": "0.10"
+                  },
+                  "min_fee": "5.00",
+                  "eligibility": "all",
+                  "effective_from": "2026-01-01",
+                  "effective_to": "2027-01-01",
+                  "temporary_until": null,
+                  "ends_on": null,
+                  "keep_for_bound": false
+                }
+              },
+              {
+                "dim_value": "eu",
+                "uncovered": false,
+                "binding": {
+                  "price_id": "<price:storage-eu>",
+                  "dim_used": "eu",
+                  "pinned_from": null,
+                  "price": {
+                    "rate": "0.08"
+                  },
+                  "min_fee": null,
+                  "eligibility": "all",
+                  "effective_from": "2026-01-01",
+                  "effective_to": null,
+                  "temporary_until": null,
+                  "ends_on": null,
+                  "keep_for_bound": false
+                }
+              },
+              {
+                "dim_value": "us",
+                "uncovered": false,
+                "binding": {
+                  "price_id": "<price:storage-us>",
+                  "dim_used": "us",
+                  "pinned_from": "<price:storage-default>",
+                  "price": {
+                    "rate": "0.09"
+                  },
+                  "min_fee": null,
+                  "eligibility": "all",
+                  "effective_from": "2026-10-01",
+                  "effective_to": null,
+                  "temporary_until": null,
+                  "ends_on": null,
+                  "keep_for_bound": false
+                }
+              },
+              {
+                "dim_value": "apac",
+                "uncovered": false,
+                "binding": {
+                  "price_id": "<price:storage-default>",
+                  "dim_used": null,
+                  "pinned_from": "<price:storage-default>",
+                  "price": {
+                    "rate": "0.10"
+                  },
+                  "min_fee": "5.00",
+                  "eligibility": "all",
+                  "effective_from": "2026-01-01",
+                  "effective_to": "2027-01-01",
+                  "temporary_until": null,
+                  "ends_on": null,
+                  "keep_for_bound": false
+                }
+              },
+              {
+                "dim_value": "latam",
+                "uncovered": false,
+                "binding": {
+                  "price_id": "<price:storage-default>",
+                  "dim_used": null,
+                  "pinned_from": null,
+                  "price": {
+                    "rate": "0.10"
+                  },
+                  "min_fee": "5.00",
+                  "eligibility": "all",
+                  "effective_from": "2026-01-01",
+                  "effective_to": "2027-01-01",
+                  "temporary_until": null,
+                  "ends_on": null,
+                  "keep_for_bound": false
+                }
+              }
+            ]
+          }
+        ]
+      }
+    }
+  ]
+}

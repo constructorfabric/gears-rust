@@ -28,6 +28,26 @@ pub struct UserIdentity {
     pub user_id: String,
 }
 
+impl UserIdentity {
+    /// Value of the provider `user` field (Anthropic: `metadata.user_id`).
+    ///
+    /// `OpenAI` and Azure `OpenAI` reject a `user` longer than 64 characters, and
+    /// `{tenant}:{user}` with two UUIDs is 73. Two UUIDs are sent as their
+    /// simple (hyphen-less) hex forms concatenated: exactly 64 characters,
+    /// the tenant first, still mappable back to both ids. Other ids (tests)
+    /// fall back to `{tenant}:{user}`.
+    #[must_use]
+    pub fn provider_user(&self) -> String {
+        match (
+            uuid::Uuid::parse_str(&self.tenant_id),
+            uuid::Uuid::parse_str(&self.user_id),
+        ) {
+            (Ok(tenant), Ok(user)) => format!("{}{}", tenant.simple(), user.simple()),
+            _ => format!("{}:{}", self.tenant_id, self.user_id),
+        }
+    }
+}
+
 /// Observability metadata attached to provider requests.
 #[derive(Debug, Clone, Serialize)]
 pub struct RequestMetadata {
@@ -314,5 +334,34 @@ impl LlmRequestBuilder {
     #[must_use]
     pub fn build_non_streaming(self) -> LlmRequest<NonStreaming> {
         self.build_inner()
+    }
+}
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod user_identity_tests {
+    use super::UserIdentity;
+
+    #[test]
+    fn provider_user_fits_the_64_char_limit_for_uuids() {
+        let identity = UserIdentity {
+            tenant_id: "00000000-df51-5b42-9538-d2b56b7ee953".to_owned(),
+            user_id: "11111111-6a88-4768-9dfc-6bcd5187d9ed".to_owned(),
+        };
+        let value = identity.provider_user();
+        assert_eq!(value.len(), 64);
+        assert_eq!(
+            value,
+            "00000000df515b429538d2b56b7ee953111111116a8847689dfc6bcd5187d9ed"
+        );
+    }
+
+    #[test]
+    fn provider_user_falls_back_for_non_uuid_ids() {
+        let identity = UserIdentity {
+            tenant_id: "abc".to_owned(),
+            user_id: "def".to_owned(),
+        };
+        assert_eq!(identity.provider_user(), "abc:def");
     }
 }

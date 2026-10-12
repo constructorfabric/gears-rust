@@ -4,7 +4,7 @@ date: 2026-07-04
 ---
 
 Created:  2026-07-07 by Virtuozzo International GmbH
-Updated:  2026-07-07 by Virtuozzo International GmbH
+Updated:  2026-10-03 by Constructor Tech
 
 # ADR-0001: Stateful Gear with Gear-Owned Secret Metadata
 
@@ -26,6 +26,8 @@ Updated:  2026-07-07 by Virtuozzo International GmbH
 <!-- /toc -->
 
 **ID**: `cpt-cf-credstore-adr-stateful-gear`
+
+**Amended by [ADR-0006](0006-cpt-cf-credstore-adr-immutable-value-versions.md)**: the write saga with `provisioning`/`deprovisioning` statuses below is replaced by provider-assigned, immutable value versions with a pointer (`value_version`, distinct from the row's own `version` counter) in the row, a write intent announcing every `put`, cleanup obligations (destroy of older versions where the backend supports it, key purge on record deletion) recorded in PostgreSQL in the same transaction and executed by the request, or healed on a later access. The backend plugin is no longer a one-value-per-key store: it is a **versioned kv store** keyed by `(tenant_id, record_id)` with three required operations and one optional, each taking the key explicitly — `put(key, value) -> version` (a durable write of a new immutable version; the provider chooses the version), `get(key, version)` (exactly the bytes of the `put` that returned `version`, or not found), `delete_key(key)` (idempotent), and the optional idempotent `destroy(key, Below(version) | Exactly(version))`, which requires versions ordered per key. It still has no list, no CAS and no transactions, so any versioned kv store qualifies. The stateful-gear decision itself — metadata (identity, sharing, ownership, version, the `value_version` pointer) in the gear's table, values in a plugin — is unchanged; it is what makes the pointer possible. The metadata database is the system of record for metadata and is backed up together with the store.
 
 ## Context and Problem Statement
 
@@ -49,13 +51,13 @@ Where should secret metadata live, and which component owns policy, uniqueness, 
 
 ## Decision Outcome
 
-Chosen option: "Stateful gear, value-only backend". The gear owns the `credstore_secrets` table (identity, sharing, ownership, lifecycle status, version); the backend plugin stores only the value, keyed by `(tenant_id, key, private-per-owner | tenant class)`. Almost every other design property follows from this single decision:
+Chosen option: "Stateful gear, value-only backend". The gear owns the `credstore_secrets` table (identity, sharing, ownership, lifecycle status, version); the backend plugin stores only values, as immutable versions under one key per record, `(tenant_id, record_id)` (originally one value per `(tenant_id, key, private-per-owner | tenant class)`; see the amendment above). Almost every other design property follows from this single decision:
 
 * uniqueness/coexistence rules become **partial unique indexes**;
 * hierarchical resolution becomes **one indexed SQL query** over the ancestor chain plus at most **one** backend read for the winning row;
 * authorization becomes a PDP `AccessScope` **enforced in SQL** through SecureORM clamps on the metadata table (fail-closed, anti-enumeration 404 preserved);
 * secret identity is a DB row — the ExternalID encoding and its collision analysis disappear;
-* writes become explicit **sagas** over the metadata row and backend value, with a lifecycle `status` column and a reaper (see [ADR-0002](0002-cpt-cf-credstore-adr-deprovisioning-saga.md));
+* writes became explicit **sagas** over the metadata row and backend value, with a lifecycle `status` column and a reaper (see [ADR-0002](0002-cpt-cf-credstore-adr-deprovisioning-saga.md)); **superseded by [ADR-0006](0006-cpt-cf-credstore-adr-immutable-value-versions.md)**, which has no saga, status or reaper;
 * optimistic concurrency (`version` / `ETag` / `If-Match`) becomes possible at the metadata layer;
 * the private↔non-private "migration" hazard is designed out: the two classes coexist under one reference and the transition is simply rejected as unsupported.
 
@@ -63,10 +65,10 @@ Chosen option: "Stateful gear, value-only backend". The gear owns the `credstore
 
 * Good, because walk-up latency no longer scales with hierarchy depth; the backend is touched at most once per resolution
 * Good, because tenant isolation (PDP tenant-scope clamps) is enforced in SQL, not in application-level string checks
-* Good, because backends need no metadata schema — the in-memory static plugin and any future vault plugin implement the same three-method value-store contract
+* Good, because backends need no metadata schema — the in-memory static plugin and any future vault plugin implement the same five-operation versioned value-store contract
 * Good, because versioning, lifecycle statuses, and metadata-only future features (list, types) become cheap
 * Bad, because the gear becomes a stateful gear: it needs a database, migrations, and the `stateful` capability
-* Bad, because metadata and backend value can diverge transiently on partial failure — this cost is contained by the saga + reaper design ([ADR-0002](0002-cpt-cf-credstore-adr-deprovisioning-saga.md))
+* Bad, because metadata and backend value can diverge transiently on partial failure — this cost was first contained by the saga + reaper design ([ADR-0002](0002-cpt-cf-credstore-adr-deprovisioning-saga.md)), now replaced by immutable versions with recorded cleanup debts ([ADR-0006](0006-cpt-cf-credstore-adr-immutable-value-versions.md))
 
 ### Confirmation
 

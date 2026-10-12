@@ -10,6 +10,7 @@ use crate::config::{Limits, WorkerSettings};
 use crate::domain::ports::metrics::AdmissionMetrics;
 
 /// The configuration one admission pass obeys, carried together.
+#[toolkit::domain_model]
 #[derive(Clone, Copy)]
 pub struct Tuning<'a> {
     pub limits: &'a Limits,

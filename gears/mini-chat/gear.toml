@@ -1,7 +1,7 @@
 [gear]
 name = "MiniChat"
-description = "Lightweight chat module for simple Azure and OpenAI conversational scenarios."
+description = "Multi-tenant AI chat with SSE streaming, attachments and quotas, backed by OpenAI / Azure OpenAI, vLLM or Anthropic (Anthropic Platform, Microsoft Foundry)."
 category = "gen-ai"
 is_plugin = false
-has_plugins = false
-has_extension_point = false
+has_plugins = true
+has_extension_point = true

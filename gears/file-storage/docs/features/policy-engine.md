@@ -2,7 +2,7 @@ Created:  2026-07-08 by Constructor Tech
 Updated:  2026-07-08 by Constructor Tech
 # Feature: Policy Engine (Allowed Types + Size Limits)
 
-- [ ] `p2` - **ID**: `cpt-cf-file-storage-featstatus-policy-engine-implemented`
+- [x] `p2` - **ID**: `cpt-cf-file-storage-featstatus-policy-engine-implemented`
 
 
 
@@ -27,14 +27,14 @@ Updated:  2026-07-08 by Constructor Tech
   - [GET/PUT /policy Endpoints](#getput-policy-endpoints)
   - [GET /policy/effective Endpoint](#get-policyeffective-endpoint)
   - [Enforcement Wired Into the Write Path](#enforcement-wired-into-the-write-path)
-  - [Semantic Validation on Write (P2 Remediation 0.11)](#semantic-validation-on-write-p2-remediation-011)
+  - [Semantic Validation on Write](#semantic-validation-on-write)
 - [6. Acceptance Criteria](#6-acceptance-criteria)
 
 <!-- /toc -->
 
 ## 1. Feature Context
 
-- [ ] `p2` - `cpt-cf-file-storage-feature-policy-engine`
+- [x] `p2` - `cpt-cf-file-storage-feature-policy-engine`
 
 ### 1.1 Overview
 
@@ -122,13 +122,18 @@ User-facing interactions that start with an actor and describe the end-to-end fl
 - `allowed_mime_types` or `size_limits.per_mime` contains a `*/*` entry — `400` (rejected outright: `*/*` would
   silently match nothing against the wildcard matcher, which only special-cases the *subtype* half of a pattern —
   a caller that wants "no restriction" should omit the field entirely)
-- Caller lacks `WRITE` (and, for a foreign `scope_owner_id`, lacks `ADMIN_POLICY` too) — `403`
+- `scope_owner_id` is absent (tenant scope) and the caller lacks `ADMIN_POLICY` — `403`, with no
+  fallback to `WRITE`: a tenant-scope policy applies to every subject in the tenant (allowed mime
+  types, size and metadata limits), so ordinary file-`WRITE` must not let an unprivileged tenant
+  member unilaterally tighten or loosen it for everyone
+- `scope_owner_id` is present and the caller lacks `WRITE` (or, for a foreign `scope_owner_id`, lacks
+  `ADMIN_POLICY` too) — `403`
 
 **Steps**:
 1. [x] - `p1` - Client: PUT /api/file-storage/v1/policy {scope, scope_owner_id?, body} - `inst-policy-set-request`
 2. [x] - `p1` - API: parse `scope`; `400` if invalid - `inst-policy-set-parse-scope`
-3. [x] - `p1` - Authorize: same `ADMIN_POLICY`-first, `WRITE`-plus-owner-match fallback as [Get Own Policy](#get-own-policy), with `WRITE` instead of `READ` as the fallback action - `inst-policy-set-authz`
-4. [x] - `p1` - Validate: reject `scope = User` with no `scope_owner_id`, and reject any `*/*` mime pattern in `allowed_mime_types`/`size_limits.per_mime` - `inst-policy-set-validate`
+3. [x] - `p1` - Validate: reject `scope = User` with no `scope_owner_id`, and reject any `*/*` mime pattern in `allowed_mime_types`/`size_limits.per_mime` - `inst-policy-set-validate` (runs before authorization: a `User`-scope request missing its owner is a malformed body, `400`, not an administrative act — validating first means it is never misreported as `403` just because a missing owner also happens to be how tenant scope is spelled)
+4. [x] - `p1` - Authorize: if `scope_owner_id` is absent (tenant scope), require `ADMIN_POLICY` outright with no fallback; otherwise the same `ADMIN_POLICY`-first, `WRITE`-plus-owner-match fallback as [Get Own Policy](#get-own-policy), with `WRITE` instead of `READ` as the fallback action - `inst-policy-set-authz`
 5. [x] - `p1` - DB: upsert the `(tenant_id, scope, scope_owner_id)` row transactionally (partial-unique-index backstop; two sequential upserts for the same scope leave exactly one row, never a duplicate) - `inst-policy-set-upsert`
 6. [x] - `p1` - RETURN 200 with the stored policy (`created_at`/`updated_at` both the write's timestamp) - `inst-policy-set-return`
 
@@ -146,10 +151,14 @@ User-facing interactions that start with an actor and describe the end-to-end fl
 
 **Error Scenarios**:
 - Caller lacks `READ` — `403`
+- `user_owner_id` is present and differs from the caller's own subject id, and the caller lacks
+  `ADMIN_POLICY` — `403` (plain `READ` only clears the tenant policy and the caller's own user
+  policy; without this check any tenant member could pass a victim's id and have that user's policy
+  merged into the response — a policy-disclosure side channel)
 
 **Steps**:
 1. [x] - `p1` - Client: GET /api/file-storage/v1/policy/effective?user_owner_id={uuid?} - `inst-policy-eff-request`
-2. [x] - `p1` - Authorize `READ` on `("", None)` - `inst-policy-eff-authz`
+2. [x] - `p1` - Authorize `READ` on `("", None)`; if `user_owner_id` is present and differs from the caller's own subject id, additionally require `ADMIN_POLICY` - `inst-policy-eff-authz`
 3. [x] - `p1` - DB: SELECT the tenant-scope policy row (always) and, if `user_owner_id` is present, the user-scope row for that owner - `inst-policy-eff-load`
 4. [x] - `p1` - Algorithm: `cpt-cf-file-storage-algo-resolve-effective-policy` combines the two (either or both may be absent) - `inst-policy-eff-resolve`
 5. [x] - `p1` - RETURN 200 with the resolved `EffectivePolicy` - `inst-policy-eff-return`
@@ -187,35 +196,41 @@ on call site), the backend's hardware `max_size_bytes` ceiling (if any)
 This single pair of helpers (`PolicyResolver::check_allowed_mime`, `PolicyResolver::compute_effective_max_bytes`) is
 called at **every** content-write entry point rather than each path re-implementing the check:
 
-- `create_file` (`create.rs:189-210`) — allowed-mime and size against `new.mime_type`, before the upload URL is
+- `create_file` — allowed-mime and size against `new.mime_type`, before the upload URL is
   even minted
-- `presign_version` (`create.rs:341-354`) — same, for a subsequent version on an existing file
-- `finalize_upload` (`write.rs:131-152`) and `finalize_upload_by_token` (`write.rs:615-647`) — a **defense-in-depth**
+- `presign_version` — same, for a subsequent version on an existing file
+- `finalize_upload` and `finalize_upload_by_token` — a **defense-in-depth**
   re-check of the size ceiling at finalize time even though the sidecar already enforced the upload constraint
   baked into the signed URL; `finalize_upload`/`finalize_upload_by_token` additionally re-run
-  `enforce_size_ceiling_for_validated_mime` (`write.rs:186-192`, `:681-687`) after MIME-sniffing the read-back
+  `enforce_size_ceiling_for_validated_mime` after MIME-sniffing the read-back
   bytes, so a client that lies about `Content-Type` in the declared MIME cannot bypass a per-mime size override
   keyed to the real, sniffed type
-- Multipart `initiate_multipart_upload` (`multipart_service.rs:435-462`) — allowed-mime and size against the
+- Multipart `initiate_multipart_upload` — allowed-mime and size against the
   **declared** total size, checked up front at initiate rather than deferred to complete
-- Multipart `complete_multipart_upload` (`multipart_service.rs:778-797`) — a residual size check against the
+- Multipart `complete_multipart_upload` — a residual size check against the
   **assembled** total, catching a mismatch the per-part sidecar enforcement and the size-verify step ahead of it
   did not
+- `create_file`'s idempotency-replay path (when a stored `idempotency_key` record matches the
+  retried request) re-validates allowed-mime and metadata limits against the **current** effective policy rather
+  than the policy in effect at the original call, recomputes the effective size ceiling from that current policy
+  and re-mints the upload URL under it, and re-runs the quota preflight — so a policy tightened after the
+  original `create_file` call is unconditionally re-checked on every replay for as long as the idempotency
+  window stays open. Quota re-check applies only when a quota client is configured, which no deployment does
+  today (§6 Acceptance Criteria notes `cpt-cf-file-storage-fr-storage-quota` is not enforced in any real
+  deployment), so a quota exhausted after the original call is not actually enforceable on replay in any real
+  deployment
 
 **Steps**:
 1. [x] - `p1` - `check_allowed_mime`: `None` `allowed_mime_types` on the effective policy permits everything; `Some([])` permits nothing; `Some(list)` requires an exact match or a `type/*` wildcard match - `inst-enforce-mime`
-2. [x] - `p1` - `compute_effective_max_bytes`: take `min` of the backend's hardware ceiling, the policy's global `max_bytes`, and the smallest matching per-mime override — `None` in all three means unbounded - `inst-enforce-size-compute`
+2. [x] - `p1` - `compute_effective_max_bytes`: take `min` of the backend's hardware ceiling, the policy's global `max_bytes`, and the smallest matching per-mime override — the effective ceiling is always the smallest of the three, so a per-mime override can only tighten the global limit, never exceed it; `None` in all three means unbounded - `inst-enforce-size-compute`
 3. [x] - `p1` - Compare the candidate size against the computed ceiling; `DomainError::policy_size_exceeded` if over - `inst-enforce-size-compare`
 4. [x] - `p1` - RETURN `Ok(())` if both checks pass - `inst-enforce-return`
 
-> **Status code note (accuracy correction relative to earlier drafts of the multipart-coordinator FEATURE doc).**
-> `DomainError::PolicyMimeNotAllowed` and `DomainError::PolicySizeExceeded` both map to HTTP **`400`** at the REST
-> boundary (`src/api/rest/error.rs`'s `FileResourceError::invalid_argument()`/`out_of_range()`, both of which
-> `error_mapping_test.rs`'s exhaustive `DomainError → status` guardrail pins to `400`), **not** `415`/`413` as the
-> in-code doc-comments on `DomainError::PolicyMimeNotAllowed`/`PolicySizeExceeded` (`domain/error.rs`) and some
-> earlier FEATURE-doc drafts state. There is no canonical-error variant on this platform that resolves to `415` or
-> `413`; every policy rejection surfaces as a `400` field-violation Problem. `DomainError::PolicyMetadataExceeded`
-> is likewise `400`, not the `422` its own doc-comment claims.
+> **Status code note.** `DomainError::PolicyMimeNotAllowed` and `DomainError::PolicySizeExceeded` both map to HTTP
+> **`400`** at the REST boundary — not `415`/`413` as their own doc-comments suggest. There is no canonical-error
+> variant on this platform that resolves to `415` or `413`; every policy rejection surfaces as a `400`
+> field-violation Problem. `DomainError::PolicyMetadataExceeded` is likewise `400`, not the `422` its own
+> doc-comment claims.
 
 ### Validate Policy Body on Write
 
@@ -225,7 +240,7 @@ called at **every** content-write entry point rather than each path re-implement
 
 **Output**: `Ok(())`, or `DomainError::Validation`
 
-P2 remediation 0.11: reject a policy body that would be silently dead or dangerous rather than accept and never
+Reject a policy body that would be silently dead or dangerous rather than accept and never
 detect it.
 
 **Steps**:
@@ -246,30 +261,36 @@ transitions to model.
 
 - [x] `p1` - **ID**: `cpt-cf-file-storage-dod-policy-types-resolver`
 
-**Shipped**: `PolicyScope` (`Tenant`/`User`), `PolicyBody` (`allowed_mime_types`, `size_limits`, `metadata_limits`,
-`enabled_event_types`), `EffectivePolicy`, and `PolicyResolver::resolve`/`check_allowed_mime`/
-`compute_effective_max_bytes`/`check_metadata_limits` (`src/domain/policy.rs`), with unit coverage in
-`src/domain/policy_tests.rs` (resolver merge behavior) and `src/domain/service/service_tests.rs` (the enforcement
-helpers, DB-free).
+This feature defines `PolicyScope` (`Tenant`/`User`), `PolicyBody` (`allowed_mime_types`, `size_limits`, `metadata_limits`,
+`enabled_event_types`), `EffectivePolicy`, and the resolver's `resolve`/`check_allowed_mime`/
+`compute_effective_max_bytes`/`check_metadata_limits` operations, with dedicated unit coverage for the resolver's
+merge behavior and for the enforcement helpers, independent of the database.
+
+**Not enforced**: `enabled_event_types` is stored and round-tripped through `GET`/`PUT /policy` like every other
+`PolicyBody` field, but nothing consults it, and no file-event enqueue path — neither the ordinary write flow nor
+the cleanup engine's own event construction — checks it before enqueuing. Every event type is enqueued
+unconditionally regardless of what a policy's `enabled_event_types` says —
+the field is inert configuration, not enforced gating. See
+the `events_outbox` table (created in `m20260701_000001_p2_initial`; every event type is enqueued unconditionally, as noted above) and
+[docs/features/audit-trail.md](audit-trail.md) for the sibling outbox's related behavior.
 
 **Implements**:
 - `cpt-cf-file-storage-algo-resolve-effective-policy`
 
 **Touches**:
-- Gears: `src/domain/policy.rs`
+- Gears: the policy domain module (resolver/merge algorithm)
 
 ### GET/PUT /policy Endpoints
 
 - [x] `p1` - **ID**: `cpt-cf-file-storage-dod-policy-get-put-endpoints`
 
-**Shipped**: `GET /api/file-storage/v1/policy` and `PUT /api/file-storage/v1/policy`
-(`src/api/rest/routes.rs:324-363`, `handlers::get_policy`/`set_policy`), backed by `PolicyService::get_own_policy`/
-`set_policy` (`src/domain/policy_service.rs`). Authorization: `ADMIN_POLICY`-first with a `READ`/`WRITE`-plus-
-owner-match fallback (`authorize_scope_owner`/`authorize_admin_or_owner`), covered by `tests/policy_authz_test.rs`
-(`set_policy_foreign_owner_without_admin_scope_is_denied`, `set_policy_self_owner_is_allowed`,
-`set_policy_tenant_admin_scope_allows_foreign_owner`, `set_policy_user_scope_without_owner_is_rejected`,
-`set_policy_star_slash_star_mime_is_rejected_or_defined`). Upsert race-safety (two sequential upserts for the same
-scope leave exactly one row) covered by `tests/policy_test.rs`.
+`GET /api/file-storage/v1/policy` and `PUT /api/file-storage/v1/policy` are backed by the policy service's own
+get/set operations. Authorization: reading or writing a specific `scope_owner_id` uses an `ADMIN_POLICY`-first
+gate with a `READ`/`WRITE`-plus-owner-match fallback; the tenant-scope write (`scope_owner_id = None`) requires
+`ADMIN_POLICY` outright with no fallback, since a tenant-scope write applies to every subject in the tenant.
+Dedicated tests cover authorization (foreign-owner denial, self-owner allowance, tenant-admin-scope allowance,
+missing-owner rejection, `*/*` mime rejection) and upsert race-safety (two sequential upserts for the same scope
+leave exactly one row).
 
 **Implements**:
 - `cpt-cf-file-storage-flow-policy-get-own`
@@ -284,8 +305,9 @@ scope leave exactly one row) covered by `tests/policy_test.rs`.
 
 - [x] `p1` - **ID**: `cpt-cf-file-storage-dod-policy-effective-endpoint`
 
-**Shipped**: `GET /api/file-storage/v1/policy/effective` (`routes.rs:365-386`, `handlers::get_effective_policy`),
-backed by `PolicyService::get_effective_policy`, gated on plain `READ`.
+`GET /api/file-storage/v1/policy/effective` is gated on plain `READ` — plus `ADMIN_POLICY` when the
+query's `user_owner_id` differs from the caller's own subject id, to prevent using it as a
+policy-disclosure side channel against another user.
 
 **Implements**:
 - `cpt-cf-file-storage-flow-policy-get-effective`
@@ -299,32 +321,30 @@ backed by `PolicyService::get_effective_policy`, gated on plain `READ`.
 
 - [x] `p1` - **ID**: `cpt-cf-file-storage-dod-policy-enforcement-wiring`
 
-**Shipped**: every content-write entry point (`create_file`, `presign_version`, `finalize_upload`,
+Every content-write entry point (`create_file`, `presign_version`, `finalize_upload`,
 `finalize_upload_by_token`, `update_metadata`, multipart `initiate_multipart_upload`,
-`complete_multipart_upload`) resolves the effective policy and calls the shared `PolicyResolver` enforcement
-helpers rather than re-implementing the check. Covered by `tests/enforce_test.rs` (mime/size/metadata rejection at
-the service layer) and `tests/multipart_test.rs` (`PolicySizeExceeded` at multipart initiate).
+`complete_multipart_upload`) resolves the effective policy and calls the shared enforcement helpers rather than
+re-implementing the check. Mime/size/metadata rejection at the service layer, and size-exceeded rejection at
+multipart initiate, are both covered by dedicated tests.
 
 **Implements**:
 - `cpt-cf-file-storage-algo-enforce-policy-at-upload`
 
 **Touches**:
-- Gears: `src/domain/service/create.rs`, `src/domain/service/write.rs`, `src/domain/multipart_service.rs`
+- Gears: the create-file, finalize, and multipart-initiate service paths
 
-### Semantic Validation on Write (P2 Remediation 0.11)
+### Semantic Validation on Write
 
 - [x] `p2` - **ID**: `cpt-cf-file-storage-dod-policy-semantic-validation`
 
-**Shipped**: `PolicyService::validate_policy_body` rejects a user-scope policy with no `scope_owner_id` and any
-`*/*` mime pattern, at `PUT /policy` write time (not silently accepted and never caught). Covered by
-`tests/policy_authz_test.rs`'s `set_policy_user_scope_without_owner_is_rejected` and
-`set_policy_star_slash_star_mime_is_rejected_or_defined`.
+Policy-body validation rejects a user-scope policy with no `scope_owner_id` and any `*/*` mime pattern, at
+`PUT /policy` write time. Both rejections are covered by dedicated tests.
 
 **Implements**:
 - `cpt-cf-file-storage-algo-validate-policy-body`
 
 **Touches**:
-- Gears: `src/domain/policy_service.rs`
+- Gears: the policy service module
 
 ## 6. Acceptance Criteria
 
@@ -341,17 +361,19 @@ the service layer) and `tests/multipart_test.rs` (`PolicySizeExceeded` at multip
   leave exactly one row carrying the latest body, never a duplicate
 - [x] A user-scope policy write without `scope_owner_id`, or any `*/*` mime pattern in `allowed_mime_types`/
   `size_limits.per_mime`, is rejected at write time rather than silently accepted as a dead or accidental deny-all
-  entry (P2 remediation 0.11)
-- [x] Policy read/write authorization tries `ADMIN_POLICY` first (cross-owner/tenant-wide administration) and falls
-  back to `READ`/`WRITE` plus an owner-match check for self-service tenant members; tenant-scope requests (no
-  owner to compare) succeed on the fallback action alone
-- [ ] `PolicyMimeNotAllowed`/`PolicySizeExceeded`/`PolicyMetadataExceeded` are documented in their own
-  `domain/error.rs` doc-comments as `415`/`413`/`422` respectively, but the platform's actual canonical-error
-  mapping (pinned by `tests/error_mapping_test.rs`) resolves **all three to `400`** — those doc-comments are stale
-  and out of scope for this FEATURE doc to fix; treat `400` as the real, current, tested behavior for every policy
-  rejection at every call site listed in [Enforce Allowed-Types and Size Limits at
-  Upload](#enforce-allowed-types-and-size-limits-at-upload)
+  entry
+- [x] Policy read authorization (`get_own_policy`) tries `ADMIN_POLICY` first (cross-owner/tenant-wide
+  administration) and falls back to `READ` plus an owner-match check for self-service tenant members;
+  a tenant-scope read (no owner to compare) succeeds on `READ` alone. `set_policy`'s user-scope write
+  follows the same `ADMIN_POLICY`-first, `WRITE`-plus-owner-match pattern, but its tenant-scope write
+  requires `ADMIN_POLICY` outright with no fallback — there is no owner to fall back to self-service
+  for, and a tenant-scope write changes policy for every subject in the tenant
+- [ ] `PolicyMimeNotAllowed`/`PolicySizeExceeded`/`PolicyMetadataExceeded` are documented in their own doc-comments
+  as `415`/`413`/`422` respectively, but the platform's actual canonical-error mapping resolves **all three to
+  `400`** — those doc-comments are stale; `400` is the tested behavior for every policy rejection at every call
+  site listed in [Enforce Allowed-Types and Size Limits at Upload](#enforce-allowed-types-and-size-limits-at-upload)
 - [ ] `cpt-cf-file-storage-fr-storage-quota` (a related but distinct requirement, not owned by this FEATURE) is
-  **not enforced in any real deployment** — `gear.rs` always wires `quota_client: None` — so a size-limits-policy
-  rejection and a quota rejection are not equally reachable in production today; this FEATURE's own allowed-types
-  and size-limits checks (unlike quota) run unconditionally and are exercised in every deployment
+  **not enforced in any real deployment** — the gear's wiring always configures no quota client — so a
+  size-limits-policy rejection and a quota rejection are not equally reachable in production today; this
+  FEATURE's own allowed-types and size-limits checks (unlike quota) run unconditionally and are exercised in
+  every deployment

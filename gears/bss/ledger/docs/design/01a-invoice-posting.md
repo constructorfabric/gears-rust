@@ -276,7 +276,7 @@ Builds the S1 **direct-split** entry (PRD § Posting rules S1; Example A). For a
 - **Idempotency** at-most-once per `(tenant, INVOICE_POST, invoiceId)` + idempotent replay is the Foundation's `idempotencyClaim` path; a replay with an identical payload returns the prior reference.
 - **Period** is pinned via the Foundation's `pinOpenPeriod(tenant, legalEntity)` — `fiscal_period FOR SHARE` + `OPEN` assertion inside the post transaction; `effectiveAt` is subject to the closed-period / material-backdating rules (A6) there.
 - **Balance deltas** — the AR (DR), Revenue (CR), Contract-liability (CR), and Tax-payable (CR) deltas — are applied by the Foundation's **`applyBalanceDeltas`** under its canonical lock order, which sorts them into `(table_rank, tenant_id, account_id, currency, payer_tenant_id, invoice_id)` and enforces no-negative on the guarded set. In S1 only AR (debit) and the credit-normal Revenue / Contract-liability / Tax lines are posted, so AR cannot be driven negative by S1 except via an erroneous double reversal — which the reversal flow prevents.
-- **Money / rounding** uses the Foundation's `MoneyModule` (banker's rounding, currency-scale registry, residual-cent determinism), so the S1 tax/revenue/contract-liability split rounds identically on every recompute and the commit-time balance check needs no tolerance.
+- **Money / rounding** uses the Foundation's money model (validated major-unit decimals, currency-scale registry, exact arithmetic, residual-increment determinism), so the S1 tax/revenue/contract-liability split rounds identically on every recompute and the commit-time balance check needs no tolerance.
 - **Tax-payable sign.** In S1 the handler posts only Tax-payable **credits**, so the negative-balance question (Tax payable MAY go negative during reversal periods, PRD) is **inert** here; the Foundation excludes Tax-payable from the aggregate ≥ 0 check and guards it at the `tax_subbalance` `(jurisdiction, filing-period)` grain instead. The in-transaction enforcement decision for Tax-payable **debits** is deferred to the handler that first posts them (reversals / credit notes).
 
 ### Resolve Account Mapping & Suspense Routing
@@ -314,17 +314,17 @@ Builds the S1 **direct-split** entry (PRD § Posting rules S1; Example A). For a
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-ledger-algo-ar-aging-rollup`
 
-**Input**: `ar_invoice_balance` cache rows (`balance_minor > 0`), tenant bucket configuration, current time
+**Input**: `ar_invoice_balance` cache rows (`balance > 0`, compared as exact decimals in the application), tenant bucket configuration, current time
 
 **Output**: AR aging rollup per payer, bucketed per `(payer, currency)`
 
 S1 is the first AR-affecting fact: a posted invoice debits AR (open AR = posted AR until a payment or note lands). AR aging is exposed as a rollup per payer (PRD Scope "AR balances & aging — HIGH"), `GET /v1/ledger/balances/ar-aging`.
 
 **Steps**:
-1. [ ] - `p1` - DB: read `ar_invoice_balance` rows with `balance_minor > 0` for the tenant/payer filter - `inst-ag-read`
+1. [ ] - `p1` - DB: read `ar_invoice_balance` rows with `balance > 0` for the tenant/payer filter (positive balances only; stored canonical text is decoded exactly, never cast or summed in SQL) - `inst-ag-read`
 2. [ ] - `p1` - Derive buckets **at read time**: **days past due** = now − `due_date`; default buckets **current / 1–30 / 31–60 / 61–90 / 90+ days past due**, tenant-configurable - `inst-ag-buckets`
 3. [ ] - `p1` - Aging is by **days past due** vs the invoice **due date** (captured on the AR posting at S1 from payment terms; due-on-receipt → `due_date = original_posted_at`), per PRD *AR aging basis* — **not** days since posting (the prior `original_posted_at` basis is superseded; `original_posted_at` stays only as the due-on-receipt fallback source) - `inst-ag-basis`
-4. [ ] - `p1` - Compute buckets per `(payer, currency)` — `ar_invoice_balance` carries `currency`, so amounts of different minor-unit scales are never mixed in one bucket - `inst-ag-currency`
+4. [ ] - `p1` - Compute buckets per `(payer, currency)` — `ar_invoice_balance` carries `currency` and `currency_scale`, so amounts of different currencies or scales are never added together; bucket sums are exact (`sum_posted`) - `inst-ag-currency`
 5. [ ] - `p2` - **Debit-note (S4) aging basis**: a debit note posts onto the **same** `ar_invoice_balance` row (per-invoice grain), so by default its delta inherits the originating invoice's `due_date`; when a debit note carries **different** payment terms the debit-note AR `journal_line.due_date` is authoritative and the aging read MUST age that delta from the **line-level** due date — a Slice 4 refinement on the same read - `inst-ag-debit-note`
 6. [ ] - `p1` - **RETURN** the rollup. The aging read is a pure read over the existing cache: **no new posted state, no new lock rank** - `inst-ag-return`
 
@@ -339,7 +339,7 @@ S1 is the first AR-affecting fact: a posted invoice debits AR (open AR = posted 
 The **only** correction shape is **strict line-negation** (AC #23) — the Foundation enforces the append-only / line-negation **mechanism** and the once-per-entry lineage index; this feature owns the invoice-reversal **domain flow**.
 
 **Steps**:
-1. [ ] - `p1` - Because `amount_minor` is `CHECK > 0`, AC #23's "same accounts and sides, negated amounts" is realized as **same accounts, flipped side, positive amount** — economically identical line-negation, and explicitly **distinct from gross-replace** (which would additionally re-post a corrected entry) - `inst-rn-shape`
+1. [ ] - `p1` - Because `amount` is `CHECK > 0`, AC #23's "same accounts and sides, negated amounts" is realized as **same accounts, flipped side, positive amount** — economically identical line-negation, and explicitly **distinct from gross-replace** (which would additionally re-post a corrected entry). The reversal re-reads the stored lines' `amount`, `currency` and `currency_scale` (`InvoicePostService::post_reversal`; `PostingService::post` refuses `SourceDocType::Reversal`), so a registry scale change after the original post never alters the reversal - `inst-rn-shape`
 2. [ ] - `p1` - The reversal entry carries `reverses_entry_id` and `reverses_period_id` (the original entry's period), posts at current effective time; the original is untouched - `inst-rn-lineage`
 3. [ ] - `p1` - Dedup key `(tenant, REVERSAL, reverses_entry_id)` — `reason` is **payload only** (covered by the Foundation's payload-hash conflict check), never part of the uniqueness key, so two reverse calls with different reasons cannot both post; an entry MUST be reversible **at most once total** - `inst-rn-dedup`
 4. [ ] - `p1` - **Amount-correction is out of S1 scope**: S1 offers **only** full strict reversal — there is no in-place restatement of a wrong-**amount** invoice. Re-posting under `INVOICE_POST` is blocked by the surviving dedup row, and `MAPPING_CORRECTION` is for suspense-remap only. Correcting a wrong amount (not a mapping) is therefore **upstream's responsibility** — a reversal plus a **new** `invoiceId` — or a Slice 3 credit/debit note. S1 deliberately does not provide amount-correction - `inst-rn-no-amount-fix`
@@ -441,7 +441,7 @@ The system **MUST** serve current-cache balance reads and a read-time AR aging r
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-ledger-dod-invoice-api`
 
-The system **MUST** expose the six §7.1 endpoints per the `rest-api-design` standard behind the inbound API gateway (JSON, OAuth 2.0, tenant from authenticated context + RLS, `/v1` versioning, minor-unit money objects, never floats), with 201-first-post / 200-idempotent-replay semantics and RFC 9457 problem responses passing Foundation invariant codes through unchanged plus the three domain codes.
+The system **MUST** expose the six §7.1 endpoints per the `rest-api-design` standard behind the inbound API gateway (JSON, OAuth 2.0, tenant from authenticated context + RLS, `/v1` versioning, `MoneyDto` decimal-string money objects in major units, never floats or JSON numbers), with 201-first-post / 200-idempotent-replay semantics and RFC 9457 problem responses passing Foundation invariant codes through unchanged plus the three domain codes.
 
 **Implements**:
 - `cpt-cf-bss-ledger-flow-invoice-post`
@@ -467,7 +467,7 @@ Derived from the source design's testing architecture (§7.8). Mocking by level:
 
 ### 7.1 REST API Surface (feature-owned endpoints)
 
-**Conventions.** REST per the `rest-api-design` standard, behind the inbound API gateway. JSON; OAuth 2.0; tenant from the authenticated context (also enforced by RLS, §7.5). Versioned under `/v1`. All money fields are `{ "amountMinor": <integer>, "currency": "USD", "scale": 2 }` — never floats. Mutating posts are idempotent on a client-supplied business key (`invoiceId`). This is the **handler-facing HTTP surface** for invoice-posting; it funnels into the Foundation's data-access API (the post/reverse/read HTTP surface is handler-owned). The seller-provisioning endpoint is **not** here — it belongs to the Foundation.
+**Conventions.** REST per the `rest-api-design` standard, behind the inbound API gateway. JSON; OAuth 2.0; tenant from the authenticated context (also enforced by RLS, §7.5). Versioned under `/v1`. All money fields are `{ "amount": "12.34", "currency": "USD", "currency_scale": 2 }` (`MoneyDto`; `amount` is a decimal string in major units, at most 64 bytes, a JSON number is rejected with `InvalidArgument`; responses carry canonical text) — never floats or integer minor units. Mutating posts are idempotent on a client-supplied business key (`invoiceId`). This is the **handler-facing HTTP surface** for invoice-posting; it funnels into the Foundation's data-access API (the post/reverse/read HTTP surface is handler-owned). The seller-provisioning endpoint is **not** here — it belongs to the Foundation.
 
 | Method | Path | Purpose | Idempotency |
 |--------|------|---------|-------------|
@@ -476,7 +476,7 @@ Derived from the source design's testing architecture (§7.8). Mocking by level:
 | `GET` | `/v1/ledger/balances` | Read balances (filter: `accountClass`, `currency`, `payerTenantId`, optional `invoiceId` for the AR-invoice grain). Warm read from the Foundation's balance cache. | Warm read from the balance cache. |
 | `GET` | `/v1/ledger/journal-entries/{entryId}` | Retrieve a posted entry with its lines + source linkage + actor/correlation (AC #8). | — |
 | `GET` | `/v1/ledger/journal-lines` | Paginated transaction history (cursor pagination; filter: payer, account class, period, source business id). | — |
-| `GET` | `/v1/ledger/balances/ar-aging` | AR aging rollup per payer. Buckets derived **at read time** from `ar_invoice_balance` (`balance_minor > 0`, **days past due** = now − `due_date`); default buckets **current / 1–30 / 31–60 / 61–90 / 90+ days past due**, tenant-configurable; computed per `(payer, currency)`. A pure read over the existing cache — no new posted state, no new lock rank. | Warm read from the balance cache. |
+| `GET` | `/v1/ledger/balances/ar-aging` | AR aging rollup per payer. Buckets derived **at read time** from `ar_invoice_balance` (`balance > 0`, **days past due** = now − `due_date`); default buckets **current / 1–30 / 31–60 / 61–90 / 90+ days past due**, tenant-configurable; computed per `(payer, currency)`. A pure read over the existing cache — no new posted state, no new lock rank. | Warm read from the balance cache. |
 
 **Success / replay semantics (not errors):** a first successful post returns `201` with the posting reference. An idempotent replay (same key + identical payload) returns `200` with the **prior** posting reference (`entryId`, `postedAtUtc`, `status`), not an error body — resolved by the Foundation's `idempotencyClaim`.
 
@@ -568,4 +568,4 @@ Consolidated decision log for the invoice-post-domain blocker items. **None bloc
 - Parent module scope (AR, ledger, financial posting) and program billing architecture — Billing Module / Billing System PRDs (legacy refs preserved in the source design).
 - Contracts & Agreements, Metering & Pricing, Product Catalog & Marketplace, Subscriptions & Entitlements PRDs — interface sources (PO tags, billable items, glCode/tax category, recurring charges).
 - Inbound API gateway ADR — API exposure pattern (C4).
-- Azure billing domain model design — related BSS domain model (this design diverges to integer minor-unit money per AC #16).
+- Azure billing domain model design — related BSS domain model (this design uses validated decimal money in major units per AC #16 and the BSS money ADR `cpt-cf-bss-adr-exact-decimal-boundaries`).

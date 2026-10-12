@@ -9,7 +9,7 @@ use bigdecimal::ToPrimitive;
 use chrono::SecondsFormat;
 use sea_orm::{
     Condition, EntityTrait, ExprTrait, QueryFilter, QueryOrder, QuerySelect,
-    sea_query::{Expr, Order},
+    sea_query::{Expr, LikeExpr, Order},
 };
 use toolkit_odata::filter::{
     FieldKind, FilterField, FilterNode, FilterOp, ODataValue, convert_expr_to_filter_node,
@@ -280,10 +280,8 @@ fn build_binary_condition<C>(
 where
     C: sea_orm::Iden + sea_orm::ColumnTrait + sea_orm::IntoSimpleExpr + Clone + 'static,
 {
-    // Convert ODataValue to sea_orm::Value
-    let sea_value = odata_value_to_sea_value(value)?;
-
-    // Handle NULL specially
+    // NULL first: it has no `sea_orm::Value` of the column's kind, and `eq`/`ne` with it
+    // mean "absent"/"present" (the parser admits it with no other operator).
     if matches!(value, ODataValue::Null) {
         return Ok(match op {
             FilterOp::Eq => Condition::all().add(Expr::col(column).is_null()),
@@ -291,6 +289,9 @@ where
             _ => return Err(format!("Unsupported operator for NULL: {op:?}")),
         });
     }
+
+    // Convert ODataValue to sea_orm::Value
+    let sea_value = odata_value_to_sea_value(value)?;
 
     // Build the expression based on the operator
     let expr = match op {
@@ -302,15 +303,15 @@ where
         FilterOp::Le => Expr::col(column).lte(sea_value),
         FilterOp::Contains => {
             let s = extract_string(value)?;
-            Expr::col(column).like(format!("%{}%", escape_like(&s)))
+            Expr::col(column).like(escaped_like(format!("%{}%", escape_like(&s))))
         }
         FilterOp::StartsWith => {
             let s = extract_string(value)?;
-            Expr::col(column).like(format!("{}%", escape_like(&s)))
+            Expr::col(column).like(escaped_like(format!("{}%", escape_like(&s))))
         }
         FilterOp::EndsWith => {
             let s = extract_string(value)?;
-            Expr::col(column).like(format!("%{}", escape_like(&s)))
+            Expr::col(column).like(escaped_like(format!("%{}", escape_like(&s))))
         }
         FilterOp::In | FilterOp::And | FilterOp::Or => {
             return Err(format!("Operator {op:?} not valid in binary context"));
@@ -379,10 +380,21 @@ fn extract_string(value: &ODataValue) -> Result<String, String> {
     }
 }
 
+/// A `LIKE` pattern built with [`escape_like`], carrying `ESCAPE '\'`.
+///
+/// The clause is what makes the escaping mean anything on every dialect: `SQLite` has no
+/// default escape character, so without it `\%` is a literal backslash followed by a wildcard;
+/// Postgres happens to default to the backslash.
+#[must_use]
+pub fn escaped_like(pattern: String) -> LikeExpr {
+    LikeExpr::new(pattern).escape('\\')
+}
+
 /// Escape special characters in LIKE patterns.
 ///
 /// This escapes `%`, `_`, and `\` to prevent them from being interpreted
-/// as wildcards in SQL LIKE patterns.
+/// as wildcards in SQL LIKE patterns. Use the result through [`escaped_like`], which adds the
+/// `ESCAPE '\'` clause the escaping relies on.
 #[must_use]
 pub fn escape_like(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -705,9 +717,12 @@ where
     }
 
     // Validate cursor consistency (filter hash only)
+    // A cursor issued for a filter carries only its hash, so a continuation
+    // must send the same filter: a missing or different one is a mismatch.
+    // A cursor without a hash is accepted (an added filter only narrows it).
     if let Some(cur) = &query.cursor
-        && let (Some(h), Some(cf)) = (query.filter_hash.as_deref(), cur.f.as_deref())
-        && h != cf
+        && let Some(cf) = cur.f.as_deref()
+        && query.filter_hash.as_deref() != Some(cf)
     {
         return Err(ODataError::FilterMismatch);
     }

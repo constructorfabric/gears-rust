@@ -41,7 +41,6 @@ use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode, header};
 use bss_ledger::api::rest::disputes::{ApiState, router};
 use bss_ledger::domain::model::{AccountRow, CurrencyScaleRow};
-use bss_ledger::domain::money::DEFAULT_PLAUSIBLE_MAX_MAJOR;
 use bss_ledger::domain::payment::settlement::SettlementInput;
 use bss_ledger::domain::ports::metrics::NoopLedgerMetrics;
 use bss_ledger::infra::events::publisher::LedgerEventPublisher;
@@ -70,6 +69,29 @@ use toolkit_gts::gts_id;
 use toolkit_security::{PlatformSecurityContext, SecurityContext};
 use tower::ServiceExt;
 use uuid::Uuid;
+
+/// A USD scale-2 posting from a cent count (`1234` ⇒ `12.34`).
+fn usd_cents(minor: i64) -> bss_ledger_sdk::PostedMoney {
+    bss_ledger_sdk::PostedMoney::try_new(
+        rust_decimal::Decimal::new(minor, 2),
+        bss_ledger_sdk::CurrencySpec::try_new("USD".to_owned(), 2).unwrap(),
+    )
+    .unwrap()
+}
+
+/// The wire form of a scale-2 cent count in `currency`.
+fn money_json(minor: i64, currency: &str) -> serde_json::Value {
+    serde_json::json!({
+        "amount": bss_ledger_sdk::canonical_decimal(rust_decimal::Decimal::new(minor, 2)),
+        "currency": currency,
+        "currency_scale": 2
+    })
+}
+
+/// The wire form of a USD scale-2 cent count.
+fn usd_json(minor: i64) -> serde_json::Value {
+    money_json(minor, "USD")
+}
 
 fn pg(sql: impl Into<String>) -> Statement {
     Statement::from_string(sea_orm::DatabaseBackend::Postgres, sql.into())
@@ -130,8 +152,7 @@ impl LedgerClientV1 for RealDisputeClient {
             cycle: req.cycle,
             phase,
             funds_at_open,
-            disputed_amount_minor: req.disputed_amount_minor,
-            currency: req.currency,
+            disputed_amount: req.disputed_amount,
             effective_at: req.effective_at,
         };
         match self
@@ -217,7 +238,7 @@ impl LedgerClientV1 for RealDisputeClient {
         _ctx: &SecurityContext,
         _tenant_id: Uuid,
         _account_id: Uuid,
-    ) -> Result<Option<i64>, CanonicalError> {
+    ) -> Result<Option<bss_ledger_sdk::PostedMoney>, CanonicalError> {
         unimplemented!("not exercised by the dispute router tests")
     }
 
@@ -445,8 +466,7 @@ async fn setup_seller(raw: &sea_orm::DatabaseConnection, provider: &DBProvider<D
         .upsert_currency_scale(CurrencyScaleRow {
             tenant_id: s.tenant,
             currency: "USD".to_owned(),
-            minor_units: 2,
-            plausible_max_major: DEFAULT_PLAUSIBLE_MAX_MAJOR,
+            currency_scale: 2,
             source: "iso".to_owned(),
         })
         .await
@@ -494,9 +514,8 @@ async fn settle(provider: &DBProvider<DbError>, s: &Seller, payment_id: &str, gr
             tenant_id: s.tenant,
             payer_tenant_id: s.payer,
             payment_id: payment_id.to_owned(),
-            gross_minor: gross,
-            fee_minor: 0,
-            currency: "USD".to_owned(),
+            gross: usd_cents(gross),
+            fee: usd_cents(0),
             effective_at: None,
         },
     )
@@ -575,9 +594,7 @@ async fn record_opened_cash_hold_returns_201() {
         "payment_id": "PAY-DSP-REST-1",
         "phase": "OPENED",
         "funds_at_open": "withheld",
-        "disputed_amount_minor": 1000,
-        "currency": "USD",
-        "scale": 2
+        "disputed_amount": usd_json(1000)
     });
     let (status, fresh) = send(
         router_with_db(provider.clone()).layer(axum::Extension(ctx)),
@@ -629,9 +646,7 @@ async fn record_into_foreign_tenant_is_denied_403() {
         "payment_id": "PAY-FOREIGN",
         "phase": "OPENED",
         "funds_at_open": "withheld",
-        "disputed_amount_minor": 1000,
-        "currency": "USD",
-        "scale": 2
+        "disputed_amount": usd_json(1000)
     });
     let (status, problem) = send(
         router_with_db(provider.clone()).layer(axum::Extension(ctx)),
@@ -676,9 +691,7 @@ async fn out_of_order_won_returns_202_queued() {
         "payment_id": "PAY-Q-REST",
         "phase": "WON",
         "funds_at_open": "withheld",
-        "disputed_amount_minor": 1000,
-        "currency": "USD",
-        "scale": 2
+        "disputed_amount": usd_json(1000)
     });
     let (status, queued) = send(
         router_with_db(provider.clone()).layer(axum::Extension(ctx)),

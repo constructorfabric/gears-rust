@@ -694,6 +694,9 @@ pub fn build_test_app_state(
             SsrfGuard::disabled(),
         )),
     );
+    // The gear hands one `max_body_size_bytes` to both the handler and the
+    // Data Plane, so a limit set for the Data Plane applies to the handler too.
+    let max_body_size_bytes = dp_builder.max_body_size.unwrap_or(100 * 1024 * 1024);
     let cp = cp_builder.build_and_register(hub);
     let dp = dp_builder
         .with_backend_selector(backend_selector.clone())
@@ -707,7 +710,7 @@ pub fn build_test_app_state(
             dp,
             backend_selector,
             config: crate::config::RuntimeConfig {
-                max_body_size_bytes: 100 * 1024 * 1024, // 100 MB default for tests
+                max_body_size_bytes,
                 websocket_idle_timeout_secs: 300,
                 websocket_close_timeout_secs: 5,
                 streaming_idle_timeout_secs: 300,

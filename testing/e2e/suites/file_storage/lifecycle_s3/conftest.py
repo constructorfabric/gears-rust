@@ -194,7 +194,7 @@ def _patch_file_storage_s3_config(config_text: str, env) -> str:
     )
 
     # Append `default_backend_id` + `s3_backends` right after
-    # `enable_background_sweep: false` (present in every `file-storage:`
+    # `finalize_internal_secret: ...` (present in every `file-storage:`
     # block of `config/e2e-local.yaml` today — re-`rg` this literal if the
     # base config's shape ever changes and this substitution stops matching,
     # since `count=1` makes a silent no-match a silent no-op rather than an
@@ -218,13 +218,13 @@ def _patch_file_storage_s3_config(config_text: str, env) -> str:
         secret_key=json.dumps(s3["secret_key"]),
     )
     new_config_text, n = re.subn(
-        r"(enable_background_sweep\s*:\s*false)",
+        r"(finalize_internal_secret\s*:\s*\"[^\"]*\")",
         lambda m: m.group(1) + s3_backends_block,
         config_text,
         count=1,
     )
     assert n == 1, (
-        "expected exactly one 'enable_background_sweep: false' line in the "
+        "expected exactly one quoted 'finalize_internal_secret' line in the "
         "file-storage config block to append s3_backends after — the base "
         "config/e2e-local.yaml shape may have changed"
     )

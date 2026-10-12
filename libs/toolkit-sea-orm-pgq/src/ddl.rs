@@ -49,7 +49,10 @@ fn require_named(value: &str, what: &'static str) -> Result<(), PgqError> {
 /// the tenant means an edge structurally cannot join a vertex of another tenant,
 /// before any scope predicate is applied.
 #[derive(Clone, Debug)]
-pub struct ElementKey(pub(crate) Vec<String>);
+pub struct ElementKey(
+    /// Key column names, in order.
+    pub(crate) Vec<String>,
+);
 
 /// One vertex table and the label it is declared under.
 #[derive(Clone, Debug)]

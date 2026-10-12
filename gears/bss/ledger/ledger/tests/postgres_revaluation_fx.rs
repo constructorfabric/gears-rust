@@ -9,7 +9,7 @@
 //! 2. at period end the rate is 1.05 → the AR is worth only 120.00 × 1.05 =
 //!    **126.00 USD**;
 //! 3. **forward revaluation** (AR scope): the carrying value falls 6.00 USD →
-//!    **CR AR 6.00 / DR FX_UNREALIZED 6.00** (functional-only, `amount_minor = 0`),
+//!    **CR AR 6.00 / DR FX_UNREALIZED 6.00** (functional-only, `amount = 0`),
 //!    moving the AR grain's functional balance to 126.00 and booking a 6.00 USD
 //!    unrealized loss;
 //! 4. the period CLOSES and the next one opens;
@@ -42,7 +42,6 @@ use bss_ledger::domain::error::DomainError;
 use bss_ledger::domain::instant::to_naive_date;
 use bss_ledger::domain::invoice::builder::{InvoiceItem, PostedInvoice};
 use bss_ledger::domain::model::{AccountRow, CurrencyScaleRow, NewEntry, NewLine};
-use bss_ledger::domain::money::DEFAULT_PLAUSIBLE_MAX_MAJOR;
 use bss_ledger::domain::period::{next_period_id, period_end_utc};
 use bss_ledger::domain::ports::metrics::NoopLedgerMetrics;
 use bss_ledger::infra::events::publisher::LedgerEventPublisher;
@@ -51,8 +50,11 @@ use bss_ledger::infra::invoice_post::InvoicePostService;
 use bss_ledger::infra::posting::service::PostingService;
 use bss_ledger::infra::storage::migrations::Migrator;
 use bss_ledger::infra::storage::repo::{FxRepo, NewFxRate, ReferenceRepo};
-use bss_ledger_sdk::{AccountClass, MappingStatus, Side, SourceDocType};
+use bss_ledger_sdk::{
+    AccountClass, CurrencySpec, MappingStatus, PostedMoney, Side, SourceDocType, canonical_decimal,
+};
 use chrono::NaiveDate;
+use rust_decimal::Decimal;
 use sea_orm::{ConnectionTrait, Database, DatabaseConnection, Statement};
 use sea_orm_migration::MigratorTrait;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
@@ -71,6 +73,35 @@ async fn scalar_i64(conn: &DatabaseConnection, sql: &str) -> Option<i64> {
         .await
         .unwrap()
         .map(|r| r.try_get_by_index::<i64>(0).unwrap())
+}
+
+/// Read one canonical decimal TEXT money column verbatim.
+async fn scalar_text(conn: &DatabaseConnection, sql: &str) -> Option<String> {
+    conn.query_one_raw(pg(sql.to_owned()))
+        .await
+        .unwrap()
+        .map(|r| r.try_get_by_index::<String>(0).unwrap())
+}
+
+/// Read one `numeric`-cast aggregate (as text) as a normalized decimal.
+async fn scalar_decimal(conn: &DatabaseConnection, sql: &str) -> Option<Decimal> {
+    scalar_text(conn, sql)
+        .await
+        .map(|t| Decimal::from_str_exact(&t).unwrap().normalize())
+}
+
+/// Scale-2 money in `code` from a cent count (`12_000` ⇒ `120.00`).
+fn money(code: &str, cents: i64) -> PostedMoney {
+    PostedMoney::try_new(
+        Decimal::new(cents, 2),
+        CurrencySpec::try_new(code.to_owned(), 2).unwrap(),
+    )
+    .unwrap()
+}
+
+/// The canonical stored text of a scale-2 cent count (`13_200` ⇒ `"132"`).
+fn text(cents: i64) -> String {
+    canonical_decimal(Decimal::new(cents, 2))
 }
 
 fn naive(y: i32, m: u32, d: u32) -> NaiveDate {
@@ -129,8 +160,7 @@ async fn cross_currency_revaluation_then_next_period_reversal() {
             .upsert_currency_scale(CurrencyScaleRow {
                 tenant_id: tenant,
                 currency: ccy.to_owned(),
-                minor_units: 2,
-                plausible_max_major: DEFAULT_PLAUSIBLE_MAX_MAJOR,
+                currency_scale: 2,
                 source: "iso".to_owned(),
             })
             .await
@@ -184,7 +214,7 @@ async fn cross_currency_revaluation_then_next_period_reversal() {
             base_currency: "EUR".to_owned(),
             quote_currency: "USD".to_owned(),
             provider: "ecb".to_owned(),
-            rate_micro: 1_100_000,
+            rate: Decimal::new(110, 2),
             as_of: now,
             fallback_order: 0,
         })
@@ -212,9 +242,8 @@ async fn cross_currency_revaluation_then_next_period_reversal() {
         due_date: Some(naive(2026, 12, 1)),
         period_id: period_id.clone(),
         items: vec![InvoiceItem {
-            amount_minor_ex_tax: 12_000,
-            deferred_minor: 0,
-            currency: "EUR".to_owned(),
+            amount_ex_tax: money("EUR", 12_000),
+            deferred: money("EUR", 0),
             revenue_stream: "subscription".to_owned(),
             catalog_class: Some(AccountClass::Revenue),
             contract_class: None,
@@ -235,10 +264,10 @@ async fn cross_currency_revaluation_then_next_period_reversal() {
         .expect("cross-currency invoice must post");
 
     assert_eq!(
-        scalar_i64(&raw, &format!(
-            "SELECT functional_balance_minor FROM bss.ledger_ar_invoice_balance WHERE tenant_id='{tenant}' AND invoice_id='INV-REVAL-1'"
+        scalar_text(&raw, &format!(
+            "SELECT functional_balance FROM bss.ledger_ar_invoice_balance WHERE tenant_id='{tenant}' AND invoice_id='INV-REVAL-1'"
         )).await,
-        Some(13_200),
+        Some(text(13_200)),
         "AR carried functional = 132.00 USD (120.00 EUR * 1.10)"
     );
 
@@ -249,7 +278,7 @@ async fn cross_currency_revaluation_then_next_period_reversal() {
             base_currency: "EUR".to_owned(),
             quote_currency: "USD".to_owned(),
             provider: "ecb".to_owned(),
-            rate_micro: 1_050_000,
+            rate: Decimal::new(105, 2),
             as_of: period_end,
             fallback_order: 0,
         })
@@ -269,30 +298,30 @@ async fn cross_currency_revaluation_then_next_period_reversal() {
 
     // The AR grain's functional carrying value falls to 126.00 USD (120.00 * 1.05).
     assert_eq!(
-        scalar_i64(&raw, &format!(
-            "SELECT functional_balance_minor FROM bss.ledger_ar_invoice_balance WHERE tenant_id='{tenant}' AND invoice_id='INV-REVAL-1'"
+        scalar_text(&raw, &format!(
+            "SELECT functional_balance FROM bss.ledger_ar_invoice_balance WHERE tenant_id='{tenant}' AND invoice_id='INV-REVAL-1'"
         )).await,
-        Some(12_600),
+        Some(text(12_600)),
         "AR functional remeasured to 126.00 USD"
     );
     // The transaction balance is UNTOUCHED (revaluation is functional-only).
     assert_eq!(
-        scalar_i64(&raw, &format!(
-            "SELECT balance_minor FROM bss.ledger_ar_invoice_balance WHERE tenant_id='{tenant}' AND invoice_id='INV-REVAL-1'"
+        scalar_text(&raw, &format!(
+            "SELECT balance FROM bss.ledger_ar_invoice_balance WHERE tenant_id='{tenant}' AND invoice_id='INV-REVAL-1'"
         )).await,
-        Some(12_000),
+        Some(text(12_000)),
         "AR transaction balance unchanged (120.00 EUR)"
     );
     // The FX_UNREALIZED account carries the 6.00 USD unrealized loss (DR-normal).
     assert_eq!(
-        scalar_i64(&raw, &format!(
-            "SELECT functional_balance_minor FROM bss.ledger_account_balance WHERE tenant_id='{tenant}' AND account_id='{fx_unrealized}'"
+        scalar_text(&raw, &format!(
+            "SELECT functional_balance FROM bss.ledger_account_balance WHERE tenant_id='{tenant}' AND account_id='{fx_unrealized}'"
         )).await,
-        Some(600),
+        Some(text(600)),
         "FX_UNREALIZED functional balance = 6.00 USD unrealized loss"
     );
     // The forward entry exists, is a FX_REVALUATION doc, and is functional-only
-    // (every line amount_minor = 0) and balances in the functional column.
+    // (every line amount = 0) and balances in the functional column.
     let reval_lines = format!(
         "FROM bss.ledger_journal_line l JOIN bss.ledger_journal_entry e \
          ON l.tenant_id=e.tenant_id AND l.entry_id=e.entry_id \
@@ -304,19 +333,19 @@ async fn cross_currency_revaluation_then_next_period_reversal() {
         "forward reval = CR AR + DR FX_UNREALIZED (two functional-only lines)"
     );
     assert_eq!(
-        scalar_i64(
+        scalar_decimal(
             &raw,
-            &format!("SELECT COALESCE(SUM(l.amount_minor),0)::bigint {reval_lines}")
+            &format!("SELECT COALESCE(SUM(l.amount::numeric),0)::text {reval_lines}")
         )
         .await,
-        Some(0),
-        "every revaluation line is functional-only (transaction amount_minor = 0)"
+        Some(Decimal::ZERO),
+        "every revaluation line is functional-only (transaction amount = 0)"
     );
     assert_eq!(
-        scalar_i64(&raw, &format!(
-            "SELECT COALESCE(SUM(CASE WHEN l.side='DR' THEN l.functional_amount_minor ELSE -l.functional_amount_minor END),0)::bigint {reval_lines}"
+        scalar_decimal(&raw, &format!(
+            "SELECT COALESCE(SUM(CASE WHEN l.side='DR' THEN l.functional_amount::numeric ELSE -(l.functional_amount::numeric) END),0)::text {reval_lines}"
         )).await,
-        Some(0),
+        Some(Decimal::ZERO),
         "revaluation entry functional column balances (DR == CR)"
     );
 
@@ -354,18 +383,18 @@ async fn cross_currency_revaluation_then_next_period_reversal() {
 
     // The reversal restores the AR grain to its historical 132.00 USD carried basis.
     assert_eq!(
-        scalar_i64(&raw, &format!(
-            "SELECT functional_balance_minor FROM bss.ledger_ar_invoice_balance WHERE tenant_id='{tenant}' AND invoice_id='INV-REVAL-1'"
+        scalar_text(&raw, &format!(
+            "SELECT functional_balance FROM bss.ledger_ar_invoice_balance WHERE tenant_id='{tenant}' AND invoice_id='INV-REVAL-1'"
         )).await,
-        Some(13_200),
+        Some(text(13_200)),
         "reversal restores AR functional to 132.00 USD (historical basis)"
     );
     // The FX_UNREALIZED contra unwinds to zero (only realized FX is permanent).
     assert_eq!(
-        scalar_i64(&raw, &format!(
-            "SELECT functional_balance_minor FROM bss.ledger_account_balance WHERE tenant_id='{tenant}' AND account_id='{fx_unrealized}'"
+        scalar_text(&raw, &format!(
+            "SELECT functional_balance FROM bss.ledger_account_balance WHERE tenant_id='{tenant}' AND account_id='{fx_unrealized}'"
         )).await,
-        Some(0),
+        Some(text(0)),
         "FX_UNREALIZED unwinds to 0 after the reversal"
     );
     // The reversal is a fresh FX_REVAL_REVERSAL entry in the NEXT period.
@@ -393,7 +422,7 @@ async fn cross_currency_revaluation_then_next_period_reversal() {
 
 /// `FxRateUnavailable` at run time: a USD-functional seller holds an OPEN
 /// cross-currency EUR receivable (a revalue-able grain: `functional_currency` set,
-/// `balance_minor > 0`), but the EUR→USD pair has NO `ledger_fx_rate` row at all.
+/// `balance > 0`), but the EUR→USD pair has NO `ledger_fx_rate` row at all.
 /// The revaluation enumerates the grain (step 1), then the period-end rate resolve
 /// (step 2) finds zero candidates and the run fails [`DomainError::FxRateUnavailable`]
 /// BEFORE any post — no `FX_REVALUATION` entry, the AR grain untouched.
@@ -432,8 +461,7 @@ async fn revaluation_with_no_period_end_rate_is_fx_rate_unavailable() {
             .upsert_currency_scale(CurrencyScaleRow {
                 tenant_id: tenant,
                 currency: ccy.to_owned(),
-                minor_units: 2,
-                plausible_max_major: DEFAULT_PLAUSIBLE_MAX_MAJOR,
+                currency_scale: 2,
                 source: "iso".to_owned(),
             })
             .await
@@ -514,16 +542,13 @@ async fn revaluation_with_no_period_end_rate_is_fx_rate_unavailable() {
         account_class: class,
         gl_code: None,
         side,
-        amount_minor: 12_000,
-        currency: "EUR".to_owned(),
-        currency_scale: 2,
+        money: money("EUR", 12_000),
         invoice_id: invoice_id.map(str::to_owned),
         due_date: None,
         revenue_stream: stream.map(str::to_owned),
         mapping_status: MappingStatus::Resolved,
         // The functional (USD) leg supplied on the line — no rate resolve at post.
-        functional_amount_minor: Some(13_200),
-        functional_currency: Some("USD".to_owned()),
+        functional_money: Some(money("USD", 13_200)),
         tax_jurisdiction: None,
         tax_filing_period: None,
         tax_rate_ref: None,
@@ -565,10 +590,10 @@ async fn revaluation_with_no_period_end_rate_is_fx_rate_unavailable() {
     // Sanity: the AR grain is cross-currency + open ⇒ the revaluation will enumerate
     // it, then hit the rate resolve.
     assert_eq!(
-        scalar_i64(&raw, &format!(
-            "SELECT balance_minor FROM bss.ledger_ar_invoice_balance WHERE tenant_id='{tenant}' AND invoice_id='INV-NORATE-1'"
+        scalar_text(&raw, &format!(
+            "SELECT balance FROM bss.ledger_ar_invoice_balance WHERE tenant_id='{tenant}' AND invoice_id='INV-NORATE-1'"
         )).await,
-        Some(12_000),
+        Some(text(12_000)),
         "AR carries the open EUR balance"
     );
 
@@ -602,10 +627,10 @@ async fn revaluation_with_no_period_end_rate_is_fx_rate_unavailable() {
         "no revaluation entry posted when the rate is unavailable"
     );
     assert_eq!(
-        scalar_i64(&raw, &format!(
-            "SELECT functional_balance_minor FROM bss.ledger_ar_invoice_balance WHERE tenant_id='{tenant}' AND invoice_id='INV-NORATE-1'"
+        scalar_text(&raw, &format!(
+            "SELECT functional_balance FROM bss.ledger_ar_invoice_balance WHERE tenant_id='{tenant}' AND invoice_id='INV-NORATE-1'"
         )).await,
-        Some(13_200),
+        Some(text(13_200)),
         "AR functional carrying value untouched (still the posted 132.00 USD)"
     );
 }

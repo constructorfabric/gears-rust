@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -27,6 +28,7 @@ sys.path.insert(0, str(SCRIPTS))
 
 import classify      # noqa: E402
 import diffparse     # noqa: E402
+import ghsource      # noqa: E402
 import budget        # noqa: E402
 import lint          # noqa: E402
 
@@ -146,13 +148,52 @@ class TestClassify(unittest.TestCase):
         self.assertIsNone(classify.test_sibling_source("a/lock.rs"))
         self.assertIsNone(classify.test_sibling_source("a/integration_test.rs"))
 
-    def test_toolkit_owned_by_path_and_by_symbol(self):
-        self.assertTrue(classify.toolkit_owned("gears/foo/src/gear.rs", ""))
-        self.assertTrue(classify.toolkit_owned("other/x.rs", "use toolkit_db::Db;"))
-        self.assertTrue(classify.toolkit_owned("other/x.rs", "let c: SecureConn = ...;"))
-        self.assertFalse(classify.toolkit_owned("other/x.rs", "fn main() {}"))
-        self.assertFalse(classify.toolkit_owned("Cargo.toml", None))
 
+class TestLocalBase(unittest.TestCase):
+    """Local mode diffs against upstream's trunk, not a fork's stale one.
+
+    The repo mirrors a fork checkout: `origin/main` and local `main` sit at A, upstream
+    has moved on to B, and the branch under review starts from B. A base taken from
+    `origin` puts B into the review as if the branch had written it.
+    """
+
+    def setUp(self):
+        self.repo = Path(tempfile.mkdtemp(prefix="prreview-base."))
+        self.addCleanup(shutil.rmtree, self.repo, True)
+        cwd = os.getcwd()
+        self.addCleanup(os.chdir, cwd)
+        os.chdir(self.repo)
+        self.git("init", "-q", "-b", "main")
+        self.a = self.commit("a")
+        self.git("update-ref", "refs/remotes/origin/main", self.a)
+        self.git("symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")
+        self.git("remote", "add", "origin", "https://github.com/fork/repo.git")
+        self.git("switch", "-q", "-c", "feature")
+        self.b = self.commit("b")
+        self.git("update-ref", "refs/remotes/upstream/main", self.b)
+        self.git("remote", "add", "upstream", "https://github.com/owner/repo.git")
+        self.commit("c")
+
+    def git(self, *args: str) -> str:
+        return subprocess.run(["git", *args], check=True, capture_output=True,
+                              text=True).stdout.strip()
+
+    def commit(self, name: str) -> str:
+        (self.repo / name).write_text(name)
+        self.git("add", name)
+        self.git("-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false",
+                 "commit", "-q", "--no-verify", "-m", name)
+        return self.git("rev-parse", "HEAD")
+
+    def test_upstream_trunk_wins_over_the_fork(self):
+        self.assertEqual(ghsource.local_base(None, "feature"), self.b)
+
+    def test_origin_is_used_when_there_is_no_upstream(self):
+        self.git("remote", "remove", "upstream")
+        self.assertEqual(ghsource.local_base(None, "feature"), self.a)
+
+    def test_an_explicit_base_wins(self):
+        self.assertEqual(ghsource.local_base("main", "feature"), self.a)
 
 class TestSeverityMarker(unittest.TestCase):
     """Criterion-level severity: `- [LEVEL] ...` overrides the rule's `**Severity**`.
@@ -193,22 +234,6 @@ class TestSeverityMarker(unittest.TestCase):
                     self.assertIn(bad.group(1), lint.SEVERITIES,
                                   f"{path.name}:{n} has a non-severity bracket marker")
 
-    def test_markers_survive_rendering(self):
-        """render-rules strips rationale and gated criteria; it must not eat the marker."""
-        src = ROOT / "docs/toolkit-pr-review/rules"
-        out = ROOT / "docs/toolkit-pr-review/agent-rules"
-        for path in sorted(src.glob("*.md")):
-            rendered = out / path.name
-            if not rendered.exists():
-                continue
-            kept = {b for _, b in lint.criteria_of(rendered.read_text(encoding="utf-8"))
-                    if lint.SEVERITY_MARKER.match(b)}
-            for _, body in lint.criteria_of(path.read_text(encoding="utf-8")):
-                m = lint.SEVERITY_MARKER.match(body)
-                # a marked criterion is either dropped by a version gate or kept verbatim
-                if m and body in {b for _, b in lint.criteria_of(rendered.read_text(encoding="utf-8"))}:
-                    self.assertIn(body, kept)
-
     def test_conventions_and_the_agent_prompt_both_document_the_override(self):
         """An undocumented marker is inert: the agent reads the rule's level and moves on."""
         conv = (ROOT / "docs/toolkit-pr-review/review-conventions.md").read_text(encoding="utf-8")
@@ -230,7 +255,7 @@ class TestBudget(unittest.TestCase):
         """budget.MODULES drives the spawn list; a name with no rule file spawns a blind agent."""
         for m in budget.MODULES:
             self.assertTrue((budget.RULES_DIR / f"{m}.md").exists(),
-                            f"agent-rules/{m}.md is missing for module {m}")
+                            f"rules/{m}.md is missing for module {m}")
 
     def test_instruction_tokens_counts_the_module_and_the_shared_docs(self):
         """The estimate must move when a rule module grows, or it silently understates cost."""
@@ -272,6 +297,35 @@ class TestPrepareOffline(unittest.TestCase):
         self.assertEqual(p.returncode, 0, p.stderr)
         return work, json.loads((work / "context.json").read_text())
 
+    def test_no_rust_file_spawns_no_agent(self):
+        """A manifest- or docs-only PR costs nothing: no agent reads it."""
+        work = Path(tempfile.mkdtemp(prefix="prreview-test."))
+        diff = work.parent / f"{work.name}.patch"
+        diff.write_text(
+            "diff --git a/Cargo.toml b/Cargo.toml\n"
+            "--- a/Cargo.toml\n"
+            "+++ b/Cargo.toml\n"
+            "@@ -1,1 +1,2 @@\n"
+            " [workspace]\n"
+            "+members = []\n"
+            "diff --git a/README.md b/README.md\n"
+            "--- a/README.md\n"
+            "+++ b/README.md\n"
+            "@@ -1,1 +1,2 @@\n"
+            " # x\n"
+            "+y\n"
+        )
+        self.addCleanup(diff.unlink)
+        p = subprocess.run([sys.executable, str(SCRIPTS / "review.py"), "prepare",
+                            "--from-diff", str(diff), "--work-dir", str(work)],
+                           capture_output=True, text=True)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        ctx = json.loads((work / "context.json").read_text())
+        self.assertEqual(ctx["agents"], [])
+        self.assertEqual(ctx["totals"]["est_tokens"], 0)
+        self.assertEqual(ctx["all_files"], ["Cargo.toml"])
+        self.assertEqual(ctx["skipped_files"], ["README.md"])
+
     def test_every_module_gets_an_agent_over_every_file(self):
         """Six subject agents, each holding one module, each seeing the whole PR.
 
@@ -283,25 +337,10 @@ class TestPrepareOffline(unittest.TestCase):
             with self.subTest(pr=pr):
                 _, ctx = self._prepare(pr)
                 by_name = {a["name"]: a for a in ctx["agents"]}
-                expected = [m for m in budget.MODULES
-                            if m != "toolkit" or ctx["toolkit_files"]] + ["architecture"]
-                self.assertEqual(sorted(by_name), sorted(expected))
+                self.assertEqual(sorted(by_name), sorted(budget.MODULES + ["architecture"]))
                 for m in budget.MODULES:
-                    if m == "toolkit":
-                        continue
                     self.assertEqual(sorted(by_name[m]["files"]), sorted(ctx["all_files"]),
                                      f"{m} was not given every file")
-
-    def test_the_toolkit_agent_is_scoped_to_toolkit_owned_files(self):
-        for pr in FIXTURE_PRS:
-            with self.subTest(pr=pr):
-                _, ctx = self._prepare(pr)
-                tk = next((a for a in ctx["agents"] if a["name"] == "toolkit"), None)
-                if not ctx["toolkit_files"]:
-                    self.assertIsNone(tk, "toolkit agent spawned with nothing to review")
-                    continue
-                self.assertEqual(tk["files"], ctx["toolkit_files"])
-                self.assertTrue(set(tk["files"]) <= set(ctx["all_files"]))
 
     def test_only_the_security_agent_carries_the_manifests(self):
         """RUST-DEP-001 lives in security.md and nowhere else; the list must not leak."""

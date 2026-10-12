@@ -1,53 +1,60 @@
 """E2E tests for OAGW proxy HTTP round-trip (passthrough, headers)."""
+import json
+from urllib.parse import urlparse
+
 import httpx
 import pytest
 
-from .helpers import create_route, create_upstream, delete_upstream, unique_alias
+from .helpers import create_route, create_upstream, unique_alias
+
+PASSTHROUGH_ALL = {"request": {"passthrough": "all"}}
 
 
+@pytest.mark.scenario("positive-12.1-plain-http-request-response-passthrough")
 @pytest.mark.asyncio
 async def test_post_proxy_returns_upstream_response(
-    oagw_base_url, oagw_headers, mock_upstream_url, mock_upstream,
+    oagw_base_url, oagw_headers, mock_upstream_url, mock_upstream, cleanup,
 ):
-    """Proxy POST to /v1/chat/completions returns mock chat completion."""
+    """Scenario 12.1: a POST body reaches the upstream unchanged and its answer comes back."""
     _ = mock_upstream
     alias = unique_alias("proxy-post")
+    payload = {"model": "gpt-4", "messages": [{"role": "user", "content": "Hello ✓"}]}
     async with httpx.AsyncClient(timeout=10.0) as client:
-        upstream = await create_upstream(
+        upstream = cleanup.upstream(oagw_headers, await create_upstream(
             client, oagw_base_url, oagw_headers, mock_upstream_url, alias=alias,
-        )
-        uid = upstream["id"]
+        ))
         await create_route(
-            client, oagw_base_url, oagw_headers, uid, ["POST"], "/v1/chat/completions",
+            client, oagw_base_url, oagw_headers, upstream["id"], ["POST"], "/echo",
         )
 
         resp = await client.post(
-            f"{oagw_base_url}/oagw/v1/proxy/{alias}/v1/chat/completions",
+            f"{oagw_base_url}/oagw/v1/proxy/{alias}/echo",
             headers={**oagw_headers, "content-type": "application/json"},
-            json={"model": "gpt-4", "messages": [{"role": "user", "content": "Hello"}]},
+            json=payload,
         )
         assert resp.status_code == 200, f"Expected 200, got {resp.status_code}: {resp.text[:500]}"
-        body = resp.json()
-        assert "id" in body
-        assert "choices" in body
+        assert resp.headers.get("x-oagw-error-source") == "upstream"
+        echo = resp.json()
+        assert echo["method"] == "POST"
+        assert echo["path"] == "/echo"
+        assert json.loads(echo["body"]) == payload
+        assert echo["headers"]["content-type"] == "application/json"
 
-        await delete_upstream(client, oagw_base_url, oagw_headers, uid)
 
-
+@pytest.mark.scenario("positive-12.1-plain-http-request-response-passthrough")
 @pytest.mark.asyncio
 async def test_get_proxy_returns_upstream_response(
-    oagw_base_url, oagw_headers, mock_upstream_url, mock_upstream,
+    oagw_base_url, oagw_headers, mock_upstream_url, mock_upstream, cleanup,
 ):
-    """Proxy GET to /v1/models returns mock model list."""
+    """Proxy GET to /v1/models returns the mock model list unchanged."""
     _ = mock_upstream
     alias = unique_alias("proxy-get")
     async with httpx.AsyncClient(timeout=10.0) as client:
-        upstream = await create_upstream(
+        upstream = cleanup.upstream(oagw_headers, await create_upstream(
             client, oagw_base_url, oagw_headers, mock_upstream_url, alias=alias,
-        )
-        uid = upstream["id"]
+        ))
         await create_route(
-            client, oagw_base_url, oagw_headers, uid, ["GET"], "/v1/models",
+            client, oagw_base_url, oagw_headers, upstream["id"], ["GET"], "/v1/models",
         )
 
         resp = await client.get(
@@ -55,106 +62,90 @@ async def test_get_proxy_returns_upstream_response(
             headers=oagw_headers,
         )
         assert resp.status_code == 200
+        assert resp.headers.get("x-oagw-error-source") == "upstream"
+        assert resp.headers.get("content-type") == "application/json"
         body = resp.json()
-        assert "data" in body
-        assert isinstance(body["data"], list)
-
-        await delete_upstream(client, oagw_base_url, oagw_headers, uid)
+        assert body["object"] == "list"
+        assert [m["id"] for m in body["data"]] == ["gpt-4", "gpt-3.5-turbo"]
 
 
+@pytest.mark.scenario("positive-7.2-hop-hop-headers-stripped")
 # ---------------------------------------------------------------------------
 # Header verification via /echo
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
 async def test_hop_by_hop_headers_stripped(
-    oagw_base_url, oagw_headers, mock_upstream_url, mock_upstream,
+    oagw_base_url, oagw_headers, mock_upstream_url, mock_upstream, cleanup,
 ):
-    """Hop-by-hop headers from the client are not forwarded to the upstream.
+    """Scenario 7.2: hop-by-hop headers are stripped even under `passthrough: all`.
 
-    The proxy itself may set its own Connection header (e.g. ``close`` on
-    HTTP/1.1) — that is acceptable.  What matters is that the *client's*
-    hop-by-hop values are stripped.
+    Without `passthrough: all` every client header is dropped anyway, so the
+    absence checks would pass whether or not stripping works. The control
+    header proves client headers do reach the upstream in this config, and
+    `x-conn-nominated` is hop-by-hop only because `Connection` names it.
     """
     _ = mock_upstream
     alias = unique_alias("proxy-hop")
     async with httpx.AsyncClient(timeout=10.0) as client:
-        upstream = await create_upstream(
-            client, oagw_base_url, oagw_headers, mock_upstream_url, alias=alias,
-        )
-        uid = upstream["id"]
+        upstream = cleanup.upstream(oagw_headers, await create_upstream(
+            client, oagw_base_url, oagw_headers, mock_upstream_url,
+            alias=alias, upstream_headers=PASSTHROUGH_ALL,
+        ))
         await create_route(
-            client, oagw_base_url, oagw_headers, uid, ["POST"], "/echo",
+            client, oagw_base_url, oagw_headers, upstream["id"], ["POST"], "/echo",
         )
 
-        # Explicitly include every hop-by-hop header so the strip
-        # assertions below are not vacuously true.
-        hop_by_hop_headers = {
-            "connection": "keep-alive",
-            "keep-alive": "timeout=5",
-            "proxy-authorization": "Basic dGVzdDp0ZXN0",
-            "te": "trailers",
-            "trailer": "X-Checksum",
-        }
         resp = await client.post(
             f"{oagw_base_url}/oagw/v1/proxy/{alias}/echo",
             headers={
                 **oagw_headers,
                 "content-type": "application/json",
-                **hop_by_hop_headers,
+                "connection": "keep-alive, x-conn-nominated",
+                "x-conn-nominated": "x",
+                "keep-alive": "timeout=5",
+                "te": "trailers",
+                "trailer": "X-Checksum",
+                "proxy-authorization": "Basic dGVzdDp0ZXN0",
+                "x-e2e-control": "arrives",
             },
             json={"test": True},
         )
         assert resp.status_code == 200
-        echoed_headers = resp.json().get("headers", {})
+        echoed = resp.json()["headers"]
 
-        # These hop-by-hop headers must never reach the upstream.
-        must_strip = [
-            "keep-alive", "proxy-authorization",
-            "te", "trailer",
-        ]
-        for h in must_strip:
-            assert h not in echoed_headers, f"Hop-by-hop header '{h}' was forwarded to upstream"
-
-        # The proxy may set its own Connection header (e.g. "close" on
-        # HTTP/1.1), but the client's value ("keep-alive") must not appear.
-        conn = echoed_headers.get("connection", "")
-        assert "keep-alive" not in conn.lower(), (
-            f"Client's 'Connection: keep-alive' was forwarded; got '{conn}'"
-        )
-
-        await delete_upstream(client, oagw_base_url, oagw_headers, uid)
+        assert echoed.get("x-e2e-control") == "arrives"
+        for h in ("keep-alive", "te", "trailer", "x-conn-nominated", "proxy-authorization"):
+            assert h not in echoed, f"hop-by-hop header {h!r} was forwarded upstream"
+        # OAGW may set its own Connection, but not relay the client's.
+        assert "x-conn-nominated" not in echoed.get("connection", "").lower()
 
 
+@pytest.mark.scenario("positive-7.3-host-header-replaced-upstream-host")
 @pytest.mark.asyncio
 async def test_host_header_replaced(
-    oagw_base_url, oagw_headers, mock_upstream_url, mock_upstream,
+    oagw_base_url, oagw_headers, mock_upstream_url, mock_upstream, cleanup,
 ):
-    """Host header is replaced with the upstream endpoint address."""
+    """Scenario 7.3: a client-supplied Host is replaced with the upstream's host."""
     _ = mock_upstream
     alias = unique_alias("proxy-host")
     async with httpx.AsyncClient(timeout=10.0) as client:
-        upstream = await create_upstream(
-            client, oagw_base_url, oagw_headers, mock_upstream_url, alias=alias,
-        )
-        uid = upstream["id"]
+        upstream = cleanup.upstream(oagw_headers, await create_upstream(
+            client, oagw_base_url, oagw_headers, mock_upstream_url,
+            alias=alias, upstream_headers=PASSTHROUGH_ALL,
+        ))
         await create_route(
-            client, oagw_base_url, oagw_headers, uid, ["POST"], "/echo",
+            client, oagw_base_url, oagw_headers, upstream["id"], ["POST"], "/echo",
         )
 
         resp = await client.post(
             f"{oagw_base_url}/oagw/v1/proxy/{alias}/echo",
-            headers={**oagw_headers, "content-type": "application/json"},
+            headers={
+                **oagw_headers,
+                "content-type": "application/json",
+                "host": "evil.example.com",
+            },
             json={"test": True},
         )
         assert resp.status_code == 200
-        echoed_host = resp.json().get("headers", {}).get("host", "")
-
-        # The host header should point to the mock upstream, not the OAGW host.
-        from urllib.parse import urlparse
-        oagw_host = urlparse(oagw_base_url).netloc
-        assert echoed_host != oagw_host, (
-            f"Host header should be upstream address, not OAGW ({oagw_host})"
-        )
-
-        await delete_upstream(client, oagw_base_url, oagw_headers, uid)
+        assert resp.json()["headers"].get("host") == urlparse(mock_upstream_url).netloc

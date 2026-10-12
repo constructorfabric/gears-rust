@@ -232,14 +232,33 @@ pub(super) fn register_tenants_routes(mut router: Router, openapi: &dyn OpenApiR
     // GET /account-management/v1/tenants/{tenant_id}/children
     router = OperationBuilder::get(CHILDREN_PATH)
         .operation_id("account_management.list_tenant_children")
-        .summary("List direct children of a tenant")
+        .summary("List children of a tenant")
         .description(
-            "List direct children of the given tenant. Cursor-paginated with `(created_at \
-             ASC, id ASC)` as the effective sort so siblings sharing a `created_at` timestamp \
-             stay disambiguated across pages. Soft-deleted rows are hidden by default -- opt \
-             in with `?$filter=status eq 'deleted'`. AM-internal `provisioning` rows are never \
-             surfaced. The parent must exist and be SDK-visible, otherwise the call collapses \
-             to `not_found`.",
+            "List the children of the given tenant. Default: direct children only. With \
+             `recursive=true`: every descendant visible to the caller under the same \
+             visibility rules (a self-managed direct child of any visible tenant is listed \
+             as an identity; nothing below a barrier is), and every item carries \
+             `ancestors` -- the chain from the child of `tenant_id` down to the item's \
+             direct parent, empty for a direct child; the key is absent without the flag. \
+             Cursor-paginated with `(created_at ASC, id ASC)` as the effective sort so rows \
+             sharing a `created_at` timestamp stay disambiguated across pages; a cursor is \
+             bound to the mode it was minted in, and replaying it with a different \
+             `recursive` value is 400 `FILTER_MISMATCH`, like a changed `$filter` (a \
+             cursor issued before mode binding existed is accepted by the direct listing \
+             only). \
+             Soft-deleted rows are hidden by default -- opt in with \
+             `?$filter=status eq 'deleted'`. AM-internal `provisioning` rows are never \
+             surfaced. The parent must exist and be SDK-visible, otherwise the call \
+             collapses to `not_found`. `$filter` operators: `name` -- `eq`, `ne`, `in`, \
+             `contains(name,'...')`, `startswith(name,'...')`, `endswith(name,'...')` \
+             (on PostgreSQL: case-sensitive, and `%` / `_` in the literal match only \
+             themselves; on SQLite: case-insensitive for ASCII letters, and `%`, `_` and \
+             `\\` in the literal are not matched literally); `status`, \
+             `tenant_type` -- `eq`, `ne`, `in`; `id`, `tenant_type_uuid` -- `eq`, `ne`, \
+             `in`; `self_managed` -- `eq`, `ne`; `created_at`, `updated_at` -- `eq`, `ne`, \
+             `gt`, `ge`, `lt`, `le`, `in`; `and`, `or`, `not`, parentheses. The generated \
+             `$filter` / `$orderby` parameter metadata lists operators by field kind only; \
+             the per-field restrictions above are enforced by the server and win.",
         )
         .tag(API_TAG)
         .authenticated()
@@ -252,11 +271,19 @@ pub(super) fn register_tenants_routes(mut router: Router, openapi: &dyn OpenApiR
             "integer",
         )
         .query_param("cursor", false, "Cursor for pagination")
+        .query_param_typed(
+            "recursive",
+            false,
+            "When `true`, list every descendant visible to the caller instead of direct \
+             children only, and carry `ancestors` on every item. Exactly `true` or \
+             `false`; anything else is 400 `validation`. Default `false`.",
+            "boolean",
+        )
         .handler(handlers::list_tenant_children)
         .json_response_with_schema::<toolkit_odata::Page<dto::TenantDto>>(
             openapi,
             http::StatusCode::OK,
-            "Paginated list of direct child tenants",
+            "Paginated list of child tenants (direct, or the visible subtree with recursive=true)",
         )
         .with_odata_filter::<TenantInfoFilterField>()
         .with_odata_orderby::<TenantInfoFilterField>()

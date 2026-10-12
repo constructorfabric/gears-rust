@@ -26,22 +26,36 @@ use crate::support::{append_segment, parent_module};
 
 /// Parsed `#[toolkit::provides(...)]` attribute.
 pub struct ProvidesAttr {
+    /// Path of the contract trait being provided.
     pub contract: Path,
+    /// Path of the factory function building the local (in-process) implementation.
     pub local: Path,
+    /// Transports the contract is exposed over; defaults to local only.
     pub transports: Vec<Transport>,
+    /// Optional override for the generated REST client type path.
     pub rest_client: Option<Path>,
+    /// Optional override for the generated gRPC client type path.
     pub grpc_client: Option<Path>,
+    /// Optional override for the path of the function returning the contract IR.
     pub ir_fn: Option<Path>,
+    /// Optional override for the path of the REST binding function.
     pub rest_binding_fn: Option<Path>,
+    /// Optional override for the path of the gRPC binding function.
     pub grpc_binding_fn: Option<Path>,
+    /// Optional config key under which the provider's transport settings are read.
     pub config_key: Option<String>,
+    /// Optional list of policy expressions applied to the provided contract.
     pub policies: Option<Vec<Expr>>,
 }
 
+/// Transport over which a provided contract can be reached.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Transport {
+    /// In-process call through the local factory.
     Local,
+    /// Remote call over REST.
     Rest,
+    /// Remote call over gRPC.
     Grpc,
 }
 
@@ -284,6 +298,23 @@ pub fn generate(attr: &ProvidesAttr, item: &ItemStruct) -> SynResult<TokenStream
     let rest_policy_warning = warn_policies_ignored("rest");
     let grpc_policy_warning = warn_policies_ignored("grpc");
 
+    // gRPC reads only `endpoint`, `timeout` and `require_tls`; the REST-only
+    // pool/concurrency tuning knobs on a `transport: grpc` wiring parse but go
+    // nowhere. Warn at wiring time rather than dropping them silently. The
+    // message is a static literal (built here) and the offending keys ride along
+    // as the structured `ignored` field, mirroring `warn_policies_ignored`.
+    let grpc_rest_only_warning_msg = format!(
+        "contract `{contract_ident}`: gRPC transport ignores REST-only client tuning knobs \
+         (pool_max_idle_per_host / pool_idle_timeout / max_concurrent_requests); they apply \
+         to the REST transport only"
+    );
+    let grpc_rest_only_warning = quote! {
+        let __ignored = tuning.rest_only_knobs_set();
+        if !__ignored.is_empty() {
+            ::tracing::warn!(gear = ctx.gear_name(), ignored = ?__ignored, #grpc_rest_only_warning_msg);
+        }
+    };
+
     // Build the match arms based on enabled transports.
     let local_arm = if enable_local {
         quote! {
@@ -342,6 +373,7 @@ pub fn generate(attr: &ProvidesAttr, item: &ItemStruct) -> SynResult<TokenStream
         quote! {
             ::toolkit_contract::wiring::ClientWiring::Grpc { endpoint, tuning } => {
                 #grpc_policy_warning
+                #grpc_rest_only_warning
                 // See the REST arm: platform-plane methods attach the runtime
                 // internal credential as `x-toolkit-internal-token` metadata.
                 let __cfg = tuning.apply_to(endpoint)

@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use toolkit_db::outbox::{
     Batch, HandlerResult, LeasedHandler, LeasedMessageHandler, MessageResult, Outbox,
-    OutboxMessage, Partitions, Record, WorkerTuning, outbox_migrations,
+    OutboxMessage, Partitions, Record, Wake, WorkerTuning, outbox_migrations,
 };
 use toolkit_db::{ConnectOpts, connect_db, migration_runner::run_migrations_for_testing};
 
@@ -90,9 +90,10 @@ async fn main() -> anyhow::Result<()> {
         .await?;
 
     let conn = db.conn()?;
+    let mut wake = Wake::empty();
     for i in 0..8u32 {
         let payload = format!(r#"{{"order_id": {i}}}"#);
-        handle
+        wake += handle
             .outbox()
             .enqueue(
                 &conn,
@@ -104,7 +105,7 @@ async fn main() -> anyhow::Result<()> {
     }
     for i in 0..3u32 {
         let payload = format!("user_{i}_welcome");
-        handle
+        wake += handle
             .outbox()
             .enqueue(
                 &conn,
@@ -114,7 +115,7 @@ async fn main() -> anyhow::Result<()> {
             )
             .await?;
     }
-    handle.outbox().flush();
+    wake.fire();
     println!("Enqueued 8 orders + 3 notifications");
 
     for _ in 0..100 {

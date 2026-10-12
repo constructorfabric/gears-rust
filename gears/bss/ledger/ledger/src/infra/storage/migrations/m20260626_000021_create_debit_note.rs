@@ -6,11 +6,11 @@
 //! `debit_note_id` is the **business** id (mirrors `recognition_schedule`'s
 //! `schedule_id` — a `varchar(128)`, NOT a `uuid` column — so it lines up with
 //! the `SecureORM` `resource_col`). The PK doubles as the design's
-//! `UNIQUE (tenant_id, debit_note_id)` (§7). `amount_minor` is incl-tax;
-//! `recognized_part_minor` + `deferred_part_minor` are the ex-tax split parts —
+//! `UNIQUE (tenant_id, debit_note_id)` (§7). `amount` is incl-tax;
+//! `recognized_part` + `deferred_part` are the ex-tax split parts —
 //! as with `credit_note`, there is **deliberately no** `recognized + deferred ==
-//! amount` CHECK (parts are ex-tax, `amount_minor` is incl-tax). A debit note
-//! **raises** the invoice's headroom (`invoice_exposure.debit_note_total_minor
+//! amount` CHECK (parts are ex-tax, `amount` is incl-tax). A debit note
+//! **raises** the invoice's headroom (`invoice_exposure.debit_note_total
 //! += amount`, see `m20260626_000019`) under the lock order; only the nonneg
 //! CHECKs are enforced on this record table.
 //!
@@ -33,17 +33,18 @@ const PG_UP_STATEMENTS: &[&str] = &["CREATE TABLE bss.ledger_debit_note (
         debit_note_id         varchar(128)  NOT NULL,
         origin_invoice_id     varchar(128)  NOT NULL,
         currency              varchar(16)   NOT NULL,
-        amount_minor          bigint        NOT NULL,
-        recognized_part_minor bigint        NOT NULL DEFAULT 0,
-        deferred_part_minor   bigint        NOT NULL DEFAULT 0,
+        amount                      text        NOT NULL CHECK (bss.ledger_decimal_valid(amount, currency_scale)),
+        recognized_part             text        NOT NULL DEFAULT '0' CHECK (bss.ledger_decimal_valid(recognized_part, currency_scale)),
+        deferred_part               text        NOT NULL DEFAULT '0' CHECK (bss.ledger_decimal_valid(deferred_part, currency_scale)),
         created_at_utc        timestamptz   NOT NULL,
+        currency_scale              smallint NOT NULL CHECK (currency_scale BETWEEN 0 AND 28),
         PRIMARY KEY (tenant_id, debit_note_id),
         CONSTRAINT chk_ledger_debit_note_amount_nonneg
-            CHECK (amount_minor >= 0),
+            CHECK (amount::numeric >= 0),
         CONSTRAINT chk_ledger_debit_note_recognized_nonneg
-            CHECK (recognized_part_minor >= 0),
+            CHECK (recognized_part::numeric >= 0),
         CONSTRAINT chk_ledger_debit_note_deferred_nonneg
-            CHECK (deferred_part_minor >= 0)
+            CHECK (deferred_part::numeric >= 0)
     )"];
 
 const PG_DOWN_STATEMENTS: &[&str] = &["DROP TABLE IF EXISTS bss.ledger_debit_note"];
@@ -58,17 +59,18 @@ const SQLITE_UP_STATEMENTS: &[&str] = &["CREATE TABLE ledger_debit_note (
         debit_note_id         varchar(128)  NOT NULL,
         origin_invoice_id     varchar(128)  NOT NULL,
         currency              varchar(16)   NOT NULL,
-        amount_minor          bigint        NOT NULL,
-        recognized_part_minor bigint        NOT NULL DEFAULT 0,
-        deferred_part_minor   bigint        NOT NULL DEFAULT 0,
+        amount                      text        NOT NULL CHECK (length(amount) BETWEEN 1 AND 31),
+        recognized_part             text        NOT NULL DEFAULT '0' CHECK (length(recognized_part) BETWEEN 1 AND 31),
+        deferred_part               text        NOT NULL DEFAULT '0' CHECK (length(deferred_part) BETWEEN 1 AND 31),
         created_at_utc        text          NOT NULL,
+        currency_scale              smallint NOT NULL CHECK (currency_scale BETWEEN 0 AND 28),
         PRIMARY KEY (tenant_id, debit_note_id),
         CONSTRAINT chk_ledger_debit_note_amount_nonneg
-            CHECK (amount_minor >= 0),
+            CHECK (substr(amount, 1, 1) <> '-'),
         CONSTRAINT chk_ledger_debit_note_recognized_nonneg
-            CHECK (recognized_part_minor >= 0),
+            CHECK (substr(recognized_part, 1, 1) <> '-'),
         CONSTRAINT chk_ledger_debit_note_deferred_nonneg
-            CHECK (deferred_part_minor >= 0)
+            CHECK (substr(deferred_part, 1, 1) <> '-')
     )"];
 
 const SQLITE_DOWN_STATEMENTS: &[&str] = &["DROP TABLE IF EXISTS ledger_debit_note"];

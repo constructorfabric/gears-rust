@@ -3,10 +3,11 @@
 //! CanonicalError` via the `From` impl in
 //! `crate::infra::sdk_error_mapping`.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::Extension;
-use axum::extract::Path;
+use axum::extract::{Path, Query};
 use axum::http::Uri;
 use axum::response::IntoResponse;
 use tracing::field::Empty;
@@ -17,7 +18,9 @@ use toolkit::api::odata::OData;
 use toolkit_security::SecurityContext;
 
 use crate::api::rest::dto::{TenantCreateRequestDto, TenantDto, TenantUpdateRequestDto};
-use crate::api::rest::handlers::common::clamp_listing_top;
+use crate::api::rest::handlers::common::{
+    bind_cursor_to_children_mode, clamp_listing_top, parse_recursive_flag,
+};
 use crate::domain::tenant::service::TenantService;
 use crate::infra::storage::repo_impl::TenantRepoImpl;
 
@@ -218,28 +221,51 @@ pub async fn unsuspend_tenant(
 
 /// `GET /account-management/v1/tenants/{tenant_id}/children`
 ///
-/// Soft-deleted rows are hidden by default — callers opt in with
+/// Direct children by default; with `recursive=true` every descendant
+/// visible to the caller, each item carrying `ancestors`. Soft-deleted
+/// rows are hidden by default — callers opt in with
 /// `?$filter=status eq 'deleted'`. AM-internal `provisioning` rows are never
 /// surfaced. Effective sort is `(created_at ASC, id ASC)` for stable
-/// cursor pagination across `created_at` ties.
+/// cursor pagination across `created_at` ties; a cursor is bound to the
+/// mode it was minted in (see `bind_cursor_to_children_mode`).
 ///
 /// # Errors
 ///
 /// Surfaces a canonical `Problem` envelope. Notable codes:
-/// `validation` (400 — malformed `$filter` / `$orderby`),
+/// `validation` (400 — malformed `$filter` / `$orderby`, `recursive` not
+/// `true`/`false`, a cursor replayed with a different `$filter` or mode, or
+/// a fingerprint-less legacy cursor replayed in recursive mode),
 /// `cross_tenant_denied` (403), parent tenant `not_found` (404),
-/// `service_unavailable` (503 — PDP / DB transport failure).
+/// `service_unavailable` (503 — PDP failure, or the DB unavailable for the
+/// parent read), `internal` (500 — the page query itself failed: the
+/// pagination helper does not keep the typed DB error, so availability
+/// cannot be told apart there).
+// `Query<HashMap<String, String>>` is the canonical Axum form for
+// scanning unmodelled query keys (see `list_own_conversions`); the
+// generic-hasher lint has no pay-off on Axum's default hasher.
+#[allow(clippy::implicit_hasher)]
 #[tracing::instrument(
-    skip(svc, ctx, query),
+    skip(svc, ctx, query, extras),
     fields(tenant_id = %tenant_id, request_id = Empty)
 )]
 pub async fn list_tenant_children(
     Extension(ctx): Extension<SecurityContext>,
     Extension(svc): Extension<Arc<ConcreteTenantService>>,
     Path(tenant_id): Path<Uuid>,
+    Query(extras): Query<HashMap<String, String>>,
     OData(query): OData,
 ) -> ApiResult<Json<toolkit_odata::Page<TenantDto>>> {
-    let query = clamp_listing_top(query, svc.max_list_children_top());
+    let recursive = parse_recursive_flag(&extras)?;
+    let query = bind_cursor_to_children_mode(
+        clamp_listing_top(query, svc.max_list_children_top()),
+        recursive,
+    )?;
+    // @cpt-begin:cpt-cf-account-management-flow-tenant-hierarchy-management-list-children:p1:inst-flow-listch-ancestors
+    if recursive {
+        let page = svc.list_descendants(&ctx, tenant_id, &query).await?;
+        return Ok(Json(page.map_items(TenantDto::from_sdk_node)));
+    }
+    // @cpt-end:cpt-cf-account-management-flow-tenant-hierarchy-management-list-children:p1:inst-flow-listch-ancestors
     let page = svc.list_children(&ctx, tenant_id, &query).await?;
     Ok(Json(page.map_items(TenantDto::from_sdk_tenant)))
 }

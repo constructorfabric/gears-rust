@@ -1,0 +1,15 @@
+suite: settings-service
+# The gear calls types-registry and credstore during its own init, so the
+# credstore gear rides along with its static plugin; the core gears
+# (types-registry, resolvers, static plugins) come from the launcher defaults.
+features:
+  - settings-service
+  - static-credstore
+  - static-tenants
+  - static-authn
+  - static-authz
+launcher: e2e-launcher
+config_gears:
+  - settings-service
+  - credstore
+  - static-credstore-plugin

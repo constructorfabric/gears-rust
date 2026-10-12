@@ -1,0 +1,70 @@
+{
+  "golden": "price_closed",
+  "proves": "D-422, AC dod-price-read-forever: a price whose window has closed is served forever with its original money - closed by a later price's start, or by its own end (an ended temporary price)",
+  "exchanges": [
+    {
+      "case": "10, followed by 12",
+      "caller": "the tenant",
+      "request": "GET /bss-pricing/v1/prices/<price:10>",
+      "status": 200,
+      "body": {
+        "price_id": "<price:10>",
+        "price_book_entry_id": "<entry:pro>",
+        "sku_id": "<sku:pro>",
+        "charge_kind": "recurring",
+        "period": "month",
+        "book_id": "<book:eur>",
+        "currency": "EUR",
+        "version_no": 1,
+        "dim_value": null,
+        "model": "flat",
+        "price": {
+          "amount": "10.00"
+        },
+        "min_fee": null,
+        "eligibility": "all",
+        "effective_from": "2026-01-01",
+        "effective_to": "2026-11-01",
+        "temporary_until": null,
+        "keep_for_bound": false,
+        "closed_explicitly": false,
+        "paired_price_id": null,
+        "return_of_price_id": null,
+        "approved_by_unit_id": "<unit:prices-1>",
+        "approved_at": "2025-12-15T09:00:00Z"
+      }
+    },
+    {
+      "case": "the ended temporary latam price",
+      "caller": "the tenant",
+      "request": "GET /bss-pricing/v1/prices/<price:storage-latam-temp>",
+      "status": 200,
+      "body": {
+        "price_id": "<price:storage-latam-temp>",
+        "price_book_entry_id": "<entry:storage>",
+        "sku_id": "<sku:storage>",
+        "charge_kind": "usage",
+        "period": null,
+        "book_id": "<book:eur>",
+        "currency": "EUR",
+        "version_no": 5,
+        "dim_value": "latam",
+        "model": "per_unit",
+        "price": {
+          "rate": "0.05"
+        },
+        "min_fee": null,
+        "eligibility": "all",
+        "effective_from": "2026-09-01",
+        "effective_to": "2026-09-20",
+        "temporary_until": "2026-09-20",
+        "keep_for_bound": false,
+        "closed_explicitly": true,
+        "paired_price_id": null,
+        "return_of_price_id": null,
+        "approved_by_unit_id": "<unit:prices-2>",
+        "approved_at": "2026-08-28T09:00:00Z"
+      }
+    }
+  ]
+}

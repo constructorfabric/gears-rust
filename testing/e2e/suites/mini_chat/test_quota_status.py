@@ -11,44 +11,27 @@ Covers:
 
 from __future__ import annotations
 
-import time
 from datetime import datetime, timezone
 
-import httpx
-
-from .conftest import API_PREFIX, expect_done, stream_message
+from .conftest import (
+    USER_A_ID, assert_no_reserves, expect_done, find_period, get_quota_status, provider_usage,
+    stream_message,
+)
 
 import pytest
 
+# Compares or seeds daily usage (conftest `same_utc_day`).
+pytestmark = pytest.mark.usefixtures("same_utc_day")
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def get_quota_status() -> dict:
-    """Call GET /v1/quota/status and return the JSON response."""
-    resp = httpx.get(f"{API_PREFIX}/quota/status", timeout=10)
-    assert resp.status_code == 200, (
-        f"GET /quota/status failed: {resp.status_code} {resp.text}"
-    )
-    return resp.json()
-
-
-def find_period(tiers: list, tier_name: str, period_name: str) -> dict | None:
-    """Find a specific tier+period entry in the quota status response."""
-    for t in tiers:
-        if t["tier"] == tier_name:
-            for p in t["periods"]:
-                if p["period"] == period_name:
-                    return p
-    return None
+# Credit multipliers (credits_micro per token: input, output) of the default
+# models (config/base.yaml, *_tokens_credit_multiplier_micro / 1e6).
+CREDIT_MULTIPLIERS = {"gpt-5.2": (1, 3), "azure-gpt-4.1": (3, 15)}
 
 
 # ---------------------------------------------------------------------------
 # Tests: GET /v1/quota/status endpoint
 # ---------------------------------------------------------------------------
 
-@pytest.mark.multi_provider
 class TestQuotaStatusEndpoint:
     """GET /v1/quota/status returns quota breakdown."""
 
@@ -57,8 +40,8 @@ class TestQuotaStatusEndpoint:
         assert "tiers" in status
         assert isinstance(status["tiers"], list)
         assert len(status["tiers"]) > 0
-        assert "warning_threshold_pct" in status
-        assert 1 <= status["warning_threshold_pct"] <= 99
+        # QuotaConfig default (config.rs), not overridden in config/base.yaml.
+        assert status["warning_threshold_pct"] == 80
 
     def test_each_tier_has_periods(self, server):
         status = get_quota_status()
@@ -105,52 +88,48 @@ class TestQuotaStatusEndpoint:
 class TestQuotaUsageTracking:
     """Quota usage increases after sending messages."""
 
-    def test_used_credits_increase_after_send(self, provider_chat):
+    @pytest.mark.timeout(20)
+    def test_used_credits_increase_after_send(self, provider_chat, mock_provider):
+        """Each completed turn adds its cost to the total daily usage.
+
+        cost = input_tokens * input multiplier + output_tokens * output
+        multiplier, in credits_micro per token (base.yaml: gpt-5.2 1 and 3,
+        azure-gpt-4.1 3 and 15); the token counts are the ones the provider
+        reported (conftest `provider_usage`).
+        """
         chat_id = provider_chat["id"]
+        in_mult, out_mult = CREDIT_MULTIPLIERS[provider_chat["model"]]
+        before = find_period(get_quota_status(), "total", "daily")["used_credits_micro"]
 
-        before = get_quota_status()
-        before_total_daily = find_period(before["tiers"], "total", "daily")
-        assert before_total_daily is not None, "Should have total/daily period"
-        before_used = before_total_daily["used_credits_micro"]
+        cost = 0
+        for content in ("Say A.", "Say B."):
+            mock_provider.clear_captured_requests()
+            status, events, _ = stream_message(chat_id, content)
+            assert status == 200
+            usage = provider_usage(mock_provider, expect_done(events).data["usage"])
+            cost += usage["input_tokens"] * in_mult + usage["output_tokens"] * out_mult
+        assert_no_reserves(USER_A_ID)
 
-        # Send a message
-        status, events, _ = stream_message(chat_id, "Say OK.")
+        after = find_period(get_quota_status(), "total", "daily")["used_credits_micro"]
+        assert after - before == cost
+
+    @pytest.mark.timeout(20)
+    def test_remaining_credits_decrease_after_send(self, provider_chat):
+        """remaining_credits_micro strictly decreases after a charged turn.
+
+        (remaining_percentage is an integer and stays at 99 for one small turn.)
+        """
+        chat_id = provider_chat["id"]
+        before = find_period(get_quota_status(), "total", "daily")
+
+        status, events, _ = stream_message(chat_id, "Say hi.")
         assert status == 200
         expect_done(events)
+        assert_no_reserves(USER_A_ID)
 
-        # Small delay for settlement
-        time.sleep(0.5)
-
-        after = get_quota_status()
-        after_total_daily = find_period(after["tiers"], "total", "daily")
-        after_used = after_total_daily["used_credits_micro"]
-
-        assert after_used > before_used, (
-            f"used_credits_micro should increase after send: "
-            f"before={before_used}, after={after_used}"
-        )
-
-    def test_remaining_percentage_decreases_after_send(self, provider_chat):
-        chat_id = provider_chat["id"]
-
-        before = get_quota_status()
-        before_total_daily = find_period(before["tiers"], "total", "daily")
-        before_pct = before_total_daily["remaining_percentage"]
-
-        # Send a message
-        status, _, _ = stream_message(chat_id, "Say hi.")
-        assert status == 200
-
-        time.sleep(0.5)
-
-        after = get_quota_status()
-        after_total_daily = find_period(after["tiers"], "total", "daily")
-        after_pct = after_total_daily["remaining_percentage"]
-
-        assert after_pct <= before_pct, (
-            f"remaining_percentage should decrease: "
-            f"before={before_pct}, after={after_pct}"
-        )
+        after = find_period(get_quota_status(), "total", "daily")
+        assert after["remaining_credits_micro"] < before["remaining_credits_micro"]
+        assert after["remaining_credits_micro"] == after["limit_credits_micro"] - after["used_credits_micro"]
 
 
 # ---------------------------------------------------------------------------
@@ -180,29 +159,19 @@ class TestQuotaWarningsInDoneEvent:
             assert isinstance(w["warning"], bool)
             assert isinstance(w["exhausted"], bool)
 
+    @pytest.mark.timeout(20)
     def test_quota_warnings_consistent_with_endpoint(self, provider_chat):
+        """Every `quota_warnings` entry of `done` equals the same tier/period of
+        GET /quota/status read right after the turn."""
         chat_id = provider_chat["id"]
         _, events, _ = stream_message(chat_id, "Say hello.")
-        done = expect_done(events)
-
-        sse_warnings = done.data.get("quota_warnings", [])
-
-        # Small delay then fetch endpoint
-        time.sleep(0.3)
+        sse_warnings = expect_done(events).data["quota_warnings"]
+        assert_no_reserves(USER_A_ID)
         endpoint_status = get_quota_status()
 
-        # Compare each SSE warning entry with the endpoint
+        assert len(sse_warnings) > 0
         for sw in sse_warnings:
-            ep = find_period(
-                endpoint_status["tiers"], sw["tier"], sw["period"]
-            )
-            assert ep is not None, (
-                f"SSE warning tier={sw['tier']} period={sw['period']} "
-                f"not found in endpoint response"
-            )
-            # Percentages should be close (may differ slightly due to timing)
-            diff = abs(ep["remaining_percentage"] - sw["remaining_percentage"])
-            assert diff <= 2, (
-                f"remaining_percentage mismatch for {sw['tier']}/{sw['period']}: "
-                f"SSE={sw['remaining_percentage']}, endpoint={ep['remaining_percentage']}"
-            )
+            ep = find_period(endpoint_status, sw["tier"], sw["period"])
+            assert (sw["remaining_percentage"], sw["warning"], sw["exhausted"]) == (
+                ep["remaining_percentage"], ep["warning"], ep["exhausted"],
+            ), (sw, ep)

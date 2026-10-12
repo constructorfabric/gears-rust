@@ -68,6 +68,18 @@ pub trait QuotaUsageRepository: Send + Sync {
         user_id: Uuid,
     ) -> Result<Vec<QuotaUsageModel>, DomainError>;
 
+    /// `SELECT` a user's `quota_usage` rows of the given periods, without
+    /// locking. Same filter as [`Self::find_bucket_rows_for_update`].
+    async fn find_bucket_rows_for_periods<C: DBRunner>(
+        &self,
+        runner: &C,
+        scope: &AccessScope,
+        tenant_id: Uuid,
+        user_id: Uuid,
+        period_types: &[PeriodType],
+        period_starts: &[time::Date],
+    ) -> Result<Vec<QuotaUsageModel>, DomainError>;
+
     /// `SELECT` `quota_usage` rows with pessimistic locking (`FOR UPDATE` on Postgres,
     /// plain `SELECT` on `SQLite`). Filters by `period_types` and `period_starts`.
     async fn find_bucket_rows_for_update<C: DBRunner>(

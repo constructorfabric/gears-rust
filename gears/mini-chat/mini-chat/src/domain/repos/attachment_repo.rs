@@ -91,6 +91,28 @@ pub trait AttachmentRepository: Send + Sync {
         scope: &AccessScope,
         params: SetUploadedParams,
     ) -> Result<u64, DomainError>;
+    /// Refresh `updated_at` of an `uploaded`, non-deleted row that no cleanup
+    /// owns. The background indexing wait calls it on each poll so the upload
+    /// reaper does not take a row that is still being indexed. Returns rows
+    /// affected (0: the row is gone, no longer `uploaded`, or its chat was
+    /// deleted).
+    async fn touch_uploaded<C: DBRunner>(
+        &self,
+        runner: &C,
+        scope: &AccessScope,
+        id: Uuid,
+    ) -> Result<u64, DomainError>;
+    /// CAS `uploaded` → `failed` with `error_code`, and mark the row for the
+    /// attachment cleanup (`cleanup_status = pending`), so the provider file
+    /// is deleted by the outbox cleanup with its retries. Only a row no
+    /// cleanup owns yet is changed. Returns rows affected.
+    async fn cas_fail_uploaded_for_cleanup<C: DBRunner>(
+        &self,
+        runner: &C,
+        scope: &AccessScope,
+        id: Uuid,
+        error_code: &str,
+    ) -> Result<u64, DomainError>;
     async fn cas_set_ready<C: DBRunner>(
         &self,
         runner: &C,

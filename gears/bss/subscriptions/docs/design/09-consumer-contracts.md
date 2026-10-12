@@ -184,7 +184,7 @@ This slice composes them into the external surface; no new sequence beyond assem
 
 ### 3.7 Database Schemas and Tables
 
-- [ ] `p2` - **ID**: `cpt-cf-bss-subscriptions-storage-boundary-con`
+- [ ] `p2` - **ID**: `cpt-cf-bss-subscriptions-datastore-boundary-con`
 
 No owned store; the boundary reads the projected read models + the outbox owned by the Foundation +
 capability slices. Concrete projection DDL is Design.
@@ -221,7 +221,7 @@ rating/Billing reads of already-served state ([`01-foundation-lifecycle.md`](./0
 - [ ] `p1` - **ID**: `cpt-cf-bss-subscriptions-normative-billing-contract-con`
 
 - `BillableItemCreated(kind=recurring)` — the **money-free period fact**, one per billable component interval, idempotent per `(subscriptionId, billing period, lineKey)` (SUB-D-19/21 — `lineKey` = `plan#n` / `addon:{addOnId}#n`, slice 08 §3.1), carrying that component's `{subscriptionId, skuId, planId, priceId}` + `pricingSnapshotRef` + the pause/intent posture + the suspended interval(s) with the suspension-billing posture + the **period-start `payerTenantId`** (SUB-D-07 as amended 2026-07-28; re-anchored from cut time by SUB-D-20, 2026-08-01); the rating gear prices it and the priced line inherits the key before Billing posts (SUB-D-07; SEAMS **SUB-R6**); proration materialises only as new billable/adjusting artifacts; posted invoices immutable ([`../PRD.md`](../PRD.md) §9.2, §6.8; SEAMS **SUB-B1**). Billing additionally exposes the **`billedThroughAt`** watermark this gear's backdating guard consumes (SEAMS **SUB-B6**).
-- `BillableItemCreated(kind=one_time)` — the **amount-less one-time/setup billable** (SUB-D-24, 2026-08-01): the qualifying instant (activation / trial conversion), the component's traceability tuple, and the frozen `pricingSnapshotRef`; idempotent once per subscription lifetime per `(subscriptionId, priceId)`; **Billing values it from the ref** and posts (SEAMS **SUB-B8** — the valuation obligation on the unauthored Billing gear, recorded like SUB-C1's platform defaults). `SubscriptionCancelled` carries the **term window + containing billing-period identity** as Billing's ETF/credit join key, with the derivation restricted to the `customer`/`operator` reason class (SUB-D-25; SEAMS **SUB-B7**).
+- `BillableItemCreated(kind=one_time)` — the **amount-less one-time/setup billable** (SUB-D-24, 2026-08-01): the qualifying instant (activation / trial conversion), the component's traceability tuple, and the frozen `pricingSnapshotRef`; idempotent once per **phase-entry occurrence** — `(tenantId, subscriptionId, phaseEntryId, componentOccurrenceId, chargeLineId)`, carried on the wire with the frozen `lineVersionId`, `priceId`, `windowId` and quantity beside it (SUB-D-28, 2026-09-20; a contract-version break from the lifetime `(subscriptionId, priceId)` key); **Billing values it from the ref** and posts (SEAMS **SUB-B8** — the valuation obligation on the unauthored Billing gear, recorded like SUB-C1's platform defaults). `SubscriptionCancelled` carries the **term window + containing billing-period identity** as Billing's ETF/credit join key, with the derivation restricted to the `customer`/`operator` reason class (SUB-D-25; SEAMS **SUB-B7**).
 
 ### 4.4 Contracts Input Contract (normative)
 

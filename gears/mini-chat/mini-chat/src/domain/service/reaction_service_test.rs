@@ -248,8 +248,8 @@ async fn set_reaction_invalid_value_rejected() {
 
     assert!(result.is_err(), "Should reject invalid reaction value");
     assert!(
-        matches!(result.unwrap_err(), DomainError::Validation { .. }),
-        "Expected Validation error"
+        matches!(result.unwrap_err(), DomainError::InvalidReaction),
+        "Expected InvalidReaction error"
     );
 }
 
@@ -299,6 +299,33 @@ async fn delete_reaction_idempotent() {
         .delete_reaction(&ctx, chat_id, assistant_msg_id)
         .await
         .expect("delete_reaction should be idempotent");
+}
+
+#[tokio::test]
+async fn delete_reaction_on_user_message_rejected() {
+    let db = inmem_db().await;
+    let db_provider = mock_db_provider(db);
+    let chat_repo = Arc::new(OrmChatRepository::new(limit_cfg()));
+
+    let tenant_id = Uuid::new_v4();
+    let ctx = test_security_ctx(tenant_id);
+
+    let (chat_id, user_msg_id, _assistant_msg_id) =
+        setup_chat_with_messages(&db_provider, &chat_repo, &ctx, tenant_id).await;
+
+    let reaction_svc = build_reaction_service(Arc::clone(&db_provider), Arc::clone(&chat_repo));
+
+    let result = reaction_svc
+        .delete_reaction(&ctx, chat_id, user_msg_id)
+        .await;
+
+    assert!(
+        matches!(
+            result,
+            Err(DomainError::InvalidReactionTarget { id }) if id == user_msg_id
+        ),
+        "Expected InvalidReactionTarget, got {result:?}"
+    );
 }
 
 #[tokio::test]

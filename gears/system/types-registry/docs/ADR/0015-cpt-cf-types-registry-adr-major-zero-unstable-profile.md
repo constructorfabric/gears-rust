@@ -119,7 +119,15 @@ ADR-0005 dependent revalidation only proves that `customer.v1~` remains *valid*.
 
 The rule needs no new machinery or state. Admission reads the immediate derivation base from the candidate identifier and extracts `$ref` targets from its content. The target major is present in each target identifier, so no target document has to be loaded for the quarantine decision.
 
-This is a static property of the submission, checked beside ADR-0014's dialect profile. ADR-0011's closed boundary makes it well-posed: every resolution-bearing target named by a managed document is Managed and its identifier is platform-interpretable.
+This property is decidable from the submission, but the admission worker
+checks it after extracting the candidate's dependency edges and before
+loading target documents. Reusing those edges keeps quarantine consistent
+with dependency ordering and malformed-reference refusals. Unlike the
+synchronous ADR-0014 dialect gate, a breach is a failed item in an accepted
+operation; independent batch candidates can still be admitted. ADR-0011's
+closed boundary makes the check well-posed: every resolution-bearing target
+named by a managed document is Managed and its identifier is
+platform-interpretable.
 
 The relation is one-way and that is deliberate. An unstable type **MAY** build on a stable one — weaker on stronger is sound, and it is the normal case, since a new type under development usually derives from a published base. Only stronger-on-weaker is refused.
 
@@ -175,10 +183,13 @@ Three limits are stated here so that they are not discovered later.
 ### Consequences
 
 * An author with an unsettled contract keeps one identifier and one Registry Reference across any number of breaking reshapes, and pays a single re-point at graduation instead of one per reshape.
-* Admission compares the candidate's immediate derivation base and `$ref` targets against the quarantine beside ADR-0014's dialect check. A major is readable from an identifier, so no target document has to be loaded.
+* The admission worker checks the candidate's immediate derivation base and
+  `$ref` targets after extracting dependency edges. A major is readable from
+  an identifier, so no target document has to be loaded. The refusal is a
+  per-candidate operation outcome rather than a whole-request dialect refusal.
 * The managed **Instance** identity profile acquires a third narrowing, so its last segment carries no explicit UUID tail, no minor version, and no major 0. On a Type Schema identifier the second is not refused anywhere; ADR-0004 admits a minor under every prefix.
 * A v0 reshape can still be refused, by dependent revalidation, when a derived type would stop satisfying its base. This is derivation compatibility doing its job and is not a defect of the profile.
-* No storage change, no migration, and no new operation.
+* No storage change, no migration, and no new operation kind.
 * The contract gains no value in any enumeration. ADR-0003 confines compatibility reporting to refusal, and a v0 entity has nothing to refuse on this axis, so admitting one simply says nothing about compatibility — which serves the concern below better than a special value would: there is no bare verdict to be mistaken for a guarantee if there is no verdict.
 * A control-plane type and its registered Instances cannot be co-developed under the profile.
 * Introducing the profile is **schema-additive**: it changes no stored row, and it needs no deployment step of its own. The quarantine rule's base case comes from the release boundary — the storage and the check arrive together — so there is no existing closure to remediate and no condition on enablement.
@@ -191,7 +202,11 @@ This decision is confirmed when:
 * a v0 derived Type Schema that violates its base chain is rejected, proving derivation compatibility is not waived;
 * a v0 Type Schema candidate declaring a dialect other than Draft-07 is rejected, proving ADR-0014 is not waived;
 * a `v0.2~` candidate is admitted without any compatibility check against `v0.1~`, while opening major 0 at `v0.1~`, admitting `v0.2~` over a missing `v0.1~`, and revising `v0.1~` at all are each rejected — proving the exemption reaches the check and not the contiguity or immutability rules;
-* admission rejects a v1 Type Schema carrying a `$ref` to a v0 target, and rejects a v1 identifier deriving from a v0 base, with diagnostics naming the offending reference;
+* a registration containing a v1 Type Schema carrying a `$ref` to a v0
+  target or deriving from a v0 base is accepted as an operation, then
+  records a failed item with `stable_refs_major_zero` or
+  `stable_derives_from_major_zero` respectively; independent items in
+  that batch remain eligible to succeed;
 * admission admits a v1 Type Schema whose `x-gts-ref` names a v0 entity exactly or through a pattern, as well as one using `gts.*` or a relative JSON pointer, proving that instance-value constraints are outside quarantine;
 * admission accepts a v0 Type Schema that references and derives from v1 targets, proving the quarantine relation is one-way;
 * a v0 reshape that would leave a v0 derived type no longer satisfying its base is refused by dependent revalidation;

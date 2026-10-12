@@ -441,3 +441,57 @@ async fn pg_create_chain_closure_invariant() {
     let conn = db.conn().expect("conn");
     common::assert_closure_matches_parent_links(&conn).await;
 }
+
+/// PostgreSQL rejects a GTS string bound to SMALLINT; verify resolution and quoted UUIDs.
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_membership_filters_resolve_gts_and_accept_quoted_uuid() {
+    let fixture = pg_fixture_or_skip!();
+    let db = fixture.db.clone();
+    let types = common::make_type_service(db.clone());
+    let groups = common::make_group_service(db.clone());
+    let memberships = common::make_membership_service(db);
+    let tenant = Uuid::now_v7();
+    let ctx = common::make_ctx(tenant);
+    let member_type = common::create_root_type(&types, "pgfiltermember").await;
+    let other_type = common::create_root_type(&types, "pgfilterother").await;
+    let group_type = common::create_root_type(&types, "pgfiltergroup").await;
+    types
+        .update_type_unscoped(
+            &group_type.code,
+            UpdateTypeRequest {
+                can_be_root: true,
+                allowed_parent_types: vec![],
+                allowed_membership_types: vec![member_type.code.clone(), other_type.code.clone()],
+                metadata_schema: None,
+            },
+        )
+        .await
+        .unwrap();
+    let group =
+        common::create_root_group(&groups, &ctx, &group_type.code, "matching", tenant).await;
+    let other_group =
+        common::create_root_group(&groups, &ctx, &group_type.code, "other", tenant).await;
+    for (id, code, resource) in [
+        (group.id, &member_type.code, "expected"),
+        (group.id, &other_type.code, "wrong-type"),
+        (other_group.id, &member_type.code, "wrong-group"),
+    ] {
+        memberships
+            .add_membership(&ctx, id, code, resource)
+            .await
+            .unwrap();
+    }
+    for group_literal in [group.id.to_string(), format!("'{}'", group.id)] {
+        let filter = toolkit_odata::parse_filter_string(&format!(
+            "group_id eq {group_literal} and resource_type eq '{}'",
+            member_type.code
+        ))
+        .unwrap();
+        let query = toolkit_odata::ODataQuery::new().with_filter(filter.into_expr());
+        let page = memberships.list_memberships(&ctx, &query).await.unwrap();
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].group_id, group.id);
+        assert_eq!(page.items[0].resource_type, member_type.code);
+        assert_eq!(page.items[0].resource_id, "expected");
+    }
+}

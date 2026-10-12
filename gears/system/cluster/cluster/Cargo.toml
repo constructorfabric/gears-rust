@@ -1,6 +1,6 @@
 [package]
 name = "cf-gears-cluster"
-version = "0.2.6"
+version = "0.2.9"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -43,11 +43,16 @@ workspace = true
 # `integration` feature so a default `cargo test` never requires a Docker
 # daemon. Run with `cargo test -p cf-gears-cluster --features integration`.
 integration = ["dep:testcontainers", "dep:testcontainers-modules"]
+# Links the native Kubernetes coordination providers (cache + the first native
+# leader-election + lock in the tree) into `provider_registry`. Off by default:
+# kube is a heavy dependency tree a non-k8s deployment should not pay for, so a
+# profile binding `provider: k8s` requires a build with this feature.
+k8s = ["dep:cf-k8s-cluster-plugin"]
 # Kubernetes TokenReview platform-plane auth. Compiles the inbound internal-token
 # validator so the cluster pod can enforce `X-ToolKit-Internal-Token` on its
 # grpc-hub (coordination plane + DirectoryService registration) in Profile 3.
 # Must propagate to grpc-hub: the hub's TokenReview validator is gated behind its
-# own `k8s-auth` feature (mirrors platform-host's `k8s` feature), otherwise
+# own `k8s-auth` feature (mirrors flight-control's `k8s` feature), otherwise
 # `internal_auth: { provider: kube }` fails init with "requires the k8s-auth
 # feature".
 k8s-auth = ["toolkit/k8s-auth", "grpc_hub/k8s-auth"]
@@ -68,7 +73,6 @@ tokio-stream = { workspace = true }
 # `PlatformSecurityContext` (§4.6).
 toolkit-transport-grpc = { workspace = true }
 toolkit-security = { workspace = true }
-secrecy = { workspace = true }
 # `bootstrap` is what carries `toolkit::bootstrap::oop::run_oop_with_options` -
 # the whole of `src/main.rs`. The feature is unconditional because the `[[bin]]`
 # is; it pulls the OoP bootstrap's own deps (serde-saphyr, the directory gRPC
@@ -106,8 +110,8 @@ tokio = { workspace = true, features = ["macros"] }
 tokio-util = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }
 rand = { workspace = true }
-cf-gears-standalone-cluster-plugin = { path = "../plugins/standalone-cluster-plugin", version = "0.2.6" }
-cf-postgres-cluster-plugin = { path = "../plugins/postgres-cluster-plugin", version = "0.4.4" }
+cf-gears-standalone-cluster-plugin = { path = "../plugins/standalone-cluster-plugin", version = "0.2.8" }
+cf-postgres-cluster-plugin = { path = "../plugins/postgres-cluster-plugin", version = "0.4.6" }
 # Non-optional, following the two plugin entries above: `ClusterGear::provider_registry`
 # registers `RedisCacheProvider` and `RedisLockProvider` unconditionally, so
 # `provider: redis` resolves in any build of this gear rather than behind a cargo
@@ -117,7 +121,14 @@ cf-postgres-cluster-plugin = { path = "../plugins/postgres-cluster-plugin", vers
 # already
 # establishes that trade; if link time or binary size ever becomes a measured
 # problem, *both* plugins want the same feature gate rather than one of them.
-cf-redis-cluster-plugin = { path = "../plugins/redis-cluster-plugin", version = "0.1.3" }
+cf-redis-cluster-plugin = { path = "../plugins/redis-cluster-plugin", version = "0.1.5" }
+# The native Kubernetes backend plugin, behind the `k8s` feature: kube is a heavy
+# dependency tree a non-k8s deployment must not link (mirrors mini-chat/chat-engine
+# gating their own k8s deps). Inline path + version like the Postgres/standalone
+# plugins above (a normal dep needs a version so `cargo publish` on this crate
+# succeeds); the dev-only cf-gears-cluster <-> plugin cycle stays release-plz-safe
+# via the plugin's path-only dev-dep back on cluster.
+cf-k8s-cluster-plugin = { path = "../plugins/k8s-cluster-plugin", version = "0.1.2", optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 # `fence_retention: 1h` in operator YAML (DESIGN.md). Taken
@@ -134,6 +145,8 @@ testcontainers-modules = { workspace = true, optional = true }
 
 [dev-dependencies]
 test-containers = { workspace = true }
+# `SecretString` for the platform credential in tests/grpc_services.rs.
+secrecy = { workspace = true }
 tokio = { workspace = true, features = ["rt", "macros", "test-util"] }
 # An in-memory metric reader, so the sweep's instruments are read back rather
 # than asserted about — including the label set, which invariant I15 makes a

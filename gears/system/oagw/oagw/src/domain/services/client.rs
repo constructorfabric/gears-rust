@@ -20,6 +20,7 @@ pub(crate) struct ServiceGatewayClientV1Facade {
 }
 
 impl ServiceGatewayClientV1Facade {
+    /// Create a facade over the given control-plane and data-plane services.
     pub(crate) fn new(cp: Arc<dyn ControlPlaneService>, dp: Arc<dyn DataPlaneService>) -> Self {
         Self { cp, dp }
     }

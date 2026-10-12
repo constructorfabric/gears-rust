@@ -5,7 +5,7 @@
 //!
 //! Covers (design §11, Group F4):
 //! - **atomic release**: a run posts one `DR CL / CR Revenue` entry per due
-//!   segment AND bumps `recognized_minor` AND stamps the segment `DONE`, all in
+//!   segment AND bumps `recognized` AND stamps the segment `DONE`, all in
 //!   one txn (balances + counter + status all move together);
 //! - **no double recognition**: re-running the same period credits each segment
 //!   exactly once (the per-segment `RECOGNITION` gate + `status = DONE` /
@@ -13,7 +13,7 @@
 //! - **over-recognition blocked at the per-schedule CHECK** even when a sibling
 //!   schedule keeps the per-stream `CONTRACT_LIABILITY` account aggregate
 //!   positive (the cap is per-obligation, not per-account);
-//! - **reversal** decrements `recognized_minor`, restores `CONTRACT_LIABILITY`,
+//! - **reversal** decrements `recognized`, restores `CONTRACT_LIABILITY`,
 //!   and leaves the reversed segment `DONE`;
 //! - **racing runs** on the same period → each segment credited exactly once (no
 //!   double-credit under contention);
@@ -44,7 +44,6 @@ use bss_ledger::domain::error::DomainError;
 use bss_ledger::domain::invoice::builder::{InvoiceItem, PostedInvoice, TaxBreakdown};
 use bss_ledger::domain::model::RepoError;
 use bss_ledger::domain::model::{AccountRow, CurrencyScaleRow};
-use bss_ledger::domain::money::DEFAULT_PLAUSIBLE_MAX_MAJOR;
 use bss_ledger::domain::recognition::input::{RecognitionInput, RecognitionTiming};
 use bss_ledger::infra::events::publisher::LedgerEventPublisher;
 use bss_ledger::infra::invoice_post::InvoicePostService;
@@ -64,8 +63,44 @@ use toolkit_db::{ConnectOpts, DBProvider, DbError, connect_db};
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
+/// A transaction body error: the repository's own, or the transaction's.
+#[derive(Debug, thiserror::Error)]
+enum CapError {
+    #[error(transparent)]
+    Db(#[from] DbError),
+    #[error(transparent)]
+    Repo(#[from] RepoError),
+}
+
 fn pg(sql: impl Into<String>) -> Statement {
     Statement::from_string(sea_orm::DatabaseBackend::Postgres, sql.into())
+}
+
+/// A USD scale-2 posting from a cent count (`1234` ⇒ `12.34`): the old
+/// minor-unit fixtures expressed as validated major-unit money.
+fn usd_cents(minor: i64) -> bss_ledger_sdk::PostedMoney {
+    bss_ledger_sdk::PostedMoney::try_new(
+        rust_decimal::Decimal::new(minor, 2),
+        bss_ledger_sdk::CurrencySpec::try_new("USD".to_owned(), 2).unwrap(),
+    )
+    .unwrap()
+}
+
+/// Validated USD scale-2 money from canonical stored text (`"12.34"`).
+fn usd_text(text: &str) -> bss_ledger_sdk::PostedMoney {
+    bss_ledger_sdk::PostedMoney::try_new(
+        bss_ledger_sdk::parse_decimal(text).unwrap(),
+        bss_ledger_sdk::CurrencySpec::try_new("USD".to_owned(), 2).unwrap(),
+    )
+    .unwrap()
+}
+
+/// Read one canonical decimal TEXT money column as USD scale-2 money.
+async fn scalar_money(conn: &DatabaseConnection, sql: &str) -> Option<bss_ledger_sdk::PostedMoney> {
+    conn.query_one_raw(pg(sql.to_owned()))
+        .await
+        .unwrap()
+        .map(|r| usd_text(&r.try_get_by_index::<String>(0).unwrap()))
 }
 
 async fn scalar_i64(conn: &DatabaseConnection, sql: &str) -> Option<i64> {
@@ -154,8 +189,7 @@ async fn setup(url: &str) -> (DatabaseConnection, DBProvider<DbError>, Seller) {
         .upsert_currency_scale(CurrencyScaleRow {
             tenant_id: s.tenant,
             currency: "USD".to_owned(),
-            minor_units: 2,
-            plausible_max_major: DEFAULT_PLAUSIBLE_MAX_MAJOR,
+            currency_scale: 2,
             source: "iso".to_owned(),
         })
         .await
@@ -202,9 +236,8 @@ async fn setup(url: &str) -> (DatabaseConnection, DBProvider<DbError>, Seller) {
 /// months from `first_period_id` (so the segments land in known periods).
 fn recognized_item(amount: i64, periods: u32, first_period: &str, item_ref: &str) -> InvoiceItem {
     InvoiceItem {
-        amount_minor_ex_tax: amount,
-        deferred_minor: 0,
-        currency: "USD".to_owned(),
+        amount_ex_tax: usd_cents(amount),
+        deferred: usd_cents(0),
         revenue_stream: "subscription".to_owned(),
         catalog_class: Some(AccountClass::Revenue),
         contract_class: None,
@@ -264,11 +297,15 @@ fn run_svc(provider: &DBProvider<DbError>, harness: &MetricsHarness) -> Recognit
     )
 }
 
-async fn bal(raw: &DatabaseConnection, s: &Seller, account: Uuid) -> Option<i64> {
-    scalar_i64(
+async fn bal(
+    raw: &DatabaseConnection,
+    s: &Seller,
+    account: Uuid,
+) -> Option<bss_ledger_sdk::PostedMoney> {
+    scalar_money(
         raw,
         &format!(
-            "SELECT balance_minor FROM bss.ledger_account_balance \
+            "SELECT balance FROM bss.ledger_account_balance \
              WHERE tenant_id='{}' AND account_id='{}' AND currency='USD'",
             s.tenant, account
         ),
@@ -289,11 +326,16 @@ async fn schedule_id(raw: &DatabaseConnection, s: &Seller, invoice_id: &str) -> 
     .expect("a schedule for the invoice")
 }
 
-async fn recognized_minor(raw: &DatabaseConnection, s: &Seller, schedule: &str) -> Option<i64> {
-    scalar_i64(
+/// The schedule's stored `recognized` counter as USD scale-2 money.
+async fn recognized(
+    raw: &DatabaseConnection,
+    s: &Seller,
+    schedule: &str,
+) -> Option<bss_ledger_sdk::PostedMoney> {
+    scalar_money(
         raw,
         &format!(
-            "SELECT recognized_minor FROM bss.ledger_recognition_schedule \
+            "SELECT recognized FROM bss.ledger_recognition_schedule \
              WHERE tenant_id='{}' AND schedule_id='{schedule}'",
             s.tenant
         ),
@@ -383,7 +425,7 @@ async fn run_releases_atomically_and_is_not_double_credited() {
     let sched = schedule_id(&raw, &s, "INV-REL").await;
     assert_eq!(
         bal(&raw, &s, s.contract_liability).await,
-        Some(1000),
+        Some(usd_cents(1000)),
         "CL fully deferred before release"
     );
 
@@ -399,19 +441,19 @@ async fn run_releases_atomically_and_is_not_double_credited() {
         RecognitionRunOutcome::Queued(_) => panic!("in-order release must not queue"),
     }
 
-    // Atomic effects: CL drained to 0, Revenue credited 1000, recognized_minor =
+    // Atomic effects: CL drained to 0, Revenue credited 1000, recognized =
     // total, both segments DONE, one release entry per segment.
     assert_eq!(
         bal(&raw, &s, s.contract_liability).await,
-        Some(0),
+        Some(usd_cents(0)),
         "CL drained"
     );
     assert_eq!(
         bal(&raw, &s, s.revenue).await,
-        Some(1000),
+        Some(usd_cents(1000)),
         "Revenue recognized"
     );
-    assert_eq!(recognized_minor(&raw, &s, &sched).await, Some(1000));
+    assert_eq!(recognized(&raw, &s, &sched).await, Some(usd_cents(1000)));
     assert_eq!(
         segment_status(&raw, &s, &sched, 1).await.as_deref(),
         Some("DONE")
@@ -433,13 +475,16 @@ async fn run_releases_atomically_and_is_not_double_credited() {
     if let RecognitionRunOutcome::Ran(r) = again {
         assert_eq!(r.released, 0, "nothing fresh on the re-run");
     }
-    assert_eq!(bal(&raw, &s, s.contract_liability).await, Some(0));
+    assert_eq!(
+        bal(&raw, &s, s.contract_liability).await,
+        Some(usd_cents(0))
+    );
     assert_eq!(
         bal(&raw, &s, s.revenue).await,
-        Some(1000),
+        Some(usd_cents(1000)),
         "no second credit"
     );
-    assert_eq!(recognized_minor(&raw, &s, &sched).await, Some(1000));
+    assert_eq!(recognized(&raw, &s, &sched).await, Some(usd_cents(1000)));
     assert_eq!(
         release_entry_count(&raw, &s, &sched, 1).await,
         1,
@@ -476,12 +521,12 @@ async fn over_recognition_blocked_at_per_schedule_check_with_sibling_positive() 
     let sched_a = schedule_id(&raw, &s, "INV-A").await;
     assert_eq!(
         bal(&raw, &s, s.contract_liability).await,
-        Some(1200),
+        Some(usd_cents(1200)),
         "both schedules aggregate on the per-stream CL account"
     );
 
     // Release ONLY schedule A's segment (via the runner's single-segment release),
-    // leaving schedule B fully deferred. recognized_minor(A) = 600 = its total;
+    // leaving schedule B fully deferred. recognized(A) = 600 = its total;
     // the per-stream CONTRACT_LIABILITY account is still +600 (B's deferred
     // balance), so the ACCOUNT aggregate is comfortably positive.
     let runner = RecognitionRunner::new(
@@ -493,45 +538,50 @@ async fn over_recognition_blocked_at_per_schedule_check_with_sibling_positive() 
         schedule_id: sched_a.clone(),
         segment_no: 1,
         period_id: "202606".to_owned(),
-        amount_minor: 600,
+        amount: usd_cents(600),
         revenue_stream: "subscription".to_owned(),
-        currency: "USD".to_owned(),
     };
     runner
         .release_segment(&ctx, &scope, s.tenant, &seg_a, Uuid::now_v7())
         .await
         .expect("release schedule A's segment");
-    assert_eq!(recognized_minor(&raw, &s, &sched_a).await, Some(600));
+    assert_eq!(recognized(&raw, &s, &sched_a).await, Some(usd_cents(600)));
     assert_eq!(
         bal(&raw, &s, s.contract_liability).await,
-        Some(600),
+        Some(usd_cents(600)),
         "the per-stream CL account is still positive (schedule B's deferred balance)"
     );
 
-    // Now attempt to OVER-bump schedule A past its 600 total by +1 (the path the
-    // runner's stamp sidecar exercises). The per-schedule
-    // `recognized_minor <= total_deferred_minor` CHECK rejects it as a cap
-    // violation — EVEN THOUGH the per-stream CONTRACT_LIABILITY account is still
-    // +600. The cap is per-obligation (per schedule), not per-account.
+    // Now attempt to OVER-bump schedule A past its 600 total by +0.01 (the path
+    // the runner's stamp sidecar exercises). The per-schedule
+    // `recognized <= total_deferred` cap (the repo's exact-arithmetic guard over
+    // the canonical decimal columns) rejects it as `MoneyOutCapExceeded` — EVEN
+    // THOUGH the per-stream CONTRACT_LIABILITY account is still +600. The cap is
+    // per-obligation (per schedule), not per-account.
+    let repo = RecognitionRepo::new(provider.clone());
+    let cap_scope = scope.clone();
+    let cap_schedule = sched_a.clone();
+    let tenant = s.tenant;
     let err = provider
-        .transaction(|txn| {
-            let sched_a = sched_a.clone();
-            let scope = scope.clone();
-            Box::pin(async move {
-                RecognitionRepo::add_recognized(txn, &scope, s.tenant, &sched_a, 1)
-                    .await
-                    .map_err(|e| DbError::Sea(sea_orm::DbErr::Custom(e.to_string())))
-            })
-        })
+        .db()
+        .transaction_ref_mapped_with_config(
+            toolkit_db::secure::TxConfig::serializable(),
+            move |txn| {
+                Box::pin(async move {
+                    repo.add_recognized(txn, &cap_scope, tenant, &cap_schedule, &usd_cents(1))
+                        .await?;
+                    Ok::<_, CapError>(())
+                })
+            },
+        )
         .await
-        .expect_err("over-recognition must be blocked at the per-schedule CHECK");
-    let msg = err.to_string().to_lowercase();
+        .expect_err("over-recognition must be blocked at the per-schedule cap");
     assert!(
-        msg.contains("chk_ledger_recognition_schedule_") || msg.contains("check"),
-        "over-recognition is the per-schedule cap CHECK, got: {msg}"
+        matches!(err, CapError::Repo(RepoError::MoneyOutCapExceeded(_))),
+        "over-recognition is the per-schedule cap, got: {err:?}"
     );
     // Schedule A's counter is unchanged (the over-bump rolled back).
-    assert_eq!(recognized_minor(&raw, &s, &sched_a).await, Some(600));
+    assert_eq!(recognized(&raw, &s, &sched_a).await, Some(usd_cents(600)));
 }
 
 #[tokio::test]
@@ -562,21 +612,21 @@ async fn reversal_decrements_and_segment_stays_done() {
         .expect("release");
     assert_eq!(
         bal(&raw, &s, s.contract_liability).await,
-        Some(0),
+        Some(usd_cents(0)),
         "CL drained"
     );
     assert_eq!(
         bal(&raw, &s, s.revenue).await,
-        Some(600),
+        Some(usd_cents(600)),
         "Revenue recognized"
     );
-    assert_eq!(recognized_minor(&raw, &s, &sched).await, Some(600));
+    assert_eq!(recognized(&raw, &s, &sched).await, Some(usd_cents(600)));
     assert_eq!(
         segment_status(&raw, &s, &sched, 1).await.as_deref(),
         Some("DONE")
     );
 
-    // Reverse the released segment: DR Revenue / CR CL, decrement recognized_minor
+    // Reverse the released segment: DR Revenue / CR CL, decrement recognized
     // back to 0 — and the reversed segment STAYS DONE (design §4.3).
     let runner = RecognitionRunner::new(
         provider.clone(),
@@ -587,9 +637,8 @@ async fn reversal_decrements_and_segment_stays_done() {
         schedule_id: sched.clone(),
         segment_no: 1,
         period_id: "202606".to_owned(),
-        amount_minor: 600,
+        amount: usd_cents(600),
         revenue_stream: "subscription".to_owned(),
-        currency: "USD".to_owned(),
     };
     let posting = runner
         .release_reversal(&ctx, &scope, s.tenant, &seg)
@@ -597,20 +646,20 @@ async fn reversal_decrements_and_segment_stays_done() {
         .expect("reversal posts");
     assert!(!posting.replayed, "a fresh reversal");
 
-    // Effects: CL restored to 600, Revenue back to 0, recognized_minor back to 0.
+    // Effects: CL restored to 600, Revenue back to 0, recognized back to 0.
     assert_eq!(
         bal(&raw, &s, s.contract_liability).await,
-        Some(600),
+        Some(usd_cents(600)),
         "CL restored"
     );
     assert_eq!(
         bal(&raw, &s, s.revenue).await,
-        Some(0),
+        Some(usd_cents(0)),
         "revenue un-recognized"
     );
     assert_eq!(
-        recognized_minor(&raw, &s, &sched).await,
-        Some(0),
+        recognized(&raw, &s, &sched).await,
+        Some(usd_cents(0)),
         "counter decremented"
     );
     // The reversed segment is left DONE (its release happened + was compensated;
@@ -622,15 +671,15 @@ async fn reversal_decrements_and_segment_stays_done() {
     );
 
     // The reversal is idempotent (schedule_id:segment_no:reversal): a replay does
-    // not decrement twice (which would underflow the recognized_minor >= 0 CHECK).
+    // not decrement twice (which would underflow the recognized >= 0 CHECK).
     let replay = runner
         .release_reversal(&ctx, &scope, s.tenant, &seg)
         .await
         .expect("reversal replay is a no-op");
     assert!(replay.replayed, "the reversal replays");
     assert_eq!(
-        recognized_minor(&raw, &s, &sched).await,
-        Some(0),
+        recognized(&raw, &s, &sched).await,
+        Some(usd_cents(0)),
         "no double decrement"
     );
 }
@@ -677,18 +726,18 @@ async fn racing_runs_credit_each_segment_exactly_once() {
     r2.expect("run 2 ok");
 
     // Exactly one credit landed: CL drained once, Revenue == 600 (not 1200),
-    // recognized_minor == 600, exactly one release entry, segment DONE.
+    // recognized == 600, exactly one release entry, segment DONE.
     assert_eq!(
         bal(&raw, &s, s.contract_liability).await,
-        Some(0),
+        Some(usd_cents(0)),
         "CL drained once"
     );
     assert_eq!(
         bal(&raw, &s, s.revenue).await,
-        Some(600),
+        Some(usd_cents(600)),
         "no double-credit"
     );
-    assert_eq!(recognized_minor(&raw, &s, &sched).await, Some(600));
+    assert_eq!(recognized(&raw, &s, &sched).await, Some(usd_cents(600)));
     assert_eq!(
         release_entry_count(&raw, &s, &sched, 1).await,
         1,
@@ -778,10 +827,10 @@ async fn queued_successor_drains_behind_its_predecessor_in_one_pass() {
     );
     assert_eq!(
         bal(&raw, &s, s.contract_liability).await,
-        Some(0),
+        Some(usd_cents(0)),
         "CL fully drained"
     );
-    assert_eq!(bal(&raw, &s, s.revenue).await, Some(1000));
+    assert_eq!(bal(&raw, &s, s.revenue).await, Some(usd_cents(1000)));
     let seg2_period = scalar_i64(
         &raw,
         &format!(
@@ -861,8 +910,8 @@ async fn queued_successor_re_parks_when_predecessor_excluded_from_window() {
         Some("DONE")
     );
     assert_eq!(
-        recognized_minor(&raw, &s, &sched).await,
-        Some(900),
+        recognized(&raw, &s, &sched).await,
+        Some(usd_cents(900)),
         "all three recognized"
     );
 }
@@ -934,9 +983,10 @@ async fn get_schedule_returns_header_and_segments_and_none_when_absent() {
     assert_eq!(schedule.status, "ACTIVE");
     assert_eq!(schedule.version, 0);
     assert_eq!(schedule.revenue_stream, "subscription");
-    assert_eq!(schedule.currency, "USD");
-    assert_eq!(schedule.total_deferred_minor, 1000);
-    assert_eq!(schedule.recognized_minor, 0);
+    assert_eq!(schedule.total_deferred.currency().code(), "USD");
+    assert_eq!(schedule.total_deferred.currency().scale(), 2);
+    assert_eq!(schedule.total_deferred, usd_cents(1000));
+    assert_eq!(schedule.recognized, usd_cents(0));
     assert_eq!(schedule.source_invoice_id, "INV-GET");
     assert_eq!(schedule.source_invoice_item_ref, "item-1");
 
@@ -948,7 +998,7 @@ async fn get_schedule_returns_header_and_segments_and_none_when_absent() {
     assert_eq!(segments.len(), 2, "two straight-line segments");
     assert_eq!(segments[0].segment_no, 1);
     assert_eq!(segments[0].period_id, "202606");
-    assert_eq!(segments[0].amount_minor, 500);
+    assert_eq!(segments[0].amount, usd_cents(500));
     assert_eq!(segments[0].status, "PENDING");
     assert_eq!(segments[1].segment_no, 2);
     assert_eq!(segments[1].period_id, "202607");
@@ -1042,8 +1092,7 @@ fn new_schedule(s: &Seller, schedule_id: &str, invoice_id: &str, item_ref: &str)
         po_allocation_group: Some("grp-1".to_owned()),
         subscription_ref: Some("sub-1".to_owned()),
         revenue_stream: "subscription".to_owned(),
-        currency: "USD".to_owned(),
-        total_deferred_minor: 100,
+        total_deferred: usd_cents(100),
         policy_ref: "policy.sl.v1".to_owned(),
         ssp_snapshot_ref: None,
         vc_estimate_ref: None,
@@ -1065,8 +1114,9 @@ async fn try_insert_active_schedule(
         .transaction(|txn| {
             let scope = scope.clone();
             let schedule = Arc::clone(&schedule);
+            let repo = RecognitionRepo::new(provider.clone());
             Box::pin(async move {
-                RecognitionRepo::insert_schedule(txn, &scope, schedule.as_ref())
+                repo.insert_schedule(txn, &scope, schedule.as_ref())
                     .await
                     .map_err(|e: RepoError| DbError::Sea(sea_orm::DbErr::Custom(e.to_string())))
             })
@@ -1114,8 +1164,8 @@ async fn drained_schedule_completes_and_frees_the_one_live_slot() {
 
     // The single segment is DONE, recognized == total ⇒ the schedule COMPLETED.
     assert_eq!(
-        recognized_minor(&raw, &s, &sched).await,
-        Some(600),
+        recognized(&raw, &s, &sched).await,
+        Some(usd_cents(600)),
         "fully recognized"
     );
     assert_eq!(
@@ -1167,8 +1217,8 @@ async fn drained_schedule_completes_and_frees_the_one_live_slot() {
         Some("PENDING")
     );
     assert_eq!(
-        recognized_minor(&raw, &s, &sched2).await,
-        Some(500),
+        recognized(&raw, &s, &sched2).await,
+        Some(usd_cents(500)),
         "partially recognized"
     );
     assert_eq!(

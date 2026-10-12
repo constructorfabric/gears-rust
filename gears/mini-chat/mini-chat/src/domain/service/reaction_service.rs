@@ -56,8 +56,7 @@ impl<RR: ReactionRepository, MR: MessageRepository, CR: ChatRepository>
         tracing::debug!("Setting reaction on message");
 
         // Validate reaction value
-        let kind = ReactionKind::parse(reaction)
-            .ok_or_else(|| DomainError::validation("Reaction must be 'like' or 'dislike'"))?;
+        let kind = ReactionKind::parse(reaction).ok_or(DomainError::InvalidReaction)?;
 
         let conn = self.db.conn().map_err(DomainError::from)?;
 
@@ -146,11 +145,17 @@ impl<RR: ReactionRepository, MR: MessageRepository, CR: ChatRepository>
         let msg_scope = chat_scope.tenant_only();
         let reaction_scope = chat_scope.tenant_and_owner();
 
-        // Verify message exists in this chat
-        self.message_repo
+        // Verify message exists in this chat and is an assistant message,
+        // like the PUT path.
+        let message = self
+            .message_repo
             .get_by_chat(&conn, &msg_scope, msg_id, chat_id)
             .await?
             .ok_or_else(|| DomainError::message_not_found(msg_id))?;
+
+        if message.role != MessageRole::Assistant {
+            return Err(DomainError::invalid_reaction_target(msg_id));
+        }
 
         let user_id = ctx.subject_id();
 
@@ -164,5 +169,6 @@ impl<RR: ReactionRepository, MR: MessageRepository, CR: ChatRepository>
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 #[path = "reaction_service_test.rs"]
 mod tests;

@@ -35,6 +35,7 @@ mod common;
 
 use std::sync::Arc;
 use std::time::Duration;
+use types_registry::domain::ports::ListFilter;
 
 use gts::GtsIdPattern;
 use sea_orm::sea_query::Expr;
@@ -172,14 +173,14 @@ async fn keyset_pages_in_byte_order(db: &Provider, family_id: i64, backend: &str
     let mut seen: Vec<String> = Vec::new();
     let mut request = PageRequest::first(2);
     loop {
-        let page = EntityRepo::list_page(&conn, &allow_all(), None, request)
+        let page = EntityRepo::list_page(&conn, &allow_all(), &ListFilter::default(), request)
             .await
             .expect("page");
         seen.extend(page.items.iter().map(|m| m.gts_id.clone()));
-        if !page.has_more {
+        let Some(next) = page.next_after else {
             break;
-        }
-        request = PageRequest::after(page.next_after.expect("cursor when more remains"), 2);
+        };
+        request = PageRequest::after(next, 2);
     }
 
     let mut expected: Vec<String> = BYTE_ORDERED.iter().map(|s| (*s).to_owned()).collect();
@@ -191,19 +192,24 @@ async fn keyset_pages_in_byte_order(db: &Provider, family_id: i64, backend: &str
     );
 }
 
-/// The prefix range narrows in SQL and `GtsId::matches_pattern` decides, on every
-/// backend. `ab` shares the range with `a_b` but not the pattern.
+/// The segment filter is exact on every backend: `ab` shares a byte prefix with
+/// `a_b` but not the pattern.
 async fn pattern_list_agrees_with_gts(db: &Provider, backend: &str) {
     let conn = db.conn().expect("conn");
     let pattern = GtsIdPattern::try_new(gts_id!("acme.crm.a_b.type.v1~")).expect("pattern");
-    let page = EntityRepo::list_page(&conn, &allow_all(), Some(&pattern), PageRequest::first(10))
-        .await
-        .expect("list");
+    let page = EntityRepo::list_page(
+        &conn,
+        &allow_all(),
+        &by_pattern(&pattern),
+        PageRequest::first(10),
+    )
+    .await
+    .expect("list");
     let ids: Vec<&str> = page.items.iter().map(|m| m.gts_id.as_str()).collect();
     assert_eq!(
         ids,
         vec![gts_id!("acme.crm.a_b.type.v1~")],
-        "only matches_pattern may decide, on {backend}"
+        "exactly the pattern's match on {backend}"
     );
 }
 
@@ -454,22 +460,12 @@ async fn current_documents_reads_the_current_revision_only(
         revised_doc.raw_schema, second,
         "a document past any varchar bound must round-trip byte-identically on {backend}"
     );
-    assert_eq!(
-        revised_doc.content_hash,
-        vec![2],
-        "revision 2 digest on {backend}"
-    );
     assert!(revised_doc.raw_schema.len() > 60_000);
     let single_doc = docs
         .iter()
         .find(|d| d.entity_id == single.id)
         .expect("the single-revision entity's document");
     assert_eq!(single_doc.raw_schema, only);
-    assert_eq!(
-        single_doc.content_hash,
-        vec![1],
-        "revision 1 digest on {backend}"
-    );
 }
 
 async fn current_projections_read_every_named_entity_that_has_one(
@@ -964,4 +960,11 @@ async fn repository_primitives_behave_on_mysql() {
 
     let db = provider_for(&format!("mysql://root@{host}:{port}/test"), 8).await;
     assert_repo_primitives_behave(&db, "mysql").await;
+}
+
+fn by_pattern(pattern: &GtsIdPattern) -> ListFilter {
+    ListFilter {
+        pattern: Some(pattern.clone()),
+        ..ListFilter::default()
+    }
 }

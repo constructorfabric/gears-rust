@@ -277,7 +277,7 @@ What happens to the members of a family over time — whether more than one may 
 * Exact resolution is literal: it resolves only the entity whose canonical GTS ID equals the supplied identifier.
 * Exact resolution must never use minor-version flexibility, version-membership expansion, or implicit pattern coverage. In particular there is no `latest`-minor resolution: `v1~` resolves `v1~` or nothing, never the highest `v1.x~`. Offering one would return the reference-pinning property that is the whole purpose of admitting a minor, and it is the same `latest` mode ADR-0008 declines for family members.
 * Version-membership, hierarchy, and wildcard queries are separate operations and may return multiple exact identifiers or Registry References. None of them establishes compatibility between the members it returns; that is per edge and is read from provenance.
-* A major-only ID used as a GTS pattern covers minor-versioned candidates according to `gts-rust` and GTS §10, and after this ADR that applies to managed candidates as well as externally managed ones. Pattern matching is therefore the one place where the minors of a major are collected under one expression, and it does not change exact resolution. Because a pattern-to-range compilation over the canonical identifier is only a pre-filter for a segment-wise matcher, the matcher's post-filter becomes load-bearing on a managed-only scan too, where the major-only profile had previously made the range exact.
+* A major-only ID used as a GTS pattern covers minor-versioned candidates according to `gts-rust` and GTS §10, and after this ADR that applies to managed candidates as well as externally managed ones. Pattern matching is therefore the one place where the minors of a major are collected under one expression, and it does not change exact resolution. A byte range over the canonical identifier cannot express that flexibility, so managed discovery matches segment-wise over stored parsed segments, with a minor constrained only where the pattern names one.
 
 ### Externally managed entities
 
@@ -286,8 +286,8 @@ The managed identity policy does not rewrite authoritative external identities, 
 * An External Registry Source may expose minor-versioned GTS IDs, major-only GTS IDs, or another source-owned revision convention.
 * Types Registry preserves and returns the exact external GTS ID without storing or normalizing it.
 * Types Registry does not synthesize a major-only GTS ID for `v1.0`, automatically advance references to `v1.1`, or claim that a source-owned immutable ID is mutable.
-* Every live plugin response must provide an opaque `external_revision` and canonical `content_hash`.
-* The same `external_revision` for one exact entity must always identify the same content and hash, and changed canonical content must produce a different revision.
+* Every live plugin response must provide an opaque `external_revision`.
+* The same `external_revision` for one exact entity must always identify the same source-owned response fields — canonical content, effective artifacts, source lifecycle, ownership scope, and source-owned tenant enablement — and a change to any of them must produce a different revision; platform-owned availability and visibility are not its concern (ADR-0002).
 * Types Registry does not require or persist an external versioning profile and does not interpret source revision ordering.
 * The External Registry Source remains responsible for its evolution and compatibility rules; Types Registry applies only the federation response checks defined by ADR-0002 and makes no compatibility claim about source-owned content.
 * The managed version-family definition is a property of Types Registry storage and is not imposed on an External Registry Source. How source lifecycle assertions map onto the platform model is decided by ADR-0008.
@@ -308,7 +308,7 @@ This concerns only which submissions conflict. Registry Reference representation
 * A Registry Reference identifies the logical entity, not the schema revision used at one historical moment.
 * Resolution results and caches must include freshness metadata for a major-only entity, and must not assume a minor-bearing one is wholly static either: its authored content never changes, but its resolved form moves when a floating dependency of its own advances.
 * Every framework and platform-gear type stays major-only through a compile-time lint over `gts.cf.*` in this repository, and through nothing in the registry. A minor admitted under that prefix by some other route is a well-formed entity the platform simply did not intend to author.
-* An installation whose owners write no minor behaves as it did before this ADR, with two changes that reach it anyway: the family key strips the whole version, and the pattern post-filter is load-bearing on managed scans. Both are unobservable until a minor is admitted and both must be in place before one is.
+* An installation whose owners write no minor behaves as it did before this ADR, with two changes that reach it anyway: the family key strips the whole version, and managed pattern discovery matches segment-wise rather than by identifier prefix. Both are unobservable until a minor is admitted and both must be in place before one is.
 * Minors accumulate `ACTIVE` members that dependents are pinned to while ADR-0008 defers authored deprecation. That gap is not created here, but it is reached sooner, and it is a further argument for closing PRD open question 1.
 * `force` adds the one stored fact this decision needs — a boolean on the Type Schema revision — and the one place a reader learns of it, the `provenance` projection. Nothing else about the profile reaches storage, the deployment flag included: whether it was on when a revision was admitted follows from whether that revision carries the waiver.
 * Because the flag is off by default, the reachable P1 behaviour of a stock deployment is BACKWARD with no per-edge exception at all. Turning it off again later does not retract waivers already applied — those majors keep their withdrawn guarantee, readable from provenance.
@@ -350,7 +350,7 @@ This decision is confirmed when:
 * reference validation accepts every visible and tenant-available non-deleted target, whatever its Lifecycle Status;
 * dependent schemas and references are revalidated without automatic ID or `$ref` rewriting;
 * external minor-versioned identities are resolved live without normalization or synthetic managed IDs;
-* plugin contract tests reject a source that returns different canonical content or content hashes for the same external revision, without requiring Types Registry to persist external revision history;
+* plugin contract tests reject a source that returns a different value of any source-owned response field for the same external revision, without requiring Types Registry to persist external revision history;
 * tests distinguish a valid sequential revision of one identity from a divergent definition that shares no admitted revision lineage with it.
 
 ## Pros and Cons of the Options
@@ -513,5 +513,5 @@ This decision directly addresses:
 * `cpt-cf-types-registry-fr-ref-tracking` - makes dependent revalidation mandatory when a floating managed reference changes revision, and bounds the revalidated set to the dependents of the exact minor that moved.
 * `cpt-cf-types-registry-fr-lifecycle` - defines the version family that lifecycle transitions operate on; the transitions themselves are decided by ADR-0008.
 * `cpt-cf-types-registry-fr-register-schemas`, `cpt-cf-types-registry-fr-register-instances` - restrict the admissible identifier profile of a managed candidate of each kind.
-* `cpt-cf-types-registry-fr-type-query-assistance` - makes a pattern the one expression that collects the minors of a major — membership, not compatibility — and makes the matcher post-filter load-bearing on managed scans.
+* `cpt-cf-types-registry-fr-type-query-assistance` - makes a pattern the one expression that collects the minors of a major — membership, not compatibility — and requires managed discovery to match segment-wise.
 * `cpt-cf-types-registry-fr-externally-managed-entities` - preserves authoritative external minor and revision semantics, untouched by the managed profile.

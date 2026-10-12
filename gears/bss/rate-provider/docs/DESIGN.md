@@ -1,4 +1,11 @@
 Created:  2026-07-17 by Virtuozzo International GmbH
+
+> Decimal quote cutover: the V2 provider returns `ProviderRate.rate: Decimal` in
+> quote major units per base major unit. `parse_rate` preserves every original
+> digit and enforces the shared SDK bounded decimal contract (positive, scale
+> 0–28, normalized coefficient at most 28 digits, input at most 64 bytes).
+> HTTP JSON numeric tokens are read as their exact source text (a `RawValue`
+> tree, not `f64`); no quote scaling or rounding occurs anywhere in this gear.
 Updated:  2026-07-17 by Virtuozzo International GmbH
 
 <!-- CONFLUENCE_TITLE: [BSS]: FX Rate Provider (Adapter Gear) — Technical Design -->
@@ -357,10 +364,10 @@ errors when nothing maps), so no source can pass an empty table off as a complet
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-rate-provider-principle-deterministic-conversion`
 
-`rate → rate_micro` conversion parses the published decimal into an **exact decimal
-representation** (never binary floating point) and rounds with banker's rounding
-(half-to-even), matching the platform ledger rounding default, so a re-fetch of the same
-published rate yields the same integer (§3.2, O-4).
+`parse_rate` parses the published decimal text into an **exact decimal**
+(`rust_decimal::Decimal`, never binary floating point) and keeps every digit. It never
+scales or rounds. A re-fetch of the same published rate yields the same `Decimal` and the
+same canonical text (§3.2, O-4). Rounding happens once, in the ledger, at FX translation.
 
 #### Provider time, not fetch time
 
@@ -451,13 +458,15 @@ store stays empty → FX posts block (`FX_RATE_UNAVAILABLE`), never a silent wro
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-rate-provider-constraint-rate-micro-precision`
 
-`ProviderRate.rate_micro` is the functional-per-unit-transaction multiplier × 1e6, `i64`
-(O-5: kept for v1; revisit for high-unit / crypto pairs — any change is an SDK change).
-Overflow / non-finite values MUST map to `RateProviderError::Internal`, never a silent
-truncation.
+`ProviderRate.rate` is a `rust_decimal::Decimal`: quote major units per base major unit
+(functional per unit transaction). `parse_rate` enforces the ledger SDK's bounded decimal
+contract: at most 64 bytes of input, a normalized coefficient of at most 28 digits, scale
+0–28 and magnitude below `10^28`. A quote such as `0.047` or `1.0875` keeps all of its
+digits; there is no fixed precision (O-5). Non-numeric or out-of-contract values MUST map
+to `RateProviderError::Internal`, never a silent truncation.
 
-**`rate_micro` MUST be strictly positive** (`> 0`) — a rate that rounds to zero or below is
-rejected at conversion, not stored. Confirmed with the BSS billing owner (2026-07-28): the
+**`rate` MUST be strictly positive** (`> 0`) — a zero or negative quote is rejected at
+parse time, not stored. Confirmed with the BSS billing owner (2026-07-28): the
 domain has no negative or zero FX rates, so accepting one would only ever mean corrupt feed
 data, and it would zero out or flip the sign of every translation derived from it. The
 ledger's `RateSyncJob` independently drops non-positive quotes before upsert, so this is the
@@ -529,7 +538,7 @@ redefined here (constraint `cpt-cf-bss-rate-provider-constraint-fixed-sdk-contra
 |-------|------|----------|-------------|
 | `base` | string | Yes | Base (transaction) currency |
 | `quote` | string | Yes | Quote (functional) currency |
-| `rate_micro` | int64 | Yes | Functional-per-unit-base × 1e6 (fixed precision) |
+| `rate` | decimal (`rust_decimal::Decimal`) | Yes | Functional (quote) major units per base major unit; exact published digits, strictly positive, within the ledger SDK bounds |
 | `as_of` | timestamp (UTC) | Yes | Provider publication time; drives ledger staleness |
 | `provider` | string | Yes | The concrete upstream that published THIS rate, stamped by the serving source; what the ledger stores as `ledger_fx_rate.provider` (see the provenance rule in §3.2) |
 
@@ -698,7 +707,7 @@ index, no interior mutability, no persistence.
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-rate-provider-component-ecb-source`
 
-HTTP fetch + XML parse + `rate_micro` conversion + error mapping over the ECB daily feed.
+HTTP fetch + XML parse + exact `parse_rate` + error mapping over the ECB daily feed.
 Dependencies: its own `toolkit_http::HttpClient` (built once in this plugin's `init()` via
 the shared `bss_rate_provider_sdk::http_client::build_source_http_client` helper — not a
 process-wide shared client), its own `EcbPluginConfig` (`id` default `"ecb"`, `vendor`,
@@ -814,25 +823,27 @@ configuration table below).
   `none` / `bearer` / `header-key` auth; richer transforms (multi-base, JSON-path dialects,
   custom date/number formats) deferred.
 
-#### `rate → rate_micro` conversion
+#### `rate` parsing (`parse_rate`)
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-rate-provider-component-rate-micro-conversion`
 
-ECB quotes ~5 significant digits. Convert `rate` (decimal) to
-`rate_micro = round(rate × 1_000_000)` using **banker's rounding (half-to-even)** to match
-the platform ledger rounding default, so a re-fetch of the same published rate yields the
-same integer (O-4: accepted — half-to-even is inherited from the ledger's platform default
-`cpt-cf-bss-ledger-fr-money-rounding-scale`, not chosen here; any revision would come from
-that requirement changing, not from this gear).
-The published decimal string MUST be parsed into an **exact decimal representation** —
-**never a binary `f64`**, whose nearest-representable value can mis-round exact half-way
-decimals under half-to-even. Implemented with `rust_decimal::Decimal`
-(`Decimal::from_str_exact` → `checked_mul` by `1_000_000` → `round_dp_with_strategy(0,
-MidpointNearestEven)` → `to_i64()`), not an arbitrary-precision `BigDecimal` — `Decimal`'s
-fixed 96-bit mantissa is sufficient for FX-rate magnitudes and is the crate already used
-elsewhere in this codebase. Overflow / non-finite / non-numeric values MUST map to
-`RateProviderError::Internal` (never a silent truncation) — verified down to the exact
-`i64::MAX`/`i64::MIN` boundary in the unit tests.
+ECB quotes ~5 significant digits; bank feeds may publish more. `parse_rate`
+(`bss-rate-provider-sdk`, `conversion.rs`) parses the published decimal text **exactly** —
+`rust_decimal::Decimal::from_str_exact`, **never a binary `f64`** — and returns the value
+unchanged: no multiplication, no rounding, no fixed scale. Previously the adapter rounded
+the quote to an integer micro-rate; now the ledger receives the published digits.
+The original text is limited to 64 bytes. Provider lexical forms (outer whitespace, a
+leading `+`, leading zeros, digit separators) are normalized, and the normalized value is
+re-validated through the ledger SDK's `parse_decimal` bounds: normalized coefficient of at
+most 28 digits, scale 0–28, magnitude below `10^28`. A zero or negative quote, a
+non-numeric token or an out-of-contract value MUST map to `RateProviderError::Internal`
+(never a silent truncation). The HTTP JSON source parses the document into a tree that
+keeps every number as its exact source token (built through `serde_json`'s `RawValue`,
+not the binary-wide `arbitrary_precision` feature), so the parser sees the published
+digits, not a float; an exponent-form number token is expanded exactly, while a string
+quote is taken as written.
+The ledger consumes the `Decimal` as-is: translation (`amount × rate`) is an exact product
+rounded once, HALF_EVEN, at the target currency scale — a ledger policy, not this gear's.
 
 #### Gear wiring
 
@@ -1174,7 +1185,7 @@ exercises real cross-gear wiring.
 
 | Level | Database | Network | What is real | What is mocked |
 |---|---|---|---|---|
-| **Unit** | None | None | Parser (`parse_ecb_xml`), field mapping (`map_json_document`/`json_lookup`), `rate_micro` conversion, HTTP-error mapping, `provider_id` | Nothing — pure functions called directly with fixture bytes/JSON, no transport abstraction |
+| **Unit** | None | None | Parser (`parse_ecb_xml`), field mapping (`map_json_document`/`json_lookup`), exact `parse_rate`, HTTP-error mapping, `provider_id` | Nothing — pure functions called directly with fixture bytes/JSON, no transport abstraction |
 | **Component integration** (`tests/discovery.rs`) | None | None | A real `ClientHub` + `DiscoveringRateProvider`; fake `RateProviderV1` sources registered scoped | `TypesRegistryClient` — `types-registry-sdk::testing::MockTypesRegistryClient`, a real test-util the SDK ships |
 | **HTTP integration** (`tests/ecb_integration.rs`, `tests/http_json_integration.rs`) | None | Real in-process `axum` server over loopback | `EcbRateProvider` / `HttpJsonRateProvider` end-to-end, incl. auth headers, timeouts, connection failure | The real external ECB / bank endpoint |
 | **API** | N/A | In-process | Trait-level: `fetch_latest`/`health` contract behavior | — (no REST surface) |
@@ -1186,7 +1197,7 @@ exercises real cross-gear wiring.
 | What to test | Verification target |
 |---|---|
 | Parse ECB daily XML fixture → `(NaiveDate, Vec<(String, String)>)` | All EUR pairs decoded; `as_of` = publication date UTC; a duplicate currency is logged and the first occurrence wins; a second **distinct** date fails the document with an error naming both dates, while a repeat of the same date still parses |
-| `rate_micro` conversion determinism | `round(rate×1e6)` half-to-even (`rust_decimal`) over exact decimal parsing (no `f64` path); half-way golden vectors incl. negative; exact `i64::MAX`/`i64::MIN` boundary and one-past-boundary overflow |
+| `parse_rate` exactness | Exact decimal parsing (`rust_decimal`, no `f64` path); every published digit preserved; provider lexical forms (whitespace, `+`, leading zeros, separators) normalized; zero, negative, non-numeric, over-64-byte and out-of-bound inputs error, never truncate |
 | Requested pair not published / case-insensitive pair match / inverse leg (X→EUR) requested | Omitted from result (not an error); a lowercase-cased request still matches (both sources); the inverse leg is never synthesized |
 | Upstream 5xx / network failure / malformed payload | `UpstreamStatus` / `Unreachable` / `Internal` respectively, via `map_http_error` |
 | `InvalidUri` mapping never echoes the raw URL | `Internal` message contains the structured `kind` + `reason`, never the URL (which may carry a spliced-in secret) |
@@ -1259,7 +1270,7 @@ at Unit/Integration. If a debug endpoint is ever added (O-6), add RFC 9457 error
 
 | Component | Why |
 |---|---|
-| `rate_micro` conversion | Money precision — must be exact and deterministic against real parsing |
+| `parse_rate` | Money precision — must be exact and deterministic against real parsing |
 | The `RateProviderV1` contract behavior (`&[]` semantics, omit-on-unavailable) | The ledger job relies on it verbatim |
 | Ledger fail-safe (block on empty store) — E2E | Proves "block, not guess" end to end |
 
@@ -1269,7 +1280,7 @@ at Unit/Integration. If a debug endpoint is ever added (O-6), add RFC 9457 error
 |---|---|---|
 | Post-path isolation | E2E | Provider down → posts still fast; only FX posts block |
 | Fetch latency p95 ≤ 2 s | Integration + load | Timed fetch against local server; sample live ECB |
-| Deterministic conversion | Unit | Golden-vector tests over the conversion function |
+| Deterministic parsing | Unit | Golden-vector tests over `parse_rate` |
 | Feed freshness | E2E | Sync tick populates store within the tick window |
 
 ### Decision register
@@ -1279,8 +1290,8 @@ at Unit/Integration. If a debug endpoint is ever added (O-6), add RFC 9457 error
 | **O-1** | Multiple providers vs single `dyn RateProviderV1` | ✅ **DECIDED — composite adapter, no merge.** ONE composite registered; ordered sources; first whole document; provenance stamped per rate (§3.1/§3.2 — the last-served-index scheme this originally specified was replaced, see O-7a). Variant (b) — a ledger-side scoped multi-provider loop — stays a future option if per-pair fallback is ever needed. **REVISED 2026-07-23 (plugin rework): each source is a scoped `PluginV1` and the composite is itself a discovered plugin — see the Implementation-revision note at the top.** | Architecture |
 | **O-2** | ECB source & format | ✅ **Accepted (2026-07-08):** direct ECB daily XML for prod; Frankfurter allowed for dev; SDMX optional. **As implemented:** XML-only — no `format` config field, no Frankfurter/SDMX code path shipped. Add if a non-XML feed is ever actually needed. | PM + Architecture |
 | **O-3** | Triangulation ownership | ✅ **DECIDED (2026-07-08) — the ledger owns triangulation.** The adapter emits only native direct pairs; cross-base rates are computed ledger-side in `RateSource`. Companion ledger change required (below). | Architecture |
-| **O-4** | Conversion rounding mode | ✅ **Accepted (2026-07-08):** banker's rounding (half-to-even) — inherited from the ledger's platform default (`cpt-cf-bss-ledger-fr-money-rounding-scale`, `p1`), not selected here. Not a release gate for this gear: deviating would break that requirement rather than differ from it, so a revision can only come from the ledger changing its default. | Ledger (owner) · PM + Finance (informed) |
-| **O-5** | `rate_micro` precision sufficiency | ✅ **Accepted (2026-07-08):** keep ×1e6 (6 dp) for v1; revisit for high-unit / crypto pairs (any change is an SDK change). | Architecture |
+| **O-4** | Conversion rounding mode | ✅ **Superseded (2026-10-09):** the adapter no longer rounds; `parse_rate` keeps the published digits. The only rounding is in the ledger: once, HALF_EVEN at the target currency scale, during FX translation (ledger design `06-fx-multicurrency.md`). A revision can only come from the ledger changing that policy. | Ledger (owner) · PM + Finance (informed) |
+| **O-5** | Rate precision sufficiency | ✅ **Superseded (2026-10-09):** `rate` is an exact `Decimal` under the ledger SDK bounds (28 significant digits, scale 0–28); high-unit and crypto pairs need no SDK change. | Architecture |
 | **O-6** | Debug/observability endpoint | ✅ **Accepted (2026-07-08):** metrics only for v1 — no debug HTTP endpoint; ops rely on metrics + the trait `health`. | Team |
 | **O-7** | Gear vs plugin & startup order | ✅ **Accepted (2026-07-08):** rely on the fail-safe + next tick; verify startup ordering during implementation (add a ledger `deps` edge if ordering proves unreliable). **REVISED 2026-07-23 (plugin rework): no `deps` edge — the ledger discovers the composite lazily each rate-sync tick, so a late adapter self-heals.** | Architecture |
 | **O-7a** | Composite provenance coupling (from O-1) | ✅ **RESOLVED (superseding the earlier "accepted for v1").** The original design had `provider_id()` report the last-served source, which held only while a single non-concurrent ticker called `fetch_latest` before `provider_id` in one pass — any second `ClientHub` consumer fetching in between made the ledger stamp the wrong source onto `ledger_fx_rate`/`rate_snapshot`. Taken instead: the option the entry itself named — `ProviderRate` now carries its own `provider`, each source stamps it, and `provider_id()` is a constant adapter identity. No call-order assumption remains. | Architecture |
@@ -1306,7 +1317,7 @@ separate `bss-ledger` work item — NOT part of this gear:
 - **Snapshot:** the resulting `rate_snapshot` MUST record `triangulated_via` (the bridge
   currency) — the column already exists on `ledger_fx_rate_snapshot`.
 - **Determinism:** the bridge path + rounding MUST be deterministic and
-  auditor-reproducible (banker's rounding per O-4).
+  auditor-reproducible (one HALF_EVEN rounding at the target scale, in the ledger; O-4).
 - **Sequencing:** this adapter can ship first — EUR-functional / EUR-base tenants already
   work with direct pairs. Non-EUR-functional tenants are unblocked only once the ledger
   triangulation lands. Track the two as linked tickets (O-9).

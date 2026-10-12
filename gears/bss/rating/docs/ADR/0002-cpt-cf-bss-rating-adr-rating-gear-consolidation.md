@@ -138,7 +138,7 @@ Pipeline slice set (initial): **12** usage ingestion & normalization; **13** win
 | "tariff evaluation" (process) | "evaluation" / "price resolution" | |
 | "tariff line", `TariffLineKey` | "charge line", `ChargeLineKey` | |
 | "resolved tariff outcome", `ResolvedTariffOutcome` | "resolved price outcome", `ResolvedPriceOutcome` | |
-| `…pricing-actor-tariffs` (pricing side, historical id) | `cpt-cf-bss-pricing-actor-rating` | **merged into the pre-existing rating actor** (commit C); plus prose mentions of "Tariffs" in pricing docs |
+| `…pricing-actor-tariffs` (pricing side, historical id) | Rating consumer (superseded by the PriceBook model, see T-D-37 in rating DECISIONS) | **merged into the pre-existing rating actor** (commit C); plus prose mentions of "Tariffs" in pricing docs |
 | word "tariff" | reserved for Pricing-gear rate definitions (rate card sense) only | |
 
 ### Consequences

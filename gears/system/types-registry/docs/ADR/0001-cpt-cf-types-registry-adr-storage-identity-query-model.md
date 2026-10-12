@@ -70,7 +70,7 @@ An Alias GTS Identifier and its target GTS Identifier are different identifiers 
 
 ## Established Constraints
 
-* GTS Identifier and wildcard-pattern validation, parsing, and matching must use the platform-approved `gts-rust` implementation.
+* GTS Identifier and wildcard-pattern validation, parsing, and matching must use the platform-approved `gts-rust` implementation. Managed discovery matches in SQL over segments `gts-rust` parsed at admission, compiling the `gts-rust`-parsed pattern; differential tests pin it to `GtsId::matches_pattern`.
 * Alias resolution, tenant availability, lifecycle, and ownership visibility remain Types Registry responsibilities. Authorization of type use must not be bypassed, and a domain gear may use a cache only with Types Registry-defined freshness and invalidation semantics.
 * The owning domain gear defines the read policy for an existing object whose referenced registry entity is unavailable. It must document whether the object is filtered, rejected, or returned with an explicit unavailable status.
 * The GTS Identifier namespace is global. Tenant ownership changes management and visibility, not the meaning of an identifier.
@@ -161,11 +161,11 @@ The set:
 * is complete for the validated filter, tenant context, and selected Alias, version-membership, hierarchy, lifecycle, and availability semantics — membership rather than compatibility, which is per edge and is not carried by a reference;
 * contains only references that are **visible and available to the requesting tenant**, so the set is tenant-specific and two tenants may receive different sets for one filter;
 * is semantically unordered, even if Types Registry uses deterministic source-major traversal to build it;
-* is bounded by a documented platform maximum, enforced by the registry as the traversal proceeds rather than by whatever client assembles it;
+* is bounded by a documented platform maximum of distinct references, enforced by the SDK helper that assembles it from paged discovery; a direct REST caller assembling one must apply the same maximum (amended: the registry keeps no expansion count);
 * is never silently truncated;
 * is exhaustive for the filter but is **not a snapshot**: it is assembled from a paged traversal, so entities may be registered or deleted between its first page and its last. Pagination is what keeps a deduplicated set from having to be held whole in server memory, and the atomicity given up for that is an accepted trade rather than an omission.
 
-If expansion exceeds the maximum, Types Registry returns `QUERY_EXPANSION_LIMIT_EXCEEDED` and no usable constraint. If a required Registry Source cannot establish its part of the result, Types Registry fails the operation rather than returning a partial set.
+If expansion exceeds the maximum, it fails with `QUERY_EXPANSION_LIMIT_EXCEEDED` and no usable constraint. If a required Registry Source cannot establish its part of the result, expansion fails rather than returning a partial set.
 
 Domain gears apply the UUIDs to their own storage. The SDK or gear repository may use backend-safe chunking or an equivalent UUID-set mechanism, but the semantic input remains one complete set. An empty set means the domain query has no matching type references.
 
@@ -180,6 +180,7 @@ The response may carry cache or source-freshness metadata, but such metadata doe
 * In P2, Alias preservation is achieved by storing the Alias's own Registry Reference. The SDK returns the Alias GTS Identifier on read and may separately return its target identity and metadata.
 * Managed Registry identity records require durable local tombstones or an equivalent non-reusable mapping. External plugins carry the same retention obligation for external references.
 * Compatibility fixtures must pin representative `GTS Identifier <-> UUID` mappings so an implementation or `gts-rust` upgrade cannot silently change persisted identities.
+* Managed storage materializes each identifier's parsed segments and chain depth, so wildcard discovery is exact before pagination. Its SQL compiler mirrors `gts-rust` matching, and a `gts-rust` upgrade must pass the differential tests before release.
 * External-source consistency belongs to the Registry Source Plugin contract.
 * Domain schemas should use native UUID columns where supported and a consistent 16-byte representation where they are not; concrete mappings must be verified for SQLite, PostgreSQL, and MySQL.
 * Types Registry outage and stale-cache behavior become part of domain read/write reliability and must have explicit fail-closed, cached-read, timeout, and retry policies.
@@ -199,6 +200,7 @@ The decision is confirmed when:
 * tests cover managed and external logical deletion/tombstone resolution, local-first plugin fallback, invalid external UUID mappings, UUID collision rejection, cross-tenant identifier conflicts, tenant availability, bulk operations, wildcard semantics, and cache invalidation;
 * tests reject registration of a new logical entity under a deleted GTS Identifier while preserving reverse resolution of its previously issued Registry Reference;
 * managed registration rejects a GTS Identifier carrying an explicit UUID tail;
+* differential tests show managed SQL pattern discovery returns exactly what `GtsId::matches_pattern` accepts on SQLite, PostgreSQL, and MySQL;
 * two distinct identifiers deriving to one Registry Reference within one operation produce a structured identity-collision error rather than a selected winner, for the managed-versus-managed, managed-versus-external, and external-versus-external cases;
 * representative measurements compare UUID and GTS Identifier column, index, and query costs across SQLite, PostgreSQL, and MySQL.
 

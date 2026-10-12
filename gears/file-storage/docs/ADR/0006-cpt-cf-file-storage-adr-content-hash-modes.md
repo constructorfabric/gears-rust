@@ -39,10 +39,9 @@ ADR-0002 committed P1 to SHA-256-only and sketched a P2 vision (`hash_policy` co
 capability discovery, per-tenant `selection_rules`) that was never implemented. Independently, the P2 remediation
 plan's item 0.1 ("Finalize trusts client-supplied size/hash; never verifies the blob") closed a real vulnerability by
 having the control plane re-read the stored blob and recompute its hash before trusting a finalize call's claimed
-`size`/`hash_value`. That fix is correct but expensive: `finalize_upload`/`finalize_upload_by_token`
-(`src/domain/service/write.rs`) stream the object back from the backend and rehash it, and
-`S3Backend::complete_multipart` (`src/infra/backend/s3.rs`) issues a full `GetObject` re-read after
-`CompleteMultipartUpload` for the same reason. For a multi-GB multipart object this is a full extra read pass — doubled
+`size`/`hash_value`. That fix is correct but expensive: both single-part finalize paths stream the object back from
+the backend and rehash it, and the S3 backend's multipart-complete path issues a full whole-object re-read after
+assembling the parts, for the same reason. For a multi-GB multipart object this is a full extra read pass — doubled
 egress/bandwidth and a real cost at fleet scale — paid on every completed upload.
 
 The maintainer has since set a new, narrower P2+ plan that supersedes ADR-0002's open-ended P2 vision (see ADR-0002's
@@ -98,9 +97,9 @@ upload with no re-read of the stored object, with no non-approved algorithm anyw
 ## Decision Outcome
 
 Chosen option: **exactly two content-hash modes, both SHA-256, each computed on-the-fly during upload, with no
-re-*hashing* re-read of the stored object at multipart `complete` time.** (Single-part `finalize` retains its
-existing whole-object read-back for defense-in-depth size/hash/MIME re-verification — see point 3 below; only the
-multipart-composite mode's assembly step avoids a full re-read.)
+re-*hashing* re-read of the stored object at multipart `complete` time.** (Single-part `finalize` likewise does not re-read the object: it trusts the sidecar-reported size/hash on the
+authenticated callback, checks the size against the stored object's length and reads only a MIME prefix — see
+point 3 below.)
 
 1. **Non-multipart upload → plain `sha256(whole object bytes)`.** The canonical whole-object hash — unchanged in
    shape. Computed by the sidecar's `put_stream` as bytes transit it. It is **not** represented as a
@@ -115,12 +114,12 @@ multipart-composite mode's assembly step avoids a full re-read.)
    check `sha256(manifest) == root`.
 3. **The multipart composite hash is never computed by re-downloading/re-reading the assembled stored object.** It is
    always computed on-the-fly, from the per-part digests already collected as bytes flow to the backend, inside the
-   sidecar's streaming `upload_part`. This removes the S3 `complete_multipart` re-`GetObject` that a flat-rehash
-   design would otherwise need. **This does not extend to single-part uploads**: `write.rs`'s
-   `read_back_and_hash_streaming` is still called on every single-part `finalize` (both `finalize_upload` and
-   `finalize_upload_by_token`) as a defense-in-depth re-derivation of size/hash/MIME from the real backend object —
-   that read-back was never proposed for elimination by this ADR and remains unchanged. `complete_multipart` does
-   still issue one bounded (~8 KiB) ranged `GetObject`/`get_range` against the assembled object, but only for MIME
+   sidecar's streaming `upload_part_stream`. This removes the S3 `complete_multipart` re-`GetObject` that a flat-rehash
+   design would otherwise need. **Single-part uploads follow the same principle**: finalize (both the in-process and the
+   token-authenticated path) no longer re-derives size/hash from the real backend object; it trusts the sidecar's
+   measured values (the callback is authenticated by the mandatory internal credential), checks the size via backend
+   metadata, and reads only a bounded MIME prefix. `complete_multipart` does
+   still issue one bounded (~8 KiB) ranged `GetObject`/`read_prefix` against the assembled object, but only for MIME
    magic-byte sniffing (P2 remediation item 1.10), not to (re)compute the hash. See
    [below](#the-on-the-fly--no-re-read-principle-and-its-trust-model) for why this still closes the 0.1
    vulnerability.
@@ -146,12 +145,35 @@ over both the prior 3-mode BLAKE3 draft and ADR-0002's original P2 vision:
   per-session choice between BLAKE3-tree and composite-SHA-256 before any bytes arrived), the multipart mode here is
   a constant, not a decision.
 
+#### Amendment (2026-07): the one-part plan degenerates to `whole-sha256`
+
+The original decision made "uploaded via multipart" imply the composite mode unconditionally. This amendment narrows
+that: **a multipart plan consisting of exactly one part finalizes as `whole-sha256`**, not
+`multipart-composite-sha256`. Rationale: for a one-part plan the single part spans the entire object, so the part's
+streaming SHA-256 digest **is** `sha256(whole object bytes)` — already computed on the fly, no re-read needed — and
+wrapping it in a one-entry manifest (`root = sha256("v1,0:<h>")`) would only make the same bytes hash differently
+depending on whether they arrived as a single-shot PUT or a one-part multipart session. Consequences:
+
+* `complete_multipart_upload` stores `hash_mode = 'whole-sha256'`, `hash_value = sha256(bytes)` (the part digest),
+  `part_count = NULL`, and persists **no** `version_hash_manifest` row; the `complete` response's `manifest` field is
+  omitted (it became `Option` on the wire).
+* The mode-selection invariant above is unchanged: `hash_mode` still records which mode actually produced the stored
+  hash, set at finalize from the executed path — the "path" now includes the plan's part count.
+* §3's "minimum-degenerate" single-entry manifest (`v1,0:<digest>`) remains a **valid encoding at the type level**
+  (the grammar has no special case); it is simply never persisted or returned by `complete` anymore.
+* **Compatibility**: versions finalized as one-part composites before this amendment keep their stored
+  `multipart-composite-sha256` mode and manifest row, and verify by that mode — verification always follows the
+  version row's own `hash_mode`, never re-derives it.
+* The split-dependent-identity trade-off (risk 2 below) is thereby removed for the one-part case only: a one-part
+  multipart upload of some content now hashes identically to a single-shot upload of the same content. Plans of two
+  or more parts keep the composite semantics unchanged.
+
 ### The on-the-fly / no-re-read principle and its trust model
 
 Every mode is computed **as bytes flow to the backend during upload**, never by reading the object back afterward.
 Concretely: the sidecar's streaming write path (`put_stream` for non-multipart, `upload_part`/`complete_multipart` for
-multipart) is the sole hash-computation site; `finalize_upload[_by_token]`'s current read-back-and-rehash step and
-`S3Backend::complete_multipart`'s post-`CompleteMultipartUpload` `GetObject` re-read are both removed.
+multipart) is the sole hash-computation site; the finalize read-back-and-rehash step and
+the S3 backend's post-`CompleteMultipartUpload` `GetObject` re-read are both removed.
 
 **Reconciliation with item 0.1.** 0.1's fix works by having the control plane independently re-derive `size`/
 `hash_value` from the stored bytes, so a client cannot forge them by lying in its finalize call. Removing the re-read
@@ -274,14 +296,18 @@ left untouched** — it is never widened, since both modes use SHA-256 as their 
 move from being unset at pending-insert time to being set at finalize time (the existing `VersionRepo::finalize` never
 touches `hash_algorithm`, a gap independent of this decision); `StorageBackend::upload_part` gains a `part_offset`
 parameter and `complete_multipart`'s contract flips from "re-read and hash the assembled object" to "build the
-manifest and root from the hashes and offsets you were given."
+manifest and root from the hashes and offsets you were given." **Gap, not enforced anywhere:** `part_count` and the
+`version_hash_manifest` row's own entry count are both derived from the same `parts` collection at finalize time, so
+they agree in practice, but nothing — no DB constraint, no runtime assertion — cross-checks that `part_count` actually
+equals the manifest's entry count after the fact; a future bug in a code path that sets one without the other would
+not be caught automatically.
 
 ### Consequences
 
 * **Removes the full-object re-hash read pass from multipart completion.** `S3Backend::complete_multipart`'s
   post-completion `GetObject`-and-rehash is eliminated — a genuine bandwidth/cost win at fleet scale for multipart
-  uploads specifically. **Single-part `finalize_upload[_by_token]`'s read-back-and-rehash is retained** (defense in
-  depth against a forged size/hash claim) and was never in scope for elimination; `complete_multipart` also still
+  uploads specifically. **Single-part finalize's read-back-and-rehash was later removed too** (the sidecar's measured size/hash is trusted on the
+  authenticated callback, with a size check against the stored object); `complete_multipart` also still
   issues one small bounded ranged read for MIME sniffing (see point 3 of the Decision Outcome above).
 * **The stored `(hash_mode, hash_value)`, plus the `version_hash_manifest` row where applicable, is the sole ground
   truth for verification going forward** — not something re-derived from gear config, and not dependent on any
@@ -315,31 +341,28 @@ manifest and root from the hashes and offsets you were given."
 
 All confirmation items are satisfied by the shipped code and tests:
 
-* [x] Code review confirming `StorageBackend::upload_part`/`complete_multipart` compute hashes on-the-fly from the
-  streamed bytes and that no implementation re-reads the assembled/stored object to produce a hash. (`s3.rs`'s
-  `complete_multipart` calls `finalize_multipart` — the POST-only helper — then `build_manifest_and_root`;
-  `get_and_hash_streaming` was removed. `in_memory.rs` builds the manifest from the collected digests.)
+* [x] Code review confirming the backend trait's per-part upload/complete-multipart operations compute hashes
+  on-the-fly from the streamed bytes and that no implementation re-reads the assembled/stored object to produce a
+  hash (the S3 backend's complete-multipart path issues only the completion call plus the manifest/root build, with
+  no whole-object read-back; the in-memory backend builds the manifest from the collected digests).
 * [x] Unit test confirming the manifest wire format is unambiguous: a fixed set of `(offset, digest)` pairs always
   serializes to the same expected byte string, and `sha256` of that string matches an independently-computed
-  reference `root`. (`src/infra/content/hash_mode_tests.rs`)
-* [x] Integration test asserting **no whole-object `GetObject`/re-read call** occurs at `complete_multipart` time —
-  a request-counting wrapper backend that counts `get`/`get_stream` but deliberately not `get_range` (a bounded
-  range read is not a "whole-object read" for this guarantee's purposes — see the test's own `CountingBackend` doc
-  comment). This qualifier matters in practice: `complete_multipart_upload` does issue one small (~8 KiB) `get_range`
-  against the assembled object for MIME magic-byte sniffing (P2 remediation item 1.10, added after this test), which
+  reference `root`.
+* [x] Integration test asserting **no whole-object read call** occurs at `complete_multipart` time —
+  a request-counting wrapper backend that counts `get_stream` but deliberately not `read_prefix` (a bounded
+  prefix read is not a "whole-object read" for this guarantee's purposes — see the test's own `CountingBackend` doc
+  comment). This qualifier matters in practice: `complete_multipart_upload` does issue one small (~8 KiB) `read_prefix`
+  call against the assembled object for MIME magic-byte sniffing (P2 remediation item 1.10, added after this test), which
   is intentionally excluded from what this test guards.
-  (`tests/content_hash_modes_test.rs::complete_multipart_issues_no_object_reread`)
 * [x] Integration test asserting a client-side re-verification helper — split the object at the manifest's offsets,
   rehash each part, rebuild the manifest, compare to `root` — succeeds against real uploaded content and fails when
   any byte in any part is tampered with.
-  (`tests/content_hash_modes_test.rs::client_reverification_succeeds_and_detects_tampering`)
 * [x] Integration test asserting `migrate_backend` verifies a `multipart-composite-sha256` version correctly using
   only the object bytes and the stored `version_hash_manifest` row, with no read of `multipart_upload_parts` (the
   test deletes the parts rows first).
-  (`tests/content_hash_modes_test.rs::migrate_backend_verifies_multipart_composite_without_parts_rows`)
 * [x] Integration test asserting the finalize-time `expected_hash` check still rejects a client-claimed hash that does
-  not match the sidecar's on-the-fly-computed value, for the `whole-sha256` mode. (`tests/finalize_test.rs` — the
-  read-back-and-rehash mismatch path, unchanged.)
+  not match the sidecar's on-the-fly-computed value, for the `whole-sha256` mode (superseded: finalize now persists
+  the sidecar-reported hash and no longer re-hashes).
 
 ## Pros and Cons of the Options
 
@@ -412,7 +435,7 @@ read-back-and-rehash at finalize/complete indefinitely.
 
 ### Open decisions and risks
 
-Carried forward from `content-hash-modes.md` §12, not resolved by this ADR — flagged honestly rather than glossed over:
+Carried forward from `content-hash-modes.md` §11, not resolved by this ADR — flagged honestly rather than glossed over:
 
 1. **Manifest storage size is bounded but not tiny.** Worst case ~10,000 parts × ~80 bytes/entry ≈ ~800 KB per
    manifest. This is why the manifest lives in its own table (not inline on `file_versions`), and why the multipart
@@ -448,5 +471,7 @@ This decision directly addresses the following requirements or design elements:
   `part_offset` parameter and manifest-building contract this decision requires
 * `cpt-cf-file-storage-fr-metadata-storage` — the version row's `(hash_mode, hash_value)` plus the
   `version_hash_manifest` table remains the system-managed metadata this decision's verification model depends on
-* `cpt-cf-file-storage-fr-get-metadata` — metadata responses continue to surface the resolved hash fields, now
-  including `hash_mode`, `part_count`, and (for multipart versions) the `manifest` text, so consumers can re-verify
+* `cpt-cf-file-storage-fr-get-metadata` — metadata responses (`VersionDto`, `GET /files/{id}/versions`) continue to
+  surface the resolved hash fields, now including `hash_mode` and `part_count`. The `manifest` text itself is
+  **not** part of this surface — it is returned only by the one-shot multipart `complete` response; see the tracked
+  API-exposure gap under [Client and migrate_backend re-verification](#client-and-migrate_backend-re-verification)

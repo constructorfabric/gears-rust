@@ -121,6 +121,20 @@ impl ModelResolver for ModelPolicyGateway {
         }
     }
 
+    async fn resolve_chat_model(
+        &self,
+        user_id: Uuid,
+        model_id: &str,
+    ) -> Result<ResolvedModel, DomainError> {
+        let snapshot = self.current_snapshot(user_id).await?;
+        snapshot
+            .model_catalog
+            .iter()
+            .find(|m| m.id == model_id)
+            .map(ResolvedModel::from)
+            .ok_or_else(|| DomainError::invalid_model(model_id))
+    }
+
     async fn list_visible_models(&self, user_id: Uuid) -> Result<Vec<ResolvedModel>, DomainError> {
         let snapshot = self.current_snapshot(user_id).await?;
 
@@ -192,5 +206,127 @@ impl UserLimitsProvider for ModelPolicyGateway {
             .get_user_limits(user_id, policy_version)
             .await
             .map_err(|e| DomainError::internal(e.to_string()))
+    }
+}
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod tests {
+    use mini_chat_sdk::{
+        KillSwitches, MiniChatModelPolicyPluginError, ModelTier, PolicyVersionInfo, PublishError,
+        UsageEvent,
+    };
+
+    use super::*;
+    use crate::domain::service::test_helpers::{TestCatalogEntryParams, test_catalog_entry};
+
+    const INSTANCE_ID: &str = "test.model_policy.plugin.v1~test._.mock.v1";
+
+    struct SnapshotPlugin {
+        snapshot: PolicySnapshot,
+    }
+
+    #[async_trait]
+    impl MiniChatModelPolicyPluginClientV1 for SnapshotPlugin {
+        async fn get_current_policy_version(
+            &self,
+            user_id: Uuid,
+        ) -> Result<PolicyVersionInfo, MiniChatModelPolicyPluginError> {
+            Ok(PolicyVersionInfo {
+                user_id,
+                policy_version: self.snapshot.policy_version,
+                generated_at: time::OffsetDateTime::now_utc(),
+            })
+        }
+
+        async fn get_policy_snapshot(
+            &self,
+            _user_id: Uuid,
+            _policy_version: u64,
+        ) -> Result<PolicySnapshot, MiniChatModelPolicyPluginError> {
+            Ok(self.snapshot.clone())
+        }
+
+        async fn get_user_limits(
+            &self,
+            _user_id: Uuid,
+            _policy_version: u64,
+        ) -> Result<UserLimits, MiniChatModelPolicyPluginError> {
+            unimplemented!("not used")
+        }
+
+        async fn publish_usage(&self, _payload: UsageEvent) -> Result<(), PublishError> {
+            unimplemented!("not used")
+        }
+    }
+
+    fn entry(model_id: &str, enabled: bool) -> mini_chat_sdk::ModelCatalogEntry {
+        test_catalog_entry(TestCatalogEntryParams {
+            model_id: model_id.to_owned(),
+            provider_model_id: format!("provider-{model_id}"),
+            display_name: model_id.to_owned(),
+            tier: ModelTier::Standard,
+            enabled,
+            is_default: false,
+            input_tokens_credit_multiplier_micro: 1_000_000,
+            output_tokens_credit_multiplier_micro: 1_000_000,
+            multimodal_capabilities: vec![],
+            context_window: 128_000,
+            max_output_tokens: 4096,
+            description: String::new(),
+            provider_display_name: String::new(),
+            multiplier_display: "1x".to_owned(),
+            provider_id: "openai".to_owned(),
+        })
+    }
+
+    async fn gateway(catalog: Vec<mini_chat_sdk::ModelCatalogEntry>) -> ModelPolicyGateway {
+        let hub = Arc::new(ClientHub::new());
+        hub.register_scoped::<dyn MiniChatModelPolicyPluginClientV1>(
+            ClientScope::gts_id(INSTANCE_ID),
+            Arc::new(SnapshotPlugin {
+                snapshot: PolicySnapshot {
+                    user_id: Uuid::nil(),
+                    policy_version: 1,
+                    model_catalog: catalog,
+                    kill_switches: KillSwitches::default(),
+                },
+            }),
+        );
+        let policy_selector = GtsPluginSelector::new();
+        policy_selector
+            .get_or_init(|| async { Ok::<_, anyhow::Error>(INSTANCE_ID.to_owned()) })
+            .await
+            .expect("pre-warm selector");
+        ModelPolicyGateway {
+            hub,
+            vendor: String::new(),
+            policy_selector,
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_chat_model_returns_globally_disabled_model() {
+        let gw = gateway(vec![entry("gpt-5.2", true), entry("gpt-old", false)]).await;
+
+        let resolved = gw
+            .resolve_chat_model(Uuid::new_v4(), "gpt-old")
+            .await
+            .expect("a chat keeps its model after the model is disabled");
+        assert_eq!(resolved.model_id, "gpt-old");
+    }
+
+    #[tokio::test]
+    async fn resolve_chat_model_rejects_id_missing_from_catalog() {
+        let gw = gateway(vec![entry("gpt-5.2", true)]).await;
+
+        let err = gw
+            .resolve_chat_model(Uuid::new_v4(), "gpt-gone")
+            .await
+            .expect_err("unknown model id must be rejected");
+        assert!(
+            matches!(&err, DomainError::InvalidModel { model } if model == "gpt-gone"),
+            "expected InvalidModel, got: {err:?}"
+        );
     }
 }

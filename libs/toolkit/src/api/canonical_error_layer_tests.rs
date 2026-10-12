@@ -426,7 +426,85 @@ async fn logs_warn_for_4xx_and_error_for_5xx() {
 }
 
 #[tokio::test]
-async fn extract_trace_id_prefers_traceparent_over_other_headers() {
+async fn log_event_does_not_carry_its_own_trace_id_field() {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    // Captures the structured fields of every event, so we can assert on the
+    // presence/absence of a field by name rather than by substring.
+    #[derive(Clone, Default)]
+    struct FieldCapture(Arc<Mutex<Vec<HashMap<String, String>>>>);
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for FieldCapture {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            struct Visitor<'a>(&'a mut HashMap<String, String>);
+            impl tracing::field::Visit for Visitor<'_> {
+                fn record_debug(&mut self, f: &tracing::field::Field, v: &dyn std::fmt::Debug) {
+                    self.0.insert(f.name().to_owned(), format!("{v:?}"));
+                }
+                fn record_str(&mut self, f: &tracing::field::Field, v: &str) {
+                    self.0.insert(f.name().to_owned(), v.to_owned());
+                }
+                fn record_u64(&mut self, f: &tracing::field::Field, v: u64) {
+                    self.0.insert(f.name().to_owned(), v.to_string());
+                }
+                fn record_i64(&mut self, f: &tracing::field::Field, v: i64) {
+                    self.0.insert(f.name().to_owned(), v.to_string());
+                }
+            }
+            let mut fields = HashMap::new();
+            event.record(&mut Visitor(&mut fields));
+            self.0.lock().unwrap().push(fields);
+        }
+    }
+
+    let capture = FieldCapture::default();
+    let events = capture.0.clone();
+    let subscriber = tracing_subscriber::registry().with(capture);
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    // A 5xx with a `traceparent` present — so the OLD code path would have put a
+    // `trace_id` field on the log event. It must not any more.
+    let problem: Problem = CanonicalError::internal("boom").create().into();
+    let app = build_app(move || problem_response(&problem, StatusCode::INTERNAL_SERVER_ERROR));
+    let req = Request::builder()
+        .uri("/api/v1/widgets/42")
+        .header(
+            "traceparent",
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+        )
+        .body(Body::empty())
+        .unwrap();
+    let _ = app.oneshot(req).await.unwrap();
+
+    let captured = events.lock().unwrap().clone();
+    let log = captured
+        .iter()
+        .find(|f| {
+            f.get("message")
+                .is_some_and(|m| m.contains("canonical error response (server)"))
+        })
+        .expect("the 5xx path must log a canonical error event");
+
+    // The log event must NOT carry its own `trace_id` field: the log-correlation
+    // formatter splices the live span's id onto the top level of the record, so
+    // a nested copy here would be a duplicate key.
+    assert!(
+        !log.contains_key("trace_id"),
+        "log_problem must not emit a trace_id field: {log:?}"
+    );
+    // Sanity: the fields it is supposed to carry are still there.
+    assert_eq!(log.get("status").map(String::as_str), Some("500"));
+    assert!(log.contains_key("instance"));
+    assert!(log.contains_key("problem_type"));
+}
+
+#[tokio::test]
+async fn extracts_trace_id_from_traceparent_ignoring_other_headers() {
     let problem: Problem = CanonicalError::internal("boom").create().into();
     let app = build_app(move || problem_response(&problem, StatusCode::INTERNAL_SERVER_ERROR));
 
@@ -443,7 +521,9 @@ async fn extract_trace_id_prefers_traceparent_over_other_headers() {
     let res = app.oneshot(req).await.unwrap();
     let problem = body_to_problem(res).await;
 
-    // 32-hex trace-id segment from traceparent wins over the other headers.
+    // Only the 32-hex trace-id segment of `traceparent` is used. `x-trace-id`
+    // and `x-request-id` are present but deliberately ignored — they are not
+    // trace ids.
     assert_eq!(
         problem.trace_id.as_deref(),
         Some("4bf92f3577b34da6a3ce929d0e0e4736")
@@ -451,7 +531,7 @@ async fn extract_trace_id_prefers_traceparent_over_other_headers() {
 }
 
 #[tokio::test]
-async fn malformed_traceparent_falls_through_to_x_trace_id() {
+async fn malformed_traceparent_and_no_active_span_yields_no_trace_id() {
     let problem: Problem = CanonicalError::internal("boom").create().into();
     let app = build_app(move || problem_response(&problem, StatusCode::INTERNAL_SERVER_ERROR));
 
@@ -459,36 +539,77 @@ async fn malformed_traceparent_falls_through_to_x_trace_id() {
         .uri("/api/v1/widgets/42")
         .header("traceparent", "not-a-w3c-traceparent")
         .header("x-trace-id", "from-x-trace-id")
+        .header("x-request-id", "from-x-request-id")
         .body(Body::empty())
         .unwrap();
     let res = app.oneshot(req).await.unwrap();
     let problem = body_to_problem(res).await;
 
-    // Malformed traceparent does not block extraction from the next header.
-    assert_eq!(problem.trace_id.as_deref(), Some("from-x-trace-id"));
+    // A malformed traceparent is ignored, and `x-trace-id` / `x-request-id`
+    // are deliberately NOT consulted — they are not trace ids. With no active
+    // OTel span there is no real trace id to report, so `trace_id` is left
+    // absent rather than filled with a non-trace value.
+    assert_eq!(problem.trace_id, None);
 }
 
 #[tokio::test]
-async fn falls_back_to_span_id_when_no_trace_headers_present() {
-    // Parity with the `sets_trace_id_when_in_span` test the legacy
-    // `CanonicalProblemMigrationExt` trait file used to carry: when
-    // none of `traceparent` / `x-trace-id` / `x-request-id` is set,
-    // the middleware fills `trace_id` from `tracing::Span::current().id()`.
-    use tracing::Instrument;
-    use tracing_subscriber::fmt;
+async fn parseable_but_invalid_traceparent_yields_no_trace_id() {
+    // A traceparent that parses structurally but is not a fully valid W3C
+    // version-`00` header (bad trace-id, parent-id, flags, or wrong field count)
+    // must be treated as absent — not shipped verbatim under `trace_id`. With no
+    // active OTel span the field is then left absent entirely.
+    for tp in [
+        "00-not-hex-at-all-x",
+        "00---",
+        // invalid trace-id (all-zero / uppercase)
+        "00-00000000000000000000000000000000-00f067aa0ba902b7-01",
+        "00-4BF92F3577B34DA6A3CE929D0E0E4736-00f067aa0ba902b7-01",
+        // invalid parent-id (all-zero / non-hex)
+        "00-4bf92f3577b34da6a3ce929d0e0e4736-0000000000000000-01",
+        "00-4bf92f3577b34da6a3ce929d0e0e4736-zzzzzzzzzzzzzzzz-01",
+        // invalid flags / extra trailing field
+        "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-zz",
+        "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01-extra",
+    ] {
+        let problem: Problem = CanonicalError::internal("boom").create().into();
+        let app = build_app(move || problem_response(&problem, StatusCode::INTERNAL_SERVER_ERROR));
 
-    // Thread-local subscriber so the assigned span ID is observable;
-    // `set_default` returns a guard that restores the previous default
-    // when dropped.
-    let subscriber = fmt().with_test_writer().finish();
+        let req = Request::builder()
+            .uri("/api/v1/widgets/42")
+            .header("traceparent", tp)
+            .body(Body::empty())
+            .unwrap();
+        let res = app.oneshot(req).await.unwrap();
+        let problem = body_to_problem(res).await;
+
+        assert_eq!(
+            problem.trace_id, None,
+            "traceparent {tp:?} must not surface a trace_id"
+        );
+    }
+}
+
+#[cfg(feature = "otel")]
+#[tokio::test]
+async fn resolves_trace_id_from_active_otel_span_when_no_traceparent() {
+    // With no incoming `traceparent`, the middleware reads the live OTel span
+    // context (the same source the JSON log-correlation formatter uses), so
+    // the wire `trace_id` is a real, correlatable 32-hex id rather than an
+    // `x-request-id` or a tracing span handle.
+    use opentelemetry::trace::{TraceContextExt as _, TracerProvider as _};
+    use tracing::Instrument as _;
+    use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder().build();
+    let tracer = provider.tracer("canonical-error-layer-test");
+
+    // `set_default` returns a guard that restores the previous default when
+    // dropped; `#[tokio::test]` runs on a current-thread runtime, so the
+    // thread-local default applies across the awaited request future.
+    let subscriber =
+        tracing_subscriber::registry().with(tracing_opentelemetry::layer().with_tracer(tracer));
     let _guard = tracing::subscriber::set_default(subscriber);
-
-    let span = tracing::info_span!("span_id_fallback_test");
-    let span_id = span
-        .id()
-        .expect("the test subscriber must assign an ID to the span")
-        .into_u64()
-        .to_string();
 
     let problem: Problem = CanonicalError::internal("boom").create().into();
     let app = build_app(move || problem_response(&problem, StatusCode::INTERNAL_SERVER_ERROR));
@@ -498,16 +619,22 @@ async fn falls_back_to_span_id_when_no_trace_headers_present() {
         .body(Body::empty())
         .unwrap();
 
-    // `.instrument(span)` makes `span` the current span every time the
-    // request future is polled, so `Span::current().id()` inside the
-    // middleware (after `next.run(...).await`) resolves to `Some(span)`.
-    let res = app.oneshot(req).instrument(span).await.unwrap();
+    // `.instrument(span)` keeps `span` current while the request future is
+    // polled; `OpenTelemetryLayer` attaches the OTel context on span entry,
+    // so `Context::current()` inside the middleware carries a valid span.
+    let span = tracing::info_span!("otel_trace_id_test");
+    let res = app.oneshot(req).instrument(span.clone()).await.unwrap();
     let problem = body_to_problem(res).await;
 
+    // The point of the change is that the wire id is the *same* trace the
+    // request ran in, not merely any well-formed id: read the expected id off
+    // `span`'s OTel context and assert equality, so a regression that restored a
+    // different or freshly-created span context would fail here.
+    let expected = span.context().span().span_context().trace_id().to_string();
     assert_eq!(
         problem.trace_id.as_deref(),
-        Some(span_id.as_str()),
-        "trace_id should fall back to the active span's id when no header is present",
+        Some(expected.as_str()),
+        "wire trace_id must equal the live span's trace id"
     );
 }
 
@@ -518,7 +645,10 @@ async fn body_is_valid_json_after_rewrite() {
 
     let req = Request::builder()
         .uri("/api/v1/widgets/42")
-        .header("x-trace-id", "abc123")
+        .header(
+            "traceparent",
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+        )
         .body(Body::empty())
         .unwrap();
     let res = app.oneshot(req).await.unwrap();
@@ -527,7 +657,10 @@ async fn body_is_valid_json_after_rewrite() {
         .unwrap();
     let v: Value = serde_json::from_slice(&bytes).expect("rewritten body must be valid JSON");
     assert_eq!(v["instance"].as_str(), Some("/api/v1/widgets/42"));
-    assert_eq!(v["trace_id"].as_str(), Some("abc123"));
+    assert_eq!(
+        v["trace_id"].as_str(),
+        Some("4bf92f3577b34da6a3ce929d0e0e4736")
+    );
 }
 
 fn foreign_response(status: StatusCode, content_type: &str, body: &'static str) -> Response {
@@ -1216,7 +1349,8 @@ async fn logs_internal_description_from_extension() {
     // `Internal::description` is `#[serde(skip)]` so the wire body cannot
     // carry the unredacted message. The middleware recovers the original
     // `CanonicalError` from response extensions (DESIGN §3.6) and logs
-    // the diagnostic alongside `trace_id` for server-side correlation.
+    // the diagnostic server-side; the live span's `trace_id` is spliced onto
+    // the log record by the correlation formatter, not by this event.
     use axum::response::IntoResponse;
 
     let app = Router::new()

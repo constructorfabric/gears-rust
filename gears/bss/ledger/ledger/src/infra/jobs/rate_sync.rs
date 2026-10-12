@@ -213,12 +213,12 @@ impl RateSyncJob {
         adapter_id: &str,
     ) -> anyhow::Result<()> {
         for rate in rates {
-            // Never poison the local store with a non-positive quote: a rate
-            // `<= 0` is never valid and would flip the sign of (or zero out)
-            // every downstream translation. The REST ingest DTO rejects it; the
-            // provider feed has no such gate, so drop the pair here (the tenant's
-            // other pairs still sync) rather than upserting corrupt data.
-            if rate.rate_micro <= 0 {
+            // Producer admission is separate from persisted-row corruption. Drop invalid
+            // positive/range quotes while the tenant's other pairs still sync;
+            // source reads fail closed on corrupt stored evidence.
+            if rate.rate <= rust_decimal::Decimal::ZERO
+                || bss_ledger_sdk::money::parse_decimal(&rate.rate.normalize().to_string()).is_err()
+            {
                 tracing::warn!(
                     target: "bss-ledger.rate-sync",
                     tenant = %tenant,
@@ -226,8 +226,8 @@ impl RateSyncJob {
                     provider = %rate.provider,
                     base = %rate.base,
                     quote = %rate.quote,
-                    rate_micro = rate.rate_micro,
-                    "bss-ledger: dropping non-positive FX quote from provider feed"
+                    rate = %rate.rate,
+                    "bss-ledger: dropping invalid FX quote from provider feed"
                 );
                 continue;
             }
@@ -237,7 +237,7 @@ impl RateSyncJob {
                     base_currency: rate.base.clone(),
                     quote_currency: rate.quote.clone(),
                     provider: rate.provider.clone(),
-                    rate_micro: rate.rate_micro,
+                    rate: rate.rate,
                     as_of: rate.as_of,
                     fallback_order: SYNC_FALLBACK_ORDER,
                 })

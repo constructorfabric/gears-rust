@@ -208,9 +208,13 @@ pub(crate) mod usage_type {
     /// `UsageType` action vocabulary. Renaming any of these is a contract
     /// change against the PDP policy bundle.
     pub mod actions {
+        /// Create a usage type.
         pub const CREATE: &str = "create";
+        /// Read a single usage type.
         pub const GET: &str = "get";
+        /// List usage types.
         pub const LIST: &str = "list";
+        /// Delete a usage type.
         pub const DELETE: &str = "delete";
     }
 }
@@ -256,9 +260,13 @@ pub(crate) mod usage_record {
     /// `UsageRecord` action vocabulary. Renaming any of these is a contract
     /// change against the PDP policy bundle.
     pub mod actions {
+        /// Ingest a usage record.
         pub const CREATE: &str = "create";
+        /// Deactivate a usage record.
         pub const DEACTIVATE: &str = "deactivate";
+        /// Read a single usage record.
         pub const GET: &str = "get";
+        /// List usage records.
         pub const LIST: &str = "list";
     }
 }

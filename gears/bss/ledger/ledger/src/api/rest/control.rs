@@ -29,6 +29,7 @@ use std::sync::Arc;
 use axum::extract::Extension;
 use axum::response::{IntoResponse, Response};
 use axum::{Json, Router, http::StatusCode};
+use bss_ledger_sdk::GrossTotals;
 use toolkit::api::canonical_prelude::CanonicalError;
 use toolkit::api::{OpenApiRegistry, operation_builder::OperationBuilder};
 use toolkit_security::SecurityContext;
@@ -36,7 +37,9 @@ use uuid::Uuid;
 
 use crate::api::rest::auth_context::require_authenticated;
 use crate::api::rest::canonical_json::CanonicalJson;
+use crate::api::rest::dto::parse_money;
 use crate::api::rest::error::authz_error_to_canonical;
+use crate::api::rest::money::MoneyDto;
 use crate::infra::control_feed::InProcessControlFeeds;
 
 /// `OpenAPI` tag applied to the control-feed operations.
@@ -65,8 +68,9 @@ pub struct IssuedInvoiceManifestRequest {
     pub invoice_ids: Vec<String>,
     /// Control total: count of issued invoices.
     pub count: u64,
-    /// Control total: summed gross amount in minor units.
-    pub gross_total_minor: i64,
+    /// Control totals: the summed gross amount per currency (one entry per
+    /// currency, each with its stored scale). Never summed across currencies.
+    pub gross_totals: Vec<MoneyDto>,
 }
 
 /// `POST /ledger/control/bill-run-finished` request body: the owning
@@ -93,10 +97,9 @@ pub struct PspSettlementReportRequest {
     pub period_id: String,
     /// External PSP report identity (idempotency grain).
     pub report_id: String,
-    /// Net settled amount in minor units the PSP reports (net of refunds/returns).
-    pub settled_minor: i64,
-    /// ISO-4217 currency of the report.
-    pub currency: String,
+    /// Net settled amount the PSP reports (net of refunds/returns), with its
+    /// currency and stored scale.
+    pub settled: MoneyDto,
 }
 
 /// Ack for a control-feed push: the feed + the `(tenant, period)` grain it landed
@@ -243,13 +246,14 @@ async fn ingest_issued_invoice_manifest(
         ));
     }
 
+    let gross_totals = validate_gross_totals(body.gross_totals).map_err(CanonicalError::from)?;
     state.feeds.ingest_manifest(
         body.tenant_id,
         &body.period_id,
         bss_ledger_sdk::IssuedInvoiceManifest {
             invoice_ids: body.invoice_ids,
             count: body.count,
-            gross_total_minor: body.gross_total_minor,
+            gross_totals,
         },
     );
 
@@ -258,6 +262,31 @@ async fn ingest_issued_invoice_manifest(
         body.tenant_id,
         body.period_id,
     ))
+}
+
+/// Most per-currency control totals one manifest may carry; far above any real
+/// currency set, it bounds the work a single request can ask for.
+const MAX_GROSS_TOTALS: usize = 256;
+
+/// Validate (never round) every per-currency control total and build the
+/// manifest's [`GrossTotals`], which sorts them by currency code and refuses a
+/// repeated code (at any scale: one bucket per currency is the comparison
+/// contract).
+fn validate_gross_totals(
+    totals: Vec<crate::api::rest::money::MoneyDto>,
+) -> Result<GrossTotals, crate::domain::error::DomainError> {
+    if totals.len() > MAX_GROSS_TOTALS {
+        return Err(crate::domain::error::DomainError::InvalidRequest(format!(
+            "gross_totals carries {} currencies, at most {MAX_GROSS_TOTALS} allowed",
+            totals.len()
+        )));
+    }
+    let parsed = totals
+        .into_iter()
+        .map(|m| parse_money("gross_totals", m))
+        .collect::<Result<Vec<_>, _>>()?;
+    GrossTotals::try_new(parsed)
+        .map_err(|e| crate::domain::error::DomainError::InvalidRequest(e.to_string()))
 }
 
 async fn ingest_bill_run_finished(
@@ -289,13 +318,13 @@ async fn ingest_psp_settlement_report(
     let ctx = require_authenticated(extension_ctx)?;
     gate_provision(&enforcer, &ctx, body.tenant_id).await?;
 
+    let settled = parse_money("settled", body.settled).map_err(CanonicalError::from)?;
     state.feeds.ingest_psp_report(
         body.tenant_id,
         &body.period_id,
         bss_ledger_sdk::PspSettlementReport {
             report_id: body.report_id,
-            settled_minor: body.settled_minor,
-            currency: body.currency,
+            settled,
         },
     );
 
@@ -339,3 +368,7 @@ fn accepted(feed: &str, tenant_id: Uuid, period_id: String) -> Response {
     )
         .into_response()
 }
+
+#[cfg(test)]
+#[path = "control_tests.rs"]
+mod tests;

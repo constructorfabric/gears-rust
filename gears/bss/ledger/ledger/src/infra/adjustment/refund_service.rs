@@ -67,10 +67,12 @@
 //! [`CreditNoteHandler`](super::credit_note_service::CreditNoteHandler)) so it is
 //! constructible from out-of-crate integration tests.
 
+use super::refund_errors::map_refund_cap_err;
 use std::sync::Arc;
 
-use bss_ledger_sdk::{AccountClass, MappingStatus, PostingRef, Side, SourceDocType};
+use bss_ledger_sdk::{AccountClass, MappingStatus, PostedMoney, PostingRef, Side, SourceDocType};
 use chrono::Datelike;
+use rust_decimal::Decimal;
 use sea_orm::DbErr;
 use toolkit_db::secure::{AccessScope, DbTx};
 use toolkit_db::{DBProvider, DbError};
@@ -85,6 +87,7 @@ use crate::domain::adjustment::refund::{
 use crate::domain::approval::intent::{ApprovalIntent, RefundIntent, RefundWithCreditNoteIntent};
 use crate::domain::approval::policy::OperationFacts;
 use crate::domain::error::DomainError;
+use crate::domain::exact_money::matching_spec;
 use crate::domain::fx::realized::carried_relief;
 use crate::domain::instant::to_naive_date;
 use crate::domain::model::{NewEntry, NewLine, RepoError};
@@ -97,7 +100,6 @@ use crate::infra::approval::service::ApprovalService;
 use crate::infra::audit::secured_audit_sink::{
     AuditEventType, NoopSecuredAuditSink, SecuredAuditSink,
 };
-use crate::infra::currency_scale::CurrencyScaleResolver;
 use crate::infra::events::payloads::{
     AffectedItem, AlarmCategory, AlarmSeverity, LedgerInvariantAlarm, RefundRecorded,
 };
@@ -109,7 +111,10 @@ use crate::infra::posting::idempotency::{
 };
 use crate::infra::posting::service::{PostSidecar, PostedFacts, PostingService};
 use crate::infra::storage::entity::pending_event_queue;
+use crate::infra::storage::money_text::StoredMoney;
 use crate::infra::storage::repo::adjustment_repo::NewRefund;
+use crate::infra::storage::repo::dispute_repo::DisputeState;
+use crate::infra::storage::repo::payment_repo::SettlementState;
 use crate::infra::storage::repo::{
     AdjustmentRepo, DisputeRepo, JournalRepo, NewQueueRow, PaymentRepo, PendingQueueRepo,
     ReferenceRepo,
@@ -262,7 +267,6 @@ enum CapMode {
 pub struct RefundHandler {
     posting: PostingService,
     reference: ReferenceRepo,
-    resolver: CurrencyScaleResolver,
     /// Reads the origin `payment_settlement` row (existence + currency + the cap
     /// basis the §4.7 counters guard; AND the claw-back underflow pre-read under the
     /// rank-1 lock, Group E).
@@ -339,7 +343,6 @@ impl RefundHandler {
     pub fn new(db: DBProvider<DbError>, publisher: Arc<LedgerEventPublisher>) -> Self {
         let posting = PostingService::new(db.clone(), Arc::clone(&publisher));
         let reference = ReferenceRepo::new(db.clone());
-        let resolver = CurrencyScaleResolver::new(ReferenceRepo::new(db.clone()));
         let payment = PaymentRepo::new(db.clone());
         let journal = JournalRepo::new(db.clone());
         let dispute = DisputeRepo::new(db.clone());
@@ -348,7 +351,6 @@ impl RefundHandler {
         Self {
             posting,
             reference,
-            resolver,
             payment,
             journal,
             dispute,
@@ -503,9 +505,9 @@ impl RefundHandler {
         // Shape gate up-front (a malformed request is a clean 400, never a
         // quarantine). A zero amount is rejected here too (mirrors `post_refund_inner`).
         validate_shape(&req)?;
-        if req.amount_minor == 0 {
+        if req.amount.amount().is_zero() {
             return Err(DomainError::InvalidRequest(
-                "refund amount_minor must be > 0".to_owned(),
+                "refund amount must be > 0".to_owned(),
             ));
         }
 
@@ -522,12 +524,7 @@ impl RefundHandler {
         };
         // The payment EXISTS but the currency disagrees: a malformed request, not a
         // quarantine — surface the 400 (mirrors `post_refund_inner`).
-        if settlement.currency != req.currency {
-            return Err(DomainError::CurrencyMismatch(format!(
-                "refund {} currency {} does not match the origin payment {} settlement currency {}",
-                req.refund_id, req.currency, req.payment_id, settlement.currency
-            )));
-        }
+        origin_spec_check(&req, &settlement)?;
 
         // Origin resolvable ⇒ the gated post path (it re-resolves the settlement
         // in-txn under the rank-1 lock; the out-of-txn read above is the quarantine
@@ -636,9 +633,9 @@ impl RefundHandler {
 
         // 1. Pure refund shape gate + zero guard (a clean 400 before any read).
         validate_shape(&refund)?;
-        if refund.amount_minor == 0 {
+        if refund.amount.amount().is_zero() {
             return Err(DomainError::InvalidRequest(
-                "refund amount_minor must be > 0".to_owned(),
+                "refund amount must be > 0".to_owned(),
             ));
         }
         // The composite is a money-out refund; only a forward stage-1 (or a
@@ -669,12 +666,7 @@ impl RefundHandler {
                     refund.refund_id, refund.payment_id
                 ))
             })?;
-        if settlement.currency != refund.currency {
-            return Err(DomainError::CurrencyMismatch(format!(
-                "refund {} currency {} does not match the origin payment {} settlement currency {}",
-                refund.refund_id, refund.currency, refund.payment_id, settlement.currency
-            )));
-        }
+        origin_spec_check(&refund, &settlement)?;
 
         // 2c. Dispute-hold (Z5-2, composite path). A forward composite refund moves
         //     cash OUT, so — like a plain refund (`post_refund_inner`) — it must NOT
@@ -692,7 +684,8 @@ impl RefundHandler {
             && let Some(open) = self
                 .dispute
                 .read_open_dispute_for_payment(scope, refund.tenant_id, &refund.payment_id)
-                .await?
+                .await
+                .map_err(|e| DomainError::Internal(format!("read open dispute: {e}")))?
         {
             return Err(DomainError::RefundDisputeHeld(format!(
                 "refund-with-credit-note {} held: origin payment {} has an OPEN dispute \
@@ -721,9 +714,10 @@ impl RefundHandler {
             );
             let facts = OperationFacts {
                 kind: crate::domain::approval::ApprovalKind::Refund,
-                // Value at the larger leg: a refund OR a credit note above D2 must
-                // route to dual-control (both legs are same-currency, same payment).
-                amount_usd_eq_minor: Some(refund.amount_minor.max(credit_note.amount_minor)),
+                // The composite's governed amount (its larger leg) from the one
+                // rule the gate compares against: a refund OR a credit note above
+                // D2 must route to dual-control.
+                amount: intent.amount()?,
                 effective_at: None,
                 has_outstanding_balance: false,
             };
@@ -767,6 +761,7 @@ impl RefundHandler {
                 cap: RefundCap::for_request(&refund),
                 refund_row: Self::refund_row(&refund, plan.clearing_state, None),
                 payment: self.payment.clone(),
+                adjustment: self.adjustment.clone(),
                 publisher: Arc::clone(&self.publisher),
                 ctx: ctx.clone(),
             },
@@ -848,9 +843,9 @@ impl RefundHandler {
         // A zero-amount refund moves no cash and would fail the engine's empty-entry
         // validation; reject up-front (inherited S1 / AC #4 forbids a zero
         // placeholder entry just as it forbids a zero placeholder line).
-        if req.amount_minor == 0 {
+        if req.amount.amount().is_zero() {
             return Err(DomainError::InvalidRequest(
-                "refund amount_minor must be > 0".to_owned(),
+                "refund amount must be > 0".to_owned(),
             ));
         }
 
@@ -873,12 +868,7 @@ impl RefundHandler {
                     req.refund_id, req.payment_id
                 ))
             })?;
-        if settlement.currency != req.currency {
-            return Err(DomainError::CurrencyMismatch(format!(
-                "refund {} currency {} does not match the origin payment {} settlement currency {}",
-                req.refund_id, req.currency, req.payment_id, settlement.currency
-            )));
-        }
+        origin_spec_check(&req, &settlement)?;
 
         // 2a. Dispute-hold gate (Z5-2, design §5 — the missing control). A refund
         //     must NOT move cash on a payment with an OPEN dispute: the disputed
@@ -900,7 +890,8 @@ impl RefundHandler {
             && let Some(open) = self
                 .dispute
                 .read_open_dispute_for_payment(scope, req.tenant_id, &req.payment_id)
-                .await?
+                .await
+                .map_err(|e| DomainError::Internal(format!("read open dispute: {e}")))?
         {
             let token = self.hold_for_dispute(ctx, scope, &req, &open).await?;
             return Err(DomainError::RefundDisputeHeld(token));
@@ -947,7 +938,7 @@ impl RefundHandler {
                 // compare (it reads the operation currency off the intent via
                 // `ApprovalIntent::transaction_currency`). Single-currency tenants
                 // compare unchanged.
-                amount_usd_eq_minor: Some(req.amount_minor),
+                amount: Some(req.amount.clone()),
                 effective_at: None,
                 has_outstanding_balance: false,
             };
@@ -1048,7 +1039,7 @@ impl RefundHandler {
         ctx: &SecurityContext,
         scope: &AccessScope,
         req: &RefundRequest,
-        open: &crate::infra::storage::entity::dispute::Model,
+        open: &DisputeState,
     ) -> Result<String, DomainError> {
         let now = OffsetDateTime::now_utc();
         let business_id = refund_business_id(&req.psp_refund_id, req.phase.as_str());
@@ -1161,8 +1152,15 @@ impl RefundHandler {
                         "payment:{}/psp_refund:{}/dispute:{}",
                         req.payment_id, req.psp_refund_id, open.dispute_id
                     ),
-                    currency: req.currency.clone(),
-                    expected_minor: req.amount_minor,
+                    currency: req.amount.currency().code().to_owned(),
+                    expected_minor: crate::infra::v1_payload::v1_minor_units_for(
+                        &req.amount,
+                        "expected_minor",
+                        &format_args!(
+                            "refund {} psp_refund {} tenant {}",
+                            req.refund_id, req.psp_refund_id, req.tenant_id
+                        ),
+                    ),
                     actual_minor: 0,
                 }],
             };
@@ -1260,13 +1258,12 @@ impl RefundHandler {
         let dispute = self
             .dispute
             .read_dispute(scope, req.tenant_id, &dispute_id)
-            .await?;
+            .await
+            .map_err(|e| DomainError::Internal(format!("read held dispute: {e}")))?;
         // The held dispute row vanished (a tenant purge / data fix) — treat as no
         // longer disputed and re-drive (the payment now stands by absence). Rare; the
         // post path re-validates everything regardless.
-        let last_phase = dispute
-            .as_ref()
-            .and_then(|d| DisputePhase::parse(&d.last_phase));
+        let last_phase = dispute.as_ref().map(|d| d.last_phase);
 
         match last_phase {
             // STILL OPEN ⇒ back off (or escalate if aged out). The cash stays held.
@@ -1372,7 +1369,7 @@ impl RefundHandler {
             payment_id = %req.payment_id,
             psp_refund_id = %req.psp_refund_id,
             dispute_id = %dispute_id,
-            amount_minor = req.amount_minor,
+            amount = %req.amount.amount(),
             "bss-ledger: dispute-held refund's dispute resolved LOST (chargeback returned the \
              money) — cancelling the hold, NOT posting (double-pay guard); escalating \
              (full exception_queue is Slice 7)"
@@ -1403,8 +1400,15 @@ impl RefundHandler {
                     "payment:{}/psp_refund:{}/dispute:{}",
                     req.payment_id, req.psp_refund_id, dispute_id
                 ),
-                currency: req.currency.clone(),
-                expected_minor: req.amount_minor,
+                currency: req.amount.currency().code().to_owned(),
+                expected_minor: crate::infra::v1_payload::v1_minor_units_for(
+                    &req.amount,
+                    "expected_minor",
+                    &format_args!(
+                        "refund {} psp_refund {} tenant {}",
+                        req.refund_id, req.psp_refund_id, req.tenant_id
+                    ),
+                ),
                 actual_minor: 0,
             }],
         };
@@ -1430,7 +1434,7 @@ impl RefundHandler {
             payment_id = %req.payment_id,
             psp_refund_id = %req.psp_refund_id,
             dispute_id = %dispute_id,
-            amount_minor = req.amount_minor,
+            amount = %req.amount.amount(),
             "bss-ledger: dispute-held refund's dispute never resolved past the aging horizon \
              — cancelling the hold + escalating (REFUND_DISPUTE_HELD; full exception_queue is \
              Slice 7)"
@@ -1456,8 +1460,15 @@ impl RefundHandler {
                     "payment:{}/psp_refund:{}/dispute:{}",
                     req.payment_id, req.psp_refund_id, dispute_id
                 ),
-                currency: req.currency.clone(),
-                expected_minor: req.amount_minor,
+                currency: req.amount.currency().code().to_owned(),
+                expected_minor: crate::infra::v1_payload::v1_minor_units_for(
+                    &req.amount,
+                    "expected_minor",
+                    &format_args!(
+                        "refund {} psp_refund {} tenant {}",
+                        req.refund_id, req.psp_refund_id, req.tenant_id
+                    ),
+                ),
                 actual_minor: 0,
             }],
         };
@@ -1645,36 +1656,9 @@ impl RefundHandler {
         // The REAL open clearing amount is the stage-1 row's amount (what stage-1
         // CR'd into REFUND_CLEARING and never drained), not the disposition request's
         // amount_minor.
-        let open_minor = stage1.amount_minor;
+        let open = stage1.amount.clone();
 
-        // The park-clearing plan: DR REFUND_CLEARING (drain the open balance) · CR
-        // SUSPENSE (park the amount pending reconciliation). Balanced (one DR == one
-        // CR), and the DR on the GUARDED REFUND_CLEARING returns its balance toward
-        // zero — the mirror of the stage-1 `CR REFUND_CLEARING`. Both legs are
-        // stream-less (matches the never-stream refund classes). Sized at the REAL
-        // open clearing amount (Z5-4). NOT a loss/gain — `unknown_final` means the
-        // outcome is unknown, so the amount holds on SUSPENSE until a terminal
-        // disposition resolves it (Slice 7).
-        let plan = RefundLegPlan {
-            legs: vec![
-                PlannedLeg {
-                    account_class: AccountClass::RefundClearing,
-                    side: Side::Debit,
-                    amount_minor: open_minor,
-                    revenue_stream: None,
-                },
-                PlannedLeg {
-                    account_class: UNKNOWN_FINAL_PARK_CLASS,
-                    side: Side::Credit,
-                    amount_minor: open_minor,
-                    revenue_stream: None,
-                },
-            ],
-            // The REFUND_CLEARING is drained off the live account (parked to
-            // SUSPENSE) — SETTLED on the `refund` row, not a fresh PENDING. The
-            // terminal loss/release attribution is a later governed step (Slice 7).
-            clearing_state: CLEARING_STATE_SETTLED,
-        };
+        let plan = unknown_final_park_plan(&open);
 
         let business_id = refund_business_id(&req.psp_refund_id, req.phase.as_str());
         let (entry, lines) = self
@@ -1689,6 +1673,7 @@ impl RefundHandler {
         // money-out of record).
         let sidecar: Arc<dyn PostSidecar> = Arc::new(UnknownFinalSidecar {
             refund_row: Self::refund_row(req, CLEARING_STATE_SETTLED, None),
+            adjustment: self.adjustment.clone(),
             audit: Arc::clone(&self.audit),
             // The acting subject (the approver/operator) — the audit `actor_ref`.
             // `subject_id` is always present on an authenticated context.
@@ -1696,7 +1681,7 @@ impl RefundHandler {
             // The audit `before` image carries the REAL stage-1 state (Z5-4): its
             // live `clearing_state` + the live open clearing amount, read above — NOT
             // a hardcoded `PENDING` / the request's amount.
-            before_after: unknown_final_audit_payload(req, &stage1.clearing_state, open_minor),
+            before_after: unknown_final_audit_payload(req, &stage1.clearing_state, &open),
             tenant: req.tenant_id,
             publisher: Arc::clone(&self.publisher),
             ctx: ctx.clone(),
@@ -2081,6 +2066,7 @@ impl RefundHandler {
                 cap: RefundCap::for_request(req),
                 refund_row: Self::refund_row(req, plan.clearing_state, None),
                 payment: self.payment.clone(),
+                adjustment: self.adjustment.clone(),
                 publisher: Arc::clone(&self.publisher),
                 ctx: ctx.clone(),
             },
@@ -2112,7 +2098,7 @@ impl RefundHandler {
             payment_id = %req.payment_id,
             psp_refund_id = %req.psp_refund_id,
             relates_to_refund_id = ?req.relates_to_refund_id,
-            amount_minor = req.amount_minor,
+            amount = %req.amount.amount(),
             "bss-ledger: claw-back never reconciled past the aging horizon — escalating \
              (CLAWBACK_UNDERFLOW; full exception_queue is Slice 7)"
         );
@@ -2151,9 +2137,12 @@ impl RefundHandler {
             ),
             code: "CLAWBACK_UNDERFLOW".to_owned(),
             detail: format!(
-                "claw-back of {} minor on payment {} (psp_refund_id {}) never found a matching \
+                "claw-back of {} {} on payment {} (psp_refund_id {}) never found a matching \
                  outbound refund to net against within the aging horizon",
-                req.amount_minor, req.payment_id, req.psp_refund_id
+                req.amount.amount(),
+                req.amount.currency().code(),
+                req.payment_id,
+                req.psp_refund_id
             ),
             affected: vec![AffectedItem {
                 id: format!(
@@ -2162,8 +2151,15 @@ impl RefundHandler {
                     req.psp_refund_id,
                     req.relates_to_refund_id.as_deref().unwrap_or("")
                 ),
-                currency: req.currency.clone(),
-                expected_minor: req.amount_minor,
+                currency: req.amount.currency().code().to_owned(),
+                expected_minor: crate::infra::v1_payload::v1_minor_units_for(
+                    &req.amount,
+                    "expected_minor",
+                    &format_args!(
+                        "refund {} psp_refund {} tenant {}",
+                        req.refund_id, req.psp_refund_id, req.tenant_id
+                    ),
+                ),
                 actual_minor: 0,
             }],
         };
@@ -2345,8 +2341,15 @@ impl RefundHandler {
                         "payment:{}/psp_refund:{}",
                         req.payment_id, req.psp_refund_id
                     ),
-                    currency: req.currency.clone(),
-                    expected_minor: req.amount_minor,
+                    currency: req.amount.currency().code().to_owned(),
+                    expected_minor: crate::infra::v1_payload::v1_minor_units_for(
+                        &req.amount,
+                        "expected_minor",
+                        &format_args!(
+                            "refund {} psp_refund {} tenant {}",
+                            req.refund_id, req.psp_refund_id, req.tenant_id
+                        ),
+                    ),
                     actual_minor: 0,
                 }],
             };
@@ -2539,7 +2542,7 @@ impl RefundHandler {
             tenant_id = %req.tenant_id,
             payment_id = %req.payment_id,
             psp_refund_id = %req.psp_refund_id,
-            amount_minor = req.amount_minor,
+            amount = %req.amount.amount(),
             "bss-ledger: quarantined refund's origin payment never landed past the aging horizon \
              — escalating (REFUND_QUARANTINED; full exception_queue is Slice 7)"
         );
@@ -2582,8 +2585,15 @@ impl RefundHandler {
                     "payment:{}/psp_refund:{}",
                     req.payment_id, req.psp_refund_id
                 ),
-                currency: req.currency.clone(),
-                expected_minor: req.amount_minor,
+                currency: req.amount.currency().code().to_owned(),
+                expected_minor: crate::infra::v1_payload::v1_minor_units_for(
+                    &req.amount,
+                    "expected_minor",
+                    &format_args!(
+                        "refund {} psp_refund {} tenant {}",
+                        req.refund_id, req.psp_refund_id, req.tenant_id
+                    ),
+                ),
                 actual_minor: 0,
             }],
         };
@@ -2648,6 +2658,7 @@ impl RefundHandler {
             cap: RefundCap::for_request(req),
             refund_row: Self::refund_row(req, plan.clearing_state, None),
             payment: self.payment.clone(),
+            adjustment: self.adjustment.clone(),
             publisher: Arc::clone(&self.publisher),
             ctx: ctx.clone(),
         });
@@ -2713,6 +2724,7 @@ impl RefundHandler {
             cap: RefundCap::for_request(req),
             refund_row: Self::refund_row(req, CLEARING_STATE_REVERSED, Some(stage1_entry_id)),
             payment: self.payment.clone(),
+            adjustment: self.adjustment.clone(),
             publisher: Arc::clone(&self.publisher),
             ctx: ctx.clone(),
         });
@@ -2773,11 +2785,6 @@ impl RefundHandler {
         reverses_entry_id: Option<Uuid>,
     ) -> Result<(NewEntry, Vec<NewLine>), DomainError> {
         let chart = load_chart(&self.reference, scope, req.tenant_id).await?;
-        let scale = self
-            .resolver
-            .resolve(scope, req.tenant_id, &req.currency)
-            .await
-            .map_err(|e| DomainError::Internal(format!("currency scale resolve: {e}")))?;
 
         let eff_date = to_naive_date(OffsetDateTime::now_utc());
         let period_id = format!("{:04}{:02}", eff_date.year(), eff_date.month());
@@ -2787,7 +2794,7 @@ impl RefundHandler {
             let account_id = chart
                 .resolve(
                     leg.account_class,
-                    &req.currency,
+                    req.amount.currency().code(),
                     leg.revenue_stream.as_deref(),
                 )
                 .ok_or_else(|| {
@@ -2795,10 +2802,10 @@ impl RefundHandler {
                         "no provisioned account for class {} / stream {:?} / currency {}",
                         leg.account_class.as_str(),
                         leg.revenue_stream,
-                        req.currency
+                        req.amount.currency().code()
                     ))
                 })?;
-            lines.push(Self::mk_line(req, leg, account_id, scale));
+            lines.push(Self::mk_line(req, leg, account_id));
         }
 
         // Slice 5 (F2): functional carry-forward on a cross-currency refund. A
@@ -2825,7 +2832,7 @@ impl RefundHandler {
             // v1: one legal entity per tenant — derived server-side.
             legal_entity_id: req.tenant_id,
             period_id,
-            entry_currency: req.currency.clone(),
+            entry_currency: req.amount.currency().code().to_owned(),
             source_doc_type: SourceDocType::Refund,
             // The engine's `(tenant, REFUND, psp_refund_id:phase)` idempotency key —
             // one claim per PSP-refund phase (design §7).
@@ -2890,82 +2897,55 @@ impl RefundHandler {
         // this read is used ONLY to detect cross-currency below (a claw-back restores
         // a position at the PRIOR refund's rate, which this WAC carry-forward cannot
         // source — see the cross-currency reject after the detect).
-        let (balance_minor, functional_balance_minor, functional_currency) =
-            match (req.phase, req.pattern) {
-                // Stage-2 / reversal: relieve REFUND_CLEARING (set at stage-1). The
-                // REFUND_CLEARING leg is present in every such entry; defensively no-op
-                // if absent.
-                (RefundPhase::Confirmed | RefundPhase::Rejected | RefundPhase::Voided, _) => {
-                    let Some(account_id) = lines
-                        .iter()
-                        .find(|l| l.account_class == AccountClass::RefundClearing)
-                        .map(|l| l.account_id)
-                    else {
-                        return Ok(());
-                    };
-                    let c = self
-                        .payment
-                        .read_account_carried(scope, req.tenant_id, account_id, &req.currency)
-                        .await
-                        .map_err(|e| {
-                            DomainError::Internal(format!("read refund-clearing carried: {e}"))
-                        })?;
-                    (
-                        c.balance_minor,
-                        c.functional_balance_minor,
-                        c.functional_currency,
-                    )
-                }
-                // Stage-1 / single-step Pattern A: relieve the UNALLOCATED pool.
-                (RefundPhase::Initiated, RefundPattern::AUnallocated) => {
-                    let u = self
-                        .payment
-                        .read_unallocated_carried(
-                            scope,
-                            req.tenant_id,
-                            req.payer_tenant_id,
-                            &req.currency,
-                        )
-                        .await
-                        .map_err(|e| {
-                            DomainError::Internal(format!("read unallocated carried: {e}"))
-                        })?;
-                    (
-                        u.balance_minor,
-                        u.functional_balance_minor,
-                        u.functional_currency,
-                    )
-                }
-                // Stage-1 / single-step Pattern B: the AR leg re-OPENS the receivable, so
-                // anchor on CASH_CLEARING (the cash being returned is the carried value).
-                (RefundPhase::Initiated, RefundPattern::BRestoreAr) => {
-                    let Some(account_id) =
-                        chart.resolve(AccountClass::CashClearing, &req.currency, None)
-                    else {
-                        return Ok(());
-                    };
-                    let c = self
-                        .payment
-                        .read_account_carried(scope, req.tenant_id, account_id, &req.currency)
-                        .await
-                        .map_err(|e| {
-                            DomainError::Internal(format!("read cash-clearing carried: {e}"))
-                        })?;
-                    (
-                        c.balance_minor,
-                        c.functional_balance_minor,
-                        c.functional_currency,
-                    )
-                }
-                // UnknownFinal (Group F) — out of scope.
-                (RefundPhase::UnknownFinal, _) => return Ok(()),
-            };
+        let currency = req.amount.currency().code();
+        let carried = match (req.phase, req.pattern) {
+            // Stage-2 / reversal: relieve REFUND_CLEARING (set at stage-1). The
+            // REFUND_CLEARING leg is present in every such entry; defensively no-op
+            // if absent.
+            (RefundPhase::Confirmed | RefundPhase::Rejected | RefundPhase::Voided, _) => {
+                let Some(account_id) = lines
+                    .iter()
+                    .find(|l| l.account_class == AccountClass::RefundClearing)
+                    .map(|l| l.account_id)
+                else {
+                    return Ok(());
+                };
+                self.payment
+                    .read_account_carried(scope, req.tenant_id, account_id, currency)
+                    .await
+                    .map_err(|e| {
+                        DomainError::Internal(format!("read refund-clearing carried: {e}"))
+                    })?
+                    .map(|c| (c.balance, c.functional_balance))
+            }
+            // Stage-1 / single-step Pattern A: relieve the UNALLOCATED pool.
+            (RefundPhase::Initiated, RefundPattern::AUnallocated) => self
+                .payment
+                .read_unallocated_carried(scope, req.tenant_id, req.payer_tenant_id, currency)
+                .await
+                .map_err(|e| DomainError::Internal(format!("read unallocated carried: {e}")))?
+                .map(|u| (u.balance, u.functional_balance)),
+            // Stage-1 / single-step Pattern B: the AR leg re-OPENS the receivable, so
+            // anchor on CASH_CLEARING (the cash being returned is the carried value).
+            (RefundPhase::Initiated, RefundPattern::BRestoreAr) => {
+                let Some(account_id) = chart.resolve(AccountClass::CashClearing, currency, None)
+                else {
+                    return Ok(());
+                };
+                self.payment
+                    .read_account_carried(scope, req.tenant_id, account_id, currency)
+                    .await
+                    .map_err(|e| DomainError::Internal(format!("read cash-clearing carried: {e}")))?
+                    .map(|c| (c.balance, c.functional_balance))
+            }
+            // UnknownFinal (Group F) — out of scope.
+            (RefundPhase::UnknownFinal, _) => return Ok(()),
+        };
 
         // Cross-currency detect (design decision 8): the anchor grain carries a
-        // functional balance. NULL ⇒ single-currency refund: leave functional NULL.
-        let (Some(anchor_functional), Some(functional_ccy)) =
-            (functional_balance_minor, functional_currency)
-        else {
+        // functional balance. An absent grain or a NULL functional ⇒ single-currency
+        // refund: leave functional NULL.
+        let Some((balance, Some(anchor_functional))) = carried else {
             return Ok(());
         };
 
@@ -2988,10 +2968,14 @@ impl RefundHandler {
         }
 
         // Both refund legs share the amount, so the first line's amount is the
-        // relieved amount. A non-positive carried balance or an over-relief ⇒ skip
+        // relieved amount. The grain's stored spec must match the refund's before any
+        // comparison. A non-positive carried balance or an over-relief ⇒ skip
         // carry-forward so the projector's NegativeBalance surfaces.
-        let relieved = lines.first().map_or(0, |l| l.amount_minor);
-        if balance_minor <= 0 || relieved > balance_minor {
+        let Some(relieved) = lines.first().map(|l| l.money.clone()) else {
+            return Ok(());
+        };
+        matching_spec(&balance, &relieved)?;
+        if balance.amount() <= Decimal::ZERO || relieved.amount() > balance.amount() {
             return Ok(());
         }
 
@@ -2999,10 +2983,9 @@ impl RefundHandler {
         // amount. Both legs share the amount, so both get the same value → the
         // functional column nets to zero (carry-forward; no FX line).
         for line in lines.iter_mut() {
-            let func = carried_relief(anchor_functional, balance_minor, line.amount_minor)
+            let func = carried_relief(&anchor_functional, &balance, &line.money)
                 .map_err(|e| DomainError::Internal(format!("refund FX carry-forward: {e}")))?;
-            line.functional_amount_minor = Some(func);
-            line.functional_currency = Some(functional_ccy.clone());
+            line.functional_money = Some(func);
         }
         Ok(())
     }
@@ -3024,8 +3007,7 @@ impl RefundHandler {
             pattern: req.pattern.as_str().to_owned(),
             payment_id: req.payment_id.clone(),
             invoice_id: req.invoice_id.clone(),
-            currency: req.currency.clone(),
-            amount_minor: req.amount_minor,
+            amount: req.amount.clone(),
             clearing_state: clearing_state.to_owned(),
             // The refund-of-refund forward link (Group E): a claw-back / additional-
             // outbound carries the prior refund it references; `None` for a
@@ -3041,7 +3023,7 @@ impl RefundHandler {
     /// cache grains key on it) + the Pattern-B `invoice_id` (so a restored-AR leg
     /// nets the right invoice's `ar_invoice_balance`); the clearing legs are
     /// stream-less, invoice-less system grains.
-    fn mk_line(req: &RefundRequest, leg: &PlannedLeg, account_id: Uuid, scale: u8) -> NewLine {
+    fn mk_line(req: &RefundRequest, leg: &PlannedLeg, account_id: Uuid) -> NewLine {
         NewLine {
             line_id: Uuid::now_v7(),
             payer_tenant_id: req.payer_tenant_id,
@@ -3051,9 +3033,7 @@ impl RefundHandler {
             account_class: leg.account_class,
             gl_code: None,
             side: leg.side,
-            amount_minor: leg.amount_minor,
-            currency: req.currency.clone(),
-            currency_scale: scale,
+            money: leg.amount.clone(),
             // Only the Pattern-B AR leg keys on an invoice (it re-opens that
             // invoice's receivable). Pattern A (UNALLOCATED) + the clearing legs
             // carry no invoice. `validate_shape` guaranteed `invoice_id` is `Some`
@@ -3064,8 +3044,7 @@ impl RefundHandler {
             due_date: None,
             revenue_stream: None,
             mapping_status: MappingStatus::Resolved,
-            functional_amount_minor: None,
-            functional_currency: None,
+            functional_money: None,
             tax_jurisdiction: None,
             tax_filing_period: None,
             tax_rate_ref: None,
@@ -3289,8 +3268,7 @@ struct DisputeHeldRefundPayload {
     pattern: String,
     payment_id: String,
     invoice_id: Option<String>,
-    currency: String,
-    amount_minor: i64,
+    amount: StoredMoney,
     two_stage: bool,
     relates_to_refund_id: Option<String>,
     /// The direction wire literal.
@@ -3315,8 +3293,7 @@ impl DisputeHeldRefundPayload {
             pattern: req.pattern.as_str().to_owned(),
             payment_id: req.payment_id.clone(),
             invoice_id: req.invoice_id.clone(),
-            currency: req.currency.clone(),
-            amount_minor: req.amount_minor,
+            amount: StoredMoney::from(&req.amount),
             two_stage: req.two_stage,
             relates_to_refund_id: req.relates_to_refund_id.clone(),
             direction: req.direction.as_str().to_owned(),
@@ -3359,8 +3336,8 @@ impl DisputeHeldRefundPayload {
             pattern,
             payment_id: self.payment_id,
             invoice_id: self.invoice_id,
-            currency: self.currency,
-            amount_minor: self.amount_minor,
+            amount: PostedMoney::try_from(self.amount)
+                .map_err(|e| DomainError::Internal(format!("queued refund payload amount: {e}")))?,
             two_stage: self.two_stage,
             relates_to_refund_id: self.relates_to_refund_id,
             direction,
@@ -3386,8 +3363,7 @@ struct QuarantinedRefundPayload {
     pattern: String,
     payment_id: String,
     invoice_id: Option<String>,
-    currency: String,
-    amount_minor: i64,
+    amount: StoredMoney,
     two_stage: bool,
     relates_to_refund_id: Option<String>,
     /// The direction wire literal.
@@ -3406,8 +3382,7 @@ impl QuarantinedRefundPayload {
             pattern: req.pattern.as_str().to_owned(),
             payment_id: req.payment_id.clone(),
             invoice_id: req.invoice_id.clone(),
-            currency: req.currency.clone(),
-            amount_minor: req.amount_minor,
+            amount: StoredMoney::from(&req.amount),
             two_stage: req.two_stage,
             relates_to_refund_id: req.relates_to_refund_id.clone(),
             direction: req.direction.as_str().to_owned(),
@@ -3445,8 +3420,8 @@ impl QuarantinedRefundPayload {
             pattern,
             payment_id: self.payment_id,
             invoice_id: self.invoice_id,
-            currency: self.currency,
-            amount_minor: self.amount_minor,
+            amount: PostedMoney::try_from(self.amount)
+                .map_err(|e| DomainError::Internal(format!("queued refund payload amount: {e}")))?,
             two_stage: self.two_stage,
             relates_to_refund_id: self.relates_to_refund_id,
             direction,
@@ -3523,8 +3498,7 @@ struct QueuedClawbackPayload {
     pattern: String,
     payment_id: String,
     invoice_id: Option<String>,
-    currency: String,
-    amount_minor: i64,
+    amount: StoredMoney,
     two_stage: bool,
     /// The prior refund this claws back (always `Some` — a claw-back requires it).
     relates_to_refund_id: Option<String>,
@@ -3544,8 +3518,7 @@ impl QueuedClawbackPayload {
             pattern: req.pattern.as_str().to_owned(),
             payment_id: req.payment_id.clone(),
             invoice_id: req.invoice_id.clone(),
-            currency: req.currency.clone(),
-            amount_minor: req.amount_minor,
+            amount: StoredMoney::from(&req.amount),
             two_stage: req.two_stage,
             relates_to_refund_id: req.relates_to_refund_id.clone(),
             direction: req.direction.as_str().to_owned(),
@@ -3581,8 +3554,8 @@ impl QueuedClawbackPayload {
             pattern,
             payment_id: self.payment_id,
             invoice_id: self.invoice_id,
-            currency: self.currency,
-            amount_minor: self.amount_minor,
+            amount: PostedMoney::try_from(self.amount)
+                .map_err(|e| DomainError::Internal(format!("queued refund payload amount: {e}")))?,
             two_stage: self.two_stage,
             relates_to_refund_id: self.relates_to_refund_id,
             direction,
@@ -3677,7 +3650,7 @@ fn invert_plan(plan: &RefundLegPlan) -> RefundLegPlan {
                 Side::Debit => Side::Credit,
                 Side::Credit => Side::Debit,
             },
-            amount_minor: l.amount_minor,
+            amount: l.amount.clone(),
             revenue_stream: l.revenue_stream.clone(),
         })
         .collect();
@@ -3698,7 +3671,7 @@ fn invert_plan(plan: &RefundLegPlan) -> RefundLegPlan {
 struct RefundCap {
     tenant: Uuid,
     payment_id: String,
-    amount_minor: i64,
+    amount: PostedMoney,
     /// `Some(invoice_id)` for Pattern B (the per-invoice cap target); `None` for
     /// Pattern A.
     invoice_id: Option<String>,
@@ -3712,7 +3685,7 @@ impl RefundCap {
         Self {
             tenant: req.tenant_id,
             payment_id: req.payment_id.clone(),
-            amount_minor: req.amount_minor,
+            amount: req.amount.clone(),
             invoice_id: match req.pattern {
                 RefundPattern::BRestoreAr => req.invoice_id.clone(),
                 RefundPattern::AUnallocated => None,
@@ -3738,11 +3711,11 @@ impl RefundCap {
         mode: CapMode,
     ) -> Result<(), CapApplyError> {
         let signed = match mode {
-            CapMode::Initiate => self.amount_minor,
+            CapMode::Initiate => self.amount.clone(),
             // Both DECREMENT by the amount: `Release` backs out a matching stage-1
             // (cannot underflow); `Clawback` nets the origin money-out down to the
             // NET refunded AFTER the underflow pre-check below has cleared it.
-            CapMode::Release | CapMode::Clawback => -self.amount_minor,
+            CapMode::Release | CapMode::Clawback => negated(&self.amount)?,
             CapMode::None => return Ok(()),
         };
 
@@ -3771,20 +3744,19 @@ impl RefundCap {
             // Would the total money-out decrement underflow? (`refunded_minor` is the
             // counter the matching outbound refund stage-1 raised; the claw-back
             // arriving first / over-clawing leaves it too small.)
-            if settlement.refunded_minor < self.amount_minor {
+            if below(&settlement.refunded, &self.amount)? {
                 return Err(CapApplyError::UnderflowDeferred);
             }
             // The additional per-pattern counters must also have room (defensive —
             // they move in lockstep with `refunded_minor` in the happy path, but an
             // out-of-order Pattern-A/B claw-back could underflow one of them first).
-            if self.is_unallocated_pattern
-                && settlement.refunded_unallocated_minor < self.amount_minor
+            if self.is_unallocated_pattern && below(&settlement.refunded_unallocated, &self.amount)?
             {
                 return Err(CapApplyError::UnderflowDeferred);
             }
             if let Some(invoice_id) = &self.invoice_id {
-                let par_refunded = payment
-                    .read_allocation_refund_refunded_for_update(
+                let par = payment
+                    .read_allocation_refund_for_update(
                         txn,
                         scope,
                         self.tenant,
@@ -3793,7 +3765,13 @@ impl RefundCap {
                     )
                     .await
                     .map_err(CapApplyError::Repo)?;
-                if par_refunded < self.amount_minor {
+                // No per-invoice row ⇒ nothing was refunded against it yet; any
+                // positive claw-back underflows.
+                let underflow = match par {
+                    Some(state) => below(&state.refunded, &self.amount)?,
+                    None => true,
+                };
+                if underflow {
                     return Err(CapApplyError::UnderflowDeferred);
                 }
             }
@@ -3801,7 +3779,8 @@ impl RefundCap {
 
         // 1. Total money-out cap (both patterns): refunded + clawed_back <= settled.
         //    Rank-1 `payment_settlement` lock — taken first.
-        PaymentRepo::add_refunded(txn, scope, self.tenant, &self.payment_id, signed)
+        payment
+            .add_refunded(txn, scope, self.tenant, &self.payment_id, &signed)
             .await
             .map_err(CapApplyError::Repo)?;
 
@@ -3809,30 +3788,26 @@ impl RefundCap {
         //     settled) — refunded on-account cash can no longer be allocated. Same
         //     `payment_settlement` row (rank-1).
         if self.is_unallocated_pattern {
-            PaymentRepo::add_refunded_unallocated(
-                txn,
-                scope,
-                self.tenant,
-                &self.payment_id,
-                signed,
-            )
-            .await
-            .map_err(CapApplyError::Repo)?;
+            payment
+                .add_refunded_unallocated(txn, scope, self.tenant, &self.payment_id, &signed)
+                .await
+                .map_err(CapApplyError::Repo)?;
         }
 
         // 2b. Pattern B: per-`(payment, invoice)` cap (refunded <= allocated) on the
         //     `payment_allocation_refund` row.
         if let Some(invoice_id) = &self.invoice_id {
-            PaymentRepo::add_allocation_refund_refunded(
-                txn,
-                scope,
-                self.tenant,
-                &self.payment_id,
-                invoice_id,
-                signed,
-            )
-            .await
-            .map_err(CapApplyError::Repo)?;
+            payment
+                .add_allocation_refund_refunded(
+                    txn,
+                    scope,
+                    self.tenant,
+                    &self.payment_id,
+                    invoice_id,
+                    &signed,
+                )
+                .await
+                .map_err(CapApplyError::Repo)?;
         }
         Ok(())
     }
@@ -3863,25 +3838,27 @@ enum CapApplyError {
 fn unknown_final_audit_payload(
     req: &RefundRequest,
     before_clearing_state: &str,
-    open_minor: i64,
+    open: &PostedMoney,
 ) -> serde_json::Value {
+    let open_text = bss_ledger_sdk::canonical_decimal(open.amount());
     serde_json::json!({
         "disposition": "REFUND_UNKNOWN_FINAL",
         "refund_id": req.refund_id,
         "psp_refund_id": req.psp_refund_id,
         "payment_id": req.payment_id,
         "pattern": req.pattern.as_str(),
-        "currency": req.currency,
+        "currency": open.currency().code(),
+        "currency_scale": open.currency().scale(),
         "before": {
             // The REAL open clearing amount + the REAL stage-1 clearing_state (Z5-4),
             // read live from the stage-1 refund row — not assumed.
-            "refund_clearing_open_minor": open_minor,
+            "refund_clearing_open": open_text,
             "clearing_state": before_clearing_state,
         },
         "after": {
-            "refund_clearing_open_minor": 0,
+            "refund_clearing_open": "0",
             "park_account_class": UNKNOWN_FINAL_PARK_CLASS.as_str(),
-            "parked_minor": open_minor,
+            "parked": open_text,
             "clearing_state": CLEARING_STATE_SETTLED,
         },
     })
@@ -3900,6 +3877,8 @@ struct UnknownFinalSidecar {
     /// park-to-SUSPENSE resolution; its own `(tenant, psp_refund_id, unknown_final)`
     /// grain).
     refund_row: NewRefund,
+    /// The adjustment store the `refund` row is written through.
+    adjustment: AdjustmentRepo,
     /// The secured-audit sink (Slice 6 port). No-op until merge.
     audit: Arc<dyn SecuredAuditSink>,
     /// The acting subject id (the approver/operator) for the audit `actor_ref`;
@@ -3927,7 +3906,8 @@ impl PostSidecar for UnknownFinalSidecar {
         // 1. Persist the refund record row (surrogate PK + natural UNIQUE on
         //    (tenant, psp_refund_id, unknown_final)). A replay is short-circuited
         //    by the engine claim BEFORE the sidecar, so a collision rolls back.
-        AdjustmentRepo::insert_refund(txn, scope, &self.refund_row)
+        self.adjustment
+            .insert_refund(txn, scope, &self.refund_row)
             .await
             .map_err(|e| DomainError::Internal(format!("insert refund (unknown_final): {e}")))?;
 
@@ -3996,6 +3976,8 @@ pub struct RefundPostSidecar {
     /// underflow pre-read under the rank-1 lock (Group E). A cheap clone of the
     /// handler's repo (it wraps the provider Arc).
     payment: PaymentRepo,
+    /// The adjustment store the `refund` row is written through.
+    adjustment: AdjustmentRepo,
     /// The event publisher: `billing.ledger.refund.recorded` is published IN this
     /// post txn (the transactional outbox, Group G) so it commits atomically with
     /// the refund entry + caps, or rolls back with them. Mirrors
@@ -4042,7 +4024,8 @@ impl PostSidecar for RefundPostSidecar {
         //    duplicate (replay) is short-circuited by the
         //    (tenant, REFUND, psp_refund_id:phase) idempotency claim BEFORE the
         //    sidecar, so an unexpected collision rolls the post back.
-        AdjustmentRepo::insert_refund(txn, scope, &self.refund_row)
+        self.adjustment
+            .insert_refund(txn, scope, &self.refund_row)
             .await
             .map_err(|e| DomainError::Internal(format!("insert refund: {e}")))?;
 
@@ -4070,6 +4053,17 @@ impl PostSidecar for RefundPostSidecar {
 /// the forward/reversal sidecar ([`RefundPostSidecar`]) and the `unknown_final`
 /// disposition sidecar ([`UnknownFinalSidecar`]).
 fn refund_recorded_event(row: &NewRefund, posted: &PostedFacts) -> RefundRecorded {
+    // The parked `v1` payload still carries integer minor units: exact when the
+    // amount fits `i64`, otherwise saturated by sign with a warning naming the
+    // refund (the one `v1_payload` policy).
+    let amount_minor = crate::infra::v1_payload::v1_minor_units_for(
+        &row.amount,
+        "amount_minor",
+        &format_args!(
+            "refund {} entry {} tenant {}",
+            row.refund_id, posted.entry_id, row.tenant_id
+        ),
+    );
     RefundRecorded {
         tenant_id: row.tenant_id,
         refund_id: row.refund_id.clone(),
@@ -4078,8 +4072,8 @@ fn refund_recorded_event(row: &NewRefund, posted: &PostedFacts) -> RefundRecorde
         phase: row.phase.clone(),
         pattern: row.pattern.clone(),
         payment_id: row.payment_id.clone(),
-        amount_minor: row.amount_minor,
-        currency: row.currency.clone(),
+        amount_minor,
+        currency: row.amount.currency().code().to_owned(),
         clearing_state: row.clearing_state.clone(),
     }
 }
@@ -4100,33 +4094,82 @@ fn map_cap_apply_err(e: CapApplyError) -> DomainError {
     }
 }
 
-/// Map a refund cap-counter [`RepoError`] into the sidecar's [`DomainError`]: a cap
-/// CHECK violation becomes [`DomainError::RefundExceedsSettled`] (the
-/// `payment_settlement` total-money-out / spendable-headroom caps) or, when the
-/// violated constraint is the per-`(payment, invoice)` `chk_par_*` cap,
-/// [`DomainError::RefundExceedsAllocated`]. Every other repo failure is an
-/// infrastructure fault that rolls the post back.
-///
-/// Both cap families surface as the same [`RepoError::MoneyOutCapExceeded`] (the
-/// repo's `is_check_violation` matches both the `chk_payment_settlement_*` and
-/// `chk_par_*` prefixes), so the message carries the discriminating constraint
-/// context the repo stamped; a `chk_par_` / "allocated" marker routes to
-/// `RefundExceedsAllocated`, everything else to `RefundExceedsSettled` (the
-/// settled-amount caps are the common case + the safe default — both are
-/// over-refund rejects on the `InvalidArgument` category).
-fn map_refund_cap_err(e: RepoError) -> DomainError {
-    match e {
-        RepoError::MoneyOutCapExceeded(m) => {
-            // The per-invoice cap is the `payment_allocation_refund` row
-            // (`chk_par_refunded_le_allocated`); its repo context stamps the
-            // "allocation_refund" marker. Everything else is a settlement cap.
-            if m.contains("allocation_refund") || m.contains("chk_par_") {
-                DomainError::RefundExceedsAllocated(m)
-            } else {
-                DomainError::RefundExceedsSettled(m)
-            }
-        }
-        other => DomainError::Internal(format!("refund cap sidecar: {other}")),
+/// The refund must carry the origin settlement's stored currency AND scale: a
+/// mismatch is a named rejection, never an implicit conversion.
+fn origin_spec_check(req: &RefundRequest, settlement: &SettlementState) -> Result<(), DomainError> {
+    let refund = req.amount.currency();
+    let origin = settlement.settled.currency();
+    if refund.code() != origin.code() {
+        return Err(DomainError::CurrencyMismatch(format!(
+            "refund {} currency {} does not match the origin payment {} settlement currency {}",
+            req.refund_id,
+            refund.code(),
+            req.payment_id,
+            origin.code()
+        )));
+    }
+    if refund.scale() != origin.scale() {
+        return Err(DomainError::InconsistentScale(format!(
+            "refund {} currency scale {} does not match the origin payment {} settlement scale {}",
+            req.refund_id,
+            refund.scale(),
+            req.payment_id,
+            origin.scale()
+        )));
+    }
+    Ok(())
+}
+
+/// The signed counter delta for a release / claw-back decrement.
+fn negated(value: &PostedMoney) -> Result<PostedMoney, CapApplyError> {
+    PostedMoney::try_new(-value.amount(), value.currency().clone())
+        .map_err(|e| CapApplyError::Repo(RepoError::Money(e)))
+}
+
+/// `current < amount` on exact values, after the stored spec is checked against
+/// the request's.
+fn below(current: &PostedMoney, amount: &PostedMoney) -> Result<bool, CapApplyError> {
+    if current.currency().code() != amount.currency().code() {
+        return Err(CapApplyError::Repo(RepoError::Money(
+            bss_ledger_sdk::MoneyError::CurrencyMismatch,
+        )));
+    }
+    if current.currency().scale() != amount.currency().scale() {
+        return Err(CapApplyError::Repo(RepoError::Money(
+            bss_ledger_sdk::MoneyError::ScaleMismatch,
+        )));
+    }
+    Ok(current.amount() < amount.amount())
+}
+
+/// The `unknown_final` park-clearing plan, sized at `open` — the stage-1 row's
+/// still-open `REFUND_CLEARING` amount (Z5-4), never the disposition request's
+/// amount: DR REFUND_CLEARING (drain the open balance) · CR SUSPENSE (park the
+/// amount pending reconciliation). Balanced (one DR == one CR), and the DR on the
+/// GUARDED REFUND_CLEARING returns its balance toward zero — the mirror of the
+/// stage-1 `CR REFUND_CLEARING`. Both legs are stream-less (matches the
+/// never-stream refund classes). NOT a loss/gain — `unknown_final` means the
+/// outcome is unknown, so the amount holds on SUSPENSE until a terminal
+/// disposition resolves it (Slice 7). The clearing is drained off the live
+/// account (parked to SUSPENSE) — SETTLED on the `refund` row, not a fresh
+/// PENDING; the terminal loss/release attribution is a later governed step.
+fn unknown_final_park_plan(open: &PostedMoney) -> RefundLegPlan {
+    RefundLegPlan {
+        legs: vec![
+            PlannedLeg {
+                account_class: AccountClass::RefundClearing,
+                side: Side::Debit,
+                amount: open.clone(),
+                revenue_stream: None,
+            },
+            PlannedLeg {
+                account_class: UNKNOWN_FINAL_PARK_CLASS,
+                side: Side::Credit,
+                amount: open.clone(),
+                revenue_stream: None,
+            },
+        ],
+        clearing_state: CLEARING_STATE_SETTLED,
     }
 }
 

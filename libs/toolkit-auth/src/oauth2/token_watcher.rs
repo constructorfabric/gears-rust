@@ -86,10 +86,12 @@ impl CachedToken {
         })
     }
 
+    /// Returns the current access token as a string slice (exposes the secret).
     pub(crate) fn access_token(&self) -> &str {
         self.access_token.expose()
     }
 
+    /// Classifies the cached token as fresh, stale or expired based on elapsed time since it was received.
     pub(crate) fn token_status(&self) -> TokenStatus {
         let elapsed = self.received_at.elapsed();
         if elapsed >= self.expires_at {
@@ -161,7 +163,9 @@ impl WatcherConfig {
 /// Result of a single token fetch — the source returns this.
 #[derive(Debug)]
 pub struct FetchedToken {
+    /// The bearer access token returned by the token endpoint.
     pub access_token: SecretString,
+    /// Token lifetime in seconds as reported by the token endpoint; must be greater than zero.
     pub lifetime_secs: u64,
     /// Freshness ratio (0.0–1.0): fraction of lifetime during which the token
     /// is considered "fresh". After this fraction, it becomes "stale" and the

@@ -1,0 +1,38 @@
+{
+  "golden": "price_keep_for_bound",
+  "proves": "D-422: the predecessor of a `new` price, kept for the subscriptions bound to it, is served with its original money",
+  "exchanges": [
+    {
+      "case": "12, kept for bound subscriptions",
+      "caller": "the tenant",
+      "request": "GET /bss-pricing/v1/prices/<price:12>",
+      "status": 200,
+      "body": {
+        "price_id": "<price:12>",
+        "price_book_entry_id": "<entry:pro>",
+        "sku_id": "<sku:pro>",
+        "charge_kind": "recurring",
+        "period": "month",
+        "book_id": "<book:eur>",
+        "currency": "EUR",
+        "version_no": 2,
+        "dim_value": null,
+        "model": "flat",
+        "price": {
+          "amount": "12.00"
+        },
+        "min_fee": null,
+        "eligibility": "all",
+        "effective_from": "2026-11-01",
+        "effective_to": "2026-12-01",
+        "temporary_until": null,
+        "keep_for_bound": true,
+        "closed_explicitly": false,
+        "paired_price_id": null,
+        "return_of_price_id": null,
+        "approved_by_unit_id": "<unit:prices-3>",
+        "approved_at": "2026-09-05T09:00:00Z"
+      }
+    }
+  ]
+}

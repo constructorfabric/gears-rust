@@ -1,0 +1,7 @@
+[gear]
+name = "Service Discovery"
+description = "Service discovery and gear directory for the runtime: instance registration, tracking, and resolution."
+category = "core-functionality"
+is_plugin = false
+has_plugins = false
+has_extension_point = false

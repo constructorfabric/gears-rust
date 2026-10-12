@@ -2,16 +2,13 @@
 """File classification for toolkit-pr-review.
 
 Decides what each changed file is: reviewable Rust, a dependency manifest, or out of
-scope; whether it is ToolKit-owned; and which module it groups with for sharding.
+scope; and which module it groups with for sharding.
 
-Classification reads the file content **as snapshotted from a commit**, never from the
-working tree. The prose this replaces sanctioned reading the checkout, which meant a
-file the PR adds does not exist locally, classifies as not-ToolKit, and weighs zero.
+Classification works from the path alone.
 """
 
 from __future__ import annotations
 
-import re
 
 # The complete set of non-.rs files this review looks at. Anything else in the diff is
 # out of scope: there are no rules for YAML, SQL, proto or Dockerfiles, so routing them
@@ -30,17 +27,6 @@ MANIFEST_NAMES = frozenset({
 # content is never snapshotted: it is generated, routinely over 300 KB, and everything
 # the rule needs from it is visible in the diff.
 NEVER_SNAPSHOT = frozenset({"Cargo.lock"})
-
-TOOLKIT_SYMBOLS = re.compile(
-    r"\buse\s+toolkit_|\b(?:OperationBuilder|SecureConn|SecureORM|ClientHub|GearLifecycle)\b"
-)
-TOOLKIT_PATHS = (
-    re.compile(r"^gears/[^/]+/.*/src/"),
-    re.compile(r"^gears/[^/]+/src/"),
-    re.compile(r"^crates/toolkit-[^/]+/"),
-    re.compile(r"^libs/toolkit[^/]*/"),
-    re.compile(r"^examples/toolkit/"),
-)
 
 
 def basename(path: str) -> str:
@@ -78,19 +64,6 @@ def group_key(path: str) -> str:
     """
     parts = path.split("/")
     return "/".join(parts[:2]) if len(parts) >= 3 else parts[0]
-
-
-def toolkit_owned(path: str, content: str | None) -> bool:
-    """True when the ToolKit framework rules apply to this file.
-
-    Path conventions first, then source symbols. `content` is the snapshot taken from a
-    commit, or None when the file has none (Cargo.lock, or a read that failed).
-    """
-    if not is_rust(path):
-        return False
-    if any(p.search(path) for p in TOOLKIT_PATHS):
-        return True
-    return bool(content and TOOLKIT_SYMBOLS.search(content))
 
 
 def test_sibling_source(path: str) -> str | None:

@@ -29,7 +29,6 @@ use std::sync::Arc;
 use bss_ledger::domain::instant::format_rfc3339;
 use bss_ledger::domain::instant::to_naive_date;
 use bss_ledger::domain::model::{AccountRow, CurrencyScaleRow, NewEntry, NewLine};
-use bss_ledger::domain::money::DEFAULT_PLAUSIBLE_MAX_MAJOR;
 use bss_ledger::domain::payment::precedence::DEFAULT_PRECEDENCE_POLICY;
 use bss_ledger::domain::payment::settlement::SettlementInput;
 use bss_ledger::domain::ports::metrics::NoopLedgerMetrics;
@@ -41,8 +40,11 @@ use bss_ledger::infra::payment::settle::SettlementService;
 use bss_ledger::infra::posting::service::PostingService;
 use bss_ledger::infra::storage::migrations::Migrator;
 use bss_ledger::infra::storage::repo::ReferenceRepo;
-use bss_ledger_sdk::{AccountClass, MappingStatus, Side, SourceDocType};
+use bss_ledger_sdk::{
+    AccountClass, CurrencySpec, MappingStatus, PostedMoney, Side, SourceDocType, canonical_decimal,
+};
 use chrono::NaiveDate;
+use rust_decimal::Decimal;
 use sea_orm::{ConnectionTrait, Database, Statement};
 use sea_orm_migration::MigratorTrait;
 use testcontainers_modules::postgres::Postgres;
@@ -55,6 +57,21 @@ use uuid::Uuid;
 
 fn pg(sql: impl Into<String>) -> Statement {
     Statement::from_string(sea_orm::DatabaseBackend::Postgres, sql.into())
+}
+
+/// The USD@2 currency spec every fixture here posts in.
+fn usd_spec() -> CurrencySpec {
+    CurrencySpec::try_new("USD".to_owned(), 2).unwrap()
+}
+
+/// A USD scale-2 posting from a cent count (`1234` ⇒ `12.34`).
+fn usd(cents: i64) -> PostedMoney {
+    PostedMoney::try_new(Decimal::new(cents, 2), usd_spec()).unwrap()
+}
+
+/// The canonical stored text of a USD cent count (`970` ⇒ `"9.7"`).
+fn text(cents: i64) -> String {
+    canonical_decimal(Decimal::new(cents, 2))
 }
 
 /// Boot a container, run the chain on a raw connection, and return a
@@ -121,8 +138,7 @@ async fn setup_seller(raw: &sea_orm::DatabaseConnection, provider: &DBProvider<D
         .upsert_currency_scale(CurrencyScaleRow {
             tenant_id: s.tenant,
             currency: "USD".to_owned(),
-            minor_units: 2,
-            plausible_max_major: DEFAULT_PLAUSIBLE_MAX_MAJOR,
+            currency_scale: 2,
             source: "iso".to_owned(),
         })
         .await
@@ -189,9 +205,9 @@ fn settlement_input(s: &Seller, payment_id: &str, gross: i64, fee: i64) -> Settl
         tenant_id: s.tenant,
         payer_tenant_id: s.payer,
         payment_id: payment_id.to_owned(),
-        gross_minor: gross,
-        fee_minor: fee,
-        currency: "USD".to_owned(),
+        gross: usd(gross),
+
+        fee: usd(fee),
         effective_at: None,
     }
 }
@@ -221,15 +237,15 @@ async fn ar_invoice_balance(
     raw: &sea_orm::DatabaseConnection,
     s: &Seller,
     invoice_id: &str,
-) -> Option<i64> {
+) -> Option<String> {
     raw.query_one_raw(pg(format!(
-        "SELECT balance_minor FROM bss.ledger_ar_invoice_balance \
+        "SELECT balance FROM bss.ledger_ar_invoice_balance \
          WHERE tenant_id='{}' AND invoice_id='{}'",
         s.tenant, invoice_id
     )))
     .await
     .unwrap()
-    .map(|r| r.try_get_by_index::<i64>(0).unwrap())
+    .map(|r| r.try_get_by_index::<String>(0).unwrap())
 }
 
 /// The distinct `precedence_policy_ref`s stamped on `(tenant, payment_id)`'s
@@ -300,15 +316,12 @@ fn ar_line(s: &Seller, invoice_id: &str, amount: i64) -> NewLine {
         account_class: AccountClass::Ar,
         gl_code: None,
         side: Side::Debit,
-        amount_minor: amount,
-        currency: "USD".to_owned(),
-        currency_scale: 2,
+        money: usd(amount),
         invoice_id: Some(invoice_id.to_owned()),
         due_date: Some(NaiveDate::from_ymd_opt(2026, 12, 1).unwrap()),
         revenue_stream: None,
         mapping_status: MappingStatus::Resolved,
-        functional_amount_minor: None,
-        functional_currency: None,
+        functional_money: None,
         tax_jurisdiction: None,
         tax_filing_period: None,
         tax_rate_ref: None,
@@ -333,15 +346,12 @@ fn psp_credit_line(s: &Seller, amount: i64) -> NewLine {
         account_class: AccountClass::PspFeeExpense,
         gl_code: None,
         side: Side::Credit,
-        amount_minor: amount,
-        currency: "USD".to_owned(),
-        currency_scale: 2,
+        money: usd(amount),
         invoice_id: None,
         due_date: None,
         revenue_stream: None,
         mapping_status: MappingStatus::Resolved,
-        functional_amount_minor: None,
-        functional_currency: None,
+        functional_money: None,
         tax_jurisdiction: None,
         tax_filing_period: None,
         tax_rate_ref: None,
@@ -395,8 +405,7 @@ fn allocate_request(s: &Seller, payment_id: &str) -> AllocateRequest {
         payer_tenant_id: s.payer,
         payment_id: payment_id.to_owned(),
         allocation_id: Uuid::now_v7(),
-        lump_minor: 500,
-        currency: "USD".to_owned(),
+        lump: usd(500),
         hint_invoice_id: None,
         caller_splits: None,
     }
@@ -432,18 +441,18 @@ async fn effective_policy_steers_split_and_stamps_real_ref() {
     );
 
     // Highest-amount-first: INV-B (800 open) fills the whole 500; INV-A gets 0.
-    let splits: Vec<(String, i64)> = outcome
+    let splits: Vec<(String, PostedMoney)> = outcome
         .splits
         .iter()
-        .map(|a| (a.invoice_id.clone(), a.amount_minor))
+        .map(|a| (a.invoice_id.clone(), a.amount.clone()))
         .collect();
     assert_eq!(
         splits,
-        vec![("INV-B".to_owned(), 500)],
+        vec![("INV-B".to_owned(), usd(500))],
         "highest-amount-first pays the largest open balance (INV-B) first"
     );
-    assert_eq!(ar_invoice_balance(&raw, &s, "INV-B").await, Some(300));
-    assert_eq!(ar_invoice_balance(&raw, &s, "INV-A").await, Some(300));
+    assert_eq!(ar_invoice_balance(&raw, &s, "INV-B").await, Some(text(300)));
+    assert_eq!(ar_invoice_balance(&raw, &s, "INV-A").await, Some(text(300)));
 
     // The REAL effective ref (strategy#version) is stamped on the rows.
     assert_eq!(
@@ -474,18 +483,21 @@ async fn no_policy_row_defaults_to_oldest_first_and_default_ref() {
     );
 
     // Oldest-first: INV-A (300) fills, INV-B takes the remaining 200.
-    let splits: Vec<(String, i64)> = outcome
+    let splits: Vec<(String, PostedMoney)> = outcome
         .splits
         .iter()
-        .map(|a| (a.invoice_id.clone(), a.amount_minor))
+        .map(|a| (a.invoice_id.clone(), a.amount.clone()))
         .collect();
     assert_eq!(
         splits,
-        vec![("INV-A".to_owned(), 300), ("INV-B".to_owned(), 200)],
+        vec![
+            ("INV-A".to_owned(), usd(300)),
+            ("INV-B".to_owned(), usd(200))
+        ],
         "no policy ⇒ oldest-first fills INV-A then INV-B"
     );
-    assert_eq!(ar_invoice_balance(&raw, &s, "INV-A").await, Some(0));
-    assert_eq!(ar_invoice_balance(&raw, &s, "INV-B").await, Some(600));
+    assert_eq!(ar_invoice_balance(&raw, &s, "INV-A").await, Some(text(0)));
+    assert_eq!(ar_invoice_balance(&raw, &s, "INV-B").await, Some(text(600)));
 
     // The default ref is stamped verbatim (NOT a strategy#version form).
     assert_eq!(
@@ -545,14 +557,17 @@ async fn latest_effective_version_in_effect_is_chosen() {
 
     // v2 (oldest-first) is in effect ⇒ INV-A then INV-B; v3's future
     // highest-amount-first must NOT apply.
-    let splits: Vec<(String, i64)> = outcome
+    let splits: Vec<(String, PostedMoney)> = outcome
         .splits
         .iter()
-        .map(|a| (a.invoice_id.clone(), a.amount_minor))
+        .map(|a| (a.invoice_id.clone(), a.amount.clone()))
         .collect();
     assert_eq!(
         splits,
-        vec![("INV-A".to_owned(), 300), ("INV-B".to_owned(), 200)],
+        vec![
+            ("INV-A".to_owned(), usd(300)),
+            ("INV-B".to_owned(), usd(200))
+        ],
         "the latest effective-now version (v2 oldest-first) decides the split"
     );
     assert_eq!(

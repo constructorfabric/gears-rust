@@ -15,13 +15,8 @@ mod schema_dump;
 
 use schema_dump::{migrate_and_dump_sqlite, normalise_sql, tables_in};
 
-/// Every `pricing_` table the chain leaves standing.
-///
-/// A count, not a roster, and deliberately so: the roster's home is the golden dump frozen in
-/// Task 3, and two rosters would drift apart. What this number is for is to catch a dump that
-/// silently renders **fewer** objects than the schema has — a filter that is too eager reads as
-/// a passing determinism case, because an empty dump is perfectly deterministic.
-const PRICING_TABLES: usize = 41;
+/// Nineteen pricing tables plus coordination and toolkit delivery tables.
+const PRICING_TABLES: usize = 19;
 
 async fn migrated_dump() -> String {
     let conn = Database::connect("sqlite::memory:")
@@ -70,15 +65,41 @@ async fn the_dump_names_every_table_the_chain_creates() {
         pricing.len()
     );
 
-    // Named rather than counted, because these three are the ones the re-authoring will touch
-    // last and hardest: the two with the widest scatter across the current chain, and the one
-    // whose guard was added by `pricing_price_window`.
-    for required in ["pricing_plan", "pricing_price", "pricing_price_window"] {
-        assert!(
-            tables.iter().any(|name| name == required),
-            "the dump does not name {required}"
-        );
-    }
+    assert_eq!(
+        tables,
+        vec![
+            "bss_pricing_outbox_body".to_owned(),
+            "bss_pricing_outbox_dead_letters".to_owned(),
+            "bss_pricing_outbox_incoming".to_owned(),
+            "bss_pricing_outbox_outgoing".to_owned(),
+            "bss_pricing_outbox_partitions".to_owned(),
+            "bss_pricing_outbox_processor".to_owned(),
+            // The toolkit outbox's traced-batch table (main `0089c5398`).
+            "bss_pricing_outbox_trace".to_owned(),
+            "bss_pricing_outbox_vacuum_counter".to_owned(),
+            "coord_leases".to_owned(),
+            "event_broker_producer_registrations".to_owned(),
+            "pricing_acceptance".to_owned(),
+            "pricing_approval_decision".to_owned(),
+            "pricing_approval_policy".to_owned(),
+            "pricing_approval_unit".to_owned(),
+            "pricing_approval_unit_item".to_owned(),
+            "pricing_audit".to_owned(),
+            "pricing_commercial_command".to_owned(),
+            "pricing_dimension_key".to_owned(),
+            "pricing_hold".to_owned(),
+            "pricing_idempotency".to_owned(),
+            "pricing_plan".to_owned(),
+            "pricing_plan_item".to_owned(),
+            "pricing_plan_revision".to_owned(),
+            "pricing_price".to_owned(),
+            "pricing_price_book".to_owned(),
+            "pricing_price_book_entry".to_owned(),
+            "pricing_reference_op".to_owned(),
+            "pricing_settings".to_owned(),
+            "pricing_usage_rating_policy".to_owned()
+        ]
+    );
 
     // Every stanza carries its DDL, so a table rendered with no definition would be a hole the
     // comparison could not see through.
@@ -151,6 +172,11 @@ async fn the_chain_still_produces_the_frozen_schema() {
         "/tests/schema_golden/sqlite.txt"
     );
     let fresh = migrated_dump().await;
+
+    // Capture a candidate for DDL review before explicitly updating the frozen oracle.
+    if let Ok(path) = std::env::var("SCHEMA_REVIEW_PATH") {
+        std::fs::write(path, &fresh).expect("write schema review candidate");
+    }
 
     if std::env::var("UPDATE_SCHEMA_GOLDEN").is_ok() {
         let dir = std::path::Path::new(golden_path)

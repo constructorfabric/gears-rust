@@ -1,181 +1,86 @@
-"""Tests for turn lifecycle — cancelled/failed null message_id, terminal immutability."""
+"""Tests for turn lifecycle: running → terminal, and null assistant_message_id on
+content-less cancel/failure."""
 
-import time
 import uuid
 
 import httpx
 import pytest
 
-from .conftest import API_PREFIX, expect_done, parse_sse, stream_message
-from .mock_provider.responses import MockEvent, Scenario
+from .conftest import (
+    API_PREFIX,
+    expect_done,
+    list_messages,
+    open_stream,
+    poll_turn,
+    slow_scenario,
+    stream_message,
+)
+from .mock_provider.responses import Scenario
 
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def poll_turn_terminal(chat_id: str, request_id: str,
-                       timeout: float = 15.0) -> dict:
-    """Poll GET /turns/{request_id} until the turn reaches a terminal state."""
-    deadline = time.monotonic() + timeout
-    body = None
-    while time.monotonic() < deadline:
-        resp = httpx.get(
-            f"{API_PREFIX}/chats/{chat_id}/turns/{request_id}", timeout=5
-        )
-        if resp.status_code == 200:
-            body = resp.json()
-            if body["state"] in ("done", "error", "cancelled"):
-                return body
-        time.sleep(0.3)
-    state = body["state"] if body else "no response"
-    raise AssertionError(
-        f"Turn {request_id} did not reach terminal state within {timeout}s "
-        f"(last state: {state})"
-    )
-
-
-# ---------------------------------------------------------------------------
-# Tests
-# ---------------------------------------------------------------------------
 
 class TestTurnLifecycle:
-    """Turn state transitions, null message_id cases, terminal immutability."""
+    """Terminal turn states and assistant_message_id."""
 
-    def test_cancelled_without_content_null_message_id(self, request, chat, mock_provider):
-        """Cancelling before any content is accumulated yields null assistant_message_id."""
+    @pytest.fixture(autouse=True)
+    def _offline_only(self, request):
         if request.config.getoption("mode") == "online":
             pytest.skip("requires mock provider (offline mode)")
+
+    @pytest.mark.timeout(30)
+    def test_cancelled_without_content_null_message_id(self, chat, mock_provider):
+        """Disconnect before the first delta: cancelled, no assistant_message_id, no message."""
         chat_id = chat["id"]
         request_id = str(uuid.uuid4())
+        scenario = slow_scenario(3, slow=0.5)
+        scenario.initial_delay = 3.0  # provider silent for 3 s after the headers
+        mock_provider.set_next_scenario(scenario)
 
-        # Very slow scenario — 5s between events guarantees disconnect arrives
-        # before any content delta. Only 3 events to keep total duration short.
-        many_deltas = [
-            MockEvent("response.output_text.delta", {"delta": f"chunk{i} "})
-            for i in range(3)
-        ]
-        many_deltas.append(
-            MockEvent("response.output_text.done", {"text": "done"})
-        )
-        mock_provider.set_next_scenario(Scenario(slow=5.0, events=many_deltas))
+        with open_stream(chat_id, "Write slowly.", request_id=request_id) as s:
+            s.read_until_started()
 
-        url = f"{API_PREFIX}/chats/{chat_id}/messages:stream"
-        body = {"content": "Write slowly.", "request_id": request_id}
-
-        # Open the SSE connection, then disconnect without reading any content.
-        # The 5s delay ensures the mock provider hasn't sent any delta yet.
-        with httpx.stream(
-            "POST", url, json=body,
-            headers={"Accept": "text/event-stream"},
-            timeout=30,
-        ) as resp:
-            assert resp.status_code == 200
-            # Don't read anything — disconnect immediately
-
-        # Poll until terminal
-        turn = poll_turn_terminal(chat_id, request_id)
+        turn = poll_turn(chat_id, request_id)
         assert turn["state"] == "cancelled"
+        assert turn.get("assistant_message_id") is None
+        assert [m["role"] for m in list_messages(chat_id)] == ["user"]
 
-        # No assistant message should exist for a content-less cancellation
-        msgs_resp = httpx.get(
-            f"{API_PREFIX}/chats/{chat_id}/messages", timeout=10
-        )
-        assert msgs_resp.status_code == 200
-        assistant_msgs = [
-            m for m in msgs_resp.json()["items"]
-            if m["role"] == "assistant" and m.get("request_id") == request_id
-        ]
-        assert len(assistant_msgs) == 0, (
-            f"Expected no assistant message for content-less cancel, "
-            f"got {len(assistant_msgs)}"
-        )
-
-    def test_failed_turn_null_message_id(self, request, chat, mock_provider):
-        """A turn that fails without producing content has null assistant_message_id."""
-        if request.config.getoption("mode") == "online":
-            pytest.skip("requires mock provider (offline mode)")
+    @pytest.mark.timeout(30)
+    def test_failed_turn_null_message_id(self, chat, mock_provider):
+        """A provider failure without content: error, no assistant_message_id, no message."""
         chat_id = chat["id"]
         request_id = str(uuid.uuid4())
-
-        # Fail immediately with no content events
         mock_provider.set_next_scenario(Scenario(
             terminal="failed",
             error={"code": "server_error", "message": "fail"},
             events=[],
         ))
 
-        url = f"{API_PREFIX}/chats/{chat_id}/messages:stream"
-        body = {"content": "Fail now.", "request_id": request_id}
-        resp = httpx.post(
-            url, json=body,
-            headers={"Accept": "text/event-stream"},
-            timeout=30,
-        )
-        # The stream completes (server sends error terminal in SSE)
-        assert resp.status_code == 200
+        status, events, _ = stream_message(chat_id, "Fail now.", request_id=request_id)
+        assert status == 200
+        # The stream ends with one `error` event, no `done`.
+        assert [e.event for e in events if e.event in ("error", "done")] == ["error"], events
+        assert events[-1].event == "error", [e.event for e in events]
+        assert (events[-1].data["code"], events[-1].data["message"]) == ("provider_error", "fail")
 
-        # Poll until terminal
-        turn = poll_turn_terminal(chat_id, request_id)
-        assert turn["state"] == "error"
+        turn = poll_turn(chat_id, request_id)
+        assert (turn["state"], turn["error_code"]) == ("error", "provider_error"), turn
+        assert turn.get("assistant_message_id") is None
+        assert [m["role"] for m in list_messages(chat_id)] == ["user"]
 
-        # No assistant message should exist for a no-content failure
-        msgs_resp = httpx.get(
-            f"{API_PREFIX}/chats/{chat_id}/messages", timeout=10
-        )
-        assert msgs_resp.status_code == 200
-        assistant_msgs = [
-            m for m in msgs_resp.json()["items"]
-            if m["role"] == "assistant" and m.get("request_id") == request_id
-        ]
-        assert len(assistant_msgs) == 0, (
-            f"Expected no assistant message for no-content failure, "
-            f"got {len(assistant_msgs)}"
-        )
-
-    def test_terminal_state_immutable_on_repeated_reads(self, chat):
-        """A completed turn stays in 'done' state on repeated queries (CAS invariant)."""
-        # TODO: Ideally this would verify the DB-level CAS by racing two
-        # finalization attempts, but that requires internal hooks. For now we
-        # verify the observable effect: a done turn remains done.
+    @pytest.mark.timeout(30)
+    def test_turn_running_then_done(self, chat, mock_provider):
+        """09-11: GET turn reports `running` while the stream is open and `done`
+        after it ended, with the assistant message announced in stream_started."""
         chat_id = chat["id"]
         rid = str(uuid.uuid4())
+        mock_provider.set_next_scenario(slow_scenario(5, slow=0.3))
 
-        status, events, _ = stream_message(chat_id, "Say OK.", request_id=rid)
-        assert status == 200
-        expect_done(events)
-
-        # Poll until DB commits the terminal state (SSE done can race the DB write)
-        turn = poll_turn_terminal(chat_id, rid)
-        assert turn["state"] == "done"
-
-        # Now verify repeated reads still return "done"
-        for _ in range(5):
-            resp = httpx.get(
-                f"{API_PREFIX}/chats/{chat_id}/turns/{rid}", timeout=5
-            )
+        with open_stream(chat_id, "Answer slowly.", request_id=rid) as s:
+            started = s.read_until_started()
+            resp = httpx.get(f"{API_PREFIX}/chats/{chat_id}/turns/{rid}", timeout=5)
             assert resp.status_code == 200
-            assert resp.json()["state"] == "done"
+            assert resp.json()["state"] == "running"
+            expect_done(s.drain())
 
-    def test_turn_state_machine_terminal_immutable(self, chat):
-        """A terminal turn state does not change over time."""
-        chat_id = chat["id"]
-        rid = str(uuid.uuid4())
-
-        status, events, _ = stream_message(chat_id, "Say OK.", request_id=rid)
-        assert status == 200
-        expect_done(events)
-
-        # Poll until DB commits the terminal state
-        turn = poll_turn_terminal(chat_id, rid)
+        turn = poll_turn(chat_id, rid)
         assert turn["state"] == "done"
-        state1 = turn["state"]
-
-        # Wait and verify state is unchanged
-        time.sleep(1.0)
-
-        resp2 = httpx.get(
-            f"{API_PREFIX}/chats/{chat_id}/turns/{rid}", timeout=5
-        )
-        assert resp2.status_code == 200
-        assert resp2.json()["state"] == state1
+        assert turn["assistant_message_id"] == started.data["message_id"]

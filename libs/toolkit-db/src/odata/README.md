@@ -80,6 +80,11 @@ async fn list_users(
 3. **Ergonomic API**: Fluent builder with sensible defaults
 4. **Type-safe**: Generic over entity and connection types
 5. **Performance**: Cursor-based pagination, limit+1 fetching, database-level filtering
+6. **Absence and text**: `eq null` / `ne null` compile to `IS NULL` / `IS NOT NULL` on the typed
+   path (`paginate_odata`) for a field whose `FilterField::nullable` answers `true` (opt-in; the
+   parser refuses `null` on any other field), and on the `FieldMap` path; `contains` /
+   `startswith` / `endswith` escape `%`, `_` and `\` and emit `LIKE … ESCAPE '\'` (`SQLite` has no
+   default escape character)
 
 ### Defaults
 

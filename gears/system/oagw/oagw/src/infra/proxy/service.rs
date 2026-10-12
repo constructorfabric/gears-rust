@@ -79,6 +79,7 @@ pub struct DataPlaneServiceImpl {
 }
 
 impl DataPlaneServiceImpl {
+    /// Create the data-plane service from its collaborators.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         cp: Arc<dyn ControlPlaneService>,

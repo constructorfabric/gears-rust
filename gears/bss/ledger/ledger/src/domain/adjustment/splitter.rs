@@ -12,12 +12,12 @@
 //! context rather than reading the DB.
 //!
 //! **The split rule (no silent pro-rata, design §4.2 / PRD L273).** The note's
-//! ex-tax amount is partitioned into a `recognized_part_minor` and a
-//! `deferred_part_minor` (`recognized + deferred == amount`). The `deferred_part`
+//! ex-tax amount is partitioned into a `recognized_part` and a
+//! `deferred_part` (`recognized + deferred == amount`). The `deferred_part`
 //! is the portion the caller's intent targets the unreleased deferred balance
-//! (`requested_deferred_minor`); the remainder is the recognized part. Each
+//! (`requested_deferred`); the remainder is the recognized part. Each
 //! stream's deferred reduction is bounded by that schedule's **remaining
-//! releasable** amount (`total_deferred_minor − recognized_minor`, never below 0)
+//! releasable** amount (`total_deferred − recognized`, never below 0)
 //! — already-released segments are never recomputed (Slice 4 §4.6) — so the
 //! deferred part can be placed onto a stream ONLY up to its releasable remainder.
 //!
@@ -41,6 +41,11 @@
 //! `CreditNoteSplitBlocked` alarm + an exception stub
 //! (`// exception stub (full exception_queue is Slice 7)`).
 
+use crate::domain::exact_money::{
+    ExactAmount, map_exact_error, matching_spec, subtract_posted, zero_posted,
+};
+use bss_ledger_sdk::money::PostedMoney;
+use rust_decimal::Decimal;
 use toolkit_macros::domain_model;
 
 use crate::domain::error::DomainError;
@@ -61,13 +66,13 @@ pub struct ScheduleStreamState {
     /// deterministic [`SplitResult::split_basis_ref`].
     pub schedule_id: String,
     /// The whole ex-tax amount this schedule deferred to `CONTRACT_LIABILITY`.
-    pub total_deferred_minor: i64,
+    pub total_deferred: PostedMoney,
     /// The cumulative amount already RELEASED to revenue (`<= total_deferred`).
-    /// The releasable remainder is `total_deferred_minor − recognized_minor`.
-    pub recognized_minor: i64,
+    /// The releasable remainder is `total_deferred − recognized`.
+    pub recognized: PostedMoney,
     /// The schedule lifecycle status (`ACTIVE` / `COMPLETED` / `REPLACED` /
     /// `CANCELLED`). Only an `ACTIVE` schedule has a reducible deferred remainder
-    /// (see [`Self::releasable_remaining_minor`]).
+    /// (see [`Self::releasable_remaining`]).
     pub status: String,
     /// The schedule's current lineage version at read time — stamped into
     /// [`SplitResult::split_basis_ref`] so the basis pins the exact schedule state
@@ -78,18 +83,40 @@ pub struct ScheduleStreamState {
 impl ScheduleStreamState {
     /// The deferred amount still releasable on this schedule — the cap on how much
     /// of the note's deferred part may reduce this stream (design §4.2): the
-    /// not-yet-released remainder `total_deferred_minor − recognized_minor`,
-    /// **floored at 0** (a drained/over-recognized snapshot never yields a negative
-    /// reducible). A non-`ACTIVE` schedule (COMPLETED/REPLACED/CANCELLED) has no
-    /// live releasable balance the split may reduce, so it returns 0.
-    #[must_use]
-    pub fn releasable_remaining_minor(&self) -> i64 {
-        if self.status != SCHEDULE_STATUS_ACTIVE {
-            return 0;
+    /// not-yet-released remainder `total_deferred − recognized`,
+    /// Invalid stored counter pairs are invariant failures. A valid non-`ACTIVE`
+    /// schedule (COMPLETED/REPLACED/CANCELLED) has no live reducible balance and
+    /// returns exact zero after validating its stored spec. Availability is an
+    /// intermediate; only an emitted reduction is narrowed to PostedMoney.
+    ///
+    /// # Errors
+    /// [`DomainError::CurrencyMismatch`] / [`DomainError::InconsistentScale`] when the stored
+    /// `total_deferred` and `recognized` disagree on currency metadata;
+    /// [`DomainError::Internal`] when either counter is negative or `recognized` exceeds
+    /// `total_deferred` (a stored-invariant failure); the exact-arithmetic [`DomainError`] when
+    /// the subtraction fails.
+    pub fn releasable_remaining(&self) -> Result<ExactAmount, DomainError> {
+        matching_spec(&self.total_deferred, &self.recognized)?;
+        if self.total_deferred.amount() < Decimal::ZERO
+            || self.recognized.amount() < Decimal::ZERO
+            || self.recognized.amount() > self.total_deferred.amount()
+        {
+            return Err(DomainError::Internal(format!(
+                "invalid stored schedule counters for schedule {} (stream {}, status {}): \
+                 total_deferred {}, recognized {}",
+                self.schedule_id,
+                self.revenue_stream,
+                self.status,
+                self.total_deferred,
+                self.recognized
+            )));
         }
-        self.total_deferred_minor
-            .saturating_sub(self.recognized_minor)
-            .max(0)
+        if self.status != SCHEDULE_STATUS_ACTIVE {
+            return Ok(ExactAmount::from_decimal(Decimal::ZERO));
+        }
+        ExactAmount::from_decimal(self.total_deferred.amount())
+            .checked_sub(&ExactAmount::from_decimal(self.recognized.amount()))
+            .map_err(map_exact_error)
     }
 }
 
@@ -98,11 +125,10 @@ impl ScheduleStreamState {
 /// balance (`CONTRACT_LIABILITY` + the schedule reduction). `recognized + deferred`
 /// is the note amount attributed to this stream. The handler builds the per-stream
 /// legs + the per-stream `recognition_schedule` reduction (negative Δ on
-/// `total_deferred_minor`) from these fields, keeping the SAME `revenue_stream`.
+/// `total_deferred`) from these fields, keeping the SAME `revenue_stream`.
 #[domain_model]
 #[derive(Clone, Debug, PartialEq, Eq)]
-// The `*_part_minor` fields mirror the `credit_note` column names verbatim (the
-// storage contract); renaming to satisfy `struct_field_names` would diverge.
+// Split-part names retain the repository/domain meaning.
 #[allow(clippy::struct_field_names)]
 pub struct StreamSplit {
     /// The stream this slice reduces (1:1 with the input [`ScheduleStreamState`]).
@@ -111,11 +137,11 @@ pub struct StreamSplit {
     pub schedule_id: String,
     /// Ex-tax amount of the note reducing this stream's **recognized** revenue
     /// (the `CONTRA_REVENUE` debit). `>= 0`.
-    pub recognized_part_minor: i64,
+    pub recognized_part: PostedMoney,
     /// Ex-tax amount of the note reducing this stream's **unreleased deferred**
     /// balance (the `CONTRACT_LIABILITY` debit + the schedule reduction). `>= 0`,
-    /// `<= releasable_remaining_minor` of the stream.
-    pub deferred_part_minor: i64,
+    /// `<= releasable_remaining` of the stream.
+    pub deferred_part: PostedMoney,
 }
 
 /// The result of splitting a credit/debit-note ex-tax amount across the targeted
@@ -126,17 +152,16 @@ pub struct StreamSplit {
 /// reductions; the splitter does not import the repo.
 #[domain_model]
 #[derive(Clone, Debug, PartialEq, Eq)]
-// The `*_part_minor` fields mirror the `credit_note` columns; `split_basis_ref`
-// mirrors the column name. Renaming to satisfy `struct_field_names` would diverge.
+// Split-part and basis names retain their repository/domain meaning.
 #[allow(clippy::struct_field_names)]
 pub struct SplitResult {
     /// Total ex-tax amount reducing already-recognized revenue (`Σ per-stream
     /// recognized_part`; the obligation-wide `CONTRA_REVENUE` debit).
-    pub recognized_part_minor: i64,
+    pub recognized_part: PostedMoney,
     /// Total ex-tax amount reducing the unreleased deferred balance (`Σ per-stream
     /// deferred_part`; the obligation-wide `CONTRACT_LIABILITY` debit, and the sum
     /// of the per-stream schedule reductions).
-    pub deferred_part_minor: i64,
+    pub deferred_part: PostedMoney,
     /// The per-stream breakdown (one entry per supplied [`ScheduleStreamState`], in
     /// input order). Each carries its own `revenue_stream` + `schedule_id` so the
     /// handler reduces the right schedule on the right stream (§4.5).
@@ -176,16 +201,16 @@ pub struct SplitInput<'a> {
     /// line has no recognition schedule (a fully point-in-time line) — then the
     /// whole amount is recognized and a deferred request blocks.
     pub streams: &'a [ScheduleStreamState],
-    /// The note's ex-tax amount to split, in minor units (`>= 0`). The
-    /// `credit_note.amount_minor` is incl-tax; the caller passes the ex-tax revenue
+    /// The note's ex-tax amount to split, in major units (`>= 0`). The
+    /// `credit_note.amount` is incl-tax; the caller passes the ex-tax revenue
     /// portion here (tax is reversed on its own `TAX_PAYABLE` leg, §4.2).
-    pub amount_minor_ex_tax: i64,
-    /// How much of `amount_minor_ex_tax` the note's intent reduces the **unreleased
-    /// deferred** balance (`0 <= requested_deferred_minor <=
-    /// amount_minor_ex_tax`). The remainder reduces recognized revenue. A request
+    pub amount_ex_tax: PostedMoney,
+    /// How much of `amount_ex_tax` the note's intent reduces the **unreleased
+    /// deferred** balance (`0 <= requested_deferred <=
+    /// amount_ex_tax`). The remainder reduces recognized revenue. A request
     /// over the summed releasable remainder, or one that cannot be placed onto the
     /// streams unambiguously, is a block (no pro-rata).
-    pub requested_deferred_minor: i64,
+    pub requested_deferred: PostedMoney,
 }
 
 impl RecognizedDeferredSplitter {
@@ -216,23 +241,30 @@ impl RecognizedDeferredSplitter {
     /// the block-on-ambiguous safety net; the handler maps it to the RFC 9457
     /// `CREDIT_NOTE_SPLIT_AMBIGUOUS` 400 + the `CreditNoteSplitBlocked` alarm).
     pub fn split(input: &SplitInput<'_>) -> Result<SplitResult, DomainError> {
+        matching_spec(&input.amount_ex_tax, &input.requested_deferred)?;
+        for stream in input.streams {
+            matching_spec(&input.amount_ex_tax, &stream.total_deferred)?;
+            matching_spec(&input.amount_ex_tax, &stream.recognized)?;
+            stream.releasable_remaining()?;
+        }
         // 1. Shape validation.
-        if input.amount_minor_ex_tax < 0 {
+        if input.amount_ex_tax.amount() < Decimal::ZERO {
             return Err(DomainError::AmountOutOfRange(format!(
                 "credit/debit-note ex-tax split amount must be >= 0, got {}",
-                input.amount_minor_ex_tax
+                input.amount_ex_tax.amount()
             )));
         }
-        if input.requested_deferred_minor < 0 {
+        if input.requested_deferred.amount() < Decimal::ZERO {
             return Err(DomainError::AmountOutOfRange(format!(
                 "requested deferred part must be >= 0, got {}",
-                input.requested_deferred_minor
+                input.requested_deferred.amount()
             )));
         }
-        if input.requested_deferred_minor > input.amount_minor_ex_tax {
+        if input.requested_deferred.amount() > input.amount_ex_tax.amount() {
             return Err(DomainError::AmountOutOfRange(format!(
                 "requested deferred part {} exceeds the ex-tax split amount {}",
-                input.requested_deferred_minor, input.amount_minor_ex_tax
+                input.requested_deferred.amount(),
+                input.amount_ex_tax.amount()
             )));
         }
 
@@ -251,38 +283,50 @@ impl RecognizedDeferredSplitter {
             }
         }
 
-        let requested_deferred = input.requested_deferred_minor;
-        let recognized_total = input.amount_minor_ex_tax - requested_deferred;
+        let requested_deferred = input.requested_deferred.clone();
+        let recognized_total = subtract_posted(&input.amount_ex_tax, &requested_deferred)?;
 
         // 3. No-schedule gate — a deferred request needs a schedule to reduce.
         if input.streams.is_empty() {
-            if requested_deferred > 0 {
+            if requested_deferred.amount() > Decimal::ZERO {
                 return Err(DomainError::CreditNoteSplitAmbiguous(format!(
                     "note for item `{}` requests a deferred part of {} but the line has no \
                      recognition-schedule state to reduce",
-                    input.source_invoice_item_ref, requested_deferred
+                    input.source_invoice_item_ref,
+                    requested_deferred.amount()
                 )));
             }
             // Wholly recognized, no streams (a fully point-in-time line). The whole
             // amount is the recognized part; no per-stream deferred reduction.
             return Ok(SplitResult {
-                recognized_part_minor: recognized_total,
-                deferred_part_minor: 0,
+                recognized_part: recognized_total,
+                deferred_part: zero_posted(&input.amount_ex_tax)?,
                 per_stream: Vec::new(),
-                split_basis_ref: build_split_basis_ref(input),
+                split_basis_ref: build_split_basis_ref(input)?,
             });
         }
 
         // 4. Releasable cap — the requested deferred must fit the summed releasable
         //    remainder across the streams (no over-reduction of in-flight schedules;
-        //    Slice 4's recognized_minor <= total_deferred CHECK is the authoritative
+        //    Slice 4's recognized <= total_deferred CHECK is the authoritative
         //    durable guard, this is the up-front domain block).
-        let total_releasable: i64 = input
+        let remainders = input
             .streams
             .iter()
-            .map(ScheduleStreamState::releasable_remaining_minor)
-            .sum();
-        if requested_deferred > total_releasable {
+            .map(ScheduleStreamState::releasable_remaining)
+            .collect::<Result<Vec<_>, _>>()?;
+        // Total availability is an exact intermediate; it may exceed any one posted amount.
+        let mut total_releasable = ExactAmount::from_decimal(Decimal::ZERO);
+        for remaining in &remainders {
+            total_releasable = total_releasable
+                .checked_add(remaining)
+                .map_err(map_exact_error)?;
+        }
+        if total_releasable
+            .checked_sub(&ExactAmount::from_decimal(requested_deferred.amount()))
+            .map_err(map_exact_error)?
+            .is_negative()
+        {
             return Err(DomainError::CreditNoteSplitAmbiguous(format!(
                 "requested deferred part {requested_deferred} exceeds the summed releasable \
                  remainder {total_releasable} across {} stream(s) for item `{}`",
@@ -292,7 +336,8 @@ impl RecognizedDeferredSplitter {
         }
 
         // 5. Per-stream placement of the deferred part (deterministic, no pro-rata).
-        let deferred_by_stream = place_deferred(input, requested_deferred, total_releasable)?;
+        let deferred_by_stream =
+            place_deferred(input, &requested_deferred, &total_releasable, &remainders)?;
 
         // The recognized part is placed onto the SAME streams (each stream's note
         // attribution is recognized + deferred). With the deferred part pinned per
@@ -301,7 +346,7 @@ impl RecognizedDeferredSplitter {
         // multi-stream note (which only reaches here with the deferred placement
         // determinate) carries the recognized remainder on the stream that took the
         // deferred part, else the sole stream. See place_recognized.
-        let recognized_by_stream = place_recognized(input, recognized_total, &deferred_by_stream)?;
+        let recognized_by_stream = place_recognized(input, &recognized_total, &deferred_by_stream)?;
 
         let per_stream: Vec<StreamSplit> = input
             .streams
@@ -310,16 +355,16 @@ impl RecognizedDeferredSplitter {
             .map(|(i, s)| StreamSplit {
                 revenue_stream: s.revenue_stream.clone(),
                 schedule_id: s.schedule_id.clone(),
-                recognized_part_minor: recognized_by_stream[i],
-                deferred_part_minor: deferred_by_stream[i],
+                recognized_part: recognized_by_stream[i].clone(),
+                deferred_part: deferred_by_stream[i].clone(),
             })
             .collect();
 
         Ok(SplitResult {
-            recognized_part_minor: recognized_total,
-            deferred_part_minor: requested_deferred,
+            recognized_part: recognized_total,
+            deferred_part: requested_deferred,
             per_stream,
-            split_basis_ref: build_split_basis_ref(input),
+            split_basis_ref: build_split_basis_ref(input)?,
         })
     }
 }
@@ -329,7 +374,7 @@ impl RecognizedDeferredSplitter {
 /// deferred amounts, or [`DomainError::CreditNoteSplitAmbiguous`] when no
 /// unambiguous placement exists. Resolvable cases:
 ///
-/// - `requested_deferred == 0` ⇒ all zero (wholly recognized).
+/// - `requested_deferred.amount() == Decimal::ZERO` ⇒ all zero (wholly recognized).
 /// - exactly ONE stream has a releasable remainder ⇒ the whole deferred part lands
 ///   on it (the others take 0).
 /// - `requested_deferred == total_releasable` ⇒ DRAIN every stream to its releasable
@@ -339,22 +384,22 @@ impl RecognizedDeferredSplitter {
 /// block.
 fn place_deferred(
     input: &SplitInput<'_>,
-    requested_deferred: i64,
-    total_releasable: i64,
-) -> Result<Vec<i64>, DomainError> {
+    requested_deferred: &PostedMoney,
+    total_releasable: &ExactAmount,
+    remainders: &[ExactAmount],
+) -> Result<Vec<PostedMoney>, DomainError> {
     let n = input.streams.len();
-    let mut deferred = vec![0_i64; n];
+    let mut deferred = vec![zero_posted(&input.amount_ex_tax)?; n];
 
-    if requested_deferred == 0 {
+    if requested_deferred.amount() == Decimal::ZERO {
         return Ok(deferred);
     }
 
     // Indices of streams that can absorb a deferred reduction.
-    let releasable_idx: Vec<usize> = input
-        .streams
+    let releasable_idx: Vec<usize> = remainders
         .iter()
         .enumerate()
-        .filter(|(_, s)| s.releasable_remaining_minor() > 0)
+        .filter(|(_, r)| **r != ExactAmount::from_decimal(Decimal::ZERO))
         .map(|(i, _)| i)
         .collect();
 
@@ -362,16 +407,19 @@ fn place_deferred(
     // (the cap gate already guaranteed requested_deferred <= total_releasable, i.e.
     // <= this stream's remainder).
     if releasable_idx.len() == 1 {
-        deferred[releasable_idx[0]] = requested_deferred;
+        deferred[releasable_idx[0]] = requested_deferred.clone();
         return Ok(deferred);
     }
 
     // Multiple releasable streams: the ONLY unambiguous multi-stream placement is a
     // full drain (request == total releasable). A partial request would have to
     // proportion across streams — the forbidden pro-rata.
-    if requested_deferred == total_releasable {
+    if &ExactAmount::from_decimal(requested_deferred.amount()) == total_releasable {
         for &i in &releasable_idx {
-            deferred[i] = input.streams[i].releasable_remaining_minor();
+            deferred[i] = remainders[i]
+                .clone()
+                .into_posted_exact(input.amount_ex_tax.currency().clone())
+                .map_err(map_exact_error)?;
         }
         return Ok(deferred);
     }
@@ -390,7 +438,7 @@ fn place_deferred(
 /// recognized remainder must land unambiguously too:
 ///
 /// - single stream ⇒ the whole recognized part lands on it.
-/// - `recognized_total == 0` ⇒ all zero.
+/// - `recognized_total.amount() == Decimal::ZERO` ⇒ all zero.
 /// - multi-stream ⇒ the recognized remainder lands on the SINGLE stream that took
 ///   the deferred part (the unambiguous "this stream is the one being reduced"
 ///   case). If the deferred placement spanned multiple streams (a full drain) AND a
@@ -398,17 +446,17 @@ fn place_deferred(
 ///   per-stream attribution for the recognized part ⇒ block.
 fn place_recognized(
     input: &SplitInput<'_>,
-    recognized_total: i64,
-    deferred_by_stream: &[i64],
-) -> Result<Vec<i64>, DomainError> {
+    recognized_total: &PostedMoney,
+    deferred_by_stream: &[PostedMoney],
+) -> Result<Vec<PostedMoney>, DomainError> {
     let n = input.streams.len();
-    let mut recognized = vec![0_i64; n];
+    let mut recognized = vec![zero_posted(&input.amount_ex_tax)?; n];
 
-    if recognized_total == 0 {
+    if recognized_total.amount() == Decimal::ZERO {
         return Ok(recognized);
     }
     if n == 1 {
-        recognized[0] = recognized_total;
+        recognized[0] = recognized_total.clone();
         return Ok(recognized);
     }
 
@@ -416,9 +464,11 @@ fn place_recognized(
     // took the deferred reduction (the line being reduced). More than one stream
     // with a deferred part (a full drain) plus a recognized remainder cannot be
     // attributed without proportioning ⇒ block.
-    let deferred_streams: Vec<usize> = (0..n).filter(|&i| deferred_by_stream[i] > 0).collect();
+    let deferred_streams: Vec<usize> = (0..n)
+        .filter(|&i| deferred_by_stream[i].amount() > Decimal::ZERO)
+        .collect();
     if deferred_streams.len() == 1 {
-        recognized[deferred_streams[0]] = recognized_total;
+        recognized[deferred_streams[0]] = recognized_total.clone();
         return Ok(recognized);
     }
 
@@ -437,37 +487,45 @@ fn place_recognized(
 /// effective time. The same inputs always render the same string (audit / replay);
 /// streams are rendered in input order (the caller supplies them in a stable
 /// order). Format is intentionally compact + greppable, not a parsed contract.
-fn build_split_basis_ref(input: &SplitInput<'_>) -> String {
+fn build_split_basis_ref(input: &SplitInput<'_>) -> Result<String, DomainError> {
     let po = input.po_allocation_group.unwrap_or("-");
     if input.streams.is_empty() {
-        return format!(
+        return Ok(format!(
             "item={};po={};streams=none",
             input.source_invoice_item_ref, po
-        );
+        ));
     }
     let streams = input
         .streams
         .iter()
         .map(|s| {
-            format!(
-                "{}:{}@v{}:def={}:rec={}:rel={}:{}",
+            Ok(format!(
+                "{}:{}@v{}:def={}:rec={}:rel={}:{}:{}:{}",
                 s.revenue_stream,
                 s.schedule_id,
                 s.version,
-                s.total_deferred_minor,
-                s.recognized_minor,
-                s.releasable_remaining_minor(),
+                bss_ledger_sdk::money::canonical_decimal(s.total_deferred.amount()),
+                bss_ledger_sdk::money::canonical_decimal(s.recognized.amount()),
+                s.releasable_remaining()?
+                    .canonical_at_scale(s.total_deferred.currency().scale())
+                    .map_err(map_exact_error)?,
                 s.status,
-            )
+                s.total_deferred.currency().code(),
+                s.total_deferred.currency().scale(),
+            ))
         })
-        .collect::<Vec<_>>()
+        .collect::<Result<Vec<_>, DomainError>>()?
         .join(",");
-    format!(
+    Ok(format!(
         "item={};po={};streams=[{}]",
         input.source_invoice_item_ref, po, streams
-    )
+    ))
 }
 
 #[cfg(test)]
 #[path = "splitter_tests.rs"]
 mod splitter_tests;
+
+#[cfg(test)]
+#[path = "splitter_counter_tests.rs"]
+mod splitter_counter_tests;

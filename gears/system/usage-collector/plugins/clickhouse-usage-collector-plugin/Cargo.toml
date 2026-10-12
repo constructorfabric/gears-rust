@@ -1,0 +1,96 @@
+[package]
+name = "cf-gears-clickhouse-usage-collector-plugin"
+description = "ClickHouse Usage Collector storage backend plugin"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+keywords = ["constructorfabric", "cf-gears"]
+metadata.docs.rs.all-features = true
+
+[lib]
+name = "clickhouse_usage_collector_plugin"
+
+[lints]
+workspace = true
+
+[features]
+# Gates the ClickHouse-backed real-DB integration tests (Docker required).
+clickhouse = []
+
+[dependencies]
+usage-collector-sdk = { workspace = true }
+types-registry-sdk = { workspace = true }
+types-registry = { workspace = true }
+
+toolkit = { workspace = true }
+toolkit-macros = { workspace = true }
+toolkit-odata = { workspace = true }
+
+async-trait = { workspace = true }
+
+clickhouse = { workspace = true }
+url = { workspace = true }
+
+# HTTP transport for the `ClickHouse` client. Built here rather than taken from
+# `clickhouse::Client::default()` so the TLS stack uses the process-wide rustls
+# CryptoProvider instead of the crate's hardcoded non-FIPS `aws-lc-rs`
+# (see `infra::storage::pool::new_base_client`). `hyper-util` needs its
+# features spelled out -- the workspace entry is bare and `client-legacy` is
+# not a default; mirrors `libs/toolkit-http/Cargo.toml`, minus `http2` because
+# the stock `ClickHouse` connector is `enable_http1()` only.
+hyper-rustls = { workspace = true }
+hyper-util = { workspace = true, features = [
+  "client",
+  "client-legacy",
+  "http1",
+  "tokio",
+] }
+rustls = { workspace = true }
+# Decode percent-encoded userinfo from `database_url` before `with_user` /
+# `with_password` (Url::username/password return the encoded form).
+percent-encoding = { workspace = true }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_repr = { workspace = true }
+# `database_url` embeds credentials; `SecretString` gives a redacted `Debug`, no
+# `Display`/`Serialize`/`PartialEq`, and zeroize on drop. `toolkit` does not
+# re-export `secrecy`, so it is a direct dependency here.
+secrecy = { workspace = true }
+
+time = { workspace = true }
+rust_decimal = { workspace = true }
+bigdecimal = { workspace = true }
+chrono = { workspace = true }
+
+opentelemetry = { workspace = true }
+tracing = { workspace = true }
+
+anyhow = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+uuid = { workspace = true }
+
+# Required by the toolkit::gear macro
+inventory = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+uuid = { workspace = true }
+# Unconditional: [dev-dependencies] can't be optional; usage is #![cfg(feature="clickhouse")]-gated.
+testcontainers = { workspace = true }
+# The ClickHouse image tag comes from `test-containers`, never a local literal:
+# a literal pins the version in four places at once (two test modules here, the
+# integration harness, and the E2E sidecar) with nothing keeping them equal.
+# Enforced by `cargo xtask check-test-container-pins`. Kept alongside
+# `testcontainers` rather than replacing it -- `test_containers` deliberately
+# does not re-export the runner or `ImageExt`.
+test-containers = { workspace = true }
+# In-memory metric reader for the metrics-recording unit tests; the `testing`
+# feature gates `InMemoryMetricExporter`.
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
+# Non-human-readable serde for `ch_uuid` / `ch_decimal128_9` binary-path unit tests.
+postcard = { workspace = true }

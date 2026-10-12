@@ -79,8 +79,8 @@ id      = "docs-arch"
 pattern = "docs/arch/**/*.md"
 
 [[categories.buckets]]
-id      = "docs-checklists"
-pattern = "docs/checklists/**/*.md"
+id      = "kit-checklists"
+pattern = "studio-kit-gears/**/checklist.md"
 
 [[categories.buckets]]
 id      = "docs-toolkit-unified-system"
@@ -95,8 +95,12 @@ id      = "docs-security"
 pattern = "docs/security/**/*.md"
 
 [[categories.buckets]]
-id      = "docs-spec-templates"
-pattern = "docs/spec-templates/**/*.md"
+id      = "kit-artifacts"
+pattern = "studio-kit-gears/artifacts/**/*.md"
+
+[[categories.buckets]]
+id      = "kit-examples"
+pattern = "studio-kit-gears/examples/**/*.md"
 
 [[categories.buckets]]
 id      = "docs"

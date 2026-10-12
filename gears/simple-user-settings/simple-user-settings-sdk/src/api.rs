@@ -7,7 +7,9 @@ use async_trait::async_trait;
 use toolkit_canonical_errors::CanonicalError;
 use toolkit_security::SecurityContext;
 
-use crate::models::{SimpleUserSettings, SimpleUserSettingsPatch, SimpleUserSettingsUpdate};
+use crate::models::{
+    NamedSetting, SimpleUserSettings, SimpleUserSettingsPatch, SimpleUserSettingsUpdate,
+};
 
 /// Public API trait for the settings gear (Version 1).
 ///
@@ -46,4 +48,59 @@ pub trait SimpleUserSettingsClientV1: Send + Sync {
         ctx: &SecurityContext,
         patch: SimpleUserSettingsPatch,
     ) -> Result<SimpleUserSettings, CanonicalError>;
+}
+
+/// Named settings: any number of keyed JSON values per user, next to the fixed
+/// `theme` and `language` of [`SimpleUserSettingsClientV1`].
+///
+/// A separate trait rather than new methods on `SimpleUserSettingsClientV1`, so
+/// existing implementations of that trait keep compiling. The settings gear
+/// registers both in `ClientHub`:
+/// ```ignore
+/// let named = hub.get::<dyn NamedSettingsClientV1>()?;
+/// named.put_named_setting(&ctx, "portal.projects.view", json!("table")).await?;
+/// ```
+///
+/// Settings are filed under the caller's `(user, tenant)` and authorized as the
+/// same resource as the fixed fields: reads need `get`, writes and deletes need
+/// `update`.
+#[async_trait]
+pub trait NamedSettingsClientV1: Send + Sync {
+    /// Every named setting the caller has, ordered by key.
+    async fn list_named_settings(
+        &self,
+        ctx: &SecurityContext,
+    ) -> Result<Vec<NamedSetting>, CanonicalError>;
+
+    /// One named setting, or `None` if the caller has not set it.
+    async fn get_named_setting(
+        &self,
+        ctx: &SecurityContext,
+        key: &str,
+    ) -> Result<Option<NamedSetting>, CanonicalError>;
+
+    /// Create or replace one named setting.
+    ///
+    /// Fails with `InvalidArgument` for a malformed key or a value over the size
+    /// bound, and with `ResourceExhausted` (quota code `NAMED_SETTINGS_PER_USER`)
+    /// for a new key past the per-user count bound: free room by deleting one.
+    async fn put_named_setting(
+        &self,
+        ctx: &SecurityContext,
+        key: &str,
+        value: serde_json::Value,
+    ) -> Result<NamedSetting, CanonicalError>;
+
+    /// Forget one named setting. Returns whether it existed; deleting a key
+    /// that is not set is not an error.
+    async fn delete_named_setting(
+        &self,
+        ctx: &SecurityContext,
+        key: &str,
+    ) -> Result<bool, CanonicalError>;
+
+    /// Forget every named setting the caller has, in one call. Returns how many
+    /// were removed; with none set it removes nothing and is not an error.
+    async fn delete_all_named_settings(&self, ctx: &SecurityContext)
+    -> Result<u64, CanonicalError>;
 }

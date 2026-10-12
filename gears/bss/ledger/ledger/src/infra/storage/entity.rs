@@ -17,6 +17,7 @@ pub mod dispute;
 pub mod dual_control_approval;
 pub mod dual_control_comment;
 pub mod dual_control_policy;
+pub mod dual_control_policy_threshold;
 pub mod entry_annotation;
 pub mod exception_queue;
 pub mod fiscal_calendar;

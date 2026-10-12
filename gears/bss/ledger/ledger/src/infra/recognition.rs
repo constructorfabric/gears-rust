@@ -35,3 +35,5 @@ pub mod change_service;
 pub mod run_service;
 pub mod runner;
 pub mod sidecar;
+
+pub(crate) mod repo_errors;

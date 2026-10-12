@@ -152,6 +152,12 @@ fn failure_variant_constants_match_failure_variant_label() {
             },
             "sa_not_found",
         ),
+        (
+            PluginError::SaQuotaExceeded {
+                detail: String::new(),
+            },
+            "sa_quota_exceeded",
+        ),
     ];
     for (err, expected) in cases {
         assert_eq!(FailureVariant::from(err).as_str(), *expected);
@@ -208,6 +214,10 @@ fn failure_variant_constants_match_their_literal() {
         "sa_invalid_input"
     );
     assert_eq!(FailureVariant::SA_NOT_FOUND.as_str(), "sa_not_found");
+    assert_eq!(
+        FailureVariant::SA_QUOTA_EXCEEDED.as_str(),
+        "sa_quota_exceeded"
+    );
 }
 
 #[test]

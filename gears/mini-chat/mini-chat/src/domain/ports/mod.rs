@@ -100,6 +100,19 @@ pub struct AddFileToVectorStoreParams {
     pub attributes: HashMap<String, String>,
 }
 
+/// Indexing status of a file in a vector store
+/// (`vector_store.file.status`).
+#[domain_model]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VectorStoreFileStatus {
+    InProgress,
+    Completed,
+    /// `failed` or `cancelled`, with the provider's `last_error.message`.
+    Failed {
+        message: String,
+    },
+}
+
 // ── Traits ──────────────────────────────────────────────────────────────
 
 /// Port for file upload/delete operations against a storage provider.
@@ -132,13 +145,23 @@ pub trait VectorStoreProvider: Send + Sync {
         provider_id: &str,
     ) -> Result<String, FileStorageError>;
 
-    /// Add a file to an existing vector store.
+    /// Add a file to an existing vector store. Returns the indexing status
+    /// from the response; indexing usually continues after it returns.
     async fn add_file_to_vector_store(
         &self,
         ctx: SecurityContext,
         provider_id: &str,
         params: AddFileToVectorStoreParams,
-    ) -> Result<(), FileStorageError>;
+    ) -> Result<VectorStoreFileStatus, FileStorageError>;
+
+    /// Read the indexing status of a file in a vector store.
+    async fn get_vector_store_file_status(
+        &self,
+        ctx: SecurityContext,
+        provider_id: &str,
+        vector_store_id: &str,
+        provider_file_id: &str,
+    ) -> Result<VectorStoreFileStatus, FileStorageError>;
 
     /// Delete a vector store from the provider. Best-effort — 404 = success.
     async fn delete_vector_store(

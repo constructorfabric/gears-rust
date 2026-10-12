@@ -49,6 +49,7 @@ pub fn determine_retrieval_mode(
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 

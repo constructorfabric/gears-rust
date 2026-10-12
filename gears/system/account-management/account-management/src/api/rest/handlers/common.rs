@@ -51,6 +51,72 @@ pub(super) fn reject_non_odata_params(query: &HashMap<String, String>) -> Result
     Ok(())
 }
 
+/// Parse the `recursive` flag of `GET /tenants/{tenant_id}/children`.
+///
+/// Absent → `false`. Exactly the lowercase literals `true` / `false`
+/// are accepted; anything else is a `validation` error so a typo
+/// (`recursive=True`, `recursive=1`) never silently degrades to the
+/// non-recursive listing. Other keys are not inspected: the `OData`
+/// extractor owns the `$` namespace and `limit` / `cursor`, and
+/// `/children` has always ignored unrecognised non-`$` keys.
+pub(super) fn parse_recursive_flag(query: &HashMap<String, String>) -> Result<bool, DomainError> {
+    match query.get("recursive").map(String::as_str) {
+        None | Some("false") => Ok(false),
+        Some("true") => Ok(true),
+        Some(other) => Err(DomainError::Validation {
+            detail: format!(
+                "invalid `recursive` value `{other}`; expected exactly `true` or `false`"
+            ),
+        }),
+    }
+}
+
+/// Bind the cursor fingerprint of a `/children` request to its mode.
+///
+/// The keyset cursor carries `f` = the query's `filter_hash`, and
+/// pagination rejects a cursor whose `f` differs from the follow-up
+/// request's hash (`400 FILTER_MISMATCH`) — but only when both are
+/// present, and the extractor sets the hash only when `$filter` is.
+/// Both modes share the effective order `(created_at ASC, id ASC)`, so
+/// a cursor minted in one mode and replayed in the other would
+/// silently skip rows of the other set. Folding the mode into the hash
+/// turns that into the same `FILTER_MISMATCH` a changed `$filter`
+/// produces:
+///
+/// * recursive: `recursive:<filter hash or empty>`;
+/// * direct, with `$filter`: the unchanged filter hash, so direct-mode
+///   cursors minted before this change keep working;
+/// * direct, without `$filter`: the constant `children`.
+///
+/// A cursor that carries no fingerprint at all can only come from a
+/// direct listing minted before the binding existed. The pagination
+/// check skips a missing `f`, so in recursive mode such a cursor is
+/// rejected here instead; the direct listing keeps accepting it.
+///
+/// # Errors
+///
+/// `Validation` (`400`, `FILTER_MISMATCH`) for a fingerprint-less
+/// cursor replayed with `recursive=true`.
+pub(super) fn bind_cursor_to_children_mode(
+    mut query: ODataQuery,
+    recursive: bool,
+) -> Result<ODataQuery, DomainError> {
+    if recursive && query.cursor.as_ref().is_some_and(|c| c.f.is_none()) {
+        return Err(DomainError::Validation {
+            detail: "list_descendants query rejected: FILTER_MISMATCH (the cursor was \
+                     issued by a direct listing that predates mode binding)"
+                .to_owned(),
+        });
+    }
+    let filter_hash = query.filter_hash.take();
+    query.filter_hash = Some(match (recursive, filter_hash) {
+        (true, hash) => format!("recursive:{}", hash.as_deref().unwrap_or_default()),
+        (false, Some(hash)) => hash,
+        (false, None) => "children".to_owned(),
+    });
+    Ok(query)
+}
+
 #[cfg(test)]
 #[path = "common_tests.rs"]
 mod tests;

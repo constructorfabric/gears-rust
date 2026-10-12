@@ -3,7 +3,7 @@ use time::OffsetDateTime;
 use toolkit_db::secure::Scopable;
 use uuid::Uuid;
 
-/// Per DESIGN.md: "No independent #[secure] — accessed through parent chat."
+/// Per DESIGN.md: "No independent `#[secure]` — accessed through parent chat."
 /// We derive `Scopable` with `no_owner`/`no_type` so the entity can pass through
 /// the secure query pipeline with `AccessScope::allow_all()` for background workers.
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Scopable)]

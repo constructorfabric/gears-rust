@@ -24,9 +24,6 @@ pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
     pub version: i64,
     pub effective_from: OffsetDateTime,
-    /// D2 threshold in USD-equivalent minor units; validated `[10000 .. 100000000]`
-    /// (100 .. 1,000,000 USD at scale 2) — out-of-range config is rejected.
-    pub d2_threshold_minor: i64,
     /// A6 material-backdating window in business days; validated `[1 .. 30]`.
     pub a6_backdating_biz_days: i32,
     /// TTL applied to a fresh `PENDING`/`NEEDS_REWORK` record before it expires.

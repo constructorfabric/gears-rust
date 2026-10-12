@@ -7,19 +7,19 @@ use toolkit_security::SecurityContext;
 use tracing::{trace, warn};
 
 use futures_util::StreamExt;
+use gts::{GtsIdPattern, GtsInstanceId};
+use toolkit_gts::gts_id;
 
 #[cfg(feature = "db")]
 use super::commit::TxCommitHandleParts;
 use crate::api::{
-    AssignedPartition, EventBrokerApi, JoinRequest, ResolvedPosition, SubscriptionAssignment,
+    AssignedPartition, EventBrokerApi, JoinRequest, Position, SubscriptionAssignment,
 };
 use crate::api::{
     BarrierMode, ControlCode, Filter, PartitionPosition, SeekPosition,
     SubscriptionInterest as BrokerSubscriptionInterest, TenantTraversalDepth, WireEvent, WireFrame,
 };
-use crate::consumer::builder::{
-    event_type_ref_to_string, subscription_filter_ref_to_filter, topic_ref_to_string,
-};
+use crate::consumer::builder::subscription_filter_ref_to_filter;
 use crate::consumer::offset_manager::CommitOffset;
 #[cfg(feature = "db")]
 use crate::consumer::progress::processed_count_from_delivered_offset;
@@ -35,25 +35,33 @@ use crate::consumer::{
 use crate::consumer::{CommitOffsetInTx, TxCommitHandle, TxConsumerHandler};
 use crate::error::EventBrokerError;
 use crate::ids::{ConsumerGroupId, SubscriptionId, TopicId};
+use crate::sequence::Sequence;
 
 /// Per-partition in-memory cursor for the contiguous processed frontier.
 #[derive(Default)]
 pub(crate) struct PartitionCursor {
     frontier: Option<PartitionFrontier>,
-    committed: i64, // the last offset actually committed to CommitOffset
+    committed: Sequence, // the last offset actually committed to CommitOffset
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct TopicPartitionKey {
-    topic: String,
+    topic: GtsInstanceId,
     topic_id: TopicId,
     partition: u32,
 }
 
+/// How many times a pre-stream seek re-reads the subscription and re-seeks when
+/// the broker fences it with `TopologyVersionMismatch` (a concurrent rebalance
+/// bumped the group's topology between reading the assignment and seeking).
+/// Bounded so a rebalance storm surfaces to the caller's re-JOIN budget rather
+/// than looping forever.
+pub(super) const RESEEK_ON_TOPOLOGY_MISMATCH_ATTEMPTS: u32 = 5;
+
 impl TopicPartitionKey {
-    pub(crate) fn new(topic: impl Into<String>, topic_id: TopicId, partition: u32) -> Self {
+    pub(crate) fn new(topic: GtsInstanceId, topic_id: TopicId, partition: u32) -> Self {
         Self {
-            topic: topic.into(),
+            topic,
             topic_id,
             partition,
         }
@@ -85,7 +93,6 @@ impl PartitionEventBuffer {
                     "partition buffer capacity {} exceeded for topic '{}' partition {}",
                     self.capacity, event.topic, event.partition
                 ),
-                instance: String::new(),
             });
         }
         self.events.push_back(event);
@@ -120,15 +127,15 @@ pub(crate) struct SlowConsumerSignal {
     pub reason: SlowConsumerReason,
     pub buffered_count: usize,
     pub consecutive_slow_handlers: u16,
-    pub latest_observed_offset: Option<i64>,
-    pub last_delivered_offset: Option<i64>,
+    pub latest_observed_offset: Option<Sequence>,
+    pub last_delivered_offset: Option<Sequence>,
 }
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct PartitionSlowState {
     buffered_count: usize,
-    latest_observed_offset: Option<i64>,
-    last_delivered_offset: Option<i64>,
+    latest_observed_offset: Option<Sequence>,
+    last_delivered_offset: Option<Sequence>,
     consecutive_slow_handlers: u16,
     slow_detected: bool,
 }
@@ -156,7 +163,7 @@ impl PartitionSlowState {
     pub(crate) fn observe_enqueue(
         &mut self,
         buffered_count: usize,
-        latest_observed_offset: i64,
+        latest_observed_offset: Sequence,
         high_watermark: usize,
     ) -> Option<SlowConsumerSignal> {
         self.buffered_count = buffered_count;
@@ -173,7 +180,7 @@ impl PartitionSlowState {
         elapsed: Duration,
         handler_latency: Duration,
         handler_strikes: u16,
-        last_delivered_offset: i64,
+        last_delivered_offset: Sequence,
     ) -> Option<SlowConsumerSignal> {
         self.last_delivered_offset = Some(last_delivered_offset);
         if elapsed >= handler_latency {
@@ -269,7 +276,7 @@ pub(crate) async fn emit_runtime_event_to(
     }
 }
 
-fn partition_progress(key: &TopicPartitionKey, offset: i64) -> PartitionProgress {
+fn partition_progress(key: &TopicPartitionKey, offset: Sequence) -> PartitionProgress {
     PartitionProgress {
         topic_id: key.topic_id,
         topic: key.topic.clone(),
@@ -279,14 +286,14 @@ fn partition_progress(key: &TopicPartitionKey, offset: i64) -> PartitionProgress
 }
 
 impl PartitionCursor {
-    pub(crate) fn latest_offset(&self) -> i64 {
+    pub(crate) fn latest_offset(&self) -> Sequence {
         self.frontier
             .as_ref()
             .map(PartitionFrontier::committed)
             .unwrap_or(self.committed)
     }
 
-    pub(crate) fn advance_through_delivered_prefix(&mut self, events: &[RawEvent]) -> i64 {
+    pub(crate) fn advance_through_delivered_prefix(&mut self, events: &[RawEvent]) -> Sequence {
         let Some(last) = events.last() else {
             return self.latest_offset();
         };
@@ -309,12 +316,12 @@ where
     pub offset_manager: Arc<OM>,
     pub handler: Arc<H>,
     pub group_ref: ConsumerGroupRef,
-    pub topics: Vec<String>,
+    pub topics: Vec<GtsInstanceId>,
     pub subscription_interests: Vec<SubscriptionInterest>,
     pub tenant_id: Option<uuid::Uuid>,
     pub tenant_depth: TenantTraversalDepth,
     pub barrier_mode: BarrierMode,
-    pub event_type_patterns: Vec<String>,
+    pub event_type_patterns: Vec<GtsIdPattern>,
     pub client_agent: String,
     pub session_timeout: Option<Duration>,
     pub filter: Option<Filter>,
@@ -350,12 +357,12 @@ where
     pub offset_manager: Arc<OM>,
     pub handler: Arc<H>,
     pub group_ref: ConsumerGroupRef,
-    pub topics: Vec<String>,
+    pub topics: Vec<GtsInstanceId>,
     pub subscription_interests: Vec<SubscriptionInterest>,
     pub tenant_id: Option<uuid::Uuid>,
     pub tenant_depth: TenantTraversalDepth,
     pub barrier_mode: BarrierMode,
-    pub event_type_patterns: Vec<String>,
+    pub event_type_patterns: Vec<GtsIdPattern>,
     pub client_agent: String,
     pub session_timeout: Option<Duration>,
     pub filter: Option<Filter>,
@@ -374,13 +381,21 @@ where
     pub subscription_id: Arc<tokio::sync::Mutex<Option<SubscriptionId>>>,
 }
 
+/// The GTS pattern matching every concrete event type: the event envelope base
+/// with a trailing `*`. `gts_id!` validates it at compile time, so the parse here
+/// cannot fail.
+fn all_event_types_pattern() -> GtsIdPattern {
+    GtsIdPattern::try_new(gts_id!("cf.core.events.event.v1~*"))
+        .expect("event envelope wildcard is a valid GTS pattern")
+}
+
 fn build_join_interests(
     subscription_interests: &[SubscriptionInterest],
-    topics: &[String],
+    topics: &[GtsInstanceId],
     tenant_id: Option<uuid::Uuid>,
     tenant_depth: TenantTraversalDepth,
     barrier_mode: BarrierMode,
-    event_type_patterns: &[String],
+    event_type_patterns: &[GtsIdPattern],
     filter: Option<Filter>,
 ) -> Result<Vec<BrokerSubscriptionInterest>, EventBrokerError> {
     let tenant_id = tenant_id.unwrap_or_else(uuid::Uuid::nil);
@@ -389,17 +404,11 @@ fn build_join_interests(
             .iter()
             .map(|interest| {
                 let mut builder = BrokerSubscriptionInterest::builder()
-                    .topic(topic_ref_to_string(&interest.topic))
+                    .topic(interest.topic.clone())
                     .tenant_id(tenant_id)
                     .tenant_depth(tenant_depth)
                     .barrier_mode(barrier_mode)
-                    .types(
-                        interest
-                            .event_types
-                            .iter()
-                            .map(event_type_ref_to_string)
-                            .collect::<Vec<_>>(),
-                    );
+                    .types(interest.event_types.clone());
                 if let Some(filter) = interest.filter.as_ref() {
                     builder = builder.filter(subscription_filter_ref_to_filter(filter));
                 }
@@ -408,8 +417,12 @@ fn build_join_interests(
             .collect();
     }
 
+    // `.topics(..)` with no explicit patterns means "every event type on the
+    // topic". Expressed as the event envelope's trailing-`*` GTS pattern, which
+    // the broker's `GtsId::matches_pattern` covers for every derived event type;
+    // topic-equality in the interest scopes it to the topic.
     let event_type_patterns = if event_type_patterns.is_empty() {
-        vec!["*".to_owned()]
+        vec![all_event_types_pattern()]
     } else {
         event_type_patterns.to_vec()
     };
@@ -456,6 +469,7 @@ where
             &ctx,
             &group_id,
             assignment.subscription_id,
+            assignment.topology_version,
             &assignment.assigned,
         )
         .await?;
@@ -472,19 +486,14 @@ where
             let sub_id = assignment.subscription_id;
             let mut stream = match self.broker.stream(&ctx, sub_id).await {
                 Ok(s) => s,
-                Err(EventBrokerError::PositionsNotSet { unseeded, .. }) => {
-                    consecutive_failures += 1;
-                    if consecutive_failures > self.max_rejoin_attempts {
-                        return Err(EventBrokerError::SubscriptionRecoveryExhausted {
-                            attempts: consecutive_failures,
-                            detail: "stream open: PositionsNotSet recovery exhausted".into(),
-                            instance: String::new(),
-                        });
-                    }
-                    let slots = self.slots_for_unseeded(&unseeded);
-                    self.resolve_and_seek(&ctx, &group_id, sub_id, &slots)
-                        .await?;
-                    continue;
+                Err(e @ EventBrokerError::PositionsNotSet { .. }) => {
+                    // A compliant consumer seeks every assigned partition before
+                    // opening the stream, and a subscription's assignment only
+                    // shrinks in place (gains arrive via terminal -> re-JOIN,
+                    // which seeks first), so this is not a transient race - the
+                    // stream was opened with an unseeded assigned partition.
+                    // Surface the protocol violation instead of masking it.
+                    return Err(e);
                 }
                 Err(e) => {
                     warn!(
@@ -499,6 +508,7 @@ where
                         &ctx,
                         &group_id,
                         assignment.subscription_id,
+                        assignment.topology_version,
                         &assignment.assigned,
                     )
                     .await?;
@@ -614,6 +624,7 @@ where
                 &ctx,
                 &group_id,
                 assignment.subscription_id,
+                assignment.topology_version,
                 &assignment.assigned,
             )
             .await?;
@@ -637,7 +648,7 @@ where
             .topic_of(&self.broker, active.ctx, &wire.type_id)
             .await
         {
-            Ok(topic) => topic.as_ref().to_owned(),
+            Ok(topic) => topic,
             Err(err) => {
                 warn!(
                     error = %err,
@@ -658,7 +669,7 @@ where
             subject_type: wire.subject_type,
             partition: wire.partition,
             sequence: wire.sequence,
-            offset: wire.offset,
+            offset: wire.sequence,
             occurred_at: wire.occurred_at,
             sequence_time: wire.sequence_time,
             trace_parent: wire.trace_parent,
@@ -683,7 +694,7 @@ where
                 state,
                 key.clone(),
                 enqueued.buffered_count,
-                wire.offset,
+                wire.sequence,
                 active,
             )
             .await
@@ -926,7 +937,7 @@ where
         state: DispatchState<'_>,
         key: TopicPartitionKey,
         buffered_count: usize,
-        latest_observed_offset: i64,
+        latest_observed_offset: Sequence,
         active: ActiveSubscription<'_>,
     ) -> bool {
         let mut guard = state.slow_states.write().await;
@@ -964,7 +975,7 @@ where
         state: DispatchState<'_>,
         key: TopicPartitionKey,
         elapsed: Duration,
-        last_delivered_offset: i64,
+        last_delivered_offset: Sequence,
         active: ActiveSubscription<'_>,
     ) -> bool {
         let mut guard = state.slow_states.write().await;
@@ -1048,36 +1059,69 @@ where
         ctx: &SecurityContext,
         group_id: &ConsumerGroupId,
         subscription_id: SubscriptionId,
+        topology_version: i64,
         slots: &[AssignedPartition],
     ) -> Result<(), EventBrokerError> {
-        if slots.is_empty() {
-            return Ok(());
+        // A concurrent rebalance can bump the group's topology_version between
+        // the moment we read our assignment and the moment we seek, so the
+        // broker fences a stale seek with TopologyVersionMismatch. Re-read the
+        // subscription for the fresh version + assignment and re-seek. A gained
+        // partition is reached via the terminal -> re-JOIN path, not here; this
+        // only re-seeks the (possibly reduced) current assignment.
+        let mut version = topology_version;
+        let mut slots: Vec<AssignedPartition> = slots.to_vec();
+        let mut attempts = 0u32;
+        loop {
+            if slots.is_empty() {
+                return Ok(());
+            }
+            let mut positions: Vec<SeekPosition> = Vec::with_capacity(slots.len());
+            for slot in &slots {
+                let topic = slot.topic.clone();
+                let topic_id = TopicId::from_gts(&topic);
+                let value = self
+                    .offset_manager
+                    .load_position(group_id, &topic_id, slot.partition)
+                    .await?;
+                self.emit_runtime_event(ConsumerRuntimeEvent::OffsetLoaded {
+                    topic_id,
+                    topic: topic.clone(),
+                    partition: slot.partition,
+                    position: value.clone(),
+                })
+                .await;
+                positions.push(SeekPosition {
+                    topic,
+                    partition: slot.partition,
+                    value,
+                });
+            }
+            match self
+                .broker
+                .seek(ctx, subscription_id, version, &positions)
+                .await
+            {
+                Ok(_) => return Ok(()),
+                Err(EventBrokerError::TopologyVersionMismatch { .. })
+                    if attempts < RESEEK_ON_TOPOLOGY_MISMATCH_ATTEMPTS =>
+                {
+                    attempts += 1;
+                    let sub = self.broker.get_subscription(ctx, subscription_id).await?;
+                    version = sub.topology_version;
+                    slots = sub
+                        .assigned
+                        .into_iter()
+                        .map(|p| AssignedPartition {
+                            topic: p.topic.clone(),
+                            partition: p.partition,
+                        })
+                        .collect();
+                }
+                // Budget exhausted (or any other error): surface it so the
+                // caller's outer re-JOIN loop can take over.
+                Err(e) => return Err(e),
+            }
         }
-        let mut positions: Vec<SeekPosition> = Vec::with_capacity(slots.len());
-        for slot in slots {
-            let topic = slot.topic.clone();
-            let topic_id = TopicId::from_gts(&topic);
-            let value = self
-                .offset_manager
-                .load_position(group_id, &topic_id, slot.partition)
-                .await?;
-            self.emit_runtime_event(ConsumerRuntimeEvent::OffsetLoaded {
-                topic_id,
-                topic: topic.clone(),
-                partition: slot.partition,
-                position: value.clone(),
-            })
-            .await;
-            positions.push(SeekPosition {
-                topic,
-                partition: slot.partition,
-                value,
-            });
-        }
-        self.broker
-            .seek(ctx, subscription_id, &positions)
-            .await
-            .map(|_| ())
     }
 
     async fn observe_positions(&self, positions: &[PartitionPosition]) {
@@ -1085,21 +1129,11 @@ where
             trace!(
                 topic = p.topic.as_ref(),
                 partition = p.partition,
-                offset = p.offset,
-                last_examined = p.last_examined,
+                offset = %p.offset,
+                last_examined = %p.last_examined,
                 "transactional position observed without out-of-tx commit"
             );
         }
-    }
-
-    fn slots_for_unseeded(&self, unseeded: &[(String, u32)]) -> Vec<AssignedPartition> {
-        unseeded
-            .iter()
-            .map(|(topic, partition)| AssignedPartition {
-                topic: topic.clone(),
-                partition: *partition,
-            })
-            .collect()
     }
 
     async fn ensure_group(
@@ -1112,7 +1146,6 @@ where
                 detail: format!(
                     "consumer group GTS reference '{gts}' must be resolved before startup"
                 ),
-                instance: String::new(),
             }),
             ConsumerGroupRef::AutoAnonymous { alias } => {
                 let group = self
@@ -1187,7 +1220,6 @@ where
             return Err(EventBrokerError::SubscriptionRecoveryExhausted {
                 attempts: *consecutive_failures,
                 detail: "max transactional re-JOIN attempts exceeded".into(),
-                instance: String::new(),
             });
         }
         self.emit_runtime_event(ConsumerRuntimeEvent::SubscriptionRejoining {
@@ -1231,6 +1263,7 @@ where
             &ctx,
             &group_id,
             assignment.subscription_id,
+            assignment.topology_version,
             &assignment.assigned,
         )
         .await?;
@@ -1248,6 +1281,9 @@ where
                 let seek_ctx = ctx.clone();
                 let seek_group = group_id;
                 let seek_sub = assignment.subscription_id;
+                // Captured with the subscription id it belongs to; both go stale
+                // together after a re-JOIN, and a stale seek here is ignored.
+                let seek_topology_version = assignment.topology_version;
                 let seek_cancel = cancel.clone();
                 let seek_listeners = self.listeners.clone();
                 let seek_listener_timeout = self.listener_timeout;
@@ -1309,10 +1345,11 @@ where
                                     let _ = seek_broker.seek(
                                         &seek_ctx,
                                         seek_sub,
+                                        seek_topology_version,
                                         &[SeekPosition {
                                             topic: key.topic.clone(),
                                             partition: key.partition,
-                                            value: ResolvedPosition::Exact(latest_offset),
+                                            value: Position::Exact(latest_offset),
                                         }],
                                     ).await;
                                 }
@@ -1337,25 +1374,16 @@ where
                     return Err(EventBrokerError::SubscriptionRecoveryExhausted {
                         attempts: consecutive_failures,
                         detail: "stream open: recovery exhausted".into(),
-                        instance: String::new(),
                     });
                 }
-                Err(EventBrokerError::PositionsNotSet { unseeded, .. }) => {
-                    // Defensive recovery: re-resolve via position() and SEEK the
-                    // unseeded partitions, then retry. Shares the
-                    // SubscriptionRecoveryExhausted budget.
-                    consecutive_failures += 1;
-                    if consecutive_failures > self.max_rejoin_attempts {
-                        return Err(EventBrokerError::SubscriptionRecoveryExhausted {
-                            attempts: consecutive_failures,
-                            detail: "stream open: PositionsNotSet recovery exhausted".into(),
-                            instance: String::new(),
-                        });
-                    }
-                    let slots = self.slots_for_unseeded(&unseeded);
-                    self.resolve_and_seek(&ctx, &group_id, sub_id, &slots)
-                        .await?;
-                    continue;
+                Err(e @ EventBrokerError::PositionsNotSet { .. }) => {
+                    // A compliant consumer seeks every assigned partition before
+                    // opening the stream, and a subscription's assignment only
+                    // shrinks in place (gains arrive via terminal -> re-JOIN,
+                    // which seeks first), so this is not a transient race - the
+                    // stream was opened with an unseeded assigned partition.
+                    // Surface the protocol violation instead of masking it.
+                    return Err(e);
                 }
                 Err(e) => {
                     warn!(
@@ -1370,6 +1398,7 @@ where
                         &ctx,
                         &group_id,
                         assignment.subscription_id,
+                        assignment.topology_version,
                         &assignment.assigned,
                     )
                     .await?;
@@ -1508,6 +1537,7 @@ where
                 &ctx,
                 &group_id,
                 assignment.subscription_id,
+                assignment.topology_version,
                 &assignment.assigned,
             )
             .await?;
@@ -1533,7 +1563,7 @@ where
             .topic_of(&self.broker, active.ctx, &wire.type_id)
             .await
         {
-            Ok(topic) => topic.as_ref().to_owned(),
+            Ok(topic) => topic,
             Err(err) => {
                 warn!(
                     error = %err,
@@ -1555,7 +1585,7 @@ where
             subject_type: wire.subject_type,
             partition: wire.partition,
             sequence: wire.sequence,
-            offset: wire.offset,
+            offset: wire.sequence,
             occurred_at: wire.occurred_at,
             sequence_time: wire.sequence_time,
             trace_parent: wire.trace_parent,
@@ -1580,7 +1610,7 @@ where
                 state,
                 key.clone(),
                 enqueued.buffered_count,
-                wire.offset,
+                wire.sequence,
                 active,
             )
             .await
@@ -1802,7 +1832,7 @@ where
         state: DispatchState<'_>,
         key: TopicPartitionKey,
         buffered_count: usize,
-        latest_observed_offset: i64,
+        latest_observed_offset: Sequence,
         active: ActiveSubscription<'_>,
     ) -> bool {
         let mut guard = state.slow_states.write().await;
@@ -1840,7 +1870,7 @@ where
         state: DispatchState<'_>,
         key: TopicPartitionKey,
         elapsed: Duration,
-        last_delivered_offset: i64,
+        last_delivered_offset: Sequence,
         active: ActiveSubscription<'_>,
     ) -> bool {
         let mut guard = state.slow_states.write().await;
@@ -1928,36 +1958,69 @@ where
         ctx: &SecurityContext,
         group_id: &ConsumerGroupId,
         subscription_id: SubscriptionId,
+        topology_version: i64,
         slots: &[AssignedPartition],
     ) -> Result<(), EventBrokerError> {
-        if slots.is_empty() {
-            return Ok(());
+        // A concurrent rebalance can bump the group's topology_version between
+        // the moment we read our assignment and the moment we seek, so the
+        // broker fences a stale seek with TopologyVersionMismatch. Re-read the
+        // subscription for the fresh version + assignment and re-seek. A gained
+        // partition is reached via the terminal -> re-JOIN path, not here; this
+        // only re-seeks the (possibly reduced) current assignment.
+        let mut version = topology_version;
+        let mut slots: Vec<AssignedPartition> = slots.to_vec();
+        let mut attempts = 0u32;
+        loop {
+            if slots.is_empty() {
+                return Ok(());
+            }
+            let mut positions: Vec<SeekPosition> = Vec::with_capacity(slots.len());
+            for slot in &slots {
+                let topic = slot.topic.clone();
+                let topic_id = TopicId::from_gts(&topic);
+                let value = self
+                    .offset_manager
+                    .load_position(group_id, &topic_id, slot.partition)
+                    .await?;
+                self.emit_runtime_event(ConsumerRuntimeEvent::OffsetLoaded {
+                    topic_id,
+                    topic: topic.clone(),
+                    partition: slot.partition,
+                    position: value.clone(),
+                })
+                .await;
+                positions.push(SeekPosition {
+                    topic,
+                    partition: slot.partition,
+                    value,
+                });
+            }
+            match self
+                .broker
+                .seek(ctx, subscription_id, version, &positions)
+                .await
+            {
+                Ok(_) => return Ok(()),
+                Err(EventBrokerError::TopologyVersionMismatch { .. })
+                    if attempts < RESEEK_ON_TOPOLOGY_MISMATCH_ATTEMPTS =>
+                {
+                    attempts += 1;
+                    let sub = self.broker.get_subscription(ctx, subscription_id).await?;
+                    version = sub.topology_version;
+                    slots = sub
+                        .assigned
+                        .into_iter()
+                        .map(|p| AssignedPartition {
+                            topic: p.topic.clone(),
+                            partition: p.partition,
+                        })
+                        .collect();
+                }
+                // Budget exhausted (or any other error): surface it so the
+                // caller's outer re-JOIN loop can take over.
+                Err(e) => return Err(e),
+            }
         }
-        let mut positions: Vec<SeekPosition> = Vec::with_capacity(slots.len());
-        for slot in slots {
-            let topic = slot.topic.clone();
-            let topic_id = TopicId::from_gts(&topic);
-            let value = self
-                .offset_manager
-                .load_position(group_id, &topic_id, slot.partition)
-                .await?;
-            self.emit_runtime_event(ConsumerRuntimeEvent::OffsetLoaded {
-                topic_id,
-                topic: topic.clone(),
-                partition: slot.partition,
-                position: value.clone(),
-            })
-            .await;
-            positions.push(SeekPosition {
-                topic,
-                partition: slot.partition,
-                value,
-            });
-        }
-        self.broker
-            .seek(ctx, subscription_id, &positions)
-            .await
-            .map(|_| ())
     }
 
     /// Feed control / topology-frame positions into the consumer's own offset
@@ -1972,7 +2035,7 @@ where
         positions: &[PartitionPosition],
     ) {
         for p in positions {
-            let topic = p.topic.as_ref().to_owned();
+            let topic = p.topic.clone();
             let topic_id = TopicId::from_gts(&topic);
             if let Err(e) = self
                 .offset_manager
@@ -2002,18 +2065,6 @@ where
         }
     }
 
-    /// Translate `(topic, partition)` pairs reported by `409 PositionsNotSet`
-    /// into the public assignment shape used by `EventBrokerApi::join`.
-    fn slots_for_unseeded(&self, unseeded: &[(String, u32)]) -> Vec<AssignedPartition> {
-        unseeded
-            .iter()
-            .map(|(topic, partition)| AssignedPartition {
-                topic: topic.clone(),
-                partition: *partition,
-            })
-            .collect()
-    }
-
     async fn ensure_group(
         &self,
         ctx: &SecurityContext,
@@ -2024,7 +2075,6 @@ where
                 detail: format!(
                     "consumer group GTS reference '{gts}' must be resolved before startup"
                 ),
-                instance: String::new(),
             }),
             ConsumerGroupRef::AutoAnonymous { alias } => {
                 let group = self
@@ -2099,7 +2149,6 @@ where
             return Err(EventBrokerError::SubscriptionRecoveryExhausted {
                 attempts: *consecutive_failures,
                 detail: "max re-JOIN attempts exceeded".into(),
-                instance: String::new(),
             });
         }
         self.emit_runtime_event(ConsumerRuntimeEvent::SubscriptionRejoining {

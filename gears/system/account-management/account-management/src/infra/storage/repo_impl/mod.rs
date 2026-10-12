@@ -36,7 +36,9 @@ use toolkit_odata::{ODataQuery, Page};
 use crate::domain::error::DomainError;
 use crate::domain::tenant::closure::ClosureRow;
 use crate::domain::tenant::integrity::{IntegrityCategory, Violation};
-use crate::domain::tenant::model::{ChildCountFilter, NewTenant, TenantModel, TenantStatus};
+use crate::domain::tenant::model::{
+    ChildCountFilter, NewTenant, TenantAncestorRow, TenantModel, TenantStatus,
+};
 use crate::domain::tenant::repo::TenantRepo;
 use crate::domain::tenant::retention::{
     HardDeleteEligibility, HardDeleteOutcome, TenantProvisioningRow, TenantRetentionRow,
@@ -76,6 +78,13 @@ impl TenantRepo for TenantRepoImpl {
         reads::find_by_id(self, scope, id).await
     }
 
+    async fn find_platform_root(
+        &self,
+        scope: &AccessScope,
+    ) -> Result<Option<TenantModel>, DomainError> {
+        reads::find_platform_root(self, scope).await
+    }
+
     async fn find_many(
         &self,
         scope: &AccessScope,
@@ -91,6 +100,25 @@ impl TenantRepo for TenantRepoImpl {
         query: &ODataQuery,
     ) -> Result<Page<TenantModel>, DomainError> {
         reads::list_children(self, scope, parent_id, query).await
+    }
+
+    async fn list_descendants(
+        &self,
+        visible: &AccessScope,
+        enumeration: &AccessScope,
+        root_id: Uuid,
+        query: &ODataQuery,
+    ) -> Result<Page<TenantModel>, DomainError> {
+        reads::list_descendants(self, visible, enumeration, root_id, query).await
+    }
+
+    async fn ancestor_chains(
+        &self,
+        scope: &AccessScope,
+        root_depth: u32,
+        tenant_ids: &[Uuid],
+    ) -> Result<HashMap<Uuid, Vec<TenantAncestorRow>>, DomainError> {
+        reads::ancestor_chains(self, scope, root_depth, tenant_ids).await
     }
 
     async fn insert_provisioning(

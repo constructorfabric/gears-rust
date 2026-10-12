@@ -501,8 +501,11 @@ async fn e2e_invalid_content_length_returns_400() {
         .expect_status(201)
         .await;
 
-    // Send request with non-integer Content-Length.
-    h.api_v1()
+    // Send request with non-integer Content-Length. Over REST hyper rejects
+    // this before OAGW runs (P-05), so only an in-process call reaches
+    // OAGW's own check.
+    let resp = h
+        .api_v1()
         .proxy_post("e2e-cl", "v1/test")
         .with_body(serde_json::json!({"test": true}))
         .with_header(
@@ -511,11 +514,14 @@ async fn e2e_invalid_content_length_returns_400() {
         )
         .expect_status(400)
         .await;
+    let violation = &resp.json()["context"]["field_violations"][0];
+    assert_eq!(violation["field"], "content-length");
+    assert_eq!(violation["reason"], oagw_sdk::field::INVALID_CONTENT_LENGTH);
 }
 
-// 8.11: Content-Length exceeding 100MB returns 400.
+// 8.11: Content-Length exceeding 100MB returns 413 PayloadTooLarge.
 #[tokio::test]
-async fn e2e_body_exceeding_limit_returns_400() {
+async fn e2e_body_exceeding_limit_returns_413() {
     let h = AppHarness::builder()
         .with_credentials(vec![("cred://openai-key".into(), "sk-e2e-test-key".into())])
         .build()
@@ -562,7 +568,10 @@ async fn e2e_body_exceeding_limit_returns_400() {
             http::header::CONTENT_LENGTH,
             http::HeaderValue::from_static("200000000"),
         )
-        .expect_status(400)
+        // Spec-mandated wire status for a body over the size cap: 413
+        // (PayloadTooLarge), carried by a transport override on the
+        // `out_of_range` canonical category. See oagw error mapping (T1).
+        .expect_status(413)
         .await;
 }
 

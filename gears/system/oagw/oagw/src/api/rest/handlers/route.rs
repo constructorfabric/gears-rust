@@ -31,7 +31,7 @@ pub async fn create_route(
     Extension(state): Extension<AppState>,
     Extension(ctx): Extension<SecurityContext>,
     Json(req): Json<CreateRouteRequest>,
-) -> Result<impl IntoResponse, Problem> {
+) -> Result<impl IntoResponse, Box<Problem>> {
     let instance = "/oagw/v1/routes";
     let upstream_uuid = parse_gts_id(&req.upstream_id, gts::UPSTREAM_SCHEMA, instance)?;
     let route = state
@@ -46,7 +46,7 @@ pub async fn get_route(
     Extension(state): Extension<AppState>,
     Extension(ctx): Extension<SecurityContext>,
     Path(id): Path<String>,
-) -> Result<impl IntoResponse, Problem> {
+) -> Result<impl IntoResponse, Box<Problem>> {
     let instance = format!("/oagw/v1/routes/{id}");
     let uuid = parse_gts_id(&id, gts::ROUTE_SCHEMA, &instance)?;
     let route = state
@@ -77,15 +77,12 @@ pub async fn list_routes(
     Extension(state): Extension<AppState>,
     Extension(ctx): Extension<SecurityContext>,
     Query(params): Query<ListRoutesQuery>,
-) -> Result<impl IntoResponse, Problem> {
+) -> Result<impl IntoResponse, Box<Problem>> {
     let instance = "/oagw/v1/routes";
     let upstream_uuid = params
         .upstream_id
         .as_deref()
-        .map(
-            #[allow(clippy::result_large_err)]
-            |id| parse_gts_id(id, gts::UPSTREAM_SCHEMA, instance),
-        )
+        .map(|id| parse_gts_id(id, gts::UPSTREAM_SCHEMA, instance))
         .transpose()?;
     let query = crate::domain::model::ListQuery {
         top: params.limit.min(100),
@@ -105,7 +102,7 @@ pub async fn update_route(
     Extension(ctx): Extension<SecurityContext>,
     Path(id): Path<String>,
     Json(req): Json<UpdateRouteRequest>,
-) -> Result<impl IntoResponse, Problem> {
+) -> Result<impl IntoResponse, Box<Problem>> {
     let instance = format!("/oagw/v1/routes/{id}");
     let uuid = parse_gts_id(&id, gts::ROUTE_SCHEMA, &instance)?;
     // Snapshot old rate_limit before update so we can detect changes and
@@ -131,7 +128,7 @@ pub async fn delete_route(
     Extension(state): Extension<AppState>,
     Extension(ctx): Extension<SecurityContext>,
     Path(id): Path<String>,
-) -> Result<impl IntoResponse, Problem> {
+) -> Result<impl IntoResponse, Box<Problem>> {
     let instance = format!("/oagw/v1/routes/{id}");
     let uuid = parse_gts_id(&id, gts::ROUTE_SCHEMA, &instance)?;
     state

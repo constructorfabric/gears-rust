@@ -16,6 +16,7 @@ use toolkit_macros::domain_model;
 /// floating-point drift; anything further out is rejected, so a detector with a
 /// scoring bug cannot gain the power to override a correct hint. `NaN` is
 /// rejected too.
+#[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
 pub struct Confidence(f32);
 

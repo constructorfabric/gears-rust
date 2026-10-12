@@ -3,9 +3,11 @@
 //! `cargo test -p cf-gears-bss-ledger --test postgres_provisioning -- --ignored`.
 //!
 //! Covers: (a) the seed is idempotent + additive across repeated calls
-//! (created-vs-existing counts + raw row counts hold); (b) a scale exceeding
-//! `i64` headroom rolls back the WHOLE transaction (the account seeded earlier
-//! in the same call is gone).
+//! (created-vs-existing counts + raw row counts hold); (b) a scale row refused
+//! inside the transaction (the currency already posted under another scale)
+//! rolls back the WHOLE transaction (the account seeded earlier in the same call
+//! is gone). A scale above 0..=28 can no longer reach the service: the request
+//! carries a validated `CurrencySpec`.
 
 #![allow(
     clippy::non_ascii_literal,
@@ -17,15 +19,14 @@
     clippy::panic
 )]
 
-use bss_ledger::domain::error::DomainError;
 use bss_ledger::infra::provisioning::service::ProvisioningService;
 use bss_ledger::infra::storage::migrations::Migrator;
 use bss_ledger::infra::storage::repo::ReferenceRepo;
 use bss_ledger_sdk::{
-    AccountClass, FiscalCalendarSpec, Granularity, ODataQuery, ProvisionAccount,
-    ProvisionCurrencyScale, ProvisionRequest, Side,
+    AccountClass, CurrencySpec, FiscalCalendarSpec, Granularity, MoneyError, ODataQuery,
+    ProvisionAccount, ProvisionCurrencyScale, ProvisionRequest, Side,
 };
-use sea_orm::{ConnectionTrait, Database, DatabaseConnection, Statement};
+use sea_orm::{ConnectionTrait, Database, DatabaseConnection, Statement, TransactionTrait};
 use sea_orm_migration::MigratorTrait;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use time::OffsetDateTime;
@@ -63,14 +64,12 @@ fn account(
     }
 }
 
-// A non-ISO currency scale within the default headroom (`plausible_max_major`
-// omitted -> 10^12, max scale 6: the guard rejects 10^12 * 10^scale > i64). A
-// higher-precision currency (e.g. BTC=8) registers a smaller per-currency max.
+// A non-ISO currency scale within the supported 0..=28 range. Decimal money has
+// no per-currency integer headroom option any more; only the scale range and
+// the 28-digit coefficient limit apply.
 fn noniso_scale() -> ProvisionCurrencyScale {
     ProvisionCurrencyScale {
-        currency: "QQQ".to_owned(),
-        minor_units: 4,
-        plausible_max_major: None,
+        currency: CurrencySpec::try_new("QQQ".to_owned(), 4).unwrap(),
         source: "TENANT".to_owned(),
     }
 }
@@ -261,7 +260,7 @@ async fn provision_is_idempotent_and_additive() {
 
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
-async fn provision_rolls_back_on_out_of_range_scale() {
+async fn provision_rolls_back_on_a_refused_scale_row() {
     let container = test_containers::postgres().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
@@ -276,28 +275,65 @@ async fn provision_rolls_back_on_out_of_range_scale() {
 
     let tenant_id = Uuid::new_v4();
 
-    // One valid account FOLLOWED BY a scale that exceeds i64 headroom: the
-    // whole transaction must roll back, so the account is gone too.
+    // A scale above 0..=28 is refused before any request exists.
+    assert_eq!(
+        CurrencySpec::try_new("BIG".to_owned(), 29),
+        Err(MoneyError::ScaleOutOfRange)
+    );
+
+    // Post a balanced QQQ@2 entry (no registry row) so a QQQ@4 registration is
+    // locked: the scale row is refused inside the provisioning transaction.
+    let entry = Uuid::now_v7();
+    let seed = db.begin().await.unwrap();
+    seed.execute_raw(pg(format!(
+        "INSERT INTO bss.ledger_journal_entry
+            (entry_id, tenant_id, legal_entity_id, period_id, entry_currency,
+             source_doc_type, source_business_id, posted_at_utc, effective_at,
+             origin, posted_by_actor_id, correlation_id)
+         VALUES ('{entry}','{tenant_id}','{tenant_id}','202606','QQQ',
+                 'MANUAL_ADJUSTMENT','biz-1', now(), CURRENT_DATE,
+                 'SYSTEM','{tenant_id}','{tenant_id}')"
+    )))
+    .await
+    .unwrap();
+    for (side, class) in [("DR", "AR"), ("CR", "CASH_CLEARING")] {
+        let line = Uuid::now_v7();
+        seed.execute_raw(pg(format!(
+            "INSERT INTO bss.ledger_journal_line
+                (line_id, entry_id, tenant_id, period_id, payer_tenant_id, account_id,
+                 account_class, side, amount, currency, currency_scale, mapping_status)
+             VALUES ('{line}','{entry}','{tenant_id}','202606','{tenant_id}','{tenant_id}',
+                     '{class}','{side}', '10', 'QQQ', 2, 'RESOLVED')"
+        )))
+        .await
+        .unwrap();
+    }
+    seed.commit().await.unwrap();
+
+    // One valid account FOLLOWED BY the locked scale row: the whole transaction
+    // must roll back, so the account is gone too.
     let req = ProvisionRequest {
         tenant_id,
         accounts: vec![account(AccountClass::Ar, "USD", None, Side::Debit)],
-        currency_scales: vec![ProvisionCurrencyScale {
-            currency: "BIG".to_owned(),
-            minor_units: 18,
-            plausible_max_major: None,
-            source: "TENANT".to_owned(),
-        }],
+        currency_scales: vec![noniso_scale()],
         fiscal_calendar: utc_calendar(),
     };
 
     let err = service
         .provision(req)
         .await
-        .expect_err("out-of-headroom scale must be rejected");
-    match err {
-        DomainError::ScaleOutOfRange(c) => assert!(c.contains("BIG"), "got {c}"),
-        other => panic!("expected ScaleOutOfRange(BIG), got {other:?}"),
-    }
+        .expect_err("a locked scale row must be refused");
+    assert!(
+        matches!(
+            err,
+            bss_ledger::domain::error::DomainError::CurrencyScaleLocked(_)
+        ),
+        "a scale lock is its business refusal, not an internal fault, got {err:?}"
+    );
+    assert!(
+        err.to_string().contains("QQQ"),
+        "the refusal names the currency, got {err:?}"
+    );
 
     // Rollback: the account seeded earlier in the SAME txn is gone, and no
     // fiscal period was committed.

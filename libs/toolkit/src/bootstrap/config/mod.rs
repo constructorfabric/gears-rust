@@ -616,9 +616,10 @@ pub struct CliArgs {
 
 /// Parse YAML with duplicate-key rejection.
 fn strict_yaml_parse<T: serde::de::DeserializeOwned>(s: &str) -> Result<T, serde_saphyr::Error> {
-    let opts = serde_saphyr::Options {
+    // `Options` is `#[non_exhaustive]`, so it cannot be built with a struct literal from
+    // outside the crate — `options!` is what serde-saphyr provides instead.
+    let opts = serde_saphyr::options! {
         duplicate_keys: serde_saphyr::DuplicateKeyPolicy::Error,
-        ..serde_saphyr::Options::default()
     };
     serde_saphyr::from_str_with_options(s, opts)
 }

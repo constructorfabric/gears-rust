@@ -5,7 +5,7 @@
 //! so issued Registry References stay reverse-resolvable until purge (ADR-0008,
 //! ADR-0013).
 //!
-//! Two derivable columns are materialized because neither is portably indexable
+//! Three derivable columns are materialized because none is portably indexable
 //! in derived form:
 //!
 //! * `gts_uuid` — the `UUIDv5` Registry Reference derived from `gts_id`. Stored so
@@ -13,6 +13,8 @@
 //!   NOT derive it locally.**
 //! * `entity_kind` — follows from the trailing `~`, but suffix predicates are not
 //!   portably indexable and the value drives kind-specific constraints.
+//! * `chain_depth` — `GtsId::segments().len()`, discovery's `depth` filter. The
+//!   parsed segments themselves live in `entity_gts_segment`.
 //!
 //! `owning_gear` is caller-declared attribution and **MUST NOT authorize**: in a
 //! single-process deployment every gear shares the process workload identity, so
@@ -48,6 +50,8 @@ pub struct Model {
     pub gts_uuid: Uuid,
     pub gts_id: String,
     pub entity_kind: EntityKind,
+    /// Number of parsed `gts_id` segments, at least 1.
+    pub chain_depth: i16,
     pub family_id: i64,
     /// Copied from `version_family` for join-free visibility checks; admission
     /// verifies the copy under the family lock. A composite foreign key would

@@ -101,7 +101,7 @@ Rely primarily on Rustdoc / doc-comments for API documentation, with minimal hig
 
 ## More Information
 
-* Template definitions: [docs/spec-templates/](../../../spec-templates/)
+* Template definitions: [studio-kit-gears/artifacts/](../../../../studio-kit-gears/artifacts/)
 * FDD framework: [Flow-Driven Development](https://github.com/constructorfabric/FDD)
 * Document placement convention: specs live inside `docs/arch/common/`, `docs/arch/{subsystem}/`, or `{gear}/` directories
 * Naming convention: ADR and Feature files use `NNNN-{fdd-id}.md` prefix format

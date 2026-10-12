@@ -9,7 +9,7 @@
 //!   fee that was expensed at settle. **Omitted entirely when `fee_share == 0`**
 //!   (never a zero line — matches how settle omits its fee leg).
 //!
-//! `Σ DR == Σ CR == amount_minor` exactly (`amount = (amount − fee_share) +
+//! `Σ DR == Σ CR == amount` exactly (`amount = (amount − fee_share) +
 //! fee_share`). A full return (`amount = gross`, `fee_share = fee`) is the exact
 //! mirror of settle. Mirrors the settlement builder's shape: each line carries a
 //! placeholder nil `account_id` (the `crate::infra` orchestrator binds the real
@@ -37,6 +37,9 @@
 
 use bss_ledger_sdk::{AccountClass, MappingStatus, PostEntry, PostLine, Side, SourceDocType};
 
+use crate::domain::exact_money::{matching_spec, subtract_posted};
+use bss_ledger_sdk::PostedMoney;
+use rust_decimal::Decimal;
 use toolkit_macros::domain_model;
 use uuid::Uuid;
 
@@ -46,7 +49,7 @@ use crate::domain::error::DomainError;
 use crate::domain::instant::to_naive_date;
 use time::OffsetDateTime;
 
-/// A settlement to claw back (architecture §4.2 input). `amount_minor` is the
+/// A settlement to claw back (architecture §4.2 input). `amount` is the
 /// gross amount the PSP returned; it decrements the original payment's
 /// `settled_minor` and leaves the pool.
 #[domain_model]
@@ -63,17 +66,15 @@ pub struct SettlementReturnInput {
     /// External return identity — the `SETTLEMENT_RETURN` idempotency business id
     /// (`source_business_id`).
     pub psp_return_id: String,
-    /// Amount returned in minor units. Must be `> 0`.
-    pub amount_minor: i64,
-    /// ISO currency of the return (every line shares it).
-    pub currency: String,
+    /// Amount returned in major units. Must be `> 0`.
+    pub amount: PostedMoney,
     /// Return instant. `None` ⇒ a placeholder effective date the orchestrator
     /// overwrites before posting (see module docs).
     pub effective_at: Option<OffsetDateTime>,
 }
 
 /// Build the balanced settlement-return entry for `input`, sized for a return of
-/// `amount_minor` given the proportional `fee_share_minor` the orchestrator
+/// `amount` given the proportional `fee_share` the orchestrator
 /// computed against the current remaining balances (Model N, symmetric reverse).
 ///
 /// Lines: DR `UNALLOCATED` (`amount`), CR `CASH_CLEARING` (`amount − fee_share`),
@@ -90,22 +91,24 @@ pub struct SettlementReturnInput {
 /// orchestrator reads the settlement and computes `fee_share` before calling.
 ///
 /// # Errors
-/// [`DomainError::InvalidRequest`] when `amount_minor <= 0` (a meaningless
-/// return — there is nothing to claw back), or when `fee_share_minor` is out of
-/// the `0 ..= amount_minor` range (a fee slice larger than the return, or
+/// Money metadata conflicts and final posting-range failures retain their named domain errors.
+/// [`DomainError::InvalidRequest`] when `amount <= 0` (a meaningless
+/// return — there is nothing to claw back), or when `fee_share` is out of
+/// the `0 ..= amount` range (a fee slice larger than the return, or
 /// negative, can't be reversed — a defensive guard on the orchestrator's
 /// arithmetic).
 pub fn build_settlement_return_entry(
     input: &SettlementReturnInput,
-    fee_share_minor: i64,
+    fee_share: &PostedMoney,
 ) -> Result<PostEntry, DomainError> {
+    matching_spec(&input.amount, fee_share)?;
     // Reject a non-positive return at the boundary with a precise
     // `InvalidRequest`: zero-amount lines would otherwise surface deep down as
     // the misleading `AMOUNT_OUT_OF_RANGE`.
-    if input.amount_minor <= 0 {
+    if input.amount.amount() <= Decimal::ZERO {
         return Err(DomainError::InvalidRequest(format!(
-            "settlement return amount_minor must be > 0, got {}",
-            input.amount_minor
+            "settlement return amount must be > 0, got {}",
+            input.amount
         )));
     }
     // Defensive: the fee slice being reversed must fit within the return
@@ -113,16 +116,16 @@ pub fn build_settlement_return_entry(
     // `fee_share = fee × amount / settled` with `fee <= settled` and
     // `amount <= settled`, so this always holds; a breach is a programming
     // error, surfaced as `InvalidRequest` rather than an unbalanced entry.
-    if fee_share_minor < 0 || fee_share_minor > input.amount_minor {
+    if fee_share.amount() < Decimal::ZERO || fee_share.amount() > input.amount.amount() {
         return Err(DomainError::InvalidRequest(format!(
-            "settlement return fee_share_minor must be in 0..={}, got {fee_share_minor}",
-            input.amount_minor
+            "settlement return fee_share must be in 0..={}, got {fee_share}",
+            input.amount
         )));
     }
 
     // A nil account_id / Resolved status line carrying the entry-wide payer +
     // currency; only the class / side / amount differ per line.
-    let line = |account_class: AccountClass, side: Side, amount_minor: i64| PostLine {
+    let line = |account_class: AccountClass, side: Side, amount: PostedMoney| PostLine {
         line_id: Uuid::now_v7(),
         payer_tenant_id: input.payer_tenant_id,
         seller_tenant_id: Some(input.tenant_id),
@@ -131,14 +134,12 @@ pub fn build_settlement_return_entry(
         account_class,
         gl_code: None,
         side,
-        amount_minor,
-        currency: input.currency.clone(),
+        money: amount,
         invoice_id: None,
         due_date: None,
         revenue_stream: None,
         mapping_status: MappingStatus::Resolved,
-        functional_amount_minor: None,
-        functional_currency: None,
+        functional_money: None,
         tax_jurisdiction: None,
         tax_filing_period: None,
         tax_rate_ref: None,
@@ -157,18 +158,18 @@ pub fn build_settlement_return_entry(
     // entirely when `fee_share == 0` — never a zero line. Σ DR = amount =
     // (amount − fee_share) + fee_share = Σ CR.
     let mut lines: Vec<PostLine> = vec![
-        line(AccountClass::Unallocated, Side::Debit, input.amount_minor),
+        line(AccountClass::Unallocated, Side::Debit, input.amount.clone()),
         line(
             AccountClass::CashClearing,
             Side::Credit,
-            input.amount_minor - fee_share_minor,
+            subtract_posted(&input.amount, fee_share)?,
         ),
     ];
-    if fee_share_minor > 0 {
+    if fee_share.amount() > Decimal::ZERO {
         lines.push(line(
             AccountClass::PspFeeExpense,
             Side::Credit,
-            fee_share_minor,
+            fee_share.clone(),
         ));
     }
 
@@ -178,7 +179,7 @@ pub fn build_settlement_return_entry(
         // Placeholder header fields the infra orchestrator overwrites before
         // posting (period, actor/correlation, real effective date for `None`).
         period_id: String::new(),
-        entry_currency: input.currency.clone(),
+        entry_currency: input.amount.currency().code().to_owned(),
         source_doc_type: SourceDocType::SettlementReturn,
         source_business_id: input.psp_return_id.clone(),
         effective_at: input.effective_at.map_or(

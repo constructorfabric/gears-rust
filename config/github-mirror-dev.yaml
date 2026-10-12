@@ -100,9 +100,9 @@ gears:
       auth_disabled: true
       require_auth_by_default: true
 
-  gear-orchestrator:
+  service-discovery:
     config: {}
-    # No configuration needed for the gear orchestrator
+    # No configuration needed for the directory service
 
   grpc-hub:
     config:
@@ -230,9 +230,18 @@ gears:
     database:
       server: "sqlite_users"
       file: "github_mirror.db"
+      pool:
+        max_conns: 20
     config:
       api_base_url: "https://api.github.com"
       github_token: "${GITHUB_TOKEN}"
+      # Repositories synced at once, and the ceiling on GitHub requests in
+      # flight across all of them (GitHub's secondary rate limit reacts to
+      # concurrency, so raise the second one only with a token pool).
+      max_concurrent_syncs: 4
+      max_concurrent_requests: 4
+      # Tasks (list pages, single entities) in flight inside one sync.
+      max_concurrent_tasks: 4
 
 # OpenTelemetry configuration (resource identity, tracing, metrics)
 opentelemetry:
@@ -281,8 +290,8 @@ opentelemetry:
       record_headers: [ "user-agent", "x-forwarded-for" ]
 
     # Add top-level trace_id / span_id to JSON log records so a backend can
-    # link a log line to its span. Off by default: it costs a context lookup
-    # per event.
+    # link a log line to its span. On by default (it costs a context lookup
+    # per event); set to false to opt out.
     logs_correlation:
       inject_trace_ids_into_logs: true
 

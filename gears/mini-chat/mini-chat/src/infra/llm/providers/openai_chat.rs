@@ -1,6 +1,6 @@
 //! `OpenAI` Chat Completions API adapter (`/v1/chat/completions`).
 //!
-//! Implements [`LlmProvider`] by converting [`LlmRequest`] to the Chat
+//! Implements [`LlmProvider`](crate::infra::llm::LlmProvider) by converting [`LlmRequest`] to the Chat
 //! Completions API format, proxying through OAGW, parsing SSE events, and
 //! translating them to the shared `TranslatedEvent` contract.
 
@@ -508,7 +508,7 @@ fn build_request_body<M>(request: &LlmRequest<M>, stream: bool) -> serde_json::V
 
     // User field: "{tenant_id}:{user_id}"
     if let Some(ref identity) = request.user_identity {
-        body["user"] = serde_json::json!(format!("{}:{}", identity.tenant_id, identity.user_id));
+        body["user"] = serde_json::json!(identity.provider_user());
     }
 
     // Map tools: Function → Chat Completions function format, others dropped
@@ -550,10 +550,16 @@ fn build_request_body<M>(request: &LlmRequest<M>, stream: bool) -> serde_json::V
     // Completions API uses a top-level `reasoning_effort`, in contrast to
     // the Responses API which nests it under `reasoning: { effort }`.
     if let Some(p) = request.api_params.as_ref() {
-        body["temperature"] = serde_json::json!(p.temperature);
-        body["top_p"] = serde_json::json!(p.top_p);
-        body["frequency_penalty"] = serde_json::json!(p.frequency_penalty);
-        body["presence_penalty"] = serde_json::json!(p.presence_penalty);
+        for (key, value) in [
+            ("temperature", p.temperature),
+            ("top_p", p.top_p),
+            ("frequency_penalty", p.frequency_penalty),
+            ("presence_penalty", p.presence_penalty),
+        ] {
+            if let Some(v) = value {
+                body[key] = serde_json::json!(v);
+            }
+        }
         if !p.stop.is_empty() {
             body["stop"] = serde_json::json!(&p.stop);
         }
@@ -562,12 +568,8 @@ fn build_request_body<M>(request: &LlmRequest<M>, stream: bool) -> serde_json::V
         }
         // `extra_body` is merged at the top level; policy author's escape
         // hatch for fields not covered by `ModelApiParams`.
-        if let Some(ref extra) = p.extra_body
-            && let (Some(body_obj), Some(extra_obj)) = (body.as_object_mut(), extra.as_object())
-        {
-            for (k, v) in extra_obj {
-                body_obj.insert(k.clone(), v.clone());
-            }
+        if let Some(ref extra) = p.extra_body {
+            super::merge_extra_body(&mut body, extra);
         }
     }
 
@@ -684,7 +686,10 @@ impl crate::infra::llm::LlmProvider for OpenAiChatProvider {
                 Ok(ProviderStream::new(translated, cancel))
             }
             ServerEventsResponse::Response(resp) => {
-                let (_parts, body) = resp.into_parts();
+                let (parts, body) = resp.into_parts();
+                if let Some(e) = crate::infra::llm::error_from_status(&parts) {
+                    return Err(e);
+                }
                 match body.into_bytes().await {
                     Ok(bytes) => {
                         if let Ok(error_payload) =
@@ -818,6 +823,7 @@ impl crate::infra::llm::LlmProvider for OpenAiChatProvider {
 // ════════════════════════════════════════════════════════════════════════════
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use crate::infra::llm::{LlmMessage, llm_request};
@@ -1396,5 +1402,70 @@ mod tests {
         let body = build_request_body(&request, true);
 
         assert!(body.get("tools").is_none());
+    }
+
+    fn sampling(
+        temperature: Option<f64>,
+        top_p: Option<f64>,
+        penalty: Option<f64>,
+    ) -> mini_chat_sdk::ModelApiParams {
+        mini_chat_sdk::ModelApiParams {
+            temperature,
+            top_p,
+            frequency_penalty: penalty,
+            presence_penalty: penalty,
+            stop: vec![],
+            extra_body: None,
+            reasoning_effort: None,
+        }
+    }
+
+    /// `extra_body` cannot turn off the usage report that settlement reads.
+    #[test]
+    fn extra_body_does_not_override_stream_options() {
+        let request = llm_request("gpt-4o")
+            .message(LlmMessage::user("Hi"))
+            .api_params(mini_chat_sdk::ModelApiParams {
+                extra_body: Some(serde_json::json!({
+                    "stream_options": {"include_usage": false},
+                    "tool_choice": "none",
+                    "seed": 7
+                })),
+                ..sampling(None, None, None)
+            })
+            .build_streaming();
+        let body = build_request_body(&request, true);
+        assert_eq!(body["stream_options"]["include_usage"], true);
+        assert!(body.get("tool_choice").is_none(), "{body}");
+        assert_eq!(body["seed"], 7);
+    }
+
+    /// Each sampling parameter is sent only when the model config sets it.
+    #[test]
+    fn api_params_sampling_sent_only_when_set() {
+        let set = llm_request("gpt-4o")
+            .message(LlmMessage::user("Hi"))
+            .api_params(sampling(Some(0.3), None, Some(0.0)))
+            .build_streaming();
+        let body = build_request_body(&set, true);
+        assert_eq!(body["temperature"], 0.3);
+        // A set zero is sent, not treated as unset.
+        assert_eq!(body["frequency_penalty"], 0.0);
+        assert_eq!(body["presence_penalty"], 0.0);
+        assert!(body.get("top_p").is_none(), "{body}");
+
+        let unset = llm_request("gpt-4o")
+            .message(LlmMessage::user("Hi"))
+            .api_params(sampling(None, None, None))
+            .build_streaming();
+        let body = build_request_body(&unset, true);
+        for key in [
+            "temperature",
+            "top_p",
+            "frequency_penalty",
+            "presence_penalty",
+        ] {
+            assert!(body.get(key).is_none(), "{key} must not be sent: {body}");
+        }
     }
 }

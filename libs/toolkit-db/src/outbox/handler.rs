@@ -80,10 +80,11 @@ pub trait LeasedMessageHandler: Send + Sync {
 /// Blanket impl: every [`LeasedMessageHandler`] is automatically a
 /// [`LeasedHandler`]. This replaces `PerMessageAdapter` for the leased path.
 ///
-/// Checks [`Batch::remaining`] before each message. When the remaining budget
-/// is zero the loop stops gracefully - the current in-flight call (if any)
-/// has already completed, and no new messages are started. The processor's
-/// `timeout_at` provides the hard backstop if the handler ignores `remaining()`.
+/// Checks [`Batch::should_stop`] after each message. Once the lease budget is
+/// spent or the outbox is shutting down the loop stops gracefully - the
+/// in-flight call has already completed, and no new messages are started. The
+/// processor drops the handler future as the hard backstop if it ignores
+/// `should_stop()`.
 #[async_trait::async_trait]
 impl<H: LeasedMessageHandler> LeasedHandler for H {
     async fn handle(&self, batch: &mut Batch<'_>) -> HandlerResult {
@@ -97,10 +98,11 @@ impl<H: LeasedMessageHandler> LeasedHandler for H {
                 }
                 MessageResult::Reject(reason) => batch.reject(reason),
             }
-            // Stop starting new messages when the lease budget is exhausted.
-            // The message just processed completed naturally (its HTTP call
-            // finished within its own timeout). Don't start the next one.
-            if batch.remaining().is_zero() {
+            // Stop starting new messages when the lease budget is exhausted
+            // or the outbox is shutting down. The message just processed
+            // completed naturally (its HTTP call finished within its own
+            // timeout). Don't start the next one.
+            if batch.should_stop() {
                 break;
             }
         }
@@ -118,8 +120,9 @@ impl<H: LeasedMessageHandler> LeasedHandler for H {
 /// to exactly one partition.
 ///
 /// **Cancellation:** transactional mode uses row-level locks (not time-based
-/// leases). The framework drops the future on shutdown; no explicit cancel
-/// token is passed.
+/// leases). No cancel token is passed: at shutdown the framework drops the
+/// future once `WorkerTuning::stop_grace` has passed, and the transaction -
+/// including the handler's writes - rolls back, so the batch is redelivered.
 #[async_trait::async_trait]
 pub trait TransactionalHandler: Send + Sync {
     async fn handle(&self, txn: &DatabaseExecutor<'_>, msgs: &[OutboxMessage]) -> HandlerResult;
@@ -247,7 +250,7 @@ mod tests {
         let handler = LeasedCountingHandler::new();
         let msgs: Vec<OutboxMessage> = (1..=5).map(make_msg).collect();
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
-        let mut batch = Batch::new(&msgs, deadline);
+        let mut batch = Batch::new(&msgs, deadline, tokio_util::sync::CancellationToken::new());
 
         let result = LeasedHandler::handle(&handler, &mut batch).await;
         assert!(matches!(result, HandlerResult::Success));
@@ -264,7 +267,7 @@ mod tests {
         };
         let msgs: Vec<OutboxMessage> = (1..=5).map(make_msg).collect();
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
-        let mut batch = Batch::new(&msgs, deadline);
+        let mut batch = Batch::new(&msgs, deadline, tokio_util::sync::CancellationToken::new());
 
         let result = LeasedHandler::handle(&handler, &mut batch).await;
         assert!(matches!(result, HandlerResult::Retry { .. }));
@@ -280,7 +283,7 @@ mod tests {
         };
         let msgs: Vec<OutboxMessage> = (1..=5).map(make_msg).collect();
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
-        let mut batch = Batch::new(&msgs, deadline);
+        let mut batch = Batch::new(&msgs, deadline, tokio_util::sync::CancellationToken::new());
 
         let result = LeasedHandler::handle(&handler, &mut batch).await;
         // Reject at msg 2 (index 1), but blanket impl continues with rest

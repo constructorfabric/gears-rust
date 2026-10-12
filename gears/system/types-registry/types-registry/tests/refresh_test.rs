@@ -27,7 +27,6 @@ use types_registry::domain::admission::worker::{
     OperationOutcome, Tuning, WorkerError, run_operation,
 };
 use types_registry::domain::admission::{Candidate, OperationDispatch, SubmitRequest};
-use types_registry::domain::enums as domain_enums;
 use types_registry::domain::enums::OperationItemStatus;
 use types_registry::domain::policy::RegistrationPolicy;
 use types_registry::domain::ports::{CurrentTypeSchemaRow, EntityRow};
@@ -49,8 +48,12 @@ struct NoDispatch;
 
 #[async_trait::async_trait]
 impl OperationDispatch for NoDispatch {
-    async fn enqueue(&self, _tx: &DbTx<'_>, _operation_id: Uuid) -> anyhow::Result<()> {
-        Ok(())
+    async fn enqueue(
+        &self,
+        _tx: &DbTx<'_>,
+        _operation_id: Uuid,
+    ) -> Result<toolkit_db::outbox::Wake, types_registry::domain::admission::OutboxError> {
+        Ok(toolkit_db::outbox::Wake::empty())
     }
 }
 
@@ -58,7 +61,7 @@ fn worker(db: &Provider) -> DBProvider<WorkerError> {
     DBProvider::new(db.db())
 }
 
-/// Vary `title` to move the content hash, revision, and dependent artifacts
+/// Vary `title` to move the authored content, revision, and dependent artifacts
 /// without changing the accepted-instance set.
 fn base_schema(marker: &str) -> Value {
     json!({
@@ -112,8 +115,7 @@ async fn submit(
         },
         &dispatch,
         &SubmitRequest {
-            idempotency_key: key.to_owned(),
-            kind: domain_enums::OperationKind::Registration,
+            idempotency_key: Some(key.to_owned()),
             dry_run: false,
             candidates: vec![Candidate {
                 gts_id: gts_id.to_owned(),

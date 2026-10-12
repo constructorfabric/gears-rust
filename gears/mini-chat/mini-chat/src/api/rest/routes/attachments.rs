@@ -1,22 +1,11 @@
 use axum::Router;
-use axum::extract::DefaultBodyLimit;
 use toolkit::api::OpenApiRegistry;
 use toolkit::api::operation_builder::OperationBuilder;
 
-use super::AiChatLicense;
-use crate::api::rest::handlers;
+use super::{AiChatLicense, retry_after_header};
+use crate::api::rest::{dto, handlers};
 
 const API_TAG: &str = "Mini Chat Attachments";
-
-/// Coarse outer body-size guard for the upload route.
-///
-/// Set to the largest allowed upload (25 MiB for files) plus 64 KiB for
-/// multipart overhead. The fine-grained per-kind limit is enforced by the
-/// handler's streaming byte counter.
-///
-/// This overrides the API gateway's global `DefaultBodyLimit` (16 MiB)
-/// so that file uploads up to 25 MiB are not rejected by the framework.
-const UPLOAD_BODY_LIMIT: usize = 25 * 1024 * 1024 + 65536;
 
 pub(super) fn register_attachment_routes(
     mut router: Router,
@@ -24,20 +13,32 @@ pub(super) fn register_attachment_routes(
     prefix: &str,
 ) -> Router {
     // POST {prefix}/v1/chats/{id}/attachments (multipart/form-data)
-    // DefaultBodyLimit overrides the gateway's global 16 MiB limit for this route.
+    // The request size cap is the api-gateway's `body_limit_bytes`; the
+    // per-kind file limit is the handler's streaming byte counter.
     router = OperationBuilder::post(format!("{prefix}/v1/chats/{{id}}/attachments"))
         .operation_id("mini_chat.upload_attachment")
+        .multipart_file_request("file", Some("File to upload"))
         .summary("Upload an attachment to a chat")
         .tag(API_TAG)
         .authenticated()
         .require_license_features([&AiChatLicense])
         .path_param("id", "Chat UUID")
         .handler(handlers::attachments::upload_attachment)
-        .json_response(http::StatusCode::CREATED, "Attachment uploaded")
-        .error_415(openapi)
-        .standard_errors(openapi)
-        .register(router, openapi)
-        .layer(DefaultBodyLimit::max(UPLOAD_BODY_LIMIT));
+        .json_response_with_schema::<dto::AttachmentDetailDto>(
+            openapi,
+            http::StatusCode::CREATED,
+            "Attachment uploaded and processed",
+        )
+        .error_400(openapi)
+        .error_401(openapi)
+        .error_403(openapi)
+        .error_404(openapi)
+        .error_409(openapi)
+        .error_429(openapi)
+        .error_500(openapi)
+        .error_503(openapi)
+        .response_header(retry_after_header())
+        .register(router, openapi);
 
     // GET {prefix}/v1/chats/{id}/attachments/{attachment_id}
     router = OperationBuilder::get(format!(
@@ -51,8 +52,18 @@ pub(super) fn register_attachment_routes(
     .path_param("id", "Chat UUID")
     .path_param("attachment_id", "Attachment UUID")
     .handler(handlers::attachments::get_attachment)
-    .json_response(http::StatusCode::OK, "Attachment metadata")
-    .standard_errors(openapi)
+    .json_response_with_schema::<dto::AttachmentDetailDto>(
+        openapi,
+        http::StatusCode::OK,
+        "Attachment metadata",
+    )
+    .error_400(openapi)
+    .error_401(openapi)
+    .error_403(openapi)
+    .error_404(openapi)
+    .error_500(openapi)
+    .error_503(openapi)
+    .response_header(retry_after_header())
     .register(router, openapi);
 
     // DELETE {prefix}/v1/chats/{id}/attachments/{attachment_id}
@@ -67,9 +78,15 @@ pub(super) fn register_attachment_routes(
     .path_param("id", "Chat UUID")
     .path_param("attachment_id", "Attachment UUID")
     .handler(handlers::attachments::delete_attachment)
-    .json_response(http::StatusCode::NO_CONTENT, "Attachment deleted")
+    .no_content_response(http::StatusCode::NO_CONTENT, "Attachment deleted")
     .error_409(openapi)
-    .standard_errors(openapi)
+    .error_400(openapi)
+    .error_401(openapi)
+    .error_403(openapi)
+    .error_404(openapi)
+    .error_500(openapi)
+    .error_503(openapi)
+    .response_header(retry_after_header())
     .register(router, openapi);
 
     router

@@ -1,3 +1,4 @@
+use crate::sequence::Sequence;
 use chrono::Utc;
 use toolkit_gts::gts_id;
 use uuid::Uuid;
@@ -13,14 +14,14 @@ const EVENT_TYPE: &str = gts_id!("cf.core.events.event.v1~example.orders.rejecte
 fn raw_event() -> RawEvent {
     RawEvent {
         id: Uuid::new_v4(),
-        type_id: EVENT_TYPE.to_owned(),
-        topic: TOPIC.to_owned(),
+        type_id: gts::GtsTypeId::new(EVENT_TYPE),
+        topic: gts::GtsInstanceId::try_new(TOPIC).unwrap(),
         tenant_id: Uuid::new_v4(),
         subject: "order-1".to_owned(),
-        subject_type: "order".to_owned(),
+        subject_type: gts::GtsTypeId::new("gts.x.eb.test.subject.v1~"),
         partition: 3,
-        sequence: 42,
-        offset: 42,
+        sequence: Sequence::assigned(42),
+        offset: Sequence::assigned(42),
         occurred_at: Utc::now(),
         sequence_time: Utc::now(),
         trace_parent: Some("00-test".to_owned()),
@@ -46,9 +47,9 @@ fn dead_letter_record_exposes_context_fields_for_diagnosis_and_replay() {
     assert_eq!(record.topic, TOPIC);
     assert_eq!(record.event_type, EVENT_TYPE);
     assert_eq!(record.subject, "order-1");
-    assert_eq!(record.subject_type, "order");
+    assert_eq!(record.subject_type, "gts.x.eb.test.subject.v1~");
     assert_eq!(record.partition, 3);
-    assert_eq!(record.offset, 42);
+    assert_eq!(record.offset, Sequence::assigned(42));
     assert_eq!(record.payload, payload);
     assert_eq!(record.reason, "schema mismatch");
     assert_eq!(record.attempts, Some(2));

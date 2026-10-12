@@ -14,3 +14,7 @@ coverage:
         target: auto
         # Allows the overall project coverage to drop by up to 1% and still pass
         threshold: 1%
+# Route registration only (paths, OpenAPI metadata, handler binding); no logic.
+# These files run only in the E2E suites, whose coverage is not uploaded.
+ignore:
+  - "gears/mini-chat/mini-chat/src/api/rest/routes/**"

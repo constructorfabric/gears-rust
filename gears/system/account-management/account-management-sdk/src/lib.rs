@@ -73,6 +73,6 @@ pub use metadata::{
     MetadataEntry, MetadataEntryFilterField, MetadataEntryQuery, UpsertMetadataRequest,
 };
 pub use tenant::{
-    CreateTenantRequest, Tenant, TenantId, TenantInfoFilterField, TenantInfoQuery, TenantStatus,
-    UpdateTenantRequest,
+    CreateTenantRequest, Tenant, TenantAncestor, TenantId, TenantInfoFilterField, TenantInfoQuery,
+    TenantNode, TenantStatus, UpdateTenantRequest,
 };

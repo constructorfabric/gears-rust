@@ -41,6 +41,7 @@ fn streaming_idents(method: &RestMethodModel) -> Option<(Type, Type)> {
     }
 }
 
+/// Expands a parsed `#[rest_contract]` projection into the cleaned trait, client, routes and REST binding function.
 pub fn generate(model: &RestContractModel) -> TokenStream {
     if let Some(err) = check_path_placeholders(model) {
         return err;
@@ -480,7 +481,10 @@ fn generate_client_struct(model: &RestContractModel, support: &TokenStream) -> T
             /// transport-layer retry disabled (the SDK retries itself), plaintext
             /// `http://` allowed unless `config.require_tls` is set, and — when
             /// the `otel` feature is enabled — W3C `traceparent` propagation plus
-            /// RED client metrics labeled with this projection trait name. For
+            /// RED client metrics labeled with this projection trait name. The
+            /// transport-construction fields of `config` are consumed here:
+            /// `require_tls`, `pool_max_idle_per_host`, `pool_idle_timeout`,
+            /// `max_concurrent_requests` and the per-attempt `timeout`. For
             /// caller-controlled HTTP client construction use
             /// [`Self::with_http_client`].
             ///
@@ -494,13 +498,19 @@ fn generate_client_struct(model: &RestContractModel, support: &TokenStream) -> T
             ) -> ::std::result::Result<Self, ::toolkit_http::HttpError> {
                 let http = #support::runtime::client::build_default_http_client(
                     #metrics_label,
-                    config.require_tls,
+                    &config,
                 )?;
                 Ok(Self { http, config })
             }
 
-            /// Build a new client with a caller-supplied `toolkit-http`
-            /// HTTP client.
+            /// Build a new client with a caller-supplied `toolkit-http` HTTP client.
+            ///
+            /// The caller owns transport construction, so the transport-construction
+            /// fields of `config` (`require_tls`, `pool_*`, `max_concurrent_requests`)
+            /// are **not** applied — they must already be baked into `http`. Only the
+            /// call-time fields (`timeout`, `retry`, streaming, `internal_token_provider`)
+            /// are read per call. In particular, `require_tls` here does **not** enforce
+            /// TLS — build `http` with `TransportSecurity::TlsOnly` if you need it.
             #[must_use]
             pub fn with_http_client(
                 http: ::toolkit_http::HttpClient,

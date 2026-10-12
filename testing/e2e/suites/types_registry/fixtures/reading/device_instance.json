@@ -1,0 +1,7 @@
+{
+  "gts_id": "gts.cf.e2e.reading.device.v1~cf.e2e.reading.sensor.v1",
+  "content": {
+    "serial": "SN-001",
+    "payload": {}
+  }
+}

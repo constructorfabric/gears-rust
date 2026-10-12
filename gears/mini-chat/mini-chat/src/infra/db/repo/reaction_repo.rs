@@ -120,5 +120,6 @@ impl crate::domain::repos::ReactionRepository for ReactionRepository {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 #[path = "reaction_repo_test.rs"]
 mod tests;

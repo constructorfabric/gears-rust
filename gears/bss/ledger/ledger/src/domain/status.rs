@@ -79,6 +79,17 @@ pub(crate) const RUN_STATUS_DONE: &str = "DONE";
 /// The `FAILED` recognition-run status — a run that aborted mid-pass.
 pub(crate) const RUN_STATUS_FAILED: &str = "FAILED";
 
+// --- Reconciliation run status (`reconciliation_run.status`) ---
+
+/// The `RUNNING` reconciliation-run status — stamped by
+/// `ReconciliationRunRepo::start` when a check opens its transaction.
+pub(crate) const RECON_RUN_STATUS_RUNNING: &str = "RUNNING";
+
+/// The `DONE` reconciliation-run status — a check that finalized with its
+/// variance result. The retired-tenant purge only ever deletes `DONE` rows, so
+/// the finalize path and the purge predicate must read this one constant.
+pub(crate) const RECON_RUN_STATUS_DONE: &str = "DONE";
+
 // --- Fiscal period status (`fiscal_period.status`) ---
 
 /// Fiscal-period status that admits posting (set at period-open; the

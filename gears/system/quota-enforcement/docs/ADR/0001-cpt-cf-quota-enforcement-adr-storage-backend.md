@@ -63,7 +63,7 @@ decision this ADR records is *how* storage is selected — not *which* storage i
 Chosen option: **(a) — pluggable trait with capability contract.** Storage is decoupled into
 `QuotaEnforcementStoragePluginV1` (defined in `cpt-cf-quota-enforcement-fr-pluggable-storage`). QE-core specifies only
 outcome-based **capability requirements** (DESIGN §3.5 «Required backend capabilities») plus the storage-trait
-invariants I1–I13 (DESIGN §3.3). Any backend that satisfies the contract is contract-compliant — QE-core does not name,
+invariants I1–I14 (DESIGN §3.3). Any backend that satisfies the contract is contract-compliant — QE-core does not name,
 prefer, or constrain any specific backend.
 
 ### Capability contract
@@ -95,12 +95,12 @@ SQLite are equally valid `toolkit-db` targets with documented operational trade-
 
 This reference plugin is a **default**, not a normative choice. Operators are free to ship a different plugin against
 the same contract — distributed KV, in-memory + WAL, embedded engines, custom solutions, anything that satisfies the
-§3.5 capability list + I1–I13 invariants. QE-core remains unchanged across plugin choices.
+§3.5 capability list + I1–I14 invariants. QE-core remains unchanged across plugin choices.
 
 ### Operator freedom
 
 Selecting a storage backend is an **operator-deployment decision**, not a QE-core decision. The single normative
-constraint is conformance to the §3.5 capability list plus I1–I13 invariants. Operators may:
+constraint is conformance to the §3.5 capability list plus I1–I14 invariants. Operators may:
 
 - adopt the reference plugin as-is;
 - swap the reference plugin for another `toolkit-db`-family target (different RDBMS);
@@ -118,17 +118,18 @@ to the contract.
   does not pin it.
 - Reference impl exists for default deployment ergonomics; alternative plugins (any vendor, any architecture) are
   first-class peers, not second-tier alternatives.
-- The capability contract (DESIGN §3.5 + I1–I13) is the single point of evolution. Changes to the contract are
+- The capability contract (DESIGN §3.5 + I1–I14) is the single point of evolution. Changes to the contract are
   major-version bumps of `QuotaEnforcementStoragePluginV1`; backwards-compatible additive changes are allowed within a
   major.
-- Sweeper / dispatcher singleton coordination is **out of scope** of this contract; it lives in
-  `cpt-cf-quota-enforcement-adr-coordination-plugin`. Storage and coordination plugins evolve independently.
+- Sweeper singleton coordination is **out of scope** of this contract; it lives in
+  `cpt-cf-quota-enforcement-adr-coordination-plugin`, which consumes the platform `cluster` gear. Storage and
+  coordination evolve independently.
 
 ### Confirmation
 
 Confirmed for any storage-plugin impl (reference or third-party) by:
 
-- code review of the impl against the §3.5 capability list and the I1–I13 invariants;
+- code review of the impl against the §3.5 capability list and the I1–I14 invariants;
 - benchmark suite covering `cpt-cf-quota-enforcement-nfr-evaluation-latency` and
   `cpt-cf-quota-enforcement-nfr-throughput` under the impl's target NFR profile;
 - DR drill validating the impl's claimed RPO under `cpt-cf-quota-enforcement-nfr-fault-tolerance`.
@@ -169,7 +170,7 @@ against their own backend.
 
 ## More Information
 
-The capability-level contract lives in DESIGN §3.5 «Required backend capabilities» plus the I1–I13 invariants on
+The capability-level contract lives in DESIGN §3.5 «Required backend capabilities» plus the I1–I14 invariants on
 `QuotaEnforcementStoragePluginV1` (DESIGN §3.3). Concrete plugin DESIGN (table / collection / file layouts, indexes,
 partitioning, locking discipline, replication strategy, metadata-storage shape) is authored by the plugin owner
 alongside the plugin crate; QE-core does not pin the file path.
@@ -187,5 +188,5 @@ This decision directly addresses:
 - `cpt-cf-quota-enforcement-nfr-throughput` — throughput is a capability obligation; per-impl realisation varies.
 - Sibling ADR `cpt-cf-quota-enforcement-adr-acquisition-ordering` — deterministic acquisition ordering as a capability;
   every plugin must respect it.
-- Sibling ADR `cpt-cf-quota-enforcement-adr-coordination-plugin` — singleton coordination is a separate plugin contract;
-  storage and coordination evolve independently.
+- Sibling ADR `cpt-cf-quota-enforcement-adr-coordination-plugin`: singleton coordination comes from the platform
+  `cluster` gear; storage and coordination evolve independently.

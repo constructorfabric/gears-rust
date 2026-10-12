@@ -174,7 +174,6 @@ impl ProducerRegistration {
                     mode_to_str(self.mode),
                     mode_to_str(managed.mode)
                 ),
-                instance: String::new(),
             });
         }
         if self.client_agent != client_agent {
@@ -183,7 +182,6 @@ impl ProducerRegistration {
                     "managed producer registration '{}' has client_agent '{}', expected '{}'",
                     self.key, self.client_agent, client_agent
                 ),
-                instance: String::new(),
             });
         }
         Ok(())

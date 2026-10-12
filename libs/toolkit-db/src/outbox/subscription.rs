@@ -19,17 +19,17 @@ use super::types::InstanceId;
 /// What an ack needs to deliver a completion in-process: who this instance is,
 /// and who is waiting.
 #[derive(Debug)]
-pub struct Mailbox {
+pub struct TraceMailbox {
     instance_id: InstanceId,
-    subscriptions: Arc<TraceRegistry>,
+    registry: Arc<TraceRegistry>,
 }
 
-impl Mailbox {
+impl TraceMailbox {
     #[must_use]
-    pub fn new(instance_id: InstanceId, subscriptions: Arc<TraceRegistry>) -> Self {
+    pub fn new(instance_id: InstanceId, registry: Arc<TraceRegistry>) -> Self {
         Self {
             instance_id,
-            subscriptions,
+            registry,
         }
     }
 
@@ -39,8 +39,8 @@ impl Mailbox {
     }
 
     #[must_use]
-    pub fn subscriptions(&self) -> &Arc<TraceRegistry> {
-        &self.subscriptions
+    pub fn registry(&self) -> &Arc<TraceRegistry> {
+        &self.registry
     }
 }
 

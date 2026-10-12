@@ -1,10 +1,4 @@
-//! Repo-level test for `VersionRepo::get`'s direct-predicate rewrite (P2 2.2).
-//!
-//! Runs against a real SQLite DB with the full migration applied, exercising
-//! `toolkit_db::secure`'s `DBRunner`/`AccessScope` machinery exactly as
-//! `Store` does — a plain `sea_orm::Database::connect` cannot stand in here
-//! because `VersionRepo::get`/`insert`/`list_by_file` require a `DBRunner`,
-//! which is only obtainable via `DBProvider::conn()`.
+//! `VersionRepo::get` direct-predicate test on a real SQLite DB.
 
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::doc_markdown)]
 
@@ -24,8 +18,7 @@ use file_storage_sdk::{File, FileVersion, OwnerKind, VersionStatus};
 
 const GTS: &str = gts_id!("cf.fstorage.file.type.v1~x.test.file.type.v1~");
 
-/// A unique temp-file SQLite DB (mirrors `service_test.rs::build_service`) —
-/// a bare `sqlite::memory:` gives each pooled connection its own empty DB.
+/// Temp-file SQLite DB (a bare `sqlite::memory:` gives each pooled connection its own).
 async fn db() -> Arc<DBProvider<DbError>> {
     let mut path = std::env::temp_dir();
     path.push(format!(
@@ -80,15 +73,8 @@ fn new_version(file_id: Uuid, version_id: Uuid, size: i64) -> FileVersion {
     }
 }
 
-/// `VersionRepo::get(file_id, version_id)` must resolve exactly the target
-/// row among many versions seeded across two different files, and must never
-/// resolve a version under a `file_id` it does not belong to.
-///
-/// This exercises the P2 2.2 rewrite of `get` from a `list_by_file` +
-/// Rust-side `.find()` scan to a direct two-column SQL predicate: the old
-/// code's comment claimed the direct predicate "proved unreliable across the
-/// secure layer", but this test — plus `cargo clippy`/`cargo test` staying
-/// green — did not reproduce that; the direct query resolves correctly.
+/// `get(file_id, version_id)` resolves exactly the target row among many versions of two files,
+/// and never under a foreign `file_id`.
 #[tokio::test]
 async fn version_repo_get_returns_correct_row_among_many() {
     let db = db().await;
@@ -109,8 +95,7 @@ async fn version_repo_get_returns_correct_row_among_many() {
         .await
         .expect("create file_b");
 
-    // Seed several versions per file. The target lives in file_a; every
-    // other row (in file_a and file_b) must be excluded by `get`.
+    // The target lives in file_a; every other row must be excluded by `get`.
     let mut target: Option<Uuid> = None;
     for i in 0..5u8 {
         let vid = Uuid::now_v7();
@@ -140,8 +125,6 @@ async fn version_repo_get_returns_correct_row_among_many() {
     assert_eq!(found.version_id, target);
     assert_eq!(found.size, 20, "must be the i==2 row, not any other");
 
-    // Cross-file bleed check: the same version_id does not exist under
-    // file_b, so looking it up scoped to file_b must resolve to nothing.
     let cross = versions
         .get(&conn, &scope, file_b, target)
         .await

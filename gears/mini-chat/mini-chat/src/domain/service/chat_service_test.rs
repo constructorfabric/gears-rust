@@ -143,8 +143,8 @@ async fn create_chat_empty_title_rejected() {
 
     assert!(result.is_err());
     assert!(
-        matches!(result.unwrap_err(), DomainError::Validation { .. }),
-        "Expected Validation error for empty title at create"
+        matches!(result.unwrap_err(), DomainError::InvalidTitle { .. }),
+        "Expected InvalidTitle error for empty title at create"
     );
 }
 
@@ -296,7 +296,7 @@ async fn update_chat_title_empty_rejected() {
 
     assert!(result.is_err());
     assert!(
-        matches!(result.unwrap_err(), DomainError::Validation { .. }),
+        matches!(result.unwrap_err(), DomainError::InvalidTitle { .. }),
         "Expected Validation error"
     );
 }
@@ -331,7 +331,7 @@ async fn update_chat_title_whitespace_only_rejected() {
 
     assert!(result.is_err());
     assert!(
-        matches!(result.unwrap_err(), DomainError::Validation { .. }),
+        matches!(result.unwrap_err(), DomainError::InvalidTitle { .. }),
         "Expected Validation error"
     );
 }
@@ -367,7 +367,7 @@ async fn update_chat_title_too_long_rejected() {
 
     assert!(result.is_err());
     assert!(
-        matches!(result.unwrap_err(), DomainError::Validation { .. }),
+        matches!(result.unwrap_err(), DomainError::InvalidTitle { .. }),
         "Expected Validation error"
     );
 }
@@ -1139,4 +1139,35 @@ async fn list_chats_filter_contains_title_excludes_null_titles() {
         Some("Q3 Report"),
         "Matched chat must be the one with title"
     );
+}
+
+// Sending a message needs `send_message` only: a policy that denies `read`
+// still lets the caller resolve the chat model for the stream.
+#[tokio::test]
+async fn chat_model_for_send_is_authorized_by_send_message_only() {
+    use crate::domain::service::actions;
+    use crate::domain::service::test_helpers::recording_enforcer;
+
+    let db = inmem_db().await;
+    let (enforcer, resolver) = recording_enforcer(Some(actions::READ));
+    let svc = build_service_with_enforcer(db, enforcer);
+    let ctx = test_security_ctx(Uuid::new_v4());
+    let created = svc
+        .create_chat(
+            &ctx,
+            NewChat {
+                model: Some("gpt-5.2".to_owned()),
+                title: None,
+                is_temporary: false,
+            },
+        )
+        .await
+        .expect("create failed");
+    resolver.actions.lock().unwrap().clear();
+
+    let model = svc.chat_model_for_send(&ctx, created.id).await.unwrap();
+    assert_eq!(model, "gpt-5.2");
+    assert_eq!(*resolver.actions.lock().unwrap(), [actions::SEND_MESSAGE]);
+    // `read` itself is denied by this policy.
+    assert!(svc.get_chat(&ctx, created.id).await.is_err());
 }

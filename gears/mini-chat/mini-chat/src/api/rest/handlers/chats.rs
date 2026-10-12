@@ -2,9 +2,9 @@ use std::sync::Arc;
 
 use crate::domain::models::{ChatPatch, NewChat};
 use axum::Extension;
-use axum::extract::Path;
 use toolkit::api::canonical_prelude::*;
 use toolkit::api::odata::OData;
+use toolkit::api::rest::extract::Path;
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
@@ -17,7 +17,7 @@ pub(crate) async fn create_chat(
     uri: axum::http::Uri,
     Extension(ctx): Extension<SecurityContext>,
     Extension(svc): Extension<Arc<AppServices>>,
-    Json(req_body): Json<CreateChatReq>,
+    extract::Json(req_body): extract::Json<CreateChatReq>,
 ) -> ApiResult<impl IntoResponse> {
     let new = NewChat {
         model: req_body.model,
@@ -59,7 +59,7 @@ pub(crate) async fn update_chat(
     Extension(ctx): Extension<SecurityContext>,
     Extension(svc): Extension<Arc<AppServices>>,
     Path(id): Path<Uuid>,
-    Json(req_body): Json<UpdateChatReq>,
+    extract::Json(req_body): extract::Json<UpdateChatReq>,
 ) -> ApiResult<JsonBody<ChatDetailDto>> {
     let patch = ChatPatch {
         title: Some(Some(req_body.title)),

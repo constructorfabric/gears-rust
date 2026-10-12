@@ -11,6 +11,7 @@ See `testing/e2e/README.md` ("How E2E Is Executed") for the full picture.
 """
 import argparse
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -177,10 +178,153 @@ def cmd_cfs_validate(_args):
         sys.exit(result.returncode)
 
 
+_FROM_RE = re.compile(r"(?i)^\s*FROM\s+(.*)$")
+_RUST_TAG_RE = re.compile(r"^rust:([0-9.]+)-")
+
+
+def _check_dockerfile_from_lines(text, channel):
+    """Parse a Dockerfile's FROM lines against `channel`.
+
+    Returns `(errors, warnings)`, each a list of `(lineno, message)` tuples.
+
+    Handles the bits a naive `line.split()[1]` misses:
+      * `FROM builder` / `FROM builder AS runtime` reference an earlier build
+        stage, not a registry image - tracked via `AS <name>` and skipped;
+      * `FROM scratch` is skipped;
+      * leading `--flag` / `--flag=value` tokens (e.g. `--platform=...`) are
+        skipped to find the real ref;
+      * `FROM`/`from` and stage names are matched case-insensitively;
+      * a ref containing `$` (a build-arg substitution, e.g. `$BASE_IMAGE`)
+        cannot be statically verified, so it is reported as a warning instead
+        of an error.
+    """
+    stage_names = set()
+    errors = []
+    warnings = []
+    for lineno, line in enumerate(text.splitlines(), 1):
+        m = _FROM_RE.match(line)
+        if not m:
+            continue
+        tokens = m.group(1).split()
+        idx = 0
+        while idx < len(tokens) and tokens[idx].startswith("--"):
+            idx += 1
+        if idx >= len(tokens):
+            continue
+        ref = tokens[idx]
+        stage_name = None
+        if idx + 2 < len(tokens) and tokens[idx + 1].lower() == "as":
+            stage_name = tokens[idx + 2].lower()
+
+        ref_lower = ref.lower()
+        if ref_lower == "scratch" or ref_lower in stage_names:
+            pass
+        elif "$" in ref:
+            warnings.append(
+                (lineno, f"base image ref could not be verified (contains a variable): {ref}")
+            )
+        else:
+            if "@sha256:" not in ref:
+                errors.append((lineno, f"base image is not digest-pinned: {ref}"))
+            rust = _RUST_TAG_RE.match(ref)
+            if rust and rust.group(1) != channel:
+                warnings.append(
+                    (lineno, f"rust {rust.group(1)} != rust-toolchain.toml {channel}")
+                )
+
+        if stage_name:
+            stage_names.add(stage_name)
+
+    return errors, warnings
+
+
+def cmd_docker_pins(_args):
+    """Guard the base-image pins against silent drift.
+
+    Two checks, enforced differently:
+      * every FROM line must be digest-pinned (`@sha256:...`). This is
+        hard-blocking: `.github/dependabot.yml`'s `docker` ecosystem owns
+        these pins and keeps the digest current whenever it bumps the tag,
+        so there is always an automated PR that can turn a red check green.
+      * the Rust version embedded in the image tag (`rust:<ver>-...`) is
+        checked against rust-toolchain.toml's `channel`, but only as a
+        *warning*. The image tag is owned by the `docker` ecosystem and
+        rust-toolchain.toml is owned by the `cargo` ecosystem - two separate
+        Dependabot updaters that do not know about each other, so nothing
+        correlates them. A hard failure here would permanently block the
+        `docker` ecosystem's PRs (no bot could ever satisfy it), and a lane
+        that automation can never pass ends up marked non-required and
+        ignored by everyone - which defeats the point of having it. So a
+        mismatch is surfaced loudly (including as a GitHub Actions
+        annotation in CI) but does not fail the build.
+
+    A warning nobody owns is a warning nobody clears, so the currently
+    outstanding mismatch has an issue of its own: #4917 tracks moving
+    rust-toolchain.toml to 1.98.0, which is blocked on 55 new
+    clippy::unused_async_trait_impl sites across 21 files. When that lands,
+    this check reports 0 warnings again.
+
+    Pure text parsing - no Docker daemon, no network, runs in well under a
+    second, so it can sit on every PR.
+    """
+    step("Checking Docker base-image pins")
+
+    toolchain_path = os.path.join(PROJECT_ROOT, "rust-toolchain.toml")
+    with open(toolchain_path, encoding="utf-8-sig") as fh:
+        m = re.search(r'^\s*channel\s*=\s*"([^"]+)"', fh.read(), re.M)
+    if not m:
+        print(f"ERROR: no [toolchain] channel in {toolchain_path}")
+        sys.exit(1)
+    channel = m.group(1)
+    print(f"rust-toolchain.toml channel: {channel}")
+
+    # Prune rather than filter after the fact: `target/` alone is ~17 GB here, and
+    # os.walk would happily recurse all of it looking for Dockerfiles it cannot
+    # contain.
+    pruned = {".git", ".venv", "node_modules", "target"}
+    dockerfiles = []
+    for root, dirs, files in os.walk(PROJECT_ROOT):
+        dirs[:] = [d for d in dirs if d not in pruned]
+        dockerfiles.extend(
+            os.path.join(root, name) for name in files if name.endswith("Dockerfile")
+        )
+    dockerfiles.sort()
+
+    errors = []
+    warnings = []  # (rel, lineno, message)
+    checked = 0
+    for path in dockerfiles:
+        rel = os.path.relpath(path, PROJECT_ROOT)
+        # .clusterfuzzlite is owned by the OSS-Fuzz base image contract, which
+        # tracks its own upstream tag; it is deliberately out of scope here.
+        if rel.startswith(".clusterfuzzlite"):
+            continue
+        checked += 1
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read()
+        file_errors, file_warnings = _check_dockerfile_from_lines(text, channel)
+        errors.extend(f"{rel}:{lineno}: {msg}" for lineno, msg in file_errors)
+        warnings.extend((rel, lineno, msg) for lineno, msg in file_warnings)
+
+    in_github_actions = os.environ.get("GITHUB_ACTIONS") == "true"
+    for rel, lineno, msg in warnings:
+        print(f"WARNING: {rel}:{lineno}: {msg}")
+        if in_github_actions:
+            print(f"::warning file={rel},line={lineno}::{msg}")
+
+    if errors:
+        print("ERROR: Docker base-image pin check FAILED")
+        for problem in errors:
+            print(f"  {problem}")
+        sys.exit(1)
+    print(f"OK. {checked} Dockerfile(s) checked, {len(warnings)} warning(s)")
+
+
 def cmd_check(args):
     step("Running full check suite")
     cmd_fmt(args)
     cmd_cfs_validate(args)
+    cmd_docker_pins(args)
     cmd_clippy(args)
     cmd_test(args)
     cmd_gts_docs(args)
@@ -311,229 +455,263 @@ def cmd_e2e(args):
     server_process = None
     release_bin = None
     release_sidecar_bin = None
+    # Pessimistic default. Everything from `docker compose up` onward can leave
+    # the process early - wait_for_health() calls sys.exit() on a readiness
+    # timeout - and the teardown below decides whether to dump the container
+    # logs by reading this value. Starting at 0 would drop the logs on exactly
+    # the failures worth reading.
+    exit_code = 1
 
-    if args.docker:
-        step("Running E2E tests in Docker mode")
+    # try/finally, not straight-line code: Python runs `finally` while a
+    # SystemExit propagates, so the compose environment comes down and its logs
+    # come out even when the readiness check exited instead of returning.
+    try:
+        if args.docker:
+            step("Running E2E tests in Docker mode")
 
-        # Check docker
-        result = run_cmd_allow_fail(["docker", "version"])
-        if result.returncode != 0:
-            print("ERROR: docker is not installed or not in PATH")
-            sys.exit(1)
-
-        result = run_cmd_allow_fail(["docker", "compose", "version"])
-        if result.returncode != 0:
-            print("ERROR: 'docker compose' is not available")
-            sys.exit(1)
-
-        # Build image
-        step("Building Docker image for E2E tests")
-        build_cmd = [
-            "docker",
-            "build",
-            "-f",
-            "testing/docker/cf-gears.Dockerfile",
-            "-t",
-            "cf-gears-api:e2e",
-        ]
-
-        # Add build args for cargo features if specified
-        if args.features:
-            build_cmd.extend(["--build-arg", f"CARGO_FEATURES={args.features}"])
-
-        build_cmd.append(".")
-        run_cmd(build_cmd)
-
-        # Rebuild only the mock service so Python mock server changes are picked up
-        # without overwriting the prebuilt API image (which was built with features).
-        step("Rebuilding docker-compose mock service")
-        run_cmd(
-            [
-                "docker",
-                "compose",
-                "-f",
-                "testing/docker/docker-compose.yml",
-                "build",
-                "mock",
-            ]
-        )
-
-        # Start environment
-        step("Starting E2E docker-compose environment")
-        run_cmd(
-            [
-                "docker",
-                "compose",
-                "-f",
-                "testing/docker/docker-compose.yml",
-                "up",
-                "--force-recreate",
-                "-d",
-            ]
-        )
-        docker_env_started = True
-
-        # Wait for healthz
-        wait_for_health(base_url)
-    else:
-        step("Running E2E tests in local mode")
-        server_process = None
-        print("Starting cf-gears-server for local E2E...")
-
-        env_e2e_binary = os.environ.get("E2E_SERVER_BINARY") or os.environ.get("E2E_BINARY")
-        env_fs_sidecar_binary = os.environ.get("FS_SIDECAR_BINARY")
-        release_sidecar_bin = None
-
-        if env_e2e_binary:
-            release_bin = env_e2e_binary
-            if not os.path.isfile(release_bin):
-                print(f"\nERROR: E2E server binary does not exist: {release_bin}")
+            # Check docker
+            result = run_cmd_allow_fail(["docker", "version"])
+            if result.returncode != 0:
+                print("ERROR: docker is not installed or not in PATH")
                 sys.exit(1)
-        else:
-            step("Building release binary for local E2E")
+
+            result = run_cmd_allow_fail(["docker", "compose", "version"])
+            if result.returncode != 0:
+                print("ERROR: 'docker compose' is not available")
+                sys.exit(1)
+
+            # Build image
+            step("Building Docker image for E2E tests")
             build_cmd = [
-                "cargo",
+                "docker",
                 "build",
-                "--release",
-                "--bin",
-                "cf-gears-example-server",
+                "-f",
+                "testing/docker/cf-gears.Dockerfile",
+                "-t",
+                "cf-gears-api:e2e",
             ]
-            e2e_features = read_e2e_features(Path(PROJECT_ROOT))
-            if e2e_features:
-                build_cmd.extend(["--features", e2e_features])
+
+            # Add build args for cargo features if specified
+            if args.features:
+                build_cmd.extend(["--build-arg", f"CARGO_FEATURES={args.features}"])
+
+            # "release" (default) or "dev". A dev build trades runtime speed for a
+            # much shorter compile, which is what the CI smoke lane wants — the
+            # image is a functional test subject, not a performance subject.
+            build_profile = os.environ.get("E2E_DOCKER_BUILD_PROFILE")
+            if build_profile:
+                build_cmd.extend(["--build-arg", f"BUILD_PROFILE={build_profile}"])
+
+            build_cmd.append(".")
             run_cmd(build_cmd)
 
-            release_bin = str(find_binary(
-                Path(PROJECT_ROOT) / "target", "release", "cf-gears-example-server"
-            ))
+            # Rebuild only the mock service so Python mock server changes are picked up
+            # without overwriting the prebuilt API image (which was built with features).
+            step("Rebuilding docker-compose mock service")
+            run_cmd(
+                [
+                    "docker",
+                    "compose",
+                    "-f",
+                    "testing/docker/docker-compose.yml",
+                    "build",
+                    "mock",
+                ]
+            )
 
-            if not os.path.isfile(release_bin):
-                print(f"\nERROR: Release binary not found at: {release_bin}")
-                print("Build it first with:")
-                print("  make cargo-build")
-                sys.exit(1)
+            # Start environment
+            step("Starting E2E docker-compose environment")
+            run_cmd(
+                [
+                    "docker",
+                    "compose",
+                    "-f",
+                    "testing/docker/docker-compose.yml",
+                    "up",
+                    "--force-recreate",
+                    "-d",
+                ]
+            )
+            docker_env_started = True
 
-        if env_fs_sidecar_binary:
-            release_sidecar_bin = env_fs_sidecar_binary
-            if not os.path.isfile(release_sidecar_bin):
-                print(f"\nERROR: FS_SIDECAR_BINARY does not exist: {release_sidecar_bin}")
-                sys.exit(1)
+            # Wait for healthz
+            wait_for_health(base_url)
+        else:
+            step("Running E2E tests in local mode")
+            server_process = None
+            print("Starting cf-gears-server for local E2E...")
 
-        # Create logs directory if it doesn't exist
-        logs_dir = os.path.join(PROJECT_ROOT, "testing", "e2e", "logs")
-        os.makedirs(logs_dir, exist_ok=True)
+            env_e2e_binary = os.environ.get("E2E_SERVER_BINARY") or os.environ.get("E2E_BINARY")
+            env_fs_sidecar_binary = os.environ.get("FS_SIDECAR_BINARY")
+            release_sidecar_bin = None
 
-        data_dir = os.path.join(PROJECT_ROOT, "data")
-        os.makedirs(data_dir, exist_ok=True)
+            if env_e2e_binary:
+                release_bin = env_e2e_binary
+                if not os.path.isfile(release_bin):
+                    print(f"\nERROR: E2E server binary does not exist: {release_bin}")
+                    sys.exit(1)
+            else:
+                step("Building release binary for local E2E")
+                build_cmd = [
+                    "cargo",
+                    "build",
+                    "--release",
+                    "--bin",
+                    "cf-gears-example-server",
+                ]
+                e2e_features = read_e2e_features(Path(PROJECT_ROOT))
+                if e2e_features:
+                    build_cmd.extend(["--features", e2e_features])
+                run_cmd(build_cmd)
 
-        # Start server in background with logs redirected to files
-        config_path = getattr(args, "config", "config/e2e-local.yaml")
-        server_cmd = [
-            release_bin,
-            "--config",
-            config_path,
-        ]
+                release_bin = str(find_binary(
+                    Path(PROJECT_ROOT) / "target", "release", "cf-gears-example-server"
+                ))
 
-        server_log_file = os.path.join(logs_dir, "cf-gears-e2e.log")
-        server_error_file = os.path.join(logs_dir, "cf-gears-e2e-error.log")
+                if not os.path.isfile(release_bin):
+                    print(f"\nERROR: Release binary not found at: {release_bin}")
+                    print("Build it first with:")
+                    print("  make cargo-build")
+                    sys.exit(1)
 
-        with open(server_log_file, "w") as out_file, open(
-            server_error_file, "w"
-        ) as err_file:
-            # Set RUST_LOG to enable debug logging for types_registry module
-            server_env = os.environ.copy()
-            server_env["RUST_LOG"] = "types_registry=debug,info"
-            # Apply per-OS server config overrides (e.g. grpc-hub TCP on
-            # Windows, where the config's UDS address is unsupported).
-            # setdefault keeps any explicit user-provided override.
-            for key, value in e2e_env_overrides().items():
-                server_env.setdefault(key, value)
-            try:
-                server_process = popen_new_group(
-                    server_cmd,
-                    stdout=out_file,
-                    stderr=err_file,
-                    env=server_env,
-                )
-            except OSError as e:
-                print(f"ERROR: Failed to start cf-gears-server: {e}")
-                _print_log_file(server_error_file, "server stderr")
-                sys.exit(1)
+            if env_fs_sidecar_binary:
+                release_sidecar_bin = env_fs_sidecar_binary
+                if not os.path.isfile(release_sidecar_bin):
+                    print(f"\nERROR: FS_SIDECAR_BINARY does not exist: {release_sidecar_bin}")
+                    sys.exit(1)
 
-        print(f"Started cf-gears-server (pid={server_process.pid})")
+            # Create logs directory if it doesn't exist
+            logs_dir = os.path.join(PROJECT_ROOT, "testing", "e2e", "logs")
+            os.makedirs(logs_dir, exist_ok=True)
 
-        print("Server logs redirected to:")
-        print(f"  - stdout: {server_log_file}")
-        print(f"  - stderr: {server_error_file}")
-        print(
-            "  - application logs: "
-            f"{os.path.join(logs_dir, 'cf-gears-e2e.log')}"
-        )
-        print(f"  - SQL logs: {os.path.join(logs_dir, 'sql.log')}")
-        print(f"  - API logs: {os.path.join(logs_dir, 'api.log')}")
+            data_dir = os.path.join(PROJECT_ROOT, "data")
+            os.makedirs(data_dir, exist_ok=True)
 
-        # Wait for server to be ready, checking for early crash
-        wait_for_health(
-            base_url,
-            timeout_secs=60,
-            server_process=server_process,
-            error_log=server_error_file,
-            output_log=server_log_file,
-        )
-        print("Server started successfully and passed health check")
+            # Start server in background with logs redirected to files
+            config_path = getattr(args, "config", "config/e2e-local.yaml")
+            server_cmd = [
+                release_bin,
+                "--config",
+                config_path,
+            ]
 
-    # Run pytest
-    step("Running pytest")
-    env = os.environ.copy()
-    env["E2E_BASE_URL"] = base_url
+            server_log_file = os.path.join(logs_dir, "cf-gears-e2e.log")
+            server_error_file = os.path.join(logs_dir, "cf-gears-e2e-error.log")
 
-    if release_bin is not None:
-        env.setdefault("FS_E2E_BINARY", release_bin)
-    if release_sidecar_bin is not None:
-        env.setdefault("FS_SIDECAR_BINARY", release_sidecar_bin)
+            with open(server_log_file, "w") as out_file, open(
+                server_error_file, "w"
+            ) as err_file:
+                # Set RUST_LOG to enable debug logging for types_registry module
+                server_env = os.environ.copy()
+                server_env["RUST_LOG"] = "types_registry=debug,info"
+                # Apply per-OS server config overrides (e.g. grpc-hub TCP on
+                # Windows, where the config's UDS address is unsupported).
+                # setdefault keeps any explicit user-provided override.
+                for key, value in e2e_env_overrides().items():
+                    server_env.setdefault(key, value)
+                try:
+                    server_process = popen_new_group(
+                        server_cmd,
+                        stdout=out_file,
+                        stderr=err_file,
+                        env=server_env,
+                    )
+                except OSError as e:
+                    print(f"ERROR: Failed to start cf-gears-server: {e}")
+                    _print_log_file(server_error_file, "server stderr")
+                    sys.exit(1)
 
-    # Set E2E_DOCKER_MODE flag for the tests to know which mode they're in
-    if args.docker:
-        env["E2E_DOCKER_MODE"] = "1"
-        env.setdefault("E2E_MOCK_UPSTREAM_URL", "http://mock:8080")
+            print(f"Started cf-gears-server (pid={server_process.pid})")
 
-    pytest_cmd = [PYTHON, "-m", "pytest", "-vv"]
-    if args.smoke:
-        pytest_cmd.extend(["-m", "smoke"])
-    if args.pytest_args:
-        # argparse.REMAINDER includes the '--' separator if used
-        # We need to strip it so pytest doesn't treat following flags as files
-        extra_args = args.pytest_args
-        if extra_args and extra_args[0] == "--":
-            extra_args = extra_args[1:]
-        if extra_args and not extra_args[0].startswith("-"):
-            pytest_cmd.extend(extra_args)
+            print("Server logs redirected to:")
+            print(f"  - stdout: {server_log_file}")
+            print(f"  - stderr: {server_error_file}")
+            print(
+                "  - application logs: "
+                f"{os.path.join(logs_dir, 'cf-gears-e2e.log')}"
+            )
+            print(f"  - SQL logs: {os.path.join(logs_dir, 'sql.log')}")
+            print(f"  - API logs: {os.path.join(logs_dir, 'api.log')}")
+
+            # Wait for server to be ready, checking for early crash
+            wait_for_health(
+                base_url,
+                timeout_secs=60,
+                server_process=server_process,
+                error_log=server_error_file,
+                output_log=server_log_file,
+            )
+            print("Server started successfully and passed health check")
+
+        # Run pytest
+        step("Running pytest")
+        env = os.environ.copy()
+        env["E2E_BASE_URL"] = base_url
+
+        if release_bin is not None:
+            env.setdefault("FS_E2E_BINARY", release_bin)
+        if release_sidecar_bin is not None:
+            env.setdefault("FS_SIDECAR_BINARY", release_sidecar_bin)
+
+        # Set E2E_DOCKER_MODE flag for the tests to know which mode they're in
+        if args.docker:
+            env["E2E_DOCKER_MODE"] = "1"
+            env.setdefault("E2E_MOCK_UPSTREAM_URL", "http://mock:8080")
+
+        pytest_cmd = [PYTHON, "-m", "pytest", "-vv"]
+        if args.smoke:
+            pytest_cmd.extend(["-m", "smoke"])
+        if args.pytest_args:
+            # argparse.REMAINDER includes the '--' separator if used
+            # We need to strip it so pytest doesn't treat following flags as files
+            extra_args = args.pytest_args
+            if extra_args and extra_args[0] == "--":
+                extra_args = extra_args[1:]
+            if extra_args and not extra_args[0].startswith("-"):
+                pytest_cmd.extend(extra_args)
+            else:
+                pytest_cmd.append("testing/e2e")
+                pytest_cmd.extend(extra_args)
         else:
             pytest_cmd.append("testing/e2e")
-            pytest_cmd.extend(extra_args)
-    else:
-        pytest_cmd.append("testing/e2e")
 
-    result = run_cmd_allow_fail(pytest_cmd, env=env)
-    exit_code = result.returncode
+        result = run_cmd_allow_fail(pytest_cmd, env=env)
+        exit_code = result.returncode
 
-    if args.docker and docker_env_started:
-        step("Stopping E2E docker-compose environment")
-        run_cmd_allow_fail(
-            [
-                "docker",
-                "compose",
-                "-f",
-                "testing/docker/docker-compose.yml",
-                "down",
-                "-v",
-            ]
-        )
+    finally:
+        if args.docker and docker_env_started:
+            # Before `down`, not after: the teardown removes the containers, so a
+            # caller (CI step, human) has nothing left to read once we return.
+            if exit_code != 0:
+                step("Capturing docker-compose logs")
+                run_cmd_allow_fail(
+                    [
+                        "docker",
+                        "compose",
+                        "-f",
+                        "testing/docker/docker-compose.yml",
+                        "logs",
+                        "--no-color",
+                        "--tail=400",
+                    ]
+                )
 
-    # Stop server if we started it
-    if server_process is not None:
-        step("Stopping cf-gears-server")
-        stop_process_tree(server_process, timeout=10)
+            step("Stopping E2E docker-compose environment")
+            run_cmd_allow_fail(
+                [
+                    "docker",
+                    "compose",
+                    "-f",
+                    "testing/docker/docker-compose.yml",
+                    "down",
+                    "-v",
+                ]
+            )
+
+        # Stop server if we started it
+        if server_process is not None:
+            step("Stopping cf-gears-server")
+            stop_process_tree(server_process, timeout=10)
 
     print("")
     if exit_code == 0:
@@ -830,6 +1008,12 @@ def build_parser():
     p_fuzz_clean.set_defaults(func=cmd_fuzz_clean)
 
     # cfs-validate
+    p_docker_pins = subparsers.add_parser(
+        "docker-pins",
+        help="Check Dockerfile base images are digest-pinned and match rust-toolchain.toml",
+    )
+    p_docker_pins.set_defaults(func=cmd_docker_pins)
+
     p_cfs = subparsers.add_parser("cfs-validate", help="Validate CFS artifacts (specs, code, templates)")
     p_cfs.set_defaults(func=cmd_cfs_validate)
 

@@ -15,6 +15,7 @@ Updated:  2026-07-08 by Virtuozzo International GmbH
 - [2. Principles & Constraints](#2-principles--constraints)
   - [2.1 Design Principles](#21-design-principles)
   - [2.2 Constraints](#22-constraints)
+  - [2.3 Numeric contract](#23-numeric-contract)
 - [3. Technical Architecture](#3-technical-architecture)
   - [3.1 Domain Model](#31-domain-model)
   - [3.2 Component Model](#32-component-model)
@@ -117,7 +118,7 @@ Foundation        total lock order · idempotency · money · provisioning · da
 (shared engine)   — owns no domain policy
        │
        ▼
-Persistence       toolkit-db backend (BIGINT minor-unit money; append-only journal)
+Persistence       toolkit-db backend (canonical decimal TEXT in major units; append-only journal)
 Cross-cutting     audit-immutability (tamper chain / freeze) protects every posting flow
 ```
 
@@ -215,17 +216,142 @@ The audit hash chain is a launch blocker, active from the first production post,
 
 Canonical terms are fixed: `journal_entry`/`journal_line` (not `LedgerEntry`); `UNALLOCATED` ≠ `REUSABLE_CREDIT`; `SUSPENSE` = mapping parking only; chargeback holds in `DISPUTE_HOLD`. Normative: [`design/01-repository-foundation.md` §4.1](./design/01-repository-foundation.md#41-naming-glossary-discipline-and-module-alignment).
 
-#### Money is BIGINT minor units (MVP)
+#### Money uses validated decimals in major units
 
-- [ ] `p1` - **ID**: `cpt-cf-bss-ledger-constraint-bigint-money`
+- [ ] `p1` - **ID**: `cpt-cf-bss-ledger-constraint-decimal-money`
 
-Money is stored as `BIGINT` minor units for MVP (`NUMERIC(38,0)` deferred); one functional currency per selling legal entity.
+Money uses `rust_decimal::Decimal` in major currency units: `12.34 EUR` at scale 2,
+never `1234` minor units. Every monetary value carries its currency code and stored
+currency scale. The type `PostedMoney { amount, currency: CurrencySpec { code, scale } }` comes from the
+shared BSS crate `bss-money` (`gears/bss/libs/money`, re-exported by the ledger SDK) and validates an incoming posting without rounding: `12.340`
+becomes `12.34`; `0.047` at scale 2 is rejected (`InvalidPostingIncrement`); zero is valid.
+`0.047` is a valid FX rate, because a rate has no posting increment. Previously the
+ledger stored integer minor units and micro-rates; now every amount and rate is a
+validated decimal, and the code is the source of truth for this contract.
+
+| Contract | Limit or rule |
+|---|---|
+| Decimal coefficient | Normalized absolute coefficient below `10^28` (at most 28 digits) |
+| Decimal scale | 0–28 fractional digits after normalization |
+| Magnitude | Absolute amount below `10^28`; coefficient limit also applies |
+| Currency code | 1–16 uppercase ASCII letters or digits |
+| Currency scale | 0–28; defines the posting increment `10^-currency_scale` |
+| Posting | Exact multiple of the currency increment; never rounded on input |
+| Wire text | Plain decimal string, at most 64 bytes before parsing |
+| Canonical output | At most 31 bytes, including sign and decimal point |
+| Balances | Same bounded decimal contract; reject out-of-range results |
+| Internal arithmetic | Exact fractions over `BigInt`; no approximate division |
+| Internal budget | At most 256 decimal digits per reduced numerator or denominator |
+| Stored amounts and rates | Canonical decimal `TEXT` on PostgreSQL and SQLite |
+
+Canonical text (`canonical_decimal`) uses no exponent, whitespace, leading `+`, leading
+integer zeros or negative zero. `parse_decimal` reads at most 64 bytes and rejects those
+forms; fractional trailing zeros are accepted and normalized away. The same text is used
+on the wire, in storage and in hashes. Journal rules separately decide whether a
+particular line may be zero or negative.
+
+Rounding happens only at declared points, each HALF_EVEN at the stored currency scale:
+
+- allocation shares (`bss_money::allocate`, `gears/bss/libs/money/src/allocate.rs`: exact proportion per share, one rounding per
+  share, the exact residual on the selected index — last or largest weight);
+- FX translation (`domain/fx/translate.rs`: exact product `amount × rate`, one rounding
+  at the target scale; the per-entry functional residual closes on the anchor line);
+- recognition segments (straight-line schedules reuse `allocate` with equal weights and
+  the residual on the last segment);
+- the two pro-rata reliefs that use the same exact-ratio-then-round rule: the
+  settlement-return fee share (`fee × amount ÷ settled`, at the settlement's scale) and
+  the realized-FX carried relief (`domain/fx/realized.rs`, at the functional scale).
+
+Nothing else rounds. Sums, differences, caps and comparisons are exact
+(`bss_money::exact`), and the posting service rejects an amount that is not a
+multiple of the increment instead of rounding it.
+
+`CurrencySpec` validates the code's shape and supported scale, not registry membership.
+The posting service compares new input against the current authoritative currency
+registry. Restoring stored values and reversing postings use their stored metadata,
+including after the registry changes.
+
+Text storage (`infra/storage/money_text.rs`) preserves all accepted digits on both
+databases; a stored value that is not canonical text is reported as corrupt, never
+normalized. SQL must not add or sort monetary text as numeric values. PostgreSQL checks
+and triggers cast validated text to exact `numeric` (`bss.ledger_decimal_valid` enforces
+the canonical pattern, at most 28 significant digits, fractional digits within the stored
+scale and magnitude below `10^28`); SQLite keeps length and sign checks only. Application
+calculations remain common to both backends. Balance scale is validated row metadata,
+never a new axis of the business key: one bucket per business key and currency, and a
+posting whose scale differs from the bucket's stored scale is a named mismatch error.
+A balance cache update reads the row, adds exactly and writes conditionally on `version`;
+a lost update retries the whole transaction, at most three attempts
+(`infra/posting/retry.rs`). FX quotes are positive decimals in quote major units per
+base major unit.
+
+On the wire every REST money field is
+`MoneyDto { "amount": "12.34", "currency": "EUR", "currency_scale": 2 }`
+(`api/rest/money.rs`); a JSON number in `amount` is rejected with `InvalidArgument`, and
+output is canonical text. FX quotes are decimal strings (`rate`). The SDK traits are
+`LedgerClientV1`, `IssuedInvoiceManifestV1`, `PspSettlementFeedV1` and `RateProviderV1`,
+with the plugin type `RateProviderPluginSpecV1`; `ProvisionCurrencyScale { currency:
+CurrencySpec, source }` seeds a non-ISO scale (the REST body keeps `currency` and
+`currency_scale`). The decimal limit is the same for every
+currency and scale.
+
+`PostingService::post` refuses `SourceDocType::Reversal`. Reversals go through
+`InvoicePostService::post_reversal`, which re-reads the stored journal facts and the
+stored currency and scale, never the current registry.
+
+Events are not migrated. The parked `v1` event schemas (`ledger/schemas/*.v1.schema.json`)
+and the parked publisher keep their integer `*_minor` fields, filled through one policy
+(`infra/v1_payload.rs`): `amount × 10^scale`, exact because a posted amount is a multiple
+of the increment, whenever the value fits `i64`. A larger value (reachable at high
+currency scales: at scale 18, anything above about 9.22 units) saturates to `i64::MAX` or
+`i64::MIN` by sign and is logged at `warn` with the exact decimal; it never fails a
+posting, rolls back a run or drops an alarm. The events move to decimal together with
+the broker integration.
+
+This release uses a fresh ledger schema and a new chain encoding
+(`VHP-BSS-LEDGER-CHAIN-v2`, length-prefixed canonical decimal text with currency and
+scale) in one breaking release. The existing migration chain was rewritten in place for
+fresh installs; there is no data conversion, backfill, dual write or old API adapter.
+A database created by an earlier release is not supported: reset it before deployment.
+The reconciliation tolerance key is `recon.ar_tolerance_increments_per_k_lines` (posting
+increments per 1,000 posted lines, per currency bucket). The recognition ceiling
+`recognition.max_segments_per_schedule` keeps its default of 120. One functional currency
+remains configured per selling legal entity.
 
 #### Call-driven ingestion
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-ledger-constraint-call-driven-ingestion`
 
 The ledger posts only in response to explicit calls from upstream BSS flows; it does not poll or self-originate entries. Normative: [`design/01-repository-foundation.md` §4.3](./design/01-repository-foundation.md#43-call-driven-ingestion-model-normative).
+
+### 2.3 Numeric contract
+
+Published limits (the same for every currency): at most 28 significant digits after
+normalization, scale 0–28, absolute magnitude below `10^28`. Internally the ledger uses
+reduced fractions in major currency units (`bss_money::exact`, `gears/bss/libs/money/src/exact.rs`, over
+`bigdecimal::num_bigint::BigInt`). Each reduced numerator and denominator has at most 256
+decimal digits. Products use at most 512 scratch digits; adding two products can need 513.
+The budget is checked after reduction, so cancellation remains exact. `into_posted_exact`
+tests divisibility at the currency scale and never rounds; `round_half_even` is the one
+explicit rounding operation, used only by the owners listed in §2.2. Query totals are
+returned as bounded `PostedMoney` with a named range error; this is deliberately stricter
+than the ADR's unbounded-query exception.
+
+Bound proof. Write each input as `c / 10^s`, with `|c| < 10^28` and `0 <= s <= 28`:
+
+| Operation | Conservative derivation |
+|---|---|
+| Sum of `n` differently scaled inputs | At common denominator `10^28`, each numerator is `c * 10^(28-s)`, below `10^56`. The total is below `n * 10^56`. |
+| Sum of 1,000 inputs | Numerator below `10^59`: at most 59 digits, denominator at most `10^28`. |
+| Product of two inputs | Coefficient product below `10^56`, denominator at most `10^56`. |
+| Weighted share, `n <= 10^20` | Write the weight sum as `S / 10^28`, where `S < 10^76`. Then `total * weight / sum = c_t*c_w*10^28 / (10^(s_t+s_w)*S)`: numerator below `10^84`, denominator below `10^132`. |
+| Quantize that share | Multiplication by `10^currency_scale` adds at most 28 numerator digits: below `10^112`, with the same denominator bound. |
+
+All fit the 256-digit reduced budget. The operation limits that feed these rows are far
+tighter than `10^20`: `MAX_LINES = 1000` per entry, 998 invoices per allocation and 120
+segments per schedule. Revalidate the proof before adding factors. The mixed-scale
+regression sums 999 copies of the largest 28-digit integer and `10^-28`; its reduced
+numerator has 59 digits.
 
 ## 3. Technical Architecture
 
@@ -302,6 +428,8 @@ Reconciliations, ERP export, period-close gate ([`design/07-reconciliation-expor
 The ledger's primary contract is the **in-process data-access API** exposed by the
 Foundation (build-balanced-lines → post → commit), consumed by the slice handlers; it is
 specified in [`design/01-repository-foundation.md`](./design/01-repository-foundation.md).
+Its Rust surface is the SDK trait `LedgerClientV1` with `PostedMoney` values; the REST
+surface carries every amount as `MoneyDto` (§2.2).
 Outward-facing surfaces (ERP export, reconciliation) are defined in
 [`design/07-reconciliation-export.md`](./design/07-reconciliation-export.md).
 
@@ -349,7 +477,7 @@ The canonical schema — `journal_entry`, `journal_line`, balance caches, accoun
 idempotency records, and per-slice tables — is owned by the Foundation and specified
 normatively in [`design/01-repository-foundation.md`](./design/01-repository-foundation.md)
 §4.2 (Foundation schema ownership). Slice-specific tables are introduced by their respective
-slice documents. Money columns are `BIGINT` minor units for MVP.
+slice documents. Money columns use canonical decimal `TEXT` in major units under the limits in §2.2.
 
 ### 3.8 Deployment Topology
 
@@ -361,7 +489,7 @@ coordination lease library. Deployment specifics are platform-standard for a BSS
 
 - **Telemetry** — posting throughput, balance-cache lag, and close-gate state are surfaced per the audit/observability slice ([`design/02-audit-immutability-observability.md`](./design/02-audit-immutability-observability.md)).
 - **Risks** — the book-ownership predicate depends on an AMS catalogue change landing (`x-gts-traits.owns_billing_books`); until then the ledger evaluates the interim seller set (`platform` + `partner`), as recorded in [`cpt-cf-bss-ledger-adr-book-ownership-predicate`](./ADR/0001-cpt-cf-bss-ledger-adr-book-ownership-predicate.md).
-- **Deferred to future scope (post-MVP)** — cross-currency conversion (rejected in MVP — payments-allocation rejects `ALLOCATION_CURRENCY_MISMATCH`; the conversion-event mechanism is a deferred extension of fx-multicurrency), the statutory allocation registry, contract assets / unbilled, bad-debt / write-off / recovery, the full variable-consideration mechanism, escheatment filing, free-form GL, inter-tenant settlement / reseller payout, `NUMERIC(38,0)` money (`BIGINT` minor units confirmed for MVP), the ledger-side payer re-validation guard against the tenant tree, and historical / as-of temporal balance (reconstructable from `journal_line`). Each slice carries its own deferred markers; the consolidated registry is in [`PRD.md`](./PRD.md) § "Deferred to future scope".
+- **Deferred to future scope (post-MVP)** — cross-currency conversion (rejected in MVP — payments-allocation rejects `ALLOCATION_CURRENCY_MISMATCH`; the conversion-event mechanism is a deferred extension of fx-multicurrency), the statutory allocation registry, contract assets / unbilled, bad-debt / write-off / recovery, the full variable-consideration mechanism, escheatment filing, free-form GL, inter-tenant settlement / reseller payout, the ledger-side payer re-validation guard against the tenant tree, and historical / as-of temporal balance (reconstructable from `journal_line`). Each slice carries its own deferred markers; the consolidated registry is in [`PRD.md`](./PRD.md) § "Deferred to future scope".
 
 ## 5. Traceability
 

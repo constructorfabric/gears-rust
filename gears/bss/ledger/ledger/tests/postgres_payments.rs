@@ -3,10 +3,10 @@
 //! with `cargo test -p cf-gears-bss-ledger --test postgres_payments -- --ignored`.
 //!
 //! Covers: (a) `seed_settlement` then `read_settlement` round-trips
-//! `settled_minor`; (b) two `add_allocated` calls net; (c) `add_allocated`
-//! past `settled_minor` trips the cap CHECK → `MoneyOutCapExceeded`;
+//! `settled`; (b) two `add_allocated` calls net; (c) `add_allocated`
+//! past `settled` trips the cap CHECK → `MoneyOutCapExceeded`;
 //! (d) `insert_allocation_rows` then `list_payment_allocations` returns N
-//! rows; (e) `list_open_ar_invoices` filters `balance_minor > 0` and orders
+//! rows; (e) `list_open_ar_invoices` filters `balance > 0` and orders
 //! `original_posted_at, invoice_id`, under the tenant's own scope; (f)
 //! `bump_allocation_refund` nets and its refund-vs-allocated CHECK is enforced.
 //!
@@ -31,7 +31,6 @@ use bss_ledger::domain::error::DomainError;
 use bss_ledger::domain::instant::format_rfc3339;
 use bss_ledger::domain::instant::to_naive_date;
 use bss_ledger::domain::model::{AccountRow, CurrencyScaleRow, NewEntry, NewLine, RepoError};
-use bss_ledger::domain::money::DEFAULT_PLAUSIBLE_MAX_MAJOR;
 use bss_ledger::domain::payment::precedence::Allocated;
 use bss_ledger::domain::payment::settlement::SettlementInput;
 use bss_ledger::domain::ports::metrics::NoopLedgerMetrics;
@@ -44,8 +43,11 @@ use bss_ledger::infra::posting::service::PostingService;
 use bss_ledger::infra::storage::migrations::Migrator;
 use bss_ledger::infra::storage::repo::payment_repo::NewAllocationRow;
 use bss_ledger::infra::storage::repo::{PaymentRepo, ReferenceRepo};
-use bss_ledger_sdk::{AccountClass, MappingStatus, Side, SourceDocType};
+use bss_ledger_sdk::{
+    AccountClass, CurrencySpec, MappingStatus, PostedMoney, Side, SourceDocType, canonical_decimal,
+};
 use chrono::NaiveDate;
+use rust_decimal::Decimal;
 use sea_orm::{ConnectionTrait, Database, DbErr, Statement};
 use sea_orm_migration::MigratorTrait;
 use testcontainers_modules::postgres::Postgres;
@@ -58,6 +60,21 @@ use uuid::Uuid;
 
 fn pg(sql: impl Into<String>) -> Statement {
     Statement::from_string(sea_orm::DatabaseBackend::Postgres, sql.into())
+}
+
+/// The USD@2 currency spec every fixture here posts in.
+fn usd_spec() -> CurrencySpec {
+    CurrencySpec::try_new("USD".to_owned(), 2).unwrap()
+}
+
+/// A USD scale-2 posting from a cent count (`1234` ⇒ `12.34`).
+fn usd(cents: i64) -> PostedMoney {
+    PostedMoney::try_new(Decimal::new(cents, 2), usd_spec()).unwrap()
+}
+
+/// The canonical stored text of a USD cent count (`970` ⇒ `"9.7"`).
+fn text(cents: i64) -> String {
+    canonical_decimal(Decimal::new(cents, 2))
 }
 
 /// Lift a component `RepoError` into a `DbError` so the repo write can be the
@@ -93,12 +110,14 @@ async fn seed_then_read_settlement() {
     let tenant = Uuid::now_v7();
     let payment_id = "psp-1";
     let scope = AccessScope::allow_all();
+    let repo = PaymentRepo::new(provider.clone());
 
     provider
         .transaction(|txn| {
             let scope = scope.clone();
+            let repo = repo.clone();
             Box::pin(async move {
-                PaymentRepo::seed_settlement(txn, &scope, tenant, payment_id, "USD", 1000, 0)
+                repo.seed_settlement(txn, &scope, tenant, payment_id, &usd(1000), &usd(0))
                     .await
                     .map_err(lift)
             })
@@ -106,15 +125,14 @@ async fn seed_then_read_settlement() {
         .await
         .expect("seed settlement");
 
-    let repo = PaymentRepo::new(provider.clone());
     let row = repo
         .read_settlement(&scope, tenant, payment_id)
         .await
         .expect("read settlement")
         .expect("settlement row present");
-    assert_eq!(row.settled_minor, 1000);
-    assert_eq!(row.allocated_minor, 0);
-    assert_eq!(row.currency, "USD");
+    assert_eq!(row.settled, usd(1000));
+    assert_eq!(row.allocated, usd(0));
+    assert_eq!(row.settled.currency(), &usd_spec());
 }
 
 #[tokio::test]
@@ -124,13 +142,15 @@ async fn add_allocated_nets_and_caps() {
     let tenant = Uuid::now_v7();
     let payment_id = "psp-2";
     let scope = AccessScope::allow_all();
+    let repo = PaymentRepo::new(provider.clone());
 
     // Seed settled=1000.
     provider
         .transaction(|txn| {
             let scope = scope.clone();
+            let repo = repo.clone();
             Box::pin(async move {
-                PaymentRepo::seed_settlement(txn, &scope, tenant, payment_id, "USD", 1000, 0)
+                repo.seed_settlement(txn, &scope, tenant, payment_id, &usd(1000), &usd(0))
                     .await
                     .map_err(lift)
             })
@@ -143,8 +163,9 @@ async fn add_allocated_nets_and_caps() {
         provider
             .transaction(|txn| {
                 let scope = scope.clone();
+                let repo = repo.clone();
                 Box::pin(async move {
-                    PaymentRepo::add_allocated(txn, &scope, tenant, payment_id, delta)
+                    repo.add_allocated(txn, &scope, tenant, payment_id, &usd(delta))
                         .await
                         .map_err(lift)
                 })
@@ -153,21 +174,21 @@ async fn add_allocated_nets_and_caps() {
             .expect("add allocated");
     }
 
-    let repo = PaymentRepo::new(provider.clone());
     let row = repo
         .read_settlement(&scope, tenant, payment_id)
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(row.allocated_minor, 500, "300 + 200 nets to 500");
+    assert_eq!(row.allocated, usd(500), "300 + 200 nets to 500");
 
     // A third increment of 600 would push allocated to 1100 > settled 1000 →
     // the cap CHECK rejects it; the repo maps it to MoneyOutCapExceeded.
     let err = provider
         .transaction(|txn| {
             let scope = scope.clone();
+            let repo = repo.clone();
             Box::pin(async move {
-                PaymentRepo::add_allocated(txn, &scope, tenant, payment_id, 600)
+                repo.add_allocated(txn, &scope, tenant, payment_id, &usd(600))
                     .await
                     .map_err(lift)
             })
@@ -185,7 +206,7 @@ async fn add_allocated_nets_and_caps() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(row.allocated_minor, 500, "over-cap increment rolled back");
+    assert_eq!(row.allocated, usd(500), "over-cap increment rolled back");
 }
 
 #[tokio::test]
@@ -197,6 +218,7 @@ async fn insert_then_list_allocations() {
     let payment_id = "psp-3";
     let allocation_id = Uuid::now_v7();
     let scope = AccessScope::allow_all();
+    let repo = PaymentRepo::new(provider.clone());
 
     let rows = vec![
         NewAllocationRow {
@@ -205,8 +227,7 @@ async fn insert_then_list_allocations() {
             payer_tenant_id: payer,
             payment_id: payment_id.to_owned(),
             invoice_id: "inv-a".to_owned(),
-            amount_minor: 300,
-            currency: "USD".to_owned(),
+            amount: usd(300),
             precedence_policy_ref: "oldest-first.v1".to_owned(),
             allocated_at_utc: OffsetDateTime::now_utc(),
         },
@@ -216,8 +237,7 @@ async fn insert_then_list_allocations() {
             payer_tenant_id: payer,
             payment_id: payment_id.to_owned(),
             invoice_id: "inv-b".to_owned(),
-            amount_minor: 200,
-            currency: "USD".to_owned(),
+            amount: usd(200),
             precedence_policy_ref: "oldest-first.v1".to_owned(),
             allocated_at_utc: OffsetDateTime::now_utc(),
         },
@@ -226,9 +246,10 @@ async fn insert_then_list_allocations() {
     provider
         .transaction(|txn| {
             let scope = scope.clone();
+            let repo = repo.clone();
             let rows = rows;
             Box::pin(async move {
-                PaymentRepo::insert_allocation_rows(txn, &scope, &rows)
+                repo.insert_allocation_rows(txn, &scope, &rows)
                     .await
                     .map_err(lift)
             })
@@ -236,16 +257,15 @@ async fn insert_then_list_allocations() {
         .await
         .expect("insert allocation rows");
 
-    let repo = PaymentRepo::new(provider.clone());
     let listed = repo
         .list_payment_allocations(&scope, tenant, payment_id)
         .await
         .expect("list allocations");
     assert_eq!(listed.len(), 2);
     assert_eq!(listed[0].invoice_id, "inv-a", "ordered by invoice_id");
-    assert_eq!(listed[0].amount_minor, 300);
+    assert_eq!(listed[0].amount, usd(300));
     assert_eq!(listed[1].invoice_id, "inv-b");
-    assert_eq!(listed[1].amount_minor, 200);
+    assert_eq!(listed[1].amount, usd(200));
 }
 
 #[tokio::test]
@@ -267,12 +287,13 @@ async fn list_open_ar_invoices_filters_and_orders() {
     // one fully paid (balance 0, must be filtered out). inv-late posts AFTER
     // inv-early, so oldest-first puts inv-early first.
     let insert = |invoice: &str, balance: i64, posted: &str| {
+        let balance = text(balance);
         pg(format!(
             "INSERT INTO bss.ledger_ar_invoice_balance
                 (tenant_id, payer_tenant_id, account_id, invoice_id, currency,
-                 balance_minor, original_posted_at)
+                 currency_scale, balance, original_posted_at)
              VALUES ('{tenant}','{payer}','{account}','{invoice}','USD',
-                     {balance}, '{posted}')"
+                     2, '{balance}', '{posted}')"
         ))
     };
     raw.execute_raw(insert("inv-late", 800, "2026-02-01T00:00:00Z"))
@@ -296,9 +317,9 @@ async fn list_open_ar_invoices_filters_and_orders() {
         "the paid (0-balance) invoice is filtered out"
     );
     assert_eq!(open[0].invoice_id, "inv-early", "oldest posted first");
-    assert_eq!(open[0].balance_minor, 300);
+    assert_eq!(open[0].balance, usd(300));
     assert_eq!(open[1].invoice_id, "inv-late");
-    assert_eq!(open[1].balance_minor, 800);
+    assert_eq!(open[1].balance, usd(800));
 }
 
 #[tokio::test]
@@ -308,15 +329,22 @@ async fn bump_allocation_refund_nets_and_caps() {
     let tenant = Uuid::now_v7();
     let payment_id = "psp-4";
     let scope = AccessScope::allow_all();
+    let repo = PaymentRepo::new(provider.clone());
 
     // Two bumps net the allocated counter to 500.
     for delta in [300_i64, 200_i64] {
         provider
             .transaction(|txn| {
                 let scope = scope.clone();
+                let repo = repo.clone();
                 Box::pin(async move {
-                    PaymentRepo::bump_allocation_refund(
-                        txn, &scope, tenant, payment_id, "inv-a", delta,
+                    repo.bump_allocation_refund(
+                        txn,
+                        &scope,
+                        tenant,
+                        payment_id,
+                        "inv-a",
+                        &usd(delta),
                     )
                     .await
                     .map_err(lift)
@@ -326,35 +354,38 @@ async fn bump_allocation_refund_nets_and_caps() {
             .expect("bump allocation refund");
     }
 
-    let allocated: i64 = {
+    let allocated: String = {
         let row = raw
             .query_one_raw(pg(format!(
-                "SELECT allocated_minor FROM bss.ledger_payment_allocation_refund
+                "SELECT allocated FROM bss.ledger_payment_allocation_refund
                  WHERE tenant_id='{tenant}' AND payment_id='{payment_id}' AND invoice_id='inv-a'"
             )))
             .await
             .unwrap()
             .expect("refund row present");
-        row.try_get("", "allocated_minor").unwrap()
+        row.try_get("", "allocated").unwrap()
     };
-    assert_eq!(allocated, 500, "300 + 200 nets to 500");
+    assert_eq!(allocated, "5", "3.00 + 2.00 nets to the canonical 5");
 
-    // Drive refunded_minor up to allocated (500) directly, then a further
-    // refund would break refunded_minor <= allocated_minor — verifying the
-    // CHECK exists on the table (the refund increment is Slice 3's path).
+    // Drive refunded up to allocated (5) directly, then a further refund
+    // would break refunded <= allocated — verifying the CHECK exists on the
+    // table (the refund increment is Slice 3's path).
     raw.execute_raw(pg(format!(
-        "UPDATE bss.ledger_payment_allocation_refund SET refunded_minor = 500
+        "UPDATE bss.ledger_payment_allocation_refund SET refunded = '5'
          WHERE tenant_id='{tenant}' AND payment_id='{payment_id}' AND invoice_id='inv-a'"
     )))
     .await
-    .expect("refunded_minor = allocated_minor is allowed");
+    .expect("refunded = allocated is allowed");
+    // '10' is numerically above '5' but sorts BELOW it as text, so only a
+    // numeric comparison in the CHECK rejects it (a lost `::numeric` cast would
+    // let it through).
     let err = raw
         .execute_raw(pg(format!(
-            "UPDATE bss.ledger_payment_allocation_refund SET refunded_minor = 600
+            "UPDATE bss.ledger_payment_allocation_refund SET refunded = '10'
              WHERE tenant_id='{tenant}' AND payment_id='{payment_id}' AND invoice_id='inv-a'"
         )))
         .await
-        .expect_err("refunded_minor > allocated_minor must be rejected by CHECK");
+        .expect_err("refunded > allocated must be rejected by CHECK");
     assert!(
         err.to_string().contains("chk_par_refunded_le_allocated"),
         "unexpected error: {err}"
@@ -418,8 +449,7 @@ async fn setup_seller(raw: &sea_orm::DatabaseConnection, provider: &DBProvider<D
         .upsert_currency_scale(CurrencyScaleRow {
             tenant_id: s.tenant,
             currency: "USD".to_owned(),
-            minor_units: 2,
-            plausible_max_major: DEFAULT_PLAUSIBLE_MAX_MAJOR,
+            currency_scale: 2,
             source: "iso".to_owned(),
         })
         .await
@@ -487,43 +517,44 @@ fn settlement_input(s: &Seller, payment_id: &str, gross: i64, fee: i64) -> Settl
         tenant_id: s.tenant,
         payer_tenant_id: s.payer,
         payment_id: payment_id.to_owned(),
-        gross_minor: gross,
-        fee_minor: fee,
-        currency: "USD".to_owned(),
+        gross: usd(gross),
+        fee: usd(fee),
         // None ⇒ the orchestrator stamps a current-month effective date /
         // period (matching the OPEN period `setup_seller` provisions).
         effective_at: None,
     }
 }
 
+/// The stored canonical balance text of an account (`None` when no row).
 async fn account_balance(
     raw: &sea_orm::DatabaseConnection,
     s: &Seller,
     account: Uuid,
-) -> Option<i64> {
+) -> Option<String> {
     raw.query_one_raw(pg(format!(
-        "SELECT balance_minor FROM bss.ledger_account_balance \
+        "SELECT balance FROM bss.ledger_account_balance \
          WHERE tenant_id='{}' AND account_id='{}' AND currency='USD'",
         s.tenant, account
     )))
     .await
     .unwrap()
-    .map(|r| r.try_get_by_index::<i64>(0).unwrap())
+    .map(|r| r.try_get_by_index::<String>(0).unwrap())
 }
 
+/// The stored canonical open-AR text of an invoice (`None` when no row).
 async fn ar_invoice_balance(
     raw: &sea_orm::DatabaseConnection,
     s: &Seller,
     invoice_id: &str,
-) -> Option<i64> {
+) -> Option<String> {
     raw.query_one_raw(pg(format!(
-        "SELECT balance_minor FROM bss.ledger_ar_invoice_balance \
+        "SELECT balance FROM bss.ledger_ar_invoice_balance \
          WHERE tenant_id='{}' AND invoice_id='{}'",
         s.tenant, invoice_id
     )))
     .await
     .unwrap()
-    .map(|r| r.try_get_by_index::<i64>(0).unwrap())
+    .map(|r| r.try_get_by_index::<String>(0).unwrap())
 }
 
 async fn count_allocations(raw: &sea_orm::DatabaseConnection, s: &Seller, payment_id: &str) -> i64 {
@@ -537,20 +568,21 @@ async fn count_allocations(raw: &sea_orm::DatabaseConnection, s: &Seller, paymen
     .map_or(0, |r| r.try_get_by_index::<i64>(0).unwrap())
 }
 
+/// The stored canonical allocated text of a (payment, invoice) refund row.
 async fn allocation_refund(
     raw: &sea_orm::DatabaseConnection,
     s: &Seller,
     payment_id: &str,
     invoice_id: &str,
-) -> Option<i64> {
+) -> Option<String> {
     raw.query_one_raw(pg(format!(
-        "SELECT allocated_minor FROM bss.ledger_payment_allocation_refund \
+        "SELECT allocated FROM bss.ledger_payment_allocation_refund \
          WHERE tenant_id='{}' AND payment_id='{}' AND invoice_id='{}'",
         s.tenant, payment_id, invoice_id
     )))
     .await
     .unwrap()
-    .map(|r| r.try_get_by_index::<i64>(0).unwrap())
+    .map(|r| r.try_get_by_index::<String>(0).unwrap())
 }
 
 /// Seed an OPEN AR invoice by posting a balanced `DR AR (invoice_id) / CR
@@ -605,15 +637,12 @@ fn ar_line(s: &Seller, invoice_id: &str, amount: i64) -> NewLine {
         account_class: AccountClass::Ar,
         gl_code: None,
         side: Side::Debit,
-        amount_minor: amount,
-        currency: "USD".to_owned(),
-        currency_scale: 2,
+        money: usd(amount),
         invoice_id: Some(invoice_id.to_owned()),
         due_date: Some(NaiveDate::from_ymd_opt(2026, 12, 1).unwrap()),
         revenue_stream: None,
         mapping_status: MappingStatus::Resolved,
-        functional_amount_minor: None,
-        functional_currency: None,
+        functional_money: None,
         tax_jurisdiction: None,
         tax_filing_period: None,
         tax_rate_ref: None,
@@ -638,15 +667,12 @@ fn psp_credit_line(s: &Seller, amount: i64) -> NewLine {
         account_class: AccountClass::PspFeeExpense,
         gl_code: None,
         side: Side::Credit,
-        amount_minor: amount,
-        currency: "USD".to_owned(),
-        currency_scale: 2,
+        money: usd(amount),
         invoice_id: None,
         due_date: None,
         revenue_stream: None,
         mapping_status: MappingStatus::Resolved,
-        functional_amount_minor: None,
-        functional_currency: None,
+        functional_money: None,
         tax_jurisdiction: None,
         tax_filing_period: None,
         tax_rate_ref: None,
@@ -684,22 +710,22 @@ async fn settle_lands_cash_in_unallocated_and_replays() {
         .await
         .unwrap()
         .expect("settlement row present");
-    assert_eq!(row.settled_minor, 1000);
-    assert_eq!(row.allocated_minor, 0);
-    assert_eq!(row.currency, "USD");
+    assert_eq!(row.settled, usd(1000));
+    assert_eq!(row.allocated, usd(0));
+    assert_eq!(row.settled.currency(), &usd_spec());
 
     // The whole gross parks in the payer's unallocated pool.
     assert_eq!(
         repo.read_unallocated(&scope, s.tenant, s.payer, "USD")
             .await
             .unwrap(),
-        1000,
+        Some(usd(1000)),
         "gross lands in UNALLOCATED"
     );
     // Net cash hit clearing; AR was untouched (a receipt does not move AR).
     assert_eq!(
         account_balance(&raw, &s, s.cash).await,
-        Some(970),
+        Some(text(970)),
         "CASH_CLEARING = net (gross - fee)"
     );
     assert_eq!(
@@ -719,12 +745,12 @@ async fn settle_lands_cash_in_unallocated_and_replays() {
         repo.read_unallocated(&scope, s.tenant, s.payer, "USD")
             .await
             .unwrap(),
-        1000,
+        Some(usd(1000)),
         "UNALLOCATED unchanged on replay"
     );
     assert_eq!(
         account_balance(&raw, &s, s.cash).await,
-        Some(970),
+        Some(text(970)),
         "CASH_CLEARING unchanged on replay"
     );
 }
@@ -760,8 +786,7 @@ async fn allocate_oldest_first_drains_unallocated_into_ar() {
                 payer_tenant_id: s.payer,
                 payment_id: "PAY-ALLOC-1".to_owned(),
                 allocation_id: Uuid::now_v7(),
-                lump_minor: 500,
-                currency: "USD".to_owned(),
+                lump: usd(500),
                 hint_invoice_id: None,
                 caller_splits: None,
             },
@@ -770,22 +795,25 @@ async fn allocate_oldest_first_drains_unallocated_into_ar() {
         .expect("allocate must succeed");
     let outcome = applied(outcome);
     assert!(!outcome.posting.replayed, "first allocate is fresh");
-    let splits: Vec<(String, i64)> = outcome
+    let splits: Vec<(String, PostedMoney)> = outcome
         .splits
         .iter()
-        .map(|a| (a.invoice_id.clone(), a.amount_minor))
+        .map(|a| (a.invoice_id.clone(), a.amount.clone()))
         .collect();
     assert_eq!(
         splits,
-        vec![("INV-A".to_owned(), 300), ("INV-B".to_owned(), 200)],
+        vec![
+            ("INV-A".to_owned(), usd(300)),
+            ("INV-B".to_owned(), usd(200))
+        ],
         "oldest-first fills INV-A then INV-B"
     );
 
     // AR drained: INV-A fully paid (0), INV-B down to 600.
-    assert_eq!(ar_invoice_balance(&raw, &s, "INV-A").await, Some(0));
-    assert_eq!(ar_invoice_balance(&raw, &s, "INV-B").await, Some(600));
+    assert_eq!(ar_invoice_balance(&raw, &s, "INV-A").await, Some(text(0)));
+    assert_eq!(ar_invoice_balance(&raw, &s, "INV-B").await, Some(text(600)));
 
-    // allocated_minor netted to 500; two payment_allocation rows; refunds 300/200.
+    // allocated netted to 5.00; two payment_allocation rows; refunds 3.00/2.00.
     let repo = PaymentRepo::new(provider.clone());
     let row = repo
         .read_settlement(&scope, s.tenant, "PAY-ALLOC-1")
@@ -793,17 +821,18 @@ async fn allocate_oldest_first_drains_unallocated_into_ar() {
         .unwrap()
         .unwrap();
     assert_eq!(
-        row.allocated_minor, 500,
+        row.allocated,
+        usd(500),
         "allocated nets to the applied total"
     );
     assert_eq!(count_allocations(&raw, &s, "PAY-ALLOC-1").await, 2);
     assert_eq!(
         allocation_refund(&raw, &s, "PAY-ALLOC-1", "INV-A").await,
-        Some(300)
+        Some(text(300))
     );
     assert_eq!(
         allocation_refund(&raw, &s, "PAY-ALLOC-1", "INV-B").await,
-        Some(200)
+        Some(text(200))
     );
 
     // The pool drained by exactly the applied total (1000 - 500 = 500 left).
@@ -811,7 +840,7 @@ async fn allocate_oldest_first_drains_unallocated_into_ar() {
         repo.read_unallocated(&scope, s.tenant, s.payer, "USD")
             .await
             .unwrap(),
-        500,
+        Some(usd(500)),
         "UNALLOCATED drained by the allocated total"
     );
 }
@@ -849,17 +878,16 @@ async fn caller_split_posts_exact_amounts_and_reduces_ar() {
                 payer_tenant_id: s.payer,
                 payment_id: "PAY-CS-1".to_owned(),
                 allocation_id: Uuid::now_v7(),
-                lump_minor: 500,
-                currency: "USD".to_owned(),
+                lump: usd(500),
                 hint_invoice_id: None,
                 caller_splits: Some(vec![
                     Allocated {
                         invoice_id: "INV-B".to_owned(),
-                        amount_minor: 400,
+                        amount: usd(400),
                     },
                     Allocated {
                         invoice_id: "INV-A".to_owned(),
-                        amount_minor: 100,
+                        amount: usd(100),
                     },
                 ]),
             },
@@ -870,14 +898,17 @@ async fn caller_split_posts_exact_amounts_and_reduces_ar() {
     assert!(!outcome.posting.replayed, "first allocate is fresh");
     // The split is the caller's, in the caller's order — not the oldest-first
     // decision.
-    let splits: Vec<(String, i64)> = outcome
+    let splits: Vec<(String, PostedMoney)> = outcome
         .splits
         .iter()
-        .map(|a| (a.invoice_id.clone(), a.amount_minor))
+        .map(|a| (a.invoice_id.clone(), a.amount.clone()))
         .collect();
     assert_eq!(
         splits,
-        vec![("INV-B".to_owned(), 400), ("INV-A".to_owned(), 100)],
+        vec![
+            ("INV-B".to_owned(), usd(400)),
+            ("INV-A".to_owned(), usd(100))
+        ],
         "caller split applied verbatim"
     );
     assert_eq!(
@@ -886,8 +917,8 @@ async fn caller_split_posts_exact_amounts_and_reduces_ar() {
     );
 
     // AR dropped by exactly the caller amounts: INV-A 300→200, INV-B 800→400.
-    assert_eq!(ar_invoice_balance(&raw, &s, "INV-A").await, Some(200));
-    assert_eq!(ar_invoice_balance(&raw, &s, "INV-B").await, Some(400));
+    assert_eq!(ar_invoice_balance(&raw, &s, "INV-A").await, Some(text(200)));
+    assert_eq!(ar_invoice_balance(&raw, &s, "INV-B").await, Some(text(400)));
 
     // Two rows, both stamped caller-split.v1; allocated nets to 500.
     assert_eq!(count_allocations(&raw, &s, "PAY-CS-1").await, 2);
@@ -906,7 +937,7 @@ async fn caller_split_posts_exact_amounts_and_reduces_ar() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(settlement.allocated_minor, 500);
+    assert_eq!(settlement.allocated, usd(500));
 }
 
 /// Mode B: a caller split that over-allocates an invoice past its open balance
@@ -943,12 +974,11 @@ async fn caller_split_over_open_is_rejected() {
                 payer_tenant_id: s.payer,
                 payment_id: "PAY-CS-OVR".to_owned(),
                 allocation_id: Uuid::now_v7(),
-                lump_minor: 1000,
-                currency: "USD".to_owned(),
+                lump: usd(1000),
                 hint_invoice_id: None,
                 caller_splits: Some(vec![Allocated {
                     invoice_id: "INV-A".to_owned(),
-                    amount_minor: 400,
+                    amount: usd(400),
                 }]),
             },
         )
@@ -960,7 +990,7 @@ async fn caller_split_over_open_is_rejected() {
     );
 
     // Rejected before the post: INV-A untouched, no rows, allocated stays 0.
-    assert_eq!(ar_invoice_balance(&raw, &s, "INV-A").await, Some(300));
+    assert_eq!(ar_invoice_balance(&raw, &s, "INV-A").await, Some(text(300)));
     assert_eq!(count_allocations(&raw, &s, "PAY-CS-OVR").await, 0);
     let row = PaymentRepo::new(provider.clone())
         .read_settlement(&scope, s.tenant, "PAY-CS-OVR")
@@ -968,14 +998,15 @@ async fn caller_split_over_open_is_rejected() {
         .unwrap()
         .unwrap();
     assert_eq!(
-        row.allocated_minor, 0,
+        row.allocated,
+        usd(0),
         "rejected caller split left no effect"
     );
 }
 
 /// Mode B is idempotent on `allocation_id` just like the precedence path: a
 /// replay of the same id returns the prior posting and writes no duplicate rows
-/// / no double-counted `allocated_minor`.
+/// / no double-counted `allocated`.
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn caller_split_replay_makes_no_duplicate_rows() {
@@ -1008,12 +1039,11 @@ async fn caller_split_replay_makes_no_duplicate_rows() {
         payer_tenant_id: s.payer,
         payment_id: "PAY-CS-RPL".to_owned(),
         allocation_id,
-        lump_minor: 1000,
-        currency: "USD".to_owned(),
+        lump: usd(1000),
         hint_invoice_id: None,
         caller_splits: Some(vec![Allocated {
             invoice_id: "INV-A".to_owned(),
-            amount_minor: 250,
+            amount: usd(250),
         }]),
     };
 
@@ -1029,14 +1059,15 @@ async fn caller_split_replay_makes_no_duplicate_rows() {
 
     // Exactly one allocation's worth of effect: one row, AR 1000→750, allocated 250.
     assert_eq!(count_allocations(&raw, &s, "PAY-CS-RPL").await, 1);
-    assert_eq!(ar_invoice_balance(&raw, &s, "INV-A").await, Some(750));
+    assert_eq!(ar_invoice_balance(&raw, &s, "INV-A").await, Some(text(750)));
     let row = PaymentRepo::new(provider.clone())
         .read_settlement(&scope, s.tenant, "PAY-CS-RPL")
         .await
         .unwrap()
         .unwrap();
     assert_eq!(
-        row.allocated_minor, 250,
+        row.allocated,
+        usd(250),
         "allocated not double-counted on replay"
     );
 }
@@ -1052,7 +1083,7 @@ async fn allocate_over_settled_cap_is_rejected() {
     // Settle PAY-CAP-1 at only 100. Settle a SECOND payment (500) for the same
     // payer so the shared UNALLOCATED pool holds 600 — the no-negative guard on
     // UNALLOCATED is therefore NOT what trips. An allocate of 200 against
-    // PAY-CAP-1 pushes ITS allocated_minor (200) past ITS settled_minor (100):
+    // PAY-CAP-1 pushes ITS allocated (2.00) past ITS settled (1.00):
     // the per-payment cap CHECK in the sidecar is the authority that rejects it
     // with MoneyOutCapExceeded, even though the pool is positive (the design's
     // "blocks Σ-allocations > settled even when pooled unallocated is positive
@@ -1084,8 +1115,7 @@ async fn allocate_over_settled_cap_is_rejected() {
                 payer_tenant_id: s.payer,
                 payment_id: "PAY-CAP-1".to_owned(),
                 allocation_id: Uuid::now_v7(),
-                lump_minor: 200,
-                currency: "USD".to_owned(),
+                lump: usd(200),
                 hint_invoice_id: None,
                 caller_splits: None,
             },
@@ -1104,8 +1134,11 @@ async fn allocate_over_settled_cap_is_rejected() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(row.allocated_minor, 0, "over-cap allocate rolled back");
-    assert_eq!(ar_invoice_balance(&raw, &s, "INV-CAP").await, Some(200));
+    assert_eq!(row.allocated, usd(0), "over-cap allocate rolled back");
+    assert_eq!(
+        ar_invoice_balance(&raw, &s, "INV-CAP").await,
+        Some(text(200))
+    );
     assert_eq!(count_allocations(&raw, &s, "PAY-CAP-1").await, 0);
 }
 
@@ -1133,8 +1166,11 @@ async fn allocate_currency_mismatch_is_rejected() {
                 payer_tenant_id: s.payer,
                 payment_id: "PAY-CCY-1".to_owned(),
                 allocation_id: Uuid::now_v7(),
-                lump_minor: 500,
-                currency: "EUR".to_owned(),
+                lump: PostedMoney::try_new(
+                    Decimal::new(500, 2),
+                    CurrencySpec::try_new("EUR".to_owned(), 2).unwrap(),
+                )
+                .unwrap(),
                 hint_invoice_id: None,
                 caller_splits: None,
             },
@@ -1151,7 +1187,7 @@ async fn allocate_currency_mismatch_is_rejected() {
 /// lump) racing on two service clones must land EXACTLY ONE ledger effect — the
 /// `PAYMENT_ALLOCATE` dedup key `(tenant, allocation_id)` admits one winner; the
 /// loser replays the winner's finalized entry. Exactly the original N
-/// `payment_allocation` rows persist and `allocated_minor` is not double-counted.
+/// `payment_allocation` rows persist and `allocated` is not double-counted.
 ///
 /// Why concurrent (not sequential): this exercises the racing-claim / SSI path —
 /// a concurrent pair both observe the same pre-allocation AR, freeze identical
@@ -1198,8 +1234,7 @@ async fn allocate_replay_makes_no_duplicate_rows() {
         payer_tenant_id: s.payer,
         payment_id: "PAY-RPL-1".to_owned(),
         allocation_id,
-        lump_minor: 500,
-        currency: "USD".to_owned(),
+        lump: usd(500),
         hint_invoice_id: None,
         caller_splits: None,
     };
@@ -1230,7 +1265,7 @@ async fn allocate_replay_makes_no_duplicate_rows() {
         "the same allocation_id adds no duplicate allocation rows"
     );
 
-    // allocated_minor reflects exactly one allocation (500), not 1000.
+    // allocated reflects exactly one allocation (5.00), not 10.00.
     let repo = PaymentRepo::new(provider.clone());
     let row = repo
         .read_settlement(&scope, s.tenant, "PAY-RPL-1")
@@ -1238,13 +1273,14 @@ async fn allocate_replay_makes_no_duplicate_rows() {
         .unwrap()
         .unwrap();
     assert_eq!(
-        row.allocated_minor, 500,
-        "allocated_minor not double-counted across the racing pair"
+        row.allocated,
+        usd(500),
+        "allocated not double-counted across the racing pair"
     );
 
     // AR drained by exactly one allocation: INV-A 0, INV-B 600.
-    assert_eq!(ar_invoice_balance(&raw, &s, "INV-A").await, Some(0));
-    assert_eq!(ar_invoice_balance(&raw, &s, "INV-B").await, Some(600));
+    assert_eq!(ar_invoice_balance(&raw, &s, "INV-A").await, Some(text(0)));
+    assert_eq!(ar_invoice_balance(&raw, &s, "INV-B").await, Some(text(600)));
 }
 
 /// SQL-level BOLA on the new payment grains: rows seeded for tenant A are
@@ -1263,17 +1299,19 @@ async fn payment_grains_are_invisible_to_a_foreign_tenant_scope() {
     let payment_id = "PAY-BOLA";
     let own = AccessScope::for_tenant(tenant_a);
     let foreign = AccessScope::for_tenant(tenant_b);
+    let repo = PaymentRepo::new(provider.clone());
 
     // Seed a settlement + one allocation row for tenant A.
     let alloc_id = Uuid::now_v7();
     provider
         .transaction(|txn| {
             let own = own.clone();
+            let repo = repo.clone();
             Box::pin(async move {
-                PaymentRepo::seed_settlement(txn, &own, tenant_a, payment_id, "USD", 1000, 0)
+                repo.seed_settlement(txn, &own, tenant_a, payment_id, &usd(1000), &usd(0))
                     .await
                     .map_err(lift)?;
-                PaymentRepo::insert_allocation_rows(
+                repo.insert_allocation_rows(
                     txn,
                     &own,
                     &[NewAllocationRow {
@@ -1282,8 +1320,7 @@ async fn payment_grains_are_invisible_to_a_foreign_tenant_scope() {
                         payer_tenant_id: payer,
                         payment_id: payment_id.to_owned(),
                         invoice_id: "INV-A".to_owned(),
-                        amount_minor: 1000,
-                        currency: "USD".to_owned(),
+                        amount: usd(1000),
                         precedence_policy_ref: "oldest-first.v1".to_owned(),
                         allocated_at_utc: OffsetDateTime::now_utc(),
                     }],
@@ -1304,16 +1341,16 @@ async fn payment_grains_are_invisible_to_a_foreign_tenant_scope() {
     let ts = format_rfc3339(OffsetDateTime::now_utc());
     raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_reusable_credit_subbalance \
-         (tenant_id, payer_tenant_id, account_id, currency, credit_grant_event_type, \
-          first_granted_at, balance_minor, version) \
-         VALUES ('{tenant_a}','{payer}','{acct}','USD','promo','{ts}',500,0)"
+         (tenant_id, payer_tenant_id, account_id, currency, currency_scale, \
+          credit_grant_event_type, first_granted_at, balance, version) \
+         VALUES ('{tenant_a}','{payer}','{acct}','USD',2,'promo','{ts}','5',0)"
     )))
     .await
     .expect("seed wallet sub-grain");
     raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_unallocated_balance \
-         (tenant_id, payer_tenant_id, account_id, currency, balance_minor, version) \
-         VALUES ('{tenant_a}','{payer}','{acct}','USD',700,0)"
+         (tenant_id, payer_tenant_id, account_id, currency, currency_scale, balance, version) \
+         VALUES ('{tenant_a}','{payer}','{acct}','USD',2,'7',0)"
     )))
     .await
     .expect("seed unallocated pool");
@@ -1331,13 +1368,11 @@ async fn payment_grains_are_invisible_to_a_foreign_tenant_scope() {
     raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_ar_invoice_balance \
          (tenant_id, payer_tenant_id, account_id, invoice_id, currency, \
-          balance_minor, original_posted_at) \
-         VALUES ('{tenant_a}','{payer}','{acct}','INV-BOLA','USD',400,'{ts}')"
+          currency_scale, balance, original_posted_at) \
+         VALUES ('{tenant_a}','{payer}','{acct}','INV-BOLA','USD',2,'4','{ts}')"
     )))
     .await
     .expect("seed ar candidate");
-
-    let repo = PaymentRepo::new(provider.clone());
 
     // Tenant A sees its own rows.
     assert!(
@@ -1392,15 +1427,15 @@ async fn payment_grains_are_invisible_to_a_foreign_tenant_scope() {
         repo.read_unallocated(&own, tenant_a, payer, "USD")
             .await
             .unwrap(),
-        700,
+        Some(usd(700)),
         "tenant A reads its own unallocated pool"
     );
     assert_eq!(
         repo.read_unallocated(&foreign, tenant_a, payer, "USD")
             .await
             .unwrap(),
-        0,
-        "a foreign scope reads zero unallocated for tenant A (SQL-level BOLA)"
+        None,
+        "a foreign scope reads no unallocated pool for tenant A (SQL-level BOLA)"
     );
     assert!(
         repo.read_effective_policy(&own, tenant_a, OffsetDateTime::now_utc())

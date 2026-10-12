@@ -53,6 +53,7 @@ pub(crate) struct ControlPlaneServiceImpl {
 }
 
 impl ControlPlaneServiceImpl {
+    /// Create the control-plane service from its repositories and collaborators.
     #[must_use]
     pub(crate) fn new(
         upstreams: Arc<dyn UpstreamRepository>,

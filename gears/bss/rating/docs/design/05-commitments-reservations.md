@@ -79,7 +79,7 @@ matrix). The slice owns two seams: **M8** (pool ≠ prepaid credit grant, §4.4)
 
 | ADR ID | Decision Summary |
 |--------|------------------|
-| `cpt-cf-bss-rating-adr-scope-key-adoption` | The rates step 6 composes over — base row, overlay stack, and the self-service `reservedRate` attribute riding the selected usage row — all resolve on the adopted 8-axis key; this slice adds no selection axis. |
+| `cpt-cf-bss-rating-adr-scope-key-adoption` | The rates step 6 composes over — base row, overlay stack, and the self-service `reservedRate` attribute riding the selected usage row — all resolve on the adopted ten-axis key; this slice adds no selection axis. |
 
 No slice-local ADR: step-6 semantics are PRD-normative (§6.6, §17.1) under **T-D-05** / **T-D-08**.
 
@@ -213,7 +213,7 @@ wrappers).
 | Dependency | What arrives frozen | Contract |
 |------------|--------------------|----------|
 | Contracts & Agreements | `commitmentPools[]` snapshot (pool set, balances, draw order, rollover policy), true-up clause, reserved-vs-pool split; negotiated RI rates via the step-5 overlay | [`../PRD.md`](../PRD.md) §9.2, §13; [`11-consumer-contracts.md`](./11-consumer-contracts.md) |
-| Pricing (Product Catalog) | `reservedRate` + `reservationFlavor` as attributes **on the single usage row**, frozen in the pinned snapshot; reservation joint fixture gates publish | [`../../../pricing/docs/design/10-advanced-primitives.md`](../../../pricing/docs/design/10-advanced-primitives.md) §3 |
+| Pricing (Product Catalog) | `reservedRate` + `reservationFlavor` as attributes **on the single usage row**, frozen in the pinned snapshot; reservation joint fixture gates publish | `../../../pricing/docs/design/10-advanced-primitives.md` (former pricing design, removed; superseded by the PriceBook model — see T-D-37) §3 |
 | OSS / Contracts (entitlement) | `reservationMatch` entitlement lifecycle/inventory — a **hard precondition** for reservation pricing | [`../PRD.md`](../PRD.md) §17.3 |
 | Billing | Executes `TrueUpObligation`; Rating posts nothing | [`../PRD.md`](../PRD.md) §9.2 |
 
@@ -239,7 +239,7 @@ wrappers).
 
 ### 3.7 Database Schemas and Tables
 
-- [ ] `p1` - **ID**: `cpt-cf-bss-rating-storage-none-cmt`
+- [ ] `p1` - **ID**: `cpt-cf-bss-rating-datastore-none-cmt`
 
 **None owned.** No table, no cache: pool balances and true-up clauses are Contracts'; the
 reservation entitlement inventory is OSS/Contracts'; reserved-rate attributes are the pricing
@@ -274,7 +274,7 @@ balance sequencing).
 - [ ] `p1` - **ID**: `cpt-cf-bss-rating-normative-reservation-flavors-cmt`
 
 - **Consumption flavor**: the matched portion of measured usage prices at the reserved rate; the remainder prices at the on-demand rates resolved in steps 2–5. The reserved portion is **excluded from `commitmentPools[]` drawdown** — reservation precedes pools ([`../PRD.md`](../PRD.md) §6.6, §17.1 step 6).
-- **Tier-counter exclusion** (adopted, money-affecting): the matched/allocated reserved quantity is excluded from the on-demand tier counter `Q` — only the on-demand remainder enters the row's bands, banded **from zero** (150K used against a 100K reservation ⇒ 100K at `reservedRate`, the remainder's `Q` starts at 0) — "from zero" = the remainder axis starts at the **window origin** with reserved quantity excluded; under sub-window slices the axis stays window-cumulative via `remainderOffsetQ`, never a per-slice reset (**T-D-23**, slice [`03`](./03-metering-models.md) §4.3). Frozen semantics per pricing `inst-rv-tier-q`; the reservation joint fixture MUST include a tiered-remainder scenario ([`../../../pricing/docs/design/10-advanced-primitives.md`](../../../pricing/docs/design/10-advanced-primitives.md) §3). **Recompute contract (T-D-13)**: on a consumption split, **steps 3–5 re-run as a unit over the on-demand remainder** — the slice-03 band math re-bands the remainder from zero, then the same frozen overlay stack (step 4) and contract overlay (step 5) re-apply to the re-banded amount (identical survivor set, order, and adjustment values; only the base amount changes — [`04-overlays-precedence.md`](./04-overlays-precedence.md) §4.2). The reserved-rate portion is **not** re-overlaid (§4.3). Compiled, not configurable; lineage records the superseded full-`Q` pass and the authoritative remainder pass.
+- **Tier-counter exclusion** (adopted, money-affecting): the matched/allocated reserved quantity is excluded from the on-demand tier counter `Q` — only the on-demand remainder enters the row's bands, banded **from zero** (150K used against a 100K reservation ⇒ 100K at `reservedRate`, the remainder's `Q` starts at 0) — "from zero" = the remainder axis starts at the **window origin** with reserved quantity excluded; under sub-window slices the axis stays window-cumulative via `remainderOffsetQ`, never a per-slice reset (**T-D-23**, slice [`03`](./03-metering-models.md) §4.3). Frozen semantics per pricing `inst-rv-tier-q`; the reservation joint fixture MUST include a tiered-remainder scenario (`../../../pricing/docs/design/10-advanced-primitives.md` (former pricing design, removed; superseded by the PriceBook model — see T-D-37) §3). **Recompute contract (T-D-13)**: on a consumption split, **steps 3–5 re-run as a unit over the on-demand remainder** — the slice-03 band math re-bands the remainder from zero, then the same frozen overlay stack (step 4) and contract overlay (step 5) re-apply to the re-banded amount (identical survivor set, order, and adjustment values; only the base amount changes — [`04-overlays-precedence.md`](./04-overlays-precedence.md) §4.2). The reserved-rate portion is **not** re-overlaid (§4.3). Compiled, not configurable; lineage records the superseded full-`Q` pass and the authoritative remainder pass.
 - **Capacity flavor**: emit `capacityCharge = reservedRate × reservedQuantity × coveredGranules` regardless of measured usage — zero usage still bills the allocation; the charge is never reduced by absent usage and never draws `commitmentPools[]`. **Accrual basis (T-D-25, 2026-08-01 — flagged for veto)**: `reservedRate` is denominated in the usage row's billable unit — **level unit × granule duration** for level-billed rows (slice 03 §4.3) — so `reservedRate × reservedQuantity` is money **per granule**, not a period charge; the once-per-period emission multiplies by **`coveredGranules`** = the reservation's covered duration within the `AnchorPeriod` expressed in those granules, summed per sub-interval when the coverage or `reservedQuantity` changed mid-period (`Σ reservedRate × reservedQuantity_i × duration_i`) — a disk allocated on day 20, or resized mid-period, bills exactly its covered sub-intervals (before T-D-25 the formula carried no time factor at all, so proration was undefined: recurring-only proration (09 §4.2) never covered it and usage is never prorated); `reservedQuantity`, rate, and flavor are frozen in `pricingSnapshotRef` ([`../PRD.md`](../PRD.md) §6.6, §12 AC 20). The `capacityCharge` is emitted as its **own line** — a **period-driven unit** keyed `(subscription, priceId, chargeKind, lineKey, AnchorPeriod)` and serialized on `(subscription, AnchorPeriod)` per slice [`14`](./14-unit-synthesis-period-tick.md) §4.1 (capacity bills even on a zero-usage period, where no usage unit exists to key on); the selected usage row's identity rides the line as **lineage attachment** (row/price id + flavor + match id), never as the serialization/dedup key (envelope shape: [`11-consumer-contracts.md`](./11-consumer-contracts.md) §4.1).
 - No `reservationMatch` ⇒ evaluation prices as pure usage; the reservation-match identifier, when present, is recorded in metadata **and** `pricingSnapshotRef` (the `commitmentReservation` segment — resolved 2026-07-11, T-D-09; the three "§4.1 open" pointers this slice had kept after the resolution were fixed by the 2026-07-31 review, #44).
 - The entitlement source feeding `reservationMatch` (OSS / Contracts) is a **hard precondition** tracked in [`../PRD.md`](../PRD.md) §17.3; Rating consumes the match from the frozen context and never resolves entitlement.
@@ -285,7 +285,7 @@ balance sequencing).
 
 Seam **M9** ([`../SEAMS.md`](../SEAMS.md)), adopted under **T-D-08**:
 
-- **Self-service** reserved rates come from the **pinned catalog snapshot** — the `reservedRate`/`reservationFlavor` attributes on the selected usage row ([`../../../pricing/docs/design/10-advanced-primitives.md`](../../../pricing/docs/design/10-advanced-primitives.md) §3, [`../PRD.md`](../PRD.md) §6.6).
+- **Self-service** reserved rates come from the **pinned catalog snapshot** — the `reservedRate`/`reservationFlavor` attributes on the selected usage row (`../../../pricing/docs/design/10-advanced-primitives.md` (former pricing design, removed; superseded by the PriceBook model — see T-D-37) §3, [`../PRD.md`](../PRD.md) §6.6).
 - **Negotiated RI-style** rates come from **Contracts**, arriving as the **step-5 contract overlay** — never as a catalog row.
 - The rate step 6 prices with is the **post-step-5 effective value**: the snapshot attribute unless a negotiated contract term overlaid it at step 5 (contract outranks catalog base — [`../PRD.md`](../PRD.md) §17.1 step 5). The outranking happens in the overlay layer; step 6 makes no source choice of its own.
 - A present `reservationMatch` whose rate resolves from **neither** source fails closed — the evaluator never guesses a reserved rate.
@@ -299,7 +299,7 @@ Seam **M8** ([`../SEAMS.md`](../SEAMS.md)) — two constructs, one colliding wor
 | | Rating **commitment pool** | Pricing **prepaid credit grant** |
 |---|---|---|
 | Construct | `commitmentPools[]`, ordered waterfall at step 6 | Plan-attached wallet primitive (`grantAmount`, `creditUnit`, `expiryPolicy`, `autoRechargeAllowed`) |
-| Definition SoR | Contracts | Pricing gear ([`../../../pricing/docs/design/10-advanced-primitives.md`](../../../pricing/docs/design/10-advanced-primitives.md) §3) |
+| Definition SoR | Contracts | Pricing gear (`../../../pricing/docs/design/10-advanced-primitives.md` (former pricing design, removed; superseded by the PriceBook model — see T-D-37) §3) |
 | Balance owner | Contracts | Billing/Rating (execution); GA-gated — grants definable, not sellable until balance execution exists |
 | Drawdown evaluator | **Rating, this slice** | **Billing-executed** — never enters step 6 |
 
@@ -326,5 +326,5 @@ grant" (the wallet, outside the §17.1 per-line order).
 - **Seams**: M8 (§4.4), M9 (§4.3); S1 segment-naming residue recorded in §4.1 — [`../SEAMS.md`](../SEAMS.md).
 - **Decisions**: T-D-05 (composition, not modelKind), T-D-08 (reserved-rate two-source split), T-D-09 (`commitmentReservation` segment), T-D-10 (balance write-back + cascade), T-D-13 (steps-3–5 remainder re-run), T-D-14 (pool flavors + true-up formulas), T-D-15 (period-driven true-up unit) — [`../DECISIONS.md`](../DECISIONS.md).
 - **ADR**: [`../ADR/0001-cpt-cf-bss-rating-adr-scope-key-adoption.md`](../ADR/0001-cpt-cf-bss-rating-adr-scope-key-adoption.md).
-- **Pricing design set**: [`../../../pricing/docs/design/10-advanced-primitives.md`](../../../pricing/docs/design/10-advanced-primitives.md) (reserved attributes, tier-counter exclusion, prepaid credit grant, GA gate).
+- **Pricing design set**: `../../../pricing/docs/design/10-advanced-primitives.md` (former pricing design, removed; superseded by the PriceBook model — see T-D-37) (reserved attributes, tier-counter exclusion, prepaid credit grant, GA gate).
 - **Step slices**: [`01-foundation.md`](./01-foundation.md) (pipeline, envelope, guards, keys); [`03-metering-models.md`](./03-metering-models.md) (remainder band math); [`04-overlays-precedence.md`](./04-overlays-precedence.md) (step-5 overlay, negotiated RI); [`06-coupons.md`](./06-coupons.md) (downstream step 7); [`08-retroactivity-corrections.md`](./08-retroactivity-corrections.md) (reversals); [`09-period-plan-change.md`](./09-period-plan-change.md) (period/plan-change wrappers); [`11-consumer-contracts.md`](./11-consumer-contracts.md) (Contracts/Billing boundaries).

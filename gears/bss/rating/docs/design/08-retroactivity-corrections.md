@@ -81,8 +81,8 @@ never mutates Usage, counters, balances, or posted financials — the owners app
 
 | ADR ID | Decision Summary |
 |--------|------------------|
-| `cpt-cf-bss-rating-adr-scope-key-adoption` | Replay selects on the same adopted 8-axis key resolved from the pinned snapshot — a correction can never resolve a different row than first rating did over identical inputs. |
-| `cpt-cf-bss-pricing-adr-pricewindow-consolidation` (adopted) | `PriceWindow*` events only invalidate the non-authoritative cache; corrections never consult live window state — expired/cancelled windows are immutable pricing history and the pin is the only read ([`../../../pricing/docs/design/07-pricewindow-linkage.md`](../../../pricing/docs/design/07-pricewindow-linkage.md)). |
+| `cpt-cf-bss-rating-adr-scope-key-adoption` | Replay selects on the same adopted **ten-axis** key resolved from the pinned snapshot (T-D-01's adoption is verbatim and pricing's key has been ten since D-196 — every sibling slice row was swept on 2026-08-25 and this one was missed, item 14 of the 2026-08-26 products review) — a correction can never resolve a different row than first rating did over identical inputs. |
+| PriceWindow consolidation (superseded by the PriceBook model, see T-D-37 in rating DECISIONS) (adopted) | `PriceWindow*` events only invalidate the non-authoritative cache; corrections never consult live window state — expired/cancelled windows are immutable pricing history and the pin is the only read (`../../../pricing/docs/design/07-pricewindow-linkage.md` (former pricing design, removed; superseded by the PriceBook model — see T-D-37)). |
 
 ### 1.3 Architecture Layers
 
@@ -212,7 +212,7 @@ replay coupons and FX — and slice 07's invoice-period close re-rate enters her
 |------------|--------------------|----------|
 | Rating pipeline (intra-gear — slices 12/13/15) | re-materialized `Q` (single-writer per partition key), prior rated versions, usage dedup, correction ingestion | PRD §9.2 handoff; slices 12–15 |
 | Billing | `periodState` (`open` / `closed_posted`); consumes delta adjustments per immutability rules | PRD §9.2 Billing |
-| Pricing (Product Catalog) | the pinned snapshot, retained for open windows (no live read — W2); window history immutable | [`../SEAMS.md`](../SEAMS.md) W2; pricing [`design/07`](../../../pricing/docs/design/07-pricewindow-linkage.md) |
+| Pricing (Product Catalog) | the pinned snapshot, retained for open windows (no live read — W2); window history immutable | [`../SEAMS.md`](../SEAMS.md) W2; pricing `design/07` (former pricing design, removed; superseded by the PriceBook model — see T-D-37) |
 | Contracts | the commitment pool set, balances, and draw order frozen in `pricingSnapshotRef` (§17.1 step 6); balance SoR applying refill effects | PRD §6.6, §6.10 |
 
 ### 3.6 Interactions and Sequences
@@ -247,7 +247,7 @@ replay coupons and FX — and slice 07's invoice-period close re-rate enters her
 
 ### 3.7 Database Schemas and Tables
 
-- [ ] `p1` - **ID**: `cpt-cf-bss-rating-storage-none-rtr`
+- [ ] `p1` - **ID**: `cpt-cf-bss-rating-datastore-none-rtr`
 
 **None owned.** Prior rated versions, `Q`, and dedup state live in Rating; snapshot retention is the
 pricing gear's W2 obligation; pool balances live in Contracts; `periodState` in Billing. The bitemporal
@@ -310,4 +310,4 @@ Runs in the `rating` gear (rating-core crate) ([`./01-foundation.md`](./01-found
 - **Seams**: W2 (owned — snapshot-only replay), M7 (counter key), S1 (the pinned ref is the replay source) — [`../SEAMS.md`](../SEAMS.md).
 - **Decisions**: T-D-04 (primary — pinned-snapshot replay + counter key), T-D-03 (snapshot composition), T-D-10/T-D-12 (cascade re-resolution), T-D-11 (delta dedup: Rating) — [`../DECISIONS.md`](../DECISIONS.md).
 - **Slices**: [`01-foundation.md`](./01-foundation.md) (pipeline, `reresolve` interface, correction keys, guards), [`03-metering-models.md`](./03-metering-models.md) (tier re-placement), [`05-commitments-reservations.md`](./05-commitments-reservations.md) (pool refill semantics), [`06-coupons.md`](./06-coupons.md) / [`07-currency-fx.md`](./07-currency-fx.md) (coupon/FX replay; FX close delta), [`09-period-plan-change.md`](./09-period-plan-change.md) (plan-change correction deltas, period obligations), [`11-consumer-contracts.md`](./11-consumer-contracts.md) (Rating/Billing boundary).
-- **Pricing design set**: [`07-pricewindow-linkage.md`](../../../pricing/docs/design/07-pricewindow-linkage.md) (immutable window history, `PriceWindow*` events), [`06-consumer-contracts.md`](../../../pricing/docs/design/06-consumer-contracts.md) (frozen read-model consumer contract).
+- **Pricing design set**: `07-pricewindow-linkage.md` (former pricing design, removed; superseded by the PriceBook model — see T-D-37) (immutable window history, `PriceWindow*` events), `06-consumer-contracts.md` (former pricing design, removed; superseded by the PriceBook model — see T-D-37) (frozen read-model consumer contract).

@@ -33,7 +33,10 @@
 //! they are the `ApprovalService`'s concern (Group 4); this layer only carries the
 //! actor ids so the handler can hand them on.
 
+use crate::domain::exact_money::{map_exact_error, matching_currency, sum_posted};
+use bss_ledger_sdk::money::PostedMoney;
 use bss_ledger_sdk::{AccountClass, Side};
+use rust_decimal::Decimal;
 use toolkit_macros::domain_model;
 use uuid::Uuid;
 
@@ -128,16 +131,16 @@ pub struct ManualLeg {
     pub account_class: AccountClass,
     /// DR / CR.
     pub side: Side,
-    /// The leg amount in minor units (`> 0`; zero/negative legs are rejected by
+    /// The leg amount in major units (`> 0`; zero/negative legs are rejected by
     /// [`govern`], inherited S1 / AC #4).
-    pub amount_minor: i64,
+    pub amount: PostedMoney,
     /// The revenue stream — `Some` only for a per-stream class
     /// ([`AccountClass::is_per_stream`]); `None` for the stream-less classes.
     pub revenue_stream: Option<String>,
 }
 
 /// One governed manual-adjustment request — the pure inputs the handler (Group 3)
-/// resolves from the REST DTO before posting. Amounts are `i64` minor units; all
+/// resolves from the REST DTO before posting. Amounts are major-unit `PostedMoney` values; all
 /// legs are in [`Self::currency`]. The request is idempotent on the `(tenant,
 /// MANUAL_ADJUSTMENT, adjustment_id)` key.
 #[domain_model]
@@ -155,7 +158,7 @@ pub struct ManualAdjustmentRequest {
     /// Which governed action this is (selects the allow-list, stamped on the row).
     pub action: ManualAdjustmentAction,
     /// ISO-4217 currency of the adjustment (every leg shares it).
-    pub currency: String,
+    pub currency: bss_ledger_sdk::money::CurrencySpec,
     /// The legs to post — must net to zero per [`govern`] (Σ DR == Σ CR).
     pub legs: Vec<ManualLeg>,
     /// The mandatory business reason code (AC #14). A governed manual adjustment
@@ -177,7 +180,7 @@ pub struct ManualAdjustmentRequest {
 
 /// The pure domain signal a governed manual adjustment is rejected (design §4.6) —
 /// distinct from [`crate::domain::error::DomainError`]: the handler (Group 3) maps
-/// **both** variants onto [`crate::domain::error::DomainError::ManualAdjustmentNotAllowed`]
+/// policy variants onto [`crate::domain::error::DomainError::ManualAdjustmentNotAllowed`]
 /// (a 400), but treats them differently for observability.
 ///
 /// - [`Self::NotAllowed`] — a generic governance violation (blank reason,
@@ -188,6 +191,8 @@ pub struct ManualAdjustmentRequest {
 ///   handler additionally fires a `SecuredAuditSink` capture + a page (the
 ///   `AttemptedWriteOff` alarm), because this is a deliberate-misuse signal, not a
 ///   benign typo.
+/// - [`Self::Numeric`] preserves named currency, scale and amount errors through
+///   [`Self::into_domain_error`].
 #[domain_model]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ManualAdjustmentReject {
@@ -197,6 +202,21 @@ pub enum ManualAdjustmentReject {
     /// A `CONTRA_REVENUE` leg without a paired same-stream revenue reduction — an
     /// attempted (disguised) write-off. The handler captures + pages on this.
     AttemptedWriteOff(String),
+    /// A named numeric rejection retained for DomainError transport.
+    Numeric(crate::domain::error::DomainError),
+}
+
+impl ManualAdjustmentReject {
+    /// Retain numeric categories while projecting policy rejections to their existing domain error.
+    #[must_use]
+    pub fn into_domain_error(self) -> crate::domain::error::DomainError {
+        match self {
+            Self::Numeric(error) => error,
+            Self::NotAllowed(detail) | Self::AttemptedWriteOff(detail) => {
+                crate::domain::error::DomainError::ManualAdjustmentNotAllowed(detail)
+            }
+        }
+    }
 }
 
 /// Govern a manual-adjustment request: the pure §4.6 gate every governed manual
@@ -209,11 +229,10 @@ pub enum ManualAdjustmentReject {
 ///
 /// 1. **Reason** — a blank `reason_code` is [`ManualAdjustmentReject::NotAllowed`]
 ///    (AC #14: a governed adjustment must justify itself).
-/// 2. **Shape** — no legs, or any `amount_minor <= 0`, is `NotAllowed` (zero /
+/// 2. **Shape** — no legs, or any `amount <= 0`, is `NotAllowed` (zero /
 ///    negative legs are forbidden, inherited S1 / AC #4).
 /// 3. **Balance** — the legs must net to zero (Σ `Side::Debit` == Σ `Side::Credit`,
-///    one currency), else `NotAllowed`. Summed in `i128` so a pathological set
-///    cannot overflow `i64`.
+///    one currency), else `NotAllowed`. Summed exactly and narrowed only after the complete side fold.
 /// 4. **Global `REVENUE` / `CONTRACT_LIABILITY` ban** — a governed posting MUST NOT
 ///    directly DR/CR `REVENUE` or touch `CONTRACT_LIABILITY` (revenue changes route
 ///    through S3/S4/S6, design §4.6). Either is `NotAllowed`.
@@ -233,7 +252,7 @@ pub enum ManualAdjustmentReject {
 /// # Errors
 /// [`ManualAdjustmentReject::AttemptedWriteOff`] for the unpaired-contra-revenue
 /// shape; [`ManualAdjustmentReject::NotAllowed`] for every other governance
-/// violation.
+/// violation. Numeric metadata/range failures are [`ManualAdjustmentReject::Numeric`].
 pub fn govern(req: &ManualAdjustmentRequest) -> Result<(), ManualAdjustmentReject> {
     use ManualAdjustmentReject as R;
 
@@ -263,24 +282,32 @@ pub fn govern(req: &ManualAdjustmentRequest) -> Result<(), ManualAdjustmentRejec
     if req.legs.is_empty() {
         return Err(R::NotAllowed("manual adjustment has no legs".to_owned()));
     }
-    if let Some(bad) = req.legs.iter().find(|l| l.amount_minor <= 0) {
+    for leg in &req.legs {
+        matching_currency(&req.currency, leg.amount.currency()).map_err(R::Numeric)?;
+    }
+    if let Some(bad) = req.legs.iter().find(|l| l.amount.amount() <= Decimal::ZERO) {
         return Err(R::NotAllowed(format!(
-            "manual adjustment leg amount_minor must be > 0, got {} for {}",
-            bad.amount_minor,
+            "manual adjustment leg amount must be > 0, got {} for {}",
+            bad.amount.amount(),
             bad.account_class.as_str()
         )));
     }
 
-    // 3. Balance: Σ DR == Σ CR (one currency, `req.currency`). i128 accumulation so
-    //    a pathological leg set cannot overflow before the comparison.
-    let mut dr: i128 = 0;
-    let mut cr: i128 = 0;
-    for leg in &req.legs {
-        match leg.side {
-            Side::Debit => dr += i128::from(leg.amount_minor),
-            Side::Credit => cr += i128::from(leg.amount_minor),
-        }
-    }
+    // 3. Balance: exact side folds with matching currency and stored scale; final gross must fit posting bounds.
+    let side_total = |side| {
+        sum_posted(
+            &req.legs
+                .iter()
+                .filter(|l| l.side == side)
+                .map(|l| l.amount.clone())
+                .collect::<Vec<_>>(),
+            req.currency.clone(),
+        )
+        .map_err(map_exact_error)
+        .map_err(R::Numeric)
+    };
+    let dr = side_total(Side::Debit)?;
+    let cr = side_total(Side::Credit)?;
     if dr != cr {
         return Err(R::NotAllowed(format!(
             "manual adjustment legs do not net to zero (DR {dr} != CR {cr})"
@@ -355,6 +382,27 @@ pub fn govern(req: &ManualAdjustmentRequest) -> Result<(), ManualAdjustmentRejec
     }
 
     Ok(())
+}
+
+/// Validate governance and return the bounded exact debit gross for approval and events.
+///
+/// # Errors
+/// The [`ManualAdjustmentReject`] raised by governance validation (`govern`), or
+/// [`ManualAdjustmentReject::Numeric`] when summing the debit legs leaves the money contract.
+pub fn governed_gross(
+    req: &ManualAdjustmentRequest,
+) -> Result<PostedMoney, ManualAdjustmentReject> {
+    govern(req)?;
+    sum_posted(
+        &req.legs
+            .iter()
+            .filter(|leg| leg.side == Side::Debit)
+            .map(|leg| leg.amount.clone())
+            .collect::<Vec<_>>(),
+        req.currency.clone(),
+    )
+    .map_err(map_exact_error)
+    .map_err(ManualAdjustmentReject::Numeric)
 }
 
 #[cfg(test)]

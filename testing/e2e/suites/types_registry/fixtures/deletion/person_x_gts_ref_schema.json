@@ -1,0 +1,24 @@
+{
+  "gts_id": "gts.cf.e2e.deletion.ref_holder.v1~",
+  "content": {
+    "$id": "gts://gts.cf.e2e.deletion.ref_holder.v1~",
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "type": "object",
+    "properties": {
+      "payload": {
+        "type": "object",
+        "properties": {
+          "person": {
+            "type": "string",
+            "x-gts-ref": "gts.cf.e2e.deletion.person.v1~"
+          }
+        },
+        "additionalProperties": true
+      }
+    },
+    "required": [
+      "payload"
+    ],
+    "additionalProperties": false
+  }
+}

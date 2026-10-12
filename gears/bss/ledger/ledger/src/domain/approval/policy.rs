@@ -1,101 +1,267 @@
-//! Pure dual-control threshold policy (§4.2). Given the tenant's effective-dated
-//! policy versions and an operation's facts, decide whether a governed mutation
-//! must go through the preparer→approver flow; and validate tenant config against
-//! the ratified ranges. No FX and no clock here — the caller passes the
-//! USD-equivalent (computed with the *operation's own* rate snapshot, DC10) and
-//! the current date, so the whole module is deterministic and unit-testable.
-
+//! Pure currency-aware dual-control policy. Callers supply the existing valuation
+//! basis; this module never converts currencies or consults the live registry.
+use super::ApprovalKind;
+use bss_ledger_sdk::{CurrencySpec, PostedMoney};
 use chrono::{Datelike, NaiveDate, Weekday};
+use rust_decimal::Decimal;
+use std::collections::BTreeMap;
+use time::OffsetDateTime;
 use toolkit_macros::domain_model;
 
-use super::ApprovalKind;
-use time::OffsetDateTime;
-
-/// Ratified platform defaults applied when a tenant has no policy row:
-/// D2 = 1000 USD (scale 2) = `100_000` minor (DECISIONS D-1); A6 = 5 business days
-/// (foundation §1.4); pending TTL = 7 days (DC12).
-pub const DEFAULT_D2_THRESHOLD_MINOR: i64 = 100_000;
+pub const D2_DEFAULT_RULE: &str = "per_currency_platform_default";
 pub const DEFAULT_A6_BACKDATING_BIZ_DAYS: i32 = 5;
 pub const DEFAULT_PENDING_TTL_SECONDS: i64 = 7 * 24 * 60 * 60;
-
-/// D2 tenant-config bounds in USD-eq minor: [100 .. 1,000,000] USD (DECISIONS D-1).
-pub const D2_MIN_MINOR: i64 = 10_000;
-pub const D2_MAX_MINOR: i64 = 100_000_000;
-/// A6 tenant-config bounds in business days: [1 .. 30] (foundation §1.4).
 pub const A6_MIN_DAYS: i32 = 1;
 pub const A6_MAX_DAYS: i32 = 30;
 
-/// The resolved thresholds in effect for a tenant at a point in time.
+/// Validated per-currency D2 overrides: at most one threshold per currency
+/// code, each within its scale-derived bounds, kept in currency-code order.
+/// Built only by [`D2Thresholds::try_new`], so a duplicate currency cannot be
+/// represented and a holder never re-validates.
 #[domain_model]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct DualControlPolicy {
-    pub d2_threshold_minor: i64,
-    pub a6_backdating_biz_days: i32,
-    pub pending_ttl_seconds: i64,
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct D2Thresholds(BTreeMap<String, PostedMoney>);
+
+impl D2Thresholds {
+    /// No per-currency override (the platform default).
+    pub const EMPTY: Self = Self(BTreeMap::new());
+
+    /// Validate the thresholds once (see [`validate_thresholds`]).
+    ///
+    /// # Errors
+    /// [`PolicyConfigError::DuplicateCurrency`] / [`PolicyConfigError::MetadataConflict`] when a
+    /// currency is configured twice (same or different scale);
+    /// [`PolicyConfigError::D2OutOfRange`] when a threshold is outside its bounds.
+    pub fn try_new(values: Vec<PostedMoney>) -> Result<Self, PolicyConfigError> {
+        validate_thresholds(&values)?;
+        Ok(Self(
+            values
+                .into_iter()
+                .map(|value| (value.currency().code().to_owned(), value))
+                .collect(),
+        ))
+    }
+
+    /// The threshold configured for `currency`, if any.
+    #[must_use]
+    pub fn get(&self, currency: &str) -> Option<&PostedMoney> {
+        self.0.get(currency)
+    }
+
+    /// The thresholds in currency-code order.
+    pub fn iter(&self) -> impl Iterator<Item = &PostedMoney> {
+        self.0.values()
+    }
+
+    /// Number of configured currencies.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// `true` when no currency is overridden.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// The thresholds in currency-code order.
+    #[must_use]
+    pub fn into_vec(self) -> Vec<PostedMoney> {
+        self.0.into_values().collect()
+    }
 }
 
+/// Currency overrides; missing currencies resolve the symbolic platform default.
+///
+/// The fields are private: a policy is built only by [`DualControlPolicy::try_new`]
+/// (or is [`DualControlPolicy::DEFAULT`]), so a holder never re-validates it.
+#[domain_model]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DualControlPolicy {
+    d2_thresholds: D2Thresholds,
+    a6_backdating_biz_days: i32,
+    pending_ttl_seconds: i64,
+}
 impl DualControlPolicy {
-    /// The ratified platform defaults (used when a tenant has no policy row).
     pub const DEFAULT: Self = Self {
-        d2_threshold_minor: DEFAULT_D2_THRESHOLD_MINOR,
+        d2_thresholds: D2Thresholds::EMPTY,
         a6_backdating_biz_days: DEFAULT_A6_BACKDATING_BIZ_DAYS,
         pending_ttl_seconds: DEFAULT_PENDING_TTL_SECONDS,
     };
-}
 
-/// One effective-dated policy version (a `ledger_dual_control_policy` row).
+    /// Build a policy from validated thresholds, checking A6 and the TTL once.
+    ///
+    /// # Errors
+    /// [`PolicyConfigError::A6OutOfRange`] or [`PolicyConfigError::TtlNotPositive`] when A6 or
+    /// the TTL is outside its allowed range.
+    pub fn try_new(
+        d2_thresholds: D2Thresholds,
+        a6: i32,
+        ttl: i64,
+    ) -> Result<Self, PolicyConfigError> {
+        validate_limits(a6, ttl)?;
+        Ok(Self {
+            d2_thresholds,
+            a6_backdating_biz_days: a6,
+            pending_ttl_seconds: ttl,
+        })
+    }
+
+    /// The validated per-currency D2 overrides.
+    #[must_use]
+    pub const fn d2_thresholds(&self) -> &D2Thresholds {
+        &self.d2_thresholds
+    }
+
+    /// The A6 material-backdating window, in business days.
+    #[must_use]
+    pub const fn a6_backdating_biz_days(&self) -> i32 {
+        self.a6_backdating_biz_days
+    }
+
+    /// How long a pending approval stays actionable, in seconds.
+    #[must_use]
+    pub const fn pending_ttl_seconds(&self) -> i64 {
+        self.pending_ttl_seconds
+    }
+    /// Resolve against comparand metadata, never against a later registry value.
+    ///
+    /// The thresholds were validated when the map was built, so the lookup does
+    /// not re-validate them; an A6 or TTL defect is not a D2 lookup failure.
+    ///
+    /// # Errors
+    /// [`PolicyConfigError::MetadataConflict`] when the configured threshold
+    /// for `currency` carries a different scale;
+    /// [`PolicyConfigError::D2DefaultUnrepresentable`] when the default threshold cannot be
+    /// expressed at the currency's scale.
+    pub fn d2_threshold(&self, currency: &CurrencySpec) -> Result<PostedMoney, PolicyConfigError> {
+        if let Some(value) = self.d2_thresholds.get(currency.code()) {
+            if value.currency() != currency {
+                return Err(PolicyConfigError::MetadataConflict {
+                    currency: currency.code().into(),
+                    configured_scale: value.currency().scale(),
+                    other_scale: currency.scale(),
+                });
+            }
+            return Ok(value.clone());
+        }
+        PostedMoney::try_new(
+            Decimal::new(100_000, u32::from(currency.scale())),
+            currency.clone(),
+        )
+        .map_err(|_| PolicyConfigError::D2DefaultUnrepresentable(currency.clone()))
+    }
+}
 #[domain_model]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PolicyVersion {
     pub effective_from: OffsetDateTime,
     pub version: i64,
     pub policy: DualControlPolicy,
 }
-
-/// Rejected tenant policy config (out of the ratified range — no silent clamp).
 #[domain_model]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PolicyConfigError {
-    D2OutOfRange(i64),
+    /// A configured D2 threshold lies outside `[min, max]` at its own currency's
+    /// scale (the bounds are scale-derived, so they travel with the error).
+    D2OutOfRange {
+        threshold: PostedMoney,
+        min: Decimal,
+        max: Decimal,
+    },
+    /// The platform default D2 threshold cannot be expressed at this currency's
+    /// scale (distinct from a configured threshold being out of range).
+    D2DefaultUnrepresentable(CurrencySpec),
+    DuplicateCurrency(String),
+    /// One currency at two stored scales: two configured thresholds, or a
+    /// configured threshold and the comparand's currency.
+    MetadataConflict {
+        currency: String,
+        configured_scale: u8,
+        other_scale: u8,
+    },
     A6OutOfRange(i32),
     TtlNotPositive(i64),
 }
 
-/// The facts a threshold check needs. This module only COMPARES — it does no FX.
-///
-/// **DC10 / FX.** `amount_usd_eq_minor` is the operation's amount valued in the
-/// threshold (FUNCTIONAL / reporting) currency. Callers pass the operation's
-/// TRANSACTION-currency minor; the dual-control gate (`ApprovalService::gate`)
-/// translates it to the tenant's functional currency at the current rate before
-/// this module compares — reading the operation currency off the `ApprovalIntent`
-/// (`ApprovalIntent::transaction_currency`). A single-currency tenant (or a
-/// same-currency op) compares unchanged. This module itself does NO FX — it only
-/// compares. Residual: `Reverse` / `RecognitionScheduleChange` derive their
-/// comparand at gate time and carry no currency on the stored intent, so they keep
-/// the transaction-currency comparand (single-currency-correct) until the currency
-/// rides those intents — for those kinds the threshold compares transaction-currency
-/// minor, which is exact only while the tenant is single-currency.
+/// Existing valuation behavior, including transaction basis for derived kinds.
 #[domain_model]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct OperationFacts {
-    pub kind: ApprovalKind,
-    /// The D2 comparand for amount-gated kinds (reverse / credit-grant / chargeback
-    /// / recognition-schedule-change); `None` for non-amount kinds. Transaction-
-    /// currency minor today; functional/USD-eq once the FX slice lands (type doc).
-    pub amount_usd_eq_minor: Option<i64>,
-    /// For `MaterialBackdating`: the effective date of the backdated post.
-    pub effective_at: Option<NaiveDate>,
-    /// For `PayerClosure`: whether the payer holds a non-zero AR or a positive
-    /// customer balance at closure.
-    pub has_outstanding_balance: bool,
+pub enum ValuationBasis {
+    Transaction,
+    Functional,
+}
+///
+/// Material backdating is gated on business days, not on an amount, so it keeps
+/// its captured transaction value (never converted to the functional currency).
+#[must_use]
+pub fn valuation_basis(kind: ApprovalKind) -> ValuationBasis {
+    match kind {
+        ApprovalKind::Reverse
+        | ApprovalKind::RecognitionScheduleChange
+        | ApprovalKind::MaterialBackdating => ValuationBasis::Transaction,
+        ApprovalKind::CreditGrant
+        | ApprovalKind::ChargebackLoss
+        | ApprovalKind::PayerClosure
+        | ApprovalKind::PeriodReopen
+        | ApprovalKind::Refund
+        | ApprovalKind::ManualAdjustment
+        | ApprovalKind::CreditNote
+        | ApprovalKind::DebitNote => ValuationBasis::Functional,
+    }
+}
+/// Which rule decides whether an operation of a kind needs dual control. The
+/// one classification both [`amount_gated`] and [`requires_dual_control`]
+/// dispatch on, so the amount-gated set cannot drift between them.
+#[domain_model]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GateRule {
+    /// The D2 amount threshold (the gate needs amount facts).
+    Amount,
+    /// The A6 material-backdating window.
+    Backdating,
+    /// An outstanding balance on the payer being closed.
+    OutstandingBalance,
+    /// Always dual-controlled.
+    Always,
 }
 
-/// The policy *version* in effect at `now`: the row with the greatest
-/// `effective_from <= now`, highest `version` on a tie; `None` when no row
-/// applies (the caller then falls back to the ratified
-/// [`DualControlPolicy::DEFAULT`]). Carries the `version` + `effective_from`
-/// provenance the read surface renders — [`resolve_policy`] keeps only the
-/// resolved thresholds.
+/// The [`GateRule`] for `kind`. Exhaustive, so a new kind must choose its rule
+/// instead of falling into the threshold check (and failing open without an
+/// amount).
+#[must_use]
+pub const fn gate_rule(kind: ApprovalKind) -> GateRule {
+    match kind {
+        ApprovalKind::MaterialBackdating => GateRule::Backdating,
+        ApprovalKind::PayerClosure => GateRule::OutstandingBalance,
+        ApprovalKind::PeriodReopen => GateRule::Always,
+        ApprovalKind::Reverse
+        | ApprovalKind::CreditGrant
+        | ApprovalKind::ChargebackLoss
+        | ApprovalKind::RecognitionScheduleChange
+        | ApprovalKind::Refund
+        | ApprovalKind::ManualAdjustment
+        | ApprovalKind::CreditNote
+        | ApprovalKind::DebitNote => GateRule::Amount,
+    }
+}
+
+/// Whether `kind` is decided by the D2 amount threshold (and so needs amount
+/// facts at the gate): [`GateRule::Amount`].
+#[must_use]
+pub const fn amount_gated(kind: ApprovalKind) -> bool {
+    matches!(gate_rule(kind), GateRule::Amount)
+}
+/// Already-valued comparand. Resubmissions do not perform this gate.
+#[domain_model]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OperationFacts {
+    pub kind: ApprovalKind,
+    pub amount: Option<PostedMoney>,
+    pub effective_at: Option<NaiveDate>,
+    pub has_outstanding_balance: bool,
+}
 #[must_use]
 pub fn effective_version(versions: &[PolicyVersion], now: OffsetDateTime) -> Option<PolicyVersion> {
     versions
@@ -106,90 +272,102 @@ pub fn effective_version(versions: &[PolicyVersion], now: OffsetDateTime) -> Opt
                 .cmp(&b.effective_from)
                 .then(a.version.cmp(&b.version))
         })
-        .copied()
+        .cloned()
 }
-
-/// Resolve the policy in effect at `now`: the row with the greatest
-/// `effective_from <= now`, highest `version` on a tie; the ratified defaults
-/// when none applies.
 #[must_use]
 pub fn resolve_policy(versions: &[PolicyVersion], now: OffsetDateTime) -> DualControlPolicy {
     effective_version(versions, now).map_or(DualControlPolicy::DEFAULT, |v| v.policy)
 }
-
-/// Validate a tenant policy config against the ratified ranges (DECISIONS D-1,
-/// foundation §1.4). Out-of-range is **rejected** — never clamped (DC9/DC11).
+/// Validate stored-spec bounds. New configuration must additionally validate each
+/// currency against current configuration on the caller's transaction runner.
 ///
 /// # Errors
-/// [`PolicyConfigError`] when D2, A6, or the TTL is outside its allowed range.
+/// [`PolicyConfigError::DuplicateCurrency`] / [`PolicyConfigError::MetadataConflict`] when a
+/// currency is configured twice (same or different scale); [`PolicyConfigError::D2OutOfRange`],
+/// [`PolicyConfigError::A6OutOfRange`] or [`PolicyConfigError::TtlNotPositive`] when D2, A6 or
+/// the TTL is outside its allowed range.
 pub fn validate_config(
-    d2_threshold_minor: i64,
-    a6_backdating_biz_days: i32,
-    pending_ttl_seconds: i64,
+    thresholds: &[PostedMoney],
+    a6: i32,
+    ttl: i64,
 ) -> Result<(), PolicyConfigError> {
-    if !(D2_MIN_MINOR..=D2_MAX_MINOR).contains(&d2_threshold_minor) {
-        return Err(PolicyConfigError::D2OutOfRange(d2_threshold_minor));
+    validate_thresholds(thresholds)?;
+    validate_limits(a6, ttl)
+}
+/// Validate the A6 backdating window and the pending TTL.
+///
+/// # Errors
+/// [`PolicyConfigError::A6OutOfRange`] or [`PolicyConfigError::TtlNotPositive`] when A6 or
+/// the TTL is outside its allowed range.
+pub fn validate_limits(a6: i32, ttl: i64) -> Result<(), PolicyConfigError> {
+    if !(A6_MIN_DAYS..=A6_MAX_DAYS).contains(&a6) {
+        return Err(PolicyConfigError::A6OutOfRange(a6));
     }
-    if !(A6_MIN_DAYS..=A6_MAX_DAYS).contains(&a6_backdating_biz_days) {
-        return Err(PolicyConfigError::A6OutOfRange(a6_backdating_biz_days));
-    }
-    if pending_ttl_seconds <= 0 {
-        return Err(PolicyConfigError::TtlNotPositive(pending_ttl_seconds));
+    if ttl <= 0 {
+        return Err(PolicyConfigError::TtlNotPositive(ttl));
     }
     Ok(())
 }
-
-/// Decide whether `op` must go through dual-control under `policy`, given the
-/// current date `today` (for the A6 backdating window). Per-policy (DC: only over
-/// threshold) — below threshold the caller proceeds single-actor.
-#[must_use]
+/// Validate the per-currency D2 thresholds alone: one threshold per currency
+/// code, each within its scale-derived bounds.
+///
+/// # Errors
+/// [`PolicyConfigError::DuplicateCurrency`] / [`PolicyConfigError::MetadataConflict`] when a
+/// currency is configured twice (same or different scale);
+/// [`PolicyConfigError::D2OutOfRange`] when a threshold is outside its bounds.
+pub fn validate_thresholds(thresholds: &[PostedMoney]) -> Result<(), PolicyConfigError> {
+    let mut currencies = std::collections::BTreeMap::new();
+    for value in thresholds {
+        let spec = value.currency();
+        if let Some(previous) = currencies.insert(spec.code(), spec.scale()) {
+            return Err(if previous == spec.scale() {
+                PolicyConfigError::DuplicateCurrency(spec.code().into())
+            } else {
+                PolicyConfigError::MetadataConflict {
+                    currency: spec.code().into(),
+                    configured_scale: previous,
+                    other_scale: spec.scale(),
+                }
+            });
+        }
+        let scale = u32::from(spec.scale());
+        let (min, max) = (
+            Decimal::new(10_000, scale),
+            Decimal::new(100_000_000, scale),
+        );
+        if value.amount() < min || value.amount() > max {
+            return Err(PolicyConfigError::D2OutOfRange {
+                threshold: value.clone(),
+                min,
+                max,
+            });
+        }
+    }
+    Ok(())
+}
+/// Compare exact magnitude only after the existing valuation step.
+///
+/// # Errors
+/// The [`PolicyConfigError`] of [`DualControlPolicy::d2_threshold`] when the policy's
+/// thresholds are invalid or conflict with the amount's currency metadata.
 pub fn requires_dual_control(
     op: &OperationFacts,
-    policy: DualControlPolicy,
+    policy: &DualControlPolicy,
     today: NaiveDate,
-) -> bool {
-    match op.kind {
-        // Amount-gated: USD-eq at or above the D2 threshold. A recognition schedule
-        // change/cancel is sized by the un-recognized deferred remainder it re-plans
-        // or strands (the gate reads it from the schedule, like `Reverse`).
-        ApprovalKind::Reverse
-        | ApprovalKind::CreditGrant
-        | ApprovalKind::ChargebackLoss
-        | ApprovalKind::RecognitionScheduleChange
-        // A refund / credit-note is money-OUT; the D2 threshold gates it on the
-        // cash returned (design §1.4 D2 — refunds & credit-notes above the
-        // tenant-configurable amount need preparer/approver). Reuses the SAME D2
-        // policy row as the other amount-gated kinds (no separate refund threshold).
-        | ApprovalKind::Refund
-        // A governed manual adjustment is a money-affecting governed posting; gated
-        // on the gross adjustment amount (Σ DR == Σ CR), the SAME D2 row as the other
-        // amount-gated kinds (no separate manual-adjustment threshold).
-        | ApprovalKind::ManualAdjustment
-        // A credit note is money-OUT (reduces AR / recognized revenue / seeds a
-        // refundable wallet); a debit note is a money-affecting additional charge
-        // that can book fresh revenue + a recognition schedule outside the normal
-        // invoice flow. Both are material adjustments to a posted invoice, gated on
-        // the note amount against the SAME D2 row (design §5 D1–D2). No separate
-        // note threshold.
-        | ApprovalKind::CreditNote
-        | ApprovalKind::DebitNote => op
-            .amount_usd_eq_minor
-            // Gate on magnitude (VHP-1855 #11): a negative USD-eq amount must not
-            // slip below the threshold and skip the gate. Defensive — the
-            // amount-bearing kinds reject a non-positive amount upstream
-            // (`build_grant_entry`, the dispute `CHECK`; the derived Reverse /
-            // RecognitionScheduleChange amounts are `>= 0`) — but the gate must not
-            // depend on those guards holding.
-            .is_some_and(|amount| amount.saturating_abs() >= policy.d2_threshold_minor),
-        // Open-period material backdating: effective date older than A6 biz days.
-        ApprovalKind::MaterialBackdating => op
+) -> Result<bool, PolicyConfigError> {
+    Ok(match gate_rule(op.kind) {
+        GateRule::Backdating => op
             .effective_at
             .is_some_and(|eff| business_days_between(eff, today) > policy.a6_backdating_biz_days),
-        // Closing a payer that still holds a balance always needs sign-off.
-        ApprovalKind::PayerClosure => op.has_outstanding_balance,
-        // Reopening a closed fiscal period is always dual-control (Slice 7 prep).
-        ApprovalKind::PeriodReopen => true,
-    }
+        GateRule::OutstandingBalance => op.has_outstanding_balance,
+        GateRule::Always => true,
+        GateRule::Amount => match &op.amount {
+            Some(amount) => {
+                amount.amount().abs() >= policy.d2_threshold(amount.currency())?.amount()
+            }
+            None => false,
+        },
+    })
 }
 
 /// Count business days (Mon–Fri) after `from` up to and including `to`. `0` when

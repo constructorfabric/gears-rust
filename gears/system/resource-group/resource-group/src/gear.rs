@@ -74,6 +74,12 @@ impl Gear for ResourceGroup {
             .client_hub()
             .get::<dyn AuthZResolverApi>()
             .map_err(|e| anyhow::anyhow!("failed to get AuthZ resolver: {e}"))?;
+        // RG owns the canonical membership and closure tables, but its group
+        // resources are nested through `parent_id`/`resource_group_closure`,
+        // not represented by membership rows. Their descriptors do not opt in
+        // to native group predicates, and RG does not advertise the service-
+        // level capabilities either; the PDP must expand group scopes to
+        // explicit `in` predicates, or deny.
         let enforcer = PolicyEnforcer::new(authz);
 
         // Create repo instances

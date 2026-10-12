@@ -1,6 +1,6 @@
 //! Fast SQLite tests for currency-scale resolution and the registration
-//! headroom guard. ISO default vs registry override vs unknown, plus an
-//! out-of-headroom scale rejected at upsert.
+//! scale guard. ISO default vs registry override vs unknown, plus a scale
+//! beyond the ledger's 28-digit decimal limit rejected at upsert.
 
 #![allow(
     clippy::non_ascii_literal,
@@ -12,7 +12,7 @@
 )]
 
 use bss_ledger::domain::model::{CurrencyScaleRow, RepoError};
-use bss_ledger::domain::money::{DEFAULT_PLAUSIBLE_MAX_MAJOR, ScaleError};
+use bss_ledger::domain::money::ScaleError;
 use bss_ledger::infra::currency_scale::CurrencyScaleResolver;
 use bss_ledger::infra::storage::migrations::Migrator;
 use bss_ledger::infra::storage::repo::ReferenceRepo;
@@ -39,27 +39,25 @@ async fn resolves_iso_override_and_rejects_unknown_and_overflow() {
     // ISO default, no registry row.
     assert_eq!(resolver.resolve(&scope, tenant, "USD").await.unwrap(), 2);
 
-    // Non-ISO currency, scale within the default headroom, via the registry.
+    // Non-ISO currency, scale within the supported range, via the registry.
     reference
         .upsert_currency_scale(CurrencyScaleRow {
             tenant_id: tenant,
             currency: "USDC".to_owned(),
-            minor_units: 6,
-            plausible_max_major: DEFAULT_PLAUSIBLE_MAX_MAJOR,
+            currency_scale: 6,
             source: "tenant".to_owned(),
         })
         .await
         .unwrap();
     assert_eq!(resolver.resolve(&scope, tenant, "USDC").await.unwrap(), 6);
 
-    // High-precision crypto (BTC@8) fits under a smaller per-currency max
-    // (21_000_000 major units): 2.1e7 * 10^8 = 2.1e15 <= i64::MAX (VHP-1834).
+    // High-precision crypto (BTC@8) registers at its own scale; the only limit is
+    // the 28-digit coefficient bound shared by every currency.
     reference
         .upsert_currency_scale(CurrencyScaleRow {
             tenant_id: tenant,
             currency: "BTC".to_owned(),
-            minor_units: 8,
-            plausible_max_major: 21_000_000,
+            currency_scale: 8,
             source: "tenant".to_owned(),
         })
         .await
@@ -70,17 +68,21 @@ async fn resolves_iso_override_and_rejects_unknown_and_overflow() {
     let unknown = resolver.resolve(&scope, tenant, "ZZZ").await.unwrap_err();
     assert!(matches!(unknown, ScaleError::UnknownCurrencyScale(_)));
 
-    // Out-of-headroom scale rejected at registration: scale 8 under the
-    // default 10^12 max overflows (10^12 * 10^8 = 10^20 > i64::MAX).
+    // A scale above the supported 0..=28 range is rejected at registration.
     let overflow = reference
         .upsert_currency_scale(CurrencyScaleRow {
             tenant_id: tenant,
             currency: "ETH".to_owned(),
-            minor_units: 8,
-            plausible_max_major: DEFAULT_PLAUSIBLE_MAX_MAJOR,
+            currency_scale: 29,
             source: "tenant".to_owned(),
         })
         .await
         .unwrap_err();
-    assert!(matches!(overflow, RepoError::ScaleOutOfRange(_)));
+    assert!(
+        matches!(overflow, RepoError::ScaleOutOfRange(_)),
+        "scale 29 must be rejected: {overflow:?}"
+    );
+    // The rejected row was never written: the currency stays unknown.
+    let unknown = resolver.resolve(&scope, tenant, "ETH").await.unwrap_err();
+    assert!(matches!(unknown, ScaleError::UnknownCurrencyScale(_)));
 }

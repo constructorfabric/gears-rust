@@ -14,14 +14,16 @@ use uuid::Uuid;
     no_type
 )]
 pub struct Model {
+    pub currency: String,
+    pub currency_scale: i16,
     #[sea_orm(primary_key, auto_increment = false)]
     pub tenant_id: Uuid,
     #[sea_orm(primary_key, auto_increment = false)]
     pub payment_id: String,
     #[sea_orm(primary_key, auto_increment = false)]
     pub invoice_id: String,
-    pub allocated_minor: i64,
-    pub refunded_minor: i64,
+    pub allocated: String,
+    pub refunded: String,
     pub version: i64,
 }
 

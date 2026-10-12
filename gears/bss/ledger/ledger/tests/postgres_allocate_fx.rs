@@ -15,7 +15,7 @@
 //!    **loss**, and BOTH grains close to functional zero.
 //!
 //! Asserts the net realized loss (2.40), the functional-only FX line shape
-//! (`amount_minor = 0`, `functional_amount_minor = 240`, side DR), that the
+//! (`amount = 0`, `functional_amount = 2.4`, side DR), that the
 //! allocate entry's functional column balances under the dual-column commit
 //! trigger, and that both the AR invoice and the pool close to `(0, 0)` in BOTH
 //! columns. No new rate is locked on the allocate entry (relief is at the carried
@@ -40,7 +40,6 @@ use bss_ledger::config::{FxConfig, RecognitionConfig};
 use bss_ledger::domain::instant::to_naive_date;
 use bss_ledger::domain::invoice::builder::{InvoiceItem, PostedInvoice};
 use bss_ledger::domain::model::{AccountRow, CurrencyScaleRow};
-use bss_ledger::domain::money::DEFAULT_PLAUSIBLE_MAX_MAJOR;
 use bss_ledger::domain::payment::settlement::SettlementInput;
 use bss_ledger::domain::ports::metrics::NoopLedgerMetrics;
 use bss_ledger::infra::events::publisher::LedgerEventPublisher;
@@ -52,7 +51,9 @@ use bss_ledger::infra::payment::settle::SettlementService;
 use bss_ledger::infra::storage::migrations::Migrator;
 use bss_ledger::infra::storage::repo::{FxRepo, NewFxRate, ReferenceRepo};
 use bss_ledger_sdk::AccountClass;
+use bss_ledger_sdk::{CurrencySpec, PostedMoney};
 use chrono::NaiveDate;
+use rust_decimal::Decimal;
 use sea_orm::{ConnectionTrait, Database, DatabaseConnection, Statement};
 use sea_orm_migration::MigratorTrait;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
@@ -71,6 +72,35 @@ async fn scalar_i64(conn: &DatabaseConnection, sql: &str) -> Option<i64> {
         .await
         .unwrap()
         .map(|r| r.try_get_by_index::<i64>(0).unwrap())
+}
+
+/// A scale-2 posting in `code` from a cent count (`12_000` ⇒ `120`).
+fn money(cents: i64, code: &str) -> PostedMoney {
+    PostedMoney::try_new(
+        Decimal::new(cents, 2),
+        CurrencySpec::try_new(code.to_owned(), 2).unwrap(),
+    )
+    .unwrap()
+}
+
+/// An EUR@2 posting from a cent count.
+fn eur(cents: i64) -> PostedMoney {
+    money(cents, "EUR")
+}
+
+/// A canonical stored-amount expectation (`"129.6"`, `"0"`), shaped like
+/// the `Option` that `scalar_text` returns.
+#[allow(clippy::unnecessary_wraps)] // compared directly with `scalar_text`'s `Option`
+fn txt(canonical: &str) -> Option<String> {
+    Some(canonical.to_owned())
+}
+
+/// Read one stored canonical decimal text column (`None` when no row).
+async fn scalar_text(conn: &DatabaseConnection, sql: &str) -> Option<String> {
+    conn.query_one_raw(pg(sql.to_owned()))
+        .await
+        .unwrap()
+        .map(|r| r.try_get_by_index::<String>(0).unwrap())
 }
 
 fn naive(y: i32, m: u32, d: u32) -> NaiveDate {
@@ -139,8 +169,7 @@ async fn cross_currency_allocate_realizes_fx_and_closes_both_grains() {
             .upsert_currency_scale(CurrencyScaleRow {
                 tenant_id: tenant,
                 currency: ccy.to_owned(),
-                minor_units: 2,
-                plausible_max_major: DEFAULT_PLAUSIBLE_MAX_MAJOR,
+                currency_scale: 2,
                 source: "iso".to_owned(),
             })
             .await
@@ -197,7 +226,7 @@ async fn cross_currency_allocate_realizes_fx_and_closes_both_grains() {
             base_currency: "EUR".to_owned(),
             quote_currency: "USD".to_owned(),
             provider: "ecb".to_owned(),
-            rate_micro: 1_100_000,
+            rate: Decimal::new(110, 2),
             as_of: now,
             fallback_order: 0,
         })
@@ -226,9 +255,8 @@ async fn cross_currency_allocate_realizes_fx_and_closes_both_grains() {
         due_date: Some(naive(2026, 12, 1)),
         period_id: period_id.clone(),
         items: vec![InvoiceItem {
-            amount_minor_ex_tax: 12_000,
-            deferred_minor: 0,
-            currency: "EUR".to_owned(),
+            amount_ex_tax: eur(12_000),
+            deferred: eur(0),
             revenue_stream: "subscription".to_owned(),
             catalog_class: Some(AccountClass::Revenue),
             contract_class: None,
@@ -250,17 +278,17 @@ async fn cross_currency_allocate_realizes_fx_and_closes_both_grains() {
 
     // AR grain carried both columns: 120.00 EUR / 132.00 USD.
     assert_eq!(
-        scalar_i64(&raw, &format!(
-            "SELECT balance_minor FROM bss.ledger_ar_invoice_balance WHERE tenant_id='{tenant}' AND invoice_id='INV-FXC-1'"
+        scalar_text(&raw, &format!(
+            "SELECT balance FROM bss.ledger_ar_invoice_balance WHERE tenant_id='{tenant}' AND invoice_id='INV-FXC-1'"
         )).await,
-        Some(12_000),
+        txt("120"),
         "AR carried transaction = 120.00 EUR"
     );
     assert_eq!(
-        scalar_i64(&raw, &format!(
-            "SELECT functional_balance_minor FROM bss.ledger_ar_invoice_balance WHERE tenant_id='{tenant}' AND invoice_id='INV-FXC-1'"
+        scalar_text(&raw, &format!(
+            "SELECT functional_balance FROM bss.ledger_ar_invoice_balance WHERE tenant_id='{tenant}' AND invoice_id='INV-FXC-1'"
         )).await,
-        Some(13_200),
+        txt("132"),
         "AR carried functional = 132.00 USD (120.00 EUR * 1.10)"
     );
 
@@ -271,7 +299,7 @@ async fn cross_currency_allocate_realizes_fx_and_closes_both_grains() {
             base_currency: "EUR".to_owned(),
             quote_currency: "USD".to_owned(),
             provider: "ecb".to_owned(),
-            rate_micro: 1_080_000,
+            rate: Decimal::new(108, 2),
             as_of: now,
             fallback_order: 0,
         })
@@ -293,9 +321,8 @@ async fn cross_currency_allocate_realizes_fx_and_closes_both_grains() {
                 tenant_id: tenant,
                 payer_tenant_id: payer,
                 payment_id: "PAY-FXC-1".to_owned(),
-                gross_minor: 12_000,
-                fee_minor: 0,
-                currency: "EUR".to_owned(),
+                gross: eur(12_000),
+                fee: eur(0),
                 effective_at: None,
             },
         )
@@ -303,17 +330,17 @@ async fn cross_currency_allocate_realizes_fx_and_closes_both_grains() {
         .expect("cross-currency settle must post");
 
     assert_eq!(
-        scalar_i64(&raw, &format!(
-            "SELECT balance_minor FROM bss.ledger_unallocated_balance WHERE tenant_id='{tenant}' AND payer_tenant_id='{payer}'"
+        scalar_text(&raw, &format!(
+            "SELECT balance FROM bss.ledger_unallocated_balance WHERE tenant_id='{tenant}' AND payer_tenant_id='{payer}'"
         )).await,
-        Some(12_000),
+        txt("120"),
         "pool carried transaction = 120.00 EUR"
     );
     assert_eq!(
-        scalar_i64(&raw, &format!(
-            "SELECT functional_balance_minor FROM bss.ledger_unallocated_balance WHERE tenant_id='{tenant}' AND payer_tenant_id='{payer}'"
+        scalar_text(&raw, &format!(
+            "SELECT functional_balance FROM bss.ledger_unallocated_balance WHERE tenant_id='{tenant}' AND payer_tenant_id='{payer}'"
         )).await,
-        Some(12_960),
+        txt("129.6"),
         "pool carried functional = 129.60 USD (120.00 EUR * 1.08)"
     );
 
@@ -334,8 +361,7 @@ async fn cross_currency_allocate_realizes_fx_and_closes_both_grains() {
                 payer_tenant_id: payer,
                 payment_id: "PAY-FXC-1".to_owned(),
                 allocation_id: Uuid::now_v7(),
-                lump_minor: 12_000,
-                currency: "EUR".to_owned(),
+                lump: eur(12_000),
                 hint_invoice_id: None,
                 caller_splits: None,
             },
@@ -361,24 +387,24 @@ async fn cross_currency_allocate_realizes_fx_and_closes_both_grains() {
     );
 
     // The net realized FX line: a functional-only DR FX_GAIN_LOSS of 2.40 USD loss
-    // (amount_minor = 0, functional_amount_minor = 240, currency = USD).
+    // (amount = 0, functional_amount = 2.4, currency = USD).
     assert_eq!(
-        scalar_i64(
+        scalar_text(
             &raw,
-            &format!("SELECT functional_amount_minor {alloc_lines} AND account_id='{fx_gl}'")
+            &format!("SELECT functional_amount {alloc_lines} AND account_id='{fx_gl}'")
         )
         .await,
-        Some(240),
+        txt("2.4"),
         "DR FX_GAIN_LOSS = 2.40 USD realized loss (132.00 - 129.60)"
     );
     assert_eq!(
-        scalar_i64(
+        scalar_text(
             &raw,
-            &format!("SELECT amount_minor {alloc_lines} AND account_id='{fx_gl}'")
+            &format!("SELECT amount {alloc_lines} AND account_id='{fx_gl}'")
         )
         .await,
-        Some(0),
-        "the FX line is functional-only (transaction amount_minor = 0)"
+        txt("0"),
+        "the FX line is functional-only (transaction amount = 0)"
     );
     assert_eq!(
         scalar_i64(&raw, &format!(
@@ -391,10 +417,12 @@ async fn cross_currency_allocate_realizes_fx_and_closes_both_grains() {
     // The allocate entry's functional column balances (DR == CR) — the dual-column
     // commit trigger accepted the post ONLY because of this.
     assert_eq!(
-        scalar_i64(&raw, &format!(
-            "SELECT COALESCE(SUM(CASE WHEN side='DR' THEN functional_amount_minor ELSE -functional_amount_minor END),0)::bigint {alloc_lines}"
-        )).await,
-        Some(0),
+        scalar_text(&raw, &format!(
+            "SELECT COALESCE(SUM(CASE WHEN side='DR' THEN functional_amount::numeric ELSE -(functional_amount::numeric) END),0)::text {alloc_lines}"
+        ))
+        .await
+        .map(|t| Decimal::from_str_exact(&t).unwrap().normalize()),
+        Some(Decimal::ZERO),
         "allocate entry functional column balances (DR == CR)"
     );
     // No new base rate is locked on an allocation close (relief at the carried
@@ -411,41 +439,41 @@ async fn cross_currency_allocate_realizes_fx_and_closes_both_grains() {
 
     // ── 5. Both grains close to ZERO in BOTH columns ────────────────────────────
     assert_eq!(
-        scalar_i64(&raw, &format!(
-            "SELECT balance_minor FROM bss.ledger_ar_invoice_balance WHERE tenant_id='{tenant}' AND invoice_id='INV-FXC-1'"
+        scalar_text(&raw, &format!(
+            "SELECT balance FROM bss.ledger_ar_invoice_balance WHERE tenant_id='{tenant}' AND invoice_id='INV-FXC-1'"
         )).await,
-        Some(0),
+        txt("0"),
         "AR transaction balance closed to 0"
     );
     assert_eq!(
-        scalar_i64(&raw, &format!(
-            "SELECT functional_balance_minor FROM bss.ledger_ar_invoice_balance WHERE tenant_id='{tenant}' AND invoice_id='INV-FXC-1'"
+        scalar_text(&raw, &format!(
+            "SELECT functional_balance FROM bss.ledger_ar_invoice_balance WHERE tenant_id='{tenant}' AND invoice_id='INV-FXC-1'"
         )).await,
-        Some(0),
+        txt("0"),
         "AR functional balance closed to 0"
     );
     assert_eq!(
-        scalar_i64(&raw, &format!(
-            "SELECT balance_minor FROM bss.ledger_unallocated_balance WHERE tenant_id='{tenant}' AND payer_tenant_id='{payer}'"
+        scalar_text(&raw, &format!(
+            "SELECT balance FROM bss.ledger_unallocated_balance WHERE tenant_id='{tenant}' AND payer_tenant_id='{payer}'"
         )).await,
-        Some(0),
+        txt("0"),
         "pool transaction balance closed to 0"
     );
     assert_eq!(
-        scalar_i64(&raw, &format!(
-            "SELECT functional_balance_minor FROM bss.ledger_unallocated_balance WHERE tenant_id='{tenant}' AND payer_tenant_id='{payer}'"
+        scalar_text(&raw, &format!(
+            "SELECT functional_balance FROM bss.ledger_unallocated_balance WHERE tenant_id='{tenant}' AND payer_tenant_id='{payer}'"
         )).await,
-        Some(0),
+        txt("0"),
         "pool functional balance closed to 0"
     );
 
     // The FX_GAIN_LOSS account carries the realized loss in the functional column
     // (a P&L grain: transaction balance 0, functional = the 2.40 USD loss).
     assert_eq!(
-        scalar_i64(&raw, &format!(
-            "SELECT functional_balance_minor FROM bss.ledger_account_balance WHERE tenant_id='{tenant}' AND account_id='{fx_gl}'"
+        scalar_text(&raw, &format!(
+            "SELECT functional_balance FROM bss.ledger_account_balance WHERE tenant_id='{tenant}' AND account_id='{fx_gl}'"
         )).await,
-        Some(240),
+        txt("2.4"),
         "FX_GAIN_LOSS functional balance = the 2.40 USD realized loss"
     );
 }

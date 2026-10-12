@@ -91,9 +91,9 @@ async fn claim_then_finalize_then_replay() {
         seed.execute_raw(pg(format!(
             "INSERT INTO bss.ledger_journal_line
                 (line_id, entry_id, tenant_id, period_id, payer_tenant_id, account_id,
-                 account_class, side, amount_minor, currency, currency_scale, mapping_status)
+                 account_class, side, amount, currency, currency_scale, mapping_status)
              VALUES ('{line}','{entry_id}','{tenant}','202606','{tenant}','{tenant}',
-                     '{class}','{side}', 1000, 'USD', 2, 'RESOLVED')"
+                     '{class}','{side}', '10', 'USD', 2, 'RESOLVED')"
         )))
         .await
         .unwrap();

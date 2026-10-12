@@ -1,0 +1,152 @@
+{
+  "golden": "resolve_sku_version_by_date",
+  "proves": "D-421, AC dod-binding-sku-version: the SKU version is read as of the date - September binds version 1 (GL 4000) although version 2 (GL 4100, from 2026-10-01) is already published; October binds version 2 while the pinned price does not change",
+  "exchanges": [
+    {
+      "case": "signup on 2026-09-15",
+      "caller": "the tenant",
+      "request": "GET /bss-pricing/v1/resolve?plan_revision_id=<revision:pro-2>&date=2026-09-15&item_id=<item:pro-2/pro>",
+      "status": 200,
+      "body": {
+        "plan_revision_id": "<revision:pro-2>",
+        "plan_id": "<plan:pro>",
+        "rev_no": 2,
+        "state": "published",
+        "book_id": "<book:eur>",
+        "currency": "EUR",
+        "currency_minor_digits": 2,
+        "rounding_policy": "half_even",
+        "date": "2026-09-15",
+        "items": [
+          {
+            "usage_rating_policy": null,
+            "item_id": "<item:pro-2/pro>",
+            "sku_id": "<sku:pro>",
+            "price_book_entry_id": "<entry:pro>",
+            "charge_kind": "recurring",
+            "period": "month",
+            "model": "flat",
+            "sku_version": {
+              "published_version": 1,
+              "effective_from": "2026-01-01"
+            },
+            "invoice_line_template": {
+              "value": "Pro plan, {period}",
+              "source": "entry"
+            },
+            "gl_code": {
+              "value": "4000",
+              "source": "sku"
+            },
+            "tax_category": {
+              "value": "std",
+              "source": "tenant"
+            },
+            "billing_timing": {
+              "value": "advance",
+              "source": "sku"
+            },
+            "meter": {
+              "usage_type_ref": null,
+              "unit": null
+            },
+            "chains": [
+              {
+                "dim_value": null,
+                "uncovered": false,
+                "binding": {
+                  "price_id": "<price:10>",
+                  "dim_used": null,
+                  "pinned_from": null,
+                  "price": {
+                    "amount": "10.00"
+                  },
+                  "min_fee": null,
+                  "eligibility": "all",
+                  "effective_from": "2026-01-01",
+                  "effective_to": "2026-11-01",
+                  "temporary_until": null,
+                  "ends_on": null,
+                  "keep_for_bound": false
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "case": "renewal pinned to 10 on 2026-10-15",
+      "caller": "the tenant",
+      "request": "GET /bss-pricing/v1/resolve?plan_revision_id=<revision:pro-2>&date=2026-10-15&item_id=<item:pro-2/pro>&pins=<price:10>",
+      "status": 200,
+      "body": {
+        "plan_revision_id": "<revision:pro-2>",
+        "plan_id": "<plan:pro>",
+        "rev_no": 2,
+        "state": "published",
+        "book_id": "<book:eur>",
+        "currency": "EUR",
+        "currency_minor_digits": 2,
+        "rounding_policy": "half_even",
+        "date": "2026-10-15",
+        "items": [
+          {
+            "usage_rating_policy": null,
+            "item_id": "<item:pro-2/pro>",
+            "sku_id": "<sku:pro>",
+            "price_book_entry_id": "<entry:pro>",
+            "charge_kind": "recurring",
+            "period": "month",
+            "model": "flat",
+            "sku_version": {
+              "published_version": 2,
+              "effective_from": "2026-10-01"
+            },
+            "invoice_line_template": {
+              "value": "Pro plan, {period}",
+              "source": "entry"
+            },
+            "gl_code": {
+              "value": "4100",
+              "source": "sku"
+            },
+            "tax_category": {
+              "value": "std",
+              "source": "tenant"
+            },
+            "billing_timing": {
+              "value": "advance",
+              "source": "sku"
+            },
+            "meter": {
+              "usage_type_ref": null,
+              "unit": null
+            },
+            "chains": [
+              {
+                "dim_value": null,
+                "uncovered": false,
+                "binding": {
+                  "price_id": "<price:10>",
+                  "dim_used": null,
+                  "pinned_from": "<price:10>",
+                  "price": {
+                    "amount": "10.00"
+                  },
+                  "min_fee": null,
+                  "eligibility": "all",
+                  "effective_from": "2026-01-01",
+                  "effective_to": "2026-11-01",
+                  "temporary_until": null,
+                  "ends_on": null,
+                  "keep_for_bound": false
+                }
+              }
+            ]
+          }
+        ]
+      }
+    }
+  ]
+}

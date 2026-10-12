@@ -33,7 +33,7 @@ pub async fn create_upstream(
     Extension(state): Extension<AppState>,
     Extension(ctx): Extension<SecurityContext>,
     Json(req): Json<CreateUpstreamRequest>,
-) -> Result<impl IntoResponse, Problem> {
+) -> Result<impl IntoResponse, Box<Problem>> {
     let upstream = state
         .cp
         .create_upstream(&ctx, req.into())
@@ -48,7 +48,7 @@ pub async fn get_upstream(
     Extension(state): Extension<AppState>,
     Extension(ctx): Extension<SecurityContext>,
     Path(id): Path<String>,
-) -> Result<impl IntoResponse, Problem> {
+) -> Result<impl IntoResponse, Box<Problem>> {
     let instance = format!("/oagw/v1/upstreams/{id}");
     let uuid = parse_gts_id(&id, gts::UPSTREAM_SCHEMA, &instance)?;
     let upstream = state
@@ -63,7 +63,7 @@ pub async fn list_upstreams(
     Extension(state): Extension<AppState>,
     Extension(ctx): Extension<SecurityContext>,
     Query(pagination): Query<PaginationQuery>,
-) -> Result<impl IntoResponse, Problem> {
+) -> Result<impl IntoResponse, Box<Problem>> {
     let query = pagination.to_list_query();
     let upstreams = state
         .cp
@@ -79,7 +79,7 @@ pub async fn update_upstream(
     Extension(ctx): Extension<SecurityContext>,
     Path(id): Path<String>,
     Json(req): Json<UpdateUpstreamRequest>,
-) -> Result<impl IntoResponse, Problem> {
+) -> Result<impl IntoResponse, Box<Problem>> {
     let instance = format!("/oagw/v1/upstreams/{id}");
     let uuid = parse_gts_id(&id, gts::UPSTREAM_SCHEMA, &instance)?;
     // Snapshot old rate_limit before update so we can detect changes and
@@ -106,7 +106,7 @@ pub async fn delete_upstream(
     Extension(state): Extension<AppState>,
     Extension(ctx): Extension<SecurityContext>,
     Path(id): Path<String>,
-) -> Result<impl IntoResponse, Problem> {
+) -> Result<impl IntoResponse, Box<Problem>> {
     let instance = format!("/oagw/v1/upstreams/{id}");
     let uuid = parse_gts_id(&id, gts::UPSTREAM_SCHEMA, &instance)?;
     let deleted_route_ids = state

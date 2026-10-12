@@ -1,0 +1,10 @@
+apiVersion: v2
+name: flight-control
+description: Deploys the flight-control unit.
+type: application
+version: 0.1.0
+appVersion: "dev"
+dependencies:
+  - name: toolkit-common
+    version: 0.1.0
+    repository: "file://../../../../../deploy/helm/toolkit-common"

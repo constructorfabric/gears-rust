@@ -1,4 +1,0 @@
-family     = "flat"
-role       = "publish"
-gates      = ["flat"]
-provenance = ["AC#60", "PRD 17.2", "PRD 6.2"]

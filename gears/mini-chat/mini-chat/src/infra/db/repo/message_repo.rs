@@ -198,16 +198,17 @@ impl crate::domain::repos::MessageRepository for MessageRepository {
             .secure()
             .scope_with(scope);
 
+        let query = super::with_id_tiebreaker(query, ("created_at", SortDir::Asc), SortDir::Asc);
         let page = paginate_odata::<MessageField, MessageODataMapper, _, _, _, _>(
             base_query,
             runner,
-            query,
-            ("created_at", SortDir::Asc),
+            &query,
+            ("id", SortDir::Asc),
             self.limit_cfg,
             std::convert::identity,
         )
         .await
-        .map_err(|e| DomainError::database(e.to_string()))?;
+        .map_err(super::odata_err)?;
 
         Ok(page)
     }
@@ -435,17 +436,23 @@ impl crate::domain::repos::MessageRepository for MessageRepository {
     // `recent_after_boundary`) which filter `RequestId.is_not_null()` to only include
     // committed messages, this method intentionally includes ALL non-deleted messages
     // to reflect the full frontier for thread summary tracking.
-    async fn find_latest_message<C: DBRunner>(
+    async fn find_latest_message_before_turn<C: DBRunner>(
         &self,
         runner: &C,
         scope: &AccessScope,
         chat_id: Uuid,
+        exclude_request_id: Uuid,
     ) -> Result<Option<crate::domain::repos::SummaryFrontier>, DomainError> {
         let row = MessageEntity::find()
             .filter(
                 Condition::all()
                     .add(Column::ChatId.eq(chat_id))
-                    .add(Column::DeletedAt.is_null()),
+                    .add(Column::DeletedAt.is_null())
+                    .add(
+                        Condition::any()
+                            .add(Column::RequestId.is_null())
+                            .add(Column::RequestId.ne(exclude_request_id)),
+                    ),
             )
             .secure()
             .scope_with(scope)
@@ -560,5 +567,6 @@ fn upper_bound_filter(b: SnapshotBoundary) -> Condition {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 #[path = "message_repo_test.rs"]
 mod tests;

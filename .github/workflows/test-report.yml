@@ -1,0 +1,222 @@
+name: Test Report
+
+# Publishes the JUnit reports that `CI` (nextest) and `e2e` (pytest) upload as
+# artifacts, as one GitHub Check Run per artifact: failing test names,
+# assertion messages, and annotations on the failing source line (the reports
+# carry file/line -- see tools/scripts/junit_enrich.py).
+#
+# Why a separate workflow: those workflows run on `pull_request`, and a PR from
+# a fork gets a read-only token there, so it cannot create Check Runs. A
+# `workflow_run` workflow always runs this file from the default branch with
+# the base repository's token. That is also why it must stay inert towards the
+# PR: no checkout, no PR code executed -- the downloaded XML is the only input,
+# artifact names included, and both are treated as untrusted data.
+#
+# Visibility only: the CI and e2e jobs remain the gate. Do not make these
+# checks required in branch protection.
+
+on:
+  workflow_run:
+    workflows: ["CI", "e2e"]
+    types: [completed]
+
+permissions:
+  contents: read
+  actions: read
+  checks: write
+
+jobs:
+  report:
+    name: Publish test reports (${{ github.event.workflow_run.name }})
+    # A cancelled run is not a test result; report nothing rather than a
+    # partial or empty one.
+    if: github.event.workflow_run.conclusion != 'cancelled'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      # One check per artifact that exists: a test job that was skipped (path
+      # filters) uploads nothing and so gets no check, rather than a
+      # "0 tests passed" one. A report that exists but holds no tests is a
+      # broken lane; it gets no check either and fails this job below, as
+      # does a test job that ran but uploaded no report.
+      #
+      # Each artifact is downloaded into its own directory by name: with a
+      # pattern, actions/download-artifact drops the per-artifact directory
+      # when exactly one artifact matches, which loses the check name.
+      - name: Download reports and plan checks
+        id: plan
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+        run: |
+          paths=() names=() empty=() missing=()
+          shopt -s nullglob
+          artifacts=$(gh api --paginate "repos/$REPO/actions/runs/$RUN_ID/artifacts" \
+            --jq '.artifacts[] | select(.expired | not) | .name')
+          # Read line by line: an unquoted `for` would glob-expand a name.
+          while IFS= read -r artifact; do
+            [ -n "$artifact" ] || continue
+            case "$artifact" in
+              rust-tests-*) title="Rust Tests / ${artifact#rust-tests-}" ;;
+              e2e-tests-*)  title="E2E / ${artifact#e2e-tests-}" ;;
+              *) continue ;;
+            esac
+            # Artifact names come from the triggering run; keep them to a
+            # plain charset before they reach a path, a check name or an output.
+            if [[ ! "$artifact" =~ ^[A-Za-z0-9_.-]+$ ]]; then
+              echo "::warning::skipping artifact with unexpected name"
+              continue
+            fi
+            gh run download "$RUN_ID" -R "$REPO" -n "$artifact" -D "reports/$artifact"
+            files=("reports/$artifact"/*.xml)
+            if [ ${#files[@]} -eq 0 ] || ! grep -q '<testcase' "${files[@]}"; then
+              empty+=("$title")
+              continue
+            fi
+            paths+=("reports/$artifact/*.xml")
+            names+=("$title")
+          done <<< "$artifacts"
+          # A producer job that ran (passed or failed) must have uploaded its
+          # report; one that was skipped by path filters or cancelled need
+          # not. Keep this map in sync with the upload steps in ci.yml/e2e.yml.
+          jobs=$(gh api --paginate "repos/$REPO/actions/runs/$RUN_ID/jobs" \
+            --jq '.jobs[] | [.name, (.conclusion // "")] | @tsv')
+          while IFS=$'\t' read -r job conclusion; do
+            case "$job" in
+              "Test Suite (ubuntu-latest)")  expected=rust-tests-Linux ;;
+              "Test Suite (windows-latest)") expected=rust-tests-Windows ;;
+              "Test Suite (macos-latest)")   expected=rust-tests-macOS ;;
+              "Integration tests")           expected=rust-tests-integration ;;
+              e2e)                           expected=e2e-tests-local ;;
+              e2e-docker)                    expected=e2e-tests-docker ;;
+              *) continue ;;
+            esac
+            case "$conclusion" in success|failure) ;; *) continue ;; esac
+            if ! grep -qxF "$expected" <<< "$artifacts"; then
+              missing+=("$job ($conclusion, no $expected)")
+            fi
+          done <<< "$jobs"
+          if [ ${#paths[@]} -gt 0 ]; then
+            eof="EOF_$(openssl rand -hex 8)"
+            {
+              echo "paths<<$eof"; printf '%s\n' "${paths[@]}"; echo "$eof"
+              echo "names<<$eof"; printf '%s\n' "${names[@]}"; echo "$eof"
+            } >> "$GITHUB_OUTPUT"
+            printf 'Publishing: %s\n' "${names[@]}"
+          else
+            echo "No test reports to publish."
+          fi
+          {
+            echo "empty=${empty[*]}"
+            (IFS=';'; echo "missing=${missing[*]}")
+            echo "planned=${#paths[@]}"
+          } >> "$GITHUB_OUTPUT"
+
+      # check_name is matched to report_paths line by line, so each artifact
+      # becomes its own check with its own conclusion (failure iff a test in
+      # it failed). fail_on_failure additionally turns this job red, so a
+      # failing report is visible from the Actions tab too.
+      - name: Publish JUnit results
+        id: publish
+        if: steps.plan.outputs.paths != ''
+        uses: mikepenz/action-junit-report@b7b80d7ac5b1da46d6aaff9fb57ad50d8453bcb3 # v6.6.0
+        with:
+          report_paths: ${{ steps.plan.outputs.paths }}
+          check_name: ${{ steps.plan.outputs.names }}
+          commit: ${{ github.event.workflow_run.head_sha }}
+          check_title_template: '{{CLASS_NAME}} › {{TEST_NAME}}'
+          detailed_summary: true
+          flaky_summary: true
+          include_time_in_summary: true
+          fail_on_failure: true
+          # Malformed XML in a matched report is an error, not a skipped file.
+          fail_on_parse_error: true
+
+      # The reporter logs a failed check creation (e.g. missing permission)
+      # and carries on; one check per planned report or this job fails.
+      - name: Verify every report got a check
+        if: ${{ !cancelled() && steps.plan.outputs.paths != '' }}
+        env:
+          PLANNED: ${{ steps.plan.outputs.planned }}
+          URLS: ${{ steps.publish.outputs.report_url }}
+        run: |
+          created=$(grep -c . <<< "$URLS" || true)
+          if [ "$created" -lt "$PLANNED" ]; then
+            echo "::error::Only $created of $PLANNED test-report checks were created"
+            exit 1
+          fi
+          echo "$created of $PLANNED checks created"
+
+      # The PR's checks list shows one line per check: its name and title.
+      # Put the failing test there instead of bare counts, so the
+      # Conversation tab says what broke without opening anything.
+      - name: Name failing tests in check titles
+        if: ${{ !cancelled() && steps.plan.outputs.paths != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.event.workflow_run.head_sha }}
+          PATHS: ${{ steps.plan.outputs.paths }}
+          NAMES: ${{ steps.plan.outputs.names }}
+        shell: python
+        run: |
+          import glob, json, os, urllib.error, urllib.parse, urllib.request
+          import xml.etree.ElementTree as ET
+
+          api = f"https://api.github.com/repos/{os.environ['REPO']}"
+          headers = {
+              "Authorization": f"Bearer {os.environ['GH_TOKEN']}",
+              "Accept": "application/vnd.github+json",
+          }
+
+          def call(method, url, body=None):
+              data = json.dumps(body).encode() if body is not None else None
+              req = urllib.request.Request(url, data=data, method=method, headers=headers)
+              with urllib.request.urlopen(req, timeout=30) as resp:
+                  return json.load(resp)
+
+          for pattern, name in zip(os.environ["PATHS"].split("\n"), os.environ["NAMES"].split("\n")):
+              total, failed = 0, []
+              for path in glob.glob(pattern):
+                  for case in ET.parse(path).iter("testcase"):
+                      total += 1
+                      if case.find("failure") is not None or case.find("error") is not None:
+                          short = case.get("classname", "").rsplit("::", 1)[-1].rsplit(".", 1)[-1]
+                          failed.append(f"{short} › {case.get('name')}" if short else case.get("name"))
+              if not failed:
+                  continue
+              more = f" (+{len(failed) - 1} more)" if len(failed) > 1 else ""
+              title = f"{len(failed)} failed: {failed[0]}{more} · {total} tests"
+              # Retitling is cosmetic: an API failure (rate limit, timeout)
+              # warns and moves on. XML errors above still fail the step.
+              try:
+                  query = urllib.parse.urlencode({"check_name": name, "filter": "latest"})
+                  runs = call("GET", f"{api}/commits/{os.environ['SHA']}/check-runs?{query}")["check_runs"]
+                  if not runs:
+                      print(f"::warning::no check run named {name!r} to retitle")
+                      continue
+                  run = runs[0]
+                  # `output.summary` is required alongside `title`; resend the one
+                  # the reporter wrote. Annotations are kept when omitted.
+                  call("PATCH", f"{api}/check-runs/{run['id']}",
+                       {"output": {"title": title[:250], "summary": run["output"]["summary"] or title}})
+              except (urllib.error.URLError, TimeoutError) as exc:
+                  print(f"::warning::could not retitle check {name!r}: {exc}")
+                  continue
+              print(f"{name}: {title}")
+
+      - name: Report empty or missing test reports
+        if: ${{ !cancelled() && (steps.plan.outputs.empty != '' || steps.plan.outputs.missing != '') }}
+        env:
+          EMPTY: ${{ steps.plan.outputs.empty }}
+          MISSING: ${{ steps.plan.outputs.missing }}
+        run: |
+          if [ -n "$EMPTY" ]; then
+            echo "::error::Test report(s) without any test cases: $EMPTY"
+          fi
+          if [ -n "$MISSING" ]; then
+            echo "::error::Test job(s) ran but uploaded no report: $MISSING"
+          fi
+          exit 1

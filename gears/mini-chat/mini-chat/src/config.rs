@@ -10,7 +10,9 @@ use crate::infra::llm::ProviderKind;
 use oagw_sdk::APIKEY_AUTH_PLUGIN_ID;
 
 pub mod background;
-pub use background::{CleanupWorkerConfig, OrphanWatchdogConfig, ThreadSummaryWorkerConfig};
+pub use background::{
+    CleanupWorkerConfig, OrphanWatchdogConfig, ThreadSummaryWorkerConfig, UploadReaperConfig,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize, toolkit_macros::ExpandVars)]
 #[serde(deny_unknown_fields)]
@@ -39,13 +41,17 @@ pub struct MiniChatConfig {
     pub client_credentials: ClientCredentialsConfig,
     #[serde(default)]
     pub metrics: MetricsConfig,
-    /// Provider registry. Key = `provider_id` (matches [`ModelCatalogEntry::provider_id`]).
+    /// Provider registry. Key = `provider_id` (matches [`ModelCatalogEntry::provider_id`](mini_chat_sdk::ModelCatalogEntry::provider_id)).
     #[expand_vars]
     #[serde(default = "default_providers")]
     pub providers: HashMap<String, ProviderEntry>,
     /// Orphan watchdog background worker.
     #[serde(default)]
     pub orphan_watchdog: OrphanWatchdogConfig,
+    /// Upload reaper background worker (abandoned `pending` / `uploaded`
+    /// attachments).
+    #[serde(default)]
+    pub upload_reaper: UploadReaperConfig,
     /// Thread summary background worker.
     #[serde(default)]
     pub thread_summary_worker: ThreadSummaryWorkerConfig,
@@ -107,11 +113,13 @@ pub struct ProviderEntry {
     pub kind: ProviderKind,
     /// OAGW upstream alias (used in proxy URI: `/{alias}/...`).
     ///
-    /// In config: only required for IP-based hosts. For hostname-based
-    /// hosts OAGW auto-derives the alias — leave this unset.
+    /// In config: optional. When unset, `init()` sets it to `host` and the
+    /// OAGW upstream is registered under that alias. Set it only when the
+    /// alias must differ from the host.
     ///
-    /// At runtime: overwritten with the OAGW-assigned alias after
-    /// `create_upstream` succeeds.
+    /// `ProviderResolver` is built in `init()` from this value. OAGW
+    /// registration in `start()` works on a copy, so the alias OAGW returns
+    /// does not reach the resolver.
     #[serde(default)]
     pub upstream_alias: Option<String>,
     /// Upstream hostname (e.g., `api.openai.com`). Used for OAGW upstream
@@ -137,7 +145,7 @@ pub struct ProviderEntry {
     #[serde(default)]
     pub auth_plugin_type: Option<String>,
     /// Auth plugin config (e.g., `header`, `prefix`, `secret_ref`).
-    /// Values support `${VAR}` env expansion via [`config_expanded()`].
+    /// Values support `${VAR}` env expansion via [`GearCtx::config_expanded`](toolkit::GearCtx::config_expanded).
     #[expand_vars]
     #[serde(default)]
     pub auth_config: Option<HashMap<String, String>>,
@@ -147,11 +155,6 @@ pub struct ProviderEntry {
     /// Example: `"azure"` for `azure_openai` providers.
     #[serde(default)]
     pub storage_backend: Option<String>,
-    /// Whether this provider supports `file_search` metadata filters.
-    /// Azure `OpenAI` does not support filters — `FilteredByAttachmentIds`
-    /// is degraded to `UnrestrictedChatSearch`. Defaults to `true`.
-    #[serde(default = "default_true")]
-    pub supports_file_search_filters: bool,
     /// Which file/vector-store implementation to use for RAG operations.
     /// Controls URI patterns and dispatch to provider-specific impls.
     /// Required — no default; forces explicit configuration per provider.
@@ -188,15 +191,17 @@ pub struct ProviderEntry {
 #[serde(deny_unknown_fields)]
 pub struct ProviderTenantOverride {
     /// Override upstream hostname for this tenant.
+    #[expand_vars]
     #[serde(default)]
     pub host: Option<String>,
     /// OAGW upstream alias for this tenant.
     ///
-    /// In config: only required for IP-based hosts. For hostname-based
-    /// hosts OAGW auto-derives the alias — leave this unset.
+    /// In config: optional when the override sets `host` — `init()` then
+    /// sets it to that host. An override needs `host` or `upstream_alias`
+    /// (see [`Self::has_distinct_upstream`]).
     ///
-    /// At runtime: overwritten with the OAGW-assigned alias after
-    /// `create_upstream` succeeds.
+    /// As for [`ProviderEntry::upstream_alias`], the resolver uses the
+    /// `init()` value, not the alias OAGW returns.
     #[serde(default)]
     pub upstream_alias: Option<String>,
     /// Override auth plugin type for this tenant.
@@ -250,13 +255,36 @@ impl ProviderEntry {
             .or(self.auth_config.as_ref())
     }
 
-    /// Validate provider entry at startup.
+    /// Validate provider entry at startup (after env expansion).
     pub fn validate(&self, provider_id: &str) -> Result<(), String> {
         if self.host.trim().is_empty() {
             return Err(format!("provider '{provider_id}': host must not be empty"));
         }
+        check_host_chars(&self.host)
+            .map_err(|c| format!("provider '{provider_id}': host contains '{c}'"))?;
         if self.port == Some(0) {
             return Err(format!("provider '{provider_id}': port must not be 0"));
+        }
+        // Azure RAG storage appends `?api-version=…` to every request.
+        if self.storage_kind == StorageKind::Azure
+            && self
+                .api_version
+                .as_deref()
+                .is_none_or(|v| v.trim().is_empty())
+        {
+            return Err(format!(
+                "provider '{provider_id}': storage_kind is 'azure' but api_version is not set"
+            ));
+        }
+        // Sent unencoded as `?api-version={}`.
+        if let Some(v) = &self.api_version
+            && let Some(c) = v
+                .chars()
+                .find(|c| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '-')))
+        {
+            return Err(format!(
+                "provider '{provider_id}': api_version contains '{c}' (allowed: letters, digits, '.', '-')"
+            ));
         }
         for (tid, tenant_override) in &self.tenant_overrides {
             if let Some(h) = &tenant_override.host
@@ -265,6 +293,11 @@ impl ProviderEntry {
                 return Err(format!(
                     "provider '{provider_id}': tenant override '{tid}' host must not be empty"
                 ));
+            }
+            if let Some(h) = &tenant_override.host {
+                check_host_chars(h).map_err(|c| {
+                    format!("provider '{provider_id}': tenant override '{tid}' host contains '{c}'")
+                })?;
             }
 
             // A tenant override must carry a host or an upstream_alias — that is
@@ -283,6 +316,19 @@ impl ProviderEntry {
             }
         }
         Ok(())
+    }
+}
+
+/// The host becomes an OAGW upstream and the alias in `/{alias}/...`, so
+/// path, query and userinfo characters would change the proxied request.
+/// Allows hostnames, IPv4 and bracketed IPv6. Returns the first bad char.
+fn check_host_chars(host: &str) -> Result<(), char> {
+    match host
+        .chars()
+        .find(|c| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | ':' | '[' | ']')))
+    {
+        Some(c) => Err(c),
+        None => Ok(()),
     }
 }
 
@@ -332,7 +378,6 @@ fn default_providers() -> HashMap<String, ProviderEntry> {
                 c
             }),
             storage_backend: None,
-            supports_file_search_filters: true,
             storage_kind: StorageKind::OpenAi,
             api_version: None,
             rag_provider: None,
@@ -382,11 +427,6 @@ pub struct StreamingConfig {
     /// Default 32768 (matching common model limits).
     #[serde(default = "default_max_output_tokens")]
     pub max_output_tokens: u32,
-
-    /// Search context size passed to the `web_search` tool.
-    /// Valid values: "low", "medium", "high" (default "low").
-    #[serde(default)]
-    pub web_search_context_size: crate::domain::llm::WebSearchContextSize,
 }
 
 impl Default for StreamingConfig {
@@ -395,7 +435,6 @@ impl Default for StreamingConfig {
             sse_channel_capacity: default_channel_capacity(),
             sse_ping_interval_seconds: default_ping_interval(),
             max_output_tokens: default_max_output_tokens(),
-            web_search_context_size: crate::domain::llm::WebSearchContextSize::default(),
         }
     }
 }
@@ -407,7 +446,7 @@ fn default_max_output_tokens() -> u32 {
 impl StreamingConfig {
     /// Validate configuration values at startup. Returns an error message
     /// describing the first invalid value found.
-    pub fn validate(&self) -> Result<(), String> {
+    pub fn validate(self) -> Result<(), String> {
         if !(16..=64).contains(&self.sse_channel_capacity) {
             return Err(format!(
                 "sse_channel_capacity must be 16-64, got {}",
@@ -420,7 +459,6 @@ impl StreamingConfig {
                 self.sse_ping_interval_seconds
             ));
         }
-        // web_search_context_size validated by serde at parse time (enum).
         Ok(())
     }
 }
@@ -448,6 +486,7 @@ impl Default for MiniChatConfig {
             metrics: MetricsConfig::default(),
             providers: default_providers(),
             orphan_watchdog: OrphanWatchdogConfig::default(),
+            upload_reaper: UploadReaperConfig::default(),
             thread_summary_worker: ThreadSummaryWorkerConfig::default(),
             cleanup_worker: CleanupWorkerConfig::default(),
             thumbnail: ThumbnailConfig::default(),
@@ -478,7 +517,12 @@ impl ClientCredentialsConfig {
     }
 }
 
-/// Token estimation parameters sourced from `ConfigMap` (P1).
+/// Token estimation parameters.
+///
+/// As a gear configuration section only `minimal_generation_floor` is used.
+/// The other fields are deprecated there: estimation uses the
+/// `estimation_budgets` of the model's catalog entry. The same type carries
+/// those catalog values inside the gear.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EstimationBudgets {
@@ -516,14 +560,70 @@ impl Default for EstimationBudgets {
 }
 
 impl EstimationBudgets {
-    pub fn validate(self) -> Result<(), String> {
-        if self.bytes_per_token_conservative == 0 {
-            return Err("bytes_per_token_conservative must be > 0".to_owned());
-        }
+    /// Validates the gear configuration section: only
+    /// `minimal_generation_floor` is used, and it must not exceed the
+    /// output token cap (`streaming.max_output_tokens`).
+    pub fn validate(self, max_output_tokens: u32) -> Result<(), String> {
         if self.minimal_generation_floor == 0 {
             return Err("minimal_generation_floor must be > 0".to_owned());
         }
+        if self.minimal_generation_floor > max_output_tokens {
+            return Err(format!(
+                "minimal_generation_floor ({}) must not exceed streaming.max_output_tokens ({max_output_tokens})",
+                self.minimal_generation_floor
+            ));
+        }
         Ok(())
+    }
+
+    /// Deprecated gear configuration fields set to a non-default value.
+    /// Estimation reads these from the model catalog instead.
+    #[must_use]
+    pub fn deprecated_fields_set(&self) -> Vec<&'static str> {
+        let d = Self::default();
+        let mut set = Vec::new();
+        for (name, value, default) in [
+            (
+                "estimation_budgets.bytes_per_token_conservative",
+                self.bytes_per_token_conservative,
+                d.bytes_per_token_conservative,
+            ),
+            (
+                "estimation_budgets.fixed_overhead_tokens",
+                self.fixed_overhead_tokens,
+                d.fixed_overhead_tokens,
+            ),
+            (
+                "estimation_budgets.safety_margin_pct",
+                self.safety_margin_pct,
+                d.safety_margin_pct,
+            ),
+            (
+                "estimation_budgets.image_token_budget",
+                self.image_token_budget,
+                d.image_token_budget,
+            ),
+            (
+                "estimation_budgets.tool_surcharge_tokens",
+                self.tool_surcharge_tokens,
+                d.tool_surcharge_tokens,
+            ),
+            (
+                "estimation_budgets.web_search_surcharge_tokens",
+                self.web_search_surcharge_tokens,
+                d.web_search_surcharge_tokens,
+            ),
+            (
+                "estimation_budgets.code_interpreter_surcharge_tokens",
+                self.code_interpreter_surcharge_tokens,
+                d.code_interpreter_surcharge_tokens,
+            ),
+        ] {
+            if value != default {
+                set.push(name);
+            }
+        }
+        set
     }
 }
 
@@ -899,7 +999,7 @@ fn default_thumbnail_max_decode_bytes() -> usize {
     33_554_432 // 32 MiB
 }
 
-/// Configuration for server-generated image thumbnails (DESIGN.md §B.6).
+/// Configuration for server-generated image thumbnails (DESIGN.md §B.8).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ThumbnailConfig {
@@ -909,7 +1009,7 @@ pub struct ThumbnailConfig {
     /// Target thumbnail height in pixels.
     #[serde(default = "default_thumbnail_height")]
     pub height: u32,
-    /// Maximum decoded thumbnail size in bytes (128 KiB).
+    /// Maximum encoded (WebP) thumbnail size in bytes (128 KiB).
     #[serde(default = "default_thumbnail_max_bytes")]
     pub max_bytes: usize,
     /// Maximum source image pixel count before skipping thumbnail generation.
@@ -1064,8 +1164,40 @@ fn default_vendor() -> String {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tenant_override_host_expands_env_vars() {
+        use toolkit::var_expand::ExpandVars;
+
+        temp_env::with_var(
+            "MINI_CHAT_TEST_TENANT_HOST",
+            Some("tenant.example.com"),
+            || {
+                let mut entry: ProviderEntry = serde_json::from_value(serde_json::json!({
+                    "kind": "openai_responses",
+                    "host": "${MINI_CHAT_TEST_TENANT_HOST}",
+                    "storage_kind": "openai",
+                    "tenant_overrides": {
+                        "00000000-0000-0000-0000-000000000001": {
+                            "host": "${MINI_CHAT_TEST_TENANT_HOST}"
+                        }
+                    }
+                }))
+                .expect("provider entry deserializes");
+                entry.expand_vars().expect("expansion succeeds");
+                assert_eq!(entry.host, "tenant.example.com");
+                assert_eq!(
+                    entry.tenant_overrides["00000000-0000-0000-0000-000000000001"]
+                        .host
+                        .as_deref(),
+                    Some("tenant.example.com")
+                );
+            },
+        );
+    }
 
     #[test]
     fn provider_tenant_override_must_have_host_or_alias() {
@@ -1080,7 +1212,6 @@ mod tests {
                 auth_plugin_type: None,
                 auth_config: None,
                 storage_backend: None,
-                supports_file_search_filters: true,
                 storage_kind: StorageKind::OpenAi,
                 api_version: None,
                 rag_provider: None,
@@ -1126,9 +1257,107 @@ mod tests {
     }
 
     #[test]
+    fn provider_host_and_api_version_characters() {
+        fn entry(host: &str) -> ProviderEntry {
+            ProviderEntry {
+                kind: ProviderKind::OpenAiResponses,
+                upstream_alias: None,
+                host: host.to_owned(),
+                port: None,
+                use_http: false,
+                api_path: default_api_path(),
+                auth_plugin_type: None,
+                auth_config: None,
+                storage_backend: None,
+                storage_kind: StorageKind::OpenAi,
+                api_version: None,
+                rag_provider: None,
+                tenant_overrides: HashMap::new(),
+            }
+        }
+        fn with_tenant_host(host: &str) -> ProviderEntry {
+            let mut e = entry("api.example.com");
+            e.tenant_overrides.insert(
+                "t".to_owned(),
+                ProviderTenantOverride {
+                    host: Some(host.to_owned()),
+                    upstream_alias: None,
+                    auth_plugin_type: None,
+                    auth_config: None,
+                },
+            );
+            e
+        }
+        fn with_api_version(v: &str) -> ProviderEntry {
+            let mut e = entry("api.example.com");
+            e.api_version = Some(v.to_owned());
+            e
+        }
+
+        for host in ["my-host.example.com", "127.0.0.1", "[::1]", "mock_llm"] {
+            entry(host).validate("p").unwrap();
+            with_tenant_host(host).validate("p").unwrap();
+        }
+        for (host, bad) in [("api.example.com/v1", '/'), ("api.example.com?x=1", '?')] {
+            let err = entry(host).validate("p").unwrap_err();
+            assert_eq!(err, format!("provider 'p': host contains '{bad}'"));
+            let err = with_tenant_host(host).validate("p").unwrap_err();
+            assert_eq!(
+                err,
+                format!("provider 'p': tenant override 't' host contains '{bad}'")
+            );
+        }
+
+        with_api_version("2024-10-21").validate("p").unwrap();
+        let err = with_api_version("2024-10-21&x=1")
+            .validate("p")
+            .unwrap_err();
+        assert!(err.contains("api_version contains '&'"), "{err}");
+    }
+
+    #[test]
+    fn azure_storage_requires_api_version() {
+        let entry = |api_version: Option<&str>| ProviderEntry {
+            kind: ProviderKind::OpenAiResponses,
+            upstream_alias: None,
+            host: "my-azure.openai.azure.com".to_owned(),
+            port: None,
+            use_http: false,
+            api_path: default_api_path(),
+            auth_plugin_type: None,
+            auth_config: None,
+            storage_backend: None,
+            storage_kind: StorageKind::Azure,
+            api_version: api_version.map(str::to_owned),
+            rag_provider: None,
+            tenant_overrides: HashMap::new(),
+        };
+
+        for missing in [None, Some(""), Some("  ")] {
+            let err = entry(missing)
+                .validate("azure_openai")
+                .expect_err("azure without api_version must be rejected");
+            assert_eq!(
+                err,
+                "provider 'azure_openai': storage_kind is 'azure' but api_version is not set"
+            );
+        }
+        entry(Some("2025-03-01-preview"))
+            .validate("azure_openai")
+            .expect("azure with api_version is valid");
+
+        // OpenAI storage ignores api_version.
+        let mut openai = entry(None);
+        openai.storage_kind = StorageKind::OpenAi;
+        openai
+            .validate("openai")
+            .expect("openai without api_version is valid");
+    }
+
+    #[test]
     fn default_config_is_valid() {
         StreamingConfig::default().validate().unwrap();
-        EstimationBudgets::default().validate().unwrap();
+        EstimationBudgets::default().validate(32_768).unwrap();
         QuotaConfig::default().validate().unwrap();
         OutboxConfig::default().validate().unwrap();
         ContextConfig::default().validate().unwrap();
@@ -1139,22 +1368,31 @@ mod tests {
     #[test]
     fn estimation_budgets_validation() {
         let valid = EstimationBudgets::default();
-
-        assert!(
-            (EstimationBudgets {
-                bytes_per_token_conservative: 0,
-                ..valid
-            })
-            .validate()
-            .is_err()
-        );
+        valid.validate(32_768).unwrap();
         assert!(
             (EstimationBudgets {
                 minimal_generation_floor: 0,
                 ..valid
             })
-            .validate()
+            .validate(32_768)
             .is_err()
+        );
+        // The floor must not exceed the output cap.
+        let err = valid
+            .validate(valid.minimal_generation_floor - 1)
+            .unwrap_err();
+        assert!(err.contains("minimal_generation_floor"), "{err}");
+        // A floor equal to the output cap is accepted.
+        valid.validate(valid.minimal_generation_floor).unwrap();
+        // Deprecated fields are not validated, only reported.
+        let deprecated = EstimationBudgets {
+            bytes_per_token_conservative: 0,
+            ..valid
+        };
+        deprecated.validate(32_768).unwrap();
+        assert_eq!(
+            deprecated.deprecated_fields_set(),
+            ["estimation_budgets.bytes_per_token_conservative"]
         );
     }
 
@@ -1224,6 +1462,34 @@ mod tests {
             .validate()
             .is_err()
         );
+    }
+
+    #[test]
+    fn quota_config_warning_threshold_boundaries() {
+        for (pct, ok) in [
+            (0, false),
+            (1, true),
+            (99, true),
+            (100, false),
+            (255, false),
+        ] {
+            let result = QuotaConfig {
+                warning_threshold_pct: pct,
+                ..QuotaConfig::default()
+            }
+            .validate();
+            assert_eq!(
+                result.is_ok(),
+                ok,
+                "warning_threshold_pct={pct}: {result:?}"
+            );
+            if !ok {
+                assert!(
+                    result.unwrap_err().contains("warning_threshold_pct"),
+                    "error must name the field for pct={pct}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1303,32 +1569,22 @@ mod tests {
     }
 
     #[test]
-    fn streaming_config_web_search_context_size_enum() {
-        use crate::domain::llm::WebSearchContextSize;
+    fn removed_config_keys_are_rejected() {
+        let err = serde_json::from_str::<StreamingConfig>(r#"{"web_search_context_size": "low"}"#)
+            .unwrap_err();
+        assert!(err.to_string().contains("web_search_context_size"), "{err}");
 
-        // Default is Low
-        let cfg = StreamingConfig::default();
-        assert_eq!(cfg.web_search_context_size, WebSearchContextSize::Low);
-
-        // Valid values deserialize correctly
-        for (json_val, expected) in [
-            ("\"low\"", WebSearchContextSize::Low),
-            ("\"medium\"", WebSearchContextSize::Medium),
-            ("\"high\"", WebSearchContextSize::High),
-        ] {
-            let json = format!(r#"{{"web_search_context_size": {json_val}}}"#);
-            let cfg: StreamingConfig = serde_json::from_str(&json).unwrap();
-            assert_eq!(cfg.web_search_context_size, expected);
-        }
-
-        // Invalid values rejected at parse time
-        for bad in ["\"Low\"", "\"med\"", "\"HIGH\"", "\"none\"", "\"\""] {
-            let json = format!(r#"{{"web_search_context_size": {bad}}}"#);
-            assert!(
-                serde_json::from_str::<StreamingConfig>(&json).is_err(),
-                "expected parse error for {bad}"
-            );
-        }
+        let err = serde_json::from_value::<ProviderEntry>(serde_json::json!({
+            "kind": "openai_responses",
+            "host": "api.openai.com",
+            "storage_kind": "openai",
+            "supports_file_search_filters": false
+        }))
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("supports_file_search_filters"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -1425,7 +1681,6 @@ mod tests {
             auth_plugin_type: None,
             auth_config: None,
             storage_backend: None,
-            supports_file_search_filters: true,
             storage_kind: StorageKind::Azure,
             api_version: Some("2024-10-21".to_owned()),
             rag_provider: None,
@@ -1491,7 +1746,6 @@ mod tests {
             auth_plugin_type: Some("root-plugin".to_owned()),
             auth_config: Some(root_auth),
             storage_backend: None,
-            supports_file_search_filters: true,
             storage_kind: StorageKind::Azure,
             api_version: Some("2024-10-21".to_owned()),
             rag_provider: None,
@@ -1549,7 +1803,6 @@ mod tests {
             auth_plugin_type: None,
             auth_config: None,
             storage_backend: None,
-            supports_file_search_filters: true,
             storage_kind: StorageKind::Azure,
             api_version: Some("2024-10-21".to_owned()),
             rag_provider: None,
@@ -1584,7 +1837,6 @@ mod tests {
             auth_plugin_type: None,
             auth_config: None,
             storage_backend: None,
-            supports_file_search_filters: true,
             storage_kind: StorageKind::Azure,
             api_version: Some("2024-10-21".to_owned()),
             rag_provider: None,
@@ -1623,7 +1875,6 @@ mod tests {
             auth_plugin_type: None,
             auth_config: None,
             storage_backend: None,
-            supports_file_search_filters: true,
             storage_kind: StorageKind::Azure,
             api_version: Some("2024-10-21".to_owned()),
             rag_provider: None,
@@ -1658,7 +1909,6 @@ mod tests {
             auth_plugin_type: None,
             auth_config: None,
             storage_backend: None,
-            supports_file_search_filters: true,
             storage_kind: StorageKind::Azure,
             api_version: Some("2024-10-21".to_owned()),
             rag_provider: None,
@@ -1691,7 +1941,6 @@ mod tests {
             auth_plugin_type: None,
             auth_config: None,
             storage_backend: None,
-            supports_file_search_filters: true,
             storage_kind: StorageKind::Azure,
             api_version: Some("2024-10-21".to_owned()),
             rag_provider: None,
@@ -1788,7 +2037,6 @@ mod tests {
             auth_plugin_type: None,
             auth_config: None,
             storage_backend: None,
-            supports_file_search_filters: true,
             storage_kind: StorageKind::OpenAi,
             api_version: None,
             rag_provider: rag_provider.map(str::to_owned),

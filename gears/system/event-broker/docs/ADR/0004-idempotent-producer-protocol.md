@@ -1,5 +1,5 @@
 ---
-status: proposed
+status: accepted
 date: 2026-05-12
 decision-makers: Event Broker Team
 ---
@@ -131,7 +131,7 @@ On every publish, after authn but before any storage write:
    - If `meta.producer_id` is absent and no other producer-protocol fields → stateless publish path (treat as if `meta` were absent).
    - If `meta.producer_id` is present:
      - Look up the producer row.
-     - If not found → reject `400 UnknownProducer`.
+     - If not found → reject `404 ProducerNotFound`.
      - If owner principal does not match the calling principal → reject `403 ProducerPrincipalMismatch`.
      - Validate shape against the stored mode:
 
@@ -184,7 +184,7 @@ Use case: the producer's fleet is alive and well, but the chain state on the bro
 
 #### Natural reset: Producer Registration TTL
 
-A producer's registration row carries `last_seen_at`, updated on every accepted chained / monotonic publish. The Reaper purges `evbk_producer` rows whose `last_seen_at` is older than the platform's producer-registration TTL (see [Producer Registration TTL](#producer-registration-ttl)). After purge, the `producer_id` is gone — the next publish referencing it gets `400 UnknownProducer`, the producer re-registers, distributes the new id, and continues.
+A producer's registration row carries `last_seen_at`, updated on every accepted chained / monotonic publish. The Reaper purges `evbk_producer` rows whose `last_seen_at` is older than the platform's producer-registration TTL (see [Producer Registration TTL](#producer-registration-ttl)). After purge, the `producer_id` is gone — the next publish referencing it gets `404 ProducerNotFound`, the producer re-registers, distributes the new id, and continues.
 
 Use case: long-quiet producers (monthly batch job that hasn't run in 6 months) shouldn't keep their identity forever. The TTL forces a natural re-registration cycle.
 
@@ -195,7 +195,7 @@ Use case: long-quiet producers (monthly batch job that hasn't run in 6 months) s
 - A producer's `evbk_producer.last_seen_at` is updated atomically with every accepted chained / monotonic publish.
 - Reaper sweep cadence: bounded (default `PT5M`); exact cadence is implementation detail, not spec.
 - Purge cascade: when an `evbk_producer` row is deleted, any orphaned `evbk_producer_state` rows for the same `producer_id` are also deleted in the same sweep.
-- Post-purge publish: `400 UnknownProducer`. Producer must re-register and obtain a new `producer_id`.
+- Post-purge publish: `404 ProducerNotFound`. Producer must re-register and obtain a new `producer_id`.
 
 ### Stateless Safety Floor
 
@@ -269,7 +269,7 @@ This atomicity is the central invariant of the "exactly-once via idempotent prod
 | 400 | `ChainModeFieldsMissing` | Chained-mode publish missing `meta.previous` or `meta.sequence` | Fix request shape |
 | 400 | `MonotonicModeFieldsViolation` | Monotonic-mode publish with forbidden `meta.previous` or missing `meta.sequence` | Fix request shape |
 | 400 | `MetaWithoutProducerId` | `meta` carries `previous` / `sequence` but no `producer_id` | Either omit `meta` entirely (stateless) or include `meta.producer_id` |
-| 400 | `UnknownProducer` | `meta.producer_id` not found in registry (or aged out by TTL) | Re-register and distribute new id |
+| 404 | `ProducerNotFound` | `meta.producer_id` not found in registry (or aged out by TTL); names the producer resource | Re-register and distribute new id |
 | 400 | `UnknownMetaVersion` | `meta.version` exceeds broker's supported version | SDK rolls back to a supported version |
 | 400 | `InvalidEventFieldEncoding` | Non-ASCII bytes in event field | Sanitize input |
 | 400 | `EventFieldTooLong` | Event string field exceeds length cap | Sanitize input |
@@ -298,7 +298,7 @@ The decision is verified by:
 - **Mode-shape enforcement test matrix**: chained / monotonic / stateless × valid / missing-field / forbidden-field / wrong-mode-for-registered-id. Every cell produces the documented outcome.
 - **Atomicity test**: simulate ingest crash between outbox enqueue and state update; verify no half-state visible after recovery.
 - **Reset audit test**: every successful `:reset` call produces an audit record with operator principal + timestamp + scope.
-- **TTL reap test**: idle producer's row is reaped after the TTL window; next publish gets `400 UnknownProducer`.
+- **TTL reap test**: idle producer's row is reaped after the TTL window; next publish gets `404 ProducerNotFound`.
 - **Principal binding test**: cross-principal calls to publish / cursor read / reset all return `403 ProducerPrincipalMismatch`.
 - **Concurrent writer test**: two writers sharing a `producer_id` produce `412 SequenceViolation` (chained) or monotonic regression (monotonic) without broker error — documented behavior.
 

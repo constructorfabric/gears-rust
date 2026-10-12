@@ -3,6 +3,7 @@ use std::sync::Arc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
+use crate::consumer::ConsumerRoute;
 use crate::consumer::builder::ConsumerBuilder;
 #[cfg(feature = "db")]
 use crate::consumer::builder::WithTx;
@@ -16,9 +17,9 @@ use crate::consumer::{
 };
 #[cfg(feature = "db")]
 use crate::consumer::{CommitOffsetInTx, TxConsumerHandler, TxSingleEventHandlerAdapter};
-use crate::consumer::{ConsumerRoute, EventTypeRef, TopicRef};
 use crate::error::{ConsumerError, EventBrokerError};
-use crate::ids::{EventTypeId, SubscriptionId, TopicId};
+use crate::ids::SubscriptionId;
+use gts::{GtsId, GtsIdPattern, GtsTypeId};
 
 struct SlotHandle {
     subscription_id: Arc<tokio::sync::Mutex<Option<SubscriptionId>>>,
@@ -144,7 +145,6 @@ where
                 "no transactional consumer route matched topic '{}' and event type '{}'",
                 event.topic, event.type_id
             ),
-            instance: String::new(),
         })
     }
 }
@@ -177,44 +177,27 @@ impl ConsumerHandler for RoutedBatchHandler {
                 "no consumer route matched topic '{}' and event type '{}'",
                 event.topic, event.type_id
             ),
-            instance: String::new(),
         })
     }
 }
 
 fn route_matches(route: &ConsumerRoute, event: &crate::consumer::RawEvent) -> bool {
-    topic_matches(&route.topic, &event.topic)
+    route.topic == event.topic
         && route
             .event_type
             .as_ref()
-            .is_none_or(|event_type| event_type_matches(event_type, &event.type_id))
+            .is_none_or(|pattern| event_type_matches(pattern, &event.type_id))
 }
 
-fn topic_matches(route_topic: &TopicRef, event_topic: &str) -> bool {
-    match route_topic {
-        TopicRef::Gts(gts) => gts == event_topic,
-        TopicRef::Id(id) => *id == TopicId::from_gts(event_topic),
-    }
-}
-
-fn event_type_matches(route_type: &EventTypeRef, event_type: &str) -> bool {
-    match route_type {
-        EventTypeRef::Gts(gts) => gts == event_type,
-        EventTypeRef::Id(id) => *id == EventTypeId::from_gts(event_type),
-        EventTypeRef::GtsPattern(pattern) => gts_pattern_matches(pattern, event_type),
-    }
-}
-
-fn gts_pattern_matches(pattern: &str, value: &str) -> bool {
-    if pattern == "*" {
-        return true;
-    }
-    pattern
-        .strip_suffix('*')
-        .map_or(pattern == value, |prefix| value.starts_with(prefix))
+/// Whether a delivered event's type matches a route's GTS pattern, via the
+/// canonical `gts` matcher. The type id is already validated, so a parse failure
+/// simply does not match rather than aborting dispatch.
+fn event_type_matches(pattern: &GtsIdPattern, event_type: &GtsTypeId) -> bool {
+    GtsId::try_new(event_type.as_ref()).is_ok_and(|id| id.matches_pattern(pattern))
 }
 
 impl ConsumerHandle {
+    /// Wraps a started `Consumer` in its public handle.
     pub(crate) fn from_consumer(consumer: Consumer) -> Self {
         Self { consumer }
     }
@@ -241,6 +224,7 @@ impl Consumer {
         Self { slots: Vec::new() }
     }
 
+    /// Starts one subscription slot per parallel worker, each dispatching events one at a time to `handler`.
     pub(crate) async fn new_with_slots<M, H>(
         builder: ConsumerBuilder<crate::consumer::builder::BrokerOnly<M>>,
         handler: H,
@@ -253,6 +237,7 @@ impl Consumer {
         Self::new_with_batch_slots(builder, handler).await
     }
 
+    /// Starts one subscription slot per parallel worker, each dispatching event batches to `handler`.
     pub(crate) async fn new_with_batch_slots<M, H>(
         builder: ConsumerBuilder<crate::consumer::builder::BrokerOnly<M>>,
         handler: H,
@@ -347,6 +332,7 @@ impl Consumer {
         Ok(Self { slots })
     }
 
+    /// Starts one subscription slot per parallel worker, dispatching events to the route handler matching topic and type, else the default handler.
     pub(crate) async fn new_with_routed_slots<M>(
         builder: ConsumerBuilder<crate::consumer::builder::BrokerOnly<M>>,
         default_handler: Option<Arc<dyn ConsumerHandler>>,
@@ -361,6 +347,7 @@ impl Consumer {
         Self::new_with_batch_slots(builder, handler).await
     }
 
+    /// Builds a tx-capable runtime that delivers events to `handler` one at a time.
     #[cfg(feature = "db")]
     pub(crate) async fn new_with_tx_slots<M, H>(
         builder: ConsumerBuilder<WithTx<M>>,
@@ -374,6 +361,7 @@ impl Consumer {
         Self::new_with_tx_batch_slots(builder, handler).await
     }
 
+    /// Builds a tx-capable runtime that delivers batches to `handler`.
     #[cfg(feature = "db")]
     pub(crate) async fn new_with_tx_batch_slots<M, H>(
         builder: ConsumerBuilder<WithTx<M>>,
@@ -456,6 +444,7 @@ impl Consumer {
         Ok(Self { slots })
     }
 
+    /// Builds a tx-capable runtime that dispatches events by route, else to the default handler.
     #[cfg(feature = "db")]
     pub(crate) async fn new_with_tx_routed_slots<M>(
         builder: ConsumerBuilder<WithTx<M>>,

@@ -4,8 +4,8 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use super::{
-    dependency, entity, instance, instance_revision, operation, operation_item, type_schema,
-    type_schema_revision, version_family,
+    dependency, entity, entity_gts_segment, instance, instance_revision, operation, operation_item,
+    type_schema, type_schema_revision, version_family,
 };
 
 /// The table name each entity binds to. A typo is a runtime "no such table" that
@@ -21,6 +21,10 @@ fn every_core_entity_binds_to_its_table_in_the_migration() {
             "types_registry__version_family",
         ),
         (entity::Entity.table_name(), "types_registry__entity"),
+        (
+            entity_gts_segment::Entity.table_name(),
+            "types_registry__entity_gts_segment",
+        ),
         (
             type_schema_revision::Entity.table_name(),
             "types_registry__type_schema_revision",

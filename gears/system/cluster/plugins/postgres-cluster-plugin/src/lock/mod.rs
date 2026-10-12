@@ -1399,6 +1399,7 @@ impl PostgresLockPlugin {
         PostgresLockBuilder {
             config,
             reaper_meter: None,
+            spawn_reaper: true,
         }
     }
 }
@@ -1413,6 +1414,9 @@ pub struct PostgresLockBuilder {
     /// in-memory reader so `pg_spec_006` can read the gauge back in isolation
     /// from other tests' reapers.
     reaper_meter: Option<opentelemetry::metrics::Meter>,
+    /// Whether to start the lock TTL reaper. Always `true` in production; see
+    /// [`__without_reaper`](Self::__without_reaper).
+    spawn_reaper: bool,
 }
 
 impl PostgresLockBuilder {
@@ -1426,6 +1430,23 @@ impl PostgresLockBuilder {
     #[doc(hidden)]
     pub fn __with_reaper_meter(mut self, meter: opentelemetry::metrics::Meter) -> Self {
         self.reaper_meter = Some(meter);
+        self
+    }
+
+    /// Test-only: starts the plugin without its lock TTL reaper, so a test that
+    /// drives sweeps itself (`__test_sweep_once`) is the only sweeper.
+    ///
+    /// A running reaper sweeps once at startup and again whenever a local
+    /// `try_lock`/`renew` signals its deadline hint, whatever
+    /// `lock_reaper_interval_ms` says. Its batches take `FOR UPDATE SKIP LOCKED`,
+    /// so a concurrent background sweep silently takes part of the backlog a
+    /// test is counting (PG-SPEC-009).
+    ///
+    /// Gated behind `--features integration` (PGR-M8).
+    #[cfg(feature = "integration")]
+    #[doc(hidden)]
+    pub fn __without_reaper(mut self) -> Self {
+        self.spawn_reaper = false;
         self
     }
 }
@@ -1442,6 +1463,7 @@ impl PostgresLockBuilder {
     pub async fn build_and_start(self) -> Result<PostgresLockHandle, ClusterError> {
         let config = self.config;
         let reaper_meter = self.reaper_meter;
+        let spawn_reaper = self.spawn_reaper;
         reject_pgbouncer_transaction_mode(config.pgbouncer_transaction_mode)?;
         // Reject an unsafe schema (PGR-L4) and a zero lock reaper interval
         // (PGR-E2) before opening the pool or spawning the reaper.
@@ -1490,23 +1512,25 @@ impl PostgresLockBuilder {
             guard_shutdown: shutdown.clone(),
         });
 
-        let meter = reaper_meter.unwrap_or_else(reaper::reaper_meter);
-        let reaper = lock.spawn_reaper(
-            reaper::LockReaperMetrics::new(
-                &meter,
-                crate::provider::PROVIDER_NAME,
-                Arc::clone(&metrics),
-            ),
-            i64::from(config.lock_name_cardinality_warn_threshold),
-            shutdown.clone(),
-        );
+        let reaper = spawn_reaper.then(|| {
+            let meter = reaper_meter.unwrap_or_else(reaper::reaper_meter);
+            lock.spawn_reaper(
+                reaper::LockReaperMetrics::new(
+                    &meter,
+                    crate::provider::PROVIDER_NAME,
+                    Arc::clone(&metrics),
+                ),
+                i64::from(config.lock_name_cardinality_warn_threshold),
+                shutdown.clone(),
+            )
+        });
         let release_listener = lock
             .spawn_release_listener(config.connection_string.clone(), shutdown.clone())
             .await;
 
         Ok(PostgresLockHandle {
             lock,
-            reaper: Some(reaper),
+            reaper,
             release_listener: Some(release_listener),
             shutdown,
             stopped: false,

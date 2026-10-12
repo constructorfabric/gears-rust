@@ -341,7 +341,7 @@ async fn create_rejects_when_quota_reached() {
     let req =
         IdpProvisionServiceAccountRequest::new(sa_tenant_ctx(tenant), "metrics".into(), vec![]);
     let err = facade.create_inner(&ctx, &req).await.expect_err("quota");
-    assert!(matches!(err, PluginError::SaInvalidInput { .. }));
+    assert!(matches!(err, PluginError::SaQuotaExceeded { .. }));
 }
 
 /// 409 on POST /clients is a strict reject even when the existing client
@@ -1683,7 +1683,7 @@ async fn create_happy_path_emits_sa_op_duration_no_failure() {
 }
 
 #[tokio::test]
-async fn create_quota_reject_emits_failure_sa_create_sa_invalid_input() {
+async fn create_quota_reject_emits_failure_sa_create_sa_quota_exceeded() {
     let server = MockServer::start().await;
     mount_bootstrap_token(&server).await;
     let tenant = Uuid::new_v4();
@@ -1729,7 +1729,7 @@ async fn create_quota_reject_emits_failure_sa_create_sa_invalid_input() {
     let failures = fail_rec.recorded();
     assert_eq!(failures.len(), 1);
     assert!(matches!(failures[0].0, PluginOp::SaCreate));
-    assert_eq!(failures[0].1, "sa_invalid_input");
+    assert_eq!(failures[0].1, "sa_quota_exceeded");
 }
 
 /// Persistent 401 on SA-attrs GET (both wrapper attempts) → AmbiguousCreated{KcSaAttrSet}.

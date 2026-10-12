@@ -38,9 +38,11 @@ const P0_TABLES: &[&str] = &[
     "types_registry__type_schema",
     "types_registry__instance",
     "types_registry__dependency",
+    "types_registry__entity_gts_segment",
 ];
 
 const OP_ID: &str = "00000000-0000-0000-0000-0000000000a1";
+const DELETION_OP_ID: &str = "00000000-0000-0000-0000-0000000000a2";
 const PRINCIPAL: &str = "00000000-0000-0000-0000-0000000000b1";
 const ENTITY_UUID: &str = "00000000-0000-0000-0000-0000000000c1";
 const TS: &str = "2026-08-18 00:00:00";
@@ -129,9 +131,9 @@ async fn assert_schema_behaves(db: &DatabaseConnection) {
         db,
         format!(
             "INSERT INTO types_registry__entity \
-             (gts_uuid, gts_id, entity_kind, family_id, ownership_scope, owner_tenant_id, \
+             (gts_uuid, gts_id, entity_kind, chain_depth, family_id, ownership_scope, owner_tenant_id, \
               owning_gear, lifecycle_status, resource_version, created_at, updated_at) \
-             VALUES ({entity_uuid}, '{GTS_TYPE}', 1, {family_id}, 1, NULL, NULL, 1, 1, \
+             VALUES ({entity_uuid}, '{GTS_TYPE}', 1, 1, {family_id}, 1, NULL, NULL, 1, 1, \
                      '{TS}', '{TS}')"
         ),
     )
@@ -142,9 +144,9 @@ async fn assert_schema_behaves(db: &DatabaseConnection) {
         db,
         format!(
             "INSERT INTO types_registry__entity \
-             (gts_uuid, gts_id, entity_kind, family_id, ownership_scope, owner_tenant_id, \
+             (gts_uuid, gts_id, entity_kind, chain_depth, family_id, ownership_scope, owner_tenant_id, \
               owning_gear, lifecycle_status, resource_version, created_at, updated_at) \
-             VALUES ({entity_uuid}, '{GTS_TYPE}', 1, {family_id}, 1, NULL, 'types-registry', \
+             VALUES ({entity_uuid}, '{GTS_TYPE}', 1, 1, {family_id}, 1, NULL, 'types-registry', \
                      1, 1, '{TS}', '{TS}')"
         ),
     )
@@ -169,7 +171,7 @@ async fn assert_schema_behaves(db: &DatabaseConnection) {
         db,
         format!(
             "INSERT INTO types_registry__operation_item \
-             (operation_id, item_no, gts_id, dry_run, kind, expected_resource_version, \
+             (operation_id, item_no, entity_key, dry_run, kind, expected_resource_version, \
               compat_forced, status, request_payload, created_at) \
              VALUES ({op_id}, 0, '{GTS_TYPE}', FALSE, 1, 0, 7, 1, '{{}}', '{TS}')"
         ),
@@ -181,7 +183,7 @@ async fn assert_schema_behaves(db: &DatabaseConnection) {
         db,
         format!(
             "INSERT INTO types_registry__operation_item \
-             (operation_id, item_no, gts_id, dry_run, kind, expected_resource_version, status, \
+             (operation_id, item_no, entity_key, dry_run, kind, expected_resource_version, status, \
               request_payload, result_revision_no, result_resource_version, error_payload, \
               created_at, started_at, completed_at) \
              VALUES ({op_id}, 0, '{GTS_TYPE}', FALSE, 1, 0, 3, NULL, NULL, 1, NULL, \
@@ -195,7 +197,7 @@ async fn assert_schema_behaves(db: &DatabaseConnection) {
         db,
         format!(
             "INSERT INTO types_registry__operation_item \
-             (operation_id, item_no, gts_id, dry_run, kind, expected_resource_version, status, \
+             (operation_id, item_no, entity_key, dry_run, kind, expected_resource_version, status, \
               request_payload, result_revision_no, result_resource_version, error_payload, \
               created_at, started_at, completed_at) \
              VALUES ({op_id}, 0, '{GTS_TYPE}', FALSE, 1, 0, 3, NULL, 1, 1, NULL, \
@@ -209,6 +211,58 @@ async fn assert_schema_behaves(db: &DatabaseConnection) {
     exec(db, "DELETE FROM types_registry__version_family".to_owned())
         .await
         .expect_err("fk_tr_entity_family RESTRICT must block dropping a family with members");
+
+    assert_segments_behave(db).await;
+}
+
+/// `chain_depth` is required and positive; segment rows are checked and cascade
+/// with their entity.
+async fn assert_segments_behave(db: &DatabaseConnection) {
+    exec(
+        db,
+        "UPDATE types_registry__entity SET chain_depth = 0".to_owned(),
+    )
+    .await
+    .expect_err("ck_tr_entity_chain_depth must reject depth 0");
+    let row = db
+        .query_one_raw(Statement::from_string(
+            db.get_database_backend(),
+            "SELECT id FROM types_registry__entity".to_owned(),
+        ))
+        .await
+        .expect("read entity id")
+        .expect("one entity");
+    let entity_id: i64 = row.try_get_by_index(0).expect("entity id");
+    let segment = |segment_no: i64, is_type: &str| {
+        format!(
+            "INSERT INTO types_registry__entity_gts_segment \
+             (entity_id, segment_no, segment_name, major, minor, is_type) \
+             VALUES ({entity_id}, {segment_no}, 'acme.crm.customer.type', 1, NULL, {is_type})"
+        )
+    };
+    exec(db, segment(-1, "TRUE"))
+        .await
+        .expect_err("ck_tr_entity_gts_segment_no must reject a negative position");
+    exec(db, segment(0, "2"))
+        .await
+        .expect_err("is_type must stay in the boolean domain");
+    exec(db, segment(0, "TRUE")).await.expect("segment 0");
+    exec(db, "DELETE FROM types_registry__entity".to_owned())
+        .await
+        .expect("delete the entity");
+    let row = db
+        .query_one_raw(Statement::from_string(
+            db.get_database_backend(),
+            "SELECT COUNT(*) FROM types_registry__entity_gts_segment".to_owned(),
+        ))
+        .await
+        .expect("count segments")
+        .expect("one row");
+    assert_eq!(
+        row.try_get_by_index::<i64>(0).expect("count"),
+        0,
+        "rows cascade"
+    );
 }
 
 /// Check the seed, backend-specific column types, and constraints.
@@ -417,6 +471,131 @@ fn normalize_type(data_type: &str) -> String {
     data_type.trim().to_lowercase()
 }
 
+/// Migration 6 on a populated installation: the rename keeps an admitted item
+/// and the revision that pins it, and down refuses while a deletion exists.
+async fn assert_entity_key_rename_behaves(db: &DatabaseConnection) {
+    let op_id = uuid_literal(db, OP_ID);
+    let deletion_id = uuid_literal(db, DELETION_OP_ID);
+    let principal = uuid_literal(db, PRINCIPAL);
+    let entity_uuid = uuid_literal(db, ENTITY_UUID);
+    let hash = binary_literal(db);
+    let scalar = |sql: &'static str| async move {
+        db.query_one_raw(Statement::from_string(
+            db.get_database_backend(),
+            sql.to_owned(),
+        ))
+        .await?
+        .ok_or_else(|| sea_orm::DbErr::Custom(format!("no row for {sql}")))?
+        .try_get_by_index::<String>(0)
+    };
+
+    Migrator::down(db, Some(1))
+        .await
+        .expect("return to migration 5");
+    for sql in [
+        format!(
+            "INSERT INTO types_registry__version_family \
+             (family_key, ownership_scope, owner_tenant_id, created_at) \
+             VALUES ('{FAMILY_KEY}', 1, NULL, '{TS}')"
+        ),
+        format!(
+            "INSERT INTO types_registry__entity \
+             (gts_uuid, gts_id, entity_kind, chain_depth, family_id, ownership_scope, owner_tenant_id, \
+              owning_gear, lifecycle_status, resource_version, created_at, updated_at) \
+             SELECT {entity_uuid}, '{GTS_TYPE}', 1, 1, id, 1, NULL, 'types-registry', 1, 1, \
+                    '{TS}', '{TS}' FROM types_registry__version_family"
+        ),
+        format!(
+            "INSERT INTO types_registry__operation \
+             (id, kind, dry_run, plane, tenant_id, principal_id, idempotency_key, \
+              idempotency_scope_hash, request_fingerprint, status, created_at) \
+             VALUES ({op_id}, 1, FALSE, 1, NULL, {principal}, 'idem-rename', {hash}, {hash}, 1, '{TS}')"
+        ),
+        format!(
+            "INSERT INTO types_registry__operation_item \
+             (operation_id, item_no, gts_id, dry_run, kind, expected_resource_version, status, \
+              request_payload, result_revision_no, result_resource_version, error_payload, \
+              created_at, started_at, completed_at) \
+             VALUES ({op_id}, 0, '{GTS_TYPE}', FALSE, 1, 0, 3, NULL, 1, 1, NULL, \
+                     '{TS}', '{TS}', '{TS}')"
+        ),
+        format!(
+            "INSERT INTO types_registry__type_schema_revision \
+             (entity_id, revision_no, raw_schema, gts_spec_version, \
+              gts_impl_version, compat_forced, operation_item_id, created_at, updated_at) \
+             SELECT e.id, 1, '{{}}', '0.13', '0.12.0', FALSE, i.id, '{TS}', '{TS}' \
+             FROM types_registry__entity e, types_registry__operation_item i"
+        ),
+    ] {
+        exec(db, sql)
+            .await
+            .expect("seed an admitted registration at migration 5");
+    }
+
+    Migrator::up(db, None).await.expect("apply the rename");
+    assert_eq!(
+        scalar(
+            "SELECT i.entity_key FROM types_registry__operation_item i \
+             JOIN types_registry__type_schema_revision r ON r.operation_item_id = i.id"
+        )
+        .await
+        .expect("the revision still reaches its item"),
+        GTS_TYPE
+    );
+    exec(db, "DELETE FROM types_registry__operation_item")
+        .await
+        .expect_err("the revision still pins its item");
+
+    exec(
+        db,
+        format!(
+            "INSERT INTO types_registry__operation \
+             (id, kind, dry_run, plane, tenant_id, principal_id, idempotency_key, \
+              idempotency_scope_hash, request_fingerprint, status, created_at) \
+             VALUES ({deletion_id}, 2, FALSE, 1, NULL, {principal}, 'idem-del', {hash}, {hash}, 1, '{TS}')"
+        ),
+    )
+    .await
+    .expect("insert a deletion operation");
+    exec(
+        db,
+        format!(
+            "INSERT INTO types_registry__operation_item \
+             (operation_id, item_no, entity_key, dry_run, kind, expected_resource_version, status, \
+              request_payload, created_at) \
+             VALUES ({deletion_id}, 0, '{GTS_TYPE}', FALSE, 2, 1, 1, 'null', '{TS}')"
+        ),
+    )
+    .await
+    .expect("insert its identifier-keyed item");
+    Migrator::down(db, Some(1))
+        .await
+        .expect_err("down must refuse while a deletion operation exists");
+    assert!(
+        exec(db, "SELECT gts_id FROM types_registry__operation_item")
+            .await
+            .is_err(),
+        "a refused rollback must leave the column renamed"
+    );
+
+    exec(
+        db,
+        format!("DELETE FROM types_registry__operation WHERE id = {deletion_id}"),
+    )
+    .await
+    .expect("drop the deletion and its item");
+    Migrator::down(db, Some(1))
+        .await
+        .expect("a registration-only installation rolls back");
+    assert_eq!(
+        scalar("SELECT gts_id FROM types_registry__operation_item")
+            .await
+            .expect("the previous column is back"),
+        GTS_TYPE
+    );
+    Migrator::up(db, None).await.expect("re-apply the rename");
+}
+
 /// `uuid` takes different literal syntax as well. Postgres has a native `uuid`
 /// type that accepts the 36-character text form; `MySQL` stores the 16 raw bytes
 /// `sqlx` binds in `BINARY(16)` and so needs a hex literal. See the migration
@@ -473,6 +652,7 @@ async fn migration_applies_and_rolls_back_on_postgres() {
         );
     }
     Migrator::up(&db, None).await.expect("re-apply on postgres");
+    assert_entity_key_rename_behaves(&db).await;
 }
 
 #[tokio::test]
@@ -509,4 +689,5 @@ async fn migration_applies_and_rolls_back_on_mysql() {
         );
     }
     Migrator::up(&db, None).await.expect("re-apply on mysql");
+    assert_entity_key_rename_behaves(&db).await;
 }

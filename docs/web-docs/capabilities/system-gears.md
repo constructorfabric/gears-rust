@@ -12,7 +12,7 @@ SDK, so it can be replaced.
 | Gear | What it does | Status |
 | --- | --- | --- |
 | **API Gateway** | Public ingress: routing, auth middleware, rate limiting, OpenAPI publication, health endpoints | ✓ |
-| **Gear Orchestrator** | Service discovery, module loading, runtime coordination | ✓ |
+| **Service Discovery** | Service discovery, module loading, runtime coordination | ✓ |
 | **AuthN Resolver** | Token validation (JWT/OIDC); produces `SecurityContext`. Plugins: static, OIDC | ✓ |
 | **AuthZ Resolver (PDP)** | Authorization decisions + row-level constraints → `AccessScope`. Plugins: static, tenant-rules | ✓ |
 | **Tenant Resolver** | Tenant tree traversal, ancestor/descendant queries, barrier semantics. Plugins: static, single-tenant, resource-group | ✓ |

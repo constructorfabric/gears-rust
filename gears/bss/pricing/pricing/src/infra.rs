@@ -1,35 +1,29 @@
-//! Infrastructure layer — persistence, transports and the outward-facing
-//! mappings the domain deliberately knows nothing about.
+//! Runtime persistence and error plumbing.
 
-pub mod approval;
-pub mod approval_participants;
-pub mod audit_read;
-pub mod bulk;
-pub mod bundle;
-pub mod change_graph;
-pub mod clone;
-pub mod currency_binding;
-pub mod cutover;
+pub mod approval_kinds;
+pub mod book_stats;
+pub mod broker;
 pub mod error_mapping;
-pub mod fixture_gate;
-pub mod grandfather;
-pub mod history;
-pub mod idempotent;
-pub mod import;
-pub mod jobs;
-pub mod local_dev_catalog;
-pub mod local_dev_registry;
-pub mod membership_publish;
-pub mod metrics;
-pub mod migration;
-pub mod overlay_publish;
-pub mod publish;
-pub mod read_model;
-pub mod registry_deadline;
-pub mod repricing;
-pub mod retirement;
+pub mod events;
+pub mod plan_revisions;
+pub mod plan_summary;
+pub mod prices;
 pub mod storage;
-pub mod supersession;
-pub mod synthesis;
-pub mod threshold;
-pub mod window;
+pub mod usage;
+
+pub mod reference_registry;
+
+pub mod reference_work;
+
+pub mod reference_ticker;
+
+pub mod reference_events;
+
+pub(crate) mod pricing_reads;
+
+pub mod commercial_terms_wire;
+pub mod meter_semantics;
+pub mod usage_policy_wire;
+
+pub mod clock;
+pub mod commercial_terms;

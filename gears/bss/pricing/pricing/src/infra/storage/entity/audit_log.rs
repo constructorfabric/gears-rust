@@ -1,47 +1,57 @@
-//! `SeaORM` entity for `bss.pricing_audit_log` — one link of a
-//! `(tenant_id, chain_id)`-segmented hash chain
-//! (`design/01-foundation.md` §3.7, D-135).
-//!
-//! `actor_principal_id` is a `Uuid` on purpose: the actor is a **pseudonymous
-//! principal id**, never a display name or an email (D-61 / `inst-au-pii`), and
-//! a retention horizon of seven-plus years must hold no directly identifying
-//! operator PII. Typing the column makes that structural rather than a
-//! convention a later writer could break.
-
+//! Scoped persistence model, following Products.
 use sea_orm::entity::prelude::*;
-use time::OffsetDateTime;
-use serde_json::Value as JsonValue;
 use toolkit_db_macros::Scopable;
 use uuid::Uuid;
 
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Scopable)]
-#[sea_orm(table_name = "pricing_audit_log")]
-#[secure(tenant_col = "tenant_id", resource_col = "chain_id", no_owner, no_type)]
+#[sea_orm(table_name = "pricing_audit")]
+#[secure(tenant_col = "tenant_id", resource_col = "audit_id", no_owner, no_type)]
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
+    pub audit_id: Uuid,
     pub tenant_id: Uuid,
-    /// The audited subject's aggregate: plan, overlay, payer, policy or bulk
-    /// operation. One chain segment per value (D-135).
-    #[sea_orm(primary_key, auto_increment = false)]
-    pub chain_id: Uuid,
-    #[sea_orm(primary_key, auto_increment = false)]
-    pub seq: i64,
-    /// `mutation` | `rollup`. A roll-up row chains the tenant's segment heads.
-    pub entry_kind: String,
-    pub recorded_at: OffsetDateTime,
-    /// Pseudonymous principal id. Never a name, never an email.
-    pub actor_principal_id: Uuid,
+    /// The acting principal from `SecurityContext::subject_id()`; no actor table.
+    pub actor_ref: Uuid,
+    /// The audit action token (`design/01-foundation.md` §4.4). No
+    /// vocabulary `CHECK` yet — an owed debt the migration's own doc names.
     pub action: String,
+    /// The kind of thing `subject_id` names. Same owed debt as `action`.
     pub subject_kind: String,
-    pub subject_ref: String,
-    pub before_state: Option<JsonValue>,
-    pub after_state: Option<JsonValue>,
-    pub approval_ref: Option<Uuid>,
-    pub correlation_id: Option<Uuid>,
-    /// Present exactly on `rollup` rows: the segment heads this row chains.
-    pub segment_heads: Option<JsonValue>,
+    /// The subject's id. Nullable in the DDL; the one writer,
+    /// `write_eventless_act_audit`, sets it on every row.
+    pub subject_id: Option<Uuid>,
+    /// The subject's revision at the time of the act. Nullable in the DDL;
+    /// `support::audit`, through which every pricing row is written, always
+    /// supplies it.
+    pub subject_revision: Option<i64>,
+    /// Carried in the DDL and always `NULL`: no door writes a refusal row
+    /// (D-433).
+    pub error_code: Option<String>,
+    /// Carried in the DDL and always `NULL` (D-433).
+    pub attempted_key: Option<String>,
+    /// A free-text reason, where the door supplies one.
+    pub reason: Option<String>,
+    /// The request's edge correlation (D-431), as `text` (D-433). Never
+    /// `NULL`: a rereserve op's rows carry the id the op minted.
+    pub correlation_id: Option<String>,
+    /// The commit instant.
+    pub written_at: TimeDateTimeWithTimeZone,
+    /// Carried in the DDL; no writer sets it, so it is always `NULL`.
+    pub session_id: Option<Uuid>,
+    /// Carried in the DDL (D-433); no writer sets it, so it is always `NULL`.
+    pub ceremony_ref: Option<Uuid>,
+    /// `unsealed | sealed`. Written `unsealed` at INSERT, always; this gear
+    /// never advances it.
+    pub seal_state: String,
+    /// Reserved for the platform sealing capability. `NULL` until sealed.
+    pub chain_id: Option<Uuid>,
+    /// Reserved for the platform sealing capability. `NULL` until sealed.
+    pub seq: Option<i64>,
+    /// Reserved for the platform sealing capability. `NULL` on the segment
+    /// head and until sealed.
     pub prev_hash: Option<Vec<u8>>,
-    pub row_hash: Vec<u8>,
+    /// Reserved for the platform sealing capability. `NULL` until sealed.
+    pub row_hash: Option<Vec<u8>>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

@@ -4,6 +4,7 @@
 //!
 //! Group list `$filter` fields: `type` (eq, ne, in), `hierarchy/parent_id` (eq, ne, in),
 //! `tenant_id` (eq, ne, in), `id` (eq, ne, in), `name` (eq, ne, in).
+//! RG accepts UUID literals with or without single quotes for UUID fields.
 //!
 //! The `hierarchy/parent_id` field uses `OData` nested path syntax; since the
 //! `ODataFilterable` derive macro does not support slash-separated names,

@@ -3,12 +3,15 @@
 use proc_macro::TokenStream;
 use syn::parse_macro_input;
 
+/// Code generation for the `#[contract]` trait expansion.
 mod codegen;
 mod consumes;
 mod contract_error;
 mod grpc_contract;
 mod grpc_contract_parse;
+/// Code generation for `#[derive(ContractError)]`.
 mod model;
+/// Code generation for the `#[grpc_contract]` projection.
 mod parse;
 mod projection;
 mod proto_bridge;

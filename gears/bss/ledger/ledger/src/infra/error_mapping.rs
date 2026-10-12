@@ -29,6 +29,12 @@ impl From<DomainError> for CanonicalError {
     fn from(err: DomainError) -> Self {
         use DomainError as D;
         match err {
+            D::ConcurrentModification(d) => EntryResource::aborted(d)
+                .with_reason("CONCURRENT_MODIFICATION")
+                .create(),
+            D::InvalidPostingIncrement(d) => EntryResource::invalid_argument()
+                .with_field_violation("amount", d, "INVALID_POSTING_INCREMENT")
+                .create(),
             // ── InvalidArgument ──
             D::Unbalanced(d) => EntryResource::invalid_argument()
                 .with_field_violation("lines", d, "LEDGER_ENTRY_UNBALANCED")
@@ -46,10 +52,10 @@ impl From<DomainError> for CanonicalError {
                 .with_field_violation("lines", d, "MIXED_LEGAL_ENTITY")
                 .create(),
             D::InconsistentScale(d) => EntryResource::invalid_argument()
-                .with_field_violation("lines", d, "AMOUNT_OUT_OF_RANGE")
+                .with_field_violation("lines", d, "CURRENCY_SCALE_MISMATCH")
                 .create(),
             D::AmountOutOfRange(d) => EntryResource::invalid_argument()
-                .with_field_violation("amount_minor", d, "AMOUNT_OUT_OF_RANGE")
+                .with_field_violation("amount", d, "AMOUNT_OUT_OF_RANGE")
                 .create(),
             D::EntryTooLarge(d) => EntryResource::invalid_argument()
                 .with_field_violation("lines", d, "LEDGER_ENTRY_TOO_LARGE")
@@ -386,3 +392,7 @@ impl From<DomainError> for CanonicalError {
 #[cfg(test)]
 #[path = "error_mapping_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "error_mapping_wire_tests.rs"]
+mod wire_tests;

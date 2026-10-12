@@ -36,3 +36,19 @@ pub struct SimpleUserSettingsUpdate {
     pub theme: String,
     pub language: String,
 }
+
+/// One named setting: a key the product chose, and a JSON value.
+///
+/// Named settings sit next to the fixed `theme` and `language` and are filed
+/// under the same `(user, tenant)`, so they carry neither: whose they are is
+/// decided by the caller's security context, exactly as for the fixed fields.
+#[domain_model]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NamedSetting {
+    /// 1–128 characters from `A–Z a–z 0–9 . _ - :`. Namespacing is the
+    /// product's business; a dotted prefix (`portal.projects.view`) is the
+    /// usual shape.
+    pub key: String,
+    /// Any JSON value, bounded in size by the gear's configuration.
+    pub value: serde_json::Value,
+}

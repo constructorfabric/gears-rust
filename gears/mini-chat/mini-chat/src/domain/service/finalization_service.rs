@@ -1,12 +1,13 @@
 use std::sync::Arc;
 
 use super::current_otel_trace_id;
+use crate::domain::repos::Wake;
 use toolkit_macros::domain_model;
 use tracing::{debug, error, warn};
 use uuid::Uuid;
 
 use mini_chat_sdk::{
-    AuditUsageTokens, LatencyMs, PolicyDecisions, QuotaDecision, TurnAuditEvent,
+    AuditUsageTokens, LatencyMs, PolicyDecisions, QuotaDecision, ToolCalls, TurnAuditEvent,
     TurnAuditEventType, UsageEvent, UsageTokens,
 };
 
@@ -28,11 +29,14 @@ use crate::infra::db::entity::chat_turn::TurnState;
 use crate::infra::llm::Usage;
 
 use crate::domain::ports::MiniChatMetricsPort;
-use crate::domain::ports::metric_labels::{period, result as result_label, trigger};
+use crate::domain::ports::metric_labels::{period, trigger};
 
 use super::DbProvider;
 
-fn to_db(e: DomainError) -> toolkit_db::DbError {
+fn to_db<E: Into<DomainError>>(e: E) -> toolkit_db::DbError {
+    // Accepts both `DomainError` (repository failures) and `OutboxError`
+    // (enqueue failures), which converts into `DomainError`.
+    let e: DomainError = e.into();
     toolkit_db::DbError::Other(anyhow::anyhow!(e))
 }
 
@@ -69,6 +73,7 @@ fn should_trigger_summary(
     assembled_context_tokens: u64,
     max_output_tokens_applied: i32,
     context_window: u32,
+    max_input_tokens: u32,
     compression_threshold_pct: u32,
     messages_truncated: bool,
     has_existing_summary: bool,
@@ -84,7 +89,13 @@ fn should_trigger_summary(
         return false;
     }
     let estimated_input = i64::try_from(assembled_context_tokens).unwrap_or(i64::MAX);
-    let effective_budget = i64::from(context_window) - i64::from(max_output_tokens_applied);
+    // Context assembly's budget, min(max_input_tokens, ctx - out), but before
+    // the tool surcharges and the fixed overhead are subtracted (see DESIGN,
+    // thread summary trigger).
+    let mut effective_budget = i64::from(context_window) - i64::from(max_output_tokens_applied);
+    if max_input_tokens > 0 {
+        effective_budget = effective_budget.min(i64::from(max_input_tokens));
+    }
     if effective_budget <= 0 || estimated_input <= 0 {
         return false;
     }
@@ -139,10 +150,13 @@ impl<TR: TurnRepository + 'static, MR: MessageRepository + 'static> Finalization
         let result = self.try_finalize(&input, trace_id.clone()).await;
 
         match result {
-            Ok(outcome) => {
+            Ok((outcome, wake)) => {
                 // Post-commit side effects (outside transaction).
                 if outcome.won_cas {
-                    self.outbox_enqueuer.flush();
+                    wake.fire();
+                }
+                if let Some(label) = outcome.summary_trigger {
+                    self.metrics.record_thread_summary_trigger(label);
                 }
                 if let Some(billing) = outcome.billing_outcome {
                     let ms = start.elapsed().as_secs_f64() * 1000.0;
@@ -163,7 +177,7 @@ impl<TR: TurnRepository + 'static, MR: MessageRepository + 'static> Finalization
                     let mut retry_input = input;
                     retry_input.terminal_state = TurnState::Failed;
                     retry_input.error_code = Some("message_persistence_failed".to_owned());
-                    let retry_outcome = self
+                    let (retry_outcome, retry_wake) = self
                         .try_finalize(&retry_input, trace_id.clone())
                         .await
                         .map_err(|fe| match fe {
@@ -173,7 +187,7 @@ impl<TR: TurnRepository + 'static, MR: MessageRepository + 'static> Finalization
                             }
                         })?;
                     if retry_outcome.won_cas {
-                        self.outbox_enqueuer.flush();
+                        retry_wake.fire();
                     }
                     if let Some(billing) = retry_outcome.billing_outcome {
                         let ms = start.elapsed().as_secs_f64() * 1000.0;
@@ -197,19 +211,19 @@ impl<TR: TurnRepository + 'static, MR: MessageRepository + 'static> Finalization
                     );
                     let mut retry_input = input;
                     retry_input.accumulated_text = String::new();
-                    let retry_outcome =
-                        self.try_finalize(&retry_input, trace_id)
-                            .await
-                            .map_err(|fe| match fe {
-                                FinalizationError::Domain(de) => de,
-                                FinalizationError::MessagePersistenceFailed(e2) => {
-                                    DomainError::internal(format!(
-                                        "unexpected message persist on empty text: {e2}"
-                                    ))
-                                }
-                            })?;
+                    let (retry_outcome, retry_wake) = self
+                        .try_finalize(&retry_input, trace_id)
+                        .await
+                        .map_err(|fe| match fe {
+                            FinalizationError::Domain(de) => de,
+                            FinalizationError::MessagePersistenceFailed(e2) => {
+                                DomainError::internal(format!(
+                                    "unexpected message persist on empty text: {e2}"
+                                ))
+                            }
+                        })?;
                     if retry_outcome.won_cas {
-                        self.outbox_enqueuer.flush();
+                        retry_wake.fire();
                     }
                     if let Some(billing) = retry_outcome.billing_outcome {
                         let ms = start.elapsed().as_secs_f64() * 1000.0;
@@ -233,12 +247,11 @@ impl<TR: TurnRepository + 'static, MR: MessageRepository + 'static> Finalization
         &self,
         input: &FinalizationInput,
         trace_id: Option<String>,
-    ) -> Result<FinalizationOutcome, FinalizationError> {
+    ) -> Result<(FinalizationOutcome, Wake), FinalizationError> {
         let turn_repo = Arc::clone(&self.turn_repo);
         let message_repo = Arc::clone(&self.message_repo);
         let quota_settler = Arc::clone(&self.quota_settler);
         let outbox_enqueuer = Arc::clone(&self.outbox_enqueuer);
-        let metrics = Arc::clone(&self.metrics);
         let summary_config = self.summary_config.clone();
         let input = input.clone();
 
@@ -270,12 +283,21 @@ impl<TR: TurnRepository + 'static, MR: MessageRepository + 'static> Finalization
 
                     if rows == 0 {
                         debug!(turn_id = %input.turn_id, "CAS loser: another finalizer won");
-                        return Ok(FinalizationOutcome {
-                            won_cas: false,
-                            billing_outcome: None,
-                            settlement_outcome: None,
-                        });
+                        return Ok((
+                            FinalizationOutcome {
+                                won_cas: false,
+                                persisted_state: input.terminal_state.clone(),
+                                billing_outcome: None,
+                                settlement_outcome: None,
+                                summary_trigger: None,
+                            },
+                            Wake::empty(),
+                        ));
                     }
+
+                    // Accumulate the wakes of every enqueue in this unit
+                    // of work; fired post-commit by the caller.
+                    let mut wake = Wake::empty();
 
                     // 2. Derive billing outcome (pure function, no DB)
                     let billing = derive_billing_outcome(&BillingDerivationInput {
@@ -357,14 +379,14 @@ impl<TR: TurnRepository + 'static, MR: MessageRepository + 'static> Finalization
 
                     // 5. Enqueue usage outbox event
                     let usage_event = build_usage_event(&input, billing, &settlement_outcome);
-                    outbox_enqueuer
+                    wake += outbox_enqueuer
                         .enqueue_usage_event(tx, usage_event)
                         .await
                         .map_err(to_db)?;
 
                     // 6. Enqueue audit outbox event
                     let audit_event = build_turn_audit_envelope(&input, trace_id);
-                    outbox_enqueuer
+                    wake += outbox_enqueuer
                         .enqueue_audit_event(tx, audit_event)
                         .await
                         .map_err(to_db)?;
@@ -384,11 +406,14 @@ impl<TR: TurnRepository + 'static, MR: MessageRepository + 'static> Finalization
                                 input.assembled_context_tokens,
                                 input.max_output_tokens_applied,
                                 input.context_window,
+                                input.max_input_tokens,
                                 summary_config.compression_threshold_pct,
                                 false, // messages_truncated already checked above
                                 false, // optimistic: assume no summary for threshold check
                             ));
 
+                    // Recorded after commit; `None` when the trigger was not evaluated.
+                    let mut summary_trigger = may_trigger.then_some("not_needed");
                     let (current_summary, summary_triggered) = if may_trigger {
                         let summary = crate::domain::repos::ThreadSummaryRepository::get_latest(
                             &ts_repo,
@@ -402,6 +427,7 @@ impl<TR: TurnRepository + 'static, MR: MessageRepository + 'static> Finalization
                             input.assembled_context_tokens,
                             input.max_output_tokens_applied,
                             input.context_window,
+                            input.max_input_tokens,
                             summary_config.compression_threshold_pct,
                             input.messages_truncated,
                             summary.is_some(),
@@ -424,12 +450,16 @@ impl<TR: TurnRepository + 'static, MR: MessageRepository + 'static> Finalization
                     if summary_triggered {
                         let base_frontier = current_summary.as_ref().map(|s| &s.frontier);
 
+                        // The finalized turn stays out of the summary: it is
+                        // the latest turn, which retry, edit and delete may
+                        // still replace.
                         let frozen_target =
-                            crate::domain::repos::MessageRepository::find_latest_message(
+                            crate::domain::repos::MessageRepository::find_latest_message_before_turn(
                                 message_repo.as_ref(),
                                 tx,
                                 &scope,
                                 input.chat_id,
+                                input.request_id,
                             )
                             .await
                             .map_err(to_db)?;
@@ -450,22 +480,25 @@ impl<TR: TurnRepository + 'static, MR: MessageRepository + 'static> Finalization
                                     frozen_target_created_at: target.created_at,
                                     frozen_target_message_id: target.message_id,
                                 };
-                                outbox_enqueuer
+                                wake += outbox_enqueuer
                                     .enqueue_thread_summary(tx, payload)
                                     .await
                                     .map_err(to_db)?;
-                                metrics.record_thread_summary_trigger("scheduled");
-                            } else {
-                                metrics.record_thread_summary_trigger("not_needed");
+                                summary_trigger = Some("scheduled");
                             }
                         }
                     }
 
-                    Ok(FinalizationOutcome {
-                        won_cas: true,
-                        billing_outcome: Some(billing),
-                        settlement_outcome: Some(settlement_outcome),
-                    })
+                    Ok((
+                        FinalizationOutcome {
+                            won_cas: true,
+                            persisted_state: input.terminal_state.clone(),
+                            billing_outcome: Some(billing),
+                            settlement_outcome: Some(settlement_outcome),
+                            summary_trigger,
+                        },
+                        wake,
+                    ))
                 })
             })
             .await;
@@ -497,7 +530,6 @@ impl<TR: TurnRepository + 'static, MR: MessageRepository + 'static> Finalization
         finalization_ms: f64,
         metrics: &dyn MiniChatMetricsPort,
     ) {
-        metrics.record_audit_emit(result_label::OK);
         metrics.record_finalization_latency_ms(finalization_ms);
         Self::emit_quota_metrics(input, billing, metrics);
         Self::emit_billing_side_effects(input, billing, metrics);
@@ -608,8 +640,12 @@ impl<TR: TurnRepository + 'static, MR: MessageRepository + 'static> Finalization
                             turn_id = %input.turn_id,
                             "orphan CAS loser: turn already finalized or progress renewed"
                         );
-                        return Ok(false);
+                        return Ok((false, Wake::empty()));
                     }
+
+                    // Accumulate the wakes of every enqueue in this unit
+                    // of work; fired post-commit once the transaction lands.
+                    let mut wake = Wake::empty();
 
                     // 2. Derive billing outcome (pure function)
                     let billing = derive_billing_outcome(&BillingDerivationInput {
@@ -713,11 +749,15 @@ impl<TR: TurnRepository + 'static, MR: MessageRepository + 'static> Finalization
                         code_interpreter_calls: input.code_interpreter_completed_count,
                         file_search_calls: input.file_search_completed_count,
                         timestamp: now,
-                        requester_type: "user".to_owned(),
-                        dedupe_key: None,
+                        requester_type: requester_type_label(input.requester_type).to_owned(),
+                        dedupe_key: Some(turn_dedupe_key(
+                            input.tenant_id,
+                            input.turn_id,
+                            input.request_id,
+                        )),
                         system_task_type: None,
                     };
-                    outbox_enqueuer
+                    wake += outbox_enqueuer
                         .enqueue_usage_event(tx, usage_event)
                         .await
                         .map_err(to_db)?;
@@ -763,24 +803,27 @@ impl<TR: TurnRepository + 'static, MR: MessageRepository + 'static> Finalization
                         prompt: None,
                         response: None,
                         attachments: Vec::new(),
-                        tool_calls: None,
+                        tool_calls: Some(ToolCalls {
+                            file_search_calls: Some(u64::from(input.file_search_completed_count)),
+                            web_search_calls: Some(u64::from(input.web_search_completed_count)),
+                        }),
                     });
-                    outbox_enqueuer
+                    wake += outbox_enqueuer
                         .enqueue_audit_event(tx, audit_event)
                         .await
                         .map_err(to_db)?;
 
-                    Ok(true)
+                    Ok((true, wake))
                 })
             })
             .await
             .map_err(DomainError::from)?;
 
         // Post-commit side effects (outside transaction).
+        let (tx_result, wake) = tx_result;
         if tx_result {
-            self.outbox_enqueuer.flush();
+            wake.fire();
             let ms = start.elapsed().as_secs_f64() * 1000.0;
-            self.metrics.record_audit_emit(result_label::OK);
             self.metrics.record_finalization_latency_ms(ms);
             self.metrics.record_streams_aborted(trigger::ORPHAN_TIMEOUT);
         }
@@ -841,7 +884,10 @@ fn build_turn_audit_envelope(input: &FinalizationInput, trace_id: Option<String>
         prompt: None,
         response: None,
         attachments: Vec::new(),
-        tool_calls: None,
+        tool_calls: Some(ToolCalls {
+            file_search_calls: Some(u64::from(input.file_search_calls)),
+            web_search_calls: Some(u64::from(input.web_search_calls)),
+        }),
     })
 }
 
@@ -885,10 +931,25 @@ fn build_usage_event(
         code_interpreter_calls: input.code_interpreter_calls,
         file_search_calls: input.file_search_calls,
         timestamp: time::OffsetDateTime::now_utc(),
-        requester_type: "user".to_owned(),
-        dedupe_key: None,
+        requester_type: requester_type_label(input.requester_type).to_owned(),
+        dedupe_key: Some(turn_dedupe_key(
+            input.tenant_id,
+            input.turn_id,
+            input.request_id,
+        )),
         system_task_type: None,
     }
+}
+
+/// Idempotency key consumers use to drop redelivered usage events for the
+/// same turn finalization (`{tenant_id}/{turn_id}/{request_id}`).
+fn turn_dedupe_key(tenant_id: Uuid, turn_id: Uuid, request_id: Uuid) -> String {
+    format!(
+        "{}/{}/{}",
+        tenant_id.as_simple(),
+        turn_id.as_simple(),
+        request_id.as_simple()
+    )
 }
 
 /// Internal error type to distinguish message persistence failure
@@ -899,47 +960,76 @@ enum FinalizationError {
     MessagePersistenceFailed(String),
 }
 
+/// Usage-event `requester_type` value (same spelling as the audit event).
+fn requester_type_label(requester_type: mini_chat_sdk::RequesterType) -> &'static str {
+    match requester_type {
+        mini_chat_sdk::RequesterType::User => "user",
+        mini_chat_sdk::RequesterType::System => "system",
+    }
+}
+
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod trigger_tests {
     use super::should_trigger_summary;
 
     #[test]
     fn proactive_fires_above_threshold_no_summary() {
         // 2000 tokens, budget=3072 (4096-1024), 60% threshold=1843
-        assert!(should_trigger_summary(2000, 1024, 4096, 60, false, false));
+        assert!(should_trigger_summary(
+            2000, 1024, 4096, 0, 60, false, false
+        ));
     }
 
     #[test]
     fn proactive_skipped_below_threshold() {
         // 1000 tokens < 1843 threshold
-        assert!(!should_trigger_summary(1000, 1024, 4096, 60, false, false));
+        assert!(!should_trigger_summary(
+            1000, 1024, 4096, 0, 60, false, false
+        ));
     }
 
     #[test]
     fn proactive_suppressed_when_summary_exists() {
         // Above threshold but summary already exists — skip
-        assert!(!should_trigger_summary(2000, 1024, 4096, 60, false, true));
+        assert!(!should_trigger_summary(
+            2000, 1024, 4096, 0, 60, false, true
+        ));
     }
 
     #[test]
     fn urgent_fires_when_truncated_even_with_summary() {
         // messages_truncated=true overrides everything
-        assert!(should_trigger_summary(500, 1024, 4096, 60, true, true));
+        assert!(should_trigger_summary(500, 1024, 4096, 0, 60, true, true));
     }
 
     #[test]
     fn non_positive_budget_returns_false() {
         // max_output >= context_window → effective_budget <= 0
-        assert!(!should_trigger_summary(1000, 5000, 4096, 60, false, false));
+        assert!(!should_trigger_summary(
+            1000, 5000, 4096, 0, 60, false, false
+        ));
     }
 
     #[test]
     fn zero_tokens_returns_false() {
-        assert!(!should_trigger_summary(0, 1024, 4096, 60, false, false));
+        assert!(!should_trigger_summary(0, 1024, 4096, 0, 60, false, false));
+    }
+
+    #[test]
+    fn trigger_budget_capped_by_max_input_tokens() {
+        // ctx - out = 3072 (threshold 60% = 1843); max_input 2000 → threshold 1200.
+        assert!(!should_trigger_summary(
+            1500, 1024, 4096, 0, 60, false, false
+        ));
+        assert!(should_trigger_summary(
+            1500, 1024, 4096, 2000, 60, false, false
+        ));
     }
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use crate::domain::llm::Usage;
@@ -979,23 +1069,28 @@ mod tests {
         }
     }
 
-    // ── Noop OutboxEnqueuer (with flush tracking) ──
+    // ── Noop OutboxEnqueuer (with enqueue tracking) ──
 
     #[domain_model]
     struct NoopOutboxEnqueuer {
-        flush_count: std::sync::atomic::AtomicU32,
+        enqueue_count: std::sync::atomic::AtomicU32,
     }
 
     impl NoopOutboxEnqueuer {
         fn new() -> Self {
             Self {
-                flush_count: std::sync::atomic::AtomicU32::new(0),
+                enqueue_count: std::sync::atomic::AtomicU32::new(0),
             }
         }
 
+        // Firing happens on the returned Wake, which this mock
+        // returns as `empty()` and cannot observe; the counter tracks
+        // enqueue activity instead. The finalize -> fire wiring is covered by
+        // the sqlite-backed integration tests below.
         #[allow(dead_code)]
-        fn flush_count(&self) -> u32 {
-            self.flush_count.load(std::sync::atomic::Ordering::Relaxed)
+        fn enqueue_count(&self) -> u32 {
+            self.enqueue_count
+                .load(std::sync::atomic::Ordering::Relaxed)
         }
     }
 
@@ -1005,45 +1100,50 @@ mod tests {
             &self,
             _runner: &(dyn toolkit_db::secure::DBRunner + Sync),
             _event: mini_chat_sdk::UsageEvent,
-        ) -> Result<(), DomainError> {
-            Ok(())
+        ) -> Result<crate::domain::repos::Wake, crate::domain::repos::OutboxError> {
+            self.enqueue_count
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(crate::domain::repos::Wake::empty())
         }
 
         async fn enqueue_attachment_cleanup(
             &self,
             _runner: &(dyn toolkit_db::secure::DBRunner + Sync),
             _event: crate::domain::repos::AttachmentCleanupEvent,
-        ) -> Result<(), DomainError> {
-            Ok(())
+        ) -> Result<crate::domain::repos::Wake, crate::domain::repos::OutboxError> {
+            self.enqueue_count
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(crate::domain::repos::Wake::empty())
         }
 
         async fn enqueue_chat_cleanup(
             &self,
             _runner: &(dyn toolkit_db::secure::DBRunner + Sync),
             _event: crate::domain::repos::ChatCleanupEvent,
-        ) -> Result<(), DomainError> {
-            Ok(())
+        ) -> Result<crate::domain::repos::Wake, crate::domain::repos::OutboxError> {
+            self.enqueue_count
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(crate::domain::repos::Wake::empty())
         }
 
         async fn enqueue_audit_event(
             &self,
             _runner: &(dyn toolkit_db::secure::DBRunner + Sync),
             _event: crate::domain::model::audit_envelope::AuditEnvelope,
-        ) -> Result<(), DomainError> {
-            Ok(())
+        ) -> Result<crate::domain::repos::Wake, crate::domain::repos::OutboxError> {
+            self.enqueue_count
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(crate::domain::repos::Wake::empty())
         }
 
         async fn enqueue_thread_summary(
             &self,
             _: &(dyn toolkit_db::secure::DBRunner + Sync),
             _: crate::domain::repos::ThreadSummaryTaskPayload,
-        ) -> Result<(), DomainError> {
-            Ok(())
-        }
-
-        fn flush(&self) {
-            self.flush_count
+        ) -> Result<crate::domain::repos::Wake, crate::domain::repos::OutboxError> {
+            self.enqueue_count
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(crate::domain::repos::Wake::empty())
         }
     }
 
@@ -1201,6 +1301,7 @@ mod tests {
             code_interpreter_calls: 0,
             file_search_calls: 0,
             context_window: 128_000,
+            max_input_tokens: 0,
             assembled_context_tokens: 0,
             messages_truncated: false,
             ttft_ms: None,
@@ -1260,9 +1361,9 @@ mod tests {
         assert!(outcome.billing_outcome.is_some());
         assert!(outcome.settlement_outcome.is_some());
         assert_eq!(
-            outbox.flush_count(),
-            1,
-            "flush should be called once after CAS win"
+            outbox.enqueue_count(),
+            2,
+            "CAS winner enqueues the usage + audit events"
         );
 
         // Verify turn is now in completed state
@@ -1324,11 +1425,12 @@ mod tests {
         assert!(!outcome2.won_cas, "second finalizer should lose CAS");
         assert!(outcome2.billing_outcome.is_none());
         assert!(outcome2.settlement_outcome.is_none());
-        // First call won CAS → 1 flush. Second lost CAS → no additional flush.
+        // First call won CAS → 2 enqueues (usage + audit). Second lost CAS →
+        // no enqueues.
         assert_eq!(
-            outbox.flush_count(),
-            1,
-            "flush should only be called for CAS winner"
+            outbox.enqueue_count(),
+            2,
+            "only the CAS winner enqueues; the loser enqueues nothing"
         );
     }
 
@@ -1407,6 +1509,150 @@ mod tests {
     // ── Metrics emission on successful finalization ──
 
     #[tokio::test]
+    async fn summary_trigger_metric_is_recorded_after_commit() {
+        use crate::domain::service::test_helpers::TestMetrics;
+
+        let db = mock_db_provider(inmem_db().await);
+        let metrics = Arc::new(TestMetrics::new());
+        let (svc, _outbox) =
+            build_finalization_service_with_metrics(Arc::clone(&db), Arc::clone(&metrics) as _);
+        let (tenant_id, chat_id, user_id) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        insert_test_chat(&db, tenant_id, chat_id, user_id).await;
+        let finalize = |truncated: bool| {
+            let svc = &svc;
+            let db = &db;
+            async move {
+                let (turn_id, request_id) = (Uuid::new_v4(), Uuid::new_v4());
+                insert_running_turn(db, tenant_id, chat_id, turn_id, request_id).await;
+                let mut input = make_input(
+                    tenant_id,
+                    chat_id,
+                    turn_id,
+                    request_id,
+                    user_id,
+                    TurnState::Completed,
+                );
+                input.messages_truncated = truncated;
+                svc.finalize_turn_cas(input).await.unwrap().summary_trigger
+            }
+        };
+
+        // Not truncated and below the threshold: not evaluated, nothing recorded.
+        assert_eq!(finalize(false).await, None);
+        assert!(metrics.thread_summary_trigger.lock().unwrap().is_empty());
+
+        // First truncated turn in a fresh chat state: the only earlier message
+        // is the answer finalized above, so a summary is scheduled.
+        assert_eq!(finalize(true).await, Some("scheduled"));
+        assert_eq!(
+            *metrics.thread_summary_trigger.lock().unwrap(),
+            ["scheduled"]
+        );
+    }
+
+    /// Truncated first turn of a chat: the trigger is evaluated, but there
+    /// is no earlier message to summarize, so the outcome is `not_needed`.
+    #[tokio::test]
+    async fn summary_trigger_not_needed_without_earlier_message() {
+        use crate::domain::service::test_helpers::TestMetrics;
+
+        let db = mock_db_provider(inmem_db().await);
+        let metrics = Arc::new(TestMetrics::new());
+        let (svc, _outbox) =
+            build_finalization_service_with_metrics(Arc::clone(&db), Arc::clone(&metrics) as _);
+        let (tenant_id, chat_id, user_id) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let (turn_id, request_id) = (Uuid::new_v4(), Uuid::new_v4());
+        insert_test_chat(&db, tenant_id, chat_id, user_id).await;
+        insert_running_turn(&db, tenant_id, chat_id, turn_id, request_id).await;
+        let mut input = make_input(
+            tenant_id,
+            chat_id,
+            turn_id,
+            request_id,
+            user_id,
+            TurnState::Completed,
+        );
+        input.messages_truncated = true;
+
+        let outcome = svc.finalize_turn_cas(input).await.unwrap();
+        assert_eq!(outcome.summary_trigger, Some("not_needed"));
+        assert_eq!(
+            *metrics.thread_summary_trigger.lock().unwrap(),
+            ["not_needed"]
+        );
+    }
+
+    /// The usage and audit events carry the input's requester type.
+    #[tokio::test]
+    async fn system_requester_type_propagates_to_usage_and_audit_events() {
+        let db = mock_db_provider(inmem_db().await);
+        let (svc, outbox) = build_finalization_service(Arc::clone(&db));
+        let (tenant_id, chat_id, user_id) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let (turn_id, request_id) = (Uuid::new_v4(), Uuid::new_v4());
+        insert_test_chat(&db, tenant_id, chat_id, user_id).await;
+        insert_running_turn(&db, tenant_id, chat_id, turn_id, request_id).await;
+        let mut input = make_input(
+            tenant_id,
+            chat_id,
+            turn_id,
+            request_id,
+            user_id,
+            TurnState::Completed,
+        );
+        input.requester_type = mini_chat_sdk::RequesterType::System;
+
+        svc.finalize_turn_cas(input).await.unwrap();
+
+        let usage_events = outbox.usage_events.lock().unwrap();
+        assert_eq!(usage_events.len(), 1);
+        assert_eq!(usage_events[0].requester_type, "system");
+        drop(usage_events);
+        match &outbox.audit_events()[..] {
+            [AuditEnvelope::Turn(evt)] => {
+                assert_eq!(evt.requester_type, mini_chat_sdk::RequesterType::System);
+            }
+            other => panic!("expected one Turn event, got: {other:?}"),
+        }
+    }
+
+    /// Orphan finalization also takes the requester type from its input.
+    #[tokio::test]
+    async fn finalize_orphan_system_requester_type_in_usage_event() {
+        let db = mock_db_provider(inmem_db().await);
+        let (svc, outbox) = build_finalization_service(Arc::clone(&db));
+        let (tenant_id, chat_id, user_id) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let (turn_id, request_id) = (Uuid::new_v4(), Uuid::new_v4());
+        insert_test_chat(&db, tenant_id, chat_id, user_id).await;
+        insert_running_turn(&db, tenant_id, chat_id, turn_id, request_id).await;
+        let conn = db.conn().unwrap();
+        backdate_turn_progress(&conn, turn_id).await;
+
+        let input = crate::domain::model::finalization::OrphanFinalizationInput {
+            turn_id,
+            tenant_id,
+            chat_id,
+            request_id,
+            user_id: Some(user_id),
+            requester_type: mini_chat_sdk::RequesterType::System,
+            effective_model: Some("gpt-5.2".to_owned()),
+            reserve_tokens: Some(100),
+            max_output_tokens_applied: Some(4096),
+            reserved_credits_micro: Some(1000),
+            policy_version_applied: Some(1),
+            minimal_generation_floor_applied: Some(10),
+            started_at: time::OffsetDateTime::now_utc(),
+            web_search_completed_count: 0,
+            code_interpreter_completed_count: 0,
+            file_search_completed_count: 0,
+        };
+        assert!(svc.finalize_orphan_turn(input, 60).await.unwrap());
+
+        let usage_events = outbox.usage_events.lock().unwrap();
+        assert_eq!(usage_events.len(), 1);
+        assert_eq!(usage_events[0].requester_type, "system");
+    }
+
+    #[tokio::test]
     async fn cas_winner_emits_audit_and_quota_metrics() {
         use crate::domain::service::test_helpers::TestMetrics;
         use std::sync::atomic::Ordering;
@@ -1439,11 +1685,12 @@ mod tests {
             .expect("finalization should succeed");
         assert!(outcome.won_cas);
 
-        // Audit emission metrics
+        // audit_emit counts delivery outcomes and is recorded by the outbox
+        // audit handler, not when the event is enqueued here.
         assert_eq!(
             metrics.audit_emit.load(Ordering::Relaxed),
-            1,
-            "should record audit_emit"
+            0,
+            "finalization must not record audit_emit"
         );
         assert_eq!(
             metrics.finalization_latency_ms.load(Ordering::Relaxed),
@@ -1603,10 +1850,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn completed_message_persist_failure_retries_as_failed() {
-        // Existing behavior unchanged — verify the guard doesn't break it.
-        // We test by finalizing as Completed, then finalizing again (CAS loser
-        // path), confirming the first finalization worked correctly.
+    async fn completed_finalization_persists_assistant_message() {
+        // A clean Completed finalization wins the CAS, stays Completed and
+        // stores the assistant message. The failed-insert downgrade to
+        // `message_persistence_failed` is covered by
+        // `completed_stream_with_unsaved_message_sends_persistence_error`
+        // (stream_service).
         let db = mock_db_provider(inmem_db().await);
         let (svc, _outbox) = build_finalization_service(Arc::clone(&db));
 
@@ -1632,6 +1881,7 @@ mod tests {
             .await
             .expect("finalization should succeed");
         assert!(outcome.won_cas);
+        assert_eq!(outcome.persisted_state, TurnState::Completed);
 
         let conn = db.conn().unwrap();
         let scope = AccessScope::allow_all();
@@ -1691,7 +1941,12 @@ mod tests {
                 assert_eq!(evt.usage.output_tokens, 5);
                 assert!(evt.prompt.is_none(), "prompt should be deferred (None)");
                 assert!(evt.response.is_none(), "response should be deferred (None)");
-                assert!(evt.tool_calls.is_none(), "tool_calls should be None");
+                let tool_calls = evt
+                    .tool_calls
+                    .as_ref()
+                    .expect("tool call counts are reported");
+                assert_eq!(tool_calls.web_search_calls, Some(3));
+                assert_eq!(tool_calls.file_search_calls, Some(0));
             }
             other => panic!("expected Turn event, got: {other:?}"),
         }
@@ -1909,6 +2164,18 @@ mod tests {
         assert_eq!(usage.cache_read_input_tokens, 42);
         assert_eq!(usage.cache_write_input_tokens, 17);
         assert_eq!(usage.reasoning_tokens, 88);
+        assert_eq!(
+            usage_events[0].dedupe_key.as_deref(),
+            Some(
+                format!(
+                    "{}/{}/{}",
+                    tenant_id.as_simple(),
+                    turn_id.as_simple(),
+                    request_id.as_simple()
+                )
+                .as_str()
+            ),
+        );
         drop(usage_events);
 
         // ── Verify audit event ──
@@ -1998,11 +2265,11 @@ mod tests {
             other => panic!("expected Turn event, got: {other:?}"),
         }
 
-        // Verify flush was called
+        // Verify events were enqueued
         assert_eq!(
-            outbox.flush_count(),
-            1,
-            "flush should be called after CAS win"
+            outbox.enqueue_count(),
+            2,
+            "orphan CAS winner enqueues the usage + audit events"
         );
     }
 
@@ -2059,6 +2326,74 @@ mod tests {
             usage_events[0].file_search_calls, 4,
             "file_search_calls must reflect persisted count"
         );
+    }
+
+    #[tokio::test]
+    async fn finalize_orphan_sets_dedupe_key_and_audit_tool_calls() {
+        let db = mock_db_provider(inmem_db().await);
+        let (svc, outbox) = build_finalization_service(Arc::clone(&db));
+
+        let tenant_id = Uuid::new_v4();
+        let chat_id = Uuid::new_v4();
+        let turn_id = Uuid::new_v4();
+        let request_id = Uuid::new_v4();
+        let user_id = Uuid::new_v4();
+
+        insert_test_chat(&db, tenant_id, chat_id, user_id).await;
+        insert_running_turn(&db, tenant_id, chat_id, turn_id, request_id).await;
+
+        let conn = db.conn().unwrap();
+        backdate_turn_progress(&conn, turn_id).await;
+
+        let input = crate::domain::model::finalization::OrphanFinalizationInput {
+            turn_id,
+            tenant_id,
+            chat_id,
+            request_id,
+            user_id: Some(user_id),
+            requester_type: mini_chat_sdk::RequesterType::User,
+            effective_model: Some("gpt-5.2".to_owned()),
+            reserve_tokens: Some(100),
+            max_output_tokens_applied: Some(4096),
+            reserved_credits_micro: Some(1000),
+            policy_version_applied: Some(1),
+            minimal_generation_floor_applied: Some(10),
+            started_at: time::OffsetDateTime::now_utc(),
+            web_search_completed_count: 3,
+            code_interpreter_completed_count: 0,
+            file_search_completed_count: 5,
+        };
+        assert!(svc.finalize_orphan_turn(input, 60).await.unwrap());
+
+        let usage_events = outbox.usage_events.lock().unwrap();
+        assert_eq!(usage_events.len(), 1);
+        assert_eq!(
+            usage_events[0].dedupe_key.as_deref(),
+            Some(
+                format!(
+                    "{}/{}/{}",
+                    tenant_id.as_simple(),
+                    turn_id.as_simple(),
+                    request_id.as_simple()
+                )
+                .as_str()
+            )
+        );
+        drop(usage_events);
+
+        let audit_events = outbox.audit_events();
+        assert_eq!(audit_events.len(), 1);
+        match &audit_events[0] {
+            AuditEnvelope::Turn(evt) => {
+                let tool_calls = evt
+                    .tool_calls
+                    .as_ref()
+                    .expect("orphan audit event must carry tool_calls");
+                assert_eq!(tool_calls.web_search_calls, Some(3));
+                assert_eq!(tool_calls.file_search_calls, Some(5));
+            }
+            other => panic!("expected Turn event, got: {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -2126,7 +2461,7 @@ mod tests {
         let audit_events = outbox.audit_events();
         assert!(audit_events.is_empty(), "no audit events for CAS loser");
 
-        assert_eq!(outbox.flush_count(), 0, "no flush for CAS loser");
+        assert_eq!(outbox.enqueue_count(), 0, "CAS loser enqueues nothing");
     }
 
     #[tokio::test]
@@ -2189,5 +2524,254 @@ mod tests {
             "usage event should be enqueued even without settlement"
         );
         drop(usage_events);
+    }
+
+    // ── finalize → post-commit fire wiring over a REAL outbox pipeline ──
+    //
+    // Every other finalization test injects a mock enqueuer that returns an
+    // inert `Wake::empty()`, so they can only prove an event was
+    // *enqueued*, never that the post-commit `wake.fire()` actually fired.
+    // These two drive the real `InfraOutboxEnqueuer` over a started `Outbox`
+    // on the same sqlite DB the finalize transaction writes to, then assert the
+    // usage event is *delivered* to a leased handler — delivery the wake is
+    // the trigger for. If `finalize_turn_cas` / `finalize_orphan_turn` failed
+    // to fire the wake they get back, the handler is never notified and the
+    // 5s timeout below fails the test.
+
+    /// Leased handler that records delivery and wakes a `Notify`. Placed on the
+    /// usage queue, which both finalize paths enqueue to.
+    struct SignalingLeasedHandler {
+        delivered: Arc<tokio::sync::Notify>,
+        count: Arc<std::sync::atomic::AtomicU32>,
+    }
+
+    #[async_trait::async_trait]
+    impl toolkit_db::outbox::LeasedMessageHandler for SignalingLeasedHandler {
+        async fn handle(
+            &self,
+            _msg: &toolkit_db::outbox::OutboxMessage,
+        ) -> toolkit_db::outbox::MessageResult {
+            self.count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.delivered.notify_one();
+            toolkit_db::outbox::MessageResult::Ok
+        }
+    }
+
+    /// Ack-and-forget handler for the audit queue, which is enqueued to but not
+    /// asserted on.
+    struct AckLeasedHandler;
+
+    #[async_trait::async_trait]
+    impl toolkit_db::outbox::LeasedMessageHandler for AckLeasedHandler {
+        async fn handle(
+            &self,
+            _msg: &toolkit_db::outbox::OutboxMessage,
+        ) -> toolkit_db::outbox::MessageResult {
+            toolkit_db::outbox::MessageResult::Ok
+        }
+    }
+
+    /// A single sqlite in-memory DB (shared-cache, so every pooled connection
+    /// sees the same data) carrying both the mini-chat schema and the outbox
+    /// schema. The finalize transaction and the outbox pipeline share it.
+    async fn inmem_db_with_outbox(name: &str) -> toolkit_db::Db {
+        use sea_orm_migration::MigratorTrait;
+        use toolkit_db::{ConnectOpts, connect_db, migration_runner::run_migrations_for_testing};
+
+        let url = format!("sqlite:file:{name}?mode=memory&cache=shared");
+        let db = connect_db(
+            &url,
+            ConnectOpts {
+                max_conns: Some(1),
+                min_conns: Some(1),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("connect");
+        run_migrations_for_testing(&db, crate::infra::db::migrations::Migrator::migrations())
+            .await
+            .expect("mini-chat migrations");
+        run_migrations_for_testing(&db, toolkit_db::outbox::outbox_migrations())
+            .await
+            .expect("outbox migrations");
+        db
+    }
+
+    /// Start an outbox with the usage + audit queues (the queues both finalize
+    /// paths enqueue to), a signaling handler on usage, and a real
+    /// `InfraOutboxEnqueuer` wired to it. Returns everything the caller needs to
+    /// build the service and assert on delivery.
+    async fn start_real_outbox(
+        db: &toolkit_db::Db,
+    ) -> (
+        toolkit_db::outbox::OutboxHandle,
+        Arc<crate::infra::outbox::InfraOutboxEnqueuer>,
+        Arc<tokio::sync::Notify>,
+        Arc<std::sync::atomic::AtomicU32>,
+    ) {
+        use toolkit_db::outbox::{Outbox, Partitions};
+
+        let delivered = Arc::new(tokio::sync::Notify::new());
+        let count = Arc::new(std::sync::atomic::AtomicU32::new(0));
+
+        let handle = Outbox::builder(db.clone())
+            .queue("test.usage", Partitions::of(1))
+            .leased(SignalingLeasedHandler {
+                delivered: Arc::clone(&delivered),
+                count: Arc::clone(&count),
+            })
+            .queue("test.audit", Partitions::of(1))
+            .leased(AckLeasedHandler)
+            .start()
+            .await
+            .expect("outbox start");
+
+        let enqueuer = Arc::new(crate::infra::outbox::InfraOutboxEnqueuer::new(
+            "test.usage".to_owned(),
+            "test.cleanup".to_owned(),
+            "test.chat_cleanup".to_owned(),
+            "test.thread_summary".to_owned(),
+            "test.audit".to_owned(),
+            1u32,
+        ));
+        enqueuer.set_outbox(Arc::clone(handle.outbox()));
+
+        (handle, enqueuer, delivered, count)
+    }
+
+    fn build_service_with_enqueuer(
+        db: Arc<DbProvider>,
+        enqueuer: Arc<dyn OutboxEnqueuer>,
+    ) -> FinalizationService<TurnRepo, MsgRepo> {
+        FinalizationService::new(
+            db,
+            Arc::new(TurnRepo),
+            Arc::new(MsgRepo::new(toolkit_db::odata::LimitCfg {
+                default: 20,
+                max: 100,
+            })),
+            Arc::new(MockQuotaSettler),
+            enqueuer,
+            Arc::new(crate::domain::ports::metrics::NoopMetrics),
+            crate::config::background::ThreadSummaryWorkerConfig::default(),
+        )
+    }
+
+    #[tokio::test]
+    async fn finalize_turn_cas_flushes_and_delivers_usage_event() {
+        use std::sync::atomic::Ordering;
+        use std::time::Duration;
+
+        let db = inmem_db_with_outbox("finalize_cas_flush").await;
+        let db_provider = mock_db_provider(db.clone());
+
+        let (handle, enqueuer, delivered, count) = start_real_outbox(&db).await;
+        let svc = build_service_with_enqueuer(
+            Arc::clone(&db_provider),
+            Arc::clone(&enqueuer) as Arc<dyn OutboxEnqueuer>,
+        );
+
+        let tenant_id = Uuid::new_v4();
+        let chat_id = Uuid::new_v4();
+        let turn_id = Uuid::new_v4();
+        let request_id = Uuid::new_v4();
+        let user_id = Uuid::new_v4();
+
+        insert_test_chat(&db_provider, tenant_id, chat_id, user_id).await;
+        insert_running_turn(&db_provider, tenant_id, chat_id, turn_id, request_id).await;
+
+        let input = make_input(
+            tenant_id,
+            chat_id,
+            turn_id,
+            request_id,
+            user_id,
+            TurnState::Completed,
+        );
+        let outcome = svc
+            .finalize_turn_cas(input)
+            .await
+            .expect("finalization should succeed");
+        assert!(outcome.won_cas, "should be CAS winner");
+
+        // Delivery only happens if the CAS winner fired the Wake it got
+        // back from the enqueuer after the transaction committed.
+        tokio::time::timeout(Duration::from_secs(5), delivered.notified())
+            .await
+            .expect("usage event should be delivered within 5s (finalize must flush post-commit)");
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            1,
+            "exactly one usage event delivered"
+        );
+
+        handle.stop().await;
+    }
+
+    #[tokio::test]
+    async fn finalize_orphan_turn_flushes_and_delivers_usage_event() {
+        use std::sync::atomic::Ordering;
+        use std::time::Duration;
+
+        let db = inmem_db_with_outbox("finalize_orphan_flush").await;
+        let db_provider = mock_db_provider(db.clone());
+
+        let (handle, enqueuer, delivered, count) = start_real_outbox(&db).await;
+        let svc = build_service_with_enqueuer(
+            Arc::clone(&db_provider),
+            Arc::clone(&enqueuer) as Arc<dyn OutboxEnqueuer>,
+        );
+
+        let tenant_id = Uuid::new_v4();
+        let chat_id = Uuid::new_v4();
+        let turn_id = Uuid::new_v4();
+        let request_id = Uuid::new_v4();
+        let user_id = Uuid::new_v4();
+
+        insert_test_chat(&db_provider, tenant_id, chat_id, user_id).await;
+        insert_running_turn(&db_provider, tenant_id, chat_id, turn_id, request_id).await;
+
+        // Make the turn orphan-eligible by backdating last_progress_at.
+        let conn = db_provider.conn().unwrap();
+        backdate_turn_progress(&conn, turn_id).await;
+
+        let input = crate::domain::model::finalization::OrphanFinalizationInput {
+            turn_id,
+            tenant_id,
+            chat_id,
+            request_id,
+            user_id: Some(user_id),
+            requester_type: mini_chat_sdk::RequesterType::User,
+            effective_model: Some("gpt-5.2".to_owned()),
+            reserve_tokens: Some(100),
+            max_output_tokens_applied: Some(4096),
+            reserved_credits_micro: Some(1000),
+            policy_version_applied: Some(1),
+            minimal_generation_floor_applied: Some(10),
+            started_at: time::OffsetDateTime::now_utc(),
+            web_search_completed_count: 0,
+            code_interpreter_completed_count: 0,
+            file_search_completed_count: 0,
+        };
+
+        let won = svc
+            .finalize_orphan_turn(input, 60)
+            .await
+            .expect("orphan finalization should succeed");
+        assert!(won, "should be CAS winner");
+
+        // Delivery only happens if the orphan path fired the Wake it
+        // got back from the enqueuer after the transaction committed.
+        tokio::time::timeout(Duration::from_secs(5), delivered.notified())
+            .await
+            .expect("usage event should be delivered within 5s (orphan finalize must flush post-commit)");
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            1,
+            "exactly one usage event delivered"
+        );
+
+        handle.stop().await;
     }
 }

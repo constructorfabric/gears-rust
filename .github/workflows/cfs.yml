@@ -13,7 +13,6 @@ on:
       - '.cf-studio/config/**'
       - '.cf-studio-kit.toml'
       - 'studio-kit-gears/**'
-      - 'docs/spec-templates/**'
       - 'Makefile'
   workflow_call:
   workflow_dispatch:
@@ -41,7 +40,7 @@ jobs:
       GITHUB_TOKEN: ${{ github.token }}
     steps:
       - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           clean: 'true'
           fetch-depth: 0
@@ -85,7 +84,7 @@ jobs:
             )"
           fi
 
-          if printf '%s\n' "$changed_files" | grep -Eq '^(studio-kit-gears/|docs/spec-templates/|\.cf-studio-kit\.toml$)'; then
+          if printf '%s\n' "$changed_files" | grep -Eq '^(studio-kit-gears/|\.cf-studio/config/|\.cf-studio-kit\.toml$)'; then
             echo "changed=true" >> "$GITHUB_OUTPUT"
           else
             echo "changed=false" >> "$GITHUB_OUTPUT"

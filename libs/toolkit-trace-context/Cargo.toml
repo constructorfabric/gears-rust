@@ -1,0 +1,39 @@
+[package]
+name = "cf-gears-toolkit-trace-context"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "W3C Trace Context propagation (parse, seed span parent, inject) shared by CF/Gears crates"
+readme = "README.md"
+keywords = ["constructorfabric", "cf-gears", "tracing", "opentelemetry", "w3c"]
+categories = ["web-programming"]
+metadata.docs.rs.all-features = true
+
+[lib]
+name = "toolkit_trace_context"
+
+[lints]
+workspace = true
+
+[features]
+default = []
+# OpenTelemetry integration: continue the caller's trace on ingress and inject
+# the active context on egress. Without it, `set_parent_from_headers` degrades to
+# recording ids only and `inject_current_span` is a no-op.
+otel = ["dep:opentelemetry", "dep:tracing-opentelemetry"]
+
+[dependencies]
+http = { workspace = true }
+tracing = { workspace = true }
+opentelemetry = { workspace = true, optional = true }
+tracing-opentelemetry = { workspace = true, optional = true }
+
+[dev-dependencies]
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
+# The resolver tests (otel-gated) build a subscriber with the
+# tracing-opentelemetry bridge to get a live span. `tracing-opentelemetry` is
+# already an otel-gated normal dep, so only the registry crate is dev-only.
+tracing-subscriber = { workspace = true }

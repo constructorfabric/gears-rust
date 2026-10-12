@@ -7,8 +7,8 @@ use toolkit_gts::gts_id;
 use uuid::Uuid;
 
 use super::{
-    FingerprintCandidate, FingerprintInput, canonical_text, idempotency_scope_hash,
-    request_fingerprint,
+    DeletionFingerprintTarget, FingerprintCandidate, FingerprintInput, RequestScope,
+    canonical_text, deletion_fingerprint, idempotency_scope_hash, request_fingerprint,
 };
 use crate::domain::admission::Precondition;
 use crate::domain::enums::{OperationKind, OwnershipScope, Plane};
@@ -235,4 +235,56 @@ fn an_absent_tenant_differs_from_a_nil_tenant() {
         idempotency_scope_hash(Plane::Tenant, None, Uuid::nil()),
         idempotency_scope_hash(Plane::Tenant, Some(Uuid::nil()), Uuid::nil()),
     );
+}
+
+/// Pins the registration bytes, so no deletion change can move a stored
+/// registration's replay into a `409`.
+#[test]
+fn a_registration_digest_keeps_its_published_bytes() {
+    let candidates = [candidate("gts.acme.crm.customer.type.v1~", "{}")];
+    let digest = request_fingerprint(&input(&candidates));
+    let hex = digest.as_bytes().iter().fold(String::new(), |mut hex, b| {
+        use std::fmt::Write as _;
+        write!(hex, "{b:02x}").expect("writing to a String cannot fail");
+        hex
+    });
+    assert_eq!(
+        hex,
+        "df07ef55782fc6318a3903994a031e02aae412974c2675a41b5e474e921d544b"
+    );
+}
+
+fn deletion_scope(dry_run: bool) -> RequestScope {
+    RequestScope {
+        kind: OperationKind::Deletion,
+        dry_run,
+        plane: Plane::Platform,
+        tenant_id: None,
+        principal_id: Uuid::nil(),
+        ownership_scope: OwnershipScope::Global,
+    }
+}
+
+fn target(n: u128, version: i64) -> DeletionFingerprintTarget {
+    DeletionFingerprintTarget {
+        gts_uuid: Uuid::from_u128(n),
+        precondition: Precondition::Version(version),
+    }
+}
+
+#[test]
+fn a_deletion_digest_covers_mode_order_and_every_precondition() {
+    let base = deletion_fingerprint(deletion_scope(false), &[target(1, 1), target(2, 1)]);
+    assert_eq!(
+        base,
+        deletion_fingerprint(deletion_scope(false), &[target(1, 1), target(2, 1)])
+    );
+    for changed in [
+        deletion_fingerprint(deletion_scope(true), &[target(1, 1), target(2, 1)]),
+        deletion_fingerprint(deletion_scope(false), &[target(2, 1), target(1, 1)]),
+        deletion_fingerprint(deletion_scope(false), &[target(1, 1), target(2, 2)]),
+        deletion_fingerprint(deletion_scope(false), &[target(1, 1)]),
+    ] {
+        assert_ne!(base, changed);
+    }
 }

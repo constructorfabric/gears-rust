@@ -6,10 +6,10 @@ Each handler that takes `extract::Json<T>` or `extract::Path<T>` must render
 a malformed request as a full RFC 9457 `Problem` body - not axum's default
 plain-text rejection. Every assertion below compares the complete response
 body as a literal dict, not a spot-checked subset, mirroring this PR's own
-Rust test convention (`assert_eq!(json, json!({...}))`). `trace_id` is the
-one field neither side can predict (a fresh, opaque per-request value) - it
-is copied from the real response into the expected dict before comparing,
-so the rest of the literal still has to match exactly.
+Rust test convention (`assert_eq!(json, json!({...}))`). `trace_id` is
+deterministic: every client sends a fixed W3C `traceparent` (conftest), which
+the canonical error layer echoes into `trace_id` as `TRACE_ID` regardless of
+server-side OTel, so the literal asserts that exact value.
 
 These exercise the real, running server (not a unit-level
 `tower::oneshot`), so they also confirm the migration didn't regress at the
@@ -20,7 +20,7 @@ import uuid
 import httpx
 import pytest
 
-from .conftest import REQUEST_TIMEOUT, TENANT_A_ID
+from .conftest import REQUEST_TIMEOUT, TENANT_A_ID, TRACEPARENT, TRACE_ID
 
 
 def _users(base: str) -> str:
@@ -39,7 +39,7 @@ def _user_address(base: str, user_id: str) -> str:
 async def existing_user(base_url, auth_headers):
     """Create a real user via the API and return its id, for tests that need
     a valid path segment to combine with a malformed body."""
-    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT, headers={"traceparent": TRACEPARENT}) as client:
         resp = await client.post(
             _users(base_url),
             headers={**auth_headers, "Content-Type": "application/json"},
@@ -60,7 +60,7 @@ async def existing_user(base_url, auth_headers):
 async def test_create_and_get_user_happy_path(base_url, auth_headers):
     """`extract::Json`/`extract::Path` must behave identically to axum's
     built-ins on well-formed input - only failure handling changed."""
-    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT, headers={"traceparent": TRACEPARENT}) as client:
         create = await client.post(
             _users(base_url),
             headers={**auth_headers, "Content-Type": "application/json"},
@@ -86,7 +86,7 @@ async def test_create_and_get_user_happy_path(base_url, auth_headers):
 async def test_malformed_json_body_returns_problem_not_plain_text(base_url, auth_headers):
     """Syntactically invalid JSON on `create_user` (`extract::Json<CreateUserReq>`)
     must render as a full `Problem`, not axum's default plain-text 400."""
-    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT, headers={"traceparent": TRACEPARENT}) as client:
         resp = await client.post(
             _users(base_url),
             headers={**auth_headers, "Content-Type": "application/json"},
@@ -101,7 +101,7 @@ async def test_malformed_json_body_returns_problem_not_plain_text(base_url, auth
             "status": 400,
             "detail": "Request validation failed",
             "instance": "/users-info/v1/users",
-            "trace_id": body["trace_id"],
+            "trace_id": TRACE_ID,
             "context": {
                 "resource_type": "gts.cf.core.http.request.v1~",
                 "field_violations": [{
@@ -117,7 +117,7 @@ async def test_malformed_json_body_on_update_user(base_url, auth_headers, existi
     """Same malformed-body guarantee on `update_user`
     (`extract::Path<Uuid>` + `extract::Json<UpdateUserReq>`), combined with a
     *valid* path segment - confirms the two extractors compose correctly."""
-    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT, headers={"traceparent": TRACEPARENT}) as client:
         resp = await client.patch(
             _users(base_url) + f"/{existing_user}",
             headers={**auth_headers, "Content-Type": "application/json"},
@@ -131,7 +131,7 @@ async def test_malformed_json_body_on_update_user(base_url, auth_headers, existi
             "status": 400,
             "detail": "Request validation failed",
             "instance": f"/users-info/v1/users/{existing_user}",
-            "trace_id": body["trace_id"],
+            "trace_id": TRACE_ID,
             "context": {
                 "resource_type": "gts.cf.core.http.request.v1~",
                 "field_violations": [{
@@ -146,7 +146,7 @@ async def test_malformed_json_body_on_update_user(base_url, auth_headers, existi
 async def test_malformed_json_body_on_create_city(base_url, auth_headers):
     """Same guarantee on a second, independently-migrated gear module
     (`create_city`) - confirms this isn't a one-handler fluke."""
-    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT, headers={"traceparent": TRACEPARENT}) as client:
         resp = await client.post(
             _cities(base_url),
             headers={**auth_headers, "Content-Type": "application/json"},
@@ -160,7 +160,7 @@ async def test_malformed_json_body_on_create_city(base_url, auth_headers):
             "status": 400,
             "detail": "Request validation failed",
             "instance": "/users-info/v1/cities",
-            "trace_id": body["trace_id"],
+            "trace_id": TRACE_ID,
             "context": {
                 "resource_type": "gts.cf.core.http.request.v1~",
                 "field_violations": [{
@@ -175,7 +175,7 @@ async def test_malformed_json_body_on_create_city(base_url, auth_headers):
 async def test_malformed_json_body_on_put_user_address(base_url, auth_headers, existing_user):
     """Same guarantee on `put_user_address`, which combines
     `extract::Path<Uuid>` and `extract::Json<PutAddressReq>` on a PUT."""
-    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT, headers={"traceparent": TRACEPARENT}) as client:
         resp = await client.put(
             _user_address(base_url, existing_user),
             headers={**auth_headers, "Content-Type": "application/json"},
@@ -189,7 +189,7 @@ async def test_malformed_json_body_on_put_user_address(base_url, auth_headers, e
             "status": 400,
             "detail": "Request validation failed",
             "instance": f"/users-info/v1/users/{existing_user}/address",
-            "trace_id": body["trace_id"],
+            "trace_id": TRACE_ID,
             "context": {
                 "resource_type": "gts.cf.core.http.request.v1~",
                 "field_violations": [{
@@ -205,7 +205,7 @@ async def test_wrong_field_type_returns_422(base_url, auth_headers):
     """Well-formed JSON that fails schema validation (a non-UUID string in a
     `Uuid` field) is a distinct rejection kind from a syntax error - must
     resolve to 422 `invalid_json_body`, not 400 `json_syntax_error`."""
-    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT, headers={"traceparent": TRACEPARENT}) as client:
         resp = await client.post(
             _users(base_url),
             headers={**auth_headers, "Content-Type": "application/json"},
@@ -219,7 +219,7 @@ async def test_wrong_field_type_returns_422(base_url, auth_headers):
             "status": 422,
             "detail": "Request validation failed",
             "instance": "/users-info/v1/users",
-            "trace_id": body["trace_id"],
+            "trace_id": TRACE_ID,
             "context": {
                 "resource_type": "gts.cf.core.http.request.v1~",
                 "field_violations": [{
@@ -234,7 +234,7 @@ async def test_wrong_field_type_returns_422(base_url, auth_headers):
 async def test_missing_required_field_returns_422(base_url, auth_headers):
     """A well-formed JSON object missing a required field is the same
     rejection kind as a wrong-type field - 422 `invalid_json_body`."""
-    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT, headers={"traceparent": TRACEPARENT}) as client:
         resp = await client.post(
             _users(base_url),
             headers={**auth_headers, "Content-Type": "application/json"},
@@ -250,7 +250,7 @@ async def test_missing_required_field_returns_422(base_url, auth_headers):
             "status": 422,
             "detail": "Request validation failed",
             "instance": "/users-info/v1/users",
-            "trace_id": body["trace_id"],
+            "trace_id": TRACE_ID,
             "context": {
                 "resource_type": "gts.cf.core.http.request.v1~",
                 "field_violations": [{
@@ -265,7 +265,7 @@ async def test_missing_required_field_returns_422(base_url, auth_headers):
 async def test_missing_content_type_returns_415(base_url, auth_headers):
     """A body that isn't declared as JSON is a third distinct rejection kind
     - 415 `missing_json_content_type`, not 400 or 422."""
-    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT, headers={"traceparent": TRACEPARENT}) as client:
         resp = await client.post(
             _users(base_url),
             headers={**auth_headers, "Content-Type": "text/plain"},
@@ -282,7 +282,7 @@ async def test_missing_content_type_returns_415(base_url, auth_headers):
             "status": 415,
             "detail": "Request validation failed",
             "instance": "/users-info/v1/users",
-            "trace_id": body["trace_id"],
+            "trace_id": TRACE_ID,
             "context": {
                 "resource_type": "gts.cf.core.http.request.v1~",
                 "field_violations": [{
@@ -301,7 +301,7 @@ async def test_missing_content_type_returns_415(base_url, auth_headers):
 async def test_invalid_path_uuid_returns_problem_not_plain_text(base_url, auth_headers):
     """A non-UUID path segment on `get_user` (`extract::Path<Uuid>`) must
     render as a full `Problem`, not axum's default plain-text 400."""
-    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT, headers={"traceparent": TRACEPARENT}) as client:
         resp = await client.get(_users(base_url) + "/not-a-uuid", headers=auth_headers)
         assert resp.status_code == 400
         assert resp.headers["content-type"].startswith("application/problem+json")
@@ -312,7 +312,7 @@ async def test_invalid_path_uuid_returns_problem_not_plain_text(base_url, auth_h
             "status": 400,
             "detail": "Request validation failed",
             "instance": "/users-info/v1/users/not-a-uuid",
-            "trace_id": body["trace_id"],
+            "trace_id": TRACE_ID,
             "context": {
                 "resource_type": "gts.cf.core.http.request.v1~",
                 "field_violations": [{
@@ -326,7 +326,7 @@ async def test_invalid_path_uuid_returns_problem_not_plain_text(base_url, auth_h
 
 async def test_invalid_path_uuid_on_delete_user(base_url, auth_headers):
     """Same guarantee on `delete_user`."""
-    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT, headers={"traceparent": TRACEPARENT}) as client:
         resp = await client.delete(_users(base_url) + "/not-a-uuid", headers=auth_headers)
         assert resp.status_code == 400
         body = resp.json()
@@ -336,7 +336,7 @@ async def test_invalid_path_uuid_on_delete_user(base_url, auth_headers):
             "status": 400,
             "detail": "Request validation failed",
             "instance": "/users-info/v1/users/not-a-uuid",
-            "trace_id": body["trace_id"],
+            "trace_id": TRACE_ID,
             "context": {
                 "resource_type": "gts.cf.core.http.request.v1~",
                 "field_violations": [{
@@ -351,7 +351,7 @@ async def test_invalid_path_uuid_on_delete_user(base_url, auth_headers):
 async def test_invalid_path_uuid_on_get_city(base_url, auth_headers):
     """Same guarantee on a second, independently-migrated gear module
     (`get_city`)."""
-    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT, headers={"traceparent": TRACEPARENT}) as client:
         resp = await client.get(_cities(base_url) + "/not-a-uuid", headers=auth_headers)
         assert resp.status_code == 400
         body = resp.json()
@@ -361,7 +361,7 @@ async def test_invalid_path_uuid_on_get_city(base_url, auth_headers):
             "status": 400,
             "detail": "Request validation failed",
             "instance": "/users-info/v1/cities/not-a-uuid",
-            "trace_id": body["trace_id"],
+            "trace_id": TRACE_ID,
             "context": {
                 "resource_type": "gts.cf.core.http.request.v1~",
                 "field_violations": [{
@@ -376,7 +376,7 @@ async def test_invalid_path_uuid_on_get_city(base_url, auth_headers):
 async def test_invalid_path_uuid_on_user_address(base_url, auth_headers):
     """Same guarantee on the address routes, whose path segment is a
     `{id}` shared with the parent `users` resource."""
-    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT, headers={"traceparent": TRACEPARENT}) as client:
         resp = await client.get(_user_address(base_url, "not-a-uuid"), headers=auth_headers)
         assert resp.status_code == 400
         body = resp.json()
@@ -386,7 +386,7 @@ async def test_invalid_path_uuid_on_user_address(base_url, auth_headers):
             "status": 400,
             "detail": "Request validation failed",
             "instance": "/users-info/v1/users/not-a-uuid/address",
-            "trace_id": body["trace_id"],
+            "trace_id": TRACE_ID,
             "context": {
                 "resource_type": "gts.cf.core.http.request.v1~",
                 "field_violations": [{

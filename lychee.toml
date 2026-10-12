@@ -1,8 +1,23 @@
 # Lychee link checker configuration
 # https://lychee.cli.rs/
 
-# Exclude paths from checking (templates with intentional placeholder links)
-exclude_path = ["docs/spec-templates/**"]
+# Exclude the kit templates and examples: their links are intentional placeholders.
+# lychee 0.24 matches exclude_path as a literal prefix or `dir/**`; a `*` inside a path does not match.
+exclude_path = [
+  "studio-kit-gears/artifacts/PRD/template.md",
+  "studio-kit-gears/artifacts/ADR/template.md",
+  "studio-kit-gears/artifacts/DESIGN/template.md",
+  "studio-kit-gears/artifacts/DECOMPOSITION/template.md",
+  "studio-kit-gears/artifacts/FEATURE/template.md",
+  "studio-kit-gears/artifacts/UPSTREAM_REQS/template.md",
+  "studio-kit-gears/artifacts/PRD/examples/**",
+  "studio-kit-gears/artifacts/ADR/examples/**",
+  "studio-kit-gears/artifacts/DESIGN/examples/**",
+  "studio-kit-gears/artifacts/DECOMPOSITION/examples/**",
+  "studio-kit-gears/artifacts/FEATURE/examples/**",
+  "studio-kit-gears/artifacts/UPSTREAM_REQS/examples/**",
+  "studio-kit-gears/examples/**",
+]
 
 # Only check local file links, not external URLs
 offline = true

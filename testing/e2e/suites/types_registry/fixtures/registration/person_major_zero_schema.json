@@ -1,0 +1,14 @@
+{
+  "gts_id": "gts.cf.e2e.registration.person.v0~",
+  "content": {
+    "$id": "gts://gts.cf.e2e.registration.person.v0~",
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "type": "object",
+    "properties": {
+      "name": {"type": "string"},
+      "payload": {"type": "object", "additionalProperties": true}
+    },
+    "required": ["name", "payload"],
+    "additionalProperties": false
+  }
+}

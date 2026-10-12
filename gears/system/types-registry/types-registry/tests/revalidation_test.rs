@@ -6,6 +6,7 @@
 mod common;
 
 use std::sync::Arc;
+use types_registry::domain::selection::FieldSelection;
 
 use serde_json::{Value, json};
 use time::OffsetDateTime;
@@ -30,15 +31,12 @@ use types_registry::domain::admission::worker::{
     OperationOutcome, Tuning, WorkerError, run_operation,
 };
 use types_registry::domain::admission::{Candidate, OperationDispatch, SubmitRequest};
-use types_registry::domain::enums as domain_enums;
 use types_registry::domain::enums::OperationItemStatus;
 use types_registry::domain::policy::RegistrationPolicy;
 use types_registry::domain::ports::{
     CurrentSchemaCas, CurrentTypeSchemaRow, EntityRow, NewCurrentTypeSchema, Stores, commit_write,
 };
-use types_registry::domain::registry_service::{
-    AdmissionMode, EntityKey, RegistryService, ServiceError,
-};
+use types_registry::domain::registry_service::{EntityKey, RegistryService, ServiceError};
 use types_registry::infra::storage::repo::{
     CoordinationStateRepo, EntityRepo, OperationRepo, TypeSchemaRepo,
 };
@@ -59,8 +57,12 @@ struct NoDispatch;
 
 #[async_trait::async_trait]
 impl OperationDispatch for NoDispatch {
-    async fn enqueue(&self, _tx: &DbTx<'_>, _operation_id: Uuid) -> anyhow::Result<()> {
-        Ok(())
+    async fn enqueue(
+        &self,
+        _tx: &DbTx<'_>,
+        _operation_id: Uuid,
+    ) -> Result<toolkit_db::outbox::Wake, types_registry::domain::admission::OutboxError> {
+        Ok(toolkit_db::outbox::Wake::empty())
     }
 }
 
@@ -158,8 +160,7 @@ async fn submit(
         },
         &dispatch,
         &SubmitRequest {
-            idempotency_key: key.to_owned(),
-            kind: domain_enums::OperationKind::Registration,
+            idempotency_key: Some(key.to_owned()),
             dry_run: false,
             candidates: vec![Candidate {
                 gts_id: gts_id.to_owned(),
@@ -241,7 +242,10 @@ async fn submitted(
         &provider,
         &allow_all(),
         EvaluationTarget {
-            gts_id: &item.gts_id,
+            gts_id: item
+                .key
+                .gts_id()
+                .expect("a registration item names an identifier"),
             canonical_body: &payload,
             operation_item_id: item.id,
             precondition: item.precondition,
@@ -1334,7 +1338,6 @@ fn service(db: &Provider) -> RegistryService {
         RegistrationPolicy::default(),
         TypesRegistryConfig::default(),
         dispatch,
-        AdmissionMode::Inline,
         common::metrics(),
     )
 }
@@ -1350,30 +1353,84 @@ async fn a_commit_on_one_pod_is_visible_to_the_others_first_read() -> Result<(),
     // asked about.
     let key = EntityKey::parse(BASE);
     assert!(
-        service(&pod_b).entity(&key).await?.is_none(),
+        service(&pod_b)
+            .entity(&key, FieldSelection::full())
+            .await?
+            .is_none(),
         "nothing is admitted yet"
     );
 
     admit(&pod_a, "k-base", BASE, base_schema("name"), None).await;
 
     let first_read = service(&pod_b)
-        .entity(&key)
+        .entity(&key, FieldSelection::full())
         .await?
         .expect("B's first read after A's commit must see it");
-    assert_eq!(first_read.resource_version, 1);
+    assert_eq!(first_read.origin.map(|o| o.resource_version), Some(1));
 
     // And a revision on A is visible to B just the same: the read is a `SELECT`, not a snapshot, so
     // there is no second thing to invalidate.
     admit(&pod_a, "k-base-2", BASE, base_schema("label"), Some(1)).await;
     let second_read = service(&pod_b)
-        .entity(&key)
+        .entity(&key, FieldSelection::full())
         .await?
         .expect("the entity is still there");
-    assert_eq!(second_read.resource_version, 2);
+    assert_eq!(second_read.origin.map(|o| o.resource_version), Some(2));
     assert_eq!(
-        second_read.content,
+        common::doc(second_read.content.as_deref()),
         Some(base_schema("label")),
         "B reads A's newest authored document"
     );
     Ok(())
+}
+
+/// A deletion committed between a new referrer's evaluation and its commit
+/// moves the target's version, so the retry sees the tombstone and refuses.
+#[tokio::test]
+async fn a_target_deleted_after_evaluation_refuses_the_new_referrer() {
+    let dir = TestDir::new("types-registry-reval-deleted-target");
+    let db = test_db_file(&dir.path().join("registry.db")).await;
+    admit(&db, "base", BASE, base_schema("name"), None).await;
+    let operation_id = submit(&db, "referrer", REFERRER, referencing_schema("x"), None)
+        .await
+        .expect("acceptance");
+    let mutating = Arc::clone(&db);
+    let outcome = admit_with_a_mutation_in_the_gap(
+        &db,
+        worker_settings(),
+        operation_id,
+        move || async move {
+            let id = entity(&mutating, BASE).await.id;
+            let ports = stores();
+            worker(&mutating)
+                .transaction(move |tx| {
+                    Box::pin(async move {
+                        ports
+                            .claim_entity_write_order(tx, &allow_all(), LATER)
+                            .await?;
+                        assert_eq!(
+                            EntityRepo::mark_deleted(tx, &allow_all(), id, 1, LATER).await?,
+                            Some(2)
+                        );
+                        Ok(())
+                    })
+                })
+                .await
+                .expect("delete");
+        },
+    )
+    .await;
+    let failure = outcome.items[0].failure.as_ref().expect("refusal");
+    assert_eq!(failure.reason, AdmissionFailureReason::DependencyDeleted);
+    let dependency = failure.dependency.as_ref().expect("names the target");
+    assert_eq!(dependency.target, BASE);
+    assert_eq!(dependency.kind, "ref");
+    let conn = db.conn().expect("conn");
+    assert!(
+        EntityRepo::find_by_gts_id(&conn, &allow_all(), REFERRER)
+            .await
+            .expect("read")
+            .is_none(),
+        "the referrer was not admitted"
+    );
 }

@@ -48,6 +48,7 @@ const DURATION_BUCKETS_SECONDS: [f64; 12] = [
 const WEBSOCKET_SESSION_BUCKETS_SECONDS: [f64; 8] =
     [1.0, 10.0, 60.0, 300.0, 1_800.0, 3_600.0, 14_400.0, 86_400.0];
 
+/// OpenTelemetry-backed implementation of the OAGW metrics port.
 pub struct OagwMetricsMeter {
     requests: Counter<u64>,
     errors: Counter<u64>,

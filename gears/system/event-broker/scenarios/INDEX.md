@@ -24,10 +24,10 @@ Anonymous groups are broker-minted via REST. Named groups are registered via `ty
 
 #### Step 2 — Publish events
 
-Producers submit typed events to a topic. Default is async (`202`); opt into sync persistence with `Sync-Wait`.
+Producers submit typed events to a topic. Publish is async (`202`); opt into synchronous persistence with the standard `Prefer: wait` header (RFC 7240).
 
 - [Publish a single event (async)](producer/single/1.01-positive-publish-single-async.md) — `POST /v1/events` → `202 Accepted`.
-- [Publish sync (wait=persisted)](producer/single/1.02-positive-publish-sync-wait-persisted.md) — `POST /v1/events` with `Sync-Wait` header → `201 Created`.
+- [Publish sync (Prefer: wait)](producer/single/1.02-positive-publish-sync-wait-persisted.md) — `POST /v1/events` with `Prefer: wait` → `201 Created`.
 
 #### Step 3 — JOIN a subscription
 
@@ -60,6 +60,7 @@ Open the long-lived multipart stream and consume frames as they arrive.
 
 - [Stream multipart frames](consumer/stream/1.01-positive-stream-multipart-frames.md) — `GET /v1/events:stream` → `200 multipart/mixed`; one event per part.
 - [SSE event stream](consumer/stream/1.09-positive-sse-event-stream.md) — `GET /v1/events:sse` → `200 text/event-stream`; browser-native alternative.
+- [Wildcard event-type stream](consumer/stream/1.15-positive-wildcard-event-type-stream.md) — interest `types: ["gts.cf.core.events.event.v1~*"]` (a topic-only subscription) delivers a concrete-type event.
 
 > **End-to-end**: [Publish → subscribe → consume](flows/1.01-flow-publish-subscribe-consume.md) composes all steps into one coupled transcript.
 
@@ -82,7 +83,7 @@ Multiple consumer instances share a group by JOINing with the same `consumer_gro
 
 #### producer/single/ — `POST /v1/events` (stateless)
 - [positive-1.1 — Publish single (async)](producer/single/1.01-positive-publish-single-async.md) — `POST /v1/events` → `202 Accepted`; event enqueued in outbox.
-- [positive-1.2 — Publish sync (wait=persisted)](producer/single/1.02-positive-publish-sync-wait-persisted.md) — `POST /v1/events` with `Sync-Wait` → `201 Created` after backend persist.
+- [positive-1.2 — Publish sync (Prefer: wait)](producer/single/1.02-positive-publish-sync-wait-persisted.md) — `POST /v1/events` with `Prefer: wait` → `201 Created` after backend persist.
 - [negative-1.5 — Read-only partition rejected](producer/single/1.05-negative-readonly-partition-rejected.md) — producer-supplied `partition` on publish → `400 Bad Request`; broker derives partition itself.
 
 #### producer/batch/ — `POST /v1/events:batch`
@@ -91,10 +92,11 @@ Multiple consumer instances share a group by JOINing with the same `consumer_gro
 #### producer/flows/ — `POST /v1/producers`, `GET /cursors`, `POST :reset`
 - [positive-1.1 — Register chained producer](producer/flows/1.01-positive-register-chained-producer.md) — `POST /v1/producers { mode: chained }` → `201` with `producer_id`.
 - [positive-1.2 — Register monotonic producer](producer/flows/1.02-positive-register-monotonic-producer.md) — `POST /v1/producers { mode: monotonic }` → `201`.
-- [positive-1.3 — Chained-mode sequence](producer/flows/1.03-positive-chained-mode-sequence.md) — `POST /v1/events` with `Producer-Id` header and `meta.previous/sequence`; broker deduplicates.
-- [positive-1.4 — Idempotency key dedup](producer/flows/1.04-positive-idempotency-key-dedup.md) — duplicate event id returns `200` with original event; no second write.
+- [positive-1.3 — Chained-mode sequence](producer/flows/1.03-positive-chained-mode-sequence.md) — `POST /v1/events` with `meta.producer_id` + `meta.previous/sequence`; broker deduplicates.
+- [positive-1.4 — Chain-head retry dedup](producer/flows/1.04-positive-chain-head-retry-dedup.md) — an exact retry of the current chain head returns `200` with an empty body; no second write. Dedup is chain-based (`previous`/`sequence`).
 - [positive-1.6 — Cursor recovery](producer/flows/1.06-positive-cursor-recovery.md) — `GET /v1/producers/{id}/cursors` → `{producer_id, client_agent, topics:[{topic, partitions:[{partition, last_sequence}]}]}`; feeds next SEEK after desync.
 - [positive-1.7 — Chain reset](producer/flows/1.07-positive-chain-reset.md) — `POST /v1/producers/{id}:reset` → `200`; chain state cleared, audited.
+- [flow-1.9 — Desync recovery](producer/flows/1.09-flow-chained-producer-desync-recovery.md) — producer loses sequence state; first publish fails `412`; reads `/cursors`; reconciles counter; republishes successfully.
 
 ---
 
@@ -106,6 +108,7 @@ Multiple consumer instances share a group by JOINing with the same `consumer_gro
 - [positive-1.3 — List groups](consumer/groups/1.03-positive-list-groups.md) — `GET /v1/consumer-groups` → paged list of caller-visible groups.
 - [positive-1.4 — Delete empty group](consumer/groups/1.04-positive-delete-empty-group.md) — `DELETE /v1/consumer-groups/{id}` → `204`; only when no active subscriptions.
 - [positive-1.8 — Named group JOIN (no create step)](consumer/groups/1.08-positive-named-group-join.md) — JOIN with `types_registry`-provisioned identifier; broker validates `:consume` grant.
+- [negative-1.9 — Cross-tenant group access denied](consumer/groups/1.09-negative-cross-tenant-anonymous-group-ownership.md) — GET/DELETE/LIST from a different tenant → `403 Permission Denied`; anonymous group ownership is tenant-scoped.
 
 #### consumer/subscriptions/ — `POST/GET/DELETE /v1/subscriptions`
 - [positive-1.1 — Cold JOIN, fresh group](consumer/subscriptions/1.01-positive-cold-join-fresh-group.md) — `POST /v1/subscriptions` → `201` with `assigned[]` and `topology_version`.
@@ -127,17 +130,23 @@ Multiple consumer instances share a group by JOINing with the same `consumer_gro
 - [positive-1.11 — SEEK at timestamp](consumer/positions/1.11-positive-seek-at-timestamp.md) — `"at:<ISO-8601>"` → resolves to first event at or after timestamp; response returns integer.
 - [positive-1.12 — Timestamp before retention](consumer/positions/1.12-positive-seek-at-timestamp-before-retention.md) — timestamp before RF → clamps to RF.
 - [positive-1.13 — Timestamp beyond HWM](consumer/positions/1.13-positive-seek-at-timestamp-beyond-hwm.md) — future timestamp → resolves to HWM (equivalent to `"latest"`).
+- [positive-1.14 — Resume from persisted cursor](consumer/positions/1.14-positive-seek-resume-from-cursor.md) — consumer reads to sequence 40, persists cursor, reconnects with SEEK to 40; first event on resumed stream is sequence 41.
 
 #### consumer/stream/ — `GET /v1/events:stream`, `GET /v1/events:sse`
 - [positive-1.1 — Multipart frames](consumer/stream/1.01-positive-stream-multipart-frames.md) — `GET /v1/events:stream` → `200 multipart/mixed`; `event`, `heartbeat`, `advisory`, `topology` frame kinds.
 - [positive-1.2 — Heartbeat cadence](consumer/stream/1.02-positive-stream-heartbeat-cadence.md) — idle stream emits `heartbeat` every 5 s; keeps connection alive through proxies.
 - [positive-1.3 — Topology frame on rebalance](consumer/stream/1.03-positive-stream-topology-frame-on-rebalance.md) — mid-stream JOIN by another member triggers `topology` frame with new `assigned[]`.
 - [positive-1.9 — SSE event stream](consumer/stream/1.09-positive-sse-event-stream.md) — `GET /v1/events:sse` → `200 text/event-stream`; same frame schema as multipart.
+- [positive-1.15 — Wildcard event-type stream](consumer/stream/1.15-positive-wildcard-event-type-stream.md) — interest with the all-types wildcard `gts.cf.core.events.event.v1~*` (the topic-only subscription shape) delivers a concrete-type event; the path that had no black-box coverage before GTS pattern matching.
+- [positive-1.12 — Partition gain terminates subscription](consumer/stream/1.12-positive-stream-terminates-on-rebalance-gain.md) — surviving member gains freed partitions; broker sends `control/terminal`; consumer re-JOINs and re-SEEKs.
+- [positive-1.13 — DELETE while streaming](consumer/stream/1.13-positive-delete-while-streaming.md) — `DELETE /v1/subscriptions/{id}` while stream is open closes the connection immediately; no final control frame emitted.
+- [positive-1.14 — Control progress frame](consumer/stream/1.14-positive-control-progress-frame.md) — heavily-filtered stream emits `control/progress` so the consumer can advance its offset store without re-scanning.
 
 #### consumer/flows/ — consumer-only end-to-end journeys
 - [flow-1.1 — Two-consumer rebalance](consumer/flows/1.01-flow-two-consumer-rebalance.md) — full inline transcript: consumer A holds all partitions; B joins; rebalance; both stream.
 - [flow-1.2 — PositionsNotSet recovery](consumer/flows/1.02-flow-positions-not-set-recovery.md) — SDK mis-SEEKs; broker returns `409`; SDK re-SEEKs and resumes.
 - [flow-1.3 — Path A consumer with DB](consumer/flows/1.03-flow-path-a-consumer-with-db.md) — consumer reads own DB → SEEK exact offset → stream → persist offset → reconnect resumes from correct position.
+- [flow-1.4 — Leave triggers gain then terminate](consumer/flows/1.04-flow-leave-triggers-gain-terminate.md) — B leaves; A gains B's partitions; A receives `control/terminal` and re-JOINs with the full assignment.
 
 ---
 
@@ -172,7 +181,7 @@ Multiple consumer instances share a group by JOINing with the same `consumer_gro
 - [negative-1.5 — Read-only partition rejected](producer/single/1.05-negative-readonly-partition-rejected.md) — producer-supplied `partition` on publish → `400 Bad Request`; `partition` is consumer-facing/read-side only.
 - [negative-1.2 — Mixed-partition batch](producer/batch/1.02-negative-mixed-partition-batch.md) — batch events span different partitions → `400 Invalid Argument`.
 - [negative-1.3 — Batch too large](producer/batch/1.03-negative-batch-too-large.md) — over 100 events or 1 MiB → `400 Invalid Argument`.
-- [negative-1.4 — Batch late validation failure](producer/batch/1.04-negative-batch-late-validation-failure.md) — later invalid event rejects whole batch → `400 Invalid Argument`.
+- [negative-1.4 — Batch late validation failure](producer/batch/1.04-negative-batch-late-validation-failure.md) — later invalid event rejects whole batch → `422 Invalid Argument`.
 - [negative-1.7 — Too many interests](consumer/subscriptions/1.07-negative-join-too-many-interests.md) — more than 64 interests in one JOIN → `400 Invalid Argument`.
 - [negative-1.6 — Invalid client_agent](consumer/groups/1.06-negative-invalid-client-agent.md) — non-ASCII or oversized `client_agent` → `400 Invalid Argument`.
 - [guardrail-1.7 — Stream requires multipart Accept](consumer/stream/1.07-guardrail-stream-accept-json-rejected.md) — `Accept: application/json` on `:stream` endpoint → `406 Invalid Argument`.
@@ -184,24 +193,28 @@ Multiple consumer instances share a group by JOINing with the same `consumer_gro
 - [negative-1.5 — Out-of-range offset](consumer/positions/1.05-negative-out-of-range-offset.md) — offset below RF−1 → `400 Invalid Argument`.
 - [negative-1.6 — Offset above HWM](consumer/positions/1.06-negative-offset-above-hwm.md) — offset beyond HWM → `400 Invalid Argument`.
 - [negative-1.7 — SEEK while streaming](consumer/positions/1.07-negative-seek-while-streaming.md) — any SEEK while `:stream` is open → `409 StreamingInProgress` (SEEK is pre-stream-only).
+- [negative-1.8 — SEEK unknown subscription](consumer/positions/1.08-negative-seek-unknown-subscription.md) — `:seek` on a non-existent `subscription_id` → `404 Not Found`.
 - [negative-1.9 — SEEK unassigned partition](consumer/positions/1.09-negative-seek-unassigned-partition.md) — SEEK references a partition not in `assigned[]` → `409 Failed Precondition`.
 
 ### Stream errors
 
-- [negative-1.4 — PositionsNotSet](consumer/stream/1.04-negative-stream-positions-not-set.md) — stream opened without prior SEEK → `409 Failed Precondition`; `context.unseeded` lists affected partitions.
+- [negative-1.4 — PositionsNotSet](consumer/stream/1.04-negative-stream-positions-not-set.md) — stream opened without prior SEEK → `409 Failed Precondition`; one `positions_not_set` violation per affected partition.
 - [negative-1.5 — Unknown subscription](consumer/stream/1.05-negative-stream-unknown-subscription.md) — `subscription_id` not found or expired → `404 Not Found`.
 - [negative-1.6 — Terminated subscription](consumer/stream/1.06-negative-stream-terminated-subscription.md) — delivery shard shutdown sends `410`; consumer re-JOINs.
+- [negative-1.11 — Second stream rejected](consumer/stream/1.11-negative-streaming-in-progress.md) — second `:stream` open while one is already active → `409 StreamingInProgress`; existing stream unaffected.
 
 ### Producer chain errors
 
 - [negative-1.5 — Chained sequence violation](producer/flows/1.05-negative-chained-sequence-violation.md) — `meta.previous` doesn't match broker's `last_sequence` → `412 Failed Precondition`; recover via `GET /v1/producers/{id}/cursors`.
-- [negative-1.8 — Unknown producer](producer/flows/1.08-negative-unknown-producer.md) — `Producer-Id` not registered or reaped → `400 Invalid Argument`.
+- [negative-1.8 — Unknown producer](producer/flows/1.08-negative-unknown-producer.md) — `meta.producer_id` not registered or reaped → `404 Not Found` naming the producer.
 
 ### Consumer group errors
 
 - [negative-1.5 — Delete group with active members](consumer/groups/1.05-negative-delete-group-with-active-members.md) — `DELETE` while subscriptions exist → `409 Failed Precondition`.
 - [negative-1.7 — Get unknown group](consumer/groups/1.07-negative-get-unknown-group.md) — `GET /v1/consumer-groups/{id}` for non-existent id → `404 Not Found`.
 - [negative-1.8 — LEAVE unknown subscription](consumer/subscriptions/1.08-negative-leave-unknown-subscription.md) — `DELETE /v1/subscriptions/{id}` for expired/unknown id → `404 Not Found`.
+- [negative-1.9 — Cross-tenant group access denied](consumer/groups/1.09-negative-cross-tenant-anonymous-group-ownership.md) — GET/DELETE/LIST from a different tenant → `403 Permission Denied`; anonymous group ownership is tenant-scoped.
+- [negative-1.13 — JOIN group at capacity](consumer/subscriptions/1.13-negative-join-group-at-capacity.md) — all partitions already assigned; new JOIN → `429` with `Retry-After`; zero-partition standby not admitted.
 
 ### Topics / segments errors
 
@@ -294,7 +307,9 @@ HTTP status → category mapping:
 | 429 | `resource_exhausted` | `"Resource Exhausted"` |
 | 500 | `internal` | `"Internal"` |
 
-Domain-specific fields (e.g., `unseeded`, `expected_previous`, `valid_range`) go inside `context`, not at root level.
+Domain-specific detail goes inside `context`, not at root level, and only in the keys `toolkit-canonical-errors` can actually produce. Its builder composes `context` from a closed set - field violations, precondition violations, quota violations, a format message, a constraint message, a reason - plus `resource_type` / `resource_name` from the resource error. The entries themselves are fixed shapes: a field violation is `{field, description, reason}`, a precondition violation is `{type, subject, description}`.
+
+So a scenario must not invent a `context` key. Anything a caller needs that has no key of its own belongs inside a `description`: the broker's `last_sequence` on a sequence violation, or the valid range on an out-of-range seek, are written into the violation's `description` text, not added as fields. The wire type is free-form JSON, so an invented key is not *impossible* - it would mean bypassing the canonical builder, which is exactly what the gear must not do.
 
 ### Side-effects predicate vocabulary
 

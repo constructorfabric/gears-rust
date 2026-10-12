@@ -1,0 +1,22 @@
+{
+  "gts_id": "gts.cf.e2e.reading.device.v1~",
+  "content": {
+    "$id": "gts://gts.cf.e2e.reading.device.v1~",
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "type": "object",
+    "properties": {
+      "serial": {
+        "type": "string"
+      },
+      "payload": {
+        "type": "object",
+        "additionalProperties": true
+      }
+    },
+    "required": [
+      "serial",
+      "payload"
+    ],
+    "additionalProperties": false
+  }
+}

@@ -36,15 +36,16 @@ fn line(account: Uuid, class: AccountClass, side: Side, amount: i64, payer: Uuid
         account_class: class,
         gl_code: None,
         side,
-        amount_minor: amount,
-        currency: "USD".to_owned(),
-        currency_scale: 2,
+        money: PostedMoney::try_new(
+            Decimal::from(amount),
+            CurrencySpec::try_new("USD".into(), 2).unwrap(),
+        )
+        .unwrap(),
         invoice_id: None,
         due_date: None,
         revenue_stream: None,
         mapping_status: MappingStatus::Resolved,
-        functional_amount_minor: None,
-        functional_currency: None,
+        functional_money: None,
         tax_jurisdiction: None,
         tax_filing_period: None,
         tax_rate_ref: None,
@@ -76,7 +77,10 @@ fn ar_line_with_invoice_yields_three_grains() {
     assert_eq!(grains[1].table_rank, GrainTable::ArPayer);
     assert_eq!(grains[2].table_rank, GrainTable::ArInvoice);
     // DR on a DR-normal account → positive delta.
-    assert_eq!(grains[0].delta, 1000);
+    assert_eq!(
+        grains[0].delta,
+        ExactAmount::from_decimal(Decimal::from(1000))
+    );
 }
 
 #[test]
@@ -89,7 +93,10 @@ fn credit_against_dr_normal_is_negative_delta() {
     normal_sides.insert(ar, Side::Debit);
 
     let grains = derive_grains(&entry(tenant), &[l], &normal_sides).unwrap();
-    assert_eq!(grains[0].delta, -1500);
+    assert_eq!(
+        grains[0].delta,
+        ExactAmount::from_decimal(Decimal::from(-1500))
+    );
 }
 
 #[test]
@@ -113,13 +120,20 @@ fn two_lines_on_one_account_coalesce_into_a_single_net_grain() {
         .filter(|g| g.table_rank == GrainTable::Account)
         .collect();
     assert_eq!(account_grains.len(), 1, "same-account legs must coalesce");
-    assert_eq!(account_grains[0].delta, 50, "net of −100 then +150");
+    assert_eq!(
+        account_grains[0].delta,
+        ExactAmount::from_decimal(Decimal::from(50)),
+        "net of −100 then +150"
+    );
     let payer_grains: Vec<_> = grains
         .iter()
         .filter(|g| g.table_rank == GrainTable::ArPayer)
         .collect();
     assert_eq!(payer_grains.len(), 1);
-    assert_eq!(payer_grains[0].delta, 50);
+    assert_eq!(
+        payer_grains[0].delta,
+        ExactAmount::from_decimal(Decimal::from(50))
+    );
 }
 
 #[test]
@@ -152,7 +166,10 @@ fn cr_unallocated_line_yields_an_unallocated_grain() {
     assert_eq!(unalloc_grain.currency, "USD");
     assert_eq!(unalloc_grain.account_class, AccountClass::Unallocated);
     // CR on a CR-normal account → positive delta.
-    assert_eq!(unalloc_grain.delta, 1000);
+    assert_eq!(
+        unalloc_grain.delta,
+        ExactAmount::from_decimal(Decimal::from(1000))
+    );
 }
 
 #[test]
@@ -162,7 +179,7 @@ fn missing_normal_side_is_an_error() {
     let ar = Uuid::now_v7();
     let l = line(ar, AccountClass::Ar, Side::Debit, 1000, payer);
     let err = derive_grains(&entry(tenant), &[l], &HashMap::new()).unwrap_err();
-    assert_eq!(err, ProjectError::MissingNormalSide(ar));
+    assert!(matches!(err, ProjectError::MissingNormalSide(id) if id == ar));
 }
 
 #[test]
@@ -201,7 +218,10 @@ fn cr_reusable_credit_line_yields_a_keyed_credit_grain() {
     assert_eq!(credit_grain.account_class, AccountClass::ReusableCredit);
     assert_eq!(credit_grain.credit_grant_event_type, "promo");
     // CR on a CR-normal account → positive delta.
-    assert_eq!(credit_grain.delta, 1000);
+    assert_eq!(
+        credit_grain.delta,
+        ExactAmount::from_decimal(Decimal::from(1000))
+    );
     // First-write-wins recency stamp = the entry's posted-at.
     assert_eq!(credit_grain.first_granted_at, Some(posted_at));
 }
@@ -231,7 +251,10 @@ fn dr_reusable_credit_line_is_negative_delta() {
         .find(|g| g.table_rank == GrainTable::ReusableCredit)
         .expect("a REUSABLE_CREDIT-rank grain must be emitted");
     // DR on a CR-normal account → negative delta.
-    assert_eq!(credit_grain.delta, -400);
+    assert_eq!(
+        credit_grain.delta,
+        ExactAmount::from_decimal(Decimal::from(-400))
+    );
 }
 
 #[test]
@@ -255,7 +278,7 @@ fn reusable_credit_without_event_type_is_rejected() {
     normal_sides.insert(wallet, Side::Credit);
 
     let err = derive_grains(&entry(tenant), &[l], &normal_sides).unwrap_err();
-    assert_eq!(err, ProjectError::MissingCreditEventType(line_id));
+    assert!(matches!(err, ProjectError::MissingCreditEventType(id) if id == line_id));
 }
 
 #[test]
@@ -366,7 +389,10 @@ fn same_credit_grant_event_type_coalesces_into_one_net_grain() {
         .collect();
     assert_eq!(credit_grains.len(), 1, "same event type must coalesce");
     // CR +500 then DR −200 on a CR-normal account → net +300.
-    assert_eq!(credit_grains[0].delta, 300);
+    assert_eq!(
+        credit_grains[0].delta,
+        ExactAmount::from_decimal(Decimal::from(300))
+    );
 }
 
 #[test]

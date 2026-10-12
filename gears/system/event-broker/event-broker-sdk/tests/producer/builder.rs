@@ -45,6 +45,11 @@ fn default_validation_is_eager() {
     assert_eq!(ValidationTiming::default(), ValidationTiming::Eager);
 }
 
+// Skipped under coverage, like every other trybuild suite in the workspace:
+// the coverage lane runs a nightly, whose diagnostics are not the stable ones
+// the `.stderr` files record, and trybuild on that nightly no longer finds the
+// crate's enabled features, so a `db` case builds without `db`.
+#[cfg(not(coverage_nightly))]
 #[test]
 fn typestate_builder_compile_failures_are_checked() {
     let tests = trybuild::TestCases::new();
@@ -66,7 +71,6 @@ impl ProducerIdentityTestExt for ProducerIdentity {
         if self.source_ref().trim().is_empty() {
             Err(EventBrokerError::InvalidProducerOptions {
                 detail: "producer identity source is required".to_owned(),
-                instance: String::new(),
             })
         } else {
             Ok(())
@@ -98,7 +102,6 @@ impl DirectDeduplicationTestExt for DirectDeduplication {
             } => Err(EventBrokerError::InvalidProducerOptions {
                 detail: "registration-backed deduplication requires monotonic or chained mode"
                     .to_owned(),
-                instance: String::new(),
             }),
         }
     }

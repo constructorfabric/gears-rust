@@ -14,8 +14,8 @@ use std::time::Duration;
 
 use sea_orm::DatabaseExecutor;
 use toolkit_db::outbox::{
-    HandlerResult, Outbox, OutboxMessage, Partitions, Record, TransactionalMessageHandler,
-    WorkerTuning, outbox_migrations,
+    HandlerResult, Outbox, OutboxMessage, Partitions, Record, TransactionalMessageHandler, Wake,
+    WorkerTuning, in_transaction, outbox_migrations,
 };
 use toolkit_db::{ConnectOpts, connect_db, migration_runner::run_migrations_for_testing};
 
@@ -64,30 +64,33 @@ async fn main() -> anyhow::Result<()> {
         .start()
         .await?;
 
-    // transaction() auto-flushes the sequencer on commit — no manual flush() needed
+    // `in_transaction` runs the closure in a DB transaction and flushes the
+    // accumulated Wake only if the commit succeeds — so the sequencer is
+    // woken against durable rows and the handle never crosses the commit
+    // boundary by hand. Enqueue accumulates into one handle with `+=`, returned
+    // as the closure's final value.
     let outbox = Arc::clone(handle.outbox());
-    let (db, result) = outbox
-        .transaction(db, |tx| {
-            let outbox = Arc::clone(&outbox);
-            Box::pin(async move {
-                for i in 0..5u32 {
-                    let payload = format!(r#"{{"order_id": {i}}}"#);
-                    outbox
-                        // payload_type is user-defined — convention: mime base + vendor domain type
-                        .enqueue(
-                            tx,
-                            Record::to("orders", i % 2)
-                                .payload(payload.into_bytes(), "application/json;orders.created.v1")
-                                .build()?,
-                        )
-                        .await
-                        .map_err(|e| anyhow::anyhow!("{e}"))?;
-                }
-                Ok(())
-            })
+    in_transaction::<_, (), anyhow::Error>(&db, |tx| {
+        let outbox = Arc::clone(&outbox);
+        Box::pin(async move {
+            let mut wake = Wake::empty();
+            for i in 0..5u32 {
+                let payload = format!(r#"{{"order_id": {i}}}"#);
+                wake += outbox
+                    // payload_type is user-defined — convention: mime base + vendor domain type
+                    .enqueue(
+                        tx,
+                        Record::to("orders", i % 2)
+                            .payload(payload.into_bytes(), "application/json;orders.created.v1")
+                            .build()?,
+                    )
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+            }
+            Ok(((), wake))
         })
-        .await;
-    result?;
+    })
+    .await?;
     println!("Enqueued 5 messages across 2 partitions");
 
     // Poll until all messages are processed (processor runs in background)

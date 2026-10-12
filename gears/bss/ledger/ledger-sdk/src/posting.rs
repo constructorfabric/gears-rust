@@ -1,7 +1,8 @@
 //! Posting request/response DTOs for the in-process data-access API.
 //! Handlers build balanced lines from these; the foundation persists them.
-//! All amounts are `i64` minor units.
+//! All amounts carry validated major-unit money and stored currency metadata.
 
+use crate::{CurrencySpec, MoneyError, PostedMoney};
 use chrono::NaiveDate;
 use uuid::Uuid;
 
@@ -20,14 +21,12 @@ pub struct PostLine {
     pub account_class: AccountClass,
     pub gl_code: Option<String>,
     pub side: Side,
-    pub amount_minor: i64,
-    pub currency: String,
+    pub money: PostedMoney,
     pub invoice_id: Option<String>,
     pub due_date: Option<NaiveDate>,
     pub revenue_stream: Option<String>,
     pub mapping_status: MappingStatus,
-    pub functional_amount_minor: Option<i64>,
-    pub functional_currency: Option<String>,
+    pub functional_money: Option<PostedMoney>,
     pub tax_jurisdiction: Option<String>,
     pub tax_filing_period: Option<String>,
     pub tax_rate_ref: Option<String>,
@@ -39,8 +38,8 @@ pub struct PostLine {
     pub credit_grant_event_type: Option<String>,
     /// AR dispute sub-class (`ACTIVE`/`DISPUTED`), set on the two AR legs of a
     /// chargeback reclass; `None` on every other line. The projector routes a
-    /// `DISPUTED` AR line's signed amount into `ar_invoice_balance.disputed_minor`
-    /// while the reclass nets ZERO on `balance_minor` (AR-class-neutral).
+    /// `DISPUTED` AR line's signed amount into `ar_invoice_balance.disputed`
+    /// while the reclass nets ZERO on `balance` (AR-class-neutral).
     pub ar_status: Option<String>,
 }
 
@@ -116,20 +115,16 @@ pub struct LineView {
     pub account_class: AccountClass,
     pub gl_code: Option<String>,
     pub side: Side,
-    pub amount_minor: i64,
-    pub currency: String,
-    pub currency_scale: u8,
+    pub money: PostedMoney,
     pub invoice_id: Option<String>,
     pub due_date: Option<NaiveDate>,
     pub revenue_stream: Option<String>,
     pub mapping_status: MappingStatus,
     /// Functional-currency translation stamped on a cross-currency line (Slice 5):
     /// `Some` when a functional rate was locked at post time, `None` on a
-    /// single-currency line (equals `amount_minor` by identity). Exposed so a
+    /// single-currency line (equals `money` by identity). Exposed so a
     /// reversal can reconstruct the original functional and net it to zero.
-    pub functional_amount_minor: Option<i64>,
-    /// Functional currency of `functional_amount_minor`; `None` single-currency.
-    pub functional_currency: Option<String>,
+    pub functional_money: Option<PostedMoney>,
     pub tax_jurisdiction: Option<String>,
     pub tax_filing_period: Option<String>,
     /// AR dispute sub-class (`ACTIVE`/`DISPUTED`) snapshot on the line; `None`
@@ -138,23 +133,19 @@ pub struct LineView {
 }
 
 /// A read-back account-balance cache row. Returned by
-/// `LedgerClientV1::list_balances`. The signed `balance_minor` is the cached
+/// `LedgerClientV1::list_balances`. The signed `balance` is the cached
 /// normal-side-positive balance at the `(tenant, account, currency)` grain.
 #[derive(Clone, Debug)]
 pub struct BalanceView {
     pub account_id: Uuid,
     pub account_class: AccountClass,
-    pub currency: String,
-    pub balance_minor: i64,
+    pub balance: PostedMoney,
     /// Functional-currency carried balance (Slice 5). `Some` only on a
     /// cross-currency grain (a functional translation was stamped); `None` on a
-    /// single-currency grain, where the functional value equals `balance_minor`
+    /// single-currency grain, where the functional value equals `balance`
     /// by identity (P1 decision 8 — the `?valuation=functional` read falls back to
-    /// `balance_minor`).
-    pub functional_balance_minor: Option<i64>,
-    /// The functional currency of `functional_balance_minor`; `None` on a
-    /// single-currency grain (equals `currency` by identity).
-    pub functional_currency: Option<String>,
+    /// `balance`).
+    pub functional_balance: Option<PostedMoney>,
 }
 
 /// A read-back per-invoice AR-balance cache row. Returned by
@@ -164,34 +155,74 @@ pub struct ArInvoiceBalanceView {
     pub payer_tenant_id: Uuid,
     pub account_id: Uuid,
     pub invoice_id: String,
-    pub currency: String,
-    pub balance_minor: i64,
+    pub balance: PostedMoney,
     pub due_date: Option<NaiveDate>,
 }
 
-/// A settled payment to record (the **money-in** side). The gross is what the
-/// payer was charged; `fee_minor` is the processor's withheld cut (`<= gross`).
-/// `scale` is the payment's currency scale as known to the caller; the ledger
-/// resolves the authoritative per-line scale from the provisioned currency
-/// config, so this is advisory. `effective_at` `None` ⇒ the receipt is stamped
-/// at post time. Consumed by `LedgerClientV1::settle_payment`.
+/// A settled payment to record (the **money-in** side). `amounts` carries the
+/// gross the payer was charged and the processor's withheld fee as one pair in
+/// one currency and scale; the posting service validates that currency against
+/// the provisioned configuration and the fee against the gross. `effective_at`
+/// `None` ⇒ the receipt is stamped at post time. Consumed by
+/// `LedgerClientV1::settle_payment`.
 #[derive(Clone, Debug)]
 pub struct SettlePayment {
     pub tenant_id: Uuid,
     pub payer_tenant_id: Uuid,
     pub payment_id: String,
-    pub gross_minor: i64,
-    pub fee_minor: i64,
-    pub currency: String,
-    pub scale: u8,
+    pub amounts: SettledAmounts,
     pub effective_at: Option<OffsetDateTime>,
 }
 
+/// The gross and fee of one settlement, in the same currency and stored scale
+/// by construction: a gross in EUR with a fee in USD cannot be built.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SettledAmounts {
+    gross: PostedMoney,
+    fee: PostedMoney,
+}
+
+impl SettledAmounts {
+    /// Pair a gross with its fee.
+    ///
+    /// # Errors
+    /// [`MoneyError::CurrencyMismatch`] when the fee names another currency,
+    /// otherwise [`MoneyError::ScaleMismatch`] when it carries another scale.
+    pub fn try_new(gross: PostedMoney, fee: PostedMoney) -> Result<Self, MoneyError> {
+        fee.currency().ensure_same(gross.currency())?;
+        Ok(Self { gross, fee })
+    }
+
+    /// The amount the payer was charged.
+    #[must_use]
+    pub fn gross(&self) -> &PostedMoney {
+        &self.gross
+    }
+
+    /// The processor's withheld cut.
+    #[must_use]
+    pub fn fee(&self) -> &PostedMoney {
+        &self.fee
+    }
+
+    /// The one currency and scale both amounts share.
+    #[must_use]
+    pub fn currency(&self) -> &CurrencySpec {
+        self.gross.currency()
+    }
+
+    /// Split the pair back into `(gross, fee)`.
+    #[must_use]
+    pub fn into_parts(self) -> (PostedMoney, PostedMoney) {
+        (self.gross, self.fee)
+    }
+}
+
 /// A settlement to claw back (the **reversal of a money-in**). Records that the
-/// PSP returned a previously-settled receipt: it removes `amount_minor` from the
+/// PSP returned a previously-settled receipt: it removes `money` from the
 /// payer's unallocated pool (`DR UNALLOCATED` / `CR CASH_CLEARING`) and
-/// decrements the original payment's `settled_minor`. `psp_return_id` is the
-/// idempotency key (a re-post replays). `scale` is advisory (as [`SettlePayment`]);
+/// decrements the original payment's `settled`. `psp_return_id` is the
+/// idempotency key (a re-post replays). Currency metadata is validated against the registry;
 /// `effective_at` `None` ⇒ the return is stamped at post time. Consumed by
 /// `LedgerClientV1::return_payment`.
 #[derive(Clone, Debug)]
@@ -202,9 +233,7 @@ pub struct ReturnPayment {
     pub payment_id: String,
     /// External return identity — the idempotency key.
     pub psp_return_id: String,
-    pub amount_minor: i64,
-    pub currency: String,
-    pub scale: u8,
+    pub money: PostedMoney,
     pub effective_at: Option<OffsetDateTime>,
 }
 
@@ -216,7 +245,7 @@ pub struct ReturnPayment {
 /// `"won"`, `"lost"`, `"partial"` (Group B implements `opened`). `cycle`
 /// defaults to 1 and increments on a re-open. `invoice_id` is the disputed
 /// `(payer, invoice)` AR grain — required for an AR-reclass `opened`, ignored
-/// for cash-hold. `scale` is advisory (as [`SettlePayment`]); `effective_at`
+/// for cash-hold. Currency metadata is validated against the registry; `effective_at`
 /// `None` ⇒ the phase is stamped at post time. Consumed by
 /// `LedgerClientV1::record_dispute_phase`.
 #[derive(Clone, Debug)]
@@ -238,14 +267,11 @@ pub struct RecordDisputePhase {
     /// variant: `"withheld"` (card rails) ⇒ cash-hold, `"not_moved"`
     /// (invoice/ACH) ⇒ AR-reclass.
     pub funds_at_open: String,
-    /// The disputed amount in minor units (`> 0`): the **gross** claim — the full
+    /// The disputed amount in major units (`> 0`): the **gross** claim — the full
     /// amount the buyer paid / the card network reverses, NOT net of the PSP fee.
     /// A `CASH_HOLD` dispute's cash hold is sized at `net = settled − fee` by the
     /// ledger itself; this gross value drives the AR-reclass legs + the dispute row.
-    pub disputed_amount_minor: i64,
-    pub currency: String,
-    /// Advisory currency scale; the ledger resolves the authoritative one.
-    pub scale: u8,
+    pub disputed_amount: PostedMoney,
     pub effective_at: Option<OffsetDateTime>,
 }
 
@@ -286,26 +312,25 @@ pub enum DisputeOutcome {
     Queued(DisputeQueued),
 }
 
-/// One caller-computed allocation share (Mode B, §4.4 F-5): apply `amount_minor`
+/// One caller-computed allocation share (Mode B, §4.4 F-5): apply `money`
 /// of the lump to `invoice_id`. Carried in [`AllocatePayment::splits`] when the
 /// caller supplies the split instead of letting a precedence policy decide it.
 #[derive(Clone, Debug)]
 pub struct AllocationSplit {
     pub invoice_id: String,
-    pub amount_minor: i64,
+    pub money: PostedMoney,
 }
 
 /// An allocation of a settled payment's unallocated pool to the payer's open
 /// receivables (the **money-out** side). `allocation_id` is the idempotency key.
-/// As with [`SettlePayment`], `scale` is advisory — the ledger resolves the
-/// authoritative per-line scale. Consumed by `LedgerClientV1::allocate_payment`.
+/// All child money must match the request currency metadata. Consumed by `LedgerClientV1::allocate_payment`.
 ///
-/// Two modes: when `splits` is `None` (Mode A/B precedence), `lump_minor` is
+/// Two modes: when `splits` is `None` (Mode A/B precedence), `lump` is
 /// distributed by the tenant's precedence policy and `hint_invoice_id` jumps one
 /// invoice to the front of that order. When `splits` is `Some` (Mode B escape
 /// hatch), the precedence decision is skipped and the caller's explicit shares
 /// are validated against the open receivables instead — they must name open
-/// invoices, not over-allocate any invoice, and sum to at most `lump_minor`;
+/// invoices, not over-allocate any invoice, and sum to at most `lump`;
 /// `hint_invoice_id` is then moot.
 #[derive(Clone, Debug)]
 pub struct AllocatePayment {
@@ -313,9 +338,7 @@ pub struct AllocatePayment {
     pub payer_tenant_id: Uuid,
     pub payment_id: String,
     pub allocation_id: Uuid,
-    pub lump_minor: i64,
-    pub currency: String,
-    pub scale: u8,
+    pub lump: PostedMoney,
     pub hint_invoice_id: Option<String>,
     /// Mode B caller-computed split; `None` ⇒ the precedence policy decides.
     pub splits: Option<Vec<AllocationSplit>>,
@@ -327,8 +350,7 @@ pub struct AllocatePayment {
 #[derive(Clone, Debug)]
 pub struct AllocationView {
     pub invoice_id: String,
-    pub amount_minor: i64,
-    pub currency: String,
+    pub money: PostedMoney,
     pub allocated_at_utc: OffsetDateTime,
     pub precedence_policy_ref: String,
 }
@@ -338,8 +360,7 @@ pub struct AllocationView {
 #[derive(Clone, Debug)]
 pub struct UnallocatedView {
     pub payer_tenant_id: Uuid,
-    pub currency: String,
-    pub balance_minor: i64,
+    pub balance: PostedMoney,
 }
 
 /// The outcome of an allocate that posted inline (the payment was already
@@ -466,8 +487,8 @@ pub struct RevenueDisaggregationQuery {
 }
 
 /// One disaggregated recognized-revenue grain: the revenue RECOGNIZED into
-/// `revenue_stream` during `period_id`, in minor units of `currency`. The sum of
-/// the DONE segments' `amount_minor` at the `(period_id, revenue_stream)` grain
+/// `revenue_stream` during `period_id`, in major units with stored currency metadata. The sum of
+/// the DONE segments' `money` at the `(period_id, revenue_stream)` grain
 /// (each DONE segment posted a `DR CONTRACT_LIABILITY / CR REVENUE` release, so
 /// this is the recognized-Revenue credit that period for that stream). A row of
 /// [`RevenueDisaggregation::entries`].
@@ -477,11 +498,9 @@ pub struct RevenueDisaggregationEntry {
     pub period_id: String,
     /// The revenue stream the recognized revenue books to.
     pub revenue_stream: String,
-    /// Revenue recognized into this `(period, stream)` grain, in minor units
-    /// (`Σ amount_minor` of the DONE segments).
-    pub recognized_minor: i64,
-    /// ISO currency of the recognized amount (one account/schedule per currency).
-    pub currency: String,
+    /// Revenue recognized into this `(period, stream)` grain, in major units
+    /// (`Σ money` of the DONE segments).
+    pub recognized: PostedMoney,
 }
 
 /// The result of `LedgerClientV1::list_revenue_disaggregation`: the recognized
@@ -512,13 +531,11 @@ pub struct RecognitionScheduleView {
     pub version: i64,
     /// The revenue stream the obligation books to (one schedule per stream).
     pub revenue_stream: String,
-    /// ISO-4217 currency (one schedule/account per currency).
-    pub currency: String,
     /// The total deferred Contract-liability the schedule plans to release.
-    pub total_deferred_minor: i64,
-    /// The cumulative recognized-to-date (`<= total_deferred_minor`, the
+    pub total_deferred: PostedMoney,
+    /// The cumulative recognized-to-date (`<= total_deferred`, the
     /// per-obligation over-recognition cap).
-    pub recognized_minor: i64,
+    pub recognized: PostedMoney,
     /// The originating posted invoice (`source_invoice_id`).
     pub source_invoice_id: String,
     /// The Contract-liability invoice line the schedule draws down
@@ -538,7 +555,7 @@ pub struct RecognitionScheduleView {
 
 /// A read-back of one recognition segment (a time- or milestone-slice of a
 /// [`RecognitionScheduleView`]): the `segment_no` (immutable, 1:1 with
-/// `period_id`), the period it recognizes into, its minor-unit amount, and its
+/// `period_id`), the period it recognizes into, its major-unit amount, and its
 /// release `status` (`PENDING` | `QUEUED` | `DONE`). A row of
 /// [`RecognitionScheduleView::segments`].
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -547,8 +564,8 @@ pub struct RecognitionScheduleSegmentView {
     pub segment_no: i32,
     /// The fiscal period this segment recognizes into (`YYYYMM`).
     pub period_id: String,
-    /// The segment's minor-unit amount.
-    pub amount_minor: i64,
+    /// The segment's major-unit amount.
+    pub money: PostedMoney,
     /// The release status (`PENDING` | `QUEUED` | `DONE`).
     pub status: String,
 }
@@ -569,12 +586,10 @@ pub struct RecognitionScheduleSummaryView {
     pub version: i64,
     /// The revenue stream the obligation books to (one schedule per stream).
     pub revenue_stream: String,
-    /// ISO-4217 currency (one schedule/account per currency).
-    pub currency: String,
     /// The total deferred Contract-liability the schedule plans to release.
-    pub total_deferred_minor: i64,
-    /// The cumulative recognized-to-date (`<= total_deferred_minor`).
-    pub recognized_minor: i64,
+    pub total_deferred: PostedMoney,
+    /// The cumulative recognized-to-date (`<= total_deferred`).
+    pub recognized: PostedMoney,
     /// The originating posted invoice (`source_invoice_id`).
     pub source_invoice_id: String,
     /// The Contract-liability invoice line the schedule draws down.
@@ -601,17 +616,17 @@ pub struct RecognitionScheduleList {
 }
 
 /// One replacement recognition segment supplied on a `replace` change (design
-/// §3.6 / Group H): the `(period_id, amount_minor)` slice the NEW schedule
-/// version re-plans the remaining deferred over. `Σ amount_minor` of the supplied
-/// segments is the new schedule's `total_deferred_minor` (= the OLD schedule's
+/// §3.6 / Group H): the `(period_id, money)` slice the NEW schedule
+/// version re-plans the remaining deferred over. `Σ money` of the supplied
+/// segments is the new schedule's `total_deferred` (= the OLD schedule's
 /// remaining deferred, `total_deferred − recognized`). Carried in
 /// [`ChangeRecognitionSchedule::new_segments`]; ignored on a `cancel`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ChangeSegment {
     /// Fiscal `period_id` (`YYYYMM`) this replacement segment recognizes into.
     pub period_id: String,
-    /// Minor-unit amount of this segment (`>= 0`).
-    pub amount_minor: i64,
+    /// Major-unit amount of this segment (`>= 0`).
+    pub money: PostedMoney,
 }
 
 /// A schedule change / cancel request (design §3.6 / §4.6, Group H). Targets one
@@ -683,10 +698,9 @@ impl CreditApplication {
     }
 }
 
-/// Grant: park `amount_minor` of the payer's unallocated pool into the wallet
+/// Grant: park `money` of the payer's unallocated pool into the wallet
 /// sub-grain `credit_grant_event_type` (`DR UNALLOCATED` / `CR REUSABLE_CREDIT`).
-/// As with [`SettlePayment`], `scale` is advisory — the ledger resolves the
-/// authoritative per-line scale from the provisioned currency config.
+/// Currency metadata is validated against the provisioned configuration.
 #[derive(Clone, Debug)]
 // `credit_grant_event_type` is the canonical domain/DB term (matches the line
 // field + the sub-grain column), not field-name noise — keep it as-is.
@@ -695,31 +709,29 @@ pub struct CreditGrant {
     pub tenant_id: Uuid,
     pub payer_tenant_id: Uuid,
     pub credit_application_id: String,
-    pub currency: String,
-    pub scale: u8,
-    pub amount_minor: i64,
+    pub money: PostedMoney,
     pub credit_grant_event_type: String,
 }
 
 /// Apply: spend the payer's reusable-credit wallet against the named open
 /// receivables (oldest-grant-first draw-down). The per-invoice receivable shares
-/// reuse [`AllocationSplit`] (`invoice_id` + `amount_minor`). `scale` is advisory.
+/// reuse [`AllocationSplit`] (`invoice_id` + `money`). All targets must match
+/// `currency` (code and scale).
 #[derive(Clone, Debug)]
 pub struct CreditApply {
     pub tenant_id: Uuid,
     pub payer_tenant_id: Uuid,
     pub credit_application_id: String,
-    pub currency: String,
-    pub scale: u8,
+    pub currency: CurrencySpec,
     pub targets: Vec<AllocationSplit>,
 }
 
-/// One per-sub-grain wallet draw-down an apply posted: `amount_minor` drawn from
+/// One per-sub-grain wallet draw-down an apply posted: `money` drawn from
 /// the `credit_grant_event_type` bucket. A row of [`CreditApplicationApplied::debits`].
 #[derive(Clone, Debug)]
 pub struct CreditDebitView {
     pub credit_grant_event_type: String,
-    pub amount_minor: i64,
+    pub money: PostedMoney,
 }
 
 /// The outcome of a grant or apply: the posting handle plus — for an apply — the
@@ -744,3 +756,7 @@ pub struct CreditApplicationApplied {
 // platform list pattern (RBAC/AM/RG). The legacy `LineFilter` / `BalanceFilter`
 // structs and the bespoke `Page { items, next_cursor }` are gone.
 pub use toolkit_odata::{ODataQuery, Page};
+
+#[cfg(test)]
+#[path = "posting_tests.rs"]
+mod tests;

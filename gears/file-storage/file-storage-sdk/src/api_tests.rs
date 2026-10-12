@@ -1,7 +1,6 @@
 use super::*;
 
-/// Minimal in-test implementation to prove the trait is object-safe and usable
-/// through a trait object (which is how `ClientHub` stores it).
+/// Minimal impl proving the trait is usable as a trait object (how `ClientHub` stores it).
 struct StubClient;
 
 impl FileStorageClientV1 for StubClient {

@@ -86,15 +86,16 @@ fn unalloc_line(entry_id: Uuid, account: u128) -> journal_line::Model {
         account_class: "UNALLOCATED".to_owned(),
         gl_code: None,
         side: "CR".to_owned(),
-        amount_minor: 1_000,
+        amount: "10".to_owned(),
         currency: "USD".to_owned(),
         currency_scale: 2,
         invoice_id: None,
         due_date: None,
         revenue_stream: None,
         mapping_status: "RESOLVED".to_owned(),
-        functional_amount_minor: None,
+        functional_amount: None,
         functional_currency: None,
+        functional_currency_scale: None,
         rate_snapshot_ref: None,
         tax_jurisdiction: None,
         tax_filing_period: None,
@@ -110,15 +111,31 @@ fn unalloc_line(entry_id: Uuid, account: u128) -> journal_line::Model {
     }
 }
 
+/// A USD scale-2 posting from a cent count (`1000` ⇒ `10`).
+fn usd_cents(minor: i64) -> bss_ledger_sdk::PostedMoney {
+    bss_ledger_sdk::PostedMoney::try_new(
+        rust_decimal::Decimal::new(minor, 2),
+        bss_ledger_sdk::CurrencySpec::try_new("USD".to_owned(), 2).unwrap(),
+    )
+    .unwrap()
+}
+
+/// Canonical stored text of a USD scale-2 cent count.
+fn cents_text(minor: i64) -> String {
+    bss_ledger_sdk::canonical_decimal(rust_decimal::Decimal::new(minor, 2))
+}
+
 fn unalloc_cache(account: u128, balance_minor: i64) -> unallocated_balance::Model {
     unallocated_balance::Model {
         tenant_id: Uuid::from_u128(TENANT),
         payer_tenant_id: Uuid::from_u128(PAYER),
         account_id: Uuid::from_u128(account),
         currency: "USD".to_owned(),
-        balance_minor,
-        functional_balance_minor: None,
+        currency_scale: 2,
+        balance: cents_text(balance_minor),
+        functional_balance: None,
         functional_currency: None,
+        functional_currency_scale: None,
         last_entry_seq: None,
         version: 0,
     }
@@ -143,7 +160,7 @@ fn aged_grains_flags_old_grain_with_positive_balance() {
             payer_tenant_id: Uuid::from_u128(PAYER),
             account_id: Uuid::from_u128(ACCOUNT),
             currency: "USD".to_owned(),
-            balance_minor: 1_000,
+            balance: usd_cents(1_000),
             age_secs: aged[0].age_secs,
         }
     );
@@ -264,9 +281,11 @@ fn clearing_cache(account: u128, balance_minor: i64) -> account_balance::Model {
         currency: "USD".to_owned(),
         account_class: "REFUND_CLEARING".to_owned(),
         normal_side: "CR".to_owned(),
-        balance_minor,
-        functional_balance_minor: None,
+        currency_scale: 2,
+        balance: cents_text(balance_minor),
+        functional_balance: None,
         functional_currency: None,
+        functional_currency_scale: None,
         last_entry_seq: None,
         version: 0,
     }
@@ -282,7 +301,8 @@ fn refund_row(psp: &str, phase: &str, created_at: OffsetDateTime) -> refund::Mod
         payment_id: "pay-1".to_owned(),
         invoice_id: None,
         currency: "USD".to_owned(),
-        amount_minor: 500,
+        currency_scale: 2,
+        amount: "5".to_owned(),
         clearing_state: "PENDING".to_owned(),
         relates_to_refund_id: None,
         reverses_entry_id: None,
@@ -314,7 +334,7 @@ fn refund_clearing_aged_flags_open_grain_past_7d_warn() {
     );
     assert_eq!(aged.len(), 1, "an 8-day-open clearing grain is aged (Warn)");
     assert_eq!(aged[0].account_id, Uuid::from_u128(ACCOUNT));
-    assert_eq!(aged[0].balance_minor, 500);
+    assert_eq!(aged[0].balance, usd_cents(500));
     assert!(!aged[0].paged, "8 days is past Warn but not the 14d Page");
 }
 
@@ -392,7 +412,7 @@ fn stage1_orphan_flags_unmatched_aged_stage1() {
     let orphans = stage1_orphans(Uuid::from_u128(TENANT), &rows, now, cutoff);
     assert_eq!(orphans.len(), 1, "an unmatched aged stage-1 is an orphan");
     assert_eq!(orphans[0].psp_refund_id, "psp-orphan");
-    assert_eq!(orphans[0].amount_minor, 500);
+    assert_eq!(orphans[0].amount, usd_cents(500));
     assert!(orphans[0].age_secs >= WARN_SECS);
 }
 
@@ -621,9 +641,9 @@ async fn aged_refund_clearing_is_detected_and_run_completes() {
     txn.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_journal_line \
          (line_id, entry_id, tenant_id, period_id, payer_tenant_id, account_id, account_class, \
-          side, amount_minor, currency, currency_scale, mapping_status) \
+          side, amount, currency, currency_scale, mapping_status) \
          VALUES ('{}', '{entry_id}', '{tenant}', '202606', '{tenant}', '{account}', \
-          'REFUND_CLEARING', 'CR', 500, 'USD', 2, 'RESOLVED')",
+          'REFUND_CLEARING', 'CR', '5', 'USD', 2, 'RESOLVED')",
         Uuid::now_v7()
     )))
     .await
@@ -634,9 +654,9 @@ async fn aged_refund_clearing_is_detected_and_run_completes() {
     txn.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_journal_line \
          (line_id, entry_id, tenant_id, period_id, payer_tenant_id, account_id, account_class, \
-          side, amount_minor, currency, currency_scale, mapping_status) \
+          side, amount, currency, currency_scale, mapping_status) \
          VALUES ('{}', '{entry_id}', '{tenant}', '202606', '{tenant}', '{source_account}', \
-          'UNALLOCATED', 'DR', 500, 'USD', 2, 'RESOLVED')",
+          'UNALLOCATED', 'DR', '5', 'USD', 2, 'RESOLVED')",
         Uuid::now_v7()
     )))
     .await
@@ -646,8 +666,8 @@ async fn aged_refund_clearing_is_detected_and_run_completes() {
     // has no balanced-trigger, so a plain autocommit insert is fine here.
     raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_account_balance \
-         (tenant_id, account_id, currency, account_class, normal_side, balance_minor, version) \
-         VALUES ('{tenant}', '{account}', 'USD', 'REFUND_CLEARING', 'CR', 500, 0)"
+         (tenant_id, account_id, currency, currency_scale, account_class, normal_side, balance, version) \
+         VALUES ('{tenant}', '{account}', 'USD', 2, 'REFUND_CLEARING', 'CR', '5', 0)"
     )))
     .await
     .unwrap();
@@ -659,7 +679,7 @@ async fn aged_refund_clearing_is_detected_and_run_completes() {
         .expect("aged_refund_clearing_grains must succeed");
     assert_eq!(aged.len(), 1, "the 8-day-open clearing grain is aged");
     assert_eq!(aged[0].tenant_id, tenant);
-    assert_eq!(aged[0].balance_minor, 500);
+    assert_eq!(aged[0].balance, usd_cents(500));
     assert!(!aged[0].paged, "8 days is Warn, not the 14d Page");
 
     job.run()
@@ -682,9 +702,9 @@ async fn stage1_orphan_refund_is_detected() {
     raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_refund \
          (tenant_id, refund_id, psp_refund_id, phase, pattern, payment_id, currency, \
-          amount_minor, clearing_state, created_at_utc, version) \
+          currency_scale, amount, clearing_state, created_at_utc, version) \
          VALUES ('{tenant}', 'rf-orphan', 'psp-orphan', 'initiated', 'A_UNALLOCATED', 'pay-1', \
-          'USD', 500, 'PENDING', now() - interval '8 days', 0)"
+          'USD', 2, '5', 'PENDING', now() - interval '8 days', 0)"
     )))
     .await
     .unwrap();
@@ -692,18 +712,18 @@ async fn stage1_orphan_refund_is_detected() {
     raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_refund \
          (tenant_id, refund_id, psp_refund_id, phase, pattern, payment_id, currency, \
-          amount_minor, clearing_state, created_at_utc, version) \
+          currency_scale, amount, clearing_state, created_at_utc, version) \
          VALUES ('{tenant}', 'rf-done-1', 'psp-done', 'initiated', 'A_UNALLOCATED', 'pay-2', \
-          'USD', 500, 'PENDING', now() - interval '9 days', 0)"
+          'USD', 2, '5', 'PENDING', now() - interval '9 days', 0)"
     )))
     .await
     .unwrap();
     raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_refund \
          (tenant_id, refund_id, psp_refund_id, phase, pattern, payment_id, currency, \
-          amount_minor, clearing_state, created_at_utc, version) \
+          currency_scale, amount, clearing_state, created_at_utc, version) \
          VALUES ('{tenant}', 'rf-done-2', 'psp-done', 'confirmed', 'A_UNALLOCATED', 'pay-2', \
-          'USD', 500, 'SETTLED', now() - interval '8 days', 0)"
+          'USD', 2, '5', 'SETTLED', now() - interval '8 days', 0)"
     )))
     .await
     .unwrap();
@@ -755,9 +775,9 @@ async fn seed_unallocated_grain(
     txn.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_journal_line \
          (line_id, entry_id, tenant_id, period_id, payer_tenant_id, account_id, account_class, \
-          side, amount_minor, currency, currency_scale, mapping_status) \
+          side, amount, currency, currency_scale, mapping_status) \
          VALUES ('{}', '{entry_id}', '{tenant}', '202606', '{payer}', '{unallocated_account}', \
-          'UNALLOCATED', 'CR', 1000, 'USD', 2, 'RESOLVED')",
+          'UNALLOCATED', 'CR', '10', 'USD', 2, 'RESOLVED')",
         Uuid::now_v7()
     )))
     .await
@@ -766,19 +786,20 @@ async fn seed_unallocated_grain(
     txn.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_journal_line \
          (line_id, entry_id, tenant_id, period_id, payer_tenant_id, account_id, account_class, \
-          side, amount_minor, currency, currency_scale, mapping_status) \
+          side, amount, currency, currency_scale, mapping_status) \
          VALUES ('{}', '{entry_id}', '{tenant}', '202606', '{payer}', '{cash_account}', \
-          'CASH_CLEARING', 'DR', 1000, 'USD', 2, 'RESOLVED')",
+          'CASH_CLEARING', 'DR', '10', 'USD', 2, 'RESOLVED')",
         Uuid::now_v7()
     )))
     .await
     .unwrap();
     txn.commit().await.unwrap();
-    // The open cache grain (`balance_minor`), keyed (tenant, payer, currency).
+    // The open cache grain (`balance`), keyed (tenant, payer, currency).
+    let balance = cents_text(balance_minor);
     raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_unallocated_balance \
-         (tenant_id, payer_tenant_id, account_id, currency, balance_minor, version) \
-         VALUES ('{tenant}', '{payer}', '{unallocated_account}', 'USD', {balance_minor}, 0)"
+         (tenant_id, payer_tenant_id, account_id, currency, currency_scale, balance, version) \
+         VALUES ('{tenant}', '{payer}', '{unallocated_account}', 'USD', 2, '{balance}', 0)"
     )))
     .await
     .unwrap();
@@ -819,7 +840,11 @@ async fn aged_unallocated_grain_is_detected_and_run_completes() {
     assert_eq!(aged[0].tenant_id, tenant);
     assert_eq!(aged[0].payer_tenant_id, payer);
     assert_eq!(aged[0].account_id, account);
-    assert_eq!(aged[0].balance_minor, 700, "the parked balance is reported");
+    assert_eq!(
+        aged[0].balance,
+        usd_cents(700),
+        "the parked balance is reported"
+    );
     assert_eq!(aged[0].currency, "USD");
     assert!(
         aged[0].age_secs >= 86_400,
@@ -884,10 +909,13 @@ async fn seed_tax_subbalance(
     filing_period: &str,
     balance_minor: i64,
 ) {
+    let balance = cents_text(balance_minor);
     raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_tax_subbalance \
-         (tenant_id, account_id, tax_jurisdiction, tax_filing_period, balance_minor, version) \
-         VALUES ('{tenant}', '{account}', '{jurisdiction}', '{filing_period}', {balance_minor}, 0)"
+         (tenant_id, account_id, tax_jurisdiction, tax_filing_period, currency, currency_scale, \
+          balance, version) \
+         VALUES ('{tenant}', '{account}', '{jurisdiction}', '{filing_period}', 'USD', 2, \
+          '{balance}', 0)"
     )))
     .await
     .unwrap();
@@ -940,7 +968,7 @@ async fn negative_tax_subbalance_beyond_window_is_detected_and_run_completes() {
     assert_eq!(g.account_id, account);
     assert_eq!(g.tax_jurisdiction, "US-CA");
     assert_eq!(g.tax_filing_period, "200001");
-    assert_eq!(g.balance_minor, -250);
+    assert_eq!(g.balance, usd_cents(-250));
 
     // run() over the seeded ledger completes Ok. The Critical alarm it emits is
     // not observed — see this case's doc.

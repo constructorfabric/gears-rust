@@ -99,6 +99,7 @@ pub fn noop() -> Arc<dyn LeaderElector> {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};

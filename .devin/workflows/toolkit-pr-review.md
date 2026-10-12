@@ -8,8 +8,7 @@ Review a GitHub PR for Rust + ToolKit compliance and post inline comments.
 
 **Usage**: `/toolkit-pr-review <PR_NUMBER> [--repo <owner/repo>]`
 
-The rules live in six modules under `docs/toolkit-pr-review/rules/`, rendered for agents into
-`docs/toolkit-pr-review/agent-rules/`. The work is split by **subject**, not by file: one agent per
+The rules live in six modules under `docs/toolkit-pr-review/rules/`. The work is split by **subject**, not by file: one agent per
 module (Step 1), each reading the whole diff, so a file is read once per subject. One extra agent
 runs over the whole diff and owns `RUST-ARCH-001`. Agent prompts live in `docs/toolkit-pr-review/agents/`. The shared
 conventions every agent follows live in `docs/toolkit-pr-review/review-conventions.md` (severity, criterion
@@ -42,8 +41,8 @@ python3 tools/scripts/toolkit-pr-review/review.py prepare --pr "${PR_NUMBER}" --
 
 Add `--repo owner/name` when the PR is not in the repository the working copy points at.
 
-Exit code `2` means the run would cost more than `--max-total-tokens`; nothing was written and the
-message names the heaviest files. Raise the limit deliberately or narrow the review. Do not work
+Exit code `2` means the run would cost more than `--max-total-tokens`: `context.json` is not
+written, so no agent runs, and the message names the heaviest files. Raise the limit deliberately or narrow the review. Do not work
 around it by reviewing a subset by hand.
 
 What it writes under `${D}`:
@@ -68,15 +67,14 @@ and its behaviour is pinned by fixture tests in `tools/scripts/toolkit-pr-review
 
 ## Step 2: Read context.json
 
-`context.json` (schema 3) is the contract between `prepare` and every step below.
+`context.json` (schema 4) is the contract between `prepare` and every step below.
 
 // turbo
 ```bash
 export PR_NUMBER=<PR_NUMBER>
 D="/tmp/toolkit-pr-review-${PR_NUMBER}"
 jq '{files: .totals.files, skipped: .totals.skipped, agents: [.agents[].name],
-     est_tokens: .totals.est_tokens, toolkit: (.toolkit_files | length),
-     manifests: .manifest_files}' "${D}/context.json"
+     est_tokens: .totals.est_tokens, manifests: .manifest_files}' "${D}/context.json"
 ```
 
 The parts that matter downstream:
@@ -90,14 +88,18 @@ The parts that matter downstream:
 - **`files["<path>"].status == "deleted"`** — the file is gone at the head. Its snapshot was taken
   from the base commit, so an agent can still see what was removed, and a finding on it carries no
   `line` and posts as a file-level comment (Step 5).
-- **`agents`** — the spawn list for Step 3, already scoped. `toolkit` carries only ToolKit-owned
-  files and is absent entirely when there are none; only `security` carries `manifest_files`.
+- **`agents`** — the spawn list for Step 3. Every subject agent carries `all_files`; only
+  `security` carries `manifest_files`.
 - **`skipped_files`** — files in the diff that no rule covers. Say so in the summary rather than
   implying they were reviewed.
 
 `Cargo.lock` is deliberately never snapshotted: it is generated, routinely over 300 KB, and
 everything `RUST-DEP-001` needs from it is already visible in `diff.patch`. It stays in
 `manifest_files` so a finding can still anchor on a changed line.
+
+**If `agents` is empty, stop here and skip Steps 3–6.** No `.rs` file changed, so nothing is
+reviewed. Print `No .rs files changed; nothing was reviewed.` and post nothing to the PR:
+"No issues found." would claim a review that never ran.
 
 ## Step 3: Run review agents in parallel
 
@@ -106,18 +108,17 @@ Each reads its inputs from `/tmp/toolkit-pr-review-${PR_NUMBER}/` and writes a J
 output file.
 
 Every subject agent reads **one** module and **all** the files. Do not hand an agent the other five
-modules, and use `agent-rules/` rather than the authored `rules/`: the generated copy drops the
-rationale an agent does not act on and the criteria the pinned toolchain cannot trigger.
+modules.
 
-The per-file scoping lives inside the rule modules: the `toolkit` agent runs only on
-`toolkit_files`, and `RUST-DEP-001` only on `manifest_files`, which the `security` agent owns.
+The per-file scoping lives inside the rule modules: the `toolkit` agent skips framework internals
+under `libs/toolkit*/`, and `RUST-DEP-001` runs only on `manifest_files`, which the `security` agent owns.
 
 // turbo
 ```bash
 PR_NUMBER=<PR_NUMBER>
 D="/tmp/toolkit-pr-review-${PR_NUMBER}"
 AGENTS_DIR="docs/toolkit-pr-review/agents"
-RULES_DIR="docs/toolkit-pr-review/agent-rules"
+RULES_DIR="docs/toolkit-pr-review/rules"
 strip() { sed '/^---$/,/^---$/d;1{/^---/d}' "$1"; }
 
 SUBJECT_PROMPT="$(strip ${AGENTS_DIR}/subject.md)"
@@ -166,14 +167,11 @@ import json, glob, sys, os, subprocess
 PR_NUMBER = os.environ["PR_NUMBER"]
 ctx = json.load(open(f"/tmp/toolkit-pr-review-{PR_NUMBER}/context.json"))
 
-# Subject agents in module order, then the architecture pass. `allowed` is the file set the
-# agent was given; only `toolkit` is narrower than the whole PR, and only it can file a
-# finding outside its scope.
-sources = [(a["name"], set(a["files"])) for a in ctx["agents"] if a["name"] != "architecture"]
-sources.append(("architecture", None))
+# Subject agents in module order, then the architecture pass.
+names = [a["name"] for a in ctx["agents"] if a["name"] != "architecture"] + ["architecture"]
 
-combined, out_of_scope = [], 0
-for name, allowed in sources:
+combined = []
+for name in names:
     path = f"/tmp/toolkit-pr-review-{PR_NUMBER}/out-{name}.json"
     try:
         text = open(path).read()
@@ -182,19 +180,11 @@ for name, allowed in sources:
     except Exception as e:
         print(f"WARNING: {name}: {e}", file=sys.stderr)
         continue
-    for f in found:
-        # An agent that reviews outside the file list it was given ignored its scope.
-        if allowed is not None and f.get("file") not in allowed:
-            out_of_scope += 1
-            continue
-        combined.append(f)
-if out_of_scope:
-    print(f"WARNING: dropped {out_of_scope} findings filed outside the agent's file list",
-          file=sys.stderr)
+    combined.extend(found)
 
 # Per-file line ranges and status, for validating a finding against the side it claims
 files_meta = ctx["files"]
-deleted_files = {p for p, r in files_meta.items() if r["status"] == "deleted"}
+deleted = {p for p, r in files_meta.items() if r["status"] == "deleted"}
 
 def in_range(file, line, side):
     """A finding is valid on the side it claims, and only there.
@@ -238,7 +228,7 @@ for f in combined:
         continue
     # No line at all is legal in two cases: a wholly deleted file, and a PR-level
     # RUST-ARCH-001 finding that no single line represents. Both post file-level.
-    lineless_ok = f["file"] in deleted_files or (
+    lineless_ok = f["file"] in deleted or (
         f.get("line") is None and f.get("id") == "RUST-ARCH-001"
     )
     if not lineless_ok and not in_range(f["file"], f.get("line"), f.get("side")):
@@ -359,6 +349,8 @@ PY
 export PR_NUMBER=<PR_NUMBER>
 D="/tmp/toolkit-pr-review-${PR_NUMBER}"
 export HEAD_SHA=$(jq -r .headRefOid ${D}/meta.json)
+# The repository prepare resolved, so posting goes where the diff came from.
+REPO=$(jq -r .repo "${D}/context.json")
 
 python3 - << 'PY'
 import json, os
@@ -371,14 +363,14 @@ HEAD_SHA = os.environ["HEAD_SHA"]
 D = f"/tmp/toolkit-pr-review-{PR_NUMBER}"
 findings = json.load(open(f"{D}/findings.json"))
 ctx = json.load(open(f"{D}/context.json"))
-deleted_files = set(ctx.get("deleted_files", []))
+deleted = {p for p, r in ctx["files"].items() if r["status"] == "deleted"}
 
 # A finding with no line can't go in the batch review's `comments` array (which
 # requires line+side), so it posts individually via the single-comment endpoint with
 # subject_type="file". Two cases produce that: a wholly deleted file, which has no
 # line on either side, and a RUST-ARCH-001 finding that no single line represents.
-line_findings = [f for f in findings if f.get("line") is not None and f["file"] not in deleted_files]
-file_findings = [f for f in findings if f.get("line") is None or f["file"] in deleted_files]
+line_findings = [f for f in findings if f.get("line") is not None and f["file"] not in deleted]
+file_findings = [f for f in findings if f.get("line") is None or f["file"] in deleted]
 
 # The comment body comes from the `comment` field, which the sub-agents write in the
 # voice defined by docs/toolkit-pr-review/comment-style.md. `issue` and `fix` are for the
@@ -413,6 +405,13 @@ json.dump(payload, open(f"{D}/review-payload.json", "w"))
 json.dump(file_findings, open(f"{D}/file-level-findings.json", "w"))
 print(f"Prepared {len(comments)} line comments, {len(file_findings)} file-level comments")
 PY
+
+# A PR with no .rs file spawned no agent (Step 2). Posting "No issues found." for it would
+# claim a review that never ran.
+if [ "$(jq '.agents | length' "${D}/context.json")" -eq 0 ]; then
+  echo "No .rs files changed; nothing was reviewed."
+  exit 0
+fi
 
 LINE_COUNT=$(jq '.comments | length' ${D}/review-payload.json)
 FILE_COUNT=$(jq 'length' ${D}/file-level-findings.json)

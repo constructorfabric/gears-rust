@@ -18,6 +18,7 @@ use cluster_sdk::{ClusterCacheProvider, ClusterLeaderElectionProvider, ClusterLo
 
 /// Name → provider lookup for all three primitives, assembled once at startup and
 /// passed to [`ClusterWiring::from_config`](crate::ClusterWiring::from_config).
+#[toolkit::domain_model]
 #[derive(Default)]
 pub struct ProviderRegistry {
     cache: HashMap<&'static str, Arc<dyn ClusterCacheProvider>>,
@@ -59,10 +60,12 @@ impl ProviderRegistry {
         self
     }
 
+    /// Looks up the cache provider registered under `name`, if any.
     pub(crate) fn cache_provider(&self, name: &str) -> Option<&Arc<dyn ClusterCacheProvider>> {
         self.cache.get(name)
     }
 
+    /// Looks up the leader-election provider registered under `name`, if any.
     pub(crate) fn leader_election_provider(
         &self,
         name: &str,
@@ -70,6 +73,7 @@ impl ProviderRegistry {
         self.leader_election.get(name)
     }
 
+    /// Looks up the lock provider registered under `name`, if any.
     pub(crate) fn lock_provider(&self, name: &str) -> Option<&Arc<dyn ClusterLockProvider>> {
         self.lock.get(name)
     }

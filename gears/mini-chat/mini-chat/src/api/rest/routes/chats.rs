@@ -1,8 +1,11 @@
 use axum::Router;
 use toolkit::api::OpenApiRegistry;
-use toolkit::api::operation_builder::{OperationBuilder, OperationBuilderODataExt, ThrottlingSpec};
+use toolkit::api::operation_builder::{
+    OperationBuilder, OperationBuilderODataExt, ResponseHeaderSpec, ResponseHeaderType,
+    ThrottlingSpec,
+};
 
-use super::AiChatLicense;
+use super::{AiChatLicense, retry_after_header};
 use crate::api::rest::{dto, handlers};
 use crate::infra::db::odata_mapper::ChatCursorField;
 
@@ -41,10 +44,18 @@ pub(super) fn register_chat_routes(
             http::StatusCode::CREATED,
             "Created chat",
         )
+        .response_header(ResponseHeaderSpec::new(
+            "Location",
+            "Path of the created chat",
+            ResponseHeaderType::String,
+        ))
         .error_400(openapi)
         .error_401(openapi)
         .error_403(openapi)
         .error_500(openapi)
+        .error_503(openapi)
+        .response_header(retry_after_header())
+        .error_422(openapi)
         .register(router, openapi);
 
     // GET {prefix}/v1/chats
@@ -68,10 +79,13 @@ pub(super) fn register_chat_routes(
             "Paginated list of chats",
         )
         .with_odata_filter::<ChatCursorField>()
+        .with_odata_orderby::<ChatCursorField>()
         .error_400(openapi)
         .error_401(openapi)
         .error_403(openapi)
         .error_500(openapi)
+        .error_503(openapi)
+        .response_header(retry_after_header())
         .register(router, openapi);
 
     // GET {prefix}/v1/chats/{id}
@@ -93,6 +107,8 @@ pub(super) fn register_chat_routes(
         .error_403(openapi)
         .error_404(openapi)
         .error_500(openapi)
+        .error_503(openapi)
+        .response_header(retry_after_header())
         .register(router, openapi);
 
     // PATCH {prefix}/v1/chats/{id}
@@ -115,6 +131,9 @@ pub(super) fn register_chat_routes(
         .error_403(openapi)
         .error_404(openapi)
         .error_500(openapi)
+        .error_503(openapi)
+        .response_header(retry_after_header())
+        .error_422(openapi)
         .register(router, openapi);
 
     // DELETE {prefix}/v1/chats/{id}
@@ -126,12 +145,14 @@ pub(super) fn register_chat_routes(
         .require_license_features([&AiChatLicense])
         .path_param("id", "Chat UUID")
         .handler(handlers::chats::delete_chat)
-        .json_response(http::StatusCode::NO_CONTENT, "Chat deleted")
+        .no_content_response(http::StatusCode::NO_CONTENT, "Chat deleted")
         .error_400(openapi)
         .error_401(openapi)
         .error_403(openapi)
         .error_404(openapi)
         .error_500(openapi)
+        .error_503(openapi)
+        .response_header(retry_after_header())
         .register(router, openapi);
 
     router

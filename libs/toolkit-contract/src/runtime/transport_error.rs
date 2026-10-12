@@ -59,6 +59,19 @@ pub enum TransportError {
     #[error("network error: {0}")]
     Network(#[source] Box<dyn std::error::Error + Send + Sync + 'static>),
 
+    /// The client-side concurrency limiter shed this request before it left the
+    /// process: more than `max_concurrent_requests`
+    /// ([`ClientConfig::max_concurrent_requests`](crate::runtime::config::ClientConfig::max_concurrent_requests))
+    /// were already in flight.
+    ///
+    /// Deliberately **not** transient (see [`Self::is_transient`]): the request
+    /// never reached the network, so re-issuing it — especially with backoff on
+    /// an already-saturated client — would only add load. Distinct from
+    /// [`Network`](Self::Network) so a caller can tell a locally-shed request
+    /// (never sent) apart from a mid-flight reset (maybe sent).
+    #[error("client concurrency limit reached (request shed before send)")]
+    Overloaded,
+
     /// The total deadline elapsed before the response was complete.
     #[error("timeout after {0:?}")]
     Timeout(std::time::Duration),
@@ -191,7 +204,11 @@ impl TransportError {
                     | tonic::Code::Aborted
                     | tonic::Code::ResourceExhausted
             ),
-            TransportError::Serialization(_) | TransportError::UrlBuild(_) => false,
+            // `Overloaded` is a local shed, not a network condition: retrying it
+            // adds load to an already-saturated client, so it fails fast.
+            TransportError::Serialization(_)
+            | TransportError::UrlBuild(_)
+            | TransportError::Overloaded => false,
         }
     }
 }
@@ -219,6 +236,13 @@ mod tests {
     fn serialization_is_not_transient() {
         assert!(!TransportError::serialization("bad json").is_transient());
         assert!(!TransportError::UrlBuild("missing path param".into()).is_transient());
+    }
+
+    #[test]
+    fn overloaded_is_not_transient() {
+        // A locally-shed request never left the process; retrying it only adds
+        // load to an already-saturated client, so it must fail fast.
+        assert!(!TransportError::Overloaded.is_transient());
     }
 
     #[test]

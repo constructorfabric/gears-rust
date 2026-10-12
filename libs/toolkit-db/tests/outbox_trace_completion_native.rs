@@ -102,8 +102,9 @@ async fn a_half_acked_batch_is_not_reported_complete(url: &str) {
     // one connection - on MySQL the id comes from `LAST_INSERT_ID()`, which is
     // per-connection, so a pooled standalone connection would read the wrong id.
     let o_inner = std::sync::Arc::clone(outbox);
-    let (db, result) = outbox
-        .transaction(db.clone(), move |tx| {
+    let (db, result) = db
+        .clone()
+        .transaction(move |tx| {
             let o2 = std::sync::Arc::clone(&o_inner);
             Box::pin(async move {
                 let batch = Records::to("q")
@@ -119,7 +120,7 @@ async fn a_half_acked_batch_is_not_reported_complete(url: &str) {
             })
         })
         .await;
-    result.expect("enqueue");
+    result.expect("enqueue").fire();
     let conn = db.conn().expect("conn");
 
     // The first entity's ack drops pending from 2 to 1. Wait for that: the batch
@@ -288,8 +289,9 @@ async fn a_completion_reaches_the_submitting_instance(url: &str) {
     // one connection - on MySQL the id comes from `LAST_INSERT_ID()`, which is
     // per-connection.
     let o_inner = std::sync::Arc::clone(outbox_a);
-    let (_db, result) = outbox_a
-        .transaction(db.clone(), move |tx| {
+    let (_db, result) = db
+        .clone()
+        .transaction(move |tx| {
             let o2 = std::sync::Arc::clone(&o_inner);
             Box::pin(async move {
                 let batch = Records::to("shared-q")
@@ -304,7 +306,7 @@ async fn a_completion_reaches_the_submitting_instance(url: &str) {
             })
         })
         .await;
-    result.expect("enqueue");
+    result.expect("enqueue").fire();
 
     // B processes and acks; A's notifier must deliver the completion to A. The
     // MySQL claim runs its stamping UPDATE before reading the outcome, so the

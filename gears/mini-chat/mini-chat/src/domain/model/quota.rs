@@ -13,6 +13,8 @@ pub enum PreflightDecision {
         effective_model: String,
         /// Provider-facing model ID of the effective model (e.g. `"gpt-5.2"`).
         effective_provider_model_id: String,
+        /// Provider routing key of the effective model (`MiniChatConfig.providers`).
+        effective_provider_id: String,
         reserve_tokens: i64,
         max_output_tokens_applied: i32,
         reserved_credits_micro: i64,
@@ -36,11 +38,15 @@ pub enum PreflightDecision {
         api_params: ModelApiParams,
         /// Web search context size hint (from `ModelCatalogEntry`).
         web_search_context_size: WebSearchContextSize,
+        /// Whether the effective model accepts image input (`VISION_INPUT`).
+        vision_input: bool,
     },
     Downgrade {
         effective_model: String,
         /// Provider-facing model ID of the effective model (e.g. `"gpt-5-mini"`).
         effective_provider_model_id: String,
+        /// Provider routing key of the effective model (`MiniChatConfig.providers`).
+        effective_provider_id: String,
         reserve_tokens: i64,
         max_output_tokens_applied: i32,
         reserved_credits_micro: i64,
@@ -66,6 +72,8 @@ pub enum PreflightDecision {
         api_params: ModelApiParams,
         /// Web search context size hint (from `ModelCatalogEntry`).
         web_search_context_size: WebSearchContextSize,
+        /// Whether the effective model accepts image input (`VISION_INPUT`).
+        vision_input: bool,
     },
     Reject {
         error_code: String,

@@ -97,4 +97,51 @@ mod tests {
         assert_eq!(req.theme, Some("dark".to_owned()));
         assert_eq!(req.language, None);
     }
+
+    #[test]
+    fn test_put_named_setting_request_takes_any_json_value() {
+        let req: dto::PutNamedSettingRequest =
+            serde_json::from_str(r#"{"value":{"wrap":true,"tab":4}}"#).unwrap();
+        assert_eq!(req.value, serde_json::json!({"wrap": true, "tab": 4}));
+
+        let req: dto::PutNamedSettingRequest = serde_json::from_str(r#"{"value":null}"#).unwrap();
+        assert_eq!(req.value, serde_json::Value::Null);
+    }
+
+    #[test]
+    fn test_named_settings_list_serialization() {
+        let dto = dto::NamedSettingsListDto {
+            settings: vec![dto::NamedSettingDto {
+                key: "portal.projects.view".to_owned(),
+                value: serde_json::json!("table"),
+            }],
+        };
+        let json = serde_json::to_value(&dto).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({"settings": [{"key": "portal.projects.view", "value": "table"}]})
+        );
+    }
+
+    #[test]
+    fn test_put_named_setting_request_requires_value() {
+        assert!(serde_json::from_str::<dto::PutNamedSettingRequest>("{}").is_err());
+        assert!(serde_json::from_str::<dto::PutNamedSettingRequest>(r#"{"val":1}"#).is_err());
+    }
+
+    /// The byte bound is not the only guard: `serde_json` refuses input nested
+    /// deeper than its recursion limit (128) while the body is parsed, so a
+    /// small but pathologically deep value never reaches the service.
+    #[test]
+    fn test_put_named_setting_request_refuses_pathological_nesting() {
+        let nested =
+            |depth: usize| format!(r#"{{"value":{}1{}}}"#, "[".repeat(depth), "]".repeat(depth));
+
+        serde_json::from_str::<dto::PutNamedSettingRequest>(&nested(100))
+            .expect("ordinary nesting is fine");
+        assert!(
+            serde_json::from_str::<dto::PutNamedSettingRequest>(&nested(1000)).is_err(),
+            "1000 levels must be refused at parse time"
+        );
+    }
 }

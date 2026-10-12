@@ -53,6 +53,7 @@ pub fn map_citation_ids<S: ::std::hash::BuildHasher>(
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use crate::domain::llm::TextSpan;

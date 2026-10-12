@@ -595,7 +595,9 @@ pub struct SecureInsertOne<A, S>
 where
     A: ActiveModelTrait,
 {
+    /// The wrapped `SeaORM` insert statement.
     pub(crate) inner: sea_orm::Insert<A>,
+    /// Typestate marker tracking whether the scope has been applied.
     pub(crate) _state: PhantomData<S>,
 }
 
@@ -791,7 +793,9 @@ pub struct SecureInsertMany<A, S>
 where
     A: ActiveModelTrait,
 {
+    /// The wrapped `SeaORM` insert-many statement.
     pub(crate) inner: sea_orm::InsertMany<A>,
+    /// Typestate marker tracking whether the scope has been applied.
     pub(crate) _state: PhantomData<S>,
 }
 
@@ -1095,8 +1099,11 @@ where
 /// ```
 #[derive(Clone, Debug)]
 pub struct SecureUpdateMany<E: EntityTrait, S> {
+    /// The wrapped `SeaORM` update-many statement.
     pub(crate) inner: sea_orm::UpdateMany<E>,
+    /// Typestate marker tracking whether the scope has been applied.
     pub(crate) _state: PhantomData<S>,
+    /// Whether the caller attempted to update the tenant column, which is rejected on execution.
     pub(crate) tenant_update_attempted: bool,
 }
 
@@ -1191,6 +1198,27 @@ where
         }
     }
 
+    /// Execute the update and return the rows it wrote, as written (`UPDATE … RETURNING`, on the
+    /// backends that support it: Postgres and `SQLite`). The scope and the tenant-immutability
+    /// rule apply exactly as in [`exec`](Self::exec).
+    ///
+    /// # Errors
+    /// Returns `ScopeError::Denied` if the update attempts to change `tenant_id`, and
+    /// `ScopeError::Db` if the database operation fails (a backend without `RETURNING` included).
+    #[allow(clippy::disallowed_methods)]
+    pub async fn exec_with_returning(
+        self,
+        runner: &impl DBRunner,
+    ) -> Result<Vec<E::Model>, ScopeError> {
+        if self.tenant_update_attempted {
+            return Err(ScopeError::Denied("tenant_id is immutable"));
+        }
+        match DBRunnerInternal::as_seaorm(runner) {
+            SeaOrmRunner::Conn(db) => Ok(self.inner.exec_with_returning(db).await?),
+            SeaOrmRunner::Tx(tx) => Ok(self.inner.exec_with_returning(tx).await?),
+        }
+    }
+
     /// Unwrap the inner `SeaORM` `UpdateMany` for advanced use cases.
     ///
     /// # Safety
@@ -1221,7 +1249,9 @@ where
 /// ```
 #[derive(Clone, Debug)]
 pub struct SecureDeleteMany<E: EntityTrait, S> {
+    /// The wrapped `SeaORM` delete-many statement.
     pub(crate) inner: sea_orm::DeleteMany<E>,
+    /// Typestate marker tracking whether the scope has been applied.
     pub(crate) _state: PhantomData<S>,
 }
 

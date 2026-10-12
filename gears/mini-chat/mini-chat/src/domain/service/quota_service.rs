@@ -228,7 +228,9 @@ struct CascadeContext<'a> {
     snapshot: &'a PolicySnapshot,
     user_limits: &'a UserLimits,
     usage_rows: &'a [QuotaUsageModel],
-    reserve_credits_micro: i64,
+    /// Reserve a candidate model would book: its estimate, multipliers and
+    /// `max_output_tokens`. Checked against the limits of that model's tier.
+    reserve_credits_micro: &'a (dyn Fn(&ModelCatalogEntry) -> i64 + Sync),
     periods: &'a [(PeriodType, time::Date)],
 }
 
@@ -300,24 +302,7 @@ impl<QR: QuotaUsageRepository> QuotaService<QR> {
                 ModelTier::Standard => &["total"],
             };
 
-            // 3c. Check tier availability
-            let tier_available = buckets.iter().all(|bucket| {
-                ctx.periods.iter().all(|(period_type, period_start)| {
-                    let limit = limit_credits_micro(bucket, period_type, ctx.user_limits);
-                    let (spent, reserved) =
-                        sum_from_usage_rows(bucket, period_type, *period_start, ctx.usage_rows);
-                    spent + reserved + ctx.reserve_credits_micro <= limit
-                })
-            });
-
-            if !tier_available {
-                if tier == ModelTier::Premium && downgrade_reason.is_none() {
-                    downgrade_reason = Some(DowngradeReason::PremiumQuotaExhausted);
-                }
-                continue;
-            }
-
-            // 3d. Select concrete model for this tier
+            // 3c. Select concrete model for this tier
             //     Prefer the explicitly requested model when it belongs to this
             //     tier and is enabled; fall back to the tier default or any
             //     enabled model otherwise.
@@ -336,6 +321,24 @@ impl<QR: QuotaUsageRepository> QuotaService<QR> {
             let Some(effective) = model else {
                 continue; // all models in tier are individually disabled
             };
+
+            // 3d. Check tier availability with the reserve of that model
+            let reserve = (ctx.reserve_credits_micro)(effective);
+            let tier_available = buckets.iter().all(|bucket| {
+                ctx.periods.iter().all(|(period_type, period_start)| {
+                    let limit = limit_credits_micro(bucket, period_type, ctx.user_limits);
+                    let (spent, reserved) =
+                        sum_from_usage_rows(bucket, period_type, *period_start, ctx.usage_rows);
+                    spent.saturating_add(reserved).saturating_add(reserve) <= limit
+                })
+            });
+
+            if !tier_available {
+                if tier == ModelTier::Premium && downgrade_reason.is_none() {
+                    downgrade_reason = Some(DowngradeReason::PremiumQuotaExhausted);
+                }
+                continue;
+            }
 
             // 3e. Decision
             if effective.id == selected_model && downgrade_reason.is_none() {
@@ -412,6 +415,9 @@ pub struct PreflightComputed {
     pub(crate) periods: Vec<(PeriodType, time::Date)>,
     pub(crate) tenant_id: uuid::Uuid,
     pub(crate) user_id: uuid::Uuid,
+    /// Limits the decision was checked against; the reserve transaction
+    /// checks them again (see [`verify_reserve_within_limits`]).
+    pub(crate) user_limits: UserLimits,
     /// Policy kill switches captured at preflight time.
     /// Avoids a redundant `PolicySnapshotProvider::get()` call in `run_stream()`.
     pub kill_switches: KillSwitches,
@@ -421,6 +427,62 @@ impl PreflightComputed {
     /// Tier label for metrics recording.
     pub(crate) fn effective_tier(&self) -> &'static str {
         self.metrics_tier
+    }
+}
+
+// ── reserve limit re-check ──
+
+/// The reserve pushed a bucket over its limit: another request reserved
+/// between the preflight check and the reserve write.
+#[allow(de0309_must_have_domain_model)]
+#[derive(Debug, thiserror::Error)]
+#[error("quota reserve exceeds the limit")]
+pub struct ReserveLimitExceeded;
+
+/// Check the limits again after the reserve increments, in the same
+/// transaction. The preflight check runs in an earlier transaction, so two
+/// concurrent requests can both pass it; the increments take the row locks
+/// (Postgres) or the write lock (`SQLite`), so this check, a new statement,
+/// sees every reserve committed before it. Returns [`ReserveLimitExceeded`] inside
+/// `DbError::Other`; the caller rolls back and reports `quota_exceeded`.
+pub async fn verify_reserve_within_limits<QR: QuotaUsageRepository, C: DBRunner>(
+    repo: &QR,
+    runner: &C,
+    computed: &PreflightComputed,
+) -> Result<(), toolkit_db::DbError> {
+    if computed.buckets.is_empty() {
+        return Ok(());
+    }
+    let scope = AccessScope::for_tenant(computed.tenant_id);
+    // Plain read of the user's rows of the checked periods (the sums below
+    // filter by bucket): the increments above already hold the rows this
+    // request reserved; locking other rows could deadlock with a concurrent
+    // preflight.
+    let (period_types, period_starts): (Vec<_>, Vec<_>) = computed.periods.iter().cloned().unzip();
+    let rows = repo
+        .find_bucket_rows_for_periods(
+            runner,
+            &scope,
+            computed.tenant_id,
+            computed.user_id,
+            &period_types,
+            &period_starts,
+        )
+        .await
+        .map_err(to_db)?;
+    let within = computed.buckets.iter().all(|bucket| {
+        computed.periods.iter().all(|(period_type, period_start)| {
+            let limit = limit_credits_micro(bucket, period_type, &computed.user_limits);
+            let (spent, reserved) = sum_from_usage_rows(bucket, period_type, *period_start, &rows);
+            spent.saturating_add(reserved) <= limit
+        })
+    });
+    if within {
+        Ok(())
+    } else {
+        Err(toolkit_db::DbError::Other(anyhow::Error::new(
+            ReserveLimitExceeded,
+        )))
     }
 }
 
@@ -457,35 +519,45 @@ impl<QR: QuotaUsageRepository + 'static> QuotaService<QR> {
         //    plus the current message. `prior_context_tokens` is the actual
         //    input_tokens + output_tokens from the last completed turn, i.e.
         //    the context that will be re-sent to the LLM on this request.
-        let mut estimation = token_estimator::estimate_tokens(
-            &EstimationInput {
-                utf8_bytes: input.utf8_bytes,
-                num_images: input.num_images,
-                tools_enabled: input.tools_enabled,
-                web_search_enabled: input.web_search_enabled,
-                code_interpreter_enabled: input.code_interpreter_enabled,
-            },
-            &self.estimation_budgets,
-        );
-        estimation.estimated_input_tokens = estimation
-            .estimated_input_tokens
-            .saturating_add(input.prior_context_tokens);
+        //    Budgets come from the catalog entry of each cascade candidate.
+        //    Tool surcharges count only for tools the turn would send with
+        //    that model: its `tool_support` and the kill switches gate them,
+        //    as they gate the tools and the context budget on the send path.
+        let floor = self.estimation_budgets.minimal_generation_floor;
+        let estimate_input_tokens = {
+            let (utf8_bytes, num_images, tools_enabled, web, ci, prior) = (
+                input.utf8_bytes,
+                input.num_images,
+                input.tools_enabled,
+                input.web_search_enabled,
+                input.code_interpreter_enabled,
+                input.prior_context_tokens,
+            );
+            let ks = snapshot.kill_switches.clone();
+            move |budgets: &EstimationBudgets, entry: &ModelCatalogEntry| {
+                let ts = &entry.general_config.tool_support;
+                token_estimator::estimate_tokens(
+                    &EstimationInput {
+                        utf8_bytes,
+                        num_images,
+                        tools_enabled: tools_enabled && ts.file_search && !ks.disable_file_search,
+                        web_search_enabled: web && ts.web_search,
+                        code_interpreter_enabled: ci
+                            && ts.code_interpreter
+                            && !ks.disable_code_interpreter,
+                    },
+                    budgets,
+                )
+                .estimated_input_tokens
+                .saturating_add(prior)
+            }
+        };
 
-        // 3. Find selected model's multipliers for conservative initial reserve
+        // 3. Selected model's catalog entry (metrics tier)
         let catalog_entry = snapshot
             .model_catalog
             .iter()
             .find(|m| m.id == input.selected_model && m.enabled);
-
-        let (in_mult, out_mult) = catalog_entry.map_or(
-            (1_000_000, 1_000_000), // fallback for disabled models
-            |e| {
-                (
-                    e.input_tokens_credit_multiplier_micro,
-                    e.output_tokens_credit_multiplier_micro,
-                )
-            },
-        );
 
         // Tier label for metrics — derived from the selected model's catalog
         // entry so that reject paths (which have empty buckets) still report
@@ -495,14 +567,24 @@ impl<QR: QuotaUsageRepository + 'static> QuotaService<QR> {
             _ => "standard",
         };
 
-        // 4. Conservative initial reserve using config cap (pre-cascade)
-        let initial_reserved = credits_micro_checked(
-            estimation.estimated_input_tokens,
-            u64::from(input.max_output_tokens_cap),
-            in_mult,
-            out_mult,
-        )
-        .map_err(|e| DomainError::internal(e.to_string()))?;
+        // 4. Reserve of a cascade candidate: the same formula as the final
+        //    reserve below. An overflow makes the candidate unavailable.
+        let max_output_tokens_cap = input.max_output_tokens_cap;
+        let candidate_reserve = move |entry: &ModelCatalogEntry| -> i64 {
+            credits_micro_checked(
+                estimate_input_tokens(&catalog_budgets(entry, floor), entry),
+                u64::from(std::cmp::min(
+                    entry.max_output_tokens,
+                    max_output_tokens_cap,
+                )),
+                entry.input_tokens_credit_multiplier_micro,
+                entry.output_tokens_credit_multiplier_micro,
+            )
+            .unwrap_or_else(|e| {
+                tracing::warn!(model = %entry.id, error = %e, "cascade candidate reserve not computable; candidate unavailable");
+                i64::MAX
+            })
+        };
 
         // 5. Compute period boundaries
         let now = OffsetDateTime::now_utc().date();
@@ -516,10 +598,10 @@ impl<QR: QuotaUsageRepository + 'static> QuotaService<QR> {
         let tenant_id = input.tenant_id;
         let user_id = input.user_id;
         let selected_model = input.selected_model.clone();
-        let max_output_tokens_cap = input.max_output_tokens_cap;
-        let estimation_budgets = self.estimation_budgets;
         let web_search_daily_quota = self.quota_config.web_search_daily_quota;
         let code_interpreter_daily_quota = self.quota_config.code_interpreter_daily_quota;
+        let web_search_enabled = input.web_search_enabled;
+        let code_interpreter_enabled = input.code_interpreter_enabled;
 
         let tx_result = self
             .db
@@ -552,7 +634,7 @@ impl<QR: QuotaUsageRepository + 'static> QuotaService<QR> {
                         snapshot: &snapshot,
                         user_limits: &user_limits,
                         usage_rows: &usage_rows,
-                        reserve_credits_micro: initial_reserved,
+                        reserve_credits_micro: &candidate_reserve,
                         periods: &periods,
                     };
 
@@ -572,6 +654,7 @@ impl<QR: QuotaUsageRepository + 'static> QuotaService<QR> {
                             periods: periods.clone(),
                             tenant_id,
                             user_id,
+                            user_limits: user_limits.clone(),
                             kill_switches: snapshot.kill_switches.clone(),
                         }),
                         CascadeDecision::Allow {
@@ -594,8 +677,11 @@ impl<QR: QuotaUsageRepository + 'static> QuotaService<QR> {
                                     to_db(DomainError::internal("effective model not in catalog"))
                                 })?;
 
-                            // 6a. Daily web search quota check (post-cascade)
-                            if eff_entry.general_config.tool_support.web_search {
+                            // 6a. Daily web search quota check (post-cascade). Only a
+                            // request that uses the tool is charged against its quota.
+                            if web_search_enabled
+                                && eff_entry.general_config.tool_support.web_search
+                            {
                                 let today = period_starts[0];
                                 let daily_web_search_calls = repo
                                     .get_daily_web_search_calls(
@@ -616,13 +702,18 @@ impl<QR: QuotaUsageRepository + 'static> QuotaService<QR> {
                                         periods: periods.clone(),
                                         tenant_id,
                                         user_id,
+                                        user_limits: user_limits.clone(),
                                         kill_switches: snapshot.kill_switches.clone(),
                                     });
                                 }
                             }
 
-                            // 6b. Daily code interpreter quota check (post-cascade)
-                            if eff_entry.general_config.tool_support.code_interpreter {
+                            // 6b. Daily code interpreter quota check (post-cascade).
+                            // Skipped when the kill switch leaves the tool out.
+                            if code_interpreter_enabled
+                                && eff_entry.general_config.tool_support.code_interpreter
+                                && !snapshot.kill_switches.disable_code_interpreter
+                            {
                                 let today = period_starts[0];
                                 let daily_ci_calls = repo
                                     .get_daily_code_interpreter_calls(
@@ -643,6 +734,7 @@ impl<QR: QuotaUsageRepository + 'static> QuotaService<QR> {
                                         periods: periods.clone(),
                                         tenant_id,
                                         user_id,
+                                        user_limits: user_limits.clone(),
                                         kill_switches: snapshot.kill_switches.clone(),
                                     });
                                 }
@@ -652,9 +744,13 @@ impl<QR: QuotaUsageRepository + 'static> QuotaService<QR> {
                             let max_output_tokens_applied =
                                 std::cmp::min(eff_entry.max_output_tokens, max_output_tokens_cap);
 
-                            // Recompute credits with effective model's multipliers and resolved max_output
+                            // Recompute the estimate with the effective model's
+                            // budgets, and credits with its multipliers and max_output.
+                            let model_estimation_budgets = catalog_budgets(eff_entry, floor);
+                            let estimated_input =
+                                estimate_input_tokens(&model_estimation_budgets, eff_entry);
                             let final_reserved = credits_micro_checked(
-                                estimation.estimated_input_tokens,
+                                estimated_input,
                                 max_output_tokens_applied as u64,
                                 eff_entry.input_tokens_credit_multiplier_micro,
                                 eff_entry.output_tokens_credit_multiplier_micro,
@@ -668,39 +764,17 @@ impl<QR: QuotaUsageRepository + 'static> QuotaService<QR> {
                                 ModelTier::Standard => vec!["total".to_owned()],
                             };
 
-                            let reserve_tokens = estimation
-                                .estimated_input_tokens
+                            let reserve_tokens = estimated_input
                                 .saturating_add(max_output_tokens_applied as u64)
                                 as i64;
                             let max_output_tokens_applied = max_output_tokens_applied as i32;
                             let policy_version_applied = policy_version as i64;
+                            // The floor never exceeds the output reservation, so an
+                            // estimated settlement cannot charge above the reserve.
                             let minimal_generation_floor_applied =
-                                estimation_budgets.minimal_generation_floor as i32;
+                                std::cmp::min(floor as i32, max_output_tokens_applied);
 
                             let system_prompt = eff_entry.system_prompt.clone();
-
-                            let model_estimation_budgets = EstimationBudgets {
-                                bytes_per_token_conservative: eff_entry
-                                    .estimation_budgets
-                                    .bytes_per_token_conservative,
-                                fixed_overhead_tokens: eff_entry
-                                    .estimation_budgets
-                                    .fixed_overhead_tokens,
-                                safety_margin_pct: eff_entry.estimation_budgets.safety_margin_pct,
-                                image_token_budget: eff_entry.estimation_budgets.image_token_budget,
-                                tool_surcharge_tokens: eff_entry
-                                    .estimation_budgets
-                                    .tool_surcharge_tokens,
-                                web_search_surcharge_tokens: eff_entry
-                                    .estimation_budgets
-                                    .web_search_surcharge_tokens,
-                                code_interpreter_surcharge_tokens: eff_entry
-                                    .estimation_budgets
-                                    .code_interpreter_surcharge_tokens,
-                                minimal_generation_floor: eff_entry
-                                    .estimation_budgets
-                                    .minimal_generation_floor,
-                            };
 
                             let preflight_decision = match decision {
                                 CascadeDecision::Allow { .. } => PreflightDecision::Allow {
@@ -708,6 +782,7 @@ impl<QR: QuotaUsageRepository + 'static> QuotaService<QR> {
                                     effective_provider_model_id: eff_entry
                                         .provider_model_id
                                         .clone(),
+                                    effective_provider_id: eff_entry.provider_id.clone(),
                                     reserve_tokens,
                                     max_output_tokens_applied,
                                     reserved_credits_micro: final_reserved,
@@ -722,6 +797,7 @@ impl<QR: QuotaUsageRepository + 'static> QuotaService<QR> {
                                     tool_support: eff_entry.general_config.tool_support.clone(),
                                     api_params: eff_entry.general_config.api_params.clone(),
                                     web_search_context_size: eff_entry.web_search_context_size,
+                                    vision_input: supports_vision(eff_entry),
                                 },
                                 CascadeDecision::Downgrade {
                                     downgrade_from,
@@ -732,6 +808,7 @@ impl<QR: QuotaUsageRepository + 'static> QuotaService<QR> {
                                     effective_provider_model_id: eff_entry
                                         .provider_model_id
                                         .clone(),
+                                    effective_provider_id: eff_entry.provider_id.clone(),
                                     reserve_tokens,
                                     max_output_tokens_applied,
                                     reserved_credits_micro: final_reserved,
@@ -748,6 +825,7 @@ impl<QR: QuotaUsageRepository + 'static> QuotaService<QR> {
                                     tool_support: eff_entry.general_config.tool_support.clone(),
                                     api_params: eff_entry.general_config.api_params.clone(),
                                     web_search_context_size: eff_entry.web_search_context_size,
+                                    vision_input: supports_vision(eff_entry),
                                 },
                                 CascadeDecision::Reject => unreachable!(),
                             };
@@ -765,6 +843,7 @@ impl<QR: QuotaUsageRepository + 'static> QuotaService<QR> {
                                 periods: periods.clone(),
                                 tenant_id,
                                 user_id,
+                                user_limits: user_limits.clone(),
                                 kill_switches: snapshot.kill_switches.clone(),
                             })
                         }
@@ -1134,7 +1213,32 @@ impl<QR: QuotaUsageRepository> QuotaService<QR> {
     }
 }
 
+/// Estimation budgets of a catalog entry, with the deployment-level
+/// `minimal_generation_floor`.
+fn catalog_budgets(entry: &ModelCatalogEntry, floor: u32) -> EstimationBudgets {
+    let b = &entry.estimation_budgets;
+    EstimationBudgets {
+        bytes_per_token_conservative: b.bytes_per_token_conservative,
+        fixed_overhead_tokens: b.fixed_overhead_tokens,
+        safety_margin_pct: b.safety_margin_pct,
+        image_token_budget: b.image_token_budget,
+        tool_surcharge_tokens: b.tool_surcharge_tokens,
+        web_search_surcharge_tokens: b.web_search_surcharge_tokens,
+        code_interpreter_surcharge_tokens: b.code_interpreter_surcharge_tokens,
+        minimal_generation_floor: floor,
+    }
+}
+
+/// Whether a catalog entry accepts image input (`VISION_INPUT` capability).
+fn supports_vision(entry: &ModelCatalogEntry) -> bool {
+    entry
+        .multimodal_capabilities
+        .iter()
+        .any(|c| c == "VISION_INPUT")
+}
+
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use crate::domain::service::test_helpers::{TestCatalogEntryParams, test_catalog_entry};
@@ -1208,7 +1312,7 @@ mod tests {
             snapshot: &snapshot,
             user_limits: &limits,
             usage_rows: &[],
-            reserve_credits_micro: 1_000,
+            reserve_credits_micro: &|_| 1_000,
             periods: &periods,
         };
         match QuotaService::<crate::infra::db::repo::quota_usage_repo::QuotaUsageRepository>::resolve_effective_model("gpt-5", &ctx) {
@@ -1232,7 +1336,7 @@ mod tests {
             snapshot: &snapshot,
             user_limits: &limits,
             usage_rows: &[],
-            reserve_credits_micro: 1_000,
+            reserve_credits_micro: &|_| 1_000,
             periods: &periods,
         };
         match QuotaService::<crate::infra::db::repo::quota_usage_repo::QuotaUsageRepository>::resolve_effective_model("gpt-5", &ctx) {
@@ -1255,7 +1359,7 @@ mod tests {
             snapshot: &snapshot,
             user_limits: &limits,
             usage_rows: &[],
-            reserve_credits_micro: 1_000,
+            reserve_credits_micro: &|_| 1_000,
             periods: &periods,
         };
         match QuotaService::<crate::infra::db::repo::quota_usage_repo::QuotaUsageRepository>::resolve_effective_model("gpt-5-mini", &ctx) {
@@ -1279,7 +1383,7 @@ mod tests {
             snapshot: &snapshot,
             user_limits: &limits,
             usage_rows: &[],
-            reserve_credits_micro: 1_000,
+            reserve_credits_micro: &|_| 1_000,
             periods: &periods,
         };
         match QuotaService::<crate::infra::db::repo::quota_usage_repo::QuotaUsageRepository>::resolve_effective_model("gpt-5", &ctx) {
@@ -1299,7 +1403,7 @@ mod tests {
             snapshot: &snapshot,
             user_limits: &limits,
             usage_rows: &[],
-            reserve_credits_micro: 1_000,
+            reserve_credits_micro: &|_| 1_000,
             periods: &periods,
         };
         match QuotaService::<crate::infra::db::repo::quota_usage_repo::QuotaUsageRepository>::resolve_effective_model("gpt-5", &ctx) {
@@ -1322,7 +1426,7 @@ mod tests {
             snapshot: &snapshot,
             user_limits: &limits,
             usage_rows: &[],
-            reserve_credits_micro: 1_000,
+            reserve_credits_micro: &|_| 1_000,
             periods: &periods,
         };
         match QuotaService::<crate::infra::db::repo::quota_usage_repo::QuotaUsageRepository>::resolve_effective_model("gpt-5", &ctx) {
@@ -1346,7 +1450,7 @@ mod tests {
             snapshot: &snapshot,
             user_limits: &limits,
             usage_rows: &[],
-            reserve_credits_micro: 1_000,
+            reserve_credits_micro: &|_| 1_000,
             periods: &periods,
         };
         match QuotaService::<crate::infra::db::repo::quota_usage_repo::QuotaUsageRepository>::resolve_effective_model("gpt-5", &ctx) {
@@ -1370,7 +1474,7 @@ mod tests {
             snapshot: &snapshot,
             user_limits: &limits,
             usage_rows: &[],
-            reserve_credits_micro: 1_000,
+            reserve_credits_micro: &|_| 1_000,
             periods: &periods,
         };
         // Selecting the disabled standard model should reject, NOT escalate to premium
@@ -1400,7 +1504,7 @@ mod tests {
             snapshot: &snapshot,
             user_limits: &limits,
             usage_rows: &[],
-            reserve_credits_micro: 1_000,
+            reserve_credits_micro: &|_| 1_000,
             periods: &periods,
         };
         match QuotaService::<crate::infra::db::repo::quota_usage_repo::QuotaUsageRepository>::resolve_effective_model("std-other", &ctx) {
@@ -1425,7 +1529,7 @@ mod tests {
             snapshot: &snapshot,
             user_limits: &limits,
             usage_rows: &[],
-            reserve_credits_micro: 1_000,
+            reserve_credits_micro: &|_| 1_000,
             periods: &periods,
         };
         match QuotaService::<crate::infra::db::repo::quota_usage_repo::QuotaUsageRepository>::resolve_effective_model("gpt-5", &ctx) {
@@ -1841,6 +1945,110 @@ mod tests {
         }
     }
 
+    async fn standard_reserve_tokens(
+        tools: bool,
+        file_search_supported: bool,
+        kill_file_search: bool,
+    ) -> i64 {
+        let db = mock_db_provider(inmem_db().await);
+        let mut snapshot = default_snapshot();
+        for entry in &mut snapshot.model_catalog {
+            entry.general_config.tool_support.file_search = file_search_supported;
+        }
+        snapshot.kill_switches.disable_file_search = kill_file_search;
+        let svc = make_test_service(Arc::clone(&db), snapshot, 1.10);
+        let mut input = preflight_input("gpt-5-mini");
+        input.tools_enabled = tools;
+        match svc.preflight_reserve(input).await.unwrap() {
+            PreflightDecision::Allow { reserve_tokens, .. } => reserve_tokens,
+            other => panic!("expected Allow, got {other:?}"),
+        }
+    }
+
+    // The file_search surcharge is reserved only when the tool is sent:
+    // the model supports it and the kill switch is off.
+    #[tokio::test]
+    async fn preflight_tool_surcharge_follows_tool_gating() {
+        let without_tools = standard_reserve_tokens(false, true, false).await;
+        let with_tools = standard_reserve_tokens(true, true, false).await;
+        assert!(
+            with_tools > without_tools,
+            "surcharge applies when file_search is sent"
+        );
+        assert_eq!(
+            standard_reserve_tokens(true, false, false).await,
+            without_tools
+        );
+        assert_eq!(
+            standard_reserve_tokens(true, true, true).await,
+            without_tools
+        );
+    }
+
+    /// Reserve of a `gpt-5-mini` turn whose models support every tool,
+    /// after `setup` adjusts the snapshot and the input.
+    async fn reserve_tokens_with(
+        setup: impl FnOnce(&mut PolicySnapshot, &mut PreflightInput),
+    ) -> i64 {
+        let db = mock_db_provider(inmem_db().await);
+        let mut snapshot = default_snapshot();
+        for entry in &mut snapshot.model_catalog {
+            let ts = &mut entry.general_config.tool_support;
+            ts.file_search = true;
+            ts.web_search = true;
+            ts.code_interpreter = true;
+        }
+        let mut input = preflight_input("gpt-5-mini");
+        setup(&mut snapshot, &mut input);
+        let svc = make_test_service(Arc::clone(&db), snapshot, 1.10);
+        match svc.preflight_reserve(input).await.unwrap() {
+            PreflightDecision::Allow { reserve_tokens, .. } => reserve_tokens,
+            other => panic!("expected Allow, got {other:?}"),
+        }
+    }
+
+    // The web_search surcharge is reserved only when the model supports it.
+    #[tokio::test]
+    async fn preflight_web_search_surcharge_follows_tool_support() {
+        let without = reserve_tokens_with(|_, _| {}).await;
+        let with = reserve_tokens_with(|_, input| input.web_search_enabled = true).await;
+        assert!(with > without, "surcharge applies when web_search is sent");
+        let unsupported = reserve_tokens_with(|snapshot, input| {
+            input.web_search_enabled = true;
+            for entry in &mut snapshot.model_catalog {
+                entry.general_config.tool_support.web_search = false;
+            }
+        })
+        .await;
+        assert_eq!(unsupported, without);
+    }
+
+    // The code_interpreter surcharge is reserved only when the model
+    // supports it and the kill switch is off.
+    #[tokio::test]
+    async fn preflight_code_interpreter_surcharge_follows_tool_gating() {
+        let without = reserve_tokens_with(|_, _| {}).await;
+        let with = reserve_tokens_with(|_, input| input.code_interpreter_enabled = true).await;
+        assert!(
+            with > without,
+            "surcharge applies when code_interpreter is sent"
+        );
+        let unsupported = reserve_tokens_with(|snapshot, input| {
+            input.code_interpreter_enabled = true;
+            for entry in &mut snapshot.model_catalog {
+                entry.general_config.tool_support.code_interpreter = false;
+            }
+        })
+        .await;
+        assert_eq!(unsupported, without);
+        let killed = reserve_tokens_with(|snapshot, input| {
+            input.code_interpreter_enabled = true;
+            snapshot.kill_switches.disable_code_interpreter = true;
+        })
+        .await;
+        assert_eq!(killed, without);
+    }
+
     #[tokio::test]
     async fn preflight_allow_returns_all_fields() {
         let db_raw = inmem_db().await;
@@ -1956,6 +2164,96 @@ mod tests {
         }
     }
 
+    // Each cascade candidate is checked with its own reserve. A premium model
+    // whose reserve exceeds every limit must not make the standard candidate
+    // look unavailable too.
+    #[tokio::test]
+    async fn preflight_cascade_checks_candidate_reserve_expensive_premium() {
+        let db = mock_db_provider(inmem_db().await);
+        let mut snapshot = default_snapshot();
+        for entry in &mut snapshot.model_catalog {
+            if entry.tier == ModelTier::Premium {
+                entry.input_tokens_credit_multiplier_micro = 1_000_000_000_000;
+                entry.output_tokens_credit_multiplier_micro = 1_000_000_000_000;
+            }
+        }
+        let svc = make_test_service(Arc::clone(&db), snapshot, 1.10);
+
+        let result = svc
+            .preflight_reserve(preflight_input("gpt-5"))
+            .await
+            .unwrap();
+        match result {
+            PreflightDecision::Downgrade {
+                effective_model,
+                downgrade_reason,
+                ..
+            } => {
+                assert_eq!(effective_model, "gpt-5-mini");
+                assert_eq!(downgrade_reason, DowngradeReason::PremiumQuotaExhausted);
+            }
+            other => panic!("expected Downgrade, got {other:?}"),
+        }
+    }
+
+    // The reverse: a cheap premium reserve must not let an expensive
+    // standard candidate through.
+    #[tokio::test]
+    async fn preflight_cascade_checks_candidate_reserve_expensive_standard() {
+        let db = mock_db_provider(inmem_db().await);
+        let mut snapshot = default_snapshot();
+        for entry in &mut snapshot.model_catalog {
+            if entry.tier == ModelTier::Standard {
+                entry.input_tokens_credit_multiplier_micro = 1_000_000_000_000;
+                entry.output_tokens_credit_multiplier_micro = 1_000_000_000_000;
+            }
+        }
+        snapshot.kill_switches.force_standard_tier = true;
+        let svc = make_test_service(Arc::clone(&db), snapshot, 1.10);
+
+        let result = svc
+            .preflight_reserve(preflight_input("gpt-5"))
+            .await
+            .unwrap();
+        assert!(
+            matches!(result, PreflightDecision::Reject { ref quota_scope, .. } if quota_scope == "tokens"),
+            "expected Reject, got {result:?}"
+        );
+    }
+
+    // The vision flag describes the effective model: a downgrade to a model
+    // without VISION_INPUT reports false even if the selected model has it.
+    #[tokio::test]
+    async fn preflight_vision_flag_follows_effective_model() {
+        let db = mock_db_provider(inmem_db().await);
+        let mut snapshot = default_snapshot();
+        for entry in &mut snapshot.model_catalog {
+            entry.multimodal_capabilities = if entry.tier == ModelTier::Premium {
+                vec!["VISION_INPUT".to_owned()]
+            } else {
+                vec![]
+            };
+        }
+        snapshot.kill_switches.force_standard_tier = true;
+        let svc = make_test_service(Arc::clone(&db), snapshot, 1.10);
+
+        match svc
+            .preflight_reserve(preflight_input("gpt-5"))
+            .await
+            .unwrap()
+        {
+            PreflightDecision::Downgrade {
+                vision_input,
+                effective_model,
+                ..
+            } => {
+                assert_eq!(effective_model, "gpt-5-mini");
+                assert!(!vision_input);
+            }
+            other => panic!("expected Downgrade, got {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn preflight_downgrade_returns_correct_reason() {
         let db_raw = inmem_db().await;
@@ -2056,10 +2354,38 @@ mod tests {
                 assert_eq!(estimation_budgets.tool_surcharge_tokens, 1000);
                 assert_eq!(estimation_budgets.web_search_surcharge_tokens, 800);
                 assert_eq!(estimation_budgets.code_interpreter_surcharge_tokens, 1000);
-                assert_eq!(estimation_budgets.minimal_generation_floor, 256);
+                // The floor is deployment configuration, not per model.
+                assert_eq!(
+                    estimation_budgets.minimal_generation_floor,
+                    crate::config::EstimationBudgets::default().minimal_generation_floor
+                );
             }
             other => panic!("expected Allow, got {other:?}"),
         }
+    }
+
+    // The reserve estimate uses the catalog budgets of the model.
+    #[tokio::test]
+    async fn reserve_uses_catalog_estimation_budgets() {
+        async fn reserve_tokens_with(fixed_overhead_tokens: u32) -> i64 {
+            let db = mock_db_provider(inmem_db().await);
+            let mut snapshot = default_snapshot();
+            snapshot.model_catalog[0]
+                .estimation_budgets
+                .fixed_overhead_tokens = fixed_overhead_tokens;
+            let svc = make_test_service(Arc::clone(&db), snapshot, 1.10);
+            match svc
+                .preflight_reserve(preflight_input("gpt-5"))
+                .await
+                .unwrap()
+            {
+                PreflightDecision::Allow { reserve_tokens, .. } => reserve_tokens,
+                other => panic!("expected Allow, got {other:?}"),
+            }
+        }
+        let base = reserve_tokens_with(100).await;
+        let more = reserve_tokens_with(1_100).await;
+        assert!(more > base + 900, "base {base}, more {more}");
     }
 
     #[tokio::test]
@@ -2274,25 +2600,17 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn preflight_web_search_daily_quota_rejects() {
-        let db_raw = inmem_db().await;
-        let db = mock_db_provider(db_raw);
-        // Use a snapshot whose models have web_search capability enabled
-        let mut snapshot = default_snapshot();
-        for entry in &mut snapshot.model_catalog {
-            entry.general_config.tool_support.web_search = true;
-        }
-        let svc = make_test_service(Arc::clone(&db), snapshot, 1.10);
-
-        // Seed daily web search usage at the quota limit
+    /// Seeds today's `total` bucket row with the given tool call counts.
+    async fn seed_daily_tool_calls(
+        db: &Arc<DbProvider>,
+        web_search_calls: u32,
+        code_interpreter_calls: u32,
+    ) {
+        use crate::domain::repos::{IncrementReserveParams, SettleParams};
         let today = OffsetDateTime::now_utc().date();
         let scope = AccessScope::for_tenant(Uuid::nil());
         let repo = QuotaUsageRepo;
         let conn = db.conn().unwrap();
-
-        // First create the row via increment_reserve, then settle with web_search_calls
-        use crate::domain::repos::IncrementReserveParams;
         repo.increment_reserve(
             &conn,
             &scope,
@@ -2307,9 +2625,6 @@ mod tests {
         )
         .await
         .unwrap();
-
-        // Settle with web_search_calls = daily quota (default 75)
-        use crate::domain::repos::SettleParams;
         repo.settle(
             &conn,
             &scope,
@@ -2323,14 +2638,47 @@ mod tests {
                 actual_credits_micro: 1000,
                 input_tokens: Some(10),
                 output_tokens: Some(5),
-                web_search_calls: QuotaConfig::default().web_search_daily_quota,
-                code_interpreter_calls: 0,
+                web_search_calls,
+                code_interpreter_calls,
             },
         )
         .await
         .unwrap();
+    }
 
-        let input = preflight_input("gpt-5");
+    /// Service whose catalog models support both tools, with both daily
+    /// tool quotas already exhausted.
+    async fn service_with_exhausted_tool_quotas() -> TestQuotaService {
+        service_with_exhausted_tool_quotas_and(|_| {}).await
+    }
+
+    async fn service_with_exhausted_tool_quotas_and(
+        adjust: impl FnOnce(&mut PolicySnapshot),
+    ) -> TestQuotaService {
+        let db_raw = inmem_db().await;
+        let db = mock_db_provider(db_raw);
+        let mut snapshot = default_snapshot();
+        adjust(&mut snapshot);
+        for entry in &mut snapshot.model_catalog {
+            entry.general_config.tool_support.web_search = true;
+            entry.general_config.tool_support.code_interpreter = true;
+        }
+        let svc = make_test_service(Arc::clone(&db), snapshot, 1.10);
+        let quota = QuotaConfig::default();
+        seed_daily_tool_calls(
+            &db,
+            quota.web_search_daily_quota,
+            quota.code_interpreter_daily_quota,
+        )
+        .await;
+        svc
+    }
+
+    #[tokio::test]
+    async fn preflight_web_search_daily_quota_rejects() {
+        let svc = service_with_exhausted_tool_quotas().await;
+        let mut input = preflight_input("gpt-5");
+        input.web_search_enabled = true;
 
         let computed = svc.preflight_evaluate(input).await.unwrap();
         match computed.decision {
@@ -2348,61 +2696,9 @@ mod tests {
 
     #[tokio::test]
     async fn preflight_code_interpreter_daily_quota_rejects() {
-        let db_raw = inmem_db().await;
-        let db = mock_db_provider(db_raw);
-        // Use a snapshot whose models have code_interpreter capability enabled
-        let mut snapshot = default_snapshot();
-        for entry in &mut snapshot.model_catalog {
-            entry.general_config.tool_support.code_interpreter = true;
-        }
-        let svc = make_test_service(Arc::clone(&db), snapshot, 1.10);
-
-        // Seed daily code interpreter usage at the quota limit
-        let today = OffsetDateTime::now_utc().date();
-        let scope = AccessScope::for_tenant(Uuid::nil());
-        let repo = QuotaUsageRepo;
-        let conn = db.conn().unwrap();
-
-        // First create the row via increment_reserve, then settle with code_interpreter_calls
-        use crate::domain::repos::IncrementReserveParams;
-        repo.increment_reserve(
-            &conn,
-            &scope,
-            IncrementReserveParams {
-                tenant_id: Uuid::nil(),
-                user_id: Uuid::nil(),
-                period_type: PeriodType::Daily,
-                period_start: today,
-                bucket: "total".to_owned(),
-                amount_micro: 1000,
-            },
-        )
-        .await
-        .unwrap();
-
-        // Settle with code_interpreter_calls = daily quota (default 50)
-        use crate::domain::repos::SettleParams;
-        repo.settle(
-            &conn,
-            &scope,
-            SettleParams {
-                tenant_id: Uuid::nil(),
-                user_id: Uuid::nil(),
-                period_type: PeriodType::Daily,
-                period_start: today,
-                bucket: "total".to_owned(),
-                reserved_credits_micro: 1000,
-                actual_credits_micro: 1000,
-                input_tokens: Some(10),
-                output_tokens: Some(5),
-                web_search_calls: 0,
-                code_interpreter_calls: QuotaConfig::default().code_interpreter_daily_quota,
-            },
-        )
-        .await
-        .unwrap();
-
-        let input = preflight_input("gpt-5");
+        let svc = service_with_exhausted_tool_quotas().await;
+        let mut input = preflight_input("gpt-5");
+        input.code_interpreter_enabled = true;
 
         let computed = svc.preflight_evaluate(input).await.unwrap();
         match computed.decision {
@@ -2416,6 +2712,38 @@ mod tests {
             }
             other => panic!("expected Reject with code_interpreter scope, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn preflight_code_interpreter_quota_skipped_when_kill_switch_set() {
+        let svc = service_with_exhausted_tool_quotas_and(|snapshot| {
+            snapshot.kill_switches.disable_code_interpreter = true;
+        })
+        .await;
+        let mut input = preflight_input("gpt-5");
+        input.code_interpreter_enabled = true;
+
+        let computed = svc.preflight_evaluate(input).await.unwrap();
+        assert!(
+            !matches!(computed.decision, PreflightDecision::Reject { .. }),
+            "the kill switch leaves the tool out, so its quota must not apply, got {:?}",
+            computed.decision
+        );
+    }
+
+    #[tokio::test]
+    async fn preflight_exhausted_tool_quotas_allow_turn_without_tools() {
+        let svc = service_with_exhausted_tool_quotas().await;
+
+        let computed = svc
+            .preflight_evaluate(preflight_input("gpt-5"))
+            .await
+            .unwrap();
+        assert!(
+            !matches!(computed.decision, PreflightDecision::Reject { .. }),
+            "a turn that uses no tool must not hit tool quotas, got {:?}",
+            computed.decision
+        );
     }
 
     // ── 10: Integration tests ──
@@ -2645,5 +2973,245 @@ mod tests {
             !rows.iter().any(|r| r.bucket == "tier:premium"),
             "tier:premium should NOT have rows for standard"
         );
+    }
+
+    // ── Quota status: configured warning threshold (E2E 14-13) ──
+
+    fn make_status_service(db: Arc<DbProvider>, warning_threshold_pct: u8) -> TestQuotaService {
+        TestQuotaService::new(
+            db,
+            Arc::new(QuotaUsageRepo),
+            Arc::new(MockPolicySnapshotProvider::new(default_snapshot())),
+            Arc::new(MockUserLimitsProvider::new(default_limits())),
+            crate::config::EstimationBudgets::default(),
+            QuotaConfig {
+                warning_threshold_pct,
+                ..QuotaConfig::default()
+            },
+        )
+    }
+
+    /// Reserve `amount_micro` in the daily `total` bucket for today.
+    async fn seed_daily_total_usage(db: &DbProvider, amount_micro: i64, today: time::Date) {
+        use crate::domain::repos::IncrementReserveParams;
+        use crate::domain::repos::QuotaUsageRepository as QURepo;
+
+        let conn = db.conn().unwrap();
+        QuotaUsageRepo
+            .increment_reserve(
+                &conn,
+                &AccessScope::for_tenant(Uuid::nil()),
+                IncrementReserveParams {
+                    tenant_id: Uuid::nil(),
+                    user_id: Uuid::nil(),
+                    period_type: PeriodType::Daily,
+                    period_start: today,
+                    bucket: "total".to_owned(),
+                    amount_micro,
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    async fn daily_total_status(
+        svc: &TestQuotaService,
+    ) -> (u8, crate::domain::model::quota::PeriodResult) {
+        use crate::domain::stream_events::{QuotaPeriod, QuotaTier};
+
+        let status = svc
+            .get_quota_status(
+                &AccessScope::for_tenant(Uuid::nil()),
+                Uuid::nil(),
+                Uuid::nil(),
+            )
+            .await
+            .unwrap();
+        let period = status
+            .tiers
+            .into_iter()
+            .find(|t| t.tier == QuotaTier::Total)
+            .expect("total tier")
+            .periods
+            .into_iter()
+            .find(|p| p.period == QuotaPeriod::Daily)
+            .expect("daily period");
+        (status.warning_threshold_pct, period)
+    }
+
+    #[tokio::test]
+    async fn quota_status_warning_uses_configured_threshold() {
+        // Daily total limit is 100_000_000; threshold 60 => warning at remaining <= 40%.
+        assert_eq!(
+            default_limits().standard.limit_daily_credits_micro,
+            100_000_000
+        );
+        let today = OffsetDateTime::now_utc().date();
+
+        // 59% used => remaining 41%: below the configured boundary.
+        let db = mock_db_provider(inmem_db().await);
+        seed_daily_total_usage(&db, 59_000_000, today).await;
+        let (threshold, period) =
+            daily_total_status(&make_status_service(Arc::clone(&db), 60)).await;
+        assert_eq!(threshold, 60, "status must echo the configured threshold");
+        assert_eq!(period.remaining_percentage, 41);
+        assert!(
+            !period.warning,
+            "remaining 41% must not warn at threshold 60"
+        );
+        assert!(!period.exhausted);
+
+        // 60% used => remaining 40%: exactly at the configured boundary.
+        let db = mock_db_provider(inmem_db().await);
+        seed_daily_total_usage(&db, 60_000_000, today).await;
+        let (_, period) = daily_total_status(&make_status_service(Arc::clone(&db), 60)).await;
+        assert_eq!(period.remaining_percentage, 40);
+        assert!(period.warning, "remaining 40% must warn at threshold 60");
+        assert!(!period.exhausted);
+
+        // Same usage with the default threshold (80) must not warn: the flag
+        // is driven by config, not by a hardcoded 80.
+        let (threshold, period) = daily_total_status(&make_status_service(db, 80)).await;
+        assert_eq!(threshold, 80);
+        assert!(
+            !period.warning,
+            "remaining 40% must not warn at threshold 80"
+        );
+    }
+
+    #[tokio::test]
+    async fn quota_warnings_follow_configured_threshold() {
+        use crate::domain::stream_events::{QuotaPeriod, QuotaTier};
+
+        assert_eq!(
+            default_limits().standard.limit_daily_credits_micro,
+            100_000_000
+        );
+        let today = OffsetDateTime::now_utc().date();
+        let db = mock_db_provider(inmem_db().await);
+        seed_daily_total_usage(&db, 60_000_000, today).await;
+
+        let warnings = make_status_service(db, 60)
+            .compute_quota_warnings(
+                &AccessScope::for_tenant(Uuid::nil()),
+                Uuid::nil(),
+                Uuid::nil(),
+            )
+            .await
+            .unwrap();
+        let daily = warnings
+            .iter()
+            .find(|w| w.tier == QuotaTier::Total && w.period == QuotaPeriod::Daily)
+            .expect("daily total warning entry");
+        assert!(daily.warning);
+        assert!(daily.next_reset.is_some(), "next_reset is set when warning");
+    }
+
+    // ── Settlement uses the snapshot of policy_version_applied (E2E 14-10) ──
+
+    /// Policy provider holding one snapshot per version; records requested versions.
+    struct VersionedPolicyProvider {
+        current: u64,
+        snapshots: std::collections::HashMap<u64, PolicySnapshot>,
+        requested: std::sync::Mutex<Vec<u64>>,
+    }
+
+    #[async_trait::async_trait]
+    impl PolicySnapshotProvider for VersionedPolicyProvider {
+        async fn get_snapshot(
+            &self,
+            _user_id: Uuid,
+            policy_version: u64,
+        ) -> Result<PolicySnapshot, DomainError> {
+            self.requested.lock().unwrap().push(policy_version);
+            self.snapshots
+                .get(&policy_version)
+                .cloned()
+                .ok_or_else(|| DomainError::internal(format!("no snapshot v{policy_version}")))
+        }
+
+        async fn get_current_version(&self, _user_id: Uuid) -> Result<u64, DomainError> {
+            Ok(self.current)
+        }
+    }
+
+    #[tokio::test]
+    async fn settle_uses_snapshot_of_policy_version_applied_not_current() {
+        let mut v1_model = make_model("gpt-5", ModelTier::Premium, true, true);
+        v1_model.input_tokens_credit_multiplier_micro = 1_000_000;
+        v1_model.output_tokens_credit_multiplier_micro = 1_000_000;
+        let v1 = PolicySnapshot {
+            policy_version: 1,
+            model_catalog: vec![v1_model],
+            ..default_snapshot()
+        };
+        // v2 reprices the model and moves it to the standard tier.
+        let mut v2_model = make_model("gpt-5", ModelTier::Standard, true, true);
+        v2_model.input_tokens_credit_multiplier_micro = 3_000_000;
+        v2_model.output_tokens_credit_multiplier_micro = 3_000_000;
+        let v2 = PolicySnapshot {
+            policy_version: 2,
+            model_catalog: vec![v2_model],
+            ..default_snapshot()
+        };
+        let provider = Arc::new(VersionedPolicyProvider {
+            current: 2,
+            snapshots: [(1, v1), (2, v2)].into_iter().collect(),
+            requested: std::sync::Mutex::new(Vec::new()),
+        });
+
+        let db = mock_db_provider(inmem_db().await);
+        let svc = TestQuotaService::new(
+            Arc::clone(&db),
+            Arc::new(QuotaUsageRepo),
+            Arc::clone(&provider) as Arc<dyn PolicySnapshotProvider>,
+            Arc::new(MockUserLimitsProvider::new(default_limits())),
+            crate::config::EstimationBudgets::default(),
+            QuotaConfig::default(),
+        );
+        let today = OffsetDateTime::now_utc().date();
+        seed_reserve(&db, ModelTier::Premium, 10_000, today).await;
+
+        let conn = db.conn().unwrap();
+        let scope = AccessScope::for_tenant(Uuid::nil());
+        let input = settlement_input(
+            "gpt-5",
+            ModelTier::Premium,
+            2000,
+            10_000,
+            SettlementPath::Actual {
+                input_tokens: 800,
+                output_tokens: 200,
+            },
+            today,
+        );
+        assert_eq!(input.policy_version_applied, 1);
+
+        let outcome = svc.settle(&conn, &scope, input).await.unwrap();
+
+        assert_eq!(*provider.requested.lock().unwrap(), vec![1]);
+        // v1 multipliers (1x): 800 + 200. v2 (3x) would give 3000.
+        assert_eq!(outcome.actual_credits_micro, 1000);
+
+        // v1 tier is premium, so both buckets are settled (v2 would touch total only).
+        use crate::domain::repos::QuotaUsageRepository as QURepo;
+        let rows = QuotaUsageRepo
+            .find_bucket_rows(&conn, &scope, Uuid::nil(), Uuid::nil())
+            .await
+            .unwrap();
+        for bucket in ["total", "tier:premium"] {
+            for (period_type, period_start) in default_periods(today) {
+                let row = rows
+                    .iter()
+                    .find(|r| {
+                        r.bucket == bucket
+                            && r.period_type == period_type
+                            && r.period_start == period_start
+                    })
+                    .unwrap_or_else(|| panic!("missing {bucket} row"));
+                assert_eq!(row.spent_credits_micro, 1000, "{bucket} spent");
+                assert_eq!(row.reserved_credits_micro, 0, "{bucket} reserve released");
+            }
+        }
     }
 }

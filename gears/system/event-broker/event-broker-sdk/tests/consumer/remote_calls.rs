@@ -1,15 +1,16 @@
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use event_broker_sdk::gts_id;
 use event_broker_sdk::{
     ConsumerBuilder, ConsumerError, ConsumerGroupRef, Fallback, HandlerOutcome,
     InMemoryOffsetManager, RawEvent, SingleEventHandler,
 };
 
-use super::common::{publish_json, topic_fixture, wait_until};
+use super::common::{publish_json, topic, topic_fixture, wait_until};
 
-const TOPIC: &str = "gts.cf.core.events.topic.v1~example.mock.showcase.remote.v1";
-const EVENT_TYPE: &str = "gts.cf.core.events.event.v1~example.mock.showcase.remote.v1~";
+const TOPIC: &str = gts_id!("cf.core.events.topic.v1~example.mock.showcase.remote.v1");
+const EVENT_TYPE: &str = gts_id!("cf.core.events.event.v1~example.mock.showcase.remote.v1~");
 
 type RemoteCall = (String, &'static str);
 type RecordedRemoteCalls = Arc<Mutex<Vec<RemoteCall>>>;
@@ -51,7 +52,7 @@ async fn if_i_need_remote_calls_the_handler_owns_its_client_and_auth() {
 
     let handle = ConsumerBuilder::new(fixture.broker.clone())
         .group(ConsumerGroupRef::auto_anonymous("showcase-remote-calls"))
-        .topics([TOPIC])
+        .topics([topic(TOPIC)])
         .offset_manager(InMemoryOffsetManager::new(Fallback::Earliest))
         .handler(ForwardingHandler { remote })
         .start()

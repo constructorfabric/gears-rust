@@ -215,7 +215,7 @@ charge-coverage reconciliation is the backstop.
 
 ### 3.7 Database Schemas and Tables
 
-- [ ] `p2` - **ID**: `cpt-cf-bss-subscriptions-storage-plan-change-chg`
+- [ ] `p2` - **ID**: `cpt-cf-bss-subscriptions-datastore-plan-change-chg`
 
 No new owned store beyond the Foundation's `scheduled_intent` (ramps + deferred changes) and the
 slice-02 interval tables — the committed quantity history lives in slice 02's `quantity_interval`

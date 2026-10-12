@@ -1,19 +1,18 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::extract::Path;
 use axum::response::sse::KeepAlive;
 use axum::response::{IntoResponse, Response, Sse};
 use axum::{Extension, Json};
-use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use toolkit::api::canonical_prelude::*;
+use toolkit::api::rest::extract::Path;
 use toolkit_security::SecurityContext;
 use tracing::{Instrument, info, warn};
-use utoipa::ToSchema;
 
-use super::messages::SseRelay;
+use super::messages::{SseRelay, run_to_completion};
+use crate::api::rest::dto::{EditTurnRequest, TurnStatusResponse, TurnStatusState};
 use crate::api::rest::error::MiniChatChatError;
 use crate::domain::stream_events::StreamEvent;
 use crate::gear::AppServices;
@@ -23,24 +22,12 @@ use crate::infra::db::entity::chat_turn::TurnState;
 // GET turn status
 // ════════════════════════════════════════════════════════════════════════════
 
-#[derive(Debug, Serialize, ToSchema)]
-pub(crate) struct TurnStatusResponse {
-    request_id: uuid::Uuid,
-    state: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    error_code: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    assistant_message_id: Option<uuid::Uuid>,
-    #[serde(with = "time::serde::rfc3339")]
-    updated_at: time::OffsetDateTime,
-}
-
-fn map_turn_state(state: &TurnState) -> &'static str {
+fn map_turn_state(state: &TurnState) -> TurnStatusState {
     match state {
-        TurnState::Running => "running",
-        TurnState::Completed => "done",
-        TurnState::Failed => "error",
-        TurnState::Cancelled => "cancelled",
+        TurnState::Running => TurnStatusState::Running,
+        TurnState::Completed => TurnStatusState::Done,
+        TurnState::Failed => TurnStatusState::Error,
+        TurnState::Cancelled => TurnStatusState::Cancelled,
     }
 }
 
@@ -59,7 +46,7 @@ pub(crate) async fn get_turn(
 
     Ok(Json(TurnStatusResponse {
         request_id: turn.request_id,
-        state: map_turn_state(&turn.state).to_owned(),
+        state: map_turn_state(&turn.state),
         error_code: turn.error_code.clone(),
         assistant_message_id: turn.assistant_message_id,
         updated_at: turn.updated_at,
@@ -96,24 +83,15 @@ pub(crate) async fn retry_turn(
     Extension(svc): Extension<Arc<AppServices>>,
     Path((chat_id, request_id)): Path<(uuid::Uuid, uuid::Uuid)>,
 ) -> Response {
-    let mutation = match svc.turns.retry(&ctx, chat_id, request_id).await {
-        Ok(m) => m,
-        Err(e) => return CanonicalError::from(e).into_response(),
-    };
-
-    start_mutation_stream(&svc, ctx, chat_id, mutation).await
+    run_to_completion(
+        async move { start_mutation_stream(&svc, ctx, chat_id, request_id, None).await },
+    )
+    .await
 }
 
 // ════════════════════════════════════════════════════════════════════════════
 // PATCH edit turn
 // ════════════════════════════════════════════════════════════════════════════
-
-#[derive(Debug, Deserialize, ToSchema)]
-pub struct EditTurnRequest {
-    pub content: String,
-}
-
-impl toolkit::api::api_dto::RequestApiDto for EditTurnRequest {}
 
 /// PATCH /mini-chat/v1/chats/{id}/turns/{request_id}
 #[tracing::instrument(skip(svc, ctx, body), fields(chat_id = %chat_id, turn_request_id = %request_id))]
@@ -121,7 +99,7 @@ pub(crate) async fn edit_turn(
     Extension(ctx): Extension<SecurityContext>,
     Extension(svc): Extension<Arc<AppServices>>,
     Path((chat_id, request_id)): Path<(uuid::Uuid, uuid::Uuid)>,
-    Json(body): Json<EditTurnRequest>,
+    extract::Json(body): extract::Json<EditTurnRequest>,
 ) -> Response {
     if body.content.trim().is_empty() {
         return MiniChatChatError::invalid_argument()
@@ -130,40 +108,82 @@ pub(crate) async fn edit_turn(
             .into_response();
     }
 
-    let mutation = match svc
-        .turns
-        .edit(&ctx, chat_id, request_id, body.content)
-        .await
-    {
-        Ok(m) => m,
-        Err(e) => return CanonicalError::from(e).into_response(),
-    };
-
-    start_mutation_stream(&svc, ctx, chat_id, mutation).await
+    run_to_completion(async move {
+        start_mutation_stream(&svc, ctx, chat_id, request_id, Some(body.content)).await
+    })
+    .await
 }
 
 // ════════════════════════════════════════════════════════════════════════════
 // Shared helpers
 // ════════════════════════════════════════════════════════════════════════════
 
+/// Retry (`new_content = None`) or edit a turn and stream the new answer.
+///
+/// Order matters: the quota preflight runs before the mutation commits, so a
+/// rejection returns a JSON error and leaves the previous turn untouched.
 #[allow(clippy::cognitive_complexity)]
 async fn start_mutation_stream(
     svc: &AppServices,
     ctx: SecurityContext,
     chat_id: uuid::Uuid,
-    mutation: crate::domain::service::MutationResult,
+    request_id: uuid::Uuid,
+    new_content: Option<String>,
 ) -> Response {
-    let chat_model = mutation.chat_model.clone();
+    let preview = match svc
+        .turns
+        .preview_mutation(&ctx, chat_id, request_id, new_content.as_deref())
+        .await
+    {
+        Ok(p) => p,
+        Err(e) => return CanonicalError::from(e).into_response(),
+    };
+
     let resolved = match svc
         .models
-        .resolve_model(ctx.subject_id(), Some(mutation.chat_model))
+        .resolve_chat_model(ctx.subject_id(), &preview.chat_model)
         .await
     {
         Ok(r) => r,
         Err(e) => {
-            warn!(error = %e, model = %chat_model, "model resolution failed for mutation stream");
+            warn!(error = %e, model = %preview.chat_model, "model resolution failed for mutation stream");
             return CanonicalError::from(e).into_response();
         }
+    };
+
+    let preflight = match svc
+        .stream
+        .preflight_mutation(
+            &ctx,
+            chat_id,
+            preview.source_message_id,
+            &preview.user_content,
+            &resolved,
+            preview.web_search_enabled,
+        )
+        .await
+    {
+        Ok(p) => p,
+        Err(e) => return CanonicalError::from(e).into_response(),
+    };
+
+    // The preview already authorized this retry/edit; reuse its scope.
+    let chat_scope = preview.chat_scope;
+    let mutation = match new_content {
+        Some(content) => {
+            svc.turns
+                .edit_in_scope(&ctx, chat_scope, chat_id, request_id, content)
+                .await
+        }
+        None => {
+            svc.turns
+                .retry_in_scope(&ctx, chat_scope, chat_id, request_id)
+                .await
+        }
+    };
+    let mutation = match mutation {
+        Ok(m) => m,
+        Err(e) => return CanonicalError::from(e).into_response(),
     };
 
     let capacity = svc.stream.channel_capacity();
@@ -189,6 +209,7 @@ async fn start_mutation_stream(
             resolved,
             mutation.web_search_enabled,
             mutation.snapshot_boundary,
+            preflight,
             cancel.clone(),
             tx,
         )
@@ -212,4 +233,25 @@ async fn start_mutation_stream(
     Sse::new(relay)
         .keep_alive(KeepAlive::new().interval(Duration::from_secs(30)))
         .into_response()
+}
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod tests {
+    use super::*;
+
+    /// The turn status endpoint reports `done` / `error` for the stored
+    /// `completed` / `failed` states.
+    #[test]
+    fn turn_state_maps_to_status_state() {
+        for (state, expected) in [
+            (TurnState::Running, "running"),
+            (TurnState::Completed, "done"),
+            (TurnState::Failed, "error"),
+            (TurnState::Cancelled, "cancelled"),
+        ] {
+            let value = serde_json::to_value(map_turn_state(&state)).unwrap();
+            assert_eq!(value, expected);
+        }
+    }
 }

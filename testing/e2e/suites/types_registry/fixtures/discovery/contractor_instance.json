@@ -1,0 +1,9 @@
+{
+  "gts_id": "gts.cf.e2e.discovery.person.v1~cf.e2e.discovery.contractor.v1~cf.e2e.discovery.eve.v1",
+  "content": {
+    "name": "Eve",
+    "payload": {
+      "agency": "Partner"
+    }
+  }
+}

@@ -1,4 +1,11 @@
 Created:  2026-07-17 by Virtuozzo International GmbH
+
+> Decimal quote cutover: the V2 provider returns `ProviderRate.rate: Decimal` in
+> quote major units per base major unit. `parse_rate` preserves every original
+> digit and enforces the shared SDK bounded decimal contract (positive, scale
+> 0–28, normalized coefficient at most 28 digits, input at most 64 bytes).
+> HTTP JSON numeric tokens are read as their exact source text (a `RawValue`
+> tree, not `f64`); no quote scaling or rounding occurs anywhere in this gear.
 Updated:  2026-07-17 by Virtuozzo International GmbH
 
 <!-- CONFLUENCE_TITLE: [BSS]: FX Rate Provider (Adapter Gear) — Product Requirements -->
@@ -168,8 +175,8 @@ Runtime, OS, and lifecycle policy follow the repository-level platform defaults
 - Ordered cross-source fallback at fetch time with true-source provenance.
 - Implementing the ledger's `RateProviderV1` contract (fetch, health, provider identity).
 - Config-driven source assembly, including no-code onboarding of plain REST JSON feeds.
-- Deterministic conversion of published decimal rates into the contract's fixed-precision
-  integer representation.
+- Exact parsing of published decimal rates into the contract's `Decimal` form, with no
+  scaling or rounding.
 
 ### 4.2 Out of Scope
 
@@ -366,25 +373,26 @@ DESIGN O-13).
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-rate-provider-nfr-deterministic-conversion`
 
-Converting a published decimal rate into the contract's fixed-precision integer form
-**MUST** be deterministic: the same published value always yields the same integer, using
-exact-decimal arithmetic with banker's rounding (half-to-even) and explicit overflow
-errors. A converted rate **MUST** be strictly positive.
+Parsing a published decimal rate into the contract's `Decimal` form **MUST** be
+deterministic and exact: the same published value always yields the same `Decimal`, every
+published digit is kept, and nothing is scaled or rounded. Non-numeric values, values
+outside the ledger SDK bounds (28 significant digits, scale 0–28, 64-byte input) and
+non-positive values error explicitly. A parsed rate **MUST** be strictly positive.
 
-- **Threshold**: Golden-vector equality on repeated conversion, including exact half-way
-  decimals; overflow / non-numeric input always errors, never truncates; a value that
-  rounds to zero or below always errors, never reaches a rate store.
-- **Rationale**: Inherits the ledger's platform rounding default
-  (`cpt-cf-bss-ledger-fr-money-rounding-scale`), so a converted rate and the amount posted
-  from it round identically; auditors must be able to reproduce rates.
+- **Threshold**: Golden-vector equality on repeated parsing; a non-numeric or
+  out-of-bound input always errors, never truncates; a zero or negative value always
+  errors, never reaches a rate store.
+- **Rationale**: The ledger (`cpt-cf-bss-ledger-fr-money-rounding-scale`) rounds once,
+  HALF_EVEN at the target currency scale, when it translates an amount; a rate rounded
+  here would be rounded twice. Auditors must be able to reproduce rates from the
+  published document.
 
-**Rounding is not this gear's decision to make.** Half-to-even is the platform default
-fixed by the ledger (`cpt-cf-bss-ledger-fr-money-rounding-scale`, `p1`), which requires it
-identically across S1–S6 and exports. This adapter inherits it so converted rates match
-posted amounts; deviating would break that requirement, not merely differ from it.
-Finance / audit sign-off is therefore **not a release gate for this gear** — it is tracked
-against the ledger's platform decision. The only event that would revise the strategy here
-is a change to that ledger requirement, which this adapter would then follow.
+**Rounding is not this gear's decision to make.** The ledger owns the only rounding step
+(`cpt-cf-bss-ledger-fr-money-rounding-scale`, `p1`): FX translation of the exact product
+`amount × rate`, rounded once at the target scale. This adapter keeps to that split by
+never rounding. Finance / audit sign-off is therefore **not a release gate for this gear**
+— it is tracked against the ledger's decision. The only event that would revise the
+strategy here is a change to that ledger requirement, which this adapter would then follow.
   The positivity rule is a product decision confirmed with the BSS billing owner
   (2026-07-28): there are no zero or negative FX rates in this domain, so such a value can
   only be corrupt feed data — and it would zero out or flip the sign of every translation
@@ -516,7 +524,8 @@ ledger sync tick.
   this gear.
 - [ ] After a primary-source outage with a healthy fallback, synced rows record the
   fallback provider's identity.
-- [ ] Re-fetching an identical published document yields byte-identical integer rates.
+- [ ] Re-fetching an identical published document yields identical `Decimal` rates and
+      identical canonical text.
 - [ ] A new plain REST feed is onboarded by configuration alone: an http-json plugin block
   with a `base_url`, `mapping`, a `priority`, and a `vendor` equal to the core gear's
   `source_vendor` (without that match, discovery never selects the plugin) puts the feed

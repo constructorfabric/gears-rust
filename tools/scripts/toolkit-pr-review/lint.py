@@ -28,7 +28,6 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[3]
 RULES_DIR = ROOT / "docs/toolkit-pr-review/rules"
 AGENT_DIR = ROOT / "docs/toolkit-pr-review/agents"
-RENDERED_DIR = ROOT / "docs/toolkit-pr-review/agent-rules"
 SUBJECT_AGENT = AGENT_DIR / "subject.md"
 STUB_DIR = ROOT / ".claude/agents"
 ARCH_AGENT = AGENT_DIR / "architecture.md"
@@ -233,6 +232,31 @@ def check_versions() -> None:
              f"{'.'.join(map(str, pin))} and cannot fire today")
 
 
+def check_conventions_versions() -> None:
+    """The toolchain and MSRV quoted in review-conventions.md must match the repo.
+
+    Agents read those two numbers to decide whether a `Requires Rust` criterion is live,
+    so a stale copy silently turns gated criteria on or off after a toolchain bump.
+    """
+    if not CONVENTIONS.exists():
+        return
+    text = CONVENTIONS.read_text(encoding="utf-8")
+    sources = (
+        ("rust-toolchain.toml", TOOLCHAIN, r'channel\s*=\s*"([0-9.]+)"',
+         r"`rust-toolchain\.toml` \(currently `([0-9.]+)`\)"),
+        ("Cargo.toml rust-version", CARGO, r'rust-version\s*=\s*"([0-9.]+)"',
+         r"`rust-version`\s+\(currently `([0-9.]+)`\)"),
+    )
+    for label, path, src_re, doc_re in sources:
+        src = re.search(src_re, path.read_text(encoding="utf-8")) if path.exists() else None
+        doc = re.search(doc_re, text)
+        if not src or not doc:
+            fail("versions", f"could not read {label} from {path.name} or review-conventions.md")
+        elif src.group(1) != doc.group(1):
+            fail("versions", f"review-conventions.md says {label} is {doc.group(1)}, "
+                             f"the repo pins {src.group(1)}")
+
+
 def check_agents_and_modules(rules: dict[str, dict]) -> None:
     """The two agent prompts carry the contract and the walk; the modules carry scope."""
     for path in (SUBJECT_AGENT, ARCH_AGENT):
@@ -263,11 +287,8 @@ def check_agents_and_modules(rules: dict[str, dict]) -> None:
         if not stub.exists():
             fail("modules", f"no agent stub {stub.relative_to(ROOT)} claims rules/{mod.name}, "
                             f"so the rules in it can never fire")
-        elif f"docs/toolkit-pr-review/agent-rules/{mod.name}" not in stub.read_text(encoding="utf-8"):
-            fail("modules", f"{stub.relative_to(ROOT)} does not name agent-rules/{mod.name}")
-        rendered = RENDERED_DIR / mod.name
-        if not rendered.exists():
-            fail("modules", f"agent-rules/{mod.name} is missing; run `review.py render-rules`")
+        elif f"docs/toolkit-pr-review/rules/{mod.name}" not in stub.read_text(encoding="utf-8"):
+            fail("modules", f"{stub.relative_to(ROOT)} does not name rules/{mod.name}")
 
     for mod in sorted(RULES_DIR.glob("*.md")):
         text = mod.read_text(encoding="utf-8")
@@ -396,6 +417,7 @@ REDRIFT = {
     "deletion_anchors": "prepare emits ranges.left instead; anchor removed code with side=LEFT",
     "changed_ranges": "prepare emits files[path].ranges.right",
     "__service.rs": "snapshot paths mirror the repo tree; `/`->`__` escaping is not injective",
+    "deleted_files": "context.json has no such field; a deleted file has files[path].status == \"deleted\"",
 }
 
 
@@ -419,7 +441,7 @@ def check_harnesses_call_prepare() -> None:
     # The agent prompts and rule modules name context.json fields too, and an agent told to
     # read a field prepare does not emit simply finds nothing and reports nothing.
     docs = [SKILL, DEVIN, SUBJECT_AGENT, ARCH_AGENT]
-    docs += sorted(RULES_DIR.glob("*.md")) + sorted(RENDERED_DIR.glob("*.md"))
+    docs += sorted(RULES_DIR.glob("*.md"))
     for f in docs:
         if not f.exists():
             continue
@@ -480,6 +502,7 @@ def main() -> int:
     check_routing(rules)
     check_enforcement(rules)
     check_versions()
+    check_conventions_versions()
     check_agents_and_modules(rules)
     check_criteria(rules)
     check_harnesses_call_prepare()

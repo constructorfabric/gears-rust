@@ -5,6 +5,7 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use std::sync::Arc;
+use types_registry::domain::ports::ListFilter;
 
 use serde_json::{Value, json};
 use time::OffsetDateTime;
@@ -15,16 +16,23 @@ use uuid::Uuid;
 
 use types_registry::config::TypesRegistryConfig;
 use types_registry::domain::admission::AdmissionFailureReason;
-use types_registry::domain::admission::acceptance::{AcceptanceContext, AcceptanceError, accept};
+use types_registry::domain::admission::acceptance::{
+    AcceptanceContext, AcceptanceError, accept_deletion,
+};
 use types_registry::domain::admission::worker::{
     ItemOutcome, OperationOutcome, Tuning, WorkerError, run_operation,
 };
-use types_registry::domain::admission::{Candidate, OperationDispatch, SubmitRequest};
-use types_registry::domain::enums as domain_enums;
+use types_registry::domain::admission::{
+    Candidate, DeleteRequest, DeleteTarget, OperationDispatch, SubmitRequest,
+};
 use types_registry::domain::enums::{LifecycleStatus, OperationItemStatus, OperationKind};
+use types_registry::domain::key::EntityKey;
 use types_registry::domain::policy::RegistrationPolicy;
 use types_registry::domain::ports::EntityRow;
-use types_registry::infra::storage::repo::{CoordinationStateRepo, EntityRepo, PageRequest};
+use types_registry::domain::ports::OperationItemRow;
+use types_registry::infra::storage::repo::{
+    CoordinationStateRepo, EntityRepo, OperationRepo, PageRequest,
+};
 
 mod common;
 use common::{allow_all, stores, test_db};
@@ -44,8 +52,12 @@ struct NoDispatch;
 
 #[async_trait::async_trait]
 impl OperationDispatch for NoDispatch {
-    async fn enqueue(&self, _tx: &DbTx<'_>, _operation_id: Uuid) -> anyhow::Result<()> {
-        Ok(())
+    async fn enqueue(
+        &self,
+        _tx: &DbTx<'_>,
+        _operation_id: Uuid,
+    ) -> Result<toolkit_db::outbox::Wake, types_registry::domain::admission::OutboxError> {
+        Ok(toolkit_db::outbox::Wake::empty())
     }
 }
 
@@ -91,7 +103,8 @@ async fn submit(
     let policy = RegistrationPolicy::default();
     let config = TypesRegistryConfig::default();
     let dispatch: Arc<dyn OperationDispatch> = Arc::new(NoDispatch);
-    accept(
+    common::accept_as(
+        kind,
         &stores(),
         &provider,
         &allow_all(),
@@ -101,9 +114,8 @@ async fn submit(
             metrics: &common::metrics(),
         },
         &dispatch,
-        &SubmitRequest {
-            idempotency_key: key.to_owned(),
-            kind,
+        SubmitRequest {
+            idempotency_key: Some(key.to_owned()),
             dry_run: false,
             candidates,
         },
@@ -180,16 +192,29 @@ async fn entity_of(db: &Provider, gts_id: &str) -> Option<EntityRow> {
         .expect("read")
 }
 
+async fn items_of(db: &Provider, operation_id: Uuid) -> Vec<OperationItemRow> {
+    let provider = worker(db);
+    let conn = provider.conn().expect("conn");
+    OperationRepo::find_items(&conn, &allow_all(), operation_id)
+        .await
+        .expect("read the operation items")
+}
+
 async fn listed_ids(db: &Provider) -> Vec<String> {
     let provider = worker(db);
     let conn = provider.conn().expect("conn");
-    EntityRepo::list_page(&conn, &allow_all(), None, PageRequest::first(100))
-        .await
-        .expect("list")
-        .items
-        .into_iter()
-        .map(|row| row.gts_id)
-        .collect()
+    EntityRepo::list_page(
+        &conn,
+        &allow_all(),
+        &ListFilter::default(),
+        PageRequest::first(100),
+    )
+    .await
+    .expect("list")
+    .items
+    .into_iter()
+    .map(|row| row.gts_id)
+    .collect()
 }
 
 async fn entity_write_sequence(db: &Provider) -> i64 {
@@ -203,7 +228,7 @@ fn item<'a>(outcome: &'a OperationOutcome, gts_id: &str) -> &'a ItemOutcome {
     outcome
         .items
         .iter()
-        .find(|item| item.gts_id == gts_id)
+        .find(|item| item.key.gts_id() == Some(gts_id))
         .unwrap_or_else(|| panic!("the operation owes {gts_id} an outcome"))
 }
 
@@ -450,15 +475,12 @@ async fn the_same_key_for_a_dry_run_and_a_commit_is_a_conflict_not_a_replay() {
     let policy = RegistrationPolicy::default();
     let config = TypesRegistryConfig::default();
     let dispatch: Arc<dyn OperationDispatch> = Arc::new(NoDispatch);
-    let request = |dry_run: bool| SubmitRequest {
-        idempotency_key: "one-key".to_owned(),
-        kind: domain_enums::OperationKind::Deletion,
+    let request = |dry_run: bool| DeleteRequest {
+        idempotency_key: Some("one-key".to_owned()),
         dry_run,
-        candidates: vec![Candidate {
-            gts_id: TARGET.to_owned(),
-            content: None,
+        targets: vec![DeleteTarget {
+            key: EntityKey::parse(TARGET),
             expected_resource_version: Some(1),
-            force: false,
         }],
     };
     let context = AcceptanceContext {
@@ -467,7 +489,7 @@ async fn the_same_key_for_a_dry_run_and_a_commit_is_a_conflict_not_a_replay() {
         metrics: &common::metrics(),
     };
 
-    accept(
+    accept_deletion(
         &stores(),
         &provider,
         &allow_all(),
@@ -479,7 +501,7 @@ async fn the_same_key_for_a_dry_run_and_a_commit_is_a_conflict_not_a_replay() {
     .await
     .expect("the dry run is accepted");
 
-    let conflict = accept(
+    let conflict = accept_deletion(
         &stores(),
         &provider,
         &allow_all(),
@@ -523,7 +545,7 @@ fn all_succeeded(outcome: &OperationOutcome) {
             item.status,
             OperationItemStatus::Succeeded,
             "{} must be deleted: {:?}",
-            item.gts_id,
+            item.key,
             item.failure,
         );
     }
@@ -605,7 +627,7 @@ async fn a_deletion_batch_reports_its_outcomes_in_submission_order() {
 
     let outcome = delete_batch(&db, "del", &[(TARGET, 1), (HOLDER, 1)]).await;
 
-    let reported: Vec<&str> = outcome.items.iter().map(|i| i.gts_id.as_str()).collect();
+    let reported: Vec<String> = outcome.items.iter().map(|i| i.key.to_string()).collect();
     assert_eq!(reported, vec![TARGET, HOLDER]);
 }
 
@@ -681,6 +703,117 @@ async fn a_deletion_whose_write_matches_no_row_is_refused_not_reported_as_done()
         entity_of(&db, TARGET).await.expect("row").lifecycle_status,
         LifecycleStatus::Active,
         "nothing was written",
+    );
+}
+
+#[tokio::test]
+async fn deletion_rolls_back_when_its_item_outcome_cannot_be_written() {
+    let db = test_db().await;
+    register(&db, "reg", TARGET, schema(TARGET)).await;
+
+    let op = submit(
+        &db,
+        "del-atomic",
+        OperationKind::Deletion,
+        vec![Candidate {
+            gts_id: TARGET.to_owned(),
+            content: None,
+            expected_resource_version: Some(1),
+            force: false,
+        }],
+    )
+    .await
+    .expect("accepted");
+    let hooked: Arc<dyn types_registry::domain::ports::Stores> =
+        common::TestStores::failing_item_success();
+
+    let result = run_operation(
+        &hooked,
+        &worker(&db),
+        &allow_all(),
+        Tuning {
+            limits: &common::limits(),
+            worker: &common::worker_settings(),
+            metrics: &common::metrics(),
+            allow_compatibility_force: false,
+        },
+        op,
+        LATER,
+    )
+    .await;
+    assert!(
+        matches!(result, Err(WorkerError::Storage(_))),
+        "the injected item write must surface as the storage failure it is: {result:?}",
+    );
+    assert_eq!(
+        entity_of(&db, TARGET).await.expect("row").lifecycle_status,
+        LifecycleStatus::Active,
+        "the entity mutation must roll back with the item outcome",
+    );
+    let items = items_of(&db, op).await;
+    assert_eq!(items.len(), 1);
+    assert_eq!(
+        items[0].status,
+        OperationItemStatus::Pending,
+        "a rolled-back commit must leave the item for the next delivery",
+    );
+}
+
+#[tokio::test]
+async fn deletion_rolls_back_tombstone_when_item_cas_loses() {
+    let db = test_db().await;
+    register(&db, "reg", TARGET, schema(TARGET)).await;
+
+    let op = submit(
+        &db,
+        "del-cas-miss",
+        OperationKind::Deletion,
+        vec![Candidate {
+            gts_id: TARGET.to_owned(),
+            content: None,
+            expected_resource_version: Some(1),
+            force: false,
+        }],
+    )
+    .await
+    .expect("accepted");
+
+    let pending_items = items_of(&db, op).await;
+    assert_eq!(pending_items[0].status, OperationItemStatus::Pending);
+    let item_id = pending_items[0].id;
+
+    let prior_payload = r#"{"reason":"prior_pass_terminated"}"#.to_owned();
+    let conn = db.conn().expect("conn");
+    OperationRepo::mark_item_failed(&conn, &allow_all(), item_id, prior_payload.clone(), NOW)
+        .await
+        .expect("terminalize item as Failed before this pass runs");
+
+    let hooked: Arc<dyn types_registry::domain::ports::Stores> =
+        common::TestStores::with_stale_snapshot(pending_items);
+
+    let outcome = run_with(&db, &hooked, op).await;
+
+    assert_eq!(
+        entity_of(&db, TARGET).await.expect("row").lifecycle_status,
+        LifecycleStatus::Active,
+        "tombstone must roll back when the item CAS loses (pre-fix: entity would be Tombstoned)",
+    );
+    let items = items_of(&db, op).await;
+    assert_eq!(items.len(), 1);
+    assert_eq!(
+        items[0].status,
+        OperationItemStatus::Failed,
+        "the prior pass's Failed outcome must be preserved verbatim",
+    );
+    assert_eq!(
+        items[0].error_payload.as_deref(),
+        Some(prior_payload.as_str()),
+        "the stored payload must be the prior pass's reason, not a new one from this pass",
+    );
+    assert_eq!(
+        outcome.items[0].status,
+        OperationItemStatus::Failed,
+        "run_operation must surface the stored Failed outcome, not a fresh write",
     );
 }
 
@@ -760,4 +893,87 @@ async fn a_dry_run_over_a_stored_deletion_item_with_no_version_is_refused_too() 
         LifecycleStatus::Active,
         "and a dry run writes nothing either way",
     );
+}
+
+/// A tombstone stays readable but is no target: each new edge kind to it is
+/// refused, naming the tombstone, while an unrelated candidate commits.
+#[tokio::test]
+async fn a_tombstone_cannot_become_a_new_dependency() {
+    const INSTANCE: &str = gts_id!("cf.core.del.target.v1~cf.core.del.alice.v1");
+    const BY_ID: &str = gts_id!("cf.core.del.target.v1~cf.core.del.byid.v1~");
+    const WITH_REF: &str = gts_id!("cf.core.del.target.v1~cf.core.del.withref.v1~");
+    let db = test_db().await;
+    register(&db, "reg", TARGET, schema(TARGET)).await;
+    assert_eq!(
+        delete(&db, "del", TARGET, 1).await.status,
+        OperationItemStatus::Succeeded
+    );
+
+    let mut with_ref = schema(WITH_REF);
+    with_ref["allOf"] = json!([{ "$ref": format!("gts://{TARGET}") }]);
+    let candidates = vec![
+        Candidate {
+            gts_id: INSTANCE.to_owned(),
+            content: Some(json!({ "name": "Alice" })),
+            expected_resource_version: None,
+            force: false,
+        },
+        Candidate {
+            gts_id: BY_ID.to_owned(),
+            content: Some(schema(BY_ID)),
+            expected_resource_version: None,
+            force: false,
+        },
+        Candidate {
+            gts_id: WITH_REF.to_owned(),
+            content: Some(with_ref),
+            expected_resource_version: None,
+            force: false,
+        },
+        Candidate {
+            gts_id: HOLDER.to_owned(),
+            content: Some(referencing(HOLDER, TARGET)),
+            expected_resource_version: None,
+            force: false,
+        },
+        Candidate {
+            gts_id: OTHER.to_owned(),
+            content: Some(schema(OTHER)),
+            expected_resource_version: None,
+            force: false,
+        },
+    ];
+    let op = submit(&db, "new-edges", OperationKind::Registration, candidates)
+        .await
+        .expect("accepted");
+    let outcome = run(&db, op).await;
+
+    for (item, (gts_id, kind)) in outcome.items[..4].iter().zip([
+        (INSTANCE, "conforming_type"),
+        (BY_ID, "base"),
+        // The base role wins over the `$ref` spelling of the same edge.
+        (WITH_REF, "base"),
+        (HOLDER, "ref"),
+    ]) {
+        assert_eq!(item.key.gts_id(), Some(gts_id));
+        let failure = item.failure.as_ref().expect("refused");
+        assert_eq!(
+            failure.reason,
+            AdmissionFailureReason::DependencyDeleted,
+            "{gts_id}"
+        );
+        let dependency = failure.dependency.as_ref().expect("names the tombstone");
+        assert_eq!(dependency.target, TARGET, "{gts_id}");
+        assert_eq!(dependency.kind, kind, "{gts_id}");
+    }
+    assert_eq!(outcome.items[4].status, OperationItemStatus::Succeeded);
+    for gts_id in [INSTANCE, BY_ID, WITH_REF, HOLDER] {
+        assert!(
+            entity_of(&db, gts_id).await.is_none(),
+            "{gts_id} stays absent"
+        );
+    }
+    let tombstone = entity_of(&db, TARGET).await.expect("still readable");
+    assert_eq!(tombstone.lifecycle_status, LifecycleStatus::Deleted);
+    assert_eq!(tombstone.resource_version, 2);
 }

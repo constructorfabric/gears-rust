@@ -19,7 +19,7 @@ Large features start from specifications that live **alongside the code** in the
 - **FEATURE** — feature specs: flows, algorithms, states, definition of done.
 - **UPSTREAM_REQS** — technical requirements flowing from other gears into this one.
 
-The specs are not ceremony; they guide implementation, review, and long-term maintenance, and they keep documentation, code, and intent aligned. See the [spec templates](https://github.com/constructorfabric/gears-rust/blob/main/docs/spec-templates/README.md) in the framework repository.
+The specs are not ceremony; they guide implementation, review, and long-term maintenance, and they keep documentation, code, and intent aligned. See the [spec templates](https://github.com/constructorfabric/gears-rust/blob/main/studio-kit-gears/artifacts/README.md) in the framework repository.
 
 ## Why this is AI-native
 

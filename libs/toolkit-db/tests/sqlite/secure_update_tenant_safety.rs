@@ -295,3 +295,80 @@ async fn update_many_rejects_setting_tenant_id() {
 
     assert!(matches!(err, ScopeError::Denied("tenant_id is immutable")));
 }
+
+/// `exec_with_returning` returns only the rows the scoped update wrote, and a deny-all scope writes none.
+#[tokio::test]
+async fn update_many_with_returning_answers_the_rows_it_wrote_within_its_scope() {
+    use sea_orm::ExprTrait;
+    use sea_orm::sea_query::Expr;
+
+    let test_db = TestDb::new().await;
+    let conn = test_db.conn();
+    let tenant_a = Uuid::new_v4();
+    let tenant_b = Uuid::new_v4();
+    let scope_a = AccessScope::for_tenant(tenant_a);
+    let scope_b = AccessScope::for_tenant(tenant_b);
+
+    let mut ids = Vec::new();
+    for (tenant, scope) in [
+        (tenant_a, &scope_a),
+        (tenant_a, &scope_a),
+        (tenant_b, &scope_b),
+    ] {
+        let id = Uuid::new_v4();
+        secure_insert::<tenant_ent::Entity>(
+            tenant_ent::ActiveModel {
+                id: Set(id),
+                tenant_id: Set(tenant),
+                name: Set("before".to_owned()),
+            },
+            scope,
+            &conn,
+        )
+        .await
+        .expect("insert");
+        ids.push(id);
+    }
+
+    let mut written = tenant_ent::Entity::update_many()
+        .secure()
+        .scope_with(&scope_a)
+        .col_expr(tenant_ent::Column::Name, Expr::value("after"))
+        .filter(sea_orm::Condition::all().add(Expr::col(tenant_ent::Column::Name).eq("before")))
+        .exec_with_returning(&conn)
+        .await
+        .expect("update");
+    written.sort_by_key(|m| m.id);
+    let mut expected = [ids[0], ids[1]];
+    expected.sort();
+    assert_eq!(
+        written
+            .iter()
+            .map(|m| (m.id, m.name.as_str()))
+            .collect::<Vec<_>>(),
+        expected.iter().map(|id| (*id, "after")).collect::<Vec<_>>(),
+        "the scope's two rows, as written"
+    );
+    let untouched = tenant_ent::Entity::update_many()
+        .secure()
+        .scope_with(&scope_b)
+        .col_expr(tenant_ent::Column::Name, Expr::value("before"))
+        .filter(sea_orm::Condition::all().add(Expr::col(tenant_ent::Column::Name).eq("before")))
+        .exec_with_returning(&conn)
+        .await
+        .expect("no-op update");
+    assert_eq!(
+        untouched.len(),
+        1,
+        "tenant B's row was not written by tenant A's update"
+    );
+
+    let err = tenant_ent::Entity::update_many()
+        .secure()
+        .scope_with(&scope_a)
+        .col_expr(tenant_ent::Column::TenantId, Expr::value(tenant_b))
+        .exec_with_returning(&conn)
+        .await
+        .expect_err("must reject tenant_id update");
+    assert!(matches!(err, ScopeError::Denied("tenant_id is immutable")));
+}

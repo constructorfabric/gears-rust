@@ -65,7 +65,6 @@ use bss_ledger::api::rest::adjustments::{ApiState, router};
 use bss_ledger::config::{FxConfig, RecognitionConfig};
 use bss_ledger::domain::invoice::builder::{InvoiceItem, PostedInvoice, TaxBreakdown};
 use bss_ledger::domain::model::{AccountRow, CurrencyScaleRow};
-use bss_ledger::domain::money::DEFAULT_PLAUSIBLE_MAX_MAJOR;
 use bss_ledger::domain::recognition::input::{RecognitionInput, RecognitionTiming};
 use bss_ledger::infra::adjustment::credit_note_service::CreditNoteHandler;
 use bss_ledger::infra::adjustment::debit_note_service::DebitNoteHandler;
@@ -89,6 +88,29 @@ use toolkit_gts::gts_id;
 use toolkit_security::{PlatformSecurityContext, SecurityContext};
 use tower::ServiceExt;
 use uuid::Uuid;
+
+/// A USD scale-2 posting from a cent count (`1234` ⇒ `12.34`).
+fn usd_cents(minor: i64) -> bss_ledger_sdk::PostedMoney {
+    bss_ledger_sdk::PostedMoney::try_new(
+        rust_decimal::Decimal::new(minor, 2),
+        bss_ledger_sdk::CurrencySpec::try_new("USD".to_owned(), 2).unwrap(),
+    )
+    .unwrap()
+}
+
+/// The wire form of a scale-2 cent count in `currency`.
+fn money_json(minor: i64, currency: &str) -> serde_json::Value {
+    serde_json::json!({
+        "amount": bss_ledger_sdk::canonical_decimal(rust_decimal::Decimal::new(minor, 2)),
+        "currency": currency,
+        "currency_scale": 2
+    })
+}
+
+/// The wire form of a USD scale-2 cent count.
+fn usd_json(minor: i64) -> serde_json::Value {
+    money_json(minor, "USD")
+}
 
 fn pg(sql: impl Into<String>) -> Statement {
     Statement::from_string(sea_orm::DatabaseBackend::Postgres, sql.into())
@@ -246,8 +268,7 @@ async fn boot() -> (
         .upsert_currency_scale(CurrencyScaleRow {
             tenant_id: s.tenant,
             currency: "USD".to_owned(),
-            minor_units: 2,
-            plausible_max_major: DEFAULT_PLAUSIBLE_MAX_MAJOR,
+            currency_scale: 2,
             source: "iso".to_owned(),
         })
         .await
@@ -330,9 +351,8 @@ async fn boot() -> (
 /// obligation), or fully point-in-time when `periods == 0`.
 fn item(amount: i64, periods: u32, item_ref: &str) -> InvoiceItem {
     InvoiceItem {
-        amount_minor_ex_tax: amount,
-        deferred_minor: 0,
-        currency: "USD".to_owned(),
+        amount_ex_tax: usd_cents(amount),
+        deferred: usd_cents(0),
         revenue_stream: "subscription".to_owned(),
         catalog_class: Some(AccountClass::Revenue),
         contract_class: None,
@@ -459,12 +479,10 @@ fn credit_body(
         "origin_invoice_item_ref": "item-1",
         "po_allocation_group": "grp-1",
         "revenue_stream": "subscription",
-        "currency": "USD",
-        "scale": 2,
-        "amount_minor": amount_minor,
-        "tax_minor": 0,
+        "amount": usd_json(amount_minor),
+        "tax_amount": usd_json(0),
         "tax": [],
-        "requested_deferred_minor": requested_deferred_minor,
+        "requested_deferred": usd_json(requested_deferred_minor),
         "reason_code": "CUSTOMER_GOODWILL"
     })
 }
@@ -495,12 +513,10 @@ fn debit_body(
         "origin_invoice_id": invoice_id,
         "origin_invoice_item_ref": "item-1",
         "revenue_stream": "subscription",
-        "currency": "USD",
-        "scale": 2,
-        "amount_minor": amount_minor,
-        "tax_minor": 0,
+        "amount": usd_json(amount_minor),
+        "tax_amount": usd_json(0),
         "tax": [],
-        "deferred_minor": deferred_minor,
+        "deferred": usd_json(deferred_minor),
         "reason_code": "ADDITIONAL_USAGE",
         "recognition": recognition
     })
@@ -522,7 +538,7 @@ fn manual_body(
             serde_json::json!({
                 "account_class": class.as_str(),
                 "side": side.as_str(),
-                "amount_minor": amount,
+                "amount": usd_json(*amount),
                 "revenue_stream": serde_json::Value::Null,
             })
         })
@@ -532,6 +548,7 @@ fn manual_body(
         "adjustment_id": adjustment_id,
         "action": action,
         "currency": "USD",
+        "currency_scale": 2,
         "legs": legs,
         "reason_code": "ROUNDING_RESIDUE",
         "tax": []
@@ -753,20 +770,12 @@ async fn get_exposure_returns_headroom_and_open_ar() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "exposure 200: {body}");
-    assert_eq!(body["original_total_minor"], serde_json::json!(1000));
-    assert_eq!(body["credit_note_total_minor"], serde_json::json!(300));
-    assert_eq!(body["debit_note_total_minor"], serde_json::json!(0));
-    assert_eq!(
-        body["remaining_headroom_minor"],
-        serde_json::json!(700),
-        "1000 − 300"
-    );
+    assert_eq!(body["original_total"], usd_json(1000));
+    assert_eq!(body["credit_note_total"], usd_json(300));
+    assert_eq!(body["debit_note_total"], usd_json(0));
+    assert_eq!(body["remaining_headroom"], usd_json(700), "1000 − 300");
     // Open AR net down by the 300 credit (1000 − 300 = 700).
-    assert_eq!(
-        body["open_ar_minor"],
-        serde_json::json!(700),
-        "body: {body}"
-    );
+    assert_eq!(body["open_ar"], usd_json(700), "body: {body}");
 }
 
 /// `GET …/exposure` for an invoice with no note posted yet (no exposure row) →

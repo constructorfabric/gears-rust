@@ -11,16 +11,16 @@ use super::core::Outbox;
 use super::prioritizer::SharedPrioritizer;
 use super::stats::{StatsListener, StatsRegistry, StatsReporter};
 use super::tables::OutboxTables;
-use super::taskward::{
-    BackoffConfig, Bulkhead, BulkheadConfig, ConcurrencyLimit, PanicPolicy, TaskSet,
-    TracingListener, WorkerBuilder, poker,
-};
 use super::types::{
     OutboxConfig, OutboxError, OutboxProfile, Partitions, SequencerConfig, WorkerTuning,
 };
 use super::workers::sequencer::{Sequencer, SequencerReport};
 use super::workers::vacuum::{CollectableTraces, VacuumReport, VacuumTask};
 use crate::Db;
+use toolkit_taskward::{
+    BackoffConfig, Bulkhead, BulkheadConfig, ConcurrencyLimit, PanicPolicy, TaskSet,
+    TracingListener, WorkerBuilder, poker,
+};
 
 /// Deferred queue declaration — factory, resolved at `start()`.
 pub struct QueueDeclaration {
@@ -47,7 +47,7 @@ struct ResolvedTuning {
 struct StartContext<'a> {
     db: &'a Db,
     cancel: &'a CancellationToken,
-    task_set: &'a mut super::taskward::TaskSet,
+    task_set: &'a mut toolkit_taskward::TaskSet,
     start_notify: &'a Arc<Notify>,
     stats_registry: &'a Option<Arc<std::sync::Mutex<super::stats::StatsRegistry>>>,
 }
@@ -122,10 +122,12 @@ pub struct OutboxBuilder {
     vacuum_tuning: Option<WorkerTuning>,
     reconciler_tuning: Option<WorkerTuning>,
     tables: OutboxTables,
+    /// Queues declared on this builder, registered when the outbox starts.
     pub(crate) queue_declarations: Vec<QueueDeclaration>,
 }
 
 impl OutboxBuilder {
+    /// Creates an outbox builder bound to the given database handle.
     pub(crate) fn new(db: Db) -> Self {
         Self {
             db,
@@ -339,6 +341,7 @@ impl OutboxBuilder {
             );
             let name = format!("sequencer-{i}");
             let mut builder = WorkerBuilder::<SequencerReport>::new(&name, ctx.cancel.clone())
+                .stop_grace(tuning.stop_grace)
                 .pacing(tuning)
                 .notifier(prioritizer.notifier())
                 .notifier(Arc::clone(ctx.start_notify))
@@ -396,6 +399,7 @@ impl OutboxBuilder {
             let name = format!("vacuum-{i}");
             let (poker_notify, _poker_handle) = poker(tuning.idle_interval, ctx.cancel.clone());
             let mut builder = WorkerBuilder::<VacuumReport>::new(&name, ctx.cancel.clone())
+                .stop_grace(tuning.stop_grace)
                 .pacing(tuning)
                 .notifier(poker_notify)
                 .notifier(Arc::clone(ctx.start_notify))
@@ -444,6 +448,7 @@ impl OutboxBuilder {
         let name = "trace-sweeper";
         let (poker_notify, _poker_handle) = poker(tuning.idle_interval, ctx.cancel.clone());
         let builder = WorkerBuilder::new(name, ctx.cancel.clone())
+            .stop_grace(tuning.stop_grace)
             .pacing(tuning)
             .notifier(collectable_traces.wakeup())
             .notifier(poker_notify)
@@ -469,11 +474,12 @@ impl OutboxBuilder {
         };
         let name = "notifier";
         let builder = WorkerBuilder::new(name, ctx.cancel.clone())
+            .stop_grace(tuning.stop_grace)
             .pacing(tuning)
             // No timer. It schedules itself while somebody is waiting, and
             // sleeps on this wakeup when nobody is - a subscription being
             // taken is the only event that gives it a reason to look.
-            .notifier(outbox.mailbox().subscriptions().arrivals())
+            .notifier(outbox.trace_mailbox().registry().arrivals())
             .notifier(Arc::clone(ctx.start_notify))
             .listener(TracingListener)
             .on_panic(PanicPolicy::CatchAndRetry);
@@ -500,6 +506,7 @@ impl OutboxBuilder {
         let name = "retry-reporter";
         let (poker_notify, _poker_handle) = poker(tuning.idle_interval, ctx.cancel.clone());
         let builder = WorkerBuilder::new(name, ctx.cancel.clone())
+            .stop_grace(tuning.stop_grace)
             .pacing(tuning)
             .notifier(poker_notify)
             .notifier(Arc::clone(ctx.start_notify))
@@ -524,6 +531,7 @@ impl OutboxBuilder {
         let name = "cold-reconciler";
         let (poker_notify, _poker_handle) = poker(tuning.idle_interval, ctx.cancel.clone());
         let worker = WorkerBuilder::new(name, ctx.cancel.clone())
+            .stop_grace(tuning.stop_grace)
             .pacing(tuning)
             .notifier(poker_notify)
             .notifier(Arc::clone(ctx.start_notify))
@@ -653,9 +661,7 @@ impl OutboxBuilder {
         let notify_map = Arc::new(notify_map);
         outbox.set_partition_notify(notify_map).await;
 
-        outbox
-            .set_prioritizer(Arc::clone(&shared_prioritizer))
-            .await;
+        outbox.set_prioritizer(Arc::clone(&shared_prioritizer));
 
         // 6. Eager reconciliation at startup
         super::workers::reconciler::reconcile_dirty(&outbox, &self.db, &shared_prioritizer).await;
@@ -769,6 +775,6 @@ impl Drop for OutboxHandle {
         // since it necessarily holds the `Arc` that owns the registry and
         // nothing else would drop the senders. `close` is idempotent, so the
         // `stop` path closing here a second time is harmless.
-        self.outbox.mailbox().subscriptions().close();
+        self.outbox.trace_mailbox().registry().close();
     }
 }

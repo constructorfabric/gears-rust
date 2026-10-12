@@ -1,38 +1,18 @@
-//! `RecognitionRepo` — the ASC 606 revenue-recognition tables
-//! (`recognition_schedule`, `recognition_segment`, `recognition_run`), keyed by
-//! `(tenant_id, schedule_id)` / `(tenant_id, schedule_id, segment_no)` /
-//! `(tenant_id, run_id)`.
-//!
-//! The **writes** (`insert_schedule`, `insert_segments`, `add_recognized`) run
-//! inside the passed-in posting transaction (the in-txn sidecar, decision M),
-//! mirroring [`PaymentRepo`](super::PaymentRepo)'s `seed_settlement` /
-//! `insert_allocation_rows` / `add_*` shape: a scoped insert via
-//! `.secure().scope_with_model`, a scoped `update_many` via
-//! `.secure().scope_with`. `insert_schedule` materializes a fresh ACTIVE
-//! schedule in the same transaction as the Slice 1 Contract-liability credit
-//! (design §4.2 — a deferred balance never exists without a schedule);
-//! `add_recognized` is the counter-delta-under-lock the `RecognitionRunner`
-//! (Phase 2) applies per released segment. The `recognized_minor <=
-//! total_deferred_minor` cap CHECK is the authoritative per-obligation
-//! over-recognition guard under `SERIALIZABLE` (design §4.3 / §7); a violation
-//! surfaces as [`RepoError::MoneyOutCapExceeded`] (the runner's stamp sidecar
-//! turns it into the `OVER_RECOGNITION` wire code), exactly as
-//! `PaymentRepo::add_*` maps its per-payment cap CHECKs.
-//!
-//! The **reads** (`read_schedule`, `list_segments`) take the PDP-compiled
-//! `AccessScope` and run out-of-txn through `.secure().scope_with(scope)`
-//! (SQL-level BOLA — a foreign tenant yields no rows); segments are ordered by
-//! `segment_no` (which is 1:1 with `period_id`, so this is also period order).
+//! Canonical recognition persistence. Mutable rows use caller-transaction reads and literal CAS.
+//! Due snapshots are advisory; callers rebuild all decisions in the posting attempt.
 
 use std::collections::HashMap;
 
-use bss_ledger_sdk::{AccountClass, Side, SourceDocType};
+use crate::domain::exact_money::{ExactAmount, ExactError};
+use crate::infra::posting::retry::{db_to_repo, scope_to_repo};
+use crate::infra::storage::money_text::{decode_money, encode_amount};
+use bss_ledger_sdk::{AccountClass, CurrencySpec, PostedMoney, Side, SourceDocType};
+use rust_decimal::Decimal;
 
-use sea_orm::ExprTrait;
 use sea_orm::sea_query::Expr;
-use sea_orm::{ActiveValue::Set, ColumnTrait, Condition, DbErr, EntityTrait, Order};
+use sea_orm::{ActiveValue::Set, ColumnTrait, Condition, EntityTrait, Order};
 use toolkit_db::secure::{
-    AccessScope, DbTx, ScopeError, SecureEntityExt, SecureInsertExt, SecureUpdateExt,
+    AccessScope, DBRunner, DbTx, SecureEntityExt, SecureInsertExt, SecureUpdateExt,
 };
 use toolkit_db::{DBProvider, DbError};
 use uuid::Uuid;
@@ -40,8 +20,8 @@ use uuid::Uuid;
 use crate::domain::model::RepoError;
 use crate::domain::status::{
     PERIOD_STATUS_OPEN, RUN_STATUS_DONE, RUN_STATUS_FAILED, RUN_STATUS_RUNNING,
-    SCHEDULE_STATUS_ACTIVE, SCHEDULE_STATUS_COMPLETED, SEGMENT_STATUS_DONE, SEGMENT_STATUS_PENDING,
-    SEGMENT_STATUS_QUEUED,
+    SCHEDULE_STATUS_ACTIVE, SCHEDULE_STATUS_CANCELLED, SCHEDULE_STATUS_COMPLETED,
+    SCHEDULE_STATUS_REPLACED, SEGMENT_STATUS_DONE, SEGMENT_STATUS_PENDING, SEGMENT_STATUS_QUEUED,
 };
 use toolkit_db::odata::sea_orm_filter::{LimitCfg, paginate_odata};
 use toolkit_odata::{ODataQuery, Page, SortDir};
@@ -57,10 +37,40 @@ use crate::infra::storage::repo::journal_repo::{
 use crate::odata::RecognitionRunFilterField;
 use time::OffsetDateTime;
 
-/// The `recognition_schedule` row to insert for a freshly materialized ACTIVE
-/// schedule (one per revenue stream, design §3.5 / §4.5). `recognized_minor`
-/// starts at 0 and `version` at 0 (set by the repo); `status` is stamped
-/// `ACTIVE`.
+/// Validated immutable metadata plus the correlated schedule amounts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScheduleState {
+    pub tenant_id: Uuid,
+    pub schedule_id: String,
+    pub payer_tenant_id: Uuid,
+    pub source_invoice_id: String,
+    pub source_invoice_item_ref: String,
+    pub po_allocation_group: Option<String>,
+    pub subscription_ref: Option<String>,
+    pub revenue_stream: String,
+    pub total_deferred: PostedMoney,
+    pub recognized: PostedMoney,
+    pub policy_ref: String,
+    pub ssp_snapshot_ref: Option<String>,
+    pub vc_estimate_ref: Option<String>,
+    pub vc_method_ref: Option<String>,
+    pub status: String,
+    pub version: i64,
+}
+/// Validated segment money, phase, and shared mutation token.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SegmentState {
+    pub tenant_id: Uuid,
+    pub schedule_id: String,
+    pub segment_no: i32,
+    pub period_id: String,
+    pub amount: PostedMoney,
+    pub version: i64,
+    pub status: String,
+    pub recognized_at: Option<OffsetDateTime>,
+    pub run_id: Option<Uuid>,
+}
+/// New schedule input in major units.
 pub struct NewSchedule {
     pub tenant_id: Uuid,
     pub schedule_id: String,
@@ -70,33 +80,23 @@ pub struct NewSchedule {
     pub po_allocation_group: Option<String>,
     pub subscription_ref: Option<String>,
     pub revenue_stream: String,
-    pub currency: String,
-    pub total_deferred_minor: i64,
+    pub total_deferred: PostedMoney,
     pub policy_ref: String,
     pub ssp_snapshot_ref: Option<String>,
     pub vc_estimate_ref: Option<String>,
     pub vc_method_ref: Option<String>,
 }
 
-/// One `recognition_segment` row to insert — a time- or milestone-slice of a
-/// schedule. `segment_no` is immutable and 1:1 with `period_id`; rows are seeded
-/// `PENDING` with `recognized_at`/`run_id` NULL (stamped on release in Phase 2).
+/// New planned segment with explicit validated currency metadata.
 pub struct NewSegment {
     pub tenant_id: Uuid,
     pub schedule_id: String,
     pub segment_no: i32,
     pub period_id: String,
-    pub amount_minor: i64,
+    pub amount: PostedMoney,
 }
 
-/// A new ACTIVE **replacement** schedule version minted by a `replace` change
-/// (Group H, design §3.6): the successor of a now-`REPLACED` schedule. Carries
-/// the SAME business-key dims as its predecessor (so the partial UNIQUE one-live
-/// guard still holds — the old flips `REPLACED` in the SAME txn before this
-/// inserts), an explicit `version = old.version + 1`, and the REMAINING deferred
-/// (`old.total_deferred − old.recognized`) as its `total_deferred_minor`. Mirrors
-/// [`NewSchedule`] but with the explicit lineage `version` (the build path always
-/// seeds `version = 0`).
+/// Replacement retains the same business-key dimensions and explicit existing lineage version.
 pub struct ReplacementSchedule {
     pub tenant_id: Uuid,
     pub schedule_id: String,
@@ -106,90 +106,60 @@ pub struct ReplacementSchedule {
     pub po_allocation_group: Option<String>,
     pub subscription_ref: Option<String>,
     pub revenue_stream: String,
-    pub currency: String,
-    pub total_deferred_minor: i64,
+    pub total_deferred: PostedMoney,
     pub policy_ref: String,
     pub ssp_snapshot_ref: Option<String>,
     pub vc_estimate_ref: Option<String>,
     pub vc_method_ref: Option<String>,
-    /// The lineage version of the successor (`= old.version + 1`).
     pub version: i64,
 }
 
-/// A due `PENDING` segment paired with the stream/currency/account context of
-/// its owning ACTIVE schedule — the unit the `RecognitionRunner` releases. The
-/// join to `recognition_schedule` carries the `revenue_stream` + `currency`
-/// (both legs of the `DR CONTRACT_LIABILITY / CR REVENUE` post need them) and
-/// the `total_deferred_minor`/`recognized_minor` snapshot (read-only context;
-/// the authoritative over-recognition guard is the in-txn cap CHECK, not this
-/// snapshot — design §4.3). A foreign tenant yields no rows (SQL-level BOLA).
+/// Advisory due money snapshot; never use it as authoritative posting-attempt state.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DuePendingSegment {
     pub schedule_id: String,
     pub segment_no: i32,
     pub period_id: String,
-    pub amount_minor: i64,
+    pub amount: PostedMoney,
     pub revenue_stream: String,
-    pub currency: String,
-    pub total_deferred_minor: i64,
-    pub recognized_minor: i64,
+    pub total_deferred: PostedMoney,
+    pub recognized: PostedMoney,
 }
 
-/// One disaggregated recognized-revenue grain (design §3.5 / §4.5): the **net**
-/// revenue RECOGNIZED into `revenue_stream` during `period_id` — the *actual*
-/// posting period (see below) — in minor units of `currency`. The
-/// [`RecognitionRepo::list_revenue_disaggregation`] read sources this from the
-/// **journal** (not the segment rows): the `REVENUE` lines of the tenant's
-/// `RECOGNITION` entries (each release posts `DR CONTRACT_LIABILITY / CR
-/// REVENUE`; each clawback the mirror `DR REVENUE / CR CONTRACT_LIABILITY`),
-/// grouped by `(period_id, revenue_stream)` and **signed-summed** (a `CR` release
-/// adds, a `DR` reversal subtracts), ordered by `(period_id, revenue_stream)`. A
-/// foreign tenant yields no rows (SQL-level BOLA).
-///
-/// **Why the journal, not the segment's `period_id`.** A segment keeps its
-/// *planned* `period_id` as the audit target even when an E-2 missed-close
-/// releases it into the current OPEN period; the journal entry (and so its lines)
-/// carries that actual open period. Sourcing from the entry's REVENUE lines
-/// therefore reports the period the revenue truly landed in, and nets out
-/// reversals — both of which a DONE-segment scan (gross, planned-period) cannot.
+/// Net recognized revenue in one actual-period/stream/currency grain.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RecognizedStreamEntry {
     pub period_id: String,
     pub revenue_stream: String,
-    pub recognized_minor: i64,
-    pub currency: String,
+    pub recognized: PostedMoney,
 }
 
-/// SeaORM-backed recognition schedule/segment/run repository.
+/// Scoped canonical schedule, segment, run, and recognition-report persistence.
 #[derive(Clone)]
 pub struct RecognitionRepo {
     db: DBProvider<DbError>,
 }
 
 impl RecognitionRepo {
+    /// Bind backend-aware error classification to the repository provider.
     #[must_use]
     pub fn new(db: DBProvider<DbError>) -> Self {
         Self { db }
     }
 
-    // --- In-txn writes (called by the schedule-build / recognition sidecars) ---
-
-    /// Insert the `recognition_schedule` row for a freshly materialized ACTIVE
-    /// schedule (`recognized_minor = 0`, `version = 0`, `status = ACTIVE`). The
-    /// partial `UNIQUE (tenant, source_invoice_id, source_invoice_item_ref,
-    /// revenue_stream) WHERE status='ACTIVE'` is the at-most-one-live guard — a
-    /// concurrent second live schedule for the same business key collides; but a
-    /// duplicate build is short-circuited by the `SCHEDULE_BUILD` idempotency
-    /// claim before the sidecar, so an unexpected collision surfaces as
-    /// [`RepoError::Db`].
+    /// Insert a fresh ACTIVE schedule with canonical total, recognized zero, and version zero. Unique business-key collisions retain the existing storage-error behavior.
     ///
     /// # Errors
-    /// [`RepoError::Db`] on a scope or storage failure.
+    /// [`RepoError::MoneyOutCapExceeded`] when `total_deferred` is negative; [`RepoError::Db`]
+    /// on a scope or storage failure (an at-most-one-live collision included);
+    /// [`RepoError::Conflict`] on classified database contention.
     pub async fn insert_schedule(
+        &self,
         txn: &DbTx<'_>,
         scope: &AccessScope,
         schedule: &NewSchedule,
     ) -> Result<(), RepoError> {
+        nonnegative(&schedule.total_deferred)?;
         let am = recognition_schedule::ActiveModel {
             tenant_id: Set(schedule.tenant_id),
             schedule_id: Set(schedule.schedule_id.clone()),
@@ -199,9 +169,10 @@ impl RecognitionRepo {
             po_allocation_group: Set(schedule.po_allocation_group.clone()),
             subscription_ref: Set(schedule.subscription_ref.clone()),
             revenue_stream: Set(schedule.revenue_stream.clone()),
-            currency: Set(schedule.currency.clone()),
-            total_deferred_minor: Set(schedule.total_deferred_minor),
-            recognized_minor: Set(0),
+            currency: Set(schedule.total_deferred.currency().code().to_owned()),
+            currency_scale: Set(i16::from(schedule.total_deferred.currency().scale())),
+            total_deferred: Set(encode_amount(&schedule.total_deferred)),
+            recognized: Set("0".to_owned()),
             policy_ref: Set(schedule.policy_ref.clone()),
             ssp_snapshot_ref: Set(schedule.ssp_snapshot_ref.clone()),
             vc_estimate_ref: Set(schedule.vc_estimate_ref.clone()),
@@ -212,41 +183,50 @@ impl RecognitionRepo {
         recognition_schedule::Entity::insert(am.clone())
             .secure()
             .scope_with_model(scope, &am)
-            .map_err(|e| RepoError::Db(format!("recognition_schedule scope: {e}")))?
+            .map_err(|e| scope_to_repo(e, self.db.db().backend()))?
             .exec(txn)
             .await
-            .map_err(|e| RepoError::Db(format!("insert recognition_schedule: {e}")))?;
+            .map_err(|e| scope_to_repo(e, self.db.db().backend()))?;
         Ok(())
     }
 
-    /// Insert the N `recognition_segment` rows for one schedule (each seeded
-    /// `PENDING`, `recognized_at`/`run_id` NULL). The PK
-    /// `(tenant, schedule_id, segment_no)` and the period UNIQUE make a replay of
-    /// the same schedule collide — but a duplicate build returns before the
-    /// sidecar (the `SCHEDULE_BUILD` claim), so this is only reached on the first
-    /// build; an unexpected duplicate surfaces as a storage [`DbError`].
-    ///
-    /// Returns [`DbError`] (NOT [`RepoError`]): this is an in-txn write driven by
-    /// both the build sidecar and the Group H change txn, and the change txn
-    /// retries on a serialization conflict — so the inner `sea_orm::DbErr` is
-    /// PRESERVED (`DbError::Sea`) for the retry helper's `as_db_err`, mirroring
-    /// [`crate::infra::period_close`]'s `scope_to_db`. A scope-construction fault
-    /// (never a serialization conflict) stays a non-retryable `DbError::Other`.
+    /// Insert immutable segment keys with version zero; validate each amount against its parent. The caller rolls back the entire batch on any error.
     ///
     /// # Errors
-    /// [`DbError`] on a scope or storage failure.
+    /// [`RepoError::MoneyOutCapExceeded`] when a segment amount is negative;
+    /// [`RepoError::RecognitionPolicyConflict`] when a segment's schedule is absent or
+    /// inaccessible; [`RepoError::Money`] when a segment disagrees with its schedule's currency
+    /// metadata; [`RepoError::Db`] on a scope or storage failure (a duplicate key included);
+    /// [`RepoError::Conflict`] on classified database contention;
+    /// [`RepoError::InvalidStoredMoney`] when the parent schedule row is malformed.
     pub async fn insert_segments(
+        &self,
         txn: &DbTx<'_>,
         scope: &AccessScope,
         segments: &[NewSegment],
-    ) -> Result<(), DbError> {
+    ) -> Result<(), RepoError> {
+        // A plan's segments share one schedule: read and validate each parent once.
+        let mut parents: std::collections::HashMap<(Uuid, String), ScheduleState> =
+            std::collections::HashMap::new();
         for seg in segments {
+            nonnegative(&seg.amount)?;
+            let parent = match parents.entry((seg.tenant_id, seg.schedule_id.clone())) {
+                std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                std::collections::hash_map::Entry::Vacant(entry) => entry.insert(
+                    self.required_schedule(txn, scope, seg.tenant_id, &seg.schedule_id)
+                        .await?,
+                ),
+            };
+            same_spec(&seg.amount, &parent.total_deferred)?;
             let am = recognition_segment::ActiveModel {
+                currency: Set(seg.amount.currency().code().to_owned()),
+                currency_scale: Set(i16::from(seg.amount.currency().scale())),
                 tenant_id: Set(seg.tenant_id),
                 schedule_id: Set(seg.schedule_id.clone()),
                 segment_no: Set(seg.segment_no),
                 period_id: Set(seg.period_id.clone()),
-                amount_minor: Set(seg.amount_minor),
+                amount: Set(encode_amount(&seg.amount)),
+                version: Set(0),
                 status: Set(SEGMENT_STATUS_PENDING.to_owned()),
                 recognized_at: Set(None),
                 run_id: Set(None),
@@ -254,36 +234,27 @@ impl RecognitionRepo {
             recognition_segment::Entity::insert(am.clone())
                 .secure()
                 .scope_with_model(scope, &am)
-                .map_err(scope_to_db)?
+                .map_err(|e| scope_to_repo(e, self.db.db().backend()))?
                 .exec(txn)
                 .await
-                .map_err(scope_to_db)?;
+                .map_err(|e| scope_to_repo(e, self.db.db().backend()))?;
         }
         Ok(())
     }
 
-    /// In-txn scoped read of the `recognition_schedule` row for
-    /// `(tenant, schedule_id)`, or `None` when absent — the read-half a Group H
-    /// schedule change runs INSIDE its serializable change transaction (so the
-    /// read, the status flip, and any replacement insert share one snapshot and
-    /// conflict with a concurrent release under SSI). The out-of-txn
-    /// [`Self::read_schedule`] is the read surface for REST `GET`s; this is its
-    /// in-txn twin. SQL-level BOLA: a foreign tenant yields no row.
-    ///
-    /// Returns [`DbError`] (NOT [`RepoError`]): driven by the Group H change txn,
-    /// which retries on a serialization conflict — so the inner `sea_orm::DbErr`
-    /// (incl. a `40001` raised reading the contended schedule row mid-statement)
-    /// is PRESERVED as `DbError::Sea` for the retry helper, mirroring
-    /// [`crate::infra::period_close`]'s `scope_to_db`.
+    /// Scoped caller-runner lookup of a schedule with validated correlated amounts.
     ///
     /// # Errors
-    /// [`DbError`] on a scope or storage failure.
-    pub async fn read_schedule_in_txn(
-        txn: &DbTx<'_>,
+    /// [`RepoError::Db`] on a scope or storage failure; [`RepoError::Conflict`] on classified
+    /// database contention. [`RepoError::InvalidStoredMoney`] when a stored amount is malformed
+    /// or off its currency contract.
+    pub async fn read_schedule_in_txn<R: DBRunner>(
+        &self,
+        txn: &R,
         scope: &AccessScope,
         tenant: Uuid,
         schedule_id: &str,
-    ) -> Result<Option<recognition_schedule::Model>, DbError> {
+    ) -> Result<Option<ScheduleState>, RepoError> {
         let row = recognition_schedule::Entity::find()
             .secure()
             .scope_with(scope)
@@ -294,36 +265,26 @@ impl RecognitionRepo {
             )
             .one(txn)
             .await
-            .map_err(scope_to_db)?;
-        Ok(row)
+            .map_err(|e| scope_to_repo(e, self.db.db().backend()))?;
+        row.map(decode_schedule).transpose()
     }
 
-    /// In-txn scoped read of the ACTIVE successor of a `REPLACED` schedule (the
-    /// Group H replay path): the one ACTIVE schedule sharing the predecessor's
-    /// business key (`source_invoice_id`, `source_invoice_item_ref`,
-    /// `revenue_stream`) at the successor lineage `version` (`= old.version + 1`).
-    /// A `replace` mints exactly one such row, so this resolves the new
-    /// `schedule_id` an idempotent change replay reports. `None` when no such
-    /// ACTIVE successor exists (e.g. the successor was itself later replaced — a
-    /// degenerate replay window). Runs INSIDE the change txn (the claim guard
-    /// already holds the task-local conn-bypass guard, so an out-of-txn `conn()`
-    /// would fail). SQL-level BOLA: a foreign tenant yields no row.
-    ///
-    /// Returns [`DbError`] (NOT [`RepoError`]) so a serialization conflict raised
-    /// mid-statement in the change txn stays retryable (`DbError::Sea`), mirroring
-    /// [`crate::infra::period_close`]'s `scope_to_db`.
+    /// Resolve the ACTIVE successor at the existing business key and exact lineage version.
     ///
     /// # Errors
-    /// [`DbError`] on a scope or storage failure.
-    pub async fn read_active_successor_in_txn(
-        txn: &DbTx<'_>,
+    /// [`RepoError::Db`] on a scope or storage failure; [`RepoError::Conflict`] on classified
+    /// database contention. [`RepoError::InvalidStoredMoney`] when a stored amount is malformed
+    /// or off its currency contract.
+    pub async fn read_active_successor_in_txn<R: DBRunner>(
+        &self,
+        txn: &R,
         scope: &AccessScope,
         tenant: Uuid,
         source_invoice_id: &str,
         source_invoice_item_ref: &str,
         revenue_stream: &str,
         version: i64,
-    ) -> Result<Option<recognition_schedule::Model>, DbError> {
+    ) -> Result<Option<ScheduleState>, RepoError> {
         let row = recognition_schedule::Entity::find()
             .secure()
             .scope_with(scope)
@@ -341,27 +302,25 @@ impl RecognitionRepo {
             )
             .one(txn)
             .await
-            .map_err(scope_to_db)?;
-        Ok(row)
+            .map_err(|e| scope_to_repo(e, self.db.db().backend()))?;
+        row.map(decode_schedule).transpose()
     }
 
-    /// In-txn scoped read of the LIVE (`ACTIVE`) schedule for a business key
-    /// `(tenant, source_invoice_id, source_invoice_item_ref, revenue_stream)`,
-    /// regardless of `version` — the at-most-one-live partial UNIQUE guarantees 0
-    /// or 1 row. A later deferring note (a debit note) reads it here to EXTEND it
-    /// (one ACTIVE schedule per key) rather than mint a second the partial UNIQUE
-    /// would reject. SQL-level BOLA: a foreign tenant yields no row.
+    /// Read the one ACTIVE schedule at its existing invoice/item/stream business key.
     ///
     /// # Errors
-    /// [`DbError`] on a scope or storage failure.
-    pub async fn read_active_schedule_in_txn(
-        txn: &DbTx<'_>,
+    /// [`RepoError::Db`] on a scope or storage failure; [`RepoError::Conflict`] on classified
+    /// database contention. [`RepoError::InvalidStoredMoney`] when a stored amount is malformed
+    /// or off its currency contract.
+    pub async fn read_active_schedule_in_txn<R: DBRunner>(
+        &self,
+        txn: &R,
         scope: &AccessScope,
         tenant: Uuid,
         source_invoice_id: &str,
         source_invoice_item_ref: &str,
         revenue_stream: &str,
-    ) -> Result<Option<recognition_schedule::Model>, DbError> {
+    ) -> Result<Option<ScheduleState>, RepoError> {
         let row = recognition_schedule::Entity::find()
             .secure()
             .scope_with(scope)
@@ -378,89 +337,64 @@ impl RecognitionRepo {
             )
             .one(txn)
             .await
-            .map_err(scope_to_db)?;
-        Ok(row)
+            .map_err(|e| scope_to_repo(e, self.db.db().backend()))?;
+        row.map(decode_schedule).transpose()
     }
 
-    /// Transition a schedule's `status` from `from_status` to `to_status` (e.g.
-    /// `ACTIVE → REPLACED` / `ACTIVE → CANCELLED`), bumping `version`, for
-    /// `(tenant, schedule_id)` — the Group H mark step (design §3.6 / §4.6). The
-    /// filter requires the current status to be `from_status`, so the flip is the
-    /// idempotency/race backstop: a concurrent change (or a replay that already
-    /// transitioned the row) matches no row (`rows_affected == 0`), which the
-    /// caller treats as "already transitioned" rather than an error. A scoped
-    /// `update_many` inside the change txn. Returns the number of rows flipped
-    /// (`0` or `1`).
-    ///
-    /// Returns [`DbError`] (NOT [`RepoError`]): the change txn retries on a
-    /// serialization conflict, and the `ACTIVE` row this flips is exactly what a
-    /// concurrent release contends — so a `40001` raised here is PRESERVED as
-    /// `DbError::Sea` for the retry helper, mirroring
-    /// [`crate::infra::period_close`]'s `scope_to_db` (a non-retryable
-    /// scope-construction fault stays `DbError::Other`).
+    /// Preserve the existing from-state no-op and single version increment.
     ///
     /// # Errors
-    /// [`DbError`] on a scope or storage failure.
+    /// [`RepoError::RecognitionPolicyConflict`] when `to_status` is not a valid schedule
+    /// status; [`RepoError::InvalidStoredMoney`] when the stored row is malformed or its
+    /// version is negative / exhausted; [`RepoError::Conflict`] when the observed version is
+    /// stale, or on classified database contention; [`RepoError::Db`] on a scope or storage
+    /// failure.
     pub async fn mark_schedule_status(
+        &self,
         txn: &DbTx<'_>,
         scope: &AccessScope,
         tenant: Uuid,
         schedule_id: &str,
         from_status: &str,
         to_status: &str,
-    ) -> Result<u64, DbError> {
-        let result = recognition_schedule::Entity::update_many()
-            .secure()
-            .scope_with(scope)
-            .col_expr(
-                recognition_schedule::Column::Status,
-                Expr::value(to_status.to_owned()),
-            )
-            .col_expr(
-                recognition_schedule::Column::Version,
-                Expr::col((
-                    recognition_schedule::Entity,
-                    recognition_schedule::Column::Version,
-                ))
-                .add(1),
-            )
-            .filter(
-                Condition::all()
-                    .add(recognition_schedule::Column::TenantId.eq(tenant))
-                    .add(recognition_schedule::Column::ScheduleId.eq(schedule_id))
-                    .add(recognition_schedule::Column::Status.eq(from_status)),
-            )
-            .exec(txn)
-            .await
-            .map_err(scope_to_db)?;
-        Ok(result.rows_affected)
+    ) -> Result<u64, RepoError> {
+        let Some(row) = self
+            .read_schedule_in_txn(txn, scope, tenant, schedule_id)
+            .await?
+        else {
+            return Ok(0);
+        };
+        if row.status != from_status {
+            return Ok(0);
+        }
+        if !valid_schedule_status(to_status) {
+            return Err(phase("invalid schedule target status"));
+        }
+        self.write_schedule(
+            txn,
+            scope,
+            &row,
+            &row.total_deferred,
+            &row.recognized,
+            to_status,
+            next_version(row.version)?,
+        )
+        .await?;
+        Ok(1)
     }
 
-    /// In-txn scoped read of the highest `period_id` among a schedule's
-    /// already-`DONE` segments, or `None` when none are `DONE` — the floor a
-    /// Group H `replace` validates its replacement periods against (design §4.6):
-    /// a replacement segment may never re-target a period the old schedule has
-    /// ALREADY recognized (that would re-recognize a closed period across the
-    /// version boundary — cross-version double-recognition), so the first
-    /// replacement period MUST be strictly greater than this. `period_id` is the
-    /// `YYYYMM` lexical-sortable string, so `ORDER BY period_id DESC LIMIT 1` is
-    /// the max-DONE-period read (1:1 with `segment_no` within a schedule). Runs
-    /// INSIDE the change txn (the claim guard already holds the task-local
-    /// conn-bypass guard, so an out-of-txn `conn()` would fail), so it joins the
-    /// serializable snapshot. SQL-level BOLA: a foreign tenant yields no row.
-    ///
-    /// Returns [`DbError`] (NOT [`RepoError`]) so a serialization conflict raised
-    /// mid-statement in the change txn stays retryable (`DbError::Sea`), mirroring
-    /// the other in-txn change helpers.
+    /// Find the latest DONE planned period on the caller runner for the cross-version replacement floor.
     ///
     /// # Errors
-    /// [`DbError`] on a scope or storage failure.
-    pub async fn max_done_segment_period_in_txn(
-        txn: &DbTx<'_>,
+    /// [`RepoError::Db`] on a scope or storage failure; [`RepoError::Conflict`] on classified
+    /// database contention.
+    pub async fn max_done_segment_period_in_txn<R: DBRunner>(
+        &self,
+        txn: &R,
         scope: &AccessScope,
         tenant: Uuid,
         schedule_id: &str,
-    ) -> Result<Option<String>, DbError> {
+    ) -> Result<Option<String>, RepoError> {
         let row = recognition_segment::Entity::find()
             .secure()
             .scope_with(scope)
@@ -473,24 +407,73 @@ impl RecognitionRepo {
             .order_by(recognition_segment::Column::PeriodId, Order::Desc)
             .one(txn)
             .await
-            .map_err(scope_to_db)?;
+            .map_err(|e| scope_to_repo(e, self.db.db().backend()))?;
         Ok(row.map(|r| r.period_id))
     }
 
-    /// Count `recognition_segment`s whose `period_id` is `<=` the closing period
-    /// and not yet `DONE` — the period-close gate input (a due segment that has
-    /// not released blocks close, design §4.5). In-txn so it joins the close's
-    /// `SERIALIZABLE` snapshot (a concurrent release conflicts under SSI).
-    /// Returns [`DbError`] so a serialization conflict stays retryable.
+    /// Read the DONE floor across all versions at the unchanged schedule business key.
     ///
     /// # Errors
-    /// Returns [`DbError`] if scope application or the segment query fails.
-    pub async fn count_due_not_done_in_txn(
-        txn: &DbTx<'_>,
+    /// [`RepoError::Db`] on a scope or storage failure; [`RepoError::Conflict`] on classified
+    /// database contention.
+    pub async fn max_done_business_period_in_txn<R: DBRunner>(
+        &self,
+        txn: &R,
+        scope: &AccessScope,
+        schedule: &ScheduleState,
+    ) -> Result<Option<String>, RepoError> {
+        let versions = recognition_schedule::Entity::find()
+            .secure()
+            .scope_with(scope)
+            .filter(
+                Condition::all()
+                    .add(recognition_schedule::Column::TenantId.eq(schedule.tenant_id))
+                    .add(
+                        recognition_schedule::Column::SourceInvoiceId
+                            .eq(&schedule.source_invoice_id),
+                    )
+                    .add(
+                        recognition_schedule::Column::SourceInvoiceItemRef
+                            .eq(&schedule.source_invoice_item_ref),
+                    )
+                    .add(recognition_schedule::Column::RevenueStream.eq(&schedule.revenue_stream)),
+            )
+            .all(txn)
+            .await
+            .map_err(|e| scope_to_repo(e, self.db.db().backend()))?;
+        let version_ids: Vec<String> = versions.into_iter().map(|v| v.schedule_id).collect();
+        if version_ids.is_empty() {
+            return Ok(None);
+        }
+        // One query for the latest DONE period across every version.
+        let row = recognition_segment::Entity::find()
+            .secure()
+            .scope_with(scope)
+            .filter(
+                Condition::all()
+                    .add(recognition_segment::Column::TenantId.eq(schedule.tenant_id))
+                    .add(recognition_segment::Column::ScheduleId.is_in(version_ids))
+                    .add(recognition_segment::Column::Status.eq(SEGMENT_STATUS_DONE)),
+            )
+            .order_by(recognition_segment::Column::PeriodId, Order::Desc)
+            .one(txn)
+            .await
+            .map_err(|e| scope_to_repo(e, self.db.db().backend()))?;
+        Ok(row.map(|r| r.period_id))
+    }
+
+    /// Count due unfinished segments in the period-close transaction.
+    ///
+    /// # Errors
+    /// [`RepoError::Db`] on a scope or storage failure; [`RepoError::Conflict`] on classified
+    /// database contention.
+    pub async fn count_due_not_done_in_txn<R: DBRunner>(
+        &self,
+        txn: &R,
         scope: &AccessScope,
         tenant: Uuid,
         period_id: &str,
-    ) -> Result<usize, DbError> {
+    ) -> Result<usize, RepoError> {
         let rows = recognition_segment::Entity::find()
             .secure()
             .scope_with(scope)
@@ -502,31 +485,27 @@ impl RecognitionRepo {
             )
             .all(txn)
             .await
-            .map_err(scope_to_db)?;
+            .map_err(|e| scope_to_repo(e, self.db.db().backend()))?;
         Ok(rows.len())
     }
 
-    /// Insert a fresh ACTIVE **replacement** schedule version (Group H `replace`,
-    /// design §3.6): `recognized_minor = 0`, `status = ACTIVE`, and the explicit
-    /// lineage `version` the caller computed (`= old.version + 1`). Mirrors
-    /// [`Self::insert_schedule`] but threads the explicit `version` (the build
-    /// path always seeds `0`). The old schedule must already be flipped `REPLACED`
-    /// in the SAME txn before this runs, so the partial `UNIQUE (tenant,
-    /// source_invoice_id, source_invoice_item_ref, revenue_stream) WHERE
-    /// status='ACTIVE'` one-live guard holds; an unexpected collision surfaces as
-    /// a storage [`DbError`] and rolls the change back.
-    ///
-    /// Returns [`DbError`] (NOT [`RepoError`]) so a serialization conflict raised
-    /// mid-statement in the change txn stays retryable (`DbError::Sea`), mirroring
-    /// [`crate::infra::period_close`]'s `scope_to_db`.
+    /// Insert an ACTIVE replacement using the explicit predecessor-derived version. Caller marks the predecessor REPLACED in the same transaction.
     ///
     /// # Errors
-    /// [`DbError`] on a scope or storage failure.
+    /// [`RepoError::MoneyOutCapExceeded`] when `total_deferred` is negative;
+    /// [`RepoError::InvalidStoredMoney`] when the replacement version is negative;
+    /// [`RepoError::Db`] on a scope or storage failure (an at-most-one-live collision
+    /// included); [`RepoError::Conflict`] on classified database contention.
     pub async fn insert_replacement_schedule(
+        &self,
         txn: &DbTx<'_>,
         scope: &AccessScope,
         schedule: &ReplacementSchedule,
-    ) -> Result<(), DbError> {
+    ) -> Result<(), RepoError> {
+        nonnegative(&schedule.total_deferred)?;
+        if schedule.version < 0 {
+            return Err(invalid("negative replacement version"));
+        }
         let am = recognition_schedule::ActiveModel {
             tenant_id: Set(schedule.tenant_id),
             schedule_id: Set(schedule.schedule_id.clone()),
@@ -536,9 +515,10 @@ impl RecognitionRepo {
             po_allocation_group: Set(schedule.po_allocation_group.clone()),
             subscription_ref: Set(schedule.subscription_ref.clone()),
             revenue_stream: Set(schedule.revenue_stream.clone()),
-            currency: Set(schedule.currency.clone()),
-            total_deferred_minor: Set(schedule.total_deferred_minor),
-            recognized_minor: Set(0),
+            currency: Set(schedule.total_deferred.currency().code().to_owned()),
+            currency_scale: Set(i16::from(schedule.total_deferred.currency().scale())),
+            total_deferred: Set(encode_amount(&schedule.total_deferred)),
+            recognized: Set("0".to_owned()),
             policy_ref: Set(schedule.policy_ref.clone()),
             ssp_snapshot_ref: Set(schedule.ssp_snapshot_ref.clone()),
             vc_estimate_ref: Set(schedule.vc_estimate_ref.clone()),
@@ -549,225 +529,134 @@ impl RecognitionRepo {
         recognition_schedule::Entity::insert(am.clone())
             .secure()
             .scope_with_model(scope, &am)
-            .map_err(scope_to_db)?
+            .map_err(|e| scope_to_repo(e, self.db.db().backend()))?
             .exec(txn)
             .await
-            .map_err(scope_to_db)?;
+            .map_err(|e| scope_to_repo(e, self.db.db().backend()))?;
         Ok(())
     }
 
-    /// Increment `recognition_schedule.recognized_minor` by `amount` for a
-    /// released segment, bumping `version`. The `recognized_minor <=
-    /// total_deferred_minor` cap CHECK
-    /// (`chk_ledger_recognition_schedule_recognized_le_deferred`) is the
-    /// authoritative per-obligation over-recognition guard: it enforces that the
-    /// cumulative release never exceeds what was deferred, evaluated against the
-    /// resulting row (`recognized_minor + amount <= total_deferred_minor`). A
-    /// violation maps to [`RepoError::MoneyOutCapExceeded`] (the recognition
-    /// stamp sidecar refines it to the `OVER_RECOGNITION` 409). A scoped UPDATE,
-    /// not an upsert: the schedule row always pre-exists (the schedule is
-    /// materialized before any release), so an `INSERT … ON CONFLICT` would trip
-    /// the CHECK on the INSERT VALUES tuple during arbitration (see
-    /// `PaymentRepo::add_allocated`). SSI + retry serialize concurrent releases
-    /// of the same schedule; `rows_affected == 0` ⇒ no such schedule.
+    /// Apply an exact signed delta; validate stored invariants first and CAS observed state/version.
     ///
     /// # Errors
-    /// [`RepoError::MoneyOutCapExceeded`] when the cap CHECK rejects the
-    /// increment; [`RepoError::Db`] when no row matched or on any other scope /
-    /// storage failure.
+    /// [`RepoError::RecognitionPolicyConflict`] when the schedule is absent or inaccessible;
+    /// [`RepoError::Money`] when `amount` disagrees with the stored currency metadata or the
+    /// exact result leaves the money contract; [`RepoError::MoneyOutCapExceeded`] when the
+    /// result would leave `recognized` outside `0..=total_deferred`; [`RepoError::Conflict`]
+    /// when the observed version is stale, or on classified database contention;
+    /// [`RepoError::Db`] on a scope or storage failure; [`RepoError::InvalidStoredMoney`] when
+    /// the stored row is malformed.
     pub async fn add_recognized(
+        &self,
         txn: &DbTx<'_>,
         scope: &AccessScope,
         tenant: Uuid,
         schedule_id: &str,
-        amount: i64,
+        amount: &PostedMoney,
     ) -> Result<(), RepoError> {
-        // Scoped UPDATE (not an upsert), exactly like `PaymentRepo::add_*`: the
-        // CHECK evaluates against the resulting row (`recognized_minor + amount <=
-        // total_deferred_minor`), so an over-recognition surfaces as the CHECK
-        // violation, mapped to `MoneyOutCapExceeded`; the runner's stamp sidecar
-        // refines it to `OverRecognition` (409).
-        let result = recognition_schedule::Entity::update_many()
-            .secure()
-            .scope_with(scope)
-            .col_expr(
-                recognition_schedule::Column::RecognizedMinor,
-                Expr::col((
-                    recognition_schedule::Entity,
-                    recognition_schedule::Column::RecognizedMinor,
-                ))
-                .add(amount),
-            )
-            .col_expr(
-                recognition_schedule::Column::Version,
-                Expr::col((
-                    recognition_schedule::Entity,
-                    recognition_schedule::Column::Version,
-                ))
-                .add(1),
-            )
-            .filter(
-                Condition::all()
-                    .add(recognition_schedule::Column::TenantId.eq(tenant))
-                    .add(recognition_schedule::Column::ScheduleId.eq(schedule_id)),
-            )
-            .exec(txn)
-            .await
-            .map_err(|e| map_cap_violation("add recognized_minor", &e))?;
-        if result.rows_affected == 0 {
-            return Err(RepoError::Db(format!(
-                "recognition_schedule row absent for ({tenant}, {schedule_id})"
-            )));
-        }
-        Ok(())
+        self.change_schedule_money(
+            txn,
+            scope,
+            tenant,
+            schedule_id,
+            amount,
+            ScheduleDelta::Recognized,
+        )
+        .await
     }
 
-    /// Decrement `recognition_schedule.total_deferred_minor` by `amount` (a
-    /// **positive** reduction over the not-yet-released remainder), bumping
-    /// `version` — the Slice-3 **credit-note deferred reduction** (design §4.2):
-    /// when a credit note debits `CONTRACT_LIABILITY` for a deferred portion it
-    /// reduces the owning schedule's deferred total in the SAME post txn, so a
-    /// later recognition run cannot re-recognize the credited-back amount. The
-    /// reduction is bounded by the schedule's remaining releasable amount
-    /// (`total_deferred_minor − recognized_minor`): the authoritative guard is the
-    /// existing `recognized_minor <= total_deferred_minor` CHECK
-    /// (`chk_ledger_recognition_schedule_recognized_le_deferred`) — it is evaluated
-    /// against the resulting row, so a reduction that would drop
-    /// `total_deferred_minor` below the already-`recognized_minor` (over-reducing an
-    /// in-flight schedule) is rejected; the `total_deferred_minor >= 0` CHECK is the
-    /// floor. A violation maps to [`RepoError::MoneyOutCapExceeded`] (the
-    /// `CreditNoteHandler` refines it — already-released segments are never
-    /// recomputed, mirroring Slice 4 §4.6 re-version semantics).
-    ///
-    /// A scoped UPDATE (not an upsert), exactly like [`Self::add_recognized`]: the
-    /// schedule row always pre-exists (a deferred portion implies an ACTIVE
-    /// schedule the split read). SSI + retry serialize a concurrent credit-note
-    /// reduction and a recognition release of the same schedule (both take the
-    /// rank-6 schedule row). `rows_affected == 0` ⇒ no such schedule (an invariant
-    /// breach — the split read it under the lock order).
+    /// [`Self::add_recognized`] on a schedule the caller already read in this
+    /// transaction: the same validation, with the CAS on the observed
+    /// status, version, currency metadata and both amounts instead of a fresh
+    /// read. Returns the schedule as written, so a release can complete it
+    /// without reading it again.
     ///
     /// # Errors
-    /// [`RepoError::MoneyOutCapExceeded`] when a schedule CHECK rejects the
-    /// reduction (over-reduction past the releasable remainder, or below zero);
-    /// [`RepoError::Db`] when no row matched or on any other scope / storage
-    /// failure.
+    /// As [`Self::add_recognized`], except that an absent schedule cannot occur;
+    /// a stale observation, or one that disagrees with the stored row, is
+    /// [`RepoError::Conflict`].
+    pub async fn add_recognized_to(
+        &self,
+        txn: &DbTx<'_>,
+        scope: &AccessScope,
+        schedule: &ScheduleState,
+        amount: &PostedMoney,
+    ) -> Result<ScheduleState, RepoError> {
+        self.apply_schedule_delta(txn, scope, schedule, amount, ScheduleDelta::Recognized)
+            .await
+    }
+
+    /// Apply an exact signed delta; validate stored invariants first and CAS observed state/version.
+    ///
+    /// # Errors
+    /// [`RepoError::RecognitionPolicyConflict`] when the schedule is absent or inaccessible;
+    /// [`RepoError::Money`] when `amount` disagrees with the stored currency metadata or the
+    /// exact result leaves the money contract; [`RepoError::MoneyOutCapExceeded`] when the
+    /// reduction would leave `recognized` outside `0..=total_deferred`; [`RepoError::Conflict`]
+    /// when the observed version is stale, or on classified database contention;
+    /// [`RepoError::Db`] on a scope or storage failure; [`RepoError::InvalidStoredMoney`] when
+    /// the stored row is malformed.
     pub async fn reduce_deferred(
+        &self,
         txn: &DbTx<'_>,
         scope: &AccessScope,
         tenant: Uuid,
         schedule_id: &str,
-        amount: i64,
+        amount: &PostedMoney,
     ) -> Result<(), RepoError> {
-        // Apply as a NEGATIVE delta on `total_deferred_minor` (`col + (−amount)`),
-        // the SAME `col_expr(col, Expr::col(col).add(delta))` shape `add_recognized`
-        // uses (the reversal path likewise feeds it a negative delta) — so the CHECK
-        // is evaluated against the resulting row exactly as for the recognized
-        // counter, and the SQL is the proven counter-delta-under-lock.
-        let neg_delta = amount.checked_neg().ok_or_else(|| {
-            RepoError::Db(format!(
-                "deferred reduction amount {amount} overflows on negate"
-            ))
-        })?;
-        let result = recognition_schedule::Entity::update_many()
-            .secure()
-            .scope_with(scope)
-            .col_expr(
-                recognition_schedule::Column::TotalDeferredMinor,
-                Expr::col((
-                    recognition_schedule::Entity,
-                    recognition_schedule::Column::TotalDeferredMinor,
-                ))
-                .add(neg_delta),
-            )
-            .col_expr(
-                recognition_schedule::Column::Version,
-                Expr::col((
-                    recognition_schedule::Entity,
-                    recognition_schedule::Column::Version,
-                ))
-                .add(1),
-            )
-            .filter(
-                Condition::all()
-                    .add(recognition_schedule::Column::TenantId.eq(tenant))
-                    .add(recognition_schedule::Column::ScheduleId.eq(schedule_id)),
-            )
-            .exec(txn)
-            .await
-            .map_err(|e| map_cap_violation("reduce total_deferred_minor", &e))?;
-        if result.rows_affected == 0 {
-            return Err(RepoError::Db(format!(
-                "recognition_schedule row absent for ({tenant}, {schedule_id})"
-            )));
-        }
-        Ok(())
+        self.change_schedule_money(
+            txn,
+            scope,
+            tenant,
+            schedule_id,
+            amount,
+            ScheduleDelta::Reduce,
+        )
+        .await
     }
 
-    /// Increase `total_deferred_minor` by `amount` (a positive delta) + bump
-    /// `version`, for `(tenant, schedule_id)` — a later deferring note (a debit
-    /// note) ADDS its deferred part to the live schedule it extends. The same
-    /// `col_expr(col, col + delta)` shape as [`Self::reduce_deferred`] (its
-    /// inverse), so the `deferred >= 0` CHECK is evaluated against the resulting
-    /// row; the `recognized <= total_deferred` CHECK can only relax (the total
-    /// grows). `rows_affected == 0` ⇒ no such schedule.
+    /// Apply an exact signed delta; validate stored invariants first and CAS observed state/version.
     ///
     /// # Errors
-    /// [`RepoError::Db`] when no row matched or on a scope / storage failure.
+    /// [`RepoError::RecognitionPolicyConflict`] when the schedule is absent or inaccessible;
+    /// [`RepoError::Money`] when `amount` disagrees with the stored currency metadata or the
+    /// exact result leaves the money contract; [`RepoError::MoneyOutCapExceeded`] when the
+    /// increase would leave `recognized` outside `0..=total_deferred`; [`RepoError::Conflict`]
+    /// when the observed version is stale, or on classified database contention;
+    /// [`RepoError::Db`] on a scope or storage failure; [`RepoError::InvalidStoredMoney`] when
+    /// the stored row is malformed.
     pub async fn increase_total_deferred(
+        &self,
         txn: &DbTx<'_>,
         scope: &AccessScope,
         tenant: Uuid,
         schedule_id: &str,
-        amount: i64,
+        amount: &PostedMoney,
     ) -> Result<(), RepoError> {
-        let result = recognition_schedule::Entity::update_many()
-            .secure()
-            .scope_with(scope)
-            .col_expr(
-                recognition_schedule::Column::TotalDeferredMinor,
-                Expr::col((
-                    recognition_schedule::Entity,
-                    recognition_schedule::Column::TotalDeferredMinor,
-                ))
-                .add(amount),
-            )
-            .col_expr(
-                recognition_schedule::Column::Version,
-                Expr::col((
-                    recognition_schedule::Entity,
-                    recognition_schedule::Column::Version,
-                ))
-                .add(1),
-            )
-            .filter(
-                Condition::all()
-                    .add(recognition_schedule::Column::TenantId.eq(tenant))
-                    .add(recognition_schedule::Column::ScheduleId.eq(schedule_id)),
-            )
-            .exec(txn)
-            .await
-            .map_err(|e| RepoError::Db(format!("increase total_deferred_minor: {e}")))?;
-        if result.rows_affected == 0 {
-            return Err(RepoError::Db(format!(
-                "recognition_schedule row absent for ({tenant}, {schedule_id})"
-            )));
-        }
-        Ok(())
+        self.change_schedule_money(
+            txn,
+            scope,
+            tenant,
+            schedule_id,
+            amount,
+            ScheduleDelta::Increase,
+        )
+        .await
     }
 
-    /// In-txn scoped read of all segments for `(tenant, schedule_id)`, ascending by
-    /// `segment_no` — the read-half of a schedule EXTEND (a debit note merging its
-    /// segments into the live schedule needs the current period set + the max
-    /// `segment_no` within the SAME txn). The in-txn twin of [`Self::list_segments`].
+    /// Read typed segment money in segment-number order, validating each spec against its scoped parent.
     ///
     /// # Errors
-    /// [`DbError`] on a scope or storage failure.
-    pub async fn list_segments_in_txn(
-        txn: &DbTx<'_>,
+    /// [`RepoError::Db`] on a scope or storage failure; [`RepoError::Conflict`] on classified
+    /// database contention. [`RepoError::InvalidStoredMoney`] when a stored amount is malformed
+    /// or off its currency contract.
+    pub async fn list_segments_in_txn<R: DBRunner>(
+        &self,
+        txn: &R,
         scope: &AccessScope,
         tenant: Uuid,
         schedule_id: &str,
-    ) -> Result<Vec<recognition_segment::Model>, DbError> {
+    ) -> Result<Vec<SegmentState>, RepoError> {
         let rows = recognition_segment::Entity::find()
             .secure()
             .scope_with(scope)
@@ -779,131 +668,128 @@ impl RecognitionRepo {
             .order_by(recognition_segment::Column::SegmentNo, Order::Asc)
             .all(txn)
             .await
-            .map_err(scope_to_db)?;
-        Ok(rows)
+            .map_err(|e| scope_to_repo(e, self.db.db().backend()))?;
+        let parent = self
+            .read_schedule_in_txn(txn, scope, tenant, schedule_id)
+            .await?;
+        rows.into_iter()
+            .map(|row| decode_segment(row, parent.as_ref()))
+            .collect()
     }
 
-    /// Add `amount` (a positive delta) to an EXISTING `PENDING` segment's
-    /// `amount_minor`, for `(tenant, schedule_id, segment_no)` — a debit note
-    /// extending the live schedule on a period it already covers folds its amount
-    /// into that period's segment (one row per period, UNIQUE
-    /// (`schedule_id`, `period_id`)). The filter requires `status = 'PENDING'` so a
-    /// period already released (`DONE`) or parked (`QUEUED`) is NOT silently grown
-    /// (that would strand revenue the run already recognized); the caller treats
-    /// `rows_affected == 0` as "cannot extend that period" and rolls the post back.
+    /// Pending amount changes share the same version protocol as queue/release.
     ///
     /// # Errors
-    /// [`RepoError::Db`] when no PENDING row matched or on a scope / storage failure.
+    /// [`RepoError::RecognitionPolicyConflict`] when the segment is absent or not PENDING;
+    /// [`RepoError::Money`] when `amount` disagrees with the stored currency metadata or the
+    /// exact result leaves the money contract; [`RepoError::MoneyOutCapExceeded`] when the sum
+    /// would be negative; [`RepoError::Conflict`] when the observed version is stale, or on
+    /// classified database contention; [`RepoError::Db`] on a scope or storage failure;
+    /// [`RepoError::InvalidStoredMoney`] when the stored row is malformed.
     pub async fn add_pending_segment_amount(
+        &self,
         txn: &DbTx<'_>,
         scope: &AccessScope,
         tenant: Uuid,
         schedule_id: &str,
         segment_no: i32,
-        amount: i64,
+        amount: &PostedMoney,
     ) -> Result<(), RepoError> {
-        let result = recognition_segment::Entity::update_many()
-            .secure()
-            .scope_with(scope)
-            .col_expr(
-                recognition_segment::Column::AmountMinor,
-                Expr::col((
-                    recognition_segment::Entity,
-                    recognition_segment::Column::AmountMinor,
-                ))
-                .add(amount),
-            )
-            .filter(
-                Condition::all()
-                    .add(recognition_segment::Column::TenantId.eq(tenant))
-                    .add(recognition_segment::Column::ScheduleId.eq(schedule_id))
-                    .add(recognition_segment::Column::SegmentNo.eq(segment_no))
-                    .add(recognition_segment::Column::Status.eq(SEGMENT_STATUS_PENDING)),
-            )
-            .exec(txn)
-            .await
-            .map_err(|e| RepoError::Db(format!("add segment amount: {e}")))?;
-        if result.rows_affected == 0 {
-            return Err(RepoError::Db(format!(
-                "no PENDING recognition_segment for ({tenant}, {schedule_id}, seg \
-                 {segment_no}) — cannot extend an already-released/parked period"
-            )));
+        let row = self
+            .required_segment(txn, scope, tenant, schedule_id, segment_no)
+            .await?;
+        if row.status != SEGMENT_STATUS_PENDING {
+            return Err(phase("cannot extend released or queued segment"));
         }
-        Ok(())
+        same_spec(&row.amount, amount)?;
+        let sum = exact(&row.amount)
+            .checked_add(&exact(amount))
+            .map_err(exact_error)?;
+        if sum.is_negative() {
+            return Err(cap("negative segment amount"));
+        }
+        let sum = sum
+            .into_posted_exact(row.amount.currency().clone())
+            .map_err(exact_error)?;
+        self.write_segment(
+            txn,
+            scope,
+            &row,
+            &sum,
+            &row.status,
+            row.recognized_at,
+            row.run_id,
+        )
+        .await
     }
 
-    /// Transition a fully-drained schedule `ACTIVE → COMPLETED` (design §4.6),
-    /// for `(tenant, schedule_id)` — the terminal stamp the recognition stamp
-    /// sidecar applies on the RELEASE path after the last segment commits `DONE`.
-    /// The filter requires the current `status` to be `ACTIVE` AND
-    /// `recognized_minor == total_deferred_minor` (a column-to-column equality:
-    /// the schedule has recognized everything it deferred), so the flip fires
-    /// exactly once — on the release that drains the last segment — and is a
-    /// no-op (`rows_affected == 0`) on every earlier release (the schedule is not
-    /// yet drained) and on a replay (already `COMPLETED`). Calling it after every
-    /// `stamp_segment_done` is therefore correct + idempotent.
-    ///
-    /// **No `version` bump** (unlike [`Self::mark_schedule_status`] /
-    /// [`Self::add_recognized`]): `COMPLETED` is the SAME schedule reaching its
-    /// terminal state, not a new lineage (a `replace`/`cancel` mints a new
-    /// version; completion does not). A scoped `update_many` inside the release
-    /// post txn. Returns `true` iff the row flipped (the last segment just
-    /// drained it), `false` otherwise (not yet drained, or already terminal).
-    ///
-    /// Reaching `COMPLETED` frees the partial `UNIQUE (tenant,
-    /// source_invoice_id, source_invoice_item_ref, revenue_stream) WHERE
-    /// status='ACTIVE'` one-live slot (a fresh deferred re-build of the same
-    /// business key is then admitted) and drops the schedule from the runner's
-    /// ACTIVE-only due feed + the `ledger_schedule_active_total` gauge.
+    /// Completion deliberately keeps the lineage/version; observed ACTIVE guards stale writers.
     ///
     /// # Errors
-    /// [`RepoError::Db`] on a scope or storage failure.
+    /// [`RepoError::Conflict`] when the observed ACTIVE row changed underneath, or on
+    /// classified database contention; [`RepoError::Db`] on a scope or storage failure;
+    /// [`RepoError::InvalidStoredMoney`] when the stored row is malformed.
     pub async fn complete_schedule_if_drained(
+        &self,
         txn: &DbTx<'_>,
         scope: &AccessScope,
         tenant: Uuid,
         schedule_id: &str,
     ) -> Result<bool, RepoError> {
-        let result = recognition_schedule::Entity::update_many()
-            .secure()
-            .scope_with(scope)
-            .col_expr(
-                recognition_schedule::Column::Status,
-                Expr::value(SCHEDULE_STATUS_COMPLETED.to_owned()),
-            )
-            .filter(
-                Condition::all()
-                    .add(recognition_schedule::Column::TenantId.eq(tenant))
-                    .add(recognition_schedule::Column::ScheduleId.eq(schedule_id))
-                    .add(recognition_schedule::Column::Status.eq(SCHEDULE_STATUS_ACTIVE))
-                    .add(
-                        Expr::col(recognition_schedule::Column::RecognizedMinor)
-                            .eq(Expr::col(recognition_schedule::Column::TotalDeferredMinor)),
-                    ),
-            )
-            .exec(txn)
+        let Some(row) = self
+            .read_schedule_in_txn(txn, scope, tenant, schedule_id)
+            .await?
+        else {
+            return Ok(false);
+        };
+        self.complete_observed_schedule_if_drained(txn, scope, &row)
             .await
-            .map_err(|e| RepoError::Db(format!("complete recognition_schedule: {e}")))?;
-        Ok(result.rows_affected > 0)
     }
 
-    /// Stamp one `recognition_segment` `DONE` (set `status = DONE`,
-    /// `recognized_at`, `run_id`) for `(tenant, schedule_id, segment_no)` — the
-    /// release marker the `RecognitionRunner`'s stamp sidecar writes in the SAME
-    /// post txn as the `DR CL / CR Revenue` entry (design §4.3). The filter
-    /// requires the current `status` to be `PENDING` or `QUEUED`, so a re-stamp of
-    /// an already-`DONE` segment matches no row (`rows_affected == 0`): this is the
-    /// at-most-once stamp guard, layered under the per-segment `RECOGNITION`
-    /// idempotency claim (a replay returns before the sidecar) and the
-    /// `UNIQUE (schedule, period_id)` key. `rows_affected == 0` therefore signals
-    /// either a foreign/absent segment or a concurrent release that already flipped
-    /// it — an invariant breach on the fresh-claim path, surfaced as
-    /// [`RepoError::Db`] so the post rolls back rather than double-crediting.
+    /// [`Self::complete_schedule_if_drained`] on a schedule the caller already
+    /// read or wrote in this transaction (for example the state
+    /// [`Self::add_recognized_to`] returns); the CAS guards the observed
+    /// ACTIVE state, version, currency metadata and both amounts, so the
+    /// drained decision taken on `row` holds for the stored row.
     ///
     /// # Errors
-    /// [`RepoError::Db`] when no `PENDING`/`QUEUED` row matched, or on any scope /
-    /// storage failure.
+    /// [`RepoError::Conflict`] when the observed ACTIVE row changed underneath or `row`
+    /// disagrees with it, or on classified database contention; [`RepoError::Db`] on a
+    /// scope or storage failure.
+    pub async fn complete_observed_schedule_if_drained(
+        &self,
+        txn: &DbTx<'_>,
+        scope: &AccessScope,
+        row: &ScheduleState,
+    ) -> Result<bool, RepoError> {
+        if row.status != SCHEDULE_STATUS_ACTIVE
+            || row.recognized.amount() != row.total_deferred.amount()
+        {
+            return Ok(false);
+        }
+        self.write_schedule(
+            txn,
+            scope,
+            row,
+            &row.total_deferred,
+            &row.recognized,
+            SCHEDULE_STATUS_COMPLETED,
+            row.version,
+        )
+        .await?;
+        Ok(true)
+    }
+
+    /// Release an eligible segment using its observed state/version; no nested retry.
+    ///
+    /// # Errors
+    /// [`RepoError::RecognitionPolicyConflict`] when the segment is absent, not PENDING/QUEUED,
+    /// or an earlier segment is not DONE; [`RepoError::Conflict`] when the observed version is
+    /// stale, or on classified database contention; [`RepoError::Db`] on a scope or storage
+    /// failure; [`RepoError::InvalidStoredMoney`] when the stored row is malformed or its
+    /// version is negative / exhausted.
     pub async fn stamp_segment_done(
+        &self,
         txn: &DbTx<'_>,
         scope: &AccessScope,
         tenant: Uuid,
@@ -912,61 +798,79 @@ impl RecognitionRepo {
         run_id: Uuid,
         recognized_at: OffsetDateTime,
     ) -> Result<(), RepoError> {
-        let result = recognition_segment::Entity::update_many()
-            .secure()
-            .scope_with(scope)
-            .col_expr(
-                recognition_segment::Column::Status,
-                Expr::value(SEGMENT_STATUS_DONE.to_owned()),
-            )
-            .col_expr(
-                recognition_segment::Column::RecognizedAt,
-                Expr::value(Some(recognized_at)),
-            )
-            .col_expr(
-                recognition_segment::Column::RunId,
-                Expr::value(Some(run_id)),
-            )
-            .filter(
-                Condition::all()
-                    .add(recognition_segment::Column::TenantId.eq(tenant))
-                    .add(recognition_segment::Column::ScheduleId.eq(schedule_id))
-                    .add(recognition_segment::Column::SegmentNo.eq(segment_no))
-                    .add(
-                        recognition_segment::Column::Status
-                            .is_in([SEGMENT_STATUS_PENDING, SEGMENT_STATUS_QUEUED]),
-                    ),
-            )
-            .exec(txn)
+        let row = self
+            .required_segment(txn, scope, tenant, schedule_id, segment_no)
+            .await?;
+        self.stamp_observed_segment_done(txn, scope, &row, run_id, recognized_at)
             .await
-            .map_err(|e| RepoError::Db(format!("stamp recognition_segment DONE: {e}")))?;
-        if result.rows_affected == 0 {
-            return Err(RepoError::Db(format!(
-                "recognition_segment ({tenant}, {schedule_id}, {segment_no}) absent or not \
-                 PENDING/QUEUED at stamp time"
-            )));
-        }
-        Ok(())
     }
 
-    // --- Out-of-txn reads (PDP In-scoped; SQL-level BOLA) ---
-
-    /// Read the `recognition_schedule` row for `(tenant, schedule_id)`, or `None`
-    /// when no such schedule exists. SQL-level BOLA: a foreign tenant yields no
-    /// row.
+    /// [`Self::stamp_segment_done`] on a segment the caller already read in this
+    /// transaction: the same phase and predecessor checks, with the CAS on the
+    /// observed status, version, period, currency metadata and amount instead of
+    /// a fresh read.
     ///
     /// # Errors
-    /// [`RepoError::Db`] on a scope or storage failure.
+    /// [`RepoError::RecognitionPolicyConflict`] when the segment is not PENDING/QUEUED or an
+    /// earlier segment is not DONE; [`RepoError::Conflict`] when the observation is stale or
+    /// disagrees with the stored row, or on classified database contention; [`RepoError::Db`] on a scope or storage failure;
+    /// [`RepoError::InvalidStoredMoney`] when its version is negative / exhausted.
+    pub async fn stamp_observed_segment_done(
+        &self,
+        txn: &DbTx<'_>,
+        scope: &AccessScope,
+        row: &SegmentState,
+        run_id: Uuid,
+        recognized_at: OffsetDateTime,
+    ) -> Result<(), RepoError> {
+        if !matches!(
+            row.status.as_str(),
+            SEGMENT_STATUS_PENDING | SEGMENT_STATUS_QUEUED
+        ) {
+            return Err(phase("segment is not pending or queued"));
+        }
+        if self
+            .count_predecessors_not_done_in(
+                txn,
+                scope,
+                row.tenant_id,
+                &row.schedule_id,
+                &row.period_id,
+            )
+            .await?
+            != 0
+        {
+            return Err(phase("earlier segment is not done"));
+        }
+        self.write_segment(
+            txn,
+            scope,
+            row,
+            &row.amount,
+            SEGMENT_STATUS_DONE,
+            Some(recognized_at),
+            Some(run_id),
+        )
+        .await
+    }
+
+    /// Standalone presentation lookup; financial decisions use the caller-runner twin.
+    ///
+    /// # Errors
+    /// [`RepoError::Db`] when no connection can be acquired or on a scope / storage failure;
+    /// [`RepoError::Conflict`] on classified database contention.
+    /// [`RepoError::InvalidStoredMoney`] when a stored amount is malformed or off its currency
+    /// contract.
     pub async fn read_schedule(
         &self,
         scope: &AccessScope,
         tenant: Uuid,
         schedule_id: &str,
-    ) -> Result<Option<recognition_schedule::Model>, RepoError> {
+    ) -> Result<Option<ScheduleState>, RepoError> {
         let conn = self
             .db
             .conn()
-            .map_err(|e| RepoError::Db(format!("conn: {e}")))?;
+            .map_err(|e| db_to_repo(e, self.db.db().backend()))?;
         let row = recognition_schedule::Entity::find()
             .secure()
             .scope_with(scope)
@@ -977,40 +881,29 @@ impl RecognitionRepo {
             )
             .one(&conn)
             .await
-            .map_err(|e| RepoError::Db(format!("read recognition_schedule: {e}")))?;
-        Ok(row)
+            .map_err(|e| scope_to_repo(e, self.db.db().backend()))?;
+        row.map(decode_schedule).transpose()
     }
 
-    /// List `recognition_schedule` headers for `tenant`, optionally narrowed to
-    /// one originating invoice (`source_invoice_id`) and/or one `revenue_stream`.
-    /// Backs the `GET /recognition-schedules` discovery surface and the
-    /// post-commit lookup that surfaces a freshly-minted `schedule_id` on
-    /// invoice-post. SQL-level BOLA: a foreign tenant yields no rows.
-    ///
-    /// Ordered by `(source_invoice_item_ref, version desc, schedule_id)` — the
-    /// trailing PK makes it a TOTAL order so the cap truncates deterministically
-    /// (schedules can share `(item_ref, version)`: different streams, archived
-    /// lineage). Returns `(rows, truncated)`: `truncated` is `true` when the
-    /// `(tenant[, stream])` scan exceeded the cap, so the caller can signal it
-    /// rather than silently drop the tail.
+    /// Typed discovery list ordered by item reference, descending version, then schedule ID. Return at most 500 rows and a truncation flag.
     ///
     /// # Errors
-    /// [`RepoError::Db`] on a scope or storage failure.
+    /// [`RepoError::Db`] when no connection can be acquired or on a scope / storage failure;
+    /// [`RepoError::Conflict`] on classified database contention.
+    /// [`RepoError::InvalidStoredMoney`] when a stored amount is malformed or off its currency
+    /// contract.
     pub async fn list_schedules(
         &self,
         scope: &AccessScope,
         tenant: Uuid,
         invoice_id: Option<&str>,
         revenue_stream: Option<&str>,
-    ) -> Result<(Vec<recognition_schedule::Model>, bool), RepoError> {
-        // A discovery lookup, not a paginated collection: a per-(tenant, invoice)
-        // result is tiny; the cap only fences a `revenue_stream`-only scan. Fetch
-        // one extra row to DETECT truncation (vs silently dropping the tail).
+    ) -> Result<(Vec<ScheduleState>, bool), RepoError> {
         const SCHEDULE_LIST_CAP: usize = 500;
         let conn = self
             .db
             .conn()
-            .map_err(|e| RepoError::Db(format!("conn: {e}")))?;
+            .map_err(|e| db_to_repo(e, self.db.db().backend()))?;
         let mut predicate = Condition::all().add(recognition_schedule::Column::TenantId.eq(tenant));
         if let Some(invoice_id) = invoice_id {
             predicate = predicate.add(recognition_schedule::Column::SourceInvoiceId.eq(invoice_id));
@@ -1019,7 +912,7 @@ impl RecognitionRepo {
             predicate =
                 predicate.add(recognition_schedule::Column::RevenueStream.eq(revenue_stream));
         }
-        let mut rows = recognition_schedule::Entity::find()
+        let rows = recognition_schedule::Entity::find()
             .secure()
             .scope_with(scope)
             .filter(predicate)
@@ -1032,7 +925,11 @@ impl RecognitionRepo {
             .limit(SCHEDULE_LIST_CAP as u64 + 1)
             .all(&conn)
             .await
-            .map_err(|e| RepoError::Db(format!("list recognition_schedule: {e}")))?;
+            .map_err(|e| scope_to_repo(e, self.db.db().backend()))?;
+        let mut rows = rows
+            .into_iter()
+            .map(decode_schedule)
+            .collect::<Result<Vec<_>, _>>()?;
         let truncated = rows.len() > SCHEDULE_LIST_CAP;
         if truncated {
             rows.truncate(SCHEDULE_LIST_CAP);
@@ -1045,22 +942,23 @@ impl RecognitionRepo {
         Ok((rows, truncated))
     }
 
-    /// List the `recognition_segment` rows for `(tenant, schedule_id)`, ordered
-    /// by `segment_no` (1:1 with `period_id`, so this is also period order).
-    /// SQL-level BOLA: a foreign tenant yields no rows.
+    /// Standalone typed segment list, ordered by immutable segment number.
     ///
     /// # Errors
-    /// [`RepoError::Db`] on a scope or storage failure.
+    /// [`RepoError::Db`] when no connection can be acquired or on a scope / storage failure;
+    /// [`RepoError::Conflict`] on classified database contention.
+    /// [`RepoError::InvalidStoredMoney`] when a stored amount is malformed or off its currency
+    /// contract.
     pub async fn list_segments(
         &self,
         scope: &AccessScope,
         tenant: Uuid,
         schedule_id: &str,
-    ) -> Result<Vec<recognition_segment::Model>, RepoError> {
+    ) -> Result<Vec<SegmentState>, RepoError> {
         let conn = self
             .db
             .conn()
-            .map_err(|e| RepoError::Db(format!("conn: {e}")))?;
+            .map_err(|e| db_to_repo(e, self.db.db().backend()))?;
         let rows = recognition_segment::Entity::find()
             .secure()
             .scope_with(scope)
@@ -1072,36 +970,22 @@ impl RecognitionRepo {
             .order_by(recognition_segment::Column::SegmentNo, Order::Asc)
             .all(&conn)
             .await
-            .map_err(|e| RepoError::Db(format!("list recognition_segment: {e}")))?;
-        Ok(rows)
+            .map_err(|e| scope_to_repo(e, self.db.db().backend()))?;
+        let parent = self
+            .read_schedule_in_txn(&conn, scope, tenant, schedule_id)
+            .await?;
+        rows.into_iter()
+            .map(|row| decode_segment(row, parent.as_ref()))
+            .collect()
     }
 
-    /// List the due releasable segments for `(tenant, period_id ≤ target)`,
-    /// joined to their ACTIVE schedule for the stream/currency/account context the
-    /// `RecognitionRunner` posts with, ordered by `schedule_id` then `segment_no`
-    /// (the runner releases each schedule's due segments in ascending `segment_no`
-    /// — the ordering GAP guard that the predecessor be `DONE` is Group E). A
-    /// segment whose schedule is not ACTIVE (`COMPLETED`/`REPLACED`/`CANCELLED`) is
-    /// dropped — a `COMPLETED` schedule has no due work and a `CANCELLED`/`REPLACED`
-    /// one is not released under its old id (design §4.6). SQL-level BOLA: a
-    /// foreign tenant yields no rows (both queries are `.secure().scope_with`).
-    ///
-    /// Implemented as a scoped segment scan + a per-distinct-schedule scoped
-    /// lookup (the gear has no cross-entity join idiom; every repo read is a
-    /// single-entity scoped query) — the schedule reads are bounded by the count
-    /// of distinct due schedules and memoized here.
-    ///
-    /// **Releasable-from set (`PENDING` + `QUEUED`).** Both `PENDING` and a
-    /// previously out-of-order-parked `QUEUED` segment are returned — the SAME
-    /// acceptance set [`Self::stamp_segment_done`] flips to `DONE`. This is the
-    /// Group F drain: a `QUEUED` segment is re-enumerated each run and releases
-    /// once its lower-period predecessor has committed `DONE` (the runner's
-    /// `count_predecessors_not_done` gate re-evaluates it); a still-blocked
-    /// `QUEUED` segment is simply re-parked (a no-op `mark_segment_queued`). Only
-    /// `DONE` segments are excluded (terminal — already released).
+    /// Advisory snapshot of PENDING/QUEUED segments of ACTIVE schedules through the target period. State-changing callers must reread on their attempt runner.
     ///
     /// # Errors
-    /// [`RepoError::Db`] on a scope or storage failure.
+    /// [`RepoError::Db`] when no connection can be acquired or on a scope / storage failure;
+    /// [`RepoError::Conflict`] on classified database contention.
+    /// [`RepoError::InvalidStoredMoney`] when a stored amount is malformed or off its currency
+    /// contract.
     pub async fn list_due_pending_segments(
         &self,
         scope: &AccessScope,
@@ -1111,14 +995,8 @@ impl RecognitionRepo {
         let conn = self
             .db
             .conn()
-            .map_err(|e| RepoError::Db(format!("conn: {e}")))?;
+            .map_err(|e| db_to_repo(e, self.db.db().backend()))?;
 
-        // Due releasable segments (PENDING or QUEUED, period_id ≤ target), ordered
-        // by schedule then segment_no. `period_id` is the `YYYYMM`
-        // lexical-sortable string, so a `<=` string compare is the period-order
-        // compare (1:1 with segment_no within a schedule). A QUEUED segment is
-        // re-enumerated so a later run drains it once its predecessor is DONE
-        // (Group F); only DONE is excluded (terminal).
         let segments = recognition_segment::Entity::find()
             .secure()
             .scope_with(scope)
@@ -1135,11 +1013,9 @@ impl RecognitionRepo {
             .order_by(recognition_segment::Column::SegmentNo, Order::Asc)
             .all(&conn)
             .await
-            .map_err(|e| RepoError::Db(format!("list due recognition_segment: {e}")))?;
+            .map_err(|e| scope_to_repo(e, self.db.db().backend()))?;
 
-        // Resolve each distinct owning schedule once (scoped), keeping only ACTIVE
-        // ones; cache the join context per schedule_id.
-        let mut schedule_ctx: HashMap<String, Option<recognition_schedule::Model>> = HashMap::new();
+        let mut schedule_ctx: HashMap<String, Option<ScheduleState>> = HashMap::new();
         let mut due = Vec::with_capacity(segments.len());
         for seg in segments {
             if !schedule_ctx.contains_key(&seg.schedule_id) {
@@ -1153,65 +1029,39 @@ impl RecognitionRepo {
                     )
                     .one(&conn)
                     .await
-                    .map_err(|e| {
-                        RepoError::Db(format!("read recognition_schedule for due segment: {e}"))
-                    })?;
-                schedule_ctx.insert(seg.schedule_id.clone(), row);
+                    .map_err(|e| scope_to_repo(e, self.db.db().backend()))?;
+                schedule_ctx.insert(
+                    seg.schedule_id.clone(),
+                    row.map(decode_schedule).transpose()?,
+                );
             }
-            // Only release segments of an ACTIVE schedule.
-            let Some(schedule) = schedule_ctx
-                .get(&seg.schedule_id)
-                .and_then(Option::as_ref)
-                .filter(|s| s.status == SCHEDULE_STATUS_ACTIVE)
-            else {
-                continue;
+            let Some(schedule) = schedule_ctx.get(&seg.schedule_id).and_then(Option::as_ref) else {
+                return Err(invalid("due recognition segment has no scoped parent"));
             };
+            let seg = decode_segment(seg, Some(schedule))?;
+            if schedule.status != SCHEDULE_STATUS_ACTIVE {
+                continue;
+            }
             due.push(DuePendingSegment {
                 schedule_id: seg.schedule_id,
                 segment_no: seg.segment_no,
                 period_id: seg.period_id,
-                amount_minor: seg.amount_minor,
+                amount: seg.amount,
                 revenue_stream: schedule.revenue_stream.clone(),
-                currency: schedule.currency.clone(),
-                total_deferred_minor: schedule.total_deferred_minor,
-                recognized_minor: schedule.recognized_minor,
+                total_deferred: schedule.total_deferred.clone(),
+                recognized: schedule.recognized.clone(),
             });
         }
         Ok(due)
     }
 
-    /// Disaggregate **net** RECOGNIZED revenue by stream for `(tenant, period_id?)`
-    /// (design §3.5 / §4.5), sourced from the **journal** — the `REVENUE` lines of
-    /// the tenant's `RECOGNITION` entries. Each segment release posts a
-    /// `DR CONTRACT_LIABILITY / CR REVENUE` entry; each clawback the mirror
-    /// `DR REVENUE / CR CONTRACT_LIABILITY`. The read groups those REVENUE lines by
-    /// `(period_id, revenue_stream)` and **signed-sums** them (a `CR` release adds,
-    /// a `DR` reversal subtracts → reversal-aware), ordered by
-    /// `(period_id, revenue_stream)`. `period_id` `None` ⇒ every period; `Some(_)`
-    /// narrows to that period. SQL-level BOLA: a foreign tenant yields no rows
-    /// (every query is `.secure().scope_with`).
-    ///
-    /// **Period = the journal entry's period, not the segment's.** A segment keeps
-    /// its *planned* `period_id` as the audit target even when an E-2 missed-close
-    /// releases it into the current OPEN period (§4.3); the journal entry — and so
-    /// each of its lines (every `journal_line.period_id` is persisted from the
-    /// owning entry's period) — carries the actual open period. Reading the entry's
-    /// REVENUE lines therefore reports the period the revenue truly landed in (and
-    /// nets out reversals), which a DONE-segment scan (gross, planned-period)
-    /// cannot.
-    ///
-    /// Implemented as two scoped single-entity reads + an in-memory group/SUM (the
-    /// gear has no cross-entity join / DB-side `GROUP BY` idiom): (1) the tenant's
-    /// `RECOGNITION` `journal_entry` ids (bounded to the recognition domain — one
-    /// per release/reversal, the same cardinality as the DONE segments), then (2)
-    /// their `REVENUE` `journal_line`s via `entry_id IN (…)`. The grouping key
-    /// `(period_id, revenue_stream)` is a `BTreeMap` key, so the result is ordered
-    /// by `(period_id, revenue_stream)`. Releases of a since-terminal schedule
-    /// (`COMPLETED`/`REPLACED`/`CANCELLED`) still contribute — their journal entries
-    /// are immutable historical fact, independent of the schedule's later lifecycle.
+    /// Exact net REVENUE from RECOGNITION journal entries, grouped and ordered by actual posting period, stream, and currency.
     ///
     /// # Errors
-    /// [`RepoError::Db`] on a scope or storage failure.
+    /// [`RepoError::Db`] when no connection can be acquired or on a scope / storage failure;
+    /// [`RepoError::Conflict`] on classified database contention.
+    /// [`RepoError::InvalidStoredMoney`] when a stored amount is malformed or off its currency
+    /// contract. [`RepoError::Money`] when the exact per-stream fold leaves the money contract.
     pub async fn list_revenue_disaggregation(
         &self,
         scope: &AccessScope,
@@ -1221,11 +1071,8 @@ impl RecognitionRepo {
         let conn = self
             .db
             .conn()
-            .map_err(|e| RepoError::Db(format!("conn: {e}")))?;
+            .map_err(|e| db_to_repo(e, self.db.db().backend()))?;
 
-        // (1) The tenant's RECOGNITION entry ids, optionally narrowed to the period
-        // (an entry's period == its lines' period, so this also prunes the line
-        // scan). Scoped (SQL-level BOLA); bounded to the recognition domain.
         let mut entry_filter = Condition::all()
             .add(journal_entry::Column::TenantId.eq(tenant))
             .add(journal_entry::Column::SourceDocType.eq(SourceDocType::Recognition.as_str()));
@@ -1238,7 +1085,7 @@ impl RecognitionRepo {
             .filter(entry_filter)
             .all(&conn)
             .await
-            .map_err(|e| RepoError::Db(format!("list recognition journal_entry: {e}")))?
+            .map_err(|e| scope_to_repo(e, self.db.db().backend()))?
             .into_iter()
             .map(|e| e.entry_id)
             .collect();
@@ -1246,9 +1093,6 @@ impl RecognitionRepo {
             return Ok(Vec::new());
         }
 
-        // (2) Their REVENUE lines. `journal_line.period_id` is the entry's period
-        // (the actual open period on an E-2 missed-close); `revenue_stream` is the
-        // per-stream tag both legs carry. Scoped.
         let lines = journal_line::Entity::find()
             .secure()
             .scope_with(scope)
@@ -1260,64 +1104,16 @@ impl RecognitionRepo {
             )
             .all(&conn)
             .await
-            .map_err(|e| RepoError::Db(format!("list recognition REVENUE journal_line: {e}")))?;
+            .map_err(|e| scope_to_repo(e, self.db.db().backend()))?;
 
-        // Net by (period_id, revenue_stream) → (Σ signed amount, currency). A
-        // BTreeMap key orders the result by (period_id, revenue_stream).
-        let mut grouped: std::collections::BTreeMap<(String, String), (i64, String)> =
-            std::collections::BTreeMap::new();
-        for line in lines {
-            // Recognition REVENUE legs always tag a stream; skip an untagged line
-            // defensively (no per-stream grain to attribute it to).
-            let Some(stream) = line.revenue_stream.clone() else {
-                continue;
-            };
-            // Signed: a CR REVENUE release recognizes (+), a DR REVENUE reversal
-            // claws back (−).
-            let signed = if line.side == Side::Credit.as_str() {
-                line.amount_minor
-            } else {
-                -line.amount_minor
-            };
-            let entry = grouped
-                .entry((line.period_id.clone(), stream))
-                .or_insert_with(|| (0, line.currency.clone()));
-            // i64 sum (the per-schedule cap CHECK bounds each schedule's release to
-            // its deferred total; the per-account no-negative CHECK bounds the
-            // aggregate — a single tenant/period/stream stays within i64).
-            entry.0 = entry.0.saturating_add(signed);
-        }
-        Ok(grouped
-            .into_iter()
-            .map(
-                |((period_id, revenue_stream), (recognized_minor, currency))| {
-                    RecognizedStreamEntry {
-                        period_id,
-                        revenue_stream,
-                        recognized_minor,
-                        currency,
-                    }
-                },
-            )
-            .collect())
+        fold_revenue(lines)
     }
 
-    /// Enumerate the distinct `(tenant_id, period_id)` pairs that have at least
-    /// one due releasable (`PENDING` or `QUEUED`) recognition segment — the
-    /// **cross-tenant work feed** the Group F `RecognitionRunJob` ticker triggers a
-    /// run for (one run per pair). An UNSCOPED, system-context read under the
-    /// sanctioned all-tenants [`AccessScope::allow_all`] (the AM reaper / tie-out /
-    /// queue-applier pattern), capped at `limit` rows scanned so a pathological
-    /// backlog can't load an unbounded set into memory; the distinct pairs are
-    /// folded in memory (the gear has no `DISTINCT`/`GROUP BY` access). A `QUEUED`
-    /// segment's own period IS enumerated so the next tick re-runs it and drains
-    /// the segment once its lower-period predecessor commits `DONE` (the runner's
-    /// predecessor gate re-evaluates it); only `DONE` segments contribute no work.
-    /// `effective_at` ordering is irrelevant — the per-pair run is idempotent and
-    /// re-evaluates due work itself.
+    /// Bounded scheduler enumeration of distinct tenant/planned-period pairs for PENDING/QUEUED segments; this is not a monetary decision feed.
     ///
     /// # Errors
-    /// [`RepoError::Db`] on a scope or storage failure.
+    /// [`RepoError::Db`] when no connection can be acquired or on a scope / storage failure;
+    /// [`RepoError::Conflict`] on classified database contention.
     pub async fn list_due_tenant_periods(
         &self,
         limit: u64,
@@ -1325,7 +1121,7 @@ impl RecognitionRepo {
         let conn = self
             .db
             .conn()
-            .map_err(|e| RepoError::Db(format!("conn: {e}")))?;
+            .map_err(|e| db_to_repo(e, self.db.db().backend()))?;
         let segments = recognition_segment::Entity::find()
             .secure()
             .scope_with(&AccessScope::allow_all())
@@ -1340,8 +1136,7 @@ impl RecognitionRepo {
             .limit(limit)
             .all(&conn)
             .await
-            .map_err(|e| RepoError::Db(format!("enumerate due tenant/periods: {e}")))?;
-        // Distinct (tenant, period) pairs, folded in memory (no DB-side DISTINCT).
+            .map_err(|e| scope_to_repo(e, self.db.db().backend()))?;
         let mut seen: std::collections::BTreeSet<(Uuid, String)> =
             std::collections::BTreeSet::new();
         for seg in segments {
@@ -1350,20 +1145,11 @@ impl RecognitionRepo {
         Ok(seen.into_iter().collect())
     }
 
-    // --- Ordering guard (Group E1, design §4.6) ---
-
-    /// Count this schedule's segments with a lower `period_id` (an earlier
-    /// period) that are NOT yet `DONE` — the **predecessor-not-done** check the
-    /// runner consults before releasing a segment (design §4.6 ordering). A
-    /// non-zero count means an earlier-period segment of the SAME schedule is
-    /// still `PENDING`/`QUEUED`, so this segment must be parked `QUEUED` rather
-    /// than released early. `period_id` is the `YYYYMM` lexical-sortable string,
-    /// so a `<` string compare is the period-order compare (1:1 with
-    /// `segment_no` within a schedule). Scoped (SQL-level BOLA); runs in the
-    /// runner's read connection (not the post txn).
+    /// Advisory standalone predecessor lookup; release attempts use the runner twin.
     ///
     /// # Errors
-    /// [`RepoError::Db`] on a scope or storage failure.
+    /// [`RepoError::Db`] when no connection can be acquired or on a scope / storage failure;
+    /// [`RepoError::Conflict`] on classified database contention.
     pub async fn count_predecessors_not_done(
         &self,
         scope: &AccessScope,
@@ -1374,7 +1160,23 @@ impl RecognitionRepo {
         let conn = self
             .db
             .conn()
-            .map_err(|e| RepoError::Db(format!("conn: {e}")))?;
+            .map_err(|e| db_to_repo(e, self.db.db().backend()))?;
+        self.count_predecessors_not_done_in(&conn, scope, tenant, schedule_id, period_id)
+            .await
+    }
+    /// Read predecessor states in the same attempt as release.
+    ///
+    /// # Errors
+    /// [`RepoError::Db`] on a scope or storage failure; [`RepoError::Conflict`] on classified
+    /// database contention.
+    pub async fn count_predecessors_not_done_in<R: DBRunner>(
+        &self,
+        runner: &R,
+        scope: &AccessScope,
+        tenant: Uuid,
+        schedule_id: &str,
+        period_id: &str,
+    ) -> Result<u64, RepoError> {
         let count = recognition_segment::Entity::find()
             .secure()
             .scope_with(scope)
@@ -1385,24 +1187,19 @@ impl RecognitionRepo {
                     .add(recognition_segment::Column::PeriodId.lt(period_id))
                     .add(recognition_segment::Column::Status.ne(SEGMENT_STATUS_DONE)),
             )
-            .count(&conn)
+            .count(runner)
             .await
-            .map_err(|e| RepoError::Db(format!("count predecessors not done: {e}")))?;
+            .map_err(|e| scope_to_repo(e, self.db.db().backend()))?;
         Ok(count)
     }
 
-    /// Mark a `PENDING` segment `QUEUED` — the out-of-order park (design §4.6):
-    /// a due segment whose lower-period predecessor is not yet `DONE` is not
-    /// released, it is moved `PENDING → QUEUED` so a later run drains it once the
-    /// predecessor commits. The filter requires the current status to be
-    /// `PENDING` (a `QUEUED`/`DONE` segment is left untouched — `rows_affected ==
-    /// 0` is then a benign no-op, not an error: a concurrent run may have already
-    /// queued/released it). A scoped UPDATE outside any post txn (queuing posts
-    /// no journal entry). `recognized_at`/`run_id` stay NULL — nothing was
-    /// recognized.
+    /// Standalone queue uses one transaction, with no repository retry.
     ///
     /// # Errors
-    /// [`RepoError::Db`] on a scope or storage failure.
+    /// [`RepoError::Db`] when the serializable transaction cannot be opened or committed, or on
+    /// a scope / storage failure; [`RepoError::Conflict`] when the observed version is stale,
+    /// or on classified database contention; [`RepoError::InvalidStoredMoney`] when the stored
+    /// segment is malformed or its version is negative / exhausted.
     pub async fn mark_segment_queued(
         &self,
         scope: &AccessScope,
@@ -1410,41 +1207,69 @@ impl RecognitionRepo {
         schedule_id: &str,
         segment_no: i32,
     ) -> Result<(), RepoError> {
-        let conn = self
-            .db
-            .conn()
-            .map_err(|e| RepoError::Db(format!("conn: {e}")))?;
-        recognition_segment::Entity::update_many()
-            .secure()
-            .scope_with(scope)
-            .col_expr(
-                recognition_segment::Column::Status,
-                Expr::value(SEGMENT_STATUS_QUEUED.to_owned()),
+        let repo = self.clone();
+        let scope = scope.clone();
+        let schedule_id = schedule_id.to_owned();
+        self.db
+            .db()
+            .transaction_ref_mapped_with_config(
+                toolkit_db::secure::TxConfig::serializable(),
+                move |txn| {
+                    Box::pin(async move {
+                        repo.mark_segment_queued_in(txn, &scope, tenant, &schedule_id, segment_no)
+                            .await
+                            .map_err(QueueAttemptError::Repository)
+                    })
+                },
             )
-            .filter(
-                Condition::all()
-                    .add(recognition_segment::Column::TenantId.eq(tenant))
-                    .add(recognition_segment::Column::ScheduleId.eq(schedule_id))
-                    .add(recognition_segment::Column::SegmentNo.eq(segment_no))
-                    .add(recognition_segment::Column::Status.eq(SEGMENT_STATUS_PENDING)),
-            )
-            .exec(&conn)
             .await
-            .map_err(|e| RepoError::Db(format!("mark recognition_segment QUEUED: {e}")))?;
-        Ok(())
+            .map_err(|e| match e {
+                QueueAttemptError::Repository(e) => e,
+                QueueAttemptError::Database(e) => db_to_repo(e, self.db.db().backend()),
+            })
     }
 
-    // --- Run-row orchestration (Group E2, design §4.3 / §7) ---
-
-    /// Read the `recognition_run` row for `(tenant, period_id, run_id)`, or `None`
-    /// when no such run exists — the run-trigger **dedup** read (design §4.3): a
-    /// trigger
-    /// whose `(tenant, period_id, run_id)` already has a row replays that run
-    /// reference instead of starting a second run. SQL-level BOLA: a foreign
-    /// tenant yields no row.
+    /// Queue within the caller attempt; absent/nonpending rows keep the existing no-op.
     ///
     /// # Errors
-    /// [`RepoError::Db`] on a scope or storage failure.
+    /// [`RepoError::Db`] on a scope or storage failure; [`RepoError::Conflict`] when the
+    /// observed version is stale, or on classified database contention;
+    /// [`RepoError::InvalidStoredMoney`] when the stored segment is malformed or its version is
+    /// negative / exhausted.
+    pub async fn mark_segment_queued_in(
+        &self,
+        txn: &DbTx<'_>,
+        scope: &AccessScope,
+        tenant: Uuid,
+        schedule_id: &str,
+        segment_no: i32,
+    ) -> Result<(), RepoError> {
+        let Some(row) = self
+            .read_segment_in(txn, scope, tenant, schedule_id, segment_no)
+            .await?
+        else {
+            return Ok(());
+        };
+        if row.status != SEGMENT_STATUS_PENDING {
+            return Ok(());
+        }
+        self.write_segment(
+            txn,
+            scope,
+            &row,
+            &row.amount,
+            SEGMENT_STATUS_QUEUED,
+            None,
+            None,
+        )
+        .await
+    }
+
+    /// Read a tenant/period/run orchestration record under the supplied scope.
+    ///
+    /// # Errors
+    /// [`RepoError::Db`] when no connection can be acquired or on a scope / storage failure;
+    /// [`RepoError::Conflict`] on classified database contention.
     pub async fn read_run(
         &self,
         scope: &AccessScope,
@@ -1455,7 +1280,7 @@ impl RecognitionRepo {
         let conn = self
             .db
             .conn()
-            .map_err(|e| RepoError::Db(format!("conn: {e}")))?;
+            .map_err(|e| db_to_repo(e, self.db.db().backend()))?;
         let row = recognition_run::Entity::find()
             .secure()
             .scope_with(scope)
@@ -1467,27 +1292,15 @@ impl RecognitionRepo {
             )
             .one(&conn)
             .await
-            .map_err(|e| RepoError::Db(format!("read recognition_run: {e}")))?;
+            .map_err(|e| scope_to_repo(e, self.db.db().backend()))?;
         Ok(row)
     }
 
-    /// Read the `recognition_run` row for `(tenant, run_id)` — the
-    /// `GET /recognition-runs/{run_id}` by-id source (read surface R4). The entity
-    /// PK is the 3-column `(tenant_id, period_id, run_id)`, but the surrogate
-    /// `run_id` is itself unique within a tenant in practice (the run-service mints
-    /// a fresh `run_id` per run; the period is folded into the PK only to defend a
-    /// client that REUSES one `run_id` across two periods), so
-    /// a by-`run_id` read yields at most one row in the common case — and when a
-    /// `run_id` WAS reused across periods this returns the first match (the by-id
-    /// read is a single-run lookup, not the period-qualified dedup [`Self::read_run`]
-    /// the run-service uses). Returns `None` when no run with that id exists for the
-    /// tenant. Scoped (SQL-level BOLA — a foreign tenant yields `None`, the same 404
-    /// as absent, no existence leak). Out-of-txn on a fresh scoped connection (a
-    /// pure read). Mirrors `AdjustmentRepo::read_refund_out_of_txn` (filtered on the
-    /// `Uuid` `run_id` rather than a `varchar` id).
+    /// Read a run by tenant and run ID; existing first-match semantics across periods remain.
     ///
     /// # Errors
-    /// [`RepoError::Db`] on a scope or storage failure.
+    /// [`RepoError::Db`] when no connection can be acquired or on a scope / storage failure;
+    /// [`RepoError::Conflict`] on classified database contention.
     pub async fn read_run_out_of_txn(
         &self,
         scope: &AccessScope,
@@ -1497,7 +1310,7 @@ impl RecognitionRepo {
         let conn = self
             .db
             .conn()
-            .map_err(|e| RepoError::Db(format!("conn: {e}")))?;
+            .map_err(|e| db_to_repo(e, self.db.db().backend()))?;
         recognition_run::Entity::find()
             .secure()
             .scope_with(scope)
@@ -1508,22 +1321,14 @@ impl RecognitionRepo {
             )
             .one(&conn)
             .await
-            .map_err(|e| RepoError::Db(format!("read recognition_run by run_id: {e}")))
+            .map_err(|e| scope_to_repo(e, self.db.db().backend()))
     }
 
-    /// List the `recognition_run` record rows for `tenant` under `scope`,
-    /// cursor-paginated via the canonical `query` (`$filter` over `run_id` /
-    /// `period_id` / `status`, `$orderby` / `limit` / `cursor`). The tenant
-    /// predicate is pre-applied to the secured select; the user `$filter` is
-    /// additive over it (SQL-level BOLA — a foreign value still ANDs the scope, so a
-    /// cross-tenant run never leaks). A bare list defaults to `run_id ASC`. The
-    /// `GET /recognition-runs` read-surface source; out-of-txn on a fresh scoped
-    /// connection. Mirrors `AdjustmentRepo::list_refunds`.
+    /// Preserve scoped OData pagination, filtering, and default run-ID ordering for nonmonetary orchestration records.
     ///
     /// # Errors
-    /// [`OdataPageError::Db`] on a storage / connection failure;
-    /// [`OdataPageError::Odata`] on a malformed `$filter` / `$orderby` / cursor
-    /// (the caller projects it to a canonical 400).
+    /// [`OdataPageError::Db`] on a storage / connection failure; [`OdataPageError::Odata`] on a
+    /// malformed `$filter` / `$orderby` / cursor (the caller projects it to a canonical 400).
     pub async fn list_runs(
         &self,
         scope: &AccessScope,
@@ -1534,9 +1339,6 @@ impl RecognitionRepo {
             .db
             .conn()
             .map_err(|e| OdataPageError::Db(format!("conn: {e}")))?;
-        // Pre-apply the tenant predicate to the secured select; the user `$filter`
-        // is applied additively by `paginate_odata` (it never replaces this scope —
-        // BOLA preserved).
         let base_select = recognition_run::Entity::find()
             .secure()
             .scope_with(scope)
@@ -1564,18 +1366,11 @@ impl RecognitionRepo {
         .map_err(map_odata_err)
     }
 
-    /// Insert a fresh `recognition_run` row in state `RUNNING` (design §4.3):
-    /// the orchestration wrapper around a [`RecognitionRunner`] pass. The run is
-    /// **not** itself the at-most-once dedup key (that is the per-segment
-    /// `RECOGNITION` gate); this row records the run for dedup + the
-    /// single-active-run guard + audit. The PK `(tenant, period_id, run_id)` makes
-    /// a duplicate run within one period collide — but the run-service dedups on a
-    /// prior [`Self::read_run`] before inserting, so a collision here surfaces as
-    /// [`RepoError::Db`]. A scoped insert (not in a post txn — the run row
-    /// brackets the runner, it is not part of any single segment's post).
+    /// Insert a RUNNING orchestration record, retaining existing uniqueness semantics.
     ///
     /// # Errors
-    /// [`RepoError::Db`] on a scope or storage failure.
+    /// [`RepoError::Db`] when no connection can be acquired, on a scope / storage failure, or
+    /// on a duplicate run identity; [`RepoError::Conflict`] on classified database contention.
     pub async fn insert_run(
         &self,
         scope: &AccessScope,
@@ -1587,7 +1382,7 @@ impl RecognitionRepo {
         let conn = self
             .db
             .conn()
-            .map_err(|e| RepoError::Db(format!("conn: {e}")))?;
+            .map_err(|e| db_to_repo(e, self.db.db().backend()))?;
         let am = recognition_run::ActiveModel {
             tenant_id: Set(tenant),
             period_id: Set(period_id.to_owned()),
@@ -1598,24 +1393,18 @@ impl RecognitionRepo {
         recognition_run::Entity::insert(am.clone())
             .secure()
             .scope_with_model(scope, &am)
-            .map_err(|e| RepoError::Db(format!("recognition_run scope: {e}")))?
+            .map_err(|e| scope_to_repo(e, self.db.db().backend()))?
             .exec(&conn)
             .await
-            .map_err(|e| RepoError::Db(format!("insert recognition_run: {e}")))?;
+            .map_err(|e| scope_to_repo(e, self.db.db().backend()))?;
         Ok(())
     }
 
-    /// Finish a `recognition_run`: flip `RUNNING → DONE` (`done = true`) or
-    /// `RUNNING → FAILED` (`done = false`) for `(tenant, period_id, run_id)`
-    /// (design §4.3). The filter carries the FULL 3-column key:
-    /// `run_id` alone is not unique — a client may reuse one `run_id` across two
-    /// periods (then BOTH run rows exist), so a `(tenant, run_id)` filter would flip
-    /// the sibling period's run row too. The filter also requires the current status
-    /// to be `RUNNING`, so a double-finish matches no row (`rows_affected == 0`) and
-    /// is a benign no-op (the run already reached a terminal state). A scoped UPDATE.
+    /// Finish only the matching RUNNING tenant/period/run row; repeated finish remains a no-op.
     ///
     /// # Errors
-    /// [`RepoError::Db`] on a scope or storage failure.
+    /// [`RepoError::Db`] when no connection can be acquired or on a scope / storage failure;
+    /// [`RepoError::Conflict`] on classified database contention.
     pub async fn finish_run(
         &self,
         scope: &AccessScope,
@@ -1627,7 +1416,7 @@ impl RecognitionRepo {
         let conn = self
             .db
             .conn()
-            .map_err(|e| RepoError::Db(format!("conn: {e}")))?;
+            .map_err(|e| db_to_repo(e, self.db.db().backend()))?;
         let next = if done {
             RUN_STATUS_DONE
         } else {
@@ -1649,32 +1438,15 @@ impl RecognitionRepo {
             )
             .exec(&conn)
             .await
-            .map_err(|e| RepoError::Db(format!("finish recognition_run: {e}")))?;
+            .map_err(|e| scope_to_repo(e, self.db.db().backend()))?;
         Ok(())
     }
 
-    // --- Current open period lookup (Group E3 missed-close, design §4.3 E-2) ---
-
-    /// The tenant's current OPEN fiscal period id (`YYYYMM`), or `None` when the
-    /// tenant has no open period — the **missed-close** target the runner falls
-    /// back to (design §4.3 E-2): a segment whose own target period is CLOSED
-    /// posts into the current open period instead (with its original target
-    /// recorded as audit linkage), never into a closed period. v1 has one legal
-    /// entity per tenant (the LE = the tenant), so the lookup keys on
-    /// `(tenant, legal_entity = tenant)`; the **lowest** `period_id` among the
-    /// tenant's OPEN periods is the current open period (periods open
-    /// chronologically and close oldest-first, so the earliest still-OPEN one is
-    /// "current"). Scoped (SQL-level BOLA).
-    ///
-    /// This is a minimal lookup the gear lacks otherwise (the foundation's
-    /// [`FiscalPeriodGuard`](crate::infra::posting::period::FiscalPeriodGuard)
-    /// only *asserts* a given period is OPEN; it does not *select* the current
-    /// open one) — flagged for the controller: confirm the "lowest OPEN
-    /// `period_id` = current" convention against the foundation's period-open job
-    /// semantics.
+    /// Return the earliest OPEN fiscal period for the tenant legal entity.
     ///
     /// # Errors
-    /// [`RepoError::Db`] on a scope or storage failure.
+    /// [`RepoError::Db`] when no connection can be acquired or on a scope / storage failure;
+    /// [`RepoError::Conflict`] on classified database contention.
     pub async fn current_open_period(
         &self,
         scope: &AccessScope,
@@ -1683,91 +1455,521 @@ impl RecognitionRepo {
         let conn = self
             .db
             .conn()
-            .map_err(|e| RepoError::Db(format!("conn: {e}")))?;
+            .map_err(|e| db_to_repo(e, self.db.db().backend()))?;
+        self.current_open_period_in(&conn, scope, tenant).await
+    }
+
+    /// Resolve missed-close reassignment in the release attempt's snapshot.
+    ///
+    /// # Errors
+    /// [`RepoError::Db`] on a scope or storage failure; [`RepoError::Conflict`] on classified
+    /// database contention.
+    pub async fn current_open_period_in<R: DBRunner>(
+        &self,
+        runner: &R,
+        scope: &AccessScope,
+        tenant: Uuid,
+    ) -> Result<Option<String>, RepoError> {
         let row = fiscal_period::Entity::find()
             .secure()
             .scope_with(scope)
             .filter(
                 Condition::all()
                     .add(fiscal_period::Column::TenantId.eq(tenant))
-                    // v1: one legal entity per tenant (LE = tenant).
                     .add(fiscal_period::Column::LegalEntityId.eq(tenant))
                     .add(fiscal_period::Column::Status.eq(PERIOD_STATUS_OPEN)),
             )
             .order_by(fiscal_period::Column::PeriodId, Order::Asc)
-            .one(&conn)
+            .one(runner)
             .await
-            .map_err(|e| RepoError::Db(format!("read current open period: {e}")))?;
+            .map_err(|e| scope_to_repo(e, self.db.db().backend()))?;
         Ok(row.map(|p| p.period_id))
     }
 }
 
-/// Map a `SecureORM` [`ScopeError`] into a [`DbError`], PRESERVING the inner
-/// `sea_orm::DbErr` so a serialization failure (`40001`) raised at a scoped read
-/// / write inside the Group H change txn stays retryable via the retry helper's
-/// `as_db_err`. Mirrors [`crate::infra::period_close`]'s `scope_to_db`. The
-/// scope-validation variants (which never carry a driver error) become a
-/// non-retryable `DbError::Other`. Used by the in-txn change helpers
-/// (`read_schedule_in_txn`, `mark_schedule_status`, `insert_segments`, …); the
-/// `add_recognized` cap path keeps its own [`map_cap_violation`] (it must classify
-/// the over-recognition CHECK, not retryability).
-fn scope_to_db(e: ScopeError) -> DbError {
-    match e {
-        ScopeError::Db(db_err) => DbError::Sea(db_err),
-        other => DbError::Other(anyhow::anyhow!("scope: {other}")),
+impl RecognitionRepo {
+    /// Require a scoped schedule without leaking foreign-tenant existence.
+    async fn required_schedule<R: DBRunner>(
+        &self,
+        runner: &R,
+        scope: &AccessScope,
+        tenant: Uuid,
+        id: &str,
+    ) -> Result<ScheduleState, RepoError> {
+        self.read_schedule_in_txn(runner, scope, tenant, id)
+            .await?
+            .ok_or_else(|| phase("schedule absent or inaccessible"))
+    }
+
+    /// Scoped attempt-local segment read; parent metadata is part of validation.
+    ///
+    /// # Errors
+    /// [`RepoError::Db`] on a scope or storage failure; [`RepoError::Conflict`] on classified
+    /// database contention. [`RepoError::InvalidStoredMoney`] when a stored amount is malformed
+    /// or off its currency contract.
+    pub async fn read_segment_in<R: DBRunner>(
+        &self,
+        runner: &R,
+        scope: &AccessScope,
+        tenant: Uuid,
+        schedule_id: &str,
+        segment_no: i32,
+    ) -> Result<Option<SegmentState>, RepoError> {
+        let Some(row) = self
+            .find_segment_row(runner, scope, tenant, schedule_id, segment_no)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let parent = self
+            .read_schedule_in_txn(runner, scope, tenant, schedule_id)
+            .await?;
+        decode_segment(row, parent.as_ref()).map(Some)
+    }
+
+    /// [`Self::read_segment_in`] of a segment of `parent`, a schedule the caller
+    /// already read on this runner: the segment is validated against `parent`
+    /// instead of reading the schedule row again.
+    ///
+    /// # Errors
+    /// [`RepoError::Db`] on a scope or storage failure; [`RepoError::Conflict`] on classified
+    /// database contention. [`RepoError::InvalidStoredMoney`] when a stored amount is malformed
+    /// or off its parent's currency contract.
+    pub async fn read_segment_of<R: DBRunner>(
+        &self,
+        runner: &R,
+        scope: &AccessScope,
+        parent: &ScheduleState,
+        segment_no: i32,
+    ) -> Result<Option<SegmentState>, RepoError> {
+        self.find_segment_row(
+            runner,
+            scope,
+            parent.tenant_id,
+            &parent.schedule_id,
+            segment_no,
+        )
+        .await?
+        .map(|row| decode_segment(row, Some(parent)))
+        .transpose()
+    }
+
+    /// The scoped stored segment row, undecoded.
+    async fn find_segment_row<R: DBRunner>(
+        &self,
+        runner: &R,
+        scope: &AccessScope,
+        tenant: Uuid,
+        schedule_id: &str,
+        segment_no: i32,
+    ) -> Result<Option<recognition_segment::Model>, RepoError> {
+        recognition_segment::Entity::find()
+            .secure()
+            .scope_with(scope)
+            .filter(
+                Condition::all()
+                    .add(recognition_segment::Column::TenantId.eq(tenant))
+                    .add(recognition_segment::Column::ScheduleId.eq(schedule_id))
+                    .add(recognition_segment::Column::SegmentNo.eq(segment_no)),
+            )
+            .one(runner)
+            .await
+            .map_err(|e| scope_to_repo(e, self.db.db().backend()))
+    }
+
+    /// Require a scoped segment for an amount or release operation.
+    async fn required_segment<R: DBRunner>(
+        &self,
+        runner: &R,
+        scope: &AccessScope,
+        tenant: Uuid,
+        id: &str,
+        segment_no: i32,
+    ) -> Result<SegmentState, RepoError> {
+        self.read_segment_in(runner, scope, tenant, id, segment_no)
+            .await?
+            .ok_or_else(|| phase("segment absent or inaccessible"))
+    }
+
+    /// Validate all correlated money before narrowing the changed value once.
+    async fn change_schedule_money(
+        &self,
+        txn: &DbTx<'_>,
+        scope: &AccessScope,
+        tenant: Uuid,
+        id: &str,
+        delta: &PostedMoney,
+        kind: ScheduleDelta,
+    ) -> Result<(), RepoError> {
+        let row = self.required_schedule(txn, scope, tenant, id).await?;
+        self.apply_schedule_delta(txn, scope, &row, delta, kind)
+            .await
+            .map(drop)
+    }
+
+    /// Apply a delta to an observed schedule: validate the correlated money,
+    /// narrow once, CAS on the observed state/version, and return the row as
+    /// written.
+    async fn apply_schedule_delta(
+        &self,
+        txn: &DbTx<'_>,
+        scope: &AccessScope,
+        row: &ScheduleState,
+        delta: &PostedMoney,
+        kind: ScheduleDelta,
+    ) -> Result<ScheduleState, RepoError> {
+        same_spec(&row.total_deferred, delta)?;
+        let total = exact(&row.total_deferred);
+        let recognized = exact(&row.recognized);
+        let (total, recognized) = match kind {
+            ScheduleDelta::Recognized => (
+                total,
+                recognized.checked_add(&exact(delta)).map_err(exact_error)?,
+            ),
+            ScheduleDelta::Reduce => (
+                total.checked_sub(&exact(delta)).map_err(exact_error)?,
+                recognized,
+            ),
+            ScheduleDelta::Increase => (
+                total.checked_add(&exact(delta)).map_err(exact_error)?,
+                recognized,
+            ),
+        };
+        if total.is_negative()
+            || recognized.is_negative()
+            || total
+                .checked_sub(&recognized)
+                .map_err(exact_error)?
+                .is_negative()
+        {
+            return Err(cap("recognized must be between zero and total deferred"));
+        }
+        let spec = row.total_deferred.currency();
+        let total = total.into_posted_exact(spec.clone()).map_err(exact_error)?;
+        let recognized = recognized
+            .into_posted_exact(spec.clone())
+            .map_err(exact_error)?;
+        let version = next_version(row.version)?;
+        self.write_schedule(txn, scope, row, &total, &recognized, &row.status, version)
+            .await?;
+        Ok(ScheduleState {
+            total_deferred: total,
+            recognized,
+            version,
+            ..row.clone()
+        })
+    }
+
+    /// One literal schedule CAS, including status because completion keeps the version.
+    ///
+    /// The predicate also pins the observed currency metadata and both stored
+    /// amounts, so an observation that disagrees with the row at the same
+    /// version (a caller-edited [`ScheduleState`]) is a conflict, never a write.
+    async fn write_schedule(
+        &self,
+        txn: &DbTx<'_>,
+        scope: &AccessScope,
+        old: &ScheduleState,
+        total: &PostedMoney,
+        recognized: &PostedMoney,
+        status: &str,
+        version: i64,
+    ) -> Result<(), RepoError> {
+        let result = recognition_schedule::Entity::update_many()
+            .secure()
+            .scope_with(scope)
+            .col_expr(
+                recognition_schedule::Column::TotalDeferred,
+                Expr::value(encode_amount(total)),
+            )
+            .col_expr(
+                recognition_schedule::Column::Recognized,
+                Expr::value(encode_amount(recognized)),
+            )
+            .col_expr(
+                recognition_schedule::Column::Status,
+                Expr::value(status.to_owned()),
+            )
+            .col_expr(recognition_schedule::Column::Version, Expr::value(version))
+            .filter(
+                Condition::all()
+                    .add(recognition_schedule::Column::TenantId.eq(old.tenant_id))
+                    .add(recognition_schedule::Column::ScheduleId.eq(&old.schedule_id))
+                    .add(recognition_schedule::Column::Version.eq(old.version))
+                    .add(recognition_schedule::Column::Status.eq(&old.status))
+                    .add(
+                        recognition_schedule::Column::Currency
+                            .eq(old.total_deferred.currency().code()),
+                    )
+                    .add(
+                        recognition_schedule::Column::CurrencyScale
+                            .eq(i16::from(old.total_deferred.currency().scale())),
+                    )
+                    .add(
+                        recognition_schedule::Column::TotalDeferred
+                            .eq(encode_amount(&old.total_deferred)),
+                    )
+                    .add(
+                        recognition_schedule::Column::Recognized.eq(encode_amount(&old.recognized)),
+                    ),
+            )
+            .exec(txn)
+            .await
+            .map_err(|e| scope_to_repo(e, self.db.db().backend()))?;
+        cas(result.rows_affected)
+    }
+
+    /// Shared amount/state CAS. Queue and release cannot silently overwrite pending money:
+    /// the predicate pins the observed period, currency metadata and stored amount as
+    /// well as version and status, so a caller-edited [`SegmentState`] is a conflict.
+    async fn write_segment(
+        &self,
+        txn: &DbTx<'_>,
+        scope: &AccessScope,
+        old: &SegmentState,
+        amount: &PostedMoney,
+        status: &str,
+        recognized_at: Option<OffsetDateTime>,
+        run_id: Option<Uuid>,
+    ) -> Result<(), RepoError> {
+        let version = next_version(old.version)?;
+        let result = recognition_segment::Entity::update_many()
+            .secure()
+            .scope_with(scope)
+            .col_expr(
+                recognition_segment::Column::Amount,
+                Expr::value(encode_amount(amount)),
+            )
+            .col_expr(
+                recognition_segment::Column::Status,
+                Expr::value(status.to_owned()),
+            )
+            .col_expr(recognition_segment::Column::Version, Expr::value(version))
+            .col_expr(
+                recognition_segment::Column::RecognizedAt,
+                Expr::value(recognized_at),
+            )
+            .col_expr(recognition_segment::Column::RunId, Expr::value(run_id))
+            .filter(
+                Condition::all()
+                    .add(recognition_segment::Column::TenantId.eq(old.tenant_id))
+                    .add(recognition_segment::Column::ScheduleId.eq(&old.schedule_id))
+                    .add(recognition_segment::Column::SegmentNo.eq(old.segment_no))
+                    .add(recognition_segment::Column::Version.eq(old.version))
+                    .add(recognition_segment::Column::Status.eq(&old.status))
+                    .add(recognition_segment::Column::PeriodId.eq(&old.period_id))
+                    .add(recognition_segment::Column::Currency.eq(old.amount.currency().code()))
+                    .add(
+                        recognition_segment::Column::CurrencyScale
+                            .eq(i16::from(old.amount.currency().scale())),
+                    )
+                    .add(recognition_segment::Column::Amount.eq(encode_amount(&old.amount))),
+            )
+            .exec(txn)
+            .await
+            .map_err(|e| scope_to_repo(e, self.db.db().backend()))?;
+        cas(result.rows_affected)
     }
 }
 
-/// Map a counter-write [`ScopeError`] to [`RepoError`]: a CHECK-constraint
-/// violation (the per-obligation over-recognition cap) becomes
-/// [`RepoError::MoneyOutCapExceeded`]; anything else stays a plain
-/// [`RepoError::Db`]. Mirrors `PaymentRepo::map_cap_violation`. Only
-/// `ScopeError::Db` can carry a driver CHECK error; the scope-validation
-/// variants never do.
-fn map_cap_violation(context: &str, err: &ScopeError) -> RepoError {
-    if let ScopeError::Db(db_err) = err
-        && is_check_violation(db_err)
+/// Existing schedule delta semantics, including signed reversals.
+enum ScheduleDelta {
+    Recognized,
+    Reduce,
+    Increase,
+}
+/// A stale observation always aborts the whole caller attempt.
+fn cas(rows: u64) -> Result<(), RepoError> {
+    if rows == 1 {
+        Ok(())
+    } else {
+        Err(RepoError::Conflict("recognition row changed".into()))
+    }
+}
+/// Exhausted/negative versions are storage faults, never retryable contention.
+fn next_version(version: i64) -> Result<i64, RepoError> {
+    if version < 0 {
+        return Err(invalid("negative recognition version"));
+    }
+    version
+        .checked_add(1)
+        .ok_or_else(|| invalid("recognition version exhausted"))
+}
+/// Exact arithmetic over posted values without intermediate carrier bounds.
+fn exact(value: &PostedMoney) -> ExactAmount {
+    ExactAmount::from_decimal(value.amount())
+}
+/// Preserve numeric rejection separately from stored corruption.
+fn exact_error(error: ExactError) -> RepoError {
+    match error {
+        ExactError::Money(e) => RepoError::Money(e),
+        other => RepoError::Db(other.to_string()),
+    }
+}
+/// Input metadata must match; scale is never an identity dimension.
+fn same_spec(a: &PostedMoney, b: &PostedMoney) -> Result<(), RepoError> {
+    Ok(a.currency().ensure_same(b.currency())?)
+}
+/// Creation permits zero and forbids negative schedule/segment amounts.
+fn nonnegative(value: &PostedMoney) -> Result<(), RepoError> {
+    if value.amount() < Decimal::ZERO {
+        Err(cap("negative recognition amount"))
+    } else {
+        Ok(())
+    }
+}
+/// Existing recognition cap rejection is refined to OverRecognition by its adapter.
+fn cap(detail: &str) -> RepoError {
+    RepoError::MoneyOutCapExceeded(detail.to_owned())
+}
+/// Valid stored phase rejecting an operation is a business error, not contention.
+fn phase(detail: &str) -> RepoError {
+    RepoError::RecognitionPolicyConflict(detail.to_owned())
+}
+/// Corrupt stored values fail closed before any operation can repair them.
+fn invalid(detail: &str) -> RepoError {
+    RepoError::InvalidStoredMoney(detail.to_owned())
+}
+/// Closed set already enforced by the fresh schema.
+fn valid_schedule_status(status: &str) -> bool {
+    matches!(
+        status,
+        SCHEDULE_STATUS_ACTIVE
+            | SCHEDULE_STATUS_COMPLETED
+            | SCHEDULE_STATUS_REPLACED
+            | SCHEDULE_STATUS_CANCELLED
+    )
+}
+
+/// Decode and validate the complete correlated schedule state.
+fn decode_schedule(row: recognition_schedule::Model) -> Result<ScheduleState, RepoError> {
+    let total_deferred = decode_money(&row.total_deferred, &row.currency, row.currency_scale)?;
+    let recognized = decode_money(&row.recognized, &row.currency, row.currency_scale)?;
+    if total_deferred.amount() < Decimal::ZERO
+        || recognized.amount() < Decimal::ZERO
+        || recognized.amount() > total_deferred.amount()
+        || row.version < 0
+        || !valid_schedule_status(&row.status)
     {
-        return RepoError::MoneyOutCapExceeded(format!("{context}: {err}"));
+        return Err(invalid("invalid stored recognition schedule invariants"));
     }
-    RepoError::Db(format!("{context}: {err}"))
+    Ok(ScheduleState {
+        tenant_id: row.tenant_id,
+        schedule_id: row.schedule_id,
+        payer_tenant_id: row.payer_tenant_id,
+        source_invoice_id: row.source_invoice_id,
+        source_invoice_item_ref: row.source_invoice_item_ref,
+        po_allocation_group: row.po_allocation_group,
+        subscription_ref: row.subscription_ref,
+        revenue_stream: row.revenue_stream,
+        total_deferred,
+        recognized,
+        policy_ref: row.policy_ref,
+        ssp_snapshot_ref: row.ssp_snapshot_ref,
+        vc_estimate_ref: row.vc_estimate_ref,
+        vc_method_ref: row.vc_method_ref,
+        status: row.status,
+        version: row.version,
+    })
 }
 
-/// Returns `true` iff `err` is a `CHECK`-constraint violation on either
-/// supported backend. Replicates `PaymentRepo::is_check_violation` (a private
-/// fn in that module) with the recognition constraint-name prefix added:
-/// `sea_orm::SqlErr` has no `Check` discriminant, so a real CHECK violation
-/// always surfaces unstructured (`sql_err() == None`); a structured error
-/// (unique / FK) is therefore never a CHECK and is refused here. The constraint
-/// NAME is the most stable signal — the over-recognition cap
-/// (`chk_ledger_recognition_schedule_recognized_le_deferred`, prefix
-/// `chk_ledger_recognition_schedule_`) is the only recognition constraint whose
-/// violation must map to `MoneyOutCapExceeded`, so match it by name first and
-/// keep the SQLSTATE-anchored fallbacks (Postgres `23514`, `SQLite` extended
-/// code `275`) as a backstop.
-fn is_check_violation(err: &DbErr) -> bool {
-    if err.sql_err().is_some() {
-        return false;
+/// Decode each segment's own metadata and validate it against its scoped parent.
+fn decode_segment(
+    row: recognition_segment::Model,
+    parent: Option<&ScheduleState>,
+) -> Result<SegmentState, RepoError> {
+    let amount = decode_money(&row.amount, &row.currency, row.currency_scale)?;
+    let parent = parent.ok_or_else(|| invalid("recognition segment has no scoped parent"))?;
+    if amount.currency() != parent.total_deferred.currency()
+        || amount.amount() < Decimal::ZERO
+        || row.version < 0
+        || !matches!(
+            row.status.as_str(),
+            SEGMENT_STATUS_PENDING | SEGMENT_STATUS_QUEUED | SEGMENT_STATUS_DONE
+        )
+    {
+        return Err(invalid(
+            "invalid stored recognition segment invariants or parent spec",
+        ));
     }
-    let msg = err.to_string().to_lowercase();
-    if msg.contains("chk_ledger_recognition_schedule_") {
-        return true;
+    Ok(SegmentState {
+        tenant_id: row.tenant_id,
+        schedule_id: row.schedule_id,
+        segment_no: row.segment_no,
+        period_id: row.period_id,
+        amount,
+        version: row.version,
+        status: row.status,
+        recognized_at: row.recognized_at,
+        run_id: row.run_id,
+    })
+}
+
+/// Exact per-(stream, currency, account) revenue accumulator keyed for stable output order.
+type RevenueFold =
+    std::collections::BTreeMap<(String, String, String), (CurrencySpec, ExactAmount)>;
+
+/// Sum every signed contribution exactly before a single bounded result per currency grain.
+fn fold_revenue(lines: Vec<journal_line::Model>) -> Result<Vec<RecognizedStreamEntry>, RepoError> {
+    let mut grouped = RevenueFold::new();
+    for line in lines {
+        let decoded = super::journal_repo::decode_line(&line)?;
+        let money = decoded.money;
+        if money.amount() < Decimal::ZERO
+            || decoded
+                .functional_money
+                .as_ref()
+                .is_some_and(|v| v.amount() < Decimal::ZERO)
+        {
+            return Err(invalid("negative stored recognized revenue line"));
+        }
+        let Some(stream) = line.revenue_stream else {
+            continue;
+        };
+        let signed = match line.side.as_str() {
+            s if s == Side::Credit.as_str() => exact(&money),
+            s if s == Side::Debit.as_str() => ExactAmount::from_decimal(Decimal::ZERO)
+                .checked_sub(&exact(&money))
+                .map_err(exact_error)?,
+            _ => return Err(invalid("invalid recognized revenue side")),
+        };
+        let entry = grouped
+            .entry((line.period_id, stream, money.currency().code().to_owned()))
+            .or_insert_with(|| {
+                (
+                    money.currency().clone(),
+                    ExactAmount::from_decimal(Decimal::ZERO),
+                )
+            });
+        if &entry.0 != money.currency() {
+            return Err(invalid("conflicting stored recognition revenue scale"));
+        }
+        entry.1 = entry.1.checked_add(&signed).map_err(exact_error)?;
     }
-    msg.contains("check constraint")
-        || msg.contains("check_violation")
-        || msg.contains("sqlite_constraint_check")
-        || msg.contains("sqlstate 23514")
-        || msg.contains("sqlstate: 23514")
-        || msg.contains("sqlstate=23514")
-        || msg.contains("code 23514")
-        || msg.contains("code: 23514")
-        || msg.contains("(23514)")
-        || msg.contains("(23514:")
-        || msg.starts_with("23514:")
-        || msg.contains(" 23514:")
-        || (msg.contains("sqlite")
-            && (msg.contains("code 275")
-                || msg.contains("code: 275")
-                || msg.contains("(275)")
-                || msg.contains("(275:")))
+    grouped
+        .into_iter()
+        .map(|((period_id, revenue_stream, _), (spec, amount))| {
+            Ok(RecognizedStreamEntry {
+                period_id,
+                revenue_stream,
+                recognized: amount.into_posted_exact(spec).map_err(exact_error)?,
+            })
+        })
+        .collect()
+}
+
+#[cfg(test)]
+#[path = "recognition_repo_tests.rs"]
+mod tests;
+
+/// Preserve both infrastructure and repository failures across standalone queue transaction rollback.
+#[derive(Debug)]
+enum QueueAttemptError {
+    Repository(RepoError),
+    Database(DbError),
+}
+impl From<DbError> for QueueAttemptError {
+    fn from(error: DbError) -> Self {
+        Self::Database(error)
+    }
 }

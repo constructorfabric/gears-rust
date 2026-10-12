@@ -7,7 +7,7 @@
 //! constraint trigger `trg_journal_entry_balanced` keeps pointing at it.
 //!
 //! NULL-aware so existing single-currency posts (every line's
-//! `functional_amount_minor` NULL) stay byte-green: let
+//! `functional_amount` NULL) stay byte-green: let
 //! `f = count(functional NOT NULL)`. `f = 0` → skip (single-currency).
 //! `f = line_count` → enforce `SUM(DR.functional) = SUM(CR.functional)`.
 //! `0 < f < line_count` → RAISE (a partial-functional entry is a posting bug —
@@ -33,14 +33,14 @@ const PG_UP_STATEMENTS: &[&str] = &[
           currency_mismatch int;
           func_count        int;
           unbalanced        int;
-          func_imbalance    bigint;
+          func_imbalance    numeric;
         BEGIN
           SELECT count(*),
                  count(DISTINCT l.payer_tenant_id),
                  count(*) FILTER (WHERE l.currency <> NEW.entry_currency
-                                  AND NOT (l.amount_minor = 0
-                                           AND l.functional_amount_minor IS NOT NULL)),
-                 count(*) FILTER (WHERE l.functional_amount_minor IS NOT NULL)
+                                  AND NOT (l.amount::numeric = 0
+                                           AND l.functional_amount IS NOT NULL)),
+                 count(*) FILTER (WHERE l.functional_amount IS NOT NULL)
             INTO line_count, payer_count, currency_mismatch, func_count
             FROM bss.ledger_journal_line l
            WHERE (l.tenant_id, l.period_id, l.entry_id)
@@ -63,8 +63,8 @@ const PG_UP_STATEMENTS: &[&str] = &[
             WHERE (l.tenant_id, l.period_id, l.entry_id)
                   = (NEW.tenant_id, NEW.period_id, NEW.entry_id)
             GROUP BY l.currency, l.currency_scale
-            HAVING sum(CASE WHEN l.side = 'DR' THEN l.amount_minor
-                            ELSE -l.amount_minor END) <> 0
+            HAVING sum(CASE WHEN l.side = 'DR' THEN l.amount::numeric
+                            ELSE -l.amount::numeric END) <> 0
           ) u;
           IF unbalanced > 0 THEN
             RAISE EXCEPTION 'LEDGER_ENTRY_UNBALANCED entry=%', NEW.entry_id;
@@ -78,8 +78,14 @@ const PG_UP_STATEMENTS: &[&str] = &[
             RAISE EXCEPTION 'LEDGER_ENTRY_FUNCTIONAL_PARTIAL entry=%', NEW.entry_id;
           END IF;
           IF func_count = line_count THEN
-            SELECT coalesce(sum(CASE WHEN l.side = 'DR' THEN l.functional_amount_minor
-                                     ELSE -l.functional_amount_minor END), 0)
+            IF (SELECT count(DISTINCT (l.functional_currency, l.functional_currency_scale))
+                FROM bss.ledger_journal_line l
+                WHERE (l.tenant_id, l.period_id, l.entry_id)
+                      = (NEW.tenant_id, NEW.period_id, NEW.entry_id)) <> 1 THEN
+              RAISE EXCEPTION 'LEDGER_ENTRY_FUNCTIONAL_METADATA_MISMATCH entry=%', NEW.entry_id;
+            END IF;
+            SELECT coalesce(sum(CASE WHEN l.side = 'DR' THEN l.functional_amount::numeric
+                                     ELSE -l.functional_amount::numeric END), 0)
               INTO func_imbalance
               FROM bss.ledger_journal_line l
              WHERE (l.tenant_id, l.period_id, l.entry_id)
@@ -106,8 +112,8 @@ const PG_DOWN_STATEMENTS: &[&str] = &[
           SELECT count(*),
                  count(DISTINCT l.payer_tenant_id),
                  count(*) FILTER (WHERE l.currency <> NEW.entry_currency
-                                  AND NOT (l.amount_minor = 0
-                                           AND l.functional_amount_minor IS NOT NULL))
+                                  AND NOT (l.amount::numeric = 0
+                                           AND l.functional_amount IS NOT NULL))
             INTO line_count, payer_count, currency_mismatch
             FROM bss.ledger_journal_line l
            WHERE (l.tenant_id, l.period_id, l.entry_id)
@@ -129,8 +135,8 @@ const PG_DOWN_STATEMENTS: &[&str] = &[
             WHERE (l.tenant_id, l.period_id, l.entry_id)
                   = (NEW.tenant_id, NEW.period_id, NEW.entry_id)
             GROUP BY l.currency, l.currency_scale
-            HAVING sum(CASE WHEN l.side = 'DR' THEN l.amount_minor
-                            ELSE -l.amount_minor END) <> 0
+            HAVING sum(CASE WHEN l.side = 'DR' THEN l.amount::numeric
+                            ELSE -l.amount::numeric END) <> 0
           ) u;
           IF unbalanced > 0 THEN
             RAISE EXCEPTION 'LEDGER_ENTRY_UNBALANCED entry=%', NEW.entry_id;

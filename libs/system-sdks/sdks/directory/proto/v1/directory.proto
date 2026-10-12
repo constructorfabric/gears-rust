@@ -1,6 +1,6 @@
 syntax = "proto3";
 
-package gear_orchestrator.v1.directory;
+package directory.v1;
 
 import "google/protobuf/empty.proto";
 

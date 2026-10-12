@@ -21,7 +21,7 @@ use account_management_sdk::ListUsersQuery as SdkListUsersQuery;
 use toolkit::api::canonical_prelude::*;
 use toolkit::api::odata::OData;
 use toolkit_odata::ODataQuery;
-use toolkit_odata::filter::convert_expr_to_filter_node;
+use toolkit_odata::filter::{FilterField, convert_expr_to_filter_node};
 use toolkit_security::SecurityContext;
 
 use crate::api::rest::dto::{UserCreateRequestDto, UserDto, UserUpdateRequestDto};
@@ -63,8 +63,11 @@ pub async fn list_users(
 /// - `$filter`: typed validation against [`IdpUserFilterField`]
 ///   (unknown fields, type mismatches, unsupported ops surface as
 ///   `DomainError::Validation` → HTTP 400).
-/// - `$orderby`: forwarded unchanged when non-empty; the service
-///   injects the default order + `id ASC` tiebreaker when `None`.
+/// - `$orderby`: forwarded unchanged when non-empty; otherwise the
+///   order a continuation cursor carries; the service injects the
+///   default order + `id ASC` tiebreaker when `None`. Either order's
+///   fields are whitelisted against [`IdpUserFilterField`] (unknown
+///   field → `DomainError::Validation` → HTTP 400).
 /// - `limit`: clamped to `[1, max_top]`; defaults to
 ///   [`IdpUserPagination::DEFAULT_TOP`] (50) when omitted.
 /// - `cursor`: encoded via [`toolkit_odata::CursorV1::encode`] and
@@ -138,31 +141,17 @@ pub(super) fn lower_odata_to_list_users_query(
     let order = if query.order.0.is_empty() {
         // Caller didn't pass $orderby. Prefer the cursor's encoded
         // order over the service-side default — this is what makes
-        // continuation work for non-default orders.
+        // continuation work for non-default orders. The cursor is
+        // caller-held, so its order is caller input exactly like
+        // `$orderby` and passes the same whitelist: a forged
+        // `s = "+foo,+id"` is the same 400, not an unknown field
+        // handed to the plugin.
+        if let Some(order) = cursor_order.as_ref() {
+            ensure_known_order_fields(order, "cursor order")?;
+        }
         cursor_order
     } else {
-        // Whitelist caller-supplied $orderby fields against
-        // IdpUserFilterField — the OData extractor accepts arbitrary
-        // field names at parse time (it's untyped per the framework's
-        // design), so this is the seam that catches `$orderby=foo asc`
-        // and surfaces it as 400 Validation. Without this gate, an
-        // unknown field would silently no-op at the plugin layer.
-        use toolkit_odata::filter::FilterField;
-        let known: std::collections::HashSet<&'static str> = IdpUserFilterField::FIELDS
-            .iter()
-            .map(toolkit_odata::filter::FilterField::name)
-            .collect();
-        for key in &query.order.0 {
-            if !known.contains(key.field.as_str()) {
-                return Err(DomainError::Validation {
-                    detail: format!(
-                        "list_users: invalid $orderby: unknown field `{}` \
-                         (allowed: {:?})",
-                        key.field, known
-                    ),
-                });
-            }
-        }
+        ensure_known_order_fields(&query.order, "$orderby")?;
         Some(query.order)
     };
 
@@ -174,6 +163,35 @@ pub(super) fn lower_odata_to_list_users_query(
         q = q.with_order(o);
     }
     Ok(q)
+}
+
+/// Whitelist order fields against [`IdpUserFilterField`] — the `OData`
+/// extractor accepts arbitrary field names at parse time (it's untyped per
+/// the framework's design), so this is the seam that catches
+/// `$orderby=foo asc` (and the same order carried in a continuation
+/// cursor) and surfaces it as 400 Validation. Without this gate an unknown
+/// field reaches the plugin, which may no-op on it or panic.
+fn ensure_known_order_fields(
+    order: &toolkit_odata::ODataOrderBy,
+    source: &str,
+) -> Result<(), DomainError> {
+    let known: Vec<&'static str> = IdpUserFilterField::FIELDS
+        .iter()
+        .map(FilterField::name)
+        .collect();
+    match order
+        .0
+        .iter()
+        .find(|key| !known.contains(&key.field.as_str()))
+    {
+        Some(key) => Err(DomainError::Validation {
+            detail: format!(
+                "list_users: invalid {source}: unknown field `{}` (allowed: {known:?})",
+                key.field
+            ),
+        }),
+        None => Ok(()),
+    }
 }
 
 #[cfg(test)]

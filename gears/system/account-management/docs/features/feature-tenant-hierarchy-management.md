@@ -19,6 +19,7 @@
   - [Closure-Table Maintenance](#closure-table-maintenance)
   - [Depth-Threshold Evaluation](#depth-threshold-evaluation)
   - [Soft-Delete Preconditions](#soft-delete-preconditions)
+  - [Recursive Visible-Set Resolution](#recursive-visible-set-resolution)
   - [Hard-Delete Leaf-First Scheduler](#hard-delete-leaf-first-scheduler)
   - [Provisioning Reaper Compensation](#provisioning-reaper-compensation)
   - [Hierarchy-Integrity Check](#hierarchy-integrity-check)
@@ -159,6 +160,7 @@ Provides the core tenant CRUD surface the platform is built around: the hierarch
 **Success Scenarios**:
 
 - Caller retrieves the direct children of a given tenant with pagination cursors and optional `status` filter (`active`, `suspended`, `deleted`; `provisioning` is never surfaced).
+- Caller retrieves every descendant visible to them under a given tenant in one cursor-paginated listing (`recursive=true`), searching `name` through the OData string operators, each row carrying its ancestor chain relative to the requested tenant.
 
 **Error Scenarios**:
 
@@ -168,10 +170,12 @@ Provides the core tenant CRUD surface the platform is built around: the hierarch
 **Steps**:
 
 1. [ ] - `p1` - Validate caller's `SecurityContext` and authorization scope - `inst-flow-listch-validate-caller`
-2. [ ] - `p1` - Normalize pagination inputs (cursor, page size capped by platform policy) and optional `status` filter - `inst-flow-listch-normalize`
+2. [ ] - `p1` - Normalize pagination inputs (cursor, page size capped by platform policy), the optional `status` filter, and the `recursive` flag (exactly `true` / `false`, default `false`; any other value → `CanonicalError::InvalidArgument`, HTTP 400) - `inst-flow-listch-normalize`
 3. [ ] - `p1` - Query `dbtable-tenants` for direct children (`parent_id = {tenant_id}`) excluding `provisioning` rows, applying the status filter and cursor - `inst-flow-listch-query`
-4. [ ] - `p1` - Re-hydrate each row's public `tenant_type` from the Types Registry - `inst-flow-listch-hydrate-type`
-5. [ ] - `p1` - **RETURN** `200` with page of children and next-cursor - `inst-flow-listch-return-200`
+4. [ ] - `p1` - **IF** `recursive=true`, replace the depth-1 pin of step 3 with `algo-recursive-visible-set` (parent Respect-visible from `{tenant_id}`), same status filter and cursor - `inst-flow-listch-recursive-set`
+5. [ ] - `p1` - Re-hydrate each row's public `tenant_type` from the Types Registry - `inst-flow-listch-hydrate-type`
+6. [ ] - `p1` - **IF** `recursive=true`, attach each row's `ancestors` — the chain from the child of `{tenant_id}` down to the row's direct parent (`id`, `name`, `tenant_type`), empty for a direct child; the key is absent without the flag - `inst-flow-listch-ancestors`
+7. [ ] - `p1` - **RETURN** `200` with page of children and next-cursor - `inst-flow-listch-return-200`
 
 ### Update Tenant Mutable Fields
 
@@ -332,6 +336,25 @@ Provides the core tenant CRUD surface the platform is built around: the hierarch
 4. [ ] - `p1` - **IF** any resource association remains - `inst-algo-sdelpc-resources`
    1. [ ] - `p1` - **RETURN** `CanonicalError::FailedPrecondition` (HTTP 400) with `reason=TENANT_HAS_RESOURCES` - `inst-algo-sdelpc-resources-return`
 5. [ ] - `p1` - **RETURN** pass - `inst-algo-sdelpc-pass`
+
+### Recursive Visible-Set Resolution
+
+- [ ] `p1` - **ID**: `cpt-cf-account-management-algo-tenant-hierarchy-management-recursive-visible-set`
+
+**Input**: `tenant_id` (listing root), the caller's PDP-emitted `AccessScope`, its barrier-relaxed clone, the OData query.
+
+**Output**: One cursor page of the tenants that level-by-level iteration of `flow-list-children` would reach from `tenant_id` under the caller's scope, each with `child_count` and its ancestor chain relative to `tenant_id`.
+
+**Steps**:
+
+> Generalises the direct-child carve-out of `flow-list-children`: a row is returned iff its parent is in `tenant_id`'s subtree and visible under the caller's original PDP-emitted scope — which carries its own barrier mode and any `descendant_status` restriction, so no barrier clamp is hard-coded — and every ancestor between `tenant_id` and the row is visible under that scope too; the row itself is bounded by the barrier-relaxed clone of the scope. Under the barrier-respecting scope AM's PEP requests, a self-managed direct child of any visible tenant is therefore returned as an identity (its `child_count` reads `0`), and nothing below a barrier is ever returned.
+
+1. [ ] - `p1` - Run the PEP gate and the parent-existence gate of `flow-list-children` (`list_children` action on `tenant_id`; the parent must exist and be SDK-visible under the barrier-respecting scope, otherwise `CanonicalError::NotFound`) - `inst-algo-rvs-gate`
+2. [ ] - `p1` - Resolve the visible parent set as a subquery of the page statement: `dbtable-tenants.id` selected under the caller's original PDP-emitted scope (the authorization boundary; its barrier mode and any `descendant_status` restriction apply) and restricted to `SELECT descendant_id FROM dbtable-tenant-closure WHERE ancestor_id = {tenant_id}` - `inst-algo-rvs-visible-set`
+3. [ ] - `p1` - Page `dbtable-tenants` with `parent_id IN (visible set)`, the `provisioning` exclusion, the hidden `status IN (active, suspended)` default, and the caller's `$filter` / `$orderby` / cursor, under the barrier-relaxed clone of the caller's scope (the relaxed scope bounds rows to the caller's own subtree and preserves the scope's other restrictions) - `inst-algo-rvs-page`
+4. [ ] - `p1` - For the page's rows, read their strict ancestors from `dbtable-tenant-closure`, keep those with `depth > depth({tenant_id})` under the caller's original scope, and order each chain by depth ascending - `inst-algo-rvs-chains`
+5. [ ] - `p1` - Drop every row whose chain is missing a depth between `depth({tenant_id}) + 1` and the row's parent: an ancestor on its path is not visible under the caller's scope (a per-descendant `descendant_status` restriction, or a barrier change committed between steps 3 and 4), so iteration could not reach it. A page may therefore hold fewer than the requested rows; its cursor stays valid - `inst-algo-rvs-complete-chain`
+6. [ ] - `p1` - **RETURN** the page with `child_count` per row (barrier-gated, as in `flow-list-children`) and the ancestor chain per row - `inst-algo-rvs-return`
 
 ### Hard-Delete Leaf-First Scheduler
 
@@ -570,16 +593,20 @@ GET `/tenants/{tenant_id}` **MUST** return tenant details (`id`, `parent_id`, `t
 
 - [x] `p1` - **ID**: `cpt-cf-account-management-dod-tenant-hierarchy-management-children-query-paginated`
 
-GET `/tenants/{tenant_id}/children` **MUST** return direct children (single-level, not transitive) with cursor pagination and optional `status` filter across `{active, suspended, deleted}`; `provisioning` children **MUST NOT** be surfaced. Page size **MUST** be capped by platform policy; deeper barrier-aware traversal is out of scope (owned by `tenant-resolver-plugin`).
+GET `/tenants/{tenant_id}/children` **MUST** return direct children by default and, with `recursive=true`, every descendant visible to the caller under the same visibility rules (`algo-recursive-visible-set`), each row carrying `ancestors` — the chain from the child of `{tenant_id}` down to the row's direct parent, empty for a direct child; the key **MUST** be absent without the flag. Both modes **MUST** be cursor-paginated with an optional `status` filter across `{active, suspended, deleted}`; `provisioning` children **MUST NOT** be surfaced; `name` **MUST** accept `eq`, `ne`, `in`, `contains`, `startswith`, `endswith` — case-sensitive with `%` / `_` matched literally on PostgreSQL; on SQLite the match is ASCII case-insensitive and `%`, `_`, `\` are not matched literally (the shared OData `LIKE` builder emits no `ESCAPE` clause), and the contract states both. Page size **MUST** be capped by platform policy. The Tenant Resolver SDK facade remains the barrier-mode traversal primitive for gears; this endpoint does not replace it.
+
+The recursive set **MUST** equal what level-by-level iteration of the direct listing reaches under the same scope: a row whose path from `{tenant_id}` crosses a tenant the caller's scope hides (barrier or `descendant_status`) **MUST NOT** be returned, even when a concurrent mode conversion commits between the page read and the ancestor read. A cursor **MUST** be bound to the mode it was minted in; replaying it with a different `recursive` value **MUST** fail like a changed `$filter` (`400`, `FILTER_MISMATCH`), and so **MUST** a cursor without a fingerprint (issued before mode binding) replayed with `recursive=true`; the direct listing keeps accepting such cursors.
 
 **Implements**:
 
 - `cpt-cf-account-management-flow-tenant-hierarchy-management-list-children`
+- `cpt-cf-account-management-algo-tenant-hierarchy-management-recursive-visible-set`
 
 **Touches**:
 
 - API: `GET /api/account-management/v1/tenants/{tenant_id}/children` (`listChildren`)
 - DB: `cpt-cf-account-management-dbtable-tenants`
+- DB: `cpt-cf-account-management-dbtable-tenant-closure`
 
 ### IdP Tenant-Provision Contract
 
@@ -734,7 +761,7 @@ Hierarchy-mutating operations on overlapping scopes **MUST** resolve with determ
 - [ ] PATCH `status=deleted` is rejected with `CanonicalError::FailedPrecondition` (HTTP 400); PATCH modifying `parent_id`, `tenant_type`, `self_managed`, or `depth` is rejected with `CanonicalError::InvalidArgument` (HTTP 400) in each case.
 - [ ] **Post-service-wiring target**: DELETE on the root tenant returns `CanonicalError::InvalidArgument` (HTTP 400) with `reason=ROOT_TENANT_CANNOT_DELETE`; DELETE on a tenant with a non-deleted child returns `CanonicalError::FailedPrecondition` (HTTP 400) with `reason=TENANT_HAS_CHILDREN`; DELETE on a tenant with remaining Resource-Group-owned resources returns `CanonicalError::FailedPrecondition` (HTTP 400) with `reason=TENANT_HAS_RESOURCES`; DELETE on a childless, resource-free non-root tenant transitions `tenants.status=deleted` and rewrites `tenant_closure.descendant_status=deleted` atomically. *Current behavior*: the `TENANT_HAS_RESOURCES` arm fires once the AM gear entry-point binds `RgResourceOwnershipChecker` via `ClientHub` (the `#1626` filter whitelist has shipped) — see the §5 DoD note for details.
 - [ ] GET `/tenants/{id}` for a tenant in internal `provisioning` state returns `CanonicalError::NotFound` (HTTP 404); GET for an SDK-visible tenant returns `200` with `tenant_type` re-hydrated to the public chained identifier.
-- [ ] GET `/tenants/{id}/children` returns direct children only (no transitive descendants), paginated with a next-cursor, filtered by the optional `status` parameter, and never surfaces `provisioning` rows.
+- [ ] GET `/tenants/{id}/children` returns direct children only by default (no transitive descendants) and, with `recursive=true`, every visible descendant with its `ancestors` chain; both modes are paginated with a next-cursor, filtered by the optional `status` filter, and never surface `provisioning` rows.
 - [ ] After retention expiry, the hard-delete background job processes due tenants in `depth DESC` order; a parent is not hard-deleted while any `tenants` child still exists; `IdpPluginClient::deprovision_tenant` is invoked exactly once per tenant before its `tenants` row is removed; closure rows where `descendant_id = tenant_id` are deleted in the same transaction as the `tenants` row delete.
 - [ ] A synthetic IdP `deprovision_tenant` terminal failure during hard-delete leaves the `tenants` row intact, emits a `dependency_health` metric increment labeled `target=idp, op=deprovision_tenant`, emits an `actor=system` audit via `errors-observability`, and retries on the next scheduler tick.
 - [ ] A retention tick where a due child is deferred because `deprovision_tenant` failed and the parent is also due keeps the parent `tenants` row intact because the in-transaction child-existence guard observes the remaining child; the parent emits deferred-cleanup telemetry and is retried on a later tick.
@@ -752,7 +779,7 @@ Hierarchy-mutating operations on overlapping scopes **MUST** resolve with determ
 - **User-level IdP operations (user provision / deprovision / query)** — *Owned by `idp-user-operations-contract`* (DECOMPOSITION §2.5). Tenant-side IdP operations (tenant-provision / tenant-deprovision) remain in this feature as hierarchy-op side-effects.
 - **Tenant metadata CRUD, schemas, inheritance resolution** — *Owned by `tenant-metadata`* (DECOMPOSITION §2.7). This FEATURE persists only the metadata entries the IdP provider returns at saga step 3; the schema catalog and resolution logic live in that feature. Metadata rows are removed through the tenant-metadata cascade-delete contract when a tenant row is removed.
 - **User-group Resource Group type registration and lifecycle** — *Owned by `user-groups`* (DECOMPOSITION §2.6). The soft-delete precondition check reads the Resource Group ownership graph but does not register types or manage user-group lifecycle.
-- **Read-only plugin query facade (`get_tenant`, `get_ancestors`, `get_descendants`, barrier-mode reductions)** — *Owned by `tenant-resolver-plugin`* (DECOMPOSITION §2.9). That plugin reads AM-owned `tenants` + `tenant_closure` directly via a dedicated SecureConn read-only pool; this feature writes the tables the plugin consumes.
+- **Read-only plugin query facade (`get_tenant`, `get_ancestors`, `get_descendants`, barrier-mode reductions)** — *Owned by `tenant-resolver-plugin`* (DECOMPOSITION §2.9). That plugin reads AM-owned `tenants` + `tenant_closure` directly via a dedicated SecureConn read-only pool; this feature writes the tables the plugin consumes. The REST `recursive=true` children listing is not that facade — it is this feature's own paginated read over `tenants` + `tenant_closure` (`algo-recursive-visible-set`).
 - **Cross-cutting error taxonomy, RFC 9457 envelope, audit pipeline, reliability/SLA policy, data-classification policy, metric catalog naming-alignment contract** — *Owned by `errors-observability`* (DECOMPOSITION §2.8). This FEATURE emits metric samples and audit events per the catalogs registered there; the public `code` identifiers and metric-family canonical names are catalog-resolved, not redefined here.
 - **Tenant lifecycle CloudEvents / event bus integration** — *Deferred to a future EVT gear* (DESIGN §4.1). v1 remains synchronous and request-driven; advisory depth threshold is an operator-visible warning signal (metric + structured log), not a CloudEvent.
 - **Subtree moves (reparenting)** — *Not supported in v1* (DESIGN §3.2 `TenantService`). `update_tenant` accepts only `name` and `status`; no subtree-wide closure rebuild is required because no subtree-move mutator exists.

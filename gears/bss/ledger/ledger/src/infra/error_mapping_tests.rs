@@ -29,6 +29,8 @@ fn each_variant_maps_to_expected_category() {
         (DomainError::MissingPayer(d()), 400),
         (DomainError::MixedLegalEntity(d()), 400),
         (DomainError::InconsistentScale(d()), 400),
+        (DomainError::InvalidPostingIncrement(d()), 400),
+        (DomainError::ConcurrentModification(d()), 409),
         (DomainError::AmountOutOfRange(d()), 400),
         (DomainError::EntryTooLarge(d()), 400),
         (DomainError::InvalidRequest(d()), 400),

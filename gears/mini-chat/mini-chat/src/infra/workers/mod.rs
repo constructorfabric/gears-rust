@@ -3,13 +3,14 @@
 //! Each worker is an autonomous async task with its own interval loop
 //! and graceful shutdown via [`CancellationToken`].
 //!
-//! - [`orphan_watchdog`] requires leader election (K8s Lease or noop).
+//! - [`orphan_watchdog`] and [`upload_reaper`] require leader election (K8s Lease or noop).
 //! - [`thread_summary_worker`] and [`cleanup_worker`] are outbox handlers
 //!   processed by the outbox pipeline (decoupled strategy, parallel across replicas).
 
 pub mod cleanup_worker;
 pub mod orphan_watchdog;
 pub mod thread_summary_worker;
+pub mod upload_reaper;
 
 use std::future::Future;
 use std::time::{Duration, Instant};
@@ -141,6 +142,7 @@ fn log_worker_result(name: &str, result: Result<anyhow::Result<()>, tokio::task:
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use std::sync::Arc;

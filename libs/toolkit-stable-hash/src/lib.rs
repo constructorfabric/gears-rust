@@ -5,6 +5,7 @@
 //! Algorithms in this crate keep their output stable across compatible
 //! releases. They are not suitable for security-sensitive hashing.
 
+/// Murmur3 x86 32-bit hash implementation.
 mod murmur3;
 pub use murmur3::murmur3_x86_32;
 

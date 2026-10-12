@@ -9,7 +9,7 @@
 //! `source_claim` and the `routing` state. No standalone `routing_config` exists.
 //!
 //! Outbox tables are not here either — they come from
-//! `outbox_migrations_with_prefix("types_registry_outbox")`.
+//! `outbox_migrations_with_prefix("types_registry__outbox")`.
 //!
 //! # Tenant columns
 //!

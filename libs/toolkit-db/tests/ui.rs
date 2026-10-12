@@ -4,6 +4,11 @@
 //! produce compile-time errors, ensuring security properties are enforced by
 //! the type system.
 
+// Skipped under coverage, like every other trybuild suite in the workspace:
+// the coverage lane runs a nightly, whose diagnostics are not the stable ones
+// the `.stderr` files record, and trybuild on nightly-2026-08-21 no longer
+// finds the crate's enabled features, so a `pgq` case builds without `pgq`.
+#[cfg(not(coverage_nightly))]
 #[test]
 fn compile_fail_tests() {
     let t = trybuild::TestCases::new();

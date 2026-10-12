@@ -127,15 +127,51 @@ impl LlmProviderError {
 #[allow(clippy::unwrap_used)] // Compile-time-known regex patterns; panics in init are intentional
 static RE_RESP_ID: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(resp_|chatcmpl-|cmpl-|msg_)[A-Za-z0-9]+").unwrap());
+/// Provider file and vector-store IDs (`OpenAI` `file-…`/`vs_…`, Azure
+/// `assistant-…`, Anthropic `file_…`). The length floor keeps words like
+/// "file-based" and `file_search` intact.
+#[allow(clippy::unwrap_used)]
+static RE_STORAGE_ID: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(file-|file_|assistant-|vs_)[A-Za-z0-9]{12,}").unwrap());
 #[allow(clippy::unwrap_used)]
 static RE_URL: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"https?://[^\s,\])}"']+"#).unwrap());
 #[allow(clippy::unwrap_used)]
 static RE_CRED: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(sk-[A-Za-z0-9]{10,}|Bearer\s+[A-Za-z0-9._\-]+)").unwrap());
 
-/// Regex-based scrubbing of provider response IDs, URLs, and credential fragments.
+/// Classifies a non-SSE response by status before its body is parsed:
+/// the gateway's own HTTP 504 Problem (deadline) is a timeout, and a
+/// provider's own HTTP 429
+/// (passed through by OAGW) is a rate limit, not a generic provider error.
+/// `Retry-After` in seconds is forwarded when present.
+pub(crate) fn error_from_status(parts: &http::response::Parts) -> Option<LlmProviderError> {
+    // A 504 with a Problem body is the gateway's own deadline
+    // (`deadline_exceeded`): a timeout. A provider's own 504 keeps its JSON
+    // error body and stays a provider error.
+    let is_problem = parts
+        .headers
+        .get(http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.starts_with("application/problem+json"));
+    if parts.status == http::StatusCode::GATEWAY_TIMEOUT && is_problem {
+        return Some(LlmProviderError::Timeout);
+    }
+    if parts.status != http::StatusCode::TOO_MANY_REQUESTS {
+        return None;
+    }
+    let retry_after_secs = parts
+        .headers
+        .get(http::header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse::<u64>().ok());
+    Some(LlmProviderError::RateLimited { retry_after_secs })
+}
+
+/// Regex-based scrubbing of provider response/file/vector-store IDs, URLs,
+/// and credential fragments.
 pub(crate) fn sanitize_provider_message(msg: &str) -> String {
     let sanitized = RE_RESP_ID.replace_all(msg, "[provider_id]");
+    let sanitized = RE_STORAGE_ID.replace_all(&sanitized, "[provider_id]");
     let sanitized = RE_URL.replace_all(&sanitized, "[url]");
     RE_CRED.replace_all(&sanitized, "[credential]").into_owned()
 }
@@ -471,7 +507,7 @@ impl Stream for ProviderStream {
 /// Provider-agnostic LLM trait. Each provider adapter implements this.
 ///
 /// The `upstream_alias` parameter identifies the OAGW upstream to route
-/// through. It is resolved per-request by [`ProviderResolver`] based on
+/// through. It is resolved per-request by [`ProviderResolver`](crate::infra::llm::provider_resolver::ProviderResolver) based on
 /// the model's `provider_id` and the tenant's endpoint configuration.
 #[async_trait::async_trait]
 pub trait LlmProvider: Send + Sync {
@@ -504,5 +540,6 @@ pub fn llm_request(model: impl Into<String>) -> LlmRequestBuilder {
 // ════════════════════════════════════════════════════════════════════════════
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 #[path = "mod_tests.rs"]
 mod mod_tests;

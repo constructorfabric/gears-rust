@@ -1,0 +1,149 @@
+replicaCount: 1
+
+image:
+  registry: ghcr.io
+  repository: constructorfabric/flight-control
+  tag: "dev"
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  name: ""
+  automount: true
+  annotations: {}
+
+command: ["/app/flight-control"]
+args: ["--config", "/app/config/flight-control.yaml", "run"]
+
+service:
+  type: ClusterIP
+  port: 8087
+
+grpc:
+  enabled: true
+  port: 50051
+
+# Optional public route to the API edge.
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts:
+    - host: flight-control.local
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+
+directoryEndpoint: ""
+
+# TokenReview authentication for grpc-hub.
+saToken:
+  enabled: true
+  audience: toolkit-internal
+  mountPath: /var/run/secrets/tokens/toolkit-internal
+  fileName: token
+  expirationSeconds: 3600
+
+probes:
+  liveness:
+    path: /healthz
+    initialDelaySeconds: 5
+    periodSeconds: 15
+    failureThreshold: 3
+  readiness:
+    path: /readyz
+    initialDelaySeconds: 3
+    periodSeconds: 5
+    failureThreshold: 6
+
+resources:
+  requests:
+    cpu: 250m
+    memory: 512Mi
+  limits:
+    memory: 2Gi
+
+extraEnv: []
+extraEnvFrom: []
+extraVolumes: []
+extraVolumeMounts: []
+podLabels: {}
+podAnnotations: {}
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: false
+  capabilities:
+    drop: ["ALL"]
+nodeSelector: {}
+affinity: {}
+tolerations: []
+
+config:
+  mountPath: /app/config/flight-control.yaml
+  fileName: flight-control.yaml
+  data:
+    server:
+      home_dir: "/app/data"
+
+    logging:
+      default:
+        console_format: "json"
+        console_level: info
+        file_level: info
+
+    gears:
+      api-gateway:
+        config:
+          bind_addr: "0.0.0.0:{{ .Values.service.port }}"
+          advertise_uri: 'http://{{ include "toolkit-common.fullname" . }}:{{ .Values.service.port }}'
+          enable_docs: true
+          cors_enabled: false
+          openapi:
+            title: "CF/Gears Flight Control API"
+            version: "0.1.0"
+            description: "CF/Gears Flight Control API Documentation"
+          defaults:
+            body_limit_bytes: 64000000
+          auth_disabled: false
+          require_auth_by_default: true
+          internal_auth:
+            provider: kube
+            audiences: ["toolkit-internal"]
+            token_path: '{{ .Values.saToken.mountPath }}/{{ .Values.saToken.fileName }}'
+          gateway_proxy:
+            enabled: true
+            directory_endpoint: "http://127.0.0.1:{{ .Values.grpc.port }}"
+            sync_interval_secs: 5
+
+      grpc-hub:
+        config:
+          listen_addr: "0.0.0.0:{{ .Values.grpc.port }}"
+          internal_auth:
+            provider: kube
+            audiences: ["{{ .Values.saToken.audience }}"]
+          internal_auth_enforcement: required
+
+      authn-resolver:
+        config:
+          vendor: "constructorfabric"
+
+      static-authn-plugin:
+        config:
+          vendor: "constructorfabric"
+          priority: 100
+          mode: accept_all
+
+      service-discovery:
+        config: {}
+
+      types-registry:
+        config: {}
+

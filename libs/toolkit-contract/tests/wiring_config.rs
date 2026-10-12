@@ -169,6 +169,128 @@ fn default_wiring_is_local() {
     assert!(matches!(w, ClientWiring::Local));
 }
 
+/// `rest_only_knobs_set` names exactly the pool/concurrency knobs that were
+/// explicitly set — this is what the runtime warns on when a `grpc` transport
+/// carries a REST-only knob that would silently go nowhere.
+#[test]
+fn rest_only_knobs_set_reports_which_were_set() {
+    // None set on a bare grpc wiring -> empty.
+    let w = parse(r#"{"transport": "grpc", "endpoint": "http://x:50051"}"#).unwrap();
+    let ClientWiring::Grpc { tuning, .. } = w else {
+        unreachable!()
+    };
+    assert!(tuning.rest_only_knobs_set().is_empty());
+
+    // A subset set -> only those names, in declaration order.
+    let w = parse(
+        r#"{"transport": "grpc", "endpoint": "http://x:50051", "max_concurrent_requests": 10}"#,
+    )
+    .unwrap();
+    let ClientWiring::Grpc { tuning, .. } = w else {
+        unreachable!()
+    };
+    assert_eq!(
+        tuning.rest_only_knobs_set(),
+        vec!["max_concurrent_requests"]
+    );
+
+    // All three set -> all three names.
+    let w = parse(
+        r#"{
+            "transport": "grpc",
+            "endpoint": "http://x:50051",
+            "pool_max_idle_per_host": 256,
+            "pool_idle_timeout": "30s",
+            "max_concurrent_requests": 500
+        }"#,
+    )
+    .unwrap();
+    let ClientWiring::Grpc { tuning, .. } = w else {
+        unreachable!()
+    };
+    assert_eq!(
+        tuning.rest_only_knobs_set(),
+        vec![
+            "pool_max_idle_per_host",
+            "pool_idle_timeout",
+            "max_concurrent_requests"
+        ]
+    );
+}
+
+/// `ConsumerWiring` — the consumer-side (`#[toolkit::consumes]`) schema:
+/// an object with an optional `endpoint` (omit to keep discovery) plus flattened
+/// `ClientTuning`. No `transport` tag (the consumer path is REST-only). The
+/// bare-string form earlier drafts accepted is deliberately rejected.
+mod consumer_wiring {
+    use super::*;
+    use toolkit_contract::wiring::ConsumerWiring;
+
+    fn parse_consumer(json: &str) -> Result<ConsumerWiring, serde_json::Error> {
+        serde_json::from_str(json)
+    }
+
+    #[test]
+    fn bare_string_is_rejected() {
+        // The legacy bare-string escape hatch is no longer a valid shape — it
+        // must fail loudly rather than be silently honoured or dropped. Use
+        // `{ "endpoint": "..." }` instead.
+        assert!(parse_consumer(r#""http://billing:8080""#).is_err());
+    }
+
+    #[test]
+    fn object_form_with_endpoint_and_tuning() {
+        let json = r#"{
+            "endpoint": "http://billing:8080",
+            "timeout": "5s",
+            "max_concurrent_requests": 256,
+            "pool_max_idle_per_host": 256
+        }"#;
+        let w = parse_consumer(json).expect("object form parses");
+        let (endpoint, tuning) = w.into_parts();
+        assert_eq!(endpoint.as_deref(), Some("http://billing:8080"));
+        assert_eq!(tuning.timeout, Some(Duration::from_secs(5)));
+        assert_eq!(tuning.max_concurrent_requests, Some(256));
+        assert_eq!(tuning.pool_max_idle_per_host, Some(256));
+    }
+
+    #[test]
+    fn object_form_without_endpoint_keeps_discovery() {
+        // Omitting `endpoint` leaves discovery in place while still tuning.
+        let w = parse_consumer(r#"{ "timeout": "1s", "max_concurrent_requests": 1 }"#)
+            .expect("tuning-only object parses");
+        let (endpoint, tuning) = w.into_parts();
+        assert_eq!(endpoint, None, "no endpoint => discovery is untouched");
+        assert_eq!(tuning.timeout, Some(Duration::from_secs(1)));
+        assert_eq!(tuning.max_concurrent_requests, Some(1));
+    }
+
+    #[test]
+    fn empty_object_is_all_defaults_and_no_endpoint() {
+        let w = parse_consumer(r"{}").expect("empty object parses");
+        let (endpoint, tuning) = w.into_parts();
+        assert_eq!(endpoint, None);
+        assert!(tuning.timeout.is_none());
+        assert!(tuning.retry.is_none());
+        assert!(tuning.max_concurrent_requests.is_none());
+    }
+
+    #[test]
+    fn object_form_accepts_retry_overrides() {
+        let json = r#"{ "endpoint": "http://x", "retry": { "max_attempts": 5 } }"#;
+        let w = parse_consumer(json).expect("retry override parses");
+        let (_endpoint, tuning) = w.into_parts();
+        assert_eq!(tuning.retry.expect("retry present").max_attempts, Some(5));
+    }
+
+    #[test]
+    fn a_non_object_is_rejected() {
+        // Only an object is a valid `ConsumerWiring`; a list (or any scalar) is
+        // a parse error.
+        assert!(parse_consumer(r"[1, 2, 3]").is_err());
+    }
+}
+
 #[cfg(feature = "runtime-client")]
 mod runtime_conversion {
     use super::*;
@@ -225,5 +347,53 @@ mod runtime_conversion {
         let cfg = tuning.apply_to(endpoint);
         assert_eq!(cfg.timeout, Duration::from_secs(30));
         assert_eq!(cfg.retry.max_attempts, 3);
+        assert_eq!(cfg.pool_max_idle_per_host, 128);
+        assert_eq!(cfg.pool_idle_timeout, Some(Duration::from_secs(90)));
+        assert_eq!(cfg.max_concurrent_requests, Some(128));
+    }
+
+    #[test]
+    fn tuning_apply_overrides_pool_and_concurrency() {
+        let w = parse(
+            r#"{
+                "transport": "rest",
+                "endpoint": "https://x",
+                "pool_max_idle_per_host": 512,
+                "pool_idle_timeout": "5m",
+                "max_concurrent_requests": 1000
+            }"#,
+        )
+        .unwrap();
+        let ClientWiring::Rest { endpoint, tuning } = w else {
+            unreachable!()
+        };
+        let cfg: ClientConfig = tuning.apply_to(endpoint);
+        assert_eq!(cfg.pool_max_idle_per_host, 512);
+        assert_eq!(cfg.pool_idle_timeout, Some(Duration::from_mins(5)));
+        assert_eq!(cfg.max_concurrent_requests, Some(1000));
+    }
+
+    /// A `0` for either knob is accepted by `apply_to` and forwarded verbatim
+    /// onto the `ClientConfig` — this test pins only that forwarding. Making a
+    /// `0` cap safe is the transport's job (clamped to 1 in `toolkit-http`'s
+    /// builder), proven behaviourally in the `concurrency_limit` integration
+    /// test, not here.
+    #[test]
+    fn tuning_apply_accepts_zero_and_forwards_verbatim() {
+        let w = parse(
+            r#"{
+                "transport": "rest",
+                "endpoint": "https://x",
+                "pool_max_idle_per_host": 0,
+                "max_concurrent_requests": 0
+            }"#,
+        )
+        .unwrap();
+        let ClientWiring::Rest { endpoint, tuning } = w else {
+            unreachable!()
+        };
+        let cfg: ClientConfig = tuning.apply_to(endpoint);
+        assert_eq!(cfg.pool_max_idle_per_host, 0);
+        assert_eq!(cfg.max_concurrent_requests, Some(0));
     }
 }

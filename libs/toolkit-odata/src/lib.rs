@@ -3,7 +3,9 @@ pub mod builder;
 pub mod errors;
 pub mod filter;
 pub mod limits;
+/// Internal `OData` filter representations.
 pub(crate) mod odata_filters;
+/// Internal `OData` filter parsing.
 mod odata_parse;
 pub mod page;
 pub mod pagination;
@@ -337,7 +339,11 @@ pub enum Error {
 ///
 /// # Errors
 /// Returns `Error::OrderMismatch` if the cursor's sort order doesn't match the effective order.
-/// Returns `Error::FilterMismatch` if the cursor's filter hash doesn't match the effective filter.
+/// Returns `Error::FilterMismatch` if the cursor carries a filter hash and the effective filter
+/// differs from it, including a filtered cursor continued without its filter (the cursor carries
+/// only the hash, so the filter cannot be restored from it). A cursor without a hash is accepted
+/// under any filter: a filter added to it only narrows the page, and cursors issued before a
+/// fingerprint was bound keep working.
 pub fn validate_cursor_against(
     cursor: &CursorV1,
     effective_order: &ODataOrderBy,
@@ -346,8 +352,8 @@ pub fn validate_cursor_against(
     if !effective_order.equals_signed_tokens(&cursor.s) {
         return Err(Error::OrderMismatch);
     }
-    if let (Some(h), Some(cf)) = (effective_filter_hash, cursor.f.as_deref())
-        && h != cf
+    if let Some(cf) = cursor.f.as_deref()
+        && effective_filter_hash != Some(cf)
     {
         return Err(Error::FilterMismatch);
     }
@@ -450,13 +456,16 @@ impl CursorV1 {
 }
 
 // base64url helpers (no padding)
+/// URL-safe base64 encoding without padding, used for cursor tokens.
 mod base64_url {
     use base64::Engine;
 
+    /// Encodes bytes as URL-safe base64 without padding.
     pub fn encode(bytes: &[u8]) -> String {
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
     }
 
+    /// Decodes URL-safe base64 without padding.
     pub fn decode(s: &str) -> Result<Vec<u8>, base64::DecodeError> {
         base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(s)
     }

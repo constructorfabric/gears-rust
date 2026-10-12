@@ -35,7 +35,6 @@ use bss_ledger::domain::adjustment::manual::{
 };
 use bss_ledger::domain::error::DomainError;
 use bss_ledger::domain::model::{AccountRow, CurrencyScaleRow};
-use bss_ledger::domain::money::DEFAULT_PLAUSIBLE_MAX_MAJOR;
 use bss_ledger::infra::adjustment::manual_adjustment_service::ManualAdjustmentHandler;
 use bss_ledger::infra::audit::secured_audit_sink::{NoopSecuredAuditSink, SecuredAuditSink};
 use bss_ledger::infra::events::publisher::LedgerEventPublisher;
@@ -53,6 +52,31 @@ use uuid::Uuid;
 
 fn pg(sql: impl Into<String>) -> Statement {
     Statement::from_string(sea_orm::DatabaseBackend::Postgres, sql.into())
+}
+
+/// The USD scale-2 currency spec every fixture here posts in.
+fn usd() -> bss_ledger_sdk::CurrencySpec {
+    bss_ledger_sdk::CurrencySpec::try_new("USD".to_owned(), 2).unwrap()
+}
+
+/// A USD scale-2 posting from a cent count (`1` ⇒ `0.01`): the old minor-unit
+/// fixtures expressed as validated major-unit money.
+fn usd_cents(minor: i64) -> bss_ledger_sdk::PostedMoney {
+    bss_ledger_sdk::PostedMoney::try_new(rust_decimal::Decimal::new(minor, 2), usd()).unwrap()
+}
+
+/// Validated USD scale-2 money from canonical stored text (`"0.01"`).
+fn usd_text(text: &str) -> bss_ledger_sdk::PostedMoney {
+    bss_ledger_sdk::PostedMoney::try_new(bss_ledger_sdk::parse_decimal(text).unwrap(), usd())
+        .unwrap()
+}
+
+/// Read one canonical decimal TEXT money column as USD scale-2 money.
+async fn scalar_money(conn: &DatabaseConnection, sql: &str) -> Option<bss_ledger_sdk::PostedMoney> {
+    conn.query_one_raw(pg(sql.to_owned()))
+        .await
+        .unwrap()
+        .map(|r| usd_text(&r.try_get_by_index::<String>(0).unwrap()))
 }
 
 async fn scalar_i64(conn: &DatabaseConnection, sql: &str) -> Option<i64> {
@@ -121,8 +145,7 @@ async fn setup(url: &str) -> (DatabaseConnection, DBProvider<DbError>, Seller) {
         .upsert_currency_scale(CurrencyScaleRow {
             tenant_id: s.tenant,
             currency: "USD".to_owned(),
-            minor_units: 2,
-            plausible_max_major: DEFAULT_PLAUSIBLE_MAX_MAJOR,
+            currency_scale: 2,
             source: "iso".to_owned(),
         })
         .await
@@ -188,11 +211,15 @@ fn handler(provider: &DBProvider<DbError>) -> ManualAdjustmentHandler {
     )
 }
 
-async fn bal(raw: &DatabaseConnection, s: &Seller, account: Uuid) -> Option<i64> {
-    scalar_i64(
+async fn bal(
+    raw: &DatabaseConnection,
+    s: &Seller,
+    account: Uuid,
+) -> Option<bss_ledger_sdk::PostedMoney> {
+    scalar_money(
         raw,
         &format!(
-            "SELECT balance_minor FROM bss.ledger_account_balance \
+            "SELECT balance FROM bss.ledger_account_balance \
              WHERE tenant_id='{}' AND account_id='{}' AND currency='USD'",
             s.tenant, account
         ),
@@ -213,11 +240,12 @@ async fn entry_count(raw: &DatabaseConnection, s: &Seller, adjustment_id: &str) 
     .await
 }
 
+/// A manual leg of `amount_minor` cents (`1` ⇒ `0.01` USD).
 fn leg(class: AccountClass, side: Side, amount_minor: i64) -> ManualLeg {
     ManualLeg {
         account_class: class,
         side,
-        amount_minor,
+        amount: usd_cents(amount_minor),
         revenue_stream: None,
     }
 }
@@ -234,7 +262,7 @@ fn req(
         payer_tenant_id: payer,
         adjustment_id: adjustment_id.to_owned(),
         action,
-        currency: "USD".to_owned(),
+        currency: usd(),
         legs,
         reason_code: "ROUNDING_RESIDUE".to_owned(),
         preparer_actor_id: Uuid::now_v7(),
@@ -283,12 +311,12 @@ async fn rounding_correction_posts_then_replays_idempotently() {
     );
     assert_eq!(
         bal(&raw, &s, s.suspense).await,
-        Some(1),
+        Some(usd_cents(1)),
         "SUSPENSE credited +1 (credit-normal holding account)"
     );
     assert_eq!(
         bal(&raw, &s, s.cash_clearing).await,
-        Some(1),
+        Some(usd_cents(1)),
         "CASH_CLEARING debited 1 (debit-normal)"
     );
 
@@ -311,7 +339,7 @@ async fn rounding_correction_posts_then_replays_idempotently() {
     );
     assert_eq!(
         bal(&raw, &s, s.suspense).await,
-        Some(1),
+        Some(usd_cents(1)),
         "SUSPENSE unchanged on replay (still +1)"
     );
 }
@@ -354,7 +382,9 @@ async fn class_outside_allow_list_is_not_allowed() {
         "no entry posted for a rejected class"
     );
     assert!(
-        matches!(bal(&raw, &s, s.suspense).await, None | Some(0)),
+        bal(&raw, &s, s.suspense)
+            .await
+            .is_none_or(|m| m.amount().is_zero()),
         "SUSPENSE untouched"
     );
 }
@@ -399,7 +429,9 @@ async fn contra_revenue_write_off_is_not_allowed_and_does_not_post() {
         "no entry posted for an attempted write-off"
     );
     assert!(
-        matches!(bal(&raw, &s, s.contra_revenue).await, None | Some(0)),
+        bal(&raw, &s, s.contra_revenue)
+            .await
+            .is_none_or(|m| m.amount().is_zero()),
         "CONTRA_REVENUE untouched — the write-off never posted"
     );
 }

@@ -36,3 +36,5 @@ pub mod credit;
 pub mod precedence;
 pub mod settlement;
 pub mod settlement_return;
+
+pub mod dispute_state;

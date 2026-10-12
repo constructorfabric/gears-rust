@@ -256,8 +256,8 @@ impl IdpServiceAccountSummary {
 /// diagnostics in-process instead.
 ///
 /// `#[non_exhaustive]` for the same reason as the sibling `IdP` failure
-/// enums: the SDK can classify a further category (say, a provider-side
-/// quota refusal) in a minor release. AM's boundary maps an unknown
+/// enums: the SDK can classify a further category in a minor release
+/// (`QuotaExceeded` arrived that way). AM's boundary maps an unknown
 /// variant conservatively onto an internal error with a loud `error!`,
 /// so a new variant surfaces as a mapping gap in operator logs rather
 /// than as a silently mis-typed response.
@@ -266,8 +266,9 @@ impl IdpServiceAccountSummary {
 pub enum IdpServiceAccountFailure {
     /// Rejected with no provider state retained by this call: a name
     /// that violates the adapter's structural rules, a name already
-    /// live in the tenant, a scope outside the allowlist, or a
-    /// provider-side quota. Permanent — do not retry the same input.
+    /// live in the tenant, or a scope outside the allowlist. Permanent
+    /// — do not retry the same input. A quota refusal is
+    /// [`Self::QuotaExceeded`], not this.
     ///
     /// `field` names the offending request field for the adapter's own
     /// logs. Like `detail` it is untrusted text and does not reach the
@@ -289,6 +290,12 @@ pub enum IdpServiceAccountFailure {
     /// tenant, match the submitted name) rather than the blind retry a
     /// `503` would invite.
     Ambiguous { detail: String },
+    /// The tenant already holds as many service accounts as the
+    /// provider allows, so the create was refused with no provider
+    /// state retained. Capacity must become available before retrying.
+    /// AM surfaces `429` under the
+    /// `service_accounts` quota subject.
+    QuotaExceeded { detail: String },
     /// The provider does not implement service-account management at
     /// all. This is the default-impl return for adapters that ship only
     /// the tenant / user halves of the contract; AM surfaces `501`.
@@ -308,6 +315,7 @@ impl IdpServiceAccountFailure {
             Self::CleanFailure { .. } => "clean_failure",
             Self::Ambiguous { .. } => "ambiguous",
             Self::UnsupportedOperation { .. } => "unsupported_operation",
+            Self::QuotaExceeded { .. } => "quota_exceeded",
         }
     }
 
@@ -321,7 +329,8 @@ impl IdpServiceAccountFailure {
             | Self::NotFound { detail }
             | Self::CleanFailure { detail }
             | Self::Ambiguous { detail }
-            | Self::UnsupportedOperation { detail } => detail,
+            | Self::UnsupportedOperation { detail }
+            | Self::QuotaExceeded { detail } => detail,
         }
     }
 }

@@ -45,13 +45,19 @@
 //!     .await?;
 //! ```
 
+/// Builder for configuring and constructing the HTTP client.
 mod builder;
+/// The HTTP client implementation.
 mod client;
+/// Client configuration types.
 mod config;
+/// Error types returned by the HTTP client.
 mod error;
 mod layers;
 pub mod otel;
+/// Request builder types.
 mod request;
+/// Response types with body-size-limited readers.
 mod response;
 pub mod security;
 mod tls;

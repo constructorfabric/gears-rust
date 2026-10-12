@@ -32,9 +32,10 @@ impl BillingOutcome {
 pub struct BillingDerivation {
     pub outcome: BillingOutcome,
     pub settlement_method: SettlementMethod,
-    /// When `true`, the caller MUST log a critical error and increment
-    /// `mini_chat_unknown_error_code_total` after the transaction commits.
-    /// Kept out of the pure function to preserve testability.
+    /// When `true`, the caller logs a critical error after the transaction
+    /// commits. `mini_chat_unknown_error_code_total` is declared but not
+    /// recorded (cardinality of the `code` label). Kept out of the pure
+    /// function to preserve testability.
     pub unknown_error_code: bool,
 }
 
@@ -93,7 +94,12 @@ pub fn derive_billing_outcome(input: &BillingDerivationInput) -> BillingDerivati
             },
 
             // Pre-provider errors — reserve released, charge = 0.
-            Some("context_length_exceeded" | "validation_error") => BillingDerivation {
+            Some(
+                "context_length_exceeded"
+                | "validation_error"
+                | "input_too_long"
+                | "turn_setup_failed",
+            ) => BillingDerivation {
                 outcome: BillingOutcome::Failed,
                 settlement_method: SettlementMethod::Released,
                 unknown_error_code: false,
@@ -104,7 +110,11 @@ pub fn derive_billing_outcome(input: &BillingDerivationInput) -> BillingDerivati
                 "provider_error"
                 | "provider_timeout"
                 | "rate_limited"
-                | "web_search_calls_exceeded",
+                | "web_search_calls_exceeded"
+                | "code_interpreter_calls_exceeded"
+                | "agentic_iterations_exceeded"
+                | "unexpected_tool_use"
+                | "message_persistence_failed",
             ) => {
                 if input.has_usage {
                     BillingDerivation {
@@ -136,6 +146,7 @@ pub fn derive_billing_outcome(input: &BillingDerivationInput) -> BillingDerivati
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 
@@ -260,5 +271,36 @@ mod tests {
             None,
             false,
         )));
+    }
+
+    #[test]
+    fn post_provider_limit_codes_are_known() {
+        for code in [
+            "code_interpreter_calls_exceeded",
+            "agentic_iterations_exceeded",
+            "unexpected_tool_use",
+            "message_persistence_failed",
+        ] {
+            let d = derive_billing_outcome(&BillingDerivationInput {
+                terminal_state: TurnState::Failed,
+                error_code: Some(code.to_owned()),
+                has_usage: true,
+            });
+            assert!(!d.unknown_error_code, "{code} must be a known error code");
+            assert_eq!(d.settlement_method, SettlementMethod::Actual, "{code}");
+        }
+    }
+
+    #[test]
+    fn unstarted_turn_codes_release_the_reserve() {
+        for code in ["input_too_long", "turn_setup_failed"] {
+            let d = derive_billing_outcome(&BillingDerivationInput {
+                terminal_state: TurnState::Failed,
+                error_code: Some(code.to_owned()),
+                has_usage: false,
+            });
+            assert!(!d.unknown_error_code, "{code} must be a known error code");
+            assert_eq!(d.settlement_method, SettlementMethod::Released, "{code}");
+        }
     }
 }

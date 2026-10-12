@@ -1,10 +1,7 @@
-//! Add the dual-currency functional columns (`functional_balance_minor`,
-//! `functional_currency`) to the three wide balance caches that lacked them
-//! (`account_balance`, `ar_invoice_balance`, `ar_payer_balance`). The two
-//! narrow caches `unallocated_balance` / `reusable_credit_subbalance` already
-//! carry them from P1. Populated by the `BalanceProjector` on cross-currency
-//! posts (Slice 5 Phase 1, group B); left NULL on single-currency grains, where
-//! the functional balance equals the transaction balance by identity.
+//! Add optional canonical functional money and stored scale to wide caches.
+//! PostgreSQL adds these columns here; SQLite declares the triplets and their
+//! co-null constraints in m003 because it cannot add table constraints in place.
+//! Migration names and order remain unchanged for the fresh schema chain.
 
 use sea_orm::{ConnectionTrait, Statement};
 use sea_orm_migration::prelude::*;
@@ -17,44 +14,42 @@ pub struct Migration;
 // ---------------------------------------------------------------------------
 
 const PG_UP_STATEMENTS: &[&str] = &[
-    "ALTER TABLE bss.ledger_account_balance ADD COLUMN functional_balance_minor bigint",
+    "ALTER TABLE bss.ledger_account_balance ADD COLUMN functional_balance text",
     "ALTER TABLE bss.ledger_account_balance ADD COLUMN functional_currency varchar(16)",
-    "ALTER TABLE bss.ledger_ar_invoice_balance ADD COLUMN functional_balance_minor bigint",
+    "ALTER TABLE bss.ledger_account_balance ADD COLUMN functional_currency_scale smallint CHECK (functional_currency_scale BETWEEN 0 AND 28)",
+    "ALTER TABLE bss.ledger_account_balance ADD CONSTRAINT chk_ledger_account_balance_functional_decimal CHECK (bss.ledger_decimal_valid(functional_balance, functional_currency_scale))",
+    "ALTER TABLE bss.ledger_ar_invoice_balance ADD COLUMN functional_balance text",
     "ALTER TABLE bss.ledger_ar_invoice_balance ADD COLUMN functional_currency varchar(16)",
-    "ALTER TABLE bss.ledger_ar_payer_balance ADD COLUMN functional_balance_minor bigint",
+    "ALTER TABLE bss.ledger_ar_invoice_balance ADD COLUMN functional_currency_scale smallint CHECK (functional_currency_scale BETWEEN 0 AND 28)",
+    "ALTER TABLE bss.ledger_ar_invoice_balance ADD CONSTRAINT chk_ledger_ar_invoice_balance_functional_decimal CHECK (bss.ledger_decimal_valid(functional_balance, functional_currency_scale))",
+    "ALTER TABLE bss.ledger_ar_payer_balance ADD COLUMN functional_balance text",
     "ALTER TABLE bss.ledger_ar_payer_balance ADD COLUMN functional_currency varchar(16)",
+    "ALTER TABLE bss.ledger_ar_payer_balance ADD COLUMN functional_currency_scale smallint CHECK (functional_currency_scale BETWEEN 0 AND 28)",
+    "ALTER TABLE bss.ledger_ar_payer_balance ADD CONSTRAINT chk_ledger_ar_payer_balance_functional_decimal CHECK (bss.ledger_decimal_valid(functional_balance, functional_currency_scale))",
 ];
 
 const PG_DOWN_STATEMENTS: &[&str] = &[
+    "ALTER TABLE bss.ledger_ar_payer_balance DROP CONSTRAINT IF EXISTS chk_ledger_ar_payer_balance_functional_decimal",
+    "ALTER TABLE bss.ledger_ar_payer_balance DROP COLUMN IF EXISTS functional_currency_scale",
     "ALTER TABLE bss.ledger_ar_payer_balance DROP COLUMN IF EXISTS functional_currency",
-    "ALTER TABLE bss.ledger_ar_payer_balance DROP COLUMN IF EXISTS functional_balance_minor",
+    "ALTER TABLE bss.ledger_ar_payer_balance DROP COLUMN IF EXISTS functional_balance",
+    "ALTER TABLE bss.ledger_ar_invoice_balance DROP CONSTRAINT IF EXISTS chk_ledger_ar_invoice_balance_functional_decimal",
+    "ALTER TABLE bss.ledger_ar_invoice_balance DROP COLUMN IF EXISTS functional_currency_scale",
     "ALTER TABLE bss.ledger_ar_invoice_balance DROP COLUMN IF EXISTS functional_currency",
-    "ALTER TABLE bss.ledger_ar_invoice_balance DROP COLUMN IF EXISTS functional_balance_minor",
+    "ALTER TABLE bss.ledger_ar_invoice_balance DROP COLUMN IF EXISTS functional_balance",
+    "ALTER TABLE bss.ledger_account_balance DROP CONSTRAINT IF EXISTS chk_ledger_account_balance_functional_decimal",
+    "ALTER TABLE bss.ledger_account_balance DROP COLUMN IF EXISTS functional_currency_scale",
     "ALTER TABLE bss.ledger_account_balance DROP COLUMN IF EXISTS functional_currency",
-    "ALTER TABLE bss.ledger_account_balance DROP COLUMN IF EXISTS functional_balance_minor",
+    "ALTER TABLE bss.ledger_account_balance DROP COLUMN IF EXISTS functional_balance",
 ];
 
 // ---------------------------------------------------------------------------
-// SQLite variant — non-production schema (unqualified; `varchar`→text affinity).
+// SQLite triplets and checks are already present in the fresh m003 schema.
 // ---------------------------------------------------------------------------
 
-const SQLITE_UP_STATEMENTS: &[&str] = &[
-    "ALTER TABLE ledger_account_balance ADD COLUMN functional_balance_minor bigint",
-    "ALTER TABLE ledger_account_balance ADD COLUMN functional_currency varchar(16)",
-    "ALTER TABLE ledger_ar_invoice_balance ADD COLUMN functional_balance_minor bigint",
-    "ALTER TABLE ledger_ar_invoice_balance ADD COLUMN functional_currency varchar(16)",
-    "ALTER TABLE ledger_ar_payer_balance ADD COLUMN functional_balance_minor bigint",
-    "ALTER TABLE ledger_ar_payer_balance ADD COLUMN functional_currency varchar(16)",
-];
+const SQLITE_UP_STATEMENTS: &[&str] = &[];
 
-const SQLITE_DOWN_STATEMENTS: &[&str] = &[
-    "ALTER TABLE ledger_ar_payer_balance DROP COLUMN functional_currency",
-    "ALTER TABLE ledger_ar_payer_balance DROP COLUMN functional_balance_minor",
-    "ALTER TABLE ledger_ar_invoice_balance DROP COLUMN functional_currency",
-    "ALTER TABLE ledger_ar_invoice_balance DROP COLUMN functional_balance_minor",
-    "ALTER TABLE ledger_account_balance DROP COLUMN functional_currency",
-    "ALTER TABLE ledger_account_balance DROP COLUMN functional_balance_minor",
-];
+const SQLITE_DOWN_STATEMENTS: &[&str] = &[];
 
 // ---------------------------------------------------------------------------
 // Migration dispatch.

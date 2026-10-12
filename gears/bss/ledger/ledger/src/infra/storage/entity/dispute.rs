@@ -22,17 +22,18 @@ pub struct Model {
     pub dispute_id: String,
     pub payment_id: String,
     pub currency: String,
+    pub currency_scale: i16,
     pub variant: String,
     pub last_phase: String,
     pub cycle: i32,
-    pub disputed_amount_minor: i64,
+    pub disputed_amount: String,
     /// The cash actually moved into `DISPUTE_HOLD` at `opened` for a `CASH_HOLD`
     /// dispute (`min(disputed, net)`, Model N) — the size the `won`/`lost`
     /// outcome releases / forfeits. Persisted at `opened` so a settlement-return
     /// that lowers the payment's `net` between `opened` and the outcome cannot
     /// strand the hold (the outcome sizes off THIS stored amount, not a re-read
     /// `settled − fee`). `0` for `AR_RECLASS` (no cash leg).
-    pub cash_hold_minor: i64,
+    pub cash_hold: String,
     pub version: i64,
 }
 

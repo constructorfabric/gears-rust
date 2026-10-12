@@ -14,9 +14,9 @@ use crate::domain::ports::metric_labels::key;
 ///
 /// ## `_total` suffix
 ///
-/// Counter instrument names intentionally omit the `_total` suffix from
-/// Prometheus metric names. The `opentelemetry-prometheus`
-/// exporter appends `_total` automatically for counters, so including it
+/// Counter instrument names intentionally omit the `_total` suffix.
+/// Metrics are exported over OTLP; the OTLP-to-Prometheus conversion
+/// downstream conventionally appends `_total` to counters, so including it
 /// here would produce a doubled `_total_total` suffix.
 pub struct MiniChatMetricsMeter {
     // ── P0: Streaming & UX Health ──────────────────────────────────────
@@ -162,7 +162,8 @@ pub struct MiniChatMetricsMeter {
     #[allow(dead_code)]
     quota_image_commit: Counter<u64>,
 
-    // ── P3: Idempotent replay (deferred: idempotent replay not implemented) ──
+    // ── Idempotent replay: replay is implemented (domain/service/replay.rs),
+    // but nothing records this counter yet ──
     #[allow(dead_code)]
     stream_replay: Counter<u64>,
 
@@ -193,6 +194,11 @@ pub struct MiniChatMetricsMeter {
     orphan_detected: Counter<u64>,
     orphan_finalized: Counter<u64>,
     orphan_scan_duration: Histogram<f64>,
+
+    // ── P1: Upload Reaper ───────────────────────────────────────────────
+    upload_abandoned: Counter<u64>,
+    background_indexing: Counter<u64>,
+    upload_reaper_scan_duration: Histogram<f64>,
 
     // ── P1: Thread Summary Health ───────────────────────────────────────
     thread_summary_trigger: Counter<u64>,
@@ -541,7 +547,7 @@ impl MiniChatMetricsMeter {
                 .with_description("Image quota commits")
                 .build(),
 
-            // deferred: idempotent replay not implemented
+            // replay is implemented; this counter is not recorded yet
             stream_replay: meter
                 .u64_counter(format!("{prefix}_stream_replay"))
                 .with_description("Stream replay events")
@@ -597,6 +603,24 @@ impl MiniChatMetricsMeter {
             orphan_scan_duration: meter
                 .f64_histogram(format!("{prefix}_orphan_scan_duration_seconds"))
                 .with_description("Watchdog scan execution duration")
+                .build(),
+
+            // ── P1: Upload Reaper ───────────────────────────────────────
+            upload_abandoned: meter
+                .u64_counter(format!("{prefix}_attachment_upload_abandoned"))
+                .with_description(
+                    "Attachments stuck in pending/uploaded marked failed by the upload reaper",
+                )
+                .build(),
+            background_indexing: meter
+                .u64_counter(format!("{prefix}_attachment_background_indexing"))
+                .with_description(
+                    "Outcome of background indexing for documents returned as uploaded",
+                )
+                .build(),
+            upload_reaper_scan_duration: meter
+                .f64_histogram(format!("{prefix}_upload_reaper_scan_duration_seconds"))
+                .with_description("Upload reaper scan execution duration")
                 .build(),
 
             // ── P1: Thread Summary Health ───────────────────────────────
@@ -874,6 +898,22 @@ impl MiniChatMetricsPort for MiniChatMetricsMeter {
         self.orphan_scan_duration.record(seconds, &[]);
     }
 
+    // ── P1: Upload Reaper ─────────────────────────────────────────────
+
+    fn record_upload_abandoned(&self, from_status: &str) {
+        self.upload_abandoned
+            .add(1, &[KeyValue::new("from_status", from_status.to_owned())]);
+    }
+
+    fn record_upload_reaper_scan_duration_seconds(&self, seconds: f64) {
+        self.upload_reaper_scan_duration.record(seconds, &[]);
+    }
+
+    fn record_background_indexing(&self, result: &str) {
+        self.background_indexing
+            .add(1, &[KeyValue::new("result", result.to_owned())]);
+    }
+
     // ── P1: Thread Summary Health ────────────────────────────────────
 
     fn record_thread_summary_trigger(&self, result: &str) {
@@ -958,5 +998,6 @@ impl MiniChatMetricsPort for MiniChatMetricsMeter {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 #[path = "metrics_tests.rs"]
 mod metrics_tests;

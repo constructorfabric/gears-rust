@@ -1,0 +1,39 @@
+[package]
+name = "cf-gears-bss-products-sdk"
+edition.workspace = true
+license.workspace = true
+description = "BSS Product & SKU Registry SDK: infrastructure-free contract for ClientHub consumers"
+
+[lib]
+name = "bss_products_sdk"
+
+[lints]
+workspace = true
+
+[dependencies]
+serde = { workspace = true, features = ["derive"] } # wire types
+async-trait = { workspace = true }
+# Every trait surface returns `CanonicalError`, per the errors ADR: the gear's
+# single `From<DomainError> for CanonicalError` ladder is the authoritative
+# classification and the ports carry no second one. The sibling
+# `bss-pricing-sdk` takes the same posture.
+toolkit-canonical-errors = { workspace = true }
+# A registry Product or SKU id, which every consumer binds to and which is a
+# UUID everywhere it appears. The contract carries the type rather than a
+# `String` so a caller cannot pass a code where an id belongs.
+uuid = { workspace = true }
+# The increment-request contract's methods take the caller's SecurityContext:
+# both bindings pass the same `catalog_version x request` gate, and an
+# in-process binding cannot gate without the identity (design/06 sec 2 rule 1).
+toolkit-security = { workspace = true }
+# The resource-error identity is a GTS id, the platform's own naming.
+toolkit-gts = { workspace = true }
+# The SKU and category timestamps are instants; a string would move the parse
+# to every consumer. `time::OffsetDateTime` rather than chrono: one instant type
+# across the gear, and the one the platform's OData cursor codec decodes to.
+time = { workspace = true }
+# A derived declaration's constants and quantities are exact decimals (P-D-230); no float.
+rust_decimal = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }

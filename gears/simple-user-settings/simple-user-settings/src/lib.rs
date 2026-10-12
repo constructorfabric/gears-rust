@@ -3,8 +3,8 @@
 //! The public API is defined in `simple_user_settings-sdk` and re-exported here.
 
 pub use simple_user_settings_sdk::{
-    SimpleUserSettings, SimpleUserSettingsClientV1, SimpleUserSettingsPatch,
-    SimpleUserSettingsUpdate,
+    NamedSetting, NamedSettingsClientV1, SimpleUserSettings, SimpleUserSettingsClientV1,
+    SimpleUserSettingsPatch, SimpleUserSettingsUpdate,
 };
 
 pub mod gear;

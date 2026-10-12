@@ -75,7 +75,7 @@ Not applicable — see §1.3. No actor-triggered flows belong in a pure scaffold
 
 - [ ] `p1` - **ID**: `cpt-cf-serverless-runtime-algo-gear-scaffold-toolkit-registration`
 
-**Input**: ToolKit gear-orchestrator startup (host-process boot).
+**Input**: ToolKit service-discovery startup (host-process boot).
 
 **Output**: `serverless-runtime` gear registered with ToolKit, lifecycle hooks wired, ClientHub slot reserved.
 

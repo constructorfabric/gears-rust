@@ -20,6 +20,7 @@ pub struct CacheResolverBuilder<'a> {
 }
 
 impl<'a> CacheResolverBuilder<'a> {
+    /// Creates a builder bound to `hub` with no profile selected and no capability requirements.
     pub(crate) fn new(hub: &'a ClientHub) -> Self {
         Self {
             hub,

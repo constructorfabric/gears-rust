@@ -58,6 +58,7 @@ pub struct ScopeFreezeRepo;
 
 impl ScopeFreezeRepo {
     #[must_use]
+    /// Creates the stateless scope-freeze repository.
     pub fn new() -> Self {
         Self
     }
@@ -220,6 +221,7 @@ pub struct TamperFreezeGuard {
 
 impl TamperFreezeGuard {
     #[must_use]
+    /// Creates a guard backed by a fresh scope-freeze repository.
     pub fn new() -> Self {
         Self {
             freeze: ScopeFreezeRepo::new(),

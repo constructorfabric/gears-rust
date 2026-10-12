@@ -66,6 +66,7 @@ fn parse_field_attrs(field: &syn::Field) -> syn::Result<Option<FilterableField>>
     }))
 }
 
+/// Expands `#[derive(ODataFilterable)]` for a struct with named fields; returns a compile error otherwise.
 #[allow(clippy::needless_pass_by_value)] // DeriveInput is consumed by proc-macro pattern
 pub fn expand_derive_odata_filterable(input: DeriveInput) -> syn::Result<TokenStream> {
     // Verify this is a struct with named fields

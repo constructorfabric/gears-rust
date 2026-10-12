@@ -181,6 +181,7 @@ pub struct LockReaperMetrics {
 }
 
 impl LockReaperMetrics {
+    /// Builds the reaper's instruments on `meter`, labelled with `provider`; backend failures are routed through `errors`.
     pub fn new(meter: &Meter, provider: &'static str, errors: Arc<dyn ClusterMetrics>) -> Self {
         Self {
             provider,

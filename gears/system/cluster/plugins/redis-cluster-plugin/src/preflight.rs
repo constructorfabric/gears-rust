@@ -432,8 +432,10 @@ pub fn parse_config_get(reply: &[String]) -> Result<BTreeMap<String, String>, Cl
         });
     }
     Ok(reply
-        .chunks_exact(2)
-        .map(|pair| (pair[0].clone(), pair[1].clone()))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|[param, value]| (param.clone(), value.clone()))
         .collect())
 }
 

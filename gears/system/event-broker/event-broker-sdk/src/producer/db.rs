@@ -52,6 +52,7 @@ pub struct DbProducerBuilder<
 }
 
 impl DbProducerBuilder {
+    /// Creates an empty builder; every required part starts unset.
     pub(crate) fn new() -> Self {
         Self {
             broker: None,
@@ -241,7 +242,6 @@ impl DbProducerBuilder<Has, Has, Has, Has, Has, Has, Has> {
         if self.topics.is_empty() || self.event_type_patterns.is_empty() {
             return Err(EventBrokerError::InvalidProducerOptions {
                 detail: "topics and event_type_patterns are required".to_owned(),
-                instance: String::new(),
             });
         }
 
@@ -292,13 +292,18 @@ impl DbProducerBuilder<Has, Has, Has, Has, Has, Has, Has> {
 
 #[derive(Clone)]
 pub struct DbProducer {
+    /// Broker the producer publishes to.
     pub(crate) broker: Arc<dyn EventBrokerApi>,
+    /// Security context publishes run under.
     pub(crate) ctx: SecurityContext,
+    /// Identity stamped on every published event.
     // Read only by `outbox_envelope`; kept on the producer so the outbox path can
     // stamp the client agent without re-deriving it from the builder.
     #[cfg_attr(not(feature = "outbox"), allow(dead_code))]
     pub(crate) identity: ProducerIdentity,
+    /// Deduplication setting the producer registers with.
     pub(crate) deduplication: DbDeduplication,
+    /// Cached producer registration, shared across clones.
     pub(crate) registration_state: Arc<Mutex<RegistrationState>>,
     registration_store: ProducerRegistrationStore,
     topics: Vec<String>,
@@ -435,7 +440,6 @@ impl DbProducer {
                 type_id: E::TYPE_ID.to_owned(),
                 detail: "call producer.prepare::<E>() outside the business transaction first"
                     .to_owned(),
-                instance: String::new(),
             });
         }
         let mode = self.deduplication.mode();
@@ -535,7 +539,6 @@ async fn resolve_managed_registration(
         None if managed.on_missing == MissingProducerRegistration::Fail => {
             Err(EventBrokerError::InvalidProducerOptions {
                 detail: format!("managed producer registration '{}' is missing", managed.key),
-                instance: String::new(),
             })
         }
         None => {

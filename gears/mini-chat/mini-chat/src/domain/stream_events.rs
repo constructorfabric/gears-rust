@@ -36,8 +36,50 @@ pub enum StreamEvent {
 #[domain_model]
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct DeltaData {
-    pub r#type: &'static str,
+    pub r#type: DeltaKind,
     pub content: String,
+}
+
+/// Kind of a `delta` chunk.
+#[domain_model]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DeltaKind {
+    Text,
+    Reasoning,
+}
+
+impl DeltaKind {
+    /// Map the provider-side delta kind; anything but `reasoning` is text.
+    #[must_use]
+    pub fn from_wire(kind: &str) -> Self {
+        if kind == "reasoning" {
+            Self::Reasoning
+        } else {
+            Self::Text
+        }
+    }
+}
+
+/// Quota decision reported in `done`.
+#[domain_model]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum QuotaDecisionKind {
+    Allow,
+    Downgrade,
+}
+
+impl QuotaDecisionKind {
+    /// Map the internal decision string (`allow` / `downgrade`).
+    #[must_use]
+    pub fn from_decision(decision: &str) -> Self {
+        if decision == "downgrade" {
+            Self::Downgrade
+        } else {
+            Self::Allow
+        }
+    }
 }
 
 /// Tool lifecycle event.
@@ -46,6 +88,7 @@ pub struct DeltaData {
 pub struct ToolData {
     pub phase: ToolPhase,
     pub name: String,
+    #[schema(value_type = Object)]
     pub details: serde_json::Value,
 }
 
@@ -60,10 +103,10 @@ pub struct CitationsData {
 #[domain_model]
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct DoneData {
-    pub usage: Option<Usage>,
+    pub usage: Usage,
     pub effective_model: String,
     pub selected_model: String,
-    pub quota_decision: String,
+    pub quota_decision: QuotaDecisionKind,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub downgrade_from: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

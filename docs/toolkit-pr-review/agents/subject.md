@@ -32,9 +32,6 @@ is not part of the diff. `ranges.left` holds removed-line numbers in the base fi
 
 It opens with a **Scope of this module** section saying which files it applies to. Honour it.
 
-It is generated from `docs/toolkit-pr-review/rules/`, which is what a person edits: the generated
-copy drops the rationale and the criteria gated above the pinned toolchain, which cannot fire today.
-
 Mandatory reading before you emit anything:
 
 - `docs/toolkit-pr-review/review-conventions.md` — severity, criterion markers, reporting discipline
@@ -98,8 +95,9 @@ issues is `[]`.
 }
 ```
 
-**All seven fields are required.** A finding missing `issue` or `fix` cannot be rendered into the
-summary table and has to be repaired by hand downstream.
+**Every field is required except `side`, which is optional, and `line`, which a finding on a deleted
+file omits.** A finding missing `issue` or `fix` cannot be rendered into the summary table and has to
+be repaired by hand downstream.
 
 - `"file"`: repo-root-relative, exactly as in the diff (strip `a/` or `b/`).
 - `"line"`: integer in that file's `ranges.right` — an added line, on the head side.

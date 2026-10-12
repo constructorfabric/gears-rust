@@ -36,7 +36,6 @@ use bss_ledger::domain::error::DomainError;
 use bss_ledger::domain::invoice::builder::{InvoiceItem, PostedInvoice, TaxBreakdown};
 use bss_ledger::domain::invoice::reversal::build_reversal;
 use bss_ledger::domain::model::{AccountRow, CurrencyScaleRow, NewEntry, NewLine};
-use bss_ledger::domain::money::DEFAULT_PLAUSIBLE_MAX_MAJOR;
 use bss_ledger::infra::events::publisher::LedgerEventPublisher;
 use bss_ledger::infra::invoice_post::InvoicePostService;
 use bss_ledger::infra::metrics::test_harness::MetricsHarness;
@@ -57,6 +56,33 @@ use uuid::Uuid;
 
 fn pg(sql: impl Into<String>) -> Statement {
     Statement::from_string(sea_orm::DatabaseBackend::Postgres, sql.into())
+}
+
+/// A USD scale-2 posting from a cent count (`1234` ⇒ `12.34`): the old
+/// minor-unit fixtures expressed as validated major-unit money.
+fn usd_cents(minor: i64) -> bss_ledger_sdk::PostedMoney {
+    bss_ledger_sdk::PostedMoney::try_new(
+        rust_decimal::Decimal::new(minor, 2),
+        bss_ledger_sdk::CurrencySpec::try_new("USD".to_owned(), 2).unwrap(),
+    )
+    .unwrap()
+}
+
+/// Validated USD scale-2 money from canonical stored text (`"12.34"`).
+fn usd_text(text: &str) -> bss_ledger_sdk::PostedMoney {
+    bss_ledger_sdk::PostedMoney::try_new(
+        bss_ledger_sdk::parse_decimal(text).unwrap(),
+        bss_ledger_sdk::CurrencySpec::try_new("USD".to_owned(), 2).unwrap(),
+    )
+    .unwrap()
+}
+
+/// Read one canonical decimal TEXT money column as USD scale-2 money.
+async fn scalar_money(conn: &DatabaseConnection, sql: &str) -> Option<bss_ledger_sdk::PostedMoney> {
+    conn.query_one_raw(pg(sql.to_owned()))
+        .await
+        .unwrap()
+        .map(|r| usd_text(&r.try_get_by_index::<String>(0).unwrap()))
 }
 
 async fn scalar_i64(conn: &DatabaseConnection, sql: &str) -> Option<i64> {
@@ -126,8 +152,7 @@ async fn setup(url: &str) -> (DatabaseConnection, DBProvider<DbError>, Seller) {
         .upsert_currency_scale(CurrencyScaleRow {
             tenant_id: s.tenant,
             currency: "USD".to_owned(),
-            minor_units: 2,
-            plausible_max_major: DEFAULT_PLAUSIBLE_MAX_MAJOR,
+            currency_scale: 2,
             source: "iso".to_owned(),
         })
         .await
@@ -172,9 +197,8 @@ async fn setup(url: &str) -> (DatabaseConnection, DBProvider<DbError>, Seller) {
 /// One ex-tax `subscription` item mapped to REVENUE via the Catalog class.
 fn revenue_item(amount: i64) -> InvoiceItem {
     InvoiceItem {
-        amount_minor_ex_tax: amount,
-        deferred_minor: 0,
-        currency: "USD".to_owned(),
+        amount_ex_tax: usd_cents(amount),
+        deferred: usd_cents(0),
         revenue_stream: "subscription".to_owned(),
         catalog_class: Some(AccountClass::Revenue),
         contract_class: None,
@@ -189,8 +213,7 @@ fn revenue_item(amount: i64) -> InvoiceItem {
 
 fn tax_breakdown(amount: i64) -> TaxBreakdown {
     TaxBreakdown {
-        amount_minor: amount,
-        currency: "USD".to_owned(),
+        amount: usd_cents(amount),
         tax_jurisdiction: "US-CA".to_owned(),
         tax_filing_period: "2026Q2".to_owned(),
         tax_rate_ref: None,
@@ -228,11 +251,15 @@ fn svc(provider: &DBProvider<DbError>, metrics: &MetricsHarness) -> InvoicePostS
     )
 }
 
-async fn bal(raw: &DatabaseConnection, s: &Seller, account: Uuid) -> Option<i64> {
-    scalar_i64(
+async fn bal(
+    raw: &DatabaseConnection,
+    s: &Seller,
+    account: Uuid,
+) -> Option<bss_ledger_sdk::PostedMoney> {
+    scalar_money(
         raw,
         &format!(
-            "SELECT balance_minor FROM bss.ledger_account_balance \
+            "SELECT balance FROM bss.ledger_account_balance \
              WHERE tenant_id='{}' AND account_id='{}' AND currency='USD'",
             s.tenant, account
         ),
@@ -267,15 +294,19 @@ async fn posts_balanced_invoice_and_emits_metrics() {
 
     assert_eq!(
         bal(&raw, &s, s.ar).await,
-        Some(1200),
+        Some(usd_cents(1200)),
         "AR debit = gross 1200"
     );
     assert_eq!(
         bal(&raw, &s, s.revenue).await,
-        Some(1000),
+        Some(usd_cents(1000)),
         "Revenue credit = 1000"
     );
-    assert_eq!(bal(&raw, &s, s.tax).await, Some(200), "Tax credit = 200");
+    assert_eq!(
+        bal(&raw, &s, s.tax).await,
+        Some(usd_cents(200)),
+        "Tax credit = 200"
+    );
 
     // Metrics: one posted attempt + one duration sample.
     harness.force_flush();
@@ -308,7 +339,7 @@ async fn posts_balanced_invoice_and_emits_metrics() {
     );
     assert_eq!(
         bal(&raw, &s, s.ar).await,
-        Some(1200),
+        Some(usd_cents(1200)),
         "AR unchanged on replay"
     );
     harness.force_flush();
@@ -417,15 +448,19 @@ async fn closed_payer_is_rejected_but_a_reversal_still_posts() {
     // The reversal nets AR/Revenue/Tax back to zero.
     assert_eq!(
         bal(&raw, &s, s.ar).await,
-        Some(0),
+        Some(usd_cents(0)),
         "AR nets to zero after reversal"
     );
     assert_eq!(
         bal(&raw, &s, s.revenue).await,
-        Some(0),
+        Some(usd_cents(0)),
         "Revenue nets to zero"
     );
-    assert_eq!(bal(&raw, &s, s.tax).await, Some(0), "Tax nets to zero");
+    assert_eq!(
+        bal(&raw, &s, s.tax).await,
+        Some(usd_cents(0)),
+        "Tax nets to zero"
+    );
 }
 
 /// Companion to `closed_payer_is_rejected_but_a_reversal_still_posts`: the REST
@@ -838,7 +873,7 @@ async fn concurrent_same_invoice_posts_exactly_once() {
     // The single posted effect moved AR exactly once (gross 1200, not 2400).
     assert_eq!(
         bal(&raw, &s, s.ar).await,
-        Some(1200),
+        Some(usd_cents(1200)),
         "AR reflects exactly one post, not a double charge"
     );
 }
@@ -976,17 +1011,17 @@ async fn concurrent_reversals_of_one_entry_post_exactly_once() {
     // the second reversal did not apply a second effect.
     assert_eq!(
         bal(&raw, &s, s.ar).await,
-        Some(0),
+        Some(usd_cents(0)),
         "AR nets to zero after exactly one reversal"
     );
     assert_eq!(
         bal(&raw, &s, s.revenue).await,
-        Some(0),
+        Some(usd_cents(0)),
         "Revenue nets to zero after exactly one reversal"
     );
     assert_eq!(
         bal(&raw, &s, s.tax).await,
-        Some(0),
+        Some(usd_cents(0)),
         "Tax nets to zero after exactly one reversal"
     );
 }
@@ -1033,15 +1068,12 @@ fn original_view(
                     account_class: *class,
                     gl_code: None,
                     side: *side,
-                    amount_minor: *amount,
-                    currency: "USD".to_owned(),
-                    currency_scale: 2,
+                    money: usd_cents(*amount),
                     invoice_id: invoice.map(str::to_owned),
                     due_date: invoice.map(|_| naive(2026, 7, 1)),
                     revenue_stream: stream.map(str::to_owned),
                     mapping_status: MappingStatus::Resolved,
-                    functional_amount_minor: None,
-                    functional_currency: None,
+                    functional_money: None,
                     tax_jurisdiction: is_tax.then(|| "US-CA".to_owned()),
                     tax_filing_period: is_tax.then(|| "2026Q2".to_owned()),
                     ar_status: None,
@@ -1166,15 +1198,12 @@ fn line(
         account_class: class,
         gl_code: None,
         side,
-        amount_minor: amount,
-        currency: "USD".to_owned(),
-        currency_scale: 2,
+        money: usd_cents(amount),
         invoice_id: invoice_id.map(str::to_owned),
         due_date: invoice_id.map(|_| naive(2026, 7, 1)),
         revenue_stream: revenue_stream.map(str::to_owned),
         mapping_status: MappingStatus::Resolved,
-        functional_amount_minor: None,
-        functional_currency: None,
+        functional_money: None,
         tax_jurisdiction: None,
         tax_filing_period: None,
         tax_rate_ref: None,

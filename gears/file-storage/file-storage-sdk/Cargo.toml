@@ -1,6 +1,6 @@
 [package]
 name = "cf-gears-file-storage-sdk"
-version = "0.1.2"
+version = "0.1.3"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -9,6 +9,7 @@ repository.workspace = true
 readme = "README.md"
 keywords = ["constructorfabric", "cf-gears", "file-storage"]
 categories = ["api-bindings"]
+metadata.docs.rs.all-features = true
 
 [lib]
 name = "file_storage_sdk"

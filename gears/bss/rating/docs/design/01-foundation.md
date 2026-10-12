@@ -43,7 +43,7 @@ The Evaluation Foundation is the pure-function core every Rating capability runs
 the mirror image of the pricing gear's *publish through the engine*: here the contract is
 **evaluate through the core**. It owns the **evaluation pipeline** (the invariant §17.1 step
 order with registered step evaluators), the **evaluation context** and **evaluation unit**
-shapes, the **adopted** pricing 8-axis canonical scope key, the **determinism contract**
+shapes, the **adopted** pricing ten-axis canonical scope key, the **determinism contract**
 (byte-identical replay over frozen inputs), `pricingSnapshotRef` **composition** (Rating is
 the composition SoR), the usage/delta **idempotency** keys, and the **emission guards**
 (non-negative line, full-precision emission, no rounding). It owns **no step policy**: what a
@@ -86,10 +86,10 @@ plus its snapshot ref *is* the output, and Rating owns its persistence
 
 | ADR ID | Decision Summary |
 |--------|------------------|
-| `cpt-cf-bss-rating-adr-scope-key-adoption` | Adopt the pricing 8-axis canonical scope key verbatim (selection + non-overlap); cohort generation selected by the pinned price id; no Rating-local key (SEAMS K1–K5). |
-| `cpt-cf-bss-pricing-adr-canonical-scope-key` (adopted) | The key definition itself — the manifest key extended additively; the pricing gear is its SoR. |
-| `cpt-cf-bss-pricing-adr-grandfathering-cohort-axis` (adopted) | `cohort` = the cutover instant; Rating resolves the generation by the cohort of the subscription's pinned price id. |
-| `cpt-cf-bss-pricing-adr-pricewindow-consolidation` (adopted) | `PriceWindow*` events are produced by the pricing gear; Rating consumes all four (incl. `Cancelled`) as read-only resolution inputs. |
+| `cpt-cf-bss-rating-adr-scope-key-adoption` | Adopt the pricing canonical scope key (ten axes since D-196) verbatim (selection + non-overlap); cohort generation selected by the pinned price id; no Rating-local key (SEAMS K1–K5; K6 resolved T-D-35). |
+| Canonical scope key (superseded by the PriceBook model, see T-D-37 in rating DECISIONS) (adopted) | The key definition itself — the manifest key extended additively; the pricing gear is its SoR. |
+| Grandfathering cohort axis (superseded by the PriceBook model, see T-D-37 in rating DECISIONS) (adopted) | `cohort` = the cutover instant; Rating resolves the generation by the cohort of the subscription's pinned price id. |
+| PriceWindow consolidation (superseded by the PriceBook model, see T-D-37 in rating DECISIONS) (adopted) | `PriceWindow*` events are produced by the pricing gear; Rating consumes all four (incl. `Cancelled`) as read-only resolution inputs. |
 
 ### 1.3 Architecture Layers
 
@@ -177,7 +177,7 @@ This satisfies the PRD §6.1 requirement that the owner be named before the Adju
 - [ ] `p1` - **ID**: `cpt-cf-bss-rating-domain-model-fnd`
 
 - **`EvaluationContext`** — the frozen input aggregate: tenant axes (`resourceTenantId`, `payerTenantId`, `sellerTenantId`), subscription/plan linkage + active `phase_id`, SKU/meter + `dimensionKey`, quantity or time slice (post-granularity), `tierAggregationWindow`, `t` (UTC), currency/region/brand scope, `periodState`, optional `reservationMatch`, optional `(changeEffectiveAt, changeMode)`, and the snapshot identifiers.
-- **`EvaluationUnit`** — what determinism quantifies over, three kinds (§4.2): a single normalized `UsageRecord` (`per_event`); the window-aggregated `Q` for `(subscription, meter, dimensionKey, window)` — per sub-window slice when the window is split; a **period-driven unit** (recurring lines, capacity-flavor charges, true-up surfacing) keyed `(subscription, priceId, chargeKind, lineKey, AnchorPeriod)`. The three kinds are exhaustive: `one_time` / `one_time_setup` charges have **no** evaluation unit — billed at sale by Subscriptions/Billing (T-D-18).
+- **`EvaluationUnit`** — what determinism quantifies over, three kinds (§4.2): a single normalized `UsageRecord` (`per_event`); the window-aggregated `Q` for `(subscription, meter, dimensionKey, window)` — per sub-window slice when the window is split; a **period-driven unit** (recurring lines, capacity-flavor charges, true-up surfacing) keyed `(subscription, priceId, chargeKind, lineKey, AnchorPeriod)`. The three kinds are exhaustive: `one_time` (`one_time_setup` is withdrawn — T-D-36) charges have **no** evaluation unit — billed at sale by Subscriptions/Billing (T-D-18).
 - **`ResolvedPriceOutcome`** — effective rates, model kind, tier thresholds, overlay winners + stack lineage, commitment/reservation effects, applied coupon ids + pre/post amounts, FX policy record, `performanceObligationRef`/`sspSnapshotPointer` (nullable), and the composed `pricingSnapshotRef`.
 - **`pricingSnapshotRef`** — the four-writer composite (§4.3 — registry, pricing, Subscriptions, Rating); immutable once emitted.
 - **`lineKey`** — the **billable component-interval coordinate** within a subscription, **value rule adopted verbatim from subscriptions SUB-D-21 (T-D-34, 2026-08-01)**: `plan#n` for the n-th `PlanLink` interval, `addon:{addOnId}#n` for the n-th interval of that add-on — `n` = the component's 1-based lifetime interval ordinal, assigned at interval open, immutable. Stability: a multi-period interval keeps its key; an in-place `changePlan` opens `plan#n+1` (a mid-period change ⇒ two period-driven units that period); a re-added add-on gets a fresh ordinal; `updateQuantity` opens no interval; **stable across sub-window slices** (a split changes `priceId` per slice, never the `lineKey`). Bundle-component sub-lines, where this gear materializes them, are rating-internal sub-coordinates under the plan line's key — the Billing handoff aggregates to the inherited fact key. Shared **identically** with the Subscriptions period-fact key (SUB-D-19/21), and since T-D-33 the period coordinate is shared too (`AnchorPeriod` ≡ the fact's period identity) — the two gears' period keys no longer differ at all.
@@ -188,7 +188,7 @@ This satisfies the PRD §6.1 requirement that the owner be named before the Adju
 - [ ] `p1` - **ID**: `cpt-cf-bss-rating-component-evaluation-core-fnd`
 
 - **`EvaluationPipeline`** — composes the registered step evaluators in the fixed §17.1 order; short-circuits fail-closed on any step error.
-- **`ScopeKeyAdapter`** — materializes the adopted 8-axis key from context + snapshot (§4.1): full-key window selection, eligibility class order, cohort-by-pinned-price-id.
+- **`ScopeKeyAdapter`** — materializes the adopted ten-axis key from context + snapshot (§4.1; the usage pair from the line being priced, the rendered absent-axis token `none` otherwise — T-D-35): full-key window selection, eligibility class order, cohort-by-pinned-price-id.
 - **`SnapshotComposer`** — verifies the pricing pre-stamp + Subscriptions binding, appends the eval-time segments, seals the ref (§4.3).
 - **`DeterminismGuard`** — derives the usage/correction idempotency keys, enforces partition-key serialization for re-resolve, and stamps the frozen-input digest into metadata so replay divergence is detectable (§4.2).
 - **`EmissionGuard`** — non-negative clamp/credit, full-precision emission, rounding-policy id record, obligation envelope (§4.4).
@@ -230,8 +230,8 @@ per-line flow (retroactivity, period obligations); 10 registers publish validato
 **Evaluate one line** (implements `cpt-cf-bss-rating-seq-evaluate-tariff`):
 
 1. Assemble `EvaluationContext`; verify every frozen input is present (fail closed otherwise).
-2. Steps 1–2 (slice 02): resolve `phase_id`; select the single window on the full 8-axis key; eligibility class order; cohort by pinned price id.
-3. Step 3 (slice 03): map `(meter, dimensionKey)` injectively; granularity round-up on the merged measure; model formula over the evaluation unit.
+2. Steps 1–2 (slice 02): resolve `phase_id`; select the single window on the full ten-axis key; eligibility class order; cohort by pinned price id.
+3. Step 3 (slice 03): map `(skuId, dimensionKey)` injectively; granularity round-up on the merged measure; model formula over the evaluation unit.
 4. Steps 4–5 (slice 04): stack scope-matching PriceOverlays (class order breaks ties); apply contract overlay; enforce the anti-drift cap.
 5. Step 6 (slice 05): reservation match first — a consumption split re-runs steps 3–5 as a unit over the on-demand remainder (T-D-13) — then commitment-pool waterfall; obligations surfaced, never posted.
 6. Step 7 (slice 06): coupons per stacking policy (price-currency before FX).
@@ -249,7 +249,7 @@ per-line flow (retroactivity, period obligations); 10 registers publish validato
 
 ### 3.7 Database Schemas and Tables
 
-- [ ] `p1` - **ID**: `cpt-cf-bss-rating-storage-none-fnd`
+- [ ] `p1` - **ID**: `cpt-cf-bss-rating-datastore-none-fnd`
 
 **None owned.** The Foundation holds no authoritative table. The only local state is a
 **non-authoritative resolved-window cache** (pinned read-model pages keyed by snapshot ref;
@@ -279,7 +279,14 @@ Selection and non-overlap use the pricing canonical key **verbatim**:
 
 ```text
 (planId, currency, region, priceOverlay, phase, priceEligibility, chargeKind, cohort)
+  + on chargeKind = usage: (skuId, dimensionKey)
 ```
+
+The usage pair is an axis of the key **conditionally** (pricing D-196, 2026-08-06; adopted here
+verbatim per ADR-0001, and materialized on `SelectionKey` since T-D-35 / SEAMS K6, 2026-08-25):
+taken from the evaluation line for `chargeKind = usage`, absent otherwise — and *absent* is spelled per surface, exactly as pricing spells it (corrected 2026-08-26: this said "the `''` sentinel", which is only pricing's index-expression spelling and would have put `''` into a **rendered** key that pricing renders `none`, breaking the byte-identity ADR-0001 requires of the shared fixture set): the rendered `SelectionKey` carries pricing's absent-axis token — the literal `none` — in both usage positions, while the storage/index surface mirrors
+pricing's `COALESCE(meter,'')` index spelling. *Verbatim adoption is what makes this key ten and
+not eight; this block was short by the pair until 2026-08-26.*
 
 - "At most one window matches" holds **only on the full key**; coexisting hybrid `chargeKind` rows and grandfathering `cohort` generations are disambiguated by the key, never fail-closed.
 - `phase` is a `phase_id` (uuid; kind names are display-only); usage rows are phase-invariant by default, phase-specific wins — the no-gap rule applies to the *resolved* set.

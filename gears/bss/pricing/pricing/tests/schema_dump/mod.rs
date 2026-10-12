@@ -66,9 +66,10 @@
 
 use std::fmt::Write as _;
 
-use bss_pricing::infra::storage::migrations::Migrator;
+use bss_pricing::module::BssPricingGear;
 use sea_orm::{ConnectionTrait, DatabaseBackend, DatabaseConnection, Statement};
-use sea_orm_migration::{MigrationTrait, MigratorTrait, SchemaManager};
+use sea_orm_migration::{MigrationTrait, SchemaManager};
+use toolkit::contracts::DatabaseCapability;
 
 /// Collapse runs of whitespace outside single-quoted literals, and trim the result.
 ///
@@ -320,12 +321,12 @@ pub fn tables_in(dump: &str) -> Vec<String> {
 
 /// The chain in the order the platform runner applies it -- by migration **name**.
 ///
-/// `Migrator::migrations()` returns declaration order, which is the registry's order and not
+/// `BssPricingGear::default().migrations()` returns declaration order, which is the registry's order and not
 /// necessarily the applied one. Sorting by name here is what makes a dump taken through
 /// `SchemaManager` comparable with a database the runner built.
 #[must_use]
 pub fn name_ordered_chain() -> Vec<Box<dyn MigrationTrait>> {
-    let mut chain = Migrator::migrations();
+    let mut chain = BssPricingGear::default().migrations();
     chain.sort_by(|a, b| a.name().cmp(b.name()));
     chain
 }

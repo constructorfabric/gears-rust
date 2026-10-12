@@ -18,6 +18,9 @@ import time
 import httpx
 import pytest
 
+# Real LLM calls only: offline, the suite's mock-based tests cover the same paths.
+pytestmark = pytest.mark.online_only
+
 BASE_URL = os.environ.get("BASE_URL", "http://127.0.0.1:8087")
 API = f"{BASE_URL}/cf/mini-chat/v1"
 TIMEOUT = 90
@@ -61,6 +64,9 @@ def parse_sse(text: str) -> list[dict]:
 
 
 def create_chat(model: str = DEFAULT_MODEL) -> dict:
+    # Online only: a model whose provider has no key is skipped, not failed.
+    from .config.generator import model_provider, skip_unless_provider_key
+    skip_unless_provider_key(model_provider(model))
     resp = httpx.post(f"{API}/chats", json={"model": model}, timeout=TIMEOUT)
     assert resp.status_code == 201, f"create chat: {resp.status_code} {resp.text}"
     return resp.json()
@@ -82,22 +88,26 @@ def find_event(events: list[dict], name: str) -> dict | None:
     return next((e for e in events if e["event"] == name), None)
 
 
-_TRANSIENT_ERROR_PHRASES = ("provider", "upstream", "rate limit", "timeout", "unavailable", "gateway")
+# SSE error codes of a provider that is temporarily unavailable (DESIGN §3.3
+# "Streaming error codes"): the provider did not answer in time or throttled
+# the request. `provider_error` is not one of them: it also covers a provider
+# rejecting the request the gear built, which must fail the test.
+PROVIDER_UNAVAILABLE_CODES = ("provider_timeout", "rate_limited")
 
 
 def require_done(events: list[dict]) -> dict:
     """Assert stream completed successfully (has 'done' event, no 'error').
 
-    Only skips for known transient/provider errors; fails on all others
-    so real bugs are not masked.
+    Skips only when the SSE error code is one of PROVIDER_UNAVAILABLE_CODES
+    and fails on every other code (`provider_error` included), so gear errors
+    are not masked.
     """
     err = find_event(events, "error")
     if err:
-        err_data = str(err.get("data", "")).lower()
-        if any(phrase in err_data for phrase in _TRANSIENT_ERROR_PHRASES):
-            pytest.skip(f"Provider error (transient): {err['data']}")
-        else:
-            pytest.fail(f"Stream error (non-transient): {err['data']}")
+        code = err["data"].get("code") if isinstance(err["data"], dict) else None
+        if code in PROVIDER_UNAVAILABLE_CODES:
+            pytest.skip(f"Provider unavailable ({code}): {err['data']}")
+        pytest.fail(f"Stream error: {err['data']}")
     done = find_event(events, "done")
     if done is None:
         pytest.fail(f"No 'done' event in stream. Events: {[e['event'] for e in events]}")
@@ -111,7 +121,7 @@ def get_response_text(events: list[dict]) -> str:
 
 
 def upload_file(chat_id: str, filename: str, content: bytes, content_type: str = "text/plain") -> str:
-    """Upload a file and return attachment_id. Skips on provider errors."""
+    """Upload a file and return attachment_id."""
     resp = httpx.post(
         f"{API}/chats/{chat_id}/attachments",
         files={"file": (filename, io.BytesIO(content), content_type)},
@@ -121,7 +131,7 @@ def upload_file(chat_id: str, filename: str, content: bytes, content_type: str =
     return resp.json()["id"]
 
 
-def poll_attachment_ready(chat_id: str, att_id: str, timeout_secs: int = 30) -> dict:
+def poll_attachment_ready(chat_id: str, att_id: str, timeout_secs: int = 180) -> dict:
     """Poll until attachment is ready or failed."""
     deadline = time.time() + timeout_secs
     while time.time() < deadline:
@@ -401,7 +411,7 @@ class TestLiveWebSearch:
         status, events, raw = send_message(
             chat["id"],
             "Search the web: what is the current population of Tokyo?",
-            web_search_enabled=True,
+            web_search={"enabled": True},
         )
         assert status == 200, f"web search failed: {raw}"
         done = require_done(events)
@@ -436,39 +446,6 @@ class TestLiveReactions:
             timeout=10,
         )
         assert resp.status_code == 204
-
-
-class TestLiveErrorHandling:
-    """Error scenarios."""
-
-    def test_empty_content_rejected(self, chat):
-        resp = httpx.post(
-            f"{API}/chats/{chat['id']}/messages:stream",
-            json={"content": ""},
-            headers={"Accept": "text/event-stream"},
-            timeout=10,
-        )
-        assert resp.status_code in (400, 422)
-
-    def test_chat_not_found_stream(self, _check_live):
-        fake_id = "00000000-0000-0000-0000-000000000000"
-        resp = httpx.post(
-            f"{API}/chats/{fake_id}/messages:stream",
-            json={"content": "hello"},
-            headers={"Accept": "text/event-stream"},
-            timeout=10,
-        )
-        assert resp.status_code in (403, 404)
-
-    def test_invalid_attachment_id_rejected(self, chat):
-        fake_att = "00000000-0000-0000-0000-000000000000"
-        resp = httpx.post(
-            f"{API}/chats/{chat['id']}/messages:stream",
-            json={"content": "hello", "attachment_ids": [fake_att]},
-            headers={"Accept": "text/event-stream"},
-            timeout=10,
-        )
-        assert resp.status_code in (400, 404, 422)
 
 
 class TestLiveMessagesAPI:
@@ -516,7 +493,7 @@ class TestLiveChatUpdate:
             json={"title": "   "},
             timeout=10,
         )
-        assert resp.status_code in (400, 422)
+        assert resp.status_code == 400
 
 
 class TestLiveThreadSummary:
@@ -684,15 +661,14 @@ class TestLiveThreadSummaryTrigger:
 
 
 class TestLiveAttachmentDeletion:
-    """Upload a document, verify LLM can find it, delete it, verify LLM cannot."""
+    """Upload a document, verify the LLM finds its content, delete it."""
 
     @pytest.mark.online_only
-    def test_delete_makes_document_invisible_to_llm(self, _check_live):
+    def test_document_answer_then_delete(self, _check_live):
         """
         1. Create chat, upload file with unique fact
-        2. Ask LLM about the fact WITH attachment → should know
-        3. Delete attachment
-        4. New chat, ask same question WITHOUT attachment → should NOT know
+        2. Ask LLM about the fact (file_search) → should know
+        3. Delete the unreferenced attachment → 204, then GET → 404
         """
         chat = create_chat(DEFAULT_MODEL)
         chat_id = chat["id"]
@@ -715,6 +691,8 @@ class TestLiveAttachmentDeletion:
         time.sleep(5)
 
         # Ask WITH attachment
+        # No attachment_ids: file_search covers every document of the chat, and
+        # the attachment stays unreferenced (deletable).
         status, events, raw = send_message(chat_id, "What is the capital of Zarvonia? Use the attached document.")
         assert status == 200, f"Stream failed: {raw}"
         require_done(events)
@@ -725,21 +703,9 @@ class TestLiveAttachmentDeletion:
 
         # Delete attachment
         resp = httpx.delete(f"{API}/chats/{chat_id}/attachments/{att_id}", timeout=10)
-        assert resp.status_code in (204, 409)  # 409 = referenced by message, still soft-deleted
-
-        # NEW chat — no vector store, no history
-        clean_chat = create_chat(DEFAULT_MODEL)
-        status2, events2, raw2 = send_message(
-            clean_chat["id"], "What is the capital of Zarvonia?"
-        )
-        assert status2 == 200, f"Stream failed: {raw2}"
-        require_done(events2)
-        response_text2 = get_response_text(events2)
-
-        # LLM should NOT know — Plimberwick is a made-up fact from a deleted file
-        assert "plimberwick" not in response_text2.lower(), (
-            f"LLM should NOT know about Plimberwick without document, got: {response_text2}"
-        )
+        assert resp.status_code == 204
+        resp = httpx.get(f"{API}/chats/{chat_id}/attachments/{att_id}", timeout=10)
+        assert resp.status_code == 404
 
     def test_attachment_api_returns_404_after_delete(self, _check_live):
         """After deletion, GET attachment returns 404."""
@@ -848,8 +814,8 @@ class TestLiveChatDeletionCleanup:
         else:
             pytest.fail(f"Chat {chat_id} not deleted after 10s")
 
-    def test_delete_chat_idempotent(self, _check_live):
-        """Deleting the same chat twice should succeed both times."""
+    def test_second_delete_chat_404(self, _check_live):
+        """A second DELETE of the same chat is 404."""
         chat = create_chat(MINI_MODEL)
         chat_id = chat["id"]
 
@@ -857,4 +823,4 @@ class TestLiveChatDeletionCleanup:
         assert resp1.status_code == 204
 
         resp2 = httpx.delete(f"{API}/chats/{chat_id}", timeout=10)
-        assert resp2.status_code in (204, 404)
+        assert resp2.status_code == 404

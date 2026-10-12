@@ -1,8 +1,8 @@
 //! Canonical error middleware (DESIGN.md §3.2 / §3.6 / §3.7).
 //!
 //! Post-processes responses with `Content-Type: application/problem+json`,
-//! filling missing `trace_id` (W3C `traceparent` → `x-trace-id` →
-//! `x-request-id` → span-id fallback) and `instance` (request URI path).
+//! filling missing `trace_id` (live `OTel` span context → W3C `traceparent`)
+//! and `instance` (request URI path).
 //! Logs at `warn!` for 4xx / `error!` for 5xx with structured fields.
 //!
 //! Any other error-status response whose body is genuinely unstructured (a
@@ -57,6 +57,8 @@ use axum::{
     response::Response,
 };
 use toolkit_canonical_errors::{CanonicalError, ForeignPassthrough, Http, Problem};
+
+use toolkit_trace_context::extract_trace_id;
 
 const PROBLEM_JSON: &str = "application/problem+json";
 
@@ -572,42 +574,6 @@ fn is_unstructured_error_body(response: &Response) -> bool {
     }
 }
 
-/// W3C `traceparent` → `x-trace-id` → `x-request-id` → span-id fallback.
-///
-/// For `traceparent`, returns the 32-hex trace-id segment only — matching
-/// `toolkit_http::otel::parse_trace_id` and the access log / `OTel` span
-/// recording in this codebase, so the wire `trace_id` is grep-equal to the
-/// trace-id surfaced in logs and traces. A malformed traceparent falls
-/// through to `x-trace-id` / `x-request-id` (preserves the function's
-/// graceful-failure semantics).
-fn extract_trace_id(headers: &HeaderMap) -> Option<String> {
-    if let Some(tp) = headers.get("traceparent").and_then(|v| v.to_str().ok())
-        && let Some(trace_id) = parse_w3c_trace_id(tp)
-    {
-        return Some(trace_id);
-    }
-    for name in ["x-trace-id", "x-request-id"] {
-        if let Some(v) = headers.get(name).and_then(|v| v.to_str().ok()) {
-            return Some(v.to_owned());
-        }
-    }
-    tracing::Span::current()
-        .id()
-        .map(|id| id.into_u64().to_string())
-}
-
-/// Mirror of `toolkit_http::otel::parse_trace_id`. Duplicated rather than
-/// taking a new dep edge from `toolkit` onto `toolkit-http` for seven lines
-/// of parsing. Keep behaviour in lock-step with the source.
-fn parse_w3c_trace_id(traceparent: &str) -> Option<String> {
-    let parts: Vec<&str> = traceparent.split('-').collect();
-    if parts.len() >= 4 && parts[0] == "00" {
-        Some(parts[1].to_owned())
-    } else {
-        None
-    }
-}
-
 fn log_problem(problem: &Problem, canonical: Option<&CanonicalError>) {
     // Every Problem this middleware logs was either just normalized from a
     // real HTTP status (`enrich_problem_response`) or built via
@@ -617,10 +583,13 @@ fn log_problem(problem: &Problem, canonical: Option<&CanonicalError>) {
     let status = problem.status.unwrap_or(0);
     let problem_type = problem.problem_type.as_str();
     let instance = problem.instance.as_deref().unwrap_or("");
-    let trace_id = problem.trace_id.as_deref().unwrap_or("");
+    // `trace_id` is intentionally NOT an event field: the log-correlation
+    // formatter splices the live span's `trace_id` onto the top level of every
+    // record (`bootstrap::host::log_correlation`), so a nested copy here would
+    // be a duplicate key.
     // `diagnostic()` returns Some only for `Internal` / `Unknown` (5xx-only
-    // categories). Surface it server-side so operators can correlate
-    // `trace_id` → root cause without exposing it on the wire.
+    // categories). Surface it server-side so operators can correlate root
+    // cause without exposing it on the wire.
     let description = canonical.and_then(CanonicalError::diagnostic).unwrap_or("");
 
     if (400..500).contains(&status) {
@@ -628,7 +597,6 @@ fn log_problem(problem: &Problem, canonical: Option<&CanonicalError>) {
             status,
             problem_type,
             instance,
-            trace_id,
             "canonical error response (client)"
         );
     } else if (500..600).contains(&status) {
@@ -636,7 +604,6 @@ fn log_problem(problem: &Problem, canonical: Option<&CanonicalError>) {
             status,
             problem_type,
             instance,
-            trace_id,
             description,
             "canonical error response (server)"
         );

@@ -149,7 +149,7 @@ Inherits Slice 1 C1–C4. Slice-6-specific (defaults; open items → §7.11):
 | Name | Meaning |
 |------|---------|
 | `chain_state` | Per-tenant **chain tip** `(tenant_id, last_row_hash, last_entry_id, last_period_id, last_seq)` — advanced by the ChainWriter (Mode A) or serialized in the post txn (Mode S — MVP reads the tip lockless under **SERIALIZABLE**/SSI; the literal `FOR UPDATE` row lock is deferred until SecureORM exposes a locking read) so each new `row_hash` links the prior committed one linearly; `last_period_id` advances atomically with `last_entry_id`. |
-| **Tamper-evidence chain** | `row_hash = H(domain_sep ‖ canonical-financial-fields ‖ prev_hash)`; `prev_hash` = the tenant's `chain_state.last_row_hash`. Default mechanism (pluggable). |
+| **Tamper-evidence chain** | `row_hash = H(domain_sep ‖ canonical-financial-fields ‖ prev_hash)`; `domain_sep = "VHP-BSS-LEDGER-CHAIN-v2"`; `prev_hash` = the tenant's `chain_state.last_row_hash`. Default mechanism (pluggable). |
 | `scope_freeze` | A flag the Verifier (or manual override) sets on a tenant/scope when chain verification fails; checked **on write** to reject further posts. |
 | **Secured audit store** | RBAC-restricted, **hash-chained / WORM** investigation-grade store (manifest §9): forensics, conflicting-payload captures, cross-tenant + re-identification + erasure records, PII where policy requires. |
 | **Payer-tenant-id ↔ PII map** | `payer_tenant_id` (the actual journal_line column) → human PII pointer (secured store / CRM); erasure **tombstones** the reverse-lookup. |
@@ -330,7 +330,8 @@ row_hash = H(domain_sep ‖ tenant_id ‖ entry_id ‖ period_id ‖ legal_entit
   ‖ effective_at ‖ posted_at_utc ‖ origin ‖ posted_by_actor_id
   ‖ for-each-line in line_id order(
       account_id, account_class, gl_code /* "account as posted" is financially binding */,
-      side, amount_minor, currency, currency_scale, functional_amount_minor, functional_currency,
+      side, amount /* canonical decimal text */, currency, currency_scale,
+      functional_amount /* canonical decimal text */, functional_currency, functional_currency_scale,
       payer_tenant_id, seller_tenant_id, resource_tenant_id, invoice_id, revenue_stream,
       tax_jurisdiction, tax_filing_period, tax_rate_ref, ar_status, mapping_status,
       rate_snapshot_ref, credit_grant_event_type, invoice_item_ref, sku_or_plan_ref,
@@ -342,7 +343,7 @@ row_hash = H(domain_sep ‖ tenant_id ‖ entry_id ‖ period_id ‖ legal_entit
 ```
 
 **Steps**:
-1. [ ] - `p1` - Encode all fields **length-prefixed, fixed integer widths, NULL-safe** (NULL encodes as a distinct marker, never as an empty value) - `inst-ch-encoding`
+1. [ ] - `p1` - Encode all fields **length-prefixed, fixed integer widths, NULL-safe** (NULL encodes as a distinct marker, never as an empty value); a money value is encoded as three fields — length-prefixed canonical decimal text (`canonical_decimal`, so `10.0` and `10` hash alike), the currency code and a one-byte scale — and an absent functional amount encodes all three as NULL markers; the domain separator is `VHP-BSS-LEDGER-CHAIN-v2` - `inst-ch-encoding`
 2. [ ] - `p1` - The field set covers the period assignment (`period_id`), the AC #8 "who" (`origin`, `posted_by_actor_id`), and **all three tenant axes** (payer/seller/resource) - `inst-ch-coverage`
 3. [ ] - `p1` - Exclude free-form jsonb and **any PII** from the hashed set (so erasure never breaks the chain) - `inst-ch-pii-excluded`
 4. [ ] - `p1` - `H` per G1 (**SHA-256** default, ratified decision 3.A) - `inst-ch-alg`
@@ -470,7 +471,7 @@ Posted lines are the historical record; never recomputed in place. `PolicyVersio
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-ledger-dod-tamper-chain`
 
-The system **MUST** activate the Slice 1 tamper seam as a per-tenant hash chain: Mode S in-txn tip advance under SERIALIZABLE/SSI (MVP), byte-reproducible SHA-256 canonical hash over the normative field list (NULL-safe, length-prefixed, PII-excluded), strictly linear and gap-tolerant linkage via the `prev_entry_id` back-pointer, with Mode A (async micro-batch writer, only-from-NULL chain columns, `SECURITY DEFINER`) addable post-MVP without migration.
+The system **MUST** activate the Slice 1 tamper seam as a per-tenant hash chain: Mode S in-txn tip advance under SERIALIZABLE/SSI (MVP), byte-reproducible SHA-256 canonical hash over the normative field list (NULL-safe, length-prefixed, PII-excluded, money as canonical decimal text + currency + scale under the `VHP-BSS-LEDGER-CHAIN-v2` separator), strictly linear and gap-tolerant linkage via the `prev_entry_id` back-pointer, with Mode A (async micro-batch writer, only-from-NULL chain columns, `SECURITY DEFINER`) addable post-MVP without migration.
 
 **Implements**:
 - `cpt-cf-bss-ledger-algo-chain-writer`
@@ -601,7 +602,7 @@ The system **MUST** keep journal lines + internal references ≥7 years, keep ar
 
 A **delta over the Foundation testing architecture** (levels + mocking inherited).
 
-- [ ] **Unit:** canonical hash serialization is byte-reproducible (NULL-safe length-prefixed, fixed widths, line order) — the byte-reproducibility test vector regenerated for the extended field list, incl. NULL-safe encoding of the new nullable fields; PII excluded from the hashed field set; G4 allow-list enforcement; PII-on-operational-surface detector against the concrete prohibited-field list
+- [ ] **Unit:** canonical hash serialization is byte-reproducible (NULL-safe length-prefixed, fixed widths, line order, canonical decimal money text) — the byte-reproducibility test vector regenerated for the extended field list and the `v3` separator, incl. NULL-safe encoding of the new nullable fields and the absent-functional-money triple; PII excluded from the hashed field set; G4 allow-list enforcement; PII-on-operational-surface detector against the concrete prohibited-field list
 - [ ] **Integration (testcontainers):** **(Mode S — MVP)** posted entry links the tenant chain tip under `chain_state` lock (concurrent commits never share a `prev_hash`; a rolled-back entry leaves no chain gap); **(Mode A — post-MVP)** the micro-batch ChainWriter chains committed entries in the deterministic order, sets chain columns only from NULL, resumes after crash/restart with no gap or double-link, and a breached lag threshold raises `chain-lag`; Verifier detects a tampered row → sets `scope_freeze` → next in-scope post is rejected (`TAMPER_VERIFICATION_FAILED`); a financial-field PATCH is rejected pre-write (`IMMUTABLE_FINANCIAL_FIELD`); an allow-listed metadata change logs before/after without touching journal tables; cross-tenant read denied without elevation, allowed only with a same-txn audit record (and **fails the read if the audit write fails**); GDPR erasure tombstones the PII map while journal lines stay intact + queryable + the chain still verifies; re-identification is recorded; a closed-period correction reuses the original posting's pinned evidence refs (pricing/SSP, PO/allocation) while its own processing uses note-time policy and schedule state at the note's effective time (split, correction; AC #15)
 - [ ] **API:** RFC 9457 mapping for each code; audit retrieval returns who/when/source/correlation; audit-pack full linkage; tamper-status + freeze state; a cross-tenant request with `targetScope` ≠ home tenant but no `reason` is rejected **pre-read** with `MISSING_INVESTIGATION_REASON` (400), and a valid elevation writes the same-txn `cross-tenant-access` record before any foreign row is returned
 - [ ] **Audit & lineage (PRD obligation):** source-document linkage, tenant-scoped retrieval, erasure tombstone, tamper verification — covered
@@ -619,7 +620,7 @@ REST per `rest-api-design`, behind the inbound API gateway; reads tenant-scoped 
 |--------|------|---------|-------|
 | `GET` | `/v1/ledger/audit/journal-entries/{entryId}` | Audit retrieval: who/when/source/correlation (AC #8). | tenant-scoped; |
 | `GET` | `/v1/ledger/audit/documents/{sourceDocType}/{sourceBusinessId}/history` | One document's posting history: linked entries, reversals, notes, allocations, refunds, schedules. | tenant-scoped |
-| `POST` | `/v1/ledger/audit/packs` | Export an audit pack (filter → full-linkage CSV/PDF). | async; Finance/Audit scope · **cross-tenant** |
+| `POST` | `/v1/ledger/audit/packs` | Export an audit pack (filter → full-linkage CSV/PDF). CSV money columns are `amount,currency,currency_scale` (canonical decimal text in major units). | async; Finance/Audit scope · **cross-tenant** |
 | `GET` | `/v1/ledger/audit/tamper-status` | Latest chain-verification result + freeze state per scope. | Audit scope · **cross-tenant** |
 | `POST` | `/v1/ledger/audit/erasure` | Apply a GDPR erasure (tombstone PII map; chained audit record). | DPO scope; journal lines untouched · **cross-tenant** |
 | `POST` | `/v1/ledger/audit/reidentify` | Authorized re-identification (recorded). | DPO/investigator scope · **cross-tenant** |

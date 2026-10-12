@@ -49,3 +49,12 @@ pub(crate) fn register_routes(
 
     router.layer(axum::Extension(services))
 }
+
+/// `Retry-After` header of a 503 response (seconds).
+fn retry_after_header() -> toolkit::api::operation_builder::ResponseHeaderSpec {
+    toolkit::api::operation_builder::ResponseHeaderSpec::new(
+        "Retry-After",
+        "Seconds to wait before retrying",
+        toolkit::api::operation_builder::ResponseHeaderType::Integer,
+    )
+}

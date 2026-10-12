@@ -17,6 +17,7 @@ use toolkit_odata::{ODataQuery, Page, SortDir};
 use toolkit_security::AccessScope;
 use uuid::Uuid;
 
+use super::odata_filter::prepare_filter;
 use crate::domain::error::DomainError;
 use crate::domain::repo::MembershipRepositoryTrait;
 use crate::infra::storage::FK_RGM_GROUP_ID;
@@ -53,17 +54,25 @@ impl MembershipRepositoryTrait for MembershipRepository {
     ) -> Result<Page<ResourceGroupMembership>, DomainError> {
         let scope = system_scope();
         let base_query = MembershipEntity::find().secure().scope_with(&scope);
+        let (base_query, query_no_filter) =
+            prepare_filter::<MembershipFilterField, MembershipODataMapper, _>(
+                db,
+                base_query,
+                query,
+                MembershipFilterField::ResourceType,
+            )
+            .await?;
 
         let page = paginate_odata::<MembershipFilterField, MembershipODataMapper, _, _, _, _>(
             base_query,
             db,
-            query,
+            &query_no_filter,
             ("group_id", SortDir::Desc),
             MEMBERSHIP_LIMIT_CFG,
             |m: membership_entity::Model| m,
         )
         .await
-        .map_err(|e| DomainError::database(e.to_string()))?;
+        .map_err(DomainError::from)?;
 
         // Batch-resolve type IDs to GTS paths (single query)
         let type_ids: Vec<i16> = page.items.iter().map(|m| m.gts_type_id).collect();

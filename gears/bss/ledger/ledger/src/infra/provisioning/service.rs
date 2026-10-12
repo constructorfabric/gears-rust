@@ -1,24 +1,31 @@
 //! `ProvisioningService` — the transactional seller-provisioning seed. One
 //! sea-orm transaction runs the additive SELECT-then-INSERT of the chart of
 //! accounts, non-ISO currency scales, the fiscal-calendar config, and the
-//! initial OPEN fiscal period. The fiscal-calendar fields are validated and
+//! initial OPEN fiscal period. The transaction is `SERIALIZABLE`, so the
+//! currency-scale lock check also excludes a first posting of the currency that
+//! has not committed yet (one side aborts as contention, returned as
+//! [`DomainError::ConcurrentModification`]). The fiscal-calendar fields are validated and
 //! the initial `period_id` derived BEFORE the transaction opens (pure
 //! `domain::provisioning::plan`), so a malformed calendar never takes a write
 //! lock.
 //!
 //! ## Error handling across the transaction boundary
 //!
-//! [`DBProvider::transaction`] fixes the closure error type to [`DbError`].
-//! The only distinct business rejection that must survive the boundary is a
-//! scale that exceeds `i64` headroom ([`RepoError::ScaleOutOfRange`]): the
-//! closure encodes it into a sentinel [`DbError::Sea`] (`DbErr::Custom`) and
-//! returns `Err`, forcing a rollback; once `transaction()` returns the
-//! sentinel is decoded back into [`DomainError::ScaleOutOfRange`]. Every
-//! other [`RepoError`]/[`DbError`] is an infrastructure fault and surfaces as
-//! [`DomainError::Internal`].
+//! [`DBProvider::transaction`] fixes the closure error type to [`DbError`], so a
+//! business rejection crosses it as the ledger's one sentinel envelope
+//! ([`error_transport`](crate::infra::posting::error_transport)): the closure
+//! encodes it and returns `Err`, forcing a rollback, and once `transaction()`
+//! returns the envelope is decoded back into its [`DomainError`]. A scale row
+//! refused because the currency is already posted under another scale is
+//! [`DomainError::CurrencyScaleLocked`]; a concurrent first registration of the
+//! same row is [`DomainError::ConcurrentModification`]. The request's scales
+//! arrive as validated `CurrencySpec`s, so the repo's scale-out-of-range refusal
+//! ([`RepoError::ScaleOutOfRange`]) is a defence for other callers; should it
+//! fire it is [`DomainError::ScaleOutOfRange`]. Every other repository or
+//! database failure is an infrastructure fault ([`DomainError::Internal`]).
 
 use bss_ledger_sdk::{AccountInfo, ProvisionOutcome, ProvisionRequest};
-use sea_orm::DbErr;
+use toolkit_db::secure::TxConfig;
 use toolkit_db::{DBProvider, DbError};
 use uuid::Uuid;
 
@@ -28,14 +35,10 @@ use crate::domain::model::{
 };
 use crate::domain::provisioning::plan;
 use crate::domain::status::{LIFECYCLE_OPEN, PERIOD_STATUS_OPEN};
+use crate::infra::posting::error_transport;
+use crate::infra::posting::retry::is_driver_contention;
 use crate::infra::storage::repo::ReferenceRepo;
 use time::OffsetDateTime;
-
-/// Record-separator framing a sentinel-encoded scale-out-of-range business
-/// error inside a `DbErr::Custom` payload: `BSS_PROV_SCALE_OOR␟<currency>`.
-const SENTINEL_TAG: &str = "BSS_PROV_SCALE_OOR";
-/// Unit-separator used inside the sentinel payload.
-const SENTINEL_SEP: char = '\u{1f}';
 
 /// The transactional seller-provisioning service.
 #[derive(Clone)]
@@ -60,8 +63,10 @@ impl ProvisioningService {
     ///
     /// # Errors
     /// [`DomainError::InvalidRequest`] on a malformed fiscal calendar;
-    /// [`DomainError::ScaleOutOfRange`] when a non-ISO scale exceeds the
-    /// supported headroom; [`DomainError::Internal`] on a storage/
+    /// [`DomainError::CurrencyScaleLocked`] when a scale row is refused because the
+    /// currency is already posted under another scale;
+    /// [`DomainError::ConcurrentModification`] when a concurrent request registers
+    /// the same row first; [`DomainError::Internal`] on any other storage or
     /// transaction failure.
     pub async fn provision(&self, req: ProvisionRequest) -> Result<ProvisionOutcome, DomainError> {
         // --- PRE-TRANSACTION (fail fast, no writes) ---
@@ -75,22 +80,27 @@ impl ProvisioningService {
         let period_id_for_txn = period_id.clone();
         let result = self
             .db
-            .transaction(move |txn| {
+            .transaction_with_config(TxConfig::serializable(), move |txn| {
                 Box::pin(async move {
                     Self::provision_in_txn(&reference, txn, req, period_id_for_txn).await
                 })
             })
             .await;
 
-        match result {
-            Ok(outcome) => Ok(outcome),
-            Err(db_err) => Err(decode_provision_error(&db_err)),
-        }
+        let backend = self.db.db().backend();
+        result.map_err(|db_err| match &db_err {
+            DbError::Sea(error) if is_driver_contention(backend, error) => {
+                DomainError::ConcurrentModification(
+                    "provisioning conflicted with a concurrent write; retry".to_owned(),
+                )
+            }
+            _ => error_transport::decode_business_error(&db_err),
+        })
     }
 
-    /// The in-transaction seed body. The scale-out-of-range business rejection
-    /// is encoded as a sentinel `DbError` so the closure error type stays
-    /// `DbError` while still forcing a rollback.
+    /// The in-transaction seed body. A business rejection is encoded as the
+    /// sentinel `DbError` envelope so the closure error type stays `DbError`
+    /// while still forcing a rollback.
     async fn provision_in_txn(
         reference: &ReferenceRepo,
         txn: &toolkit_db::secure::DbTx<'_>,
@@ -148,11 +158,8 @@ impl ProvisioningService {
         for scale in req.currency_scales {
             let row = CurrencyScaleRow {
                 tenant_id,
-                currency: scale.currency,
-                minor_units: i16::from(scale.minor_units),
-                plausible_max_major: scale
-                    .plausible_max_major
-                    .unwrap_or(crate::domain::money::DEFAULT_PLAUSIBLE_MAX_MAJOR),
+                currency: scale.currency.code().to_owned(),
+                currency_scale: scale.currency.scale(),
                 source: scale.source,
             };
             if reference
@@ -211,41 +218,22 @@ impl ProvisioningService {
 }
 
 /// Map a [`RepoError`] into a `DbError` for the transaction closure: a
-/// scale-out-of-range rejection is sentinel-encoded (decoded back to
-/// [`DomainError::ScaleOutOfRange`]); everything else is an infrastructure
-/// fault carried as a plain `DbErr::Custom`.
+/// scale-out-of-range refusal is [`DomainError::ScaleOutOfRange`] (this flow's
+/// contract); every other error goes through the one table
+/// ([`error_transport::repo_to_db`]), so a scale lock and a concurrent first
+/// registration keep their business meaning instead of reading as a broken
+/// database.
 fn repo_to_db(e: RepoError) -> DbError {
     match e {
-        RepoError::ScaleOutOfRange(currency) => scale_out_of_range(&currency),
-        other => infra(other.to_string()),
+        RepoError::ScaleOutOfRange(currency) => {
+            error_transport::business(DomainError::ScaleOutOfRange(format!(
+                "currency {currency} scale exceeds the supported headroom"
+            )))
+        }
+        other => error_transport::repo_to_db(other),
     }
 }
 
-/// Encode a scale-out-of-range business rejection as a sentinel `DbError` so
-/// the transaction closure rolls back yet preserves the offending currency for
-/// decoding after `transaction()` returns.
-fn scale_out_of_range(currency: &str) -> DbError {
-    DbError::Sea(DbErr::Custom(format!(
-        "{SENTINEL_TAG}{SENTINEL_SEP}{currency}"
-    )))
-}
-
-/// Encode an internal (infrastructure) failure as a non-sentinel `DbError`.
-fn infra(message: impl Into<String>) -> DbError {
-    DbError::Sea(DbErr::Custom(message.into()))
-}
-
-/// Decode a `DbError` returned from `transaction()` back into a
-/// [`DomainError`]: a sentinel-tagged `DbErr::Custom` yields
-/// [`DomainError::ScaleOutOfRange`]; any other `DbError` is an
-/// infrastructure fault.
-fn decode_provision_error(db_err: &DbError) -> DomainError {
-    if let DbError::Sea(DbErr::Custom(payload)) = db_err
-        && let Some(currency) = payload.strip_prefix(&format!("{SENTINEL_TAG}{SENTINEL_SEP}"))
-    {
-        return DomainError::ScaleOutOfRange(format!(
-            "currency {currency} scale exceeds the supported headroom"
-        ));
-    }
-    DomainError::Internal(db_err.to_string())
-}
+#[cfg(test)]
+#[path = "service_tests.rs"]
+mod tests;

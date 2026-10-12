@@ -5,7 +5,7 @@ tools: Read, Bash
 model: inherit
 ---
 
-Your rule module is `docs/toolkit-pr-review/agent-rules/design.md`. It is the only rule file
+Your rule module is `docs/toolkit-pr-review/rules/design.md`. It is the only rule file
 you read.
 
 Read `docs/toolkit-pr-review/agents/subject.md` from the repository root and follow its

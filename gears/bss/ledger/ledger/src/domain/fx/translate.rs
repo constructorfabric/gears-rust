@@ -1,115 +1,124 @@
-//! Pure FX translation (design §4.2): convert a balanced set of transaction
-//! amounts to the functional currency at a single locked rate (banker's
-//! rounding), then close the per-entry functional rounding **residual**
-//! deterministically onto an anchor line so the functional column balances by
-//! construction. Per-line `amount × rate` rounding can leave a residual
-//! (`|residual| ≤ lines − 1` minor units) even when the transaction column is
-//! exact; a single deterministic plug onto a real anchor line (e.g. the AR leg,
-//! whose functional dwarfs the residual) closes it. No infra; the `RateLocker`
-//! feeds it the locked rate and picks the anchor.
+//! Exact major-unit FX translation and deterministic functional anchor balancing.
 
-use bss_ledger_sdk::Side;
+use crate::domain::exact_money::{ExactAmount, ExactError};
+use bss_ledger_sdk::{
+    Side,
+    money::{CurrencySpec, PostedMoney},
+};
+use rust_decimal::Decimal;
 use toolkit_macros::domain_model;
 
-use crate::domain::money_math::{checked_minor, round_half_even};
-
-/// Micro scale: `rate_micro` is the functional-per-unit-transaction rate × 1e6.
-const MICRO: i128 = 1_000_000;
-
-/// A line to translate: its transaction amount (minor units) and DR/CR side.
+/// A positive transaction posting and its posting side.
 #[domain_model]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FxLine {
-    pub amount_minor: i64,
+    pub amount: PostedMoney,
     pub side: Side,
 }
 
-/// A functional-translation failure.
+/// Translation validation and final-boundary failures, retaining exact diagnostics.
 #[domain_model]
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum FxTranslateError {
-    #[error("FX rate must be positive (rate_micro > 0)")]
+    #[error("FX rate must be positive")]
     RateNonPositive,
     #[error("anchor line index is out of bounds")]
     AnchorOutOfBounds,
+    #[error("transaction line must be positive")]
+    NonPositiveLine,
     #[error("functional residual would drive the anchor line non-positive")]
     ResidualExceedsAnchor,
-    #[error("translated functional amount out of range: {0}")]
-    Overflow(i128),
+    #[error(transparent)]
+    Exact(#[from] ExactError),
 }
 
-/// Translate a single transaction amount to functional at `rate_micro`, banker's
-/// rounding (`amount × rate_micro / 1e6`, ties to even). Public so the
-/// unrealized-revaluation run (Group H2) can remeasure one grain's transaction
-/// balance at the period-end rate without going through [`translate_entry`]
-/// (which closes a multi-line residual it does not need).
-///
-/// Rejects a non-positive `rate_micro` up front: a rate `<= 0` is never a valid
-/// FX quote, and letting it through would flip the sign of (or zero out) the
-/// translated amount and post a wrong revaluation/allocation entry. The
-/// [`translate_entry`] path already guards this; guarding here closes the same
-/// hole for the direct single-amount callers (e.g. the revaluation run), which
-/// resolve a rate straight from the local store that the provider-sync path
-/// upserts.
-///
+/// Validate matching stored monetary metadata, including zero values.
 /// # Errors
-/// - [`FxTranslateError::RateNonPositive`] if `rate_micro <= 0`.
-/// - [`FxTranslateError::Overflow`] if the translated amount exceeds `i64`.
-pub fn translate_amount(amount_minor: i64, rate_micro: i64) -> Result<i64, FxTranslateError> {
-    if rate_micro <= 0 {
+/// Returns the named currency or scale mismatch.
+pub(crate) fn ensure_same_spec(
+    left: &CurrencySpec,
+    right: &CurrencySpec,
+) -> Result<(), ExactError> {
+    Ok(left.ensure_same(right)?)
+}
+
+/// Validate a positive bounded quote without rounding or limiting its fractional digits.
+fn validate_rate(rate: Decimal) -> Result<(), FxTranslateError> {
+    if rate <= Decimal::ZERO {
         return Err(FxTranslateError::RateNonPositive);
     }
-    let raw = round_half_even(i128::from(amount_minor) * i128::from(rate_micro), MICRO);
-    checked_minor(raw).map_err(|_| FxTranslateError::Overflow(raw))
+    bss_money::validate_amount(rate).map_err(ExactError::from)?;
+    Ok(())
 }
 
-/// Translate every line at `rate_micro` and close the per-entry functional
-/// residual onto `anchor` (the index of a real line whose functional absorbs the
-/// small residual), so `SUM(DR.functional) == SUM(CR.functional)` exactly. Returns
-/// the functional amount per line, in the input order, each `> 0`.
-///
+/// Translate quote-major/base-major exactly and round once HalfEven at the target scale.
+/// Identity applies only to the same code and stored scale at rate one.
 /// # Errors
-/// - [`FxTranslateError::RateNonPositive`] if `rate_micro <= 0`.
-/// - [`FxTranslateError::AnchorOutOfBounds`] if `anchor >= lines.len()`.
-/// - [`FxTranslateError::ResidualExceedsAnchor`] if the residual would drive the
-///   anchor's functional `<= 0` (a misuse — the anchor must be a substantial line).
-/// - [`FxTranslateError::Overflow`] if a translated amount exceeds `i64`.
+/// Rejects nonpositive/out-of-contract quotes or a final amount outside the money bounds.
+pub fn translate_amount(
+    source: &PostedMoney,
+    rate: Decimal,
+    target: CurrencySpec,
+) -> Result<PostedMoney, FxTranslateError> {
+    validate_rate(rate)?;
+    if source.currency() == &target && rate == Decimal::ONE {
+        return Ok(source.clone());
+    }
+    Ok(ExactAmount::from_decimal(source.amount())
+        .checked_mul(&ExactAmount::from_decimal(rate))?
+        .round_half_even(target)?)
+}
+
+/// Translate lines in order and close the exact functional residual onto the chosen anchor.
+/// Inputs use one stored transaction spec; sides carry signs and all legs are positive.
+/// # Errors
+/// Rejects malformed inputs, metadata mismatch, invalid quotes, nonpositive adjusted
+/// anchors and out-of-range final postings. Sums are never narrowed before cancellation.
 pub fn translate_entry(
     lines: &[FxLine],
-    rate_micro: i64,
+    rate: Decimal,
+    target: CurrencySpec,
     anchor: usize,
-) -> Result<Vec<i64>, FxTranslateError> {
-    if rate_micro <= 0 {
-        return Err(FxTranslateError::RateNonPositive);
-    }
+) -> Result<Vec<PostedMoney>, FxTranslateError> {
+    validate_rate(rate)?;
     if anchor >= lines.len() {
         return Err(FxTranslateError::AnchorOutOfBounds);
     }
-    let mut func: Vec<i64> = Vec::with_capacity(lines.len());
-    for l in lines {
-        func.push(translate_amount(l.amount_minor, rate_micro)?);
+    for line in lines {
+        ensure_same_spec(lines[0].amount.currency(), line.amount.currency())?;
+        if line.amount.amount() <= Decimal::ZERO {
+            return Err(FxTranslateError::NonPositiveLine);
+        }
     }
-    // net = SUM(DR.functional) − SUM(CR.functional); the rounding residual.
-    let net: i128 = lines
-        .iter()
-        .zip(&func)
-        .map(|(l, &f)| match l.side {
-            Side::Debit => i128::from(f),
-            Side::Credit => -i128::from(f),
-        })
-        .sum();
-    // Close the residual onto the anchor so the new net is exactly zero:
-    // a DR anchor moves net by +Δ (want Δ = −net); a CR anchor by −Δ (want Δ = net).
-    let adj = match lines[anchor].side {
-        Side::Debit => -net,
-        Side::Credit => net,
+    let mut functional = Vec::with_capacity(lines.len());
+    let mut net = ExactAmount::from_decimal(Decimal::ZERO);
+    for line in lines {
+        let exact = ExactAmount::from_decimal(line.amount.amount())
+            .checked_mul(&ExactAmount::from_decimal(rate))?
+            .round_half_even_exact(target.scale())?;
+        net = match line.side {
+            Side::Debit => net.checked_add(&exact)?,
+            Side::Credit => net.checked_sub(&exact)?,
+        };
+        functional.push(exact);
+    }
+    let old_anchor = &functional[anchor];
+    let adjusted = match lines[anchor].side {
+        Side::Debit => old_anchor.checked_sub(&net)?,
+        Side::Credit => old_anchor.checked_add(&net)?,
     };
-    let new_anchor = i128::from(func[anchor]) + adj;
-    if new_anchor <= 0 {
+    if adjusted.is_negative() || adjusted == ExactAmount::from_decimal(Decimal::ZERO) {
         return Err(FxTranslateError::ResidualExceedsAnchor);
     }
-    func[anchor] = checked_minor(new_anchor).map_err(|_| FxTranslateError::Overflow(new_anchor))?;
-    Ok(func)
+    functional[anchor] = adjusted;
+    functional
+        .into_iter()
+        .map(|value| {
+            value
+                .into_posted_exact(target.clone())
+                .map_err(FxTranslateError::from)
+        })
+        .collect()
 }
 
 #[cfg(test)]

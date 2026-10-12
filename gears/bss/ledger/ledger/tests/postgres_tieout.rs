@@ -26,9 +26,9 @@
 
 use std::sync::Arc;
 
+use bss_ledger::domain::exact_money::ExactAmount;
 use bss_ledger::domain::instant::to_naive_date;
 use bss_ledger::domain::model::{AccountRow, CurrencyScaleRow, NewEntry, NewLine};
-use bss_ledger::domain::money::DEFAULT_PLAUSIBLE_MAX_MAJOR;
 use bss_ledger::domain::payment::settlement::SettlementInput;
 use bss_ledger::domain::ports::metrics::NoopLedgerMetrics;
 use bss_ledger::infra::events::publisher::LedgerEventPublisher;
@@ -38,7 +38,9 @@ use bss_ledger::infra::payment::settle::SettlementService;
 use bss_ledger::infra::posting::service::PostingService;
 use bss_ledger::infra::storage::migrations::Migrator;
 use bss_ledger::infra::storage::repo::{PaymentRepo, ReferenceRepo};
-use bss_ledger_sdk::{AccountClass, MappingStatus, Side, SourceDocType};
+use bss_ledger_sdk::{
+    AccountClass, CurrencySpec, MappingStatus, PostedMoney, Side, SourceDocType, parse_decimal,
+};
 use chrono::NaiveDate;
 use sea_orm::{ConnectionTrait, Database, DatabaseConnection, Statement, TransactionTrait};
 use sea_orm_migration::MigratorTrait;
@@ -51,6 +53,20 @@ use uuid::Uuid;
 
 fn pg(sql: impl Into<String>) -> Statement {
     Statement::from_string(sea_orm::DatabaseBackend::Postgres, sql.into())
+}
+
+/// Validated USD (scale 2) money from canonical major-unit text (`"10"` = ten dollars).
+fn usd(text: &str) -> PostedMoney {
+    PostedMoney::try_new(
+        parse_decimal(text).expect("decimal"),
+        CurrencySpec::try_new("USD".to_owned(), 2).expect("USD spec"),
+    )
+    .expect("posted money")
+}
+
+/// The exact value of canonical decimal text, for tie-out grain comparisons.
+fn exact(text: &str) -> ExactAmount {
+    ExactAmount::from_decimal(parse_decimal(text).expect("decimal"))
 }
 
 struct Fixture {
@@ -91,8 +107,7 @@ async fn setup(
         .upsert_currency_scale(CurrencyScaleRow {
             tenant_id: tenant,
             currency: "USD".to_owned(),
-            minor_units: 2,
-            plausible_max_major: DEFAULT_PLAUSIBLE_MAX_MAJOR,
+            currency_scale: 2,
             source: "iso".to_owned(),
         })
         .await
@@ -152,7 +167,7 @@ async fn setup(
 
 /// Build a balanced entry for `fixture` with `business_id`: DR AR / CR CASH,
 /// each `amount`. (Copied from `tests/postgres_posting.rs::balanced_entry`.)
-fn balanced_entry(f: &Fixture, business_id: &str, amount: i64) -> (NewEntry, Vec<NewLine>) {
+fn balanced_entry(f: &Fixture, business_id: &str, amount: &str) -> (NewEntry, Vec<NewLine>) {
     let entry_id = Uuid::now_v7();
     let entry = NewEntry {
         entry_id,
@@ -185,7 +200,7 @@ fn balanced_entry(f: &Fixture, business_id: &str, amount: i64) -> (NewEntry, Vec
     (entry, lines)
 }
 
-fn line(f: &Fixture, account: Uuid, class: AccountClass, side: Side, amount: i64) -> NewLine {
+fn line(f: &Fixture, account: Uuid, class: AccountClass, side: Side, amount: &str) -> NewLine {
     NewLine {
         line_id: Uuid::now_v7(),
         payer_tenant_id: f.tenant,
@@ -195,15 +210,12 @@ fn line(f: &Fixture, account: Uuid, class: AccountClass, side: Side, amount: i64
         account_class: class,
         gl_code: None,
         side,
-        amount_minor: amount,
-        currency: "USD".to_owned(),
-        currency_scale: 2,
+        money: usd(amount),
         invoice_id: None,
         due_date: None,
         revenue_stream: None,
         mapping_status: MappingStatus::Resolved,
-        functional_amount_minor: None,
-        functional_currency: None,
+        functional_money: None,
         tax_jurisdiction: None,
         tax_filing_period: None,
         tax_rate_ref: None,
@@ -226,7 +238,7 @@ async fn setup_with_one_balanced_post(
     let (raw, service, provider, f) = setup(url).await;
     let scope = AccessScope::for_tenant(f.tenant);
     let ctx = SecurityContext::anonymous();
-    let (entry, lines) = balanced_entry(&f, "biz-1", 1000);
+    let (entry, lines) = balanced_entry(&f, "biz-1", "10");
     service
         .post(&ctx, &scope, entry, lines, None)
         .await
@@ -252,11 +264,7 @@ async fn clean_tenant_ties_out() {
         .await
         .expect("tie-out must succeed");
 
-    assert!(
-        report.is_clean(),
-        "clean books must tie out: {}",
-        report.summary()
-    );
+    assert!(report.is_clean(), "clean books must tie out");
     assert!(report.account_balance_variances.is_empty());
     assert!(report.imbalanced_entries.is_empty());
     assert!(report.negative_grains.is_empty());
@@ -276,7 +284,7 @@ async fn account_balance_drift_is_detected() {
     // carries no append-only trigger, so a plain UPDATE is fine; the no-negative
     // CHECK is satisfied by adding to the positive AR balance.
     raw.execute_raw(pg(format!(
-        "UPDATE bss.ledger_account_balance SET balance_minor = balance_minor + 1 \
+        "UPDATE bss.ledger_account_balance SET balance = (balance::numeric + 0.01)::text \
          WHERE tenant_id='{}' AND account_id='{}' AND currency='USD'",
         f.tenant, f.ar_account
     )))
@@ -292,8 +300,7 @@ async fn account_balance_drift_is_detected() {
     assert_eq!(
         report.account_balance_variances.len(),
         1,
-        "exactly one grain diverged: {:?}",
-        report.account_balance_variances
+        "exactly one grain diverged"
     );
     let v = &report.account_balance_variances[0];
     assert_ne!(v.computed, v.cached, "computed must differ from cached");
@@ -312,7 +319,7 @@ async fn ar_sub_grain_drift_is_detected() {
     // the sub-grain recompute — not just `account_balance` — catches it.
     let (raw, provider, f) = setup_with_one_balanced_post(&url).await;
     raw.execute_raw(pg(format!(
-        "UPDATE bss.ledger_ar_payer_balance SET balance_minor = balance_minor + 1 \
+        "UPDATE bss.ledger_ar_payer_balance SET balance = (balance::numeric + 0.01)::text \
          WHERE tenant_id='{}' AND account_id='{}'",
         f.tenant, f.ar_account
     )))
@@ -410,7 +417,7 @@ async fn entry_balance_backstop_catches_imbalanced_entry() {
     // BYPASS the P1 deferrable balanced-entry constraint trigger (a DEFERRABLE
     // CONSTRAINT TRIGGER AFTER INSERT, fired at COMMIT) so a deliberately
     // imbalanced entry can land: a single DR line with no offsetting CR, so
-    // SUM(DR) - SUM(CR) = +500 (net != 0). `session_replication_role = replica`
+    // SUM(DR) - SUM(CR) = +5 (net != 0). `session_replication_role = replica`
     // skips regular + constraint triggers (superuser; testcontainers runs as
     // `postgres`). It MUST be `SET LOCAL` inside the SAME transaction as the
     // inserts so the setting holds through the deferred-trigger fire at COMMIT
@@ -433,9 +440,9 @@ async fn entry_balance_backstop_catches_imbalanced_entry() {
     txn.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_journal_line \
             (line_id, entry_id, tenant_id, period_id, payer_tenant_id, account_id, \
-             account_class, side, amount_minor, currency, currency_scale, mapping_status) \
+             account_class, side, amount, currency, currency_scale, mapping_status) \
          VALUES ('{line_id}','{entry_id}','{tenant}','{period_id}','{tenant}','{account}', \
-             'AR','DR',500,'USD',2,'RESOLVED')"
+             'AR','DR','5','USD',2,'RESOLVED')"
     )))
     .await
     .unwrap();
@@ -456,13 +463,17 @@ async fn entry_balance_backstop_catches_imbalanced_entry() {
         .iter()
         .find(|e| e.entry_id == entry_id)
         .expect("the malformed entry must be among the imbalanced entries");
-    assert_ne!(imbalanced.net_minor, 0, "net DR-CR must be non-zero");
+    assert_ne!(
+        imbalanced.net.exact().expect("a trusted net"),
+        exact("0"),
+        "net DR-CR must be non-zero"
+    );
 }
 
 /// The entry-balance backstop also catches a BALANCED entry whose lines span
 /// more than one payer (`payer_count > 1`) — the app-level safety net for the
 /// case the DB single-payer trigger is bypassed. The existing test exercises
-/// only `net_minor != 0`; this pins the mixed-payer arm.
+/// only `net != 0`; this pins the mixed-payer arm.
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn entry_backstop_catches_mixed_payer_entry() {
@@ -496,7 +507,7 @@ async fn entry_backstop_catches_mixed_payer_entry() {
         .unwrap();
 
     // BYPASS the deferrable single-payer/balance trigger (replica role) so a
-    // BALANCED but cross-payer entry can land: DR 500 (payer A) + CR 500
+    // BALANCED but cross-payer entry can land: DR 5 (payer A) + CR 5
     // (payer B). net = 0 (NOT imbalanced), but two distinct payers.
     let txn = raw.begin().await.unwrap();
     txn.execute_raw(pg("SET LOCAL session_replication_role = replica"))
@@ -517,9 +528,9 @@ async fn entry_backstop_catches_mixed_payer_entry() {
         txn.execute_raw(pg(format!(
             "INSERT INTO bss.ledger_journal_line \
                 (line_id, entry_id, tenant_id, period_id, payer_tenant_id, account_id, \
-                 account_class, side, amount_minor, currency, currency_scale, mapping_status) \
+                 account_class, side, amount, currency, currency_scale, mapping_status) \
              VALUES ('{}','{entry_id}','{tenant}','{period_id}','{payer}','{account}', \
-                 'AR','{side}',500,'USD',2,'RESOLVED')",
+                 'AR','{side}','5','USD',2,'RESOLVED')",
             Uuid::now_v7()
         )))
         .await
@@ -543,7 +554,8 @@ async fn entry_backstop_catches_mixed_payer_entry() {
         "two distinct payers must be reported"
     );
     assert_eq!(
-        flagged.net_minor, 0,
+        flagged.net.exact(),
+        Some(exact("0")),
         "the entry is balanced — flagged for mixed-payer, not imbalance"
     );
 }
@@ -635,12 +647,12 @@ async fn run_emits_negative_grain_and_entry_imbalance_arms() {
         .unwrap();
     txn.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_account_balance \
-            (tenant_id, account_id, currency, account_class, normal_side, balance_minor) \
-         VALUES ('{tenant}','{guarded_account}','USD','AR','DR',-500)"
+            (tenant_id, account_id, currency, currency_scale, account_class, normal_side, balance) \
+         VALUES ('{tenant}','{guarded_account}','USD',2,'AR','DR','-5')"
     )))
     .await
     .unwrap();
-    // (b) A single, unbalanced DR line (net +700) — the entry-balance backstop's
+    // (b) A single, unbalanced DR line (net +7) — the entry-balance backstop's
     // `EntryImbalance` defect.
     txn.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_journal_entry \
@@ -656,9 +668,9 @@ async fn run_emits_negative_grain_and_entry_imbalance_arms() {
     txn.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_journal_line \
             (line_id, entry_id, tenant_id, period_id, payer_tenant_id, account_id, \
-             account_class, side, amount_minor, currency, currency_scale, mapping_status) \
+             account_class, side, amount, currency, currency_scale, mapping_status) \
          VALUES ('{}','{bad_entry_id}','{tenant}','{period_id}','{tenant}','{bad_entry_account}', \
-             'AR','DR',700,'USD',2,'RESOLVED')",
+             'AR','DR','7','USD',2,'RESOLVED')",
         Uuid::now_v7()
     )))
     .await
@@ -687,7 +699,7 @@ async fn run_emits_negative_grain_and_entry_imbalance_arms() {
         report
             .negative_grains
             .iter()
-            .any(|g| g.account_id == guarded_account && g.balance_minor == -500),
+            .any(|g| g.account_id == guarded_account && g.balance == usd("-5")),
         "the negative guarded AR grain must be flagged: {:?}",
         report.negative_grains
     );
@@ -696,7 +708,7 @@ async fn run_emits_negative_grain_and_entry_imbalance_arms() {
         .iter()
         .find(|e| e.entry_id == bad_entry_id)
         .expect("the imbalanced entry must be flagged");
-    assert_eq!(imbalanced.net_minor, 700, "net DR-CR is +700");
+    assert_eq!(imbalanced.net.exact(), Some(exact("7")), "net DR-CR is +7");
 }
 
 // ── Payment-counter reconcile through a REAL settle + allocate ───────────────
@@ -749,8 +761,7 @@ async fn setup_seller(raw: &DatabaseConnection, provider: &DBProvider<DbError>) 
         .upsert_currency_scale(CurrencyScaleRow {
             tenant_id: s.tenant,
             currency: "USD".to_owned(),
-            minor_units: 2,
-            plausible_max_major: DEFAULT_PLAUSIBLE_MAX_MAJOR,
+            currency_scale: 2,
             source: "iso".to_owned(),
         })
         .await
@@ -790,7 +801,7 @@ async fn seed_ar_invoice(
     provider: &DBProvider<DbError>,
     s: &Seller,
     invoice_id: &str,
-    amount: i64,
+    amount: &str,
 ) {
     let posting = PostingService::new(provider.clone(), noop_publisher());
     let ctx = SecurityContext::anonymous();
@@ -822,15 +833,12 @@ async fn seed_ar_invoice(
         account_class: AccountClass::Ar,
         gl_code: None,
         side: Side::Debit,
-        amount_minor: amount,
-        currency: "USD".to_owned(),
-        currency_scale: 2,
+        money: usd(amount),
         invoice_id: Some(invoice_id.to_owned()),
         due_date: Some(NaiveDate::from_ymd_opt(2026, 12, 1).unwrap()),
         revenue_stream: None,
         mapping_status: MappingStatus::Resolved,
-        functional_amount_minor: None,
-        functional_currency: None,
+        functional_money: None,
         tax_jurisdiction: None,
         tax_filing_period: None,
         tax_rate_ref: None,
@@ -861,7 +869,7 @@ async fn seed_ar_invoice(
 /// A clean ledger built from a REAL settle + allocate ties out (the payment-
 /// counter reconcile runs over the real `payment_settlement` /
 /// `payment_allocation` rows and the `PAYMENT_SETTLE` journal, and passes);
-/// corrupting the cached `allocated_minor` then surfaces exactly one
+/// corrupting the cached `allocated` counter then surfaces exactly one
 /// `PaymentCounterVariance` — proving `recompute_payment_counter_variances` is
 /// wired through the full `tie_out_tenant`, not just unit-tested in memory.
 #[tokio::test]
@@ -876,8 +884,8 @@ async fn payment_counter_reconcile_through_full_tie_out() {
     let ctx = SecurityContext::anonymous();
     let scope = AccessScope::for_tenant(s.tenant);
 
-    // Settle gross=1000 fee=30 (DR CASH 970 / DR PSP_FEE 30 / CR UNALLOCATED 1000),
-    // seed an open AR invoice (300), then allocate 300 onto it.
+    // Settle gross=10 fee=0.30 (DR CASH 9.70 / DR PSP_FEE 0.30 / CR UNALLOCATED 10),
+    // seed an open AR invoice (3), then allocate 3 onto it.
     let settle = SettlementService::new(
         provider.clone(),
         noop_publisher(),
@@ -891,15 +899,14 @@ async fn payment_counter_reconcile_through_full_tie_out() {
                 tenant_id: s.tenant,
                 payer_tenant_id: s.payer,
                 payment_id: "PAY-TIE-1".to_owned(),
-                gross_minor: 1000,
-                fee_minor: 30,
-                currency: "USD".to_owned(),
+                gross: usd("10"),
+                fee: usd("0.3"),
                 effective_at: None,
             },
         )
         .await
         .expect("settle must succeed");
-    seed_ar_invoice(&provider, &s, "INV-TIE", 300).await;
+    seed_ar_invoice(&provider, &s, "INV-TIE", "3").await;
     let allocate = AllocationService::new(
         provider.clone(),
         noop_publisher(),
@@ -914,8 +921,7 @@ async fn payment_counter_reconcile_through_full_tie_out() {
                 payer_tenant_id: s.payer,
                 payment_id: "PAY-TIE-1".to_owned(),
                 allocation_id: Uuid::now_v7(),
-                lump_minor: 300,
-                currency: "USD".to_owned(),
+                lump: usd("3"),
                 hint_invoice_id: None,
                 caller_splits: None,
             },
@@ -935,12 +941,11 @@ async fn payment_counter_reconcile_through_full_tie_out() {
         .expect("tie-out must succeed");
     assert!(
         clean.is_clean(),
-        "a real settle+allocate must tie out clean: {}",
-        clean.summary()
+        "a real settle+allocate must tie out clean"
     );
     assert!(clean.payment_counter_variances.is_empty());
 
-    // Corrupt the cached `allocated_minor` (the allocation rows are the truth, so
+    // Corrupt the cached `allocated` counter (the allocation rows are the truth, so
     // the recompute now disagrees). `payment_settlement` carries no append-only
     // trigger, so a plain UPDATE suffices.
     let repo = PaymentRepo::new(provider.clone());
@@ -949,12 +954,9 @@ async fn payment_counter_reconcile_through_full_tie_out() {
         .await
         .unwrap()
         .expect("settlement row present");
-    assert_eq!(
-        before.allocated_minor, 300,
-        "allocated counter seeded to 300"
-    );
+    assert_eq!(before.allocated, usd("3"), "allocated counter seeded to 3");
     raw.execute_raw(pg(format!(
-        "UPDATE bss.ledger_payment_settlement SET allocated_minor = 250 \
+        "UPDATE bss.ledger_payment_settlement SET allocated = '2.5' \
          WHERE tenant_id='{}' AND payment_id='PAY-TIE-1'",
         s.tenant
     )))
@@ -969,12 +971,12 @@ async fn payment_counter_reconcile_through_full_tie_out() {
     let v = drifted
         .payment_counter_variances
         .iter()
-        .find(|v| v.payment_id == "PAY-TIE-1" && v.counter == "allocated_minor")
-        .expect("the allocated_minor counter must diverge");
+        .find(|v| v.payment_id == "PAY-TIE-1" && v.counter == "allocated")
+        .expect("the allocated counter must diverge");
     assert_eq!(
-        (v.computed, v.cached),
-        (300, 250),
-        "computed (rows=300) vs corrupted cache (250)"
+        (v.computed.exact(), v.cached.exact()),
+        (Some(exact("3")), Some(exact("2.5"))),
+        "computed (rows=3) vs corrupted cache (2.5)"
     );
 }
 
@@ -1019,7 +1021,7 @@ async fn incremental_tie_out_covers_reusable_credit_grain() {
 
     // A balanced DR AR / CR REUSABLE_CREDIT wallet credit for `period`, with the
     // wallet sub-grain bucket (`credit_grant_event_type`) the projector requires.
-    let wallet_entry = |business_id: &str, period: &str, effective: NaiveDate, amount: i64| {
+    let wallet_entry = |business_id: &str, period: &str, effective: NaiveDate, amount: &str| {
         let entry = NewEntry {
             entry_id: Uuid::now_v7(),
             tenant_id: f.tenant,
@@ -1050,13 +1052,13 @@ async fn incremental_tie_out_covers_reusable_credit_grain() {
         (entry, vec![ar_debit, wallet_credit])
     };
 
-    // Period 1 (the fixture's 202606): credit 1000 into the wallet, then close +
+    // Period 1 (the fixture's 202606): credit 10 into the wallet, then close +
     // snapshot the baseline (mirrors period-close).
     let (e1, l1) = wallet_entry(
         "wallet-p1",
         &f.period_id,
         NaiveDate::from_ymd_opt(2026, 6, 1).unwrap(),
-        1000,
+        "10",
     );
     service.post(&ctx, &scope, e1, l1, None).await.unwrap();
     raw.execute_raw(pg(format!(
@@ -1072,7 +1074,7 @@ async fn incremental_tie_out_covers_reusable_credit_grain() {
         .await
         .expect("snapshot baseline at close");
 
-    // Period 2: open it, credit another 400 into the wallet (a second event-type
+    // Period 2: open it, credit another 4 into the wallet (a second event-type
     // bucket would also work; the same bucket keeps the grain a single key).
     raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_fiscal_period (tenant_id, legal_entity_id, period_id, fiscal_tz, status) \
@@ -1085,7 +1087,7 @@ async fn incremental_tie_out_covers_reusable_credit_grain() {
         "wallet-p2",
         "202607",
         NaiveDate::from_ymd_opt(2026, 7, 1).unwrap(),
-        400,
+        "4",
     );
     service.post(&ctx, &scope, e2, l2, None).await.unwrap();
 
@@ -1105,24 +1107,24 @@ async fn incremental_tie_out_covers_reusable_credit_grain() {
 
     // The full all-time fold agrees (and the wallet sub-grain ties out there too).
     let full = job.tie_out_on(&conn, f.tenant).await.unwrap();
-    assert!(
-        full.is_clean(),
-        "the full fold is clean too: {}",
-        full.summary()
-    );
+    assert!(full.is_clean(), "the full fold is clean too");
 
-    // The wallet cache carries the all-time total (1000 + 400 = 1400) — confirms
+    // The wallet cache carries the all-time total (10 + 4 = 14) — confirms
     // both credits projected onto the reusable_credit sub-grain.
     let wallet_balance = raw
         .query_one_raw(pg(format!(
-            "SELECT balance_minor FROM bss.ledger_reusable_credit_subbalance \
+            "SELECT balance FROM bss.ledger_reusable_credit_subbalance \
              WHERE tenant_id='{}' AND account_id='{wallet}' AND credit_grant_event_type='promo'",
             f.tenant
         )))
         .await
         .unwrap()
-        .map(|r| r.try_get_by_index::<i64>(0).unwrap());
-    assert_eq!(wallet_balance, Some(1400), "wallet sub-grain = 1000 + 400");
+        .map(|r| r.try_get_by_index::<String>(0).unwrap());
+    assert_eq!(
+        wallet_balance.as_deref(),
+        Some("14"),
+        "wallet sub-grain = 10 + 4"
+    );
 
     // `into_tie_out_report` adapts the clean incremental result to a clean
     // `TieOutReport` (open-line count carried; full-only defect classes empty).

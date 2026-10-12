@@ -1,0 +1,20 @@
+[package]
+name = "cf-gears-bss-approvals-sdk"
+edition.workspace = true
+license.workspace = true
+description = "BSS approvals inbox SDK: the source port a gear registers for the shared inbox"
+
+[lib]
+name = "bss_approvals_sdk"
+
+[lints]
+workspace = true
+
+[dependencies]
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+time = { workspace = true }
+toolkit-canonical-errors = { workspace = true }
+toolkit-security = { workspace = true }
+uuid = { workspace = true }

@@ -159,7 +159,8 @@ fails closed upstream (core slice [`08`](./08-retroactivity-corrections.md) §4.
 
 ### 3.2 Component Model
 
-- [ ] `p2` - **ID**: `cpt-cf-bss-rating-component-billing-handoff`
+Declared by [`../DESIGN.md`](../DESIGN.md) §3.2's component model as `cpt-cf-bss-rating-component-billing-handoff`.
+This slice details it; the component model is where it is defined.
 
 - **`BillingDelivery`** — writes `BillableItemDelivery` to the transactional outbox (same commit as rated output) and relays to Billing at-least-once, ordered per M7 partition, idempotency-keyed.
 - **`PeriodStateRelay`** — ingests Billing's `periodState` and makes it available to context assembly (slice [`14`](./14-unit-synthesis-period-tick.md)); fail-closed absence.
@@ -216,7 +217,7 @@ closed at assembly (never guessed).
 
 ### 3.7 Database Schemas and Tables
 
-- [ ] `p2` - **ID**: `cpt-cf-bss-rating-storage-billing-handoff-bhf`
+- [ ] `p2` - **ID**: `cpt-cf-bss-rating-datastore-billing-handoff-bhf`
 
 **Owned (partitioned by the pinned `orderingTenantId`, UTC):**
 

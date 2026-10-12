@@ -53,6 +53,7 @@ fn log_and_translate_sa_failure(op: SaOp, e: &PluginError) {
     }
 }
 
+/// Translate a [`PluginError`] into the SDK-level [`IdpServiceAccountFailure`] at the plugin boundary.
 #[must_use]
 pub fn translate_sa_failure(e: PluginError) -> IdpServiceAccountFailure {
     match e {
@@ -60,6 +61,9 @@ pub fn translate_sa_failure(e: PluginError) -> IdpServiceAccountFailure {
             IdpServiceAccountFailure::InvalidInput { detail, field }
         }
         PluginError::SaNotFound { detail } => IdpServiceAccountFailure::NotFound { detail },
+        PluginError::SaQuotaExceeded { detail } => {
+            IdpServiceAccountFailure::QuotaExceeded { detail }
+        }
         PluginError::AmbiguousCreated { stage, detail } => IdpServiceAccountFailure::Ambiguous {
             detail: format!("{stage}: {detail}"),
         },
@@ -167,6 +171,10 @@ mod tests {
                 "invalid_input",
             ),
             (PluginError::SaNotFound { detail: "d".into() }, "not_found"),
+            (
+                PluginError::SaQuotaExceeded { detail: "d".into() },
+                "quota_exceeded",
+            ),
             (
                 PluginError::AmbiguousCreated {
                     stage: AmbiguousStage::KcClientDelete,

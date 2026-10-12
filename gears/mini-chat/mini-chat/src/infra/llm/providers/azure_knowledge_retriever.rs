@@ -1,6 +1,6 @@
 //! Azure `OpenAI` Knowledge Retriever (RAG via vector store search API).
 //!
-//! Implements [`KnowledgeRetriever`] using the Azure `OpenAI` vector store
+//! Implements `KnowledgeRetriever` using the Azure `OpenAI` vector store
 //! search endpoint:
 //! `POST /{alias}/openai/vector_stores/{id}/search?api-version={ver}`
 

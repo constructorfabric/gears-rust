@@ -1,6 +1,6 @@
 [gear]
 name = "Settings Service"
-description = "Typed configuration and feature flags with tenant-scoped inheritance and staged apply."
+description = "Typed configuration and feature flags with tenant-scoped inheritance and validate-then-set writes."
 category = "serverless"
 is_plugin = false
 has_plugins = false

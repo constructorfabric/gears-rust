@@ -1,146 +1,220 @@
-//! Typed repositories over the Foundation entities.
+//! Repositories accept any scoped transaction or connection runner.
 //!
-//! Six land ahead of the paths that call them, and for the same reason: each
-//! carries an invariant rather than a caller convention. The pin-frontier
-//! repository's `advance` is forward-only in SQL; the plan repository's draft
-//! edits are compare-and-swaps in SQL, with the row-version bump inside the same
-//! statement that matches on the version the caller read; the idempotency gate's
-//! at-most-once guarantee **is** an `INSERT... ON CONFLICT DO NOTHING`; the
-//! price repository's row and band set are one transaction, because a row whose
-//! geometry can land a moment late is a row that is briefly wrong; the plan
-//! shape repository replaces a revision's phase chain wholesale under the
-//! **revision's** entity tag, because a child set with a tag of its own would
-//! let two authors edit one draft and both satisfy their precondition; the
-//! policy repository resolves a tenant's authoring caps **against the deployment
-//! defaults**, so no caller can read a per-tenant cap without the ratified value
-//! behind it. None of those guards survives being reimplemented per call site —
-//! that is what makes them repositories and not helpers.
-//!
-//! The remaining tables get their repositories with the paths that write them —
-//! a repository nothing calls is dead code, and dead code fails CI here.
-//! Three of them arrive together with the publish commit — `pricing_audit_log`,
-//! `pricing_outbox` and `pricing_catalog_version_ref` — because that is the
-//! first path that has an actor, a subject and a transaction to commit inside
-//! of. All three are shaped differently from the six above and deliberately so:
-//! they take a **runner** rather than a provider, because a record, an event or
-//! a pending version handle that could commit separately from the mutation it
-//! describes is evidence of something that may not have happened (D-14 for the
-//! audit row; the outbox's own "an event exists if and only if its commit
-//! happened"; a dangling pending ref that trips the commit-overdue alarm for a
-//! publish that never occurred). [`idempotency_repo`] set that precedent for the
-//! same reason.
-//!
-//! [`read_model_repo`] is the fourth runner-taking one, and its reason is
-//! sharper still: D-136 requires the pin frontier to advance **in the
-//! transaction that sets the last outstanding `warm_completed` marker** of the
-//! frontier's next version in order, so the delta write and the advance are one
-//! transaction by rule rather than by preference — and a repository holding a
-//! provider could not join it, `Db::conn()` being refused outright inside an
-//! open transaction.
-
+//! @cpt-dod:cpt-cf-bss-pricing-dod-scoped-repositories:p1
+use super::RepoError;
+use toolkit_db::secure::ScopeError;
 pub mod approval_repo;
 pub mod audit_repo;
-pub mod bulk_repo;
-pub mod bundle_repo;
-pub mod catalog_version_ref_repo;
-pub mod group_membership_repo;
+pub mod book_repo;
+pub mod dimension_repo;
 pub mod idempotency_repo;
-pub mod migration_repo;
-pub mod outbox_repo;
-pub mod overlay_repo;
-pub mod pin_frontier_repo;
+pub mod plan_item_repo;
 pub mod plan_repo;
-pub mod plan_shape_repo;
-pub mod policy_repo;
+pub mod plan_revision_repo;
+pub mod plan_summary;
+pub mod price_book_entry_repo;
 pub mod price_repo;
-pub mod read_model_repo;
-pub mod repricing_journal_repo;
-pub mod synthesis_repo;
-pub mod taxonomy_repo;
-pub mod threshold_repo;
-pub mod window_repo;
-
-use time::OffsetDateTime;
-
-use crate::domain::instant;
-use crate::infra::storage::RepoError;
-
-use crate::domain::instant::format_rfc3339;
-pub use approval_repo::{ApprovalRecord, NewApproval};
-pub use audit_repo::NewAuditEntry;
-pub use bulk_repo::{BulkOperationRecord, BulkRepo, NewBulkOperation};
-pub use bundle_repo::{
-    BundleComponentDraft, BundleRecord, BundleRepo, CompositionDraft, NewBundle,
-};
-pub use catalog_version_ref_repo::PendingVersionRow;
-pub use group_membership_repo::{MembershipRow, NewMembership};
-pub use idempotency_repo::{ClaimOutcome, IdempotencyGate};
-pub use migration_repo::{MigrationRecord, NewMigration};
-pub use outbox_repo::{
-    NewOutboxEvent, PlanMigrationScheduledPayload, PlanPublishDegradedPayload,
-    PlanPublishedPayload, PlanRetiredPayload, PriceUpdatedPayload, PriceWindowTransitionPayload,
-    WindowMutationEvent,
-};
-pub use overlay_repo::{NewOverlay, OverlayRecord, OverlayRepo};
-pub use pin_frontier_repo::PinFrontierRepo;
-pub use plan_repo::{NewPlanDraft, PlanRepo};
-pub use plan_shape_repo::PlanShapeRepo;
-pub use policy_repo::{AuthoringPolicy, PolicyObjectRepo};
-pub use price_repo::{NewPriceDraft, PriceRepo};
-pub use read_model_repo::NewDelta;
-pub use synthesis_repo::{NewProvenance, ProvenanceRecord};
-pub use threshold_repo::{StoredVersion, ThresholdEntryRow};
-pub use window_repo::{NewWindow, WindowRecord};
-
-/// Refuse an authored instant finer than the millisecond quantum (D-144).
-///
-/// Here rather than in each repository because several of them store instants an
-/// operator authored — `grandfatherUntil`, `availableFrom`/`availableTo` — and
-/// the quantum is one rule. The predicate itself stays in
-/// [`crate::domain::instant`]: the resolution the catalog compares at is a
-/// domain fact, and this is only the storage boundary refusing to write past it.
-///
-/// # Its callers are the tables holding an authored instant, and that is checkable
-///
-/// A rule stated over an unnamed set cannot be checked against the set — "both of
-/// them" hides a repository that stores an authored instant without calling this.
-/// The callers are `plan_repo`
-/// (`availableFrom`/`availableTo`), `price_repo` (`grandfatherUntil`),
-/// `window_repo` and `group_membership_repo` and `threshold_repo`
-/// (`effectiveFrom`/`effectiveTo`), `overlay_repo` (the overlay interval and a
-/// line's `cohort`), `migration_repo` (`effectiveAt`) and `synthesis_repo`
-/// (`snapshotInstant`) — every table with such a column, which is the invariant to
-/// re-derive by grep rather than a list to trust.
-///
-/// **What is outside it is machine-generated, not merely uncompared.** `created_at`,
-/// the audit chain, outbox timestamps, `pricing_migration.announced_at` and a
-/// window activation's flip instant are all minted from `OffsetDateTime::now_utc()`, which carries
-/// sub-millisecond precision — [`window_repo::transition`] measured what applying
-/// the quantum there does: it refuses every write. `domain::instant` states the
-/// same exclusion from the domain side.
-///
-/// The columns will not do it for us. `timestamptz` holds microseconds and
-/// `SQLite`'s text rendering holds whatever it is handed, so a finer instant
-/// persists in silence and is then matched for equality against one produced at
-/// the quantum in another gear.
-///
-/// `None` is nothing authored, which is not a precision fault.
-///
-/// # Errors
-/// [`RepoError::TimestampPrecisionExceeded`] naming `field` and the instant, so
-/// the author corrects one value rather than resubmitting and guessing.
-pub(crate) fn check_authored_instant(
-    field: &str,
-    at: Option<OffsetDateTime>,
-) -> Result<(), RepoError> {
-    let Some(at) = at else {
-        return Ok(());
-    };
-    if instant::is_quantized(at) {
-        return Ok(());
+pub mod reference_op_repo;
+pub mod settings_repo;
+/// The latest of `instant` over a group, as text [`latest_instant`] reads back (D-441): on
+/// Postgres the `timestamptz` maximum rendered in UTC to the microsecond it keeps; on `SQLite`,
+/// where an instant is RFC 3339 text whose fraction has as many digits as it needs (so `…00Z`
+/// sorts after `…00.5Z`, and `…00.41868Z` after `…00.418681Z`, P-D-213), the maximum of a
+/// fixed-width key that pads the fraction to nine digits, so the text sorts as time. Pricing
+/// writes every instant in UTC (`Z`); `NULL` stays out of the maximum.
+//
+// Raw SQL, on purpose (whole-branch review PS-02): the maximum must compare as time on both
+// dialects, and neither half has a portable spelling in sea-query: Postgres renders the
+// `timestamptz` maximum with `to_char … AT TIME ZONE 'UTC'`, and `SQLite`, which stores RFC 3339
+// text with a fraction of any width, pads that fraction with `substr`/`rtrim` so the text sorts
+// as time. The instant is the only operand, and it stays an expression of the scoped select.
+// Upstream gears use the same pattern in repository code: account-management
+// `infra/lease/manager.rs` (`Expr::cust("NOW()")`, `INTERVAL`) and
+// `infra/storage/repo_impl/retention.rs` (`make_interval`, `julianday`), and settings-service
+// `infra/storage/search_repo.rs` (`LIKE … ESCAPE`, the JSON null checks). A toolkit-db helper
+// would be a change to a foreign crate, proposed upstream on its own (owner, O3/O4).
+#[must_use]
+pub fn latest(
+    backend: sea_orm::DbBackend,
+    instant: sea_orm::sea_query::Expr,
+) -> sea_orm::sea_query::Expr {
+    use sea_orm::sea_query::Expr;
+    if backend == sea_orm::DbBackend::Postgres {
+        Expr::cust_with_expr(
+            r#"to_char(MAX($1) AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US')"#,
+            instant,
+        )
+    } else {
+        Expr::cust_with_exprs(
+            "MAX(substr(?, 1, 19) || substr(CASE WHEN substr(?, 20, 1) = '.' \
+             THEN rtrim(substr(?, 20), 'Z') ELSE '.' END || '000000000', 1, 10))",
+            [instant.clone(), instant.clone(), instant],
+        )
     }
-    Err(RepoError::TimestampPrecisionExceeded {
-        field: field.to_owned(),
-        value: format_rfc3339(at),
-    })
 }
+/// The instant [`latest`] rendered, in UTC.
+/// # Errors
+/// `CorruptRow` for text that is not such an instant (a stored instant pricing did not write).
+pub fn latest_instant(text: Option<&str>) -> Result<Option<time::OffsetDateTime>, RepoError> {
+    let format = time::macros::format_description!(
+        "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond]"
+    );
+    text.map(|t| {
+        time::PrimitiveDateTime::parse(t, &format)
+            .map(time::PrimitiveDateTime::assume_utc)
+            .map_err(|e| RepoError::CorruptRow(format!("the latest instant {t:?}: {e}")))
+    })
+    .transpose()
+}
+/// `lower(expr)`, folded through [`book_repo::PG_FOLD_COLLATION`] on Postgres and through the
+/// database's own `lower()` on `SQLite`.
+///
+/// Raw SQL, on purpose: sea-query has no `COLLATE` on an expression, and the fold must name the
+/// ICU collation, or a `C`-locale database folds ASCII only. The folded text stays a bound value.
+pub(super) fn folded(
+    backend: sea_orm::DbBackend,
+    expr: sea_orm::sea_query::Expr,
+) -> sea_orm::sea_query::Expr {
+    use sea_orm::sea_query::Expr;
+    if backend == sea_orm::DbBackend::Postgres {
+        Expr::cust_with_expr(
+            format!(r#"lower($1 COLLATE "{}")"#, book_repo::PG_FOLD_COLLATION),
+            expr,
+        )
+    } else {
+        Expr::expr(sea_orm::sea_query::Func::lower(expr))
+    }
+}
+
+/// `lower(column) LIKE lower(pattern) ESCAPE '\'` over any of `columns`. The caller's text is
+/// matched literally (`%`, `_` and `\` escaped). Both sides fold the same way.
+pub(super) fn text_like_any(
+    text: &str,
+    backend: sea_orm::DbBackend,
+    columns: impl IntoIterator<Item = sea_orm::sea_query::Expr>,
+) -> sea_orm::Condition {
+    use sea_orm::sea_query::{BinOper, Expr, ExprTrait};
+    use toolkit_db::odata::sea_orm_filter::escape_like;
+    let pattern = format!("%{}%", escape_like(text));
+    columns
+        .into_iter()
+        .fold(sea_orm::Condition::any(), |any, column| {
+            let lowered = folded(backend, Expr::val(pattern.clone())).binary(
+                BinOper::Escape,
+                Expr::Constant(sea_orm::Value::Char(Some('\\'))),
+            );
+            any.add(folded(backend, column).binary(BinOper::Like, lowered))
+        })
+}
+
+/// Preserve the driver's variant for serializable retries.
+#[must_use]
+pub fn driver_failure(context: String, error: ScopeError) -> RepoError {
+    match error {
+        ScopeError::Db(source) => RepoError::Driver { context, source },
+        other => RepoError::Db(format!("{context}: {other}")),
+    }
+}
+/// The conflict of a price's `(entry, version_no)` key: the create and the PATCH retry on it with
+/// the entry's next number, matched on this one symbol, never a second literal (PS-41).
+pub const PRICE_VERSION_TAKEN: &str = "PRICE_VERSION_TAKEN";
+/// Identify named Postgres constraints and `SQLite` unique column/index diagnostics.
+#[must_use]
+pub fn unique_code(message: &str) -> Option<&'static str> {
+    if message.contains("pricing_price_book_tenant_id_code_key")
+        || message.contains("pricing_price_book.tenant_id, pricing_price_book.code")
+    {
+        Some("BOOK_CODE_TAKEN")
+    } else if message.contains("pricing_price_book_entry_key") {
+        Some("ENTRY_KEY_TAKEN")
+    } else if message.contains("pricing_price_approved_start") {
+        Some("WINDOW_OVERLAP")
+    } else if message.contains("pricing_price_price_book_entry_id_version_no_key")
+        || message.contains("pricing_price.price_book_entry_id, pricing_price.version_no")
+    {
+        Some(PRICE_VERSION_TAKEN)
+    } else if message.contains("pricing_dimension_key_pkey")
+        || message.contains("pricing_dimension_key.tenant_id, pricing_dimension_key.key")
+    {
+        Some("DIM_KEY_TAKEN")
+    } else {
+        plan_unique_code(message)
+    }
+}
+/// The phase 3 keys, and phase 8's scheduled index (D-446). Postgres names the index or
+/// constraint; `SQLite` names the columns, which a partial index shares with its siblings: the
+/// three single-column revision indexes read alike there and are told apart by
+/// `plan_revision_repo`, which knows the state it wrote. Longer column lists are matched before the
+/// single column they begin with.
+fn plan_unique_code(message: &str) -> Option<&'static str> {
+    if message.contains("pricing_plan_code")
+        || message.contains("pricing_plan.tenant_id, pricing_plan.code")
+    {
+        Some("PLAN_CODE_TAKEN")
+    } else if message.contains("pricing_plan_revision_no")
+        || message.contains("pricing_plan_revision.plan_id, pricing_plan_revision.rev_no")
+    {
+        Some("REVISION_NO_TAKEN")
+    } else if message.contains("pricing_plan_revision_open") {
+        Some("REVISION_DRAFT_EXISTS")
+    } else if message.contains("pricing_plan_revision_published") {
+        Some("REVISION_PUBLISHED_EXISTS")
+    } else if message.contains("pricing_plan_revision_scheduled") {
+        Some("REVISION_SCHEDULED_EXISTS")
+    } else if message.contains("pricing_plan_item_sku")
+        || message.contains("pricing_plan_item.revision_id, pricing_plan_item.sku_id")
+    {
+        Some("ITEM_SKU_TAKEN")
+    } else {
+        None
+    }
+}
+fn map_unique(context: String, error: ScopeError) -> RepoError {
+    if error.is_unique_violation()
+        && let Some(code) = unique_code(&error.to_string())
+    {
+        return RepoError::Conflict { code };
+    }
+    driver_failure(context, error)
+}
+/// Refuse a lock that names no approval unit of the tenant.
+async fn unit_exists(
+    runner: &impl toolkit_db::secure::DBRunner,
+    scope: &toolkit_db::secure::AccessScope,
+    tenant: uuid::Uuid,
+    unit: uuid::Uuid,
+    context: &str,
+) -> Result<(), RepoError> {
+    let parent = approval_repo::find_unit(runner, scope, tenant, unit)
+        .await
+        .map_err(|error| {
+            error.db_err().map_or_else(
+                || RepoError::Db(error.to_string()),
+                |source| RepoError::Driver {
+                    context: context.to_owned(),
+                    source: source.clone(),
+                },
+            )
+        })?;
+    if parent.is_none() {
+        return Err(RepoError::Conflict {
+            code: "UNIT_NOT_FOUND",
+        });
+    }
+    Ok(())
+}
+fn matched(rows: u64, code: &'static str) -> Result<(), RepoError> {
+    if rows == 1 {
+        Ok(())
+    } else {
+        Err(RepoError::Conflict { code })
+    }
+}
+
+pub mod usage_policy_repo;
+
+pub mod acceptance_repo;
+
+pub mod hold_repo;
+
+pub mod commercial_command_repo;

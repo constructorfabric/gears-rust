@@ -1,0 +1,9 @@
+{
+  "gts_id": "gts.cf.e2e.deletion.person.v1~cf.e2e.deletion.employee.v1~cf.e2e.deletion.ernie.v1",
+  "content": {
+    "name": "Ernie",
+    "payload": {
+      "employee_id": "E101"
+    }
+  }
+}

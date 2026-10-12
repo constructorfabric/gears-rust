@@ -1,0 +1,37 @@
+# Created: 2026-08-11 by Virtuozzo International GmbH
+[package]
+name = "cf-gears-settings-service-sdk"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "SDK for settings-service gear: setting-key value object, models, and error definitions"
+repository.workspace = true
+readme = "README.md"
+keywords = ["constructorfabric", "cf-gears", "settings-service"]
+categories = ["api-bindings"]
+metadata.docs.rs.all-features = true
+
+[lints]
+workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+gts-id = { workspace = true }
+# The abstract `setting_type` base and the starter value-type catalogue are
+# submitted to the link-time schema inventory the types registry drains at init.
+toolkit-gts = { workspace = true }
+toolkit-odata-macros = { workspace = true }
+toolkit-odata = { workspace = true }
+async-trait = { workspace = true }
+toolkit-canonical-errors = { workspace = true }
+toolkit-security = { workspace = true }
+# The plaintext a secret resolves to is handed over wrapped, never as a bare string.
+secrecy = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+jsonschema = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt"] }

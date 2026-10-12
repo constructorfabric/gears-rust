@@ -42,6 +42,18 @@ pub trait FilterField: Copy + Eq + std::hash::Hash + fmt::Debug + 'static {
 
     fn kind(&self) -> FieldKind;
 
+    /// Whether the field can be absent, so that `null` compares with it: `field eq null` asks for
+    /// the rows where it is absent and `field ne null` for the rows where it is present.
+    ///
+    /// Opt-in, `false` by default: `null` is then a value outside the field's kind and is refused
+    /// like any other mistyped value (`FilterError::TypeMismatch`), with every operator and inside
+    /// `in`. A consumer that evaluates the filter itself (an `IdP` plugin matching users, say)
+    /// therefore never sees a `null` it has no answer for unless its field says it can be absent.
+    /// On a nullable field an ordering with `null` is refused, and so is `null` inside `in`.
+    fn nullable(&self) -> bool {
+        false
+    }
+
     fn from_name(name: &str) -> Option<Self> {
         // Try exact match first (handles both simple names and slash-delimited property paths
         // like "hierarchy/depth" if the enum defines them).
@@ -284,8 +296,6 @@ pub fn convert_expr_to_filter_node<F: FilterField>(
             let field = F::from_name(field_name)
                 .ok_or_else(|| FilterError::UnknownField(field_name.to_owned()))?;
 
-            validate_value_type(field, &value)?;
-
             let filter_op = match op {
                 odata_ast::CompareOperator::Eq => FilterOp::Eq,
                 odata_ast::CompareOperator::Ne => FilterOp::Ne,
@@ -294,6 +304,22 @@ pub fn convert_expr_to_filter_node<F: FilterField>(
                 odata_ast::CompareOperator::Lt => FilterOp::Lt,
                 odata_ast::CompareOperator::Le => FilterOp::Le,
             };
+
+            // On a field that can be absent, absence is not a value of the field's kind, so the
+            // value check does not apply: `eq null` asks for the rows where the field is absent
+            // and `ne null` for the rows where it is present. An ordering has no answer for it.
+            // On any other field `null` falls through to the value check, which refuses it.
+            if matches!(value, odata_ast::Value::Null) && field.nullable() {
+                if !matches!(filter_op, FilterOp::Eq | FilterOp::Ne) {
+                    return Err(FilterError::UnsupportedOperation(format!(
+                        "`{filter_op}` with null on field `{field_name}`; only `eq null` and \
+                         `ne null` compare with null"
+                    )));
+                }
+                return Ok(FilterNode::binary(field, filter_op, value));
+            }
+
+            validate_value_type(field, &value)?;
             reject_unsupported_op(field, field_name, filter_op)?;
 
             Ok(FilterNode::binary(field, filter_op, value))
@@ -396,6 +422,14 @@ pub fn convert_expr_to_filter_node<F: FilterField>(
             let mut values = Vec::with_capacity(list.len());
             for item in list {
                 match item {
+                    // An `in` list is a set of values; absence is asked with `eq null`. On a field
+                    // that cannot be absent, the value check below refuses `null` as a mismatch.
+                    E::Value(odata_ast::Value::Null) if field.nullable() => {
+                        return Err(FilterError::InvalidExpression(format!(
+                            "null is not a member of an `in` list on field `{field_name}`; \
+                             compare with `eq null`"
+                        )));
+                    }
                     E::Value(val) => {
                         validate_value_type(field, val)?;
                         values.push(val.clone());

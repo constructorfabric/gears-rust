@@ -171,7 +171,8 @@ core.
 
 ### 3.2 Component Model
 
-- [ ] `p2` - **ID**: `cpt-cf-bss-rating-component-unit-synthesis`
+Declared by [`../DESIGN.md`](../DESIGN.md) §3.2's component model as `cpt-cf-bss-rating-component-unit-synthesis`.
+This slice details it; the component model is where it is defined.
 
 - **`UnitSynthesizer`** — builds `EvaluationUnitSpec`s from usage arrival (slice 12/13), window close, the period tick, and cascade triggers.
 - **`PeriodTick`** — the coordinated period-driven synthesizer, **fact-driven since T-D-33**: triggered by the subscriptions period-fact set, never a boundary clock; emits period-driven units idempotently per `(subscription, AnchorPeriod)` (§4.2).
@@ -231,7 +232,7 @@ feed back as cascade triggers).
 
 ### 3.7 Database Schemas and Tables
 
-- [ ] `p2` - **ID**: `cpt-cf-bss-rating-storage-synthesis-syn`
+- [ ] `p2` - **ID**: `cpt-cf-bss-rating-datastore-synthesis-syn`
 
 **Owned (partitioned by the pinned `orderingTenantId`, UTC):**
 
@@ -261,7 +262,7 @@ work queue drained by lane workers with backpressure, distinct from the first-ra
 
 - **`per_event`** — one normalized `UsageRecord` (discrete meters); the unit is the event.
 - **Windowed-`Q` (per sub-window slice)** — the aggregated `Q` for `(subscription, meter, dimensionKey, window)`; when a period split partitions the window, **one unit per sub-window slice**, each carrying the frozen `bandOffsetQ` from slice [`13`](./13-q-store-attribution.md) (T-D-12) and binding exactly one pin (core slice [`01`](./01-foundation.md) §4.2).
-- **Period-driven** — recurring lines, capacity-flavor charges, and period-end true-up surfacing, keyed `(subscription, priceId, chargeKind, lineKey, AnchorPeriod)` (T-D-15; `lineKey` value rule per T-D-34, `AnchorPeriod` ≡ the consumed fact's period identity per T-D-33); synthesized by the **fact-driven** period tick, priced by the core. A **zero-usage period still emits** its period-driven units (§4.2; PRD §12 AC 20 capacity charge). This enumeration is **exhaustive**: `one_time` / `one_time_setup` rows synthesize **nothing** here — they are billed at their qualifying instant by Subscriptions/Billing from the frozen snapshot amount (T-D-18; the tick never emits, and can never re-emit, a one-time line).
+- **Period-driven** — recurring lines, capacity-flavor charges, and period-end true-up surfacing, keyed `(subscription, priceId, chargeKind, lineKey, AnchorPeriod)` (T-D-15; `lineKey` value rule per T-D-34, `AnchorPeriod` ≡ the consumed fact's period identity per T-D-33); synthesized by the **fact-driven** period tick, priced by the core. A **zero-usage period still emits** its period-driven units (§4.2; PRD §12 AC 20 capacity charge). This enumeration is **exhaustive**: `one_time` rows synthesize **nothing** here (`one_time_setup` is withdrawn — T-D-36) — they are billed at their qualifying instant by Subscriptions/Billing from the frozen snapshot amount (T-D-18; the tick never emits, and can never re-emit, a one-time line).
 - **Serialization across kinds (fills core slice [`01`](./01-foundation.md) §4.2)**: a usage unit serializes on its counter partition key `(subscription, meter, dimensionKey, window)`; a period-driven unit serializes on `(subscription, AnchorPeriod)` (the tick-ledger key). The two key spaces are disjoint by construction — a usage unit prices metered `Q`, a period-driven unit prices a recurring/capacity/true-up line — so they never contend for the same row; where a period-driven true-up reads a window aggregate, it reads it **frozen** (the window's `qVersion` at tick time), not the live counter.
 
 ### 4.2 The Period Tick (normative)

@@ -138,8 +138,13 @@ An all-equal batch is reachable: content identical to what was just read satisfi
 
 The preconditions rule out the raced form:
 
-* `must_not_exist` yields `precondition_failed` once the entity exists;
-* `match_resource_version(v)` fails once another write advances the version, even if that write makes the content equal.
+* `must_not_exist` yields the per-candidate `already_exists` reason once the
+  identifier belongs to an entity, including a tombstone, regardless of
+  authored-content equality. This distinguishes a new creation attempt from
+  an update whose observed version became stale;
+* `match_resource_version(v)` yields `precondition_failed` once another
+  content write advances an active entity's version, even if that write
+  makes the content equal. A tombstone instead yields `entity_deleted`.
 
 `unchanged` is therefore a **guarantee** rather than an acceptance path: a redundant submission creates no revision and no `resource_version` increment. The operation's per-candidate result records that outcome.
 
@@ -174,7 +179,18 @@ Optimistic locking answers whether the caller's read is still current. Every can
 * `must_not_exist` for an identifier that was absent during reconciliation;
 * `match_resource_version(version)` for an existing entity.
 
-The worker enforces the precondition in the commit transaction. A mismatch is a terminal per-item `precondition_failed`; Types Registry does not silently rebase the update. This token is the logical entity's monotonic `resource_version`, not the authored revision number, because lifecycle and other correctness-relevant changes must also invalidate a stale write.
+The worker enforces the precondition in the commit transaction. A creation
+against an occupied identifier terminates with per-item `already_exists`,
+while an update whose target is absent or whose active target's observed
+version no longer matches terminates with per-item `precondition_failed`.
+A tombstoned target yields `entity_deleted` before the version check.
+Types Registry does not silently rebase an update. The token is the logical
+entity's monotonic `resource_version`, not the authored revision number,
+because lifecycle and other correctness-relevant changes must also
+invalidate a stale write. A same-key request with a different fingerprint
+that passes static validation remains a separate, synchronous HTTP
+`409 Conflict`; its canonical Problem category is also `already_exists`,
+but no candidate outcome is created.
 
 Dependency freshness is internal concurrency control. Validation records the dependency revision vector. If the target precondition still holds but a dependency changes before commit, the worker revalidates within a bounded retry policy. This internal retry does not weaken the caller's target precondition.
 
@@ -261,7 +277,7 @@ Removal releases the scoped request key, so a later replay executes afresh:
 |---|---|
 | Dry run | Harmless because it has no effect. |
 | Nothing admitted | Fails again, or succeeds because registry state changed. |
-| Successful deletion | Fails its stale precondition: the entity is already `DELETED` at a later `resource_version`. |
+| Successful deletion | Fails `not_active`: it is a new deletion of a tombstone, refused before its version is checked. |
 | Revisions purged | Runs as an ordinary registration of a free identifier, subject to current authorization and its original precondition. |
 
 In the last case, a precondition that permits creation can create a new logical entity; it does not restore the purged one. An original update carrying `match_resource_version` instead fails because the entity is absent. Purge releases the identifier for reuse and reserves nothing against it. This does not breach ADR-0013, which reserves removal of admitted content and identity to one operator-invoked act; replay of an unpinned operation is neither.
@@ -333,7 +349,12 @@ This decision is confirmed when:
 * a matching key replay returns the same operation even after another request changes current state;
 * the same scoped key with another fingerprint is rejected;
 * two callers on different planes may use the same key value without collision, and so may two principals in one tenant;
-* an update whose target resource version changed fails with `precondition_failed` and creates no revision;
+* a fresh `must_not_exist` creation against an existing identifier, even
+  with equal content or a tombstone, fails per item as `already_exists`
+  rather than `unchanged` or `precondition_failed`;
+* an update whose active target's resource version changed fails with
+  `precondition_failed` and creates no revision, while a deleted target
+  fails with `entity_deleted`;
 * a dependency-only race is revalidated without bypassing the target precondition;
 * a minor whose predecessor is absent at commit fails retryably rather than as a caller-precondition failure, and no predecessor relationship appears as a row in the `dependency` relation — deleting `v1.0~` while `v1.1~` exists still succeeds;
 * two minors of one major in one batch are admitted in ascending order, and the higher one is blocked when the lower one fails;

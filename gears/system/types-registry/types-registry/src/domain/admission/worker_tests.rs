@@ -6,6 +6,66 @@ use super::{ItemFailure, reason_label};
 use crate::domain::admission::AdmissionFailureReason;
 
 #[test]
+fn missing_dependency_details_survive_outcome_redelivery() {
+    use crate::domain::dependency::DependencyEdge;
+    use crate::domain::enums::DependencyKind;
+    for kind in [
+        DependencyKind::Derivation,
+        DependencyKind::InstanceOf,
+        DependencyKind::SchemaRef,
+    ] {
+        let failure = ItemFailure::missing_dependency(DependencyEdge {
+            kind,
+            target: "cf.core.absent.type.v1~".into(),
+        });
+        assert_eq!(
+            ItemFailure::from_payload(&failure.to_payload().expect("encode")),
+            failure
+        );
+    }
+}
+
+#[test]
+fn an_unknown_dependency_kind_survives_with_its_target() {
+    let stored = r#"{"reason":"dependency_not_found","message":"'cf.core.absent.type.v1~' is not registered","dependency_id":"cf.core.absent.type.v1~","dependency_kind":"successor_of"}"#;
+
+    let failure = ItemFailure::from_payload(stored);
+
+    let dependency = failure
+        .dependency
+        .as_ref()
+        .expect("an unrecognized kind must not discard the dependency");
+    assert_eq!(dependency.kind, "successor_of");
+    assert_eq!(dependency.target, "cf.core.absent.type.v1~");
+    assert_eq!(
+        failure.reason,
+        AdmissionFailureReason::DependencyNotFound,
+        "an unknown kind says nothing about the reason",
+    );
+    assert_eq!(
+        ItemFailure::from_payload(&failure.to_payload().expect("encode")),
+        failure,
+        "and re-recording it writes the token back unchanged",
+    );
+}
+
+#[tokio::test]
+async fn evaluation_panics_are_permanent_but_cancelled_tasks_can_be_recovered() {
+    use super::WorkerError;
+    let panicked = tokio::spawn(async {
+        std::panic::resume_unwind(Box::new("injected evaluation panic"));
+    })
+    .await
+    .expect_err("task panicked");
+    assert!(!WorkerError::EvaluationTask(panicked).transient());
+
+    let task = tokio::spawn(std::future::pending::<()>());
+    task.abort();
+    let cancelled = task.await.expect_err("task cancelled");
+    assert!(WorkerError::EvaluationTask(cancelled).transient());
+}
+
+#[test]
 fn known_reasons_keep_their_wire_codes_and_metric_labels_after_storage() {
     for (reason, code) in [
         (
@@ -67,7 +127,7 @@ fn known_reasons_keep_their_wire_codes_and_metric_labels_after_storage() {
         ),
     ] {
         let failure = ItemFailure::new(reason.clone(), "failure details".to_owned());
-        let payload = failure.to_payload();
+        let payload = failure.to_payload().expect("encode");
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(&payload).expect("JSON"),
             serde_json::json!({"reason": code, "message": "failure details"}),
@@ -90,7 +150,8 @@ fn an_unknown_stored_reason_is_preserved_but_counts_under_other() {
     assert_eq!(reason_label(&failure.reason), "other");
     assert_eq!(failure.reason.as_str(), "future_refusal");
     assert_eq!(
-        serde_json::from_str::<serde_json::Value>(&failure.to_payload()).expect("JSON"),
+        serde_json::from_str::<serde_json::Value>(&failure.to_payload().expect("encode"))
+            .expect("JSON"),
         serde_json::from_str::<serde_json::Value>(payload).expect("JSON"),
     );
 }
@@ -111,6 +172,9 @@ fn malformed_payloads_keep_the_original_content_and_diagnostic_reason() {
         let failure = ItemFailure::from_payload(payload);
         assert_eq!(failure.reason, reason);
         assert_eq!(failure.message, payload);
-        assert_eq!(ItemFailure::from_payload(&failure.to_payload()), failure);
+        assert_eq!(
+            ItemFailure::from_payload(&failure.to_payload().expect("encode")),
+            failure
+        );
     }
 }

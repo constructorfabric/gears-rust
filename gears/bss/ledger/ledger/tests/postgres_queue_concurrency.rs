@@ -8,7 +8,7 @@
 //!
 //! Covers: (1) two concurrent `AllocationService::drain`s of one tenant whose
 //! queue holds a single due allocation apply it EXACTLY ONCE — one
-//! `payment_allocation` row, `allocated_minor == 300` (not 600), queue
+//! `payment_allocation` row, `allocated == 300` (not 600), queue
 //! `APPLIED`, dedup `POSTED`. The `FOR UPDATE SKIP LOCKED` claim + the
 //! `QueuedApply` POSTED-replay short-circuit are the two guards; a loser that
 //! claims nothing (or replays the POSTED winner) never lands a second effect.
@@ -36,7 +36,6 @@ use std::sync::Arc;
 use bss_ledger::domain::error::DomainError;
 use bss_ledger::domain::instant::to_naive_date;
 use bss_ledger::domain::model::{AccountRow, CurrencyScaleRow, NewEntry, NewLine, RepoError};
-use bss_ledger::domain::money::DEFAULT_PLAUSIBLE_MAX_MAJOR;
 use bss_ledger::domain::payment::settlement::SettlementInput;
 use bss_ledger::domain::ports::metrics::NoopLedgerMetrics;
 use bss_ledger::infra::events::publisher::LedgerEventPublisher;
@@ -46,8 +45,11 @@ use bss_ledger::infra::payment::settle::SettlementService;
 use bss_ledger::infra::posting::service::PostingService;
 use bss_ledger::infra::storage::migrations::Migrator;
 use bss_ledger::infra::storage::repo::{PaymentRepo, ReferenceRepo};
-use bss_ledger_sdk::{AccountClass, MappingStatus, Side, SourceDocType};
+use bss_ledger_sdk::{
+    AccountClass, CurrencySpec, MappingStatus, PostedMoney, Side, SourceDocType, canonical_decimal,
+};
 use chrono::NaiveDate;
+use rust_decimal::Decimal;
 use sea_orm::{ConnectionTrait, Database, DbErr, Statement};
 use sea_orm_migration::MigratorTrait;
 use testcontainers_modules::postgres::Postgres;
@@ -60,6 +62,21 @@ use uuid::Uuid;
 
 fn pg(sql: impl Into<String>) -> Statement {
     Statement::from_string(sea_orm::DatabaseBackend::Postgres, sql.into())
+}
+
+/// The USD@2 currency spec every fixture here posts in.
+fn usd_spec() -> CurrencySpec {
+    CurrencySpec::try_new("USD".to_owned(), 2).unwrap()
+}
+
+/// A USD scale-2 posting from a cent count (`1234` ⇒ `12.34`).
+fn usd(cents: i64) -> PostedMoney {
+    PostedMoney::try_new(Decimal::new(cents, 2), usd_spec()).unwrap()
+}
+
+/// The canonical stored text of a USD cent count (`970` ⇒ `"9.7"`).
+fn text(cents: i64) -> String {
+    canonical_decimal(Decimal::new(cents, 2))
 }
 
 /// Lift a component `RepoError` into a `DbError` so an in-txn repo write can be
@@ -134,8 +151,7 @@ async fn setup_seller(raw: &sea_orm::DatabaseConnection, provider: &DBProvider<D
         .upsert_currency_scale(CurrencyScaleRow {
             tenant_id: s.tenant,
             currency: "USD".to_owned(),
-            minor_units: 2,
-            plausible_max_major: DEFAULT_PLAUSIBLE_MAX_MAJOR,
+            currency_scale: 2,
             source: "iso".to_owned(),
         })
         .await
@@ -190,9 +206,9 @@ fn settlement_input(s: &Seller, payment_id: &str, gross: i64, fee: i64) -> Settl
         tenant_id: s.tenant,
         payer_tenant_id: s.payer,
         payment_id: payment_id.to_owned(),
-        gross_minor: gross,
-        fee_minor: fee,
-        currency: "USD".to_owned(),
+        gross: usd(gross),
+
+        fee: usd(fee),
         effective_at: None,
     }
 }
@@ -205,8 +221,7 @@ fn allocate_req(s: &Seller, payment_id: &str, allocation_id: Uuid, lump: i64) ->
         payer_tenant_id: s.payer,
         payment_id: payment_id.to_owned(),
         allocation_id,
-        lump_minor: lump,
-        currency: "USD".to_owned(),
+        lump: usd(lump),
         hint_invoice_id: None,
         caller_splits: None,
     }
@@ -274,15 +289,15 @@ async fn ar_invoice_balance(
     raw: &sea_orm::DatabaseConnection,
     s: &Seller,
     invoice_id: &str,
-) -> Option<i64> {
+) -> Option<String> {
     raw.query_one_raw(pg(format!(
-        "SELECT balance_minor FROM bss.ledger_ar_invoice_balance \
+        "SELECT balance FROM bss.ledger_ar_invoice_balance \
          WHERE tenant_id='{}' AND invoice_id='{}'",
         s.tenant, invoice_id
     )))
     .await
     .unwrap()
-    .map(|r| r.try_get_by_index::<i64>(0).unwrap())
+    .map(|r| r.try_get_by_index::<String>(0).unwrap())
 }
 
 async fn count_allocations(raw: &sea_orm::DatabaseConnection, s: &Seller, payment_id: &str) -> i64 {
@@ -344,15 +359,12 @@ fn ar_line(s: &Seller, invoice_id: &str, amount: i64) -> NewLine {
         account_class: AccountClass::Ar,
         gl_code: None,
         side: Side::Debit,
-        amount_minor: amount,
-        currency: "USD".to_owned(),
-        currency_scale: 2,
+        money: usd(amount),
         invoice_id: Some(invoice_id.to_owned()),
         due_date: Some(NaiveDate::from_ymd_opt(2026, 12, 1).unwrap()),
         revenue_stream: None,
         mapping_status: MappingStatus::Resolved,
-        functional_amount_minor: None,
-        functional_currency: None,
+        functional_money: None,
         tax_jurisdiction: None,
         tax_filing_period: None,
         tax_rate_ref: None,
@@ -377,15 +389,12 @@ fn psp_credit_line(s: &Seller, amount: i64) -> NewLine {
         account_class: AccountClass::PspFeeExpense,
         gl_code: None,
         side: Side::Credit,
-        amount_minor: amount,
-        currency: "USD".to_owned(),
-        currency_scale: 2,
+        money: usd(amount),
         invoice_id: None,
         due_date: None,
         revenue_stream: None,
         mapping_status: MappingStatus::Resolved,
-        functional_amount_minor: None,
-        functional_currency: None,
+        functional_money: None,
         tax_jurisdiction: None,
         tax_filing_period: None,
         tax_rate_ref: None,
@@ -440,12 +449,14 @@ async fn queue_with_seeded_settlement(
     // both racing appliers find a still-QUEUED, now-due row to compete over.
     let tenant = s.tenant;
     let payment = payment_id.to_owned();
+    let repo = PaymentRepo::new(provider.clone());
     provider
         .transaction(move |txn| {
             let scope = scope.clone();
             let payment = payment.clone();
+            let repo = repo.clone();
             Box::pin(async move {
-                PaymentRepo::seed_settlement(txn, &scope, tenant, &payment, "USD", 1000, 0)
+                repo.seed_settlement(txn, &scope, tenant, &payment, &usd(1000), &usd(0))
                     .await
                     .map_err(lift)
             })
@@ -462,16 +473,16 @@ async fn queue_with_seeded_settlement(
     // allocation is (correctly) blocked.
     raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_account_balance \
-            (tenant_id, account_id, currency, account_class, normal_side, balance_minor) \
-         VALUES ('{}','{}','USD','UNALLOCATED','CR',1000)",
+            (tenant_id, account_id, currency, currency_scale, account_class, normal_side, balance) \
+         VALUES ('{}','{}','USD',2,'UNALLOCATED','CR','10')",
         s.tenant, s.unallocated
     )))
     .await
     .expect("seed unallocated account_balance");
     raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_unallocated_balance \
-            (tenant_id, payer_tenant_id, account_id, currency, balance_minor) \
-         VALUES ('{}','{}','{}','USD',1000)",
+            (tenant_id, payer_tenant_id, account_id, currency, currency_scale, balance) \
+         VALUES ('{}','{}','{}','USD',2,'10')",
         s.tenant, s.payer, s.unallocated
     )))
     .await
@@ -487,7 +498,7 @@ async fn queue_with_seeded_settlement(
 /// LOCKED` claim hands the row to at most one applier; if the other still
 /// observes it (or replays a finalized winner via the `QueuedApply` POSTED
 /// short-circuit), it lands NO second effect. INVARIANT: exactly ONE
-/// `payment_allocation` row, `allocated_minor == 300` (never 600), queue
+/// `payment_allocation` row, `allocated == 300` (never 600), queue
 /// `APPLIED`, dedup `POSTED`, AR drained to 0.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires Docker (testcontainers)"]
@@ -550,8 +561,9 @@ async fn two_drains_apply_a_queued_allocation_exactly_once() {
         .unwrap()
         .expect("settlement row present");
     assert_eq!(
-        row.allocated_minor, 300,
-        "allocated_minor reflects exactly one apply (300), not a doubled 600"
+        row.allocated,
+        usd(300),
+        "allocated reflects exactly one apply (3.00), not a doubled 6.00"
     );
     assert_eq!(
         queue_status(&raw, &s, allocation_id).await.as_deref(),
@@ -565,7 +577,7 @@ async fn two_drains_apply_a_queued_allocation_exactly_once() {
         entry_id.is_some(),
         "the applied dedup carries the result entry id"
     );
-    assert_eq!(ar_invoice_balance(&raw, &s, "INV-A").await, Some(0));
+    assert_eq!(ar_invoice_balance(&raw, &s, "INV-A").await, Some(text(0)));
 }
 
 /// A `settle` (whose drain-on-settle hook applies the queue) racing a
@@ -574,7 +586,7 @@ async fn two_drains_apply_a_queued_allocation_exactly_once() {
 /// arrives via the real `SettlementService` (so the settle's own drain competes
 /// with the concurrent sweep over the same SKIP-LOCKED claim). Asserts both
 /// futures return (no deadlock) and the allocation is applied once (one
-/// `payment_allocation` row, `allocated_minor == 300`, queue `APPLIED`).
+/// `payment_allocation` row, `allocated == 300`, queue `APPLIED`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires Docker (testcontainers)"]
 async fn drain_and_sweep_race_without_deadlock() {
@@ -642,13 +654,10 @@ async fn drain_and_sweep_race_without_deadlock() {
         .await
         .unwrap()
         .expect("settlement row present");
-    assert_eq!(
-        row.allocated_minor, 300,
-        "allocated_minor is 300, not doubled"
-    );
+    assert_eq!(row.allocated, usd(300), "allocated is 3.00, not doubled");
     assert_eq!(
         queue_status(&raw, &s, allocation_id).await.as_deref(),
         Some("APPLIED")
     );
-    assert_eq!(ar_invoice_balance(&raw, &s, "INV-A").await, Some(0));
+    assert_eq!(ar_invoice_balance(&raw, &s, "INV-A").await, Some(text(0)));
 }

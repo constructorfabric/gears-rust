@@ -94,7 +94,7 @@ System SHALL store settings as JSON key-value pairs, support nested JSON objects
 **ID**: [ ] `p1` `fdd-user-settings-fr-retrieval-v1`
 
 <!-- fdd-id-content -->
-System SHALL retrieve all settings for a user, retrieve specific setting by key, and return default values for missing settings.
+System SHALL retrieve all settings for a user and retrieve a specific setting by key. For the fixed fields (`theme`, `language`), missing values are returned as defaults (`null`). For named settings, which have no defined default, a key that is not set is reported as not found (404), and it is simply absent from the list of all named settings.
 
 **Actors**: `fdd-user-settings-actor-consumer`
 <!-- fdd-id-content -->

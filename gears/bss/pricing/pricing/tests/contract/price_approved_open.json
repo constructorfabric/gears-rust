@@ -1,0 +1,185 @@
+{
+  "golden": "price_approved_open",
+  "proves": "D-422: an approved price with an open window, as stored - its entry's SKU, charge kind and period, its book and currency, the approval that applied it and when (UTC, as stored); every price model's money as stored (flat, per_unit, graduated and volume bands with an open top band, package); no status or other value computed from today, no authoring internals",
+  "exchanges": [
+    {
+      "case": "the new 15, open",
+      "caller": "the tenant",
+      "request": "GET /bss-pricing/v1/prices/<price:15>",
+      "status": 200,
+      "body": {
+        "price_id": "<price:15>",
+        "price_book_entry_id": "<entry:pro>",
+        "sku_id": "<sku:pro>",
+        "charge_kind": "recurring",
+        "period": "month",
+        "book_id": "<book:eur>",
+        "currency": "EUR",
+        "version_no": 3,
+        "dim_value": null,
+        "model": "flat",
+        "price": {
+          "amount": "15.00"
+        },
+        "min_fee": null,
+        "eligibility": "new",
+        "effective_from": "2026-12-01",
+        "effective_to": null,
+        "temporary_until": null,
+        "keep_for_bound": false,
+        "closed_explicitly": false,
+        "paired_price_id": null,
+        "return_of_price_id": null,
+        "approved_by_unit_id": "<unit:prices-3>",
+        "approved_at": "2026-09-05T09:00:00Z"
+      }
+    },
+    {
+      "case": "the 2027 storage default, open, with a minimum fee",
+      "caller": "the tenant",
+      "request": "GET /bss-pricing/v1/prices/<price:storage-default-2027>",
+      "status": 200,
+      "body": {
+        "price_id": "<price:storage-default-2027>",
+        "price_book_entry_id": "<entry:storage>",
+        "sku_id": "<sku:storage>",
+        "charge_kind": "usage",
+        "period": null,
+        "book_id": "<book:eur>",
+        "currency": "EUR",
+        "version_no": 6,
+        "dim_value": null,
+        "model": "per_unit",
+        "price": {
+          "rate": "0.12"
+        },
+        "min_fee": "5.00",
+        "eligibility": "all",
+        "effective_from": "2027-01-01",
+        "effective_to": null,
+        "temporary_until": null,
+        "keep_for_bound": false,
+        "closed_explicitly": false,
+        "paired_price_id": null,
+        "return_of_price_id": null,
+        "approved_by_unit_id": "<unit:prices-3>",
+        "approved_at": "2026-09-05T09:00:00Z"
+      }
+    },
+    {
+      "case": "a graduated price: a band up to 1000, then an open top band",
+      "caller": "the tenant",
+      "request": "GET /bss-pricing/v1/prices/<price:requests-graduated>",
+      "status": 200,
+      "body": {
+        "price_id": "<price:requests-graduated>",
+        "price_book_entry_id": "<entry:requests>",
+        "sku_id": "<sku:requests>",
+        "charge_kind": "usage",
+        "period": null,
+        "book_id": "<book:eur>",
+        "currency": "EUR",
+        "version_no": 1,
+        "dim_value": null,
+        "model": "graduated",
+        "price": {
+          "tiers": [
+            {
+              "up_to": "1000",
+              "rate": "0.010"
+            },
+            {
+              "up_to": null,
+              "rate": "0.008"
+            }
+          ]
+        },
+        "min_fee": null,
+        "eligibility": "all",
+        "effective_from": "2026-01-01",
+        "effective_to": null,
+        "temporary_until": null,
+        "keep_for_bound": false,
+        "closed_explicitly": false,
+        "paired_price_id": null,
+        "return_of_price_id": null,
+        "approved_by_unit_id": "<unit:prices-1>",
+        "approved_at": "2025-12-15T09:00:00Z"
+      }
+    },
+    {
+      "case": "a volume price: a band up to 1000, then an open top band",
+      "caller": "the tenant",
+      "request": "GET /bss-pricing/v1/prices/<price:requests-volume>",
+      "status": 200,
+      "body": {
+        "price_id": "<price:requests-volume>",
+        "price_book_entry_id": "<entry:requests-volume>",
+        "sku_id": "<sku:requests-volume>",
+        "charge_kind": "usage",
+        "period": null,
+        "book_id": "<book:eur>",
+        "currency": "EUR",
+        "version_no": 1,
+        "dim_value": "eu",
+        "model": "volume",
+        "price": {
+          "tiers": [
+            {
+              "up_to": "1000",
+              "rate": "0.009"
+            },
+            {
+              "up_to": null,
+              "rate": "0.007"
+            }
+          ]
+        },
+        "min_fee": null,
+        "eligibility": "all",
+        "effective_from": "2026-01-01",
+        "effective_to": null,
+        "temporary_until": null,
+        "keep_for_bound": false,
+        "closed_explicitly": false,
+        "paired_price_id": null,
+        "return_of_price_id": null,
+        "approved_by_unit_id": "<unit:prices-1>",
+        "approved_at": "2025-12-15T09:00:00Z"
+      }
+    },
+    {
+      "case": "a package price: 5.00 per 1000",
+      "caller": "the tenant",
+      "request": "GET /bss-pricing/v1/prices/<price:requests-package>",
+      "status": 200,
+      "body": {
+        "price_id": "<price:requests-package>",
+        "price_book_entry_id": "<entry:requests-package>",
+        "sku_id": "<sku:requests-package>",
+        "charge_kind": "usage",
+        "period": null,
+        "book_id": "<book:eur>",
+        "currency": "EUR",
+        "version_no": 1,
+        "dim_value": "us",
+        "model": "package",
+        "price": {
+          "package_size": "1000",
+          "package_price": "5.00"
+        },
+        "min_fee": null,
+        "eligibility": "all",
+        "effective_from": "2026-01-01",
+        "effective_to": null,
+        "temporary_until": null,
+        "keep_for_bound": false,
+        "closed_explicitly": false,
+        "paired_price_id": null,
+        "return_of_price_id": null,
+        "approved_by_unit_id": "<unit:prices-1>",
+        "approved_at": "2025-12-15T09:00:00Z"
+      }
+    }
+  ]
+}

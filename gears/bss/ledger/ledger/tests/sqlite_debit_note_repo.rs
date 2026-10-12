@@ -6,8 +6,8 @@
 //!
 //! Covered:
 //! - **`add_debit_note_total` raises the headroom** (D3 / AC #24): a debit note
-//!   bumps `debit_note_total_minor`, which is the RHS of the headroom CHECK
-//!   (`credit_note_total_minor <= original_total_minor + debit_note_total_minor`),
+//!   bumps `debit_note_total`, which is the RHS of the headroom check
+//!   (`credit_note_total <= original_total + debit_note_total`),
 //!   so the cap for *later credit notes* grows — a credit note that would have been
 //!   over-cap before the debit note now fits, and the one-unit-over is still
 //!   rejected (proving the raise is exactly the debit-note amount).
@@ -31,12 +31,23 @@ use bss_ledger::domain::model::RepoError;
 use bss_ledger::infra::storage::migrations::Migrator;
 use bss_ledger::infra::storage::repo::AdjustmentRepo;
 use bss_ledger::infra::storage::repo::adjustment_repo::NewDebitNote;
+use bss_ledger_sdk::{CurrencySpec, PostedMoney, parse_decimal};
 use sea_orm_migration::MigratorTrait;
 use time::OffsetDateTime;
 use toolkit_db::migration_runner::run_migrations_for_testing;
 use toolkit_db::secure::AccessScope;
 use toolkit_db::{ConnectOpts, DBProvider, DbError, connect_db};
 use uuid::Uuid;
+
+/// USD at scale 2 — the only currency these repo-level tests use.
+fn usd() -> CurrencySpec {
+    CurrencySpec::try_new("USD".to_owned(), 2).expect("USD spec")
+}
+
+/// Validated USD money from canonical major-unit text (`"10"` = ten dollars).
+fn money(text: &str) -> PostedMoney {
+    PostedMoney::try_new(parse_decimal(text).expect("decimal"), usd()).expect("posted money")
+}
 
 /// Connect an in-memory SQLite + run the migrator (the same harness as the
 /// credit-note repo test).
@@ -78,27 +89,27 @@ async fn debit_note_total_raises_headroom_for_credit_notes() {
     let scope = AccessScope::for_tenant(tenant);
     let invoice = "inv-dn-headroom";
 
-    // Seed original_total = 1000 (no debit notes ⇒ headroom = 1000).
+    // Seed original_total = 10 (no debit notes ⇒ headroom = 10).
     let scope_a = scope.clone();
+    let repo = AdjustmentRepo::new(provider.clone());
     provider
         .transaction(move |tx| {
             Box::pin(async move {
-                AdjustmentRepo::seed_exposure_first_touch(
-                    tx, &scope_a, tenant, invoice, "USD", 1000,
-                )
-                .await
-                .map_err(|e| DbError::Other(anyhow::Error::msg(e.to_string())))
+                repo.seed_exposure_first_touch(tx, &scope_a, tenant, invoice, &money("10"))
+                    .await
+                    .map_err(|e| DbError::Other(anyhow::Error::msg(e.to_string())))
             })
         })
         .await
         .expect("seed exposure");
 
-    // Raise the headroom by a 500 debit note ⇒ headroom = 1000 + 500 = 1500.
+    // Raise the headroom by a 5 debit note ⇒ headroom = 10 + 5 = 15.
     let scope_b = scope.clone();
+    let repo = AdjustmentRepo::new(provider.clone());
     provider
         .transaction(move |tx| {
             Box::pin(async move {
-                AdjustmentRepo::add_debit_note_total(tx, &scope_b, tenant, invoice, 500)
+                repo.add_debit_note_total(tx, &scope_b, tenant, invoice, &money("5"))
                     .await
                     .map_err(|e| DbError::Other(anyhow::Error::msg(e.to_string())))
             })
@@ -106,13 +117,14 @@ async fn debit_note_total_raises_headroom_for_credit_notes() {
         .await
         .expect("debit note raises headroom");
 
-    // A 1500 credit note now fits exactly to the raised cap (1000 original + 500
-    // debit) — it WOULD have been over-cap (1500 > 1000) before the debit note.
+    // A 15 credit note now fits exactly to the raised cap (10 original + 5
+    // debit) — it WOULD have been over-cap (15 > 10) before the debit note.
     let scope_c = scope.clone();
+    let repo = AdjustmentRepo::new(provider.clone());
     provider
         .transaction(move |tx| {
             Box::pin(async move {
-                AdjustmentRepo::add_credit_note_total(tx, &scope_c, tenant, invoice, 1500)
+                repo.add_credit_note_total(tx, &scope_c, tenant, invoice, &money("15"))
                     .await
                     .map_err(|e| DbError::Other(anyhow::Error::msg(e.to_string())))
             })
@@ -120,13 +132,14 @@ async fn debit_note_total_raises_headroom_for_credit_notes() {
         .await
         .expect("credit note fits the debit-note-raised headroom");
 
-    // One unit over the raised cap (running credit 1501 > 1500) is rejected —
+    // One cent over the raised cap (running credit 15.01 > 15) is rejected —
     // confirms the headroom was raised by exactly the debit-note amount.
     let scope_d = scope.clone();
+    let repo = AdjustmentRepo::new(provider.clone());
     let res = provider
         .transaction(move |tx| {
             Box::pin(async move {
-                AdjustmentRepo::add_credit_note_total(tx, &scope_d, tenant, invoice, 1)
+                repo.add_credit_note_total(tx, &scope_d, tenant, invoice, &money("0.01"))
                     .await
                     .map_err(repo_to_db)
             })
@@ -143,10 +156,11 @@ async fn add_debit_note_total_requires_a_seeded_row() {
 
     // No seed first ⇒ the bump matches no row and is a Db invariant error.
     let scope_a = scope.clone();
+    let repo = AdjustmentRepo::new(provider.clone());
     let res = provider
         .transaction(move |tx| {
             Box::pin(async move {
-                AdjustmentRepo::add_debit_note_total(tx, &scope_a, tenant, "inv-unseeded", 100)
+                repo.add_debit_note_total(tx, &scope_a, tenant, "inv-unseeded", &money("1"))
                     .await
                     .map_err(repo_to_db)
             })
@@ -172,17 +186,17 @@ async fn debit_note_row_round_trips() {
         tenant_id: tenant,
         debit_note_id: "dn-rt".to_owned(),
         origin_invoice_id: "inv-1".to_owned(),
-        currency: "USD".to_owned(),
-        amount_minor: 1100,
-        recognized_part_minor: 600,
-        deferred_part_minor: 400,
+        amount: money("11"),
+        recognized_part: money("6"),
+        deferred_part: money("4"),
         created_at_utc: OffsetDateTime::now_utc(),
     };
     let scope_a = scope.clone();
+    let repo = AdjustmentRepo::new(provider.clone());
     provider
         .transaction(move |tx| {
             Box::pin(async move {
-                AdjustmentRepo::insert_debit_note(tx, &scope_a, &note)
+                repo.insert_debit_note(tx, &scope_a, &note)
                     .await
                     .map_err(|e| DbError::Other(anyhow::Error::msg(e.to_string())))
             })
@@ -202,17 +216,17 @@ async fn debit_note_row_round_trips() {
         tenant_id: tenant,
         debit_note_id: "dn-rt".to_owned(),
         origin_invoice_id: "inv-1".to_owned(),
-        currency: "USD".to_owned(),
-        amount_minor: 1,
-        recognized_part_minor: 1,
-        deferred_part_minor: 0,
+        amount: money("0.01"),
+        recognized_part: money("0.01"),
+        deferred_part: money("0"),
         created_at_utc: OffsetDateTime::now_utc(),
     };
     let scope_b = scope.clone();
+    let repo = AdjustmentRepo::new(provider.clone());
     let dup = provider
         .transaction(move |tx| {
             Box::pin(async move {
-                AdjustmentRepo::insert_debit_note(tx, &scope_b, &note2)
+                repo.insert_debit_note(tx, &scope_b, &note2)
                     .await
                     .map_err(repo_to_db)
             })

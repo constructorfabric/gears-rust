@@ -8,9 +8,9 @@
 //! for a period — **not** itself the dedup key, keyed by
 //! `(tenant_id, period_id, run_id)`).
 //!
-//! `recognized_minor <= total_deferred_minor` on the schedule is the
+//! `recognized <= total_deferred` on the schedule is the
 //! **authoritative** in-transaction over-recognition guard (design §7); the
-//! `RecognitionRunner` (Phase 2) bumps `recognized_minor` by an in-place delta
+//! `RecognitionRunner` (Phase 2) bumps `recognized` by an in-place delta
 //! under the lock order and the CHECK is evaluated post-delta. The partial
 //! `UNIQUE (tenant_id, source_invoice_id, source_invoice_item_ref,
 //! revenue_stream) WHERE status='ACTIVE'` is the **at-most-one-live** guard (one
@@ -24,7 +24,7 @@
 //! **Lock order.** A recognition post first locks the `CONTRACT_LIABILITY` +
 //! `REVENUE` `account_balance` rows via the Slice 1 projection (the existing
 //! balance-grain order), then the stamp sidecar takes `recognition_schedule`
-//! (the `recognized_minor` delta) BEFORE `recognition_segment` (the `DONE`
+//! (the `recognized` delta) BEFORE `recognition_segment` (the `DONE`
 //! stamp) — one consistent order across all recognition posts, enforced
 //! PROCEDURALLY by the sidecar's call order. These tables are NOT projector
 //! balance grains, so they carry no `GrainTable` rank (the projector ranks stay
@@ -56,21 +56,22 @@ const PG_UP_STATEMENTS: &[&str] = &[
         subscription_ref        varchar(128),
         revenue_stream          varchar(64)   NOT NULL,
         currency                varchar(16)   NOT NULL,
-        total_deferred_minor    bigint        NOT NULL,
-        recognized_minor        bigint        NOT NULL DEFAULT 0,
+        total_deferred              text        NOT NULL CHECK (bss.ledger_decimal_valid(total_deferred, currency_scale)),
+        recognized                  text        NOT NULL DEFAULT '0' CHECK (bss.ledger_decimal_valid(recognized, currency_scale)),
         policy_ref              varchar(256)  NOT NULL,
         ssp_snapshot_ref        varchar(256),
         vc_estimate_ref         varchar(256),
         vc_method_ref           varchar(256),
-        status                  varchar(16)   NOT NULL,
+        status         varchar(16)   NOT NULL,
         version                 bigint        NOT NULL DEFAULT 0,
+        currency_scale              smallint NOT NULL CHECK (currency_scale BETWEEN 0 AND 28),
         PRIMARY KEY (tenant_id, schedule_id),
         CONSTRAINT chk_ledger_recognition_schedule_recognized_nonneg
-            CHECK (recognized_minor >= 0),
+            CHECK (recognized::numeric >= 0),
         CONSTRAINT chk_ledger_recognition_schedule_deferred_nonneg
-            CHECK (total_deferred_minor >= 0),
+            CHECK (total_deferred::numeric >= 0),
         CONSTRAINT chk_ledger_recognition_schedule_recognized_le_deferred
-            CHECK (recognized_minor <= total_deferred_minor),
+            CHECK (recognized::numeric <= total_deferred::numeric),
         CONSTRAINT chk_ledger_recognition_schedule_status
             CHECK (status IN ('ACTIVE','COMPLETED','REPLACED','CANCELLED'))
     )",
@@ -87,13 +88,16 @@ const PG_UP_STATEMENTS: &[&str] = &[
         schedule_id   varchar(128)  NOT NULL,
         segment_no    integer       NOT NULL,
         period_id     varchar(64)   NOT NULL,
-        amount_minor  bigint        NOT NULL,
-        status        varchar(16)   NOT NULL,
+        amount                      text        NOT NULL CHECK (bss.ledger_decimal_valid(amount, currency_scale)),
+        version                 bigint        NOT NULL DEFAULT 0,
+        status         varchar(16)   NOT NULL,
         recognized_at timestamptz,
         run_id        uuid,
+        currency                varchar(16) NOT NULL,
+        currency_scale              smallint NOT NULL CHECK (currency_scale BETWEEN 0 AND 28),
         PRIMARY KEY (tenant_id, schedule_id, segment_no),
         CONSTRAINT chk_ledger_recognition_segment_amount_nonneg
-            CHECK (amount_minor >= 0),
+            CHECK (amount::numeric >= 0),
         CONSTRAINT chk_ledger_recognition_segment_status
             CHECK (status IN ('PENDING','QUEUED','DONE'))
     )",
@@ -131,7 +135,7 @@ const PG_DOWN_STATEMENTS: &[&str] = &[
 
 const SQLITE_UP_STATEMENTS: &[&str] = &[
     "CREATE TABLE ledger_recognition_schedule (
-        tenant_id               text          NOT NULL,
+        tenant_id      text          NOT NULL,
         schedule_id             varchar(128)  NOT NULL,
         payer_tenant_id         text          NOT NULL,
         source_invoice_id       varchar(128)  NOT NULL,
@@ -140,21 +144,20 @@ const SQLITE_UP_STATEMENTS: &[&str] = &[
         subscription_ref        varchar(128),
         revenue_stream          varchar(64)   NOT NULL,
         currency                varchar(16)   NOT NULL,
-        total_deferred_minor    bigint        NOT NULL,
-        recognized_minor        bigint        NOT NULL DEFAULT 0,
+        total_deferred              text        NOT NULL CHECK (length(total_deferred) BETWEEN 1 AND 31),
+        recognized                  text        NOT NULL DEFAULT '0' CHECK (length(recognized) BETWEEN 1 AND 31),
         policy_ref              varchar(256)  NOT NULL,
         ssp_snapshot_ref        varchar(256),
         vc_estimate_ref         varchar(256),
         vc_method_ref           varchar(256),
-        status                  varchar(16)   NOT NULL,
+        status         varchar(16)   NOT NULL,
         version                 bigint        NOT NULL DEFAULT 0,
+        currency_scale              smallint NOT NULL CHECK (currency_scale BETWEEN 0 AND 28),
         PRIMARY KEY (tenant_id, schedule_id),
         CONSTRAINT chk_ledger_recognition_schedule_recognized_nonneg
-            CHECK (recognized_minor >= 0),
+            CHECK (substr(recognized, 1, 1) <> '-'),
         CONSTRAINT chk_ledger_recognition_schedule_deferred_nonneg
-            CHECK (total_deferred_minor >= 0),
-        CONSTRAINT chk_ledger_recognition_schedule_recognized_le_deferred
-            CHECK (recognized_minor <= total_deferred_minor),
+            CHECK (substr(total_deferred, 1, 1) <> '-'),
         CONSTRAINT chk_ledger_recognition_schedule_status
             CHECK (status IN ('ACTIVE','COMPLETED','REPLACED','CANCELLED'))
     )",
@@ -163,17 +166,20 @@ const SQLITE_UP_STATEMENTS: &[&str] = &[
             (tenant_id, source_invoice_id, source_invoice_item_ref, revenue_stream)
         WHERE status = 'ACTIVE'",
     "CREATE TABLE ledger_recognition_segment (
-        tenant_id     text          NOT NULL,
+        tenant_id      text          NOT NULL,
         schedule_id   varchar(128)  NOT NULL,
         segment_no    integer       NOT NULL,
         period_id     varchar(64)   NOT NULL,
-        amount_minor  bigint        NOT NULL,
-        status        varchar(16)   NOT NULL,
+        amount                      text        NOT NULL CHECK (length(amount) BETWEEN 1 AND 31),
+        version                 bigint        NOT NULL DEFAULT 0,
+        status         varchar(16)   NOT NULL,
         recognized_at text,
-        run_id        text,
+        run_id         text,
+        currency                varchar(16) NOT NULL,
+        currency_scale              smallint NOT NULL CHECK (currency_scale BETWEEN 0 AND 28),
         PRIMARY KEY (tenant_id, schedule_id, segment_no),
         CONSTRAINT chk_ledger_recognition_segment_amount_nonneg
-            CHECK (amount_minor >= 0),
+            CHECK (substr(amount, 1, 1) <> '-'),
         CONSTRAINT chk_ledger_recognition_segment_status
             CHECK (status IN ('PENDING','QUEUED','DONE'))
     )",

@@ -29,6 +29,8 @@ pub(crate) mod actions {
     pub const UPDATE: &str = "update";
 }
 
+mod named;
+
 // ============================================================================
 // Service Configuration
 // ============================================================================
@@ -36,12 +38,18 @@ pub(crate) mod actions {
 #[domain_model]
 pub struct ServiceConfig {
     pub max_field_length: usize,
+    /// How many named settings one user may hold in one tenant.
+    pub named_settings_per_user: usize,
+    /// Upper bound on one named setting's value, as serialized JSON bytes.
+    pub named_value_max_bytes: usize,
 }
 
 impl Default for ServiceConfig {
     fn default() -> Self {
         Self {
             max_field_length: 100,
+            named_settings_per_user: 256,
+            named_value_max_bytes: 4096,
         }
     }
 }
@@ -59,6 +67,13 @@ pub struct Service<R: SettingsRepository> {
 }
 
 impl<R: SettingsRepository> Service<R> {
+    /// The configured bound on one named setting's value, as JSON bytes; the
+    /// routes size their request-body limit from it.
+    #[must_use]
+    pub fn named_value_max_bytes(&self) -> usize {
+        self.config.named_value_max_bytes
+    }
+
     pub fn new(
         db: Arc<DbProvider>,
         repo: Arc<R>,
@@ -93,7 +108,11 @@ impl<R: SettingsRepository> Service<R> {
 
         let conn = self.db.conn().map_err(DomainError::from)?;
 
-        if let Some(settings) = self.repo.find_by_user(&conn, &scope).await? {
+        if let Some(settings) = self
+            .repo
+            .find_by_user(&conn, &scope, tenant_id, user_id)
+            .await?
+        {
             Ok(settings)
         } else {
             Ok(SimpleUserSettings {

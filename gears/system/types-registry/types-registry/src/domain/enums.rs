@@ -78,6 +78,29 @@ pub enum LifecycleStatus {
     Deleted,
 }
 
+/// Which lifecycle states a discovery page lists. `Active` is the default: a
+/// tombstone leaves discovery unless asked for.
+#[domain_model]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum LifecycleFilter {
+    #[default]
+    Active,
+    Deleted,
+    All,
+}
+
+impl LifecycleFilter {
+    /// The one status listed, or `None` for both.
+    #[must_use]
+    pub const fn status(self) -> Option<LifecycleStatus> {
+        match self {
+            Self::Active => Some(LifecycleStatus::Active),
+            Self::Deleted => Some(LifecycleStatus::Deleted),
+            Self::All => None,
+        }
+    }
+}
+
 /// What an operation was asked to do (ADR-0012).
 ///
 /// Dry run is **not** a kind: it is orthogonal, carried alongside, and part of the

@@ -159,6 +159,25 @@ fn operation_vendor_extensions(
     ext
 }
 
+/// Build a scalar parameter schema, preserving its format and minimum.
+///
+/// `format` is the token as the document carries it. `SchemaFormat::Custom`
+/// serializes it verbatim, which is what a `KnownFormat` serializes to as well
+/// — `"int64"` here and `SchemaFormat::KnownFormat(KnownFormat::Int64)` build
+/// the same document — so a declaration site states the token and takes no
+/// `utoipa` dependency for it.
+fn param_schema_object(
+    schema_type: SchemaType,
+    format: Option<&str>,
+    minimum: Option<f64>,
+) -> utoipa::openapi::schema::Object {
+    ObjectBuilder::new()
+        .schema_type(schema_type)
+        .format(format.map(|format| SchemaFormat::Custom(format.to_owned())))
+        .minimum(minimum)
+        .build()
+}
+
 /// Implementation of `OpenAPI` registry with lock-free data structures
 pub struct OpenApiRegistryImpl {
     /// Store operation specs keyed by "METHOD:path"
@@ -213,53 +232,7 @@ impl OpenApiRegistryImpl {
 
             // Parameters
             for p in &spec.params {
-                let in_ = match p.location {
-                    operation_builder::ParamLocation::Path => ParameterIn::Path,
-                    operation_builder::ParamLocation::Query => ParameterIn::Query,
-                    operation_builder::ParamLocation::Header => ParameterIn::Header,
-                    operation_builder::ParamLocation::Cookie => ParameterIn::Cookie,
-                };
-                let required =
-                    if matches!(p.location, operation_builder::ParamLocation::Path) || p.required {
-                        Required::True
-                    } else {
-                        Required::False
-                    };
-
-                let schema_type = match p.param_type.as_str() {
-                    "integer" => SchemaType::Type(utoipa::openapi::schema::Type::Integer),
-                    "number" => SchemaType::Type(utoipa::openapi::schema::Type::Number),
-                    "boolean" => SchemaType::Type(utoipa::openapi::schema::Type::Boolean),
-                    _ => SchemaType::Type(utoipa::openapi::schema::Type::String),
-                };
-                let item_object = ObjectBuilder::new().schema_type(schema_type).build();
-
-                let mut builder = ParameterBuilder::new()
-                    .name(&p.name)
-                    .parameter_in(in_)
-                    .required(required)
-                    .description(p.description.clone());
-
-                if p.array {
-                    // `style: form, explode: true` is the repeated-key encoding
-                    // (`?tag=a&tag=b`). Spelling it out matters: the OpenAPI
-                    // default for a query array is `form` with `explode: true`,
-                    // but generators differ on whether they assume it, and the
-                    // wire format has to be unambiguous for a client written
-                    // against this spec to interoperate.
-                    builder = builder
-                        .style(Some(utoipa::openapi::path::ParameterStyle::Form))
-                        .explode(Some(true))
-                        .schema(Some(Schema::Array(
-                            utoipa::openapi::schema::ArrayBuilder::new()
-                                .items(item_object)
-                                .build(),
-                        )));
-                } else {
-                    builder = builder.schema(Some(Schema::Object(item_object)));
-                }
-
-                op = op.parameter(builder.build());
+                op = op.parameter(build_parameter(p));
             }
 
             // Request body
@@ -517,6 +490,62 @@ fn truncate_json(v: &serde_json::Value) -> String {
     }
 }
 
+/// One `ParamSpec` as the document's parameter object.
+fn build_parameter(p: &operation_builder::ParamSpec) -> utoipa::openapi::path::Parameter {
+    let in_ = match p.location {
+        operation_builder::ParamLocation::Path => ParameterIn::Path,
+        operation_builder::ParamLocation::Query => ParameterIn::Query,
+        operation_builder::ParamLocation::Header => ParameterIn::Header,
+        operation_builder::ParamLocation::Cookie => ParameterIn::Cookie,
+    };
+    let required = if matches!(p.location, operation_builder::ParamLocation::Path) || p.required {
+        Required::True
+    } else {
+        Required::False
+    };
+
+    let schema_type = match p.param_type.as_str() {
+        "integer" => SchemaType::Type(utoipa::openapi::schema::Type::Integer),
+        "number" => SchemaType::Type(utoipa::openapi::schema::Type::Number),
+        "boolean" => SchemaType::Type(utoipa::openapi::schema::Type::Boolean),
+        _ => SchemaType::Type(utoipa::openapi::schema::Type::String),
+    };
+    let mut item_object = param_schema_object(schema_type, p.format.as_deref(), p.minimum);
+    // A closed set of values stays a string in the document; the `enum` is
+    // what tells a generated client which ones it may send.
+    if !p.enum_values.is_empty() {
+        item_object = ObjectBuilder::from(item_object)
+            .enum_values(Some(p.enum_values.clone()))
+            .build();
+    }
+
+    let mut builder = ParameterBuilder::new()
+        .name(&p.name)
+        .parameter_in(in_)
+        .required(required)
+        .description(p.description.clone());
+
+    if p.array {
+        // `style: form, explode: true` is the repeated-key encoding
+        // (`?tag=a&tag=b`). Spelling it out matters: the OpenAPI default for a
+        // query array is `form` with `explode: true`, but generators differ on
+        // whether they assume it, and the wire format has to be unambiguous
+        // for a client written against this spec to interoperate.
+        builder = builder
+            .style(Some(utoipa::openapi::path::ParameterStyle::Form))
+            .explode(Some(true))
+            .schema(Some(Schema::Array(
+                utoipa::openapi::schema::ArrayBuilder::new()
+                    .items(item_object)
+                    .build(),
+            )));
+    } else {
+        builder = builder.schema(Some(Schema::Object(item_object)));
+    }
+
+    builder.build()
+}
+
 /// Build the `OpenAPI` content object for a request body schema variant.
 fn build_request_body_content(
     schema: &operation_builder::RequestBodySchema,
@@ -658,8 +687,8 @@ fn collect_refs_from_json(value: &serde_json::Value, refs: &mut HashSet<String>)
 mod tests {
     use super::*;
     use crate::api::operation_builder::{
-        OperationSpec, ParamLocation, ParamSpec, ResponseHeaderSpec, ResponseHeaderType,
-        ResponseSchema, ResponseSpec, VendorExtensions,
+        OperationSpec, ParamSpec, ResponseHeaderSpec, ResponseHeaderType, ResponseSchema,
+        ResponseSpec, VendorExtensions,
     };
     use http::Method;
 
@@ -749,6 +778,52 @@ mod tests {
         let registry = OpenApiRegistryImpl::new();
         assert_eq!(registry.operation_specs.len(), 0);
         assert_eq!(registry.components_registry.load().len(), 0);
+    }
+
+    #[test]
+    fn parameter_formats_are_preserved_in_scalar_and_array_schemas() {
+        use serde_json::json;
+
+        // `int64` is a format `utoipa` knows and `resource-version` is not:
+        // both reach the document as the token the declaration spelled, which
+        // is what lets `ParamSpec::format` be a plain string.
+        for (format, param_type, expected) in [
+            (
+                Some("int64"),
+                "integer",
+                json!({"type": "integer", "format": "int64", "minimum": 1}),
+            ),
+            (
+                Some("resource-version"),
+                "integer",
+                json!({"type": "integer", "format": "resource-version", "minimum": 1}),
+            ),
+            (None, "integer", json!({"type": "integer", "minimum": 1})),
+        ] {
+            for array in [false, true] {
+                let registry = OpenApiRegistryImpl::new();
+                let mut spec = spec_with_response("/test", "get_test", None);
+                let mut param = ParamSpec::query("version")
+                    .required(true)
+                    .param_type(param_type)
+                    .array(array)
+                    .minimum(1.0);
+                if let Some(format) = format {
+                    param = param.format(format);
+                }
+                spec.params.push(param);
+                registry.register_operation(&spec);
+                let doc = registry.build_openapi(&test_info()).expect("build OpenAPI");
+                let json = serde_json::to_value(doc).expect("serialize OpenAPI");
+                let schema = &json["paths"]["/test"]["get"]["parameters"][0]["schema"];
+                let expected_schema = if array {
+                    json!({"type": "array", "items": expected})
+                } else {
+                    expected.clone()
+                };
+                assert_eq!(schema, &expected_schema, "format={format:?}, array={array}");
+            }
+        }
     }
 
     #[test]
@@ -927,14 +1002,7 @@ mod tests {
             summary: Some("Get user by ID".to_owned()),
             description: Some("Retrieves a user by their ID".to_owned()),
             tags: vec!["users".to_owned()],
-            params: vec![ParamSpec {
-                name: "id".to_owned(),
-                location: ParamLocation::Path,
-                required: true,
-                description: Some("User ID".to_owned()),
-                param_type: "string".to_owned(),
-                array: false,
-            }],
+            params: vec![ParamSpec::path("id").description("User ID")],
             request_body: None,
             responses: vec![ResponseSpec {
                 status: 200,

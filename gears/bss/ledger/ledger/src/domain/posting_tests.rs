@@ -1,34 +1,42 @@
 //! Tests for the pure posting invariants ([`super::validate_balanced_entry`]).
 
 use super::*;
+use bss_ledger_sdk::{CurrencySpec, parse_decimal};
 
-fn line(side: Side, amount: i64, payer: Uuid) -> LineFacts {
+fn money(amount: &str, currency: &str, scale: u8) -> PostedMoney {
+    PostedMoney::try_new(
+        parse_decimal(amount).unwrap(),
+        CurrencySpec::try_new(currency.to_owned(), scale).unwrap(),
+    )
+    .unwrap()
+}
+
+fn line(side: Side, amount: &str, payer: Uuid) -> LineFacts {
     LineFacts {
         side,
-        amount_minor: amount,
-        currency: "USD".to_owned(),
-        currency_scale: 2,
+        money: money(amount, "USD", 2),
         payer_tenant_id: payer,
-        functional_amount_minor: None,
+        functional_money: None,
     }
 }
 
 /// A line carrying an explicit functional amount (Slice 5 dual-column tests).
-fn line_f(side: Side, amount: i64, payer: Uuid, functional: Option<i64>) -> LineFacts {
+fn line_f(side: Side, amount: &str, payer: Uuid, functional: Option<&str>) -> LineFacts {
     LineFacts {
         side,
-        amount_minor: amount,
-        currency: "USD".to_owned(),
-        currency_scale: 2,
+        money: money(amount, "USD", 2),
         payer_tenant_id: payer,
-        functional_amount_minor: functional,
+        functional_money: functional.map(|amount| money(amount, "EUR", 2)),
     }
 }
 
 #[test]
 fn balanced_entry_is_ok() {
     let p = Uuid::now_v7();
-    let lines = vec![line(Side::Debit, 1000, p), line(Side::Credit, 1000, p)];
+    let lines = vec![
+        line(Side::Debit, "10.00", p),
+        line(Side::Credit, "10.00", p),
+    ];
     assert!(validate_balanced_entry("USD", &lines).is_ok());
 }
 
@@ -43,7 +51,7 @@ fn empty_is_rejected() {
 #[test]
 fn unbalanced_is_rejected() {
     let p = Uuid::now_v7();
-    let lines = vec![line(Side::Debit, 1000, p), line(Side::Credit, 700, p)];
+    let lines = vec![line(Side::Debit, "10.00", p), line(Side::Credit, "7.00", p)];
     assert_eq!(
         validate_balanced_entry("USD", &lines),
         Err(PostingViolation::Unbalanced)
@@ -53,8 +61,8 @@ fn unbalanced_is_rejected() {
 #[test]
 fn mixed_payer_is_rejected() {
     let lines = vec![
-        line(Side::Debit, 1000, Uuid::now_v7()),
-        line(Side::Credit, 1000, Uuid::now_v7()),
+        line(Side::Debit, "10.00", Uuid::now_v7()),
+        line(Side::Credit, "10.00", Uuid::now_v7()),
     ];
     assert_eq!(
         validate_balanced_entry("USD", &lines),
@@ -65,9 +73,9 @@ fn mixed_payer_is_rejected() {
 #[test]
 fn foreign_currency_line_is_rejected() {
     let p = Uuid::now_v7();
-    let mut eur = line(Side::Credit, 1000, p);
-    eur.currency = "EUR".to_owned();
-    let lines = vec![line(Side::Debit, 1000, p), eur];
+    let mut eur = line(Side::Credit, "10.00", p);
+    eur.money = money("10", "EUR", 2);
+    let lines = vec![line(Side::Debit, "10.00", p), eur];
     assert_eq!(
         validate_balanced_entry("USD", &lines),
         Err(PostingViolation::CurrencyMismatch)
@@ -80,9 +88,9 @@ fn inconsistent_scale_same_currency_is_rejected() {
     // Two USD lines that net to zero but carry different scales: a wrong
     // per-line scale must be rejected, not silently posted at the wrong
     // implied magnitude.
-    let mut hi = line(Side::Credit, 1000, p);
-    hi.currency_scale = 3;
-    let lines = vec![line(Side::Debit, 1000, p), hi];
+    let mut hi = line(Side::Credit, "10.00", p);
+    hi.money = money("10", "USD", 3);
+    let lines = vec![line(Side::Debit, "10.00", p), hi];
     assert_eq!(
         validate_balanced_entry("USD", &lines),
         Err(PostingViolation::InconsistentScale)
@@ -112,7 +120,7 @@ fn each_violation_maps_to_its_domain_error() {
     // CurrencyMismatch has no dedicated variant — surfaces as unbalanced.
     assert!(matches!(
         DomainError::from(PostingViolation::CurrencyMismatch),
-        DomainError::Unbalanced(_)
+        DomainError::CurrencyMismatch(_)
     ));
 }
 
@@ -122,7 +130,10 @@ fn negative_amount_lines_are_rejected_even_when_balanced() {
     // Two negative-amount lines net to zero, but a negative amount violates
     // chk_journal_line_amount (amount > 0, or 0 with a functional amount) —
     // it must be rejected before COMMIT, not surface as a DB constraint fault.
-    let lines = vec![line(Side::Debit, -100, p), line(Side::Credit, -100, p)];
+    let lines = vec![
+        line(Side::Debit, "-1.00", p),
+        line(Side::Credit, "-1.00", p),
+    ];
     assert_eq!(
         validate_balanced_entry("USD", &lines),
         Err(PostingViolation::AmountOutOfRange)
@@ -132,7 +143,7 @@ fn negative_amount_lines_are_rejected_even_when_balanced() {
 #[test]
 fn zero_amount_without_functional_is_rejected() {
     let p = Uuid::now_v7();
-    let lines = vec![line(Side::Debit, 0, p), line(Side::Credit, 0, p)];
+    let lines = vec![line(Side::Debit, "0.00", p), line(Side::Credit, "0.00", p)];
     assert_eq!(
         validate_balanced_entry("USD", &lines),
         Err(PostingViolation::AmountOutOfRange)
@@ -144,8 +155,8 @@ fn functional_only_zero_amount_lines_are_allowed() {
     let p = Uuid::now_v7();
     // Functional-only lines (amount 0 WITH a positive functional amount) are valid
     // and must balance in the functional column — a DR/CR pair nets to zero there.
-    let dr = line_f(Side::Debit, 0, p, Some(500));
-    let cr = line_f(Side::Credit, 0, p, Some(500));
+    let dr = line_f(Side::Debit, "0.00", p, Some("5.00"));
+    let cr = line_f(Side::Credit, "0.00", p, Some("5.00"));
     assert!(validate_balanced_entry("USD", &[dr, cr]).is_ok());
 }
 
@@ -155,8 +166,8 @@ fn zero_amount_with_zero_functional_is_rejected() {
     // Tightened chk_journal_line_amount: a functional-only line must carry a
     // POSITIVE functional amount (the side carries the sign), so functional 0 fails.
     let lines = vec![
-        line_f(Side::Debit, 0, p, Some(0)),
-        line_f(Side::Credit, 0, p, Some(0)),
+        line_f(Side::Debit, "0.00", p, Some("0.00")),
+        line_f(Side::Credit, "0.00", p, Some("0.00")),
     ];
     assert_eq!(
         validate_balanced_entry("USD", &lines),
@@ -169,7 +180,10 @@ fn single_currency_entry_skips_functional_check() {
     let p = Uuid::now_v7();
     // f = 0: no functional amounts → the functional check is skipped, so existing
     // single-currency posts are byte-unaffected.
-    let lines = vec![line(Side::Debit, 1000, p), line(Side::Credit, 1000, p)];
+    let lines = vec![
+        line(Side::Debit, "10.00", p),
+        line(Side::Credit, "10.00", p),
+    ];
     assert!(validate_balanced_entry("USD", &lines).is_ok());
 }
 
@@ -179,8 +193,8 @@ fn cross_currency_functional_balanced_is_ok() {
     // Every line carries a functional amount; BOTH the transaction column
     // (1000 = 1000) and the functional column (1100 = 1100) balance.
     let lines = vec![
-        line_f(Side::Debit, 1000, p, Some(1100)),
-        line_f(Side::Credit, 1000, p, Some(1100)),
+        line_f(Side::Debit, "10.00", p, Some("11.00")),
+        line_f(Side::Credit, "10.00", p, Some("11.00")),
     ];
     assert!(validate_balanced_entry("USD", &lines).is_ok());
 }
@@ -191,8 +205,8 @@ fn functional_unbalanced_is_rejected() {
     // Transaction balances (1000 = 1000) but the functional column does not
     // (1100 != 1090) — the dual-column invariant rejects it.
     let lines = vec![
-        line_f(Side::Debit, 1000, p, Some(1100)),
-        line_f(Side::Credit, 1000, p, Some(1090)),
+        line_f(Side::Debit, "10.00", p, Some("11.00")),
+        line_f(Side::Credit, "10.00", p, Some("10.90")),
     ];
     assert_eq!(
         validate_balanced_entry("USD", &lines),
@@ -206,8 +220,8 @@ fn partial_functional_entry_is_rejected() {
     // 0 < f < len: one line carries functional, the other does not — a posting bug,
     // fail loud rather than silently imbalance the functional column.
     let lines = vec![
-        line_f(Side::Debit, 1000, p, Some(1100)),
-        line_f(Side::Credit, 1000, p, None),
+        line_f(Side::Debit, "10.00", p, Some("11.00")),
+        line_f(Side::Credit, "10.00", p, None),
     ];
     assert_eq!(
         validate_balanced_entry("USD", &lines),
@@ -233,4 +247,34 @@ fn functional_violations_map_to_unbalanced() {
         DomainError::from(PostingViolation::FunctionalUnbalanced),
         DomainError::Unbalanced(_)
     ));
+}
+
+#[test]
+fn balanced_large_intermediates_cancel_exactly() {
+    let payer = Uuid::now_v7();
+    let amount = "99999999999999999999999999.99";
+    let lines = vec![
+        line(Side::Debit, amount, payer),
+        line(Side::Debit, amount, payer),
+        line(Side::Credit, amount, payer),
+        line(Side::Credit, amount, payer),
+    ];
+    assert!(validate_balanced_entry("USD", &lines).is_ok());
+}
+
+#[test]
+fn functional_currency_and_scale_must_agree() {
+    let payer = Uuid::now_v7();
+    let dr = line_f(Side::Debit, "10", payer, Some("11"));
+    let mut cr = line_f(Side::Credit, "10", payer, Some("11"));
+    cr.functional_money = Some(money("11", "GBP", 2));
+    assert_eq!(
+        validate_balanced_entry("USD", &[dr.clone(), cr.clone()]),
+        Err(PostingViolation::CurrencyMismatch)
+    );
+    cr.functional_money = Some(money("11", "EUR", 3));
+    assert_eq!(
+        validate_balanced_entry("USD", &[dr, cr]),
+        Err(PostingViolation::InconsistentScale)
+    );
 }

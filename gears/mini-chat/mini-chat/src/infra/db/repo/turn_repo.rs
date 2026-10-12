@@ -18,6 +18,19 @@ use crate::infra::db::entity::chat_turn::{
 
 pub struct TurnRepository;
 
+/// A running turn is stale when its last progress is older than `cutoff`.
+/// Rows created before `last_progress_at` existed have it NULL and fall back
+/// to `started_at`, so they are still recovered by the watchdog.
+fn stale_progress(cutoff: OffsetDateTime) -> Condition {
+    Condition::any()
+        .add(Column::LastProgressAt.lte(cutoff))
+        .add(
+            Condition::all()
+                .add(Column::LastProgressAt.is_null())
+                .add(Column::StartedAt.lte(cutoff)),
+        )
+}
+
 #[async_trait]
 impl crate::domain::repos::TurnRepository for TurnRepository {
     async fn create_turn<C: DBRunner>(
@@ -257,8 +270,7 @@ impl crate::domain::repos::TurnRepository for TurnRepository {
                 Condition::all()
                     .add(Column::State.eq(TurnState::Running))
                     .add(Column::DeletedAt.is_null())
-                    .add(Column::LastProgressAt.is_not_null())
-                    .add(Column::LastProgressAt.lte(cutoff)),
+                    .add(stale_progress(cutoff)),
             )
             .secure()
             .scope_with(&scope)
@@ -290,7 +302,7 @@ impl crate::domain::repos::TurnRepository for TurnRepository {
                     .add(Column::Id.eq(turn_id))
                     .add(Column::State.eq(TurnState::Running))
                     .add(Column::DeletedAt.is_null())
-                    .add(Column::LastProgressAt.lte(cutoff)),
+                    .add(stale_progress(cutoff)),
             )
             .secure()
             .scope_with(&scope)
@@ -593,6 +605,74 @@ mod tests {
         let candidates = repo.find_orphan_candidates(&conn, 60, 100).await.unwrap();
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].id, turn_id);
+    }
+
+    #[tokio::test]
+    async fn find_orphan_candidates_includes_stale_turn_without_progress() {
+        let db = mock_db_provider(inmem_db().await);
+        let (_, _, turn_id, _) = setup_running_turn(&db).await;
+
+        // A row created before `last_progress_at` existed: NULL progress,
+        // started long ago.
+        let conn = db.conn().unwrap();
+        let past = OffsetDateTime::now_utc() - time::Duration::seconds(600);
+        TurnEntity::update_many()
+            .col_expr(
+                Column::LastProgressAt,
+                sea_orm::sea_query::Expr::value(Option::<OffsetDateTime>::None),
+            )
+            .col_expr(Column::StartedAt, sea_orm::sea_query::Expr::value(past))
+            .filter(Column::Id.eq(turn_id))
+            .secure()
+            .scope_with(&AccessScope::allow_all())
+            .exec(&conn)
+            .await
+            .expect("clear progress");
+
+        let repo = TurnRepository;
+        let candidates = repo.find_orphan_candidates(&conn, 60, 100).await.unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(
+            repo.cas_finalize_orphan(&conn, turn_id, 60).await.unwrap(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn find_orphan_candidates_excludes_recent_turn_without_progress() {
+        let db = mock_db_provider(inmem_db().await);
+        let (_, chat_id, turn_id, request_id) = setup_running_turn(&db).await;
+
+        // NULL progress, but `started_at` is recent (set by create_turn).
+        let conn = db.conn().unwrap();
+        TurnEntity::update_many()
+            .col_expr(
+                Column::LastProgressAt,
+                sea_orm::sea_query::Expr::value(Option::<OffsetDateTime>::None),
+            )
+            .filter(Column::Id.eq(turn_id))
+            .secure()
+            .scope_with(&AccessScope::allow_all())
+            .exec(&conn)
+            .await
+            .expect("clear progress");
+
+        let repo = TurnRepository;
+        let candidates = repo.find_orphan_candidates(&conn, 60, 100).await.unwrap();
+        assert!(
+            candidates.is_empty(),
+            "a recently started turn without progress is not an orphan"
+        );
+        assert_eq!(
+            repo.cas_finalize_orphan(&conn, turn_id, 60).await.unwrap(),
+            0
+        );
+        let turn = repo
+            .find_by_chat_and_request_id(&conn, &AccessScope::allow_all(), chat_id, request_id)
+            .await
+            .unwrap()
+            .expect("turn should exist");
+        assert_eq!(turn.state, TurnState::Running);
     }
 
     #[tokio::test]
