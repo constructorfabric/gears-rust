@@ -92,6 +92,9 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }
 toolkit-security = { workspace = true }
+# GTS id parser: the scope compiler derives a member type's Registry Reference
+# (`GtsId::to_uuid`) for the native group predicates.
+toolkit-gts = { workspace = true }
 # SQL/PGQ syntax layer; optional, pulled in by the `pgq` feature. Nothing
 # outside that feature names its types: `ScopeError::GraphSyntax` carries the
 # syntax layer's message as a `String`, so a gear without a Postgres backend
@@ -142,7 +145,6 @@ harness = false
 required-features = ["_any-backend"]
 
 [dev-dependencies]
-toolkit-gts = { workspace = true }
 strum = { workspace = true }
 criterion = { workspace = true, features = ["html_reports"] }
 tempfile = { workspace = true }
