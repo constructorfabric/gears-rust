@@ -1,67 +1,23 @@
 -- Created:  2026-03-06 by Constructor Tech
 -- Updated:  2026-03-16 by Constructor Tech
 
--- ── GTS type path domain ─────────────────────────────────────────────────────
--- GTS type identifier: single or chained, always ends with ~ (schema, not instance).
--- Format: gts.<vendor>.<package>.<namespace>.<type>.v<MAJOR>[.<MINOR>][~<segment>]*~
--- Spec:   https://github.com/GlobalTypeSystem/gts-spec
-CREATE DOMAIN gts_type_path AS TEXT
-    CHECK (
-        LENGTH(VALUE) <= 1024
-        AND VALUE ~ '^gts\.[a-z_][a-z0-9_]*\.[a-z_][a-z0-9_]*\.[a-z_][a-z0-9_]*\.[a-z_][a-z0-9_]*\.v(0|[1-9][0-9]*)(\.(0|[1-9][0-9]*))?(?:~[a-z_][a-z0-9_]*\.[a-z_][a-z0-9_]*\.[a-z_][a-z0-9_]*\.[a-z_][a-z0-9_]*\.v(0|[1-9][0-9]*)(\.(0|[1-9][0-9]*))?)*~$'
-    );
-
--- ── GTS types ────────────────────────────────────────────────────────────────
-
-CREATE TABLE gts_type (
-    id SMALLINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    schema_id gts_type_path NOT NULL UNIQUE,
-    metadata_schema JSONB,
-    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NULL
-);
-
-COMMENT ON TABLE gts_type
-    IS 'GTS type definitions. Stores raw GTS JSON Schema documents. schema_id = GTS type path ($id without gts:// prefix). can_be_root is resolved at runtime from x-gts-traits in the registered GTS schema (not stored as a column). metadata_schema stores the JSON Schema for the metadata object of instances of this type (e.g. tenant barrier, department category). Surrogate SMALLINT id used as FK from resource_group, resource_group_membership, and junction tables.';
-
--- ── GTS type relationships (junction tables) ─────────────────────────────────
-
-CREATE TABLE gts_type_allowed_parent (
-    type_id        SMALLINT NOT NULL REFERENCES gts_type(id) ON DELETE CASCADE,
-    parent_type_id SMALLINT NOT NULL REFERENCES gts_type(id) ON DELETE CASCADE,
-    PRIMARY KEY (type_id, parent_type_id)
-);
-
-COMMENT ON TABLE gts_type_allowed_parent
-    IS 'Many-to-many: which GTS types are allowed as parents for a given RG type. E.g. department → tenant means departments can be children of tenants.';
-
-CREATE TABLE gts_type_allowed_membership (
-    type_id            SMALLINT NOT NULL REFERENCES gts_type(id) ON DELETE CASCADE,
-    membership_type_id SMALLINT NOT NULL REFERENCES gts_type(id) ON DELETE CASCADE,
-    PRIMARY KEY (type_id, membership_type_id)
-);
-
-COMMENT ON TABLE gts_type_allowed_membership
-    IS 'Many-to-many: which resource types are allowed as members of groups of a given RG type. E.g. branch → user means users can be members of branches.';
-
--- NOTE: The placement invariant (can_be_root OR at least one allowed_parent) is enforced at the
--- application layer. can_be_root is resolved from x-gts-traits in the registered GTS schema.
+-- Reference DDL (PostgreSQL) for the current schema. Resource group types are NOT stored here:
+-- they are GTS Type Schemas in the Types Registry. Rows reference a type by its Types Registry
+-- Registry Reference (UUID) with no foreign key. The tables gts_type, gts_type_allowed_parent,
+-- gts_type_allowed_membership and the gts_type_path domain no longer exist.
 
 -- ── Resource groups ──────────────────────────────────────────────────────────
 
 CREATE TABLE resource_group (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     parent_id UUID,
-    gts_type_id SMALLINT NOT NULL,
+    gts_type_id UUID NOT NULL,
+    is_tenant BOOLEAN NOT NULL,
     name TEXT NOT NULL CHECK (length(name) BETWEEN 1 AND 255),
     metadata JSONB,
     tenant_id UUID NOT NULL,
     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT NULL,
-    CONSTRAINT fk_rg_gts_type
-        FOREIGN KEY (gts_type_id)
-        REFERENCES gts_type(id)
-        ON DELETE RESTRICT,
     CONSTRAINT fk_resource_group_parent
         FOREIGN KEY (parent_id)
         REFERENCES resource_group(id)
@@ -87,12 +43,18 @@ CREATE INDEX idx_rg_gts_type_id
 CREATE INDEX idx_rg_tenant_id
     ON resource_group (tenant_id);
 
+-- At most one tenant root group in the whole deployment.
+CREATE UNIQUE INDEX uq_rg_tenant_root
+    ON resource_group (is_tenant) WHERE parent_id IS NULL AND is_tenant;
+
 COMMENT ON TABLE resource_group
     IS 'Hierarchical resource groups with closure table pattern for efficient ancestor/descendant queries';
 COMMENT ON COLUMN resource_group.parent_id
     IS 'Direct parent group reference; NULL for root groups (e.g. top-level tenants)';
 COMMENT ON COLUMN resource_group.gts_type_id
-    IS 'Reference to gts_type.id defining the type of this resource group';
+    IS 'Types Registry Registry Reference (UUID) of the group type; no foreign key, resolved through the Types Registry';
+COMMENT ON COLUMN resource_group.is_tenant
+    IS 'TRUE when the group type is the platform tenant type; derived from the type id at creation, never changes';
 
 -- ── Closure table ────────────────────────────────────────────────────────────
 
@@ -129,7 +91,7 @@ CREATE INDEX idx_rgc_ancestor_depth
 
 CREATE TABLE resource_group_membership (
     group_id UUID NOT NULL,
-    gts_type_id SMALLINT NOT NULL,
+    gts_type_id UUID NOT NULL,
     resource_id TEXT NOT NULL,
     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
     CONSTRAINT fk_rgm_group_id
@@ -137,13 +99,12 @@ CREATE TABLE resource_group_membership (
         REFERENCES resource_group(id)
         ON UPDATE CASCADE
         ON DELETE RESTRICT,
-    CONSTRAINT fk_rgm_gts_type
-        FOREIGN KEY (gts_type_id)
-        REFERENCES gts_type(id)
-        ON DELETE RESTRICT,
     CONSTRAINT uq_resource_group_membership_unique
         UNIQUE (group_id, gts_type_id, resource_id)
 );
+
+COMMENT ON COLUMN resource_group_membership.gts_type_id
+    IS 'Types Registry Registry Reference (UUID) of the member resource type; no foreign key';
 
 -- ── resource_group_membership indexes ──────────────────────────────────────
 
