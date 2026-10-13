@@ -1,10 +1,16 @@
-//! Reconciled corpus only: seven evaluations and eleven usage-chain guards.
+//! Reconciled corpus only: eight evaluations and eleven usage-chain guards.
+//!
+//! Every price and every expected charge is a major-unit decimal string (`"12.34"`, `"0.047"`)
+//! in canonical spelling. An evaluation is compared as an exact value; it is never narrowed to a
+//! `Decimal`.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
+use bss_money::exact::ExactAmount;
 use bss_pricing::domain::{
     money::{PriceData, Tier, amount_for},
     price::{Eligibility, Price, PriceState, SkuMetering, chain_guard},
     price_book_entry::{ChargeKind, Model},
 };
+use bss_pricing_sdk::numeric;
 use rust_decimal::Decimal;
 use serde::Deserialize;
 use std::{
@@ -33,9 +39,10 @@ struct Snapshot {
     model_kind: Model,
     charge_kind: ChargeKind,
     currency: String,
-    amount_minor: Option<i64>,
+    amount: Option<String>,
+    rate: Option<String>,
     package_size: Option<i64>,
-    package_price_minor: Option<i64>,
+    package_price: Option<String>,
     #[serde(default)]
     bands: Vec<Band>,
     included_allowance: Option<Included>,
@@ -57,7 +64,7 @@ struct Included {
 struct Band {
     from_qty: i64,
     to_qty: Top,
-    unit_amount_minor: i64,
+    rate: String,
 }
 #[derive(Deserialize)]
 #[serde(untagged)]
@@ -71,7 +78,7 @@ struct Given {
 }
 #[derive(Deserialize)]
 struct Expected {
-    charge_minor: Option<i64>,
+    charge: Option<String>,
     publish: Option<String>,
     error_code: Option<String>,
 }
@@ -83,18 +90,38 @@ struct Assertion {
     why: String,
 }
 
+/// A price decimal of the corpus: plain text within the rate limit, in its canonical spelling.
+fn rate(text: &str) -> Decimal {
+    let value = numeric::parse_rate(text).unwrap();
+    assert_eq!(
+        bss_money::canonical_decimal(value),
+        text,
+        "a corpus decimal is written in its canonical spelling"
+    );
+    value
+}
+/// An expected charge: major-unit text, read into an exact value.
+fn charge(text: &str) -> ExactAmount {
+    let value = bss_money::parse_decimal(text).unwrap();
+    assert_eq!(
+        bss_money::canonical_decimal(value),
+        text,
+        "a corpus charge is written in its canonical spelling"
+    );
+    ExactAmount::from_decimal(value)
+}
 fn data(s: &Snapshot) -> PriceData {
     assert!(matches!(s.currency.as_str(), "USD" | "EUR"));
     match s.model_kind {
         Model::Flat => PriceData::Flat {
-            amount: Decimal::new(s.amount_minor.unwrap(), 2),
+            amount: rate(s.amount.as_deref().unwrap()),
         },
         Model::PerUnit => PriceData::PerUnit {
-            rate: Decimal::new(s.amount_minor.unwrap(), 2),
+            rate: rate(s.rate.as_deref().unwrap()),
         },
         Model::Package => PriceData::Package {
             package_size: Decimal::from(s.package_size.unwrap()),
-            package_price: Decimal::new(s.package_price_minor.unwrap(), 2),
+            package_price: rate(s.package_price.as_deref().unwrap()),
         },
         Model::Graduated | Model::Volume => {
             let mut previous = 0;
@@ -115,7 +142,7 @@ fn data(s: &Snapshot) -> PriceData {
                     };
                     Tier {
                         up_to,
-                        rate: Decimal::new(b.unit_amount_minor, 2),
+                        rate: rate(&b.rate),
                     }
                 })
                 .collect();
@@ -130,6 +157,7 @@ fn price(s: &Snapshot, version: i32) -> Price {
         version_no: version,
         dim_value: None,
         model: s.model_kind,
+        currency: bss_money::CurrencySpec::try_new("EUR".into(), 2).unwrap(),
         price: Some(data(s)),
         min_fee: None,
         eligibility: Eligibility::All,
@@ -167,7 +195,7 @@ fn run(path: &str) {
                 .max(Decimal::ZERO);
                 assert_eq!(
                     amount_for(s.model_kind, &data(s), billable).unwrap(),
-                    Decimal::new(a.expect.charge_minor.unwrap(), 2),
+                    charge(a.expect.charge.as_deref().unwrap()),
                     "{path}: {}",
                     a.why
                 );
@@ -232,11 +260,14 @@ fn files(dir: &Path) -> Vec<PathBuf> {
     result
 }
 #[test]
-fn exactly_eighteen_runnable_files() {
+fn exactly_nineteen_runnable_files() {
     let paths = files(&Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden"));
-    assert_eq!(paths.len(), 18);
+    assert_eq!(paths.len(), 19);
     for path in paths {
-        let c: Case = toml::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let text = std::fs::read_to_string(path).unwrap();
+        // The other keys are read leniently, so a minor-unit key left in a case would be ignored.
+        assert!(!text.contains("_minor"), "no case holds a minor-unit key");
+        let c: Case = toml::from_str(&text).unwrap();
         assert!(matches!(c.kind.as_str(), "evaluation" | "publish"));
     }
 }
@@ -254,6 +285,7 @@ case!(
     per_unit_untiered_included_allowance,
     "per-unit/untiered-included-allowance"
 );
+case!(per_unit_sub_minor_rate, "per-unit/sub-minor-rate");
 case!(
     package_repeating_block_roundup,
     "package/repeating-block-roundup"

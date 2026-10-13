@@ -7,6 +7,7 @@ use uuid::Uuid;
 use toolkit_canonical_errors::CanonicalError;
 use toolkit_security::SecurityContext;
 
+use crate::PostedMoney;
 use crate::close::CloseOutcome;
 use crate::posting::{
     AllocateOutcome, AllocatePayment, AllocationView, ArInvoiceBalanceView, BalanceView,
@@ -46,7 +47,7 @@ pub trait LedgerClientV1: Send + Sync {
         ctx: &SecurityContext,
         tenant_id: Uuid,
         account_id: Uuid,
-    ) -> Result<Option<i64>, CanonicalError>;
+    ) -> Result<Option<PostedMoney>, CanonicalError>;
 
     /// List the chart of accounts for a tenant — every account's persistent
     /// `account_id` + coordinate, so a caller can resolve the ids it needs to
@@ -132,15 +133,16 @@ pub trait LedgerClientV1: Send + Sync {
         payer_tenant_id: Option<Uuid>,
     ) -> Result<Vec<ArInvoiceBalanceView>, CanonicalError>;
 
-    /// Provision a tenant's ledger: seed its chart of accounts, non-ISO
-    /// currency scales, fiscal-calendar config, and initial OPEN period in
-    /// one transaction. Idempotent and additive — a re-call leaves existing
-    /// rows untouched and reports them as "existing".
+    /// Provision a tenant's ledger: seed its chart of accounts, currency scales
+    /// (non-ISO codes; an ISO code only at its ISO scale), fiscal-calendar config,
+    /// and initial OPEN period in one transaction. Idempotent and additive — a
+    /// re-call leaves existing rows untouched and reports them as "existing".
     ///
     /// # Errors
     /// A [`CanonicalError`]: `InvalidArgument` on a malformed calendar / empty
-    /// seed or a non-ISO scale beyond the supported headroom; `PermissionDenied`
-    /// when the PEP denies; `Internal` on a storage failure.
+    /// seed or a scale row that gives an ISO 4217 code another scale than its ISO
+    /// scale; `PermissionDenied` when the PEP denies; `Internal` on a storage
+    /// failure.
     async fn provision(
         &self,
         ctx: &SecurityContext,
@@ -179,7 +181,7 @@ pub trait LedgerClientV1: Send + Sync {
     /// Record a settlement return (the reversal of a money-in): claw a
     /// previously-settled receipt back out of the payer's unallocated pool
     /// (`DR UNALLOCATED` / `CR CASH_CLEARING`) and decrement the original
-    /// payment's `settled_minor`. Idempotent on `(tenant, psp_return_id)` — a
+    /// payment's `settled`. Idempotent on `(tenant, psp_return_id)` — a
     /// re-post replays the prior entry with no new ledger effect. Records money
     /// already moved and lands even for a closed payer.
     ///
@@ -293,7 +295,7 @@ pub trait LedgerClientV1: Send + Sync {
 
     /// Operate a tenant's reusable-credit wallet (the wallet surface,
     /// architecture §5.2) — ONE entry point, two kinds. A `Grant` parks
-    /// `amount_minor` of the payer's unallocated pool into the wallet sub-grain
+    /// `money` of the payer's unallocated pool into the wallet sub-grain
     /// (`DR UNALLOCATED` / `CR REUSABLE_CREDIT`), capped at the live pool. An
     /// `Apply` spends the wallet against the named open receivables oldest-grant-
     /// first (`N×DR REUSABLE_CREDIT` / `M×CR AR`), capped on both the receivable

@@ -47,7 +47,7 @@ fn whole_table_when_no_pairs_requested() {
     assert_eq!(rates.len(), 3);
     let usd = rates.iter().find(|r| r.quote == "USD").unwrap();
     assert_eq!(usd.base, "EUR");
-    assert_eq!(usd.rate_micro, 1_085_600);
+    assert_eq!(usd.rate.to_string(), "1.0856");
     assert_eq!(usd.as_of, midnight_utc(2026, 7, 21));
 }
 
@@ -463,4 +463,52 @@ fn unparseable_publication_date_is_reported_as_missing_not_silently_ignored() {
         parse_ecb_xml(BAD_DATE_XML),
         Err(RateProviderError::Internal(_))
     ));
+}
+
+#[test]
+fn xml_quotes_preserve_precision_without_rounding() {
+    let xml = br#"<Envelope><Cube><Cube time="2026-07-21"><Cube currency="USD" rate="1.123456789"/><Cube currency="GBP" rate="0.0000001"/></Cube></Cube></Envelope>"#;
+    let (date, raw) = parse_ecb_xml(xml).unwrap();
+    let rates = ecb_rates_to_provider_rates(date, &raw, &[], PROVIDER).unwrap();
+    assert_eq!(
+        rates
+            .iter()
+            .find(|r| r.quote == "USD")
+            .unwrap()
+            .rate
+            .to_string(),
+        "1.123456789"
+    );
+    assert_eq!(
+        rates
+            .iter()
+            .find(|r| r.quote == "GBP")
+            .unwrap()
+            .rate
+            .to_string(),
+        "0.0000001"
+    );
+}
+
+#[test]
+fn provider_lexical_forms_remain_mappable_from_xml() {
+    let xml = br#"<Envelope><Cube><Cube time="2026-07-21"><Cube currency="USD" rate=" +01.123456789 "/><Cube currency="GBP" rate="000.0000001"/><Cube currency="JPY" rate="1_234.5_6"/></Cube></Cube></Envelope>"#;
+    let (date, raw) = parse_ecb_xml(xml).unwrap();
+    let rates = ecb_rates_to_provider_rates(date, &raw, &[], PROVIDER).unwrap();
+    assert_eq!(rates.len(), 3);
+    for (quote, expected) in [
+        ("USD", "1.123456789"),
+        ("GBP", "0.0000001"),
+        ("JPY", "1234.56"),
+    ] {
+        assert_eq!(
+            rates
+                .iter()
+                .find(|rate| rate.quote == quote)
+                .unwrap()
+                .rate
+                .to_string(),
+            expected
+        );
+    }
 }

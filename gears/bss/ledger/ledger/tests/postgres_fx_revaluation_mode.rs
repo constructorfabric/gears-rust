@@ -1,5 +1,5 @@
 //! Postgres-only integration tests for Group B — the per-tenant FX
-//! revaluation-mode repository (`FxRevaluationModeRepo`, VHP-1986). Exercises the
+//! revaluation-mode repository (`FxRevaluationModeRepo`). Exercises the
 //! effective-dated read/write against a testcontainer Postgres through the REAL
 //! `SecureORM` scoping:
 //!

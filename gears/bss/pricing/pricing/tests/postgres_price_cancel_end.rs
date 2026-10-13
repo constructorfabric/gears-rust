@@ -108,7 +108,7 @@ async fn index_defs(pg: &Pg) -> Vec<String> {
 fn seed() -> Vec<String> {
     let price = |id, version, from, state| {
         format!(
-            "INSERT INTO bss.pricing_price (id,tenant_id,price_book_entry_id,version_no,price_json,eligibility,effective_from,state,created_by,version,created_at,updated_at) VALUES ({},{},{},{version},'{{}}','all','{from}','{state}',{},1,'2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
+            "INSERT INTO bss.pricing_price (id,tenant_id,price_book_entry_id,version_no,price_json,currency,currency_scale,eligibility,effective_from,state,created_by,version,created_at,updated_at) VALUES ({},{},{},{version},'{{}}','EUR',2,'all','{from}','{state}',{},1,'2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
             q(id),
             q(TENANT),
             q(ENTRY),
@@ -152,7 +152,7 @@ async fn down_refuses_an_applied_change_on_its_prices_start(pg: &Pg, narrowed: &
     exec(
         pg,
         &format!(
-            "INSERT INTO bss.pricing_price (id,tenant_id,price_book_entry_id,version_no,price_json,eligibility,effective_from,effective_to,state,change_kind,target_price_id,created_by,version,created_at,updated_at) VALUES ({},{},{},5,'{{}}','all','2026-01-01','2026-02-01','approved','end',{},{},1,'2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
+            "INSERT INTO bss.pricing_price (id,tenant_id,price_book_entry_id,version_no,price_json,currency,currency_scale,eligibility,effective_from,effective_to,state,change_kind,target_price_id,created_by,version,created_at,updated_at) VALUES ({},{},{},5,'{{}}','EUR',2,'all','2026-01-01','2026-02-01','approved','end',{},{},1,'2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
             q(CHANGE),
             q(TENANT),
             q(ENTRY),

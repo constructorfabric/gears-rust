@@ -580,8 +580,8 @@ pub enum AlarmCategory {
     /// — Finance must reconcile it (the `refunded_minor >= 0` CHECK never fired
     /// because the underflow was deferred, not applied). Raised EXPLICITLY by the
     /// `RefundHandler` on the never-reconcile escalation, out-of-band on the
-    /// CANCELLED queue row (an exception stub — full `exception_queue` is Slice 7 /
-    /// VHP-1859), mirroring the `CreditNoteSplitBlocked` explicit raise.
+    /// CANCELLED queue row (an exception stub — full `exception_queue` is Slice 7),
+    /// mirroring the `CreditNoteSplitBlocked` explicit raise.
     ClawbackUnderflow,
     /// A `REFUND_CLEARING` balance aged past the PAGE threshold (14 days, design
     /// §4.4 / §13) — the close-blocking `STUCK_REFUND_CLEARING` exception. The
@@ -590,8 +590,8 @@ pub enum AlarmCategory {
     /// close (the Slice-7 close gate, §4.5) and joins the Payments↔PSP
     /// reconciliation. Raised by the `AgedAlarmJob` alongside an
     /// `// exception stub (full exception_queue is Slice 7)` marker (the
-    /// additive `exception_queue.type = STUCK_REFUND_CLEARING` lands in Slice 7 /
-    /// VHP-1859). `Critical`. Slice 6 catalog seam (the additive type name,
+    /// additive `exception_queue.type = STUCK_REFUND_CLEARING` lands in Slice 7).
+    /// `Critical`. Slice 6 catalog seam (the additive type name,
     /// verbatim).
     StuckRefundClearing,
     /// §4.7 `billrun-partial-failure` — owned by Slice 2.

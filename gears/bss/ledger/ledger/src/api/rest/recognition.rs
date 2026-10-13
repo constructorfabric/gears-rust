@@ -1,6 +1,6 @@
 //! Axum handler + router for the ledger's recognition-run REST surface
 //! (architecture §5, the ASC 606 S6 release). One write operation under
-//! `/bss-ledger/v1`, tenant-scoped WITHOUT a tenant in the path (the vhp-core
+//! `/bss-ledger/v1`, tenant-scoped WITHOUT a tenant in the path (the platform
 //! convention, matching the payment / dispute surfaces): the `tenant_id` is in
 //! the **body**.
 //!
@@ -19,7 +19,7 @@
 //! operation with its declared request / response schemas. Mirrors the
 //! `record_dispute_phase` handler in [`crate::api::rest::disputes`].
 //!
-// TODO(VHP-1855 I4): the benidorm recognition-lifecycle e2e (deferred post →
+// TODO: the recognition-lifecycle e2e (deferred post →
 // run → schedule GET → change) is cluster-gated and lives in the separate e2e
 // suite; not implemented here (it needs a live cluster, out of this slice's
 // build-only scope).
@@ -115,7 +115,7 @@ impl RecognitionApprovalGate for crate::infra::approval::service::ApprovalServic
 pub struct ApiState {
     /// In-process data-access client (the gear's own local impl).
     pub client: Arc<dyn LedgerClientV1>,
-    /// Dual-control gate (VHP-1852): a schedule change/cancel whose un-recognized
+    /// Dual-control gate: a schedule change/cancel whose un-recognized
     /// deferred remainder crosses the D2 threshold routes to the preparer→approver
     /// queue (409); below-threshold changes apply inline. Taken behind
     /// [`RecognitionApprovalGate`] so the gated path is
@@ -223,11 +223,11 @@ pub fn router(state: Arc<ApiState>, openapi: &dyn OpenApiRegistry) -> Router {
             "Returns the recognition schedule named by the path `schedule_id` for \
              the `tenant_id` query (the schedule PK is `(tenant_id, schedule_id)`; \
              the tenant is in the query, like the disaggregation report). The body \
-             is the schedule header (status, version, revenue_stream, currency, \
-             total_deferred_minor, recognized_minor, the originating \
+             is the schedule header (status, version, revenue_stream, \
+             total_deferred and recognized as money objects, the originating \
              source_invoice_id + source_invoice_item_ref invoice-link anchor, \
              po_allocation_group, subscription_ref, policy_ref) plus its segments \
-             (segment_no, period_id, amount_minor, status), ordered by segment_no \
+             (segment_no, period_id, money, status), ordered by segment_no \
              (period order). The read is tenant-scoped (SQL-level BOLA): a schedule \
              outside the caller's authorized subtree — or simply absent — yields a \
              404 (no existence leak).",
@@ -655,7 +655,7 @@ async fn change_recognition_schedule(
     crate::domain::recognition::change::gate_treatment(&cmd.treatment)
         .map_err(CanonicalError::from)?;
 
-    // Dual-control gate (VHP-1852): a schedule change/cancel whose un-recognized
+    // Dual-control gate: a schedule change/cancel whose un-recognized
     // deferred remainder (the revenue it re-plans / strands) crosses the D2
     // threshold routes to the preparer→approver queue (409 DUAL_CONTROL_REQUIRED);
     // a below-threshold change applies inline. The remainder is read from the
@@ -673,9 +673,10 @@ async fn change_recognition_schedule(
             .await?
         && view.status == crate::domain::status::SCHEDULE_STATUS_ACTIVE
     {
-        let affected = view
-            .total_deferred_minor
-            .saturating_sub(view.recognized_minor);
+        // The unreleased remainder, exact in the schedule's currency and scale
+        // (a scale/currency disagreement between the two stored totals is a
+        // named error, never an implicit conversion).
+        let affected = schedule_change_governed_amount(&view).map_err(CanonicalError::from)?;
         let intent = crate::domain::approval::intent::ApprovalIntent::RecognitionScheduleChange(
             crate::domain::approval::intent::RecognitionScheduleChangeIntent {
                 tenant_id: cmd.tenant_id,
@@ -688,7 +689,7 @@ async fn change_recognition_schedule(
                         .map(
                             |s| crate::domain::approval::intent::RecognitionChangeSegment {
                                 period_id: s.period_id.clone(),
-                                amount_minor: s.amount_minor,
+                                amount: s.money.clone(),
                             },
                         )
                         .collect()
@@ -697,7 +698,7 @@ async fn change_recognition_schedule(
         );
         let facts = crate::domain::approval::policy::OperationFacts {
             kind: crate::domain::approval::ApprovalKind::RecognitionScheduleChange,
-            amount_usd_eq_minor: Some(affected),
+            amount: Some(affected),
             effective_at: None,
             has_outstanding_balance: false,
         };
@@ -722,6 +723,16 @@ async fn change_recognition_schedule(
 
     let result = state.client.change_recognition_schedule(&ctx, cmd).await?;
     Ok(Json(ScheduleChangeResponse::from(result)))
+}
+
+/// The governed amount of a schedule change: the unreleased deferred remainder
+/// `total_deferred − recognized`, exact in the schedule's currency and scale (a
+/// scale/currency disagreement between the two stored totals is a named error,
+/// never an implicit conversion).
+fn schedule_change_governed_amount(
+    view: &bss_ledger_sdk::RecognitionScheduleView,
+) -> Result<bss_ledger_sdk::PostedMoney, crate::domain::error::DomainError> {
+    crate::domain::exact_money::subtract_posted(&view.total_deferred, &view.recognized)
 }
 
 /// `GET /recognition-runs/{run_id}` query parameters: the run's owning seller
@@ -816,3 +827,7 @@ async fn list_recognition_runs(
         page_info: page.page_info,
     }))
 }
+
+#[cfg(test)]
+#[path = "recognition_governed_tests.rs"]
+mod governed_tests;

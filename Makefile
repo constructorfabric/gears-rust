@@ -721,7 +721,7 @@ OPENAPI_BUILD_FEATURE_ARGS := $(if $(GEAR),$(GEAR_OPENAPI_FEATURE_ARGS),$(OPENAP
 
 # -------- Tests --------
 
-.PHONY: test test-no-macros test-macros test-sqlite test-pg test-pgq test-mysql test-db test-users-info-pg test-usage-collector-pg test-usage-collector-ch test-quota-enforcement-pg test-types-registry-db test-cluster-pg test-cluster-redis test-cluster-k8s coverage-cluster-k8s test-rg-pg test-settings-service-pg test-pricing-pg test-coord-pg test-products-pg test-fixtures-narrow test-fips
+.PHONY: test test-no-macros test-macros test-sqlite test-pg test-pgq test-mysql test-db test-users-info-pg test-usage-collector-pg test-usage-collector-ch test-quota-enforcement-pg test-types-registry-db test-cluster-pg test-cluster-redis test-cluster-k8s coverage-cluster-k8s test-rg-pg test-settings-service-pg test-pricing-pg test-coord-pg test-products-pg test-ledger-pg test-fixtures-narrow test-fips
 
 # Run all tests, or a single gear when GEAR=<gear> is set.
 # When GEAR= is set, cargo gears ls packages finds matching crates + their
@@ -1003,6 +1003,17 @@ test-coord-pg: install-tools
 ## found, not the first.
 test-products-pg: install-tools
 	$(call nextest_run,products-pg,-p cf-gears-bss-products --run-ignored ignored-only -E 'binary(/^postgres_/)' --no-fail-fast)
+
+## Run bss-ledger's Postgres tier (Docker required; testcontainers).
+##
+## Same `--run-ignored ignored-only` shape as pricing, coord and products: the ledger tests that
+## need a database are `#[ignore]` with a Docker reason — the `postgres_*` and
+## `rest_*` binaries and the lib's `pg` modules — so there is no binary filter.
+## One ignored test is not a Docker test: `grain_fold_timing` is a manual timing helper that
+## prints a cost. It is excluded by name, so do not add it back.
+## `--no-fail-fast` for the reason the pricing target gives.
+test-ledger-pg: install-tools
+	$(call nextest_run,ledger-pg,-p cf-gears-bss-ledger --run-ignored ignored-only -E 'not test(grain_fold_timing)' --no-fail-fast)
 
 ## Run the Redis cluster plugin's conformance (Layer 2) and Layer 3 integration
 ## suites (Docker required; each spins up its own redis container via

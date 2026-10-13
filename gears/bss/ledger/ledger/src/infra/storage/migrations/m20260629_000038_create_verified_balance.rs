@@ -1,5 +1,5 @@
 //! Create the cumulative tie-out baseline table in schema `bss`:
-//! `ledger_verified_balance` (VHP-1843 incremental tie-out). One row per
+//! `ledger_verified_balance` (the incremental tie-out). One row per
 //! `(tenant_id, grain, grain_key)` holding the cumulative VERIFIED balance
 //! through the last closed period. Written atomically in the period-close
 //! SERIALIZABLE txn right after the clean full tie-out passes (the closing
@@ -28,10 +28,13 @@ const PG_UP_STATEMENTS: &[&str] = &[
         tenant_id              uuid         NOT NULL,
         grain                  varchar(32)  NOT NULL,
         grain_key              varchar(512) NOT NULL,
-        verified_balance_minor bigint       NOT NULL,
+        verified_balance            text       NOT NULL CHECK (bss.ledger_decimal_valid(verified_balance, currency_scale)),
         through_period         varchar(64)  NOT NULL,
         watermark_seq          bigint       NOT NULL,
         updated_at_utc         timestamptz  NOT NULL,
+        currency                    varchar(16) NOT NULL,
+        currency_scale              smallint NOT NULL CHECK (currency_scale BETWEEN 0 AND 28),
+        version                     bigint NOT NULL DEFAULT 0,
         PRIMARY KEY (tenant_id, grain, grain_key),
         CONSTRAINT chk_verified_balance_grain CHECK (grain IN (
             'account', 'ar_payer', 'ar_invoice', 'ar_invoice_disputed',
@@ -55,10 +58,13 @@ const SQLITE_UP_STATEMENTS: &[&str] = &[
         tenant_id              text         NOT NULL,
         grain                  varchar(32)  NOT NULL,
         grain_key              varchar(512) NOT NULL,
-        verified_balance_minor bigint       NOT NULL,
+        verified_balance            text       NOT NULL CHECK (length(verified_balance) BETWEEN 1 AND 31),
         through_period         varchar(64)  NOT NULL,
         watermark_seq          bigint       NOT NULL,
         updated_at_utc         text         NOT NULL,
+        currency                    varchar(16) NOT NULL,
+        currency_scale              smallint NOT NULL CHECK (currency_scale BETWEEN 0 AND 28),
+        version                     bigint NOT NULL DEFAULT 0,
         PRIMARY KEY (tenant_id, grain, grain_key),
         CONSTRAINT chk_verified_balance_grain CHECK (grain IN (
             'account', 'ar_payer', 'ar_invoice', 'ar_invoice_disputed',

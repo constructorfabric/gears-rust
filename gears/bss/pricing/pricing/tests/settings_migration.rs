@@ -4,11 +4,10 @@
 //!
 //! A file database is migrated by the gear's whole list without 000014 — the chain the deployment runs
 //! today — and holds one tenant's settings row, written with the encodings the application writes
-//! (a `Uuid` is a 16-byte blob; the timestamps are copied from a row the repository wrote). Its
-//! rounding is a value outside today's set (D-437), as a legacy row may hold. Then the whole list
-//! runs again and applies 000014 alone; the structure is proved by the schema dump and the table
-//! text, the row by its columns, and the application's own doors read and write it. The Postgres
-//! twin is `postgres_settings_migration.rs`.
+//! (a `Uuid` is a 16-byte blob; the timestamps are copied from a row the repository wrote). Then
+//! the whole list runs again and applies 000014 alone; the structure is proved by the schema dump
+//! and the table text, the row by its columns, and the application's own doors read and write it.
+//! The Postgres twin is `postgres_settings_migration.rs`.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 mod entry_support;
@@ -180,9 +179,9 @@ async fn seeded() -> Lite {
     .await
     .unwrap();
     db.exec(&format!(
-        "INSERT INTO pricing_settings (tenant_id, default_timing, default_rounding, default_gl, \
+        "INSERT INTO pricing_settings (tenant_id, default_timing, default_gl, \
          default_tax_category, invoice_line_templates, version, created_at, updated_at) \
-         VALUES (X'{}', 'arrears', 'bankers', 'GL-1', 'std', '{{\"usage\":\"{{sku}} usage\"}}', 3, \
+         VALUES (X'{}', 'arrears', 'GL-1', 'std', '{{\"usage\":\"{{sku}} usage\"}}', 3, \
          (SELECT created_at FROM pricing_price_book), (SELECT updated_at FROM pricing_price_book))",
         TENANT.simple()
     ))
@@ -257,9 +256,8 @@ async fn the_forward_migration_adds_currencies_and_updated_by_and_keeps_the_row(
 }
 
 /// The migrated row through the application: a legacy row reads `currencies: []` and no
-/// `updated_by`; its rounding outside today's set is read back as stored and refused on a PUT
-/// that keeps it (why the deploy pre-flight is a hard gate, D-437); a PUT with a mode of the set
-/// is accepted and stamps the writer.
+/// `updated_by`; a PUT that sends the read back with a currency list is accepted and stamps the
+/// writer.
 #[tokio::test]
 async fn the_application_reads_and_rewrites_a_migrated_row() {
     let db = seeded().await;
@@ -274,7 +272,10 @@ async fn the_application_reads_and_rewrites_a_migrated_row() {
     let (s, read, tag) = request(&app, &ctx, "GET", "/settings", json!({}), None, None).await;
     assert_eq!(s, 200, "{read}");
     assert_eq!(tag, "\"3\"");
-    assert_eq!(read["default_rounding"], "bankers");
+    assert!(
+        read.get("default_rounding").is_none(),
+        "no rounding setting"
+    );
     assert_eq!(read["currencies"], json!([]));
     assert!(read["updated_by"].is_null(), "{read}");
     assert!(read["updated_at"].is_string(), "{read}");
@@ -282,22 +283,6 @@ async fn the_application_reads_and_rewrites_a_migrated_row() {
     for field in ["version", "updated_at", "updated_by"] {
         body.as_object_mut().unwrap().remove(field);
     }
-    let (s, refused, _) = request(
-        &app,
-        &ctx,
-        "PUT",
-        "/settings",
-        body.clone(),
-        Some(&tag),
-        None,
-    )
-    .await;
-    assert_eq!(s, 400, "{refused}");
-    assert!(
-        refused.to_string().contains("ROUNDING_INVALID"),
-        "{refused}"
-    );
-    body["default_rounding"] = json!("half_even");
     body["currencies"] = json!(["EUR"]);
     let (s, saved, _) = request(&app, &ctx, "PUT", "/settings", body, Some(&tag), None).await;
     assert_eq!(s, 200, "{saved}");

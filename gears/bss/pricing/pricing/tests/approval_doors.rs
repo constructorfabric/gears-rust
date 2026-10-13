@@ -160,7 +160,7 @@ impl Gov {
         let mut r = entry_support::price(&p);
         r.version_no = version_no;
         r.state = "approved".into();
-        r.price_json = json!({"rate":"0.20"});
+        r.price_json = json!({"rate":"0.2"});
         r.effective_from =
             time::Date::parse(from, &time::format_description::well_known::Iso8601::DATE).unwrap();
         price_repo::insert(&conn, &scope, r).await.unwrap().id
@@ -1437,7 +1437,7 @@ async fn an_entry_with_only_draft_or_rejected_prices_is_deleted_with_them() {
     assert_eq!(card["state"], "rejected");
     assert_eq!(
         card["snapshot"]["prices"][0]["after"]["price"],
-        json!({"rate":"0.10"}),
+        json!({"rate":"0.1"}),
         "the rejected proposal's history survives its price"
     );
 }

@@ -1,4 +1,4 @@
-//! Dual-control governance domain (VHP-1852): the approval `kind` discriminator,
+//! Dual-control governance domain: the approval `kind` discriminator,
 //! the `PENDING → APPROVED | REJECTED | NEEDS_REWORK | CANCELLED | EXPIRED` state
 //! type, and the pure threshold-policy resolver ([`policy`]). The state-machine
 //! transition rules and the `preparer ≠ approver` enforcement live with the

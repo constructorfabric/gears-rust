@@ -20,6 +20,7 @@ pub mod exceptions;
 pub mod fx;
 pub mod fx_revaluation_mode;
 pub mod journal_entries;
+pub mod money;
 pub(crate) mod odata_list;
 pub mod payers;
 pub mod payments;
@@ -28,3 +29,6 @@ pub mod provisioning;
 pub mod recognition;
 pub mod reconciliation;
 pub mod refunds;
+
+#[cfg(test)]
+mod money_tests;

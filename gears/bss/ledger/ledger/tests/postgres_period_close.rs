@@ -28,7 +28,6 @@ use std::sync::Arc;
 
 use bss_ledger::domain::error::DomainError;
 use bss_ledger::domain::model::{AccountRow, CurrencyScaleRow, NewEntry, NewLine};
-use bss_ledger::domain::money::DEFAULT_PLAUSIBLE_MAX_MAJOR;
 use bss_ledger::infra::events::publisher::LedgerEventPublisher;
 use bss_ledger::infra::period_close::PeriodCloseService;
 use bss_ledger::infra::posting::service::PostingService;
@@ -47,6 +46,16 @@ use uuid::Uuid;
 
 fn pg(sql: impl Into<String>) -> Statement {
     Statement::from_string(sea_orm::DatabaseBackend::Postgres, sql.into())
+}
+
+/// A USD scale-2 posting from a cent count (`1234` ⇒ `12.34`): the old
+/// minor-unit fixtures expressed as validated major-unit money.
+fn usd_cents(minor: i64) -> bss_ledger_sdk::PostedMoney {
+    bss_ledger_sdk::PostedMoney::try_new(
+        rust_decimal::Decimal::new(minor, 2),
+        bss_ledger_sdk::CurrencySpec::try_new("USD".to_owned(), 2).unwrap(),
+    )
+    .unwrap()
 }
 
 /// Read the `status` of a `(tenant, le, period)` fiscal-period row.
@@ -105,8 +114,7 @@ async fn setup(
         .upsert_currency_scale(CurrencyScaleRow {
             tenant_id: tenant,
             currency: "USD".to_owned(),
-            minor_units: 2,
-            plausible_max_major: DEFAULT_PLAUSIBLE_MAX_MAJOR,
+            currency_scale: 2,
             source: "iso".to_owned(),
         })
         .await
@@ -208,15 +216,12 @@ fn line(f: &Fixture, account: Uuid, class: AccountClass, side: Side, amount: i64
         account_class: class,
         gl_code: None,
         side,
-        amount_minor: amount,
-        currency: "USD".to_owned(),
-        currency_scale: 2,
+        money: usd_cents(amount),
         invoice_id: None,
         due_date: None,
         revenue_stream: None,
         mapping_status: MappingStatus::Resolved,
-        functional_amount_minor: None,
-        functional_currency: None,
+        functional_money: None,
         tax_jurisdiction: None,
         tax_filing_period: None,
         tax_rate_ref: None,
@@ -262,7 +267,7 @@ async fn close_blocked_by_tieout_variance() {
 
     // Drift one cached grain so the pre-close tie-out fails.
     raw.execute_raw(pg(format!(
-        "UPDATE bss.ledger_account_balance SET balance_minor = balance_minor + 1 \
+        "UPDATE bss.ledger_account_balance SET balance = (balance::numeric + 0.01)::text \
          WHERE tenant_id='{}' AND account_id='{}' AND currency='USD'",
         f.tenant, f.ar_account
     )))
@@ -450,8 +455,8 @@ async fn close_blocked_by_due_recognition_segment() {
     // Seed one due-but-not-DONE recognition segment in the closing period.
     raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_recognition_segment \
-         (tenant_id, schedule_id, segment_no, period_id, amount_minor, status) \
-         VALUES ('{}','SCH-D',1,'{}',1000,'PENDING')",
+         (tenant_id, schedule_id, segment_no, period_id, currency, currency_scale, amount, status) \
+         VALUES ('{}','SCH-D',1,'{}','USD',2,'10','PENDING')",
         f.tenant, f.period_id
     )))
     .await

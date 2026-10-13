@@ -1,24 +1,31 @@
 use bss_ledger_sdk::{
-    BillRunFinishedV1, IssuedInvoiceManifest, IssuedInvoiceManifestV1, PspSettlementFeedV1,
-    PspSettlementReport,
+    BillRunFinishedV1, CurrencySpec, GrossTotals, IssuedInvoiceManifest, IssuedInvoiceManifestV1,
+    PostedMoney, PspSettlementFeedV1, PspSettlementReport, parse_decimal,
 };
 use uuid::Uuid;
 
 use super::InProcessControlFeeds;
 
+fn eur(amount: &str) -> PostedMoney {
+    PostedMoney::try_new(
+        parse_decimal(amount).unwrap(),
+        CurrencySpec::try_new("EUR".to_owned(), 2).unwrap(),
+    )
+    .unwrap()
+}
+
 fn manifest() -> IssuedInvoiceManifest {
     IssuedInvoiceManifest {
         invoice_ids: vec!["inv-1".to_owned(), "inv-2".to_owned()],
         count: 2,
-        gross_total_minor: 4_200,
+        gross_totals: GrossTotals::try_new(vec![eur("42")]).unwrap(),
     }
 }
 
 fn report() -> PspSettlementReport {
     PspSettlementReport {
         report_id: "psp-rep-1".to_owned(),
-        settled_minor: 9_900,
-        currency: "EUR".to_owned(),
+        settled: eur("99"),
     }
 }
 
@@ -102,7 +109,7 @@ async fn ingest_overwrites_prior_manifest() {
     let newer = IssuedInvoiceManifest {
         invoice_ids: vec!["inv-9".to_owned()],
         count: 1,
-        gross_total_minor: 100,
+        gross_totals: GrossTotals::try_new(vec![eur("1")]).unwrap(),
     };
     feeds.ingest_manifest(tenant, "2026-06", newer.clone());
     assert_eq!(

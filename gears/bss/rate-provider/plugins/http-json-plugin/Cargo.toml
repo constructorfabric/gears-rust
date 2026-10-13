@@ -29,7 +29,8 @@ async-trait = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }
-serde_json = { workspace = true }
+# `raw_value` keeps each JSON number token exact (see infra::exact_json).
+serde_json = { workspace = true, features = ["raw_value"] }
 # RFC3339 parse of the publication timestamp.
 time = { workspace = true }
 # `SecretString` for `api_key`: redacts on Debug/log, matches the

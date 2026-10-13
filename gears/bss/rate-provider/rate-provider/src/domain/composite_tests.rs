@@ -74,7 +74,7 @@ impl RateProviderV1 for Fake {
             None => Ok(vec![ProviderRate {
                 base: "EUR".to_owned(),
                 quote: "USD".to_owned(),
-                rate_micro: 1_000_000,
+                rate: bss_ledger_sdk::parse_decimal("1").unwrap(),
                 as_of: OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap(),
                 // Each source stamps its own id — this is what the ledger
                 // records, so the fake must behave like a real source.

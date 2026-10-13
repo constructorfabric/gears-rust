@@ -477,8 +477,8 @@ gears:
   bss-ledger:
     # Gear-specific database (SQLite for E2E, like the other user gears; the
     # gear ships dual PG/SQLite migrations). The defaults
-    # (events_enabled=false, seller_tenant_types=partner+platform) are correct
-    # for E2E; only the recon lifecycle knob below is overridden.
+    # (events_enabled=false) are correct for E2E; the seller types are not (see
+    # below), and the recon lifecycle knob is overridden too.
     # `fx.provider_vendor` also defaults to "cf.bss", the same default the core
     # `bss-rate-provider` gear advertises as its `vendor`, so the commented FX
     # example above lines up without further edits.
@@ -486,6 +486,11 @@ gears:
       server: "sqlite_users"
       file: "bss_ledger.db"
     config:
+      # The ledger-owner tenant types. The defaults name other vendors' partner and platform
+      # types; the E2E AM root (`account-management` `root_tenant_type`) is the platform type
+      # below, and the suite provisions and posts as that root.
+      seller_tenant_types:
+        - "gts.cf.core.am.tenant_type.v1~cf.core.am.platform.v1~"
       recon:
         # E2E binds `static-tr-plugin`, which knows only its fixed tenants, so
         # tenants created at runtime through AM are absent from the resolver's

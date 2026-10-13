@@ -57,6 +57,8 @@ pub async fn insert(
         version_no: Set(m.version_no),
         dim_value: Set(m.dim_value),
         price_json: Set(m.price_json),
+        currency: Set(m.currency),
+        currency_scale: Set(m.currency_scale),
         min_fee: Set(m.min_fee),
         eligibility: Set(m.eligibility),
         effective_from: Set(m.effective_from),
@@ -185,7 +187,9 @@ pub async fn list(
         .await
         .map_err(|e| driver_failure("list price".into(), e))
 }
-/// Change business columns only if the caller's version still owns the row.
+/// Change business columns only if the caller's version still owns the row. The caller sets
+/// `currency_scale` to the table's current scale of the price's currency: an edited draft takes
+/// the scale of today (the currency itself never changes).
 /// # Errors
 /// Zero matches is a typed version conflict; database failures preserve their type.
 pub async fn update_draft(
@@ -202,6 +206,7 @@ pub async fn update_draft(
         .scope_with(scope)
         .col_expr(e::Column::DimValue, Expr::value(m.dim_value))
         .col_expr(e::Column::PriceJson, Expr::value(m.price_json))
+        .col_expr(e::Column::CurrencyScale, Expr::value(m.currency_scale))
         .col_expr(e::Column::MinFee, Expr::value(m.min_fee))
         .col_expr(e::Column::Eligibility, Expr::value(m.eligibility))
         .col_expr(e::Column::EffectiveFrom, Expr::value(m.effective_from))
@@ -486,30 +491,87 @@ pub async fn delete_draft(
         .map_err(|e| driver_failure("delete draft".into(), e))?;
     matched(result.rows_affected, "STALE_REVISION")
 }
+/// The currency spec a price was stored with: its code and the scale the currency table gave it
+/// then. A code that is not a currency code or a scale outside 0 to 28 is a corrupt row; the
+/// current table is never read.
+/// # Errors
+/// Returns `CorruptRow` naming the column and the cause.
+pub fn currency_of(m: &e::Model) -> Result<bss_money::CurrencySpec, RepoError> {
+    let corrupt = |column: &str, cause: &str| {
+        RepoError::CorruptRow(format!("price {} {column}: {cause}", m.id))
+    };
+    if !crate::domain::book::currency_code(&m.currency) {
+        return Err(corrupt(
+            "currency",
+            &format!("{:?} is not three uppercase letters", m.currency),
+        ));
+    }
+    let scale = u8::try_from(m.currency_scale).map_err(|_| {
+        corrupt(
+            "currency_scale",
+            &format!("{} is outside 0 to 28", m.currency_scale),
+        )
+    })?;
+    bss_money::CurrencySpec::try_new(m.currency.clone(), scale).map_err(|error| match error {
+        bss_money::MoneyError::ScaleOutOfRange => {
+            corrupt("currency_scale", &format!("{scale} is outside 0 to 28"))
+        }
+        other => corrupt("currency", &other.to_string()),
+    })
+}
+/// The stored columns of a currency spec: its code and its scale.
+#[must_use]
+pub fn currency_columns(spec: &bss_money::CurrencySpec) -> (String, i16) {
+    (spec.code().to_owned(), i16::from(spec.scale()))
+}
 /// Decode a stored price into the pure model, in its ENTRY's model (D-427: a price has no model
 /// of its own; the caller passes `price_book_entry_repo::model_of` of the price's entry). Unknown
-/// vocabulary, or money whose shape is not the entry's model, is a corrupt row.
+/// vocabulary, money whose shape is not the entry's model, a decimal that is not canonical text
+/// within its limit, or a currency spec [`currency_of`] refuses, is a corrupt row. A read that
+/// knows the price's book uses [`in_book`], which also checks the currency against the book's.
 /// # Errors
-/// Returns `CorruptRow` for a stored enum or price shape the model does not know.
+/// Returns `CorruptRow` for a stored enum or price shape the model does not know, for a stored
+/// decimal that `money::decode_stored` or `money::stored_fee` refuses (naming the field and why),
+/// for a stored minimum fee off the increment of the row's own `currency_scale`, or for a stored
+/// currency spec [`currency_of`] refuses.
 pub fn to_domain(
     m: &e::Model,
     model: crate::domain::price_book_entry::Model,
 ) -> Result<crate::domain::price::Price, RepoError> {
     use crate::domain::{money, price};
     let corrupt = |what: &str| RepoError::CorruptRow(format!("price {} {what}", m.id));
+    let currency = currency_of(m)?;
+    // A stored fee is canonical, not negative, and on the increment of the price's own stored
+    // scale (D-527): the door judged it on that scale, so any other value is a corrupt row.
+    let min_fee = m
+        .min_fee
+        .as_deref()
+        .map(|fee| {
+            let value = money::stored_fee(fee).ok_or_else(|| {
+                corrupt(&format!(
+                    "min_fee: {fee:?} is not canonical, non-negative decimal text"
+                ))
+            })?;
+            bss_pricing_sdk::numeric::validate_minimum_fee(value, &currency).map_err(|_| {
+                corrupt(&format!(
+                    "min_fee: {fee} is off the increment of currency_scale {}",
+                    currency.scale()
+                ))
+            })
+        })
+        .transpose()?;
     Ok(price::Price {
         id: m.id,
         price_book_entry_id: m.price_book_entry_id,
         version_no: m.version_no,
         dim_value: m.dim_value.clone(),
         model,
-        price: Some(money::decode(model, m.price_json.clone()).map_err(|_| corrupt("price_json"))?),
-        min_fee: m
-            .min_fee
-            .as_deref()
-            .map(str::parse)
-            .transpose()
-            .map_err(|_| corrupt("min_fee"))?,
+        currency,
+        price: Some(
+            money::decode_stored(model, m.price_json.clone())
+                .map_err(|e| corrupt(&format!("price_json: {e} ({})", e.code())))?,
+        ),
+        min_fee,
         eligibility: m.eligibility.parse().map_err(|_| corrupt("eligibility"))?,
         effective_from: m.effective_from,
         effective_to: m.effective_to,
@@ -519,6 +581,26 @@ pub fn to_domain(
         closed_explicitly: m.closed_explicitly,
         state: m.state.parse().map_err(|_| corrupt("state"))?,
     })
+}
+/// A stored price of a book whose currency is `book_currency`, decoded as [`to_domain`] decodes
+/// it. The price stores a copy of its book's currency, so the copy must equal it. Every read that
+/// serves a stored price, and the approval judge, read the row through here.
+/// # Errors
+/// Every refusal of [`to_domain`], and `CorruptRow` for a price whose currency is not its book's.
+pub fn in_book(
+    m: &e::Model,
+    model: crate::domain::price_book_entry::Model,
+    book_currency: &str,
+) -> Result<crate::domain::price::Price, RepoError> {
+    let price = to_domain(m, model)?;
+    if price.currency.code() != book_currency {
+        return Err(RepoError::CorruptRow(format!(
+            "price {} currency: {} is not its book's {book_currency}",
+            m.id,
+            price.currency.code()
+        )));
+    }
+    Ok(price)
 }
 /// Point a freshly inserted draft at its pair partner, without a version step.
 /// The partner must exist first: the pair reference is a foreign key.

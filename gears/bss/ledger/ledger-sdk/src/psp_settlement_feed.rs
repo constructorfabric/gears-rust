@@ -8,6 +8,7 @@
 //! the settlement reconciliation is inert until the feed lands; design §0 decision 3),
 //! mirroring [`crate::UnconfiguredRateProviderV1`].
 
+use crate::PostedMoney;
 use async_trait::async_trait;
 use uuid::Uuid;
 
@@ -19,10 +20,8 @@ use crate::issued_invoice_manifest::ControlFeedError;
 pub struct PspSettlementReport {
     /// External PSP report identity (idempotency grain for ingest).
     pub report_id: String,
-    /// Net settled amount in minor units the PSP reports for the period (net of refunds/returns).
-    pub settled_minor: i64,
-    /// ISO-4217 currency of the report.
-    pub currency: String,
+    /// Net settled major-unit money reported for the period (net of refunds/returns).
+    pub settled: PostedMoney,
 }
 
 /// Read port for the PSP settlement report (call-driven; the ledger never pulls a

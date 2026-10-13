@@ -1,6 +1,6 @@
 {
   "golden": "resolve_invoice_inputs",
-  "proves": "D-421: each invoice input carries its source - the invoice line from the entry's override, else the SKU version's template, else the tenant template for the charge kind (an item without an entry: its SKU's type), else null; GL code, tax category and billing timing from the SKU version, else the tenant (PRD AC #13: advance on the SKU beats arrears as the tenant default); a SKU Products does not know has no version; the revision carries the book's currency and scale and the tenant's rounding",
+  "proves": "D-421: each invoice input carries its source - the invoice line from the entry's override, else the SKU version's template, else the tenant template for the charge kind (an item without an entry: its SKU's type), else null; GL code, tax category and billing timing from the SKU version, else the tenant (PRD AC #13: advance on the SKU beats arrears as the tenant default); a SKU Products does not know has no version; the revision carries the book's currency and scale",
   "exchanges": [
     {
       "case": "revision 1 on 2026-09-15: the entry's line, the tenant's line, no line at all",
@@ -14,8 +14,6 @@
         "state": "superseded",
         "book_id": "<book:eur>",
         "currency": "EUR",
-        "currency_minor_digits": 2,
-        "rounding_policy": "half_even",
         "date": "2026-09-15",
         "items": [
           {
@@ -58,8 +56,10 @@
                   "price_id": "<price:10>",
                   "dim_used": null,
                   "pinned_from": null,
+                  "currency": "EUR",
+                  "currency_scale": 2,
                   "price": {
-                    "amount": "10.00"
+                    "amount": "10"
                   },
                   "min_fee": null,
                   "eligibility": "all",
@@ -112,10 +112,12 @@
                   "price_id": "<price:storage-default>",
                   "dim_used": null,
                   "pinned_from": null,
+                  "currency": "EUR",
+                  "currency_scale": 2,
                   "price": {
-                    "rate": "0.10"
+                    "rate": "0.1"
                   },
-                  "min_fee": "5.00",
+                  "min_fee": "5",
                   "eligibility": "all",
                   "effective_from": "2026-01-01",
                   "effective_to": "2027-01-01",
@@ -131,6 +133,8 @@
                   "price_id": "<price:storage-eu>",
                   "dim_used": "eu",
                   "pinned_from": null,
+                  "currency": "EUR",
+                  "currency_scale": 2,
                   "price": {
                     "rate": "0.08"
                   },
@@ -150,10 +154,12 @@
                   "price_id": "<price:storage-default>",
                   "dim_used": null,
                   "pinned_from": null,
+                  "currency": "EUR",
+                  "currency_scale": 2,
                   "price": {
-                    "rate": "0.10"
+                    "rate": "0.1"
                   },
-                  "min_fee": "5.00",
+                  "min_fee": "5",
                   "eligibility": "all",
                   "effective_from": "2026-01-01",
                   "effective_to": "2027-01-01",
@@ -169,10 +175,12 @@
                   "price_id": "<price:storage-default>",
                   "dim_used": null,
                   "pinned_from": null,
+                  "currency": "EUR",
+                  "currency_scale": 2,
                   "price": {
-                    "rate": "0.10"
+                    "rate": "0.1"
                   },
-                  "min_fee": "5.00",
+                  "min_fee": "5",
                   "eligibility": "all",
                   "effective_from": "2026-01-01",
                   "effective_to": "2027-01-01",
@@ -188,6 +196,8 @@
                   "price_id": "<price:storage-latam-temp>",
                   "dim_used": "latam",
                   "pinned_from": null,
+                  "currency": "EUR",
+                  "currency_scale": 2,
                   "price": {
                     "rate": "0.05"
                   },
@@ -248,8 +258,6 @@
         "state": "published",
         "book_id": "<book:eur>",
         "currency": "EUR",
-        "currency_minor_digits": 2,
-        "rounding_policy": "half_even",
         "date": "2026-09-15",
         "items": [
           {
@@ -297,6 +305,8 @@
                   "price_id": "<price:egress-eu>",
                   "dim_used": "eu",
                   "pinned_from": null,
+                  "currency": "EUR",
+                  "currency_scale": 2,
                   "price": {
                     "rate": "0.02"
                   },
@@ -316,6 +326,8 @@
                   "price_id": "<price:egress-us>",
                   "dim_used": "us",
                   "pinned_from": null,
+                  "currency": "EUR",
+                  "currency_scale": 2,
                   "price": {
                     "rate": "0.03"
                   },
@@ -335,6 +347,8 @@
                   "price_id": "<price:egress-apac-temp>",
                   "dim_used": "apac",
                   "pinned_from": null,
+                  "currency": "EUR",
+                  "currency_scale": 2,
                   "price": {
                     "rate": "0.01"
                   },
@@ -369,8 +383,6 @@
         "state": "published",
         "book_id": "<book:eur>",
         "currency": "EUR",
-        "currency_minor_digits": 2,
-        "rounding_policy": "half_even",
         "date": "2026-09-15",
         "items": [
           {

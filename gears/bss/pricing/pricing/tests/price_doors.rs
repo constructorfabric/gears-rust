@@ -98,7 +98,7 @@ async fn approved(
     price.version_no = version_no;
     price.state = "approved".into();
     price.dim_value = dim.map(str::to_owned);
-    price.price_json = json!({"rate":"0.20"});
+    price.price_json = json!({"rate":"0.2"});
     price.effective_from =
         time::Date::parse(from, &time::format_description::well_known::Iso8601::DATE).unwrap();
     price_repo::insert(&conn, &scope, price).await.unwrap().id
@@ -128,7 +128,7 @@ async fn a_draft_price_is_created_once_per_key_and_numbered_per_entry() {
     assert_eq!(price["state"], "draft");
     assert_eq!(price["status"], "draft");
     assert_eq!(price["version_no"], 1);
-    assert_eq!(price["price_json"], json!({"rate":"0.10"}));
+    assert_eq!(price["price_json"], json!({"rate":"0.1"}));
     assert_eq!(price["created_by"], f.ctx.subject_id().to_string());
     assert!(price["pending_unit_id"].is_null());
     assert_eq!(
@@ -197,7 +197,7 @@ async fn a_temporary_price_on_an_owned_chain_is_a_pair_that_returns_to_the_price
     assert!(ret["effective_to"].is_null());
     assert_eq!(
         ret["price_json"],
-        json!({"rate":"0.20"}),
+        json!({"rate":"0.2"}),
         "the return copies the price in force"
     );
     assert_eq!(ret["note"], "spring promo");
@@ -252,7 +252,7 @@ async fn pure_rule_refusals_answer_400_with_their_codes_and_no_price() {
         (
             &package,
             json!({"price":{"package_size":"0","package_price":"5"},"eligibility":"all","effective_from":"2031-05-01"}),
-            "PACKAGE_FIELDS_INVALID",
+            "AMOUNT_INVALID",
         ),
         (
             &graduated,
@@ -445,7 +445,7 @@ async fn patch_and_delete_touch_only_unlocked_drafts_at_their_version() {
     assert_eq!(changed.0, 200, "{changed:?}");
     assert_eq!(changed.2, "\"2\"");
     assert_eq!(changed.1["price_json"], json!({"rate":"0.12"}));
-    assert_eq!(changed.1["min_fee"], "30.00");
+    assert_eq!(changed.1["min_fee"], "30");
     assert_eq!(changed.1["effective_from"], "2031-01-15");
     let stale = f
         .call(
@@ -516,6 +516,64 @@ async fn patch_and_delete_touch_only_unlocked_drafts_at_their_version() {
             .0,
         404
     );
+}
+
+/// PATCH `min_fee` has three states: omitted keeps the stored fee, `null` clears it, and a value
+/// replaces it. Each answer is checked against the stored row.
+#[tokio::test]
+async fn a_patch_keeps_an_omitted_fee_and_clears_a_null_one() {
+    let (f, entry) = priced(false).await;
+    let mut body = draft("2031-01-01");
+    body["min_fee"] = json!("1.50");
+    let created = f
+        .call("POST", &prices_path(&entry), body, None, Some("fee"))
+        .await;
+    assert_eq!(created.0, 201, "the draft with a fee is created");
+    assert_eq!(
+        created.1["items"][0]["min_fee"], "1.5",
+        "the draft has a fee"
+    );
+    let id: Uuid = created.1["items"][0]["id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let path = format!("/prices/{id}");
+    let tenant = f.ctx.subject_tenant_id();
+    let stored_fee = || async {
+        price_repo::find(
+            &f.db.conn().unwrap(),
+            &AccessScope::for_tenant(tenant),
+            tenant,
+            id,
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .min_fee
+    };
+    let kept = f
+        .call(
+            "PATCH",
+            &path,
+            json!({"note":"the fee is not named"}),
+            Some(&created.2),
+            None,
+        )
+        .await;
+    assert_eq!(kept.0, 200, "a PATCH without the fee is accepted");
+    assert_eq!(kept.1["min_fee"], "1.5", "an omitted fee is kept");
+    assert_eq!(
+        stored_fee().await.as_deref(),
+        Some("1.5"),
+        "the stored fee is kept"
+    );
+    let cleared = f
+        .call("PATCH", &path, json!({"min_fee":null}), Some(&kept.2), None)
+        .await;
+    assert_eq!(cleared.0, 200, "a null fee is accepted");
+    assert!(cleared.1["min_fee"].is_null(), "a null fee clears it");
+    assert_eq!(stored_fee().await, None, "the stored fee is cleared");
 }
 
 #[tokio::test]
@@ -706,6 +764,87 @@ async fn money_as_a_json_number_is_refused_and_the_detail_says_strings() {
     assert!(b.to_string().contains("AMOUNT_INVALID"), "{b}");
 }
 
+// Each decimal refusal says its own cause: a JSON number is told to send a string, bad text to
+// send plain decimal text, a value over a limit names the limit, a sign names the field.
+#[tokio::test]
+async fn each_decimal_refusal_says_its_cause() {
+    let (f, entry) = priced(false).await;
+    let package = beside(&f, &entry, "package").await;
+    for (n, (target, price, code, says, never)) in [
+        (
+            &entry,
+            json!({"rate": 0.047}),
+            "AMOUNT_INVALID",
+            "JSON strings",
+            "plain decimal text",
+        ),
+        (
+            &entry,
+            json!({"rate": "1e-3"}),
+            "AMOUNT_INVALID",
+            "plain decimal text",
+            "JSON strings",
+        ),
+        (
+            &entry,
+            json!({"rate": " 0.047"}),
+            "AMOUNT_INVALID",
+            "plain decimal text",
+            "JSON strings",
+        ),
+        (
+            &entry,
+            json!({"rate": "0.0000000000001"}),
+            "AMOUNT_OUT_OF_RANGE",
+            "12 fractional places",
+            "JSON strings",
+        ),
+        (
+            &entry,
+            json!({"rate": "-1"}),
+            "AMOUNT_INVALID",
+            "rate must not be negative",
+            "JSON strings",
+        ),
+        (
+            &package,
+            json!({"package_size": "0", "package_price": "5"}),
+            "AMOUNT_INVALID",
+            "package_size must be above zero",
+            "PACKAGE_FIELDS_INVALID",
+        ),
+        (
+            &package,
+            json!({"package_size": "10", "package_price": "-5"}),
+            "AMOUNT_INVALID",
+            "package_price must not be negative",
+            "PACKAGE_FIELDS_INVALID",
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut body = draft("2031-03-01");
+        body["price"] = price;
+        let (status, b, _) = f
+            .call(
+                "POST",
+                &prices_path(target),
+                body,
+                None,
+                Some(&format!("cause-{n}")),
+            )
+            .await;
+        assert_eq!(status, 400, "a decimal refusal is 400");
+        assert!(code_in(&b, code), "the refusal carries its code");
+        assert!(b.to_string().contains(says), "the message says its cause");
+        assert!(
+            !b.to_string().contains(never),
+            "the message says no other cause"
+        );
+    }
+}
+
 // dod-if-match-version (PRD AC #25): at every PATCH/PUT door a successful update moves the
 // ETag, the old token is 409 STALE_REVISION with nothing written, and no token is a
 // precondition failure.
@@ -773,7 +912,7 @@ async fn every_conditional_door_answers_a_stale_token_with_stale_revision() {
         (
             "PUT",
             "/settings".to_owned(),
-            json!({"default_timing":"arrears","default_rounding":"half_up","invoice_line_templates":{},"currencies":[]}),
+            json!({"default_timing":"arrears","invoice_line_templates":{},"currencies":[]}),
             settings_tag,
         ),
         (

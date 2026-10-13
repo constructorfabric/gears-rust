@@ -89,14 +89,20 @@ async fn boot(url: &str) -> (DatabaseConnection, DBProvider<DbError>) {
 //   - debit_note:      amount/recognized/deferred >= 0;
 //   - dispute:         variant∈{CASH_HOLD,AR_RECLASS},
 //                      last_phase∈{OPENED,WON,LOST,PARTIAL}, cycle>=1,
-//                      cash_hold_minor <= disputed_amount_minor;
+//                      cash_hold <= disputed_amount;
 //   - recognition_run: status∈{RUNNING,DONE,FAILED};
 //   - journal_entry:   origin∈{SYSTEM,USER} + a balanced 2-line body (the deferred
 //                      balance trigger rejects a zero-line / unbalanced header at
 //                      COMMIT — so a header is seeded with two balancing lines).
 
+/// The canonical stored TEXT of a USD cent count (`1000` ⇒ `"10"`).
+fn cents_text(minor: i64) -> String {
+    bss_ledger_sdk::canonical_decimal(usd_cents(minor).amount())
+}
+
 /// Seed a `ledger_refund` row (surrogate PK `(tenant, refund_id)`; natural UNIQUE
 /// `(tenant, psp_refund_id, phase)`). Pattern A (`invoice_id` NULL) by default.
+/// `amount` is a USD cent count.
 async fn seed_refund(
     raw: &DatabaseConnection,
     tenant: Uuid,
@@ -108,9 +114,10 @@ async fn seed_refund(
     raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_refund \
          (tenant_id, refund_id, psp_refund_id, phase, pattern, payment_id, currency, \
-          amount_minor, clearing_state, created_at_utc) \
+          currency_scale, amount, clearing_state, created_at_utc) \
          VALUES ('{tenant}','{refund_id}','{psp_refund_id}','initiated','A_UNALLOCATED', \
-                 '{payment_id}','USD',{amount},'PENDING', now())"
+                 '{payment_id}','USD',2,'{amount}','PENDING', now())",
+        amount = cents_text(amount)
     )))
     .await
     .unwrap();
@@ -127,9 +134,10 @@ async fn seed_credit_note(
     raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_credit_note \
          (tenant_id, credit_note_id, origin_invoice_id, revenue_stream, currency, \
-          amount_minor, reason_code, created_at_utc) \
+          currency_scale, amount, reason_code, created_at_utc) \
          VALUES ('{tenant}','{credit_note_id}','{origin_invoice_id}','subscription','USD', \
-                 {amount},'CUSTOMER_GOODWILL', now())"
+                 2,'{amount}','CUSTOMER_GOODWILL', now())",
+        amount = cents_text(amount)
     )))
     .await
     .unwrap();
@@ -145,15 +153,17 @@ async fn seed_debit_note(
 ) {
     raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_debit_note \
-         (tenant_id, debit_note_id, origin_invoice_id, currency, amount_minor, created_at_utc) \
-         VALUES ('{tenant}','{debit_note_id}','{origin_invoice_id}','USD',{amount}, now())"
+         (tenant_id, debit_note_id, origin_invoice_id, currency, currency_scale, amount, \
+          created_at_utc) \
+         VALUES ('{tenant}','{debit_note_id}','{origin_invoice_id}','USD',2,'{amount}', now())",
+        amount = cents_text(amount)
     )))
     .await
     .unwrap();
 }
 
 /// Seed an OPEN `ledger_dispute` row (`(tenant, dispute_id)` PK).
-/// `cash_hold_minor <= disputed_amount_minor` satisfies the table CHECK. Mirrors
+/// `cash_hold <= disputed_amount` satisfies the table CHECK. Mirrors
 /// `postgres_refund_dispute_hold.rs::open_dispute`.
 async fn seed_dispute(
     raw: &DatabaseConnection,
@@ -164,10 +174,11 @@ async fn seed_dispute(
 ) {
     raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_dispute \
-         (tenant_id, dispute_id, payment_id, currency, variant, last_phase, cycle, \
-          disputed_amount_minor, cash_hold_minor, version) \
-         VALUES ('{tenant}','{dispute_id}','{payment_id}','USD','CASH_HOLD','OPENED',1, \
-                 {disputed},{disputed},0)"
+         (tenant_id, dispute_id, payment_id, currency, currency_scale, variant, last_phase, \
+          cycle, disputed_amount, cash_hold, version) \
+         VALUES ('{tenant}','{dispute_id}','{payment_id}','USD',2,'CASH_HOLD','OPENED',1, \
+                 '{disputed}','{disputed}',0)",
+        disputed = cents_text(disputed)
     )))
     .await
     .unwrap();
@@ -187,6 +198,18 @@ async fn seed_run(raw: &DatabaseConnection, tenant: Uuid, run_id: Uuid, period_i
 /// Seed a `ledger_dual_control_policy` version (`(tenant, version)` PK). `d2`/`a6`/
 /// `ttl` must satisfy the migration range CHECKs (`d2 ∈ [10000, 100000000]`,
 /// `a6 ∈ [1, 30]`, `ttl > 0`). `effective_from` is an RFC-3339 instant.
+/// A USD scale-2 amount from a cent count (`200_000` ⇒ `2000.00`): the old
+/// minor-unit policy fixtures expressed as validated major-unit money.
+fn usd_cents(minor: i64) -> bss_ledger_sdk::PostedMoney {
+    bss_ledger_sdk::PostedMoney::try_new(
+        rust_decimal::Decimal::new(minor, 2),
+        bss_ledger_sdk::CurrencySpec::try_new("USD".to_owned(), 2).unwrap(),
+    )
+    .unwrap()
+}
+
+/// Seed one policy version with a single USD@2 D2 threshold of `d2` cents (the
+/// per-currency child row the repo joins back into `d2_thresholds`).
 async fn seed_policy(
     raw: &DatabaseConnection,
     tenant: Uuid,
@@ -198,9 +221,17 @@ async fn seed_policy(
 ) {
     raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_dual_control_policy \
-         (tenant_id, version, effective_from, d2_threshold_minor, \
+         (tenant_id, version, effective_from, \
           a6_backdating_biz_days, pending_ttl_seconds, created_at_utc) \
-         VALUES ('{tenant}',{version},'{effective_from}',{d2},{a6},{ttl}, now())"
+         VALUES ('{tenant}',{version},'{effective_from}',{a6},{ttl}, now())"
+    )))
+    .await
+    .unwrap();
+    raw.execute_raw(pg(format!(
+        "INSERT INTO bss.ledger_dual_control_policy_threshold \
+         (tenant_id, version, currency, currency_scale, amount) \
+         VALUES ('{tenant}',{version},'USD',2,'{amount}')",
+        amount = bss_ledger_sdk::canonical_decimal(usd_cents(d2).amount())
     )))
     .await
     .unwrap();
@@ -233,10 +264,11 @@ async fn seed_journal_entry(
         txn.execute_raw(pg(format!(
             "INSERT INTO bss.ledger_journal_line \
                 (line_id, entry_id, tenant_id, period_id, payer_tenant_id, account_id, \
-                 account_class, side, amount_minor, currency, currency_scale, mapping_status) \
+                 account_class, side, amount, currency, currency_scale, mapping_status) \
              VALUES ('{}','{entry_id}','{tenant}','{period_id}','{tenant}','{tenant}', \
-                     'AR','{side}',{amount},'USD',2,'RESOLVED')",
-            Uuid::now_v7()
+                     'AR','{side}','{amount}','USD',2,'RESOLVED')",
+            Uuid::now_v7(),
+            amount = cents_text(amount)
         )))
         .await
         .unwrap();
@@ -768,9 +800,12 @@ async fn dual_control_policy_effective_read_resolves_and_is_scoped() {
     assert_eq!(versions.len(), 2, "A sees exactly its own 2 versions");
     let effective = effective_version(&versions, now).expect("a version is in force");
     assert_eq!(effective.version, 2, "the latest effective_from wins");
-    assert_eq!(effective.policy.d2_threshold_minor, 200_000);
-    assert_eq!(effective.policy.a6_backdating_biz_days, 7);
-    assert_eq!(effective.policy.pending_ttl_seconds, 3_600);
+    assert_eq!(
+        effective.policy.d2_thresholds().clone().into_vec(),
+        vec![usd_cents(200_000)]
+    );
+    assert_eq!(effective.policy.a6_backdating_biz_days(), 7);
+    assert_eq!(effective.policy.pending_ttl_seconds(), 3_600);
 
     // BOLA: A's scope reading B's tenant resolves to no rows (no value/existence leak).
     let cross = repo

@@ -189,13 +189,13 @@ async fn payment_tables_created_on_up_and_dropped_on_down() {
     // `Migrator::down` reverts in REVERSE of the `migrations()` Vec order (not name
     // order): payment is at Vec position 6 of 45, so reverting down to-and-including
     // it is 45 − 6 + 1 = 40 steps. (Magic count — recompute when a migration is
-    // added: it grew 9 → 24 → 28 → 29 → 31 → 34 → 35 → 36 → 38 → 39 → 40 over the VHP-1858
+    // added: it grew 9 → 24 → 28 → 29 → 31 → 34 → 35 → 36 → 38 → 39 → 40 over the Slice-6
     // audit block + the S3 adjustment/note migrations + the Slice-5 FX substrate (incl.
     // the S5-F3 functional-currency column + the Slice-5 remediation cache-consistency and
     // snapshot-identity migrations) + the Slice-7 reconciliation/period-close substrate
-    // + the exception-queue OPEN-uniq remediation index + the VHP-1853 posting-policy
-    // table + the VHP-1843 verified-balance baseline + the C3 fx-revaluation-run marker
-    // + the VHP-1986 fx-revaluation-mode table + the currency-scale immutability trigger,
+    // + the exception-queue OPEN-uniq remediation index + the posting-policy
+    // table + the verified-balance baseline + the C3 fx-revaluation-run marker
+    // + the fx-revaluation-mode table + the currency-scale immutability trigger,
     // all appended AFTER payment in the Vec.)
     Migrator::down(&db, Some(40))
         .await
@@ -246,13 +246,13 @@ async fn pending_event_queue_created_on_up_and_dropped_on_down() {
     // `migrations()` Vec order (not name order): the queue is at Vec position 8 of
     // 45, so reverting down to-and-including it is 45 − 8 + 1 = 38 steps. (Magic
     // count — recompute when a migration is added after the queue in the Vec: it
-    // grew 7 → 22 → 26 → 27 → 29 → 32 → 33 → 36 → 37 → 38 over the VHP-1858 audit block + the
+    // grew 7 → 22 → 26 → 27 → 29 → 32 → 33 → 36 → 37 → 38 over the Slice-6 audit block + the
     // S3 adjustment/note migrations + the Slice-5 FX substrate (incl. the S5-F3
     // functional-currency column + the Slice-5 remediation cache-consistency and
     // snapshot-identity migrations) + the Slice-7 reconciliation/period-close substrate
-    // + the exception-queue OPEN-uniq remediation index + the VHP-1853 posting-policy
-    // table + the VHP-1843 verified-balance baseline + the C3 fx-revaluation-run marker
-    // + the VHP-1986 fx-revaluation-mode table + the currency-scale immutability trigger.)
+    // + the exception-queue OPEN-uniq remediation index + the posting-policy
+    // table + the verified-balance baseline + the C3 fx-revaluation-run marker
+    // + the fx-revaluation-mode table + the currency-scale immutability trigger.)
     Migrator::down(&db, Some(38))
         .await
         .expect("down reverses the last 38 migrations (to before the queue)");

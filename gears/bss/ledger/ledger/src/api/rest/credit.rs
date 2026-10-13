@@ -1,6 +1,6 @@
 //! Axum handler + router for the ledger's reusable-credit (wallet) REST surface
 //! (architecture §5.2). ONE operation under `/bss-ledger/v1`, tenant-scoped
-//! WITHOUT a tenant in the path (the vhp-core convention, matching the
+//! WITHOUT a tenant in the path (the platform convention, matching the
 //! payment / journal-entry / provisioning surfaces): the write carries
 //! `tenant_id` in the **body**.
 //!
@@ -43,7 +43,7 @@ const TAG: &str = "BSS Ledger Credit";
 pub struct ApiState {
     /// In-process data-access client (the gear's own local impl).
     pub client: Arc<dyn LedgerClientV1>,
-    /// Dual-control lifecycle engine (VHP-1852): the grant gate routes a
+    /// Dual-control lifecycle engine: the grant gate routes a
     /// high-value credit grant to the preparer→approver queue. `None` disables
     /// the gate (router unit tests without a governance DB).
     pub approval: Option<Arc<crate::infra::approval::service::ApprovalService>>,
@@ -62,7 +62,7 @@ pub fn router(state: Arc<ApiState>, openapi: &dyn OpenApiRegistry) -> Router {
         .description(
             "Operates the payer's reusable-credit wallet for the seller named by \
              the body's `tenant_id`. ONE endpoint, two `kind`s. `kind = \"grant\"` \
-             parks `amount_minor` of the payer's unallocated pool into the wallet \
+             parks `money` of the payer's unallocated pool into the wallet \
              sub-grain `credit_grant_event_type` (DR UNALLOCATED, CR \
              REUSABLE_CREDIT), capped at the live pool. `kind = \"apply\"` spends \
              the wallet against the `targets` open receivables oldest-grant-first \
@@ -127,26 +127,30 @@ async fn post_credit_application(
     .await
     .map_err(authz_error_to_canonical)?;
 
-    // Dual-control gate (VHP-1852): a high-value credit GRANT routes to the
+    // Lower (and fully validate) the body once, before the gate: a grant whose
+    // `money` disagrees with the declared `currency`/`currency_scale`, or that
+    // omits `credit_grant_event_type`, is the same 400 on both paths and never
+    // reaches the approval queue.
+    let cmd = body.into_sdk()?;
+
+    // Dual-control gate: a high-value credit GRANT routes to the
     // preparer→approver queue (409); an apply, or a below-threshold grant, posts
     // inline (unchanged).
-    if body.kind == "grant"
-        && let Some(amount) = body.amount_minor
+    if let bss_ledger_sdk::CreditApplication::Grant(grant) = &cmd
         && let Some(approval) = &state.approval
     {
         let grant_intent = crate::domain::approval::intent::ApprovalIntent::CreditGrant(
             crate::domain::approval::intent::CreditGrantIntent {
-                tenant_id: body.tenant_id,
-                payer_tenant_id: body.payer_tenant_id,
-                credit_application_id: body.credit_application_id.clone(),
-                currency: body.currency.clone(),
-                amount_minor: amount,
-                credit_grant_event_type: body.credit_grant_event_type.clone(),
+                tenant_id: grant.tenant_id,
+                payer_tenant_id: grant.payer_tenant_id,
+                credit_application_id: grant.credit_application_id.clone(),
+                amount: grant.money.clone(),
+                credit_grant_event_type: Some(grant.credit_grant_event_type.clone()),
             },
         );
         let grant_facts = crate::domain::approval::policy::OperationFacts {
             kind: crate::domain::approval::ApprovalKind::CreditGrant,
-            amount_usd_eq_minor: Some(amount),
+            amount: Some(grant.money.clone()),
             effective_at: None,
             has_outstanding_balance: false,
         };
@@ -180,7 +184,6 @@ async fn post_credit_application(
         }
     }
 
-    let cmd = body.into_sdk()?;
     let applied = state.client.post_credit_application(&ctx, cmd).await?;
     Ok((
         StatusCode::CREATED,

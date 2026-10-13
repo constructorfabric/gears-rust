@@ -23,7 +23,6 @@ pub async fn insert(
     let active = e::ActiveModel {
         tenant_id: Set(m.tenant_id),
         default_timing: Set(m.default_timing),
-        default_rounding: Set(m.default_rounding),
         default_gl: Set(m.default_gl),
         default_tax_category: Set(m.default_tax_category),
         invoice_line_templates: Set(m.invoice_line_templates),
@@ -88,7 +87,6 @@ pub async fn update(
         .secure()
         .scope_with(scope)
         .col_expr(e::Column::DefaultTiming, Expr::value(m.default_timing))
-        .col_expr(e::Column::DefaultRounding, Expr::value(m.default_rounding))
         .col_expr(e::Column::DefaultGl, Expr::value(m.default_gl))
         .col_expr(
             e::Column::DefaultTaxCategory,

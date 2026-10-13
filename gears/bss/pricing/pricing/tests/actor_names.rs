@@ -121,7 +121,7 @@ async fn settings_by_ann(fixture: &Fixture) {
         .call(
             "PUT",
             "/settings",
-            json!({"default_timing":"arrears","default_rounding":"half_up","invoice_line_templates":{},"currencies":[]}),
+            json!({"default_timing":"arrears","invoice_line_templates":{},"currencies":[]}),
             Some(&tag),
             None,
         )

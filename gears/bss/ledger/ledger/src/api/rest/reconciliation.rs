@@ -1,6 +1,6 @@
 //! Axum handlers + router for the reconciliation surface (Slice 7 Phase 3,
 //! design §4.3 / §4 / §5). Two operations under `/bss-ledger/v1/ledger`,
-//! tenant-scoped WITHOUT a tenant in the path (the vhp-core convention — the
+//! tenant-scoped WITHOUT a tenant in the path (the platform convention — the
 //! tenant is the caller's auth context).
 //!
 //! - `POST /ledger/reconciliation-runs` — trigger one named reconciliation check
@@ -33,13 +33,14 @@ use uuid::Uuid;
 
 use crate::api::rest::auth_context::require_authenticated;
 use crate::api::rest::canonical_json::CanonicalJson;
+use crate::api::rest::dto::ReconciliationVarianceDto;
 use crate::api::rest::error::{authz_error_to_canonical, reconciliation_run_not_found};
 use crate::domain::error::DomainError;
 use crate::domain::instant::rfc3339;
-use crate::infra::reconciliation::{
-    CHECK_AR_DERIVED, CHECK_INVOICE_COMPLETENESS, CHECK_PAYMENTS_PSP, ReconciliationFramework,
+use crate::domain::reconciliation::{
+    CHECK_AR_DERIVED, CHECK_INVOICE_COMPLETENESS, CHECK_PAYMENTS_PSP,
 };
-use crate::infra::storage::entity::reconciliation_run;
+use crate::infra::reconciliation::ReconciliationFramework;
 use crate::infra::storage::repo::ReconciliationRunRepo;
 use time::OffsetDateTime;
 
@@ -85,20 +86,26 @@ pub struct ReconciliationRunView {
     pub run_id: Uuid,
     pub period_id: String,
     pub check_type: String,
-    pub variance_minor: i64,
+    /// The reconciled variance: per-currency money buckets for a monetary check,
+    /// or a diagnostic invoice count for `INVOICE_COMPLETENESS`.
+    pub variance: ReconciliationVarianceDto,
     pub within_tolerance: bool,
     pub status: String,
     #[serde(with = "rfc3339")]
     pub at_utc: OffsetDateTime,
 }
 
-impl From<reconciliation_run::Model> for ReconciliationRunView {
-    fn from(m: reconciliation_run::Model) -> Self {
+impl From<crate::infra::storage::repo::reconciliation_run_repo::ReconciliationRunView>
+    for ReconciliationRunView
+{
+    fn from(
+        m: crate::infra::storage::repo::reconciliation_run_repo::ReconciliationRunView,
+    ) -> Self {
         Self {
             run_id: m.run_id,
             period_id: m.period_id,
             check_type: m.check_type,
-            variance_minor: m.variance_minor,
+            variance: ReconciliationVarianceDto::from(&m.variance),
             within_tolerance: m.within_tolerance,
             status: m.status,
             at_utc: m.at_utc,
@@ -150,7 +157,8 @@ pub fn router(state: Arc<ApiState>, openapi: &dyn OpenApiRegistry) -> Router {
         .summary("Read a reconciliation run's variance result")
         .description(
             "Returns one `reconciliation_run` for `{run_id}` — the check type, the \
-             reconciled `variance_minor`, whether it is within tolerance, the run \
+             reconciled `variance` (per-currency money, or a missing-invoice count), \
+             whether it is within tolerance, the run \
              status, and when it ran. Tenant-scoped (SQL-level BOLA): a run that \
              does not exist for the caller's tenant, or that lies outside the \
              caller's authorized subtree, is the same 404 (no existence leak). \
@@ -268,8 +276,13 @@ async fn read_reconciliation_run(
     let row = state
         .run_repo
         .read(&scope, tenant, run_id)
-        .await?
+        .await
+        .map_err(|e| DomainError::Internal(format!("read reconciliation run: {e}")))?
         .ok_or_else(|| reconciliation_run_not_found(run_id))?;
 
     Ok(Json(ReconciliationRunView::from(row)))
 }
+
+#[cfg(test)]
+#[path = "reconciliation_tests.rs"]
+mod tests;

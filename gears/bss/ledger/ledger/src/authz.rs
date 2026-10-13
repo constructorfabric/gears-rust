@@ -92,7 +92,7 @@ pub mod labels {
     /// got their own) so a revenue-assurance role grants recon read/run independently
     /// of the `entry` data plane or `fiscal_period` close. OUTSIDE `gts.cf.resources.*`.
     pub const RECONCILIATION: &str = gts_id!("cf.bss.ledger.reconciliation.v1~");
-    /// Tenant ledger config plane (VHP-1853 invoice-posting policy + VHP-1986 FX
+    /// Tenant ledger config plane (invoice-posting policy + FX
     /// revaluation mode) — `write` appends an effective-dated version of a tenant
     /// setting; `read` the effective value. ONE shared config resource so a
     /// billing-config role grants these tenant settings together, independently of
@@ -170,7 +170,7 @@ pub mod actions {
     /// Approve (or reject / return) a dual-control governed mutation (data plane,
     /// write). Distinct from [`POST`]/[`REVERSE`]/[`WRITE`] so a role can grant
     /// posting authority without granting approval authority — and the
-    /// `preparer ≠ approver` rule is enforced server-side (VHP-1852).
+    /// `preparer ≠ approver` rule is enforced server-side.
     pub const APPROVE: &str = "approve";
     /// Trigger a reconciliation check (the `reconciliation` control plane, Slice 7
     /// Phase 3). Distinct from [`READ`] so a revenue-assurance role can read the

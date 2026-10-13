@@ -22,6 +22,10 @@ reason = "Ignore 'gears/bss/libs' — not a module, only a grouping for shared B
 patterns = ["gears/bss/libs"]
 
 [[ignore]]
+reason = "Ignore 'gears/bss/docs' — BSS-wide architecture decisions shared by the BSS gears (ADR/), not a module; each gear's own design set stays under gears/bss/$system/docs."
+patterns = ["gears/bss/docs", "gears/bss/docs/*"]
+
+[[ignore]]
 reason = "Ignore 'coord' shared utility library (distributed-lease primitive; infrastructure crate, not an SDLC-documented product module — no PRD/DESIGN required, README-documented)."
 patterns = ["gears/bss/libs/coord/*"]
 
@@ -32,6 +36,10 @@ patterns = ["gears/bss/libs/approval/*"]
 [[ignore]]
 reason = "Ignore 'rest' shared utility library (weak ETag and If-None-Match for BSS list and reference reads; infrastructure crate used by products, pricing and approvals, documented in their design sets, not an SDLC-documented product module)."
 patterns = ["gears/bss/libs/rest/*"]
+
+[[ignore]]
+reason = "Ignore 'money' shared utility library (validated decimal money, exact arithmetic and canonical decimal text; infrastructure crate used by ledger, rate-provider and pricing, documented in their design sets and its README, not an SDLC-documented product module)."
+patterns = ["gears/bss/libs/money/*"]
 
 [[ignore]]
 reason = "Ignore 'fixtures' joint golden conformance corpus (cf-gears-bss-fixtures + its conformance harness; test-support infrastructure crates consumed by the BSS gears, not an SDLC-documented product module — no PRD/DESIGN required, README-documented). Same class as 'coord' above."

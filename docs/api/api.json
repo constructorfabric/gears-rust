@@ -329,14 +329,15 @@
       "AgingBucketDto": {
         "description": "One aged AR grain in the `GET /balances/ar-aging` response: the outstanding\nreceivable for a `(payer, currency, bucket)`.",
         "properties": {
-          "amount_minor": {
-            "format": "int64",
-            "type": "integer"
+          "amount": {
+            "$ref": "#/components/schemas/MoneyDto",
+            "description": "The outstanding receivable in this bucket."
           },
           "bucket": {
             "type": "string"
           },
           "currency": {
+            "description": "The grain's currency (the bucket key; `amount` carries it too).",
             "type": "string"
           },
           "payer_tenant_id": {
@@ -348,19 +349,16 @@
           "payer_tenant_id",
           "currency",
           "bucket",
-          "amount_minor"
+          "amount"
         ],
         "type": "object"
       },
       "AllocatePaymentRequest": {
-        "description": "The `POST /payments/{payment_id}/allocations` request body: allocate a\nsettled payment's unallocated pool to the payer's open receivables (the\n**money-out** side). The `payment_id` comes from the PATH (not the body —\nsee [`SettlePaymentRequest::into`] vs [`AllocatePaymentRequest::into_sdk`]),\nso the lowering to the SDK type takes it as a parameter. `allocation_id` is\nthe idempotency key. `scale` is advisory.\n\nWhen `splits` is omitted the `lump_minor` is applied by the tenant's\nprecedence policy and `hint_invoice_id` jumps one invoice to the front of\nthat fill order. When `splits` is supplied (Mode B), the precedence decision\nis skipped and those explicit shares are validated against the open\nreceivables instead (each must name an open invoice and not over-allocate it;\nthe shares must sum to at most `lump_minor`) — a bad split is rejected\n`ALLOCATION_SPLIT_INVALID`.",
+        "description": "The `POST /payments/{payment_id}/allocations` request body: allocate a\nsettled payment's unallocated pool to the payer's open receivables (the\n**money-out** side). The `payment_id` comes from the PATH (not the body —\nsee [`SettlePaymentRequest::into`] vs [`AllocatePaymentRequest::into_sdk`]),\nso the lowering to the SDK type takes it as a parameter. `allocation_id` is\nthe idempotency key. `lump` carries its currency and stored scale.\n\nWhen `splits` is omitted the `lump` is applied by the tenant's\nprecedence policy and `hint_invoice_id` jumps one invoice to the front of\nthat fill order. When `splits` is supplied (Mode B), the precedence decision\nis skipped and those explicit shares are validated against the open\nreceivables instead (each must name an open invoice and not over-allocate it;\nthe shares must sum to at most `lump`) — a bad split is rejected\n`ALLOCATION_SPLIT_INVALID`.",
         "properties": {
           "allocation_id": {
             "description": "Idempotency key for the allocation (a re-issue replays).",
             "format": "uuid",
-            "type": "string"
-          },
-          "currency": {
             "type": "string"
           },
           "hint_invoice_id": {
@@ -370,20 +368,13 @@
               "null"
             ]
           },
-          "lump_minor": {
-            "description": "The lump to apply in minor units, drained oldest-first across open AR.",
-            "format": "int64",
-            "type": "integer"
+          "lump": {
+            "$ref": "#/components/schemas/MoneyDto",
+            "description": "The lump to apply in major units, drained oldest-first across open AR."
           },
           "payer_tenant_id": {
             "format": "uuid",
             "type": "string"
-          },
-          "scale": {
-            "description": "Advisory currency scale; the ledger resolves the authoritative one.",
-            "format": "int32",
-            "minimum": 0,
-            "type": "integer"
           },
           "splits": {
             "description": "Optional caller-computed per-invoice split (Mode B escape hatch). `None`\n⇒ the precedence policy decides the split.",
@@ -405,9 +396,7 @@
           "tenant_id",
           "payer_tenant_id",
           "allocation_id",
-          "lump_minor",
-          "currency",
-          "scale"
+          "lump"
         ],
         "type": "object"
       },
@@ -447,15 +436,12 @@
             "format": "date-time",
             "type": "string"
           },
-          "amount_minor": {
-            "format": "int64",
-            "type": "integer"
-          },
-          "currency": {
-            "type": "string"
-          },
           "invoice_id": {
             "type": "string"
+          },
+          "money": {
+            "$ref": "#/components/schemas/MoneyDto",
+            "description": "The applied share with its currency and stored scale."
           },
           "precedence_policy_ref": {
             "type": "string"
@@ -463,8 +449,7 @@
         },
         "required": [
           "invoice_id",
-          "amount_minor",
-          "currency",
+          "money",
           "allocated_at_utc",
           "precedence_policy_ref"
         ],
@@ -500,19 +485,19 @@
         "type": "object"
       },
       "AllocationSplitDto": {
-        "description": "One caller-computed allocation share (Mode B, §4.4 F-5): apply `amount_minor`\nof the lump to `invoice_id`. A row of [`AllocatePaymentRequest::splits`].",
+        "description": "One caller-computed allocation share (Mode B, §4.4 F-5): apply `money`\nof the lump to `invoice_id`. A row of [`AllocatePaymentRequest::splits`].",
         "properties": {
-          "amount_minor": {
-            "format": "int64",
-            "type": "integer"
-          },
           "invoice_id": {
             "type": "string"
+          },
+          "money": {
+            "$ref": "#/components/schemas/MoneyDto",
+            "description": "The share in major units, in the lump's currency and scale."
           }
         },
         "required": [
           "invoice_id",
-          "amount_minor"
+          "money"
         ],
         "type": "object"
       },
@@ -551,11 +536,15 @@
       "ApprovalDto": {
         "description": "A dual-control approval rendered for the queue / detail views.",
         "properties": {
-          "amount_usd_eq_minor": {
-            "format": "int64",
-            "type": [
-              "integer",
-              "null"
+          "amount": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/MoneyDto",
+                "description": "The governed magnitude the D2 threshold was compared against, in the\noperation's own currency and stored scale; `null` for a kind with no\nmonetary facts (period reopen, payer closure)."
+              }
             ]
           },
           "approval_id": {
@@ -1101,7 +1090,7 @@
         "type": "string"
       },
       "BalanceDto": {
-        "description": "A read-back account-balance row in the `GET /balances` response. Carries both\nthe transaction-currency `balance_minor` and the Slice-5 functional valuation:\n`functional_balance_minor` is `null` on a single-currency grain (the\n`?valuation=functional` read falls back to `balance_minor` by identity, P1\ndecision 8).",
+        "description": "A read-back account-balance row in the `GET /balances` response. Carries both\nthe transaction-currency `balance` and the Slice-5 functional valuation:\n`functional_balance` is `null` on a single-currency grain (the\n`?valuation=functional` read falls back to `balance` by identity, P1\ndecision 8).",
         "properties": {
           "account_class": {
             "type": "string"
@@ -1110,34 +1099,26 @@
             "format": "uuid",
             "type": "string"
           },
-          "balance_minor": {
-            "format": "int64",
-            "type": "integer"
+          "balance": {
+            "$ref": "#/components/schemas/MoneyDto",
+            "description": "The transaction-currency balance with its currency and stored scale."
           },
-          "currency": {
-            "type": "string"
-          },
-          "functional_balance_minor": {
-            "description": "Functional-currency carried balance; `null` on a single-currency grain\n(functional ≡ transaction).",
-            "format": "int64",
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "functional_currency": {
-            "description": "Functional currency of `functional_balance_minor`; `null` on a\nsingle-currency grain.",
-            "type": [
-              "string",
-              "null"
+          "functional_balance": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/MoneyDto",
+                "description": "Functional-currency carried balance; `null` on a single-currency grain\n(functional ≡ transaction)."
+              }
             ]
           }
         },
         "required": [
           "account_id",
           "account_class",
-          "currency",
-          "balance_minor"
+          "balance"
         ],
         "type": "object"
       },
@@ -1613,7 +1594,7 @@
         "type": "object"
       },
       "ChangeRecognitionScheduleRequest": {
-        "description": "The `POST /recognition-schedules/{schedule_id}/changes` request body: change or\ncancel an ASC 606 recognition schedule (design §3.6 / §4.6). `{schedule_id}`\n(the ACTIVE schedule to change) comes from the PATH; the target seller ledger\nis the body's own `tenant_id` (tenant in body, not path — the vhp-core REST\nconvention); the `(entry, post)` PEP gate authorizes it (a change marks/mints\nschedule state). `change_id` is the idempotency key (a replay returns the prior\nresult, minting no second schedule). `action` is `\"cancel\"` | `\"replace\"`.\n`treatment` is the upstream modification-accounting decision: `\"prospective\"` /\n`\"separate_contract\"` apply; `\"catch_up\"` / unknown is rejected\n`MODIFICATION_TREATMENT_REVIEW` (the ledger never silently treats a\nmodification as prospective). `new_segments` is required for a `replace` (the\nNEW version's plan of the remaining deferred), ignored for a `cancel`.",
+        "description": "The `POST /recognition-schedules/{schedule_id}/changes` request body: change or\ncancel an ASC 606 recognition schedule (design §3.6 / §4.6). `{schedule_id}`\n(the ACTIVE schedule to change) comes from the PATH; the target seller ledger\nis the body's own `tenant_id` (tenant in body, not path — the platform REST\nconvention); the `(entry, post)` PEP gate authorizes it (a change marks/mints\nschedule state). `change_id` is the idempotency key (a replay returns the prior\nresult, minting no second schedule). `action` is `\"cancel\"` | `\"replace\"`.\n`treatment` is the upstream modification-accounting decision: `\"prospective\"` /\n`\"separate_contract\"` apply; `\"catch_up\"` / unknown is rejected\n`MODIFICATION_TREATMENT_REVIEW` (the ledger never silently treats a\nmodification as prospective). `new_segments` is required for a `replace` (the\nNEW version's plan of the remaining deferred), ignored for a `cancel`.",
         "properties": {
           "action": {
             "description": "The change action: `\"cancel\"` | `\"replace\"`.",
@@ -1654,10 +1635,9 @@
       "ChangeSegmentDto": {
         "description": "One replacement recognition segment on a `replace` change (Group H). Maps to\nthe SDK [`bss_ledger_sdk::ChangeSegment`]; ignored on a `cancel`.",
         "properties": {
-          "amount_minor": {
-            "description": "Minor-unit amount of this segment (`>= 0`).",
-            "format": "int64",
-            "type": "integer"
+          "money": {
+            "$ref": "#/components/schemas/MoneyDto",
+            "description": "Major-unit amount of this segment (`>= 0`) with its currency and scale."
           },
           "period_id": {
             "description": "Fiscal `period_id` (`YYYYMM`) this replacement segment recognizes into.",
@@ -1666,7 +1646,7 @@
         },
         "required": [
           "period_id",
-          "amount_minor"
+          "money"
         ],
         "type": "object"
       },
@@ -3433,16 +3413,8 @@
         "description": "The response to a create: the declaration, and whether a retired one was\nrevived or the active one evolved rather than a new setting declared."
       },
       "CreditApplicationRequest": {
-        "description": "The `POST /credit-applications` request body: ONE wire shape for both wallet\nkinds, discriminated by `kind` (`\"grant\"` | `\"apply\"`). The target seller\nledger is the body's own `tenant_id` (tenant in body, not path — the vhp-core\nREST convention); the `(credit_application, write)` PEP gate authorizes it.\n`scale` is advisory; the ledger resolves the authoritative per-line scale.\n\nThe kind-specific fields are all optional on the wire and validated in\n[`Self::into_sdk`]: a `grant` requires `amount_minor` + `credit_grant_event_type`\n(and ignores `targets`); an `apply` requires a non-empty `targets` (and ignores\nthe grant fields). A missing required field or an unknown `kind` is rejected\n`400 InvalidArgument` before the SDK type is built.",
+        "description": "The `POST /credit-applications` request body: ONE wire shape for both wallet\nkinds, discriminated by `kind` (`\"grant\"` | `\"apply\"`). The target seller\nledger is the body's own `tenant_id` (tenant in body, not path — the platform\nREST convention); the `(credit_application, write)` PEP gate authorizes it.\n`currency` + `currency_scale` constrain the whole application: a grant's\n`money` and every apply target must carry the same pair (a mismatch is a\nnamed error, never an implicit conversion).\n\nThe kind-specific fields are all optional on the wire and validated in\n[`Self::into_sdk`]: a `grant` requires `money` + `credit_grant_event_type`\n(and ignores `targets`); an `apply` requires a non-empty `targets` (and ignores\nthe grant fields). A missing required field or an unknown `kind` is rejected\n`400 InvalidArgument` before the SDK type is built.",
         "properties": {
-          "amount_minor": {
-            "description": "Grant only: amount to park into the wallet, in minor units. Required for\n`kind = \"grant\"`, ignored for `\"apply\"`.",
-            "format": "int64",
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
           "credit_application_id": {
             "description": "The `CREDIT_APPLY` idempotency business id (a replay returns the prior post).",
             "type": "string"
@@ -3455,21 +3427,33 @@
             ]
           },
           "currency": {
+            "description": "The application's currency (every monetary child carries the same).",
             "type": "string"
+          },
+          "currency_scale": {
+            "description": "The application's stored currency scale (0..=28).",
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
           },
           "kind": {
             "description": "The wallet operation: `\"grant\"` (park pool cash) | `\"apply\"` (spend wallet).",
             "type": "string"
           },
+          "money": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/MoneyDto",
+                "description": "Grant only: amount to park into the wallet, in major units. Required for\n`kind = \"grant\"`, ignored for `\"apply\"`."
+              }
+            ]
+          },
           "payer_tenant_id": {
             "format": "uuid",
             "type": "string"
-          },
-          "scale": {
-            "description": "Advisory currency scale; the ledger resolves the authoritative one.",
-            "format": "int32",
-            "minimum": 0,
-            "type": "integer"
           },
           "targets": {
             "description": "Apply only: the per-invoice receivable shares to spend the wallet against\n(validated against the payer's open AR). Required (non-empty) for\n`kind = \"apply\"`, ignored for `\"grant\"`.",
@@ -3493,7 +3477,7 @@
           "payer_tenant_id",
           "credit_application_id",
           "currency",
-          "scale"
+          "currency_scale"
         ],
         "type": "object"
       },
@@ -3536,51 +3520,46 @@
       "CreditApplicationShareDto": {
         "description": "One per-invoice receivable share in a credit-application apply response: how\nmuch of the wallet was applied to `invoice_id`. A row of\n[`CreditApplicationResponse::applications`] (empty for a grant). Mirrors the\nSDK's reuse of `AllocationSplit` on the apply side.",
         "properties": {
-          "amount_minor": {
-            "format": "int64",
-            "type": "integer"
-          },
           "invoice_id": {
             "type": "string"
+          },
+          "money": {
+            "$ref": "#/components/schemas/MoneyDto",
+            "description": "The applied share with its currency and stored scale."
           }
         },
         "required": [
           "invoice_id",
-          "amount_minor"
+          "money"
         ],
         "type": "object"
       },
       "CreditDebitDto": {
         "description": "One per-sub-grain wallet draw-down in a credit-application response: how much\nthe apply drew from the `credit_grant_event_type` bucket. A row of\n[`CreditApplicationResponse::debits`] (empty for a grant).",
         "properties": {
-          "amount_minor": {
-            "format": "int64",
-            "type": "integer"
-          },
           "credit_grant_event_type": {
             "type": "string"
+          },
+          "money": {
+            "$ref": "#/components/schemas/MoneyDto",
+            "description": "The draw-down with its currency and stored scale."
           }
         },
         "required": [
           "credit_grant_event_type",
-          "amount_minor"
+          "money"
         ],
         "type": "object"
       },
       "CreditNoteRequest": {
-        "description": "The `POST /credit-notes` request body: a compensating credit note against a\nposted invoice (design §4.2). The target seller ledger is the body's own\n`tenant_id` (tenant in body, not path — the vhp-core REST convention); the\n`(entry, post)` PEP gate authorizes it (a credit note posts a balanced\ncompensating journal entry — the same data-plane post action as the\nrecognition run / invoice post). Idempotent on `credit_note_id` (the\n`(tenant, CREDIT_NOTE, credit_note_id)` engine claim): a replay returns the\nprior posting with `replayed = true`.\n\n`amount_minor` is **incl-tax**; `tax_minor` is the reversed-tax slice of it;\n`requested_deferred_minor` is the **split intent** — how much of the ex-tax\nrevenue portion (`amount_minor − tax_minor`) targets the unreleased deferred\nbalance (the rest reduces recognized revenue). `goodwill = true` ⇒ an AR-only\ngoodwill credit (debits `GOODWILL`, touches no schedule, MUST carry\n`requested_deferred_minor = 0`). A malformed shape (negative amounts, tax over\namount, deferred over ex-tax, empty reason, goodwill-with-deferred) is rejected\n`400` (`AMOUNT_OUT_OF_RANGE` / `InvalidArgument`) by the domain `validate_shape`;\nan indeterminable split is `CREDIT_NOTE_SPLIT_AMBIGUOUS`; an over-headroom note\nis `CREDIT_NOTE_EXCEEDS_HEADROOM`.",
+        "description": "The `POST /credit-notes` request body: a compensating credit note against a\nposted invoice (design §4.2). The target seller ledger is the body's own\n`tenant_id` (tenant in body, not path — the platform REST convention); the\n`(entry, post)` PEP gate authorizes it (a credit note posts a balanced\ncompensating journal entry — the same data-plane post action as the\nrecognition run / invoice post). Idempotent on `credit_note_id` (the\n`(tenant, CREDIT_NOTE, credit_note_id)` engine claim): a replay returns the\nprior posting with `replayed = true`.\n\n`amount` is **incl-tax**; `tax_amount` is the reversed-tax slice of it;\n`requested_deferred` is the **split intent** — how much of the ex-tax\nrevenue portion (`amount − tax_amount`) targets the unreleased deferred\nbalance (the rest reduces recognized revenue). `goodwill = true` ⇒ an AR-only\ngoodwill credit (debits `GOODWILL`, touches no schedule, MUST carry\n`requested_deferred = 0`). A malformed shape (negative amounts, tax over\namount, deferred over ex-tax, empty reason, goodwill-with-deferred) is rejected\n`400` (`AMOUNT_OUT_OF_RANGE` / `InvalidArgument`) by the domain `validate_shape`;\nan indeterminable split is `CREDIT_NOTE_SPLIT_AMBIGUOUS`; an over-headroom note\nis `CREDIT_NOTE_EXCEEDS_HEADROOM`.",
         "properties": {
-          "amount_minor": {
-            "description": "The note amount **incl-tax**, in minor units (`>= 0`, `> 0` enforced).",
-            "format": "int64",
-            "type": "integer"
+          "amount": {
+            "$ref": "#/components/schemas/MoneyDto",
+            "description": "The note amount **incl-tax**, in major units (`> 0`), with the note's\ncurrency and stored scale (every other monetary field shares them)."
           },
           "credit_note_id": {
             "description": "The `(tenant, CREDIT_NOTE, credit_note_id)` idempotency business id + the\n`credit_note` row PK.",
-            "type": "string"
-          },
-          "currency": {
-            "description": "ISO-4217 currency of the note (all legs share it).",
             "type": "string"
           },
           "goodwill": {
@@ -3617,32 +3596,24 @@
             "description": "The mandatory business reason code (AC #14) recorded on the `credit_note`\nrow.",
             "type": "string"
           },
-          "requested_deferred_minor": {
-            "description": "The split **intent**: how much of the ex-tax revenue amount targets the\nunreleased deferred balance (`0 <= … <= amount_minor − tax_minor`). MUST be\n`0` when `goodwill` is set.",
-            "format": "int64",
-            "type": "integer"
+          "requested_deferred": {
+            "$ref": "#/components/schemas/MoneyDto",
+            "description": "The split **intent**: how much of the ex-tax revenue amount targets the\nunreleased deferred balance (`0 <= … <= amount − tax_amount`). MUST be\n`0` when `goodwill` is set."
           },
           "revenue_stream": {
             "description": "The revenue stream the credit books against (per-stream legs carry it).",
             "type": "string"
           },
-          "scale": {
-            "description": "Advisory currency scale; the ledger resolves the authoritative one.",
-            "format": "int32",
-            "minimum": 0,
-            "type": "integer"
-          },
           "tax": {
-            "description": "The authoritative tax breakdown — one component per `(jurisdiction,\nfiling-period, rate)`, each reversing onto its OWN `TAX_PAYABLE` leg so\n`tax_subbalance` disaggregates (§4.5). Empty ⇒ a single dimensionless tax leg\nfrom `tax_minor` (legacy). A non-empty breakdown MUST sum to `tax_minor` (a\n`400` otherwise); `tax_minor` stays the split scalar.",
+            "description": "The authoritative tax breakdown — one component per `(jurisdiction,\nfiling-period, rate)`, each reversing onto its OWN `TAX_PAYABLE` leg so\n`tax_subbalance` disaggregates (§4.5). Empty ⇒ a single dimensionless tax leg\nfrom `tax_amount` (legacy). A non-empty breakdown MUST sum to `tax_amount` (a\n`400` otherwise); `tax_amount` stays the split scalar.",
             "items": {
               "$ref": "#/components/schemas/TaxBreakdownDto"
             },
             "type": "array"
           },
-          "tax_minor": {
-            "description": "The tax slice of `amount_minor` to reverse onto `TAX_PAYABLE` (`>= 0`,\n`<= amount_minor`).",
-            "format": "int64",
-            "type": "integer"
+          "tax_amount": {
+            "$ref": "#/components/schemas/MoneyDto",
+            "description": "The tax slice of `amount` to reverse onto `TAX_PAYABLE` (`>= 0`,\n`<= amount`)."
           },
           "tenant_id": {
             "description": "The seller tenant whose ledger this posts into; the PEP gate target.\nCarried in the body, not the path.",
@@ -3656,12 +3627,10 @@
           "credit_note_id",
           "origin_invoice_id",
           "revenue_stream",
-          "currency",
-          "scale",
-          "amount_minor",
-          "tax_minor",
+          "amount",
+          "tax_amount",
           "tax",
-          "requested_deferred_minor",
+          "requested_deferred",
           "reason_code"
         ],
         "type": "object"
@@ -3689,11 +3658,11 @@
         "type": "object"
       },
       "CreditNoteView": {
-        "description": "The `GET /credit-notes` / `GET /credit-notes/{creditNoteId}` response: the\nrecorded credit note (Phase 1b / read-surface §5). Drawn from the\n`credit_note` row (the `(tenant, credit_note_id)` grain). `amount_minor` is\nincl-tax; `recognized_part_minor` + `deferred_part_minor` are the ex-tax split\nparts and do NOT sum to `amount_minor` (no CHECK — they mirror the entity).\nTenant-scoped (SQL-level BOLA): an unknown credit note — or one outside the\ncaller's subtree — yields a `404` (no existence leak). Mirrors [`RefundView`].",
+        "description": "The `GET /credit-notes` / `GET /credit-notes/{creditNoteId}` response: the\nrecorded credit note (Phase 1b / read-surface §5). Drawn from the\n`credit_note` row (the `(tenant, credit_note_id)` grain). `amount` is\nincl-tax; `recognized_part` + `deferred_part` are the ex-tax split\nparts and do NOT sum to `amount` (no CHECK — they mirror the entity).\nTenant-scoped (SQL-level BOLA): an unknown credit note — or one outside the\ncaller's subtree — yields a `404` (no existence leak). Mirrors [`RefundView`].",
         "properties": {
-          "amount_minor": {
-            "format": "int64",
-            "type": "integer"
+          "amount": {
+            "$ref": "#/components/schemas/MoneyDto",
+            "description": "The incl-tax note amount with its currency and stored scale."
           },
           "created_at_utc": {
             "format": "date-time",
@@ -3702,13 +3671,9 @@
           "credit_note_id": {
             "type": "string"
           },
-          "currency": {
-            "type": "string"
-          },
-          "deferred_part_minor": {
-            "description": "The ex-tax deferred part of the split.",
-            "format": "int64",
-            "type": "integer"
+          "deferred_part": {
+            "$ref": "#/components/schemas/MoneyDto",
+            "description": "The ex-tax deferred part of the split."
           },
           "origin_invoice_id": {
             "type": "string"
@@ -3723,10 +3688,9 @@
           "reason_code": {
             "type": "string"
           },
-          "recognized_part_minor": {
-            "description": "The ex-tax recognized part of the split (does NOT sum with the deferred\npart to `amount_minor`).",
-            "format": "int64",
-            "type": "integer"
+          "recognized_part": {
+            "$ref": "#/components/schemas/MoneyDto",
+            "description": "The ex-tax recognized part of the split (does NOT sum with the deferred\npart to `amount`)."
           },
           "revenue_stream": {
             "type": "string"
@@ -3743,32 +3707,25 @@
           "credit_note_id",
           "origin_invoice_id",
           "revenue_stream",
-          "currency",
-          "amount_minor",
-          "recognized_part_minor",
-          "deferred_part_minor",
+          "amount",
+          "recognized_part",
+          "deferred_part",
           "reason_code",
           "created_at_utc"
         ],
         "type": "object"
       },
       "CurrencyScaleDto": {
-        "description": "One non-ISO currency-scale row to seed.",
+        "description": "One currency-scale row to seed: a code with no ISO 4217 minor-unit scale (such as `XTS`, or a\ncode ISO does not list), at its posting scale. A row for an ISO 4217 code with a scale may only\nrepeat that scale; another scale refuses the whole request (400).",
         "properties": {
           "currency": {
             "type": "string"
           },
-          "minor_units": {
+          "currency_scale": {
+            "description": "Posting scale (fractional digits) of the currency, between 0 and 28.",
             "format": "int32",
+            "minimum": 0,
             "type": "integer"
-          },
-          "plausible_max_major": {
-            "description": "Per-currency plausible maximum in MAJOR units; omit for the default\n`10^12` (max scale 6). A higher-precision currency (e.g. BTC scale 8)\npasses a smaller cap (e.g. `21_000_000`) so its scale fits `i64` headroom.",
-            "format": "int64",
-            "type": [
-              "integer",
-              "null"
-            ]
           },
           "source": {
             "type": [
@@ -3779,30 +3736,24 @@
         },
         "required": [
           "currency",
-          "minor_units"
+          "currency_scale"
         ],
         "type": "object"
       },
       "DebitNoteRequest": {
-        "description": "The `POST /debit-notes` request body: an *additional charge* against a posted\ninvoice — a DIRECT split mirroring the Slice-1 invoice-post (design §4.3). The\ntarget seller ledger is the body's own `tenant_id` (tenant in body, not path);\nthe `(entry, post)` PEP gate authorizes it. Idempotent on `debit_note_id` (the\n`(tenant, DEBIT_NOTE, debit_note_id)` engine claim): a replay returns the prior\nposting with `replayed = true`. A debit note **raises** the invoice's headroom\n(`debit_note_total_minor += amount`); it cannot trip the headroom cap.\n\n`amount_minor` is **incl-tax** (the single DR `AR`); `tax_minor` is the posted\ntax evidence (CR `TAX_PAYABLE`, never recomputed); `deferred_minor` is how much\nof the ex-tax revenue portion (`amount_minor − tax_minor`) defers to\n`CONTRACT_LIABILITY` (the rest recognizes now to `REVENUE`). When\n`deferred_minor > 0` the `recognition` spec drives the schedule build (D4 — the\nSAME `ScheduleBuilder` path the invoice-post uses) and is REQUIRED (a deferred\nnote with no spec is a `400`). A malformed shape is rejected `400` by the\ndomain `validate_shape`; a closed payer is `PAYER_CLOSED`.",
+        "description": "The `POST /debit-notes` request body: an *additional charge* against a posted\ninvoice — a DIRECT split mirroring the Slice-1 invoice-post (design §4.3). The\ntarget seller ledger is the body's own `tenant_id` (tenant in body, not path);\nthe `(entry, post)` PEP gate authorizes it. Idempotent on `debit_note_id` (the\n`(tenant, DEBIT_NOTE, debit_note_id)` engine claim): a replay returns the prior\nposting with `replayed = true`. A debit note **raises** the invoice's headroom\n(`debit_note_total += amount`); it cannot trip the headroom cap.\n\n`amount` is **incl-tax** (the single DR `AR`); `tax_amount` is the posted\ntax evidence (CR `TAX_PAYABLE`, never recomputed); `deferred` is how much\nof the ex-tax revenue portion (`amount − tax_amount`) defers to\n`CONTRACT_LIABILITY` (the rest recognizes now to `REVENUE`). When\n`deferred > 0` the `recognition` spec drives the schedule build (D4 — the\nSAME `ScheduleBuilder` path the invoice-post uses) and is REQUIRED (a deferred\nnote with no spec is a `400`). A malformed shape is rejected `400` by the\ndomain `validate_shape`; a closed payer is `PAYER_CLOSED`.",
         "properties": {
-          "amount_minor": {
-            "description": "The note amount **incl-tax**, in minor units (`>= 0`, `> 0` enforced) — the\nsingle DR `AR`.",
-            "format": "int64",
-            "type": "integer"
-          },
-          "currency": {
-            "description": "ISO-4217 currency of the note (all legs share it).",
-            "type": "string"
+          "amount": {
+            "$ref": "#/components/schemas/MoneyDto",
+            "description": "The note amount **incl-tax**, in major units (`> 0`) — the single DR `AR`,\nwith the note's currency and stored scale (every other monetary field\nshares them)."
           },
           "debit_note_id": {
             "description": "The `(tenant, DEBIT_NOTE, debit_note_id)` idempotency business id + the\n`debit_note` row PK.",
             "type": "string"
           },
-          "deferred_minor": {
-            "description": "How much of the ex-tax revenue amount is deferred to `CONTRACT_LIABILITY`\n(`0 <= … <= amount_minor − tax_minor`); the rest recognizes now. `0` ⇒ fully\nrecognized (no `CONTRACT_LIABILITY` line, no schedule build).",
-            "format": "int64",
-            "type": "integer"
+          "deferred": {
+            "$ref": "#/components/schemas/MoneyDto",
+            "description": "How much of the ex-tax revenue amount is deferred to `CONTRACT_LIABILITY`\n(`0 <= … <= amount − tax_amount`); the rest recognizes now. `0` ⇒ fully\nrecognized (no `CONTRACT_LIABILITY` line, no schedule build)."
           },
           "origin_invoice_id": {
             "description": "The originating posted invoice (whose headroom this raises; its rows are\nnever mutated).",
@@ -3831,7 +3782,7 @@
               },
               {
                 "$ref": "#/components/schemas/RecognitionInputDto",
-                "description": "The ASC 606 recognition spec (Slice 4 — the SAME shape the invoice-post\nitem carries). REQUIRED when `deferred_minor > 0` (drives the schedule\nbuild, D4); `None` for a fully-recognized note."
+                "description": "The ASC 606 recognition spec (Slice 4 — the SAME shape the invoice-post\nitem carries). REQUIRED when `deferred > 0` (drives the schedule\nbuild, D4); `None` for a fully-recognized note."
               }
             ]
           },
@@ -3839,23 +3790,16 @@
             "description": "The revenue stream the charge books against (per-stream legs carry it).",
             "type": "string"
           },
-          "scale": {
-            "description": "Advisory currency scale; the ledger resolves the authoritative one.",
-            "format": "int32",
-            "minimum": 0,
-            "type": "integer"
-          },
           "tax": {
-            "description": "The authoritative tax breakdown — one component per `(jurisdiction,\nfiling-period, rate)`, each posting onto its OWN `TAX_PAYABLE` leg so\n`tax_subbalance` disaggregates (§4.5). Empty ⇒ a single dimensionless tax leg\nfrom `tax_minor` (legacy). A non-empty breakdown MUST sum to `tax_minor` (a\n`400` otherwise); `tax_minor` stays the split scalar.",
+            "description": "The authoritative tax breakdown — one component per `(jurisdiction,\nfiling-period, rate)`, each posting onto its OWN `TAX_PAYABLE` leg so\n`tax_subbalance` disaggregates (§4.5). Empty ⇒ a single dimensionless tax leg\nfrom `tax_amount` (legacy). A non-empty breakdown MUST sum to `tax_amount` (a\n`400` otherwise); `tax_amount` stays the split scalar.",
             "items": {
               "$ref": "#/components/schemas/TaxBreakdownDto"
             },
             "type": "array"
           },
-          "tax_minor": {
-            "description": "The tax slice of `amount_minor` posted onto `TAX_PAYABLE` (`>= 0`,\n`<= amount_minor`). Posted tax evidence — never recomputed.",
-            "format": "int64",
-            "type": "integer"
+          "tax_amount": {
+            "$ref": "#/components/schemas/MoneyDto",
+            "description": "The tax slice of `amount` posted onto `TAX_PAYABLE` (`>= 0`,\n`<= amount`). Posted tax evidence — never recomputed."
           },
           "tenant_id": {
             "description": "The seller tenant whose ledger this posts into; the PEP gate target.\nCarried in the body, not the path.",
@@ -3869,12 +3813,10 @@
           "debit_note_id",
           "origin_invoice_id",
           "revenue_stream",
-          "currency",
-          "scale",
-          "amount_minor",
-          "tax_minor",
+          "amount",
+          "tax_amount",
           "tax",
-          "deferred_minor",
+          "deferred",
           "reason_code"
         ],
         "type": "object"
@@ -3902,43 +3844,37 @@
         "type": "object"
       },
       "DebitNoteView": {
-        "description": "The `GET /debit-notes` / `GET /debit-notes/{debitNoteId}` response: the\nrecorded debit note — an additional charge (Phase 1b / read-surface §5). Drawn\nfrom the `debit_note` row (the `(tenant, debit_note_id)` grain). `amount_minor`\nis incl-tax; `recognized_part_minor` + `deferred_part_minor` are the ex-tax\nsplit parts and do NOT sum to `amount_minor` (no CHECK). The `debit_note`\ntable is leaner than `credit_note` (NO `revenue_stream` / `reason_code` /\nitem ref). Tenant-scoped (SQL-level BOLA): an unknown debit note — or one\noutside the caller's subtree — yields a `404` (no existence leak). Mirrors\n[`CreditNoteView`].",
+        "description": "The `GET /debit-notes` / `GET /debit-notes/{debitNoteId}` response: the\nrecorded debit note — an additional charge (Phase 1b / read-surface §5). Drawn\nfrom the `debit_note` row (the `(tenant, debit_note_id)` grain). `amount`\nis incl-tax; `recognized_part` + `deferred_part` are the ex-tax\nsplit parts and do NOT sum to `amount` (no CHECK). The `debit_note`\ntable is leaner than `credit_note` (NO `revenue_stream` / `reason_code` /\nitem ref). Tenant-scoped (SQL-level BOLA): an unknown debit note — or one\noutside the caller's subtree — yields a `404` (no existence leak). Mirrors\n[`CreditNoteView`].",
         "properties": {
-          "amount_minor": {
-            "format": "int64",
-            "type": "integer"
+          "amount": {
+            "$ref": "#/components/schemas/MoneyDto",
+            "description": "The incl-tax note amount with its currency and stored scale."
           },
           "created_at_utc": {
             "format": "date-time",
             "type": "string"
           },
-          "currency": {
-            "type": "string"
-          },
           "debit_note_id": {
             "type": "string"
           },
-          "deferred_part_minor": {
-            "description": "The ex-tax deferred part of the split.",
-            "format": "int64",
-            "type": "integer"
+          "deferred_part": {
+            "$ref": "#/components/schemas/MoneyDto",
+            "description": "The ex-tax deferred part of the split."
           },
           "origin_invoice_id": {
             "type": "string"
           },
-          "recognized_part_minor": {
-            "description": "The ex-tax recognized part of the split.",
-            "format": "int64",
-            "type": "integer"
+          "recognized_part": {
+            "$ref": "#/components/schemas/MoneyDto",
+            "description": "The ex-tax recognized part of the split."
           }
         },
         "required": [
           "debit_note_id",
           "origin_invoice_id",
-          "currency",
-          "amount_minor",
-          "recognized_part_minor",
-          "deferred_part_minor",
+          "amount",
+          "recognized_part",
+          "deferred_part",
           "created_at_utc"
         ],
         "type": "object"
@@ -4385,15 +4321,11 @@
         "type": "object"
       },
       "DisputeView": {
-        "description": "The `GET /disputes` / `GET /disputes/{disputeId}` response: the chargeback\ndispute's current state (read-surface R3). Drawn from the `ledger_dispute` row\n(the `(tenant, dispute_id)` grain) — its chosen `variant` (`CASH_HOLD` /\n`AR_RECLASS`), the current `cycle` + `last_phase` (`OPENED` / `WON` / `LOST`),\nthe `disputed_amount_minor`, and the `cash_hold_minor` actually moved into\n`DISPUTE_HOLD` at open (`0` for `AR_RECLASS`). The persisted `version` (the\noptimistic-concurrency counter) is INTERNAL and not surfaced. Tenant-scoped\n(SQL-level BOLA): an unknown dispute — or one outside the caller's subtree —\nyields a `404` (no existence leak). Mirrors [`RefundView`].",
+        "description": "The `GET /disputes` / `GET /disputes/{disputeId}` response: the chargeback\ndispute's current state (read-surface R3). Drawn from the `ledger_dispute` row\n(the `(tenant, dispute_id)` grain) — its chosen `variant` (`CASH_HOLD` /\n`AR_RECLASS`), the current `cycle` + `last_phase` (`OPENED` / `WON` / `LOST`),\nthe `disputed_amount`, and the `cash_hold` actually moved into\n`DISPUTE_HOLD` at open (`0` for `AR_RECLASS`). The persisted `version` (the\noptimistic-concurrency counter) is INTERNAL and not surfaced. Tenant-scoped\n(SQL-level BOLA): an unknown dispute — or one outside the caller's subtree —\nyields a `404` (no existence leak). Mirrors [`RefundView`].",
         "properties": {
-          "cash_hold_minor": {
-            "description": "The cash held in `DISPUTE_HOLD` at open (`0` for `AR_RECLASS`) — the size\nthe `won`/`lost` outcome releases / forfeits.",
-            "format": "int64",
-            "type": "integer"
-          },
-          "currency": {
-            "type": "string"
+          "cash_hold": {
+            "$ref": "#/components/schemas/MoneyDto",
+            "description": "The cash held in `DISPUTE_HOLD` at open (`0` for `AR_RECLASS`) — the size\nthe `won`/`lost` outcome releases / forfeits."
           },
           "cycle": {
             "description": "The dispute cycle (re-opens advance it; the `last_phase` is at this cycle).",
@@ -4403,9 +4335,9 @@
           "dispute_id": {
             "type": "string"
           },
-          "disputed_amount_minor": {
-            "format": "int64",
-            "type": "integer"
+          "disputed_amount": {
+            "$ref": "#/components/schemas/MoneyDto",
+            "description": "The gross disputed claim with its currency and stored scale."
           },
           "last_phase": {
             "description": "The latest phase recorded on this dispute (`OPENED` / `WON` / `LOST`).",
@@ -4422,12 +4354,11 @@
         "required": [
           "dispute_id",
           "payment_id",
-          "currency",
           "variant",
           "last_phase",
           "cycle",
-          "disputed_amount_minor",
-          "cash_hold_minor"
+          "disputed_amount",
+          "cash_hold"
         ],
         "type": "object"
       },
@@ -4519,9 +4450,11 @@
             "format": "int32",
             "type": "integer"
           },
-          "d2_threshold_minor": {
-            "format": "int64",
-            "type": "integer"
+          "d2_thresholds": {
+            "items": {
+              "$ref": "#/components/schemas/MoneyDto"
+            },
+            "type": "array"
           },
           "effective_from": {
             "format": "date-time",
@@ -4539,7 +4472,7 @@
         "required": [
           "version",
           "effective_from",
-          "d2_threshold_minor",
+          "d2_thresholds",
           "a6_backdating_biz_days",
           "pending_ttl_seconds"
         ],
@@ -4553,10 +4486,16 @@
             "format": "int32",
             "type": "integer"
           },
-          "d2_threshold_minor": {
-            "description": "The D2 amount threshold in USD-equivalent minor units: a governed money-out\n/ grant at or above this needs preparer→approver sign-off.",
-            "format": "int64",
-            "type": "integer"
+          "d2_default_rule": {
+            "description": "The symbolic rule applied to a currency with no `d2_thresholds` override.",
+            "type": "string"
+          },
+          "d2_thresholds": {
+            "description": "The per-currency D2 amount thresholds: a governed money-out / grant at or\nabove the threshold of its currency needs preparer→approver sign-off. A\ncurrency with no override resolves the symbolic platform default rule.",
+            "items": {
+              "$ref": "#/components/schemas/MoneyDto"
+            },
+            "type": "array"
           },
           "effective_from": {
             "description": "The `effective_from` instant of the version in force (`None` when the\nplatform defaults apply — the tenant has no row).",
@@ -4585,7 +4524,8 @@
           }
         },
         "required": [
-          "d2_threshold_minor",
+          "d2_thresholds",
+          "d2_default_rule",
           "a6_backdating_biz_days",
           "pending_ttl_seconds",
           "is_default"
@@ -5586,7 +5526,7 @@
         "type": "object"
       },
       "FxRateIngestRequest": {
-        "description": "Secondary manual / seed ingest of one FX rate into the local `ledger_fx_rate`\nstore (the primary path is the `RateProviderV1` plugin pull, design §4.6 /\ndecision 2). Upsert-keyed on `(tenant_id, base_currency, quote_currency,\nprovider)`: re-posting the same tuple overwrites the quote (`rate_micro` /\n`as_of` / `fallback_order`) — idempotent on `(tenant, base, quote, provider,\nas_of)`. `tenant_id` rides the body (the vhp-core write convention, no tenant\nin the path).",
+        "description": "Secondary manual / seed ingest of one FX rate into the local `ledger_fx_rate`\nstore (the primary path is the `RateProviderV1` plugin pull, design §4.6 /\ndecision 2). Upsert-keyed on `(tenant_id, base_currency, quote_currency,\nprovider)`: re-posting the same tuple overwrites the quote (`rate` /\n`as_of` / `fallback_order`) — idempotent on `(tenant, base, quote, provider,\nas_of)`. `tenant_id` rides the body (the platform write convention, no tenant\nin the path).",
         "properties": {
           "as_of": {
             "description": "The publication timestamp that drives the staleness rule.",
@@ -5613,10 +5553,11 @@
             "description": "Functional-side ISO-4217 code (the `quote`).",
             "type": "string"
           },
-          "rate_micro": {
-            "description": "The rate as a fixed-precision multiplier (functional per unit transaction\n× 1e6). Must be `> 0`.",
-            "format": "int64",
-            "type": "integer"
+          "rate": {
+            "description": "The rate as plain decimal text: quote major units per base major unit\n(functional per unit transaction). Must be `> 0`; digits are kept exactly.",
+            "example": "1.0875",
+            "maxLength": 64,
+            "type": "string"
           },
           "tenant_id": {
             "description": "The seller tenant whose local rate store receives the row.",
@@ -5629,7 +5570,7 @@
           "base_currency",
           "quote_currency",
           "provider",
-          "rate_micro",
+          "rate",
           "as_of"
         ],
         "type": "object"
@@ -5654,9 +5595,9 @@
           "quote_currency": {
             "type": "string"
           },
-          "rate_micro": {
-            "format": "int64",
-            "type": "integer"
+          "rate": {
+            "description": "The stored rate as canonical decimal text.",
+            "type": "string"
           },
           "tenant_id": {
             "format": "uuid",
@@ -5668,7 +5609,7 @@
           "base_currency",
           "quote_currency",
           "provider",
-          "rate_micro",
+          "rate",
           "as_of",
           "fallback_order"
         ],
@@ -5684,6 +5625,12 @@
           "base_currency": {
             "type": "string"
           },
+          "base_currency_scale": {
+            "description": "The stored scale of the base (transaction) currency at lock time.",
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
           "fallback_order": {
             "format": "int32",
             "type": "integer"
@@ -5694,13 +5641,19 @@
           "quote_currency": {
             "type": "string"
           },
+          "quote_currency_scale": {
+            "description": "The stored scale of the quote (functional) currency at lock time.",
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "rate": {
+            "description": "The locked rate as canonical decimal text (quote per base major unit).",
+            "type": "string"
+          },
           "rate_id": {
             "format": "uuid",
             "type": "string"
-          },
-          "rate_micro": {
-            "format": "int64",
-            "type": "integer"
           },
           "stale": {
             "type": "boolean"
@@ -5720,8 +5673,10 @@
           "rate_id",
           "tenant_id",
           "base_currency",
+          "base_currency_scale",
           "quote_currency",
-          "rate_micro",
+          "quote_currency_scale",
+          "rate",
           "as_of",
           "provider",
           "stale",
@@ -6940,59 +6895,49 @@
         "type": "object"
       },
       "InvoiceExposureResponse": {
-        "description": "The `GET /invoices/{invoice_id}/exposure` response: an invoice's credit-note\n**headroom** (the `invoice_exposure` counter) plus its **true remaining AR**\n(the payment-reduced open receivable, design §4.7). The headroom is the room\nleft for further credit notes: `remaining_headroom_minor = original_total_minor\n+ `debit_note_total_minor` − `credit_note_total_minor`` (the slack in the\n``credit_note_total_minor` <= `original_total_minor` + `debit_note_total_minor``\nCHECK, AC #24). ``open_ar_minor`` is the SEPARATE current open AR (what a credit\nnote's `CR AR` leg is capped at before the wallet remainder, K-2) — distinct\nfrom the headroom (which never decreases with payments). Tenant-scoped\n(SQL-level BOLA): an invoice with no exposure row yet (no note ever posted) —\nor one outside the caller's subtree — yields a `404` (no existence leak).",
+        "description": "The `GET /invoices/{invoice_id}/exposure` response: an invoice's credit-note\n**headroom** (the `invoice_exposure` counter) plus its **true remaining AR**\n(the payment-reduced open receivable, design §4.7). The headroom is the room\nleft for further credit notes: `remaining_headroom = original_total\n+ debit_note_total − credit_note_total` (the slack in the\n`credit_note_total <= original_total + debit_note_total`\nCHECK, AC #24). `open_ar` is the SEPARATE current open AR (what a credit\nnote's `CR AR` leg is capped at before the wallet remainder, K-2) — distinct\nfrom the headroom (which never decreases with payments). Tenant-scoped\n(SQL-level BOLA): an invoice with no exposure row yet (no note ever posted) —\nor one outside the caller's subtree — yields a `404` (no existence leak).",
         "properties": {
-          "credit_note_total_minor": {
-            "description": "The running Σ credit-note incl-tax totals (consumes the headroom).",
-            "format": "int64",
-            "type": "integer"
+          "credit_note_total": {
+            "$ref": "#/components/schemas/MoneyDto",
+            "description": "The running Σ credit-note incl-tax totals (consumes the headroom)."
           },
-          "currency": {
-            "description": "ISO-4217 currency of the exposure counters.",
-            "type": "string"
-          },
-          "debit_note_total_minor": {
-            "description": "The running Σ debit-note incl-tax totals (raises the headroom).",
-            "format": "int64",
-            "type": "integer"
+          "debit_note_total": {
+            "$ref": "#/components/schemas/MoneyDto",
+            "description": "The running Σ debit-note incl-tax totals (raises the headroom)."
           },
           "invoice_id": {
             "description": "The invoice the exposure is for.",
             "type": "string"
           },
-          "open_ar_minor": {
-            "description": "The invoice's current open AR incl. tax (payment-reduced) — the `CR AR` cap\na credit note fills before spilling to the wallet remainder. SEPARATE from\nthe headroom.",
-            "format": "int64",
-            "type": "integer"
+          "open_ar": {
+            "$ref": "#/components/schemas/MoneyDto",
+            "description": "The invoice's current open AR incl. tax (payment-reduced) — the `CR AR` cap\na credit note fills before spilling to the wallet remainder. SEPARATE from\nthe headroom."
           },
-          "original_total_minor": {
-            "description": "The seeded original posted AR incl. tax (the headroom basis).",
-            "format": "int64",
-            "type": "integer"
+          "original_total": {
+            "$ref": "#/components/schemas/MoneyDto",
+            "description": "The seeded original posted AR incl. tax (the headroom basis)."
           },
-          "remaining_headroom_minor": {
-            "description": "The remaining credit-note headroom = `original + debit − credit` (`>= 0`).",
-            "format": "int64",
-            "type": "integer"
+          "remaining_headroom": {
+            "$ref": "#/components/schemas/MoneyDto",
+            "description": "The remaining credit-note headroom = `original + debit − credit` (`>= 0`)."
           }
         },
         "required": [
           "invoice_id",
-          "currency",
-          "original_total_minor",
-          "debit_note_total_minor",
-          "credit_note_total_minor",
-          "remaining_headroom_minor",
-          "open_ar_minor"
+          "original_total",
+          "debit_note_total",
+          "credit_note_total",
+          "remaining_headroom",
+          "open_ar"
         ],
         "type": "object"
       },
       "InvoiceItemDto": {
-        "description": "One ex-tax billable line of an invoice to post. Money is the flat\n`amount_minor` + `currency` pair the domain/storage carry (the ledger has no\ncomposite money type). `catalog_class` / `contract_class` are the optional\nGL-mapping inputs — a missing pair routes the line to `SUSPENSE`/`PENDING`.",
+        "description": "One ex-tax billable line of an invoice to post. Money is a [`MoneyDto`]\n(decimal text + currency + stored scale) validated, never rounded, at the\nboundary. `catalog_class` / `contract_class` are the optional GL-mapping\ninputs — a missing pair routes the line to `SUSPENSE`/`PENDING`.",
         "properties": {
-          "amount_minor_ex_tax": {
-            "format": "int64",
-            "type": "integer"
+          "amount_ex_tax": {
+            "$ref": "#/components/schemas/MoneyDto",
+            "description": "The ex-tax line amount in major units (`>= 0`)."
           },
           "catalog_class": {
             "description": "Catalog-supplied GL class (the default mapping); a known `AccountClass`\nliteral (e.g. `\"REVENUE\"`). `None` ⇒ no Catalog mapping.",
@@ -7007,9 +6952,6 @@
               "string",
               "null"
             ]
-          },
-          "currency": {
-            "type": "string"
           },
           "gl_code": {
             "type": [
@@ -7057,8 +6999,7 @@
           }
         },
         "required": [
-          "amount_minor_ex_tax",
-          "currency",
+          "amount_ex_tax",
           "revenue_stream"
         ],
         "type": "object"
@@ -7287,10 +7228,12 @@
             "minimum": 0,
             "type": "integer"
           },
-          "gross_total_minor": {
-            "description": "Control total: summed gross amount in minor units.",
-            "format": "int64",
-            "type": "integer"
+          "gross_totals": {
+            "description": "Control totals: the summed gross amount per currency (one entry per\ncurrency, each with its stored scale). Never summed across currencies.",
+            "items": {
+              "$ref": "#/components/schemas/MoneyDto"
+            },
+            "type": "array"
           },
           "invoice_ids": {
             "description": "The authoritative set of issued invoiceIds for the period.",
@@ -7314,7 +7257,7 @@
           "period_id",
           "invoice_ids",
           "count",
-          "gross_total_minor"
+          "gross_totals"
         ],
         "type": "object"
       },
@@ -7430,24 +7373,12 @@
             "format": "uuid",
             "type": "string"
           },
-          "amount_minor": {
-            "format": "int64",
-            "type": "integer"
-          },
           "ar_status": {
             "description": "AR dispute sub-class (`ACTIVE`/`DISPUTED`); absent on non-dispute lines.",
             "type": [
               "string",
               "null"
             ]
-          },
-          "currency": {
-            "type": "string"
-          },
-          "currency_scale": {
-            "format": "int32",
-            "minimum": 0,
-            "type": "integer"
           },
           "due_date": {
             "format": "date",
@@ -7459,6 +7390,17 @@
           "entry_id": {
             "format": "uuid",
             "type": "string"
+          },
+          "functional_money": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/MoneyDto",
+                "description": "The functional-currency translation; `null` on a single-currency line."
+              }
+            ]
           },
           "gl_code": {
             "type": [
@@ -7478,6 +7420,10 @@
           },
           "mapping_status": {
             "type": "string"
+          },
+          "money": {
+            "$ref": "#/components/schemas/MoneyDto",
+            "description": "The posted amount with its currency and stored scale."
           },
           "payer_tenant_id": {
             "format": "uuid",
@@ -7512,9 +7458,7 @@
           "account_id",
           "account_class",
           "side",
-          "amount_minor",
-          "currency",
-          "currency_scale",
+          "money",
           "mapping_status"
         ],
         "type": "object"
@@ -7553,8 +7497,14 @@
             "type": "string"
           },
           "currency": {
-            "description": "ISO-4217 currency of the adjustment (every leg shares it).",
+            "description": "Currency of the adjustment (every leg shares it).",
             "type": "string"
+          },
+          "currency_scale": {
+            "description": "Stored currency scale of the adjustment (every leg shares it).",
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
           },
           "legs": {
             "description": "The legs to post — must net to zero (`Σ DR == Σ CR`, enforced by `govern`).",
@@ -7593,6 +7543,7 @@
           "adjustment_id",
           "action",
           "currency",
+          "currency_scale",
           "legs",
           "reason_code",
           "tax"
@@ -7628,10 +7579,9 @@
             "description": "The [`AccountClass`] wire token this leg posts to (parsed in `into_domain`).",
             "type": "string"
           },
-          "amount_minor": {
-            "description": "The leg amount in minor units (`> 0`; the domain `govern` rejects\nzero/negative legs).",
-            "format": "int64",
-            "type": "integer"
+          "amount": {
+            "$ref": "#/components/schemas/MoneyDto",
+            "description": "The leg amount in major units (`> 0`; the domain `govern` rejects\nzero/negative legs), in the adjustment's currency and scale."
           },
           "revenue_stream": {
             "description": "The revenue stream — `Some` only for a per-stream class; `null` otherwise.",
@@ -7648,7 +7598,7 @@
         "required": [
           "account_class",
           "side",
-          "amount_minor"
+          "amount"
         ],
         "type": "object"
       },
@@ -8338,6 +8288,33 @@
           "premium"
         ],
         "type": "string"
+      },
+      "MoneyDto": {
+        "description": "Money in major currency units with explicit currency and posting scale.",
+        "properties": {
+          "amount": {
+            "description": "Plain decimal text; requests may include fractional trailing zeros.",
+            "example": "12.34",
+            "maxLength": 64,
+            "type": "string"
+          },
+          "currency": {
+            "description": "Currency code carried with every monetary value.",
+            "type": "string"
+          },
+          "currency_scale": {
+            "description": "Stored posting scale, between 0 and 28 inclusive.",
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "amount",
+          "currency",
+          "currency_scale"
+        ],
+        "type": "object"
       },
       "MultipartCompleteDto": {
         "description": "Response of `POST /files/{id}/multipart/{upload_id}/complete`: the bound version,\nits size, and the composite content hash. `manifest` lets a client re-verify the hash.",
@@ -10381,7 +10358,7 @@
         "type": "object"
       },
       "PostInvoiceRequestDto": {
-        "description": "The `POST /journal-entries` request body: a fully-recognized invoice\n(Variant A) to post. The target seller ledger is the body's own `tenant_id`\n(tenant in body, not path — the vhp-core REST convention); the `(entry,\npost)` PEP gate authorizes it.",
+        "description": "The `POST /journal-entries` request body: a fully-recognized invoice\n(Variant A) to post. The target seller ledger is the body's own `tenant_id`\n(tenant in body, not path — the platform REST convention); the `(entry,\npost)` PEP gate authorizes it.",
         "properties": {
           "correlation_id": {
             "description": "Caller-supplied trace token propagated onto the entry (NOT an authority\nclaim — the poster identity is the authenticated subject, stamped\nserver-side, never read from the body).",
@@ -11582,7 +11559,14 @@
             "type": "boolean"
           },
           "currency": {
+            "description": "The price's currency as stored with the price: its book's.",
             "type": "string"
+          },
+          "currency_scale": {
+            "description": "The currency's scale stored with the price, a JSON integer; never the current table's.",
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
           },
           "dim_value": {
             "description": "The value's chain; null for the default chain.",
@@ -11688,6 +11672,7 @@
           "charge_kind",
           "book_id",
           "currency",
+          "currency_scale",
           "version_no",
           "model",
           "price",
@@ -13140,6 +13125,7 @@
             "type": "string"
           },
           "min_fee": {
+            "description": "Exact decimal text, a JSON string; a JSON number is 400 `MIN_FEE_INVALID` (D-528).",
             "type": [
               "string",
               "null"
@@ -13228,6 +13214,16 @@
               "string",
               "null"
             ]
+          },
+          "currency": {
+            "description": "The price's currency, its book's, stored with the price.",
+            "type": "string"
+          },
+          "currency_scale": {
+            "description": "The currency's scale stored with the price, a JSON integer: the table's scale when the\nprice was written or last edited. An approved price keeps it whatever the table says later.",
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
           },
           "dim_value": {
             "type": [
@@ -13340,6 +13336,8 @@
           "price_book_entry_id",
           "version_no",
           "model",
+          "currency",
+          "currency_scale",
           "price_json",
           "eligibility",
           "effective_from",
@@ -13392,6 +13390,7 @@
             ]
           },
           "min_fee": {
+            "description": "Exact decimal text, a JSON string, or `null` to clear it; a JSON number is 400\n`MIN_FEE_INVALID` (D-528).",
             "type": [
               "string",
               "null"
@@ -13660,6 +13659,16 @@
       "PricingResolveBindingDto": {
         "description": "The price bound for the period, as stored.",
         "properties": {
+          "currency": {
+            "description": "The price's currency as stored with the price: its book's.",
+            "type": "string"
+          },
+          "currency_scale": {
+            "description": "The currency's scale stored with the price: the number of minor digits its money posts\nwith, a JSON integer. A later change of the currency table does not change it.",
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
           "dim_used": {
             "description": "The chain the bound price belongs to: the value, or null for the default chain.",
             "type": [
@@ -13722,6 +13731,8 @@
         },
         "required": [
           "price_id",
+          "currency",
+          "currency_scale",
           "price",
           "eligibility",
           "effective_from",
@@ -13767,14 +13778,8 @@
             "type": "string"
           },
           "currency": {
-            "description": "The book's currency.",
+            "description": "The book's currency. Each binding carries its price's own currency spec: the scale is\nstored per price, so prices of one book written under different scales each keep theirs.",
             "type": "string"
-          },
-          "currency_minor_digits": {
-            "description": "The currency's scale: the number of minor digits money carries.",
-            "format": "int32",
-            "minimum": 0,
-            "type": "integer"
           },
           "date": {
             "description": "The date resolved, `YYYY-MM-DD`.",
@@ -13799,10 +13804,6 @@
             "format": "int32",
             "type": "integer"
           },
-          "rounding_policy": {
-            "description": "The tenant's `default_rounding`, as stored: a string, since no CHECK guards the column\n(D-437, D-439).",
-            "type": "string"
-          },
           "state": {
             "$ref": "#/components/schemas/PricingResolvedRevisionState",
             "description": "The revision's state as it reads today (D-447): `published`, `superseded`, or `scheduled`\nfor a revision asked on or after its sale date while that date has not come yet (D-454). No\nother revision resolves."
@@ -13815,8 +13816,6 @@
           "state",
           "book_id",
           "currency",
-          "currency_minor_digits",
-          "rounding_policy",
           "date",
           "items"
         ],
@@ -14078,10 +14077,6 @@
               "null"
             ]
           },
-          "default_rounding": {
-            "description": "One of the five modes (D-437) once written through the door; a string, not an enum: no\nCHECK guards the column, and a legacy value reads back as stored (D-439).",
-            "type": "string"
-          },
           "default_tax_category": {
             "type": [
               "string",
@@ -14122,7 +14117,6 @@
         },
         "required": [
           "default_timing",
-          "default_rounding",
           "invoice_line_templates",
           "currencies",
           "version"
@@ -14144,10 +14138,6 @@
               "string",
               "null"
             ]
-          },
-          "default_rounding": {
-            "description": "`half_up`, `half_even`, `half_down`, `up` or `down` (D-437).",
-            "type": "string"
           },
           "default_tax_category": {
             "type": [
@@ -14177,7 +14167,6 @@
         },
         "required": [
           "default_timing",
-          "default_rounding",
           "invoice_line_templates",
           "currencies"
         ],
@@ -15306,7 +15295,7 @@
         "type": "object"
       },
       "ProvisioningRequestDto": {
-        "description": "The provisioning request body: the target seller tenant, accounts, currency\nscales, and the fiscal-calendar config to seed in one transaction. The\ntenant is carried in the **body** (not the path) — the gear's REST surface is\ntenant-from-context/body per the vhp-core convention (RBAC/RMS), and a\nprovision targets a seller the caller authorizes via the PEP gate.",
+        "description": "The provisioning request body: the target seller tenant, accounts, currency\nscales, and the fiscal-calendar config to seed in one transaction. The\ntenant is carried in the **body** (not the path) — the gear's REST surface is\ntenant-from-context/body per the platform convention (RBAC/RMS), and a\nprovision targets a seller the caller authorizes via the PEP gate.",
         "properties": {
           "accounts": {
             "items": {
@@ -15390,10 +15379,6 @@
       "PspSettlementReportRequest": {
         "description": "`POST /ledger/control/psp-settlement-report` request body: the PSP's net settled\namount for `(tenant, period)`.",
         "properties": {
-          "currency": {
-            "description": "ISO-4217 currency of the report.",
-            "type": "string"
-          },
           "period_id": {
             "description": "The fiscal `period_id` (`YYYYMM`) the report covers.",
             "type": "string"
@@ -15402,10 +15387,9 @@
             "description": "External PSP report identity (idempotency grain).",
             "type": "string"
           },
-          "settled_minor": {
-            "description": "Net settled amount in minor units the PSP reports (net of refunds/returns).",
-            "format": "int64",
-            "type": "integer"
+          "settled": {
+            "$ref": "#/components/schemas/MoneyDto",
+            "description": "Net settled amount the PSP reports (net of refunds/returns), with its\ncurrency and stored scale."
           },
           "tenant_id": {
             "description": "The seller tenant whose ledger this feeds; the PEP gate target. In the body.",
@@ -15417,8 +15401,7 @@
           "tenant_id",
           "period_id",
           "report_id",
-          "settled_minor",
-          "currency"
+          "settled"
         ],
         "type": "object"
       },
@@ -16235,10 +16218,6 @@
       "RecognitionScheduleResponse": {
         "description": "The `GET /recognition-schedules/{schedule_id}` response: one schedule's\nlifecycle view (design §3.7 / §4) — the schedule header (status, version,\nrevenue stream, currency, total-deferred / recognized-to-date, the originating\ninvoice + the §4.7 item-link anchor, the PO / subscription / policy refs) plus\nits segments, ordered by `segment_no` (period order). A schedule outside the\ncaller's authorized subtree (or simply absent) yields a 404 — never this body\n(no existence leak).",
         "properties": {
-          "currency": {
-            "description": "ISO-4217 currency (one schedule/account per currency).",
-            "type": "string"
-          },
           "po_allocation_group": {
             "description": "The PO / allocation group this obligation books under; `null` when none.",
             "type": [
@@ -16250,10 +16229,9 @@
             "description": "The immutable deferral/timing policy version stamped at build.",
             "type": "string"
           },
-          "recognized_minor": {
-            "description": "The cumulative recognized-to-date (`<= total_deferred_minor`).",
-            "format": "int64",
-            "type": "integer"
+          "recognized": {
+            "$ref": "#/components/schemas/MoneyDto",
+            "description": "The cumulative recognized-to-date (`<= total_deferred`)."
           },
           "revenue_stream": {
             "description": "The revenue stream the obligation books to (one schedule per stream).",
@@ -16289,10 +16267,9 @@
               "null"
             ]
           },
-          "total_deferred_minor": {
-            "description": "The total deferred Contract-liability the schedule plans to release.",
-            "format": "int64",
-            "type": "integer"
+          "total_deferred": {
+            "$ref": "#/components/schemas/MoneyDto",
+            "description": "The total deferred Contract-liability the schedule plans to release."
           },
           "version": {
             "description": "The lineage version (`0` fresh; `old + 1` for a `replace` successor).",
@@ -16305,9 +16282,8 @@
           "status",
           "version",
           "revenue_stream",
-          "currency",
-          "total_deferred_minor",
-          "recognized_minor",
+          "total_deferred",
+          "recognized",
           "source_invoice_id",
           "source_invoice_item_ref",
           "policy_ref",
@@ -16316,12 +16292,11 @@
         "type": "object"
       },
       "RecognitionScheduleSegmentDto": {
-        "description": "One recognition segment in the `GET /recognition-schedules/{schedule_id}`\nresponse: the `segment_no` (immutable, 1:1 with `period_id`), the period it\nrecognizes into, its minor-unit amount, and its release status\n(`PENDING` | `QUEUED` | `DONE`). A row of [`RecognitionScheduleResponse::segments`].",
+        "description": "One recognition segment in the `GET /recognition-schedules/{schedule_id}`\nresponse: the `segment_no` (immutable, 1:1 with `period_id`), the period it\nrecognizes into, its major-unit amount, and its release status\n(`PENDING` | `QUEUED` | `DONE`). A row of [`RecognitionScheduleResponse::segments`].",
         "properties": {
-          "amount_minor": {
-            "description": "The segment's minor-unit amount.",
-            "format": "int64",
-            "type": "integer"
+          "money": {
+            "$ref": "#/components/schemas/MoneyDto",
+            "description": "The segment's amount with its currency and stored scale."
           },
           "period_id": {
             "description": "The fiscal period this segment recognizes into (`YYYYMM`).",
@@ -16340,7 +16315,7 @@
         "required": [
           "segment_no",
           "period_id",
-          "amount_minor",
+          "money",
           "status"
         ],
         "type": "object"
@@ -16348,10 +16323,6 @@
       "RecognitionScheduleSummaryDto": {
         "description": "One recognition schedule header in the `GET /recognition-schedules` list\nresponse — like [`RecognitionScheduleResponse`] but WITHOUT segments (the\nby-id `GET /recognition-schedules/{schedule_id}` carries those). Maps from\n[`bss_ledger_sdk::RecognitionScheduleSummaryView`].",
         "properties": {
-          "currency": {
-            "description": "ISO-4217 currency (one schedule/account per currency).",
-            "type": "string"
-          },
           "po_allocation_group": {
             "description": "The PO / allocation group this obligation books under; `null` when none.",
             "type": [
@@ -16363,10 +16334,9 @@
             "description": "The immutable deferral/timing policy version stamped at build.",
             "type": "string"
           },
-          "recognized_minor": {
-            "description": "The cumulative recognized-to-date (`<= total_deferred_minor`).",
-            "format": "int64",
-            "type": "integer"
+          "recognized": {
+            "$ref": "#/components/schemas/MoneyDto",
+            "description": "The cumulative recognized-to-date (`<= total_deferred`)."
           },
           "revenue_stream": {
             "description": "The revenue stream the obligation books to (one schedule per stream).",
@@ -16395,10 +16365,9 @@
               "null"
             ]
           },
-          "total_deferred_minor": {
-            "description": "The total deferred Contract-liability the schedule plans to release.",
-            "format": "int64",
-            "type": "integer"
+          "total_deferred": {
+            "$ref": "#/components/schemas/MoneyDto",
+            "description": "The total deferred Contract-liability the schedule plans to release."
           },
           "version": {
             "description": "The lineage version (`0` fresh; `old + 1` for a `replace` successor).",
@@ -16411,9 +16380,8 @@
           "status",
           "version",
           "revenue_stream",
-          "currency",
-          "total_deferred_minor",
-          "recognized_minor",
+          "total_deferred",
+          "recognized",
           "source_invoice_id",
           "source_invoice_item_ref",
           "policy_ref"
@@ -16440,9 +16408,9 @@
           "status": {
             "type": "string"
           },
-          "variance_minor": {
-            "format": "int64",
-            "type": "integer"
+          "variance": {
+            "$ref": "#/components/schemas/ReconciliationVarianceDto",
+            "description": "The reconciled variance: per-currency money buckets for a monetary check,\nor a diagnostic invoice count for `INVOICE_COMPLETENESS`."
           },
           "within_tolerance": {
             "type": "boolean"
@@ -16452,19 +16420,62 @@
           "run_id",
           "period_id",
           "check_type",
-          "variance_minor",
+          "variance",
           "within_tolerance",
           "status",
           "at_utc"
         ],
         "type": "object"
       },
-      "RecordDisputePhaseRequest": {
-        "description": "The `POST /disputes/{dispute_id}/phases` request body: record one phase of a\nchargeback dispute. `{dispute_id}` (the dispute's external id) comes from the\nPATH; the target seller ledger is the body's own `tenant_id` (tenant in body,\nnot path — the vhp-core REST convention); the `(dispute, write)` PEP gate\nauthorizes it. The LEDGER chooses the variant at `opened` from `funds_at_open`\n(`\"withheld\"` ⇒ cash-hold, `\"not_moved\"` ⇒ AR-reclass); `phase` is one of\n`\"opened\" | \"won\" | \"lost\" | \"partial\"` (Group B implements `opened`).\n`cycle` defaults to 1 and increments on a re-open. `invoice_id` is required\nfor an AR-reclass `opened` (the disputed `(payer, invoice)` grain), ignored\nfor cash-hold. `scale` is advisory; `effective_at` `None` ⇒ stamped at post\ntime.",
-        "properties": {
-          "currency": {
-            "type": "string"
+      "ReconciliationVarianceDto": {
+        "description": "A closed tagged variance: `kind = \"money\"` carries one value per currency\n(each with its stored scale, never summed across currencies);\n`kind = \"missing_invoices\"` carries the integer diagnostic count.",
+        "oneOf": [
+          {
+            "properties": {
+              "by_currency": {
+                "items": {
+                  "$ref": "#/components/schemas/MoneyDto"
+                },
+                "type": "array"
+              },
+              "kind": {
+                "enum": [
+                  "money"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "by_currency",
+              "kind"
+            ],
+            "type": "object"
           },
+          {
+            "properties": {
+              "count": {
+                "format": "int64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "kind": {
+                "enum": [
+                  "missing_invoices"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "count",
+              "kind"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "RecordDisputePhaseRequest": {
+        "description": "The `POST /disputes/{dispute_id}/phases` request body: record one phase of a\nchargeback dispute. `{dispute_id}` (the dispute's external id) comes from the\nPATH; the target seller ledger is the body's own `tenant_id` (tenant in body,\nnot path — the platform REST convention); the `(dispute, write)` PEP gate\nauthorizes it. The LEDGER chooses the variant at `opened` from `funds_at_open`\n(`\"withheld\"` ⇒ cash-hold, `\"not_moved\"` ⇒ AR-reclass); `phase` is one of\n`\"opened\" | \"won\" | \"lost\" | \"partial\"` (Group B implements `opened`).\n`cycle` defaults to 1 and increments on a re-open. `invoice_id` is required\nfor an AR-reclass `opened` (the disputed `(payer, invoice)` grain), ignored\nfor cash-hold. `disputed_amount` carries its currency and stored scale;\n`effective_at` `None` ⇒ stamped at post time.",
+        "properties": {
           "cycle": {
             "description": "Re-entrancy counter; `None` ⇒ 1 (the first cycle).",
             "format": "int32",
@@ -16473,10 +16484,9 @@
               "null"
             ]
           },
-          "disputed_amount_minor": {
-            "description": "The disputed amount in minor units (`> 0`): the **gross** claim (what the\nbuyer paid / the bank reverses), NOT net of the PSP fee — the ledger sizes a\n`CASH_HOLD` cash leg at `net = settled − fee` itself.",
-            "format": "int64",
-            "type": "integer"
+          "disputed_amount": {
+            "$ref": "#/components/schemas/MoneyDto",
+            "description": "The disputed amount in major units (`> 0`): the **gross** claim (what the\nbuyer paid / the bank reverses), NOT net of the PSP fee — the ledger sizes a\n`CASH_HOLD` cash leg at `net = settled − fee` itself."
           },
           "effective_at": {
             "description": "Phase instant; `None` ⇒ stamped at post time (current-month period).",
@@ -16509,12 +16519,6 @@
             "description": "The phase: `\"opened\" | \"won\" | \"lost\" | \"partial\"`.",
             "type": "string"
           },
-          "scale": {
-            "description": "Advisory currency scale; the ledger resolves the authoritative one.",
-            "format": "int32",
-            "minimum": 0,
-            "type": "integer"
-          },
           "tenant_id": {
             "description": "The seller tenant whose ledger this disputes within; the PEP gate target.\nCarried in the body, not the path.",
             "format": "uuid",
@@ -16527,9 +16531,7 @@
           "payment_id",
           "phase",
           "funds_at_open",
-          "disputed_amount_minor",
-          "currency",
-          "scale"
+          "disputed_amount"
         ],
         "type": "object"
       },
@@ -16743,16 +16745,11 @@
         "type": "object"
       },
       "RefundRequest": {
-        "description": "The `POST /refunds` request body: one PSP refund phase to record (the\n**money-out** side that unwinds a settled receipt). The target seller ledger\nis the body's own `tenant_id` (tenant in body, not path — the vhp-core REST\nconvention); the `(entry, post)` PEP gate authorizes it (a refund posts a\nbalanced journal entry into the seller's ledger, like the credit/debit notes,\ndesign §8 / Phase-1 precedent). `pattern` selects the economic shape\n(`\"A_UNALLOCATED\"` / `\"B_RESTORE_AR\"`); `phase` the lifecycle stage\n(`\"initiated\"` / `\"confirmed\"` / `\"rejected\"` / `\"voided\"` /\n`\"unknown_final\"`). `invoice_id` is required for Pattern B (the AR it\nrestores), absent for Pattern A. `two_stage` defaults to `true` (the\nconservative `REFUND_CLEARING` shape). `relates_to_refund_id` + `direction`\ndrive a refund-of-refund (Group E); a first-order refund omits both (direction\ndefaults to outbound). `scale` is advisory; the ledger resolves the\nauthoritative currency scale.",
+        "description": "The `POST /refunds` request body: one PSP refund phase to record (the\n**money-out** side that unwinds a settled receipt). The target seller ledger\nis the body's own `tenant_id` (tenant in body, not path — the platform REST\nconvention); the `(entry, post)` PEP gate authorizes it (a refund posts a\nbalanced journal entry into the seller's ledger, like the credit/debit notes,\ndesign §8 / Phase-1 precedent). `pattern` selects the economic shape\n(`\"A_UNALLOCATED\"` / `\"B_RESTORE_AR\"`); `phase` the lifecycle stage\n(`\"initiated\"` / `\"confirmed\"` / `\"rejected\"` / `\"voided\"` /\n`\"unknown_final\"`). `invoice_id` is required for Pattern B (the AR it\nrestores), absent for Pattern A. `two_stage` defaults to `true` (the\nconservative `REFUND_CLEARING` shape). `relates_to_refund_id` + `direction`\ndrive a refund-of-refund (Group E); a first-order refund omits both (direction\ndefaults to outbound). `amount` carries its currency and stored scale, which\nMUST match the origin settlement's.",
         "properties": {
-          "amount_minor": {
-            "description": "The cash to return, in minor units (`> 0`).",
-            "format": "int64",
-            "type": "integer"
-          },
-          "currency": {
-            "description": "ISO-4217 currency (all legs share it; MUST match the origin settlement's).",
-            "type": "string"
+          "amount": {
+            "$ref": "#/components/schemas/MoneyDto",
+            "description": "The cash to return, in major units (`> 0`), with its currency and stored\nscale (all legs share them; MUST match the origin settlement's)."
           },
           "direction": {
             "description": "The economic direction (refund-of-refund only): `OUTBOUND` | `CLAWBACK`.\n`None` ⇒ `OUTBOUND` for a first-order refund (the domain default is\nclaw-back ONLY when a `relates_to_refund_id` is set; a first-order refund is\nalways outbound, so the DTO defaults to outbound here and lets\n`validate_shape` require the link for an explicit claw-back).",
@@ -16800,12 +16797,6 @@
               "null"
             ]
           },
-          "scale": {
-            "description": "Advisory currency scale; the ledger resolves the authoritative one.",
-            "format": "int32",
-            "minimum": 0,
-            "type": "integer"
-          },
           "tenant_id": {
             "description": "The seller tenant whose ledger this posts into; the PEP gate target.\nCarried in the body, not the path.",
             "format": "uuid",
@@ -16827,9 +16818,7 @@
           "phase",
           "pattern",
           "payment_id",
-          "currency",
-          "amount_minor",
-          "scale"
+          "amount"
         ],
         "type": "object"
       },
@@ -16858,15 +16847,12 @@
       "RefundView": {
         "description": "The `GET /refunds/{refundId}` response: the recorded refund + its clearing\nstate (Group G). Drawn from the `refund` row (the surrogate `(tenant,\nrefund_id)` grain). `clearing_state` is the two-stage `REFUND_CLEARING` drain\nstate (`PENDING` ⇒ stage-1 open / `SETTLED` ⇒ drained or single-step /\n`REVERSED` ⇒ a PSP reject/void line-negated the stage-1). Tenant-scoped\n(SQL-level BOLA): an unknown refund — or one outside the caller's subtree —\nyields a `404` (no existence leak).",
         "properties": {
-          "amount_minor": {
-            "format": "int64",
-            "type": "integer"
+          "amount": {
+            "$ref": "#/components/schemas/MoneyDto",
+            "description": "The refunded cash with its currency and stored scale."
           },
           "clearing_state": {
             "description": "The `REFUND_CLEARING` drain state (`PENDING` / `SETTLED` / `REVERSED`).",
-            "type": "string"
-          },
-          "currency": {
             "type": "string"
           },
           "invoice_id": {
@@ -16914,8 +16900,7 @@
           "phase",
           "pattern",
           "payment_id",
-          "currency",
-          "amount_minor",
+          "amount",
           "clearing_state"
         ],
         "type": "object"
@@ -17881,16 +17866,8 @@
         "type": "array"
       },
       "ReturnPaymentRequest": {
-        "description": "The `POST /payments/{payment_id}/returns` request body: claw a settled\nreceipt back out (the reversal of a money-in). `{payment_id}` (the original\nsettled payment) comes from the PATH; `psp_return_id` is the idempotency key\n(a re-post replays). `scale` is advisory; `effective_at` `None` ⇒ stamped at\npost time.",
+        "description": "The `POST /payments/{payment_id}/returns` request body: claw a settled\nreceipt back out (the reversal of a money-in). `{payment_id}` (the original\nsettled payment) comes from the PATH; `psp_return_id` is the idempotency key\n(a re-post replays). `money` carries its currency and stored scale;\n`effective_at` `None` ⇒ stamped at post time.",
         "properties": {
-          "amount_minor": {
-            "description": "Amount returned in minor units (`> 0`).",
-            "format": "int64",
-            "type": "integer"
-          },
-          "currency": {
-            "type": "string"
-          },
           "effective_at": {
             "description": "Return instant; `None` ⇒ stamped at post time (current-month period).",
             "format": "date-time",
@@ -17899,6 +17876,10 @@
               "null"
             ]
           },
+          "money": {
+            "$ref": "#/components/schemas/MoneyDto",
+            "description": "Amount returned in major units (`> 0`)."
+          },
           "payer_tenant_id": {
             "format": "uuid",
             "type": "string"
@@ -17906,12 +17887,6 @@
           "psp_return_id": {
             "description": "External return identity — the idempotency key.",
             "type": "string"
-          },
-          "scale": {
-            "description": "Advisory currency scale; the ledger resolves the authoritative one.",
-            "format": "int32",
-            "minimum": 0,
-            "type": "integer"
           },
           "tenant_id": {
             "description": "The seller tenant whose ledger this returns within; the PEP gate target.\nCarried in the body, not the path.",
@@ -17923,9 +17898,7 @@
           "tenant_id",
           "payer_tenant_id",
           "psp_return_id",
-          "amount_minor",
-          "currency",
-          "scale"
+          "money"
         ],
         "type": "object"
       },
@@ -17952,7 +17925,7 @@
         "type": "object"
       },
       "RevaluationRunRequest": {
-        "description": "Trigger an unrealized (Mode-B) revaluation for one period across the monetary\nscopes `{AR, UNALLOCATED, REUSABLE_CREDIT}` (design §4.5). `tenant_id` rides\nthe body (the vhp-core write convention). Each scope is idempotent on\n`(tenant, period_id, scope)` — re-posting the same period replays the\nalready-posted scopes. A no-op when the tenant is Mode-A\n(`revaluation_enabled = false`).",
+        "description": "Trigger an unrealized (Mode-B) revaluation for one period across the monetary\nscopes `{AR, UNALLOCATED, REUSABLE_CREDIT}` (design §4.5). `tenant_id` rides\nthe body (the platform write convention). Each scope is idempotent on\n`(tenant, period_id, scope)` — re-posting the same period replays the\nalready-posted scopes. A no-op when the tenant is Mode-A\n(`revaluation_enabled = false`).",
         "properties": {
           "period_id": {
             "description": "The period to revalue (`YYYYMM`). Must be an OPEN period at run time (the\nrun posts INTO it); a CLOSED/absent period is rejected by the posting gate.",
@@ -18022,20 +17995,15 @@
         "type": "object"
       },
       "RevenueDisaggregationEntryDto": {
-        "description": "One disaggregated recognized-revenue grain in the `GET\n/revenue/disaggregation` response: the revenue RECOGNIZED into\n`revenue_stream` during `period_id` (`Σ amount_minor` of the DONE recognition\nsegments at that grain), in minor units of `currency`. A row of\n[`RevenueDisaggregationResponse::entries`].",
+        "description": "One disaggregated recognized-revenue grain in the `GET\n/revenue/disaggregation` response: the revenue RECOGNIZED into\n`revenue_stream` during `period_id` (the exact sum of the DONE recognition\nsegments at that grain), with its currency and stored scale. A row of\n[`RevenueDisaggregationResponse::entries`].",
         "properties": {
-          "currency": {
-            "description": "ISO currency of the recognized amount.",
-            "type": "string"
-          },
           "period_id": {
             "description": "The fiscal period the revenue recognized in (`YYYYMM`).",
             "type": "string"
           },
-          "recognized_minor": {
-            "description": "Revenue recognized into this `(period, stream)` grain, in minor units.",
-            "format": "int64",
-            "type": "integer"
+          "recognized": {
+            "$ref": "#/components/schemas/MoneyDto",
+            "description": "Revenue recognized into this `(period, stream)` grain."
           },
           "revenue_stream": {
             "description": "The revenue stream the recognized revenue books to.",
@@ -18045,8 +18013,7 @@
         "required": [
           "period_id",
           "revenue_stream",
-          "recognized_minor",
-          "currency"
+          "recognized"
         ],
         "type": "object"
       },
@@ -18697,15 +18664,17 @@
         "type": "string"
       },
       "SetDualControlPolicyRequest": {
-        "description": "A new dual-control threshold policy version to write (DC8). `effective_from`\ndefaults to now when omitted; out-of-range D2/A6/TTL is rejected (409, no clamp).",
+        "description": "A new dual-control threshold policy version to write (DC8). `effective_from`\ndefaults to now when omitted; out-of-range D2/A6/TTL is rejected (409, no clamp).\n`d2_thresholds` carries one threshold per currency (each with its stored\nscale); a currency with no entry resolves the symbolic platform default.",
         "properties": {
           "a6_backdating_biz_days": {
             "format": "int32",
             "type": "integer"
           },
-          "d2_threshold_minor": {
-            "format": "int64",
-            "type": "integer"
+          "d2_thresholds": {
+            "items": {
+              "$ref": "#/components/schemas/MoneyDto"
+            },
+            "type": "array"
           },
           "effective_from": {
             "format": "date-time",
@@ -18720,14 +18689,14 @@
           }
         },
         "required": [
-          "d2_threshold_minor",
+          "d2_thresholds",
           "a6_backdating_biz_days",
           "pending_ttl_seconds"
         ],
         "type": "object"
       },
       "SetFxRevaluationModeRequest": {
-        "description": "A new FX revaluation-mode version to write (VHP-1986). `effective_from`\ndefaults to now when omitted. An unknown `revaluation_mode` is rejected (400),\nnever coerced.",
+        "description": "A new FX revaluation-mode version to write. `effective_from`\ndefaults to now when omitted. An unknown `revaluation_mode` is rejected (400),\nnever coerced.",
         "properties": {
           "effective_from": {
             "description": "When this version takes effect; defaults to now.",
@@ -18774,7 +18743,7 @@
         "type": "object"
       },
       "SetPostingPolicyRequest": {
-        "description": "A new posting-policy version to write (VHP-1853). `effective_from` defaults to\nnow when omitted. An unknown `missing_mapping_mode`, or empty / non-positive /\nnon-monotone `ar_aging_thresholds`, is rejected (400), never coerced.",
+        "description": "A new posting-policy version to write. `effective_from` defaults to\nnow when omitted. An unknown `missing_mapping_mode`, or empty / non-positive /\nnon-monotone `ar_aging_thresholds`, is rejected (400), never coerced.",
         "properties": {
           "ar_aging_thresholds": {
             "description": "AR-aging bucket upper-bounds: strictly increasing positive day counts\n(e.g. `[30, 60, 90]` → `current / 1-30 / 31-60 / 61-90 / 90+`).",
@@ -18946,11 +18915,8 @@
         "type": "object"
       },
       "SettlePaymentRequest": {
-        "description": "The `POST /payments` request body: a settled payment to record (the\n**money-in** side). The target seller ledger is the body's own `tenant_id`\n(tenant in body, not path — the vhp-core REST convention); the `(payment,\nwrite)` PEP gate authorizes it. `scale` is the payment's currency scale as\nknown to the caller — advisory; the ledger resolves the authoritative\nper-line scale from the provisioned currency config. `effective_at` `None`\n⇒ the receipt is stamped at post time.",
+        "description": "The `POST /payments` request body: a settled payment to record (the\n**money-in** side). The target seller ledger is the body's own `tenant_id`\n(tenant in body, not path — the platform REST convention); the `(payment,\nwrite)` PEP gate authorizes it. `gross` and `fee` carry their currency and\nstored scale; the scale is validated against the provisioned currency\nconfig at post time (a mismatch is rejected, never rescaled). `effective_at`\n`None` ⇒ the receipt is stamped at post time.",
         "properties": {
-          "currency": {
-            "type": "string"
-          },
           "effective_at": {
             "description": "Receipt instant; `None` ⇒ stamped at post time (current-month period).",
             "format": "date-time",
@@ -18959,15 +18925,13 @@
               "null"
             ]
           },
-          "fee_minor": {
-            "description": "Processor's withheld cut in minor units (`<= gross`).",
-            "format": "int64",
-            "type": "integer"
+          "fee": {
+            "$ref": "#/components/schemas/MoneyDto",
+            "description": "Processor's withheld cut in major units (`<= gross`), same currency and\nscale as `gross`."
           },
-          "gross_minor": {
-            "description": "Gross received in minor units (what the payer was charged).",
-            "format": "int64",
-            "type": "integer"
+          "gross": {
+            "$ref": "#/components/schemas/MoneyDto",
+            "description": "Gross received in major units (what the payer was charged)."
           },
           "payer_tenant_id": {
             "format": "uuid",
@@ -18976,12 +18940,6 @@
           "payment_id": {
             "description": "External payment identity — the idempotency key (a re-settle replays).",
             "type": "string"
-          },
-          "scale": {
-            "description": "Advisory currency scale; the ledger resolves the authoritative one.",
-            "format": "int32",
-            "minimum": 0,
-            "type": "integer"
           },
           "tenant_id": {
             "description": "The seller tenant whose ledger this settles into; the PEP gate target.\nCarried in the body, not the path.",
@@ -18993,10 +18951,8 @@
           "tenant_id",
           "payer_tenant_id",
           "payment_id",
-          "gross_minor",
-          "fee_minor",
-          "currency",
-          "scale"
+          "gross",
+          "fee"
         ],
         "type": "object"
       },
@@ -19025,52 +18981,42 @@
       "SettlementView": {
         "description": "The `GET /payments/{payment_id}/settlement` response: the per-payment money-out\nserialization counters (read-surface R4). Drawn from the `payment_settlement`\nrow (the `(tenant, payment_id)` grain) — the settled / fee / allocated /\nrefunded / clawed-back running totals the money-out caps serialize against.\nThe persisted `version` (the optimistic-concurrency counter) is INTERNAL and\nnot surfaced. Tenant-scoped (SQL-level BOLA): a payment that was never settled\n— or one outside the caller's subtree — yields a `404` (no existence leak).\nMirrors [`RefundView`].",
         "properties": {
-          "allocated_minor": {
-            "description": "The portion of the pool already drained to open AR (money-out).",
-            "format": "int64",
-            "type": "integer"
+          "allocated": {
+            "$ref": "#/components/schemas/MoneyDto",
+            "description": "The portion of the pool already drained to open AR (money-out)."
           },
-          "clawed_back_minor": {
-            "description": "The portion clawed back (a refund-of-refund / PSP claw-back).",
-            "format": "int64",
-            "type": "integer"
+          "clawed_back": {
+            "$ref": "#/components/schemas/MoneyDto",
+            "description": "The portion clawed back (a refund-of-refund / PSP claw-back)."
           },
-          "currency": {
-            "type": "string"
-          },
-          "fee_minor": {
-            "description": "The PSP fee withheld from the settled receipt.",
-            "format": "int64",
-            "type": "integer"
+          "fee": {
+            "$ref": "#/components/schemas/MoneyDto",
+            "description": "The PSP fee withheld from the settled receipt."
           },
           "payment_id": {
             "type": "string"
           },
-          "refunded_minor": {
-            "description": "The portion already returned to the payer via refunds.",
-            "format": "int64",
-            "type": "integer"
+          "refunded": {
+            "$ref": "#/components/schemas/MoneyDto",
+            "description": "The portion already returned to the payer via refunds."
           },
-          "refunded_unallocated_minor": {
-            "description": "The portion refunded from the still-unallocated pool (Pattern A).",
-            "format": "int64",
-            "type": "integer"
+          "refunded_unallocated": {
+            "$ref": "#/components/schemas/MoneyDto",
+            "description": "The portion refunded from the still-unallocated pool (Pattern A)."
           },
-          "settled_minor": {
-            "description": "The gross settled amount recorded for the payment (money-in).",
-            "format": "int64",
-            "type": "integer"
+          "settled": {
+            "$ref": "#/components/schemas/MoneyDto",
+            "description": "The gross settled amount recorded for the payment (money-in)."
           }
         },
         "required": [
           "payment_id",
-          "currency",
-          "settled_minor",
-          "fee_minor",
-          "allocated_minor",
-          "refunded_minor",
-          "refunded_unallocated_minor",
-          "clawed_back_minor"
+          "settled",
+          "fee",
+          "allocated",
+          "refunded",
+          "refunded_unallocated",
+          "clawed_back"
         ],
         "type": "object"
       },
@@ -20516,12 +20462,9 @@
       "TaxBreakdownDto": {
         "description": "One tax component of an invoice to post, already computed by the tax engine.",
         "properties": {
-          "amount_minor": {
-            "format": "int64",
-            "type": "integer"
-          },
-          "currency": {
-            "type": "string"
+          "amount": {
+            "$ref": "#/components/schemas/MoneyDto",
+            "description": "The tax component amount in major units (`>= 0`)."
           },
           "tax_filing_period": {
             "type": "string"
@@ -20537,8 +20480,7 @@
           }
         },
         "required": [
-          "amount_minor",
-          "currency",
+          "amount",
           "tax_jurisdiction",
           "tax_filing_period"
         ],
@@ -20922,7 +20864,7 @@
         "type": "object"
       },
       "TriggerRecognitionRunRequest": {
-        "description": "The `POST /recognition-runs` request body: trigger an ASC 606 recognition\nrun for one fiscal period (release the period's due `PENDING` segments). The\ntarget seller ledger is the body's own `tenant_id` (tenant in body, not path\n— the vhp-core REST convention); the `(entry, post)` PEP gate authorizes it\n(a run posts `DR CL / CR Revenue` journal entries). `run_id` is the\nrun-trigger idempotency key: `None` ⇒ the ledger mints a fresh one (a first,\nun-keyed trigger); a stable one makes retries idempotent (a replay returns\nthe prior run reference without starting a second run).",
+        "description": "The `POST /recognition-runs` request body: trigger an ASC 606 recognition\nrun for one fiscal period (release the period's due `PENDING` segments). The\ntarget seller ledger is the body's own `tenant_id` (tenant in body, not path\n— the platform REST convention); the `(entry, post)` PEP gate authorizes it\n(a run posts `DR CL / CR Revenue` journal entries). `run_id` is the\nrun-trigger idempotency key: `None` ⇒ the ledger mints a fresh one (a first,\nun-keyed trigger); a stable one makes retries idempotent (a replay returns\nthe prior run reference without starting a second run).",
         "properties": {
           "period_id": {
             "description": "The fiscal period to release due segments for (`YYYYMM`).",
@@ -21065,12 +21007,9 @@
       "UnallocatedDto": {
         "description": "The `GET /balances/unallocated` response: the payer's still-undrained pool\nfor a currency.",
         "properties": {
-          "balance_minor": {
-            "format": "int64",
-            "type": "integer"
-          },
-          "currency": {
-            "type": "string"
+          "balance": {
+            "$ref": "#/components/schemas/MoneyDto",
+            "description": "The undrained pool with its currency and stored scale."
           },
           "payer_tenant_id": {
             "format": "uuid",
@@ -21079,8 +21018,7 @@
         },
         "required": [
           "payer_tenant_id",
-          "currency",
-          "balance_minor"
+          "balance"
         ],
         "type": "object"
       },
@@ -30974,7 +30912,7 @@
     },
     "/bss-ledger/v1/balances": {
       "get": {
-        "description": "Cursor-paginated list of the account-balance cache rows for the seller named by `$filter=tenant_id eq <uuid>` (the caller's own by default). Supports OData `$filter` over `tenant_id`, `account_class` and `currency`. The `$filter` ANDs the caller's authorized subtree, so rows outside it are excluded (SQL-level BOLA). Each row carries BOTH the transaction-currency `balance_minor` and the Slice-5 functional valuation (`functional_balance_minor` / `functional_currency`); the latter is `null` on a single-currency grain, where the functional value equals `balance_minor` by identity (`?valuation=functional` fallback, P1 decision 8).",
+        "description": "Cursor-paginated list of the account-balance cache rows for the seller named by `$filter=tenant_id eq <uuid>` (the caller's own by default). Supports OData `$filter` over `tenant_id`, `account_class` and `currency`. The `$filter` ANDs the caller's authorized subtree, so rows outside it are excluded (SQL-level BOLA). Each row carries BOTH the transaction-currency `balance` and the Slice-5 functional valuation `functional_balance` (a money object with its own currency); the latter is `null` on a single-currency grain, where the functional value equals `balance` by identity (`?valuation=functional` fallback, P1 decision 8).",
         "operationId": "bss_ledger.list_balances",
         "parameters": [
           {
@@ -31303,7 +31241,7 @@
     },
     "/bss-ledger/v1/credit-applications": {
       "post": {
-        "description": "Operates the payer's reusable-credit wallet for the seller named by the body's `tenant_id`. ONE endpoint, two `kind`s. `kind = \"grant\"` parks `amount_minor` of the payer's unallocated pool into the wallet sub-grain `credit_grant_event_type` (DR UNALLOCATED, CR REUSABLE_CREDIT), capped at the live pool. `kind = \"apply\"` spends the wallet against the `targets` open receivables oldest-grant-first (N×DR REUSABLE_CREDIT, M×CR AR), capped on both the receivable side (open AR) and the wallet side (spendable sub-grains). Idempotent on `credit_application_id`. Rejected (400) when a grant exceeds the unallocated pool (GRANT_EXCEEDS_UNALLOCATED), an apply target names an unknown/closed invoice or over-applies the open AR (CREDIT_EXCEEDS_OPEN_AR), or the spendable wallet cannot cover the apply total (CREDIT_EXCEEDS_WALLET).",
+        "description": "Operates the payer's reusable-credit wallet for the seller named by the body's `tenant_id`. ONE endpoint, two `kind`s. `kind = \"grant\"` parks `money` of the payer's unallocated pool into the wallet sub-grain `credit_grant_event_type` (DR UNALLOCATED, CR REUSABLE_CREDIT), capped at the live pool. `kind = \"apply\"` spends the wallet against the `targets` open receivables oldest-grant-first (N×DR REUSABLE_CREDIT, M×CR AR), capped on both the receivable side (open AR) and the wallet side (spendable sub-grains). Idempotent on `credit_application_id`. Rejected (400) when a grant exceeds the unallocated pool (GRANT_EXCEEDS_UNALLOCATED), an apply target names an unknown/closed invoice or over-applies the open AR (CREDIT_EXCEEDS_OPEN_AR), or the spendable wallet cannot cover the apply total (CREDIT_EXCEEDS_WALLET).",
         "operationId": "bss_ledger.post_credit_application",
         "requestBody": {
           "content": {
@@ -31539,7 +31477,7 @@
         }
       },
       "post": {
-        "description": "Posts a balanced compensating credit note against a posted invoice for the seller named by the body's `tenant_id` (DR CONTRA_REVENUE — or GOODWILL for an AR-only goodwill credit — + per-stream DR CONTRACT_LIABILITY over the unreleased deferred + DR TAX_PAYABLE; CR AR capped at the invoice's current open AR + CR REUSABLE_CREDIT for any paid-invoice remainder, K-2). It never mutates the posted invoice rows and, in the SAME txn, reduces the owning recognition schedule's deferred total (so a later S6 run cannot re-recognize the credited- back amount) and bumps the invoice's credit-note headroom counter. `requested_deferred_minor` is the split INTENT (how much targets the deferred balance). Idempotent on `credit_note_id`: a re-post returns the prior posting reference (200) instead of a new one (201). Rejected when the recognized-vs-deferred split is indeterminable (CREDIT_NOTE_SPLIT_AMBIGUOUS — never a silent pro-rata) or the note would push past the invoice's headroom (CREDIT_NOTE_EXCEEDS_HEADROOM — route over-cap via goodwill/non- revenue, never silently through S3).",
+        "description": "Posts a balanced compensating credit note against a posted invoice for the seller named by the body's `tenant_id` (DR CONTRA_REVENUE — or GOODWILL for an AR-only goodwill credit — + per-stream DR CONTRACT_LIABILITY over the unreleased deferred + DR TAX_PAYABLE; CR AR capped at the invoice's current open AR + CR REUSABLE_CREDIT for any paid-invoice remainder, K-2). It never mutates the posted invoice rows and, in the SAME txn, reduces the owning recognition schedule's deferred total (so a later S6 run cannot re-recognize the credited- back amount) and bumps the invoice's credit-note headroom counter. `requested_deferred` is the split INTENT (how much targets the deferred balance). Idempotent on `credit_note_id`: a re-post returns the prior posting reference (200) instead of a new one (201). Rejected when the recognized-vs-deferred split is indeterminable (CREDIT_NOTE_SPLIT_AMBIGUOUS — never a silent pro-rata) or the note would push past the invoice's headroom (CREDIT_NOTE_EXCEEDS_HEADROOM — route over-cap via goodwill/non- revenue, never silently through S3).",
         "operationId": "bss_ledger.post_credit_note",
         "requestBody": {
           "content": {
@@ -31862,7 +31800,7 @@
         }
       },
       "post": {
-        "description": "Posts an additional charge against a posted invoice for the seller named by the body's `tenant_id` — a DIRECT split mirroring the invoice-post (DR AR incl-tax / CR REVENUE recognized-now / CR CONTRACT_LIABILITY deferred per PO / CR TAX_PAYABLE). When the note defers (`deferred_minor > 0`) it builds the releasing recognition schedule in the SAME txn (D4 — the `recognition` spec is required) so a later S6 run can release it, and it RAISES the invoice's headroom (`debit_note_total += amount`), widening the room for later credit notes (it can never trip the headroom cap). Idempotent on `debit_note_id`: a re-post returns the prior posting reference (200) instead of a new one (201). A closed payer cannot be charged (PAYER_CLOSED).",
+        "description": "Posts an additional charge against a posted invoice for the seller named by the body's `tenant_id` — a DIRECT split mirroring the invoice-post (DR AR incl-tax / CR REVENUE recognized-now / CR CONTRACT_LIABILITY deferred per PO / CR TAX_PAYABLE). When the note defers (`deferred > 0`) it builds the releasing recognition schedule in the SAME txn (D4 — the `recognition` spec is required) so a later S6 run can release it, and it RAISES the invoice's headroom (`debit_note_total += amount`), widening the room for later credit notes (it can never trip the headroom cap). Idempotent on `debit_note_id`: a re-post returns the prior posting reference (200) instead of a new one (201). A closed payer cannot be charged (PAYER_CLOSED).",
         "operationId": "bss_ledger.post_debit_note",
         "requestBody": {
           "content": {
@@ -32918,7 +32856,7 @@
     },
     "/bss-ledger/v1/fx/rates": {
       "post": {
-        "description": "Upserts one `base → quote` rate into the seller's local `ledger_fx_rate` store for the tenant named by the body's `tenant_id`. This is the SECONDARY ingest path — the primary is the `RateProviderV1` adapter pull driven by the background rate-sync job. Upsert-keyed on `(tenant, base, quote, provider)`: re-posting the same tuple overwrites the quote (`rate_micro` / `as_of` / `fallback_order`), so it is idempotent on `(tenant, base, quote, provider, as_of)`. Rejected (400) on an empty/oversized currency or provider code, a non-positive `rate_micro`, a negative `fallback_order`, or an identity (`base == quote`) pair. `(ledger, provision)` PEP gate against the body's `tenant_id`.",
+        "description": "Upserts one `base → quote` rate into the seller's local `ledger_fx_rate` store for the tenant named by the body's `tenant_id`. This is the SECONDARY ingest path — the primary is the `RateProviderV1` adapter pull driven by the background rate-sync job. Upsert-keyed on `(tenant, base, quote, provider)`: re-posting the same tuple overwrites the quote (`rate` / `as_of` / `fallback_order`), so it is idempotent on `(tenant, base, quote, provider, as_of)`. `rate` is plain decimal text (quote major units per base major unit), kept exactly. Rejected (400) on an empty/oversized currency or provider code, a malformed or non-positive `rate`, a negative `fallback_order`, or an identity (`base == quote`) pair. `(ledger, provision)` PEP gate against the body's `tenant_id`.",
         "operationId": "bss_ledger.ingest_fx_rate",
         "requestBody": {
           "content": {
@@ -33062,7 +33000,7 @@
         ]
       },
       "post": {
-        "description": "Writes a new effective-dated FX revaluation-mode version (`MODE_A` defer-to-ERP | `MODE_B` BSS-is-ledger-of-record) for the caller's tenant (VHP-1986). Append-only: a new version supersedes; the revaluation job / period-close pick the latest effective_from (highest version on a tie). An unknown mode is rejected (400), never coerced. Requires `config_write.v1`.",
+        "description": "Writes a new effective-dated FX revaluation-mode version (`MODE_A` defer-to-ERP | `MODE_B` BSS-is-ledger-of-record) for the caller's tenant. Append-only: a new version supersedes; the revaluation job / period-close pick the latest effective_from (highest version on a tie). An unknown mode is rejected (400), never coerced. Requires `config_write.v1`.",
         "operationId": "bss_ledger.set_fx_revaluation_mode",
         "requestBody": {
           "content": {
@@ -34911,7 +34849,7 @@
     },
     "/bss-ledger/v1/ledger/reconciliation-runs/{run_id}": {
       "get": {
-        "description": "Returns one `reconciliation_run` for `{run_id}` — the check type, the reconciled `variance_minor`, whether it is within tolerance, the run status, and when it ran. Tenant-scoped (SQL-level BOLA): a run that does not exist for the caller's tenant, or that lies outside the caller's authorized subtree, is the same 404 (no existence leak). `(reconciliation, read)` PEP gate.",
+        "description": "Returns one `reconciliation_run` for `{run_id}` — the check type, the reconciled `variance` (per-currency money, or a missing-invoice count), whether it is within tolerance, the run status, and when it ran. Tenant-scoped (SQL-level BOLA): a run that does not exist for the caller's tenant, or that lies outside the caller's authorized subtree, is the same 404 (no existence leak). `(reconciliation, read)` PEP gate.",
         "operationId": "bss_ledger.read_reconciliation_run",
         "parameters": [
           {
@@ -35867,7 +35805,7 @@
         ]
       },
       "post": {
-        "description": "Writes a new effective-dated invoice-posting policy version (the missing-mapping mode + the AR-aging bucket thresholds) for the caller's tenant (VHP-1853). Append-only: a new version supersedes; the orchestrator / aging read pick the latest effective_from (highest version on a tie). An unknown mode or empty / non-positive / non-monotone thresholds are rejected (400), never coerced. Requires `config_write.v1`.",
+        "description": "Writes a new effective-dated invoice-posting policy version (the missing-mapping mode + the AR-aging bucket thresholds) for the caller's tenant. Append-only: a new version supersedes; the orchestrator / aging read pick the latest effective_from (highest version on a tie). An unknown mode or empty / non-positive / non-monotone thresholds are rejected (400), never coerced. Requires `config_write.v1`.",
         "operationId": "bss_ledger.set_posting_policy",
         "requestBody": {
           "content": {
@@ -35945,7 +35883,7 @@
     },
     "/bss-ledger/v1/provisioning": {
       "post": {
-        "description": "Seeds the chart of accounts, non-ISO currency scales, the fiscal-calendar config, and the initial OPEN fiscal period for the seller legal-entity named by the body's `tenant_id`. Re-calls are additive: existing rows are a no-op.",
+        "description": "Seeds the chart of accounts, the currency scales of codes with no ISO 4217 minor-unit scale, the fiscal-calendar config, and the initial OPEN fiscal period for the seller legal-entity named by the body's `tenant_id`. An ISO 4217 code always has its ISO scale: a row for it may only repeat that scale, and another scale refuses the whole request with 400 and writes nothing. Re-calls are additive: existing rows are a no-op.",
         "operationId": "bss_ledger.provision",
         "requestBody": {
           "content": {
@@ -36449,7 +36387,7 @@
     },
     "/bss-ledger/v1/recognition-schedules/{schedule_id}": {
       "get": {
-        "description": "Returns the recognition schedule named by the path `schedule_id` for the `tenant_id` query (the schedule PK is `(tenant_id, schedule_id)`; the tenant is in the query, like the disaggregation report). The body is the schedule header (status, version, revenue_stream, currency, total_deferred_minor, recognized_minor, the originating source_invoice_id + source_invoice_item_ref invoice-link anchor, po_allocation_group, subscription_ref, policy_ref) plus its segments (segment_no, period_id, amount_minor, status), ordered by segment_no (period order). The read is tenant-scoped (SQL-level BOLA): a schedule outside the caller's authorized subtree — or simply absent — yields a 404 (no existence leak).",
+        "description": "Returns the recognition schedule named by the path `schedule_id` for the `tenant_id` query (the schedule PK is `(tenant_id, schedule_id)`; the tenant is in the query, like the disaggregation report). The body is the schedule header (status, version, revenue_stream, total_deferred and recognized as money objects, the originating source_invoice_id + source_invoice_item_ref invoice-link anchor, po_allocation_group, subscription_ref, policy_ref) plus its segments (segment_no, period_id, money, status), ordered by segment_no (period order). The read is tenant-scoped (SQL-level BOLA): a schedule outside the caller's authorized subtree — or simply absent — yields a 404 (no existence leak).",
         "operationId": "bss_ledger.get_recognition_schedule",
         "parameters": [
           {
@@ -38144,7 +38082,7 @@
     },
     "/bss-pricing/v1/approval-units/{id}/approve": {
       "post": {
-        "description": "Records an approving vote on the generation the reviewer saw; the vote that reaches the quorum applies the unit (a plan revision whose sale date is after today is scheduled for that date, D-449). The vote's note is at most 2000 characters. Refusals: 400 GENERATION_MISMATCH, UNIT_STALE or NOTE_TOO_LONG; 403 SOD_VIOLATION for the submitter or the author; 409 DUPLICATE_VOTE, UNIT_ALREADY_DECIDED or APPLY_REFUSED, and PRICE_ALREADY_STARTED when a price the unit cancels started after its submit (D-520); 503 REGISTRY_UNAVAILABLE when Products cannot answer a read the applying vote's rules make: a plan revision's checks, or a usage chain's dated metering (D-402).",
+        "description": "Records an approving vote on the generation the reviewer saw; the vote that reaches the quorum applies the unit (a plan revision whose sale date is after today is scheduled for that date, D-449). The vote's note is at most 2000 characters. Refusals: 400 GENERATION_MISMATCH, UNIT_STALE or NOTE_TOO_LONG; 403 SOD_VIOLATION for the submitter or the author; 409 DUPLICATE_VOTE, UNIT_ALREADY_DECIDED or APPLY_REFUSED, and PRICE_ALREADY_STARTED when a price the unit cancels started after its submit (D-520), CURRENCY_SCALE_CHANGED when a draft of the unit is stored at another scale than the currency table gives today (the submitter withdraws the unit, edits the draft and submits it again; a cancel or end row keeps its price's scale and is never refused for it), or BOOK_CURRENCY_INVALID when the table no longer lists the book's currency; 503 REGISTRY_UNAVAILABLE when Products cannot answer a read the applying vote's rules make: a plan revision's checks, or a usage chain's dated metering (D-402).",
         "operationId": "bss_pricing.approve_unit",
         "parameters": [
           {
@@ -42370,7 +42308,7 @@
         ]
       },
       "post": {
-        "description": "Adds a draft price to an entry's chain, and a temporary price's return partner with it; the Idempotency-Key replays the answer. The money is in the entry's model and the price carries no model of its own (D-427). The note is at most 2000 characters (D-457). Refusals: 400 for a rule the price breaks (for example PRICE_MISSING for money of another model's shape, AMOUNT_INVALID, WINDOW_START_IN_PAST, DIM_VALUE_UNKNOWN or PRICE_INSIDE_TEMPORARY), or NOTE_TOO_LONG; 409 ENTRY_REFERENCE_LOST.",
+        "description": "Adds a draft price to an entry's chain, and a temporary price's return partner with it; the Idempotency-Key replays the answer. The money is in the entry's model and the price carries no model of its own (D-427). The note is at most 2000 characters (D-457). Every decimal is a JSON string of plain decimal text, stored in its canonical form (30.00 is stored as 30; D-527, D-528). Refusals: 400 for a rule the price breaks (for example PRICE_MISSING for money of another model's shape, AMOUNT_INVALID for a decimal sent as a JSON number, text that is not plain decimal text, a negative value or a zero package size, the message naming the field, AMOUNT_OUT_OF_RANGE for a decimal over its limit (a rate takes 12 fractional places, a threshold or a package size 28, and any decimal 28 digits), MIN_FEE_INVALID, WINDOW_START_IN_PAST, DIM_VALUE_UNKNOWN or PRICE_INSIDE_TEMPORARY), or NOTE_TOO_LONG; 409 ENTRY_REFERENCE_LOST, or BOOK_CURRENCY_INVALID when the currency table no longer lists the book's currency. A new price, and a temporary price's return, store the book's currency at the scale the currency table gives it today (currency, currency_scale; D-531).",
         "operationId": "bss_pricing.create_price",
         "parameters": [
           {
@@ -42782,7 +42720,7 @@
         }
       },
       "post": {
-        "description": "Creates a price book of the tenant with a code, a name, one currency, an optional validity window and an optional description of at most 2000 characters (D-444); the Idempotency-Key replays the first answer. The currency must be one the tenant settings offer, when they offer any (D-438). The code is at most 64 characters and the name 200 (D-457). Refusals: 400 BOOK_CODE_REQUIRED, BOOK_NAME_REQUIRED, BOOK_CURRENCY_INVALID, BOOK_VALIDITY_INVALID, BOOK_DESCRIPTION_TOO_LONG, or FIELD_TOO_LONG on a code or a name over its cap; 409 CURRENCY_NOT_OFFERED, BOOK_CODE_TAKEN or IDEMPOTENCY_CONFLICT.",
+        "description": "Creates a price book of the tenant with a code, a name, one currency, an optional validity window and an optional description of at most 2000 characters (D-444); the Idempotency-Key replays the first answer. The currency must be one the currency table resolves: an ISO 4217 code with a scale, or a non-ISO code the deployment's currency_scales adds (D-529); else 400 BOOK_CURRENCY_INVALID. It must also be one the tenant settings offer, when they offer any (D-438). The code is at most 64 characters and the name 200 (D-457). Refusals: 400 BOOK_CODE_REQUIRED, BOOK_NAME_REQUIRED, BOOK_CURRENCY_INVALID, BOOK_VALIDITY_INVALID, BOOK_DESCRIPTION_TOO_LONG, or FIELD_TOO_LONG on a code or a name over its cap; 409 CURRENCY_NOT_OFFERED, BOOK_CODE_TAKEN or IDEMPOTENCY_CONFLICT.",
         "operationId": "bss_pricing.create_book",
         "parameters": [
           {
@@ -44007,7 +43945,7 @@
         ]
       },
       "post": {
-        "description": "Submits the book's draft prices, all of them or the listed price_ids, optionally on a common effective date, as one prices approval unit; at quorum 0 it applies at once. An optional note for the approver is stored on the unit as submit_note (D-464). Refusals: 400 NOTE_TOO_LONG for a note over 2000 characters, judged before anything is read; 400 NO_DRAFT_PRICES, PRICE_NOT_IN_BOOK or PAIR_SPLIT, or END_DATE_INVALID for an end (D-521); 409 PRICE_LOCKED_PENDING or UNIT_CONTENDED, or a guard of a cancel or an end (PRICE_NOT_SCHEDULED, PRICE_CHANGE_PENDING when another pending change or the same unit names its price, PRICE_BOUND, PRICE_ALREADY_ENDED, D-520, D-521), or a price of a released entry (BOOK_ARCHIVED while its book is archived, else ENTRY_REFERENCE_RELEASED, D-522); 503 REGISTRY_UNAVAILABLE when Products cannot answer a usage chain's dated metering read (D-402).",
+        "description": "Submits the book's draft prices, all of them or the listed price_ids, optionally on a common effective date, as one prices approval unit; at quorum 0 it applies at once. An optional note for the approver is stored on the unit as submit_note (D-464). Refusals: 400 NOTE_TOO_LONG for a note over 2000 characters, judged before anything is read; 400 NO_DRAFT_PRICES, PRICE_NOT_IN_BOOK or PAIR_SPLIT, or END_DATE_INVALID for an end (D-521); 409 PRICE_LOCKED_PENDING or UNIT_CONTENDED, or a guard of a cancel or an end (PRICE_NOT_SCHEDULED, PRICE_CHANGE_PENDING when another pending change or the same unit names its price, PRICE_BOUND, PRICE_ALREADY_ENDED, D-520, D-521), or a price of a released entry (BOOK_ARCHIVED while its book is archived, else ENTRY_REFERENCE_RELEASED, D-522), or CURRENCY_SCALE_CHANGED for a draft stored at another scale than the currency table gives today (edit the draft and submit it again), or BOOK_CURRENCY_INVALID when the table no longer lists the book's currency; 503 REGISTRY_UNAVAILABLE when Products cannot answer a usage chain's dated metering read (D-402).",
         "operationId": "bss_pricing.publish_changes",
         "parameters": [
           {
@@ -44514,7 +44452,7 @@
         ]
       },
       "patch": {
-        "description": "Changes an unlocked draft price of its author at the version the author read (If-Match). The temporary half of a draft takes effective_from and temporary_until: its pair is built again over the new dates in the same transaction (D-443) - its return re-derived in place, deleted when the chain's next price starts on the new end or nothing of the chain is in force there, or created when a price is to be returned to - and both halves are judged as the create judges them; the answer is the edited price, its paired_price_id naming its partner now, or null. A return's own dates, a temporary price's chain (dim_value), an end on any other price and a null end are 400 TEMPORARY_PRICE_FIXED. Refusals: 400 for a rule the change breaks (for example WINDOW_END_INVALID, WINDOW_START_IN_PAST or TEMPORARY_SPANS_A_CHANGE), or NOTE_TOO_LONG on a note over 2000 characters (D-457); 403 NOT_DRAFT_AUTHOR; 409 PRICE_NOT_DRAFT (the price or its partner, or a cancel or end row, which is deleted instead, D-520) or STALE_REVISION.",
+        "description": "Changes an unlocked draft price of its author at the version the author read (If-Match). The temporary half of a draft takes effective_from and temporary_until: its pair is built again over the new dates in the same transaction (D-443) - its return re-derived in place, deleted when the chain's next price starts on the new end or nothing of the chain is in force there, or created when a price is to be returned to - and both halves are judged as the create judges them; the answer is the edited price, its paired_price_id naming its partner now, or null. A return's own dates, a temporary price's chain (dim_value), an end on any other price and a null end are 400 TEMPORARY_PRICE_FIXED. Every PATCH, whatever it changes, stores the currency scale the currency table gives the book's currency today, and the fee is judged on that scale: a draft refused with CURRENCY_SCALE_CHANGED is edited (a note is enough) and submitted again. Of a temporary pair whose dates stay, only the edited half takes the new scale. Refusals: 400 for a rule the change breaks (for example AMOUNT_INVALID or AMOUNT_OUT_OF_RANGE as on the create, MIN_FEE_INVALID, WINDOW_END_INVALID, WINDOW_START_IN_PAST or TEMPORARY_SPANS_A_CHANGE), or NOTE_TOO_LONG on a note over 2000 characters (D-457); 403 NOT_DRAFT_AUTHOR; 409 PRICE_NOT_DRAFT (the price or its partner, or a cancel or end row, which is deleted instead, D-520), STALE_REVISION, or BOOK_CURRENCY_INVALID when the currency table no longer lists the book's currency.",
         "operationId": "bss_pricing.patch_price",
         "parameters": [
           {
@@ -44941,7 +44879,7 @@
     },
     "/bss-pricing/v1/prices/{id}/submit": {
       "post": {
-        "description": "Puts one draft price into a prices approval unit; at quorum 0 the unit applies at once. A half of a temporary pair is not submitted alone: it is 400 PAIR_SPLIT, and the pair goes through POST /price-books/{id}/publish-changes, which completes it (D-405). It takes no body and no note: a note for the approver travels with publish-changes (D-464). Refusals: 400 BODY_UNEXPECTED for a body with any key; 400 PAIR_SPLIT, or a rule the price breaks at submit (for example WINDOW_START_IN_PAST, PAIR_RETURN_STALE or CHAIN_MODEL_CHANGED, or END_DATE_INVALID for an end, D-521); 409 PRICE_NOT_DRAFT, PRICE_LOCKED_PENDING or UNIT_CONTENDED, or a guard of a cancel or an end (PRICE_NOT_SCHEDULED, PRICE_CHANGE_PENDING, PRICE_BOUND, PRICE_ALREADY_ENDED, D-520, D-521), or a price of a released entry (BOOK_ARCHIVED while its book is archived, else ENTRY_REFERENCE_RELEASED, D-522); 503 REGISTRY_UNAVAILABLE when Products cannot answer a usage chain's dated metering read (D-402).",
+        "description": "Puts one draft price into a prices approval unit; at quorum 0 the unit applies at once. A half of a temporary pair is not submitted alone: it is 400 PAIR_SPLIT, and the pair goes through POST /price-books/{id}/publish-changes, which completes it (D-405). It takes no body and no note: a note for the approver travels with publish-changes (D-464). Refusals: 400 BODY_UNEXPECTED for a body with any key; 400 PAIR_SPLIT, or a rule the price breaks at submit (for example WINDOW_START_IN_PAST, PAIR_RETURN_STALE or CHAIN_MODEL_CHANGED, or END_DATE_INVALID for an end, D-521); 409 PRICE_NOT_DRAFT, PRICE_LOCKED_PENDING or UNIT_CONTENDED, or a guard of a cancel or an end (PRICE_NOT_SCHEDULED, PRICE_CHANGE_PENDING, PRICE_BOUND, PRICE_ALREADY_ENDED, D-520, D-521), or a price of a released entry (BOOK_ARCHIVED while its book is archived, else ENTRY_REFERENCE_RELEASED, D-522), or CURRENCY_SCALE_CHANGED for a draft stored at another scale than the currency table gives today (edit the draft and submit it again), or BOOK_CURRENCY_INVALID when the table no longer lists the book's currency; 503 REGISTRY_UNAVAILABLE when Products cannot answer a usage chain's dated metering read (D-402).",
         "operationId": "bss_pricing.submit_price",
         "parameters": [
           {
@@ -45349,7 +45287,7 @@
     },
     "/bss-pricing/v1/settings": {
       "get": {
-        "description": "Returns the tenant's billing defaults (timing, rounding, GL code, tax category), invoice-line templates by SKU type and the currencies a new book may take (empty: any), with who wrote them last and when, and its version as the ETag; the defaults apply, with no writer, until the settings are first written. An If-None-Match that matches that ETag by weak comparison is 304 with an empty body and the same ETag; both answers carry Cache-Control private, no-cache (D-518).",
+        "description": "Returns the tenant's billing defaults (timing, GL code, tax category), invoice-line templates by SKU type and the currencies a new book may take (empty: any), with who wrote them last and when, and its version as the ETag; the defaults apply, with no writer, until the settings are first written. An If-None-Match that matches that ETag by weak comparison is 304 with an empty body and the same ETag; both answers carry Cache-Control private, no-cache (D-518).",
         "operationId": "bss_pricing.get_settings",
         "parameters": [
           {
@@ -45496,7 +45434,7 @@
         ]
       },
       "put": {
-        "description": "Replaces the tenant settings at the version the caller read (If-Match), currencies included (required; [] offers any currency, D-438), and records the caller and the time. Rounding is half_up, half_even, half_down, up or down (D-437). A GL code or a tax category other than the stored one is at most 64 characters, and a line template other than the one stored for its SKU type 2000; a stored text sent back unchanged passes whatever its length (D-457). Refusals: 400 TIMING_INVALID, ROUNDING_REQUIRED, ROUNDING_INVALID, SKU_TYPE_INVALID, CURRENCY_INVALID, an invalid line template (LINE_TEMPLATE_EMPTY, LINE_TEMPLATE_INVALID), or FIELD_TOO_LONG on a changed default_gl, default_tax_category or invoice_line_templates over its cap; 409 STALE_REVISION.",
+        "description": "Replaces the tenant settings at the version the caller read (If-Match), currencies included (required; [] offers any currency, D-438), and records the caller and the time. Each offered currency is one the currency table resolves, listed once; else 400 CURRENCY_INVALID naming the code and the reason (D-529), or with a fixed message that does not repeat a value that is not three uppercase letters. A GL code or a tax category other than the stored one is at most 64 characters, and a line template other than the one stored for its SKU type 2000; a stored text sent back unchanged passes whatever its length (D-457). Refusals: 400 TIMING_INVALID, SKU_TYPE_INVALID, CURRENCY_INVALID, an invalid line template (LINE_TEMPLATE_EMPTY, LINE_TEMPLATE_INVALID), or FIELD_TOO_LONG on a changed default_gl, default_tax_category or invoice_line_templates over its cap; 409 STALE_REVISION.",
         "operationId": "bss_pricing.put_settings",
         "parameters": [
           {

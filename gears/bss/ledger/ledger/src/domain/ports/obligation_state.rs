@@ -11,7 +11,7 @@
 //! is skipped (delayed — never released early).
 //!
 //! **v1 default = proceed.** There is no Subscriptions obligation-satisfaction
-//! feed in v1 (the consumer is deferred to Slice 7 / VHP-1859), and the design
+//! feed in v1 (the consumer is deferred to Slice 7), and the design
 //! is explicit that **revenue is earned regardless of collections** — so the v1
 //! default [`AlwaysSatisfiedObligationState`] returns
 //! [`ObligationState::Satisfied`] for every schedule and recognition actually
@@ -106,8 +106,8 @@ pub trait ObligationStateResolver: Send + Sync + 'static {
 /// The v1 default resolver: every obligation is treated as satisfied, so
 /// recognition runs (design §4.3 — revenue is earned regardless of collections,
 /// and there is no Subscriptions feed in v1). Replaced by the real fail-safe
-/// reader when the Subscriptions obligation-satisfaction feed lands (Slice 7 /
-/// VHP-1859). Mirrors [`NoopLedgerMetrics`](super::metrics::NoopLedgerMetrics):
+/// reader when the Subscriptions obligation-satisfaction feed lands (Slice 7).
+/// Mirrors [`NoopLedgerMetrics`](super::metrics::NoopLedgerMetrics):
 /// a zero-state safe default wired in until the real adapter exists.
 #[domain_model]
 #[derive(Debug, Default, Clone, Copy)]

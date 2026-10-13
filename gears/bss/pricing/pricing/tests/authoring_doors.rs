@@ -498,6 +498,8 @@ fn price(p: &price_book_entry::Model) -> price::Model {
         version_no: 1,
         dim_value: None,
         price_json: serde_json::json!({"rate":"0.1"}),
+        currency: "EUR".into(),
+        currency_scale: 2,
         min_fee: Some("12.34".into()),
         eligibility: "all".into(),
         effective_from: at(9).date(),
@@ -947,7 +949,7 @@ async fn a_nul_character_in_free_text_is_refused_before_any_write() {
         .call(
             "PUT",
             "/settings",
-            json!({"default_timing":"advance","default_rounding":"half\u{0}up","invoice_line_templates":{}}),
+            json!({"default_timing":"advance","default_gl":"gl\u{0}x","invoice_line_templates":{}}),
             Some(&tag),
             None,
         )

@@ -22,6 +22,8 @@ pub struct Model {
     pub business_id: String,
     pub payload_hash: String,
     pub result_entry_id: Option<Uuid>,
+    /// Immutable successor result for SCHEDULE_CHANGE; never a journal entry.
+    pub result_schedule_id: Option<String>,
     pub posted_at_utc: Option<OffsetDateTime>,
     pub status: String,
     pub retain_until: Option<OffsetDateTime>,

@@ -60,7 +60,7 @@ async fn approved(
     let mut price = entry_support::price(&p);
     price.version_no = version_no;
     price.state = "approved".into();
-    price.price_json = json!({"rate":"0.20"});
+    price.price_json = json!({"rate":"0.2"});
     price.effective_from = date(from);
     price.effective_to = to.or(until).map(date);
     price.closed_explicitly = to.is_some();
@@ -185,7 +185,7 @@ async fn moving_a_pairs_dates_re_derives_its_return_in_place() {
     assert_eq!(r.version, 3, "created, edited, re-derived");
     assert_eq!(
         r.price_json,
-        json!({"rate":"0.20"}),
+        json!({"rate":"0.2"}),
         "the money is copied again"
     );
     assert_eq!(r.return_of_price_id, Some(back));
@@ -262,7 +262,7 @@ async fn a_return_is_created_numbered_after_every_price_and_deleted_when_the_end
         promo.as_str().map(str::to_owned)
     );
     assert_eq!(r.created_by, f.ctx.subject_id());
-    assert_eq!(r.price_json, json!({"rate":"0.20"}));
+    assert_eq!(r.price_json, json!({"rate":"0.2"}));
     assert_eq!(audited(&f, &ret).await, [("price.create".to_owned(), 1)]);
 
     // The end on the next start again: the return goes.

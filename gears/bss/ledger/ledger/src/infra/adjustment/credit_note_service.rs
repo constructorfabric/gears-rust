@@ -47,7 +47,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use bss_ledger_sdk::{AccountClass, MappingStatus, PostingRef, Side, SourceDocType};
+use bss_ledger_sdk::{AccountClass, MappingStatus, PostedMoney, PostingRef, Side, SourceDocType};
 use chrono::Datelike;
 use toolkit_db::secure::{AccessScope, DbTx};
 use toolkit_db::{DBProvider, DbError};
@@ -64,12 +64,12 @@ use crate::domain::approval::ApprovalKind;
 use crate::domain::approval::intent::{ApprovalIntent, CreditNoteIntent};
 use crate::domain::approval::policy::OperationFacts;
 use crate::domain::error::DomainError;
+use crate::domain::exact_money::matching_spec;
 use crate::domain::instant::to_naive_date;
 use crate::domain::model::{NewEntry, NewLine};
 use crate::domain::ports::metrics::{LedgerMetricsPort, NoteOutcome};
 use crate::domain::status::{LIFECYCLE_OPEN, SCHEDULE_STATUS_ACTIVE};
 use crate::infra::approval::service::ApprovalService;
-use crate::infra::currency_scale::CurrencyScaleResolver;
 use crate::infra::events::payloads::{
     AffectedItem, AlarmCategory, AlarmSeverity, CreditNotePosted, LedgerInvariantAlarm,
 };
@@ -79,9 +79,10 @@ use crate::infra::posting::chart::load_chart;
 use crate::infra::posting::idempotency::{ClaimOutcome, IdempotencyGate};
 use crate::infra::posting::projector::BalanceProjector;
 use crate::infra::posting::service::{PostSidecar, PostedFacts, PostingService};
-use crate::infra::storage::entity::recognition_schedule;
-use crate::infra::storage::repo::adjustment_repo::NewCreditNote;
+use crate::infra::storage::repo::adjustment_repo::{ExposureView, NewCreditNote};
+use crate::infra::storage::repo::recognition_repo::ScheduleState;
 use crate::infra::storage::repo::{AdjustmentRepo, JournalRepo, RecognitionRepo, ReferenceRepo};
+use crate::infra::v1_payload::v1_minor_units_for;
 use time::OffsetDateTime;
 
 /// Origin literal stamped on posts made through this service (mirrors the peer
@@ -92,7 +93,6 @@ const ORIGIN_SYSTEM: &str = "SYSTEM";
 pub struct CreditNoteHandler {
     posting: PostingService,
     reference: ReferenceRepo,
-    resolver: CurrencyScaleResolver,
     recognition: RecognitionRepo,
     adjustment: AdjustmentRepo,
     /// Append-only journal insert — used by the COMPOSITE path (Group G): the
@@ -101,6 +101,7 @@ pub struct CreditNoteHandler {
     /// here directly rather than through `PostingService::post` (which would open
     /// its own txn). A cheap clone of the same provider.
     journal: JournalRepo,
+    backend: sea_orm::DbBackend,
     /// The event publisher — threaded into the posting engine AND held so the
     /// in-txn sidecar can publish `billing.ledger.credit_note.posted`, and so the
     /// split-ambiguous path can raise the `CreditNoteSplitBlocked` alarm
@@ -110,7 +111,7 @@ pub struct CreditNoteHandler {
     /// per attempt, labelled posted / replayed / `blocked_split` / `blocked_headroom`
     /// / rejected.
     metrics: Arc<dyn LedgerMetricsPort>,
-    /// The dual-control engine (VHP-1852). `Some` ⇒ a credit note whose amount
+    /// The dual-control engine. `Some` ⇒ a credit note whose amount
     /// crosses the tenant's D2 threshold is gated to the preparer→approver queue
     /// ([`DomainError::DualControlRequired`]) instead of posting inline; `None` ⇒
     /// gating is disabled (the executor's approved replay, and the unit tests that
@@ -139,17 +140,17 @@ impl CreditNoteHandler {
     ) -> Self {
         let posting = PostingService::new(db.clone(), Arc::clone(&publisher));
         let reference = ReferenceRepo::new(db.clone());
-        let resolver = CurrencyScaleResolver::new(ReferenceRepo::new(db.clone()));
         let recognition = RecognitionRepo::new(db.clone());
         let adjustment = AdjustmentRepo::new(db.clone());
+        let backend = db.db().backend();
         let journal = JournalRepo::new(db);
         Self {
             posting,
             reference,
-            resolver,
             recognition,
             adjustment,
             journal,
+            backend,
             publisher,
             metrics,
             approval: None,
@@ -166,7 +167,7 @@ impl CreditNoteHandler {
         self
     }
 
-    /// Attach the dual-control engine (VHP-1852): a credit note whose amount crosses
+    /// Attach the dual-control engine: a credit note whose amount crosses
     /// the tenant's D2 threshold is then gated to the preparer→approver queue
     /// ([`DomainError::DualControlRequired`]) rather than posting inline. The approved
     /// replay re-enters through [`Self::post_credit_note_approved`], which skips the
@@ -211,7 +212,7 @@ impl CreditNoteHandler {
         result
     }
 
-    /// The approved-replay entry (VHP-1852): re-drive a held credit note WITHOUT the
+    /// The approved-replay entry: re-drive a held credit note WITHOUT the
     /// dual-control gate. Called only by the `ApprovalExecutor` after a second actor
     /// approves the PENDING credit-note approval — the threshold was already crossed
     /// at gate time, so re-checking it would re-open a second approval (an infinite
@@ -253,9 +254,9 @@ impl CreditNoteHandler {
         // A zero-amount note has no compensating effect and would fail the engine's
         // empty-entry validation; reject up-front (inherited S1 / AC #4 forbids a
         // zero placeholder entry just as it forbids a zero placeholder line).
-        if req.amount_minor == 0 {
+        if req.amount.amount().is_zero() {
             return Err(DomainError::InvalidRequest(
-                "credit note amount_minor must be > 0".to_owned(),
+                "credit note amount must be > 0".to_owned(),
             ));
         }
 
@@ -277,7 +278,7 @@ impl CreditNoteHandler {
             )));
         }
 
-        // 1c. Dual-control gate (VHP-1852, design §1.4 D2 / §4.2). Gated on the
+        // 1c. Dual-control gate (design §1.4 D2 / §4.2). Gated on the
         //     credit note's amount crossing the tenant's D2 threshold, AFTER the
         //     shape gate (a malformed request 400s) AND the originating-invoice link
         //     gate (an absent origin 404s) — so neither opens an approval — but
@@ -293,7 +294,7 @@ impl CreditNoteHandler {
                 // FX-SIMPLIFICATION (DC10 / FX = Slice 5): transaction-currency minor,
                 // not USD-eq. Single-currency until the FX slice lands; mirrors the
                 // refund gate's comment.
-                amount_usd_eq_minor: Some(req.amount_minor),
+                amount: Some(req.amount.clone()),
                 effective_at: None,
                 has_outstanding_balance: false,
             };
@@ -341,16 +342,16 @@ impl CreditNoteHandler {
             .await
             .map_err(|e| DomainError::Internal(format!("read invoice_exposure: {e}")))?
         {
-            Some(exp) => {
-                exp.original_total_minor + exp.debit_note_total_minor - exp.credit_note_total_minor
-            }
-            None => posted_ar_incl_tax,
+            Some(exp) => exposure_headroom(&exp)?,
+            None => posted_ar_incl_tax.clone(),
         };
-        if req.amount_minor > remaining_headroom {
+        matching_spec(&req.amount, &remaining_headroom)?;
+        if req.amount.amount() > remaining_headroom.amount() {
             return Err(DomainError::CreditNoteExceedsHeadroom(format!(
-                "credit note {} incl-tax amount {} exceeds the invoice's remaining \
-                 headroom {remaining_headroom}",
-                req.credit_note_id, req.amount_minor
+                "credit note {} incl-tax amount {} exceeds the invoice's remaining headroom {}",
+                req.credit_note_id,
+                req.amount.amount(),
+                remaining_headroom.amount()
             )));
         }
 
@@ -361,8 +362,8 @@ impl CreditNoteHandler {
             source_invoice_item_ref: req.origin_invoice_item_ref.as_deref().unwrap_or(""),
             po_allocation_group: req.po_allocation_group.as_deref(),
             streams: &streams,
-            amount_minor_ex_tax: req.amount_minor_ex_tax(),
-            requested_deferred_minor: req.requested_deferred_minor,
+            amount_ex_tax: req.amount_ex_tax()?,
+            requested_deferred: req.requested_deferred.clone(),
         });
         let split = match split {
             Ok(s) => s,
@@ -422,9 +423,9 @@ impl CreditNoteHandler {
         req: &CreditNoteRequest,
     ) -> Result<PreparedCreditNote, DomainError> {
         validate_shape(req)?;
-        if req.amount_minor == 0 {
+        if req.amount.amount().is_zero() {
             return Err(DomainError::InvalidRequest(
-                "credit note amount_minor must be > 0".to_owned(),
+                "credit note amount must be > 0".to_owned(),
             ));
         }
         if !self
@@ -447,8 +448,8 @@ impl CreditNoteHandler {
             source_invoice_item_ref: req.origin_invoice_item_ref.as_deref().unwrap_or(""),
             po_allocation_group: req.po_allocation_group.as_deref(),
             streams: &streams,
-            amount_minor_ex_tax: req.amount_minor_ex_tax(),
-            requested_deferred_minor: req.requested_deferred_minor,
+            amount_ex_tax: req.amount_ex_tax()?,
+            requested_deferred: req.requested_deferred.clone(),
         });
         let split = match split {
             Ok(s) => s,
@@ -554,7 +555,7 @@ impl CreditNoteHandler {
         // Balance projection (AR no-negative guard) on the credit-note entry, in the
         // shared txn — the same guard `PostingService::post` runs for a standalone
         // credit note.
-        BalanceProjector::new()
+        BalanceProjector::new(self.backend)
             .project(
                 txn,
                 scope,
@@ -604,17 +605,18 @@ impl CreditNoteHandler {
         ctx: &SecurityContext,
         req: &CreditNoteRequest,
         plan: &CreditNoteLegPlan,
-        posted_ar_incl_tax: i64,
+        posted_ar_incl_tax: PostedMoney,
     ) -> CreditNotePostSidecar {
         CreditNotePostSidecar {
             tenant_id: req.tenant_id,
             origin_invoice_id: req.origin_invoice_id.clone(),
-            currency: req.currency.clone(),
             posted_ar_incl_tax,
-            credit_note_amount_minor: req.amount_minor,
+            credit_note_amount: req.amount.clone(),
             credit_note_id: req.credit_note_id.clone(),
-            recognized_part_minor: plan.recognized_part_minor,
-            deferred_part_minor: plan.deferred_part_minor,
+            recognized_part: plan.recognized_part.clone(),
+            deferred_part: plan.deferred_part.clone(),
+            recognition: self.recognition.clone(),
+            adjustment: self.adjustment.clone(),
             publisher: Arc::clone(&self.publisher),
             ctx: ctx.clone(),
             schedule_reductions: plan
@@ -628,10 +630,9 @@ impl CreditNoteHandler {
                 origin_invoice_id: req.origin_invoice_id.clone(),
                 origin_invoice_item_ref: req.origin_invoice_item_ref.clone(),
                 revenue_stream: req.revenue_stream.clone(),
-                currency: req.currency.clone(),
-                amount_minor: req.amount_minor,
-                recognized_part_minor: plan.recognized_part_minor,
-                deferred_part_minor: plan.deferred_part_minor,
+                amount: req.amount.clone(),
+                recognized_part: plan.recognized_part.clone(),
+                deferred_part: plan.deferred_part.clone(),
                 split_basis_ref: Some(plan.split_basis_ref.clone()),
                 reason_code: req.reason_code.clone(),
                 created_at_utc: OffsetDateTime::now_utc(),
@@ -741,21 +742,31 @@ impl CreditNoteHandler {
         &self,
         scope: &AccessScope,
         req: &CreditNoteRequest,
-    ) -> Result<(i64, i64), DomainError> {
+    ) -> Result<(PostedMoney, PostedMoney), DomainError> {
         // Out-of-txn scoped reads on a fresh connection (no active post txn yet),
         // mirroring how the engine reads `normal_sides` before the post txn and how
         // `CreditApplicationService` reads its open-AR candidates pre-txn — the
         // headroom + AR no-negative CHECKs are the authoritative in-txn backstops.
         let posted_ar = self
             .adjustment
-            .read_posted_ar_incl_tax_out_of_txn(scope, req.tenant_id, &req.origin_invoice_id)
+            .read_posted_ar_incl_tax_out_of_txn(
+                scope,
+                req.tenant_id,
+                &req.origin_invoice_id,
+                req.amount.currency(),
+            )
             .await
-            .map_err(|e| DomainError::Internal(format!("read posted AR: {e}")))?;
+            .map_err(|e| crate::infra::adjustment::map_adjustment_repo_err("read posted AR", e))?;
         let open_ar = self
             .adjustment
-            .read_open_ar_for_invoice_out_of_txn(scope, req.tenant_id, &req.origin_invoice_id)
+            .read_open_ar_for_invoice_out_of_txn(
+                scope,
+                req.tenant_id,
+                &req.origin_invoice_id,
+                req.amount.currency(),
+            )
             .await
-            .map_err(|e| DomainError::Internal(format!("read open AR: {e}")))?;
+            .map_err(|e| crate::infra::adjustment::map_adjustment_repo_err("read open AR", e))?;
         Ok((posted_ar, open_ar))
     }
 
@@ -772,11 +783,6 @@ impl CreditNoteHandler {
         plan: &CreditNoteLegPlan,
     ) -> Result<(NewEntry, Vec<NewLine>), DomainError> {
         let chart = load_chart(&self.reference, scope, req.tenant_id).await?;
-        let scale = self
-            .resolver
-            .resolve(scope, req.tenant_id, &req.currency)
-            .await
-            .map_err(|e| DomainError::Internal(format!("currency scale resolve: {e}")))?;
 
         let eff_date = to_naive_date(OffsetDateTime::now_utc());
         let period_id = format!("{:04}{:02}", eff_date.year(), eff_date.month());
@@ -786,7 +792,7 @@ impl CreditNoteHandler {
             let account_id = chart
                 .resolve(
                     leg.account_class,
-                    &req.currency,
+                    req.amount.currency().code(),
                     leg.revenue_stream.as_deref(),
                 )
                 .ok_or_else(|| {
@@ -794,10 +800,10 @@ impl CreditNoteHandler {
                         "no provisioned account for class {} / stream {:?} / currency {}",
                         leg.account_class.as_str(),
                         leg.revenue_stream,
-                        req.currency
+                        req.amount.currency().code()
                     ))
                 })?;
-            lines.push(Self::mk_line(req, leg, account_id, scale));
+            lines.push(Self::mk_line(req, leg, account_id));
         }
 
         let entry = NewEntry {
@@ -806,7 +812,7 @@ impl CreditNoteHandler {
             // v1: one legal entity per tenant — derived server-side.
             legal_entity_id: req.tenant_id,
             period_id,
-            entry_currency: req.currency.clone(),
+            entry_currency: req.amount.currency().code().to_owned(),
             source_doc_type: SourceDocType::CreditNote,
             // The engine's `(tenant, CREDIT_NOTE, credit_note_id)` idempotency key.
             source_business_id: req.credit_note_id.clone(),
@@ -828,7 +834,7 @@ impl CreditNoteHandler {
     /// [`NewLine`]. AR / `REUSABLE_CREDIT` carry `payer_tenant_id` + `invoice_id`
     /// (their cache grains key on them); the `CR REUSABLE_CREDIT` leg carries
     /// `credit_grant_event_type` so the projector seeds the wallet sub-grain.
-    fn mk_line(req: &CreditNoteRequest, leg: &PlannedLeg, account_id: Uuid, scale: u8) -> NewLine {
+    fn mk_line(req: &CreditNoteRequest, leg: &PlannedLeg, account_id: Uuid) -> NewLine {
         NewLine {
             line_id: Uuid::now_v7(),
             payer_tenant_id: req.payer_tenant_id,
@@ -838,15 +844,12 @@ impl CreditNoteHandler {
             account_class: leg.account_class,
             gl_code: None,
             side: leg.side,
-            amount_minor: leg.amount_minor,
-            currency: req.currency.clone(),
-            currency_scale: scale,
+            money: leg.amount.clone(),
             invoice_id: Some(req.origin_invoice_id.clone()),
             due_date: None,
             revenue_stream: leg.revenue_stream.clone(),
             mapping_status: MappingStatus::Resolved,
-            functional_amount_minor: None,
-            functional_currency: None,
+            functional_money: None,
             // Tax dims (jurisdiction / filing-period / rate) carry the posted
             // TaxBreakdown evidence the leg routed: `Some` on a per-component
             // TAX_PAYABLE leg (so the projector disaggregates `tax_subbalance` per
@@ -897,7 +900,7 @@ impl CreditNoteHandler {
                     req.revenue_stream,
                     req.origin_invoice_item_ref.as_deref().unwrap_or("")
                 ),
-                currency: req.currency.clone(),
+                currency: req.amount.currency().code().to_owned(),
                 expected_minor: 0,
                 actual_minor: 0,
             }],
@@ -967,11 +970,15 @@ pub(crate) struct CompositeCreditNoteOutcome {
 fn map_project_err(e: crate::infra::posting::projector::ProjectError) -> DomainError {
     use crate::infra::posting::projector::ProjectError;
     match e {
+        ProjectError::Repo(e) => crate::infra::posting::error_transport::repo_to_domain(e),
+        ProjectError::Conflict => {
+            DomainError::ConcurrentModification("cache version changed".to_owned())
+        }
         ProjectError::NegativeBalance {
             account_id,
-            balance_minor,
+            balance,
         } => DomainError::NegativeBalance(format!(
-            "balance for account {account_id} would go negative ({balance_minor})"
+            "balance for account {account_id} would go negative ({balance})"
         )),
         ProjectError::MissingNormalSide(id) => {
             DomainError::AccountClosed(format!("missing normal_side for account {id}"))
@@ -979,14 +986,8 @@ fn map_project_err(e: crate::infra::posting::projector::ProjectError) -> DomainE
         ProjectError::MissingCreditEventType(id) => DomainError::Internal(format!(
             "REUSABLE_CREDIT line {id} missing credit_grant_event_type"
         )),
-        ProjectError::Overflow {
-            account_id,
-            currency,
-            field,
-        } => DomainError::AmountOutOfRange(format!(
-            "coalesced money delta overflowed i64 for account {account_id} ({currency}, {field})"
-        )),
         ProjectError::Db(e) => DomainError::Internal(format!("composite projector: {e}")),
+        ProjectError::Arithmetic(e) => DomainError::Internal(format!("composite projector: {e}")),
     }
 }
 
@@ -997,7 +998,7 @@ fn map_project_err(e: crate::infra::posting::projector::ProjectError) -> DomainE
 #[derive(Clone, Debug)]
 struct ScheduleReduction {
     schedule_id: String,
-    amount_minor: i64,
+    amount: PostedMoney,
 }
 
 /// Project a planned `DR CONTRACT_LIABILITY` leg into its schedule reduction (it
@@ -1007,7 +1008,7 @@ fn planned_schedule_reduction(leg: &PlannedLeg) -> Option<ScheduleReduction> {
         (AccountClass::ContractLiability, Side::Debit, Some(schedule_id)) => {
             Some(ScheduleReduction {
                 schedule_id: schedule_id.clone(),
-                amount_minor: leg.amount_minor,
+                amount: leg.amount.clone(),
             })
         }
         _ => None,
@@ -1016,12 +1017,12 @@ fn planned_schedule_reduction(leg: &PlannedLeg) -> Option<ScheduleReduction> {
 
 /// Map a stored `recognition_schedule` row into the splitter's pure
 /// [`ScheduleStreamState`] input.
-fn map_schedule_state(s: recognition_schedule::Model) -> ScheduleStreamState {
+fn map_schedule_state(s: ScheduleState) -> ScheduleStreamState {
     ScheduleStreamState {
         revenue_stream: s.revenue_stream,
         schedule_id: s.schedule_id,
-        total_deferred_minor: s.total_deferred_minor,
-        recognized_minor: s.recognized_minor,
+        total_deferred: s.total_deferred,
+        recognized: s.recognized,
         status: s.status,
         version: s.version,
     }
@@ -1052,18 +1053,21 @@ fn map_schedule_state(s: recognition_schedule::Model) -> ScheduleStreamState {
 pub struct CreditNotePostSidecar {
     tenant_id: Uuid,
     origin_invoice_id: String,
-    currency: String,
-    /// The posted AR incl. tax — the `invoice_exposure.original_total_minor` seed.
-    posted_ar_incl_tax: i64,
-    /// The note's incl-tax amount — the `credit_note_total_minor` bump delta +
+    /// The posted AR incl. tax — the `invoice_exposure.original_total` seed.
+    posted_ar_incl_tax: PostedMoney,
+    /// The note's incl-tax amount — the `credit_note_total` bump delta +
     /// the published event's `amount_minor`.
-    credit_note_amount_minor: i64,
+    credit_note_amount: PostedMoney,
     /// The note's business id — the published event's `credit_note_id`.
     credit_note_id: String,
     /// The ex-tax recognized part — the published event's `recognized_part_minor`.
-    recognized_part_minor: i64,
+    recognized_part: PostedMoney,
     /// The ex-tax deferred part — the published event's `deferred_part_minor`.
-    deferred_part_minor: i64,
+    deferred_part: PostedMoney,
+    /// The schedule store the deferred reductions are written through.
+    recognition: RecognitionRepo,
+    /// The adjustment store the exposure counters and the note row are written through.
+    adjustment: AdjustmentRepo,
     /// The event publisher: `billing.ledger.credit_note.posted` is published IN
     /// this post txn (the transactional outbox) so it commits atomically with the
     /// entry + counters, or rolls back with them. Mirrors
@@ -1090,50 +1094,62 @@ impl PostSidecar for CreditNotePostSidecar {
         //    total over its unreleased remainder. The CHECK is the over-reduction
         //    backstop (refined to OverRecognition).
         for r in &self.schedule_reductions {
-            RecognitionRepo::reduce_deferred(
-                txn,
-                scope,
-                self.tenant_id,
-                &r.schedule_id,
-                r.amount_minor,
-            )
-            .await
-            .map_err(map_schedule_repo_err)?;
+            self.recognition
+                .reduce_deferred(txn, scope, self.tenant_id, &r.schedule_id, &r.amount)
+                .await
+                .map_err(map_schedule_repo_err)?;
         }
 
         // 2. Headroom (rank 10) — first-touch seed then bump. The headroom CHECK is
         //    the authoritative over-cap guard, refined to CreditNoteExceedsHeadroom
         //    (→ CREDIT_NOTE_EXCEEDS_HEADROOM, 400).
-        AdjustmentRepo::seed_exposure_first_touch(
-            txn,
-            scope,
-            self.tenant_id,
-            &self.origin_invoice_id,
-            &self.currency,
-            self.posted_ar_incl_tax,
-        )
-        .await
-        .map_err(|e| DomainError::Internal(format!("seed invoice_exposure: {e}")))?;
-        AdjustmentRepo::add_credit_note_total(
-            txn,
-            scope,
-            self.tenant_id,
-            &self.origin_invoice_id,
-            self.credit_note_amount_minor,
-        )
-        .await
-        .map_err(map_headroom_repo_err)?;
+        self.adjustment
+            .seed_exposure_first_touch(
+                txn,
+                scope,
+                self.tenant_id,
+                &self.origin_invoice_id,
+                &self.posted_ar_incl_tax,
+            )
+            .await
+            .map_err(|e| {
+                crate::infra::adjustment::map_adjustment_repo_err("seed invoice_exposure", e)
+            })?;
+        self.adjustment
+            .add_credit_note_total(
+                txn,
+                scope,
+                self.tenant_id,
+                &self.origin_invoice_id,
+                &self.credit_note_amount,
+            )
+            .await
+            .map_err(map_headroom_repo_err)?;
 
         // 3. Persist the credit_note record row.
-        AdjustmentRepo::insert_credit_note(txn, scope, &self.credit_note_row)
+        self.adjustment
+            .insert_credit_note(txn, scope, &self.credit_note_row)
             .await
-            .map_err(|e| DomainError::Internal(format!("insert credit_note: {e}")))?;
+            .map_err(|e| crate::infra::adjustment::map_note_record_err("insert credit_note", e))?;
 
         // 4. Publish `billing.ledger.credit_note.posted` into the SAME post txn
         //    (transactional outbox): the event row commits atomically with the
         //    entry + the schedule/headroom/record writes, or a publish failure
         //    rolls the whole post back. Never on replay (a replay returns before
         //    the sidecar). Ids + amount + split parts only (no PII).
+        // The v1 payload keeps integer minor units (saturating policy); a
+        // saturation warning names the field and this credit note.
+        let (amount_minor, recognized_part_minor, deferred_part_minor) = {
+            let entity = format_args!(
+                "credit_note {} entry {} tenant {}",
+                self.credit_note_id, posted.entry_id, self.tenant_id
+            );
+            (
+                v1_minor_units_for(&self.credit_note_amount, "amount_minor", &entity),
+                v1_minor_units_for(&self.recognized_part, "recognized_part_minor", &entity),
+                v1_minor_units_for(&self.deferred_part, "deferred_part_minor", &entity),
+            )
+        };
         self.publisher
             .publish_credit_note_posted(
                 &self.ctx,
@@ -1143,10 +1159,10 @@ impl PostSidecar for CreditNotePostSidecar {
                     credit_note_id: self.credit_note_id.clone(),
                     origin_invoice_id: self.origin_invoice_id.clone(),
                     entry_id: posted.entry_id,
-                    currency: self.currency.clone(),
-                    amount_minor: self.credit_note_amount_minor,
-                    recognized_part_minor: self.recognized_part_minor,
-                    deferred_part_minor: self.deferred_part_minor,
+                    currency: self.credit_note_amount.currency().code().to_owned(),
+                    amount_minor,
+                    recognized_part_minor,
+                    deferred_part_minor,
                     posted_at_utc: OffsetDateTime::now_utc(),
                 },
             )
@@ -1157,20 +1173,33 @@ impl PostSidecar for CreditNotePostSidecar {
     }
 }
 
+/// The exposure row's remaining headroom through the shared domain rule
+/// ([`crate::domain::adjustment::credit_note::remaining_headroom`]).
+fn exposure_headroom(exp: &ExposureView) -> Result<PostedMoney, DomainError> {
+    crate::domain::adjustment::credit_note::remaining_headroom(
+        &exp.original_total,
+        &exp.debit_note_total,
+        &exp.credit_note_total,
+    )
+}
+
 /// Map a schedule-counter [`RepoError`](crate::domain::model::RepoError) into the
-/// sidecar's [`DomainError`]: the `recognized_minor <= total_deferred_minor` CHECK
-/// violation (an over-reduction of an in-flight schedule) becomes
+/// sidecar's [`DomainError`]: the `recognized <= total_deferred` CHECK violation
+/// (an over-reduction of an in-flight schedule) becomes
 /// [`DomainError::OverRecognition`] (the `OVER_RECOGNITION` 409 — the credited-back
 /// amount cannot exceed the unreleased remainder, mirroring the recognition stamp
-/// sidecar); every other repo failure is an infrastructure fault that rolls the
-/// post back.
+/// sidecar); every other repo failure goes through
+/// [`map_adjustment_repo_err`](crate::infra::adjustment::map_adjustment_repo_err).
 fn map_schedule_repo_err(e: crate::domain::model::RepoError) -> DomainError {
     use crate::domain::model::RepoError;
     match e {
         RepoError::MoneyOutCapExceeded(m) => DomainError::OverRecognition(format!(
             "credit-note deferred reduction exceeds the schedule's releasable remainder: {m}"
         )),
-        other => DomainError::Internal(format!("credit-note schedule reduction: {other}")),
+        other => crate::infra::adjustment::map_adjustment_repo_err(
+            "credit-note schedule reduction",
+            other,
+        ),
     }
 }
 
@@ -1178,13 +1207,16 @@ fn map_schedule_repo_err(e: crate::domain::model::RepoError) -> DomainError {
 /// sidecar's [`DomainError`]: the `invoice_exposure` headroom CHECK violation
 /// becomes [`DomainError::CreditNoteExceedsHeadroom`] (the `CREDIT_NOTE_EXCEEDS_HEADROOM`
 /// 400 — design §4.2 / AC #24; over-cap routes via goodwill/non-revenue, never
-/// silently through S3); every other repo failure is an infra fault.
+/// silently through S3); every other repo failure goes through
+/// [`map_adjustment_repo_err`](crate::infra::adjustment::map_adjustment_repo_err).
 fn map_headroom_repo_err(e: crate::domain::model::RepoError) -> DomainError {
     use crate::domain::model::RepoError;
     match e {
         RepoError::MoneyOutCapExceeded(m) => DomainError::CreditNoteExceedsHeadroom(format!(
             "credit note would exceed the invoice's remaining headroom: {m}"
         )),
-        other => DomainError::Internal(format!("credit-note headroom bump: {other}")),
+        other => {
+            crate::infra::adjustment::map_adjustment_repo_err("credit-note headroom bump", other)
+        }
     }
 }

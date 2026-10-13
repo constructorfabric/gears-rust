@@ -113,7 +113,7 @@ Actors: `cpt-cf-bss-pricing-actor-finance-manager`, `cpt-cf-bss-pricing-actor-pr
 
 Feature algorithm: `cpt-cf-bss-pricing-algo-books-entries-book-and-key`.
 
-1. [ ] - `p1` - Validate currency and nonempty validity interval; scope code uniqueness to tenant. - `inst-books-entries-book-and-key-1`
+1. [ ] - `p1` - Validate the currency against the currency table (an ISO 4217 code with a scale, or a configured non-ISO code, else 400 BOOK_CURRENCY_INVALID, D-529) and a nonempty validity interval; scope code uniqueness to tenant. - `inst-books-entries-book-and-key-1`
 2. [ ] - `p1` - Derive charge_kind from the current SKU; recurring accepts month/year, usage and one_time require null period; the model must be one the charge kind allows (D-386, D-427). - `inst-books-entries-book-and-key-2`
 3. [ ] - `p1` - Enforce the book/SKU/kind/coalesced-period/model/policy-digest unique index and map races to a conflict. - `inst-books-entries-book-and-key-3`
 4. [ ] - `p1` - PATCH name/validity or permitted entry overrides conditionally; reject currency edits and dimension changes after valued prices exist. - `inst-books-entries-book-and-key-4`
@@ -132,7 +132,7 @@ Feature algorithm: `cpt-cf-bss-pricing-algo-books-entries-dimension-registry`.
 Feature algorithm: `cpt-cf-bss-pricing-algo-books-entries-settings-and-export`.
 
 1. [ ] - `p1` - Authorize settings separately from book authoring and enforce If-Match on settings changes. - `inst-books-entries-settings-and-export-1`
-2. [ ] - `p1` - Resolve defaults by SKU billing-timing override then tenant timing; preserve rounding and per-type template inputs for binding. - `inst-books-entries-settings-and-export-2`
+2. [ ] - `p1` - Resolve defaults by SKU billing-timing override then tenant timing; preserve per-type template inputs for binding. - `inst-books-entries-settings-and-export-2`
 3. [ ] - `p1` - For export, authorize read and select only the scoped book, entries and prices; preserve price identities and chain windows. - `inst-books-entries-settings-and-export-3`
 4. [ ] - `p1` - Return JSON without modifying state, submitting units or evaluating totals. - `inst-books-entries-settings-and-export-4`
 
@@ -158,7 +158,7 @@ The book reads (D-441, D-442): GET /price-books and GET /price-books/{id} carry 
 
 Dimension values (D-436): every registry answer (GET, PUT and PATCH /dimension-keys) is PricingDimensionRegistry, each value with usage { prices }: the prices of any state whose entry names the key and whose chain is the value, from one grouped count. PATCH /dimension-keys { key, add, remove } edits the values of one declared key under If-Match; keys are added and removed by the PUT. Removing a value a price uses is 409 DIM_VALUE_IN_USE naming it, at the PATCH and at the PUT, and both judge from the same grouped count.
 
-Settings (D-437, D-438): default_rounding is half_up, half_even, half_down, up or down (400 ROUNDING_INVALID), and half_even, the ledger's platform default, for a tenant that never wrote its settings; PUT /settings requires currencies, the codes a new book may take ([] offers any; 400 CURRENCY_INVALID for a malformed or repeated code); a new book outside a non-empty list is 409 CURRENCY_NOT_OFFERED, and existing books are untouched. The settings answer carries updated_at and updated_by, null before the first write; updated_by is also null on a row written before m20260927_000014, and each PUT stamps both.
+Settings (D-438): the settings carry no rounding, since an invoice line always rounds HALF_EVEN (D-535); PUT /settings requires currencies, the codes a new book may take ([] offers any; 400 CURRENCY_INVALID, naming the code and the reason, for a code the currency table does not know or a repeated code, and with a fixed message that does not repeat it for a value that is not three uppercase letters, D-528, D-529); a new book outside a non-empty list is 409 CURRENCY_NOT_OFFERED, and existing books are untouched. The settings answer carries updated_at and updated_by, null before the first write; updated_by is also null on a row written before m20260927_000014, and each PUT stamps both.
 
 [DESIGN §3.3](../DESIGN.md#33-api-contracts) fixes canonical errors and route prefixes.
 Each mounted route must appear in all four censuses with authz and precondition expectations.

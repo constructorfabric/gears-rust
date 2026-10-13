@@ -15,11 +15,12 @@
         "period": "month",
         "book_id": "<book:eur>",
         "currency": "EUR",
+        "currency_scale": 2,
         "version_no": 3,
         "dim_value": null,
         "model": "flat",
         "price": {
-          "amount": "15.00"
+          "amount": "15"
         },
         "min_fee": null,
         "eligibility": "new",
@@ -47,13 +48,14 @@
         "period": null,
         "book_id": "<book:eur>",
         "currency": "EUR",
+        "currency_scale": 2,
         "version_no": 6,
         "dim_value": null,
         "model": "per_unit",
         "price": {
           "rate": "0.12"
         },
-        "min_fee": "5.00",
+        "min_fee": "5",
         "eligibility": "all",
         "effective_from": "2027-01-01",
         "effective_to": null,
@@ -79,6 +81,7 @@
         "period": null,
         "book_id": "<book:eur>",
         "currency": "EUR",
+        "currency_scale": 2,
         "version_no": 1,
         "dim_value": null,
         "model": "graduated",
@@ -86,7 +89,7 @@
           "tiers": [
             {
               "up_to": "1000",
-              "rate": "0.010"
+              "rate": "0.01"
             },
             {
               "up_to": null,
@@ -120,6 +123,7 @@
         "period": null,
         "book_id": "<book:eur>",
         "currency": "EUR",
+        "currency_scale": 2,
         "version_no": 1,
         "dim_value": "eu",
         "model": "volume",
@@ -161,12 +165,13 @@
         "period": null,
         "book_id": "<book:eur>",
         "currency": "EUR",
+        "currency_scale": 2,
         "version_no": 1,
         "dim_value": "us",
         "model": "package",
         "price": {
           "package_size": "1000",
-          "package_price": "5.00"
+          "package_price": "5"
         },
         "min_fee": null,
         "eligibility": "all",

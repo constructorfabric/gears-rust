@@ -32,12 +32,23 @@ use bss_ledger::domain::model::RepoError;
 use bss_ledger::infra::storage::migrations::Migrator;
 use bss_ledger::infra::storage::repo::AdjustmentRepo;
 use bss_ledger::infra::storage::repo::adjustment_repo::NewRefund;
+use bss_ledger_sdk::{CurrencySpec, PostedMoney, parse_decimal};
 use sea_orm_migration::MigratorTrait;
 use time::OffsetDateTime;
 use toolkit_db::migration_runner::run_migrations_for_testing;
 use toolkit_db::secure::AccessScope;
 use toolkit_db::{ConnectOpts, DBProvider, DbError, connect_db};
 use uuid::Uuid;
+
+/// USD at scale 2 — the only currency these repo-level tests use.
+fn usd() -> CurrencySpec {
+    CurrencySpec::try_new("USD".to_owned(), 2).expect("USD spec")
+}
+
+/// Validated USD money from canonical major-unit text (`"5"` = five dollars).
+fn money(text: &str) -> PostedMoney {
+    PostedMoney::try_new(parse_decimal(text).expect("decimal"), usd()).expect("posted money")
+}
 
 /// Connect an in-memory SQLite + run the migrator (the same harness as the
 /// note repo tests).
@@ -68,8 +79,7 @@ fn refund_a(tenant: Uuid, refund_id: &str, psp_refund_id: &str, phase: &str) -> 
         pattern: "A_UNALLOCATED".to_owned(),
         payment_id: "pay-1".to_owned(),
         invoice_id: None,
-        currency: "USD".to_owned(),
-        amount_minor: 500,
+        amount: money("5"),
         clearing_state: "PENDING".to_owned(),
         relates_to_refund_id: None,
         reverses_entry_id: None,
@@ -84,10 +94,11 @@ async fn insert(
     row: NewRefund,
 ) -> Result<(), DbError> {
     let scope = scope.clone();
+    let repo = AdjustmentRepo::new(provider.clone());
     provider
         .transaction(move |tx| {
             Box::pin(async move {
-                AdjustmentRepo::insert_refund(tx, &scope, &row)
+                repo.insert_refund(tx, &scope, &row)
                     .await
                     .map_err(repo_to_db)
             })
@@ -119,8 +130,7 @@ async fn refund_row_round_trips_pattern_a_and_b() {
         pattern: "B_RESTORE_AR".to_owned(),
         payment_id: "pay-2".to_owned(),
         invoice_id: Some("inv-9".to_owned()),
-        currency: "USD".to_owned(),
-        amount_minor: 800,
+        amount: money("8"),
         clearing_state: "SETTLED".to_owned(),
         relates_to_refund_id: None,
         reverses_entry_id: None,

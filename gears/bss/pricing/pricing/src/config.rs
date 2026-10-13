@@ -1,4 +1,5 @@
 //! Default-tolerant deployment configuration and versioned seller hold policy.
+use std::collections::BTreeMap;
 use std::num::{NonZeroU32, NonZeroU64};
 
 /// Retired deployment keys remain accepted; commercial policy is validated at startup.
@@ -7,6 +8,11 @@ use std::num::{NonZeroU32, NonZeroU64};
 pub struct BssPricingConfig {
     /// Versioned duration observed when issuing an acceptance.
     pub seller_hold_policy: SellerHoldPolicy,
+    /// Posting scales, by code, of the currency codes this deployment prices in that have no ISO
+    /// 4217 minor-unit scale (`iso_scale` gives none), such as `XTS` or a code ISO does not list.
+    /// Empty by default: an ISO 4217 code with a scale takes it from the shared table and is never
+    /// listed here. A code listed here must also be provisioned in the ledger with the same scale.
+    pub currency_scales: BTreeMap<String, u8>,
 }
 
 /// A deployment's seller policy; changing it never rewrites issued receipts.

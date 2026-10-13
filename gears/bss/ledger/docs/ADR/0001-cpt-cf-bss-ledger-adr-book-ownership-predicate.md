@@ -31,7 +31,7 @@ Updated:  2026-07-07 by Virtuozzo International GmbH
 
 ## Context and Problem Statement
 
-Several ledger-wide anchors hang off "the owning `tenant_id`": it is the tenant-isolation/owner axis, the `export_target` holder, the period-close unit, and the functional-currency carrier. VHP tenants are **typed** (`tenant_type` on the platform `TenantInfo` — e.g. `platform`, `partner`, `organization`) and sit in one tenant tree that serves two different commercial roles: entities that **sell** (and must keep AR / Revenue / Contract-liability books, close periods, and export to an ERP) and entities that only **buy** (and appear on ledger lines as payers or resources). Which tenants own billing books, and how does the ledger decide?
+Several ledger-wide anchors hang off "the owning `tenant_id`": it is the tenant-isolation/owner axis, the `export_target` holder, the period-close unit, and the functional-currency carrier. Tenants are **typed** (`tenant_type` on the platform `TenantInfo` — e.g. `platform`, `partner`, `organization`) and sit in one tenant tree that serves two different commercial roles: entities that **sell** (and must keep AR / Revenue / Contract-liability books, close periods, and export to an ERP) and entities that only **buy** (and appear on ledger lines as payers or resources). Which tenants own billing books, and how does the ledger decide?
 
 ## Decision Drivers
 
@@ -60,7 +60,7 @@ The normative decision (ledger-wide, stated in [`01-repository-foundation.md`](.
 * The predicate "this tenant owns books" resolves from **`tenant_type` (AMS/GTS)** + the **commercial-account mapping**.
 * **Two distinct hierarchies — do NOT conflate:** the **buyer hierarchy** (org → department) drives **payer resolution / AR consolidation**; the **seller hierarchy** (platform → partner → reseller) is the **book-ownership / subtree-read** axis. Different axes on the same tenant tree.
 * The `tenant ↔ commercial-account ↔ legal-entity` mapping (**1:1 or 1:N**) is owned by **AMS / Catalog / billing-setup, not the ledger**; the one-functional-currency-per-legal-entity rule (FX F5) hangs off it.
-* **Hardening (verified against the platform catalogue).** The tenant-type catalogue (`vhp-core-am/config/tenant-types.yaml`; GTS ids `gts.cf.core.am.tenant_type.v1~vz.ams.tenants.<type>.v1~`) defines **`platform`, `partner`, `organization`** (hierarchy via `x-gts-traits.allowed_parent_types`: platform → partner → organization); there is no `individual` type yet, and no `seller`/`buyer` enum exists — none is needed, since tenant types already carry custom `x-gts-traits`.
+* **Hardening (verified against the platform catalogue).** The tenant-type catalogue (the account-management `tenant-types.yaml`; GTS ids `gts.cf.core.am.tenant_type.v1~vz.ams.tenants.<type>.v1~`) defines **`platform`, `partner`, `organization`** (hierarchy via `x-gts-traits.allowed_parent_types`: platform → partner → organization); there is no `individual` type yet, and no `seller`/`buyer` enum exists — none is needed, since tenant types already carry custom `x-gts-traits`.
 * **Predicate (proposed):** book-owning **seller** = `platform` + `partner`; **buyer** = `organization` (+ a future `individual`).
 * **Recommended mechanism:** AMS adds an **`x-gts-traits.owns_billing_books: true`** trait to the `platform` and `partner` type schemas; the ledger's provisioning gate and the owner predicate read **that trait**, not a hardcoded type list.
 * ⏳ **Pending (AMS):** confirm platform + partner are the intended sellers (and whether an `organization`/reseller can ever sell), then add the trait to the catalogue. The predicate decision itself is ratified; this hardening item is the open remainder.
@@ -118,7 +118,7 @@ AMS adds `x-gts-traits.owns_billing_books: true` to the `platform` and `partner`
 * Good, because the seller set is AMS catalogue data — adding/retiring a selling type is a catalogue change, not a ledger change
 * Good, because it uses an existing, verified extension mechanism (`x-gts-traits`), not a new modeling concept
 * Good, because the ledger stays taxonomy-free: it evaluates one boolean trait plus the AMS-owned commercial-account mapping
-* Good, because the mechanism was verified against the actual platform catalogue (`vhp-core-am/config/tenant-types.yaml`) rather than assumed
+* Good, because the mechanism was verified against the actual platform catalogue (the account-management `tenant-types.yaml`) rather than assumed
 * Neutral, because until the trait lands the ledger evaluates the proposed set (`platform` + `partner`) as an interim
 * Bad, because it introduces a cross-team dependency — AMS must confirm the seller set and land the catalogue change (⏳ pending)
 * Bad, because a misconfigured trait (e.g. accidentally set on `organization`) would grant books platform-wide; catalogue governance must guard the trait

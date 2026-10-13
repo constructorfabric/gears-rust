@@ -26,13 +26,14 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use bss_ledger_sdk::AccountClass;
+use bss_ledger_sdk::{AccountClass, PostedMoney};
 use sea_orm::{ColumnTrait, Condition, EntityTrait};
 use toolkit_db::secure::{AccessScope, DBRunner, SecureEntityExt};
 use toolkit_db::{DBProvider, DbError};
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
+use crate::domain::reconciliation::GrainAmount;
 use crate::domain::status::{AR_STATUS_DISPUTED, PERIOD_STATUS_CLOSED, PERIOD_STATUS_OPEN};
 use crate::infra::events::payloads::{
     AffectedItem, AlarmCategory, AlarmSeverity, LedgerInvariantAlarm,
@@ -46,6 +47,10 @@ use crate::infra::storage::entity::{
     account_balance, ar_invoice_balance, ar_payer_balance, fiscal_period, journal_entry,
     journal_line, payment_allocation, payment_settlement, reusable_credit_subbalance,
     tax_subbalance, tenant_account, unallocated_balance,
+};
+use crate::infra::storage::money_text::decode_money;
+use crate::infra::storage::repo::verified_balance_repo::{
+    key_account, key_payer_account_ccy, key_payer_account_invoice, key_reusable, key_tax,
 };
 use crate::infra::storage::repo::{BaselineRow, VerifiedBalanceRepo};
 
@@ -88,6 +93,229 @@ const MAX_AFFECTED: usize = 50;
 /// working set on a long-lived tenant.
 const TIE_OUT_PAGE_SIZE: u64 = 5_000;
 
+/// The `v1` alarm payload field `field` of the alarm item `item`: the grain
+/// total's integer minor units under the saturating policy; `None` for an
+/// untrusted or out-of-contract total.
+fn grain_minor_units(
+    grain: &GrainAmount,
+    field: &'static str,
+    item: &dyn std::fmt::Display,
+) -> Option<i64> {
+    grain
+        .to_posted()
+        .ok()
+        .map(|m| crate::infra::v1_payload::v1_minor_units_for(&m, field, item))
+}
+
+/// Names one tie-out alarm item in a `v1` saturation warning; formatted only
+/// when an amount saturates.
+struct AlarmItem<'a> {
+    id: &'a str,
+    currency: &'a str,
+}
+
+impl std::fmt::Display for AlarmItem<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "tie-out alarm item {} currency {}",
+            self.id, self.currency
+        )
+    }
+}
+
+/// A cache row whose stored money the tie-out decodes: enough identity to name
+/// the row when its text is corrupt.
+trait CacheRow {
+    /// The cache table.
+    const TABLE: &'static str;
+    /// The owning tenant.
+    fn tenant(&self) -> Uuid;
+    /// The row's stored currency code and scale.
+    fn currency_meta(&self) -> (&str, i16);
+    /// The row's grain key (ids only, no PII).
+    fn grain(&self) -> String;
+}
+
+impl<T: CacheRow> CacheRow for &T {
+    const TABLE: &'static str = T::TABLE;
+    fn tenant(&self) -> Uuid {
+        (**self).tenant()
+    }
+    fn currency_meta(&self) -> (&str, i16) {
+        (**self).currency_meta()
+    }
+    fn grain(&self) -> String {
+        (**self).grain()
+    }
+}
+
+/// Implement [`CacheRow`] for a cache entity from its grain-key rendering.
+macro_rules! cache_row {
+    ($model:path, $table:literal, |$r:ident| $grain:expr) => {
+        impl CacheRow for $model {
+            const TABLE: &'static str = $table;
+            fn tenant(&self) -> Uuid {
+                self.tenant_id
+            }
+            fn currency_meta(&self) -> (&str, i16) {
+                (&self.currency, self.currency_scale)
+            }
+            fn grain(&self) -> String {
+                let $r = self;
+                $grain
+            }
+        }
+    };
+}
+
+cache_row!(account_balance::Model, "account_balance", |r| format!(
+    "account={}/currency={}",
+    r.account_id, r.currency
+));
+cache_row!(ar_payer_balance::Model, "ar_payer_balance", |r| format!(
+    "payer={}/account={}/currency={}",
+    r.payer_tenant_id, r.account_id, r.currency
+));
+cache_row!(
+    ar_invoice_balance::Model,
+    "ar_invoice_balance",
+    |r| format!(
+        "payer={}/account={}/invoice={}",
+        r.payer_tenant_id, r.account_id, r.invoice_id
+    )
+);
+cache_row!(tax_subbalance::Model, "tax_subbalance", |r| format!(
+    "account={}/jurisdiction={}/filing={}",
+    r.account_id, r.tax_jurisdiction, r.tax_filing_period
+));
+cache_row!(
+    unallocated_balance::Model,
+    "unallocated_balance",
+    |r| format!(
+        "payer={}/account={}/currency={}",
+        r.payer_tenant_id, r.account_id, r.currency
+    )
+);
+cache_row!(
+    reusable_credit_subbalance::Model,
+    "reusable_credit_subbalance",
+    |r| format!(
+        "payer={}/account={}/currency={}/event_type={}",
+        r.payer_tenant_id, r.account_id, r.currency, r.credit_grant_event_type
+    )
+);
+cache_row!(
+    payment_settlement::Model,
+    "payment_settlement",
+    |r| format!("payment={}", r.payment_id)
+);
+
+/// Decode one stored cache amount into an exact grain total; a corrupt stored
+/// value becomes an untrusted zero that always surfaces as a variance, and the
+/// log names the tenant, table, column and grain so the row can be found.
+fn cached_amount<R: CacheRow>(row: &R, column: &'static str, text: &str) -> GrainAmount {
+    let (currency, currency_scale) = row.currency_meta();
+    match decode_money(text, currency, currency_scale) {
+        Ok(money) => GrainAmount::from_posted(&money),
+        Err(e) => {
+            tracing::error!(
+                target: "bss-ledger",
+                tenant_id = %row.tenant(),
+                table = R::TABLE,
+                column,
+                grain = %row.grain(),
+                currency,
+                error = %e,
+                "bss-ledger: tie-out: corrupt stored balance text"
+            );
+            GrainAmount::untrusted(currency, u8::try_from(currency_scale).unwrap_or(0))
+        }
+    }
+}
+
+/// A line's validated posting, or `None` for corrupt stored text (the caller
+/// force-flags the grain so the corruption surfaces).
+fn line_money(line: &journal_line::Model) -> Option<PostedMoney> {
+    decode_money(&line.amount, &line.currency, line.currency_scale).ok()
+}
+
+/// One page of journal lines with every stored amount decoded once and shared
+/// by all the accumulators (`None` marks corrupt stored text), instead of each
+/// fold re-parsing the same text.
+struct DecodedPage<'a> {
+    lines: &'a [journal_line::Model],
+    money: Vec<Option<PostedMoney>>,
+}
+
+impl<'a> DecodedPage<'a> {
+    fn new(lines: &'a [journal_line::Model]) -> Self {
+        Self {
+            lines,
+            money: lines.iter().map(line_money).collect(),
+        }
+    }
+
+    /// Each line with its decoded posting.
+    fn iter(&self) -> impl Iterator<Item = (&'a journal_line::Model, Option<&PostedMoney>)> {
+        self.lines.iter().zip(self.money.iter().map(Option::as_ref))
+    }
+}
+
+/// The additive inverse of a validated posting (always representable).
+fn negated(money: &PostedMoney) -> Option<PostedMoney> {
+    PostedMoney::try_new(-money.amount(), money.currency().clone()).ok()
+}
+
+/// Build one `v1` alarm item from exact totals. `None`, logged with its cause,
+/// when either side is untrusted (corrupt stored text, a missing normal side, a
+/// mixed scale: it has no amount to report, never a zero) or when a trusted
+/// total exceeds the bounded money contract and so has no v1 representation.
+fn affected_item(
+    id: String,
+    currency: String,
+    expected: &GrainAmount,
+    actual: &GrainAmount,
+) -> Option<AffectedItem> {
+    if expected.is_untrusted() || actual.is_untrusted() {
+        tracing::error!(
+            target: "bss-ledger",
+            id,
+            currency,
+            expected_untrusted = expected.is_untrusted(),
+            actual_untrusted = actual.is_untrusted(),
+            "bss-ledger: tie-out: untrusted grain total carries no v1 alarm amount"
+        );
+        return None;
+    }
+    let item = AlarmItem {
+        id: &id,
+        currency: &currency,
+    };
+    if let (Some(expected_minor), Some(actual_minor)) = (
+        grain_minor_units(expected, "expected_minor", &item),
+        grain_minor_units(actual, "actual_minor", &item),
+    ) {
+        Some(AffectedItem {
+            id,
+            currency,
+            expected_minor,
+            actual_minor,
+        })
+    } else {
+        tracing::error!(
+            target: "bss-ledger",
+            id,
+            currency,
+            expected = %expected.text(),
+            actual = %actual.text(),
+            "bss-ledger: tie-out: grain total exceeds the bounded money contract; \
+             no v1 alarm amount"
+        );
+        None
+    }
+}
+
 /// A recomputed `account_balance` grain that disagrees with the cache (or has
 /// no cache counterpart / a stray cache row).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -96,11 +324,11 @@ pub struct AccountBalanceVariance {
     pub account_id: Uuid,
     /// Currency of the grain.
     pub currency: String,
-    /// Balance recomputed from the journal lines (`0` if the cache row has no
+    /// Balance recomputed from the journal lines (zero if the cache row has no
     /// computed counterpart).
-    pub computed: i64,
-    /// Cached `account_balance.balance_minor` (`0` if no cache row exists).
-    pub cached: i64,
+    pub computed: GrainAmount,
+    /// Cached `account_balance.balance` (zero if no cache row exists).
+    pub cached: GrainAmount,
 }
 
 /// A recomputed sub-grain (`ar_payer_balance` / `ar_invoice_balance` /
@@ -114,11 +342,11 @@ pub struct SubGrainVariance {
     pub grain: &'static str,
     /// Human-readable grain key (ids only — no PII), for the alarm diagnostic.
     pub key: String,
-    /// Balance recomputed from the journal lines (`0` if no computed
+    /// Balance recomputed from the journal lines (zero if no computed
     /// counterpart for a stray cache row).
-    pub computed: i64,
-    /// Cached `balance_minor` (`0` if no cache row exists for a computed grain).
-    pub cached: i64,
+    pub computed: GrainAmount,
+    /// Cached balance (zero if no cache row exists for a computed grain).
+    pub cached: GrainAmount,
 }
 
 /// A posted entry that fails the entry-balance backstop.
@@ -128,8 +356,8 @@ pub struct ImbalancedEntry {
     pub entry_id: Uuid,
     /// Currency of the imbalanced group.
     pub currency: String,
-    /// Net minor units (`sum(DR) - sum(CR)`); non-zero is a defect.
-    pub net_minor: i64,
+    /// Exact net (`sum(DR) - sum(CR)`); non-zero is a defect.
+    pub net: GrainAmount,
     /// Number of lines in the group.
     pub line_count: u64,
     /// Distinct `payer_tenant_id` count (`> 1` is a defect).
@@ -144,24 +372,24 @@ pub struct NegativeGrain {
     /// Currency of the grain.
     pub currency: String,
     /// The offending (negative) balance.
-    pub balance_minor: i64,
+    pub balance: PostedMoney,
 }
 
 /// A `payment_settlement` counter that disagrees with the value recomputed from
-/// the truth (`payment_allocation` rows for `allocated_minor`; the
-/// `PAYMENT_SETTLE` journal entry for `settled_minor` / `fee_minor`). Shares the
+/// the truth (`payment_allocation` rows for `allocated`; the
+/// `PAYMENT_SETTLE` journal entry for `settled` / `fee`). Shares the
 /// [`AlarmCategory::TieOutVariance`] alarm class with the balance variances (a
 /// cache disagreeing with truth). `counter` names which counter diverged.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PaymentCounterVariance {
     /// The payment whose counter diverged (`payment_settlement.payment_id`).
     pub payment_id: String,
-    /// Which counter (`"allocated_minor"` / `"settled_minor"` / `"fee_minor"`).
+    /// Which counter (`"allocated"` / `"settled"` / `"fee"`).
     pub counter: &'static str,
     /// Value recomputed from the truth (allocation rows / settle journal).
-    pub computed: i64,
+    pub computed: GrainAmount,
     /// Cached `payment_settlement` counter value.
-    pub cached: i64,
+    pub cached: GrainAmount,
 }
 
 /// Per-tenant tie-out result. Clean iff every defect vec is empty AND there are
@@ -182,8 +410,7 @@ pub struct TieOutReport {
     pub imbalanced_entries: Vec<ImbalancedEntry>,
     /// Guarded grains that went negative.
     pub negative_grains: Vec<NegativeGrain>,
-    /// `payment_settlement` counter divergences (`allocated_minor` /
-    /// `settled_minor` / `fee_minor`).
+    /// `payment_settlement` counter divergences (`allocated` / `settled` / `fee`).
     pub payment_counter_variances: Vec<PaymentCounterVariance>,
     /// Count of PENDING-mapped lines (a soft defect — blocks a clean report).
     pub pending_lines: u64,
@@ -247,7 +474,7 @@ impl TieOutJob {
     }
 
     /// Tie out one tenant for a daily tick: the incremental path (baseline + open
-    /// fold, VHP-1843) when `full` is false AND the tenant has a baseline, else
+    /// fold) when `full` is false AND the tenant has a baseline, else
     /// the full all-time fold. Both yield a [`TieOutReport`] so the alarm path is
     /// shared. The incremental report omits the full-only defect classes
     /// (imbalanced entries / negative grains / PENDING lines) — those ride the
@@ -428,10 +655,12 @@ impl TieOutJob {
             let Some(last) = page.last() else { break };
             line_cursor = Some(last.line_id);
             let fetched = u64::try_from(page.len()).unwrap_or(u64::MAX);
-            account_balance.fold(&page, &normal_side_map);
-            sub_grain.fold(&page, &normal_side_map);
-            entry_balance.fold(&page);
-            payment_counter.fold(&page, &settle_payment_by_entry);
+            // Decode each stored amount once; all four accumulators share it.
+            let decoded = DecodedPage::new(&page);
+            account_balance.fold_page(&decoded, &normal_side_map);
+            sub_grain.fold_page(&decoded, &normal_side_map);
+            entry_balance.fold_page(&decoded);
+            payment_counter.fold_page(&decoded, &settle_payment_by_entry);
             let page_pending = u64::try_from(
                 page.iter()
                     .filter(|l| l.mapping_status == MAPPING_PENDING)
@@ -492,7 +721,7 @@ impl TieOutJob {
     /// One tie-out tick over every tenant. `full` forces the all-time fold for
     /// every tenant (the periodic drift backstop); otherwise each tenant takes the
     /// incremental path (baseline + open fold) when it has a baseline, falling
-    /// back to the full fold when it does not (VHP-1843).
+    /// back to the full fold when it does not.
     ///
     /// # Errors
     /// Returns `Err` only if the up-front tenant *enumeration* fails (DB
@@ -568,29 +797,30 @@ impl TieOutJob {
                 let affected = report
                     .account_balance_variances
                     .iter()
-                    .map(|v| AffectedItem {
-                        id: v.account_id.to_string(),
-                        currency: v.currency.clone(),
-                        expected_minor: v.computed,
-                        actual_minor: v.cached,
+                    .filter_map(|v| {
+                        affected_item(
+                            v.account_id.to_string(),
+                            v.currency.clone(),
+                            &v.computed,
+                            &v.cached,
+                        )
                     })
-                    .chain(report.sub_grain_variances.iter().map(|v| AffectedItem {
-                        id: v.key.clone(),
-                        currency: String::new(),
-                        expected_minor: v.computed,
-                        actual_minor: v.cached,
+                    .chain(report.sub_grain_variances.iter().filter_map(|v| {
+                        affected_item(
+                            v.key.clone(),
+                            v.cached.currency().to_owned(),
+                            &v.computed,
+                            &v.cached,
+                        )
                     }))
-                    .chain(
-                        report
-                            .payment_counter_variances
-                            .iter()
-                            .map(|v| AffectedItem {
-                                id: format!("payment={}/{}", v.payment_id, v.counter),
-                                currency: String::new(),
-                                expected_minor: v.computed,
-                                actual_minor: v.cached,
-                            }),
-                    )
+                    .chain(report.payment_counter_variances.iter().filter_map(|v| {
+                        affected_item(
+                            format!("payment={}/{}", v.payment_id, v.counter),
+                            v.cached.currency().to_owned(),
+                            &v.computed,
+                            &v.cached,
+                        )
+                    }))
                     .take(MAX_AFFECTED)
                     .collect();
                 self.emit(tenant_id, AlarmCategory::TieOutVariance, &summary, affected)
@@ -600,11 +830,13 @@ impl TieOutJob {
                 let affected = report
                     .imbalanced_entries
                     .iter()
-                    .map(|ie| AffectedItem {
-                        id: ie.entry_id.to_string(),
-                        currency: ie.currency.clone(),
-                        expected_minor: 0,
-                        actual_minor: ie.net_minor,
+                    .filter_map(|ie| {
+                        affected_item(
+                            ie.entry_id.to_string(),
+                            ie.currency.clone(),
+                            &GrainAmount::zero(ie.net.currency(), ie.net.currency_scale()),
+                            &ie.net,
+                        )
                     })
                     .take(MAX_AFFECTED)
                     .collect();
@@ -615,11 +847,14 @@ impl TieOutJob {
                 let affected = report
                     .negative_grains
                     .iter()
-                    .map(|g| AffectedItem {
-                        id: g.account_id.to_string(),
-                        currency: g.currency.clone(),
-                        expected_minor: 0,
-                        actual_minor: g.balance_minor,
+                    .filter_map(|g| {
+                        let balance = GrainAmount::from_posted(&g.balance);
+                        affected_item(
+                            g.account_id.to_string(),
+                            g.currency.clone(),
+                            &GrainAmount::zero(balance.currency(), balance.currency_scale()),
+                            &balance,
+                        )
                     })
                     .take(MAX_AFFECTED)
                     .collect();
@@ -666,17 +901,40 @@ impl TieOutJob {
     }
 }
 
-/// A line's signed minor delta: `+amount_minor` when its side equals the
-/// account's `normal_side`, else `-amount_minor` — the SAME rule the
-/// `BalanceProjector` uses for every grain. `None` when the account has no
-/// `normal_side` in the map (a defect handled by the `account_balance` pass).
-fn signed(line: &journal_line::Model, normal_side_map: &HashMap<Uuid, String>) -> Option<i64> {
+/// A line's signed delta: `+amount` when its side equals the account's
+/// `normal_side`, else `-amount` — the SAME rule the `BalanceProjector` uses for
+/// every grain. `None` when the account has no `normal_side` in the map, or
+/// when the stored amount text is corrupt (both defects handled by the
+/// `account_balance` pass, which force-flags the grain).
+fn signed(
+    line: &journal_line::Model,
+    money: Option<&PostedMoney>,
+    normal_side_map: &HashMap<Uuid, String>,
+) -> Option<PostedMoney> {
+    signed_owned(line, money?.clone(), normal_side_map)
+}
+
+/// [`signed`] for a posting the caller owns: the normal-side delta is the
+/// posting itself, with no clone.
+fn signed_owned(
+    line: &journal_line::Model,
+    money: PostedMoney,
+    normal_side_map: &HashMap<Uuid, String>,
+) -> Option<PostedMoney> {
     let normal_side = normal_side_map.get(&line.account_id)?;
-    Some(if &line.side == normal_side {
-        line.amount_minor
+    if &line.side == normal_side {
+        Some(money)
     } else {
-        -line.amount_minor
-    })
+        negated(&money)
+    }
+}
+
+/// The grain total a line's currency metadata starts from.
+fn line_zero(line: &journal_line::Model) -> GrainAmount {
+    GrainAmount::zero(
+        &line.currency,
+        u8::try_from(line.currency_scale).unwrap_or(0),
+    )
 }
 
 /// Fold the lines into `(account_id, currency) -> signed sum` and diff against
@@ -690,22 +948,31 @@ fn signed(line: &journal_line::Model, normal_side_map: &HashMap<Uuid, String>) -
 /// of distinct grains, not the number of lines.
 #[derive(Default)]
 struct AccountBalanceAcc {
-    computed: HashMap<(Uuid, String), i64>,
+    computed: HashMap<(Uuid, String), GrainAmount>,
     /// Grains whose recompute is untrustworthy (missing normal_side) — always a
     /// variance regardless of whether the cache happens to match.
     forced: HashSet<(Uuid, String)>,
 }
 
 impl AccountBalanceAcc {
-    /// Fold one page of lines into the running sums.
+    /// Fold raw lines (decoding them first); the page loop shares one decode.
+    #[cfg(test)]
     fn fold(&mut self, lines: &[journal_line::Model], normal_side_map: &HashMap<Uuid, String>) {
-        for line in lines {
+        self.fold_page(&DecodedPage::new(lines), normal_side_map);
+    }
+
+    /// Fold one decoded page of lines into the running sums.
+    fn fold_page(&mut self, page: &DecodedPage<'_>, normal_side_map: &HashMap<Uuid, String>) {
+        for (line, money) in page.iter() {
             let key = (line.account_id, line.currency.clone());
-            let Some(delta) = signed(line, normal_side_map) else {
+            let Some(delta) = signed(line, money, normal_side_map) else {
                 self.forced.insert(key);
                 continue;
             };
-            *self.computed.entry(key).or_insert(0) += delta;
+            self.computed
+                .entry(key)
+                .or_insert_with(|| line_zero(line))
+                .add_posted(&delta);
         }
     }
 
@@ -721,43 +988,57 @@ impl AccountBalanceAcc {
     ) -> Vec<AccountBalanceVariance> {
         let Self { computed, forced } = self;
         let mut variances = Vec::new();
+        let cached_of = |key: &(Uuid, String), like: &GrainAmount| {
+            cache_map.get(key).map_or_else(
+                || GrainAmount::zero(like.currency(), like.currency_scale()),
+                |m| cached_amount(m, "balance", &m.balance),
+            )
+        };
 
-        // Computed grains: compare to the cache (missing cache → cached = 0).
+        // Computed grains: compare to the cache (missing cache → zero).
         for (key, computed_sum) in &computed {
-            let cached = cache_map.get(key).map_or(0_i64, |m| m.balance_minor);
-            if *computed_sum != cached || forced.contains(key) {
+            let cached = cached_of(key, computed_sum);
+            if computed_sum.differs_from(&cached) || forced.contains(key) {
                 variances.push(AccountBalanceVariance {
                     account_id: key.0,
                     currency: key.1.clone(),
-                    computed: *computed_sum,
+                    computed: computed_sum.clone(),
                     cached,
                 });
             }
         }
 
         // Force-flagged grains that had NO surviving computed entry (every line
-        // for the grain was dropped for a missing normal_side).
+        // for the grain was dropped for a missing normal_side / corrupt text).
         for key in &forced {
             if !computed.contains_key(key) {
-                let cached = cache_map.get(key).map_or(0_i64, |m| m.balance_minor);
+                let cached = cache_map.get(key).map_or_else(
+                    || GrainAmount::untrusted(&key.1, 0),
+                    |m| cached_amount(m, "balance", &m.balance),
+                );
                 variances.push(AccountBalanceVariance {
                     account_id: key.0,
                     currency: key.1.clone(),
-                    computed: 0,
+                    computed: GrainAmount::untrusted(cached.currency(), cached.currency_scale()),
                     cached,
                 });
             }
         }
 
-        // Stray cache grains with no computed counterpart (computed treated as 0).
+        // Stray cache grains with no computed counterpart (computed treated as
+        // zero); a corrupt stored balance always surfaces.
         for b in balances {
             let key = (b.account_id, b.currency.clone());
-            if !computed.contains_key(&key) && !forced.contains(&key) && b.balance_minor != 0 {
+            if computed.contains_key(&key) || forced.contains(&key) {
+                continue;
+            }
+            let cached = cached_amount(b, "balance", &b.balance);
+            if !cached.is_zero() {
                 variances.push(AccountBalanceVariance {
                     account_id: b.account_id,
                     currency: b.currency.clone(),
-                    computed: 0,
-                    cached: b.balance_minor,
+                    computed: GrainAmount::zero(cached.currency(), cached.currency_scale()),
+                    cached,
                 });
             }
         }
@@ -773,8 +1054,8 @@ impl AccountBalanceAcc {
 /// cache; `label` renders a key into the human (ids-only) diagnostic string.
 fn diff_grain<K, F>(
     grain: &'static str,
-    computed: &HashMap<K, i64>,
-    cache: &HashMap<K, i64>,
+    computed: &HashMap<K, GrainAmount>,
+    cache: &HashMap<K, GrainAmount>,
     label: F,
 ) -> Vec<SubGrainVariance>
 where
@@ -782,26 +1063,29 @@ where
     F: Fn(&K) -> String,
 {
     let mut variances = Vec::new();
-    // Computed grains: compare to the cache (missing cache → cached = 0).
+    // Computed grains: compare to the cache (missing cache → zero).
     for (key, computed_sum) in computed {
-        let cached = cache.get(key).copied().unwrap_or(0);
-        if *computed_sum != cached {
+        let cached = cache.get(key).cloned().unwrap_or_else(|| {
+            GrainAmount::zero(computed_sum.currency(), computed_sum.currency_scale())
+        });
+        if computed_sum.differs_from(&cached) {
             variances.push(SubGrainVariance {
                 grain,
                 key: label(key),
-                computed: *computed_sum,
+                computed: computed_sum.clone(),
                 cached,
             });
         }
     }
-    // Stray non-zero cache grains with no computed counterpart (computed = 0).
+    // Stray non-zero (or corrupt) cache grains with no computed counterpart
+    // (computed = zero).
     for (key, cached) in cache {
-        if *cached != 0 && !computed.contains_key(key) {
+        if !cached.is_zero() && !computed.contains_key(key) {
             variances.push(SubGrainVariance {
                 grain,
                 key: label(key),
-                computed: 0,
-                cached: *cached,
+                computed: GrainAmount::zero(cached.currency(), cached.currency_scale()),
+                cached: cached.clone(),
             });
         }
     }
@@ -811,12 +1095,12 @@ where
 /// Recompute the sub-grain caches in memory from the journal lines and diff each
 /// against its cache, mirroring `BalanceProjector::derive_grains`:
 /// - `ar_payer_balance` `(payer, account, currency)` from `AR` lines;
-/// - `ar_invoice_balance.balance_minor` `(payer, account, invoice)` from `AR`
+/// - `ar_invoice_balance.balance` `(payer, account, invoice)` from `AR`
 ///   lines carrying an `invoice_id`;
-/// - `ar_invoice_balance.disputed_minor` — a SECOND `(payer, account, invoice)`
+/// - `ar_invoice_balance.disputed` — a SECOND `(payer, account, invoice)`
 ///   map summing the signed delta of ONLY the `ar_status == "DISPUTED"` AR lines
 ///   (mirrors `projector.rs:788`: a DISPUTED leg routes its signed amount onto
-///   `disputed_minor`; `DR +`, `CR −`);
+///   `disputed`; `DR +`, `CR −`);
 /// - `tax_subbalance` `(account, jurisdiction, filing)` from `TAX_PAYABLE`
 ///   lines carrying BOTH tax dims;
 /// - `unallocated_balance` `(payer, account, currency)` from `UNALLOCATED` lines;
@@ -838,22 +1122,28 @@ where
 #[derive(Default)]
 struct SubGrainAcc {
     // (payer_tenant_id, account_id, currency) -> signed sum.
-    ar_payer: HashMap<(Uuid, Uuid, String), i64>,
-    // (payer_tenant_id, account_id, invoice_id) -> signed sum (balance_minor).
-    ar_invoice: HashMap<(Uuid, Uuid, String), i64>,
+    ar_payer: HashMap<(Uuid, Uuid, String), GrainAmount>,
+    // (payer_tenant_id, account_id, invoice_id) -> signed sum (balance).
+    ar_invoice: HashMap<(Uuid, Uuid, String), GrainAmount>,
     // (payer_tenant_id, account_id, invoice_id) -> signed sum of DISPUTED legs only.
-    ar_invoice_disputed: HashMap<(Uuid, Uuid, String), i64>,
+    ar_invoice_disputed: HashMap<(Uuid, Uuid, String), GrainAmount>,
     // (account_id, tax_jurisdiction, tax_filing_period) -> signed sum.
-    tax: HashMap<(Uuid, String, String), i64>,
+    tax: HashMap<(Uuid, String, String), GrainAmount>,
     // (payer_tenant_id, account_id, currency) -> signed sum.
-    unallocated: HashMap<(Uuid, Uuid, String), i64>,
+    unallocated: HashMap<(Uuid, Uuid, String), GrainAmount>,
     // (payer_tenant_id, account_id, currency, credit_grant_event_type) -> signed sum.
-    reusable_credit: HashMap<(Uuid, Uuid, String, String), i64>,
+    reusable_credit: HashMap<(Uuid, Uuid, String, String), GrainAmount>,
 }
 
 impl SubGrainAcc {
-    /// Fold one page of lines into the per-grain sums.
+    /// Fold raw lines (decoding them first); the page loop shares one decode.
+    #[cfg(test)]
     fn fold(&mut self, lines: &[journal_line::Model], normal_side_map: &HashMap<Uuid, String>) {
+        self.fold_page(&DecodedPage::new(lines), normal_side_map);
+    }
+
+    /// Fold one decoded page of lines into the per-grain sums.
+    fn fold_page(&mut self, page: &DecodedPage<'_>, normal_side_map: &HashMap<Uuid, String>) {
         let Self {
             ar_payer,
             ar_invoice,
@@ -862,26 +1152,33 @@ impl SubGrainAcc {
             unallocated,
             reusable_credit,
         } = self;
-        for line in lines {
+        for (line, money) in page.iter() {
             // Skip lines whose account lacks a normal_side (already force-flagged
             // by the account_balance pass) — never contributes to any projector
             // cache.
-            let Some(delta) = signed(line, normal_side_map) else {
+            let Some(delta) = signed(line, money, normal_side_map) else {
                 continue;
             };
 
             if line.account_class == CLASS_AR {
-                *ar_payer
+                ar_payer
                     .entry((line.payer_tenant_id, line.account_id, line.currency.clone()))
-                    .or_insert(0) += delta;
+                    .or_insert_with(|| line_zero(line))
+                    .add_posted(&delta);
                 if let Some(invoice_id) = &line.invoice_id {
                     let key = (line.payer_tenant_id, line.account_id, invoice_id.clone());
-                    *ar_invoice.entry(key.clone()).or_insert(0) += delta;
+                    ar_invoice
+                        .entry(key.clone())
+                        .or_insert_with(|| line_zero(line))
+                        .add_posted(&delta);
                     // DISPUTED-tagged AR lines additionally route their signed delta
-                    // onto `disputed_minor` (projector.rs:788). Untagged / ACTIVE AR
+                    // onto `disputed` (projector.rs:788). Untagged / ACTIVE AR
                     // lines leave it untouched.
                     if line.ar_status.as_deref() == Some(AR_STATUS_DISPUTED) {
-                        *ar_invoice_disputed.entry(key).or_insert(0) += delta;
+                        ar_invoice_disputed
+                            .entry(key)
+                            .or_insert_with(|| line_zero(line))
+                            .add_posted(&delta);
                     }
                 }
             }
@@ -890,28 +1187,31 @@ impl SubGrainAcc {
                 && let (Some(juris), Some(filing)) =
                     (&line.tax_jurisdiction, &line.tax_filing_period)
             {
-                *tax.entry((line.account_id, juris.clone(), filing.clone()))
-                    .or_insert(0) += delta;
+                tax.entry((line.account_id, juris.clone(), filing.clone()))
+                    .or_insert_with(|| line_zero(line))
+                    .add_posted(&delta);
             }
 
             if line.account_class == CLASS_UNALLOCATED {
-                *unallocated
+                unallocated
                     .entry((line.payer_tenant_id, line.account_id, line.currency.clone()))
-                    .or_insert(0) += delta;
+                    .or_insert_with(|| line_zero(line))
+                    .add_posted(&delta);
             }
 
             if line.account_class == CLASS_REUSABLE_CREDIT {
                 // The credit-grant event type sub-divides the wallet (a PK dim); a
                 // missing one keys as `""` (the projector's `unwrap_or_default()`).
                 let event_type = line.credit_grant_event_type.clone().unwrap_or_default();
-                *reusable_credit
+                reusable_credit
                     .entry((
                         line.payer_tenant_id,
                         line.account_id,
                         line.currency.clone(),
                         event_type,
                     ))
-                    .or_insert(0) += delta;
+                    .or_insert_with(|| line_zero(line))
+                    .add_posted(&delta);
             }
         }
     }
@@ -935,35 +1235,37 @@ impl SubGrainAcc {
             reusable_credit,
         } = self;
 
-        // Cache rows keyed the same way as the computed maps.
-        let ar_payer_cache_map: HashMap<(Uuid, Uuid, String), i64> = ar_payer_cache
+        // Cache rows keyed the same way as the computed maps (decoded exactly;
+        // a corrupt stored amount is an untrusted zero that always surfaces).
+        let ar_payer_cache_map: HashMap<(Uuid, Uuid, String), GrainAmount> = ar_payer_cache
             .iter()
             .map(|r| {
                 (
                     (r.payer_tenant_id, r.account_id, r.currency.clone()),
-                    r.balance_minor,
+                    cached_amount(r, "balance", &r.balance),
                 )
             })
             .collect();
-        let ar_invoice_cache_map: HashMap<(Uuid, Uuid, String), i64> = ar_invoice_cache
+        let ar_invoice_cache_map: HashMap<(Uuid, Uuid, String), GrainAmount> = ar_invoice_cache
             .iter()
             .map(|r| {
                 (
                     (r.payer_tenant_id, r.account_id, r.invoice_id.clone()),
-                    r.balance_minor,
+                    cached_amount(r, "balance", &r.balance),
                 )
             })
             .collect();
-        let ar_invoice_disputed_cache_map: HashMap<(Uuid, Uuid, String), i64> = ar_invoice_cache
-            .iter()
-            .map(|r| {
-                (
-                    (r.payer_tenant_id, r.account_id, r.invoice_id.clone()),
-                    r.disputed_minor,
-                )
-            })
-            .collect();
-        let tax_cache_map: HashMap<(Uuid, String, String), i64> = tax_cache
+        let ar_invoice_disputed_cache_map: HashMap<(Uuid, Uuid, String), GrainAmount> =
+            ar_invoice_cache
+                .iter()
+                .map(|r| {
+                    (
+                        (r.payer_tenant_id, r.account_id, r.invoice_id.clone()),
+                        cached_amount(r, "disputed", &r.disputed),
+                    )
+                })
+                .collect();
+        let tax_cache_map: HashMap<(Uuid, String, String), GrainAmount> = tax_cache
             .iter()
             .map(|r| {
                 (
@@ -972,20 +1274,20 @@ impl SubGrainAcc {
                         r.tax_jurisdiction.clone(),
                         r.tax_filing_period.clone(),
                     ),
-                    r.balance_minor,
+                    cached_amount(r, "balance", &r.balance),
                 )
             })
             .collect();
-        let unallocated_cache_map: HashMap<(Uuid, Uuid, String), i64> = unallocated_cache
+        let unallocated_cache_map: HashMap<(Uuid, Uuid, String), GrainAmount> = unallocated_cache
             .iter()
             .map(|r| {
                 (
                     (r.payer_tenant_id, r.account_id, r.currency.clone()),
-                    r.balance_minor,
+                    cached_amount(r, "balance", &r.balance),
                 )
             })
             .collect();
-        let reusable_credit_cache_map: HashMap<(Uuid, Uuid, String, String), i64> =
+        let reusable_credit_cache_map: HashMap<(Uuid, Uuid, String, String), GrainAmount> =
             reusable_credit_cache
                 .iter()
                 .map(|r| {
@@ -996,7 +1298,7 @@ impl SubGrainAcc {
                             r.currency.clone(),
                             r.credit_grant_event_type.clone(),
                         ),
-                        r.balance_minor,
+                        cached_amount(r, "balance", &r.balance),
                     )
                 })
                 .collect();
@@ -1067,10 +1369,10 @@ fn settle_index(entries: &[journal_entry::Model]) -> (HashMap<Uuid, String>, boo
 /// Reconciles the `payment_settlement` counters against the truth, per
 /// `payment_id`, emitting a [`PaymentCounterVariance`] for each disagreement:
 ///
-/// - **`allocated_minor`** ← Σ `payment_allocation.amount_minor` for the
+/// - **`allocated`** ← Σ `payment_allocation.amount` for the
 ///   `payment_id` (the allocation rows ARE the truth — a direct table sum, not a
 ///   journal recompute). Always reconciled.
-/// - **`settled_minor`** ← Σ of the `CR UNALLOCATED` line amounts on the
+/// - **`settled`** ← Σ of the `CR UNALLOCATED` line amounts on the
 ///   payment's `PAYMENT_SETTLE` journal entry (`= gross`, the settlement seed).
 ///   Reconciled ONLY when the tenant has NO `SETTLEMENT_RETURN` entry: a return
 ///   decrements the cached `settled_minor` via `add_settled(-amount)`, but its
@@ -1099,8 +1401,8 @@ fn settle_index(entries: &[journal_entry::Model]) -> (HashMap<Uuid, String>, boo
 /// no counter row surfaces as `computed != 0, cached = 0`.
 #[derive(Default)]
 struct PaymentCounterAcc {
-    settled_from_journal: HashMap<String, i64>,
-    fee_from_journal: HashMap<String, i64>,
+    settled_from_journal: HashMap<String, GrainAmount>,
+    fee_from_journal: HashMap<String, GrainAmount>,
 }
 
 impl PaymentCounterAcc {
@@ -1109,23 +1411,45 @@ impl PaymentCounterAcc {
     /// line's PAYMENT_SETTLE entry payment (via `settle_payment_by_entry`). A line
     /// on a non-settle entry is ignored — matching the by-entry grouping the
     /// former one-shot pass used.
+    #[cfg(test)]
     fn fold(
         &mut self,
         lines: &[journal_line::Model],
         settle_payment_by_entry: &HashMap<Uuid, String>,
     ) {
-        for line in lines {
+        self.fold_page(&DecodedPage::new(lines), settle_payment_by_entry);
+    }
+
+    /// [`Self::fold`] over a page whose amounts are already decoded.
+    fn fold_page(
+        &mut self,
+        page: &DecodedPage<'_>,
+        settle_payment_by_entry: &HashMap<Uuid, String>,
+    ) {
+        for (line, money) in page.iter() {
             let Some(payment_id) = settle_payment_by_entry.get(&line.entry_id) else {
                 continue;
             };
-            if line.side == SIDE_CREDIT && line.account_class == CLASS_UNALLOCATED {
-                *self
-                    .settled_from_journal
+            let Some(money) = money else {
+                // Corrupt stored text: the counter cannot be trusted; mark it so
+                // the payment surfaces as a variance rather than vanish.
+                self.settled_from_journal
                     .entry(payment_id.clone())
-                    .or_insert(0) += line.amount_minor;
+                    .or_insert_with(|| line_zero(line))
+                    .mark_untrusted();
+                continue;
+            };
+            if line.side == SIDE_CREDIT && line.account_class == CLASS_UNALLOCATED {
+                self.settled_from_journal
+                    .entry(payment_id.clone())
+                    .or_insert_with(|| line_zero(line))
+                    .add_posted(money);
             }
             if line.side == SIDE_DEBIT && line.account_class == CLASS_PSP_FEE_EXPENSE {
-                *self.fee_from_journal.entry(payment_id.clone()).or_insert(0) += line.amount_minor;
+                self.fee_from_journal
+                    .entry(payment_id.clone())
+                    .or_insert_with(|| line_zero(line))
+                    .add_posted(money);
             }
         }
     }
@@ -1165,12 +1489,17 @@ impl PaymentCounterAcc {
             );
         }
 
-        // `allocated_minor` from the allocation rows (truth), per payment.
-        let mut allocated_from_rows: HashMap<String, i64> = HashMap::new();
+        // `allocated` from the allocation rows (truth), per payment.
+        let mut allocated_from_rows: HashMap<String, GrainAmount> = HashMap::new();
         for alloc in allocations {
-            *allocated_from_rows
+            let scale = u8::try_from(alloc.currency_scale).unwrap_or(0);
+            let total = allocated_from_rows
                 .entry(alloc.payment_id.clone())
-                .or_insert(0) += alloc.amount_minor;
+                .or_insert_with(|| GrainAmount::zero(&alloc.currency, scale));
+            match decode_money(&alloc.amount, &alloc.currency, alloc.currency_scale) {
+                Ok(money) => total.add_posted(&money),
+                Err(_) => total.mark_untrusted(),
+            }
         }
 
         // Diff each reconciled counter against the cache. The settlement cache row is
@@ -1181,45 +1510,53 @@ impl PaymentCounterAcc {
         let mut seen_payments: HashSet<&str> = HashSet::new();
         for row in settlement_cache {
             seen_payments.insert(row.payment_id.as_str());
+            let scale = u8::try_from(row.currency_scale).unwrap_or(0);
+            let zero = || GrainAmount::zero(&row.currency, scale);
 
             let allocated = allocated_from_rows
                 .get(&row.payment_id)
-                .copied()
-                .unwrap_or(0);
-            if allocated != row.allocated_minor {
+                .cloned()
+                .unwrap_or_else(zero);
+            let cached_allocated = cached_amount(row, "allocated", &row.allocated);
+            if allocated.differs_from(&cached_allocated) {
                 variances.push(PaymentCounterVariance {
                     payment_id: row.payment_id.clone(),
-                    counter: "allocated_minor",
+                    counter: "allocated",
                     computed: allocated,
-                    cached: row.allocated_minor,
+                    cached: cached_allocated,
                 });
             }
 
-            // `settled_minor` + `fee_minor` share the SETTLEMENT_RETURN gate: a return
+            // `settled` + `fee` share the SETTLEMENT_RETURN gate: a return
             // decrements both on its un-mappable `psp_return_id`-keyed entry (Model N
             // D1), so neither is journal→payment recoverable in memory once any return
             // exists for the tenant.
             if !has_settlement_return {
-                let fee = fee_from_journal.get(&row.payment_id).copied().unwrap_or(0);
-                if fee != row.fee_minor {
+                let fee = fee_from_journal
+                    .get(&row.payment_id)
+                    .cloned()
+                    .unwrap_or_else(zero);
+                let cached_fee = cached_amount(row, "fee", &row.fee);
+                if fee.differs_from(&cached_fee) {
                     variances.push(PaymentCounterVariance {
                         payment_id: row.payment_id.clone(),
-                        counter: "fee_minor",
+                        counter: "fee",
                         computed: fee,
-                        cached: row.fee_minor,
+                        cached: cached_fee,
                     });
                 }
 
                 let settled = settled_from_journal
                     .get(&row.payment_id)
-                    .copied()
-                    .unwrap_or(0);
-                if settled != row.settled_minor {
+                    .cloned()
+                    .unwrap_or_else(zero);
+                let cached_settled = cached_amount(row, "settled", &row.settled);
+                if settled.differs_from(&cached_settled) {
                     variances.push(PaymentCounterVariance {
                         payment_id: row.payment_id.clone(),
-                        counter: "settled_minor",
+                        counter: "settled",
                         computed: settled,
-                        cached: row.settled_minor,
+                        cached: cached_settled,
                     });
                 }
             }
@@ -1228,7 +1565,7 @@ impl PaymentCounterAcc {
         // Computed-but-uncached payments (a settle journal / allocation rows with NO
         // `payment_settlement` counter row — the seed that should anchor them is
         // missing). Mirror `diff_grain`'s stray-computed rule: flag each non-zero
-        // computed counter with `cached = 0`. `settled_minor` stays gated on the
+        // computed counter with `cached = 0`. `settled` stays gated on the
         // no-return guard.
         let mut orphans: HashSet<&str> = HashSet::new();
         orphans.extend(allocated_from_rows.keys().map(String::as_str));
@@ -1238,34 +1575,37 @@ impl PaymentCounterAcc {
             if seen_payments.contains(payment_id) {
                 continue;
             }
-            let allocated = allocated_from_rows.get(payment_id).copied().unwrap_or(0);
-            if allocated != 0 {
+            if let Some(allocated) = allocated_from_rows.get(payment_id)
+                && !allocated.is_zero()
+            {
                 variances.push(PaymentCounterVariance {
                     payment_id: payment_id.to_owned(),
-                    counter: "allocated_minor",
-                    computed: allocated,
-                    cached: 0,
+                    counter: "allocated",
+                    computed: allocated.clone(),
+                    cached: GrainAmount::zero(allocated.currency(), allocated.currency_scale()),
                 });
             }
-            // `fee_minor` + `settled_minor` share the SETTLEMENT_RETURN gate (see the
+            // `fee` + `settled` share the SETTLEMENT_RETURN gate (see the
             // main loop): both carry un-mappable return decrements (Model N D1).
             if !has_settlement_return {
-                let fee = fee_from_journal.get(payment_id).copied().unwrap_or(0);
-                if fee != 0 {
+                if let Some(fee) = fee_from_journal.get(payment_id)
+                    && !fee.is_zero()
+                {
                     variances.push(PaymentCounterVariance {
                         payment_id: payment_id.to_owned(),
-                        counter: "fee_minor",
-                        computed: fee,
-                        cached: 0,
+                        counter: "fee",
+                        computed: fee.clone(),
+                        cached: GrainAmount::zero(fee.currency(), fee.currency_scale()),
                     });
                 }
-                let settled = settled_from_journal.get(payment_id).copied().unwrap_or(0);
-                if settled != 0 {
+                if let Some(settled) = settled_from_journal.get(payment_id)
+                    && !settled.is_zero()
+                {
                     variances.push(PaymentCounterVariance {
                         payment_id: payment_id.to_owned(),
-                        counter: "settled_minor",
-                        computed: settled,
-                        cached: 0,
+                        counter: "settled",
+                        computed: settled.clone(),
+                        cached: GrainAmount::zero(settled.currency(), settled.currency_scale()),
                     });
                 }
             }
@@ -1278,7 +1618,7 @@ impl PaymentCounterAcc {
 /// Per-entry running tally for the entry-balance backstop.
 #[derive(Default)]
 struct EntryAgg {
-    net_minor: i64,
+    net: Option<GrainAmount>,
     line_count: u64,
     payers: HashSet<Uuid>,
 }
@@ -1296,17 +1636,28 @@ struct EntryBackstopAcc {
 }
 
 impl EntryBackstopAcc {
-    /// Fold one page of lines into the per-entry tallies.
+    /// Fold raw lines (decoding them first); the page loop shares one decode.
+    #[cfg(test)]
     fn fold(&mut self, lines: &[journal_line::Model]) {
-        for line in lines {
+        self.fold_page(&DecodedPage::new(lines));
+    }
+
+    /// Fold one decoded page of lines into the per-entry tallies.
+    fn fold_page(&mut self, page: &DecodedPage<'_>) {
+        for (line, money) in page.iter() {
             let key = (line.entry_id, line.currency.clone(), line.currency_scale);
             let agg = self.groups.entry(key).or_default();
-            let signed = if line.side == SIDE_DEBIT {
-                line.amount_minor
-            } else {
-                -line.amount_minor
-            };
-            agg.net_minor += signed;
+            let net = agg.net.get_or_insert_with(|| line_zero(line));
+            match money.and_then(|money| {
+                if line.side == SIDE_DEBIT {
+                    Some(money.clone())
+                } else {
+                    negated(money)
+                }
+            }) {
+                Some(signed) => net.add_posted(&signed),
+                None => net.mark_untrusted(),
+            }
             agg.line_count += 1;
             agg.payers.insert(line.payer_tenant_id);
         }
@@ -1316,13 +1667,16 @@ impl EntryBackstopAcc {
     /// more than one payer.
     fn finalize(self) -> Vec<ImbalancedEntry> {
         let mut imbalanced = Vec::new();
-        for ((entry_id, currency, _scale), agg) in self.groups {
+        for ((entry_id, currency, scale), agg) in self.groups {
             let payer_count = u64::try_from(agg.payers.len()).unwrap_or(u64::MAX);
-            if agg.net_minor != 0 || payer_count > 1 {
+            let net = agg
+                .net
+                .unwrap_or_else(|| GrainAmount::zero(&currency, u8::try_from(scale).unwrap_or(0)));
+            if !net.is_zero() || payer_count > 1 {
                 imbalanced.push(ImbalancedEntry {
                     entry_id,
                     currency,
-                    net_minor: agg.net_minor,
+                    net,
                     line_count: agg.line_count,
                     payer_count,
                 });
@@ -1340,21 +1694,24 @@ fn negative_grains(balances: &[account_balance::Model]) -> Vec<NegativeGrain> {
     balances
         .iter()
         .filter(|b| {
-            b.balance_minor < 0
-                && b.account_class
-                    .parse::<AccountClass>()
-                    .map_or(true, AccountClass::is_guarded)
+            b.account_class
+                .parse::<AccountClass>()
+                .map_or(true, AccountClass::is_guarded)
         })
-        .map(|b| NegativeGrain {
-            account_id: b.account_id,
-            currency: b.currency.clone(),
-            balance_minor: b.balance_minor,
+        .filter_map(|b| {
+            // A corrupt stored balance is surfaced by the cache variance pass.
+            let balance = decode_money(&b.balance, &b.currency, b.currency_scale).ok()?;
+            balance.amount().is_sign_negative().then(|| NegativeGrain {
+                account_id: b.account_id,
+                currency: b.currency.clone(),
+                balance,
+            })
         })
         .collect()
 }
 
 // ────────────────────────────────────────────────────────────────────────────
-// VHP-1843 incremental tie-out: (grain, grain_key) string-space projection.
+// Incremental tie-out: (grain, grain_key) string-space projection.
 //
 // The full `tie_out_on` folds ALL of a tenant's lines (O(history)). The
 // incremental path verifies `baseline + fold(open periods) == cache` instead:
@@ -1364,29 +1721,6 @@ fn negative_grains(balances: &[account_balance::Model]) -> Vec<NegativeGrain> {
 // projection and the line fold land in the SAME `(grain, grain_key)` string
 // space the baseline is stored in, so the three compare like-for-like.
 // ────────────────────────────────────────────────────────────────────────────
-
-/// Canonical `grain_key` for the `account_balance` grain.
-fn key_account(account_id: Uuid, currency: &str) -> String {
-    format!("{account_id}|{currency}")
-}
-/// Canonical `grain_key` for `(payer, account, currency)` grains
-/// (`ar_payer_balance`, `unallocated_balance`).
-fn key_payer_account_ccy(payer: Uuid, account: Uuid, currency: &str) -> String {
-    format!("{payer}|{account}|{currency}")
-}
-/// Canonical `grain_key` for `(payer, account, invoice)` grains
-/// (`ar_invoice` balance + disputed).
-fn key_payer_account_invoice(payer: Uuid, account: Uuid, invoice: &str) -> String {
-    format!("{payer}|{account}|{invoice}")
-}
-/// Canonical `grain_key` for the `tax_subbalance` grain.
-fn key_tax(account: Uuid, juris: &str, filing: &str) -> String {
-    format!("{account}|{juris}|{filing}")
-}
-/// Canonical `grain_key` for the `reusable_credit_subbalance` grain.
-fn key_reusable(payer: Uuid, account: Uuid, currency: &str, event_type: &str) -> String {
-    format!("{payer}|{account}|{currency}|{event_type}")
-}
 
 /// Project the derived caches into `(grain, grain_key) -> balance` — the shared
 /// representation the baseline is stored in and the open fold is compared
@@ -1398,12 +1732,12 @@ fn cache_grains(
     tax: &[tax_subbalance::Model],
     unallocated: &[unallocated_balance::Model],
     reusable_credit: &[reusable_credit_subbalance::Model],
-) -> HashMap<(&'static str, String), i64> {
-    let mut m: HashMap<(&'static str, String), i64> = HashMap::new();
+) -> HashMap<(&'static str, String), GrainAmount> {
+    let mut m: HashMap<(&'static str, String), GrainAmount> = HashMap::new();
     for b in balances {
         m.insert(
             (GRAIN_ACCOUNT, key_account(b.account_id, &b.currency)),
-            b.balance_minor,
+            cached_amount(b, "balance", &b.balance),
         );
     }
     for r in ar_payer {
@@ -1412,13 +1746,19 @@ fn cache_grains(
                 GRAIN_AR_PAYER,
                 key_payer_account_ccy(r.payer_tenant_id, r.account_id, &r.currency),
             ),
-            r.balance_minor,
+            cached_amount(r, "balance", &r.balance),
         );
     }
     for r in ar_invoice {
         let key = key_payer_account_invoice(r.payer_tenant_id, r.account_id, &r.invoice_id);
-        m.insert((GRAIN_AR_INVOICE, key.clone()), r.balance_minor);
-        m.insert((GRAIN_AR_INVOICE_DISPUTED, key), r.disputed_minor);
+        m.insert(
+            (GRAIN_AR_INVOICE, key.clone()),
+            cached_amount(r, "balance", &r.balance),
+        );
+        m.insert(
+            (GRAIN_AR_INVOICE_DISPUTED, key),
+            cached_amount(r, "disputed", &r.disputed),
+        );
     }
     for r in tax {
         m.insert(
@@ -1426,7 +1766,7 @@ fn cache_grains(
                 GRAIN_TAX,
                 key_tax(r.account_id, &r.tax_jurisdiction, &r.tax_filing_period),
             ),
-            r.balance_minor,
+            cached_amount(r, "balance", &r.balance),
         );
     }
     for r in unallocated {
@@ -1435,7 +1775,7 @@ fn cache_grains(
                 GRAIN_UNALLOCATED,
                 key_payer_account_ccy(r.payer_tenant_id, r.account_id, &r.currency),
             ),
-            r.balance_minor,
+            cached_amount(r, "balance", &r.balance),
         );
     }
     for r in reusable_credit {
@@ -1449,7 +1789,7 @@ fn cache_grains(
                     &r.credit_grant_event_type,
                 ),
             ),
-            r.balance_minor,
+            cached_amount(r, "balance", &r.balance),
         );
     }
     m
@@ -1457,13 +1797,22 @@ fn cache_grains(
 
 /// Convert a cache projection into baseline rows to snapshot (absolute totals).
 /// Used at period close to persist the freshly-verified cache as the baseline.
-fn cache_baseline_rows(cache: &HashMap<(&'static str, String), i64>) -> Vec<BaselineRow> {
+///
+/// # Errors
+/// A corrupt or out-of-contract cached total cannot be snapshotted as verified.
+fn cache_baseline_rows(
+    cache: &HashMap<(&'static str, String), GrainAmount>,
+) -> anyhow::Result<Vec<BaselineRow>> {
     cache
         .iter()
-        .map(|((grain, key), balance)| BaselineRow {
-            grain: (*grain).to_owned(),
-            grain_key: key.clone(),
-            balance_minor: *balance,
+        .map(|((grain, key), balance)| {
+            Ok(BaselineRow {
+                grain: (*grain).to_owned(),
+                grain_key: key.clone(),
+                balance: balance
+                    .to_posted()
+                    .map_err(|e| anyhow::anyhow!("baseline grain {grain}/{key}: {e}"))?,
+            })
         })
         .collect()
 }
@@ -1476,28 +1825,36 @@ fn cache_baseline_rows(cache: &HashMap<(&'static str, String), i64>) -> Vec<Base
 fn fold_grains(
     lines: &[journal_line::Model],
     normal_side_map: &HashMap<Uuid, String>,
-) -> HashMap<(&'static str, String), i64> {
-    let mut m: HashMap<(&'static str, String), i64> = HashMap::new();
+) -> HashMap<(&'static str, String), GrainAmount> {
+    let mut m: HashMap<(&'static str, String), GrainAmount> = HashMap::new();
+    // Decoded inline, one line at a time: this fold is the only consumer of the
+    // open-period lines, so a `DecodedPage` would only keep every decoded
+    // posting alive at once (it pays off where several accumulators share a page).
     for line in lines {
-        let Some(delta) = signed(line, normal_side_map) else {
+        let Some(delta) =
+            line_money(line).and_then(|money| signed_owned(line, money, normal_side_map))
+        else {
             continue;
         };
+        let mut bump = |key: (&'static str, String)| {
+            m.entry(key)
+                .or_insert_with(|| line_zero(line))
+                .add_posted(&delta);
+        };
         // account_balance — every line.
-        *m.entry((GRAIN_ACCOUNT, key_account(line.account_id, &line.currency)))
-            .or_insert(0) += delta;
+        bump((GRAIN_ACCOUNT, key_account(line.account_id, &line.currency)));
 
         if line.account_class == CLASS_AR {
-            *m.entry((
+            bump((
                 GRAIN_AR_PAYER,
                 key_payer_account_ccy(line.payer_tenant_id, line.account_id, &line.currency),
-            ))
-            .or_insert(0) += delta;
+            ));
             if let Some(invoice_id) = &line.invoice_id {
                 let key =
                     key_payer_account_invoice(line.payer_tenant_id, line.account_id, invoice_id);
-                *m.entry((GRAIN_AR_INVOICE, key.clone())).or_insert(0) += delta;
+                bump((GRAIN_AR_INVOICE, key.clone()));
                 if line.ar_status.as_deref() == Some(AR_STATUS_DISPUTED) {
-                    *m.entry((GRAIN_AR_INVOICE_DISPUTED, key)).or_insert(0) += delta;
+                    bump((GRAIN_AR_INVOICE_DISPUTED, key));
                 }
             }
         }
@@ -1505,21 +1862,19 @@ fn fold_grains(
         if line.account_class == CLASS_TAX_PAYABLE
             && let (Some(juris), Some(filing)) = (&line.tax_jurisdiction, &line.tax_filing_period)
         {
-            *m.entry((GRAIN_TAX, key_tax(line.account_id, juris, filing)))
-                .or_insert(0) += delta;
+            bump((GRAIN_TAX, key_tax(line.account_id, juris, filing)));
         }
 
         if line.account_class == CLASS_UNALLOCATED {
-            *m.entry((
+            bump((
                 GRAIN_UNALLOCATED,
                 key_payer_account_ccy(line.payer_tenant_id, line.account_id, &line.currency),
-            ))
-            .or_insert(0) += delta;
+            ));
         }
 
         if line.account_class == CLASS_REUSABLE_CREDIT {
             let event_type = line.credit_grant_event_type.clone().unwrap_or_default();
-            *m.entry((
+            bump((
                 GRAIN_REUSABLE_CREDIT,
                 key_reusable(
                     line.payer_tenant_id,
@@ -1527,8 +1882,7 @@ fn fold_grains(
                     &line.currency,
                     &event_type,
                 ),
-            ))
-            .or_insert(0) += delta;
+            ));
         }
     }
     m
@@ -1539,9 +1893,9 @@ fn fold_grains(
 /// stray cache row, a missing baseline grain, or an open-only grain all
 /// surface). A clean ledger yields an empty vec.
 fn verify_incremental(
-    baseline: &HashMap<(&'static str, String), i64>,
-    open_fold: &HashMap<(&'static str, String), i64>,
-    cache: &HashMap<(&'static str, String), i64>,
+    baseline: &HashMap<(&'static str, String), GrainAmount>,
+    open_fold: &HashMap<(&'static str, String), GrainAmount>,
+    cache: &HashMap<(&'static str, String), GrainAmount>,
 ) -> Vec<SubGrainVariance> {
     let mut keys: HashSet<&(&'static str, String)> = HashSet::new();
     keys.extend(baseline.keys());
@@ -1550,10 +1904,25 @@ fn verify_incremental(
 
     let mut variances = Vec::new();
     for key in keys {
-        let computed =
-            baseline.get(key).copied().unwrap_or(0) + open_fold.get(key).copied().unwrap_or(0);
-        let cached = cache.get(key).copied().unwrap_or(0);
-        if computed != cached {
+        // The currency metadata of whichever side exists seeds the zeros, so an
+        // absent side compares as an exact zero of the same grain.
+        let like = baseline
+            .get(key)
+            .or_else(|| open_fold.get(key))
+            .or_else(|| cache.get(key))
+            .map_or_else(|| GrainAmount::zero("", 0), Clone::clone);
+        let mut computed = baseline
+            .get(key)
+            .cloned()
+            .unwrap_or_else(|| GrainAmount::zero(like.currency(), like.currency_scale()));
+        if let Some(open) = open_fold.get(key) {
+            computed.add_grain(open);
+        }
+        let cached = cache
+            .get(key)
+            .cloned()
+            .unwrap_or_else(|| GrainAmount::zero(like.currency(), like.currency_scale()));
+        if computed.differs_from(&cached) {
             variances.push(SubGrainVariance {
                 grain: key.0,
                 key: key.1.clone(),
@@ -1608,7 +1977,7 @@ impl IncrementalReport {
 }
 
 impl TieOutJob {
-    /// Incremental tie-out (VHP-1843): verify `baseline + fold(open periods) ==
+    /// Incremental tie-out: verify `baseline + fold(open periods) ==
     /// cache`, bounding the daily/recon cost to the open period instead of
     /// folding all of history. Returns `Ok(None)` — signalling the caller to run
     /// the full [`tie_out_on`](Self::tie_out_on) — when the tenant has no stored
@@ -1628,7 +1997,8 @@ impl TieOutJob {
         let scope = AccessScope::for_tenant(tenant_id);
 
         // 1. Baseline. Empty → never closed a period → full fold.
-        let baseline_rows = VerifiedBalanceRepo::load_baseline(runner, &scope, tenant_id)
+        let baseline_rows = VerifiedBalanceRepo::new(self.db.clone())
+            .load_baseline(runner, &scope, tenant_id)
             .await
             .map_err(|e| anyhow::anyhow!("incremental tie-out: load baseline: {e}"))?;
         if baseline_rows.is_empty() {
@@ -1731,10 +2101,15 @@ impl TieOutJob {
             .iter()
             .map(|a| (a.account_id, a.normal_side.clone()))
             .collect();
-        let baseline_map: HashMap<(&'static str, String), i64> = baseline_rows
+        let baseline_map: HashMap<(&'static str, String), GrainAmount> = baseline_rows
             .iter()
             .filter_map(|r| {
-                grain_label(&r.grain).map(|g| ((g, r.grain_key.clone()), r.verified_balance_minor))
+                grain_label(&r.grain).map(|g| {
+                    (
+                        (g, r.grain_key.clone()),
+                        GrainAmount::from_posted(&r.balance),
+                    )
+                })
             })
             .collect();
         let open_fold = fold_grains(&open_lines, &normal_side_map);
@@ -1826,7 +2201,7 @@ impl TieOutJob {
             &unallocated_cache,
             &reusable_credit_cache,
         );
-        let rows = cache_baseline_rows(&cache_map);
+        let rows = cache_baseline_rows(&cache_map)?;
 
         // Watermark = max created_seq among the closing period's entries.
         let entries = journal_entry::Entity::find()
@@ -1842,16 +2217,17 @@ impl TieOutJob {
             .map_err(|e| anyhow::anyhow!("snapshot baseline: read journal_entry: {e}"))?;
         let watermark_seq = entries.iter().map(|e| e.created_seq).max().unwrap_or(0);
 
-        VerifiedBalanceRepo::snapshot(
-            runner,
-            &scope,
-            tenant_id,
-            through_period,
-            watermark_seq,
-            &rows,
-        )
-        .await
-        .map_err(|e| anyhow::anyhow!("snapshot baseline: persist: {e}"))?;
+        VerifiedBalanceRepo::new(self.db.clone())
+            .snapshot(
+                runner,
+                &scope,
+                tenant_id,
+                through_period,
+                watermark_seq,
+                &rows,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("snapshot baseline: persist: {e}"))?;
         Ok(())
     }
 }

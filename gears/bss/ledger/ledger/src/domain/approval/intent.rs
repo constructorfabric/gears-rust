@@ -1,16 +1,12 @@
-//! Serializable replay payloads for dual-control approvals. Stored as the
-//! `ledger_approval.intent` jsonb at create-pending time and replayed verbatim by
-//! the `ApprovalExecutor` on approve — so the executed mutation is exactly the one
-//! the preparer submitted (and edited on resubmit). Phase 1 covered the three
-//! seams on the payments-and-allocation base (reverse / credit-grant /
-//! chargeback-loss); Phase 2 adds payer-closure and material-backdating. The
-//! period-reopen intent lands with Slice 7 (no reopen operation exists yet).
+//! Typed captured mutations for approval replay. Persisted/wire JSON is encoded
+//! explicitly by infra::approval::stored_intent; SDK/domain money stays transport-free.
 
 use std::str::FromStr;
 
+use crate::domain::exact_money::{map_exact_error, sum_posted};
 use bss_ledger_sdk::{AccountClass, Side};
+use bss_ledger_sdk::{CurrencySpec, PostedMoney};
 use chrono::NaiveDate;
-use serde::{Deserialize, Serialize};
 use toolkit_macros::domain_model;
 use uuid::Uuid;
 
@@ -29,8 +25,7 @@ use crate::domain::recognition::input::{RecognitionInput, RecognitionTiming};
 
 /// A governed mutation captured for later replay, discriminated by `kind`.
 #[domain_model]
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "SCREAMING_SNAKE_CASE")]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ApprovalIntent {
     Reverse(ReverseIntent),
     CreditGrant(CreditGrantIntent),
@@ -50,42 +45,13 @@ pub enum ApprovalIntent {
     RefundWithCreditNote(RefundWithCreditNoteIntent),
 }
 
-impl ApprovalIntent {
-    /// The operation's TRANSACTION currency for the FX-aware dual-control threshold
-    /// (DC10): the D2 threshold is held in the tenant's FUNCTIONAL (reporting)
-    /// currency, so the dual-control gate translates the comparand from this
-    /// currency before comparing. `None` for non-amount kinds (payer-closure /
-    /// material-backdating) and for the two whose comparand is derived at gate time,
-    /// so their currency is not carried on the stored intent (`Reverse` reads the
-    /// original entry; `RecognitionScheduleChange` reads the schedule) — those keep
-    /// the pre-FX transaction-currency comparand (single-currency-correct; a
-    /// documented residual until the currency rides those intents).
-    #[must_use]
-    pub fn transaction_currency(&self) -> Option<&str> {
-        match self {
-            Self::Refund(i) => Some(&i.currency),
-            Self::RefundWithCreditNote(i) => Some(&i.refund.currency),
-            Self::CreditGrant(i) => Some(&i.currency),
-            Self::ChargebackLoss(i) => Some(&i.currency),
-            Self::ManualAdjustment(i) => Some(&i.currency),
-            Self::CreditNote(i) => Some(&i.currency),
-            Self::DebitNote(i) => Some(&i.currency),
-            Self::Reverse(_)
-            | Self::PayerClosure(_)
-            | Self::MaterialBackdating(_)
-            | Self::RecognitionScheduleChange(_)
-            | Self::PeriodReopen(_) => None,
-        }
-    }
-}
-
 /// Replay payload for a fiscal-period reopen (Slice 7, design §7 / N-core-3): the
 /// `CLOSED → REOPENED` transition (`fiscal_period` flipped back to `OPEN`) for the
 /// `(tenant, legal_entity, period)` it targets. Always dual-control (policy
 /// `requires_dual_control` returns `true` for `PeriodReopen`); the amount is
-/// structural, so `amount_minor` / `currency` return `None`.
+/// structural, so `amount` / `currency` return `None`.
 #[domain_model]
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 #[allow(
     clippy::struct_field_names,
     reason = "(tenant, legal_entity, period) is the canonical fiscal-period coordinate; the _id suffix is the domain convention, not redundant naming"
@@ -100,7 +66,7 @@ pub struct PeriodReopenIntent {
 /// entry at gate time (so it is not carried here); tenant + actor come from the
 /// approve request's `ctx`.
 #[domain_model]
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReverseIntent {
     pub entry_id: Uuid,
     pub into_period_id: Option<String>,
@@ -110,19 +76,18 @@ pub struct ReverseIntent {
 
 /// Replay payload for a high-value reusable-credit grant.
 #[domain_model]
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CreditGrantIntent {
     pub tenant_id: Uuid,
     pub payer_tenant_id: Uuid,
     pub credit_application_id: String,
-    pub currency: String,
-    pub amount_minor: i64,
+    pub amount: PostedMoney,
     pub credit_grant_event_type: Option<String>,
 }
 
 /// Replay payload for a chargeback-loss (`LOST`) dispute phase.
 #[domain_model]
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ChargebackLossIntent {
     pub tenant_id: Uuid,
     pub payer_tenant_id: Uuid,
@@ -131,15 +96,14 @@ pub struct ChargebackLossIntent {
     pub invoice_id: Option<String>,
     pub cycle: i32,
     pub funds_at_open: String,
-    pub disputed_amount_minor: i64,
-    pub currency: String,
+    pub disputed_amount: PostedMoney,
 }
 
 /// Replay payload for a payer-closure (sets `lifecycle_state = CLOSED`). The
 /// `disposition` records the customer-balance election when closing with a
 /// positive balance (design 01 §4.2); `tenant_id` is the seller ledger.
 #[domain_model]
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PayerClosureIntent {
     pub tenant_id: Uuid,
     pub payer_tenant_id: Uuid,
@@ -155,7 +119,7 @@ pub struct PayerClosureIntent {
 /// amount (the schedule's un-recognized deferred remainder) is read from the
 /// schedule by the gate — like `Reverse` — so it is not carried here.
 #[domain_model]
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RecognitionScheduleChangeIntent {
     pub tenant_id: Uuid,
     pub schedule_id: String,
@@ -168,14 +132,14 @@ pub struct RecognitionScheduleChangeIntent {
 /// One replacement segment in a [`RecognitionScheduleChangeIntent`] — the plain
 /// mirror of the SDK `ChangeSegment` (`None`-list on a `cancel`).
 #[domain_model]
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RecognitionChangeSegment {
     pub period_id: String,
-    pub amount_minor: i64,
+    pub amount: PostedMoney,
 }
 
 /// Replay payload for a high-value refund (Slice 3 Group D × dual-control,
-/// design §4.4 / §1.4 D2). A plain-type serde mirror of the domain
+/// design §4.4 / §1.4 D2). A plain-type typed mirror of the domain
 /// [`RefundRequest`] (no SDK/enum-with-no-serde imported into the stored jsonb):
 /// `phase` + `pattern` are stored as their stable `as_str` tokens and rebuilt via
 /// `parse` on approve (precedent: `BackdatedInvoiceItem.account_class`). The whole
@@ -185,7 +149,7 @@ pub struct RecognitionChangeSegment {
 /// `RefundHandler::post_refund` idempotently (the engine's
 /// `(tenant, REFUND, psp_refund_id:phase)` claim makes the replay at-most-once).
 #[domain_model]
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 // The `*_id` fields mirror the storage / domain column names verbatim (the same
 // `allow` `RefundRequest` carries).
 #[allow(clippy::struct_field_names)]
@@ -202,8 +166,7 @@ pub struct RefundIntent {
     pub pattern: String,
     pub payment_id: String,
     pub invoice_id: Option<String>,
-    pub currency: String,
-    pub amount_minor: i64,
+    pub amount: PostedMoney,
     pub two_stage: bool,
     /// The prior refund this one claws back / extends (refund-of-refund, Group E);
     /// `None` for a first-order refund. Snapshotted verbatim so the approved replay
@@ -226,8 +189,8 @@ impl From<&RefundRequest> for RefundIntent {
             pattern: req.pattern.as_str().to_owned(),
             payment_id: req.payment_id.clone(),
             invoice_id: req.invoice_id.clone(),
-            currency: req.currency.clone(),
-            amount_minor: req.amount_minor,
+
+            amount: req.amount.clone(),
             two_stage: req.two_stage,
             relates_to_refund_id: req.relates_to_refund_id.clone(),
             direction: req.direction.as_str().to_owned(),
@@ -263,8 +226,8 @@ impl TryFrom<&RefundIntent> for RefundRequest {
             pattern,
             payment_id: i.payment_id.clone(),
             invoice_id: i.invoice_id.clone(),
-            currency: i.currency.clone(),
-            amount_minor: i.amount_minor,
+
+            amount: i.amount.clone(),
             two_stage: i.two_stage,
             relates_to_refund_id: i.relates_to_refund_id.clone(),
             direction,
@@ -272,25 +235,25 @@ impl TryFrom<&RefundIntent> for RefundRequest {
     }
 }
 
-/// One leg of a [`ManualAdjustmentIntent`] — a plain-type serde mirror of the domain
+/// One leg of a [`ManualAdjustmentIntent`] — a plain-type typed mirror of the domain
 /// [`ManualLeg`]. `account_class` + `side` are the SDK enums [`AccountClass`] /
 /// [`Side`] (no serde — dylint DE0101), so they are stored as their stable `as_str`
 /// tokens and rebuilt via `parse` (`FromStr`) on replay (precedent:
 /// [`BackdatedInvoiceItem.account_class`](BackdatedInvoiceItem)).
 #[domain_model]
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ManualLegIntent {
     /// The `AccountClass::as_str` token, rebuilt via `AccountClass::from_str` on
     /// replay.
     pub account_class: String,
     /// The `Side::as_str` token (`DR` / `CR`), rebuilt via `Side::from_str` on replay.
     pub side: String,
-    pub amount_minor: i64,
+    pub amount: PostedMoney,
     pub revenue_stream: Option<String>,
 }
 
 /// Replay payload for an over-threshold governed manual adjustment (Slice 3
-/// Group 5 / Phase 3 governance, design §4.6 / §1.4 D2). A plain-type serde mirror
+/// Group 5 / Phase 3 governance, design §4.6 / §1.4 D2). A plain-type typed mirror
 /// of the domain [`ManualAdjustmentRequest`] (no SDK/enum-with-no-serde stored in the
 /// jsonb): `action` is stored as its `as_str` token and rebuilt via
 /// `ManualAdjustmentAction::parse`, and each leg's `account_class` / `side` are
@@ -302,11 +265,10 @@ pub struct ManualLegIntent {
 /// idempotently (the engine's `(tenant, MANUAL_ADJUSTMENT, adjustment_id)` claim makes
 /// the replay at-most-once).
 ///
-/// **No `tax` field.** The MVP governed actions move no tax — `TAX_PAYABLE` is in NO
-/// action's allow-list (so a governed manual adjustment can never carry a tax leg) —
-/// so the snapshot does not store it; the rebuilt request restores `tax: Vec::new()`.
+/// Tax evidence is captured verbatim; the existing governed-action restrictions
+/// still reject unsupported tax legs at execution.
 #[domain_model]
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 // The `*_id` fields mirror the storage / domain column names verbatim.
 #[allow(clippy::struct_field_names)]
 pub struct ManualAdjustmentIntent {
@@ -316,8 +278,9 @@ pub struct ManualAdjustmentIntent {
     /// The action wire literal (`ManualAdjustmentAction::as_str`), rebuilt via
     /// `ManualAdjustmentAction::parse` on replay.
     pub action: String,
-    pub currency: String,
+    pub currency: CurrencySpec,
     pub legs: Vec<ManualLegIntent>,
+    pub tax: Vec<BackdatedTaxBreakdown>,
     pub reason_code: String,
     pub preparer_actor_id: Uuid,
     pub approver_actor_id: Option<Uuid>,
@@ -330,6 +293,7 @@ impl From<&ManualAdjustmentRequest> for ManualAdjustmentIntent {
             payer_tenant_id: req.payer_tenant_id,
             adjustment_id: req.adjustment_id.clone(),
             action: req.action.as_str().to_owned(),
+
             currency: req.currency.clone(),
             legs: req
                 .legs
@@ -337,10 +301,11 @@ impl From<&ManualAdjustmentRequest> for ManualAdjustmentIntent {
                 .map(|l| ManualLegIntent {
                     account_class: l.account_class.as_str().to_owned(),
                     side: l.side.as_str().to_owned(),
-                    amount_minor: l.amount_minor,
+                    amount: l.amount.clone(),
                     revenue_stream: l.revenue_stream.clone(),
                 })
                 .collect(),
+            tax: req.tax.iter().map(BackdatedTaxBreakdown::from).collect(),
             reason_code: req.reason_code.clone(),
             preparer_actor_id: req.preparer_actor_id,
             approver_actor_id: req.approver_actor_id,
@@ -377,7 +342,7 @@ impl TryFrom<&ManualAdjustmentIntent> for ManualAdjustmentRequest {
                 Ok(ManualLeg {
                     account_class,
                     side,
-                    amount_minor: l.amount_minor,
+                    amount: l.amount.clone(),
                     revenue_stream: l.revenue_stream.clone(),
                 })
             })
@@ -387,38 +352,32 @@ impl TryFrom<&ManualAdjustmentIntent> for ManualAdjustmentRequest {
             payer_tenant_id: i.payer_tenant_id,
             adjustment_id: i.adjustment_id.clone(),
             action,
+
             currency: i.currency.clone(),
             legs,
             reason_code: i.reason_code.clone(),
             preparer_actor_id: i.preparer_actor_id,
             approver_actor_id: i.approver_actor_id,
-            // The MVP governed actions move no tax (TAX_PAYABLE is in no allow-list),
-            // so the snapshot carries none — rebuild empty.
-            tax: Vec::new(),
+            tax: i.tax.iter().map(TaxBreakdown::from).collect(),
         })
     }
 }
 
 impl ManualAdjustmentIntent {
-    /// Gross adjustment amount in minor units = `Σ DR` (== `Σ CR`; `govern` balanced
-    /// the legs). `i128` fold to avoid an intermediate overflow, saturating at
-    /// `i64::MAX` (the post / `govern` guards reject an out-of-i64 set). This is the
-    /// D2 comparand — matching the gross the handler passes the gate (so the resubmit
-    /// re-evaluation reads the same amount).
-    fn gross_minor(&self) -> i64 {
-        let dr_token = Side::Debit.as_str();
-        let dr: i128 = self
+    /// Exact gross debit total in the request's declared stored currency.
+    fn gross(&self) -> Result<PostedMoney, DomainError> {
+        let values: Vec<_> = self
             .legs
             .iter()
-            .filter(|l| l.side == dr_token)
-            .map(|l| i128::from(l.amount_minor))
-            .sum();
-        i64::try_from(dr).unwrap_or(i64::MAX)
+            .filter(|l| l.side == Side::Debit.as_str())
+            .map(|l| l.amount.clone())
+            .collect();
+        sum_posted(&values, self.currency.clone()).map_err(map_exact_error)
     }
 }
 
 /// Replay payload for an over-threshold credit note (Slice 3 Phase 1 × dual-control,
-/// design §5 D1–D2). A plain-type serde mirror of the domain [`CreditNoteRequest`]
+/// design §5 D1–D2). A plain-type typed mirror of the domain [`CreditNoteRequest`]
 /// (no SDK/enum-with-no-serde stored in the jsonb): the `tax` breakdown reuses the
 /// [`BackdatedTaxBreakdown`] mirror. The whole request is carried because a credit
 /// note is gated BEFORE its post (the journal entry does not exist at gate time —
@@ -426,7 +385,7 @@ impl ManualAdjustmentIntent {
 /// `post_credit_note_approved` idempotently (the engine's
 /// `(tenant, CREDIT_NOTE, credit_note_id)` claim makes the replay at-most-once).
 #[domain_model]
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 // The `*_id` / `*_ref` / `*_group` fields mirror the domain column names verbatim.
 #[allow(clippy::struct_field_names)]
 pub struct CreditNoteIntent {
@@ -437,12 +396,11 @@ pub struct CreditNoteIntent {
     pub origin_invoice_item_ref: Option<String>,
     pub po_allocation_group: Option<String>,
     pub revenue_stream: String,
-    pub currency: String,
-    pub amount_minor: i64,
-    pub tax_minor: i64,
-    /// The authoritative tax breakdown dims, mirrored verbatim (sums to `tax_minor`).
+    pub amount: PostedMoney,
+    pub tax_amount: PostedMoney,
+    /// The authoritative tax breakdown dims, mirrored verbatim (sums to `tax_amount`).
     pub tax: Vec<BackdatedTaxBreakdown>,
-    pub requested_deferred_minor: i64,
+    pub requested_deferred: PostedMoney,
     pub reason_code: String,
     pub goodwill: bool,
 }
@@ -457,11 +415,11 @@ impl From<&CreditNoteRequest> for CreditNoteIntent {
             origin_invoice_item_ref: req.origin_invoice_item_ref.clone(),
             po_allocation_group: req.po_allocation_group.clone(),
             revenue_stream: req.revenue_stream.clone(),
-            currency: req.currency.clone(),
-            amount_minor: req.amount_minor,
-            tax_minor: req.tax_minor,
+
+            amount: req.amount.clone(),
+            tax_amount: req.tax_amount.clone(),
             tax: req.tax.iter().map(BackdatedTaxBreakdown::from).collect(),
-            requested_deferred_minor: req.requested_deferred_minor,
+            requested_deferred: req.requested_deferred.clone(),
             reason_code: req.reason_code.clone(),
             goodwill: req.goodwill,
         }
@@ -478,11 +436,11 @@ impl From<&CreditNoteIntent> for CreditNoteRequest {
             origin_invoice_item_ref: i.origin_invoice_item_ref.clone(),
             po_allocation_group: i.po_allocation_group.clone(),
             revenue_stream: i.revenue_stream.clone(),
-            currency: i.currency.clone(),
-            amount_minor: i.amount_minor,
-            tax_minor: i.tax_minor,
+
+            amount: i.amount.clone(),
+            tax_amount: i.tax_amount.clone(),
             tax: i.tax.iter().map(TaxBreakdown::from).collect(),
-            requested_deferred_minor: i.requested_deferred_minor,
+            requested_deferred: i.requested_deferred.clone(),
             reason_code: i.reason_code.clone(),
             goodwill: i.goodwill,
         }
@@ -490,13 +448,13 @@ impl From<&CreditNoteIntent> for CreditNoteRequest {
 }
 
 /// Replay payload for an over-threshold debit note (Slice 3 Phase 1 × dual-control,
-/// design §5 D1–D2). A plain-type serde mirror of the domain [`DebitNoteRequest`];
+/// design §5 D1–D2). A plain-type typed mirror of the domain [`DebitNoteRequest`];
 /// the optional `recognition` spec (a deferred debit note builds a schedule) is
 /// carried via [`DebitNoteRecognitionSnapshot`] so the approved replay rebuilds the
 /// SAME schedule. The executor re-drives `post_debit_note_approved` idempotently
 /// (the engine's `(tenant, DEBIT_NOTE, debit_note_id)` claim makes it at-most-once).
 #[domain_model]
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 #[allow(clippy::struct_field_names)]
 pub struct DebitNoteIntent {
     pub tenant_id: Uuid,
@@ -505,11 +463,10 @@ pub struct DebitNoteIntent {
     pub origin_invoice_id: String,
     pub origin_invoice_item_ref: Option<String>,
     pub revenue_stream: String,
-    pub currency: String,
-    pub amount_minor: i64,
-    pub tax_minor: i64,
+    pub amount: PostedMoney,
+    pub tax_amount: PostedMoney,
     pub tax: Vec<BackdatedTaxBreakdown>,
-    pub deferred_minor: i64,
+    pub deferred: PostedMoney,
     pub reason_code: String,
     /// The ASC 606 recognition spec for a deferred debit note (Slice 4); `None` for
     /// a fully-recognized note. Carried so a deferred over-D2 debit note rebuilds its
@@ -517,10 +474,10 @@ pub struct DebitNoteIntent {
     pub recognition: Option<DebitNoteRecognitionSnapshot>,
 }
 
-/// Serde mirror of [`RecognitionInput`] — primitives + the [`DebitNoteTimingSnapshot`]
+/// Typed mirror of [`RecognitionInput`] — primitives + the [`DebitNoteTimingSnapshot`]
 /// timing mirror (the domain timing carries no serde). Round-trips losslessly.
 #[domain_model]
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DebitNoteRecognitionSnapshot {
     pub policy_ref: String,
     pub timing: DebitNoteTimingSnapshot,
@@ -533,11 +490,10 @@ pub struct DebitNoteRecognitionSnapshot {
     pub immaterial_one_shot_sku: bool,
 }
 
-/// Serde mirror of [`RecognitionTiming`] (`POINT_IN_TIME` / `STRAIGHT_LINE { periods,
+/// Typed mirror of [`RecognitionTiming`] (`POINT_IN_TIME` / `STRAIGHT_LINE { periods,
 /// first_period_id }`).
 #[domain_model]
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "timing", rename_all = "SCREAMING_SNAKE_CASE")]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DebitNoteTimingSnapshot {
     PointInTime,
     StraightLine {
@@ -617,11 +573,11 @@ impl From<&DebitNoteRequest> for DebitNoteIntent {
             origin_invoice_id: req.origin_invoice_id.clone(),
             origin_invoice_item_ref: req.origin_invoice_item_ref.clone(),
             revenue_stream: req.revenue_stream.clone(),
-            currency: req.currency.clone(),
-            amount_minor: req.amount_minor,
-            tax_minor: req.tax_minor,
+
+            amount: req.amount.clone(),
+            tax_amount: req.tax_amount.clone(),
             tax: req.tax.iter().map(BackdatedTaxBreakdown::from).collect(),
-            deferred_minor: req.deferred_minor,
+            deferred: req.deferred.clone(),
             reason_code: req.reason_code.clone(),
             recognition: req
                 .recognition
@@ -640,11 +596,11 @@ impl From<&DebitNoteIntent> for DebitNoteRequest {
             origin_invoice_id: i.origin_invoice_id.clone(),
             origin_invoice_item_ref: i.origin_invoice_item_ref.clone(),
             revenue_stream: i.revenue_stream.clone(),
-            currency: i.currency.clone(),
-            amount_minor: i.amount_minor,
-            tax_minor: i.tax_minor,
+
+            amount: i.amount.clone(),
+            tax_amount: i.tax_amount.clone(),
             tax: i.tax.iter().map(TaxBreakdown::from).collect(),
-            deferred_minor: i.deferred_minor,
+            deferred: i.deferred.clone(),
             reason_code: i.reason_code.clone(),
             recognition: i.recognition.as_ref().map(RecognitionInput::from),
         }
@@ -659,7 +615,7 @@ impl From<&DebitNoteIntent> for DebitNoteRequest {
 /// grain — but the executor replays `post_refund_with_credit_note_approved`, NOT a
 /// bare refund (the bug Z5-1 fixed: a plain `Refund` intent dropped the credit note).
 #[domain_model]
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RefundWithCreditNoteIntent {
     pub refund: RefundIntent,
     pub credit_note: CreditNoteIntent,
@@ -698,8 +654,7 @@ impl RefundWithCreditNoteIntent {
 /// settle / return / allocate / dispute / credit extend it (each gates the same
 /// A6 way and replays its own command).
 #[domain_model]
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "post", rename_all = "SCREAMING_SNAKE_CASE")]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BackdatedPost {
     Invoice(BackdatedInvoiceSnapshot),
 }
@@ -712,29 +667,22 @@ impl BackdatedPost {
         }
     }
 
-    /// Gross minor of the backdated post (for the approval-queue display).
-    fn gross_minor(&self) -> i64 {
+    /// Exact gross of the captured invoice.
+    fn gross(&self) -> Result<PostedMoney, DomainError> {
         match self {
-            Self::Invoice(s) => s.gross_minor(),
-        }
-    }
-
-    /// The post currency, if any.
-    fn currency(&self) -> Option<&str> {
-        match self {
-            Self::Invoice(s) => s.currency(),
+            Self::Invoice(s) => s.gross(),
         }
     }
 }
 
-/// Serializable mirror of [`PostedInvoice`] (`domain::invoice::builder`). The SDK
+/// Captured mirror of [`PostedInvoice`] (`domain::invoice::builder`). The SDK
 /// `PostedInvoice`/`InvoiceItem` carry `AccountClass`, a contract enum with no
 /// serde (dylint DE0101), and a DTO may not live in `domain` (DE0301) — so the
-/// replay payload mirrors the domain primitive here with serde-able fields,
+/// replay payload mirrors the domain primitive here with typed fields,
 /// storing each `AccountClass` as its stable `as_str` token (rebuilt via
 /// `from_str` on replay). Precedent: `pending_event_queue.payload`.
 #[domain_model]
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BackdatedInvoiceSnapshot {
     pub invoice_id: String,
     pub payer_tenant_id: Uuid,
@@ -750,37 +698,33 @@ pub struct BackdatedInvoiceSnapshot {
 }
 
 impl BackdatedInvoiceSnapshot {
-    /// Gross receivable in minor units (`Σ items ex-tax + Σ tax`), mirroring
-    /// [`PostedInvoice::gross_minor`] — `i128` fold to avoid an intermediate
-    /// overflow, saturating at `i64::MAX` (the post guards reject an overflow).
-    fn gross_minor(&self) -> i64 {
-        let items: i128 = self
+    /// Sum all monetary postings exactly, rejecting missing or conflicting metadata.
+    fn gross(&self) -> Result<PostedMoney, DomainError> {
+        let values: Vec<_> = self
             .items
             .iter()
-            .map(|i| i128::from(i.amount_minor_ex_tax))
-            .sum();
-        let tax: i128 = self.tax.iter().map(|t| i128::from(t.amount_minor)).sum();
-        i64::try_from(items + tax).unwrap_or(i64::MAX)
-    }
-
-    /// The post currency — first item, else first tax breakdown.
-    fn currency(&self) -> Option<&str> {
-        self.items
+            .map(|i| i.amount_ex_tax.clone())
+            .chain(self.tax.iter().map(|t| t.amount.clone()))
+            .collect();
+        let spec = values
             .first()
-            .map(|i| i.currency.as_str())
-            .or_else(|| self.tax.first().map(|t| t.currency.as_str()))
+            .ok_or_else(|| DomainError::InvalidRequest("empty backdated invoice".into()))?
+            .currency()
+            .clone();
+        sum_posted(&values, spec).map_err(map_exact_error)
     }
 }
 
-/// Serializable mirror of [`InvoiceItem`] — the `account_class` fields are stored
+/// Captured mirror of [`InvoiceItem`] — the `account_class` fields are stored
 /// as the `AccountClass::as_str` token (see [`BackdatedInvoiceSnapshot`]).
 #[domain_model]
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 // Field names mirror `InvoiceItem` / the storage columns verbatim.
 #[allow(clippy::struct_field_names)]
 pub struct BackdatedInvoiceItem {
-    pub amount_minor_ex_tax: i64,
-    pub currency: String,
+    pub amount_ex_tax: PostedMoney,
+    pub deferred: PostedMoney,
+    pub recognition: Option<DebitNoteRecognitionSnapshot>,
     pub revenue_stream: String,
     pub catalog_class: Option<String>,
     pub contract_class: Option<String>,
@@ -791,12 +735,11 @@ pub struct BackdatedInvoiceItem {
     pub pricing_snapshot_ref: Option<String>,
 }
 
-/// Serializable mirror of [`TaxBreakdown`] (all-primitive fields).
+/// Captured mirror of [`TaxBreakdown`] (all-primitive fields).
 #[domain_model]
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BackdatedTaxBreakdown {
-    pub amount_minor: i64,
-    pub currency: String,
+    pub amount: PostedMoney,
     pub tax_jurisdiction: String,
     pub tax_filing_period: String,
     pub tax_rate_ref: Option<String>,
@@ -823,8 +766,13 @@ impl From<&PostedInvoice> for BackdatedInvoiceSnapshot {
 impl From<&InvoiceItem> for BackdatedInvoiceItem {
     fn from(i: &InvoiceItem) -> Self {
         Self {
-            amount_minor_ex_tax: i.amount_minor_ex_tax,
-            currency: i.currency.clone(),
+            amount_ex_tax: i.amount_ex_tax.clone(),
+            deferred: i.deferred.clone(),
+            recognition: i
+                .recognition
+                .as_ref()
+                .map(DebitNoteRecognitionSnapshot::from),
+
             revenue_stream: i.revenue_stream.clone(),
             catalog_class: i.catalog_class.map(|c| c.as_str().to_owned()),
             contract_class: i.contract_class.map(|c| c.as_str().to_owned()),
@@ -840,8 +788,8 @@ impl From<&InvoiceItem> for BackdatedInvoiceItem {
 impl From<&TaxBreakdown> for BackdatedTaxBreakdown {
     fn from(t: &TaxBreakdown) -> Self {
         Self {
-            amount_minor: t.amount_minor,
-            currency: t.currency.clone(),
+            amount: t.amount.clone(),
+
             tax_jurisdiction: t.tax_jurisdiction.clone(),
             tax_filing_period: t.tax_filing_period.clone(),
             tax_rate_ref: t.tax_rate_ref.clone(),
@@ -879,20 +827,13 @@ impl TryFrom<&BackdatedInvoiceItem> for InvoiceItem {
 
     fn try_from(i: &BackdatedInvoiceItem) -> Result<Self, Self::Error> {
         Ok(Self {
-            amount_minor_ex_tax: i.amount_minor_ex_tax,
-            // SEAM (dual-control × Slice 4 recognition): the backdating snapshot
-            // `BackdatedInvoiceItem` predates ASC 606 recognition and does not
-            // capture the deferred split / schedule spec, so a replayed backdated
-            // post is treated as non-deferred — no recognition schedule is rebuilt.
-            // To let a backdated post carry recognition, add `deferred_minor` +
-            // `recognition` to the snapshot and thread them through here.
-            deferred_minor: 0,
-            currency: i.currency.clone(),
+            amount_ex_tax: i.amount_ex_tax.clone(),
+            deferred: i.deferred.clone(),
             revenue_stream: i.revenue_stream.clone(),
             catalog_class: parse_account_class(i.catalog_class.as_deref())?,
             contract_class: parse_account_class(i.contract_class.as_deref())?,
             gl_code: i.gl_code.clone(),
-            recognition: None,
+            recognition: i.recognition.as_ref().map(RecognitionInput::from),
             invoice_item_ref: i.invoice_item_ref.clone(),
             sku_or_plan_ref: i.sku_or_plan_ref.clone(),
             price_id: i.price_id.clone(),
@@ -904,8 +845,8 @@ impl TryFrom<&BackdatedInvoiceItem> for InvoiceItem {
 impl From<&BackdatedTaxBreakdown> for TaxBreakdown {
     fn from(t: &BackdatedTaxBreakdown) -> Self {
         Self {
-            amount_minor: t.amount_minor,
-            currency: t.currency.clone(),
+            amount: t.amount.clone(),
+
             tax_jurisdiction: t.tax_jurisdiction.clone(),
             tax_filing_period: t.tax_filing_period.clone(),
             tax_rate_ref: t.tax_rate_ref.clone(),
@@ -984,58 +925,103 @@ impl ApprovalIntent {
         }
     }
 
-    /// The native-currency minor amount for amount-gated kinds (credit-grant,
-    /// chargeback-loss, refund, manual-adjustment, material-backdating). `Reverse` /
-    /// `PayerClosure` / `RecognitionScheduleChange` return `None` — their threshold
-    /// amount is derived/structural (read from the entry/schedule by the gate), not
-    /// carried in the intent.
-    #[must_use]
-    pub fn amount_minor(&self) -> Option<i64> {
+    /// Validate monetary metadata across every nested request, including zero values.
+    pub(crate) fn validate_money_metadata(&self) -> Result<(), DomainError> {
         match self {
+            Self::ManualAdjustment(i) => validate_specs(
+                i.legs
+                    .iter()
+                    .map(|v| &v.amount)
+                    .chain(i.tax.iter().map(|v| &v.amount)),
+                &i.currency,
+            ),
+            Self::CreditNote(i) => validate_credit_note(i),
+            Self::DebitNote(i) => validate_specs(
+                [&i.amount, &i.tax_amount, &i.deferred]
+                    .into_iter()
+                    .chain(i.tax.iter().map(|v| &v.amount)),
+                i.amount.currency(),
+            ),
+            Self::RefundWithCreditNote(i) => {
+                validate_specs(
+                    [&i.refund.amount, &i.credit_note.amount].into_iter(),
+                    i.refund.amount.currency(),
+                )?;
+                validate_credit_note(&i.credit_note)
+            }
+            Self::MaterialBackdating(BackdatedPost::Invoice(i)) => {
+                if let Some(spec) = i
+                    .items
+                    .first()
+                    .map(|v| v.amount_ex_tax.currency())
+                    .or_else(|| i.tax.first().map(|v| v.amount.currency()))
+                {
+                    validate_specs(
+                        i.items
+                            .iter()
+                            .flat_map(|v| [&v.amount_ex_tax, &v.deferred])
+                            .chain(i.tax.iter().map(|v| &v.amount)),
+                        spec,
+                    )?;
+                }
+                Ok(())
+            }
+            Self::RecognitionScheduleChange(i) => {
+                if let Some(segments) = &i.new_segments
+                    && let Some(first) = segments.first()
+                {
+                    validate_specs(segments.iter().map(|v| &v.amount), first.amount.currency())?;
+                }
+                Ok(())
+            }
+            // Single-amount or amount-free intents: their one value is validated
+            // when it is built. Listed so a new kind must choose explicitly.
             Self::Reverse(_)
+            | Self::CreditGrant(_)
+            | Self::ChargebackLoss(_)
             | Self::PayerClosure(_)
             | Self::PeriodReopen(_)
-            | Self::RecognitionScheduleChange(_) => None,
-            Self::CreditGrant(i) => Some(i.amount_minor),
-            Self::ChargebackLoss(i) => Some(i.disputed_amount_minor),
-            Self::MaterialBackdating(p) => Some(p.gross_minor()),
-            Self::Refund(i) => Some(i.amount_minor),
-            // The gross adjustment amount = Σ DR (== Σ CR; govern balanced the legs).
-            // `i128` fold then saturate (the post / govern guards reject an out-of-i64
-            // set) — matches the D2 comparand the handler passes the gate.
-            Self::ManualAdjustment(i) => Some(i.gross_minor()),
-            Self::CreditNote(i) => Some(i.amount_minor),
-            Self::DebitNote(i) => Some(i.amount_minor),
-            // The composite gates on its refund leg's cash amount (the credit note
-            // rides the same approval).
-            Self::RefundWithCreditNote(i) => Some(i.refund.amount_minor),
+            | Self::Refund(_) => Ok(()),
         }
     }
 
-    /// The operation currency for amount-gated kinds (for the USD-eq conversion,
-    /// DC10). `Reverse` carries no currency here (derived from the original entry).
-    #[must_use]
-    pub fn currency(&self) -> Option<&str> {
-        match self {
+    /// Governed transaction amount: the direct amount, or the larger leg of a
+    /// refund-with-credit-note composite. Derived and structural kinds preserve absence.
+    ///
+    /// # Errors
+    /// A [`DomainError`] when the intent's money metadata is inconsistent
+    /// (`validate_money_metadata`), or when a derived gross (material backdating, manual
+    /// adjustment) cannot be summed exactly.
+    pub fn amount(&self) -> Result<Option<PostedMoney>, DomainError> {
+        self.validate_money_metadata()?;
+        Ok(match self {
             Self::Reverse(_)
             | Self::PayerClosure(_)
             | Self::PeriodReopen(_)
             | Self::RecognitionScheduleChange(_) => None,
-            Self::CreditGrant(i) => Some(&i.currency),
-            Self::ChargebackLoss(i) => Some(&i.currency),
-            Self::MaterialBackdating(p) => p.currency(),
-            Self::Refund(i) => Some(&i.currency),
-            Self::ManualAdjustment(i) => Some(&i.currency),
-            Self::CreditNote(i) => Some(&i.currency),
-            Self::DebitNote(i) => Some(&i.currency),
-            Self::RefundWithCreditNote(i) => Some(&i.refund.currency),
-        }
+            Self::CreditGrant(i) => Some(i.amount.clone()),
+            Self::ChargebackLoss(i) => Some(i.disputed_amount.clone()),
+            Self::MaterialBackdating(p) => Some(p.gross()?),
+            Self::Refund(i) => Some(i.amount.clone()),
+            Self::ManualAdjustment(i) => Some(i.gross()?),
+            Self::CreditNote(i) => Some(i.amount.clone()),
+            Self::DebitNote(i) => Some(i.amount.clone()),
+            // The composite is governed by its larger leg (same currency and scale,
+            // checked above): a large credit note must not ride under a small refund.
+            Self::RefundWithCreditNote(i) => Some(
+                if i.credit_note.amount.amount() > i.refund.amount.amount() {
+                    i.credit_note.amount.clone()
+                } else {
+                    i.refund.amount.clone()
+                },
+            ),
+        })
     }
 
     /// True iff `other` addresses the SAME approval target as `self` — same kind
     /// and the same immutable recipient/target fields. The ONLY field a resubmit
     /// (DC17) may edit is the scalar approval amount on the amount-bearing kinds
-    /// (`CreditGrant.amount_minor` / `ChargebackLoss.disputed_amount_minor`); every
+    /// (`CreditGrant.amount` / `ChargebackLoss.disputed_amount`); every
     /// other field (recipient tenant, entry / application / dispute / payment /
     /// schedule id, currency, …) is pinned. So a resubmit can lower the amount on
     /// rework but CANNOT swap the recipient under the still-frozen `business_key`:
@@ -1048,20 +1034,26 @@ impl ApprovalIntent {
     pub fn same_target(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::CreditGrant(a), Self::CreditGrant(b)) => {
+                if a.amount.currency() != b.amount.currency() {
+                    return false;
+                }
                 CreditGrantIntent {
-                    amount_minor: 0,
+                    amount: b.amount.clone(),
                     ..a.clone()
                 } == CreditGrantIntent {
-                    amount_minor: 0,
+                    amount: b.amount.clone(),
                     ..b.clone()
                 }
             }
             (Self::ChargebackLoss(a), Self::ChargebackLoss(b)) => {
+                if a.disputed_amount.currency() != b.disputed_amount.currency() {
+                    return false;
+                }
                 ChargebackLossIntent {
-                    disputed_amount_minor: 0,
+                    disputed_amount: b.disputed_amount.clone(),
                     ..a.clone()
                 } == ChargebackLossIntent {
-                    disputed_amount_minor: 0,
+                    disputed_amount: b.disputed_amount.clone(),
                     ..b.clone()
                 }
             }
@@ -1072,6 +1064,41 @@ impl ApprovalIntent {
     }
 }
 
+/// A credit note's amount, tax, requested deferred and tax components share one
+/// currency spec; shared by the plain and the refund-composite intents (no clone).
+fn validate_credit_note(i: &CreditNoteIntent) -> Result<(), DomainError> {
+    validate_specs(
+        [&i.amount, &i.tax_amount, &i.requested_deferred]
+            .into_iter()
+            .chain(i.tax.iter().map(|v| &v.amount)),
+        i.amount.currency(),
+    )
+}
+
+/// Require the full stored spec on every monetary field without consulting a registry.
+fn validate_specs<'a>(
+    values: impl Iterator<Item = &'a PostedMoney>,
+    spec: &CurrencySpec,
+) -> Result<(), DomainError> {
+    for value in values {
+        if value.currency().code() != spec.code() {
+            return Err(DomainError::CurrencyMismatch(
+                "approval nested money currency mismatch".into(),
+            ));
+        }
+        if value.currency().scale() != spec.scale() {
+            return Err(DomainError::InconsistentScale(
+                "approval nested money scale mismatch".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 #[path = "intent_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "intent_money_tests.rs"]
+mod money_tests;

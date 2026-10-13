@@ -20,6 +20,7 @@ const PG_UP_STATEMENTS: &[&str] = &[
         business_id     varchar(256) NOT NULL,
         payload_hash    varchar(128) NOT NULL,
         result_entry_id uuid,
+        result_schedule_id text,
         posted_at_utc   timestamptz,
         status          text         NOT NULL,
         retain_until    timestamptz,
@@ -30,11 +31,11 @@ const PG_UP_STATEMENTS: &[&str] = &[
         tenant_id       uuid         NOT NULL,
         legal_entity_id uuid         NOT NULL,
         account_class   text         NOT NULL,
-        currency        varchar(16)  NOT NULL,
+        currency           varchar(16)  NOT NULL,
         revenue_stream  text,
         normal_side     text         NOT NULL CHECK (normal_side IN ('DR','CR')),
         may_go_negative boolean      NOT NULL DEFAULT false,
-        lifecycle_state text         NOT NULL DEFAULT 'OPEN' CHECK (lifecycle_state IN ('OPEN','CLOSED')),
+        lifecycle_state          text         NOT NULL DEFAULT 'OPEN' CHECK (lifecycle_state IN ('OPEN','CLOSED')),
         PRIMARY KEY (account_id)
     )",
     "CREATE UNIQUE INDEX uq_tenant_account_coa
@@ -50,8 +51,7 @@ const PG_UP_STATEMENTS: &[&str] = &[
     "CREATE TABLE bss.ledger_currency_scale_registry (
         tenant_id          uuid        NOT NULL,
         currency           varchar(16) NOT NULL,
-        minor_units        smallint    NOT NULL,
-        plausible_max_major bigint     NOT NULL DEFAULT 1000000000000 CHECK (plausible_max_major > 0),
+        currency_scale              smallint    NOT NULL CHECK (currency_scale BETWEEN 0 AND 28),
         source             text        NOT NULL,
         PRIMARY KEY (tenant_id, currency)
     )",
@@ -92,11 +92,12 @@ const PG_DOWN_STATEMENTS: &[&str] = &[
 
 const SQLITE_UP_STATEMENTS: &[&str] = &[
     "CREATE TABLE ledger_idempotency_dedup (
-        tenant_id       text         NOT NULL,
+        tenant_id                text         NOT NULL,
         flow            text         NOT NULL,
         business_id     varchar(256) NOT NULL,
         payload_hash    varchar(128) NOT NULL,
         result_entry_id text,
+        result_schedule_id text,
         posted_at_utc   text,
         status          text         NOT NULL,
         retain_until    text,
@@ -104,20 +105,20 @@ const SQLITE_UP_STATEMENTS: &[&str] = &[
     )",
     "CREATE TABLE ledger_tenant_account (
         account_id      text         NOT NULL,
-        tenant_id       text         NOT NULL,
+        tenant_id                text         NOT NULL,
         legal_entity_id text         NOT NULL,
         account_class   text         NOT NULL,
-        currency        varchar(16)  NOT NULL,
+        currency           varchar(16)  NOT NULL,
         revenue_stream  text,
         normal_side     text         NOT NULL CHECK (normal_side IN ('DR','CR')),
         may_go_negative boolean      NOT NULL DEFAULT false,
-        lifecycle_state text         NOT NULL DEFAULT 'OPEN' CHECK (lifecycle_state IN ('OPEN','CLOSED')),
+        lifecycle_state          text         NOT NULL DEFAULT 'OPEN' CHECK (lifecycle_state IN ('OPEN','CLOSED')),
         PRIMARY KEY (account_id)
     )",
     "CREATE UNIQUE INDEX uq_tenant_account_coa
         ON ledger_tenant_account (tenant_id, legal_entity_id, account_class, currency, COALESCE(revenue_stream,'-'))",
     "CREATE TABLE ledger_fiscal_period (
-        tenant_id       text        NOT NULL,
+        tenant_id                text        NOT NULL,
         legal_entity_id text        NOT NULL,
         period_id       varchar(6)  NOT NULL,
         fiscal_tz       varchar(64) NOT NULL,
@@ -125,15 +126,14 @@ const SQLITE_UP_STATEMENTS: &[&str] = &[
         PRIMARY KEY (tenant_id, legal_entity_id, period_id)
     )",
     "CREATE TABLE ledger_currency_scale_registry (
-        tenant_id          text        NOT NULL,
+        tenant_id                text        NOT NULL,
         currency           varchar(16) NOT NULL,
-        minor_units        smallint    NOT NULL,
-        plausible_max_major bigint     NOT NULL DEFAULT 1000000000000 CHECK (plausible_max_major > 0),
+        currency_scale              smallint    NOT NULL CHECK (currency_scale BETWEEN 0 AND 28),
         source             text        NOT NULL,
         PRIMARY KEY (tenant_id, currency)
     )",
     "CREATE TABLE ledger_tenant_posting_lock (
-        tenant_id   text        NOT NULL,
+        tenant_id                text        NOT NULL,
         locked      boolean     NOT NULL DEFAULT false,
         reason_code text,
         set_by      text,

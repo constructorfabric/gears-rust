@@ -1,4 +1,4 @@
-//! Tenant-configurable FX **revaluation mode** (VHP-1986, design 06 §4.5 /
+//! Tenant-configurable FX **revaluation mode** (design 06 §4.5 /
 //! §13 F2): whether BSS runs the period-end **unrealized revaluation** for a
 //! tenant, or defers to the tenant's ERP. Pure domain — the literal, the parse,
 //! and the fail-safe default; the effective row is loaded by the repo (`infra`)
@@ -66,7 +66,7 @@ impl RevaluationMode {
         matches!(self, Self::ModeB)
     }
 
-    /// The fleet default applied to a tenant with NO explicit mode row (VHP-1986):
+    /// The fleet default applied to a tenant with NO explicit mode row:
     /// the global `fx.revaluation_enabled` flag — `true` ⇒ [`Self::ModeB`] (the
     /// design-06 §13 F2 "Mode B default-on" fleet behaviour), `false` ⇒
     /// [`Self::ModeA`] (fail-safe off, the v1 prod default). An explicit per-tenant

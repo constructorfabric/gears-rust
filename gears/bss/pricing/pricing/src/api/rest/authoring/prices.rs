@@ -9,7 +9,9 @@ use super::{
 };
 use crate::{
     domain::{
-        RuleError, money,
+        RuleError,
+        currency::CurrencyScales,
+        money,
         price::{self, Eligibility, Price, PriceState},
     },
     infra::{
@@ -26,7 +28,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use rust_decimal::Decimal;
-use std::str::FromStr;
+use std::sync::Arc;
 use time::OffsetDateTime;
 use toolkit_canonical_errors::CanonicalError;
 use toolkit_db::secure::{AccessScope, DBRunner};
@@ -36,15 +38,44 @@ use uuid::Uuid;
 /// Attempts of the create transaction when a concurrent writer took the next `version_no`.
 const VERSION_ATTEMPTS: u32 = 3;
 
+/// What a client is told when a minimum fee breaks the price's rules (D-528).
+const MIN_FEE_RULE: &str = "min_fee must not be negative and must be a multiple of the increment \
+     of the price's currency_scale";
 fn refuse(error: RuleError) -> DoorError {
-    support::invalid(price::field_of(error.code), error.code).into()
+    match error.code {
+        "MIN_FEE_INVALID" => support::invalid_because("min_fee", error.code, MIN_FEE_RULE).into(),
+        code => support::invalid(price::field_of(code), code).into(),
+    }
 }
-/// A price body refusal; a decimal sent as a JSON number is told to send a string.
-fn refuse_price(error: RuleError) -> DoorError {
-    if error.code == "AMOUNT_INVALID" {
-        support::invalid_because("price", error.code, money::DECIMALS_ARE_STRINGS).into()
-    } else {
-        refuse(error)
+/// A refusal of one half of a new or re-dated pair. The return a temporary price makes copies its
+/// fee from the price it returns to, but takes today's scale: a fee that no longer fits that scale
+/// is `MIN_FEE_INVALID` on a field the caller did not send, so the message says where it came from.
+fn refuse_half(error: RuleError, half: &Price) -> DoorError {
+    match (error.code, half.return_of_price_id) {
+        ("MIN_FEE_INVALID", Some(back)) => support::invalid_because(
+            "min_fee",
+            error.code,
+            &format!(
+                "the min_fee is copied from price {back}, the price the temporary price returns \
+                 to, and is not a multiple of the increment of today's currency_scale {}",
+                half.currency.scale()
+            ),
+        )
+        .into(),
+        _ => refuse(error),
+    }
+}
+/// A price body refusal, worded by its cause: a decimal sent as a JSON number is told to send
+/// a string, invalid text to send plain decimal text, a value over a limit gets the limit, and a
+/// sign error names the field. A shape error (`PRICE_MISSING`) is refused as any other rule.
+fn refuse_price(error: money::DecodeError) -> DoorError {
+    match error {
+        money::DecodeError::Shape => refuse(error.into()),
+        money::DecodeError::JsonNumber
+        | money::DecodeError::Numeric { .. }
+        | money::DecodeError::NotCanonical { .. } => {
+            support::invalid_because("price", error.code(), &error.message()).into()
+        }
     }
 }
 
@@ -61,12 +92,58 @@ fn parse_eligibility(text: &str) -> Result<Eligibility, DoorError> {
     text.parse()
         .map_err(|_| support::invalid("eligibility", "ELIGIBILITY_INVALID").into())
 }
-fn parse_min_fee(text: Option<&str>) -> Result<Option<Decimal>, DoorError> {
-    text.map(|s| {
-        Decimal::from_str(s.trim())
-            .map_err(|_| support::invalid("min_fee", "MIN_FEE_INVALID").into())
+/// A minimum fee is a JSON string of plain decimal text, read by the shared parser and
+/// normalized: `30.00` is stored as `30`, the one spelling the stored row is read back with. A JSON
+/// number, and text with spaces, an exponent or more than 28 digits, is `MIN_FEE_INVALID`, its
+/// message saying which; the currency increment and the sign are judged with the price's other
+/// rules.
+fn parse_min_fee(fee: Option<&serde_json::Value>) -> Result<Option<Decimal>, DoorError> {
+    let refused = |message: &str| -> DoorError {
+        support::invalid_because("min_fee", "MIN_FEE_INVALID", message).into()
+    };
+    fee.map(|value| match value {
+        serde_json::Value::String(text) => {
+            bss_money::parse_decimal(text).map_err(|error| refused(&min_fee_refusal(&error)))
+        }
+        serde_json::Value::Number(_) => Err(refused(money::DECIMALS_ARE_STRINGS)),
+        _ => Err(refused(&min_fee_refusal(
+            &bss_money::MoneyError::InvalidDecimal,
+        ))),
     })
     .transpose()
+}
+/// What a client is told about a minimum fee the shared parser refused.
+fn min_fee_refusal(error: &bss_money::MoneyError) -> String {
+    match error {
+        bss_money::MoneyError::AmountOutOfRange => {
+            "min_fee has at most 28 digits in all".to_owned()
+        }
+        _ => format!(
+            "min_fee: {}, with at most 28 fractional places",
+            money::PLAIN_DECIMAL_TEXT
+        ),
+    }
+}
+/// The currency spec a new or edited draft of the entry takes: the book's currency at the scale
+/// the currency table gives it today.
+/// # Errors
+/// 409 `BOOK_CURRENCY_INVALID` when the table no longer knows the book's currency (a non-ISO
+/// code taken out of the deployment's table): no price can be written in it.
+fn current_spec(
+    pc: &PriceBookEntryContext,
+    scales: &CurrencyScales,
+) -> Result<bss_money::CurrencySpec, DoorError> {
+    pc.current(scales).ok_or_else(|| {
+        support::conflict_because(
+            "BOOK_CURRENCY_INVALID",
+            format!(
+                "the currency table no longer lists the book's currency {}, so the book takes no \
+                 new price",
+                pc.currency
+            ),
+        )
+        .into()
+    })
 }
 /// The approved prices of an entry: the chain a draft is judged against at the door.
 fn approved_of(prices: &[Price]) -> Vec<Price> {
@@ -75,6 +152,16 @@ fn approved_of(prices: &[Price]) -> Vec<Price> {
         .filter(|r| r.state == PriceState::Approved)
         .cloned()
         .collect()
+}
+/// A stored row of the entry as the doors answer it on `today`, read as every read of a stored
+/// price reads it ([`PriceBookEntryContext::decode`]).
+fn shown(
+    pc: &PriceBookEntryContext,
+    m: entity::price::Model,
+    today: time::Date,
+) -> Result<PricingPriceDto, RepoError> {
+    let price = pc.decode(&m)?;
+    PricingPriceDto::at(m, &price, today)
 }
 fn price_json(r: &Price) -> Result<serde_json::Value, DoorError> {
     Ok(support::value(&r.price)?)
@@ -95,6 +182,7 @@ fn stored(
     author: Uuid,
     now: OffsetDateTime,
 ) -> Result<entity::price::Model, DoorError> {
+    let (currency, currency_scale) = price_repo::currency_columns(&r.currency);
     Ok(entity::price::Model {
         id: r.id,
         tenant_id: tenant,
@@ -102,7 +190,9 @@ fn stored(
         version_no: r.version_no,
         dim_value: r.dim_value.clone(),
         price_json: price_json(r)?,
-        min_fee: r.min_fee.map(|fee| fee.to_string()),
+        currency,
+        currency_scale,
+        min_fee: r.min_fee.map(bss_money::canonical_decimal),
         eligibility: r.eligibility.as_str().into(),
         effective_from: r.effective_from,
         effective_to: r.effective_to,
@@ -228,8 +318,8 @@ async fn open_change_in(
     )
     .map_err(support::approval_failure)?;
     let now = crate::infra::storage::stored_now();
-    // The row names the price and carries its money and chain unchanged: it is not a price of
-    // its own, and no chain, count or resolve reads it as one.
+    // The row names the price and carries its money, its currency spec and its chain unchanged:
+    // it is not a price of its own, and no chain, count or resolve reads it as one.
     let row = entity::price::Model {
         id: Uuid::now_v7(),
         tenant_id: tenant,
@@ -237,6 +327,8 @@ async fn open_change_in(
         version_no: next_version(&pc.prices)?,
         dim_value: target.dim_value.clone(),
         price_json: target.price_json.clone(),
+        currency: target.currency.clone(),
+        currency_scale: target.currency_scale,
         min_fee: target.min_fee.clone(),
         eligibility: target.eligibility.clone(),
         effective_from: target.effective_from,
@@ -269,7 +361,7 @@ async fn open_change_in(
         stored.version,
     )
     .await?;
-    let body = PricingPriceDto::at(stored, pc.model.as_str(), request.today)?;
+    let body = shown(&pc, stored, request.today)?;
     support::answer(
         tx,
         tenant,
@@ -283,12 +375,14 @@ async fn open_change_in(
 }
 
 /// Create under a bounded retry: the `(price_book_entry_id, version_no)` unique index arbitrates
-/// two writers that read the same maximum; the loser recomputes in a fresh transaction.
+/// two writers that read the same maximum; the loser recomputes in a fresh transaction. The new
+/// prices take the book currency's scale in `scales`.
 /// # Errors
 /// Returns the canonical refusal of the last attempt.
 #[expect(
     clippy::too_many_arguments,
-    reason = "authorized door identity, replay operands and input belong to one transaction"
+    reason = "authorized door identity, replay operands, input and the currency table belong to \
+              one transaction"
 )]
 pub async fn create(
     db: &toolkit_db::Db,
@@ -299,23 +393,26 @@ pub async fn create(
     key: String,
     digest: Vec<u8>,
     input: PricingPriceCreate,
+    scales: Arc<CurrencyScales>,
 ) -> Result<Response, CanonicalError> {
     let mut attempt = 1;
     loop {
-        let (scope, ctx, key, digest, input) = (
+        let (scope, ctx, key, digest, input, scales) = (
             scope.clone(),
             ctx.clone(),
             key.clone(),
             digest.clone(),
             input.clone(),
+            scales.clone(),
         );
         let result = support::transaction_door(db, move |tx| {
-            let (scope, ctx, key, digest, input) = (
+            let (scope, ctx, key, digest, input, scales) = (
                 scope.clone(),
                 ctx.clone(),
                 key.clone(),
                 digest.clone(),
                 input.clone(),
+                scales.clone(),
             );
             Box::pin(async move {
                 create_in(
@@ -327,6 +424,7 @@ pub async fn create(
                     &key,
                     &digest,
                     input,
+                    &scales,
                 )
                 .await
             })
@@ -343,7 +441,8 @@ pub async fn create(
 
 #[expect(
     clippy::too_many_arguments,
-    reason = "authorized door identity, replay operands and input belong to one transaction"
+    reason = "authorized door identity, replay operands, input and the currency table belong to \
+              one transaction"
 )]
 async fn create_in(
     tx: &impl DBRunner,
@@ -354,6 +453,7 @@ async fn create_in(
     key: &str,
     digest: &[u8],
     input: PricingPriceCreate,
+    scales: &CurrencyScales,
 ) -> Result<Response, DoorError> {
     let tenant = ctx.subject_tenant_id();
     let endpoint = format!("/bss-pricing/v1/price-book-entries/{price_book_entry_id}/prices");
@@ -369,14 +469,17 @@ async fn create_in(
     let now = crate::infra::storage::stored_now();
     // D-427: the money is judged against the entry's model; a price carries none of its own.
     let model = pc.model;
+    // A new price, and the return a temporary one makes (a copy of it), take today's scale.
+    let currency = current_spec(&pc, scales)?;
     let promo = Price {
         id: Uuid::now_v7(),
         price_book_entry_id,
         version_no: next_version(&pc.prices)?,
         dim_value: input.dim_value,
         model,
+        currency,
         price: Some(money::decode(model, input.price).map_err(refuse_price)?),
-        min_fee: parse_min_fee(input.min_fee.as_deref())?,
+        min_fee: parse_min_fee(input.min_fee.as_ref())?,
         eligibility: parse_eligibility(&input.eligibility)?,
         effective_from: price::parse_start(&input.effective_from).map_err(refuse)?,
         effective_to: None,
@@ -396,7 +499,7 @@ async fn create_in(
     };
     for r in &prices {
         if let Some(error) = pc.first_refusal(r, &siblings, now.date()) {
-            return Err(refuse(error));
+            return Err(refuse_half(error, r));
         }
     }
     // D-406: no price starts inside an approved temporary window, and no temporary spans an
@@ -427,7 +530,7 @@ async fn create_in(
     let body = PricingPriceCreated {
         items: items
             .into_iter()
-            .map(|m| PricingPriceDto::of(m, pc.model.as_str()))
+            .map(|m| shown(&pc, m, now.date()))
             .collect::<Result<_, _>>()?,
     };
     support::answer(
@@ -444,9 +547,15 @@ async fn create_in(
 
 /// Change business fields of an unlocked draft at the version the caller read, under the
 /// create's bounded retry: a return the new dates call for takes the entry's next `version_no`,
-/// which a concurrent writer may take first.
+/// which a concurrent writer may take first. The edited draft, and its return, take the book
+/// currency's scale in `scales` today.
 /// # Errors
 /// Returns the canonical refusal of the last attempt.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "authorized door identity, version, input and the currency table belong to one \
+              transaction"
+)]
 pub async fn patch(
     db: &toolkit_db::Db,
     scope: AccessScope,
@@ -455,15 +564,18 @@ pub async fn patch(
     id: Uuid,
     version: u64,
     input: PricingPricePatch,
+    scales: Arc<CurrencyScales>,
 ) -> Result<Response, CanonicalError> {
     let mut attempt = 1;
     loop {
-        let (scope, ctx, input) = (scope.clone(), ctx.clone(), input.clone());
+        let (scope, ctx, input, scales) =
+            (scope.clone(), ctx.clone(), input.clone(), scales.clone());
         let result = support::transaction_door(db, move |tx| {
-            let (scope, ctx, input) = (scope.clone(), ctx.clone(), input.clone());
-            Box::pin(
-                async move { patch_in(tx, &scope, &ctx, correlation, id, version, input).await },
-            )
+            let (scope, ctx, input, scales) =
+                (scope.clone(), ctx.clone(), input.clone(), scales.clone());
+            Box::pin(async move {
+                patch_in(tx, &scope, &ctx, correlation, id, version, input, &scales).await
+            })
         })
         .await;
         match result {
@@ -481,9 +593,16 @@ fn unlocked_draft(m: &entity::price::Model) -> bool {
 /// One draft's PATCH. A temporary pair keeps its chain; its return keeps its own dates (its start
 /// is its pair's end); a price's temporariness is fixed. The temporary half's dates move: a PATCH
 /// that sends `effective_from` or `temporary_until` to it re-derives the pair ([`redate`], D-443).
+/// Every PATCH, whatever it changes, gives the draft the currency's scale of today, so a draft
+/// the table changed under is edited and submitted again (`CURRENCY_SCALE_CHANGED`).
 /// # Errors
-/// Returns `PRICE_NOT_DRAFT`, `NOT_DRAFT_AUTHOR`, `STALE_REVISION`, `TEMPORARY_PRICE_FIXED` or a
-/// pure-rule refusal.
+/// Returns `PRICE_NOT_DRAFT`, `NOT_DRAFT_AUTHOR`, `STALE_REVISION`, `TEMPORARY_PRICE_FIXED`,
+/// `BOOK_CURRENCY_INVALID` or a pure-rule refusal.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "authorized door identity, version, input and the currency table belong to one \
+              transaction"
+)]
 async fn patch_in(
     tx: &impl DBRunner,
     scope: &AccessScope,
@@ -492,6 +611,7 @@ async fn patch_in(
     id: Uuid,
     version: u64,
     input: PricingPricePatch,
+    scales: &CurrencyScales,
 ) -> Result<Response, DoorError> {
     let tenant = ctx.subject_tenant_id();
     let m = price_repo::find(tx, scope, tenant, id)
@@ -511,7 +631,8 @@ async fn patch_in(
         &live_entry(tx, &children, tenant, m.price_book_entry_id).await?,
     )
     .await?;
-    let mut r = price_repo::to_domain(&m, pc.model)?;
+    let mut r = pc.decode(&m)?;
+    r.currency = current_spec(&pc, scales)?;
     // The temporary half carries the end; its return names its partner and the price it restores.
     let promo = m.temporary_until.is_some();
     let temporary = promo || m.paired_price_id.is_some() || m.return_of_price_id.is_some();
@@ -541,7 +662,7 @@ async fn patch_in(
         r.price = Some(money::decode(r.model, data).map_err(refuse_price)?);
     }
     if let Some(fee) = input.min_fee {
-        r.min_fee = parse_min_fee(fee.as_deref())?;
+        r.min_fee = parse_min_fee(fee.as_ref())?;
     }
     if let Some(eligibility) = input.eligibility.as_deref() {
         r.eligibility = parse_eligibility(eligibility)?;
@@ -576,7 +697,7 @@ async fn patch_in(
     support::audit(tx, ctx, correlation, "price.patch", id, next.version).await?;
     Ok(support::response(
         StatusCode::OK,
-        &PricingPriceDto::of(next, pc.model.as_str())?,
+        &shown(&pc, next, now.date())?,
         Some(version + 1),
     )?)
 }
@@ -584,7 +705,8 @@ async fn patch_in(
 fn shaped(row: &mut entity::price::Model, r: &Price) -> Result<(), DoorError> {
     row.dim_value.clone_from(&r.dim_value);
     row.price_json = price_json(r)?;
-    row.min_fee = r.min_fee.map(|fee| fee.to_string());
+    (row.currency, row.currency_scale) = price_repo::currency_columns(&r.currency);
+    row.min_fee = r.min_fee.map(bss_money::canonical_decimal);
     row.eligibility = r.eligibility.as_str().into();
     row.effective_from = r.effective_from;
     row.effective_to = r.effective_to;
@@ -659,7 +781,7 @@ async fn redate(
     next.version = reconcile(tx, &written, &next, partner, returned).await?;
     Ok(support::response(
         StatusCode::OK,
-        &PricingPriceDto::of(next, dates.pc.model.as_str())?,
+        &shown(dates.pc, next, dates.now.date())?,
         Some(version + 1),
     )?)
 }
@@ -704,7 +826,7 @@ fn judged_shape(
     }
     for r in &shape {
         if let Some(error) = dates.pc.first_refusal(r, dates.siblings, dates.now.date()) {
-            return Err(refuse(error));
+            return Err(refuse_half(error, r));
         }
     }
     // D-406, as the create judges it: against the approved prices and the pair itself.
@@ -813,3 +935,7 @@ pub async fn delete(
     }
     Ok(StatusCode::NO_CONTENT.into_response())
 }
+
+#[cfg(test)]
+#[path = "prices_tests.rs"]
+mod tests;

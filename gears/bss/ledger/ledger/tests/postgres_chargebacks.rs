@@ -8,20 +8,20 @@
 //! helper) + `postgres_payments.rs` (`seed_ar_invoice`, the over-cap
 //! fund-the-pool idiom). Each case asserts on the `ledger_dispute` row
 //! (`variant` / `last_phase`), the chart `account_balance` /
-//! `ar_invoice_balance.disputed_minor`, and `payment_settlement.clawed_back_minor`:
+//! `ar_invoice_balance.disputed`, and `payment_settlement.clawed_back`:
 //!
 //! 1. opened cash-hold (withheld): DISPUTE_HOLD = disputed, CASH_CLEARING net 0;
 //!    dispute variant=CASH_HOLD, last_phase=OPENED.
-//! 2. opened AR-reclass (not_moved): `balance_minor` unchanged, `disputed_minor`
+//! 2. opened AR-reclass (not_moved): `balance` unchanged, `disputed`
 //!    = disputed.
 //! 3. won cash-hold: DISPUTE_HOLD 0, CASH_CLEARING restored; last_phase=WON.
-//! 4. won AR-reclass: `disputed_minor` 0.
+//! 4. won AR-reclass: `disputed` 0.
 //! 5. lost cash-hold: DISPUTE_LOSS_EXPENSE = disputed, DISPUTE_HOLD 0,
-//!    `clawed_back_minor` = disputed.
+//!    `clawed_back` = disputed.
 //! 6. lost AR-reclass (write-off, Model N): the lone `CR AR DISPUTED` writes the
-//!    receivable off — `disputed_minor → 0` AND `balance_minor` dropped by
+//!    receivable off — `disputed → 0` AND `balance` dropped by
 //!    disputed; DISPUTE_LOSS_EXPENSE = disputed; NO cash leg, so CASH_CLEARING is
-//!    UNTOUCHED (the settle left it intact) and `clawed_back_minor` stays 0.
+//!    UNTOUCHED (the settle left it intact) and `clawed_back` stays 0.
 //! 7. lost AR-reclass write-off on an UNSETTLED payment: no settle ⇒
 //!    CASH_CLEARING never funded; the write-off still books a REAL loss
 //!    (DISPUTE_LOSS_EXPENSE = disputed, not netted to zero), posts no cash leg, and
@@ -35,7 +35,7 @@
 //!     CASH_CLEARING net 97; opened parks 97 (CASH_CLEARING → 0, dropped by 97
 //!     not 100); won restores CASH_CLEARING to 97.
 //! 12. fee-bearing cash-hold lost (Model N): same net-97 open; lost ⇒
-//!     DISPUTE_LOSS_EXPENSE = 97, CASH_CLEARING untouched, `clawed_back_minor` = 97
+//!     DISPUTE_LOSS_EXPENSE = 97, CASH_CLEARING untouched, `clawed_back` = 97
 //!     (the net, not the gross 100).
 
 #![allow(
@@ -54,7 +54,6 @@ use std::sync::Arc;
 use bss_ledger::domain::error::DomainError;
 use bss_ledger::domain::instant::to_naive_date;
 use bss_ledger::domain::model::{AccountRow, CurrencyScaleRow, NewEntry, NewLine};
-use bss_ledger::domain::money::DEFAULT_PLAUSIBLE_MAX_MAJOR;
 use bss_ledger::domain::payment::chargeback::{DisputePhase, FundsAtOpen};
 use bss_ledger::domain::payment::settlement::SettlementInput;
 use bss_ledger::domain::payment::settlement_return::SettlementReturnInput;
@@ -68,8 +67,12 @@ use bss_ledger::infra::payment::settlement_return::SettlementReturnService;
 use bss_ledger::infra::posting::service::PostingService;
 use bss_ledger::infra::storage::migrations::Migrator;
 use bss_ledger::infra::storage::repo::{PaymentRepo, ReferenceRepo};
-use bss_ledger_sdk::{AccountClass, MappingStatus, Side, SourceDocType};
+use bss_ledger_sdk::{
+    AccountClass, CurrencySpec, MappingStatus, PostedMoney, Side, SourceDocType, canonical_decimal,
+    parse_decimal,
+};
 use chrono::NaiveDate;
+use rust_decimal::Decimal;
 use sea_orm::{ConnectionTrait, Database, Statement};
 use sea_orm_migration::MigratorTrait;
 use testcontainers_modules::postgres::Postgres;
@@ -82,6 +85,21 @@ use uuid::Uuid;
 
 fn pg(sql: impl Into<String>) -> Statement {
     Statement::from_string(sea_orm::DatabaseBackend::Postgres, sql.into())
+}
+
+/// The USD@2 currency spec every fixture here posts in.
+fn usd_spec() -> CurrencySpec {
+    CurrencySpec::try_new("USD".to_owned(), 2).unwrap()
+}
+
+/// A USD scale-2 posting from a cent count (`1234` ⇒ `12.34`).
+fn usd(cents: i64) -> PostedMoney {
+    PostedMoney::try_new(Decimal::new(cents, 2), usd_spec()).unwrap()
+}
+
+/// The canonical stored text of a USD cent count (`970` ⇒ `"9.7"`).
+fn text(cents: i64) -> String {
+    canonical_decimal(Decimal::new(cents, 2))
 }
 
 /// Boot a container, migrate on a raw connection, and return a `bss`-search-path
@@ -157,8 +175,7 @@ async fn setup_seller(raw: &sea_orm::DatabaseConnection, provider: &DBProvider<D
         .upsert_currency_scale(CurrencyScaleRow {
             tenant_id: s.tenant,
             currency: "USD".to_owned(),
-            minor_units: 2,
-            plausible_max_major: DEFAULT_PLAUSIBLE_MAX_MAJOR,
+            currency_scale: 2,
             source: "iso".to_owned(),
         })
         .await
@@ -222,7 +239,7 @@ fn chargeback_svc(provider: &DBProvider<DbError>) -> ChargebackService {
 
 /// Settle `gross` (fee 0) for `payment_id` — lands the cash in `CASH_CLEARING`
 /// (DR net) + the unallocated pool (CR gross), and seeds the
-/// `payment_settlement` counter row (`settled_minor = gross`) the clawback cap
+/// `payment_settlement` counter row (`settled = gross`) the clawback cap
 /// nets against.
 async fn settle(provider: &DBProvider<DbError>, s: &Seller, payment_id: &str, gross: i64) {
     settle_with_fee(provider, s, payment_id, gross, 0).await;
@@ -231,8 +248,8 @@ async fn settle(provider: &DBProvider<DbError>, s: &Seller, payment_id: &str, gr
 /// Settle `gross` with a PSP `fee` for `payment_id` (Model N): `settle` posts
 /// `DR CASH_CLEARING (gross − fee) · DR PSP_FEE_EXPENSE (fee) · CR UNALLOCATED
 /// (gross)`, so `CASH_CLEARING` only ever holds **net** = `gross − fee`. The
-/// `payment_settlement` counter row is seeded `settled_minor = gross`,
-/// `fee_minor = fee` — the orchestrator reads `net = settled − fee` pre-build to
+/// `payment_settlement` counter row is seeded `settled = gross`,
+/// `fee = fee` — the orchestrator reads `net = settled − fee` pre-build to
 /// size the CASH_HOLD dispute cash legs.
 async fn settle_with_fee(
     provider: &DBProvider<DbError>,
@@ -249,9 +266,9 @@ async fn settle_with_fee(
                 tenant_id: s.tenant,
                 payer_tenant_id: s.payer,
                 payment_id: payment_id.to_owned(),
-                gross_minor: gross,
-                fee_minor: fee,
-                currency: "USD".to_owned(),
+                gross: usd(gross),
+
+                fee: usd(fee),
                 effective_at: None,
             },
         )
@@ -268,7 +285,7 @@ fn settlement_return_svc(provider: &DBProvider<DbError>) -> SettlementReturnServ
 }
 
 /// Claw `amount` (fee 0) back out of `payment_id` through the real service —
-/// decrements the payment's `settled_minor`/`net`, mirroring a PSP refund landing
+/// decrements the payment's `settled`/`net`, mirroring a PSP refund landing
 /// AFTER a dispute has opened on the same payment.
 async fn return_settlement(
     provider: &DBProvider<DbError>,
@@ -286,8 +303,7 @@ async fn return_settlement(
                 payer_tenant_id: s.payer,
                 payment_id: payment_id.to_owned(),
                 psp_return_id: psp_return_id.to_owned(),
-                amount_minor: amount,
-                currency: "USD".to_owned(),
+                amount: usd(amount),
                 effective_at: None,
             },
         )
@@ -321,8 +337,7 @@ async fn record(
                 cycle,
                 phase,
                 funds_at_open,
-                disputed_amount_minor: disputed,
-                currency: "USD".to_owned(),
+                disputed_amount: usd(disputed),
                 effective_at: None,
             },
         )
@@ -333,11 +348,11 @@ async fn record(
 /// `opened` first or IS the `opened`, so the outcome is `Recorded`; a `Queued`
 /// would be a test-setup bug (it is the out-of-order REST path, exercised in
 /// `rest_disputes.rs`), so panic.
-fn recorded(outcome: ChargebackOutcome) -> bss_ledger_sdk::PostingRef {
+fn recorded(outcome: &ChargebackOutcome) -> bss_ledger_sdk::PostingRef {
     match outcome {
-        ChargebackOutcome::Recorded(r) => r,
-        ChargebackOutcome::Queued(q) => {
-            panic!("expected an inline-posted phase, got Queued: {q:?}")
+        ChargebackOutcome::Recorded(r) => *r,
+        ChargebackOutcome::Queued(_) => {
+            panic!("expected an inline-posted phase, got Queued")
         }
     }
 }
@@ -346,45 +361,45 @@ async fn account_balance(
     raw: &sea_orm::DatabaseConnection,
     s: &Seller,
     account: Uuid,
-) -> Option<i64> {
+) -> Option<String> {
     raw.query_one_raw(pg(format!(
-        "SELECT balance_minor FROM bss.ledger_account_balance \
+        "SELECT balance FROM bss.ledger_account_balance \
          WHERE tenant_id='{}' AND account_id='{}' AND currency='USD'",
         s.tenant, account
     )))
     .await
     .unwrap()
-    .map(|r| r.try_get_by_index::<i64>(0).unwrap())
+    .map(|r| r.try_get_by_index::<String>(0).unwrap())
 }
 
 async fn ar_invoice_balance(
     raw: &sea_orm::DatabaseConnection,
     s: &Seller,
     invoice_id: &str,
-) -> Option<i64> {
+) -> Option<String> {
     raw.query_one_raw(pg(format!(
-        "SELECT balance_minor FROM bss.ledger_ar_invoice_balance \
+        "SELECT balance FROM bss.ledger_ar_invoice_balance \
          WHERE tenant_id='{}' AND invoice_id='{}'",
         s.tenant, invoice_id
     )))
     .await
     .unwrap()
-    .map(|r| r.try_get_by_index::<i64>(0).unwrap())
+    .map(|r| r.try_get_by_index::<String>(0).unwrap())
 }
 
-async fn ar_disputed_minor(
+async fn ar_disputed(
     raw: &sea_orm::DatabaseConnection,
     s: &Seller,
     invoice_id: &str,
-) -> Option<i64> {
+) -> Option<String> {
     raw.query_one_raw(pg(format!(
-        "SELECT disputed_minor FROM bss.ledger_ar_invoice_balance \
+        "SELECT disputed FROM bss.ledger_ar_invoice_balance \
          WHERE tenant_id='{}' AND invoice_id='{}'",
         s.tenant, invoice_id
     )))
     .await
     .unwrap()
-    .map(|r| r.try_get_by_index::<i64>(0).unwrap())
+    .map(|r| r.try_get_by_index::<String>(0).unwrap())
 }
 
 /// Read the `ledger_dispute` current-state row's `(variant, last_phase, cycle)`.
@@ -429,20 +444,20 @@ async fn queue_status(
     .map(|r| r.try_get_by_index::<String>(0).unwrap())
 }
 
-/// `clawed_back_minor` on the payment's settlement counter (0 when never bumped).
-async fn clawed_back(provider: &DBProvider<DbError>, s: &Seller, payment_id: &str) -> i64 {
+/// `clawed_back` on the payment's settlement counter (0 when never bumped).
+async fn clawed_back(provider: &DBProvider<DbError>, s: &Seller, payment_id: &str) -> PostedMoney {
     PaymentRepo::new(provider.clone())
         .read_settlement(&AccessScope::for_tenant(s.tenant), s.tenant, payment_id)
         .await
         .unwrap()
         .expect("settlement row present")
-        .clawed_back_minor
+        .clawed_back
 }
 
 /// Seed an OPEN AR invoice by posting `DR AR (invoice_id) / CR PSP_FEE_EXPENSE`
 /// directly through the engine (mirrors `postgres_payments.rs::seed_ar_invoice`).
 /// PSP_FEE_EXPENSE is unguarded, so this lands a clean `ar_invoice_balance` row
-/// (`disputed_minor = 0`) the AR-reclass dispute then moves.
+/// (`disputed = 0`) the AR-reclass dispute then moves.
 async fn seed_ar_invoice(
     provider: &DBProvider<DbError>,
     s: &Seller,
@@ -488,15 +503,12 @@ fn ar_line(s: &Seller, invoice_id: &str, amount: i64) -> NewLine {
         account_class: AccountClass::Ar,
         gl_code: None,
         side: Side::Debit,
-        amount_minor: amount,
-        currency: "USD".to_owned(),
-        currency_scale: 2,
+        money: usd(amount),
         invoice_id: Some(invoice_id.to_owned()),
         due_date: Some(NaiveDate::from_ymd_opt(2026, 12, 1).unwrap()),
         revenue_stream: None,
         mapping_status: MappingStatus::Resolved,
-        functional_amount_minor: None,
-        functional_currency: None,
+        functional_money: None,
         tax_jurisdiction: None,
         tax_filing_period: None,
         tax_rate_ref: None,
@@ -521,15 +533,12 @@ fn psp_credit_line(s: &Seller, amount: i64) -> NewLine {
         account_class: AccountClass::PspFeeExpense,
         gl_code: None,
         side: Side::Credit,
-        amount_minor: amount,
-        currency: "USD".to_owned(),
-        currency_scale: 2,
+        money: usd(amount),
         invoice_id: None,
         due_date: None,
         revenue_stream: None,
         mapping_status: MappingStatus::Resolved,
-        functional_amount_minor: None,
-        functional_currency: None,
+        functional_money: None,
         tax_jurisdiction: None,
         tax_filing_period: None,
         tax_rate_ref: None,
@@ -559,7 +568,7 @@ async fn opened_cash_hold_moves_cash_into_hold() {
 
     settle(&provider, &s, "PAY-CH-1", 1000).await;
     let posted = recorded(
-        record(
+        &record(
             &provider,
             &s,
             "DSP-CH-1",
@@ -578,12 +587,12 @@ async fn opened_cash_hold_moves_cash_into_hold() {
     // The cash parked in the hold; clearing is back to net zero.
     assert_eq!(
         account_balance(&raw, &s, s.dispute_hold).await,
-        Some(1000),
+        Some(text(1000)),
         "DISPUTE_HOLD holds the disputed cash"
     );
     assert_eq!(
         account_balance(&raw, &s, s.cash).await,
-        Some(0),
+        Some(text(0)),
         "CASH_CLEARING net 0 (1000 in from settle, 1000 out to the hold)"
     );
     // The dispute current-state row records the chosen variant + phase.
@@ -598,8 +607,8 @@ async fn opened_cash_hold_moves_cash_into_hold() {
 
 /// `opened` with `funds_at_open = not_moved` selects `AR_RECLASS`: seed an open
 /// AR invoice (1000), then `opened` reclasses it `ACTIVE → DISPUTED`
-/// (`DR AR DISPUTED + CR AR ACTIVE`, AR-class-neutral) ⇒ `balance_minor`
-/// unchanged (1000), `disputed_minor` = 1000. No cash moves.
+/// (`DR AR DISPUTED + CR AR ACTIVE`, AR-class-neutral) ⇒ `balance`
+/// unchanged (1000), `disputed` = 1000. No cash moves.
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn opened_ar_reclass_moves_disputed_slice() {
@@ -615,7 +624,7 @@ async fn opened_ar_reclass_moves_disputed_slice() {
     )
     .await;
     recorded(
-        record(
+        &record(
             &provider,
             &s,
             "DSP-AR-2",
@@ -633,13 +642,13 @@ async fn opened_ar_reclass_moves_disputed_slice() {
     // AR-class-neutral: the full open AR is unchanged; the disputed slice moved.
     assert_eq!(
         ar_invoice_balance(&raw, &s, "INV-AR-2").await,
-        Some(1000),
-        "balance_minor unchanged by an AR-class-neutral reclass"
+        Some(text(1000)),
+        "balance unchanged by an AR-class-neutral reclass"
     );
     assert_eq!(
-        ar_disputed_minor(&raw, &s, "INV-AR-2").await,
-        Some(1000),
-        "disputed_minor = the disputed amount (+D)"
+        ar_disputed(&raw, &s, "INV-AR-2").await,
+        Some(text(1000)),
+        "disputed = the disputed amount (+D)"
     );
     assert_eq!(
         dispute_row(&raw, &s, "DSP-AR-2").await,
@@ -674,7 +683,7 @@ async fn won_cash_hold_releases_hold() {
     .await
     .expect("opened");
     recorded(
-        record(
+        &record(
             &provider,
             &s,
             "DSP-CH-3",
@@ -691,12 +700,12 @@ async fn won_cash_hold_releases_hold() {
 
     assert_eq!(
         account_balance(&raw, &s, s.dispute_hold).await,
-        Some(0),
+        Some(text(0)),
         "the hold is released on a won"
     );
     assert_eq!(
         account_balance(&raw, &s, s.cash).await,
-        Some(1000),
+        Some(text(1000)),
         "CASH_CLEARING restored (the withheld cash is the seller's again)"
     );
     assert_eq!(
@@ -706,7 +715,7 @@ async fn won_cash_hold_releases_hold() {
     );
     assert_eq!(
         clawed_back(&provider, &s, "PAY-CH-3").await,
-        0,
+        usd(0),
         "a won claws nothing back"
     );
 }
@@ -714,8 +723,8 @@ async fn won_cash_hold_releases_hold() {
 // ── 4. won AR-reclass ────────────────────────────────────────────────────────
 
 /// `won` on an `AR_RECLASS` dispute reverses the reclass `DISPUTED → ACTIVE`
-/// (`DR AR ACTIVE + CR AR DISPUTED`) ⇒ `disputed_minor` back to 0,
-/// `balance_minor` still the full open AR; `last_phase = WON`.
+/// (`DR AR ACTIVE + CR AR DISPUTED`) ⇒ `disputed` back to 0,
+/// `balance` still the full open AR; `last_phase = WON`.
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn won_ar_reclass_clears_disputed_slice() {
@@ -744,7 +753,7 @@ async fn won_ar_reclass_clears_disputed_slice() {
     .await
     .expect("opened");
     recorded(
-        record(
+        &record(
             &provider,
             &s,
             "DSP-AR-4",
@@ -760,14 +769,14 @@ async fn won_ar_reclass_clears_disputed_slice() {
     );
 
     assert_eq!(
-        ar_disputed_minor(&raw, &s, "INV-AR-4").await,
-        Some(0),
-        "disputed_minor cleared on a won (−D)"
+        ar_disputed(&raw, &s, "INV-AR-4").await,
+        Some(text(0)),
+        "disputed cleared on a won (−D)"
     );
     assert_eq!(
         ar_invoice_balance(&raw, &s, "INV-AR-4").await,
-        Some(1000),
-        "balance_minor still the full open AR"
+        Some(text(1000)),
+        "balance still the full open AR"
     );
     assert_eq!(
         dispute_row(&raw, &s, "DSP-AR-4").await.map(|r| r.1),
@@ -781,7 +790,7 @@ async fn won_ar_reclass_clears_disputed_slice() {
 /// `lost` on a `CASH_HOLD` dispute forfeits the already-withheld hold funds
 /// (`DR DISPUTE_LOSS_EXPENSE / CR DISPUTE_HOLD`): DISPUTE_LOSS_EXPENSE = 1000,
 /// DISPUTE_HOLD 0, CASH_CLEARING untouched (the cash left clearing at open); the
-/// orchestrator bumps `clawed_back_minor` by 1000.
+/// orchestrator bumps `clawed_back` by 1000.
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn lost_cash_hold_forfeits_hold_and_claws_back() {
@@ -803,7 +812,7 @@ async fn lost_cash_hold_forfeits_hold_and_claws_back() {
     .await
     .expect("opened");
     recorded(
-        record(
+        &record(
             &provider,
             &s,
             "DSP-CH-5",
@@ -820,23 +829,23 @@ async fn lost_cash_hold_forfeits_hold_and_claws_back() {
 
     assert_eq!(
         account_balance(&raw, &s, s.dispute_loss).await,
-        Some(1000),
+        Some(text(1000)),
         "the forfeiture booked into DISPUTE_LOSS_EXPENSE"
     );
     assert_eq!(
         account_balance(&raw, &s, s.dispute_hold).await,
-        Some(0),
+        Some(text(0)),
         "the hold is emptied on the loss"
     );
     assert_eq!(
         account_balance(&raw, &s, s.cash).await,
-        Some(0),
+        Some(text(0)),
         "CASH_CLEARING untouched by the cash-hold loss (cash left at open)"
     );
     assert_eq!(
         clawed_back(&provider, &s, "PAY-CH-5").await,
-        1000,
-        "clawed_back_minor bumped by the forfeited held funds"
+        usd(1000),
+        "clawed_back bumped by the forfeited held funds"
     );
 }
 
@@ -845,11 +854,11 @@ async fn lost_cash_hold_forfeits_hold_and_claws_back() {
 /// `lost` on an `AR_RECLASS` dispute is a WRITE-OFF (Model N): the receivable was
 /// never collected (funds `not_moved`), so the lone `CR AR (ar_status = DISPUTED)`
 /// writes it off — `DR DISPUTE_LOSS_EXPENSE (disputed) / CR AR DISPUTED
-/// (disputed)`. The single CR AR DISPUTED nets `−D` on BOTH `balance_minor` and
-/// `disputed_minor`, so after `lost`: `disputed_minor → 0` AND `balance_minor`
+/// (disputed)`. The single CR AR DISPUTED nets `−D` on BOTH `balance` and
+/// `disputed`, so after `lost`: `disputed → 0` AND `balance`
 /// dropped by `disputed`; `DISPUTE_LOSS_EXPENSE = disputed`. There is NO cash leg,
 /// so `CASH_CLEARING` is UNTOUCHED (still whatever the settle left it) and the
-/// payment's `clawed_back_minor` stays 0. A settle funds CASH_CLEARING here only
+/// payment's `clawed_back` stays 0. A settle funds CASH_CLEARING here only
 /// to prove the write-off leaves it alone (no clawback against the held cash).
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
@@ -859,7 +868,7 @@ async fn lost_ar_reclass_writes_off_to_loss() {
 
     // Settle (CASH_CLEARING = 1000) + seed the settlement counter — present ONLY
     // so we can prove the write-off does NOT touch the cash. The disputed
-    // receivable is a separate seeded AR invoice (balance_minor = 1000).
+    // receivable is a separate seeded AR invoice (balance = 1000).
     settle(&provider, &s, "PAY-AR-6", 1000).await;
     seed_ar_invoice(
         &provider,
@@ -883,7 +892,7 @@ async fn lost_ar_reclass_writes_off_to_loss() {
     .await
     .expect("opened");
     recorded(
-        record(
+        &record(
             &provider,
             &s,
             "DSP-AR-6",
@@ -899,32 +908,32 @@ async fn lost_ar_reclass_writes_off_to_loss() {
     );
 
     // The lone CR AR DISPUTED clears the disputed slice AND writes the receivable
-    // down: disputed_minor → 0 and balance_minor dropped by the full disputed.
+    // down: disputed → 0 and balance dropped by the full disputed.
     assert_eq!(
-        ar_disputed_minor(&raw, &s, "INV-AR-6").await,
-        Some(0),
-        "disputed_minor → 0 (the disputed slice is written off)"
+        ar_disputed(&raw, &s, "INV-AR-6").await,
+        Some(text(0)),
+        "disputed → 0 (the disputed slice is written off)"
     );
     assert_eq!(
         ar_invoice_balance(&raw, &s, "INV-AR-6").await,
-        Some(0),
-        "balance_minor dropped by disputed (1000 → 0) via the lone CR AR DISPUTED"
+        Some(text(0)),
+        "balance dropped by disputed (1000 → 0) via the lone CR AR DISPUTED"
     );
     assert_eq!(
         account_balance(&raw, &s, s.dispute_loss).await,
-        Some(1000),
+        Some(text(1000)),
         "the receivable written off to DISPUTE_LOSS_EXPENSE (a real loss)"
     );
     // The write-off posts NO cash leg, so CASH_CLEARING is untouched by it (still
     // the 1000 the settle left).
     assert_eq!(
         account_balance(&raw, &s, s.cash).await,
-        Some(1000),
+        Some(text(1000)),
         "CASH_CLEARING UNTOUCHED by the write-off (no cash leg)"
     );
     assert_eq!(
         clawed_back(&provider, &s, "PAY-AR-6").await,
-        0,
+        usd(0),
         "a write-off claws nothing back (nothing was ever collected)"
     );
 }
@@ -936,7 +945,7 @@ async fn lost_ar_reclass_writes_off_to_loss() {
 /// (the funds were `not_moved`, so nothing ever hit `CASH_CLEARING`). The
 /// write-off still books a REAL loss — `DR DISPUTE_LOSS_EXPENSE (disputed) /
 /// CR AR DISPUTED (disputed)` — it is NOT netted to zero. After `lost`:
-/// `disputed_minor → 0`, `balance_minor` dropped by `disputed`,
+/// `disputed → 0`, `balance` dropped by `disputed`,
 /// `DISPUTE_LOSS_EXPENSE = disputed`. CASH_CLEARING is never funded (no settle)
 /// and the write-off posts no cash leg, so it stays at 0; the unsettled payment
 /// has no `payment_settlement` counter row at all (nothing clawed back). The post
@@ -948,7 +957,7 @@ async fn lost_ar_reclass_write_off_without_settlement() {
     let s = setup_seller(&raw, &provider).await;
 
     // No settle ⇒ CASH_CLEARING is never funded (stays 0). Seed the disputed AR
-    // invoice (balance_minor = 1000). The write-off posts no cash leg, so it never
+    // invoice (balance = 1000). The write-off posts no cash leg, so it never
     // touches clearing and never bumps a (non-existent) settlement counter.
     seed_ar_invoice(
         &provider,
@@ -974,7 +983,7 @@ async fn lost_ar_reclass_write_off_without_settlement() {
 
     // The write-off posts (no cash leg ⇒ no negative-balance abort).
     let posted = recorded(
-        record(
+        &record(
             &provider,
             &s,
             "DSP-AR-7",
@@ -991,32 +1000,35 @@ async fn lost_ar_reclass_write_off_without_settlement() {
     assert!(!posted.replayed, "the write-off lost is a fresh post");
 
     // The lone CR AR DISPUTED clears the disputed slice AND writes the receivable
-    // down: disputed_minor → 0 and balance_minor dropped by the full disputed.
+    // down: disputed → 0 and balance dropped by the full disputed.
     assert_eq!(
-        ar_disputed_minor(&raw, &s, "INV-AR-7").await,
-        Some(0),
-        "disputed_minor → 0 (the disputed slice is written off)"
+        ar_disputed(&raw, &s, "INV-AR-7").await,
+        Some(text(0)),
+        "disputed → 0 (the disputed slice is written off)"
     );
     assert_eq!(
         ar_invoice_balance(&raw, &s, "INV-AR-7").await,
-        Some(0),
-        "balance_minor dropped by disputed (1000 → 0) via the lone CR AR DISPUTED"
+        Some(text(0)),
+        "balance dropped by disputed (1000 → 0) via the lone CR AR DISPUTED"
     );
     // A REAL loss is booked (the receivable written off) — NOT netted to zero.
     assert_eq!(
         account_balance(&raw, &s, s.dispute_loss).await,
-        Some(1000),
+        Some(text(1000)),
         "DISPUTE_LOSS_EXPENSE = disputed (a real write-off loss, not zero)"
     );
     // CASH_CLEARING was never funded and the write-off posts no cash leg, so it
     // stays at 0 (and never went negative — the post would have aborted if it had).
-    let cash = account_balance(&raw, &s, s.cash).await.unwrap_or(0);
+    let cash = account_balance(&raw, &s, s.cash)
+        .await
+        .map_or(Decimal::ZERO, |t| parse_decimal(&t).unwrap());
     assert!(
-        cash >= 0,
-        "CASH_CLEARING must never be negative; got {cash}"
+        cash >= Decimal::ZERO,
+        "CASH_CLEARING must never be negative"
     );
     assert_eq!(
-        cash, 0,
+        cash,
+        Decimal::ZERO,
         "CASH_CLEARING never funded and untouched by the write-off (no cash leg)"
     );
     // The payment was never settled, so there is no counter row to claw back from.
@@ -1097,7 +1109,7 @@ async fn opened_replay_is_idempotent() {
 
     settle(&provider, &s, "PAY-R-9", 1000).await;
     let fresh = recorded(
-        record(
+        &record(
             &provider,
             &s,
             "DSP-R-9",
@@ -1114,7 +1126,7 @@ async fn opened_replay_is_idempotent() {
     assert!(!fresh.replayed, "first opened is fresh");
 
     let replay = recorded(
-        record(
+        &record(
             &provider,
             &s,
             "DSP-R-9",
@@ -1137,12 +1149,12 @@ async fn opened_replay_is_idempotent() {
     // The hold move applied exactly once (1000, not 2000).
     assert_eq!(
         account_balance(&raw, &s, s.dispute_hold).await,
-        Some(1000),
+        Some(text(1000)),
         "the ledger effect applied once, not twice"
     );
     assert_eq!(
         account_balance(&raw, &s, s.cash).await,
-        Some(0),
+        Some(text(0)),
         "CASH_CLEARING net 0 (the replay moved no further cash)"
     );
 }
@@ -1189,7 +1201,7 @@ async fn reopen_after_won_starts_fresh_cycle() {
 
     // Cycle 2: a fresh opened on the now-resolved dispute is legal.
     recorded(
-        record(
+        &record(
             &provider,
             &s,
             "DSP-RE-10",
@@ -1213,7 +1225,7 @@ async fn reopen_after_won_starts_fresh_cycle() {
     // Cycle 1 won released the hold (→0), cycle 2 opened took it again (→1000).
     assert_eq!(
         account_balance(&raw, &s, s.dispute_hold).await,
-        Some(1000),
+        Some(text(1000)),
         "the new cycle's hold is taken"
     );
 }
@@ -1239,7 +1251,7 @@ async fn fee_bearing_cash_hold_won_uses_net_legs() {
     settle_with_fee(&provider, &s, "PAY-FEE-W", 100, 3).await;
     assert_eq!(
         account_balance(&raw, &s, s.cash).await,
-        Some(97),
+        Some(text(97)),
         "settle lands NET 97 in CASH_CLEARING (the 3 fee went to PSP_FEE_EXPENSE)"
     );
 
@@ -1260,18 +1272,18 @@ async fn fee_bearing_cash_hold_won_uses_net_legs() {
     .expect("opened cash-hold (fee-bearing)");
     assert_eq!(
         account_balance(&raw, &s, s.dispute_hold).await,
-        Some(97),
+        Some(text(97)),
         "DISPUTE_HOLD holds the NET 97, not the gross 100"
     );
     assert_eq!(
         account_balance(&raw, &s, s.cash).await,
-        Some(0),
+        Some(text(0)),
         "CASH_CLEARING dropped by exactly 97 (97 → 0), not by the gross 100"
     );
 
     // won: release the net hold back to clearing (CASH_CLEARING restored to 97).
     recorded(
-        record(
+        &record(
             &provider,
             &s,
             "DSP-FEE-W",
@@ -1287,17 +1299,17 @@ async fn fee_bearing_cash_hold_won_uses_net_legs() {
     );
     assert_eq!(
         account_balance(&raw, &s, s.dispute_hold).await,
-        Some(0),
+        Some(text(0)),
         "the hold is released on the won"
     );
     assert_eq!(
         account_balance(&raw, &s, s.cash).await,
-        Some(97),
+        Some(text(97)),
         "CASH_CLEARING restored by the net 97 (the 3 fee stays expensed)"
     );
     assert_eq!(
         clawed_back(&provider, &s, "PAY-FEE-W").await,
-        0,
+        usd(0),
         "a won claws nothing back"
     );
 }
@@ -1309,7 +1321,7 @@ async fn fee_bearing_cash_hold_won_uses_net_legs() {
 /// (CASH_CLEARING → 0). `lost` forfeits the held net out of the hold: `DR
 /// DISPUTE_LOSS_EXPENSE 97 / CR DISPUTE_HOLD 97` ⇒ DISPUTE_LOSS_EXPENSE = 97,
 /// DISPUTE_HOLD = 0, CASH_CLEARING untouched (the cash left at open). The
-/// orchestrator bumps `clawed_back_minor` by the NET 97 (not the gross 100); the
+/// orchestrator bumps `clawed_back` by the NET 97 (not the gross 100); the
 /// total loss is net 97 + the 3 fee already expensed at settle = gross 100.
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
@@ -1336,18 +1348,18 @@ async fn fee_bearing_cash_hold_lost_uses_net_legs() {
     .expect("opened cash-hold (fee-bearing)");
     assert_eq!(
         account_balance(&raw, &s, s.dispute_hold).await,
-        Some(97),
+        Some(text(97)),
         "DISPUTE_HOLD holds the NET 97"
     );
     assert_eq!(
         account_balance(&raw, &s, s.cash).await,
-        Some(0),
+        Some(text(0)),
         "CASH_CLEARING dropped by exactly 97 (→ 0)"
     );
 
     // lost: forfeit the net hold to loss; CASH_CLEARING untouched (cash left at open).
     recorded(
-        record(
+        &record(
             &provider,
             &s,
             "DSP-FEE-L",
@@ -1363,23 +1375,23 @@ async fn fee_bearing_cash_hold_lost_uses_net_legs() {
     );
     assert_eq!(
         account_balance(&raw, &s, s.dispute_loss).await,
-        Some(97),
+        Some(text(97)),
         "DISPUTE_LOSS_EXPENSE = the NET 97 (the 3 fee was already expensed at settle)"
     );
     assert_eq!(
         account_balance(&raw, &s, s.dispute_hold).await,
-        Some(0),
+        Some(text(0)),
         "the hold is emptied on the loss"
     );
     assert_eq!(
         account_balance(&raw, &s, s.cash).await,
-        Some(0),
+        Some(text(0)),
         "CASH_CLEARING untouched by the loss (the cash left clearing at open)"
     );
     assert_eq!(
         clawed_back(&provider, &s, "PAY-FEE-L").await,
-        97,
-        "clawed_back_minor bumped by the NET 97, not the gross 100"
+        usd(97),
+        "clawed_back bumped by the NET 97, not the gross 100"
     );
 }
 
@@ -1430,7 +1442,7 @@ async fn opened_drains_queued_outcome() {
     // Record the `opened` — the drain-on-opened hook then applies the queued won
     // inline (a fresh, non-replayed opened is the only outcome that drains).
     recorded(
-        record(
+        &record(
             &provider,
             &s,
             "DSP-CH-DR",
@@ -1461,12 +1473,12 @@ async fn opened_drains_queued_outcome() {
     // The won's ledger effect landed: the hold is released back to clearing.
     assert_eq!(
         account_balance(&raw, &s, s.dispute_hold).await,
-        Some(0),
+        Some(text(0)),
         "the hold is released by the drained won"
     );
     assert_eq!(
         account_balance(&raw, &s, s.cash).await,
-        Some(1000),
+        Some(text(1000)),
         "CASH_CLEARING restored to its pre-dispute net by the drained won"
     );
 }
@@ -1475,11 +1487,11 @@ async fn opened_drains_queued_outcome() {
 /// outcome targeting a STALE cycle must NOT resolve the CURRENT open cycle. Open
 /// cycle 1 (CASH_HOLD), win it, re-open as cycle 2, then submit a `lost` for the
 /// already-closed cycle 1. Its dedup key (`DSP:1:lost`) never posted (cycle 1 was
-/// WON, not lost), so it clears the dedup gate AND the out-of-txn transition guard
-/// (which sees the cycle-2 row as OPENED and does not check the cycle). Only the
-/// in-txn `cycle = 1` predicate stops it: the cycle-2 row matches 0 rows, so the
-/// stale outcome is rejected as `InvalidDisputeTransition` instead of silently
-/// resolving cycle 2 (and committing a second outcome entry) with cycle 1's data.
+/// WON, not lost), so it clears the dedup gate; the dispute state machine then
+/// refuses it (an outcome resolves only the OPENED cycle it names), both in the
+/// out-of-txn guard and on the in-txn row, so the stale outcome is rejected as
+/// `InvalidDisputeTransition` instead of silently resolving cycle 2 (and
+/// committing a second outcome entry) with cycle 1's data.
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn stale_cycle_outcome_does_not_resolve_current_cycle() {
@@ -1534,8 +1546,8 @@ async fn stale_cycle_outcome_does_not_resolve_current_cycle() {
         "the dispute is OPENED at cycle 2 before the stale outcome"
     );
 
-    // The stale cycle-1 `lost` clears dedup (DSP:1:lost never posted) and the
-    // out-of-txn guard (the row is OPENED) — only the cycle predicate rejects it.
+    // The stale cycle-1 `lost` clears dedup (DSP:1:lost never posted); the state
+    // machine refuses an outcome for a cycle that is not the open one.
     let err = record(
         &provider,
         &s,
@@ -1588,8 +1600,12 @@ async fn cash_hold_chargeback_in_wrong_currency_is_rejected() {
                 cycle: 1,
                 phase: DisputePhase::Opened,
                 funds_at_open: FundsAtOpen::Withheld,
-                disputed_amount_minor: 1000,
-                currency: "EUR".to_owned(), // != settled USD
+                // != settled USD
+                disputed_amount: PostedMoney::try_new(
+                    Decimal::new(1000, 2),
+                    CurrencySpec::try_new("EUR".to_owned(), 2).unwrap(),
+                )
+                .unwrap(),
                 effective_at: None,
             },
         )
@@ -1610,7 +1626,7 @@ async fn cash_hold_chargeback_in_wrong_currency_is_rejected() {
 /// Regression — cross-feature stranded hold: a settlement-return that lowers
 /// a payment's settled total AFTER a CASH_HOLD dispute opened must NOT change what
 /// the outcome releases. The held cash is a fact fixed at open
-/// (`cash_hold_minor`), so the `won` outcome releases the FULL amount held — not a
+/// (`cash_hold`), so the `won` outcome releases the FULL amount held — not a
 /// re-read `settled − fee`. Pre-fix the outcome re-read the now-lower net and
 /// released too little, stranding cash in DISPUTE_HOLD.
 #[tokio::test]
@@ -1627,7 +1643,7 @@ async fn won_cash_hold_after_settlement_return_releases_full_held_amount() {
     // Open a CASH_HOLD dispute on PAY-A: the full net (1000, fee 0) parks in the
     // hold (CASH_CLEARING 2000 → 1000, DISPUTE_HOLD → 1000).
     recorded(
-        record(
+        &record(
             &provider,
             &s,
             "DISP-A",
@@ -1643,7 +1659,7 @@ async fn won_cash_hold_after_settlement_return_releases_full_held_amount() {
     );
     assert_eq!(
         account_balance(&raw, &s, s.dispute_hold).await,
-        Some(1000),
+        Some(text(1000)),
         "open parks the full net in the hold"
     );
 
@@ -1653,14 +1669,14 @@ async fn won_cash_hold_after_settlement_return_releases_full_held_amount() {
     return_settlement(&provider, &s, "PAY-A", "RET-A", 500).await;
     assert_eq!(
         account_balance(&raw, &s, s.cash).await,
-        Some(500),
+        Some(text(500)),
         "the partial return credits clearing back down to 500"
     );
 
     // Win the dispute: the hold releases the amount HELD at open (1000), sized off
-    // the stored `cash_hold_minor` — not the now-lower net.
+    // the stored `cash_hold` — not the now-lower net.
     recorded(
-        record(
+        &record(
             &provider,
             &s,
             "DISP-A",
@@ -1679,12 +1695,12 @@ async fn won_cash_hold_after_settlement_return_releases_full_held_amount() {
     // to the consistent 1500 = 2000 settled − 500 returned.
     assert_eq!(
         account_balance(&raw, &s, s.dispute_hold).await,
-        Some(0),
+        Some(text(0)),
         "won releases the full held amount; DISPUTE_HOLD is not stranded"
     );
     assert_eq!(
         account_balance(&raw, &s, s.cash).await,
-        Some(1500),
+        Some(text(1500)),
         "clearing restored by the full held net; books consistent (2000 − 500)"
     );
 }
@@ -1693,7 +1709,7 @@ async fn won_cash_hold_after_settlement_return_releases_full_held_amount() {
 
 /// A buyer disputes only PART of a settled receipt: settle 1000 (CASH_CLEARING =
 /// 1000, fee 0 ⇒ net = 1000), then `opened` a CASH_HOLD dispute for only 600. The
-/// orchestrator sizes the hold at `cash_hold_minor = min(disputed, net) =
+/// orchestrator sizes the hold at `cash_hold = min(disputed, net) =
 /// min(600, 1000) = 600` (the `min` branch the all-or-nothing 1000-disputed cases
 /// never exercise), so only 600 moves CASH_CLEARING → DISPUTE_HOLD and 400 of
 /// collected cash stays in clearing. `won` then releases exactly the 600 held back
@@ -1709,13 +1725,13 @@ async fn opened_partial_cash_hold_parks_only_disputed_slice() {
     settle(&provider, &s, "PAY-PCH-1", 1000).await;
     assert_eq!(
         account_balance(&raw, &s, s.cash).await,
-        Some(1000),
+        Some(text(1000)),
         "settle lands the full net in CASH_CLEARING"
     );
 
     // Dispute only 600 of the 1000: the hold is sized at min(600, 1000) = 600.
     recorded(
-        record(
+        &record(
             &provider,
             &s,
             "DSP-PCH-1",
@@ -1731,12 +1747,12 @@ async fn opened_partial_cash_hold_parks_only_disputed_slice() {
     );
     assert_eq!(
         account_balance(&raw, &s, s.dispute_hold).await,
-        Some(600),
+        Some(text(600)),
         "DISPUTE_HOLD holds only the 600 disputed slice (min(disputed, net))"
     );
     assert_eq!(
         account_balance(&raw, &s, s.cash).await,
-        Some(400),
+        Some(text(400)),
         "CASH_CLEARING keeps the 400 un-disputed remainder (1000 − 600)"
     );
     assert_eq!(
@@ -1748,7 +1764,7 @@ async fn opened_partial_cash_hold_parks_only_disputed_slice() {
     // Win the partial dispute: the 600 held is released back, leaving CASH_CLEARING
     // restored to the full 1000 (the 400 was never disputed).
     recorded(
-        record(
+        &record(
             &provider,
             &s,
             "DSP-PCH-1",
@@ -1764,18 +1780,18 @@ async fn opened_partial_cash_hold_parks_only_disputed_slice() {
     );
     assert_eq!(
         account_balance(&raw, &s, s.dispute_hold).await,
-        Some(0),
+        Some(text(0)),
         "the 600 hold is fully released on won"
     );
     assert_eq!(
         account_balance(&raw, &s, s.cash).await,
-        Some(1000),
+        Some(text(1000)),
         "CASH_CLEARING restored to the full collected 1000 (only the slice round-tripped)"
     );
     // A won claws nothing back.
     assert_eq!(
         clawed_back(&provider, &s, "PAY-PCH-1").await,
-        0,
+        usd(0),
         "a won claws nothing back"
     );
 }
@@ -1788,15 +1804,15 @@ async fn opened_partial_cash_hold_parks_only_disputed_slice() {
 /// logged + `ChargebackOnRefunded` — instead of a generic `ChargebackExceedsSettled`.
 ///
 /// Scenario (a real PSP sequence): a 1000 receipt is settled, then a 600 refund
-/// already landed against it (`refunded_minor = 600`, seeded directly on the
+/// already landed against it (`refunded = 600`, seeded directly on the
 /// settlement counter — the refund path's own write — exactly as
 /// `postgres_payments.rs::bump_allocation_refund_nets_and_caps` drives a counter to
 /// a target state). A CASH_HOLD dispute then opens for the full 1000 (hold = 1000)
 /// and is LOST: the clawback (1000) would push `refunded(600) + clawed(0) +
-/// clawback(1000) = 1600 > settled(1000)` over the cap, AND `refunded_minor > 0`,
+/// clawback(1000) = 1600 > settled(1000)` over the cap, AND `refunded > 0`,
 /// so the pre-check raises `ChargebackOnRefunded`. The post never reaches the
 /// engine: the dispute stays OPENED, DISPUTE_HOLD keeps the held 1000 (the loss did
-/// not post), and `clawed_back_minor` stays 0.
+/// not post), and `clawed_back` stays 0.
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn lost_cash_hold_on_refunded_payment_routes_to_exception() {
@@ -1806,7 +1822,7 @@ async fn lost_cash_hold_on_refunded_payment_routes_to_exception() {
     // Settle 1000, open a CASH_HOLD dispute for the full 1000 (hold = 1000).
     settle(&provider, &s, "PAY-CBR-1", 1000).await;
     recorded(
-        record(
+        &record(
             &provider,
             &s,
             "DSP-CBR-1",
@@ -1822,16 +1838,16 @@ async fn lost_cash_hold_on_refunded_payment_routes_to_exception() {
     );
     assert_eq!(
         account_balance(&raw, &s, s.dispute_hold).await,
-        Some(1000),
+        Some(text(1000)),
         "the full net is held at open"
     );
 
-    // A 600 refund already landed on this payment: bump `refunded_minor` to 600 on
+    // A 600 refund already landed on this payment: bump `refunded` to 600 on
     // the settlement counter (the refund path's own write; seeded directly so this
     // test owns the dispute lifecycle, mirroring the counter-seed idiom). 600 + 0
     // <= 1000 still satisfies the money-out cap, so the seed itself is admissible.
     raw.execute_raw(pg(format!(
-        "UPDATE bss.ledger_payment_settlement SET refunded_minor = 600 \
+        "UPDATE bss.ledger_payment_settlement SET refunded = '6' \
          WHERE tenant_id='{}' AND payment_id='PAY-CBR-1'",
         s.tenant
     )))
@@ -1861,7 +1877,7 @@ async fn lost_cash_hold_on_refunded_payment_routes_to_exception() {
 
     // The pre-check rejected BEFORE the post: the loss never booked. The dispute is
     // still OPENED (not advanced to LOST), DISPUTE_HOLD still holds the 1000, no
-    // DISPUTE_LOSS_EXPENSE, and clawed_back_minor stays 0.
+    // DISPUTE_LOSS_EXPENSE, and clawed_back stays 0.
     assert_eq!(
         dispute_row(&raw, &s, "DSP-CBR-1").await.map(|r| r.1),
         Some("OPENED".to_owned()),
@@ -1869,19 +1885,19 @@ async fn lost_cash_hold_on_refunded_payment_routes_to_exception() {
     );
     assert_eq!(
         account_balance(&raw, &s, s.dispute_hold).await,
-        Some(1000),
+        Some(text(1000)),
         "the held cash is untouched (the forfeit never posted)"
     );
     assert!(
         matches!(
-            account_balance(&raw, &s, s.dispute_loss).await,
-            None | Some(0)
+            account_balance(&raw, &s, s.dispute_loss).await.as_deref(),
+            None | Some("0")
         ),
         "no DISPUTE_LOSS_EXPENSE was booked"
     );
     assert_eq!(
         clawed_back(&provider, &s, "PAY-CBR-1").await,
-        0,
+        usd(0),
         "nothing was clawed back (the cap pre-check rejected first)"
     );
 }

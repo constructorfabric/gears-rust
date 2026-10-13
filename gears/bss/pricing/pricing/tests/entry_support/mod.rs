@@ -225,6 +225,33 @@ impl Fixture {
         );
         Self::on_named(db, tenant, dsn, registry, Some(names)).await
     }
+    /// [`Fixture::new`] over a currency table that adds the non-ISO codes of `scales` (code to
+    /// scale) to the ISO one.
+    pub async fn with_currency_scales(
+        registry: Arc<dyn bss_products_sdk::ReferenceRegistryV1>,
+        scales: &[(&str, u8)],
+    ) -> Self {
+        let (db, _, tenant, dsn) = storage_support::test_db().await;
+        Self::on_with_currency_scales(db, tenant, dsn, registry, scales).await
+    }
+    /// [`Fixture::on`] over a currency table that adds the non-ISO codes of `scales` (code to
+    /// scale) to the ISO one: a database of either backend.
+    pub async fn on_with_currency_scales(
+        db: toolkit_db::DBProvider<toolkit_db::DbError>,
+        tenant: Uuid,
+        dsn: TestDsn,
+        registry: Arc<dyn bss_products_sdk::ReferenceRegistryV1>,
+        scales: &[(&str, u8)],
+    ) -> Self {
+        let scales = bss_pricing::domain::currency::CurrencyScales::try_new(
+            scales
+                .iter()
+                .map(|(code, scale)| ((*code).to_owned(), *scale))
+                .collect(),
+        )
+        .unwrap();
+        Self::build(db, tenant, dsn, registry, None, Some(scales)).await
+    }
     /// [`Fixture::on`] with the actor names `names`, or the hub's when `None`.
     pub async fn on_named(
         db: toolkit_db::DBProvider<toolkit_db::DbError>,
@@ -232,6 +259,18 @@ impl Fixture {
         dsn: TestDsn,
         registry: Arc<dyn bss_products_sdk::ReferenceRegistryV1>,
         names: Option<bss_rest::actor_names::ActorNames>,
+    ) -> Self {
+        Self::build(db, tenant, dsn, registry, names, None).await
+    }
+    /// The fixture over a state with the actor names `names` and the currency table `scales`,
+    /// or the hub's names and the ISO table when `None`.
+    async fn build(
+        db: toolkit_db::DBProvider<toolkit_db::DbError>,
+        tenant: Uuid,
+        dsn: TestDsn,
+        registry: Arc<dyn bss_products_sdk::ReferenceRegistryV1>,
+        names: Option<bss_rest::actor_names::ActorNames>,
+        scales: Option<bss_pricing::domain::currency::CurrencyScales>,
     ) -> Self {
         let hub = Arc::new(toolkit::ClientHub::default());
         hub.register::<dyn bss_pricing_sdk::meter_semantics::UsageMeterSemanticsV1>(Arc::new(
@@ -243,8 +282,12 @@ impl Fixture {
         let state = bss_pricing::api::rest::authoring::AuthoringState::new(db.clone(), hub)
             .await
             .unwrap();
-        let state = Arc::new(match names {
+        let state = match names {
             Some(names) => state.with_actor_names(names),
+            None => state,
+        };
+        let state = Arc::new(match scales {
+            Some(scales) => state.with_currency_scales(Arc::new(scales)),
             None => state,
         });
         let make = |allow| {
@@ -326,6 +369,34 @@ impl Fixture {
             )
             .await
             .unwrap(),
+        );
+        production(state).layer(axum::Extension(authz_resolver_sdk::PolicyEnforcer::new(
+            Arc::new(Resolver {
+                tenant: self.ctx.subject_tenant_id(),
+                allow: true,
+                every_subject: false,
+            }),
+        )))
+    }
+    /// A router over the same database whose state resolves currencies through another table:
+    /// the ISO one plus the non-ISO codes of `scales` (code to scale). The deployment's table
+    /// changed; what the database holds did not.
+    pub async fn app_with_currency_scales(&self, scales: &[(&str, u8)]) -> Router {
+        let scales = bss_pricing::domain::currency::CurrencyScales::try_new(
+            scales
+                .iter()
+                .map(|(code, scale)| ((*code).to_owned(), *scale))
+                .collect(),
+        )
+        .unwrap();
+        let state = Arc::new(
+            bss_pricing::api::rest::authoring::AuthoringState::new(
+                self.db.clone(),
+                self.state.hub.clone(),
+            )
+            .await
+            .unwrap()
+            .with_currency_scales(Arc::new(scales)),
         );
         production(state).layer(axum::Extension(authz_resolver_sdk::PolicyEnforcer::new(
             Arc::new(Resolver {
@@ -770,6 +841,8 @@ pub fn price(p: &price_book_entry::Model) -> price::Model {
         version_no: 1,
         dim_value: None,
         price_json: serde_json::json!({"rate":"0.1"}),
+        currency: "EUR".into(),
+        currency_scale: 2,
         min_fee: Some("12.34".into()),
         eligibility: "all".into(),
         effective_from: at(9).date(),

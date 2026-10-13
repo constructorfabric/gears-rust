@@ -20,13 +20,9 @@ pub struct PricingResolveDto {
     pub state: PricingResolvedRevisionState,
     /// The revision's book.
     pub book_id: Uuid,
-    /// The book's currency.
+    /// The book's currency. Each binding carries its price's own currency spec: the scale is
+    /// stored per price, so prices of one book written under different scales each keep theirs.
     pub currency: String,
-    /// The currency's scale: the number of minor digits money carries.
-    pub currency_minor_digits: u32,
-    /// The tenant's `default_rounding`, as stored: a string, since no CHECK guards the column
-    /// (D-437, D-439).
-    pub rounding_policy: String,
     /// The date resolved, `YYYY-MM-DD`.
     pub date: String,
     /// Every item of the revision, or the one `item_id` names.
@@ -101,6 +97,11 @@ pub struct PricingResolveBindingDto {
     pub dim_used: Option<String>,
     /// The pin the renewal walk started from; null for a signup.
     pub pinned_from: Option<Uuid>,
+    /// The price's currency as stored with the price: its book's.
+    pub currency: String,
+    /// The currency's scale stored with the price: the number of minor digits its money posts
+    /// with, a JSON integer. A later change of the currency table does not change it.
+    pub currency_scale: u8,
     /// The price's money as stored, in the item's model (D-427), amounts as exact decimal text.
     pub price: serde_json::Value,
     /// Exact decimal text.
@@ -129,7 +130,10 @@ pub struct PricingPinnedPriceDto {
     pub charge_kind: PricingChargeKind,
     pub period: Option<PricingPeriod>,
     pub book_id: Uuid,
+    /// The price's currency as stored with the price: its book's.
     pub currency: String,
+    /// The currency's scale stored with the price, a JSON integer; never the current table's.
+    pub currency_scale: u8,
     /// The price's place in its entry's order of prices.
     pub version_no: i32,
     /// The value's chain; null for the default chain.

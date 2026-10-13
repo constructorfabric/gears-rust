@@ -66,6 +66,70 @@ fn golden_v1_decodes_and_reencodes_byte_identically_without_rehashing() {
         .is_err()
     );
 }
+/// The golden is a genuine issued receipt, never hand-written hashes: every digest it carries
+/// recomputes from its own content, the price's stored scale included, and the scale is the
+/// price's: the invoice inputs carry none.
+#[test]
+fn golden_v1_digests_recompute_from_its_content() {
+    use bss_pricing_sdk::{
+        digest::{
+            billing_terms_digest, money_digest, request_digest, selected_bindings_digest,
+            template_digest, terms_digest,
+        },
+        read::{ResolvedBindings, ResolvedCell},
+    };
+    let raw = include_str!("commercial_receipts/acceptance-v1.json");
+    assert!(
+        raw.contains("\"currency\":\"EUR\",\"currency_scale\":\"2\""),
+        "the price stores its scale"
+    );
+    assert!(
+        !raw.contains("\"timing\":\"arrears\",\"currency_scale\""),
+        "the invoice inputs carry no scale"
+    );
+    let receipt = wire::decode_acceptance(raw).unwrap();
+    let q = &receipt.query;
+    let binding = &receipt.bindings[0];
+    assert_eq!(
+        (
+            binding.price.currency.code(),
+            binding.price.currency.scale()
+        ),
+        ("EUR", 2)
+    );
+    assert_eq!(binding.price.money_digest, money_digest(&binding.price));
+    assert_eq!(
+        binding.invoice.template_digest,
+        template_digest(&binding.invoice.template)
+    );
+    assert_eq!(
+        q.billing_terms.digest,
+        billing_terms_digest(&q.billing_terms)
+    );
+    let resolved = ResolvedBindings {
+        plan_id: q.plan_id,
+        revision_id: q.plan_revision_id,
+        cells: vec![ResolvedCell {
+            selection: q.selections[0].clone(),
+            binding: Some(binding.clone()),
+        }],
+    };
+    assert_eq!(
+        q.resolved_bindings_digest,
+        selected_bindings_digest(&resolved, &q.selections).unwrap()
+    );
+    assert_eq!(receipt.request_digest, request_digest(q));
+    assert_eq!(receipt.terms_digest, terms_digest(q, &receipt.bindings));
+    assert!(
+        bss_pricing::domain::commercial_terms::validate_stored_terms(
+            q,
+            &receipt.bindings,
+            &receipt.terms_digest
+        )
+        .is_ok(),
+        "the golden is a valid stored receipt"
+    );
+}
 #[tokio::test]
 async fn unique_business_identity_rejects_a_second_insert() {
     let (db, _dir, _) = database().await;
@@ -401,6 +465,102 @@ fn versioned_decode_refuses_lossy_or_ambiguous_wire_values() {
     let good = wire::decode_acceptance(raw).unwrap();
     let again = wire::decode_acceptance(&wire::encode_acceptance(&good).unwrap()).unwrap();
     assert_eq!(again, good);
+}
+
+/// A stored receipt's price carries its own currency spec, so a scale over 28, a scale past a `u8`,
+/// a missing scale and a price currency the spec refuses make the receipt unreadable, in an
+/// acceptance and in a hold alike.
+#[test]
+fn both_decoders_refuse_a_receipt_whose_currency_spec_is_invalid() {
+    use bss_pricing_sdk::acceptance::HeldBindings;
+    let acceptance = include_str!("commercial_receipts/acceptance-v1.json");
+    let receipt = wire::decode_acceptance(acceptance).unwrap();
+    let hold = wire::encode_hold(&HeldBindings {
+        hold_id: Uuid::from_u128(7),
+        acceptance_id: receipt.acceptance_id,
+        terms_digest: receipt.terms_digest,
+        activation_at: receipt.query.start_at,
+        bindings: receipt.bindings,
+    })
+    .unwrap();
+    assert!(
+        wire::decode_hold(&hold).is_ok(),
+        "the hold reads as written"
+    );
+    for (written, bad) in [
+        ("\"currency_scale\":\"2\"", "\"currency_scale\":\"29\""),
+        ("\"currency_scale\":\"2\"", "\"currency_scale\":\"256\""),
+        ("\"currency_scale\":\"2\"", "\"currency_scale\":2"),
+        ("\"currency_scale\":\"2\",", ""),
+        (
+            "\"currency\":\"EUR\",\"currency_scale\"",
+            "\"currency\":\"eur\",\"currency_scale\"",
+        ),
+    ] {
+        let refused = acceptance.replace(written, bad);
+        assert_ne!(refused, acceptance, "the acceptance carries the value");
+        assert!(
+            wire::decode_acceptance(&refused).is_err(),
+            "the acceptance decoder refuses an invalid currency spec"
+        );
+        let refused = hold.replace(written, bad);
+        assert_ne!(refused, hold, "the hold carries the value");
+        assert!(
+            wire::decode_hold(&refused).is_err(),
+            "the hold decoder refuses an invalid currency spec"
+        );
+    }
+    // A spec that does not build is a corrupt row whose cause names the price, its code and its
+    // scale, so the row can be found from the log.
+    let named = "price 00000000-0000-0000-0000-000000000001: currency \"EUR\" at scale 29";
+    let rescaled = |raw: &str| raw.replace("\"currency_scale\":\"2\"", "\"currency_scale\":\"29\"");
+    for refused in [
+        wire::decode_acceptance(&rescaled(acceptance)).map(|_| ()),
+        wire::decode_hold(&rescaled(&hold)).map(|_| ()),
+    ] {
+        let Err(bss_pricing::infra::storage::RepoError::CorruptRow(cause)) = refused else {
+            panic!("a currency spec that does not build is a corrupt row");
+        };
+        assert!(
+            cause.contains(named),
+            "the cause names the price, its code and its scale"
+        );
+    }
+}
+
+/// Decoding never recomputes an issued digest, so a stored price scale edited without its money
+/// digest still decodes, as stored; the stored-receipt check then refuses it as other money. The
+/// invoice inputs have no scale of their own to edit.
+#[test]
+fn a_price_scale_edited_without_its_digest_is_refused() {
+    use bss_pricing_sdk::acceptance::CommercialReason;
+    let raw = include_str!("commercial_receipts/acceptance-v1.json");
+    let issued = wire::decode_acceptance(raw).unwrap();
+    let edited = raw.replace("\"currency_scale\":\"2\"", "\"currency_scale\":\"3\"");
+    assert_ne!(edited, raw, "the golden stores the price scale");
+    let stored = wire::decode_acceptance(&edited).unwrap();
+    let (price, original) = (&stored.bindings[0].price, &issued.bindings[0].price);
+    assert_eq!(price.currency.scale(), 3, "decoded as stored");
+    assert_eq!(
+        (price.money_digest, stored.terms_digest),
+        (original.money_digest, issued.terms_digest),
+        "decoding keeps the issued digests"
+    );
+    let refused = bss_pricing::domain::commercial_terms::validate_stored_terms(
+        &stored.query,
+        &stored.bindings,
+        &stored.terms_digest,
+    )
+    .unwrap_err();
+    assert_eq!(refused.reason, Some(CommercialReason::MoneyDigestMismatch));
+    assert!(
+        wire::decode_acceptance(&raw.replace(
+            "\"timing\":\"arrears\",",
+            "\"timing\":\"arrears\",\"currency_scale\":\"2\","
+        ))
+        .is_err(),
+        "an invoice scale is an unknown field"
+    );
 }
 
 proptest::proptest! {

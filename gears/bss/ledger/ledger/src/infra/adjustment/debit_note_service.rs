@@ -56,7 +56,7 @@
 
 use std::sync::Arc;
 
-use bss_ledger_sdk::{MappingStatus, PostingRef, SourceDocType};
+use bss_ledger_sdk::{MappingStatus, PostedMoney, PostingRef, SourceDocType};
 use chrono::Datelike;
 use toolkit_db::secure::{AccessScope, DbTx};
 use toolkit_db::{DBProvider, DbError};
@@ -80,7 +80,6 @@ use crate::domain::recognition::ports::{
     DefaultDeferralPolicyResolver, DefaultSspResolver, DefaultVcResolver, RecognitionContext,
 };
 use crate::infra::approval::service::ApprovalService;
-use crate::infra::currency_scale::CurrencyScaleResolver;
 use crate::infra::events::payloads::DebitNotePosted;
 use crate::infra::events::publisher::LedgerEventPublisher;
 use crate::infra::exception::ExceptionRouter;
@@ -89,7 +88,8 @@ use crate::infra::posting::idempotency::IdempotencyGate;
 use crate::infra::posting::service::{PostSidecar, PostedFacts, PostingService};
 use crate::infra::recognition::sidecar::{PlannedScheduleMaterialization, ScheduleBuilderSidecar};
 use crate::infra::storage::repo::adjustment_repo::NewDebitNote;
-use crate::infra::storage::repo::{AdjustmentRepo, ReferenceRepo};
+use crate::infra::storage::repo::{AdjustmentRepo, RecognitionRepo, ReferenceRepo};
+use crate::infra::v1_payload::v1_minor_units_for;
 use time::OffsetDateTime;
 
 /// Origin literal stamped on posts made through this service (mirrors the peer
@@ -100,8 +100,8 @@ const ORIGIN_SYSTEM: &str = "SYSTEM";
 pub struct DebitNoteHandler {
     posting: PostingService,
     reference: ReferenceRepo,
-    resolver: CurrencyScaleResolver,
     adjustment: AdjustmentRepo,
+    recognition: Arc<RecognitionRepo>,
     /// ASC 606 recognition tunables (Slice 4): the per-schedule segment ceiling the
     /// pure [`ScheduleBuilder`] enforces when the note defers (D4).
     recognition_config: RecognitionConfig,
@@ -111,7 +111,7 @@ pub struct DebitNoteHandler {
     /// Metrics sink (`ledger_debit_note_total{outcome}`, Group F): one increment
     /// per attempt, labelled posted / replayed / rejected.
     metrics: Arc<dyn LedgerMetricsPort>,
-    /// The dual-control engine (VHP-1852). `Some` ⇒ a debit note whose amount
+    /// The dual-control engine. `Some` ⇒ a debit note whose amount
     /// crosses the tenant's D2 threshold is gated to the preparer→approver queue
     /// ([`DomainError::DualControlRequired`]) instead of posting inline; `None` ⇒
     /// gating is disabled (the executor's approved replay, and the unit tests that
@@ -144,13 +144,13 @@ impl DebitNoteHandler {
     ) -> Self {
         let posting = PostingService::new(db.clone(), Arc::clone(&publisher));
         let reference = ReferenceRepo::new(db.clone());
-        let resolver = CurrencyScaleResolver::new(ReferenceRepo::new(db.clone()));
-        let adjustment = AdjustmentRepo::new(db);
+        let adjustment = AdjustmentRepo::new(db.clone());
+        let recognition = Arc::new(RecognitionRepo::new(db));
         Self {
             posting,
             reference,
-            resolver,
             adjustment,
+            recognition,
             recognition_config,
             publisher,
             metrics,
@@ -168,7 +168,7 @@ impl DebitNoteHandler {
         self
     }
 
-    /// Attach the dual-control engine (VHP-1852): a debit note whose amount crosses
+    /// Attach the dual-control engine: a debit note whose amount crosses
     /// the tenant's D2 threshold is then gated to the preparer→approver queue
     /// ([`DomainError::DualControlRequired`]) rather than posting inline. The approved
     /// replay re-enters through [`Self::post_debit_note_approved`], which skips the
@@ -215,7 +215,7 @@ impl DebitNoteHandler {
         result
     }
 
-    /// The approved-replay entry (VHP-1852): re-drive a held debit note WITHOUT the
+    /// The approved-replay entry: re-drive a held debit note WITHOUT the
     /// dual-control gate. Called only by the `ApprovalExecutor` after a second actor
     /// approves the PENDING debit-note approval — the threshold was already crossed
     /// at gate time, so re-checking it would re-open a second approval (an infinite
@@ -268,9 +268,9 @@ impl DebitNoteHandler {
 
         // A zero-amount note has no charge and would fail the engine's empty-entry
         // validation; reject up-front (inherited S1 / AC #4 — no zero placeholder).
-        if req.amount_minor == 0 {
+        if req.amount.amount().is_zero() {
             return Err(DomainError::InvalidRequest(
-                "debit note amount_minor must be > 0".to_owned(),
+                "debit note amount must be > 0".to_owned(),
             ));
         }
 
@@ -292,7 +292,7 @@ impl DebitNoteHandler {
             )));
         }
 
-        // 1c. Dual-control gate (VHP-1852, design §1.4 D2 / §4.3). Gated on the debit
+        // 1c. Dual-control gate (design §1.4 D2 / §4.3). Gated on the debit
         //     note's amount crossing the tenant's D2 threshold, AFTER the payer-close
         //     gate + shape gate (a malformed request 400s) AND the originating-invoice
         //     link gate (an absent origin 404s) — so none of those open an approval —
@@ -308,7 +308,7 @@ impl DebitNoteHandler {
                 // FX-SIMPLIFICATION (DC10 / FX = Slice 5): transaction-currency minor,
                 // not USD-eq. Single-currency until the FX slice lands; mirrors the
                 // refund gate's comment.
-                amount_usd_eq_minor: Some(req.amount_minor),
+                amount: Some(req.amount.clone()),
                 effective_at: None,
                 has_outstanding_balance: false,
             };
@@ -379,6 +379,8 @@ impl DebitNoteHandler {
                 source_invoice_id: req.origin_invoice_id.clone(),
                 schedules,
                 idempotency: IdempotencyGate::new(),
+                recognition_repo: Arc::clone(&self.recognition),
+                max_segments_per_schedule: self.recognition_config.max_segments_per_schedule,
                 // A debit note EXTENDS the live schedule for its key — discriminate
                 // its SCHEDULE_BUILD claim by the note id so it does not replay (and
                 // skip) the base build.
@@ -388,14 +390,14 @@ impl DebitNoteHandler {
         let sidecar: Arc<dyn PostSidecar> = Arc::new(DebitNotePostSidecar {
             tenant_id: req.tenant_id,
             origin_invoice_id: req.origin_invoice_id.clone(),
-            currency: req.currency.clone(),
             posted_ar_incl_tax,
-            debit_note_amount_minor: req.amount_minor,
+            debit_note_amount: req.amount.clone(),
             // The event payload's identity + recognized/deferred split parts (the
             // posted entry id is filled in-txn from `PostedFacts`).
             debit_note_id: req.debit_note_id.clone(),
-            recognized_part_minor: plan.recognized_part_minor,
-            deferred_part_minor: plan.deferred_part_minor,
+            recognized_part: plan.recognized_part.clone(),
+            deferred_part: plan.deferred_part.clone(),
+            adjustment: self.adjustment.clone(),
             // Published in-txn (transactional outbox) so the event commits
             // atomically with the entry + counters, or rolls back with them.
             publisher: Arc::clone(&self.publisher),
@@ -405,10 +407,9 @@ impl DebitNoteHandler {
                 tenant_id: req.tenant_id,
                 debit_note_id: req.debit_note_id.clone(),
                 origin_invoice_id: req.origin_invoice_id.clone(),
-                currency: req.currency.clone(),
-                amount_minor: req.amount_minor,
-                recognized_part_minor: plan.recognized_part_minor,
-                deferred_part_minor: plan.deferred_part_minor,
+                amount: req.amount.clone(),
+                recognized_part: plan.recognized_part.clone(),
+                deferred_part: plan.deferred_part.clone(),
                 created_at_utc: OffsetDateTime::now_utc(),
             },
         });
@@ -445,7 +446,7 @@ impl DebitNoteHandler {
     ) -> Result<Vec<PlannedScheduleMaterialization>, DomainError> {
         // Fully-recognized note ⇒ no schedule (validate_shape already guaranteed a
         // deferring note carries a spec; a non-deferring note ignores any spec).
-        if req.deferred_minor == 0 {
+        if req.deferred.amount().is_zero() {
             return Ok(Vec::new());
         }
         let Some(input) = &req.recognition else {
@@ -461,22 +462,21 @@ impl DebitNoteHandler {
         let vc = DefaultVcResolver;
         let builder = ScheduleBuilder::new(&policy, &ssp, &vc, &self.recognition_config);
 
-        let ex_tax = req.amount_minor_ex_tax();
+        let ex_tax = req.amount_ex_tax()?;
         let period_id = current_period_id();
         let ctx = RecognitionContext {
             input,
             invoice_period_id: &period_id,
             // Only the DEFERRED part defers — the recognized part books to REVENUE
-            // now. The builder lays `item_amount_minor_ex_tax` out across the
-            // schedule segments, so pass the note's `deferred_minor` (clamped), NOT
-            // the whole ex-tax amount, else the schedule over-defers (total_deferred
-            // would be the full ex-tax, not the deferred split). Matches the CL leg
-            // `build_debit_note_legs` books (it defers the same clamped amount).
-            item_amount_minor_ex_tax: req.deferred_minor.clamp(0, ex_tax),
+            // now. The builder lays `item_amount_ex_tax` out across the schedule
+            // segments, so pass the note's `deferred` part, NOT the whole ex-tax
+            // amount, else the schedule over-defers. `validate_shape` already bounds
+            // `0 <= deferred <= ex_tax` (no clamp, no implicit rescale). Matches the
+            // CL leg `build_debit_note_legs` books (it defers the same amount).
+            item_amount_ex_tax: &req.deferred,
             // A debit note is a single charge line; its own ex-tax is the
             // R4-materiality denominator (no surrounding invoice total here).
-            invoice_total_minor: ex_tax,
-            currency: &req.currency,
+            invoice_total: &ex_tax,
             revenue_stream: &req.revenue_stream,
         };
         match builder.derive(&ctx)? {
@@ -487,7 +487,8 @@ impl DebitNoteHandler {
                 Err(DomainError::RecognitionPolicyConflict(format!(
                     "debit note requests a deferred part ({}) but its recognition policy `{}` \
                      resolves point-in-time",
-                    req.deferred_minor, input.policy_ref
+                    req.deferred.amount(),
+                    input.policy_ref
                 )))
             }
             ScheduleOutcome::Schedule(schedule) => {
@@ -524,11 +525,16 @@ impl DebitNoteHandler {
         &self,
         scope: &AccessScope,
         req: &DebitNoteRequest,
-    ) -> Result<i64, DomainError> {
+    ) -> Result<PostedMoney, DomainError> {
         self.adjustment
-            .read_posted_ar_incl_tax_out_of_txn(scope, req.tenant_id, &req.origin_invoice_id)
+            .read_posted_ar_incl_tax_out_of_txn(
+                scope,
+                req.tenant_id,
+                &req.origin_invoice_id,
+                req.amount.currency(),
+            )
             .await
-            .map_err(|e| DomainError::Internal(format!("read posted AR: {e}")))
+            .map_err(|e| crate::infra::adjustment::map_adjustment_repo_err("read posted AR", e))
     }
 
     /// Resolve each planned leg's chart `account_id` + currency scale and assemble
@@ -545,11 +551,6 @@ impl DebitNoteHandler {
         plan: &DebitNoteLegPlan,
     ) -> Result<(NewEntry, Vec<NewLine>), DomainError> {
         let chart = load_chart(&self.reference, scope, req.tenant_id).await?;
-        let scale = self
-            .resolver
-            .resolve(scope, req.tenant_id, &req.currency)
-            .await
-            .map_err(|e| DomainError::Internal(format!("currency scale resolve: {e}")))?;
 
         let eff_date = to_naive_date(OffsetDateTime::now_utc());
         let period_id = format!("{:04}{:02}", eff_date.year(), eff_date.month());
@@ -559,7 +560,7 @@ impl DebitNoteHandler {
             let account_id = chart
                 .resolve(
                     leg.account_class,
-                    &req.currency,
+                    req.amount.currency().code(),
                     leg.revenue_stream.as_deref(),
                 )
                 .ok_or_else(|| {
@@ -567,10 +568,10 @@ impl DebitNoteHandler {
                         "no provisioned account for class {} / stream {:?} / currency {}",
                         leg.account_class.as_str(),
                         leg.revenue_stream,
-                        req.currency
+                        req.amount.currency().code()
                     ))
                 })?;
-            lines.push(Self::mk_line(req, leg, account_id, scale));
+            lines.push(Self::mk_line(req, leg, account_id));
         }
 
         let entry = NewEntry {
@@ -579,7 +580,7 @@ impl DebitNoteHandler {
             // v1: one legal entity per tenant — derived server-side.
             legal_entity_id: req.tenant_id,
             period_id,
-            entry_currency: req.currency.clone(),
+            entry_currency: req.amount.currency().code().to_owned(),
             source_doc_type: SourceDocType::DebitNote,
             // The engine's `(tenant, DEBIT_NOTE, debit_note_id)` idempotency key.
             source_business_id: req.debit_note_id.clone(),
@@ -601,7 +602,7 @@ impl DebitNoteHandler {
     /// [`NewLine`]. The DR `AR` carries `payer_tenant_id` + `invoice_id` (its cache
     /// grain keys on them); the per-stream `REVENUE` / `CONTRACT_LIABILITY` legs
     /// carry their `revenue_stream` (the per-stream account + the DB CHECK need it).
-    fn mk_line(req: &DebitNoteRequest, leg: &PlannedLeg, account_id: Uuid, scale: u8) -> NewLine {
+    fn mk_line(req: &DebitNoteRequest, leg: &PlannedLeg, account_id: Uuid) -> NewLine {
         NewLine {
             line_id: Uuid::now_v7(),
             payer_tenant_id: req.payer_tenant_id,
@@ -611,15 +612,12 @@ impl DebitNoteHandler {
             account_class: leg.account_class,
             gl_code: None,
             side: leg.side,
-            amount_minor: leg.amount_minor,
-            currency: req.currency.clone(),
-            currency_scale: scale,
+            money: leg.amount.clone(),
             invoice_id: Some(req.origin_invoice_id.clone()),
             due_date: None,
             revenue_stream: leg.revenue_stream.clone(),
             mapping_status: MappingStatus::Resolved,
-            functional_amount_minor: None,
-            functional_currency: None,
+            functional_money: None,
             // Tax dims (jurisdiction / filing-period / rate) carry the posted
             // TaxBreakdown evidence the leg routed: `Some` on a per-component
             // TAX_PAYABLE leg (so the projector disaggregates `tax_subbalance` per
@@ -692,19 +690,20 @@ fn current_period_id() -> String {
 pub struct DebitNotePostSidecar {
     tenant_id: Uuid,
     origin_invoice_id: String,
-    currency: String,
-    /// The posted AR incl. tax — the `invoice_exposure.original_total_minor` seed
+    /// The posted AR incl. tax — the `invoice_exposure.original_total` seed
     /// (a no-op on a re-seed; the running counters are never reset).
-    posted_ar_incl_tax: i64,
-    /// The note's incl-tax amount — the `debit_note_total_minor` raise delta +
+    posted_ar_incl_tax: PostedMoney,
+    /// The note's incl-tax amount — the `debit_note_total` raise delta +
     /// the published event's `amount_minor`.
-    debit_note_amount_minor: i64,
+    debit_note_amount: PostedMoney,
     /// The note's business id — the published event's `debit_note_id`.
     debit_note_id: String,
     /// The ex-tax recognized part — the published event's `recognized_part_minor`.
-    recognized_part_minor: i64,
+    recognized_part: PostedMoney,
     /// The ex-tax deferred part — the published event's `deferred_part_minor`.
-    deferred_part_minor: i64,
+    deferred_part: PostedMoney,
+    /// The adjustment store the exposure counters and the note row are written through.
+    adjustment: AdjustmentRepo,
     /// The event publisher: `billing.ledger.debit_note.posted` is published IN
     /// this post txn (the transactional outbox) so it commits atomically with the
     /// entry + counters, or rolls back with them. Mirrors the credit-note sidecar.
@@ -741,36 +740,55 @@ impl PostSidecar for DebitNotePostSidecar {
         //    debit_note_total_minor by the note's incl-tax amount. Raising the RHS
         //    of the headroom CHECK can never trip it (it only widens the cap), so
         //    this is a plain bump with no cap-refinement mapping.
-        AdjustmentRepo::seed_exposure_first_touch(
-            txn,
-            scope,
-            self.tenant_id,
-            &self.origin_invoice_id,
-            &self.currency,
-            self.posted_ar_incl_tax,
-        )
-        .await
-        .map_err(|e| DomainError::Internal(format!("seed invoice_exposure: {e}")))?;
-        AdjustmentRepo::add_debit_note_total(
-            txn,
-            scope,
-            self.tenant_id,
-            &self.origin_invoice_id,
-            self.debit_note_amount_minor,
-        )
-        .await
-        .map_err(|e| DomainError::Internal(format!("raise debit_note_total: {e}")))?;
+        self.adjustment
+            .seed_exposure_first_touch(
+                txn,
+                scope,
+                self.tenant_id,
+                &self.origin_invoice_id,
+                &self.posted_ar_incl_tax,
+            )
+            .await
+            .map_err(|e| {
+                crate::infra::adjustment::map_adjustment_repo_err("seed invoice_exposure", e)
+            })?;
+        self.adjustment
+            .add_debit_note_total(
+                txn,
+                scope,
+                self.tenant_id,
+                &self.origin_invoice_id,
+                &self.debit_note_amount,
+            )
+            .await
+            .map_err(|e| {
+                crate::infra::adjustment::map_adjustment_repo_err("raise debit_note_total", e)
+            })?;
 
         // 3. Persist the debit_note record row.
-        AdjustmentRepo::insert_debit_note(txn, scope, &self.debit_note_row)
+        self.adjustment
+            .insert_debit_note(txn, scope, &self.debit_note_row)
             .await
-            .map_err(|e| DomainError::Internal(format!("insert debit_note: {e}")))?;
+            .map_err(|e| crate::infra::adjustment::map_note_record_err("insert debit_note", e))?;
 
         // 4. Publish `billing.ledger.debit_note.posted` into the SAME post txn
         //    (transactional outbox): the event row commits atomically with the
         //    entry + the schedule/headroom/record writes, or a publish failure
         //    rolls the whole post back. Never on replay (a replay returns before
         //    the sidecar). Ids + amount + split parts only (no PII).
+        // The v1 payload keeps integer minor units (saturating policy); a
+        // saturation warning names the field and this debit note.
+        let (amount_minor, recognized_part_minor, deferred_part_minor) = {
+            let entity = format_args!(
+                "debit_note {} entry {} tenant {}",
+                self.debit_note_id, posted.entry_id, self.tenant_id
+            );
+            (
+                v1_minor_units_for(&self.debit_note_amount, "amount_minor", &entity),
+                v1_minor_units_for(&self.recognized_part, "recognized_part_minor", &entity),
+                v1_minor_units_for(&self.deferred_part, "deferred_part_minor", &entity),
+            )
+        };
         self.publisher
             .publish_debit_note_posted(
                 &self.ctx,
@@ -780,10 +798,10 @@ impl PostSidecar for DebitNotePostSidecar {
                     debit_note_id: self.debit_note_id.clone(),
                     origin_invoice_id: self.origin_invoice_id.clone(),
                     entry_id: posted.entry_id,
-                    currency: self.currency.clone(),
-                    amount_minor: self.debit_note_amount_minor,
-                    recognized_part_minor: self.recognized_part_minor,
-                    deferred_part_minor: self.deferred_part_minor,
+                    currency: self.debit_note_amount.currency().code().to_owned(),
+                    amount_minor,
+                    recognized_part_minor,
+                    deferred_part_minor,
                     posted_at_utc: OffsetDateTime::now_utc(),
                 },
             )

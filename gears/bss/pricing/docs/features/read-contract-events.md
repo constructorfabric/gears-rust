@@ -110,7 +110,7 @@ Not built (D-415): the owner dropped quote and the Studio wiring; consumers read
 1. [ ] - `p1` - Split the period at every price boundary inside the bound chain, including a temporary end. - `inst-read-contract-events-period-slices-and-quote-1`
 2. [ ] - `p1` - Prorate recurring slices by calendar days; rate usage by reading timestamp with tier counters per slice. - `inst-read-contract-events-period-slices-and-quote-2`
 3. [ ] - `p1` - Aggregate per price/subscription/period (no plan carries an included quantity to deduct since D-467) and apply the coverage-prorated min_fee once per price; not built in pricing, Rating applies the floor (D-415). - `inst-read-contract-events-period-slices-and-quote-3`
-4. [ ] - `p1` - Apply period-start promotion after floors, then the bound rounding/currency policy; quote returns totals while resolve never does; quote is not built (D-415). - `inst-read-contract-events-period-slices-and-quote-4`
+4. [ ] - `p1` - Apply period-start promotion after floors, then HALF_EVEN rounding at the bound price's currency scale (D-533, D-535); quote returns totals while resolve never does; quote is not built (D-415). - `inst-read-contract-events-period-slices-and-quote-4`
 
 ### typed-events
 
@@ -153,7 +153,7 @@ Requirement: `cpt-cf-bss-pricing-fr-resolve`; PRD AC #18.
 
 - [x] `p1` - **ID**: `cpt-cf-bss-pricing-dod-binding-sku-version`
 
-Binding reads versions?as_of at period start, not the latest mutable SKU, as pricing's system actor on both REST resolve and `PricingReadV1::resolve` after the caller passed plan read (D-424). Preserve version, unit/meter, descriptors, timing, rounding and currency scale in replay inputs (spec §2.2, §7.1). An SDK binding that cannot supply a commercial input is `INCOMPLETE_COMMERCIAL_INPUTS` on that field (D-501). REST keeps the descriptor nullable.
+Binding reads versions?as_of at period start, not the latest mutable SKU, as pricing's system actor on both REST resolve and `PricingReadV1::resolve` after the caller passed plan read (D-424). Preserve version, unit/meter, descriptors, timing and the price's stored currency spec in replay inputs (D-531) (spec §2.2, §7.1). An SDK binding that cannot supply a commercial input is `INCOMPLETE_COMMERCIAL_INPUTS` on that field (D-501). REST keeps the descriptor nullable.
 
 Requirement: `cpt-cf-bss-pricing-fr-resolve`; PRD AC #18.
 
@@ -161,7 +161,7 @@ Requirement: `cpt-cf-bss-pricing-fr-resolve`; PRD AC #18.
 
 - [x] `p1` - **ID**: `cpt-cf-bss-pricing-dod-price-read-forever`
 
-The public price-id read serves original approved money after closure, supersession or keep_for_bound. A cancelled price is served with its money as approved and says so: `status: cancelled` on REST, `state` `Cancelled` in the SDK (D-520). Tenant scope remains enforced and no retention deletes a pinned fact (spec §7.1).
+The public price-id read serves original approved money after closure, supersession or keep_for_bound, with the price's stored currency and currency_scale; a later change of the currency table changes neither (D-531). A cancelled price is served with its money as approved and says so: `status: cancelled` on REST, `state` `Cancelled` in the SDK (D-520). Tenant scope remains enforced and no retention deletes a pinned fact (spec §7.1).
 
 Requirement: `cpt-cf-bss-pricing-fr-price-read`; PRD AC #19.
 

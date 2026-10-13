@@ -58,7 +58,7 @@ async fn strings(db: &sea_orm::DatabaseConnection, sql: &str) -> Vec<String> {
 fn seed() -> Vec<String> {
     let price = |id, entry, version, from, state| {
         format!(
-            "INSERT INTO pricing_price (id,tenant_id,price_book_entry_id,version_no,price_json,eligibility,effective_from,state,created_by,version,created_at,updated_at) VALUES ({},{},{},{version},'{{}}','all','{from}','{state}',{},1,'2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
+            "INSERT INTO pricing_price (id,tenant_id,price_book_entry_id,version_no,price_json,currency,currency_scale,eligibility,effective_from,state,created_by,version,created_at,updated_at) VALUES ({},{},{},{version},'{{}}','EUR',2,'all','{from}','{state}',{},1,'2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
             x(id),
             x(TENANT),
             x(entry),
@@ -135,6 +135,16 @@ async fn columns(db: &sea_orm::DatabaseConnection) -> Vec<String> {
     .await
 }
 
+/// Each price's currency spec, `code:scale`, by version number.
+async fn specs(db: &sea_orm::DatabaseConnection) -> Vec<String> {
+    strings(
+        db,
+        "SELECT currency || ':' || CAST(currency_scale AS TEXT) AS v FROM pricing_price \
+         ORDER BY version_no",
+    )
+    .await
+}
+
 #[tokio::test]
 async fn sqlite_rebuilds_the_price_keeps_the_chain_and_round_trips() {
     let db = Database::connect("sqlite::memory:").await.unwrap();
@@ -151,6 +161,7 @@ async fn sqlite_rebuilds_the_price_keeps_the_chain_and_round_trips() {
     for name in ["change_kind", "target_price_id", "cancelled_by_unit_id"] {
         assert!(cols.iter().any(|c| c == name), "{cols:?}");
     }
+    assert_eq!(specs(&db).await, ["EUR:2"; 4], "each price keeps its spec");
     // The rebuild keeps both indexes; only the approved start narrows to the `set` rows.
     let narrowed: Vec<String> = indexes
         .iter()
@@ -266,7 +277,7 @@ async fn sqlite_rebuilds_the_price_keeps_the_chain_and_round_trips() {
     exec(
         &db,
         &format!(
-            "INSERT INTO pricing_price (id,tenant_id,price_book_entry_id,version_no,price_json,eligibility,effective_from,effective_to,state,change_kind,target_price_id,created_by,version,created_at,updated_at) VALUES ({},{},{},5,'{{}}','all','2026-01-01','2026-02-01','approved','end',{},{},1,'2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
+            "INSERT INTO pricing_price (id,tenant_id,price_book_entry_id,version_no,price_json,currency,currency_scale,eligibility,effective_from,effective_to,state,change_kind,target_price_id,created_by,version,created_at,updated_at) VALUES ({},{},{},5,'{{}}','EUR',2,'all','2026-01-01','2026-02-01','approved','end',{},{},1,'2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
             x(CHANGE),
             x(TENANT),
             x(ENTRY),
@@ -319,6 +330,7 @@ async fn sqlite_rebuilds_the_price_keeps_the_chain_and_round_trips() {
     )
     .await;
     assert_eq!(plain, ["draft 2026-01-01"]);
+    assert_eq!(specs(&db).await, ["EUR:2"; 5], "down keeps each spec");
     let cancelled = try_exec(
         &db,
         &format!(

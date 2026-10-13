@@ -502,18 +502,20 @@ fn chain_price(p: &entity::price::Model) -> Result<crate::domain::price::ChainPr
 /// rejected price): the price in force — started on or before the day and not ended, chosen as
 /// resolve chooses a price in force (the latest start, then the latest version) — and the next
 /// price (`domain::price::next_of`), each with its status on the day; an entry with neither has
-/// no key. The door maps the rows; both choices are the domain's. The caller has judged whose
-/// money it may show: every entry given is shown.
+/// no key. Each entry comes with its book's currency, which every shown price must carry. The door
+/// maps the rows; both choices are the domain's. The caller has judged whose money it may show:
+/// every entry given is shown.
 /// # Errors
-/// Storage failures; a stored token outside its closed set is a corrupt row.
+/// Storage failures; a stored token outside its closed set, or a price outside its contract, is a
+/// corrupt row.
 pub(super) async fn headline(
     tx: &impl DBRunner,
     tenant: Uuid,
-    entries: &[&entity::price_book_entry::Model],
+    entries: &[(&entity::price_book_entry::Model, &str)],
     day: time::Date,
 ) -> Result<std::collections::BTreeMap<Uuid, Headline>, DoorError> {
     use crate::infra::storage::RepoError;
-    let ids: Vec<Uuid> = entries.iter().map(|e| e.id).collect();
+    let ids: Vec<Uuid> = entries.iter().map(|(e, _)| e.id).collect();
     let stored =
         price_repo::default_chain(tx, &AccessScope::for_tenant(tenant), tenant, &ids).await?;
     // Each entry's chain by key, grouped once: linear in the book, not entries x prices (PS-38).
@@ -523,20 +525,23 @@ pub(super) async fn headline(
         chains.entry(p.price_book_entry_id).or_default().push(p);
     }
     let mut out = std::collections::BTreeMap::new();
-    for e in entries {
+    for &(e, currency) in entries {
         let model = price_book_entry_repo::model_of(e)?;
         let chain: Vec<&entity::price::Model> = chains.get(&e.id).cloned().unwrap_or_default();
         // Only the approved prices are decoded: they alone can be in force.
         let approved = chain
             .iter()
             .filter(|p| p.state == PriceState::Approved.as_str())
-            .map(|p| price_repo::to_domain(p, model))
+            .map(|p| price_repo::in_book(p, model, currency))
             .collect::<Result<Vec<_>, RepoError>>()?;
         let current = crate::domain::price::own_version_at(&approved, e.id, day, None)
             .and_then(|found| chain.iter().find(|p| p.id == found.id));
         let shown = |p: Option<&&entity::price::Model>| {
-            p.map(|p| super::dto::PricingPriceDto::at((*p).clone(), &e.model, day))
-                .transpose()
+            p.map(|p| {
+                let price = price_repo::in_book(p, model, currency)?;
+                super::dto::PricingPriceDto::at((*p).clone(), &price, day)
+            })
+            .transpose()
         };
         let views = chain
             .iter()
@@ -554,38 +559,41 @@ pub(super) async fn headline(
     }
     Ok(out)
 }
-/// Whether the caller's `price_book` read — `books`, or `None` without that grant — admits the
-/// tenant's `book`: the money's second judgement (D-434), ONE read.
+/// The tenant's `book` when the caller's `price_book` read — `books`, or `None` without that
+/// grant — admits it: the money's second judgement (D-434), ONE read. `None` when the money is not
+/// shown.
 /// # Errors
 /// Storage failures.
-pub(super) async fn shows_money(
+pub(super) async fn money_book(
     tx: &impl DBRunner,
     books: Option<&AccessScope>,
     tenant: Uuid,
     book: Uuid,
-) -> Result<bool, DoorError> {
+) -> Result<Option<entity::price_book::Model>, DoorError> {
     Ok(match books {
-        Some(books) => book_repo::find(tx, books, tenant, book).await?.is_some(),
-        None => false,
+        Some(books) => book_repo::find(tx, books, tenant, book).await?,
+        None => None,
     })
 }
 /// `GET /price-book-entries/{id}` and each item of `GET /price-books/{id}/entries` (D-428,
-/// D-440, D-472): the entries with their usage and, when `shown`, their price in force and their
-/// next price — all dated on `day`, today or the list's `as_of` (D-473), in a fixed number of
-/// statements whatever their number.
+/// D-440, D-472): the entries with their usage and, when `shown` (the currency of the entries'
+/// book, given when their money is shown), their price in force and their next price — all dated
+/// on `day`, today or the list's `as_of` (D-473), in a fixed number of statements whatever their
+/// number.
 /// # Errors
 /// Storage failures; a stored token outside its closed set is a corrupt row.
 pub(super) async fn read(
     tx: &impl DBRunner,
     tenant: Uuid,
     entries: Vec<entity::price_book_entry::Model>,
-    shown: bool,
+    shown: Option<&str>,
     day: time::Date,
 ) -> Result<Vec<super::dto::PricingPriceBookEntryReadDto>, DoorError> {
     let ids: Vec<Uuid> = entries.iter().map(|m| m.id).collect();
     let mut usage = crate::infra::usage::entry_usage(tx, tenant, &ids, day).await?;
-    let mut headlines = if shown {
-        headline(tx, tenant, &entries.iter().collect::<Vec<_>>(), day).await?
+    let mut headlines = if let Some(currency) = shown {
+        let shown: Vec<_> = entries.iter().map(|e| (e, currency)).collect();
+        headline(tx, tenant, &shown, day).await?
     } else {
         std::collections::BTreeMap::new()
     };
@@ -628,13 +636,14 @@ pub(super) async fn prices(
     today: time::Date,
 ) -> Result<super::dto::PricingEntryPriceList, DoorError> {
     let entry = find(tx, scope, tenant, id).await?;
-    if !shows_money(tx, books, tenant, entry.book_id).await? {
+    let Some(book) = money_book(tx, books, tenant, entry.book_id).await? else {
         return Err(support::forbidden_because(
             "PRICE_BOOK_READ_REQUIRED",
             "an entry's prices are money: reading them takes price_book read on its book",
         )
         .into());
-    }
+    };
+    let model = price_book_entry_repo::model_of(&entry)?;
     let mut rows = price_repo::for_entry(tx, &AccessScope::for_tenant(tenant), tenant, id).await?;
     rows.sort_by(|a, b| {
         (&a.dim_value, a.effective_from, a.version_no, a.id).cmp(&(
@@ -646,7 +655,10 @@ pub(super) async fn prices(
     });
     let mut items = Vec::with_capacity(rows.len());
     for row in rows {
-        let price = super::dto::PricingPriceDto::at(row, &entry.model, today)?;
+        // Read as every read of a stored price reads it: a price in another currency than its
+        // book's is a corrupt row, never listed.
+        let decoded = price_repo::in_book(&row, model, &book.currency)?;
+        let price = super::dto::PricingPriceDto::at(row, &decoded, today)?;
         if wanted.is_none_or(|w| w.contains(&price.status)) {
             items.push(price);
         }
@@ -726,14 +738,14 @@ async fn present(
     let mut usage = crate::infra::usage::entry_usage(tx, tenant, &ids, today).await?;
     // The money: only the entries whose book the caller's price_book read admits.
     let mut headlines = if let Some(books) = books {
-        let readable: BTreeSet<Uuid> = book_repo::find_many(tx, books, tenant, &book_ids)
+        let readable: BTreeMap<Uuid, String> = book_repo::find_many(tx, books, tenant, &book_ids)
             .await?
             .into_iter()
-            .map(|b| b.id)
+            .map(|b| (b.id, b.currency))
             .collect();
-        let shown: Vec<&entity::price_book_entry::Model> = entries
+        let shown: Vec<(&entity::price_book_entry::Model, &str)> = entries
             .iter()
-            .filter(|e| readable.contains(&e.book_id))
+            .filter_map(|e| readable.get(&e.book_id).map(|c| (e, c.as_str())))
             .collect();
         headline(tx, tenant, &shown, today).await?
     } else {

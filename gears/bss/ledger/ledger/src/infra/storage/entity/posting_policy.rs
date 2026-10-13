@@ -1,5 +1,5 @@
 //! `SeaORM` entity for `bss.ledger_tenant_posting_policy` — per-tenant,
-//! append-only effective-dated invoice-posting policy versions (VHP-1853): the
+//! append-only effective-dated invoice-posting policy versions: the
 //! missing-mapping mode (`SUSPENSE` | `HARD_BLOCK`) and the AR-aging bucket
 //! thresholds (CSV upper-bounds). The orchestrator / aging read picks the row in
 //! effect at decision time (latest `effective_from <= now`, highest `version` on

@@ -21,7 +21,8 @@ pub struct Model {
     pub run_id: Uuid,
     pub period_id: String,
     pub check_type: String,
-    pub variance_minor: i64,
+    /// Tagged count or currency-qualified money variance (Task 9 contract).
+    pub variance: JsonValue,
     pub within_tolerance: bool,
     pub status: String,
     pub watermark: Option<i64>,

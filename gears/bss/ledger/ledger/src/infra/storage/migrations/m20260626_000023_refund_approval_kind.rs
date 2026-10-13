@@ -1,5 +1,5 @@
 //! Forward-fix: add `REFUND` to the dual-control `ledger_approval.kind` CHECK
-//! (Slice 3 Group D, VHP-1856) on clusters where `m20260624_000012` was ALREADY
+//! (Slice 3) on clusters where `m20260624_000012` was ALREADY
 //! applied with its original kind set.
 //!
 //! `m20260624_000012` was amended in place to add `REFUND` to the

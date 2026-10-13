@@ -14,6 +14,12 @@ use toolkit_macros::domain_model;
 #[domain_model]
 #[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
 pub enum DomainError {
+    /// The whole operation must be rebuilt from a fresh transaction snapshot.
+    #[error("concurrent ledger modification: {0}")]
+    ConcurrentModification(String),
+    /// Caller money is not on its currency posting grid.
+    #[error("invalid posting increment: {0}")]
+    InvalidPostingIncrement(String),
     // ── InvalidArgument (bad request shape / value) ──
     #[error("entry does not net to zero per currency: {0}")]
     Unbalanced(String),

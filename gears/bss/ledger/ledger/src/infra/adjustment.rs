@@ -45,4 +45,48 @@
 pub mod credit_note_service;
 pub mod debit_note_service;
 pub mod manual_adjustment_service;
+mod refund_errors;
 pub mod refund_service;
+
+/// Map a repository failure inside an adjustment flow through the one
+/// `RepoError` table ([`repo_to_domain`](crate::infra::posting::error_transport::repo_to_domain)):
+/// a lost version race or classified contention becomes `ConcurrentModification`,
+/// which the posting retry loop retries; a caller money mismatch (currency or
+/// scale against the stored invoice) is the client's error; anything else keeps
+/// its category. `context` prefixes the diagnostic of an internal fault or a
+/// conflict. A flow mapper handles only its own arms and falls through to this.
+pub(crate) fn map_adjustment_repo_err(
+    context: &str,
+    error: crate::domain::model::RepoError,
+) -> crate::domain::error::DomainError {
+    use crate::domain::error::DomainError;
+    match crate::infra::posting::error_transport::repo_to_domain(error) {
+        DomainError::Internal(detail) => DomainError::Internal(format!("{context}: {detail}")),
+        DomainError::ConcurrentModification(detail) => {
+            DomainError::ConcurrentModification(format!("{context}: {detail}"))
+        }
+        other => other,
+    }
+}
+
+/// Map a repository failure while persisting a note row whose amounts the
+/// ledger computed (the credit / debit note record: its split parts come from
+/// the leg plan, already checked against the note before the post). Only a lost
+/// race retries (`ConcurrentModification`); every other failure, a money
+/// mismatch included, is an invariant breach the caller cannot act on, so it is
+/// internal, never a client `CURRENCY_MISMATCH`.
+pub(crate) fn map_note_record_err(
+    context: &str,
+    error: crate::domain::model::RepoError,
+) -> crate::domain::error::DomainError {
+    use crate::domain::error::DomainError;
+    use crate::domain::model::RepoError;
+    match error {
+        RepoError::Conflict(m) => DomainError::ConcurrentModification(format!("{context}: {m}")),
+        other => DomainError::Internal(format!("{context}: {other}")),
+    }
+}
+
+#[cfg(test)]
+#[path = "adjustment_tests.rs"]
+mod tests;

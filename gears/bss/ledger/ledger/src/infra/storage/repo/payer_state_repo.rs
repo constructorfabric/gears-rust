@@ -1,5 +1,5 @@
 //! `PayerStateRepo` — the payer lifecycle row (`bss.ledger_payer_state`) plus the
-//! closure balance check (VHP-1852 Phase 2). Absence of a row means OPEN; closure
+//! closure balance check. Absence of a row means OPEN; closure
 //! upserts the row to `CLOSED` with the approver + the closed-with-open-balance
 //! marker. The outstanding-balance check reads the per-payer AR cache
 //! (`ledger_ar_payer_balance`); a non-zero grain means closing strands a balance,
@@ -83,7 +83,9 @@ impl PayerStateRepo {
                 Condition::all()
                     .add(ar_payer_balance::Column::TenantId.eq(tenant))
                     .add(ar_payer_balance::Column::PayerTenantId.eq(payer_tenant_id))
-                    .add(ar_payer_balance::Column::BalanceMinor.ne(0)),
+                    // Canonical decimal text: a zero balance is exactly `"0"`, so a
+                    // text inequality is an exact non-zero test (no numeric cast).
+                    .add(ar_payer_balance::Column::Balance.ne("0")),
             )
             .one(&conn)
             .await
@@ -146,3 +148,7 @@ impl PayerStateRepo {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "payer_state_repo_balance_tests.rs"]
+mod balance_tests;

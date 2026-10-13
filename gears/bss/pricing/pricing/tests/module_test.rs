@@ -580,6 +580,111 @@ async fn startup_validates_versioned_hold_policy_before_registering_providers() 
     );
 }
 
+/// The deployment's table of non-ISO currency scales is judged at startup: a bad entry stops the
+/// gear before it registers anything, with the code `CURRENCY_SCALES_INVALID` and naming the entry
+/// and why, a good one starts it, and no table is an empty one.
+#[tokio::test]
+async fn startup_validates_the_currency_scale_table_before_registering_providers() {
+    for (table, cause) in [
+        (serde_json::json!({"EUR":3}), "key EUR is an ISO 4217 code"),
+        (
+            serde_json::json!({"USDC":6}),
+            "key \"USDC\" is not a currency code",
+        ),
+        (
+            serde_json::json!({"xts":2}),
+            "key \"xts\" is not a currency code",
+        ),
+        (serde_json::json!({"XTS":29}), "key XTS has scale 29"),
+        (
+            serde_json::json!({"XTS":2,"JPY":0}),
+            "key JPY is an ISO 4217 code",
+        ),
+    ] {
+        let result =
+            rest_support::Harness::with_config(serde_json::json!({"currency_scales":table})).await;
+        let Err(error) = result else {
+            panic!("a bad currency scale table must not start the gear");
+        };
+        let text = format!("{error:#}");
+        assert!(
+            text.contains("invalid currency_scales (CURRENCY_SCALES_INVALID)"),
+            "the refusal names the table and its stable code"
+        );
+        assert!(text.contains(cause), "the refusal names the entry and why");
+    }
+    rest_support::Harness::with_config(serde_json::json!({"currency_scales":{"XTS":2,"QQQ":8}}))
+        .await
+        .unwrap();
+    let config: bss_pricing::config::BssPricingConfig =
+        serde_json::from_value(serde_json::json!({})).unwrap();
+    assert!(config.currency_scales.is_empty(), "empty by default");
+}
+
+/// The configured table reaches the doors through the gear's own wiring: a book in `XTS`, a code
+/// only the deployment's table knows, is created when the table lists it and refused when it does
+/// not.
+#[tokio::test]
+async fn the_configured_currency_table_reaches_the_doors() {
+    use tower::ServiceExt;
+    let tenant = uuid::Uuid::new_v4();
+    let author = toolkit_security::SecurityContext::builder()
+        .subject_id(uuid::Uuid::new_v4())
+        .subject_tenant_id(tenant)
+        .subject_type("user")
+        .build()
+        .unwrap();
+    for (table, status) in [
+        (serde_json::json!({"XTS": 2}), 201),
+        (serde_json::json!({}), 400),
+    ] {
+        let harness = rest_support::Harness::with_pdp(
+            serde_json::json!({"currency_scales": table}),
+            Some(std::sync::Arc::new(rest_support::AllowingResolver {
+                tenant,
+            })),
+        )
+        .await
+        .unwrap();
+        let (router, _) = harness.router(axum::Router::new()).unwrap();
+        let response = router
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/bss-pricing/v1/price-books")
+                    .extension(author.clone())
+                    .header("content-type", "application/json")
+                    .header("idempotency-key", "xts-book")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({"code":"xts","name":"XTS","currency":"XTS"}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status().as_u16(),
+            status,
+            "the door reads the table the gear was configured with"
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        if status == 201 {
+            assert_eq!(
+                body["currency"], "XTS",
+                "the book takes the configured code"
+            );
+        } else {
+            assert_eq!(
+                body["context"]["field_violations"][0]["reason"], "BOOK_CURRENCY_INVALID",
+                "without the table the code is unknown"
+            );
+        }
+    }
+}
+
 #[test]
 fn resource_and_action_census_is_exact() {
     assert_eq!(

@@ -37,7 +37,7 @@ pub fn encode_acceptance(receipt: &AcceptanceReceipt) -> Result<String, RepoErro
 /// Unsupported receipt/BillingTerms versions, duplicate/unknown fields or invalid scalars.
 pub fn decode_acceptance(raw: &str) -> Result<AcceptanceReceipt, RepoError> {
     let AcceptanceWire::V1 { receipt } = serde_json::from_str(raw).map_err(invalid)?;
-    let receipt: AcceptanceReceipt = receipt.into();
+    let receipt: AcceptanceReceipt = receipt.try_into().map_err(invalid)?;
     if receipt.query.billing_terms.schema_version != 1 {
         return Err(invalid("unsupported BillingTerms schema"));
     }
@@ -57,7 +57,7 @@ pub fn encode_hold(receipt: &HeldBindings) -> Result<String, RepoError> {
 /// Unsupported schema, duplicate/unknown fields or invalid exact scalar.
 pub fn decode_hold(raw: &str) -> Result<HeldBindings, RepoError> {
     let HoldWire::V1 { receipt } = serde_json::from_str(raw).map_err(invalid)?;
-    Ok(receipt.into())
+    receipt.try_into().map_err(invalid)
 }
 /// Lossless UTC nanosecond relational timestamp, identical on both backends.
 /// # Errors

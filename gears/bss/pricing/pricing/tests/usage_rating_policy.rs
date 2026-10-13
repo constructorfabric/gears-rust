@@ -514,42 +514,40 @@ async fn legacy_published_usage_upgrades_without_inventing_policy_and_keeps_reso
     run_migrations_for_testing(&db, prior).await.unwrap();
     let catalog = Arc::new(Catalog::default());
     let sku = catalog.sku(SkuType::Usage);
-    let f = Fixture::on(
-        toolkit_db::DBProvider::new(db),
-        Uuid::new_v4(),
-        dsn,
-        catalog,
-    )
-    .await;
-    let tenant = f.ctx.subject_tenant_id();
+    // Seed the legacy rows and finish the chain before the fixture starts its outbox
+    // pipeline: a lease write racing a migration's read-to-write upgrade fails at once
+    // with `database is locked`, whatever the busy timeout.
+    let tenant = Uuid::new_v4();
+    let author = Uuid::new_v4();
     let book_id = Uuid::new_v4();
     let plan_id = Uuid::new_v4();
     let revision = Uuid::new_v4();
     let entry = Uuid::new_v4();
     let price = Uuid::new_v4();
     let now = time::OffsetDateTime::now_utc();
-    let raw = Database::connect(&f.dsn).await.unwrap();
+    let raw = Database::connect(&dsn).await.unwrap();
     raw.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
         "INSERT INTO pricing_price_book (id,tenant_id,code,name,currency,version,created_at,updated_at) VALUES (?,?,?,?,?,1,?,?)",
         vec![book_id.into(),tenant.into(),"LEGACY".into(),"Legacy".into(),"EUR".into(),now.into(),now.into()])).await.unwrap();
     raw.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
         "INSERT INTO pricing_plan (id,tenant_id,code,name,published_rev,version,created_by,created_at,updated_at) VALUES (?,?,?,?,1,1,?,?,?)",
-        vec![plan_id.into(),tenant.into(),"LEGACY".into(),"Legacy".into(),f.ctx.subject_id().into(),now.into(),now.into()])).await.unwrap();
+        vec![plan_id.into(),tenant.into(),"LEGACY".into(),"Legacy".into(),author.into(),now.into(),now.into()])).await.unwrap();
     raw.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
         "INSERT INTO pricing_plan_revision (id,tenant_id,plan_id,rev_no,book_id,state,version,created_by,created_at,updated_at) VALUES (?,?,?,1,?,'published',1,?,?,?)",
-        vec![revision.into(),tenant.into(),plan_id.into(),book_id.into(),f.ctx.subject_id().into(),now.into(),now.into()])).await.unwrap();
+        vec![revision.into(),tenant.into(),plan_id.into(),book_id.into(),author.into(),now.into(),now.into()])).await.unwrap();
     raw.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
         "INSERT INTO pricing_price_book_entry (id,tenant_id,book_id,sku_id,charge_kind,model,reservation_id,reference_state,version,created_at,updated_at) VALUES (?,?,?,?,'usage','per_unit',?,'confirmed',1,?,?)",
         vec![entry.into(),tenant.into(),book_id.into(),sku.into(),Uuid::new_v4().into(),now.into(),now.into()])).await.unwrap();
     raw.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
         "INSERT INTO pricing_plan_item (id,tenant_id,revision_id,sku_id,price_book_entry_id,treatment,reservation_id,reference_state,version,created_by,created_at,updated_at) VALUES (?,?,?,?,?,'paid',?,'confirmed',1,?,?,?)",
-        vec![Uuid::new_v4().into(),tenant.into(),revision.into(),sku.into(),entry.into(),Uuid::new_v4().into(),f.ctx.subject_id().into(),now.into(),now.into()])).await.unwrap();
+        vec![Uuid::new_v4().into(),tenant.into(),revision.into(),sku.into(),entry.into(),Uuid::new_v4().into(),author.into(),now.into(),now.into()])).await.unwrap();
     raw.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-        "INSERT INTO pricing_price (id,tenant_id,price_book_entry_id,version_no,price_json,eligibility,effective_from,state,created_by,version,created_at,updated_at) VALUES (?,?,?,1,?,'all','2026-09-01','approved',?,1,?,?)",
-        vec![price.into(),tenant.into(),entry.into(),json!({"rate":"1"}).to_string().into(),f.ctx.subject_id().into(),now.into(),now.into()])).await.unwrap();
-    run_migrations_for_testing(&f.db.db(), BssPricingGear::default().migrations())
+        "INSERT INTO pricing_price (id,tenant_id,price_book_entry_id,version_no,price_json,currency,currency_scale,eligibility,effective_from,state,created_by,version,created_at,updated_at) VALUES (?,?,?,1,?,'EUR',2,'all','2026-09-01','approved',?,1,?,?)",
+        vec![price.into(),tenant.into(),entry.into(),json!({"rate":"1"}).to_string().into(),author.into(),now.into(),now.into()])).await.unwrap();
+    run_migrations_for_testing(&db, BssPricingGear::default().migrations())
         .await
         .unwrap();
+    let f = Fixture::on(toolkit_db::DBProvider::new(db), tenant, dsn, catalog).await;
     let stored = price_book_entry_repo::find(&f.db.conn().unwrap(), &scope(&f), tenant, entry)
         .await
         .unwrap()

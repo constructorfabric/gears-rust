@@ -419,3 +419,5 @@ Tests that add confidence without blocking delivery:
 - Zero `sleep`, `timeout`, or `tokio::time` usage in tests
 - Every domain invariant from gear acceptance criteria is covered by at least one test
 - `make all` (or `make fmt && make lint && make test`) passes with zero errors
+
+See also: [`14_db_behavior_testing.md`](14_db_behavior_testing.md) for DB behavior rules and the query-recorder and barrier tests (reusing this guide's setup), and [`TRADEOFFS.md`](../arch/database/TRADEOFFS.md) for choices such as batching versus per-row queries; concurrency correctness is out of scope here.

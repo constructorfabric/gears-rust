@@ -166,13 +166,15 @@ fn model(value: &PriceModel) -> V {
         ]),
     }
 }
-/// Financial content only: no identity, dates, closing observations or self digest.
+/// Financial content only: no identity, dates, closing observations or self digest. The currency
+/// scale is money: the minimum fee and the invoice line post at it.
 #[must_use]
 pub fn money_digest(price: &ImmutablePrice) -> Digest {
     hash_document(
         "pricing.money.v1",
         object([
-            ("currency", text(&price.currency)),
+            ("currency", text(price.currency.code())),
+            ("currency_scale", text(price.currency.scale())),
             ("model", model(&price.model)),
             ("minimum_fee", optional(price.minimum_fee, decimal)),
         ]),
@@ -238,7 +240,8 @@ fn price(p: &ImmutablePrice) -> V {
         ("price_id", text(p.price_id)),
         ("price_book_entry_id", text(p.price_book_entry_id)),
         ("money_digest", hex(&p.money_digest)),
-        ("currency", text(&p.currency)),
+        ("currency", text(p.currency.code())),
+        ("currency_scale", text(p.currency.scale())),
         ("model", model(&p.model)),
         ("minimum_fee", optional(p.minimum_fee, decimal)),
         ("effective_from", text(p.effective_from)),
@@ -266,7 +269,6 @@ fn invoice(i: &InvoiceInputs) -> V {
                 BillingTiming::Arrears => "arrears",
             }),
         ),
-        ("currency_scale", text(i.currency_scale)),
         (
             "rounding",
             text(match i.rounding {

@@ -2,7 +2,7 @@
 //! (via `#[toolkit_macros::api_dto]`) so the SDK value types
 //! (`bss_ledger_sdk::provisioning`) stay infra-free. The `api_dto` macro is
 //! the platform-mandated DTO wrapper (dylint DE0203) and fixes the wire shape
-//! to `snake_case` — the uniform vhp-core REST convention, overriding the
+//! to `snake_case` — the uniform platform REST convention, overriding the
 //! architecture doc's illustrative camelCase.
 
 use std::str::FromStr;
@@ -12,11 +12,14 @@ use toolkit::api::canonical_prelude::{CanonicalError, resource_error};
 use uuid::Uuid;
 
 use bss_ledger_sdk::{
-    AccountClass, AccountInfo, BalanceView, EntryView, FiscalCalendarSpec, Granularity, LineView,
-    ProvisionAccount, ProvisionCurrencyScale, ProvisionOutcome, ProvisionRequest, Side,
+    AccountClass, AccountInfo, BalanceView, CurrencySpec, EntryView, FiscalCalendarSpec,
+    Granularity, LineView, MoneyError, PostedMoney, ProvisionAccount, ProvisionCurrencyScale,
+    ProvisionOutcome, ProvisionRequest, Side, canonical_decimal, parse_decimal,
 };
+use rust_decimal::Decimal;
 
-use crate::domain::approval::policy::{DualControlPolicy, PolicyVersion};
+use crate::api::rest::money::MoneyDto;
+use crate::domain::approval::policy::{D2_DEFAULT_RULE, DualControlPolicy, PolicyVersion};
 use crate::domain::error::DomainError;
 use crate::domain::instant::rfc3339;
 use crate::domain::invoice::aging::AgingBucket;
@@ -35,16 +38,15 @@ pub struct AccountDto {
     pub may_go_negative: Option<bool>,
 }
 
-/// One non-ISO currency-scale row to seed.
+/// One currency-scale row to seed: a code with no ISO 4217 minor-unit scale (such as `XTS`, or a
+/// code ISO does not list), at its posting scale. A row for an ISO 4217 code with a scale may only
+/// repeat that scale; another scale refuses the whole request (400).
 #[derive(Debug, Clone)]
 #[toolkit_macros::api_dto(request)]
 pub struct CurrencyScaleDto {
     pub currency: String,
-    pub minor_units: i16,
-    /// Per-currency plausible maximum in MAJOR units; omit for the default
-    /// `10^12` (max scale 6). A higher-precision currency (e.g. BTC scale 8)
-    /// passes a smaller cap (e.g. `21_000_000`) so its scale fits `i64` headroom.
-    pub plausible_max_major: Option<i64>,
+    /// Posting scale (fractional digits) of the currency, between 0 and 28.
+    pub currency_scale: u8,
     pub source: Option<String>,
 }
 
@@ -63,7 +65,7 @@ pub struct FiscalCalendarDto {
 /// The provisioning request body: the target seller tenant, accounts, currency
 /// scales, and the fiscal-calendar config to seed in one transaction. The
 /// tenant is carried in the **body** (not the path) — the gear's REST surface is
-/// tenant-from-context/body per the vhp-core convention (RBAC/RMS), and a
+/// tenant-from-context/body per the platform convention (RBAC/RMS), and a
 /// provision targets a seller the caller authorizes via the PEP gate.
 #[derive(Debug, Clone)]
 #[toolkit_macros::api_dto(request)]
@@ -169,19 +171,12 @@ impl ProvisioningRequestDto {
             .currency_scales
             .into_iter()
             .map(|s| {
-                // Narrow the request scale to `u8` at the boundary: a negative or
-                // > 255 value is not a valid minor-unit scale and is rejected as
-                // InvalidArgument here (not deep in the upsert headroom guard).
-                let minor_units = u8::try_from(s.minor_units).map_err(|_| {
-                    DomainError::ScaleOutOfRange(format!(
-                        "currency {} scale {} is out of range (0..=255)",
-                        s.currency, s.minor_units
-                    ))
-                })?;
+                // Validate the code shape and the 0..=28 scale at the boundary (a
+                // bad value is a 400 here, not a deep registry fault).
+                let spec = CurrencySpec::try_new(s.currency, s.currency_scale)
+                    .map_err(|e| money_field_error("currency_scales", e))?;
                 Ok(ProvisionCurrencyScale {
-                    currency: s.currency,
-                    minor_units,
-                    plausible_max_major: s.plausible_max_major,
+                    currency: spec,
                     source: s.source.unwrap_or_else(|| DEFAULT_SCALE_SOURCE.to_owned()),
                 })
             })
@@ -211,18 +206,18 @@ impl ProvisioningRequestDto {
 
 // ── Invoice-posting request DTOs (§6) ────────────────────────────────────────
 
-/// One ex-tax billable line of an invoice to post. Money is the flat
-/// `amount_minor` + `currency` pair the domain/storage carry (the ledger has no
-/// composite money type). `catalog_class` / `contract_class` are the optional
-/// GL-mapping inputs — a missing pair routes the line to `SUSPENSE`/`PENDING`.
+/// One ex-tax billable line of an invoice to post. Money is a [`MoneyDto`]
+/// (decimal text + currency + stored scale) validated, never rounded, at the
+/// boundary. `catalog_class` / `contract_class` are the optional GL-mapping
+/// inputs — a missing pair routes the line to `SUSPENSE`/`PENDING`.
 #[derive(Debug, Clone)]
 #[toolkit_macros::api_dto(request)]
 // Field names mirror the domain `InvoiceItem` / `journal_line` columns verbatim;
 // renaming to satisfy `struct_field_names` would diverge from the contract.
 #[allow(clippy::struct_field_names)]
 pub struct InvoiceItemDto {
-    pub amount_minor_ex_tax: i64,
-    pub currency: String,
+    /// The ex-tax line amount in major units (`>= 0`).
+    pub amount_ex_tax: MoneyDto,
     pub revenue_stream: String,
     /// Catalog-supplied GL class (the default mapping); a known `AccountClass`
     /// literal (e.g. `"REVENUE"`). `None` ⇒ no Catalog mapping.
@@ -251,33 +246,33 @@ impl InvoiceItemDto {
     /// when the `recognition` block carries an invalid timing (see
     /// [`RecognitionInputDto::into_domain`]).
     fn into_domain(self) -> Result<InvoiceItem, DomainError> {
+        // Validate (never round) the wire money; the currency code and scale are
+        // screened by the same parse so no malformed code reaches a persisted
+        // column.
+        let amount_ex_tax = parse_money("items.amount_ex_tax", self.amount_ex_tax)?;
         // Money invariant: an ex-tax line amount is non-negative. A negative
-        // value is not just wrong accounting — it drives the recognition split's
-        // `deferred.clamp(0, amount)` into `min > max` (a panic) downstream, so
-        // reject it here at the wire boundary as a 400, never deeper.
-        if self.amount_minor_ex_tax < 0 {
+        // value is not just wrong accounting — it would drive the recognition
+        // split's deferred clamp inside out downstream, so reject it here at the
+        // wire boundary as a 400, never deeper.
+        if amount_ex_tax.amount().is_sign_negative() {
             return Err(DomainError::InvalidRequest(format!(
-                "invoice item amount_minor_ex_tax must be non-negative, got {}",
-                self.amount_minor_ex_tax
+                "invoice item amount_ex_tax must be non-negative, got {}",
+                canonical_decimal(amount_ex_tax.amount())
             )));
         }
-        // The line currency is stamped verbatim on the journal line and never
-        // re-parsed downstream; screen a malformed code here (a 400) rather than let
-        // it silently match zero currency-scale rows / land in a persisted column.
-        check_currency_code("currency", &self.currency)?;
         let catalog_class = parse_opt_account_class("catalog_class", self.catalog_class)?;
         let contract_class = parse_opt_account_class("contract_class", self.contract_class)?;
         let recognition = self
             .recognition
             .map(RecognitionInputDto::into_domain)
             .transpose()?;
+        // The deferred portion is DERIVED server-side by the recognition
+        // builder in the post orchestrator (never trusted from the wire); seed a
+        // zero in the item's own currency and scale here.
+        let deferred = zero_money(amount_ex_tax.currency());
         Ok(InvoiceItem {
-            amount_minor_ex_tax: self.amount_minor_ex_tax,
-            // The deferred portion is DERIVED server-side by the recognition
-            // builder in the post orchestrator (never trusted from the wire);
-            // seed `0` here.
-            deferred_minor: 0,
-            currency: self.currency,
+            amount_ex_tax,
+            deferred,
             revenue_stream: self.revenue_stream,
             catalog_class,
             contract_class,
@@ -389,28 +384,52 @@ impl RecognitionInputDto {
 #[derive(Debug, Clone)]
 #[toolkit_macros::api_dto(request)]
 pub struct TaxBreakdownDto {
-    pub amount_minor: i64,
-    pub currency: String,
+    /// The tax component amount in major units (`>= 0`).
+    pub amount: MoneyDto,
     pub tax_jurisdiction: String,
     pub tax_filing_period: String,
     pub tax_rate_ref: Option<String>,
 }
 
-impl From<TaxBreakdownDto> for TaxBreakdown {
-    fn from(t: TaxBreakdownDto) -> Self {
-        Self {
-            amount_minor: t.amount_minor,
-            currency: t.currency,
+impl TryFrom<TaxBreakdownDto> for TaxBreakdown {
+    type Error = DomainError;
+
+    /// Validate (never round) the component's money at the boundary. A negative
+    /// tax component understates the receivable, so it is a 400 here.
+    fn try_from(t: TaxBreakdownDto) -> Result<Self, DomainError> {
+        let amount = parse_money("tax.amount", t.amount)?;
+        if amount.amount().is_sign_negative() {
+            return Err(DomainError::InvalidRequest(format!(
+                "tax amount must be non-negative, got {}",
+                canonical_decimal(amount.amount())
+            )));
+        }
+        Ok(Self {
+            amount,
             tax_jurisdiction: t.tax_jurisdiction,
             tax_filing_period: t.tax_filing_period,
             tax_rate_ref: t.tax_rate_ref,
-        }
+        })
     }
+}
+
+/// Lower a wire tax breakdown and require every component to share `spec`.
+fn lower_tax(
+    tax: Vec<TaxBreakdownDto>,
+    spec: &CurrencySpec,
+) -> Result<Vec<TaxBreakdown>, DomainError> {
+    tax.into_iter()
+        .map(|t| {
+            let t = TaxBreakdown::try_from(t)?;
+            require_same_spec("tax.amount", &t.amount, spec)?;
+            Ok(t)
+        })
+        .collect()
 }
 
 /// The `POST /journal-entries` request body: a fully-recognized invoice
 /// (Variant A) to post. The target seller ledger is the body's own `tenant_id`
-/// (tenant in body, not path — the vhp-core REST convention); the `(entry,
+/// (tenant in body, not path — the platform REST convention); the `(entry,
 /// post)` PEP gate authorizes it.
 #[derive(Debug, Clone)]
 #[toolkit_macros::api_dto(request)]
@@ -452,21 +471,13 @@ impl PostInvoiceRequestDto {
             .into_iter()
             .map(InvoiceItemDto::into_domain)
             .collect::<Result<Vec<_>, DomainError>>()?;
-        // Tax amounts are non-negative for the same reason (the AR gross folds
-        // `Σ items + Σ tax`; a negative tax line understates the receivable).
-        if let Some(bad) = self.tax.iter().find(|t| t.amount_minor < 0) {
-            return Err(DomainError::InvalidRequest(format!(
-                "tax amount_minor must be non-negative, got {}",
-                bad.amount_minor
-            )));
-        }
-        // Each tax component's currency is stamped on its own line but lowers via a
-        // plain `From` (no per-field guard), so this is the one place its code is
-        // screened before it reaches a persisted line.
-        for t in &self.tax {
-            check_currency_code("tax.currency", &t.currency)?;
-        }
-        let tax: Vec<TaxBreakdown> = self.tax.into_iter().map(TaxBreakdown::from).collect();
+        // Tax amounts are validated (non-negative, never rounded) by the same
+        // boundary lowering as the items (the AR gross folds `Σ items + Σ tax`).
+        let tax = self
+            .tax
+            .into_iter()
+            .map(TaxBreakdown::try_from)
+            .collect::<Result<Vec<_>, DomainError>>()?;
         // A zero-line invoice (no items AND no tax) has nothing to post — the builder
         // would emit an empty entry. Reject it at the boundary as a 400 (an
         // items-empty-but-tax-present invoice is a legitimate tax-only posting).
@@ -478,17 +489,31 @@ impl PostInvoiceRequestDto {
         // Single-currency invariant: the builder stamps the reference currency on
         // every line, so a differing item/tax currency would be silently
         // misattributed. Reject it at the boundary (the reference = first item's
-        // currency, else first tax's).
+        // currency, else first tax's). A same-currency scale disagreement is the
+        // named scale-mismatch error, never an implicit rescale.
         if let Some(reference) = items
             .first()
-            .map(|i| i.currency.as_str())
-            .or_else(|| tax.first().map(|t| t.currency.as_str()))
-            && (items.iter().any(|i| i.currency != reference)
-                || tax.iter().any(|t| t.currency != reference))
+            .map(|i| i.amount_ex_tax.currency())
+            .or_else(|| tax.first().map(|t| t.amount.currency()))
         {
-            return Err(DomainError::InvalidRequest(
-                "mixed-currency invoice: all items and tax must share one currency".to_owned(),
-            ));
+            let reference = reference.clone();
+            if items
+                .iter()
+                .any(|i| i.amount_ex_tax.currency().code() != reference.code())
+                || tax
+                    .iter()
+                    .any(|t| t.amount.currency().code() != reference.code())
+            {
+                return Err(DomainError::InvalidRequest(
+                    "mixed-currency invoice: all items and tax must share one currency".to_owned(),
+                ));
+            }
+            for i in &items {
+                require_same_spec("items.amount_ex_tax", &i.amount_ex_tax, &reference)?;
+            }
+            for t in &tax {
+                require_same_spec("tax.amount", &t.amount, &reference)?;
+            }
         }
         Ok(PostedInvoice {
             invoice_id: self.invoice_id,
@@ -915,13 +940,14 @@ pub struct LineDto {
     pub account_class: String,
     pub gl_code: Option<String>,
     pub side: String,
-    pub amount_minor: i64,
-    pub currency: String,
-    pub currency_scale: u8,
+    /// The posted amount with its currency and stored scale.
+    pub money: MoneyDto,
     pub invoice_id: Option<String>,
     pub due_date: Option<NaiveDate>,
     pub revenue_stream: Option<String>,
     pub mapping_status: String,
+    /// The functional-currency translation; `null` on a single-currency line.
+    pub functional_money: Option<MoneyDto>,
     pub tax_jurisdiction: Option<String>,
     pub tax_filing_period: Option<String>,
     /// AR dispute sub-class (`ACTIVE`/`DISPUTED`); absent on non-dispute lines.
@@ -938,13 +964,12 @@ impl From<LineView> for LineDto {
             account_class: l.account_class.as_str().to_owned(),
             gl_code: l.gl_code,
             side: l.side.as_str().to_owned(),
-            amount_minor: l.amount_minor,
-            currency: l.currency,
-            currency_scale: l.currency_scale,
+            money: MoneyDto::from(&l.money),
             invoice_id: l.invoice_id,
             due_date: l.due_date,
             revenue_stream: l.revenue_stream,
             mapping_status: l.mapping_status.as_str().to_owned(),
+            functional_money: l.functional_money.as_ref().map(MoneyDto::from),
             tax_jurisdiction: l.tax_jurisdiction,
             tax_filing_period: l.tax_filing_period,
             ar_status: l.ar_status,
@@ -1006,23 +1031,20 @@ impl From<EntryView> for EntryDto {
 // pattern: the page envelope is the shared toolkit type, not a per-gear DTO).
 
 /// A read-back account-balance row in the `GET /balances` response. Carries both
-/// the transaction-currency `balance_minor` and the Slice-5 functional valuation:
-/// `functional_balance_minor` is `null` on a single-currency grain (the
-/// `?valuation=functional` read falls back to `balance_minor` by identity, P1
+/// the transaction-currency `balance` and the Slice-5 functional valuation:
+/// `functional_balance` is `null` on a single-currency grain (the
+/// `?valuation=functional` read falls back to `balance` by identity, P1
 /// decision 8).
 #[derive(Debug, Clone)]
 #[toolkit_macros::api_dto(response)]
 pub struct BalanceDto {
     pub account_id: Uuid,
     pub account_class: String,
-    pub currency: String,
-    pub balance_minor: i64,
+    /// The transaction-currency balance with its currency and stored scale.
+    pub balance: MoneyDto,
     /// Functional-currency carried balance; `null` on a single-currency grain
     /// (functional ≡ transaction).
-    pub functional_balance_minor: Option<i64>,
-    /// Functional currency of `functional_balance_minor`; `null` on a
-    /// single-currency grain.
-    pub functional_currency: Option<String>,
+    pub functional_balance: Option<MoneyDto>,
 }
 
 impl From<BalanceView> for BalanceDto {
@@ -1030,10 +1052,8 @@ impl From<BalanceView> for BalanceDto {
         Self {
             account_id: b.account_id,
             account_class: b.account_class.as_str().to_owned(),
-            currency: b.currency,
-            balance_minor: b.balance_minor,
-            functional_balance_minor: b.functional_balance_minor,
-            functional_currency: b.functional_currency,
+            balance: MoneyDto::from(&b.balance),
+            functional_balance: b.functional_balance.as_ref().map(MoneyDto::from),
         }
     }
 }
@@ -1048,18 +1068,20 @@ impl From<BalanceView> for BalanceDto {
 #[toolkit_macros::api_dto(response)]
 pub struct AgingBucketDto {
     pub payer_tenant_id: Uuid,
+    /// The grain's currency (the bucket key; `amount` carries it too).
     pub currency: String,
     pub bucket: String,
-    pub amount_minor: i64,
+    /// The outstanding receivable in this bucket.
+    pub amount: MoneyDto,
 }
 
 impl From<AgingBucket> for AgingBucketDto {
     fn from(b: AgingBucket) -> Self {
         Self {
             payer_tenant_id: b.payer_tenant_id,
-            currency: b.currency,
+            currency: b.amount.currency().code().to_owned(),
             bucket: b.bucket,
-            amount_minor: b.amount_minor,
+            amount: MoneyDto::from(&b.amount),
         }
     }
 }
@@ -1083,11 +1105,11 @@ impl From<Vec<AgingBucket>> for ArAgingDto {
 
 /// The `POST /payments` request body: a settled payment to record (the
 /// **money-in** side). The target seller ledger is the body's own `tenant_id`
-/// (tenant in body, not path — the vhp-core REST convention); the `(payment,
-/// write)` PEP gate authorizes it. `scale` is the payment's currency scale as
-/// known to the caller — advisory; the ledger resolves the authoritative
-/// per-line scale from the provisioned currency config. `effective_at` `None`
-/// ⇒ the receipt is stamped at post time.
+/// (tenant in body, not path — the platform REST convention); the `(payment,
+/// write)` PEP gate authorizes it. `gross` and `fee` carry their currency and
+/// stored scale; the scale is validated against the provisioned currency
+/// config at post time (a mismatch is rejected, never rescaled). `effective_at`
+/// `None` ⇒ the receipt is stamped at post time.
 #[derive(Debug, Clone)]
 #[toolkit_macros::api_dto(request)]
 pub struct SettlePaymentRequest {
@@ -1097,13 +1119,11 @@ pub struct SettlePaymentRequest {
     pub payer_tenant_id: Uuid,
     /// External payment identity — the idempotency key (a re-settle replays).
     pub payment_id: String,
-    /// Gross received in minor units (what the payer was charged).
-    pub gross_minor: i64,
-    /// Processor's withheld cut in minor units (`<= gross`).
-    pub fee_minor: i64,
-    pub currency: String,
-    /// Advisory currency scale; the ledger resolves the authoritative one.
-    pub scale: u8,
+    /// Gross received in major units (what the payer was charged).
+    pub gross: MoneyDto,
+    /// Processor's withheld cut in major units (`<= gross`), same currency and
+    /// scale as `gross`.
+    pub fee: MoneyDto,
     /// Receipt instant; `None` ⇒ stamped at post time (current-month period).
     #[serde(default, with = "rfc3339::option")]
     pub effective_at: Option<OffsetDateTime>,
@@ -1145,15 +1165,15 @@ impl SettlePaymentRequest {
     /// [`MAX_BUSINESS_ID_LEN`].
     pub fn into_sdk(self) -> Result<bss_ledger_sdk::SettlePayment, DomainError> {
         validate_business_id("payment_id", &self.payment_id)?;
-        check_currency_code("currency", &self.currency)?;
+        let gross = parse_money("gross", self.gross)?;
+        let fee = parse_money("fee", self.fee)?;
+        let amounts = bss_ledger_sdk::SettledAmounts::try_new(gross, fee)
+            .map_err(|e| money_field_error("fee", e))?;
         Ok(bss_ledger_sdk::SettlePayment {
             tenant_id: self.tenant_id,
             payer_tenant_id: self.payer_tenant_id,
             payment_id: self.payment_id,
-            gross_minor: self.gross_minor,
-            fee_minor: self.fee_minor,
-            currency: self.currency,
-            scale: self.scale,
+            amounts,
             effective_at: self.effective_at,
         })
     }
@@ -1183,8 +1203,8 @@ impl From<bss_ledger_sdk::PostingRef> for SettlePaymentResponse {
 /// The `POST /payments/{payment_id}/returns` request body: claw a settled
 /// receipt back out (the reversal of a money-in). `{payment_id}` (the original
 /// settled payment) comes from the PATH; `psp_return_id` is the idempotency key
-/// (a re-post replays). `scale` is advisory; `effective_at` `None` ⇒ stamped at
-/// post time.
+/// (a re-post replays). `money` carries its currency and stored scale;
+/// `effective_at` `None` ⇒ stamped at post time.
 #[derive(Debug, Clone)]
 #[toolkit_macros::api_dto(request)]
 pub struct ReturnPaymentRequest {
@@ -1194,11 +1214,8 @@ pub struct ReturnPaymentRequest {
     pub payer_tenant_id: Uuid,
     /// External return identity — the idempotency key.
     pub psp_return_id: String,
-    /// Amount returned in minor units (`> 0`).
-    pub amount_minor: i64,
-    pub currency: String,
-    /// Advisory currency scale; the ledger resolves the authoritative one.
-    pub scale: u8,
+    /// Amount returned in major units (`> 0`).
+    pub money: MoneyDto,
     /// Return instant; `None` ⇒ stamped at post time (current-month period).
     #[serde(default, with = "rfc3339::option")]
     pub effective_at: Option<OffsetDateTime>,
@@ -1219,15 +1236,13 @@ impl ReturnPaymentRequest {
     ) -> Result<bss_ledger_sdk::ReturnPayment, DomainError> {
         validate_business_id("payment_id", &payment_id)?;
         validate_business_id("psp_return_id", &self.psp_return_id)?;
-        check_currency_code("currency", &self.currency)?;
+        let money = parse_money("money", self.money)?;
         Ok(bss_ledger_sdk::ReturnPayment {
             tenant_id: self.tenant_id,
             payer_tenant_id: self.payer_tenant_id,
             payment_id,
             psp_return_id: self.psp_return_id,
-            amount_minor: self.amount_minor,
-            currency: self.currency,
-            scale: self.scale,
+            money,
             effective_at: self.effective_at,
         })
     }
@@ -1259,14 +1274,14 @@ impl From<bss_ledger_sdk::PostingRef> for ReturnPaymentResponse {
 /// The `POST /disputes/{dispute_id}/phases` request body: record one phase of a
 /// chargeback dispute. `{dispute_id}` (the dispute's external id) comes from the
 /// PATH; the target seller ledger is the body's own `tenant_id` (tenant in body,
-/// not path — the vhp-core REST convention); the `(dispute, write)` PEP gate
+/// not path — the platform REST convention); the `(dispute, write)` PEP gate
 /// authorizes it. The LEDGER chooses the variant at `opened` from `funds_at_open`
 /// (`"withheld"` ⇒ cash-hold, `"not_moved"` ⇒ AR-reclass); `phase` is one of
 /// `"opened" | "won" | "lost" | "partial"` (Group B implements `opened`).
 /// `cycle` defaults to 1 and increments on a re-open. `invoice_id` is required
 /// for an AR-reclass `opened` (the disputed `(payer, invoice)` grain), ignored
-/// for cash-hold. `scale` is advisory; `effective_at` `None` ⇒ stamped at post
-/// time.
+/// for cash-hold. `disputed_amount` carries its currency and stored scale;
+/// `effective_at` `None` ⇒ stamped at post time.
 #[derive(Debug, Clone)]
 #[toolkit_macros::api_dto(request)]
 pub struct RecordDisputePhaseRequest {
@@ -1286,13 +1301,10 @@ pub struct RecordDisputePhaseRequest {
     /// The funds-movement fact: `"withheld"` (card rails) | `"not_moved"`
     /// (invoice/ACH) — read at `opened` to choose the variant.
     pub funds_at_open: String,
-    /// The disputed amount in minor units (`> 0`): the **gross** claim (what the
+    /// The disputed amount in major units (`> 0`): the **gross** claim (what the
     /// buyer paid / the bank reverses), NOT net of the PSP fee — the ledger sizes a
     /// `CASH_HOLD` cash leg at `net = settled − fee` itself.
-    pub disputed_amount_minor: i64,
-    pub currency: String,
-    /// Advisory currency scale; the ledger resolves the authoritative one.
-    pub scale: u8,
+    pub disputed_amount: MoneyDto,
     /// Phase instant; `None` ⇒ stamped at post time (current-month period).
     #[serde(default, with = "rfc3339::option")]
     pub effective_at: Option<OffsetDateTime>,
@@ -1317,7 +1329,7 @@ impl RecordDisputePhaseRequest {
         if let Some(invoice_id) = &self.invoice_id {
             validate_business_id("invoice_id", invoice_id)?;
         }
-        check_currency_code("currency", &self.currency)?;
+        let disputed_amount = parse_money("disputed_amount", self.disputed_amount)?;
         // The DB CHECK (cycle >= 1) is authoritative; reject a non-positive cycle
         // at the boundary with a clear `InvalidRequest` rather than letting it hit
         // the constraint and surface as a generic 500.
@@ -1337,9 +1349,7 @@ impl RecordDisputePhaseRequest {
             cycle: self.cycle.unwrap_or(1),
             phase: self.phase,
             funds_at_open: self.funds_at_open,
-            disputed_amount_minor: self.disputed_amount_minor,
-            currency: self.currency,
-            scale: self.scale,
+            disputed_amount,
             effective_at: self.effective_at,
         })
     }
@@ -1403,22 +1413,41 @@ impl From<bss_ledger_sdk::DisputeQueued> for DisputePhaseQueuedResponse {
     }
 }
 
-/// One caller-computed allocation share (Mode B, §4.4 F-5): apply `amount_minor`
+/// One caller-computed allocation share (Mode B, §4.4 F-5): apply `money`
 /// of the lump to `invoice_id`. A row of [`AllocatePaymentRequest::splits`].
 #[derive(Debug, Clone)]
 #[toolkit_macros::api_dto(request)]
 pub struct AllocationSplitDto {
     pub invoice_id: String,
-    pub amount_minor: i64,
+    /// The share in major units, in the lump's currency and scale.
+    pub money: MoneyDto,
 }
 
-impl From<AllocationSplitDto> for bss_ledger_sdk::AllocationSplit {
-    fn from(s: AllocationSplitDto) -> Self {
-        Self {
+impl TryFrom<AllocationSplitDto> for bss_ledger_sdk::AllocationSplit {
+    type Error = DomainError;
+
+    fn try_from(s: AllocationSplitDto) -> Result<Self, DomainError> {
+        Ok(Self {
             invoice_id: s.invoice_id,
-            amount_minor: s.amount_minor,
-        }
+            money: parse_money("splits.money", s.money)?,
+        })
     }
+}
+
+/// Lower caller-supplied shares and require each to share `spec`.
+fn lower_splits(
+    field: &str,
+    splits: Vec<AllocationSplitDto>,
+    spec: &CurrencySpec,
+) -> Result<Vec<bss_ledger_sdk::AllocationSplit>, DomainError> {
+    splits
+        .into_iter()
+        .map(|s| {
+            let split = bss_ledger_sdk::AllocationSplit::try_from(s)?;
+            require_same_spec(field, &split.money, spec)?;
+            Ok(split)
+        })
+        .collect()
 }
 
 /// The `POST /payments/{payment_id}/allocations` request body: allocate a
@@ -1426,14 +1455,14 @@ impl From<AllocationSplitDto> for bss_ledger_sdk::AllocationSplit {
 /// **money-out** side). The `payment_id` comes from the PATH (not the body —
 /// see [`SettlePaymentRequest::into`] vs [`AllocatePaymentRequest::into_sdk`]),
 /// so the lowering to the SDK type takes it as a parameter. `allocation_id` is
-/// the idempotency key. `scale` is advisory.
+/// the idempotency key. `lump` carries its currency and stored scale.
 ///
-/// When `splits` is omitted the `lump_minor` is applied by the tenant's
+/// When `splits` is omitted the `lump` is applied by the tenant's
 /// precedence policy and `hint_invoice_id` jumps one invoice to the front of
 /// that fill order. When `splits` is supplied (Mode B), the precedence decision
 /// is skipped and those explicit shares are validated against the open
 /// receivables instead (each must name an open invoice and not over-allocate it;
-/// the shares must sum to at most `lump_minor`) — a bad split is rejected
+/// the shares must sum to at most `lump`) — a bad split is rejected
 /// `ALLOCATION_SPLIT_INVALID`.
 #[derive(Debug, Clone)]
 #[toolkit_macros::api_dto(request)]
@@ -1444,11 +1473,8 @@ pub struct AllocatePaymentRequest {
     pub payer_tenant_id: Uuid,
     /// Idempotency key for the allocation (a re-issue replays).
     pub allocation_id: Uuid,
-    /// The lump to apply in minor units, drained oldest-first across open AR.
-    pub lump_minor: i64,
-    pub currency: String,
-    /// Advisory currency scale; the ledger resolves the authoritative one.
-    pub scale: u8,
+    /// The lump to apply in major units, drained oldest-first across open AR.
+    pub lump: MoneyDto,
     /// Optional invoice to jump to the front of the oldest-first fill order.
     /// Ignored when `splits` is supplied (Mode B bypasses the fill order).
     pub hint_invoice_id: Option<String>,
@@ -1479,17 +1505,19 @@ impl AllocatePaymentRequest {
                 validate_business_id("splits.invoice_id", &split.invoice_id)?;
             }
         }
-        check_currency_code("currency", &self.currency)?;
+        let lump = parse_money("lump", self.lump)?;
+        let splits = self
+            .splits
+            .map(|v| lower_splits("splits.money", v, lump.currency()))
+            .transpose()?;
         Ok(bss_ledger_sdk::AllocatePayment {
             tenant_id: self.tenant_id,
             payer_tenant_id: self.payer_tenant_id,
             payment_id,
             allocation_id: self.allocation_id,
-            lump_minor: self.lump_minor,
-            currency: self.currency,
-            scale: self.scale,
+            lump,
             hint_invoice_id: self.hint_invoice_id,
-            splits: self.splits.map(|v| v.into_iter().map(Into::into).collect()),
+            splits,
         })
     }
 }
@@ -1502,8 +1530,8 @@ impl AllocatePaymentRequest {
 #[toolkit_macros::api_dto(response)]
 pub struct AllocationDto {
     pub invoice_id: String,
-    pub amount_minor: i64,
-    pub currency: String,
+    /// The applied share with its currency and stored scale.
+    pub money: MoneyDto,
     #[serde(with = "rfc3339")]
     pub allocated_at_utc: OffsetDateTime,
     pub precedence_policy_ref: String,
@@ -1513,8 +1541,7 @@ impl From<bss_ledger_sdk::AllocationView> for AllocationDto {
     fn from(a: bss_ledger_sdk::AllocationView) -> Self {
         Self {
             invoice_id: a.invoice_id,
-            amount_minor: a.amount_minor,
-            currency: a.currency,
+            money: MoneyDto::from(&a.money),
             allocated_at_utc: a.allocated_at_utc,
             precedence_policy_ref: a.precedence_policy_ref,
         }
@@ -1603,16 +1630,15 @@ impl From<Vec<bss_ledger_sdk::AllocationView>> for PaymentAllocationsDto {
 #[toolkit_macros::api_dto(response)]
 pub struct UnallocatedDto {
     pub payer_tenant_id: Uuid,
-    pub currency: String,
-    pub balance_minor: i64,
+    /// The undrained pool with its currency and stored scale.
+    pub balance: MoneyDto,
 }
 
 impl From<bss_ledger_sdk::UnallocatedView> for UnallocatedDto {
     fn from(u: bss_ledger_sdk::UnallocatedView) -> Self {
         Self {
             payer_tenant_id: u.payer_tenant_id,
-            currency: u.currency,
-            balance_minor: u.balance_minor,
+            balance: MoneyDto::from(&u.balance),
         }
     }
 }
@@ -1628,12 +1654,14 @@ struct CreditApplicationResource;
 
 /// The `POST /credit-applications` request body: ONE wire shape for both wallet
 /// kinds, discriminated by `kind` (`"grant"` | `"apply"`). The target seller
-/// ledger is the body's own `tenant_id` (tenant in body, not path — the vhp-core
+/// ledger is the body's own `tenant_id` (tenant in body, not path — the platform
 /// REST convention); the `(credit_application, write)` PEP gate authorizes it.
-/// `scale` is advisory; the ledger resolves the authoritative per-line scale.
+/// `currency` + `currency_scale` constrain the whole application: a grant's
+/// `money` and every apply target must carry the same pair (a mismatch is a
+/// named error, never an implicit conversion).
 ///
 /// The kind-specific fields are all optional on the wire and validated in
-/// [`Self::into_sdk`]: a `grant` requires `amount_minor` + `credit_grant_event_type`
+/// [`Self::into_sdk`]: a `grant` requires `money` + `credit_grant_event_type`
 /// (and ignores `targets`); an `apply` requires a non-empty `targets` (and ignores
 /// the grant fields). A missing required field or an unknown `kind` is rejected
 /// `400 InvalidArgument` before the SDK type is built.
@@ -1648,12 +1676,13 @@ pub struct CreditApplicationRequest {
     pub payer_tenant_id: Uuid,
     /// The `CREDIT_APPLY` idempotency business id (a replay returns the prior post).
     pub credit_application_id: String,
+    /// The application's currency (every monetary child carries the same).
     pub currency: String,
-    /// Advisory currency scale; the ledger resolves the authoritative one.
-    pub scale: u8,
-    /// Grant only: amount to park into the wallet, in minor units. Required for
+    /// The application's stored currency scale (0..=28).
+    pub currency_scale: u8,
+    /// Grant only: amount to park into the wallet, in major units. Required for
     /// `kind = "grant"`, ignored for `"apply"`.
-    pub amount_minor: Option<i64>,
+    pub money: Option<MoneyDto>,
     /// Grant only: the wallet sub-grain bucket the credit accrues to. Required for
     /// `kind = "grant"`, ignored for `"apply"`.
     pub credit_grant_event_type: Option<String>,
@@ -1672,7 +1701,7 @@ impl CreditApplicationRequest {
     /// # Errors
     /// A `400 InvalidArgument` [`CanonicalError`] when `credit_application_id` is
     /// empty / over [`MAX_BUSINESS_ID_LEN`], when `kind = "grant"` omits
-    /// `amount_minor` / `credit_grant_event_type`, when `kind = "apply"` omits a
+    /// `money` / `credit_grant_event_type`, when `kind = "apply"` omits a
     /// non-empty `targets` (or a target names an empty / over-long invoice id), or
     /// when `kind` is neither `"grant"` nor `"apply"`.
     pub fn into_sdk(self) -> Result<bss_ledger_sdk::CreditApplication, CanonicalError> {
@@ -1684,15 +1713,19 @@ impl CreditApplicationRequest {
                 format!("must be 1..={MAX_BUSINESS_ID_LEN} bytes"),
             ));
         }
-        // Screen the currency at the boundary; the `DomainError` 400 flows through
-        // the existing `From<DomainError> for CanonicalError` ladder so it renders
-        // the same InvalidArgument shape as the kind-specific violations below.
-        check_currency_code("currency", &self.currency).map_err(CanonicalError::from)?;
+        // Validate the application's currency pair at the boundary; the
+        // `DomainError` 400 flows through the existing `From<DomainError> for
+        // CanonicalError` ladder so it renders the same InvalidArgument shape as
+        // the kind-specific violations below.
+        let spec = CurrencySpec::try_new(self.currency, self.currency_scale)
+            .map_err(|e| CanonicalError::from(money_field_error("currency", e)))?;
         match self.kind.as_str() {
             "grant" => {
-                let amount_minor = self.amount_minor.ok_or_else(|| {
-                    invalid_field("amount_minor", "grant requires `amount_minor`")
-                })?;
+                let money = self
+                    .money
+                    .ok_or_else(|| invalid_field("money", "grant requires `money`"))?;
+                let money = parse_money("money", money).map_err(CanonicalError::from)?;
+                require_same_spec("money", &money, &spec).map_err(CanonicalError::from)?;
                 let credit_grant_event_type = self.credit_grant_event_type.ok_or_else(|| {
                     invalid_field(
                         "credit_grant_event_type",
@@ -1704,9 +1737,7 @@ impl CreditApplicationRequest {
                         tenant_id: self.tenant_id,
                         payer_tenant_id: self.payer_tenant_id,
                         credit_application_id: self.credit_application_id,
-                        currency: self.currency,
-                        scale: self.scale,
-                        amount_minor,
+                        money,
                         credit_grant_event_type,
                     },
                 ))
@@ -1723,14 +1754,15 @@ impl CreditApplicationRequest {
                         ));
                     }
                 }
+                let targets =
+                    lower_splits("targets.money", targets, &spec).map_err(CanonicalError::from)?;
                 Ok(bss_ledger_sdk::CreditApplication::Apply(
                     bss_ledger_sdk::CreditApply {
                         tenant_id: self.tenant_id,
                         payer_tenant_id: self.payer_tenant_id,
                         credit_application_id: self.credit_application_id,
-                        currency: self.currency,
-                        scale: self.scale,
-                        targets: targets.into_iter().map(Into::into).collect(),
+                        currency: spec,
+                        targets,
                     },
                 ))
             }
@@ -1760,14 +1792,15 @@ fn invalid_field(field: &'static str, message: impl Into<String>) -> CanonicalEr
 #[toolkit_macros::api_dto(response)]
 pub struct CreditDebitDto {
     pub credit_grant_event_type: String,
-    pub amount_minor: i64,
+    /// The draw-down with its currency and stored scale.
+    pub money: MoneyDto,
 }
 
 impl From<bss_ledger_sdk::CreditDebitView> for CreditDebitDto {
     fn from(d: bss_ledger_sdk::CreditDebitView) -> Self {
         Self {
             credit_grant_event_type: d.credit_grant_event_type,
-            amount_minor: d.amount_minor,
+            money: MoneyDto::from(&d.money),
         }
     }
 }
@@ -1780,14 +1813,15 @@ impl From<bss_ledger_sdk::CreditDebitView> for CreditDebitDto {
 #[toolkit_macros::api_dto(response)]
 pub struct CreditApplicationShareDto {
     pub invoice_id: String,
-    pub amount_minor: i64,
+    /// The applied share with its currency and stored scale.
+    pub money: MoneyDto,
 }
 
 impl From<bss_ledger_sdk::AllocationSplit> for CreditApplicationShareDto {
     fn from(s: bss_ledger_sdk::AllocationSplit) -> Self {
         Self {
             invoice_id: s.invoice_id,
-            amount_minor: s.amount_minor,
+            money: MoneyDto::from(&s.money),
         }
     }
 }
@@ -1829,7 +1863,7 @@ impl From<bss_ledger_sdk::CreditApplicationApplied> for CreditApplicationRespons
 /// The `POST /recognition-runs` request body: trigger an ASC 606 recognition
 /// run for one fiscal period (release the period's due `PENDING` segments). The
 /// target seller ledger is the body's own `tenant_id` (tenant in body, not path
-/// — the vhp-core REST convention); the `(entry, post)` PEP gate authorizes it
+/// — the platform REST convention); the `(entry, post)` PEP gate authorizes it
 /// (a run posts `DR CL / CR Revenue` journal entries). `run_id` is the
 /// run-trigger idempotency key: `None` ⇒ the ledger mints a fresh one (a first,
 /// un-keyed trigger); a stable one makes retries idempotent (a replay returns
@@ -1946,8 +1980,8 @@ impl From<bss_ledger_sdk::RecognitionRunQueued> for RecognitionRunQueuedResponse
 
 /// One disaggregated recognized-revenue grain in the `GET
 /// /revenue/disaggregation` response: the revenue RECOGNIZED into
-/// `revenue_stream` during `period_id` (`Σ amount_minor` of the DONE recognition
-/// segments at that grain), in minor units of `currency`. A row of
+/// `revenue_stream` during `period_id` (the exact sum of the DONE recognition
+/// segments at that grain), with its currency and stored scale. A row of
 /// [`RevenueDisaggregationResponse::entries`].
 #[derive(Debug, Clone)]
 #[toolkit_macros::api_dto(response)]
@@ -1956,10 +1990,8 @@ pub struct RevenueDisaggregationEntryDto {
     pub period_id: String,
     /// The revenue stream the recognized revenue books to.
     pub revenue_stream: String,
-    /// Revenue recognized into this `(period, stream)` grain, in minor units.
-    pub recognized_minor: i64,
-    /// ISO currency of the recognized amount.
-    pub currency: String,
+    /// Revenue recognized into this `(period, stream)` grain.
+    pub recognized: MoneyDto,
 }
 
 impl From<bss_ledger_sdk::RevenueDisaggregationEntry> for RevenueDisaggregationEntryDto {
@@ -1967,8 +1999,7 @@ impl From<bss_ledger_sdk::RevenueDisaggregationEntry> for RevenueDisaggregationE
         Self {
             period_id: e.period_id,
             revenue_stream: e.revenue_stream,
-            recognized_minor: e.recognized_minor,
-            currency: e.currency,
+            recognized: MoneyDto::from(&e.recognized),
         }
     }
 }
@@ -2006,23 +2037,25 @@ impl From<bss_ledger_sdk::RevenueDisaggregation> for RevenueDisaggregationRespon
 pub struct ChangeSegmentDto {
     /// Fiscal `period_id` (`YYYYMM`) this replacement segment recognizes into.
     pub period_id: String,
-    /// Minor-unit amount of this segment (`>= 0`).
-    pub amount_minor: i64,
+    /// Major-unit amount of this segment (`>= 0`) with its currency and scale.
+    pub money: MoneyDto,
 }
 
-impl From<ChangeSegmentDto> for bss_ledger_sdk::ChangeSegment {
-    fn from(s: ChangeSegmentDto) -> Self {
-        Self {
+impl TryFrom<ChangeSegmentDto> for bss_ledger_sdk::ChangeSegment {
+    type Error = DomainError;
+
+    fn try_from(s: ChangeSegmentDto) -> Result<Self, DomainError> {
+        Ok(Self {
             period_id: s.period_id,
-            amount_minor: s.amount_minor,
-        }
+            money: parse_money("new_segments.money", s.money)?,
+        })
     }
 }
 
 /// The `POST /recognition-schedules/{schedule_id}/changes` request body: change or
 /// cancel an ASC 606 recognition schedule (design §3.6 / §4.6). `{schedule_id}`
 /// (the ACTIVE schedule to change) comes from the PATH; the target seller ledger
-/// is the body's own `tenant_id` (tenant in body, not path — the vhp-core REST
+/// is the body's own `tenant_id` (tenant in body, not path — the platform REST
 /// convention); the `(entry, post)` PEP gate authorizes it (a change marks/mints
 /// schedule state). `change_id` is the idempotency key (a replay returns the prior
 /// result, minting no second schedule). `action` is `"cancel"` | `"replace"`.
@@ -2075,7 +2108,12 @@ impl ChangeRecognitionScheduleRequest {
             treatment: self.treatment,
             new_segments: self
                 .new_segments
-                .map(|v| v.into_iter().map(Into::into).collect()),
+                .map(|v| {
+                    v.into_iter()
+                        .map(bss_ledger_sdk::ChangeSegment::try_from)
+                        .collect::<Result<Vec<_>, DomainError>>()
+                })
+                .transpose()?,
         })
     }
 }
@@ -2110,7 +2148,7 @@ impl From<bss_ledger_sdk::ScheduleChangeRef> for ScheduleChangeResponse {
 
 /// One recognition segment in the `GET /recognition-schedules/{schedule_id}`
 /// response: the `segment_no` (immutable, 1:1 with `period_id`), the period it
-/// recognizes into, its minor-unit amount, and its release status
+/// recognizes into, its major-unit amount, and its release status
 /// (`PENDING` | `QUEUED` | `DONE`). A row of [`RecognitionScheduleResponse::segments`].
 #[derive(Debug, Clone)]
 #[toolkit_macros::api_dto(response)]
@@ -2119,8 +2157,8 @@ pub struct RecognitionScheduleSegmentDto {
     pub segment_no: i32,
     /// The fiscal period this segment recognizes into (`YYYYMM`).
     pub period_id: String,
-    /// The segment's minor-unit amount.
-    pub amount_minor: i64,
+    /// The segment's amount with its currency and stored scale.
+    pub money: MoneyDto,
     /// The release status (`PENDING` | `QUEUED` | `DONE`).
     pub status: String,
 }
@@ -2130,7 +2168,7 @@ impl From<bss_ledger_sdk::RecognitionScheduleSegmentView> for RecognitionSchedul
         Self {
             segment_no: s.segment_no,
             period_id: s.period_id,
-            amount_minor: s.amount_minor,
+            money: MoneyDto::from(&s.money),
             status: s.status,
         }
     }
@@ -2158,12 +2196,10 @@ pub struct RecognitionScheduleResponse {
     pub version: i64,
     /// The revenue stream the obligation books to (one schedule per stream).
     pub revenue_stream: String,
-    /// ISO-4217 currency (one schedule/account per currency).
-    pub currency: String,
     /// The total deferred Contract-liability the schedule plans to release.
-    pub total_deferred_minor: i64,
-    /// The cumulative recognized-to-date (`<= total_deferred_minor`).
-    pub recognized_minor: i64,
+    pub total_deferred: MoneyDto,
+    /// The cumulative recognized-to-date (`<= total_deferred`).
+    pub recognized: MoneyDto,
     /// The originating posted invoice.
     pub source_invoice_id: String,
     /// The Contract-liability invoice line the schedule draws down (the §4.7
@@ -2186,9 +2222,8 @@ impl From<bss_ledger_sdk::RecognitionScheduleView> for RecognitionScheduleRespon
             status: v.status,
             version: v.version,
             revenue_stream: v.revenue_stream,
-            currency: v.currency,
-            total_deferred_minor: v.total_deferred_minor,
-            recognized_minor: v.recognized_minor,
+            total_deferred: MoneyDto::from(&v.total_deferred),
+            recognized: MoneyDto::from(&v.recognized),
             source_invoice_id: v.source_invoice_id,
             source_invoice_item_ref: v.source_invoice_item_ref,
             po_allocation_group: v.po_allocation_group,
@@ -2219,12 +2254,10 @@ pub struct RecognitionScheduleSummaryDto {
     pub version: i64,
     /// The revenue stream the obligation books to (one schedule per stream).
     pub revenue_stream: String,
-    /// ISO-4217 currency (one schedule/account per currency).
-    pub currency: String,
     /// The total deferred Contract-liability the schedule plans to release.
-    pub total_deferred_minor: i64,
-    /// The cumulative recognized-to-date (`<= total_deferred_minor`).
-    pub recognized_minor: i64,
+    pub total_deferred: MoneyDto,
+    /// The cumulative recognized-to-date (`<= total_deferred`).
+    pub recognized: MoneyDto,
     /// The originating posted invoice.
     pub source_invoice_id: String,
     /// The Contract-liability invoice line the schedule draws down.
@@ -2244,9 +2277,8 @@ impl From<bss_ledger_sdk::RecognitionScheduleSummaryView> for RecognitionSchedul
             status: v.status,
             version: v.version,
             revenue_stream: v.revenue_stream,
-            currency: v.currency,
-            total_deferred_minor: v.total_deferred_minor,
-            recognized_minor: v.recognized_minor,
+            total_deferred: MoneyDto::from(&v.total_deferred),
+            recognized: MoneyDto::from(&v.recognized),
             source_invoice_id: v.source_invoice_id,
             source_invoice_item_ref: v.source_invoice_item_ref,
             po_allocation_group: v.po_allocation_group,
@@ -2327,31 +2359,27 @@ pub struct ReidentifyResponseDto {
 
 // ── Credit-note / debit-note / exposure DTOs (Slice 3 §4.2 / §4.3 / §4.7, Group E) ─
 //
-// Wire shape: `snake_case` + the gear's flat money triple (`amount_minor` +
-// `currency` + advisory `scale`), the SAME convention every other ledger DTO
-// uses (the `api_dto` macro fixes `snake_case`, see the module header) — NOT the
-// design doc's illustrative `camelCase` / nested `{amountMinor,currency,scale}`
-// money object (that overrides nothing here; the dto.rs convention is
-// authoritative and dylint-enforced, exactly as the payment / dispute / credit
-// surfaces already ship). `scale` is advisory on the request: the ledger resolves
-// the authoritative per-line scale from the provisioned currency config (mirrors
-// `SettlePaymentRequest`); the credit/debit-note domain requests carry no scale.
+// Wire shape: `snake_case` + the gear's [`MoneyDto`] (decimal `amount` text +
+// `currency` + `currency_scale`), the SAME convention every other ledger DTO
+// uses (the `api_dto` macro fixes `snake_case`, see the module header). Every
+// monetary field of one note must share the note's currency and stored scale;
+// a mismatch is a named error, never an implicit conversion.
 
 /// The `POST /credit-notes` request body: a compensating credit note against a
 /// posted invoice (design §4.2). The target seller ledger is the body's own
-/// `tenant_id` (tenant in body, not path — the vhp-core REST convention); the
+/// `tenant_id` (tenant in body, not path — the platform REST convention); the
 /// `(entry, post)` PEP gate authorizes it (a credit note posts a balanced
 /// compensating journal entry — the same data-plane post action as the
 /// recognition run / invoice post). Idempotent on `credit_note_id` (the
 /// `(tenant, CREDIT_NOTE, credit_note_id)` engine claim): a replay returns the
 /// prior posting with `replayed = true`.
 ///
-/// `amount_minor` is **incl-tax**; `tax_minor` is the reversed-tax slice of it;
-/// `requested_deferred_minor` is the **split intent** — how much of the ex-tax
-/// revenue portion (`amount_minor − tax_minor`) targets the unreleased deferred
+/// `amount` is **incl-tax**; `tax_amount` is the reversed-tax slice of it;
+/// `requested_deferred` is the **split intent** — how much of the ex-tax
+/// revenue portion (`amount − tax_amount`) targets the unreleased deferred
 /// balance (the rest reduces recognized revenue). `goodwill = true` ⇒ an AR-only
 /// goodwill credit (debits `GOODWILL`, touches no schedule, MUST carry
-/// `requested_deferred_minor = 0`). A malformed shape (negative amounts, tax over
+/// `requested_deferred = 0`). A malformed shape (negative amounts, tax over
 /// amount, deferred over ex-tax, empty reason, goodwill-with-deferred) is rejected
 /// `400` (`AMOUNT_OUT_OF_RANGE` / `InvalidArgument`) by the domain `validate_shape`;
 /// an indeterminable split is `CREDIT_NOTE_SPLIT_AMBIGUOUS`; an over-headroom note
@@ -2382,25 +2410,22 @@ pub struct CreditNoteRequest {
     pub po_allocation_group: Option<String>,
     /// The revenue stream the credit books against (per-stream legs carry it).
     pub revenue_stream: String,
-    /// ISO-4217 currency of the note (all legs share it).
-    pub currency: String,
-    /// Advisory currency scale; the ledger resolves the authoritative one.
-    pub scale: u8,
-    /// The note amount **incl-tax**, in minor units (`>= 0`, `> 0` enforced).
-    pub amount_minor: i64,
-    /// The tax slice of `amount_minor` to reverse onto `TAX_PAYABLE` (`>= 0`,
-    /// `<= amount_minor`).
-    pub tax_minor: i64,
+    /// The note amount **incl-tax**, in major units (`> 0`), with the note's
+    /// currency and stored scale (every other monetary field shares them).
+    pub amount: MoneyDto,
+    /// The tax slice of `amount` to reverse onto `TAX_PAYABLE` (`>= 0`,
+    /// `<= amount`).
+    pub tax_amount: MoneyDto,
     /// The authoritative tax breakdown — one component per `(jurisdiction,
     /// filing-period, rate)`, each reversing onto its OWN `TAX_PAYABLE` leg so
     /// `tax_subbalance` disaggregates (§4.5). Empty ⇒ a single dimensionless tax leg
-    /// from `tax_minor` (legacy). A non-empty breakdown MUST sum to `tax_minor` (a
-    /// `400` otherwise); `tax_minor` stays the split scalar.
+    /// from `tax_amount` (legacy). A non-empty breakdown MUST sum to `tax_amount` (a
+    /// `400` otherwise); `tax_amount` stays the split scalar.
     pub tax: Vec<TaxBreakdownDto>,
     /// The split **intent**: how much of the ex-tax revenue amount targets the
-    /// unreleased deferred balance (`0 <= … <= amount_minor − tax_minor`). MUST be
+    /// unreleased deferred balance (`0 <= … <= amount − tax_amount`). MUST be
     /// `0` when `goodwill` is set.
-    pub requested_deferred_minor: i64,
+    pub requested_deferred: MoneyDto,
     /// The mandatory business reason code (AC #14) recorded on the `credit_note`
     /// row.
     pub reason_code: String,
@@ -2412,10 +2437,9 @@ pub struct CreditNoteRequest {
 impl CreditNoteRequest {
     /// Lower the wire DTO into the domain
     /// [`crate::domain::adjustment::credit_note::CreditNoteRequest`], validating
-    /// the client-supplied id lengths at the boundary (the amounts / goodwill shape
-    /// are validated by the domain `validate_shape` in the handler — a `400` from
-    /// there). The advisory `scale` is dropped (the handler resolves the
-    /// authoritative scale). `goodwill` defaults to `false`.
+    /// the client-supplied id lengths and the money metadata at the boundary (the
+    /// amounts / goodwill shape are validated by the domain `validate_shape` in the
+    /// handler — a `400` from there). `goodwill` defaults to `false`.
     ///
     /// # Errors
     /// [`DomainError::InvalidRequest`] when `credit_note_id` / `origin_invoice_id`
@@ -2429,8 +2453,14 @@ impl CreditNoteRequest {
         if let Some(item) = &self.origin_invoice_item_ref {
             validate_business_id("origin_invoice_item_ref", item)?;
         }
-        check_currency_code("currency", &self.currency)?;
         check_free_text("reason_code", &self.reason_code, MAX_REASON_CODE_LEN)?;
+        let amount = parse_money("amount", self.amount)?;
+        let spec = amount.currency().clone();
+        let tax_amount = parse_money("tax_amount", self.tax_amount)?;
+        require_same_spec("tax_amount", &tax_amount, &spec)?;
+        let requested_deferred = parse_money("requested_deferred", self.requested_deferred)?;
+        require_same_spec("requested_deferred", &requested_deferred, &spec)?;
+        let tax = lower_tax(self.tax, &spec)?;
         Ok(crate::domain::adjustment::credit_note::CreditNoteRequest {
             tenant_id: self.tenant_id,
             payer_tenant_id: self.payer_tenant_id,
@@ -2439,11 +2469,10 @@ impl CreditNoteRequest {
             origin_invoice_item_ref: self.origin_invoice_item_ref,
             po_allocation_group: self.po_allocation_group,
             revenue_stream: self.revenue_stream,
-            currency: self.currency,
-            amount_minor: self.amount_minor,
-            tax_minor: self.tax_minor,
-            tax: self.tax.into_iter().map(TaxBreakdown::from).collect(),
-            requested_deferred_minor: self.requested_deferred_minor,
+            amount,
+            tax_amount,
+            tax,
+            requested_deferred,
             reason_code: self.reason_code,
             goodwill: self.goodwill.unwrap_or(false),
         })
@@ -2486,9 +2515,9 @@ pub struct ManualLegDto {
     pub account_class: String,
     /// The [`Side`] wire token: `"DR"` (debit) / `"CR"` (credit).
     pub side: String,
-    /// The leg amount in minor units (`> 0`; the domain `govern` rejects
-    /// zero/negative legs).
-    pub amount_minor: i64,
+    /// The leg amount in major units (`> 0`; the domain `govern` rejects
+    /// zero/negative legs), in the adjustment's currency and scale.
+    pub amount: MoneyDto,
     /// The revenue stream — `Some` only for a per-stream class; `null` otherwise.
     pub revenue_stream: Option<String>,
 }
@@ -2525,8 +2554,10 @@ pub struct ManualAdjustmentRequest {
     /// The governed action wire token (`"ROUNDING_CORRECTION"` /
     /// `"SUSPENSE_CLEAR"`) — selects the allow-list, parsed in `into_domain`.
     pub action: String,
-    /// ISO-4217 currency of the adjustment (every leg shares it).
+    /// Currency of the adjustment (every leg shares it).
     pub currency: String,
+    /// Stored currency scale of the adjustment (every leg shares it).
+    pub currency_scale: u8,
     /// The legs to post — must net to zero (`Σ DR == Σ CR`, enforced by `govern`).
     pub legs: Vec<ManualLegDto>,
     /// The mandatory business reason code (AC #14); an empty/blank one is rejected.
@@ -2556,7 +2587,8 @@ impl ManualAdjustmentRequest {
         preparer_actor_id: Uuid,
     ) -> Result<crate::domain::adjustment::manual::ManualAdjustmentRequest, DomainError> {
         validate_business_id("adjustment_id", &self.adjustment_id)?;
-        check_currency_code("currency", &self.currency)?;
+        let currency = CurrencySpec::try_new(self.currency, self.currency_scale)
+            .map_err(|e| money_field_error("currency", e))?;
         check_free_text("reason_code", &self.reason_code, MAX_REASON_CODE_LEN)?;
         let action = crate::domain::adjustment::manual::ManualAdjustmentAction::parse(&self.action)
             .ok_or_else(|| {
@@ -2578,20 +2610,23 @@ impl ManualAdjustmentRequest {
                 let side = leg.side.parse::<Side>().map_err(|_| {
                     DomainError::InvalidRequest(format!("unknown side {:?}", leg.side))
                 })?;
+                let amount = parse_money("legs.amount", leg.amount)?;
+                require_same_spec("legs.amount", &amount, &currency)?;
                 Ok(crate::domain::adjustment::manual::ManualLeg {
                     account_class,
                     side,
-                    amount_minor: leg.amount_minor,
+                    amount,
                     revenue_stream: leg.revenue_stream,
                 })
             })
             .collect::<Result<Vec<_>, DomainError>>()?;
+        let tax = lower_tax(self.tax, &currency)?;
         Ok(crate::domain::adjustment::manual::ManualAdjustmentRequest {
             tenant_id: self.tenant_id,
             payer_tenant_id: self.payer_tenant_id,
             adjustment_id: self.adjustment_id,
             action,
-            currency: self.currency,
+            currency,
             legs,
             reason_code: self.reason_code,
             preparer_actor_id,
@@ -2599,7 +2634,7 @@ impl ManualAdjustmentRequest {
             // POST body (the preparer is the authenticated subject; SoD is enforced
             // by the ApprovalService when the gross crosses the D2 threshold).
             approver_actor_id: None,
-            tax: self.tax.into_iter().map(TaxBreakdown::from).collect(),
+            tax,
         })
     }
 }
@@ -2631,13 +2666,13 @@ impl From<bss_ledger_sdk::PostingRef> for ManualAdjustmentResponse {
 /// the `(entry, post)` PEP gate authorizes it. Idempotent on `debit_note_id` (the
 /// `(tenant, DEBIT_NOTE, debit_note_id)` engine claim): a replay returns the prior
 /// posting with `replayed = true`. A debit note **raises** the invoice's headroom
-/// (`debit_note_total_minor += amount`); it cannot trip the headroom cap.
+/// (`debit_note_total += amount`); it cannot trip the headroom cap.
 ///
-/// `amount_minor` is **incl-tax** (the single DR `AR`); `tax_minor` is the posted
-/// tax evidence (CR `TAX_PAYABLE`, never recomputed); `deferred_minor` is how much
-/// of the ex-tax revenue portion (`amount_minor − tax_minor`) defers to
+/// `amount` is **incl-tax** (the single DR `AR`); `tax_amount` is the posted
+/// tax evidence (CR `TAX_PAYABLE`, never recomputed); `deferred` is how much
+/// of the ex-tax revenue portion (`amount − tax_amount`) defers to
 /// `CONTRACT_LIABILITY` (the rest recognizes now to `REVENUE`). When
-/// `deferred_minor > 0` the `recognition` spec drives the schedule build (D4 — the
+/// `deferred > 0` the `recognition` spec drives the schedule build (D4 — the
 /// SAME `ScheduleBuilder` path the invoice-post uses) and is REQUIRED (a deferred
 /// note with no spec is a `400`). A malformed shape is rejected `400` by the
 /// domain `validate_shape`; a closed payer is `PAYER_CLOSED`.
@@ -2662,30 +2697,27 @@ pub struct DebitNoteRequest {
     pub origin_invoice_item_ref: Option<String>,
     /// The revenue stream the charge books against (per-stream legs carry it).
     pub revenue_stream: String,
-    /// ISO-4217 currency of the note (all legs share it).
-    pub currency: String,
-    /// Advisory currency scale; the ledger resolves the authoritative one.
-    pub scale: u8,
-    /// The note amount **incl-tax**, in minor units (`>= 0`, `> 0` enforced) — the
-    /// single DR `AR`.
-    pub amount_minor: i64,
-    /// The tax slice of `amount_minor` posted onto `TAX_PAYABLE` (`>= 0`,
-    /// `<= amount_minor`). Posted tax evidence — never recomputed.
-    pub tax_minor: i64,
+    /// The note amount **incl-tax**, in major units (`> 0`) — the single DR `AR`,
+    /// with the note's currency and stored scale (every other monetary field
+    /// shares them).
+    pub amount: MoneyDto,
+    /// The tax slice of `amount` posted onto `TAX_PAYABLE` (`>= 0`,
+    /// `<= amount`). Posted tax evidence — never recomputed.
+    pub tax_amount: MoneyDto,
     /// The authoritative tax breakdown — one component per `(jurisdiction,
     /// filing-period, rate)`, each posting onto its OWN `TAX_PAYABLE` leg so
     /// `tax_subbalance` disaggregates (§4.5). Empty ⇒ a single dimensionless tax leg
-    /// from `tax_minor` (legacy). A non-empty breakdown MUST sum to `tax_minor` (a
-    /// `400` otherwise); `tax_minor` stays the split scalar.
+    /// from `tax_amount` (legacy). A non-empty breakdown MUST sum to `tax_amount` (a
+    /// `400` otherwise); `tax_amount` stays the split scalar.
     pub tax: Vec<TaxBreakdownDto>,
     /// How much of the ex-tax revenue amount is deferred to `CONTRACT_LIABILITY`
-    /// (`0 <= … <= amount_minor − tax_minor`); the rest recognizes now. `0` ⇒ fully
+    /// (`0 <= … <= amount − tax_amount`); the rest recognizes now. `0` ⇒ fully
     /// recognized (no `CONTRACT_LIABILITY` line, no schedule build).
-    pub deferred_minor: i64,
+    pub deferred: MoneyDto,
     /// The mandatory business reason / context code (AC #14). Non-empty.
     pub reason_code: String,
     /// The ASC 606 recognition spec (Slice 4 — the SAME shape the invoice-post
-    /// item carries). REQUIRED when `deferred_minor > 0` (drives the schedule
+    /// item carries). REQUIRED when `deferred > 0` (drives the schedule
     /// build, D4); `None` for a fully-recognized note.
     pub recognition: Option<RecognitionInputDto>,
 }
@@ -2693,9 +2725,8 @@ pub struct DebitNoteRequest {
 impl DebitNoteRequest {
     /// Lower the wire DTO into the domain
     /// [`crate::domain::adjustment::debit_note::DebitNoteRequest`], validating the
-    /// client-supplied id lengths + lowering the optional `recognition` block at
-    /// the boundary. The advisory `scale` is dropped (the handler resolves the
-    /// authoritative scale).
+    /// client-supplied id lengths, the money metadata and the optional
+    /// `recognition` block at the boundary.
     ///
     /// # Errors
     /// [`DomainError::InvalidRequest`] when `debit_note_id` / `origin_invoice_id`
@@ -2710,12 +2741,18 @@ impl DebitNoteRequest {
         if let Some(item) = &self.origin_invoice_item_ref {
             validate_business_id("origin_invoice_item_ref", item)?;
         }
-        check_currency_code("currency", &self.currency)?;
         check_free_text("reason_code", &self.reason_code, MAX_REASON_CODE_LEN)?;
         let recognition = self
             .recognition
             .map(RecognitionInputDto::into_domain)
             .transpose()?;
+        let amount = parse_money("amount", self.amount)?;
+        let spec = amount.currency().clone();
+        let tax_amount = parse_money("tax_amount", self.tax_amount)?;
+        require_same_spec("tax_amount", &tax_amount, &spec)?;
+        let deferred = parse_money("deferred", self.deferred)?;
+        require_same_spec("deferred", &deferred, &spec)?;
+        let tax = lower_tax(self.tax, &spec)?;
         Ok(crate::domain::adjustment::debit_note::DebitNoteRequest {
             tenant_id: self.tenant_id,
             payer_tenant_id: self.payer_tenant_id,
@@ -2723,11 +2760,10 @@ impl DebitNoteRequest {
             origin_invoice_id: self.origin_invoice_id,
             origin_invoice_item_ref: self.origin_invoice_item_ref,
             revenue_stream: self.revenue_stream,
-            currency: self.currency,
-            amount_minor: self.amount_minor,
-            tax_minor: self.tax_minor,
-            tax: self.tax.into_iter().map(TaxBreakdown::from).collect(),
-            deferred_minor: self.deferred_minor,
+            amount,
+            tax_amount,
+            tax,
+            deferred,
             reason_code: self.reason_code,
             recognition,
         })
@@ -2757,10 +2793,10 @@ impl From<bss_ledger_sdk::PostingRef> for DebitNoteResponse {
 /// The `GET /invoices/{invoice_id}/exposure` response: an invoice's credit-note
 /// **headroom** (the `invoice_exposure` counter) plus its **true remaining AR**
 /// (the payment-reduced open receivable, design §4.7). The headroom is the room
-/// left for further credit notes: `remaining_headroom_minor = original_total_minor
-/// + `debit_note_total_minor` − `credit_note_total_minor`` (the slack in the
-/// ``credit_note_total_minor` <= `original_total_minor` + `debit_note_total_minor``
-/// CHECK, AC #24). ``open_ar_minor`` is the SEPARATE current open AR (what a credit
+/// left for further credit notes: `remaining_headroom = original_total
+/// + debit_note_total − credit_note_total` (the slack in the
+/// `credit_note_total <= original_total + debit_note_total`
+/// CHECK, AC #24). `open_ar` is the SEPARATE current open AR (what a credit
 /// note's `CR AR` leg is capped at before the wallet remainder, K-2) — distinct
 /// from the headroom (which never decreases with payments). Tenant-scoped
 /// (SQL-level BOLA): an invoice with no exposure row yet (no note ever posted) —
@@ -2771,27 +2807,25 @@ impl From<bss_ledger_sdk::PostingRef> for DebitNoteResponse {
 pub struct InvoiceExposureResponse {
     /// The invoice the exposure is for.
     pub invoice_id: String,
-    /// ISO-4217 currency of the exposure counters.
-    pub currency: String,
     /// The seeded original posted AR incl. tax (the headroom basis).
-    pub original_total_minor: i64,
+    pub original_total: MoneyDto,
     /// The running Σ debit-note incl-tax totals (raises the headroom).
-    pub debit_note_total_minor: i64,
+    pub debit_note_total: MoneyDto,
     /// The running Σ credit-note incl-tax totals (consumes the headroom).
-    pub credit_note_total_minor: i64,
+    pub credit_note_total: MoneyDto,
     /// The remaining credit-note headroom = `original + debit − credit` (`>= 0`).
-    pub remaining_headroom_minor: i64,
+    pub remaining_headroom: MoneyDto,
     /// The invoice's current open AR incl. tax (payment-reduced) — the `CR AR` cap
     /// a credit note fills before spilling to the wallet remainder. SEPARATE from
     /// the headroom.
-    pub open_ar_minor: i64,
+    pub open_ar: MoneyDto,
 }
 
 // ── Refund request/response DTOs (§4.4 / §5 / §7, Group G — money-OUT) ────────
 
 /// The `POST /refunds` request body: one PSP refund phase to record (the
 /// **money-out** side that unwinds a settled receipt). The target seller ledger
-/// is the body's own `tenant_id` (tenant in body, not path — the vhp-core REST
+/// is the body's own `tenant_id` (tenant in body, not path — the platform REST
 /// convention); the `(entry, post)` PEP gate authorizes it (a refund posts a
 /// balanced journal entry into the seller's ledger, like the credit/debit notes,
 /// design §8 / Phase-1 precedent). `pattern` selects the economic shape
@@ -2801,8 +2835,8 @@ pub struct InvoiceExposureResponse {
 /// restores), absent for Pattern A. `two_stage` defaults to `true` (the
 /// conservative `REFUND_CLEARING` shape). `relates_to_refund_id` + `direction`
 /// drive a refund-of-refund (Group E); a first-order refund omits both (direction
-/// defaults to outbound). `scale` is advisory; the ledger resolves the
-/// authoritative currency scale.
+/// defaults to outbound). `amount` carries its currency and stored scale, which
+/// MUST match the origin settlement's.
 #[derive(Debug, Clone)]
 #[toolkit_macros::api_dto(request)]
 // `*_id` fields mirror the domain `RefundRequest` / `refund` columns verbatim;
@@ -2829,12 +2863,9 @@ pub struct RefundRequest {
     /// The invoice whose AR the refund restores — REQUIRED for Pattern B, MUST be
     /// absent for Pattern A (validated by the domain `validate_shape`).
     pub invoice_id: Option<String>,
-    /// ISO-4217 currency (all legs share it; MUST match the origin settlement's).
-    pub currency: String,
-    /// The cash to return, in minor units (`> 0`).
-    pub amount_minor: i64,
-    /// Advisory currency scale; the ledger resolves the authoritative one.
-    pub scale: u8,
+    /// The cash to return, in major units (`> 0`), with its currency and stored
+    /// scale (all legs share them; MUST match the origin settlement's).
+    pub amount: MoneyDto,
     /// `true` (default) ⇒ the two-stage `REFUND_CLEARING` shape; `false` ⇒ the
     /// single-step shape (D1). `None` ⇒ `true`.
     pub two_stage: Option<bool>,
@@ -2875,7 +2906,7 @@ impl RefundRequest {
         if let Some(rel) = &self.relates_to_refund_id {
             validate_business_id("relates_to_refund_id", rel)?;
         }
-        check_currency_code("currency", &self.currency)?;
+        let amount = parse_money("amount", self.amount)?;
         let phase = RefundPhase::parse(&self.phase).ok_or_else(|| {
             DomainError::InvalidRequest(format!(
                 "unknown refund phase {:?} (expected initiated|confirmed|rejected|voided|\
@@ -2909,8 +2940,7 @@ impl RefundRequest {
             pattern,
             payment_id: self.payment_id,
             invoice_id: self.invoice_id,
-            currency: self.currency,
-            amount_minor: self.amount_minor,
+            amount,
             two_stage: self.two_stage.unwrap_or(true),
             relates_to_refund_id: self.relates_to_refund_id,
             direction,
@@ -3051,8 +3081,8 @@ pub struct RefundView {
     pub pattern: String,
     pub payment_id: String,
     pub invoice_id: Option<String>,
-    pub currency: String,
-    pub amount_minor: i64,
+    /// The refunded cash with its currency and stored scale.
+    pub amount: MoneyDto,
     /// The `REFUND_CLEARING` drain state (`PENDING` / `SETTLED` / `REVERSED`).
     pub clearing_state: String,
     /// The refund-of-refund forward link (`None` for a first-order refund).
@@ -3061,8 +3091,8 @@ pub struct RefundView {
     pub reverses_entry_id: Option<Uuid>,
 }
 
-impl From<crate::infra::storage::entity::refund::Model> for RefundView {
-    fn from(r: crate::infra::storage::entity::refund::Model) -> Self {
+impl From<crate::infra::storage::repo::adjustment_repo::RefundView> for RefundView {
+    fn from(r: crate::infra::storage::repo::adjustment_repo::RefundView) -> Self {
         Self {
             refund_id: r.refund_id,
             psp_refund_id: r.psp_refund_id,
@@ -3070,8 +3100,7 @@ impl From<crate::infra::storage::entity::refund::Model> for RefundView {
             pattern: r.pattern,
             payment_id: r.payment_id,
             invoice_id: r.invoice_id,
-            currency: r.currency,
-            amount_minor: r.amount_minor,
+            amount: MoneyDto::from(&r.amount),
             clearing_state: r.clearing_state,
             relates_to_refund_id: r.relates_to_refund_id,
             reverses_entry_id: r.reverses_entry_id,
@@ -3081,9 +3110,9 @@ impl From<crate::infra::storage::entity::refund::Model> for RefundView {
 
 /// The `GET /credit-notes` / `GET /credit-notes/{creditNoteId}` response: the
 /// recorded credit note (Phase 1b / read-surface §5). Drawn from the
-/// `credit_note` row (the `(tenant, credit_note_id)` grain). `amount_minor` is
-/// incl-tax; `recognized_part_minor` + `deferred_part_minor` are the ex-tax split
-/// parts and do NOT sum to `amount_minor` (no CHECK — they mirror the entity).
+/// `credit_note` row (the `(tenant, credit_note_id)` grain). `amount` is
+/// incl-tax; `recognized_part` + `deferred_part` are the ex-tax split
+/// parts and do NOT sum to `amount` (no CHECK — they mirror the entity).
 /// Tenant-scoped (SQL-level BOLA): an unknown credit note — or one outside the
 /// caller's subtree — yields a `404` (no existence leak). Mirrors [`RefundView`].
 #[derive(Debug, Clone)]
@@ -3095,13 +3124,13 @@ pub struct CreditNoteView {
     /// The originating invoice item the note targets (`None` when whole-invoice).
     pub origin_invoice_item_ref: Option<String>,
     pub revenue_stream: String,
-    pub currency: String,
-    pub amount_minor: i64,
+    /// The incl-tax note amount with its currency and stored scale.
+    pub amount: MoneyDto,
     /// The ex-tax recognized part of the split (does NOT sum with the deferred
-    /// part to `amount_minor`).
-    pub recognized_part_minor: i64,
+    /// part to `amount`).
+    pub recognized_part: MoneyDto,
     /// The ex-tax deferred part of the split.
-    pub deferred_part_minor: i64,
+    pub deferred_part: MoneyDto,
     /// The schedule/split basis the `RecognizedDeferredSplitter` keyed on
     /// (`None` when the split needed no schedule basis).
     pub split_basis_ref: Option<String>,
@@ -3110,17 +3139,16 @@ pub struct CreditNoteView {
     pub created_at_utc: OffsetDateTime,
 }
 
-impl From<crate::infra::storage::entity::credit_note::Model> for CreditNoteView {
-    fn from(c: crate::infra::storage::entity::credit_note::Model) -> Self {
+impl From<crate::infra::storage::repo::adjustment_repo::CreditNoteView> for CreditNoteView {
+    fn from(c: crate::infra::storage::repo::adjustment_repo::CreditNoteView) -> Self {
         Self {
             credit_note_id: c.credit_note_id,
             origin_invoice_id: c.origin_invoice_id,
             origin_invoice_item_ref: c.origin_invoice_item_ref,
             revenue_stream: c.revenue_stream,
-            currency: c.currency,
-            amount_minor: c.amount_minor,
-            recognized_part_minor: c.recognized_part_minor,
-            deferred_part_minor: c.deferred_part_minor,
+            amount: MoneyDto::from(&c.amount),
+            recognized_part: MoneyDto::from(&c.recognized_part),
+            deferred_part: MoneyDto::from(&c.deferred_part),
             split_basis_ref: c.split_basis_ref,
             reason_code: c.reason_code,
             created_at_utc: c.created_at_utc,
@@ -3130,9 +3158,9 @@ impl From<crate::infra::storage::entity::credit_note::Model> for CreditNoteView 
 
 /// The `GET /debit-notes` / `GET /debit-notes/{debitNoteId}` response: the
 /// recorded debit note — an additional charge (Phase 1b / read-surface §5). Drawn
-/// from the `debit_note` row (the `(tenant, debit_note_id)` grain). `amount_minor`
-/// is incl-tax; `recognized_part_minor` + `deferred_part_minor` are the ex-tax
-/// split parts and do NOT sum to `amount_minor` (no CHECK). The `debit_note`
+/// from the `debit_note` row (the `(tenant, debit_note_id)` grain). `amount`
+/// is incl-tax; `recognized_part` + `deferred_part` are the ex-tax
+/// split parts and do NOT sum to `amount` (no CHECK). The `debit_note`
 /// table is leaner than `credit_note` (NO `revenue_stream` / `reason_code` /
 /// item ref). Tenant-scoped (SQL-level BOLA): an unknown debit note — or one
 /// outside the caller's subtree — yields a `404` (no existence leak). Mirrors
@@ -3143,25 +3171,24 @@ impl From<crate::infra::storage::entity::credit_note::Model> for CreditNoteView 
 pub struct DebitNoteView {
     pub debit_note_id: String,
     pub origin_invoice_id: String,
-    pub currency: String,
-    pub amount_minor: i64,
+    /// The incl-tax note amount with its currency and stored scale.
+    pub amount: MoneyDto,
     /// The ex-tax recognized part of the split.
-    pub recognized_part_minor: i64,
+    pub recognized_part: MoneyDto,
     /// The ex-tax deferred part of the split.
-    pub deferred_part_minor: i64,
+    pub deferred_part: MoneyDto,
     #[serde(with = "rfc3339")]
     pub created_at_utc: OffsetDateTime,
 }
 
-impl From<crate::infra::storage::entity::debit_note::Model> for DebitNoteView {
-    fn from(d: crate::infra::storage::entity::debit_note::Model) -> Self {
+impl From<crate::infra::storage::repo::adjustment_repo::DebitNoteView> for DebitNoteView {
+    fn from(d: crate::infra::storage::repo::adjustment_repo::DebitNoteView) -> Self {
         Self {
             debit_note_id: d.debit_note_id,
             origin_invoice_id: d.origin_invoice_id,
-            currency: d.currency,
-            amount_minor: d.amount_minor,
-            recognized_part_minor: d.recognized_part_minor,
-            deferred_part_minor: d.deferred_part_minor,
+            amount: MoneyDto::from(&d.amount),
+            recognized_part: MoneyDto::from(&d.recognized_part),
+            deferred_part: MoneyDto::from(&d.deferred_part),
             created_at_utc: d.created_at_utc,
         }
     }
@@ -3171,7 +3198,7 @@ impl From<crate::infra::storage::entity::debit_note::Model> for DebitNoteView {
 /// dispute's current state (read-surface R3). Drawn from the `ledger_dispute` row
 /// (the `(tenant, dispute_id)` grain) — its chosen `variant` (`CASH_HOLD` /
 /// `AR_RECLASS`), the current `cycle` + `last_phase` (`OPENED` / `WON` / `LOST`),
-/// the `disputed_amount_minor`, and the `cash_hold_minor` actually moved into
+/// the `disputed_amount`, and the `cash_hold` actually moved into
 /// `DISPUTE_HOLD` at open (`0` for `AR_RECLASS`). The persisted `version` (the
 /// optimistic-concurrency counter) is INTERNAL and not surfaced. Tenant-scoped
 /// (SQL-level BOLA): an unknown dispute — or one outside the caller's subtree —
@@ -3182,7 +3209,6 @@ impl From<crate::infra::storage::entity::debit_note::Model> for DebitNoteView {
 pub struct DisputeView {
     pub dispute_id: String,
     pub payment_id: String,
-    pub currency: String,
     /// The chosen variant (`CASH_HOLD` ⇒ cash moved to `DISPUTE_HOLD` at open /
     /// `AR_RECLASS` ⇒ AR reclassed `ACTIVE`→`DISPUTED`, no cash leg).
     pub variant: String,
@@ -3190,23 +3216,23 @@ pub struct DisputeView {
     pub last_phase: String,
     /// The dispute cycle (re-opens advance it; the `last_phase` is at this cycle).
     pub cycle: i32,
-    pub disputed_amount_minor: i64,
+    /// The gross disputed claim with its currency and stored scale.
+    pub disputed_amount: MoneyDto,
     /// The cash held in `DISPUTE_HOLD` at open (`0` for `AR_RECLASS`) — the size
     /// the `won`/`lost` outcome releases / forfeits.
-    pub cash_hold_minor: i64,
+    pub cash_hold: MoneyDto,
 }
 
-impl From<crate::infra::storage::entity::dispute::Model> for DisputeView {
-    fn from(d: crate::infra::storage::entity::dispute::Model) -> Self {
+impl From<crate::infra::storage::repo::dispute_repo::DisputeState> for DisputeView {
+    fn from(d: crate::infra::storage::repo::dispute_repo::DisputeState) -> Self {
         Self {
             dispute_id: d.dispute_id,
             payment_id: d.payment_id,
-            currency: d.currency,
-            variant: d.variant,
-            last_phase: d.last_phase,
+            variant: d.variant.as_str().to_owned(),
+            last_phase: d.last_phase.as_str().to_owned(),
             cycle: d.cycle,
-            disputed_amount_minor: d.disputed_amount_minor,
-            cash_hold_minor: d.cash_hold_minor,
+            disputed_amount: MoneyDto::from(&d.disputed_amount),
+            cash_hold: MoneyDto::from(&d.cash_hold),
         }
     }
 }
@@ -3255,32 +3281,30 @@ impl From<crate::infra::storage::entity::recognition_run::Model> for Recognition
 #[toolkit_macros::api_dto(response)]
 pub struct SettlementView {
     pub payment_id: String,
-    pub currency: String,
     /// The gross settled amount recorded for the payment (money-in).
-    pub settled_minor: i64,
+    pub settled: MoneyDto,
     /// The PSP fee withheld from the settled receipt.
-    pub fee_minor: i64,
+    pub fee: MoneyDto,
     /// The portion of the pool already drained to open AR (money-out).
-    pub allocated_minor: i64,
+    pub allocated: MoneyDto,
     /// The portion already returned to the payer via refunds.
-    pub refunded_minor: i64,
+    pub refunded: MoneyDto,
     /// The portion refunded from the still-unallocated pool (Pattern A).
-    pub refunded_unallocated_minor: i64,
+    pub refunded_unallocated: MoneyDto,
     /// The portion clawed back (a refund-of-refund / PSP claw-back).
-    pub clawed_back_minor: i64,
+    pub clawed_back: MoneyDto,
 }
 
-impl From<crate::infra::storage::entity::payment_settlement::Model> for SettlementView {
-    fn from(s: crate::infra::storage::entity::payment_settlement::Model) -> Self {
+impl From<crate::infra::storage::repo::payment_repo::SettlementState> for SettlementView {
+    fn from(s: crate::infra::storage::repo::payment_repo::SettlementState) -> Self {
         Self {
             payment_id: s.payment_id,
-            currency: s.currency,
-            settled_minor: s.settled_minor,
-            fee_minor: s.fee_minor,
-            allocated_minor: s.allocated_minor,
-            refunded_minor: s.refunded_minor,
-            refunded_unallocated_minor: s.refunded_unallocated_minor,
-            clawed_back_minor: s.clawed_back_minor,
+            settled: MoneyDto::from(&s.settled),
+            fee: MoneyDto::from(&s.fee),
+            allocated: MoneyDto::from(&s.allocated),
+            refunded: MoneyDto::from(&s.refunded),
+            refunded_unallocated: MoneyDto::from(&s.refunded_unallocated),
+            clawed_back: MoneyDto::from(&s.clawed_back),
         }
     }
 }
@@ -3387,9 +3411,12 @@ impl From<crate::infra::storage::entity::payer_state::Model> for PayerStateView 
 #[derive(Debug, Clone)]
 #[toolkit_macros::api_dto(response)]
 pub struct DualControlPolicyView {
-    /// The D2 amount threshold in USD-equivalent minor units: a governed money-out
-    /// / grant at or above this needs preparer→approver sign-off.
-    pub d2_threshold_minor: i64,
+    /// The per-currency D2 amount thresholds: a governed money-out / grant at or
+    /// above the threshold of its currency needs preparer→approver sign-off. A
+    /// currency with no override resolves the symbolic platform default rule.
+    pub d2_thresholds: Vec<MoneyDto>,
+    /// The symbolic rule applied to a currency with no `d2_thresholds` override.
+    pub d2_default_rule: String,
     /// The A6 material-backdating window in business days.
     pub a6_backdating_biz_days: i32,
     /// The TTL (seconds) a fresh `PENDING` / `NEEDS_REWORK` approval lives before
@@ -3415,18 +3442,25 @@ impl DualControlPolicyView {
         let Some(v) = effective else {
             let d = DualControlPolicy::DEFAULT;
             return Self {
-                d2_threshold_minor: d.d2_threshold_minor,
-                a6_backdating_biz_days: d.a6_backdating_biz_days,
-                pending_ttl_seconds: d.pending_ttl_seconds,
+                d2_thresholds: d.d2_thresholds().iter().map(MoneyDto::from).collect(),
+                d2_default_rule: D2_DEFAULT_RULE.to_owned(),
+                a6_backdating_biz_days: d.a6_backdating_biz_days(),
+                pending_ttl_seconds: d.pending_ttl_seconds(),
                 effective_from: None,
                 version: None,
                 is_default: true,
             };
         };
         Self {
-            d2_threshold_minor: v.policy.d2_threshold_minor,
-            a6_backdating_biz_days: v.policy.a6_backdating_biz_days,
-            pending_ttl_seconds: v.policy.pending_ttl_seconds,
+            d2_thresholds: v
+                .policy
+                .d2_thresholds()
+                .iter()
+                .map(MoneyDto::from)
+                .collect(),
+            d2_default_rule: D2_DEFAULT_RULE.to_owned(),
+            a6_backdating_biz_days: v.policy.a6_backdating_biz_days(),
+            pending_ttl_seconds: v.policy.pending_ttl_seconds(),
             effective_from: Some(v.effective_from),
             version: Some(v.version),
             is_default: false,
@@ -3436,17 +3470,49 @@ impl DualControlPolicyView {
 
 // ── FX & multi-currency (Slice 5) ────────────────────────────────────────────
 
-/// Light boundary check for a currency code on an FX ingest: non-empty, ASCII,
-/// ≤ 10 chars (the gear admits non-ISO/crypto codes — same envelope as the
-/// `read_unallocated` query guard). An unvalidated code would silently match zero
-/// rows at lock time instead of a clean 400 here.
+/// Boundary check for a currency code on an FX ingest: the same allowlist the
+/// money contract and the rate store enforce (`CurrencySpec`: 1–16 uppercase
+/// ASCII letters or digits; non-ISO/crypto codes admitted). A code the store
+/// would refuse is a clean 400 here instead of a 500 from the repository.
 fn check_currency_code(field: &str, code: &str) -> Result<(), DomainError> {
-    if code.is_empty() || code.len() > 10 || !code.is_ascii() {
-        return Err(DomainError::InvalidRequest(format!(
-            "{field} must be a non-empty ASCII code of at most 10 chars, got {code:?}"
-        )));
-    }
-    Ok(())
+    // The scale is irrelevant to the code check; 0 is always in range.
+    CurrencySpec::try_new(code.to_owned(), 0)
+        .map(|_| ())
+        .map_err(|e| money_field_error(field, e))
+}
+
+/// Lower a wire money value, naming the offending field in the diagnostic. The
+/// value is validated (currency shape, 0..=28 scale, 28-digit coefficient,
+/// posting increment) and never rounded.
+pub(crate) fn parse_money(field: &str, value: MoneyDto) -> Result<PostedMoney, DomainError> {
+    PostedMoney::try_from(value).map_err(|error| money_field_error(field, error))
+}
+
+/// Project a money validation failure onto the `DomainError` ladder (the same
+/// variant mapping as the domain's `map_money_error`), prefixed with the field.
+pub(crate) fn money_field_error(field: &str, error: MoneyError) -> DomainError {
+    let detail = format!("{field}: {error}");
+    crate::domain::exact_money::money_error_with_detail(error, detail)
+}
+
+/// Require a wire money value to share `reference`'s currency and stored scale:
+/// a different code is `CURRENCY_MISMATCH`, a different scale of the same code
+/// is `CURRENCY_SCALE_MISMATCH` — never an implicit conversion.
+pub(crate) fn require_same_spec(
+    field: &str,
+    value: &PostedMoney,
+    reference: &CurrencySpec,
+) -> Result<(), DomainError> {
+    value
+        .currency()
+        .ensure_same(reference)
+        .map_err(|e| money_field_error(field, e))
+}
+
+/// A zero posting in an already-validated currency and scale (always valid).
+pub(crate) fn zero_money(spec: &CurrencySpec) -> PostedMoney {
+    PostedMoney::try_new(Decimal::ZERO, spec.clone())
+        .unwrap_or_else(|_| unreachable!("zero fits every validated currency spec"))
 }
 
 /// Max bytes of a machine `reason_code` (a short enumerated-style token).
@@ -3455,7 +3521,7 @@ const MAX_REASON_CODE_LEN: usize = 64;
 const MAX_FREE_TEXT_LEN: usize = 4096;
 
 /// Light boundary cap for a persisted free-text field: reject a value whose byte
-/// length exceeds `max` (mirrors [`check_currency_code`]). An unbounded note would
+/// length exceeds `max`. An unbounded note would
 /// otherwise blow past its storage column as a 500 instead of a clean 400 here.
 fn check_free_text(field: &str, value: &str, max: usize) -> Result<(), DomainError> {
     if value.len() > max {
@@ -3470,9 +3536,9 @@ fn check_free_text(field: &str, value: &str, max: usize) -> Result<(), DomainErr
 /// Secondary manual / seed ingest of one FX rate into the local `ledger_fx_rate`
 /// store (the primary path is the `RateProviderV1` plugin pull, design §4.6 /
 /// decision 2). Upsert-keyed on `(tenant_id, base_currency, quote_currency,
-/// provider)`: re-posting the same tuple overwrites the quote (`rate_micro` /
+/// provider)`: re-posting the same tuple overwrites the quote (`rate` /
 /// `as_of` / `fallback_order`) — idempotent on `(tenant, base, quote, provider,
-/// as_of)`. `tenant_id` rides the body (the vhp-core write convention, no tenant
+/// as_of)`. `tenant_id` rides the body (the platform write convention, no tenant
 /// in the path).
 #[derive(Debug, Clone)]
 #[toolkit_macros::api_dto(request)]
@@ -3485,9 +3551,10 @@ pub struct FxRateIngestRequest {
     pub quote_currency: String,
     /// Provider id recorded verbatim (the fallback-order key, e.g. `"ecb"`).
     pub provider: String,
-    /// The rate as a fixed-precision multiplier (functional per unit transaction
-    /// × 1e6). Must be `> 0`.
-    pub rate_micro: i64,
+    /// The rate as plain decimal text: quote major units per base major unit
+    /// (functional per unit transaction). Must be `> 0`; digits are kept exactly.
+    #[schema(example = "1.0875", max_length = 64)]
+    pub rate: String,
     /// The publication timestamp that drives the staleness rule.
     #[serde(with = "rfc3339")]
     pub as_of: OffsetDateTime,
@@ -3496,14 +3563,15 @@ pub struct FxRateIngestRequest {
 }
 
 impl FxRateIngestRequest {
-    /// Validate the ingest and return the resolved `fallback_order` (defaulted to
-    /// `0`). Rejects empty/oversized currency or provider codes, a non-positive
-    /// `rate_micro`, a negative `fallback_order`, and an identity (`base ==
-    /// quote`) pair (a no-op rate the lock-time short-circuit never reads).
+    /// Validate the ingest and return the exact parsed `rate` plus the resolved
+    /// `fallback_order` (defaulted to `0`). Rejects empty/oversized currency or
+    /// provider codes, a malformed or non-positive `rate`, a negative
+    /// `fallback_order`, and an identity (`base == quote`) pair (a no-op rate the
+    /// lock-time short-circuit never reads).
     ///
     /// # Errors
     /// [`DomainError::InvalidRequest`] on any boundary violation (rendered 400).
-    pub fn validate(&self) -> Result<i32, DomainError> {
+    pub fn validate(&self) -> Result<(Decimal, i32), DomainError> {
         check_currency_code("base_currency", &self.base_currency)?;
         check_currency_code("quote_currency", &self.quote_currency)?;
         if self.base_currency == self.quote_currency {
@@ -3519,10 +3587,12 @@ impl FxRateIngestRequest {
                 self.provider
             )));
         }
-        if self.rate_micro <= 0 {
+        let rate = parse_decimal(&self.rate)
+            .map_err(|e| DomainError::InvalidRequest(format!("rate: {e}")))?;
+        if rate <= Decimal::ZERO {
             return Err(DomainError::InvalidRequest(format!(
-                "rate_micro must be > 0, got {}",
-                self.rate_micro
+                "rate must be > 0, got {}",
+                self.rate
             )));
         }
         let fallback_order = self.fallback_order.unwrap_or(0);
@@ -3531,7 +3601,7 @@ impl FxRateIngestRequest {
                 "fallback_order must be >= 0, got {fallback_order}"
             )));
         }
-        Ok(fallback_order)
+        Ok((rate, fallback_order))
     }
 }
 
@@ -3544,7 +3614,8 @@ pub struct FxRateIngestResponse {
     pub base_currency: String,
     pub quote_currency: String,
     pub provider: String,
-    pub rate_micro: i64,
+    /// The stored rate as canonical decimal text.
+    pub rate: String,
     #[serde(with = "rfc3339")]
     pub as_of: OffsetDateTime,
     pub fallback_order: i32,
@@ -3558,8 +3629,13 @@ pub struct FxRateSnapshotResponse {
     pub rate_id: Uuid,
     pub tenant_id: Uuid,
     pub base_currency: String,
+    /// The stored scale of the base (transaction) currency at lock time.
+    pub base_currency_scale: u8,
     pub quote_currency: String,
-    pub rate_micro: i64,
+    /// The stored scale of the quote (functional) currency at lock time.
+    pub quote_currency_scale: u8,
+    /// The locked rate as canonical decimal text (quote per base major unit).
+    pub rate: String,
     #[serde(with = "rfc3339")]
     pub as_of: OffsetDateTime,
     pub provider: String,
@@ -3568,26 +3644,29 @@ pub struct FxRateSnapshotResponse {
     pub triangulated_via: Option<String>,
 }
 
-impl From<crate::infra::storage::entity::fx_rate_snapshot::Model> for FxRateSnapshotResponse {
-    fn from(m: crate::infra::storage::entity::fx_rate_snapshot::Model) -> Self {
+impl From<crate::infra::storage::repo::fx_repo::RateSnapshotRow> for FxRateSnapshotResponse {
+    fn from(m: crate::infra::storage::repo::fx_repo::RateSnapshotRow) -> Self {
+        let q = m.quote;
         Self {
             rate_id: m.rate_id,
-            tenant_id: m.tenant_id,
-            base_currency: m.base_currency,
-            quote_currency: m.quote_currency,
-            rate_micro: m.rate_micro,
-            as_of: m.as_of,
-            provider: m.provider,
-            stale: m.stale,
-            fallback_order: m.fallback_order,
-            triangulated_via: m.triangulated_via,
+            tenant_id: q.tenant_id,
+            base_currency: q.base_currency.code().to_owned(),
+            base_currency_scale: q.base_currency.scale(),
+            quote_currency: q.quote_currency.code().to_owned(),
+            quote_currency_scale: q.quote_currency.scale(),
+            rate: canonical_decimal(q.rate),
+            as_of: q.as_of,
+            provider: q.provider,
+            stale: q.stale,
+            fallback_order: q.fallback_order,
+            triangulated_via: q.triangulated_via,
         }
     }
 }
 
 /// Trigger an unrealized (Mode-B) revaluation for one period across the monetary
 /// scopes `{AR, UNALLOCATED, REUSABLE_CREDIT}` (design §4.5). `tenant_id` rides
-/// the body (the vhp-core write convention). Each scope is idempotent on
+/// the body (the platform write convention). Each scope is idempotent on
 /// `(tenant, period_id, scope)` — re-posting the same period replays the
 /// already-posted scopes. A no-op when the tenant is Mode-A
 /// (`revaluation_enabled = false`).
@@ -3641,6 +3720,33 @@ pub struct RevaluationScopeOutcomeDto {
     pub entries: i64,
     /// Grains moved across those entries (a forward run only; `0` for a no-op).
     pub grains: i64,
+}
+
+// ── Reconciliation read DTOs ─────────────────────────────────────────────────
+
+/// A closed tagged variance: `kind = "money"` carries one value per currency
+/// (each with its stored scale, never summed across currencies);
+/// `kind = "missing_invoices"` carries the integer diagnostic count.
+#[derive(Debug, Clone)]
+#[toolkit_macros::api_dto(response)]
+#[serde(tag = "kind")]
+pub enum ReconciliationVarianceDto {
+    Money { by_currency: Vec<MoneyDto> },
+    MissingInvoices { count: u64 },
+}
+
+impl From<&crate::domain::reconciliation::ReconciliationVariance> for ReconciliationVarianceDto {
+    fn from(v: &crate::domain::reconciliation::ReconciliationVariance) -> Self {
+        use crate::domain::reconciliation::ReconciliationVariance;
+        match v {
+            ReconciliationVariance::Money { by_currency } => Self::Money {
+                by_currency: by_currency.iter().map(MoneyDto::from).collect(),
+            },
+            ReconciliationVariance::MissingInvoices { count } => {
+                Self::MissingInvoices { count: *count }
+            }
+        }
+    }
 }
 
 #[cfg(test)]

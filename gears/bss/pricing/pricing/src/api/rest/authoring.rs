@@ -76,6 +76,9 @@ pub struct AuthoringState {
     /// The names of the actors a read shows (D-519), through Account Management when the hub
     /// holds it.
     actor_names: bss_rest::actor_names::ActorNames,
+    /// The currencies a book and the settings may name, with their scales: the ISO 4217 table
+    /// unless the deployment adds non-ISO codes.
+    currency_scales: Arc<crate::domain::currency::CurrencyScales>,
     pipeline: tokio::sync::Mutex<Option<Pipeline>>,
 }
 /// The running outbox processor: the broker SDK's producer, or the holding one.
@@ -133,6 +136,7 @@ impl AuthoringState {
             outbox,
             clock: Arc::new(crate::infra::reference_work::WallClock),
             actor_names,
+            currency_scales: Arc::default(),
             pipeline: tokio::sync::Mutex::new(Some(pipeline)),
         })
     }
@@ -149,6 +153,23 @@ impl AuthoringState {
             actor_names,
             ..self
         }
+    }
+    /// The same state resolving currencies through `currency_scales`: the deployment's table of
+    /// non-ISO codes beside the ISO one. A state that never calls this knows ISO codes only.
+    #[must_use]
+    pub fn with_currency_scales(
+        self,
+        currency_scales: Arc<crate::domain::currency::CurrencyScales>,
+    ) -> Self {
+        Self {
+            currency_scales,
+            ..self
+        }
+    }
+    /// The currencies this gear prices in, and the scale of each.
+    #[must_use]
+    pub fn currency_scales(&self) -> &crate::domain::currency::CurrencyScales {
+        &self.currency_scales
     }
     pub(crate) async fn stop(&self) {
         match self.pipeline.lock().await.take() {
@@ -181,9 +202,11 @@ pub fn router(state: Arc<AuthoringState>, openapi: &dyn OpenApiRegistry) -> Rout
         .description(
             "Creates a price book of the tenant with a code, a name, one currency, an optional \
              validity window and an optional description of at most 2000 characters (D-444); the \
-             Idempotency-Key replays the first answer. The currency must be one the tenant \
-             settings offer, when they offer any (D-438). The code is at most 64 characters and \
-             the name 200 (D-457). Refusals: 400 BOOK_CODE_REQUIRED, BOOK_NAME_REQUIRED, \
+             Idempotency-Key replays the first answer. The currency must be one the currency \
+             table resolves: an ISO 4217 code with a scale, or a non-ISO code the deployment's \
+             currency_scales adds (D-529); else 400 BOOK_CURRENCY_INVALID. It must also be one \
+             the tenant settings offer, when they offer any (D-438). The code is at most 64 \
+             characters and the name 200 (D-457). Refusals: 400 BOOK_CODE_REQUIRED, BOOK_NAME_REQUIRED, \
              BOOK_CURRENCY_INVALID, BOOK_VALIDITY_INVALID, BOOK_DESCRIPTION_TOO_LONG, or \
              FIELD_TOO_LONG on a code or a name over its cap; 409 CURRENCY_NOT_OFFERED, \
              BOOK_CODE_TAKEN or IDEMPOTENCY_CONFLICT.",
@@ -288,7 +311,7 @@ pub fn router(state: Arc<AuthoringState>, openapi: &dyn OpenApiRegistry) -> Rout
         .operation_id("bss_pricing.get_settings")
         .summary("Read the tenant settings")
         .description(
-            "Returns the tenant's billing defaults (timing, rounding, GL code, tax category), \
+            "Returns the tenant's billing defaults (timing, GL code, tax category), \
              invoice-line templates by SKU type and the currencies a new book may take (empty: \
              any), with who wrote them last and when, and its version as the ETag; the defaults \
              apply, with no writer, until the settings are first written. An If-None-Match that \
@@ -318,14 +341,15 @@ pub fn router(state: Arc<AuthoringState>, openapi: &dyn OpenApiRegistry) -> Rout
         .description(
             "Replaces the tenant settings at the version the caller read (If-Match), currencies \
              included (required; [] offers any currency, D-438), and records the caller and the \
-             time. Rounding is half_up, half_even, half_down, up or down (D-437). A GL code or a \
-             tax category other than the stored one is at most 64 characters, and a line template \
+             time. Each offered currency is one the currency table resolves, listed once; else 400 \
+             CURRENCY_INVALID naming the code and the reason (D-529), or with a fixed message that \
+             does not repeat a value that is not three uppercase letters. A GL code or a tax \
+             category other than the stored one is at most 64 characters, and a line template \
              other than the one stored for its SKU type 2000; a stored text sent back unchanged \
-             passes whatever its length (D-457). Refusals: 400 TIMING_INVALID, ROUNDING_REQUIRED, \
-             ROUNDING_INVALID, SKU_TYPE_INVALID, CURRENCY_INVALID, an invalid line template \
-             (LINE_TEMPLATE_EMPTY, LINE_TEMPLATE_INVALID), or FIELD_TOO_LONG on a changed \
-             default_gl, default_tax_category or invoice_line_templates over its cap; 409 \
-             STALE_REVISION.",
+             passes whatever its length (D-457). Refusals: 400 TIMING_INVALID, SKU_TYPE_INVALID, \
+             CURRENCY_INVALID, an invalid line template (LINE_TEMPLATE_EMPTY, \
+             LINE_TEMPLATE_INVALID), or FIELD_TOO_LONG on a changed default_gl, \
+             default_tax_category or invoice_line_templates over its cap; 409 STALE_REVISION.",
         )
         .tag("Pricing")
         .authenticated()
@@ -734,9 +758,11 @@ fn approval_routes(router: Router, openapi: &dyn OpenApiRegistry) -> Router {
              409 PRICE_NOT_DRAFT, PRICE_LOCKED_PENDING or UNIT_CONTENDED, or a guard of a cancel \
              or an end (PRICE_NOT_SCHEDULED, PRICE_CHANGE_PENDING, PRICE_BOUND, \
              PRICE_ALREADY_ENDED, D-520, D-521), or a price of a released entry (BOOK_ARCHIVED \
-             while its book is archived, else ENTRY_REFERENCE_RELEASED, D-522); 503 \
-             REGISTRY_UNAVAILABLE when Products cannot answer a usage chain's dated metering \
-             read (D-402).",
+             while its book is archived, else ENTRY_REFERENCE_RELEASED, D-522), or \
+             CURRENCY_SCALE_CHANGED for a draft stored at another scale than the currency table \
+             gives today (edit the draft and submit it again), or BOOK_CURRENCY_INVALID when the \
+             table no longer lists the book's currency; 503 REGISTRY_UNAVAILABLE when Products \
+             cannot answer a usage chain's dated metering read (D-402).",
         )
         .tag("Pricing")
         .authenticated()
@@ -849,8 +875,11 @@ fn approval_routes(router: Router, openapi: &dyn OpenApiRegistry) -> Router {
              cancel or an end (PRICE_NOT_SCHEDULED, PRICE_CHANGE_PENDING when another pending \
              change or the same unit names its price, PRICE_BOUND, PRICE_ALREADY_ENDED, D-520, \
              D-521), or a price of a released entry (BOOK_ARCHIVED while its book is archived, \
-             else ENTRY_REFERENCE_RELEASED, D-522); 503 REGISTRY_UNAVAILABLE when Products \
-             cannot answer a usage chain's dated metering read (D-402).",
+             else ENTRY_REFERENCE_RELEASED, D-522), or CURRENCY_SCALE_CHANGED for a draft stored \
+             at another scale than the currency table gives today (edit the draft and submit it \
+             again), or BOOK_CURRENCY_INVALID when the table no longer lists the book's \
+             currency; 503 REGISTRY_UNAVAILABLE when Products cannot answer a usage chain's \
+             dated metering read (D-402).",
         )
         .tag("Pricing")
         .authenticated()
@@ -978,9 +1007,13 @@ fn approval_routes(router: Router, openapi: &dyn OpenApiRegistry) -> Router {
              Refusals: 400 GENERATION_MISMATCH, UNIT_STALE or NOTE_TOO_LONG; 403 SOD_VIOLATION \
              for the submitter or the author; 409 DUPLICATE_VOTE, UNIT_ALREADY_DECIDED or \
              APPLY_REFUSED, and PRICE_ALREADY_STARTED when a price the unit cancels started \
-             after its submit (D-520); 503 REGISTRY_UNAVAILABLE when Products cannot answer a \
-             read the applying vote's rules make: a plan revision's checks, or a usage chain's \
-             dated metering (D-402).",
+             after its submit (D-520), CURRENCY_SCALE_CHANGED when a draft of the unit is stored \
+             at another scale than the currency table gives today (the submitter withdraws the \
+             unit, edits the draft and submits it again; a cancel or end row keeps its price's \
+             scale and is never refused for it), or BOOK_CURRENCY_INVALID when the table no \
+             longer lists the book's currency; 503 REGISTRY_UNAVAILABLE when Products cannot \
+             answer a read the applying vote's rules make: a plan revision's checks, or a usage \
+             chain's dated metering (D-402).",
         )
         .tag("Pricing")
         .authenticated()
@@ -1250,6 +1283,7 @@ async fn submit_price(
         digest,
         approve_scope,
         submit_scope,
+        currency_scales: state.currency_scales.clone(),
     };
     approvals::submit_price(&state.db.db(), cmd, id).await
 }
@@ -1292,6 +1326,7 @@ async fn submit_plan_revision(
         digest,
         approve_scope,
         submit_scope,
+        currency_scales: state.currency_scales.clone(),
     };
     approvals::submit_revision(&state.db.db(), cmd, id, note).await
 }
@@ -1385,6 +1420,7 @@ async fn publish_changes(
         digest,
         approve_scope,
         submit_scope,
+        currency_scales: state.currency_scales.clone(),
     };
     approvals::publish(&state.db.db(), cmd, id, input).await
 }
@@ -1686,6 +1722,7 @@ async fn approve_unit(
         digest,
         approve_scope,
         submit_scope,
+        currency_scales: state.currency_scales.clone(),
     };
     approvals::vote(
         &state.db.db(),
@@ -1733,6 +1770,7 @@ async fn reject_unit(
         digest,
         approve_scope,
         submit_scope,
+        currency_scales: state.currency_scales.clone(),
     };
     approvals::vote(
         &state.db.db(),
@@ -1778,6 +1816,7 @@ async fn withdraw_unit(
         digest,
         approve_scope,
         submit_scope,
+        currency_scales: state.currency_scales.clone(),
     };
     approvals::vote(&state.db.db(), cmd, id, approvals::Vote::Withdraw, None).await
 }
@@ -1893,10 +1932,18 @@ fn price_routes(router: Router, openapi: &dyn OpenApiRegistry) -> Router {
             "Adds a draft price to an entry's chain, and a temporary price's return partner with \
              it; the Idempotency-Key replays the answer. The money is in the entry's model and \
              the price carries no model of its own (D-427). The note is at most 2000 characters \
-             (D-457). Refusals: 400 for a rule the price breaks (for example PRICE_MISSING for \
-             money of another model's shape, AMOUNT_INVALID, WINDOW_START_IN_PAST, \
+             (D-457). Every decimal is a JSON string of plain decimal text, stored in its \
+             canonical form (30.00 is stored as 30; D-527, D-528). Refusals: 400 for a rule the price breaks \
+             (for example PRICE_MISSING for money of another model's shape, AMOUNT_INVALID for a \
+             decimal sent as a JSON number, text that is not plain decimal text, a negative value \
+             or a zero package size, the message naming the field, AMOUNT_OUT_OF_RANGE for a \
+             decimal over its limit (a rate takes 12 fractional places, a threshold or a package \
+             size 28, and any decimal 28 digits), MIN_FEE_INVALID, WINDOW_START_IN_PAST, \
              DIM_VALUE_UNKNOWN or PRICE_INSIDE_TEMPORARY), or NOTE_TOO_LONG; 409 \
-             ENTRY_REFERENCE_LOST.",
+             ENTRY_REFERENCE_LOST, or BOOK_CURRENCY_INVALID when the currency table no longer \
+             lists the book's currency. A new price, and a temporary price's return, store the \
+             book's currency at the scale the currency table gives it today (currency, \
+             currency_scale; D-531).",
         )
         .tag("Pricing")
         .authenticated()
@@ -1926,12 +1973,17 @@ fn price_routes(router: Router, openapi: &dyn OpenApiRegistry) -> Router {
              returned to - and both halves are judged as the create judges them; the answer is \
              the edited price, its paired_price_id naming its partner now, or null. A return's \
              own dates, a temporary price's chain (dim_value), an end on any other price and a \
-             null end are 400 TEMPORARY_PRICE_FIXED. Refusals: 400 for a rule the change breaks \
-             (for example WINDOW_END_INVALID, WINDOW_START_IN_PAST or \
-             TEMPORARY_SPANS_A_CHANGE), or NOTE_TOO_LONG on a note over 2000 characters \
-             (D-457); 403 NOT_DRAFT_AUTHOR; 409 PRICE_NOT_DRAFT (the price or \
-             its partner, or a cancel or end row, which is deleted instead, D-520) or \
-             STALE_REVISION.",
+             null end are 400 TEMPORARY_PRICE_FIXED. Every PATCH, whatever it changes, stores \
+             the currency scale the currency table gives the book's currency today, and the fee \
+             is judged on that scale: a draft refused with CURRENCY_SCALE_CHANGED is edited (a \
+             note is enough) and submitted again. Of a temporary pair whose dates stay, only the \
+             edited half takes the new scale. Refusals: 400 for a rule the change breaks (for \
+             example AMOUNT_INVALID or AMOUNT_OUT_OF_RANGE as on the create, MIN_FEE_INVALID, \
+             WINDOW_END_INVALID, WINDOW_START_IN_PAST or TEMPORARY_SPANS_A_CHANGE), or \
+             NOTE_TOO_LONG on a note over 2000 characters (D-457); 403 NOT_DRAFT_AUTHOR; 409 \
+             PRICE_NOT_DRAFT (the price or its partner, or a cancel or end row, which is deleted \
+             instead, D-520), STALE_REVISION, or BOOK_CURRENCY_INVALID when the currency table \
+             no longer lists the book's currency.",
         )
         .tag("Pricing")
         .authenticated()
@@ -1998,6 +2050,7 @@ async fn create_price(
         key,
         digest,
         input,
+        state.currency_scales.clone(),
     )
     .await
 }
@@ -2025,7 +2078,17 @@ async fn patch_price(
     let version = preconditions::if_match(&headers)?.get();
     let input: dto::PricingPricePatch = preconditions::parse_body(&body)?;
     input.caps()?;
-    prices::patch(&state.db.db(), scope, ctx, correlation, id, version, input).await
+    prices::patch(
+        &state.db.db(),
+        scope,
+        ctx,
+        correlation,
+        id,
+        version,
+        input,
+        state.currency_scales.clone(),
+    )
+    .await
 }
 async fn delete_price(
     Extension(state): Extension<Arc<AuthoringState>>,
@@ -2079,12 +2142,14 @@ async fn create_book(
     let digest = preconditions::request_digest(&payload)?;
     let body: PriceBookCreate = preconditions::parse_body(&body)?;
     body.caps()?;
+    let scales = Arc::clone(&state.currency_scales);
     transaction(&state.db.db(), move |tx| {
         let (scope, ctx, body) = (scope.clone(), ctx.clone(), body.clone());
         let (key, digest) = (key.clone(), digest.clone());
-        Box::pin(
-            async move { books::create(tx, &scope, &ctx, correlation, &key, &digest, body).await },
-        )
+        let scales = Arc::clone(&scales);
+        Box::pin(async move {
+            books::create(tx, &scope, &ctx, correlation, &key, &digest, body, &scales).await
+        })
     })
     .await
 }
@@ -2499,10 +2564,12 @@ async fn put_settings(
     let version = preconditions::if_match(&headers)?.get();
     // D-457: the caps are judged against the stored settings (`configuration::put_settings`).
     let body: PricingSettingsPut = preconditions::parse_body(&body)?;
+    let scales = Arc::clone(&state.currency_scales);
     transaction(&state.db.db(), move |tx| {
         let (scope, ctx, body) = (scope.clone(), ctx.clone(), body.clone());
+        let scales = Arc::clone(&scales);
         Box::pin(async move {
-            configuration::put_settings(tx, &scope, &ctx, correlation, version, body).await
+            configuration::put_settings(tx, &scope, &ctx, correlation, version, body, &scales).await
         })
     })
     .await
@@ -2702,8 +2769,9 @@ async fn get_entry(
             let version = preconditions::RowVersion::from_stored(m.version)
                 .map_err(CanonicalError::from)?
                 .get();
-            let shown =
-                price_book_entries::shows_money(tx, books.as_ref(), tenant, m.book_id).await?;
+            let money =
+                price_book_entries::money_book(tx, books.as_ref(), tenant, m.book_id).await?;
+            let shown = money.as_ref().map(|book| book.currency.as_str());
             let body = price_book_entries::read(tx, tenant, vec![m], shown, today)
                 .await?
                 .pop()

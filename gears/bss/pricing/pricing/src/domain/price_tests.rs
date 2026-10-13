@@ -3,7 +3,7 @@ use super::*;
 use crate::domain::{
     money::PriceData,
     price_book_entry::{ChargeKind, Model},
-    test_support::{date, dec},
+    test_support::{date, dec, spec},
 };
 use uuid::Uuid;
 fn price(v: i32, from: &str, dim: Option<&str>, state: PriceState) -> Price {
@@ -13,6 +13,7 @@ fn price(v: i32, from: &str, dim: Option<&str>, state: PriceState) -> Price {
         version_no: v,
         dim_value: dim.map(str::to_owned),
         model: Model::PerUnit,
+        currency: spec("EUR", 2),
         price: Some(PriceData::PerUnit { rate: dec("1") }),
         min_fee: None,
         eligibility: Eligibility::All,
@@ -40,14 +41,7 @@ fn rules(
     siblings: &[Price],
     values: Option<&[String]>,
 ) -> Vec<crate::domain::RuleError> {
-    validate(
-        r,
-        ChargeKind::Usage,
-        values,
-        siblings,
-        date("2026-09-23"),
-        2,
-    )
+    validate(r, ChargeKind::Usage, values, siblings, date("2026-09-23"))
 }
 #[test]
 fn prototype_l45_l47_version_at_ignores_pending() {
@@ -106,7 +100,7 @@ fn prototype_l73_price_missing() {
     r.model = Model::Flat;
     r.price = None;
     assert_eq!(
-        validate(&r, ChargeKind::Recurring, None, &[], date("2026-09-23"), 2)[0].code,
+        validate(&r, ChargeKind::Recurring, None, &[], date("2026-09-23"))[0].code,
         "PRICE_MISSING"
     );
 }
@@ -362,18 +356,40 @@ fn matrix_12_19_closed_end_survives_twice_and_later_default() {
 #[test]
 fn matrix_18_min_fee_is_only_validated() {
     let mut r = price(9, "2026-12-01", None, PriceState::Draft);
-    for fee in ["-1", "1.001", "1.000"] {
-        r.min_fee = Some(dec(fee));
+    for fee in [dec("-1"), dec("1.001"), dec("0.0001"), Decimal::MAX] {
+        r.min_fee = Some(fee);
         assert!(
             rules(&r, &[], None)
                 .iter()
-                .any(|e| e.code == "MIN_FEE_INVALID")
+                .any(|e| e.code == "MIN_FEE_INVALID"),
+            "off the currency increment, negative or over 28 digits"
         );
     }
-    r.min_fee = Some(dec("30"));
-    assert!(rules(&r, &[], None).is_empty());
+    // The increment is judged on the normalized value: trailing zeros are not places.
+    for fee in ["30", "30.00", "1.000", "0.10", "0"] {
+        r.min_fee = Some(dec(fee));
+        assert!(rules(&r, &[], None).is_empty(), "on the currency increment");
+    }
     // `amount_for` takes no fee at all: that the fee is not applied holds by its signature
     // (PT-08), and resolve serves it as stored (tests/read_contract.rs).
+}
+#[test]
+fn the_minimum_fee_is_judged_on_the_price_s_own_scale() {
+    let mut r = price(9, "2026-12-01", None, PriceState::Draft);
+    r.min_fee = Some(dec("1.001"));
+    let refused = |r: &Price| {
+        rules(r, &[], None)
+            .iter()
+            .any(|e| e.code == "MIN_FEE_INVALID")
+    };
+    assert!(refused(&r), "three places at scale 2");
+    r.currency = spec("EUR", 3);
+    assert!(!refused(&r), "three places at the price's stored scale 3");
+    r.min_fee = Some(dec("1.5"));
+    r.currency = spec("JPY", 0);
+    assert!(refused(&r), "one place at scale 0");
+    r.min_fee = Some(dec("2.0"));
+    assert!(!refused(&r), "trailing zeros are not places");
 }
 #[test]
 fn matrix_18_amount_package_and_start_invalid() {
@@ -385,7 +401,7 @@ fn matrix_18_amount_package_and_start_invalid() {
         package_size: dec("0"),
         package_price: dec("5"),
     });
-    assert_eq!(rules(&r, &[], None)[0].code, "PACKAGE_FIELDS_INVALID");
+    assert_eq!(rules(&r, &[], None)[0].code, "AMOUNT_INVALID");
     assert_eq!(
         parse_start("2026-02-30").unwrap_err().code,
         "WINDOW_START_INVALID"

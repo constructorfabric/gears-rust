@@ -53,7 +53,9 @@
 
 use std::sync::Arc;
 
-use bss_ledger_sdk::{AccountClass, MappingStatus, PostingRef, Side, SourceDocType};
+use bss_ledger_sdk::{
+    AccountClass, MappingStatus, PostedMoney, PostingRef, Side, SourceDocType, canonical_decimal,
+};
 use chrono::Datelike;
 use sea_orm::DbErr;
 use toolkit_db::secure::{AccessScope, DbTx};
@@ -62,17 +64,17 @@ use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
 use crate::domain::adjustment::manual::{
-    ManualAdjustmentReject, ManualAdjustmentRequest, ManualLeg, govern,
+    ManualAdjustmentReject, ManualAdjustmentRequest, ManualLeg, govern, governed_gross,
 };
 use crate::domain::approval::ApprovalKind;
 use crate::domain::approval::intent::{ApprovalIntent, ManualAdjustmentIntent};
 use crate::domain::approval::policy::OperationFacts;
 use crate::domain::error::DomainError;
+use crate::domain::exact_money::{map_exact_error, sum_posted};
 use crate::domain::instant::to_naive_date;
 use crate::domain::model::{NewEntry, NewLine};
 use crate::infra::approval::service::ApprovalService;
 use crate::infra::audit::secured_audit_sink::{AuditEventType, SecuredAuditSink};
-use crate::infra::currency_scale::CurrencyScaleResolver;
 use crate::infra::events::payloads::{
     AlarmCategory, AlarmSeverity, LedgerInvariantAlarm, ManualAdjustmentPosted,
 };
@@ -80,6 +82,7 @@ use crate::infra::events::publisher::LedgerEventPublisher;
 use crate::infra::posting::chart::load_chart;
 use crate::infra::posting::service::{PostSidecar, PostedFacts, PostingService};
 use crate::infra::storage::repo::ReferenceRepo;
+use crate::infra::v1_payload::v1_minor_units_for;
 use time::OffsetDateTime;
 
 /// Origin literal stamped on posts made through this service (mirrors the peer
@@ -95,20 +98,19 @@ const CODE_MANUAL_ADJUSTMENT_NOT_ALLOWED: &str = "MANUAL_ADJUSTMENT_NOT_ALLOWED"
 pub struct ManualAdjustmentHandler {
     posting: PostingService,
     reference: ReferenceRepo,
-    resolver: CurrencyScaleResolver,
     /// The event publisher — threaded into the posting engine AND held so the in-txn
     /// sidecar can publish `billing.ledger.manual_adjustment.posted`, and so the
     /// write-off path can raise the `AttemptedWriteOff` alarm out-of-band.
     publisher: Arc<LedgerEventPublisher>,
     /// The Slice-6 secured-audit port — the write-off path captures the actor on its
     /// OWN committed transaction (the post was rejected, so there is no post txn to
-    /// ride). No-op until Slice 6 (VHP-1858) merges its real store.
+    /// ride). No-op until Slice 6 merges its real store.
     audit: Arc<dyn SecuredAuditSink>,
     /// Provider held to open the out-of-band write-off capture transaction (the
     /// reject has no post txn to ride). A cheap clone of the same provider the
     /// posting engine + repos wrap.
     db: DBProvider<DbError>,
-    /// The dual-control engine (VHP-1852, Group 5 / Phase 3). `Some` ⇒ a governed
+    /// The dual-control engine. `Some` ⇒ a governed
     /// manual adjustment whose gross crosses the tenant's D2 threshold is gated to the
     /// preparer→approver queue ([`DomainError::DualControlRequired`]) instead of
     /// posting inline; `None` ⇒ gating is disabled (the executor's approved replay,
@@ -136,11 +138,9 @@ impl ManualAdjustmentHandler {
     ) -> Self {
         let posting = PostingService::new(db.clone(), Arc::clone(&publisher));
         let reference = ReferenceRepo::new(db.clone());
-        let resolver = CurrencyScaleResolver::new(ReferenceRepo::new(db.clone()));
         Self {
             posting,
             reference,
-            resolver,
             publisher,
             audit,
             db,
@@ -236,6 +236,10 @@ impl ManualAdjustmentHandler {
                 self.capture_and_page_write_off(ctx, scope, &req, &d).await;
                 return Err(DomainError::ManualAdjustmentNotAllowed(d));
             }
+            // A money-contract violation keeps its named numeric error.
+            Err(numeric @ ManualAdjustmentReject::Numeric(_)) => {
+                return Err(numeric.into_domain_error());
+            }
         }
 
         // 2. Payer gate: an AR / UNALLOCATED leg posts against a payer-scoped balance
@@ -255,7 +259,7 @@ impl ManualAdjustmentHandler {
         }
         let payer = req.payer_tenant_id.unwrap_or(req.tenant_id);
 
-        // 2b. Dual-control gate (VHP-1852, Group 5 / Phase 3 / design §1.4 D2 / §4.6).
+        // 2b. Dual-control gate (design §1.4 D2 / §4.6).
         //     A governed manual adjustment is a money-affecting governed posting, gated
         //     BEFORE the post (the journal entry does not exist at gate time — like a
         //     refund). Above the tenant's D2 threshold ⇒ a PENDING approval is created
@@ -267,15 +271,7 @@ impl ManualAdjustmentHandler {
         if gate && let Some(approval) = &self.approval {
             // Gross = Σ DR (== Σ CR; govern balanced the legs). `i128` accumulate then
             // i64 cast (govern rejected an out-of-i64 set) — the D2 comparand.
-            let gross_i128: i128 = req
-                .legs
-                .iter()
-                .filter(|l| l.side == Side::Debit)
-                .map(|l| i128::from(l.amount_minor))
-                .sum();
-            let gross = i64::try_from(gross_i128).map_err(|_| {
-                DomainError::Internal("manual adjustment gross overflows i64".to_owned())
-            })?;
+            let gross = governed_gross(&req).map_err(ManualAdjustmentReject::into_domain_error)?;
             let intent = ApprovalIntent::ManualAdjustment(ManualAdjustmentIntent::from(&req));
             let facts = OperationFacts {
                 kind: ApprovalKind::ManualAdjustment,
@@ -285,7 +281,7 @@ impl ManualAdjustmentHandler {
                 // == functional currency), so the D2 compare is currency-correct today;
                 // when FX lands this MUST source the operation's rate snapshot. Mirrors
                 // the refund gate's comment.
-                amount_usd_eq_minor: Some(gross),
+                amount: Some(gross),
                 effective_at: None,
                 has_outstanding_balance: false,
             };
@@ -301,7 +297,7 @@ impl ManualAdjustmentHandler {
 
         // 3. Resolve chart accounts + scales, assemble the engine entry + lines, and
         //    compute the gross amount (Σ DR == Σ CR; govern guaranteed the balance).
-        let (entry, lines, amount_minor) = self.assemble_post(ctx, scope, &req, payer).await?;
+        let (entry, lines, gross) = self.assemble_post(ctx, scope, &req, payer).await?;
 
         // 4. Post via the invariant engine with the in-txn event sidecar. The
         //    engine's Fresh claim on (tenant, MANUAL_ADJUSTMENT, adjustment_id) is the
@@ -318,9 +314,11 @@ impl ManualAdjustmentHandler {
                 action: req.action.as_str().to_owned(),
                 reason_code: req.reason_code.clone(),
                 actor_ref: req.preparer_actor_id.to_string(),
-                amount_minor,
-                currency: req.currency.clone(),
+                // Placeholder — the sidecar converts `gross` when it publishes.
+                amount_minor: 0,
+                currency: gross.currency().code().to_owned(),
             },
+            gross,
         });
 
         self.posting
@@ -340,24 +338,19 @@ impl ManualAdjustmentHandler {
         scope: &AccessScope,
         req: &ManualAdjustmentRequest,
         payer: Uuid,
-    ) -> Result<(NewEntry, Vec<NewLine>, i64), DomainError> {
+    ) -> Result<(NewEntry, Vec<NewLine>, PostedMoney), DomainError> {
         let chart = load_chart(&self.reference, scope, req.tenant_id).await?;
-        let scale = self
-            .resolver
-            .resolve(scope, req.tenant_id, &req.currency)
-            .await
-            .map_err(|e| DomainError::Internal(format!("currency scale resolve: {e}")))?;
 
         let eff_date = to_naive_date(OffsetDateTime::now_utc());
         let period_id = format!("{:04}{:02}", eff_date.year(), eff_date.month());
 
         let mut lines: Vec<NewLine> = Vec::with_capacity(req.legs.len());
-        let mut dr: i128 = 0;
+        let mut debits: Vec<PostedMoney> = Vec::new();
         for leg in &req.legs {
             let account_id = chart
                 .resolve(
                     leg.account_class,
-                    &req.currency,
+                    req.currency.code(),
                     leg.revenue_stream.as_deref(),
                 )
                 .ok_or_else(|| {
@@ -365,21 +358,17 @@ impl ManualAdjustmentHandler {
                         "no provisioned account for class {} / stream {:?} / currency {}",
                         leg.account_class.as_str(),
                         leg.revenue_stream,
-                        req.currency
+                        req.currency.code()
                     ))
                 })?;
             if leg.side == Side::Debit {
-                dr += i128::from(leg.amount_minor);
+                debits.push(leg.amount.clone());
             }
-            lines.push(Self::mk_line(req, leg, account_id, scale, payer));
+            lines.push(Self::mk_line(req, leg, account_id, payer));
         }
-        // govern already balanced the legs in i128 and rejected an out-of-i64 set, so
-        // the DR total fits i64; guard the cast defensively rather than truncate.
-        let amount_minor = i64::try_from(dr).map_err(|_| {
-            DomainError::Internal(format!(
-                "manual adjustment gross amount {dr} overflows i64 (govern should have rejected)"
-            ))
-        })?;
+        // The exact debit gross in the request's declared stored currency (govern
+        // already validated every leg against it).
+        let gross = sum_posted(&debits, req.currency.clone()).map_err(map_exact_error)?;
 
         let entry = NewEntry {
             entry_id: Uuid::now_v7(),
@@ -387,7 +376,7 @@ impl ManualAdjustmentHandler {
             // v1: one legal entity per tenant — derived server-side.
             legal_entity_id: req.tenant_id,
             period_id,
-            entry_currency: req.currency.clone(),
+            entry_currency: req.currency.code().to_owned(),
             source_doc_type: SourceDocType::ManualAdjustment,
             // The engine's (tenant, MANUAL_ADJUSTMENT, adjustment_id) idempotency key.
             source_business_id: req.adjustment_id.clone(),
@@ -402,7 +391,7 @@ impl ManualAdjustmentHandler {
             // Slice 5: same-currency in v1 (no FX lock on this path).
             rate_snapshot_ref: None,
         };
-        Ok((entry, lines, amount_minor))
+        Ok((entry, lines, gross))
     }
 
     /// Map one [`ManualLeg`] + its resolved chart account/scale to the engine
@@ -415,7 +404,6 @@ impl ManualAdjustmentHandler {
         req: &ManualAdjustmentRequest,
         leg: &ManualLeg,
         account_id: Uuid,
-        scale: u8,
         payer: Uuid,
     ) -> NewLine {
         NewLine {
@@ -427,15 +415,12 @@ impl ManualAdjustmentHandler {
             account_class: leg.account_class,
             gl_code: None,
             side: leg.side,
-            amount_minor: leg.amount_minor,
-            currency: req.currency.clone(),
-            currency_scale: scale,
+            money: leg.amount.clone(),
             invoice_id: None,
             due_date: None,
             revenue_stream: leg.revenue_stream.clone(),
             mapping_status: MappingStatus::Resolved,
-            functional_amount_minor: None,
-            functional_currency: None,
+            functional_money: None,
             // The MVP governed actions (rounding / suspense clean-up) move no tax, so
             // a manual-adjustment leg carries no tax dimensions.
             tax_jurisdiction: None,
@@ -503,13 +488,15 @@ impl ManualAdjustmentHandler {
             "adjustment_id": req.adjustment_id,
             "action": req.action.as_str(),
             "reason_code": req.reason_code,
+            "currency": req.currency.code(),
+            "currency_scale": req.currency.scale(),
             "legs": req
                 .legs
                 .iter()
                 .map(|l| serde_json::json!({
                     "account_class": l.account_class.as_str(),
                     "side": l.side.as_str(),
-                    "amount_minor": l.amount_minor,
+                    "amount": canonical_decimal(l.amount.amount()),
                 }))
                 .collect::<Vec<_>>(),
         });
@@ -576,8 +563,12 @@ pub struct ManualAdjustmentPostSidecar {
     /// The event payload assembled by the handler (tenant / `adjustment_id` / action /
     /// `reason_code` / `actor_ref` / `amount_minor` / currency). Its `entry_id` is a nil
     /// placeholder — [`Self::run`] substitutes the posted entry id from
-    /// [`PostedFacts`].
+    /// [`PostedFacts`]. Its `amount_minor` is a placeholder too — [`Self::run`]
+    /// converts [`Self::gross`] only when the event is actually published.
     event_template: ManualAdjustmentPosted,
+    /// The gross adjustment amount (`Σ DR`), converted to the v1 `amount_minor`
+    /// at publish time (so a replay or a failed post logs no saturation).
+    gross: PostedMoney,
 }
 
 #[async_trait::async_trait]
@@ -593,12 +584,21 @@ impl PostSidecar for ManualAdjustmentPostSidecar {
         // a publish failure rolls the whole post back. Never on replay (a replay
         // returns before the sidecar). Ids + enum codes + amount only (no PII). The
         // posted entry id is stamped here (the template carried a nil placeholder).
+        let amount_minor = v1_minor_units_for(
+            &self.gross,
+            "amount_minor",
+            &format_args!(
+                "manual_adjustment {} entry {} tenant {}",
+                self.event_template.adjustment_id, posted.entry_id, self.event_template.tenant_id
+            ),
+        );
         self.publisher
             .publish_manual_adjustment_posted(
                 &self.ctx,
                 txn,
                 ManualAdjustmentPosted {
                     entry_id: posted.entry_id,
+                    amount_minor,
                     ..self.event_template.clone()
                 },
             )

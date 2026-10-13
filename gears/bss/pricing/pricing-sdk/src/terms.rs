@@ -129,7 +129,8 @@ pub enum Rounding {
     HalfEven,
 }
 
-/// `InvoiceInputs` value in the versioned pricing read contract.
+/// `InvoiceInputs` value in the versioned pricing read contract. The line has no scale of its own:
+/// it posts at the bound price's stored scale, `price.currency.scale()`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InvoiceInputs {
     /// Template.
@@ -149,9 +150,6 @@ pub struct InvoiceInputs {
 
     /// Timing.
     pub timing: BillingTiming,
-
-    /// Currency scale.
-    pub currency_scale: u32,
 
     /// Rounding.
     pub rounding: Rounding,

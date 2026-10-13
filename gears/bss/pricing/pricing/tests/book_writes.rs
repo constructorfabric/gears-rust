@@ -1037,7 +1037,7 @@ async fn over_the_caps(f: &Fixture, named: &Named) -> Vec<Capped> {
     let tag_of = |path: String| async move { f.call("GET", &path, json!({}), None, None).await.2 };
     let settings = |field: &str, value: Value| {
         let mut body = json!({
-            "default_timing":"advance","default_rounding":"half_even","default_gl":null,
+            "default_timing":"advance","default_gl":null,
             "default_tax_category":null,"invoice_line_templates":{},"currencies":[]
         });
         body[field] = value;

@@ -20,7 +20,7 @@ tier_aggregation_window = "invoice_period"
   [[predecessor.bands]]
   from_qty = 0
   to_qty   = "open"
-  unit_amount_minor = 5
+  rate              = "0.05"
 
 [successor]
 model_kind              = "graduated"
@@ -33,7 +33,7 @@ tier_aggregation_window = "invoice_period"
   [[successor.bands]]
   from_qty = 0
   to_qty   = "open"
-  unit_amount_minor = 5
+  rate              = "0.05"
 
 [[assert]]
 expect = { publish = "rejected", error_code = "SUPERSESSION_UNIT_MISMATCH" }

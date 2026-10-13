@@ -19,7 +19,7 @@ use super::{
 };
 use crate::api::rest::closed_sets::PricingVoteOutcome;
 use crate::{
-    domain::price::{self, PriceState},
+    domain::price::{self, Price, PriceState},
     infra::{
         approval_kinds::{Kind, Subject},
         events::{
@@ -72,6 +72,8 @@ pub struct Command {
     /// Compiled once per request for the unit flags (D-497).
     pub approve_scope: AccessScope,
     pub submit_scope: AccessScope,
+    /// The currency table a `prices` unit judges its drafts' stored scales against.
+    pub currency_scales: Arc<crate::domain::currency::CurrencyScales>,
 }
 impl Command {
     fn tenant(&self) -> Uuid {
@@ -178,26 +180,31 @@ fn attach_book_identity(value: &mut serde_json::Value, books: &BTreeMap<Uuid, se
 /// Put `book { id, code, name, currency }` beside every book id a served snapshot names (D-516).
 /// One grouped read for the page, and none when no snapshot names a book. A book the tenant no
 /// longer holds leaves `book` absent, so a decided unit stays readable after its book is deleted.
-/// The stored snapshot and its fingerprint are unchanged: this is what the review reads.
+/// The stored snapshot and its fingerprint are unchanged: this is what the review reads. Answers
+/// the books it read, by id, so a caller that needs another field of one reads it no second time.
 /// # Errors
 /// Storage failures.
 async fn name_books(
     tx: &impl DBRunner,
     tenant: Uuid,
     units: &mut [PricingApprovalUnitDto],
-) -> Result<(), DoorError> {
+) -> Result<BTreeMap<Uuid, entity::price_book::Model>, DoorError> {
     let mut ids = BTreeSet::new();
     for unit in units.iter() {
         collect_book_ids(&unit.snapshot, &mut ids);
     }
     if ids.is_empty() {
-        return Ok(());
+        return Ok(BTreeMap::new());
     }
     let id_list: Vec<Uuid> = ids.iter().copied().collect();
-    let found =
-        book_repo::find_many(tx, &AccessScope::for_tenant(tenant), tenant, &id_list).await?;
+    let found: BTreeMap<Uuid, entity::price_book::Model> =
+        book_repo::find_many(tx, &AccessScope::for_tenant(tenant), tenant, &id_list)
+            .await?
+            .into_iter()
+            .map(|book| (book.id, book))
+            .collect();
     let books: BTreeMap<Uuid, serde_json::Value> = found
-        .into_iter()
+        .values()
         .map(|book| {
             (
                 book.id,
@@ -213,7 +220,7 @@ async fn name_books(
     for unit in units {
         attach_book_identity(&mut unit.snapshot, &books);
     }
-    Ok(())
+    Ok(found)
 }
 /// One unit's item authors and decisions, one statement each: what its receipt's flag and, for a
 /// plan revision, its progress are built from.
@@ -244,12 +251,14 @@ async fn load_unit(
         .map_err(approval_failure)?
         .ok_or_else(|| support::missing_what("approval_unit").into())
 }
-/// The prices of a unit's `items`, in their order, each with its entry's model (D-427): the prices
-/// and their entries in two statements whatever the number of items (PS-39).
+/// The prices of a unit's `items`, in their order, each with its entry's model (D-427) and read
+/// as every read of a stored price reads it, against its book's currency (`book_currency`): the
+/// prices and their entries in two statements whatever the number of items (PS-39).
 async fn prices_of(
     tx: &DbTx<'_>,
     store: &PricingApprovalStore,
     items: &[bss_approval::ItemRef],
+    book_currency: &str,
 ) -> Result<Vec<PricingPriceDto>, DoorError> {
     let scope = AccessScope::for_tenant(store.tenant_id);
     let ids: Vec<Uuid> = items.iter().map(|i| i.item_id).collect();
@@ -265,19 +274,20 @@ async fn prices_of(
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect();
-    let models: BTreeMap<Uuid, String> =
-        price_book_entry_repo::find_many(tx, &scope, store.tenant_id, &entry_ids)
-            .await?
-            .into_iter()
-            .map(|e| (e.id, e.model))
-            .collect();
+    let models = price_book_entry_repo::find_many(tx, &scope, store.tenant_id, &entry_ids)
+        .await?
+        .iter()
+        .map(|e| Ok((e.id, price_book_entry_repo::model_of(e)?)))
+        .collect::<Result<BTreeMap<Uuid, _>, RepoError>>()?;
     let mut prices = Vec::new();
     for item in items {
         if let Some(m) = found.remove(&item.item_id) {
             let model = models
                 .get(&m.price_book_entry_id)
+                .copied()
                 .ok_or_else(|| RepoError::CorruptRow(format!("price {} has no entry", m.id)))?;
-            prices.push(PricingPriceDto::of(m, model)?);
+            let price = price_repo::in_book(&m, model, book_currency)?;
+            prices.push(PricingPriceDto::of(m, &price)?);
         }
     }
     Ok(prices)
@@ -517,19 +527,17 @@ async fn record_prices(
         note,
         now: subject.now,
     };
+    let book = subject.book_id;
     let submitted = record(tx, outbox, cmd, &Subject::Prices(subject), submission, ids).await?;
+    let unit_id = submitted.unit.id;
     let store = cmd.store();
     // The unit's items and decisions, read once each: its prices and its unit are built from
     // them (the phase 9 review's R44).
-    let items = store
-        .items(tx, submitted.unit.id)
-        .await
-        .map_err(approval_failure)?;
+    let items = store.items(tx, unit_id).await.map_err(approval_failure)?;
     let decisions = store
-        .decisions(tx, submitted.unit.id)
+        .decisions(tx, unit_id)
         .await
         .map_err(approval_failure)?;
-    let prices = prices_of(tx, &store, &items).await?;
     let mut unit = PricingApprovalUnitDto::of(
         submitted.unit,
         &authors_of(&items),
@@ -538,7 +546,14 @@ async fn record_prices(
         &cmd.approve_scope,
         &cmd.submit_scope,
     )?;
-    name_books(tx, cmd.tenant(), std::slice::from_mut(&mut unit)).await?;
+    // The unit's snapshot names its book, so naming the books reads it: the receipt's prices
+    // carry that book's currency, read as every read of a price reads it.
+    let books = name_books(tx, cmd.tenant(), std::slice::from_mut(&mut unit)).await?;
+    let book_currency = &books
+        .get(&book)
+        .ok_or_else(|| RepoError::CorruptRow(format!("unit {unit_id} names lost book {book}")))?
+        .currency;
+    let prices = prices_of(tx, &store, &items, book_currency).await?;
     let receipt = PricingSubmitReceipt {
         applied: submitted.applied,
         unit,
@@ -601,8 +616,13 @@ pub async fn submit_price(db: &Db, cmd: Command, id: Uuid) -> Result<Response, C
                 )
                 .await?
                 .ok_or_else(support::missing_entry)?;
-                let mut subject =
-                    PricesSubject::new(cmd.ctx.clone(), cmd.hub.clone(), entry.book_id, cmd.now());
+                let mut subject = PricesSubject::new(
+                    cmd.ctx.clone(),
+                    cmd.hub.clone(),
+                    entry.book_id,
+                    cmd.now(),
+                    cmd.currency_scales.clone(),
+                );
                 subject.meter_observations = observations;
                 record_prices(tx, &outbox, &cmd, &endpoint, (subject, None), &[id]).await
             })
@@ -723,11 +743,13 @@ pub async fn submit_revision(
     .map_err(Into::into)
 }
 
-/// Every draft price of a book with its entry, chain and predecessor, in proposal order.
+/// Every draft price of a book with its entry, chain and predecessor, in proposal order. Each
+/// price is read as every read of a stored price reads it, against the book's `currency`.
 async fn proposals(
     tx: &impl DBRunner,
     tenant: Uuid,
     book: Uuid,
+    currency: &str,
 ) -> Result<Vec<PricingProposedPrice>, DoorError> {
     let children = AccessScope::for_tenant(tenant);
     let entries = price_book_entry_repo::for_book(tx, &children, tenant, book).await?;
@@ -741,19 +763,20 @@ async fn proposals(
         )
         .await?,
     );
-    let mut stored: BTreeMap<Uuid, entity::price::Model> = BTreeMap::new();
+    let mut stored: BTreeMap<Uuid, (entity::price::Model, Price)> = BTreeMap::new();
     // The chains are prices only; a draft `cancel` or `end` is listed beside them (D-520, D-521).
     let mut prices = Vec::new();
     let mut changes = Vec::new();
     for p in &entries {
         let model = price_book_entry_repo::model_of(p)?;
         for m in grouped.remove(&p.id).unwrap_or_default() {
+            let decoded = price_repo::in_book(&m, model, currency)?;
             if price_repo::is_price(&m) {
-                prices.push(price_repo::to_domain(&m, model)?);
+                prices.push(decoded.clone());
             } else {
-                changes.push(price_repo::to_domain(&m, model)?);
+                changes.push(decoded.clone());
             }
-            stored.insert(m.id, m);
+            stored.insert(m.id, (m, decoded));
         }
     }
     let policies =
@@ -766,7 +789,7 @@ async fn proposals(
     drafts.extend(price::proposed_prices(book, &owners, &changes));
     drafts.sort_by_key(|r| (r.effective_from, r.price_book_entry_id, r.version_no));
     for r in drafts {
-        let Some(m) = stored.get(&r.id) else {
+        let Some((m, decoded)) = stored.get(&r.id) else {
             continue;
         };
         if m.pending_unit_id.is_some() {
@@ -782,10 +805,9 @@ async fn proposals(
             Some(target) => stored.get(&target),
             None => price::in_force_before(&prices, r).and_then(|b| stored.get(&b.id)),
         }
-        .cloned()
-        .map(|b| PricingPriceDto::of(b, &entry.model))
+        .map(|(b, price)| PricingPriceDto::of(b.clone(), price))
         .transpose()?;
-        let price = PricingPriceDto::of(m.clone(), &entry.model)?;
+        let price = PricingPriceDto::of(m.clone(), decoded)?;
         let policy = policies.get(&entry.id).cloned();
         let entry = PricingPriceBookEntryDto::from_stored(entry, policy)?;
         out.push(PricingProposedPrice {
@@ -812,7 +834,7 @@ pub async fn publish_list(
     let model = book_repo::find(tx, scope, tenant, book)
         .await?
         .ok_or_else(support::missing)?;
-    let prices = proposals(tx, tenant, book).await?;
+    let prices = proposals(tx, tenant, book, &model.currency).await?;
     let entries: BTreeSet<Uuid> = prices.iter().map(|r| r.entry.id).collect();
     let plans = crate::infra::prices::plans_reading(tx, tenant, &entries, plans::today()).await?;
     let impact = crate::infra::prices::impact_of(prices.len(), entries.len(), &plans);
@@ -945,8 +967,13 @@ pub async fn publish(
                     .collect();
                 added.sort_unstable();
                 added.dedup();
-                let mut subject =
-                    PricesSubject::new(cmd.ctx.clone(), cmd.hub.clone(), book, cmd.now());
+                let mut subject = PricesSubject::new(
+                    cmd.ctx.clone(),
+                    cmd.hub.clone(),
+                    book,
+                    cmd.now(),
+                    cmd.currency_scales.clone(),
+                );
                 subject.meter_observations = observations;
                 subject.common_effective_date = date;
                 subject.added_partner = added;
@@ -1162,8 +1189,13 @@ fn subject_of(
 ) -> Result<Subject, DoorError> {
     match Kind::of(unit)? {
         Kind::Prices => {
-            let mut subject =
-                PricesSubject::new(cmd.ctx.clone(), cmd.hub.clone(), unit.ref_id, now);
+            let mut subject = PricesSubject::new(
+                cmd.ctx.clone(),
+                cmd.hub.clone(),
+                unit.ref_id,
+                now,
+                cmd.currency_scales.clone(),
+            );
             subject.common_effective_date = unit.common_effective_date;
             // Every `prices` unit records the partners publish-changes pulled in (an empty list
             // when none); one that does not read is a corrupt row, never "no partner" (PS-06).

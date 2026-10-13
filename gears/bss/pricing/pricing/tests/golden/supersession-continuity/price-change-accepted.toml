@@ -19,12 +19,12 @@ tier_aggregation_window = "invoice_period"
   [[predecessor.bands]]
   from_qty = 0
   to_qty   = 1000
-  unit_amount_minor = 5
+  rate              = "0.05"
 
   [[predecessor.bands]]
   from_qty = 1000
   to_qty   = "open"
-  unit_amount_minor = 3
+  rate              = "0.03"
 
 [successor]
 model_kind              = "graduated"
@@ -37,12 +37,12 @@ tier_aggregation_window = "invoice_period"
   [[successor.bands]]
   from_qty = 0
   to_qty   = 2000
-  unit_amount_minor = 7
+  rate              = "0.07"
 
   [[successor.bands]]
   from_qty = 2000
   to_qty   = "open"
-  unit_amount_minor = 4
+  rate              = "0.04"
 
 [[assert]]
 expect = { publish = "accepted" }

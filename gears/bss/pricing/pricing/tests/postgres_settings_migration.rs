@@ -1,7 +1,6 @@
 //! D-438 on Postgres: the same forward migration as `settings_migration.rs`, tables in schema
 //! `bss`. A database is migrated by the gear's whole list without 000014 through the toolkit
-//! runner and holds one tenant's settings row with a legacy rounding; the list runs again and
-//! applies 000014 alone. The structure is proved by the Postgres schema dump, before and after and
+//! runner and holds one tenant's settings row; the list runs again and applies 000014 alone. The structure is proved by the Postgres schema dump, before and after and
 //! against a fresh chain; the row by its columns; and the application's doors read and rewrite it.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
@@ -72,9 +71,9 @@ async fn seeded() -> Pg {
         .execute_raw(Statement::from_string(
             DbBackend::Postgres,
             format!(
-                "INSERT INTO bss.pricing_settings (tenant_id, default_timing, default_rounding, \
-                 default_gl, default_tax_category, invoice_line_templates, version, created_at, \
-                 updated_at) VALUES ('{TENANT}'::uuid, 'arrears', 'bankers', 'GL-1', 'std', \
+                "INSERT INTO bss.pricing_settings (tenant_id, default_timing, default_gl, \
+                 default_tax_category, invoice_line_templates, version, created_at, \
+                 updated_at) VALUES ('{TENANT}'::uuid, 'arrears', 'GL-1', 'std', \
                  '{{\"usage\":\"{{sku}} usage\"}}'::jsonb, 3, '2026-09-01T09:00:00Z', \
                  '2026-09-02T10:00:00Z')"
             ),
@@ -132,8 +131,7 @@ async fn postgres_the_forward_migration_adds_currencies_and_updated_by_and_keeps
     assert_eq!(dump_after, dump(&fresh).await, "upgraded and fresh agree");
     assert!(migrate(&pg, None).await.unwrap().applied_names.is_empty());
 
-    // Through the application: the legacy row reads, keeps its rounding only if it is rewritten
-    // with a mode of the set, and the PUT stamps the writer.
+    // Through the application: the legacy row reads, and a PUT that rewrites it stamps the writer.
     let state = state_on(DBProvider::new(pg.db().await), Arc::new(Script::default())).await;
     let app = app_for(state, TENANT);
     let ctx = user_of(TENANT);
@@ -147,22 +145,6 @@ async fn postgres_the_forward_migration_adds_currencies_and_updated_by_and_keeps
     for field in ["version", "updated_at", "updated_by"] {
         body.as_object_mut().unwrap().remove(field);
     }
-    let (s, refused, _) = request(
-        &app,
-        &ctx,
-        "PUT",
-        "/settings",
-        body.clone(),
-        Some(&tag),
-        None,
-    )
-    .await;
-    assert_eq!(s, 400, "{refused}");
-    assert!(
-        refused.to_string().contains("ROUNDING_INVALID"),
-        "{refused}"
-    );
-    body["default_rounding"] = json!("half_even");
     body["currencies"] = json!(["EUR", "USD"]);
     let (s, saved, _) = request(&app, &ctx, "PUT", "/settings", body, Some(&tag), None).await;
     assert_eq!(s, 200, "{saved}");

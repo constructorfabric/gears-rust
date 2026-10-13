@@ -1,4 +1,4 @@
-//! Axum handler + router for payer-closure (VHP-1852 Phase 2).
+//! Axum handler + router for payer-closure.
 //! `POST /bss-ledger/v1/payers/{payer_tenant_id}/close` — set the payer's
 //! lifecycle to CLOSED for the caller's own tenant. Closing a payer that still
 //! holds a balance routes through dual-control (409 `DUAL_CONTROL_REQUIRED` →
@@ -189,7 +189,7 @@ async fn close_payer(
     });
     let facts = OperationFacts {
         kind: ApprovalKind::PayerClosure,
-        amount_usd_eq_minor: None,
+        amount: None,
         effective_at: None,
         has_outstanding_balance: has_balance,
     };

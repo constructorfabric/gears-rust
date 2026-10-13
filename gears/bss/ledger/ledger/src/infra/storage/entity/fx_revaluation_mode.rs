@@ -1,5 +1,5 @@
 //! `SeaORM` entity for `bss.ledger_tenant_fx_revaluation_mode` — per-tenant,
-//! append-only effective-dated FX revaluation-mode versions (VHP-1986): whether
+//! append-only effective-dated FX revaluation-mode versions: whether
 //! BSS runs the period-end unrealized revaluation (`MODE_B` = ledger of record)
 //! or defers to the tenant's ERP (`MODE_A`, the fail-safe default). The
 //! revaluation job / period-close pick the row in effect at decision time (latest

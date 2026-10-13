@@ -1546,6 +1546,8 @@ async fn postgres_the_sku_reads_and_the_value_counts_read_set_based() {
             version_no: n,
             dim_value: dim.map(str::to_owned),
             price_json: serde_json::json!({"rate":"0.1"}),
+            currency: "EUR".into(),
+            currency_scale: 2,
             min_fee: None,
             eligibility: "all".into(),
             effective_from: date("2031-01-01") + time::Duration::days(i64::from(n)),

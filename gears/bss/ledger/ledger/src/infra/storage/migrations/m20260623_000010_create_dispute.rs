@@ -37,19 +37,20 @@ const PG_UP_STATEMENTS: &[&str] = &[
         variant               varchar(16)   NOT NULL,
         last_phase            varchar(16)   NOT NULL,
         cycle                 integer       NOT NULL DEFAULT 1,
-        disputed_amount_minor bigint        NOT NULL DEFAULT 0,
-        cash_hold_minor       bigint        NOT NULL DEFAULT 0,
+        disputed_amount             text        NOT NULL DEFAULT '0' CHECK (bss.ledger_decimal_valid(disputed_amount, currency_scale)),
+        cash_hold                   text        NOT NULL DEFAULT '0' CHECK (bss.ledger_decimal_valid(cash_hold, currency_scale)),
         version               bigint        NOT NULL DEFAULT 0,
+        currency_scale              smallint NOT NULL CHECK (currency_scale BETWEEN 0 AND 28),
         PRIMARY KEY (tenant_id, dispute_id),
         CONSTRAINT chk_ledger_dispute_variant
             CHECK (variant IN ('CASH_HOLD','AR_RECLASS')),
         CONSTRAINT chk_ledger_dispute_last_phase
             CHECK (last_phase IN ('OPENED','WON','LOST','PARTIAL')),
         CONSTRAINT chk_ledger_dispute_cycle CHECK (cycle >= 1),
-        CONSTRAINT chk_ledger_dispute_amount_nonneg CHECK (disputed_amount_minor >= 0),
-        CONSTRAINT chk_ledger_dispute_cash_hold_nonneg CHECK (cash_hold_minor >= 0),
+        CONSTRAINT chk_ledger_dispute_amount_nonneg CHECK (disputed_amount::numeric >= 0),
+        CONSTRAINT chk_ledger_dispute_cash_hold_nonneg CHECK (cash_hold::numeric >= 0),
         CONSTRAINT chk_ledger_dispute_cash_hold_le_disputed
-            CHECK (cash_hold_minor <= disputed_amount_minor)
+            CHECK (cash_hold::numeric <= disputed_amount::numeric)
     )",
     "CREATE INDEX ledger_dispute_payment_idx ON bss.ledger_dispute (tenant_id, payment_id)",
 ];
@@ -70,19 +71,18 @@ const SQLITE_UP_STATEMENTS: &[&str] = &[
         variant               varchar(16)   NOT NULL,
         last_phase            varchar(16)   NOT NULL,
         cycle                 integer       NOT NULL DEFAULT 1,
-        disputed_amount_minor bigint        NOT NULL DEFAULT 0,
-        cash_hold_minor       bigint        NOT NULL DEFAULT 0,
+        disputed_amount             text        NOT NULL DEFAULT '0' CHECK (length(disputed_amount) BETWEEN 1 AND 31),
+        cash_hold                   text        NOT NULL DEFAULT '0' CHECK (length(cash_hold) BETWEEN 1 AND 31),
         version               bigint        NOT NULL DEFAULT 0,
+        currency_scale              smallint NOT NULL CHECK (currency_scale BETWEEN 0 AND 28),
         PRIMARY KEY (tenant_id, dispute_id),
         CONSTRAINT chk_ledger_dispute_variant
             CHECK (variant IN ('CASH_HOLD','AR_RECLASS')),
         CONSTRAINT chk_ledger_dispute_last_phase
             CHECK (last_phase IN ('OPENED','WON','LOST','PARTIAL')),
         CONSTRAINT chk_ledger_dispute_cycle CHECK (cycle >= 1),
-        CONSTRAINT chk_ledger_dispute_amount_nonneg CHECK (disputed_amount_minor >= 0),
-        CONSTRAINT chk_ledger_dispute_cash_hold_nonneg CHECK (cash_hold_minor >= 0),
-        CONSTRAINT chk_ledger_dispute_cash_hold_le_disputed
-            CHECK (cash_hold_minor <= disputed_amount_minor)
+        CONSTRAINT chk_ledger_dispute_amount_nonneg CHECK (substr(disputed_amount, 1, 1) <> '-'),
+        CONSTRAINT chk_ledger_dispute_cash_hold_nonneg CHECK (substr(cash_hold, 1, 1) <> '-')
     )",
     "CREATE INDEX ledger_dispute_payment_idx ON ledger_dispute (tenant_id, payment_id)",
 ];

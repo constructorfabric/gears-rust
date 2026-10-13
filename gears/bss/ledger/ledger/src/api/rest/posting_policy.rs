@@ -1,4 +1,4 @@
-//! Axum handlers + router for the tenant invoice-posting policy (VHP-1853).
+//! Axum handlers + router for the tenant invoice-posting policy.
 //! `POST /bss-ledger/v1/posting-policy` appends an effective-dated version (the
 //! missing-mapping mode + the AR-aging bucket thresholds); `GET …` reads the
 //! caller tenant's effective policy. Tenant-scoped to the caller's own tenant
@@ -38,7 +38,7 @@ pub struct ApiState {
     pub posting_policy: PostingPolicyRepo,
 }
 
-/// A new posting-policy version to write (VHP-1853). `effective_from` defaults to
+/// A new posting-policy version to write. `effective_from` defaults to
 /// now when omitted. An unknown `missing_mapping_mode`, or empty / non-positive /
 /// non-monotone `ar_aging_thresholds`, is rejected (400), never coerced.
 #[derive(Debug, Clone)]
@@ -100,7 +100,7 @@ pub fn router(state: Arc<ApiState>, openapi: &dyn OpenApiRegistry) -> Router {
         .description(
             "Writes a new effective-dated invoice-posting policy version (the \
              missing-mapping mode + the AR-aging bucket thresholds) for the \
-             caller's tenant (VHP-1853). Append-only: a new version supersedes; \
+             caller's tenant. Append-only: a new version supersedes; \
              the orchestrator / aging read pick the latest effective_from (highest \
              version on a tie). An unknown mode or empty / non-positive / \
              non-monotone thresholds are rejected (400), never coerced. Requires \

@@ -2,7 +2,7 @@
 //! `POST /bss-ledger/v1/provisioning` (seed the ledger; target tenant in the
 //! body) and `GET /bss-ledger/v1/accounts` (list the chart of accounts; seller
 //! from `$filter=tenant_id eq …`, the caller's own by default).
-//! Tenant is carried in body/query (not the path) per the vhp-core REST
+//! Tenant is carried in body/query (not the path) per the platform REST
 //! convention (RBAC/RMS) — see the gear's invoice-posting impl design.
 //!
 //! The gear's first REST surface. Translates the provisioning request into the
@@ -58,10 +58,12 @@ pub fn router(state: Arc<ApiState>, openapi: &dyn OpenApiRegistry) -> Router {
         .operation_id("bss_ledger.provision")
         .summary("Provision a seller legal-entity (idempotent, additive)")
         .description(
-            "Seeds the chart of accounts, non-ISO currency scales, the \
-             fiscal-calendar config, and the initial OPEN fiscal period for the \
-             seller legal-entity named by the body's `tenant_id`. Re-calls are \
-             additive: existing rows are a no-op.",
+            "Seeds the chart of accounts, the currency scales of codes with no \
+             ISO 4217 minor-unit scale, the fiscal-calendar config, and the initial OPEN fiscal \
+             period for the seller legal-entity named by the body's `tenant_id`. An \
+             ISO 4217 code always has its ISO scale: a row for it may only repeat \
+             that scale, and another scale refuses the whole request with 400 and \
+             writes nothing. Re-calls are additive: existing rows are a no-op.",
         )
         .tag(TAG)
         .authenticated()
@@ -79,7 +81,7 @@ pub fn router(state: Arc<ApiState>, openapi: &dyn OpenApiRegistry) -> Router {
         // Malformed body / bad enum literals / out-of-range scale all surface
         // as canonical `InvalidArgument` = HTTP 400 (the canonical taxonomy has
         // no 422; this projects the architecture's RFC-9457 codes onto the
-        // platform error layer, like every other vhp-core gear).
+        // platform error layer, like every other gear).
         .error_400(openapi)
         .error_401(openapi)
         .error_403(openapi)

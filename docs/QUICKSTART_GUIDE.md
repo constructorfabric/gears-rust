@@ -48,6 +48,7 @@ Each gear has a QUICKSTART.md with minimal curl examples:
 - [File Parser](../gears/file-parser/QUICKSTART.md) - Parse documents into structured blocks
 - [Nodes Registry](../gears/system/nodes-registry/QUICKSTART.md) - Hardware and system info
 - [Tenant Resolver](../gears/system/tenant-resolver/QUICKSTART.md) - Multi-tenant hierarchy
+- [Construct](../gears/construct/QUICKSTART.md) - Gear foundation (placeholder note route and client)
 
 > **Note:** Gear quickstarts show basic usage only. Use `/cf/docs` for complete API documentation in the example setup. This path is configurable via `api_gateway.prefix_path`.
 

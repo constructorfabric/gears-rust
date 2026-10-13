@@ -1,5 +1,5 @@
 //! D-446: a plan revision can be `scheduled` — approved, and waiting for its sale date. A FORWARD
-//! migration (D-427 closed D-412: the chain is deployed and no shipped migration is edited again).
+//! migration (D-427). A shipped migration is edited in place only under D-534.
 //! The state CHECK of `pricing_plan_revision` (`chk_pricing_plan_revision_state`, from
 //! `m20260926_000011`) gains `'scheduled'`, and the partial unique index
 //! `pricing_plan_revision_scheduled` admits at most one scheduled revision per plan. No column

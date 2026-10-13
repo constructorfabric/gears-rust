@@ -1,10 +1,11 @@
-//! The tenant settings (D-437, D-438): `default_rounding` is one of five modes; `currencies` is
-//! required on every PUT (a full replace, `[]` = any currency) and restricts the currency of a
-//! NEW book; the settings say who changed them and when.
+//! The tenant settings (D-438): `currencies` is required on every PUT (a full replace, `[]` = any
+//! currency) and restricts the currency of a NEW book; the settings say who changed them and
+//! when. The settings carry no rounding: invoice lines always round `HALF_EVEN`.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 mod plan_support;
-use plan_support::{Fixture, holding, setup};
+use plan_support::{Catalog, Fixture, holding, setup};
 use serde_json::{Value, json};
+use std::sync::Arc;
 
 async fn read(f: &Fixture) -> (Value, String) {
     let (s, b, tag) = f.call("GET", "/settings", json!({}), None, None).await;
@@ -14,7 +15,6 @@ async fn read(f: &Fixture) -> (Value, String) {
 fn body(currencies: Value) -> Value {
     let mut b = json!({
         "default_timing": "advance",
-        "default_rounding": "half_even",
         "default_gl": null,
         "default_tax_category": null,
         "invoice_line_templates": {},
@@ -39,7 +39,7 @@ async fn create_book(f: &Fixture, code: &str, currency: &str) -> (u16, Value) {
     (s, b)
 }
 
-/// The default rounding is banker's `half_even`, the ledger's platform default (D-437).
+/// A tenant that never wrote its settings reads version 0, and the answer names no rounding.
 #[tokio::test]
 async fn the_default_settings_say_nobody_changed_them() {
     let (f, _) = setup().await;
@@ -49,7 +49,6 @@ async fn the_default_settings_say_nobody_changed_them() {
         b,
         json!({
             "default_timing": "advance",
-            "default_rounding": "half_even",
             "default_gl": null,
             "default_tax_category": null,
             "invoice_line_templates": {},
@@ -118,30 +117,35 @@ async fn a_put_requires_currencies_and_stamps_who_and_when() {
     let _ = tag;
 }
 
+/// The tenant has no rounding setting: the PUT body is closed, so a client that still sends
+/// `default_rounding` gets the standard 400 for an unknown field, and nothing is written. The
+/// answers carry no rounding either.
 #[tokio::test]
-async fn the_rounding_is_one_of_five_modes() {
+async fn the_removed_rounding_setting_is_an_unknown_field() {
     let (f, _) = setup().await;
-    for mode in ["half_up", "half_even", "half_down", "up", "down"] {
+    for mode in ["half_even", "half_up", "bankers", ""] {
         let mut b = body(json!([]));
         b["default_rounding"] = json!(mode);
         let (s, answer, _) = put(&f, b).await;
-        assert_eq!(s, 200, "{mode}: {answer}");
-        assert_eq!(answer["default_rounding"], mode);
+        assert_eq!(s, 400, "a PUT that names default_rounding is refused");
+        assert!(
+            answer
+                .to_string()
+                .contains("unknown field `default_rounding`"),
+            "the refusal names the unknown field"
+        );
     }
-    for (mode, code) in [
-        ("bankers", "ROUNDING_INVALID"),
-        ("HALF_UP", "ROUNDING_INVALID"),
-        ("half-up", "ROUNDING_INVALID"),
-        ("ceiling", "ROUNDING_INVALID"),
-        (" ", "ROUNDING_REQUIRED"),
-        ("", "ROUNDING_REQUIRED"),
-    ] {
-        let mut b = body(json!([]));
-        b["default_rounding"] = json!(mode);
-        let (s, answer, _) = put(&f, b).await;
-        assert_eq!(s, 400, "{mode:?}: {answer}");
-        assert!(answer.to_string().contains(code), "{mode:?}: {answer}");
-    }
+    assert_eq!(read(&f).await.1, "\"0\"", "no refusal wrote anything");
+    let (s, saved, _) = put(&f, body(json!([]))).await;
+    assert_eq!(s, 200, "a PUT without default_rounding is accepted");
+    assert!(
+        saved.get("default_rounding").is_none(),
+        "the PUT answer names no rounding"
+    );
+    assert!(
+        read(&f).await.0.get("default_rounding").is_none(),
+        "the GET answer names no rounding"
+    );
 }
 
 // Probed in run 6.4: a book outside the offered currencies is refused.
@@ -185,9 +189,164 @@ async fn a_new_book_takes_an_offered_currency() {
     assert_eq!(create_book(&f, "gbp2", "GBP").await.0, 201);
 }
 
+/// The first field violation of a 400: its reason and what the client is told.
+fn violation(b: &Value) -> (&str, &str) {
+    let first = &b["context"]["field_violations"][0];
+    (
+        first["reason"].as_str().unwrap_or_default(),
+        first["description"].as_str().unwrap_or_default(),
+    )
+}
+
+/// A currency the table does not resolve is refused at the book and at the settings list, before
+/// anything is written: `ZZZ` is no ISO 4217 code, and `XTS` is ISO's test code, which has no
+/// scale. Without a configured table the ISO codes only are known. The settings refusal names the
+/// code and says whether the table does not know it or the list repeats it.
+#[tokio::test]
+async fn an_unknown_currency_is_refused_by_the_book_and_the_settings() {
+    let (f, _) = setup().await;
+    for code in ["ZZZ", "XTS", "XAU", "BTC"] {
+        let (s, b) = create_book(&f, &code.to_lowercase(), code).await;
+        assert_eq!(s, 400, "an unknown book currency is refused");
+        assert_eq!(
+            violation(&b).0,
+            "BOOK_CURRENCY_INVALID",
+            "the book names its currency"
+        );
+        let (s, b, _) = put(&f, body(json!([code]))).await;
+        assert_eq!(s, 400, "an unknown offered currency is refused");
+        let (reason, description) = violation(&b);
+        assert_eq!(reason, "CURRENCY_INVALID", "the settings name the list");
+        assert!(
+            description.contains(&format!(
+                "\"{code}\" is not a currency the currency table knows"
+            )),
+            "the refusal names the unknown code"
+        );
+    }
+    // One unknown code refuses the whole list.
+    let (s, b, _) = put(&f, body(json!(["EUR", "ZZZ"]))).await;
+    assert_eq!(s, 400, "one unknown code refuses the list");
+    assert_eq!(violation(&b).0, "CURRENCY_INVALID", "the list is refused");
+    // A code listed twice is named as repeated, not as unknown.
+    let (s, b, _) = put(&f, body(json!(["EUR", "JPY", "EUR"]))).await;
+    assert_eq!(s, 400, "a repeated code refuses the list");
+    assert_eq!(
+        violation(&b),
+        ("CURRENCY_INVALID", "EUR is listed more than once"),
+        "the refusal names the repeated code"
+    );
+    assert_eq!(read(&f).await.1, "\"0\"", "no refusal wrote anything");
+    // The ISO codes pass, at every scale.
+    for code in ["EUR", "JPY", "KWD", "CLF"] {
+        let (s, _) = create_book(&f, &code.to_lowercase(), code).await;
+        assert_eq!(s, 201, "an ISO code is a book currency");
+    }
+    let (s, _, _) = put(&f, body(json!(["EUR", "JPY", "KWD", "CLF"]))).await;
+    assert_eq!(s, 200, "ISO codes are offered");
+}
+
+/// A value that is not three uppercase letters is refused before the currency table is asked, with
+/// a fixed message: the refusal never repeats the value, however long it is.
+#[tokio::test]
+async fn an_offered_value_that_is_not_a_code_is_refused_without_repeating_it() {
+    let (f, _) = setup().await;
+    let long = "Q".repeat(4096);
+    for bad in [long.as_str(), "USDOLLAR", "<img src=x>"] {
+        let (s, b, _) = put(&f, body(json!(["EUR", bad]))).await;
+        assert_eq!(s, 400, "a value that is not a code is refused");
+        assert_eq!(
+            violation(&b),
+            (
+                "CURRENCY_INVALID",
+                "an offered currency is a currency code: three uppercase letters"
+            ),
+            "the refusal has a fixed message"
+        );
+        assert!(
+            !b.to_string().contains(bad),
+            "the refusal does not repeat the value"
+        );
+    }
+    assert_eq!(read(&f).await.1, "\"0\"", "no refusal wrote anything");
+}
+
+/// A non-ISO code is known only where the deployment configures it, and only that code: the
+/// configured table adds to the ISO one and never replaces it.
+#[tokio::test]
+async fn a_configured_non_iso_currency_is_accepted_by_the_book_and_the_settings() {
+    let f = Fixture::with_currency_scales(Arc::new(Catalog::default()), &[("XTS", 2)]).await;
+    let (s, b) = create_book(&f, "xts", "XTS").await;
+    assert_eq!(s, 201, "a configured code is a book currency");
+    assert_eq!(b["currency"], "XTS");
+    let (s, b, _) = put(&f, body(json!(["XTS", "EUR"]))).await;
+    assert_eq!(s, 200, "a configured code is offered");
+    assert_eq!(b["currencies"], json!(["XTS", "EUR"]));
+    // The other unknown codes stay refused.
+    let (s, b) = create_book(&f, "zzz", "ZZZ").await;
+    assert_eq!(s, 400, "an unlisted code stays unknown to a book");
+    assert_eq!(
+        violation(&b).0,
+        "BOOK_CURRENCY_INVALID",
+        "the book refuses it"
+    );
+    let (s, b, _) = put(&f, body(json!(["XTS", "ZZZ"]))).await;
+    assert_eq!(s, 400, "an unlisted code stays unknown to the settings");
+    assert_eq!(
+        violation(&b).0,
+        "CURRENCY_INVALID",
+        "the settings refuse it"
+    );
+}
+
+/// A book keeps its currency for life, so an edit does not judge it against today's table: a book
+/// stored under a currency the table no longer knows (a code a deployment stopped configuring)
+/// stays editable.
+#[tokio::test]
+async fn a_book_of_a_currency_the_table_forgot_stays_editable() {
+    use bss_pricing::infra::storage::{entity::price_book, repo::book_repo};
+    let (f, _) = setup().await;
+    let now = time::OffsetDateTime::now_utc();
+    let id = uuid::Uuid::new_v4();
+    book_repo::insert(
+        &f.db.conn().unwrap(),
+        &plan_support::scope(&f),
+        price_book::Model {
+            id,
+            tenant_id: f.ctx.subject_tenant_id(),
+            code: "old".into(),
+            name: "old".into(),
+            currency: "ZZZ".into(),
+            valid_from: None,
+            valid_until: None,
+            description: None,
+            version: 1,
+            created_at: now,
+            updated_at: now,
+            archived_at: None,
+            archived_by: None,
+        },
+    )
+    .await
+    .unwrap();
+    let (s, b, tag) = f
+        .call(
+            "PATCH",
+            &format!("/price-books/{id}"),
+            json!({"name":"renamed"}),
+            Some("\"1\""),
+            None,
+        )
+        .await;
+    assert_eq!(s, 200, "the book is edited");
+    assert_eq!(b["name"], "renamed");
+    assert_eq!(b["currency"], "ZZZ");
+    assert_eq!(tag, "\"2\"");
+}
+
 /// Fix run W1c L2 (D-457): only a changed text is judged. Settings stored before the caps, with a
 /// GL code, a tax category and an invoice line template each over its cap, never lock the
-/// settings: a PUT that sends them back unchanged and changes only the rounding passes. A PUT that
+/// settings: a PUT that sends them back unchanged and changes only the timing passes. A PUT that
 /// changes one of them to another text over its cap is 400 `FIELD_TOO_LONG` on that field, and
 /// nothing is written.
 #[tokio::test]
@@ -204,7 +363,6 @@ async fn a_stored_text_over_its_cap_never_locks_the_settings() {
         settings::Model {
             tenant_id: tenant,
             default_timing: "advance".into(),
-            default_rounding: "half_even".into(),
             default_gl: Some(gl.clone()),
             default_tax_category: Some(tax.clone()),
             invoice_line_templates: json!({ "usage": line }),
@@ -217,19 +375,18 @@ async fn a_stored_text_over_its_cap_never_locks_the_settings() {
     )
     .await
     .unwrap();
-    let stored = |rounding: &str| {
+    let stored = |timing: &str| {
         json!({
-            "default_timing": "advance",
-            "default_rounding": rounding,
+            "default_timing": timing,
             "default_gl": gl,
             "default_tax_category": tax,
             "invoice_line_templates": { "usage": line },
             "currencies": [],
         })
     };
-    let (s, saved, _) = put(&f, stored("half_up")).await;
+    let (s, saved, _) = put(&f, stored("arrears")).await;
     assert_eq!(s, 200, "{saved}");
-    assert_eq!(saved["default_rounding"], "half_up");
+    assert_eq!(saved["default_timing"], "arrears");
     assert_eq!(saved["default_gl"], json!(gl), "kept as stored");
     for (field, value) in [
         ("default_gl", json!(long('h', 65))),
@@ -243,7 +400,7 @@ async fn a_stored_text_over_its_cap_never_locks_the_settings() {
             json!({ "usage": line, "recurring": line }),
         ),
     ] {
-        let mut changed = stored("half_up");
+        let mut changed = stored("arrears");
         changed[field] = value.clone();
         let (s, b, _) = put(&f, changed).await;
         assert_eq!(s, 400, "{field} {value}: {b}");

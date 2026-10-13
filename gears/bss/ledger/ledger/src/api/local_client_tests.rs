@@ -1,6 +1,7 @@
-//! Pure mapper units for the in-process client — no DB. Build storage `Model`
-//! / domain `Record` values by hand and assert the row→SDK-view projection,
-//! the scale clamp, the unknown-enum fail-loud, and the OData error mapping.
+//! Pure mapper units for the in-process client — no DB. Build decoded repository
+//! read models by hand and assert the record→SDK-view projection, the
+//! unknown-enum fail-loud, and the OData error mapping. Stored money decoding and
+//! the balance views are the repository's (`journal_repo_read_model_tests`).
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -13,32 +14,22 @@
 
 use std::str::FromStr;
 
-use super::{
-    ar_invoice_model_to_view, balance_model_to_view, entry_record_to_view, line_model_to_view,
-    line_record_to_view, map_odata_page_err, parse_enum, scale_to_u8,
-};
+use super::{entry_record_to_view, line_record_to_view, map_odata_page_err, parse_enum};
 use crate::domain::model::{EntryRecord, LineRecord};
-use crate::infra::storage::entity::{account_balance, ar_invoice_balance, journal_line};
 use crate::infra::storage::repo::journal_repo::OdataPageError;
-use bss_ledger_sdk::{AccountClass, MappingStatus, Side, SourceDocType};
+use bss_ledger_sdk::{AccountClass, CurrencySpec, MappingStatus, PostedMoney, Side, SourceDocType};
 use chrono::NaiveDate;
+use rust_decimal::Decimal;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-// ---------------------------------------------------------------------------
-// scale_to_u8
-// ---------------------------------------------------------------------------
-
-#[test]
-fn scale_to_u8_passes_small_value() {
-    assert_eq!(scale_to_u8(2), 2);
-    assert_eq!(scale_to_u8(0), 0);
-}
-
-#[test]
-fn scale_to_u8_clamps_negative_to_zero() {
-    // Impossible-by-construction stored value must not panic.
-    assert_eq!(scale_to_u8(-5), 0);
+/// A USD scale-2 posting from a cent count (`1234` ⇒ `12.34`).
+fn usd_cents(minor: i64) -> PostedMoney {
+    PostedMoney::try_new(
+        Decimal::new(minor, 2),
+        CurrencySpec::try_new("USD".to_owned(), 2).expect("spec"),
+    )
+    .expect("posting")
 }
 
 // ---------------------------------------------------------------------------
@@ -58,152 +49,6 @@ fn parse_enum_unknown_literal_is_internal_500() {
 }
 
 // ---------------------------------------------------------------------------
-// balance_model_to_view
-// ---------------------------------------------------------------------------
-
-fn sample_balance_row() -> account_balance::Model {
-    account_balance::Model {
-        tenant_id: Uuid::now_v7(),
-        account_id: Uuid::now_v7(),
-        currency: "USD".to_owned(),
-        account_class: AccountClass::Revenue.as_str().to_owned(),
-        normal_side: Side::Credit.as_str().to_owned(),
-        balance_minor: 1000,
-        functional_balance_minor: None,
-        functional_currency: None,
-        last_entry_seq: None,
-        version: 1,
-    }
-}
-
-#[test]
-fn balance_model_to_view_projects_fields_and_parses_class() {
-    let row = sample_balance_row();
-    let view = balance_model_to_view(row).expect("valid class projects");
-    assert_eq!(view.account_class, AccountClass::Revenue);
-    assert_eq!(view.balance_minor, 1000);
-    assert_eq!(view.currency, "USD");
-}
-
-#[test]
-fn balance_model_to_view_unknown_class_fails_loud() {
-    let mut row = sample_balance_row();
-    row.account_class = "WAT".to_owned();
-    assert_eq!(balance_model_to_view(row).unwrap_err().status_code(), 500);
-}
-
-// ---------------------------------------------------------------------------
-// line_model_to_view
-// ---------------------------------------------------------------------------
-
-fn sample_journal_line_row() -> journal_line::Model {
-    journal_line::Model {
-        line_id: Uuid::now_v7(),
-        entry_id: Uuid::now_v7(),
-        tenant_id: Uuid::now_v7(),
-        period_id: "2025-01".to_owned(),
-        payer_tenant_id: Uuid::now_v7(),
-        seller_tenant_id: None,
-        resource_tenant_id: None,
-        account_id: Uuid::now_v7(),
-        account_class: AccountClass::Ar.as_str().to_owned(),
-        gl_code: None,
-        side: Side::Debit.as_str().to_owned(),
-        amount_minor: 5000,
-        currency: "EUR".to_owned(),
-        currency_scale: 2,
-        invoice_id: Some("INV-001".to_owned()),
-        due_date: Some(NaiveDate::from_ymd_opt(2025, 12, 31).unwrap()),
-        revenue_stream: None,
-        mapping_status: MappingStatus::Resolved.as_str().to_owned(),
-        functional_amount_minor: None,
-        functional_currency: None,
-        rate_snapshot_ref: None,
-        tax_jurisdiction: None,
-        tax_filing_period: None,
-        tax_rate_ref: None,
-        legal_entity_id: None,
-        invoice_item_ref: None,
-        sku_or_plan_ref: None,
-        price_id: None,
-        pricing_snapshot_ref: None,
-        po_allocation_group: None,
-        credit_grant_event_type: None,
-        ar_status: None,
-    }
-}
-
-#[test]
-fn line_model_to_view_projects_fields() {
-    let row = sample_journal_line_row();
-    let view = line_model_to_view(row).expect("valid row projects");
-    assert_eq!(view.account_class, AccountClass::Ar);
-    assert_eq!(view.side, Side::Debit);
-    assert_eq!(view.amount_minor, 5000);
-    assert_eq!(view.currency, "EUR");
-    assert_eq!(view.currency_scale, 2);
-    assert_eq!(view.mapping_status, MappingStatus::Resolved);
-    assert_eq!(view.invoice_id.as_deref(), Some("INV-001"));
-}
-
-#[test]
-fn line_model_to_view_unknown_side_fails_loud() {
-    let mut row = sample_journal_line_row();
-    row.side = "NEITHER".to_owned();
-    assert_eq!(line_model_to_view(row).unwrap_err().status_code(), 500);
-}
-
-#[test]
-fn line_model_to_view_unknown_class_fails_loud() {
-    let mut row = sample_journal_line_row();
-    row.account_class = "BOGUS".to_owned();
-    assert_eq!(line_model_to_view(row).unwrap_err().status_code(), 500);
-}
-
-#[test]
-fn line_model_to_view_unknown_mapping_status_fails_loud() {
-    let mut row = sample_journal_line_row();
-    row.mapping_status = "UNKNOWN_STATUS".to_owned();
-    assert_eq!(line_model_to_view(row).unwrap_err().status_code(), 500);
-}
-
-// ---------------------------------------------------------------------------
-// ar_invoice_model_to_view  (infallible mapper, no enum parsing)
-// ---------------------------------------------------------------------------
-
-fn sample_ar_invoice_row() -> ar_invoice_balance::Model {
-    ar_invoice_balance::Model {
-        tenant_id: Uuid::now_v7(),
-        payer_tenant_id: Uuid::now_v7(),
-        account_id: Uuid::now_v7(),
-        invoice_id: "INV-999".to_owned(),
-        currency: "USD".to_owned(),
-        balance_minor: 2500,
-        disputed_minor: 0,
-        functional_balance_minor: None,
-        functional_currency: None,
-        original_posted_at: Some(OffsetDateTime::now_utc()),
-        due_date: Some(NaiveDate::from_ymd_opt(2026, 1, 31).unwrap()),
-        last_entry_seq: Some(7),
-        version: 3,
-    }
-}
-
-#[test]
-fn ar_invoice_model_to_view_projects_fields() {
-    let row = sample_ar_invoice_row();
-    let payer = row.payer_tenant_id;
-    let account = row.account_id;
-    let view = ar_invoice_model_to_view(row);
-    assert_eq!(view.payer_tenant_id, payer);
-    assert_eq!(view.account_id, account);
-    assert_eq!(view.invoice_id, "INV-999");
-    assert_eq!(view.currency, "USD");
-    assert_eq!(view.balance_minor, 2500);
-    assert!(view.due_date.is_some());
-}
-
-// ---------------------------------------------------------------------------
 // line_record_to_view and entry_record_to_view
 // ---------------------------------------------------------------------------
 
@@ -220,15 +65,12 @@ fn sample_line_record() -> LineRecord {
         account_class: AccountClass::Revenue.as_str().to_owned(),
         gl_code: None,
         side: Side::Credit.as_str().to_owned(),
-        amount_minor: 800,
-        currency: "USD".to_owned(),
-        currency_scale: 2,
+        money: usd_cents(800),
         invoice_id: None,
         due_date: None,
         revenue_stream: Some("SaaS".to_owned()),
         mapping_status: MappingStatus::Resolved.as_str().to_owned(),
-        functional_amount_minor: None,
-        functional_currency: None,
+        functional_money: None,
         tax_jurisdiction: None,
         tax_filing_period: None,
         tax_rate_ref: None,
@@ -249,9 +91,8 @@ fn line_record_to_view_projects_fields() {
     let view = line_record_to_view(rec).expect("valid record projects");
     assert_eq!(view.account_class, AccountClass::Revenue);
     assert_eq!(view.side, Side::Credit);
-    assert_eq!(view.amount_minor, 800);
-    assert_eq!(view.currency, "USD");
-    assert_eq!(view.currency_scale, 2);
+    assert_eq!(view.money, usd_cents(800));
+    assert_eq!(view.money.currency().scale(), 2);
     assert_eq!(view.revenue_stream.as_deref(), Some("SaaS"));
 }
 
@@ -259,6 +100,16 @@ fn line_record_to_view_projects_fields() {
 fn line_record_to_view_unknown_side_fails_loud() {
     let mut rec = sample_line_record();
     rec.side = "SIDEWAYS".to_owned();
+    assert_eq!(line_record_to_view(rec).unwrap_err().status_code(), 500);
+}
+
+#[test]
+fn line_record_to_view_unknown_class_or_mapping_status_fails_loud() {
+    let mut rec = sample_line_record();
+    rec.account_class = "BOGUS".to_owned();
+    assert_eq!(line_record_to_view(rec).unwrap_err().status_code(), 500);
+    let mut rec = sample_line_record();
+    rec.mapping_status = "UNKNOWN_STATUS".to_owned();
     assert_eq!(line_record_to_view(rec).unwrap_err().status_code(), 500);
 }
 
@@ -346,10 +197,11 @@ mod pg {
     use authz_resolver_sdk::{AuthZResolverApi, PolicyEnforcer};
     use bss_ledger_sdk::api::LedgerClientV1;
     use bss_ledger_sdk::{
-        AccountClass, AllocateOutcome, AllocatePayment, FiscalCalendarSpec, Granularity,
-        MappingStatus, ODataQuery, PostEntry, PostLine, ProvisionAccount, ProvisionCurrencyScale,
-        ProvisionOutcome, ProvisionRequest, RecordDisputePhase, ReturnPayment,
-        RevenueDisaggregationQuery, SettlePayment, Side, SourceDocType,
+        AccountClass, AllocateOutcome, AllocatePayment, CurrencySpec, FiscalCalendarSpec,
+        Granularity, MappingStatus, ODataQuery, PostEntry, PostLine, ProvisionAccount,
+        ProvisionCurrencyScale, ProvisionOutcome, ProvisionRequest, RecordDisputePhase,
+        ReturnPayment, RevenueDisaggregationQuery, SettlePayment, SettledAmounts, Side,
+        SourceDocType,
     };
     use chrono::NaiveDate;
     use sea_orm::Database;
@@ -362,6 +214,7 @@ mod pg {
     use toolkit_security::{PlatformSecurityContext, SecurityContext};
     use uuid::Uuid;
 
+    use super::usd_cents;
     use crate::api::local_client::LedgerLocalClient;
     use crate::domain::ports::metrics::NoopLedgerMetrics;
     use crate::infra::events::publisher::LedgerEventPublisher;
@@ -540,12 +393,10 @@ mod pg {
         }
     }
 
-    /// USD at scale 2 (ISO). Default headroom (`plausible_max_major` omitted).
+    /// USD at scale 2 (ISO).
     fn usd2_scale() -> ProvisionCurrencyScale {
         ProvisionCurrencyScale {
-            currency: "USD".to_owned(),
-            minor_units: 2,
-            plausible_max_major: None,
+            currency: CurrencySpec::try_new("USD".to_owned(), 2).expect("spec"),
             source: "iso".to_owned(),
         }
     }
@@ -643,14 +494,12 @@ mod pg {
             account_class: class,
             gl_code: None,
             side,
-            amount_minor: amount,
-            currency: "USD".to_owned(),
+            money: usd_cents(amount),
             invoice_id: invoice.map(str::to_owned),
             due_date: invoice.map(|_| NaiveDate::from_ymd_opt(2026, 7, 1).unwrap()),
             revenue_stream: rstream.map(str::to_owned),
             mapping_status: MappingStatus::Resolved,
-            functional_amount_minor: None,
-            functional_currency: None,
+            functional_money: None,
             tax_jurisdiction: taxj.map(str::to_owned),
             tax_filing_period: taxj.map(|_| "2026Q3".to_owned()),
             tax_rate_ref: None,
@@ -836,7 +685,7 @@ mod pg {
         let (ar, rev, tax) = account_ids(&out);
         let mut entry = balanced_post(tenant, Uuid::now_v7(), &out.period_id, ar, rev, tax);
         // DR 1199 ≠ CR 1200 → unbalanced
-        entry.lines[0].amount_minor = 1199;
+        entry.lines[0].money = usd_cents(1199);
         let err = client.post_balanced_entry(&ctx, entry).await.unwrap_err();
         assert_eq!(err.status_code(), 400);
     }
@@ -1040,10 +889,8 @@ mod pg {
                     tenant_id: tenant,
                     payer_tenant_id: payer,
                     payment_id: "PAY-LC-1".to_owned(),
-                    gross_minor: 1000,
-                    fee_minor: 0,
-                    currency: "USD".to_owned(),
-                    scale: 2,
+                    amounts: SettledAmounts::try_new(usd_cents(1000), usd_cents(0))
+                        .expect("one currency"),
                     effective_at: None,
                 },
             )
@@ -1056,9 +903,9 @@ mod pg {
             .read_unallocated(&ctx, tenant, payer, "USD".to_owned())
             .await
             .expect("read unallocated");
-        assert_eq!(pool.balance_minor, 1000, "gross parked in UNALLOCATED");
+        assert_eq!(pool.balance, usd_cents(1000), "gross parked in UNALLOCATED");
         assert_eq!(pool.payer_tenant_id, payer);
-        assert_eq!(pool.currency, "USD");
+        assert_eq!(pool.balance.currency().code(), "USD");
 
         // Seed an open AR invoice (DR AR 400 / CR PSP_FEE 400 — PSP_FEE is
         // unguarded, so the CR from zero is allowed) into the same period.
@@ -1084,14 +931,12 @@ mod pg {
                     account_class: AccountClass::Ar,
                     gl_code: None,
                     side: Side::Debit,
-                    amount_minor: 400,
-                    currency: "USD".to_owned(),
+                    money: usd_cents(400),
                     invoice_id: Some("INV-LC".to_owned()),
                     due_date: Some(NaiveDate::from_ymd_opt(2026, 12, 1).unwrap()),
                     revenue_stream: None,
                     mapping_status: MappingStatus::Resolved,
-                    functional_amount_minor: None,
-                    functional_currency: None,
+                    functional_money: None,
                     tax_jurisdiction: None,
                     tax_filing_period: None,
                     tax_rate_ref: None,
@@ -1114,12 +959,10 @@ mod pg {
                     seller_tenant_id: Some(tenant),
                     resource_tenant_id: None,
                     gl_code: None,
-                    amount_minor: 400,
-                    currency: "USD".to_owned(),
+                    money: usd_cents(400),
                     revenue_stream: None,
                     mapping_status: MappingStatus::Resolved,
-                    functional_amount_minor: None,
-                    functional_currency: None,
+                    functional_money: None,
                     tax_jurisdiction: None,
                     tax_filing_period: None,
                     tax_rate_ref: None,
@@ -1147,9 +990,7 @@ mod pg {
                     payer_tenant_id: payer,
                     payment_id: "PAY-LC-1".to_owned(),
                     allocation_id: Uuid::now_v7(),
-                    lump_minor: 400,
-                    currency: "USD".to_owned(),
-                    scale: 2,
+                    lump: usd_cents(400),
                     hint_invoice_id: None,
                     splits: None,
                 },
@@ -1163,7 +1004,7 @@ mod pg {
         assert!(!applied.posting.replayed, "first allocate is fresh");
         assert_eq!(applied.allocations.len(), 1, "one invoice filled");
         assert_eq!(applied.allocations[0].invoice_id, "INV-LC");
-        assert_eq!(applied.allocations[0].amount_minor, 400);
+        assert_eq!(applied.allocations[0].money, usd_cents(400));
 
         // list_payment_allocations returns the persisted row as an AllocationView.
         let listed = client
@@ -1172,15 +1013,15 @@ mod pg {
             .expect("list allocations");
         assert_eq!(listed.len(), 1, "one persisted allocation row");
         assert_eq!(listed[0].invoice_id, "INV-LC");
-        assert_eq!(listed[0].amount_minor, 400);
-        assert_eq!(listed[0].currency, "USD");
+        assert_eq!(listed[0].money, usd_cents(400));
+        assert_eq!(listed[0].money.currency().code(), "USD");
 
         // The pool drained by the allocated total (1000 - 400 = 600 left).
         let pool_after = client
             .read_unallocated(&ctx, tenant, payer, "USD".to_owned())
             .await
             .expect("read unallocated after allocate");
-        assert_eq!(pool_after.balance_minor, 600, "pool drained by 400");
+        assert_eq!(pool_after.balance, usd_cents(600), "pool drained by 400");
     }
 
     /// `record_dispute_phase` with an unknown `phase` literal is rejected
@@ -1206,9 +1047,7 @@ mod pg {
                     cycle: 1,
                     phase: "not-a-phase".to_owned(),
                     funds_at_open: "withheld".to_owned(),
-                    disputed_amount_minor: 100,
-                    currency: "USD".to_owned(),
-                    scale: 2,
+                    disputed_amount: usd_cents(100),
                     effective_at: None,
                 },
             )
@@ -1328,26 +1167,42 @@ mod pg {
                 .read_account_balance(&ctx, tenant, ar)
                 .await
                 .expect("read AR"),
-            Some(1200),
+            Some(usd_cents(1200)),
             "AR reflects the posted debit"
         );
 
-        // reverse: flip every side; the header points back at the original.
-        let mut reversal = balanced_post(tenant, payer, &out.period_id, ar, rev, tax);
-        reversal.source_doc_type = SourceDocType::Reversal;
-        reversal.source_business_id = "reverses=INV-1".to_owned();
-        reversal.reverses_entry_id = Some(entry_id);
-        reversal.reverses_period_id = Some(out.period_id.clone());
-        for l in &mut reversal.lines {
-            l.side = match l.side {
-                Side::Debit => Side::Credit,
-                Side::Credit => Side::Debit,
-            };
-        }
-        client
-            .post_balanced_entry(&ctx, reversal)
+        // reverse: built from the stored original by `build_reversal` and posted
+        // through the one reversal entry point, `InvoicePostService::post_reversal`,
+        // which re-reads the stored journal facts (the generic post path refuses a
+        // `Reversal` entry by design).
+        let original = client
+            .get_entry(&ctx, tenant, entry_id)
             .await
-            .expect("reversal post");
+            .expect("get_entry")
+            .expect("original entry");
+        let reversal = crate::domain::invoice::reversal::build_reversal(
+            &original,
+            out.period_id.clone(),
+            NaiveDate::from_ymd_opt(2026, 7, 1).unwrap(),
+            tenant,
+            Uuid::now_v7(),
+        )
+        .expect("reversal must build");
+        crate::infra::invoice_post::InvoicePostService::new(
+            provider.clone(),
+            Arc::clone(&publisher),
+            Arc::new(NoopLedgerMetrics),
+            crate::config::RecognitionConfig::default(),
+            crate::config::FxConfig::default(),
+        )
+        .post_reversal(
+            &ctx,
+            &toolkit_db::secure::AccessScope::for_tenant(tenant),
+            reversal,
+            None,
+        )
+        .await
+        .expect("reversal post");
 
         // every balance nets back to zero.
         for (label, acct) in [("AR", ar), ("REVENUE", rev), ("TAX", tax)] {
@@ -1356,7 +1211,7 @@ mod pg {
                     .read_account_balance(&ctx, tenant, acct)
                     .await
                     .expect("read balance"),
-                Some(0),
+                Some(usd_cents(0)),
                 "{label} nets to zero after the reversal"
             );
         }
@@ -1367,11 +1222,7 @@ mod pg {
             .tie_out_tenant(tenant)
             .await
             .expect("tie-out runs");
-        assert!(
-            report.is_clean(),
-            "books must tie out after post+reverse: {}",
-            report.summary()
-        );
+        assert!(report.is_clean(), "books must tie out after post+reverse");
     }
 
     /// Payments E2E through the real client: provision the money-flow chart,
@@ -1392,10 +1243,7 @@ mod pg {
             tenant_id: tenant,
             payer_tenant_id: payer,
             payment_id: "PAY-1".to_owned(),
-            gross_minor: 1000,
-            fee_minor: 0,
-            currency: "USD".to_owned(),
-            scale: 2,
+            amounts: SettledAmounts::try_new(usd_cents(1000), usd_cents(0)).expect("one currency"),
             effective_at: None,
         };
 
@@ -1410,7 +1258,11 @@ mod pg {
             .read_unallocated(&ctx, tenant, payer, "USD".to_owned())
             .await
             .expect("read unallocated");
-        assert_eq!(pool.balance_minor, 1000, "settled net sits in unallocated");
+        assert_eq!(
+            pool.balance,
+            usd_cents(1000),
+            "settled net sits in unallocated"
+        );
 
         // A replay of the same payment is idempotent — same ref, no double-credit.
         let replay = client
@@ -1423,7 +1275,8 @@ mod pg {
             .await
             .expect("read unallocated after replay");
         assert_eq!(
-            pool_after.balance_minor, 1000,
+            pool_after.balance,
+            usd_cents(1000),
             "replay must not double-credit the pool"
         );
     }
@@ -1478,10 +1331,8 @@ mod pg {
                     tenant_id: tenant,
                     payer_tenant_id: payer,
                     payment_id: "PAY-1".to_owned(),
-                    gross_minor: 1200,
-                    fee_minor: 0,
-                    currency: "USD".to_owned(),
-                    scale: 2,
+                    amounts: SettledAmounts::try_new(usd_cents(1200), usd_cents(0))
+                        .expect("one currency"),
                     effective_at: None,
                 },
             )
@@ -1497,9 +1348,7 @@ mod pg {
                     payer_tenant_id: payer,
                     payment_id: "PAY-1".to_owned(),
                     allocation_id: Uuid::now_v7(),
-                    lump_minor: 1200,
-                    currency: "USD".to_owned(),
-                    scale: 2,
+                    lump: usd_cents(1200),
                     hint_invoice_id: None,
                     splits: None,
                 },
@@ -1518,8 +1367,8 @@ mod pg {
                 .read_unallocated(&ctx, tenant, payer, "USD".to_owned())
                 .await
                 .expect("read unallocated")
-                .balance_minor,
-            0,
+                .balance,
+            usd_cents(0),
             "the pool drains into AR"
         );
         assert_eq!(
@@ -1527,7 +1376,7 @@ mod pg {
                 .read_account_balance(&ctx, tenant, ar)
                 .await
                 .expect("read AR"),
-            Some(0),
+            Some(usd_cents(0)),
             "the invoice's AR is paid off"
         );
         assert!(
@@ -1562,10 +1411,8 @@ mod pg {
                     tenant_id: tenant,
                     payer_tenant_id: payer,
                     payment_id: "PAY-1".to_owned(),
-                    gross_minor: 1000,
-                    fee_minor: 0,
-                    currency: "USD".to_owned(),
-                    scale: 2,
+                    amounts: SettledAmounts::try_new(usd_cents(1000), usd_cents(0))
+                        .expect("one currency"),
                     effective_at: None,
                 },
             )
@@ -1579,9 +1426,7 @@ mod pg {
             payer_tenant_id: payer,
             payment_id: "PAY-1".to_owned(),
             psp_return_id: "RET-1".to_owned(),
-            amount_minor: 400,
-            currency: "USD".to_owned(),
-            scale: 2,
+            money: usd_cents(400),
             effective_at: None,
         };
         client
@@ -1593,8 +1438,8 @@ mod pg {
                 .read_unallocated(&ctx, tenant, payer, "USD".to_owned())
                 .await
                 .expect("read unallocated")
-                .balance_minor,
-            600,
+                .balance,
+            usd_cents(600),
             "the return claws 400 back out of the 1000 pool"
         );
 
@@ -1609,8 +1454,8 @@ mod pg {
                 .read_unallocated(&ctx, tenant, payer, "USD".to_owned())
                 .await
                 .expect("read unallocated after replay")
-                .balance_minor,
-            600,
+                .balance,
+            usd_cents(600),
             "replay must not claw back a second time"
         );
     }

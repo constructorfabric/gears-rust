@@ -34,13 +34,18 @@ use toolkit_db::{DBProvider, DbError};
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
-use bss_ledger_sdk::{IssuedInvoiceManifestV1, PspSettlementFeedV1, SourceDocType};
+use bss_ledger_sdk::{
+    IssuedInvoiceManifestV1, PspSettlementFeedV1, SourceDocType, canonical_decimal,
+};
 
 use crate::config::ReconConfig;
 use crate::domain::error::DomainError;
 use crate::domain::exception::ExceptionType;
 use crate::domain::model::RepoError;
 use crate::domain::ports::metrics::LedgerMetricsPort;
+use crate::domain::reconciliation::{
+    ReconciliationVariance, ToleranceDecision, ar_tolerance_decision, psp_tolerance_decision,
+};
 use crate::infra::events::alarm_catalog::severity;
 use crate::infra::events::payloads::{
     AlarmCategory, LedgerInvariantAlarm, LedgerReconciliationCompleted,
@@ -56,12 +61,11 @@ use crate::infra::storage::repo::{
 use crate::infra::tenant_lifecycle::{LifecyclePlan, TenantLifecycleReader, plan_lifecycle};
 use time::OffsetDateTime;
 
-/// `reconciliation_run.check_type` for the AR-ledger ↔ derived-projection tie-out (AC #7).
-pub const CHECK_AR_DERIVED: &str = "AR_DERIVED";
-/// `reconciliation_run.check_type` for the Payments ↔ PSP settlement tie.
-pub const CHECK_PAYMENTS_PSP: &str = "PAYMENTS_PSP";
-/// `reconciliation_run.check_type` for the upstream → ledger invoice-completeness check.
-pub const CHECK_INVOICE_COMPLETENESS: &str = "INVOICE_COMPLETENESS";
+// The stored check types are defined once in the domain, below both this
+// framework and the storage codec that persists them.
+pub use crate::domain::reconciliation::{
+    CHECK_AR_DERIVED, CHECK_INVOICE_COMPLETENESS, CHECK_PAYMENTS_PSP,
+};
 
 use crate::domain::status::RECON_RUN_STATUS_DONE as RUN_STATUS_DONE;
 
@@ -82,8 +86,75 @@ fn saturating_i64(n: usize) -> i64 {
 /// The decision carried out of a check's transaction to the out-of-band
 /// metrics / exception-routing / alarm step.
 struct ReconOutcome {
-    variance_minor: i64,
+    variance: ReconciliationVariance,
     within_tolerance: bool,
+}
+
+/// Map a domain failure inside a check's transaction into `DbError`.
+fn domain_to_db(e: DomainError) -> DbError {
+    DbError::Other(anyhow::anyhow!("reconciliation: {e}"))
+}
+
+/// The parked `v1` event's single integer field, derived locally from the
+/// per-currency result: the exact minor units of the first non-zero currency
+/// bucket in deterministic currency order (`0` when every bucket is zero), or
+/// the missing-invoice count. Several non-zero currencies cannot share one
+/// integer without summing unlike currencies, so only the first is carried; the
+/// stored run and the REST view keep every bucket.
+/// `run` names the run in a saturation warning.
+fn v1_variance_minor(
+    variance: &ReconciliationVariance,
+    run: &dyn std::fmt::Display,
+) -> Result<i64, DomainError> {
+    match variance {
+        ReconciliationVariance::Money { by_currency } => by_currency
+            .iter()
+            .find(|m| !m.amount().is_zero())
+            .map_or(Ok(0), |m| {
+                Ok(crate::infra::v1_payload::v1_minor_units_for(
+                    m,
+                    "variance_minor",
+                    run,
+                ))
+            }),
+        ReconciliationVariance::MissingInvoices { count } => i64::try_from(*count).map_err(|_| {
+            DomainError::Internal("missing-invoice count exceeds the v1 event payload".into())
+        }),
+    }
+}
+
+/// Human-readable variance for log lines and alarm detail (no PII).
+fn variance_text(variance: &ReconciliationVariance) -> String {
+    match variance {
+        ReconciliationVariance::Money { by_currency } if by_currency.is_empty() => "0".to_owned(),
+        ReconciliationVariance::Money { by_currency } => by_currency
+            .iter()
+            .map(|m| format!("{} {}", canonical_decimal(m.amount()), m.currency().code()))
+            .collect::<Vec<_>>()
+            .join("; "),
+        ReconciliationVariance::MissingInvoices { count } => format!("missing_invoices={count}"),
+    }
+}
+
+/// The tagged JSON form of a variance for exception payloads.
+fn variance_json(variance: &ReconciliationVariance) -> serde_json::Value {
+    match variance {
+        ReconciliationVariance::Money { by_currency } => json!({
+            "kind": "money",
+            "by_currency": by_currency
+                .iter()
+                .map(|m| json!({
+                    "amount": canonical_decimal(m.amount()),
+                    "currency": m.currency().code(),
+                    "currency_scale": m.currency().scale(),
+                }))
+                .collect::<Vec<_>>(),
+        }),
+        ReconciliationVariance::MissingInvoices { count } => json!({
+            "kind": "missing_invoices",
+            "count": count,
+        }),
+    }
 }
 
 /// Runs the Slice 7 reconciliation checks, writing `reconciliation_run` rows and
@@ -383,7 +454,7 @@ impl ReconciliationFramework {
         let db = self.db.clone();
         let ctx = ctx.clone();
         let period_owned = period.to_owned();
-        let per_k = self.config.ar_tolerance_minor_per_k_lines;
+        let per_k = self.config.ar_tolerance_increments_per_k_lines;
 
         let outcome: Result<ReconOutcome, DbError> = self
             .db
@@ -394,17 +465,12 @@ impl ReconciliationFramework {
                 let ctx = ctx.clone();
                 let period_owned = period_owned.clone();
                 Box::pin(async move {
-                    ReconciliationRunRepo::start(
-                        txn,
-                        &scope,
-                        tenant,
-                        run_id,
-                        &period_owned,
-                        CHECK_AR_DERIVED,
-                    )
-                    .await
-                    .map_err(repo_to_db)?;
-                    // VHP-1843: prefer the incremental tie-out (baseline + fold of
+                    let run_repo = ReconciliationRunRepo::new(db.clone());
+                    run_repo
+                        .start(txn, &scope, tenant, run_id, &period_owned, CHECK_AR_DERIVED)
+                        .await
+                        .map_err(repo_to_db)?;
+                    // Prefer the incremental tie-out (baseline + fold of
                     // the open period) over the all-time full fold; fall back to the
                     // full fold when there is no baseline yet (the tenant has never
                     // closed a period) or a period is transitional. The incremental
@@ -426,25 +492,27 @@ impl ReconciliationFramework {
                                 None,
                             ),
                         };
-                    let (variance_minor, within_tolerance) = ar_tolerance_eval(&report, per_k);
+                    let (variance, within_tolerance) =
+                        ar_tolerance_eval(&report, per_k).map_err(domain_to_db)?;
                     let detail = json!({
                         "summary": report.summary(),
                         "posted_line_count": report.posted_line_count,
-                        "tolerance_minor_per_k_lines": per_k,
+                        "tolerance_increments_per_k_lines": per_k,
                     });
-                    ReconciliationRunRepo::finalize(
-                        txn,
-                        &scope,
-                        tenant,
-                        run_id,
-                        RUN_STATUS_DONE,
-                        variance_minor,
-                        within_tolerance,
-                        watermark,
-                        Some(detail),
-                    )
-                    .await
-                    .map_err(repo_to_db)?;
+                    run_repo
+                        .finalize(
+                            txn,
+                            &scope,
+                            tenant,
+                            run_id,
+                            RUN_STATUS_DONE,
+                            &variance,
+                            within_tolerance,
+                            watermark,
+                            Some(detail),
+                        )
+                        .await
+                        .map_err(repo_to_db)?;
                     Self::emit_completed_in_txn(
                         &publisher,
                         &ctx,
@@ -453,12 +521,12 @@ impl ReconciliationFramework {
                         run_id,
                         &period_owned,
                         CHECK_AR_DERIVED,
-                        variance_minor,
+                        &variance,
                         within_tolerance,
                     )
                     .await?;
                     Ok(ReconOutcome {
-                        variance_minor,
+                        variance,
                         within_tolerance,
                     })
                 })
@@ -504,9 +572,9 @@ impl ReconciliationFramework {
         let publisher = Arc::clone(&self.publisher);
         let ctx = ctx.clone();
         let period_owned = period.to_owned();
-        let psp_settled = psp.settled_minor;
+        let psp_settled = psp.settled.clone();
         // PSP rounding tolerance rate (captured for the move-closure below).
-        let per_k = i64::from(self.config.ar_tolerance_minor_per_k_lines);
+        let per_k = self.config.ar_tolerance_increments_per_k_lines;
         let db = self.db.clone();
 
         let outcome: Result<ReconOutcome, DbError> = self
@@ -518,58 +586,73 @@ impl ReconciliationFramework {
                 let period_owned = period_owned.clone();
                 let db = db.clone();
                 Box::pin(async move {
-                    ReconciliationRunRepo::start(
-                        txn,
-                        &scope,
-                        tenant,
-                        run_id,
-                        &period_owned,
-                        CHECK_PAYMENTS_PSP,
-                    )
-                    .await
-                    .map_err(repo_to_db)?;
-                    // Ledger-side settled total, PERIOD-SCOPED (C2): the net-of-returns
-                    // sum of this period's PAYMENT_SETTLE / SETTLEMENT_RETURN UNALLOCATED
-                    // legs, on the SAME net basis as the PSP report. The prior lifetime
-                    // `payment_settlement.settled_minor` sum (PK tenant+payment, NO period
-                    // column) compared a tenant-lifetime total against a per-period PSP
-                    // figure — a multi-period tenant diverged. Folds in i128, narrowed
-                    // checked inside the helper (no `unwrap_or(i64::MAX)` saturation).
-                    let (ledger_settled, settle_count) = JournalRepo::new(db.clone())
-                        .sum_period_settled_net(txn, &scope, tenant, &period_owned)
+                    let run_repo = ReconciliationRunRepo::new(db.clone());
+                    run_repo
+                        .start(
+                            txn,
+                            &scope,
+                            tenant,
+                            run_id,
+                            &period_owned,
+                            CHECK_PAYMENTS_PSP,
+                        )
                         .await
                         .map_err(repo_to_db)?;
-                    // Store the variance MAGNITUDE in the shared `variance_minor` column
-                    // (consistent with the AR check, which sums absolute divergences); the
-                    // signed direction stays recoverable from the ledger/psp totals in `detail`.
-                    let variance_minor = ledger_settled.saturating_sub(psp_settled).abs();
-                    // Rounding tolerance, mirroring AR (X4): exact-match is brittle for
-                    // cross-system penny rounding, so allow `per_k` minor units per 1,000
-                    // settlements, floored at the statutory minimum (`per_k`). A divergence
-                    // above the budget is a real variance and blocks close.
-                    let budget = per_k
-                        .saturating_mul(i64::try_from(settle_count / 1000).unwrap_or(i64::MAX))
-                        .max(per_k);
-                    let within_tolerance = variance_minor <= budget;
+                    // Ledger-side settled total, PERIOD-SCOPED (C2): the net-of-returns
+                    // sum of this period's PAYMENT_SETTLE / SETTLEMENT_RETURN UNALLOCATED
+                    // legs, on the SAME net basis as the PSP report, in the PSP report's
+                    // currency bucket (the repo validates the stored scale and never
+                    // matches an alternate bucket). Folded exactly; the bounded total is
+                    // the documented range error when it does not fit.
+                    let total = JournalRepo::new(db.clone())
+                        .sum_period_settled_net(
+                            txn,
+                            &scope,
+                            tenant,
+                            &period_owned,
+                            psp_settled.currency(),
+                        )
+                        .await
+                        .map_err(repo_to_db)?;
+                    // Store the variance MAGNITUDE per currency (consistent with the AR
+                    // check, which sums absolute divergences); the signed direction stays
+                    // recoverable from the ledger/psp totals in `detail`. Rounding
+                    // tolerance, mirroring AR (X4): exact-match is brittle for
+                    // cross-system penny rounding, so allow `per_k` posting increments per
+                    // 1,000 settlements, floored at the statutory minimum (`per_k`). A
+                    // divergence above the budget is a real variance and blocks close.
+                    let ToleranceDecision {
+                        variance,
+                        within_tolerance,
+                    } = psp_tolerance_decision(
+                        &total.settled,
+                        &psp_settled,
+                        u64::try_from(total.settlement_count).unwrap_or(u64::MAX),
+                        per_k,
+                    )
+                    .map_err(domain_to_db)?;
                     let detail = json!({
-                        "ledger_settled_minor": ledger_settled,
-                        "psp_settled_minor": psp_settled,
-                        "psp_currency": psp.currency,
+                        "ledger_settled": canonical_decimal(total.settled.amount()),
+                        "psp_settled": canonical_decimal(psp_settled.amount()),
+                        "currency": psp_settled.currency().code(),
+                        "currency_scale": psp_settled.currency().scale(),
+                        "settlement_count": total.settlement_count,
                         "psp_report_id": psp.report_id,
                     });
-                    ReconciliationRunRepo::finalize(
-                        txn,
-                        &scope,
-                        tenant,
-                        run_id,
-                        RUN_STATUS_DONE,
-                        variance_minor,
-                        within_tolerance,
-                        None,
-                        Some(detail),
-                    )
-                    .await
-                    .map_err(repo_to_db)?;
+                    run_repo
+                        .finalize(
+                            txn,
+                            &scope,
+                            tenant,
+                            run_id,
+                            RUN_STATUS_DONE,
+                            &variance,
+                            within_tolerance,
+                            None,
+                            Some(detail),
+                        )
+                        .await
+                        .map_err(repo_to_db)?;
                     Self::emit_completed_in_txn(
                         &publisher,
                         &ctx,
@@ -578,12 +661,12 @@ impl ReconciliationFramework {
                         run_id,
                         &period_owned,
                         CHECK_PAYMENTS_PSP,
-                        variance_minor,
+                        &variance,
                         within_tolerance,
                     )
                     .await?;
                     Ok(ReconOutcome {
-                        variance_minor,
+                        variance,
                         within_tolerance,
                     })
                 })
@@ -635,6 +718,7 @@ impl ReconciliationFramework {
         let period_owned = period.to_owned();
         let issued: Vec<String> = manifest.invoice_ids.clone();
         let manifest_count = manifest.count;
+        let db = self.db.clone();
 
         // The set of missing issued ids is computed inside the txn and carried out for
         // the exception routing below. (Default isolation — the authoritative gate is the
@@ -648,23 +732,27 @@ impl ReconciliationFramework {
                     let ctx = ctx.clone();
                     let period_owned = period_owned.clone();
                     let issued = issued.clone();
+                    let db = db.clone();
                     move |txn| {
                         let scope = scope.clone();
                         let publisher = Arc::clone(&publisher);
                         let ctx = ctx.clone();
                         let period_owned = period_owned.clone();
                         let issued = issued.clone();
+                        let db = db.clone();
                         Box::pin(async move {
-                            ReconciliationRunRepo::start(
-                                txn,
-                                &scope,
-                                tenant,
-                                run_id,
-                                &period_owned,
-                                CHECK_INVOICE_COMPLETENESS,
-                            )
-                            .await
-                            .map_err(repo_to_db)?;
+                            let run_repo = ReconciliationRunRepo::new(db.clone());
+                            run_repo
+                                .start(
+                                    txn,
+                                    &scope,
+                                    tenant,
+                                    run_id,
+                                    &period_owned,
+                                    CHECK_INVOICE_COMPLETENESS,
+                                )
+                                .await
+                                .map_err(repo_to_db)?;
                             let posted = posted_invoice_ids(txn, &scope, tenant, &period_owned)
                                 .await
                                 .map_err(|e| {
@@ -680,26 +768,30 @@ impl ReconciliationFramework {
                             let count_mismatch =
                                 manifest_count != u64::try_from(posted.len()).unwrap_or(u64::MAX);
                             let within_tolerance = missing.is_empty() && !count_mismatch;
-                            let variance_minor = i64::try_from(missing.len()).unwrap_or(i64::MAX);
+                            // A diagnostic count, never money with an invented currency.
+                            let variance = ReconciliationVariance::MissingInvoices {
+                                count: u64::try_from(missing.len()).unwrap_or(u64::MAX),
+                            };
                             let detail = json!({
                                 "issued_count": manifest_count,
                                 "posted_count": posted.len(),
                                 "missing_count": missing.len(),
                                 "count_mismatch": count_mismatch,
                             });
-                            ReconciliationRunRepo::finalize(
-                                txn,
-                                &scope,
-                                tenant,
-                                run_id,
-                                RUN_STATUS_DONE,
-                                variance_minor,
-                                within_tolerance,
-                                None,
-                                Some(detail),
-                            )
-                            .await
-                            .map_err(repo_to_db)?;
+                            run_repo
+                                .finalize(
+                                    txn,
+                                    &scope,
+                                    tenant,
+                                    run_id,
+                                    RUN_STATUS_DONE,
+                                    &variance,
+                                    within_tolerance,
+                                    None,
+                                    Some(detail),
+                                )
+                                .await
+                                .map_err(repo_to_db)?;
                             Self::emit_completed_in_txn(
                                 &publisher,
                                 &ctx,
@@ -708,13 +800,13 @@ impl ReconciliationFramework {
                                 run_id,
                                 &period_owned,
                                 CHECK_INVOICE_COMPLETENESS,
-                                variance_minor,
+                                &variance,
                                 within_tolerance,
                             )
                             .await?;
                             Ok((
                                 ReconOutcome {
-                                    variance_minor,
+                                    variance,
                                     within_tolerance,
                                 },
                                 missing,
@@ -733,8 +825,7 @@ impl ReconciliationFramework {
             .map_err(|e| DomainError::Internal(format!("recon INVOICE_COMPLETENESS run: {e}")))?;
 
         self.metrics.reconciliation_run(CHECK_INVOICE_COMPLETENESS);
-        self.metrics
-            .reconciliation_variance_minor(CHECK_INVOICE_COMPLETENESS, outcome.variance_minor);
+        self.record_variance_metrics(CHECK_INVOICE_COMPLETENESS, &outcome.variance);
         // Clear any OPEN MISSED_POSTING whose invoice has since been posted (the §4.6
         // idempotent re-post). Runs regardless of tolerance — a now-complete period must
         // clear its stale close-blocking rows even when `within_tolerance` is true.
@@ -763,7 +854,7 @@ impl ReconciliationFramework {
                     tenant,
                     CHECK_INVOICE_COMPLETENESS,
                     AlarmCategory::MissedPosting,
-                    outcome.variance_minor,
+                    &outcome.variance,
                 )
                 .await;
             }
@@ -785,9 +876,18 @@ impl ReconciliationFramework {
         run_id: Uuid,
         period: &str,
         check_type: &str,
-        variance_minor: i64,
+        variance: &ReconciliationVariance,
         within_tolerance: bool,
     ) -> Result<(), DbError> {
+        // The parked `v1` payload keeps its integer field; convert locally.
+        let variance_minor = v1_variance_minor(
+            variance,
+            &format_args!(
+                "reconciliation.completed run {run_id} check {check_type} period {period} \
+                 tenant {tenant}"
+            ),
+        )
+        .map_err(domain_to_db)?;
         publisher
             .publish_reconciliation_completed(
                 ctx,
@@ -819,8 +919,7 @@ impl ReconciliationFramework {
         outcome: &ReconOutcome,
     ) {
         self.metrics.reconciliation_run(check_type);
-        self.metrics
-            .reconciliation_variance_minor(check_type, outcome.variance_minor);
+        self.record_variance_metrics(check_type, &outcome.variance);
         if !outcome.within_tolerance {
             self.metrics.reconciliation_out_of_tolerance(check_type);
             let business_ref = format!("recon:{period}:{check_type}");
@@ -833,7 +932,7 @@ impl ReconciliationFramework {
                     Some(json!({
                         "check_type": check_type,
                         "period_id": period,
-                        "variance_minor": outcome.variance_minor,
+                        "variance": variance_json(&outcome.variance),
                     })),
                 )
                 .await;
@@ -841,9 +940,27 @@ impl ReconciliationFramework {
                 tenant,
                 check_type,
                 AlarmCategory::ReconciliationVariance,
-                outcome.variance_minor,
+                &outcome.variance,
             )
             .await;
+        }
+    }
+
+    /// Record the variance metrics: monetary checks count the currencies that
+    /// diverged (never a summed or converted amount); the completeness check
+    /// records its integer diagnostic count.
+    fn record_variance_metrics(&self, check_type: &str, variance: &ReconciliationVariance) {
+        match variance {
+            ReconciliationVariance::Money { by_currency } => {
+                let diverged = by_currency.iter().filter(|m| !m.amount().is_zero()).count();
+                self.metrics.reconciliation_money_variance_currencies(
+                    check_type,
+                    u64::try_from(diverged).unwrap_or(u64::MAX),
+                );
+            }
+            ReconciliationVariance::MissingInvoices { count } => {
+                self.metrics.reconciliation_missing_invoices(*count);
+            }
         }
     }
 
@@ -854,7 +971,7 @@ impl ReconciliationFramework {
         tenant: Uuid,
         check_type: &str,
         category: AlarmCategory,
-        variance_minor: i64,
+        variance: &ReconciliationVariance,
     ) {
         let alarm = LedgerInvariantAlarm {
             category,
@@ -862,7 +979,7 @@ impl ReconciliationFramework {
             tenant_id: tenant,
             scope: format!("tenant:{tenant}"),
             code: category.as_str().to_owned(),
-            detail: format!("check={check_type} variance_minor={variance_minor}"),
+            detail: format!("check={check_type} variance={}", variance_text(variance)),
             affected: Vec::new(),
         };
         self.publisher
@@ -919,51 +1036,49 @@ impl ReconciliationFramework {
     }
 }
 
-/// Evaluate the AR↔derived tie-out report against the X4 rounding tolerance.
-/// Returns `(variance_minor, within_tolerance)`.
+/// Evaluate the AR↔derived tie-out report against the X4 rounding tolerance
+/// ([`ar_tolerance_decision`]): extract the `(computed, cached)` totals of the
+/// account-balance, sub-grain and payment-counter variances, and the structural
+/// defects (imbalanced entries, negative guarded grains, PENDING mapping lines)
+/// that are never rounding. Returns `(variance, within_tolerance)`; a clean
+/// report ties out exactly (no bucket, within).
 ///
-/// A clean report ties out exactly (`0`, within). Otherwise the total **absolute**
-/// monetary divergence (account-balance + sub-grain + payment-counter variances) is the
-/// `variance_minor`, and it is within tolerance only when there is **no** structural
-/// defect (an imbalanced entry / a negative guarded grain / a PENDING mapping line are
-/// hard defects, never rounding) AND the divergence fits the rounding budget
-/// `(posted_line_count / 1000) * per_k_lines` (X4: ≤ `per_k_lines` minor units per 1,000
-/// posted lines; statutory floors override — floored at `per_k_lines` minor units).
-fn ar_tolerance_eval(report: &TieOutReport, per_k_lines: u32) -> (i64, bool) {
-    if report.is_clean() {
-        return (0, true);
-    }
-    let total: i128 = report
+/// # Errors
+/// The documented range error when a currency's exact total does not fit the
+/// bounded decimal contract, or a money-metadata error.
+fn ar_tolerance_eval(
+    report: &TieOutReport,
+    per_k_lines: u32,
+) -> Result<(ReconciliationVariance, bool), DomainError> {
+    let pairs = report
         .account_balance_variances
         .iter()
-        .map(|v| (i128::from(v.computed) - i128::from(v.cached)).abs())
+        .map(|v| (&v.computed, &v.cached))
         .chain(
             report
                 .sub_grain_variances
                 .iter()
-                .map(|v| (i128::from(v.computed) - i128::from(v.cached)).abs()),
+                .map(|v| (&v.computed, &v.cached)),
         )
         .chain(
             report
                 .payment_counter_variances
                 .iter()
-                .map(|v| (i128::from(v.computed) - i128::from(v.cached)).abs()),
-        )
-        .sum();
-    let variance_minor = i64::try_from(total).unwrap_or(i64::MAX);
-    let hard_defect = !report.imbalanced_entries.is_empty()
+                .map(|v| (&v.computed, &v.cached)),
+        );
+    let structural_defect = !report.imbalanced_entries.is_empty()
         || !report.negative_grains.is_empty()
         || report.pending_lines > 0;
-    // X4 per-1000-lines rounding allowance, FLOORED at a statutory minimum
-    // (`per_k_lines` minor units) so a sub-1,000-line period can still absorb the
-    // immaterial-rounding bucket the design grants ("statutory floors override") —
-    // integer division alone yields 0 under 1,000 lines, blocking on 1 minor of
-    // legitimate rounding. (A per-jurisdiction statutory registry remains future.)
-    let budget = i64::from(per_k_lines)
-        .saturating_mul(i64::try_from(report.posted_line_count / 1000).unwrap_or(i64::MAX))
-        .max(i64::from(per_k_lines));
-    let within_tolerance = !hard_defect && variance_minor <= budget;
-    (variance_minor, within_tolerance)
+    let ToleranceDecision {
+        variance,
+        within_tolerance,
+    } = ar_tolerance_decision(
+        pairs,
+        structural_defect,
+        report.posted_line_count,
+        per_k_lines,
+    )?;
+    Ok((variance, within_tolerance))
 }
 
 /// The set of `INVOICE_POST` `source_business_id`s (invoiceIds) committed to the journal
@@ -993,3 +1108,7 @@ pub(crate) async fn posted_invoice_ids(
 #[cfg(test)]
 #[path = "reconciliation_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "reconciliation_scale_tests.rs"]
+mod scale_tests;

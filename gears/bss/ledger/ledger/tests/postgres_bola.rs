@@ -90,8 +90,7 @@ async fn cross_tenant_reference_reads_are_sql_scoped_to_empty() {
         .expect("list cross");
     assert!(
         cross.items.is_empty(),
-        "A's scope must NOT see B's accounts (SQL-level BOLA); got {} row(s)",
-        cross.items.len()
+        "A's scope must NOT see B's accounts (SQL-level BOLA)"
     );
 
     // BOLA on a by-id read: A's scope cannot resolve a B-owned account by id.
@@ -125,8 +124,7 @@ async fn cross_tenant_reference_reads_are_sql_scoped_to_empty() {
         .expect("all cross");
     assert!(
         all_cross.is_empty(),
-        "A's scope must NOT see B's chart (SQL-level BOLA); got {} row(s)",
-        all_cross.len()
+        "A's scope must NOT see B's chart (SQL-level BOLA)"
     );
     let all_own = repo
         .all_accounts(&scope_a, tenant_a)

@@ -11,16 +11,16 @@ use super::core::Outbox;
 use super::prioritizer::SharedPrioritizer;
 use super::stats::{StatsListener, StatsRegistry, StatsReporter};
 use super::tables::OutboxTables;
-use super::taskward::{
-    BackoffConfig, Bulkhead, BulkheadConfig, ConcurrencyLimit, PanicPolicy, TaskSet,
-    TracingListener, WorkerBuilder, poker,
-};
 use super::types::{
     OutboxConfig, OutboxError, OutboxProfile, Partitions, SequencerConfig, WorkerTuning,
 };
 use super::workers::sequencer::{Sequencer, SequencerReport};
 use super::workers::vacuum::{CollectableTraces, VacuumReport, VacuumTask};
 use crate::Db;
+use toolkit_taskward::{
+    BackoffConfig, Bulkhead, BulkheadConfig, ConcurrencyLimit, PanicPolicy, TaskSet,
+    TracingListener, WorkerBuilder, poker,
+};
 
 /// Deferred queue declaration — factory, resolved at `start()`.
 pub struct QueueDeclaration {
@@ -47,7 +47,7 @@ struct ResolvedTuning {
 struct StartContext<'a> {
     db: &'a Db,
     cancel: &'a CancellationToken,
-    task_set: &'a mut super::taskward::TaskSet,
+    task_set: &'a mut toolkit_taskward::TaskSet,
     start_notify: &'a Arc<Notify>,
     stats_registry: &'a Option<Arc<std::sync::Mutex<super::stats::StatsRegistry>>>,
 }

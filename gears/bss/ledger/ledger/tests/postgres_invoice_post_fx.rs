@@ -7,7 +7,7 @@
 //! local store, the S1 hook resolves + snapshots the rate, stamps the functional
 //! translation on every line, and the dual-column commit trigger accepts the post
 //! ONLY because the functional column balances. Asserts: every line carries
-//! `functional_amount_minor` + `functional_currency = USD` + a non-null
+//! `functional_amount` + `functional_currency = USD` + a non-null
 //! `rate_snapshot_ref` (one snapshot per entry), the functional column nets to
 //! zero, and the immutable `fx_rate_snapshot` row was frozen.
 //!
@@ -28,7 +28,6 @@ use std::sync::Arc;
 use bss_ledger::config::{FxConfig, RecognitionConfig};
 use bss_ledger::domain::invoice::builder::{InvoiceItem, PostedInvoice, TaxBreakdown};
 use bss_ledger::domain::model::{AccountRow, CurrencyScaleRow};
-use bss_ledger::domain::money::DEFAULT_PLAUSIBLE_MAX_MAJOR;
 use bss_ledger::infra::events::publisher::LedgerEventPublisher;
 use bss_ledger::infra::invoice_post::InvoicePostService;
 use bss_ledger::infra::metrics::test_harness::MetricsHarness;
@@ -47,6 +46,34 @@ use uuid::Uuid;
 
 fn pg(sql: impl Into<String>) -> Statement {
     Statement::from_string(sea_orm::DatabaseBackend::Postgres, sql.into())
+}
+
+/// A scale-2 posting from a cent count (`1000` ⇒ `10.00`) in `code`: the old
+/// minor-unit fixtures expressed as validated major-unit money.
+fn cents(code: &str, minor: i64) -> bss_ledger_sdk::PostedMoney {
+    bss_ledger_sdk::PostedMoney::try_new(
+        rust_decimal::Decimal::new(minor, 2),
+        bss_ledger_sdk::CurrencySpec::try_new(code.to_owned(), 2).unwrap(),
+    )
+    .unwrap()
+}
+
+/// Read one canonical decimal TEXT money column as scale-2 money in `code`.
+async fn scalar_money(
+    conn: &DatabaseConnection,
+    code: &str,
+    sql: &str,
+) -> Option<bss_ledger_sdk::PostedMoney> {
+    conn.query_one_raw(pg(sql.to_owned()))
+        .await
+        .unwrap()
+        .map(|r| {
+            bss_ledger_sdk::PostedMoney::try_new(
+                bss_ledger_sdk::parse_decimal(&r.try_get_by_index::<String>(0).unwrap()).unwrap(),
+                bss_ledger_sdk::CurrencySpec::try_new(code.to_owned(), 2).unwrap(),
+            )
+            .unwrap()
+        })
 }
 
 async fn scalar_i64(conn: &DatabaseConnection, sql: &str) -> Option<i64> {
@@ -108,8 +135,7 @@ async fn cross_currency_invoice_stamps_functional_and_balances_both_columns() {
             .upsert_currency_scale(CurrencyScaleRow {
                 tenant_id: tenant,
                 currency: ccy.to_owned(),
-                minor_units: 2,
-                plausible_max_major: DEFAULT_PLAUSIBLE_MAX_MAJOR,
+                currency_scale: 2,
                 source: "iso".to_owned(),
             })
             .await
@@ -152,7 +178,7 @@ async fn cross_currency_invoice_stamps_functional_and_balances_both_columns() {
             base_currency: "EUR".to_owned(),
             quote_currency: "USD".to_owned(),
             provider: "ecb".to_owned(),
-            rate_micro: 1_100_000,
+            rate: rust_decimal::Decimal::new(11, 1),
             as_of: OffsetDateTime::now_utc(),
             fallback_order: 0,
         })
@@ -175,7 +201,7 @@ async fn cross_currency_invoice_stamps_functional_and_balances_both_columns() {
     let ctx = SecurityContext::anonymous();
     let scope = AccessScope::for_tenant(tenant);
 
-    // An EUR invoice: 10.00 ex-tax (1000 minor) + 2.00 tax (200) = 12.00 gross AR.
+    // An EUR invoice: 10.00 ex-tax + 2.00 tax = 12.00 gross AR.
     let inv = PostedInvoice {
         invoice_id: "INV-FX-1".to_owned(),
         payer_tenant_id: payer,
@@ -185,9 +211,8 @@ async fn cross_currency_invoice_stamps_functional_and_balances_both_columns() {
         due_date: Some(naive(2026, 7, 1)),
         period_id: period_id.to_owned(),
         items: vec![InvoiceItem {
-            amount_minor_ex_tax: 1000,
-            deferred_minor: 0,
-            currency: "EUR".to_owned(),
+            amount_ex_tax: cents("EUR", 1000),
+            deferred: cents("EUR", 0),
             revenue_stream: "subscription".to_owned(),
             catalog_class: Some(AccountClass::Revenue),
             contract_class: None,
@@ -199,8 +224,7 @@ async fn cross_currency_invoice_stamps_functional_and_balances_both_columns() {
             pricing_snapshot_ref: None,
         }],
         tax: vec![TaxBreakdown {
-            amount_minor: 200,
-            currency: "EUR".to_owned(),
+            amount: cents("EUR", 200),
             tax_jurisdiction: "US-CA".to_owned(),
             tax_filing_period: "2026Q2".to_owned(),
             tax_rate_ref: None,
@@ -219,27 +243,27 @@ async fn cross_currency_invoice_stamps_functional_and_balances_both_columns() {
 
     let where_t = format!("WHERE tenant_id='{tenant}'");
 
-    // Transaction column unchanged: AR 1200 DR = Revenue 1000 + Tax 200 CR.
+    // Transaction column unchanged: AR 12.00 DR = Revenue 10.00 + Tax 2.00 CR.
     assert_eq!(
-        scalar_i64(&raw, &format!(
-            "SELECT functional_amount_minor FROM bss.ledger_journal_line {where_t} AND account_id='{ar}'"
+        scalar_money(&raw, "USD", &format!(
+            "SELECT functional_amount FROM bss.ledger_journal_line {where_t} AND account_id='{ar}'"
         )).await,
-        Some(1_320),
-        "AR functional = 1200 EUR * 1.10 = 13.20 USD (1320 minor)"
+        Some(cents("USD", 1_320)),
+        "AR functional = 12.00 EUR * 1.10 = 13.20 USD"
     );
     assert_eq!(
-        scalar_i64(&raw, &format!(
-            "SELECT functional_amount_minor FROM bss.ledger_journal_line {where_t} AND account_id='{revenue}'"
+        scalar_money(&raw, "USD", &format!(
+            "SELECT functional_amount FROM bss.ledger_journal_line {where_t} AND account_id='{revenue}'"
         )).await,
-        Some(1_100),
-        "Revenue functional = 1000 EUR * 1.10 = 11.00 USD"
+        Some(cents("USD", 1_100)),
+        "Revenue functional = 10.00 EUR * 1.10 = 11.00 USD"
     );
     assert_eq!(
-        scalar_i64(&raw, &format!(
-            "SELECT functional_amount_minor FROM bss.ledger_journal_line {where_t} AND account_id='{tax}'"
+        scalar_money(&raw, "USD", &format!(
+            "SELECT functional_amount FROM bss.ledger_journal_line {where_t} AND account_id='{tax}'"
         )).await,
-        Some(220),
-        "Tax functional = 200 EUR * 1.10 = 2.20 USD"
+        Some(cents("USD", 220)),
+        "Tax functional = 2.00 EUR * 1.10 = 2.20 USD"
     );
 
     // Every line stamped functional USD; none left NULL.
@@ -252,7 +276,7 @@ async fn cross_currency_invoice_stamps_functional_and_balances_both_columns() {
     );
     assert_eq!(
         scalar_i64(&raw, &format!(
-            "SELECT count(*) FROM bss.ledger_journal_line {where_t} AND functional_amount_minor IS NULL"
+            "SELECT count(*) FROM bss.ledger_journal_line {where_t} AND functional_amount IS NULL"
         )).await,
         Some(0),
         "no line is left functional-NULL on a cross-currency entry (all-or-nothing)"
@@ -260,11 +284,11 @@ async fn cross_currency_invoice_stamps_functional_and_balances_both_columns() {
 
     // The functional column nets to zero (DR == CR).
     assert_eq!(
-        scalar_i64(&raw, &format!(
-            "SELECT COALESCE(SUM(CASE WHEN side='DR' THEN functional_amount_minor ELSE -functional_amount_minor END), 0)::bigint \
+        scalar_money(&raw, "USD", &format!(
+            "SELECT COALESCE(SUM(CASE WHEN side='DR' THEN functional_amount::numeric ELSE -(functional_amount::numeric) END), 0)::text \
              FROM bss.ledger_journal_line {where_t}"
         )).await,
-        Some(0),
+        Some(cents("USD", 0)),
         "functional column balances (DR == CR)"
     );
 
@@ -294,7 +318,7 @@ async fn cross_currency_invoice_stamps_functional_and_balances_both_columns() {
             &raw,
             &format!(
                 "SELECT count(*) FROM bss.ledger_fx_rate_snapshot {where_t} \
-             AND base_currency='EUR' AND quote_currency='USD' AND rate_micro=1100000"
+             AND base_currency='EUR' AND quote_currency='USD' AND rate='1.1'"
             )
         )
         .await,

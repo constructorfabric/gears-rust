@@ -346,10 +346,23 @@ pub enum DoorError {
     #[error("the vote names another generation; the unit is at {current}")]
     Generation { current: i32 },
 }
+/// What a draft whose currency scale the table changed asks of its author at submit: the draft
+/// is not locked, so the author edits it, which takes today's scale.
+const SCALE_CHANGED_AT_SUBMIT: &str =
+    "the currency scale changed after the price was drafted; edit the draft and submit it again";
+/// The same refusal at apply: the unit locks the draft, so it is withdrawn first.
+const SCALE_CHANGED_AT_APPLY: &str = "the currency scale changed after the price was submitted; \
+     the submitter withdraws the unit, edits the draft and submits it again";
+/// What a draft in a currency the table no longer lists is told: no edit makes it a price.
+const CURRENCY_NOT_LISTED: &str = "the currency table no longer lists the book's currency, so \
+     the book takes no new price and no edit makes this draft one";
 /// Refusals of the shared approval engine and the `prices` subject, with their codes.
 ///
 /// A pure-rule refusal is 400 with its code (D-403); a conflict is 409; separation of duties
-/// and the submitter-only withdraw are 403. Database errors stay typed for the retry loop.
+/// and the submitter-only withdraw are 403. Database errors stay typed for the retry loop. A
+/// draft whose stored currency scale is not the table's today is 409 `CURRENCY_SCALE_CHANGED`,
+/// and a draft in a currency the table no longer lists is 409 `BOOK_CURRENCY_INVALID`, at submit
+/// and at apply alike; each detail says what the caller can do.
 #[must_use]
 pub fn approval_failure(error: bss_approval::ApprovalError) -> DoorError {
     use bss_approval::ApprovalError as A;
@@ -358,6 +371,24 @@ pub fn approval_failure(error: bss_approval::ApprovalError) -> DoorError {
             context: "approval".into(),
             source,
         }),
+        A::InvalidSubmit {
+            code: code @ "CURRENCY_SCALE_CHANGED",
+            detail,
+            ..
+        } => conflict_because(code, format!("{detail}: {SCALE_CHANGED_AT_SUBMIT}")).into(),
+        A::ApplyRefused {
+            code: code @ "CURRENCY_SCALE_CHANGED",
+            detail,
+        } => conflict_because(code, format!("{detail}: {SCALE_CHANGED_AT_APPLY}")).into(),
+        A::InvalidSubmit {
+            code: code @ "BOOK_CURRENCY_INVALID",
+            detail,
+            ..
+        }
+        | A::ApplyRefused {
+            code: code @ "BOOK_CURRENCY_INVALID",
+            detail,
+        } => conflict_because(code, format!("{detail}: {CURRENCY_NOT_LISTED}")).into(),
         A::InvalidSubmit { code, field, .. } => match code {
             "PRICE_NOT_DRAFT"
             | "ENTRY_REFERENCE_LOST"

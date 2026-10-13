@@ -15,9 +15,8 @@
 //!    `business_id = source_invoice_id:source_invoice_item_ref:revenue_stream`.
 //!    `SCHEDULE_BUILD` posts NO journal entry of its own (the invoice post is the
 //!    entry); the claim is purely the at-most-once build guard. On a **replay**
-//!    (the key is already present — a duplicate build of the same invoice/item/
-//!    stream) it **skips** the schedule (the ACTIVE schedule already exists; the
-//!    partial UNIQUE is the storage backstop) and does NOT mint a second
+//!    (same key and canonical plan) it **skips** materialization, even if the
+//!    original schedule has since completed. Changed plans conflict. It does NOT mint a second
 //!    `schedule_id`. The claim is never `finalize`d (there is no result entry to
 //!    stamp); it stays `CLAIMED` as a permanent build marker.
 //! 2. On a **fresh claim**, mints a fresh `schedule_id` (`UUIDv7` string), projects
@@ -32,10 +31,12 @@
 //! BEFORE the post, so every [`PlannedScheduleMaterialization`] here already
 //! carries a non-empty ref.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use bss_ledger_sdk::SourceDocType;
+use super::repo_errors::map_recognition_repo_err;
+use crate::domain::canonical::{digest32_hex, put_i32, put_money, put_opt_str, put_str, put_uuid};
+use bss_ledger_sdk::{PostedMoney, SourceDocType};
 use toolkit_db::secure::{AccessScope, DbTx};
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
@@ -43,12 +44,16 @@ use uuid::Uuid;
 use crate::domain::error::DomainError;
 use crate::domain::model::RepoError;
 use crate::domain::recognition::builder::BuiltSchedule;
+use crate::domain::status::{
+    SCHEDULE_STATUS_ACTIVE, SEGMENT_STATUS_DONE, SEGMENT_STATUS_PENDING, SEGMENT_STATUS_QUEUED,
+};
 use crate::infra::events::payloads::{LedgerRevenueRecognitionReversed, LedgerRevenueRecognized};
 use crate::infra::events::publisher::LedgerEventPublisher;
 use crate::infra::posting::idempotency::{ClaimOutcome, IdempotencyGate};
 use crate::infra::posting::service::{PostSidecar, PostedFacts};
-use crate::infra::storage::repo::RecognitionRepo;
-use crate::infra::storage::repo::recognition_repo::{NewSchedule, NewSegment};
+use crate::infra::storage::repo::recognition_repo::{
+    NewSchedule, NewSegment, RecognitionRepo, ScheduleState, SegmentState,
+};
 use time::OffsetDateTime;
 
 /// One schedule to materialize: the pure [`BuiltSchedule`] plan plus the
@@ -80,6 +85,10 @@ pub struct ScheduleBuilderSidecar {
     pub schedules: Vec<PlannedScheduleMaterialization>,
     /// The at-most-once build gate (claims `SCHEDULE_BUILD`).
     pub idempotency: IdempotencyGate,
+    /// Backend-aware repository on the caller transaction.
+    pub recognition_repo: Arc<RecognitionRepo>,
+    /// Existing configured builder ceiling for each supplied plan, not accumulated extension rows.
+    pub max_segments_per_schedule: usize,
     /// Discriminates a later EXTEND build (a debit note adding deferred to a live
     /// schedule) from the FIRST build (invoice-post): `None` for the invoice-post
     /// (mints the schedule), `Some(note_id)` for a debit note — so its
@@ -103,6 +112,64 @@ impl ScheduleBuilderSidecar {
         }
     }
 
+    /// Closed typed framing, independent of JSON and amount spelling.
+    fn plan_hash(&self, plan: &PlannedScheduleMaterialization) -> String {
+        let mut bytes = Vec::new();
+        put_str(&mut bytes, "ledger.schedule-build.v1");
+        put_uuid(&mut bytes, self.tenant_id);
+        put_uuid(&mut bytes, self.payer_tenant_id);
+        put_str(&mut bytes, &self.source_invoice_id);
+        put_opt_str(&mut bytes, self.build_discriminator.as_deref());
+        put_str(&mut bytes, &plan.source_invoice_item_ref);
+        let s = &plan.schedule;
+        put_money(&mut bytes, &s.deferred);
+        put_str(&mut bytes, &s.revenue_stream);
+        put_str(&mut bytes, &s.policy_ref);
+        for field in [
+            &s.ssp_snapshot_ref,
+            &s.po_allocation_group,
+            &s.subscription_ref,
+            &s.vc_estimate_ref,
+            &s.vc_method_ref,
+        ] {
+            put_opt_str(&mut bytes, field.as_deref());
+        }
+        for segment in &s.segments {
+            put_i32(&mut bytes, segment.segment_no);
+            put_str(&mut bytes, &segment.period_id);
+            put_money(&mut bytes, &segment.amount);
+        }
+        digest32_hex(&bytes)
+    }
+
+    /// Reject all malformed direct plans before claiming or writing any schedule.
+    /// The identity rules (non-empty refs, one schedule per item and stream) are
+    /// the sidecar's; the plan layout rules are [`BuiltSchedule::validate_plan`].
+    fn validate(&self) -> Result<(), DomainError> {
+        let mut keys = HashSet::new();
+        for plan in &self.schedules {
+            let s = &plan.schedule;
+            let item = plan.source_invoice_item_ref.as_str();
+            if self.source_invoice_id.is_empty()
+                || item.is_empty()
+                || s.revenue_stream.is_empty()
+                || s.policy_ref.is_empty()
+            {
+                return Err(DomainError::RecognitionPolicyConflict(format!(
+                    "item {item:?}: invoice id, item ref, revenue stream and policy ref are required"
+                )));
+            }
+            if !keys.insert(self.build_business_id(item, &s.revenue_stream)) {
+                return Err(DomainError::RecognitionPolicyConflict(format!(
+                    "item {item}: duplicate schedule for revenue stream {}",
+                    s.revenue_stream
+                )));
+            }
+            s.validate_plan(item, self.max_segments_per_schedule)?;
+        }
+        Ok(())
+    }
+
     /// Project one [`BuiltSchedule`] + its `source_invoice_item_ref` into the
     /// repo insert shapes, minting the supplied `schedule_id`. Pure (no I/O); the
     /// caller runs the inserts.
@@ -121,8 +188,7 @@ impl ScheduleBuilderSidecar {
             po_allocation_group: s.po_allocation_group.clone(),
             subscription_ref: s.subscription_ref.clone(),
             revenue_stream: s.revenue_stream.clone(),
-            currency: s.currency.clone(),
-            total_deferred_minor: s.deferred_minor,
+            total_deferred: s.deferred.clone(),
             policy_ref: s.policy_ref.clone(),
             ssp_snapshot_ref: s.ssp_snapshot_ref.clone(),
             vc_estimate_ref: s.vc_estimate_ref.clone(),
@@ -136,14 +202,14 @@ impl ScheduleBuilderSidecar {
                 schedule_id: schedule_id.to_owned(),
                 segment_no: seg.segment_no,
                 period_id: seg.period_id.clone(),
-                amount_minor: seg.amount_minor,
+                amount: seg.amount.clone(),
             })
             .collect();
         (new_schedule, segments)
     }
 
     /// EXTEND a live ACTIVE schedule with a later note's deferred part: add to its
-    /// `total_deferred_minor` and MERGE the note's segments — fold the amount into
+    /// `total_deferred` and MERGE the note's segments — fold the amount into
     /// an existing PENDING period, else append a fresh segment (continuing
     /// `segment_no` past the current max). One ACTIVE schedule per key is preserved
     /// (the partial UNIQUE), so the credit-note splitter + the recognition runner
@@ -159,50 +225,50 @@ impl ScheduleBuilderSidecar {
         plan: &PlannedScheduleMaterialization,
     ) -> Result<(), DomainError> {
         let s = &plan.schedule;
-        RecognitionRepo::increase_total_deferred(
-            txn,
-            scope,
-            self.tenant_id,
-            schedule_id,
-            s.deferred_minor,
-        )
-        .await
-        .map_err(|e| DomainError::Internal(format!("extend total_deferred: {e}")))?;
+        self.recognition_repo
+            .increase_total_deferred(txn, scope, self.tenant_id, schedule_id, &s.deferred)
+            .await
+            .map_err(map_recognition_repo_err)?;
 
-        let existing =
-            RecognitionRepo::list_segments_in_txn(txn, scope, self.tenant_id, schedule_id)
-                .await
-                .map_err(|e| DomainError::Internal(format!("list segments for extend: {e}")))?;
+        let existing = self
+            .recognition_repo
+            .list_segments_in_txn(txn, scope, self.tenant_id, schedule_id)
+            .await
+            .map_err(map_recognition_repo_err)?;
         let by_period: HashMap<&str, i32> = existing
             .iter()
             .map(|r| (r.period_id.as_str(), r.segment_no))
             .collect();
-        let mut next_no = existing.iter().map(|r| r.segment_no).max().unwrap_or(0) + 1;
+        let mut next_no = existing.iter().map(|r| r.segment_no).max().unwrap_or(0);
 
         for seg in &s.segments {
             if let Some(&segment_no) = by_period.get(seg.period_id.as_str()) {
-                RecognitionRepo::add_pending_segment_amount(
-                    txn,
-                    scope,
-                    self.tenant_id,
-                    schedule_id,
-                    segment_no,
-                    seg.amount_minor,
-                )
-                .await
-                .map_err(|e| DomainError::Internal(format!("extend segment: {e}")))?;
+                self.recognition_repo
+                    .add_pending_segment_amount(
+                        txn,
+                        scope,
+                        self.tenant_id,
+                        schedule_id,
+                        segment_no,
+                        &seg.amount,
+                    )
+                    .await
+                    .map_err(map_recognition_repo_err)?;
             } else {
+                next_no = next_no.checked_add(1).ok_or_else(|| {
+                    DomainError::ScheduleTooLong("segment number exhausted".into())
+                })?;
                 let appended = vec![NewSegment {
                     tenant_id: self.tenant_id,
                     schedule_id: schedule_id.to_owned(),
                     segment_no: next_no,
                     period_id: seg.period_id.clone(),
-                    amount_minor: seg.amount_minor,
+                    amount: seg.amount.clone(),
                 }];
-                RecognitionRepo::insert_segments(txn, scope, &appended)
+                self.recognition_repo
+                    .insert_segments(txn, scope, &appended)
                     .await
-                    .map_err(|e| DomainError::Internal(format!("append extend segment: {e}")))?;
-                next_no += 1;
+                    .map_err(map_recognition_repo_err)?;
             }
         }
         Ok(())
@@ -217,24 +283,28 @@ impl PostSidecar for ScheduleBuilderSidecar {
         scope: &AccessScope,
         _posted: &PostedFacts,
     ) -> Result<(), DomainError> {
+        self.validate()?;
         let flow = SourceDocType::ScheduleBuild.as_str();
         for plan in &self.schedules {
             let business_id = self
                 .build_business_id(&plan.source_invoice_item_ref, &plan.schedule.revenue_stream);
 
-            // Claim the SCHEDULE_BUILD key. There is no journal entry of its own
-            // for this flow, so the payload hash is over the build business id
-            // (stable across retries). A `Replay` means the schedule was already
-            // built (a duplicate build) — skip; the ACTIVE schedule exists.
-            let payload_hash = IdempotencyGate::content_hash(&business_id);
+            // The outer journal hash contains no schedule plan; bind this claim independently.
+            let payload_hash = self.plan_hash(plan);
             match self
                 .idempotency
                 .claim(txn, self.tenant_id, flow, &business_id, &payload_hash)
                 .await
-                .map_err(|e| {
-                    DomainError::Internal(format!("schedule-build idempotency claim: {e}"))
-                })? {
-                ClaimOutcome::Replay(_) => continue,
+                .map_err(map_recognition_repo_err)?
+            {
+                ClaimOutcome::Replay(row) => {
+                    if row.payload_hash != payload_hash {
+                        return Err(DomainError::IdempotencyConflict(
+                            "schedule build payload differs".into(),
+                        ));
+                    }
+                    continue;
+                }
                 ClaimOutcome::Claimed => {}
             }
 
@@ -242,94 +312,53 @@ impl PostSidecar for ScheduleBuilderSidecar {
             // later deferring note — a debit note — adds its deferred part to it;
             // one ACTIVE schedule per key, the partial UNIQUE), else mint the FIRST
             // schedule (the invoice-post). A failure rolls the whole post back.
-            if let Some(existing) = RecognitionRepo::read_active_schedule_in_txn(
-                txn,
-                scope,
-                self.tenant_id,
-                &self.source_invoice_id,
-                &plan.source_invoice_item_ref,
-                &plan.schedule.revenue_stream,
-            )
-            .await
-            .map_err(|e| DomainError::Internal(format!("read active schedule: {e}")))?
+            if let Some(existing) = self
+                .recognition_repo
+                .read_active_schedule_in_txn(
+                    txn,
+                    scope,
+                    self.tenant_id,
+                    &self.source_invoice_id,
+                    &plan.source_invoice_item_ref,
+                    &plan.schedule.revenue_stream,
+                )
+                .await
+                .map_err(map_recognition_repo_err)?
             {
                 self.extend(txn, scope, &existing.schedule_id, plan).await?;
             } else {
                 let schedule_id = Uuid::now_v7().to_string();
                 let (new_schedule, segments) = self.project(&schedule_id, plan);
-                RecognitionRepo::insert_schedule(txn, scope, &new_schedule)
+                self.recognition_repo
+                    .insert_schedule(txn, scope, &new_schedule)
                     .await
-                    .map_err(|e| {
-                        DomainError::Internal(format!("insert recognition_schedule: {e}"))
-                    })?;
-                RecognitionRepo::insert_segments(txn, scope, &segments)
+                    .map_err(map_recognition_repo_err)?;
+                self.recognition_repo
+                    .insert_segments(txn, scope, &segments)
                     .await
-                    .map_err(|e| {
-                        DomainError::Internal(format!("insert recognition_segment: {e}"))
-                    })?;
+                    .map_err(map_recognition_repo_err)?;
             }
         }
         Ok(())
     }
 }
 
-/// In-transaction [`PostSidecar`] for one released recognition segment (design
-/// §4.3, Group D2). Threaded by the [`RecognitionRunner`](super::runner) into the
-/// `DR CONTRACT_LIABILITY / CR REVENUE` post so the journal entry, the
-/// `recognized_minor += amount` counter bump, and the segment `→ DONE` stamp
-/// commit atomically in the SAME serializable transaction (or roll back
-/// together) — the post engine runs this AFTER balance projection and BEFORE the
-/// dedup finalize, on the fresh-claim path only (a `RECOGNITION` replay returns
-/// before the sidecar, so a re-credit is structurally impossible).
-///
-/// **Lock order (design §2 / §4.3).** The post's projection already locked the
-/// `CONTRACT_LIABILITY` + `REVENUE` `account_balance` rows (rank 0). This sidecar
-/// then takes the recognition rows in the global rank order: **`recognition_schedule`
-/// (the `recognized_minor` delta, rank 6) BEFORE `recognition_segment` (the
-/// `DONE` stamp, rank 7)** — acquire schedule before segment, one consistent
-/// order across all recognition posts, so concurrent runs serialize and never
-/// deadlock.
-///
-/// **Over-recognition guard.** `add_recognized`'s per-schedule
-/// `recognized_minor <= total_deferred_minor` cap CHECK is the authoritative,
-/// in-txn, lock-ordered guard; a breach surfaces from the repo as
-/// [`RepoError::MoneyOutCapExceeded`], which this sidecar refines to
-/// [`DomainError::OverRecognition`] (the `OVER_RECOGNITION` 409). The post engine
-/// encodes that as a non-retryable business rejection and rolls the whole release
-/// back — the counter is never advanced past the deferred total.
+/// Release evidence rebuilt by the caller on the same posting attempt.
+/// The caller must use this exact stored segment money for both journal legs.
 pub struct RecognitionStampSidecar {
-    /// The seller tenant whose ledger this releases into (`= entry.tenant_id`).
     pub tenant_id: Uuid,
-    /// The owning schedule's id (the `recognized_minor` counter grain + the first
-    /// segment of the `RECOGNITION` dedup business id).
     pub schedule_id: String,
-    /// The released segment's number (immutable, 1:1 with `period_id`).
     pub segment_no: i32,
-    /// The accounting period the recognized revenue lands in (`YYYYMM`) — the
-    /// release entry's period (the segment's own, or the current-open period on
-    /// an E-2 missed-close reassignment). Carried only for the
-    /// `billing.ledger.revenue.recognized` event payload.
+    /// Actual posting period, including missed-close reassignment.
     pub period_id: String,
-    /// The segment's amount released this post (`= the entry's DR/CR amount`),
-    /// added to `recognized_minor` under the cap CHECK.
-    pub amount_minor: i64,
-    /// The revenue stream both legs draw (per-stream disaggregation). Carried for
-    /// the recognized-event payload.
+    pub amount: PostedMoney,
     pub revenue_stream: String,
-    /// ISO-4217 currency of the release entry. Carried for the recognized-event
-    /// payload.
-    pub currency: String,
-    /// The run that released this segment (stamped on the segment row for audit
-    /// linkage).
+    pub expected_schedule_version: i64,
+    pub expected_segment_version: i64,
     pub run_id: Uuid,
-    /// The event publisher: `billing.ledger.revenue.recognized` is published IN
-    /// this post txn (the transactional outbox) so it commits atomically with the
-    /// release entry + the counter bump + the segment `DONE` stamp, or rolls back
-    /// with them. Mirrors the payment
-    /// [sidecars](crate::infra::payment::sidecar).
+    pub recognition_repo: Arc<RecognitionRepo>,
+    /// Parked no-op publisher; call placement does not establish broker/outbox atomicity.
     pub publisher: Arc<LedgerEventPublisher>,
-    /// The security context for the in-txn outbox publish (the same `ctx` the
-    /// engine threads through; cloned by the runner into the sidecar).
     pub ctx: SecurityContext,
 }
 
@@ -339,66 +368,54 @@ impl PostSidecar for RecognitionStampSidecar {
         &self,
         txn: &DbTx<'_>,
         scope: &AccessScope,
-        _posted: &PostedFacts,
+        _: &PostedFacts,
     ) -> Result<(), DomainError> {
-        // 1. Schedule first (rank 6): bump `recognized_minor` by the released
-        //    amount. The per-schedule cap CHECK is the SERIALIZABLE backstop — an
-        //    over-release surfaces as `MoneyOutCapExceeded`, refined to
-        //    `OverRecognition` (409). A replay returned before the sidecar, so this
-        //    is reached only on the first release of `(schedule, segment)`.
-        RecognitionRepo::add_recognized(
+        let (schedule, segment) = check_observed(
+            &self.recognition_repo,
             txn,
             scope,
             self.tenant_id,
-            &self.schedule_id,
-            self.amount_minor,
+            &ExpectedObservation {
+                schedule_id: &self.schedule_id,
+                segment_no: self.segment_no,
+                amount: &self.amount,
+                stream: &self.revenue_stream,
+                schedule_version: self.expected_schedule_version,
+                segment_version: self.expected_segment_version,
+            },
+            ReleaseMode::Release,
         )
-        .await
-        .map_err(map_recognition_repo_err)?;
-
-        // 2. Segment next (rank 7): flip PENDING/QUEUED → DONE, stamping
-        //    `recognized_at` (the infra wall clock — `OffsetDateTime::now_utc()` is allowed in
-        //    infra, mirroring the payment sidecars' `allocated_at_utc`) + `run_id`.
-        //    The status filter refuses an already-DONE row, so a stray re-stamp on
-        //    the fresh-claim path is an invariant breach that rolls the post back
-        //    (`RepoError::Db` → `Internal`) rather than silently double-crediting.
-        RecognitionRepo::stamp_segment_done(
-            txn,
-            scope,
-            self.tenant_id,
-            &self.schedule_id,
-            self.segment_no,
-            self.run_id,
-            OffsetDateTime::now_utc(),
-        )
-        .await
-        .map_err(map_recognition_repo_err)?;
-
-        // 3. Terminal completion (design §4.6): if THIS release drained the
-        //    schedule (`recognized_minor == total_deferred_minor` after the bump
-        //    above, all segments DONE), flip it `ACTIVE → COMPLETED` in the SAME
-        //    txn — freeing the partial one-live UNIQUE slot, dropping it from the
-        //    runner's ACTIVE-only feed + the `schedule_active_total` gauge. The
-        //    filter is column-to-column equality, so this is a no-op on every
-        //    non-final release and on a replay (idempotent); it never bumps
-        //    `version` (COMPLETED is the same schedule reaching terminal, not a
-        //    new lineage). RELEASE path only — the reversal sidecar must NOT
-        //    complete (a reversal un-drains the schedule).
-        RecognitionRepo::complete_schedule_if_drained(
-            txn,
-            scope,
-            self.tenant_id,
-            &self.schedule_id,
-        )
-        .await
-        .map_err(map_recognition_repo_err)?;
-
-        // 4. Publish `billing.ledger.revenue.recognized` into the SAME post txn
-        //    (transactional outbox): the event row commits atomically with the
-        //    release entry + the counter bump + the segment `DONE` stamp, or a
-        //    publish failure rolls the whole release back. Ids + amount + stream +
-        //    period only (no PII). Reached only on the fresh-claim path (a replay
-        //    returns before the sidecar), so the event fires once per release.
+        .await?;
+        // Schedule before segment; all errors escape the caller's whole attempt.
+        // Each write CASes on the state read once above (or just written), so
+        // the release reads the schedule and the segment once each.
+        let schedule = self
+            .recognition_repo
+            .add_recognized_to(txn, scope, &schedule, &self.amount)
+            .await
+            .map_err(map_recognition_repo_err)?;
+        self.recognition_repo
+            .stamp_observed_segment_done(
+                txn,
+                scope,
+                &segment,
+                self.run_id,
+                OffsetDateTime::now_utc(),
+            )
+            .await
+            .map_err(map_recognition_repo_err)?;
+        self.recognition_repo
+            .complete_observed_schedule_if_drained(txn, scope, &schedule)
+            .await
+            .map_err(map_recognition_repo_err)?;
+        let amount_minor = crate::infra::v1_payload::v1_minor_units_for(
+            &self.amount,
+            "amount_minor",
+            &format_args!(
+                "revenue.recognized schedule {} segment {} period {} tenant {}",
+                self.schedule_id, self.segment_no, self.period_id, self.tenant_id
+            ),
+        );
         self.publisher
             .publish_revenue_recognized(
                 &self.ctx,
@@ -408,91 +425,32 @@ impl PostSidecar for RecognitionStampSidecar {
                     schedule_id: self.schedule_id.clone(),
                     segment_no: self.segment_no,
                     period_id: self.period_id.clone(),
-                    amount_minor: self.amount_minor,
+                    amount_minor,
                     revenue_stream: self.revenue_stream.clone(),
-                    currency: self.currency.clone(),
+                    currency: self.amount.currency().code().to_owned(),
                 },
             )
             .await
-            .map_err(|e| DomainError::Internal(format!("publish revenue_recognized: {e}")))?;
-
-        Ok(())
+            .map_err(|e| DomainError::Internal(format!("publish revenue_recognized: {e}")))
     }
 }
 
-/// Map a recognition-counter [`RepoError`] into the sidecar's [`DomainError`]:
-/// the per-schedule `recognized_minor <= total_deferred_minor` cap CHECK
-/// violation (`add_recognized`) becomes [`DomainError::OverRecognition`] (the
-/// `OVER_RECOGNITION` 409 — design §4.3 / §5); every other repo failure (incl.
-/// the `stamp_segment_done` `rows_affected == 0` invariant breach) is an
-/// infrastructure fault whose diagnostic stays server-side and rolls the post
-/// back. Mirrors the payment sidecars' `map_*_repo_err` shape.
-fn map_recognition_repo_err(e: RepoError) -> DomainError {
-    match e {
-        RepoError::MoneyOutCapExceeded(m) => DomainError::OverRecognition(m),
-        other => DomainError::Internal(format!("recognition stamp sidecar: {other}")),
-    }
-}
-
-/// In-transaction [`PostSidecar`] for one recognition **reversal / clawback**
-/// (design §4.3, Group F1). Threaded by the [`RecognitionRunner`](super::runner)
-/// into the compensating `DR REVENUE / CR CONTRACT_LIABILITY` post so the
-/// reversing journal entry and the `recognized_minor -= amount` counter
-/// **decrement** commit in the SAME serializable transaction (or roll back
-/// together). The reversal is the mirror of [`RecognitionStampSidecar`]: it
-/// posts the opposite legs and applies a NEGATIVE delta to `recognized_minor`.
-///
-/// **The reversed segment stays `DONE` (design §4.3).** A reversal compensates a
-/// release that genuinely happened; the segment's release is a historical fact,
-/// so its `recognition_segment` row is left untouched (`status = DONE`,
-/// `recognized_at`/`run_id` preserved). Re-recognizing the period needs a NEW
-/// schedule version (a fresh `schedule_id`, Phase 3) — never a re-flip of this
-/// segment back to `PENDING`. This sidecar therefore writes ONLY the counter
-/// decrement; it does not touch the segment row.
-///
-/// **Lock order (design §2 / §4.3).** Same as the release: the post's projection
-/// already locked the `REVENUE` + `CONTRACT_LIABILITY` `account_balance` rows
-/// (rank 0); this sidecar then takes only the `recognition_schedule` row (the
-/// `recognized_minor` delta, rank 6). It never touches `recognition_segment`
-/// (rank 7), so it acquires a strict prefix of the release's lock set — no new
-/// ordering edge, no deadlock.
-///
-/// **Underflow guard.** `add_recognized` with a negative delta is guarded by the
-/// per-schedule `recognized_minor >= 0` cap CHECK
-/// (`chk_ledger_recognition_schedule_recognized_nonneg`): a reversal larger than
-/// the cumulative recognized would drive the counter below zero and is rejected,
-/// surfacing from the repo as [`RepoError::MoneyOutCapExceeded`] (both schedule
-/// CHECKs share the `chk_ledger_recognition_schedule_` prefix the repo's
-/// violation classifier keys on). This sidecar refines that to
-/// [`DomainError::OverRecognition`] with a reversal-specific detail — a reversal
-/// can never un-recognize more than was recognized.
+/// Historical reversal evidence. Caller must prove the original posted release
+/// belongs to this DONE segment and restore its full stored lines through
+/// post_reversal_once. `amount` is positive original release money, never current registry money.
+/// Segment remains DONE and terminal schedules are not reopened/completed here.
 pub struct RecognitionReversalSidecar {
-    /// The seller tenant whose ledger this reverses within (`= entry.tenant_id`).
     pub tenant_id: Uuid,
-    /// The owning schedule's id (the `recognized_minor` counter grain + the first
-    /// segment of the `RECOGNITION` reversal dedup business id).
     pub schedule_id: String,
-    /// The reversed segment's number (the segment stays `DONE`). Carried for the
-    /// `billing.ledger.revenue.recognition_reversed` event payload.
     pub segment_no: i32,
-    /// The accounting period the reversal lands in (`YYYYMM`). Carried for the
-    /// reversed-event payload.
     pub period_id: String,
-    /// The segment amount being reversed (`= the entry's DR/CR amount`),
-    /// SUBTRACTED from `recognized_minor` under the non-negative cap CHECK.
-    pub amount_minor: i64,
-    /// The revenue stream both legs draw. Carried for the reversed-event payload.
+    pub amount: PostedMoney,
     pub revenue_stream: String,
-    /// ISO-4217 currency of the reversal entry. Carried for the reversed-event
-    /// payload.
-    pub currency: String,
-    /// The event publisher: `billing.ledger.revenue.recognition_reversed` is
-    /// published IN this post txn (the transactional outbox) so it commits
-    /// atomically with the reversing entry + the counter decrement, or rolls back
-    /// with them. Mirrors [`RecognitionStampSidecar`].
+    pub expected_schedule_version: i64,
+    pub expected_segment_version: i64,
+    pub recognition_repo: Arc<RecognitionRepo>,
+    /// Parked no-op publisher, called within the attempt without delivery guarantees.
     pub publisher: Arc<LedgerEventPublisher>,
-    /// The security context for the in-txn outbox publish (the same `ctx` the
-    /// engine threads through; cloned by the runner into the sidecar).
     pub ctx: SecurityContext,
 }
 
@@ -502,32 +460,38 @@ impl PostSidecar for RecognitionReversalSidecar {
         &self,
         txn: &DbTx<'_>,
         scope: &AccessScope,
-        _posted: &PostedFacts,
+        _: &PostedFacts,
     ) -> Result<(), DomainError> {
-        // Schedule only (rank 6): DECREMENT `recognized_minor` by the reversed
-        // amount (a negative delta). The per-schedule `recognized_minor >= 0`
-        // CHECK is the SERIALIZABLE backstop — an over-reversal surfaces as
-        // `MoneyOutCapExceeded`, refined to `OverRecognition` (the reversal cannot
-        // un-recognize more than was recognized). The segment row is NOT touched:
-        // the reversed segment stays `DONE` (design §4.3). A `RECOGNITION` reversal
-        // replay returned before the sidecar, so this runs once per
-        // `(schedule, segment, reversal)`.
-        RecognitionRepo::add_recognized(
+        let (schedule, _) = check_observed(
+            &self.recognition_repo,
             txn,
             scope,
             self.tenant_id,
-            &self.schedule_id,
-            -self.amount_minor,
+            &ExpectedObservation {
+                schedule_id: &self.schedule_id,
+                segment_no: self.segment_no,
+                amount: &self.amount,
+                stream: &self.revenue_stream,
+                schedule_version: self.expected_schedule_version,
+                segment_version: self.expected_segment_version,
+            },
+            ReleaseMode::Reversal,
         )
-        .await
-        .map_err(map_recognition_repo_err)?;
-
-        // Publish `billing.ledger.revenue.recognition_reversed` into the SAME post
-        // txn (transactional outbox): the event row commits atomically with the
-        // reversing entry + the counter decrement, or a publish failure rolls the
-        // whole reversal back. Ids + amount + stream + period only (no PII). A
-        // reversal replay returns before the sidecar, so the event fires once per
-        // `(schedule, segment, reversal)`.
+        .await?;
+        let delta = PostedMoney::try_new(-self.amount.amount(), self.amount.currency().clone())
+            .map_err(|e| map_recognition_repo_err(RepoError::Money(e)))?;
+        self.recognition_repo
+            .add_recognized_to(txn, scope, &schedule, &delta)
+            .await
+            .map_err(map_recognition_repo_err)?;
+        let amount_minor = crate::infra::v1_payload::v1_minor_units_for(
+            &delta,
+            "amount_minor",
+            &format_args!(
+                "revenue.recognition_reversed schedule {} segment {} period {} tenant {}",
+                self.schedule_id, self.segment_no, self.period_id, self.tenant_id
+            ),
+        );
         self.publisher
             .publish_revenue_recognition_reversed(
                 &self.ctx,
@@ -537,20 +501,104 @@ impl PostSidecar for RecognitionReversalSidecar {
                     schedule_id: self.schedule_id.clone(),
                     segment_no: self.segment_no,
                     period_id: self.period_id.clone(),
-                    // Signed delta to cumulative recognized revenue: NEGATIVE on a
-                    // reversal, mirroring the counter decrement
-                    // above. A consumer nets `recognized` against `recognition_reversed`
-                    // by summing `amount_minor` across both, without special-casing
-                    // the event type-id.
-                    amount_minor: -self.amount_minor,
+                    amount_minor,
                     revenue_stream: self.revenue_stream.clone(),
-                    currency: self.currency.clone(),
+                    currency: delta.currency().code().to_owned(),
                 },
             )
             .await
             .map_err(|e| {
                 DomainError::Internal(format!("publish revenue_recognition_reversed: {e}"))
-            })?;
-        Ok(())
+            })
     }
 }
+
+/// What the caller observed (and posts against): the segment, its money and
+/// stream, and the two mutation tokens that must still hold. Named fields, so
+/// the adjacent versions cannot be swapped silently.
+struct ExpectedObservation<'a> {
+    schedule_id: &'a str,
+    segment_no: i32,
+    amount: &'a PostedMoney,
+    stream: &'a str,
+    schedule_version: i64,
+    segment_version: i64,
+}
+
+/// Which eligibility rule applies: a release needs an ACTIVE schedule and a
+/// PENDING/QUEUED segment, a reversal needs a DONE segment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReleaseMode {
+    Release,
+    Reversal,
+}
+
+/// Compare caller evidence with validated stored state before any counter
+/// mutation. Returns the schedule and segment as read (the segment validated
+/// against that schedule), so the release mutates them without reading again.
+async fn check_observed(
+    repo: &RecognitionRepo,
+    txn: &DbTx<'_>,
+    scope: &AccessScope,
+    tenant: Uuid,
+    expected: &ExpectedObservation<'_>,
+    mode: ReleaseMode,
+) -> Result<(ScheduleState, SegmentState), DomainError> {
+    let ExpectedObservation {
+        schedule_id,
+        segment_no,
+        amount,
+        stream,
+        schedule_version,
+        segment_version,
+    } = *expected;
+    let schedule = repo
+        .read_schedule_in_txn(txn, scope, tenant, schedule_id)
+        .await
+        .map_err(map_recognition_repo_err)?
+        .ok_or_else(|| DomainError::RecognitionPolicyConflict("schedule unavailable".into()))?;
+    let segment = repo
+        .read_segment_of(txn, scope, &schedule, segment_no)
+        .await
+        .map_err(map_recognition_repo_err)?
+        .ok_or_else(|| DomainError::RecognitionPolicyConflict("segment unavailable".into()))?;
+    if schedule.version != schedule_version || segment.version != segment_version {
+        return Err(DomainError::ConcurrentModification(
+            "recognition observation changed".into(),
+        ));
+    }
+    same_spec(amount, &segment.amount)?;
+    if amount != &segment.amount
+        || amount.amount().is_sign_negative()
+        || stream != schedule.revenue_stream
+    {
+        return Err(DomainError::RecognitionPolicyConflict(
+            "release money or stream differs from stored evidence".into(),
+        ));
+    }
+    let eligible = match mode {
+        ReleaseMode::Reversal => segment.status == SEGMENT_STATUS_DONE,
+        ReleaseMode::Release => {
+            schedule.status == SCHEDULE_STATUS_ACTIVE
+                && (segment.status == SEGMENT_STATUS_PENDING
+                    || segment.status == SEGMENT_STATUS_QUEUED)
+        }
+    };
+    if !eligible {
+        return Err(DomainError::RecognitionPolicyConflict(
+            "recognition state is not eligible".into(),
+        ));
+    }
+    Ok((schedule, segment))
+}
+
+/// Preserve currency and scale mismatch as distinct named errors.
+fn same_spec(a: &PostedMoney, b: &PostedMoney) -> Result<(), DomainError> {
+    a.currency()
+        .ensure_same(b.currency())
+        .map_err(|e| map_recognition_repo_err(RepoError::Money(e)))
+}
+
+#[cfg(test)]
+#[path = "sidecar_tests.rs"]
+mod tests;

@@ -1,7 +1,8 @@
 //! D-522: a finished price book can be archived, and archiving it releases its entries' SKU
 //! references.
 //!
-//! A forward migration: the shipped chain is frozen. It makes three changes.
+//! A forward migration. A shipped migration is edited in place only under D-534, which puts the
+//! price's currency spec into this migration's `pricing_price` rebuild. It makes three changes.
 //!
 //! - `pricing_price_book` gains `archived_at` and `archived_by`, both null until the book is
 //!   archived, and set and cleared together: `(archived_at IS NULL) = (archived_by IS NULL)`.
@@ -115,7 +116,9 @@ fn price_table(table: &str, entry: &str) -> String {
   id text PRIMARY KEY, tenant_id text NOT NULL, price_book_entry_id text NOT NULL REFERENCES {entry}(id),
   version_no integer NOT NULL, dim_value text,
   price_json text NOT NULL,
-  min_fee text CHECK (min_fee GLOB '[0-9]*' AND min_fee NOT GLOB '*[^0-9.]*' AND min_fee NOT GLOB '*.*.*' AND min_fee NOT GLOB '*.'), eligibility text NOT NULL CHECK (eligibility IN ('all','new')),
+  currency text NOT NULL CHECK (length(currency) = 3 AND currency NOT GLOB '*[^A-Z]*'),
+  currency_scale integer NOT NULL CHECK (currency_scale BETWEEN 0 AND 28),
+  min_fee text CHECK (min_fee GLOB '[0-9]*' AND min_fee NOT GLOB '*[^0-9.]*' AND min_fee NOT GLOB '*.*.*' AND min_fee NOT GLOB '*.' AND min_fee NOT GLOB '0[0-9]*' AND min_fee NOT GLOB '*.*0'), eligibility text NOT NULL CHECK (eligibility IN ('all','new')),
   effective_from text NOT NULL, effective_to text, keep_for_bound integer NOT NULL DEFAULT 0,
   closed_explicitly integer NOT NULL DEFAULT 0,
   temporary_until text, paired_price_id text REFERENCES {table}(id),
@@ -139,9 +142,10 @@ fn price_table(table: &str, entry: &str) -> String {
 /// The columns copied with the rows, a change's `target_price_id` among them (its pairing CHECK
 /// holds on insert); the two pair references follow once every row exists.
 const PRICE_COLUMNS: &str = "id, tenant_id, price_book_entry_id, version_no, dim_value, price_json, \
-min_fee, eligibility, effective_from, effective_to, keep_for_bound, closed_explicitly, \
-temporary_until, state, change_kind, target_price_id, cancelled_by_unit_id, pending_unit_id, \
-approved_by_unit_id, note, created_by, approved_at, version, created_at, updated_at";
+currency, currency_scale, min_fee, eligibility, effective_from, effective_to, keep_for_bound, \
+closed_explicitly, temporary_until, state, change_kind, target_price_id, cancelled_by_unit_id, \
+pending_unit_id, approved_by_unit_id, note, created_by, approved_at, version, created_at, \
+updated_at";
 
 /// The plan item table of `m20260930_000018`, named `table`, its entry `entry`.
 fn item_table(table: &str, entry: &str) -> String {

@@ -6,9 +6,9 @@
 //! `SecureORM`; the resource col is the business `schedule_id` (mirrors
 //! `dispute`'s `dispute_id`).
 //!
-//! `recognized_minor <= total_deferred_minor` is the authoritative
+//! `recognized <= total_deferred` is the authoritative
 //! over-recognition guard (design §7); the `RecognitionRunner` (Phase 2) bumps
-//! `recognized_minor` by an in-place delta under the lock order with the CHECK
+//! `recognized` by an in-place delta under the lock order with the CHECK
 //! evaluated post-delta. The partial `UNIQUE (tenant_id, source_invoice_id,
 //! source_invoice_item_ref, revenue_stream) WHERE status='ACTIVE'` is the
 //! at-most-one-live guard; build-idempotency is decoupled from `status` and
@@ -39,8 +39,9 @@ pub struct Model {
     pub subscription_ref: Option<String>,
     pub revenue_stream: String,
     pub currency: String,
-    pub total_deferred_minor: i64,
-    pub recognized_minor: i64,
+    pub currency_scale: i16,
+    pub total_deferred: String,
+    pub recognized: String,
     pub policy_ref: String,
     pub ssp_snapshot_ref: Option<String>,
     pub vc_estimate_ref: Option<String>,

@@ -1,4 +1,4 @@
-//! Tenant-configurable invoice-posting policies (VHP-1853, design 01a §4.2 /
+//! Tenant-configurable invoice-posting policies (design 01a §4.2 /
 //! §4.4): the missing-mapping mode and the AR-aging bucket thresholds. Pure
 //! domain — the parsing, validation, and defaults; the effective row is loaded
 //! by the repo (`infra`), and these value types are its shape. No infra / DB

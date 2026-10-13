@@ -1,5 +1,5 @@
 //! `SeaORM` entity for `bss.ledger_verified_balance` — the cumulative VERIFIED
-//! tie-out baseline per grain through the last closed period (VHP-1843
+//! tie-out baseline per grain through the last closed period (the
 //! incremental tie-out). One row per `(tenant_id, grain, grain_key)`; the daily
 //! job and the `AR_DERIVED` recon check verify `baseline + fold(open periods) ==
 //! cache` instead of folding all-time. Written in the period-close txn right
@@ -30,6 +30,8 @@ pub const GRAIN_REUSABLE_CREDIT: &str = "reusable_credit";
     no_type
 )]
 pub struct Model {
+    pub currency: String,
+    pub currency_scale: i16,
     #[sea_orm(primary_key, auto_increment = false)]
     pub tenant_id: Uuid,
     /// Cache discriminator — one of the `GRAIN_*` constants.
@@ -39,8 +41,9 @@ pub struct Model {
     /// (e.g. `account_id|currency`), so the verify compares like-for-like.
     #[sea_orm(primary_key, auto_increment = false)]
     pub grain_key: String,
-    /// Cumulative verified balance through `through_period`, in minor units.
-    pub verified_balance_minor: i64,
+    /// Cumulative verified balance through `through_period`, in canonical major units.
+    pub verified_balance: String,
+    pub version: i64,
     /// The last closed period this baseline is verified through.
     pub through_period: String,
     /// Max in-period `created_seq` covered by this baseline (the incremental

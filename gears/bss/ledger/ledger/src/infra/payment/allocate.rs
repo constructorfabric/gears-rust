@@ -35,7 +35,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use bss_ledger_sdk::{
-    AccountClass, MappingStatus, PostEntry, PostLine, PostingRef, Side, SourceDocType,
+    AccountClass, MappingStatus, PostEntry, PostLine, PostedMoney, PostingRef, Side, SourceDocType,
 };
 use chrono::Datelike;
 use sea_orm::DbErr;
@@ -45,6 +45,7 @@ use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
 use crate::domain::error::DomainError;
+use crate::domain::exact_money::{map_exact_error, matching_spec, sum_posted, zero_posted};
 use crate::domain::fx::realized::{ClosingLeg, realize};
 use crate::domain::instant::to_naive_date;
 use crate::domain::model::{NewEntry, NewLine};
@@ -55,7 +56,6 @@ use crate::domain::payment::precedence::{
     Allocated, Candidate, DEFAULT_PRECEDENCE_POLICY, PrecedenceStrategy, select_split,
 };
 use crate::domain::ports::metrics::{LedgerMetricsPort, PostFlow, PostResult};
-use crate::infra::currency_scale::CurrencyScaleResolver;
 use crate::infra::events::publisher::LedgerEventPublisher;
 use crate::infra::payment::sidecar::AllocationSidecar;
 use crate::infra::posting::chart::{ChartIndex, load_chart};
@@ -64,6 +64,7 @@ use crate::infra::posting::idempotency::{
 };
 use crate::infra::posting::service::{PostSidecar, PostedFacts, PostingService};
 use crate::infra::storage::entity::pending_event_queue;
+use crate::infra::storage::money_text::StoredMoney;
 use crate::infra::storage::repo::{NewQueueRow, PaymentRepo, PendingQueueRepo, ReferenceRepo};
 use time::Duration;
 use time::OffsetDateTime;
@@ -103,8 +104,9 @@ pub const MAX_INVOICES_PER_ALLOCATION: usize = 500;
 /// the caller and validated, not decided by a precedence policy.
 const CALLER_SPLIT_POLICY_REF: &str = "caller-split.v1";
 
-/// One allocate request: apply `lump_minor` of the settled payment's
-/// unallocated pool to the payer's open receivables.
+/// One allocate request: apply `lump` of the settled payment's unallocated
+/// pool to the payer's open receivables.
+#[derive(Clone)]
 pub struct AllocateRequest {
     /// The seller tenant whose ledger this posts into.
     pub tenant_id: Uuid,
@@ -114,10 +116,9 @@ pub struct AllocateRequest {
     pub payment_id: String,
     /// Allocation identity — the `PAYMENT_ALLOCATE` idempotency business id.
     pub allocation_id: Uuid,
-    /// Amount to apply from the pool, in minor units.
-    pub lump_minor: i64,
-    /// ISO currency of the allocation (must match the settlement currency).
-    pub currency: String,
+    /// Amount to apply from the pool, in major units with its stored currency
+    /// and scale (must match the settlement's).
+    pub lump: PostedMoney,
     /// Optional invoice to pay FIRST (jumps to the front of the oldest-first
     /// order); ignored when it names no open candidate. Only consulted on the
     /// precedence path — a caller-computed split (`caller_splits`) bypasses the
@@ -196,8 +197,7 @@ pub struct QueuedAllocationPayload {
     pub payer_tenant_id: Uuid,
     pub payment_id: String,
     pub allocation_id: Uuid,
-    pub lump_minor: i64,
-    pub currency: String,
+    pub lump: StoredMoney,
     pub hint_invoice_id: Option<String>,
     pub caller_splits: Option<Vec<QueuedSplit>>,
 }
@@ -209,7 +209,7 @@ pub struct QueuedAllocationPayload {
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct QueuedSplit {
     pub invoice_id: String,
-    pub amount_minor: i64,
+    pub amount: StoredMoney,
 }
 
 impl AllocateRequest {
@@ -217,25 +217,41 @@ impl AllocateRequest {
     /// mapping each Mode B [`QueuedSplit`] back to the domain [`Allocated`]. The
     /// inverse of [`QueuedAllocationPayload::from_request`]; the round-trip
     /// preserves every field the decide/build path consults.
-    fn from_payload(payload: QueuedAllocationPayload) -> Self {
-        Self {
+    fn from_payload(
+        payload: QueuedAllocationPayload,
+        business_id: &str,
+    ) -> Result<Self, DomainError> {
+        let caller_splits = payload
+            .caller_splits
+            .map(|splits| {
+                splits
+                    .into_iter()
+                    .map(|s| {
+                        let amount = PostedMoney::try_from(s.amount).map_err(|e| {
+                            payload_money(
+                                business_id,
+                                &format!("split for invoice {}", s.invoice_id),
+                                &e,
+                            )
+                        })?;
+                        Ok(Allocated {
+                            invoice_id: s.invoice_id,
+                            amount,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, DomainError>>()
+            })
+            .transpose()?;
+        Ok(Self {
             tenant_id: payload.tenant_id,
             payer_tenant_id: payload.payer_tenant_id,
             payment_id: payload.payment_id,
             allocation_id: payload.allocation_id,
-            lump_minor: payload.lump_minor,
-            currency: payload.currency,
+            lump: PostedMoney::try_from(payload.lump)
+                .map_err(|e| payload_money(business_id, "lump", &e))?,
             hint_invoice_id: payload.hint_invoice_id,
-            caller_splits: payload.caller_splits.map(|splits| {
-                splits
-                    .into_iter()
-                    .map(|s| Allocated {
-                        invoice_id: s.invoice_id,
-                        amount_minor: s.amount_minor,
-                    })
-                    .collect()
-            }),
-        }
+            caller_splits,
+        })
     }
 }
 
@@ -248,15 +264,14 @@ impl QueuedAllocationPayload {
             payer_tenant_id: req.payer_tenant_id,
             payment_id: req.payment_id.clone(),
             allocation_id: req.allocation_id,
-            lump_minor: req.lump_minor,
-            currency: req.currency.clone(),
+            lump: StoredMoney::from(&req.lump),
             hint_invoice_id: req.hint_invoice_id.clone(),
             caller_splits: req.caller_splits.as_ref().map(|splits| {
                 splits
                     .iter()
                     .map(|s| QueuedSplit {
                         invoice_id: s.invoice_id.clone(),
-                        amount_minor: s.amount_minor,
+                        amount: StoredMoney::from(&s.amount),
                     })
                     .collect()
             }),
@@ -290,7 +305,7 @@ struct BuiltAllocation {
     entry: PostEntry,
     splits: Vec<Allocated>,
     policy_ref: String,
-    total: i64,
+    total: PostedMoney,
 }
 
 /// The result of applying ONE queued allocation row ([`AllocationService::apply_queued_row`]).
@@ -299,7 +314,9 @@ struct BuiltAllocation {
 #[derive(Debug)]
 pub enum ApplyOutcome {
     /// The settlement landed and the queued allocation posted — the queue row was
-    /// flipped `→APPLIED` atomically in the post txn.
+    /// flipped `→APPLIED` atomically in the post txn. When another drain claimed
+    /// the same row and applied it first, the post finds the dedup `POSTED` and
+    /// replays that entry ([`PostingRef::replayed`]): no second effect.
     Applied(PostingRef),
     /// The payment is STILL not settled: leave the row `QUEUED`, do NOT bump
     /// attempts (this is not a failure — a settle/sweep will retry once the
@@ -319,6 +336,9 @@ pub enum ApplyOutcome {
 pub struct DrainReport {
     /// Rows that posted + flipped `→APPLIED` this pass.
     pub applied: u64,
+    /// Rows another drain had already applied: the apply replayed the posted
+    /// entry and changed nothing.
+    pub replayed: u64,
     /// Rows left `QUEUED` because the payment is not yet settled (no attempt bump).
     pub not_ready: u64,
     /// Rows left `QUEUED` after an apply-time cap/precondition rejection
@@ -331,7 +351,6 @@ pub struct DrainReport {
 pub struct AllocationService {
     posting: PostingService,
     reference: ReferenceRepo,
-    resolver: CurrencyScaleResolver,
     repo: PaymentRepo,
     // The deferred-apply queue (work-state SoT): an allocate of a not-yet-settled
     // payment is enqueued here at intake (§4.7) and drained later (Group D).
@@ -361,13 +380,11 @@ impl AllocationService {
     ) -> Self {
         let posting = PostingService::new(db.clone(), publisher);
         let reference = ReferenceRepo::new(db.clone());
-        let resolver = CurrencyScaleResolver::new(ReferenceRepo::new(db.clone()));
         let repo = PaymentRepo::new(db.clone());
         let pending_queue = PendingQueueRepo::new(db.clone());
         Self {
             posting,
             reference,
-            resolver,
             repo,
             pending_queue,
             db,
@@ -417,9 +434,43 @@ impl AllocationService {
         input: AllocateRequest,
     ) -> Result<AllocationOutcome, DomainError> {
         let started = Instant::now();
-        let result = self.allocate_inner(ctx, scope, input).await;
+        let result = self.allocate_with_fresh_decisions(ctx, scope, input).await;
         self.record(&result, started);
         result
+    }
+
+    /// Decide and post once more when the first plan went stale.
+    ///
+    /// The split is decided from state read before the posting transaction, so a
+    /// concurrent allocation that commits in between can leave the plan larger
+    /// than what is still open; the posting then fails as a cache that would go
+    /// negative (`NegativeBalance`), which for an allocation only means the plan no
+    /// longer fits. The state that made it stale has already committed, so one
+    /// fresh decision turns it into the real answer (usually
+    /// `MoneyOutCapExceeded`, or a smaller allocation) and needs no backoff. A
+    /// second `NegativeBalance` against fresh state is a real rejection and is
+    /// returned. Contention (`ConcurrentModification`) is not re-decided: the
+    /// posting transaction already retried it with backoff and gave up.
+    async fn allocate_with_fresh_decisions(
+        &self,
+        ctx: &SecurityContext,
+        scope: &AccessScope,
+        input: AllocateRequest,
+    ) -> Result<AllocationOutcome, DomainError> {
+        match self.allocate_inner(ctx, scope, input.clone()).await {
+            Err(DomainError::NegativeBalance(detail)) => {
+                tracing::warn!(
+                    target: "bss-ledger",
+                    tenant_id = %input.tenant_id,
+                    payment_id = %input.payment_id,
+                    allocation_id = %input.allocation_id,
+                    detail = %detail,
+                    "bss-ledger: allocation plan went stale; deciding once more"
+                );
+                self.allocate_inner(ctx, scope, input).await
+            }
+            other => other,
+        }
     }
 
     /// Run the allocate sequence (no metrics — the public wrapper records them).
@@ -457,12 +508,7 @@ impl AllocationService {
             let queued = self.enqueue_allocation(scope, &input).await?;
             return Ok(AllocationOutcome::Queued(queued));
         };
-        if settlement.currency != input.currency {
-            return Err(DomainError::AllocationCurrencyMismatch(format!(
-                "allocation currency {} != settlement currency {} for payment {}",
-                input.currency, settlement.currency, input.payment_id
-            )));
-        }
+        settlement_spec_check(&input, &settlement.settled)?;
 
         // 2.–4. Decide the split + build the bound entry (caps re-read against
         //        current state). Shared with the deferred-apply path.
@@ -481,10 +527,10 @@ impl AllocationService {
             payer: input.payer_tenant_id,
             payment_id: input.payment_id.clone(),
             allocation_id: input.allocation_id,
-            currency: input.currency.clone(),
             splits: splits.clone(),
-            total_minor: total,
+            total,
             policy_ref: policy_ref.clone(),
+            payment: self.repo.clone(),
         });
         let request_hash = allocation_request_hash(&input)?;
         let posting = self
@@ -524,7 +570,7 @@ impl AllocationService {
                 scope,
                 input.tenant_id,
                 input.payer_tenant_id,
-                &input.currency,
+                input.lump.currency().code(),
             )
             .await
             .map_err(|e| DomainError::Internal(format!("list open ar invoices: {e}")))?;
@@ -537,12 +583,12 @@ impl AllocationService {
         // `Candidate`s. The realized-FX poster (`apply_realized_fx`) reads it to
         // value each AR leg's close at the grain's WAC carried rate. Empty / all-
         // `None`-functional ⇒ a single-currency close (the poster no-ops).
-        let ar_carried: HashMap<String, (i64, Option<i64>)> = rows
+        let ar_carried: HashMap<String, (PostedMoney, Option<PostedMoney>)> = rows
             .iter()
             .map(|r| {
                 (
                     r.invoice_id.clone(),
-                    (r.balance_minor, r.functional_balance_minor),
+                    (r.balance.clone(), r.functional_balance.clone()),
                 )
             })
             .collect();
@@ -570,7 +616,7 @@ impl AllocationService {
             .into_iter()
             .map(|r| Candidate {
                 invoice_id: r.invoice_id,
-                open_minor: r.balance_minor,
+                open: r.balance,
                 original_posted_at: r.original_posted_at,
             })
             .collect();
@@ -582,16 +628,16 @@ impl AllocationService {
         // resolved `policy_ref` only governs the unchanged precedence path.
         let (splits, policy_ref) = match &input.caller_splits {
             Some(caller) => (
-                validate_caller_split(&candidates, caller, input.lump_minor)?,
+                validate_caller_split(&candidates, caller, &input.lump)?,
                 CALLER_SPLIT_POLICY_REF.to_owned(),
             ),
             None => (
                 select_split(
                     &candidates,
-                    input.lump_minor,
+                    &input.lump,
                     input.hint_invoice_id.as_deref(),
                     strategy,
-                ),
+                )?,
                 policy_ref,
             ),
         };
@@ -613,7 +659,11 @@ impl AllocationService {
                 self.max_invoices
             )));
         }
-        let total: i64 = splits.iter().map(|s| s.amount_minor).sum();
+        let total = sum_posted(
+            &splits.iter().map(|s| s.amount.clone()).collect::<Vec<_>>(),
+            input.lump.currency().clone(),
+        )
+        .map_err(map_exact_error)?;
 
         // 4. Build the balanced Pattern-A-apply entry, overwrite the placeholder
         //    header, and bind chart account_ids.
@@ -622,7 +672,7 @@ impl AllocationService {
             payer_tenant_id: input.payer_tenant_id,
             payment_id: input.payment_id.clone(),
             allocation_id: input.allocation_id,
-            currency: input.currency.clone(),
+            currency: input.lump.currency().clone(),
             splits: splits.clone(),
             // 2a: allocation posts effective-now; thread a request field here if
             // a back-dated allocation is ever needed.
@@ -637,7 +687,7 @@ impl AllocationService {
                     "no provisioned account for class {} / stream {:?} / currency {}",
                     line.account_class.as_str(),
                     line.revenue_stream,
-                    line.currency
+                    line.money.currency().code()
                 ))
             })?;
         }
@@ -650,7 +700,7 @@ impl AllocationService {
         //    — functional stays NULL, byte-green. Runs on BOTH the inline and the
         //    deferred-apply paths (this method is shared), so a queued allocation
         //    drained after a rate move also posts the correct realized FX.
-        self.apply_realized_fx(scope, input, &mut entry, &ar_carried, total, &chart)
+        self.apply_realized_fx(scope, input, &mut entry, &ar_carried, &total, &chart)
             .await?;
 
         Ok(BuiltAllocation {
@@ -702,8 +752,8 @@ impl AllocationService {
         scope: &AccessScope,
         input: &AllocateRequest,
         entry: &mut PostEntry,
-        ar_carried: &HashMap<String, (i64, Option<i64>)>,
-        total: i64,
+        ar_carried: &HashMap<String, (PostedMoney, Option<PostedMoney>)>,
+        total: &PostedMoney,
         chart: &ChartIndex,
     ) -> Result<(), DomainError> {
         // Read the pool's carried functional value (the DR UNALLOCATED leg's grain).
@@ -713,26 +763,29 @@ impl AllocationService {
                 scope,
                 input.tenant_id,
                 input.payer_tenant_id,
-                &input.currency,
+                input.lump.currency().code(),
             )
             .await
             .map_err(|e| DomainError::Internal(format!("read unallocated carried: {e}")))?;
+        // An absent pool is a single-currency position too: leave functional NULL.
+        let Some(pool) = pool else {
+            return Ok(());
+        };
 
         // Cross-currency detect (design decision 8): the relieved pool grain carries
         // a functional balance (S2 settle stamped it). NULL ⇒ a single-currency
         // close: leave every functional column NULL (byte-green) and post no FX line.
-        let (Some(pool_functional), Some(functional_ccy)) = (
-            pool.functional_balance_minor,
-            pool.functional_currency.clone(),
-        ) else {
+        let Some(pool_functional) = pool.functional_balance else {
             return Ok(());
         };
+        let functional_ccy = pool_functional.currency().code().to_owned();
 
         // Pool-underflow guard: an allocate draining more than the pool holds is
         // invalid — the projector rejects it with `NegativeBalance`. Skip realized
         // FX so that cleaner rejection surfaces rather than a `realize`
         // `RelievedOutOfRange` mapped to a 500 (the close never posts either way).
-        if total > pool.balance_minor {
+        matching_spec(&pool.balance, total)?;
+        if total.amount() > pool.balance.amount() {
             return Ok(());
         }
 
@@ -745,19 +798,20 @@ impl AllocationService {
         let mut legs: Vec<ClosingLeg> = Vec::with_capacity(entry.lines.len());
         for line in &entry.lines {
             let (carried_transaction, carried_functional) = match line.account_class {
-                AccountClass::Unallocated => (pool.balance_minor, pool_functional),
+                AccountClass::Unallocated => (pool.balance.clone(), pool_functional.clone()),
                 AccountClass::Ar => {
                     let invoice_id = line.invoice_id.as_deref().ok_or_else(|| {
                         DomainError::Internal(
                             "realized FX: AR allocation line carries no invoice_id".to_owned(),
                         )
                     })?;
-                    let (bal, func) = ar_carried.get(invoice_id).copied().ok_or_else(|| {
+                    let (bal, func) = ar_carried.get(invoice_id).cloned().ok_or_else(|| {
                         DomainError::Internal(format!(
                             "realized FX: no carried AR grain for invoice {invoice_id}"
                         ))
                     })?;
-                    (bal, func.unwrap_or(bal))
+                    let func = func.unwrap_or_else(|| bal.clone());
+                    (bal, func)
                 }
                 other => {
                     return Err(DomainError::Internal(format!(
@@ -768,9 +822,9 @@ impl AllocationService {
             };
             legs.push(ClosingLeg {
                 side: line.side,
-                carried_functional_minor: carried_functional,
-                carried_transaction_minor: carried_transaction,
-                relieved_transaction_minor: line.amount_minor,
+                carried_functional,
+                carried_transaction,
+                relieved_transaction: line.money.clone(),
             });
         }
 
@@ -779,9 +833,8 @@ impl AllocationService {
             realize(&legs).map_err(|e| DomainError::Internal(format!("realized FX: {e}")))?;
 
         // Stamp the functional relief onto each existing line (same order as legs).
-        for (line, func) in entry.lines.iter_mut().zip(&realized.leg_functional_minor) {
-            line.functional_amount_minor = Some(*func);
-            line.functional_currency = Some(functional_ccy.clone());
+        for (line, func) in entry.lines.iter_mut().zip(&realized.leg_functional) {
+            line.functional_money = Some(func.clone());
         }
 
         // Append the net FX_GAIN_LOSS functional-only line so the functional column
@@ -800,10 +853,9 @@ impl AllocationService {
             entry.lines.push(fx_gain_loss_line(
                 input,
                 account_id,
-                &functional_ccy,
                 fx_line.side,
-                fx_line.functional_minor,
-            ));
+                &fx_line.functional,
+            )?);
             // Realized-FX amount metric (§9): the sign-by-role direction is the
             // FX_GAIN_LOSS side — a CREDIT is a gain, a DEBIT a loss (the same
             // convention `RealizedFxLine` documents); the magnitude is the
@@ -817,8 +869,7 @@ impl AllocationService {
                 Side::Credit => "gain",
                 Side::Debit => "loss",
             };
-            self.metrics
-                .fx_realized_minor(fx_line.functional_minor, &functional_ccy, direction);
+            self.metrics.fx_realized(&functional_ccy, direction);
         }
 
         Ok(())
@@ -1081,6 +1132,8 @@ impl AllocationService {
     /// - [`ApplyOutcome::NotReady`] when the settlement is STILL absent (leave the
     ///   row `QUEUED`, no attempt bump — a settle/sweep retries),
     /// - [`ApplyOutcome::Applied`] on a successful post (row flipped `→APPLIED`),
+    ///   or on a replay when another drain applied the row first
+    ///   ([`PostingRef::replayed`], no effect),
     /// - [`ApplyOutcome::Blocked`] on an apply-time cap/precondition rejection
     ///   (`MoneyOutCapExceeded` / `NegativeBalance` / `PeriodClosed` /
     ///   `AllocationSplitInvalid`) — the caller bumps attempts + leaves `QUEUED`.
@@ -1104,7 +1157,7 @@ impl AllocationService {
         //    `Allocated`).
         let payload: QueuedAllocationPayload = serde_json::from_value(row.payload.clone())
             .map_err(|e| DomainError::Internal(format!("deserialize queued payload: {e}")))?;
-        let input = AllocateRequest::from_payload(payload);
+        let input = AllocateRequest::from_payload(payload, &row.business_id)?;
 
         // 2. Re-gate on the settlement. ABSENT ⇒ NotReady (the payment still isn't
         //    settled — leave the row QUEUED, don't bump attempts; a settle/sweep
@@ -1117,15 +1170,10 @@ impl AllocationService {
         else {
             return Ok(ApplyOutcome::NotReady);
         };
-        if settlement.currency != input.currency {
+        if let Err(e) = settlement_spec_check(&input, &settlement.settled) {
             // A currency mismatch is a permanent precondition failure, not infra —
             // treat as Blocked (the caller bumps attempts; Phase 5 alarms it).
-            return Ok(ApplyOutcome::Blocked(
-                DomainError::AllocationCurrencyMismatch(format!(
-                    "allocation currency {} != settlement currency {} for payment {}",
-                    input.currency, settlement.currency, input.payment_id
-                )),
-            ));
+            return Ok(ApplyOutcome::Blocked(e));
         }
 
         // 3. Re-run the EXACT decide/validate/build path — caps thus re-evaluated
@@ -1153,13 +1201,13 @@ impl AllocationService {
                 payer: input.payer_tenant_id,
                 payment_id: input.payment_id.clone(),
                 allocation_id: input.allocation_id,
-                currency: input.currency.clone(),
                 // Moved (not cloned): an apply does not return the splits to the
                 // caller (the queue row already recorded them), so the sidecar is
                 // their sole consumer here.
                 splits,
-                total_minor: total,
+                total,
                 policy_ref,
+                payment: self.repo.clone(),
             },
             flow: row.flow.clone(),
             business_id: row.business_id.clone(),
@@ -1187,6 +1235,9 @@ impl AllocationService {
     /// lock; the authoritative work-state flip (`→APPLIED`) rides each apply's post
     /// txn. (Chosen over claim+apply-in-one-txn so a long apply doesn't hold the
     /// claim lock across the whole batch, and so a per-row failure is isolated.)
+    /// The claim does not flip the status, so two concurrent drains can claim the
+    /// same row: the second apply replays the first one's posted entry and counts
+    /// as `replayed`, not `applied`.
     ///
     /// Per-row infra errors are isolated (logged, counted as neither applied nor
     /// blocked) so one bad row doesn't abort the batch — mirrors the tie-out job's
@@ -1224,6 +1275,7 @@ impl AllocationService {
         let mut report = DrainReport::default();
         for row in claimed {
             match self.apply_queued_row(ctx, scope, &row).await {
+                Ok(ApplyOutcome::Applied(posting)) if posting.replayed => report.replayed += 1,
                 Ok(ApplyOutcome::Applied(_)) => report.applied += 1,
                 Ok(ApplyOutcome::NotReady) => report.not_ready += 1,
                 Ok(ApplyOutcome::Blocked(err)) => {
@@ -1322,7 +1374,7 @@ impl AllocationService {
         sidecar: Arc<dyn PostSidecar>,
         request_hash: String,
     ) -> Result<PostingRef, DomainError> {
-        let (new_entry, new_lines) = self.to_engine_inputs(scope, entry).await?;
+        let (new_entry, new_lines) = self.to_engine_inputs(entry).await?;
         self.posting
             .post_with_request_hash(
                 ctx,
@@ -1347,7 +1399,7 @@ impl AllocationService {
         entry: PostEntry,
         sidecar: Arc<dyn PostSidecar>,
     ) -> Result<PostingRef, DomainError> {
-        let (new_entry, new_lines) = self.to_engine_inputs(scope, entry).await?;
+        let (new_entry, new_lines) = self.to_engine_inputs(entry).await?;
         self.posting
             .post_queued_apply(ctx, scope, new_entry, new_lines, Some(sidecar))
             .await
@@ -1359,7 +1411,6 @@ impl AllocationService {
     /// ([`Self::post_bound_queued_apply`]) post paths.
     async fn to_engine_inputs(
         &self,
-        scope: &AccessScope,
         entry: PostEntry,
     ) -> Result<(NewEntry, Vec<NewLine>), DomainError> {
         let new_entry = NewEntry {
@@ -1384,12 +1435,7 @@ impl AllocationService {
         };
         let mut new_lines: Vec<NewLine> = Vec::with_capacity(entry.lines.len());
         for line in entry.lines {
-            let scale = self
-                .resolver
-                .resolve(scope, entry.tenant_id, &line.currency)
-                .await
-                .map_err(|e| DomainError::Internal(format!("currency scale resolve: {e}")))?;
-            new_lines.push(new_line(line, scale));
+            new_lines.push(new_line(line));
         }
         Ok((new_entry, new_lines))
     }
@@ -1437,14 +1483,14 @@ fn overwrite_header(entry: &mut PostEntry, ctx: &SecurityContext) {
 fn resolve_line(chart: &ChartIndex, line: &PostLine) -> Option<Uuid> {
     chart.resolve(
         line.account_class,
-        &line.currency,
+        line.money.currency().code(),
         line.revenue_stream.as_deref(),
     )
 }
 
 /// Map one SDK [`PostLine`] + its resolved scale to the engine's [`NewLine`]
 /// (mirrors `invoice_post::new_line`).
-fn new_line(line: PostLine, scale: u8) -> NewLine {
+fn new_line(line: PostLine) -> NewLine {
     NewLine {
         line_id: line.line_id,
         payer_tenant_id: line.payer_tenant_id,
@@ -1454,15 +1500,12 @@ fn new_line(line: PostLine, scale: u8) -> NewLine {
         account_class: line.account_class,
         gl_code: line.gl_code,
         side: line.side,
-        amount_minor: line.amount_minor,
-        currency: line.currency,
-        currency_scale: scale,
+        money: line.money,
         invoice_id: line.invoice_id,
         due_date: line.due_date,
         revenue_stream: line.revenue_stream,
         mapping_status: line.mapping_status,
-        functional_amount_minor: line.functional_amount_minor,
-        functional_currency: line.functional_currency,
+        functional_money: line.functional_money,
         tax_jurisdiction: line.tax_jurisdiction,
         tax_filing_period: line.tax_filing_period,
         tax_rate_ref: line.tax_rate_ref,
@@ -1493,11 +1536,10 @@ fn new_line(line: PostLine, scale: u8) -> NewLine {
 fn fx_gain_loss_line(
     input: &AllocateRequest,
     account_id: Uuid,
-    functional_ccy: &str,
     side: Side,
-    fx_minor: i64,
-) -> PostLine {
-    PostLine {
+    functional: &PostedMoney,
+) -> Result<PostLine, DomainError> {
+    Ok(PostLine {
         line_id: Uuid::now_v7(),
         payer_tenant_id: input.payer_tenant_id,
         seller_tenant_id: Some(input.tenant_id),
@@ -1506,14 +1548,14 @@ fn fx_gain_loss_line(
         account_class: AccountClass::FxGainLoss,
         gl_code: None,
         side,
-        amount_minor: 0,
-        currency: functional_ccy.to_owned(),
+        // The transaction column of a pure FX line is zero IN the functional
+        // currency; the whole value rides the functional column.
+        money: zero_posted(functional)?,
         invoice_id: None,
         due_date: None,
         revenue_stream: None,
         mapping_status: MappingStatus::Resolved,
-        functional_amount_minor: Some(fx_minor),
-        functional_currency: Some(functional_ccy.to_owned()),
+        functional_money: Some(functional.clone()),
         tax_jurisdiction: None,
         tax_filing_period: None,
         tax_rate_ref: None,
@@ -1524,7 +1566,47 @@ fn fx_gain_loss_line(
         po_allocation_group: None,
         credit_grant_event_type: None,
         ar_status: None,
+    })
+}
+
+/// The allocation must carry the settlement's stored currency AND scale: a
+/// mismatch is the named allocation rejection, never an implicit conversion.
+fn settlement_spec_check(
+    input: &AllocateRequest,
+    settled: &PostedMoney,
+) -> Result<(), DomainError> {
+    let request = input.lump.currency();
+    let origin = settled.currency();
+    if request.code() != origin.code() {
+        return Err(DomainError::AllocationCurrencyMismatch(format!(
+            "allocation currency {} != settlement currency {} for payment {}",
+            request.code(),
+            origin.code(),
+            input.payment_id
+        )));
     }
+    if request.scale() != origin.scale() {
+        return Err(DomainError::AllocationCurrencyMismatch(format!(
+            "allocation currency scale {} != settlement scale {} for payment {}",
+            request.scale(),
+            origin.scale(),
+            input.payment_id
+        )));
+    }
+    Ok(())
+}
+
+/// A queued payload's money is our own canonical encoding; a parse failure is
+/// corruption of a stored row, an infra fault naming the row and the field, as
+/// `apply_queued_row` documents, never a client money rejection.
+fn payload_money(
+    business_id: &str,
+    field: &str,
+    error: &bss_ledger_sdk::MoneyError,
+) -> DomainError {
+    DomainError::Internal(format!(
+        "corrupt queued allocation payload {business_id}: {field}: {error}"
+    ))
 }
 
 /// Is this rejection an apply-time cap / precondition failure (so the drain
@@ -1581,8 +1663,9 @@ fn allocation_request_hash(input: &AllocateRequest) -> Result<String, DomainErro
     // `IdempotencyConflict`. Sorting here affects ONLY the dedup fingerprint — the
     // queue row stores the caller's original order separately for apply.
     if let Some(splits) = payload.caller_splits.as_mut() {
-        splits
-            .sort_by(|a, b| (&a.invoice_id, a.amount_minor).cmp(&(&b.invoice_id, b.amount_minor)));
+        splits.sort_by(|a, b| {
+            (&a.invoice_id, &a.amount.amount).cmp(&(&b.invoice_id, &b.amount.amount))
+        });
     }
     let canonical = serde_json::to_string(&payload)
         .map_err(|e| DomainError::Internal(format!("canonicalize allocate payload: {e}")))?;
@@ -1630,3 +1713,7 @@ impl PostSidecar for QueuedAllocationApplySidecar {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "allocate_payload_tests.rs"]
+mod payload_tests;

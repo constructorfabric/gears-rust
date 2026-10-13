@@ -30,12 +30,12 @@ fn hourly_window_does_not_make_the_invoice_hourly() {
 }
 
 use bss_pricing::domain::{
-    commercial_terms::{SaleObservation, validate_new_sale_observation},
+    commercial_terms::{SaleObservation, validate_new_sale_observation, validate_stored_terms},
     money,
 };
 use bss_pricing_sdk::{
     acceptance::{CommercialReason as R, NewSaleQuery, Term},
-    digest::billing_terms_digest,
+    digest::{billing_terms_digest, terms_digest},
     read::{AcceptedBinding, ChargeKind, PriceModel, Tier},
     terms::{AggregationScope, BillingAnchor, BillingCycle, Rounding, TermsSource},
 };
@@ -224,6 +224,8 @@ fn each_query_mutation_has_one_stable_refusal() {
     let cases: &[(Mutation, R)] = &[
         (|q| q.quantity = Decimal::ZERO, R::InvalidQuantity),
         (|q| q.quantity = -Decimal::ONE, R::InvalidQuantity),
+        // Over the 28-digit limit of every pricing decimal.
+        (|q| q.quantity = Decimal::MAX, R::InvalidQuantity),
         (
             |q| q.term = Term::FixedPeriods { count: 0 },
             R::InvalidTermCount,
@@ -297,8 +299,14 @@ fn each_binding_mutation_has_one_stable_refusal() {
             |b| b.price.price_book_entry_id = Uuid::from_u128(99),
             R::BindingEntryMismatch,
         ),
-        (|b| b.price.currency = "USD".into(), R::CurrencyMismatch),
-        (|b| b.invoice.currency_scale = 3, R::UnsupportedTerms),
+        (
+            |b| b.price.currency = bss_money::CurrencySpec::try_new("USD".into(), 2).unwrap(),
+            R::CurrencyMismatch,
+        ),
+        (
+            |b| b.price.currency = bss_money::CurrencySpec::try_new("EUR".into(), 3).unwrap(),
+            R::MoneyDigestMismatch,
+        ),
         (
             |b| b.invoice.template.clear(),
             R::IncompleteCommercialInputs,
@@ -351,6 +359,66 @@ fn each_binding_mutation_has_one_stable_refusal() {
         mutate(&mut b);
         reason(&sale_query(), &[b], *expected);
     }
+}
+/// Money is checked at the bound price's own stored scale, never at the ISO table's: a EUR price
+/// stored at 4 (ISO gives EUR 2) takes a minimum fee of 0.0001, its increment, and a EUR price
+/// stored at 2 refuses that fee. A rate is not posted money: it may be finer than the scale, up to
+/// the profile's 12 places.
+#[test]
+fn money_is_checked_at_the_stored_price_scale_not_the_iso_scale() {
+    let eur = |scale| bss_money::CurrencySpec::try_new("EUR".into(), scale).unwrap();
+    let mut b = vm_binding();
+    b.price.currency = eur(4);
+    b.price.minimum_fee = Some("0.0001".parse().unwrap());
+    certify(&mut b);
+    assert!(
+        validate_commercial_terms(&sale_query(), &[b.clone()]).is_ok(),
+        "a fee on the stored scale's increment is accepted, whatever ISO says"
+    );
+    b.price.currency = eur(2);
+    certify(&mut b);
+    reason(&sale_query(), &[b.clone()], R::InvalidMoney);
+    b.price.minimum_fee = Some("0.01".parse().unwrap());
+    certify(&mut b);
+    assert!(
+        validate_commercial_terms(&sale_query(), &[b.clone()]).is_ok(),
+        "a fee on the increment of scale 2 is accepted"
+    );
+    b.price.model = PriceModel::PerUnit {
+        unit_amount: "0.000000000001".parse().unwrap(),
+    };
+    certify(&mut b);
+    assert!(
+        validate_commercial_terms(&sale_query(), &[b.clone()]).is_ok(),
+        "a rate with 12 places is accepted at scale 2"
+    );
+    b.price.model = PriceModel::PerUnit {
+        unit_amount: "0.0000000000001".parse().unwrap(),
+    };
+    certify(&mut b);
+    reason(&sale_query(), &[b], R::InvalidMoney);
+}
+/// A stored receipt is checked as issued: its content must still hash to its terms digest. A
+/// price scale edited without its money digest is refused as other money; edited with its money
+/// digest but not the terms digest, it is refused as another acceptance, as is any other field.
+#[test]
+fn a_stored_receipt_must_still_hash_to_its_terms_digest() {
+    let q = sale_query();
+    let issued = vm_binding();
+    let digest = terms_digest(&q, std::slice::from_ref(&issued));
+    assert!(validate_stored_terms(&q, std::slice::from_ref(&issued), &digest).is_ok());
+    let stored_reason = |b: AcceptedBinding, expected: R| {
+        let error = validate_stored_terms(&q, &[b], &digest).unwrap_err();
+        assert_eq!(error.reason, Some(expected));
+    };
+    let mut rescaled = issued.clone();
+    rescaled.price.currency = bss_money::CurrencySpec::try_new("EUR".into(), 3).unwrap();
+    stored_reason(rescaled.clone(), R::MoneyDigestMismatch);
+    certify(&mut rescaled);
+    stored_reason(rescaled, R::AcceptanceMismatch);
+    let mut renamed = issued;
+    renamed.sku_name = "Another name".into();
+    stored_reason(renamed, R::AcceptanceMismatch);
 }
 #[test]
 fn recurring_cycles_must_agree_and_one_time_has_no_period() {
@@ -432,7 +500,7 @@ fn hourly_tiers_reuse_half_open_math_at_exact_threshold_ten() {
     ] {
         assert_eq!(
             money::amount_for(kind, &model, Decimal::TEN).unwrap(),
-            value.parse::<Decimal>().unwrap()
+            bss_money::exact::ExactAmount::from_decimal(value.parse::<Decimal>().unwrap())
         );
     }
     for model in [

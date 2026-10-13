@@ -2066,6 +2066,7 @@ dependencies = [
  "async-trait",
  "aws-lc-rs",
  "axum",
+ "bigdecimal",
  "cf-gears-account-management",
  "cf-gears-account-management-sdk",
  "cf-gears-authz-resolver",
@@ -2073,6 +2074,7 @@ dependencies = [
  "cf-gears-bss-coord",
  "cf-gears-bss-ledger",
  "cf-gears-bss-ledger-sdk",
+ "cf-gears-bss-money",
  "cf-gears-tenant-resolver",
  "cf-gears-tenant-resolver-sdk",
  "cf-gears-test-containers",
@@ -2091,6 +2093,7 @@ dependencies = [
  "gts",
  "opentelemetry",
  "opentelemetry_sdk",
+ "rust_decimal",
  "sea-orm",
  "sea-orm-migration",
  "serde",
@@ -2099,6 +2102,7 @@ dependencies = [
  "thiserror 2.0.20",
  "time",
  "tokio",
+ "tokio-retry",
  "tokio-util",
  "tower",
  "tracing",
@@ -2111,6 +2115,7 @@ name = "cf-gears-bss-ledger-sdk"
 version = "0.1.8"
 dependencies = [
  "async-trait",
+ "cf-gears-bss-money",
  "cf-gears-toolkit-canonical-errors",
  "cf-gears-toolkit-gts",
  "cf-gears-toolkit-odata",
@@ -2118,12 +2123,24 @@ dependencies = [
  "cf-gears-toolkit-security",
  "chrono",
  "gts",
+ "rust_decimal",
  "schemars 1.2.1",
  "serde",
  "serde_json",
  "thiserror 2.0.20",
  "time",
  "uuid",
+]
+
+[[package]]
+name = "cf-gears-bss-money"
+version = "0.1.0"
+dependencies = [
+ "bigdecimal",
+ "rust_decimal",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -2140,6 +2157,7 @@ dependencies = [
  "cf-gears-bss-approval",
  "cf-gears-bss-approvals-sdk",
  "cf-gears-bss-coord",
+ "cf-gears-bss-money",
  "cf-gears-bss-pricing",
  "cf-gears-bss-pricing-sdk",
  "cf-gears-bss-products-sdk",
@@ -2184,9 +2202,11 @@ version = "0.0.0"
 dependencies = [
  "async-trait",
  "aws-lc-rs",
+ "cf-gears-bss-money",
  "cf-gears-toolkit-canonical-errors",
  "cf-gears-toolkit-contract",
  "cf-gears-toolkit-security",
+ "proptest",
  "rust_decimal",
  "serde_json",
  "thiserror 2.0.20",
@@ -2344,6 +2364,7 @@ dependencies = [
  "anyhow",
  "axum",
  "cf-gears-bss-ledger-sdk",
+ "cf-gears-bss-money",
  "cf-gears-toolkit",
  "cf-gears-toolkit-gts",
  "cf-gears-toolkit-http",
@@ -2514,6 +2535,47 @@ dependencies = [
  "tonic-prost-build",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "cf-gears-construct"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum",
+ "cf-gears-authz-resolver",
+ "cf-gears-authz-resolver-sdk",
+ "cf-gears-construct-sdk",
+ "cf-gears-toolkit",
+ "cf-gears-toolkit-canonical-errors",
+ "cf-gears-toolkit-db",
+ "cf-gears-toolkit-db-macros",
+ "cf-gears-toolkit-gts",
+ "cf-gears-toolkit-macros",
+ "cf-gears-toolkit-security",
+ "inventory",
+ "sea-orm",
+ "sea-orm-migration",
+ "serde",
+ "thiserror 2.0.20",
+ "tokio",
+ "tower",
+ "tracing",
+ "utoipa",
+ "uuid",
+]
+
+[[package]]
+name = "cf-gears-construct-sdk"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "cf-gears-toolkit",
+ "cf-gears-toolkit-canonical-errors",
+ "cf-gears-toolkit-macros",
+ "cf-gears-toolkit-security",
+ "uuid",
 ]
 
 [[package]]
@@ -4315,6 +4377,7 @@ dependencies = [
  "cf-gears-toolkit-odata",
  "cf-gears-toolkit-sea-orm-pgq",
  "cf-gears-toolkit-security",
+ "cf-gears-toolkit-taskward",
  "cf-gears-toolkit-utils",
  "chrono",
  "criterion",
@@ -4620,6 +4683,19 @@ dependencies = [
 [[package]]
 name = "cf-gears-toolkit-stable-hash"
 version = "0.1.0"
+
+[[package]]
+name = "cf-gears-toolkit-taskward"
+version = "0.1.0"
+dependencies = [
+ "criterion",
+ "futures-util",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+ "xxhash-rust",
+]
 
 [[package]]
 name = "cf-gears-toolkit-trace-context"

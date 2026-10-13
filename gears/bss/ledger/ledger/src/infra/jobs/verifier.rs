@@ -30,7 +30,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use bss_ledger_sdk::{AccountClass, MappingStatus, Side, SourceDocType};
+use bss_ledger_sdk::SourceDocType;
 use sea_orm::{ColumnTrait, Condition, EntityTrait, FromQueryResult, QuerySelect};
 use toolkit_db::secure::{AccessScope, SecureEntityExt, TxConfig};
 use toolkit_db::{DBProvider, DbError};
@@ -46,6 +46,7 @@ use crate::infra::events::payloads::{AlarmCategory, AlarmSeverity, LedgerInvaria
 use crate::infra::events::publisher::LedgerEventPublisher;
 use crate::infra::posting::freeze::ScopeFreezeRepo;
 use crate::infra::storage::entity::{chain_state, journal_entry, journal_line};
+use crate::infra::storage::repo::journal_repo::decode_line;
 
 /// `scope_freeze.scope` kind for a tenant-wide freeze.
 const SCOPE_KIND_TENANT: &str = "tenant";
@@ -411,7 +412,7 @@ impl ChainVerifierJob {
             // SAME `chain_row_hash` the in-posting seal uses) linked to the
             // entry's own stored `prev_hash`, and compare to the stored value.
             let Some((new_entry, new_lines)) = reconstruct(&header, &line_rows) else {
-                // A stored enum literal no longer parses — a corrupt row.
+                // A stored enum literal or line money no longer decodes — a corrupt row.
                 break 'walk Some(ChainBreak {
                     entry_id,
                     period_id,
@@ -705,8 +706,9 @@ impl ChainVerifierJob {
 /// Rebuild the canonical [`NewEntry`] + `Vec<NewLine>` from a stored header +
 /// its line rows, parsing the stored string enums back into their SDK types and
 /// narrowing `currency_scale` from the persisted `i16` to the `u8` the encoder
-/// expects. Returns `None` if any stored enum literal no longer parses (a
-/// corrupt row — caught as a chain break by the caller).
+/// expects. Returns `None` if a stored enum literal no longer parses or a stored
+/// line's money or functional triple does not decode (noncanonical text, an
+/// amount off its scale): a corrupt row, caught as a chain break by the caller.
 ///
 /// `correlation_id` and `rounding_evidence` are excluded from the chain hash
 /// (see [`crate::domain::chain`]), so any value reproduces the same `row_hash`;
@@ -739,38 +741,21 @@ fn reconstruct(
 
     let mut lines = Vec::with_capacity(line_rows.len());
     for row in line_rows {
-        lines.push(NewLine {
-            line_id: row.line_id,
-            payer_tenant_id: row.payer_tenant_id,
-            seller_tenant_id: row.seller_tenant_id,
-            resource_tenant_id: row.resource_tenant_id,
-            account_id: row.account_id,
-            account_class: row.account_class.parse::<AccountClass>().ok()?,
-            gl_code: row.gl_code.clone(),
-            side: row.side.parse::<Side>().ok()?,
-            amount_minor: row.amount_minor,
-            currency: row.currency.clone(),
-            // `journal_line.currency_scale` is persisted as `i16`; the encoder
-            // takes `u8`. A scale outside `0..=255` is a corrupt row.
-            currency_scale: u8::try_from(row.currency_scale).ok()?,
-            invoice_id: row.invoice_id.clone(),
-            due_date: row.due_date,
-            revenue_stream: row.revenue_stream.clone(),
-            mapping_status: row.mapping_status.parse::<MappingStatus>().ok()?,
-            functional_amount_minor: row.functional_amount_minor,
-            functional_currency: row.functional_currency.clone(),
-            tax_jurisdiction: row.tax_jurisdiction.clone(),
-            tax_filing_period: row.tax_filing_period.clone(),
-            tax_rate_ref: row.tax_rate_ref.clone(),
-            legal_entity_id: row.legal_entity_id,
-            invoice_item_ref: row.invoice_item_ref.clone(),
-            sku_or_plan_ref: row.sku_or_plan_ref.clone(),
-            price_id: row.price_id.clone(),
-            pricing_snapshot_ref: row.pricing_snapshot_ref.clone(),
-            po_allocation_group: row.po_allocation_group.clone(),
-            credit_grant_event_type: row.credit_grant_event_type.clone(),
-            ar_status: row.ar_status.clone(),
-        });
+        match decode_line(row) {
+            Ok(line) => lines.push(line),
+            Err(error) => {
+                // The caller freezes the tenant on a CorruptRow; this line is the
+                // only record of which line, column and stored value failed.
+                tracing::warn!(
+                    tenant_id = %header.tenant_id,
+                    entry_id = %header.entry_id,
+                    line_id = %row.line_id,
+                    error = %error,
+                    "bss-ledger: chain verify: stored journal line does not decode"
+                );
+                return None;
+            }
+        }
     }
 
     Some((entry, lines))

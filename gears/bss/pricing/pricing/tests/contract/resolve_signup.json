@@ -14,8 +14,6 @@
         "state": "published",
         "book_id": "<book:eur>",
         "currency": "EUR",
-        "currency_minor_digits": 2,
-        "rounding_policy": "half_even",
         "date": "2026-10-05",
         "items": [
           {
@@ -58,8 +56,10 @@
                   "price_id": "<price:10>",
                   "dim_used": null,
                   "pinned_from": null,
+                  "currency": "EUR",
+                  "currency_scale": 2,
                   "price": {
-                    "amount": "10.00"
+                    "amount": "10"
                   },
                   "min_fee": null,
                   "eligibility": "all",
@@ -112,10 +112,12 @@
                   "price_id": "<price:storage-default>",
                   "dim_used": null,
                   "pinned_from": null,
+                  "currency": "EUR",
+                  "currency_scale": 2,
                   "price": {
-                    "rate": "0.10"
+                    "rate": "0.1"
                   },
-                  "min_fee": "5.00",
+                  "min_fee": "5",
                   "eligibility": "all",
                   "effective_from": "2026-01-01",
                   "effective_to": "2027-01-01",
@@ -131,6 +133,8 @@
                   "price_id": "<price:storage-eu>",
                   "dim_used": "eu",
                   "pinned_from": null,
+                  "currency": "EUR",
+                  "currency_scale": 2,
                   "price": {
                     "rate": "0.08"
                   },
@@ -150,6 +154,8 @@
                   "price_id": "<price:storage-us>",
                   "dim_used": "us",
                   "pinned_from": null,
+                  "currency": "EUR",
+                  "currency_scale": 2,
                   "price": {
                     "rate": "0.09"
                   },
@@ -169,6 +175,8 @@
                   "price_id": "<price:storage-apac>",
                   "dim_used": "apac",
                   "pinned_from": null,
+                  "currency": "EUR",
+                  "currency_scale": 2,
                   "price": {
                     "rate": "0.11"
                   },
@@ -188,10 +196,12 @@
                   "price_id": "<price:storage-default>",
                   "dim_used": null,
                   "pinned_from": null,
+                  "currency": "EUR",
+                  "currency_scale": 2,
                   "price": {
-                    "rate": "0.10"
+                    "rate": "0.1"
                   },
-                  "min_fee": "5.00",
+                  "min_fee": "5",
                   "eligibility": "all",
                   "effective_from": "2026-01-01",
                   "effective_to": "2027-01-01",
@@ -247,6 +257,8 @@
                   "price_id": "<price:egress-eu>",
                   "dim_used": "eu",
                   "pinned_from": null,
+                  "currency": "EUR",
+                  "currency_scale": 2,
                   "price": {
                     "rate": "0.02"
                   },
@@ -266,6 +278,8 @@
                   "price_id": "<price:egress-us>",
                   "dim_used": "us",
                   "pinned_from": null,
+                  "currency": "EUR",
+                  "currency_scale": 2,
                   "price": {
                     "rate": "0.03"
                   },
@@ -364,11 +378,13 @@
                   "price_id": "<price:requests-graduated>",
                   "dim_used": null,
                   "pinned_from": null,
+                  "currency": "EUR",
+                  "currency_scale": 2,
                   "price": {
                     "tiers": [
                       {
                         "up_to": "1000",
-                        "rate": "0.010"
+                        "rate": "0.01"
                       },
                       {
                         "up_to": null,
@@ -392,11 +408,13 @@
                   "price_id": "<price:requests-graduated>",
                   "dim_used": null,
                   "pinned_from": null,
+                  "currency": "EUR",
+                  "currency_scale": 2,
                   "price": {
                     "tiers": [
                       {
                         "up_to": "1000",
-                        "rate": "0.010"
+                        "rate": "0.01"
                       },
                       {
                         "up_to": null,
@@ -420,11 +438,13 @@
                   "price_id": "<price:requests-graduated>",
                   "dim_used": null,
                   "pinned_from": null,
+                  "currency": "EUR",
+                  "currency_scale": 2,
                   "price": {
                     "tiers": [
                       {
                         "up_to": "1000",
-                        "rate": "0.010"
+                        "rate": "0.01"
                       },
                       {
                         "up_to": null,
@@ -448,11 +468,13 @@
                   "price_id": "<price:requests-graduated>",
                   "dim_used": null,
                   "pinned_from": null,
+                  "currency": "EUR",
+                  "currency_scale": 2,
                   "price": {
                     "tiers": [
                       {
                         "up_to": "1000",
-                        "rate": "0.010"
+                        "rate": "0.01"
                       },
                       {
                         "up_to": null,
@@ -476,11 +498,13 @@
                   "price_id": "<price:requests-graduated>",
                   "dim_used": null,
                   "pinned_from": null,
+                  "currency": "EUR",
+                  "currency_scale": 2,
                   "price": {
                     "tiers": [
                       {
                         "up_to": "1000",
-                        "rate": "0.010"
+                        "rate": "0.01"
                       },
                       {
                         "up_to": null,
@@ -544,6 +568,8 @@
                   "price_id": "<price:requests-volume>",
                   "dim_used": "eu",
                   "pinned_from": null,
+                  "currency": "EUR",
+                  "currency_scale": 2,
                   "price": {
                     "tiers": [
                       {
@@ -632,9 +658,11 @@
                   "price_id": "<price:requests-package>",
                   "dim_used": "us",
                   "pinned_from": null,
+                  "currency": "EUR",
+                  "currency_scale": 2,
                   "price": {
                     "package_size": "1000",
-                    "package_price": "5.00"
+                    "package_price": "5"
                   },
                   "min_fee": null,
                   "eligibility": "all",

@@ -8,12 +8,13 @@ use super::{
         PricingSettingsPut,
     },
     support::{
-        DoorError, audit, check_version, conflict, conflict_because, invalid, response, value,
+        DoorError, audit, check_version, conflict, conflict_because, invalid, invalid_because,
+        response, value,
     },
 };
 use crate::{
     api::rest::closed_sets::PricingBillingTiming,
-    domain::{book, dimension, price_book_entry::validate_template},
+    domain::{book, currency::CurrencyScales, dimension, price_book_entry::validate_template},
     infra::storage::{
         RepoError,
         entity::{dimension_key, settings},
@@ -27,16 +28,6 @@ use toolkit_db::secure::{AccessScope, DBRunner};
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
-/// The rounding modes a tenant's `default_rounding` may name (D-437). The column has no CHECK: a
-/// stored value outside the set reads back as stored, and the deploy pre-flight normalises one
-/// before the door that refuses it ships.
-pub const ROUNDING_MODES: [&str; 5] = ["half_up", "half_even", "half_down", "up", "down"];
-
-/// The rounding of a tenant that never wrote its settings: banker's `half_even`, the ledger's
-/// platform default (D-437). It reaches every revision drafted before the first write and
-/// `/resolve`'s `rounding_policy` for them.
-pub const DEFAULT_ROUNDING: &str = "half_even";
-
 pub async fn settings(
     tx: &impl DBRunner,
     scope: &AccessScope,
@@ -46,7 +37,6 @@ pub async fn settings(
         // Version 0: nothing was ever written, so nobody changed anything (D-438).
         return Ok(PricingSettingsDto {
             default_timing: PricingBillingTiming::Advance,
-            default_rounding: DEFAULT_ROUNDING.into(),
             default_gl: None,
             default_tax_category: None,
             invoice_line_templates: serde_json::json!({}),
@@ -64,7 +54,6 @@ pub async fn settings(
             &m.default_timing,
             &format_args!("settings of {tenant}: default_timing"),
         )?,
-        default_rounding: m.default_rounding,
         default_gl: m.default_gl,
         default_tax_category: m.default_tax_category,
         invoice_line_templates: m.invoice_line_templates,
@@ -75,13 +64,23 @@ pub async fn settings(
         updated_by_name: None,
     })
 }
-/// D-438: each offered code is spelled as a book's currency is, once.
-fn validate_currencies(codes: &[String]) -> Result<(), CanonicalError> {
+/// D-438: each offered code is one the currency table resolves, once. A value that is not three
+/// uppercase letters is refused first with a fixed message that does not repeat it. Any other
+/// refusal names the code and says whether the table does not know it or the list repeats it: a
+/// code stored earlier can stop being known when the deployment's table changes.
+fn validate_currencies(codes: &[String], scales: &CurrencyScales) -> Result<(), CanonicalError> {
     let mut seen = BTreeSet::new();
     for code in codes {
-        if !book::currency_code(code) || !seen.insert(code.as_str()) {
-            return Err(invalid("currencies", "CURRENCY_INVALID"));
-        }
+        let reason = if !book::currency_code(code) {
+            "an offered currency is a currency code: three uppercase letters".to_owned()
+        } else if scales.resolve(code).is_none() {
+            format!("{code:?} is not a currency the currency table knows")
+        } else if !seen.insert(code.as_str()) {
+            format!("{code} is listed more than once")
+        } else {
+            continue;
+        };
+        return Err(invalid_because("currencies", "CURRENCY_INVALID", &reason));
     }
     Ok(())
 }
@@ -92,6 +91,7 @@ pub async fn put_settings(
     correlation: Uuid,
     version: u64,
     body: PricingSettingsPut,
+    scales: &CurrencyScales,
 ) -> Result<Response, DoorError> {
     let tenant = ctx.subject_tenant_id();
     let before = settings(tx, scope, tenant).await?;
@@ -102,24 +102,17 @@ pub async fn put_settings(
     if !matches!(body.default_timing.as_str(), "advance" | "arrears") {
         return Err(invalid("default_timing", "TIMING_INVALID").into());
     }
-    if body.default_rounding.trim().is_empty() {
-        return Err(invalid("default_rounding", "ROUNDING_REQUIRED").into());
-    }
-    if !ROUNDING_MODES.contains(&body.default_rounding.as_str()) {
-        return Err(invalid("default_rounding", "ROUNDING_INVALID").into());
-    }
     for (kind, template) in &body.invoice_line_templates {
         if !matches!(kind.as_str(), "recurring" | "usage" | "one_time" | "bundle") {
             return Err(invalid("invoice_line_templates", "SKU_TYPE_INVALID").into());
         }
         validate_template(template).map_err(|e| invalid("invoice_line_templates", e.code))?;
     }
-    validate_currencies(&body.currencies)?;
+    validate_currencies(&body.currencies, scales)?;
     let now = crate::infra::storage::stored_now();
     let m = settings::Model {
         tenant_id: tenant,
         default_timing: body.default_timing,
-        default_rounding: body.default_rounding,
         default_gl: body.default_gl,
         default_tax_category: body.default_tax_category,
         invoice_line_templates: value(&body.invoice_line_templates)?,

@@ -7,6 +7,7 @@ use super::{
     money::{self, PriceData},
     price_book_entry::{ChargeKind, Model, model_allowed},
 };
+use bss_money::CurrencySpec;
 use rust_decimal::Decimal;
 use time::Date;
 use uuid::Uuid;
@@ -32,6 +33,10 @@ pub struct Price {
     pub version_no: i32,
     pub dim_value: Option<String>,
     pub model: Model,
+    /// The price's own currency spec: its book's currency and the scale the currency table gave
+    /// it when the price was written. A new or edited draft takes the current scale; an approved
+    /// price keeps its stored one.
+    pub currency: CurrencySpec,
     pub price: Option<PriceData>,
     pub min_fee: Option<Decimal>,
     pub eligibility: Eligibility,
@@ -50,7 +55,8 @@ pub fn parse_start(text: &str) -> Result<Date, RuleError> {
     Date::parse(text, &time::format_description::well_known::Iso8601::DATE)
         .map_err(|_| RuleError::new("WINDOW_START_INVALID"))
 }
-/// Validate all independent authoring rules. Currency scale is supplied by the book context.
+/// Validate all independent authoring rules. The minimum fee is judged on the price's own
+/// currency spec.
 #[must_use]
 pub fn validate(
     price: &Price,
@@ -58,7 +64,6 @@ pub fn validate(
     values: Option<&[String]>,
     siblings: &[Price],
     today: Date,
-    minor_digits: u32,
 ) -> Vec<RuleError> {
     let mut errors = Vec::new();
     if !model_allowed(kind, price.model) {
@@ -91,10 +96,12 @@ pub fn validate(
             Some(_) => {}
         }
     }
-    if price
-        .min_fee
-        .is_some_and(|fee| fee < Decimal::ZERO || fee.scale() > minor_digits)
-    {
+    // Not negative, at most 28 digits, and no more fractional places than the currency once
+    // trailing zeros are dropped: `30.00` is on a 2-place increment and on a 0-place one, `0.001`
+    // is on neither.
+    if price.min_fee.is_some_and(|fee| {
+        bss_pricing_sdk::numeric::validate_minimum_fee(fee, &price.currency).is_err()
+    }) {
         errors.push(RuleError::new("MIN_FEE_INVALID"));
     }
     errors

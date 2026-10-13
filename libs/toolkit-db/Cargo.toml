@@ -112,6 +112,7 @@ sqlx = { workspace = true, optional = true }
 # Unconditional: the transactional outbox pipeline is always compiled in.
 tokio-util = { workspace = true }
 futures-util = { workspace = true }
+toolkit-taskward = { workspace = true }
 
 [[example]]
 name = "outbox_transactional"
@@ -138,11 +139,6 @@ name = "outbox_throughput"
 harness = false
 # `_any-backend` is a virtual OR over pg/mysql/sqlite (see [features] above).
 # The bench body compile-errors out if no backend is present.
-required-features = ["_any-backend"]
-
-[[bench]]
-name = "worker_overhead"
-harness = false
 required-features = ["_any-backend"]
 
 [dev-dependencies]

@@ -1,4 +1,4 @@
-<!-- migration-note: index for the Billing Ledger design set, converted from the legacy Virtuozzo design set at vhp-architecture/docs/bss/design/DESIGN-billing-ledger-balances-202606091200/ (original README + slice docs 00–07). Mirrors the source layout: a foundation design plus per-slice design docs, ordered by implementation phase. -->
+<!-- migration-note: index for the Billing Ledger design set, converted from the legacy Virtuozzo design set (original README + slice docs 00–07). Mirrors the source layout: a foundation design plus per-slice design docs, ordered by implementation phase. -->
 <!-- CONFLUENCE_TITLE: [BSS]: Billing Ledger — Design Set -->
 <!-- Related: ../DESIGN.md, ../PRD.md, ../ADR/ | Owners: @vstudzinskyi (BSS Billing Platform team) -->
 

@@ -363,6 +363,8 @@ TABLE pricing_price
   COLUMN closed_explicitly INTEGER NOT NULL DEFAULT 0 PK 0
   COLUMN created_at TEXT NOT NULL DEFAULT - PK 0
   COLUMN created_by TEXT NOT NULL DEFAULT - PK 0
+  COLUMN currency TEXT NOT NULL DEFAULT - PK 0
+  COLUMN currency_scale INTEGER NOT NULL DEFAULT - PK 0
   COLUMN dim_value TEXT NULL DEFAULT - PK 0
   COLUMN effective_from TEXT NOT NULL DEFAULT - PK 0
   COLUMN effective_to TEXT NULL DEFAULT - PK 0
@@ -452,7 +454,6 @@ TABLE pricing_settings
   COLUMN created_at TEXT NOT NULL DEFAULT - PK 0
   COLUMN currencies TEXT NOT NULL DEFAULT '[]' PK 0
   COLUMN default_gl TEXT NULL DEFAULT - PK 0
-  COLUMN default_rounding TEXT NOT NULL DEFAULT - PK 0
   COLUMN default_tax_category TEXT NULL DEFAULT - PK 0
   COLUMN default_timing TEXT NOT NULL DEFAULT - PK 0
   COLUMN invoice_line_templates TEXT NOT NULL DEFAULT - PK 0

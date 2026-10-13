@@ -1,5 +1,5 @@
 //! `SecuredAuditSink` — the Slice-3-local **port** for Slice 6's secured-audit
-//! store (design §2.1, F1). Slice 6 (VHP-1858) owns the durable
+//! store (design §2.1, F1). Slice 6 owns the durable
 //! `secured_audit_record` table + its append-only / hash-chained / retention
 //! semantics, but its code is not in our base. So Slice 3 depends on this trait
 //! whose method signature mirrors Slice 6's `SecuredAuditStore::append`
@@ -25,7 +25,7 @@
 //! `before_after` payload is asserted PII-clean by the caller (ids + amounts +
 //! enum codes only) before it reaches here (design §2.3).
 //!
-//! GAP (post-VHP-1858 rebase, tracked follow-up — NOT a runtime defect today):
+//! GAP (a known follow-up — NOT a runtime defect today):
 //! Slice 6's real [`crate::infra::audit::store::SecuredAuditStore`] now lives in
 //! the base, but the Slice-3 dispositions (the `unknown_final` refund clear in
 //! `adjustment::refund_service` and the write-off capture in

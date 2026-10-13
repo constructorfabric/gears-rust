@@ -10,7 +10,8 @@
 //! @cpt-dod:cpt-cf-bss-pricing-dod-sod-excludes-authors:p1
 use crate::{
     domain::{
-        RuleError, book,
+        RuleError,
+        currency::CurrencyScales,
         price::{self, ChangeKind, Eligibility, Price, PriceState, SkuMetering},
         price_book_entry::{ChargeKind, Model},
     },
@@ -56,7 +57,9 @@ pub struct PriceBookEntryContext {
     /// The entry's model (D-427): every price of the entry is decoded and judged in it.
     pub model: Model,
     pub values: Option<Vec<String>>,
-    pub digits: u32,
+    /// The book's currency: every price of the entry carries it, and a new or edited draft takes
+    /// its current scale ([`Self::current`]).
+    pub currency: String,
     pub prices: Vec<entity::price::Model>,
     pub policy: Option<crate::infra::usage_policy_wire::UsageRatingPolicy>,
 }
@@ -92,7 +95,7 @@ impl PriceBookEntryContext {
             kind,
             model: price_book_entry_repo::model_of(entry)?,
             values,
-            digits: book::minor_digits(&book.currency),
+            currency: book.currency,
             prices,
             policy: crate::infra::storage::repo::usage_policy_repo::for_entries(
                 tx,
@@ -111,8 +114,21 @@ impl PriceBookEntryContext {
         self.prices
             .iter()
             .filter(|m| price_repo::is_price(m))
-            .map(|m| price_repo::to_domain(m, self.model))
+            .map(|m| self.decode(m))
             .collect()
+    }
+    /// One stored price of the entry in the pure model, in the entry's model and with its stored
+    /// currency spec, which must name the book's currency.
+    /// # Errors
+    /// A corrupt stored price, or one whose currency is not its book's.
+    pub fn decode(&self, m: &entity::price::Model) -> Result<Price, RepoError> {
+        price_repo::in_book(m, self.model, &self.currency)
+    }
+    /// The spec a new or edited draft of the entry takes: the book's currency at the scale
+    /// `scales` gives it today; `None` when the table no longer knows the currency.
+    #[must_use]
+    pub fn current(&self, scales: &CurrencyScales) -> Option<bss_money::CurrencySpec> {
+        scales.resolve(&self.currency)
     }
     /// The first pure refusal of a candidate against the entry's approved prices.
     #[must_use]
@@ -135,7 +151,6 @@ impl PriceBookEntryContext {
             self.values.as_deref(),
             siblings,
             today,
-            self.digits,
         )
         .first()
         .copied()
@@ -166,6 +181,10 @@ pub struct PricesSubject {
     /// Partners that publish-changes pulled in; recorded in the snapshot.
     pub added_partner: Vec<Uuid>,
     pub release: Release,
+    /// The currency table a draft's stored scale is checked against: a draft written under
+    /// another scale is refused (`CURRENCY_SCALE_CHANGED`) until its author edits it, and a draft
+    /// in a currency the table no longer lists is refused (`BOOK_CURRENCY_INVALID`).
+    currency_scales: Arc<CurrencyScales>,
     /// A definite Products refusal met while judging, kept whole for the door: the approval
     /// error carries only static codes, and the caller must see Products' own status and code.
     refused: Arc<Mutex<Option<CanonicalError>>>,
@@ -319,7 +338,7 @@ fn after(r: &Price, note: Option<&str>) -> Value {
         "version_no": r.version_no,
         "dim_value": r.dim_value,
         "price": r.price,
-        "min_fee": r.min_fee.map(|v| v.to_string()),
+        "min_fee": r.min_fee.map(bss_money::canonical_decimal),
         "eligibility": r.eligibility.as_str(),
         "effective_from": date(r.effective_from),
         "effective_to": r.effective_to.map(date),
@@ -346,7 +365,7 @@ fn before(r: &Price) -> Value {
         "price_id": r.id,
         "version_no": r.version_no,
         "price": r.price,
-        "min_fee": r.min_fee.map(|v| v.to_string()),
+        "min_fee": r.min_fee.map(bss_money::canonical_decimal),
         "eligibility": r.eligibility.as_str(),
         "effective_from": date(r.effective_from),
         "effective_to": r.effective_to.map(date),
@@ -524,13 +543,15 @@ fn by_entry(models: Vec<entity::price::Model>) -> BTreeMap<Uuid, Vec<entity::pri
 }
 
 impl PricesSubject {
-    /// A subject for the caller's tenant; no shift, no pulled-in partner, withdraw semantics.
+    /// A subject for the caller's tenant judging drafts against `currency_scales`; no shift, no
+    /// pulled-in partner, withdraw semantics.
     #[must_use]
     pub fn new(
         ctx: SecurityContext,
         hub: Arc<toolkit::ClientHub>,
         book_id: Uuid,
         now: OffsetDateTime,
+        currency_scales: Arc<CurrencyScales>,
     ) -> Self {
         let tenant_id = ctx.subject_tenant_id();
         Self {
@@ -543,6 +564,7 @@ impl PricesSubject {
             common_effective_date: None,
             added_partner: Vec::new(),
             release: Release::Draft,
+            currency_scales,
             refused: Arc::default(),
             review: Arc::default(),
             moved: Arc::default(),
@@ -722,9 +744,38 @@ impl PricesSubject {
             .collect();
         let drafts = sets
             .iter()
-            .map(|m| price_repo::to_domain(m, pc.model))
+            .map(|m| pc.decode(m))
             .collect::<Result<Vec<_>, _>>()
             .map_err(storage)?;
+        // A draft carries the scale of the day it was written or last edited. One the table has
+        // changed since is refused and left as it is: its author edits it, which takes today's
+        // scale, and submits it again. A book currency the table no longer lists takes no price
+        // at all, so its drafts are refused with their own code: no edit can help them. A
+        // `cancel` or `end` row keeps its price's scale and is not judged here.
+        match pc.current(&self.currency_scales) {
+            None => {
+                if let Some(draft) = drafts.first() {
+                    return Err(invalid(
+                        "BOOK_CURRENCY_INVALID",
+                        format!("price {}: currency {}", draft.id, pc.currency),
+                    ));
+                }
+            }
+            Some(current) => {
+                if let Some(stale) = drafts.iter().find(|r| r.currency != current) {
+                    return Err(invalid(
+                        "CURRENCY_SCALE_CHANGED",
+                        format!(
+                            "price {}: stored at scale {}, the table now gives {} scale {}",
+                            stale.id,
+                            stale.currency.scale(),
+                            current.code(),
+                            current.scale()
+                        ),
+                    ));
+                }
+            }
+        }
         let proposed =
             price::shift_selection(&drafts, shift).map_err(|e| rule(e, price_book_entry_id))?;
         let today = self.now.date();
@@ -907,6 +958,9 @@ impl<'a> ApprovalSubject<DbTx<'a>> for PricesSubject {
         let mut items = Vec::new();
         let grouped = by_entry(models);
         self.review(tx, &grouped.keys().copied().collect()).await?;
+        // Each entry's book currency, read once per book: every price decodes as every read of a
+        // price decodes it, with its stored currency checked against its book's.
+        let mut currencies: BTreeMap<Uuid, String> = BTreeMap::new();
         for (price_book_entry_id, prices) in grouped {
             let unit: BTreeSet<Uuid> = prices.iter().map(|m| m.id).collect();
             let entry =
@@ -917,6 +971,21 @@ impl<'a> ApprovalSubject<DbTx<'a>> for PricesSubject {
                         invalid("ENTRY_NOT_FOUND", format!("entry {price_book_entry_id}"))
                     })?;
             let model = price_book_entry_repo::model_of(&entry).map_err(storage)?;
+            let currency: &str = match currencies.entry(entry.book_id) {
+                std::collections::btree_map::Entry::Occupied(known) => known.into_mut(),
+                std::collections::btree_map::Entry::Vacant(slot) => {
+                    let book = book_repo::find(tx, &self.scope(), self.tenant_id, entry.book_id)
+                        .await
+                        .map_err(storage)?
+                        .ok_or_else(|| {
+                            storage(RepoError::CorruptRow(format!(
+                                "entry {} has no book",
+                                entry.id
+                            )))
+                        })?;
+                    slot.insert(book.currency)
+                }
+            };
             let approved: Vec<Price> =
                 price_repo::for_entry(tx, &self.scope(), self.tenant_id, price_book_entry_id)
                     .await
@@ -927,14 +996,14 @@ impl<'a> ApprovalSubject<DbTx<'a>> for PricesSubject {
                             && price_repo::is_price(m)
                             && !unit.contains(&m.id)
                     })
-                    .map(|m| price_repo::to_domain(m, model))
+                    .map(|m| price_repo::in_book(m, model, currency))
                     .collect::<Result<_, _>>()
                     .map_err(storage)?;
             let sets: Vec<&entity::price::Model> =
                 prices.iter().filter(|m| price_repo::is_price(m)).collect();
             let drafts = sets
                 .iter()
-                .map(|m| price_repo::to_domain(m, model))
+                .map(|m| price_repo::in_book(m, model, currency))
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(storage)?;
             let proposed = price::shift_selection(&drafts, self.common_effective_date)

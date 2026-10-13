@@ -1,8 +1,8 @@
 //! D-520 and D-521: a price row can ask to cancel or end another price, and a price can be
 //! `cancelled`.
 //!
-//! A forward migration. The shipped chain is frozen, so this does not edit an earlier file.
-//! Postgres adds the columns and replaces `pricing_price_state_check`. `SQLite` cannot widen a
+//! A forward migration. A shipped migration is edited in place only under D-534, which puts the price's currency spec
+//! into this migration's `pricing_price` rebuild. Postgres adds the columns and replaces `pricing_price_state_check`. `SQLite` cannot widen a
 //! `CHECK` in place, and the toolkit runner runs `up()` inside a transaction, where
 //! `PRAGMA foreign_keys=OFF` has no effect. The `SQLite` arm therefore rebuilds `pricing_price`
 //! only: nothing else references it (the self references are copied after the rows exist, so a
@@ -76,7 +76,9 @@ const SQLITE_NEW: &str = "CREATE TABLE pricing_price__d520 (
   id text PRIMARY KEY, tenant_id text NOT NULL, price_book_entry_id text NOT NULL REFERENCES pricing_price_book_entry(id),
   version_no integer NOT NULL, dim_value text,
   price_json text NOT NULL,
-  min_fee text CHECK (min_fee GLOB '[0-9]*' AND min_fee NOT GLOB '*[^0-9.]*' AND min_fee NOT GLOB '*.*.*' AND min_fee NOT GLOB '*.'), eligibility text NOT NULL CHECK (eligibility IN ('all','new')),
+  currency text NOT NULL CHECK (length(currency) = 3 AND currency NOT GLOB '*[^A-Z]*'),
+  currency_scale integer NOT NULL CHECK (currency_scale BETWEEN 0 AND 28),
+  min_fee text CHECK (min_fee GLOB '[0-9]*' AND min_fee NOT GLOB '*[^0-9.]*' AND min_fee NOT GLOB '*.*.*' AND min_fee NOT GLOB '*.' AND min_fee NOT GLOB '0[0-9]*' AND min_fee NOT GLOB '*.*0'), eligibility text NOT NULL CHECK (eligibility IN ('all','new')),
   effective_from text NOT NULL, effective_to text, keep_for_bound integer NOT NULL DEFAULT 0,
   closed_explicitly integer NOT NULL DEFAULT 0,
   temporary_until text, paired_price_id text REFERENCES pricing_price__d520(id),
@@ -99,7 +101,9 @@ const SQLITE_OLD: &str = "CREATE TABLE pricing_price__d520_old (
   id text PRIMARY KEY, tenant_id text NOT NULL, price_book_entry_id text NOT NULL REFERENCES pricing_price_book_entry(id),
   version_no integer NOT NULL, dim_value text,
   price_json text NOT NULL,
-  min_fee text CHECK (min_fee GLOB '[0-9]*' AND min_fee NOT GLOB '*[^0-9.]*' AND min_fee NOT GLOB '*.*.*' AND min_fee NOT GLOB '*.'), eligibility text NOT NULL CHECK (eligibility IN ('all','new')),
+  currency text NOT NULL CHECK (length(currency) = 3 AND currency NOT GLOB '*[^A-Z]*'),
+  currency_scale integer NOT NULL CHECK (currency_scale BETWEEN 0 AND 28),
+  min_fee text CHECK (min_fee GLOB '[0-9]*' AND min_fee NOT GLOB '*[^0-9.]*' AND min_fee NOT GLOB '*.*.*' AND min_fee NOT GLOB '*.' AND min_fee NOT GLOB '0[0-9]*' AND min_fee NOT GLOB '*.*0'), eligibility text NOT NULL CHECK (eligibility IN ('all','new')),
   effective_from text NOT NULL, effective_to text, keep_for_bound integer NOT NULL DEFAULT 0,
   closed_explicitly integer NOT NULL DEFAULT 0,
   temporary_until text, paired_price_id text REFERENCES pricing_price__d520_old(id),
@@ -114,9 +118,9 @@ const SQLITE_OLD: &str = "CREATE TABLE pricing_price__d520_old (
 )";
 
 const PRICE_COLUMNS: &str = "id, tenant_id, price_book_entry_id, version_no, dim_value, price_json, \
-min_fee, eligibility, effective_from, effective_to, keep_for_bound, closed_explicitly, \
-temporary_until, state, pending_unit_id, approved_by_unit_id, note, created_by, approved_at, \
-version, created_at, updated_at";
+currency, currency_scale, min_fee, eligibility, effective_from, effective_to, keep_for_bound, \
+closed_explicitly, temporary_until, state, pending_unit_id, approved_by_unit_id, note, created_by, \
+approved_at, version, created_at, updated_at";
 
 fn sqlite_up() -> Vec<String> {
     vec![

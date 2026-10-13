@@ -331,8 +331,8 @@ fn price_row(
     let unit = unit.map_or_else(|| "NULL".to_owned(), u);
     let approved_at = if state == "approved" { "now()" } else { "NULL" };
     format!(
-        "INSERT INTO bss.pricing_price (id,tenant_id,price_book_entry_id,version_no,dim_value,model,price_json,min_fee,eligibility,effective_from,effective_to,keep_for_bound,closed_explicitly,temporary_until,paired_price_id,return_of_price_id,state,pending_unit_id,approved_by_unit_id,note,created_by,approved_at,version,created_at,updated_at) \
-         VALUES ({},{},{},{version_no},NULL,'{model}','{money}'::jsonb,NULL,'all','{from}',NULL,false,false,NULL,NULL,NULL,'{state}',{unit},NULL,'seed',{},{approved_at},1,now(),now())",
+        "INSERT INTO bss.pricing_price (id,tenant_id,price_book_entry_id,version_no,dim_value,model,price_json,currency,currency_scale,min_fee,eligibility,effective_from,effective_to,keep_for_bound,closed_explicitly,temporary_until,paired_price_id,return_of_price_id,state,pending_unit_id,approved_by_unit_id,note,created_by,approved_at,version,created_at,updated_at) \
+         VALUES ({},{},{},{version_no},NULL,'{model}','{money}'::jsonb,'EUR',2,NULL,'all','{from}',NULL,false,false,NULL,NULL,NULL,'{state}',{unit},NULL,'seed',{},{approved_at},1,now(),now())",
         u(Uuid::from_u128(n)),
         u(TENANT),
         u(entry),
@@ -341,7 +341,7 @@ fn price_row(
 }
 
 fn graduated() -> Value {
-    json!({"tiers":[{"up_to":"1000","rate":"0.010"},{"up_to":null,"rate":"0.008"}]})
+    json!({"tiers":[{"up_to":"1000","rate":"0.01"},{"up_to":null,"rate":"0.008"}]})
 }
 
 fn item_row(n: u128, sku: Uuid, entry: Option<Uuid>, treatment: &str, qty: Option<&str>) -> String {
@@ -409,7 +409,7 @@ fn seed_rows() -> Vec<String> {
             SEATS,
             1,
             "flat",
-            &json!({"amount":"10.00"}),
+            &json!({"amount":"10"}),
             "2026-01-01",
             "approved",
             None,
@@ -419,7 +419,7 @@ fn seed_rows() -> Vec<String> {
             SEATS,
             2,
             "flat",
-            &json!({"amount":"12.00"}),
+            &json!({"amount":"12"}),
             "2031-01-01",
             "pending",
             Some(UNIT),
@@ -429,7 +429,7 @@ fn seed_rows() -> Vec<String> {
             SUPPORT,
             1,
             "per_unit",
-            &json!({"rate":"2.00"}),
+            &json!({"rate":"2"}),
             "2026-01-01",
             "approved",
             None,
@@ -732,7 +732,7 @@ async fn postgres_the_migration_locks_both_tables_before_it_judges_the_models() 
             STORAGE,
             9,
             "per_unit",
-            &json!({"rate":"1.00"}),
+            &json!({"rate":"1"}),
             "2032-01-01",
             "rejected",
             None,
@@ -775,7 +775,7 @@ async fn postgres_two_models_on_one_entry_fail_the_migration_and_change_nothing(
                 CALLS,
                 1,
                 "per_unit",
-                &json!({"rate":"1.00"}),
+                &json!({"rate":"1"}),
                 "2026-01-01",
                 "approved",
                 None,
@@ -795,7 +795,7 @@ async fn postgres_two_models_on_one_entry_fail_the_migration_and_change_nothing(
                 SUPPORT,
                 2,
                 "flat",
-                &json!({"amount":"3.00"}),
+                &json!({"amount":"3"}),
                 "2031-01-01",
                 "draft",
                 None,
@@ -848,7 +848,7 @@ async fn postgres_after_the_migration_the_entry_key_takes_the_model() {
                 CALLS,
                 9,
                 "per_unit",
-                &json!({"rate":"1.00"}),
+                &json!({"rate":"1"}),
                 "2031-01-01",
                 "draft",
                 None,

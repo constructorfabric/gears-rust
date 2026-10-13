@@ -1,4 +1,4 @@
-//! Axum handlers + router for the per-tenant FX revaluation mode (VHP-1986).
+//! Axum handlers + router for the per-tenant FX revaluation mode.
 //! `POST /bss-ledger/v1/fx/revaluation-mode` appends an effective-dated version
 //! (`MODE_A` defer-to-ERP | `MODE_B` BSS-is-ledger-of-record); `GET …` reads the
 //! tenant's effective mode. The write gates on `(ledger_config, write)`, the read
@@ -36,7 +36,7 @@ pub struct ApiState {
     pub fx_revaluation_mode: FxRevaluationModeRepo,
 }
 
-/// A new FX revaluation-mode version to write (VHP-1986). `effective_from`
+/// A new FX revaluation-mode version to write. `effective_from`
 /// defaults to now when omitted. An unknown `revaluation_mode` is rejected (400),
 /// never coerced.
 #[derive(Debug, Clone)]
@@ -92,7 +92,7 @@ pub fn router(state: Arc<ApiState>, openapi: &dyn OpenApiRegistry) -> Router {
         .description(
             "Writes a new effective-dated FX revaluation-mode version (`MODE_A` \
              defer-to-ERP | `MODE_B` BSS-is-ledger-of-record) for the caller's \
-             tenant (VHP-1986). Append-only: a new version supersedes; the \
+             tenant. Append-only: a new version supersedes; the \
              revaluation job / period-close pick the latest effective_from (highest \
              version on a tie). An unknown mode is rejected (400), never coerced. \
              Requires `config_write.v1`.",

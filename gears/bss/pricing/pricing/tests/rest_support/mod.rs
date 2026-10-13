@@ -40,6 +40,35 @@ impl authz_resolver_sdk::AuthZResolverApi for DenyingResolver {
     }
 }
 
+/// A PDP that grants every request, scoped to the owner tenant `tenant`.
+pub struct AllowingResolver {
+    pub tenant: Uuid,
+}
+#[async_trait]
+impl authz_resolver_sdk::AuthZResolverApi for AllowingResolver {
+    async fn evaluate(
+        &self,
+        _ctx: toolkit_security::PlatformSecurityContext,
+        _request: authz_resolver_sdk::EvaluationRequest,
+    ) -> Result<authz_resolver_sdk::EvaluationResponse, CanonicalError> {
+        use authz_resolver_sdk::{
+            Constraint, EvaluationResponse, EvaluationResponseContext, InPredicate, Predicate,
+        };
+        Ok(EvaluationResponse {
+            decision: true,
+            context: EvaluationResponseContext {
+                constraints: vec![Constraint {
+                    predicates: vec![Predicate::In(InPredicate::new(
+                        toolkit_security::pep_properties::OWNER_TENANT_ID,
+                        vec![self.tenant],
+                    ))],
+                }],
+                deny_reason: None,
+            },
+        })
+    }
+}
+
 /// Captures the mandatory authz schema registration, even for the empty frame.
 #[derive(Default)]
 pub struct Registry {
@@ -150,10 +179,22 @@ impl Harness {
         config: serde_json::Value,
         with_pdp: bool,
     ) -> anyhow::Result<Self> {
+        let pdp: Option<Arc<dyn authz_resolver_sdk::AuthZResolverApi>> =
+            with_pdp.then(|| Arc::new(DenyingResolver) as _);
+        Self::with_pdp(config, pdp).await
+    }
+
+    /// Boot with `pdp` as the gear's PDP, or none.
+    /// # Errors
+    /// Missing PDP, invalid config or runtime initialization failure.
+    pub async fn with_pdp(
+        config: serde_json::Value,
+        pdp: Option<Arc<dyn authz_resolver_sdk::AuthZResolverApi>>,
+    ) -> anyhow::Result<Self> {
         let db = common::migrated_db().await?;
         let hub = Arc::new(toolkit::ClientHub::new());
-        if with_pdp {
-            hub.register::<dyn authz_resolver_sdk::AuthZResolverApi>(Arc::new(DenyingResolver));
+        if let Some(pdp) = pdp {
+            hub.register::<dyn authz_resolver_sdk::AuthZResolverApi>(pdp);
         }
         let registry = Arc::new(Registry::default());
         hub.register::<dyn TypesRegistryClient>(registry.clone());

@@ -114,19 +114,19 @@ impl MigratorTrait for Migrator {
             Box::new(m20260628_000035_create_reconciliation_run::Migration),
             // Remediation: enforce single-OPEN-row dedup at the DB level.
             Box::new(m20260628_000036_exception_queue_open_uniq::Migration),
-            // VHP-1853: tenant-configurable invoice-posting policies (missing-mapping
+            // Tenant-configurable invoice-posting policies (missing-mapping
             // mode + AR-aging buckets), appended at the Vec end so the down-magic
             // counts in postgres_migration_idempotency.rs shift by +1 only.
             Box::new(m20260629_000037_create_posting_policy::Migration),
-            // VHP-1843: incremental tie-out baseline (ledger_verified_balance),
+            // Incremental tie-out baseline (ledger_verified_balance),
             // appended at the Vec end so the down-magic counts in
             // postgres_migration_idempotency.rs shift by +1 only.
             Box::new(m20260629_000038_create_verified_balance::Migration),
-            // VHP-1859 review C3: Mode-B FX-revaluation completion marker
+            // Mode-B FX-revaluation completion marker
             // (ledger_fx_revaluation_run), appended at the Vec end so the
             // down-magic counts in postgres_migration_idempotency.rs shift by +1.
             Box::new(m20260629_000039_create_fx_revaluation_run::Migration),
-            // VHP-1986 per-tenant FX revaluation-mode table, appended at the Vec
+            // Per-tenant FX revaluation-mode table, appended at the Vec
             // end so the down-magic counts in postgres_migration_idempotency.rs
             // shift by +1 (43 → 44 applied; before-payment / before-queue downs +1).
             Box::new(m20260630_000040_create_fx_revaluation_mode::Migration),

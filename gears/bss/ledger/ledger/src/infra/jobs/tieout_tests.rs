@@ -33,7 +33,7 @@ use super::{
     cache_grains, fold_grains, key_account, negative_grains, settle_index, verify_incremental,
 };
 use crate::domain::model::{AccountRow, CurrencyScaleRow, NewEntry, NewLine};
-use crate::domain::money::DEFAULT_PLAUSIBLE_MAX_MAJOR;
+use crate::domain::reconciliation::GrainAmount;
 use crate::infra::events::publisher::LedgerEventPublisher;
 use crate::infra::jobs::tieout::TieOutJob;
 use crate::infra::posting::service::PostingService;
@@ -47,16 +47,37 @@ use crate::infra::storage::migrations::Migrator;
 use crate::infra::storage::repo::ReferenceRepo;
 use time::OffsetDateTime;
 
+/// A USD scale-2 posting from a cent count (`1234` ⇒ `12.34`).
+fn usd_cents(minor: i64) -> bss_ledger_sdk::PostedMoney {
+    bss_ledger_sdk::PostedMoney::try_new(
+        rust_decimal::Decimal::new(minor, 2),
+        bss_ledger_sdk::CurrencySpec::try_new("USD".to_owned(), 2).unwrap(),
+    )
+    .unwrap()
+}
+
+/// Canonical stored text of a USD scale-2 cent count.
+fn cents_text(minor: i64) -> String {
+    bss_ledger_sdk::canonical_decimal(rust_decimal::Decimal::new(minor, 2))
+}
+
+/// An exact USD scale-2 grain total from a cent count.
+fn ga(minor: i64) -> GrainAmount {
+    GrainAmount::from_posted(&usd_cents(minor))
+}
+
 fn bal(account_id: u128, class: &str, balance_minor: i64) -> account_balance::Model {
     account_balance::Model {
         tenant_id: Uuid::from_u128(0xA1),
         account_id: Uuid::from_u128(account_id),
         currency: "USD".to_owned(),
+        currency_scale: 2,
         account_class: class.to_owned(),
         normal_side: "DR".to_owned(),
-        balance_minor,
-        functional_balance_minor: None,
+        balance: cents_text(balance_minor),
+        functional_balance: None,
         functional_currency: None,
+        functional_currency_scale: None,
         last_entry_seq: None,
         version: 0,
     }
@@ -95,15 +116,16 @@ fn line_for(entry_id: Uuid, side: &str, amount_minor: i64) -> journal_line::Mode
         account_class: "AR".to_owned(),
         gl_code: None,
         side: side.to_owned(),
-        amount_minor,
+        amount: cents_text(amount_minor),
         currency: "USD".to_owned(),
         currency_scale: 2,
         invoice_id: None,
         due_date: None,
         revenue_stream: None,
         mapping_status: "RESOLVED".to_owned(),
-        functional_amount_minor: None,
+        functional_amount: None,
         functional_currency: None,
+        functional_currency_scale: None,
         rate_snapshot_ref: None,
         tax_jurisdiction: None,
         tax_filing_period: None,
@@ -153,23 +175,23 @@ fn is_clean_true_only_when_all_defect_vecs_empty() {
                 .push(AccountBalanceVariance {
                     account_id: Uuid::from_u128(1),
                     currency: "USD".to_owned(),
-                    computed: 100,
-                    cached: 90,
+                    computed: ga(100),
+                    cached: ga(90),
                 });
         }),
         ("sub_grain_variances", |report| {
             report.sub_grain_variances.push(SubGrainVariance {
                 grain: "ar_payer_balance",
                 key: "payer=1".to_owned(),
-                computed: 100,
-                cached: 90,
+                computed: ga(100),
+                cached: ga(90),
             });
         }),
         ("imbalanced_entries", |report| {
             report.imbalanced_entries.push(ImbalancedEntry {
                 entry_id: Uuid::from_u128(2),
                 currency: "USD".to_owned(),
-                net_minor: 10,
+                net: ga(10),
                 line_count: 2,
                 payer_count: 1,
             });
@@ -178,7 +200,7 @@ fn is_clean_true_only_when_all_defect_vecs_empty() {
             report.negative_grains.push(NegativeGrain {
                 account_id: Uuid::from_u128(1),
                 currency: "USD".to_owned(),
-                balance_minor: -50,
+                balance: usd_cents(-50),
             });
         }),
         ("payment_counter_variances", |report| {
@@ -186,9 +208,9 @@ fn is_clean_true_only_when_all_defect_vecs_empty() {
                 .payment_counter_variances
                 .push(PaymentCounterVariance {
                     payment_id: "pay-1".to_owned(),
-                    counter: "allocated_minor",
-                    computed: 100,
-                    cached: 90,
+                    counter: "allocated",
+                    computed: ga(100),
+                    cached: ga(90),
                 });
         }),
     ];
@@ -206,12 +228,11 @@ fn is_clean_true_only_when_all_defect_vecs_empty() {
     negative.negative_grains.push(NegativeGrain {
         account_id: Uuid::from_u128(1),
         currency: "USD".to_owned(),
-        balance_minor: -50,
+        balance: usd_cents(-50),
     });
     assert!(
         negative.summary().contains("negative_grains=1"),
-        "the summary carries the count, not just the word: {}",
-        negative.summary()
+        "the summary carries the count, not just the word"
     );
 }
 
@@ -232,7 +253,7 @@ fn entry_backstop_flags_unbalanced_entry() {
     let flagged = entry_backstop(&lines);
     assert_eq!(flagged.len(), 1, "1-minor drift must be caught");
     assert_eq!(flagged[0].entry_id, entry_id);
-    assert_eq!(flagged[0].net_minor, 1); // DR 1000 - CR 999 = +1
+    assert_eq!(flagged[0].net, ga(1)); // DR 10.00 - CR 9.99 = +0.01
 }
 
 #[test]
@@ -293,8 +314,7 @@ async fn setup(
         .upsert_currency_scale(CurrencyScaleRow {
             tenant_id: tenant,
             currency: "USD".to_owned(),
-            minor_units: 2,
-            plausible_max_major: DEFAULT_PLAUSIBLE_MAX_MAJOR,
+            currency_scale: 2,
             source: "iso".to_owned(),
         })
         .await
@@ -394,15 +414,12 @@ fn new_line(f: &Fixture, account: Uuid, class: AccountClass, side: Side, amount:
         account_class: class,
         gl_code: None,
         side,
-        amount_minor: amount,
-        currency: "USD".to_owned(),
-        currency_scale: 2,
+        money: usd_cents(amount),
         invoice_id: None,
         due_date: None,
         revenue_stream: None,
         mapping_status: MappingStatus::Resolved,
-        functional_amount_minor: None,
-        functional_currency: None,
+        functional_money: None,
         tax_jurisdiction: None,
         tax_filing_period: None,
         tax_rate_ref: None,
@@ -461,11 +478,7 @@ async fn run_over_clean_tenant_completes() {
         .tie_out_tenant(f.tenant)
         .await
         .expect("tie_out_tenant must succeed");
-    assert!(
-        report.is_clean(),
-        "clean books must tie out: {}",
-        report.summary()
-    );
+    assert!(report.is_clean(), "clean books must tie out");
 }
 
 /// `run()` over a drifted tenant completes with `Ok(())` AND the per-tenant
@@ -492,7 +505,7 @@ async fn run_over_drifted_tenant_emits_alarm() {
     // Corrupt the AR balance cache grain (add 1 so no-negative check stays
     // satisfied while creating a variance for the tie-out).
     raw.execute_raw(pg(format!(
-        "UPDATE bss.ledger_account_balance SET balance_minor = balance_minor + 1 \
+        "UPDATE bss.ledger_account_balance SET balance = (balance::numeric + 0.01)::text \
          WHERE tenant_id='{}' AND account_id='{}' AND currency='USD'",
         f.tenant, f.ar_account
     )))
@@ -512,11 +525,7 @@ async fn run_over_drifted_tenant_emits_alarm() {
         .tie_out_tenant(f.tenant)
         .await
         .expect("tie_out_tenant must succeed");
-    assert!(
-        !report.is_clean(),
-        "drifted books must NOT tie out: {}",
-        report.summary()
-    );
+    assert!(!report.is_clean(), "drifted books must NOT tie out");
     assert_eq!(
         report.account_balance_variances.len(),
         1,
@@ -560,15 +569,16 @@ fn jl(
         account_class: account_class.to_owned(),
         gl_code: None,
         side: side.to_owned(),
-        amount_minor,
+        amount: cents_text(amount_minor),
         currency: "USD".to_owned(),
         currency_scale: 2,
         invoice_id: invoice_id.map(ToOwned::to_owned),
         due_date: None,
         revenue_stream: None,
         mapping_status: "RESOLVED".to_owned(),
-        functional_amount_minor: None,
+        functional_amount: None,
         functional_currency: None,
+        functional_currency_scale: None,
         rate_snapshot_ref: None,
         tax_jurisdiction: None,
         tax_filing_period: None,
@@ -603,10 +613,12 @@ fn ar_invoice_row(
         account_id,
         invoice_id: invoice_id.to_owned(),
         currency: "USD".to_owned(),
-        balance_minor,
-        disputed_minor,
-        functional_balance_minor: None,
+        currency_scale: 2,
+        balance: cents_text(balance_minor),
+        disputed: cents_text(disputed_minor),
+        functional_balance: None,
         functional_currency: None,
+        functional_currency_scale: None,
         original_posted_at: None,
         due_date: None,
         last_entry_seq: None,
@@ -620,9 +632,11 @@ fn unallocated_row(account_id: Uuid, balance_minor: i64) -> unallocated_balance:
         payer_tenant_id: Uuid::from_u128(PAYER),
         account_id,
         currency: "USD".to_owned(),
-        balance_minor,
-        functional_balance_minor: None,
+        currency_scale: 2,
+        balance: cents_text(balance_minor),
+        functional_balance: None,
         functional_currency: None,
+        functional_currency_scale: None,
         last_entry_seq: None,
         version: 0,
     }
@@ -638,11 +652,13 @@ fn reusable_row(
         payer_tenant_id: Uuid::from_u128(PAYER),
         account_id,
         currency: "USD".to_owned(),
+        currency_scale: 2,
         credit_grant_event_type: event_type.to_owned(),
         first_granted_at: None,
-        balance_minor,
-        functional_balance_minor: None,
+        balance: cents_text(balance_minor),
+        functional_balance: None,
         functional_currency: None,
+        functional_currency_scale: None,
         last_entry_seq: None,
         version: 0,
     }
@@ -737,8 +753,8 @@ fn disputed_minor_flags_seeded_divergence() {
     let v = sub_grain(&lines, &dr_sides(&[acct]), &cache, &[], &[]);
     assert_eq!(v.len(), 1, "exactly the disputed grain diverges: {v:?}");
     assert_eq!(v[0].grain, "ar_invoice_disputed");
-    assert_eq!(v[0].computed, 300);
-    assert_eq!(v[0].cached, 250);
+    assert_eq!(v[0].computed, ga(300));
+    assert_eq!(v[0].cached, ga(250));
 }
 
 #[test]
@@ -763,8 +779,8 @@ fn unallocated_clean_then_flags_divergence() {
     let dirty = sub_grain(&lines, &sides, &[], &[unallocated_row(acct, -500)], &[]);
     assert_eq!(dirty.len(), 1, "seeded divergence flagged: {dirty:?}");
     assert_eq!(dirty[0].grain, "unallocated_balance");
-    assert_eq!(dirty[0].computed, -600);
-    assert_eq!(dirty[0].cached, -500);
+    assert_eq!(dirty[0].computed, ga(-600));
+    assert_eq!(dirty[0].cached, ga(-500));
 }
 
 #[test]
@@ -814,8 +830,8 @@ fn reusable_credit_keys_by_event_type_and_flags_divergence() {
     );
     assert_eq!(dirty.len(), 1, "the \"\" grain diverges: {dirty:?}");
     assert_eq!(dirty[0].grain, "reusable_credit_subbalance");
-    assert_eq!(dirty[0].computed, -200);
-    assert_eq!(dirty[0].cached, 0);
+    assert_eq!(dirty[0].computed, ga(-200));
+    assert_eq!(dirty[0].cached, ga(0));
     assert!(
         dirty[0].key.contains("event_type="),
         "key names the event-type dim: {}",
@@ -869,12 +885,13 @@ fn settlement_row(
         tenant_id: Uuid::from_u128(0xA1),
         payment_id: payment_id.to_owned(),
         currency: "USD".to_owned(),
-        settled_minor,
-        fee_minor,
-        allocated_minor,
-        refunded_minor: 0,
-        refunded_unallocated_minor: 0,
-        clawed_back_minor: 0,
+        currency_scale: 2,
+        settled: cents_text(settled_minor),
+        fee: cents_text(fee_minor),
+        allocated: cents_text(allocated_minor),
+        refunded: "0".to_owned(),
+        refunded_unallocated: "0".to_owned(),
+        clawed_back: "0".to_owned(),
         version: 0,
     }
 }
@@ -886,8 +903,9 @@ fn alloc_row(payment_id: &str, invoice_id: &str, amount_minor: i64) -> payment_a
         invoice_id: invoice_id.to_owned(),
         payer_tenant_id: Uuid::from_u128(PAYER),
         payment_id: payment_id.to_owned(),
-        amount_minor,
+        amount: cents_text(amount_minor),
         currency: "USD".to_owned(),
+        currency_scale: 2,
         precedence_policy_ref: "p".to_owned(),
         allocated_at_utc: OffsetDateTime::now_utc(),
     }
@@ -938,11 +956,17 @@ fn payment_counters_flag_each_diverged_counter() {
         "settled + allocated diverge, fee ties out: {v:?}"
     );
     let counters: Vec<&str> = v.iter().map(|x| x.counter).collect();
-    assert_eq!(counters, vec!["allocated_minor", "settled_minor"]);
-    let settled = v.iter().find(|x| x.counter == "settled_minor").unwrap();
-    assert_eq!((settled.computed, settled.cached), (1000, 900));
-    let alloc = v.iter().find(|x| x.counter == "allocated_minor").unwrap();
-    assert_eq!((alloc.computed, alloc.cached), (600, 550));
+    assert_eq!(counters, vec!["allocated", "settled"]);
+    let settled = v.iter().find(|x| x.counter == "settled").unwrap();
+    assert_eq!(
+        (settled.computed.clone(), settled.cached.clone()),
+        (ga(1000), ga(900))
+    );
+    let alloc = v.iter().find(|x| x.counter == "allocated").unwrap();
+    assert_eq!(
+        (alloc.computed.clone(), alloc.cached.clone()),
+        (ga(600), ga(550))
+    );
     assert!(v.iter().all(|x| x.payment_id == "PAY1"));
 }
 
@@ -976,12 +1000,12 @@ fn payment_settled_and_fee_reconcile_skipped_when_tenant_has_a_settlement_return
 
     let v = recompute_payment_counter_variances(&entries, &lines, &allocs, &cache);
     assert!(
-        v.iter().all(|x| x.counter != "settled_minor"),
-        "settled_minor must be skipped when a SETTLEMENT_RETURN exists: {v:?}"
+        v.iter().all(|x| x.counter != "settled"),
+        "settled must be skipped when a SETTLEMENT_RETURN exists: {v:?}"
     );
     assert!(
-        v.iter().all(|x| x.counter != "fee_minor"),
-        "fee_minor must ALSO be skipped when a SETTLEMENT_RETURN exists (Model N): {v:?}"
+        v.iter().all(|x| x.counter != "fee"),
+        "fee must ALSO be skipped when a SETTLEMENT_RETURN exists (Model N): {v:?}"
     );
     assert!(
         v.is_empty(),
@@ -998,12 +1022,15 @@ fn payment_allocation_with_no_settlement_row_is_flagged() {
     let v = recompute_payment_counter_variances(&[], &[], &allocs, &[]);
     assert_eq!(v.len(), 1, "orphan allocation flagged: {v:?}");
     assert_eq!(v[0].payment_id, "GHOST");
-    assert_eq!(v[0].counter, "allocated_minor");
-    assert_eq!((v[0].computed, v[0].cached), (250, 0));
+    assert_eq!(v[0].counter, "allocated");
+    assert_eq!(
+        (v[0].computed.clone(), v[0].cached.clone()),
+        (ga(250), ga(0))
+    );
 }
 
 // ────────────────────────────────────────────────────────────────────────────
-// VHP-1843 incremental tie-out — pure projection unit tests (no container).
+// Incremental tie-out — pure projection unit tests (no container).
 // Exercise the `(grain, grain_key)` string-space helpers that the daily / recon
 // incremental path shares with the close-time baseline snapshot.
 // ────────────────────────────────────────────────────────────────────────────
@@ -1021,7 +1048,7 @@ fn incremental_clean_when_baseline_plus_open_equals_cache() {
     let fold = fold_grains(&open, &dr_sides(&[acc]));
     // Closed-period contribution carried by the baseline.
     let mut baseline = std::collections::HashMap::new();
-    baseline.insert((GRAIN_ACCOUNT, key_account(acc, "USD")), 500_i64);
+    baseline.insert((GRAIN_ACCOUNT, key_account(acc, "USD")), ga(500));
     // Cache (all-time) = 600 = baseline 500 + open 100.
     let cache = cache_grains(&[bal(0xC1, "REVENUE", 600)], &[], &[], &[], &[], &[]);
     assert!(
@@ -1038,12 +1065,15 @@ fn incremental_flags_baseline_drift() {
     let open = vec![jl(e, acc, "REVENUE", "DR", 100, None, None, None)];
     let fold = fold_grains(&open, &dr_sides(&[acc]));
     let mut baseline = std::collections::HashMap::new();
-    baseline.insert((GRAIN_ACCOUNT, key_account(acc, "USD")), 500_i64);
+    baseline.insert((GRAIN_ACCOUNT, key_account(acc, "USD")), ga(500));
     // Cache claims 700 but baseline(500) + open(100) = 600 → a 100 divergence.
     let cache = cache_grains(&[bal(0xC2, "REVENUE", 700)], &[], &[], &[], &[], &[]);
     let v = verify_incremental(&baseline, &fold, &cache);
     assert_eq!(v.len(), 1, "one grain diverges: {v:?}");
-    assert_eq!((v[0].computed, v[0].cached), (600, 700));
+    assert_eq!(
+        (v[0].computed.clone(), v[0].cached.clone()),
+        (ga(600), ga(700))
+    );
 }
 
 /// A sub-grain (unallocated) folds + projects into the same key space and
@@ -1075,14 +1105,14 @@ fn incremental_subgrain_clean_with_matching_cache() {
 fn cache_baseline_rows_roundtrip() {
     let acc = Uuid::from_u128(0xC4);
     let cache = cache_grains(&[bal(0xC4, "REVENUE", 123)], &[], &[], &[], &[], &[]);
-    let rows = cache_baseline_rows(&cache);
+    let rows = cache_baseline_rows(&cache).expect("trusted totals snapshot");
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].grain, GRAIN_ACCOUNT);
     assert_eq!(rows[0].grain_key, key_account(acc, "USD"));
-    assert_eq!(rows[0].balance_minor, 123);
+    assert_eq!(rows[0].balance, usd_cents(123));
 }
 
-/// VHP-1843 (PG) — the incremental tie-out equals the full fold across a CLOSED +
+/// PG: the incremental tie-out equals the full fold across a CLOSED +
 /// OPEN period split: post in period 1, close it + snapshot the baseline (what
 /// period-close does), post in period 2; the incremental path (baseline[p1] +
 /// open-fold[p2]) must reconcile clean and agree with the full all-time fold.
@@ -1191,4 +1221,194 @@ fn entry_backstop(lines: &[journal_line::Model]) -> Vec<ImbalancedEntry> {
     let mut acc = EntryBackstopAcc::default();
     acc.fold(lines);
     acc.finalize()
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// GrainAmount fail-loud transitions and corrupt stored text (no container).
+// ────────────────────────────────────────────────────────────────────────────
+
+/// A posting under any currency and scale (`"1.5"`, `"EUR"`, `3`).
+fn posted(amount: &str, currency: &str, scale: u8) -> bss_ledger_sdk::PostedMoney {
+    bss_ledger_sdk::PostedMoney::try_new(
+        bss_ledger_sdk::parse_decimal(amount).unwrap(),
+        bss_ledger_sdk::CurrencySpec::try_new(currency.to_owned(), scale).unwrap(),
+    )
+    .unwrap()
+}
+
+/// A trusted USD@2 grain total of `9 * 10^255`: inside the exact budget, but
+/// doubling it is not, and it is far beyond the bounded posting contract.
+fn huge_grain() -> GrainAmount {
+    use crate::domain::exact_money::ExactAmount;
+    let step = ExactAmount::from_decimal(rust_decimal::Decimal::from_i128_with_scale(
+        10_i128.pow(28),
+        0,
+    ));
+    let mut amount = ExactAmount::from_decimal(rust_decimal::Decimal::from(9_000));
+    for _ in 0..9 {
+        amount = amount.checked_mul(&step).unwrap();
+    }
+    GrainAmount::from_exact(amount, "USD", 2)
+}
+
+#[test]
+fn add_posted_flags_a_currency_or_scale_mismatch_instead_of_mixing() {
+    for delta in [posted("1", "EUR", 2), posted("1", "USD", 3)] {
+        let mut total = ga(100);
+        total.add_posted(&delta);
+        assert!(
+            total.is_untrusted(),
+            "{delta:?} must not be summed into USD@2"
+        );
+        assert!(total.differs_from(&ga(100)));
+        assert!(!total.is_zero());
+    }
+    let mut trusted = ga(100);
+    trusted.add_posted(&usd_cents(-100));
+    assert!(trusted.is_zero(), "a matching delta stays exact");
+}
+
+#[test]
+fn add_grain_propagates_untrusted_mismatch_and_budget_breaches() {
+    let mut total = ga(100);
+    total.add_grain(&GrainAmount::untrusted("USD", 2));
+    assert!(
+        total.is_untrusted(),
+        "an untrusted open fold taints the sum"
+    );
+
+    let mut mixed = ga(100);
+    mixed.add_grain(&GrainAmount::zero("USD", 3));
+    assert!(mixed.is_untrusted(), "a scale disagreement taints the sum");
+
+    let mut overflow = huge_grain();
+    overflow.add_grain(&huge_grain());
+    assert!(
+        overflow.is_untrusted(),
+        "an exact-budget breach taints the sum"
+    );
+
+    let mut clean = ga(100);
+    clean.add_grain(&ga(-40));
+    assert_eq!(clean, ga(60));
+}
+
+#[test]
+fn untrusted_totals_always_differ_and_are_never_zero() {
+    let placeholder = GrainAmount::untrusted("USD", 2);
+    assert!(placeholder.differs_from(&placeholder.clone()));
+    assert!(ga(0).differs_from(&placeholder));
+    assert!(!placeholder.is_zero());
+    assert_eq!(placeholder.text(), "<untrusted>");
+    assert_eq!(
+        super::grain_minor_units(&placeholder, "expected_minor", &"item"),
+        None
+    );
+    assert!(placeholder.to_posted().is_err());
+}
+
+#[test]
+fn affected_item_omits_untrusted_and_out_of_contract_grains() {
+    let item = super::affected_item("g".into(), "USD".into(), &ga(1234), &ga(1200)).unwrap();
+    assert_eq!((item.expected_minor, item.actual_minor), (1234, 1200));
+    // Deliberate absence, never a zero: the alarm cannot report an amount it
+    // does not have.
+    let untrusted = GrainAmount::untrusted("USD", 2);
+    assert!(super::affected_item("g".into(), "USD".into(), &untrusted, &ga(1)).is_none());
+    assert!(super::affected_item("g".into(), "USD".into(), &ga(1), &untrusted).is_none());
+    assert!(super::affected_item("g".into(), "USD".into(), &huge_grain(), &ga(1)).is_none());
+}
+
+#[test]
+fn a_corrupt_cache_row_surfaces_as_an_account_balance_variance() {
+    let acct = Uuid::from_u128(0xC7);
+    let e = Uuid::now_v7();
+    let lines = vec![jl(e, acct, "REVENUE", "DR", 100, None, None, None)];
+    for corrupt in ["1.00", "1.001", "garbage"] {
+        let mut row = bal(0xC7, "REVENUE", 100);
+        row.balance = corrupt.to_owned();
+        let mut acc = super::AccountBalanceAcc::default();
+        acc.fold(&lines, &dr_sides(&[acct]));
+        let cache_map = HashMap::from([((acct, "USD".to_owned()), &row)]);
+        let v = acc.finalize(&cache_map, std::slice::from_ref(&row));
+        assert_eq!(v.len(), 1, "{corrupt}: {v:?}");
+        assert!(v[0].cached.is_untrusted(), "{corrupt}");
+        assert_eq!(v[0].computed, ga(100));
+    }
+}
+
+#[test]
+fn a_corrupt_journal_line_force_flags_its_grain_even_when_the_cache_agrees() {
+    let acct = Uuid::from_u128(0xC8);
+    let e = Uuid::now_v7();
+    let mut corrupt = jl(e, acct, "REVENUE", "DR", 50, None, None, None);
+    corrupt.amount = "0.50".to_owned();
+    let lines = vec![jl(e, acct, "REVENUE", "DR", 100, None, None, None), corrupt];
+    // The cache happens to hold the sum of the readable line only.
+    let row = bal(0xC8, "REVENUE", 100);
+    let mut acc = super::AccountBalanceAcc::default();
+    acc.fold(&lines, &dr_sides(&[acct]));
+    let cache_map = HashMap::from([((acct, "USD".to_owned()), &row)]);
+    let v = acc.finalize(&cache_map, std::slice::from_ref(&row));
+    assert_eq!(v.len(), 1, "{v:?}");
+    assert_eq!(v[0].account_id, acct);
+}
+
+#[test]
+fn a_corrupt_allocation_row_surfaces_as_an_allocated_variance() {
+    let mut alloc = alloc_row("PAY1", "INV1", 600);
+    alloc.amount = "6.000".to_owned();
+    let cache = vec![settlement_row("PAY1", 1000, 0, 600)];
+    let v = recompute_payment_counter_variances(&[], &[], &[alloc], &cache);
+    let allocated = v.iter().find(|x| x.counter == "allocated").unwrap();
+    assert!(allocated.computed.is_untrusted(), "{v:?}");
+}
+
+#[test]
+fn a_corrupt_settlement_counter_surfaces_as_a_variance() {
+    let mut row = settlement_row("PAY1", 1000, 0, 600);
+    row.allocated = "6.0".to_owned();
+    let v =
+        recompute_payment_counter_variances(&[], &[], &[alloc_row("PAY1", "INV1", 600)], &[row]);
+    let allocated = v.iter().find(|x| x.counter == "allocated").unwrap();
+    assert!(allocated.cached.is_untrusted(), "{v:?}");
+}
+
+#[test]
+fn a_corrupt_line_makes_the_entry_backstop_net_untrusted() {
+    let e = Uuid::now_v7();
+    let mut credit = line_for(e, "CR", 100);
+    credit.amount = "1.0".to_owned();
+    let imbalanced = entry_backstop(&[line_for(e, "DR", 100), credit]);
+    assert_eq!(imbalanced.len(), 1, "{imbalanced:?}");
+    assert!(imbalanced[0].net.is_untrusted());
+}
+
+#[test]
+fn a_corrupt_sub_grain_cache_row_surfaces() {
+    let acct = Uuid::from_u128(0xC9);
+    let e = Uuid::now_v7();
+    let lines = vec![jl(e, acct, "UNALLOCATED", "DR", 250, None, None, None)];
+    let mut row = unallocated_row(acct, 250);
+    row.balance = "2.50".to_owned();
+    let v = sub_grain(&lines, &dr_sides(&[acct]), &[], &[row], &[]);
+    assert_eq!(v.len(), 1, "{v:?}");
+    assert_eq!(v[0].grain, "unallocated_balance");
+    assert!(v[0].cached.is_untrusted());
+}
+
+#[test]
+fn cache_baseline_rows_refuses_a_corrupt_or_out_of_contract_total() {
+    let mut row = bal(0xCA, "REVENUE", 123);
+    row.balance = "1.230".to_owned();
+    let cache = cache_grains(&[row], &[], &[], &[], &[], &[]);
+    let error = cache_baseline_rows(&cache).unwrap_err().to_string();
+    assert!(error.contains("baseline grain"), "{error}");
+
+    let mut huge = HashMap::new();
+    huge.insert(
+        (GRAIN_ACCOUNT, key_account(Uuid::from_u128(0xCB), "USD")),
+        huge_grain(),
+    );
+    assert!(cache_baseline_rows(&huge).is_err());
 }

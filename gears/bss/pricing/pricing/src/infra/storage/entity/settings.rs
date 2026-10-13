@@ -13,7 +13,6 @@ pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
     pub tenant_id: Uuid,
     pub default_timing: String,
-    pub default_rounding: String,
     pub default_gl: Option<String>,
     pub default_tax_category: Option<String>,
     pub invoice_line_templates: Json,

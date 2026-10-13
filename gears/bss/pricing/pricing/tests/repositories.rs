@@ -65,6 +65,8 @@ fn price(p: &price_book_entry::Model) -> price::Model {
         version_no: 1,
         dim_value: None,
         price_json: serde_json::json!({"rate":"0.1"}),
+        currency: "EUR".into(),
+        currency_scale: 2,
         min_fee: Some("12.34".into()),
         eligibility: "all".into(),
         effective_from: at(9).date(),
@@ -632,7 +634,6 @@ async fn settings_and_dimensions_roundtrip_and_version_guards() {
     let s = settings::Model {
         tenant_id: tenant,
         default_timing: "arrears".into(),
-        default_rounding: "half-up-2".into(),
         default_gl: None,
         default_tax_category: None,
         invoice_line_templates: serde_json::json!({"usage":"{sku}"}),
@@ -1000,8 +1001,8 @@ async fn price_pending_ownership_is_a_conditional_versioned_write() {
 }
 #[tokio::test]
 async fn min_fee_round_trips_exactly_on_sqlite() {
-    // sea-orm decodes every SQLite Decimal through f64: an authored "30.00" came back
-    // as "30", and digits past f64's precision were lost. A fee is money: exact text.
+    // sea-orm decodes every SQLite Decimal through f64: digits past f64's precision were lost.
+    // A fee is money: exact text, in its one canonical spelling.
     let (db, scope, tenant, _dsn) = test_db().await;
     let conn = db.conn().unwrap();
     let b = book(tenant);
@@ -1010,7 +1011,7 @@ async fn min_fee_round_trips_exactly_on_sqlite() {
     price_book_entry_repo::insert(&conn, &scope, p.clone())
         .await
         .unwrap();
-    for (n, text) in ["30.00", "0.10", "12345678901234567.89", "0"]
+    for (n, text) in ["30", "0.1", "12345678901234567.89", "0"]
         .into_iter()
         .enumerate()
     {
@@ -1033,8 +1034,11 @@ async fn min_fee_round_trips_exactly_on_sqlite() {
         );
     }
 }
+// Storage holds canonical decimal text only. A stored `30.00` fee or a `0.10` rate is another
+// spelling of a valid value, and the reader treats it as a corrupt row, as it does a JSON number
+// or a rate over its limit.
 #[tokio::test]
-async fn min_fee_column_refuses_anything_but_an_unsigned_plain_decimal() {
+async fn a_stored_decimal_that_is_not_canonical_text_is_a_corrupt_row() {
     let (db, scope, tenant, _dsn) = test_db().await;
     let conn = db.conn().unwrap();
     let b = book(tenant);
@@ -1043,9 +1047,69 @@ async fn min_fee_column_refuses_anything_but_an_unsigned_plain_decimal() {
     price_book_entry_repo::insert(&conn, &scope, p.clone())
         .await
         .unwrap();
-    for (n, text) in ["-1", "1.", "1.2.3", "1e5", "", " 3"]
-        .into_iter()
-        .enumerate()
+    let model = price_book_entry_repo::model_of(&p).unwrap();
+    let mut canonical = price(&p);
+    canonical.price_json = serde_json::json!({"rate":"0.047"});
+    canonical.min_fee = Some("30".into());
+    price_repo::insert(&conn, &scope, canonical.clone())
+        .await
+        .unwrap();
+    let stored = price_repo::find(&conn, &scope, tenant, canonical.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let read = price_repo::to_domain(&stored, model).unwrap();
+    assert_eq!(read.min_fee.unwrap().to_string(), "30");
+    assert_eq!(
+        read.price,
+        Some(bss_pricing::domain::money::PriceData::PerUnit {
+            rate: "0.047".parse().unwrap()
+        })
+    );
+    // A non-canonical fee (`30.00`) never reaches a row: the column refuses it
+    // (`min_fee_column_refuses_anything_but_a_canonical_unsigned_decimal`).
+    for (n, (price_json, min_fee)) in [
+        (serde_json::json!({"rate":"0.10"}), Some("30")),
+        (serde_json::json!({"rate":0.1}), None),
+        (serde_json::json!({"rate":"0.0000000000001"}), None),
+        (serde_json::json!({"rate":"1e-3"}), None),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut r = price(&p);
+        r.version_no = i32::try_from(n).unwrap() + 2;
+        r.price_json = price_json;
+        r.min_fee = min_fee.map(str::to_owned);
+        price_repo::insert(&conn, &scope, r.clone()).await.unwrap();
+        let back = price_repo::find(&conn, &scope, tenant, r.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(
+                price_repo::to_domain(&back, model),
+                Err(RepoError::CorruptRow(_))
+            ),
+            "a non-canonical or out-of-limit stored decimal is corrupt"
+        );
+    }
+}
+#[tokio::test]
+async fn min_fee_column_refuses_anything_but_a_canonical_unsigned_decimal() {
+    let (db, scope, tenant, _dsn) = test_db().await;
+    let conn = db.conn().unwrap();
+    let b = book(tenant);
+    book_repo::insert(&conn, &scope, b.clone()).await.unwrap();
+    let p = entry(&b);
+    price_book_entry_repo::insert(&conn, &scope, p.clone())
+        .await
+        .unwrap();
+    for (n, text) in [
+        "-1", "1.", "1.2.3", "1e5", "", " 3", "30.00", "0.10", "01", "00", "0.0", ".5",
+    ]
+    .into_iter()
+    .enumerate()
     {
         let mut r = price(&p);
         r.version_no = i32::try_from(n).unwrap() + 1;
@@ -1053,6 +1117,88 @@ async fn min_fee_column_refuses_anything_but_an_unsigned_plain_decimal() {
         assert!(
             price_repo::insert(&conn, &scope, r).await.is_err(),
             "the column must refuse min_fee {text:?}"
+        );
+    }
+    for (n, text) in ["0", "0.5", "30", "12.34", "100.01"]
+        .into_iter()
+        .enumerate()
+    {
+        let mut r = price(&p);
+        r.version_no = i32::try_from(n).unwrap() + 100;
+        r.min_fee = Some(text.into());
+        price_repo::insert(&conn, &scope, r)
+            .await
+            .expect("the column takes a canonical fee");
+    }
+}
+#[tokio::test]
+async fn currency_columns_refuse_a_spec_out_of_shape_or_range() {
+    let (db, scope, tenant, _dsn) = test_db().await;
+    let conn = db.conn().unwrap();
+    let b = book(tenant);
+    book_repo::insert(&conn, &scope, b.clone()).await.unwrap();
+    let p = entry(&b);
+    price_book_entry_repo::insert(&conn, &scope, p.clone())
+        .await
+        .unwrap();
+    for (n, (code, scale)) in [
+        ("eur", 2),
+        ("EU", 2),
+        ("EURO", 2),
+        ("E1R", 2),
+        ("EUR", -1),
+        ("EUR", 29),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut r = price(&p);
+        r.version_no = i32::try_from(n).unwrap() + 1;
+        r.currency = code.into();
+        r.currency_scale = scale;
+        assert!(
+            price_repo::insert(&conn, &scope, r).await.is_err(),
+            "the columns must refuse a malformed code or a scale outside 0 to 28"
+        );
+    }
+    for (n, scale) in [0, 28].into_iter().enumerate() {
+        let mut r = price(&p);
+        r.version_no = i32::try_from(n).unwrap() + 100;
+        r.currency_scale = scale;
+        let stored = price_repo::insert(&conn, &scope, r).await.unwrap();
+        let spec = price_repo::currency_of(&stored).unwrap();
+        assert_eq!(
+            (spec.code(), i16::from(spec.scale())),
+            ("EUR", scale),
+            "the stored spec reads back as written"
+        );
+    }
+    // A row that slipped past the columns (another writer, a drifted schema) is corrupt on read,
+    // never mended, and the refusal names the column. `EURO`, `E1R` and `EUR1` are codes the
+    // shared currency spec takes, so only the three-letter check refuses them.
+    let model = price_book_entry_repo::model_of(&p).unwrap();
+    for (code, scale, column) in [
+        ("eur", 2, " currency: "),
+        ("EURO", 2, " currency: "),
+        ("E1R", 2, " currency: "),
+        ("EUR1", 2, " currency: "),
+        ("EUR", 29, " currency_scale: "),
+        ("EUR", -1, " currency_scale: "),
+        ("EUR", 300, " currency_scale: "),
+    ] {
+        let mut r = price(&p);
+        r.currency = code.into();
+        r.currency_scale = scale;
+        let Err(RepoError::CorruptRow(what)) = price_repo::currency_of(&r) else {
+            panic!("a stored spec out of shape or range is a corrupt row");
+        };
+        assert!(what.contains(column), "the refusal names the column");
+        assert!(
+            matches!(
+                price_repo::to_domain(&r, model),
+                Err(RepoError::CorruptRow(what)) if what.contains(column)
+            ),
+            "the decode refuses it the same way"
         );
     }
 }

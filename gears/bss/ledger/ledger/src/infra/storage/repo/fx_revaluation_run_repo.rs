@@ -1,5 +1,5 @@
 //! Repository for the Mode-B FX-revaluation completion marker
-//! (`ledger_fx_revaluation_run`, VHP-1859 review C3). The revaluation job marks a
+//! (`ledger_fx_revaluation_run`). The revaluation job marks a
 //! period COMPLETE after a clean period-end run; the period-close gate reads it.
 //! Both ops are generic over `DBRunner` so they run on the caller's transaction.
 //! Tenant-scoped via `SecureORM` (SQL-level BOLA).

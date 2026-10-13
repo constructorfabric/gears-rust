@@ -22,13 +22,21 @@ fn input_with(timing: RecognitionTiming) -> RecognitionInput {
     }
 }
 
+fn money() -> PostedMoney {
+    PostedMoney::try_new(
+        rust_decimal::Decimal::from(120),
+        bss_ledger_sdk::money::CurrencySpec::try_new("USD".to_owned(), 2).unwrap(),
+    )
+    .unwrap()
+}
+
 fn ctx<'a>(input: &'a RecognitionInput, invoice_period: &'a str) -> RecognitionContext<'a> {
     RecognitionContext {
         input,
         invoice_period_id: invoice_period,
-        item_amount_minor_ex_tax: 12_000,
-        invoice_total_minor: 12_000,
-        currency: "USD",
+        // Leaked so the borrowed context can outlive this helper (test-only).
+        item_amount_ex_tax: Box::leak(Box::new(money())),
+        invoice_total: Box::leak(Box::new(money())),
         revenue_stream: "recurring",
     }
 }

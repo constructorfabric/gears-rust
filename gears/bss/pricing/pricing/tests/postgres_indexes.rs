@@ -256,6 +256,8 @@ fn price_template(
         version_no: 1,
         dim_value: None,
         price_json: serde_json::json!({"rate":"0.10"}),
+        currency: "EUR".into(),
+        currency_scale: 2,
         min_fee: None,
         eligibility: "all".into(),
         effective_from: now.date(),

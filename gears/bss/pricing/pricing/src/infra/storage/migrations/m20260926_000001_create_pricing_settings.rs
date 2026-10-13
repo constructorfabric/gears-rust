@@ -6,13 +6,13 @@ pub struct Migration;
 
 const PG_UP: &[&str] = &[r"CREATE TABLE IF NOT EXISTS bss.pricing_settings (
   tenant_id uuid PRIMARY KEY, default_timing text NOT NULL CHECK (default_timing IN ('advance','arrears')),
-  default_rounding text NOT NULL, default_gl text, default_tax_category text,
+  default_gl text, default_tax_category text,
   invoice_line_templates jsonb NOT NULL, version bigint NOT NULL DEFAULT 1,
   created_at timestamptz NOT NULL, updated_at timestamptz NOT NULL
 )"];
 const SQLITE_UP: &[&str] = &[r"CREATE TABLE IF NOT EXISTS pricing_settings (
   tenant_id text PRIMARY KEY, default_timing text NOT NULL CHECK (default_timing IN ('advance','arrears')),
-  default_rounding text NOT NULL, default_gl text, default_tax_category text,
+  default_gl text, default_tax_category text,
   invoice_line_templates text NOT NULL, version integer NOT NULL DEFAULT 1,
   created_at text NOT NULL, updated_at text NOT NULL
 )"];

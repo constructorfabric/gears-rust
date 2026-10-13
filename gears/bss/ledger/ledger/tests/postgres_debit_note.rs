@@ -10,7 +10,7 @@
 //!   (+ segments)** for the new deferred balance (D4) so a later S6 run can release
 //!   it (no stuck liability);
 //! - a debit note **raises** the invoice's headroom
-//!   (`invoice_exposure.debit_note_total_minor += amount`), so a *credit note* that
+//!   (`invoice_exposure.debit_note_total += amount`), so a *credit note* that
 //!   would have been over-cap before now fits;
 //! - a **fully-recognized** debit note posts DR `AR` / CR `REVENUE` (+ tax) with NO
 //!   `CONTRACT_LIABILITY` line and builds NO schedule.
@@ -38,7 +38,6 @@ use bss_ledger::domain::adjustment::credit_note::CreditNoteRequest;
 use bss_ledger::domain::adjustment::debit_note::DebitNoteRequest;
 use bss_ledger::domain::invoice::builder::{InvoiceItem, PostedInvoice, TaxBreakdown};
 use bss_ledger::domain::model::{AccountRow, CurrencyScaleRow};
-use bss_ledger::domain::money::DEFAULT_PLAUSIBLE_MAX_MAJOR;
 use bss_ledger::domain::recognition::input::{RecognitionInput, RecognitionTiming};
 use bss_ledger::infra::adjustment::credit_note_service::CreditNoteHandler;
 use bss_ledger::infra::adjustment::debit_note_service::DebitNoteHandler;
@@ -60,6 +59,33 @@ use uuid::Uuid;
 
 fn pg(sql: impl Into<String>) -> Statement {
     Statement::from_string(sea_orm::DatabaseBackend::Postgres, sql.into())
+}
+
+/// A USD scale-2 posting from a cent count (`1234` ⇒ `12.34`): the old
+/// minor-unit fixtures expressed as validated major-unit money.
+fn usd_cents(minor: i64) -> bss_ledger_sdk::PostedMoney {
+    bss_ledger_sdk::PostedMoney::try_new(
+        rust_decimal::Decimal::new(minor, 2),
+        bss_ledger_sdk::CurrencySpec::try_new("USD".to_owned(), 2).unwrap(),
+    )
+    .unwrap()
+}
+
+/// Validated USD scale-2 money from canonical stored text (`"12.34"`).
+fn usd_text(text: &str) -> bss_ledger_sdk::PostedMoney {
+    bss_ledger_sdk::PostedMoney::try_new(
+        bss_ledger_sdk::parse_decimal(text).unwrap(),
+        bss_ledger_sdk::CurrencySpec::try_new("USD".to_owned(), 2).unwrap(),
+    )
+    .unwrap()
+}
+
+/// Read one canonical decimal TEXT money column as USD scale-2 money.
+async fn scalar_money(conn: &DatabaseConnection, sql: &str) -> Option<bss_ledger_sdk::PostedMoney> {
+    conn.query_one_raw(pg(sql.to_owned()))
+        .await
+        .unwrap()
+        .map(|r| usd_text(&r.try_get_by_index::<String>(0).unwrap()))
 }
 
 async fn scalar_i64(conn: &DatabaseConnection, sql: &str) -> Option<i64> {
@@ -133,8 +159,7 @@ async fn setup(url: &str) -> (DatabaseConnection, DBProvider<DbError>, Seller) {
         .upsert_currency_scale(CurrencyScaleRow {
             tenant_id: s.tenant,
             currency: "USD".to_owned(),
-            minor_units: 2,
-            plausible_max_major: DEFAULT_PLAUSIBLE_MAX_MAJOR,
+            currency_scale: 2,
             source: "iso".to_owned(),
         })
         .await
@@ -203,9 +228,8 @@ async fn setup(url: &str) -> (DatabaseConnection, DBProvider<DbError>, Seller) {
 /// `invoice_item_ref` it books under.
 fn recognized_item(amount: i64, item_ref: &str) -> InvoiceItem {
     InvoiceItem {
-        amount_minor_ex_tax: amount,
-        deferred_minor: 0,
-        currency: "USD".to_owned(),
+        amount_ex_tax: usd_cents(amount),
+        deferred: usd_cents(0),
         revenue_stream: "subscription".to_owned(),
         catalog_class: Some(AccountClass::Revenue),
         contract_class: None,
@@ -240,9 +264,8 @@ fn recognized_item(amount: i64, item_ref: &str) -> InvoiceItem {
 /// EXTEND path then folds into. (`recognized_item` is point-in-time; this defers.)
 fn deferred_item(amount: i64, periods: u32, item_ref: &str) -> InvoiceItem {
     InvoiceItem {
-        amount_minor_ex_tax: amount,
-        deferred_minor: 0,
-        currency: "USD".to_owned(),
+        amount_ex_tax: usd_cents(amount),
+        deferred: usd_cents(0),
         revenue_stream: "subscription".to_owned(),
         catalog_class: Some(AccountClass::Revenue),
         contract_class: None,
@@ -311,11 +334,15 @@ fn credit_handler(provider: &DBProvider<DbError>) -> CreditNoteHandler {
     )
 }
 
-async fn bal(raw: &DatabaseConnection, s: &Seller, account: Uuid) -> Option<i64> {
-    scalar_i64(
+async fn bal(
+    raw: &DatabaseConnection,
+    s: &Seller,
+    account: Uuid,
+) -> Option<bss_ledger_sdk::PostedMoney> {
+    scalar_money(
         raw,
         &format!(
-            "SELECT balance_minor FROM bss.ledger_account_balance \
+            "SELECT balance FROM bss.ledger_account_balance \
              WHERE tenant_id='{}' AND account_id='{}' AND currency='USD'",
             s.tenant, account
         ),
@@ -342,11 +369,11 @@ async fn schedule_total_deferred(
     raw: &DatabaseConnection,
     s: &Seller,
     invoice_id: &str,
-) -> Option<i64> {
-    scalar_i64(
+) -> Option<bss_ledger_sdk::PostedMoney> {
+    scalar_money(
         raw,
         &format!(
-            "SELECT total_deferred_minor FROM bss.ledger_recognition_schedule \
+            "SELECT total_deferred FROM bss.ledger_recognition_schedule \
              WHERE tenant_id='{}' AND source_invoice_id='{invoice_id}' \
                AND revenue_stream='subscription'",
             s.tenant
@@ -358,11 +385,15 @@ async fn schedule_total_deferred(
 /// Σ of all recognition_segment amounts for the invoice's `subscription` schedule —
 /// must equal `total_deferred` after an EXTEND merge (else the S6 run cannot drain
 /// it exactly — stranded or over-recognized revenue).
-async fn segment_sum(raw: &DatabaseConnection, s: &Seller, invoice_id: &str) -> Option<i64> {
-    scalar_i64(
+async fn segment_sum(
+    raw: &DatabaseConnection,
+    s: &Seller,
+    invoice_id: &str,
+) -> Option<bss_ledger_sdk::PostedMoney> {
+    scalar_money(
         raw,
         &format!(
-            "SELECT COALESCE(SUM(seg.amount_minor), 0)::bigint \
+            "SELECT COALESCE(SUM(seg.amount::numeric), 0)::text \
              FROM bss.ledger_recognition_segment seg \
              JOIN bss.ledger_recognition_schedule sch \
                ON seg.tenant_id = sch.tenant_id AND seg.schedule_id = sch.schedule_id \
@@ -374,11 +405,15 @@ async fn segment_sum(raw: &DatabaseConnection, s: &Seller, invoice_id: &str) -> 
     .await
 }
 
-async fn debit_note_total(raw: &DatabaseConnection, s: &Seller, invoice_id: &str) -> Option<i64> {
-    scalar_i64(
+async fn debit_note_total(
+    raw: &DatabaseConnection,
+    s: &Seller,
+    invoice_id: &str,
+) -> Option<bss_ledger_sdk::PostedMoney> {
+    scalar_money(
         raw,
         &format!(
-            "SELECT debit_note_total_minor FROM bss.ledger_invoice_exposure \
+            "SELECT debit_note_total FROM bss.ledger_invoice_exposure \
              WHERE tenant_id='{}' AND invoice_id='{invoice_id}'",
             s.tenant
         ),
@@ -386,8 +421,9 @@ async fn debit_note_total(raw: &DatabaseConnection, s: &Seller, invoice_id: &str
     .await
 }
 
-/// A debit-note request against `inv`'s `item-1` / `subscription` stream. Carries a
-/// straight-line spec (the schedule build needs it) when `deferred_minor > 0`.
+/// A debit-note request against `inv`'s `item-1` / `subscription` stream. Amounts
+/// are cent counts (`1000` ⇒ `10.00` USD). Carries a straight-line spec (the
+/// schedule build needs it) when `deferred_minor > 0`.
 fn debit_req(
     s: &Seller,
     debit_note_id: &str,
@@ -404,9 +440,8 @@ fn debit_req(
         origin_invoice_id: invoice_id.to_owned(),
         origin_invoice_item_ref: Some("item-1".to_owned()),
         revenue_stream: "subscription".to_owned(),
-        currency: "USD".to_owned(),
-        amount_minor,
-        tax_minor,
+        amount: usd_cents(amount_minor),
+        tax_amount: usd_cents(tax_minor),
         // Tax booking requires a dimensioned breakdown — chk_journal_line_tax_dims
         // rejects a TAX_PAYABLE line without (jurisdiction, filing_period). The
         // legacy bare-`tax_minor` path in `build_debit_note_legs` emits a
@@ -414,8 +449,7 @@ fn debit_req(
         // taxed note must carry a breakdown (mirrors the S1 invoice-post tests).
         tax: if tax_minor > 0 {
             vec![TaxBreakdown {
-                amount_minor: tax_minor,
-                currency: "USD".to_owned(),
+                amount: usd_cents(tax_minor),
                 tax_jurisdiction: "US-CA".to_owned(),
                 tax_filing_period: "2026Q2".to_owned(),
                 tax_rate_ref: None,
@@ -423,7 +457,7 @@ fn debit_req(
         } else {
             Vec::new()
         },
-        deferred_minor,
+        deferred: usd_cents(deferred_minor),
         reason_code: "ADDITIONAL_USAGE".to_owned(),
         recognition: if deferred_minor > 0 {
             Some(RecognitionInput {
@@ -523,8 +557,8 @@ async fn deferred_debit_note_books_ar_revenue_cl_and_builds_schedule() {
         .post_invoice(&ctx, &scope, &inv, true)
         .await
         .expect("base invoice posts");
-    assert_eq!(bal(&raw, &s, s.ar).await, Some(1000));
-    assert_eq!(bal(&raw, &s, s.revenue).await, Some(1000));
+    assert_eq!(bal(&raw, &s, s.ar).await, Some(usd_cents(1000)));
+    assert_eq!(bal(&raw, &s, s.revenue).await, Some(usd_cents(1000)));
     // The base invoice mints NO schedule (recognized over 1 period).
     assert_eq!(schedule_count(&raw, &s, "INV-DN").await, Some(0));
 
@@ -544,17 +578,17 @@ async fn deferred_debit_note_books_ar_revenue_cl_and_builds_schedule() {
     // 1400; CONTRACT_LIABILITY up by the deferred 600.
     assert_eq!(
         bal(&raw, &s, s.ar).await,
-        Some(2000),
+        Some(usd_cents(2000)),
         "AR up by the additional charge"
     );
     assert_eq!(
         bal(&raw, &s, s.revenue).await,
-        Some(1400),
+        Some(usd_cents(1400)),
         "REVENUE up by the recognized-now part"
     );
     assert_eq!(
         bal(&raw, &s, s.contract_liability).await,
-        Some(600),
+        Some(usd_cents(600)),
         "CONTRACT_LIABILITY up by the deferred part"
     );
 
@@ -567,25 +601,29 @@ async fn deferred_debit_note_books_ar_revenue_cl_and_builds_schedule() {
     );
     assert_eq!(
         schedule_total_deferred(&raw, &s, "INV-DN").await,
-        Some(600),
+        Some(usd_cents(600)),
         "schedule total_deferred = the debit note's deferred part"
     );
 
     // The headroom row is seeded (= posted AR 1000) and the debit note RAISED it.
-    let original = scalar_i64(
+    let original = scalar_money(
         &raw,
         &format!(
-            "SELECT original_total_minor FROM bss.ledger_invoice_exposure \
+            "SELECT original_total FROM bss.ledger_invoice_exposure \
              WHERE tenant_id='{}' AND invoice_id='INV-DN'",
             s.tenant
         ),
     )
     .await;
-    assert_eq!(original, Some(1000), "headroom seeded = posted AR");
+    assert_eq!(
+        original,
+        Some(usd_cents(1000)),
+        "headroom seeded = posted AR"
+    );
     assert_eq!(
         debit_note_total(&raw, &s, "INV-DN").await,
-        Some(1000),
-        "debit_note_total_minor raised by the incl-tax note amount"
+        Some(usd_cents(1000)),
+        "debit_note_total raised by the incl-tax note amount"
     );
 }
 
@@ -620,7 +658,7 @@ async fn debit_note_raises_headroom_for_a_later_credit_note() {
         .expect("fully-recognized debit note posts");
     assert_eq!(
         bal(&raw, &s, s.ar).await,
-        Some(1500),
+        Some(usd_cents(1500)),
         "AR up by the additional charge"
     );
     assert_eq!(
@@ -630,7 +668,7 @@ async fn debit_note_raises_headroom_for_a_later_credit_note() {
     );
     assert_eq!(
         debit_note_total(&raw, &s, "INV-HR").await,
-        Some(500),
+        Some(usd_cents(500)),
         "headroom raised"
     );
 
@@ -644,11 +682,10 @@ async fn debit_note_raises_headroom_for_a_later_credit_note() {
         origin_invoice_item_ref: Some("item-1".to_owned()),
         po_allocation_group: Some("grp-1".to_owned()),
         revenue_stream: "subscription".to_owned(),
-        currency: "USD".to_owned(),
-        amount_minor: 1300,
-        tax_minor: 0,
+        amount: usd_cents(1300),
+        tax_amount: usd_cents(0),
         tax: Vec::new(),
-        requested_deferred_minor: 0,
+        requested_deferred: usd_cents(0),
         reason_code: "CUSTOMER_GOODWILL".to_owned(),
         goodwill: false,
     };
@@ -657,10 +694,10 @@ async fn debit_note_raises_headroom_for_a_later_credit_note() {
         .await
         .expect("credit note fits the debit-note-raised headroom");
 
-    let credit_total = scalar_i64(
+    let credit_total = scalar_money(
         &raw,
         &format!(
-            "SELECT credit_note_total_minor FROM bss.ledger_invoice_exposure \
+            "SELECT credit_note_total FROM bss.ledger_invoice_exposure \
              WHERE tenant_id='{}' AND invoice_id='INV-HR'",
             s.tenant
         ),
@@ -668,7 +705,7 @@ async fn debit_note_raises_headroom_for_a_later_credit_note() {
     .await;
     assert_eq!(
         credit_total,
-        Some(1300),
+        Some(usd_cents(1300)),
         "credit note recorded against the raised headroom"
     );
 }
@@ -704,21 +741,23 @@ async fn fully_recognized_debit_note_books_no_contract_liability() {
 
     assert_eq!(
         bal(&raw, &s, s.ar).await,
-        Some(2100),
+        Some(usd_cents(2100)),
         "AR 1000 base + 1100 note"
     );
     assert_eq!(
         bal(&raw, &s, s.revenue).await,
-        Some(2000),
+        Some(usd_cents(2000)),
         "REVENUE 1000 base + 1000 note"
     );
     assert_eq!(
         bal(&raw, &s, s.tax).await,
-        Some(100),
+        Some(usd_cents(100)),
         "TAX_PAYABLE credited the posted tax"
     );
     assert!(
-        matches!(bal(&raw, &s, s.contract_liability).await, None | Some(0)),
+        bal(&raw, &s, s.contract_liability)
+            .await
+            .is_none_or(|m| m.amount().is_zero()),
         "fully-recognized debit note books no CONTRACT_LIABILITY"
     );
     assert_eq!(
@@ -758,11 +797,11 @@ async fn deferred_debit_note_extends_the_live_schedule_not_a_second() {
     );
     assert_eq!(
         schedule_total_deferred(&raw, &s, "INV-EXT").await,
-        Some(1200)
+        Some(usd_cents(1200))
     );
     assert_eq!(
         segment_sum(&raw, &s, "INV-EXT").await,
-        Some(1200),
+        Some(usd_cents(1200)),
         "base Σ(segments) == total_deferred"
     );
 
@@ -787,14 +826,14 @@ async fn deferred_debit_note_extends_the_live_schedule_not_a_second() {
     );
     assert_eq!(
         schedule_total_deferred(&raw, &s, "INV-EXT").await,
-        Some(1800),
+        Some(usd_cents(1800)),
         "total_deferred grew by the note's deferred part (1200 + 600)"
     );
     // The merged segments still sum to total_deferred — the S6 run drains exactly,
     // no stranded or over-recognized revenue.
     assert_eq!(
         segment_sum(&raw, &s, "INV-EXT").await,
-        Some(1800),
+        Some(usd_cents(1800)),
         "Σ(segment amounts) == total_deferred after the EXTEND merge"
     );
 }
@@ -833,7 +872,7 @@ async fn debit_note_for_closed_payer_is_rejected() {
     );
     assert_eq!(
         bal(&raw, &s, s.ar).await,
-        Some(1000),
+        Some(usd_cents(1000)),
         "no charge posted for a closed payer"
     );
 }

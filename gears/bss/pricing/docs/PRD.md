@@ -299,7 +299,7 @@ legacy policy never becomes a new policy. Explicit item selection chooses the re
 
 **Phase:** 2. **Source:** spec §2.2, §5–§7, §12–§13; phase 2 plan for delivery details.
 
-Draft prices carry price_json in their entry's model, dates, optional dim_value and min_fee, eligibility all or new, note and author; a price carries no model of its own, and money whose shape does not match the entry's model is PRICE_MISSING (D-427). Approved money is append-only and survives forever for pins. Draft-only PATCH/DELETE and pending ownership prevent changing reviewed content. Tier bands are half-open [from, to), including volume boundaries.
+Draft prices carry price_json in their entry's model, dates, optional dim_value and min_fee, eligibility all or new, note and author; a price carries no model of its own, and money whose shape does not match the entry's model is PRICE_MISSING (D-427). Every decimal is exact text in major currency units: a JSON string, never a JSON number, within the published limits (a rate has at most 12 fractional places), stored as canonical text and never rounded (D-527, D-528). Each price stores its currency spec, the book's currency and its scale when written, and every read and receipt uses it (D-531). Approved money is append-only and survives forever for pins. Draft-only PATCH/DELETE and pending ownership prevent changing reviewed content. Tier bands are half-open [from, to), including volume boundaries.
 
 #### `fr-chain-windows`
 
@@ -323,7 +323,7 @@ On a usage chain, a successor preserves package size and the SKU unit; the model
 
 **Phase:** 2. **Source:** spec §2.2, §5–§7, §12–§13; phase 2 plan for delivery details.
 
-The floor belongs to a price per subscription per billing period, aggregating every value and slice rated by that price. Apply before promotions, prorated by the fraction of the period the price covered; no plan carries an included quantity to deduct first (D-467). There is no plan minimum or cap. Pricing stores and validates min_fee and resolve returns it; Rating applies the floor (D-415).
+The floor belongs to a price per subscription per billing period, aggregating every value and slice rated by that price. Apply before promotions, prorated by the fraction of the period the price covered; no plan carries an included quantity to deduct first (D-467). There is no plan minimum or cap. Pricing stores and validates min_fee, a multiple of the price's currency increment (D-527), and resolve returns it; Rating applies the floor (D-415).
 
 #### `fr-temporary-pair`
 
@@ -371,7 +371,7 @@ Provide one read-only JSON export of a tenant-scoped book with its entries and p
 
 **Phase:** 2. **Source:** spec §2.2, §5–§7, §12–§13; phase 2 plan for delivery details.
 
-Tenant settings provide default billing timing, rounding, GL code, tax category and invoice-line templates by SKU type. SKU billing timing overrides the tenant default. Approval policy is per tenant with optional kind overrides, never per book or plan. Settings and dimension-registry edits are direct versioned changes.
+Tenant settings provide default billing timing, GL code, tax category and invoice-line templates by SKU type; an invoice line always rounds HALF_EVEN (D-535). SKU billing timing overrides the tenant default. Approval policy is per tenant with optional kind overrides, never per book or plan. Settings and dimension-registry edits are direct versioned changes.
 
 #### `fr-events`
 
@@ -411,7 +411,7 @@ An approved migration_request records target plan/revision, subscription ids, ne
 
 **Phase:** 4. **Source:** spec §2.2, §2.4, §5–§7, §12–§13; D-419, D-420, D-421, D-424, D-425.
 
-GET /bss-pricing/v1/resolve (spec §7.1's /pricing/v1/resolve, D-419) accepts plan_revision_id, date, an optional item_id and optional pins (price_id, or price_id:dim_value for a default-chain price a value was bound to) and returns, for a published or superseded revision, or a scheduled one on or after its sale date (D-454), each item's full default/value chain matrix without totals; the active promotion (id, version) is deferred with promotions (D-409). New subscriptions bind the price in force, the value's own chain else the default. Renewal walks a pinned chain through all successors, stopping before the first new successor; a binding is always a price in force on the date, and a default-chain pin moves to the value's own later all price (D-420). Each binding carries ends_on, its own end (a temporary price's end or an explicit close, else null), and the consumer slices a period at ends_on, never at the stored effective_to (D-425). A chain that no price covers is explicit uncovered, never refused and never an invented price. Usage binds lazily per (item, dim_value); at a binding's ends_on inside a period the consumer resolves again with the pin on that date. Each item binds its SKU version from Products versions?as_of at the date, read as pricing's system actor, so a consumer needs only pricing's grants (D-424), and resolved invoice inputs with their source (entry, SKU or tenant): invoice-line template, GL code, tax category and billing timing, with rounding policy and currency scale (D-421). Each item carries its entry's model, null without an entry; a binding carries none (D-427).
+GET /bss-pricing/v1/resolve (spec §7.1's /pricing/v1/resolve, D-419) accepts plan_revision_id, date, an optional item_id and optional pins (price_id, or price_id:dim_value for a default-chain price a value was bound to) and returns, for a published or superseded revision, or a scheduled one on or after its sale date (D-454), each item's full default/value chain matrix without totals; the active promotion (id, version) is deferred with promotions (D-409). New subscriptions bind the price in force, the value's own chain else the default. Renewal walks a pinned chain through all successors, stopping before the first new successor; a binding is always a price in force on the date, and a default-chain pin moves to the value's own later all price (D-420). Each binding carries ends_on, its own end (a temporary price's end or an explicit close, else null), and the consumer slices a period at ends_on, never at the stored effective_to (D-425). A chain that no price covers is explicit uncovered, never refused and never an invented price. Usage binds lazily per (item, dim_value); at a binding's ends_on inside a period the consumer resolves again with the pin on that date. Each item binds its SKU version from Products versions?as_of at the date, read as pricing's system actor, so a consumer needs only pricing's grants (D-424), and resolved invoice inputs with their source (entry, SKU or tenant): invoice-line template, GL code, tax category and billing timing (D-421); each binding carries its price's currency and currency scale (D-531). Each item carries its entry's model, null without an entry; a binding carries none (D-427).
 
 D-501 delivers the matching authorized SDK matrix through `PricingReadV1::resolve`, with an explicit
 catalog tenant and typed complete bindings. Missing priced-cell commercial inputs are a typed failure;
@@ -424,7 +424,7 @@ persisting any due approved switch. Acceptance and consumer integration remain s
 
 **Phase:** 4. **Source:** spec §2.2, §5–§7, §12–§13; D-422.
 
-GET /bss-pricing/v1/prices/{id} (spec §7.1's /pricing/v1/prices/{id}, D-422) serves an approved price forever, including closed, superseded and keep_for_bound prices, with its entry's SKU, charge kind, period, model (D-427), book and currency: stored facts only, nothing computed from today. A draft, pending or rejected price, an unknown id and another tenant's id answer the same 404. The consumer retains price id, dimension value and used chain, SKU version/meter/unit, descriptors, timing, rounding, currency scale and promotion version (deferred with promotions, D-409) in its binding; later descriptor changes do not rewrite earlier pins.
+GET /bss-pricing/v1/prices/{id} (spec §7.1's /pricing/v1/prices/{id}, D-422) serves an approved price forever, including closed, superseded and keep_for_bound prices, with its entry's SKU, charge kind, period, model (D-427), book, and its stored currency and currency scale (D-531): stored facts only, nothing computed from today. A draft, pending or rejected price, an unknown id and another tenant's id answer the same 404. The consumer retains price id, dimension value and used chain, SKU version/meter/unit, descriptors, timing, the price's currency scale and promotion version (deferred with promotions, D-409) in its binding; later descriptor changes do not rewrite earlier pins.
 
 `PricingReadV1::price` (D-501) exposes these approved facts as exact decimal models with a financial
 content digest that excludes mutable closure metadata. The selected-binding digest separately freezes
@@ -488,8 +488,7 @@ Authoring routes mount at `/bss-pricing/v1`: books and export, entries, prices, 
 approval-policy, settings and dimension-keys. Later routes add plans/revisions/checks; promotions (D-409) and migrations (D-410) are deferred.
 Phase 6 adds the operator reads and edits: where a SKU is priced and sold (a SKU's entries across books, the plans
 that name it, one plan item, D-434), the reset of a kind's quorum override (D-435), the one-key edit of dimension
-values with each value's use (D-436), and settings that offer currencies and say who changed them, with a closed set
-of rounding modes (D-437, D-438).
+values with each value's use (D-436), and settings that offer currencies and say who changed them (D-438).
 Phase 7 adds the Price Books screen's reads: an entry's prices with their status today, its price in force and its
 approved prices by date (D-440), every book read's stats (D-441), and a book list that pages on the toolkit's OData
 pager and is searched by q and sku_id (D-442); and its writes: the dates of a temporary draft, whose pair follows
@@ -504,6 +503,8 @@ kind under the list's narrowing, the list pages newest first on request, and it 
 (D-470); every unit says whether its reader may approve it, by the engine's own rule (D-471). Each entry read names
 the entry's next price beside its price in force (D-472), and a book's entries list reads its prices on a date
 (D-473).
+Every price decimal is exact text within published limits, and each price, binding and receipt carries its
+currency spec (D-527 to D-533).
 The frozen consumer contract is named `/pricing/v1/resolve` and `/pricing/v1/prices/{id}` in spec §7.1;
 phase 4 must explicitly wire that public surface. Wire fields and query parameters are snake_case.
 Doors use headers + Bytes and preconditions::parse_body with correlation::establish on mutations. Errors expose
@@ -532,10 +533,10 @@ Quantity and fixed period count must be positive. Selected bindings must cover e
 item, with no duplicate/foreign selection, and agree on requested dimensions and binding/price entry
 identity. Every price currency must equal the market currency; a region dimension must equal the
 market region, including when the price came via the default chain. Invoice inputs require dated SKU
-identity/version/code/name, the unit for PerUnit/usage, nonempty template/GL/tax, the existing book
-currency scale and HalfEven. The existing book currency spelling/minor-digit rules apply; this slice
-adds neither a currency registry nor FX. Money is nonnegative and tier validation delegates to
-`domain::money::validate_tiers`. BillingTerms, policy, money and template digests are recomputed;
+identity/version/code/name, the unit for PerUnit/usage, nonempty template/GL/tax and HalfEven; the
+line posts at the price's stored scale (D-533). The price's currency spec, its money and its minimum
+fee follow the pricing profile at that scale (D-527, D-531); this slice adds no FX. Tier validation
+delegates to `domain::money::validate_tiers`. BillingTerms, policy, money and template digests are recomputed;
 policy unit must equal the dated binding unit. No second tier interpreter is introduced.
 
 The deterministic VM fixture uses entry 2, EUR, no dimension/region, 2026-10-01T00:00Z, monthly
@@ -623,7 +624,7 @@ earlier pins retain the original GL. Pricing creates no refreeze prices or appro
 | AC #1 | `cpt-cf-bss-pricing-fr-dimension-registry` | Given a registered region with priced EU prices, when an operator adds US then it is available; removing EU is refused and a price for an unknown value is DIM_VALUE_UNKNOWN. |
 | AC #2 | `cpt-cf-bss-pricing-fr-price-book` | Given a EUR book, when USD commercial terms are needed then a separate book is created; duplicate book code in the same tenant and invalid validity bounds are refused. |
 | AC #3 | `cpt-cf-bss-pricing-fr-entry-key` | Given a published recurring SKU, when its monthly entry is created then charge_kind is recurring; a duplicate key, the model included, is refused while another model is another entry (D-427), a bundle cannot be priced, and changing the dimension key after a valued price exists is refused. |
-| AC #4 | `cpt-cf-bss-pricing-fr-price` | Given a volume ladder with a boundary at 1000, when quantity is 1000 then the band starting at 1000 applies; editing approved money or creating a usage entry with flat is refused. |
+| AC #4 | `cpt-cf-bss-pricing-fr-price` | Given a volume ladder with a boundary at 1000, when quantity is 1000 then the band starting at 1000 applies; editing approved money or creating a usage entry with flat is refused. Given a EUR book, a rate of `0.047` is stored unchanged and `0.10` as `0.1`, while a JSON number, a 13th fractional place or a minimum fee of `12.341` is refused with nothing written (D-527, D-528). |
 | AC #5 | `cpt-cf-bss-pricing-fr-chain-windows` | Given EU and default chains, when a new EU price is approved then only the EU predecessor closes; after an explicit EU tail ends the default applies, and overlapping prices on the same chain are refused. |
 | AC #6 | `cpt-cf-bss-pricing-fr-pair-guard` | Given a package usage predecessor, when its successor changes only money then it is admissible; changing package size or SKU (unit, usage_type_ref) as of each price's start produces 400 CHAIN_MODEL_CHANGED. |
 | AC #7 | `cpt-cf-bss-pricing-fr-min-fee` | Given two regions rated at 10 each, when both bind one default price with min_fee 30 then their combined charge floors at 30; two separate prices each carrying 30 floor at 60, without applying the shared floor twice. |

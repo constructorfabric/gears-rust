@@ -20,6 +20,8 @@ use uuid::Uuid;
     no_type
 )]
 pub struct Model {
+    pub currency: Option<String>,
+    pub currency_scale: Option<i16>,
     #[sea_orm(primary_key, auto_increment = false)]
     pub approval_id: Uuid,
     pub tenant_id: Uuid,
@@ -28,7 +30,7 @@ pub struct Model {
     pub revision: i32,
     pub business_key: String,
     pub intent: JsonValue,
-    pub amount_usd_eq_minor: Option<i64>,
+    pub amount: Option<String>,
     pub threshold_snapshot: JsonValue,
     pub reason_code: String,
     pub prepared_by: Uuid,

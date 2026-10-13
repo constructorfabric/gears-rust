@@ -14,8 +14,6 @@
         "state": "published",
         "book_id": "<book:eur>",
         "currency": "EUR",
-        "currency_minor_digits": 2,
-        "rounding_policy": "half_even",
         "date": "2026-09-15",
         "items": [
           {
@@ -58,10 +56,12 @@
                   "price_id": "<price:storage-default>",
                   "dim_used": null,
                   "pinned_from": null,
+                  "currency": "EUR",
+                  "currency_scale": 2,
                   "price": {
-                    "rate": "0.10"
+                    "rate": "0.1"
                   },
-                  "min_fee": "5.00",
+                  "min_fee": "5",
                   "eligibility": "all",
                   "effective_from": "2026-01-01",
                   "effective_to": "2027-01-01",
@@ -77,6 +77,8 @@
                   "price_id": "<price:storage-eu>",
                   "dim_used": "eu",
                   "pinned_from": null,
+                  "currency": "EUR",
+                  "currency_scale": 2,
                   "price": {
                     "rate": "0.08"
                   },
@@ -96,10 +98,12 @@
                   "price_id": "<price:storage-default>",
                   "dim_used": null,
                   "pinned_from": "<price:storage-default>",
+                  "currency": "EUR",
+                  "currency_scale": 2,
                   "price": {
-                    "rate": "0.10"
+                    "rate": "0.1"
                   },
-                  "min_fee": "5.00",
+                  "min_fee": "5",
                   "eligibility": "all",
                   "effective_from": "2026-01-01",
                   "effective_to": "2027-01-01",
@@ -115,10 +119,12 @@
                   "price_id": "<price:storage-default>",
                   "dim_used": null,
                   "pinned_from": "<price:storage-default>",
+                  "currency": "EUR",
+                  "currency_scale": 2,
                   "price": {
-                    "rate": "0.10"
+                    "rate": "0.1"
                   },
-                  "min_fee": "5.00",
+                  "min_fee": "5",
                   "eligibility": "all",
                   "effective_from": "2026-01-01",
                   "effective_to": "2027-01-01",
@@ -134,6 +140,8 @@
                   "price_id": "<price:storage-latam-temp>",
                   "dim_used": "latam",
                   "pinned_from": null,
+                  "currency": "EUR",
+                  "currency_scale": 2,
                   "price": {
                     "rate": "0.05"
                   },
@@ -163,8 +171,6 @@
         "state": "published",
         "book_id": "<book:eur>",
         "currency": "EUR",
-        "currency_minor_digits": 2,
-        "rounding_policy": "half_even",
         "date": "2026-10-05",
         "items": [
           {
@@ -207,10 +213,12 @@
                   "price_id": "<price:storage-default>",
                   "dim_used": null,
                   "pinned_from": null,
+                  "currency": "EUR",
+                  "currency_scale": 2,
                   "price": {
-                    "rate": "0.10"
+                    "rate": "0.1"
                   },
-                  "min_fee": "5.00",
+                  "min_fee": "5",
                   "eligibility": "all",
                   "effective_from": "2026-01-01",
                   "effective_to": "2027-01-01",
@@ -226,6 +234,8 @@
                   "price_id": "<price:storage-eu>",
                   "dim_used": "eu",
                   "pinned_from": null,
+                  "currency": "EUR",
+                  "currency_scale": 2,
                   "price": {
                     "rate": "0.08"
                   },
@@ -245,6 +255,8 @@
                   "price_id": "<price:storage-us>",
                   "dim_used": "us",
                   "pinned_from": "<price:storage-default>",
+                  "currency": "EUR",
+                  "currency_scale": 2,
                   "price": {
                     "rate": "0.09"
                   },
@@ -264,10 +276,12 @@
                   "price_id": "<price:storage-default>",
                   "dim_used": null,
                   "pinned_from": "<price:storage-default>",
+                  "currency": "EUR",
+                  "currency_scale": 2,
                   "price": {
-                    "rate": "0.10"
+                    "rate": "0.1"
                   },
-                  "min_fee": "5.00",
+                  "min_fee": "5",
                   "eligibility": "all",
                   "effective_from": "2026-01-01",
                   "effective_to": "2027-01-01",
@@ -283,10 +297,12 @@
                   "price_id": "<price:storage-default>",
                   "dim_used": null,
                   "pinned_from": null,
+                  "currency": "EUR",
+                  "currency_scale": 2,
                   "price": {
-                    "rate": "0.10"
+                    "rate": "0.1"
                   },
-                  "min_fee": "5.00",
+                  "min_fee": "5",
                   "eligibility": "all",
                   "effective_from": "2026-01-01",
                   "effective_to": "2027-01-01",

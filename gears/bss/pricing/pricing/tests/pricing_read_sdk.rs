@@ -541,6 +541,64 @@ async fn current_revision_promotes_due_revision_even_without_ticker() {
     );
 }
 
+/// History wins: the typed read serves the scale stored with the price, never the currency
+/// table's, on the price read and on the bound price alike, and REST resolve says the same.
+#[tokio::test]
+async fn the_stored_scale_is_served_whatever_the_table_says() {
+    let f = ReadFixture::new().await;
+    let initial = f
+        .provider
+        .price(&f.ctx, f.price_query.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        (initial.currency.code(), initial.currency.scale()),
+        ("EUR", 2),
+        "a EUR price written at the ISO scale"
+    );
+    // A scale the ISO table does not give EUR, as a price stored under another table would carry.
+    update_by_id(
+        &f.fixture,
+        "UPDATE pricing_price SET currency_scale = 4 WHERE id = ?",
+        initial.price_id,
+    )
+    .await;
+    let read = f
+        .provider
+        .price(&f.ctx, f.price_query.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        read.currency.scale(),
+        4,
+        "the price read serves the stored scale"
+    );
+    let resolved = f
+        .provider
+        .resolve(&f.ctx, f.resolve_query.clone())
+        .await
+        .unwrap();
+    let binding = resolved.cells[0].binding.as_ref().unwrap();
+    assert_eq!(
+        binding.price.currency.scale(),
+        4,
+        "the bound price serves the stored scale, the one its invoice line posts at"
+    );
+    let (status, rest) = seam_support::resolve(
+        &f.fixture,
+        &format!(
+            "plan_revision_id={}&date={}",
+            f.resolve_query.revision_id, f.resolve_query.date
+        ),
+    )
+    .await;
+    assert_eq!(status, 200, "REST resolves the same matrix");
+    assert_eq!(
+        rest["items"][0]["chains"][0]["binding"]["currency_scale"], 4,
+        "REST serves the stored scale"
+    );
+}
+
 async fn update_by_id(f: &plan_support::Fixture, sql: &str, id: uuid::Uuid) {
     use sea_orm::{ConnectionTrait, Database, DbBackend, Statement};
     let changed = Database::connect(&f.dsn)

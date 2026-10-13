@@ -7,7 +7,7 @@ use crate::{
     },
     authz::{actions, resource_types},
     domain::commercial_terms::{
-        validate_activation_window, validate_commercial_terms, validate_hold_time,
+        validate_activation_window, validate_hold_time, validate_stored_terms,
     },
     infra::{
         reference_registry,
@@ -207,9 +207,18 @@ impl CommercialTermsService {
             receipt.hold_until,
         )
         .map_err(CanonicalError::from)?;
-        // Check compatibility of the frozen inputs; never replace BillingTerms or descriptors.
-        validate_commercial_terms(&receipt.query, &receipt.bindings)
-            .map_err(CanonicalError::from)?;
+        // Check compatibility of the frozen inputs at their stored currency specs, and that they
+        // still hash to the issued terms digest; never replace BillingTerms or descriptors. The
+        // receipt is pricing's own row, checked when it was issued, so a refusal here is a
+        // corrupt row (a logged 500), never the caller's error.
+        validate_stored_terms(&receipt.query, &receipt.bindings, &receipt.terms_digest).map_err(
+            |refusal| {
+                RepoError::CorruptRow(format!(
+                    "acceptance receipt {}: {}",
+                    receipt.acceptance_id, refusal.code
+                ))
+            },
+        )?;
         let reader = PricingReadProvider::new(self.state.clone(), self.enforcer.clone());
         let mut prices = Vec::with_capacity(receipt.bindings.len());
         for binding in &receipt.bindings {

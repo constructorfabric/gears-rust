@@ -4,8 +4,8 @@
 //! AR↔derived / Payments↔PSP / invoice-completeness check for a period; an
 //! out-of-tolerance run opens an `exception_queue` row and feeds the close gate.
 //! `watermark` is the max in-period `created_seq` the run covered (the close
-//! flip checks it). (Ledger↔ERP / GL check types are deferred with ERP export,
-//! VHP-1948.) `SQLite` mirrors the shape (`uuid`→`text`, `jsonb`→`text`,
+//! flip checks it). (Ledger↔ERP / GL check types are deferred with ERP export.)
+//! `SQLite` mirrors the shape (`uuid`→`text`, `jsonb`→`text`,
 //! `boolean`→`boolean DEFAULT 1`, `timestamptz`→`text`, no `bss.` prefix);
 //! CHECKs, PK, index preserved.
 
@@ -25,7 +25,7 @@ const PG_UP_STATEMENTS: &[&str] = &[
         run_id           uuid         NOT NULL,
         period_id        varchar(64)  NOT NULL,
         check_type       varchar(32)  NOT NULL,
-        variance_minor   bigint       NOT NULL DEFAULT 0,
+        variance   jsonb NOT NULL,
         within_tolerance boolean      NOT NULL DEFAULT true,
         status           varchar(16)  NOT NULL,
         watermark        bigint,
@@ -53,7 +53,7 @@ const SQLITE_UP_STATEMENTS: &[&str] = &[
         run_id           text         NOT NULL,
         period_id        varchar(64)  NOT NULL,
         check_type       varchar(32)  NOT NULL,
-        variance_minor   bigint       NOT NULL DEFAULT 0,
+        variance                    text NOT NULL,
         within_tolerance boolean      NOT NULL DEFAULT 1,
         status           varchar(16)  NOT NULL,
         watermark        bigint,

@@ -72,7 +72,7 @@ fn seed() -> Vec<String> {
     let now = "'2026-10-03T00:00:00Z'";
     let price = |id, version, from, state: &str| {
         format!(
-            "INSERT INTO pricing_price (id,tenant_id,price_book_entry_id,version_no,price_json,eligibility,effective_from,state,created_by,version,created_at,updated_at) VALUES ({},{},{},{version},'{{}}','all','{from}','{state}',{},1,{now},{now})",
+            "INSERT INTO pricing_price (id,tenant_id,price_book_entry_id,version_no,price_json,currency,currency_scale,eligibility,effective_from,state,created_by,version,created_at,updated_at) VALUES ({},{},{},{version},'{{}}','EUR',2,'all','{from}','{state}',{},1,{now},{now})",
             x(id),
             x(TENANT),
             x(ENTRY),
@@ -301,7 +301,7 @@ async fn sqlite_widens_the_family_keeps_every_row_and_round_trips() {
         ),
         (
             format!(
-                "INSERT INTO pricing_price (id,tenant_id,price_book_entry_id,version_no,price_json,eligibility,effective_from,state,created_by,version,created_at,updated_at) VALUES ({},{},{},9,'{{}}','all','2026-01-01','draft',{},1,'2026-10-03T00:00:00Z','2026-10-03T00:00:00Z')",
+                "INSERT INTO pricing_price (id,tenant_id,price_book_entry_id,version_no,price_json,currency,currency_scale,eligibility,effective_from,state,created_by,version,created_at,updated_at) VALUES ({},{},{},9,'{{}}','EUR',2,'all','2026-01-01','draft',{},1,'2026-10-03T00:00:00Z','2026-10-03T00:00:00Z')",
                 x(Uuid::from_u128(0x2399)),
                 x(TENANT),
                 x(Uuid::from_u128(0x2398)),

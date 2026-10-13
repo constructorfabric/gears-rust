@@ -32,29 +32,29 @@ billing_granularity     = "whole_unit"
   [[snapshot.bands]]
   from_qty = 0
   to_qty   = 1000
-  unit_amount_minor = 5
+  rate              = "0.05"
 
   [[snapshot.bands]]
   from_qty = 1000
   to_qty   = "open"
-  unit_amount_minor = 3
+  rate              = "0.03"
 
 [[assert]]
 given  = { q = 0 }
-expect = { charge_minor = 0 }
+expect = { charge = "0" }
 why    = "no usage bills nothing; the open top band must not be reached"
 
 [[assert]]
 given  = { q = 999 }
-expect = { charge_minor = 4995 }
+expect = { charge = "49.95" }
 why    = "the last unit inside band 1"
 
 [[assert]]
 given  = { q = 1000 }
-expect = { charge_minor = 5000 }
+expect = { charge = "50" }
 why    = "half-open [from,to): q=1000 opens band 2, but graduated is marginal, so band 1 is consumed whole and band 2 contributes nothing"
 
 [[assert]]
 given  = { q = 1500 }
-expect = { charge_minor = 6500 }
-why    = "1000 units at 5 plus 500 at 3 — the marginal split"
+expect = { charge = "65" }
+why    = "1000 units at 0.05 plus 500 at 0.03 — the marginal split"

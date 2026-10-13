@@ -151,6 +151,8 @@ COLUMN bss.pricing_price change_kind text NOT NULL DEFAULT 'set'::text
 COLUMN bss.pricing_price closed_explicitly boolean NOT NULL DEFAULT false
 COLUMN bss.pricing_price created_at timestamp with time zone NOT NULL DEFAULT -
 COLUMN bss.pricing_price created_by uuid NOT NULL DEFAULT -
+COLUMN bss.pricing_price currency text NOT NULL DEFAULT -
+COLUMN bss.pricing_price currency_scale smallint NOT NULL DEFAULT -
 COLUMN bss.pricing_price dim_value text NULL DEFAULT -
 COLUMN bss.pricing_price effective_from date NOT NULL DEFAULT -
 COLUMN bss.pricing_price effective_to date NULL DEFAULT -
@@ -221,7 +223,6 @@ COLUMN bss.pricing_reference_op updated_at timestamp with time zone NOT NULL DEF
 COLUMN bss.pricing_settings created_at timestamp with time zone NOT NULL DEFAULT -
 COLUMN bss.pricing_settings currencies jsonb NOT NULL DEFAULT '[]'::jsonb
 COLUMN bss.pricing_settings default_gl text NULL DEFAULT -
-COLUMN bss.pricing_settings default_rounding text NOT NULL DEFAULT -
 COLUMN bss.pricing_settings default_tax_category text NULL DEFAULT -
 COLUMN bss.pricing_settings default_timing text NOT NULL DEFAULT -
 COLUMN bss.pricing_settings invoice_line_templates jsonb NOT NULL DEFAULT -
@@ -353,9 +354,11 @@ CONSTRAINT bss.pricing_price pricing_price_cancelled_unit_check CHECK (((state =
 CONSTRAINT bss.pricing_price pricing_price_change_kind_check CHECK ((change_kind = ANY (ARRAY['set'::text, 'cancel'::text, 'end'::text])))
 CONSTRAINT bss.pricing_price pricing_price_change_target_check CHECK (((change_kind = 'set'::text) = (target_price_id IS NULL)))
 CONSTRAINT bss.pricing_price pricing_price_check CHECK (((effective_to IS NULL) OR (effective_from < effective_to)))
+CONSTRAINT bss.pricing_price pricing_price_currency_check CHECK ((currency ~ '^[A-Z]{3}$'::text))
+CONSTRAINT bss.pricing_price pricing_price_currency_scale_check CHECK (((currency_scale >= 0) AND (currency_scale <= 28)))
 CONSTRAINT bss.pricing_price pricing_price_dim_value_check CHECK (((dim_value IS NULL) OR (dim_value <> ''::text)))
 CONSTRAINT bss.pricing_price pricing_price_eligibility_check CHECK ((eligibility = ANY (ARRAY['all'::text, 'new'::text])))
-CONSTRAINT bss.pricing_price pricing_price_min_fee_check CHECK ((min_fee ~ '^[0-9]+(\.[0-9]+)?$'::text))
+CONSTRAINT bss.pricing_price pricing_price_min_fee_check CHECK ((min_fee ~ '^(0|[1-9][0-9]*)(\.[0-9]*[1-9])?$'::text))
 CONSTRAINT bss.pricing_price pricing_price_paired_price_id_fkey FOREIGN KEY (paired_price_id) REFERENCES bss.pricing_price(id)
 CONSTRAINT bss.pricing_price pricing_price_pending_unit_id_fkey FOREIGN KEY (pending_unit_id) REFERENCES bss.pricing_approval_unit(id)
 CONSTRAINT bss.pricing_price pricing_price_pkey PRIMARY KEY (id)

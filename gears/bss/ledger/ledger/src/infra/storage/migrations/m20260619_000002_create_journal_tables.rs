@@ -3,8 +3,7 @@
 //! reject-mutation triggers and a DEFERRABLE balanced/single-payer/
 //! single-currency constraint trigger; `SQLite` (non-production test
 //! backend) omits all triggers and PL/pgSQL — those invariants are
-//! re-asserted in application code in a later phase (P3). Every CHECK,
-//! index, PK, and FK is preserved on both backends.
+//! re-asserted in application code in a later phase (P3). Metadata checks, indexes, PKs and FKs remain on both backends.
 
 use sea_orm::{ConnectionTrait, Statement};
 use sea_orm_migration::prelude::*;
@@ -69,14 +68,14 @@ pub(crate) const PG_UP_STATEMENTS: &[&str] = &[
         account_class          text        NOT NULL,
         gl_code                varchar(128),
         side                   text        NOT NULL CHECK (side IN ('DR','CR')),
-        amount_minor           bigint      NOT NULL,
+        amount                      text      NOT NULL CHECK (bss.ledger_decimal_valid(amount, currency_scale)),
         currency               varchar(16) NOT NULL,
-        currency_scale         smallint    NOT NULL,
+        currency_scale         smallint    NOT NULL CHECK (currency_scale BETWEEN 0 AND 28),
         invoice_id             varchar(128),
         due_date               date,
         revenue_stream         text,
         mapping_status         text        NOT NULL CHECK (mapping_status IN ('RESOLVED','PENDING')),
-        functional_amount_minor bigint,
+        functional_amount           text CHECK (bss.ledger_decimal_valid(functional_amount, functional_currency_scale)),
         functional_currency    varchar(16),
         tax_jurisdiction       varchar(128),
         tax_filing_period      varchar(32),
@@ -88,6 +87,7 @@ pub(crate) const PG_UP_STATEMENTS: &[&str] = &[
         pricing_snapshot_ref   varchar(128),
         po_allocation_group    varchar(128),
         credit_grant_event_type text,
+        functional_currency_scale   smallint CHECK (functional_currency_scale BETWEEN 0 AND 28),
         PRIMARY KEY (tenant_id, period_id, line_id),
         FOREIGN KEY (tenant_id, period_id, entry_id)
             REFERENCES bss.ledger_journal_entry (tenant_id, period_id, entry_id),
@@ -96,14 +96,17 @@ pub(crate) const PG_UP_STATEMENTS: &[&str] = &[
             'TAX_PAYABLE','SUSPENSE','DISPUTE_HOLD','REFUND_CLEARING','CONTRA_REVENUE','GOODWILL',
             'DISPUTE_LOSS_EXPENSE','PSP_FEE_EXPENSE','FX_GAIN_LOSS','FX_UNREALIZED')),
         CONSTRAINT chk_journal_line_amount CHECK (
-            amount_minor > 0 OR (amount_minor = 0 AND functional_amount_minor IS NOT NULL)),
+            amount::numeric > 0
+            OR (amount::numeric = 0 AND functional_amount IS NOT NULL
+                AND functional_amount::numeric > 0)),
         CONSTRAINT chk_journal_line_tax_dims CHECK (
             account_class <> 'TAX_PAYABLE'
             OR (tax_jurisdiction IS NOT NULL AND tax_filing_period IS NOT NULL)),
         CONSTRAINT chk_journal_line_revenue_stream CHECK (
             account_class NOT IN ('REVENUE','CONTRACT_LIABILITY') OR revenue_stream IS NOT NULL),
         CONSTRAINT chk_journal_line_credit_grant CHECK (
-            (account_class = 'REUSABLE_CREDIT') = (credit_grant_event_type IS NOT NULL))
+            (account_class = 'REUSABLE_CREDIT') = (credit_grant_event_type IS NOT NULL)),
+        CONSTRAINT chk_ledger_journal_line_money_metadata CHECK ((functional_amount IS NULL) = (functional_currency IS NULL) AND (functional_amount IS NULL) = (functional_currency_scale IS NULL))
     )",
     "CREATE INDEX idx_journal_line_account
         ON bss.ledger_journal_line (tenant_id, account_id, currency)",
@@ -138,8 +141,8 @@ pub(crate) const PG_UP_STATEMENTS: &[&str] = &[
           SELECT count(*),
                  count(DISTINCT l.payer_tenant_id),
                  count(*) FILTER (WHERE l.currency <> NEW.entry_currency
-                                  AND NOT (l.amount_minor = 0
-                                           AND l.functional_amount_minor IS NOT NULL))
+                                  AND NOT (l.amount::numeric = 0
+                                           AND l.functional_amount IS NOT NULL))
             INTO line_count, payer_count, currency_mismatch
             FROM bss.ledger_journal_line l
            WHERE (l.tenant_id, l.period_id, l.entry_id)
@@ -162,8 +165,8 @@ pub(crate) const PG_UP_STATEMENTS: &[&str] = &[
             WHERE (l.tenant_id, l.period_id, l.entry_id)
                   = (NEW.tenant_id, NEW.period_id, NEW.entry_id)
             GROUP BY l.currency, l.currency_scale
-            HAVING sum(CASE WHEN l.side = 'DR' THEN l.amount_minor
-                            ELSE -l.amount_minor END) <> 0
+            HAVING sum(CASE WHEN l.side = 'DR' THEN l.amount::numeric
+                            ELSE -l.amount::numeric END) <> 0
           ) u;
           IF unbalanced > 0 THEN
             RAISE EXCEPTION 'LEDGER_ENTRY_UNBALANCED entry=%', NEW.entry_id;
@@ -197,13 +200,13 @@ const PG_DOWN_STATEMENTS: &[&str] = &[
 // * `bytea` → `blob`;
 // * append-only + balance triggers and the PL/pgSQL functions are
 //   DROPPED — those invariants are re-asserted in application code (P3).
-// Every CHECK, index, PK, and FK is preserved.
+// Exact relational money checks run in the application on SQLite.
 
 const SQLITE_UP_STATEMENTS: &[&str] = &[
     "CREATE TABLE ledger_journal_entry (
-        entry_id           text          NOT NULL,
-        tenant_id          text          NOT NULL,
-        legal_entity_id    text          NOT NULL,
+        entry_id               text          NOT NULL,
+        tenant_id              text          NOT NULL,
+        legal_entity_id        text          NOT NULL,
         period_id          varchar(6)    NOT NULL,
         entry_currency     varchar(16)   NOT NULL,
         source_doc_type    text          NOT NULL,
@@ -248,14 +251,14 @@ const SQLITE_UP_STATEMENTS: &[&str] = &[
         account_class          text        NOT NULL,
         gl_code                varchar(128),
         side                   text        NOT NULL CHECK (side IN ('DR','CR')),
-        amount_minor           bigint      NOT NULL,
+        amount                      text      NOT NULL CHECK (length(amount) BETWEEN 1 AND 31),
         currency               varchar(16) NOT NULL,
-        currency_scale         smallint    NOT NULL,
+        currency_scale         smallint    NOT NULL CHECK (currency_scale BETWEEN 0 AND 28),
         invoice_id             varchar(128),
         due_date               date,
         revenue_stream         text,
         mapping_status         text        NOT NULL CHECK (mapping_status IN ('RESOLVED','PENDING')),
-        functional_amount_minor bigint,
+        functional_amount           text CHECK (length(functional_amount) BETWEEN 1 AND 31),
         functional_currency    varchar(16),
         tax_jurisdiction       varchar(128),
         tax_filing_period      varchar(32),
@@ -267,6 +270,7 @@ const SQLITE_UP_STATEMENTS: &[&str] = &[
         pricing_snapshot_ref   varchar(128),
         po_allocation_group    varchar(128),
         credit_grant_event_type text,
+        functional_currency_scale   smallint CHECK (functional_currency_scale BETWEEN 0 AND 28),
         PRIMARY KEY (tenant_id, period_id, line_id),
         FOREIGN KEY (tenant_id, period_id, entry_id)
             REFERENCES ledger_journal_entry (tenant_id, period_id, entry_id),
@@ -275,14 +279,15 @@ const SQLITE_UP_STATEMENTS: &[&str] = &[
             'TAX_PAYABLE','SUSPENSE','DISPUTE_HOLD','REFUND_CLEARING','CONTRA_REVENUE','GOODWILL',
             'DISPUTE_LOSS_EXPENSE','PSP_FEE_EXPENSE','FX_GAIN_LOSS','FX_UNREALIZED')),
         CONSTRAINT chk_journal_line_amount CHECK (
-            amount_minor > 0 OR (amount_minor = 0 AND functional_amount_minor IS NOT NULL)),
+            (substr(amount, 1, 1) <> '-' AND amount <> '0') OR (amount = '0' AND functional_amount IS NOT NULL AND substr(functional_amount, 1, 1) <> '-' AND functional_amount <> '0')),
         CONSTRAINT chk_journal_line_tax_dims CHECK (
             account_class <> 'TAX_PAYABLE'
             OR (tax_jurisdiction IS NOT NULL AND tax_filing_period IS NOT NULL)),
         CONSTRAINT chk_journal_line_revenue_stream CHECK (
             account_class NOT IN ('REVENUE','CONTRACT_LIABILITY') OR revenue_stream IS NOT NULL),
         CONSTRAINT chk_journal_line_credit_grant CHECK (
-            (account_class = 'REUSABLE_CREDIT') = (credit_grant_event_type IS NOT NULL))
+            (account_class = 'REUSABLE_CREDIT') = (credit_grant_event_type IS NOT NULL)),
+        CONSTRAINT chk_ledger_journal_line_money_metadata CHECK ((functional_amount IS NULL) = (functional_currency IS NULL) AND (functional_amount IS NULL) = (functional_currency_scale IS NULL))
     )",
     "CREATE INDEX idx_journal_line_account
         ON ledger_journal_line (tenant_id, account_id, currency)",

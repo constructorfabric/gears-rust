@@ -1,6 +1,6 @@
 //! Postgres-only repo tests for `PayerStateRepo` (the payer-lifecycle row
 //! `bss.ledger_payer_state` + the outstanding-balance check over
-//! `bss.ledger_ar_payer_balance`, VHP-1852 Phase 2). Ignored by default; run with
+//! `bss.ledger_ar_payer_balance`). Ignored by default; run with
 //! `cargo test -p cf-gears-bss-ledger --test postgres_payer_state -- --ignored`.
 //!
 //! Covers: (a) `close` upserts the row to CLOSED, stamping the approver + the
@@ -164,8 +164,8 @@ async fn has_outstanding_balance_reflects_the_ar_grain() {
     let acct = Uuid::now_v7();
     raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_ar_payer_balance \
-         (tenant_id, payer_tenant_id, account_id, currency, balance_minor, version) \
-         VALUES ('{tenant}','{payer}','{acct}','USD',500,0)"
+         (tenant_id, payer_tenant_id, account_id, currency, currency_scale, balance, version) \
+         VALUES ('{tenant}','{payer}','{acct}','USD',2,'5',0)"
     )))
     .await
     .expect("seed ar payer balance");

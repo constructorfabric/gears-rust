@@ -22,18 +22,20 @@ const PG_UP_STATEMENTS: &[&str] = &[
     "CREATE TABLE bss.ledger_fx_rate_snapshot (
         tenant_id        uuid         NOT NULL,
         rate_id          uuid         NOT NULL,
-        base_currency    varchar(16)  NOT NULL,
-        quote_currency   varchar(16)  NOT NULL,
-        rate_micro       bigint       NOT NULL,
+        base_currency  varchar(16)  NOT NULL,
+        quote_currency varchar(16)  NOT NULL,
+        rate                        text       NOT NULL CHECK (bss.ledger_decimal_valid(rate, 28)),
         as_of            timestamptz  NOT NULL,
         provider         varchar(128) NOT NULL,
         stale            boolean      NOT NULL DEFAULT false,
         fallback_order   integer      NOT NULL DEFAULT 0,
         triangulated_via varchar(128),
+        base_currency_scale         smallint NOT NULL CHECK (base_currency_scale BETWEEN 0 AND 28),
+        quote_currency_scale        smallint NOT NULL CHECK (quote_currency_scale BETWEEN 0 AND 28),
         PRIMARY KEY (tenant_id, rate_id),
-        CONSTRAINT ck_fx_rate_snapshot_rate_positive CHECK (rate_micro > 0),
+        CONSTRAINT ck_fx_rate_snapshot_rate_positive CHECK (rate::numeric > 0),
         CONSTRAINT uq_fx_rate_snapshot_lock UNIQUE
-            (tenant_id, base_currency, quote_currency, provider, as_of, fallback_order)
+            (tenant_id, base_currency, base_currency_scale, quote_currency, quote_currency_scale, provider, as_of, fallback_order)
     )",
     "CREATE INDEX idx_fx_rate_snapshot_pair
         ON bss.ledger_fx_rate_snapshot (tenant_id, base_currency, quote_currency, as_of)",
@@ -49,12 +51,12 @@ const PG_UP_STATEMENTS: &[&str] = &[
         base_currency  varchar(16)  NOT NULL,
         quote_currency varchar(16)  NOT NULL,
         provider       varchar(128) NOT NULL,
-        rate_micro     bigint       NOT NULL,
+        rate                        text       NOT NULL CHECK (bss.ledger_decimal_valid(rate, 28)),
         as_of          timestamptz  NOT NULL,
         fallback_order integer      NOT NULL DEFAULT 0,
         updated_at     timestamptz  NOT NULL DEFAULT now(),
         PRIMARY KEY (tenant_id, base_currency, quote_currency, provider),
-        CONSTRAINT ck_fx_rate_rate_positive CHECK (rate_micro > 0)
+        CONSTRAINT ck_fx_rate_rate_positive CHECK (rate::numeric > 0)
     )",
 ];
 
@@ -71,20 +73,22 @@ const PG_DOWN_STATEMENTS: &[&str] = &[
 
 const SQLITE_UP_STATEMENTS: &[&str] = &[
     "CREATE TABLE ledger_fx_rate_snapshot (
-        tenant_id        text         NOT NULL,
+        tenant_id      text         NOT NULL,
         rate_id          text         NOT NULL,
-        base_currency    varchar(16)  NOT NULL,
-        quote_currency   varchar(16)  NOT NULL,
-        rate_micro       bigint       NOT NULL,
-        as_of            text         NOT NULL,
+        base_currency  varchar(16)  NOT NULL,
+        quote_currency varchar(16)  NOT NULL,
+        rate                        text       NOT NULL CHECK (length(rate) BETWEEN 1 AND 31),
+        as_of          text         NOT NULL,
         provider         varchar(128) NOT NULL,
         stale            boolean      NOT NULL DEFAULT 0,
         fallback_order   integer      NOT NULL DEFAULT 0,
         triangulated_via varchar(128),
+        base_currency_scale         smallint NOT NULL CHECK (base_currency_scale BETWEEN 0 AND 28),
+        quote_currency_scale        smallint NOT NULL CHECK (quote_currency_scale BETWEEN 0 AND 28),
         PRIMARY KEY (tenant_id, rate_id),
-        CONSTRAINT ck_fx_rate_snapshot_rate_positive CHECK (rate_micro > 0),
+        CONSTRAINT ck_fx_rate_snapshot_rate_positive CHECK ((substr(rate, 1, 1) <> '-' AND rate <> '0')),
         CONSTRAINT uq_fx_rate_snapshot_lock UNIQUE
-            (tenant_id, base_currency, quote_currency, provider, as_of, fallback_order)
+            (tenant_id, base_currency, base_currency_scale, quote_currency, quote_currency_scale, provider, as_of, fallback_order, rate)
     )",
     "CREATE INDEX idx_fx_rate_snapshot_pair
         ON ledger_fx_rate_snapshot (tenant_id, base_currency, quote_currency, as_of)",
@@ -93,12 +97,12 @@ const SQLITE_UP_STATEMENTS: &[&str] = &[
         base_currency  varchar(16)  NOT NULL,
         quote_currency varchar(16)  NOT NULL,
         provider       varchar(128) NOT NULL,
-        rate_micro     bigint       NOT NULL,
+        rate                        text       NOT NULL CHECK (length(rate) BETWEEN 1 AND 31),
         as_of          text         NOT NULL,
         fallback_order integer      NOT NULL DEFAULT 0,
         updated_at     text         NOT NULL DEFAULT (CURRENT_TIMESTAMP),
         PRIMARY KEY (tenant_id, base_currency, quote_currency, provider),
-        CONSTRAINT ck_fx_rate_rate_positive CHECK (rate_micro > 0)
+        CONSTRAINT ck_fx_rate_rate_positive CHECK ((substr(rate, 1, 1) <> '-' AND rate <> '0'))
     )",
 ];
 

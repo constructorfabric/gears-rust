@@ -1,5 +1,5 @@
 //! D-438: the tenant settings offer currencies and say who changed them. A FORWARD migration
-//! (D-427 closed D-412: the chain is deployed and no shipped migration is edited again).
+//! (D-427). A shipped migration is edited in place only under D-534.
 //!
 //! `ADD COLUMN` only, inside the toolkit runner's transaction, on both dialects:
 //! - `pricing_settings.currencies`, declared as `invoice_line_templates` is (`jsonb` on Postgres,
@@ -10,7 +10,7 @@
 //!   every row written before this migration.
 //!
 //! No CHECK is added: the currency codes are judged by the door (`CURRENCY_INVALID`), as a book's
-//! own code is; `default_rounding` gets no CHECK either (D-437; the deploy pre-flight is the gate).
+//! own code is.
 //!
 //! Each step is skipped when its column is already there (Postgres `IF NOT EXISTS`; on `SQLite`
 //! the catalog is read first), so a replay changes nothing; `down` drops the two columns the same

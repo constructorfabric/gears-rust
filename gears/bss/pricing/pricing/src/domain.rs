@@ -37,6 +37,7 @@ macro_rules! string_enum {
 
 pub mod book;
 pub mod caps;
+pub mod currency;
 pub mod dimension;
 pub mod money;
 pub mod plan;

@@ -9,6 +9,7 @@ use crate::api::rest::closed_sets::{
     PricingVoteOutcome,
 };
 use crate::domain::plan::{self, EffectiveRevision};
+use crate::domain::price::Price;
 use crate::infra::plan_revisions::{effective_revisions, stored_revisions};
 use crate::infra::storage::{RepoError, entity, repo::approval_repo::UnitInstants};
 use std::collections::BTreeMap;
@@ -366,6 +367,11 @@ pub struct PricingPriceDto {
     pub dim_value: Option<String>,
     /// The entry's model, read-only (D-427): a price has no model of its own.
     pub model: PricingModel,
+    /// The price's currency, its book's, stored with the price.
+    pub currency: String,
+    /// The currency's scale stored with the price, a JSON integer: the table's scale when the
+    /// price was written or last edited. An approved price keeps it whatever the table says later.
+    pub currency_scale: u8,
     pub price_json: serde_json::Value,
     pub min_fee: Option<String>,
     pub eligibility: PricingEligibility,
@@ -406,18 +412,32 @@ pub struct PricingPriceDto {
     pub updated_at: time::OffsetDateTime,
 }
 impl PricingPriceDto {
-    /// A stored price with its entry's model (D-427).
+    /// A stored price with `price`, the row as `price_repo::in_book` decoded it: its entry's model
+    /// (D-427) and its stored currency spec, checked against its book's.
     /// # Errors
-    /// `CorruptRow` for a stored token outside its closed set (D-439).
-    pub fn of(m: entity::price::Model, model: &str) -> Result<Self, RepoError> {
-        Self::at(m, model, time::OffsetDateTime::now_utc().date())
+    /// `CorruptRow` for a stored token outside its closed set (D-439), or when `price` is not
+    /// the row's decoded price.
+    pub fn of(m: entity::price::Model, price: &Price) -> Result<Self, RepoError> {
+        Self::at(m, price, time::OffsetDateTime::now_utc().date())
     }
     /// [`Self::of`] with its display status on `today`, the one day a whole read is dated on
-    /// (D-440).
+    /// (D-440). The DTO reads nothing itself: the money, the fee and the currency spec were judged
+    /// when `price` was decoded, and `price` must be the row's own.
     /// # Errors
-    /// `CorruptRow` for a stored token outside its closed set (D-439).
-    pub fn at(m: entity::price::Model, model: &str, today: time::Date) -> Result<Self, RepoError> {
+    /// `CorruptRow` for a stored token outside its closed set (D-439), or when `price` is not
+    /// the row's decoded price.
+    pub fn at(
+        m: entity::price::Model,
+        price: &Price,
+        today: time::Date,
+    ) -> Result<Self, RepoError> {
         let id = m.id;
+        if price.id != id {
+            return Err(RepoError::CorruptRow(format!(
+                "price {id} is served with the decoded price {}",
+                price.id
+            )));
+        }
         let state = PricingPriceState::stored(&m.state, &format_args!("price {id} state"))?;
         let change_kind =
             PricingChangeKind::stored(&m.change_kind, &format_args!("price {id} change_kind"))?;
@@ -439,7 +459,9 @@ impl PricingPriceDto {
             price_book_entry_id: m.price_book_entry_id,
             version_no: m.version_no,
             dim_value: m.dim_value,
-            model: PricingModel::stored(model, &format_args!("price {id} model"))?,
+            model: price.model.into(),
+            currency: price.currency.code().to_owned(),
+            currency_scale: price.currency.scale(),
             price_json: m.price_json,
             min_fee: m.min_fee,
             eligibility: PricingEligibility::stored(
@@ -486,7 +508,7 @@ pub struct PriceBookCreate {
 #[toolkit_macros::api_dto(request)]
 #[derive(Clone)]
 #[serde(deny_unknown_fields)]
-#[allow(
+#[expect(
     clippy::option_option,
     reason = "PATCH distinguishes omission, null clearing, and a new date"
 )]
@@ -500,7 +522,7 @@ pub struct PriceBookPatch {
     #[serde(default, deserialize_with = "nullable_date")]
     pub description: Option<Option<String>>,
 }
-#[allow(
+#[expect(
     clippy::option_option,
     reason = "PATCH distinguishes omission, null clearing, and a new date"
 )]
@@ -508,6 +530,16 @@ fn nullable_date<'de, D: serde::Deserializer<'de>>(
     d: D,
 ) -> Result<Option<Option<String>>, D::Error> {
     <Option<String> as serde::Deserialize>::deserialize(d).map(Some)
+}
+/// [`nullable_date`] for a field the door reads as JSON: present and `null` is `Some(None)`.
+#[expect(
+    clippy::option_option,
+    reason = "PATCH distinguishes omission, null clearing, and a new value"
+)]
+fn nullable_value<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Option<Option<serde_json::Value>>, D::Error> {
+    <Option<serde_json::Value> as serde::Deserialize>::deserialize(d).map(Some)
 }
 /// One page of a book's entries (D-483), ordered `(sku_id, charge_kind, model, id)`.
 #[toolkit_macros::api_dto(response)]
@@ -582,8 +614,6 @@ pub struct PricingDimensionRegistry {
 #[serde(deny_unknown_fields)]
 pub struct PricingSettingsPut {
     pub default_timing: String,
-    /// `half_up`, `half_even`, `half_down`, `up` or `down` (D-437).
-    pub default_rounding: String,
     pub default_gl: Option<String>,
     pub default_tax_category: Option<String>,
     pub invoice_line_templates: std::collections::BTreeMap<String, String>,
@@ -597,9 +627,6 @@ pub struct PricingSettingsPut {
 #[toolkit_macros::api_dto(response)]
 pub struct PricingSettingsDto {
     pub default_timing: PricingBillingTiming,
-    /// One of the five modes (D-437) once written through the door; a string, not an enum: no
-    /// CHECK guards the column, and a legacy value reads back as stored (D-439).
-    pub default_rounding: String,
     pub default_gl: Option<String>,
     pub default_tax_category: Option<String>,
     pub invoice_line_templates: serde_json::Value,
@@ -1551,7 +1578,9 @@ pub struct PricingPriceCreate {
     pub dim_value: Option<String>,
     /// Money in the entry's model (D-427); a price carries no model of its own.
     pub price: serde_json::Value,
-    pub min_fee: Option<String>,
+    /// Exact decimal text, a JSON string; a JSON number is 400 `MIN_FEE_INVALID` (D-528).
+    #[schema(value_type = Option<String>)]
+    pub min_fee: Option<serde_json::Value>,
     pub eligibility: String,
     pub effective_from: String,
     pub temporary_until: Option<String>,
@@ -1577,8 +1606,11 @@ pub struct PricingPricePatch {
     #[serde(default, deserialize_with = "nullable_date")]
     pub dim_value: Option<Option<String>>,
     pub price: Option<serde_json::Value>,
-    #[serde(default, deserialize_with = "nullable_date")]
-    pub min_fee: Option<Option<String>>,
+    /// Exact decimal text, a JSON string, or `null` to clear it; a JSON number is 400
+    /// `MIN_FEE_INVALID` (D-528).
+    #[serde(default, deserialize_with = "nullable_value")]
+    #[schema(value_type = Option<String>)]
+    pub min_fee: Option<Option<serde_json::Value>>,
     pub eligibility: Option<String>,
     /// A temporary draft's start moves with its end; a return's start is its pair's end.
     pub effective_from: Option<String>,

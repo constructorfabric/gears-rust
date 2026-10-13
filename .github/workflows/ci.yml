@@ -472,6 +472,12 @@ jobs:
         if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
         run: tools/scripts/with_rust_annotations.sh make test-products-pg
 
+      # bss-ledger's Postgres tier: every posting, chain, payment and REST-over-Postgres
+      # proof the gear owns. Without this step the tier compiles here and runs nowhere.
+      - name: Test bss-ledger with Postgres (integration)
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        run: tools/scripts/with_rust_annotations.sh make test-ledger-pg
+
       - name: Test redis-cluster-plugin (redis integration)
         if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
         run: tools/scripts/with_rust_annotations.sh make test-cluster-redis

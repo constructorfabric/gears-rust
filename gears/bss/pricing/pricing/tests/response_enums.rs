@@ -117,12 +117,10 @@ const CLOSED: &[Closed] = &[
     ("PricingPinnedPriceDto", "status", PINNED_PRICE_STATUS, true),
 ];
 
-/// Response fields that stay `string` (D-439): no CHECK guards the stored set (`default_rounding`
-/// and the resolve's copy of it, D-437; the approval unit's `ref_type`), or the value is a code
-/// vocabulary or an open value rather than a state (`code`, `chain`).
+/// Response fields that stay `string` (D-439): no CHECK guards the stored set (the approval unit's
+/// `ref_type`), or the value is a code vocabulary or an open value rather than a state (`code`,
+/// `chain`).
 const KEPT_STRING: &[(&str, &str)] = &[
-    ("PricingSettingsDto", "default_rounding"),
-    ("PricingResolveDto", "rounding_policy"),
     ("PricingApprovalUnitDto", "ref_type"),
     ("PricingPlanCheckDto", "code"),
     ("PricingProposedPrice", "chain"),
@@ -135,7 +133,6 @@ const REQUEST_STRING: &[(&str, &str)] = &[
     ("PricingPriceCreate", "eligibility"),
     ("PricingPricePatch", "eligibility"),
     ("PricingSettingsPut", "default_timing"),
-    ("PricingSettingsPut", "default_rounding"),
     ("PricingApprovalPolicyPut", "kind"),
 ];
 

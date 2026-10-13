@@ -1,153 +1,193 @@
-//! `RateLocker` — translate + snapshot + stamp (design §4.2 / §4.5): for a
-//! cross-currency entry, resolve the lock-ready rate
-//! ([`RateSource`](super::rate_source::RateSource)), freeze it in a
-//! `ledger_fx_rate_snapshot` ([`FxRepo::insert_snapshot`]), translate every line
-//! to the functional currency at that single locked rate
-//! ([`translate_entry`](crate::domain::fx::translate::translate_entry)), and
-//! stamp the functional columns (`functional_amount_minor` /
-//! `functional_currency` / `rate_snapshot_ref`) onto the lines in place.
-//!
-//! A single-currency entry (`transaction_ccy == functional_ccy`) needs no FX: the
-//! functional columns stay NULL and no snapshot is written.
-//!
-//! **Wired into the live S1 (invoice/post) and S2 (settle) posting paths.** Each
-//! caller drives this gated on `functional_ccy.is_some() && fc != entry_currency`,
-//! so a single-currency tenant (no functional currency, or one equal to the entry
-//! currency) is unaffected — no snapshot, functional columns stay NULL. The
-//! cross-currency path is exercised by the controller's testcontainer test (the
-//! snapshot insert needs a database); the single-currency short-circuit is
-//! unit-tested here.
+//! Lock exact FX evidence and stamp functional money on a caller-owned posting attempt.
+//! Identity requires both currency code and stored scale. New-post registry admission
+//! remains the posting caller's responsibility; historical evidence is never relabelled.
 
-use bss_ledger_sdk::AccountClass;
-
-use toolkit_db::secure::AccessScope;
+use crate::domain::fx::translate::{FxLine, FxTranslateError, ensure_same_spec, translate_entry};
+use crate::domain::{error::DomainError, exact_money::ExactError, model::NewLine};
+use crate::infra::fx::rate_source::{RateSource, ResolvedRate};
+use crate::infra::posting::retry::AttemptError;
+use crate::infra::storage::repo::{FxRepo, NewRateSnapshot};
+use bss_ledger_sdk::{AccountClass, CurrencySpec, PostedMoney};
+use time::OffsetDateTime;
+use toolkit_db::secure::{AccessScope, DBRunner};
 use uuid::Uuid;
 
-use crate::domain::error::DomainError;
-use crate::domain::fx::translate::{FxLine, FxTranslateError, translate_entry};
-use crate::domain::model::NewLine;
-use crate::infra::fx::rate_source::RateSource;
-use crate::infra::storage::repo::{FxRepo, NewRateSnapshot};
-use time::OffsetDateTime;
-
-/// Resolves + locks the FX rate for an entry and stamps the functional columns.
+/// Resolves and freezes one quote and both actual specs for an entry.
 #[derive(Clone)]
 pub struct RateLocker {
     source: RateSource,
     repo: FxRepo,
 }
-
 impl RateLocker {
+    /// Build a locker over the local reference-rate repository.
     #[must_use]
     pub fn new(source: RateSource, repo: FxRepo) -> Self {
         Self { source, repo }
     }
 
-    /// Lock an FX rate for the entry and stamp the functional translation onto
-    /// `lines`, or do nothing for a single-currency entry.
-    ///
-    /// - `transaction_ccy == functional_ccy` (single-currency): returns
-    ///   `Ok(None)` and leaves every line's functional columns NULL — there is no
-    ///   translation to do and no snapshot to write.
-    /// - else (cross-currency): resolves the rate for `transaction_ccy →
-    ///   functional_ccy`, inserts a `ledger_fx_rate_snapshot` from it (`rate_id`),
-    ///   translates every line at the locked `rate_micro` with the per-entry
-    ///   rounding residual closed onto the AR anchor (the first `AccountClass::Ar`
-    ///   line, else line 0), and sets each line's `functional_amount_minor` /
-    ///   `functional_currency` / `rate_snapshot_ref`. Returns `Ok(Some(rate_id))`.
+    /// Standalone non-posting convenience; authoritative posting uses `lock_and_stamp_in`.
+    /// Failed metadata validation, translation or persistence never changes caller lines.
     ///
     /// # Errors
-    /// - [`DomainError::FxRateUnavailable`] / [`DomainError::FxRateStaleNotAllowed`]
-    ///   propagated from [`RateSource::resolve`].
-    /// - [`DomainError::Internal`] on a snapshot-insert failure, or when the pure
-    ///   translation rejects the input (a residual/anchor/overflow misuse — see
-    ///   [`map_translate_err`]).
+    /// A metadata [`DomainError`] from `validate_metadata` when a line disagrees with the
+    /// transaction / functional specs; [`DomainError::FxRateUnavailable`] /
+    /// [`DomainError::FxRateStaleNotAllowed`] propagated from [`RateSource::resolve`]; the
+    /// translation error when the pure translation rejects the input; the posting-transport
+    /// [`DomainError`] (an infrastructure fault or database contention) when the snapshot
+    /// insert fails.
     pub async fn lock_and_stamp(
         &self,
         scope: &AccessScope,
         tenant: Uuid,
         lines: &mut [NewLine],
-        transaction_ccy: &str,
-        functional_ccy: &str,
+        transaction: &CurrencySpec,
+        functional: &CurrencySpec,
         now: OffsetDateTime,
     ) -> Result<Option<Uuid>, DomainError> {
-        // Single-currency: nothing to translate, functional columns stay NULL.
-        if transaction_ccy == functional_ccy {
+        validate_metadata(lines, transaction, functional)?;
+        if transaction == functional {
             return Ok(None);
         }
-
-        // Resolve the lock-ready rate (transaction → functional) and freeze it.
         let resolved = self
             .source
-            .resolve(scope, tenant, transaction_ccy, functional_ccy, now)
+            .resolve(scope, tenant, transaction.code(), functional.code(), now)
             .await?;
-        let rate_id = self
+        let translated = translated(lines, &resolved, functional)?;
+        let id = self
             .repo
-            .insert_snapshot(
-                scope,
-                &NewRateSnapshot {
-                    tenant_id: tenant,
-                    base_currency: transaction_ccy.to_owned(),
-                    quote_currency: functional_ccy.to_owned(),
-                    rate_micro: resolved.rate_micro,
-                    as_of: resolved.as_of,
-                    provider: resolved.provider.clone(),
-                    stale: resolved.stale,
-                    fallback_order: resolved.fallback_order,
-                    triangulated_via: resolved.triangulated_via.clone(),
-                },
-            )
+            .insert_snapshot(scope, &snapshot(tenant, transaction, functional, &resolved))
             .await
-            .map_err(|e| DomainError::Internal(format!("fx snapshot insert: {e}")))?;
+            .map_err(crate::infra::posting::error_transport::repo_to_domain)?;
+        stamp(lines, translated);
+        Ok(Some(id))
+    }
 
-        // Translate every line at the single locked rate, closing the per-entry
-        // functional rounding residual onto the AR anchor (the leg whose
-        // functional dwarfs a ≤ lines−1 minor-unit residual). No AR line → anchor
-        // line 0 (the residual plug still balances the functional column; the
-        // anchor must merely be a substantial real line).
-        let fxlines: Vec<FxLine> = lines
-            .iter()
-            .map(|l| FxLine {
-                amount_minor: l.amount_minor,
-                side: l.side,
-            })
-            .collect();
-        let anchor = lines
-            .iter()
-            .position(|l| l.account_class == AccountClass::Ar)
-            .unwrap_or(0);
-        let func = translate_entry(&fxlines, resolved.rate_micro, anchor)
-            .map_err(|e| map_translate_err(&e))?;
-
-        // Stamp the functional columns in place (one functional amount per line,
-        // input order). NOTE: the per-line `rate_snapshot_ref` FK (journal_line →
-        // fx_rate_snapshot) is NOT carried on `NewLine` — one rate per entry (§4.3),
-        // so it rides the entry header (`NewEntry.rate_snapshot_ref`): the live
-        // S1/S2 hook sets it from the `rate_id` returned here, and the journal repo
-        // stamps it onto every line on insert. The snapshot id is returned to the
-        // caller for that purpose.
-        for (line, func_amount) in lines.iter_mut().zip(func) {
-            line.functional_amount_minor = Some(func_amount);
-            line.functional_currency = Some(functional_ccy.to_owned());
+    /// Read, translate and insert immutable evidence on the caller's runner.
+    /// The caller owns the sole retry and commits snapshot, journal and sidecars together.
+    /// All lines are validated before identity; no lines change on any returned error.
+    pub(crate) async fn lock_and_stamp_in<R: DBRunner>(
+        &self,
+        runner: &R,
+        scope: &AccessScope,
+        tenant: Uuid,
+        lines: &mut [NewLine],
+        transaction: &CurrencySpec,
+        functional: &CurrencySpec,
+        now: OffsetDateTime,
+    ) -> Result<Option<Uuid>, AttemptError> {
+        validate_metadata(lines, transaction, functional)?;
+        if transaction == functional {
+            return Ok(None);
         }
-
-        Ok(Some(rate_id))
+        let resolved = self
+            .source
+            .resolve_in(
+                runner,
+                scope,
+                tenant,
+                transaction.code(),
+                functional.code(),
+                now,
+            )
+            .await?;
+        let translated = translated(lines, &resolved, functional)?;
+        let id = self
+            .repo
+            .insert_snapshot_in(
+                runner,
+                scope,
+                &snapshot(tenant, transaction, functional, &resolved),
+            )
+            .await?;
+        stamp(lines, translated);
+        Ok(Some(id))
     }
 }
 
-/// Map a pure [`FxTranslateError`] to a [`DomainError`]. Every variant is a
-/// translate **misuse** the caller should not reach with a balanced entry and a
-/// positive locked rate (a non-positive rate, an out-of-bounds anchor, a residual
-/// that would drive the anchor non-positive, or an out-of-range product) — the
-/// rate itself was already accepted by `RateSource`, so these are internal
-/// invariant breaches, not a "no acceptable rate" condition. They therefore map
-/// to [`DomainError::Internal`] (a 500 whose diagnostic stays server-side), NOT
-/// `FxRateUnavailable` (which means the store had no usable quote).
-#[must_use]
-fn map_translate_err(e: &FxTranslateError) -> DomainError {
-    DomainError::Internal(format!("fx translation rejected the entry: {e}"))
+/// Verify every stored input spec, including zero/identity and existing functional evidence.
+fn validate_metadata(
+    lines: &[NewLine],
+    transaction: &CurrencySpec,
+    functional: &CurrencySpec,
+) -> Result<(), DomainError> {
+    for line in lines {
+        ensure_same_spec(line.money.currency(), transaction).map_err(map_exact_err)?;
+        if let Some(existing) = &line.functional_money {
+            ensure_same_spec(existing.currency(), functional).map_err(map_exact_err)?;
+        }
+    }
+    Ok(())
 }
-
+/// Calculate all values before any persistence or in-place stamping.
+fn translated(
+    lines: &[NewLine],
+    resolved: &ResolvedRate,
+    functional: &CurrencySpec,
+) -> Result<Vec<PostedMoney>, DomainError> {
+    let inputs: Vec<_> = lines
+        .iter()
+        .map(|line| FxLine {
+            amount: line.money.clone(),
+            side: line.side,
+        })
+        .collect();
+    let anchor = lines
+        .iter()
+        .position(|line| line.account_class == AccountClass::Ar)
+        .unwrap_or(0);
+    let result = translate_entry(&inputs, resolved.rate, functional.clone(), anchor)
+        .map_err(map_translate_err)?;
+    // Existing evidence may be repeated, but never silently replaced by a new value.
+    for (line, value) in lines.iter().zip(&result) {
+        if line
+            .functional_money
+            .as_ref()
+            .is_some_and(|existing| existing != value)
+        {
+            return Err(DomainError::InvalidRequest(
+                "existing functional evidence differs from locked translation".into(),
+            ));
+        }
+    }
+    Ok(result)
+}
+/// Freeze complete quote provenance and both stored specs.
+fn snapshot(
+    tenant: Uuid,
+    transaction: &CurrencySpec,
+    functional: &CurrencySpec,
+    resolved: &ResolvedRate,
+) -> NewRateSnapshot {
+    NewRateSnapshot {
+        tenant_id: tenant,
+        base_currency: transaction.clone(),
+        quote_currency: functional.clone(),
+        rate: resolved.rate,
+        as_of: resolved.as_of,
+        provider: resolved.provider.clone(),
+        stale: resolved.stale,
+        fallback_order: resolved.fallback_order,
+        triangulated_via: resolved.triangulated_via.clone(),
+    }
+}
+/// Infallible final stamping in original line order.
+fn stamp(lines: &mut [NewLine], translated: Vec<PostedMoney>) {
+    for (line, value) in lines.iter_mut().zip(translated) {
+        line.functional_money = Some(value);
+    }
+}
+/// The gear's one exact-arithmetic table, so an FX overflow reports the same
+/// category as every other money path (no DB-transport round trip).
+fn map_exact_err(error: ExactError) -> DomainError {
+    crate::domain::exact_money::map_exact_error(error)
+}
+/// Keep numeric failures distinct from invalid entry shape/anchor policy.
+fn map_translate_err(error: FxTranslateError) -> DomainError {
+    match error {
+        FxTranslateError::Exact(error) => map_exact_err(error),
+        other => DomainError::Internal(format!("FX translation rejected the entry: {other}")),
+    }
+}
 #[cfg(test)]
 #[path = "rate_locker_tests.rs"]
 mod rate_locker_tests;

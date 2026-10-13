@@ -1,12 +1,14 @@
-//! Resolves the minor-unit scale for a (tenant, currency): registry row
-//! first (tenant overrides + non-ISO codes), then the ISO-4217 default;
-//! a non-ISO currency with no row is an error (no implicit scale).
+//! Resolves the currency posting scale for a (tenant, currency): the ISO 4217 scale from
+//! `bss_money::iso_scale` first, then the registry row for a code with no ISO 4217 minor-unit
+//! scale. The
+//! registry never overrides an ISO scale (provisioning refuses such a row, and a stored one
+//! is ignored); a non-ISO currency with no row is an error (no implicit scale).
 
-use toolkit_db::secure::AccessScope;
+use bss_money::iso_scale;
+use toolkit_db::secure::{AccessScope, DBRunner};
 use uuid::Uuid;
 
 use crate::domain::money::ScaleError;
-use crate::domain::scale::iso_default_scale;
 use crate::infra::storage::repo::ReferenceRepo;
 
 /// Registry-backed currency-scale resolver.
@@ -20,31 +22,52 @@ impl CurrencyScaleResolver {
         Self { reference }
     }
 
-    /// Resolve the scale for `(tenant_id, currency)`: a registry row wins,
-    /// else the ISO-4217 default, else [`ScaleError::UnknownCurrencyScale`].
+    /// Resolve the scale for `(tenant_id, currency)`: the ISO-4217 scale of an ISO
+    /// code (the registry is not read), else the registry row, else
+    /// [`ScaleError::UnknownCurrencyScale`].
     ///
     /// # Errors
     /// [`ScaleError::Repo`] on a storage failure; [`ScaleError::UnknownCurrencyScale`]
-    /// for a non-ISO currency with no registry row; [`ScaleError::CorruptStoredScale`]
-    /// when a registry row's stored scale is itself out of range.
+    /// for a non-ISO currency with no registry row. Invalid stored metadata is
+    /// rejected by the repository before a scale is returned.
     pub async fn resolve(
         &self,
         scope: &AccessScope,
         tenant_id: Uuid,
         currency: &str,
     ) -> Result<u8, ScaleError> {
-        if let Some(row) = self
-            .reference
+        if let Some(scale) = iso_scale(currency) {
+            return Ok(scale);
+        }
+        self.reference
             .find_currency_scale(scope, tenant_id, currency)
             .await
-            .map_err(|e| ScaleError::Repo(e.to_string()))?
-        {
-            return u8::try_from(row.minor_units).map_err(|_| ScaleError::CorruptStoredScale {
-                currency: currency.to_owned(),
-                minor_units: row.minor_units,
-            });
+            .map_err(ScaleError::from)?
+            .map(|row| row.currency_scale)
+            .ok_or_else(|| ScaleError::UnknownCurrencyScale(currency.to_owned()))
+    }
+
+    /// Resolve authoritative scale inside the caller's transaction snapshot.
+    ///
+    /// Stored historical/reversal values must use their own metadata instead.
+    ///
+    /// # Errors
+    /// Returns a repository failure or `UnknownCurrencyScale` with no implicit default.
+    pub async fn resolve_in<R: DBRunner>(
+        &self,
+        runner: &R,
+        scope: &AccessScope,
+        tenant_id: Uuid,
+        currency: &str,
+    ) -> Result<u8, ScaleError> {
+        if let Some(scale) = iso_scale(currency) {
+            return Ok(scale);
         }
-        iso_default_scale(currency)
+        self.reference
+            .find_currency_scale_in(runner, scope, tenant_id, currency)
+            .await
+            .map_err(ScaleError::from)?
+            .map(|row| row.currency_scale)
             .ok_or_else(|| ScaleError::UnknownCurrencyScale(currency.to_owned()))
     }
 }

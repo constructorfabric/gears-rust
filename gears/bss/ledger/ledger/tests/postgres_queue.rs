@@ -32,7 +32,6 @@ use std::sync::Arc;
 use bss_ledger::domain::error::DomainError;
 use bss_ledger::domain::instant::to_naive_date;
 use bss_ledger::domain::model::{AccountRow, CurrencyScaleRow, NewEntry, NewLine, RepoError};
-use bss_ledger::domain::money::DEFAULT_PLAUSIBLE_MAX_MAJOR;
 use bss_ledger::domain::payment::settlement::SettlementInput;
 use bss_ledger::domain::ports::metrics::NoopLedgerMetrics;
 use bss_ledger::infra::events::publisher::LedgerEventPublisher;
@@ -42,8 +41,11 @@ use bss_ledger::infra::payment::settle::SettlementService;
 use bss_ledger::infra::posting::service::PostingService;
 use bss_ledger::infra::storage::migrations::Migrator;
 use bss_ledger::infra::storage::repo::{PaymentRepo, ReferenceRepo};
-use bss_ledger_sdk::{AccountClass, MappingStatus, Side, SourceDocType};
+use bss_ledger_sdk::{
+    AccountClass, CurrencySpec, MappingStatus, PostedMoney, Side, SourceDocType, canonical_decimal,
+};
 use chrono::NaiveDate;
+use rust_decimal::Decimal;
 use sea_orm::{ConnectionTrait, Database, DbErr, Statement};
 use sea_orm_migration::MigratorTrait;
 use testcontainers_modules::postgres::Postgres;
@@ -56,6 +58,21 @@ use uuid::Uuid;
 
 fn pg(sql: impl Into<String>) -> Statement {
     Statement::from_string(sea_orm::DatabaseBackend::Postgres, sql.into())
+}
+
+/// The USD@2 currency spec every fixture here posts in.
+fn usd_spec() -> CurrencySpec {
+    CurrencySpec::try_new("USD".to_owned(), 2).unwrap()
+}
+
+/// A USD scale-2 posting from a cent count (`1234` ⇒ `12.34`).
+fn usd(cents: i64) -> PostedMoney {
+    PostedMoney::try_new(Decimal::new(cents, 2), usd_spec()).unwrap()
+}
+
+/// The canonical stored text of a USD cent count (`970` ⇒ `"9.7"`).
+fn text(cents: i64) -> String {
+    canonical_decimal(Decimal::new(cents, 2))
 }
 
 /// Lift a component `RepoError` into a `DbError` so a repo write can be the
@@ -131,8 +148,7 @@ async fn setup_seller(raw: &sea_orm::DatabaseConnection, provider: &DBProvider<D
         .upsert_currency_scale(CurrencyScaleRow {
             tenant_id: s.tenant,
             currency: "USD".to_owned(),
-            minor_units: 2,
-            plausible_max_major: DEFAULT_PLAUSIBLE_MAX_MAJOR,
+            currency_scale: 2,
             source: "iso".to_owned(),
         })
         .await
@@ -187,9 +203,9 @@ fn settlement_input(s: &Seller, payment_id: &str, gross: i64, fee: i64) -> Settl
         tenant_id: s.tenant,
         payer_tenant_id: s.payer,
         payment_id: payment_id.to_owned(),
-        gross_minor: gross,
-        fee_minor: fee,
-        currency: "USD".to_owned(),
+        gross: usd(gross),
+
+        fee: usd(fee),
         effective_at: None,
     }
 }
@@ -203,8 +219,7 @@ fn allocate_req(s: &Seller, payment_id: &str, allocation_id: Uuid, lump: i64) ->
         payer_tenant_id: s.payer,
         payment_id: payment_id.to_owned(),
         allocation_id,
-        lump_minor: lump,
-        currency: "USD".to_owned(),
+        lump: usd(lump),
         hint_invoice_id: None,
         caller_splits: None,
     }
@@ -214,15 +229,15 @@ async fn ar_invoice_balance(
     raw: &sea_orm::DatabaseConnection,
     s: &Seller,
     invoice_id: &str,
-) -> Option<i64> {
+) -> Option<String> {
     raw.query_one_raw(pg(format!(
-        "SELECT balance_minor FROM bss.ledger_ar_invoice_balance \
+        "SELECT balance FROM bss.ledger_ar_invoice_balance \
          WHERE tenant_id='{}' AND invoice_id='{}'",
         s.tenant, invoice_id
     )))
     .await
     .unwrap()
-    .map(|r| r.try_get_by_index::<i64>(0).unwrap())
+    .map(|r| r.try_get_by_index::<String>(0).unwrap())
 }
 
 async fn count_allocations(raw: &sea_orm::DatabaseConnection, s: &Seller, payment_id: &str) -> i64 {
@@ -376,15 +391,12 @@ fn ar_line(s: &Seller, invoice_id: &str, amount: i64) -> NewLine {
         account_class: AccountClass::Ar,
         gl_code: None,
         side: Side::Debit,
-        amount_minor: amount,
-        currency: "USD".to_owned(),
-        currency_scale: 2,
+        money: usd(amount),
         invoice_id: Some(invoice_id.to_owned()),
         due_date: Some(NaiveDate::from_ymd_opt(2026, 12, 1).unwrap()),
         revenue_stream: None,
         mapping_status: MappingStatus::Resolved,
-        functional_amount_minor: None,
-        functional_currency: None,
+        functional_money: None,
         tax_jurisdiction: None,
         tax_filing_period: None,
         tax_rate_ref: None,
@@ -409,15 +421,12 @@ fn psp_credit_line(s: &Seller, amount: i64) -> NewLine {
         account_class: AccountClass::PspFeeExpense,
         gl_code: None,
         side: Side::Credit,
-        amount_minor: amount,
-        currency: "USD".to_owned(),
-        currency_scale: 2,
+        money: usd(amount),
         invoice_id: None,
         due_date: None,
         revenue_stream: None,
         mapping_status: MappingStatus::Resolved,
-        functional_amount_minor: None,
-        functional_currency: None,
+        functional_money: None,
         tax_jurisdiction: None,
         tax_filing_period: None,
         tax_rate_ref: None,
@@ -482,7 +491,7 @@ async fn unsettled_allocate_queues() {
     assert_eq!(count_allocations(&raw, &s, "PAY-Q1").await, 0);
     assert_eq!(
         ar_invoice_balance(&raw, &s, "INV-A").await,
-        Some(300),
+        Some(text(300)),
         "AR untouched by a queued allocate"
     );
 }
@@ -603,7 +612,7 @@ async fn settle_drains_queued_allocation() {
 
     // The ledger effect landed: one allocation row, AR drained to 0.
     assert_eq!(count_allocations(&raw, &s, "PAY-DRAIN").await, 1);
-    assert_eq!(ar_invoice_balance(&raw, &s, "INV-A").await, Some(0));
+    assert_eq!(ar_invoice_balance(&raw, &s, "INV-A").await, Some(text(0)));
     let repo = PaymentRepo::new(provider.clone());
     let row = repo
         .read_settlement(&scope, s.tenant, "PAY-DRAIN")
@@ -611,8 +620,9 @@ async fn settle_drains_queued_allocation() {
         .unwrap()
         .expect("settlement row present");
     assert_eq!(
-        row.allocated_minor, 300,
-        "the drained allocation netted 300"
+        row.allocated,
+        usd(300),
+        "the drained allocation netted 3.00"
     );
 }
 
@@ -620,7 +630,7 @@ async fn settle_drains_queued_allocation() {
 /// when the queued allocation is applied, NOT trusted from intake. Queue an
 /// allocate of lump=1000 on PAY-CAP with AR inv=1000 (so the AR is NOT the
 /// binding constraint), then settle PAY-CAP at only gross=500. At apply the split
-/// re-derives to 1000 against the still-open 1000 AR, but bumping `allocated_minor`
+/// re-derives to 1000 against the still-open 1000 AR, but bumping `allocated`
 /// to 1000 > settled 500 trips the per-payment cap ⇒ the row is `Blocked`: it
 /// stays `QUEUED` with `attempts >= 1`, the dedup stays `QUEUED`, the AR is
 /// unchanged, and NO `payment_allocation` row is written (the apply rolled back).
@@ -655,7 +665,7 @@ async fn cap_reevaluated_at_apply_blocks() {
         .expect("unsettled allocate queues");
     assert!(matches!(queued, AllocationOutcome::Queued(_)));
 
-    // Settle PAY-CAP at only 500 ⇒ settled_minor=500 < the queued lump 1000. The
+    // Settle PAY-CAP at only 500 ⇒ settled=500 < the queued lump 1000. The
     // drain-on-settle applies the queue; at apply the cap (allocated 1000 > settled
     // 500) blocks it. The settle itself still succeeds (the drain swallows errors).
     settle_svc(&provider)
@@ -684,8 +694,11 @@ async fn cap_reevaluated_at_apply_blocks() {
         "the dedup stays QUEUED (nothing posted)"
     );
 
-    // Nothing applied: AR unchanged, no allocation row, allocated_minor still 0.
-    assert_eq!(ar_invoice_balance(&raw, &s, "INV-A").await, Some(1000));
+    // Nothing applied: AR unchanged, no allocation row, allocated still 0.
+    assert_eq!(
+        ar_invoice_balance(&raw, &s, "INV-A").await,
+        Some(text(1000))
+    );
     assert_eq!(count_allocations(&raw, &s, "PAY-CAP").await, 0);
     let repo = PaymentRepo::new(provider.clone());
     let row = repo
@@ -694,7 +707,8 @@ async fn cap_reevaluated_at_apply_blocks() {
         .unwrap()
         .expect("settlement row present");
     assert_eq!(
-        row.allocated_minor, 0,
+        row.allocated,
+        usd(0),
         "the blocked apply left allocated at 0"
     );
 }
@@ -845,11 +859,14 @@ async fn sweep_applies_seeded_settlement() {
     // Seed the settlement DIRECTLY (bypassing SettlementService → no drain runs),
     // so the queue row is still QUEUED when the sweep starts (the restart path).
     let scope_seed = scope.clone();
+    let provider_seed = provider.clone();
     provider
         .transaction(move |txn| {
             let scope = scope_seed.clone();
+            let provider_seed = provider_seed.clone();
             Box::pin(async move {
-                PaymentRepo::seed_settlement(txn, &scope, s.tenant, "PAY-SWEEP", "USD", 1000, 0)
+                PaymentRepo::new(provider_seed)
+                    .seed_settlement(txn, &scope, s.tenant, "PAY-SWEEP", &usd(1000), &usd(0))
                     .await
                     .map_err(lift)
             })
@@ -865,16 +882,16 @@ async fn sweep_applies_seeded_settlement() {
     // row is (correctly) blocked instead of applied.
     raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_account_balance \
-            (tenant_id, account_id, currency, account_class, normal_side, balance_minor) \
-         VALUES ('{}','{}','USD','UNALLOCATED','CR',1000)",
+            (tenant_id, account_id, currency, currency_scale, account_class, normal_side, balance) \
+         VALUES ('{}','{}','USD',2,'UNALLOCATED','CR','10')",
         s.tenant, s.unallocated
     )))
     .await
     .expect("seed unallocated account_balance");
     raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_unallocated_balance \
-            (tenant_id, payer_tenant_id, account_id, currency, balance_minor) \
-         VALUES ('{}','{}','{}','USD',1000)",
+            (tenant_id, payer_tenant_id, account_id, currency, currency_scale, balance) \
+         VALUES ('{}','{}','{}','USD',2,'10')",
         s.tenant, s.payer, s.unallocated
     )))
     .await
@@ -912,5 +929,5 @@ async fn sweep_applies_seeded_settlement() {
     assert_eq!(status, "POSTED");
     assert!(entry_id.is_some());
     assert_eq!(count_allocations(&raw, &s, "PAY-SWEEP").await, 1);
-    assert_eq!(ar_invoice_balance(&raw, &s, "INV-A").await, Some(0));
+    assert_eq!(ar_invoice_balance(&raw, &s, "INV-A").await, Some(text(0)));
 }
