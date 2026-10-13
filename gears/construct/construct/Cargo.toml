@@ -72,3 +72,4 @@ tower = { workspace = true, features = ["util"] }
 proptest = { workspace = true }
 tracing-test = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
+reqwest = { workspace = true }

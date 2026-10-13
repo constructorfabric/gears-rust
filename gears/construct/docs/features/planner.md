@@ -16,6 +16,7 @@
   - [Build the Plan](#build-the-plan)
   - [Run the Agent Loop](#run-the-agent-loop)
   - [Build the Prompt](#build-the-prompt)
+  - [Score the Planner](#score-the-planner)
 - [4. States (CDSL)](#4-states-cdsl)
 - [5. Definitions of Done](#5-definitions-of-done)
   - [Numbered Profile](#numbered-profile)
@@ -23,6 +24,7 @@
   - [Plan Building](#plan-building)
   - [Agent Loop](#agent-loop)
   - [Prompt](#prompt)
+  - [Reference Evaluation Set](#reference-evaluation-set)
 - [6. Acceptance Criteria](#6-acceptance-criteria)
 - [7. Non-Functional Considerations](#7-non-functional-considerations)
 
@@ -40,7 +42,8 @@
 The planner decides how a record changes the subject's profile. A language model proposes add, replace and remove
 steps through tools; the planner builds them into a plan in memory and writes nothing. This document covers the
 numbered profile the model sees, the plan tools with their checks, building the plan with its node keys and origin, the
-agent loop with its caps and drop events, and the prompt. The hand-off from intake and the rerun on a
+agent loop with its caps and drop events, the prompt, and the reference evaluation set that scores the planner. The
+hand-off from intake and the rerun on a
 write conflict follow in later changes.
 
 ### 1.2 Purpose
@@ -50,9 +53,8 @@ The model works on numbered values and plain property names, never on IDs
 (`cpt-cf-construct-principle-model-never-sees-ids`). The tools refuse a call that breaks a rule and tell the model
 why, so the plan holds only steps that fit the person types.
 
-**Out of scope**: the reference evaluation set that scores the prompt; the hand-off from Record Intake and the
-processing chain; the rerun on a write conflict; skipping a fact under an open review request (Review Queue); the
-profile read.
+**Out of scope**: the hand-off from Record Intake and the processing chain; the rerun on a write conflict; skipping a
+fact under an open review request (Review Queue); the profile read.
 
 **Requirements**: `cpt-cf-construct-fr-fact-decisions`
 
@@ -194,6 +196,29 @@ profile read.
    the model gets no ID of the source either (DESIGN: "It never gets an ID"). The rule is the same for every record
    type, so a new connector needs no Construct code - `inst-prompt-no-ids`
 
+### Score the Planner
+
+- [ ] `p1` - **ID**: `cpt-cf-construct-algo-planner-eval`
+
+1. [ ] - `p1` - The reference evaluation set is JSON files of cases in the crate, `tests/eval/`. A case has a name, a
+   starting profile of properties and values, one record, the expected decision per property, the values that must
+   not remain, and the values that must be held after the plan - `inst-eval-cases`
+2. [ ] - `p1` - A record is a user message, an assistant message or a fact candidate payload. The cases use invented
+   people only - `inst-eval-records`
+3. [ ] - `p1` - Each case is checked against the person types and its record type on every test run: a profile value
+   or a value that must be held fits its property's schema, a value that must not remain is in the profile and is not
+   also a value that must be held, and the payload fits its record type - `inst-eval-check`
+4. [ ] - `p1` - The planner runs on each case through the chat completions adapter against the model named by
+   `CONSTRUCT_EVAL_URL`, `CONSTRUCT_EVAL_MODEL` and `CONSTRUCT_EVAL_API_KEY`, with 10 rounds and 50 000 tokens. The run
+   is an ignored test, because it calls a model - `inst-eval-run`
+5. [ ] - `p1` - The decision per property comes from the plan: a replace, or a remove and an add of one property, is
+   `replace`; otherwise `add` or `remove`. A record is right when its decisions are the expected ones, no other
+   property changed, and every value that must be held is held. A dropped record is wrong - `inst-eval-decision`
+6. [ ] - `p1` - A contradicting pair is a value that must not remain and is still in the profile after the plan -
+   `inst-eval-contradiction`
+7. [ ] - `p1` - The run prints each wrong record and each contradicting pair, and fails below 95 % right records or
+   with any contradicting pair (PRD G2) - `inst-eval-target`
+
 ## 4. States (CDSL)
 
 None. A plan lives in memory for one planning run.
@@ -282,6 +307,26 @@ record input with the payload, its schema and the numbered profile, without an I
 `an_id_nested_in_a_list_of_objects_is_not_shown`, `each_example_in_the_instructions_gets_the_answer_it_shows` and
 `the_model_gets_the_record_and_the_profile_as_data_but_no_id`.
 
+### Reference Evaluation Set
+
+- [x] `p1` - **ID**: `cpt-cf-construct-dod-planner-eval`
+
+The system **MUST** ship a reference evaluation set with a runner that scores the planner's decisions and counts the
+contradicting pairs against the PRD G2 target.
+
+**Implements**:
+- `cpt-cf-construct-algo-planner-eval`
+
+**Touches**:
+- Code: `tests/planner_eval.rs`, `tests/eval/`
+
+**Verified by**: `every_case_fits_the_person_types_and_its_record_type`. The score itself comes from
+`the_planner_meets_the_decision_target`, run with
+`cargo test -p cf-gears-construct --test planner_eval -- --ignored --nocapture`.
+
+The reference model is `gpt-5.6-luna`. On 2026-10-15 three runs on it decided 99, 99 and 100 of the 100 records right,
+with no contradicting pair.
+
 ## 6. Acceptance Criteria
 
 - [ ] For a record and a profile, the planner builds a plan of add, replace and remove steps with node keys, the
@@ -289,6 +334,8 @@ record input with the payload, its schema and the numbered profile, without an I
 - [ ] No message or tool result sent to the model holds an ID.
 - [ ] A tool call that breaks a rule is refused with a reason, and the plan does not change.
 - [ ] A loop that hits a cap, or a failed model call, drops the record with a content-free event and gives no plan.
+- [ ] On the reference evaluation set, at least 95 % of records give the expected decisions, and no contradicting
+      pair remains.
 
 ## 7. Non-Functional Considerations
 

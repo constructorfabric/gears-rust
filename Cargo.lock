@@ -2548,6 +2548,7 @@ dependencies = [
  "inventory",
  "jsonschema",
  "proptest",
+ "reqwest",
  "sea-orm",
  "sea-orm-migration",
  "serde",
