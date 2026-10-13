@@ -138,14 +138,15 @@ pub const USER_RG_TYPE_CODE: &str = gts_id!("cf.core.rg.type.v1~cf.core.am.user.
 //     DB-level `CHECK (length(name) BETWEEN ...)` remains the backstop).
 //   * `conversion_request.v1~` -- registered via [`ConversionRequestV1`] below.
 //
-// Not on the registration list (no vendor-derived extensions planned):
-//   * `user_group.v1~` -- no consumer (the SDK constant was removed in
-//     this PR); the JSON file may be deletable separately.
+// Registered as Resource Group types (derived from `gts.cf.core.rg.type.v1~`,
+// see [`UserRgTypeV1`] and [`UserGroupRgTypeV1`] below): the user member
+// handle and the user-group container, with placement rules in `x-gts-traits`.
 
 // ---------------------------------------------------------------------------
 // AM resource type schema mirrors
 // ---------------------------------------------------------------------------
 
+use resource_group_sdk::gts::ResourceGroupTypeV1;
 use schemars::JsonSchema;
 use toolkit::gts::PluginV1;
 use toolkit_gts::{GtsTraitsSchema, gts_id, gts_type_schema};
@@ -210,6 +211,56 @@ pub struct UserV1 {
     #[schemars(length(min = 1, max = 255))]
     pub last_name: Option<String>,
 }
+
+// ---------------------------------------------------------------------------
+// Resource Group types (derived from `gts.cf.core.rg.type.v1~`)
+// ---------------------------------------------------------------------------
+
+/// RG type schema for the AM user **member handle**
+/// ([`USER_RG_TYPE_CODE`]): a type-registry placeholder that
+/// `add_membership` resolves against. AM never creates groups of this type,
+/// so it is root-capable with no parents and no members, and its group
+/// metadata is a closed empty object.
+///
+/// Placement values mirror the runtime registration in
+/// `account-management::domain::user_groups::registration`.
+#[derive(Default)]
+#[gts_type_schema(
+    dir_path = "schemas",
+    base = ResourceGroupTypeV1,
+    type_id = gts_id!("cf.core.rg.type.v1~cf.core.am.user.v1~"),
+    description = "Account Management user member handle (resource group type)",
+    properties = "",
+    traits = serde_json::json!({
+        "can_be_root": true,
+        "allowed_parent_types": [],
+        "allowed_membership_types": []
+    })
+)]
+pub struct UserRgTypeV1;
+
+/// RG type schema for the AM **user-group container**
+/// ([`USER_GROUP_RG_TYPE_CODE`]): root-capable, nestable under itself, and
+/// accepting AM users ([`USER_RG_TYPE_CODE`]) as members. Group metadata is a
+/// closed empty object (`docs/schemas/user_group.v1.schema.json` defines no
+/// Account Management specific metadata fields in v1).
+///
+/// Placement values mirror the runtime registration in
+/// `account-management::domain::user_groups::registration`.
+#[derive(Default)]
+#[gts_type_schema(
+    dir_path = "schemas",
+    base = ResourceGroupTypeV1,
+    type_id = gts_id!("cf.core.rg.type.v1~cf.core.am.user_group.v1~"),
+    description = "Account Management user group container (resource group type)",
+    properties = "",
+    traits = serde_json::json!({
+        "can_be_root": true,
+        "allowed_parent_types": [USER_GROUP_RG_TYPE_CODE],
+        "allowed_membership_types": [USER_RG_TYPE_CODE]
+    })
+)]
+pub struct UserGroupRgTypeV1;
 
 // ---------------------------------------------------------------------------
 // IdP provider plugin spec
@@ -790,3 +841,7 @@ mod sync_tests {
         assert_data_shape(&generated, &disk, TenantMetadataEnvelopeV1::<()>::TYPE_ID);
     }
 }
+
+#[cfg(test)]
+#[path = "gts_rg_tests.rs"]
+mod rg_type_gts_tests;

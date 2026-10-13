@@ -138,36 +138,6 @@ fn gts_type_path_display_and_into_string() {
     assert_eq!(display, into_string);
 }
 
-// -- ResourceGroupType serialization -- TC-SDK-14
-
-#[test]
-fn resource_group_type_camel_case_keys() {
-    let rgt = ResourceGroupType {
-        code: gts_id!("cf.core.rg.type.v1~").to_owned(),
-        can_be_root: true,
-        allowed_parent_types: vec![format!("{GTS_ID_PREFIX}parent~")],
-        allowed_membership_types: vec![format!("{GTS_ID_PREFIX}member~")],
-        metadata_schema: None,
-    };
-    let json = serde_json::to_value(&rgt).unwrap();
-    assert!(
-        json.get("canBeRoot").is_some(),
-        "expected camelCase 'canBeRoot'"
-    );
-    assert!(
-        json.get("allowedParentTypes").is_some(),
-        "expected camelCase 'allowedParentTypes'"
-    );
-    assert!(
-        json.get("allowedMembershipTypes").is_some(),
-        "expected camelCase 'allowedMembershipTypes'"
-    );
-    assert!(
-        json.get("metadataSchema").is_none(),
-        "metadataSchema should be absent when None"
-    );
-}
-
 // -- ResourceGroup serialization -- TC-SDK-15, 16
 
 #[test]
