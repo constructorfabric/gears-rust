@@ -9,6 +9,21 @@ release-plz updates this file in the Release PR.
 
 ## [Unreleased]
 
+### Added
+
+- `toolkit-auth`: lazy OAuth2 token acquisition via `Token::new_lazy()` and
+  async `Token::wait_ready()` with shared attempt results, retained acquisition
+  errors, and initial retry delays capped at 30 seconds.
+
+### Changed
+
+- `toolkit-auth`: rejected HTTP responses now return the non-exhaustive
+  `TokenError::HttpStatus { operation, status, .. }` variant instead of
+  `TokenError::Http(String)`. Existing matches on `Http(..)` still compile but
+  no longer catch response errors; handle `HttpStatus` as well or use
+  `TokenError::status()` to preserve error classification. `HttpOperation`
+  distinguishes discovery from token requests. Transport errors remain `Http`.
+
 ### Fixed
 
 - Resource-group filters accept quoted UUIDs and resolve membership GTS type paths

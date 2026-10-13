@@ -1,7 +1,7 @@
 use serde::Deserialize;
 use url::Url;
 
-use super::error::TokenError;
+use super::error::{HttpOperation, TokenError};
 
 /// Minimal subset of the `OpenID` Connect discovery document.
 ///
@@ -18,7 +18,7 @@ struct OidcDiscoveryDoc {
 ///
 /// # Errors
 ///
-/// Returns [`TokenError::Http`] if the discovery request fails or returns a
+/// Returns [`TokenError::Http`] or [`TokenError::HttpStatus`] if the discovery request fails or returns a
 /// non-success status.
 /// Returns [`TokenError::InvalidResponse`] if the response body cannot be
 /// parsed, the `token_endpoint` field is missing, or it is not a valid URL.
@@ -33,9 +33,9 @@ pub async fn discover_token_endpoint(
         .get(&discovery_url)
         .send()
         .await
-        .map_err(|e| TokenError::Http(crate::http_error::format_http_error(&e, "OIDC discovery")))?
+        .map_err(|e| TokenError::from_http(&e, HttpOperation::Discovery))?
         .error_for_status()
-        .map_err(|e| TokenError::Http(crate::http_error::format_http_error(&e, "OIDC discovery")))?
+        .map_err(|e| TokenError::from_http(&e, HttpOperation::Discovery))?
         .json()
         .await
         .map_err(|e| {
@@ -198,9 +198,8 @@ mod tests {
         assert!(
             matches!(
                 err,
-                TokenError::Http(ref msg)
-                    if msg.contains("OIDC discovery")
-                        && msg.contains("500")
+                TokenError::HttpStatus { operation: HttpOperation::Discovery, .. }
+                    if err.status() == Some(http::StatusCode::INTERNAL_SERVER_ERROR)
             ),
             "expected Http error with 500 status, got: {err}"
         );

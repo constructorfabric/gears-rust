@@ -19,7 +19,7 @@ struct TokenInner {
 
 /// Handle for obtaining `OAuth2` bearer tokens.
 ///
-/// Internally drives a [`token_watcher::TokenWatcher`] for background refresh
+/// Internally drives a `TokenWatcher` for background refresh
 /// and exposes lock-free reads via `ArcSwap` (same pattern as the JWKS key
 /// provider).
 ///
@@ -27,8 +27,8 @@ struct TokenInner {
 #[derive(Clone)]
 pub struct Token {
     inner: Arc<ArcSwap<TokenInner>>,
-    source_factory: Arc<dyn Fn() -> Result<OAuthTokenSource, TokenError> + Send + Sync>,
-    watcher_config: Arc<WatcherConfig>,
+    source: Arc<OAuthTokenSource>,
+    watcher_config: WatcherConfig,
 }
 
 impl fmt::Debug for Token {
@@ -46,41 +46,55 @@ impl Token {
     /// # Errors
     ///
     /// Returns [`TokenError::ConfigError`] if the config is invalid.
-    /// Returns [`TokenError::Http`] if the initial token fetch fails.
-    pub async fn new(mut config: OAuthClientConfig) -> Result<Self, TokenError> {
+    /// Returns [`TokenError::Http`] or [`TokenError::HttpStatus`] if acquisition fails.
+    pub async fn new(config: OAuthClientConfig) -> Result<Self, TokenError> {
+        let (source, watcher_config) = Self::prepare(&config)?;
+        let watcher = spawn_watcher(source.clone(), &watcher_config).await?;
+        Ok(Self::with_watcher(source, watcher_config, watcher))
+    }
+
+    /// Create a handle without making discovery or token requests.
+    ///
+    /// The first [`Self::get`] starts acquisition and returns
+    /// [`TokenError::Unavailable`] before the first attempt completes, then the
+    /// latest acquisition error until a token is cached. The watcher retries
+    /// failures with exponential backoff, then refreshes normally after success.
+    /// Clones share one watcher. Dropping the last handle cancels pending work.
+    /// Requires an active Tokio runtime, just like [`Self::new`].
+    ///
+    /// # Errors
+    /// Returns configuration or HTTP client construction errors immediately,
+    /// including [`TokenError::ConfigError`] when no Tokio runtime is active.
+    #[allow(clippy::needless_pass_by_value)] // Match new() and consume the credential config.
+    pub fn new_lazy(config: OAuthClientConfig) -> Result<Self, TokenError> {
+        tokio::runtime::Handle::try_current().map_err(|_| {
+            TokenError::ConfigError("Token::new_lazy requires an active Tokio runtime".into())
+        })?;
+        let (source, watcher_config) = Self::prepare(&config)?;
+        let watcher = TokenWatcher::spawn_lazy(source.clone(), watcher_config);
+        Ok(Self::with_watcher(source, watcher_config, watcher))
+    }
+
+    /// Validate configuration and build a token source without network I/O.
+    fn prepare(
+        config: &OAuthClientConfig,
+    ) -> Result<(OAuthTokenSource, WatcherConfig), TokenError> {
         config.validate()?;
+        let watcher_config = WatcherConfig::new(config.jitter_max, config.min_refresh_period)?;
+        Ok((OAuthTokenSource::new(config)?, watcher_config))
+    }
 
-        // Resolve issuer_url → token_endpoint via OIDC discovery (one-time).
-        if let Some(issuer_url) = config.issuer_url.take() {
-            let http_config = config
-                .http_config
-                .clone()
-                .unwrap_or_else(toolkit_http::HttpClientConfig::token_endpoint);
-            let client = toolkit_http::HttpClientBuilder::with_config(http_config)
-                .build()
-                .map_err(|e| {
-                    TokenError::Http(crate::http_error::format_http_error(&e, "OIDC discovery"))
-                })?;
-            let resolved = super::discovery::discover_token_endpoint(&client, &issuer_url).await?;
-            config.token_endpoint = Some(resolved);
-        }
-
-        let watcher_config = Arc::new(WatcherConfig::new(
-            config.jitter_max,
-            config.min_refresh_period,
-        )?);
-
-        let source = OAuthTokenSource::new(&config)?;
-        let watcher = spawn_watcher(source, &watcher_config).await?;
-
-        let source_factory: Arc<dyn Fn() -> Result<OAuthTokenSource, TokenError> + Send + Sync> =
-            Arc::new(move || OAuthTokenSource::new(&config));
-
-        Ok(Self {
+    /// Assemble a clonable handle sharing the watcher and discovery state.
+    fn with_watcher(
+        source: OAuthTokenSource,
+        config: WatcherConfig,
+        watcher: TokenWatcher,
+    ) -> Self {
+        Self {
             inner: Arc::new(ArcSwap::from_pointee(TokenInner { watcher })),
-            source_factory,
-            watcher_config,
-        })
+            source: Arc::new(source),
+            watcher_config: config,
+        }
     }
 
     /// Get the current bearer token.
@@ -94,13 +108,29 @@ impl Token {
     ///
     /// # Errors
     ///
-    /// Returns [`TokenError::Unavailable`] if the cached token has expired
-    /// (the background watcher has not yet refreshed it).
+    /// Returns [`TokenError::Unavailable`] while initial acquisition is pending
+    /// or if the cached token has expired. After failed initial acquisition,
+    /// returns the last acquisition error instead. For a lazy handle, this call starts
+    /// the watcher without waiting for network I/O.
     pub fn get(&self) -> Result<SecretString, TokenError> {
         let guard = self.inner.load();
-        let cached = guard.watcher.valid_token()?;
-        let raw = cached.access_token();
-        Ok(SecretString::new(raw))
+        guard.watcher.valid_token()
+    }
+
+    /// Wait for a usable token or the result of one shared acquisition attempt.
+    ///
+    /// Returns a valid cached token immediately. Otherwise starts lazy acquisition
+    /// and waits for the current or next scheduled attempt, including its backoff.
+    /// Each waiter receives that attempt's result even if another retry completes
+    /// before the waiter is polled again. Cancelling this future does not cancel
+    /// the shared watcher; callers may impose their own timeout.
+    ///
+    /// # Errors
+    /// Returns the acquisition error of the observed attempt, or
+    /// [`TokenError::Unavailable`] if the watcher stops or its token has expired.
+    pub async fn wait_ready(&self) -> Result<SecretString, TokenError> {
+        let inner = self.inner.load_full();
+        inner.watcher.wait_ready().await
     }
 
     /// Force-replace the internal watcher with a freshly-spawned one.
@@ -108,16 +138,14 @@ impl Token {
     /// Use this after receiving a 401 from a downstream service to immediately
     /// discard a potentially revoked token.
     ///
-    /// If recreating the source or the initial token fetch fails, a warning is
+    /// If fetching a replacement token fails, a warning is
     /// logged and the existing watcher is left in place.
     pub async fn invalidate(&self) {
-        let source = match (self.source_factory)() {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::warn!("OAuth2 token invalidation: failed to create source: {e}");
-                return;
-            }
-        };
+        // Share pending acquisition rather than starting a competing fetch.
+        if self.inner.load().watcher.start_if_pending() {
+            return;
+        }
+        let source = self.source.as_ref().clone();
 
         let watcher = match spawn_watcher(source, &self.watcher_config).await {
             Ok(w) => w,
@@ -136,7 +164,7 @@ async fn spawn_watcher(
     source: OAuthTokenSource,
     config: &WatcherConfig,
 ) -> Result<TokenWatcher, TokenError> {
-    TokenWatcher::spawn(source, config.clone()).await
+    TokenWatcher::spawn(source, *config).await
 }
 
 #[cfg(test)]
