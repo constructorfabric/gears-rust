@@ -2,7 +2,7 @@
 # @cpt-dod:cpt-cf-resource-group-dod-e2e-test-suite:p1
 """E2E integration seam tests for resource-group gear (Feature 0007).
 
-11 tests. One file. < 15 seconds. Zero flakes.
+14 tests. One file. < 15 seconds. Zero flakes.
 
 Each test guards a specific integration seam -- a point where two independently
 correct components can break when connected. If the seam is already covered by
@@ -26,10 +26,6 @@ def _groups(base: str) -> str:
     return f"{base}/resource-group/v1/groups"
 
 
-def _types(base: str) -> str:
-    return f"{base}/types-registry/v1/types"
-
-
 def _memberships(base: str) -> str:
     return f"{base}/resource-group/v1/memberships"
 
@@ -51,28 +47,6 @@ async def test_route_smoke_all_endpoints(
         h = rg_headers
 
         # --- Endpoints NOT covered by other seam tests ---
-
-        # GET /types -- list types, not exercised elsewhere
-        r = await c.get(_types(rg_base_url), headers=h)
-        assert r.status_code not in (404, 405), f"GET /types: {r.status_code}"
-
-        # GET /types/{code} -- get single type, not exercised elsewhere
-        type_data = await create_type("s1route")
-        type_code = type_data["code"]
-        r = await c.get(f"{_types(rg_base_url)}/{type_code}", headers=h)
-        assert r.status_code not in (404, 405), f"GET /types/{{code}}: {r.status_code}"
-
-        # PUT /types/{code} -- update type, not exercised elsewhere
-        r = await c.put(
-            f"{_types(rg_base_url)}/{type_code}", headers=h,
-            json={"code": type_code, "can_be_root": True},
-        )
-        assert r.status_code not in (404, 405), f"PUT /types/{{code}}: {r.status_code}"
-
-        # DELETE /types/{code} -- delete type, not exercised elsewhere
-        del_type = await create_type("s1del")
-        r = await c.delete(f"{_types(rg_base_url)}/{del_type['code']}", headers=h)
-        assert r.status_code not in (404, 405), f"DELETE /types/{{code}}: {r.status_code}"
 
         # DELETE /memberships/{group_id}/{type}/{id} -- not exercised elsewhere
         member_type = await create_type("s1mem", allowed_membership_types=[])
@@ -101,6 +75,31 @@ async def test_route_smoke_all_endpoints(
             f"{_groups(rg_base_url)}/{grp['id']}/ancestors", headers=h,
         )
         assert r.status_code not in (404, 405), f"GET /groups/{{id}}/ancestors: {r.status_code}"
+
+
+# ── S1b: Types come from Types Registry ─────────────────────────────────
+
+
+@pytest.mark.smoke
+async def test_group_type_resolved_via_types_registry(
+    rg_base_url, rg_headers, create_type, create_group,
+):
+    """Seam: RG -> Types Registry -- group types are resolved through TR.
+
+    A type registered in TR is usable for group creation (201); an
+    unregistered type code is rejected with 404 (TypeNotFound).
+    """
+    type_data = await create_type("s1tr")
+    group = await create_group(type_data["code"], "S1 TR Type")
+    assert group["type"] == type_data["code"]
+
+    missing = "gts.cf.core.rg.type.v1~x.e2etest._.neverregistered.v1~"
+    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as c:
+        r = await c.post(
+            _groups(rg_base_url), headers=rg_headers,
+            json={"type": missing, "name": "S1 Missing Type"},
+        )
+        assert r.status_code == 404, f"Unregistered type: {r.status_code} {r.text}"
 
 
 # ── S2: DTO roundtrip ───────────────────────────────────────────────────
