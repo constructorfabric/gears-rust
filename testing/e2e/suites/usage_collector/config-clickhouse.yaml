@@ -78,6 +78,10 @@ gears:
       listen_addr: "uds:///tmp/cf-gears-grpc-uc-ch-e2e"
 
   types-registry:
+    # resource-group reads its group types through the database-backed registry API.
+    database:
+      server: "sqlite_uc_e2e"
+      file: "types_registry.db"
     config: {}
 
   tenant-resolver:

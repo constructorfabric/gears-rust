@@ -12,7 +12,6 @@
 mod common;
 
 use std::sync::Arc;
-use toolkit_gts::GTS_ID_PREFIX;
 
 use async_trait::async_trait;
 use uuid::Uuid;
@@ -30,9 +29,8 @@ use toolkit_security::{PlatformSecurityContext, pep_properties};
 use resource_group::domain::group_service::{GroupService, QueryProfile};
 use resource_group::infra::storage::group_repo::GroupRepository;
 use resource_group::infra::storage::membership_repo::MembershipRepository;
-use resource_group::infra::storage::type_repo::TypeRepository;
 
-use common::{make_ctx, test_db};
+use common::{TestTypes, make_ctx, test_db};
 
 // ── Mock AuthZ: tenant-scoping (like static-authz-plugin) ───────────────
 
@@ -77,7 +75,8 @@ impl AuthZResolverApi for TenantScopingAuthZ {
 /// scoping via `In(OWNER_TENANT_ID)` to exercise the `AccessScope` path.
 fn make_group_service(
     db: Arc<DBProvider<DbError>>,
-) -> GroupService<GroupRepository, TypeRepository> {
+    types: &TestTypes,
+) -> GroupService<GroupRepository> {
     let authz: Arc<dyn AuthZResolverApi> = Arc::new(TenantScopingAuthZ);
     let enforcer = PolicyEnforcer::new(authz);
     GroupService::new(
@@ -85,27 +84,7 @@ fn make_group_service(
         QueryProfile::default(),
         enforcer,
         Arc::new(GroupRepository),
-        Arc::new(TypeRepository),
-        common::make_types_registry(),
-    )
-}
-
-/// Same wiring, but every metadata validation fails: the registry answers
-/// `Internal` rather than `NotFound`, so `validate_metadata_via_gts` returns
-/// an error instead of skipping. Used to check what a cross-tenant caller can
-/// learn from *which* error comes back.
-fn make_group_service_with_unavailable_registry(
-    db: Arc<DBProvider<DbError>>,
-) -> GroupService<GroupRepository, TypeRepository> {
-    let authz: Arc<dyn AuthZResolverApi> = Arc::new(TenantScopingAuthZ);
-    let enforcer = PolicyEnforcer::new(authz);
-    GroupService::new(
-        db,
-        QueryProfile::default(),
-        enforcer,
-        Arc::new(GroupRepository),
-        Arc::new(TypeRepository),
-        common::make_unavailable_types_registry(),
+        types.catalog(),
     )
 }
 
@@ -123,8 +102,8 @@ fn make_group_service_with_unavailable_registry(
 #[tokio::test]
 async fn tenant_isolation_list_groups() {
     let db = test_db().await;
-    let type_svc = common::make_type_service(db.clone());
-    let group_svc = make_group_service(db.clone());
+    let types = TestTypes::new();
+    let group_svc = make_group_service(db.clone(), &types);
 
     let tenant_a = Uuid::now_v7();
     let tenant_b = Uuid::now_v7();
@@ -132,7 +111,7 @@ async fn tenant_isolation_list_groups() {
     let ctx_b = make_ctx(tenant_b);
 
     // Create a type (types are not tenant-scoped)
-    let type_code = common::create_root_type(&type_svc, "dbiso").await.code;
+    let type_code = common::create_root_type(&types, "dbiso").code;
 
     // Tenant A creates 2 groups
     let ga1 = common::create_root_group(
@@ -202,8 +181,8 @@ async fn tenant_isolation_list_groups() {
 #[tokio::test]
 async fn tenant_isolation_get_group_cross_tenant_invisible() {
     let db = test_db().await;
-    let type_svc = common::make_type_service(db.clone());
-    let group_svc = make_group_service(db.clone());
+    let types = TestTypes::new();
+    let group_svc = make_group_service(db.clone(), &types);
 
     let tenant_a = Uuid::now_v7();
     let tenant_b = Uuid::now_v7();
@@ -211,7 +190,7 @@ async fn tenant_isolation_get_group_cross_tenant_invisible() {
     let ctx_b = make_ctx(tenant_b);
 
     // Create type
-    let type_code = common::create_root_type(&type_svc, "xget").await.code;
+    let type_code = common::create_root_type(&types, "xget").code;
 
     // Tenant A creates a group
     let ga =
@@ -231,8 +210,8 @@ async fn tenant_isolation_get_group_cross_tenant_invisible() {
 #[tokio::test]
 async fn tenant_isolation_hierarchy_scoped() {
     let db = test_db().await;
-    let type_svc = common::make_type_service(db.clone());
-    let group_svc = make_group_service(db.clone());
+    let types = TestTypes::new();
+    let group_svc = make_group_service(db.clone(), &types);
 
     let tenant_a = Uuid::now_v7();
     let tenant_b = Uuid::now_v7();
@@ -240,10 +219,8 @@ async fn tenant_isolation_hierarchy_scoped() {
     let ctx_b = make_ctx(tenant_b);
 
     // Create parent and child types
-    let parent_type = common::create_root_type(&type_svc, "hierp").await.code;
-    let child_type = common::create_child_type(&type_svc, "hierc", &[&parent_type], &[])
-        .await
-        .code;
+    let parent_type = common::create_root_type(&types, "hierp").code;
+    let child_type = common::create_child_type(&types, "hierc", &[&parent_type], &[]).code;
 
     // Tenant A: parent + child
     let parent =
@@ -314,15 +291,15 @@ async fn tenant_isolation_hierarchy_scoped() {
 #[tokio::test]
 async fn tenant_isolation_update_cross_tenant_blocked() {
     let db = test_db().await;
-    let type_svc = common::make_type_service(db.clone());
-    let group_svc = make_group_service(db.clone());
+    let types = TestTypes::new();
+    let group_svc = make_group_service(db.clone(), &types);
 
     let tenant_a = Uuid::now_v7();
     let tenant_b = Uuid::now_v7();
     let ctx_a = make_ctx(tenant_a);
     let ctx_b = make_ctx(tenant_b);
 
-    let type_code = common::create_root_type(&type_svc, "xupd").await.code;
+    let type_code = common::create_root_type(&types, "xupd").code;
 
     // Tenant A creates a group
     let ga = common::create_root_group(&group_svc, &ctx_a, &type_code, "A's group", tenant_a).await;
@@ -362,27 +339,29 @@ async fn tenant_isolation_update_cross_tenant_blocked() {
 ///
 /// `update_group` reads the row before it opens its transaction, and that
 /// read builds `system_scope()` -- it answers for a group in any tenant. If
-/// metadata validation ran on the strength of that read alone, a caller in
-/// tenant B would get a *validation* error for a group that exists in
+/// type/metadata resolution ran on the strength of that read alone, a caller in
+/// tenant B would get a *validation* (or 503) error for a group that exists in
 /// tenant A and a *not-found* for an id that exists nowhere: two different
 /// answers, which is exactly how one learns that the foreign group is real.
 /// The scoped read has to come first, so both cases answer the same way.
 #[tokio::test]
 async fn tenant_isolation_update_cross_tenant_is_not_an_existence_oracle() {
     let db = test_db().await;
-    let type_svc = common::make_type_service(db.clone());
-    let group_svc = make_group_service(db.clone());
-    // Every metadata validation on this one fails, so the only thing that can
-    // keep the two cases indistinguishable is the order of the two reads.
-    let oracle_svc = make_group_service_with_unavailable_registry(db.clone());
+    let types = TestTypes::new();
+    let group_svc = make_group_service(db.clone(), &types);
 
     let tenant_a = Uuid::now_v7();
     let tenant_b = Uuid::now_v7();
     let ctx_a = make_ctx(tenant_a);
     let ctx_b = make_ctx(tenant_b);
 
-    let type_code = common::create_root_type(&type_svc, "xoracle").await.code;
+    let type_code = common::create_root_type(&types, "xoracle").code;
     let ga = common::create_root_group(&group_svc, &ctx_a, &type_code, "A's group", tenant_a).await;
+    // From here on every catalog read fails (Types Registry unavailable), so the
+    // only thing that can keep the two cases indistinguishable is that the
+    // scoped read runs before anything that touches the catalog.
+    types.fail_reads();
+    let oracle_svc = &group_svc;
 
     let req = || resource_group_sdk::UpdateGroupRequest {
         name: "Probe".to_owned(),
@@ -421,15 +400,15 @@ async fn tenant_isolation_update_cross_tenant_is_not_an_existence_oracle() {
 #[tokio::test]
 async fn tenant_isolation_delete_cross_tenant_blocked() {
     let db = test_db().await;
-    let type_svc = common::make_type_service(db.clone());
-    let group_svc = make_group_service(db.clone());
+    let types = TestTypes::new();
+    let group_svc = make_group_service(db.clone(), &types);
 
     let tenant_a = Uuid::now_v7();
     let tenant_b = Uuid::now_v7();
     let ctx_a = make_ctx(tenant_a);
     let ctx_b = make_ctx(tenant_b);
 
-    let type_code = common::create_root_type(&type_svc, "xdel").await.code;
+    let type_code = common::create_root_type(&types, "xdel").code;
 
     // Tenant A creates a group
     let ga = common::create_root_group(
@@ -457,6 +436,37 @@ async fn tenant_isolation_delete_cross_tenant_blocked() {
         del.is_ok(),
         "Tenant A should be able to delete their own group"
     );
+}
+
+/// A caller denied by `AuthZ` must get the denial, not a 503, even when the
+/// Types Registry is down: on create the catalog is read only after the
+/// `AuthZ` gate, so an unauthorized caller learns nothing about registry health.
+#[tokio::test]
+async fn denied_create_does_not_reach_unavailable_catalog() {
+    let db = test_db().await;
+    let types = TestTypes::new();
+    let type_code = common::create_root_type(&types, "denyfirst").code;
+    types.fail_reads();
+    let svc = common::make_group_service_deny(db.clone(), &types);
+
+    let tenant = Uuid::now_v7();
+    let err = svc
+        .create_group(
+            &make_ctx(tenant),
+            resource_group_sdk::CreateGroupRequest::new(type_code, "Denied".to_owned()),
+            tenant,
+        )
+        .await
+        .expect_err("denied caller must not create");
+
+    assert!(
+        matches!(
+            err,
+            resource_group::domain::error::DomainError::AccessDenied { .. }
+        ),
+        "denied caller must get AccessDenied, not a registry error: {err}"
+    );
+    assert_eq!(types.batch_get_calls(), 0, "catalog must not be read");
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -560,44 +570,16 @@ async fn group_based_in_group_predicate_against_groups_fails_closed() {
 #[tokio::test]
 async fn group_based_membership_data_correctly_stored() {
     let db = test_db().await;
-    let type_svc = common::make_type_service(db.clone());
-    let group_svc = make_group_service(db.clone());
+    let types = TestTypes::new();
+    let group_svc = make_group_service(db.clone(), &types);
 
     let tenant = Uuid::now_v7();
     let ctx = make_ctx(tenant);
 
     // Create types: project (root, allows "task" members) and task
-    let project_type = format!(
-        "{GTS_ID_PREFIX}cf.core.rg.type.v1~x.test.proj.i{}.v1~",
-        Uuid::now_v7().as_simple()
-    );
-    let task_type = format!(
-        "{GTS_ID_PREFIX}cf.core.rg.type.v1~x.test.task.i{}.v1~",
-        Uuid::now_v7().as_simple()
-    );
-
-    // Create task type first (project references it in allowed_membership_types)
-    type_svc
-        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
-            code: task_type.clone(),
-            can_be_root: true,
-            allowed_parent_types: vec![],
-            allowed_membership_types: vec![],
-            metadata_schema: None,
-        })
-        .await
-        .expect("create task type");
-
-    type_svc
-        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
-            code: project_type.clone(),
-            can_be_root: true,
-            allowed_parent_types: vec![],
-            allowed_membership_types: vec![task_type.clone()],
-            metadata_schema: None,
-        })
-        .await
-        .expect("create project type");
+    let task_type = types.new_member_type("task");
+    let project_type =
+        common::create_root_type_with_memberships(&types, "proj", &[&task_type]).code;
 
     // Create ProjectA and ProjectB
     let project_a = group_svc
@@ -628,7 +610,7 @@ async fn group_based_membership_data_correctly_stored() {
         db.clone(),
         enforcer,
         Arc::new(GroupRepository),
-        Arc::new(TypeRepository),
+        types.catalog(),
         Arc::new(MembershipRepository),
     );
 

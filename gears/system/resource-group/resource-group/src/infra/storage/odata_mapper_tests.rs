@@ -1,16 +1,6 @@
 // Created: 2026-04-16 by Constructor Tech
 use super::*;
 
-// TC-ODATA-06: TypeODataMapper field -> column
-#[test]
-fn type_odata_mapper_field_to_column() {
-    let col = TypeODataMapper::map_field(TypeFilterField::Code);
-    assert!(
-        matches!(col, TypeColumn::SchemaId),
-        "Expected TypeColumn::SchemaId, got: {col:?}"
-    );
-}
-
 // TC-ODATA-07: GroupODataMapper field -> column
 #[test]
 fn group_odata_mapper_field_to_column() {
@@ -87,4 +77,21 @@ fn membership_odata_mapper_field_to_column() {
         ),
         "ResourceId -> ResourceId"
     );
+}
+
+// `type` / `resource_type` are Registry References (UUIDs) in storage: no
+// meaningful order, so `$orderby` on them must be rejected.
+#[test]
+fn type_fields_are_not_orderable() {
+    assert!(!GroupODataMapper::is_orderable(GroupFilterField::Type));
+    assert!(GroupODataMapper::is_orderable(GroupFilterField::Name));
+    assert!(!HierarchyODataMapper::is_orderable(
+        HierarchyFilterField::Type
+    ));
+    assert!(!MembershipODataMapper::is_orderable(
+        MembershipFilterField::ResourceType
+    ));
+    assert!(MembershipODataMapper::is_orderable(
+        MembershipFilterField::ResourceId
+    ));
 }

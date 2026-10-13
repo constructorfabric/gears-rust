@@ -12,9 +12,8 @@
 //! `toolkit_db::secure::error` and is exercised there.
 use sea_orm::DbErr;
 
-use super::{FK_RESOURCE_GROUP_PARENT, map_insert_error};
+use super::{FK_RESOURCE_GROUP_PARENT, UQ_RG_TENANT_ROOT, map_insert_error, map_update_error};
 use crate::domain::error::DomainError;
-use crate::infra::storage::FK_RG_GTS_TYPE;
 use toolkit_db::secure::ScopeError;
 
 fn fk_violation(constraint: &str) -> ScopeError {
@@ -52,27 +51,6 @@ fn fk_resource_group_parent_maps_to_group_not_found_by_parent_id() {
 }
 
 #[test]
-fn fk_rg_gts_type_is_not_reported_as_group_not_found() {
-    // `fk_rg_gts_type` fails when a concurrent `delete_type` removes the type
-    // between resolution and insert -- a different resource and a different
-    // cause than a missing parent, so this must not be answered with
-    // `GroupNotFound`.
-    let id = uuid::Uuid::now_v7();
-    let parent_id = uuid::Uuid::now_v7();
-
-    let err = map_insert_error(&fk_violation(FK_RG_GTS_TYPE), id, Some(parent_id));
-
-    assert!(
-        !matches!(err, DomainError::GroupNotFound { .. }),
-        "fk_rg_gts_type must not be mistaken for a missing parent, got: {err}"
-    );
-    assert!(
-        matches!(err, DomainError::Database(_)),
-        "expected a database error, got: {err}"
-    );
-}
-
-#[test]
 fn fk_resource_group_parent_without_a_parent_id_stays_a_database_error() {
     // A root group has no `parent_id` to name. `fk_resource_group_parent`
     // firing anyway would be a contradiction in terms, not a case this
@@ -104,4 +82,49 @@ fn unique_violation_maps_to_group_already_exists_by_inserted_id() {
         }
         other => panic!("expected GroupAlreadyExists, got: {other}"),
     }
+}
+
+fn tenant_root_violation_pg() -> ScopeError {
+    ScopeError::Db(DbErr::Custom(format!(
+        "error returned from database: duplicate key value violates unique constraint \
+         \"{UQ_RG_TENANT_ROOT}\""
+    )))
+}
+
+fn tenant_root_violation_sqlite() -> ScopeError {
+    ScopeError::Db(DbErr::Custom(
+        "error returned from database: UNIQUE constraint failed: resource_group.is_tenant"
+            .to_owned(),
+    ))
+}
+
+#[test]
+fn tenant_root_unique_violation_maps_to_conflict_on_insert() {
+    for violation in [tenant_root_violation_pg(), tenant_root_violation_sqlite()] {
+        let err = map_insert_error(&violation, uuid::Uuid::now_v7(), None);
+        assert!(
+            matches!(err, DomainError::Conflict { .. }),
+            "expected Conflict, got: {err}"
+        );
+    }
+}
+
+#[test]
+fn tenant_root_unique_violation_maps_to_conflict_on_update() {
+    for violation in [tenant_root_violation_pg(), tenant_root_violation_sqlite()] {
+        let err = map_update_error(&violation);
+        assert!(
+            matches!(err, DomainError::Conflict { .. }),
+            "expected Conflict, got: {err}"
+        );
+    }
+}
+
+#[test]
+fn other_update_failures_stay_database_errors() {
+    let err = map_update_error(&unique_violation());
+    assert!(
+        matches!(err, DomainError::Database(_)),
+        "expected a database error, got: {err}"
+    );
 }

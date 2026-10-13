@@ -26,9 +26,7 @@
 //! |---|------------|------------|--------|
 //! | 1 | move A→B   | move B→A   | no cycle committed |
 //! | 2 | create child | move parent | closure consistent |
-//! | 3 | two `create_type` same code | | exactly one 409 |
 //! | 4 | non-force delete | create child | FK blocks create |
-//! | 5 | `delete_type` | `create_group` of type | RESTRICT blocks |
 //! | 6 | `add_membership` (tenant A) | `add_membership` (tenant B), same resource | exactly one commits, the other gets a clean `TenantIncompatibility` -- not a bare DB error |
 //! | 7 | `remove_membership` x2, same resource | | the resource is free for another tenant once its last membership is gone |
 //! | 8 | tenant check + membership insert, forced overlap at `SERIALIZABLE` | | SSI cancels one side; the resource ends up owned by one tenant |
@@ -41,15 +39,13 @@ use std::sync::Arc;
 use resource_group::domain::error::DomainError;
 use resource_group::domain::group_service::GroupService;
 use resource_group::domain::repo::MembershipRepositoryTrait;
-use resource_group::domain::type_service::TypeService;
 use resource_group::infra::storage::entity::resource_group_membership::{
     self as membership_entity, Entity as MembershipEntity,
 };
 use resource_group::infra::storage::group_repo::GroupRepository;
 use resource_group::infra::storage::membership_repo::MembershipRepository;
 use resource_group::infra::storage::migrations::Migrator;
-use resource_group::infra::storage::type_repo::TypeRepository;
-use resource_group_sdk::models::{CreateGroupRequest, CreateTypeRequest, UpdateTypeRequest};
+use resource_group_sdk::models::CreateGroupRequest;
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 use sea_orm_migration::MigratorTrait;
 use testcontainers::{ImageExt, runners::AsyncRunner};
@@ -127,24 +123,12 @@ fn make_ctx(tenant_id: Uuid) -> SecurityContext {
         .expect("valid SecurityContext")
 }
 
-fn type_code(suffix: &str) -> String {
-    format!(
-        "{}x.test.{}.i{}.v1~",
-        toolkit_gts::gts_id!("cf.core.rg.type.v1~"),
-        suffix,
-        Uuid::now_v7().as_simple()
-    )
-}
-
 fn make_services(
     db: Arc<DBProvider<DbError>>,
-) -> (
-    TypeService<TypeRepository>,
-    GroupService<GroupRepository, TypeRepository>,
-) {
-    let type_svc = common::make_type_service(db.clone());
-    let group_svc = common::make_group_service(db);
-    (type_svc, group_svc)
+) -> (common::TestTypes, GroupService<GroupRepository>) {
+    let types = common::TestTypes::new();
+    let group_svc = common::make_group_service(db, &types);
+    (types, group_svc)
 }
 
 /// Render a fallible operation's outcome for a diagnostic log line without
@@ -168,35 +152,10 @@ async fn concurrent_move_a_to_b_and_b_to_a() {
 
     let tenant_id = Uuid::now_v7();
     let ctx = make_ctx(tenant_id);
-    let (type_svc, group_svc) = make_services(fix.db.clone());
+    let (types, group_svc) = make_services(fix.db.clone());
 
-    let rt = type_svc
-        .create_type_unscoped(CreateTypeRequest {
-            code: type_code("mvab"),
-            can_be_root: true,
-            allowed_parent_types: vec![],
-            allowed_membership_types: vec![],
-            metadata_schema: None,
-        })
-        .await
-        .expect("create type");
-
-    // A and B below are both of this type and need to become each other's
-    // parent, so the type must allow itself as a parent. It cannot list
-    // itself at creation (the row does not exist yet for `resolve_ids` to
-    // find), so this is a follow-up update against the now-existing row.
-    let rt = type_svc
-        .update_type_unscoped(
-            &rt.code,
-            UpdateTypeRequest {
-                can_be_root: rt.can_be_root,
-                allowed_parent_types: vec![rt.code.clone()],
-                allowed_membership_types: rt.allowed_membership_types.clone(),
-                metadata_schema: None,
-            },
-        )
-        .await
-        .expect("allow type to parent itself");
+    // The type allows itself as a parent, so groups of it nest under each other.
+    let rt = common::create_self_parenting_type(&types, "mvab");
 
     let root = group_svc
         .create_group(
@@ -261,35 +220,10 @@ async fn concurrent_create_child_and_move_parent() {
 
     let tenant_id = Uuid::now_v7();
     let ctx = make_ctx(tenant_id);
-    let (type_svc, group_svc) = make_services(fix.db.clone());
+    let (types, group_svc) = make_services(fix.db.clone());
 
-    let rt = type_svc
-        .create_type_unscoped(CreateTypeRequest {
-            code: type_code("ccmp"),
-            can_be_root: true,
-            allowed_parent_types: vec![],
-            allowed_membership_types: vec![],
-            metadata_schema: None,
-        })
-        .await
-        .expect("create type");
-
-    // `parent` and `child` below nest under groups of this same type, so the
-    // type must allow itself as a parent. It cannot list itself at creation
-    // (the row does not exist yet for `resolve_ids` to find), so this is a
-    // follow-up update against the now-existing row.
-    let rt = type_svc
-        .update_type_unscoped(
-            &rt.code,
-            UpdateTypeRequest {
-                can_be_root: rt.can_be_root,
-                allowed_parent_types: vec![rt.code.clone()],
-                allowed_membership_types: rt.allowed_membership_types.clone(),
-                metadata_schema: None,
-            },
-        )
-        .await
-        .expect("allow type to parent itself");
+    // The type allows itself as a parent, so groups of it nest under each other.
+    let rt = common::create_self_parenting_type(&types, "ccmp");
 
     let root = group_svc
         .create_group(
@@ -333,50 +267,6 @@ async fn concurrent_create_child_and_move_parent() {
 }
 
 // -----------------------------------------------------------------------
-// 3. two concurrent create_type of same code → 409
-// -----------------------------------------------------------------------
-#[tokio::test]
-async fn concurrent_create_type_same_code_returns_one_409() {
-    let Some(fix) = pg_fixture().await else {
-        return;
-    };
-
-    let (type_svc, _) = make_services(fix.db.clone());
-    let code = type_code("dup");
-
-    let req = CreateTypeRequest {
-        code: code.clone(),
-        can_be_root: true,
-        allowed_parent_types: vec![],
-        allowed_membership_types: vec![],
-        metadata_schema: None,
-    };
-
-    let (r1, r2) = tokio::join!(
-        type_svc.create_type_unscoped(req.clone()),
-        type_svc.create_type_unscoped(req),
-    );
-
-    match (&r1, &r2) {
-        (Ok(_), Ok(_)) => panic!("both creates succeeded -- duplicate committed!"),
-        (Err(e1), Err(e2)) => {
-            let m = format!("{e1}{e2}");
-            assert!(
-                m.contains("already exists"),
-                "expected 'already exists', got: {e1} / {e2}"
-            );
-        }
-        (Ok(t), Err(e)) | (Err(e), Ok(t)) => {
-            assert_eq!(t.code, code);
-            assert!(
-                format!("{e}").contains("already exists"),
-                "expected 'already exists', got: {e}"
-            );
-        }
-    }
-}
-
-// -----------------------------------------------------------------------
 // 4. non-force delete vs concurrent create child
 // -----------------------------------------------------------------------
 #[tokio::test]
@@ -387,35 +277,10 @@ async fn concurrent_non_force_delete_and_create_child() {
 
     let tenant_id = Uuid::now_v7();
     let ctx = make_ctx(tenant_id);
-    let (type_svc, group_svc) = make_services(fix.db.clone());
+    let (types, group_svc) = make_services(fix.db.clone());
 
-    let rt = type_svc
-        .create_type_unscoped(CreateTypeRequest {
-            code: type_code("nfdel"),
-            can_be_root: true,
-            allowed_parent_types: vec![],
-            allowed_membership_types: vec![],
-            metadata_schema: None,
-        })
-        .await
-        .expect("create type");
-
-    // `Orphan` below nests under `root`, a group of this same type, so the
-    // type must allow itself as a parent. It cannot list itself at creation
-    // (the row does not exist yet for `resolve_ids` to find), so this is a
-    // follow-up update against the now-existing row.
-    let rt = type_svc
-        .update_type_unscoped(
-            &rt.code,
-            UpdateTypeRequest {
-                can_be_root: rt.can_be_root,
-                allowed_parent_types: vec![rt.code.clone()],
-                allowed_membership_types: rt.allowed_membership_types.clone(),
-                metadata_schema: None,
-            },
-        )
-        .await
-        .expect("allow type to parent itself");
+    // The type allows itself as a parent, so groups of it nest under each other.
+    let rt = common::create_self_parenting_type(&types, "nfdel");
 
     let root = group_svc
         .create_group(
@@ -487,60 +352,6 @@ async fn concurrent_non_force_delete_and_create_child() {
 }
 
 // -----------------------------------------------------------------------
-// 5. delete_type vs create_group of that type
-// -----------------------------------------------------------------------
-#[tokio::test]
-async fn concurrent_delete_type_and_create_group() {
-    let Some(fix) = pg_fixture().await else {
-        return;
-    };
-
-    let tenant_id = Uuid::now_v7();
-    let ctx = make_ctx(tenant_id);
-    let (type_svc, group_svc) = make_services(fix.db.clone());
-
-    let rt = type_svc
-        .create_type_unscoped(CreateTypeRequest {
-            code: type_code("deltp"),
-            can_be_root: true,
-            allowed_parent_types: vec![],
-            allowed_membership_types: vec![],
-            metadata_schema: None,
-        })
-        .await
-        .expect("create type");
-
-    let (del_res, create_res) = tokio::join!(
-        type_svc.delete_type(&ctx, &rt.code),
-        group_svc.create_group(
-            &ctx,
-            CreateGroupRequest::new(rt.code.clone(), "Race".to_owned()),
-            tenant_id
-        ),
-    );
-
-    match (&del_res, &create_res) {
-        (Ok(()), Ok(_)) => {
-            panic!("both delete_type and create_group succeeded -- type in use but removed!")
-        }
-        (Err(e1), Err(e2)) => {
-            let m = format!("{e1}{e2}");
-            assert!(
-                m.contains("conflict") || m.contains("references") || m.contains("not found"),
-                "expected conflict/references, got: {e1} / {e2}"
-            );
-        }
-        (Ok(()), Err(e)) | (Err(e), Ok(_)) => {
-            let m = format!("{e}");
-            assert!(
-                m.contains("conflict") || m.contains("references") || m.contains("not found"),
-                "expected conflict/references/not_found, got: {e}"
-            );
-        }
-    }
-}
-
-// -----------------------------------------------------------------------
 // 6. add_membership from two tenants on the same resource
 // -----------------------------------------------------------------------
 #[tokio::test]
@@ -553,30 +364,13 @@ async fn concurrent_add_membership_from_two_tenants_claims_exactly_one() {
     let tenant_b = Uuid::now_v7();
     let ctx_a = make_ctx(tenant_a);
     let ctx_b = make_ctx(tenant_b);
-    let (type_svc, group_svc) = make_services(fix.db.clone());
-    let membership_svc = common::make_membership_service(fix.db.clone());
+    let (types, group_svc) = make_services(fix.db.clone());
+    let membership_svc = common::make_membership_service(fix.db.clone(), &types);
 
-    let member_type = type_svc
-        .create_type_unscoped(CreateTypeRequest {
-            code: type_code("addmbr"),
-            can_be_root: true,
-            allowed_parent_types: vec![],
-            allowed_membership_types: vec![],
-            metadata_schema: None,
-        })
-        .await
-        .expect("create member type");
+    let member_type = common::create_root_type(&types, "addmbr");
 
-    let group_type = type_svc
-        .create_type_unscoped(CreateTypeRequest {
-            code: type_code("addgrp"),
-            can_be_root: true,
-            allowed_parent_types: vec![],
-            allowed_membership_types: vec![member_type.code.clone()],
-            metadata_schema: None,
-        })
-        .await
-        .expect("create group type");
+    let group_type =
+        common::create_root_type_with_memberships(&types, "addgrp", &[&member_type.code]);
 
     let group_a = group_svc
         .create_group(
@@ -651,30 +445,13 @@ async fn concurrent_removals_free_the_resource_for_another_tenant() {
     let tenant_b = Uuid::now_v7();
     let ctx_a = make_ctx(tenant_a);
     let ctx_b = make_ctx(tenant_b);
-    let (type_svc, group_svc) = make_services(fix.db.clone());
-    let membership_svc = common::make_membership_service(fix.db.clone());
+    let (types, group_svc) = make_services(fix.db.clone());
+    let membership_svc = common::make_membership_service(fix.db.clone(), &types);
 
-    let member_type = type_svc
-        .create_type_unscoped(CreateTypeRequest {
-            code: type_code("relmbr"),
-            can_be_root: true,
-            allowed_parent_types: vec![],
-            allowed_membership_types: vec![],
-            metadata_schema: None,
-        })
-        .await
-        .expect("create member type");
+    let member_type = common::create_root_type(&types, "relmbr");
 
-    let group_type = type_svc
-        .create_type_unscoped(CreateTypeRequest {
-            code: type_code("relgrp"),
-            can_be_root: true,
-            allowed_parent_types: vec![],
-            allowed_membership_types: vec![member_type.code.clone()],
-            metadata_schema: None,
-        })
-        .await
-        .expect("create group type");
+    let group_type =
+        common::create_root_type_with_memberships(&types, "relgrp", &[&member_type.code]);
 
     // Two groups under the same tenant, both linked to the same resource --
     // ownership is per tenant, not per group, so both adds succeed.
@@ -766,29 +543,12 @@ async fn run_first_membership_overlap(fix: &PgFixture, config: TxConfig) -> Over
     let tenant_b = Uuid::now_v7();
     let ctx_a = make_ctx(tenant_a);
     let ctx_b = make_ctx(tenant_b);
-    let (type_svc, group_svc) = make_services(fix.db.clone());
+    let (types, group_svc) = make_services(fix.db.clone());
 
-    let member_type = type_svc
-        .create_type_unscoped(CreateTypeRequest {
-            code: type_code("ovlmbr"),
-            can_be_root: true,
-            allowed_parent_types: vec![],
-            allowed_membership_types: vec![],
-            metadata_schema: None,
-        })
-        .await
-        .expect("create member type");
+    let member_type = common::create_root_type(&types, "ovlmbr");
 
-    let group_type = type_svc
-        .create_type_unscoped(CreateTypeRequest {
-            code: type_code("ovlgrp"),
-            can_be_root: true,
-            allowed_parent_types: vec![],
-            allowed_membership_types: vec![member_type.code.clone()],
-            metadata_schema: None,
-        })
-        .await
-        .expect("create group type");
+    let group_type =
+        common::create_root_type_with_memberships(&types, "ovlgrp", &[&member_type.code]);
 
     let mut group_ids = Vec::new();
     for (ctx, tenant, name) in [(&ctx_a, tenant_a, "A"), (&ctx_b, tenant_b, "B")] {
@@ -804,11 +564,7 @@ async fn run_first_membership_overlap(fix: &PgFixture, config: TxConfig) -> Over
     }
     let (group_a, group_b) = (group_ids[0], group_ids[1]);
 
-    let conn = fix.db.conn().expect("conn");
-    let gts_type_id: i16 = TypeRepository::resolve_id(&conn, &member_type.code)
-        .await
-        .expect("resolve type id")
-        .expect("type must exist");
+    let gts_type_id: Uuid = types.uuid_of(&member_type.code).await;
 
     let resource_id = "overlap-res".to_owned();
     let db = fix.db.db();

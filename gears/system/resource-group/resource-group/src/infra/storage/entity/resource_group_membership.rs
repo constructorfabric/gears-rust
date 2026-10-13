@@ -12,7 +12,7 @@ pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
     pub group_id: Uuid,
     #[sea_orm(primary_key, auto_increment = false)]
-    pub gts_type_id: i16,
+    pub gts_type_id: Uuid,
     #[sea_orm(primary_key, auto_increment = false)]
     pub resource_id: String,
     pub created_at: OffsetDateTime,
