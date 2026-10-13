@@ -700,7 +700,7 @@ mod no_seed_startup_tests {
         );
 
         // Initialize the actual Resource Group gear so AM resolves its normal
-        // production dependencies and performs user-group type registration.
+        // production dependencies.
         let resource_group_gear = resource_group::gear::ResourceGroup::default();
         let resource_group_ctx = context(
             "resource-group",
