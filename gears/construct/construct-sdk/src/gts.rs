@@ -1,4 +1,5 @@
-//! The connector record types Construct takes at intake.
+//! The GTS type ids of Construct: the connector record types it takes at intake, and the ids of its four person
+//! types, whose schemas are in `person_types`.
 //!
 //! The schemas under `schemas/` are byte-for-byte copies of the connector
 //! boundary schemas in rolos-cyber (`docs/construct/GTS/schemas/`, ADR 0003),
@@ -10,6 +11,19 @@
 //! @cpt-dod:cpt-cf-construct-dod-record-intake-types:p1
 
 use toolkit_gts::{InventoryTypeSchema, gts_id};
+
+/// A person's identity: names, external ids, public profiles, location, background.
+pub const IDENTITY_TYPE: &str =
+    gts_id!("cf.core.graph.node.v1~cf.core.graph.owned_node.v1~cf.construct.person.identity.v1~");
+/// A person's roles: current role, education, programme, affiliations and work history.
+pub const ROLE_TYPE: &str =
+    gts_id!("cf.core.graph.node.v1~cf.core.graph.owned_node.v1~cf.construct.person.role.v1~");
+/// A person's skills: skills, languages, research areas, publications, awards and research metrics.
+pub const SKILL_TYPE: &str =
+    gts_id!("cf.core.graph.node.v1~cf.core.graph.owned_node.v1~cf.construct.person.skill.v1~");
+/// How a person wants to be served: language, format, tone, accessibility, constraints and goals.
+pub const PREFERENCE_TYPE: &str =
+    gts_id!("cf.core.graph.node.v1~cf.core.graph.owned_node.v1~cf.construct.person.preference.v1~");
 
 /// The abstract base every connector record type derives from. It fixes the
 /// envelope: `type`, `provenance`, `version`, `observed_at`, the optional

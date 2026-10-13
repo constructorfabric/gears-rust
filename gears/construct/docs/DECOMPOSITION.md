@@ -488,7 +488,7 @@ The DESIGN's largest component, subject control, is split across four features. 
   - The profile entity: the subject node as root, and entities that hang from it
   - Writing the profile's root node, including creating it for a new subject, in the same single write as the facts. How two first writes for the same new subject are kept from both succeeding is settled in the FEATURE document of the Profile Writer, as the DESIGN does not specify it
   - Finding the new root key of a profile created after an erasure; the Profile Writer owns it, and the mechanism is left to the feature design
-  - Using Construct's GTS person types for the profile's categories and facts, registered in the types registry and with graph storage (`cpt-cf-construct-contract-person-types`)
+  - Using Construct's GTS person types for the profile's categories and facts, registered with graph storage (`cpt-cf-construct-contract-person-types`)
   - Re-admission and a new write for a value without a planner, on a conflict
   - Making the next read return the stored value and never a replaced or removed one
   - Using graph storage's compare-and-set (a write that succeeds only while a node still has the expected version) as it is (`cpt-cf-construct-adr-graph-storage-as-is`)

@@ -457,7 +457,7 @@ The guardrails **MUST** find special-category content on the reference test set 
 - [ ] `p1` - **ID**: `cpt-cf-construct-contract-person-types`
 
 - **Direction**: provided by Construct
-- **Protocol/Format**: GTS types for the categories of each kind of subject's profile and the facts in them, registered in the types registry and with graph storage. This release ships the person types: `gts.cf.construct.person.identity.v1~`, `gts.cf.construct.person.roles.v1~`, `gts.cf.construct.person.skills.v1~` and `gts.cf.construct.person.preferences.v1~`. A person's subject ID is the UUID of the platform user, `gts.cf.core.am.user.v1~`
+- **Protocol/Format**: GTS types for the categories of each kind of subject's profile and the facts in them, registered with graph storage. This release ships the person types. Each derives from graph storage's owned node, so its registered id carries the family chain: `gts.cf.core.graph.node.v1~cf.core.graph.owned_node.v1~cf.construct.person.identity.v1~`, `gts.cf.core.graph.node.v1~cf.core.graph.owned_node.v1~cf.construct.person.role.v1~`, `gts.cf.core.graph.node.v1~cf.core.graph.owned_node.v1~cf.construct.person.skill.v1~` and `gts.cf.core.graph.node.v1~cf.core.graph.owned_node.v1~cf.construct.person.preference.v1~`. A person's subject ID is the UUID of the platform user, `gts.cf.core.am.user.v1~`
 - **Compatibility**: A published GTS version never changes; facts stored under earlier versions stay readable and servable
 
 ## 8. Use Cases

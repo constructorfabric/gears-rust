@@ -30,3 +30,7 @@ toolkit-canonical-errors = { workspace = true }
 toolkit-gts = { workspace = true }
 toolkit-macros = { workspace = true }
 toolkit-security = { workspace = true }
+
+[dev-dependencies]
+graph-storage-sdk = { package = "cf-gears-graph-storage-sdk", path = "../../graph-storage/graph-storage-sdk" }
+jsonschema = { workspace = true }
