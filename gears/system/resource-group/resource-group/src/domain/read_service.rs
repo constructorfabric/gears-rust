@@ -25,7 +25,7 @@ use uuid::Uuid;
 
 use crate::domain::group_service::GroupService;
 use crate::domain::membership_service::MembershipService;
-use crate::domain::repo::{GroupRepositoryTrait, MembershipRepositoryTrait, TypeRepositoryTrait};
+use crate::domain::repo::{GroupRepositoryTrait, MembershipRepositoryTrait};
 
 /// Adapter service exposing hierarchy reads via SDK traits.
 ///
@@ -35,23 +35,17 @@ use crate::domain::repo::{GroupRepositoryTrait, MembershipRepositoryTrait, TypeR
 /// itself (circular dependency). The in-process `ClientHub` path therefore
 /// skips `AuthZ`.
 #[allow(unknown_lints, de0309_must_have_domain_model)]
-pub struct RgReadService<
-    GR: GroupRepositoryTrait,
-    TR: TypeRepositoryTrait,
-    MR: MembershipRepositoryTrait,
-> {
-    group_service: Arc<GroupService<GR, TR>>,
-    membership_service: Arc<MembershipService<GR, TR, MR>>,
+pub struct RgReadService<GR: GroupRepositoryTrait, MR: MembershipRepositoryTrait> {
+    group_service: Arc<GroupService<GR>>,
+    membership_service: Arc<MembershipService<GR, MR>>,
 }
 
-impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait, MR: MembershipRepositoryTrait>
-    RgReadService<GR, TR, MR>
-{
+impl<GR: GroupRepositoryTrait, MR: MembershipRepositoryTrait> RgReadService<GR, MR> {
     /// Create a new `RgReadService`.
     #[must_use]
     pub fn new(
-        group_service: Arc<GroupService<GR, TR>>,
-        membership_service: Arc<MembershipService<GR, TR, MR>>,
+        group_service: Arc<GroupService<GR>>,
+        membership_service: Arc<MembershipService<GR, MR>>,
     ) -> Self {
         Self {
             group_service,
@@ -86,8 +80,8 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait, MR: MembershipRepository
 // @cpt-end:cpt-cf-resource-group-flow-integration-auth-plugin-routing:p1:inst-plugin-4b
 // @cpt-end:cpt-cf-resource-group-flow-integration-auth-plugin-routing:p1:inst-plugin-4
 #[async_trait]
-impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait, MR: MembershipRepositoryTrait>
-    ResourceGroupReadHierarchy for RgReadService<GR, TR, MR>
+impl<GR: GroupRepositoryTrait, MR: MembershipRepositoryTrait> ResourceGroupReadHierarchy
+    for RgReadService<GR, MR>
 {
     async fn get_group_descendants(
         &self,

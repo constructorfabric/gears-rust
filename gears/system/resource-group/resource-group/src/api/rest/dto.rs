@@ -1,107 +1,12 @@
 // Created: 2026-04-16 by Constructor Tech
 // Updated: 2026-04-29 by Constructor Tech
-//! REST DTOs for resource-group type and group management.
+//! REST DTOs for resource-group group and membership management.
 
 use resource_group_sdk::models::{
-    CreateGroupRequest, CreateTypeRequest, ResourceGroup, ResourceGroupMembership,
-    ResourceGroupType, ResourceGroupWithDepth, UpdateGroupRequest, UpdateTypeRequest,
+    CreateGroupRequest, ResourceGroup, ResourceGroupMembership, ResourceGroupWithDepth,
+    UpdateGroupRequest,
 };
 use uuid::Uuid;
-
-/// REST DTO for GTS type representation.
-#[derive(Debug, Clone)]
-#[toolkit_macros::api_dto(request, response)]
-pub struct TypeDto {
-    /// GTS type path
-    pub code: String,
-    /// Whether groups of this type can be root nodes
-    pub can_be_root: bool,
-    /// GTS type paths of allowed parent types
-    pub allowed_parent_types: Vec<String>,
-    /// GTS type paths of allowed membership resource types
-    pub allowed_membership_types: Vec<String>,
-    /// Optional JSON Schema for instance metadata
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub metadata_schema: Option<serde_json::Value>,
-}
-
-/// REST DTO for creating a new GTS type.
-#[derive(Debug, Clone)]
-#[toolkit_macros::api_dto(request)]
-pub struct CreateTypeDto {
-    /// GTS type path. Must have prefix `gts.cf.core.rg.type.v1~`.
-    ///
-    /// Whether the type creates a new tenant scope is derived from the code:
-    /// any path starting with the tenant RG type prefix is a tenant type.
-    pub code: String,
-    /// Whether groups of this type can be root nodes.
-    pub can_be_root: bool,
-    /// GTS type paths of allowed parent types.
-    #[serde(default)]
-    pub allowed_parent_types: Vec<String>,
-    /// GTS type paths of allowed membership resource types.
-    #[serde(default)]
-    pub allowed_membership_types: Vec<String>,
-    /// Optional JSON Schema for instance metadata.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub metadata_schema: Option<serde_json::Value>,
-}
-
-/// REST DTO for updating a GTS type (full replacement via PUT).
-///
-/// Every replaceable field is **required** so an omitted field cannot be
-/// confused with "preserve previous value". Nullable fields
-/// (`metadata_schema`) must be sent explicitly as `null` to clear them.
-#[derive(Debug, Clone)]
-#[toolkit_macros::api_dto(request)]
-pub struct UpdateTypeDto {
-    /// Whether groups of this type can be root nodes.
-    pub can_be_root: bool,
-    /// GTS type paths of allowed parent types.
-    pub allowed_parent_types: Vec<String>,
-    /// GTS type paths of allowed membership resource types.
-    pub allowed_membership_types: Vec<String>,
-    /// JSON Schema for instance metadata (`null` to clear).
-    #[schema(required)]
-    pub metadata_schema: Option<serde_json::Value>,
-}
-
-// -- Conversions --
-
-impl From<ResourceGroupType> for TypeDto {
-    fn from(t: ResourceGroupType) -> Self {
-        Self {
-            code: t.code,
-            can_be_root: t.can_be_root,
-            allowed_parent_types: t.allowed_parent_types,
-            allowed_membership_types: t.allowed_membership_types,
-            metadata_schema: t.metadata_schema,
-        }
-    }
-}
-
-impl From<CreateTypeDto> for CreateTypeRequest {
-    fn from(dto: CreateTypeDto) -> Self {
-        Self {
-            code: dto.code,
-            can_be_root: dto.can_be_root,
-            allowed_parent_types: dto.allowed_parent_types,
-            allowed_membership_types: dto.allowed_membership_types,
-            metadata_schema: dto.metadata_schema,
-        }
-    }
-}
-
-impl From<UpdateTypeDto> for UpdateTypeRequest {
-    fn from(dto: UpdateTypeDto) -> Self {
-        Self {
-            can_be_root: dto.can_be_root,
-            allowed_parent_types: dto.allowed_parent_types,
-            allowed_membership_types: dto.allowed_membership_types,
-            metadata_schema: dto.metadata_schema,
-        }
-    }
-}
 
 // -- Group DTOs --
 

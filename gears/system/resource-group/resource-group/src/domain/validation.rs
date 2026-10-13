@@ -3,6 +3,7 @@
 //! Shared domain validation utilities.
 
 use crate::domain::error::DomainError;
+use crate::domain::type_catalog::RgTypeDef;
 use toolkit_gts::gts_id;
 
 /// GTS type path prefix required for resource group types.
@@ -45,143 +46,33 @@ pub fn validate_type_code(code: &str) -> Result<(), DomainError> {
     Ok(())
 }
 
-/// Validate a GTS type code used as a membership resource type.
+/// Validate group metadata against the resolved schema of the group's type.
 ///
-/// Unlike [`validate_type_code`], this does NOT require the
-/// `gts.cf.core.rg.type.v1~` prefix. Per `DESIGN.md` ("RG type prefix
-/// requirement"), `allowed_memberships` entries are external domain
-/// types (e.g. `gts.cf.core.idp.user.v1~`, `gts.cf.vendor.lms.course.v1~`)
-/// and need not live in the RG type-registry namespace.
+/// The Types Registry resolves an RG type to an `allOf` document with the
+/// base type inlined, so there is no top-level `properties.metadata`; the
+/// wrapper document `{"metadata": <metadata>}` is therefore validated against
+/// the WHOLE resolved schema.
 ///
-/// Format validation is delegated to [`gts::GtsId::try_new`], the canonical
-/// GTS parser. Only **exact** GTS IDs (`gts.cf.core.idp.user.v1~`) are
-/// accepted; trailing-wildcard patterns (`gts.cf.core.am.*`) are
-/// rejected. `allowed_memberships` entries must resolve to a registered
-/// concrete type — `gts_type_allowed_membership` is a junction table
-/// with `SMALLINT FK → gts_type.id`, which cannot store a pattern.
+/// Passes trivially when `metadata` is `None` or the type carries no schema.
 ///
 /// # Errors
 ///
-/// Returns [`DomainError::validation`] if the code is not a valid GTS
-/// ID, or if it is a wildcard pattern.
-pub fn validate_membership_type_code(code: &str) -> Result<(), DomainError> {
-    if code.contains('*') {
-        return Err(DomainError::validation(format!(
-            "Membership type code '{code}' must be a concrete GTS type, not a wildcard pattern"
-        )));
-    }
-    gts::GtsId::try_new(code).map_err(|e| {
-        DomainError::validation(format!("Invalid membership type code '{code}': {e}"))
-    })?;
-    Ok(())
-}
-
-/// Validate that a `metadata_schema` value is a valid JSON Schema.
-///
-/// Attempts to compile the schema via `jsonschema::validator_for`. If the value
-/// cannot be interpreted as a JSON Schema, returns a [`DomainError::validation`].
-///
-/// # Errors
-///
-/// Returns [`DomainError`] if the value is not a valid JSON Schema.
-// @cpt-begin:cpt-cf-resource-group-algo-type-mgmt-validate-type-input:p1:inst-val-input-7
-pub fn validate_metadata_schema(schema: &serde_json::Value) -> Result<(), DomainError> {
-    jsonschema::validator_for(schema).map_err(|e| {
-        DomainError::validation(format!("metadata_schema is not a valid JSON Schema: {e}"))
-    })?;
-    Ok(())
-}
-// @cpt-end:cpt-cf-resource-group-algo-type-mgmt-validate-type-input:p1:inst-val-input-7
-
-/// Validate a metadata JSON value against a raw JSON Schema.
-///
-/// Synchronous counterpart to [`validate_metadata_via_gts`] that does not
-/// resolve GTS types. When either `metadata` or `schema` is `None`, the
-/// check passes trivially.
-///
-/// # Errors
-///
-/// Returns [`DomainError::validation`] when the schema fails to compile
-/// or the metadata violates any schema constraint.
-pub fn validate_metadata_against_schema(
+/// Returns [`DomainError::validation`] when the schema fails to compile or
+/// the metadata violates any schema constraint.
+pub fn validate_metadata_against_def(
     metadata: Option<&serde_json::Value>,
-    schema: Option<&serde_json::Value>,
+    def: &RgTypeDef,
 ) -> Result<(), DomainError> {
-    let (Some(metadata), Some(schema)) = (metadata, schema) else {
+    let (Some(metadata), Some(schema)) = (metadata, def.schema.as_ref()) else {
         return Ok(());
     };
 
     let validator = jsonschema::validator_for(schema)
-        .map_err(|e| DomainError::validation(format!("metadata_schema is invalid: {e}")))?;
-
-    let errors: Vec<String> = validator
-        .iter_errors(metadata)
-        .map(|e| e.to_string())
-        .collect();
-    if !errors.is_empty() {
-        return Err(DomainError::validation(format!(
-            "Metadata does not match type schema: {}",
-            errors.join("; ")
-        )));
-    }
-    Ok(())
-}
-
-/// Validate a metadata value against a resolved GTS type schema.
-///
-/// Uses `TypesRegistryClient` to fetch the resolved schema (with `allOf`
-/// composition, `$ref` resolution, and `x-gts-traits` applied), then validates
-/// the metadata against the resolved schema using `jsonschema`.
-///
-/// Returns `Ok(())` when:
-/// - `metadata` is `None` (nothing to validate)
-/// - `type_code` has no registered schema in the types registry
-/// - `metadata` validates against the resolved schema
-///
-/// # Errors
-///
-/// Returns [`DomainError`] when metadata violates the schema constraints
-/// or the types registry is unavailable.
-pub async fn validate_metadata_via_gts(
-    metadata: Option<&serde_json::Value>,
-    type_code: &str,
-    types_registry: &dyn types_registry_sdk::TypesRegistryClient,
-) -> Result<(), DomainError> {
-    let Some(metadata) = metadata else {
-        return Ok(());
-    };
-
-    // Fetch the GTS schema. Local client pre-links ancestors via Arc, so
-    // `effective_properties()` returns the chain-resolved property map (own
-    // overrides + inherited).
-    let schema = match types_registry.get_type_schema(type_code).await {
-        Ok(schema) => schema,
-        // No registered schema for this type -- skip metadata validation.
-        // The trait boundary is `CanonicalError` (ADR 0005); a missing schema
-        // surfaces as `NotFound` regardless of entity kind.
-        Err(toolkit_canonical_errors::CanonicalError::NotFound { .. }) => return Ok(()),
-        Err(e) => {
-            return Err(DomainError::validation(format!(
-                "Failed to resolve GTS type '{type_code}' for metadata validation: {e}"
-            )));
-        }
-    };
-
-    // The chained RG type schema may declare `metadata` at any level of
-    // the inheritance chain — `effective_properties` collects them all.
-    let merged = schema.effective_properties();
-    let metadata_schema = merged.get("metadata");
-
-    let Some(metadata_schema) = metadata_schema else {
-        // No metadata property in the schema — any metadata accepted.
-        return Ok(());
-    };
-
-    let validator = jsonschema::validator_for(metadata_schema)
         .map_err(|e| DomainError::validation(format!("Type metadata_schema is invalid: {e}")))?;
 
+    let document = serde_json::json!({ "metadata": metadata });
     let errors: Vec<String> = validator
-        .iter_errors(metadata)
+        .iter_errors(&document)
         .map(|e| e.to_string())
         .collect();
     if !errors.is_empty() {
@@ -193,3 +84,7 @@ pub async fn validate_metadata_via_gts(
     Ok(())
 }
 // @cpt-end:cpt-cf-resource-group-dod-sdk-foundation-sdk-models:p1:inst-validation-full
+
+#[cfg(test)]
+#[path = "validation_tests.rs"]
+mod tests;

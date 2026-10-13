@@ -4,7 +4,8 @@
 //! Shared test helpers for resource-group integration tests.
 //!
 //! Provides database setup, service construction, security context helpers,
-//! and assertion utilities. Used by Phases 2-5 of the unit test plan.
+//! the Types Registry fixture ([`TestTypes`]) and assertion utilities. Used
+//! by Phases 2-5 of the unit test plan.
 
 use std::sync::Arc;
 use toolkit_gts::gts_id;
@@ -25,182 +26,168 @@ use toolkit_db::{
     ConnectOpts, DBProvider, DbError, connect_db, migration_runner::run_migrations_for_testing,
 };
 use toolkit_security::{PlatformSecurityContext, SecurityContext, pep_properties};
+use types_registry_sdk::testing_platform::{Call, Fault, MockTypesRegistry};
 
 use resource_group::domain::group_service::{GroupService, QueryProfile};
 use resource_group::domain::membership_service::MembershipService;
-use resource_group::domain::type_service::TypeService;
+use resource_group::domain::type_catalog::TypeCatalog;
 use resource_group::infra::storage::group_repo::GroupRepository;
 use resource_group::infra::storage::membership_repo::MembershipRepository;
 use resource_group::infra::storage::migrations::Migrator;
-use resource_group::infra::storage::type_repo::TypeRepository;
-use resource_group_sdk::{
-    CreateGroupRequest, CreateTypeRequest, ResourceGroup as ResourceGroupModel, ResourceGroupType,
-};
+use resource_group::infra::type_catalog::TrTypeCatalog;
+use resource_group_sdk::{CreateGroupRequest, ResourceGroup as ResourceGroupModel};
 
-// -- Stub TypesRegistryClient (returns NotFound for all types — metadata validation skipped) --
+// -- Types Registry fixture --
 
-#[derive(Default)]
-struct StubTypesRegistry {
-    /// When set, `get_type_schema` answers with an `Internal` error instead
-    /// of `NotFound`. `NotFound` makes `validate_metadata_via_gts` skip
-    /// validation; any other error makes it *fail*, which is what a test
-    /// about the order between the scope check and metadata validation needs.
-    type_schema_unavailable: bool,
+/// A resource-group type registered in the mock Types Registry, as the tests
+/// need to read it back.
+#[derive(Debug, Clone)]
+pub struct TestType {
+    pub code: String,
+    pub can_be_root: bool,
+    pub allowed_parent_types: Vec<String>,
+    pub allowed_membership_types: Vec<String>,
 }
 
-#[async_trait]
-impl types_registry_sdk::TypesRegistryClient for StubTypesRegistry {
-    async fn register(
-        &self,
-        _entities: Vec<serde_json::Value>,
-    ) -> Result<Vec<types_registry_sdk::RegisterResult>, toolkit_canonical_errors::CanonicalError>
-    {
-        Ok(vec![])
-    }
+/// Types Registry fixture: a [`MockTypesRegistry`] seeded with the RG base
+/// type and the static tenant type, plus helpers to register test types.
+///
+/// One fixture serves one test; services built from it
+/// (`make_group_service(db, &types)` ...) share its catalog.
+pub struct TestTypes {
+    pub mock: Arc<MockTypesRegistry>,
+}
 
-    async fn register_type_schemas(
-        &self,
-        _type_schemas: Vec<serde_json::Value>,
-    ) -> Result<Vec<types_registry_sdk::RegisterResult>, toolkit_canonical_errors::CanonicalError>
-    {
-        Ok(vec![])
-    }
-
-    async fn get_type_schema(
-        &self,
-        type_id: &str,
-    ) -> Result<types_registry_sdk::GtsTypeSchema, toolkit_canonical_errors::CanonicalError> {
-        if self.type_schema_unavailable {
-            return Err(types_registry_sdk::testing::internal(format!(
-                "types registry unavailable for {type_id}"
-            )));
-        }
-        Err(types_registry_sdk::testing::not_found(type_id))
-    }
-
-    async fn get_type_schema_by_uuid(
-        &self,
-        type_uuid: Uuid,
-    ) -> Result<types_registry_sdk::GtsTypeSchema, toolkit_canonical_errors::CanonicalError> {
-        Err(types_registry_sdk::testing::not_found(
-            type_uuid.to_string(),
-        ))
-    }
-
-    async fn get_type_schemas(
-        &self,
-        type_ids: Vec<String>,
-    ) -> std::collections::HashMap<
-        String,
-        Result<types_registry_sdk::GtsTypeSchema, toolkit_canonical_errors::CanonicalError>,
-    > {
-        type_ids
-            .into_iter()
-            .map(|id| {
-                let err = types_registry_sdk::testing::not_found(&id);
-                (id, Err(err))
-            })
-            .collect()
-    }
-
-    async fn get_type_schemas_by_uuid(
-        &self,
-        type_uuids: Vec<Uuid>,
-    ) -> std::collections::HashMap<
-        Uuid,
-        Result<types_registry_sdk::GtsTypeSchema, toolkit_canonical_errors::CanonicalError>,
-    > {
-        type_uuids
-            .into_iter()
-            .map(|uuid| {
-                let err = types_registry_sdk::testing::not_found(uuid.to_string());
-                (uuid, Err(err))
-            })
-            .collect()
-    }
-
-    async fn list_type_schemas(
-        &self,
-        _query: types_registry_sdk::TypeSchemaQuery,
-    ) -> Result<Vec<types_registry_sdk::GtsTypeSchema>, toolkit_canonical_errors::CanonicalError>
-    {
-        Ok(vec![])
-    }
-
-    async fn register_instances(
-        &self,
-        _instances: Vec<serde_json::Value>,
-    ) -> Result<Vec<types_registry_sdk::RegisterResult>, toolkit_canonical_errors::CanonicalError>
-    {
-        Ok(vec![])
-    }
-
-    async fn get_instance(
-        &self,
-        id: &str,
-    ) -> Result<types_registry_sdk::GtsInstance, toolkit_canonical_errors::CanonicalError> {
-        Err(types_registry_sdk::testing::not_found(id))
-    }
-
-    async fn get_instance_by_uuid(
-        &self,
-        uuid: Uuid,
-    ) -> Result<types_registry_sdk::GtsInstance, toolkit_canonical_errors::CanonicalError> {
-        Err(types_registry_sdk::testing::not_found(uuid.to_string()))
-    }
-
-    async fn get_instances(
-        &self,
-        ids: Vec<String>,
-    ) -> std::collections::HashMap<
-        String,
-        Result<types_registry_sdk::GtsInstance, toolkit_canonical_errors::CanonicalError>,
-    > {
-        ids.into_iter()
-            .map(|id| {
-                let err = types_registry_sdk::testing::not_found(&id);
-                (id, Err(err))
-            })
-            .collect()
-    }
-
-    async fn get_instances_by_uuid(
-        &self,
-        uuids: Vec<Uuid>,
-    ) -> std::collections::HashMap<
-        Uuid,
-        Result<types_registry_sdk::GtsInstance, toolkit_canonical_errors::CanonicalError>,
-    > {
-        uuids
-            .into_iter()
-            .map(|uuid| {
-                let err = types_registry_sdk::testing::not_found(uuid.to_string());
-                (uuid, Err(err))
-            })
-            .collect()
-    }
-
-    async fn list_instances(
-        &self,
-        _query: types_registry_sdk::InstanceQuery,
-    ) -> Result<Vec<types_registry_sdk::GtsInstance>, toolkit_canonical_errors::CanonicalError>
-    {
-        Ok(vec![])
+impl Default for TestTypes {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
-/// Build stub `TypesRegistryClient` for tests.
-pub fn make_types_registry() -> Arc<dyn types_registry_sdk::TypesRegistryClient> {
-    Arc::new(StubTypesRegistry::default())
+impl TestTypes {
+    /// A registry holding the RG base type and the static tenant type.
+    #[must_use]
+    pub fn new() -> Self {
+        let mock = Arc::new(MockTypesRegistry::new());
+        mock.seed_inventory();
+        Self { mock }
+    }
+
+    /// The catalog the services read types through.
+    #[must_use]
+    pub fn catalog(&self) -> Arc<dyn TypeCatalog> {
+        Arc::new(TrTypeCatalog::new(self.mock.clone()))
+    }
+
+    /// Registers a derived RG type and returns its code.
+    ///
+    /// `metadata_schema` becomes the schema of the group `metadata`; `None`
+    /// means a free-form object.
+    pub fn add_rg_type(
+        &self,
+        code: &str,
+        can_be_root: bool,
+        parents: &[&str],
+        memberships: &[&str],
+        metadata_schema: Option<serde_json::Value>,
+    ) -> String {
+        let metadata = metadata_schema.unwrap_or_else(|| serde_json::json!({"type": "object"}));
+        let doc = serde_json::json!({
+            "$id": format!("gts://{code}"),
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "type": "object",
+            "x-gts-traits": {
+                "can_be_root": can_be_root,
+                "allowed_parent_types": parents,
+                "allowed_membership_types": memberships,
+            },
+            "allOf": [
+                { "$ref": format!("gts://{}", parent_type_code(code)) },
+                { "type": "object", "properties": { "metadata": metadata } }
+            ]
+        });
+        self.mock.seed(code, doc);
+        code.to_owned()
+    }
+
+    /// Registers a plain (non-RG) GTS type usable as a membership resource
+    /// type and returns its code.
+    pub fn add_member_type(&self, code: &str) -> String {
+        let doc = serde_json::json!({
+            "$id": format!("gts://{code}"),
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "type": "object",
+        });
+        self.mock.seed(code, doc);
+        code.to_owned()
+    }
+
+    /// The Registry Reference (UUID) the registry reports for a type code, as
+    /// stored in the `gts_type_id` columns.
+    ///
+    /// # Panics
+    /// If the type is not registered.
+    pub async fn uuid_of(&self, code: &str) -> Uuid {
+        let defs = self
+            .catalog()
+            .resolve(&[code.to_owned()], &[])
+            .await
+            .expect("catalog read")
+            .by_code;
+        defs.get(code)
+            .unwrap_or_else(|| panic!("type {code} is not registered"))
+            .uuid
+    }
+
+    /// Registers a fresh plain member type with a unique code.
+    pub fn new_member_type(&self, suffix: &str) -> String {
+        self.add_member_type(&unique_member_code(suffix))
+    }
+
+    /// Makes every subsequent catalog read fail (Types Registry unavailable).
+    pub fn fail_reads(&self) {
+        self.mock
+            .inject(Fault::on(Call::BatchGet).fail(CanonicalError::service_unavailable().create()));
+    }
+
+    /// Number of catalog reads (`batch_get`) issued so far.
+    #[must_use]
+    pub fn batch_get_calls(&self) -> u32 {
+        self.mock.calls(Call::BatchGet)
+    }
 }
 
-/// A registry whose schema lookups fail with `Internal`, so metadata
-/// validation returns an error instead of skipping it.
+/// The direct parent of a chained GTS type code (the code without its last
+/// segment): `base~x.v1~` -> `base~`.
+fn parent_type_code(code: &str) -> &str {
+    let body = code.strip_suffix('~').unwrap_or(code);
+    body.rfind('~').map_or(code, |i| &code[..=i])
+}
+
+/// A unique RG type code derived from the RG base type.
+///
+/// Format: vendor.package.namespace.type.vMAJOR -- 5 tokens per ADR-001
+/// Finding 2. Suffix goes in namespace (lowercased so callers can use
+/// CamelCase without breaking the GTS regex); UUID-hex (prefixed with `i` so
+/// it starts with a letter) goes in type.
 #[must_use]
-pub fn make_unavailable_types_registry() -> Arc<dyn types_registry_sdk::TypesRegistryClient> {
-    Arc::new(StubTypesRegistry {
-        type_schema_unavailable: true,
-    })
+pub fn unique_rg_code(suffix: &str) -> String {
+    format!(
+        "{}x.test.{}.i{}.v1~",
+        gts_id!("cf.core.rg.type.v1~"),
+        suffix.to_ascii_lowercase(),
+        Uuid::now_v7().as_simple()
+    )
+}
+
+/// A unique single-segment code for a plain member type.
+#[must_use]
+pub fn unique_member_code(suffix: &str) -> String {
+    format!(
+        "gts.x.test.{}.i{}.v1~",
+        suffix.to_ascii_lowercase(),
+        Uuid::now_v7().as_simple()
+    )
 }
 
 // -- AllowAll AuthZ mock --
@@ -309,65 +296,101 @@ pub fn make_enforcer() -> PolicyEnforcer {
 
 // -- Type helpers --
 
-/// Create a root type (can_be_root = true, no parents, no memberships).
-pub async fn create_root_type(
-    svc: &TypeService<TypeRepository>,
-    suffix: &str,
-) -> ResourceGroupType {
-    // Format: vendor.package.namespace.type.vMAJOR -- 5 tokens per ADR-001
-    // Finding 2. Suffix goes in namespace (lowercased so callers can use
-    // CamelCase without breaking the GTS regex); UUID-hex (prefixed with
-    // `i` so it starts with a letter) goes in type.
-    let code = format!(
-        "{}x.test.{}.i{}.v1~",
-        gts_id!("cf.core.rg.type.v1~"),
-        suffix.to_ascii_lowercase(),
-        Uuid::now_v7().as_simple()
-    );
-    svc.create_type_unscoped(CreateTypeRequest {
+/// Register a root type (can_be_root = true, no parents, no memberships).
+pub fn create_root_type(types: &TestTypes, suffix: &str) -> TestType {
+    let code = types.add_rg_type(&unique_rg_code(suffix), true, &[], &[], None);
+    TestType {
         code,
         can_be_root: true,
         allowed_parent_types: vec![],
         allowed_membership_types: vec![],
-        metadata_schema: None,
-    })
-    .await
-    .expect("create root type")
+    }
 }
 
-/// Create a child type with specified allowed parents and memberships.
-pub async fn create_child_type(
-    svc: &TypeService<TypeRepository>,
+/// Register a child type (can_be_root = false) with the given allowed
+/// parents and memberships.
+pub fn create_child_type(
+    types: &TestTypes,
     suffix: &str,
     parents: &[&str],
     memberships: &[&str],
-) -> ResourceGroupType {
-    // Format: vendor.package.namespace.type.vMAJOR -- 5 tokens per ADR-001
-    // Finding 2. Suffix goes in namespace (lowercased so callers can use
-    // CamelCase without breaking the GTS regex); UUID-hex (prefixed with
-    // `i` so it starts with a letter) goes in type.
-    let code = format!(
-        "{}x.test.{}.i{}.v1~",
-        gts_id!("cf.core.rg.type.v1~"),
-        suffix.to_ascii_lowercase(),
-        Uuid::now_v7().as_simple()
-    );
-    svc.create_type_unscoped(CreateTypeRequest {
+) -> TestType {
+    let code = types.add_rg_type(&unique_rg_code(suffix), false, parents, memberships, None);
+    TestType {
         code,
         can_be_root: false,
         allowed_parent_types: parents.iter().map(|s| (*s).to_owned()).collect(),
         allowed_membership_types: memberships.iter().map(|s| (*s).to_owned()).collect(),
-        metadata_schema: None,
-    })
-    .await
-    .expect("create child type")
+    }
+}
+
+/// Register a root type that accepts the given membership resource types.
+pub fn create_root_type_with_memberships(
+    types: &TestTypes,
+    suffix: &str,
+    memberships: &[&str],
+) -> TestType {
+    let code = types.add_rg_type(&unique_rg_code(suffix), true, &[], memberships, None);
+    TestType {
+        code,
+        can_be_root: true,
+        allowed_parent_types: vec![],
+        allowed_membership_types: memberships.iter().map(|s| (*s).to_owned()).collect(),
+    }
+}
+
+/// Register a root-capable type that allows itself as a parent, so a chain of
+/// arbitrary depth can be built.
+pub fn create_self_parenting_type(types: &TestTypes, suffix: &str) -> TestType {
+    let code = unique_rg_code(suffix);
+    types.add_rg_type(&code, true, &[&code], &[], None);
+    TestType {
+        code: code.clone(),
+        can_be_root: true,
+        allowed_parent_types: vec![code],
+        allowed_membership_types: vec![],
+    }
+}
+
+/// A unique tenant-type code: it starts with `TENANT_RG_TYPE_PATH`, so groups
+/// of it are classified as tenant groups (`is_tenant`).
+#[must_use]
+pub fn unique_tenant_type_code() -> String {
+    format!(
+        "{}x.test.tn.i{}.v1~",
+        resource_group_sdk::TENANT_RG_TYPE_PATH,
+        Uuid::now_v7().as_simple()
+    )
+}
+
+/// Register a root-capable tenant-derived type (no allowed parents).
+pub fn create_tenant_type(types: &TestTypes) -> TestType {
+    let code = types.add_rg_type(&unique_tenant_type_code(), true, &[], &[], None);
+    TestType {
+        code,
+        can_be_root: true,
+        allowed_parent_types: vec![],
+        allowed_membership_types: vec![],
+    }
+}
+
+/// Register a root-capable tenant-derived type that may be placed under the
+/// given parent tenant type.
+pub fn create_tenant_sub_type(types: &TestTypes, parent_code: &str) -> TestType {
+    let code = types.add_rg_type(&unique_tenant_type_code(), true, &[parent_code], &[], None);
+    TestType {
+        code,
+        can_be_root: true,
+        allowed_parent_types: vec![parent_code.to_owned()],
+        allowed_membership_types: vec![],
+    }
 }
 
 // -- Group helpers --
 
 /// Create a root group of the given type.
 pub async fn create_root_group(
-    svc: &GroupService<GroupRepository, TypeRepository>,
+    svc: &GroupService<GroupRepository>,
     ctx: &SecurityContext,
     type_code: &str,
     name: &str,
@@ -384,7 +407,7 @@ pub async fn create_root_group(
 
 /// Create a child group under the given parent.
 pub async fn create_child_group(
-    svc: &GroupService<GroupRepository, TypeRepository>,
+    svc: &GroupService<GroupRepository>,
     ctx: &SecurityContext,
     type_code: &str,
     parent_id: Uuid,
@@ -530,7 +553,7 @@ pub async fn assert_closure_matches_parent_links(conn: &impl toolkit_db::secure:
     // closure", and a set comparison cannot see a duplicated row. Today the
     // schema makes one impossible -- `PRIMARY KEY (ancestor_id,
     // descendant_id)`, declared in both backend branches of
-    // `m20260306_000001_initial.rs` (:72 Postgres, :149 SQLite) -- so this
+    // `m20261012_000001_types_in_types_registry.rs` (:67 Postgres, :129 SQLite) -- so this
     // cannot fire. It stays because the invariant lives in string SQL that no
     // compiler checks: a migration that weakened the key would otherwise
     // silently collapse duplicates into the set below and pass.
@@ -550,39 +573,22 @@ pub async fn assert_closure_matches_parent_links(conn: &impl toolkit_db::secure:
     );
 }
 
-/// Assert that a JSON value contains no surrogate integer IDs
-/// (e.g. `gts_type_id` SMALLINT fields should not leak to the API).
+/// Assert that a JSON value contains no internal identifiers: the
+/// `gts_type_id` column holds a Registry Reference UUID and `is_tenant` is a
+/// storage flag; neither may leak to the API.
 pub fn assert_no_surrogate_ids(json: &serde_json::Value) {
     let text = json.to_string();
     assert!(
         !text.contains("gts_type_id"),
-        "JSON should not contain surrogate 'gts_type_id': {text}"
+        "JSON should not contain internal 'gts_type_id': {text}"
     );
     assert!(
-        !text.contains("schema_id"),
-        "JSON should not contain surrogate 'schema_id': {text}"
+        !text.contains("is_tenant"),
+        "JSON should not contain internal 'is_tenant': {text}"
     );
 }
 
 // -- Service construction helpers --
-
-/// Build a `TypeService` from a DB provider.
-pub fn make_type_service(db: Arc<DBProvider<DbError>>) -> TypeService<TypeRepository> {
-    TypeService::new(db, make_enforcer(), Arc::new(TypeRepository))
-}
-
-/// Build a `TypeService` wired with the deny-all enforcer. Scoped operations
-/// (`create_type` / `get_type` / `update_type`) would be rejected; an
-/// unscoped call that still succeeds proves it never consulted `PolicyEnforcer`
-/// -- used to pin the `ResourceGroupTypeBootstrap` bypass (see
-/// [`make_group_service_deny`] for the same pattern on the group side).
-pub fn make_type_service_deny(db: Arc<DBProvider<DbError>>) -> TypeService<TypeRepository> {
-    TypeService::new(
-        db,
-        PolicyEnforcer::new(Arc::new(DenyAllAuthZ)),
-        Arc::new(TypeRepository),
-    )
-}
 
 /// In-memory SQLite with migrations applied and a [`QueryRecorder`] attached,
 /// for the DB-behaviour audit suites.
@@ -614,26 +620,36 @@ pub async fn test_db_with_recorder() -> (Arc<DBProvider<DbError>>, QueryRecorder
 /// Build a `GroupService` from a DB provider using the allow-all enforcer.
 pub fn make_group_service(
     db: Arc<DBProvider<DbError>>,
-) -> GroupService<GroupRepository, TypeRepository> {
+    types: &TestTypes,
+) -> GroupService<GroupRepository> {
+    make_group_service_with_profile(db, types, QueryProfile::default())
+}
+
+/// Build a `GroupService` with a custom `QueryProfile` (allow-all enforcer).
+pub fn make_group_service_with_profile(
+    db: Arc<DBProvider<DbError>>,
+    types: &TestTypes,
+    profile: QueryProfile,
+) -> GroupService<GroupRepository> {
     GroupService::new(
         db,
-        QueryProfile::default(),
+        profile,
         make_enforcer(),
         Arc::new(GroupRepository),
-        Arc::new(TypeRepository),
-        make_types_registry(),
+        types.catalog(),
     )
 }
 
 /// Build a `MembershipService` from a DB provider using the allow-all enforcer.
 pub fn make_membership_service(
     db: Arc<DBProvider<DbError>>,
-) -> MembershipService<GroupRepository, TypeRepository, MembershipRepository> {
+    types: &TestTypes,
+) -> MembershipService<GroupRepository, MembershipRepository> {
     MembershipService::new(
         db,
         make_enforcer(),
         Arc::new(GroupRepository),
-        Arc::new(TypeRepository),
+        types.catalog(),
         Arc::new(MembershipRepository),
     )
 }
@@ -642,14 +658,14 @@ pub fn make_membership_service(
 /// would be rejected; an unscoped read that still succeeds proves the AuthZ bypass.
 pub fn make_group_service_deny(
     db: Arc<DBProvider<DbError>>,
-) -> GroupService<GroupRepository, TypeRepository> {
+    types: &TestTypes,
+) -> GroupService<GroupRepository> {
     GroupService::new(
         db,
         QueryProfile::default(),
         PolicyEnforcer::new(Arc::new(DenyAllAuthZ)),
         Arc::new(GroupRepository),
-        Arc::new(TypeRepository),
-        make_types_registry(),
+        types.catalog(),
     )
 }
 
@@ -657,12 +673,13 @@ pub fn make_group_service_deny(
 /// [`make_group_service_deny`]).
 pub fn make_membership_service_deny(
     db: Arc<DBProvider<DbError>>,
-) -> MembershipService<GroupRepository, TypeRepository, MembershipRepository> {
+    types: &TestTypes,
+) -> MembershipService<GroupRepository, MembershipRepository> {
     MembershipService::new(
         db,
         PolicyEnforcer::new(Arc::new(DenyAllAuthZ)),
         Arc::new(GroupRepository),
-        Arc::new(TypeRepository),
+        types.catalog(),
         Arc::new(MembershipRepository),
     )
 }
