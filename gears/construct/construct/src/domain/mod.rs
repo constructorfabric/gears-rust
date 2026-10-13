@@ -14,6 +14,8 @@ pub mod error;
 pub mod local_client;
 pub mod model_client;
 pub mod plan;
+pub mod planner;
+pub mod profile;
 pub mod record_intake;
 pub mod refusal;
 pub mod sensitive_data;
