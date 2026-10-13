@@ -1,94 +1,16 @@
-use std::collections::VecDeque;
-use std::num::{NonZeroU32, NonZeroU64};
-use std::sync::{Arc, Mutex};
+use std::num::NonZeroU64;
+use std::sync::Arc;
 
-use async_trait::async_trait;
 use serde_json::{Value, json};
-use toolkit_security::SecurityContext;
 
 use super::agent::{Planner, PlannerCaps};
-use super::test_data::{SUBJECT, TENANT, catalog, origin, profile};
-use crate::domain::model_client::{
-    Message, ModelClient, ModelError, ModelOutput, ModelRequest, ModelResponse, ToolCall, Usage,
+use super::test_data::{
+    Answer, SUBJECT, ScriptedModel, TENANT, caps, catalog, done, origin, profile, tool_calls, usage,
 };
+use crate::domain::model_client::{Message, ModelError, ModelOutput, ModelResponse, ToolCall};
 use crate::domain::plan::{Change, Origin, Plan, Step};
 use crate::domain::record_intake::{DropEvent, DropReason, DropStage, ReceivedRecord};
 use crate::test_support::{RecordingEvents, context_in, received_chat_record};
-
-type Answer = Result<ModelResponse, ModelError>;
-
-fn caps() -> PlannerCaps {
-    PlannerCaps {
-        max_rounds: NonZeroU32::new(3).expect("rounds"),
-        max_tokens: NonZeroU64::new(10_000).expect("tokens"),
-    }
-}
-
-struct ScriptedModel {
-    answers: Mutex<VecDeque<Answer>>,
-    requests: Mutex<Vec<ModelRequest>>,
-}
-
-impl ScriptedModel {
-    fn answering(answers: Vec<Answer>) -> Arc<Self> {
-        Arc::new(Self {
-            answers: Mutex::new(answers.into()),
-            requests: Mutex::default(),
-        })
-    }
-
-    fn requests(&self) -> Vec<ModelRequest> {
-        self.requests.lock().expect("lock").clone()
-    }
-}
-
-#[async_trait]
-impl ModelClient for ScriptedModel {
-    async fn complete(
-        &self,
-        _: &SecurityContext,
-        request: &ModelRequest,
-    ) -> Result<ModelResponse, ModelError> {
-        self.requests.lock().expect("lock").push(request.clone());
-        let mut answers = self.answers.lock().expect("lock");
-        if answers.len() > 1 {
-            answers.pop_front().expect("an answer")
-        } else {
-            answers.front().cloned().expect("an answer")
-        }
-    }
-}
-
-fn usage(input_tokens: u64) -> Usage {
-    Usage {
-        input_tokens,
-        output_tokens: 20,
-    }
-}
-
-fn tool_calls(calls: &[(&str, Value)], input_tokens: u64) -> ModelResponse {
-    ModelResponse {
-        output: ModelOutput::ToolCalls(
-            calls
-                .iter()
-                .enumerate()
-                .map(|(index, (name, arguments))| ToolCall {
-                    id: format!("call_{index}"),
-                    name: (*name).to_owned(),
-                    arguments: arguments.clone(),
-                })
-                .collect(),
-        ),
-        usage: Some(usage(input_tokens)),
-    }
-}
-
-fn done(input_tokens: u64) -> ModelResponse {
-    ModelResponse {
-        output: ModelOutput::Text("The plan is complete.".to_owned()),
-        usage: Some(usage(input_tokens)),
-    }
-}
 
 fn add_go() -> (&'static str, Value) {
     (

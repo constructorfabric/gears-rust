@@ -2555,6 +2555,7 @@ dependencies = [
  "thiserror 2.0.20",
  "time",
  "tokio",
+ "tokio-util",
  "tower",
  "tracing",
  "tracing-test",

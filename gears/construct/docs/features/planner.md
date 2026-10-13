@@ -16,6 +16,8 @@
   - [Build the Plan](#build-the-plan)
   - [Run the Agent Loop](#run-the-agent-loop)
   - [Build the Prompt](#build-the-prompt)
+  - [Queue a Received Record](#queue-a-received-record)
+  - [Process a Record](#process-a-record)
 - [4. States (CDSL)](#4-states-cdsl)
 - [5. Definitions of Done](#5-definitions-of-done)
   - [Numbered Profile](#numbered-profile)
@@ -23,6 +25,8 @@
   - [Plan Building](#plan-building)
   - [Agent Loop](#agent-loop)
   - [Prompt](#prompt)
+  - [Record Queue](#record-queue)
+  - [Processing](#processing)
 - [6. Acceptance Criteria](#6-acceptance-criteria)
 - [7. Non-Functional Considerations](#7-non-functional-considerations)
 
@@ -38,10 +42,10 @@
 ### 1.1 Overview
 
 The planner decides how a record changes the subject's profile. A language model proposes add, replace and remove
-steps through tools; the planner builds them into a plan in memory and writes nothing. This document covers the
-numbered profile the model sees, the plan tools with their checks, building the plan with its node keys and origin, the
-agent loop with its caps and drop events, and the prompt. The hand-off from intake and the rerun on a
-write conflict follow in later changes.
+steps through tools; the planner builds them into a plan in memory and writes nothing. This document covers the profile
+read port, the numbered profile the model sees, the plan tools with their checks, building the plan with its node keys
+and origin, the agent loop with its caps and drop events, the prompt, the queue that takes a received record from
+intake, and the processing of a record through the checks, Admission and the writer with a rerun on a write conflict.
 
 ### 1.2 Purpose
 
@@ -50,9 +54,10 @@ The model works on numbered values and plain property names, never on IDs
 (`cpt-cf-construct-principle-model-never-sees-ids`). The tools refuse a call that breaks a rule and tell the model
 why, so the plan holds only steps that fit the person types.
 
-**Out of scope**: the reference evaluation set that scores the prompt; the hand-off from Record Intake and the
-processing chain; the rerun on a write conflict; skipping a fact under an open review request (Review Queue); the
-profile read.
+**Out of scope**: the reference evaluation set that scores the prompt; skipping a fact under an open review request
+(Review Queue); the graph storage implementations of the profile read and the write (Profile Writer); the context
+processing runs under for a tenant; wiring the queue into the gear in place of the stub that drops every record,
+which waits for those three and for the admission rules from the deployment configuration.
 
 **Requirements**: `cpt-cf-construct-fr-fact-decisions`
 
@@ -83,9 +88,9 @@ profile read.
 
 - [ ] `p1` - **ID**: `cpt-cf-construct-algo-planner-read-profile`
 
-1. [ ] - `p1` - The planner works on the subject's current profile and its version, read from graph storage, not
-   through the Profile Reader or the writer. The read itself comes with the change that reads graph storage -
-   `inst-read-source`
+1. [ ] - `p1` - The planner works on the subject's current profile and its version, read from graph storage through
+   the `ProfileSource` port, not through the Profile Reader or the writer. The graph storage implementation of the
+   port comes with the Profile Writer - `inst-read-source`
 2. [ ] - `p1` - Each fact comes with its node key, its category, its property and its value. The version is the root
    node's version, which the planner carries as an opaque value into the plan - `inst-read-facts`
 
@@ -194,6 +199,39 @@ profile read.
    the model gets no ID of the source either (DESIGN: "It never gets an ID"). The rule is the same for every record
    type, so a new connector needs no Construct code - `inst-prompt-no-ids`
 
+### Queue a Received Record
+
+- [ ] `p1` - **ID**: `cpt-cf-construct-algo-planner-queue`
+
+1. [ ] - `p1` - The hand-off puts the received record on a bounded queue in memory and returns at once - `inst-queue-put`
+2. [ ] - `p1` - A full queue, or a queue whose worker stopped, refuses the record as unavailable, so intake keeps no
+   identity and answers `503`, and the connector can send the record again - `inst-queue-full`
+3. [ ] - `p1` - A worker takes records from the queue and processes at most the given number at once -
+   `inst-queue-worker`
+4. [ ] - `p1` - When the gear stops, the worker stops with the records in flight. A record still queued or in flight
+   is lost without an event, and its identity stays, as the DESIGN says - `inst-queue-stop`
+
+### Process a Record
+
+- [ ] `p1` - **ID**: `cpt-cf-construct-algo-planner-processing`
+
+1. [ ] - `p1` - The planner decides on chat messages and fact candidates about a subject. Any other record, a mastery
+   record or one without a subject, is dropped with `not_planned` before the profile is read: a mastery record is
+   stored as it is, by the mastery story, and never reaches the model - `inst-process-subject`
+2. [ ] - `p1` - Processing runs under the security context and the scope built for the record's tenant, never the
+   connector's - `inst-process-context`
+3. [ ] - `p1` - Read the profile, run the agent loop, run the sensitive-data checks on the plan, and give the plan
+   and the verdicts to Admission. A plan without steps, or an admitted plan with every value blocked, stores nothing -
+   `inst-process-chain`
+4. [ ] - `p1` - The writer stores the admitted plan in one write that expects the profile version the plan was built
+   on - `inst-process-write`
+5. [ ] - `p1` - When the profile changed, the record is planned again on a new read of the profile, at most
+   the given number of times. Past that, the record is dropped at the writer stage with `rerun_limit` -
+   `inst-process-rerun`
+6. [ ] - `p1` - A failed context, profile read, rules read or write drops the record with `processing_failed` at its
+   stage. The planner, the checks and Admission send their own drop events, so a record is dropped once -
+   `inst-process-drop`
+
 ## 4. States (CDSL)
 
 None. A plan lives in memory for one planning run.
@@ -282,6 +320,39 @@ record input with the payload, its schema and the numbered profile, without an I
 `an_id_nested_in_a_list_of_objects_is_not_shown`, `each_example_in_the_instructions_gets_the_answer_it_shows` and
 `the_model_gets_the_record_and_the_profile_as_data_but_no_id`.
 
+### Record Queue
+
+- [x] `p1` - **ID**: `cpt-cf-construct-dod-planner-queue`
+
+The system **MUST** take a received record onto a bounded queue at once, **MUST** refuse it when the queue is full
+or stopped, and **MUST** process at most the configured number of records at once until the gear stops.
+
+**Implements**:
+- `cpt-cf-construct-algo-planner-queue`
+
+**Touches**:
+- Code: `infra::record_queue`
+
+**Verified by**: `a_full_queue_refuses_the_record`, `a_stopped_queue_refuses_the_record`,
+`each_taken_record_is_processed`, `no_more_records_than_the_concurrency_run_at_once`,
+and `a_cancel_stops_the_worker_and_the_records_in_flight`.
+
+### Processing
+
+- [x] `p1` - **ID**: `cpt-cf-construct-dod-planner-processing`
+
+The system **MUST** take a record through the planner, the checks, Admission and the writer, **MUST** plan again on
+a write conflict up to the rerun limit, and **MUST** drop a record that fails with one content-free event.
+
+**Implements**:
+- `cpt-cf-construct-algo-planner-processing`
+- `cpt-cf-construct-algo-planner-read-profile`
+
+**Touches**:
+- Code: `domain::planner::processing`, `domain::record_intake::DropReason`
+
+**Verified by**: `domain::planner::processing_test`.
+
 ## 6. Acceptance Criteria
 
 - [ ] For a record and a profile, the planner builds a plan of add, replace and remove steps with node keys, the
@@ -289,6 +360,8 @@ record input with the payload, its schema and the numbered profile, without an I
 - [ ] No message or tool result sent to the model holds an ID.
 - [ ] A tool call that breaks a rule is refused with a reason, and the plan does not change.
 - [ ] A loop that hits a cap, or a failed model call, drops the record with a content-free event and gives no plan.
+- [ ] A full queue refuses a record, and intake answers `503` with no identity kept.
+- [ ] A write conflict plans the record again on the new profile; past the rerun limit the record is dropped.
 
 ## 7. Non-Functional Considerations
 
@@ -301,4 +374,8 @@ record input with the payload, its schema and the numbered profile, without an I
   all rounds. A record usually needs one to three rounds: tool calls, then an answer. Ten rounds leave room for
   the refusals the model has to correct and still end a loop that never answers. Each round sends the whole
   conversation again, so the token cap is sized for ten rounds over the instructions and a large profile.
+- **Queue and reruns**: the queue capacity, the records processed at once and the reruns come from the code that
+  builds the queue and the processing, with the caps. The intended values are 256 records, 4 at once and 3 reruns. A record usually takes one to three model calls, so four at once keep the model endpoint busy without
+  a burst of one connector taking all of it. A rerun happens only when two records of one subject are written at the
+  same time; three reruns end a loop where the profile keeps changing.
 - **Plan type**: the planner builds on `domain::plan`, the plan type the sensitive-data checks and Admission read.

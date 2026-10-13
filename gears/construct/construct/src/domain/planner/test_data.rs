@@ -1,8 +1,18 @@
+use std::collections::VecDeque;
+use std::num::{NonZeroU32, NonZeroU64};
+use std::sync::{Arc, Mutex};
+
+use async_trait::async_trait;
 use construct_sdk::person_types::PERSON_TYPES;
 use serde_json::{Value, json};
+use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
+use super::agent::PlannerCaps;
 use super::catalog::PropertyCatalog;
+use crate::domain::model_client::{
+    ModelClient, ModelError, ModelOutput, ModelRequest, ModelResponse, ToolCall, Usage,
+};
 use crate::domain::plan::{NodeKey, Origin};
 use crate::domain::profile::{Category, Fact, Profile};
 
@@ -87,4 +97,79 @@ pub(super) fn node_key(number: usize) -> NodeKey {
 pub(super) fn is_new_key(key: &NodeKey) -> bool {
     key.0.starts_with(&format!("construct:{TENANT}:"))
         && profile().facts.iter().all(|fact| fact.node_key != *key)
+}
+
+pub(super) type Answer = Result<ModelResponse, ModelError>;
+
+pub(super) fn caps() -> PlannerCaps {
+    PlannerCaps {
+        max_rounds: NonZeroU32::new(3).expect("rounds"),
+        max_tokens: NonZeroU64::new(10_000).expect("tokens"),
+    }
+}
+
+pub(super) struct ScriptedModel {
+    answers: Mutex<VecDeque<Answer>>,
+    requests: Mutex<Vec<ModelRequest>>,
+}
+
+impl ScriptedModel {
+    pub(super) fn answering(answers: Vec<Answer>) -> Arc<Self> {
+        Arc::new(Self {
+            answers: Mutex::new(answers.into()),
+            requests: Mutex::default(),
+        })
+    }
+
+    pub(super) fn requests(&self) -> Vec<ModelRequest> {
+        self.requests.lock().expect("lock").clone()
+    }
+}
+
+#[async_trait]
+impl ModelClient for ScriptedModel {
+    async fn complete(
+        &self,
+        _: &SecurityContext,
+        request: &ModelRequest,
+    ) -> Result<ModelResponse, ModelError> {
+        self.requests.lock().expect("lock").push(request.clone());
+        let mut answers = self.answers.lock().expect("lock");
+        if answers.len() > 1 {
+            answers.pop_front().expect("an answer")
+        } else {
+            answers.front().cloned().expect("an answer")
+        }
+    }
+}
+
+pub(super) fn usage(input_tokens: u64) -> Usage {
+    Usage {
+        input_tokens,
+        output_tokens: 20,
+    }
+}
+
+pub(super) fn tool_calls(calls: &[(&str, Value)], input_tokens: u64) -> ModelResponse {
+    ModelResponse {
+        output: ModelOutput::ToolCalls(
+            calls
+                .iter()
+                .enumerate()
+                .map(|(index, (name, arguments))| ToolCall {
+                    id: format!("call_{index}"),
+                    name: (*name).to_owned(),
+                    arguments: arguments.clone(),
+                })
+                .collect(),
+        ),
+        usage: Some(usage(input_tokens)),
+    }
+}
+
+pub(super) fn done(input_tokens: u64) -> ModelResponse {
+    ModelResponse {
+        output: ModelOutput::Text("The plan is complete.".to_owned()),
+        usage: Some(usage(input_tokens)),
+    }
 }
