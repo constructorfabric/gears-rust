@@ -172,7 +172,7 @@ async fn a_zero_amount_is_an_actionable_four_hundred() {
             json!({ "attribution": attribution(), "amount": 0, "idempotency_key": "k1" }),
         ),
         (
-            "/operations/evaluate",
+            "/operations/preview",
             json!({ "attribution": attribution(), "amount": 0 }),
         ),
         (
@@ -242,7 +242,7 @@ async fn a_preview_carries_no_key_and_says_it_is_one() {
 
     let (status, body) = post(
         &app,
-        "/operations/evaluate",
+        "/operations/preview",
         json!({ "attribution": attribution(), "amount": 10 }),
     )
     .await;

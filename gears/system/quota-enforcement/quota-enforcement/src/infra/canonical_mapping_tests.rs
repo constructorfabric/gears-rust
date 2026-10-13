@@ -527,3 +527,20 @@ fn the_remaining_variants_map_to_their_status_and_their_own_token() {
         assert!(body.contains(token), "{label}: {body}");
     }
 }
+
+#[test]
+fn an_unknown_quota_or_operation_names_its_token_on_the_wire() {
+    for (kind, token) in [
+        (ResourceKind::Quota, "UNKNOWN_QUOTA"),
+        (ResourceKind::Operation, "UNKNOWN_OPERATION"),
+    ] {
+        let problem = Problem::from(CanonicalError::from(DomainError::NotFound {
+            kind,
+            id: "k1".to_owned(),
+        }));
+        assert_eq!(problem.status, Some(404));
+        let body = serde_json::to_string(&problem).expect("problem serializes");
+        assert!(body.contains(token), "{body}");
+        assert!(body.contains("k1"), "the identifier is still named: {body}");
+    }
+}

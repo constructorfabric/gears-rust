@@ -141,7 +141,7 @@ consumption-operations feature), `cpt-cf-quota-enforcement-usecase-region-gated-
 6. [x] - `p1` - Call the named Engine's `validate_config(raw)` with the snapshotted schemas: the `cel` validator parses, type-checks, and statically verifies property/projection references and pair compatibility per `cpt-cf-quota-enforcement-algo-cel-engine`; the `most-restrictive-wins` validator rejects any non-empty config; validation work is bounded before it starts: the serialized `engine_config` by the operator-configured `config_max_bytes` (default 16 KiB, `POLICY_CONFIG_TOO_LARGE`), the schema snapshot by byte, schema-count, and depth limits (`POLICY_SCHEMA_TOO_LARGE`), and a `cel` expression by 8 KiB of source, 32 levels of bracket nesting, and 1024 AST nodes at depth 48 after macro expansion; write-path validation and cache-miss rebuilds share the `preparation_max_concurrency` cap (default 4) - `inst-pw-validate`
 7. [x] - `p1` - **IF** validation fails - `inst-pw-invalid-if`
    1. [x] - `p1` - **RETURN** the Engine's structured error before persistence; persisted Policies always carry an Engine-validated config - `inst-pw-invalid`
-8. [x] - `p1` - DB: in one storage transaction (`cpt-cf-quota-enforcement-seq-policy-version-update`): insert the new `quota_resolution_policy_version` row with `version_state = active` (create: `policy_version = 1`; update: `N + 1`) carrying the step-5 schema snapshot narrowed to the inputs the config reads, transition the prior active version to `superseded` (update only), move the latest-pointer atomically, enqueue the `policy-changed` event (`change_kind = created` or `updated`) in the same transaction (invariant I11; dispatch is owned by the notifications feature). The compiled artifact from step 6 is retained and published into the `ValidatedConfig` cache keyed by `(policy_id, policy_version)` only after the transaction commits, per the Engine Plugin Trait compiled-artifact contract; a rolled-back transaction publishes nothing; the cache holds at most `artifact_cache_entries` artifacts (default 512) and evicts the oldest first, and a cache miss rebuilds from the persisted config - `inst-pw-persist`
+8. [x] - `p1` - DB: in one storage transaction (`cpt-cf-quota-enforcement-seq-policy-version-update`): insert the new `policy_versions` row with `version_state = active` (create: `policy_version = 1`; update: `N + 1`) carrying the step-5 schema snapshot narrowed to the inputs the config reads, transition the prior active version to `superseded` (update only), move the latest-pointer atomically, enqueue the `policy-changed` event (`change_kind = created` or `updated`) in the same transaction (invariant I11; dispatch is owned by the notifications feature). The compiled artifact from step 6 is retained and published into the `ValidatedConfig` cache keyed by `(policy_id, policy_version)` only after the transaction commits, per the Engine Plugin Trait compiled-artifact contract; a rolled-back transaction publishes nothing; the cache holds at most `artifact_cache_entries` artifacts (default 512) and evicts the oldest first, and a cache miss rebuilds from the persisted config - `inst-pw-persist`
 9. [x] - `p1` - **IF** `if_match_version` does not equal the current latest - `inst-pw-conflict-if`
    1. [x] - `p1` - **RETURN** `VERSION_CONFLICT` (409) with the current latest; increment `policy_version_conflict_rejections_total`; no version row is written - `inst-pw-conflict`
 10. [x] - `p1` - **RETURN** `201 Created` (create) or `200 OK` (update) with the new `PolicyVersion`; increment `policy_version_transitions_total`; every replica's next evaluation observes the new version through the authoritative pointer read - `inst-pw-return`
@@ -304,7 +304,7 @@ upstream DESIGN/consumption-operations alignment item); Active versions are neve
 - [ ] `p1` - **ID**: `cpt-cf-quota-enforcement-dod-policy-service`
 
 The system **MUST** deliver `PolicyService` owning the Quota Resolution Policy lifecycle over the
-`quota_resolution_policy` and `quota_resolution_policy_version` tables via the storage plugin: create, update (new
+`policies` and `policy_versions` tables (audited in `policy_operation_log`) via the storage plugin: create, update (new
 immutable version), rollback, soft-delete (narrow-scope only), read latest or a specific version, and list versions,
 with version-based optimistic concurrency (`VERSION_CONFLICT` on `if_match_version` mismatch), atomic
 version-plus-latest-pointer transitions, most-specific-scope selection (per-metric over `global`) with the latest-version pointer read authoritatively from
@@ -355,9 +355,10 @@ active Policy ever references an unregistered Engine.
 - [ ] `p1` - **ID**: `cpt-cf-quota-enforcement-dod-engine-contract`
 
 The system **MUST** ship `QuotaResolutionEngineV1` in the `quota-enforcement-sdk` crate as a sync trait with three
-methods: `id() -> &str`, `validate_config(raw: &serde_json::Value) -> Result<Box<dyn ValidatedConfig>,
-EngineConfigError>`, and `evaluate(ctx: &EvaluationContext, config: &dyn ValidatedConfig) -> Result<Decision,
-EngineError>`, where `ValidatedConfig` is an opaque marker trait (`Any + Send + Sync`) and `EngineError` is the closed
+methods: `id() -> &'static str`, `validate_config(input: EngineValidationInput) -> Result<Arc<dyn ValidatedConfig>,
+EngineConfigError>` (the raw config plus the Policy's schema snapshot), and `evaluate(ctx: &EvaluationContext, config:
+&dyn ValidatedConfig) -> Result<Decision, EngineError>`, where `ValidatedConfig` (`Any + Send + Sync`) exposes
+`as_any()` for the Engine's downcast and `inputs()` for the environment inputs it reads, and `EngineError` is the closed
 enum `{Timeout, CostExceeded, TypeError, InvalidConfig, Internal}`. `evaluate` **MUST** be deterministic given the
 `EvaluationContext` and **MUST NOT** perform I/O; cost-bounding is the Engine implementation's responsibility. Engines
 whose evaluation requires a compiled artifact rely on the `ValidatedConfig` cache keyed by

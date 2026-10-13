@@ -392,7 +392,7 @@ pub fn register(mut router: Router, openapi: &dyn OpenApiRegistry) -> Router {
         .json_response_with_schema::<DecisionDto>(openapi, StatusCode::OK, "The decision")
         .standard_errors(openapi)
         .register(router, openapi);
-    OperationBuilder::post(format!("{prefix}/operations/evaluate"))
+    OperationBuilder::post(format!("{prefix}/operations/preview"))
         .operation_id("quota_enforcement.evaluate_preview")
         .summary("Evaluate without mutating anything")
         .description("A dry run. Persists nothing and occupies no idempotency key.")
