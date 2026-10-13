@@ -49,7 +49,8 @@ impl FilterField for GroupFilterField {
     fn kind(&self) -> FieldKind {
         match self {
             // Type is a GTS type path string in the public API; the persistence
-            // layer resolves string paths to SMALLINT IDs after OData validation.
+            // service resolves string paths to Registry References (UUIDs) through the
+            // Types Registry before the query runs.
             Self::Type | Self::Name => FieldKind::String,
             Self::HierarchyParentId | Self::TenantId | Self::Id => FieldKind::Uuid,
         }

@@ -1741,6 +1741,7 @@ name = "cf-gears-account-management-sdk"
 version = "0.8.0"
 dependencies = [
  "async-trait",
+ "cf-gears-resource-group-sdk",
  "cf-gears-tenant-resolver-sdk",
  "cf-gears-toolkit",
  "cf-gears-toolkit-canonical-errors",
