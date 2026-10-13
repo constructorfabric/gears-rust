@@ -71,6 +71,35 @@ fn a_drop_event_names_the_record_its_stage_and_its_reason() {
 
 #[tracing_test::traced_test]
 #[test]
+fn each_planner_reason_is_logged_by_its_own_name() {
+    let cases = [
+        (DropReason::RoundCap, "round_cap"),
+        (DropReason::TokenCap, "token_cap"),
+        (DropReason::ModelFailed, "model_failed"),
+    ];
+    let mut expected = Vec::new();
+    for (reason, name) in cases {
+        let record = received(Some(Uuid::new_v4()));
+        LogIntakeEvents.dropped(DropEvent::for_record(&record, DropStage::Planner, reason));
+        expected.push((record.tenant_id.to_string(), name));
+    }
+
+    logs_assert(|lines: &[&str]| {
+        for (tenant_id, name) in &expected {
+            let line = lines
+                .iter()
+                .find(|line| line.contains(tenant_id.as_str()))
+                .ok_or(format!("no line for {tenant_id}"))?;
+            if !line.contains(&format!("reason=\"{name}\"")) {
+                return Err(format!("{tenant_id} is not logged as {name}: {line}"));
+            }
+        }
+        Ok(())
+    });
+}
+
+#[tracing_test::traced_test]
+#[test]
 fn the_drop_event_is_logged_without_record_content() {
     let subject = Uuid::new_v4();
     let record = received(Some(subject));

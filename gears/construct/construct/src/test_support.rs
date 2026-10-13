@@ -25,8 +25,8 @@ use crate::domain::admission::{
 use crate::domain::error::DomainError;
 use crate::domain::plan::{Change, NodeKey, Origin, Plan, PlanValue, Property, Step};
 use crate::domain::record_intake::{
-    DropEvent, IntakeEvents, IntakePorts, ReceivedRecord, RecordHandOff, RecordIntakeService,
-    RecordTypes,
+    DropEvent, Envelope, IntakeEvents, IntakePorts, ReceivedRecord, RecordHandOff,
+    RecordIntakeService, RecordTypes,
 };
 use crate::domain::sensitive_data::{Found, SensitiveDataCheck, SensitiveDataKind, Verdict};
 use crate::domain::subject_settings::{
@@ -273,6 +273,23 @@ pub fn chat_record(subject_id: Uuid, provenance: &str, version: &str) -> serde_j
             "text": "Which of these two papers contradict each other?"
         }
     })
+}
+
+/// A received chat message for `subject_id` in `tenant_id`, as intake hands it on.
+pub fn received_chat_record(tenant_id: Uuid, subject_id: Uuid) -> ReceivedRecord {
+    let provenance = "chat_engine/thread-42/msg-7";
+    ReceivedRecord {
+        tenant_id,
+        connector: "chat_engine".to_owned(),
+        envelope: Envelope {
+            type_id: construct_sdk::gts::CHAT_MESSAGE_TYPE.to_owned(),
+            provenance: provenance.to_owned(),
+            version: "v1".to_owned(),
+            subject_id: Some(subject_id),
+            observed_at: time::OffsetDateTime::UNIX_EPOCH,
+        },
+        record: chat_record(subject_id, provenance, "v1"),
+    }
 }
 
 /// One valid record of each derived type: the rolos-cyber examples

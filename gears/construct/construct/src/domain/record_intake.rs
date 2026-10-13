@@ -165,6 +165,12 @@ pub enum DropReason {
     NoPlanner,
     /// Processing could not finish.
     ProcessingFailed,
+    /// Planner: the last round still ended in tool calls.
+    RoundCap,
+    /// Planner: the model calls used more tokens than its cap.
+    TokenCap,
+    /// Planner: a model call failed, reported no usage, or answered in a form the planner cannot use.
+    ModelFailed,
     /// A sensitive-data check failed, or answered outside the plan.
     CheckFailed,
     /// Admission: personalization is off for the subject.
@@ -179,6 +185,27 @@ pub enum DropReason {
     EntityKindNotAllowed,
     /// Admission: the plan is over the tenant's write caps.
     WriteCapExceeded,
+}
+
+impl DropReason {
+    /// The reason's name in the drop event and in logs.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::NoPlanner => "no_planner",
+            Self::ProcessingFailed => "processing_failed",
+            Self::RoundCap => "round_cap",
+            Self::TokenCap => "token_cap",
+            Self::ModelFailed => "model_failed",
+            Self::CheckFailed => "check_failed",
+            Self::PersonalizationOff => "personalization_off",
+            Self::ErasureInProgress => "erasure_in_progress",
+            Self::UntrustedSource => "untrusted_source",
+            Self::BelowConfidenceFloor => "below_confidence_floor",
+            Self::EntityKindNotAllowed => "entity_kind_not_allowed",
+            Self::WriteCapExceeded => "write_cap_exceeded",
+        }
+    }
 }
 
 /// A content-free event for a dropped record: the tenant, the subject, the

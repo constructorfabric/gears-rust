@@ -1,4 +1,4 @@
-use crate::domain::record_intake::{DropEvent, DropReason, DropStage, IntakeEvents};
+use crate::domain::record_intake::{DropEvent, DropStage, IntakeEvents};
 
 /// [`IntakeEvents`] written to the structured log, until the Audit gear ships.
 /// The event carries no record content.
@@ -16,20 +16,6 @@ fn stage(stage: DropStage) -> &'static str {
     }
 }
 
-fn reason(reason: DropReason) -> &'static str {
-    match reason {
-        DropReason::NoPlanner => "no_planner",
-        DropReason::ProcessingFailed => "processing_failed",
-        DropReason::CheckFailed => "check_failed",
-        DropReason::PersonalizationOff => "personalization_off",
-        DropReason::ErasureInProgress => "erasure_in_progress",
-        DropReason::UntrustedSource => "untrusted_source",
-        DropReason::BelowConfidenceFloor => "below_confidence_floor",
-        DropReason::EntityKindNotAllowed => "entity_kind_not_allowed",
-        DropReason::WriteCapExceeded => "write_cap_exceeded",
-    }
-}
-
 impl IntakeEvents for LogIntakeEvents {
     fn dropped(&self, event: DropEvent) {
         // @cpt-begin:cpt-cf-construct-algo-record-intake-drop-event:p1:inst-drop-event-log
@@ -43,7 +29,7 @@ impl IntakeEvents for LogIntakeEvents {
             version = %event.version,
             record_type = %event.type_id,
             stage = stage(event.stage),
-            reason = reason(event.reason),
+            reason = event.reason.name(),
             "record dropped"
         );
         // @cpt-end:cpt-cf-construct-algo-record-intake-drop-event:p1:inst-drop-event-log
