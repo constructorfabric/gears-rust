@@ -4716,6 +4716,8 @@ dependencies = [
  "aws-lc-rs",
  "axum",
  "base64 0.22.1",
+ "cf-gears-account-management-sdk",
+ "cf-gears-resource-group-sdk",
  "cf-gears-test-containers",
  "cf-gears-toolkit",
  "cf-gears-toolkit-canonical-errors",
