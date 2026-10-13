@@ -71,3 +71,4 @@ toolkit-gts = { workspace = true }
 tower = { workspace = true, features = ["util"] }
 proptest = { workspace = true }
 tracing-test = { workspace = true }
+reqwest = { workspace = true }
