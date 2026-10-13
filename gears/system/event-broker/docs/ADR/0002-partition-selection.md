@@ -7,6 +7,7 @@ revision-history:
   - 2026-05-12 — revised (drop explicit `partition` override; broker re-hashes and is authoritative)
   - 2026-06-07 — default partition key changed from `subject` to `tenant`: a tenant's events are totally ordered by default
   - 2026-09-01 — the partition key is a JSON Pointer declared by the event type, validated at registration; no publish-time key
+  - 2026-10-02 - the storage backend maps the key to a partition with a function of its own choice; determinism is the only contract
 ---
 
 # Partition Selection — A JSON Pointer Declared by the Event Type
@@ -17,10 +18,10 @@ revision-history:
 - [Decision Drivers](#decision-drivers)
 - [Considered Options](#considered-options)
 - [Decision Outcome](#decision-outcome)
-  - [Default Algorithm](#default-algorithm)
+  - [Key to Partition](#key-to-partition)
   - [The Pointer](#the-pointer)
   - [Registration-Time Validation](#registration-time-validation)
-  - [Hash Location](#hash-location)
+  - [Partition Location](#partition-location)
   - [Encoding](#encoding)
   - [Consequences](#consequences)
   - [Confirmation](#confirmation)
@@ -41,22 +42,22 @@ revision-history:
 
 ## Context and Problem Statement
 
-A topic in the Gears event broker is divided into partitions, whose count is broker configuration (see DESIGN §3.1). Every `Event` is bound to a partition; sequence assignment, ordering, idempotent-producer state, and consumer cursors are all scoped to `(topic, partition)`. The broker therefore needs a contract for **how partition assignment is computed** before the event is enqueued in the producer outbox and ultimately landed in `backend.persist`.
+A topic in the Gears event broker is divided into partitions, whose count is broker configuration until the topic is provisioned, and the count its backend reports from then on (feature 0006 §2.2) (see DESIGN §3.1). Every stored `Event` is bound to a partition; sequence assignment, ordering, and consumer cursors are all scoped to `(topic, partition)`. The broker therefore needs a contract for **which value decides an event's partition, and what is promised about how that value maps to one**.
 
 The existing design imposes hard constraints on this decision:
 
 - The partition count cannot be grown or shrunk on a live topic. Re-partitioning would break per-key ordering for every key already published; the migration path is "create new topic, dual-write, cut consumers over." Partition selection MUST therefore behave deterministically across the topic's full lifetime.
-- The broker assigns the consumer-visible `event.sequence` per `(topic, partition)`. Producers never set `sequence`; they only carry chain state for ingest-side dedup in `meta.previous` and `meta.sequence` (see [ADR-0003 Event Schema](0003-event-schema.md)).
-- Idempotent-producer state is keyed by `(producer_id, topic, partition)` (`evbk_producer_state`). The same producer publishing "the same logical event" on a retry MUST land on the same partition, otherwise the chain check fires against a state row that does not contain the previous attempt and the duplicate is admitted.
+- A topic's log lives in a storage backend (feature 0007), and the backend assigns the consumer-visible `event.sequence` per `(topic, partition)`. Producers never set `sequence`; they only carry chain state for ingest-side dedup in `meta.previous` and `meta.sequence` (see [ADR-0003 Event Schema](0003-event-schema.md)).
+- Producer chain state is keyed by `(producer_id, topic)` and checked at ingest, before any partition exists (see [ADR-0004](0004-idempotent-producer-protocol.md)), so deduplication does not depend on where an event lands.
+- Storage media place keys differently: a Kafka cluster has its own partitioner, a database plugin its own hash. A contract that mandates one function binds every medium to it.
 - Every consumer of a topic depends on the *same* key-to-partition mapping. Ordering is a property the whole set of consumers observes, so the choice of key cannot be one that individual publishers make independently.
 
 ## Decision Drivers
 
-* Per-key order: events sharing a stable partition key MUST land on the same partition for the lifetime of the topic so consumers observe them in publish order
+* Per-key order: events sharing a stable partition key MUST land on the same partition for the lifetime of the topic on its backend, so consumers observe them in publish order
 * One decision per type, not per message: the routing contract MUST be the same for every publisher of an event type, and visible to every consumer of it
 * Even distribution under unbiased keys: the chosen partition distribution SHOULD be approximately uniform across the partition count
-* Idempotent retry determinism: a retry of the same logical publish MUST resolve to the same `partition`, otherwise idempotent-producer dedup degrades to "best effort"
-* First-party SDK / broker parity: when an SDK computes a local partition hint for outbox routing, it must use the same input as the broker
+* Backend freedom: each storage medium places keys the way it does natively; the contract asks only for what per-key order needs
 * Fail early: a mis-declared routing contract SHOULD be caught once, when the type is registered, rather than on every publish of it
 * Reach: the interesting keys frequently live inside the payload, so the contract MUST be able to name a member of `data`
 * Schema extensibility: support legitimate cases where the partition key differs from the event subject (per-tenant audit, system events with no business-domain subject, deliberate fan-out)
@@ -73,27 +74,28 @@ The existing design imposes hard constraints on this decision:
 
 ## Decision Outcome
 
-Adopt a **JSON Pointer (RFC 6901) declared by the event type**, naming the member of an event whose value is hashed. The pointer is an `x-gts-traits` value on the event type's GTS schema, merged along the derivation chain like every other trait, and the base event type defaults it to `/tenant_id`.
+Adopt a **JSON Pointer (RFC 6901) declared by the event type**, naming the member of an event whose value is the event's partition key. The pointer is an `x-gts-traits` value on the event type's GTS schema, merged along the derivation chain like every other trait, and the base event type defaults it to `/tenant_id`.
 
-An event carries no partition key. There is no publish-time way to choose one, and no explicit `partition` field. The broker computes the final topic partition; any producer SDK partition computation is an internal/local hint for outbox routing.
+An event carries no partition key. There is no publish-time way to choose one, and no explicit `partition` field. Ingest resolves the pointer and hands the key to the topic's storage backend with the event; the backend maps the key to a partition with a function of its own choice.
 
 The `/tenant_id` default gives **per-tenant total ordering** out of the box - every event a tenant emits to a topic lands on one partition and is observed in publish order, the property the audit pipeline needs. A type that wants finer-grained grouping declares a pointer at the member it wants to group by.
 
-### Default Algorithm
+### Key to Partition
 
-The partition is computed deterministically from a single input:
+The partition follows from a single input:
 
 ```text
-pointer         = event type's `partition_key` trait, resolved along its chain
-partition_input = the value `pointer` resolves to within the event
-partition       = local_derivation(ascii_bytes(partition_input)) % partition_count
+pointer   = event type's `partition_key` trait, resolved along its chain
+key       = the value `pointer` resolves to within the event, as ASCII text
+partition = backend_function(topic, key)    # the storage backend's own choice
 ```
 
-- Current first-party SDK/broker implementation: **MurmurHash3 (32-bit, x86 variant)** with a fixed seed of `0x00000000`, masked with `& 0x7FFFFFFF` before modulo. This pins first-party SDK hints to broker validation but is not a native Kafka producer compatibility promise.
-- The mask `& 0x7FFFFFFF` strips the sign bit so the modulo operates on a non-negative `u31` value and avoids the negative-modulo edge case in languages with signed `%`.
-- The bytes hashed MUST be the **ASCII byte representation** of the resolved value. Per the platform convention recorded in [ADR-0003 Event Schema § Event Field Encoding](0003-event-schema.md#event-field-encoding-ascii-only), all event string fields are ASCII; UTF-8 is permitted only inside `data`. A pointer into `data` therefore carries a caller obligation to name an ASCII member.
-- A pointer resolving to a JSON string hashes its contents; one resolving to a number or boolean hashes its JSON form, so a numeric identifier is usable without a producer stringifying it. A pointer resolving to an object, an array, or null is an error rather than a silent fallback.
-- Producers MUST NOT provide a top-level topic `partition`. First-party SDKs that send an internal `meta.partition_hint` MUST compute it with the broker-supported local derivation for that broker version.
+- **The only contract is determinism**: for a topic on a backend, a given key always maps to the same partition, on every instance. Nothing else about the function is promised - not which partition, not agreement between backends.
+- Any deterministic function qualifies. One example is MurmurHash3 (32-bit, x86 variant) with a fixed seed of `0x00000000`, masked with `& 0x7FFFFFFF` and taken modulo the topic's partition count; a Kafka plugin may use Kafka's own partitioner instead.
+- A changed function, re-partitioning, or a move between backends with different functions changes where keys land. Per-key ordering across such a change is the end user's to handle; the broker does not carry it across.
+- The key MUST be the **ASCII byte representation** of the resolved value. Per the platform convention recorded in [ADR-0003 Event Schema § Event Field Encoding](0003-event-schema.md#event-field-encoding-ascii-only), all event string fields are ASCII; UTF-8 is permitted only inside `data`. A pointer into `data` therefore carries a caller obligation to name an ASCII member.
+- A pointer resolving to a JSON string yields its contents as the key; one resolving to a number or boolean yields its JSON form, so a numeric identifier is usable without a producer stringifying it. A pointer resolving to an object, an array, or null is an error rather than a silent fallback.
+- Producers MUST NOT provide a top-level topic `partition`. An event has no partition until its backend stores it.
 
 ### The Pointer
 
@@ -133,31 +135,19 @@ This is the right moment for the check because:
 
 The failure is a validation error naming the pointer and the member it failed to find, so the registering gear can correct the declaration without reading broker code.
 
-### Hash Location
+### Partition Location
 
-Partition selection happens in **both** the producer SDK and the broker:
+Partition selection happens in the **storage backend**, and only there:
 
-- **Producer SDK** resolves the pointer from the prepared event type and computes the partition locally before calling `outbox.enqueue()`, so the `toolkit-db` outbox can route the row to the correct per-`(topic, partition)` outbox shard and preserve order.
-- **Broker** re-resolves the pointer on ingest from the registered event type and re-computes the partition. The broker's value is authoritative; if persisted at all, the SDK-computed value is treated as a hint only.
+- **Ingest** resolves the pointer from the registered event type and passes the key with the event to `append` (feature 0007 §2.2). It computes no topic partition and stamps none on the event.
+- **The backend** maps the key to one of the topic's partitions and assigns the sequence.
+- **Producers** compute no topic partition and send none.
 
-The trade-offs:
-
-- Adds one Murmur3-32 hash plus one pointer resolution to the ingest path (~ns-scale; negligible against the DB write that follows).
-- Adds defense-in-depth against SDK bugs: if the SDK stamps an internal `meta.partition_hint` for outbox routing, the broker validates equality and returns `400 PartitionHashMismatch` on drift.
-
-Each partition domain derives its own local partition from the same resolved input and its own partition count, so the counts need not agree:
-
-```text
-producer local/outbox partition = local_derivation(partition_input) % producer_outbox_partitions
-broker topic partition          = broker_derivation(partition_input) % broker topic partitions
-ingest service shard            = ingest_derivation(partition_input or topic/partition) % ingest_shard_count
-```
-
-These counts can legitimately differ, such as 16 producer outbox partitions, 64 broker topic partitions, and 8 ingest shards. A topic reports no partition count, so a producer computing a local hint declares the count its broker is configured with.
+A producer's own partitions (for example its outbox partitions), ingest's outbox slots, and the backend's partitions of the topic log are distinct concepts, and none is derived from another. Only the backend's partition is the topic partition that sequences, ordering and cursors are scoped to.
 
 ### Encoding
 
-All inputs to the hash are ASCII per [ADR-0003 § Event Field Encoding](0003-event-schema.md#event-field-encoding-ascii-only). The broker rejects publishes with non-ASCII bytes in the resolved value with `400 InvalidEventFieldEncoding` before partition computation is attempted.
+The partition key is ASCII per [ADR-0003 § Event Field Encoding](0003-event-schema.md#event-field-encoding-ascii-only). The broker rejects publishes with non-ASCII bytes in the resolved value with `400 InvalidEventFieldEncoding` before the event is enqueued.
 
 ### Consequences
 
@@ -165,30 +155,29 @@ All inputs to the hash are ASCII per [ADR-0003 § Event Field Encoding](0003-eve
 - Good, because per-`tenant` ordering holds by default, with zero declaration - a tenant's events on a topic are totally ordered, which is the common platform need.
 - Good, because a mis-declared key is rejected at registration rather than failing on every publish, and the party that can fix it is the party that sees the error.
 - Good, because the pointer reaches inside `data`, so grouping by a payload identifier needs no synthesized envelope field.
-- Good, because idempotent retries are deterministic: the same event resolves through the same pointer to the same `partition` and therefore to the same `evbk_producer_state` row, so chain dedup works as designed.
+- Good, because each backend places keys the way its medium does natively - a Kafka plugin can use Kafka's partitioner - and the broker carries no partition function of its own.
 - Good, because the event schema is one field smaller and carries no member whose only purpose is routing.
 - Bad / accepted limitation, because **re-partitioning is not supported**. The only way to change the count is the dual-write migration path. Deliberate match to Kafka semantics; consumers depend on stable key-to-partition mapping.
+- Bad / accepted limitation, because **per-key ordering holds only while the backend's function holds**. A changed function, re-partitioning, or a move between backends with different functions re-places keys, and ordering across that change is the end user's to handle.
 - Bad / accepted limitation, because **changing an event type's pointer re-routes its future events**. Events already published keep their partition, so per-key ordering spans the change only if the pointer resolves to the same value. A type that needs a different key is a new type.
 - Bad / accepted limitation, because **a pointer may name an optional member**. The registration check proves the member is *declared*, not that every event carries it; an event omitting it is rejected at publish. A type whose grouping must always resolve declares the member required.
-- Bad / accepted limitation, because **no per-topic partitioner choice in MVP**. Every topic uses the same Murmur3 algorithm.
-- Bad / accepted limitation, because **hash collisions are accepted**. Two distinct values can map to the same partition; intrinsic to modulo-hash partitioning.
+- Bad / accepted limitation, because **key placement is not portable across backends**. Two backends may place one key on different partitions, so a key's partition cannot be predicted from the key alone.
+- Bad / accepted limitation, because **collisions are accepted**. Two distinct values can map to the same partition; intrinsic to mapping keys onto a fixed partition count.
 - Bad / accepted limitation, because **a large tenant hot-spots its partition** under the default - all of one tenant's events route to a single partition, so a high-volume tenant gets no intra-tenant parallelism and can become a noisy neighbour. Accepted in exchange for per-tenant ordering; the escape hatch is a type-level pointer at a finer-grained member.
-- Bad / accepted limitation, because **adversarial values can hot-spot a partition**. Murmur3 is not cryptographic, so a type should point at an authenticated, normalized identifier rather than a raw attacker-controlled free-form member. The broker's threat model treats producers as authenticated trusted modules; opening ingest to untrusted producers requires a separately versioned keyed partition algorithm and migration design.
-- Bad / accepted cost, because **the broker spends one Murmur3-32 hash per ingest** that the SDK already computed. Sub-microsecond; negligible against the DB write that follows.
+- Bad / accepted limitation, because **adversarial values can hot-spot a partition**. A backend's function is typically not cryptographic, so a type should point at an authenticated, normalized identifier rather than a raw attacker-controlled free-form member. The broker's threat model treats producers as authenticated trusted modules; opening ingest to untrusted producers requires keyed placement in the backends and a migration design.
+- Bad / accepted cost, because **ingest resolves one pointer per event**. Sub-microsecond; negligible against the write that follows.
 
 ### Confirmation
 
 The decision is verified by:
 
 - **Registration tests**: a pointer into `data` is admitted; a pointer naming a member the type inherits from the base is admitted; a pointer naming no declared member is rejected with a message naming the pointer; a value that is not a JSON Pointer is rejected.
-- **SDK unit tests** pinning the current first-party local derivation: known input → known partition, with partition counts 1, 2, 16, 64. The tests SHALL fail any future SDK change that drifts from the broker-supported derivation for that version.
-- **Broker-side test** of the same fixture vector: the broker's re-hash matches the SDK's per-vector value bit-for-bit.
+- **Backend determinism tests** (per plugin): one key maps to the same partition across calls, across plugin instances built from the same settings, and across a restart, with partition counts 1, 2, 16, 64.
+- **Ingest test**: the key handed to `append` is the value the pointer resolves to, and ingest stamps no partition on the event.
 - **Routing tests**: a type declaring no pointer partitions by tenant, so two events of one tenant share a partition; a type pointing at a member two *different* tenants share routes both to one partition, which is the property that proves the key is the type's choice rather than the tenant's.
 - **Broker rejection tests**:
   - Publish with top-level `partition` field → `400 BadRequest` (`...partition.forbidden.v1`).
-  - Publish with `meta.partition_hint` that disagrees with broker's re-hash → `400 PartitionHashMismatch` (`...partition.hash.mismatch.v1`).
   - Publish with non-ASCII bytes in the resolved value → `400 InvalidEventFieldEncoding`.
-- **Idempotent-retry test**: a producer publishes with chained mode, retries the publish without the original network response, and the test asserts both attempts resolve to the same partition (so they hit the same `evbk_producer_state` row) and the second is rejected per the chain protocol (`412 SequenceViolation` for chain mismatch, `200 OK` for duplicate).
 
 ## Pros and Cons of the Options
 
@@ -200,12 +189,12 @@ The decision is verified by:
 * Good, because a pointer reaches into `data`, covering the common case where the grouping identifier is a payload member
 * Good, because the declaration is checkable at registration, so the failure mode is closed-ended
 * Bad, because a type author must think about ordering at registration time rather than deferring it to publish sites - which is the point, but it does move the decision earlier
-* Bad, because Murmur3 is not cryptographic - adversarial values can collide on one partition (accepted; producer threat model is "trusted modules")
+* Bad, because a backend's function is typically not cryptographic - adversarial values can collide on one partition (accepted; producer threat model is "trusted modules")
 * Bad, because the broker resolves a pointer once per ingest (accepted; sub-microsecond cost)
 
 ### A Producer-Supplied `partition_key` Field on the Event
 
-**Description**: An optional body-level `partition_key: Option<String>` on the event, hashed when present and falling back to `tenant_id` otherwise.
+**Description**: An optional body-level `partition_key: Option<String>` on the event, used as the key when present and falling back to `tenant_id` otherwise.
 
 * Good, because a publisher can choose grouping per message with no type change
 * Good, because the fallback makes the default path always defined - `tenant_id` is required on every event
@@ -221,15 +210,15 @@ The decision is verified by:
 
 * Good, because the escape hatch covers niche use cases without bloating the default path
 * Good, because producers replaying historical data could preserve the original partition numbers
-* Bad / decisive against, because **a refactor that switches a code path from declaring a key to setting `partition` directly quietly breaks per-key ordering on a live topic**, and the broker has no way to tell whether the producer *meant* to bypass the hash. It is invisible in CI and staging and manifests only as a production ordering anomaly.
+* Bad / decisive against, because **a refactor that switches a code path from declaring a key to setting `partition` directly quietly breaks per-key ordering on a live topic**, and the broker has no way to tell whether the producer *meant* to bypass the key. It is invisible in CI and staging and manifests only as a production ordering anomaly.
 * Bad, because the niche use cases re-decompose cleanly:
-  - **Test fixtures**: point the fixture's event type at a member the test varies; the hash is deterministic.
+  - **Test fixtures**: point the fixture's event type at a member the test varies; the backend's mapping is deterministic.
   - **Cross-system replay**: preserve the source system's *key*, not its partition number. Source N's partition layout is irrelevant once events land in our broker.
   - **Operator-driven traffic shaping**: an operator-side concern for replay tooling, not a producer-facing API.
 
 ### Always Derive Partition From `event.subject`
 
-**Description**: No declaration at all; `partition = murmur3(subject) % N` always.
+**Description**: No declaration at all; the partition key is always `event.subject`.
 
 * Good, because there is nothing to declare and nothing to get wrong
 * Bad, because `subject` and the grouping key are not always the same - audit aggregation per tenant, system events with no domain subject, and deliberate fan-out for non-causal events all need a different key
@@ -252,7 +241,6 @@ The decision is verified by:
 
 * Good, because partition utilization is even by construction
 * Bad, because it violates the design's central per-topic-ordering guarantee; two events about the same subject end up on different partitions
-* Bad, because idempotent producer retry becomes non-deterministic
 * Bad, because the only legitimate niche (high-volume non-causal events wanting even spread) is covered by pointing a type at a member that varies per event
 
 ### Custom Pluggable Partitioner Trait in SDK (MVP)
@@ -262,16 +250,15 @@ The decision is verified by:
 * Good, because it is maximally extensible
 * Bad, because a pluggable partitioner that disagrees across producer instances on the same topic silently breaks per-key ordering - one Pod hashes with FNV, the other with Murmur3, and a fraction of keys land on different partitions
 * Bad, because it expands the public SDK surface before any concrete second use case has been identified (YAGNI)
-* Bad, because the broker is authoritative on partition assignment - a custom SDK partitioner that disagrees with the broker's Murmur3 simply gets `400 PartitionHashMismatch` on every publish
+* Bad, because the SDK places nothing: the storage backend maps keys to partitions, so an SDK partitioner has no decision to make
 * Captured as a post-MVP extension in [More Information](#more-information) if and when a real second use case appears
 
 ## More Information
 
 - **Sticky-batch partitioning post-MVP**: Kafka 2.4+ offers a "sticky batch" partitioner that keeps consecutive keyless events on the same partition for batching efficiency, then rotates. Likely worth offering as an opt-in once the SDK gains true batch-publish performance work; deferred.
-- **Pluggable Partitioner trait**: if a real second use case appears (e.g., a producer wanting weighted partition selection for hot-tenant isolation), the SDK could expose a `Partitioner` trait - but the broker would still be authoritative and reject mismatches, so any pluggable scheme would need an explicit broker-side contract. Decision deferred until a concrete request lands.
+- **Pluggable Partitioner trait**: if a real second use case appears (e.g., weighted partition selection for hot-tenant isolation), it belongs in the backend's function, as that backend's configuration, not in the SDK. Decision deferred until a concrete request lands.
 - **Requiring the pointed-at member**: the registration check proves the member is declared, not that it is required. Tightening it to reject a pointer at an optional member, or at a `readOnly` one that can never be present on publish, is a plausible next step and is not decided here.
-- **Hash function evolution**: Murmur3 has known weaknesses against adversarial inputs. The threat model treats producers as trusted, but if the broker ever opens to untrusted producers (e.g., a public ingest endpoint), it requires a separately versioned keyed partition algorithm and a migration plan that preserves existing topic assignments. Out of scope for MVP.
-- **`meta.partition_hint`**: an internal SDK-stamped optimization the broker may accept to short-circuit re-hashing once cross-validated; not part of the public producer API. The SDK MAY omit it; the broker MUST handle its absence gracefully.
+- **Function evolution**: common deterministic functions (MurmurHash3 among them) have known weaknesses against adversarial inputs. The threat model treats producers as trusted, but if the broker ever opens to untrusted producers (e.g., a public ingest endpoint), it requires keyed placement in the backends and a migration plan that preserves existing topic assignments. Out of scope for MVP.
 
 External references:
 
@@ -284,16 +271,18 @@ External references:
 ## Traceability
 
 - **PRD**: [PRD.md](../PRD.md)
-  - `cpt-cf-evbk-fr-publish-single` — single-event publish; partition is broker-derived
-  - `cpt-cf-evbk-fr-publish-batch` — batch publish requires same `(topic, partition)` for all events (broker derives partition; a batch's events must resolve through their types' pointers to one partition)
-  - `cpt-cf-evbk-fr-producer-modes` — chained / monotonic dedup uses chain check on `evbk_producer_state(producer_id, topic, partition)`; partition determinism on retry is the dedup invariant
+  - `cpt-cf-evbk-fr-publish-single` - single-event publish; the storage backend assigns the partition
+  - `cpt-cf-evbk-fr-publish-batch` - batch publish; ingest resolves each event's key and the backend places each event
+  - `cpt-cf-evbk-fr-producer-modes` - chained / monotonic dedup checks chain state per `(producer_id, topic)`, independent of the partition
 - **DESIGN**: [DESIGN.md](../DESIGN.md)
   - §1.1 Architectural Vision — per-topic ordering centrality
   - §2.1 Design Principles — Per-topic ordering, Immutable log
   - §3.1 Domain Model — "Partition count is broker configuration" subsection
   - §3.2 Producer Modes — references [ADR-0004](0004-idempotent-producer-protocol.md)
   - §3.6 Two Sequences — producer chain in `meta` / server-assigned `sequence` (per [ADR-0003](0003-event-schema.md))
-  - `evbk_producer_state` — keyed by `(producer_id, topic, partition)`
+  - producer chain state - keyed by `(producer_id, topic)`
+- **Features**:
+  - [0007 Storage Backend API](../features/0007-storage-backend-api.md) - `append` takes the key; the backend maps it to a partition
 - **Related ADRs**:
   - [`0003-event-schema`](0003-event-schema.md) — canonical event shape; `partition` is `readOnly` (server-stamped on read)
-  - [`0004-idempotent-producer-protocol`](0004-idempotent-producer-protocol.md) — chain dedup is keyed by `(producer_id, topic, partition)`; partition determinism is the chain-correctness invariant
+  - [`0004-idempotent-producer-protocol`](0004-idempotent-producer-protocol.md) - chain dedup is keyed by `(producer_id, topic)`, independent of the partition
