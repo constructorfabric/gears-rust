@@ -12,36 +12,8 @@ Defined in `resource-group-sdk/src/models.rs`. Aligned with REST API schemas ([o
 ```rust
 use uuid::Uuid;
 
-// ── Type ────────────────────────────────────────────────────────────────
-
-/// Matches REST `Type` schema.
-#[derive(Debug, Clone)]
-pub struct ResourceGroupType {
-    pub code: String,
-    pub can_be_root: bool,
-    pub allowed_parents: Vec<String>,
-    pub allowed_memberships: Vec<String>,
-    pub metadata_schema: Option<serde_json::Value>,
-}
-
-/// Matches REST `CreateTypeRequest` schema.
-#[derive(Debug, Clone)]
-pub struct CreateTypeRequest {
-    pub code: String,
-    pub can_be_root: bool,
-    pub allowed_parents: Vec<String>,
-    pub allowed_memberships: Vec<String>,
-    pub metadata_schema: Option<serde_json::Value>,
-}
-
-/// Matches REST `UpdateTypeRequest` schema.
-#[derive(Debug, Clone)]
-pub struct UpdateTypeRequest {
-    pub can_be_root: bool,
-    pub allowed_parents: Vec<String>,
-    pub allowed_memberships: Vec<String>,
-    pub metadata_schema: Option<serde_json::Value>,
-}
+// There are no type models: resource group types are GTS Type Schemas in the Types Registry
+// (ADR-002). The SDK declares only the platform tenant type and `TENANT_RG_TYPE_PATH`.
 
 // ── Hierarchy context ────────────────────────────────────────────────────
 
@@ -166,13 +138,6 @@ use uuid::Uuid;
 
 #[async_trait]
 pub trait ResourceGroupClient: Send + Sync {
-    // ── Type lifecycle ──────────────────────────────────────────────
-    async fn create_type(&self, ctx: &SecurityContext, request: CreateTypeRequest) -> Result<ResourceGroupType, ResourceGroupError>;
-    async fn get_type(&self, ctx: &SecurityContext, code: &str) -> Result<ResourceGroupType, ResourceGroupError>;
-    async fn list_types(&self, ctx: &SecurityContext, query: ListQuery) -> Result<Page<ResourceGroupType>, ResourceGroupError>;
-    async fn update_type(&self, ctx: &SecurityContext, code: &str, request: UpdateTypeRequest) -> Result<ResourceGroupType, ResourceGroupError>;
-    async fn delete_type(&self, ctx: &SecurityContext, code: &str) -> Result<(), ResourceGroupError>;
-
     // ── Group lifecycle ─────────────────────────────────────────────
     async fn create_group(&self, ctx: &SecurityContext, request: CreateGroupRequest) -> Result<ResourceGroup, ResourceGroupError>;
     async fn get_group(&self, ctx: &SecurityContext, group_id: Uuid) -> Result<ResourceGroup, ResourceGroupError>;
@@ -310,5 +275,5 @@ let group = rg
 
 | Trait | Methods | Consumers | ClientHub key |
 |-------|---------|-----------|---------------|
-| `ResourceGroupClient` | 14 (full CRUD: types, groups, memberships, hierarchy) | Domain services, Apps, Admins | `dyn ResourceGroupClient` |
+| `ResourceGroupClient` | full CRUD: groups, memberships, hierarchy | Domain services, Apps, Admins | `dyn ResourceGroupClient` |
 | `ResourceGroupReadHierarchy` | 5 (`get_group_descendants`, `get_group_ancestors`, `list_groups`, `get_group`, `list_memberships`; all unscoped / PEP-bypassing) | AuthZ resolver plugin, tenant-resolver RG plugin, in-process AuthZ PDP | `dyn ResourceGroupReadHierarchy` |
