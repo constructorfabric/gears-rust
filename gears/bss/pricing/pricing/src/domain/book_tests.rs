@@ -62,6 +62,38 @@ fn prototype_l229_book_validity_half_open() {
     assert!(!valid_on(&b, date("2026-12-31")));
     assert!(!valid_on(&b, date("2025-12-31")));
 }
+/// D-524: one half-open rule over several days; an absent bound is open.
+#[test]
+fn sells_on_each_judges_every_day_in_the_half_open_window() {
+    let (from, until) = (Some(date("2026-10-01")), Some(date("2026-10-03")));
+    assert!(sells_on_each(
+        from,
+        until,
+        &[date("2026-10-01"), date("2026-10-02")]
+    ));
+    assert!(
+        !sells_on_each(from, until, &[date("2026-10-02"), date("2026-10-03")]),
+        "the end is outside"
+    );
+    assert!(
+        !sells_on_each(from, until, &[date("2026-09-30"), date("2026-10-01")]),
+        "a day before the start"
+    );
+    assert!(
+        sells_on_each(None, until, &[date("2020-01-01"), date("2026-10-02")]),
+        "no start bound"
+    );
+    assert!(
+        sells_on_each(from, None, &[date("2026-10-01"), date("2099-12-31")]),
+        "no end bound"
+    );
+    assert!(!sells_on_each(
+        None,
+        until,
+        &[date("2026-10-02"), date("2026-10-03")]
+    ));
+    assert!(sells_on_each(None, None, &[date("1970-01-01")]));
+}
 #[test]
 fn prototype_l230_unbounded_book() {
     assert!(valid_on(&book(), date("2031-01-01")));

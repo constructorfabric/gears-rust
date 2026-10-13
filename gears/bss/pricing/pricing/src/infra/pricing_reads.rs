@@ -123,6 +123,13 @@ pub struct LocalGeneration {
     settings: serde_json::Value,
 }
 
+impl LocalGeneration {
+    /// The revision's book as the snapshot read it (D-524 judges its window at a new sale).
+    pub(crate) fn book(&self) -> &price_book::Model {
+        &self.book
+    }
+}
+
 pub async fn load_price(
     tx: &impl DBRunner,
     scope: &AccessScope,

@@ -516,8 +516,8 @@ D-504 defines the pure new-sale profile, narrower than the readable catalog:
 | Recurring | Flat or PerUnit; month/year equal to BillingTerms | UnsupportedModel / BillingCycleMismatch |
 | One-time | Flat or PerUnit; no recurring period or usage policy | UnsupportedModel / UnsupportedTerms |
 | Usage BillingCycle | PerUnit, Volume or Graduated; period null; immutable explicit policy | MissingRatingPolicy / MeterPolicyMismatch |
-| Usage CalendarHour | Same usage models; UTC, SUM, subscription_line or resource scope; no minimum fee, including zero | UnsupportedTerms |
-| BillingCycle minimum fee | SubscriptionLine only; any Resource-scoped floor is refused | UnsupportedTerms |
+| Usage CalendarHour | Same usage models; UTC, SUM, subscription_line or resource scope; a non-negative minimum fee is supported (D-525) | UnsupportedTerms for a window or zone outside this set |
+| Price book window | The revision's book sells on the acceptance day and on the start day (D-524) | NotSellable |
 | FX / cross-currency sale | Currency must equal the selected price currency | CURRENCY_MISMATCH |
 | Package, promotions, phases, allowances, quarter | Not part of new-sale terms; historical catalog reads remain intact | UnsupportedModel / UnsupportedTerms |
 
@@ -544,9 +544,10 @@ VM 2 vCPU / 4 GB, VM·hour, PerUnit 0.047, no floor, VM_REVENUE, cloud-services,
 scale 2 and HalfEven. Supported test variants recertify altered content digests; integrity tests
 intentionally retain a stale digest. Exact threshold 10 exercises the existing half-open arithmetic.
 
-Pure SaleObservation is the specified five booleans, derived from verified live reads. Non-current or
-unavailable revisions and inactive/unsellable SKUs return NotSellable; missing coverage returns
-ResolutionChanged. That shape intentionally does not distinguish retired from deprecated or off-sale.
+Pure SaleObservation is the specified six booleans, derived from verified live reads. Non-current or
+unavailable revisions, a book outside its window (D-524) and inactive/unsellable SKUs return
+NotSellable; missing coverage returns ResolutionChanged. That shape intentionally does not distinguish
+retired from deprecated or off-sale.
 Provider failures are not observations of commercial ineligibility: missing E1 remains 400
 UNCONFIGURED_DEPENDENCY naming UsageMeterSemanticsV1, configured outage remains 503 and denial 403.
 E1 = E1a (raw meters, the usage collector / types registry; external) + E1b (derived meters, provided by Products since P-D-233).
@@ -701,11 +702,12 @@ SellabilityV1::check issues the immutable receipt, PricingAcceptanceV1::acceptan
 the first eligible activation, and check_fulfilment rechecks current eligibility. Orders must retain the
 receipt; Subscriptions retains accepted entry/policy/price, dated descriptors and BillingTerms. Existing
 recurring/one-time Flat/PerUnit and usage PerUnit/Volume/Graduated support remains exactly the D-504
-matrix above. No Package sale, allowance, FX, promotional phase, cross-line pooling or hourly minimum fee
-is admitted. Approval submit and final apply revalidate authoritative meter evidence and local entry
-identity. Different plan items may use different entry-owned windows; a book change must match the
-policy digest and dimension key as well as SKU/kind/period/model, retaining an unmatched old entry for
-explicit repair. Legacy policy-less reads remain valid while new usage sales fail closed.
+matrix above. No Package sale, allowance, FX, promotional phase or cross-line pooling is admitted; a
+minimum fee is admitted on every window and scope (D-525). Approval submit and final apply revalidate
+authoritative meter evidence and local entry identity. Different plan items may use different
+entry-owned windows; a book change must match the policy digest and dimension key as well as
+SKU/kind/period/model, retaining an unmatched old entry for explicit repair. Legacy policy-less reads
+remain valid while new usage sales fail closed.
 
 **External production obligations remain open.** E1 = E1a (raw meters, the usage collector / types registry; external) + E1b (derived meters, provided by Products since P-D-233). E1a (raw meters): Types Registry owns immutable
 declarations, Usage Collector the authorized exact-version semantic adapter, and source/IRM owners

@@ -44,11 +44,19 @@ pub fn validate_description(text: Option<&str>) -> Result<(), RuleError> {
         Ok(())
     }
 }
+/// Whether sales are allowed on every one of `days` in the half-open window
+/// `[valid_from, valid_until)`; an absent bound is open. A new sale is judged on its acceptance day
+/// and its start day (D-524).
+#[must_use]
+pub fn sells_on_each(valid_from: Option<Date>, valid_until: Option<Date>, days: &[Date]) -> bool {
+    days.iter().all(|day| {
+        valid_from.is_none_or(|start| *day >= start) && valid_until.is_none_or(|end| *day < end)
+    })
+}
 /// Whether sales from this book are allowed on a date.
 #[must_use]
 pub fn valid_on(book: &Book, date: Date) -> bool {
-    book.valid_from.is_none_or(|start| date >= start)
-        && book.valid_until.is_none_or(|end| date < end)
+    sells_on_each(book.valid_from, book.valid_until, &[date])
 }
 /// Fractional digits of an ISO 4217 currency; two unless the standard says otherwise.
 #[must_use]

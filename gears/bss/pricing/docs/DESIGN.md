@@ -182,8 +182,9 @@ keep_for_bound when the successor is new; it cannot rewrite money or remove hist
 end explicitly. Tier arithmetic uses decimal/money types without binary float rounding and [from, to) bands.
 Every decimal of a price (amount, rate, package size and package price, tier up_to and rate) travels as a JSON string;
 a JSON number is refused 400 AMOUNT_INVALID, because reading it would round it through f64.
-Min-fee accounting groups by price/subscription/period across values and slices before promotions; Rating applies it
-(D-415).
+Min-fee accounting groups by price and by the entry's rating window and aggregation scope across values and slices
+before promotions: one floor per billing period for `billing_cycle`, one per hour for `calendar_hour` (D-525); Rating
+applies it (D-415).
 
 ### 3.2 Component Model
 
@@ -315,10 +316,9 @@ and an old approval cannot publish it. A scheduled revision is checked at approv
 switch does not revalidate dependencies. New usage approvals require a policy-bearing entry;
 legacy approved prices and published revisions remain readable.
 
-D-503 refuses CalendarHour with any `min_fee` at price create, submit and apply
-(`UNSUPPORTED_TERMS`), and when publishing a revision selecting such approved money. D-504's
-`refuses_minimum_fee` is that rule and the resource-scoped floor, at price validation, the plan
-check and sale validation (amended 2026-10-02). A successor,
+A minimum fee is accepted on every rating window and scope since D-525; the floor is Rating's, once per window per
+scope (D-388 for `billing_cycle`). A new sale also judges the revision's book window on the acceptance day and the
+start day (D-524). A successor,
 temporary pair and return keep their entry and therefore the same policy, window, scope and reset.
 Policy changes require a different entry and an explicitly selected revision. The existing dated
 SKU chain guard uses immutable Products history captured before the transaction.

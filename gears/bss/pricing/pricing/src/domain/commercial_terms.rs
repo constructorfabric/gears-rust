@@ -23,12 +23,19 @@ pub struct SaleObservation {
     pub sku_active: bool,
     pub sku_sellable: bool,
     pub covered: bool,
+    /// The revision's book sells on the acceptance day and on the sale's start day (D-524).
+    pub book_valid: bool,
 }
 /// Validate live new-sale eligibility; provider errors never become these booleans.
 /// # Errors
-/// `NotSellable` for ineligible revision/SKU facts, `ResolutionChanged` for coverage loss.
+/// `NotSellable` for ineligible revision, book or SKU facts, `ResolutionChanged` for coverage loss.
 pub fn validate_new_sale_observation(o: &SaleObservation) -> Result<(), RuleError> {
-    if !o.revision_is_current || !o.revision_available || !o.sku_active || !o.sku_sellable {
+    if !o.revision_is_current
+        || !o.revision_available
+        || !o.book_valid
+        || !o.sku_active
+        || !o.sku_sellable
+    {
         return Err(R::NotSellable.into());
     }
     if !o.covered {
@@ -203,9 +210,6 @@ fn validate_model_and_policy(q: &NewSaleQuery, b: &AcceptedBinding) -> Result<()
                 return Err(R::MeterPolicyMismatch.into());
             }
             let hourly = matches!(p.content.rating_window, RatingWindow::CalendarHour { .. });
-            if b.price.minimum_fee.is_some() && usage_policy::refuses_minimum_fee(&p.content) {
-                return Err(R::UnsupportedTerms.into());
-            }
             let at = q.billing_terms.anchor_at.to_offset(UtcOffset::UTC);
             if hourly
                 && q.billing_terms.anchor == BillingAnchor::SubscriptionStart
