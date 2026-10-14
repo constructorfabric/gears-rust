@@ -65,6 +65,9 @@ pub struct Declaration {
     /// The contributing module, for module-contributed declarations.
     pub owner_module: Option<String>,
 
+    /// Optional human-readable label; never derived from `leaf_slug`.
+    pub display_name: Option<String>,
+
     /// Optional long-form description.
     pub description: Option<String>,
 
@@ -131,6 +134,8 @@ pub struct DeclarationDraft {
     pub owner_module: Option<String>,
     /// The licence feature gating the setting, if any.
     pub licence_feature: Option<String>,
+    /// Human-readable label, trimmed.
+    pub display_name: Option<String>,
     /// Human-readable description.
     pub description: Option<String>,
     /// The principal or module that created the row.
@@ -146,6 +151,9 @@ pub struct DeclarationDraft {
 pub struct DeclarationMetadata {
     /// `standard` or `advanced`.
     pub mode: String,
+    /// Human-readable label, trimmed. Presentation only: it never moves
+    /// `last_change_at`.
+    pub display_name: Option<String>,
     /// Human-readable description.
     pub description: Option<String>,
     /// The administrative domain, if any.

@@ -302,6 +302,10 @@ pub struct SettingItemDto {
     /// every page carries every setting and a client groups them itself.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mode: Option<String>,
+    /// The declaration's display name; omitted when it has none, never derived
+    /// from the key.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
 }
 
 impl SettingItemDto {
@@ -309,6 +313,13 @@ impl SettingItemDto {
     #[must_use]
     pub fn with_mode(mut self, mode: &str) -> Self {
         self.mode = Some(mode.to_owned());
+        self
+    }
+
+    /// The same entry, tagged with its declaration's display name, if any.
+    #[must_use]
+    pub fn with_display_name(mut self, display_name: Option<&str>) -> Self {
+        self.display_name = display_name.map(str::to_owned);
         self
     }
 
@@ -322,6 +333,7 @@ impl SettingItemDto {
             flagged: None,
             detail: None,
             mode: None,
+            display_name: None,
         }
     }
 
@@ -335,6 +347,7 @@ impl SettingItemDto {
             flagged: Some(flagged),
             detail: None,
             mode: None,
+            display_name: None,
         }
     }
 
@@ -355,6 +368,7 @@ impl SettingItemDto {
             flagged: None,
             detail: Some(err.wire_message()),
             mode: None,
+            display_name: None,
         }
     }
 

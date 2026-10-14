@@ -305,7 +305,8 @@ pub async fn browse_settings(
                 let declaration = by_id.get(&row.declaration_id)?;
                 Some(
                     SettingItemDto::flagged(render_flagged(&declaration.key, row, root, pii))
-                        .with_mode(&declaration.mode),
+                        .with_mode(&declaration.mode)
+                        .with_display_name(declaration.display_name.as_deref()),
                 )
             })
             .collect()
@@ -325,9 +326,9 @@ pub async fn browse_settings(
             .iter()
             .zip(outcomes)
             .map(|(declaration, outcome)| match outcome {
-                Ok(effective) => {
-                    SettingItemDto::resolved(render(&effective, pii)).with_mode(&declaration.mode)
-                }
+                Ok(effective) => SettingItemDto::resolved(render(&effective, pii))
+                    .with_mode(&declaration.mode)
+                    .with_display_name(declaration.display_name.as_deref()),
                 Err(err) => {
                     if let Some(diagnostic) = err.internal_diagnostic() {
                         tracing::error!(
@@ -336,7 +337,9 @@ pub async fn browse_settings(
                             "a browse entry failed internally"
                         );
                     }
-                    SettingItemDto::failed(&declaration.key, &err).with_mode(&declaration.mode)
+                    SettingItemDto::failed(&declaration.key, &err)
+                        .with_mode(&declaration.mode)
+                        .with_display_name(declaration.display_name.as_deref())
                 }
             })
             .collect()

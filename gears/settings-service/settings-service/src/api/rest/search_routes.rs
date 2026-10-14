@@ -30,13 +30,13 @@ pub fn register_routes(
         .summary("Search settings across categories")
         .description(
             "Cross-field search over every category the caller may see. Matches a \
-             setting's key, description, category name, Schema Default and the overrides \
+             setting's key, display name, description, category name, Schema Default and the overrides \
              explicitly set inside the target's subtree, under the same authorization, \
              target, visibility and `hidden` rules as browsing; results come back flat and \
              ordered by key, each hit with its category, the field that matched -- one of \
-             `key`, `description`, `category_name`, `default_value` or `value` -- and its \
+             `key`, `display_name`, `description`, `category_name`, `default_value` or `value` -- and its \
              declaration's `mode` as a tag that withholds nothing. A hit on the key, \
-             description, category name or default belongs to the declaration and carries \
+             display name, description, category name or default belongs to the declaration and carries \
              no scope; a hit on an override names the scope and tenant where it is set. \
              Search runs over stored rows, not resolved values: an inherited value is a hit \
              where it was set, and a default is a hit on its declaration. `tenant` bounds the \

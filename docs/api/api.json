@@ -2805,6 +2805,13 @@
               "null"
             ]
           },
+          "display_name": {
+            "description": "Optional human-readable label, 1..256 characters after trimming. An\nexplicit `null` reads as unsupplied.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "domain_affinity": {
             "description": "Optional administrative domain.",
             "type": [
@@ -3943,6 +3950,13 @@
           },
           "description": {
             "description": "Optional long-form description.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "display_name": {
+            "description": "Optional human-readable label; omitted when unset, never derived from\n`leaf_slug`.",
             "type": [
               "string",
               "null"
@@ -18485,6 +18499,13 @@
               "null"
             ]
           },
+          "display_name": {
+            "description": "The declaration's display name, when it has one; omitted when unset,\nnever derived from `leaf_slug`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "key": {
             "description": "The setting key.",
             "type": "string"
@@ -18494,7 +18515,7 @@
             "type": "string"
           },
           "matched_field": {
-            "description": "Which field matched: `key`, `description`, `category_name`,\n`default_value` or `value`.",
+            "description": "Which field matched: `key`, `display_name`, `description`,\n`category_name`, `default_value` or `value`.",
             "type": "string"
           },
           "mode": {
@@ -18517,7 +18538,7 @@
             ]
           },
           "value": {
-            "description": "The matched stored value — the override for a `value` hit, the Schema\nDefault for a `default_value` hit — masked by classification exactly\nas a read would mask it. Absent for a hit on the key, description or\ncategory name."
+            "description": "The matched stored value — the override for a `value` hit, the Schema\nDefault for a `default_value` hit — masked by classification exactly\nas a read would mask it. Absent for a hit on the key, display name,\ndescription or category name."
           }
         },
         "required": [
@@ -18896,6 +18917,13 @@
         "properties": {
           "detail": {
             "description": "What went wrong, for the failure outcomes.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "display_name": {
+            "description": "The declaration's display name; omitted when it has none, never derived\nfrom the key.",
             "type": [
               "string",
               "null"
@@ -21281,6 +21309,13 @@
           },
           "description": {
             "description": "Long-form description; `null` clears it.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "display_name": {
+            "description": "Human-readable label, 1..256 characters after trimming; `null` clears it.",
             "type": [
               "string",
               "null"
@@ -62445,7 +62480,7 @@
     },
     "/settings-service/v1/search": {
       "get": {
-        "description": "Cross-field search over every category the caller may see. Matches a setting's key, description, category name, Schema Default and the overrides explicitly set inside the target's subtree, under the same authorization, target, visibility and `hidden` rules as browsing; results come back flat and ordered by key, each hit with its category, the field that matched -- one of `key`, `description`, `category_name`, `default_value` or `value` -- and its declaration's `mode` as a tag that withholds nothing. A hit on the key, description, category name or default belongs to the declaration and carries no scope; a hit on an override names the scope and tenant where it is set. Search runs over stored rows, not resolved values: an inherited value is a hit where it was set, and a default is a hit on its declaration. `tenant` bounds the override corpus to that subtree and is resolution context as everywhere else. `q` is a case-insensitive substring of at least two characters and at most two hundred; shorter or longer is refused 400. A `secret` value is never matched, so an empty result says nothing about it; a `pii` value is matched only for a caller entitled to read it unmasked. A page holds up to `limit` settings; a setting with several matching overrides contributes one hit per override. `$filter` takes the grammar `GET /settings` takes - `category_id eq`, `key eq`, `key in (...)` and `needs_review eq true`, joined by `and` - and narrows the corpus in the query, so the cursor pages the filtered set; `needs_review eq true` keeps the settings with an override flagged for review in the target's subtree. `$orderby` and `$select` are refused.",
+        "description": "Cross-field search over every category the caller may see. Matches a setting's key, display name, description, category name, Schema Default and the overrides explicitly set inside the target's subtree, under the same authorization, target, visibility and `hidden` rules as browsing; results come back flat and ordered by key, each hit with its category, the field that matched -- one of `key`, `display_name`, `description`, `category_name`, `default_value` or `value` -- and its declaration's `mode` as a tag that withholds nothing. A hit on the key, display name, description, category name or default belongs to the declaration and carries no scope; a hit on an override names the scope and tenant where it is set. Search runs over stored rows, not resolved values: an inherited value is a hit where it was set, and a default is a hit on its declaration. `tenant` bounds the override corpus to that subtree and is resolution context as everywhere else. `q` is a case-insensitive substring of at least two characters and at most two hundred; shorter or longer is refused 400. A `secret` value is never matched, so an empty result says nothing about it; a `pii` value is matched only for a caller entitled to read it unmasked. A page holds up to `limit` settings; a setting with several matching overrides contributes one hit per override. `$filter` takes the grammar `GET /settings` takes - `category_id eq`, `key eq`, `key in (...)` and `needs_review eq true`, joined by `and` - and narrows the corpus in the query, so the cursor pages the filtered set; `needs_review eq true` keeps the settings with an override flagged for review in the target's subtree. `$orderby` and `$select` are refused.",
         "operationId": "settings_service.search_settings",
         "parameters": [
           {

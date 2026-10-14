@@ -3,7 +3,7 @@
 //!
 //! Two dialects, one shape. On `PostgreSQL` every predicate is `ILIKE` over
 //! exactly the expression a trigram GIN index is built on — `key`,
-//! `description`, `categories.name`, `(default_value #>> '{}')`,
+//! `display_name`, `description`, `categories.name`, `(default_value #>> '{}')`,
 //! `(value #>> '{}')` — with the classification predicate the split index
 //! pairs of DESIGN §4.7 carry, so each half of a pair serves its own corpus.
 //! On `SQLite` the same predicates are `LIKE` scans; the gear's single-node
@@ -226,6 +226,7 @@ impl SearchRepository for SearchRepo {
 
         let matched = Condition::any()
             .add(self.contains("setting_declarations.key", &pattern))
+            .add(self.contains("setting_declarations.display_name", &pattern))
             .add(self.contains("setting_declarations.description", &pattern))
             .add(declaration::Column::CategoryId.in_subquery(categories.into_query()))
             .add(default_matches)

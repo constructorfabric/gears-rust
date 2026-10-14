@@ -68,6 +68,7 @@ async fn declare_described(
                 source: "module_contributed".to_owned(),
                 owner_module: Some("test".to_owned()),
                 licence_feature: None,
+                display_name: None,
                 description: description.map(str::to_owned),
                 created_by: "test".to_owned(),
             },

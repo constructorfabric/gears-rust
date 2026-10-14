@@ -1625,3 +1625,213 @@ async fn setter_identity_is_masked_for_a_reader_without_the_pii_entitlement() {
         );
     }
 }
+
+// ── The display name ─────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn a_browse_item_carries_the_display_name_when_set_and_omits_it_otherwise() {
+    // The label rides beside `mode` on every browse item so a console renders
+    // one page without a second read; an unset one is absent, not derived.
+    let h = RestHarness::new().await;
+    h.inner
+        .declare_labelled("labelled", "cascading", json!(true), "Minimum TLS version")
+        .await;
+    h.inner.declare("bare", "cascading", json!(true)).await;
+
+    let items = h
+        .items("/settings-service/v1/settings", h.inner.tree.root)
+        .await;
+    assert_eq!(items.len(), 2, "{items:?}");
+    for item in &items {
+        let key = item["key"].as_str().expect("a key");
+        if key.contains(".labelled.") {
+            assert_eq!(item["display_name"], json!("Minimum TLS version"), "{item}");
+        } else {
+            assert!(
+                item.get("display_name").is_none(),
+                "an unset label is omitted, never derived from the slug: {item}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn the_single_effective_read_never_carries_the_display_name() {
+    // Value-only by design: a detail view composes the declaration read with
+    // this one, as it does for the description.
+    let h = RestHarness::new().await;
+    h.inner
+        .declare_labelled("labelled", "cascading", json!(true), "Minimum TLS version")
+        .await;
+
+    let uri = format!("/settings-service/v1/settings/{}", encoded(&h, "labelled"));
+    let (status, body) = h.get(&uri, h.inner.tree.root).await;
+    assert_eq!(status, 200, "{body}");
+    assert!(
+        body.get("display_name").is_none(),
+        "the effective value read carries no label: {body}"
+    );
+}
+
+#[tokio::test]
+async fn a_search_hit_carries_the_display_name_when_set_and_omits_it_otherwise() {
+    let h = RestHarness::new().await;
+    h.inner
+        .declare_labelled("proxy_host", "cascading", json!("direct"), "Proxy host")
+        .await;
+    h.inner
+        .declare("proxy_port", "cascading", json!("direct"))
+        .await;
+
+    let items = h
+        .items("/settings-service/v1/search?q=proxy", h.inner.tree.root)
+        .await;
+    assert_eq!(items.len(), 2, "{items:?}");
+    for hit in &items {
+        if hit["leaf_slug"] == json!("proxy_host") {
+            assert_eq!(hit["display_name"], json!("Proxy host"), "{hit}");
+        } else {
+            assert!(hit.get("display_name").is_none(), "{hit}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_hit_found_only_in_the_display_name_names_it_and_carries_no_scope() {
+    // What a person types is the label they see, not the key. The hit says the
+    // label matched, and since the label belongs to the declaration rather
+    // than to a tenant it carries no scope.
+    let h = RestHarness::new().await;
+    h.inner
+        .declare_labelled("relay", "cascading", json!("direct"), "Minimum TLS version")
+        .await;
+
+    let items = h
+        .items("/settings-service/v1/search?q=tls", h.inner.tree.root)
+        .await;
+    assert_eq!(items.len(), 1, "{items:?}");
+    let hit = &items[0];
+    assert_eq!(hit["matched_field"], json!("display_name"), "{hit}");
+    assert_eq!(hit["display_name"], json!("Minimum TLS version"));
+    assert!(
+        hit.get("scope").is_none(),
+        "a declaration-level hit carries no scope: {hit}"
+    );
+}
+
+#[tokio::test]
+async fn an_override_hit_carries_the_display_name_of_its_declaration() {
+    let h = RestHarness::new().await;
+    let id = h
+        .inner
+        .declare_labelled("motto", "cascading", json!("nothing"), "Company motto")
+        .await;
+    h.inner.set(id, h.inner.tree.a, json!("alpha")).await;
+
+    let items = h
+        .items("/settings-service/v1/search?q=alpha", h.inner.tree.a)
+        .await;
+    assert_eq!(items.len(), 1, "{items:?}");
+    let hit = &items[0];
+    assert_eq!(hit["matched_field"], json!("value"));
+    assert_eq!(
+        hit["display_name"],
+        json!("Company motto"),
+        "an override hit names its declaration's label too: {hit}"
+    );
+}
+
+#[tokio::test]
+async fn a_hidden_setting_is_not_found_through_its_display_name() {
+    // The label is ordinary declaration text under the same visibility filter
+    // as the key and the description: hiding a setting hides it from this path.
+    let h = RestHarness::new().await;
+    h.inner
+        .declare_labelled("visible", "cascading", json!(true), "Secretive label")
+        .await;
+    let hidden = h
+        .inner
+        .declare_labelled("concealed", "cascading", json!(true), "Secretive label")
+        .await;
+    h.restrict(hidden, h.inner.tree.a, TenantAccess::Hidden)
+        .await;
+
+    let items = h
+        .items("/settings-service/v1/search?q=secretive", h.inner.tree.a)
+        .await;
+    let slugs: Vec<&str> = items
+        .iter()
+        .filter_map(|i| i["leaf_slug"].as_str())
+        .collect();
+    assert_eq!(
+        slugs,
+        vec!["visible"],
+        "a hidden setting is not discoverable through its label either"
+    );
+}
+
+#[tokio::test]
+async fn the_flagged_browse_item_carries_the_display_name() {
+    // The review listing is a third item branch; a console renders the label
+    // of a flagged row exactly as it does on the resolved page.
+    let h = RestHarness::new().await;
+    let flagged = h
+        .inner
+        .declare_labelled("flagged", "cascading", json!(true), "Minimum TLS version")
+        .await;
+    h.inner
+        .set_flagged(flagged, h.inner.tree.a, json!(false))
+        .await;
+
+    let items = h
+        .items(
+            "/settings-service/v1/settings?$filter=needs_review%20eq%20true",
+            h.inner.tree.root,
+        )
+        .await;
+    assert_eq!(items.len(), 1, "{items:?}");
+    assert_eq!(items[0]["outcome"], json!("needs_review"));
+    assert_eq!(
+        items[0]["display_name"],
+        json!("Minimum TLS version"),
+        "{}",
+        items[0]
+    );
+}
+
+#[tokio::test]
+async fn a_failed_entry_carries_the_display_name_and_a_not_found_one_has_none() {
+    // A retired setting fails as its own entry yet still has a declaration to
+    // label it; a requested key with no declaration has nothing to report.
+    let h = RestHarness::new().await;
+    let retired = h
+        .inner
+        .declare_labelled("retired", "cascading", json!(true), "Old label")
+        .await;
+    h.inner.retire(retired).await;
+
+    let items = h
+        .items("/settings-service/v1/settings", h.inner.tree.root)
+        .await;
+    let gone = items
+        .iter()
+        .find(|i| i["key"].as_str().is_some_and(|k| k.contains("retired")))
+        .expect("the retired setting is listed");
+    assert_eq!(gone["outcome"], json!("retired"));
+    assert_eq!(gone["display_name"], json!("Old label"), "{gone}");
+
+    let filter = urlencoding(&format!("key in ('{}')", h.inner.key("never_declared")));
+    let items = h
+        .items(
+            &format!("/settings-service/v1/settings?$filter={filter}"),
+            h.inner.tree.root,
+        )
+        .await;
+    assert_eq!(items.len(), 1, "{items:?}");
+    assert_eq!(items[0]["outcome"], json!("not_found"));
+    assert!(
+        items[0].get("display_name").is_none(),
+        "no declaration, no label: {}",
+        items[0]
+    );
+}

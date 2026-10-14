@@ -50,6 +50,7 @@ pub(crate) fn to_domain(model: declaration::Model) -> Declaration {
         domain_affinity: model.domain_affinity,
         licence_feature: model.licence_feature,
         owner_module: model.owner_module,
+        display_name: model.display_name,
         description: model.description,
         default_value: model.default_value,
         has_secret_trait: model.has_secret_trait,
@@ -203,6 +204,7 @@ impl DeclarationRepository for DeclarationRepo {
             owner_module: Set(draft.owner_module),
             licence_feature: Set(draft.licence_feature),
             status: Set("active".to_owned()),
+            display_name: Set(draft.display_name),
             description: Set(draft.description),
             last_change_at: Set(at),
             created_at: Set(at),
@@ -234,6 +236,10 @@ impl DeclarationRepository for DeclarationRepo {
             .col_expr(
                 declaration::Column::Description,
                 Expr::value(metadata.description),
+            )
+            .col_expr(
+                declaration::Column::DisplayName,
+                Expr::value(metadata.display_name),
             )
             .col_expr(
                 declaration::Column::DomainAffinity,

@@ -370,7 +370,7 @@ One requirement is counted as covered while being split across releases: `cpt-cf
 
 - **API**:
   - GET /settings-service/v1/settings/{key}?tenant={tenant_id}
-  - GET /settings-service/v1/settings?tenant={tenant_id} (bulk by category or key set, browse)
+  - GET /settings-service/v1/settings?tenant={tenant_id} (bulk by category or key set, browse; items carry the `mode` tag and `display_name` when set)
   - SDK `SettingsReaderClient` in-process read path (`get_effective`, `get_effective_bulk`)
 
 - **Sequences**:
@@ -643,14 +643,14 @@ One requirement is counted as covered while being split across releases: `cpt-cf
 
 - [x] `p2` - **ID**: `cpt-cf-settings-service-feature-search-discoverability`
 
-- **Purpose**: Let an administrator reach any setting from one query — by key, description, category name, Schema Default or an explicitly set override — without learning the category tree, with the corpus filtered by classification and authorization before matching so that no secret or unentitled PII content is discoverable through a match, a count or a hit.
+- **Purpose**: Let an administrator reach any setting from one query — by key, display name, description, category name, Schema Default or an explicitly set override — without learning the category tree, with the corpus filtered by classification and authorization before matching so that no secret or unentitled PII content is discoverable through a match, a count or a hit.
 
 - **Depends On**: `cpt-cf-settings-service-feature-value-resolution`, `cpt-cf-settings-service-feature-tenant-access`, `cpt-cf-settings-service-feature-category-management`
 
 - **Scope**:
-  - `GET /settings-service/v1/search?q=…&tenant=…` with `limit`/`cursor`: one page query over active declarations ordered by key, matching key, description, category name (subquery), Schema Default within the corpus, or an override within the corpus at the target's non-standalone subtree (subquery); one query for the page's matching overrides
+  - `GET /settings-service/v1/search?q=…&tenant=…` with `limit`/`cursor`: one page query over active declarations ordered by key, matching key, display name, description, category name (subquery), Schema Default within the corpus, or an override within the corpus at the target's non-standalone subtree (subquery); one query for the page's matching overrides
   - The corpus rule of DESIGN §4.2 *Search*: `secret` never (`secret_ref IS NULL` and classification predicate), `pii` only with `read_unmasked`, JSON `null` defaults excluded, the same predicate in both queries so the split trigram index pairs of §4.7 serve them on PostgreSQL
-  - Hits: declaration-level for key/description/category/default with the first matching field in that order; one per matching override with its tenant and scope; values masked by classification; `mode` as a tag
+  - Hits: declaration-level for key/display name/description/category/default with the first matching field in that order; one per matching override with its tenant and scope; values masked by classification; `mode` as a tag and `display_name` when set
   - Browse's gates reused: `read` on the value resource as the secure scope, target within the subtree and not standalone, domain visibility, `hidden` excluded
   - Dialect chosen at gear init from the database in use: `ILIKE` over the indexed expressions on PostgreSQL, `LIKE` with identical escaping on SQLite
   - Cursor bound to `(q, target, corpus)` so a continuation cannot be replayed against another search
@@ -716,4 +716,4 @@ cpt-cf-settings-service-feature-typed-value-validation ─→ cpt-cf-settings-se
 
 **Order of delivery within the waves.** Declarations reach the platform through two doors, and only one of them is on the critical path: gears contribute theirs through the SDK (2.10), administrators author theirs through `POST /settings-service/v1/declarations` (the write flows of 2.3). Set and read of values need declarations to exist, not an administrative way to author them, so the sequence that reaches a working value path soonest is: the `setting_type` base registered at init (2.1, step 9 of gear init), the Type Validator and the `setting_values` table (2.4), the reconciler (2.10), the read surface and the in-process reader (2.5), the audit store (2.6), the write path (2.8) — with tenant access (2.7) entering as its absent-row semantics first, which is `overridable` for everyone, and its endpoints after. The administrative declaration writes of 2.3 follow; their read surface is already in place.
 
-**What unblocks next**: 2.10 and 2.11 complete R1 — 2.11 carries cross-field search, and the `mode` tag rides every browse item and search hit. R2 then waits on the platform — verified machine caller identity for the out-of-process profiles and the service-write SDK path, the platform-wide elevated session behind the existing `StepUpVerifier` port, the platform Audit Subsystem behind the existing `AuditSink` port, the tenant-deleted signal, and per-feature licence entitlement — while file-valued settings, the anonymous read route, and the replica broadcast need nothing outside this gear and the broker it already publishes to.
+**What unblocks next**: 2.10 and 2.11 complete R1 — 2.11 carries cross-field search, and the `mode` tag, with `display_name` when set, rides every browse item and search hit. R2 then waits on the platform — verified machine caller identity for the out-of-process profiles and the service-write SDK path, the platform-wide elevated session behind the existing `StepUpVerifier` port, the platform Audit Subsystem behind the existing `AuditSink` port, the tenant-deleted signal, and per-feature licence entitlement — while file-valued settings, the anonymous read route, and the replica broadcast need nothing outside this gear and the broker it already publishes to.

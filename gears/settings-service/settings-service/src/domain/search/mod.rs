@@ -2,8 +2,8 @@
 //! Cross-field search over the settings hub: what may be matched, and how.
 //!
 //! Search runs over **stored rows**, never resolved values (DESIGN §4.2
-//! *Search*): a declaration's key, description and category name, its Schema
-//! Default, and the overrides explicitly set inside the caller's visible
+//! *Search*): a declaration's key, display name, description and category
+//! name, its Schema Default, and the overrides explicitly set inside the caller's visible
 //! subtree. Authorization is applied to the **corpus** before matching, not to
 //! the output, because a match's existence, a count and a hit each disclose
 //! content on their own. This module holds the vocabulary that rule is stated
@@ -153,6 +153,7 @@ impl Corpus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum MatchedField {
     Key,
+    DisplayName,
     Description,
     CategoryName,
     DefaultValue,
@@ -165,6 +166,7 @@ impl MatchedField {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Key => "key",
+            Self::DisplayName => "display_name",
             Self::Description => "description",
             Self::CategoryName => "category_name",
             Self::DefaultValue => "default_value",
@@ -265,7 +267,7 @@ pub fn too_many_hits(limit: usize) -> DomainError {
 #[async_trait]
 pub trait SearchRepository: Send + Sync {
     /// A page of **active** declarations, ordered by key, that match the
-    /// request's needle on key, description, the name of their category, their
+    /// request's needle on key, display name, description, the name of their category, their
     /// Schema Default (within the corpus and not JSON `null`), or an override
     /// explicitly set at one of the request's tenants (within the corpus,
     /// never a secret row). The scope and visibility narrow the page as they
