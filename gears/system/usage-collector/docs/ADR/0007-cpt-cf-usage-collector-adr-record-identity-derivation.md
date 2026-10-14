@@ -64,8 +64,9 @@ normative, not merely rationale.
   and makes a point event a zero-length period rather than a separate shape.
 - `cpt-cf-usage-collector-principle-fail-closed` — a client-supplied identifier
   is never trusted, so the gear derives the value itself.
-- Offline reproducibility — an emitter must compute a target's identifier before
-  submission, so that a correction needs no round-trip.
+- Offline reproducibility — an emitter reproduces an entry's identifier from the
+  fields it sent, and a correction needs no round-trip, because the gear derives
+  the target's identifier from the withdrawal's own fields.
 - One derivation for every surface — REST, the in-process SDK and the Plugin SPI
   must agree on the identifier of one entry.
 
@@ -266,8 +267,8 @@ The identifier is a deterministic projection of the dedup identity that
 
 - Good, because the identifier and the dedup identity read the same six inputs,
   so the two can never disagree about what one entry is.
-- Good, because an emitter reproduces the value offline and names a correction
-  target before submission.
+- Good, because an emitter reproduces the value offline, and the gear derives a
+  correction's target from the withdrawal's own fields.
 - Good, because two entries covering different periods stay distinct under one
   stable per-meter idempotency key.
 - Good, because a point event needs no special case. A zero-length window is an
