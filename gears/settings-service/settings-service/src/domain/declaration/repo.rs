@@ -332,10 +332,22 @@ pub trait DeclarationRepository: Send + Sync {
         category_id: Uuid,
     ) -> Result<Vec<Declaration>, DomainError>;
 
+    /// The declarations with these ids, in one read.
+    ///
+    /// # Errors
+    /// [`DomainError`] when the read fails.
+    async fn find_by_ids<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        ids: &[Uuid],
+    ) -> Result<Vec<Declaration>, DomainError>;
+
     /// List declarations for the caller, leaving out those `hidden` for the
     /// tenant whose root-to-self chain is `hidden_for` — in the query, so the
     /// page is cut and counted after the exclusion. An empty chain excludes
-    /// nothing.
+    /// nothing. With `flagged_at`, only the declarations whose own override at
+    /// that tenant is flagged for review — also in the query.
     ///
     /// # Errors
     /// [`DomainError::Validation`] when the query names an unmapped field, uses
@@ -346,6 +358,23 @@ pub trait DeclarationRepository: Send + Sync {
         scope: &AccessScope,
         visibility: &DomainVisibility,
         hidden_for: &[Uuid],
+        flagged_at: Option<Uuid>,
         query: &ODataQuery,
     ) -> Result<Page<Declaration>, DomainError>;
+
+    /// Which of `keys` name a declaration the caller may see: within the
+    /// caller's grant and administrative domains and not `hidden` on the
+    /// chain `hidden_for` — the three gates of [`Self::list`], in one read
+    /// however many keys are asked.
+    ///
+    /// # Errors
+    /// [`DomainError`] when the read fails.
+    async fn visible_keys<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        visibility: &DomainVisibility,
+        hidden_for: &[Uuid],
+        keys: &[String],
+    ) -> Result<Vec<String>, DomainError>;
 }

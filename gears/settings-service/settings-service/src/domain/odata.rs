@@ -134,6 +134,33 @@ impl FilterField for SettingOrderField {
     }
 }
 
+/// The fields the review listing is keyset-paged by: the order is fixed —
+/// declaration, then tenant, which `uq_value_scope` makes unique for
+/// subject-less rows — and these are not a surface a caller can order by
+/// (`$orderby` is refused), only what the cursor carries. Both are non-null
+/// identifiers and compare as UUIDs.
+#[domain_model]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ReviewOrderField {
+    DeclarationId,
+    TenantId,
+}
+
+impl FilterField for ReviewOrderField {
+    const FIELDS: &'static [Self] = &[Self::DeclarationId, Self::TenantId];
+
+    fn name(&self) -> &'static str {
+        match self {
+            Self::DeclarationId => "declaration_id",
+            Self::TenantId => "tenant_id",
+        }
+    }
+
+    fn kind(&self) -> FieldKind {
+        FieldKind::Uuid
+    }
+}
+
 /// Refuse an `$orderby` naming a field outside `O`, the fields `resource` is
 /// ordered by — before any page is read, so the refusal names the field rather
 /// than surfacing later as a cursor that will not encode.

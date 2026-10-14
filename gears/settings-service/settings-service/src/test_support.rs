@@ -823,6 +823,27 @@ impl ResolutionHarness {
             .await;
     }
 
+    /// An override that stopped validating, carrying the classification the
+    /// writer would denormalize from its declaration: what a review row of a
+    /// `pii` setting must be masked by.
+    pub async fn set_flagged_classified(
+        &self,
+        declaration_id: Uuid,
+        tenant: Uuid,
+        value: Value,
+        classification: &str,
+    ) {
+        self.write(
+            declaration_id,
+            tenant,
+            Some(value),
+            None,
+            true,
+            classification,
+        )
+        .await;
+    }
+
     /// A secret override that stopped validating: held by reference, as every
     /// secret row is, and flagged for review.
     pub async fn set_flagged_secret(&self, declaration_id: Uuid, tenant: Uuid, secret_ref: &str) {

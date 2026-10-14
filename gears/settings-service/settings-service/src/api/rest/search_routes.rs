@@ -49,8 +49,8 @@ pub fn register_routes(
              `$filter` takes the grammar `GET /settings` takes - `category_id eq`, `key eq`, \
              `key in (...)` and `needs_review eq true`, joined by `and` - and narrows the \
              corpus in the query, so the cursor pages the filtered set; `needs_review eq \
-             true` keeps the settings with an override flagged for review in the target's \
-             subtree. `$orderby` and `$select` are refused.",
+             true` keeps the settings whose own override at the target is flagged for review; \
+             the value of a flagged override is never a match. `$orderby` and `$select` are refused.",
         )
         .tag(TAG)
         .authenticated()

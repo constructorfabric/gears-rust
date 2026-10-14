@@ -224,6 +224,8 @@ pub struct SearchRequest<'a> {
     pub needle: &'a Needle,
     /// The classifications the caller may match against.
     pub corpus: Corpus,
+    /// The tenant the search is made at: where `flagged_only` looks.
+    pub target: Uuid,
     /// The target and its non-standalone descendants: where an override may
     /// be matched.
     pub tenant_ids: &'a [Uuid],
@@ -233,9 +235,9 @@ pub struct SearchRequest<'a> {
     /// The most matching override rows a page fetches; more than that and the
     /// search is refused rather than cut short of its hits.
     pub override_limit: usize,
-    /// `needs_review eq true`: only settings with an override flagged for
-    /// review at one of the tenants — a narrowing of the corpus, in the page
-    /// query, where browse switches its listing instead.
+    /// `needs_review eq true`: only settings whose own override at the target
+    /// (`target`) is flagged for review: a narrowing in the page query, the
+    /// one the browse applies.
     pub flagged_only: bool,
     /// Page size, cursor, the declaration-selecting `$filter` remainder and
     /// the binding the cursor must carry.

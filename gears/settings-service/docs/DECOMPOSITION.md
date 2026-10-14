@@ -330,7 +330,7 @@ One requirement is counted as covered while being split across releases: `cpt-cf
   - Batched resolution sharing one ancestry walk per scope, with independent per-key outcomes so a mixed batch never fails wholesale — the bulk read by category or by key set, a key the caller may not see or that does not exist reported in its own entry
   - Needs-review fallthrough: a flagged override is skipped rather than served, resolution continues to the nearest valid ancestor or the Schema Default, and the flagged override stays visible to administrators
   - Distinct not-found outcomes: a stale key after a category rename resolves as `NotFound` with no tombstone or alias, while a retired declaration resolves as the distinct `Retired`
-  - The administrative read surface over the resolver: `GET …/settings/{key}` with source, trail, leak-safe recency, the scope's own review flag and the value state tag in `ETag`; `GET …/settings` by category or key set with per-key outcomes, and the needs-review listing over the caller's subtree; hidden settings absent, standalone descendants outside the subtree, values masked by classification
+  - The administrative read surface over the resolver: `GET …/settings/{key}` with source, trail, leak-safe recency, the scope's own review flag and the value state tag in `ETag`; `GET …/settings` by category or key set with per-key outcomes; `$filter=needs_review eq true` narrowing browse to the settings whose own override at the target is flagged; `GET …/settings/review` listing every flagged override across the target's subtree, one item per setting and tenant, bounded by the subtree budget and paged by cursor over the flagged rows; hidden settings absent, standalone descendants outside the subtree, values masked by classification
   - The in-process `SettingsReaderClient` over the resolver, registered into `ClientHub` at init, with no REST contract published and startup refused on a remote binding while the release is Embedded-only
   - Revert-to-default resolution semantics, with the Schema Default independent of any override and never destroyed by setting or clearing one
   - Cache `get`, `populate`, and `invalidate` keyed by `(key, scope)`, with key-wide eviction for cascading declarations so descendants re-resolve lazily
@@ -348,6 +348,7 @@ One requirement is counted as covered while being split across releases: `cpt-cf
   - [x] `p1` - `cpt-cf-settings-service-fr-cascading-inheritance`
   - [ ] `p2` - `cpt-cf-settings-service-fr-defaults-revert`
   - [x] `p1` - `cpt-cf-settings-service-fr-bulk-effective-read`
+  - [x] `p1` - `cpt-cf-settings-service-fr-typed-value-validation` (the needs-review narrowing and the review listing; the validation itself is 2.4's)
   - [ ] `p1` - `cpt-cf-settings-service-nfr-performance-read-cache`
   - [x] `p1` - `cpt-cf-settings-service-nfr-efficiency-live-read`
 

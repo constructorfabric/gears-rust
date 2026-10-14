@@ -27,3 +27,22 @@ fn the_category_surface_lists_exactly_its_declared_fields() {
         "widening the surface is deliberate and lands here"
     );
 }
+
+#[test]
+fn the_review_surface_is_browses_grammar_without_needs_review() {
+    // Every row the review listing serves is flagged already, so the field
+    // selects nothing there; it is refused as unknown rather than accepted
+    // as a no-op, which the declared surface guarantees by leaving it out.
+    use super::ReviewFilterField;
+    let names: Vec<&str> = ReviewFilterField::FIELDS
+        .iter()
+        .map(FilterField::name)
+        .collect();
+    assert_eq!(
+        names,
+        vec!["key", "category_id"],
+        "no `needs_review` on the review listing"
+    );
+    assert_eq!(ReviewFilterField::from_name("needs_review"), None);
+    assert_eq!(ReviewFilterField::CategoryId.kind(), FieldKind::Uuid);
+}

@@ -1260,6 +1260,18 @@ struct JournalingDeclarations(Journal);
 
 #[async_trait::async_trait]
 impl DeclarationRepository for JournalingDeclarations {
+    async fn visible_keys<C: toolkit_db::secure::DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        visibility: &crate::domain::category::visibility::DomainVisibility,
+        hidden_for: &[Uuid],
+        keys: &[String],
+    ) -> Result<Vec<String>, crate::domain::error::DomainError> {
+        DeclarationRepo
+            .visible_keys(conn, scope, visibility, hidden_for, keys)
+            .await
+    }
     async fn find_by_key<C: toolkit_db::secure::DBRunner>(
         &self,
         conn: &C,
@@ -1361,16 +1373,25 @@ impl DeclarationRepository for JournalingDeclarations {
             .find_by_category(conn, scope, category_id)
             .await
     }
+    async fn find_by_ids<C: toolkit_db::secure::DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        ids: &[Uuid],
+    ) -> Result<Vec<Declaration>, crate::domain::error::DomainError> {
+        DeclarationRepo.find_by_ids(conn, scope, ids).await
+    }
     async fn list<C: toolkit_db::secure::DBRunner>(
         &self,
         conn: &C,
         scope: &AccessScope,
         visibility: &crate::domain::category::visibility::DomainVisibility,
         hidden_for: &[Uuid],
+        flagged_at: Option<Uuid>,
         query: &toolkit_odata::ODataQuery,
     ) -> Result<toolkit_odata::Page<Declaration>, crate::domain::error::DomainError> {
         DeclarationRepo
-            .list(conn, scope, visibility, hidden_for, query)
+            .list(conn, scope, visibility, hidden_for, flagged_at, query)
             .await
     }
 }

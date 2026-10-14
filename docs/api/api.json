@@ -5437,61 +5437,6 @@
         ],
         "type": "object"
       },
-      "FlaggedOverrideDto": {
-        "description": "An override flagged for review, as the needs-review listing reports it.",
-        "properties": {
-          "etag": {
-            "description": "The override's value state tag — what a write correcting this row\npresents in `If-Match`.",
-            "type": "string"
-          },
-          "key": {
-            "description": "The setting key.",
-            "type": "string"
-          },
-          "last_change_at": {
-            "description": "When the override last changed.",
-            "type": "string"
-          },
-          "masked": {
-            "description": "Whether `value` carries the mask token.",
-            "type": "boolean"
-          },
-          "needs_review_detail": {
-            "description": "Why the override no longer validates.",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "scope": {
-            "description": "Its scope path.",
-            "type": "string"
-          },
-          "set_by": {
-            "description": "Who set it: an administrator's identity, masked for a caller not\nauthorized for unmasked PII.",
-            "type": "string"
-          },
-          "tenant_id": {
-            "description": "The tenant whose override is flagged.",
-            "format": "uuid",
-            "type": "string"
-          },
-          "value": {
-            "description": "The stored value, masked by classification."
-          }
-        },
-        "required": [
-          "key",
-          "tenant_id",
-          "scope",
-          "value",
-          "masked",
-          "last_change_at",
-          "set_by",
-          "etag"
-        ],
-        "type": "object"
-      },
       "Fold": {
         "enum": [
           "SUM"
@@ -9496,6 +9441,24 @@
           "items": {
             "items": {
               "$ref": "#/components/schemas/RestrictionDto"
+            },
+            "type": "array"
+          },
+          "page_info": {
+            "$ref": "#/components/schemas/PageInfo"
+          }
+        },
+        "required": [
+          "items",
+          "page_info"
+        ],
+        "type": "object"
+      },
+      "Page_ReviewItemDto": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/ReviewItemDto"
             },
             "type": "array"
           },
@@ -18298,6 +18261,73 @@
         ],
         "type": "object"
       },
+      "ReviewItemDto": {
+        "description": "One flagged override row, as `GET /settings-service/v1/settings/review`\nlists it: the row at the scope that holds it, where it must be fixed — not\na resolved value.",
+        "properties": {
+          "display_name": {
+            "description": "The declaration's display name; omitted when it has none, never derived\nfrom the key.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "etag": {
+            "description": "The override's value state tag — what a write correcting this row\npresents in `If-Match`.",
+            "type": "string"
+          },
+          "key": {
+            "description": "The setting key.",
+            "type": "string"
+          },
+          "last_change_at": {
+            "description": "When the override last changed.",
+            "type": "string"
+          },
+          "masked": {
+            "description": "Whether `value` carries the mask token.",
+            "type": "boolean"
+          },
+          "mode": {
+            "description": "`standard` or `advanced`, from the declaration.",
+            "type": "string"
+          },
+          "needs_review_detail": {
+            "description": "Why the override no longer validates.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "scope": {
+            "description": "Its scope path: `/` or `/tenants/{id}`.",
+            "type": "string"
+          },
+          "set_by": {
+            "description": "Who set it: an administrator's identity, masked for a caller not\nauthorized for unmasked PII.",
+            "type": "string"
+          },
+          "tenant_id": {
+            "description": "The tenant whose override is flagged.",
+            "format": "uuid",
+            "type": "string"
+          },
+          "value": {
+            "description": "The stored value, masked by classification."
+          }
+        },
+        "required": [
+          "key",
+          "mode",
+          "tenant_id",
+          "scope",
+          "value",
+          "masked",
+          "last_change_at",
+          "set_by",
+          "etag"
+        ],
+        "type": "object"
+      },
       "ReviewThreadDto": {
         "description": "A mirrored PR review conversation thread, served by the extended API.",
         "properties": {
@@ -18940,17 +18970,6 @@
               }
             ]
           },
-          "flagged": {
-            "oneOf": [
-              {
-                "type": "null"
-              },
-              {
-                "$ref": "#/components/schemas/FlaggedOverrideDto",
-                "description": "The flagged override, when `outcome` is `needs_review`."
-              }
-            ]
-          },
           "key": {
             "description": "The setting key.",
             "type": "string"
@@ -18963,7 +18982,7 @@
             ]
           },
           "outcome": {
-            "description": "`resolved`, `needs_review`, `not_found`, `retired`, `unavailable` or\n`error`.",
+            "description": "`resolved`, `not_found`, `retired`, `unavailable` or `error`.",
             "type": "string"
           }
         },
@@ -62491,7 +62510,7 @@
     },
     "/settings-service/v1/search": {
       "get": {
-        "description": "Cross-field search over every category the caller may see. Matches a setting's key, display name, description, category name, Schema Default and the overrides explicitly set inside the target's subtree, under the same authorization, target, visibility and `hidden` rules as browsing; results come back flat and ordered by key, each hit with its category, the field that matched -- one of `key`, `display_name`, `description`, `category_name`, `default_value` or `value` -- and its declaration's `mode` as a tag that withholds nothing. A hit on the key, display name, description, category name or default belongs to the declaration and carries no scope; a hit on an override names the scope and tenant where it is set. Search runs over stored rows, not resolved values: an inherited value is a hit where it was set, and a default is a hit on its declaration. `tenant` bounds the override corpus to that subtree and is resolution context as everywhere else. `q` is a case-insensitive substring of at least two characters and at most two hundred; shorter or longer is refused 400. A `secret` value is never matched, so an empty result says nothing about it; a `pii` value is matched only for a caller entitled to read it unmasked. A page holds up to `limit` settings; a setting with several matching overrides contributes one hit per override. `$filter` takes the grammar `GET /settings` takes - `category_id eq`, `key eq`, `key in (...)` and `needs_review eq true`, joined by `and` - and narrows the corpus in the query, so the cursor pages the filtered set; `needs_review eq true` keeps the settings with an override flagged for review in the target's subtree. `$orderby` and `$select` are refused.",
+        "description": "Cross-field search over every category the caller may see. Matches a setting's key, display name, description, category name, Schema Default and the overrides explicitly set inside the target's subtree, under the same authorization, target, visibility and `hidden` rules as browsing; results come back flat and ordered by key, each hit with its category, the field that matched -- one of `key`, `display_name`, `description`, `category_name`, `default_value` or `value` -- and its declaration's `mode` as a tag that withholds nothing. A hit on the key, display name, description, category name or default belongs to the declaration and carries no scope; a hit on an override names the scope and tenant where it is set. Search runs over stored rows, not resolved values: an inherited value is a hit where it was set, and a default is a hit on its declaration. `tenant` bounds the override corpus to that subtree and is resolution context as everywhere else. `q` is a case-insensitive substring of at least two characters and at most two hundred; shorter or longer is refused 400. A `secret` value is never matched, so an empty result says nothing about it; a `pii` value is matched only for a caller entitled to read it unmasked. A page holds up to `limit` settings; a setting with several matching overrides contributes one hit per override. `$filter` takes the grammar `GET /settings` takes - `category_id eq`, `key eq`, `key in (...)` and `needs_review eq true`, joined by `and` - and narrows the corpus in the query, so the cursor pages the filtered set; `needs_review eq true` keeps the settings whose own override at the target is flagged for review; the value of a flagged override is never a match. `$orderby` and `$select` are refused.",
         "operationId": "settings_service.search_settings",
         "parameters": [
           {
@@ -62636,7 +62655,7 @@
     },
     "/settings-service/v1/settings": {
       "get": {
-        "description": "Resolve a page of settings at one scope. `tenant` is resolution context, never a filter: omitted, it is the caller's own tenant, which for a platform administrator is the root and therefore platform scope; a tenant outside the caller's subtree, or a standalone descendant, answers 403. OData `$filter` supports `category_id eq`, `key eq`, `key in (...)` and `needs_review eq true`, joined by `and`; an unmapped field or unsupported operator answers 400 rather than an unfiltered page. `$orderby` takes `key` and `category_id`; any other field answers 400. Each item carries its own outcome, so a named key that does not exist is reported in its entry, never as a failure of the request. `needs_review eq true` lists the flagged override rows in the caller's subtree instead of resolved values. Values are masked by classification.",
+        "description": "Resolve a page of settings at one scope. `tenant` is resolution context, never a filter: omitted, it is the caller's own tenant, which for a platform administrator is the root and therefore platform scope; a tenant outside the caller's subtree, or a standalone descendant, answers 403. OData `$filter` supports `category_id eq`, `key eq`, `key in (...)` and `needs_review eq true`, joined by `and`; an unmapped field or unsupported operator answers 400 rather than an unfiltered page. `$orderby` takes `key` and `category_id`; any other field answers 400. Each item carries its own outcome, so a named key that does not exist is reported in its entry, never as a failure of the request. `needs_review eq true` narrows the page to the settings whose own override at the target tenant is flagged for review, still resolved values with the flag beside them, paged and counted over the narrowed set; a named key that is visible but not flagged is absent from it. The flagged rows of the target's subtree are `GET /settings-service/v1/settings/review`. Values are masked by classification.",
         "operationId": "settings_service.browse_settings",
         "parameters": [
           {
@@ -62884,6 +62903,138 @@
         "tags": [
           "settings-values"
         ]
+      }
+    },
+    "/settings-service/v1/settings/review": {
+      "get": {
+        "description": "The override rows flagged for review at the target tenant and its descendants, one item per row at the scope that holds it - the place it must be fixed - not one resolved value per setting. Ordered by setting, then tenant, and paged by a row-level cursor: a setting flagged at more tenants than `limit` continues on the next page, and the cursor is bound to the `$filter` and the target, so it is refused 400 under another. `tenant` follows the read surface: omitted, the caller's own tenant; a tenant outside the caller's subtree or a standalone descendant answers 403, and standalone descendants' rows are not listed. `$filter` takes `category_id eq`, `key eq` and `key in (...)`, joined by `and`; `needs_review` is refused 400, as is any other field or operator, and a named key with no flagged row simply has no item. `$orderby` and `$select` are refused 400. `limit` defaults to 50 and is capped at 200. A target whose subtree exceeds the budget answers 400 `subtree_too_large`, never a partial listing. A setting hidden from the caller has no rows here. Values are masked by classification - a `secret` never shows its value or its reference - and the setter's identity is masked for a caller without the PII entitlement.",
+        "operationId": "settings_service.list_review",
+        "parameters": [
+          {
+            "description": "Target tenant id; omitted, the caller's own tenant",
+            "in": "query",
+            "name": "tenant",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Page size",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Cursor for pagination",
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "OData v4 filter expression\n- key: eq|ne|contains|startswith|endswith|in\n- category_id: eq|ne|in",
+            "in": "query",
+            "name": "$filter",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Page_ReviewItemDto"
+                }
+              }
+            },
+            "description": "A page of flagged override rows with its pagination cursors"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "List values needing review",
+        "tags": [
+          "settings-values"
+        ],
+        "x-odata-filter": {
+          "allowedFields": {
+            "category_id": [
+              "eq",
+              "ne",
+              "in"
+            ],
+            "key": [
+              "eq",
+              "ne",
+              "contains",
+              "startswith",
+              "endswith",
+              "in"
+            ]
+          }
+        }
       }
     },
     "/settings-service/v1/settings/{key}": {

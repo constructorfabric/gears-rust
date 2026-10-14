@@ -95,8 +95,10 @@ pub use DeclarationQueryFilterField as DeclarationFilterField;
 /// Written by hand rather than derived because `needs_review` is a boolean and
 /// the derive knows only strings and UUIDs. The three fields are the whole
 /// vocabulary: `category_id` and `key` select declarations — `key in (…)` is
-/// the bulk read by key set — and `needs_review eq true` switches the listing
-/// to the flagged override rows in the caller's subtree. `tenant` is resolution
+/// the bulk read by key set — and `needs_review eq true` narrows the page to
+/// the settings whose own override at the target tenant is flagged for review;
+/// the rows themselves, across the target's subtree, are the review listing's,
+/// which takes the same grammar without `needs_review`. `tenant` is resolution
 /// context and deliberately not a field here: it is a query parameter, so a
 /// filter on it is refused as unknown rather than silently narrowing a page.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -125,6 +127,39 @@ impl toolkit_odata::filter::FilterField for SettingFilterField {
             Self::Key => toolkit_odata::filter::FieldKind::String,
             Self::CategoryId => toolkit_odata::filter::FieldKind::Uuid,
             Self::NeedsReview => toolkit_odata::filter::FieldKind::Bool,
+        }
+    }
+}
+
+/// The filter surface of the review listing:
+/// `GET /settings-service/v1/settings/review`.
+///
+/// Browse's grammar without `needs_review`: every row the listing serves is
+/// flagged for review already, so the field selects nothing there and is
+/// refused rather than accepted as a no-op. `category_id` and `key` select
+/// declarations exactly as they do on browse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ReviewFilterField {
+    /// The full setting key.
+    Key,
+    /// The owning category.
+    CategoryId,
+}
+
+impl toolkit_odata::filter::FilterField for ReviewFilterField {
+    const FIELDS: &'static [Self] = &[Self::Key, Self::CategoryId];
+
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Key => "key",
+            Self::CategoryId => "category_id",
+        }
+    }
+
+    fn kind(&self) -> toolkit_odata::filter::FieldKind {
+        match self {
+            Self::Key => toolkit_odata::filter::FieldKind::String,
+            Self::CategoryId => toolkit_odata::filter::FieldKind::Uuid,
         }
     }
 }
