@@ -30,6 +30,7 @@ logs
 .DS_Store
 /.venv/*
 **/__pycache__
+/.logs/ci-bench/
 
 # Code coverage reports
 /coverage/
