@@ -1,0 +1,27 @@
+name: Gears sccache statistics
+description: Save backend, hits, misses and non-cacheable calls for comparison.
+runs:
+  using: composite
+  steps:
+    - name: Collect sccache statistics
+      shell: bash
+      run: |
+        mkdir -p ci-metrics
+        sccache --show-stats > ci-metrics/sccache.txt
+        sccache --show-stats --stats-format=json > ci-metrics/sccache.json
+        rustc -vV > ci-metrics/toolchain.txt
+        sccache --version >> ci-metrics/toolchain.txt
+        python3 -c 'import json, os; names = ["GITHUB_SHA", "GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT", "RUNNER_OS", "RUNNER_ARCH", "ImageOS", "ImageVersion", "RUSTFLAGS", "CARGO_INCREMENTAL", "CF_CACHE_NAMESPACE"]; print(json.dumps({name: os.environ.get(name, "") for name in names}, indent=2))' > ci-metrics/environment.json
+        cat ci-metrics/sccache.txt
+        {
+          echo '### sccache'
+          echo '```text'
+          cat ci-metrics/sccache.txt
+          echo '```'
+        } >> "$GITHUB_STEP_SUMMARY"
+    - name: Upload statistics
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      with:
+        name: sccache-${{ github.job }}-${{ runner.os }}-${{ runner.arch }}-${{ github.run_attempt }}
+        path: ci-metrics/
+        retention-days: 14

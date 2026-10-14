@@ -1,0 +1,55 @@
+name: Pinned Gears CI tools
+description: Install only requested tools; cache the pinned cargo-gears executable.
+inputs:
+  tools:
+    description: Comma-separated tools from tools/ci/make/versions.mk
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Read tool versions
+      id: versions
+      shell: bash
+      env:
+        CF_INSTALL_TOOLS: ${{ inputs.tools }}
+      run: python3 "$GITHUB_ACTION_PATH/../../../tools/ci/tool_versions.py"
+
+    - name: Install prebuilt tools
+      if: steps.versions.outputs.prebuilt != ''
+      uses: taiki-e/install-action@861a07ce7084f55488e375df125cdc99bba60eb7 # v2.87.23
+      with:
+        tool: ${{ steps.versions.outputs.prebuilt }}
+
+    - name: Identify cargo-gears build toolchain
+      if: steps.versions.outputs.needs_gears == 'true'
+      id: rustc
+      shell: bash
+      run: |
+        python3 -c 'import hashlib, os, subprocess; identity = subprocess.check_output(["rustc", "-vV"]); print(identity.decode()); open(os.environ["GITHUB_OUTPUT"], "a").write("hash=" + hashlib.sha256(identity).hexdigest() + "\n")'
+
+    - name: Cache cargo-gears installation
+      if: steps.versions.outputs.needs_gears == 'true'
+      id: cache
+      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+      with:
+        path: ${{ runner.temp }}/cf-ci-tools/cargo-gears
+        key: cargo-gears-${{ runner.os }}-${{ runner.arch }}-${{ steps.versions.outputs.cargo_gears }}-${{ steps.rustc.outputs.hash }}-${{ env.CF_CACHE_NAMESPACE || 'default' }}
+
+    - name: Install cargo-gears on cache miss
+      if: steps.versions.outputs.needs_gears == 'true' && steps.cache.outputs.cache-hit != 'true'
+      shell: bash
+      env:
+        GEARS_VERSION: ${{ steps.versions.outputs.cargo_gears }}
+      run: cargo install --locked --version "$GEARS_VERSION" --root "$RUNNER_TEMP/cf-ci-tools/cargo-gears" cargo-gears
+
+    - name: Add cargo-gears to PATH
+      if: steps.versions.outputs.needs_gears == 'true'
+      shell: bash
+      run: echo "$RUNNER_TEMP/cf-ci-tools/cargo-gears/bin" >> "$GITHUB_PATH"
+
+    - name: Verify cargo-gears version
+      if: steps.versions.outputs.needs_gears == 'true'
+      shell: bash
+      env:
+        GEARS_VERSION: ${{ steps.versions.outputs.cargo_gears }}
+      run: python3 "$GITHUB_ACTION_PATH/../../../tools/ci/run.py" require cargo-gears "$GEARS_VERSION" "$GEARS_VERSION"

@@ -1,0 +1,32 @@
+name: Gears remote sccache
+description: Configure GHA before starting sccache; fall back to rustc on startup failure.
+outputs:
+  enabled:
+    description: Whether the server started and RUSTC_WRAPPER was enabled
+    value: ${{ steps.probe.outputs.enabled }}
+runs:
+  using: composite
+  steps:
+    - name: Read sccache version
+      id: versions
+      shell: bash
+      run: python3 "$GITHUB_ACTION_PATH/../../../tools/ci/tool_versions.py"
+    - name: Install pinned sccache
+      uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+      with:
+        version: v${{ steps.versions.outputs.sccache }}
+    - name: Start remote sccache
+      id: probe
+      shell: bash
+      env:
+        SCCACHE_GHA_ENABLED: "true"
+        SCCACHE_GHA_VERSION: ${{ env.CF_CACHE_NAMESPACE || 'gears-v1' }}
+      run: |
+        if sccache --start-server; then
+          echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
+          echo "enabled=true" >> "$GITHUB_OUTPUT"
+          sccache --show-stats
+        else
+          echo "enabled=false" >> "$GITHUB_OUTPUT"
+          echo "::warning::sccache failed to start; compiling with plain rustc"
+        fi

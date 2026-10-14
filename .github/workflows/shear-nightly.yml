@@ -38,6 +38,7 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: full
   CARGO_INCREMENTAL: "0"
+  SCCACHE_GHA_ENABLED: "true"
   # Pinned nightly required by `cargo shear --expand`. Authoritative for CI:
   # passed through to `make shear` below so the toolchain this job installs and
   # caches is provably the one that compiles. The Makefile's RUST_NIGHTLY
@@ -96,25 +97,16 @@ jobs:
           cache-targets: false
           shared-key: nightly-${{ runner.os }}-${{ env.RUSTUP_TOOLCHAIN_NIGHTLY }}-shear
 
-      - name: Install sccache
-        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
-
-      - name: Probe sccache & set RUSTC_WRAPPER
-        shell: bash
-        run: |
-          if sccache --start-server >/dev/null 2>&1; then
-            echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
-            echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
-          else
-            echo "sccache failed, falling back to plain rustc"
-          fi
+      - name: Configure remote sccache
+        id: sccache
+        uses: ./.github/actions/sccache
 
       # Keep this version in sync with SHEAR_VERSION in the Makefile, so a local
       # `make shear` and this job reach the same verdict.
       - name: Install cargo-shear
-        uses: taiki-e/install-action@861a07ce7084f55488e375df125cdc99bba60eb7 # v2.87.23
+        uses: ./.github/actions/ci-tools
         with:
-          tool: cargo-shear@1.13.1
+          tools: cargo-shear
 
       # `shell: bash` runs with -eo pipefail, so make's exit status survives the
       # pipe into tee. Without pipefail this would report success on failure.
@@ -217,3 +209,8 @@ jobs:
               });
               core.info(`Closed #${issue.number}`);
             }
+
+      - name: Save sccache statistics
+        if: ${{ always() && steps.sccache.outputs.enabled == 'true' }}
+        continue-on-error: true
+        uses: ./.github/actions/sccache-stats

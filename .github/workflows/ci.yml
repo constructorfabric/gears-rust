@@ -15,6 +15,15 @@ on:
       - '**/*.md'
       - 'docs/**'
   workflow_dispatch:
+    inputs:
+      benchmark_cache_namespace:
+        description: 'Optional isolated benchmark cache namespace (empty uses normal caches)'
+        type: string
+        default: ''
+      benchmark_target_cache:
+        description: 'Experiment: persist target artifacts in the Linux unit-test job only'
+        type: boolean
+        default: false
 
 # NOTE: workflow-level paths-ignore above still skips the entire workflow for
 # pure doc/markdown changes.  The per-job path filters below provide finer
@@ -32,6 +41,7 @@ permissions:
   contents: read
 
 env:
+  CF_CACHE_NAMESPACE: ${{ inputs.benchmark_cache_namespace || '' }}
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: full
   # We do NOT set RUSTC_WRAPPER globally; we'll enable it per-job after probing sccache.
@@ -39,6 +49,7 @@ env:
   SCCACHE_CACHE_SIZE: "2G"
   # Usually better determinism and smaller cache churn in CI.
   CARGO_INCREMENTAL: "0"
+  SCCACHE_GHA_ENABLED: "true"
   # Pinned nightly toolchain used by the coverage job. Independent of the pin in
   # shear-nightly.yml — they happen to match today but need not.
   RUSTUP_TOOLCHAIN_NIGHTLY: nightly-2026-08-21
@@ -77,6 +88,7 @@ jobs:
               - '**/Cargo.toml'
               - 'Cargo.lock'
               - 'Makefile'
+              - 'tools/ci/**'
               - 'rust-toolchain.toml'
               - '.cargo/**'
               # Input to `make check-release-config` in the test job: a config-only
@@ -104,13 +116,24 @@ jobs:
             graph_storage:
               - 'gears/graph-storage/**'
             dylint:
+              - '**/*.rs'
+              - '**/Cargo.toml'
+              - 'Cargo.lock'
+              - 'rust-toolchain.toml'
+              - '.cargo/**'
+              - 'Makefile'
+              - 'tools/ci/**'
               - 'tools/dylint_lints/**'
+              - 'Gears.toml'
+              - 'dylint.toml'
+              - 'lint.yml'
             deps:
               - '**/Cargo.toml'
               - 'Cargo.lock'
               - 'deny.toml'
             ci:
               - '.github/workflows/**'
+              - '.github/actions/**'
 
   # ── Jobs ──────────────────────────────────────────────────────────────
 
@@ -160,29 +183,20 @@ jobs:
           rustup show
 
       - name: Install cargo-hack
-        uses: taiki-e/install-action@861a07ce7084f55488e375df125cdc99bba60eb7 # v2.87.23
+        uses: ./.github/actions/ci-tools
         with:
-          tool: cargo-hack
+          tools: cargo-hack
 
       - name: Cache Cargo/target
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           cache-bin: false
           cache-targets: false
-          shared-key: pr-clippy-${{ hashFiles('rust-toolchain.toml') }}
+          shared-key: pr-clippy-${{ hashFiles('rust-toolchain.toml') }}${{ env.CF_CACHE_NAMESPACE && format('-bench-{0}', env.CF_CACHE_NAMESPACE) || '' }}
 
-      - name: Install sccache
-        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
-
-      - name: Probe sccache & set RUSTC_WRAPPER
-        shell: bash
-        run: |
-          if sccache --start-server >/dev/null 2>&1; then
-            echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
-            echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
-          else
-            echo "sccache failed, falling back to plain rustc"
-          fi
+      - name: Configure remote sccache
+        id: sccache
+        uses: ./.github/actions/sccache
 
       # Database image tags are pinned in libs/test-containers (docs/TESTING.md
       # 4.4). A fixture that constructs a container any other way re-introduces
@@ -202,6 +216,11 @@ jobs:
       # their code (E0308, DE0904, clippy::...) when the command fails.
       - name: cargo clippy
         run: tools/scripts/with_rust_annotations.sh make clippy
+
+      - name: Save sccache statistics
+        if: ${{ always() && steps.sccache.outputs.enabled == 'true' }}
+        continue-on-error: true
+        uses: ./.github/actions/sccache-stats
 
   test:
     name: Test Suite (${{ matrix.os }})
@@ -278,32 +297,22 @@ jobs:
           rustup show
 
       - name: Install nextest
-        uses: taiki-e/install-action@861a07ce7084f55488e375df125cdc99bba60eb7 # v2.87.23
+        uses: ./.github/actions/ci-tools
         with:
-          tool: nextest
+          tools: nextest
 
       # Cache Cargo registry/git + target/ across platforms.
       - name: Cache Cargo/target
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           cache-bin: false
-          cache-targets: false
-          shared-key: pr-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml') }}
+          cache-targets: ${{ github.event_name == 'workflow_dispatch' && inputs.benchmark_target_cache && inputs.benchmark_cache_namespace != '' && runner.os == 'Linux' }}
+          shared-key: pr-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml') }}${{ env.CF_CACHE_NAMESPACE && format('-bench-{0}', env.CF_CACHE_NAMESPACE) || '' }}
 
       # Install sccache (cross-platform)
-      - name: Install sccache
-        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
-
-      # Probe sccache; if startup fails, fall back to plain rustc (no hard CI failure).
-      - name: Probe sccache & set RUSTC_WRAPPER
-        shell: bash
-        run: |
-          if sccache --start-server >/dev/null 2>&1; then
-            echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
-            echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
-          else
-            echo "sccache failed, falling back to plain rustc"
-          fi
+      - name: Configure remote sccache
+        id: sccache
+        uses: ./.github/actions/sccache
 
       - name: cargo test (no macros)
         shell: bash
@@ -321,6 +330,11 @@ jobs:
           path: test-results/*.xml
           if-no-files-found: warn
           retention-days: 14
+
+      - name: Save sccache statistics
+        if: ${{ always() && steps.sccache.outputs.enabled == 'true' }}
+        continue-on-error: true
+        uses: ./.github/actions/sccache-stats
 
   integration:
     name: Integration tests
@@ -368,66 +382,55 @@ jobs:
           rustup show
 
       - name: Install nextest
-        uses: taiki-e/install-action@861a07ce7084f55488e375df125cdc99bba60eb7 # v2.87.23
+        uses: ./.github/actions/ci-tools
         with:
-          tool: nextest
+          tools: nextest
 
       - name: Cache Cargo/target
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           cache-bin: false
           cache-targets: false
-          shared-key: pr-${{ runner.os }}-integration-${{ hashFiles('rust-toolchain.toml') }}
+          shared-key: pr-${{ runner.os }}-integration-${{ hashFiles('rust-toolchain.toml') }}${{ env.CF_CACHE_NAMESPACE && format('-bench-{0}', env.CF_CACHE_NAMESPACE) || '' }}
 
       # Install sccache (cross-platform)
-      - name: Install sccache
-        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
-
-      # Probe sccache; if startup fails, fall back to plain rustc (no hard CI failure).
-      - name: Probe sccache & set RUSTC_WRAPPER
-        id: setup
-        shell: bash
-        run: |
-          if sccache --start-server >/dev/null 2>&1; then
-            echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
-            echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
-          else
-            echo "sccache failed, falling back to plain rustc"
-          fi
+      - name: Configure remote sccache
+        id: sccache
+        uses: ./.github/actions/sccache
 
       # Every test step below runs even when an earlier one failed
       # (`!cancelled()`), so one broken suite no longer hides the results of the
       # rest; the job still fails if any of them did. Gated on `setup` so a
       # broken toolchain does not cascade into a wall of identical failures.
       - name: UI tests for toolkit macros libraries
-        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.sccache.outcome == 'success' }}
         run: tools/scripts/with_rust_annotations.sh make test-macros
 
       - name: Test users_info with Postgres (integration)
-        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.sccache.outcome == 'success' }}
         run: tools/scripts/with_rust_annotations.sh make test-users-info-pg
 
       - name: Test timescaledb usage-collector plugin (pg integration)
-        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.sccache.outcome == 'success' }}
         run: tools/scripts/with_rust_annotations.sh make test-usage-collector-pg
 
       - name: Test clickhouse usage-collector plugin (ch integration)
-        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.sccache.outcome == 'success' }}
         run: tools/scripts/with_rust_annotations.sh make test-usage-collector-ch
 
       - name: Test postgres-cluster-plugin (pg integration)
-        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.sccache.outcome == 'success' }}
         run: tools/scripts/with_rust_annotations.sh make test-cluster-pg
 
       - name: Test k8s-cluster-plugin (k3s L2+L3 integration)
-        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.sccache.outcome == 'success' }}
         # k3s runs in a **privileged** container (testcontainers-modules sets it);
         # GitHub-hosted ubuntu runners permit that. The target uses `cargo test`, not
         # nextest, so one k3s container is shared per test binary -- see the Makefile.
         run: tools/scripts/with_rust_annotations.sh make test-cluster-k8s
 
       - name: Test resource-group (pg smoke, integration)
-        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.sccache.outcome == 'success' }}
         # Fail if Docker is unreachable instead of letting the suite skip itself
         # into a green step that asserted nothing.
         env:
@@ -435,7 +438,7 @@ jobs:
         run: tools/scripts/with_rust_annotations.sh make test-rg-pg
 
       - name: Test settings-service (pg migrations, integration)
-        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.sccache.outcome == 'success' }}
         # Same shape as resource-group above: Docker is on this runner, so a
         # skip here would be a broken daemon passing green.
         env:
@@ -447,7 +450,7 @@ jobs:
       # owns lives in them. This job already has Docker. The target passes
       # `--no-fail-fast`; see the Makefile for what the default cost on 2026-08-18.
       - name: Test bss-pricing with Postgres (integration)
-        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.sccache.outcome == 'success' }}
         run: tools/scripts/with_rust_annotations.sh make test-pricing-pg
 
       # coord's `m0001_…` writes two independent SQL literals and only the
@@ -455,7 +458,7 @@ jobs:
       # that stops the `bss-pricing`-beside-`bss-ledger` boot crash, and the
       # `in_schema("bss")` form both gears actually pass, ran in no job.
       - name: Test coord with Postgres (integration)
-        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.sccache.outcome == 'success' }}
         run: tools/scripts/with_rust_annotations.sh make test-coord-pg
 
       # bss-products' Postgres tier, added 2026-08-30. It carries the gear's
@@ -466,29 +469,29 @@ jobs:
       # here and runs nowhere, which is the state the pricing comment above
       # records as having cost that gear nine hidden failures.
       - name: Test bss-products with Postgres (integration)
-        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.sccache.outcome == 'success' }}
         run: tools/scripts/with_rust_annotations.sh make test-products-pg
 
       # bss-ledger's Postgres tier: every posting, chain, payment and REST-over-Postgres
       # proof the gear owns. Without this step the tier compiles here and runs nowhere.
       - name: Test bss-ledger with Postgres (integration)
-        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.sccache.outcome == 'success' }}
         run: tools/scripts/with_rust_annotations.sh make test-ledger-pg
 
       - name: Test redis-cluster-plugin (redis integration)
-        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.sccache.outcome == 'success' }}
         run: tools/scripts/with_rust_annotations.sh make test-cluster-redis
 
       - name: Test toolkit-db (sqlite integration)
-        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.sccache.outcome == 'success' }}
         run: tools/scripts/with_rust_annotations.sh make test-sqlite
 
       - name: Test toolkit-db (pg integration)
-        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.sccache.outcome == 'success' }}
         run: tools/scripts/with_rust_annotations.sh make test-pg
 
       - name: Test toolkit-db (pgq unit + PG19 integration)
-        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.sccache.outcome == 'success' }}
         # Compiles and runs everything behind the `pgq` feature — the secure
         # graph builder, its unit suites and the trybuild guards — and the
         # PostgreSQL 19 integration suite. Locally that suite skips itself while
@@ -500,11 +503,11 @@ jobs:
         run: tools/scripts/with_rust_annotations.sh make test-pgq
 
       - name: Test toolkit-db (mysql integration)
-        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.sccache.outcome == 'success' }}
         run: tools/scripts/with_rust_annotations.sh make test-mysql
 
       - name: Test types-registry (db integration)
-        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.sccache.outcome == 'success' }}
         run: tools/scripts/with_rust_annotations.sh make test-types-registry-db
 
       # Published as GitHub Checks by test-report.yml (workflow_run), which has
@@ -519,6 +522,11 @@ jobs:
           path: test-results/*.xml
           if-no-files-found: warn
           retention-days: 14
+
+      - name: Save sccache statistics
+        if: ${{ always() && steps.sccache.outputs.enabled == 'true' }}
+        continue-on-error: true
+        uses: ./.github/actions/sccache-stats
 
   test-fips:
     name: FIPS verification (${{ matrix.os }})
@@ -578,35 +586,24 @@ jobs:
           rustup show
 
       - name: Install nextest
-        uses: taiki-e/install-action@861a07ce7084f55488e375df125cdc99bba60eb7 # v2.87.23
+        uses: ./.github/actions/ci-tools
         with:
-          tool: nextest
+          tools: nextest
 
-      # FIPS builds use a SEPARATE sccache bucket from non-FIPS jobs. The `-fips`
-      # cache-key segment guarantees a runner that toggles between FIPS and
-      # non-FIPS builds never reuses non-FIPS object files, which would otherwise
-      # silently produce a mixed binary that passes tests but isn't a true FIPS build.
+      # FIPS builds use a separate Cargo cache from non-FIPS jobs. The `-fips`
+      # suffix separates rust-cache entries. sccache independently keys compiler
+      # inputs; this shared-key is not a separate remote sccache bucket.
       - name: Cache Cargo/target
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           cache-bin: false
           cache-targets: false
-          shared-key: pr-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml') }}-fips
+          shared-key: pr-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml') }}-fips${{ env.CF_CACHE_NAMESPACE && format('-bench-{0}', env.CF_CACHE_NAMESPACE) || '' }}
 
       # Install sccache (cross-platform)
-      - name: Install sccache
-        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
-
-      # Probe sccache; if startup fails, fall back to plain rustc (no hard CI failure).
-      - name: Probe sccache & set RUSTC_WRAPPER
-        shell: bash
-        run: |
-          if sccache --start-server >/dev/null 2>&1; then
-            echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
-            echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
-          else
-            echo "sccache failed, falling back to plain rustc"
-          fi
+      - name: Configure remote sccache
+        id: sccache
+        uses: ./.github/actions/sccache
 
       # Linux: aws-lc-fips path via the existing make target
       # (cf-gears-toolkit + cf-gears-toolkit-http, bootstrap + fips).
@@ -643,6 +640,12 @@ jobs:
   # PostgreSQL lane the figure is ~55%, because the built-in store is the half
   # of the gear only a real server exercises — so measuring and running are the
   # same job or neither is honest.
+
+      - name: Save sccache statistics
+        if: ${{ always() && steps.sccache.outputs.enabled == 'true' }}
+        continue-on-error: true
+        uses: ./.github/actions/sccache-stats
+
   test-graph-storage:
     name: graph-storage (PostgreSQL 19 + pgvector, coverage floor)
     needs: changes
@@ -688,15 +691,15 @@ jobs:
         with:
           cache-bin: false
           cache-targets: false
-          shared-key: pr-${{ runner.os }}-nightly-${{ env.RUSTUP_TOOLCHAIN_NIGHTLY }}-llvm-cov
+          shared-key: pr-${{ runner.os }}-nightly-${{ env.RUSTUP_TOOLCHAIN_NIGHTLY }}-llvm-cov${{ env.CF_CACHE_NAMESPACE && format('-bench-{0}', env.CF_CACHE_NAMESPACE) || '' }}
 
       # The same pin as the workspace coverage job: the v2.70.3 one installed
       # cargo-llvm-cov 0.8.5, which on nightly-2026-08-21 ran every test and
       # then found no object files to report on.
       - name: Install cargo-llvm-cov and nextest
-        uses: taiki-e/install-action@861a07ce7084f55488e375df125cdc99bba60eb7 # v2.87.23
+        uses: ./.github/actions/ci-tools
         with:
-          tool: cargo-llvm-cov, nextest
+          tools: cargo-llvm-cov, nextest
 
       # PostgreSQL 19 plus a pinned pgvector, on the official base so the
       # stock entrypoint and server arguments testcontainers drives are intact.
@@ -817,7 +820,7 @@ jobs:
         with:
           cache-bin: false
           cache-targets: false
-          shared-key: pr-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml') }}-onnx
+          shared-key: pr-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml') }}-onnx${{ env.CF_CACHE_NAMESPACE && format('-bench-{0}', env.CF_CACHE_NAMESPACE) || '' }}
 
       - name: Fetch ONNX Runtime shared library
         shell: bash
@@ -915,20 +918,11 @@ jobs:
         with:
           cache-bin: false
           cache-targets: false
-          shared-key: pr-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml') }}-magika
+          shared-key: pr-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml') }}-magika${{ env.CF_CACHE_NAMESPACE && format('-bench-{0}', env.CF_CACHE_NAMESPACE) || '' }}
 
-      - name: Install sccache
-        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
-
-      - name: Probe sccache & set RUSTC_WRAPPER
-        shell: bash
-        run: |
-          if sccache --start-server >/dev/null 2>&1; then
-            echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
-            echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
-          else
-            echo "sccache failed, falling back to plain rustc"
-          fi
+      - name: Configure remote sccache
+        id: sccache
+        uses: ./.github/actions/sccache
 
       - name: Fetch ONNX Runtime shared library
         shell: bash
@@ -946,16 +940,17 @@ jobs:
         run: cargo test -p cf-gears-file-parser --features magika
 
       - name: Install cargo-deny
-        uses: taiki-e/install-action@861a07ce7084f55488e375df125cdc99bba60eb7 # v2.87.23
+        uses: ./.github/actions/ci-tools
         with:
-          tool: cargo-deny@0.20.2
+          tools: cargo-deny
 
       - name: cargo deny check (magika feature)
         run: make deny-magika
 
-  cfs:
-    name: CFS
-    uses: ./.github/workflows/cfs.yml
+      - name: Save sccache statistics
+        if: ${{ always() && steps.sccache.outputs.enabled == 'true' }}
+        continue-on-error: true
+        uses: ./.github/actions/sccache-stats
 
   security:
     name: Security (cargo-deny on Ubuntu)
@@ -978,9 +973,9 @@ jobs:
 
       # Install tools via prebuilt binaries for speed.
       - name: Install cargo-deny
-        uses: taiki-e/install-action@861a07ce7084f55488e375df125cdc99bba60eb7 # v2.87.23
+        uses: ./.github/actions/ci-tools
         with:
-          tool: cargo-deny@0.20.2
+          tools: cargo-deny
 
       # Blocking gate: advisories, licenses, bans and sources.
       - name: cargo deny check
@@ -1034,12 +1029,12 @@ jobs:
         with:
           cache-bin: false
           cache-targets: false
-          shared-key: pr-${{ runner.os }}-nightly-${{ env.RUSTUP_TOOLCHAIN_NIGHTLY }}-llvm-cov
+          shared-key: pr-${{ runner.os }}-nightly-${{ env.RUSTUP_TOOLCHAIN_NIGHTLY }}-llvm-cov${{ env.CF_CACHE_NAMESPACE && format('-bench-{0}', env.CF_CACHE_NAMESPACE) || '' }}
 
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@861a07ce7084f55488e375df125cdc99bba60eb7 # v2.87.23
+        uses: ./.github/actions/ci-tools
         with:
-          tool: cargo-llvm-cov, nextest
+          tools: cargo-llvm-cov, nextest
 
       # Generate lcov.info for upload. Customize flags/features as needed.
       #
@@ -1143,6 +1138,13 @@ jobs:
 
   lint:
     name: Architecture Lints (cargo gears lint)
+    needs: changes
+    if: >-
+      !cancelled()
+      && (needs.changes.result != 'success'
+      || needs.changes.outputs.dylint == 'true'
+      || needs.changes.outputs.ci == 'true'
+      || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -1155,13 +1157,15 @@ jobs:
         with:
           tool: protoc@3.34.1
 
-      - name: Install Rust stable toolchain
-        uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2 # stable
-        with:
-          toolchain: stable
+      - name: Install project Rust toolchain
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustup show
 
-      - name: Install cargo-gears
-        run: cargo install --locked cargo-gears@0.0.8
+      - name: Install pinned cargo-gears
+        uses: ./.github/actions/ci-tools
+        with:
+          tools: cargo-gears
 
       - name: Run architecture lints
         run: tools/scripts/with_rust_annotations.sh cargo gears lint --dylint

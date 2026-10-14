@@ -17,6 +17,8 @@ on:
       - '**/Cargo.toml'
       - 'Cargo.lock'
       - 'Makefile'
+      - 'tools/ci/**'
+      - '.github/actions/**'
       - 'config/quickstart.yaml'
       - 'config/e2e-features.txt'
       - 'docs/api/api.json'
@@ -32,6 +34,7 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
+  SCCACHE_GHA_ENABLED: "true"
 
 jobs:
   api_contracts:
@@ -94,18 +97,9 @@ jobs:
           shared-key: pr-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml') }}
 
       # Install sccache (cross-platform)
-      - name: Install sccache
-        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
-
-      # Probe sccache; if startup fails, fall back to plain rustc (no hard CI failure).
-      - name: Probe sccache & set RUSTC_WRAPPER
-        run: |
-          if sccache --start-server >/dev/null 2>&1; then
-            echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
-            echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
-          else
-            echo "sccache failed, falling back to plain rustc"
-          fi
+      - name: Configure remote sccache
+        id: sccache
+        uses: ./.github/actions/sccache
 
       - name: Save committed spec & generate fresh spec
         run: |
@@ -284,3 +278,8 @@ jobs:
           else
             echo "✅ **No breaking changes detected**" >> $GITHUB_STEP_SUMMARY
           fi
+
+      - name: Save sccache statistics
+        if: ${{ always() && steps.sccache.outputs.enabled == 'true' }}
+        continue-on-error: true
+        uses: ./.github/actions/sccache-stats
