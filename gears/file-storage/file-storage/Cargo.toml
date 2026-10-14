@@ -106,6 +106,8 @@ toolkit-security = { workspace = true }
 toolkit-canonical-errors = { workspace = true, features = ["axum", "utoipa"] }
 toolkit-macros = { workspace = true }
 toolkit-gts = { workspace = true }
+# `Page<T>` / cursor types for the three keyset-paginated listings; "with-utoipa" registers `Page<T>`'s OpenAPI schema.
+toolkit-odata = { workspace = true, features = ["with-utoipa"] }
 gts = { workspace = true }
 
 [dev-dependencies]

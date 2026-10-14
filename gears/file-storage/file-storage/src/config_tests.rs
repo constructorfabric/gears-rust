@@ -253,3 +253,74 @@ fn config_default_backend_id_serde_round_trip() {
     let back: FileStorageConfig = serde_json::from_str(&json).unwrap();
     assert_eq!(back.default_backend_id.as_deref(), Some("s3-primary"));
 }
+
+#[test]
+fn default_page_sizes_are_valid_and_within_ceiling() {
+    let cfg = FileStorageConfig::default();
+    assert_eq!(cfg.default_page_size, 25);
+    assert_eq!(cfg.max_page_size, 200);
+    assert!(
+        cfg.max_page_size <= MAX_PAGE_SIZE_CEILING,
+        "the shipped default_max_page_size must not itself exceed the ceiling"
+    );
+}
+
+#[test]
+fn validate_rejects_default_page_size_exceeding_max_page_size() {
+    let cfg = FileStorageConfig {
+        default_page_size: 150,
+        max_page_size: 100,
+        require_signing_key_seed: false,
+        ..FileStorageConfig::default()
+    };
+    assert!(
+        cfg.validate().is_err(),
+        "default_page_size exceeding max_page_size is a direct self-contradiction \
+         and must be rejected"
+    );
+}
+
+#[test]
+fn validate_accepts_default_page_size_equal_to_max_page_size() {
+    let cfg = FileStorageConfig {
+        default_page_size: 100,
+        max_page_size: 100,
+        require_signing_key_seed: false,
+        finalize_internal_secret: Some(SecretString::new("test-internal-secret")),
+        ..FileStorageConfig::default()
+    };
+    assert!(
+        cfg.validate().is_ok(),
+        "default_page_size == max_page_size must be accepted"
+    );
+}
+
+#[test]
+fn validate_accepts_max_page_size_at_ceiling() {
+    let cfg = FileStorageConfig {
+        default_page_size: MAX_PAGE_SIZE_CEILING,
+        max_page_size: MAX_PAGE_SIZE_CEILING,
+        require_signing_key_seed: false,
+        finalize_internal_secret: Some(SecretString::new("test-internal-secret")),
+        ..FileStorageConfig::default()
+    };
+    assert!(
+        cfg.validate().is_ok(),
+        "max_page_size == MAX_PAGE_SIZE_CEILING must be accepted"
+    );
+}
+
+#[test]
+fn validate_rejects_max_page_size_above_ceiling() {
+    let cfg = FileStorageConfig {
+        default_page_size: MAX_PAGE_SIZE_CEILING,
+        max_page_size: MAX_PAGE_SIZE_CEILING + 1,
+        require_signing_key_seed: false,
+        ..FileStorageConfig::default()
+    };
+    assert!(
+        cfg.validate().is_err(),
+        "max_page_size exceeding MAX_PAGE_SIZE_CEILING must be rejected regardless of what an \
+         operator configures"
+    );
+}

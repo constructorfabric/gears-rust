@@ -9,11 +9,11 @@ fn gear_provides_p1_and_p2_migrations() {
     let gear = FileStorageGear::default();
     assert_eq!(
         gear.migrations().len(),
-        7,
+        8,
         "gear must provide the P1, P2 initial, P2 multipart plan columns, P2 \
          remediation 0.10 idempotency subject_id, P2 remediation 2.1 \
          idempotency request_hash, P2 remediation 2.4 policies unique \
-         scope, and ADR-0006 content-hash-modes migrations"
+         scope, ADR-0006 content-hash-modes, and listing-indexes migrations"
     );
 }
 

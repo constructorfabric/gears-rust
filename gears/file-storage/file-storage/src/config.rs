@@ -7,6 +7,10 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 use toolkit_utils::SecretString;
 
+/// Absolute ceiling accepted for `max_page_size` (the platform-wide cursor-pagination cap);
+/// `validate()` rejects anything above it.
+pub const MAX_PAGE_SIZE_CEILING: u64 = 200;
+
 /// Configuration for the `file-storage` gear.
 ///
 /// `Debug` is implemented manually so the `signing_key_seed` private key is never
@@ -168,6 +172,24 @@ impl FileStorageConfig {
                  same value as the sidecar's FS_SIDECAR_INTERNAL_TOKEN)"
             );
         }
+        // The default page size must not exceed the max.
+        if self.default_page_size > self.max_page_size {
+            anyhow::bail!(
+                "invalid file-storage config: default_page_size ({}) must not exceed \
+                 max_page_size ({})",
+                self.default_page_size,
+                self.max_page_size
+            );
+        }
+        // Cap `max_page_size` at the ceiling.
+        if self.max_page_size > MAX_PAGE_SIZE_CEILING {
+            anyhow::bail!(
+                "invalid file-storage config: max_page_size ({}) must not exceed \
+                 MAX_PAGE_SIZE_CEILING ({})",
+                self.max_page_size,
+                MAX_PAGE_SIZE_CEILING
+            );
+        }
         Ok(())
     }
 }
@@ -236,11 +258,11 @@ fn default_sidecar_base_url() -> String {
 }
 
 fn default_page_size() -> u64 {
-    50
+    25 // platform-wide cursor-pagination default (guidelines/DNA/REST/QUERYING.md)
 }
 
 fn default_max_page_size() -> u64 {
-    1000
+    200 // platform-wide cursor-pagination cap; see MAX_PAGE_SIZE_CEILING
 }
 
 fn default_storage_root() -> String {

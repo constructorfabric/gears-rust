@@ -141,6 +141,8 @@ async fn build_harness() -> Harness {
     let policy_svc = Arc::new(PolicyService::new(
         Arc::clone(&policy_store),
         Arc::clone(&authorizer),
+        50,
+        1000,
     ));
     Harness {
         file_svc,

@@ -4,6 +4,7 @@
 <!-- toc -->
 
 - [Two planes](#two-planes)
+- [Changes for 0.2.x clients](#changes-for-02x-clients)
 - [P1 — Control plane (`/api/file-storage/v1`)](#p1--control-plane-apifile-storagev1)
 - [P1 — Sidecar (signed-URL authorized)](#p1--sidecar-signed-url-authorized)
 - [Data-plane callbacks (sidecar → control plane, s2s token-authenticated)](#data-plane-callbacks-sidecar--control-plane-s2s-token-authenticated)
@@ -55,6 +56,19 @@ Encoding conventions:
 - Control bodies are `application/json`. The sidecar `PUT` body is the **raw** object bytes (no `multipart/form-data`).
 - All error responses follow RFC 7807 (`application/problem+json`).
 - `file_id` and `version_id` are UUIDs. A backend object lives at `/{file_id}/{version_id}` and is immutable.
+
+## Changes for 0.2.x clients
+
+Breaking changes to the three list endpoints — `GET /files`, `GET /files/{id}/versions`, `GET /retention-rules`
+(details in [Cursor pagination](#cursor-pagination) and [P2 — Retention rules](#p2--retention-rules)):
+
+- Each now returns `{"items": [...], "page_info": {"next_cursor", "prev_cursor", "limit"}}` instead of a bare JSON
+  array.
+- The `cursor` query parameter (taken from `page_info.next_cursor` or `page_info.prev_cursor`) replaces `offset`.
+  `offset`, and any other unrecognized query parameter, is rejected with `400`.
+- `limit=0` is rejected with `400`. The default page size is 25 and the maximum is 200; a larger `limit` is
+  clamped down to 200.
+- `GET /retention-rules` is now paginated.
 
 ## P1 — Control plane (`/api/file-storage/v1`)
 
