@@ -23,13 +23,16 @@ use file_storage_sdk::{CustomMetadataPatch, NewFile, OwnerFilter, OwnerKind};
 use super::dto::{
     BindReq, CreateFileReq, CreateRetentionRuleReq, DownloadTicketDto, EffectivePolicyDto, FileDto,
     InitiateMultipartReq, MigrateBackendReq, MissingPartDto, MultipartCompleteDto,
-    MultipartPartPlanDto, MultipartPlanDto, MultipartStatusDto, PolicyDto, ReceivedPartDto,
-    RetentionRuleDto, SetPolicyReq, StorageDto, StorageDtoList, TransferOwnershipReq,
-    UpdateMetadataReq, UploadTicketDto, VersionDto,
+    MultipartCompletingDto, MultipartPartPlanDto, MultipartPlanDto, MultipartStatusDto, PolicyDto,
+    ReceivedPartDto, RetentionRuleDto, SetPolicyReq, StorageDto, StorageDtoList,
+    TransferOwnershipReq, UpdateMetadataReq, UploadTicketDto, VersionDto,
 };
+use crate::domain::create_flow::{self, CreateFileOutcome, MultipartIntent};
 use crate::domain::error::DomainError;
 use crate::domain::etag;
-use crate::domain::multipart::{MultipartPlan, MultipartUploadStatus};
+use crate::domain::multipart::{
+    BindState, MultipartCompleteOutcome, MultipartPlan, MultipartUploadStatus,
+};
 use crate::domain::multipart_service::MultipartService;
 use crate::domain::policy::{PolicyScope, RetentionScope};
 use crate::domain::policy_service::PolicyService;
@@ -81,19 +84,30 @@ fn header_str(headers: &HeaderMap, name: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// Shared-secret credential for the s2s finalize/report-part callbacks (ADR-0003);
-/// interim until `toolkit-security::internal_auth` can replace it.
+/// Policies for the s2s finalize/report-part callbacks, on top of the signed upload token:
 ///
-/// The secret (`FileStorageConfig::finalize_internal_secret`) is mandatory: `verify`
-/// always requires a matching `x-fs-internal-token` on top of the signed upload token.
+/// * A mandatory shared secret (`finalize_internal_secret`, ADR-0003): `verify` always requires
+///   a matching `x-fs-internal-token`. Interim until `toolkit-security::internal_auth`.
+/// * A grace window on the token's `exp` (`verify_with_grace`): the sidecar checks the token only
+///   at upload start, so a slow upload can reach finalize after `exp`. `0` restores strict `exp`.
 pub struct FinalizeAuth {
     secret: String,
+    token_grace: time::Duration,
 }
 
 impl FinalizeAuth {
     #[must_use]
-    pub fn new(secret: String) -> Self {
-        Self { secret }
+    pub fn new(secret: String, token_grace: time::Duration) -> Self {
+        Self {
+            secret,
+            token_grace,
+        }
+    }
+
+    /// Grace window on the upload token's `exp` on the callbacks.
+    #[must_use]
+    pub fn token_grace(&self) -> time::Duration {
+        self.token_grace
     }
 
     /// Verify the `x-fs-internal-token` header; the comparison is constant-time.
@@ -119,15 +133,29 @@ impl FinalizeAuth {
     }
 }
 
+/// `POST /files`: create a file and presign its first content upload.
+///
+/// * No `multipart` block (or a one-part plan): a single-part `upload_url`; with `bind: "auto"`
+///   (default) the sidecar's finalize binds the first content itself.
+/// * `multipart` with at least 2 parts: the response carries the parts plan and no single-part
+///   version is pre-registered.
 pub async fn create_file(
     uri: Uri,
     Extension(ctx): Ctx,
     Extension(svc): Svc,
+    Extension(msvc): MultiSvc,
     Json(req): Json<CreateFileReq>,
 ) -> ApiResult<impl IntoResponse> {
     let owner_kind = req
         .parse_owner_kind()
         .ok_or_else(|| DomainError::validation("owner_kind", "must be 'user' or 'app'"))?;
+    let auto_bind = match req.bind.as_deref() {
+        None | Some("auto") => true,
+        Some("manual") => false,
+        Some(_) => {
+            return Err(DomainError::validation("bind", "must be 'auto' or 'manual'").into());
+        }
+    };
     let new = NewFile {
         owner_kind,
         owner_id: req.owner_id,
@@ -143,18 +171,39 @@ pub async fn create_file(
             })
             .collect(),
     };
-    let ticket = svc.create_file(&ctx, new, req.idempotency_key).await?;
-    let id = ticket.file_id.to_string();
-    Ok(created_json(
-        UploadTicketDto {
+
+    let multipart_intent = req.multipart.as_ref().map(|mp| MultipartIntent {
+        declared_size: mp.declared_size,
+        preferred_part_size: mp.preferred_part_size,
+    });
+
+    let outcome = create_flow::create_file(
+        &svc,
+        &msvc,
+        &ctx,
+        new,
+        req.idempotency_key,
+        auto_bind,
+        multipart_intent,
+    )
+    .await?;
+
+    let dto = match outcome {
+        CreateFileOutcome::SinglePart(ticket) => UploadTicketDto {
             file_id: ticket.file_id,
             version_id: ticket.version_id,
-            upload_url: ticket.upload_url,
+            upload_url: Some(ticket.upload_url),
+            multipart: None,
         },
-        &uri,
-        &id,
-    )
-    .into_response())
+        CreateFileOutcome::Multipart { file_id, plan } => UploadTicketDto {
+            file_id,
+            version_id: plan.version_id,
+            upload_url: None,
+            multipart: Some(plan_to_dto(plan)),
+        },
+    };
+    let id = dto.file_id.to_string();
+    Ok(created_json(dto, &uri, &id).into_response())
 }
 
 pub async fn presign_version(
@@ -166,7 +215,8 @@ pub async fn presign_version(
     Ok(Json(UploadTicketDto {
         file_id: ticket.file_id,
         version_id: ticket.version_id,
-        upload_url: ticket.upload_url,
+        upload_url: Some(ticket.upload_url),
+        multipart: None,
     }))
 }
 
@@ -241,9 +291,11 @@ pub async fn list_versions(
     CanonicalQuery(q): CanonicalQuery<ListVersionsQuery>,
 ) -> ApiResult<JsonPage<VersionDto>> {
     let page = svc
-        .list_versions(&ctx, file_id, q.limit, q.cursor.as_deref())
+        .list_versions_with_manifests(&ctx, file_id, q.limit, q.cursor.as_deref())
         .await?;
-    Ok(Json(page.map_items(VersionDto::from)))
+    Ok(Json(page.map_items(|(v, manifest)| {
+        VersionDto::from_parts(v, manifest)
+    })))
 }
 
 pub async fn download_url(
@@ -455,7 +507,8 @@ pub async fn initiate_multipart(
             &req.declared_mime,
             req.declared_size,
             req.preferred_part_size,
-            req.concurrency,
+            // Standalone initiate: the client binds explicitly.
+            false,
         )
         .await?;
     Ok(Json(plan_to_dto(plan)))
@@ -463,28 +516,49 @@ pub async fn initiate_multipart(
 
 /// `POST /files/{id}/multipart/{upload_id}/complete` — finalize all parts.
 ///
-/// Returns the bound version's id, size, and ADR-0006 composite hash. `If-Match` is
-/// optional: a concrete value is checked against the current content `ETag`; `*` or
-/// omission is unconditional.
+/// Returns the version's id, size, hash and bind outcome (`200`), or `202` + `Retry-After` while
+/// another caller holds the lease. `If-Match` is optional: a concrete value is checked against
+/// the content `ETag`; `*` or omission is unconditional.
 pub async fn complete_multipart(
     Extension(ctx): Ctx,
     Extension(svc): MultiSvc,
     Path((file_id, upload_id)): Path<(Uuid, Uuid)>,
     headers: HeaderMap,
-) -> ApiResult<JsonBody<MultipartCompleteDto>> {
+) -> ApiResult<axum::response::Response> {
     let if_match = header_str(&headers, "if-match");
-    let completed = svc
+    let outcome = svc
         .complete_multipart_upload(&ctx, file_id, upload_id, if_match.as_deref())
         .await?;
-    Ok(Json(MultipartCompleteDto {
-        version_id: completed.version_id,
-        size: completed.size,
-        hash_algorithm: completed.hash_algorithm.to_owned(),
-        content_hash: hex::encode(&completed.content_hash),
-        hash_mode: completed.hash_mode.as_str().to_owned(),
-        part_count: completed.part_count,
-        manifest: completed.manifest,
-    }))
+    Ok(match outcome {
+        MultipartCompleteOutcome::Completed(completed) => Json(MultipartCompleteDto {
+            version_id: completed.version_id,
+            size: completed.size,
+            hash_algorithm: completed.hash_algorithm.to_owned(),
+            content_hash: hex::encode(&completed.content_hash),
+            hash_mode: completed.hash_mode.as_str().to_owned(),
+            part_count: completed.part_count,
+            manifest: completed.manifest,
+            bind_state: completed.bind_state.as_str().to_owned(),
+            etag: completed.etag,
+            current_etag: completed.current_etag,
+        })
+        .into_response(),
+        // Lease held elsewhere: poll by re-issuing complete.
+        MultipartCompleteOutcome::Completing { retry_after_secs } => {
+            let mut resp = (
+                StatusCode::ACCEPTED,
+                Json(MultipartCompletingDto {
+                    state: "completing".to_owned(),
+                    retry_after_secs,
+                }),
+            )
+                .into_response();
+            if let Ok(v) = HeaderValue::from_str(&retry_after_secs.to_string()) {
+                resp.headers_mut().insert(header::RETRY_AFTER, v);
+            }
+            resp
+        }
+    })
 }
 
 fn status_to_dto(s: MultipartUploadStatus) -> MultipartStatusDto {
@@ -603,7 +677,11 @@ pub async fn finalize_version(
         .ok_or_else(|| DomainError::token_invalid("missing x-fs-token header"))?;
 
     let claims = verifier
-        .verify(&token, OffsetDateTime::now_utc())
+        .verify_with_grace(
+            &token,
+            OffsetDateTime::now_utc(),
+            finalize_auth.token_grace(),
+        )
         .map_err(|e| DomainError::token_invalid(e.to_string()))?;
 
     // The token must authorize a PUT to exactly this (file_id, version_id).
@@ -639,10 +717,25 @@ pub async fn finalize_version(
         .into());
     }
 
-    svc.finalize_upload_by_token(&claims, req.size, hash_value)
+    let outcome = svc
+        .finalize_upload_by_token(&claims, req.size, hash_value)
         .await?;
 
-    Ok(StatusCode::NO_CONTENT.into_response())
+    // Surface the auto-bind outcome; the sidecar forwards it on its `PUT` response.
+    let mut resp = StatusCode::NO_CONTENT.into_response();
+    let (bound, name, value) = match outcome.bind_state {
+        Some(BindState::Bound) => ("true", "etag", outcome.etag),
+        Some(BindState::Conflict) => ("conflict", "x-fs-current-etag", outcome.current_etag),
+        Some(BindState::Manual) | None => return Ok(resp),
+    };
+    resp.headers_mut()
+        .insert("x-fs-bound", HeaderValue::from_static(bound));
+    if let Some(v) = value
+        && let Ok(v) = HeaderValue::from_str(&v)
+    {
+        resp.headers_mut().insert(name, v);
+    }
+    Ok(resp)
 }
 
 /// Request body for the data-plane report-part endpoint.
@@ -677,7 +770,11 @@ pub async fn report_multipart_part(
         .ok_or_else(|| DomainError::token_invalid("missing x-fs-token header"))?;
 
     let claims = verifier
-        .verify(&token, OffsetDateTime::now_utc())
+        .verify_with_grace(
+            &token,
+            OffsetDateTime::now_utc(),
+            finalize_auth.token_grace(),
+        )
         .map_err(|e| DomainError::token_invalid(e.to_string()))?;
 
     // The token must authorize exactly this (file, version, upload, part).

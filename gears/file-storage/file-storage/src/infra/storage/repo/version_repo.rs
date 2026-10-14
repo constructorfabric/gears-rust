@@ -4,7 +4,7 @@ use sea_orm::sea_query::{Expr, Query};
 use sea_orm::{ColumnTrait, Condition, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set};
 use time::OffsetDateTime;
 use toolkit_db::secure::{
-    DBRunner, SecureDeleteExt, SecureEntityExt, SecureUpdateExt, secure_insert,
+    DBRunner, SecureDeleteExt, SecureEntityExt, SecureUpdateExt, max_bind_params_for, secure_insert,
 };
 use toolkit_security::AccessScope;
 use uuid::Uuid;
@@ -51,6 +51,7 @@ impl VersionRepo {
             backend_id: Set(v.backend_id.clone()),
             backend_path: Set(v.backend_path.clone()),
             created_at: Set(v.created_at),
+            bound_on_finalize: Set(v.bound_on_finalize),
         };
         secure_insert::<Entity>(am, scope, conn)
             .await
@@ -269,14 +270,48 @@ impl VersionRepo {
         Ok(found.map(|m| m.manifest))
     }
 
+    /// Batched [`Self::get_manifest`] keyed by `version_id`; versions without a manifest are absent.
+    ///
+    /// `version_ids` is chunked to [`max_bind_params_for`] minus
+    /// [`Self::GET_MANIFESTS_RESERVED_PARAMS`] so a large page cannot exceed the bind-parameter limit.
+    const GET_MANIFESTS_RESERVED_PARAMS: usize = 16;
+
+    pub async fn get_manifests<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        version_ids: &[Uuid],
+    ) -> Result<std::collections::HashMap<Uuid, String>, DomainError> {
+        if version_ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let chunk_size = max_bind_params_for(conn)
+            .saturating_sub(Self::GET_MANIFESTS_RESERVED_PARAMS)
+            .max(1);
+        let mut manifests = std::collections::HashMap::new();
+        for chunk in version_ids.chunks(chunk_size) {
+            let rows = ManifestEntity::find()
+                .filter(ManifestColumn::VersionId.is_in(chunk.iter().copied()))
+                .secure()
+                .scope_with(scope)
+                .all(conn)
+                .await
+                .map_err(DomainError::from)?;
+            manifests.extend(rows.into_iter().map(|m| (m.version_id, m.manifest)));
+        }
+        Ok(manifests)
+    }
+
     /// Clear `is_current` on all versions of a file (before promoting a new current one).
+    ///
+    /// Returns the rows cleared; `0` is expected for a brand-new file, unlike [`Self::set_current`].
     pub async fn clear_current<C: DBRunner>(
         &self,
         conn: &C,
         scope: &AccessScope,
         file_id: Uuid,
-    ) -> Result<(), DomainError> {
-        Entity::update_many()
+    ) -> Result<u64, DomainError> {
+        let res = Entity::update_many()
             .col_expr(Column::IsCurrent, Expr::value(false))
             .filter(
                 Condition::all()
@@ -288,18 +323,21 @@ impl VersionRepo {
             .exec(conn)
             .await
             .map_err(DomainError::from)?;
-        Ok(())
+        Ok(res.rows_affected)
     }
 
-    /// Promote one version to `is_current = true`.
+    /// Promote one version to `is_current = true`; returns the rows updated (0 or 1).
+    ///
+    /// A concurrent `delete_version` can remove the version after the bind CAS; callers MUST treat
+    /// `0` as a fatal conflict and abort, or `files.content_id` would dangle.
     pub async fn set_current<C: DBRunner>(
         &self,
         conn: &C,
         scope: &AccessScope,
         file_id: Uuid,
         version_id: Uuid,
-    ) -> Result<(), DomainError> {
-        Entity::update_many()
+    ) -> Result<u64, DomainError> {
+        let res = Entity::update_many()
             .col_expr(Column::IsCurrent, Expr::value(true))
             .filter(
                 Condition::all()
@@ -311,7 +349,52 @@ impl VersionRepo {
             .exec(conn)
             .await
             .map_err(DomainError::from)?;
+        Ok(res.rows_affected)
+    }
+
+    /// Make `version_id` the file's only current version after its bind CAS won.
+    ///
+    /// # Errors
+    /// `DomainError::Conflict` if the version vanished (`set_current` updated 0 rows), so the
+    /// caller's transaction aborts instead of leaving `files.content_id` dangling.
+    pub async fn promote_current<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        file_id: Uuid,
+        version_id: Uuid,
+    ) -> Result<(), DomainError> {
+        self.clear_current(conn, scope, file_id).await?;
+        if self.set_current(conn, scope, file_id, version_id).await? == 0 {
+            return Err(DomainError::conflict(
+                "target version no longer exists -- it was deleted concurrently",
+            ));
+        }
         Ok(())
+    }
+
+    /// Record that a version won its finalize-time bind CAS (same transaction), so a retried
+    /// finalize replays it instead of re-reading `files.content_id`. Returns the rows updated.
+    pub async fn mark_bound_on_finalize<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        file_id: Uuid,
+        version_id: Uuid,
+    ) -> Result<u64, DomainError> {
+        let res = Entity::update_many()
+            .col_expr(Column::BoundOnFinalize, Expr::value(true))
+            .filter(
+                Condition::all()
+                    .add(Column::FileId.eq(file_id))
+                    .add(Column::VersionId.eq(version_id)),
+            )
+            .secure()
+            .scope_with(scope)
+            .exec(conn)
+            .await
+            .map_err(DomainError::from)?;
+        Ok(res.rows_affected)
     }
 
     /// Delete a single version; returns the number of rows removed (0 or 1).
@@ -366,11 +449,12 @@ impl VersionRepo {
         Ok(res.rows_affected > 0)
     }
 
-    /// List `pending` versions created before `older_than`, excluding versions backing
-    /// a live `in_progress` session (`expires_at > now`).
+    /// List `pending` versions created before `older_than`, excluding versions backing an active
+    /// multipart session (live `in_progress`, or any `completing`).
     ///
-    /// A long multipart upload keeps its version `pending` for the whole session; an
-    /// already-expired session is not excluded and is aborted by the sweep first.
+    /// A long multipart upload keeps its version `pending` for the whole session. An expired
+    /// `in_progress` session is not excluded (the sweep aborts it first). `completing` is excluded
+    /// unconditionally: a completer may be assembling; a stuck one is reaped by the expired-multipart CAS.
     pub async fn list_pending_older_than<C: DBRunner>(
         &self,
         conn: &C,
@@ -388,8 +472,15 @@ impl VersionRepo {
                             Query::select()
                                 .column(MultipartUploadColumn::VersionId)
                                 .from(MultipartUploadEntity)
-                                .and_where(MultipartUploadColumn::State.eq("in_progress"))
-                                .and_where(MultipartUploadColumn::ExpiresAt.gt(now))
+                                .cond_where(
+                                    Condition::any()
+                                        .add(
+                                            Condition::all()
+                                                .add(MultipartUploadColumn::State.eq("in_progress"))
+                                                .add(MultipartUploadColumn::ExpiresAt.gt(now)),
+                                        )
+                                        .add(MultipartUploadColumn::State.eq("completing")),
+                                )
                                 .to_owned(),
                         ),
                     ),

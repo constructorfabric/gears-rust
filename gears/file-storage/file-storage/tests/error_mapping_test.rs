@@ -54,6 +54,7 @@ fn all_variant_instances() -> Vec<DomainError> {
         },
         DomainError::Database {
             message: "db down".into(),
+            source: None,
         },
         DomainError::Validation {
             field: "name".into(),

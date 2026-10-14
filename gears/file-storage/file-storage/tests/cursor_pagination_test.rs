@@ -10,6 +10,7 @@ use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use axum::routing::get;
+use bytes::Bytes;
 use sea_orm_migration::MigratorTrait;
 use serde_json::Value;
 use time::OffsetDateTime;
@@ -20,13 +21,16 @@ use toolkit_security::{AccessScope, SecurityContext};
 use tower::ServiceExt;
 use uuid::Uuid;
 
+use file_storage::api::rest::dto::VersionDto;
 use file_storage::api::rest::handlers;
 use file_storage::domain::authz::{Authorizer, TenantOnlyAuthorizer};
+use file_storage::domain::data_plane::DataPlaneService;
 use file_storage::domain::error::DomainError;
+use file_storage::domain::multipart::DEFAULT_MIN_PART_SIZE;
 use file_storage::domain::pagination;
 use file_storage::domain::policy::{AgeRetention, RetentionRuleBody, RetentionScope};
 use file_storage::domain::policy_service::PolicyService;
-use file_storage::domain::ports::PolicyStore;
+use file_storage::domain::ports::{DataPlanePort, PolicyStore};
 use file_storage::domain::service::{FileService, ServiceConfig};
 use file_storage::infra::backend::{BackendRegistry, InMemoryBackend, StorageBackend};
 use file_storage::infra::signed_url::Issuer;
@@ -34,6 +38,8 @@ use file_storage::infra::storage::Store;
 use file_storage::infra::storage::migrations::Migrator;
 use file_storage::infra::storage::repo::{FileRepo, VersionRepo};
 use file_storage_sdk::{File, FileVersion, NewFile, OwnerFilter, OwnerKind, VersionStatus};
+
+mod common;
 
 const GTS: &str = gts_id!("cf.fstorage.file.type.v1~x.cursor_pagination_test.file.type.v1~");
 const BASE: &str = "/api/file-storage/v1";
@@ -396,7 +402,7 @@ async fn build_files_harness() -> (Arc<FileService>, SecurityContext, Uuid) {
     ));
     let tenant = Uuid::now_v7();
     let owner = Uuid::now_v7();
-    svc.create_file(&ctx(tenant, owner), new_file(owner), None)
+    svc.create_file(&ctx(tenant, owner), new_file(owner), None, false)
         .await
         .expect("seed one file");
     (svc, ctx(tenant, owner), owner)
@@ -483,6 +489,7 @@ fn new_version(file_id: Uuid, version_id: Uuid, created_at: OffsetDateTime) -> F
         backend_id: "mem".to_owned(),
         backend_path: format!("/{file_id}/{version_id}"),
         created_at,
+        bound_on_finalize: false,
     }
 }
 
@@ -965,4 +972,387 @@ async fn retention_rules_backward_cursor_with_wrong_order_field_is_rejected() {
         .await
         .expect_err("a backward cursor built for a different listing's order must be rejected");
     assert!(matches!(err, DomainError::Cursor(_)));
+}
+
+/// Three composite versions whose 3 MiB manifests each exceed half of the 4 MiB page budget, so
+/// every `list_versions_with_manifests` page holds exactly one row. Returns the service, caller
+/// context, file id and the version ids newest first: `[v2, v1, v0]`.
+async fn seed_budget_busting_versions() -> (FileService, SecurityContext, Uuid, [Uuid; 3]) {
+    let db = build_db().await;
+    let store = Store::new(Arc::clone(&db));
+    let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("mem"));
+    let backends = BackendRegistry::new(vec![backend], "mem").expect("registry");
+    let issuer = Arc::new(Issuer::generate(3600).expect("issuer"));
+    let authorizer: Arc<dyn Authorizer> = Arc::new(TenantOnlyAuthorizer);
+    let svc = FileService::new(
+        store,
+        backends,
+        issuer,
+        authorizer,
+        base_config(),
+        None,
+        None,
+    );
+
+    let tenant = Uuid::now_v7();
+    let owner = Uuid::now_v7();
+    let base = OffsetDateTime::now_utc();
+    let conn = db.conn().expect("conn");
+    let files = FileRepo::new();
+    let versions = VersionRepo::new();
+    let scope = AccessScope::allow_all();
+    let file_id = Uuid::now_v7();
+    files
+        .create(
+            &conn,
+            &scope,
+            &File {
+                file_id,
+                tenant_id: tenant,
+                owner_kind: OwnerKind::User,
+                owner_id: owner,
+                name: "doc.bin".to_owned(),
+                gts_file_type: GTS.to_owned(),
+                content_id: None,
+                meta_version: 0,
+                created_at: base,
+                last_modified_at: base,
+            },
+        )
+        .await
+        .expect("create file");
+
+    let manifest_text = "x".repeat(3 * 1024 * 1024);
+    let mut version_ids = Vec::new();
+    for i in 0..3u8 {
+        let version_id = Uuid::now_v7();
+        let created_at = base + time::Duration::seconds(i64::from(i));
+        let mut v = new_version(file_id, version_id, created_at);
+        "multipart-composite-sha256".clone_into(&mut v.hash_mode);
+        v.part_count = Some(2);
+        versions
+            .insert(&conn, &scope, &v)
+            .await
+            .expect("insert composite version");
+        versions
+            .insert_manifest(&conn, &scope, version_id, &manifest_text, created_at)
+            .await
+            .expect("insert manifest");
+        version_ids.push(version_id);
+    }
+    // Newest-first order: v2 (base+2), v1 (base+1), v0 (base).
+    (
+        svc,
+        ctx(tenant, owner),
+        file_id,
+        [version_ids[2], version_ids[1], version_ids[0]],
+    )
+}
+
+fn version_ids_of(page: &toolkit_odata::Page<(FileVersion, Option<String>)>) -> Vec<Uuid> {
+    page.items.iter().map(|(v, _)| v.version_id).collect()
+}
+
+/// A forward page cut short by the manifest budget keeps the leading rows (adjacent to the
+/// cursor) and rebuilds `next_cursor` from the last kept row.
+#[tokio::test]
+async fn versions_manifest_budget_truncation_forces_next_cursor_with_no_gap_or_duplicate() {
+    let (svc, ctx, file_id, [v2, v1, v0]) = seed_budget_busting_versions().await;
+
+    let page1 = svc
+        .list_versions_with_manifests(&ctx, file_id, Some(10), None)
+        .await
+        .expect("page 1");
+    assert_eq!(
+        version_ids_of(&page1),
+        vec![v2],
+        "the manifest budget must cut the page short after the first version"
+    );
+    assert!(
+        page1.page_info.prev_cursor.is_none(),
+        "page 1 has no earlier page"
+    );
+    let cursor = page1
+        .page_info
+        .next_cursor
+        .clone()
+        .expect("a budget-truncated page must still carry a next_cursor");
+
+    let page2 = svc
+        .list_versions_with_manifests(&ctx, file_id, Some(10), Some(&cursor))
+        .await
+        .expect("page 2");
+    assert_eq!(
+        version_ids_of(&page2),
+        vec![v1],
+        "page 2 must resume exactly at v1 -- no gap, no repeat of v2"
+    );
+    let cursor2 = page2
+        .page_info
+        .next_cursor
+        .clone()
+        .expect("page 2 is budget-truncated too, so it must also carry a next_cursor");
+
+    let page3 = svc
+        .list_versions_with_manifests(&ctx, file_id, Some(10), Some(&cursor2))
+        .await
+        .expect("page 3");
+    assert_eq!(
+        version_ids_of(&page3),
+        vec![v0],
+        "page 3 must resume exactly at v0 -- no gap, no repeat of v1"
+    );
+    assert!(
+        page3.page_info.next_cursor.is_none(),
+        "must be the last page"
+    );
+}
+
+/// A backward page cut short by the manifest budget keeps the TRAILING rows (the ones adjacent to
+/// its cursor in canonical newest-first order) and rebuilds `prev_cursor` from the first kept row;
+/// `next_cursor` stays valid. Walking back from the last page then loses and repeats nothing.
+#[tokio::test]
+async fn versions_manifest_budget_truncation_on_a_backward_page_keeps_rows_adjacent_to_the_cursor()
+{
+    let (svc, ctx, file_id, [v2, v1, v0]) = seed_budget_busting_versions().await;
+
+    // Walk forward to the last page to obtain a genuine `prev_cursor` positioned at v0.
+    let mut cursor = None;
+    let mut last_page = None;
+    for _ in 0..3 {
+        let page = svc
+            .list_versions_with_manifests(&ctx, file_id, Some(10), cursor.as_deref())
+            .await
+            .expect("forward walk");
+        cursor = page.page_info.next_cursor.clone();
+        last_page = Some(page);
+    }
+    let last_page = last_page.unwrap();
+    assert_eq!(version_ids_of(&last_page), vec![v0]);
+    let prev_from_v0 = last_page
+        .page_info
+        .prev_cursor
+        .clone()
+        .expect("the last page has an earlier page");
+
+    // Backward from v0: v2 and v1 are both newer, but the budget fits only one manifest. The row
+    // adjacent to the cursor (v1) must be kept, not the far one (v2).
+    let back1 = svc
+        .list_versions_with_manifests(&ctx, file_id, Some(10), Some(&prev_from_v0))
+        .await
+        .expect("backward page 1");
+    assert_eq!(
+        version_ids_of(&back1),
+        vec![v1],
+        "a truncated backward page must keep the row adjacent to its cursor"
+    );
+    assert!(
+        back1.items[0].1.is_some(),
+        "the kept composite version still carries its manifest"
+    );
+    let prev_from_v1 = back1
+        .page_info
+        .prev_cursor
+        .clone()
+        .expect("truncation must leave a prev_cursor for the dropped newer row");
+    let next_from_v1 = back1
+        .page_info
+        .next_cursor
+        .clone()
+        .expect("the opposite-direction cursor must stay valid");
+
+    // The rebuilt `prev_cursor` re-serves exactly the dropped row, nothing more or less.
+    let back2 = svc
+        .list_versions_with_manifests(&ctx, file_id, Some(10), Some(&prev_from_v1))
+        .await
+        .expect("backward page 2");
+    assert_eq!(
+        version_ids_of(&back2),
+        vec![v2],
+        "backward page 2 must resume exactly at v2 -- no gap, no repeat of v1"
+    );
+    assert!(
+        back2.page_info.prev_cursor.is_none(),
+        "v2 is the newest version: nothing earlier"
+    );
+
+    // The untouched `next_cursor` of the truncated backward page leads forward to v0 again.
+    let forward = svc
+        .list_versions_with_manifests(&ctx, file_id, Some(10), Some(&next_from_v1))
+        .await
+        .expect("forward from the backward page");
+    assert_eq!(version_ids_of(&forward), vec![v0]);
+}
+
+#[test]
+fn version_dto_from_file_version_omits_manifest() {
+    let v = FileVersion {
+        file_id: Uuid::now_v7(),
+        version_id: Uuid::now_v7(),
+        mime_type: "text/plain".to_owned(),
+        size: 42,
+        hash_algorithm: "sha256".to_owned(),
+        hash_value: vec![1, 2, 3],
+        hash_mode: "whole-sha256".to_owned(),
+        part_count: None,
+        status: VersionStatus::Available,
+        is_current: true,
+        backend_id: "mem".to_owned(),
+        backend_path: "/a/b".to_owned(),
+        created_at: OffsetDateTime::now_utc(),
+        bound_on_finalize: false,
+    };
+    let dto: VersionDto = v.clone().into();
+    assert_eq!(dto.version_id, v.version_id);
+    assert_eq!(dto.status, v.status.as_str());
+    assert!(
+        dto.manifest.is_none(),
+        "the bare `From` conversion must never attach a manifest"
+    );
+}
+
+async fn get_versions_body(router: Router, uri: String) -> Value {
+    let resp = router.oneshot(get_req(uri)).await.expect("dispatch");
+    assert_eq!(resp.status(), StatusCode::OK);
+    body_json(resp).await
+}
+
+/// `GET /files/{id}/versions` serializes versions (manifest lookup batched for composite ones):
+/// a bound whole-sha256 version carries no manifest, a page of whole-sha256 versions is never
+/// capped below `?limit`, and a composite version carries its non-empty manifest.
+#[tokio::test]
+async fn list_versions_endpoint_serializes_whole_and_composite_versions() {
+    enum Seed {
+        OneBoundWhole,
+        EightWholeWithLimit8,
+        BoundComposite,
+    }
+    for (row, seed) in [
+        ("one bound whole-sha256 version", Seed::OneBoundWhole),
+        ("eight whole-sha256 versions", Seed::EightWholeWithLimit8),
+        ("bound composite version", Seed::BoundComposite),
+    ] {
+        let stack = common::build_stack(
+            "cursor-pagination",
+            Arc::new(Issuer::generate(3600).expect("issuer")),
+            None,
+        )
+        .await;
+        let svc = Arc::clone(&stack.svc);
+        let dp = DataPlaneService::new(Arc::clone(&svc) as Arc<dyn DataPlanePort>);
+        let owner = Uuid::now_v7();
+        let ctx = ctx(Uuid::now_v7(), owner);
+
+        let (file_id, only_version_id, query) = match seed {
+            Seed::OneBoundWhole | Seed::EightWholeWithLimit8 => {
+                let ticket = svc
+                    .create_file(&ctx, new_file(owner), None, false)
+                    .await
+                    .expect("create_file");
+                dp.put_content(
+                    &ctx,
+                    ticket.file_id,
+                    ticket.version_id,
+                    "application/octet-stream",
+                    Bytes::from_static(b"v0"),
+                )
+                .await
+                .expect("put_content v0");
+                if matches!(seed, Seed::OneBoundWhole) {
+                    svc.bind(&ctx, ticket.file_id, ticket.version_id, None)
+                        .await
+                        .expect("bind");
+                    (ticket.file_id, ticket.version_id, "")
+                } else {
+                    for i in 1..8u32 {
+                        let t = svc
+                            .presign_version(&ctx, ticket.file_id)
+                            .await
+                            .expect("presign_version");
+                        dp.put_content(
+                            &ctx,
+                            ticket.file_id,
+                            t.version_id,
+                            "application/octet-stream",
+                            Bytes::from(format!("v{i}")),
+                        )
+                        .await
+                        .expect("put_content");
+                    }
+                    (ticket.file_id, ticket.version_id, "?limit=8")
+                }
+            }
+            Seed::BoundComposite => {
+                let file_id = svc
+                    .create_file_bare(&ctx, new_file(owner))
+                    .await
+                    .expect("create_file_bare");
+                let plan = stack
+                    .msvc
+                    .initiate_multipart_upload(
+                        &ctx,
+                        file_id,
+                        "application/octet-stream",
+                        DEFAULT_MIN_PART_SIZE + 3,
+                        None,
+                        false,
+                    )
+                    .await
+                    .expect("initiate_multipart_upload");
+                assert_eq!(plan.parts.len(), 2, "{row}: must plan exactly 2 parts");
+                for part in &plan.parts {
+                    let data = Bytes::from(vec![b'x'; usize::try_from(part.size).unwrap()]);
+                    common::put_part(
+                        &stack.multipart_store,
+                        &stack.backend,
+                        &plan,
+                        file_id,
+                        part.part_number,
+                        data,
+                    )
+                    .await;
+                }
+                stack
+                    .msvc
+                    .complete_multipart_upload(&ctx, file_id, plan.upload_id, None)
+                    .await
+                    .expect("complete_multipart_upload");
+                svc.bind(&ctx, file_id, plan.version_id, None)
+                    .await
+                    .expect("bind");
+                (file_id, plan.version_id, "")
+            }
+        };
+
+        let body = get_versions_body(
+            versions_router(ctx, svc),
+            format!("{BASE}/files/{file_id}/versions{query}"),
+        )
+        .await;
+        let items = body["items"].as_array().expect("array body");
+        match seed {
+            Seed::OneBoundWhole => {
+                assert_eq!(items.len(), 1, "{row}: expected exactly the one version");
+                assert_eq!(items[0]["version_id"], only_version_id.to_string().as_str());
+                assert!(
+                    items[0].get("manifest").is_none() || items[0]["manifest"].is_null(),
+                    "{row}: a whole-sha256 version must carry no manifest"
+                );
+            }
+            Seed::EightWholeWithLimit8 => assert_eq!(
+                items.len(),
+                8,
+                "{row}: a page of whole-sha256 versions (no manifests) must never be capped \
+                 below ?limit"
+            ),
+            Seed::BoundComposite => {
+                assert_eq!(items.len(), 1, "{row}: expected exactly the one version");
+                assert_eq!(items[0]["hash_mode"], "multipart-composite-sha256", "{row}");
+                let manifest = items[0]["manifest"]
+                    .as_str()
+                    .expect("composite version must carry a non-null manifest string");
+                assert!(!manifest.is_empty(), "{row}: manifest must not be empty");
+            }
+        }
+    }
 }

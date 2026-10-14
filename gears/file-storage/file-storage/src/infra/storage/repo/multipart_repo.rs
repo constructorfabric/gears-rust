@@ -3,7 +3,8 @@
 //! No `tenant_id` column, so all queries use `AccessScope::allow_all()`; the tenant
 //! boundary is enforced through the parent `files` row before a session is created.
 
-use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder, Set};
+use sea_orm::sea_query::LockType;
+use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set};
 use time::OffsetDateTime;
 use toolkit_db::secure::{
     DBRunner, SecureDeleteExt, SecureEntityExt, SecureUpdateExt, secure_insert,
@@ -40,9 +41,12 @@ impl MultipartRepo {
         file_id: Uuid,
         version_id: Uuid,
         backend_upload_handle: &str,
+        backend_id: &str,
+        backend_path: &str,
         declared_mime: &str,
         declared_size: u64,
         part_size: u64,
+        auto_bind: bool,
         expires_at: OffsetDateTime,
         now: OffsetDateTime,
     ) -> Result<(), DomainError> {
@@ -60,6 +64,12 @@ impl MultipartRepo {
             mime_validated: Set(false),
             declared_size: Set(declared_size_i64),
             part_size: Set(part_size_i64),
+            auto_bind: Set(auto_bind),
+            lease_until: Set(None),
+            lease_owner: Set(None),
+            complete_result: Set(None),
+            backend_id: Set(Some(backend_id.to_owned())),
+            backend_path: Set(Some(backend_path.to_owned())),
             created_at: Set(now),
             expires_at: Set(expires_at),
         };
@@ -67,6 +77,25 @@ impl MultipartRepo {
             .await
             .map_err(DomainError::from)?;
         Ok(())
+    }
+
+    /// Lock a `multipart_uploads` row (`SELECT ... FOR UPDATE`) and return its `state`, or `None`.
+    /// Call only as the transaction's FIRST statement (parent-before-children ordering, see
+    /// `FileRepo::lock_for_update`), so finalize cannot commit against a session the sweep aborted.
+    pub async fn lock_session_state<C: DBRunner>(
+        &self,
+        conn: &C,
+        upload_id: Uuid,
+    ) -> Result<Option<String>, DomainError> {
+        let found = UploadEntity::find()
+            .filter(UploadColumn::UploadId.eq(upload_id))
+            .lock(LockType::Update)
+            .secure()
+            .scope_with(&AccessScope::allow_all())
+            .one(conn)
+            .await
+            .map_err(DomainError::from)?;
+        Ok(found.map(|m| m.state))
     }
 
     /// Fetch a multipart upload session by `upload_id`.
@@ -116,6 +145,128 @@ impl MultipartRepo {
             .exec(conn)
             .await
             .map_err(DomainError::from)?;
+        Ok(res.rows_affected > 0)
+    }
+
+    /// Acquire (or take over) the completion lease with one conditional UPDATE from `in_progress`
+    /// or an EXPIRED `completing`; `false` = live lease elsewhere, terminal, or expired.
+    /// Fenced by `expires_at > now` in the CAS itself: the service's snapshot check cannot see a
+    /// session that expired since.
+    pub async fn acquire_complete_lease<C: DBRunner>(
+        &self,
+        conn: &C,
+        upload_id: Uuid,
+        owner: &str,
+        lease_until: OffsetDateTime,
+        now: OffsetDateTime,
+    ) -> Result<bool, DomainError> {
+        use sea_orm::sea_query::Expr;
+        let res = UploadEntity::update_many()
+            .col_expr(UploadColumn::State, Expr::value("completing"))
+            .col_expr(UploadColumn::LeaseUntil, Expr::value(lease_until))
+            .col_expr(UploadColumn::LeaseOwner, Expr::value(owner))
+            .filter(
+                sea_orm::Condition::all()
+                    .add(UploadColumn::UploadId.eq(upload_id))
+                    .add(UploadColumn::ExpiresAt.gt(now))
+                    .add(claimable(now)),
+            )
+            .secure()
+            .scope_with(&AccessScope::allow_all())
+            .exec(conn)
+            .await
+            .map_err(DomainError::from)?;
+        Ok(res.rows_affected > 0)
+    }
+
+    /// Release a held lease back to `in_progress` (assembly failed). Scoped to `owner` so a
+    /// takeover's lease is not clobbered by the crashed original.
+    pub async fn release_complete_lease<C: DBRunner>(
+        &self,
+        conn: &C,
+        upload_id: Uuid,
+        owner: &str,
+    ) -> Result<bool, DomainError> {
+        use sea_orm::sea_query::Expr;
+        let res = clear_lease(
+            UploadEntity::update_many().col_expr(UploadColumn::State, Expr::value("in_progress")),
+        )
+        .filter(
+            sea_orm::Condition::all()
+                .add(UploadColumn::UploadId.eq(upload_id))
+                .add(UploadColumn::State.eq("completing"))
+                .add(UploadColumn::LeaseOwner.eq(owner)),
+        )
+        .secure()
+        .scope_with(&AccessScope::allow_all())
+        .exec(conn)
+        .await
+        .map_err(DomainError::from)?;
+        Ok(res.rows_affected > 0)
+    }
+
+    /// Abort a `completing` session whose lease has EXPIRED: CAS `lease_until < now` -> `aborted`.
+    pub async fn abort_expired_completing<C: DBRunner>(
+        &self,
+        conn: &C,
+        upload_id: Uuid,
+        now: OffsetDateTime,
+    ) -> Result<bool, DomainError> {
+        use sea_orm::sea_query::Expr;
+        let res = clear_lease(
+            UploadEntity::update_many().col_expr(UploadColumn::State, Expr::value("aborted")),
+        )
+        .filter(
+            sea_orm::Condition::all()
+                .add(UploadColumn::UploadId.eq(upload_id))
+                .add(UploadColumn::State.eq("completing"))
+                .add(UploadColumn::LeaseUntil.lt(now)),
+        )
+        .secure()
+        .scope_with(&AccessScope::allow_all())
+        .exec(conn)
+        .await
+        .map_err(DomainError::from)?;
+        Ok(res.rows_affected > 0)
+    }
+
+    /// Terminal transition `completing -> completed`, persisting the snapshot and clearing the lease.
+    ///
+    /// `expected_owner`: when `Some`, the CAS also requires `lease_owner = expected_owner`. `None`
+    /// is for `finalize_multipart_version` only (same transaction as its won finalize CAS, which is
+    /// fenced only by `status = 'pending'`; requiring the owner would strand the session after a
+    /// takeover) and also accepts `in_progress`. `aborted`/`completed` are never matched.
+    pub async fn finish_complete<C: DBRunner>(
+        &self,
+        conn: &C,
+        upload_id: Uuid,
+        expected_owner: Option<&str>,
+        result_json: &str,
+    ) -> Result<bool, DomainError> {
+        use sea_orm::sea_query::Expr;
+        let mut condition = sea_orm::Condition::all().add(UploadColumn::UploadId.eq(upload_id));
+        condition = match expected_owner {
+            Some(owner) => condition
+                .add(UploadColumn::State.eq("completing"))
+                .add(UploadColumn::LeaseOwner.eq(owner)),
+            None => condition.add(
+                sea_orm::Condition::any()
+                    .add(UploadColumn::State.eq("completing"))
+                    .add(UploadColumn::State.eq("in_progress")),
+            ),
+        };
+        let res = clear_lease(
+            UploadEntity::update_many()
+                .col_expr(UploadColumn::State, Expr::value("completed"))
+                .col_expr(UploadColumn::MimeValidated, Expr::value(true))
+                .col_expr(UploadColumn::CompleteResult, Expr::value(result_json)),
+        )
+        .filter(condition)
+        .secure()
+        .scope_with(&AccessScope::allow_all())
+        .exec(conn)
+        .await
+        .map_err(DomainError::from)?;
         Ok(res.rows_affected > 0)
     }
 
@@ -199,7 +350,6 @@ impl MultipartRepo {
         rows.into_iter().map(part_from_model).collect()
     }
 
-    /// List `in_progress` sessions whose `expires_at` is before `now` (for the sweep).
     pub async fn list_expired<C: DBRunner>(
         &self,
         conn: &C,
@@ -208,8 +358,8 @@ impl MultipartRepo {
         let rows = UploadEntity::find()
             .filter(
                 sea_orm::Condition::all()
-                    .add(UploadColumn::State.eq("in_progress"))
-                    .add(UploadColumn::ExpiresAt.lt(now)),
+                    .add(UploadColumn::ExpiresAt.lt(now))
+                    .add(claimable(now)),
             )
             .order_by_asc(UploadColumn::ExpiresAt)
             .secure()
@@ -220,29 +370,60 @@ impl MultipartRepo {
         rows.into_iter().map(session_from_model).collect()
     }
 
-    /// Whether `file_id` has an `in_progress` session, regardless of `expires_at`.
+    /// Whether `file_id` has an active (`in_progress` or `completing`) multipart session.
     ///
     /// Guards orphan-file reconciliation: a pending version keyed only on age can look
-    /// abandoned while a not-yet-expired session uses it, and deleting the `files`
-    /// row would cascade the session away.
-    pub async fn has_in_progress_for_file<C: DBRunner>(
+    /// abandoned while a not-yet-reaped session uses it, and deleting the `files` row would
+    /// cascade the session away. Existence uses `LIMIT 1` + `one()`, never `COUNT(*)`.
+    pub async fn has_active_for_file<C: DBRunner>(
         &self,
         conn: &C,
         file_id: Uuid,
     ) -> Result<bool, DomainError> {
-        let count = UploadEntity::find()
+        let row = UploadEntity::find()
             .filter(
                 sea_orm::Condition::all()
                     .add(UploadColumn::FileId.eq(file_id))
-                    .add(UploadColumn::State.eq("in_progress")),
+                    .add(
+                        sea_orm::Condition::any()
+                            .add(UploadColumn::State.eq("in_progress"))
+                            .add(UploadColumn::State.eq("completing")),
+                    ),
             )
             .secure()
             .scope_with(&AccessScope::allow_all())
-            .count(conn)
+            .limit(1)
+            .one(conn)
             .await
             .map_err(DomainError::from)?;
-        Ok(count > 0)
+        Ok(row.is_some())
     }
+}
+
+/// Clear the completion lease columns on an UPDATE.
+fn clear_lease(update: sea_orm::UpdateMany<UploadEntity>) -> sea_orm::UpdateMany<UploadEntity> {
+    use sea_orm::sea_query::Expr;
+    update
+        .col_expr(
+            UploadColumn::LeaseUntil,
+            Expr::value(Option::<OffsetDateTime>::None),
+        )
+        .col_expr(
+            UploadColumn::LeaseOwner,
+            Expr::value(Option::<String>::None),
+        )
+}
+
+/// Sessions `complete` may claim and the sweep may reap: `in_progress`, or `completing` with an
+/// expired lease.
+fn claimable(now: OffsetDateTime) -> sea_orm::Condition {
+    sea_orm::Condition::any()
+        .add(UploadColumn::State.eq("in_progress"))
+        .add(
+            sea_orm::Condition::all()
+                .add(UploadColumn::State.eq("completing"))
+                .add(UploadColumn::LeaseUntil.lt(now)),
+        )
 }
 
 fn session_from_model(m: UploadModel) -> Result<MultipartUploadSession, DomainError> {
@@ -255,6 +436,17 @@ fn session_from_model(m: UploadModel) -> Result<MultipartUploadSession, DomainEr
             m.upload_id, m.state
         ))
     })?;
+    let missing = |column: &str| {
+        DomainError::database(format!(
+            "multipart upload {} has no {column} in DB",
+            m.upload_id
+        ))
+    };
+    let backend_id = m.backend_id.clone().ok_or_else(|| missing("backend_id"))?;
+    let backend_path = m
+        .backend_path
+        .clone()
+        .ok_or_else(|| missing("backend_path"))?;
     let declared_size = u64::try_from(m.declared_size).unwrap_or(0);
     let part_size = u64::try_from(m.part_size).unwrap_or(0);
     Ok(MultipartUploadSession {
@@ -267,6 +459,11 @@ fn session_from_model(m: UploadModel) -> Result<MultipartUploadSession, DomainEr
         mime_validated: m.mime_validated,
         declared_size,
         part_size,
+        auto_bind: m.auto_bind,
+        lease_until: m.lease_until,
+        complete_result: m.complete_result,
+        backend_id,
+        backend_path,
         created_at: m.created_at,
         expires_at: m.expires_at,
     })

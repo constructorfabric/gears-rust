@@ -577,15 +577,16 @@ See the `idempotency_keys` table (`m20260701_000001_p2_initial`, extended by `m2
 
 ## Upgrading from v0.2.x and rolling back
 
-This release adds one additive migration, `m20260924_000001_upload_flow_redesign`: new `multipart_uploads` columns
+This release adds two additive migrations, applied in this order: `m20261008_000001_listing_indexes` (the
+`file_versions_file_created_idx` and `files_owner_listing_v2_idx` listing indexes, the latter superseding
+`files_owner_listing_idx`) and `m20261014_000001_upload_flow`. The second adds new `multipart_uploads` columns
 — `auto_bind`, `lease_until`, `lease_owner`, `complete_result`, `backend_id`, `backend_path` — and the `completing`
-state in its CHECK (on SQLite it rebuilds `multipart_uploads`, carrying rows and parts over), plus indexes only
-(`idempotency_keys_file_idx`, `multipart_uploads_sweep_idx`, `files_versionless_sweep_idx`,
-`file_versions_file_created_idx`, `files_owner_listing_v2_idx` superseding `files_owner_listing_idx`). Existing rows
-keep working: new columns are nullable or default to the old behaviour, and `backend_id`/`backend_path` are
-backfilled from the session's version. No released migration changes.
+state in its CHECK (on SQLite it rebuilds `multipart_uploads`, carrying rows and parts over), plus the
+`idempotency_keys_file_idx` index and the `file_versions.bound_on_finalize` column. Existing rows keep working: new
+columns are nullable or default to the old behaviour. The sweep indexes for the cleanup job (`multipart_uploads_sweep_idx`,
+`files_versionless_sweep_idx`) come with a later migration, not this release. No released migration changes.
 
-**Mixed-version window.** Run the migration once, then roll the fleet. An older (v0.2.x) instance tolerates the new
+**Mixed-version window.** Run the migrations once, then roll the fleet. An older (v0.2.x) instance tolerates the new
 schema, with two exceptions to keep short: it rejects a multipart session in the new `completing` state as
 `invalid multipart upload state` (a `complete` in flight on a new instance), and it never auto-binds. Roll the
 control plane and the sidecars together — the sidecar forwards the new finalize headers and the control plane
@@ -593,9 +594,11 @@ accepts the new token grace — and keep the window as short as a normal rolling
 
 **Rolling back the binary.** An older binary refuses to start against a database that has migrations it does not
 know (sea-orm reports `Migration file of version '…' is missing`), so the order is: with the **new** binary, run
-`m20260924_000001_upload_flow_redesign` down, then deploy the old binary. Its `down()` drops the new columns, so
-sessions in `completing` and stored completion snapshots are lost; finish or abort in-flight multipart uploads
-before rolling back. Files and versions themselves are untouched by either direction.
+`m20261014_000001_upload_flow` down, then `m20261008_000001_listing_indexes` down (reverse of the apply order), then
+deploy the old binary. The down step of `m20261014_000001_upload_flow` folds any session in `completing` into
+`aborted` (the narrow pre-upgrade CHECK cannot hold it), narrows the CHECK again, and drops the new columns and the
+index, so stored completion snapshots, leases and the `bound_on_finalize` flag are lost; finish or abort in-flight
+multipart uploads before rolling back. Files and versions themselves are untouched by either direction.
 
 ## Storage quota (not enforced)
 

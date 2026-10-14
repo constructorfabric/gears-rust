@@ -12,7 +12,10 @@ use super::error::DomainError;
 #[allow(unknown_lints, de1302_error_from_to_string)]
 impl From<DbError> for DomainError {
     fn from(e: DbError) -> Self {
-        Self::database(e.to_string())
+        match e {
+            DbError::Sea(db) => Self::from(db),
+            other => Self::database(other.to_string()),
+        }
     }
 }
 
@@ -27,13 +30,31 @@ impl From<toolkit_odata::Error> for DomainError {
 #[allow(unknown_lints, de1302_error_from_to_string)]
 impl From<ScopeError> for DomainError {
     fn from(e: ScopeError) -> Self {
-        Self::database(e.to_string())
+        match e {
+            ScopeError::Db(db) => Self::from(db),
+            other => Self::database(other.to_string()),
+        }
     }
 }
 
 #[allow(unknown_lints, de1302_error_from_to_string)]
 impl From<DbErr> for DomainError {
     fn from(e: DbErr) -> Self {
-        Self::database(e.to_string())
+        Self::database_with_source(e.to_string(), e)
     }
 }
+
+/// The original `DbErr` behind a database error, for `Db::transaction_with_retry`.
+pub(crate) fn db_err(e: &DomainError) -> Option<&DbErr> {
+    match e {
+        DomainError::Database {
+            source: Some(source),
+            ..
+        } => source.downcast_ref::<DbErr>(),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+#[path = "error_convert_tests.rs"]
+mod error_convert_tests;

@@ -368,3 +368,118 @@ fn validate_rejects_zero_max_page_size() {
         "unexpected error: {err}"
     );
 }
+
+/// Each case sets the key(s) under test on a config that is otherwise valid; `true` = `validate`
+/// must accept it.
+fn assert_validate_cases(cases: Vec<(&str, FileStorageConfig, bool)>) {
+    for (name, cfg, accepted) in cases {
+        let cfg = FileStorageConfig {
+            require_signing_key_seed: false,
+            ..cfg
+        };
+        assert_eq!(
+            cfg.validate().is_ok(),
+            accepted,
+            "{name}: expected {}",
+            if accepted { "accepted" } else { "rejected" }
+        );
+    }
+}
+
+#[test]
+fn finalize_grace_session_ttl_and_complete_lease_defaults_and_overrides() {
+    let cfg = FileStorageConfig::default();
+    assert_eq!(cfg.finalize_token_grace_secs, 3600);
+    assert_eq!(cfg.multipart_session_ttl_secs, 86400);
+    assert!(
+        cfg.multipart_session_ttl_secs > cfg.default_url_ttl_secs,
+        "the stock session lifetime must outlive the per-part URL TTL"
+    );
+    assert!(cfg.multipart_session_ttl_secs <= MAX_MULTIPART_SESSION_TTL_SECS);
+    assert_eq!(cfg.multipart_complete_lease_secs, 120);
+    assert!(cfg.multipart_complete_lease_secs <= MAX_MULTIPART_COMPLETE_LEASE_SECS);
+
+    let cfg: FileStorageConfig = serde_json::from_str(
+        r#"{"finalize_token_grace_secs": 0, "multipart_session_ttl_secs": 3600,
+            "multipart_complete_lease_secs": 30}"#,
+    )
+    .unwrap();
+    assert_eq!(cfg.finalize_token_grace_secs, 0);
+    assert_eq!(cfg.multipart_session_ttl_secs, 3600);
+    assert_eq!(cfg.multipart_complete_lease_secs, 30);
+}
+
+// Guards the saturating `i64` conversion: an unbounded grace would become `i64::MAX` seconds.
+#[test]
+fn validate_finalize_token_grace_bounds() {
+    let with_grace = |secs| FileStorageConfig {
+        finalize_token_grace_secs: secs,
+        ..cfg_with_secret()
+    };
+    assert_validate_cases(vec![
+        (
+            "grace at MAX",
+            with_grace(MAX_FINALIZE_TOKEN_GRACE_SECS),
+            true,
+        ),
+        (
+            "grace above MAX",
+            with_grace(MAX_FINALIZE_TOKEN_GRACE_SECS + 1),
+            false,
+        ),
+        ("zero grace (disabled)", with_grace(0), true),
+    ]);
+}
+
+#[test]
+fn validate_multipart_session_ttl_bounds() {
+    let with_ttl = |url_ttl, session_ttl| FileStorageConfig {
+        default_url_ttl_secs: url_ttl,
+        multipart_session_ttl_secs: session_ttl,
+        ..cfg_with_secret()
+    };
+    let default_url_ttl = FileStorageConfig::default().default_url_ttl_secs;
+    assert_validate_cases(vec![
+        (
+            "shorter than default_url_ttl_secs (self-contradiction)",
+            with_ttl(900, 300),
+            false,
+        ),
+        ("equal to default_url_ttl_secs", with_ttl(900, 900), true),
+        (
+            "at ceiling",
+            with_ttl(default_url_ttl, MAX_MULTIPART_SESSION_TTL_SECS),
+            true,
+        ),
+        (
+            "above ceiling",
+            with_ttl(default_url_ttl, MAX_MULTIPART_SESSION_TTL_SECS + 1),
+            false,
+        ),
+        ("zero", with_ttl(default_url_ttl, 0), false),
+        ("one", with_ttl(1, 1), true),
+    ]);
+}
+
+// The lease must be bounded: an oversized value would delay another caller taking over.
+#[test]
+fn validate_multipart_complete_lease_bounds() {
+    let with_lease = |secs| FileStorageConfig {
+        multipart_complete_lease_secs: secs,
+        ..cfg_with_secret()
+    };
+    assert_validate_cases(vec![
+        (
+            "at ceiling",
+            with_lease(MAX_MULTIPART_COMPLETE_LEASE_SECS),
+            true,
+        ),
+        (
+            "above ceiling",
+            with_lease(MAX_MULTIPART_COMPLETE_LEASE_SECS + 1),
+            false,
+        ),
+        ("zero", with_lease(0), false),
+        ("one", with_lease(1), true),
+    ]);
+}

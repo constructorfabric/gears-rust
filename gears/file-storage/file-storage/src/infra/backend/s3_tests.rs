@@ -520,3 +520,91 @@ async fn s3_backend_put_stream_enforces_max_size_mid_stream() {
     assert!(!backend.exists(path).await.unwrap());
     assert!(backend.get(path).await.is_err());
 }
+
+#[tokio::test]
+async fn s3_backend_publish_exclusive_single_put_rejects_overwrite() {
+    let (addr, dir) = start_s3s_fs().await;
+    let bucket = unique_bucket();
+    let backend = make_backend(addr, &dir, &bucket).await;
+
+    let path = "publish-exclusive/small";
+    let first: &[u8] = b"the original immutable blob";
+    let second: &[u8] = b"a replay attempt with different bytes";
+
+    let outcome = backend
+        .publish_exclusive(path, chunk_stream(vec![Bytes::from_static(first)]), None)
+        .await
+        .expect("first publish_exclusive should succeed");
+    assert!(outcome.created, "first publish must report created = true");
+    assert_eq!(outcome.bytes_written, first.len() as u64);
+    assert_eq!(outcome.digest, hash::digest_to_array(hash::sha256(first)));
+
+    // A replayed PUT token must not overwrite: `If-None-Match: *` -> 412 -> `created = false`.
+    let outcome2 = backend
+        .publish_exclusive(path, chunk_stream(vec![Bytes::from_static(second)]), None)
+        .await
+        .expect("second publish_exclusive must return Ok(created=false), not an error");
+    assert!(
+        !outcome2.created,
+        "second publish to an existing path must report created = false"
+    );
+    assert_eq!(outcome2.bytes_written, second.len() as u64);
+
+    let got = backend.get(path).await.unwrap();
+    assert_eq!(
+        got.as_ref(),
+        first,
+        "the original bytes must survive the rejected overwrite"
+    );
+}
+
+#[tokio::test]
+async fn s3_backend_publish_exclusive_multipart_rejects_overwrite() {
+    let (addr, dir) = start_s3s_fs().await;
+    let bucket = unique_bucket();
+    // Low threshold so the stream takes the multipart path, whose `CompleteMultipartUpload`
+    // carries `If-None-Match: *`.
+    let part_size: u64 = 5 * 1024 * 1024;
+    let backend = make_backend(addr, &dir, &bucket)
+        .await
+        .with_multipart_threshold_bytes(part_size);
+
+    let chunk_size = 1024 * 1024;
+    let num_chunks: u8 = 11;
+    let first_chunks: Vec<Bytes> = (0..num_chunks)
+        .map(|i| Bytes::from(vec![b'a' + i; chunk_size]))
+        .collect();
+    let first_concat: Vec<u8> = first_chunks.iter().flat_map(|c| c.to_vec()).collect();
+
+    let path = "publish-exclusive/large";
+    let outcome = backend
+        .publish_exclusive(path, chunk_stream(first_chunks), None)
+        .await
+        .expect("first multipart publish_exclusive should succeed");
+    assert!(outcome.created, "first multipart publish must create");
+    assert_eq!(outcome.bytes_written, first_concat.len() as u64);
+
+    // Second publish: 412 on complete, and the just-opened multipart session is aborted.
+    let second_chunks: Vec<Bytes> = (0..num_chunks)
+        .map(|i| Bytes::from(vec![b'z' - i; chunk_size]))
+        .collect();
+    let outcome2 = backend
+        .publish_exclusive(path, chunk_stream(second_chunks), None)
+        .await
+        .expect("second multipart publish must return Ok(created=false)");
+    assert!(
+        !outcome2.created,
+        "second multipart publish to an existing path must report created = false"
+    );
+
+    let got = backend.get(path).await.unwrap();
+    assert_eq!(
+        got.as_ref(),
+        first_concat.as_slice(),
+        "the original multipart object must survive the rejected overwrite"
+    );
+}
+
+// No concurrent-racer test here: `s3s-fs` checks `If-None-Match: *` with a plain `exists()` then
+// writes, so concurrent publishes can both win. That is a test-double limitation, not
+// `S3Backend`'s; the conditional header is covered sequentially by the tests above.

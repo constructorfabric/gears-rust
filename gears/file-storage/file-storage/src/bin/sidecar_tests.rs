@@ -19,7 +19,7 @@ use file_storage::infra::signed_url::{Claims, Issuer, MultipartClaims, Op, Uploa
 
 use super::{
     DEFAULT_MAX_BODY_BYTES, SidecarState, build_router, finalize_with_control_plane,
-    report_part_with_control_plane, write_multipart_part_native,
+    interpret_finalize_response, report_part_with_control_plane, write_multipart_part_native,
     write_multipart_part_offset_object,
 };
 
@@ -322,6 +322,7 @@ fn download_token_with_meta(
         request_id: "test-request-id".to_owned(),
         content_type: content_type.to_owned(),
         etag: etag.to_owned(),
+        bind_on_finalize: false,
     };
     issuer
         .issue(claims, OffsetDateTime::now_utc())
@@ -711,6 +712,7 @@ fn upload_token(
         request_id: "test-request-id".to_owned(),
         content_type: String::new(),
         etag: String::new(),
+        bind_on_finalize: false,
     };
     issuer
         .issue(claims, OffsetDateTime::now_utc())
@@ -748,6 +750,7 @@ fn multipart_part_token(
         request_id: "test-request-id".to_owned(),
         content_type: String::new(),
         etag: String::new(),
+        bind_on_finalize: false,
     };
     issuer
         .issue(claims, OffsetDateTime::now_utc())
@@ -933,6 +936,7 @@ async fn write_multipart_part_native_undersized_returns_400() {
         request_id: "test-request-id".to_owned(),
         content_type: String::new(),
         etag: String::new(),
+        bind_on_finalize: false,
     };
 
     let err = write_multipart_part_native(&backend, &claims, 1, Body::from(b"short".to_vec()))
@@ -967,6 +971,7 @@ async fn write_multipart_part_offset_object_undersized_returns_400() {
         request_id: "test-request-id".to_owned(),
         content_type: String::new(),
         etag: String::new(),
+        bind_on_finalize: false,
     };
 
     let err =
@@ -1109,6 +1114,7 @@ fn part_claims(backend_id: &str, backend_path: &str, size: u64, backend_handle: 
         request_id: "test-request-id".to_owned(),
         content_type: String::new(),
         etag: String::new(),
+        bind_on_finalize: false,
     }
 }
 
@@ -1319,4 +1325,384 @@ async fn multipart_part_returns_502_when_report_fails() {
         .await
         .expect("read response body");
     assert_eq!(&body[..], b"report failed");
+}
+
+/// Mock control plane answering finalize calls with `statuses` in order (the last one repeats).
+/// Returns its base URL and the number of finalize calls received.
+async fn scripted_control_plane(statuses: Vec<u16>) -> (String, Arc<AtomicUsize>) {
+    scripted_control_plane_with_headers(statuses, "").await
+}
+
+/// Like [`scripted_control_plane`], adding `extra_headers` (raw header lines ending in CRLF) to
+/// every response.
+async fn scripted_control_plane_with_headers(
+    statuses: Vec<u16>,
+    extra_headers: &'static str,
+) -> (String, Arc<AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind mock control plane");
+    let addr = listener.local_addr().expect("local addr");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_clone = Arc::clone(&calls);
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let mut buf = [0u8; 4096];
+            if stream.read(&mut buf).await.is_ok() {
+                let n = calls_clone.fetch_add(1, Ordering::SeqCst);
+                let status = statuses[n.min(statuses.len() - 1)];
+                let response = format!(
+                    "HTTP/1.1 {status} X\r\n{extra_headers}content-length: 0\r\nconnection: close\r\n\r\n"
+                );
+                stream.write_all(response.as_bytes()).await.ok();
+            }
+        }
+    });
+    (format!("http://{addr}"), calls)
+}
+
+/// State over a shared in-memory backend, plus an `Issuer` its verifier accepts.
+fn upload_state(control_base_url: String) -> (SidecarState, Issuer, Arc<InMemoryBackend>) {
+    let (mut state, issuer, backend) = test_download_state();
+    state.control_base_url = control_base_url;
+    (state, issuer, backend)
+}
+
+fn put_request(file_id: Uuid, version_id: Uuid, token: &str, body: &'static [u8]) -> Request<Body> {
+    Request::put(format!(
+        "/api/file-storage-data/v1/upload/{file_id}/{version_id}?fs-token={token}"
+    ))
+    .body(Body::from(body))
+    .expect("valid request")
+}
+
+/// One upload token for a fresh `(file, version)` against a router wired to `control_base_url`,
+/// so a test can `put` the same token repeatedly.
+struct UploadFixture {
+    router: axum::Router,
+    backend: Arc<InMemoryBackend>,
+    file_id: Uuid,
+    version_id: Uuid,
+    path: String,
+    token: String,
+}
+
+impl UploadFixture {
+    fn new(control_base_url: String) -> Self {
+        let (state, issuer, backend) = upload_state(control_base_url);
+        let file_id = Uuid::now_v7();
+        let version_id = Uuid::now_v7();
+        let path = format!("/{file_id}/{version_id}");
+        let token = upload_token(&issuer, file_id, version_id, "test", &path);
+        Self {
+            router: build_router(state, DEFAULT_MAX_BODY_BYTES),
+            backend,
+            file_id,
+            version_id,
+            path,
+            token,
+        }
+    }
+
+    async fn put(&self, body: &'static [u8]) -> axum::response::Response {
+        self.router
+            .clone()
+            .oneshot(put_request(
+                self.file_id,
+                self.version_id,
+                &self.token,
+                body,
+            ))
+            .await
+            .expect("router call succeeds")
+    }
+
+    async fn stored(&self) -> bytes::Bytes {
+        self.backend.get(&self.path).await.expect("stored blob")
+    }
+}
+
+#[tokio::test]
+async fn upload_replay_after_publish_is_rejected_with_409() {
+    // The control plane accepts the first finalize, then rejects the replay (version already
+    // `available` with different content).
+    let (cp_url, calls) = scripted_control_plane(vec![204, 409]).await;
+    let fx = UploadFixture::new(cp_url);
+
+    let first = fx.put(b"original-bytes").await;
+    assert_eq!(
+        first.status(),
+        StatusCode::OK,
+        "first PUT to a fresh backend path must publish successfully"
+    );
+
+    let second = fx.put(b"replayed-different-bytes").await;
+    assert_eq!(
+        second.status(),
+        StatusCode::CONFLICT,
+        "a replayed PUT rejected by the control plane must get 409, never overwrite"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "the replay must still call finalize with its own size/hash"
+    );
+    assert_eq!(
+        &fx.stored().await[..],
+        b"original-bytes",
+        "a replayed PUT must never overwrite the already-published content"
+    );
+}
+
+/// A retry with identical content (e.g. the first finalize never landed) converges to `200`
+/// with the same bind headers as the original, since the control plane replays its decision.
+#[tokio::test]
+async fn upload_replay_with_identical_content_and_successful_finalize_returns_200() {
+    let (cp_url, calls) = scripted_control_plane_with_headers(
+        vec![204],
+        "x-fs-bound: true\r\netag: \"content-etag\"\r\n",
+    )
+    .await;
+    let fx = UploadFixture::new(cp_url);
+
+    for attempt in 1..=2 {
+        let response = fx.put(b"same-bytes").await;
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "attempt {attempt}: identical content with a successful finalize must be 200"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("x-fs-bound")
+                .expect("X-FS-Bound echoed on every attempt"),
+            "true",
+            "attempt {attempt}: a converged replay must carry the original bind headers"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(header::ETAG)
+                .expect("ETag echoed on every attempt"),
+            "\"content-etag\"",
+            "attempt {attempt}: a converged replay must carry the original ETag"
+        );
+    }
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "finalize runs on every attempt"
+    );
+    assert_eq!(&fx.stored().await[..], b"same-bytes");
+}
+
+/// A control-plane 5xx on a replay is not a rejection: it keeps the first-upload status (`502`).
+#[tokio::test]
+async fn upload_replay_with_control_plane_5xx_returns_502_not_409() {
+    let (cp_url, _calls) = scripted_control_plane(vec![500]).await;
+    let fx = UploadFixture::new(cp_url);
+
+    // First PUT publishes but its finalize fails: 502. The replay hits `created: false`.
+    for attempt in 1..=2 {
+        assert_eq!(
+            fx.put(b"some-bytes").await.status(),
+            StatusCode::BAD_GATEWAY,
+            "attempt {attempt}: a finalize 5xx must stay 502 on both the first PUT and the replay"
+        );
+    }
+}
+
+#[tokio::test]
+async fn upload_exact_size_mismatch_returns_400_and_deletes_created_object() {
+    let (state, issuer, backend) = test_download_state();
+
+    let file_id = Uuid::now_v7();
+    let version_id = Uuid::now_v7();
+    let path = format!("/{file_id}/{version_id}");
+    let claims = Claims {
+        op: Op::Put,
+        file_id,
+        version_id,
+        backend_id: "test".to_owned(),
+        backend_path: path.clone(),
+        exp: OffsetDateTime::now_utc().unix_timestamp() + 60,
+        upload: UploadConstraints {
+            exact_size: Some(999), // deliberately wrong: the body below is 11 bytes
+            ..UploadConstraints::default()
+        },
+        multipart: MultipartClaims::default(),
+        request_id: "test-request-id".to_owned(),
+        content_type: String::new(),
+        etag: String::new(),
+        bind_on_finalize: false,
+    };
+    let token = issuer
+        .issue(claims, OffsetDateTime::now_utc())
+        .expect("issue upload token");
+
+    let router = build_router(state, DEFAULT_MAX_BODY_BYTES);
+    let response = router
+        .oneshot(put_request(file_id, version_id, &token, b"hello world"))
+        .await
+        .expect("router call succeeds");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let exists = backend
+        .exists(&path)
+        .await
+        .expect("backend exists check succeeds");
+    assert!(
+        !exists,
+        "the object this request itself created must be cleaned up after a \
+         post-validation failure, not left poisoning the immutable path"
+    );
+}
+
+/// Without a control plane a first upload is `200`, but a replay is `409`: nothing can confirm
+/// it matches the stored object, and the replay took no effect.
+#[tokio::test]
+async fn upload_replay_without_control_plane_returns_409() {
+    let fx = UploadFixture::new(String::new());
+
+    assert_eq!(fx.put(b"original-bytes").await.status(), StatusCode::OK);
+    assert_eq!(
+        fx.put(b"original-bytes").await.status(),
+        StatusCode::CONFLICT
+    );
+    assert_eq!(&fx.stored().await[..], b"original-bytes");
+}
+
+async fn mock_http_response(raw_response: Vec<u8>) -> reqwest::Response {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind mock server");
+    let addr = listener.local_addr().expect("local addr");
+
+    tokio::spawn(async move {
+        if let Ok((mut stream, _)) = listener.accept().await {
+            let mut buf = [0u8; 1024];
+            let _n = stream.read(&mut buf).await;
+            stream.write_all(&raw_response).await.ok();
+        }
+    });
+
+    reqwest::Client::new()
+        .get(format!("http://{addr}"))
+        .send()
+        .await
+        .expect("mock server responds")
+}
+
+/// `interpret_finalize_response`: success statuses echo the bind headers (`bound`, `etag`,
+/// `current_etag`) and anything else maps to `502`.
+#[tokio::test]
+async fn interpret_finalize_response_echoes_bind_headers_or_maps_error_to_bad_gateway() {
+    // (row, raw response, expected `(bound, etag, current_etag)`; `None` = expect Err(502))
+    type Echo = (
+        Option<&'static str>,
+        Option<&'static str>,
+        Option<&'static str>,
+    );
+    type Row = (&'static str, Vec<u8>, Option<Echo>);
+    let mut non_utf8 = b"HTTP/1.1 204 No Content\r\nx-fs-bound: ".to_vec();
+    non_utf8.extend_from_slice(&[0xFF, 0xFE]); // not valid UTF-8
+    non_utf8.extend_from_slice(b"\r\ncontent-length: 0\r\n\r\n");
+    let rows: Vec<Row> = vec![
+        (
+            // Won auto-bind CAS: bound + etag echoed, no current_etag.
+            "bound forwards bound and etag",
+            b"HTTP/1.1 204 No Content\r\nx-fs-bound: true\r\netag: \"abc123\"\r\ncontent-length: 0\r\n\r\n"
+                .to_vec(),
+            Some((Some("true"), Some("\"abc123\""), None)),
+        ),
+        (
+            // Lost auto-bind CAS: bound + current_etag echoed, no new etag (nothing was bound).
+            "conflict forwards current etag",
+            b"HTTP/1.1 204 No Content\r\nx-fs-bound: conflict\r\nx-fs-current-etag: \"xyz789\"\r\n\
+              content-length: 0\r\n\r\n"
+                .to_vec(),
+            Some((Some("conflict"), None, Some("\"xyz789\""))),
+        ),
+        (
+            "manual mode has no bind headers",
+            b"HTTP/1.1 204 No Content\r\ncontent-length: 0\r\n\r\n".to_vec(),
+            Some((None, None, None)),
+        ),
+        (
+            // A header value that fails to_str() must read as absent, not propagate garbage.
+            "non-utf8 header value is treated as absent",
+            non_utf8,
+            Some((None, None, None)),
+        ),
+        (
+            "error status maps to bad gateway",
+            b"HTTP/1.1 500 Internal Server Error\r\ncontent-length: 5\r\n\r\noops!".to_vec(),
+            None,
+        ),
+    ];
+
+    for (row, raw, expected) in rows {
+        let resp = mock_http_response(raw).await;
+        let result = interpret_finalize_response(resp, Uuid::nil(), Uuid::nil()).await;
+        match (result, expected) {
+            (Ok(echo), Some((bound, etag, current_etag))) => {
+                assert_eq!(echo.bound.as_deref(), bound, "{row}: bound");
+                assert_eq!(echo.etag.as_deref(), etag, "{row}: etag");
+                assert_eq!(
+                    echo.current_etag.as_deref(),
+                    current_etag,
+                    "{row}: current_etag"
+                );
+            }
+            (Err(err), None) => assert_eq!(err.status, StatusCode::BAD_GATEWAY, "{row}"),
+            (Ok(_), None) => panic!("{row}: a non-success status must be interpreted as Err"),
+            (Err(err), Some(_)) => panic!(
+                "{row}: a success status must be interpreted as Ok, got Err({})",
+                err.status
+            ),
+        }
+    }
+}
+
+#[tokio::test]
+async fn upload_forwards_bind_conflict_headers_from_finalize_callback() {
+    let (cp_url, _calls) = scripted_control_plane_with_headers(
+        vec![204],
+        "x-fs-bound: conflict\r\nx-fs-current-etag: \"current-etag-value\"\r\n",
+    )
+    .await;
+    let fx = UploadFixture::new(cp_url);
+
+    let response = fx.put(b"hello world").await;
+
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "the upload itself succeeds even when the auto-bind CAS is lost -- only the bind, \
+         not the upload, conflicted"
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-fs-bound")
+            .expect("X-FS-Bound header present")
+            .to_str()
+            .expect("valid header value"),
+        "conflict"
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-fs-current-etag")
+            .expect("X-FS-Current-ETag header present")
+            .to_str()
+            .expect("valid header value"),
+        "\"current-etag-value\""
+    );
+    assert!(
+        response.headers().get(header::ETAG).is_none(),
+        "a lost CAS carries no new ETag -- only X-FS-Current-ETag"
+    );
 }

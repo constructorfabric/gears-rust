@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 use time::OffsetDateTime;
 use toolkit_gts::gts_id;
+use toolkit_macros::domain_model;
 use toolkit_security::{AccessScope, SecurityContext};
 use uuid::Uuid;
 
@@ -51,6 +52,20 @@ pub struct UploadTicket {
     pub file_id: Uuid,
     pub version_id: Uuid,
     pub upload_url: String,
+}
+
+/// Outcome of the token-authenticated finalize callback; the sidecar surfaces it as `PUT`-response headers.
+#[domain_model]
+#[derive(Debug, Clone)]
+pub struct FinalizeByTokenOutcome {
+    /// `None`: no bind requested (manual mode), first call. `Some(Bound)`/`Some(Conflict)`: auto-bind
+    /// token that won/lost the `content_id IS NULL` CAS. `Some(Manual)`: retry of a manual finalize
+    /// on an `Available`, unbound version; handled like `None`.
+    pub bind_state: Option<crate::domain::multipart::BindState>,
+    /// Content ETag after a successful bind (`Bound` only).
+    pub etag: Option<String>,
+    /// Current content ETag on a lost CAS (`Conflict` only), for a manual rebind.
+    pub current_etag: Option<String>,
 }
 
 /// Result of `download-url`: the signed URL plus the content ETag.
@@ -145,6 +160,18 @@ impl FileService {
         constraints: UploadConstraints,
         download_meta: Option<(String, String)>,
     ) -> Result<String, DomainError> {
+        self.sign_url_with_bind(op, v, constraints, download_meta, false)
+    }
+
+    /// `sign_url` with an explicit `bind_on_finalize` claim (only `create_file` with auto-bind).
+    pub(super) fn sign_url_with_bind(
+        &self,
+        op: Op,
+        v: &VersionRef,
+        constraints: UploadConstraints,
+        download_meta: Option<(String, String)>,
+        bind_on_finalize: bool,
+    ) -> Result<String, DomainError> {
         let verb = content_verb(op)?;
         let now = OffsetDateTime::now_utc();
         let (content_type, etag) = match op {
@@ -164,6 +191,7 @@ impl FileService {
             request_id: Uuid::now_v7().to_string(),
             content_type,
             etag,
+            bind_on_finalize,
         };
         let token = self.issuer.issue(claims, now)?;
         Ok(format!(
@@ -255,6 +283,9 @@ pub(super) struct IdempotencyTicket {
     pub(super) file_id: Uuid,
     pub(super) version_id: Uuid,
     pub(super) upload_url: String,
+    /// The `bind` mode minted into the token at the original `create_file`; a replay re-mints with it.
+    #[serde(default)]
+    pub(super) auto_bind: bool,
 }
 
 impl From<IdempotencyTicket> for UploadTicket {
