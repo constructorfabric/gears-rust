@@ -475,11 +475,13 @@ impl<'a> QuotaManagement<'a> {
         ctx: &SecurityContext,
         request: ListQuotasRequest,
     ) -> Result<PageResult<QuotaView>, DomainError> {
-        let (filter, page) =
+        let (mut filter, page) =
             validate_list(request, &self.limits).map_err(|e| self.shape_rejected(e))?;
         let target = filter
             .tenant_id
             .unwrap_or_else(|| TenantId::new(ctx.subject_tenant_id()));
+        // A wider grant must not widen an absent tenant to every tenant it covers.
+        filter.tenant_id = Some(target);
         let admitted = self
             .admission
             .admit(

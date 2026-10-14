@@ -9,7 +9,7 @@ use quota_enforcement_sdk::{
     CapPatch, EnforcementMode, IdempotencyScope, IdempotencySubjectKey, IdempotencyWrite,
     LeaseState, MetricKind, NotificationEventKind, OperationType, PayloadHash, PeriodType,
     QuotaEnforcementStoragePluginV1, QuotaId, QuotaSource, QuotaStatus, QuotaType, SubjectRef,
-    ValidityWindow,
+    TenantId, ValidityWindow,
 };
 use serde_json::{Value, json};
 use time::OffsetDateTime;
@@ -882,6 +882,33 @@ async fn ac12_deactivated_quotas_stay_readable_and_reads_are_pdp_gated() {
         "the PDP answers before any registry call"
     );
     assert!(denied.storage.events().is_empty());
+}
+
+#[tokio::test]
+async fn a_list_without_a_tenant_returns_only_the_callers_own_tenant() {
+    let other = TenantId::new(Uuid::from_u128(0x0e7e_0000_0000_0000_0000_0000_0000_0002));
+    let h = Harness::with_pdp(Arc::new(PermitTenantsPdp::new(vec![
+        tenant().as_uuid(),
+        other.as_uuid(),
+    ])))
+    .await;
+    let own = h.create(request()).await;
+    h.create(CreateQuotaRequest {
+        tenant_id: other,
+        ..request()
+    })
+    .await;
+    let page = h
+        .quotas()
+        .list(&ctx(), ListQuotasRequest::default())
+        .await
+        .expect("list");
+    let ids: Vec<QuotaId> = page.items.iter().map(|v| v.quota.id).collect();
+    assert_eq!(
+        ids,
+        vec![own],
+        "an absent tenant_id means the caller's own tenant"
+    );
 }
 
 #[tokio::test]

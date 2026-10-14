@@ -102,3 +102,25 @@ async fn a_metric_the_registry_removed_is_left_out_rather_than_defaulted() {
         Err(DomainError::MetricNotRegistered { .. })
     ));
 }
+
+struct MalformedRegistry;
+
+#[async_trait]
+impl MetricRegistry for MalformedRegistry {
+    async fn describe(&self, metric: &MetricId) -> Result<Option<Classified>, DomainError> {
+        Err(DomainError::MetricClassificationInvalid {
+            metric: metric.as_str().to_owned(),
+        })
+    }
+}
+
+#[tokio::test]
+async fn a_metric_without_a_usable_classification_is_left_out_rather_than_fatal() {
+    let snapshot = MetricClassifications::load([metric()], &MalformedRegistry)
+        .await
+        .expect("a malformed metric is not a registry outage");
+    assert!(matches!(
+        snapshot.ensure_quota_gated(&metric()),
+        Err(DomainError::MetricNotRegistered { .. })
+    ));
+}

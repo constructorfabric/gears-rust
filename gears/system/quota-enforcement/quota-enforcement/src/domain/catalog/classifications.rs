@@ -38,8 +38,9 @@ impl MetricClassifications {
     /// # Errors
     ///
     /// The registry's own error when it cannot answer. A metric it no longer
-    /// knows is left out of the snapshot instead, and every operation on it is
-    /// then refused as unregistered.
+    /// knows, or one without a usable classification, is left out of the
+    /// snapshot instead, and every operation on it is then refused as
+    /// unregistered.
     pub async fn load(
         metrics: impl IntoIterator<Item = MetricId>,
         registry: &dyn MetricRegistry,
@@ -50,16 +51,30 @@ impl MetricClassifications {
             if by_metric.contains_key(&metric) || absent.contains(&metric) {
                 continue;
             }
-            if let Some(classified) = registry.describe(&metric).await? {
-                by_metric.insert(metric, classified.descriptor);
-            } else {
-                tracing::warn!(
-                    target: "qe.bootstrap",
-                    metric = %metric,
-                    "the types registry no longer knows this metric; operations on it \
-                     are refused and Quotas bound to it are inert"
-                );
-                absent.push(metric);
+            match registry.describe(&metric).await {
+                Ok(Some(classified)) => {
+                    by_metric.insert(metric, classified.descriptor);
+                }
+                Ok(None) => {
+                    tracing::warn!(
+                        target: "qe.bootstrap",
+                        metric = %metric,
+                        "the types registry no longer knows this metric; operations on it \
+                         are refused and Quotas bound to it are inert"
+                    );
+                    absent.push(metric);
+                }
+                // A malformed definition is the metric's problem, not a registry outage.
+                Err(DomainError::MetricClassificationInvalid { .. }) => {
+                    tracing::warn!(
+                        target: "qe.bootstrap",
+                        metric = %metric,
+                        "this metric carries no usable classification; operations on it \
+                         are refused and Quotas bound to it are inert"
+                    );
+                    absent.push(metric);
+                }
+                Err(e) => return Err(e),
             }
         }
         Ok(Self::of(by_metric))

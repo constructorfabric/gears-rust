@@ -446,6 +446,30 @@ async fn an_active_quota_on_a_removed_metric_is_flagged_and_bootstrap_completes(
 }
 
 #[tokio::test]
+async fn an_active_quota_on_a_misclassified_metric_is_flagged_and_bootstrap_completes() {
+    let storage = Arc::new(InMemoryStorage::new());
+    let mut stranded = quota_draft(
+        SubjectRef {
+            projection_type: type_id(LLM_USER_PROJECTION),
+            subject_id: "u-1".to_owned(),
+        },
+        Some(5),
+    );
+    stranded.metric = MetricId::parse(METRIC_TOKENS).expect("metric");
+    storage
+        .create_quota(&ctx(), &AccessScope::allow_all(), stranded, &[])
+        .await
+        .expect("seeded");
+    let h = harness(storage, true, permitting_pdp());
+    h.metric_registry.set_invalid(METRIC_TOKENS);
+    bootstrap(&h)
+        .run()
+        .await
+        .expect("a malformed metric is flagged, never a registry outage");
+    assert!(h.readiness.is_ready());
+}
+
+#[tokio::test]
 async fn a_registry_that_does_not_answer_the_metric_scan_fails_on_the_registry_dependency() {
     let storage = Arc::new(InMemoryStorage::new());
     let mut bound_quota = quota_draft(

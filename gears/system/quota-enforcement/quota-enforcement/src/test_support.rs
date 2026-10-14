@@ -1403,6 +1403,7 @@ pub fn gated_counter() -> MetricDescriptor {
 #[derive(Default)]
 pub struct FakeMetricRegistry {
     metrics: Mutex<HashMap<String, Classified>>,
+    invalid: Mutex<HashSet<String>>,
     calls: AtomicUsize,
     fail_all: AtomicBool,
     hang: AtomicBool,
@@ -1452,6 +1453,11 @@ impl FakeMetricRegistry {
         self.metrics.lock().expect("lock").remove(id);
     }
 
+    /// `id` is registered but carries no usable classification.
+    pub fn set_invalid(&self, id: &str) {
+        self.invalid.lock().expect("lock").insert(id.to_owned());
+    }
+
     /// Every later `describe` fails as unavailable.
     pub fn fail_all(&self) {
         self.fail_all.store(true, Ordering::SeqCst);
@@ -1485,6 +1491,11 @@ impl MetricRegistry for FakeMetricRegistry {
             return Err(DomainError::TypesRegistryUnavailable(
                 "fake metric registry unavailable".to_owned(),
             ));
+        }
+        if self.invalid.lock().expect("lock").contains(metric.as_str()) {
+            return Err(DomainError::MetricClassificationInvalid {
+                metric: metric.as_str().to_owned(),
+            });
         }
         Ok(self
             .metrics
