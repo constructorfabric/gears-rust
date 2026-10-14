@@ -271,12 +271,16 @@ fn validate_rejects_default_page_size_exceeding_max_page_size() {
         default_page_size: 150,
         max_page_size: 100,
         require_signing_key_seed: false,
+        finalize_internal_secret: Some(SecretString::new("test-internal-secret")),
         ..FileStorageConfig::default()
     };
-    assert!(
-        cfg.validate().is_err(),
+    let err = cfg.validate().expect_err(
         "default_page_size exceeding max_page_size is a direct self-contradiction \
-         and must be rejected"
+         and must be rejected",
+    );
+    assert!(
+        err.to_string().contains("must not exceed max_page_size"),
+        "unexpected error: {err}"
     );
 }
 
@@ -316,11 +320,51 @@ fn validate_rejects_max_page_size_above_ceiling() {
         default_page_size: MAX_PAGE_SIZE_CEILING,
         max_page_size: MAX_PAGE_SIZE_CEILING + 1,
         require_signing_key_seed: false,
+        finalize_internal_secret: Some(SecretString::new("test-internal-secret")),
         ..FileStorageConfig::default()
     };
-    assert!(
-        cfg.validate().is_err(),
+    let err = cfg.validate().expect_err(
         "max_page_size exceeding MAX_PAGE_SIZE_CEILING must be rejected regardless of what an \
-         operator configures"
+         operator configures",
+    );
+    assert!(
+        err.to_string().contains("MAX_PAGE_SIZE_CEILING"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn validate_rejects_zero_default_page_size() {
+    let cfg = FileStorageConfig {
+        default_page_size: 0,
+        max_page_size: 100,
+        require_signing_key_seed: false,
+        finalize_internal_secret: Some(SecretString::new("test-internal-secret")),
+        ..FileStorageConfig::default()
+    };
+    let err = cfg
+        .validate()
+        .expect_err("a zero default_page_size must be rejected");
+    assert!(
+        err.to_string().contains("must be at least 1"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn validate_rejects_zero_max_page_size() {
+    let cfg = FileStorageConfig {
+        default_page_size: 25,
+        max_page_size: 0,
+        require_signing_key_seed: false,
+        finalize_internal_secret: Some(SecretString::new("test-internal-secret")),
+        ..FileStorageConfig::default()
+    };
+    let err = cfg
+        .validate()
+        .expect_err("a zero max_page_size must be rejected");
+    assert!(
+        err.to_string().contains("must be at least 1"),
+        "unexpected error: {err}"
     );
 }

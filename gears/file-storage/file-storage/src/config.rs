@@ -172,6 +172,15 @@ impl FileStorageConfig {
                  same value as the sidecar's FS_SIDECAR_INTERNAL_TOKEN)"
             );
         }
+        // A zero page size would make every listing return an empty page with no cursor.
+        if self.default_page_size == 0 || self.max_page_size == 0 {
+            anyhow::bail!(
+                "invalid file-storage config: default_page_size ({}) and max_page_size ({}) \
+                 must be at least 1",
+                self.default_page_size,
+                self.max_page_size
+            );
+        }
         // The default page size must not exceed the max.
         if self.default_page_size > self.max_page_size {
             anyhow::bail!(
