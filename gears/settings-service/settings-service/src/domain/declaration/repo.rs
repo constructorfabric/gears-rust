@@ -332,6 +332,26 @@ pub trait DeclarationRepository: Send + Sync {
         category_id: Uuid,
     ) -> Result<Vec<Declaration>, DomainError>;
 
+    /// The active declaration of a category that holds `leaf_slug`, if any —
+    /// the one a revive of a retired declaration with that leaf would collide
+    /// with.
+    ///
+    /// # Errors
+    /// [`DomainError`] when the read fails.
+    async fn find_active_by_leaf<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        category_id: Uuid,
+        leaf_slug: &str,
+    ) -> Result<Option<Declaration>, DomainError> {
+        Ok(self
+            .find_by_category(conn, scope, category_id)
+            .await?
+            .into_iter()
+            .find(|d| d.status == "active" && d.leaf_slug == leaf_slug))
+    }
+
     /// The declarations with these ids, in one read.
     ///
     /// # Errors

@@ -1922,3 +1922,293 @@ async fn the_audit_images_carry_the_display_name_before_and_after_each_edit() {
         "clearing records null"
     );
 }
+
+// ── The revival report ───────────────────────────────────────────────────────
+
+/// A validator that resolves every type's traits and judges every value as
+/// the real one does, except that one value cannot be judged: the registry
+/// is gone by the time it is asked about it.
+struct FailsOnOneValue {
+    inner: Arc<dyn crate::domain::validation::TypeValidator>,
+    unjudgeable: Value,
+}
+
+#[async_trait::async_trait]
+impl crate::domain::validation::TypeValidator for FailsOnOneValue {
+    async fn validate_value(
+        &self,
+        value_type_id: &str,
+        value: &Value,
+    ) -> Result<crate::domain::validation::ValidationResult, DomainError> {
+        if *value == self.unjudgeable {
+            return Err(DomainError::Unavailable {
+                detail: "types registry down".to_owned(),
+            });
+        }
+        self.inner.validate_value(value_type_id, value).await
+    }
+
+    async fn resolve_traits(
+        &self,
+        value_type_id: &str,
+    ) -> Result<crate::domain::validation::TraitSet, DomainError> {
+        self.inner.resolve_traits(value_type_id).await
+    }
+}
+
+#[tokio::test]
+async fn a_validator_that_goes_down_at_the_row_re_validation_fails_the_report_unavailable() {
+    // The traits and the Schema Default are judged first and succeed; it is
+    // the re-validation of a retained row that cannot be answered, and the
+    // whole report fails with it rather than listing the rows it could judge.
+    let h = Harness::verified().await;
+    let created = h
+        .create(h.request("retry_policy"), &admin_actor())
+        .await
+        .expect("created");
+    let id = created.declaration.id;
+    let tag = etag_of(&created.declaration);
+    h.retire(id, Some(tag.as_str()), &admin_actor())
+        .await
+        .expect("retired");
+    let (root, a) = (h.base.tree.root, h.base.tree.a);
+    h.base.set(id, root, json!(true)).await;
+    h.base.set(id, a, json!("unjudgeable")).await;
+
+    let flaky = DeclarationAdmin::new(
+        DeclarationRepo,
+        CategoryRepo,
+        ValueRepo,
+        Arc::new(FailsOnOneValue {
+            inner: Arc::new(GtsTypeValidator::new(resolution_catalogue())),
+            unjudgeable: json!("unjudgeable"),
+        }),
+        Arc::clone(&h.registrar) as Arc<dyn crate::domain::contribution::SettingTypeRegistrar>,
+        Arc::new(FixedStepUp::verified()),
+        Arc::clone(&h.audit),
+        Arc::clone(&h.base.cache),
+    );
+    let conn = h.base.db.conn().expect("connection");
+    let scope = AccessScope::allow_all();
+    let request = h.request("retry_policy");
+    let report = |tenants: Vec<Uuid>| {
+        let (flaky, conn, scope, request) = (&flaky, &conn, &scope, &request);
+        async move {
+            let plan = flaky
+                .plan_revival(conn, scope, request, &OpenGate)
+                .await
+                .expect("planned");
+            flaky
+                .revival_report(conn, scope, plan, request, 100, || async move {
+                    Ok(super::Walk {
+                        tenants,
+                        truncated: false,
+                    })
+                })
+                .await
+        }
+    };
+
+    let err = report(vec![root, a])
+        .await
+        .expect_err("the row cannot be judged");
+    assert!(matches!(err, DomainError::Unavailable { .. }), "{err:?}");
+
+    // The same admin reports a walk that does not reach the unjudgeable row.
+    let whole = report(vec![root]).await.expect("reported");
+    assert_eq!(whole.rows.len(), 1);
+    assert!(!whole.rows[0].needs_review);
+
+    // Advisory: the declaration is still retired and nothing was audited
+    // beyond the create and the retire.
+    assert_eq!(h.load(id).await.status, "retired");
+    assert_eq!(h.audit.operations(), vec!["create", "remove"]);
+}
+
+/// A read gate that lets every caller read every declaration.
+struct OpenGate;
+
+#[async_trait::async_trait]
+impl super::RevivalReadGate for OpenGate {
+    async fn may_read(&self, _declaration: &Declaration) -> Result<bool, DomainError> {
+        Ok(true)
+    }
+}
+
+/// A read gate that refuses every declaration to the caller.
+struct ClosedGate;
+
+#[async_trait::async_trait]
+impl super::RevivalReadGate for ClosedGate {
+    async fn may_read(&self, _declaration: &Declaration) -> Result<bool, DomainError> {
+        Ok(false)
+    }
+}
+
+#[tokio::test]
+async fn a_refusing_read_gate_answers_nothing_to_revive_like_an_absent_declaration() {
+    let h = Harness::verified().await;
+    let created = h
+        .create(h.request("retry_policy"), &admin_actor())
+        .await
+        .expect("created");
+    let tag = etag_of(&created.declaration);
+    h.retire(created.declaration.id, Some(tag.as_str()), &admin_actor())
+        .await
+        .expect("retired");
+    let conn = h.base.db.conn().expect("connection");
+    let scope = AccessScope::allow_all();
+
+    let refused = h
+        .admin
+        .plan_revival(&conn, &scope, &h.request("retry_policy"), &ClosedGate)
+        .await
+        .expect_err("refused");
+    let absent = h
+        .admin
+        .plan_revival(&conn, &scope, &h.request("never_declared"), &OpenGate)
+        .await
+        .expect_err("absent");
+    assert_eq!(format!("{refused:?}"), format!("{absent:?}"));
+    assert!(matches!(
+        refused,
+        DomainError::NotFound {
+            resource: super::NOTHING_TO_REVIVE
+        }
+    ));
+    assert!(
+        h.admin
+            .plan_revival(&conn, &scope, &h.request("retry_policy"), &OpenGate)
+            .await
+            .is_ok()
+    );
+}
+
+#[test]
+fn a_listed_value_is_masked_by_the_strictest_class_and_an_unknown_one_fails_closed() {
+    use super::strictest_classification as strictest;
+    assert_eq!(strictest(["public", "public"]), "public");
+    assert_eq!(strictest(["public", "pii"]), "pii");
+    assert_eq!(strictest(["pii", "public", "secret"]), "secret");
+    assert_eq!(strictest(["pii", "secret"]), "secret");
+    assert_eq!(strictest(["public", "restricted"]), "secret", "unknown");
+    assert_eq!(strictest(["", "public"]), "secret", "empty is unknown");
+    assert_eq!(strictest(std::iter::empty::<&str>()), "public");
+}
+
+/// A validator that records every value it was asked to judge.
+struct CountingValidator {
+    inner: Arc<dyn crate::domain::validation::TypeValidator>,
+    judged: std::sync::Mutex<Vec<Value>>,
+}
+
+#[async_trait::async_trait]
+impl crate::domain::validation::TypeValidator for CountingValidator {
+    async fn validate_value(
+        &self,
+        value_type_id: &str,
+        value: &Value,
+    ) -> Result<crate::domain::validation::ValidationResult, DomainError> {
+        self.judged.lock().expect("lock").push(value.clone());
+        self.inner.validate_value(value_type_id, value).await
+    }
+
+    async fn resolve_traits(
+        &self,
+        value_type_id: &str,
+    ) -> Result<crate::domain::validation::TraitSet, DomainError> {
+        self.inner.resolve_traits(value_type_id).await
+    }
+}
+
+#[tokio::test]
+async fn rows_holding_the_same_value_are_judged_once_and_each_gets_its_own_verdict() {
+    let h = Harness::verified().await;
+    let created = h
+        .create(h.request("retry_policy"), &admin_actor())
+        .await
+        .expect("created");
+    let id = created.declaration.id;
+    let tag = etag_of(&created.declaration);
+    h.retire(id, Some(tag.as_str()), &admin_actor())
+        .await
+        .expect("retired");
+
+    // The same text twice; one object with its keys in two orders; the
+    // integer `1` and the float `1.0`; the one valid boolean twice.
+    let held = [
+        json!("x"),
+        json!("x"),
+        json!({"a": 1, "b": 2}),
+        serde_json::from_str(r#"{"b": 2, "a": 1}"#).expect("json"),
+        json!(1),
+        json!(1.0),
+        json!(true),
+        json!(true),
+    ];
+    let mut tenants = Vec::new();
+    for value in &held {
+        let tenant = Uuid::new_v4();
+        h.base.set(id, tenant, value.clone()).await;
+        tenants.push(tenant);
+    }
+
+    let counting = Arc::new(CountingValidator {
+        inner: Arc::new(GtsTypeValidator::new(resolution_catalogue())),
+        judged: std::sync::Mutex::new(Vec::new()),
+    });
+    let admin = DeclarationAdmin::new(
+        DeclarationRepo,
+        CategoryRepo,
+        ValueRepo,
+        Arc::clone(&counting) as Arc<dyn crate::domain::validation::TypeValidator>,
+        Arc::clone(&h.registrar) as Arc<dyn crate::domain::contribution::SettingTypeRegistrar>,
+        Arc::new(FixedStepUp::verified()),
+        Arc::clone(&h.audit),
+        Arc::clone(&h.base.cache),
+    );
+    let conn = h.base.db.conn().expect("connection");
+    let scope = AccessScope::allow_all();
+    let request = h.request("retry_policy");
+    let plan = admin
+        .plan_revival(&conn, &scope, &request, &OpenGate)
+        .await
+        .expect("planned");
+    let walk_tenants = tenants.clone();
+    let report = admin
+        .revival_report(&conn, &scope, plan, &request, 100, || async move {
+            Ok(super::Walk {
+                tenants: walk_tenants,
+                truncated: false,
+            })
+        })
+        .await
+        .expect("reported");
+
+    // The Schema Default is judged by the create's checks, once; every
+    // other judgement is of a retained value.
+    let judged: Vec<Value> = counting
+        .judged
+        .lock()
+        .expect("lock")
+        .iter()
+        .filter(|v| **v != request.default_value)
+        .cloned()
+        .collect();
+    let distinct = judged.len();
+    assert_eq!(
+        distinct, 5,
+        "`x`, the object, `1`, `1.0` and `true`, each once: {judged:?}"
+    );
+    assert_eq!(report.rows.len(), held.len());
+    for (row, value) in report.rows.iter().zip(&held) {
+        assert_eq!(row.value.as_ref(), Some(value));
+        assert_eq!(
+            row.needs_review,
+            *value != json!(true),
+            "a boolean validates, everything else is flagged: {value}"
+        );
+        assert_eq!(row.needs_review_detail.is_some(), row.needs_review);
+    }
+    assert_eq!(report.total_needs_review, 6);
+}

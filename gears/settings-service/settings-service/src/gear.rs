@@ -790,6 +790,7 @@ impl RestApiCapability for SettingsService {
             openapi,
             declarations,
             admin,
+            self.resolver()?,
             self.db()?,
             self.enforcer()?,
         );
