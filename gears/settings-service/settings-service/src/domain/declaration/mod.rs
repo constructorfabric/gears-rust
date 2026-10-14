@@ -6,7 +6,10 @@ pub mod repo;
 pub mod service;
 
 pub use admin::{CreateDeclaration, Created, DeclarationAdmin, FieldClass};
-pub use repo::{Declaration, DeclarationDraft, DeclarationMetadata, DeclarationRepository};
+pub use repo::{
+    BrowseCandidate, BrowseNarrowing, Declaration, DeclarationDraft, DeclarationMetadata,
+    DeclarationRepository,
+};
 pub use service::DeclarationService;
 
 /// Where a declaration came from: authored by an administrator, or
