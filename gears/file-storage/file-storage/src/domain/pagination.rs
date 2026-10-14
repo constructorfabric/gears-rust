@@ -13,6 +13,7 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 use toolkit_db::odata::sea_orm_filter::{encode_cursor_value, parse_cursor_value};
+use toolkit_macros::domain_model;
 use toolkit_odata::filter::FieldKind;
 use toolkit_odata::{CursorV1, Error as ODataError, ODataOrderBy, OrderKey, SortDir};
 
@@ -31,6 +32,7 @@ const FORWARD: &str = "fwd";
 const BACKWARD: &str = "bwd";
 
 /// Which way a keyset query seeks relative to a decoded cursor's position.
+#[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Direction {
     /// Resume strictly after this position in canonical order (older rows); used by `next_cursor`.
@@ -84,6 +86,7 @@ pub fn versions_binding(file_id: Uuid) -> Option<String> {
 }
 
 /// Decoded position of the last (backward: first) row of the previous page, plus seek direction.
+#[domain_model]
 #[derive(Debug, Clone, Copy)]
 pub struct Seek {
     pub created_at: OffsetDateTime,
