@@ -291,6 +291,71 @@ fn index(rows: Vec<StoredValue>) -> HashMap<Uuid, StoredValue> {
     rows.into_iter().map(|r| (r.tenant_id, r)).collect()
 }
 
+/// The effective value a walk produced, with the declaration's own facts.
+fn effective_value(
+    declaration: &Declaration,
+    root: Uuid,
+    tenant: Uuid,
+    walk: Walk,
+    traits: Value,
+) -> EffectiveValue {
+    EffectiveValue {
+        key: declaration.key.clone(),
+        declaration_id: declaration.id,
+        scope: scope_path(tenant, root),
+        tenant_id: tenant,
+        value: walk.value,
+        source: walk.source,
+        source_scope: walk.source_tenant.map(|t| scope_path(t, root)),
+        fallback: walk.fallback,
+        fallback_source: walk.fallback_source,
+        fallback_scope: walk.fallback_tenant.map(|t| scope_path(t, root)),
+        traits,
+        trail: walk.trail,
+        data_classification: declaration.data_classification.clone(),
+        domain_affinity: declaration.domain_affinity.clone(),
+        secret_backed: walk.secret_backed,
+        declaration_last_change_at: declaration.last_change_at,
+        resolved_row_last_change_at: walk.resolved_row_last_change_at,
+        own_row: walk.own_row,
+    }
+}
+
+/// One declaration's outcome in a batch.
+type Outcome = Result<Arc<EffectiveValue>, DomainError>;
+
+/// The scopes a read of a declaration inspects, root to self where it
+/// inherits: the platform row alone for `global`, the target's chain for
+/// `cascading`, the target's own row alone for `local`. One mapping for the
+/// single read and the batch read, so the two cannot disagree.
+fn inspected_tenants(
+    declaration: &Declaration,
+    root: Uuid,
+    tenant: Uuid,
+    chain: Option<&[Uuid]>,
+) -> Result<Vec<Uuid>, DomainError> {
+    match declaration.scope_class.as_str() {
+        scope_class::GLOBAL => Ok(vec![root]),
+        scope_class::CASCADING => {
+            chain
+                .map(<[Uuid]>::to_vec)
+                .ok_or_else(|| DomainError::Internal {
+                    diagnostic: format!(
+                        "declaration `{}` is cascading and no ancestor chain was read",
+                        declaration.key
+                    ),
+                })
+        }
+        scope_class::LOCAL => Ok(vec![tenant]),
+        other => Err(DomainError::Internal {
+            diagnostic: format!(
+                "declaration `{}` carries the unknown scope class `{other}`",
+                declaration.key
+            ),
+        }),
+    }
+}
+
 fn same_detail(err: &DomainError) -> DomainError {
     match err {
         DomainError::Unavailable { detail } => DomainError::Unavailable {
@@ -466,7 +531,15 @@ where
     }
 
     /// Resolve declarations already loaded — a browse page — at one target,
-    /// sharing one ancestry walk; one outcome per declaration.
+    /// sharing one value read; one outcome per declaration.
+    ///
+    /// Cache first, per declaration; a retired one answers its own outcome.
+    /// The chain is fetched only when a cascading declaration missed; what
+    /// remains is read with a single query over the platform, the target and
+    /// that chain, and each declaration then inspects the scopes its Scope
+    /// Class names, as a single read of it does. A failed row read fails every
+    /// miss; a failed chain fails the cascading ones alone. A page never lists
+    /// one declaration twice, but if a batch does, each occurrence resolves.
     pub async fn resolve_declarations<C: DBRunner>(
         &self,
         conn: &C,
@@ -483,14 +556,157 @@ where
             }
         };
         let mut ancestry = Ancestry::new(root, target);
-        let mut out = Vec::with_capacity(declarations.len());
-        for declaration in declarations {
-            out.push(
-                self.resolve_loaded(conn, declaration, &mut ancestry, None)
-                    .await,
-            );
+        let tenant = ancestry.tenant;
+        let mut out: Vec<Option<Outcome>> = Vec::with_capacity(declarations.len());
+        // The misses, with the generation captured before their rows are read.
+        let mut misses: Vec<(usize, Generation)> = Vec::new();
+        for (position, declaration) in declarations.iter().enumerate() {
+            if let Some(hit) = self.cache.get(&declaration.key, tenant) {
+                out.push(Some(Ok(hit)));
+                continue;
+            }
+            let seen = self.cache.generation(&declaration.key, tenant);
+            if declaration.status.is_retired() {
+                out.push(Some(Err(DomainError::Retired {
+                    key: declaration.key.clone(),
+                })));
+                continue;
+            }
+            out.push(None);
+            misses.push((position, seen));
         }
-        out
+        if !misses.is_empty() {
+            self.settle_misses(conn, declarations, &misses, &mut ancestry, &mut out)
+                .await;
+        }
+        out.into_iter()
+            .map(|outcome| {
+                outcome.unwrap_or_else(|| {
+                    Err(DomainError::Internal {
+                        diagnostic: "a browse declaration was left unresolved".to_owned(),
+                    })
+                })
+            })
+            .collect()
+    }
+
+    /// Fill the outcomes of the cache misses of a batch: the chain when a
+    /// cascading one needs it, one read of every miss's rows, then each walk.
+    async fn settle_misses<C: DBRunner>(
+        &self,
+        conn: &C,
+        declarations: &[Declaration],
+        misses: &[(usize, Generation)],
+        ancestry: &mut Ancestry,
+        out: &mut [Option<Outcome>],
+    ) {
+        let (root, tenant) = (ancestry.root, ancestry.tenant);
+        let wants_chain = misses
+            .iter()
+            .any(|(position, _)| declarations[*position].scope_class == scope_class::CASCADING);
+        let chain: Option<Result<Vec<Uuid>, DomainError>> = if wants_chain {
+            Some(
+                ancestry
+                    .chain(self.hierarchy.as_ref())
+                    .await
+                    .map(<[Uuid]>::to_vec),
+            )
+        } else {
+            None
+        };
+        // A chain that failed and nothing but cascading misses: no row read
+        // could settle any of them.
+        if let Some(Err(err)) = &chain {
+            let only_cascading = misses
+                .iter()
+                .all(|(position, _)| declarations[*position].scope_class == scope_class::CASCADING);
+            if only_cascading {
+                for (position, _) in misses {
+                    out[*position] = Some(Err(same_detail(err)));
+                }
+                return;
+            }
+        }
+        // The platform, the target and, where it was read, the chain.
+        let mut tenants = vec![root, tenant];
+        if let Some(Ok(chain)) = &chain {
+            tenants.extend(chain.iter().copied());
+        }
+        tenants.sort_unstable();
+        tenants.dedup();
+        let mut ids: Vec<Uuid> = misses
+            .iter()
+            .map(|(position, _)| declarations[*position].id)
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        // Unscoped, as `dispatch` reads them: inheritance crosses tenant
+        // boundaries by design, and who may ask was decided at the door.
+        let rows = match self
+            .values
+            .find_many_in_tenants(conn, &AccessScope::allow_all(), &ids, &tenants)
+            .await
+        {
+            Ok(rows) => rows,
+            Err(err) => {
+                for (position, _) in misses {
+                    out[*position] = Some(Err(same_detail(&err)));
+                }
+                return;
+            }
+        };
+        let mut grouped: HashMap<Uuid, Vec<StoredValue>> = HashMap::new();
+        for row in rows {
+            grouped.entry(row.declaration_id).or_default().push(row);
+        }
+        // One registry call per distinct value type of the batch.
+        let mut traits: HashMap<String, Result<Value, DomainError>> = HashMap::new();
+        for (position, seen) in misses {
+            let declaration = &declarations[*position];
+            let chain_for_class = match &chain {
+                Some(Ok(chain)) => Some(chain.as_slice()),
+                _ => None,
+            };
+            let inspected = match (&chain, declaration.scope_class.as_str()) {
+                (Some(Err(err)), scope_class::CASCADING) => Err(same_detail(err)),
+                _ => inspected_tenants(declaration, root, tenant, chain_for_class),
+            };
+            let outcome = match inspected {
+                Err(err) => Err(err),
+                Ok(inspected) => {
+                    let rows = index(
+                        grouped
+                            .get(&declaration.id)
+                            .into_iter()
+                            .flatten()
+                            .filter(|row| inspected.contains(&row.tenant_id))
+                            .cloned()
+                            .collect(),
+                    );
+                    let walk = select(declaration, tenant, root, &inspected, &rows);
+                    if !traits.contains_key(&declaration.value_type_id) {
+                        let fetched = self.traits(&declaration.value_type_id).await;
+                        traits.insert(declaration.value_type_id.clone(), fetched);
+                    }
+                    let known = &traits[&declaration.value_type_id];
+                    match known {
+                        Err(err) => Err(same_detail(err)),
+                        Ok(value) => {
+                            let effective = Arc::new(effective_value(
+                                declaration,
+                                root,
+                                tenant,
+                                walk,
+                                value.clone(),
+                            ));
+                            self.cache.populate(Arc::clone(&effective), *seen);
+                            Ok(effective)
+                        }
+                    }
+                }
+            };
+            out[*position] = Some(outcome);
+        }
     }
 
     /// Resolve one setting at every descendant of a target in one pass — one
@@ -696,6 +912,29 @@ where
             .await
     }
 
+    /// One candidate batch of the narrowed browse: [`Self::list_declarations`]
+    /// with each candidate marked by whether its declaration text matched the
+    /// needle, and its position in the listing.
+    ///
+    /// # Errors
+    /// As [`Self::list_declarations`].
+    pub async fn list_candidates<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        hidden_for: &[Uuid],
+        flagged_at: Option<Uuid>,
+        query: &toolkit_odata::ODataQuery,
+        narrowing: &crate::domain::declaration::BrowseNarrowing<'_>,
+    ) -> Result<toolkit_odata::Page<crate::domain::declaration::BrowseCandidate>, DomainError> {
+        let visible = crate::domain::category::visibility::domain_visibility(scope);
+        self.declarations
+            .list_candidates(
+                conn, scope, &visible, hidden_for, flagged_at, query, narrowing,
+            )
+            .await
+    }
+
     /// Which of `keys` name a declaration the caller may see — the page's own
     /// three gates (grant, administrative domain, `hidden` on the caller's
     /// chain `hidden_for`), in one read.
@@ -850,27 +1089,13 @@ where
         // @cpt-begin:cpt-cf-settings-service-flow-value-resolution-resolve:p1:inst-vr-resolve-9
         let traits = self.traits(&declaration.value_type_id).await?;
         // @cpt-end:cpt-cf-settings-service-flow-value-resolution-resolve:p1:inst-vr-resolve-9
-        let (root, tenant) = (ancestry.root, ancestry.tenant);
-        let effective = Arc::new(EffectiveValue {
-            key: declaration.key.clone(),
-            declaration_id: declaration.id,
-            scope: scope_path(tenant, root),
-            tenant_id: tenant,
-            value: walk.value,
-            source: walk.source,
-            source_scope: walk.source_tenant.map(|t| scope_path(t, root)),
-            fallback: walk.fallback,
-            fallback_source: walk.fallback_source,
-            fallback_scope: walk.fallback_tenant.map(|t| scope_path(t, root)),
+        let effective = Arc::new(effective_value(
+            declaration,
+            ancestry.root,
+            ancestry.tenant,
+            walk,
             traits,
-            trail: walk.trail,
-            data_classification: declaration.data_classification.clone(),
-            domain_affinity: declaration.domain_affinity.clone(),
-            secret_backed: walk.secret_backed,
-            declaration_last_change_at: declaration.last_change_at,
-            resolved_row_last_change_at: walk.resolved_row_last_change_at,
-            own_row: walk.own_row,
-        });
+        ));
         // @cpt-begin:cpt-cf-settings-service-flow-value-resolution-resolve:p1:inst-vr-resolve-11
         self.cache.populate(Arc::clone(&effective), seen);
         // @cpt-end:cpt-cf-settings-service-flow-value-resolution-resolve:p1:inst-vr-resolve-11
@@ -912,13 +1137,22 @@ where
         // boundary, never by narrowing which rows the walk may see.
         let scope = AccessScope::allow_all();
         let (root, tenant) = (ancestry.root, ancestry.tenant);
+        // The scopes this class inspects, from the one mapping the batch read
+        // shares; an unknown class is refused here, before any read. Only a
+        // cascading setting asks for the ancestry.
+        let chain = if declaration.scope_class == scope_class::CASCADING {
+            Some(ancestry.chain(self.hierarchy.as_ref()).await?.to_vec())
+        } else {
+            None
+        };
+        let inspected = inspected_tenants(declaration, root, tenant, chain.as_deref())?;
         match declaration.scope_class.as_str() {
             // @cpt-begin:cpt-cf-settings-service-algo-value-resolution-dispatch:p1:inst-vr-disp-1
             scope_class::GLOBAL => {
                 // @cpt-begin:cpt-cf-settings-service-algo-value-resolution-dispatch:p1:inst-vr-disp-2
                 let row = self
                     .values
-                    .find_one(conn, &scope, declaration.id, root)
+                    .find_one(conn, &scope, declaration.id, inspected[0])
                     .await?;
                 // @cpt-end:cpt-cf-settings-service-algo-value-resolution-dispatch:p1:inst-vr-disp-2
                 // A tenant asking for a global setting is served the platform
@@ -926,12 +1160,11 @@ where
                 // Gating that on the tenant's effective access arrives with
                 // tenant access restrictions; today every setting is visible.
                 let rows = index(row.into_iter().collect());
-                Ok(select(declaration, tenant, root, &[root], &rows))
+                Ok(select(declaration, tenant, root, &inspected, &rows))
             }
             // @cpt-end:cpt-cf-settings-service-algo-value-resolution-dispatch:p1:inst-vr-disp-1
             // @cpt-begin:cpt-cf-settings-service-algo-value-resolution-dispatch:p1:inst-vr-disp-5
             scope_class::CASCADING => {
-                let chain = ancestry.chain(self.hierarchy.as_ref()).await?;
                 // @cpt-begin:cpt-cf-settings-service-algo-value-resolution-dispatch:p1:inst-vr-disp-7
                 // One exact-match set query over the ancestor ids. The chain
                 // begins at the root, so platform scope is its first element
@@ -939,32 +1172,26 @@ where
                 // and never scanned as a path.
                 let rows = self
                     .values
-                    .find_in_tenants(conn, &scope, declaration.id, chain)
+                    .find_in_tenants(conn, &scope, declaration.id, &inspected)
                     .await?;
                 // @cpt-end:cpt-cf-settings-service-algo-value-resolution-dispatch:p1:inst-vr-disp-7
-                Ok(select(declaration, tenant, root, chain, &index(rows)))
+                Ok(select(declaration, tenant, root, &inspected, &index(rows)))
             }
             // @cpt-end:cpt-cf-settings-service-algo-value-resolution-dispatch:p1:inst-vr-disp-5
             // @cpt-begin:cpt-cf-settings-service-algo-value-resolution-dispatch:p1:inst-vr-disp-12
-            scope_class::LOCAL => {
+            // Local, the only class left once `inspected` accepted the rest.
+            _ => {
                 // @cpt-begin:cpt-cf-settings-service-algo-value-resolution-dispatch:p1:inst-vr-disp-13
                 // The requested tenant's row and nothing else: a local setting
                 // is never inherited, so no ancestor is asked for.
                 let row = self
                     .values
-                    .find_one(conn, &scope, declaration.id, tenant)
+                    .find_one(conn, &scope, declaration.id, inspected[0])
                     .await?;
                 // @cpt-end:cpt-cf-settings-service-algo-value-resolution-dispatch:p1:inst-vr-disp-13
                 let rows = index(row.into_iter().collect());
-                Ok(select(declaration, tenant, root, &[tenant], &rows))
-            }
-            // @cpt-end:cpt-cf-settings-service-algo-value-resolution-dispatch:p1:inst-vr-disp-12
-            other => Err(DomainError::Internal {
-                diagnostic: format!(
-                    "declaration `{}` carries the unknown scope class `{other}`",
-                    declaration.key
-                ),
-            }),
+                Ok(select(declaration, tenant, root, &inspected, &rows))
+            } // @cpt-end:cpt-cf-settings-service-algo-value-resolution-dispatch:p1:inst-vr-disp-12
         }
         // @cpt-begin:cpt-cf-settings-service-algo-value-resolution-dispatch:p1:inst-vr-disp-15
         // Each arm returns the resolved value with its source and source scope.

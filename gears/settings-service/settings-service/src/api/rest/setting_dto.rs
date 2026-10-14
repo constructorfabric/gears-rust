@@ -39,6 +39,14 @@ pub fn mask(value: &Value, data_classification: &str, may_read_pii: bool) -> (Va
     // @cpt-end:cpt-cf-settings-service-flow-value-resolution-admin-read:p1:inst-vr-aread-10
 }
 
+/// Whether a value of this classification is shown to the caller unmasked —
+/// the masking rule's own answer, asked without a value, so what a text
+/// narrowing may match and what [`mask`] shows cannot drift apart.
+#[must_use]
+pub fn is_shown_unmasked(data_classification: &str, may_read_pii: bool) -> bool {
+    !mask(&Value::Null, data_classification, may_read_pii).1
+}
+
 /// One scope on the inheritance trail, with the setter identity and
 /// timestamp the administrative read is allowed to show.
 // Three independent facts about one scope, each read on its own by a client

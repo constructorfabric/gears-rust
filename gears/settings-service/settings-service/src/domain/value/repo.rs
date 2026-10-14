@@ -87,6 +87,20 @@ pub trait ValueRepository: Send + Sync {
         tenant_ids: &[Uuid],
     ) -> Result<Vec<ListedValue>, DomainError>;
 
+    /// The rows of several declarations whose tenant is in `tenant_ids` — a
+    /// browse batch's one read, where [`Self::find_in_tenants`] is one
+    /// declaration's.
+    ///
+    /// # Errors
+    /// [`DomainError`] when the read fails.
+    async fn find_many_in_tenants<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        declaration_ids: &[Uuid],
+        tenant_ids: &[Uuid],
+    ) -> Result<Vec<StoredValue>, DomainError>;
+
     /// The row of one declaration at exactly one tenant.
     ///
     /// # Errors

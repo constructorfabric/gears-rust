@@ -9,21 +9,26 @@ use serde::Deserialize;
 use settings_service_sdk::SettingKey;
 use toolkit::api::canonical_prelude::*;
 use toolkit::api::odata::OData;
-use toolkit_odata::ODataQuery;
+use toolkit_odata::{CursorV1, ODataQuery, PageInfo};
 use toolkit_security::{AccessScope, SecurityContext};
 use uuid::Uuid;
 
 use crate::api::authz::{self, resource};
+use crate::api::rest::browse_narrowing::{
+    browse_binding, candidate_batch, page_size, value_part_matches,
+};
 use crate::api::rest::page_dto::{PageDto, PageInfoDto};
 use crate::api::rest::setting_dto::{
-    AuditRecordDto, EffectiveValueDto, ReviewItemDto, SettingItemDto, render, render_flagged,
-    render_record,
+    AuditRecordDto, EffectiveValueDto, ReviewItemDto, SettingItemDto, is_shown_unmasked, render,
+    render_flagged, render_record,
 };
 use crate::api::rest::setting_filter::interpret;
 pub(crate) use crate::api::rest::setting_filter::unsupported;
 use crate::domain::category::visibility;
+use crate::domain::declaration::{BrowseNarrowing, Declaration};
 use crate::domain::error::DomainError;
-use crate::domain::resolution::{SUBTREE_BUDGET, ScopeTarget, subtree_too_large};
+use crate::domain::resolution::{EffectiveValue, SUBTREE_BUDGET, ScopeTarget, subtree_too_large};
+use crate::domain::search::{Corpus, Needle};
 use crate::domain::value::{ReviewRequest, review_binding};
 use crate::field;
 use crate::gear::ConcreteResolver;
@@ -41,6 +46,18 @@ pub struct TenantParam {
     /// root, and therefore platform scope.
     #[serde(default)]
     pub tenant: Option<String>,
+}
+
+/// The query parameters of the browse: the target tenant and the optional text
+/// that narrows the page.
+#[derive(Debug, Default, Deserialize)]
+pub struct BrowseParams {
+    /// As [`TenantParam::tenant`].
+    #[serde(default)]
+    pub tenant: Option<String>,
+    /// Free text narrowing the page; trimmed, 2..200 characters.
+    #[serde(default)]
+    pub q: Option<String>,
 }
 
 /// Parses the optional `tenant` query parameter; absent or empty means "not given".
@@ -200,21 +217,293 @@ pub async fn get_setting(
     // @cpt-end:cpt-cf-settings-service-flow-value-resolution-source-trail:p1:inst-vr-trail-9
 }
 
-/// `GET /settings-service/v1/settings?tenant={tenant_id}` with `OData`
-/// `$filter`, `$orderby` and cursor pagination.
+/// An entry with the diagnostic of an internal failure, for the caller to log
+/// when the entry is served.
+type BrowseEntry = (SettingItemDto, Option<String>);
+
+/// One browse entry from a declaration and the outcome of resolving it; see
+/// [`BrowseEntry`].
+fn browse_entry(
+    declaration: &Declaration,
+    outcome: Result<Arc<EffectiveValue>, DomainError>,
+    pii: bool,
+) -> BrowseEntry {
+    match outcome {
+        Ok(effective) => (
+            SettingItemDto::resolved(render(&effective, pii))
+                .with_mode(&declaration.mode)
+                .with_display_name(declaration.display_name.as_deref()),
+            None,
+        ),
+        Err(err) => (
+            SettingItemDto::failed(&declaration.key, &err)
+                .with_mode(&declaration.mode)
+                .with_display_name(declaration.display_name.as_deref()),
+            err.internal_diagnostic().map(str::to_owned),
+        ),
+    }
+}
+
+/// Log the internal failure of an entry that is on the page.
+fn log_failure(key: &str, diagnostic: Option<&str>) {
+    if let Some(diagnostic) = diagnostic {
+        tracing::error!(
+            key = %key,
+            diagnostic = %LogSafe(diagnostic),
+            "a browse entry failed internally"
+        );
+    }
+}
+
+/// Encode a cursor, an encoding failure being the service's own.
+fn mint(cursor: &CursorV1) -> Result<String, DomainError> {
+    cursor.encode().map_err(|err| DomainError::Internal {
+        diagnostic: format!("a browse cursor failed to encode: {err}"),
+    })
+}
+
+/// A refusal of a cursor, reported against the `cursor` field.
+fn cursor_refused(message: &str) -> DomainError {
+    DomainError::Validation {
+        field: "cursor".to_owned(),
+        code: field::ODATA_QUERY,
+        message: message.to_owned(),
+    }
+}
+
+/// What a narrowed browse resolves at, decided before its first batch.
+struct NarrowedBrowse<'a> {
+    scope: &'a AccessScope,
+    caller_chain: &'a [Uuid],
+    flagged_at: Option<Uuid>,
+    target: ScopeTarget,
+    needle: &'a Needle,
+    /// Whether the caller reads `pii` unmasked: decided once, so the corpus of
+    /// the declaration text and the rendering of every row agree.
+    pii: bool,
+    postgres: bool,
+}
+
+/// A row the narrowing kept, with its place in the listing.
+struct KeptRow {
+    item: SettingItemDto,
+    diagnostic: Option<String>,
+    position: CursorV1,
+}
+
+/// Whether a candidate qualifies, and if so its entry.
+///
+/// By its declaration text, or by the value or fallback the caller receives
+/// unmasked. A `retired` candidate qualifies by its text alone. A candidate
+/// whose value could not be read because a dependency is unavailable, and
+/// whose value the caller would have seen unmasked, cannot be decided: the
+/// whole request is refused with that failure rather than paged through. One
+/// that fails on its own keeps its `error` entry under the same condition, so
+/// a defect is never hidden behind the narrowing; a value the caller could
+/// never match leaves the decision to the text.
 ///
 /// # Errors
-/// 400 on a malformed `tenant`, an unmapped field or an unsupported operator;
-/// 403 when the caller may not read values or the target is outside its
-/// subtree or standalone; 503 when a dependency cannot answer. A key that
-/// fails on its own is reported in its entry, never as a request failure.
+/// The `Unavailable` failure of an undecidable candidate.
+fn qualify(
+    declaration: &Declaration,
+    text_matched: bool,
+    outcome: Result<Arc<EffectiveValue>, DomainError>,
+    needle: &Needle,
+    pii: bool,
+) -> Result<Option<BrowseEntry>, DomainError> {
+    // @cpt-begin:cpt-cf-settings-service-flow-value-resolution-admin-browse:p1:inst-vr-browse-11
+    let readable = is_shown_unmasked(&declaration.data_classification, pii);
+    match outcome {
+        Ok(effective) => {
+            // Rendered once: the entry is this rendering, kept or not.
+            let dto = render(&effective, pii);
+            let qualifies =
+                text_matched || value_part_matches(&dto, effective.secret_backed, needle);
+            Ok(qualifies.then(|| {
+                (
+                    SettingItemDto::resolved(dto)
+                        .with_mode(&declaration.mode)
+                        .with_display_name(declaration.display_name.as_deref()),
+                    None,
+                )
+            }))
+        }
+        Err(err @ DomainError::Unavailable { .. }) if !text_matched && readable => Err(err),
+        Err(err) => {
+            let keep = text_matched || (readable && matches!(err, DomainError::Internal { .. }));
+            Ok(keep.then(|| browse_entry(declaration, Err(err), pii)))
+        }
+    }
+    // @cpt-end:cpt-cf-settings-service-flow-value-resolution-admin-browse:p1:inst-vr-browse-11
+}
+
+/// Assemble one page under the text narrowing: read candidate batches wider
+/// than the page, resolve each in one pass, keep the ones that qualify, and go
+/// on until the page is full — and one qualifying row beyond it is found, to
+/// know whether a cursor is owed — or the candidates run out.
+async fn narrowed_page<C: toolkit_db::secure::DBRunner>(
+    resolver: &ConcreteResolver,
+    conn: &C,
+    base: &ODataQuery,
+    ctx: &NarrowedBrowse<'_>,
+) -> Result<(Vec<SettingItemDto>, PageInfo), DomainError> {
+    let limit = page_size(base.limit);
+    let wanted = usize::try_from(limit).unwrap_or(usize::MAX);
+    let backward = base.cursor.as_ref().is_some_and(|c| c.d == "bwd");
+    let had_cursor = base.cursor.is_some();
+    let narrowing = BrowseNarrowing {
+        needle: ctx.needle,
+        corpus: Corpus::for_caller(ctx.pii),
+        postgres: ctx.postgres,
+    };
+    let mut cursor = base.cursor.clone();
+    // In the order walked: ascending, or descending under a backward cursor.
+    let mut kept: Vec<KeptRow> = Vec::new();
+    let mut more = false;
+    // @cpt-begin:cpt-cf-settings-service-flow-value-resolution-admin-browse:p1:inst-vr-browse-12
+    'rounds: loop {
+        let batch_query = ODataQuery {
+            limit: Some(candidate_batch(limit)),
+            cursor: cursor.clone(),
+            ..base.clone()
+        };
+        // @cpt-begin:cpt-cf-settings-service-flow-value-resolution-admin-browse:p1:inst-vr-browse-12-fetch
+        // @cpt-begin:cpt-cf-settings-service-flow-value-resolution-admin-browse:p1:inst-vr-browse-12-grant
+        // The grant is not decided again here: it is the secure scope pushed
+        // into this batch query, as the narrowed-grant step states, so the
+        // batch holds only what the caller may read and the two refills are
+        // one loop.
+        // @cpt-begin:cpt-cf-settings-service-flow-value-resolution-admin-browse:p1:inst-vr-browse-6
+        let batch = resolver
+            .list_candidates(
+                conn,
+                ctx.scope,
+                ctx.caller_chain,
+                ctx.flagged_at,
+                &batch_query,
+                &narrowing,
+            )
+            .await?;
+        // @cpt-end:cpt-cf-settings-service-flow-value-resolution-admin-browse:p1:inst-vr-browse-6
+        // @cpt-end:cpt-cf-settings-service-flow-value-resolution-admin-browse:p1:inst-vr-browse-12-grant
+        // @cpt-end:cpt-cf-settings-service-flow-value-resolution-admin-browse:p1:inst-vr-browse-12-fetch
+        let continuation = if backward {
+            batch.page_info.prev_cursor.clone()
+        } else {
+            batch.page_info.next_cursor.clone()
+        };
+        // @cpt-begin:cpt-cf-settings-service-flow-value-resolution-admin-browse:p1:inst-vr-browse-12-match
+        let (declarations, marks): (Vec<Declaration>, Vec<(bool, CursorV1)>) = batch
+            .items
+            .into_iter()
+            .map(|c| (c.declaration, (c.text_matched, c.position)))
+            .unzip();
+        let outcomes = resolver
+            .resolve_declarations(conn, &declarations, ctx.target)
+            .await;
+        let mut rows: Vec<_> = declarations.iter().zip(marks).zip(outcomes).collect();
+        if backward {
+            rows.reverse();
+        }
+        for ((declaration, (text_matched, position)), outcome) in rows {
+            let qualified = match qualify(declaration, text_matched, outcome, ctx.needle, ctx.pii) {
+                Ok(qualified) => qualified,
+                // The page is full and this row is only looked at to know
+                // whether a cursor is owed: one that may qualify owes it, and
+                // the next page request decides it.
+                Err(DomainError::Unavailable { .. }) if kept.len() == wanted => {
+                    more = true;
+                    break 'rounds;
+                }
+                Err(err) => return Err(err),
+            };
+            let Some((item, diagnostic)) = qualified else {
+                continue;
+            };
+            if kept.len() == wanted {
+                more = true;
+                break 'rounds;
+            }
+            kept.push(KeptRow {
+                item,
+                diagnostic,
+                position,
+            });
+        }
+        // @cpt-end:cpt-cf-settings-service-flow-value-resolution-admin-browse:p1:inst-vr-browse-12-match
+        let Some(token) = continuation else {
+            break;
+        };
+        cursor = Some(
+            CursorV1::decode(&token).map_err(|_| cursor_refused("the cursor does not decode"))?,
+        );
+    }
+    // @cpt-end:cpt-cf-settings-service-flow-value-resolution-admin-browse:p1:inst-vr-browse-12
+    if backward {
+        kept.reverse();
+    }
+    // @cpt-begin:cpt-cf-settings-service-flow-value-resolution-admin-browse:p1:inst-vr-browse-15
+    // After the last row kept, the cursor is bound to the trimmed `q` beside
+    // the filter (the batch positions carry the binding); none once the
+    // candidates have run out, an empty page included. A walk backward
+    // mirrors the toolkit: it always owes the cursor after its last row, and
+    // the one before its first only while earlier candidates remain. Only the
+    // two rows a cursor is minted from are encoded.
+    let after = kept.last().map(|row| mint(&row.position)).transpose()?;
+    let before = kept
+        .first()
+        .map(|row| {
+            mint(&CursorV1 {
+                d: "bwd".to_owned(),
+                ..row.position.clone()
+            })
+        })
+        .transpose()?;
+    let page_info = if backward {
+        PageInfo {
+            next_cursor: after,
+            prev_cursor: if more { before } else { None },
+            limit,
+        }
+    } else {
+        PageInfo {
+            next_cursor: if more { after } else { None },
+            prev_cursor: if had_cursor { before } else { None },
+            limit,
+        }
+    };
+    // @cpt-end:cpt-cf-settings-service-flow-value-resolution-admin-browse:p1:inst-vr-browse-15
+    let items = kept
+        .into_iter()
+        .map(|row| {
+            log_failure(&row.item.key, row.diagnostic.as_deref());
+            row.item
+        })
+        .collect();
+    Ok((items, page_info))
+}
+
+/// `GET /settings-service/v1/settings?tenant={tenant_id}` with `OData`
+/// `$filter`, `$orderby` and cursor pagination, and an optional text `q` that
+/// narrows the page.
+///
+/// # Errors
+/// 400 on a malformed `tenant`, an unmapped field or an unsupported operator,
+/// a `q` outside 2..200 characters after trimming, or a cursor minted under
+/// another `q` (or without one); 403 when the caller may not read values or
+/// the target is outside its subtree or standalone; 503 when a dependency
+/// cannot answer, and under `q` when a dependency is unavailable for a setting
+/// whose value the caller could have matched — the narrowing cannot be
+/// decided; a page already full still answers, with a cursor. A key that
+/// fails on its own is reported in its entry, never as a request failure —
+/// without `q`, or a failure the narrowing does not depend on.
 #[allow(clippy::too_many_lines)]
 pub async fn browse_settings(
     Extension(ctx): Extension<SecurityContext>,
     Extension(resolver): Extension<Arc<ConcreteResolver>>,
     Extension(db): Extension<Arc<toolkit_db::DBProvider<toolkit_db::DbError>>>,
     Extension(enforcer): Extension<Arc<authz_resolver_sdk::PolicyEnforcer>>,
-    Query(params): Query<TenantParam>,
+    Query(params): Query<BrowseParams>,
     OData(query): OData,
 ) -> ApiResult<impl IntoResponse> {
     // @cpt-begin:cpt-cf-settings-service-flow-value-resolution-admin-browse:p1:inst-vr-browse-1
@@ -225,6 +514,32 @@ pub async fn browse_settings(
     )?;
     let filter = interpret(query.filter.as_deref())?;
     // @cpt-end:cpt-cf-settings-service-flow-value-resolution-admin-browse:p1:inst-vr-browse-1
+    // @cpt-begin:cpt-cf-settings-service-flow-value-resolution-admin-browse:p1:inst-vr-browse-13
+    // The search's bounds, the search's trimming: an empty `q` is as refused as
+    // a short one.
+    let needle = params.q.as_deref().map(Needle::parse).transpose()?;
+    // @cpt-end:cpt-cf-settings-service-flow-value-resolution-admin-browse:p1:inst-vr-browse-13
+    // @cpt-begin:cpt-cf-settings-service-flow-value-resolution-admin-browse:p1:inst-vr-browse-14
+    // The cursor is bound to the trimmed `q` beside the `$filter` hash, before
+    // any batch is read. Without `q` the toolkit's own check refuses a cursor
+    // minted under one; a cursor minted without `q` carries no such binding
+    // and is refused here when `q` is given.
+    let filter_hash = match &needle {
+        Some(needle) => {
+            let binding = browse_binding(query.filter_hash.as_deref(), needle);
+            if let Some(cursor) = &query.cursor
+                && cursor.f.as_deref() != Some(binding.as_str())
+            {
+                return Err(cursor_refused(
+                    "the cursor was minted under another `q`, or without one",
+                )
+                .into());
+            }
+            Some(binding)
+        }
+        None => query.filter_hash.clone(),
+    };
+    // @cpt-end:cpt-cf-settings-service-flow-value-resolution-admin-browse:p1:inst-vr-browse-14
     // @cpt-begin:cpt-cf-settings-service-flow-value-resolution-admin-browse:p1:inst-vr-browse-2
     // @cpt-begin:cpt-cf-settings-service-flow-value-resolution-admin-browse:p1:inst-vr-browse-3
     // One decision on the value resource for the whole page. Its constraints
@@ -245,7 +560,7 @@ pub async fn browse_settings(
         order: query.order.clone(),
         limit: query.limit,
         cursor: query.cursor.clone(),
-        filter_hash: query.filter_hash.clone(),
+        filter_hash,
         select: None,
     };
     // @cpt-begin:cpt-cf-settings-service-flow-value-resolution-admin-browse:p1:inst-vr-browse-7
@@ -261,64 +576,80 @@ pub async fn browse_settings(
     // and counted after the exclusion: a page shortened afterwards would tell
     // the caller that something sits in the gap.
     let caller_chain = resolver.chain_of(ctx.subject_tenant_id()).await?;
-    let page = resolver
-        .list_declarations(
-            &conn,
-            &scope,
-            &caller_chain,
-            flagged_at,
-            &declarations_query,
-        )
-        .await?;
     // @cpt-end:cpt-cf-settings-service-flow-value-resolution-admin-browse:p1:inst-vr-browse-6
-    let has_pii = page.items.iter().any(|d| d.data_classification == "pii");
+    let (mut items, page_info, total_count) = if let Some(needle) = &needle {
+        // The entitlement is decided before the first batch: the corpus the
+        // declaration text is matched in and the rendering of the value half
+        // follow it.
+        let pii = may_read_pii(&enforcer, &ctx).await;
+        narrowed_page(
+            &resolver,
+            &conn,
+            &declarations_query,
+            &NarrowedBrowse {
+                scope: &scope,
+                caller_chain: &caller_chain,
+                flagged_at,
+                target,
+                needle,
+                pii,
+                // A flag, not the backend: the repository cannot read it from
+                // its connection; a wrong value is wrong-dialect SQL.
+                postgres: db.db().db_engine() == "postgres",
+            },
+        )
+        .await
+        .map(|(items, page_info)| (items, page_info, None))?
+    } else {
+        // @cpt-begin:cpt-cf-settings-service-flow-value-resolution-admin-browse:p1:inst-vr-browse-6
+        let page = resolver
+            .list_declarations(
+                &conn,
+                &scope,
+                &caller_chain,
+                flagged_at,
+                &declarations_query,
+            )
+            .await?;
+        // @cpt-end:cpt-cf-settings-service-flow-value-resolution-admin-browse:p1:inst-vr-browse-6
+        let has_pii = page.items.iter().any(|d| d.data_classification == "pii");
 
-    // @cpt-begin:cpt-cf-settings-service-flow-value-resolution-admin-browse:p1:inst-vr-browse-8
-    // The same resolution narrowed or not: a flagged own override is reported
-    // on the resolved item through `needs_review` and its detail, and the
-    // value served is the fallthrough.
-    let outcomes = resolver
-        .resolve_declarations(&conn, &page.items, target)
-        .await;
-    let names_a_setter = outcomes.iter().any(|outcome| {
-        outcome
-            .as_ref()
-            .is_ok_and(|effective| effective.trail.iter().any(|entry| entry.set_by.is_some()))
-    });
-    let pii = (has_pii || names_a_setter) && may_read_pii(&enforcer, &ctx).await;
-    let mut items: Vec<SettingItemDto> = page
-        .items
-        .iter()
-        .zip(outcomes)
-        .map(|(declaration, outcome)| match outcome {
-            Ok(effective) => SettingItemDto::resolved(render(&effective, pii))
-                .with_mode(&declaration.mode)
-                .with_display_name(declaration.display_name.as_deref()),
-            Err(err) => {
-                if let Some(diagnostic) = err.internal_diagnostic() {
-                    tracing::error!(
-                        key = %declaration.key,
-                        diagnostic = %LogSafe(diagnostic),
-                        "a browse entry failed internally"
-                    );
-                }
-                SettingItemDto::failed(&declaration.key, &err)
-                    .with_mode(&declaration.mode)
-                    .with_display_name(declaration.display_name.as_deref())
-            }
-        })
-        .collect();
-    // @cpt-end:cpt-cf-settings-service-flow-value-resolution-admin-browse:p1:inst-vr-browse-8
+        // @cpt-begin:cpt-cf-settings-service-flow-value-resolution-admin-browse:p1:inst-vr-browse-8
+        // The same resolution narrowed or not: a flagged own override is reported
+        // on the resolved item through `needs_review` and its detail, and the
+        // value served is the fallthrough.
+        let outcomes = resolver
+            .resolve_declarations(&conn, &page.items, target)
+            .await;
+        let names_a_setter = outcomes.iter().any(|outcome| {
+            outcome
+                .as_ref()
+                .is_ok_and(|effective| effective.trail.iter().any(|entry| entry.set_by.is_some()))
+        });
+        let pii = (has_pii || names_a_setter) && may_read_pii(&enforcer, &ctx).await;
+        let items: Vec<SettingItemDto> = page
+            .items
+            .iter()
+            .zip(outcomes)
+            .map(|(declaration, outcome)| {
+                let (item, diagnostic) = browse_entry(declaration, outcome, pii);
+                log_failure(&declaration.key, diagnostic.as_deref());
+                item
+            })
+            .collect();
+        // @cpt-end:cpt-cf-settings-service-flow-value-resolution-admin-browse:p1:inst-vr-browse-8
+        (items, page.page_info, Some(page.total_count))
+    };
 
     // @cpt-begin:cpt-cf-settings-service-flow-value-resolution-admin-browse:p1:inst-vr-browse-9
     // A named key with no declaration, or one the caller may not see, gets its
     // own entry — on the final page, where its absence is known to be final.
-    // Under the narrowing a visible key whose own override is not flagged is
-    // absent from the page because the narrowing excluded it, not because it
-    // does not exist: it gets no entry, and only a key with no declaration the
-    // caller may see is reported `not_found`.
+    // Under a narrowing — `needs_review`, or the text `q` — a visible key whose
+    // setting the narrowing excluded is absent from the page because of the
+    // narrowing, not because it does not exist: it gets no entry, and only a
+    // key with no declaration the caller may see is reported `not_found`.
     if let Some(keys) = &filter.keys
-        && page.page_info.next_cursor.is_none()
+        && page_info.next_cursor.is_none()
     {
         let absent: Vec<String> = keys
             .iter()
@@ -327,7 +658,7 @@ pub async fn browse_settings(
             .collect();
         // One read for every absent key, through the page's own gates, so a
         // key the caller may not see is answered as one that does not exist.
-        let visible = if flagged_at.is_some() {
+        let visible = if flagged_at.is_some() || needle.is_some() {
             resolver
                 .visible_keys(&conn, &scope, &caller_chain, &absent)
                 .await?
@@ -347,10 +678,12 @@ pub async fn browse_settings(
     // The total is of the settings the walk pages — counted after the hidden
     // exclusion as the page is, and under `needs_review eq true` over the
     // narrowed set, since the narrowing is in the page query — so it tells the
-    // caller nothing the page does not.
+    // caller nothing the page does not. Under `q` the page is assembled from
+    // candidate batches matched in process, so a count of the page query
+    // would count the wrong set: none is reported, as the review listing does.
     Ok(Json(PageDto {
         items,
-        page_info: PageInfoDto::of(page.page_info, Some(page.total_count)),
+        page_info: PageInfoDto::of(page_info, total_count),
     }))
     // @cpt-end:cpt-cf-settings-service-flow-value-resolution-admin-browse:p1:inst-vr-browse-10
 }

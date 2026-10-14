@@ -640,6 +640,46 @@ impl ResolutionHarness {
             .id
     }
 
+    /// Declare a public setting carrying a `description`, the free-text field
+    /// `declare` leaves unset.
+    pub async fn declare_described(
+        &self,
+        name: &str,
+        scope_class: &str,
+        default: Value,
+        description: &str,
+    ) -> Uuid {
+        let conn = self.db.conn().expect("connection");
+        DeclarationRepo
+            .insert(
+                &conn,
+                &AccessScope::allow_all(),
+                DeclarationDraft {
+                    key: self.key(name).to_string(),
+                    leaf_slug: name.to_owned(),
+                    value_type_id: BOOL.to_owned(),
+                    category_id: self.category_id,
+                    default_value: default,
+                    scope_class: scope_class.to_owned(),
+                    mode: "standard".to_owned(),
+                    requires_step_up: true,
+                    anonymous_exposable: false,
+                    domain_affinity: None,
+                    has_secret_trait: false,
+                    data_classification: "public".to_owned(),
+                    source: "module_contributed".to_owned(),
+                    owner_module: Some("test".to_owned()),
+                    licence_feature: None,
+                    display_name: None,
+                    description: Some(description.to_owned()),
+                    created_by: "test".to_owned(),
+                },
+            )
+            .await
+            .expect("declaration")
+            .id
+    }
+
     pub async fn declare_typed(
         &self,
         name: &str,
@@ -925,6 +965,36 @@ impl ResolutionHarness {
             )
             .await
             .expect("value row");
+    }
+
+    /// A row attached to a subject: the subject track, which a read naming no
+    /// subject never sees.
+    pub async fn set_for_subject(&self, declaration_id: Uuid, tenant: Uuid, value: Value) {
+        let conn = self.db.conn().expect("connection");
+        let at = crate::infra::storage::clock::now();
+        let active = crate::infra::storage::entity::setting_value::ActiveModel {
+            id: sea_orm::ActiveValue::Set(Uuid::new_v4()),
+            declaration_id: sea_orm::ActiveValue::Set(declaration_id),
+            tenant_id: sea_orm::ActiveValue::Set(tenant),
+            subject_type: sea_orm::ActiveValue::Set(Some("user".to_owned())),
+            subject_id: sea_orm::ActiveValue::Set(Some("u-1".to_owned())),
+            value: sea_orm::ActiveValue::Set(Some(value)),
+            secret_ref: sea_orm::ActiveValue::Set(None),
+            data_classification: sea_orm::ActiveValue::Set("public".to_owned()),
+            needs_review: sea_orm::ActiveValue::Set(false),
+            needs_review_detail: sea_orm::ActiveValue::Set(None),
+            last_change_at: sea_orm::ActiveValue::Set(at),
+            created_at: sea_orm::ActiveValue::Set(at),
+            updated_at: sea_orm::ActiveValue::Set(at),
+            set_by: sea_orm::ActiveValue::Set("subject-admin".to_owned()),
+        };
+        toolkit_db::secure::secure_insert::<crate::infra::storage::entity::setting_value::Entity>(
+            active,
+            &AccessScope::allow_all(),
+            &conn,
+        )
+        .await
+        .expect("subject row");
     }
 
     pub async fn resolve(

@@ -264,6 +264,28 @@ impl ValueRepository for ValueRepo {
             .collect())
     }
 
+    async fn find_many_in_tenants<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        declaration_ids: &[Uuid],
+        tenant_ids: &[Uuid],
+    ) -> Result<Vec<StoredValue>, DomainError> {
+        if declaration_ids.is_empty() || tenant_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows = ValueEntity::find()
+            .filter(setting_value::Column::DeclarationId.is_in(declaration_ids.iter().copied()))
+            .filter(setting_value::Column::TenantId.is_in(tenant_ids.iter().copied()))
+            .filter(subjectless())
+            .secure()
+            .scope_with(scope)
+            .all(conn)
+            .await
+            .map_err(db_error)?;
+        Ok(rows.into_iter().map(to_domain).collect())
+    }
+
     async fn find_all<C: DBRunner>(
         &self,
         conn: &C,
