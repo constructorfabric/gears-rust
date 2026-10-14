@@ -469,7 +469,18 @@ pub async fn list_review(
         .items
         .iter()
         .filter_map(|row| {
-            let declaration = by_id.get(&row.declaration_id)?;
+            // The page query joins each row to a visible declaration, so a
+            // miss here means the declaration went away between the two
+            // reads; the row is skipped, and the gap is said aloud because
+            // the page is shorter than its cursor claims.
+            let Some(declaration) = by_id.get(&row.declaration_id) else {
+                tracing::warn!(
+                    declaration_id = %row.declaration_id,
+                    tenant = %row.tenant_id,
+                    "a review row lost its declaration between the page and the declaration reads"
+                );
+                return None;
+            };
             Some(
                 render_flagged(&declaration.key, &declaration.mode, row, root, pii)
                     .with_display_name(declaration.display_name.as_deref()),
