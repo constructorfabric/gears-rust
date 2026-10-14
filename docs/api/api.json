@@ -11183,6 +11183,46 @@
         ],
         "type": "string"
       },
+      "PricingCurrency": {
+        "description": "One currency of the table (D-537).",
+        "properties": {
+          "code": {
+            "description": "Three uppercase letters.",
+            "type": "string"
+          },
+          "iso": {
+            "description": "The scale is ISO 4217's; false for a code the deployment's `currency_scales` adds.",
+            "type": "boolean"
+          },
+          "scale": {
+            "description": "The scale a new price in this currency takes, its fractional digits: a JSON integer.",
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "code",
+          "scale",
+          "iso"
+        ],
+        "type": "object"
+      },
+      "PricingCurrencyTable": {
+        "description": "What `GET /currencies` answers (D-537): every currency the table resolves, in code order.",
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/PricingCurrency"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "items"
+        ],
+        "type": "object"
+      },
       "PricingDecisionDto": {
         "description": "One reviewer decision; decisions of earlier generations are kept and marked stale.",
         "properties": {
@@ -38478,6 +38518,113 @@
           }
         ],
         "summary": "Withdraw an approval unit",
+        "tags": [
+          "Pricing"
+        ]
+      }
+    },
+    "/bss-pricing/v1/currencies": {
+      "get": {
+        "description": "Returns every currency a book can take and the scale a new price in it takes: the active ISO 4217 codes with their minor digits, and the codes the deployment's currency_scales adds, each marked iso false (D-529, D-537). One list in code order, the same for every tenant; the settings' currencies narrow it for a new book (D-438). A stored price keeps the scale it was written with (D-531). Only a caller without config read is refused (403).",
+        "operationId": "bss_pricing.list_currencies",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PricingCurrencyTable"
+                }
+              }
+            },
+            "description": "Response"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "429": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Too Many Requests"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "List the currency table",
         "tags": [
           "Pricing"
         ]

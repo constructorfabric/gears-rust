@@ -140,3 +140,49 @@ fn an_empty_table_still_resolves_the_iso_codes() {
     assert_eq!(scale_of(&none, "JPY"), Some(0), "an ISO code resolves");
     assert_eq!(scale_of(&none, "XTS"), None, "a non-ISO code is unknown");
 }
+#[test]
+fn the_table_lists_the_iso_codes_in_code_order() {
+    let scales = CurrencyScales::default();
+    let known = scales.known();
+    assert_eq!(known.len(), 165, "every active ISO 4217 code");
+    assert!(known.iter().all(|c| c.iso), "every listed code is ISO's");
+    assert!(
+        known
+            .windows(2)
+            .all(|pair| pair[0].spec.code() < pair[1].spec.code()),
+        "once each, in code order"
+    );
+    let eur = known.iter().find(|c| c.spec.code() == "EUR").unwrap();
+    assert_eq!(eur.spec.scale(), 2);
+    let jpy = known.iter().find(|c| c.spec.code() == "JPY").unwrap();
+    assert_eq!(jpy.spec.scale(), 0);
+    assert!(
+        known.iter().all(|c| c.spec.code() != "XTS"),
+        "no code ISO lists without a scale"
+    );
+}
+#[test]
+fn the_table_lists_the_deployment_codes_among_the_iso_codes() {
+    let scales = CurrencyScales::try_new(overrides(&[("XTS", 2), ("QQQ", 8)])).unwrap();
+    let known = scales.known();
+    assert_eq!(known.len(), 167);
+    assert!(
+        known
+            .windows(2)
+            .all(|pair| pair[0].spec.code() < pair[1].spec.code()),
+        "one order across both sources"
+    );
+    let configured: Vec<(&str, u8)> = known
+        .iter()
+        .filter(|c| !c.iso)
+        .map(|c| (c.spec.code(), c.spec.scale()))
+        .collect();
+    assert_eq!(configured, vec![("QQQ", 8), ("XTS", 2)]);
+    for c in known {
+        assert_eq!(
+            scales.resolve(c.spec.code()).as_ref(),
+            Some(&c.spec),
+            "the table is what resolves"
+        );
+    }
+}
