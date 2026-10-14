@@ -10,7 +10,7 @@ sidebar:
 backend platforms out of composable, secure-by-default components called _gears_.**
 You write each capability once as a
 self-contained gear; the runtime discovers it, wires it to its dependencies, and
-runs it — in a single process on the edge, across processes over gRPC, or as
+runs it — in a single process on the edge, across processes, or as
 containers in Kubernetes — from the same codebase.
 
 If you are building a multi-tenant product backend and you care about security,
@@ -28,8 +28,9 @@ A **gear** is a vertically-sliced, self-contained capability. Each gear:
   connection; all access flows through `SecureConn` + `AccessScope`.
 - **Is discovered at link time** and initialized in dependency order by the runtime —
   there is no central switchboard to edit when you add a gear.
-- **Composes with other gears** through the typed `ClientHub` (in-process) or gRPC
-  (out-of-process), behind the same SDK trait.
+- **Composes with other gears** through the typed `ClientHub` (in-process) or generated REST clients
+  (out-of-process), behind the same SDK trait. gRPC remains available as
+  an opt-in transport for specific contracts.
 - **Is extensible** through plugins and the [Global Type System (GTS)](https://github.com/GlobalTypeSystem/gts-rust).
 
 ## What you get out of the box
@@ -45,7 +46,7 @@ Gears ships a substantial substrate so you build features, not plumbing:
 - **Multi-tenancy** — a single-root tenant tree with barriers and resource groups.
 - **OData querying** — `$filter` / `$orderby` / `$select` with cursor pagination.
 - **Observability** — OpenTelemetry tracing, request IDs, and health endpoints.
-- **Out-of-process gears** over gRPC, selected by configuration — no code changes.
+- **Out-of-process gears** as REST-first standalone processes, selected by configuration — no code changes. gRPC remains an opt-in transport for specific contracts.
 - **FIPS 140-3-ready** crypto on Linux, macOS, and Windows.
 - **`cargo gears` CLI** — a manifest-driven command-line tool for scaffolding
   workspaces, generating runnable servers, managing runtime config, building,
@@ -60,8 +61,8 @@ not by rewriting code:
 
 - **Single-node** — every gear in one process (edge, on-prem, development). Gears talk
   in-process through `ClientHub`.
-- **Multi-node** — gears split across processes/machines over gRPC, without container
-  orchestration.
+- **Self-hosted** — a `HostRuntime` process runs some gears in-process and spawns
+  selected gears as REST-first OoP worker processes.
 - **Kubernetes** — gears as containerized services with cluster-native discovery.
 
 ## What Gears is _not_

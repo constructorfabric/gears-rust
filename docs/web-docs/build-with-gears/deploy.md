@@ -1,6 +1,6 @@
 ---
 title: Deploy Gears
-description: Run the same gear code as a single node, across processes over gRPC, or as containers on Kubernetes — selected by configuration.
+description: Run the same gear code as a single node, across processes, or as containers on Kubernetes — selected by configuration.
 sidebar:
   label: Deploy Gears
   order: 14
@@ -19,18 +19,21 @@ gears:
       type: local
 ```
 
-## Multi-node (gRPC)
+## Self-hosted / multi-node (Profile 2)
 
-Gears split across processes or machines over gRPC, without container orchestration. Out-of-process gears self-register with a directory (the gRPC hub) and consumers get a gRPC client behind the same SDK trait.
+A `HostRuntime` process runs one or more gears in-process, while selected gears run as separate REST-first worker processes managed by the same host. Out-of-process gears self-register with the directory service, and the host's edge reverse-proxies their public routes.
 
 ```yaml
 gears:
-  my-gear:
+  hello:
     runtime:
       type: oop
+      execution:
+        executable_path: "./target/debug/hello-oop"
+        args: ["--config", "config/oop-hello.yaml"]
 ```
 
-The example ships a master config wiring the gateway, gRPC hub, and orchestrator. See [Run a gear out-of-process](../out-of-process/).
+The spawned worker connects to the host's `DirectoryService` using `TOOLKIT_DIRECTORY_ENDPOINT` and serves its own REST endpoints. gRPC remains available as an opt-in transport per gear. See [Run a gear out-of-process](../out-of-process/).
 
 ## Kubernetes
 

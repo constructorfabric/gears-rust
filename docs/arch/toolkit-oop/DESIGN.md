@@ -29,8 +29,11 @@ This design extends the ToolKit gear system to support out-of-process deployment
 transparency**: the same Rust trait, OperationBuilder routes, and ClientHub wiring work across all three deployment
 profiles without source changes. **Flight Control** is the minimal platform control-plane deployment unit — it runs the
 orchestrator (`service-discovery` / `DirectoryService`), the transport + edge (`grpc-hub`, `api-gateway`), and edge JWT
-validation (`authn-resolver`), coordinating OoP gear lifecycle, discovery, and gateway registration. The AuthZ plane and
-application gears run out-of-process. The architecture is built on four pillars:
+validation (`authn-resolver`), coordinating OoP gear discovery and gateway registration. In Profile 2 (Self-hosted),
+a `HostRuntime` binary runs some gears in-process and spawns selected application gears as REST-first OoP workers;
+`flight-control` is the minimal such host. In Profile 3 (K8s Native), `flight-control` runs as the platform pod and
+Kubernetes schedules each gear as its own pod. The AuthZ plane and application gears run out-of-process. The architecture
+is built on four pillars:
 
 1. **OoP gears run their own HTTP server** using the same ToolKit middleware stack (OperationBuilder, error handling,
    OpenAPI generation) as in-process gears. The gear's `register_rest()` builds routes on a local Axum router
@@ -277,8 +280,8 @@ standalone HTTP-serving process.
 The existing implementation (`libs/toolkit/src/bootstrap/oop.rs`, `OopRunOptions` / `run_oop_with_options`) already
 handles:
 
-- Configuration loading and merging (master-rendered config via `TOOLKIT_MODULE_CONFIG` env var, merged with local config
-  field-by-field for DB, key-by-key for logging).
+- Configuration loading and merging (a rendered `TOOLKIT_MODULE_CONFIG` env-var base from the spawning host, merged
+  field-by-field for DB and key-by-key for logging under the worker's own `--config` file, which takes precedence).
 - Logging initialization with OpenTelemetry support (tracing config from master).
 - gRPC connection to DirectoryService (via `DirectoryGrpcClient::connect`).
 - Heartbeat loop using a child `CancellationToken`.
@@ -286,8 +289,12 @@ handles:
 - Graceful shutdown driven by a root `CancellationToken` hooked to OS signals.
 
 The host side (`libs/toolkit/src/runtime/host_runtime.rs`, `run_oop_spawn_phase`) spawns OoP processes using
-`OopBackend.spawn(OopSpawnConfig)` after grpc-hub is ready, passing `TOOLKIT_DIRECTORY_ENDPOINT` and
-`TOOLKIT_MODULE_CONFIG` env vars.
+`OopBackend.spawn(OopSpawnConfig)` after grpc-hub is ready. For each `runtime.type: oop` gear, the host launches the
+configured executable, injecting `TOOLKIT_DIRECTORY_ENDPOINT` (the host's DirectoryService) and a rendered
+`TOOLKIT_MODULE_CONFIG` JSON blob as a configuration base; the worker's own `--config <path>` file overrides it.
+Workers started manually receive neither env var from the host: the operator sets `TOOLKIT_DIRECTORY_ENDPOINT`
+when starting the worker standalone, and the worker runs on its `--config`/`TOOLKIT_CONFIG_PATH` file alone. The worker then
+starts its own HTTP server and self-registers.
 
 What is **missing** and needs to be added:
 
@@ -1458,7 +1465,7 @@ The `toolkit-common` dependency is referenced from each gear chart via a relativ
 #### Library Chart — `toolkit-common`
 
 All ToolKit gears share the same process structure: an HTTP server on a configurable port, `/healthz`, `/readyz`, and `/health`
-probe endpoints (provided by ToolKit runtime), optional gRPC port, config via `TOOLKIT_MODULE_CONFIG` env var, and Flight
+probe endpoints (provided by ToolKit runtime), optional gRPC port, config loaded from a mounted file, and Flight
 Control's `TOOLKIT_DIRECTORY_ENDPOINT` for service registration. The `toolkit-common` library chart codifies these
 conventions into reusable named templates.
 
@@ -1470,7 +1477,7 @@ conventions into reusable named templates.
 | HTTP port          | Named `http` port on container and Service                                | `service.port` (default: `8080`)                  |
 | gRPC port          | Conditional named `grpc` port                                             | `grpc.enabled`, `grpc.port` (default: `50051`)    |
 | Health probes      | `/healthz` (liveness), `/readyz` (readiness), `/health` (diagnostics) — provided by ToolKit runtime | `health.liveness.*`, `health.readiness.*`         |
-| Gear config      | `TOOLKIT_MODULE_CONFIG` from ConfigMap                                     | `gearConfig` (arbitrary map → JSON)             |
+| Gear config      | Mounted YAML file (`/app/config/gear.yaml`) from ConfigMap                                     | `gearConfig` (arbitrary map → YAML)             |
 | Directory endpoint | `TOOLKIT_DIRECTORY_ENDPOINT` env var                                       | `global.directoryEndpoint`                        |
 | Internal auth      | Projected SA token volume (audience: `toolkit-internal`) for Profile 3     | `internalAuth.audience`, `internalAuth.tokenPath` |
 | Resources          | requests/limits block                                                     | `resources.requests.*`, `resources.limits.*`      |
@@ -1553,7 +1560,7 @@ resources:
     cpu: 500m
     memory: 512Mi
 
-gearConfig: { }                    # passed as JSON to TOOLKIT_MODULE_CONFIG
+gearConfig: { }                    # rendered as YAML and mounted at /app/config/gear.yaml
 
 ingress:
   enabled: false

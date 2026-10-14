@@ -31,11 +31,11 @@
 //! deliberate, and carries the citation it was decided against.
 //!
 //! - **`api/grpc/` is a directory**, where `09:132` prescribes a single
-//!   `src/grpc_server.rs`. No file by that name exists anywhere in the repo; the only
-//!   other out-of-process gear (`examples/oop-gears/calculator/`) also uses an `api/grpc/`
-//!   directory. `S4` adds `api/rest/` beside it, which is `02:39`'s shape.
+//!   `src/grpc_server.rs`. No file by that name exists anywhere in the repo; the
+//!   gRPC opt-in example gear (`examples/toolkit/api-contracts/api-contracts/`) also uses
+//!   an `api/grpc/` directory. `S4` adds `api/rest/` beside it, which is `02:39`'s shape.
 //! - **No `infra/`.** This gear owns no store — a backend's persistence belongs to the
-//!   plugin implementing it. `calculator` and `nodes-registry` ship without one too.
+//!   plugin implementing it. `api-contracts` and `nodes-registry` ship without one too.
 //! - **[`defaults`] is an unprecedented module name** (no other gear has one). Kept
 //!   because it is DESIGN §3.11's own term for what it holds — the "implement cache
 //!   only, get all three primitives" backends — and because it is a public path that
