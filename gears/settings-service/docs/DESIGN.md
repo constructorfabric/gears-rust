@@ -520,7 +520,7 @@ Identity and shape are separate types. A setting `key` derives from `gts.cf.core
 | `name` | string (1..256) | Yes | Human-readable name; globally unique (categories are flat — no nesting). |
 | `description` | string (0..4096) | No | Category description. |
 | `domain_affinity` | `DomainAffinity` | No | Optional administrative-domain binding (e.g. `infrastructure`, `commercial`). |
-| `sort_order` | integer | Yes | Display ordering hint. |
+| `sort_order` | integer | Yes | Display ordering weight, lower first. The listing's default order, with `name` as the tiebreaker, and accepted in `$orderby` and `$filter` (§4.3). |
 | `icon` | string | No | Icon token for the hub. |
 | `created_at` / `updated_at` | `timestamptz` | Yes | UTC timestamps. |
 
@@ -796,7 +796,7 @@ graph TD
 | `create_category` | `CreateCategoryRequest`, `Context` | `Category` | Authorize `create` on `gts.cf.core.settings.category.v1~` (category governance is per-resource-type CRUD — create/read/update/delete — per §4.8). Reject duplicate `key`/`name` (`409`). Insert; audit. (`cpt-cf-settings-service-fr-settings-category-model`) |
 | `update_category` | `id`, `UpdateCategoryRequest`, `Context` | `Category` | Authorize `update` on `gts.cf.core.settings.category.v1~`. Partial update (`name`, `description`, `domain_affinity`, `sort_order`, `icon`). Requires `If-Match` (optimistic concurrency, §4.3). |
 | `delete_category` | `id`, `Context` | — | Authorize `delete` on `gts.cf.core.settings.category.v1~`. Reject (`409 CategoryNotEmpty`) if any declaration row references it — **including `retired` ones** (a retired declaration still occupies the category and its values are retained, §4.2 *Declaration Management*; no-orphan, `cpt-cf-settings-service-fr-settings-category-model`). Hard-delete only when no declaration row remains. Authoritative guard is the declaration→category FK `ON DELETE RESTRICT` (§4.7), which blocks regardless of `status`. |
-| `get_category` / `list_categories` | filter, `Context` | `Category` / `Category[]` | Domain-filtered, visibility-gated, paginated. |
+| `get_category` / `list_categories` | filter, `Context` | `Category` / `Category[]` | Domain-filtered, visibility-gated, paginated. Ordered by `sort_order` then `name` unless `$orderby` says otherwise: `$orderby` accepts `key`, `name` and `sort_order`, each `asc` or `desc`, and `name asc` is appended as the tiebreaker unless `name` is already an order key, so a page cursor is always total; `domain_affinity` is refused because it may be empty. |
 
 #### Component: Declaration Management
 
@@ -1232,7 +1232,7 @@ All REST APIs follow the shared DNA REST contract: `snake_case` JSON; UUIDv7 IDs
 | Method | Endpoint | Description | Idempotency |
 |--------|----------|-------------|-------------|
 | `POST` | `/settings-service/v1/categories` | Create a category | No — unique key → `409`; lost-response retry disambiguated by re-read (§4.3 DNA) |
-| `GET` | `/settings-service/v1/categories` | List categories (domain/visibility filtered, paginated) | Yes |
+| `GET` | `/settings-service/v1/categories` | List categories (domain/visibility filtered, paginated) — OData `$filter` over `key`, `name`, `domain_affinity` and `sort_order`; `$orderby` over `key`, `name` and `sort_order`, `asc` or `desc`, default `sort_order asc` then `name asc`; `$orderby` over `domain_affinity` refused `400 odata_unsortable_field` (it may be empty, and a page cursor cannot carry an empty value) and over any undeclared field `UNSUPPORTED_ORDERBY_FIELD`; `$select` refused (§4.3 DNA) | Yes |
 | `GET` | `/settings-service/v1/categories/{id}` | Get a category | Yes |
 | `PATCH` | `/settings-service/v1/categories/{id}` | Update category metadata | Yes |
 | `DELETE` | `/settings-service/v1/categories/{id}` | Delete category (empty only) | Yes |
@@ -2342,6 +2342,7 @@ The targets above are validated against these order-of-magnitude bounds. They ar
 |---|---|---|
 | Create category | `POST /settings-service/v1/categories` | `201`, `Location`, body matches schema |
 | Delete non-empty category | `DELETE /settings-service/v1/categories/{id}` | `409 CategoryNotEmpty` |
+| List categories in display order | categories sharing a weight and spanning more than one page: `GET /settings-service/v1/categories` with no `$orderby`, with `$orderby=sort_order asc`, `desc`, `$filter=sort_order eq N`, and `$orderby=domain_affinity asc` | Default and `asc` pages ordered by `sort_order` then `name asc`; `desc` reverses the weight only, equal weights still by `name asc`; the order reproduced across cursor pages where equal weights straddle a boundary; the filter narrows the page to that weight; `domain_affinity` → `400 odata_unsortable_field` |
 | Create declaration — happy/duplicate/invalid default | `POST /settings-service/v1/declarations` | `201` / `409` / `422` |
 | Patch/delete contributed declaration | `PATCH`/`DELETE /settings-service/v1/declarations/{id}` | `409 ContributedDeclarationImmutable` |
 | Retire admin declaration (soft-delete) | `DELETE /settings-service/v1/declarations/{id}` | `200` with retired body (`status=retired`, `updated_at`); values retained; contrast category hard delete → `204` |

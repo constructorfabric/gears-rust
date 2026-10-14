@@ -74,27 +74,33 @@ impl FilterField for DeclarationOrderField {
     }
 }
 
-/// The fields `GET /categories` orders by: its filter fields less the optional
-/// `domain_affinity`, for the reason [`DeclarationOrderField`] gives.
+/// The fields `GET /categories` orders by: its filter fields (`key`, `name`,
+/// `sort_order`) less the optional `domain_affinity`, for the reason
+/// [`DeclarationOrderField`] gives.
 #[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CategoryOrderField {
     Key,
     Name,
+    SortOrder,
 }
 
 impl FilterField for CategoryOrderField {
-    const FIELDS: &'static [Self] = &[Self::Key, Self::Name];
+    const FIELDS: &'static [Self] = &[Self::Key, Self::Name, Self::SortOrder];
 
     fn name(&self) -> &'static str {
         match self {
             Self::Key => "key",
             Self::Name => "name",
+            Self::SortOrder => "sort_order",
         }
     }
 
     fn kind(&self) -> FieldKind {
-        FieldKind::String
+        match self {
+            Self::Key | Self::Name => FieldKind::String,
+            Self::SortOrder => FieldKind::I64,
+        }
     }
 }
 

@@ -14,10 +14,11 @@ use toolkit_odata_macros::ODataFilterable;
 
 /// The filterable surface of a category.
 ///
-/// Deliberately narrow. `description` and `icon` are presentation, and
-/// `sort_order` is an ordering weight rather than something to select on; none
-/// of them answers a question an administrator asks of a list. A field can be
-/// added later without breaking a caller, whereas removing one cannot.
+/// Deliberately narrow. `description` and `icon` are presentation and answer no
+/// question an administrator asks of a list, so they are left out. `sort_order`
+/// is declared because the listing orders by it; a declared field is filterable
+/// as well. A field can be added later without breaking a caller, whereas
+/// removing one cannot.
 #[derive(ODataFilterable)]
 pub struct CategoryQuery {
     /// The stable slug — an exact-match lookup by the key a setting embeds.
@@ -32,6 +33,11 @@ pub struct CategoryQuery {
     /// listing is built around.
     #[odata(filter(kind = "String"))]
     pub domain_affinity: String,
+
+    /// The display weight. Declared so the listing can order by it, and
+    /// therefore also filterable.
+    #[odata(filter(kind = "I64"))]
+    pub sort_order: i64,
 }
 
 /// The generated filter-field enum for categories.
@@ -122,3 +128,7 @@ impl toolkit_odata::filter::FilterField for SettingFilterField {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "odata_tests.rs"]
+mod odata_tests;

@@ -61109,7 +61109,7 @@
     },
     "/settings-service/v1/categories": {
       "get": {
-        "description": "List categories visible to the caller, ordered by sort order then name. Supports OData `$filter` over `key`, `name` and `domain_affinity`, and `$orderby` over `key` and `name`, with cursor pagination. `$orderby` over `domain_affinity` is refused: it may be empty, and a page cursor cannot carry an empty value. `$select` is not supported and is rejected rather than ignored.",
+        "description": "List categories visible to the caller, ordered by sort order then name. Supports OData `$filter` over `key`, `name`, `domain_affinity` and `sort_order`, and `$orderby` over `key`, `name` and `sort_order`, each `asc` or `desc`, with cursor pagination; the default order is sort order then name, and `name` is appended as the tiebreaker unless it is already named. `$orderby` over `domain_affinity` is refused: it may be empty, and a page cursor cannot carry an empty value. `$select` is not supported and is rejected rather than ignored.",
         "operationId": "settings_service.list_categories",
         "parameters": [
           {
@@ -61131,7 +61131,7 @@
             }
           },
           {
-            "description": "OData v4 filter expression\n- key: eq|ne|contains|startswith|endswith|in\n- name: eq|ne|contains|startswith|endswith|in\n- domain_affinity: eq|ne|contains|startswith|endswith|in",
+            "description": "OData v4 filter expression\n- key: eq|ne|contains|startswith|endswith|in\n- name: eq|ne|contains|startswith|endswith|in\n- domain_affinity: eq|ne|contains|startswith|endswith|in\n- sort_order: eq|ne|gt|ge|lt|le|in",
             "in": "query",
             "name": "$filter",
             "required": false,
@@ -61140,7 +61140,7 @@
             }
           },
           {
-            "description": "OData v4 orderby expression\n- key asc\n- key desc\n- name asc\n- name desc",
+            "description": "OData v4 orderby expression\n- key asc\n- key desc\n- name asc\n- name desc\n- sort_order asc\n- sort_order desc",
             "in": "query",
             "name": "$orderby",
             "required": false,
@@ -61245,6 +61245,15 @@
               "startswith",
               "endswith",
               "in"
+            ],
+            "sort_order": [
+              "eq",
+              "ne",
+              "gt",
+              "ge",
+              "lt",
+              "le",
+              "in"
             ]
           }
         },
@@ -61253,7 +61262,9 @@
             "key asc",
             "key desc",
             "name asc",
-            "name desc"
+            "name desc",
+            "sort_order asc",
+            "sort_order desc"
           ]
         }
       },

@@ -166,7 +166,7 @@ One requirement is counted as covered while being split across releases: `cpt-cf
   - `key` validation rejecting `/` and enforcing the 1..128 bound; `key` refused on update rather than merely discouraged, because an in-place change would re-key every declaration filed under it with nothing left pointing at the old name
   - No-orphan deletion returning `409 CategoryNotEmpty` while any declaration references the category, including `retired` declarations
   - `If-Match` and ETag optimistic concurrency on `PATCH` and `DELETE`
-  - Domain-filtered, visibility-gated, paginated list ordered by `sort_order` then `name`
+  - Domain-filtered, visibility-gated, paginated list ordered by `sort_order` then `name`, with `$orderby` over `key`, `name` and `sort_order` and `$filter` over `sort_order` beside the other fields
   - Category mutations audited at platform scope — the root tenant's id — through the emitter of 2.1
   - `idx_categories_name_trgm` GIN trigram index on `name`, supporting search in a later wave
 

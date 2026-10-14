@@ -48,3 +48,39 @@ fn no_route_opts_out_of_authentication() {
         );
     }
 }
+
+#[test]
+fn the_list_categories_description_names_sort_order_for_filtering_and_ordering() {
+    // The description is the only place a client learns which fields the
+    // listing accepts; `sort_order` must be named under both options, or the
+    // weight a listing is ordered by cannot be discovered.
+    let start = SOURCE
+        .find("settings_service.list_categories")
+        .expect("the list route is declared");
+    let end = start
+        + SOURCE[start..]
+            .find(".tag(TAG)")
+            .expect("the description precedes the tag");
+    // Join the string literal's continuation lines into one sentence run.
+    let description = SOURCE[start..end]
+        .replace("\\\n", " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    let (filter, orderby) = description
+        .split_once("`$orderby` over")
+        .expect("the description covers `$orderby`");
+    assert!(
+        filter.contains("`$filter` over") && filter.contains("`sort_order`"),
+        "`$filter` must list `sort_order`: {filter}"
+    );
+    let orderby = orderby
+        .split("with cursor pagination")
+        .next()
+        .unwrap_or(orderby);
+    assert!(
+        orderby.contains("`sort_order`"),
+        "`$orderby` must list `sort_order`: {orderby}"
+    );
+}

@@ -27,6 +27,7 @@ impl FieldToColumn<CategoryFilterField> for CategoryODataMapper {
             CategoryFilterField::Key => CategoryColumn::Key,
             CategoryFilterField::Name => CategoryColumn::Name,
             CategoryFilterField::DomainAffinity => CategoryColumn::DomainAffinity,
+            CategoryFilterField::SortOrder => CategoryColumn::SortOrder,
         }
     }
 }
@@ -41,6 +42,7 @@ impl ODataFieldMapping<CategoryFilterField> for CategoryODataMapper {
             CategoryFilterField::Key => model.key.clone().into(),
             CategoryFilterField::Name => model.name.clone().into(),
             CategoryFilterField::DomainAffinity => model.domain_affinity.clone().into(),
+            CategoryFilterField::SortOrder => model.sort_order.into(),
         }
     }
 }
