@@ -150,6 +150,11 @@ Always include unit tests when introducing new code.
 
 ### 2.4. Run Code Quality Checks
 
+Makefile targets are grouped into internal includes under `tools/ci/make/`.
+See [the CI tooling and benchmark procedure](tools/ci/README.md).
+Run `make setup` explicitly when tools are missing; test and lint targets do not
+install them. `make help` and dry runs work without a virtual environment.
+
 Build and run all the quality checks:
 
 ```bash

@@ -11,6 +11,10 @@ on:
     - cron: "0 2 * * *" # nightly full E2E at 02:00 UTC
   workflow_dispatch:
     inputs:
+      benchmark_cache_namespace:
+        description: 'Optional isolated benchmark cache namespace'
+        type: string
+        default: ''
       mode:
         description: "Test suite to run"
         required: false
@@ -25,14 +29,16 @@ permissions:
   issues: write
 
 concurrency:
-  group: e2e-${{ github.ref }}
-  cancel-in-progress: false
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
+  CF_CACHE_NAMESPACE: ${{ inputs.benchmark_cache_namespace || '' }}
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: full
   # Local dev enables incremental via [profile.dev]; CI does not want the churn.
   CARGO_INCREMENTAL: "0"
+  SCCACHE_GHA_ENABLED: "true"
   # Debug info is dead weight here — nothing in this job reads a backtrace
   # symbol table, and it dominates both link time and cache size. Same value
   # the compiling jobs in ci.yml use.
@@ -131,6 +137,10 @@ jobs:
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.11"
+          cache: pip
+          cache-dependency-path: |
+            testing/requirements.txt
+            testing/e2e/requirements.txt
 
       # docker-changes' paths-filter matches `**/*.Dockerfile`, so editing any
       # Dockerfile triggers this job - but until now the job only ever built
@@ -203,13 +213,17 @@ jobs:
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.11"
+          cache: pip
+          cache-dependency-path: |
+            testing/requirements.txt
+            testing/e2e/requirements.txt
 
       - name: Install Rust toolchain from rust-toolchain.toml
         run: |
           rustup show active-toolchain || rustup toolchain install
           rustup show
 
-      # This job compiles more than any other: `e2e-local` builds the release
+      # This job compiles more than any other: `e2e-local` builds the debug
       # binary and the lane-specific targets below each build their own feature
       # configuration. Without a cache every run started from zero, which is
       # what put e2e runs at 29-41 minutes. Mirrors the `integration` job in
@@ -220,26 +234,16 @@ jobs:
         with:
           cache-bin: false
           cache-targets: false
-          shared-key: pr-${{ runner.os }}-e2e-${{ hashFiles('rust-toolchain.toml') }}
+          shared-key: pr-${{ runner.os }}-e2e-${{ hashFiles('rust-toolchain.toml') }}${{ env.CF_CACHE_NAMESPACE && format('-bench-{0}', env.CF_CACHE_NAMESPACE) || '' }}
 
       # Install sccache (cross-platform)
-      - name: Install sccache
-        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
-
-      # Probe sccache; if startup fails, fall back to plain rustc (no hard CI failure).
-      - name: Probe sccache & set RUSTC_WRAPPER
-        shell: bash
-        run: |
-          if sccache --start-server >/dev/null 2>&1; then
-            echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
-            echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
-          else
-            echo "sccache failed, falling back to plain rustc"
-          fi
+      - name: Configure remote sccache
+        id: sccache
+        uses: ./.github/actions/sccache
 
       - name: Install Python dependencies
         id: setup
-        run: pip install -r testing/e2e/requirements.txt
+        run: make py-env
 
       # `make e2e-local` (no SUITE) runs only the shared-server suites
       # (launcher: e2e-launcher) against a single server. Self-managed suites
@@ -337,7 +341,7 @@ jobs:
           retention-days: 7
           path: |
             ${{ github.workspace }}/testing/e2e/logs/**
-            ${{ runner.home }}/.constructorfabric/logs/**
+            ~/.constructorfabric/logs/**
 
       - name: Create or update issue on nightly failure
         if: failure() && github.event_name == 'schedule'
@@ -410,3 +414,8 @@ jobs:
               });
               await tryAssign(created.data.number);
             }
+
+      - name: Save sccache statistics
+        if: ${{ always() && steps.sccache.outputs.enabled == 'true' }}
+        continue-on-error: true
+        uses: ./.github/actions/sccache-stats

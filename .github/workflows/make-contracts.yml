@@ -1,0 +1,35 @@
+name: Makefile includes
+on:
+  pull_request:
+    paths:
+      - Makefile
+      - 'tools/ci/**'
+      - 'tools/scripts/make_help.py'
+      - 'tools/scripts/junit_enrich.py'
+      - '.github/actions/**'
+      - '.github/workflows/make-contracts.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  contracts:
+    name: Make contracts (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.11'
+      - name: Makefile regression tests
+        run: python3 -m unittest discover -s tools/ci/tests -v
+      - name: Root make help and dry run
+        run: |
+          make help
+          make -n gear-ci GEAR=file-parser

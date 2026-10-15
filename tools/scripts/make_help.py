@@ -27,12 +27,12 @@ def _color_support() -> bool:
 
 
 def _is_help_target(name: str) -> bool:
-    return bool(name) and not name.startswith(".") and name == name.lower() and not any(
+    return bool(name) and not name.startswith((".", "cf-")) and name == name.lower() and not any(
         char.isspace() for char in name
     )
 
 
-def generate_help(makefile_path: Path) -> None:
+def generate_help(makefile_path: Path, *included_paths: Path) -> None:
     section: str = ""
     section_order: list[str] = []
     entries: dict[str, list[tuple[int, str, str]]] = {}
@@ -54,7 +54,10 @@ def generate_help(makefile_path: Path) -> None:
     name_field_width = 22
 
     try:
-        lines = makefile_path.read_text(encoding="utf-8").splitlines()
+        lines = []
+        for source in dict.fromkeys((makefile_path, *included_paths)):
+            lines.extend(source.read_text(encoding="utf-8").splitlines())
+            lines.append("")
     except OSError as exc:
         print(f"ERROR: cannot read {makefile_path}: {exc}", file=sys.stderr)
         sys.exit(1)
@@ -148,13 +151,11 @@ def generate_help(makefile_path: Path) -> None:
         )
         print(f"{color_secondary}{note}{color_reset}")
         print()
-        print(f"{color_secondary}Run '{color_primary}make build{color_secondary}' to build the release binary")
-        print(f"{color_secondary}Run '{color_primary}make all{color_secondary}' to run all necessary quality checks and tests and then build the release binary")
 
 
 def main(argv: list[str]) -> None:
-    makefile = Path(argv[1]) if len(argv) > 1 else Path("Makefile")
-    generate_help(makefile)
+    makefiles = [Path(name) for name in argv[1:]] or [Path("Makefile")]
+    generate_help(*makefiles)
 
 
 if __name__ == "__main__":

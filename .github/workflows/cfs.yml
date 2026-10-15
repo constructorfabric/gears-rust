@@ -3,18 +3,12 @@ name: CFS
 
 on:
   pull_request:
+    branches: [ main, develop ]
+  push:
     branches: [ main ]
-    paths:
+    paths-ignore:
       - '**/*.md'
       - 'docs/**'
-      - 'gears/**/docs/**'
-      - 'gears/**/src/**'
-      - 'gears/**/tests/**'
-      - '.cf-studio/config/**'
-      - '.cf-studio-kit.toml'
-      - 'studio-kit-gears/**'
-      - 'Makefile'
-  workflow_call:
   workflow_dispatch:
 
 concurrency:

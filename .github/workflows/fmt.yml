@@ -5,6 +5,11 @@ on:
     branches: [ main, develop ]
     paths:
       - '**/*.rs'
+      - 'Makefile'
+      - 'tools/ci/**'
+      - '.github/actions/**'
+      - 'rust-toolchain.toml'
+      - '.github/workflows/fmt.yml'
   workflow_dispatch:
 
 permissions:

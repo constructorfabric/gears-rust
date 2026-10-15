@@ -33,6 +33,7 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: full
   CARGO_INCREMENTAL: "0"
+  SCCACHE_GHA_ENABLED: "true"
 
 jobs:
   detect:
@@ -232,22 +233,13 @@ jobs:
           rustup show
 
       - name: Install cargo tools
-        uses: taiki-e/install-action@861a07ce7084f55488e375df125cdc99bba60eb7 # v2.87.23
+        uses: ./.github/actions/ci-tools
         with:
-          tool: cargo-hack, nextest, cargo-llvm-cov
+          tools: nextest, cargo-gears
 
-      - name: Install sccache
-        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
-
-      - name: Probe sccache & set RUSTC_WRAPPER
-        shell: bash
-        run: |
-          if sccache --start-server >/dev/null 2>&1; then
-            echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
-            echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
-          else
-            echo "sccache failed, falling back to plain rustc"
-          fi
+      - name: Configure remote sccache
+        id: sccache
+        uses: ./.github/actions/sccache
 
       - name: Cache Cargo/target
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
@@ -256,11 +248,15 @@ jobs:
           cache-targets: false
           shared-key: pr-gear-scoped-${{ hashFiles('rust-toolchain.toml') }}
 
-      - name: Mark required tools installed
-        run: touch .setup-stamp
-
       - name: Run scoped CI command
-        run: ${{ needs.detect.outputs.make_cmd }}
+        env:
+          GEAR_SCOPE: ${{ needs.detect.outputs.gear }}
+        run: make gear-ci GEAR="$GEAR_SCOPE"
+
+      - name: Save sccache statistics
+        if: ${{ always() && steps.sccache.outputs.enabled == 'true' }}
+        continue-on-error: true
+        uses: ./.github/actions/sccache-stats
 
   not-scoped:
     name: Full CI required
