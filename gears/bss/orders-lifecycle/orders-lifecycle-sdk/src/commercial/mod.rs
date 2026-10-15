@@ -194,7 +194,9 @@ impl OrderPin {
                 || b.price.price_id.is_nil()
                 || b.price_book_entry_id.is_nil()
                 || !matches!(b.price.state, PriceState::Approved)
-                || b.price.currency != q.market.currency
+                || b.price.currency.code() != q.market.currency
+                // One currency at one scale across the receipt (bss_money `ensure_same`).
+                || r.bindings[0].price.currency.ensure_same(&b.price.currency).is_err()
             {
                 return Err(CodecError::Mismatch);
             }

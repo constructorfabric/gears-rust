@@ -10,8 +10,8 @@
   },
   "receipt": {
     "acceptance_id": "00000000-0000-0000-0000-000000000014",
-    "request_digest": "58db3522dd38a09fc8e89b1f91239b99c65c19aa670bd5331fce269d7c0f91ee",
-    "terms_digest": "2ff644fed80d145db66e9d549a1a1029b018fac00d8b71777d541dd11158cd43",
+    "request_digest": "fa43630bc27ba50e07dfd4b93f140bed30e68c064e63f028fdd7440de4bb5d40",
+    "terms_digest": "5ecffe5acffb16099d45ffa10c41f8fffd4ea7b68be820bd0e8bb50c3e5dde1f",
     "query": {
       "tenant_axes": {
         "seller_tenant_id": "00000000-0000-0000-0000-000000000008",
@@ -59,7 +59,7 @@
         "digest": "8bbd1652e172dcb1c4498d7dec92af3b6d7f727d34bb7ffebc8aed1181bda983"
       },
       "hold_policy_version": "18446744073709551615",
-      "resolved_bindings_digest": "0906228e0f49a7974346fb20e0da3d52d452072fb69dd9538e77b8ebf305e95f"
+      "resolved_bindings_digest": "1a21429ae66940fd8d6d8243d6b6b6e2a091e14a40c80fa0408f221824129b31"
     },
     "accepted_at": "2026-10-01T10:29:00.123456789Z",
     "hold_until": "2026-10-02T10:29:00.123456789Z",
@@ -78,7 +78,10 @@
         "price": {
           "price_id": "00000000-0000-0000-0000-000000000065",
           "price_book_entry_id": "00000000-0000-0000-0000-0000000000c9",
-          "currency": "EUR",
+          "currency": {
+            "code": "EUR",
+            "scale": 2
+          },
           "model": {
             "kind": "flat",
             "amount": "1.23"
@@ -87,7 +90,7 @@
           "effective_from": "2026-09-01",
           "ends_on": null,
           "state": "approved",
-          "money_digest": "7264ec021836ab6e910a1d89869e6d394e05dff70ed3588770ba4d8306236b00"
+          "money_digest": "d64a9c36ac7903a52d4ac3228b7d5308ab15e76b475c1d3e531037e3787a9cfd"
         },
         "kind": "recurring",
         "recurring_period": "month",
@@ -99,7 +102,6 @@
           "gl_code": "REVENUE",
           "tax_category": "cloud",
           "timing": "advance",
-          "currency_scale": 2,
           "rounding": "half_even",
           "template_digest": "bd2dc3e291bd73005db8cfb421d113725884a289a2e383f69d49ffe9438970d2"
         }
@@ -118,7 +120,10 @@
         "price": {
           "price_id": "00000000-0000-0000-0000-000000000066",
           "price_book_entry_id": "00000000-0000-0000-0000-0000000000ca",
-          "currency": "EUR",
+          "currency": {
+            "code": "EUR",
+            "scale": 2
+          },
           "model": {
             "kind": "per_unit",
             "unit_amount": "2.5"
@@ -127,7 +132,7 @@
           "effective_from": "2026-09-01",
           "ends_on": null,
           "state": "approved",
-          "money_digest": "e9b7ee2048e685a12343aba3c2f6e016cf4342d06620f59ac2c6dce750906fc9"
+          "money_digest": "a55a47c50e0aeb307b1ca1bd0020234d2fb4869963011e5f389e066e9519e402"
         },
         "kind": "one_time",
         "recurring_period": null,
@@ -139,7 +144,6 @@
           "gl_code": "REVENUE",
           "tax_category": "cloud",
           "timing": "advance",
-          "currency_scale": 2,
           "rounding": "half_even",
           "template_digest": "bd2dc3e291bd73005db8cfb421d113725884a289a2e383f69d49ffe9438970d2"
         }
@@ -161,7 +165,10 @@
         "price": {
           "price_id": "00000000-0000-0000-0000-000000000067",
           "price_book_entry_id": "00000000-0000-0000-0000-0000000000cb",
-          "currency": "EUR",
+          "currency": {
+            "code": "EUR",
+            "scale": 2
+          },
           "model": {
             "kind": "volume",
             "tiers": [
@@ -179,7 +186,7 @@
           "effective_from": "2026-09-01",
           "ends_on": null,
           "state": "approved",
-          "money_digest": "9d7d00b300749ca95a2037d63ae2f599afbf52537e712ee3610dc9ae4bad62bf"
+          "money_digest": "11967806d3ca9fccc34eed341a2dcaecf339ae6bcfa35440763f26a1dff2ddcd"
         },
         "kind": "usage",
         "recurring_period": null,
@@ -205,7 +212,6 @@
           "gl_code": "REVENUE",
           "tax_category": "cloud",
           "timing": "arrears",
-          "currency_scale": 2,
           "rounding": "half_even",
           "template_digest": "bd2dc3e291bd73005db8cfb421d113725884a289a2e383f69d49ffe9438970d2"
         }

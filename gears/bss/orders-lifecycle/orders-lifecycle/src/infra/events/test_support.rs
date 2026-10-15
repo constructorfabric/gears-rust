@@ -8,7 +8,7 @@ use tenant_resolver_sdk::{TenantInfo, TenantResolverClient, TenantResolverError,
 use time::OffsetDateTime;
 use toolkit_security::SecurityContext;
 use types_registry::config::TypesRegistryConfig;
-use types_registry::domain::local_client::TypesRegistryLocalClient;
+use types_registry::domain::legacy_local_client::TypesRegistryLocalClient;
 use types_registry::domain::service::TypesRegistryService;
 use types_registry::infra::InMemoryGtsRepository;
 use types_registry_sdk::{RegisterResult, TypesRegistryClient};

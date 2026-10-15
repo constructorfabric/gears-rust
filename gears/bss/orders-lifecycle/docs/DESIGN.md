@@ -6757,7 +6757,7 @@ transaction; failed/reserved attempts and their receipts remain operational evid
 | Legacy requirement | D-192 disposition |
 |---|---|
 | Seller, plan and revision | Retained exactly in `receipt.query.tenant_axes` and plan/revision fields; authorized origin remains mandatory |
-| Currency, minor digits, rounding | Retained as accepted market/price currency and each binding's `invoice.currency_scale` / `invoice.rounding`; require agreement where the consumer requires a common currency, never guess from currency code |
+| Currency, minor digits, rounding | Retained as each price's `currency` (code and the scale it was priced at, a `bss_money::CurrencySpec`; one code and scale across the receipt, D-213) and each binding's `invoice.rounding`; require agreement where the consumer requires a common currency, never guess from currency code |
 | SKU version and descriptors | Retain `sku_id`, `sku_version`, code/name/unit/meter and complete invoice/policy values exactly. No activation-time SKU-head lookup replaces them |
 | Invoice template, GL, tax category and timing | **Values remain required** as supplied by `InvoiceInputs`, with template digest and `template_source`. Missing required GL/tax/timing/template facts are an incomplete input, not optional provenance |
 | Source of GL/tax/timing | Retired as a mandatory commercial field: current SDK supplies values but not those source labels. May be separate producer-backed diagnostics; never invent `source = sku_version` or null placeholders |

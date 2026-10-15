@@ -186,6 +186,77 @@ fn issuer_hashes_do_not_replace_exact_binding_comparison() {
     );
 }
 #[test]
+fn one_currency_at_one_scale_across_the_receipt() {
+    use bss_pricing_sdk::{
+        digest,
+        read::{BindingSelection, ResolvedBindings, ResolvedCell},
+    };
+    let golden = OrderPin::decode(GOLDEN.as_bytes()).unwrap();
+    // Issuer digests are recomputed, so only the scale rule (bss_money `ensure_same`) refuses.
+    let mut receipt = golden.receipt().clone();
+    receipt.bindings[1].price.currency = bss_money::CurrencySpec::try_new("EUR".into(), 3).unwrap();
+    for b in &mut receipt.bindings {
+        b.price.money_digest = digest::money_digest(&b.price);
+    }
+    let resolved = ResolvedBindings {
+        plan_id: receipt.query.plan_id,
+        revision_id: receipt.query.plan_revision_id,
+        cells: receipt
+            .bindings
+            .iter()
+            .map(|b| ResolvedCell {
+                selection: BindingSelection {
+                    item_id: b.item_id,
+                    dimension_value: b.dimension_value.clone(),
+                },
+                binding: Some(b.clone()),
+            })
+            .collect(),
+    };
+    receipt.query.resolved_bindings_digest =
+        digest::selected_bindings_digest(&resolved, &receipt.query.selections).unwrap();
+    receipt.request_digest = digest::request_digest(&receipt.query);
+    receipt.terms_digest = digest::terms_digest(&receipt.query, &receipt.bindings);
+    let assessment = AssessmentRef {
+        assessment_id: uuid::Uuid::from_u128(30),
+        assessed_at: receipt.accepted_at,
+        resolve_date: receipt.accepted_at.date(),
+    };
+    let selected = AcceptedVersionRef {
+        order_id: receipt.query.order_id,
+        order_version: OrderVersion::try_from(2).unwrap(),
+        line_id: receipt.query.line_id,
+    };
+    assert_eq!(
+        OrderPin::new(assessment, selected.clone(), receipt.clone()),
+        Err(CodecError::Mismatch)
+    );
+    // The same receipt at one scale is accepted.
+    for b in &mut receipt.bindings {
+        b.price.currency = bss_money::CurrencySpec::try_new("EUR".into(), 3).unwrap();
+        b.price.money_digest = digest::money_digest(&b.price);
+    }
+    let resolved = ResolvedBindings {
+        cells: receipt
+            .bindings
+            .iter()
+            .map(|b| ResolvedCell {
+                selection: BindingSelection {
+                    item_id: b.item_id,
+                    dimension_value: b.dimension_value.clone(),
+                },
+                binding: Some(b.clone()),
+            })
+            .collect(),
+        ..resolved
+    };
+    receipt.query.resolved_bindings_digest =
+        digest::selected_bindings_digest(&resolved, &receipt.query.selections).unwrap();
+    receipt.request_digest = digest::request_digest(&receipt.query);
+    receipt.terms_digest = digest::terms_digest(&receipt.query, &receipt.bindings);
+    assert!(OrderPin::new(assessment, selected, receipt).is_ok());
+}
+#[test]
 fn calendar_terms_preserve_intent_and_never_approximate_days() {
     use TermIntent::{Calendar, Missing, Periods, Rolling};
     assert_eq!(

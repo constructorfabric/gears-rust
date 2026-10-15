@@ -101,7 +101,8 @@ pub(super) struct ImmutablePriceDef {
     price_book_entry_id: Uuid,
     #[serde(with = "crate::commercial::scalars::digest")]
     money_digest: Digest,
-    currency: String,
+    #[serde(with = "currency_spec")]
+    currency: bss_money::CurrencySpec,
     #[serde(with = "PriceModelDef")]
     model: PriceModel,
     #[serde(with = "bss_money::serde_text::option")]
@@ -202,7 +203,6 @@ pub(super) struct InvoiceInputsDef {
     tax_category: String,
     #[serde(with = "BillingTimingDef")]
     timing: BillingTiming,
-    currency_scale: u32,
     #[serde(with = "RoundingDef")]
     rounding: Rounding,
 }
@@ -447,6 +447,34 @@ mod vec_accepted_binding {
             .into_iter()
             .map(|v| v.0)
             .collect())
+    }
+}
+/// The price currency as one object, `{"code", "scale"}`: the code and the scale it was priced at
+/// (Pricing D-421), validated by `CurrencySpec` on read.
+mod currency_spec {
+    use super::{Deserialize, Serialize};
+    use bss_money::CurrencySpec;
+    #[derive(Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Wire {
+        code: String,
+        scale: u8,
+    }
+    pub fn serialize<S: serde::Serializer>(
+        value: &CurrencySpec,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        Wire {
+            code: value.code().to_owned(),
+            scale: value.scale(),
+        }
+        .serialize(serializer)
+    }
+    pub fn deserialize<'de, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<CurrencySpec, D::Error> {
+        let wire = Wire::deserialize(deserializer)?;
+        CurrencySpec::try_new(wire.code, wire.scale).map_err(serde::de::Error::custom)
     }
 }
 mod option_date {
