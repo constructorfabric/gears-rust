@@ -607,7 +607,7 @@ mod tests {
     }
 
     /// Same contract for the plain `PostgreSQL` image the Rust integration
-    /// suites run (`postgres()`): the self-managed `bss-orders-lifecycle` E2E
+    /// suites run (`postgres()`): the self-managed `bss-orders` E2E
     /// lane must exercise the same major, or its migrations and role grants are
     /// validated against one server and run against another.
     #[test]

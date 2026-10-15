@@ -329,7 +329,7 @@ Tariff evaluation **MUST** expose a conceptual evaluation contract that, for a g
 **Selected target reconciliation, Orders D-197 (2026-10-05); implementation remains missing.**
 Rating **MUST** expose an authorized, nonbinding pre-purchase evaluation SDK over the exact
 selected native Pricing bindings, quantities, market and Subscriptions-resolved term/BillingTerms
-specified by [the joint purchase contract](../../orders-lifecycle/docs/DESIGN.md#contract-03-rating-purchase-evaluation).
+specified by [the joint purchase contract](../../orders/docs/DESIGN.md#contract-03-rating-purchase-evaluation).
 No subscription, activated cohort, receipt or complete billing snapshot is invented. The request
 fixes assessment/line/revision identity and producer digests; Rating does not select a successor
 or return the obsolete catalog-version/cohort prefix as purchase authority.

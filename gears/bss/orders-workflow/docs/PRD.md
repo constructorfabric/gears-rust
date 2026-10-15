@@ -1226,7 +1226,7 @@ Until the Generic Approval service exists, criteria **1–4a** (including **2a**
 | **Compensation gaps on partially provisioned multi-line orders**: If a step is not classified, or a compensable step has no declared action, permanent failure leaves subscriptions active with no rollback path. | Stranded subscriptions are billed to the customer without delivering service; no manual task may exist for operator remediation. | §6.4 requires classification (this phase: both waves compensable) and a declared action for compensable steps. Uncompletable compensation follows the escalation path. Manual tasks are required for every permanent failure with 100% coverage. |
 | **Canon fork conflict** (closed 2026-09-01): the BSS gears this PRD cites (subscriptions / rating / pricing) previously lived only in a pre-merge checkout, so citations were pinned by organisation and SHA. | Was: the implementation team could work from a different spec baseline, and Orders Workflow decisions could conflict with decisions taken on the fork. | Resolved — those gears are now resolved in-repo and §17 cites them by repository path rather than by external pin. The remaining unpinned dependency is the approval-service gear, whose PRD is still a stub; that exposure is carried by the separate approval-dependency risk below, not by this one. |
 
-**Orders seam naming reconciliation (S1-01):** use the [source-qualified semantic alias map](../../orders-lifecycle/docs/UPSTREAM_REQS.md#subscription-seam-alias-map) when joining these obligations to Lifecycle or Workflow. Bare SUB-O numbers are not cross-document API identities; existing IDs and unresolved delivery status are preserved.
+**Orders seam naming reconciliation (S1-01):** use the [source-qualified semantic alias map](../../orders/docs/UPSTREAM_REQS.md#subscription-seam-alias-map) when joining these obligations to Lifecycle or Workflow. Bare SUB-O numbers are not cross-document API identities; existing IDs and unresolved delivery status are preserved.
 
 ## 17. Reference Materials
 
@@ -1302,7 +1302,7 @@ flowchart TD
 ```
 
 
-**D-198 target reconciliation (2026-10-05; runtime/peer conformance pending):** Workflow coordinates the [Orders receiver admission protocol](../../orders-lifecycle/docs/DESIGN.md#contract-06-activation-admission). Exact committed version/receipt linkage and durable fulfillment-attempt generation govern dispatch. Subscriptions reserves capacity before asynchronous OSS provisioning and checks its receiver fence again on confirmation. Post-spawn hold/ordinary terminal operations require full receiver pause/revoke and target/create-key settlement evidence before Orders becomes effectively held/terminal; no remote read alone is a fence. Existing active subscriptions survive order hold. Unknown outcomes retain slots and reconciliation; D-182 forced unknown failure is explicitly exceptional. This target adds no public Orders state or endpoint and does not assert delivered SDKs/implementation.
+**D-198 target reconciliation (2026-10-05; runtime/peer conformance pending):** Workflow coordinates the [Orders receiver admission protocol](../../orders/docs/DESIGN.md#contract-06-activation-admission). Exact committed version/receipt linkage and durable fulfillment-attempt generation govern dispatch. Subscriptions reserves capacity before asynchronous OSS provisioning and checks its receiver fence again on confirmation. Post-spawn hold/ordinary terminal operations require full receiver pause/revoke and target/create-key settlement evidence before Orders becomes effectively held/terminal; no remote read alone is a fence. Existing active subscriptions survive order hold. Unknown outcomes retain slots and reconciliation; D-182 forced unknown failure is explicitly exceptional. This target adds no public Orders state or endpoint and does not assert delivered SDKs/implementation.
 
 The D-198 internal durable pause/revoke coordination port narrowly amends the former Lifecycle-to-Workflow call prohibition for this control protocol only; approval/payment verdict ownership and absence of synchronous verdict queries remain unchanged. The port and authenticated receiver-evidence SDK are implementation prerequisites, not existing public endpoints.
 
@@ -1311,6 +1311,6 @@ The D-198 internal durable pause/revoke coordination port narrowly amends the fo
 Use the semantic operation and historical alias matrix.
 The matrix preserves SUB-O IDs as provenance, never as ambiguous callable API names. Internal
 rebuild is a guarded engine continuation; normal worker restart reuses its existing attempt.
-For activation clocks and failure mapping use the [normative receiver clock contract](../../orders-lifecycle/docs/DESIGN.md#contract-06-activation-clocks)
-and [acknowledgement enumeration](../../orders-lifecycle/docs/features/06-workflow-seam.md#contract-06-4-4).
+For activation clocks and failure mapping use the [normative receiver clock contract](../../orders/docs/DESIGN.md#contract-06-activation-clocks)
+and [acknowledgement enumeration](../../orders/docs/features/06-workflow-seam.md#contract-06-4-4).
 These contracts do not establish deployed owner SDK support.

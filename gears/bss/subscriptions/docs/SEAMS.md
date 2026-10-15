@@ -160,7 +160,7 @@
 
 ---
 
-**Orders seam naming reconciliation (S1-01):** use the [source-qualified semantic alias map](../../orders-lifecycle/docs/UPSTREAM_REQS.md#subscription-seam-alias-map) when joining these obligations to Lifecycle or Workflow. Bare SUB-O numbers are not cross-document API identities; existing IDs and unresolved delivery status are preserved.
+**Orders seam naming reconciliation (S1-01):** use the [source-qualified semantic alias map](../../orders/docs/UPSTREAM_REQS.md#subscription-seam-alias-map) when joining these obligations to Lifecycle or Workflow. Bare SUB-O numbers are not cross-document API identities; existing IDs and unresolved delivery status are preserved.
 
 ## Ownership matrix (contested / adjacent responsibilities)
 
@@ -272,9 +272,9 @@ the design set — each slice implements the Subscriptions side of the seams lis
 The receiver contract matrix preserves historical
 SUB-O aliases and names each semantic operation. All activation writers (direct, Orders,
 resume, transfer and key-changing plan change) obey the shared capacity/fence protocol.
-An Orders draft rebuild requires the [engine-issued successor](../../orders-lifecycle/docs/DESIGN.md#contract-06-replace-fulfillment-grant);
+An Orders draft rebuild requires the [engine-issued successor](../../orders/docs/DESIGN.md#contract-06-replace-fulfillment-grant);
 closed generations never reopen and completed members are not recreated. Intent admission and
-applied confirmation use the [separate clock contract](../../orders-lifecycle/docs/DESIGN.md#contract-06-activation-clocks).
+applied confirmation use the [separate clock contract](../../orders/docs/DESIGN.md#contract-06-activation-clocks).
 Hold pauses pending confirmation; it preserves already active service. Late OSS effects remain
 reconcilable with uncertain claims retained. These are normative receiver requirements;
 provider SDK implementation and deployed conformance remain separate delivery work.

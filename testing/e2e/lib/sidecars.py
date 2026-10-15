@@ -69,7 +69,7 @@ def timescaledb_tag() -> str:
 
 # The PostgreSQL pin, mirrored from libs/test-containers/src/lib.rs (`postgres()`,
 # POSTGRES_TAG, ENV_POSTGRES_TAG): the image the Rust PostgreSQL integration suites run, so a
-# self-managed E2E lane (bss-orders-lifecycle) exercises the same major. The Rust test
+# self-managed E2E lane (bss-orders) exercises the same major. The Rust test
 # `e2e_sidecar_pins_the_same_postgres_image` fails the build if any of the three drifts.
 POSTGRES_IMAGE = "postgres"
 POSTGRES_TAG = "18-alpine"

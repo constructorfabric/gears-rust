@@ -250,7 +250,7 @@ the **coordination lease library** for the singleton `IntentScheduler` firing an
 7. `OssCoordinator`: where the edge provisions/deprovisions, issue the work order and coordinate confirmation (§4.5 — confirmation is event-driven; the OSS-blocking edge classes run asynchronously, see the async note below).
 8. Commit atomically: new `status`/attributes + `version` increment + `SubscriptionRevision` + `AuditRecord` + entitlement issue/revoke (slice 05) + outbox events — sequenced by `OrderingSequencer`.
 
-**D-198 target admission (not implemented):** reserve canonical-key capacity with the activation intent before issuing OSS work; keep it through unknown outcomes. Both intent admission and active confirmation serialize with the durable receiver attempt pause/revoke fence. Late confirmations after closure reconcile externally and cannot commit active. All Orders-originated work requires exact committed version/receipt and authorized Workflow generation. See the [cross-service receiver protocol](../../../orders-lifecycle/docs/DESIGN.md#contract-06-activation-admission); SDK/grants/conformance remain pending.
+**D-198 target admission (not implemented):** reserve canonical-key capacity with the activation intent before issuing OSS work; keep it through unknown outcomes. Both intent admission and active confirmation serialize with the durable receiver attempt pause/revoke fence. Late confirmations after closure reconcile externally and cannot commit active. All Orders-originated work requires exact committed version/receipt and authorized Workflow generation. See the [cross-service receiver protocol](../../../orders/docs/DESIGN.md#contract-06-activation-admission); SDK/grants/conformance remain pending.
 
 **Async note (OSS-blocking edges).** Edges that require OSS provisioning confirmation (`activate`, `suspend`/`resume` with resource legs, `cancel` deprovision) are **not** in the synchronous sub-second class: the `TransitionRequest` commits its *intent* synchronously (`approved`, work order issued) and the status edge commits when the confirmation event arrives; the client tracks `pending → approved → applied`. On confirmation timeout (Design timers) the request fails `oss_unconfirmed` and the work order is **idempotently cancelled**; a confirmation arriving after the timeout hits the cancelled order and is reconciled (compensating deprovision work order + audit) — no orphaned resource without a committed transition. **No-op deprovision (SUB-D-22, 2026-08-01):** a `cancel` whose deprovision targets resources a prior transition's **recorded work-order outcome** already deprovisioned (e.g. the SUB-D-16 dwell cancel after a deprovisioning suspend) has **no OSS-blocking leg** — the firing consults the persisted outcome and commits synchronously; only still-provisioned/paused resources put the edge in the async class.
 
@@ -420,9 +420,9 @@ firings and the `RenewalJob` (slice 04).
 The receiver contract matrix preserves historical
 SUB-O aliases and names each semantic operation. All activation writers (direct, Orders,
 resume, transfer and key-changing plan change) obey the shared capacity/fence protocol.
-An Orders draft rebuild requires the [engine-issued successor](../../../orders-lifecycle/docs/DESIGN.md#contract-06-replace-fulfillment-grant);
+An Orders draft rebuild requires the [engine-issued successor](../../../orders/docs/DESIGN.md#contract-06-replace-fulfillment-grant);
 closed generations never reopen and completed members are not recreated. Intent admission and
-applied confirmation use the [separate clock contract](../../../orders-lifecycle/docs/DESIGN.md#contract-06-activation-clocks).
+applied confirmation use the [separate clock contract](../../../orders/docs/DESIGN.md#contract-06-activation-clocks).
 Hold pauses pending confirmation; it preserves already active service. Late OSS effects remain
 reconcilable with uncertain claims retained. These are normative receiver requirements;
 provider SDK implementation and deployed conformance remain separate delivery work.

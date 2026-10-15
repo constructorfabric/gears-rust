@@ -2126,7 +2126,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "cf-gears-bss-orders-lifecycle"
+name = "cf-gears-bss-orders"
 version = "0.0.0"
 dependencies = [
  "anyhow",
@@ -2138,7 +2138,7 @@ dependencies = [
  "cf-gears-api-gateway",
  "cf-gears-authz-resolver",
  "cf-gears-authz-resolver-sdk",
- "cf-gears-bss-orders-lifecycle-sdk",
+ "cf-gears-bss-orders-sdk",
  "cf-gears-event-broker",
  "cf-gears-event-broker-sdk",
  "cf-gears-rules-authz-plugin",
@@ -2180,7 +2180,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "cf-gears-bss-orders-lifecycle-sdk"
+name = "cf-gears-bss-orders-sdk"
 version = "0.0.0"
 dependencies = [
  "async-trait",
@@ -2804,7 +2804,7 @@ dependencies = [
  "cf-gears-authz-resolver",
  "cf-gears-bss-approvals",
  "cf-gears-bss-ledger",
- "cf-gears-bss-orders-lifecycle",
+ "cf-gears-bss-orders",
  "cf-gears-bss-pricing",
  "cf-gears-bss-products",
  "cf-gears-bss-rate-provider",

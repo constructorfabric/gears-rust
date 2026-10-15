@@ -177,8 +177,8 @@ members = [
     "gears/bss/pricing/pricing-sdk",
     "gears/bss/products/products",
     "gears/bss/products/products-sdk",
-    "gears/bss/orders-lifecycle/orders-lifecycle",
-    "gears/bss/orders-lifecycle/orders-lifecycle-sdk",
+    "gears/bss/orders/orders",
+    "gears/bss/orders/orders-sdk",
     "gears/bss/approvals/approvals",
     "gears/bss/approvals/approvals-sdk",
     "gears/bss/rate-provider/rate-provider-sdk",
@@ -439,7 +439,7 @@ bss-pricing = { package = "cf-gears-bss-pricing", path = "gears/bss/pricing/pric
 # because neither crate is a release artifact and the gear that consumes it is
 # not published either.
 bss-products-sdk = { package = "cf-gears-bss-products-sdk", path = "gears/bss/products/products-sdk" }
-bss-orders-lifecycle-sdk = { package = "cf-gears-bss-orders-lifecycle-sdk", path = "gears/bss/orders-lifecycle/orders-lifecycle-sdk" }
+bss-orders-sdk = { package = "cf-gears-bss-orders-sdk", path = "gears/bss/orders/orders-sdk" }
 # The approvals inbox. Same WIP posture as pricing: no `version`, because neither
 # crate is a release artifact yet.
 bss-approvals-sdk = { package = "cf-gears-bss-approvals-sdk", path = "gears/bss/approvals/approvals-sdk" }
