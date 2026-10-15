@@ -18,7 +18,7 @@ use toolkit_db::secure::DBRunner;
 use toolkit_security::AccessScope;
 use uuid::Uuid;
 
-use crate::audit::{AuditOperation, AuditRecord, AuditSink, AuditValue};
+use crate::audit::{ActorTenant, AuditOperation, AuditRecord, AuditSink, AuditValue};
 use crate::domain::category::repo::CategoryRepository;
 use crate::domain::category::visibility;
 use crate::domain::contribution::SettingTypeRegistrar;
@@ -996,6 +996,7 @@ where
                         needs_review: detail.is_some(),
                         needs_review_detail: detail,
                         set_by: row.set_by.clone(),
+                        set_by_tenant: row.set_by_tenant,
                     },
                 )
                 .await?;
@@ -1375,6 +1376,7 @@ where
             declaration.key.as_str(),
             None,
             actor.subject(),
+            ActorTenant::of(actor.tenant()),
             operation,
             actor.request_id.clone(),
         );

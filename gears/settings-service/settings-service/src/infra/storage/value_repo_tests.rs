@@ -200,6 +200,7 @@ async fn a_subject_bound_flagged_row_is_neither_listed_for_review_nor_a_flag_at_
             created_at: Set(at),
             updated_at: Set(at),
             set_by: Set("identity-model".to_owned()),
+            set_by_tenant: Set(None),
         },
         &AccessScope::allow_all(),
         &conn,

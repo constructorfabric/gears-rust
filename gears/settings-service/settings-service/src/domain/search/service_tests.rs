@@ -81,6 +81,7 @@ fn override_row(declaration_id: Uuid, tenant: Uuid, value: Value) -> StoredValue
         last_change_at: at(1),
         updated_at: at(1),
         set_by: "admin".to_owned(),
+        set_by_tenant: None,
     }
 }
 

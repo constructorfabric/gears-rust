@@ -5,7 +5,8 @@ use settings_service_sdk::SettingKey;
 use time::{Duration, OffsetDateTime};
 
 use super::{
-    ActorClassification, AuditOperation, AuditOutcome, AuditRecord, AuditValue, retention_horizon,
+    ActorClassification, ActorTenant, AuditOperation, AuditOutcome, AuditRecord, AuditValue,
+    retention_horizon,
 };
 
 fn key() -> SettingKey {
@@ -18,6 +19,7 @@ fn record() -> AuditRecord {
         key().as_str(),
         Some(uuid::Uuid::nil()),
         "admin@acme",
+        ActorTenant::machine(),
         AuditOperation::Change,
         "req-1",
     )
