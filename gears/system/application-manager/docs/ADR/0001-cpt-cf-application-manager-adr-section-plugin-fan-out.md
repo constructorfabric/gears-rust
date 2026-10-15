@@ -3,6 +3,7 @@ status: proposed
 date: 2026-09-30
 description: Every section plugin takes part in each seed and uninstall, and section plugins are discovered once at startup into an in-memory key map and priority order
 ---
+<!-- Created: 2026-10-05 by Constructor Tech -->
 # Every Section Plugin Participates, Discovered Once at Startup
 
 

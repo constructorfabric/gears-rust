@@ -3,6 +3,7 @@ status: proposed
 date: 2026-09-30
 description: The registry keeps one minimal, rebuildable entry per seeded application, holding its id, version, last result, last seed time and audit id
 ---
+<!-- Created: 2026-10-05 by Constructor Tech -->
 # Keep a Minimal, Rebuildable Application Registry
 
 
@@ -59,7 +60,7 @@ The decision has these parts:
 * **Re-seed carries no diff meaning.** A re-seed simply overwrites the entry with the newest values. The gear does not compare the new version with the old one, does not record what changed and does not decide whether a re-seed is an upgrade, a downgrade or a repeat.
 * **Uninstall.** Once an uninstall is accepted (authorized, application found, request hand-off accepted by the audit plugin), the entry is deleted, whatever the section plugins return. Section plugin outcomes of an uninstall live only in the response and the audit event. The last seeded version is read from the entry before deletion and passed to the section plugins.
 * **Recovery.** The registry is a rebuildable view of the last seeds. Recovery, including repair after a registry write failed post-dispatch, is a re-seed by each application's seeding caller.
-* **Storage scoping.** The table also carries `owner_tenant_id`, a secure-ORM scoping value that is always the platform root tenant. It is not application data and not per-tenant ownership, and the sentence "nothing else of the application is stored" refers to application data.
+* **Storage scoping.** The registry is a platform-wide entity with no tenant scoping value; its table carries no tenant column ([ADR 0007](./0007-cpt-cf-application-manager-adr-no-root-tenant.md)).
 * **Scope.** The registry is one platform-wide set held in platform storage, reachable only through the platform's access checks. It is not per tenant.
 
 Decision scope: this ADR covers what the registry stores, when an entry is written or deleted, what a re-seed means for it, and how it is recovered. It does not decide validation and dispatch ([ADR 0003](./0003-cpt-cf-application-manager-adr-validate-all-then-dispatch.md)), the audit id and audit storage ([ADR 0004](./0004-cpt-cf-application-manager-adr-audit-via-plugin.md)), how outcomes are reported over HTTP ([ADR 0006](./0006-cpt-cf-application-manager-adr-outcome-http-mapping.md)), or concurrent seeds for the same application id, which [DESIGN §4.2](../DESIGN.md#42-concurrent-requests-for-the-same-application) resolves.
@@ -88,7 +89,7 @@ Impact by concern:
 
 ### Confirmation
 
-* Confirmation of storage scoping: the registry table carries the platform root tenant as its scoping value and no other tenant value.
+* Confirmation of storage scoping: the registry table carries no tenant column.
 * Review of record: the registry section of the [DESIGN](../DESIGN.md) matches the field list above: no field beyond those named, and no manifest or section content.
 * Tests that compare the registry before and after each outcome that ends before dispatch (unchanged) and each outcome after dispatch (created or updated, with the correct last result).
 * A test that deletes the entry on an accepted uninstall regardless of section plugin outcomes, and leaves it unchanged on a not permitted, unavailable or not found uninstall.
@@ -147,6 +148,7 @@ Related decisions:
 * [ADR 0003](./0003-cpt-cf-application-manager-adr-validate-all-then-dispatch.md): validation before dispatch and the ordered dispatch whose section outcomes yield the last result value.
 * [ADR 0006](./0006-cpt-cf-application-manager-adr-outcome-http-mapping.md): how outcome categories, ranked by `cpt-cf-application-manager-fr-outcome-precedence`, are reported over HTTP, with partial failure reported as an error.
 * [ADR 0004](./0004-cpt-cf-application-manager-adr-audit-via-plugin.md): the audit plugin issues the audit id at the request hand-off, and owns audit storage and exposure.
+* [ADR 0007](./0007-cpt-cf-application-manager-adr-no-root-tenant.md): the registry and operation records are platform-wide, with no tenant scoping value; the PDP decides platform-level permission.
 
 Review and supersession: revisit this decision if a consumer needs history of past seeds or per-section applied state in the gear itself, or if per-tenant installs enter scope. Either change would supersede this ADR and would need to weigh the data, privacy and domain-logic costs recorded above. Concurrent seeds for the same application id are not decided here; they are resolved in [DESIGN §4.2](../DESIGN.md#42-concurrent-requests-for-the-same-application).
 

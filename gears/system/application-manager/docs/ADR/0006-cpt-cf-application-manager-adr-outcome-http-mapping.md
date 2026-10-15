@@ -3,6 +3,7 @@ status: proposed
 date: 2026-10-01
 description: Each outcome category of a seed or uninstall maps to one HTTP status, and a partial failure is reported as an error, never as success
 ---
+<!-- Created: 2026-10-05 by Constructor Tech -->
 # Map Each Outcome Category to One HTTP Status, With Partial Failure Reported as an Error
 
 
@@ -56,13 +57,13 @@ Every seed and uninstall request ends in exactly one outcome category, mapped as
 | Plugin rejected | 400 | At least one section plugin refused its section as unacceptable |
 | Not permitted | 403 | Platform access control refused the caller before dispatch, or a section plugin refused for lack of an extra permission after dispatch |
 | Not found | 404 | Uninstall named an unknown application; no section plugin was called |
-| Invalid manifest | 422 | Validation failed; nothing was dispatched |
+| Invalid manifest | 400 | Validation failed; nothing was dispatched |
 | Internal failure | 500 | A section plugin failed unexpectedly or exceeded the time limit, or the registry could not be updated after dispatch, or, after an accepted uninstall, the system could not delete the registry entry |
 | Temporarily unavailable | 503 | Platform access control, registry storage, the audit plugin (request hand-off) or a schema could not be reached; nothing was dispatched; retryable |
 
-Errors are returned in the platform's standard problem format. Invalid manifest is 422, kept apart from 400, so that "the manifest is malformed against the schemas" is never confused with "a section plugin refused a well-formed section". Requests the platform rejects before they reach the Application Manager (request protection, authentication, scope and license checks) get none of these outcomes. The gateway's own deadline-exceeded response is likewise outside the mapping of the gear and does not mean the request was abandoned: once the request hand-off is accepted, the request runs to its end, and its outcome is in the audit trail and in the registry listing.
+Errors are returned in the platform's standard problem format. Invalid manifest and plugin rejected share 400, as the platform's canonical error categories fix it, and are kept apart by canonical category: invalid manifest is `invalid_argument` with field violations, plugin rejected is `failed_precondition` with precondition violations. This way "the manifest is malformed against the schemas" is never confused with "a section plugin refused a well-formed section". Requests the platform rejects before they reach the Application Manager (request protection, authentication, scope and license checks) get none of these outcomes. The gateway's own deadline-exceeded response is likewise outside the mapping of the gear and does not mean the request was abandoned: once the request hand-off is accepted, the request runs to its end, and its outcome is in the audit trail and in the registry listing.
 
-Precedence is set by `cpt-cf-application-manager-fr-outcome-precedence` over the categories of `cpt-cf-application-manager-fr-outcome-categories`; this ADR gives only the status for each rank. Before dispatch: rank 1 (platform access control cannot answer, or registry storage cannot answer for a permitted caller) is 503, so a denied caller is 403 even when storage is down. Rank 2 is 403, rank 3 is 404, rank 4 is 503, rank 5 is 422. After dispatch: 403, then 400, then 500.
+Precedence is set by `cpt-cf-application-manager-fr-outcome-precedence` over the categories of `cpt-cf-application-manager-fr-outcome-categories`; this ADR gives only the status for each rank. Before dispatch: rank 1 (platform access control cannot answer, or registry storage cannot answer for a permitted caller) is 503, so a denied caller is 403 even when storage is down. Rank 2 is 403, rank 3 is 404, rank 4 is 503, rank 5 is 400. After dispatch: 403, then 400, then 500.
 
 A partial failure is never reported as success: 200 means every section succeeded. The per-section outcomes in the body carry the detail. The registry records the same distinction ("partially failed" when at least one section succeeded and at least one failed) as decided in [ADR 0005](./0005-cpt-cf-application-manager-adr-minimal-application-registry.md).
 
@@ -74,7 +75,7 @@ Decision scope: this ADR covers how each outcome category is reported over HTTP,
 * When a section schema is temporarily unavailable, the report names the section key with a reason: `unreachable`, `timed_out` or `unusable`. For `unusable` (a schema that declares another dialect, uses an external reference, or does not compile), retrying helps only after the section plugin is fixed.
 * Generic HTTP clients, deploy jobs and monitoring can treat any status that is not 2xx as a failure, so a partial failure stops a deploy job without body parsing.
 * When several sections fail in different ways, the status names only the category that ranks highest after dispatch; callers that need every failure read the per-section outcomes in the body.
-* The endpoint table of the [DESIGN](../DESIGN.md) must use exactly this mapping and keep 422 and 400 apart.
+* The endpoint table of the [DESIGN](../DESIGN.md) must use exactly this mapping and keep invalid manifest (`invalid_argument`) and plugin rejected (`failed_precondition`) apart by canonical category.
 * Carrying the outcome report in a failed response depends on the platform's problem format keeping the gear's extension member; the PRD lists it as a p1 dependency with a matching risk, and the [DESIGN](../DESIGN.md) records it as a pending platform dependency. Until it lands, a failed response carries the status and the problem detail only, and `cpt-cf-application-manager-fr-response-content` is not yet met for failed responses.
 
 Impact by concern:
@@ -87,7 +88,7 @@ Impact by concern:
 * Operations: the outcome category is an operator signal; monitoring can alert on 500 and 503 separately.
 * Testing: see Confirmation.
 * Compliance: the deterministic precedence and per-section outcomes give reviewers a reproducible account of each request. No personal data is added.
-* UX: this is a machine-facing interface with no screens. Callers act on the status: 422 to fix the manifest, 400 to fix a section, 403 to request access, 503 to retry, 500 to escalate.
+* UX: this is a machine-facing interface with no screens. Callers act on the status and canonical category: 400 `invalid_argument` to fix the manifest, 400 `failed_precondition` to fix a section, 403 to request access, 503 to retry, 500 to escalate.
 * Business: partial installs do not pass unnoticed through deploy jobs that check only the status.
 
 ### Confirmation
@@ -100,7 +101,7 @@ Impact by concern:
 
 ### One HTTP status per outcome category, partial failure reported as an error
 
-* Good, because callers can act on the category: 422 to fix the manifest, 400 to fix a section, 403 to request access, 503 to retry, 500 to escalate.
+* Good, because callers can act on the category: 400 `invalid_argument` to fix the manifest, 400 `failed_precondition` to fix a section, 403 to request access, 503 to retry, 500 to escalate.
 * Good, because a status class that is not 2xx makes deploy jobs and monitoring notice partial failures without parsing bodies.
 * Good, because the fixed precedence gives the same status in the same situation.
 * Neutral, because the per-section detail lives in the body, as in every other option.

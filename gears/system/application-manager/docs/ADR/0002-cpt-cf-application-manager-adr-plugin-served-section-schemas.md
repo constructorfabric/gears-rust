@@ -3,6 +3,7 @@ status: proposed
 date: 2026-09-30
 description: Section plugins serve the schemas of their own sections, the Application Manager fetches them on every seed without reuse, and every registered section is required
 ---
+<!-- Created: 2026-10-05 by Constructor Tech -->
 # Section Plugins Serve Their Own Schemas, Fetched on Every Seed, With Every Section Required
 
 

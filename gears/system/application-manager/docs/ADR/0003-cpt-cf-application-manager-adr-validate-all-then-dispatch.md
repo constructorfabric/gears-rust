@@ -3,6 +3,7 @@ status: proposed
 date: 2026-09-30
 description: Validate the whole manifest before any dispatch, then dispatch one section at a time in section-plugin priority order, continue after failures, and leave rollback to section plugins
 ---
+<!-- Created: 2026-10-05 by Constructor Tech -->
 # Validate the Whole Manifest, Then Dispatch in Priority Order
 
 
