@@ -19,8 +19,8 @@ use crate::api::rest::browse_narrowing::{
 };
 use crate::api::rest::page_dto::{PageDto, PageInfoDto};
 use crate::api::rest::setting_dto::{
-    AuditRecordDto, EffectiveValueDto, ReviewItemDto, SettingItemDto, is_shown_unmasked, render,
-    render_flagged, render_record,
+    AuditRecordDto, EffectiveValueDto, Reader, ReviewItemDto, SettingItemDto, is_shown_unmasked,
+    render, render_flagged, render_record,
 };
 use crate::api::rest::setting_filter::interpret;
 pub(crate) use crate::api::rest::setting_filter::unsupported;
@@ -129,6 +129,23 @@ pub(crate) async fn gate_target(
     })
 }
 
+/// The target's chain, root first, for the upward disclosure boundary to read
+/// what lies above the reader tenant off. A platform administrator has nothing
+/// above it, so its rendering needs no chain and none is asked for.
+///
+/// # Errors
+/// [`DomainError`] when a tenant reader's chain cannot be read.
+pub(crate) async fn target_chain(
+    resolver: &ConcreteResolver,
+    reader: Reader,
+    target: Uuid,
+) -> Result<Vec<Uuid>, DomainError> {
+    match reader {
+        Reader::Platform => Ok(Vec::new()),
+        Reader::Tenant(_) => resolver.chain_of(target).await,
+    }
+}
+
 /// Whether the caller may see `pii` values unmasked: a separate decision on
 /// the value resource, asked only when the page carries something it
 /// governs — a `pii` value, or a setter identity, which is an
@@ -210,7 +227,15 @@ pub async fn get_setting(
     let governed = effective.data_classification == "pii"
         || effective.trail.iter().any(|entry| entry.set_by.is_some());
     let pii = governed && may_read_pii(&enforcer, &ctx).await;
-    let dto: EffectiveValueDto = render(&effective, pii);
+    // @cpt-begin:cpt-cf-settings-service-flow-value-resolution-admin-read:p1:inst-vr-aread-13
+    // The reader is the caller's own tenant; what lies above it is collapsed
+    // and each identity is shown only where it belongs, per request, never in
+    // the cache.
+    let reader = Reader::new(ctx.subject_tenant_id(), resolver.root_tenant().await?);
+    // The target's chain: what is above the reader tenant is read off it.
+    let chain = target_chain(&resolver, reader, effective.tenant_id).await?;
+    let dto: EffectiveValueDto = render(&effective, pii, reader, &chain);
+    // @cpt-end:cpt-cf-settings-service-flow-value-resolution-admin-read:p1:inst-vr-aread-13
     let etag = dto.etag.clone();
     // @cpt-begin:cpt-cf-settings-service-flow-value-resolution-source-trail:p1:inst-vr-trail-9
     Ok(([(header::ETAG, super::etag_header(&etag))], Json(dto)))
@@ -227,10 +252,14 @@ fn browse_entry(
     declaration: &Declaration,
     outcome: Result<Arc<EffectiveValue>, DomainError>,
     pii: bool,
+    reader: Reader,
+    chain: &[Uuid],
 ) -> BrowseEntry {
     match outcome {
         Ok(effective) => (
-            SettingItemDto::resolved(render(&effective, pii))
+            // @cpt-begin:cpt-cf-settings-service-flow-value-resolution-admin-browse:p1:inst-vr-browse-16
+            SettingItemDto::resolved(render(&effective, pii, reader, chain))
+                // @cpt-end:cpt-cf-settings-service-flow-value-resolution-admin-browse:p1:inst-vr-browse-16
                 .with_mode(&declaration.mode)
                 .with_display_name(declaration.display_name.as_deref()),
             None,
@@ -281,6 +310,10 @@ struct NarrowedBrowse<'a> {
     /// Whether the caller reads `pii` unmasked: decided once, so the corpus of
     /// the declaration text and the rendering of every row agree.
     pii: bool,
+    /// Who the page is rendered for.
+    reader: Reader,
+    /// The target's chain, root first: what the reader tenant is above.
+    chain: &'a [Uuid],
     postgres: bool,
 }
 
@@ -310,13 +343,15 @@ fn qualify(
     outcome: Result<Arc<EffectiveValue>, DomainError>,
     needle: &Needle,
     pii: bool,
+    reader: Reader,
+    chain: &[Uuid],
 ) -> Result<Option<BrowseEntry>, DomainError> {
     // @cpt-begin:cpt-cf-settings-service-flow-value-resolution-admin-browse:p1:inst-vr-browse-11
     let readable = is_shown_unmasked(&declaration.data_classification, pii);
     match outcome {
         Ok(effective) => {
             // Rendered once: the entry is this rendering, kept or not.
-            let dto = render(&effective, pii);
+            let dto = render(&effective, pii, reader, chain);
             let qualifies =
                 text_matched || value_part_matches(&dto, effective.secret_backed, needle);
             Ok(qualifies.then(|| {
@@ -331,7 +366,7 @@ fn qualify(
         Err(err @ DomainError::Unavailable { .. }) if !text_matched && readable => Err(err),
         Err(err) => {
             let keep = text_matched || (readable && matches!(err, DomainError::Internal { .. }));
-            Ok(keep.then(|| browse_entry(declaration, Err(err), pii)))
+            Ok(keep.then(|| browse_entry(declaration, Err(err), pii, reader, chain)))
         }
     }
     // @cpt-end:cpt-cf-settings-service-flow-value-resolution-admin-browse:p1:inst-vr-browse-11
@@ -406,7 +441,15 @@ async fn narrowed_page<C: toolkit_db::secure::DBRunner>(
             rows.reverse();
         }
         for ((declaration, (text_matched, position)), outcome) in rows {
-            let qualified = match qualify(declaration, text_matched, outcome, ctx.needle, ctx.pii) {
+            let qualified = match qualify(
+                declaration,
+                text_matched,
+                outcome,
+                ctx.needle,
+                ctx.pii,
+                ctx.reader,
+                ctx.chain,
+            ) {
                 Ok(qualified) => qualified,
                 // The page is full and this row is only looked at to know
                 // whether a cursor is owed: one that may qualify owes it, and
@@ -577,6 +620,16 @@ pub async fn browse_settings(
     // the caller that something sits in the gap.
     let caller_chain = resolver.chain_of(ctx.subject_tenant_id()).await?;
     // @cpt-end:cpt-cf-settings-service-flow-value-resolution-admin-browse:p1:inst-vr-browse-6
+    let reader = Reader::new(ctx.subject_tenant_id(), root);
+    // One target per page: its chain is read once.
+    // When the target is the caller's own tenant it is the chain already read
+    // for the hidden-setting exclusion.
+    let target_tenant = target.tenant_id(root);
+    let target_chain = if target_tenant == ctx.subject_tenant_id() {
+        caller_chain.clone()
+    } else {
+        target_chain(&resolver, reader, target_tenant).await?
+    };
     let (mut items, page_info, total_count) = if let Some(needle) = &needle {
         // The entitlement is decided before the first batch: the corpus the
         // declaration text is matched in and the rendering of the value half
@@ -593,6 +646,8 @@ pub async fn browse_settings(
                 target,
                 needle,
                 pii,
+                reader,
+                chain: &target_chain,
                 // A flag, not the backend: the repository cannot read it from
                 // its connection; a wrong value is wrong-dialect SQL.
                 postgres: db.db().db_engine() == "postgres",
@@ -632,7 +687,8 @@ pub async fn browse_settings(
             .iter()
             .zip(outcomes)
             .map(|(declaration, outcome)| {
-                let (item, diagnostic) = browse_entry(declaration, outcome, pii);
+                let (item, diagnostic) =
+                    browse_entry(declaration, outcome, pii, reader, &target_chain);
                 log_failure(&declaration.key, diagnostic.as_deref());
                 item
             })
@@ -747,13 +803,16 @@ pub async fn list_review(
     // hierarchy and at most the subtree budget of tenants: a subtree the
     // budget cuts would hide rows silently, so the request is refused with the
     // bound named.
-    let (mut tenant_ids, truncated) = resolver
+    // The walk's parent links are kept: they are the path from the target down
+    // to each row's tenant, which the identity rule reads.
+    let walk = resolver
         .hierarchy()
-        .descendants_bfs(target_tenant, SUBTREE_BUDGET)
+        .subtree(target_tenant, SUBTREE_BUDGET)
         .await?;
-    if truncated {
+    if walk.truncated {
         return Err(subtree_too_large("tenant", "target's").into());
     }
+    let mut tenant_ids = walk.order.clone();
     tenant_ids.push(target_tenant);
     // @cpt-end:cpt-cf-settings-service-flow-value-resolution-review-list:p1:inst-vr-review-4
 
@@ -802,6 +861,14 @@ pub async fn list_review(
     // Every row names who set it, an administrator's identity, so the
     // entitlement is asked whenever the page has a row.
     let pii = !page.items.is_empty() && may_read_pii(&enforcer, &ctx).await;
+    // @cpt-begin:cpt-cf-settings-service-flow-value-resolution-review-list:p1:inst-vr-review-10
+    // The path from the reader tenant down to the target is the target's chain
+    // from the reader; each row's path extends it by the walk's parent links
+    // down to the row's tenant.
+    let reader = Reader::new(ctx.subject_tenant_id(), root);
+    let target_chain = resolver.chain_of(target_tenant).await?;
+    let to_target = reader.path_in(&target_chain);
+    // @cpt-end:cpt-cf-settings-service-flow-value-resolution-review-list:p1:inst-vr-review-10
     let items: Vec<ReviewItemDto> = page
         .items
         .iter()
@@ -818,8 +885,15 @@ pub async fn list_review(
                 );
                 return None;
             };
+            let mut path = to_target.to_vec();
+            path.extend(
+                walk.path_from(target_tenant, row.tenant_id)
+                    .into_iter()
+                    .skip(1),
+            );
+            let shown = reader.is_shown(row.set_by_tenant, &path);
             Some(
-                render_flagged(&declaration.key, &declaration.mode, row, root, pii)
+                render_flagged(&declaration.key, &declaration.mode, row, root, pii, shown)
                     .with_display_name(declaration.display_name.as_deref()),
             )
         })
@@ -921,10 +995,30 @@ pub async fn get_history(
         });
     let pii = needs_entitlement && may_read_pii(&enforcer, &ctx).await;
     // @cpt-begin:cpt-cf-settings-service-flow-audit-store-history:p1:inst-as-hist-9
+    // @cpt-begin:cpt-cf-settings-service-flow-audit-store-history:p1:inst-as-hist-10
+    // The path from the reader tenant down to the record's tenant is the
+    // target's chain from the reader. A definition record has no tenant, so
+    // its actor is on no path.
+    let reader = Reader::new(ctx.subject_tenant_id(), root);
+    let target_chain = resolver.chain_of(target.tenant_id(root)).await?;
+    let to_target = reader.path_in(&target_chain);
+    // @cpt-end:cpt-cf-settings-service-flow-audit-store-history:p1:inst-as-hist-10
     let items: Vec<AuditRecordDto> = page
         .items
         .iter()
-        .map(|r| render_record(r, values_are_pii, pii))
+        .map(|r| {
+            let path: &[Uuid] = if r.tenant_id.is_some() {
+                to_target
+            } else {
+                &[]
+            };
+            render_record(
+                r,
+                values_are_pii,
+                pii,
+                reader.is_shown(r.actor_tenant_id, path),
+            )
+        })
         .collect();
     Ok(Json(PageDto {
         items,

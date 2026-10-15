@@ -2427,10 +2427,20 @@ impl ValueRepository for BatchRecordingValues {
         value: Option<Value>,
         secret_ref: Option<String>,
         set_by: &str,
+        set_by_tenant: Option<Uuid>,
         expected: time::OffsetDateTime,
     ) -> Result<crate::domain::value::StoredValue, DomainError> {
         ValueRepo
-            .update(conn, scope, id, value, secret_ref, set_by, expected)
+            .update(
+                conn,
+                scope,
+                id,
+                value,
+                secret_ref,
+                set_by,
+                set_by_tenant,
+                expected,
+            )
             .await
     }
 

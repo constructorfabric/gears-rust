@@ -234,6 +234,7 @@ impl Harness {
                     needs_review: false,
                     needs_review_detail: None,
                     set_by: "an-admin".to_owned(),
+                    set_by_tenant: None,
                 },
             )
             .await

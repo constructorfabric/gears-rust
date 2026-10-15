@@ -183,6 +183,7 @@ fn select(
                 provided_value: winner.is_some_and(|w| w.tenant_id == *t),
                 needs_review: row.is_some_and(|r| r.needs_review),
                 set_by: row.map(|r| r.set_by.clone()),
+                set_by_tenant: row.and_then(|r| r.set_by_tenant),
                 last_change_at: row.map(|r| r.last_change_at),
             }
         })

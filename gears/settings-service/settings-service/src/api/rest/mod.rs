@@ -154,3 +154,7 @@ mod revival_surface_tests;
 #[cfg(test)]
 #[path = "value_surface_tests.rs"]
 mod value_surface_tests;
+
+#[cfg(test)]
+#[path = "boundary_surface_tests.rs"]
+mod boundary_surface_tests;

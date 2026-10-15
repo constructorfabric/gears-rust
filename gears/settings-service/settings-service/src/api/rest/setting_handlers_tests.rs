@@ -5,6 +5,7 @@ use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
 use super::{gate_target, interpret, qualify};
+use crate::api::rest::setting_dto::Reader;
 use crate::domain::error::DomainError;
 use crate::domain::resolution::ScopeTarget;
 use crate::test_support::ResolutionHarness;
@@ -205,29 +206,63 @@ async fn a_failed_candidate_is_decided_by_what_the_caller_could_have_seen() {
             Err(failure("unavailable")),
             &needle,
             entitled,
+            Reader::Platform,
+            &[],
         );
         assert!(matches!(outcome, Err(DomainError::Unavailable { .. })));
     }
     // A defect keeps its entry, as it does without `q`.
-    let kept = qualify(&public, false, Err(failure("internal")), &needle, false)
-        .expect("decided")
-        .expect("kept");
+    let kept = qualify(
+        &public,
+        false,
+        Err(failure("internal")),
+        &needle,
+        false,
+        Reader::Platform,
+        &[],
+    )
+    .expect("decided")
+    .expect("kept");
     assert_eq!(kept.0.outcome, "error");
     assert!(kept.0.effective.is_none());
     // What the caller could never match is left to the text.
     for (declaration, entitled) in [(&secret, true), (&pii, false)] {
         for kind in ["unavailable", "internal"] {
-            let outcome = qualify(declaration, false, Err(failure(kind)), &needle, entitled);
+            let outcome = qualify(
+                declaration,
+                false,
+                Err(failure(kind)),
+                &needle,
+                entitled,
+                Reader::Platform,
+                &[],
+            );
             assert!(matches!(outcome, Ok(None)), "{kind}");
         }
     }
     // A retired one qualifies by its text alone; a text match keeps any failure.
     assert!(matches!(
-        qualify(&public, false, Err(failure("retired")), &needle, true),
+        qualify(
+            &public,
+            false,
+            Err(failure("retired")),
+            &needle,
+            true,
+            Reader::Platform,
+            &[],
+        ),
         Ok(None)
     ));
     for kind in ["retired", "unavailable", "internal"] {
-        let outcome = qualify(&secret, true, Err(failure(kind)), &needle, false);
+        let outcome = qualify(
+            &secret,
+            true,
+            Err(failure(kind)),
+            &needle,
+            false,
+            Reader::Platform,
+            &[],
+        );
         assert!(matches!(outcome, Ok(Some(_))), "{kind}");
     }
 }

@@ -512,6 +512,7 @@ mod access {
                         tenant_id: tenant,
                         access,
                         set_by: "root-admin".to_owned(),
+                        set_by_tenant: None,
                     },
                     None,
                 )
@@ -1149,6 +1150,7 @@ async fn the_named_keys_a_caller_may_see_come_from_one_read_through_the_pages_ow
                     tenant_id: h.tree.a,
                     access: TenantAccess::Hidden,
                     set_by: "test".to_owned(),
+                    set_by_tenant: None,
                 },
                 None,
             )

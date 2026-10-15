@@ -243,6 +243,41 @@ pub async fn sqlite_provider_recorded() -> (Arc<DBProvider<DbError>>, QueryRecor
     (migrated(db).await, recorder)
 }
 
+/// A second, raw view of a file-backed `SQLite` database: what a test reads
+/// a stored column through, or rewrites a row with, where no repository
+/// reaches — a column the entity has no field for yet, a row as an older
+/// release left it. The file is removed with the probe.
+pub struct Probe {
+    pub raw: sea_orm::DatabaseConnection,
+    paths: Vec<std::path::PathBuf>,
+}
+
+impl Drop for Probe {
+    fn drop(&mut self) {
+        for path in &self.paths {
+            std::fs::remove_file(path).ok();
+        }
+    }
+}
+
+/// As [`sqlite_provider`], over a file a [`Probe`] also opens.
+pub async fn sqlite_provider_probed() -> (Arc<DBProvider<DbError>>, Probe) {
+    let file = std::env::temp_dir().join(format!("settings-service-probe-{}.db", Uuid::new_v4()));
+    let url = format!("sqlite://{}?mode=rwc", file.display());
+    let db = connect_db(&url, sqlite_opts())
+        .await
+        .expect("a file-backed sqlite connects");
+    let provider = migrated(db).await;
+    let raw = sea_orm::Database::connect(&url)
+        .await
+        .expect("the probe connects to the same file");
+    let paths = ["", "-wal", "-shm", "-journal"]
+        .iter()
+        .map(|suffix| std::path::PathBuf::from(format!("{}{suffix}", file.display())))
+        .collect();
+    (provider, Probe { raw, paths })
+}
+
 fn sqlite_opts() -> ConnectOpts {
     ConnectOpts {
         max_conns: Some(1),
@@ -326,6 +361,20 @@ impl FakeHierarchy {
     /// Add a tenant below `parent` to a tree already handed out.
     pub fn add_tenant(&self, id: Uuid, parent: Uuid) {
         self.parents.lock().expect("lock").insert(id, Some(parent));
+    }
+
+    /// Move a tenant to another parent in a tree already handed out; the
+    /// tenant's own subtree goes with it. `add_tenant` overwrites the parent
+    /// too, so this is the same operation under the name a re-parent test
+    /// reads.
+    pub fn reparent(&self, id: Uuid, new_parent: Uuid) {
+        self.add_tenant(id, new_parent);
+    }
+
+    /// Delete a tenant from a tree already handed out: it is on no chain and
+    /// in no subtree from then on.
+    pub fn remove_tenant(&self, id: Uuid) {
+        self.parents.lock().expect("lock").remove(&id);
     }
 
     /// Every tenant below `tenant` that administration from it can reach:
@@ -541,6 +590,13 @@ impl ResolutionHarness {
     pub async fn recorded() -> (Self, QueryRecorder) {
         let (db, recorder) = sqlite_provider_recorded().await;
         (Self::over(db, Duration::from_secs(30)).await, recorder)
+    }
+
+    /// A harness over a file-backed database, with the probe that reads it
+    /// raw.
+    pub async fn probed() -> (Self, Probe) {
+        let (db, probe) = sqlite_provider_probed().await;
+        (Self::over(db, Duration::from_secs(30)).await, probe)
     }
 
     async fn over(db: Arc<DBProvider<DbError>>, ttl: Duration) -> Self {
@@ -961,6 +1017,10 @@ impl ResolutionHarness {
                     needs_review: flagged,
                     needs_review_detail: flagged.then(|| "no longer validates".to_owned()),
                     set_by: format!("admin-of-{tenant}"),
+                    // A row the repository inserts directly records no setter
+                    // tenant: what an older release left, which the boundary
+                    // withholds from every reader but a platform administrator.
+                    set_by_tenant: None,
                 },
             )
             .await
@@ -987,6 +1047,7 @@ impl ResolutionHarness {
             created_at: sea_orm::ActiveValue::Set(at),
             updated_at: sea_orm::ActiveValue::Set(at),
             set_by: sea_orm::ActiveValue::Set("subject-admin".to_owned()),
+            set_by_tenant: sea_orm::ActiveValue::Set(None),
         };
         toolkit_db::secure::secure_insert::<crate::infra::storage::entity::setting_value::Entity>(
             active,
@@ -1380,6 +1441,10 @@ pub struct RestHarness {
     pub published: Arc<RecordingPublisher>,
     /// The setting types the declaration admin registered.
     pub registrar: Arc<RecordingRegistrar>,
+
+    /// The raw view of the database, on a harness built with
+    /// [`RestHarness::probed`].
+    pub probe: Option<Probe>,
     router: axum::Router,
 }
 
@@ -1448,7 +1513,13 @@ impl RestHarness {
         pdp: Arc<dyn authz_resolver_sdk::AuthZResolverApi>,
         step_up: Arc<dyn crate::domain::stepup::StepUpVerifier>,
     ) -> Self {
-        Self::build_with(pdp, step_up, resolution_catalogue()).await
+        Self::build_over(
+            ResolutionHarness::new().await,
+            None,
+            pdp,
+            step_up,
+            resolution_catalogue(),
+        )
     }
 
     async fn build_with(
@@ -1456,7 +1527,64 @@ impl RestHarness {
         step_up: Arc<dyn crate::domain::stepup::StepUpVerifier>,
         admin_catalogue: FakeSource,
     ) -> Self {
-        let inner = ResolutionHarness::new().await;
+        Self::build_over(
+            ResolutionHarness::new().await,
+            None,
+            pdp,
+            step_up,
+            admin_catalogue,
+        )
+    }
+
+    /// The same surface over a file-backed database a test can also read and
+    /// rewrite raw, through [`RestHarness::probe_query`] and
+    /// [`RestHarness::probe_exec`].
+    pub async fn probed() -> Self {
+        let (inner, probe) = ResolutionHarness::probed().await;
+        Self::build_over(
+            inner,
+            Some(probe),
+            Arc::new(AllowAll),
+            Arc::new(FixedStepUp::verified()),
+            resolution_catalogue(),
+        )
+    }
+
+    /// A raw query against the probed database. An error — a column that
+    /// does not exist yet — is the caller's to read as an absence.
+    pub async fn probe_query(
+        &self,
+        sql: &str,
+    ) -> Result<Vec<sea_orm::QueryResult>, sea_orm::DbErr> {
+        use sea_orm::ConnectionTrait as _;
+        let probe = self.probe.as_ref().expect("a probed harness");
+        probe
+            .raw
+            .query_all_raw(sea_orm::Statement::from_string(
+                sea_orm::DbBackend::Sqlite,
+                sql.to_owned(),
+            ))
+            .await
+    }
+
+    /// A raw statement against the probed database.
+    pub async fn probe_exec(&self, sql: &str) {
+        use sea_orm::ConnectionTrait as _;
+        let probe = self.probe.as_ref().expect("a probed harness");
+        probe
+            .raw
+            .execute_unprepared(sql)
+            .await
+            .expect("the probe statement applies");
+    }
+
+    fn build_over(
+        inner: ResolutionHarness,
+        probe: Option<Probe>,
+        pdp: Arc<dyn authz_resolver_sdk::AuthZResolverApi>,
+        step_up: Arc<dyn crate::domain::stepup::StepUpVerifier>,
+        admin_catalogue: FakeSource,
+    ) -> Self {
         let enforcer = Arc::new(authz_resolver_sdk::PolicyEnforcer::new(pdp));
         let openapi = toolkit::api::OpenApiRegistryImpl::new();
         let search = Arc::new(crate::domain::search::service::SearchService::new(
@@ -1558,6 +1686,7 @@ impl RestHarness {
             secrets,
             published,
             registrar,
+            probe,
             router,
         }
     }
@@ -1731,6 +1860,7 @@ impl RestHarness {
                     tenant_id: tenant,
                     access,
                     set_by: "an ancestor's administrator".to_owned(),
+                    set_by_tenant: None,
                 },
                 None,
             )

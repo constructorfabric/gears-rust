@@ -965,7 +965,11 @@
             "type": "string"
           },
           "actor_masked": {
-            "description": "Whether `actor` carries the mask token.",
+            "description": "Whether `actor` carries the mask token, whether because the caller lacks\nthe unmasked-PII entitlement or because the boundary withheld it\n(`actor_withheld` tells the two apart).",
+            "type": "boolean"
+          },
+          "actor_withheld": {
+            "description": "Whether `actor` is withheld by the upward disclosure boundary, whatever\nthe entitlement: its tenant is not on the path from the reader tenant to\nthe record's.",
             "type": "boolean"
           },
           "change_set_id": {
@@ -4739,12 +4743,16 @@
             "type": "string"
           },
           "supplied_by": {
-            "description": "The tenant whose row supplies it; absent for `overridable`.",
+            "description": "The tenant whose row supplies it; absent for `overridable`, and absent\nwhen that tenant is above the reader tenant.",
             "format": "uuid",
             "type": [
               "string",
               "null"
             ]
+          },
+          "supplied_from_above": {
+            "description": "Set when the supplying tenant is above the reader tenant, so it is\nnot named: the access is inherited from above.",
+            "type": "boolean"
           }
         },
         "required": [
@@ -17917,6 +17925,10 @@
             "description": "The administrator of a strict ancestor who recorded it: an\nadministrator's identity, masked for a caller not authorized for\nunmasked PII.",
             "type": "string"
           },
+          "set_by_withheld": {
+            "description": "Whether `set_by` is withheld by the upward disclosure boundary rather\nthan by the PII entitlement: its tenant is not on the path from the\nreader tenant down to the restricted tenant.",
+            "type": "boolean"
+          },
           "tenant_id": {
             "description": "The tenant restricted.",
             "format": "uuid",
@@ -18502,8 +18514,12 @@
             "type": "string"
           },
           "set_by": {
-            "description": "Who set it: an administrator's identity, masked for a caller not\nauthorized for unmasked PII.",
+            "description": "Who set it: an administrator's identity, masked for a caller not\nauthorized for unmasked PII, and the mask token with `set_by_withheld`\nwhen its tenant is not on the path from the reader tenant to the row's\ntenant.",
             "type": "string"
+          },
+          "set_by_withheld": {
+            "description": "Whether `set_by` is withheld by the upward disclosure boundary rather\nthan by the PII entitlement.",
+            "type": "boolean"
           },
           "tenant_id": {
             "description": "The tenant whose override is flagged.",
@@ -21165,6 +21181,10 @@
       "TrailEntryDto": {
         "description": "One scope on the inheritance trail, with the setter identity and\ntimestamp the administrative read is allowed to show.",
         "properties": {
+          "above": {
+            "description": "Set on the one leading entry that stands for every scope above the\nreader tenant: it carries `provided_value`, `has_override` and\n`needs_review`, the last always `false` — a flagged ancestor row is\nnot the reader's to see.",
+            "type": "boolean"
+          },
           "has_override": {
             "description": "Whether an override row exists here.",
             "type": "boolean"
@@ -21185,25 +21205,33 @@
             "type": "boolean"
           },
           "scope": {
-            "description": "`/` or `/tenants/{id}`.",
-            "type": "string"
-          },
-          "set_by": {
-            "description": "Who set the row here: an administrator's identity, masked for a\ncaller not authorized for unmasked PII.",
+            "description": "`/` or `/tenants/{id}`; absent on the collapsed entry that stands for\nevery scope above the reader tenant.",
             "type": [
               "string",
               "null"
             ]
           },
+          "set_by": {
+            "description": "Who set the row here: an administrator's identity, masked for a\ncaller not authorized for unmasked PII, and the mask token with\n`set_by_withheld` when its tenant is not on the path from the reader\ntenant down to this scope.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "set_by_withheld": {
+            "description": "Whether `set_by` is withheld by the upward disclosure boundary rather\nthan by the PII entitlement.",
+            "type": "boolean"
+          },
           "tenant_id": {
-            "description": "The tenant inspected.",
+            "description": "The tenant inspected; absent on the collapsed entry.",
             "format": "uuid",
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "required": [
-          "scope",
-          "tenant_id",
           "has_override",
           "provided_value",
           "needs_review"

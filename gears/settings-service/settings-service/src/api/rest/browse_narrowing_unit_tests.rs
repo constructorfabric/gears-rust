@@ -6,7 +6,7 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 use super::{browse_binding, candidate_batch, page_size, value_part_matches};
-use crate::api::rest::setting_dto::{EffectiveValueDto, render};
+use crate::api::rest::setting_dto::{EffectiveValueDto, Reader, render};
 use crate::domain::resolution::EffectiveValue;
 use crate::domain::search::Needle;
 
@@ -39,6 +39,8 @@ fn rendered(classification: &str, value: Value, fallback: Value, pii: bool) -> E
             own_row: None,
         },
         pii,
+        Reader::Platform,
+        &[],
     )
 }
 

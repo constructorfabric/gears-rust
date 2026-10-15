@@ -88,6 +88,9 @@ pub struct StoredValue {
     pub updated_at: OffsetDateTime,
     /// Who set it.
     pub set_by: String,
+    /// The tenant the setter acted from, recorded with `set_by`; `None` on a
+    /// row written before it was recorded.
+    pub set_by_tenant: Option<Uuid>,
 }
 
 /// The columns of a subject-less row that a revival report's listing reads —
@@ -136,6 +139,9 @@ pub struct ValueDraft {
     pub needs_review_detail: Option<String>,
     /// Who set it.
     pub set_by: String,
+    /// The tenant the setter acted from, recorded with `set_by`; `None` on a
+    /// row written before it was recorded.
+    pub set_by_tenant: Option<Uuid>,
 }
 
 #[cfg(test)]

@@ -66,6 +66,7 @@ pub(crate) fn to_domain(model: setting_value::Model) -> StoredValue {
         last_change_at: model.last_change_at,
         updated_at: model.updated_at,
         set_by: model.set_by,
+        set_by_tenant: model.set_by_tenant,
     }
 }
 
@@ -514,6 +515,7 @@ impl ValueRepository for ValueRepo {
             created_at: Set(at),
             updated_at: Set(at),
             set_by: Set(draft.set_by),
+            set_by_tenant: Set(draft.set_by_tenant),
         };
         let model = toolkit_db::secure::secure_insert::<ValueEntity>(active, scope, conn)
             .await
@@ -530,6 +532,7 @@ impl ValueRepository for ValueRepo {
         value: Option<serde_json::Value>,
         secret_ref: Option<String>,
         set_by: &str,
+        set_by_tenant: Option<Uuid>,
         expected: time::OffsetDateTime,
     ) -> Result<StoredValue, DomainError> {
         // Strictly after the version being replaced: the tag moves with the
@@ -546,6 +549,10 @@ impl ValueRepository for ValueRepo {
             .col_expr(setting_value::Column::LastChangeAt, Expr::value(at))
             .col_expr(setting_value::Column::UpdatedAt, Expr::value(at))
             .col_expr(setting_value::Column::SetBy, Expr::value(set_by.to_owned()))
+            .col_expr(
+                setting_value::Column::SetByTenant,
+                Expr::value(set_by_tenant),
+            )
             .filter(setting_value::Column::Id.eq(id))
             // The row at the version the tag was compared against, and no
             // other: two writers holding one tag both pass the comparison, and
