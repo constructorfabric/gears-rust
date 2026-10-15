@@ -171,7 +171,7 @@ The vocabularies of `operation`, `outcome` and `actor_classification` carry a co
 
 - [x] `p1` - **ID**: `cpt-cf-settings-service-dod-audit-store-transactional-sink`
 
-The system **MUST** bind the `AuditSink` port — `append(txn, scope, record)` — to the `audit_records` table so that every mutation commits its record in its own transaction, as the last step before commit, and is rejected as unavailable when the record cannot be written. Category and declaration mutations **MUST** be moved onto this sink and the tracing stand-in retired. The port **MUST** stay the only way a record is written, so the R2 outbox binding can be added behind it without touching a call site. Each record's `actor_tenant_id` **MUST** be stamped once at insert from the security context's subject tenant — the root for a machine act with no context — and never rewritten.
+The system **MUST** bind the `AuditSink` port — `append(txn, scope, record)` — to the `audit_records` table so that every mutation commits its record in its own transaction, as the last step before commit, and is rejected as unavailable when the record cannot be written. Category and declaration mutations **MUST** be moved onto this sink and the tracing stand-in retired. The port **MUST** stay the only way a record is written, so the R2 outbox binding can be added behind it without touching a call site. Each record's `actor_tenant_id` **MUST** be stamped once at insert from the security context's subject tenant — none for a machine act with no security context, such as a gear's reconcile or upgrade — and never rewritten.
 
 **Implements**:
 - `cpt-cf-settings-service-algo-audit-store-append`

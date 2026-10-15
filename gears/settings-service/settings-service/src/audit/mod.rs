@@ -289,8 +289,9 @@ pub struct AuditRecord {
     /// How the actor identity is classified for the read side.
     pub actor_classification: ActorClassification,
     /// The tenant the actor acted from, taken from the request's security
-    /// context; the root for a machine act with no context. Decides whether a
-    /// tenant reader of the history is shown the actor.
+    /// context; `None` for a machine act with no context, such as a gear's
+    /// reconcile or upgrade. Decides whether a tenant reader of the history is
+    /// shown the actor.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub actor_tenant_id: Option<Uuid>,
     /// The value before, masked when secret.
