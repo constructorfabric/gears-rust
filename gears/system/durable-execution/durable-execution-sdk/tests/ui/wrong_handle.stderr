@@ -1,0 +1,7 @@
+error[E0308]: mismatched types
+ --> tests/ui/wrong_handle.rs:3:18
+  |
+3 |     let _: u32 = client.result(ctx, handle).await.unwrap();
+  |            ---   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ expected `u32`, found `String`
+  |            |
+  |            expected due to this

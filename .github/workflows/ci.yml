@@ -479,6 +479,10 @@ jobs:
         if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
         run: tools/scripts/with_rust_annotations.sh make test-cluster-redis
 
+      - name: Test durable-execution (PostgreSQL and subprocess recovery)
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        run: tools/scripts/with_rust_annotations.sh make test-durable-execution-pg
+
       - name: Test toolkit-db (sqlite integration)
         if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
         run: tools/scripts/with_rust_annotations.sh make test-sqlite
@@ -1055,6 +1059,10 @@ jobs:
       #   4. The k8s-cluster-plugin L2/L3 k3s suites. These live behind
       #      `required-features = ["integration"]`.
       #
+      #   5. The durable-execution PostgreSQL suites behind the integration
+      #      feature, including subprocess recovery. A single test binary
+      #      shares the workspace-pinned PostgreSQL container.
+      #
       # The per-binary k3s loop (one container per binary, cleaned between —
       # nextest's process-per-test would start ~70 of them) lives in the
       # `coverage-cluster-k8s` Makefile target so this step stays readable; it
@@ -1091,6 +1099,10 @@ jobs:
           # Pass 4: k8s-cluster-plugin k3s suites (cargo test: no JUnit).
           fresh_report
           "$W" make coverage-cluster-k8s
+          # Pass 5: durable-execution PostgreSQL and subprocess recovery suites
+          # (cargo test: no JUnit).
+          fresh_report
+          "$W" make coverage-durable-execution-pg
           # Merge into the single report that gets uploaded.
           cargo llvm-cov report --lcov --output-path lcov.info
 
@@ -1112,7 +1124,7 @@ jobs:
           if [ -n "$report" ]; then
             python3 tools/scripts/junit_enrich.py --github "$report"
           else
-            echo "The failing pass left no JUnit report (a build error, or the k8s pass, which runs cargo test); see the step above."
+            echo "The failing pass left no JUnit report (a build error, or the k8s or durable-execution pass, which run cargo test); see the step above."
           fi
 
       # Upload LCOV report as a GitHub Actions artifact so it is always
