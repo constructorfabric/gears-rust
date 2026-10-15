@@ -28,7 +28,7 @@
 //!
 //! Ignored by default (Docker); run with
 //! `cargo test -p cf-gears-bss-coord --test postgres_two_gear_migration -- --ignored`, or via
-//! `make test-coord-pg`.
+//! `make test-integration LANE=coord-pg`.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 

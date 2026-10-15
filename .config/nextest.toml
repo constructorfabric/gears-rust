@@ -25,5 +25,5 @@ fail-fast = false
 path = "junit.xml"
 store-success-output = false
 store-failure-output = true
-# Requires nextest >= 0.9.143 (see NEXTEST_MIN_VERSION in the Makefile).
+# Requires nextest >= 0.9.143 (see NEXTEST_MIN_VERSION in gears.mk).
 report-skipped = "ignored"

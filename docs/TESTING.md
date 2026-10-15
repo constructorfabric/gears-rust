@@ -34,24 +34,24 @@ make check                  # full quality gate (fmt + clippy + test + security)
 make build                 # whole-project example server release binary
 make run                   # default example server
 make test                  # unit tests (workspace, all OS)
-make test-sqlite           # integration — SQLite
-make test-pg               # integration — PostgreSQL
-make test-pgq              # integration — PostgreSQL 19 SQL/PGQ (Docker)
-make test-mysql            # integration — MySQL
+make test-integration LANE=toolkit-db-sqlite  # integration — SQLite
+make test-integration LANE=toolkit-db-pg  # integration — PostgreSQL
+make test-integration LANE=toolkit-db-pgq  # integration — PostgreSQL 19 SQL/PGQ (Docker)
+make test-integration LANE=toolkit-db-mysql  # integration — MySQL
 make test-db               # all DB integration tests (sqlite, pg, pgq, mysql)
-make test-users-info-pg    # users-info gear integration (Postgres)
+make test-integration LANE=users-info-pg  # users-info gear integration (Postgres)
 make e2e-docker            # E2E — Docker environment
 make e2e-docker-smoke      # E2E — Docker environment (smoke subset only)
 make e2e-local             # E2E — local: run every shared-server suite against one shared server
 make e2e-local-smoke       # E2E — smoke subset only
-make e2e-mini-chat         # E2E — mini-chat lane (dedicated binary, offline mode)
+make e2e-local SUITE=mini-chat  # E2E — mini-chat lane (dedicated binary, offline mode)
 make e2e-tr-authz          # E2E — AuthZ -> TR -> RG chain (resource_group/e2e.yaml, profile: tr-authz)
-make e2e-usage-collector   # E2E — usage-collector lane, both backends (aggregate of the two targets below)
-make e2e-usage-collector-timescaledb  # E2E — usage-collector lane, TimescaleDB only (dedicated binary; needs Docker)
-make e2e-usage-collector-clickhouse   # E2E — usage-collector lane, ClickHouse only (dedicated binary; needs Docker)
+make e2e-usage-collector   # E2E — usage-collector lane, both backends (BACKEND= for one, below)
+make e2e-usage-collector BACKEND=timescaledb  # E2E — usage-collector lane, TimescaleDB only (dedicated binary; needs Docker)
+make e2e-usage-collector BACKEND=clickhouse  # E2E — usage-collector lane, ClickHouse only (dedicated binary; needs Docker)
 make fuzz                  # fuzz — 30 s smoke per target
 make check                 # full quality gate (fmt + clippy + test + security)
-make all                   # full pipeline (build + check + test-sqlite + e2e-local)
+make all                   # full pipeline (build + check + toolkit-db-sqlite lane + e2e-local)
 
 # CI gate: no database container built outside libs/test-containers (4.4)
 cargo xtask check-test-container-pins
@@ -143,19 +143,20 @@ behind the `integration` Cargo feature so that `cargo test --workspace` (without
 |---------|----------|---------|
 | `cf-gears-toolkit-db` | `sqlite,integration` | SQLite (in-process) |
 | `cf-gears-toolkit-db` | `pg,integration` | PostgreSQL (requires running instance) |
-| `cf-gears-toolkit-db` | `pgq,integration` | PostgreSQL 19 SQL/PGQ (testcontainers; `make test-pgq`) |
+| `cf-gears-toolkit-db` | `pgq,integration` | PostgreSQL 19 SQL/PGQ (testcontainers; `make test-integration LANE=toolkit-db-pgq`) |
 | `cf-gears-toolkit-db` | `mysql,integration` | MySQL (requires running instance) |
 | `users-info` | `integration` | PostgreSQL |
 
 ### 4.2 Running
 
 ```bash
-make test-sqlite           # quick, no external services needed
-make test-pg               # requires Postgres
-make test-pgq              # requires Docker; PostgreSQL 19 SQL/PGQ lane (testcontainers)
-make test-mysql            # requires MySQL
-make test-db               # all of the above, test-pgq included
-make test-users-info-pg    # users-info Postgres integration
+make test-integration LANE=toolkit-db-sqlite  # quick, no external services needed
+make test-integration LANE=toolkit-db-pg      # requires Postgres
+make test-integration LANE=toolkit-db-pgq     # requires Docker; PostgreSQL 19 SQL/PGQ lane (testcontainers)
+make test-integration LANE=toolkit-db-mysql   # requires MySQL
+make test-db                                  # all of the above, toolkit-db-pgq included
+make test-integration LANE=users-info-pg      # users-info Postgres integration
+make test-integration                         # every integration lane (`make help` lists them)
 ```
 
 ### 4.3 CI
@@ -292,9 +293,9 @@ set the default local-mode binary does not carry, so they cannot share the commo
 server: they are `launcher: pytest` suites that own their server (and, for
 usage-collector, a TimescaleDB container) in their own `conftest.py`. A plain
 `make e2e-local` (no `SUITE`) runs **only** the shared-server suites (`launcher:
-e2e-launcher`) and therefore **skips these** — run them via their dedicated
-`make e2e-mini-chat` / `make e2e-usage-collector` targets (or `make e2e-local
-SUITE=<suite>`), which CI invokes as separate steps.
+e2e-launcher`) and therefore **skips these** — run them via
+`make e2e-local SUITE=mini-chat` and `make e2e-usage-collector`, which CI
+invokes as separate steps.
 
 The usage-collector lane additionally needs a reachable Docker daemon — its storage
 plugin connects and migrates a real TimescaleDB (or ClickHouse) at gear init, which
@@ -432,7 +433,7 @@ cargo install cargo-llvm-cov                    # coverage backend (works on Win
 The `Makefile` wraps the same operations for convenience:
 
 ```bash
-make all        # build + check + test-sqlite + e2e-local
+make all        # build + check + toolkit-db-sqlite lane + e2e-local
 make check      # fmt + clippy + test + security
 make build      # whole-project example server release binary
 make run        # default example server

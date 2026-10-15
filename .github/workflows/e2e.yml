@@ -269,7 +269,7 @@ jobs:
         if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
         env:
           PYTEST_ADDOPTS: "--junitxml=${{ github.workspace }}/test-results/e2e/mini-chat.xml -o junit_suite_name=e2e-mini-chat"
-        run: tools/scripts/with_rust_annotations.sh make e2e-mini-chat
+        run: tools/scripts/with_rust_annotations.sh make e2e-local SUITE=mini-chat
 
       # tr-authz is a PROFILE of the resource-group suite (not a standalone
       # suite), so `make e2e-local` does not run it — keep it as its own step.
@@ -296,13 +296,13 @@ jobs:
         if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
         env:
           PYTEST_ADDOPTS: "--junitxml=${{ github.workspace }}/test-results/e2e/usage-collector-timescaledb.xml -o junit_suite_name=e2e-usage-collector-timescaledb"
-        run: tools/scripts/with_rust_annotations.sh make e2e-usage-collector-timescaledb
+        run: tools/scripts/with_rust_annotations.sh make e2e-usage-collector BACKEND=timescaledb
 
       - name: Run usage-collector E2E tests (ClickHouse container)
         if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
         env:
           PYTEST_ADDOPTS: "--junitxml=${{ github.workspace }}/test-results/e2e/usage-collector-clickhouse.xml -o junit_suite_name=e2e-usage-collector-clickhouse"
-        run: tools/scripts/with_rust_annotations.sh make e2e-usage-collector-clickhouse
+        run: tools/scripts/with_rust_annotations.sh make e2e-usage-collector BACKEND=clickhouse
 
       # Self-managed OoP (loopback, no k8s) suite: builds flight-control + three
       # oop_module gear binaries and orchestrates them as processes itself, so it

@@ -26,7 +26,7 @@ Every task below that says **gear tests** means both halves:
 cargo nextest run -p cf-gears-types-registry
 
 # PostgreSQL + MySQL, one testcontainers container per test (Docker required)
-make test-types-registry-db
+make test-integration LANE=types-registry-db
 ```
 
 **Per-task versus checkpoint.** Per task: `make fmt`, `make clippy`, gear tests. At the checkpoint: the full `make ci`, which adds `dylint` (whole-workspace build — P13), `deny`, `lychee`, `gts-docs` and the container targets.
@@ -574,13 +574,13 @@ uses that pairing internally and does not publish the revision number.
 **Consequence for later tasks, since it would have surfaced there as a regression.** T29's `get_instance` and T22a's `batchGet` both sit on this method; the SDK helpers that hydrate a content-free page through `batchGet` would have returned pages of null values.
 
 **Verification:**
-- [x] Gear tests, all three backends — 454 on `SQLite`, and `make test-types-registry-db` green: 4 container tests, migration and repository primitives on both `PostgreSQL` and `MySQL`
+- [x] Gear tests, all three backends — 454 on `SQLite`, and `make test-integration LANE=types-registry-db` green: 4 container tests, migration and repository primitives on both `PostgreSQL` and `MySQL`
 - [x] Test: Instance value violating its schema is refused — `invalid_value`, distinct from `invalid_schema`: the schema is fine, the value is not
 - [x] Test: `fk_tr_instance_revision_schema` prevents dangling schema-revision references — `instance_revision_cannot_reference_a_missing_schema_revision`. Foreign keys are enabled explicitly on that connection, because `SQLite` does not enforce them by default and the test would otherwise pass while proving nothing
 - [x] Test: an Instance admits against a Type Schema committed by an **earlier** operation, with the `dependency` table asserted empty
 - [x] Test: a derived Type Schema admits against a committed base, with the `dependency` table empty
 - [x] Test: Type Schema then Instance under one `family_key` — second is refused; and the reverse order
-- [x] Test: an admitted Instance reads back over the **real routes** with its authored value under `content`, without exposing internal `revision_no`, and with the three `effective_*` artifacts asserted absent — `api_rest_test.rs::an_instance_reads_back_with_its_authored_value`, which polls the operation first so a refused candidate cannot be mistaken for a value the read failed to reach. Plus the same Instance by its Registry Reference, pinning that the kind branch is chosen by the row and not by how it was found. Both are genuine RED→GREEN: they failed on `content: null` before the fix. Re-run on all three backends — 457 on `SQLite`, `make test-types-registry-db` green
+- [x] Test: an admitted Instance reads back over the **real routes** with its authored value under `content`, without exposing internal `revision_no`, and with the three `effective_*` artifacts asserted absent — `api_rest_test.rs::an_instance_reads_back_with_its_authored_value`, which polls the operation first so a refused candidate cannot be mistaken for a value the read failed to reach. Plus the same Instance by its Registry Reference, pinning that the kind branch is chosen by the row and not by how it was found. Both are genuine RED→GREEN: they failed on `content: null` before the fix. Re-run on all three backends — 457 on `SQLite`, `make test-integration LANE=types-registry-db` green
 
 **Interim, and stated rather than discovered later:** *"fails retryably"* is exercisable only as a
 unit call on `run_operation`, because there is no outbox to redeliver until T21 and inline
@@ -728,7 +728,7 @@ it, both interleavings are serializable — a re-read that still sees `expected`
 admission had not committed yet.
 
 **Verification:**
-- [x] Gear tests, all three backends (see [Commands](#commands)) — 514 on `SQLite`, and `make test-types-registry-db` green on `PostgreSQL` and `MySQL`
+- [x] Gear tests, all three backends (see [Commands](#commands)) — 514 on `SQLite`, and `make test-integration LANE=types-registry-db` green on `PostgreSQL` and `MySQL`
 - [x] Tests: stale version, equal content, content equal to an *older* non-current revision (must create a new revision, ADR-0005) — `TR/tests/revision_test.rs`, eleven tests
 - [x] Test: revision numbers are contiguous per entity — three admissions yield `1, 2, 3` with `resource_version` at 3
 - [x] Test: a revision in a region the policy has since **closed** is admitted (the restored bypass), while a creation there is still refused — `a_revision_survives_a_region_the_policy_has_since_closed` drives both halves against two compiled policies, and the acceptance unit tests pin the pure half
@@ -791,7 +791,7 @@ stores it is a rule that **silently never fires** rather than one that fails lou
 own family and that an Instance probes Instance spellings.
 
 **Verification:**
-- [x] Gear tests, all three backends (see [Commands](#commands)) — 514 on `SQLite`; `make test-types-registry-db` green on `PostgreSQL` and `MySQL`. No new backend cases: the rules add no new SQL shape, only more `find_by_gts_id` calls, which the suite already covers
+- [x] Gear tests, all three backends (see [Commands](#commands)) — 514 on `SQLite`; `make test-integration LANE=types-registry-db` green on `PostgreSQL` and `MySQL`. No new backend cases: the rules add no new SQL shape, only more `find_by_gts_id` calls, which the suite already covers
 - [x] Table-driven test over shape and contiguity combinations — twelve rows, each its own database, `shape_and_contiguity_over_the_combinations`. Genuine RED→GREEN
 - [x] Test: family key derivation maps `v1~`, `v1.4~`, `v2~` to one row, and a preceding-segment minor survives verbatim — the pure half in `key_tests.rs` (unchanged from T8), the *one row* half in `one_family_row_holds_every_version_and_owns_its_members`, which also pins the owner projection
 - [x] ~~Test: concurrent first registration under two owners yields one winner~~ — **already covered, and deliberately not duplicated on `SQLite`.** `repo_backends_test.rs::family_race_yields_one_row` (eight concurrent callers, exactly one `created`) and `family_race_inside_a_transaction_yields_one_row` (the loser keeps reading in the same transaction) are T4's, on both container backends. A `SQLite` version cannot exist: a second concurrent writer fails the whole transaction with `database is locked` rather than losing a unique-key race — measured, not assumed. `family_test.rs` carries a named placeholder test pointing at the two that do cover it. *"Two owners"* is P1 language; P0 fixes every row to `ownership_scope = 1` (ceiling C6)
@@ -892,7 +892,7 @@ does not physically remove them. No incomplete edge set is written. A malformed 
 fails at extraction as `invalid_schema`.
 
 **Verification:**
-- [x] Gear tests, all three backends (see [Commands](#commands)) — 531 on `SQLite`, six consecutive full-suite runs green; `make test-types-registry-db` green on `PostgreSQL` and `MySQL`. No new backend cases: the writes go through `replace_outgoing` and the resolution through `find_by_gts_ids`, both already exercised on both container backends by T4's `closure_walks_a_chain`. T13 adds no new SQL shape
+- [x] Gear tests, all three backends (see [Commands](#commands)) — 531 on `SQLite`, six consecutive full-suite runs green; `make test-integration LANE=types-registry-db` green on `PostgreSQL` and `MySQL`. No new backend cases: the writes go through `replace_outgoing` and the resolution through `find_by_gts_ids`, both already exercised on both container backends by T4's `closure_walks_a_chain`. T13 adds no new SQL shape
 - [x] Table-driven test over edge-kind fixtures, including a derived schema carrying both schema edge kinds, a reference-free schema, and an Instance of a derived type; focused no-edge tests cover `x-gts-ref`
 - [x] Test: re-admission removes an edge the new revision dropped — `a_revision_removes_the_edge_it_dropped_and_adds_the_one_it_gained`, with `a_revision_that_keeps_its_reference_keeps_the_edge` for the other direction, because "replace" could otherwise be read as "clear and forget"
 - [x] Test: a new schema whose `$ref` names an existing schema **outside its identifier chain** is admitted — the case that failed with `invalid_schema`. It was already pinned, inverted, as `admission_worker_test::a_ref_outside_the_chain_still_fails`; that test is now `a_ref_outside_the_chain_is_admitted` and its flip is the RED→GREEN record. `dependency_test.rs` pins the rows the same admission writes
@@ -1341,7 +1341,7 @@ reads as scope rather than as silence.
   `pg_stat_activity` and MySQL `data_lock_waits` / `data_locks`. An isolated container
   identifies the writer; `ClaimHooks` verifies pending-before-release and progress
   afterwards. Both backends detect wrong-table and premature-return mutations.
-- [x] **`make test-types-registry-db` did not run `revision_race_backends_test`, and now does.**
+- [x] **`make test-integration LANE=types-registry-db` did not run `revision_race_backends_test`, and now does.**
   The suite that proves the `entity_write_order` claim on a backend with real row locking was
   reachable only by hand, so `make ci` never ran it — the container test the last commit added to
   close a P0 blocker was outside the gate meant to protect it. One line in the `Makefile` target
@@ -1410,7 +1410,7 @@ rejected with its own reason, never collapsed into `Incompatible`.
 **Verification:**
 - [~] Gear tests, all three backends (see [Commands](#commands)) — 739/739 SQLite tests pass.
       `compat_backends_test` now runs the T17/T18 matrix on PostgreSQL and MySQL and is selected
-      by `make test-types-registry-db`; its Docker execution remains to be recorded
+      by `make test-integration LANE=types-registry-db`; its Docker execution remains to be recorded
 - [x] Compatibility matrix: optional property added at a `Closed` level (compatible), at `Open` (incompatible), at `Partial` (`Unknown`)
 - [x] Test: provenance columns match `GTS_SPECIFICATION_VERSION` and the crate version
 - [x] Disabled `skip_compatibility_check` is refused (`force_is_refused_while_the_deployment_disallows_it`).
@@ -1548,7 +1548,7 @@ Ordering is pure; admitted state stays acyclic without atomic groups or condensa
 
 **Verification:**
 - [x] Gear tests, all three backends (see [Commands](#commands)) — recorded at completion:
-      SQLite 781/781; `make test-types-registry-db` 24/24 on PostgreSQL and MySQL
+      SQLite 781/781; `make test-integration LANE=types-registry-db` 24/24 on PostgreSQL and MySQL
 - [x] Tests: partial commit, blocked dependent, blocked predecessor, refused in-batch `$ref` cycle
 - [x] Test: batch over `limits.batch_candidates` refused synchronously — covered by T7's
       `a_batch_over_the_limit_is_refused_with_both_numbers`
@@ -1717,7 +1717,7 @@ Read completion belongs to T22a (P17).
 routes have no duplicate path/method pair in the served document.
 
 **Recorded verification:** SQLite 894/894 (44 router tests); PostgreSQL/MySQL 36/36 in one
-`make test-types-registry-db` run. Formatting, gear clippy and link checks passed.
+`make test-integration LANE=types-registry-db` run. Formatting, gear clippy and link checks passed.
 Manual `/cf/types-registry/v2/*` checks covered register/poll/read, dry-run and committed
 deletion, tombstones, `If-Match`, missing versions, unknown UUIDs and replay.
 `make e2e-local`: 324 passed, 19 skipped; no e2e edits.
@@ -2126,7 +2126,7 @@ and quickstart, for the seven-route completeness check)
   wildcard cuts, bare `~*`, early-segment minors, instance tails, UUID-tail patterns —
   composed with `depth`, `kind` and `lifecycle`, returns exactly what
   `GtsId::matches_pattern` accepts on SQLite, PostgreSQL and MySQL
-  (`make test-types-registry-db` 48/48; gear tests 1088/1088)
+  (`make test-integration LANE=types-registry-db` 48/48; gear tests 1088/1088)
 - [x] `EXPLAIN` of each page's recorded statement over 18k rows, after `ANALYZE`, on all
   three backends: a
   broad pattern reads `gts_id` order with an early `LIMIT`; a sparse minor drives from
@@ -2444,7 +2444,7 @@ Implement sequentially in four S/M slices; do not land a client before its seed 
 - [ ] Await every seed outcome under one monotonic deadline starting before preparatory reads: the whole seed budget is `cfg.worker.operation_timeout` (default five minutes), not multiplied by delivery attempts or reset after CAS retries. Use the runtime cancellation token; a short configured budget exercises expiry. Only successful/equal seeds permit client publication; rejection, pending/missing dependency, limit refusal, deadline and cancellation fail boot with identifiers/reasons. The registry waits only for its own seeds, never a future consumer. Publisher stamps remain Phase 9; do not add an attribution/ordering mechanism here
 
 **Verification — slice 2 / intermediate review:**
-- [ ] `cargo nextest run -p cf-gears-types-registry --test seeding_test`; `make test-types-registry-db` — seed/restart/refusal and concurrent same-version seeding behaviour on SQLite, PostgreSQL and MySQL, using existing shared delivery helpers. Put container cases in `seeding_backends_test.rs` behind the existing `integration` feature so the make target actually selects them
+- [ ] `cargo nextest run -p cf-gears-types-registry --test seeding_test`; `make test-integration LANE=types-registry-db` — seed/restart/refusal and concurrent same-version seeding behaviour on SQLite, PostgreSQL and MySQL, using existing shared delivery helpers. Put container cases in `seeding_backends_test.rs` behind the existing `integration` feature so the make target actually selects them
 - [ ] At least two linked crates, a cross-crate dependency, real `toolkit-gts` base declarations, registry declarations and a configured dependent entity are readable through database-backed reads; a second boot preserves revisions/artifacts, and a permitted configured-content change updates through CAS
 - [ ] Invalid/unresolved seeds and an oversized combined set fail before either new client is published; a seed failure/cancellation leaves no running worker owned by the failed startup. The configured customer schema succeeds without its `x-gts-ref` target being stored, and a real missing parent/`$ref` fails; concurrent seeders both succeed with one admitted version of each equal document. Review the audit, budgets and seed barrier before slice 3
 
@@ -2468,7 +2468,7 @@ Implement sequentially in four S/M slices; do not land a client before its seed 
 - [ ] `make quickstart` and the example composition boot with all linked inventory/configured entities readable through the new database API; restart is idempotent. Audit the current v2 e2e registration/discovery suites against the now-prepopulated database: scope test entities/counts to their own namespaces and do not create an already-seeded identifier expecting fresh creation. Any necessary e2e adjustments land in separate commits of at most five files, preserve admission assertions and keep `make e2e-local` green on its current routes, with no earlier legacy-v1 red window
 
 **Verification — handoff:**
-- [ ] `cargo test -p cf-gears-types-registry-sdk`; `cargo test -p cf-gears-types-registry-sdk --doc`; `cargo nextest run -p cf-gears-types-registry`; `make test-types-registry-db`; `cargo check -p cf-gears-types-registry --all-targets`; `make fmt`; `make clippy`
+- [ ] `cargo test -p cf-gears-types-registry-sdk`; `cargo test -p cf-gears-types-registry-sdk --doc`; `cargo nextest run -p cf-gears-types-registry`; `make test-integration LANE=types-registry-db`; `cargo check -p cf-gears-types-registry --all-targets`; `make fmt`; `make clippy`
 - [ ] Run the documented local consumer example against the ordinary registry gear and repeat its startup; the existing manually assembled `platform_local_client_test` alone does not satisfy this handoff. Review every SDK README section: old `TypesRegistryClient` and its legacy models/examples appear only under `Legacy API`, and the main examples use the signatures/models actually exported by the new SDK
 
 **Files likely touched — slice 4:** `TR-SDK/README.md`, `TR-SDK/src/lib.rs`, `gears/system/types-registry/QUICKSTART.md`, plus `TR-SDK/Cargo.toml` only if compiled examples need additional dev-dependencies; e2e namespace corrections under `testing/e2e/suites/types_registry/` are separate S/M commits if the audit identifies them
@@ -2704,7 +2704,7 @@ Commits inside the task: (1) resolving wrappers, `rest-server` and `provides` wi
 **Verification:**
 - [ ] Shared conformance cases pass against both the mock and the real local client: valid roots/derived types; malformed schema, invalid traits and invalid derivation refused at admission; failed update leaves prior content/version/artifacts unchanged; unordered and mixed-validity batches; dry-run refusal without writes
 - [ ] SDK regression tests preserve injected admission refusals, unavailable-call faults, idempotent replay and the explicit seed bypass; removing candidate validation makes the new admission tests fail
-- [ ] `cargo test -p cf-gears-types-registry-sdk --all-features`; `cargo nextest run -p cf-gears-types-registry`; `make test-types-registry-db`; `cargo check -p cf-gears-types-registry-sdk --all-targets --all-features`; the standing fmt/clippy gates pass
+- [ ] `cargo test -p cf-gears-types-registry-sdk --all-features`; `cargo nextest run -p cf-gears-types-registry`; `make test-integration LANE=types-registry-db`; `cargo check -p cf-gears-types-registry-sdk --all-targets --all-features`; the standing fmt/clippy gates pass
 
 **Dependencies:** T29 and T30 (mock and both contracts). Uses the existing GTS schema-validation API; does not require T35a's new helper or its upstream release. T35a is the queue predecessor only. **Files likely touched:** listed separately for each stage above. **Scope:** L umbrella over the two ordered M stages above, at most four files per stage; fixture preparation precedes enabling validation so every commit stays green
 
@@ -3109,7 +3109,7 @@ Commits inside the task: (1) stamp; (2) migration; (3) durable context and finge
 
 **Verification:**
 - [ ] Focused tests — ordering through the stamp, `publisher_mismatch`, an unclaimed row
-- [ ] Migration tests — a populated pre-migration database keeps every row with its placeholder name and `NULL` version; `make test-types-registry-db` on PostgreSQL and MySQL, SQLite in the plain gear tests
+- [ ] Migration tests — a populated pre-migration database keeps every row with its placeholder name and `NULL` version; `make test-integration LANE=types-registry-db` on PostgreSQL and MySQL, SQLite in the plain gear tests
 - [ ] Acceptance and storage tests — same body with a different `publisher`, a lost response retried under the same key, a pending item re-read from a real database
 - [ ] The real local client and the real TCP contract test — mixed credentials, an invalid SemVer, strict operation-result parsing
 

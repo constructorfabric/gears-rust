@@ -44,7 +44,7 @@ Anthropic chats use `rag_provider` for file storage and vector stores; document 
 ## Running Locally
 
 ```bash
-make mini-chat
+make run PRESET=mini-chat
 ```
 
 This starts the server at `http://127.0.0.1:8087` with SQLite, mock auth, and single-tenant mode.
@@ -76,7 +76,7 @@ Routes are mounted under the gear's `url_prefix` (default `/mini-chat`, `mini-ch
 {gateway}/cf/mini-chat/v1/...
 ```
 
-`config/mini-chat.yaml` sets no `prefix_path`, so `make mini-chat` serves `http://127.0.0.1:8087/mini-chat/v1`. `config/quickstart.yaml` sets `/cf`: `http://127.0.0.1:8087/cf/mini-chat/v1`.
+`config/mini-chat.yaml` sets no `prefix_path`, so `make run PRESET=mini-chat` serves `http://127.0.0.1:8087/mini-chat/v1`. `config/quickstart.yaml` sets `/cf`: `http://127.0.0.1:8087/cf/mini-chat/v1`.
 
 Paths below are relative to `{prefix_path}{url_prefix}`:
 

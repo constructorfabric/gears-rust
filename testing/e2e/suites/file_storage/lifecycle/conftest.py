@@ -377,7 +377,7 @@ def _require_e2e_binary():
     AND the sidecar binary.  We gate on a DEDICATED env var (``FS_E2E_BINARY``)
     rather than the shared ``E2E_BINARY`` so that enabling this suite does not
     accidentally un-skip other gears (e.g. mini-chat) that gate on ``E2E_BINARY``
-    and expect their own scoped invocation (``make e2e-mini-chat``).
+    and expect their own scoped invocation (``make e2e-local SUITE=mini-chat``).
     """
     if not os.environ.get("FS_E2E_BINARY"):
         pytest.skip(

@@ -227,7 +227,7 @@ An upstream deleted through another replica leaves its pool cached here, and eac
 
 ### Confirmation
 
-Each behavior below has an ID. The test, or tests, that prove it name the ID in their doc comment, so `grep -rn PERS-GATE-003` finds them. "Every backend" means the in-memory repositories and SQLite, PostgreSQL and MySQL; `make test` runs memory and SQLite, `make test-oagw-db` runs PostgreSQL, MySQL and the SQLite lock races.
+Each behavior below has an ID. The test, or tests, that prove it name the ID in their doc comment, so `grep -rn PERS-GATE-003` finds them. "Every backend" means the in-memory repositories and SQLite, PostgreSQL and MySQL; `make test` runs memory and SQLite, `make test-integration LANE=oagw-db` runs PostgreSQL, MySQL and the SQLite lock races.
 
 **Repositories**
 

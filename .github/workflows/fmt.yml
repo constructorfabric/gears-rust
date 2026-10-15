@@ -5,6 +5,9 @@ on:
     branches: [ main, develop ]
     paths:
       - '**/*.rs'
+      - 'Makefile'
+      - '.gears-dna/gears.mk'
+      - 'gears-rust.mk'
   workflow_dispatch:
 
 permissions:
