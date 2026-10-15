@@ -1,11 +1,10 @@
-# Timeout guard plugin enforces request timeout
+# Gear-level request timeout enforced (not a guard plugin)
 
 ## Setup
 
-Attach builtin timeout guard plugin to the route:
-- `gts.cf.core.oagw.guard_plugin.v1~cf.core.oagw.timeout.v1`
+Request timeout is **gear-level configuration**, not a per-route/per-upstream `GuardPlugin` binding: the `gts.cf.core.oagw.guard_plugin.v1~cf.core.oagw.timeout.v1` identifier is cataloged in the types registry for discoverability only and cannot be bound via `plugins.items[].plugin_ref` (see [DESIGN.md](../../../docs/DESIGN.md#plugin-system)). The actual enforcement is the gear's `proxy_timeout_secs` config value (default `30`), applied uniformly to every proxied request.
 
-Route plugin list includes the timeout guard with a low timeout (example: 100ms) via its config mechanism (exact config shape is implementation-defined).
+For this scenario, run OAGW with `proxy_timeout_secs` set low (example: `2`) and point the route at an upstream that intentionally sleeps past that duration.
 
 ## Inbound request
 

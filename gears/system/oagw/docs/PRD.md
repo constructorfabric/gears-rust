@@ -445,16 +445,18 @@ The system **MUST** return the following error codes for proxy and management op
 | HTTP | Error                | Retriable |
 |------|----------------------|-----------|
 | 400  | ValidationError      | No        |
+| 400  | PayloadTooLarge      | No        |
 | 401  | AuthenticationFailed | No        |
+| 403  | PermissionDenied     | No        |
 | 404  | RouteNotFound        | No        |
-| 413  | PayloadTooLarge      | No        |
 | 429  | RateLimitExceeded    | Yes       |
 | 500  | SecretNotFound       | No        |
-| 502  | DownstreamError      | Depends   |
+| 503  | DownstreamError      | Depends   |
 | 503  | CircuitBreakerOpen   | Yes       |
 | 504  | Timeout              | Yes       |
 
-- **Rationale**: Consistent, well-defined error codes enable clients to implement correct retry and fallback behavior.
+- **Note**: `PayloadTooLarge` and `DownstreamError` moved off their historical `413`/`502` codes onto the canonical-errors `OutOfRange`/`ServiceUnavailable` categories (`400`/`503`); see [DESIGN.md's error table](./DESIGN.md#error-response-format) for the verified per-error mapping and source references.
+- **Rationale**: Consistent, well-defined error codes enable clients to implement correct retry and fallback behavior. This table's one-row-per-HTTP-code shape is a simplification: `503` alone maps to six distinct error types with different `Retriable` values (`DownstreamError`, `ProtocolError`, `StreamAborted`, `LinkUnavailable`, `CircuitBreakerOpen`, `UpstreamDisabled`), and the wire response gives no reliable way to tell which one produced a given `503` — see [DESIGN.md's disambiguation caveat](./DESIGN.md#error-response-format) before building retry logic that assumes otherwise.
 - **Actors**: `cpt-cf-oagw-actor-app-developer`
 
 ## 6. Non-Functional Requirements
@@ -626,7 +628,8 @@ None. All project-default NFRs apply to this gear.
 **Alternative Flows**:
 - **Upstream not found**: Return 404 RouteNotFound
 - **Upstream disabled**: Return 503 with gateway error type
-- **Auth plugin fails**: Return 401 AuthenticationFailed
+- **Auth plugin fails**: Return 401 AuthenticationFailed (no resolvable identity — e.g. missing/invalid token)
+- **AuthZ denies resolved identity**: Return 403 PermissionDenied (e.g. the token resolves to the nil tenant UUID `00000000-0000-0000-0000-000000000000`). This check runs before upstream resolution, so it always produces a clean 403 rather than falling through to a 404/503 from a later stage.
 - **Rate limit exceeded**: Return 429 with Retry-After header
 - **Upstream timeout**: Return 504 Timeout
 
