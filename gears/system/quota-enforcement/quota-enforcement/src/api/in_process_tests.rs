@@ -6,8 +6,8 @@ use authz_resolver_sdk::PolicyEnforcer;
 use gts::GtsTypeId;
 use quota_enforcement_sdk::testing::InMemoryStorage;
 use quota_enforcement_sdk::{
-    EnforcementMode, MetricId, PageRequest, PeriodType, QuotaFilter, QuotaManagerClientV1,
-    QuotaPatch, QuotaSource, QuotaSpec, QuotaStatus, QuotaType, SubjectRef,
+    EnforcementMode, MetricId, PageRequest, PeriodType, QuotaFilter, QuotaManagerApi, QuotaPatch,
+    QuotaSource, QuotaSpec, QuotaStatus, QuotaType, SubjectRef,
 };
 use serde_json::json;
 use toolkit_canonical_errors::{CanonicalError, Problem};
@@ -136,7 +136,13 @@ async fn before_bootstrap_every_call_is_not_ready() {
         .expect_err("not ready");
     assert_eq!(status(err), 503);
     let err = client
-        .read_quotas(&ctx(), QuotaFilter::default(), PageRequest::default())
+        .read_quotas(
+            &ctx(),
+            quota_enforcement_sdk::ReadQuotasRequest {
+                filter: QuotaFilter::default(),
+                page: PageRequest::default(),
+            },
+        )
         .await
         .expect_err("not ready");
     assert_eq!(status(err), 503);
@@ -149,16 +155,24 @@ async fn the_client_round_trips_through_the_same_domain_path_as_rest() {
     client
         .update_quota(
             &ctx(),
-            id,
-            QuotaPatch {
-                fail_open_hint: Some(true),
-                ..QuotaPatch::default()
+            quota_enforcement_sdk::UpdateQuotaRequest {
+                quota_id: id,
+                patch: QuotaPatch {
+                    fail_open_hint: Some(true),
+                    ..QuotaPatch::default()
+                },
             },
         )
         .await
         .expect("update returns unit");
     let page = client
-        .read_quotas(&ctx(), QuotaFilter::default(), PageRequest::default())
+        .read_quotas(
+            &ctx(),
+            quota_enforcement_sdk::ReadQuotasRequest {
+                filter: QuotaFilter::default(),
+                page: PageRequest::default(),
+            },
+        )
         .await
         .expect("read");
     assert_eq!(page.items.len(), 1);
@@ -174,11 +188,13 @@ async fn the_client_round_trips_through_the_same_domain_path_as_rest() {
     let page = client
         .read_quotas(
             &ctx(),
-            QuotaFilter {
-                status: Some(QuotaStatus::Deactivated),
-                ..QuotaFilter::default()
+            quota_enforcement_sdk::ReadQuotasRequest {
+                filter: QuotaFilter {
+                    status: Some(QuotaStatus::Deactivated),
+                    ..QuotaFilter::default()
+                },
+                page: PageRequest::default(),
             },
-            PageRequest::default(),
         )
         .await
         .expect("read deactivated");
@@ -198,8 +214,10 @@ async fn domain_rejections_arrive_as_canonical_errors() {
     let err = client
         .update_quota(
             &ctx(),
-            quota_enforcement_sdk::QuotaId::generate(),
-            QuotaPatch::default(),
+            quota_enforcement_sdk::UpdateQuotaRequest {
+                quota_id: quota_enforcement_sdk::QuotaId::generate(),
+                patch: QuotaPatch::default(),
+            },
         )
         .await
         .expect_err("an empty patch is rejected before the lookup");
@@ -213,14 +231,16 @@ async fn a_caller_supplied_constraint_contract_is_rejected_before_the_lookup() {
     let err = client
         .update_quota(
             &ctx(),
-            id,
-            QuotaPatch {
-                metadata: Some(serde_json::Map::new()),
-                constraint_contract: Some(quota_enforcement_sdk::ContractRef {
-                    type_id: type_id(crate::test_support::LLM_TOKEN_CONSTRAINT),
-                    version: 1,
-                }),
-                ..QuotaPatch::default()
+            quota_enforcement_sdk::UpdateQuotaRequest {
+                quota_id: id,
+                patch: QuotaPatch {
+                    metadata: Some(serde_json::Map::new()),
+                    constraint_contract: Some(quota_enforcement_sdk::ContractRef {
+                        type_id: type_id(crate::test_support::LLM_TOKEN_CONSTRAINT),
+                        version: 1,
+                    }),
+                    ..QuotaPatch::default()
+                },
             },
         )
         .await
@@ -302,7 +322,7 @@ fn attribution() -> quota_enforcement_sdk::EvaluationAttribution {
 
 #[tokio::test]
 async fn before_bootstrap_every_operator_and_enforcement_call_is_not_ready() {
-    use quota_enforcement_sdk::{QuotaEnforcementClientV1, QuotaOperatorClientV1};
+    use quota_enforcement_sdk::{QuotaEnforcementApi, QuotaOperatorApi};
     let service = unbound_service();
     let operator = super::InProcessQuotaOperator::new(Arc::clone(&service));
     let enforcement = super::InProcessQuotaEnforcement::new(service);
@@ -319,17 +339,54 @@ async fn before_bootstrap_every_operator_and_enforcement_call_is_not_ready() {
     let refusals = [
         operator.create_policy(&ctx(), policy_spec()).await.err(),
         operator
-            .update_policy(&ctx(), id.clone(), patch)
+            .update_policy(
+                &ctx(),
+                quota_enforcement_sdk::UpdatePolicyRequest {
+                    id: id.clone(),
+                    patch,
+                },
+            )
             .await
             .err(),
         operator
-            .rollback_policy(&ctx(), id.clone(), 1, None)
+            .rollback_policy(
+                &ctx(),
+                quota_enforcement_sdk::RollbackPolicyRequest {
+                    id: id.clone(),
+                    target_version: 1,
+                    comment: None,
+                },
+            )
             .await
             .err(),
-        operator.delete_policy(&ctx(), id.clone(), None).await.err(),
-        operator.read_policy(&ctx(), id.clone(), None).await.err(),
         operator
-            .list_policy_versions(&ctx(), id, PageRequest::default())
+            .delete_policy(
+                &ctx(),
+                quota_enforcement_sdk::DeletePolicyRequest {
+                    id: id.clone(),
+                    comment: None,
+                },
+            )
+            .await
+            .err(),
+        operator
+            .read_policy(
+                &ctx(),
+                quota_enforcement_sdk::ReadPolicyRequest {
+                    id: id.clone(),
+                    version: None,
+                },
+            )
+            .await
+            .err(),
+        operator
+            .list_policy_versions(
+                &ctx(),
+                quota_enforcement_sdk::ListPolicyVersionsRequest {
+                    id,
+                    page: PageRequest::default(),
+                },
+            )
             .await
             .err(),
         enforcement
@@ -409,7 +466,7 @@ async fn before_bootstrap_every_operator_and_enforcement_call_is_not_ready() {
 
 #[tokio::test]
 async fn the_operator_client_drives_a_policy_through_its_versions() {
-    use quota_enforcement_sdk::QuotaOperatorClientV1;
+    use quota_enforcement_sdk::QuotaOperatorApi;
     let service = bind(
         unbound_service_with(Arc::new(crate::test_support::PermitUnconstrainedPdp)),
         Arc::new(InMemoryStorage::new()),
@@ -424,13 +481,15 @@ async fn the_operator_client_drives_a_policy_through_its_versions() {
     let updated = operator
         .update_policy(
             &ctx(),
-            id.clone(),
-            quota_enforcement_sdk::PolicyPatch {
-                if_match_version: created.version,
-                engine_id: None,
-                engine_config: None,
-                timeout_ms: Some(50),
-                comment: Some("v2".to_owned()),
+            quota_enforcement_sdk::UpdatePolicyRequest {
+                id: id.clone(),
+                patch: quota_enforcement_sdk::PolicyPatch {
+                    if_match_version: created.version,
+                    engine_id: None,
+                    engine_config: None,
+                    timeout_ms: Some(50),
+                    comment: Some("v2".to_owned()),
+                },
             },
         )
         .await
@@ -438,7 +497,13 @@ async fn the_operator_client_drives_a_policy_through_its_versions() {
     assert_eq!(updated.version, 2);
     assert_eq!(
         operator
-            .read_policy(&ctx(), id.clone(), Some(1))
+            .read_policy(
+                &ctx(),
+                quota_enforcement_sdk::ReadPolicyRequest {
+                    id: id.clone(),
+                    version: Some(1),
+                },
+            )
             .await
             .expect("read v1")
             .version,
@@ -447,17 +512,26 @@ async fn the_operator_client_drives_a_policy_through_its_versions() {
     let history = operator
         .list_policy_versions(
             &ctx(),
-            id.clone(),
-            PageRequest {
-                limit: 10,
-                cursor: None,
+            quota_enforcement_sdk::ListPolicyVersionsRequest {
+                id: id.clone(),
+                page: PageRequest {
+                    limit: 10,
+                    cursor: None,
+                },
             },
         )
         .await
         .expect("history");
     assert_eq!(history.items.len(), 2);
     let rolled_back = operator
-        .rollback_policy(&ctx(), id.clone(), 1, Some("back".to_owned()))
+        .rollback_policy(
+            &ctx(),
+            quota_enforcement_sdk::RollbackPolicyRequest {
+                id: id.clone(),
+                target_version: 1,
+                comment: Some("back".to_owned()),
+            },
+        )
         .await
         .expect("rollback");
     assert_eq!(
@@ -465,11 +539,20 @@ async fn the_operator_client_drives_a_policy_through_its_versions() {
         "v1's configuration is active again"
     );
     operator
-        .delete_policy(&ctx(), id.clone(), None)
+        .delete_policy(
+            &ctx(),
+            quota_enforcement_sdk::DeletePolicyRequest {
+                id: id.clone(),
+                comment: None,
+            },
+        )
         .await
         .expect("delete");
     let err = operator
-        .read_policy(&ctx(), id, None)
+        .read_policy(
+            &ctx(),
+            quota_enforcement_sdk::ReadPolicyRequest { id, version: None },
+        )
         .await
         .expect_err("a deleted policy has no active version");
     assert!(status(err) >= 400);
@@ -477,7 +560,7 @@ async fn the_operator_client_drives_a_policy_through_its_versions() {
 
 #[tokio::test]
 async fn the_enforcement_client_debits_previews_rolls_back_and_settles_leases() {
-    use quota_enforcement_sdk::{AcquireLeaseOutcome, DecisionResult, QuotaEnforcementClientV1};
+    use quota_enforcement_sdk::{AcquireLeaseOutcome, DecisionResult, QuotaEnforcementApi};
     let storage = Arc::new(InMemoryStorage::new());
     {
         use quota_enforcement_sdk::QuotaEnforcementStoragePluginV1;

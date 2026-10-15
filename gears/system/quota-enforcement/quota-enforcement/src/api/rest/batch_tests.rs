@@ -11,7 +11,7 @@ use axum::{Extension, Router};
 use quota_enforcement_sdk::testing::{InMemoryStorage, bundle_with_global_policy};
 use quota_enforcement_sdk::{
     BatchDebitRequest, BatchItemRequest, BatchMode, BatchResult, EnforcementMode,
-    EvaluationAttribution, QuotaDraft, QuotaEnforcementClientV1, QuotaEnforcementStoragePluginV1,
+    EvaluationAttribution, QuotaDraft, QuotaEnforcementApi, QuotaEnforcementStoragePluginV1,
     QuotaId, QuotaSource, QuotaType, SubjectClaim, SubjectRef,
 };
 use serde_json::{Value, json};

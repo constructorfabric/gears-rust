@@ -14,6 +14,11 @@ surface in `api-gateway`.
 - **Plugin binding.** The storage plugin is selected by vendor through the
   types registry and resolved as a scoped `ClientHub` client. Nothing is
   cached before bootstrap succeeds.
+- **Client contracts.** The gear provides `QuotaManagerApi`,
+  `QuotaEnforcementApi` and `QuotaOperatorApi` through `#[toolkit::provides]`:
+  in process by default, or a REST client when `client_wiring.<contract>` says
+  so. It also hosts their internal REST routes under `/quota-enforcement/v1`,
+  served from its own domain service beside the public API.
 - **Cluster coordination.** The sweeper singletons run under the platform
   `cluster` gear's leader election (ADR-0006). The gear depends on
   `cluster-sdk` only, defines the typed profile `quota-enforcement`, and

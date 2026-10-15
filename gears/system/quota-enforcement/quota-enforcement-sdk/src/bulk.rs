@@ -17,7 +17,7 @@ use crate::models::{
 };
 
 /// Create every listed Quota of one tenant, or none.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct BulkCreateQuotasRequest {
     /// The one tenant every draft belongs to.
@@ -29,7 +29,7 @@ pub struct BulkCreateQuotasRequest {
 }
 
 /// One draft of a bulk create.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct BulkCreateItem {
     /// Identifies the item in outcomes and errors; no replay of its own.
@@ -40,7 +40,7 @@ pub struct BulkCreateItem {
 }
 
 /// Apply every listed patch to one tenant's Quotas, or none.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct BulkUpdateQuotasRequest {
     /// The one tenant every Quota belongs to.
@@ -52,7 +52,7 @@ pub struct BulkUpdateQuotasRequest {
 }
 
 /// One patch of a bulk update.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct BulkUpdateItem {
     /// Identifies the item in outcomes and errors; no replay of its own.
@@ -65,7 +65,7 @@ pub struct BulkUpdateItem {
 }
 
 /// Deactivate every listed Quota of one tenant, or none.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct BulkDeactivateQuotasRequest {
     /// The one tenant every Quota belongs to.
@@ -77,7 +77,7 @@ pub struct BulkDeactivateQuotasRequest {
 }
 
 /// One Quota of a bulk deactivate.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct BulkDeactivateItem {
     /// Identifies the item in outcomes and errors; no replay of its own.
@@ -88,14 +88,14 @@ pub struct BulkDeactivateItem {
 }
 
 /// A committed bulk create: one entry per item, in submission order.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct BulkCreated {
     /// The created Quotas.
     pub items: Vec<BulkCreatedItem>,
 }
 
 /// One created Quota.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct BulkCreatedItem {
     /// Position of the item in the request.
     pub index: usize,
@@ -106,14 +106,14 @@ pub struct BulkCreatedItem {
 }
 
 /// A committed bulk update: one entry per item, in submission order.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct BulkUpdated {
     /// The patched Quotas.
     pub items: Vec<BulkUpdatedItem>,
 }
 
 /// One patched Quota.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct BulkUpdatedItem {
     /// Position of the item in the request.
     pub index: usize,
@@ -126,14 +126,14 @@ pub struct BulkUpdatedItem {
 }
 
 /// A committed bulk deactivate: one entry per item, in submission order.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct BulkDeactivated {
     /// The deactivated Quotas.
     pub items: Vec<BulkDeactivatedItem>,
 }
 
 /// One deactivated Quota.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct BulkDeactivatedItem {
     /// Position of the item in the request.
     pub index: usize,

@@ -395,7 +395,7 @@ no lease semantics are re-specified here.
 - **Contract shapes** (settled with the design owner): the storage plugin gains three typed primitives, one per
   bulk operation, each applying its envelope in one plugin-owned transaction that reuses the single-item
   transaction bodies; an item-specific failure inside it is reported wrapped with the item's index, and a failure of
-  the envelope as a whole (the backend, a payload mismatch, contention) is reported as is. `QuotaManagerClientV1`
+  the envelope as a whole (the backend, a payload mismatch, contention) is reported as is. `QuotaManagerApi`
   gains the three bulk calls, and REST and the in-process client enter the same domain methods. DESIGN records the
   names.
 - **Envelope idempotency scope**: a management envelope names its target Quotas explicitly and resolves no

@@ -12,8 +12,8 @@ use axum::http::{Method, Request, StatusCode, header};
 use axum::{Extension, Router};
 use quota_enforcement_sdk::testing::{InMemoryStorage, bundle_with_global_policy};
 use quota_enforcement_sdk::{
-    EnforcementMode, QuotaDraft, QuotaEnforcementClientV1, QuotaEnforcementStoragePluginV1,
-    QuotaSource, QuotaType, SCOPE_TENANT, SCOPE_USER, SnapshotRequest, SnapshotSubject, SubjectRef,
+    EnforcementMode, QuotaDraft, QuotaEnforcementApi, QuotaEnforcementStoragePluginV1, QuotaSource,
+    QuotaType, SCOPE_TENANT, SCOPE_USER, SnapshotRequest, SnapshotSubject, SubjectRef,
 };
 use serde_json::{Value, json};
 use toolkit::api::openapi_registry::OpenApiRegistryImpl;

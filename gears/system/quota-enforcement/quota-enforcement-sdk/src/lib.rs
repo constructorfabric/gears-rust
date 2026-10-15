@@ -15,8 +15,9 @@
 //! Singleton coordination for the sweepers is not a contract of this SDK: the
 //! gear consumes the platform `cluster` gear's leader election (ADR-0006).
 //!
-//! The manager client trait ([`QuotaManagerClientV1`]) carries the Quota
-//! lifecycle; the consumer and operator traits land with their features.
+//! Three client contracts serve callers, in process or over REST ([`rest`]):
+//! [`QuotaManagerApi`] (Quota lifecycle and credit), [`QuotaEnforcementApi`]
+//! (consumption, leases, snapshots) and [`QuotaOperatorApi`] (policies).
 //!
 //! Enable the `test-util` feature for a complete in-memory double of the
 //! storage contract in [`testing`].
@@ -29,6 +30,7 @@ pub mod gts;
 pub mod models;
 pub mod notifications;
 pub mod period;
+pub mod rest;
 pub mod storage_plugin;
 pub mod thresholds;
 
@@ -42,7 +44,10 @@ pub use bulk::{
     BulkUpdateEnvelope, BulkUpdateItem, BulkUpdateQuotasRequest, BulkUpdated, BulkUpdatedItem,
 };
 pub use client::{
-    QuotaEnforcementClientV1, QuotaEnforcementError, QuotaManagerClientV1, QuotaOperatorClientV1,
+    DeletePolicyRequest, ListPolicyVersionsRequest, QuotaEnforcementApi, QuotaEnforcementError,
+    QuotaManagerApi, QuotaOperatorApi, ReadPolicyRequest, ReadQuotasRequest, RollbackPolicyRequest,
+    UpdatePolicyRequest, UpdateQuotaRequest, quota_enforcement_api_ir, quota_manager_api_ir,
+    quota_operator_api_ir,
 };
 pub use engine::{
     EngineConfigError, EngineError, EngineValidationInput, EnvironmentInputs, EvaluationBudget,
@@ -79,6 +84,17 @@ pub use models::{
 pub use notifications::{
     DeliveryOutcome, DispatchError, NotificationDeliveryHandle, NotificationDeliveryV1, QuotaEvent,
     QuotaNotificationSinkV1,
+};
+pub use rest::{
+    QuotaEnforcementApiRest, QuotaManagerApiRest, QuotaOperatorApiRest,
+    quota_enforcement_api_rest_http_binding, quota_manager_api_rest_http_binding,
+    quota_operator_api_rest_http_binding,
+};
+#[cfg(feature = "rest-client")]
+pub use rest::{
+    QuotaEnforcementApiRestClient, QuotaEnforcementApiRestResolvingClient,
+    QuotaManagerApiRestClient, QuotaManagerApiRestResolvingClient, QuotaOperatorApiRestClient,
+    QuotaOperatorApiRestResolvingClient,
 };
 pub use storage_plugin::{
     BatchEntry, BatchTimer, CONTRACT_MAJOR, EvaluatedBatch, EvaluatedMutation,

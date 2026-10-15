@@ -133,7 +133,7 @@ Realises `cpt-cf-quota-enforcement-seq-quota-create`.
 8. [x] - `p1` - DB: `create_quota` in a single transaction: insert the `quotas` row (server-assigned UUIDv7 `quota_id`, status `active`), insert the `quota_allocation_counters` row for allocation type (consumption counter rows are created lazily on first evaluate), enqueue `quota-changed (change_kind='created')` in the outbox (I11), append the `operation_log` entry, and commit the transaction - `inst-qcr-persist`
 9. [x] - `p1` - **IF** the registry-reported metric mode is `Direct` - `inst-qcr-direct-if`
    1. [x] - `p1` - Accept the Quota anyway (a metric's mode can flip over time, PRD §3.2); it is inert until the flip and is surfaced through the `quota_for_direct_metric_total` gauge - `inst-qcr-direct`
-10. [x] - `p1` - **RETURN** `201` with the Quota body; the SDK path returns `QuotaId` from `QuotaManagerClientV1::create_quota` - `inst-qcr-return`
+10. [x] - `p1` - **RETURN** `201` with the Quota body; the SDK path returns `QuotaId` from `QuotaManagerApi::create_quota` - `inst-qcr-return`
 
 ### Quota Update
 
@@ -168,7 +168,7 @@ Realises `cpt-cf-quota-enforcement-seq-quota-create`.
 7. [x] - `p1` - **IF** the reduced or newly numeric cap is strictly below the active period's consumed amount (consumption type) or the in-flight count (allocation type) - `inst-qup-guard-if`
    1. [x] - `p1` - **RETURN** `CAP_BELOW_CONSUMED` (`DomainError::CapBelowConsumed`); the operator first issues credits, then reduces the cap - `inst-qup-guard`
 8. [x] - `p1` - Enqueue `quota-changed (change_kind='updated')` in the same transaction (I11) - `inst-qup-event`
-9. [x] - `p1` - **RETURN** success; the SDK path is `QuotaManagerClientV1::update_quota(id, patch)` returning `()` - `inst-qup-return`
+9. [x] - `p1` - **RETURN** success; the SDK path is `QuotaManagerApi::update_quota(id, patch)` returning `()` - `inst-qup-return`
 
 ### Quota Deactivation Cascade
 
@@ -324,7 +324,7 @@ lease-operations features.
 The system **MUST** deliver `QuotaManagementService`
 (`cpt-cf-quota-enforcement-component-quota-management-service`) with transactional create, update, deactivate, and
 read over the storage plugin's Quota CRUD group, exposed as the five REST endpoints and the
-`QuotaManagerClientV1` methods `create_quota`, `update_quota`, `deactivate_quota`, and `read_quotas`. Every draft
+`QuotaManagerApi` methods `create_quota`, `update_quota`, `deactivate_quota`, and `read_quotas`. Every draft
 runs the full validation chain outside the storage transaction; every mutation enqueues its `quota-changed` event in
 the same transaction (I11) and appends the operation-log entry (I1); the cap-vs-consumed guard is evaluated at commit
 time in-tx (I6). Updates preserve the quota ID and the subject reference; breaking changes are rejected.
@@ -343,7 +343,7 @@ time in-tx (I6). Updates preserve the quota ID and the subject reference; breaki
 **Touches**:
 - API: `POST /v1/quota-enforcement/quotas`, `GET /v1/quota-enforcement/quotas/{id}`,
   `PATCH /v1/quota-enforcement/quotas/{id}`, `POST /v1/quota-enforcement/quotas/{id}/deactivate`,
-  `GET /v1/quota-enforcement/quotas`; `QuotaManagerClientV1` Quota methods
+  `GET /v1/quota-enforcement/quotas`; `QuotaManagerApi` Quota methods
 - DB: `cpt-cf-quota-enforcement-db-schema` (`quotas` table plus the allocation-counter materialization)
 - Entities: `Quota`, `QuotaDraft`, `QuotaPatch`, `QuotaFilter`, `QuotaId`, `DeactivateOutcome`
 
@@ -407,7 +407,7 @@ the evaluation paths.
 **Constraints**: `cpt-cf-quota-enforcement-constraint-toolkit`
 
 **Touches**:
-- API: `POST /v1/quota-enforcement/quotas/{id}/deactivate`; `QuotaManagerClientV1::deactivate_quota`
+- API: `POST /v1/quota-enforcement/quotas/{id}/deactivate`; `QuotaManagerApi::deactivate_quota`
 - DB: `cpt-cf-quota-enforcement-db-schema` (`quotas`, `leases`, `lease_holds`, `lease_capacity_counters`,
   `notification_outbox`)
 - Entities: `DeactivateOutcome`
@@ -500,7 +500,7 @@ respectively. No high-cardinality identifier (`quota_id`, `tenant_id`, metric, p
   `cpt-cf-quota-enforcement-dod-projection-catalog` of the projection-contracts feature.
 - **Delivered surface and open items (2026-09-09)**: the create, update, and read flows, the draft, metadata, and
   validity-window algorithms, and the CRUD, metadata, and rate-rejection Definitions of Done are implemented: the
-  `QuotaManagementService`, the five REST endpoints, the `QuotaManagerClientV1` in-process client registered on the
+  `QuotaManagementService`, the five REST endpoints, the `QuotaManagerApi` in-process client registered on the
   ClientHub by the gear (the SDK trait; the public read shape is `QuotaView`, the create shape `QuotaSpec`), and the
   reference storage plugin's `qe_quotas`, `qe_quota_allocation_counters`, `qe_operation_log` tables with the four
   lifecycle primitives, the two platform-plane reads, and same-transaction enqueue on the toolkit outbox under the

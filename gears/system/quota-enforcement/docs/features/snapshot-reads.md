@@ -56,7 +56,7 @@ read-only Decision Preview of the consumption-operations feature instead
 cases; S2S consumer reads used by product backends to render self-service views; manager/operator reads with explicit
 targets; lazy period-row materialization as the single read-path write
 exception (the semantics are owned by the consumption-operations feature and invoked here); the
-`QuotaEnforcementClientV1::snapshot` SDK method.
+`QuotaEnforcementApi::snapshot` SDK method.
 
 **Out of scope**: admission verdicts (served by `evaluate_preview` in the consumption-operations feature), the Quota
 CRUD read endpoints (`GET /v1/quota-enforcement/quotas*`, owned by the quota-lifecycle feature), Policy attribution
@@ -83,7 +83,7 @@ applies the foundation admission and tenant-isolation machinery unchanged.
 
 - **PRD**: [PRD.md](../PRD.md) (§5.10 Quota Snapshot Read API, §1.4 glossary "Quota Snapshot",
   §5.12 tenant isolation)
-- **Design**: [DESIGN.md](../DESIGN.md) (REST endpoint inventory, `QuotaEnforcementClientV1` SDK trait, storage-plugin
+- **Design**: [DESIGN.md](../DESIGN.md) (REST endpoint inventory, `QuotaEnforcementApi` SDK trait, storage-plugin
   snapshot-read group, §3.3 error model, `cpt-cf-quota-enforcement-seq-end-user-snapshot`)
 - **Decomposition**: [DECOMPOSITION.md](../DECOMPOSITION.md) (§2.8)
 - **ADR**: [ADR-0007 Declarative GTS projection contracts](../ADR/0007-cpt-cf-quota-enforcement-adr-projection-contracts.md)
@@ -136,7 +136,7 @@ reads are PRD requirement surfaces without a dedicated use case)
    1. [x] - `p1` - Create only the current window's period row (`consumed = 0`, no threshold marker), the single permitted I3 write exception on this read path; nothing is settled and no event is emitted, because closing the elapsed period (settlement and the `period-rollover` event with its closing figures) belongs to the mutating operation that crosses the boundary per `cpt-cf-quota-enforcement-algo-period-rollover` (consumption-operations feature); a Quota outside its validity window gets no row; the snapshot reflects the fresh period - `inst-snp-lazy`
 6. [x] - `p1` - Assemble each returned Quota's state per `cpt-cf-quota-enforcement-algo-snapshot-state` - `inst-snp-assemble`
 7. [x] - `p1` - Apply `cpt-cf-quota-enforcement-algo-snapshot-pagination` to the result set - `inst-snp-page`
-8. [x] - `p1` - **RETURN** `200` with the `PageResult<QuotaSnapshot>` page; an empty applicable set returns an empty page; the SDK path is `QuotaEnforcementClientV1::snapshot(req)` returning `PageResult<QuotaSnapshot>` - `inst-snp-return`
+8. [x] - `p1` - **RETURN** `200` with the `PageResult<QuotaSnapshot>` page; an empty applicable set returns an empty page; the SDK path is `QuotaEnforcementApi::snapshot(req)` returning `PageResult<QuotaSnapshot>` - `inst-snp-return`
 
 ### Consumer-Backed Self-Service Snapshot
 
@@ -222,7 +222,7 @@ elsewhere. The Quota lifecycle states it reads are defined by `cpt-cf-quota-enfo
 
 The system **MUST** deliver the unified `POST /v1/quota-enforcement/snapshot` endpoint on `QuotaEnforcementService`
 (`cpt-cf-quota-enforcement-component-quota-enforcement-service`, shared with the consumption-operations feature per
-DECOMPOSITION §2.12) and the SDK method `QuotaEnforcementClientV1::snapshot(req: SnapshotRequest)` returning
+DECOMPOSITION §2.12) and the SDK method `QuotaEnforcementApi::snapshot(req: SnapshotRequest)` returning
 `PageResult<QuotaSnapshot>`. The endpoint **MUST** accept `1..N` `(subject, metric)` filter pairs, treating single
 (`subjects.len() == 1`) and bulk (`subjects.len() >= 1`) as degenerate cases of one request shape, **MUST** paginate
 per `cpt-cf-quota-enforcement-algo-snapshot-pagination` (operator-configured page size, default 100 entries per
@@ -242,7 +242,7 @@ surface it **MUST** return a `Problem` envelope on every error and never a Decis
 `cpt-cf-quota-enforcement-constraint-security-context`
 
 **Touches**:
-- API: `POST /v1/quota-enforcement/snapshot`; `QuotaEnforcementClientV1::snapshot`;
+- API: `POST /v1/quota-enforcement/snapshot`; `QuotaEnforcementApi::snapshot`;
   storage `bulk_read_quota_snapshot(pairs, page)`
 - DB: reads `quotas`, `quota_allocation_counters`, and `quota_consumption_counters`; no new tables
   (DECOMPOSITION §2.8)

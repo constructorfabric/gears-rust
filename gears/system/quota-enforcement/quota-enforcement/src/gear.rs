@@ -19,18 +19,21 @@ use std::time::Duration;
 use anyhow::Context as _;
 use async_trait::async_trait;
 use authz_resolver_sdk::{AuthZResolverApi, PolicyEnforcer};
-use quota_enforcement_sdk::QuotaManagerClientV1;
+use quota_enforcement_sdk::{QuotaEnforcementApi, QuotaManagerApi, QuotaOperatorApi};
 use tokio_util::sync::CancellationToken;
 use toolkit::api::OpenApiRegistry;
 use toolkit::client_hub::ClientHub;
 use toolkit::context::GearCtx;
 use toolkit::lifecycle::ReadySignal;
 use toolkit::{Gear, Healthcheck, RestApiCapability};
+use toolkit_contract::policy::PolicyStack;
 use tracing::info;
 use types_registry_sdk::TypesRegistryClient;
 
 use crate::api::healthcheck::ReadinessCheck;
-use crate::api::in_process::InProcessQuotaManager;
+use crate::api::in_process::{
+    InProcessQuotaEnforcement, InProcessQuotaManager, InProcessQuotaOperator,
+};
 use crate::api::rest::routes;
 use crate::config::QuotaEnforcementConfig;
 use crate::domain::ports::{LifecycleGaugeSink, MetricRegistry, QeMetrics};
@@ -59,6 +62,21 @@ const LOG_TARGET: &str = "qe.lifecycle";
     deps = [authz_resolver, types_registry],
     capabilities = [rest, stateful],
     lifecycle(entry = "serve", stop_timeout = "30s", await_ready)
+)]
+#[toolkit::provides(
+    contract = quota_enforcement_sdk::QuotaManagerApi,
+    local = Self::build_manager,
+    transports = [local, rest],
+)]
+#[toolkit::provides(
+    contract = quota_enforcement_sdk::QuotaEnforcementApi,
+    local = Self::build_enforcement,
+    transports = [local, rest],
+)]
+#[toolkit::provides(
+    contract = quota_enforcement_sdk::QuotaOperatorApi,
+    local = Self::build_operator,
+    transports = [local, rest],
 )]
 pub struct QuotaEnforcementGear {
     service: OnceLock<Arc<Service>>,
@@ -354,16 +372,11 @@ impl Gear for QuotaEnforcementGear {
                 snapshot: cfg.snapshot.to_limits(),
             },
         ));
-        // In-process clients share the REST domain boundary.
-        hub.register::<dyn quota_enforcement_sdk::QuotaOperatorClientV1>(Arc::new(
-            crate::api::in_process::InProcessQuotaOperator::new(service.clone()),
-        ));
-        hub.register::<dyn quota_enforcement_sdk::QuotaEnforcementClientV1>(Arc::new(
-            crate::api::in_process::InProcessQuotaEnforcement::new(service.clone()),
-        ));
-        hub.register::<dyn QuotaManagerClientV1>(Arc::new(InProcessQuotaManager::new(
-            service.clone(),
-        )));
+        // The local builders find the service here; the key is crate-private.
+        hub.register::<LocalService>(Arc::new(LocalService(service.clone())));
+        self.wire_quota_manager_api(ctx).await?;
+        self.wire_quota_enforcement_api(ctx).await?;
+        self.wire_quota_operator_api(ctx).await?;
 
         let timing = ElectionTiming::new(
             cfg.election.ttl(),
@@ -422,6 +435,46 @@ fn set_once<T>(cell: &OnceLock<T>, value: T) -> anyhow::Result<()> {
     })
 }
 
+/// The shared service, keyed by a type no other crate can name.
+pub(crate) struct LocalService(Arc<Service>);
+
+impl LocalService {
+    fn of(ctx: &GearCtx) -> anyhow::Result<Arc<Service>> {
+        let local = ctx
+            .client_hub()
+            .get::<Self>()
+            .context("quota-enforcement: the local service is registered before wiring")?;
+        Ok(local.0.clone())
+    }
+}
+
+impl QuotaEnforcementGear {
+    fn build_manager(
+        ctx: &GearCtx,
+        _policies: Arc<PolicyStack>,
+    ) -> anyhow::Result<Arc<dyn QuotaManagerApi>> {
+        Ok(Arc::new(InProcessQuotaManager::new(LocalService::of(ctx)?)))
+    }
+
+    fn build_enforcement(
+        ctx: &GearCtx,
+        _policies: Arc<PolicyStack>,
+    ) -> anyhow::Result<Arc<dyn QuotaEnforcementApi>> {
+        Ok(Arc::new(InProcessQuotaEnforcement::new(LocalService::of(
+            ctx,
+        )?)))
+    }
+
+    fn build_operator(
+        ctx: &GearCtx,
+        _policies: Arc<PolicyStack>,
+    ) -> anyhow::Result<Arc<dyn QuotaOperatorApi>> {
+        Ok(Arc::new(InProcessQuotaOperator::new(LocalService::of(
+            ctx,
+        )?)))
+    }
+}
+
 impl RestApiCapability for QuotaEnforcementGear {
     // @cpt-flow:cpt-cf-quota-enforcement-flow-gear-bootstrap:p1
     fn register_rest(
@@ -436,7 +489,26 @@ impl RestApiCapability for QuotaEnforcementGear {
             .get()
             .cloned()
             .context("quota-enforcement: register_rest invoked before init")?;
-        Ok(routes::register_routes(router, openapi, service))
+        let router = routes::register_routes(router, openapi, service.clone());
+        // Served from the local service, never the hub: a REST-wired hub client would forward.
+        let router = quota_enforcement_sdk::rest::register_quota_manager_api_rest_routes(
+            router,
+            openapi,
+            Arc::new(InProcessQuotaManager::new(service.clone())) as Arc<dyn QuotaManagerApi>,
+        );
+        let router = quota_enforcement_sdk::rest::register_quota_enforcement_api_rest_routes(
+            router,
+            openapi,
+            Arc::new(InProcessQuotaEnforcement::new(service.clone()))
+                as Arc<dyn QuotaEnforcementApi>,
+        );
+        Ok(
+            quota_enforcement_sdk::rest::register_quota_operator_api_rest_routes(
+                router,
+                openapi,
+                Arc::new(InProcessQuotaOperator::new(service)) as Arc<dyn QuotaOperatorApi>,
+            ),
+        )
         // @cpt-end:cpt-cf-quota-enforcement-flow-gear-bootstrap:p1:inst-boot-rest
     }
 

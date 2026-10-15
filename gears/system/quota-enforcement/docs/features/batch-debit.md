@@ -135,7 +135,7 @@ Realises `cpt-cf-quota-enforcement-seq-batch-debit`.
 7. [x] - `p1` - Run `cpt-cf-quota-enforcement-algo-batch-envelope-evaluation` under the batch-level evaluation timeout - `inst-bde-envelope`
 8. [x] - `p1` - **IF** the envelope outcome is `Denied` - `inst-bde-denied-if`
    1. [x] - `p1` - **RETURN** the batch-level `Denied` verdict as an HTTP 200 `BatchDecision` body with per-item statuses included for diagnostic purposes only and every counter unchanged; `Denied` is a deterministic over-cap signal, so a retry is futile until a credit or period rollover (PRD §5.7) - `inst-bde-denied`
-9. [x] - `p1` - **RETURN** the batch-level outcome with the per-item array preserving submission order; a `BatchDecision` (HTTP 200) and a `Problem` (canonical error) are mutually exclusive outcomes, and a retry of a canonical error under the same envelope key is replay-safe; the SDK path is `QuotaEnforcementClientV1::batch_debit(req)` returning `BatchDecision` - `inst-bde-return`
+9. [x] - `p1` - **RETURN** the batch-level outcome with the per-item array preserving submission order; a `BatchDecision` (HTTP 200) and a `Problem` (canonical error) are mutually exclusive outcomes, and a retry of a canonical error under the same envelope key is replay-safe; the SDK path is `QuotaEnforcementApi::batch_debit(req)` returning `BatchDecision` - `inst-bde-return`
 
 ## 3. Processes / Business Logic (CDSL)
 
@@ -200,7 +200,7 @@ feature.
 
 The system **MUST** deliver `POST /v1/quota-enforcement/operations/batch-debit` on `QuotaEnforcementService` (per the
 DESIGN service surface; see the section 7 note on the DECOMPOSITION sharer list) and the SDK method
-`QuotaEnforcementClientV1::batch_debit(req: BatchDebitRequest)` returning `BatchDecision`. The `mode` field is
+`QuotaEnforcementApi::batch_debit(req: BatchDebitRequest)` returning `BatchDecision`. The `mode` field is
 required; `mode = independent` **MUST** be rejected with `NOT_YET_IMPLEMENTED` (canonical `Unimplemented`, 501) until
 the P2 mode ships. Batches over the operator-configurable maximum size (default 100 items) **MUST** be rejected with
 `BULK_TOO_LARGE` before any item is evaluated. If any item carries `amount <= 0`, the envelope **MUST** be rejected

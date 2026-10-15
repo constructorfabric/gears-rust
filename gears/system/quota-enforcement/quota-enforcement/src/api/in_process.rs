@@ -1,4 +1,4 @@
-//! The in-process `QuotaManagerClientV1`: the SDK client trait over the domain
+//! The in-process `QuotaManagerApi`: the SDK client trait over the domain
 //! service, registered in `ClientHub` at `init`. It carries Quota management
 //! and credit, the management-plane counter correction.
 //!
@@ -11,9 +11,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use quota_enforcement_sdk::{
     BulkCreateQuotasRequest, BulkCreated, BulkDeactivateQuotasRequest, BulkDeactivated,
-    BulkUpdateQuotasRequest, BulkUpdated, DeactivateOutcome, PageRequest, PageResult,
-    QuotaEnforcementError, QuotaFilter, QuotaId, QuotaManagerClientV1, QuotaPatch, QuotaSpec,
-    QuotaView,
+    BulkUpdateQuotasRequest, BulkUpdated, DeactivateOutcome, PageResult, QuotaEnforcementError,
+    QuotaId, QuotaManagerApi, QuotaSpec, QuotaView,
 };
 use toolkit_security::SecurityContext;
 
@@ -38,7 +37,7 @@ impl InProcessQuotaManager {
 
 // @cpt-dod:cpt-cf-quota-enforcement-dod-quota-crud:p1
 #[async_trait]
-impl QuotaManagerClientV1 for InProcessQuotaManager {
+impl QuotaManagerApi for InProcessQuotaManager {
     async fn create_quota(
         &self,
         ctx: &SecurityContext,
@@ -52,12 +51,11 @@ impl QuotaManagerClientV1 for InProcessQuotaManager {
     async fn update_quota(
         &self,
         ctx: &SecurityContext,
-        quota_id: QuotaId,
-        patch: QuotaPatch,
+        request: quota_enforcement_sdk::UpdateQuotaRequest,
     ) -> Result<(), QuotaEnforcementError> {
         let quotas = self.service.quotas()?;
-        let request = UpdateQuotaRequest::try_from(patch)?;
-        quotas.update(ctx, quota_id, request).await?;
+        let patch = UpdateQuotaRequest::try_from(request.patch)?;
+        quotas.update(ctx, request.quota_id, patch).await?;
         Ok(())
     }
 
@@ -73,12 +71,11 @@ impl QuotaManagerClientV1 for InProcessQuotaManager {
     async fn read_quotas(
         &self,
         ctx: &SecurityContext,
-        filter: QuotaFilter,
-        page: PageRequest,
+        request: quota_enforcement_sdk::ReadQuotasRequest,
     ) -> Result<PageResult<QuotaView>, QuotaEnforcementError> {
         let quotas = self.service.quotas()?;
         Ok(quotas
-            .list(ctx, ListQuotasRequest::from((filter, page)))
+            .list(ctx, ListQuotasRequest::from((request.filter, request.page)))
             .await?)
     }
 
@@ -196,7 +193,7 @@ impl InProcessQuotaOperator {
     }
 }
 #[async_trait]
-impl quota_enforcement_sdk::QuotaOperatorClientV1 for InProcessQuotaOperator {
+impl quota_enforcement_sdk::QuotaOperatorApi for InProcessQuotaOperator {
     async fn create_policy(
         &self,
         ctx: &SecurityContext,
@@ -207,47 +204,57 @@ impl quota_enforcement_sdk::QuotaOperatorClientV1 for InProcessQuotaOperator {
     async fn update_policy(
         &self,
         ctx: &SecurityContext,
-        id: quota_enforcement_sdk::PolicyId,
-        patch: quota_enforcement_sdk::PolicyPatch,
-    ) -> Result<quota_enforcement_sdk::PolicyVersion, QuotaEnforcementError> {
-        Ok(self.service.policies()?.update(ctx, id, patch).await?)
-    }
-    async fn rollback_policy(
-        &self,
-        ctx: &SecurityContext,
-        id: quota_enforcement_sdk::PolicyId,
-        target_version: u32,
-        comment: Option<String>,
+        request: quota_enforcement_sdk::UpdatePolicyRequest,
     ) -> Result<quota_enforcement_sdk::PolicyVersion, QuotaEnforcementError> {
         Ok(self
             .service
             .policies()?
-            .rollback(ctx, id, target_version, comment)
+            .update(ctx, request.id, request.patch)
+            .await?)
+    }
+    async fn rollback_policy(
+        &self,
+        ctx: &SecurityContext,
+        request: quota_enforcement_sdk::RollbackPolicyRequest,
+    ) -> Result<quota_enforcement_sdk::PolicyVersion, QuotaEnforcementError> {
+        Ok(self
+            .service
+            .policies()?
+            .rollback(ctx, request.id, request.target_version, request.comment)
             .await?)
     }
     async fn delete_policy(
         &self,
         ctx: &SecurityContext,
-        id: quota_enforcement_sdk::PolicyId,
-        comment: Option<String>,
+        request: quota_enforcement_sdk::DeletePolicyRequest,
     ) -> Result<(), QuotaEnforcementError> {
-        Ok(self.service.policies()?.delete(ctx, id, comment).await?)
+        Ok(self
+            .service
+            .policies()?
+            .delete(ctx, request.id, request.comment)
+            .await?)
     }
     async fn read_policy(
         &self,
         ctx: &SecurityContext,
-        id: quota_enforcement_sdk::PolicyId,
-        version: Option<u32>,
+        request: quota_enforcement_sdk::ReadPolicyRequest,
     ) -> Result<quota_enforcement_sdk::PolicyVersion, QuotaEnforcementError> {
-        Ok(self.service.policies()?.read(ctx, &id, version).await?)
+        Ok(self
+            .service
+            .policies()?
+            .read(ctx, &request.id, request.version)
+            .await?)
     }
     async fn list_policy_versions(
         &self,
         ctx: &SecurityContext,
-        id: quota_enforcement_sdk::PolicyId,
-        page: PageRequest,
+        request: quota_enforcement_sdk::ListPolicyVersionsRequest,
     ) -> Result<PageResult<quota_enforcement_sdk::PolicyVersionMeta>, QuotaEnforcementError> {
-        Ok(self.service.policies()?.list(ctx, &id, page).await?)
+        Ok(self
+            .service
+            .policies()?
+            .list(ctx, &request.id, request.page)
+            .await?)
     }
 }
 
@@ -268,7 +275,7 @@ impl InProcessQuotaEnforcement {
 }
 
 #[async_trait]
-impl quota_enforcement_sdk::QuotaEnforcementClientV1 for InProcessQuotaEnforcement {
+impl quota_enforcement_sdk::QuotaEnforcementApi for InProcessQuotaEnforcement {
     async fn debit(
         &self,
         ctx: &SecurityContext,

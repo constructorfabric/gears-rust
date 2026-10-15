@@ -8,7 +8,7 @@ use axum::http::{Request, StatusCode};
 use axum::{Extension, Router};
 use quota_enforcement_sdk::testing::{DrainReport, InMemoryStorage, RecordingSink, quota_draft};
 use quota_enforcement_sdk::{
-    PageRequest, QuotaEnforcementStoragePluginV1, QuotaFilter, QuotaManagerClientV1, SubjectRef,
+    PageRequest, QuotaEnforcementStoragePluginV1, QuotaFilter, QuotaManagerApi, SubjectRef,
 };
 use quota_enforcement_storage_plugin::StoragePluginGear;
 use serde_json::json;
@@ -44,7 +44,12 @@ impl ConfigProvider for StaticConfigProvider {
 }
 
 fn make_ctx(hub: Arc<ClientHub>) -> GearCtx {
-    let cfg = json!({
+    make_ctx_wired(hub, serde_json::Value::Null)
+}
+
+/// [`make_ctx`] with a `client_wiring` section; `Null` leaves it out.
+fn make_ctx_wired(hub: Arc<ClientHub>, wiring: serde_json::Value) -> GearCtx {
+    let mut cfg = json!({
         "quota-enforcement": {
             "config": {
                 "storage_vendor": "acme",
@@ -59,6 +64,9 @@ fn make_ctx(hub: Arc<ClientHub>) -> GearCtx {
             }
         }
     });
+    if !wiring.is_null() {
+        cfg["quota-enforcement"]["config"]["client_wiring"] = wiring;
+    }
     GearCtx::new(
         QuotaEnforcementGear::MODULE_NAME,
         Uuid::from_u128(1),
@@ -242,13 +250,15 @@ async fn init_then_serve_bootstraps_signals_ready_and_stops_on_cancel() {
     // The in-process manager client registered by init answers from the hub.
     let client = ctx
         .client_hub()
-        .get::<dyn QuotaManagerClientV1>()
+        .get::<dyn QuotaManagerApi>()
         .expect("manager client published by init");
     let page = client
         .read_quotas(
             &security_ctx(),
-            QuotaFilter::default(),
-            PageRequest::first(10),
+            quota_enforcement_sdk::ReadQuotasRequest {
+                filter: QuotaFilter::default(),
+                page: PageRequest::first(10),
+            },
         )
         .await
         .expect("read through the in-process client");
@@ -407,13 +417,15 @@ async fn the_in_process_client_answers_not_ready_before_bootstrap_binds_storage(
     gear.init(&ctx).await.expect("init");
     let client = ctx
         .client_hub()
-        .get::<dyn QuotaManagerClientV1>()
+        .get::<dyn QuotaManagerApi>()
         .expect("manager client published by init");
     let err = client
         .read_quotas(
             &security_ctx(),
-            QuotaFilter::default(),
-            PageRequest::default(),
+            quota_enforcement_sdk::ReadQuotasRequest {
+                filter: QuotaFilter::default(),
+                page: PageRequest::default(),
+            },
         )
         .await
         .expect_err("storage is bound by serve, not init");
@@ -633,9 +645,7 @@ async fn a_bulk_envelope_over_the_sql_plugin_replays_only_while_its_targets_stay
     );
     rx.await.expect("ready");
 
-    let client = hub
-        .get::<dyn QuotaManagerClientV1>()
-        .expect("manager client");
+    let client = hub.get::<dyn QuotaManagerApi>().expect("manager client");
     let spec = |subject: &str| quota_enforcement_sdk::QuotaSpec {
         tenant_id: tenant(),
         subject: SubjectRef {
@@ -722,4 +732,158 @@ async fn a_bulk_envelope_over_the_sql_plugin_replays_only_while_its_targets_stay
         .expect("serve task joins")
         .expect("serve returns Ok on shutdown");
     fixture.stop().await;
+}
+
+/// Every method of the three contracts, as its internal REST path.
+const INTERNAL_ROUTES: [&str; 22] = [
+    "/quotas/create",
+    "/quotas/update",
+    "/quotas/deactivate",
+    "/quotas/read",
+    "/quotas/credit",
+    "/quotas/bulk-create",
+    "/quotas/bulk-update",
+    "/quotas/bulk-deactivate",
+    "/operations/debit",
+    "/operations/rollback",
+    "/operations/preview",
+    "/operations/batch-debit",
+    "/leases/acquire",
+    "/leases/commit",
+    "/leases/release",
+    "/snapshot",
+    "/policies/create",
+    "/policies/update",
+    "/policies/rollback",
+    "/policies/delete",
+    "/policies/read",
+    "/policies/versions",
+];
+
+async fn post_json(
+    app: &Router,
+    path: &str,
+    body: &serde_json::Value,
+) -> (StatusCode, serde_json::Value) {
+    let request = Request::builder()
+        .method("POST")
+        .uri(path)
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .expect("request");
+    let response = app.clone().oneshot(request).await.expect("response");
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+        .await
+        .expect("body");
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+    )
+}
+
+#[tokio::test]
+async fn init_publishes_all_three_contracts_and_rest_mounts_every_internal_route() {
+    let (hub, _storage, fixture) = environment(true, ClusterBinding::QuotaEnforcement);
+    let gear = QuotaEnforcementGear::default();
+    let ctx = make_ctx(hub.clone());
+    gear.init(&ctx).await.expect("init");
+    assert!(hub.get::<dyn QuotaManagerApi>().is_ok());
+    assert!(
+        hub.get::<dyn quota_enforcement_sdk::QuotaEnforcementApi>()
+            .is_ok()
+    );
+    assert!(
+        hub.get::<dyn quota_enforcement_sdk::QuotaOperatorApi>()
+            .is_ok()
+    );
+
+    let app = gear
+        .register_rest(&ctx, Router::new(), &OpenApiRegistryImpl::new())
+        .expect("routes")
+        .layer(Extension(security_ctx()));
+    for path in INTERNAL_ROUTES {
+        let (status, _) =
+            post_json(&app, &format!("/quota-enforcement/v1{path}"), &json!({})).await;
+        assert_ne!(status, StatusCode::NOT_FOUND, "{path} is not mounted");
+    }
+    fixture.stop().await;
+}
+
+#[tokio::test]
+async fn rest_client_wiring_cannot_redirect_the_server_handlers() {
+    let (hub, _storage, fixture) = environment(true, ClusterBinding::QuotaEnforcement);
+    // Nothing listens on the discard port: a forwarded call can only fail.
+    let nowhere = json!({ "transport": "rest", "endpoint": "http://127.0.0.1:9" });
+    let gear = Arc::new(QuotaEnforcementGear::default());
+    let ctx = make_ctx_wired(
+        hub.clone(),
+        json!({
+            "quota_manager_api": nowhere,
+            "quota_enforcement_api": nowhere,
+            "quota_operator_api": nowhere,
+        }),
+    );
+    gear.init(&ctx).await.expect("init");
+    let (tx, rx) = oneshot::channel();
+    let cancel = CancellationToken::new();
+    let handle = tokio::spawn(
+        gear.clone()
+            .serve(cancel.clone(), ReadySignal::from_sender(tx)),
+    );
+    rx.await.expect("ready");
+
+    let read = quota_enforcement_sdk::ReadQuotasRequest {
+        filter: QuotaFilter::default(),
+        page: PageRequest::first(10),
+    };
+    hub.get::<dyn QuotaManagerApi>()
+        .expect("wired client")
+        .read_quotas(&security_ctx(), read.clone())
+        .await
+        .expect_err("the hub holds the REST client, which reaches nothing");
+
+    let app = gear
+        .register_rest(&ctx, Router::new(), &OpenApiRegistryImpl::new())
+        .expect("routes")
+        .layer(Extension(security_ctx()));
+    let (status, internal) = post_json(
+        &app,
+        "/quota-enforcement/v1/quotas/read",
+        &serde_json::to_value(&read).expect("request"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the internal route answers locally: {internal}"
+    );
+
+    let request = Request::builder()
+        .uri(format!("{PATH_PREFIX}/quotas?limit=10"))
+        .body(Body::empty())
+        .expect("request");
+    let response = app.clone().oneshot(request).await.expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+        .await
+        .expect("body");
+    let public: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+    assert_eq!(
+        internal["items"], public["items"],
+        "both surfaces read one store"
+    );
+
+    cancel.cancel();
+    handle.await.expect("join").expect("serve");
+    fixture.stop().await;
+}
+
+#[tokio::test]
+async fn a_local_builder_without_the_registered_service_is_an_error_not_a_panic() {
+    let ctx = make_ctx(Arc::new(ClientHub::new()));
+    let policies = toolkit::wiring::default_policy_stack();
+    assert!(QuotaEnforcementGear::build_manager(&ctx, policies.clone()).is_err());
+    assert!(QuotaEnforcementGear::build_enforcement(&ctx, policies.clone()).is_err());
+    assert!(QuotaEnforcementGear::build_operator(&ctx, policies).is_err());
 }

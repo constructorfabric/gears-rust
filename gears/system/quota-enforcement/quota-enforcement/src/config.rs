@@ -47,6 +47,25 @@ pub struct QuotaEnforcementConfig {
     pub snapshot: SnapshotSection,
     /// Retry and timeout bounds of notification dispatch.
     pub notifications: NotificationsSection,
+    /// Transport of each provided contract, read by `#[toolkit::provides]`;
+    /// absent means in-process.
+    pub client_wiring: ClientWiringSection,
+}
+
+/// `client_wiring.<contract>`: one entry per contract QE provides.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+#[allow(
+    clippy::struct_field_names,
+    reason = "the keys are the contract names `#[toolkit::provides]` reads"
+)]
+pub struct ClientWiringSection {
+    /// Wiring of `QuotaManagerApi`.
+    pub quota_manager_api: Option<toolkit_contract::wiring::ClientWiring>,
+    /// Wiring of `QuotaEnforcementApi`.
+    pub quota_enforcement_api: Option<toolkit_contract::wiring::ClientWiring>,
+    /// Wiring of `QuotaOperatorApi`.
+    pub quota_operator_api: Option<toolkit_contract::wiring::ClientWiring>,
 }
 
 impl Default for QuotaEnforcementConfig {
@@ -66,6 +85,7 @@ impl Default for QuotaEnforcementConfig {
             leases: LeasesSection::default(),
             snapshot: SnapshotSection::default(),
             notifications: NotificationsSection::default(),
+            client_wiring: ClientWiringSection::default(),
         }
     }
 }

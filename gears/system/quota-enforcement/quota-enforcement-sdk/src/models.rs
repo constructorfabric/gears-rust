@@ -33,6 +33,7 @@ macro_rules! uuid_id {
         $(#[$meta])*
         #[derive(
             Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize,
+            utoipa::ToSchema,
         )]
         #[serde(transparent)]
         pub struct $name(Uuid);
@@ -101,7 +102,9 @@ uuid_id!(
 
 /// Stable identifier of a Quota Resolution Policy. The seeded platform policy
 /// is [`PolicyId::GLOBAL`].
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, utoipa::ToSchema,
+)]
 #[serde(transparent)]
 pub struct PolicyId(String);
 
@@ -144,8 +147,9 @@ impl fmt::Display for PolicyId {
 ///
 /// QE mints no metric names. The value is validated against the registry at
 /// Quota create and update time, never on the evaluation path.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(transparent)]
+#[schema(value_type = String)]
 pub struct MetricId(GtsInstanceId);
 
 impl MetricId {
@@ -445,6 +449,18 @@ macro_rules! gts_closed_enum {
                 raw.parse().map_err(serde::de::Error::custom)
             }
         }
+
+        // The wire form is the GTS id string, one of `ALL`.
+        impl utoipa::PartialSchema for $name {
+            fn schema() -> utoipa::openapi::RefOr<utoipa::openapi::schema::Schema> {
+                utoipa::openapi::schema::ObjectBuilder::new()
+                    .schema_type(utoipa::openapi::schema::Type::String)
+                    .enum_values(Some(Self::ALL.iter().map(|value| value.as_gts_id())))
+                    .into()
+            }
+        }
+
+        impl utoipa::ToSchema for $name {}
     };
 }
 
@@ -499,7 +515,7 @@ gts_closed_enum!(
 // ---------------------------------------------------------------------------
 
 /// Lifecycle state of a Quota record.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum QuotaStatus {
     /// Accepts debits and leases.
@@ -533,7 +549,7 @@ impl LeaseState {
 }
 
 /// State of one immutable Policy version (PRD section 5.9).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum PolicyVersionState {
     /// The version the latest pointer names. At most one per policy.
@@ -612,7 +628,9 @@ impl OperationType {
 /// lease commit under the same key, subjects and tenant. The rollback names
 /// which of the two it means; there is no fallback lookup that could reverse
 /// the wrong one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize, utoipa::ToSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum RollbackableOperation {
     /// A direct debit, recorded under [`OperationType::Debit`]. The default, so
@@ -677,7 +695,7 @@ impl NotificationEventKind {
 
 /// Registry-reported kind of a metric (PRD section 3.2). Closed; the gear
 /// reads it from the metric instance and never defaults it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum MetricKind {
     /// Cumulative within a period; pairs naturally with consumption Quotas.
@@ -694,18 +712,20 @@ pub enum MetricKind {
 ///
 /// The projection type never arrives on the wire. The gear maps the caller's
 /// `(metric, kind)` through its validated catalogue after PDP authorization.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct SubjectRef {
     /// Concrete owner projection derived from `gts.cf.core.qe.subj.v1~`.
+    #[schema(value_type = String)]
     pub projection_type: GtsTypeId,
     /// Opaque, non-empty subject identifier.
     pub subject_id: String,
 }
 
 /// The constraint contract a Quota's metadata was validated against.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct ContractRef {
     /// Concrete contract type derived from `gts.cf.core.qe.constraint.v1~`.
+    #[schema(value_type = String)]
     pub type_id: GtsTypeId,
     /// Accepted contract version.
     pub version: u32,
@@ -732,8 +752,9 @@ impl ContractRef {
 
 /// A validated instance of the `gts.cf.core.qe.scope.v1~` discriminator.
 /// Deserialization preserves the same invariant as [`Self::parse`].
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize, utoipa::ToSchema)]
 #[serde(try_from = "String")]
+#[schema(value_type = String)]
 pub struct SubjectScope(GtsInstanceId);
 
 impl SubjectScope {
@@ -845,7 +866,7 @@ pub enum ScopeError {
 /// `InvalidArgument` at ingress rather than a deserialization failure. The
 /// gear maps `(metric, kind)` to the owner projection; callers never name a
 /// projection.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SubjectClaim {
     /// A well-known instance of the scope-discriminator type, as text.
@@ -858,7 +879,7 @@ pub struct SubjectClaim {
 ///
 /// Optional fields distinguish omission from `null`; explicit `null` is
 /// rejected and omitted values are not serialized.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ResourceProjection {
     /// The concrete resource projection type, as text.
@@ -885,7 +906,7 @@ pub struct ResourceProjection {
 ///
 /// `metadata` is represented as [`Option`] only to distinguish omission; the
 /// service requires it on the wire and rejects `null`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct EvaluationAttribution {
     /// Target tenant. The tenant-scope subject is materialized from it.
@@ -949,7 +970,7 @@ pub struct ActiveQuotaCounts {
 }
 
 /// Optional validity bounds of a Quota. Both ends are inclusive.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ValidityWindow {
     /// Start of validity, inclusive. `None` means no lower bound.
@@ -973,7 +994,7 @@ impl ValidityWindow {
 // ---------------------------------------------------------------------------
 
 /// A stored Quota record (DESIGN section 3.1).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[allow(
     clippy::struct_field_names,
     reason = "`quota_type` is the PRD field name; `type` is a keyword and `kind` would drift from the wire contract"
@@ -1027,7 +1048,7 @@ impl Quota {
 }
 
 /// Public Quota read shape: the stored record plus computed state.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct QuotaView {
     /// The stored record.
     #[serde(flatten)]
@@ -1056,7 +1077,7 @@ impl QuotaView {
 
 /// Public Quota create input. The service resolves and snapshots the constraint
 /// contract before constructing a [`QuotaDraft`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct QuotaSpec {
     /// PDP-authorized target tenant.
@@ -1158,7 +1179,7 @@ impl QuotaDraft {
 }
 
 /// Patch of a Quota's `cap`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum CapPatch {
     /// Set a numeric cap.
@@ -1168,7 +1189,7 @@ pub enum CapPatch {
 }
 
 /// Patch of a Quota's `validity_window`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ValidityWindowPatch {
     /// Remove the window.
@@ -1179,7 +1200,7 @@ pub enum ValidityWindowPatch {
 
 /// Partial update of a Quota. Absent fields stay untouched. Metric, type,
 /// period, and subject are immutable and therefore absent here.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(default, deny_unknown_fields)]
 pub struct QuotaPatch {
     /// New cap.
@@ -1212,7 +1233,7 @@ impl QuotaPatch {
 
 /// Filter for [`crate::QuotaEnforcementStoragePluginV1::read_quotas`].
 /// Every set field narrows the result.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(default)]
 pub struct QuotaFilter {
     /// Owning tenant.
@@ -1232,7 +1253,7 @@ pub struct QuotaFilter {
 // ---------------------------------------------------------------------------
 
 /// Cursor-based page request.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct PageRequest {
     /// Maximum number of items. Storage may clamp it to its own maximum.
     pub limit: u32,
@@ -1268,6 +1289,47 @@ pub struct PageResult<T> {
     pub items: Vec<T>,
     /// Cursor for the next page. `None` on the last page.
     pub next_cursor: Option<String>,
+}
+
+// Named per item type: the registry refuses two pages under one schema name.
+impl<T: utoipa::ToSchema> utoipa::PartialSchema for PageResult<T> {
+    fn schema() -> utoipa::openapi::RefOr<utoipa::openapi::schema::Schema> {
+        use utoipa::openapi::schema::{ArrayBuilder, ObjectBuilder, Type};
+        use utoipa::openapi::{Ref, RefOr};
+
+        ObjectBuilder::new()
+            .property(
+                "items",
+                ArrayBuilder::new().items(RefOr::<utoipa::openapi::schema::Schema>::Ref(
+                    Ref::from_schema_name(T::name().to_string()),
+                )),
+            )
+            .required("items")
+            .property(
+                "next_cursor",
+                ObjectBuilder::new().schema_type(utoipa::openapi::schema::SchemaType::from_iter([
+                    Type::String,
+                    Type::Null,
+                ])),
+            )
+            .into()
+    }
+}
+
+impl<T: utoipa::ToSchema> utoipa::ToSchema for PageResult<T> {
+    fn name() -> Cow<'static, str> {
+        Cow::Owned(format!("PageResult_{}", T::name()))
+    }
+
+    fn schemas(
+        schemas: &mut Vec<(
+            String,
+            utoipa::openapi::RefOr<utoipa::openapi::schema::Schema>,
+        )>,
+    ) {
+        schemas.push((T::name().to_string(), T::schema()));
+        T::schemas(schemas);
+    }
 }
 
 impl<T> PageResult<T> {
@@ -1311,7 +1373,7 @@ pub struct ApplicableQuotas {
 }
 
 /// Per-Quota mutation directive inside a [`Decision`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct QuotaDebitPlan {
     /// Total counter mutation for the Quota. Never negative.
     pub amount: u64,
@@ -1321,7 +1383,7 @@ pub struct QuotaDebitPlan {
 pub type DebitPlan = BTreeMap<QuotaId, QuotaDebitPlan>;
 
 /// Two-arm verdict of an evaluation (PRD section 3.4).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
 pub enum DecisionResult {
     /// The operation is within every applicable cap.
@@ -1336,7 +1398,7 @@ pub enum DecisionResult {
 }
 
 /// Engine output. Server-derived, response-only.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct Decision {
     /// The verdict.
     pub result: DecisionResult,
@@ -1398,7 +1460,7 @@ impl DecisionResult {
 // still an error.
 
 /// Charge a metric against every Quota that applies to the attribution.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct DebitRequest {
     /// Who and what is being charged.
     pub attribution: EvaluationAttribution,
@@ -1412,7 +1474,7 @@ pub struct DebitRequest {
 
 /// Return consumption to one Quota. Corrective and operator-facing: it names a
 /// Quota by id and evaluates no policy.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct CreditRequest {
     /// Authorized target tenant.
     pub tenant_id: TenantId,
@@ -1430,7 +1492,7 @@ pub struct CreditRequest {
 /// re-authorizes it, recomputes the subject key the debit was recorded under
 /// (a caller may never supply one), and requires the stored record to carry the
 /// same authorized attribution.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct RollbackRequest {
     /// Attribution of the debit being reversed.
     pub attribution: EvaluationAttribution,
@@ -1445,7 +1507,7 @@ pub struct RollbackRequest {
 }
 
 /// Evaluate without mutating anything.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct PreviewRequest {
     /// Who and what would be charged.
     pub attribution: EvaluationAttribution,
@@ -1454,7 +1516,7 @@ pub struct PreviewRequest {
 }
 
 /// Hold capacity against every applicable Quota for a bounded TTL.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct AcquireLeaseRequest {
     /// Who and what is being held.
     pub attribution: EvaluationAttribution,
@@ -1475,7 +1537,7 @@ pub struct AcquireLeaseRequest {
 /// The tenant is carried explicitly, as [`CreditRequest`] does, so the
 /// authenticated principal is authorized before the token is ever read: a token
 /// outside the caller's authorized tenant is simply absent.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct CommitLeaseRequest {
     /// Authorized target tenant.
     pub tenant_id: TenantId,
@@ -1491,7 +1553,7 @@ pub struct CommitLeaseRequest {
 }
 
 /// Return an active lease's held capacity without committing a debit.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct ReleaseLeaseRequest {
     /// Authorized target tenant. See [`CommitLeaseRequest::tenant_id`].
     pub tenant_id: TenantId,
@@ -1502,7 +1564,7 @@ pub struct ReleaseLeaseRequest {
 }
 
 /// How a batch debit's items relate to each other.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum BatchMode {
     /// All or nothing: every item is admitted, or none moves a counter.
@@ -1513,7 +1575,7 @@ pub enum BatchMode {
 }
 
 /// One item of a batch debit: a debit of its own metric.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct BatchItemRequest {
     /// Who and what this item charges.
     pub attribution: EvaluationAttribution,
@@ -1532,7 +1594,7 @@ pub struct BatchItemRequest {
 /// same tenant (`BATCH_TENANT_MIXED`): the envelope has one idempotency scope,
 /// keyed by that tenant. Each item is still authorized on its own attribution.
 /// Item keys must be unique within the batch (`BATCH_ITEM_KEY_DUPLICATE`).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct BatchDebitRequest {
     /// Required batch semantics.
     pub mode: BatchMode,
@@ -1543,7 +1605,7 @@ pub struct BatchDebitRequest {
 }
 
 /// The batch-level verdict.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum BatchResult {
     /// Every item was allowed and the union of their plans was applied.
@@ -1553,7 +1615,7 @@ pub enum BatchResult {
 }
 
 /// One item's decision, in submission order.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct BatchItemOutcome {
     /// The item's own key.
     pub idempotency_key: String,
@@ -1563,7 +1625,7 @@ pub struct BatchItemOutcome {
 }
 
 /// The outcome of an atomic batch.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[must_use]
 pub struct BatchDecision {
     /// The batch-level verdict.
@@ -1625,7 +1687,7 @@ impl BatchRecord {
 
 /// A decision that was never applied. Structurally a [`Decision`] plus the flag
 /// that says so, so a caller can parse both responses the same way.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct DecisionPreview {
     /// The verdict, flattened: `result`, `debit_plan`, and `diagnostics` sit at
     /// the top level next to `preview`.
@@ -1993,7 +2055,7 @@ pub struct EvaluatedLease {
 ///
 /// A denial is a successful call carrying a [`Decision`], not an error
 /// (PRD section 3.4), which a bare token could not express.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[must_use]
 #[serde(tag = "outcome", rename_all = "snake_case")]
 pub enum AcquireLeaseOutcome {
@@ -2122,7 +2184,7 @@ pub enum ApportionError {
 // ---------------------------------------------------------------------------
 
 /// Current period bounds of a consumption Quota.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct PeriodWindow {
     /// Period start, inclusive.
     #[serde(with = "rfc3339")]
@@ -2136,7 +2198,7 @@ pub struct PeriodWindow {
 }
 
 /// Per-Quota state returned by snapshot reads (PRD section 5.10).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct QuotaSnapshot {
     /// The Quota.
     pub quota_id: QuotaId,
@@ -2173,7 +2235,7 @@ pub struct QuotaSnapshot {
 /// subject is that subject or the request's tenant. The tenant kind
 /// ([`SCOPE_TENANT`]) is a tenant-only filter: its `id` must equal the
 /// request's `tenant_id`, and it selects the tenant's own Quotas only.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SnapshotSubject {
     /// A well-known instance of the scope-discriminator type, as text.
@@ -2198,7 +2260,7 @@ pub struct SnapshotSubject {
 /// (`SNAPSHOT_TOO_MANY_SUBJECTS`), a `limit` outside `1..=page_size`
 /// (`SNAPSHOT_LIMIT_OUT_OF_RANGE`), or a `tenant` filter naming another tenant
 /// (`SNAPSHOT_TENANT_MISMATCH`).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct SnapshotRequest {
     /// Target tenant.
     pub tenant_id: TenantId,
@@ -2211,7 +2273,7 @@ pub struct SnapshotRequest {
 }
 
 /// Outcome of a Quota deactivation.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct DeactivateOutcome {
     /// Leases resolved atomically with the deactivation.
     pub resolved_leases: Vec<LeaseToken>,
@@ -2222,7 +2284,7 @@ pub struct DeactivateOutcome {
 // ---------------------------------------------------------------------------
 
 /// Scope of a Quota Resolution Policy. P1 is closed to two levels.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PolicyScope {
     /// Platform-wide fallback.
@@ -2272,7 +2334,7 @@ impl<T> TransitionOutcome<T> {
 }
 
 /// Public create input. Actor identity and validation snapshots are server-owned.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PolicySpec {
     /// Scope.
@@ -2293,7 +2355,7 @@ pub struct PolicySpec {
 }
 
 /// Public update input. Creates a new immutable version after operator admission.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PolicyPatch {
     /// Expected current version. Lost-update protection.
@@ -2364,7 +2426,7 @@ pub struct PolicyUpdate {
 }
 
 /// One immutable Policy version.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct PolicyVersion {
     /// Server-resolved engine schema closure; empty for MRW.
     #[serde(default)]
@@ -2396,7 +2458,7 @@ pub struct PolicyVersion {
 }
 
 /// Version listing entry.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct PolicyVersionMeta {
     /// Version number.
     pub version: u32,

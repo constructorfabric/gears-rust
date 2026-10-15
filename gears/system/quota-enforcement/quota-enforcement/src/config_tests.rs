@@ -583,3 +583,42 @@ fn the_notification_bounds_are_read_from_their_own_section() {
     );
     config.validate().expect("valid");
 }
+
+#[test]
+fn client_wiring_declares_each_contract_and_defaults_to_local() {
+    use toolkit_contract::wiring::ClientWiring;
+
+    let absent = QuotaEnforcementConfig::default();
+    assert!(absent.client_wiring.quota_manager_api.is_none());
+    assert!(absent.client_wiring.quota_enforcement_api.is_none());
+    assert!(absent.client_wiring.quota_operator_api.is_none());
+
+    let split: QuotaEnforcementConfig = serde_json::from_str(
+        r#"{ "client_wiring": {
+            "quota_manager_api": { "transport": "rest", "endpoint": "http://qe:8080" },
+            "quota_enforcement_api": { "transport": "rest", "endpoint": "http://qe:8080" },
+            "quota_operator_api": { "transport": "local" }
+        } }"#,
+    )
+    .expect("a split deployment's wiring parses");
+    assert!(matches!(
+        split.client_wiring.quota_manager_api,
+        Some(ClientWiring::Rest { .. })
+    ));
+    assert!(matches!(
+        split.client_wiring.quota_enforcement_api,
+        Some(ClientWiring::Rest { .. })
+    ));
+    assert!(matches!(
+        split.client_wiring.quota_operator_api,
+        Some(ClientWiring::Local)
+    ));
+
+    assert!(
+        serde_json::from_str::<QuotaEnforcementConfig>(
+            r#"{ "client_wiring": { "quota_manager_client_v1": { "transport": "local" } } }"#
+        )
+        .is_err(),
+        "a contract key QE does not provide is a boot failure, not an ignored setting"
+    );
+}

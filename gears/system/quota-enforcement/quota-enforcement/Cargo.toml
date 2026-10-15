@@ -34,7 +34,7 @@ grpc-client = ["cluster-sdk/grpc-client"]
 quota-enforcement-engine-cel = { workspace = true }
 quota-enforcement-engine-most-restrictive = { workspace = true }
 parking_lot = { workspace = true }
-quota-enforcement-sdk = { workspace = true }
+quota-enforcement-sdk = { workspace = true, features = ["rest-client", "rest-server"] }
 authz-resolver-sdk = { workspace = true }
 authz-resolver = { workspace = true }
 types-registry-sdk = { workspace = true }
@@ -56,7 +56,7 @@ jsonschema = { workspace = true }
 
 axum = { workspace = true }
 # Repeated list query parameters (`id=a&id=b`) and their OpenAPI declaration.
-toolkit-contract = { workspace = true, features = ["rest-server"] }
+toolkit-contract = { workspace = true, features = ["runtime-client", "rest-server"] }
 anyhow = { workspace = true }
 # One server clock reading per read response and the gauge refresh timing.
 time = { workspace = true }
