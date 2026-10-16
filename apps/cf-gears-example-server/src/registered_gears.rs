@@ -52,9 +52,6 @@ use static_authz_plugin as _;
 #[cfg(feature = "tr-authz")]
 use tr_authz_plugin as _;
 
-#[cfg(feature = "rules-authz")]
-use rules_authz_plugin as _;
-
 #[cfg(feature = "static-license")]
 use static_license_plugin as _;
 

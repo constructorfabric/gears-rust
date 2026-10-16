@@ -151,7 +151,6 @@ members = [
     "gears/system/authz-resolver/authz-resolver",
     "gears/system/authz-resolver/plugins/static-authz-plugin",
     "gears/system/authz-resolver/plugins/tr-authz-plugin",
-    "gears/system/authz-resolver/plugins/rules-authz-plugin",
     "gears/system/oagw/oagw",
     "gears/system/oagw/oagw-sdk",
     "gears/system/usage-collector/usage-collector-sdk",
@@ -398,7 +397,6 @@ api-gateway = { package = "cf-gears-api-gateway", version = "0.5.2", path = "gea
 # Concrete plugins needed to link a standalone-mode binary.
 static-authn-plugin = { package = "cf-gears-static-authn-plugin", version = "0.3.18", path = "gears/system/authn-resolver/plugins/static-authn-plugin" }
 static-authz-plugin = { package = "cf-gears-static-authz-plugin", version = "0.1.38", path = "gears/system/authz-resolver/plugins/static-authz-plugin" }
-rules-authz-plugin = { package = "cf-gears-rules-authz-plugin", version = "0.1.0", path = "gears/system/authz-resolver/plugins/rules-authz-plugin" }
 standalone-cluster-plugin = { package = "cf-gears-standalone-cluster-plugin", version = "0.2.8", path = "gears/system/cluster/plugins/standalone-cluster-plugin" }
 
 cf-gears-cluster-sdk = { version = "0.2.8", path = "gears/system/cluster/cluster-sdk" }

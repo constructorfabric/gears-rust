@@ -33,7 +33,6 @@ static-authn = ["dep:static-authn-plugin"]
 static-authz = ["dep:static-authz-plugin"]
 static-license = ["dep:static-license-plugin"]
 tr-authz = ["dep:tr-authz-plugin"]
-rules-authz = ["dep:rules-authz-plugin"]
 tenant-resolver-rg = ["dep:rg-tr-plugin"]
 static-credstore = ["credstore", "dep:static-credstore-plugin"]
 mini-chat = ["dep:mini-chat"]
@@ -104,7 +103,6 @@ rg-tr-plugin = { package = "cf-gears-rg-tr-plugin", path = "../../gears/system/t
 static-authn-plugin = { package = "cf-gears-static-authn-plugin", path = "../../gears/system/authn-resolver/plugins/static-authn-plugin", optional = true }
 static-authz-plugin = { package = "cf-gears-static-authz-plugin", path = "../../gears/system/authz-resolver/plugins/static-authz-plugin", optional = true }
 tr-authz-plugin = { package = "cf-gears-tr-authz-plugin", path = "../../gears/system/authz-resolver/plugins/tr-authz-plugin", optional = true }
-rules-authz-plugin = { package = "cf-gears-rules-authz-plugin", path = "../../gears/system/authz-resolver/plugins/rules-authz-plugin", optional = true }
 
 # Optional license resolver plugins
 static-license-plugin = { package = "cf-gears-static-license-plugin", path = "../../gears/system/license-resolver/plugins/static-license-plugin", optional = true }
