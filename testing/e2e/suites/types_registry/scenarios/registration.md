@@ -54,8 +54,8 @@ Valid root Type Schema fixtures follow the GTS §4.4.1 closed-envelope pattern: 
   - [TR-REG-603 — One major cannot mix major-only and minor-bearing shapes](#tr-reg-603--one-major-cannot-mix-major-only-and-minor-bearing-shapes)
   - [TR-REG-604 — Refuse a content revision of a minor-bearing schema](#tr-reg-604--refuse-a-content-revision-of-a-minor-bearing-schema)
   - [TR-REG-605 — A failed predecessor blocks the next minor](#tr-reg-605--a-failed-predecessor-blocks-the-next-minor)
-  - [TR-REG-606 — Admit a compatible minor with changed content without force](#tr-reg-606--admit-a-compatible-minor-with-changed-content-without-force)
-  - [TR-REG-607 — Refuse an incompatible minor without force](#tr-reg-607--refuse-an-incompatible-minor-without-force)
+  - [TR-REG-606 — Admit a compatible minor with changed content without a skip request](#tr-reg-606--admit-a-compatible-minor-with-changed-content-without-a-skip-request)
+  - [TR-REG-607 — Refuse an incompatible minor without a skip request](#tr-reg-607--refuse-an-incompatible-minor-without-a-skip-request)
 - [Dry-run admission](#dry-run-admission)
   - [TR-REG-701 — Predict creation, then commit under a new key](#tr-reg-701--predict-creation-then-commit-under-a-new-key)
   - [TR-REG-702 — A mixed dry run predicts the committed item verdicts](#tr-reg-702--a-mixed-dry-run-predicts-the-committed-item-verdicts)
@@ -69,8 +69,8 @@ Valid root Type Schema fixtures follow the GTS §4.4.1 closed-envelope pattern: 
   - [TR-REG-803 — Stable schemas cannot derive from or `$ref` major zero](#tr-reg-803--stable-schemas-cannot-derive-from-or-ref-major-zero)
 - [Deployment policy and compatibility waiver](#deployment-policy-and-compatibility-waiver)
   - [TR-REG-901 — A region outside the allowlist refuses a non-platform vendor](#tr-reg-901--a-region-outside-the-allowlist-refuses-a-non-platform-vendor)
-  - [TR-REG-902 — Disabled `force` is a synchronous refusal](#tr-reg-902--disabled-force-is-a-synchronous-refusal)
-  - [TR-REG-903 — Enabled `force` records a waived minor transition](#tr-reg-903--enabled-force-records-a-waived-minor-transition)
+  - [TR-REG-902 — A disallowed `skip_compatibility_check` is a synchronous refusal](#tr-reg-902--a-disallowed-skip_compatibility_check-is-a-synchronous-refusal)
+  - [TR-REG-903 — An allowed `skip_compatibility_check` records a waived minor transition](#tr-reg-903--an-allowed-skip_compatibility_check-records-a-waived-minor-transition)
   - [TR-REG-904 — A configured region admits its allowed vendor](#tr-reg-904--a-configured-region-admits-its-allowed-vendor)
 
 ## Successful registration
@@ -497,25 +497,25 @@ B also reports `dependency_kind=ref` and the missing ID. A is readable; B and C 
 
 **Then:** v1.0 fails with `dependency_not_found`; v1.1 fails with `blocked_by_predecessor`. Neither ID becomes readable. This reason differs from the `blocked_by_dependency` of a failed authored `$ref` or conforming-type edge.
 
-### TR-REG-606 — Admit a compatible minor with changed content without force
+### TR-REG-606 — Admit a compatible minor with changed content without a skip request
 
 **Fixtures:** [person_minor_0_schema](../fixtures/registration/person_minor_0_schema.json), [person_minor_1_schema](../fixtures/registration/person_minor_1_schema.json).
 
 **Given:** register `person_minor_0_schema` and retain its version-1 body. Prepare `person_minor_1_schema` with optional string property `nickname` added at its closed root, leaving all existing constraints and its own matching `$id` intact.
 
-**When:** submit the v1.1 candidate as a creation, without `expected_resource_version` or `force`, and await completion.
+**When:** submit the v1.1 candidate as a creation, without `expected_resource_version` or `skip_compatibility_check`, and await completion.
 
-**Then:** v1.1 succeeds at its own resource version 1. Exact read returns its distinct GTS ID and UUID, the new optional property and `provenance.compat_forced=false`. V1.0 retains its original content, identity, timestamps and version. The content change is accepted by the ordinary cross-minor compatibility check.
+**Then:** v1.1 succeeds at its own resource version 1. Exact read returns its distinct GTS ID and UUID, the new optional property and `provenance.compatibility_check_skipped=false`. V1.0 retains its original content, identity, timestamps and version. The content change is accepted by the ordinary cross-minor compatibility check.
 
-### TR-REG-607 — Refuse an incompatible minor without force
+### TR-REG-607 — Refuse an incompatible minor without a skip request
 
 **Fixtures:** [person_minor_0_schema](../fixtures/registration/person_minor_0_schema.json), [person_minor_1_schema](../fixtures/registration/person_minor_1_schema.json).
 
 **Given:** register `person_minor_0_schema` and retain its version-1 body and ETag. Prepare `person_minor_1_schema` with `content.properties.name.minLength=2`; the predecessor accepted one-character names. Keep the candidate's `$id`, dialect and other constraints valid.
 
-**When:** submit the v1.1 candidate as a creation without `force`, even though the default deployment permits explicitly requested compatibility waivers.
+**When:** submit the v1.1 candidate as a creation without `skip_compatibility_check`, even though the default deployment permits explicitly requested compatibility waivers.
 
-**Then:** acceptance returns `202`; the item fails `incompatible_with_baseline` with `resource_version=null`. V1.1 remains absent. V1.0's body and ETag remain unchanged. Deployment permission to use `force` does not apply it implicitly; TR-REG-903 covers an explicit waiver.
+**Then:** acceptance returns `202`; the item fails `incompatible_with_baseline` with `resource_version=null`. V1.1 remains absent. V1.0's body and ETag remain unchanged. Deployment permission to use `skip_compatibility_check` does not apply it implicitly; TR-REG-903 covers an explicit waiver.
 
 
 ## Dry-run admission
@@ -629,25 +629,25 @@ B also reports `dependency_kind=ref` and the missing ID. A is readable; B and C 
 
 **Then:** acceptance refuses it synchronously with `400` RFC-9457 `failed_precondition`: one `REGISTRATION_POLICY_ALLOWED_VENDORS` violation whose subject is the implicit `<default>` region, because no matching region provides `allowed_vendors`. There is no operation `Location` and the ID is not readable. A `cf`-vendor ID would not exercise this policy gate.
 
-### TR-REG-902 — Disabled `force` is a synchronous refusal
+### TR-REG-902 — A disallowed `skip_compatibility_check` is a synchronous refusal
 
 **Fixtures:** [person_minor_0_schema](../fixtures/registration/person_minor_0_schema.json), [person_minor_1_schema](../fixtures/registration/person_minor_1_schema.json).
 
-**Given:** a registered first minor `person_minor_0_schema` and a `person_minor_1_schema` candidate carrying `force=true`. The local launcher keeps `allow_compatibility_force=false` in its `force-disabled` profile.
+**Given:** a registered first minor `person_minor_0_schema` and a `person_minor_1_schema` candidate carrying `skip_compatibility_check=true`. The local launcher keeps `allow_compatibility_force=false` in its `force-disabled` profile.
 
 **When:** submit the candidate, then submit it again with `dry_run=true`.
 
-**Then:** each request is refused before `202` with `400` RFC-9457 `invalid_argument` and a `force` field violation. Neither creates an operation or v1.1 entity: a dry run cannot be used to probe a waiver the deployment does not allow.
+**Then:** each request is refused before `202` with `400` RFC-9457 `invalid_argument` and a `skip_compatibility_check` field violation. Neither creates an operation or v1.1 entity: a dry run cannot be used to probe a waiver the deployment does not allow.
 
-### TR-REG-903 — Enabled `force` records a waived minor transition
+### TR-REG-903 — An allowed `skip_compatibility_check` records a waived minor transition
 
 **Fixtures:** [person_minor_0_schema](../fixtures/registration/person_minor_0_schema.json), [person_minor_1_schema](../fixtures/registration/person_minor_1_schema.json).
 
-**Given:** the shared e2e config has `allow_compatibility_force=true`. A stable `person_minor_0_schema` schema is registered. Its `person_minor_1_schema` candidate is incompatible with v1.0 but carries `force=true`.
+**Given:** the shared e2e config has `allow_compatibility_force=true`. A stable `person_minor_0_schema` schema is registered. Its `person_minor_1_schema` candidate is incompatible with v1.0 but carries `skip_compatibility_check=true`.
 
 **When:** submit v1.1 and await completion, then read both minors with `$select=content,provenance`.
 
-**Then:** v1.1 `succeeded` at version 1, with its incompatible content and `provenance.compat_forced=true`. V1.0 remains unchanged and reports `compat_forced=false`. The waiver belongs only to the cross-minor comparison and does not revise v1.0. Every run but the force-disabled profile runs this scenario.
+**Then:** v1.1 `succeeded` at version 1, with its incompatible content and `provenance.compatibility_check_skipped=true`. V1.0 remains unchanged and reports `provenance.compatibility_check_skipped=false`. The waiver belongs only to the cross-minor comparison and does not revise v1.0. Every run but the force-disabled profile runs this scenario.
 
 ### TR-REG-904 — A configured region admits its allowed vendor
 

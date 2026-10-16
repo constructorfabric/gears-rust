@@ -82,6 +82,12 @@ jobs:
               # Input to `make check-release-config` in the test job: a config-only
               # edit must still get the release configuration validated.
               - 'release-plz.toml'
+              # Input to `make check-release-resolver` in the test job: a config-only
+              # edit to the release manifest must still get the resolver + manifest
+              # integrity (chart/dockerfile paths exist) tests run.
+              - 'deploy/components.yaml'
+              - 'tools/scripts/resolve_release.py'
+              - 'tools/scripts/tests/test_resolve_release.py'
               # Input to `e2e_sidecar_pins_the_same_timescaledb_image` in
               # libs/test-containers: a Python-only edit to the E2E sidecar must
               # still get the cross-lane TimescaleDB pin checked, or the guard
@@ -265,6 +271,9 @@ jobs:
 
       - name: Validate release configuration (publish flags, release-plz.toml)
         run: make check-release-config
+
+      - name: Release resolver tests (resolve_release.py + components.yaml)
+        run: make check-release-resolver
 
       - name: Install Go (required for aws-lc-fips-sys FIPS build)
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
@@ -509,6 +518,10 @@ jobs:
       - name: Test types-registry (db integration)
         if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
         run: tools/scripts/with_rust_annotations.sh make test-types-registry-db
+
+      - name: Test oagw (pg/mysql conformance + migrations, integration)
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        run: tools/scripts/with_rust_annotations.sh make test-oagw-db
 
       # Published as GitHub Checks by test-report.yml (workflow_run), which has
       # the `checks: write` this job lacks on fork PRs. `!cancelled()` so a

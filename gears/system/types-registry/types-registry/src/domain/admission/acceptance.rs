@@ -383,7 +383,7 @@ pub fn validate(
             item_no,
             key: EntityKey::GtsId(id.id().to_owned()),
             precondition: expected,
-            // The wire and ADR-0004 say `force`; the column says `compat_forced`.
+            // The wire says `skip_compatibility_check`; the column says `compat_forced`.
             // This is the one place the two names meet.
             compat_forced: candidate.force,
             request_payload: canonical,
@@ -698,8 +698,32 @@ fn count_refusal(
     }
 }
 
-/// Resolve the `Idempotency-Key` and commit a validated request.
+/// Resolve the `Idempotency-Key`, commit a validated request, and report the accepted or
+/// replayed operation once it is durable.
 async fn accept_inner(
+    stores: &Arc<dyn Stores>,
+    db: &DBProvider<AcceptanceError>,
+    scope: &AccessScope,
+    dispatch: &Arc<dyn OperationDispatch>,
+    validated: Validated,
+    now: OffsetDateTime,
+) -> Result<Accepted, AcceptanceError> {
+    let (kind, dry_run, items) = (validated.kind, validated.dry_run, validated.items.len());
+    let key = validated.idempotency_key.clone();
+    let accepted = commit_or_replay(stores, db, scope, dispatch, validated, now).await?;
+    crate::observability::operation_accepted(
+        accepted.operation_id,
+        kind,
+        dry_run,
+        items,
+        accepted.replayed,
+        &key,
+    );
+    Ok(accepted)
+}
+
+/// Resolve the `Idempotency-Key` and commit a validated request.
+async fn commit_or_replay(
     stores: &Arc<dyn Stores>,
     db: &DBProvider<AcceptanceError>,
     scope: &AccessScope,

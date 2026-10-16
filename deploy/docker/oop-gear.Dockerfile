@@ -1,11 +1,14 @@
-# Generalized multi-stage build for a single OoP gear image.
+# Generalized multi-stage build for one OoP gear image.
 #
-# Parameterized by build args so one Dockerfile produces a minimal image per
-# gear. Because OoP dependency resolution goes through the DirectoryService +
-# REST clients (not in-process linking), a gear image only compiles the target
-# gear crate + its SDK/client deps - not the full gear set.
+# One image per gear via build args: an OoP gear compiles only its own crate +
+# SDK/client deps (resolution is REST, not in-process linking), not the full gear
+# set.
 #
-# Build the hello OoP gear:
+# The per-gear recipe (package, binary, features, config, port) lives in
+# deploy/components.yaml, fed to this Dockerfile by
+# .github/workflows/publish-artifacts.yml — add a gear there, not here.
+#
+# Build by hand:
 #   docker build -f deploy/docker/oop-gear.Dockerfile \
 #     --build-arg GEAR_PACKAGE=hello \
 #     --build-arg GEAR_BIN=hello-oop \

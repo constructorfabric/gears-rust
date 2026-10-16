@@ -1,0 +1,63 @@
+# Release manifest — the single source of truth for what the image + chart pipeline
+# (.github/workflows/publish-artifacts.yml) publishes. One entry per component, keyed
+# by its artifact name (image ghcr.io/constructorfabric/<name>, chart <name>).
+#
+# Fields:
+#   crate   (optional) Cargo crate whose release publishes this automatically —
+#           release-plz.yml reads release-plz's output and publishes it in the same
+#           run. Omit for components with no crate (published via workflow_dispatch).
+#   chart   Path to the Helm chart directory.
+#   image   (optional) Docker image recipe; omit for chart-only components.
+#     dockerfile  Dockerfile path (build context is the repo root).
+#     buildArgs   `--build-arg` values; for oop-gear.Dockerfile, the whole recipe
+#                 (package, bin, features, config).
+
+components:
+  flight-control:
+    crate: cf-gears-flight-control
+    chart: apps/cf-gears-flight-control/deploy/helm/flight-control
+    image:
+      dockerfile: deploy/docker/flight-control.Dockerfile
+      buildArgs:
+        - CARGO_NO_DEFAULT_FEATURES=1
+        - CARGO_FEATURES=static-authn k8s otel
+
+  hello:
+    crate: hello
+    chart: examples/toolkit/hello/deploy/helm/hello
+    image:
+      dockerfile: deploy/docker/oop-gear.Dockerfile
+      buildArgs:
+        - GEAR_PACKAGE=hello
+        - GEAR_BIN=hello-oop
+        - GEAR_FEATURES=oop_module k8s-auth otel
+        - GEAR_CONFIG=config/oop-hello.yaml
+        - GEAR_PORT=9091
+
+  api-contracts:
+    crate: cf-api-contracts
+    chart: examples/toolkit/api-contracts/deploy/helm/api-contracts
+    image:
+      dockerfile: deploy/docker/oop-gear.Dockerfile
+      buildArgs:
+        - GEAR_PACKAGE=cf-api-contracts
+        - GEAR_BIN=api-contracts-oop
+        - GEAR_FEATURES=oop_module k8s-auth otel
+        - GEAR_CONFIG=config/oop-api-contracts.yaml
+        - GEAR_PORT=9097
+
+  api-contracts-consumer:
+    crate: cf-api-contracts-consumer
+    chart: examples/toolkit/api-contracts/deploy/helm/api-contracts-consumer
+    image:
+      dockerfile: deploy/docker/oop-gear.Dockerfile
+      buildArgs:
+        - GEAR_PACKAGE=cf-api-contracts-consumer
+        - GEAR_BIN=api-contracts-consumer-oop
+        - GEAR_FEATURES=oop_module k8s-auth otel
+        - GEAR_CONFIG=config/oop-api-contracts-consumer.yaml
+        - GEAR_PORT=9098
+
+  # Platform umbrella — chart only, no crate; published via workflow_dispatch.
+  toolkit-platform:
+    chart: deploy/helm/toolkit-platform

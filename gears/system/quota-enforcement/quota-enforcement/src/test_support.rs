@@ -47,7 +47,7 @@ use toolkit_canonical_errors::CanonicalError;
 use toolkit_security::{PlatformSecurityContext, SecurityContext, pep_properties};
 use types_registry::config::TypesRegistryConfig;
 use types_registry::domain::TypesRegistryService;
-use types_registry::domain::local_client::TypesRegistryLocalClient;
+use types_registry::domain::legacy_local_client::TypesRegistryLocalClient;
 use types_registry::infra::InMemoryGtsRepository;
 use types_registry_sdk::testing::{MockTypesRegistryClient, make_test_instance};
 use types_registry_sdk::{

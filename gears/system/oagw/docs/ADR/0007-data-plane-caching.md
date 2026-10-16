@@ -6,6 +6,8 @@ decision-makers: Constructor Fabric Steering Committee
 
 # Control Plane Caching — Multi-Layer L1/L2 Strategy
 
+> **Implementation status:** not implemented. OAGW has no configuration cache: every proxied request reads the repositories (with a database, three queries; see [ADR: Optional Persistence](./0018-optional-persistence.md)). No configuration is cached. Endpoint connection pools are; with a shared database, how they follow writes made on other replicas is in [Endpoint Pool Freshness Across Replicas](./0018-optional-persistence.md#endpoint-pool-freshness-across-replicas). OAuth2 tokens and the negotiated HTTP version per host are cached with a TTL, keyed by content, not by upstream.
+
 
 <!-- toc -->
 
@@ -61,7 +63,7 @@ Chosen option: "Multi-layer caching: L1 (in-memory) + optional L2 (Redis) + Data
 |---|---|---|---|---|---|
 | L1 (In-Memory) | Per-instance LRU | 10,000 entries | No TTL (LRU eviction) | <1μs | |
 | L2 (Redis, optional) | Shared across instances | Unbounded | 5 minutes | ~1-2ms | MessagePack serialization |
-| Database (PostgreSQL) | Source of truth (JSON text) | Unlimited | N/A | ~5-10ms | Queried only on L1+L2 miss |
+| Database (PostgreSQL, MySQL or SQLite) | Source of truth (JSON columns) | Unlimited | N/A | ~5-10ms | Queried only on L1+L2 miss |
 
 ### Lookup Flow
 

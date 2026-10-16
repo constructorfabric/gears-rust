@@ -156,8 +156,16 @@ patterns = [
 ]
 
 [[ignore]]
+reason = "Ignore credstore out-of-scope list — out-of-scope.md lists, in prose, the cases the gear does not handle in this version; a companion to DESIGN.md §6 and ADR-0006, not a standalone SDLC artifact. Same class as the file-storage operations.md entry above."
+patterns = ["gears/credstore/docs/out-of-scope.md"]
+
+[[ignore]]
 reason = "Ignore chat-engine companion doc — WEBHOOK-PROTOCOL.md documents the webhook JSON Schema (docs/webhook-protocol.json), the HTTP contract Chat Engine calls backend plugins over. A protocol reference supplementary to DESIGN.md, not a standalone SDLC artifact. Same class as the file-storage api.md/operations.md entry above."
 patterns = ["gears/chat-engine/docs/WEBHOOK-PROTOCOL.md"]
+
+[[ignore]]
+reason = "Ignore module 'llm-gateway' (not SDLC-documented yet: PRD is a draft and DESIGN is missing). Remove this ignore after PRD/DESIGN conform to template."
+patterns = ["gears/llm-gateway/*"]
 
 [[ignore]]
 reason = "Ignore module 'mini-chat' docs (temporary: PRD/DESIGN constraints failing in CI)."

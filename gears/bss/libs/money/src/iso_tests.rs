@@ -1,7 +1,7 @@
 //! ISO 4217 scale table tests.
 #![allow(clippy::unwrap_used)]
 
-use super::iso_scale;
+use super::{iso_codes, iso_scale};
 
 #[test]
 fn common_currencies_have_their_iso_scale() {
@@ -80,4 +80,30 @@ fn the_table_lists_exactly_the_active_codes() {
         }
     }
     assert_eq!((zero, two, three, four), (17, 139, 7, 2));
+}
+
+#[test]
+fn the_code_list_is_the_table_in_code_order() {
+    let listed: Vec<(&str, u8)> = iso_codes().collect();
+    assert_eq!(listed.len(), 165);
+    assert!(
+        listed.windows(2).all(|pair| pair[0].0 < pair[1].0),
+        "the codes are listed once each, in code order"
+    );
+    for (code, scale) in &listed {
+        assert_eq!(iso_scale(code), Some(*scale), "{code}");
+    }
+    // Every three-letter code with a scale is listed.
+    for a in b'A'..=b'Z' {
+        for b in b'A'..=b'Z' {
+            for c in b'A'..=b'Z' {
+                let code = String::from_utf8(vec![a, b, c]).unwrap();
+                assert_eq!(
+                    iso_scale(&code).is_some(),
+                    listed.iter().any(|(listed, _)| *listed == code),
+                    "{code}"
+                );
+            }
+        }
+    }
 }

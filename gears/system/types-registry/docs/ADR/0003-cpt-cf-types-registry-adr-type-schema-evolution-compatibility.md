@@ -101,7 +101,7 @@ Chosen option: **Types Registry follows a `BACKWARD` compatibility strategy and 
 
 A candidate is admissible only when `Valid(baseline) ⊆ Valid(candidate)` under the platform-approved GTS implementation, where the baseline is the current revision of the same logical entity when it is major-only, and the definition of the preceding minor of its major when the candidate is minor-bearing (ADR-0004). Because deciding that inclusion is not always possible for arbitrary JSON Schema, a candidate whose compatibility the implementation cannot establish is rejected rather than published; Types Registry fails closed and never treats an undecided check as a pass.
 
-The one exception is per candidate and reaches only the second case: ADR-0004's `force` waives the cross-minor check, and can never waive the intra-entity one. §*The comparison baseline* records why that asymmetry is sound rather than convenient.
+The one exception is per candidate and reaches only the second case: ADR-0004's `skip_compatibility_check` waives the cross-minor check, and can never waive the intra-entity one. §*The comparison baseline* records why that asymmetry is sound rather than convenient.
 
 This is exactly the guarantee the architecture requires. Because a domain object carries no revision and a `$ref` floats, the current revision is validated against payloads and references created under any earlier revision. Backward compatibility is the property that makes that safe.
 
@@ -126,7 +126,7 @@ major-only     v1#1  ≤  v1#2  ≤  v1#3  …      each vs its own current revi
 minor-bearing  v1.0  ≤  v1.1  ≤  v1.2  …      each vs the minor before it
 ```
 
-Transitivity then yields the guarantee at the granularity a consumer cares about: **the current revision of the highest minor of a stable major accepts every instance ever accepted anywhere in that major**, provided every edge it composes was actually established — which excludes a step admitted under `force` and excludes any edge whose verdict was computed under semantics the relation has since left behind. Admission still reads one baseline, so its cost is independent of how many minors and revisions the major holds.
+Transitivity then yields the guarantee at the granularity a consumer cares about: **the current revision of the highest minor of a stable major accepts every instance ever accepted anywhere in that major**, provided every edge it composes was actually established — which excludes a step admitted under `skip_compatibility_check` and excludes any edge whose verdict was computed under semantics the relation has since left behind. Admission still reads one baseline, so its cost is independent of how many minors and revisions the major holds.
 
 The argument requires the chain to stay intact, which ADR-0005 guarantees — every revision is checked against the then-current revision, no admitted revision is removed, and the current pointer never moves backward. Across minor boundaries one further rule keeps it intact, and ADR-0004 owns it because it is a property of identity rather than of compatibility: **the minors of a major are contiguous and open at `M.0`.** Without it the sequence branches at a shared predecessor, the endpoints stop being comparable, and the guarantee above is not established.
 
@@ -138,7 +138,7 @@ The argument requires the chain to stay intact, which ADR-0005 guarantees — ev
 
 Contiguity instead names the baseline in the candidate identifier: `vM.n~` always uses `vM.(n-1)~`. At commit, admission only rechecks that this identifier still exists as `ACTIVE` or `DELETED`. Deletion does not unaccept the predecessor's instances, so a deleted predecessor remains the baseline.
 
-**Only the intra-entity half of the chain is structural**, because only there is a consumer carried onto the new revision by a floating reference. The cross-minor edge underwrites no mechanism, which is why ADR-0004 permits `force` to waive it for one candidate and why nothing may waive the other. A major containing a forced step still has a well-formed sequence; what it no longer has is the guarantee stated above about its endpoints.
+**Only the intra-entity half of the chain is structural**, because only there is a consumer carried onto the new revision by a floating reference. The cross-minor edge underwrites no mechanism, which is why ADR-0004 permits `skip_compatibility_check` to waive it for one candidate and why nothing may waive the other. A major containing a forced step still has a well-formed sequence; what it no longer has is the guarantee stated above about its endpoints.
 
 The erase-and-reintroduce hazard follows from the same property rather than from a separate rule. Under specification §4.5, adding and removing a property have opposite backward verdicts in each content model: in a closed model addition is backward compatible and removal is not, in an open model removal is backward compatible and addition is not. A property therefore cannot be dropped and later reintroduced under a different schema without one of the two steps failing the enforced mode.
 
@@ -189,16 +189,16 @@ There is no separate structured diagnostics field in the current contract. Autho
 The asymmetry is not an economy. Everything a successful result could have said is already available to the caller, or unreachable, or a fold this decision set declined elsewhere:
 
 * the **enforced mode** follows from the identifier the caller submitted — backward unless the last segment carries major 0;
-* the **verdict** on a success can only be *compatible*, *waived*, or *no baseline to compare against*: fail-closed rejects *incompatible* and *undecided*, `force` is a flag the caller sent and is read back through provenance, and *no baseline* means the candidate is the first minor of its major, which its identifier states;
+* the **verdict** on a success can only be *compatible*, *waived*, or *no baseline to compare against*: fail-closed rejects *incompatible* and *undecided*, `skip_compatibility_check` is a flag the caller sent and is read back as the Type Schema's `provenance.compatibility_check_skipped`, and *no baseline* means the candidate is the first minor of its major, which its identifier states;
 * **per-level evolvability** describes a future limitation rather than this candidate. An owner learns it where it applies: the refusal of the change that runs into it names the level. Reporting it a publication earlier was the original intent and is dropped, because it would need a stored per-item payload that nothing else in the write path has.
 
 Operational guarantees are reported separately from schema compatibility, as specification §4.3 requires. P1 does not certify tolerant-reader contracts, constrained-producer conventions, casting, or default materialization, and **MUST NOT** present any of them as a schema-compatibility result.
 
 ### The whole-history statement can lapse, and the lapse is not aggregated
 
-A major carries the statement *the highest minor accepts every instance ever accepted here* only while every edge of its chain was actually established. Two things break that: a semantic change of the relation, which invalidates edges admitted under superseded rules and whose handling is deferred above; and a `force`-admitted minor, where an edge was deliberately never established (ADR-0004).
+A major carries the statement *the highest minor accepts every instance ever accepted here* only while every edge of its chain was actually established. Two things break that: a semantic change of the relation, which invalidates edges admitted under superseded rules and whose handling is deferred above; and a minor admitted with `skip_compatibility_check`, where an edge was deliberately never established (ADR-0004).
 
-Neither is reported as an aggregate over the major, and for the second that is a decision rather than an omission: ADR-0004 declined the aggregate outright, since it would be "a fold over facts the caller is already reading" — `compat_forced` on each member's provenance — and a consumer crossing several minors consults each. The first is not reported at all, which §*What the platform does* records as an accepted limitation.
+Neither is reported as an aggregate over the major, and for the second that is a decision rather than an omission: ADR-0004 declined the aggregate outright, since it would be "a fold over facts the caller is already reading" — `provenance.compatibility_check_skipped` on each member — and a consumer crossing several minors consults each. The first is not reported at all, which §*What the platform does* records as an accepted limitation.
 
 ### External Registry Sources
 
@@ -230,7 +230,7 @@ This decision is confirmed when:
 * `v1.1~` is checked against `v1.0~` and rejected when it is not backward compatible with it, while a revision of a major-only entity is checked against its own current revision;
 * `v1.1~` and `v1.2~` submitted concurrently over `v1.0~` never both commit without `v1.2~` having been compared against `v1.1~`, and a deleted `v1.1~` is still the baseline of `v1.2~` rather than being skipped for `v1.0~`;
 * an instance valid under any retained revision of any minor of a stable, unforced major validates against the current revision of that major's highest minor, and the test is not asserted for a major-0 major or for one containing a forced edge;
-* a `force`-admitted candidate is accepted without the cross-minor check and no attempt to force a revision of a major-only entity succeeds;
+* a candidate admitted with `skip_compatibility_check` is accepted without the cross-minor check and no attempt to force a revision of a major-only entity succeeds;
 * the erase-and-reintroduce sequence is rejected: a revision that drops a property and a later revision that reintroduces it under a different schema cannot both be admitted;
 * admission classifies content model per object level from the resolved effective schema, admits open-topped and `x-gts-abstract` schemas without objection, and reports no classification on an admitted candidate;
 * the classification is exercised against a schema closed only by `unevaluatedProperties`, one closed only through an `allOf` branch, one closed only through a resolved GTS `$ref` to its base, and one made partially open by a schema-valued `additionalProperties`;
@@ -283,14 +283,14 @@ Adopting it would first require deciding where the mode attaches and how precede
 
 This ADR selects behaviour inside the latitude GTS 0.13 leaves to implementations. It requires backward compatibility as defined by the specification and adds no authoring rule the specification does not already recommend. It does not redefine compatibility, transitivity, or derivation.
 
-It declines one part of that latitude deliberately. §4.3 permits an implementation to enforce different modes for different identifier namespaces; Types Registry enforces one mode — BACKWARD — wherever a mode is enforced at all, for the reasons recorded against the configurable option above. Two exceptions are named elsewhere and are not namespace-scoped: a major 0 declares no mode (ADR-0015), and a `force`-admitted minor leaves one edge of an enforced major unestablished (ADR-0004). Should that be revisited, the specification permits the change without amendment.
+It declines one part of that latitude deliberately. §4.3 permits an implementation to enforce different modes for different identifier namespaces; Types Registry enforces one mode — BACKWARD — wherever a mode is enforced at all, for the reasons recorded against the configurable option above. Two exceptions are named elsewhere and are not namespace-scoped: a major 0 declares no mode (ADR-0015), and a minor admitted with `skip_compatibility_check` leaves one edge of an enforced major unestablished (ADR-0004). Should that be revisited, the specification permits the change without amendment.
 
 ## Traceability
 
 - **PRD**: [../PRD.md](../PRD.md)
 - **DESIGN**: [../DESIGN.md](../DESIGN.md)
 - **ADR-0002**: [0002-cpt-cf-types-registry-adr-external-source-live-delegation.md](./0002-cpt-cf-types-registry-adr-external-source-live-delegation.md)
-- **ADR-0004**: [0004-cpt-cf-types-registry-adr-gts-minor-version-identity-evolution.md](./0004-cpt-cf-types-registry-adr-gts-minor-version-identity-evolution.md) — makes a major-only identifier a mutable logical entity, admits minors as immutable single-definition entities, owns the contiguity rule that keeps the chain governed here from branching at a minor boundary and makes its baseline immune to concurrent admission, and owns the `force` waiver of the cross-minor edge.
+- **ADR-0004**: [0004-cpt-cf-types-registry-adr-gts-minor-version-identity-evolution.md](./0004-cpt-cf-types-registry-adr-gts-minor-version-identity-evolution.md) — makes a major-only identifier a mutable logical entity, admits minors as immutable single-definition entities, owns the contiguity rule that keeps the chain governed here from branching at a minor boundary and makes its baseline immune to concurrent admission, and owns the `skip_compatibility_check` waiver of the cross-minor edge.
 - **ADR-0005**: [0005-cpt-cf-types-registry-adr-type-schema-revisions.md](./0005-cpt-cf-types-registry-adr-type-schema-revisions.md)
 - **ADR-0014**: [0014-cpt-cf-types-registry-adr-managed-type-schema-dialect-profile.md](./0014-cpt-cf-types-registry-adr-managed-type-schema-dialect-profile.md)
 - **ADR-0011**: [0011-cpt-cf-types-registry-adr-managed-external-boundary.md](./0011-cpt-cf-types-registry-adr-managed-external-boundary.md) — forbids a managed Type Schema from referencing an externally managed one, so the guarantee defined here applies to a reference closure that is entirely managed.

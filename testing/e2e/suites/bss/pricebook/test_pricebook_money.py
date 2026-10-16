@@ -3,7 +3,8 @@
 Every price decimal is a JSON string of plain decimal text, kept and echoed in canonical text. An
 amount has at most 12 fractional places (a rate takes 12 too), and a minimum fee is a multiple of the increment
 of the price's currency scale. The binary links other gears, so this also shows that no other
-gear changes how pricing reads a JSON number.
+gear changes how pricing reads a JSON number. The currency table endpoint returns the scale a new
+price uses (D-537).
 """
 
 import datetime
@@ -97,3 +98,20 @@ def test_a_minimum_fee_is_a_multiple_of_the_currency_increment(api, entries):
         "1.5",
         2,
     ), price
+
+
+def test_the_currency_table_gives_the_scale_a_new_price_takes(api, entries):
+    r = api.get(f"{PRICING}/currencies")
+    assert r.status_code == 200, r.text
+    items = r.json()["items"]
+    codes = [c["code"] for c in items]
+    assert codes == sorted(set(codes)), "each code once, in code order"
+    assert sum(c["iso"] for c in items) == 165, "every active ISO 4217 code"
+    table = {c["code"]: c for c in items}
+    assert table["EUR"] == {"code": "EUR", "scale": 2, "iso": True}, table["EUR"]
+    assert (table["JPY"]["scale"], table["KWD"]["scale"]) == (0, 3)
+    assert "XTS" not in table, "ISO lists XTS without a scale"
+    r = _draft(api, entries["flat"], {"price": {"amount": "30"}})
+    assert r.status_code == 201, r.text
+    [price] = r.json()["items"]
+    assert (price["currency"], price["currency_scale"]) == ("EUR", table["EUR"]["scale"]), price

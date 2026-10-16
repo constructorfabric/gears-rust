@@ -4727,7 +4727,7 @@
         "type": "object"
       },
       "EntityDto": {
-        "description": "One entity, projected by `$select` (SPEC §10.2).\n\n`gts_id`, `gts_uuid`, `kind` and `lifecycle_status` are always present, so a\nprojected item is identifiable, its kind needs no second read, and a tombstone is\nnever mistaken for an absence. An\nunselected field is omitted; a selected document that is JSON `null` stays\npresent as `null`. The three artifacts are absent on an Instance. Documents\nare written as stored, canonical text: keys sorted, no insignificant whitespace.",
+        "description": "One entity, projected by `$select` (SPEC §10.2).\n\n`gts_id`, `gts_uuid`, `kind` and `lifecycle_status` are always present, so a\nprojected item is identifiable, its kind needs no second read, and a tombstone is\nnever mistaken for an absence. An\nunselected field is omitted; a selected document that is JSON `null` stays\npresent as `null`. The three artifacts and `provenance` are absent on an\nInstance, selected or not. Documents\nare written as stored, canonical text: keys sorted, no insignificant whitespace.",
         "properties": {
           "content": {
             "description": "The whole authored document, either kind."
@@ -4759,7 +4759,8 @@
             "$ref": "#/components/schemas/OriginDto"
           },
           "provenance": {
-            "$ref": "#/components/schemas/ProvenanceDto"
+            "$ref": "#/components/schemas/ProvenanceDto",
+            "description": "Managed Type Schemas only: how the current revision was admitted."
           },
           "resolved_schema": {
             "description": "Type Schemas only."
@@ -4840,7 +4841,7 @@
         "type": "object"
       },
       "EntityPageDto": {
-        "description": "One bounded page of discovery results (SPEC §10.1's `EntityPage`).",
+        "description": "One bounded page of discovery results (SPEC §10.1's `ListEntitiesResponse`).",
         "properties": {
           "items": {
             "description": "Each item projected exactly as the exact read projects it.",
@@ -11183,6 +11184,46 @@
         ],
         "type": "string"
       },
+      "PricingCurrency": {
+        "description": "One currency of the table (D-537).",
+        "properties": {
+          "code": {
+            "description": "Three uppercase letters.",
+            "type": "string"
+          },
+          "iso": {
+            "description": "True when ISO 4217 defines the code; false for a code that the deployment's\n`currency_scales` config adds.",
+            "type": "boolean"
+          },
+          "scale": {
+            "description": "The number of decimal places a new price in this currency uses, as a JSON integer.",
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "code",
+          "scale",
+          "iso"
+        ],
+        "type": "object"
+      },
+      "PricingCurrencyTable": {
+        "description": "The response of `GET /currencies` (D-537): every currency the table accepts, sorted by code.",
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/PricingCurrency"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "items"
+        ],
+        "type": "object"
+      },
       "PricingDecisionDto": {
         "description": "One reviewer decision; decisions of earlier generations are kept and marked stale.",
         "properties": {
@@ -15272,25 +15313,15 @@
         "type": "string"
       },
       "ProvenanceDto": {
-        "description": "Who admitted the current revision and how. Selected as one group.",
+        "description": "Admission metadata of the current revision, selected as one group.",
         "properties": {
-          "compat_forced": {
-            "description": "Whether ADR-0004 `force` waived a cross-minor check; `null` for Instances.",
-            "type": [
-              "boolean",
-              "null"
-            ]
-          },
-          "gts_impl_version": {
-            "type": "string"
-          },
-          "gts_spec_version": {
-            "type": "string"
+          "compatibility_check_skipped": {
+            "description": "`true`: an applicable cross-minor compatibility check was deliberately\nwaived with ADR-0004 `skip_compatibility_check`. `false`: no such waiver,\nwhich does not mean a check ran (a first minor or a major-0 version has\nnone). Derivation and every other admission check apply either way.",
+            "type": "boolean"
           }
         },
         "required": [
-          "gts_spec_version",
-          "gts_impl_version"
+          "compatibility_check_skipped"
         ],
         "type": "object"
       },
@@ -19913,7 +19944,7 @@
       },
       "SubmitEntitiesRequest": {
         "additionalProperties": false,
-        "description": "A submission of one or more entities.\n\n`items` and not `entities`: the operation result, the discovery page and\n`Page<T>` all call their array `items`, so this is the house word for \"the\narray in this envelope\". It is also the name v1 does *not* use, which keeps\nthe T24a promotion a loud break rather than one that turns on the element\nshape.",
+        "description": "Entity submission envelope; `items` matches operation and page envelopes.",
         "properties": {
           "dry_run": {
             "description": "Predict the batch using one snapshot and an overlay of prior candidates' effects.\nRecord outcomes without entity-state writes or reservations.\n\nDefaults to `false`; participates in the idempotency fingerprint.",
@@ -19951,17 +19982,17 @@
               "null"
             ]
           },
-          "force": {
-            "description": "ADR-0004: waive one cross-minor check when the deployment permits it.\nIntra-entity revisions are never waivable. The revision records the\neffective waiver as `compat_forced`.",
-            "type": [
-              "boolean",
-              "null"
-            ]
-          },
           "gts_id": {
             "description": "The canonical GTS identifier. A non-canonical spelling is refused rather\nthan normalized.",
             "maxLength": 1024,
             "type": "string"
+          },
+          "skip_compatibility_check": {
+            "description": "ADR-0004: skip this candidate's applicable cross-minor compatibility check\nwhen the deployment permits it. Refused where there is no such check (first\nminor, major 0, major-only); intra-entity revisions and derivation are never\nskipped. Absent means `false`. A Type Schema read reports the effective outcome\nas `provenance.compatibility_check_skipped`.",
+            "type": [
+              "boolean",
+              "null"
+            ]
           }
         },
         "required": [
@@ -22583,6 +22614,12 @@
         "bearerFormat": "JWT",
         "scheme": "bearer",
         "type": "http"
+      },
+      "internalToken": {
+        "description": "Platform-plane workload credential, validated by the receiving listener",
+        "in": "header",
+        "name": "x-toolkit-internal-token",
+        "type": "apiKey"
       }
     }
   },
@@ -29149,7 +29186,12 @@
             },
             "description": "Internal Server Error"
           }
-        }
+        },
+        "security": [
+          {
+            "internalToken": []
+          }
+        ]
       }
     },
     "/bss-approvals/v1/approval-units": {
@@ -38478,6 +38520,113 @@
           }
         ],
         "summary": "Withdraw an approval unit",
+        "tags": [
+          "Pricing"
+        ]
+      }
+    },
+    "/bss-pricing/v1/currencies": {
+      "get": {
+        "description": "Returns every currency a price book can use, with the number of decimal places a new price in that currency uses: the active ISO 4217 codes, and the codes the deployment's currency_scales config adds (iso false). The list is sorted by code and is the same for every tenant; the settings' currencies limit only which currency a new book can use (D-438, D-529, D-537). A saved price keeps the scale it was saved with (D-531). A caller without config read gets 403.",
+        "operationId": "bss_pricing.list_currencies",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PricingCurrencyTable"
+                }
+              }
+            },
+            "description": "Response"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "429": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Too Many Requests"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "List the currency table",
         "tags": [
           "Pricing"
         ]
@@ -66476,7 +66625,7 @@
         ]
       },
       "get": {
-        "description": "Return one entity, projected by `$select`. The key is either a canonical GTS identifier or the Registry Reference UUID derived from it; a key over 1024 bytes is a 400, and any other key naming no entity is a 404. Absent `$select` is the document-free default `gts_id,gts_uuid,kind,origin,lifecycle_status`; documents are selected individually from `content`, `resolved_schema`, `effective_traits` and `effective_traits_schema` (the last three Type Schemas only), plus the `provenance` group. Names are case-insensitive; an empty, duplicate, unknown or nested name is a 400. `gts_id`, `gts_uuid`, `kind` and `lifecycle_status` are always returned, whether or not `$select` names them, so a deleted entity is still readable and reports it. No other query parameter is accepted. The `ETag` is scoped to the `$select`; `If-None-Match` with a current one returns a bodyless 304.",
+        "description": "Return one entity, projected by `$select`. The key is either a canonical GTS identifier or the Registry Reference UUID derived from it; a key over 1024 bytes is a 400, and any other key naming no entity is a 404. Absent `$select` is the document-free default `gts_id,gts_uuid,kind,origin,lifecycle_status`; documents are selected individually from `content`, `resolved_schema`, `effective_traits` and `effective_traits_schema` (the last three Type Schemas only), plus the `provenance` group of a Type Schema (omitted on an Instance). Names are case-insensitive; an empty, duplicate, unknown or nested name is a 400. `gts_id`, `gts_uuid`, `kind` and `lifecycle_status` are always returned, whether or not `$select` names them, so a deleted entity is still readable and reports it. No other query parameter is accepted. The `ETag` is scoped to the `$select`; `If-None-Match` with a current one returns a bodyless 304.",
         "operationId": "types_registry.get_entity",
         "parameters": [
           {

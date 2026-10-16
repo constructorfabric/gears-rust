@@ -11,7 +11,7 @@
 //! keeps that revision alive as long as the Instance.
 //!
 //! No `compat_forced` counterpart to [`super::type_schema_revision`]: an Instance is
-//! either valid or refused, so `force` has nothing to waive. The engine versions are
+//! either valid or refused, so `skip_compatibility_check` has nothing to waive. The engine versions are
 //! recorded for the reason they are there — a checker upgrade can change the verdict
 //! for an unchanged pair.
 

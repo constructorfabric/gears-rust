@@ -104,7 +104,9 @@ emitting a zone to an external gateway (Kong / Envoy / AWS API Gateway).
   gateway config dissolves the cycle instead of routing around it.
 * `KeyType::Identity` requires an authenticated request. Config validation
   already rejects identity-keyed zones referenced from pre-auth operations
-  (`require_security_context = false`); that rule is unchanged.
+  (`require_security_context = false`); that rule is unchanged. Platform
+  operations (`.platform_authenticated()`) qualify too, even with
+  `auth_disabled`, because the platform plane still validates their callers.
 * Zones are shared across the pre-auth and post-auth partitions by one `Arc`
   each (`build_maps`); any key accounting added must be per-zone, not per
   partition, or the bound doubles.
@@ -142,9 +144,19 @@ The zone owns the key strategy. An operation names a zone; it does not describe
 how that zone keys. This is the config/code boundary ADR-0002 asks for, applied
 to keying.
 
-`Identity` resolves to `SecurityContext::subject_id()`. A missing context is an
-invariant violation, not a shared bucket: the request fails with an internal
-error. `Ip` resolves through `client_ip()` with `trusted_proxy_hops`, unchanged.
+`Identity` resolves from the plane of the operation's auth, never the other:
+`SecurityContext::subject_id()` (the raw UUID) on a tenant operation, the
+validated `PlatformSecurityContext` on a platform operation. A platform key
+names the workload, not the instance — `platform:k8s:<namespace>/<service_account>`
+(no pod), `platform:spiffe:<trust_domain>/<name>` (no version, so a rolling
+upgrade does not double the budget) or `platform:shared:<name>` — with `%` and
+`/` in a component percent-encoded. A tenant UUID never starts with
+`platform:`, so tenant keys and `excluded_keys` are unchanged and one zone may
+serve both planes, sharing its budget (including `max_keys`); separate zones
+isolate them. A missing context, or a platform identity that names no caller
+(`OutboundMarker`, `Unknown`), is an invariant violation, not a shared bucket:
+the request fails with an internal error, in dry-run too. `Ip` resolves through
+`client_ip()` with `trusted_proxy_hops`, unchanged.
 
 ### D3: `max_keys` becomes an enforced bound on rate zones
 

@@ -1,5 +1,5 @@
 # Development preset. Ensure dev images are available, then:
-#   bash deploy/helm/update-helm-deps.sh
+#   bash tools/scripts/update-helm-deps.sh
 #   helm install demo deploy/helm/toolkit-platform -f deploy/helm/toolkit-platform/values-dev.yaml
 
 global:

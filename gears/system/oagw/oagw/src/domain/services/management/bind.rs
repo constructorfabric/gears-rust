@@ -158,9 +158,7 @@ pub(in crate::domain::services) async fn validate_secret_ref_accessible(
     credstore: &dyn CredStoreClientV1,
     raw_ref: &str,
 ) -> Result<(), DomainError> {
-    let bare = raw_ref.strip_prefix("cred://").unwrap_or(raw_ref);
-    let key = credstore_sdk::SecretRef::new(bare)
-        .map_err(|e| DomainError::validation(format!("invalid secret_ref '{raw_ref}': {e}")))?;
+    let key = parse_secret_ref(raw_ref)?;
 
     match credstore.get(ctx, &key).await {
         Ok(Some(_)) => Ok(()),
@@ -193,33 +191,43 @@ pub(in crate::domain::services) async fn validate_secret_ref_accessible(
             ),
             instance: String::new(),
         }),
+        // The credential store is down or absent: nothing about this request
+        // is wrong, and every other secret_ref would fail the same way.
+        Err(e) if e.is_unavailable() => {
+            tracing::warn!(secret_ref = raw_ref, error = %e, "cred_store unavailable during secret_ref validation");
+            Err(DomainError::Internal {
+                message: format!("credential validation unavailable: {e}"),
+            })
+        }
         Err(e) => Err(DomainError::validation(format!(
             "secret_ref '{raw_ref}' validation failed: {e}"
         ))),
     }
 }
 
+/// Parse a `secret_ref` (with or without the `cred://` scheme), without
+/// asking the credential store whether it exists.
+pub(in crate::domain::services) fn parse_secret_ref(
+    raw_ref: &str,
+) -> Result<credstore_sdk::SecretRef, DomainError> {
+    let bare = raw_ref.strip_prefix("cred://").unwrap_or(raw_ref);
+    credstore_sdk::SecretRef::new(bare)
+        .map_err(|e| DomainError::validation(format!("invalid secret_ref '{raw_ref}': {e}")))
+}
+
 /// Validate bind constraints against the **closest** ancestor with a matching
-/// alias. Delegates to [`validate_bind_constraints`] for the actual checks.
+/// alias ([`super::ancestor::closest_ancestor_upstream`]).
+/// Delegates to [`validate_bind_constraints`] for the actual checks.
 ///
 /// No-op if no ancestor has the alias (fresh upstream, no bind needed).
 pub(in crate::domain::services) async fn validate_ancestor_bind(
     ctx: &SecurityContext,
-    upstreams: &dyn crate::domain::repo::UpstreamRepository,
     enforcer: &PolicyEnforcer,
-    tenant_chain: &[uuid::Uuid],
-    alias: &str,
+    ancestor: Option<&Upstream>,
     overrides: &BindOverrides<'_>,
 ) -> Result<(), DomainError> {
-    for &ancestor_tid in &tenant_chain[1..] {
-        match upstreams.get_by_alias(ancestor_tid, alias).await {
-            Ok(ancestor_upstream) => {
-                validate_bind_constraints(ctx, enforcer, &ancestor_upstream, overrides).await?;
-                break; // Only check closest ancestor with matching alias.
-            }
-            Err(crate::domain::repo::RepositoryError::NotFound { .. }) => continue,
-            Err(e) => return Err(DomainError::from(e)),
-        }
+    match ancestor {
+        Some(ancestor) => validate_bind_constraints(ctx, enforcer, ancestor, overrides).await,
+        None => Ok(()),
     }
-    Ok(())
 }

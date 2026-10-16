@@ -76,10 +76,12 @@ impl Harness {
             candidates: vec![candidate],
         };
         let accepted = match kind {
-            OperationKind::Registration => self.service.submit(&request, NOW).await,
+            OperationKind::Registration => {
+                self.service.submit(common::caller(), &request, NOW).await
+            }
             OperationKind::Deletion => {
                 self.service
-                    .delete(&common::deletion_of(request), NOW)
+                    .delete(common::caller(), &common::deletion_of(request), NOW)
                     .await
             }
         }
@@ -90,7 +92,7 @@ impl Harness {
             .expect("admitted");
         let operation = self
             .service
-            .operation(accepted.operation_id)
+            .operation(common::caller(), accepted.operation_id)
             .await
             .expect("read")
             .expect("operation");
@@ -129,7 +131,12 @@ impl Harness {
         if_none_match: Option<IfNoneMatch>,
     ) -> EntityLookup {
         self.service
-            .lookup(&EntityKey::parse(gts_id), selection, if_none_match)
+            .lookup(
+                common::caller(),
+                &EntityKey::parse(gts_id),
+                selection,
+                if_none_match,
+            )
             .await
             .expect("read")
     }
@@ -234,7 +241,7 @@ async fn a_batch_answers_each_key_by_its_own_validator() {
     ];
     let results = h
         .service
-        .batch_get(&items, FieldSelection::default())
+        .batch_get(common::caller(), &items, FieldSelection::default())
         .await
         .expect("read");
 
@@ -266,7 +273,7 @@ async fn a_batch_answers_each_key_by_its_own_validator() {
     ];
     let results = h
         .service
-        .batch_get(&items, FieldSelection::default())
+        .batch_get(common::caller(), &items, FieldSelection::default())
         .await
         .expect("read");
     let answer = |key: &str| common::answer_for(&results, &EntityKey::parse(key));
@@ -299,6 +306,7 @@ async fn a_duplicate_key_is_answered_by_its_first_condition() {
     let results = h
         .service
         .batch_get(
+            common::caller(),
             &[conditional.clone(), unconditional.clone()],
             FieldSelection::default(),
         )
@@ -310,7 +318,11 @@ async fn a_duplicate_key_is_answered_by_its_first_condition() {
     );
     let results = h
         .service
-        .batch_get(&[unconditional, conditional], FieldSelection::default())
+        .batch_get(
+            common::caller(),
+            &[unconditional, conditional],
+            FieldSelection::default(),
+        )
         .await
         .expect("read");
     assert!(
@@ -339,7 +351,7 @@ async fn both_keys_of_one_entity_are_answered_by_their_own_conditions() {
     ];
     let results = h
         .service
-        .batch_get(&items, select(&["content"]))
+        .batch_get(common::caller(), &items, select(&["content"]))
         .await
         .expect("read");
     let answer = |key: &EntityKey| common::answer_for(&results, key);

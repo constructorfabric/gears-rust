@@ -217,8 +217,6 @@ Provide unified access to multiple LLM providers with multimodal support, tool c
 - [ ] p3 - embeddings batching
 - [ ] p4 - audit events (audit plugin)
 #### More details
-- [PRD](../gears/llm-gateway/docs/PRD.md)
-- [Design](../gears/llm-gateway/docs/DESIGN.md)
 - [API](../gears/llm-gateway/README.md)
 - [SDK](../gears/llm-gateway/llm-gateway-sdk/)
 

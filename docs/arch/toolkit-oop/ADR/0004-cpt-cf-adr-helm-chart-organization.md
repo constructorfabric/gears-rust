@@ -71,7 +71,7 @@ chart), while remaining publishable to OCI registries.
 
 > **Amended (dependency resolution):** all chart dependencies are currently local `file://` references at a
 > fixed version, so `Chart.lock` pins nothing useful and is gitignored. CI/local resolution uses
-> `helm dependency update` (see `deploy/helm/update-helm-deps.sh`). If `toolkit-common` is later published to a
+> `helm dependency update` (see `tools/scripts/update-helm-deps.sh`). If `toolkit-common` is later published to a
 > registry (versioned remote dependency), commit `Chart.lock` and switch to `helm dependency build` for
 > reproducible installs.
 

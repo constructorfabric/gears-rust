@@ -3,7 +3,7 @@ replicaCount: 1
 image:
   registry: ghcr.io
   repository: constructorfabric/hello
-  tag: "dev"
+  tag: "0.0.0"   # placeholder; the release pipeline stamps the real version
   pullPolicy: IfNotPresent
 
 imagePullSecrets: []

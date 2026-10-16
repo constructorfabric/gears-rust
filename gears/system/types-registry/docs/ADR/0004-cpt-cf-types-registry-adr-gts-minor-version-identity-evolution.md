@@ -21,7 +21,7 @@ decision-makers: Constructor Fabric Steering Committee
   - [A minor is a reference-pinning boundary](#a-minor-is-a-reference-pinning-boundary)
   - [When a minor is admissible](#when-a-minor-is-admissible)
   - [The compatibility chain spans minors](#the-compatibility-chain-spans-minors)
-  - [Breaking the chain deliberately: `force`](#breaking-the-chain-deliberately-force)
+  - [Breaking the chain deliberately: `skip_compatibility_check`](#breaking-the-chain-deliberately-skip_compatibility_check)
   - [What a managed version family is](#what-a-managed-version-family-is)
   - [Lifecycle of family members](#lifecycle-of-family-members)
   - [Reference and derivation rules](#reference-and-derivation-rules)
@@ -100,7 +100,7 @@ This ADR does not define database tables, revision retention, rollback APIs, or 
 
 ## Decision Outcome
 
-Chosen option for Types Registry-managed entities: **one major of a version family is either a single mutable major-only entity or a gap-free sequence of immutable minor-bearing ones opening at `M.0`, decided by its first admitted member; a minor is the boundary at which references stop floating; and the cross-minor compatibility check may be waived per candidate with `force`, which is recorded.**
+Chosen option for Types Registry-managed entities: **one major of a version family is either a single mutable major-only entity or a gap-free sequence of immutable minor-bearing ones opening at `M.0`, decided by its first admitted member; a minor is the boundary at which references stop floating; and the cross-minor compatibility check may be waived per candidate with `skip_compatibility_check`, which is recorded.**
 
 Major-only remains the recommendation and the overwhelmingly common case. It is what platform documentation tells a vendor to use, what everything under `gts.cf.*` uses by a lint over its own source, and what an author gets by not writing a minor. A minor is for the owner who has a reason for one — a catalogue that is already minor-versioned, or a contract whose consumers must not be carried onto a successor — and the reason is theirs to have rather than an operator's to grant.
 
@@ -110,7 +110,7 @@ Major-only remains the recommendation and the overwhelmingly common case. It is 
 * A newly registered managed GTS Type Schema **may** carry a minor version in the last segment of its identifier, with no region of the namespace excepted. P2 managed GTS Aliases use the same rule when introduced.
 * Newly registered managed **registered Instances must** omit the minor version from the last segment, for ADR-0015's reason rather than a new one: a minor there would be a marker with nothing to mark. Nothing is lost — an Instance of a minor-versioned type carries the minor in a *preceding* segment, `gts.A~acme.crm.order.type.v1.2~acme.thing.v1`.
 * A content update that is backward compatible under ADR-0003 preserves the same GTS ID and Registry Reference. It is available only to a major-only entity; a minor-bearing one has no content update, and its owner publishes the next minor instead.
-* A backward-incompatible Type Schema change requires a new major GTS ID. A minor is not an alternative to it: the check across a minor boundary is the same check, so an ordinary minor carries no change a revision could not. The single exception is the `force` waiver below, which is available on a minor precisely because it is *not* available on a revision — and which withdraws a statement rather than granting a licence.
+* A backward-incompatible Type Schema change requires a new major GTS ID. A minor is not an alternative to it: the check across a minor boundary is the same check, so an ordinary minor carries no change a revision could not. The single exception is the `skip_compatibility_check` waiver below, which is available on a minor precisely because it is *not* available on a revision — and which withdraws a statement rather than granting a licence.
 * Registered Instance content may change under the same GTS ID according to ADR-0006; schema compatibility terminology does not apply to successive Instance values.
 * Where an owner writes no minor, the profile is exactly what it was: major-only, one mutable logical entity per major.
 
@@ -196,38 +196,38 @@ ADR-0013 therefore permits purge to release only a suffix of a major's minors. T
 
 An unstable Type Schema is exempt from the check and nothing else, since what ADR-0015 exempts is the enforced mode: a minor on a major-0 identifier is checked against nothing, while contiguity still holds and its major still opens at `v0.0~`.
 
-### Breaking the chain deliberately: `force`
+### Breaking the chain deliberately: `skip_compatibility_check`
 
-A registration may carry `force`, which **skips the cross-minor compatibility check for that candidate and does nothing else**. It is admissible only where that check would otherwise run — on a minor that has a predecessor in its major — and is refused on a major-only candidate, on the first minor of a major, and on a major-0 candidate, in each case because there is no check to skip and a flag that silently does nothing is a trap.
+A registration may carry `skip_compatibility_check`, which **skips the cross-minor compatibility check for that candidate and does nothing else**. It is admissible only where that check would otherwise run — on a minor that has a predecessor in its major — and is refused on a major-only candidate, on the first minor of a major, and on a major-0 candidate, in each case because there is no check to skip and a flag that silently does nothing is a trap.
 
-**The waiver is off unless a deployment turns it on.** One **global run-time configuration value, disabled by default**, governs `force`. It is read at process start, so a change requires restart.
+**The waiver is off unless a deployment turns it on.** One **global run-time configuration value, disabled by default**, governs `skip_compatibility_check`. It is read at process start, so a change requires restart.
 
 When disabled:
 
-* Dry Run and real submissions refuse `force` identically rather than ignore it;
+* Dry Run and real submissions refuse `skip_compatibility_check` identically rather than ignore it;
 * the named reason identifies deployment configuration, distinguishing it from a candidate with nothing to waive.
 
 As with ADR-0013's purge control, silently ignoring a control would make it appear effective. Unlike disabled purge, however, a request field cannot disappear from the API surface. Availability is therefore learned through attempted use and operator documentation; no capability endpoint is added for one boolean.
 
 Default-off follows from the flag's purpose. It is a rare deliberate act; repeated use means the contract likely belongs in major 0 or a new major. An exception callers can take unilaterally is not an exception.
 
-With the flag off, every successive edge of a **stable** major is checked under BACKWARD without a per-edge waiver. `force` is a local relaxation opted into by an operator. Major 0 remains exempt from any enforced mode, so this claim concerns stable majors and the force axis, not the whole platform.
+With the flag off, every successive edge of a **stable** major is checked under BACKWARD without a per-edge waiver. `skip_compatibility_check` is a local relaxation opted into by an operator. Major 0 remains exempt from any enforced mode, so this claim concerns stable majors and the force axis, not the whole platform.
 
 The value is **global and read at run time**; a build-time gate and a per-identifier-region variant were both considered and rejected — see *Sub-choices within the selected option*, below.
 
 All three refusals below are decidable from the candidate's identifier alone, which is a consequence of contiguity rather than a coincidence: *first minor of a major* is `n == 0` once a major can only open at `M.0`, and the other two are the shape of the last segment. Under the *strictly higher* rule this was not so — `v1.7~` might have been the first member of an empty major — so admissibility of the flag would have depended on family state and could have changed between acceptance and execution.
 
-It is safe in the sense that matters at admission: the identifier is new, so nothing references it, no domain row holds its Registry Reference, and no Instance conforms to it. Nobody is broken by the act. What is broken is the statement above — and only that, which is why `force` reaches the cross-minor edge and can never reach a revision of a major-only entity, where the same relaxation would break live consumers of a floating reference.
+It is safe in the sense that matters at admission: the identifier is new, so nothing references it, no domain row holds its Registry Reference, and no Instance conforms to it. Nobody is broken by the act. What is broken is the statement above — and only that, which is why `skip_compatibility_check` reaches the cross-minor edge and can never reach a revision of a major-only entity, where the same relaxation would break live consumers of a floating reference.
 
-Everything else stands: derivation compatibility against the whole base chain, the dialect profile, the ADR-0015 quarantine, the identifier profile, the contiguity rule, and reference resolvability. `force` is not a general escape from admission and must not be described as one.
+Everything else stands: derivation compatibility against the whole base chain, the dialect profile, the ADR-0015 quarantine, the identifier profile, the contiguity rule, and reference resolvability. `skip_compatibility_check` is not a general escape from admission and must not be described as one.
 
 **A forced step is recorded and exposed; that is a condition of accepting it.** Otherwise two identifiers would look like an ordinary minor succession while silently withdrawing the inferred guarantee — the failure ADR-0015 avoids by putting its marker in the identifier.
 
-The fact is not derivable from retained data. It is stored on the revision beside `gts_spec_version` and `gts_impl_version`, which likewise record how a verdict was reached — here, that there was none. DESIGN §3.3 exposes it through the `provenance` projection.
+The fact is not derivable from retained data. It is stored on the revision beside `gts_spec_version` and `gts_impl_version`, which likewise record how a verdict was reached — here, that there was none. DESIGN §3.3 exposes it as `compatibility_check_skipped` in a managed Type Schema's selectable `provenance` group: `true` when an applicable cross-minor check was waived, `false` when not — which does not claim a check ran. The engine versions stay internal audit and are not read fields.
 
 Two consequences of it being per-entity are stated rather than mechanised. The safe-upgrade statement holds across a run of minors **only if no member of that run was forced**, and the interval to inspect is precise: the flag records the edge *entering* a minor, so a move from `s` to `t` is established only if none of `s+1 … t` carries it. A forced edge entering `s` itself is irrelevant — the consumer is already there. And the registry offers no aggregate for that, because it would be a fold over facts the caller is already reading.
 
-**Where `force` should not be reached for** is the case ADR-0015 already serves: a contract whose shape is not settled is a major-0 contract, where the relaxation is permanent, legible in the identifier, and quarantined. `force` is the opposite — a single break in a published major, visible only on request and quarantined by nothing — so reaching for it repeatedly is a sign the major should have been a v0 or should become a new major.
+**Where `skip_compatibility_check` should not be reached for** is the case ADR-0015 already serves: a contract whose shape is not settled is a major-0 contract, where the relaxation is permanent, legible in the identifier, and quarantined. `skip_compatibility_check` is the opposite — a single break in a published major, visible only on request and quarantined by nothing — so reaching for it repeatedly is a sign the major should have been a v0 or should become a new major.
 
 ### What a managed version family is
 
@@ -253,7 +253,7 @@ The consequences are deliberate:
 * Adopting a new base major means admitting a **new logical entity in a new family**. `gts.cf.core.events.type.v2~acme.crm.order.type.v1~` does not succeed `gts.cf.core.events.type.v1~acme.crm.order.type.v1~`; the two are unrelated by version succession even though their identifiers look like siblings.
 * A derived entity's status is independent of the status of the base it chains through; every non-deleted base remains a valid reference and derivation target.
 * Version succession is therefore always a change in exactly one identifier segment — the last one. Types Registry never infers succession across a difference in any preceding segment.
-* Succession within one major now carries a guarantee and succession across majors still carries none. A minor bump within a stable major is checked to be a safe upgrade unless `force` waives that one edge; a major bump is precisely how a change that is not one gets published, and a major-0 major offers the guarantee nowhere.
+* Succession within one major now carries a guarantee and succession across majors still carries none. A minor bump within a stable major is checked to be a safe upgrade unless `skip_compatibility_check` waives that one edge; a major bump is precisely how a change that is not one gets published, and a major-0 major offers the guarantee nowhere.
 * **A minor is cheap on a leaf type and expensive on a base type, for the same reason a major is.** Adopting a new minor of a *referenced* target costs the dependent one content revision editing the reference string. Adopting a new minor of a *base* changes the dependent's own identifier, so it becomes a new logical entity in a new family with a new Registry Reference — and everything derived from it faces the same cascade, the one ADR-0015 records for graduating an unstable base. Authoring guidance must say so.
 * Normalizing the kind marker away makes a family name **exclusive across kinds**: a derived Type Schema `gts.A~acme.crm.order.type.v1~` and a well-known registered Instance `gts.A~acme.crm.order.type.v1` map to the same family, and Types Registry admits whichever arrives first and refuses the other. This is a managed-profile restriction that GTS itself does not impose, alongside the restrictions on minor versions here and the prohibition on an explicit UUID tail in ADR-0001. It is adopted because the two identifiers differ by one character while denoting entirely unrelated things, nothing needs both — an Instance of that derived type is `gts.A~acme.crm.order.type.v1~<segment>`, not the colliding form — and because a family groups Version Successors, which are by definition of one kind. Keeping the marker in the key would instead let both families exist and force a shared owner on them, rejecting the second registrant over a family it may not be able to see.
 
@@ -276,7 +276,7 @@ What happens to the members of a family over time — whether more than one may 
 
 * Exact resolution is literal: it resolves only the entity whose canonical GTS ID equals the supplied identifier.
 * Exact resolution must never use minor-version flexibility, version-membership expansion, or implicit pattern coverage. In particular there is no `latest`-minor resolution: `v1~` resolves `v1~` or nothing, never the highest `v1.x~`. Offering one would return the reference-pinning property that is the whole purpose of admitting a minor, and it is the same `latest` mode ADR-0008 declines for family members.
-* Version-membership, hierarchy, and wildcard queries are separate operations and may return multiple exact identifiers or Registry References. None of them establishes compatibility between the members it returns; that is per edge and is read from provenance.
+* Version-membership, hierarchy, and wildcard queries are separate operations and may return multiple exact identifiers or Registry References. None of them establishes compatibility between the members it returns; that is per edge and is read from each member's `provenance.compatibility_check_skipped`.
 * A major-only ID used as a GTS pattern covers minor-versioned candidates according to `gts-rust` and GTS §10, and after this ADR that applies to managed candidates as well as externally managed ones. Pattern matching is therefore the one place where the minors of a major are collected under one expression, and it does not change exact resolution. A byte range over the canonical identifier cannot express that flexibility, so managed discovery matches segment-wise over stored parsed segments, with a minor constrained only where the pattern names one.
 
 ### Externally managed entities
@@ -310,8 +310,8 @@ This concerns only which submissions conflict. Registry Reference representation
 * Every framework and platform-gear type stays major-only through a compile-time lint over `gts.cf.*` in this repository, and through nothing in the registry. A minor admitted under that prefix by some other route is a well-formed entity the platform simply did not intend to author.
 * An installation whose owners write no minor behaves as it did before this ADR, with two changes that reach it anyway: the family key strips the whole version, and managed pattern discovery matches segment-wise rather than by identifier prefix. Both are unobservable until a minor is admitted and both must be in place before one is.
 * Minors accumulate `ACTIVE` members that dependents are pinned to while ADR-0008 defers authored deprecation. That gap is not created here, but it is reached sooner, and it is a further argument for closing PRD open question 1.
-* `force` adds the one stored fact this decision needs — a boolean on the Type Schema revision — and the one place a reader learns of it, the `provenance` projection. Nothing else about the profile reaches storage, the deployment flag included: whether it was on when a revision was admitted follows from whether that revision carries the waiver.
-* Because the flag is off by default, the reachable P1 behaviour of a stock deployment is BACKWARD with no per-edge exception at all. Turning it off again later does not retract waivers already applied — those majors keep their withdrawn guarantee, readable from provenance.
+* `skip_compatibility_check` adds the one stored fact this decision needs — a boolean on the Type Schema revision — and the one place a reader learns of it, the selectable `provenance` group. Nothing else about the profile reaches storage, the deployment flag included: whether it was on when a revision was admitted follows from whether that revision carries the waiver.
+* Because the flag is off by default, the reachable P1 behaviour of a stock deployment is BACKWARD with no per-edge exception at all. Turning it off again later does not retract waivers already applied — those majors keep their withdrawn guarantee, readable from `provenance.compatibility_check_skipped`.
 * Every family-level admission check except kind exclusivity becomes a keyed lookup rather than a scan, because contiguity fixes which single identifier answers each question. Admission needs no family snapshot to compare against at commit; it re-asks one existence question inside the transaction.
 * **A vendor whose existing catalogue has gaps, or does not start at `.0`, must renumber to register it as managed.** That cost falls on the actor ADR-0011 directs toward managed registration, and it is the price of the property above. Two exits remain and both are already described: a new major, or an External Registry Source, which serves a self-contained universe under no platform numbering rule at all.
 * **Relaxing this later is not additive, unlike every other narrowing of the managed profile.** Permitting gaps would return the baseline to a function of family state and would require the commit-time snapshot-and-recheck protocol that contiguity exists to avoid. The narrowing is cheap to adopt now and expensive to reverse, and that asymmetry is accepted deliberately rather than overlooked.
@@ -340,8 +340,8 @@ This decision is confirmed when:
 * a predecessor deleted and purged during validation of its successor causes the successor to fail rather than commit over a gap, proving the existence question is re-asked inside the commit transaction;
 * two minors of one major submitted in one batch are admitted in ascending order, and the higher one is blocked rather than admitted when the lower one fails;
 * a major-only `v1~` and a minor-bearing `v2.0~` coexist in one family, while `v1~` and `v1.0~` do not;
-* `force` is refused in a deployment that has not enabled it, on a Dry Run identically to a real submission, with a reason naming the deployment configuration and distinguishable from the refusal of a candidate that has nothing to waive; with it enabled, `force` admits a `v1.1~` that is not backward compatible with `v1.0~`, and is itself rejected on a major-only candidate, on the first minor of a major, and on a major-0 candidate; a forced candidate that violates its base chain, its dialect, or the ADR-0015 quarantine is still rejected;
-* a forced admission is recorded and returned through the `provenance` projection, and an unforced one is distinguishable from it;
+* `skip_compatibility_check` is refused in a deployment that has not enabled it, on a Dry Run identically to a real submission, with a reason naming the deployment configuration and distinguishable from the refusal of a candidate that has nothing to waive; with it enabled, `skip_compatibility_check` admits a `v1.1~` that is not backward compatible with `v1.0~`, and is itself rejected on a major-only candidate, on the first minor of a major, and on a major-0 candidate; a forced candidate that violates its base chain, its dialect, or the ADR-0015 quarantine is still rejected;
+* a forced admission is recorded and returned as `provenance.compatibility_check_skipped=true`, and an unforced one is distinguishable from it as `false`;
 * admitting a minor triggers no revalidation of any dependent of the preceding minor, and moves no `resolution_fingerprint` outside its own entity;
 * a managed registered Instance identifier carrying a minor in its last segment is rejected, while an Instance of a minor-versioned Type Schema is admitted;
 * the family key strips the whole version of the last segment, so `v1~`, `v1.0~`, `v1.7~`, and `v2~` resolve to one family while `A.v1.0~B.v1~` and `A.v1.1~B.v1~` resolve to different ones;
@@ -410,7 +410,7 @@ That entry was faulted for producing "two admission, compatibility, and lifecycl
 * Bad, because every compatible change in a minor-bearing major costs a minor and a re-point for each dependent that wants it, where a major-only entity would have absorbed it in place. That is the trade, not a defect, but it is the reason major-only stays the recommendation.
 * Bad, because publishing a minor of a widely derived **base** cascades new families and new Registry References down everything derived from it.
 * Bad, because minors accumulate `ACTIVE` members with dependents pinned to them while ADR-0008 defers the deprecation signal that would let an owner discourage the old ones.
-* Bad, because `force` puts a hole in the safe-upgrade statement that is visible only to a caller who selects provenance, where ADR-0015's comparable relaxation is visible in the identifier itself — mitigated by the flag being off by default, so the hole exists only where an operator opened it.
+* Bad, because `skip_compatibility_check` puts a hole in the safe-upgrade statement that is visible only to a caller who selects `provenance`, where ADR-0015's comparable relaxation is visible in the identifier itself — mitigated by the flag being off by default, so the hole exists only where an operator opened it.
 * Bad, because contiguity forbids gaps and reserved numbers, so a vendor catalogue that has either must be renumbered on the way into managed storage and its identifiers stop matching its own upstream.
 * Bad, because that narrowing is the one clause of the managed profile that cannot be relaxed additively later: permitting gaps would bring back a state-dependent baseline and the commit-time recheck protocol with it.
 
@@ -427,19 +427,19 @@ Three narrower alternatives were considered while shaping the option above and a
 
 ADR-0015 rejected the same trade for the adjacent marker because review, not admission, owns that control. A minor is an even weaker case: it *narrows* what an owner may do to consumers rather than widening it.
 
-**A build-time gate for `force` instead of a run-time one.** Purge and `force` need different guards. Purge can cause stored rows to rebind after it releases an identifier, so making the capability absent from the artefact is valuable. `force` only withdraws a compatibility statement on a new identifier; the admission itself breaks nobody.
+**A build-time gate for `skip_compatibility_check` instead of a run-time one.** Purge and `skip_compatibility_check` need different guards. Purge can cause stored rows to rebind after it releases an identifier, so making the capability absent from the artefact is valuable. `skip_compatibility_check` only withdraws a compatibility statement on a new identifier; the admission itself breaks nobody.
 
 An auditor needs to know *whether an edge was forced*, not whether forcing was possible. `compat_forced` records that permanently per entity, regardless of the current flag. Configuration governs the future; provenance records the past.
 
 A build flag would add an unnecessary capability claim, make a legitimate rare operation require redeployment, and turn a deployment choice into a product choice because one binary serves many deployments.
 
-**A per-identifier-region `force` policy instead of a global one.** It would introduce:
+**A per-identifier-region `skip_compatibility_check` policy instead of a global one.** It would introduce:
 
 * a third prefix-policy system beside Source Claims and grants;
 * an identifier-profile verdict dependent on installation state and therefore unreadable from `gts.acme.crm.order.type.v1.3~` itself;
 * historical ambiguity because overlapping regions change, while `compat_forced` records only whether the waiver occurred.
 
-The plausible carve-out — forbidding `force` on platform contracts — is unnecessary. Repository lint keeps `gts.cf.*` major-only, and major-only candidates refuse `force`.
+The plausible carve-out — forbidding `skip_compatibility_check` on platform contracts — is unnecessary. Repository lint keeps `gts.cf.*` major-only, and major-only candidates refuse `skip_compatibility_check`.
 
 If regional control gains a consumer, it belongs in **authorization**: a PDP `force-register` action over the candidate identifier can reuse grant pattern matching, precedence, and audit. That addition does not require building a separate configuration policy now.
 
@@ -463,21 +463,21 @@ Two clauses of this decision narrow or relax what the specification describes, a
 
 This ADR defines the managed profile: the shapes never mix within a major, and minors are contiguous from `M.0`. This narrows the grammar just as ADR-0001 forbids an explicit UUID tail and ADR-0014 pins the dialect — to keep a platform guarantee decidable.
 
-**The `force` waiver is a platform extension, and this ADR does not claim the specification authorizes it.** The honest position is a boundary rather than a licence, and it is drawn here so that nobody has to infer it.
+**The `skip_compatibility_check` waiver is a platform extension, and this ADR does not claim the specification authorizes it.** The honest position is a boundary rather than a licence, and it is drawn here so that nobody has to infer it.
 
 The specification clearly leaves *which* mode a registry enforces and *how* it publishes successors open: §6 item 6 makes both implementation-defined, and §4.3 says the enforced mode is out of scope and may vary by namespace.
 
 It does not clearly authorize declaring BACKWARD and then skipping it for one candidate. §5.3 requires a production registry to validate successive definitions and reject incompatible changes under its declared mode. Although framed as a capability — which this registry has and exercises by default — treating it as authorization for per-edge exceptions would be a stretch this ADR declines.
 
-**So the limitation is stated instead.** A forced edge never establishes `Valid(v1.n-1) ⊆ Valid(v1.n)`, and the GTS minor-evolution type-safety guarantee does not hold across it. A product or deployment exposing `force` therefore does not claim unqualified §5.3 conformance; client restraint is not a server property.
+**So the limitation is stated instead.** A forced edge never establishes `Valid(v1.n-1) ⊆ Valid(v1.n)`, and the GTS minor-evolution type-safety guarantee does not hold across it. A product or deployment exposing `skip_compatibility_check` therefore does not claim unqualified §5.3 conformance; client restraint is not a server property.
 
-A deployment requiring that claim leaves the flag **disabled, its default**. The server then validates every successor and refuses `force` instead of relying on callers not to use it. The platform still offers the waiver because a recorded, bounded exception for an unpublished successor can be safer than changing an identifier consumers already persisted.
+A deployment requiring that claim leaves the flag **disabled, its default**. The server then validates every successor and refuses `skip_compatibility_check` instead of relying on callers not to use it. The platform still offers the waiver because a recorded, bounded exception for an unpublished successor can be safer than changing an identifier consumers already persisted.
 
-Everything else remains unaffected: derivation compatibility under §4.1 and OP#12, trait validation under OP#13, and identifier and reference validity. `force` reaches only one relation and one edge.
+Everything else remains unaffected: derivation compatibility under §4.1 and OP#12, trait validation under OP#13, and identifier and reference validity. `skip_compatibility_check` reaches only one relation and one edge.
 
 It differs from ADR-0015 in exactly this respect and the difference is worth keeping visible. There a whole major declares no enforced mode, which §4.3 and §6 do plainly permit; here an enforced major has one unestablished step. If the specification is ever asked to accommodate this, a recorded per-edge waiver is the shape to propose.
 
-Two properties keep the withdrawal legible rather than silent, and both are conditions on which it was accepted. The waiver is refused wherever there is no such check to skip, so it can never be present without meaning something. And it is recorded on the admitted revision and readable through provenance, so a consumer can establish for any run of minors whether the safe-upgrade statement holds across it — which is why this ADR states that statement with the proviso rather than unconditionally.
+Two properties keep the withdrawal legible rather than silent, and both are conditions on which it was accepted. The waiver is refused wherever there is no such check to skip, so it can never be present without meaning something. And it is recorded on the admitted revision and readable as `provenance.compatibility_check_skipped`, so a consumer can establish for any run of minors whether the safe-upgrade statement holds across it — which is why this ADR states that statement with the proviso rather than unconditionally.
 
 ### Industry Practice
 
@@ -506,7 +506,7 @@ The managed model follows major-version API channels externally while ADR-0005 r
 
 This decision directly addresses:
 
-* `cpt-cf-types-registry-fr-minor-version-profile` - is the sole source of that requirement: when a minor is admissible, what it means, the per-major no-mixing and contiguity rules, the immutability of a minor-bearing entity, the `force` waiver and its record, and the lint that keeps the platform's own contracts major-only.
+* `cpt-cf-types-registry-fr-minor-version-profile` - is the sole source of that requirement: when a minor is admissible, what it means, the per-major no-mixing and contiguity rules, the immutability of a minor-bearing entity, the `skip_compatibility_check` waiver and its record, and the lint that keeps the platform's own contracts major-only.
 * `cpt-cf-types-registry-fr-gts-validation` - defines the platform profile for managed GTS version semantics, including when a minor version is admissible and where it is refused outright.
 * `cpt-cf-types-registry-fr-validate-schema-compat` - maps compatible managed changes to in-place revisions or to a checked minor successor, and incompatible changes to a new major identity.
 * `cpt-cf-types-registry-fr-id-resolution` - separates exact identity resolution from pattern and version-membership expansion, and refuses a `latest`-minor resolution mode.

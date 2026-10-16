@@ -1836,6 +1836,7 @@ async fn an_oversized_deletion_batch_is_refused_before_it_reads_and_counted_as_a
         .collect();
     let refused = registry
         .delete(
+            common::caller(),
             &DeleteRequest {
                 idempotency_key: Some("over-the-limit".to_owned()),
                 dry_run: false,

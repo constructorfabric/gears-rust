@@ -15,6 +15,7 @@ updates:
   # 1.95.0 long after rust-toolchain.toml moved to 1.97.0 (#4798).
   - package-ecosystem: "docker"
     directories:
+      - "/deploy/docker"
       - "/testing/docker"
       - "/gears/mini-chat/deploy/docker"
     schedule:

@@ -15,7 +15,7 @@ use toolkit_db::secure::{
 use super::IN_CHUNK;
 use crate::domain::ports::{
     CurrentDocument, CurrentReadRow, CurrentSchemaCas, CurrentSchemaProjection,
-    CurrentTypeSchemaRow, NewCurrentTypeSchema, NewRevision, RevisionProvenance,
+    CurrentTypeSchemaRow, NewCurrentTypeSchema, NewRevision,
 };
 use crate::domain::selection::{EntityField, FieldSelection};
 use crate::infra::storage::entity::{type_schema, type_schema_revision};
@@ -59,24 +59,7 @@ struct SchemaReadPointer {
 pub(super) struct RevisionReadColumns {
     pub(super) entity_id: i64,
     pub(super) content: Option<String>,
-    pub(super) gts_spec_version: Option<String>,
-    pub(super) gts_impl_version: Option<String>,
     pub(super) compat_forced: Option<bool>,
-}
-
-impl RevisionReadColumns {
-    /// Provenance exists only when both engine versions were selected.
-    pub(super) fn take_provenance(&mut self) -> Option<RevisionProvenance> {
-        let (gts_spec_version, gts_impl_version) = self
-            .gts_spec_version
-            .take()
-            .zip(self.gts_impl_version.take())?;
-        Some(RevisionProvenance {
-            gts_spec_version,
-            gts_impl_version,
-            compat_forced: self.compat_forced,
-        })
-    }
 }
 
 /// One current-state row as the domain names it. See `entity_repo::row` for why
@@ -260,10 +243,7 @@ impl TypeSchemaRepo {
                         query = query.column_as(type_schema_revision::Column::RawSchema, "content");
                     }
                     if selection.contains(EntityField::Provenance) {
-                        query = query
-                            .column(type_schema_revision::Column::GtsSpecVersion)
-                            .column(type_schema_revision::Column::GtsImplVersion)
-                            .column(type_schema_revision::Column::CompatForced);
+                        query = query.column(type_schema_revision::Column::CompatForced);
                     }
                     query.into_model::<RevisionReadColumns>()
                 })
@@ -274,7 +254,7 @@ impl TypeSchemaRepo {
         let mut out: Vec<CurrentReadRow> = pointers
             .into_iter()
             .map(|pointer| {
-                let mut revision = revisions.remove(&pointer.entity_id).ok_or_else(|| {
+                let revision = revisions.remove(&pointer.entity_id).ok_or_else(|| {
                     tracing::error!(
                         entity_id = pointer.entity_id,
                         revision_no = pointer.revision_no,
@@ -282,14 +262,13 @@ impl TypeSchemaRepo {
                     );
                     ScopeError::Invalid("current Type Schema pointer names a missing revision")
                 })?;
-                let provenance = revision.take_provenance();
                 Ok(CurrentReadRow {
                     entity_id: pointer.entity_id,
                     content: revision.content,
                     resolved_schema: pointer.resolved_schema,
                     effective_traits: pointer.effective_traits,
                     effective_traits_schema: pointer.effective_traits_schema,
-                    provenance,
+                    compat_forced: revision.compat_forced,
                 })
             })
             .collect::<Result<_, ScopeError>>()?;

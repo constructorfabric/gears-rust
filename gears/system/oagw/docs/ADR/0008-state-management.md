@@ -6,6 +6,8 @@ decision-makers: Constructor Fabric Steering Committee
 
 # State Management — Data Plane L1 Cache and Rate Limiter Ownership
 
+> **Implementation status:** the Data Plane L1 cache is not implemented ([ADR-0007](./0007-data-plane-caching.md)); its invalidation described here does not exist yet. Rate-limit counters are per instance as described.
+
 
 <!-- toc -->
 

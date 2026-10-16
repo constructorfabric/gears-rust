@@ -27,9 +27,9 @@ use axum::{
 };
 use caps::Capped;
 use dto::{
-    PriceBookCreate, PriceBookDto, PriceBookExport, PriceBookPatch, PricingDimensionKeyPatch,
-    PricingDimensionRegistry, PricingDimensions, PricingPriceBookReadDto, PricingSettingsDto,
-    PricingSettingsPut,
+    PriceBookCreate, PriceBookDto, PriceBookExport, PriceBookPatch, PricingCurrencyTable,
+    PricingDimensionKeyPatch, PricingDimensionRegistry, PricingDimensions, PricingPriceBookReadDto,
+    PricingSettingsDto, PricingSettingsPut,
 };
 use std::sync::Arc;
 use support::{authz_failure, etag, header, require_authenticated, response, transaction};
@@ -359,6 +359,25 @@ pub fn router(state: Arc<AuthoringState>, openapi: &dyn OpenApiRegistry) -> Rout
         .handler(put_settings)
         .json_response_with_schema::<PricingSettingsDto>(openapi, StatusCode::OK, "Response")
         .response_header(etag())
+        .standard_errors(openapi)
+        .error_503(openapi)
+        .register(router, openapi);
+    let router = OperationBuilder::get("/bss-pricing/v1/currencies")
+        .operation_id("bss_pricing.list_currencies")
+        .summary("List the currency table")
+        .description(
+            "Returns every currency a price book can use, with the number of decimal places a \
+             new price in that currency uses: the active ISO 4217 codes, and the codes the \
+             deployment's currency_scales config adds (iso false). The list is sorted by code and \
+             is the same for every tenant; the settings' currencies limit only which currency a \
+             new book can use (D-438, D-529, D-537). A saved price keeps the scale it was saved \
+             with (D-531). A caller without config read gets 403.",
+        )
+        .tag("Pricing")
+        .authenticated()
+        .no_license_required()
+        .handler(list_currencies)
+        .json_response_with_schema::<PricingCurrencyTable>(openapi, StatusCode::OK, "Response")
         .standard_errors(openapi)
         .error_503(openapi)
         .register(router, openapi);
@@ -2573,6 +2592,30 @@ async fn put_settings(
         })
     })
     .await
+}
+async fn list_currencies(
+    Extension(state): Extension<Arc<AuthoringState>>,
+    Extension(enforcer): Extension<PolicyEnforcer>,
+    ctx: Option<Extension<SecurityContext>>,
+) -> Result<Response, CanonicalError> {
+    let ctx = require_authenticated(ctx)?;
+    // D-537: the table belongs to the deployment, not to a tenant, so only the permission is
+    // checked.
+    authz::access_scope(
+        &enforcer,
+        &ctx,
+        &resource_types::CONFIG,
+        actions::READ,
+        None,
+        None,
+    )
+    .await
+    .map_err(authz_failure)?;
+    let items = state.currency_scales.known().iter().map(Into::into);
+    let body = PricingCurrencyTable {
+        items: items.collect(),
+    };
+    response(StatusCode::OK, &body, None)
 }
 async fn get_dimensions(
     Extension(state): Extension<Arc<AuthoringState>>,

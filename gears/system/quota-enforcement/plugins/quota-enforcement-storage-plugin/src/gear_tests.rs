@@ -34,7 +34,7 @@ fn in_process_registry() -> Arc<dyn TypesRegistryClient> {
     entries.extend(toolkit::gts::all_inventory_instances().expect("inventory instances"));
     RegisterResult::ensure_all_ok(&service.register(entries)).expect("inventory registers");
     service.switch_to_ready().expect("registry ready");
-    Arc::new(types_registry::domain::local_client::TypesRegistryLocalClient::new(service))
+    Arc::new(types_registry::domain::legacy_local_client::TypesRegistryLocalClient::new(service))
 }
 
 fn hub() -> Arc<ClientHub> {

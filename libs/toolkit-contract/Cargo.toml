@@ -131,6 +131,9 @@ uuid = { workspace = true, features = ["v4"] }
 # published *after* us (it depends on this crate), so the release fails.
 toolkit = { package = "cf-gears-toolkit", path = "../toolkit" }
 utoipa = { workspace = true }
+# rest_server_platform_plane.rs: wires the generated platform routes behind the
+# real per-route auth stack. Path-only for the same publish reason as `toolkit`.
+toolkit-http-middleware = { package = "cf-gears-toolkit-http-middleware", path = "../toolkit-http-middleware" }
 # otel_propagation.rs (feature = "otel"): builds an in-process (no exporter)
 # SdkTracerProvider to prove the generated client span's trace_id propagates
 # to the server via toolkit-http's OtelLayer. No collector/emulator needed —

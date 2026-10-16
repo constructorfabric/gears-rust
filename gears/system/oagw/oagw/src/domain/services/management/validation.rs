@@ -1,8 +1,140 @@
+use super::alias::{enforce_alias_create_derived, enforce_alias_create_with};
+use super::bind::parse_secret_ref;
+use super::budget::validate_budget_config;
+use super::canonical::canonicalize_match_rules;
 use crate::domain::error::DomainError;
-use crate::domain::model::{Endpoint, ListQuery, MatchRules, Route};
-use crate::domain::repo::RouteRepository;
+use crate::domain::model::{
+    AuthConfig, CorsConfig, CreateRouteRequest, CreateUpstreamRequest, Endpoint, HeadersConfig,
+    HttpMatch, HttpMethod, MatchRules, PluginsConfig, RateLimitConfig, Route, UpdateRouteRequest,
+    UpdateUpstreamRequest,
+};
+use crate::domain::repo::RowKey;
 use crate::domain::ssrf::SsrfGuard;
-use uuid::Uuid;
+
+/// The checks of an upstream create that read nothing: the request's fields,
+/// its endpoints against the SSRF policy, and its `secret_ref` syntax.
+/// Returns the alias the create stores. The Management API and the registry
+/// reconcile both run it before any read.
+pub(in crate::domain::services) fn validate_upstream_request(
+    ssrf: &SsrfGuard,
+    req: &CreateUpstreamRequest,
+) -> Result<String, DomainError> {
+    validate_upstream_content(
+        ssrf,
+        &req.tags,
+        &req.protocol,
+        req.auth.as_ref(),
+        req.headers.as_ref(),
+        req.plugins.as_ref(),
+        req.cors.as_ref(),
+        req.rate_limit.as_ref(),
+        &req.server.endpoints,
+    )?;
+    match req.alias.as_deref() {
+        Some(user_alias) => enforce_alias_create_with(user_alias, &req.server.endpoints),
+        None => enforce_alias_create_derived(&req.server.endpoints),
+    }
+}
+
+/// [`validate_upstream_request`] for a full-replacement update, without the
+/// alias: which alias rules apply depends on the stored row and the writer.
+pub(in crate::domain::services) fn validate_upstream_update_request(
+    ssrf: &SsrfGuard,
+    req: &UpdateUpstreamRequest,
+) -> Result<(), DomainError> {
+    validate_upstream_content(
+        ssrf,
+        &req.tags,
+        &req.protocol,
+        req.auth.as_ref(),
+        req.headers.as_ref(),
+        req.plugins.as_ref(),
+        req.cors.as_ref(),
+        req.rate_limit.as_ref(),
+        &req.server.endpoints,
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the shared body of the create and update upstream checks"
+)]
+fn validate_upstream_content(
+    ssrf: &SsrfGuard,
+    tags: &[String],
+    protocol: &str,
+    auth: Option<&AuthConfig>,
+    headers: Option<&HeadersConfig>,
+    plugins: Option<&PluginsConfig>,
+    cors: Option<&CorsConfig>,
+    rate_limit: Option<&RateLimitConfig>,
+    endpoints: &[Endpoint],
+) -> Result<(), DomainError> {
+    validate_tags(tags)?;
+    validate_upstream_refs(protocol, auth)?;
+    validate_plugin_refs(plugins)?;
+    validate_json_text(auth, headers, cors, plugins)?;
+    validate_endpoints(endpoints)?;
+    validate_endpoints_ssrf(ssrf, endpoints)?;
+    if let Some(cors) = cors {
+        crate::domain::cors::validate_cors_config(cors)?;
+    }
+    if let Some(budget) = rate_limit.and_then(|rl| rl.budget.as_ref()) {
+        validate_budget_config(budget)?;
+    }
+    if let Some(raw_ref) = auth
+        .and_then(|a| a.config.as_ref())
+        .and_then(|c| c.get("secret_ref"))
+    {
+        parse_secret_ref(raw_ref)?;
+    }
+    Ok(())
+}
+
+/// The checks of a route create that read nothing. Returns the canonical
+/// match rules the create stores. The Management API and the registry
+/// reconcile both run it before any read.
+pub(in crate::domain::services) fn validate_route_request(
+    req: &CreateRouteRequest,
+) -> Result<MatchRules, DomainError> {
+    validate_route_content(
+        &req.tags,
+        &req.match_rules,
+        req.plugins.as_ref(),
+        req.cors.as_ref(),
+    )
+}
+
+/// [`validate_route_request`] for a full-replacement update.
+pub(in crate::domain::services) fn validate_route_update_request(
+    req: &UpdateRouteRequest,
+) -> Result<MatchRules, DomainError> {
+    validate_route_content(
+        &req.tags,
+        &req.match_rules,
+        req.plugins.as_ref(),
+        req.cors.as_ref(),
+    )
+}
+
+fn validate_route_content(
+    tags: &[String],
+    match_rules: &MatchRules,
+    plugins: Option<&PluginsConfig>,
+    cors: Option<&CorsConfig>,
+) -> Result<MatchRules, DomainError> {
+    validate_tags(tags)?;
+    validate_match_fields(match_rules)?;
+    validate_plugin_refs(plugins)?;
+    validate_json_text(None, None, cors, plugins)?;
+    if let Some(cors) = cors {
+        crate::domain::cors::validate_cors_config(cors)?;
+    }
+    let mut rules = match_rules.clone();
+    canonicalize_match_rules(&mut rules);
+    validate_match_rules(&rules)?;
+    Ok(rules)
+}
 
 /// Ensure exactly one of `http` or `grpc` is present in the match rules.
 ///
@@ -20,6 +152,174 @@ pub(in crate::domain::services) fn validate_match_rules(
         )),
         _ => Ok(()),
     }
+}
+
+/// Most tags an upstream or route may carry.
+const MAX_TAGS: usize = 64;
+/// Longest tag, in bytes.
+pub(crate) const MAX_TAG_BYTES: usize = 128;
+/// Longest HTTP path prefix, in bytes.
+pub(crate) const MAX_PATH_BYTES: usize = 2048;
+/// Longest gRPC service or method name, in bytes.
+pub(crate) const MAX_GRPC_NAME_BYTES: usize = 256;
+/// Longest protocol, auth plugin type or plugin reference, in bytes.
+pub(crate) const MAX_REF_BYTES: usize = 256;
+/// Most plugin bindings an upstream or route may carry. The proxy reads them
+/// joined to their parent row, so this also bounds the rows of one read.
+const MAX_PLUGINS: usize = 32;
+/// Most query parameters an HTTP match may allow.
+const MAX_QUERY_PARAMS: usize = 64;
+/// Longest allowed query parameter name, in bytes.
+const MAX_QUERY_PARAM_BYTES: usize = 128;
+
+/// At most [`MAX_TAGS`] tags of at most [`MAX_TAG_BYTES`] bytes, without
+/// control characters. Tags are stored in `varchar` columns sized to the
+/// limit, which `PostgreSQL` rejects NUL in.
+pub(in crate::domain::services) fn validate_tags(tags: &[String]) -> Result<(), DomainError> {
+    if tags.len() > MAX_TAGS {
+        return Err(DomainError::validation(format!(
+            "at most {MAX_TAGS} tags are allowed, got {}",
+            tags.len()
+        )));
+    }
+    for (i, tag) in tags.iter().enumerate() {
+        validate_stored_text(&format!("tags[{i}]"), tag, MAX_TAG_BYTES)?;
+    }
+    Ok(())
+}
+
+/// Bound the matched path prefix and gRPC names, which are stored in sized
+/// `varchar` columns like tags.
+pub(in crate::domain::services) fn validate_match_fields(
+    rules: &MatchRules,
+) -> Result<(), DomainError> {
+    if let Some(http) = &rules.http {
+        validate_stored_text("match.http.path", &http.path, MAX_PATH_BYTES)?;
+        if http.query_allowlist.len() > MAX_QUERY_PARAMS {
+            return Err(DomainError::validation(format!(
+                "match.http.query_allowlist allows at most {MAX_QUERY_PARAMS} parameters, got {}",
+                http.query_allowlist.len()
+            )));
+        }
+        for (i, param) in http.query_allowlist.iter().enumerate() {
+            validate_stored_text(
+                &format!("match.http.query_allowlist[{i}]"),
+                param,
+                MAX_QUERY_PARAM_BYTES,
+            )?;
+        }
+    }
+    if let Some(grpc) = &rules.grpc {
+        validate_stored_text("match.grpc.service", &grpc.service, MAX_GRPC_NAME_BYTES)?;
+        validate_stored_text("match.grpc.method", &grpc.method, MAX_GRPC_NAME_BYTES)?;
+    }
+    Ok(())
+}
+
+/// Bound the upstream's protocol and auth plugin type, which are stored in
+/// `varchar` columns that `PostgreSQL` rejects NUL in.
+pub(in crate::domain::services) fn validate_upstream_refs(
+    protocol: &str,
+    auth: Option<&AuthConfig>,
+) -> Result<(), DomainError> {
+    validate_stored_text("protocol", protocol, MAX_REF_BYTES)?;
+    if let Some(auth) = auth {
+        validate_stored_text("auth.type", &auth.plugin_type, MAX_REF_BYTES)?;
+    }
+    Ok(())
+}
+
+/// At most [`MAX_PLUGINS`] plugin bindings, with references bounded like
+/// [`validate_upstream_refs`].
+pub(in crate::domain::services) fn validate_plugin_refs(
+    plugins: Option<&PluginsConfig>,
+) -> Result<(), DomainError> {
+    if let Some(plugins) = plugins
+        && plugins.items.len() > MAX_PLUGINS
+    {
+        return Err(DomainError::validation(format!(
+            "plugins.items allows at most {MAX_PLUGINS} plugins, got {}",
+            plugins.items.len()
+        )));
+    }
+    for (i, item) in plugins.iter().flat_map(|p| &p.items).enumerate() {
+        validate_stored_text(
+            &format!("plugins.items[{i}].plugin_ref"),
+            &item.plugin_ref,
+            MAX_REF_BYTES,
+        )?;
+    }
+    Ok(())
+}
+
+/// Reject NUL in the free-form strings stored inside JSON columns: auth and
+/// plugin config, header rules and CORS lists. `PostgreSQL`'s `jsonb` cannot
+/// store `\u0000`, so such input would otherwise fail as a 500 there only.
+pub(in crate::domain::services) fn validate_json_text(
+    auth: Option<&AuthConfig>,
+    headers: Option<&HeadersConfig>,
+    cors: Option<&CorsConfig>,
+    plugins: Option<&PluginsConfig>,
+) -> Result<(), DomainError> {
+    if let Some(config) = auth.and_then(|a| a.config.as_ref()) {
+        reject_nul_in_map("auth.config", config)?;
+    }
+    if let Some(request) = headers.and_then(|h| h.request.as_ref()) {
+        reject_nul_in_map("headers.request.set", &request.set)?;
+        reject_nul_in_map("headers.request.add", &request.add)?;
+        reject_nul("headers.request.remove", &request.remove)?;
+        reject_nul(
+            "headers.request.passthrough_allowlist",
+            &request.passthrough_allowlist,
+        )?;
+    }
+    if let Some(response) = headers.and_then(|h| h.response.as_ref()) {
+        reject_nul_in_map("headers.response.set", &response.set)?;
+        reject_nul_in_map("headers.response.add", &response.add)?;
+        reject_nul("headers.response.remove", &response.remove)?;
+    }
+    if let Some(cors) = cors {
+        reject_nul("cors.allowed_origins", &cors.allowed_origins)?;
+        reject_nul("cors.expose_headers", &cors.expose_headers)?;
+    }
+    for (i, item) in plugins.iter().flat_map(|p| &p.items).enumerate() {
+        reject_nul_in_map(&format!("plugins.items[{i}].config"), &item.config)?;
+    }
+    Ok(())
+}
+
+fn reject_nul<'a>(
+    name: &str,
+    values: impl IntoIterator<Item = &'a String>,
+) -> Result<(), DomainError> {
+    if values.into_iter().any(|v| v.contains('\0')) {
+        return Err(DomainError::validation(format!(
+            "{name} must not contain NUL characters"
+        )));
+    }
+    Ok(())
+}
+
+fn reject_nul_in_map(
+    name: &str,
+    entries: &std::collections::HashMap<String, String>,
+) -> Result<(), DomainError> {
+    reject_nul(name, entries.keys().chain(entries.values()))
+}
+
+fn validate_stored_text(name: &str, value: &str, max_bytes: usize) -> Result<(), DomainError> {
+    if value.len() > max_bytes {
+        return Err(DomainError::validation(format!(
+            "{name} must not exceed {max_bytes} bytes, got {}",
+            value.len()
+        )));
+    }
+    if value.chars().any(char::is_control) {
+        return Err(DomainError::validation(format!(
+            "{name} must not contain control characters"
+        )));
+    }
+    Ok(())
 }
 
 /// Validate the endpoint list for a server configuration.
@@ -100,14 +400,9 @@ pub(in crate::domain::services) fn validate_endpoints_ssrf(
     if !guard.is_enabled() {
         return Ok(());
     }
+    validate_endpoint_hostnames_ssrf(guard, endpoints)?;
     for (i, ep) in endpoints.iter().enumerate() {
         let host = ep.normalized_host();
-        if let Some(blocked) = guard.is_hostname_blocked(&host) {
-            return Err(DomainError::validation(format!(
-                "endpoint[{i}] hostname '{}' is blocked by SSRF protection (matches '{blocked}')",
-                ep.host,
-            )));
-        }
         if let Ok(ip) = host.parse::<std::net::IpAddr>()
             && guard.is_ip_blocked(ip)
         {
@@ -115,6 +410,24 @@ pub(in crate::domain::services) fn validate_endpoints_ssrf(
                 "endpoint[{i}] IP address '{}' is blocked by SSRF protection: {}",
                 ep.host,
                 guard.ip_block_reason(ip),
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Reject an endpoint whose host is on the SSRF hostname deny-list. Runs on
+/// every alias resolution too, so a stored upstream stops proxying once the
+/// deny-list covers it; resolved IPs are checked by the data plane.
+pub(in crate::domain::services) fn validate_endpoint_hostnames_ssrf(
+    guard: &SsrfGuard,
+    endpoints: &[Endpoint],
+) -> Result<(), DomainError> {
+    for (i, ep) in endpoints.iter().enumerate() {
+        if let Some(blocked) = guard.is_hostname_blocked(&ep.normalized_host()) {
+            return Err(DomainError::validation(format!(
+                "endpoint[{i}] hostname '{}' is blocked by SSRF protection (matches '{blocked}')",
+                ep.host,
             )));
         }
     }
@@ -166,73 +479,70 @@ fn validate_hostname(index: usize, host: &str) -> Result<(), DomainError> {
     Ok(())
 }
 
-/// Check that no existing **enabled** route under the same upstream shares
-/// `(path_prefix, priority, method)` with the candidate route.
-///
-/// `exclude_id` is `Some(route.id)` on update to skip the route being
-/// modified (it will be compared against its new state, not itself).
-///
-/// Returns `DomainError::Conflict` on violation (maps to 409).
-pub(in crate::domain::services) async fn check_route_overlap(
-    routes: &dyn RouteRepository,
-    candidate: &Route,
-    exclude_id: Option<Uuid>,
-) -> Result<(), DomainError> {
-    // Disabled routes cannot cause match-time ambiguity.
-    if !candidate.enabled {
-        return Ok(());
+/// The method two HTTP matches on the same upstream both serve at the same
+/// path and priority, if any. Callers check that both routes are enabled.
+pub(crate) fn overlapping_method(
+    a: &HttpMatch,
+    a_priority: i32,
+    b: &HttpMatch,
+    b_priority: i32,
+) -> Option<HttpMethod> {
+    if a.path != b.path || a_priority != b_priority {
+        return None;
     }
+    a.methods.iter().find(|m| b.methods.contains(m)).copied()
+}
 
-    let candidate_http = match &candidate.match_rules.http {
-        Some(h) => h,
-        None => return Ok(()), // No HTTP match rules → no overlap to check.
-    };
+/// The 409 for a route write that overlaps a stored route on `method` (the
+/// rule of [`overlapping_method`]). One rule for every writer: a stale
+/// registry row blocks an overlapping registry write until it moves.
+pub(in crate::domain::services) fn route_overlap_conflict(
+    route: &Route,
+    method: HttpMethod,
+) -> DomainError {
+    let path = route
+        .match_rules
+        .http
+        .as_ref()
+        .map_or("", |h| h.path.as_str());
+    DomainError::conflict(
+        "route",
+        format!("{}:{}:{:?}", route.upstream_id, path, method),
+        format!(
+            "route overlap: an enabled route already exists on upstream '{}' \
+                 with path '{}', priority {}, method {:?}",
+            route.upstream_id, path, route.priority, method
+        ),
+    )
+}
 
-    // Fetch all routes for this (tenant, upstream).
-    let all = routes
-        .list(
-            candidate.tenant_id,
-            Some(candidate.upstream_id),
-            &ListQuery {
-                top: u32::MAX,
-                skip: 0,
-            },
-        )
-        .await
-        .map_err(DomainError::from)?;
-
-    for existing in &all {
-        // Skip self on update.
-        if Some(existing.id) == exclude_id {
-            continue;
-        }
-        // Only enabled routes can conflict.
-        if !existing.enabled {
-            continue;
-        }
-        // Must have HTTP match rules.
-        let Some(existing_http) = &existing.match_rules.http else {
-            continue;
-        };
-        // Must share path and priority.
-        if existing_http.path != candidate_http.path || existing.priority != candidate.priority {
-            continue;
-        }
-        // Check for any overlapping method.
-        for m in &candidate_http.methods {
-            if existing_http.methods.contains(m) {
-                return Err(DomainError::conflict(
-                    "route",
-                    format!("{}:{}:{:?}", candidate.upstream_id, candidate_http.path, m),
-                    format!(
-                        "route overlap: an enabled route already exists on upstream '{}' \
-                             with path '{}', priority {}, method {:?}",
-                        candidate.upstream_id, candidate_http.path, candidate.priority, m
-                    ),
-                ));
+/// Every pair of routes the types registry provides that overlap each other,
+/// by the rule of [`route_overlap_conflict`], with the first shared method. Pairs
+/// are ordered by the lower route ID first, then by the higher.
+pub(crate) fn registry_route_overlaps(
+    routes: &[(RowKey, &CreateRouteRequest)],
+) -> Vec<(RowKey, RowKey, HttpMethod)> {
+    let enabled_http = routes.iter().filter_map(|(key, req)| {
+        let http = req.match_rules.http.as_ref()?;
+        req.enabled.then_some((*key, *req, http))
+    });
+    let enabled_http: Vec<_> = enabled_http.collect();
+    let mut pairs = Vec::new();
+    for (i, (a_key, a, a_http)) in enabled_http.iter().enumerate() {
+        for (b_key, b, b_http) in &enabled_http[i + 1..] {
+            if a_key.tenant_id != b_key.tenant_id || a.upstream_id != b.upstream_id {
+                continue;
+            }
+            if let Some(m) = overlapping_method(a_http, a.priority, b_http, b.priority) {
+                let (first, second) = if a_key.id <= b_key.id {
+                    (*a_key, *b_key)
+                } else {
+                    (*b_key, *a_key)
+                };
+                pairs.push((first, second, m));
             }
         }
     }
-
-    Ok(())
+    pairs.sort_by_key(|(a, b, _)| (a.id, b.id));
+    pairs
 }

@@ -244,11 +244,11 @@ jobs:
       # `make e2e-local` (no SUITE) runs only the shared-server suites
       # (launcher: e2e-launcher) against a single server. Self-managed suites
       # (launcher: pytest — mini-chat, usage-collector) and profile lanes
-      # (tr-authz) are NOT covered by it, so they run as their own steps below.
-      # Each test step writes its own JUnit file via PYTEST_ADDOPTS (both
-      # run_e2e.py and ci.py hand their env to pytest), and runs even when an
-      # earlier one failed (`!cancelled()`) so one broken suite no longer hides
-      # the others; the job still fails if any did. Gated on `setup` so a
+      # (tr-authz, oagw-sqlite) are NOT covered by it, so they run as their own
+      # steps below. Each test step writes its own JUnit file via PYTEST_ADDOPTS
+      # (both run_e2e.py and ci.py hand their env to pytest), and runs even when
+      # an earlier one failed (`!cancelled()`) so one broken suite no longer
+      # hides the others; the job still fails if any did. Gated on `setup` so a
       # broken environment does not cascade.
       - name: Run E2E tests
         if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
@@ -278,6 +278,15 @@ jobs:
         env:
           PYTEST_ADDOPTS: "--junitxml=${{ github.workspace }}/test-results/e2e/tr-authz.xml -o junit_suite_name=e2e-tr-authz"
         run: tools/scripts/with_rust_annotations.sh make e2e-tr-authz
+
+      # sqlite is a PROFILE of the oagw suite: OAGW on SQLite, with an upstream
+      # and a route provisioned from types-registry `entities`. The default
+      # oagw run keeps OAGW in memory.
+      - name: Run OAGW E2E tests (SQLite storage, types-registry provisioning)
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        env:
+          PYTEST_ADDOPTS: "--junitxml=${{ github.workspace }}/test-results/e2e/oagw-sqlite.xml -o junit_suite_name=e2e-oagw-sqlite"
+        run: tools/scripts/with_rust_annotations.sh make e2e-oagw-sqlite
 
       # Self-managed suite (launcher: pytest): starts its own server plus a
       # TimescaleDB or ClickHouse container, so it needs a reachable Docker daemon.

@@ -166,7 +166,7 @@ async def test_failed_first_minor_blocks_the_next_minor(
 
 
 @pytest.mark.scenario("TR-REG-606")
-async def test_a_compatible_minor_with_changed_content_needs_no_force(
+async def test_a_compatible_minor_with_changed_content_needs_no_skip(
     registry_http, registry_api_path, registration_fixture, given_registered
 ):
     """An ordinary cross-minor check admits a widening; nothing is waived."""
@@ -197,10 +197,10 @@ async def test_a_compatible_minor_with_changed_content_needs_no_force(
 
 
 @pytest.mark.scenario("TR-REG-607")
-async def test_an_incompatible_minor_is_refused_without_force(
+async def test_an_incompatible_minor_is_refused_without_a_skip_request(
     registry_http, registry_api_path, registration_fixture, given_registered
 ):
-    """A deployment that permits `force` still applies it only when asked."""
+    """A deployment that allows `skip_compatibility_check` applies it only when asked."""
     first = registration_fixture("person_minor_0_schema")
     second = registration_fixture("person_minor_1_schema")
     await given_registered(first)

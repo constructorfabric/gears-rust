@@ -504,7 +504,7 @@ Successful deletion increments `resource_version` once and leaves a readable tom
 
 **Given:** register `person_minor_0_schema` and `person_minor_1_schema`. The latter adds optional root field `extra` while retaining open `payload`. Delete `person_minor_1_schema`. Prepare `person_minor_2_incompatible_schema`, which removes `extra` and otherwise returns to the v1.0 definition apart from its ID.
 
-**When:** register `person_minor_2_incompatible_schema` without `force`.
+**When:** register `person_minor_2_incompatible_schema` without `skip_compatibility_check`.
 
 **Then:** registration fails compatibility: `person_minor_1_schema` accepted objects containing `extra`, and the proposed closed `person_minor_2_incompatible_schema` rejects them. The registry must use retained `person_minor_1_schema` as baseline, not skip it in favor of `person_minor_0_schema`. `person_minor_2_incompatible_schema` remains absent; `person_minor_1_schema` stays deleted.
 

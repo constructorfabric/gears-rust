@@ -9,11 +9,13 @@ import httpx
 import pytest
 
 from .helpers import (
+    GRPC_PROTOCOL_ID,
     HTTP_PROTOCOL_ID,
     ROUTE_SCHEMA,
     UPSTREAM_SCHEMA,
     assert_problem,
     create_route,
+    create_route_raw,
     create_upstream,
     create_upstream_raw,
     delete_upstream,
@@ -308,6 +310,56 @@ async def test_delete_upstream_cascades_routes(
         assert await list_all(client, oagw_base_url, oagw_headers, "routes", **by_upstream) == []
 
 
+@pytest.mark.scenario("negative-3.11-overlapping-route-rejected-409")
+@pytest.mark.asyncio
+async def test_overlapping_route_rejected(
+    oagw_base_url, oagw_headers, mock_upstream_url, mock_upstream, cleanup,
+):
+    """Scenario 3.11: an enabled route with the same path, priority and a shared
+    method on the same upstream is a 409 that names the route resource."""
+    _ = mock_upstream
+    alias = unique_alias("mgmt-overlap")
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        upstream = cleanup.upstream(oagw_headers, await create_upstream(
+            client, oagw_base_url, oagw_headers, mock_upstream_url, alias=alias,
+        ))
+        uid = upstream["id"]
+        first = await create_route(
+            client, oagw_base_url, oagw_headers, uid, ["GET", "POST"], "/v1/models",
+        )
+
+        resp = await create_route_raw(
+            client, oagw_base_url, oagw_headers, uid, ["POST", "PUT"], "/v1/models",
+        )
+        body = assert_problem(
+            resp, 409, esrc=None,
+            category="already_exists",
+            resource_type=ROUTE_SCHEMA,
+            detail_contains="route overlap",
+        )
+        # The detail names the upstream (its UUID), the path, the priority and
+        # the shared method.
+        upstream_uuid = uid.rsplit("~", 1)[-1]
+        for part in (f"upstream '{upstream_uuid}'", "path '/v1/models'", "priority 0"):
+            assert part in body["detail"], body["detail"]
+        assert "method post" in body["detail"].lower(), body["detail"]
+        by_upstream = {"upstream_id": uid}
+        listed = await list_all(client, oagw_base_url, oagw_headers, "routes", **by_upstream)
+        assert [r["id"] for r in listed] == [first["id"]]
+
+        # No shared method, or another priority, on the same path is not an overlap.
+        other_method = await create_route(
+            client, oagw_base_url, oagw_headers, uid, ["DELETE"], "/v1/models",
+        )
+        other_priority = await create_route(
+            client, oagw_base_url, oagw_headers, uid, ["POST"], "/v1/models", priority=1,
+        )
+        listed = await list_all(client, oagw_base_url, oagw_headers, "routes", **by_upstream)
+        assert sorted(r["id"] for r in listed) == sorted(
+            [first["id"], other_method["id"], other_priority["id"]],
+        )
+
+
 @pytest.mark.scenario("positive-2.9-tags-support-discovery-filtering")
 # ---------------------------------------------------------------------------
 # Tags
@@ -355,3 +407,170 @@ async def test_list_rejects_unsupported_query_parameters(param, oagw_base_url, o
             f"{oagw_base_url}/oagw/v1/upstreams", headers=oagw_headers, params={param: "llm"},
         )
         assert_problem(resp, 400, esrc=None)
+
+
+# ---------------------------------------------------------------------------
+# Field limits
+# ---------------------------------------------------------------------------
+
+_FIELD_LIMITS = "negative-2.14-field-limits-rejected-400"
+
+
+def _limit_case(case_id, part, target, at_limit, over_limit, detail):
+    return pytest.param(
+        target, at_limit, over_limit, detail,
+        id=case_id, marks=pytest.mark.scenario(_FIELD_LIMITS, part=part),
+    )
+
+
+def _http_match(path: str, **fields) -> dict:
+    return {"http": {"methods": ["GET"], "path": path, **fields}}
+
+
+def _grpc_match(service: str, method: str) -> dict:
+    return {"grpc": {"service": service, "method": method}}
+
+
+def _plugins(plugin_ref: str) -> dict:
+    return {"items": [{"plugin_ref": plugin_ref}]}
+
+
+def _assert_stored(stored, expected, field="body"):
+    """The fields of ``expected`` are stored as sent; tags in any order, and
+    fields the server adds (defaults such as ``sharing``) are ignored."""
+    if isinstance(expected, dict):
+        for key, value in expected.items():
+            _assert_stored(stored[key], value, f"{field}.{key}")
+    elif field.endswith(".tags"):
+        assert sorted(stored) == sorted(expected), field
+    elif isinstance(expected, list) and expected and isinstance(expected[0], dict):
+        assert len(stored) == len(expected), field
+        for i, (s, e) in enumerate(zip(stored, expected)):
+            _assert_stored(s, e, f"{field}[{i}]")
+    else:
+        assert stored == expected, field
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("target", "at_limit", "over_limit", "detail"),
+    [
+        _limit_case(
+            "65-tags", "A", "upstream",
+            {"tags": [f"t{i}" for i in range(64)]}, {"tags": [f"t{i}" for i in range(65)]},
+            "at most 64 tags are allowed, got 65",
+        ),
+        # Bytes, not characters: 65 two-byte characters fit 128 characters.
+        _limit_case(
+            "129-byte-tag", "A", "upstream",
+            {"tags": ["\u00e9" * 64]}, {"tags": ["\u00e9" * 64 + "a"]},
+            "tags[0] must not exceed 128 bytes, got 129",
+        ),
+        _limit_case(
+            "control-character-tag", "A", "upstream",
+            {"tags": ["a-b"]}, {"tags": ["a\tb"]},
+            "tags[0] must not contain control characters",
+        ),
+        # Bytes, not characters: both paths are 1025 characters.
+        _limit_case(
+            "2049-byte-path", "B", "route",
+            {"match": _http_match("/" + "\u00e9" * 1023 + "a")},
+            {"match": _http_match("/" + "\u00e9" * 1024)},
+            "match.http.path must not exceed 2048 bytes, got 2049",
+        ),
+        _limit_case(
+            "257-byte-grpc-service", "B", "grpc-route",
+            {"match": _grpc_match("s" * 256, "Get")}, {"match": _grpc_match("s" * 257, "Get")},
+            "match.grpc.service must not exceed 256 bytes, got 257",
+        ),
+        _limit_case(
+            "257-byte-grpc-method", "B", "grpc-route",
+            {"match": _grpc_match("pkg.Service", "m" * 256)},
+            {"match": _grpc_match("pkg.Service", "m" * 257)},
+            "match.grpc.method must not exceed 256 bytes, got 257",
+        ),
+        _limit_case(
+            "65-query-parameters", "B", "route",
+            {"match": _http_match("/q", query_allowlist=[f"q{i}" for i in range(64)])},
+            {"match": _http_match("/q", query_allowlist=[f"q{i}" for i in range(65)])},
+            "match.http.query_allowlist allows at most 64 parameters, got 65",
+        ),
+        _limit_case(
+            "129-byte-query-parameter", "B", "route",
+            {"match": _http_match("/q", query_allowlist=["\u00e9" * 64])},
+            {"match": _http_match("/q", query_allowlist=["\u00e9" * 64 + "a"])},
+            "match.http.query_allowlist[0] must not exceed 128 bytes, got 129",
+        ),
+        _limit_case(
+            "257-byte-protocol", "C", "upstream",
+            {"protocol": "p" * 256}, {"protocol": "p" * 257},
+            "protocol must not exceed 256 bytes, got 257",
+        ),
+        _limit_case(
+            "257-byte-auth-type", "C", "upstream",
+            {"auth": {"type": "a" * 256}}, {"auth": {"type": "a" * 257}},
+            "auth.type must not exceed 256 bytes, got 257",
+        ),
+        _limit_case(
+            "control-character-upstream-plugin-ref", "C", "upstream",
+            {"plugins": _plugins("p-1")}, {"plugins": _plugins("p\u0000")},
+            "plugins.items[0].plugin_ref must not contain control characters",
+        ),
+        _limit_case(
+            "257-byte-route-plugin-ref", "C", "route",
+            {"match": _http_match("/p"), "plugins": _plugins("p" * 256)},
+            {"match": _http_match("/p"), "plugins": _plugins("p" * 257)},
+            "plugins.items[0].plugin_ref must not exceed 256 bytes, got 257",
+        ),
+    ],
+)
+async def test_field_limits_rejected(
+    target, at_limit, over_limit, detail,
+    oagw_base_url, oagw_headers, mock_upstream_url, mock_upstream, cleanup,
+):
+    """Scenario 2.14: a value one past a stored-field limit is a 400 and is not
+    stored; the value at the limit is accepted."""
+    _ = mock_upstream
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        if target == "upstream":
+            over_alias = unique_alias("mgmt-limit")
+            resp = await create_upstream_raw(
+                client, oagw_base_url, oagw_headers, mock_upstream_url,
+                alias=over_alias, **over_limit,
+            )
+            if resp.status_code == 201:
+                cleanup.upstream(oagw_headers, resp.json())
+            assert_problem(
+                resp, 400, esrc=None, category="invalid_argument", detail_contains=detail,
+            )
+            upstreams = await list_all(client, oagw_base_url, oagw_headers, "upstreams")
+            assert not [u for u in upstreams if u["alias"] == over_alias]
+
+            upstream = cleanup.upstream(oagw_headers, await create_upstream(
+                client, oagw_base_url, oagw_headers, mock_upstream_url,
+                alias=unique_alias("mgmt-limit"), **at_limit,
+            ))
+            stored = (await _get(client, oagw_base_url, oagw_headers, "upstreams", upstream["id"])).json()
+            _assert_stored(stored, at_limit)
+        else:
+            protocol = GRPC_PROTOCOL_ID if target == "grpc-route" else HTTP_PROTOCOL_ID
+            upstream = cleanup.upstream(oagw_headers, await create_upstream(
+                client, oagw_base_url, oagw_headers, mock_upstream_url,
+                alias=unique_alias("mgmt-limit"), protocol=protocol,
+            ))
+            uid = upstream["id"]
+            resp = await create_route_raw(
+                client, oagw_base_url, oagw_headers, uid, [], "", **over_limit,
+            )
+            assert_problem(
+                resp, 400, esrc=None, category="invalid_argument", detail_contains=detail,
+            )
+            by_upstream = {"upstream_id": uid}
+            assert await list_all(client, oagw_base_url, oagw_headers, "routes", **by_upstream) == []
+
+            resp = await create_route_raw(
+                client, oagw_base_url, oagw_headers, uid, [], "", **at_limit,
+            )
+            assert resp.status_code == 201, resp.text[:500]
+            stored = (await _get(client, oagw_base_url, oagw_headers, "routes", resp.json()["id"])).json()
+            _assert_stored(stored, at_limit)

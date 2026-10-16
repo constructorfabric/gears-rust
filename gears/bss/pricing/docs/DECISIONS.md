@@ -146,7 +146,7 @@ and the sold-as bundle and grants (D-411), and drops quote and the Studio wiring
 | D-523 | M | The PEP gate asks the PDP for the caller's tenant only (twin of products P-D-265) | DECIDED 2026-10-04 · Owner, 2026-10-04 (the approval lists under a root tenant) |
 | D-527 | H | Every authored decimal is exact text within a published profile; a rate has at most 12 places | DECIDED 2026-10-12 · Owner, 2026-10-11 (the rate bound); pricing exact-money plan rev 2.1, Tasks 1, 2 and 5; amends D-504 |
 | D-528 | H | Each numeric and currency refusal has its code and names its cause | DECIDED 2026-10-12 · Pricing exact-money plan rev 2.1, Tasks 2 and 3; its mid-plan review |
-| D-529 | H | One ISO 4217 table; the deployment's table adds non-ISO codes only | DECIDED 2026-10-12 · Owner, 2026-10-11; pricing exact-money plan rev 2.1, Tasks 0 and 3; amends D-438 |
+| D-529 | H | One ISO 4217 table; the deployment's table adds non-ISO codes only | DECIDED 2026-10-12 · Owner, 2026-10-11; pricing exact-money plan rev 2.1, Tasks 0 and 3; amends D-438; extended by D-537 |
 | D-530 | H | No gear overrides an ISO scale, and a non-ISO code has one scale in ledger and in pricing | DECIDED 2026-10-12 · Owner, 2026-10-12; agreed with ledger |
 | D-531 | H | Each price stores its currency spec, and every read and receipt uses it | DECIDED 2026-10-12 · Pricing exact-money plan rev 2.1, Task 3; amends D-421, D-422 |
 | D-532 | H | The money digest and the price projection carry the scale; digest domains and the receipt schema stay at version 1 | DECIDED 2026-10-12 · Owner, 2026-10-09 (no version bumps before production); pricing exact-money plan rev 2.1, Task 4; amends D-501, D-505 |
@@ -154,6 +154,7 @@ and the sold-as bundle and grants (D-411), and drops quote and the Studio wiring
 | D-534 | M | The pricing migrations are edited in place for the price's currency spec and the settings | DECIDED 2026-10-12 · Owner, 2026-10-08 (fresh schema); amends D-412, D-427 |
 | D-535 | M | No tenant rounding setting; an invoice line rounds HALF_EVEN | DECIDED 2026-10-12 · Owner, 2026-10-11; BSS money ADR rule 7; supersedes D-437; amends D-421, D-439 |
 | D-536 | L | A minimum billable unit is deferred (owner, 2026-10-11) | DECIDED 2026-10-12 · Owner, 2026-10-11; BSS money ADR rule 5 |
+| D-537 | M | The currency table is a read: GET /currencies | DECIDED 2026-10-14 · Owner, 2026-10-14; extends D-529 |
 
 ## Entries
 
@@ -2361,9 +2362,9 @@ A refused input writes nothing: no price, approval unit, audit row, outbox event
 
 - **The shared table.** `bss_money::iso_scale` is the one ISO 4217 table of the workspace: the active codes and their minor digits. A code that ISO lists without a scale (`XAU`, `XTS`) gives no scale, and so does a code ISO does not list.
 - **Pricing's resolution.** `domain::currency::CurrencyScales` resolves a code: the ISO scale first, else the deployment's `currency_scales` config (`BssPricingConfig`, empty by default). A key is three uppercase letters, is a code with no ISO 4217 minor-unit scale (`iso_scale` gives none), such as `XTS` or a code ISO does not list, and has a scale of 0 to 28. A table that breaks this stops the gear at startup (D-528).
-- **Who reads it.** A new book takes only a currency the table resolves, and so do the offered currencies of the settings (D-438). A new price, a draft edit, a submit and an approval read the table. Reads, receipts and replay never read it: they use the price's stored spec (D-531).
+- **Who reads it.** A new book takes only a currency the table resolves, and so do the offered currencies of the settings (D-438). A new price, a draft edit, a submit and an approval read the table. Reads, receipts and replay never read it: they use the price's stored spec (D-531). `GET /currencies` lists it (D-537).
 
-**Source:** Owner, 2026-10-11 (the ISO table lands with the exact-money work). Pricing exact-money plan rev 2.1, Tasks 0 and 3. Amends D-438.
+**Source:** Owner, 2026-10-11 (the ISO table lands with the exact-money work). Pricing exact-money plan rev 2.1, Tasks 0 and 3. Amends D-438. Extended by D-537.
 
 #### D-530 [H] No gear overrides an ISO scale, and a non-ISO code has one scale in ledger and in pricing
 
@@ -2430,3 +2431,14 @@ The tenant settings carry no rounding. The platform fixes the invoice-line round
 Pricing rates the actual quantity. No tariff field says "per started hour" or "whole GB only" (BSS money ADR, rule 5). A later plan adds one to the usage rating policy and the rating contract when a tariff needs it. The package count stays a whole number of packages (D-527).
 
 **Source:** Owner, 2026-10-11.
+
+#### D-537 [M] The currency table is a read: GET /currencies
+
+**Status:** DECIDED 2026-10-14.
+
+- **The endpoint.** `GET /bss-pricing/v1/currencies` returns `{ items: [ { code, scale, iso } ] }`: every currency code the currency table accepts (D-529), once each, sorted by code. `scale` is the number of decimal places a new price in that currency uses, as a JSON integer. `iso` is true for an ISO 4217 code and false for a code that the deployment's `currency_scales` config adds. The list has no paging and no filter: it holds the 165 active ISO 4217 codes and the deployment's own codes.
+- **Access.** The table belongs to the deployment and is the same for every tenant. The endpoint requires `config:read`, like `GET /settings`, and applies no tenant filter. It sets no ETag, because the table changes only when the service starts with a different config.
+- **What it is for.** A client takes the scale of a new price, the minimum-fee step and the list of currencies a book or the settings can use from this endpoint, not from its own copy of the table. The settings' `currencies` limit only which currency a new book can use (D-438). A saved price keeps its own `currency_scale` (D-531): when the table gives a different scale, submitting that draft is refused with `CURRENCY_SCALE_CHANGED`.
+- **One table.** `bss_money::iso_codes` returns the same ISO table that `iso_scale` reads, so this endpoint and the price checks use the same data.
+
+**Source:** Owner, 2026-10-14 (a client needs a currency's scale before its book has a price). Extends D-529.

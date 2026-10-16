@@ -6,8 +6,8 @@
 //!   `require_security_context = false`. Enforced *before* authentication and
 //!   restricted to IP-keyed zones (identity keying is unavailable pre-auth).
 //! - [`ThrottlingMap`] — operations with `require_security_context = true`.
-//!   Enforced *after* authentication; identity-keyed zones use the subject id
-//!   from the request's `SecurityContext`.
+//!   Enforced *after* authentication; identity-keyed zones key on the identity
+//!   validated by the route's own plane (see [`compute_key`]).
 //!
 //! Each `(method, path)` lands in exactly one map (decided by the per-operation
 //! flag).
@@ -42,9 +42,10 @@ use opentelemetry::KeyValue;
 use opentelemetry::metrics::Counter;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
+use toolkit::api::RouteAuth;
 use toolkit::api::{OperationSpec, ThrottlingSpec};
 use toolkit_canonical_errors::CanonicalError;
-use toolkit_security::SecurityContext;
+use toolkit_security::{PlatformIdentity, PlatformSecurityContext, SecurityContext};
 
 use crate::config::{ApiGatewayConfig, InFlightLimitZone, KeyType, RateLimitZone, RetryAfter};
 use crate::middleware::common;
@@ -231,6 +232,8 @@ impl InFlightZone {
 /// A per-operation throttling entry.
 struct ThrottlingEntry {
     spec: ThrottlingSpec,
+    /// The operation's auth plane; selects the identity source in [`compute_key`].
+    auth: RouteAuth,
     rate_zone: Option<Arc<RateZone>>,
     inflight_zone: Option<Arc<InFlightZone>>,
 }
@@ -278,9 +281,9 @@ impl ThrottlingMap {
     /// # Errors
     /// Returns an error if an entry references an undefined zone, an invalid
     /// (e.g. zero-limit) zone, an identity-keyed zone bound to an operation
-    /// that allows anonymous access, or an identity-keyed zone while
-    /// `auth_disabled` is true. The dry-run consistency check is skipped here;
-    /// only [`build_maps`] performs it.
+    /// that allows anonymous access, or an identity-keyed zone on a tenant
+    /// operation while `auth_disabled` is true. The dry-run consistency check
+    /// is skipped here; only [`build_maps`] performs it.
     #[cfg(test)]
     fn from_specs(specs: &[OperationSpec], cfg: &ApiGatewayConfig) -> Result<Self> {
         let mut rate_zones = HashMap::new();
@@ -338,9 +341,9 @@ impl ThrottlingMapNoAuth {
 /// # Errors
 /// Returns an error if any entry references an undefined or invalid zone, an
 /// identity-keyed zone from a pre-auth operation, an identity-keyed zone bound
-/// to an operation that allows anonymous access, or an identity-keyed zone
-/// while `auth_disabled` is true. It also fails when one zone is bound by both
-/// dry-run and enforced operations.
+/// to an operation that allows anonymous access, or an identity-keyed zone on
+/// a tenant operation while `auth_disabled` is true. It also fails when one
+/// zone is bound by both dry-run and enforced operations.
 pub fn build_maps(
     specs: &[OperationSpec],
     cfg: &ApiGatewayConfig,
@@ -519,6 +522,7 @@ fn build(
             key,
             ThrottlingEntry {
                 spec: thr.clone(),
+                auth: spec.auth,
                 rate_zone,
                 inflight_zone,
             },
@@ -561,9 +565,11 @@ fn build_counter(cfg: &ApiGatewayConfig, suffix: &str, description: &str) -> Cou
         .build()
 }
 
-/// Identity keying is only valid on an authenticated operation, after
-/// authentication, with authentication enabled. Otherwise every client would
-/// share one bucket (the anonymous or the `auth_disabled` default subject).
+/// Identity keying is only valid on an authenticated or platform operation,
+/// after authentication. Otherwise every client would share one bucket (the
+/// anonymous or the `auth_disabled` default subject). A platform operation is
+/// allowed even with `auth_disabled`: its caller is still validated by the
+/// platform plane, never replaced by the default subject.
 fn check_key_type(
     spec: &OperationSpec,
     cfg: &ApiGatewayConfig,
@@ -580,13 +586,15 @@ fn check_key_type(
              (require_security_context=false) operation; identity keying requires authentication"
         );
     }
-    if !spec.authenticated {
-        bail!(
+    match spec.auth {
+        RouteAuth::Anonymous => bail!(
             "throttling: zone '{zone}' is identity-keyed but operation {} {} allows anonymous \
              access; every anonymous client would share one key",
             spec.method,
             spec.path
-        );
+        ),
+        RouteAuth::Platform => return Ok(()),
+        RouteAuth::Authenticated => {}
     }
     if cfg.auth_disabled {
         bail!(
@@ -679,8 +687,13 @@ async fn enforce(inner: &ThrottlingInner, req: Request, next: Next) -> Response 
 
     // Rate limiting.
     if let Some(zone) = entry.rate_zone.as_ref() {
-        let Some(id) = compute_key(zone.cfg.key.key_type, &req, inner.trusted_proxy_hops) else {
-            return missing_context_response(&key, &zone.name);
+        let Some(id) = compute_key(
+            zone.cfg.key.key_type,
+            entry.auth,
+            &req,
+            inner.trusted_proxy_hops,
+        ) else {
+            return missing_context_response(&key, &zone.name, entry.auth);
         };
         // `max_keys` admission cap: a new key beyond the cap is rejected before
         // it can grow the limiter's keyed store (until the next prune frees
@@ -734,8 +747,13 @@ async fn enforce(inner: &ThrottlingInner, req: Request, next: Next) -> Response 
 
     // In-flight concurrency limiting.
     if let Some(zone) = entry.inflight_zone.as_ref() {
-        let Some(id) = compute_key(zone.cfg.key.key_type, &req, inner.trusted_proxy_hops) else {
-            return missing_context_response(&key, &zone.name);
+        let Some(id) = compute_key(
+            zone.cfg.key.key_type,
+            entry.auth,
+            &req,
+            inner.trusted_proxy_hops,
+        ) else {
+            return missing_context_response(&key, &zone.name, entry.auth);
         };
         if !zone.excluded.contains(&id) {
             // `max_keys` admission cap, same contract as the rate zone above:
@@ -821,30 +839,85 @@ fn apply_rate_headers(response: &mut Response, rate_headers: Option<&RateHeaders
 
 /// Compute the throttling key for a request according to the zone key type.
 ///
-/// Returns `None` only for an identity-keyed zone without a `SecurityContext`.
-/// Startup validation guarantees such zones run after authentication on
-/// authenticated operations, so `None` is an invariant violation, not a limit;
-/// dry-run does not soften it.
-fn compute_key(kind: KeyType, req: &Request, trusted_proxy_hops: usize) -> Option<String> {
-    match kind {
-        KeyType::Ip => Some(client_ip(req, trusted_proxy_hops)),
-        KeyType::Identity => req
+/// An identity key comes only from the plane of the operation's `auth`, never
+/// from the other one:
+///
+/// - tenant (`Authenticated`): the raw `SecurityContext::subject_id()` UUID;
+/// - `Platform`: the [`platform_key`] of the validated `PlatformSecurityContext`.
+///
+/// Tenant and platform operations may share an identity zone: their keys never
+/// collide, and they share the zone's budget, including `max_keys`.
+///
+/// Returns `None` when that identity is missing, names no caller, or the
+/// operation is anonymous. Startup validation guarantees identity zones run
+/// after authentication on authenticated or platform operations, so `None` is
+/// an invariant violation, not a limit; dry-run does not soften it.
+fn compute_key(
+    kind: KeyType,
+    auth: RouteAuth,
+    req: &Request,
+    trusted_proxy_hops: usize,
+) -> Option<String> {
+    match (kind, auth) {
+        (KeyType::Ip, _) => Some(client_ip(req, trusted_proxy_hops)),
+        (KeyType::Identity, RouteAuth::Authenticated) => req
             .extensions()
             .get::<SecurityContext>()
             .map(|sc| sc.subject_id().to_string()),
+        (KeyType::Identity, RouteAuth::Platform) => req
+            .extensions()
+            .get::<PlatformSecurityContext>()
+            .and_then(|ctx| platform_key(ctx.identity())),
+        // Rejected at startup; never key on an anonymous or synthetic context.
+        (KeyType::Identity, RouteAuth::Anonymous) => None,
     }
 }
 
-/// Internal error for an identity-keyed zone reached without a security
-/// context; see [`compute_key`].
-fn missing_context_response(key: &ThrottleKey, zone: &str) -> Response {
+/// The identity key of a validated platform caller.
+///
+/// The key names the workload, not its instance, so every replica shares one
+/// budget: `platform:k8s:<namespace>/<service_account>` (the pod is dropped),
+/// `platform:spiffe:<trust_domain>/<name>` (the version is dropped, so a
+/// rolling upgrade does not double the budget) and `platform:shared:<name>`.
+/// `%` and `/` in a component are percent-encoded, so the key is unambiguous;
+/// a tenant UUID never starts with `platform:`. Identities that name no caller
+/// (`OutboundMarker`, `Unknown`, or a variant this build does not know) have
+/// no key.
+fn platform_key(identity: &PlatformIdentity) -> Option<String> {
+    let escape = |part: &str| part.replace('%', "%25").replace('/', "%2F");
+    match identity {
+        PlatformIdentity::KubernetesServiceAccount {
+            namespace,
+            service_account,
+            ..
+        } => Some(format!(
+            "platform:k8s:{}/{}",
+            escape(namespace),
+            escape(service_account)
+        )),
+        PlatformIdentity::Spiffe {
+            trust_domain, name, ..
+        } => Some(format!(
+            "platform:spiffe:{}/{}",
+            escape(trust_domain),
+            escape(name)
+        )),
+        PlatformIdentity::Shared { name } => Some(format!("platform:shared:{}", escape(name))),
+        _ => None,
+    }
+}
+
+/// Internal error for an identity-keyed zone reached without the identity of
+/// the operation's plane; see [`compute_key`].
+fn missing_context_response(key: &ThrottleKey, zone: &str, auth: RouteAuth) -> Response {
     tracing::error!(
         method = %key.0,
         path = %key.1,
         zone,
-        "throttling: identity-keyed zone reached without a security context"
+        auth = ?auth,
+        "throttling: identity-keyed zone reached without a keyable identity"
     );
-    CanonicalError::internal("throttling: identity-keyed zone without security context")
+    CanonicalError::internal("throttling: identity-keyed zone without a keyable identity")
         .create()
         .into_response()
 }
@@ -947,9 +1020,9 @@ fn throttle_response(
 /// log at `info` so operators have production visibility at the default level.
 ///
 /// The high-cardinality bucket key stays a structured field (`key`) — never in
-/// the message body and never a metric attribute. `key` carries personal data
-/// (a client IP or a subject UUID); keeping it a separate field lets a log
-/// pipeline redact it or shorten its retention. The request id is attached
+/// the message body and never a metric attribute. `key` may carry personal
+/// data (a client IP or a subject UUID); keeping it a separate field lets a
+/// log pipeline redact it or shorten its retention. The request id is attached
 /// through the enclosing `http_request` span.
 fn record_rejection(inner: &ThrottlingInner, key: &ThrottleKey, zone: &str, kind: &str, id: &str) {
     if let Some(counter) = inner.rejections.as_ref() {

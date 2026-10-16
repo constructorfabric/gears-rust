@@ -100,8 +100,12 @@ curl -s "$BASE/types-registry/v2/entities/gts.cf.core.example.event.v1~" \
 
 Every read returns this document-free default unless `$select` names fields. Documents
 are selected individually and returned flat: `content` (either kind), `resolved_schema`,
-`effective_traits`, `effective_traits_schema` (Type Schemas only; absent on an Instance),
-plus the `provenance` group (`gts_spec_version`, `gts_impl_version`, `compat_forced`):
+`effective_traits`, `effective_traits_schema` (Type Schemas only; absent on an Instance).
+A Type Schema's `provenance` group, never in the default, is selected whole as
+`provenance` and reads `{"compatibility_check_skipped": false}`: `true` means
+`skip_compatibility_check` deliberately waived an applicable cross-minor compatibility
+check; `false` means no waiver, not that a check ran (a first minor or a major-0 version
+has none). An Instance omits the group even when selected:
 
 ```bash
 curl -s "$BASE/types-registry/v2/entities/gts.cf.core.example.event.v1~?\$select=content,effective_traits" \

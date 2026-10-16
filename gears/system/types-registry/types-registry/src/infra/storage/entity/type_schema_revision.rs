@@ -42,7 +42,7 @@ pub struct Model {
     pub raw_schema: String,
     pub gts_spec_version: String,
     pub gts_impl_version: String,
-    /// True when ADR-0004 `force` waived ADR-0003 cross-minor compatibility.
+    /// True when ADR-0004 `skip_compatibility_check` waived ADR-0003 cross-minor compatibility.
     /// Always false for major-only entities and the first minor of a major; a
     /// safe upgrade across several minors requires every traversed value to be
     /// false.

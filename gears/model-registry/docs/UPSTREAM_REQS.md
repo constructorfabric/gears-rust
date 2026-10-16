@@ -9,7 +9,6 @@
   - [2.1 LLM Gateway](#21-llm-gateway)
 - [3. Priorities](#3-priorities)
 - [4. Traceability](#4-traceability)
-  - [LLM Gateway Sources](#llm-gateway-sources)
 
 <!-- /toc -->
 
@@ -36,7 +35,7 @@ Model Registry serves as a centralized catalog of AI models. This document conso
 The gear **MUST** resolve a model by canonical ID for a given tenant, checking catalog existence, tenant approval status (considering hierarchy), and returning model metadata with provider information.
 
 - **Rationale**: LLM Gateway must resolve the target model and provider on every incoming request before routing to the provider API.
-- **Source**: `gears/llm-gateway` ([`cpt-cf-llm-gateway-seq-provider-resolution-v1`](../../llm-gateway/docs/DESIGN.md))
+- **Source**: `gears/llm-gateway`
 
 #### Return Model Capabilities and Limits
 
@@ -45,7 +44,7 @@ The gear **MUST** resolve a model by canonical ID for a given tenant, checking c
 The gear **MUST** return model capability flags and limits (context window, max output tokens) alongside model resolution so that the caller can validate request compatibility.
 
 - **Rationale**: LLM Gateway needs to validate that a request is compatible with the model's capabilities before forwarding to the provider.
-- **Source**: `gears/llm-gateway` ([`cpt-cf-llm-gateway-seq-provider-resolution-v1`](../../llm-gateway/docs/DESIGN.md))
+- **Source**: `gears/llm-gateway`
 
 #### Return Provider Endpoint Information
 
@@ -54,7 +53,7 @@ The gear **MUST** return model capability flags and limits (context window, max 
 The gear **MUST** return the provider's API endpoint and GTS type for credential injection as part of model resolution.
 
 - **Rationale**: LLM Gateway routes requests through OAGW and needs the provider base URL and GTS type to inject credentials.
-- **Source**: `gears/llm-gateway` ([`cpt-cf-llm-gateway-seq-provider-resolution-v1`](../../llm-gateway/docs/DESIGN.md))
+- **Source**: `gears/llm-gateway`
 
 #### Return Provider Health Metrics
 
@@ -63,7 +62,7 @@ The gear **MUST** return the provider's API endpoint and GTS type for credential
 The gear **MUST** return provider health status (healthy, degraded, unhealthy) and optionally latency and error rate metrics for proactive provider selection.
 
 - **Rationale**: LLM Gateway uses health metrics to select providers before making requests, avoiding providers that are degraded or unhealthy.
-- **Source**: `gears/llm-gateway` ([`cpt-cf-llm-gateway-adr-circuit-breaking`](../../llm-gateway/docs/ADR/0004-fdd-llmgw-adr-circuit-breaking.md), [`cpt-cf-llm-gateway-fr-provider-fallback-v1`](../../llm-gateway/docs/PRD.md))
+- **Source**: `gears/llm-gateway`
 
 #### Tenant Hierarchy Resolution
 
@@ -72,7 +71,7 @@ The gear **MUST** return provider health status (healthy, degraded, unhealthy) a
 The gear **MUST** resolve approval status considering the tenant hierarchy, where child tenants inherit parent approvals and the most specific approval (own > parent > root) takes precedence.
 
 - **Rationale**: LLM Gateway serves requests from tenants at any hierarchy level; approval resolution must be transparent to the caller.
-- **Source**: `gears/llm-gateway` ([`cpt-cf-llm-gateway-seq-provider-resolution-v1`](../../llm-gateway/docs/DESIGN.md))
+- **Source**: `gears/llm-gateway`
 
 #### Low Latency Resolution
 
@@ -81,7 +80,7 @@ The gear **MUST** resolve approval status considering the tenant hierarchy, wher
 The gear **MUST** resolve model lookups within <10ms at P99 latency.
 
 - **Rationale**: LLM Gateway calls model resolution on every request; high latency here directly impacts end-user response times.
-- **Source**: `gears/llm-gateway` ([`cpt-cf-llm-gateway-seq-provider-resolution-v1`](../../llm-gateway/docs/DESIGN.md))
+- **Source**: `gears/llm-gateway`
 
 #### Specific Error Responses
 
@@ -90,7 +89,7 @@ The gear **MUST** resolve model lookups within <10ms at P99 latency.
 The gear **MUST** return distinct errors for: model not found in catalog, model not approved for tenant, and model deprecated/sunset by provider.
 
 - **Rationale**: LLM Gateway maps these errors to specific HTTP status codes (404, 403, 410) for its callers; a generic error is insufficient.
-- **Source**: `gears/llm-gateway` ([`cpt-cf-llm-gateway-seq-provider-resolution-v1`](../../llm-gateway/docs/DESIGN.md))
+- **Source**: `gears/llm-gateway`
 
 ## 3. Priorities
 
@@ -103,9 +102,3 @@ The gear **MUST** return distinct errors for: model not found in catalog, model 
 
 - **PRD** (when created): [PRD.md](./PRD.md)
 - **Design** (when created): [DESIGN.md](./DESIGN.md)
-
-### LLM Gateway Sources
-
-- [`cpt-cf-llm-gateway-seq-provider-resolution-v1`](../../llm-gateway/docs/DESIGN.md)
-- [`cpt-cf-llm-gateway-adr-circuit-breaking`](../../llm-gateway/docs/ADR/0004-fdd-llmgw-adr-circuit-breaking.md)
-- [`cpt-cf-llm-gateway-fr-provider-fallback-v1`](../../llm-gateway/docs/PRD.md)

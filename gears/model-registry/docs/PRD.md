@@ -1460,10 +1460,6 @@ Key interfaces:
 
 | Artifact | Link |
 |----------|------|
-| LLM Gateway PRD | `gears/llm_gateway/docs/PRD.md` |
-| ADR: Stateless Gateway | `gears/llm_gateway/docs/ADR/0001-fdd-llmgw-adr-stateless.md` |
-| ADR: Pass-through Content | `gears/llm_gateway/docs/ADR/0002-fdd-llmgw-adr-pass-through.md` |
-| ADR: Circuit Breaking | `gears/llm_gateway/docs/ADR/0004-fdd-llmgw-adr-circuit-breaking.md` |
 | OData Pagination Standard | `docs/toolkit_unified_system/07_odata_pagination_select_filter.md` |
 | Error Handling Standard | `docs/toolkit_unified_system/05_errors_rfc9457.md` |
 | GTS Contracts | `gts/` (to be defined) |

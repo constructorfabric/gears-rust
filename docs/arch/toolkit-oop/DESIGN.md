@@ -1419,8 +1419,9 @@ service discovery state. Persistent state (if needed for multi-host P2) will be 
 
 ```
 deploy/
+  README.md                            # Chart mechanics + release/publishing guide
+  components.yaml                      # Publishable units: image recipe + chart path per component
   helm/
-    update-helm-deps.sh                # Resolves toolkit-common for every gear chart + umbrella
     toolkit-common/                    # Library chart (type: library)
       Chart.yaml
       templates/
@@ -1449,10 +1450,14 @@ deploy/
       service.yaml                    # {{ include "toolkit-common.service" . }}
       configmap.yaml                  # {{ include "toolkit-common.configmap" . }}
       serviceaccount.yaml             # {{ include "toolkit-common.serviceAccount" . }}
+
+tools/scripts/
+  update-helm-deps.sh                  # Resolves toolkit-common for every gear chart + umbrella
+  resolve_release.py                   # Resolves a release to its image/chart build outputs
 ```
 
 The `toolkit-common` dependency is referenced from each gear chart via a relative
-`file://` path to `deploy/helm/toolkit-common`, resolved by `deploy/helm/update-helm-deps.sh`.
+`file://` path to `deploy/helm/toolkit-common`, resolved by `tools/scripts/update-helm-deps.sh`.
 
 
 #### Library Chart — `toolkit-common`
@@ -1527,7 +1532,7 @@ replicaCount: 1
 image:
   registry: ghcr.io/constructorfabric    # overridable by global.imageRegistry
   repository: <gear-name>
-  tag: ""                           # defaults to .Chart.AppVersion
+  tag: "0.0.0"                      # placeholder; the release pipeline stamps the version
 
 service:
   type: ClusterIP

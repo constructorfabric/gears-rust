@@ -21,26 +21,47 @@ workspace = true
 [features]
 # Default: production build, no test utilities.
 default = []
-# Exposes `pub mod testing` with a stateful `MockTypesRegistryClient` mock for
-# consumers that need a `dyn TypesRegistryClient` in their unit tests.
-test-util = []
+# In-memory clients and fixtures for consumer tests.
+test-util = ["dep:toolkit", "dep:parking_lot"]
 
 [dependencies]
-# Per ADR 0005 the `TypesRegistryClient` trait boundary is `CanonicalError`;
-# the SDK ships `TypesRegistryError` as an opt-in `From<CanonicalError>`
-# projection (see src/error.rs). The single AIP-193 ladder
-# (`From<DomainError> for CanonicalError`) lives in the impl crate's
-# `api::rest::error`; this SDK depends on the canonical-errors crate to
-# project that envelope into the typed view (and to construct the in-process
-# `InvalidArgument` errors its client-side `try_new` constructors emit).
+# API errors and client-side validation.
 toolkit-canonical-errors = { workspace = true }
 
 # Core dependencies for API trait
 async-trait = { workspace = true }
 thiserror = { workspace = true }
-uuid = { workspace = true, features = ["v5"] }
+uuid = { workspace = true, features = ["v4", "v5"] }
 serde_json = { workspace = true }
 
-# GTS types (from git dependency)
+# GTS identifiers and schemas.
 gts = { workspace = true }
 toolkit-gts = { workspace = true }
+
+# Contracts and security contexts.
+toolkit-contract = { workspace = true }
+toolkit-security = { workspace = true }
+time = { workspace = true }
+tracing = { workspace = true }
+# Async deadlines, polling and cancellation.
+tokio = { workspace = true, features = ["time", "macros"] }
+# `PublisherVersion`: SemVer parsing and precedence.
+semver = { workspace = true }
+tokio-util = { workspace = true }
+# Jittered backoff of reconciliation passes and transport retries.
+rand = { workspace = true }
+
+# Test doubles only (`test-util`).
+toolkit = { workspace = true, optional = true }
+parking_lot = { workspace = true, optional = true }
+
+[dev-dependencies]
+# Paused-clock tests of the submit/poll deadline and polling.
+tokio = { workspace = true, features = ["macros", "rt", "test-util"] }
+# Round-trip and consistency properties of the SDK's codecs and orderings.
+proptest = { workspace = true }
+# Captures reconciliation's events and spans in tests.
+tracing-subscriber = { workspace = true }
+# The test doubles also compile under `cfg(test)` without `test-util`.
+toolkit = { workspace = true }
+parking_lot = { workspace = true }

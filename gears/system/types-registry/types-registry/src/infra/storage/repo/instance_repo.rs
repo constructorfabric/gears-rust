@@ -133,24 +133,16 @@ impl InstanceRepo {
                         query =
                             query.column_as(instance_revision::Column::CanonicalValue, "content");
                     }
-                    if selection.contains(EntityField::Provenance) {
-                        query = query
-                            .column(instance_revision::Column::GtsSpecVersion)
-                            .column(instance_revision::Column::GtsImplVersion);
-                    }
                     query.into_model::<RevisionReadColumns>()
                 })
                 .await?;
-            out.extend(rows.into_iter().map(|mut revision| {
-                let provenance = revision.take_provenance();
-                CurrentReadRow {
-                    entity_id: revision.entity_id,
-                    content: revision.content,
-                    resolved_schema: None,
-                    effective_traits: None,
-                    effective_traits_schema: None,
-                    provenance,
-                }
+            out.extend(rows.into_iter().map(|revision| CurrentReadRow {
+                entity_id: revision.entity_id,
+                content: revision.content,
+                resolved_schema: None,
+                effective_traits: None,
+                effective_traits_schema: None,
+                compat_forced: None,
             }));
         }
         out.sort_by_key(|row| row.entity_id);

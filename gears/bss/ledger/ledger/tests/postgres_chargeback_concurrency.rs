@@ -19,6 +19,10 @@
 //!   `NegativeBalance` on it still surfaces (with its alarm).
 //! - #D-5: a chargeback drain that replays an outcome another drain applied
 //!   counts it as `replayed`, not `applied`, with no second effect.
+//! - #D-6: #D-1 made deterministic with two gates: a repeat of the same `lost`
+//!   that starts before the first `lost` commits, and whose dispute read sees
+//!   it committed, replays the first entry instead of being refused as
+//!   `InvalidDisputeTransition`.
 //!
 //! Mirrors `postgres_payment_concurrency.rs`'s `retry_on_serialization` +
 //! `tokio::join!` shape (and `postgres_payments::allocate_replay_makes_no_
@@ -226,6 +230,25 @@ fn negative_balance_alarm() -> [(&'static str, &'static str); 2] {
 /// The longest the gate tests wait on one step while the gate is held. A
 /// locking regression then fails the test instead of hanging it.
 const GATE_WAIT: Duration = Duration::from_secs(60);
+
+/// Poll `pg_locks` until a lock request that matches `filter` (an SQL predicate
+/// over `pg_locks`) waits, for at most 30 s. Returns whether one did.
+async fn lock_request_waits(raw: &sea_orm::DatabaseConnection, filter: &str) -> bool {
+    for _ in 0..1500 {
+        let waiting = raw
+            .query_one_raw(pg(format!(
+                "SELECT COUNT(*) FROM pg_locks WHERE NOT granted AND {filter}"
+            )))
+            .await
+            .unwrap()
+            .map_or(0, |r| r.try_get_by_index::<i64>(0).unwrap());
+        if waiting > 0 {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    false
+}
 
 /// A cash-hold dispute request for `PAY-<suffix>` / `DSP-<suffix>`, cycle 1,
 /// disputing the full 10.00.
@@ -910,5 +933,198 @@ async fn a_chargeback_drain_that_replays_an_applied_outcome_counts_a_replay() {
         account_balance(&raw, &s, s.cash).await,
         Some(text(1000)),
         "CASH_CLEARING got the hold back once"
+    );
+}
+
+/// Chargeback #D-6 (the #D-1 race, made deterministic): a repeat of the SAME
+/// `lost` (same `dispute_id:cycle:phase` key) that starts before the first
+/// `lost` commits, and whose dispute read returns after that commit, MUST replay
+/// the first entry. It must not be refused as `InvalidDisputeTransition` because
+/// its dispute read already shows `LOST` (the #D-1 failure: a dedup lookup made
+/// before the commit missed the first `lost`). Two gates fix the order:
+/// - a test-only trigger holds the first `lost` at its dedup finalize (after its
+///   dispute write, before its commit) on an advisory lock this test owns;
+/// - a gate transaction queues an `ACCESS EXCLUSIVE` lock on `ledger_dispute`
+///   behind the held post, so the repeat's out-of-txn dispute read waits.
+///
+/// The repeat starts while both gates are held, and its dispute read waits. The
+/// test then releases the first `lost` (it commits; the table gate gets its
+/// lock) and then the table gate: the repeat reads the dispute as `LOST`. Every
+/// wait while a gate is held is bounded (`GATE_WAIT`, and a `lock_timeout` in
+/// both gates).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_lost_repeated_after_the_first_commits_replays() {
+    let (_c, raw, provider) = boot().await;
+    let s = setup_seller(&raw, &provider).await;
+    let ctx = SecurityContext::anonymous();
+    let scope = AccessScope::for_tenant(s.tenant);
+
+    settle(&provider, &s, "PAY-CC-6", 1000).await;
+    chargeback_svc(&provider)
+        .record_phase(
+            &ctx,
+            &scope,
+            dispute_request(&s, "CC-6", DisputePhase::Opened),
+        )
+        .await
+        .expect("opened cash-hold");
+
+    // Gate 1: the `lost` dedup finalize (`CLAIMED` -> `POSTED`) waits on advisory
+    // lock (4242, 6). Only the first `lost` finalizes; a replay never does.
+    raw.execute_raw(pg(
+        "CREATE FUNCTION bss.test_gate_lost_finalize() RETURNS trigger \
+         LANGUAGE plpgsql AS $$ BEGIN SET LOCAL lock_timeout = '60s'; \
+         PERFORM pg_advisory_xact_lock(4242, 6); RETURN NEW; END $$",
+    ))
+    .await
+    .expect("create the finalize gate function");
+    raw.execute_raw(pg(
+        "CREATE TRIGGER test_gate_lost_finalize BEFORE UPDATE ON bss.ledger_idempotency_dedup \
+         FOR EACH ROW WHEN (NEW.business_id = 'DSP-CC-6:1:LOST' AND NEW.status = 'POSTED') \
+         EXECUTE FUNCTION bss.test_gate_lost_finalize()",
+    ))
+    .await
+    .expect("create the finalize gate trigger");
+    let finalize_gate = raw.begin().await.expect("open the finalize gate");
+    finalize_gate
+        .execute_raw(pg("SELECT pg_advisory_xact_lock(4242, 6)"))
+        .await
+        .expect("take the finalize gate lock");
+
+    // The first `lost` writes the dispute and waits at its finalize.
+    let first_svc = chargeback_svc(&provider);
+    let first_scope = scope.clone();
+    let first_req = dispute_request(&s, "CC-6", DisputePhase::Lost);
+    let first = tokio::spawn(async move {
+        first_svc
+            .record_phase(&SecurityContext::anonymous(), &first_scope, first_req)
+            .await
+    });
+    assert!(
+        lock_request_waits(
+            &raw,
+            "locktype = 'advisory' AND classid = 4242 AND objid = 6"
+        )
+        .await,
+        "the first lost reaches the gated finalize"
+    );
+
+    // Gate 2: an ACCESS EXCLUSIVE lock on `ledger_dispute` queues behind the
+    // held first `lost` (it holds the dispute row it wrote). Every later read of
+    // the table queues behind this request.
+    let table_gate = raw.begin().await.expect("open the table gate");
+    let (release_table, table_released) = tokio::sync::oneshot::channel::<()>();
+    let table_gate = tokio::spawn(async move {
+        table_gate
+            .execute_raw(pg("SET LOCAL lock_timeout = '60s'"))
+            .await?;
+        table_gate
+            .execute_raw(pg("LOCK TABLE bss.ledger_dispute IN ACCESS EXCLUSIVE MODE"))
+            .await?;
+        let _ = table_released.await;
+        table_gate.commit().await
+    });
+    let dispute_lock = "locktype = 'relation' AND relation = 'bss.ledger_dispute'::regclass";
+    assert!(
+        lock_request_waits(
+            &raw,
+            &format!("{dispute_lock} AND mode = 'AccessExclusiveLock'")
+        )
+        .await,
+        "the table gate queues behind the held first lost"
+    );
+
+    // The repeat starts while the first `lost` is not committed; its dispute
+    // read waits behind the table gate. A dedup lookup made before that read
+    // cannot see the first `lost`.
+    let repeat_svc = chargeback_svc(&provider);
+    let repeat_scope = scope.clone();
+    let repeat_req = dispute_request(&s, "CC-6", DisputePhase::Lost);
+    let repeat = tokio::spawn(async move {
+        repeat_svc
+            .record_phase(&SecurityContext::anonymous(), &repeat_scope, repeat_req)
+            .await
+    });
+    assert!(
+        lock_request_waits(
+            &raw,
+            &format!("{dispute_lock} AND mode = 'AccessShareLock'")
+        )
+        .await,
+        "the repeat's dispute read waits behind the table gate"
+    );
+
+    // Release gate 1: the first `lost` commits. The table gate then gets its lock.
+    finalize_gate
+        .commit()
+        .await
+        .expect("release the finalize gate");
+    let first = tokio::time::timeout(GATE_WAIT, first)
+        .await
+        .expect("the first lost finishes after the finalize gate opens")
+        .expect("the first lost task must not panic");
+    let first = match first {
+        Ok(ChargebackOutcome::Recorded(first)) => first,
+        other => panic!("the first lost posts inline, got: {other:?}"),
+    };
+    assert!(!first.replayed, "the first lost posts fresh");
+
+    // Release gate 2: the repeat reads the dispute as `LOST`.
+    release_table.send(()).expect("the table gate is waiting");
+    tokio::time::timeout(GATE_WAIT, table_gate)
+        .await
+        .expect("the table gate finishes")
+        .expect("the table gate task must not panic")
+        .expect("the table gate takes and releases its lock");
+    let repeat = tokio::time::timeout(GATE_WAIT, repeat)
+        .await
+        .expect("the repeat finishes after the table gate opens")
+        .expect("the repeat task must not panic");
+    let replay = match repeat {
+        Ok(ChargebackOutcome::Recorded(replay)) => replay,
+        other => panic!("the repeated lost must replay the first entry, got: {other:?}"),
+    };
+    assert!(replay.replayed, "the repeated lost is a replay");
+    assert_eq!(
+        replay.entry_id, first.entry_id,
+        "the replay returns the first lost's entry"
+    );
+
+    // Money: the forfeiture booked once.
+    let lost_entries = raw
+        .query_one_raw(pg(format!(
+            "SELECT COUNT(*) FROM bss.ledger_journal_entry \
+             WHERE tenant_id='{}' AND source_business_id='DSP-CC-6:1:LOST'",
+            s.tenant
+        )))
+        .await
+        .unwrap()
+        .map_or(0, |r| r.try_get_by_index::<i64>(0).unwrap());
+    assert_eq!(lost_entries, 1, "one lost entry");
+    assert_eq!(
+        dispute_phase(&raw, &s, "DSP-CC-6").await.as_deref(),
+        Some("LOST"),
+        "the dispute resolved to LOST"
+    );
+    assert_eq!(
+        account_balance(&raw, &s, s.dispute_hold).await,
+        Some(text(0)),
+        "DISPUTE_HOLD emptied once"
+    );
+    assert_eq!(
+        account_balance(&raw, &s, s.dispute_loss).await,
+        Some(text(1000)),
+        "the forfeiture booked once"
+    );
+    let row = PaymentRepo::new(provider.clone())
+        .read_settlement(&scope, s.tenant, "PAY-CC-6")
+        .await
+        .unwrap()
+        .expect("settlement row present");
+    assert_eq!(
+        row.clawed_back,
+        usd(1000),
+        "clawed_back reflects one clawback (10.00)"
     );
 }

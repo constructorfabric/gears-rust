@@ -1,4 +1,10 @@
 # Default profile: Flight Control only.
+#
+# Each gear's `image.tag` is the platform's bill-of-materials: the pinned,
+# already-published image version this umbrella deploys. Bump these, then tag
+# `toolkit-platform-v<version>`. (Standalone gear charts carry a 0.0.0 placeholder
+# that the pipeline stamps at release; the umbrella pins explicitly, so a release
+# is reproducible.)
 
 global:
   imageRegistry: ""
@@ -13,7 +19,7 @@ flight-control:
   image:
     registry: ghcr.io
     repository: constructorfabric/flight-control
-    tag: "dev"
+    tag: "0.1.0"
     pullPolicy: IfNotPresent
 
 hello:
@@ -22,18 +28,26 @@ hello:
   image:
     registry: ghcr.io
     repository: constructorfabric/hello
-    tag: "dev"
+    tag: "0.1.0"
     pullPolicy: IfNotPresent
   directoryEndpoint: "http://flight-control:50051"
 
 api-contracts:
   enabled: false
+  fullnameOverride: api-contracts
   image:
     registry: ghcr.io
     repository: constructorfabric/api-contracts
+    tag: "0.1.0"
+    pullPolicy: IfNotPresent
+  directoryEndpoint: "http://flight-control:50051"
 
 api-contracts-consumer:
   enabled: false
+  fullnameOverride: api-contracts-consumer
   image:
     registry: ghcr.io
     repository: constructorfabric/api-contracts-consumer
+    tag: "0.1.0"
+    pullPolicy: IfNotPresent
+  directoryEndpoint: "http://flight-control:50051"

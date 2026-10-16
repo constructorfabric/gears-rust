@@ -3,7 +3,7 @@ name: flight-control
 description: Deploys the flight-control unit.
 type: application
 version: 0.1.0
-appVersion: "dev"
+appVersion: "0.1.0"
 dependencies:
   - name: toolkit-common
     version: 0.1.0

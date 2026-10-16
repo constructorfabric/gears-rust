@@ -29,11 +29,10 @@ use tenant_resolver_sdk::{
 use time::OffsetDateTime;
 use toolkit_canonical_errors::CanonicalError;
 use toolkit_security::SecurityContext;
-use types_registry_sdk::TypesRegistryClient;
-use types_registry_sdk::models::{
-    GtsInstance, GtsTypeSchema, InstanceQuery, RegisterResult, TypeSchemaQuery,
-};
 use types_registry_sdk::testing::make_test_type_schema;
+use types_registry_sdk::{
+    GtsInstance, GtsTypeSchema, InstanceQuery, RegisterResult, TypeSchemaQuery, TypesRegistryClient,
+};
 use uuid::Uuid;
 
 use super::PluginImpl;

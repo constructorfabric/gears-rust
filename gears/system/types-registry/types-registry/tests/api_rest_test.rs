@@ -156,6 +156,19 @@ impl std::ops::Deref for TestApi {
     }
 }
 
+/// The gear's routes with the request context `.authenticated()` installs in production:
+/// these tests call the handlers directly, below the authentication layer.
+fn routes(
+    router: Router,
+    openapi: &dyn toolkit::api::OpenApiRegistry,
+    legacy: Arc<TypesRegistryService>,
+    registry: Option<Arc<RegistryService>>,
+) -> Router {
+    types_registry::api::rest::routes::register_routes(router, openapi, legacy, registry).layer(
+        axum::Extension(toolkit_security::SecurityContext::anonymous()),
+    )
+}
+
 /// A router with both services wired, as `register_rest` builds it.
 async fn router_with_db() -> TestApi {
     router_with(false).await
@@ -225,12 +238,7 @@ async fn router_and_db_setup(
     } else {
         None
     };
-    let router = types_registry::api::rest::routes::register_routes(
-        Router::new(),
-        &openapi,
-        legacy,
-        Some(registry),
-    );
+    let router = routes(Router::new(), &openapi, legacy, Some(registry));
     let api = TestApi {
         router,
         _handle: handle,
@@ -249,7 +257,7 @@ fn router_without_db() -> Router {
         config,
     ));
     legacy.switch_to_ready().expect("switch legacy to ready");
-    types_registry::api::rest::routes::register_routes(Router::new(), &openapi, legacy, None)
+    routes(Router::new(), &openapi, legacy, None)
 }
 
 fn schema(gts_id: &str) -> Value {
@@ -902,6 +910,87 @@ async fn a_zero_precondition_is_refused() {
     assert_eq!(refused.status, StatusCode::BAD_REQUEST);
 }
 
+/// `skip_compatibility_check` is optional: absent and an explicit `false` are the same
+/// ordinary request, and `true` is refused, naming the field, wherever there is no
+/// applicable cross-minor check the deployment lets the caller skip.
+#[tokio::test]
+async fn skip_compatibility_check_defaults_to_false_and_names_its_refusals() {
+    let candidate = |skip: Option<bool>| {
+        let mut item = json!({ "gts_id": CF_TYPE, "content": schema(CF_TYPE) });
+        if let Some(skip) = skip {
+            item["skip_compatibility_check"] = json!(skip);
+        }
+        json!({ "items": [item] })
+    };
+    for (key, skip) in [("absent", None), ("false", Some(false))] {
+        let router = router_with_db().await;
+        let accepted = call(&router, submit(Some(key), &candidate(skip))).await;
+        assert_eq!(
+            accepted.status,
+            StatusCode::ACCEPTED,
+            "{key}: {:?}",
+            accepted.body
+        );
+    }
+
+    let disallowed = router_with_db().await;
+    let refused = call_raw(&disallowed, submit(Some("off"), &candidate(Some(true)))).await;
+    assert_candidate_refusal(
+        &refused,
+        CF_TYPE,
+        "skip_compatibility_check",
+        "VALIDATION_FAILED",
+    );
+
+    let (permitted, _) = router_and_db_configured(
+        false,
+        TypesRegistryConfig {
+            allow_compatibility_force: true,
+            ..TypesRegistryConfig::default()
+        },
+    )
+    .await;
+    // A major-only Type Schema has no cross-minor check to skip.
+    let refused = call_raw(&permitted, submit(Some("on"), &candidate(Some(true)))).await;
+    assert_candidate_refusal(
+        &refused,
+        CF_TYPE,
+        "skip_compatibility_check",
+        "VALIDATION_FAILED",
+    );
+    let description = refused.body["context"]["field_violations"][0]["description"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        description.contains("no cross-minor compatibility check to skip"),
+        "{description}"
+    );
+}
+
+/// `force` is not a submission field; the body is refused rather than the flag
+/// ignored.
+#[tokio::test]
+async fn force_is_an_unknown_submission_field() {
+    let router = router_with_db().await;
+    let body = json!({
+        "items": [{ "gts_id": CF_TYPE, "content": schema(CF_TYPE), "force": true }]
+    });
+    let refused = call_raw(&router, submit(Some("key-1"), &body)).await;
+    assert_eq!(
+        refused.status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "{:?}",
+        refused.body
+    );
+    let violation = &refused.body["context"]["field_violations"][0];
+    assert_eq!(violation["reason"], json!("invalid_json_body"));
+    let description = violation["description"].as_str().unwrap_or_default();
+    assert!(
+        description.contains("unknown field `force`"),
+        "{description}"
+    );
+}
+
 /// A Type Schema's `$id` must be exactly `gts://<gts_id>` of its item. Every
 /// other shape is a synchronous `400` naming the candidate and the `entity`
 /// field, before any `202` or operation exists.
@@ -1374,8 +1463,7 @@ fn both_versions_are_declared_with_distinct_operation_ids() {
         Arc::new(InMemoryGtsRepository::new(config.to_gts_config())),
         config,
     ));
-    let _router =
-        types_registry::api::rest::routes::register_routes(Router::new(), &openapi, legacy, None);
+    let _router = routes(Router::new(), &openapi, legacy, None);
 
     let declared = openapi.operations.lock().expect("operations lock").clone();
 
@@ -1459,8 +1547,7 @@ fn mutation_routes_are_internal_only() {
         Arc::new(InMemoryGtsRepository::new(config.to_gts_config())),
         config,
     ));
-    let _router =
-        types_registry::api::rest::routes::register_routes(Router::new(), &openapi, legacy, None);
+    let _router = routes(Router::new(), &openapi, legacy, None);
 
     let exposure = openapi.exposure.lock().expect("exposure lock");
     for operation_id in MUTATION_OPERATIONS {
@@ -1484,8 +1571,7 @@ fn the_idempotency_key_header_is_declared_as_a_required_parameter() {
         Arc::new(InMemoryGtsRepository::new(config.to_gts_config())),
         config,
     ));
-    let _router =
-        types_registry::api::rest::routes::register_routes(Router::new(), &openapi, legacy, None);
+    let _router = routes(Router::new(), &openapi, legacy, None);
 
     let params = openapi.params.lock().expect("params lock").clone();
     for operation_id in V2_MUTATION_OPERATIONS {
@@ -1517,8 +1603,7 @@ fn the_single_deletion_query_parameters_are_declared() {
         Arc::new(InMemoryGtsRepository::new(config.to_gts_config())),
         config,
     ));
-    let _router =
-        types_registry::api::rest::routes::register_routes(Router::new(), &openapi, legacy, None);
+    let _router = routes(Router::new(), &openapi, legacy, None);
 
     let params = openapi.params.lock().expect("params lock").clone();
     let declared = params
@@ -1568,8 +1653,7 @@ fn submission_response_headers_are_declared() {
         Arc::new(InMemoryGtsRepository::new(config.to_gts_config())),
         config,
     ));
-    let _router =
-        types_registry::api::rest::routes::register_routes(Router::new(), &openapi, legacy, None);
+    let _router = routes(Router::new(), &openapi, legacy, None);
 
     let headers = openapi
         .response_headers
@@ -1616,8 +1700,7 @@ fn json_extractor_error_statuses_are_declared_for_both_post_operations() {
         Arc::new(InMemoryGtsRepository::new(config.to_gts_config())),
         config,
     ));
-    let _router =
-        types_registry::api::rest::routes::register_routes(Router::new(), &openapi, legacy, None);
+    let _router = routes(Router::new(), &openapi, legacy, None);
 
     let responses = openapi.responses.lock().expect("responses lock");
     for operation_id in [
@@ -3571,8 +3654,7 @@ fn the_discovery_query_parameters_are_declared() {
         Arc::new(InMemoryGtsRepository::new(config.to_gts_config())),
         config,
     ));
-    let _router =
-        types_registry::api::rest::routes::register_routes(Router::new(), &openapi, legacy, None);
+    let _router = routes(Router::new(), &openapi, legacy, None);
 
     let params = openapi.params.lock().expect("params lock").clone();
     let declared = params
@@ -3643,8 +3725,7 @@ fn all_seven_v2_operations_declare_problem_responses() {
         Arc::new(InMemoryGtsRepository::new(config.to_gts_config())),
         config,
     ));
-    let _router =
-        types_registry::api::rest::routes::register_routes(Router::new(), &openapi, legacy, None);
+    let _router = routes(Router::new(), &openapi, legacy, None);
 
     let responses = openapi.responses.lock().expect("responses lock");
     for operation_id in V2_OPERATIONS {
@@ -3896,32 +3977,82 @@ async fn a_mixed_batch_omits_type_schema_documents_on_the_instance() {
     assert_eq!(instance["content"], json!({ "name": "first" }));
 }
 
+/// `provenance` is a Type Schema group: a selected `false` stays inside it, and an
+/// Instance omits the whole group on every read even when selected.
 #[tokio::test]
-async fn provenance_is_one_group_and_null_where_inapplicable() {
+async fn provenance_is_a_type_schema_group_absent_on_instances() {
+    const SELECT: &str = "provenance";
     let router = router_with_db().await;
     register_type_and_instance(&router).await;
 
-    let response = call(
-        &router,
-        selective_batch(&[CF_TYPE, CF_INSTANCE], "provenance"),
-    )
-    .await;
-    let schema = &response.body["items"][0]["entity"]["provenance"];
-    let instance = &response.body["items"][1]["entity"]["provenance"];
-    for provenance in [schema, instance] {
-        assert_eq!(
-            field_names(provenance),
-            ["compat_forced", "gts_impl_version", "gts_spec_version"],
-            "attribution is internal until P1",
-        );
-        assert!(provenance["gts_spec_version"].is_string(), "{provenance:?}");
-        assert!(provenance["gts_impl_version"].is_string(), "{provenance:?}");
-    }
-    assert_eq!(schema["compat_forced"], json!(false));
-    assert!(
-        instance["compat_forced"].is_null(),
-        "an Instance has nothing to waive: {instance:?}",
+    let batch = call(&router, selective_batch(&[CF_TYPE, CF_INSTANCE], SELECT)).await;
+    assert_eq!(batch.status, StatusCode::OK, "{:?}", batch.body);
+    let schema = &batch.body["items"][0]["entity"];
+    let instance = &batch.body["items"][1]["entity"];
+    assert_eq!(
+        field_names(schema),
+        ["gts_id", "gts_uuid", "kind", "lifecycle_status", SELECT],
     );
+    assert_eq!(
+        schema[SELECT],
+        json!({ "compatibility_check_skipped": false }),
+        "exactly one member, and a selected false is kept",
+    );
+    assert_eq!(
+        field_names(instance),
+        ["gts_id", "gts_uuid", "kind", "lifecycle_status"],
+        "an Instance omits the group, rather than reporting null or an empty one",
+    );
+
+    let single = call(&router, exact(CF_TYPE, &format!("?$select={SELECT}"))).await;
+    assert_eq!(single.status, StatusCode::OK, "{:?}", single.body);
+    assert_eq!(&single.body, schema);
+    let single = call(&router, exact(CF_INSTANCE, &format!("?$select={SELECT}"))).await;
+    assert_eq!(&single.body, instance);
+
+    let listed = traverse(&router, &format!("?$select=gts_id,{SELECT}")).await;
+    assert_eq!(listed.len(), 2, "{listed:?}");
+    assert_eq!(listed[0]["gts_id"], json!(CF_TYPE));
+    assert_eq!(listed[0][SELECT], schema[SELECT]);
+    assert!(listed[1].get(SELECT).is_none(), "{:?}", listed[1]);
+
+    let default = call(&router, exact(CF_TYPE, "")).await;
+    assert!(
+        default.body.get(SELECT).is_none(),
+        "not in the default projection: {:?}",
+        default.body
+    );
+    let selected = call(&router, exact(CF_TYPE, &format!("?$select={SELECT}"))).await;
+    assert_ne!(
+        selected.etag, default.etag,
+        "the validator is scoped to the selection"
+    );
+}
+
+/// An unknown name, a `provenance` member on its own or by path, and the internal
+/// revision audit columns are `INVALID_SELECT` on every read.
+#[tokio::test]
+async fn unsupported_read_fields_are_invalid_select() {
+    let router = router_with_db().await;
+    register_type_and_instance(&router).await;
+
+    for select in [
+        "unknown_field",
+        "compatibility_check_skipped",
+        "provenance.compatibility_check_skipped",
+        "provenance/compatibility_check_skipped",
+        "compat_forced",
+        "gts_spec_version",
+        "gts_impl_version",
+    ] {
+        let query = format!("?$select={select}");
+        let single = call(&router, exact(CF_TYPE, &query)).await;
+        assert_field_refusal(&single, "$select", "INVALID_SELECT");
+        let batch = call(&router, selective_batch(&[CF_TYPE], select)).await;
+        assert_field_refusal(&batch, "$select", "INVALID_SELECT");
+        let listed = call(&router, discover(&query)).await;
+        assert_field_refusal(&listed, "$select", "INVALID_SELECT");
+    }
 }
 
 /// Identity, kind and lifecycle are mandatory, so a projected tombstone is not an
@@ -4114,7 +4245,7 @@ fn router_for_openapi(openapi: &TestOpenApi) -> Router {
         Arc::new(InMemoryGtsRepository::new(config.to_gts_config())),
         config,
     ));
-    types_registry::api::rest::routes::register_routes(Router::new(), openapi, legacy, None)
+    routes(Router::new(), openapi, legacy, None)
 }
 
 // ---------------------------------------------------------------------------
@@ -4314,8 +4445,19 @@ async fn toolkit_spellings_of_limit_and_cursor_are_one_slot_each() {
         let response = call(&router, discover(&query)).await;
         assert_field_refusal(&response, field, "VALIDATION_FAILED");
     }
-    let zero = call(&router, discover("?$top=0")).await;
-    assert_field_refusal(&zero, "$top", "VALIDATION_FAILED");
+    // Every spelling of zero is the gear's refusal under the name sent, never
+    // ToolKit's `$top` / `INVALID_LIMIT`; `%2B` is a literal `+`.
+    for (query, field) in [
+        ("?$top=0", "$top"),
+        ("?$top=00", "$top"),
+        ("?$top=%2B0", "$top"),
+        ("?limit=0", "limit"),
+        ("?limit=00", "limit"),
+        ("?limit=%2B0", "limit"),
+    ] {
+        let zero = call(&router, discover(query)).await;
+        assert_field_refusal(&zero, field, "VALIDATION_FAILED");
+    }
 }
 
 #[tokio::test]
@@ -4550,8 +4692,7 @@ fn generated_openapi() -> Value {
         Arc::new(InMemoryGtsRepository::new(config.to_gts_config())),
         config,
     ));
-    let _router =
-        types_registry::api::rest::routes::register_routes(Router::new(), &registry, legacy, None);
+    let _router = routes(Router::new(), &registry, legacy, None);
     let document = registry
         .build_openapi(&toolkit::api::OpenApiInfo::default())
         .expect("the document builds");
@@ -4645,6 +4786,31 @@ fn discovery_declares_kind_and_lifecycle_status_as_optional_strings() {
     }
 }
 
+/// A submitted item publishes exactly its four fields; only the identifier and the
+/// document are required.
+#[test]
+fn a_submitted_item_publishes_exactly_its_fields() {
+    let doc = generated_openapi();
+    let item = &doc["components"]["schemas"]["SubmitEntityDto"];
+    let mut published: Vec<&str> = item["properties"]
+        .as_object()
+        .expect("SubmitEntityDto properties")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    published.sort_unstable();
+    assert_eq!(
+        published,
+        [
+            "content",
+            "expected_resource_version",
+            "gts_id",
+            "skip_compatibility_check"
+        ]
+    );
+    assert_eq!(item["required"], json!(["gts_id", "content"]));
+}
+
 /// All three database-backed reads answer with the one `EntityDto`, whose
 /// identity, kind and lifecycle are required and never `null`.
 #[test]
@@ -4667,15 +4833,46 @@ fn every_entity_read_requires_identity_kind_and_lifecycle_in_the_generated_docum
     let kind = &entity["properties"]["kind"];
     assert_eq!(kind["$ref"], "#/components/schemas/EntityKindDto", "{kind}");
     assert!(kind.get("oneOf").is_none(), "never nullable: {kind}");
-    let provenance = schemas["ProvenanceDto"]["properties"]
+    let mut published: Vec<&str> = entity["properties"]
         .as_object()
-        .expect("provenance properties");
-    let mut members: Vec<&str> = provenance.keys().map(String::as_str).collect();
-    members.sort_unstable();
+        .expect("EntityDto properties")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    published.sort_unstable();
     assert_eq!(
-        members,
-        ["compat_forced", "gts_impl_version", "gts_spec_version"],
-        "attribution is not published in P0",
+        published,
+        [
+            "content",
+            "effective_traits",
+            "effective_traits_schema",
+            "gts_id",
+            "gts_uuid",
+            "kind",
+            "lifecycle_status",
+            "origin",
+            "provenance",
+            "resolved_schema",
+        ],
+        "exactly the read contract's fields are published",
+    );
+    let provenance = &entity["properties"]["provenance"];
+    assert_eq!(
+        provenance["$ref"], "#/components/schemas/ProvenanceDto",
+        "omitted rather than null: {provenance}"
+    );
+    assert!(provenance.get("oneOf").is_none(), "{provenance}");
+    let group = &schemas["ProvenanceDto"];
+    assert_eq!(
+        group["properties"],
+        json!({ "compatibility_check_skipped": group["properties"]["compatibility_check_skipped"] }),
+        "exactly one member: {group}"
+    );
+    assert_eq!(group["required"], json!(["compatibility_check_skipped"]));
+    assert_eq!(
+        group["properties"]["compatibility_check_skipped"]["type"],
+        json!("boolean"),
+        "a non-null boolean: {group}"
     );
     let body = |path: String, method: &str| {
         doc["paths"][path][method]["responses"]["200"]["content"]["application/json"]["schema"]
