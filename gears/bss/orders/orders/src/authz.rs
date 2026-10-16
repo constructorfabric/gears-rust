@@ -512,8 +512,9 @@ impl Pep {
     }
 
     /// Untargeted authorization of a complete proposed arrangement: `order × create` or
-    /// `order × preview`. Payer-use authority is part of the same complete decision: the returned
-    /// scope must admit the full proposed model before any registry probe or commercial read.
+    /// `order × preview`. The returned scope must admit the full proposed model before any
+    /// registry probe or commercial read. The payer relationship is a business guard (D-215), not
+    /// part of this decision.
     ///
     /// # Errors
     /// Untargeted denial reasons, sanitized outage or integration failure.
@@ -580,7 +581,7 @@ impl Pep {
     }
 
     /// Second decision for an axis change on an existing order: the same action against the
-    /// complete proposed arrangement, including payer-use authority. Both decisions are required;
+    /// complete proposed arrangement (no payer condition, D-215). Both decisions are required;
     /// the proposed side never authorizes the existing order and vice versa.
     ///
     /// # Errors

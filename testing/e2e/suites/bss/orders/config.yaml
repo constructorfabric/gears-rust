@@ -237,8 +237,8 @@ gears:
       priority: 10
       policy_revision: "orders-e2e-s2-12"
       rules:
-        # Each buyer authors on resource tenant A and may use payer P (payer-use authority is
-        # part of the same complete decision); one identical rule per buyer identity.
+        # Each buyer authors on resource tenant A; one identical rule per buyer identity. The
+        # policy names no payer: which payer an order names is a business rule (D-215).
         - id: "e2e-buyer-1"
           subject: { id: "11111111-6a88-4768-9dfc-6bcd5187d9ed" }
           resource_type: "gts.cf.bss.orders.order.v1~"
@@ -246,9 +246,6 @@ gears:
           paths:
             - predicates:
                 - { property: "resource_tenant_id", values: ["a0000000-0000-4000-8000-00000000000a"] }
-          payer_use:
-            property: "payer_tenant_id"
-            values: ["9a9e0000-0000-4000-8000-000000000009"]
         - id: "e2e-buyer-2"
           subject: { id: "11111112-6a88-4768-9dfc-6bcd5187d9ed" }
           resource_type: "gts.cf.bss.orders.order.v1~"
@@ -256,9 +253,6 @@ gears:
           paths:
             - predicates:
                 - { property: "resource_tenant_id", values: ["a0000000-0000-4000-8000-00000000000a"] }
-          payer_use:
-            property: "payer_tenant_id"
-            values: ["9a9e0000-0000-4000-8000-000000000009"]
         - id: "e2e-buyer-3"
           subject: { id: "11111113-6a88-4768-9dfc-6bcd5187d9ed" }
           resource_type: "gts.cf.bss.orders.order.v1~"
@@ -266,9 +260,6 @@ gears:
           paths:
             - predicates:
                 - { property: "resource_tenant_id", values: ["a0000000-0000-4000-8000-00000000000a"] }
-          payer_use:
-            property: "payer_tenant_id"
-            values: ["9a9e0000-0000-4000-8000-000000000009"]
         - id: "e2e-buyer-4"
           subject: { id: "11111114-6a88-4768-9dfc-6bcd5187d9ed" }
           resource_type: "gts.cf.bss.orders.order.v1~"
@@ -276,9 +267,6 @@ gears:
           paths:
             - predicates:
                 - { property: "resource_tenant_id", values: ["a0000000-0000-4000-8000-00000000000a"] }
-          payer_use:
-            property: "payer_tenant_id"
-            values: ["9a9e0000-0000-4000-8000-000000000009"]
         - id: "e2e-buyer-5"
           subject: { id: "11111115-6a88-4768-9dfc-6bcd5187d9ed" }
           resource_type: "gts.cf.bss.orders.order.v1~"
@@ -286,9 +274,6 @@ gears:
           paths:
             - predicates:
                 - { property: "resource_tenant_id", values: ["a0000000-0000-4000-8000-00000000000a"] }
-          payer_use:
-            property: "payer_tenant_id"
-            values: ["9a9e0000-0000-4000-8000-000000000009"]
         - id: "e2e-buyer-6"
           subject: { id: "11111116-6a88-4768-9dfc-6bcd5187d9ed" }
           resource_type: "gts.cf.bss.orders.order.v1~"
@@ -296,9 +281,6 @@ gears:
           paths:
             - predicates:
                 - { property: "resource_tenant_id", values: ["a0000000-0000-4000-8000-00000000000a"] }
-          payer_use:
-            property: "payer_tenant_id"
-            values: ["9a9e0000-0000-4000-8000-000000000009"]
         - id: "e2e-buyer-7"
           subject: { id: "11111117-6a88-4768-9dfc-6bcd5187d9ed" }
           resource_type: "gts.cf.bss.orders.order.v1~"
@@ -306,9 +288,6 @@ gears:
           paths:
             - predicates:
                 - { property: "resource_tenant_id", values: ["a0000000-0000-4000-8000-00000000000a"] }
-          payer_use:
-            property: "payer_tenant_id"
-            values: ["9a9e0000-0000-4000-8000-000000000009"]
         - id: "e2e-buyer-8"
           subject: { id: "11111118-6a88-4768-9dfc-6bcd5187d9ed" }
           resource_type: "gts.cf.bss.orders.order.v1~"
@@ -316,9 +295,6 @@ gears:
           paths:
             - predicates:
                 - { property: "resource_tenant_id", values: ["a0000000-0000-4000-8000-00000000000a"] }
-          payer_use:
-            property: "payer_tenant_id"
-            values: ["9a9e0000-0000-4000-8000-000000000009"]
         # The seller operator reads, holds and resumes the seller's orders; never authors.
         - id: "e2e-seller-operator"
           subject: { id: "55555555-6a88-4768-9dfc-6bcd5187d9ed" }

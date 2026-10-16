@@ -13,7 +13,6 @@ Each rule names:
 | `subject` | Authenticated subject selector (`id`, `tenant_id`, `subject_type`); every present field must match; at least one is required |
 | `resource_type`, `actions` | Exact resource type and action names; no wildcard |
 | `paths` | OR alternatives; each path is an AND of `property IN values` predicates (finite resource-ID sets use the `id` property) |
-| `payer_use` | Optional separate condition: the named property must be one of `values`; added to every path and checked against a supplied proposed value |
 | `delegation` | Optional delegated-path condition: the request property `proof_property` must carry one of `accepted` |
 
 `unconditional_grants` (optional, default none) lists explicit grants for **property-less**

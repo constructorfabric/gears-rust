@@ -15,7 +15,7 @@ use crate::domain::read::{AccessOutcome, Collection, CursorBinding, Position};
 use crate::infra::capture::{CaptureService, LocalOrdersClient};
 use crate::infra::read::{ReadService, ReadSignals};
 use arc_swap::ArcSwapOption;
-use bss_orders_sdk::authoring::{BillingCycle, Category};
+use bss_orders_sdk::authoring::{BillingCycle, Category, HeaderPatch};
 use bss_orders_sdk::catalog::{OrderState, Reason};
 use bss_orders_sdk::reads::{
     Cursor, LineList, ListOrders, OrderFilters, OrderPage, PageSize, ReadMeta,
@@ -53,14 +53,13 @@ fn rule(id: &str, subject: u128, actions: &[&str], property: &str, values: &[Uui
 }
 /// The read policy; `workflow_ids` are the explicit finite order IDs of the service principal.
 fn policy(workflow_ids: &[Uuid]) -> Value {
-    let mut buyer = rule(
+    let buyer = rule(
         "buyer",
         BUYER.0,
         &["create", "write", "edit", "read"],
         "resource_tenant_id",
         &[u(10), u(11)],
     );
-    buyer["payer_use"] = json!({"property": "payer_tenant_id", "values": [s(u(30)), s(u(31))]});
     let mut partner = rule(
         "partner-delegated",
         PARTNER.0,
@@ -1164,6 +1163,34 @@ async fn log_failures_and_changed_facts_follow_the_disclosure_rules() {
         2,
         "one restart after the changed facts"
     );
+}
+
+/// D-215: the policy grants access by resource tenant and names no payer, so changing the payer
+/// to a tenant no rule mentions neither refuses the edit nor hides the order from its own
+/// resource tenant's reader, on the point read or the list.
+#[tokio::test]
+async fn a_payer_change_keeps_the_order_readable_by_its_resource_tenant() {
+    let r = R::new().await;
+    let (id, _) = r.draft("payer", 0).await;
+    let changed = result(
+        r.capture
+            .patch_order(
+                &buyer(),
+                id,
+                HeaderPatch {
+                    payer_tenant_id: Some(u(32)),
+                    ..HeaderPatch::default()
+                },
+                &write("payer-h", 1, Some(2)),
+            )
+            .await
+            .unwrap(),
+    );
+    assert_eq!(changed.draft_revision.map(i64::from), Some(3));
+    let view = r.reads.get(&buyer(), id).await.unwrap();
+    assert_eq!(view.order.payer_tenant_id, u(32));
+    let listed = r.reads.list(&buyer(), &list_all()).await.unwrap();
+    assert!(listed.items.iter().any(|o| o.order.order_id == id));
 }
 
 /// The delivered authoring and read routes mounted behind the buyer's authenticated context.

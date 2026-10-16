@@ -2,8 +2,7 @@
 //!
 //! A platform PDP provider that evaluates explicitly configured permission rules: per subject,
 //! resource type and action, OR alternatives of AND predicate paths over named resource
-//! properties (including finite resource-ID sets), an optional separate payer-use condition and
-//! an optional delegated-path condition. It knows no consumer gear's types.
+//! properties (including finite resource-ID sets) and an optional delegated-path condition. It knows no consumer gear's types.
 //!
 //! Fail closed: no matching rule denies, a malformed configuration fails startup, and there is
 //! no default policy, wildcard or allow-all form.

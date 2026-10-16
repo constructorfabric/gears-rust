@@ -58,8 +58,7 @@ fn path(pairs: &[(&str, Vec<Uuid>)]) -> Value {
         "property": p, "values": v.iter().map(|x| s(*x)).collect::<Vec<_>>()
     })).collect::<Vec<_>>()})
 }
-/// Real rules policy: the buyer may do every user operation on resource tenant 10 (payer use
-/// 30/31); Workflow may do the seam operations on exactly the listed orders of seller 20.
+/// Real rules policy: the buyer may do every user operation on resource tenant 10; Workflow may do the seam operations on exactly the listed orders of seller 20.
 fn policy(workflow_orders: &[Uuid]) -> Value {
     let mut rules = vec![
         json!({
@@ -67,7 +66,6 @@ fn policy(workflow_orders: &[Uuid]) -> Value {
             "actions": ["create", "write", "edit", "submit", "amend", "cancel", "hold", "resume",
                         "read", "force_fail_unreconciled"],
             "paths": [path(&[("resource_tenant_id", vec![u(10)])])],
-            "payer_use": {"property": "payer_tenant_id", "values": [s(u(30)), s(u(31))]},
         }),
         json!({
             "id": "buyer-acceptance", "subject": {"id": s(u(BUYER.0))},
@@ -1237,7 +1235,7 @@ async fn changed_facts_and_lost_access_audit_without_settling_the_key() {
     let mut p = Prepared::new(AggregateContribution::None);
     p.guards = guards(21, None);
     p.event = event(21, S::Submitted, 2);
-    // Payer reassigned between authorization and lock (payer 31 is still within the policy).
+    // Payer reassigned between authorization and lock (the policy names no payer, so access stays).
     let stale = Prep {
         prepared: p.clone(),
         side_effect: Some((

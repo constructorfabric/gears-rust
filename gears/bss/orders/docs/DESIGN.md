@@ -9637,8 +9637,8 @@ whose tenant axes the caller supplies. Without this clause any authenticated par
 enumerate baskets against an arbitrary `payerTenantId` and learn whether that tenant exists, holds
 an active contract, which market it binds to, and whether it already subscribes to a named
 product. Therefore Preview **MUST** establish PDP authority for the requested operation and
-named relationships, including payer-use authority, before resolving or disclosing their
-commercial facts. If authority relies on delegation, PDP policy decides that the supplied proof
+named relationships, and confirm the payer relationship (D-215), before resolving or disclosing
+their commercial facts. If authority relies on delegation, PDP policy decides that the supplied proof
 covers that relationship; an independent direct seller/customer relationship is not itself a delegation.
 Missing authority or required proof refuses Preview rather than returning a partial verdict.
 [03 §4.6](features/03-gate-and-pin.md#contract-03-4-6)'s fourth absolute prohibition remains: Preview **MUST NOT** return, in a gate result,
@@ -10118,7 +10118,7 @@ must not fabricate default grants when provisioning is absent.
 **Provider capability must be verified separately.** In the repository implementations inspected
 for this decision, the static plugin supplies development tenant constraints and the
 tenant-resolver plugin evaluates tenant hierarchy using `owner_tenant_id`; neither establishes
-Orders' complete action-specific, three-axis and payer-use policy. The resolver routes to the
+Orders' complete action-specific and three-axis policy. The resolver routes to the
 selected plugin rather than adding those missing policy decisions itself. Platform ownership
 must identify the intended deployed provider and demonstrate that it enforces the declared
 permission matrix and tenant relationships. Do not infer capability from successful permission
@@ -10132,8 +10132,8 @@ integration evidence under `cpt-cf-bss-orders-upreq-pdp-policy-integration`
 an instruction to implement a policy engine or new validation API in Orders.
 
 Acceptance must include principals with the same tenant relationship but different action
-grants, and proposed payer changes where old-order access is allowed but payer-use authority
-is denied. A permissive response that ignores supplied properties is not proof of proposed-value
+grants, and proposed resource-tenant changes where old-order access is allowed but the proposed
+side is denied. A permissive response that ignores supplied properties is not proof of proposed-value
 authorization. Keep constraints required for scoped database paths; disabling the requirement
 is not a substitute for the missing policy. Proposed-value enforcement remains to be validated
 with the existing provider/toolkit APIs before deciding whether any upstream extension is
@@ -10440,8 +10440,8 @@ condition within the selected path **MUST** hold; conditions from incomplete pat
 be combined to manufacture a grant. A dash means that path grants no permission, not that holding
 the role vetoes a grant through another path. For example, payer-reader status neither grants
 cancellation nor removes cancellation independently authorized through the seller path, including
-its seller scope and mandatory reason. Common requirements, such as payer-use authorization
-where applicable and business guards, remain mandatory regardless of the access path. This rule
+its seller scope and mandatory reason. Common requirements, such as the payer relationship
+check (D-215) and other business guards, remain mandatory regardless of the access path. This rule
 does not override explicit PDP denials or platform policy restrictions. Acceptance tests must
 cover overlapping payer/seller permissions and reject combinations of incomplete access paths.
 
@@ -10561,8 +10561,8 @@ roles these permissions. Do not copy Pricing's single-tenant-per-request reposit
 Orders must retain the three-axis relationship scopes defined here. Nor does adopting the
 catalog import Pricing's audit-export surface; Orders has no such endpoint in this design.
 
-This catalog settles the public-operation permission boundaries. Payer-use authority is an
-additional condition defined below, not a grant implied by any action in the table. Fully
+This catalog settles the public-operation permission boundaries. Which payer an order may name
+is a business rule defined below (D-215), not a grant implied by any action in the table. Fully
 qualified labels are defined in §3.5; deployed PDP policy/relationship behavior must be verified
 under the upstream integration requirement. Private persistence and maintenance follow §3.5's
 bounded internal authority, not a new per-table PDP catalog. Registration alone is not enforcement.
@@ -10630,26 +10630,27 @@ Being the creating user, belonging to the payer tenant, or knowing the order ID 
 independently grant access. Partner delegation and seller access remain separate authorization
 paths. This definition does not widen the matrix above: Direct Customers still cannot amend
 submitted commercial content or read audit, and the acceptance-specific restrictions still apply.
-Authority to select a payer is separate, as defined below. The PDP wiring and bounded internal
+Which payer an order may name is a business rule, not a permission, as defined below (D-215). The PDP wiring and bounded internal
 authority are defined in §3.5; runtime implementation and deployed policy verification remain
 pending, not a further choice of an Orders-owned evaluator.
 
 **Create and mutation authorization: check both (normative).** For an existing order, the
 platform PDP **MUST** authorize the requested action against the existing order and its current
 tenant relationships. If an otherwise permitted mutation changes any tenant axis, PDP **MUST**
-also authorize the proposed resulting relationships for that operation, including authority
-to use the proposed payer. Both conditions are required: access to the old order cannot grant
-authority over a new payer or resource tenant, and authority over proposed values cannot grant
-access to an existing order. Construct the proposed values from the stored order plus the
+also authorize the proposed resulting relationships for that operation. Both conditions are
+required: access to the old order cannot grant authority over a new resource tenant, and
+authority over proposed values cannot grant access to an existing order. The proposed payer is
+part of the proposed arrangement the PDP sees, but the policy grants no payer condition; the
+payer relationship is the business check below (D-215). Construct the proposed values from the stored order plus the
 validated delta; omitted fields retain their stored values and must not disappear from the
 authorization context. Do not overwrite the existing authorization properties with proposed
 ones before checking the existing-order permission.
 
 Creation has no existing-order side: authorize `order × create` and the complete proposed
 tenant arrangement before insertion. For mutations without tenant-axis changes, authorize the
-operation against the current order; action-specific requirements still apply, including the
-submit-time payer-use check below. Authority to use a tenant in an order is not permission to
-edit that tenant's account. Neither check widens the actor matrix or overrides business rules
+operation against the current order; action-specific requirements still apply, and the
+submit-time payer relationship check below is a business guard (D-215). Naming a tenant as payer
+is not permission to edit that tenant's account. Neither check widens the actor matrix or overrides business rules
 about immutable axes, allowed states, commercial eligibility or seller-scoped payer rebinding.
 
 The mutation transaction **MUST** enforce the PDP-produced current-order scope and verify that
@@ -10673,25 +10674,26 @@ the documented flow is not a claim of implemented enforcement.
 Acceptance tests must cover old-side allow/new-side deny, old-side deny/new-side allow,
 both sides allowed, prohibited axis changes despite both grants (including a draft
 `sellerTenantId` change, refused `tenant-axis-immutable` under D-119), concurrent axis/version
-changes, and create with an unauthorized payer. Refusal evidence continues to follow the
+changes, and create on an unauthorized resource tenant. Refusal evidence continues to follow the
 private service persistence path of §3.5; the denied caller gains no audit-write permission.
 
-**Authority to select a payer.** `payerTenantId` may differ from `resourceTenantId`, but the
-platform PDP **MUST** explicitly authorize the authenticated principal to use the named payer
-for the requested operation, based on an approved relationship or valid delegation. Authority
-over the resource tenant alone **MUST NOT** confer authority to make another tenant the payer.
-This is an additional authorization condition, not an alternative to the operation's existing
-permission and resource/seller scope checks. Apply it when creating an order, previewing a
-basket, changing its payer through an otherwise permitted edit or amendment, and submitting
-the order; an earlier authorization **MUST NOT** substitute for authorization at submit.
-Preview authorization permits assessment only and does not authorize a later commitment.
-Orders **MUST** authorize use of the requested payer before disclosing payer-related commercial
-facts. Knowing the payer's identifier, its eligibility, or the existence of an active contract
-**MUST NOT** establish the caller's authority: eligibility and contract validity remain separate
-business checks. This rule does not widen actor permissions, permit otherwise prohibited
-tenant-axis changes, or override seller-scope restrictions on payer rebinding. Exact PDP action
-names, relationship inputs and enforcement wiring remain to be specified in the integration
-contract; no Orders-local authorization fallback is implied.
+**Payer relationship (business rule, D-215).** `payerTenantId` may differ from
+`resourceTenantId`. Whether the named payer may pay for the resource tenant is a commercial
+relationship between those tenants, not a permission of the caller: PDP policy grants access
+through the resource, seller and current-payer paths and names no payer condition. Previewing a
+basket, submitting and amending **MUST** confirm the payer ↔ resource-tenant relationship from the
+payer commercial profile Account Management returns (`cpt-cf-bss-orders-upreq-payer-commercial-profile`),
+alongside the payer ↔ seller relationship of D-128, **before** resolving or disclosing any
+payer-related commercial fact. An unconfirmed relationship refuses `payer-relationship-unconfirmed`
+(registered with the Stage 3 gate); an unavailable or late answer is the existing
+`identity-party-unavailable`. A draft may name any payer: it commits nothing, and an earlier draft
+edit or Preview **MUST NOT** substitute for the check at submit. Knowing the payer's identifier, its
+eligibility, or the existence of an active contract establishes nothing; eligibility and contract
+validity remain separate business checks. This rule does not widen actor permissions, permit
+otherwise prohibited tenant-axis changes, or override seller-scope restrictions on payer
+rebinding. If a deployment also requires a caller-specific authority to commit another tenant's
+money, that is an ordinary PDP check on that tenant's billing-account resource, not a condition of
+the order policy.
 
 **Payer-reader permission (current payer only).** A principal explicitly granted payer-reader
 access by the platform PDP may list and read orders through their **current** `payerTenantId`,
@@ -10778,7 +10780,7 @@ calls; test each row, mixed/empty pages, and served/refused logging failures.
 Any operation relying on a delegated access path—ordinarily a partner acting for another
 tenant—**MUST** carry explicit, auditable delegation proof for that path. Direct customer,
 seller and current-payer paths do not require resource-tenant delegation solely because the
-order spans different tenants. PDP grants, action limits and payer-use checks remain mandatory.
+order spans different tenants. PDP grants, action limits and the payer relationship check (D-215) remain mandatory.
 **Evaluation is PDP policy, not Orders code** (D-111): the shared adapter forwards the supplied proof
 reference as request context on every PolicyEnforcer call, read and write; PDP policy decides
 whether the path needs delegation and verifies the proof against the properties below, and Orders
@@ -10914,8 +10916,8 @@ must preserve non-reuse through the aggregate high-water and preserve committed 
 
 ### Engine execution subflow (overrides ordinary steps 2–9 for commercial commands)
 
-1. Recheck current access and proposed relationships/payer-use authority before resolving
-foreign commercial facts. Authorized settled replay returns before external work. An authorized matching existing
+1. Recheck current access and the proposed relationships, and confirm the payer relationship
+(D-215), before resolving foreign commercial facts. Authorized settled replay returns before external work. An authorized matching existing
 execution loads its frozen attempt and recovers that identity before any fresh assessment:
 new resolution results or outages cannot replace/block exact historical receipt recovery. Fresh
 authorization and final eligibility/deadline/state checks still apply before any new commercial
@@ -11357,8 +11359,8 @@ Orders/Subscriptions grants. Public read and inter-gear provider behavior requir
 ### Buyer authority, retries and attribution
 
 Before foreign-party reads or acceptance, Orders independently authorizes the original caller for
-the operation, resource tenant, seller relationship and proposed payer use under the existing
-buyer-axis/delegation contract. Before final commit it rechecks required current authority and
+the operation, resource tenant and seller relationship under the existing buyer-axis/delegation
+contract, and confirms the proposed payer relationship (D-215). Before final commit it rechecks required current authority and
 D-188 expected snapshot/version/claim and worker fences. A service's catalog permission cannot
 satisfy those checks. Recovery keeps original caller attribution and authority requirements;
 maintenance permission alone cannot create business effects. Record service identity and original
@@ -11381,7 +11383,7 @@ attempt identity.
 - [ ] Real-provider Pricing→Products tests pass for the intended ordinary principals with exact
   grants; remove each required grant and prove denial before protected effects. Test cross-seller
   requests, forged system identities and PDP outage without leakage or privilege fallback.
-- [ ] Test unauthorized resource/proposed payer use before foreign reads and final commit,
+- [ ] Test an unauthorized resource and an unconfirmed payer relationship before foreign reads and final commit,
   revocation during recovery, and original actor attribution independent of service permission.
 - [ ] Test same-principal token refresh/rotation exact replay, changed-principal refusal/reconciliation,
   stale worker fences, and no duplicate receipts from recovery.

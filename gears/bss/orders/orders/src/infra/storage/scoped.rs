@@ -177,7 +177,7 @@ pub async fn apply_authorized_arrangement<T: TransactionRunner>(
 }
 
 /// Insert a newly created aggregate whose complete arrangement was authorized by
-/// `order × create` (payer use included). Every security property is populated by the model.
+/// `order × create`. Every security property is populated by the model.
 ///
 /// # Errors
 /// `Denied` when the model is not the authorized arrangement or the scope rejects it.

@@ -34,7 +34,8 @@ pub(super) const SELLER_OPERATOR: (u128, u128) = (103, 20);
 pub(super) fn s(id: Uuid) -> String {
     id.to_string()
 }
-/// The buyer authors on resource tenants 10/11 with payer use 30/31 (never 32).
+/// The buyer authors on resource tenants 10/11 (never 12). Which payer an order names is a
+/// business rule checked at submit (D-215), so the policy grants no payer condition.
 pub(super) fn policy() -> Value {
     json!({"vendor": "constructorfabric", "priority": 10, "policy_revision": "s2-09",
     "rules": [{
@@ -42,7 +43,6 @@ pub(super) fn policy() -> Value {
         "actions": ["create", "write", "edit", "read"],
         "paths": [{"predicates": [{"property": "resource_tenant_id",
             "values": [s(u(10)), s(u(11))]}]}],
-        "payer_use": {"property": "payer_tenant_id", "values": [s(u(30)), s(u(31))]},
     }, {
         // Seller operations on the seller's orders: read, hold and resume only (02 §1.3).
         "id": "seller-ops", "subject": {"id": s(u(SELLER_OPERATOR.0))}, "resource_type": ORDER_RT,
@@ -936,14 +936,14 @@ async fn header_and_axis_edits_are_written_by_the_engine_under_complete_authoriz
     // The immutable audit namespace and seller stay as created.
     assert_eq!(row["audit_tenant_id"], json!(s(u(10))));
     assert_eq!(row["seller_tenant_id"], json!(s(u(20))));
-    // A payer the caller may not use is refused before any write, never settled.
+    // A resource tenant the caller may not author on is refused before any write, never settled.
     let registry = t.registry().await;
     let denied = svc
         .patch_order(
             &buyer(),
             id,
             HeaderPatch {
-                payer_tenant_id: Some(u(32)),
+                resource_tenant_id: Some(u(12)),
                 ..HeaderPatch::default()
             },
             &write("h-4", 1, Some(3)),
@@ -953,6 +953,23 @@ async fn header_and_axis_edits_are_written_by_the_engine_under_complete_authoriz
     assert!(matches!(denied, OrdersError::Refused(_)), "{denied:?}");
     assert_eq!(t.registry().await, registry);
     assert_eq!(t.order_row(id).await, row);
+    // Any payer is accepted on a draft: the payer relationship is a business rule the submit
+    // gate checks (D-215), not a permission the policy grants.
+    let r = result(
+        svc.patch_order(
+            &buyer(),
+            id,
+            HeaderPatch {
+                payer_tenant_id: Some(u(32)),
+                ..HeaderPatch::default()
+            },
+            &write("h-5", 1, Some(3)),
+        )
+        .await
+        .unwrap(),
+    );
+    assert_eq!(revision(&r), 4);
+    assert_eq!(t.order_row(id).await["payer_tenant_id"], json!(s(u(32))));
 }
 
 /// Resource tenants 10 and 11 granted by separate rules: each decision is constrained to one
@@ -964,7 +981,6 @@ fn split_tenant_policy() -> Value {
             "actions": ["create", "write", "edit", "read"],
             "paths": [{"predicates": [{"property": "resource_tenant_id",
                 "values": [s(u(tenant))]}]}],
-            "payer_use": {"property": "payer_tenant_id", "values": [s(u(30))]},
         })
     };
     json!({"vendor": "constructorfabric", "priority": 10, "policy_revision": "split-tenants",

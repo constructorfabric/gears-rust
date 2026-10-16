@@ -38,15 +38,11 @@ fn with(mut rule: serde_json::Value, key: &str, value: serde_json::Value) -> ser
 fn policy(accepted_proofs: &[&str]) -> serde_json::Value {
     let delegation = json!({"proof_property": "delegation_proof_ref", "accepted": accepted_proofs});
     let mut rules = vec![
-        with(
-            rule(
-                "customer",
-                102,
-                &["create", "write", "read", "cancel"],
-                &[&[("resource_tenant_id", &[10])]],
-            ),
-            "payer_use",
-            json!({"property": "payer_tenant_id", "values": [s(30)]}),
+        rule(
+            "customer",
+            102,
+            &["create", "write", "read", "cancel"],
+            &[&[("resource_tenant_id", &[10])]],
         ),
         rule(
             "customer-read-only",
@@ -54,15 +50,11 @@ fn policy(accepted_proofs: &[&str]) -> serde_json::Value {
             &["read"],
             &[&[("resource_tenant_id", &[10])]],
         ),
-        with(
-            rule(
-                "partner-direct",
-                101,
-                &["create", "write", "read"],
-                &[&[("resource_tenant_id", &[10])]],
-            ),
-            "payer_use",
-            json!({"property": "payer_tenant_id", "values": [s(30), s(31)]}),
+        rule(
+            "partner-direct",
+            101,
+            &["create", "write", "read"],
+            &[&[("resource_tenant_id", &[10])]],
         ),
         rule(
             "seller",
@@ -340,24 +332,30 @@ async fn actor_axis_matrix_on_real_provider_and_postgres() -> anyhow::Result<()>
     Ok(())
 }
 
-/// Check-both, payer use, immutable seller, create proposal and stale facts on PostgreSQL.
+/// Check-both, immutable seller, create proposal and stale facts on PostgreSQL.
 #[tokio::test]
-async fn old_new_arrangement_payer_use_and_stale_facts() -> anyhow::Result<()> {
+async fn old_new_arrangement_and_stale_facts() -> anyhow::Result<()> {
     let pg = Pg::new().await?;
     let runtime = seed(&pg).await?;
     let pep = rules_pep(&["proof-p"]);
     let before = row(&pg, 1).await;
 
-    // Old allowed, new payer denied (customer has payer use for 30 only): 403, no change.
+    // Old allowed, new resource tenant denied (customer authors on 10 only): 403, no change.
     let customer = user(102, 10);
     let current = target(&runtime, &pep, &customer, Action::OrderWrite, 1)
         .await
         .unwrap();
-    let proposed = current.facts().arrangement().with_delta(None, Some(u(31)));
+    let moved = current.facts().arrangement().with_delta(Some(u(11)), None);
     assert_eq!(
-        reason(pep.authorize_proposed(&customer, &current, proposed).await).0,
+        reason(pep.authorize_proposed(&customer, &current, moved).await).0,
         Reason::OperationNotPermittedForActor
     );
+    // A payer change is not a permission question (D-215): the policy names no payer, so the
+    // proposed side is allowed and the payer relationship is left to the submit gate.
+    let proposed = current.facts().arrangement().with_delta(None, Some(u(31)));
+    pep.authorize_proposed(&customer, &current, proposed)
+        .await
+        .unwrap();
     // Old denied (payer reader has no write): the proposal is never reached.
     assert_eq!(
         reason(target(&runtime, &pep, &user(105, 30), Action::OrderWrite, 1).await).0,
@@ -365,7 +363,7 @@ async fn old_new_arrangement_payer_use_and_stale_facts() -> anyhow::Result<()> {
     );
     assert_eq!(row(&pg, 1).await, before);
 
-    // Both allowed (partner with payer use 30/31): the authorized arrangement is persisted.
+    // Both allowed (partner): the authorized arrangement is persisted.
     let partner = user(101, 10);
     let current = target(&runtime, &pep, &partner, Action::OrderWrite, 1)
         .await
@@ -473,13 +471,13 @@ async fn create_proposals_require_the_complete_authorized_arrangement() -> anyho
     let runtime = seed(&pg).await?;
     let pep = rules_pep(&["proof-p"]);
     let customer = user(102, 10);
-    // Unauthorized payer on create: refused before any insert.
+    // Unauthorized resource tenant on create: refused before any insert.
     assert_eq!(
         reason(
             pep.authorize_new_arrangement(
                 &customer,
                 Action::OrderCreate,
-                arrangement_of(10, 20, 31)
+                arrangement_of(11, 20, 30)
             )
             .await
         )

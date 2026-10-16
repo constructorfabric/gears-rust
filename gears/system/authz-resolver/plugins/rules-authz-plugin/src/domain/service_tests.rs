@@ -1,6 +1,6 @@
 use super::*;
 use crate::config::{
-    DelegationConfig, ExactSubject, PathConfig, PayerUseConfig, PredicateConfig, RuleConfig,
+    DelegationConfig, ExactSubject, PathConfig, PredicateConfig, RuleConfig,
     RulesAuthZPluginConfig, SubjectMatch, UnconditionalGrantConfig,
 };
 use authz_resolver_sdk::{Action, EvaluationRequestContext, Resource, Subject};
@@ -31,7 +31,6 @@ fn rule(id: &str, subject: u128, actions: &[&str], paths: Vec<PathConfig>) -> Ru
         resource_type: THING.to_owned(),
         actions: actions.iter().map(|a| (*a).to_owned()).collect(),
         paths,
-        payer_use: None,
         delegation: None,
     }
 }
@@ -212,32 +211,31 @@ fn finite_resource_ids_bind_the_request_id() {
 }
 
 #[test]
-fn payer_use_is_a_separate_required_condition() {
-    let mut r = rule(
+fn a_rule_constrains_only_the_properties_its_paths_name() {
+    let svc = service(vec![rule(
         "create",
         1,
         &["create"],
         vec![path(&[("resource_tenant_id", &[5])])],
-    );
-    r.payer_use = Some(PayerUseConfig {
-        property: "payer_tenant_id".to_owned(),
-        values: vec![u(3)],
-    });
-    let svc = service(vec![r]);
-    let allowed = svc.evaluate(&request(
+    )]);
+    // A supplied property no path names neither refuses nor narrows the answer: which other
+    // tenants an object may involve is the consumer's business rule, not a permission.
+    for payer in [3, 4] {
+        let allowed = svc.evaluate(&request(
+            1,
+            "create",
+            &[("resource_tenant_id", s(5)), ("payer_tenant_id", s(payer))],
+        ));
+        assert!(allowed.decision, "payer {payer}");
+        assert_eq!(allowed.context.constraints.len(), 1);
+        assert_eq!(allowed.context.constraints[0].predicates.len(), 1);
+    }
+    let other_resource = svc.evaluate(&request(
         1,
         "create",
-        &[("resource_tenant_id", s(5)), ("payer_tenant_id", s(3))],
+        &[("resource_tenant_id", s(6)), ("payer_tenant_id", s(3))],
     ));
-    assert!(allowed.decision);
-    // The payer-use predicate is part of the returned path, so a scope check enforces it too.
-    assert_eq!(allowed.context.constraints[0].predicates.len(), 2);
-    let unauthorized_payer = svc.evaluate(&request(
-        1,
-        "create",
-        &[("resource_tenant_id", s(5)), ("payer_tenant_id", s(4))],
-    ));
-    assert!(!unauthorized_payer.decision);
+    assert!(!other_resource.decision);
 }
 
 #[test]

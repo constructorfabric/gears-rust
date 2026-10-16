@@ -19,7 +19,6 @@ fn valid_rule() -> RuleConfig {
                 values: vec![u(2)],
             }],
         }],
-        payer_use: None,
         delegation: None,
     }
 }
@@ -83,15 +82,6 @@ fn malformed_policies_fail_startup() {
             Box::new(|c| c.rules[0].paths[0].predicates[0].values = vec![Uuid::nil()]),
         ),
         (
-            "empty payer use",
-            Box::new(|c| {
-                c.rules[0].payer_use = Some(PayerUseConfig {
-                    property: "payer_tenant_id".to_owned(),
-                    values: vec![],
-                });
-            }),
-        ),
-        (
             "delegation accepts nothing",
             Box::new(|c| {
                 c.rules[0].delegation = Some(DelegationConfig {
@@ -115,6 +105,18 @@ fn unknown_fields_are_rejected_by_deserialization() {
         "default_allow": true
     });
     assert!(serde_json::from_value::<RulesAuthZPluginConfig>(value).is_err());
+    // A rule-level condition that is not part of the model (such as the retired `payer_use`)
+    // fails startup instead of being ignored.
+    let retired = serde_json::json!({
+        "vendor": "v", "priority": 1, "policy_revision": "r",
+        "rules": [{
+            "id": "r", "subject": {"id": u(1)}, "resource_type": "gts.cf.example.thing.v1~",
+            "actions": ["read"],
+            "paths": [{"predicates": [{"property": "seller_tenant_id", "values": [u(2)]}]}],
+            "payer_use": {"property": "payer_tenant_id", "values": [u(3)]}
+        }]
+    });
+    assert!(serde_json::from_value::<RulesAuthZPluginConfig>(retired).is_err());
     let missing_rules = serde_json::json!({"vendor": "v", "priority": 1, "policy_revision": "r"});
     assert!(serde_json::from_value::<RulesAuthZPluginConfig>(missing_rules).is_err());
 }

@@ -1221,7 +1221,7 @@ acceptance dependency, not a claim that the docs-only Subscriptions gear now has
   before foreign-party calls and final commit.
 - [ ] Persist authenticated commercial principal identity with D-188 attempts; validate stable
   identity through refresh/rotation, changed-principal reconciliation, revocation and stale workers.
-- [ ] Pass real-provider positive/negative grant tests, seller isolation, unauthorized payer use,
+- [ ] Pass real-provider positive/negative grant tests, seller isolation, an unconfirmed payer relationship,
   no impersonation and no leakage on denial/outage. Existing code paths are not deployed grants.
 
 ### R09 implementation dependency — diagnostic contract and mapping (D-195)

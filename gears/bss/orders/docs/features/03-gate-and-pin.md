@@ -661,8 +661,8 @@ when previously observed facts change. None of these tests is claimed executed b
 Use the [authenticated service-principal contract and call matrix](../DESIGN.md#contract-08-commercial-service-authorization)
 for every catalog/acceptance port. Provisioned seller identity and explicit PDP grants remain
 unchecked dependencies (`cpt-cf-bss-orders-upreq-commercial-service-provisioning`).
-Authorize original resource/proposed-payer use before foreign-party reads and recheck for final
-commit. Freeze authenticated commercial caller identity with each D-188 attempt; neither token
+Authorize the original resource tenant and confirm the proposed payer relationship (D-215) before
+foreign-party reads, and recheck for final commit. Freeze authenticated commercial caller identity with each D-188 attempt; neither token
 refresh nor credential rotation permits rebinding an uncertain command to a different principal.
 Preview uses only its read capabilities; hold remains Subscriptions-owned. Real Pricing→Products
 provider tests, missing/revoked grants and foreign-seller/payer failures are required before release.

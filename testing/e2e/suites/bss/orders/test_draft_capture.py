@@ -328,25 +328,36 @@ def test_authorization_matrix_and_tenant_isolation(env: OrdersEnv, buyer: Buyer)
     # The payer's reader sees the order through the payer axis only.
     assert env.client("payer").get(path).status_code == 200
 
-    # The buyer's complete arrangement is authorized: a payer outside the payer-use set is
-    # refused for the actor, and a foreign resource tenant is refused, with nothing created.
-    for body in (
-        create_body(payer_tenant_id=FOREIGN_TENANT),
-        create_body(resource_tenant_id=FOREIGN_TENANT),
-    ):
-        problem(
-            api.post(f"{API}/orders", json=body, headers={"Idempotency-Key": new_key()}),
-            403,
-            "OPERATION_NOT_PERMITTED_FOR_ACTOR",
-        )
+    # The buyer's resource tenant is authorized: a foreign resource tenant is refused for the
+    # actor, with nothing created.
+    problem(
+        api.post(
+            f"{API}/orders",
+            json=create_body(resource_tenant_id=FOREIGN_TENANT),
+            headers={"Idempotency-Key": new_key()},
+        ),
+        403,
+        "OPERATION_NOT_PERMITTED_FOR_ACTOR",
+    )
     # Nothing leaked and nothing changed under the hidden/forbidden attempts.
     assert env.psql(
         f"SELECT draft_revision FROM bss_orders__order WHERE order_id = '{order_id}'"
     ) == "0"
     assert env.count(
         f"SELECT count(*) FROM bss_orders__order WHERE resource_tenant_id = '{FOREIGN_TENANT}'"
-        f" OR payer_tenant_id = '{FOREIGN_TENANT}'"
     ) == 0
+    # The payer is not a permission (D-215): a draft may name any payer, and the order stays
+    # readable by its resource tenant's buyer. The payer relationship is checked at submit.
+    foreign_payer = api.post(
+        f"{API}/orders",
+        json=create_body(payer_tenant_id=FOREIGN_TENANT),
+        headers={"Idempotency-Key": new_key()},
+    )
+    assert foreign_payer.status_code == 201, foreign_payer.text
+    foreign_payer_id = foreign_payer.json()["order"]["order_id"]
+    read_back = api.get(f"{API}/orders/{foreign_payer_id}")
+    assert read_back.status_code == 200, read_back.text
+    assert read_back.json()["order"]["payer_tenant_id"] == FOREIGN_TENANT
 
 
 def test_service_principals_need_finite_explicit_constraints(env: OrdersEnv, buyer: Buyer):

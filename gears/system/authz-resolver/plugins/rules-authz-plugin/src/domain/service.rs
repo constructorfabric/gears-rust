@@ -7,10 +7,9 @@
 //! 1. Candidate rules match the authenticated subject, exact resource type and exact action.
 //! 2. A delegated rule needs an accepted proof reference in its configured property; a missing
 //!    or unaccepted reference refuses only that rule, never another complete rule.
-//! 3. A payer-use rule refuses a supplied proposed payer outside its set.
-//! 4. Each path survives only if every predicate whose property the request supplies holds for
-//!    the supplied value. Surviving paths (plus the payer-use predicate) become OR constraints.
-//! 5. No surviving path means deny. Proof-caused denials carry a stable deny code.
+//! 3. Each path survives only if every predicate whose property the request supplies holds for
+//!    the supplied value. Surviving paths become OR constraints.
+//! 4. No surviving path means deny. Proof-caused denials carry a stable deny code.
 //!
 //! Paths of different rules are never merged: an incomplete path cannot borrow a predicate from
 //! another rule.
@@ -93,16 +92,9 @@ impl Service {
                 proof_failure = proof_failure.max(Some(failure));
                 continue;
             }
-            if let Some(payer) = &rule.payer_use
-                && supplied
-                    .get(payer.property.as_str())
-                    .is_some_and(|value| !value.is_some_and(|v| payer.values.contains(&v)))
-            {
-                continue;
-            }
             for path in &rule.paths {
                 if path_holds(path, &supplied) {
-                    constraints.push(constraint(path, rule));
+                    constraints.push(constraint(path));
                 }
             }
         }
@@ -215,16 +207,14 @@ fn predicate(property: &str, values: &[Uuid]) -> Predicate {
     }
 }
 
-fn constraint(path: &PathConfig, rule: &RuleConfig) -> Constraint {
-    let mut predicates: Vec<Predicate> = path
-        .predicates
-        .iter()
-        .map(|p| predicate(&p.property, &p.values))
-        .collect();
-    if let Some(payer) = &rule.payer_use {
-        predicates.push(predicate(&payer.property, &payer.values));
+fn constraint(path: &PathConfig) -> Constraint {
+    Constraint {
+        predicates: path
+            .predicates
+            .iter()
+            .map(|p| predicate(&p.property, &p.values))
+            .collect(),
     }
-    Constraint { predicates }
 }
 
 #[cfg(test)]

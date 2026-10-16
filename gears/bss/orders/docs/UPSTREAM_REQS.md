@@ -491,9 +491,13 @@ The profile **must also state the payer's commercial relationship with a named s
 whether the payer is in a commercial relationship with the order's `sellerTenantId`. An amendment
 that changes `payerTenantId` reads this answer to decide whether the change crosses seller scope
 ([04 §2.2](DESIGN.md#contract-04-2-2)), and refuses `payer-rebinding-requires-seller` unless the
-relationship is confirmed. No separate tenant-hierarchy operation is requested. See
+relationship is confirmed. It **must likewise state the payer's commercial relationship with the
+order's resource tenant** (D-215): Preview, submit and amendment refuse `payer-relationship-unconfirmed`
+unless the payer may pay for that resource tenant, before any payer-related fact is disclosed.
+No separate tenant-hierarchy operation is requested. See
 [`DECISIONS.md`](./DECISIONS.md) D-128. Shape (2026-10-02): `payer_profile(payer_tenant_id,
-seller_tenant_id) → { currency, region, in_relationship_with_seller }`, as a first-class read or a
+seller_tenant_id, resource_tenant_id) → { currency, region, in_relationship_with_seller,
+in_relationship_with_resource }`, as a first-class read or a
 documented schema on the tenant metadata API; Seam Atlas takes the market from the caller's
 request, which this gear treats as untrusted.
 
@@ -977,8 +981,9 @@ delegation relationships those policies evaluate. Orders does not build a parall
 infer permission from successful registration of an `AuthzPermissionV1` instance.
 
 The authoritative Orders policy contract is [08 §3.5](DESIGN.md#contract-08-3-5) and §4.3: distinct
-actions, resource/seller/current-payer access paths, complete alternative grants, payer-use authority,
-and existing/proposed arrangement checks. The bounded trusted-maintenance exception there remains
+actions, resource/seller/current-payer access paths, complete alternative grants, and existing/proposed
+arrangement checks. Which payer an order may name is not part of the policy: it is the payer
+relationship business check below (D-215). The bounded trusted-maintenance exception there remains
 separate; it does not exempt Workflow or public SDK/REST callers from PDP.
 
 **Delegation-proof evaluation (D-111).** PDP policy, not Orders, evaluates delegation proof. The

@@ -69,10 +69,6 @@ pub struct RuleConfig {
     pub actions: Vec<String>,
     /// OR alternatives; every predicate within one path is an AND requirement.
     pub paths: Vec<PathConfig>,
-    /// Separate payer-use authority: the named property must be one of these values. Added to
-    /// every path of this rule and checked against a supplied proposed value.
-    #[serde(default)]
-    pub payer_use: Option<PayerUseConfig>,
     /// Delegated path: the request must carry an accepted proof reference in this property.
     #[serde(default)]
     pub delegation: Option<DelegationConfig>,
@@ -101,14 +97,6 @@ pub struct PathConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PredicateConfig {
-    pub property: String,
-    pub values: Vec<Uuid>,
-}
-
-/// Separate payer-use authority condition.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct PayerUseConfig {
     pub property: String,
     pub values: Vec<Uuid>,
 }
@@ -232,9 +220,6 @@ impl RuleConfig {
             for predicate in &path.predicates {
                 values(&predicate.property, &predicate.values, &self.id)?;
             }
-        }
-        if let Some(payer) = &self.payer_use {
-            values(&payer.property, &payer.values, &self.id)?;
         }
         if let Some(delegation) = &self.delegation {
             non_blank(&delegation.proof_property, "proof_property")?;
