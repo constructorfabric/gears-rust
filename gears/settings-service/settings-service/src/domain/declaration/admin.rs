@@ -204,6 +204,49 @@ pub trait RevivalReadGate: Send + Sync {
     async fn may_read(&self, declaration: &Declaration) -> Result<bool, DomainError>;
 }
 
+/// Feed `value` to `state` so that equal values hash alike. An object's
+/// members go in key order: `Value` equality ignores the order of an object's
+/// keys, but the object's text keeps it once `serde_json`'s `preserve_order`
+/// feature is on — and a workspace build turns it on through other crates — so
+/// hashing the text would put two equal objects in different buckets. A number
+/// goes as its text, as equal numbers print alike; a float zero's sign is the
+/// one exception, and it costs no more than a second validation.
+fn hash_value<H: std::hash::Hasher>(value: &Value, state: &mut H) {
+    use std::hash::Hash as _;
+    match value {
+        Value::Null => 0_u8.hash(state),
+        Value::Bool(flag) => {
+            1_u8.hash(state);
+            flag.hash(state);
+        }
+        Value::Number(number) => {
+            2_u8.hash(state);
+            number.to_string().hash(state);
+        }
+        Value::String(text) => {
+            3_u8.hash(state);
+            text.hash(state);
+        }
+        Value::Array(items) => {
+            4_u8.hash(state);
+            items.len().hash(state);
+            for item in items {
+                hash_value(item, state);
+            }
+        }
+        Value::Object(members) => {
+            5_u8.hash(state);
+            members.len().hash(state);
+            let mut sorted: Vec<(&String, &Value)> = members.iter().collect();
+            sorted.sort_unstable_by(|a, b| a.0.cmp(b.0));
+            for (key, member) in sorted {
+                key.hash(state);
+                hash_value(member, state);
+            }
+        }
+    }
+}
+
 /// The strictest of any number of classifications: `secret` over `pii` over
 /// `public`, and a string that is none of these ranks as the strictest of
 /// all — fail closed, so an unknown class masks rather than shows.
@@ -797,7 +840,8 @@ where
         // type alone, so it is reused for every row holding that value. Rows
         // are found by a hash of the value and confirmed by `Value` equality,
         // so no second copy of any value is kept; a secret row has no value
-        // here to judge.
+        // here to judge. The hash ignores an object's key order, as `Value`
+        // equality does (see `hash_value`).
         let mut verdicts: std::collections::HashMap<u64, VerdictBucket> =
             std::collections::HashMap::new();
         let mut rows = Vec::with_capacity(limit.min(stored.len()));
@@ -806,9 +850,9 @@ where
             let detail = match &row.value {
                 None => None,
                 Some(value) => {
-                    use std::hash::{Hash as _, Hasher as _};
+                    use std::hash::Hasher as _;
                     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                    value.to_string().hash(&mut hasher);
+                    hash_value(value, &mut hasher);
                     let bucket = verdicts.entry(hasher.finish()).or_default();
                     let known = bucket
                         .iter()

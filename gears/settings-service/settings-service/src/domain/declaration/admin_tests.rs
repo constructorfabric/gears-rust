@@ -2212,3 +2212,26 @@ async fn rows_holding_the_same_value_are_judged_once_and_each_gets_its_own_verdi
     }
     assert_eq!(report.total_needs_review, 6);
 }
+
+#[test]
+fn equal_objects_hash_alike_whatever_their_key_order() {
+    use std::hash::Hasher as _;
+    let hash = |value: &Value| {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        super::hash_value(value, &mut hasher);
+        hasher.finish()
+    };
+    // Built member by member in the opposite order: with `serde_json`'s
+    // `preserve_order` on, as a workspace build has it, the two print
+    // differently and are still equal, nested objects included.
+    let mut inner = Map::new();
+    inner.insert("q".to_owned(), json!(1));
+    inner.insert("p".to_owned(), json!(2));
+    let mut outer = Map::new();
+    outer.insert("x".to_owned(), json!([Value::Object(inner)]));
+    outer.insert("y".to_owned(), json!(1));
+    let reversed = json!({ "outer": Value::Object(outer) });
+    let ordered = json!({ "outer": { "y": 1, "x": [{ "p": 2, "q": 1 }] } });
+    assert_eq!(ordered, reversed);
+    assert_eq!(hash(&ordered), hash(&reversed));
+}
