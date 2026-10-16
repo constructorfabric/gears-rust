@@ -49,6 +49,9 @@ use static_authn_plugin as _;
 #[cfg(feature = "static-authz")]
 use static_authz_plugin as _;
 
+#[cfg(feature = "rules-authz")]
+use rules_authz_plugin as _;
+
 #[cfg(feature = "tr-authz")]
 use tr_authz_plugin as _;
 

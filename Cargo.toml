@@ -151,6 +151,7 @@ members = [
     "gears/system/authn-resolver/plugins/oidc-authn-plugin",
     "gears/system/authz-resolver/authz-resolver-sdk",
     "gears/system/authz-resolver/authz-resolver",
+    "gears/system/authz-resolver/plugins/rules-authz-plugin",
     "gears/system/authz-resolver/plugins/static-authz-plugin",
     "gears/system/authz-resolver/plugins/tr-authz-plugin",
     "gears/system/oagw/oagw",
@@ -396,6 +397,7 @@ cluster = { package = "cf-gears-cluster", version = "0.2.9", path = "gears/syste
 api-gateway = { package = "cf-gears-api-gateway", version = "0.5.2", path = "gears/system/api-gateway" }
 # Concrete plugins needed to link a standalone-mode binary.
 static-authn-plugin = { package = "cf-gears-static-authn-plugin", version = "0.3.18", path = "gears/system/authn-resolver/plugins/static-authn-plugin" }
+rules-authz-plugin = { package = "cf-gears-rules-authz-plugin", version = "0.1.0", path = "gears/system/authz-resolver/plugins/rules-authz-plugin" }
 static-authz-plugin = { package = "cf-gears-static-authz-plugin", version = "0.1.38", path = "gears/system/authz-resolver/plugins/static-authz-plugin" }
 standalone-cluster-plugin = { package = "cf-gears-standalone-cluster-plugin", version = "0.2.8", path = "gears/system/cluster/plugins/standalone-cluster-plugin" }
 
@@ -413,6 +415,7 @@ oagw-sdk = { package = "cf-gears-oagw-sdk", version = "0.5.15", path = "gears/sy
 usage-collector-sdk = { package = "cf-gears-usage-collector-sdk", version = "0.3.14", path = "gears/system/usage-collector/usage-collector-sdk" }
 quota-enforcement-sdk = { package = "cf-gears-quota-enforcement-sdk", version = "0.1.0", path = "gears/system/quota-enforcement/quota-enforcement-sdk" }
 event-broker-sdk = { package = "cf-gears-event-broker-sdk", version = "0.2.6", path = "gears/system/event-broker/event-broker-sdk" }
+event-broker = { package = "cf-gears-event-broker", path = "gears/system/event-broker/event-broker" }
 sqlite-event-broker-plugin = { package = "cf-gears-sqlite-event-broker-plugin", version = "0.1.0", path = "gears/system/event-broker/plugins/sqlite-event-broker-plugin" }
 
 # BSS gears (ported from vhp-core)
