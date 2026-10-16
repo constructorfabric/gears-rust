@@ -379,15 +379,18 @@ mod setting_handlers_tests;
 /// the target is outside its subtree or standalone; 404 when no declaration
 /// exists at the key or it is outside the caller's administrative domain; 503
 /// when the store cannot answer.
+#[allow(clippy::too_many_arguments)]
 pub async fn get_history(
     Extension(ctx): Extension<SecurityContext>,
     Extension(resolver): Extension<Arc<ConcreteResolver>>,
     Extension(db): Extension<Arc<toolkit_db::DBProvider<toolkit_db::DbError>>>,
     Extension(enforcer): Extension<Arc<authz_resolver_sdk::PolicyEnforcer>>,
+    Extension(names): Extension<Arc<crate::infra::actor_names::ActorNameResolver>>,
     Path(key): Path<String>,
     Query(params): Query<TenantParam>,
     OData(query): OData,
 ) -> ApiResult<impl IntoResponse> {
+    let started = tokio::time::Instant::now();
     // @cpt-begin:cpt-cf-settings-service-flow-audit-store-history:p1:inst-as-hist-1
     let key = parse_key(&key)?;
     let requested = parse_tenant(params.tenant.as_deref())?;
@@ -453,11 +456,31 @@ pub async fn get_history(
         });
     let pii = needs_entitlement && may_read_pii(&enforcer, &ctx).await;
     // @cpt-begin:cpt-cf-settings-service-flow-audit-store-history:p1:inst-as-hist-9
-    let items: Vec<AuditRecordDto> = page
+    let mut items: Vec<AuditRecordDto> = page
         .items
         .iter()
         .map(|r| render_record(r, values_are_pii, pii))
         .collect();
+    // @cpt-end:cpt-cf-settings-service-flow-audit-store-history:p1:inst-as-hist-9
+    let actors: Vec<crate::infra::actor_names::ActorRef> = items
+        .iter()
+        .map(|r| crate::infra::actor_names::ActorRef {
+            tenant_id: r.tenant_id,
+            actor: r.actor.clone(),
+            masked: r.actor_masked,
+        })
+        .collect();
+    let actor_names = names
+        .names_for_page(
+            &ctx,
+            &actors,
+            started + crate::infra::actor_names::PAGE_DEADLINE,
+        )
+        .await;
+    for (item, name) in items.iter_mut().zip(actor_names) {
+        item.actor_name = name;
+    }
+    // @cpt-begin:cpt-cf-settings-service-flow-audit-store-history:p1:inst-as-hist-9
     Ok(Json(toolkit_odata::Page {
         items,
         page_info: page.page_info,

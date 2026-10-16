@@ -1,5 +1,5 @@
 Created:  2026-07-20 by Virtuozzo International GmbH
-Updated:  2026-08-30 by Virtuozzo International GmbH
+Updated:  2026-10-16 by Virtuozzo International GmbH
 
 # PRD — Settings Service
 
@@ -155,7 +155,7 @@ The platform has no configuration service yet: each gear owns its own configurat
 **ID**: `cpt-cf-settings-service-actor-compliance-reviewer`
 
 - **Role**: Reviews the audit trail of settings mutations and machine secret-use events to answer "who changed what, when, and which service used which secret."
-- **Needs**: A queryable, masked audit history per setting/scope and a global audit view; secret values remain masked in every audit record, with no human/administrative reveal path.
+- **Needs**: A queryable, masked audit history per setting/scope and a global audit view; secret values remain masked in every audit record, with no human/administrative reveal path; on a setting's own mutation history, the display name of the actor of each change beside its identity, where the reviewer may see it.
 
 ### 2.2 System Actors
 
@@ -228,6 +228,14 @@ The platform has no configuration service yet: each gear owns its own configurat
 - **Role**: The platform `types-registry` gear. Owns the GTS type/trait definitions that Setting Declarations reference for validation and rendering.
 - **Integration Direction**: Outbound — Settings Service resolves GTS type schemas from `types-registry` at declaration-authoring and value-validation time; `types-registry` does not call into Settings Service.
 - **Availability Expectation**: Required at declaration-authoring and value-write time for type resolution/validation. If briefly unavailable, already-validated effective values continue to be servable from cache per [§6.1 Performance: Read-Path Caching](#61-gear-specific-nfrs).
+
+#### Account Management
+
+**ID**: `cpt-cf-settings-service-actor-account-management`
+
+- **Role**: The platform `account-management` gear (`gears/system/account-management`). Owns administrator accounts and their display names, which Settings Service shows beside the actor identity on a setting's audit history.
+- **Integration Direction**: Outbound — Settings Service asks `account-management` for the display names of the administrators recorded in a history page, under the caller's own authorization; `account-management` does not call into Settings Service.
+- **Availability Expectation**: Optional. Not required for any read or write: when `account-management` is absent, unavailable, slow or refuses, the history read completes with the administrator display names reading `null` and nothing else changes ([§5.7](#57-security-secrets--audit), [§10](#10-dependencies)).
 
 ## 3. Operational Concept & Environment
 
@@ -564,8 +572,10 @@ Any mutating operation (create/set/revert/remove-value/clone) **MUST** write an 
 
 Audit-record actor identities **MUST** be classified as public or PII. Actor-identity PII **MUST** be visible unmasked only to callers authorized for unmasked PII, **MUST** be masked in all other administrative audit reads and audit/report outputs, and **MUST** remain governed by the platform's retention/anonymization policy. These outputs do not include settings-manifest export/import, which is out of scope ([§4.2](#42-out-of-scope)); the classification mechanism is owned by DESIGN.
 
+The per-(setting, scope) audit history read **MUST** carry, beside the actor identity, the actor's current display name as Account Management knows it, so a reviewer reads who made a change and not only an identifier (`cpt-cf-settings-service-actor-compliance-reviewer`). The name **MUST** be absent (`null`) when the actor identity is masked for the caller, when the actor is a contributing module (its module name is the identity), or when Account Management cannot supply it — refused, not listed, failed, slow or not deployed. The history read **MUST NOT** fail because of Account Management and **MUST** still meet `cpt-cf-settings-service-nfr-scale-growth` when Account Management is slow or absent. The platform's own system context — the identity the platform uses when it acts on its own behalf, which is not one of the system actors in [§2.2](#22-system-actors) — **MUST** read "System" when unmasked. The name is actor-identity PII and **MUST** follow the same unmask authorization as the actor identity it accompanies. The name is a read-side projection: it **MUST NOT** be stored with the audit record and **MUST NOT** be written to any log.
+
 - **Rationale**: A complete, tamper-evident audit trail — including secret reveals — is required for compliance review of who changed or accessed configuration and when.
-- **Actors**: `cpt-cf-settings-service-actor-platform-admin`, `cpt-cf-settings-service-actor-tenant-admin`, `cpt-cf-settings-service-actor-compliance-reviewer`
+- **Actors**: `cpt-cf-settings-service-actor-platform-admin`, `cpt-cf-settings-service-actor-tenant-admin`, `cpt-cf-settings-service-actor-compliance-reviewer`, `cpt-cf-settings-service-actor-account-management`
 
 #### Per-Setting Access
 
@@ -755,7 +765,7 @@ The system **MUST** support at least 100,000 tenants in the tenant scope hierarc
 - **Safety** (SAFE-PRD-001/002): Not applicable — this service is a pure information/configuration system with no physical, medical, or industrial interaction; "safety" appears elsewhere in this document only in the operational-safety-net sense (staged-change → Apply), not the physical-harm sense these checklist items address.
 - **Device/Platform** (UX-PRD-004): Not applicable to this PRD for the same reason as Accessibility/Internationalization — supported platforms, browsers, and responsive/offline behavior are UI-level concerns owned by the future frontend DESIGN document, not this service's backend contract.
 - **Inclusivity** (UX-PRD-005): Not applicable to this PRD for the same reason — this is a backend administrative service with no direct end-user-facing surface of its own; inclusivity requirements for the Settings Hub UI belong to the frontend DESIGN document.
-- **Regulatory Compliance beyond stated audit requirements**: Not applicable as additional scope — audit coverage is fully defined by `cpt-cf-settings-service-nfr-security-baseline` and `cpt-cf-settings-service-fr-audit-mutations`, and PII-shaped values are governed by the data-classification model in [§5.2](#52-typed-values--validation). Audit-record actor identities (administrator user IDs, retention configurable per [§5.7](#57-security-secrets--audit)) are processed for accountability of privileged administrative actions; the lawful basis and retention terms for this processing are determined by the **platform's approved privacy policy / legal decision**, which this service defers to rather than asserting a specific basis here. If a gear-contributed setting's value is independently PII, its handling is governed by the [§5.2](#52-typed-values--validation) classification model. No further regulatory scope is introduced by this service.
+- **Regulatory Compliance beyond stated audit requirements**: Not applicable as additional scope — audit coverage is fully defined by `cpt-cf-settings-service-nfr-security-baseline` and `cpt-cf-settings-service-fr-audit-mutations`, and PII-shaped values are governed by the data-classification model in [§5.2](#52-typed-values--validation). Audit-record actor identities (administrator user IDs, retention configurable per [§5.7](#57-security-secrets--audit)) and the administrator display names read from Account Management for history reads (never stored with the audit record or logged) are processed for accountability of privileged administrative actions; the lawful basis and retention terms for this processing are determined by the **platform's approved privacy policy / legal decision**, which this service defers to rather than asserting a specific basis here. If a gear-contributed setting's value is independently PII, its handling is governed by the [§5.2](#52-typed-values--validation) classification model. No further regulatory scope is introduced by this service.
 
 ## 7. Public Library Interfaces
 
@@ -858,7 +868,7 @@ The system **MUST** support at least 100,000 tenants in the tenant scope hierarc
 
 1. Reviewer opens the global audit view and filters by scope, setting, actor, and/or time range
 2. Reviewer inspects matching audit records — actor, target (category + key + scope), pre/post values, timestamp, outcome, and request identifier — with all secret values shown masked and no reveal path
-3. Reviewer drills into a single setting/scope to see its full mutation history, including any recorded secret-reveal events (actor, timestamp, request id; value still masked)
+3. Reviewer drills into a single setting/scope to see its full mutation history, including any recorded secret-reveal events (actor, timestamp, request id; value still masked) — each record shows the actor's display name beside the actor where the reviewer may see it
 
 **Postconditions**: The reviewer can answer "who changed what, when" for any setting/scope in their audit visibility, without ever observing a plaintext secret.
 
@@ -915,6 +925,7 @@ Each criterion validates the referenced FR/NFR; the full normative statement liv
 - [ ] Credential step-up is a pluggable behaviour behind a stable contract: the Settings Service hard-codes no single second-authentication implementation, works against a platform-provided default second-authentication gear, and accepts an integrator-supplied replacement behind the same contract (`cpt-cf-settings-service-fr-authn-role-gating`)
 - [ ] Every mutation writes an audit record (actor, target, pre/post values with secrets masked, timestamp, outcome, request id); audit history queryable globally and per (setting, scope) with no reveal path (`cpt-cf-settings-service-fr-audit-mutations`)
 - [ ] Audit-record actor identities are classified as public or PII; unauthorized administrative audit reads and audit/report outputs mask actor-identity PII, only callers authorized for unmasked PII can observe it, and retention/anonymization policy remains enforced (`cpt-cf-settings-service-fr-audit-mutations`)
+- [ ] Each history record carries the actor's current display name beside the actor identity under the same unmask authorization as the identity; the name is `null` when the identity is masked for the caller, the actor is a module, or Account Management cannot supply it, and reads "System" for the platform's own system context when unmasked; the name is neither stored with the record nor written to any log; a missing or late name never fails the read, and the read still meets the scoped audit query target (`cpt-cf-settings-service-fr-audit-mutations`, `cpt-cf-settings-service-nfr-scale-growth`)
 - [ ] Licence/feature-gated settings are excluded server-side for callers without the entitlement, consistently across all administrative read paths; the internal in-process settings reader is not licence-gated (`cpt-cf-settings-service-fr-feature-license-gating`)
 - [ ] An invalid value is rejected before anything is stored; a setting that fails leaves no value behind and its failure reaches the caller and a durable notification channel (`cpt-cf-settings-service-nfr-reliability-validated-set`)
 - [ ] Cache-served effective-value reads complete within 50ms at p95 at the SDK boundary while sustaining at least 1,000 reads/second for 15 minutes against 5,000 settings, 100,000 tenants, and hierarchy depth up to 10, distributed across settings and tenant depths rather than one hot key or scope; cache invalidated on the set; secrets never cached or returned in plaintext (`cpt-cf-settings-service-nfr-performance-read-cache`)
@@ -945,6 +956,7 @@ Each criterion validates the referenced FR/NFR; the full normative statement liv
 | AuthN Resolver (`gears/system/authn-resolver`)                                                                                                                                                                                                                                        | Bearer-token authentication only (single `authenticate()` call per ADR-0003) — **credential step-up re-verification is new work**; no re-authentication primitive exists in `authn-resolver` today                                                                                   | `p1`        |
 | `toolkit-db` (library)                                                                                                                                                                                                                                                                | Storage of settings and encrypted secrets                                                                                                                                                                                                                                            | `p1`        |
 | Audit (Core Functionality) — **aspirational, not yet implemented per `docs/GEARS.md`**                                                                                                                                                                                                | Audit trail for every mutation, including secret-reveal events                                                                                                                                                                                                                  | `p1`        |
+| Account Management (`gears/system/account-management`) — **optional** | Supplies the actor display name on audit history reads; absent or unavailable, the administrator display names read `null` and nothing else changes | `p2` |
 | License Resolver (`gears/system/license-resolver`) — **aspirational, not yet implemented** (zero `.rs` files; absent from the workspace `Cargo.toml` members; every `docs/GEARS.md` scenario unchecked) + broader Policy Manager concept — **also aspirational, not yet implemented** | Admission gating and feature/licence gating                                                                                                                                                                                                                                          | `p2`        |
 | Events & Notifications (Core Functionality) — **aspirational, not yet implemented**                                                                                                                                                                                                   | Set failure notifications                                                                                                                                                                                                                                                           | `p2`        |
 
@@ -967,6 +979,7 @@ Several mandatory acceptance criteria depend on platform capabilities that **do 
 - A view/owner/admin access-level model is built — by `authz-resolver`'s future AuthZ Management Gear or an interim mechanism — to back the view-vs-mutate distinction `cpt-cf-settings-service-fr-authn-role-gating` depends on; `authz-resolver`'s current PDP API has no built-in role storage or hierarchy (see [§13 Open Questions](#13-open-questions)).
 - A credential step-up (re-authentication) primitive is built behind a stable, pluggable step-up contract before a set can enforce it — satisfied by a default second-authentication gear provided by the platform, or by an integrator-supplied implementation behind the same contract; `authn-resolver`'s current API has no re-authentication method (see [§13 Open Questions](#13-open-questions)).
 - A platform audit subsystem becomes available to record mutation and secret-reveal audit events (currently aspirational — see [§10 Dependencies](#10-dependencies)).
+- Account Management lists a descendant tenant's administrators to an administrator of an ancestor tenant or of the platform who may read that tenant's history; where it does not, the history shows no name for them.
 
 ## 12. Risks
 
