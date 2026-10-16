@@ -6,8 +6,8 @@ use authz_resolver_sdk::PolicyEnforcer;
 use gts::GtsTypeId;
 use quota_enforcement_sdk::testing::InMemoryStorage;
 use quota_enforcement_sdk::{
-    EnforcementMode, MetricId, PageRequest, PeriodType, QuotaFilter, QuotaManagerApi, QuotaPatch,
-    QuotaSource, QuotaSpec, QuotaStatus, QuotaType, SubjectRef,
+    EnforcementMode, MetricId, PageRequest, PeriodType, QuotaFilter, QuotaManagerApi, QuotaSource,
+    QuotaSpec, QuotaStatus, QuotaType, QuotaUpdate, SubjectRef,
 };
 use serde_json::json;
 use toolkit_canonical_errors::{CanonicalError, Problem};
@@ -157,9 +157,9 @@ async fn the_client_round_trips_through_the_same_domain_path_as_rest() {
             &ctx(),
             quota_enforcement_sdk::UpdateQuotaRequest {
                 quota_id: id,
-                patch: QuotaPatch {
+                patch: QuotaUpdate {
                     fail_open_hint: Some(true),
-                    ..QuotaPatch::default()
+                    ..QuotaUpdate::default()
                 },
             },
         )
@@ -216,39 +216,11 @@ async fn domain_rejections_arrive_as_canonical_errors() {
             &ctx(),
             quota_enforcement_sdk::UpdateQuotaRequest {
                 quota_id: quota_enforcement_sdk::QuotaId::generate(),
-                patch: QuotaPatch::default(),
+                patch: QuotaUpdate::default(),
             },
         )
         .await
         .expect_err("an empty patch is rejected before the lookup");
-    assert_eq!(status(err), 400);
-}
-
-#[tokio::test]
-async fn a_caller_supplied_constraint_contract_is_rejected_before_the_lookup() {
-    let client = InProcessQuotaManager::new(bound_service().await);
-    let id = client.create_quota(&ctx(), spec()).await.expect("created");
-    let err = client
-        .update_quota(
-            &ctx(),
-            quota_enforcement_sdk::UpdateQuotaRequest {
-                quota_id: id,
-                patch: QuotaPatch {
-                    metadata: Some(serde_json::Map::new()),
-                    constraint_contract: Some(quota_enforcement_sdk::ContractRef {
-                        type_id: type_id(crate::test_support::LLM_TOKEN_CONSTRAINT),
-                        version: 1,
-                    }),
-                    ..QuotaPatch::default()
-                },
-            },
-        )
-        .await
-        .expect_err("the gear alone names the accepted contract");
-    assert!(
-        format!("{err:?}").contains("CONSTRAINT_CONTRACT_NOT_CALLER_SUPPLIED"),
-        "{err:?}"
-    );
     assert_eq!(status(err), 400);
 }
 

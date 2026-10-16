@@ -70,8 +70,6 @@ pub const STATUS_INVALID: &str = "STATUS_INVALID";
 pub const CAP_OUT_OF_RANGE: &str = "CAP_OUT_OF_RANGE";
 /// A list continuation cursor that storage does not decode.
 pub const CURSOR_INVALID: &str = "CURSOR_INVALID";
-/// A client set `constraint_contract` on a patch; the gear alone fills it.
-pub const CONSTRAINT_CONTRACT_NOT_CALLER_SUPPLIED: &str = "CONSTRAINT_CONTRACT_NOT_CALLER_SUPPLIED";
 
 // --- consumption operations ---
 

@@ -75,11 +75,11 @@ pub use models::{
     PeriodType, PeriodWindow, PolicyDraft, PolicyId, PolicyPatch, PolicyScope, PolicySpec,
     PolicyUpdate, PolicyVersion, PolicyVersionMeta, PolicyVersionState, PreviewRequest,
     ProjectionBinding, Quota, QuotaDebitPlan, QuotaDraft, QuotaFilter, QuotaId, QuotaPatch,
-    QuotaSnapshot, QuotaSource, QuotaSpec, QuotaStatus, QuotaType, QuotaView, ReleaseLeaseRequest,
-    ResourceProjection, Retention, RollbackRequest, RollbackTarget, RollbackableOperation,
-    ScopeError, SnapshotRequest, SnapshotSubject, SubjectClaim, SubjectRef, SubjectScope, TenantId,
-    ThresholdCrossing, TransitionOutcome, UnknownValue, ValidityWindow, ValidityWindowPatch,
-    apportion, positive_amount,
+    QuotaSnapshot, QuotaSource, QuotaSpec, QuotaStatus, QuotaType, QuotaUpdate, QuotaView,
+    ReleaseLeaseRequest, ResourceProjection, Retention, RollbackRequest, RollbackTarget,
+    RollbackableOperation, ScopeError, SnapshotRequest, SnapshotSubject, SubjectClaim, SubjectRef,
+    SubjectScope, TenantId, ThresholdCrossing, TransitionOutcome, UnknownValue, ValidityWindow,
+    ValidityWindowPatch, apportion, positive_amount,
 };
 pub use notifications::{
     DeliveryOutcome, DispatchError, NotificationDeliveryHandle, NotificationDeliveryV1, QuotaEvent,

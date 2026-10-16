@@ -696,9 +696,9 @@ async fn a_bulk_envelope_over_the_sql_plugin_replays_only_while_its_targets_stay
             .map(|item| quota_enforcement_sdk::BulkUpdateItem {
                 idempotency_key: None,
                 quota_id: item.quota_id,
-                patch: quota_enforcement_sdk::QuotaPatch {
+                patch: quota_enforcement_sdk::QuotaUpdate {
                     cap: Some(quota_enforcement_sdk::CapPatch::Bounded(200)),
-                    ..quota_enforcement_sdk::QuotaPatch::default()
+                    ..quota_enforcement_sdk::QuotaUpdate::default()
                 },
             })
             .collect(),

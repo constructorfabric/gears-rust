@@ -13,7 +13,7 @@ use toolkit_security::AccessScope;
 
 use crate::models::{
     IdempotencyWrite, LeaseToken, NotificationEvent, QuotaDraft, QuotaId, QuotaPatch, QuotaSpec,
-    TenantId,
+    QuotaUpdate, TenantId,
 };
 
 /// Create every listed Quota of one tenant, or none.
@@ -61,7 +61,7 @@ pub struct BulkUpdateItem {
     /// The Quota to patch.
     pub quota_id: QuotaId,
     /// The non-breaking patch.
-    pub patch: QuotaPatch,
+    pub patch: QuotaUpdate,
 }
 
 /// Deactivate every listed Quota of one tenant, or none.

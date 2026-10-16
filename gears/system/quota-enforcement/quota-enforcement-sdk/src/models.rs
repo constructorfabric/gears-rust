@@ -1198,9 +1198,30 @@ pub enum ValidityWindowPatch {
     Set(ValidityWindow),
 }
 
-/// Partial update of a Quota. Absent fields stay untouched. Metric, type,
-/// period, and subject are immutable and therefore absent here.
+/// A caller's partial update of a Quota, the client and REST shape. Absent
+/// fields stay untouched. Metric, type, period, and subject are immutable and
+/// therefore absent here, as is the constraint contract, which the gear alone
+/// resolves.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct QuotaUpdate {
+    /// New cap.
+    pub cap: Option<CapPatch>,
+    /// New thresholds, replacing the previous list.
+    pub notification_thresholds: Option<Vec<u8>>,
+    /// New validity window.
+    pub validity_window: Option<ValidityWindowPatch>,
+    /// New metadata object, replacing the previous one.
+    pub metadata: Option<Map<String, Value>>,
+    /// New enforcement mode.
+    pub enforcement_mode: Option<EnforcementMode>,
+    /// New fail-open hint.
+    pub fail_open_hint: Option<bool>,
+}
+
+/// A validated partial update of a Quota as storage applies it, built by the
+/// gear from a [`QuotaUpdate`]. Absent fields stay untouched.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct QuotaPatch {
     /// New cap.
@@ -1213,9 +1234,8 @@ pub struct QuotaPatch {
     pub metadata: Option<Map<String, Value>>,
     /// The contract the new `metadata` was validated against, stored with it in
     /// the same write so the reference never lags the object. Set by the gear
-    /// whenever `metadata` is present, never caller-supplied: the gear rejects a
-    /// present value from a client. Storage rejects a `metadata` patch without
-    /// it as `Internal`.
+    /// whenever `metadata` is present. Storage rejects a `metadata` patch
+    /// without it as `Internal`.
     pub constraint_contract: Option<ContractRef>,
     /// New enforcement mode.
     pub enforcement_mode: Option<EnforcementMode>,

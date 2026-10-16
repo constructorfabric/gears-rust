@@ -18,8 +18,8 @@ use crate::bulk::{
 use crate::models::{
     AcquireLeaseOutcome, AcquireLeaseRequest, BatchDebitRequest, BatchDecision, CommitLeaseRequest,
     CreditRequest, DeactivateOutcome, DebitRequest, Decision, DecisionPreview, PageRequest,
-    PageResult, PolicyId, PolicyPatch, PreviewRequest, QuotaFilter, QuotaId, QuotaPatch,
-    QuotaSnapshot, QuotaSpec, QuotaView, ReleaseLeaseRequest, RollbackRequest, SnapshotRequest,
+    PageResult, PolicyId, PolicyPatch, PreviewRequest, QuotaFilter, QuotaId, QuotaSnapshot,
+    QuotaSpec, QuotaUpdate, QuotaView, ReleaseLeaseRequest, RollbackRequest, SnapshotRequest,
 };
 
 /// Error of every client method: the platform canonical error.
@@ -379,7 +379,7 @@ pub struct UpdateQuotaRequest {
     /// The Quota to patch.
     pub quota_id: QuotaId,
     /// The non-breaking changes to apply.
-    pub patch: QuotaPatch,
+    pub patch: QuotaUpdate,
 }
 
 /// Input of [`QuotaManagerApi::read_quotas`].

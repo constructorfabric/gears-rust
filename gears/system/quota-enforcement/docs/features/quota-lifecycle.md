@@ -156,7 +156,7 @@ Realises `cpt-cf-quota-enforcement-seq-quota-create`.
 - The Quota is already deactivated: `QUOTA_DEACTIVATED` (`DomainError::QuotaDeactivated`)
 
 **Steps**:
-1. [x] - `p1` - Caller sends `PATCH /v1/quota-enforcement/quotas/{id}` with a `QuotaPatch` - `inst-qup-request`
+1. [x] - `p1` - Caller sends `PATCH /v1/quota-enforcement/quotas/{id}` with a `QuotaUpdate` - `inst-qup-request`
 2. [x] - `p1` - **IF** the patch references `type = rate` - `inst-qup-rate-if`
    1. [x] - `p1` - **RETURN** `DomainError::NotYetImplemented`, canonicalized as `Unimplemented` (HTTP 501, `NOT_YET_IMPLEMENTED`); the rate check runs before the breaking-change gate, so an update referencing `rate` returns `Unimplemented` per the DESIGN rejection rule (`cpt-cf-quota-enforcement-fr-quota-type-rate-rejection`) - `inst-qup-rate`
 3. [x] - `p1` - **IF** the patch changes metric, type, period, or subject - `inst-qup-breaking-if`
@@ -345,7 +345,7 @@ time in-tx (I6). Updates preserve the quota ID and the subject reference; breaki
   `PATCH /v1/quota-enforcement/quotas/{id}`, `POST /v1/quota-enforcement/quotas/{id}/deactivate`,
   `GET /v1/quota-enforcement/quotas`; `QuotaManagerApi` Quota methods
 - DB: `cpt-cf-quota-enforcement-db-schema` (`quotas` table plus the allocation-counter materialization)
-- Entities: `Quota`, `QuotaDraft`, `QuotaPatch`, `QuotaFilter`, `QuotaId`, `DeactivateOutcome`
+- Entities: `Quota`, `QuotaDraft`, `QuotaUpdate`, `QuotaPatch`, `QuotaFilter`, `QuotaId`, `DeactivateOutcome`
 
 ### Metric Identity Validation
 
