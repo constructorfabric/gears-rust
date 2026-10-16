@@ -810,7 +810,7 @@ graph TD
 |-----------|-------|--------|--------------|
 | `create_category` | `CreateCategoryRequest`, `Context` | `Category` | Authorize `create` on `gts.cf.core.settings.category.v1~` (category governance is per-resource-type CRUD — create/read/update/delete — per §4.8). Reject duplicate `key`/`name` (`409`). Insert; audit. (`cpt-cf-settings-service-fr-settings-category-model`) |
 | `update_category` | `id`, `UpdateCategoryRequest`, `Context` | `Category` | Authorize `update` on `gts.cf.core.settings.category.v1~`. Partial update (`name`, `description`, `domain_affinity`, `sort_order`, `icon`). Requires `If-Match` (optimistic concurrency, §4.3). |
-| `delete_category` | `id`, `Context` | — | Authorize `delete` on `gts.cf.core.settings.category.v1~`. Reject (`409 CategoryNotEmpty`) if any declaration row references it — **including `retired` ones** (a retired declaration still occupies the category and its values are retained, §4.2 *Declaration Management*; no-orphan, `cpt-cf-settings-service-fr-settings-category-model`). Hard-delete only when no declaration row remains. Authoritative guard is the declaration→category FK `ON DELETE RESTRICT` (§4.7), which blocks regardless of `status`. |
+| `delete_category` | `id`, `Context` | — | Authorize `delete` on `gts.cf.core.settings.category.v1~`. Reject (`409 CategoryNotEmpty`) if any declaration row references it — **including `retired` ones** (a retired declaration still occupies the category and its values are retained, §4.2 *Declaration Management*; no-orphan, `cpt-cf-settings-service-fr-settings-category-model`). Hard-delete only when no declaration row remains. The `409` carries the number of declaration rows still referencing the category, retired ones included (counted again after the refused transaction has rolled back, on a fresh connection — a failed statement leaves a PostgreSQL transaction unusable) — the total regardless of the caller's visibility: the refusal itself already discloses that the category is not empty, and the administrator needs the true number to clear it. Authoritative guard is the declaration→category FK `ON DELETE RESTRICT` (§4.7), which blocks regardless of `status`. |
 | `get_category` / `list_categories` | filter, `Context` | `Category` / `Category[]` | Domain-filtered, visibility-gated, paginated. |
 
 #### Component: Declaration Management
@@ -1299,7 +1299,7 @@ All REST APIs follow the shared DNA REST contract: `snake_case` JSON; UUIDv7 IDs
 | Condition | Error | Description |
 |-----------|-------|-------------|
 | Category exists | `404` | Not found |
-| Category empty | `409 CategoryNotEmpty` | Must contain no declarations (`cpt-cf-settings-service-fr-settings-category-model`) |
+| Category empty | `409 CategoryNotEmpty` | Must contain no declarations, active or retired; the `409` reports how many still reference it, on the pre-check and on the foreign-key path alike (`cpt-cf-settings-service-fr-settings-category-model`) |
 | Actor authorized | `403` | `delete` on `gts.cf.core.settings.category.v1~` |
 
 #### REST API — Setting Declarations
