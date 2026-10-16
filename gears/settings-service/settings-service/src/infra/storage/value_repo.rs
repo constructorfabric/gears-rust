@@ -1,6 +1,8 @@
 // Created: 2026-09-06 by Virtuozzo International GmbH
 //! `ValueRepository` over `setting_values`.
 
+use std::collections::HashSet;
+
 use async_trait::async_trait;
 use sea_orm::sea_query::Expr;
 use sea_orm::{ActiveValue::Set, ColumnTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect};
@@ -13,6 +15,9 @@ use crate::domain::precondition;
 use crate::domain::value::{StoredValue, ValueDraft, ValueRepository};
 use crate::infra::storage::clock::{now, stamp_after};
 use crate::infra::storage::entity::setting_value::{self, Entity as ValueEntity};
+
+/// How many references one `IN` list carries.
+const REFERENCE_CHUNK: usize = 500;
 
 /// The repository. Stateless: every operation takes its connection.
 #[derive(Debug, Default, Clone, Copy)]
@@ -149,6 +154,49 @@ impl ValueRepository for ValueRepo {
             .await
             .map_err(db_error)?;
         Ok(rows.into_iter().map(to_domain).collect())
+    }
+
+    async fn secret_refs<C: DBRunner>(
+        &self,
+        conn: &C,
+        declaration_id: Uuid,
+    ) -> Result<Vec<(Uuid, String)>, DomainError> {
+        // Unscoped and not narrowed to the subject-less track, for the reason
+        // `count_referencing_declarations` gives: the cascade removes every row
+        // whatever the caller's scope, so the collect must see them all.
+        let rows = ValueEntity::find()
+            .filter(setting_value::Column::DeclarationId.eq(declaration_id))
+            .filter(setting_value::Column::SecretRef.is_not_null())
+            .secure()
+            .scope_with(&AccessScope::allow_all())
+            .all(conn)
+            .await
+            .map_err(db_error)?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|row| row.secret_ref.map(|secret_ref| (row.tenant_id, secret_ref)))
+            .collect())
+    }
+
+    async fn references_held_by_others<C: DBRunner>(
+        &self,
+        conn: &C,
+        declaration_id: Uuid,
+        refs: &[String],
+    ) -> Result<HashSet<String>, DomainError> {
+        let mut held = HashSet::new();
+        for chunk in refs.chunks(REFERENCE_CHUNK) {
+            let rows = ValueEntity::find()
+                .filter(setting_value::Column::DeclarationId.ne(declaration_id))
+                .filter(setting_value::Column::SecretRef.is_in(chunk.iter().cloned()))
+                .secure()
+                .scope_with(&AccessScope::allow_all())
+                .all(conn)
+                .await
+                .map_err(db_error)?;
+            held.extend(rows.into_iter().filter_map(|row| row.secret_ref));
+        }
+        Ok(held)
     }
 
     async fn flag<C: DBRunner>(

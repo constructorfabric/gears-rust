@@ -16,6 +16,7 @@ use crate::log_text::LogSafe;
 pub struct OtelWriteMetrics {
     writes: Counter<u64>,
     step_ups: Counter<u64>,
+    purge_releases: Counter<u64>,
 }
 
 impl OtelWriteMetrics {
@@ -31,6 +32,10 @@ impl OtelWriteMetrics {
             step_ups: meter
                 .u64_counter("settings_step_up_total")
                 .with_description("Step-up verifications by operation and result")
+                .build(),
+            purge_releases: meter
+                .u64_counter("settings_declaration_purge_secret_releases_total")
+                .with_description("Credential Store releases after a declaration purge, by result")
                 .build(),
         }
     }
@@ -55,6 +60,11 @@ impl WriteMetrics for OtelWriteMetrics {
                 KeyValue::new("result", result),
             ],
         );
+    }
+
+    fn purge_release(&self, result: &'static str) {
+        self.purge_releases
+            .add(1, &[KeyValue::new("result", result)]);
     }
 }
 

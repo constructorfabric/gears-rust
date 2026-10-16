@@ -660,6 +660,11 @@ impl Gear for SettingsService {
             crate::infra::secret_manager::CredStoreSecretManager::new(credstore),
         );
         let step_up_for_admin = Arc::clone(&step_up);
+        // One counter set for the write path and the declaration admin, so
+        // `settings_step_up_total` is one series per operation.
+        let write_metrics: Arc<dyn crate::domain::ports::WriteMetrics> =
+            Arc::new(crate::infra::write_metrics::OtelWriteMetrics::new());
+        let secrets_for_admin = Arc::clone(&secrets);
         let writer = Arc::new(crate::domain::writes::ValueWriter::new(
             crate::infra::storage::value_repo::ValueRepo,
             Arc::clone(&resolver),
@@ -669,7 +674,7 @@ impl Gear for SettingsService {
             Arc::clone(&secrets),
             crate::infra::storage::pending_secret_repo::PendingSecretRepo,
             Arc::new(crate::infra::write_metrics::LoggingPublisher),
-            Arc::new(crate::infra::write_metrics::OtelWriteMetrics::new()),
+            Arc::clone(&write_metrics),
         ));
         self.writes
             .set(Arc::new(crate::infra::value_writes::WriteCoordinator::new(
@@ -745,6 +750,9 @@ impl Gear for SettingsService {
                 Arc::clone(&step_up_for_admin),
                 crate::infra::storage::audit_store::AuditStore,
                 Arc::clone(&cache),
+                crate::infra::storage::pending_secret_repo::PendingSecretRepo,
+                secrets_for_admin,
+                write_metrics,
             )))
             .map_err(|_| anyhow::anyhow!("{} gear already initialized", Self::MODULE_NAME))?;
 
