@@ -35,8 +35,10 @@ pub enum Category {
     Change,
 }
 impl Category {
-    pub const NEW_SALE: &'static str = "gts.cf.bss.orders.category.v1~cf.bss.orders.new_sale.v1";
-    pub const CHANGE: &'static str = "gts.cf.bss.orders.category.v1~cf.bss.orders.change.v1";
+    pub const NEW_SALE: &'static str =
+        toolkit_gts::gts_id!("cf.bss.orders.category.v1~cf.bss.orders.new_sale.v1");
+    pub const CHANGE: &'static str =
+        toolkit_gts::gts_id!("cf.bss.orders.category.v1~cf.bss.orders.change.v1");
     /// The registered GTS identity stored on the aggregate.
     #[must_use]
     pub const fn gts_id(self) -> &'static str {

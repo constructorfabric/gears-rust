@@ -1,6 +1,11 @@
 //! Strict, lossless schema-2 scalar encodings. No binary floating point.
 use serde::{Deserialize, Deserializer, Serializer, de::Error as _};
 
+/// Deserialize an `Option` whose member must be present: `null` is `None`, an absent member is
+/// an error (paired with `deserialize_with`, which disables serde's absent-means-`None`).
+///
+/// # Errors
+/// The deserializer's error for an absent or malformed member.
 pub fn required_option<'de, T: Deserialize<'de>, D: Deserializer<'de>>(
     d: D,
 ) -> Result<Option<T>, D::Error> {
@@ -27,8 +32,13 @@ macro_rules! integer {
 integer!(unsigned, u64);
 integer!(signed, i64);
 
+/// A 32-byte digest as 64 lowercase hexadecimal digits.
 pub mod digest {
     use super::*;
+    /// Encode the digest as lowercase hexadecimal.
+    ///
+    /// # Errors
+    /// A value outside the encoding, or the serializer's error.
     pub fn serialize<S: Serializer>(v: &[u8; 32], s: S) -> Result<S::Ok, S::Error> {
         use std::fmt::Write as _;
         let mut text = String::with_capacity(64);
@@ -37,6 +47,10 @@ pub mod digest {
         }
         s.serialize_str(&text)
     }
+    /// Decode exactly 64 lowercase hexadecimal digits.
+    ///
+    /// # Errors
+    /// Any other spelling, or the deserializer's error.
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<[u8; 32], D::Error> {
         let text = String::deserialize(d)?;
         if text.len() != 64
@@ -60,6 +74,7 @@ pub mod digest {
         Ok(result)
     }
 }
+/// A UTC instant as RFC 3339 text with nine fractional digits, the one canonical spelling.
 pub mod instant {
     use super::*;
     use time::{OffsetDateTime, UtcOffset, format_description::well_known::Rfc3339};
@@ -74,11 +89,19 @@ pub mod instant {
             v.nanosecond()
         )
     }
+    /// Encode the instant in UTC with nine fractional digits.
+    ///
+    /// # Errors
+    /// A value outside the encoding, or the serializer's error.
     pub fn serialize<S: Serializer>(v: &OffsetDateTime, s: S) -> Result<S::Ok, S::Error> {
         let encoded = text(*v);
         OffsetDateTime::parse(&encoded, &Rfc3339).map_err(serde::ser::Error::custom)?;
         s.serialize_str(&encoded)
     }
+    /// Decode only the canonical UTC spelling with nine fractional digits.
+    ///
+    /// # Errors
+    /// Any other spelling, or the deserializer's error.
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<OffsetDateTime, D::Error> {
         let input = String::deserialize(d)?;
         let v = OffsetDateTime::parse(&input, &Rfc3339).map_err(D::Error::custom)?;
@@ -90,16 +113,25 @@ pub mod instant {
         Ok(v)
     }
 }
+/// A calendar date as `YYYY-MM-DD` within years 0 to 9999.
 pub mod date {
     use super::*;
     use time::{Date, OffsetDateTime, format_description::well_known::Rfc3339};
     #[allow(clippy::trivially_copy_pass_by_ref)] // Serde with-hook signature.
+    /// Encode the date; a year outside 0 to 9999 is refused.
+    ///
+    /// # Errors
+    /// A value outside the encoding, or the serializer's error.
     pub fn serialize<S: Serializer>(v: &Date, s: S) -> Result<S::Ok, S::Error> {
         if !(0..=9999).contains(&v.year()) {
             return Err(serde::ser::Error::custom("date outside schema-2 range"));
         }
         s.serialize_str(&v.to_string())
     }
+    /// Decode only the canonical `YYYY-MM-DD` spelling.
+    ///
+    /// # Errors
+    /// Any other spelling, or the deserializer's error.
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Date, D::Error> {
         let input = String::deserialize(d)?;
         let v = OffsetDateTime::parse(&format!("{input}T00:00:00Z"), &Rfc3339)
@@ -111,10 +143,15 @@ pub mod date {
         Ok(v)
     }
 }
+/// A Pricing price state as its wire token (`approved`, `cancelled`).
 pub mod price_state {
     use super::*;
     use bss_pricing_sdk::read::PriceState;
     #[allow(clippy::trivially_copy_pass_by_ref)] // Serde with-hook signature.
+    /// Encode a supported price state.
+    ///
+    /// # Errors
+    /// A value outside the encoding, or the serializer's error.
     pub fn serialize<S: Serializer>(v: &PriceState, s: S) -> Result<S::Ok, S::Error> {
         s.serialize_str(match v {
             PriceState::Approved => "approved",
@@ -122,6 +159,10 @@ pub mod price_state {
             _ => return Err(serde::ser::Error::custom("unsupported price state")),
         })
     }
+    /// Decode a supported price-state token.
+    ///
+    /// # Errors
+    /// Any other spelling, or the deserializer's error.
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<PriceState, D::Error> {
         match String::deserialize(d)?.as_str() {
             "approved" => Ok(PriceState::Approved),
