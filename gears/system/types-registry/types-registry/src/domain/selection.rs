@@ -109,6 +109,16 @@ impl FieldSelection {
         Self::of(&EntityField::ALL)
     }
 
+    /// Build from validated typed fields plus mandatory fields; no parsing needed.
+    #[must_use]
+    pub fn from_fields(fields: impl IntoIterator<Item = EntityField>) -> Self {
+        Self(
+            fields
+                .into_iter()
+                .fold(Self::of(&[]).0, |bits, field| bits | field.bit()),
+        )
+    }
+
     fn of(fields: &[EntityField]) -> Self {
         Self(
             Self::MANDATORY_FIELDS

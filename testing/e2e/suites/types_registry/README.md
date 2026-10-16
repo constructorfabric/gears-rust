@@ -36,7 +36,7 @@ Every scenario has a test. Scenarios proved by one workflow share a test functio
 | 24 | [Cursor continuation](scenarios/discovery.md#cursor-continuation) | `TR-DISC-201`–`TR-DISC-299` | [test_discovery.py](test_discovery.py) | Implemented |
 | 25 | [Read discovered entities with batchGet](scenarios/discovery.md#read-discovered-entities-with-batchget) | `TR-DISC-301`–`TR-DISC-399` | [test_discovery.py](test_discovery.py) | Implemented |
 
-The shared base config (`config/e2e-local.yaml`) enables compatibility force and allows vendor `acme` only under `gts.acme.e2e.*`, so the unscoped `make e2e-local` server runs TR-REG-903 and TR-REG-904 too. TR-REG-902 uses the force-disabled profile; every other run skips it.
+The shared base config (`config/e2e-local.yaml`) allows `skip_compatibility_check` requests and allows vendor `acme` only under `gts.acme.e2e.*`, so the unscoped `make e2e-local` server runs TR-REG-903 and TR-REG-904 too. TR-REG-902 uses the force-disabled profile; every other run skips it.
 
 `conftest.py` provides HTTP/fixture setup, `given_registered` and scenario-ID binding; `helpers.py` provides submit-and-poll and read helpers, expected-body builders and comparators. Pytest collects both sets.
 
@@ -76,8 +76,8 @@ make e2e-local SUITE=types-registry
 # Scenario tests only.
 .venv/bin/python tools/scripts/run_e2e.py --suite types-registry -- -m scenario
 
-# Disabled-force refusal (TR-REG-902).
-.venv/bin/python tools/scripts/run_e2e.py --suite types-registry --profile force-disabled -- -k test_disabled_force_rejects_commit_and_dry_run
+# Disallowed skip refusal (TR-REG-902).
+.venv/bin/python tools/scripts/run_e2e.py --suite types-registry --profile force-disabled -- -k test_a_disallowed_skip_is_refused_on_commit_and_dry_run
 
 # Legacy tests only.
 .venv/bin/python tools/scripts/run_e2e.py --suite types-registry -- -m "not scenario"

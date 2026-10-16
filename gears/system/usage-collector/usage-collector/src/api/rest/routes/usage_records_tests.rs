@@ -66,10 +66,11 @@ fn assert_standard_errors_registered(spec: &OperationSpec) {
 
 fn assert_authenticated_and_no_license(spec: &OperationSpec) {
     assert!(
-        spec.authenticated,
+        spec.auth == toolkit::api::RouteAuth::Authenticated,
         "operation `{}:{}` MUST be `.authenticated()` — \
          the foundation surface refuses anonymous callers",
-        spec.method, spec.path,
+        spec.method,
+        spec.path,
     );
     assert!(
         spec.license_requirement.is_none(),

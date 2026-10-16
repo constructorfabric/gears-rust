@@ -116,6 +116,7 @@ fn schema() -> Value {
 async fn admit(service: &RegistryService, key: &str, gts_id: &str, content: Value) {
     let accepted = service
         .submit(
+            common::caller(),
             &SubmitRequest {
                 idempotency_key: Some(key.to_owned()),
                 dry_run: false,
@@ -181,7 +182,7 @@ async fn metadata_only_reads_fetch_no_document(h: &Harness, backend: &str) {
         h.recorder.clear();
         let results = h
             .service
-            .batch_get(&keys, selection)
+            .batch_get(common::caller(), &keys, selection)
             .await
             .expect("batch read");
         assert!(
@@ -200,7 +201,7 @@ async fn metadata_only_reads_fetch_no_document(h: &Harness, backend: &str) {
 
     h.recorder.clear();
     h.service
-        .entity(&keys[0].key, FieldSelection::default())
+        .entity(common::caller(), &keys[0].key, FieldSelection::default())
         .await
         .expect("exact read")
         .expect("found");
@@ -218,7 +219,7 @@ async fn selected_documents_are_fetched_and_only_they(h: &Harness, backend: &str
     h.recorder.clear();
     let results = h
         .service
-        .batch_get(&keys, select(&["content"]))
+        .batch_get(common::caller(), &keys, select(&["content"]))
         .await
         .expect("batch read");
     let statements = assert_read_shape(&h.recorder, backend, "content batch");
@@ -244,7 +245,7 @@ async fn selected_documents_are_fetched_and_only_they(h: &Harness, backend: &str
     h.recorder.clear();
     let results = h
         .service
-        .batch_get(&keys, select(&["effective_traits"]))
+        .batch_get(common::caller(), &keys, select(&["effective_traits"]))
         .await
         .expect("batch read");
     let statements = assert_read_shape(&h.recorder, backend, "traits batch");
@@ -291,7 +292,7 @@ async fn absent_columns_read_as_none_and_selected_ones_as_some(h: &Harness, back
             && light[0].resolved_schema.is_none()
             && light[0].effective_traits.is_none()
             && light[0].effective_traits_schema.is_none()
-            && light[0].provenance.is_none(),
+            && light[0].compat_forced.is_none(),
         "absent columns must read as None on {backend}: {:?}",
         light[0],
     );
@@ -307,8 +308,7 @@ async fn absent_columns_read_as_none_and_selected_ones_as_some(h: &Harness, back
         "selected columns must read as Some on {backend}: {:?}",
         full[0],
     );
-    let provenance = full[0].provenance.as_ref().expect("schema provenance");
-    assert_eq!(provenance.compat_forced, Some(false), "{backend}");
+    assert_eq!(full[0].compat_forced, Some(false), "{backend}");
 
     let instance =
         InstanceRepo::read_current(&conn, &scope, &[instance_id], FieldSelection::full())
@@ -319,12 +319,8 @@ async fn absent_columns_read_as_none_and_selected_ones_as_some(h: &Harness, back
         Some(r#"{"name":"first"}"#),
         "{backend}"
     );
-    let provenance = instance[0]
-        .provenance
-        .as_ref()
-        .expect("instance provenance");
     assert_eq!(
-        provenance.compat_forced, None,
+        instance[0].compat_forced, None,
         "an Instance has none, on {backend}"
     );
     let light =
@@ -332,7 +328,7 @@ async fn absent_columns_read_as_none_and_selected_ones_as_some(h: &Harness, back
             .await
             .expect("light instance read");
     assert!(
-        light[0].content.is_none() && light[0].provenance.is_none(),
+        light[0].content.is_none() && light[0].compat_forced.is_none(),
         "{backend}"
     );
 }
@@ -345,10 +341,13 @@ async fn discovery_fetches_only_selected_documents(h: &Harness, backend: &str) {
         h.recorder.clear();
         let page = h
             .service
-            .discover(&DiscoveryQuery {
-                selection,
-                ..DiscoveryQuery::default()
-            })
+            .discover(
+                common::caller(),
+                &DiscoveryQuery {
+                    selection,
+                    ..DiscoveryQuery::default()
+                },
+            )
             .await
             .expect("discovery");
         assert_eq!(page.items.len(), 2, "{backend}");
@@ -386,6 +385,7 @@ async fn non_canonical_keys_are_absent_without_sql(h: &Harness, backend: &str) {
         let batch = h
             .service
             .batch_get(
+                common::caller(),
                 &[EntityKey::GtsId(TYPE.to_owned()).into(), key.clone().into()],
                 FieldSelection::default(),
             )
@@ -401,7 +401,7 @@ async fn non_canonical_keys_are_absent_without_sql(h: &Harness, backend: &str) {
         h.recorder.clear();
         let exact = h
             .service
-            .entity(&key, FieldSelection::default())
+            .entity(common::caller(), &key, FieldSelection::default())
             .await
             .unwrap_or_else(|e| panic!("exact read of {key:?} on {backend}: {e}"));
         assert!(exact.is_none(), "{key:?} on {backend}: {exact:?}");
@@ -416,10 +416,13 @@ async fn an_over_long_key_is_refused_by_the_service(h: &Harness, backend: &str) 
     let selection = FieldSelection::default();
     for result in [
         h.service
-            .batch_get(&[over.clone().into()], selection)
+            .batch_get(common::caller(), &[over.clone().into()], selection)
             .await
             .map(drop),
-        h.service.entity(&over, selection).await.map(drop),
+        h.service
+            .entity(common::caller(), &over, selection)
+            .await
+            .map(drop),
     ] {
         assert!(
             matches!(result, Err(ServiceError::KeyTooLong { len }) if len == MAX_KEY_LEN + 1),
@@ -434,7 +437,7 @@ async fn an_unchanged_key_fetches_no_document(h: &Harness, backend: &str) {
     let key = EntityKey::GtsId(TYPE.to_owned());
     let EntityLookup::Found { etag, .. } = h
         .service
-        .lookup(&key, content, None)
+        .lookup(common::caller(), &key, content, None)
         .await
         .expect("exact read")
     else {
@@ -444,7 +447,7 @@ async fn an_unchanged_key_fetches_no_document(h: &Harness, backend: &str) {
     let condition = IfNoneMatch::Validators(vec![etag.encode()]);
     let lookup = h
         .service
-        .lookup(&key, content, Some(condition))
+        .lookup(common::caller(), &key, content, Some(condition))
         .await
         .expect("conditional read");
     assert!(
@@ -466,7 +469,11 @@ async fn an_over_long_validator_is_refused_by_the_service(h: &Harness, backend: 
     };
     let result = h
         .service
-        .batch_get(&[item(MAX_KEY_LEN + 1)], FieldSelection::default())
+        .batch_get(
+            common::caller(),
+            &[item(MAX_KEY_LEN + 1)],
+            FieldSelection::default(),
+        )
         .await;
     assert!(
         matches!(result, Err(ServiceError::ValidatorTooLong { len }) if len == MAX_KEY_LEN + 1),
@@ -474,7 +481,11 @@ async fn an_over_long_validator_is_refused_by_the_service(h: &Harness, backend: 
     );
     let at_bound = h
         .service
-        .batch_get(&[item(MAX_KEY_LEN)], FieldSelection::default())
+        .batch_get(
+            common::caller(),
+            &[item(MAX_KEY_LEN)],
+            FieldSelection::default(),
+        )
         .await
         .expect("a validator at the bound is read");
     assert!(

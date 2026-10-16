@@ -11,3 +11,46 @@ config_gears:
   - oagw
   - credstore
   - static-credstore-plugin
+profiles:
+  # OAGW on SQLite instead of in memory, with one upstream and two routes
+  # provisioned from the types registry. The section 19 tests run only here,
+  # keyed on OAGW_E2E_PROFILE. Run: `make e2e-oagw-sqlite`.
+  sqlite:
+    config_overrides:
+      gears:
+        oagw:
+          database:
+            server: sqlite_users
+            file: oagw.db
+        types-registry:
+          config:
+            entities:
+              # The IDs and alias are mirrored in test_configuration_storage.py.
+              - $id: "gts.cf.core.oagw.upstream.v1~5e0a1900-0000-4000-8000-000000000001"
+                alias: "e2e-registry-upstream"
+                server:
+                  endpoints:
+                    - host: "127.0.0.1"
+                      port: 19876
+                      scheme: "http"
+                protocol: "gts.cf.core.oagw.protocol.v1~cf.core.oagw.http.v1"
+                tags: ["e2e-registry"]
+              # `enabled` and `priority` are left to their defaults.
+              - $id: "gts.cf.core.oagw.route.v1~5e0a1900-0000-4000-8000-000000000002"
+                upstream_id: "gts.cf.core.oagw.upstream.v1~5e0a1900-0000-4000-8000-000000000001"
+                match:
+                  http:
+                    methods: ["GET"]
+                    path: "/v1/models"
+                tags: ["e2e-registry"]
+              # Names its upstream by bare UUID instead of GTS identifier.
+              - $id: "gts.cf.core.oagw.route.v1~5e0a1900-0000-4000-8000-000000000003"
+                upstream_id: "5e0a1900-0000-4000-8000-000000000001"
+                match:
+                  http:
+                    methods: ["GET"]
+                    path: "/v1/bare-uuid"
+    env:
+      OAGW_E2E_PROFILE: "sqlite"
+      # Where 19.1 reads the stored rows; set it when `home_dir` moves.
+      OAGW_E2E_DB: "~/.cf-gears/oagw/oagw.db"

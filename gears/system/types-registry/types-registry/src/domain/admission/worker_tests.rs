@@ -148,7 +148,7 @@ fn an_unknown_stored_reason_is_preserved_but_counts_under_other() {
         AdmissionFailureReason::Unknown("future_refusal".to_owned()),
     );
     assert_eq!(reason_label(&failure.reason), "other");
-    assert_eq!(failure.reason.as_str(), "future_refusal");
+    assert_eq!(failure.reason.as_wire(), "future_refusal");
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(&failure.to_payload().expect("encode"))
             .expect("JSON"),

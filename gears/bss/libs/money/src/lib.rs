@@ -15,7 +15,7 @@
 //!   proportional shares with a deterministic residual.
 //! - `serde` (feature): [`serde_text`], a `#[serde(with)]` adapter for canonical text.
 //! - [`iso_scale`]: the one ISO 4217 table of minor-unit scales for the active currency
-//!   codes. An ISO code always takes this scale. A gear's registry, provisioning or config
+//!   codes; [`iso_codes`] returns the whole list. An ISO code always takes this scale. A gear's registry, provisioning or config
 //!   row serves only a code for which [`iso_scale`] gives `None`, and never overrides an ISO
 //!   scale. A code that has neither has no implicit scale.
 
@@ -29,7 +29,7 @@ pub mod exact;
 #[cfg(feature = "serde")]
 pub mod serde_text;
 
-pub use iso::iso_scale;
+pub use iso::{iso_codes, iso_scale};
 pub use money::{
     CurrencySpec, MoneyError, PostedMoney, canonical_decimal, parse_decimal, validate_amount,
 };

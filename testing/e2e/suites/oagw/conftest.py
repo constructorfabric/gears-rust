@@ -3,6 +3,7 @@ import asyncio
 import os
 import re
 import threading
+import time
 from collections import defaultdict
 from pathlib import Path
 
@@ -173,6 +174,55 @@ def pytest_terminal_summary(terminalreporter, config):
 # ---------------------------------------------------------------------------
 # Environment-driven fixtures
 # ---------------------------------------------------------------------------
+
+REGISTRY_WAIT_SECS = 60
+
+
+@pytest.fixture(scope="session", autouse=True)
+def registry_provisioned():
+    """On the sqlite profile, wait until the registry rows exist.
+
+    With a database, OAGW reconciles the types-registry instances in a
+    background task once it serves (ADR-0018), so ``/healthz`` can answer
+    before the first run has written them. Poll the Management API for every
+    registry instance of the profile (``e2e.yaml``); fail with the last answer
+    after ``REGISTRY_WAIT_SECS``. Other profiles provision synchronously.
+    """
+    if os.getenv("OAGW_E2E_PROFILE") != "sqlite":
+        return
+    from .helpers import BARE_UUID_ROUTE_ID, REGISTRY_ROUTE_ID, REGISTRY_UPSTREAM_ID
+
+    base_url = os.getenv("E2E_OAGW_BASE_URL", "http://localhost:8086")
+    token = os.getenv("E2E_AUTH_TOKEN", "e2e-token-tenant-a")
+    headers = {"Authorization": f"Bearer {token}"}
+    urls = [
+        f"{base_url}/oagw/v1/upstreams/{REGISTRY_UPSTREAM_ID}",
+        f"{base_url}/oagw/v1/routes/{REGISTRY_ROUTE_ID}",
+        f"{base_url}/oagw/v1/routes/{BARE_UUID_ROUTE_ID}",
+    ]
+    deadline = time.monotonic() + REGISTRY_WAIT_SECS
+    last = "no response"
+    with httpx.Client(timeout=5.0) as client:
+        while True:
+            pending = []
+            for url in urls:
+                try:
+                    resp = client.get(url, headers=headers)
+                except httpx.HTTPError as e:
+                    pending.append(url)
+                    last = f"{url}: {e}"
+                    continue
+                if resp.status_code != 200:
+                    pending.append(url)
+                    last = f"{url}: {resp.status_code} {resp.text[:200]}"
+            if not pending:
+                return
+            if time.monotonic() > deadline:
+                pytest.fail(
+                    f"registry rows not provisioned within {REGISTRY_WAIT_SECS}s; last: {last}"
+                )
+            time.sleep(0.5)
+
 
 @pytest.fixture
 def oagw_base_url():

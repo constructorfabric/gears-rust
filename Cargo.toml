@@ -92,6 +92,8 @@ members = [
     "libs/system-sdks/sdks/directory",
     "gears/credstore/credstore-sdk",
     "gears/credstore/credstore",
+    "gears/credstore/v2/credstore-sdk",
+    "gears/credstore/v2/credstore",
     "gears/credstore/plugins/static-credstore-plugin",
     "gears/graph-storage/graph-storage-sdk",
     "gears/graph-storage/graph-storage",
@@ -574,7 +576,7 @@ hyper-rustls = { version = "0.27", default-features = false, features = [
     "native-tokio",
     "webpki-tokio",
 ] }
-rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
+rustls = { version = "0.23.46", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
 rustls-native-certs = "0.8"
 rustls-pki-types = "1"
 tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs"] }
@@ -743,6 +745,10 @@ percent-encoding = "2"
 
 # Regex for env expansion
 regex = "1.10"
+
+# SemVer parsing and precedence for publisher versions (`types-registry-sdk`).
+# Already in the tree through `rustc_version` / `cargo_metadata`.
+semver = "1.0"
 
 # CLI and terminal output
 glob = "0.3"

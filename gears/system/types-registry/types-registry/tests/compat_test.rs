@@ -29,9 +29,11 @@ use types_registry::domain::admission::{
 };
 use types_registry::domain::enums as domain_enums;
 use types_registry::domain::policy::RegistrationPolicy;
+use types_registry::domain::selection::FieldSelection;
 use types_registry::infra::storage::entity::{
     entity, instance_revision, operation_item, type_schema_revision,
 };
+use types_registry::infra::storage::repo::TypeSchemaRepo;
 
 mod common;
 use common::{allow_all, stores, test_db};
@@ -285,6 +287,32 @@ async fn revisions(db: &Arc<DBProvider<DbError>>) -> Vec<(String, i32, bool)> {
     rows
 }
 
+/// What the read port answers for `provenance.compatibility_check_skipped`, per identifier: the
+/// stored `compat_forced`, read back rather than recomputed.
+async fn read_waivers(db: &Arc<DBProvider<DbError>>) -> Vec<(String, Option<bool>)> {
+    let conn = db.conn().expect("conn");
+    let entities: HashMap<i64, String> = entity::Entity::find()
+        .secure()
+        .scope_with(&allow_all())
+        .all(&conn)
+        .await
+        .expect("entities")
+        .into_iter()
+        .map(|e| (e.id, e.gts_id))
+        .collect();
+    let ids: Vec<i64> = entities.keys().copied().collect();
+    let selection = FieldSelection::parse(&["provenance"]).expect("valid");
+    let mut rows: Vec<(String, Option<bool>)> =
+        TypeSchemaRepo::read_current(&conn, &allow_all(), &ids, selection)
+            .await
+            .expect("projected read")
+            .into_iter()
+            .map(|row| (entities[&row.entity_id].clone(), row.compat_forced))
+            .collect();
+    rows.sort_unstable();
+    rows
+}
+
 /// The item's status, and the machine reason when it was refused.
 fn outcome_of(
     outcome: &OperationOutcome,
@@ -525,6 +553,15 @@ async fn force_waives_the_cross_minor_check_and_is_recorded_on_the_revision() {
         ],
         "only the forced candidate's revision carries the waiver; the two unforced \
          ones must not be tainted by it",
+    );
+    assert_eq!(
+        read_waivers(&db).await,
+        vec![
+            (V2_0.to_owned(), Some(false)),
+            (V2_1.to_owned(), Some(false)),
+            (V2_2.to_owned(), Some(true)),
+        ],
+        "the read contract reports the stored waiver",
     );
 }
 

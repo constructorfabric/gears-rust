@@ -84,9 +84,9 @@ fn the_pre_existing_keys_are_retained() {
 
 /// The four `local_client.cache.*` keys stay live in P0 — the cache is kept
 /// (SPEC §8.3) and its reshaping into `freshness_window` / `store_bound` belongs
-/// to T30. Asserted so that reshaping is a deliberate change and not a silent one.
+/// to T36. Asserted so that reshaping is a deliberate change and not a silent one.
 #[test]
-fn the_cache_keys_are_still_the_pre_t30_shape() {
+fn the_cache_keys_are_still_the_pre_sdk_cache_shape() {
     let cfg = parse(json!({
         "local_client": {
             "cache": {

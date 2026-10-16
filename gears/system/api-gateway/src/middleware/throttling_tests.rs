@@ -23,9 +23,14 @@ fn op(method: Method, path: &str, throttling: Option<ThrottlingSpec>) -> Operati
         responses: vec![],
         handler_id: "test".to_owned(),
         // Identity zones need an authenticated operation; IP zones do not care.
-        authenticated: throttling
+        auth: if throttling
             .as_ref()
-            .is_some_and(|t| t.require_security_context),
+            .is_some_and(|t| t.require_security_context)
+        {
+            toolkit::api::RouteAuth::Authenticated
+        } else {
+            toolkit::api::RouteAuth::Anonymous
+        },
         exposed: true,
         throttling,
         allowed_request_content_types: None,
@@ -254,10 +259,13 @@ fn client_ip_trusted_proxy_falls_back_when_xff_short_or_invalid() {
 fn compute_key_identity_requires_security_context() {
     // No SecurityContext present → None (invariant violation, not "anonymous").
     let req = Request::builder().body(Body::empty()).unwrap();
-    assert_eq!(compute_key(KeyType::Identity, &req, 0), None);
+    assert_eq!(
+        compute_key(KeyType::Identity, RouteAuth::Authenticated, &req, 0),
+        None
+    );
     // IP keys never depend on a context.
     assert_eq!(
-        compute_key(KeyType::Ip, &req, 0).as_deref(),
+        compute_key(KeyType::Ip, RouteAuth::Authenticated, &req, 0).as_deref(),
         Some("unknown")
     );
 }
@@ -272,7 +280,7 @@ fn compute_key_identity_returns_subject_id() {
     let mut req = Request::builder().body(Body::empty()).unwrap();
     req.extensions_mut().insert(sc);
     assert_eq!(
-        compute_key(KeyType::Identity, &req, 0),
+        compute_key(KeyType::Identity, RouteAuth::Authenticated, &req, 0),
         Some("00000000-0000-0000-0000-00000000002a".to_owned())
     );
 }
@@ -281,7 +289,7 @@ fn compute_key_identity_returns_subject_id() {
 fn identity_zone_rejects_anonymous_operation_and_auth_disabled() {
     let mut cfg = cfg_with_rate("id", rate_zone_cfg(10, 10, KeyType::Identity));
     let mut anon = op(Method::GET, "/x", Some(thr("id", "", true)));
-    anon.authenticated = false;
+    anon.auth = toolkit::api::RouteAuth::Anonymous;
     let err = ThrottlingMap::from_specs(&[anon], &cfg)
         .err()
         .expect("should error")
@@ -936,4 +944,388 @@ async fn dry_run_in_flight_does_not_grow_gates_past_max_keys() {
 
     assert_eq!(inflight_zone.keys.len(), 1);
     assert_eq!(inflight_zone.tracked.load(Ordering::Relaxed), 1);
+}
+
+fn k8s(namespace: &str, service_account: &str, pod: Option<&str>) -> PlatformIdentity {
+    PlatformIdentity::KubernetesServiceAccount {
+        namespace: namespace.to_owned(),
+        service_account: service_account.to_owned(),
+        pod: pod.map(str::to_owned),
+    }
+}
+
+fn spiffe(trust_domain: &str, name: &str, version: &str) -> PlatformIdentity {
+    PlatformIdentity::Spiffe {
+        trust_domain: trust_domain.to_owned(),
+        name: name.to_owned(),
+        version: version.to_owned(),
+    }
+}
+
+fn tenant_context() -> SecurityContext {
+    SecurityContext::builder()
+        .subject_id(uuid::Uuid::from_u128(42))
+        .subject_tenant_id(uuid::Uuid::from_u128(1))
+        .build()
+        .unwrap()
+}
+
+fn platform_op(throttling: ThrottlingSpec) -> OperationSpec {
+    let mut spec = op(Method::GET, "/p", Some(throttling));
+    spec.auth = RouteAuth::Platform;
+    spec
+}
+
+/// Serve `/p` behind the post-auth throttling map built from `cfg`.
+fn platform_app(spec: OperationSpec, cfg: &ApiGatewayConfig) -> Router {
+    let map = ThrottlingMap::from_specs(&[spec], cfg).unwrap();
+    Router::new()
+        .route("/p", get(|| async { "ok" }))
+        .layer(axum::middleware::from_fn(
+            move |req: Request, next: Next| {
+                let map = map.clone();
+                async move { throttling_middleware(map, req, next).await }
+            },
+        ))
+}
+
+fn platform_request(identity: Option<PlatformIdentity>) -> Request {
+    let mut req = Request::builder().uri("/p").body(Body::empty()).unwrap();
+    if let Some(identity) = identity {
+        req.extensions_mut()
+            .insert(PlatformSecurityContext::new(identity));
+    }
+    req
+}
+
+#[test]
+fn platform_key_names_the_workload_not_the_instance() {
+    let key = platform_key(&k8s("ns", "sa", Some("pod-1")));
+    assert_eq!(key.as_deref(), Some("platform:k8s:ns/sa"));
+    assert_eq!(platform_key(&k8s("ns", "sa", Some("pod-2"))), key);
+    assert_eq!(platform_key(&k8s("ns", "sa", None)), key);
+    assert_ne!(platform_key(&k8s("other", "sa", None)), key);
+    assert_ne!(platform_key(&k8s("ns", "other", None)), key);
+
+    let key = platform_key(&spiffe("example.org", "gear", "1.0.0"));
+    assert_eq!(key.as_deref(), Some("platform:spiffe:example.org/gear"));
+    assert_eq!(platform_key(&spiffe("example.org", "gear", "1.1.0")), key);
+    assert_ne!(platform_key(&spiffe("other.org", "gear", "1.0.0")), key);
+
+    assert_eq!(
+        platform_key(&PlatformIdentity::Shared {
+            name: "worker".to_owned()
+        })
+        .as_deref(),
+        Some("platform:shared:worker")
+    );
+}
+
+#[test]
+fn platform_key_encodes_components_unambiguously() {
+    assert_eq!(
+        platform_key(&k8s("a", "b/c", None)).as_deref(),
+        Some("platform:k8s:a/b%2Fc")
+    );
+    assert_eq!(
+        platform_key(&k8s("a/b", "c", None)).as_deref(),
+        Some("platform:k8s:a%2Fb/c")
+    );
+    // `%` is escaped first, so a literal `%2F` cannot pass for an encoded `/`.
+    assert_ne!(
+        platform_key(&k8s("a%2Fb", "c", None)),
+        platform_key(&k8s("a/b", "c", None))
+    );
+    assert_eq!(
+        platform_key(&PlatformIdentity::Shared {
+            name: "x/y%z".to_owned()
+        })
+        .as_deref(),
+        Some("platform:shared:x%2Fy%25z")
+    );
+}
+
+#[test]
+fn platform_key_refuses_identities_that_name_no_caller() {
+    assert_eq!(platform_key(&PlatformIdentity::OutboundMarker), None);
+    assert_eq!(platform_key(&PlatformIdentity::Unknown), None);
+}
+
+#[test]
+fn compute_key_reads_only_the_operation_plane() {
+    let identity = |auth| move |req: &Request| compute_key(KeyType::Identity, auth, req, 0);
+
+    // Platform route: only the platform context counts.
+    let mut req = platform_request(Some(k8s("ns", "sa", None)));
+    assert_eq!(
+        identity(RouteAuth::Platform)(&req).as_deref(),
+        Some("platform:k8s:ns/sa")
+    );
+    req.extensions_mut().insert(tenant_context());
+    assert_eq!(
+        identity(RouteAuth::Platform)(&req).as_deref(),
+        Some("platform:k8s:ns/sa")
+    );
+    let mut tenant_only = platform_request(None);
+    tenant_only.extensions_mut().insert(tenant_context());
+    assert_eq!(identity(RouteAuth::Platform)(&tenant_only), None);
+    assert_eq!(
+        identity(RouteAuth::Platform)(&platform_request(Some(PlatformIdentity::OutboundMarker))),
+        None
+    );
+
+    // Tenant route: a platform context never stands in for the subject.
+    assert_eq!(
+        identity(RouteAuth::Authenticated)(&platform_request(Some(k8s("ns", "sa", None)))),
+        None
+    );
+    assert_eq!(
+        identity(RouteAuth::Authenticated)(&req).as_deref(),
+        Some("00000000-0000-0000-0000-00000000002a")
+    );
+
+    // Anonymous: rejected at startup, and never keyed on whatever context is present.
+    assert_eq!(identity(RouteAuth::Anonymous)(&req), None);
+}
+
+#[test]
+fn identity_zones_build_on_platform_operations_even_with_auth_disabled() {
+    let mut cfg = cfg_with_rate("id", rate_zone_cfg(10, 10, KeyType::Identity));
+    cfg.in_flight_limit_zones.insert(
+        "ifl".to_owned(),
+        inflight_zone_cfg(1, KeyType::Identity, vec![]),
+    );
+    let platform = platform_op(thr("id", "ifl", true));
+    assert!(ThrottlingMap::from_specs(std::slice::from_ref(&platform), &cfg).is_ok());
+
+    // The platform plane still validates its caller with auth disabled; only
+    // the tenant identity collapses to the default subject.
+    cfg.auth_disabled = true;
+    assert!(ThrottlingMap::from_specs(&[platform], &cfg).is_ok());
+    let tenant = op(Method::GET, "/t", Some(thr("id", "ifl", true)));
+    let err = ThrottlingMap::from_specs(&[tenant], &cfg)
+        .err()
+        .expect("tenant identity zone should error")
+        .to_string();
+    assert!(err.contains("auth_disabled=true"), "{err}");
+}
+
+#[test]
+fn identity_zone_may_be_shared_by_tenant_and_platform_operations() {
+    let cfg = cfg_with_rate("id", rate_zone_cfg(10, 10, KeyType::Identity));
+    let specs = vec![
+        op(Method::GET, "/t", Some(thr("id", "", true))),
+        platform_op(thr("id", "", true)),
+    ];
+    let (map, _, _) = build_maps(&specs, &cfg).unwrap();
+    let tenant = map
+        .inner
+        .routes
+        .get(&(Method::GET, "/t".to_owned()))
+        .unwrap();
+    let platform = map
+        .inner
+        .routes
+        .get(&(Method::GET, "/p".to_owned()))
+        .unwrap();
+    assert_eq!(tenant.auth, RouteAuth::Authenticated);
+    assert_eq!(platform.auth, RouteAuth::Platform);
+    assert!(Arc::ptr_eq(
+        tenant.rate_zone.as_ref().unwrap(),
+        platform.rate_zone.as_ref().unwrap()
+    ));
+}
+
+#[tokio::test]
+async fn platform_rate_limit_is_shared_by_workload_replicas() {
+    let cfg = cfg_with_rate("id", rate_zone_cfg(1, 1, KeyType::Identity));
+    let app = platform_app(platform_op(thr("id", "", true)), &cfg);
+
+    let send = |identity| app.clone().oneshot(platform_request(Some(identity)));
+    assert_eq!(
+        send(k8s("ns", "sa", Some("pod-1"))).await.unwrap().status(),
+        StatusCode::OK
+    );
+    let replica = send(k8s("ns", "sa", Some("pod-2"))).await.unwrap();
+    assert_eq!(replica.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert!(replica.headers().contains_key(header::RETRY_AFTER));
+    assert_eq!(
+        send(k8s("ns", "other", Some("pod-1")))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn platform_inflight_excluded_key_bypasses_limit() {
+    let mut cfg = ApiGatewayConfig::default();
+    cfg.in_flight_limit_zones.insert(
+        "ifl".to_owned(),
+        inflight_zone_cfg(1, KeyType::Identity, vec!["platform:k8s:ns/sa".to_owned()]),
+    );
+    let map = ThrottlingMap::from_specs(&[platform_op(thr("", "ifl", true))], &cfg).unwrap();
+    let zone = Arc::clone(
+        map.inner.routes[&(Method::GET, "/p".to_owned())]
+            .inflight_zone
+            .as_ref()
+            .unwrap(),
+    );
+    let app = Router::new()
+        .route("/p", get(|| async { "ok" }))
+        .layer(axum::middleware::from_fn(
+            move |req: Request, next: Next| {
+                let map = map.clone();
+                async move { throttling_middleware(map, req, next).await }
+            },
+        ));
+
+    let resp = app
+        .clone()
+        .oneshot(platform_request(Some(k8s("ns", "sa", Some("pod-1")))))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(zone.keys.len(), 0, "an excluded key never gets a gate");
+
+    // Hold the only slot of a non-excluded workload: its next request is refused.
+    let _held = zone
+        .gate("platform:k8s:ns/other")
+        .unwrap()
+        .try_acquire()
+        .unwrap();
+    let resp = app
+        .oneshot(platform_request(Some(k8s("ns", "other", Some("pod-1")))))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test]
+async fn tenant_inflight_excluded_raw_uuid_still_bypasses_limit() {
+    let subject = tenant_context().subject_id().to_string();
+    let mut cfg = ApiGatewayConfig::default();
+    cfg.in_flight_limit_zones.insert(
+        "ifl".to_owned(),
+        inflight_zone_cfg(1, KeyType::Identity, vec![subject.clone()]),
+    );
+    let map = ThrottlingMap::from_specs(&[op(Method::GET, "/t", Some(thr("", "ifl", true)))], &cfg)
+        .unwrap();
+    let zone = Arc::clone(
+        map.inner.routes[&(Method::GET, "/t".to_owned())]
+            .inflight_zone
+            .as_ref()
+            .unwrap(),
+    );
+    // Even a held slot under the subject's key cannot refuse an excluded key.
+    let _held = zone.gate(&subject).unwrap().try_acquire().unwrap();
+    let app = Router::new()
+        .route("/t", get(|| async { "ok" }))
+        .layer(axum::middleware::from_fn(
+            move |req: Request, next: Next| {
+                let map = map.clone();
+                async move { throttling_middleware(map, req, next).await }
+            },
+        ));
+    let mut req = Request::builder().uri("/t").body(Body::empty()).unwrap();
+    req.extensions_mut().insert(tenant_context());
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn shared_zone_keeps_tenant_and_platform_buckets_apart() {
+    // A platform caller named like a tenant subject still gets its own bucket.
+    let cfg = cfg_with_rate("id", rate_zone_cfg(1, 1, KeyType::Identity));
+    let specs = vec![
+        op(Method::GET, "/t", Some(thr("id", "", true))),
+        platform_op(thr("id", "", true)),
+    ];
+    let (map, _, _) = build_maps(&specs, &cfg).unwrap();
+    let app = Router::new()
+        .route("/t", get(|| async { "ok" }))
+        .route("/p", get(|| async { "ok" }))
+        .layer(axum::middleware::from_fn(
+            move |req: Request, next: Next| {
+                let map = map.clone();
+                async move { throttling_middleware(map, req, next).await }
+            },
+        ));
+    let tenant = || {
+        let mut req = Request::builder().uri("/t").body(Body::empty()).unwrap();
+        req.extensions_mut().insert(tenant_context());
+        req
+    };
+    let impostor = || {
+        platform_request(Some(PlatformIdentity::Shared {
+            name: tenant_context().subject_id().to_string(),
+        }))
+    };
+
+    assert_eq!(
+        app.clone().oneshot(tenant()).await.unwrap().status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        app.clone().oneshot(impostor()).await.unwrap().status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        app.clone().oneshot(tenant()).await.unwrap().status(),
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    assert_eq!(
+        app.oneshot(impostor()).await.unwrap().status(),
+        StatusCode::TOO_MANY_REQUESTS
+    );
+}
+
+#[tokio::test]
+async fn dry_run_platform_rate_limit_serves_over_burst() {
+    let cfg = cfg_with_rate("id", rate_zone_cfg(1, 1, KeyType::Identity));
+    let mut spec = thr("id", "", true);
+    spec.dry_run = true;
+    let app = platform_app(platform_op(spec), &cfg);
+
+    for _ in 0..2 {
+        let resp = app
+            .clone()
+            .oneshot(platform_request(Some(k8s("ns", "sa", None))))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "dry-run always serves");
+    }
+}
+
+#[tokio::test]
+async fn platform_zone_without_keyable_identity_is_internal_error_even_in_dry_run() {
+    let mut cfg = cfg_with_rate("id", rate_zone_cfg(10, 10, KeyType::Identity));
+    cfg.in_flight_limit_zones.insert(
+        "ifl".to_owned(),
+        inflight_zone_cfg(1, KeyType::Identity, vec![]),
+    );
+    for (rate, inflight) in [("id", ""), ("", "ifl")] {
+        for dry_run in [false, true] {
+            let mut spec = thr(rate, inflight, true);
+            spec.dry_run = dry_run;
+            let app = platform_app(platform_op(spec), &cfg);
+
+            let mut tenant_only = platform_request(None);
+            tenant_only.extensions_mut().insert(tenant_context());
+            for req in [
+                platform_request(None),
+                tenant_only,
+                platform_request(Some(PlatformIdentity::OutboundMarker)),
+                platform_request(Some(PlatformIdentity::Unknown)),
+            ] {
+                let resp = app.clone().oneshot(req).await.unwrap();
+                assert_eq!(
+                    resp.status(),
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "rate={rate:?} inflight={inflight:?} dry_run={dry_run}"
+                );
+            }
+        }
+    }
 }

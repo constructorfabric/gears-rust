@@ -498,11 +498,8 @@ components:
     CredentialDto:
       description: 'Response body for both `GET /credstore/v1/credentials/{ref}` and each item
 
-        of `GET /credstore/v1/credentials` (ADR-0004 Amendment A, "Why one item
-
-        shape, and why writes do not follow `$select`"): one shape for both
-
-        addresses. `secret` is populated only when `$select` names it (point
+        of `GET /credstore/v1/credentials` (ADR-0004, "Read actions follow the
+        projection"): one shape for both addresses. `secret` is populated only when `$select` names it (point
 
         read or collection read), and only for an item the caller may
 
@@ -584,7 +581,7 @@ components:
       type: object
     CredentialPatchDto:
       additionalProperties: false
-      description: 'Request body for `PATCH /credstore/v1/credentials/{ref}` (ADR-0004): an
+      description: 'Request body for `PATCH /credstore/v1/credentials/{ref}` (ADR-0007): an
 
         RFC 7396 JSON Merge Patch. Every field is tri-state (`Option<Option<T>>`):
 
@@ -621,9 +618,7 @@ components:
           - 'null'
       type: object
     CredentialStatusDto:
-      description: 'The caller''s own-row status for the REST transport layer (ADR-0004, "Two
-
-        representations").'
+      description: 'The caller''s own-row status for the REST transport layer (ADR-0004).'
       enum:
       - none
       - declared
@@ -631,7 +626,7 @@ components:
       - expired
       type: string
     FallbackDto:
-      description: Suppression policy for the REST transport layer (ADR-0004, "Suppression").
+      description: Suppression policy for the REST transport layer (ADR-0008).
       enum:
       - inherit
       - none
@@ -639,7 +634,7 @@ components:
     InheritanceStatusDto:
       description: 'The effective-row inheritance status for the REST transport layer
 
-        (ADR-0004, "Two representations").'
+        (ADR-0004).'
       enum:
       - own
       - inherited
@@ -702,9 +697,9 @@ components:
       type: object
     PutCredentialRequestDto:
       additionalProperties: false
-      description: 'Request body for `PUT /credstore/v1/credentials/{ref}` (ADR-0004; tri-state
+      description: 'Request body for `PUT /credstore/v1/credentials/{ref}` (ADR-0007; tri-state
 
-        `secret` per Amendment B): a whole-credential replace. `secret` is
+        `secret`): a whole-credential replace. `secret` is
 
         tri-state (`Option<Option<String>>`, like [`CredentialPatchDto::secret`])
 
@@ -735,13 +730,13 @@ components:
 
             SECRET_REQUIRED` — but once present it is tri-state: a string writes a
 
-            value, an explicit `null` writes none (ADR-0004 Amendment B).'
+            value, an explicit `null` writes none (ADR-0007).'
           type:
           - string
           - 'null'
         sharing:
           $ref: '#/components/schemas/SharingModeDto'
-          description: Sharing mode — required (ADR-0004).
+          description: Sharing mode — required (ADR-0007).
         type:
           description: 'Full GTS type id. Required on create; on replace it must equal the
 

@@ -71,7 +71,7 @@ The architecture uses two domain traits within a single `oagw` crate:
 
 **1. Control Plane (`ControlPlaneService` trait)**
 
-- **Location**: Trait in `domain/services/mod.rs`, impl in `domain/services/management.rs`
+- **Location**: Trait in `domain/services/mod.rs`, impl in `domain/services/management/mod.rs`
 - **Responsibility**: Manage configuration data
 - **Functions**:
     - CRUD operations for upstreams and routes

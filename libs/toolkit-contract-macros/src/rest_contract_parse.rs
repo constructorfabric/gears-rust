@@ -301,7 +301,7 @@ fn parse_method(method: &TraitItemFn) -> syn::Result<RestMethodModel> {
     let mut stream_open_arg: Option<StreamOpen> = None;
     let mut server_manual = false;
     let mut exposed: Option<bool> = None;
-    let mut anonymous = false;
+    let mut anonymous: Option<Span> = None;
 
     for attr in &method.attrs {
         let path = attr.path();
@@ -367,7 +367,7 @@ fn parse_method(method: &TraitItemFn) -> syn::Result<RestMethodModel> {
             }
             exposed = Some(wants_exposed);
         } else if path.is_ident("anonymous") {
-            anonymous = true;
+            anonymous = Some(attr.span());
         }
     }
 
@@ -409,6 +409,20 @@ fn parse_method(method: &TraitItemFn) -> syn::Result<RestMethodModel> {
         }
     }
 
+    // Reject `#[anonymous]` on platform methods: it would remove the required internal-token gate.
+    if let Some(span) = anonymous
+        && params
+            .first()
+            .is_some_and(|first| crate::projection::is_platform_security_context_type(&first.ty))
+    {
+        return Err(syn::Error::new(
+            span,
+            "`#[anonymous]` cannot mark a platform-plane method: a \
+             `PlatformSecurityContext` method always requires a validated \
+             `X-ToolKit-Internal-Token` (cpt-cf-adr-two-plane-auth)",
+        ));
+    }
+
     // Both unary and streaming methods declare their return types as
     // `Result<T, E>`. For streaming methods the macro rewrites the emitted
     // signature to `Pin<Box<dyn Stream<Item = Result<T, E>>>>`.
@@ -444,7 +458,7 @@ fn parse_method(method: &TraitItemFn) -> syn::Result<RestMethodModel> {
         optional,
         server_manual,
         exposed,
-        anonymous,
+        anonymous: anonymous.is_some(),
     })
 }
 

@@ -7,11 +7,14 @@
 //! Sequence for one phase (mirrors
 //! [`crate::infra::payment::settlement_return::SettlementReturnService`] plus a
 //! dispute pre-read + the net cash-leg read):
-//! 1. **dedup short-circuit** — a replayed phase returns the prior entry BEFORE
-//!    the state-dependent transition guard (which would spuriously reject a
-//!    replayed `opened`).
-//! 2. **read the dispute** — out-of-txn, scoped. Drives the variant selection,
+//! 1. **read the dispute** — out-of-txn, scoped. Drives the variant selection,
 //!    the transition guard, and the out-of-order decision.
+//! 2. **dedup short-circuit** — a replayed phase returns the prior entry BEFORE
+//!    the state-dependent transition guard (which would refuse a replayed
+//!    phase: its first post already moved the dispute). It runs AFTER the
+//!    dispute read: when that read sees the dispute write of a post with the
+//!    same key, this lookup sees that post's `POSTED` dedup row (both commit in
+//!    one transaction).
 //! 3. **out-of-order** (`won`/`lost` with NO prior dispute row, §4.7) — durably
 //!    ENQUEUE the request on `ledger_pending_event_queue` (`flow = CHARGEBACK`,
 //!    `business_id = dispute_id:cycle:phase`) and return [`ChargebackOutcome::Queued`]
@@ -445,26 +448,38 @@ impl ChargebackService {
         scope: &AccessScope,
         req: ChargebackRequest,
     ) -> Result<ChargebackOutcome, DomainError> {
-        // 0. Early dedup short-circuit (BEFORE the dispute read + transition
-        //    guard), mirroring the allocate/credit short-circuit. The transition
-        //    guard below is state-dependent, so a replayed `opened` would
-        //    otherwise be spuriously rejected (its row is already `OPENED`). A
-        //    `POSTED` row returns the prior entry as a `Recorded` replay; a
-        //    `QUEUED` row (an out-of-order phase already enqueued) returns the
-        //    same `Queued` handle. Racy by nature (the authoritative dedup is the
-        //    engine's in-txn claim / the intake's `claim_queued`).
-        let business_id = req.business_id();
-        if let Some(outcome) = self.replay_short_circuit(scope, &req, &business_id).await? {
-            return Ok(outcome);
-        }
-
-        // 1. Read the dispute's current state (out-of-txn, scoped). Drives the
+        // 0. Read the dispute's current state (out-of-txn, scoped). Drives the
         //    variant selection + transition guard + the out-of-order decision.
         let existing = self
             .dispute_repo
             .read_dispute(scope, req.tenant_id, &req.dispute_id)
             .await
             .map_err(|e| DomainError::Internal(format!("read dispute: {e}")))?;
+
+        // 1. Dedup short-circuit (BEFORE the transition guard), mirroring the
+        //    allocate/credit short-circuit. The transition guard below is
+        //    state-dependent: a replayed phase finds the dispute already moved by
+        //    its first post (a replayed `opened` finds it `OPENED`, a replayed
+        //    `won`/`lost` finds it resolved), so the guard would refuse it. A
+        //    `POSTED` row returns the prior entry as a `Recorded` replay; a
+        //    `QUEUED` row (an out-of-order phase already enqueued) returns the
+        //    same `Queued` handle.
+        //
+        //    The lookup runs AFTER the dispute read. A post commits its dedup row
+        //    and its dispute write in one transaction, so when the read above
+        //    sees the dispute write of a post with this key, this lookup sees its
+        //    `POSTED` row. A lookup before the read misses a post that commits
+        //    between the two reads, and the guard then refuses this repeat as an
+        //    invalid transition instead of replaying it. Otherwise racy by nature
+        //    (the authoritative dedup is the engine's in-txn claim / the intake's
+        //    `claim_queued`). The later out-of-txn reads are not covered: a repeat
+        //    whose lookup runs before the first post commits, and whose refund
+        //    guard or cross-currency carry-forward reads after it, can still fail
+        //    there before it reaches the engine's claim.
+        let business_id = req.business_id();
+        if let Some(outcome) = self.replay_short_circuit(scope, &req, &business_id).await? {
+            return Ok(outcome);
+        }
 
         // 2. Out-of-order (§4.7): a `won`/`lost` whose dispute has NO prior row
         //    (no `opened` landed yet) MUST NOT post a partial outcome — enqueue it
@@ -643,10 +658,12 @@ impl ChargebackService {
     ///   return a [`ChargebackOutcome::Recorded`] replay.
     /// - `QUEUED` ⇒ an out-of-order phase already enqueued: read the queue row's
     ///   `queued_at` and return the same [`ChargebackOutcome::Queued`] handle.
-    /// - `CLAIMED` / absent ⇒ `None`: fall through to the dispute read.
+    /// - `CLAIMED` / absent ⇒ `None`: fall through to the transition guard.
     ///
     /// Runs out-of-txn (racy by nature); the authoritative dedup is the engine's
-    /// in-txn claim (inline) or the intake's `claim_queued`.
+    /// in-txn claim (inline) or the intake's `claim_queued`. Call it after the
+    /// dispute read that the transition guard checks, never before it (see
+    /// [`Self::record_inner`]).
     async fn replay_short_circuit(
         &self,
         scope: &AccessScope,

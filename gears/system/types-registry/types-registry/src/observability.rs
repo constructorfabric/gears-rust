@@ -16,6 +16,38 @@ const fn kind_label(kind: OperationKind) -> &'static str {
     }
 }
 
+/// An operation the registry has durably accepted, or found under the same key and request.
+///
+/// The bridge from a client whose acknowledgement was lost: the client knows the
+/// `Idempotency-Key` it sent, and this event pairs it with the operation. Only a key spelled
+/// exactly as a canonical hyphenated UUID — what the SDK generates — is logged; any other key
+/// may carry a caller's data, and reformatting one could merge distinct case-sensitive keys,
+/// so it is logged by kind and length only.
+pub fn operation_accepted(
+    operation_id: Uuid,
+    kind: OperationKind,
+    dry_run: bool,
+    items: usize,
+    replayed: bool,
+    idempotency_key: &str,
+) {
+    let uuid_key = Uuid::try_parse(idempotency_key)
+        .ok()
+        .filter(|uuid| uuid.hyphenated().to_string() == idempotency_key);
+    tracing::info!(
+        log_kind = "operation_accepted",
+        %operation_id,
+        kind = kind_label(kind),
+        dry_run,
+        items,
+        replayed,
+        idempotency_key = uuid_key.map(field::display),
+        idempotency_key_kind = if uuid_key.is_some() { "uuid" } else { "opaque" },
+        idempotency_key_len = idempotency_key.len(),
+        "types_registry accepted an operation"
+    );
+}
+
 /// The span covering one admission pass over one operation.
 #[must_use]
 pub fn operation_span(operation_id: Uuid) -> Span {

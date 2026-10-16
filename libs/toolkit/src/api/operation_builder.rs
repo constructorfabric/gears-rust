@@ -452,6 +452,12 @@ pub struct LicenseReqSpec {
     pub license_names: Vec<String>,
 }
 
+/// Name of the platform `OpenAPI` apiKey scheme.
+pub use super::openapi_registry::INTERNAL_TOKEN_SECURITY_SCHEME;
+
+/// Per-route credential requirement, shared with listeners and the gateway.
+pub use toolkit_security::RouteAuth;
+
 /// Simplified operation specification for the type-safe builder
 #[derive(Clone, Debug)]
 pub struct OperationSpec {
@@ -466,17 +472,14 @@ pub struct OperationSpec {
     pub responses: Vec<ResponseSpec>,
     /// Internal handler id; can be used by registry/generator to map a handler identity
     pub handler_id: String,
-    /// Auth axis: whether this operation requires a validated tenant JWT.
-    /// `true` = authenticated (bearer required); `false` = anonymous (a missing
-    /// bearer is allowed — a present bearer is still always re-validated).
-    /// Independent of [`exposed`](Self::exposed); maps 1:1 to the
-    /// `AnonymousRoute` marker in the `OoP` per-gear middleware (`!authenticated`).
-    pub authenticated: bool,
+    /// Auth axis: which credential this operation requires. Set by the builder's
+    /// `.authenticated()`, `.anonymous()` or `.platform_authenticated()`. Independent of
+    /// [`exposed`](Self::exposed).
+    pub auth: RouteAuth,
     /// Visibility axis: whether this route is registered in the gateway for
     /// external access (`true`) or is internal-only, reachable only via
     /// inter-gear communication (`false`). Defaults to `false` (internal).
-    /// Independent of [`authenticated`](Self::authenticated) — an exposed route
-    /// may still require a JWT.
+    /// Independent of [`auth`](Self::auth) — an exposed route may still require a JWT.
     pub exposed: bool,
     /// Optional zone-based throttling configuration for this operation.
     /// Binds the operation to gateway throttling zones and carries the
@@ -545,12 +548,14 @@ pub struct ThrottlingSpec {
     /// `None` when the operation has no in-flight limit.
     pub in_flight_limit_zone: Option<String>,
     /// Whether this operation's throttling must run after authentication
-    /// (so a `SecurityContext` / subject identity is available).
+    /// (so the identity validated by the operation's auth plane is available).
     ///
     /// - `false` (default): the operation is throttled *before* auth, using
     ///   IP-keyed zones only.
     /// - `true`: the operation is throttled *after* auth, allowing
-    ///   identity-keyed zones (keyed by the subject id or a custom extractor).
+    ///   identity-keyed zones: keyed by the tenant subject id on an
+    ///   `.authenticated()` operation, or by the calling workload on a
+    ///   `.platform_authenticated()` one.
     pub require_security_context: bool,
     /// Observe-but-don't-enforce mode.
     ///
@@ -737,7 +742,7 @@ impl<S> OperationBuilder<Missing, Missing, S, AuthNotSet> {
                 request_body: None,
                 responses: Vec::new(),
                 handler_id,
-                authenticated: false,
+                auth: RouteAuth::Anonymous,
                 exposed: false,
                 throttling: None,
                 allowed_request_content_types: None,
@@ -1169,13 +1174,8 @@ where
         self
     }
 
-    /// Mark this route as **publicly visible** — registered in the gateway for
-    /// external access (the *visibility* axis).
-    ///
-    /// This is independent of authentication (`.authenticated()` /
-    /// `.anonymous()`): an exposed route may still require a JWT. Routes are
-    /// **internal by default** (not registered in the gateway). Available at any
-    /// stage of the builder.
+    /// Expose the route through the gateway, independently of authentication. Internal by
+    /// default; callable at any stage. Platform auth suppresses exposure with a warning.
     pub fn exposed(mut self) -> Self {
         self.spec.exposed = true;
         self
@@ -1305,7 +1305,24 @@ where
     /// # }
     /// ```
     pub fn authenticated(mut self) -> OperationBuilder<H, R, S, AuthSet, L> {
-        self.spec.authenticated = true;
+        self.spec.auth = RouteAuth::Authenticated;
+        OperationBuilder {
+            spec: self.spec,
+            method_router: self.method_router,
+            _has_handler: self._has_handler,
+            _has_response: self._has_response,
+            _state: self._state,
+            _auth_state: PhantomData,
+            _license_state: self._license_state,
+        }
+    }
+
+    /// Require a validated `X-ToolKit-Internal-Token`; a bearer alone is never validated and
+    /// yields 401, as do missing internal auth and a bearer beside the token. `OpenAPI` uses
+    /// [`INTERNAL_TOKEN_SECURITY_SCHEME`]; discovery excludes the route. Handlers read
+    /// `Extension<PlatformSecurityContext>`; a license decision is still required.
+    pub fn platform_authenticated(mut self) -> OperationBuilder<H, R, S, AuthSet, L> {
+        self.spec.auth = RouteAuth::Platform;
         OperationBuilder {
             spec: self.spec,
             method_router: self.method_router,
@@ -1346,7 +1363,7 @@ where
     /// # let _ = router;
     /// ```
     pub fn anonymous(mut self) -> OperationBuilder<H, R, S, AuthSet, LicenseSet> {
-        self.spec.authenticated = false;
+        self.spec.auth = RouteAuth::Anonymous;
         OperationBuilder {
             spec: self.spec,
             method_router: self.method_router,

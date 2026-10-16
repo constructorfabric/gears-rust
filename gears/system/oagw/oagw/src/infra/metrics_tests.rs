@@ -99,6 +99,22 @@ fn gauge_last_f64(exporter: &InMemoryMetricExporter, name: &str) -> Option<f64> 
     None
 }
 
+fn gauge_last_u64(exporter: &InMemoryMetricExporter, name: &str) -> Option<u64> {
+    let metrics = exporter.get_finished_metrics().unwrap();
+    for rm in &metrics {
+        for sm in rm.scope_metrics() {
+            for m in sm.metrics() {
+                if m.name() == name
+                    && let AggregatedMetrics::U64(MetricData::Gauge(g)) = m.data()
+                {
+                    return g.data_points().last().map(|dp| dp.value());
+                }
+            }
+        }
+    }
+    None
+}
+
 // ── Counter tests ───────────────────────────────────────────────────────
 
 #[test]
@@ -139,6 +155,23 @@ fn rate_limit_exceeded_counter_increments() {
     provider.force_flush().unwrap();
 
     assert_eq!(counter_u64(&exporter, "oagw_rate_limit_exceeded"), 2);
+}
+
+#[test]
+fn rate_limit_sweep_counts_evictions_and_records_live_buckets() {
+    let (provider, exporter) = local_provider();
+    let m = make_meter(&provider, "oagw");
+
+    m.record_rate_limit_sweep(3, 7);
+    m.record_rate_limit_sweep(2, 5);
+
+    provider.force_flush().unwrap();
+
+    assert_eq!(counter_u64(&exporter, "oagw_rate_limit_buckets_evicted"), 5);
+    assert_eq!(
+        gauge_last_u64(&exporter, "oagw_rate_limit_buckets"),
+        Some(5)
+    );
 }
 
 // ── Histogram ───────────────────────────────────────────────────────────
@@ -403,4 +436,58 @@ fn normalize_method_collapses_unknown_verbs_to_other() {
     assert_eq!(super::normalize_method(&propfind), "_OTHER");
     let mkcol = Method::from_bytes(b"MKCOL").unwrap();
     assert_eq!(super::normalize_method(&mkcol), "_OTHER");
+}
+
+// ── Registry provisioning ───────────────────────────────────────────────
+
+/// The value of the string attribute `key` in `attrs`.
+fn attr(attrs: &[(String, opentelemetry::Value)], key: &str) -> Option<String> {
+    attrs
+        .iter()
+        .find(|(k, _)| k == key)
+        .map(|(_, v)| v.as_str().into_owned())
+}
+
+#[test]
+fn registry_provisioning_failures_carry_kind_and_reason() {
+    use crate::domain::ports::metric_labels::provisioning_reason;
+
+    let (provider, exporter) = local_provider();
+    let m = make_meter(&provider, "oagw");
+
+    m.record_registry_provisioning_failure("route", provisioning_reason::INVALID_REQUEST);
+    m.record_registry_provisioning_failure("route", provisioning_reason::INVALID_REQUEST);
+
+    provider.force_flush().unwrap();
+
+    let name = "oagw_registry_provisioning_failures";
+    assert_eq!(counter_u64(&exporter, name), 2);
+    let attrs = single_counter_attrs(&exporter, name);
+    assert_eq!(attrs.len(), 2, "{attrs:?}");
+    assert_eq!(attr(&attrs, "kind").as_deref(), Some("route"));
+    assert_eq!(
+        attr(&attrs, "reason").as_deref(),
+        Some(provisioning_reason::INVALID_REQUEST)
+    );
+}
+
+#[test]
+fn registry_provisioning_runs_carry_the_outcome() {
+    use crate::domain::ports::metric_labels::provisioning_outcome;
+
+    let (provider, exporter) = local_provider();
+    let m = make_meter(&provider, "oagw");
+
+    m.record_registry_provisioning_run(provisioning_outcome::NOT_CLEAN);
+
+    provider.force_flush().unwrap();
+
+    let name = "oagw_registry_provisioning_runs";
+    assert_eq!(counter_u64(&exporter, name), 1);
+    let attrs = single_counter_attrs(&exporter, name);
+    assert_eq!(attrs.len(), 1, "{attrs:?}");
+    assert_eq!(
+        attr(&attrs, "outcome").as_deref(),
+        Some(provisioning_outcome::NOT_CLEAN)
+    );
 }

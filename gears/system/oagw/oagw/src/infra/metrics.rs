@@ -56,8 +56,12 @@ pub struct OagwMetricsMeter {
     requests_in_flight: UpDownCounter<i64>,
     rate_limit_exceeded: Counter<u64>,
     rate_limit_usage_ratio: Gauge<f64>,
+    rate_limit_buckets_evicted: Counter<u64>,
+    rate_limit_buckets: Gauge<u64>,
     active_websocket_sessions: UpDownCounter<i64>,
     websocket_session_duration_seconds: Histogram<f64>,
+    registry_provisioning_failures: Counter<u64>,
+    registry_provisioning_runs: Counter<u64>,
 }
 
 impl OagwMetricsMeter {
@@ -92,6 +96,14 @@ impl OagwMetricsMeter {
                 .f64_gauge(format!("{prefix}_rate_limit_usage_ratio"))
                 .with_description("Current rate-limit bucket usage ratio (1 - remaining/limit)")
                 .build(),
+            rate_limit_buckets_evicted: meter
+                .u64_counter(format!("{prefix}_rate_limit_buckets_evicted"))
+                .with_description("Idle rate-limit buckets evicted by the periodic sweep")
+                .build(),
+            rate_limit_buckets: meter
+                .u64_gauge(format!("{prefix}_rate_limit_buckets"))
+                .with_description("Rate-limit buckets held in memory after the last sweep")
+                .build(),
             active_websocket_sessions: meter
                 .i64_up_down_counter(format!("{prefix}_active_websocket_sessions"))
                 .with_description("Currently open WebSocket bridge sessions")
@@ -101,6 +113,16 @@ impl OagwMetricsMeter {
                 .with_description("WebSocket bridge session lifetime (seconds)")
                 .with_unit("s")
                 .with_boundaries(WEBSOCKET_SESSION_BUCKETS_SECONDS.to_vec())
+                .build(),
+            registry_provisioning_failures: meter
+                .u64_counter(format!("{prefix}_registry_provisioning_failures"))
+                .with_description(
+                    "Registry instances the reconcile skipped, and dropped upstreams it kept",
+                )
+                .build(),
+            registry_provisioning_runs: meter
+                .u64_counter(format!("{prefix}_registry_provisioning_runs"))
+                .with_description("Registry reconcile runs by outcome")
                 .build(),
         }
     }
@@ -185,6 +207,26 @@ impl OagwMetricsPort for OagwMetricsMeter {
     fn record_websocket_session_duration_seconds(&self, host: &str, seconds: f64) {
         self.websocket_session_duration_seconds
             .record(seconds, &[KeyValue::new(key::HOST, host.to_owned())]);
+    }
+
+    fn record_rate_limit_sweep(&self, evicted: u64, live: u64) {
+        self.rate_limit_buckets_evicted.add(evicted, &[]);
+        self.rate_limit_buckets.record(live, &[]);
+    }
+
+    fn record_registry_provisioning_failure(&self, kind: &str, reason: &str) {
+        self.registry_provisioning_failures.add(
+            1,
+            &[
+                KeyValue::new(key::KIND, kind.to_owned()),
+                KeyValue::new(key::REASON, reason.to_owned()),
+            ],
+        );
+    }
+
+    fn record_registry_provisioning_run(&self, outcome: &str) {
+        self.registry_provisioning_runs
+            .add(1, &[KeyValue::new(key::OUTCOME, outcome.to_owned())]);
     }
 }
 

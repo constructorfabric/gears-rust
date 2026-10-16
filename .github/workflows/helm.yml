@@ -8,6 +8,7 @@ on:
       - 'apps/**/deploy/helm/**'
       - 'examples/**/deploy/helm/**'
       - 'gears/**/deploy/helm/**'
+      - 'tools/scripts/update-helm-deps.sh'
       - '.github/workflows/helm.yml'
   workflow_dispatch:
 
@@ -32,14 +33,13 @@ jobs:
           tool: helm
 
       - name: Resolve chart dependencies
-        run: bash deploy/helm/update-helm-deps.sh
+        run: bash tools/scripts/update-helm-deps.sh
 
       - name: Helm lint (library, umbrella, and all gear charts)
         run: |
-          gear_charts=$(grep -rlE --include=Chart.yaml \
-            '^[[:space:]]*-[[:space:]]*name:[[:space:]]*toolkit-common' \
-            apps examples gears | grep -v '/charts/' | xargs -r -n1 dirname)
-          helm lint deploy/helm/toolkit-common deploy/helm/toolkit-platform $gear_charts
+          chart_dirs=$(find apps examples gears deploy/helm -name Chart.yaml \
+            -not -path '*/charts/*' -exec dirname {} \;)
+          helm lint $chart_dirs
 
       - name: Helm template (umbrella presets)
         run: |

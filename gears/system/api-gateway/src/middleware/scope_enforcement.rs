@@ -11,6 +11,7 @@ use axum::response::IntoResponse;
 use glob::{MatchOptions, Pattern};
 
 use crate::config::RoutePoliciesConfig;
+use crate::middleware::auth::PlatformAdmitted;
 use crate::middleware::common;
 use crate::middleware::errors::ApiGatewayRouteError;
 use toolkit_canonical_errors::CanonicalError;
@@ -195,6 +196,12 @@ pub async fn scope_enforcement_middleware(
 ) -> axum::response::Response {
     // Skip if enforcement is disabled
     if !state.rules.enabled {
+        return next.run(req).await;
+    }
+
+    // `PlatformAdmitted` proves platform admission; tenant token scopes do not apply, and a
+    // platform route never carries a tenant `SecurityContext`: its bearer is dropped unvalidated.
+    if req.extensions().get::<PlatformAdmitted>().is_some() {
         return next.run(req).await;
     }
 

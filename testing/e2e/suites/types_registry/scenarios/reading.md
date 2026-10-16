@@ -13,7 +13,7 @@ Responses are compared whole as JSON values. The mandatory `gts_id`, `gts_uuid`,
   - [TR-READ-002 — GTS ID and Registry Reference resolve to the same entity](#tr-read-002--gts-id-and-registry-reference-resolve-to-the-same-entity)
   - [TR-READ-003 — Authored content is selected independently](#tr-read-003--authored-content-is-selected-independently)
   - [TR-READ-004 — Effective documents are independently selectable](#tr-read-004--effective-documents-are-independently-selectable)
-  - [TR-READ-005 — Provenance is one selected group](#tr-read-005--provenance-is-one-selected-group)
+  - [TR-READ-005 — Provenance is a Type Schema group](#tr-read-005--provenance-is-a-type-schema-group)
   - [TR-READ-006 — Inapplicable Instance artifacts are absent](#tr-read-006--inapplicable-instance-artifacts-are-absent)
   - [TR-READ-007 — A projected tombstone remains distinguishable from absence](#tr-read-007--a-projected-tombstone-remains-distinguishable-from-absence)
   - [TR-READ-008 — Absent and impossible keys have one exact-read error shape](#tr-read-008--absent-and-impossible-keys-have-one-exact-read-error-shape)
@@ -75,7 +75,7 @@ Responses are compared whole as JSON values. The mandatory `gts_id`, `gts_uuid`,
 
 **Then:** each derived-schema response includes exactly its named document plus the mandatory `gts_id`, `gts_uuid`, `kind`, and `lifecycle_status`; selecting traits does not transfer `resolved_schema`. The resolved schema requires `payload.employee_id`; effective traits contain `category=internal`, and the effective traits schema constrains it to `internal|public`. Both Instance responses have only their mandatory identity, kind and lifecycle fields, without `resolved_schema`. The valid derived Instance succeeds; the separate extra-field item has `status=failed`, `resource_version=null`, and `error.reason=invalid_value`, and its key remains absent. Together they show that the inherited envelope is closed while `payload` accepts derived fields.
 
-### TR-READ-005 — Provenance is one selected group
+### TR-READ-005 — Provenance is a Type Schema group
 
 **Fixtures:** [person_schema](../fixtures/reading/person_schema.json), [person_instance](../fixtures/reading/person_instance.json), [other_schema](../fixtures/reading/other_schema.json), [other_instance](../fixtures/reading/other_instance.json).
 
@@ -83,7 +83,7 @@ Responses are compared whole as JSON values. The mandatory `gts_id`, `gts_uuid`,
 
 **When:** GET both schemas and both Instances with `$select=provenance`.
 
-**Then:** each selected group contains exactly `gts_spec_version`, `gts_impl_version`, and `compat_forced`; both Instances carry an explicit JSON `null` for `compat_forced`, while both schemas carry `false`. No provenance member or owning-gear attribution appears at the entity's top level.
+**Then:** both schemas carry the mandatory fields plus `provenance` with exactly `compatibility_check_skipped=false`: nothing was skipped, and a selected `false` is a value, not an omission. Both Instances carry only the mandatory fields; the group is absent, neither `null` nor empty.
 
 ### TR-READ-006 — Inapplicable Instance artifacts are absent
 
@@ -135,7 +135,7 @@ Responses are compared whole as JSON values. The mandatory `gts_id`, `gts_uuid`,
 
 **When:** POST `:batchGet` with top-level `"$select": "content,provenance"` for both keys, and GET each key with the same selection.
 
-**Then:** the batch has exactly the two requested keys, no other registered key, and each `entity` body equals its exact GET body as a JSON value. Each batch `etag` is byte-identical to that key's exact GET `ETag` under the same selection. Each entity has only the mandatory `gts_id`, `gts_uuid`, `kind`, and `lifecycle_status`, authored `content`, and the `provenance` group.
+**Then:** the batch has exactly the two requested keys, no other registered key, and each `entity` body equals its exact GET body as a JSON value. Each batch `etag` is byte-identical to that key's exact GET `ETag` under the same selection. Each entity has only the mandatory `gts_id`, `gts_uuid`, `kind`, and `lifecycle_status`, authored `content`; `person_schema` adds `provenance` with `compatibility_check_skipped=false`, and `person_instance` omits the group.
 
 ### TR-READ-103 — A batch can read a tombstone beside a live entity
 

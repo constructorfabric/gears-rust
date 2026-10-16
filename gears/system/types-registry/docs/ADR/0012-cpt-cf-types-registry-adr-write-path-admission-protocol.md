@@ -161,9 +161,9 @@ The stored fingerprint covers at least:
 * the canonical request body and operation kind;
 * the ownership scope and dry-run mode;
 * every candidate precondition;
-* every per-candidate check waiver — in P1, ADR-0004's `force`.
+* every per-candidate check waiver — in P1, ADR-0004's `skip_compatibility_check`.
 
-The write path accepts `force` only when deployment configuration enables it; otherwise envelope validation refuses it. Mode, preconditions, and waivers are explicit fingerprint inputs even though they travel in the body. Omitting any of them could make a distinct submission replay the stored operation and never execute: a silent lost write.
+The write path accepts `skip_compatibility_check` only when deployment configuration enables it; otherwise envelope validation refuses it. Mode, preconditions, and waivers are explicit fingerprint inputs even though they travel in the body. Omitting any of them could make a distinct submission replay the stored operation and never execute: a silent lost write.
 
 A repeat with the same scoped key and fingerprint returns the immutable stored operation without re-evaluating current registry state:
 

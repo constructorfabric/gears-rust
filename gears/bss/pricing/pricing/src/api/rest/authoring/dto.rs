@@ -609,6 +609,31 @@ pub struct PricingDimensionKey {
 pub struct PricingDimensionRegistry {
     pub items: Vec<PricingDimensionKey>,
 }
+/// One currency of the table (D-537).
+#[toolkit_macros::api_dto(response)]
+pub struct PricingCurrency {
+    /// Three uppercase letters.
+    pub code: String,
+    /// The number of decimal places a new price in this currency uses, as a JSON integer.
+    pub scale: u8,
+    /// True when ISO 4217 defines the code; false for a code that the deployment's
+    /// `currency_scales` config adds.
+    pub iso: bool,
+}
+impl From<&crate::domain::currency::KnownCurrency> for PricingCurrency {
+    fn from(known: &crate::domain::currency::KnownCurrency) -> Self {
+        Self {
+            code: known.spec.code().to_owned(),
+            scale: known.spec.scale(),
+            iso: known.iso,
+        }
+    }
+}
+/// The response of `GET /currencies` (D-537): every currency the table accepts, sorted by code.
+#[toolkit_macros::api_dto(response)]
+pub struct PricingCurrencyTable {
+    pub items: Vec<PricingCurrency>,
+}
 #[toolkit_macros::api_dto(request)]
 #[derive(Clone)]
 #[serde(deny_unknown_fields)]

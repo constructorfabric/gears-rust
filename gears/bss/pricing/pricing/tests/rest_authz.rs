@@ -22,6 +22,7 @@ fn census() -> census::Routes {
         ("GET", "/bss-pricing/v1/price-books/{id}/export"),
         ("GET", "/bss-pricing/v1/settings"),
         ("PUT", "/bss-pricing/v1/settings"),
+        ("GET", "/bss-pricing/v1/currencies"),
         ("GET", "/bss-pricing/v1/dimension-keys"),
         ("PUT", "/bss-pricing/v1/dimension-keys"),
         ("POST", "/bss-pricing/v1/price-book-entries/{id}/prices"),
@@ -88,7 +89,7 @@ async fn the_census_covers_every_route_the_routers_register() {
     assert_eq!(census::source_routes(), registered);
     assert_eq!(census::readers("require_authenticated("), registered);
     assert_eq!(census::readers("authz::access_scope("), registered);
-    assert_eq!(registered.len(), 60);
+    assert_eq!(registered.len(), 61);
     assert_eq!(bss_pricing::authz::labels::ALL.len(), 7);
     let permissions: Vec<_> = toolkit_gts::inventory::iter::<toolkit_gts::InventoryInstance>
         .into_iter()
@@ -133,7 +134,7 @@ async fn no_rest_door_serves_pricings_system_actor() {
             (method.to_owned(), path.to_owned())
         })
         .collect();
-    assert_eq!(doors.len(), 60, "every served door");
+    assert_eq!(doors.len(), 61, "every served door");
     for (method, template) in doors {
         let path = template
             .replace("{id}", &uuid::Uuid::new_v4().to_string())
@@ -174,7 +175,7 @@ async fn no_rest_door_serves_pricings_system_actor() {
 
 #[test]
 fn the_authentication_and_authz_parsers_have_positive_controls() {
-    // One per route (55), and more: `require_authenticated(` is also its own definition;
+    // One per route (61), and more: `require_authenticated(` is also its own definition;
     // `authz::access_scope(` is also the SKU usage port, which authorizes the Products caller it
     // serves (D-428), and the money's second judgement, price_book read, in the one helper the
     // SKU's entry list, the two entry reads and an entry's prices call (D-434, D-440).
@@ -186,7 +187,7 @@ fn the_authentication_and_authz_parsers_have_positive_controls() {
     // the two flag grants at once (one PDP round trip), so a 401 still comes first.
     for (needle, more) in [("require_authenticated(", 3), ("authz::access_scope(", 5)] {
         assert_eq!(census::count_in_functions(census::CONTROL, needle), 2);
-        assert_eq!(census::production_count(needle), 60 + more, "{needle}");
+        assert_eq!(census::production_count(needle), 61 + more, "{needle}");
     }
     let routes = census::registrations(census::CONTROL);
     assert_eq!(
@@ -196,7 +197,7 @@ fn the_authentication_and_authz_parsers_have_positive_controls() {
             .count(),
         2
     );
-    assert_eq!(census::source_routes().len(), 60);
+    assert_eq!(census::source_routes().len(), 61);
 }
 
 #[test]
@@ -237,6 +238,7 @@ fn every_mounted_router_is_merged_into_both_censuses() {
 // GET /price-books/{id}/export price_book:read false false
 // GET /settings config:read false false
 // PUT /settings config:settings true false
+// GET /currencies config:read false false (D-537)
 // GET /dimension-keys config:read false false
 // PUT /dimension-keys config:settings true false
 

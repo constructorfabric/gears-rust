@@ -1,4 +1,4 @@
-"""Vendor regions and the deployment compatibility-force switch."""
+"""Vendor regions and the deployment switch for skipping compatibility checks."""
 
 from copy import deepcopy
 import os
@@ -23,7 +23,7 @@ from .helpers import (
 )
 
 
-# The shared e2e config enables force; only the force-disabled profile sets "0".
+# The shared e2e config allows skip requests; only the force-disabled profile sets "0".
 FORCE_ENABLED = os.getenv("TYPES_REGISTRY_FORCE_ENABLED_E2E") != "0"
 
 
@@ -76,23 +76,24 @@ async def test_default_policy_refuses_non_platform_vendor(
 
 @pytest.mark.skipif(FORCE_ENABLED, reason="TR-REG-902 requires the force-disabled profile")
 @pytest.mark.scenario("TR-REG-902")
-async def test_disabled_force_rejects_commit_and_dry_run(
+async def test_a_disallowed_skip_is_refused_on_commit_and_dry_run(
     registry_http, registry_api_path, registration_fixture, given_registered
 ):
-    """A dry run cannot bypass a deployment's disabled force gate."""
+    """A dry run cannot bypass a deployment that disallows skip requests."""
     first = registration_fixture("person_minor_0_schema")
     second = registration_fixture("person_minor_1_schema")
     await given_registered(first)
-    second["force"] = True
+    second["skip_compatibility_check"] = True
     for dry_run in (False, True):
         assert_bad_request(
             await post_registration(
                 registry_http, registry_api_path, [second], dry_run=dry_run
             ),
             invalid_argument(
-                "force",
+                "skip_compatibility_check",
                 "VALIDATION_FAILED",
-                f"force is not permitted on '{second['gts_id']}' in this deployment",
+                f"skip_compatibility_check is not permitted on '{second['gts_id']}' "
+                "in this deployment",
                 resource_name=second["gts_id"],
             ),
         )
@@ -118,10 +119,10 @@ async def test_disabled_force_rejects_commit_and_dry_run(
     not FORCE_ENABLED, reason="TR-REG-903 requires the default force-enabled launcher"
 )
 @pytest.mark.scenario("TR-REG-903")
-async def test_enabled_force_records_waiver_on_only_the_new_minor(
+async def test_an_allowed_skip_is_recorded_on_only_the_new_minor(
     registry_http, registry_api_path, registration_fixture, given_registered
 ):
-    """A force-enabled minor records a waiver without revising its predecessor."""
+    """An allowed skip request records a waiver without revising its predecessor."""
     first = registration_fixture("person_minor_0_schema")
     second = registration_fixture("person_minor_1_schema")
     await given_registered(first)
@@ -146,7 +147,7 @@ async def test_enabled_force_records_waiver_on_only_the_new_minor(
     second["content"]["properties"]["payload"]["properties"] = {
         "employee_id": {"type": "string"}
     }
-    second["force"] = True
+    second["skip_compatibility_check"] = True
     await register_and_assert(
         registry_http, registry_api_path, [second], outcome(second, "succeeded", 1)
     )

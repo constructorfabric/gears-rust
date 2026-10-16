@@ -763,3 +763,105 @@ async fn a_temporary_price_over_a_fee_off_the_narrowed_scale_names_where_its_fee
         "no half of the pair is written"
     );
 }
+
+/// D-537: `GET /currencies` lists today's table, in code order: the active ISO 4217 codes and the
+/// deployment's own, each with the scale a new price takes. A changed table answers the changed
+/// scale, and a new price takes it. Every tenant reads the same table, whatever its settings
+/// offer.
+#[tokio::test]
+async fn the_currency_table_read_answers_todays_table() {
+    let iso_only = Fixture::new(Arc::new(Script::default())).await;
+    let (status, table, _) = iso_only
+        .call("GET", "/currencies", json!({}), None, None)
+        .await;
+    assert_eq!(status, 200, "{table}");
+    let items = table["items"].as_array().unwrap();
+    assert_eq!(items.len(), 165, "the active ISO 4217 codes");
+    let codes: Vec<&str> = items.iter().map(|c| c["code"].as_str().unwrap()).collect();
+    assert!(
+        codes.windows(2).all(|pair| pair[0] < pair[1]),
+        "once each, in code order"
+    );
+    let of = |items: &[Value], code: &str| items.iter().find(|c| c["code"] == code).cloned();
+    assert_eq!(
+        of(items, "EUR"),
+        Some(json!({"code": "EUR", "scale": 2, "iso": true})),
+        "a currency is its code, its scale as a JSON integer, and whether ISO gives it"
+    );
+    assert_eq!(of(items, "JPY").unwrap()["scale"], 0);
+    assert_eq!(of(items, "KWD").unwrap()["scale"], 3);
+    assert_eq!(of(items, "CLF").unwrap()["scale"], 4);
+    assert_eq!(of(items, "XTS"), None, "ISO lists XTS without a scale");
+
+    let w = World::new().await;
+    // The settings offer EUR alone: they narrow a new book's currency, never the table.
+    let (_, _, tag) = w.f.call("GET", "/settings", json!({}), None, None).await;
+    let settings = json!({
+        "default_timing": "advance",
+        "default_gl": null,
+        "default_tax_category": null,
+        "invoice_line_templates": {},
+        "currencies": ["EUR"],
+    });
+    let (status, saved, _) =
+        w.f.call("PUT", "/settings", settings, Some(&tag), None)
+            .await;
+    assert_eq!(status, 200, "{saved}");
+    let (status, before) = w
+        .call(&w.f.app, "GET", "/currencies", json!({}), None)
+        .await;
+    assert_eq!(status, 200, "{before}");
+    let items = before["items"].as_array().unwrap();
+    assert_eq!(items.len(), 166, "the ISO codes and the deployment's XTS");
+    assert_eq!(
+        of(items, "XTS"),
+        Some(json!({"code": "XTS", "scale": 2, "iso": false})),
+        "a code the deployment adds is marked iso false"
+    );
+    let codes: Vec<&str> = items.iter().map(|c| c["code"].as_str().unwrap()).collect();
+    assert!(
+        codes.windows(2).all(|pair| pair[0] < pair[1]),
+        "one order across both sources"
+    );
+    let first = &w.draft(&w.f.app, price("2030-01-01"), "before").await[0];
+    assert_eq!(
+        first["currency_scale"],
+        of(items, "XTS").unwrap()["scale"],
+        "a new price takes the scale the table lists"
+    );
+
+    let (status, after) = w
+        .call(&w.changed, "GET", "/currencies", json!({}), None)
+        .await;
+    assert_eq!(status, 200, "{after}");
+    let items = after["items"].as_array().unwrap();
+    assert_eq!(of(items, "XTS").unwrap()["scale"], 3, "today's scale");
+    let second = &w.draft(&w.changed, price("2031-01-01"), "after").await[0];
+    assert_eq!(
+        second["currency_scale"],
+        of(items, "XTS").unwrap()["scale"],
+        "a new price takes the scale the changed table lists"
+    );
+
+    let elsewhere = SecurityContext::builder()
+        .subject_id(Uuid::new_v4())
+        .subject_tenant_id(Uuid::new_v4())
+        .subject_type("config:read")
+        .build()
+        .unwrap();
+    let (status, theirs, _) = request(
+        &w.f.app,
+        &elsewhere,
+        "GET",
+        "/currencies",
+        json!({}),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "{theirs}");
+    assert_eq!(
+        theirs, before,
+        "every tenant reads the same table, whatever its settings offer"
+    );
+}

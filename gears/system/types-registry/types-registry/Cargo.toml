@@ -67,6 +67,8 @@ toolkit = { workspace = true }
 # runtime; dev-dependency feature unification must not be what enables it.
 toolkit-db = { workspace = true, features = ["sqlite"] }
 toolkit-canonical-errors = { workspace = true, features = ["axum"] }
+# The platform-plane security context of `PlatformTypesRegistryApi` (local client).
+toolkit-security = { workspace = true }
 toolkit-gts = { workspace = true }
 # Versioned base64url keyset cursors for content-free discovery (D12): `CursorV1`
 # refuses an unknown version, which is the property the page contract needs.
@@ -91,6 +93,8 @@ tokio = { workspace = true, features = [
     "net",
     "test-util",
 ] }
+# The SDK's contract conformance checks, run against the local client.
+types-registry-sdk = { package = "cf-gears-types-registry-sdk", path = "../types-registry-sdk", features = ["test-util"] }
 # SQLite and transaction observation for dispatch tests.
 toolkit-db = { workspace = true, features = ["sqlite", "test-support"] }
 # PostgreSQL / MySQL bring-up for the `integration` suite. Not optional --

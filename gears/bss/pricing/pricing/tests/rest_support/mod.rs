@@ -249,6 +249,7 @@ impl Harness {
             ("GET", "/bss-pricing/v1/price-books/{id}/export"),
             ("GET", "/bss-pricing/v1/settings"),
             ("PUT", "/bss-pricing/v1/settings"),
+            ("GET", "/bss-pricing/v1/currencies"),
             ("GET", "/bss-pricing/v1/dimension-keys"),
             ("PUT", "/bss-pricing/v1/dimension-keys"),
             ("POST", "/bss-pricing/v1/price-book-entries/{id}/prices"),
@@ -311,6 +312,7 @@ impl Harness {
 // GET /price-books/{id}/export price_book:read false false
 // GET /settings config:read false false
 // PUT /settings config:settings true false
+// GET /currencies config:read false false (D-537)
 // GET /dimension-keys config:read false false
 // PUT /dimension-keys config:settings true false
 

@@ -214,7 +214,7 @@ Requirement: `cpt-cf-bss-pricing-fr-dimension-registry`; PRD AC #1.
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-pricing-dod-settings-defaults`
 
-Tenant timing, GL, tax and per-type invoice templates are stored and exposed. SKU timing overrides tenant timing at binding; settings permissions and optimistic versioning apply (spec §5). An invoice line always rounds HALF_EVEN, so the settings carry no rounding (D-535); the settings offer the currencies a new book may take and say who wrote them last and when (D-438). GET /settings keeps its version as the strong ETag a PUT sends back as If-Match; an If-None-Match that matches it is 304, and the read sends Cache-Control: private, no-cache (D-518). The read names its last writer (`updated_by_name`, D-519); the PUT accepts that field and ignores it, so a read without version, updated_at and updated_by stays a PUT body.
+Tenant timing, GL, tax and per-type invoice templates are stored and exposed. SKU timing overrides tenant timing at binding; settings permissions and optimistic versioning apply (spec §5). An invoice line always rounds HALF_EVEN, so the settings carry no rounding (D-535); the settings offer the currencies a new book may take and say who wrote them last and when (D-438). GET /currencies lists the currency table those codes come from, each with the scale a new price takes (D-537). GET /settings keeps its version as the strong ETag a PUT sends back as If-Match; an If-None-Match that matches it is 304, and the read sends Cache-Control: private, no-cache (D-518). The read names its last writer (`updated_by_name`, D-519); the PUT accepts that field and ignores it, so a read without version, updated_at and updated_by stays a PUT body.
 
 Requirement: `cpt-cf-bss-pricing-fr-settings`; PRD AC #13.
 

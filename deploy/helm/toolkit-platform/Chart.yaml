@@ -3,7 +3,7 @@ name: toolkit-platform
 description: Deploys the CF/Gears platform.
 type: application
 version: 0.1.0
-appVersion: "dev"
+appVersion: "0.1.0"
 dependencies:
   - name: flight-control
     version: 0.1.0

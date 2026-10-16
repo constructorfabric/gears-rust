@@ -167,6 +167,7 @@ None. OAGW follows standard Gears ToolKit gear conventions.
 ### 4.1 In Scope
 
 - CRUD management of upstreams, routes, and plugins via REST API
+- Opt-in database persistence of upstream and route configuration, with in-memory storage when no database is configured
 - HTTP/HTTPS proxy with alias-based upstream resolution and route matching
 - Credential injection via auth plugins (API Key, Basic Auth, OAuth2 Client Credentials, Bearer Token)
 - Rate limiting at upstream and route levels with configurable strategies
@@ -217,6 +218,15 @@ The system **MUST** provide CRUD operations for routes. Routes define matching r
 The system **MUST** support an `enabled` boolean field (default: `true`) on upstreams and routes. A disabled upstream **MUST** cause all proxy requests to be rejected with `503 Service Unavailable`. A disabled route **MUST** be excluded from route matching. If an ancestor tenant disables an upstream, it **MUST** be disabled for all descendants; descendants **MUST NOT** re-enable an ancestor-disabled resource.
 
 - **Rationale**: Enables temporary maintenance, emergency circuit breaks, and gradual rollouts without deleting configuration.
+- **Actors**: `cpt-cf-oagw-actor-platform-operator`, `cpt-cf-oagw-actor-tenant-admin`
+
+#### Configuration Persistence
+
+- [ ] `p1` - **ID**: `cpt-cf-oagw-fr-config-persistence`
+
+The system **MUST** persist upstreams and routes created through the Management API in a database when a database is configured for the gear, so that they survive restarts. Persistence is opt-in: when no database is configured, the system **MUST** keep upstreams and routes in memory and log that configuration is not persisted. When a database is configured but unusable (connection failure, unsupported backend, malformed configuration, or migration failure), the system **MUST** fail startup and **MUST NOT** fall back to in-memory storage. Management API and proxy behavior **MUST** be identical with either storage backend. The system **MUST** support PostgreSQL, MySQL, and SQLite through one portable schema without backend-specific behavior. Which backends a given build includes is a deployment choice described in [ADR-0018 Backend Selection](./ADR/0018-optional-persistence.md#backend-selection); the default build includes SQLite and PostgreSQL.
+
+- **Rationale**: Configuration created at runtime is lost on every restart without persistence, while deployments without a database must keep working. Failing on an unusable database prevents silent data loss.
 - **Actors**: `cpt-cf-oagw-actor-platform-operator`, `cpt-cf-oagw-actor-tenant-admin`
 
 ### 5.2 Proxy Execution
@@ -726,6 +736,7 @@ None. All project-default NFRs apply to this gear.
 - [ ] 99.9% availability under normal operating conditions
 - [ ] Complete audit trail for all proxy requests (correlation ID, timestamps, status)
 - [ ] All upstream/route CRUD operations validated and tenant-scoped
+- [ ] With a database configured, upstreams and routes survive a gear restart; without one, the gear starts with in-memory storage; with an unusable database, startup fails
 - [ ] Rate limiting enforced per configuration; 429 responses include Retry-After header
 - [ ] SSE streaming proxies events with correct lifecycle handling
 
@@ -736,7 +747,7 @@ None. All project-default NFRs apply to this gear.
 | `types_registry` | GTS schema/instance registration for plugin types and upstream/route type definitions | p1 |
 | `cred_store` | Secret material retrieval by UUID reference for auth plugin credential injection | p1 |
 | `api_ingress` | REST API hosting via ToolKit framework | p1 |
-| `toolkit-db` | Database persistence for upstream, route, and plugin configurations | p1 |
+| `toolkit-db` | Optional database persistence for upstream and route configuration; without a configured database, configuration is kept in memory. p2 although `cpt-cf-oagw-fr-config-persistence` is p1: OAGW runs without it, so it is not required for operation | p2 |
 | `toolkit-auth` | Authorization and SecurityContext extraction for all API endpoints | p1 |
 
 ## 11. Assumptions
@@ -745,6 +756,7 @@ None. All project-default NFRs apply to this gear.
 - ToolKit framework provides gear lifecycle, dependency injection, and REST API hosting
 - Tenant hierarchy is resolved by the platform (tenant-resolver gear); OAGW receives tenant_id from SecurityContext
 - External upstream services are reachable via HTTP/HTTPS from the Gears deployment environment
+- `toolkit-db` provides PostgreSQL, MySQL, and SQLite backends, and provides no database to a gear that has no database configuration
 
 ## 12. Risks
 
@@ -753,6 +765,7 @@ None. All project-default NFRs apply to this gear.
 | Upstream service outage cascading to OAGW callers | High — all consumers of that upstream blocked | Circuit breaker pattern; configurable timeout and fallback behavior |
 | Credential store unavailability | High — proxy requests fail if credentials cannot be retrieved | Cache last-known-good credentials with short TTL; alert on cred_store health |
 | Rate limit state loss on restart | Medium — brief window of unlimited requests | Persist rate limit counters; accept brief burst on cold start |
+| Configuration loss on restart without a database | Medium — upstreams and routes created through the Management API disappear | Configure a database for production deployments; log a warning at startup when running with in-memory storage |
 | Plugin execution exceeding timeout | Medium — increased proxy latency | Enforced plugin timeout; circuit-break misbehaving plugins |
 
 ## 13. Open Questions

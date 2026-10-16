@@ -5,6 +5,7 @@ import httpx
 import pytest
 
 from .helpers import (
+    ROUTE_SCHEMA,
     UPSTREAM_SCHEMA,
     assert_problem,
     create_route,
@@ -32,6 +33,38 @@ async def test_nonexistent_alias_returns_404_gateway(
             category="not_found",
             resource_type=UPSTREAM_SCHEMA,
             detail_contains="upstream not found",
+        )
+
+
+@pytest.mark.scenario("negative-6.5-known-alias-without-matching-route-returns-404")
+@pytest.mark.asyncio
+async def test_known_alias_without_matching_route_returns_404_gateway(
+    oagw_base_url, oagw_headers, mock_upstream_url, mock_upstream, cleanup,
+):
+    """Scenario 6.5: a known alias with no route for the path is a gateway 404
+    that names the route; 6.4's unknown alias names the upstream instead."""
+    _ = mock_upstream
+    alias = unique_alias("err-noroute")
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        upstream = cleanup.upstream(oagw_headers, await create_upstream(
+            client, oagw_base_url, oagw_headers, mock_upstream_url, alias=alias,
+        ))
+        await create_route(
+            client, oagw_base_url, oagw_headers, upstream["id"], ["GET"], "/v1/models",
+        )
+        resp = await client.get(
+            f"{oagw_base_url}/oagw/v1/proxy/{alias}/v1/models", headers=oagw_headers,
+        )
+        assert resp.status_code == 200, resp.text[:300]
+
+        resp = await client.get(
+            f"{oagw_base_url}/oagw/v1/proxy/{alias}/v2/unrouted", headers=oagw_headers,
+        )
+        assert_problem(
+            resp, 404,
+            category="not_found",
+            resource_type=ROUTE_SCHEMA,
+            detail_contains="route not found",
         )
 
 

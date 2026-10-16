@@ -2,7 +2,7 @@
 //!
 //! Queries the types-registry for upstream and route GTS instances registered
 //! by other gears during `init()`, deserializes their content, and returns
-//! domain-level provisioned objects for `post_init()` to insert into repos.
+//! domain-level provisioned objects for the registry reconcile.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -842,6 +842,7 @@ mod tests {
         assert!(upstreams[0].request.enabled);
     }
 
+    /// ADR-0018: PERS-PROV-018.
     #[tokio::test]
     async fn list_upstreams_rejects_non_uuid_instance_id() {
         let registry =
@@ -922,6 +923,7 @@ mod tests {
         assert!(routes[0].request.enabled);
     }
 
+    /// ADR-0018: PERS-PROV-018.
     #[tokio::test]
     async fn list_routes_rejects_non_uuid_instance_id() {
         let registry =
