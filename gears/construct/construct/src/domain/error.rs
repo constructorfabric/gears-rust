@@ -2,14 +2,13 @@ use toolkit_canonical_errors::CanonicalError;
 use toolkit_db::DbError;
 use toolkit_macros::domain_model;
 
+use super::refusal::Refusal;
+
 #[domain_model]
 #[derive(Debug, thiserror::Error)]
 pub enum DomainError {
-    #[error("Note not found")]
-    NotFound,
-
-    #[error("Validation error on field '{field}': {message}")]
-    Validation { field: String, message: String },
+    #[error("Record refused: {} at '{}': {}", .0.reason.code(), .0.place, .0.rule)]
+    Refused(Refusal),
 
     #[error("Access forbidden: {0}")]
     Forbidden(String),
@@ -25,13 +24,6 @@ pub enum DomainError {
 }
 
 impl DomainError {
-    pub fn validation(field: impl Into<String>, message: impl Into<String>) -> Self {
-        Self::Validation {
-            field: field.into(),
-            message: message.into(),
-        }
-    }
-
     pub fn forbidden(message: impl Into<String>) -> Self {
         Self::Forbidden(message.into())
     }
@@ -44,7 +36,7 @@ impl DomainError {
 /// Whether retrying the failed call can help: the error answers with one of the
 /// platform's retryable HTTP statuses, 429, 503 or 504 (`is_retryable_status` in
 /// `toolkit-contract`). Any other status is not retryable.
-fn is_retryable(inner: &CanonicalError) -> bool {
+pub(crate) fn is_retryable(inner: &CanonicalError) -> bool {
     matches!(inner.status_code(), 429 | 503 | 504)
 }
 
@@ -72,14 +64,14 @@ fn describe_failure(inner: &CanonicalError) -> String {
 impl From<authz_resolver_sdk::EnforcerError> for DomainError {
     fn from(e: authz_resolver_sdk::EnforcerError) -> Self {
         match e {
-            // @cpt-begin:cpt-cf-construct-algo-gear-foundation-scope-note-access:p1:inst-scope-denied
-            // @cpt-begin:cpt-cf-construct-algo-gear-foundation-scope-note-access:p1:inst-scope-denied-return
+            // @cpt-begin:cpt-cf-construct-algo-gear-foundation-map-errors:p1:inst-map-enforcer-denied
+            // @cpt-begin:cpt-cf-construct-algo-gear-foundation-map-errors:p1:inst-map-enforcer-denied-return
             authz_resolver_sdk::EnforcerError::Denied { .. }
             | authz_resolver_sdk::EnforcerError::CompileFailed(_) => Self::Forbidden(e.to_string()),
-            // @cpt-end:cpt-cf-construct-algo-gear-foundation-scope-note-access:p1:inst-scope-denied-return
-            // @cpt-end:cpt-cf-construct-algo-gear-foundation-scope-note-access:p1:inst-scope-denied
-            // @cpt-begin:cpt-cf-construct-algo-gear-foundation-scope-note-access:p1:inst-scope-failed
-            // @cpt-begin:cpt-cf-construct-algo-gear-foundation-scope-note-access:p1:inst-scope-failed-return
+            // @cpt-end:cpt-cf-construct-algo-gear-foundation-map-errors:p1:inst-map-enforcer-denied-return
+            // @cpt-end:cpt-cf-construct-algo-gear-foundation-map-errors:p1:inst-map-enforcer-denied
+            // @cpt-begin:cpt-cf-construct-algo-gear-foundation-map-errors:p1:inst-map-enforcer-failed
+            // @cpt-begin:cpt-cf-construct-algo-gear-foundation-map-errors:p1:inst-map-enforcer-failed-return
             // A failure that the caller may retry is unavailable; any other
             // failure of the policy service is an internal error.
             authz_resolver_sdk::EnforcerError::EvaluationFailed(inner) if is_retryable(&inner) => {
@@ -89,7 +81,13 @@ impl From<authz_resolver_sdk::EnforcerError> for DomainError {
                 Self::Internal(describe_failure(&inner))
             }
         }
-        // @cpt-end:cpt-cf-construct-algo-gear-foundation-scope-note-access:p1:inst-scope-failed-return
-        // @cpt-end:cpt-cf-construct-algo-gear-foundation-scope-note-access:p1:inst-scope-failed
+        // @cpt-end:cpt-cf-construct-algo-gear-foundation-map-errors:p1:inst-map-enforcer-failed-return
+        // @cpt-end:cpt-cf-construct-algo-gear-foundation-map-errors:p1:inst-map-enforcer-failed
+    }
+}
+
+impl From<Refusal> for DomainError {
+    fn from(refusal: Refusal) -> Self {
+        Self::Refused(refusal)
     }
 }
