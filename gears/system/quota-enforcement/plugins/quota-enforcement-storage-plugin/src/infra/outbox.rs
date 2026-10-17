@@ -12,7 +12,7 @@
 use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
-use quota_enforcement_sdk::{NotificationEvent, TenantId};
+use quota_enforcement_sdk::{NotificationEvent, NotificationScope, TenantId};
 use toolkit_db::Db;
 use toolkit_db::outbox::{Outbox, OutboxError, OutboxHandle, OutboxMessageId, Records};
 use toolkit_db::secure::DBRunner;
@@ -112,11 +112,12 @@ impl NotificationEnqueuer for QeOutbox {
         for event in events {
             let payload =
                 serde_json::to_vec(event).map_err(|e| EnqueueError::Serialize(e.to_string()))?;
-            batch = batch.push_with_type(
-                Self::partition_for(event.tenant_id),
-                payload,
-                event.kind.as_str(),
-            );
+            let partition = match event.scope {
+                NotificationScope::Tenant { tenant_id } => Self::partition_for(tenant_id),
+                // All policy transitions share one ordered platform stream.
+                NotificationScope::Platform => 0,
+            };
+            batch = batch.push_with_type(partition, payload, event.kind.as_str());
         }
         let wake = outbox.enqueue_batch(runner, batch.build()?).await?;
         let ids = wake.ids().to_vec();

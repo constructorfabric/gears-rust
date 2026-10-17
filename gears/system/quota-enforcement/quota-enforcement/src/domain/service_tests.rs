@@ -6,7 +6,7 @@ use quota_enforcement_sdk::testing::InMemoryStorage;
 use super::Service;
 use crate::domain::admission::Admission;
 use crate::domain::bootstrap::Bound;
-use crate::domain::catalog::ProjectionContractCatalog;
+use crate::domain::catalog::{MetricClassifications, ProjectionContractCatalog};
 use crate::domain::error::{Dependency, DomainError};
 use crate::domain::ports::metrics::NoopMetrics;
 use crate::domain::quotas::QuotaLimits;
@@ -29,6 +29,15 @@ fn service() -> Service {
         Admission::new(enforcer, Arc::new(NoopMetrics)),
         Arc::new(Readiness::new()),
         limits(),
+        crate::test_support::policy_limits(),
+        crate::domain::service::OperationsRuntime {
+            cache_entries: 16,
+            cache_ttl: std::time::Duration::from_secs(5),
+            preparation_max_attempts: std::num::NonZeroU32::new(3).expect("attempts"),
+            leases: crate::domain::operations::LeaseLimits::default(),
+            batch: crate::domain::operations::BatchLimits::default(),
+            snapshot: crate::domain::operations::SnapshotLimits::default(),
+        },
     )
 }
 
@@ -63,11 +72,17 @@ fn dependencies_are_not_ready_until_bound_and_bind_happens_once() {
     );
 
     let bound = Bound {
+        engines: Arc::new(crate::domain::engines::builtin_registry().expect("engines")),
+        artifacts: Arc::new(crate::domain::engines::PolicyArtifactCache::new(
+            std::num::NonZeroUsize::new(256).expect("capacity"),
+            std::num::NonZeroUsize::new(2).expect("permits"),
+        )),
         storage: Arc::new(InMemoryStorage::new()),
         coordinator: Arc::new(NoopCoordinator),
         catalog: Arc::new(ProjectionContractCatalog::empty()),
         registry: Arc::new(FakeContractRegistry::empty()),
         metric_registry: Arc::new(FakeMetricRegistry::empty()),
+        classifications: Arc::new(MetricClassifications::default()),
     };
     svc.bind(bound.clone()).expect("first bind");
     assert!(svc.storage().is_ok());

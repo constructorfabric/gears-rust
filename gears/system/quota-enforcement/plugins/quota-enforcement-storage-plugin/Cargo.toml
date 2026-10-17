@@ -47,6 +47,8 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true, features = ["v7"] }
+# The contention budget's backoff between refused-lock retries (I8).
+tokio = { workspace = true, features = ["time"] }
 
 # Required by the toolkit::gear macro.
 inventory = { workspace = true }
@@ -55,6 +57,9 @@ inventory = { workspace = true }
 quota-enforcement-sdk = { workspace = true, features = ["test-util"] }
 tokio = { workspace = true, features = ["rt", "macros"] }
 tokio-util = { workspace = true }
+# File-backed SQLite tests: the directory, WAL files included, goes on drop,
+# and a file Windows still holds open cannot fail the test.
+tempfile = { workspace = true }
 # Unconditional: dev-dependencies cannot be optional; the suite that needs a
 # container is `#![cfg(feature = "postgres")]`-gated.
 testcontainers = { workspace = true }

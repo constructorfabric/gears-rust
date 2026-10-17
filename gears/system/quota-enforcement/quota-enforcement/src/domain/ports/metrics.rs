@@ -7,12 +7,15 @@
 //! instruments to this port; none of them leaves the catalogue.
 //!
 //! Cardinality rule (`cpt-cf-quota-enforcement-constraint-bounded-cardinality`):
-//! every label value is a `&'static str` from a closed enum. `tenant_id`,
+//! every label value is a `&'static str` from a closed enum, or a
+//! [`MetricLabel`], whose values are the metrics the catalogue admitted when
+//! the gear started — a set closed at bootstrap. `tenant_id`,
 //! `subject_id`, `quota_id`, `policy_id`, idempotency keys, lease tokens,
 //! projection types, caller attribution, and raw metric input never appear as
 //! labels. They belong to spans and structured logs.
 
 use std::fmt;
+use std::sync::Arc;
 
 use toolkit_macros::domain_model;
 
@@ -21,6 +24,39 @@ pub const REASON_LABEL: &str = "reason";
 
 /// Label key of the contract-validation counters.
 pub const SURFACE_LABEL: &str = "surface";
+
+/// Label key of the lease instruments.
+pub const METRIC_LABEL: &str = "metric";
+
+/// A `metric` label value: the canonical id of a metric the catalogue admitted
+/// at bootstrap.
+///
+/// Only [`MetricClassifications`](crate::domain::catalog::MetricClassifications)
+/// makes one, from its frozen snapshot, so the values an instrument can carry
+/// are exactly the admitted metrics and never raw caller input.
+#[domain_model]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct MetricLabel(Arc<str>);
+
+impl MetricLabel {
+    /// The label of an admitted metric. Crate-private: the classification
+    /// snapshot is the only caller.
+    pub(crate) fn admitted(metric: &quota_enforcement_sdk::MetricId) -> Self {
+        Self(Arc::from(metric.as_str()))
+    }
+
+    /// The label value.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// The label value, shared rather than copied.
+    #[must_use]
+    pub fn shared(&self) -> Arc<str> {
+        Arc::clone(&self.0)
+    }
+}
 
 /// Closed `reason` set of `denial_total`.
 // @cpt-dod:cpt-cf-quota-enforcement-dod-telemetry-conventions:p1
@@ -35,16 +71,41 @@ pub enum DenialReason {
     InvalidArgument,
     /// Bootstrap has not completed.
     NotReady,
+    /// An applicable Quota would be exceeded.
+    QuotaExceeded,
+    /// No active Quota covers the metric, so nothing was recorded.
+    NoApplicableQuota,
+    /// The policy's engine denied for a reason of its own. Engine reasons are
+    /// authored in policy and are unbounded, so they collapse into this one
+    /// label rather than opening the label set to arbitrary strings.
+    EngineDenied,
 }
 
 impl DenialReason {
     /// Every value, for conformance tests.
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 7] = [
         Self::PermissionDenied,
         Self::PdpUnavailable,
         Self::InvalidArgument,
         Self::NotReady,
+        Self::QuotaExceeded,
+        Self::NoApplicableQuota,
+        Self::EngineDenied,
     ];
+
+    /// The label of a decision's closed reason token.
+    ///
+    /// Anything an engine authored that is not one of the two tokens the
+    /// platform defines counts as an engine denial, which keeps the label set
+    /// closed however a policy is written.
+    #[must_use]
+    pub fn from_decision_reason(reason: &str) -> Self {
+        match reason {
+            quota_enforcement_sdk::NO_APPLICABLE_QUOTA => Self::NoApplicableQuota,
+            "QUOTA_EXCEEDED" => Self::QuotaExceeded,
+            _ => Self::EngineDenied,
+        }
+    }
 
     /// Stable label value.
     #[must_use]
@@ -54,6 +115,81 @@ impl DenialReason {
             Self::PdpUnavailable => "pdp_unavailable",
             Self::InvalidArgument => "invalid_argument",
             Self::NotReady => "not_ready",
+            Self::QuotaExceeded => "quota_exceeded",
+            Self::NoApplicableQuota => "no_applicable_quota",
+            Self::EngineDenied => "engine_denied",
+        }
+    }
+}
+
+/// Closed `operation` set of the hot-path latency histogram and the replay
+/// counter.
+#[domain_model]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OperationKind {
+    /// Charge against every applicable Quota.
+    Debit,
+    /// Return consumption to one Quota.
+    Credit,
+    /// Reverse a committed debit.
+    Rollback,
+    /// Evaluate without mutating.
+    Preview,
+    /// Acquire a lease.
+    Reserve,
+    /// Commit a lease.
+    Commit,
+    /// Release a lease.
+    Release,
+}
+
+impl OperationKind {
+    /// Every value, for conformance tests.
+    pub const ALL: [Self; 7] = [
+        Self::Debit,
+        Self::Credit,
+        Self::Rollback,
+        Self::Preview,
+        Self::Reserve,
+        Self::Commit,
+        Self::Release,
+    ];
+
+    /// Stable label value.
+    #[must_use]
+    pub const fn as_label(self) -> &'static str {
+        match self {
+            Self::Debit => "debit",
+            Self::Credit => "credit",
+            Self::Rollback => "rollback",
+            Self::Preview => "preview",
+            Self::Reserve => "reserve",
+            Self::Commit => "commit",
+            Self::Release => "release",
+        }
+    }
+}
+
+/// Closed `table` set of the retention counters.
+#[domain_model]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetentionTable {
+    /// Replay records.
+    Idempotency,
+    /// The operation ledger.
+    OperationLog,
+}
+
+impl RetentionTable {
+    /// Every value, for conformance tests.
+    pub const ALL: [Self; 2] = [Self::Idempotency, Self::OperationLog];
+
+    /// Stable label value.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Idempotency => "idempotency",
+            Self::OperationLog => "operation_log",
         }
     }
 }
@@ -215,7 +351,23 @@ impl fmt::Display for ValidationReason {
 
 /// Gear-specific instruments. Implemented on the platform meter in
 /// `infra::metrics`; a no-op double serves tests.
+// @cpt-dod:cpt-cf-quota-enforcement-dod-policy-engine-telemetry:p1
 pub trait QeMetrics: Send + Sync {
+    /// Registration or persisted-artifact bootstrap failure.
+    fn record_engine_bootstrap_failure(&self, engine: EngineLabel);
+    /// Evaluation duration on both success and failure.
+    fn record_engine_evaluation(&self, engine: EngineLabel, elapsed: std::time::Duration);
+    /// Rejected engine decision by closed invariant label.
+    fn record_plan_violation(
+        &self,
+        engine: EngineLabel,
+        invariant: quota_enforcement_sdk::engine::DebitPlanInvariant,
+    );
+    /// One committed transition, excluding no-op retries.
+    fn record_policy_transition(&self, transition: PolicyTransition);
+    /// One rejected optimistic concurrency check.
+    fn record_policy_conflict(&self);
+
     /// `denial_total{reason}` += 1.
     fn record_denial(&self, reason: DenialReason);
 
@@ -228,6 +380,50 @@ pub trait QeMetrics: Send + Sync {
 
     /// `admitted_metric_violations_total{surface}` += 1.
     fn record_admitted_metric_violation(&self, surface: ValidationSurface);
+
+    /// `evaluation_seconds{operation}` observes one hot-path call, on success
+    /// and on failure alike: a slow refusal is as interesting as a slow commit.
+    fn record_evaluation(&self, operation: OperationKind, elapsed: std::time::Duration);
+
+    /// `idempotency_replays_total{operation}` += 1.
+    fn record_idempotency_replay(&self, operation: OperationKind);
+
+    /// `retention_reclaimed_total{table}` += `rows`.
+    fn record_retention_reclaimed(&self, table: RetentionTable, rows: u64);
+
+    /// `retention_sweep_failures_total{table}` += 1.
+    fn record_retention_failure(&self, table: RetentionTable);
+
+    /// `lease_acquisition_wait_seconds{metric}` observes one acquisition,
+    /// from the storage call to its answer: admitted, denied, or refused on
+    /// the cap or on contention.
+    fn record_lease_acquisition_wait(&self, metric: &MetricLabel, elapsed: std::time::Duration);
+
+    /// `lease_contention_rejected_total{metric}` += 1.
+    fn record_lease_contention_rejected(&self, metric: &MetricLabel);
+
+    /// `lease_inflight_limit_exceeded_total{metric}` += 1.
+    fn record_lease_inflight_limit_exceeded(&self, metric: &MetricLabel);
+}
+
+/// One backlog sample: expired, unreclaimed leases per admitted metric.
+pub type LeaseBacklog = Vec<(MetricLabel, u64)>;
+
+/// Where the lease sweeper publishes the expired-but-unreclaimed backlog that
+/// `lease_unreclaimed_expired{metric}` observes. `None` withdraws the sample:
+/// a replica that does not lead has nothing to report.
+pub trait LeaseBacklogSink: Send + Sync {
+    /// Replace the published sample.
+    fn publish(&self, backlog: Option<LeaseBacklog>);
+}
+
+/// Publishes nothing. For tests and pre-init contexts.
+#[domain_model]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NoopLeaseBacklog;
+
+impl LeaseBacklogSink for NoopLeaseBacklog {
+    fn publish(&self, _backlog: Option<LeaseBacklog>) {}
 }
 
 /// Records nothing. For tests and pre-init contexts.
@@ -236,6 +432,17 @@ pub trait QeMetrics: Send + Sync {
 pub struct NoopMetrics;
 
 impl QeMetrics for NoopMetrics {
+    fn record_engine_bootstrap_failure(&self, _: EngineLabel) {}
+    fn record_engine_evaluation(&self, _: EngineLabel, _: std::time::Duration) {}
+    fn record_plan_violation(
+        &self,
+        _: EngineLabel,
+        _: quota_enforcement_sdk::engine::DebitPlanInvariant,
+    ) {
+    }
+    fn record_policy_transition(&self, _: PolicyTransition) {}
+    fn record_policy_conflict(&self) {}
+
     fn record_denial(&self, _reason: DenialReason) {}
 
     fn record_contract_validation_failure(
@@ -246,4 +453,68 @@ impl QeMetrics for NoopMetrics {
     }
 
     fn record_admitted_metric_violation(&self, _surface: ValidationSurface) {}
+    fn record_evaluation(&self, _operation: OperationKind, _elapsed: std::time::Duration) {}
+    fn record_idempotency_replay(&self, _operation: OperationKind) {}
+    fn record_retention_reclaimed(&self, _table: RetentionTable, _rows: u64) {}
+    fn record_retention_failure(&self, _table: RetentionTable) {}
+    fn record_lease_acquisition_wait(&self, _: &MetricLabel, _: std::time::Duration) {}
+    fn record_lease_contention_rejected(&self, _: &MetricLabel) {}
+    fn record_lease_inflight_limit_exceeded(&self, _: &MetricLabel) {}
+}
+
+/// Bounded deployment engine labels; unknown submitted strings cannot enter metrics.
+#[domain_model]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EngineLabel {
+    /// Built-in deterministic selection.
+    MostRestrictiveWins,
+    /// Sandboxed CEL.
+    Cel,
+}
+impl EngineLabel {
+    /// Static telemetry value.
+    #[must_use]
+    pub const fn as_label(self) -> &'static str {
+        match self {
+            Self::MostRestrictiveWins => "most-restrictive-wins",
+            Self::Cel => "cel",
+        }
+    }
+
+    /// The label of a registered engine id, or `None` for an id outside the
+    /// bounded built-in set. The bound is what keeps operator-submitted strings
+    /// out of metric labels: an unknown id is refused at registration, never
+    /// interpolated into a label.
+    #[must_use]
+    pub fn from_id(id: &str) -> Option<Self> {
+        [Self::MostRestrictiveWins, Self::Cel]
+            .into_iter()
+            .find(|label| label.as_label() == id)
+    }
+}
+
+/// Committed policy transition labels.
+#[domain_model]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PolicyTransition {
+    /// Policy creation.
+    Create,
+    /// A new version.
+    Update,
+    /// Reactivation of historical version.
+    Rollback,
+    /// Soft deletion.
+    Delete,
+}
+impl PolicyTransition {
+    /// Static telemetry value.
+    #[must_use]
+    pub const fn as_label(self) -> &'static str {
+        match self {
+            Self::Create => "create",
+            Self::Update => "update",
+            Self::Rollback => "rollback",
+            Self::Delete => "delete",
+        }
+    }
 }
