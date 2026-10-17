@@ -6,10 +6,24 @@
     reason = "domain uses toolkit_db types like the other gears on this template until the platform-wide refactor"
 )]
 
+/// The database provider every domain service is built on.
+pub(crate) type DbProvider = toolkit_db::DBProvider<toolkit_db::DbError>;
+
+pub mod admission;
 pub mod error;
 pub mod local_client;
-pub mod repo;
-pub mod service;
+pub mod model_client;
+pub mod plan;
+pub mod record_intake;
+pub mod refusal;
+pub mod sensitive_data;
+pub mod subject_settings;
 
 #[cfg(test)]
-mod service_test;
+mod admission_test;
+#[cfg(test)]
+mod record_intake_test;
+#[cfg(test)]
+mod sensitive_data_test;
+#[cfg(test)]
+mod subject_settings_test;
