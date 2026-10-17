@@ -7,3 +7,5 @@ pub mod config_repo;
 pub mod operation_log_repo;
 pub mod quota_repo;
 pub mod schema_repo;
+
+pub mod policy_repo;

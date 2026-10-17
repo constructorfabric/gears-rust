@@ -9,6 +9,7 @@ use toolkit_db::outbox::outbox_migrations_with_prefix;
 
 mod m0001_foundation;
 mod m0002_quotas;
+mod m0003_policies;
 
 /// Prefix of the notification outbox tables (`qe_outbox_body`,
 /// `qe_outbox_incoming`, ...). The toolkit joins prefix and suffix with an
@@ -39,6 +40,7 @@ impl MigratorTrait for Migrator {
             Box::new(m0002_quotas::Migration),
         ];
         migrations.extend(outbox_migrations());
+        migrations.push(Box::new(m0003_policies::Migration));
         migrations
     }
 }
@@ -64,6 +66,6 @@ mod migrations_tests {
     #[test]
     fn the_outbox_prefix_is_accepted_by_the_toolkit() {
         assert!(outbox_migrations_with_prefix(OUTBOX_TABLE_PREFIX).is_ok());
-        assert_eq!(Migrator::migrations().len(), 3);
+        assert_eq!(Migrator::migrations().len(), 4);
     }
 }

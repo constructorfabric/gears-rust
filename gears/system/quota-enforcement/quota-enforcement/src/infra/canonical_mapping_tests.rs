@@ -6,6 +6,7 @@ use uuid::Uuid;
 
 use crate::domain::error::{Dependency, DomainError, PluginKind, ResourceKind};
 use crate::domain::ports::metrics::ValidationReason;
+use quota_enforcement_sdk::engine::DebitPlanInvariant;
 
 fn status(err: DomainError) -> u16 {
     Problem::from(CanonicalError::from(err))
@@ -105,6 +106,32 @@ fn every_variant_family_maps_to_its_documented_status() {
             500,
         ),
         (DomainError::Internal("secret detail".to_owned()), 500),
+        (
+            DomainError::EngineTimeout {
+                engine_id: "cel".to_owned(),
+            },
+            504,
+        ),
+        (
+            DomainError::EngineCostExceeded {
+                engine_id: "cel".to_owned(),
+            },
+            429,
+        ),
+        (
+            DomainError::InvariantViolation {
+                engine_id: "cel".to_owned(),
+                invariant: DebitPlanInvariant::NegativeAmount,
+            },
+            500,
+        ),
+        (
+            DomainError::EngineFailure {
+                engine_id: "cel".to_owned(),
+                detail: "type error: request.region is 42".to_owned(),
+            },
+            500,
+        ),
         (DomainError::CapMustBeNonNegative { cap: -1 }, 400),
         (DomainError::ThresholdsRequireBoundedCap, 400),
         (
@@ -260,4 +287,54 @@ fn quota_lifecycle_rejections_carry_their_tokens_and_subjects() {
         assert!(rendered.contains(token), "{token}: {rendered}");
         assert!(rendered.contains(subject), "{subject}: {rendered}");
     }
+}
+
+#[test]
+fn engine_failures_map_to_their_canonical_classes_and_leak_no_engine_detail() {
+    // The toolkit's `Internal` envelope carries a fixed detail on the wire, so
+    // the `INVARIANT_VIOLATION` sub-token is observable on the domain error,
+    // the log line and the `invariant` metric label, not in the HTTP body.
+    let violation = DomainError::InvariantViolation {
+        engine_id: "cel".to_owned(),
+        invariant: DebitPlanInvariant::QuotaIdOutsideApplicableSet,
+    };
+    assert!(
+        violation
+            .to_string()
+            .contains("quota_id_outside_applicable_set")
+    );
+    let problem = Problem::from(CanonicalError::from(violation));
+    assert_eq!(problem.status, Some(500));
+
+    // What the engine said may quote operator config or request values; the
+    // response says only that an internal error occurred.
+    let failure = Problem::from(CanonicalError::from(DomainError::EngineFailure {
+        engine_id: "cel".to_owned(),
+        detail: "type error near request.region == \"eu-secret\"".to_owned(),
+    }));
+    let rendered = serde_json::to_string(&failure).expect("json");
+    assert_eq!(failure.status, Some(500));
+    assert!(!rendered.contains("eu-secret"), "{rendered}");
+
+    let timeout = Problem::from(CanonicalError::from(DomainError::EngineTimeout {
+        engine_id: "cel".to_owned(),
+    }));
+    assert_eq!(
+        timeout.status,
+        Some(504),
+        "Timeout lifts to DeadlineExceeded"
+    );
+    let cost = Problem::from(CanonicalError::from(DomainError::EngineCostExceeded {
+        engine_id: "cel".to_owned(),
+    }));
+    assert_eq!(
+        cost.status,
+        Some(429),
+        "CostExceeded lifts to ResourceExhausted"
+    );
+    assert!(
+        serde_json::to_string(&cost)
+            .expect("json")
+            .contains("ENGINE_COST_EXCEEDED")
+    );
 }

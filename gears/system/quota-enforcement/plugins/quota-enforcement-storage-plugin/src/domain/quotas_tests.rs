@@ -25,7 +25,11 @@ fn ctx() -> SecurityContext {
 async fn plugin_over(store: FakeQuotaStore) -> (StoragePlugin, Arc<FakeQuotaStore>) {
     let store = Arc::new(store);
     let db = test_db().await;
-    let plugin = StoragePlugin::new(Arc::new(SqlFoundationStore::new(db)), store.clone());
+    let plugin = StoragePlugin::new(
+        Arc::new(SqlFoundationStore::new(db)),
+        store.clone(),
+        Arc::new(crate::test_support::FakePolicyStore::default()),
+    );
     (plugin, store)
 }
 

@@ -1,6 +1,5 @@
 //! The doubles must hold the contract semantics the gear's tests rely on.
 
-use std::collections::BTreeMap;
 use std::time::Duration;
 
 use time::OffsetDateTime;
@@ -8,16 +7,22 @@ use toolkit_security::{AccessScope, SecurityContext};
 use uuid::Uuid;
 
 use super::{
-    InMemoryStorage, empty_engine_config, quota_draft, test_metric, test_subject, test_tenant,
+    InMemoryStorage, ScriptedEvaluator, bundle_with_global_policy, empty_engine_config,
+    quota_draft, test_metric, test_subject, test_tenant,
 };
+use crate::engine::{EvaluationContext, EvaluationLimits, PolicySchemaSnapshot};
 use crate::models::{
-    ApplicableQuotas, BootstrapBundle, CapPatch, ConfigDefaults, Decision, DecisionResult, EventId,
-    IdempotencyScope, IdempotencySubjectKey, IdempotencyWrite, LeaseState, NotificationEvent,
-    NotificationEventKind, OperationType, PageRequest, PayloadHash, PolicyDraft, PolicyId,
-    PolicyScope, PolicyUpdate, PolicyVersionState, QuotaDebitPlan, QuotaFilter, QuotaId,
-    QuotaPatch, QuotaStatus,
+    ApplicableQuotas, BatchDebitItem, BootstrapBundle, CapPatch, ConfigDefaults, DecisionResult,
+    EventId, IdempotencyScope, IdempotencySubjectKey, IdempotencyWrite, LeaseState, LeaseToken,
+    NotificationEvent, NotificationEventKind, OperationType, PageRequest, PayloadHash, PolicyDraft,
+    PolicyId, PolicyScope, PolicyUpdate, PolicyVersionState, QuotaFilter, QuotaId, QuotaPatch,
+    QuotaStatus,
 };
-use crate::storage_plugin::{CONTRACT_MAJOR, QuotaEnforcementStoragePluginV1, StorageError};
+use crate::models::{EvaluatedDebit, EvaluatedLease, TransitionOutcome};
+use crate::storage_plugin::{
+    CONTRACT_MAJOR, EvaluatedBatch, EvaluatedMutation, QuotaEnforcementStoragePluginV1,
+    StorageError,
+};
 
 fn ctx() -> SecurityContext {
     SecurityContext::builder()
@@ -40,15 +45,106 @@ fn idem(op: OperationType, key: &str, payload: u8) -> IdempotencyWrite {
             key: key.to_owned(),
         },
         payload_hash: PayloadHash::from_bytes([payload; 32]),
-        decision: Decision {
-            result: DecisionResult::Allowed,
-            debit_plan: BTreeMap::new(),
-            diagnostics: BTreeMap::new(),
-        },
-        engine_id: "most-restrictive-wins".to_owned(),
-        policy_id: PolicyId::global(),
-        policy_version: 1,
     }
+}
+
+fn limits() -> EvaluationLimits {
+    EvaluationLimits {
+        upper_timeout_ms: std::num::NonZeroU64::new(5).expect("nonzero"),
+        cost_limit: std::num::NonZeroU64::new(10_000).expect("nonzero"),
+    }
+}
+
+/// A double carrying the global policy an evaluated mutation selects inside
+/// its own transaction.
+async fn storage_with_policy() -> InMemoryStorage {
+    let storage = InMemoryStorage::new();
+    storage
+        .bootstrap(&bundle_with_global_policy())
+        .await
+        .expect("bootstrap");
+    storage
+}
+
+/// The two primitives that evaluate inside their own transaction, with the
+/// scripted evaluator and an empty environment supplied for the caller.
+trait EvaluatedMutations {
+    async fn apply_debit_plan_for(
+        &self,
+        amount: u64,
+        write: &IdempotencyWrite,
+    ) -> Result<TransitionOutcome<EvaluatedDebit>, StorageError>;
+
+    async fn acquire_lease_for(
+        &self,
+        amount: u64,
+        ttl: Duration,
+        write: &IdempotencyWrite,
+    ) -> Result<TransitionOutcome<EvaluatedLease>, StorageError>;
+}
+
+impl EvaluatedMutations for InMemoryStorage {
+    async fn apply_debit_plan_for(
+        &self,
+        amount: u64,
+        write: &IdempotencyWrite,
+    ) -> Result<TransitionOutcome<EvaluatedDebit>, StorageError> {
+        let storage = self;
+        let evaluator = ScriptedEvaluator::new();
+        let call = |context: &EvaluationContext<'_>| evaluator.evaluate(context);
+        let applicable = applicable();
+        storage
+            .apply_debit_plan(
+                &ctx(),
+                &scope(),
+                &EvaluatedMutation {
+                    applicable: &applicable,
+                    amount,
+                    request: &serde_json::Value::Null,
+                    resource: &serde_json::Value::Null,
+                    user_projection: None,
+                    limits: limits(),
+                    idempotency: write,
+                    evaluate: &call,
+                },
+                &[],
+            )
+            .await
+    }
+
+    async fn acquire_lease_for(
+        &self,
+        amount: u64,
+        ttl: Duration,
+        write: &IdempotencyWrite,
+    ) -> Result<TransitionOutcome<EvaluatedLease>, StorageError> {
+        let storage = self;
+        let evaluator = ScriptedEvaluator::new();
+        let call = |context: &EvaluationContext<'_>| evaluator.evaluate(context);
+        let applicable = applicable();
+        storage
+            .acquire_lease(
+                &ctx(),
+                &scope(),
+                &EvaluatedMutation {
+                    applicable: &applicable,
+                    amount,
+                    request: &serde_json::Value::Null,
+                    resource: &serde_json::Value::Null,
+                    user_projection: None,
+                    limits: limits(),
+                    idempotency: write,
+                    evaluate: &call,
+                },
+                ttl,
+            )
+            .await
+    }
+}
+
+/// The token of an acquisition the evaluator allowed.
+fn token_of(outcome: &TransitionOutcome<EvaluatedLease>) -> LeaseToken {
+    outcome.get().token.expect("an allowed acquisition holds")
 }
 
 fn applicable() -> ApplicableQuotas {
@@ -64,10 +160,6 @@ async fn seeded_quota(storage: &InMemoryStorage, cap: Option<u64>) -> QuotaId {
         .create_quota(&ctx(), &scope(), quota_draft(test_subject("u1"), cap), &[])
         .await
         .expect("create quota")
-}
-
-fn plan(id: QuotaId, amount: u64) -> BTreeMap<QuotaId, QuotaDebitPlan> {
-    BTreeMap::from([(id, QuotaDebitPlan { amount })])
 }
 
 // --- storage bootstrap -----------------------------------------------------
@@ -115,6 +207,7 @@ async fn storage_bootstrap_seeds_the_global_policy_when_the_bundle_carries_one()
     let storage = InMemoryStorage::new();
     let mut bundle = BootstrapBundle::foundation();
     bundle.global_policy = Some(PolicyDraft {
+        schema_snapshot: PolicySchemaSnapshot::default(),
         scope: PolicyScope::Global,
         engine_id: "most-restrictive-wins".to_owned(),
         engine_config: empty_engine_config(),
@@ -159,33 +252,30 @@ async fn storage_injected_failure_blocks_every_call_until_cleared() {
 
 #[tokio::test]
 async fn storage_debit_plan_mutates_counters_once_and_replays_verbatim() {
-    let storage = InMemoryStorage::new();
+    let storage = storage_with_policy().await;
     let id = seeded_quota(&storage, Some(100)).await;
     let write = idem(OperationType::Debit, "k1", 7);
     let first = storage
-        .apply_debit_plan(&ctx(), &scope(), &applicable(), &plan(id, 40), &write, &[])
+        .apply_debit_plan_for(40, &write)
         .await
         .expect("first debit");
-    assert_eq!(first.counters[0].value, 40);
+    assert_eq!(first.get().mutation.counters[0].value, 40);
     assert_eq!(storage.consumed(id), 40);
 
     let replay = storage
-        .apply_debit_plan(&ctx(), &scope(), &applicable(), &plan(id, 40), &write, &[])
+        .apply_debit_plan_for(40, &write)
         .await
         .expect("replay");
     assert_eq!(storage.consumed(id), 40, "replay must not mutate");
-    assert_eq!(replay.counters[0].value, 40);
+    assert!(
+        matches!(replay, TransitionOutcome::NoOp(_)),
+        "a replay is typed as one"
+    );
+    assert_eq!(replay.get().mutation.counters[0].value, 40);
 
     let mismatch = idem(OperationType::Debit, "k1", 8);
     let err = storage
-        .apply_debit_plan(
-            &ctx(),
-            &scope(),
-            &applicable(),
-            &plan(id, 1),
-            &mismatch,
-            &[],
-        )
+        .apply_debit_plan_for(1, &mismatch)
         .await
         .expect_err("different payload under the same key");
     assert_eq!(err, StorageError::IdempotencyPayloadMismatch);
@@ -200,17 +290,10 @@ async fn storage_debit_plan_mutates_counters_once_and_replays_verbatim() {
 
 #[tokio::test]
 async fn storage_update_enforces_cap_versus_consumed_and_bumps_the_version() {
-    let storage = InMemoryStorage::new();
+    let storage = storage_with_policy().await;
     let id = seeded_quota(&storage, Some(100)).await;
     storage
-        .apply_debit_plan(
-            &ctx(),
-            &scope(),
-            &applicable(),
-            &plan(id, 60),
-            &idem(OperationType::Debit, "d", 1),
-            &[],
-        )
+        .apply_debit_plan_for(60, &idem(OperationType::Debit, "d", 1))
         .await
         .expect("debit");
     let err = storage
@@ -263,25 +346,15 @@ async fn storage_update_enforces_cap_versus_consumed_and_bumps_the_version() {
 
 #[tokio::test]
 async fn storage_lease_lifecycle_commit_release_expiry_and_deactivation() {
-    let storage = InMemoryStorage::new();
-    storage
-        .bootstrap(&BootstrapBundle::foundation())
-        .await
-        .expect("bootstrap");
+    let storage = storage_with_policy().await;
     let id = seeded_quota(&storage, Some(100)).await;
     let ttl = Duration::from_mins(1);
 
-    let token = storage
-        .acquire_lease(
-            &ctx(),
-            &scope(),
-            &applicable(),
-            &plan(id, 30),
-            ttl,
-            &idem(OperationType::Reserve, "r1", 1),
-        )
+    let first_lease = storage
+        .acquire_lease_for(30, ttl, &idem(OperationType::Reserve, "r1", 1))
         .await
         .expect("acquire");
+    let token = token_of(&first_lease);
     assert_eq!(storage.consumed(id), 30);
     assert_eq!(storage.lease_state(token), Some(LeaseState::Active));
 
@@ -329,17 +402,11 @@ async fn storage_lease_lifecycle_commit_release_expiry_and_deactivation() {
         .expect_err("terminal lease");
     assert_eq!(again, StorageError::LeaseNotActive { token });
 
-    let token2 = storage
-        .acquire_lease(
-            &ctx(),
-            &scope(),
-            &applicable(),
-            &plan(id, 10),
-            ttl,
-            &idem(OperationType::Reserve, "r2", 1),
-        )
+    let expiring_lease = storage
+        .acquire_lease_for(10, ttl, &idem(OperationType::Reserve, "r2", 1))
         .await
         .expect("second lease");
+    let token2 = token_of(&expiring_lease);
     storage.expire_leases();
     let expired = storage
         .commit_lease(
@@ -362,17 +429,11 @@ async fn storage_lease_lifecycle_commit_release_expiry_and_deactivation() {
     assert_eq!(storage.consumed(id), 20, "auto-release returned the hold");
     assert_eq!(storage.lease_state(token2), Some(LeaseState::AutoReleased));
 
-    let token3 = storage
-        .acquire_lease(
-            &ctx(),
-            &scope(),
-            &applicable(),
-            &plan(id, 5),
-            ttl,
-            &idem(OperationType::Reserve, "r3", 1),
-        )
+    let held_lease = storage
+        .acquire_lease_for(5, ttl, &idem(OperationType::Reserve, "r3", 1))
         .await
         .expect("third lease");
+    let token3 = token_of(&held_lease);
     let outcome = storage
         .deactivate_quota(&ctx(), &scope(), id, &[])
         .await
@@ -382,44 +443,37 @@ async fn storage_lease_lifecycle_commit_release_expiry_and_deactivation() {
         storage.lease_state(token3),
         Some(LeaseState::ResolvedByDeactivation)
     );
+    // A deactivated Quota leaves the applicable set the transaction builds, so
+    // the operation is denied by the policy rather than failing on the row.
     let blocked = storage
-        .apply_debit_plan(
-            &ctx(),
-            &scope(),
-            &applicable(),
-            &plan(id, 1),
-            &idem(OperationType::Debit, "z", 1),
-            &[],
-        )
+        .apply_debit_plan_for(1, &idem(OperationType::Debit, "z", 1))
         .await
-        .expect_err("deactivated quota accepts no debit");
-    assert_eq!(blocked, StorageError::QuotaDeactivated { id });
+        .expect("a debit with nothing applicable still decides");
+    assert!(matches!(
+        blocked.get().decision.result,
+        DecisionResult::Denied { ref reason, .. } if reason == "NO_APPLICABLE_QUOTA"
+    ));
+    assert_eq!(storage.consumed(id), 20, "a denial moves no counter");
 }
 
 #[tokio::test]
 async fn storage_active_lease_cap_is_enforced_from_the_seeded_defaults() {
     let storage = InMemoryStorage::new();
-    let mut bundle = BootstrapBundle::foundation();
+    let mut bundle = bundle_with_global_policy();
     bundle.config_defaults.max_active_leases = 1;
     storage.bootstrap(&bundle).await.expect("bootstrap");
-    let id = seeded_quota(&storage, None).await;
+    let _quota = seeded_quota(&storage, None).await;
     storage
-        .acquire_lease(
-            &ctx(),
-            &scope(),
-            &applicable(),
-            &plan(id, 1),
+        .acquire_lease_for(
+            1,
             Duration::from_secs(9),
             &idem(OperationType::Reserve, "a", 1),
         )
         .await
         .expect("first");
     let err = storage
-        .acquire_lease(
-            &ctx(),
-            &scope(),
-            &applicable(),
-            &plan(id, 1),
+        .acquire_lease_for(
+            1,
             Duration::from_secs(9),
             &idem(OperationType::Reserve, "b", 1),
         )
@@ -430,17 +484,10 @@ async fn storage_active_lease_cap_is_enforced_from_the_seeded_defaults() {
 
 #[tokio::test]
 async fn storage_snapshot_reads_reflect_scope_and_remaining_capacity() {
-    let storage = InMemoryStorage::new();
-    let id = seeded_quota(&storage, Some(10)).await;
+    let storage = storage_with_policy().await;
+    let _quota = seeded_quota(&storage, Some(10)).await;
     storage
-        .apply_debit_plan(
-            &ctx(),
-            &scope(),
-            &applicable(),
-            &plan(id, 4),
-            &idem(OperationType::Debit, "d", 1),
-            &[],
-        )
+        .apply_debit_plan_for(4, &idem(OperationType::Debit, "d", 1))
         .await
         .expect("debit");
     let snaps = storage
@@ -471,6 +518,7 @@ async fn storage_snapshot_reads_reflect_scope_and_remaining_capacity() {
 async fn storage_policy_versions_update_rollback_and_delete() {
     let storage = InMemoryStorage::new();
     let draft = PolicyDraft {
+        schema_snapshot: PolicySchemaSnapshot::default(),
         scope: PolicyScope::Global,
         engine_id: "most-restrictive-wins".to_owned(),
         engine_config: empty_engine_config(),
@@ -488,9 +536,10 @@ async fn storage_policy_versions_update_rollback_and_delete() {
         .create_policy(&ctx(), draft, &[])
         .await
         .expect_err("scope taken");
-    assert!(matches!(dup, StorageError::VersionConflict { .. }));
+    assert!(matches!(dup, StorageError::PolicyScopeOccupied { .. }));
 
     let stale = PolicyUpdate {
+        schema_snapshot: None,
         if_match_version: 7,
         engine_id: None,
         engine_config: None,
@@ -515,6 +564,7 @@ async fn storage_policy_versions_update_rollback_and_delete() {
             &ctx(),
             PolicyId::global(),
             PolicyUpdate {
+                schema_snapshot: None,
                 if_match_version: 1,
                 engine_id: Some("cel".to_owned()),
                 engine_config: None,
@@ -541,6 +591,8 @@ async fn storage_policy_versions_update_rollback_and_delete() {
         .rollback_policy(&ctx(), PolicyId::global(), 1, None, &[])
         .await
         .expect("rollback");
+    assert!(back.is_applied(), "the pointer moved off version 2");
+    let back = back.into_inner();
     assert_eq!(back.version, 1);
     assert_eq!(back.state, PolicyVersionState::Active);
     assert_eq!(
@@ -568,36 +620,27 @@ async fn storage_policy_versions_update_rollback_and_delete() {
         StorageError::UnknownPolicyVersion { version: 9, .. }
     ));
 
-    storage
-        .delete_policy(&ctx(), PolicyId::global(), None, &[])
-        .await
-        .expect("delete");
+    assert_eq!(
+        storage
+            .delete_policy(&ctx(), PolicyId::global(), None, &[])
+            .await,
+        Err(StorageError::CannotDeleteSeededGlobalPolicy)
+    );
     assert!(
         storage
             .read_policy(&PolicyScope::Global)
             .await
             .expect("read")
-            .is_none()
+            .is_some()
     );
-    storage
-        .delete_policy(&ctx(), PolicyId::global(), None, &[])
-        .await
-        .expect("idempotent delete");
 }
 
 #[tokio::test]
 async fn storage_reclaims_expired_idempotency_records_and_log_entries() {
-    let storage = InMemoryStorage::new();
-    let id = seeded_quota(&storage, None).await;
+    let storage = storage_with_policy().await;
+    let _quota = seeded_quota(&storage, None).await;
     storage
-        .apply_debit_plan(
-            &ctx(),
-            &scope(),
-            &applicable(),
-            &plan(id, 1),
-            &idem(OperationType::Debit, "d", 1),
-            &[],
-        )
+        .apply_debit_plan_for(1, &idem(OperationType::Debit, "d", 1))
         .await
         .expect("debit");
     let far_future = OffsetDateTime::now_utc() + time::Duration::days(10);
@@ -707,7 +750,9 @@ fn quota_changed(quota_id: Option<QuotaId>) -> NotificationEvent {
     NotificationEvent {
         event_id: EventId::generate(),
         kind: NotificationEventKind::QuotaChanged,
-        tenant_id: test_tenant(),
+        scope: crate::NotificationScope::Tenant {
+            tenant_id: test_tenant(),
+        },
         quota_id,
         policy_id: None,
         subject: None,
@@ -801,37 +846,21 @@ async fn storage_update_rejects_thresholds_on_an_unbounded_merged_row() {
 
 #[tokio::test]
 async fn storage_deactivation_is_terminal_returns_held_capacity_and_skips_expired_leases() {
-    let storage = InMemoryStorage::new();
-    storage
-        .bootstrap(&BootstrapBundle::foundation())
-        .await
-        .expect("bootstrap");
+    let storage = storage_with_policy().await;
     let id = seeded_quota(&storage, Some(100)).await;
     let ttl = Duration::from_mins(1);
 
-    let expired = storage
-        .acquire_lease(
-            &ctx(),
-            &scope(),
-            &applicable(),
-            &plan(id, 30),
-            ttl,
-            &idem(OperationType::Reserve, "e", 1),
-        )
+    let expired_outcome = storage
+        .acquire_lease_for(30, ttl, &idem(OperationType::Reserve, "e", 1))
         .await
         .expect("lease that will expire");
+    let expired = token_of(&expired_outcome);
     storage.expire_leases();
-    let live = storage
-        .acquire_lease(
-            &ctx(),
-            &scope(),
-            &applicable(),
-            &plan(id, 5),
-            ttl,
-            &idem(OperationType::Reserve, "l", 1),
-        )
+    let live_outcome = storage
+        .acquire_lease_for(5, ttl, &idem(OperationType::Reserve, "l", 1))
         .await
         .expect("live lease");
+    let live = token_of(&live_outcome);
     assert_eq!(storage.consumed(id), 35);
 
     let outcome = storage
@@ -1110,5 +1139,567 @@ async fn storage_update_quota_moves_the_contract_reference_with_the_metadata() {
     assert_eq!(
         unrelated.constraint_contract, v2,
         "other patches leave it alone"
+    );
+}
+
+#[tokio::test]
+async fn deleted_policy_history_survives_scope_recreation_and_replays_are_noops() {
+    let storage = InMemoryStorage::new();
+    let draft = PolicyDraft {
+        schema_snapshot: PolicySchemaSnapshot::default(),
+        scope: PolicyScope::Metric {
+            metric: test_metric(),
+        },
+        engine_id: "most-restrictive-wins".into(),
+        engine_config: empty_engine_config(),
+        timeout_ms: None,
+        description: None,
+        comment: Some("original".into()),
+        created_by: "operator".into(),
+    };
+    let first = storage
+        .create_policy(&ctx(), draft.clone(), &[])
+        .await
+        .expect("create");
+    assert!(
+        storage
+            .delete_policy(&ctx(), first.policy_id.clone(), Some("retire".into()), &[])
+            .await
+            .expect("delete")
+            .is_applied()
+    );
+    let count = storage.policy_audit().len();
+    assert!(
+        !storage
+            .delete_policy(&ctx(), first.policy_id.clone(), None, &[])
+            .await
+            .expect("replay")
+            .is_applied(),
+        "a repeated delete reports a no-op"
+    );
+    assert_eq!(storage.policy_audit().len(), count);
+    assert_eq!(
+        storage
+            .policy_audit()
+            .last()
+            .and_then(|entry| entry.comment.as_deref()),
+        Some("retire")
+    );
+    let second = storage
+        .create_policy(&ctx(), draft, &[])
+        .await
+        .expect("recreate");
+    assert_ne!(first.policy_id, second.policy_id);
+    assert_eq!(second.version, 1);
+    let old = storage
+        .read_policy_version(&first.policy_id, 1)
+        .await
+        .expect("read")
+        .expect("retained");
+    assert_eq!(old.state, PolicyVersionState::Deleted);
+    assert_eq!(old.comment.as_deref(), Some("original"));
+    assert!(matches!(
+        storage
+            .rollback_policy(&ctx(), first.policy_id, 1, None, &[])
+            .await,
+        Err(StorageError::PolicyDeleted { .. })
+    ));
+    assert!(matches!(
+        storage
+            .delete_policy(&ctx(), PolicyId::new("never-created"), None, &[])
+            .await,
+        Err(StorageError::PolicyNotFound { .. })
+    ));
+}
+
+#[tokio::test]
+async fn rollback_preserves_comments_and_update_allocates_above_high_water() {
+    let storage = InMemoryStorage::new();
+    let first = storage
+        .create_policy(
+            &ctx(),
+            PolicyDraft {
+                schema_snapshot: PolicySchemaSnapshot::default(),
+                scope: PolicyScope::Global,
+                engine_id: "most-restrictive-wins".into(),
+                engine_config: empty_engine_config(),
+                timeout_ms: None,
+                description: None,
+                comment: Some("created".into()),
+                created_by: "operator".into(),
+            },
+            &[],
+        )
+        .await
+        .expect("create");
+    let patch = |version| PolicyUpdate {
+        schema_snapshot: None,
+        if_match_version: version,
+        engine_id: None,
+        engine_config: None,
+        timeout_ms: None,
+        comment: None,
+        created_by: "operator".into(),
+    };
+    storage
+        .update_policy(&ctx(), first.policy_id.clone(), patch(1), &[])
+        .await
+        .expect("v2");
+    storage
+        .update_policy(&ctx(), first.policy_id.clone(), patch(2), &[])
+        .await
+        .expect("v3");
+    let back = storage
+        .rollback_policy(
+            &ctx(),
+            first.policy_id.clone(),
+            1,
+            Some("rollback note".into()),
+            &[],
+        )
+        .await
+        .expect("rollback");
+    assert!(back.is_applied());
+    assert_eq!(back.into_inner().comment.as_deref(), Some("created"));
+    let audit = storage.policy_audit();
+    assert_eq!(
+        audit.last().and_then(|entry| entry.comment.as_deref()),
+        Some("rollback note")
+    );
+    assert!(
+        !storage
+            .rollback_policy(
+                &ctx(),
+                first.policy_id.clone(),
+                1,
+                Some("retry".into()),
+                &[],
+            )
+            .await
+            .expect("replay")
+            .is_applied(),
+        "rolling back onto the already-active target reports a no-op"
+    );
+    assert_eq!(storage.policy_audit(), audit);
+    assert_eq!(
+        storage
+            .update_policy(&ctx(), first.policy_id, patch(1), &[])
+            .await
+            .expect("v4")
+            .version,
+        4
+    );
+}
+
+// --- the in-transaction evaluation convention ------------------------------
+
+#[tokio::test]
+async fn an_evaluated_debit_records_what_the_transaction_decided_not_what_a_caller_claimed() {
+    let storage = storage_with_policy().await;
+    let id = seeded_quota(&storage, Some(10)).await;
+    let write = idem(OperationType::Debit, "over", 3);
+
+    // The caller states an amount; the plan and the verdict are the
+    // transaction's, computed against rows it holds.
+    let denied = storage
+        .apply_debit_plan_for(40, &write)
+        .await
+        .expect("a refusal is a decision, not a failure");
+    assert!(matches!(
+        denied.get().decision.result,
+        DecisionResult::Denied { ref reason, .. } if reason == "QUOTA_EXCEEDED"
+    ));
+    assert_eq!(storage.consumed(id), 0, "a denial moves no counter");
+
+    // The record is attributed to the policy the transaction selected.
+    let record = storage
+        .lookup_idempotency(&write.scope)
+        .await
+        .expect("lookup")
+        .expect("a denial still occupies the key");
+    assert_eq!(record.engine_id.as_deref(), Some(super::TEST_ENGINE_ID));
+    assert_eq!(record.policy_id, Some(PolicyId::global()));
+    assert_eq!(record.policy_version, Some(1));
+
+    // A replay of a denial denies again, without a second evaluation.
+    let replay = storage
+        .apply_debit_plan_for(40, &write)
+        .await
+        .expect("replay");
+    assert!(matches!(replay, TransitionOutcome::NoOp(_)));
+    assert!(matches!(
+        replay.get().decision.result,
+        DecisionResult::Denied { .. }
+    ));
+}
+
+#[tokio::test]
+async fn a_transaction_that_needs_a_prepared_artifact_rolls_back_and_writes_nothing() {
+    let storage = storage_with_policy().await;
+    let id = seeded_quota(&storage, Some(100)).await;
+    let write = idem(OperationType::Debit, "miss", 4);
+    let evaluator = ScriptedEvaluator::with_preparation_misses(1);
+    let call = |context: &EvaluationContext<'_>| evaluator.evaluate(context);
+    let applicable = applicable();
+    let err = storage
+        .apply_debit_plan(
+            &ctx(),
+            &scope(),
+            &EvaluatedMutation {
+                applicable: &applicable,
+                amount: 5,
+                request: &serde_json::Value::Null,
+                resource: &serde_json::Value::Null,
+                user_projection: None,
+                limits: limits(),
+                idempotency: &write,
+                evaluate: &call,
+            },
+            &[],
+        )
+        .await
+        .expect_err("the artifact is not resident");
+    assert_eq!(
+        err,
+        StorageError::PreparationRequired {
+            policy_id: PolicyId::global(),
+            version: 1,
+        }
+    );
+    assert_eq!(storage.consumed(id), 0, "nothing was applied");
+    assert!(
+        storage
+            .lookup_idempotency(&write.scope)
+            .await
+            .expect("lookup")
+            .is_none(),
+        "the key stays free, so the retry is not a replay"
+    );
+    assert_eq!(evaluator.calls(), 1);
+}
+
+#[tokio::test]
+async fn an_atomic_batch_evaluates_each_item_and_replays_as_one_envelope() {
+    let storage = storage_with_policy().await;
+    let id = seeded_quota(&storage, Some(100)).await;
+    let envelope = idem(OperationType::Debit, "batch", 5);
+    let evaluator = ScriptedEvaluator::new();
+    let call = |context: &EvaluationContext<'_>| evaluator.evaluate(context);
+    let items = vec![
+        BatchDebitItem {
+            applicable: applicable(),
+            amount: 7,
+            request: serde_json::Value::Null,
+            resource: serde_json::Value::Null,
+            item_scope: None,
+        },
+        BatchDebitItem {
+            applicable: applicable(),
+            amount: 3,
+            request: serde_json::Value::Null,
+            resource: serde_json::Value::Null,
+            item_scope: None,
+        },
+    ];
+    let batch = EvaluatedBatch {
+        envelope: &envelope,
+        items: &items,
+        user_projection: None,
+        limits: limits(),
+        evaluate: &call,
+    };
+    let applied = storage
+        .apply_batch_debit(&ctx(), &scope(), &batch, &[])
+        .await
+        .expect("batch");
+    assert_eq!(applied.get().len(), 2);
+    assert_eq!(storage.consumed(id), 10, "both items applied");
+    assert_eq!(evaluator.calls(), 2, "each item is evaluated on its own");
+
+    let replay = storage
+        .apply_batch_debit(&ctx(), &scope(), &batch, &[])
+        .await
+        .expect("replay");
+    assert!(matches!(replay, TransitionOutcome::NoOp(_)));
+    assert_eq!(replay.get().len(), 2);
+    assert_eq!(
+        storage.consumed(id),
+        10,
+        "a replayed envelope mutates nothing"
+    );
+    assert_eq!(evaluator.calls(), 2, "and evaluates nothing");
+}
+
+#[tokio::test]
+async fn selection_prefers_the_metric_policy_and_falls_through_to_global_once_it_is_deleted() {
+    let storage = storage_with_policy().await;
+    let _quota = seeded_quota(&storage, Some(100)).await;
+    let metric_policy = storage
+        .create_policy(
+            &ctx(),
+            PolicyDraft {
+                schema_snapshot: PolicySchemaSnapshot::default(),
+                scope: PolicyScope::Metric {
+                    metric: test_metric(),
+                },
+                engine_id: "metric-engine".to_owned(),
+                engine_config: empty_engine_config(),
+                timeout_ms: None,
+                description: None,
+                comment: None,
+                created_by: "operator".to_owned(),
+            },
+            &[],
+        )
+        .await
+        .expect("metric policy");
+
+    // The more specific scope wins while it is active.
+    let first = storage
+        .apply_debit_plan_for(1, &idem(OperationType::Debit, "s1", 9))
+        .await
+        .expect("debit");
+    assert_eq!(
+        first.get().decision.diagnostics["engine_id"],
+        "metric-engine"
+    );
+
+    // Deleting it falls the metric through to the global policy, inside the
+    // same transaction that mutates the counters.
+    storage
+        .delete_policy(&ctx(), metric_policy.policy_id, None, &[])
+        .await
+        .expect("delete");
+    let after = storage
+        .apply_debit_plan_for(1, &idem(OperationType::Debit, "s2", 9))
+        .await
+        .expect("debit");
+    assert_eq!(
+        after.get().decision.diagnostics["engine_id"],
+        super::TEST_ENGINE_ID
+    );
+}
+
+fn batch_item(amount: u64) -> BatchDebitItem {
+    BatchDebitItem {
+        applicable: applicable(),
+        amount,
+        request: serde_json::Value::Null,
+        resource: serde_json::Value::Null,
+        item_scope: None,
+    }
+}
+
+#[tokio::test]
+async fn an_atomic_batch_evaluates_against_running_state_and_denies_as_a_whole() {
+    // The PRD's worked scenario: one Quota of 800, two items of 500. The first
+    // is affordable alone, the pair is not, and nothing may be written.
+    let storage = storage_with_policy().await;
+    let id = seeded_quota(&storage, Some(800)).await;
+    let envelope = idem(OperationType::Debit, "atomic", 6);
+    let evaluator = ScriptedEvaluator::new();
+    let call = |context: &EvaluationContext<'_>| evaluator.evaluate(context);
+    let items = vec![batch_item(500), batch_item(500)];
+    let outcome = storage
+        .apply_batch_debit(
+            &ctx(),
+            &scope(),
+            &EvaluatedBatch {
+                envelope: &envelope,
+                items: &items,
+                user_projection: None,
+                limits: limits(),
+                evaluate: &call,
+            },
+            &[],
+        )
+        .await
+        .expect("a denied batch is a decision, not a failure");
+    let decided = outcome.get();
+    assert!(
+        matches!(decided[0].decision.result, DecisionResult::Allowed),
+        "the first item is affordable on its own"
+    );
+    assert!(
+        matches!(
+            decided[1].decision.result,
+            DecisionResult::Denied { ref reason, .. } if reason == "QUOTA_EXCEEDED"
+        ),
+        "the second sees what the first consumed: {:?}",
+        decided[1].decision.result
+    );
+    assert_eq!(
+        storage.consumed(id),
+        0,
+        "one denial rolls the whole envelope back"
+    );
+    assert!(
+        storage.events().is_empty(),
+        "nothing was applied, so nothing is announced"
+    );
+
+    // A batch every item can afford commits the union of the plans, each item
+    // still evaluated against what its predecessors took.
+    let fits = vec![batch_item(500), batch_item(200)];
+    let committed = storage
+        .apply_batch_debit(
+            &ctx(),
+            &scope(),
+            &EvaluatedBatch {
+                envelope: &idem(OperationType::Debit, "fits", 7),
+                items: &fits,
+                user_projection: None,
+                limits: limits(),
+                evaluate: &call,
+            },
+            &[],
+        )
+        .await
+        .expect("batch");
+    assert!(
+        committed
+            .get()
+            .iter()
+            .all(|item| matches!(item.decision.result, DecisionResult::Allowed))
+    );
+    assert_eq!(storage.consumed(id), 700);
+}
+
+#[tokio::test]
+async fn a_replayed_acquisition_returns_its_own_token_not_another_lease_of_the_subject() {
+    let storage = storage_with_policy().await;
+    let id = seeded_quota(&storage, Some(100)).await;
+    let ttl = Duration::from_mins(1);
+    let small = idem(OperationType::Reserve, "small", 1);
+    let large = idem(OperationType::Reserve, "large", 2);
+
+    let small_lease = storage
+        .acquire_lease_for(10, ttl, &small)
+        .await
+        .expect("first acquisition");
+    let large_lease = storage
+        .acquire_lease_for(20, ttl, &large)
+        .await
+        .expect("second acquisition for the same subject");
+    let small_token = token_of(&small_lease);
+    let large_token = token_of(&large_lease);
+    assert_ne!(small_token, large_token);
+
+    let replayed = storage
+        .acquire_lease_for(10, ttl, &small)
+        .await
+        .expect("replay");
+    assert!(matches!(replayed, TransitionOutcome::NoOp(_)));
+    assert_eq!(
+        token_of(&replayed),
+        small_token,
+        "a replay returns the lease that acquisition took"
+    );
+    assert_eq!(storage.consumed(id), 30, "neither replay held again");
+
+    // A denial holds nothing, and its replay must not adopt a live lease.
+    let refused = idem(OperationType::Reserve, "refused", 3);
+    let denied = storage
+        .acquire_lease_for(500, ttl, &refused)
+        .await
+        .expect("a refusal is a decision");
+    assert!(denied.get().token.is_none());
+    let denied_replay = storage
+        .acquire_lease_for(500, ttl, &refused)
+        .await
+        .expect("replayed refusal");
+    assert!(
+        denied_replay.get().token.is_none(),
+        "a replayed denial holds nothing"
+    );
+}
+
+#[tokio::test]
+async fn the_budget_is_resolved_against_the_policy_the_transaction_selected() {
+    let storage = InMemoryStorage::new();
+    let mut bundle = bundle_with_global_policy();
+    // The seeded version asks for 3ms, well inside the operator clamp of 5ms.
+    if let Some(policy) = bundle.global_policy.as_mut() {
+        policy.timeout_ms = Some(3);
+    }
+    storage.bootstrap(&bundle).await.expect("bootstrap");
+    let _quota = seeded_quota(&storage, Some(100)).await;
+    let evaluator = ScriptedEvaluator::new();
+    let call = |context: &EvaluationContext<'_>| evaluator.evaluate(context);
+    let write = idem(OperationType::Debit, "budget", 8);
+    let applicable = applicable();
+    storage
+        .apply_debit_plan(
+            &ctx(),
+            &scope(),
+            &EvaluatedMutation {
+                applicable: &applicable,
+                amount: 1,
+                request: &serde_json::Value::Null,
+                resource: &serde_json::Value::Null,
+                user_projection: None,
+                limits: limits(),
+                idempotency: &write,
+                evaluate: &call,
+            },
+            &[],
+        )
+        .await
+        .expect("debit");
+    assert_eq!(
+        evaluator.observed_timeouts(),
+        vec![Duration::from_millis(3)],
+        "the selected version's requested timeout reaches the engine, \
+         without the caller having resolved it"
+    );
+
+    // Raising the version's request past the clamp clamps it, per evaluation
+    // and with no artifact republished.
+    let active = storage
+        .read_policy(&PolicyScope::Global)
+        .await
+        .expect("read")
+        .expect("seeded");
+    storage
+        .update_policy(
+            &ctx(),
+            active.policy_id,
+            PolicyUpdate {
+                schema_snapshot: None,
+                if_match_version: active.version,
+                engine_id: None,
+                engine_config: None,
+                timeout_ms: Some(9),
+                comment: None,
+                created_by: "operator".to_owned(),
+            },
+            &[],
+        )
+        .await
+        .expect("raise the requested timeout");
+    let clamped = idem(OperationType::Debit, "clamped", 9);
+    storage
+        .apply_debit_plan(
+            &ctx(),
+            &scope(),
+            &EvaluatedMutation {
+                applicable: &applicable,
+                amount: 1,
+                request: &serde_json::Value::Null,
+                resource: &serde_json::Value::Null,
+                user_projection: None,
+                limits: limits(),
+                idempotency: &clamped,
+                evaluate: &call,
+            },
+            &[],
+        )
+        .await
+        .expect("debit");
+    assert_eq!(
+        evaluator.observed_timeouts(),
+        vec![Duration::from_millis(3), Duration::from_millis(5)],
+        "the new version's request is re-clamped per evaluation, with no \
+         artifact republished"
     );
 }

@@ -81,3 +81,70 @@ impl QuotaManagerClientV1 for InProcessQuotaManager {
 #[cfg_attr(coverage_nightly, coverage(off))]
 #[path = "in_process_tests.rs"]
 mod in_process_tests;
+
+/// Platform operator client; business Quota management remains a separate trait.
+pub struct InProcessQuotaOperator {
+    service: Arc<Service>,
+}
+impl InProcessQuotaOperator {
+    /// Share the same service as REST.
+    #[must_use]
+    pub fn new(service: Arc<Service>) -> Self {
+        Self { service }
+    }
+}
+#[async_trait]
+impl quota_enforcement_sdk::QuotaOperatorClientV1 for InProcessQuotaOperator {
+    async fn create_policy(
+        &self,
+        ctx: &SecurityContext,
+        spec: quota_enforcement_sdk::PolicySpec,
+    ) -> Result<quota_enforcement_sdk::PolicyVersion, QuotaEnforcementError> {
+        Ok(self.service.policies()?.create(ctx, spec).await?)
+    }
+    async fn update_policy(
+        &self,
+        ctx: &SecurityContext,
+        id: quota_enforcement_sdk::PolicyId,
+        patch: quota_enforcement_sdk::PolicyPatch,
+    ) -> Result<quota_enforcement_sdk::PolicyVersion, QuotaEnforcementError> {
+        Ok(self.service.policies()?.update(ctx, id, patch).await?)
+    }
+    async fn rollback_policy(
+        &self,
+        ctx: &SecurityContext,
+        id: quota_enforcement_sdk::PolicyId,
+        target_version: u32,
+        comment: Option<String>,
+    ) -> Result<quota_enforcement_sdk::PolicyVersion, QuotaEnforcementError> {
+        Ok(self
+            .service
+            .policies()?
+            .rollback(ctx, id, target_version, comment)
+            .await?)
+    }
+    async fn delete_policy(
+        &self,
+        ctx: &SecurityContext,
+        id: quota_enforcement_sdk::PolicyId,
+        comment: Option<String>,
+    ) -> Result<(), QuotaEnforcementError> {
+        Ok(self.service.policies()?.delete(ctx, id, comment).await?)
+    }
+    async fn read_policy(
+        &self,
+        ctx: &SecurityContext,
+        id: quota_enforcement_sdk::PolicyId,
+        version: Option<u32>,
+    ) -> Result<quota_enforcement_sdk::PolicyVersion, QuotaEnforcementError> {
+        Ok(self.service.policies()?.read(ctx, &id, version).await?)
+    }
+    async fn list_policy_versions(
+        &self,
+        ctx: &SecurityContext,
+        id: quota_enforcement_sdk::PolicyId,
+        page: PageRequest,
+    ) -> Result<PageResult<quota_enforcement_sdk::PolicyVersionMeta>, QuotaEnforcementError> {
+        Ok(self.service.policies()?.list(ctx, &id, page).await?)
+    }
+}

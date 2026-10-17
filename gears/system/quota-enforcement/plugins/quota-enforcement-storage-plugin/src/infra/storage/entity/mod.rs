@@ -17,3 +17,7 @@ pub mod schema_meta;
 
 /// Sentinel key of the platform-default row in the configuration tables.
 pub const DEFAULT_KEY: &str = "*";
+
+pub mod policy;
+pub mod policy_operation_log;
+pub mod policy_version;

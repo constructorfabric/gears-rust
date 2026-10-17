@@ -306,3 +306,83 @@ fn lifecycle_gauges_honour_the_configured_prefix() {
     );
     assert_eq!(gauge_last_u64(&exporter, QUOTA_CAP_ZERO_TOTAL), None);
 }
+
+#[test]
+fn policy_engine_instruments_use_only_documented_labels() {
+    use crate::domain::ports::metrics::{EngineLabel, PolicyTransition};
+    use quota_enforcement_sdk::engine::DebitPlanInvariant;
+    let (provider, exporter) = local_provider();
+    let adapter = QeMetricsMeter::new(
+        &provider.meter("qe-policy-test"),
+        &MetricsConfig::default(),
+        cell(),
+    );
+    adapter.record_engine_bootstrap_failure(EngineLabel::Cel);
+    adapter.record_engine_evaluation(EngineLabel::Cel, std::time::Duration::from_millis(1));
+    adapter.record_plan_violation(
+        EngineLabel::Cel,
+        DebitPlanInvariant::AmountExceedsRequestAmount,
+    );
+    adapter.record_policy_transition(PolicyTransition::Rollback);
+    adapter.record_policy_conflict();
+    provider.force_flush().expect("flush");
+    assert_eq!(
+        counter_sum(
+            &exporter,
+            "engine_bootstrap_failures_total",
+            Some(("engine_id", "cel"))
+        ),
+        Some(1)
+    );
+    assert_eq!(
+        counter_sum(
+            &exporter,
+            "policy_version_transitions_total",
+            Some(("transition_kind", "rollback"))
+        ),
+        Some(1)
+    );
+    assert_eq!(
+        counter_sum(&exporter, "policy_version_conflict_rejections_total", None),
+        Some(1)
+    );
+    for resource in exporter.get_finished_metrics().expect("metrics") {
+        for scope in resource.scope_metrics() {
+            for metric in scope.metrics() {
+                let expected: &[&str] = match metric.name() {
+                    "engine_bootstrap_failures_total" | "engine_evaluation_seconds" => {
+                        &["engine_id"]
+                    }
+                    "debit_plan_invariant_violations_total" => &["engine_id", "invariant"],
+                    "policy_version_transitions_total" => &["transition_kind"],
+                    "policy_version_conflict_rejections_total" => &[],
+                    _ => continue,
+                };
+                match metric.data() {
+                    AggregatedMetrics::U64(MetricData::Sum(sum)) => {
+                        for point in sum.data_points() {
+                            let mut keys: Vec<_> = point
+                                .attributes()
+                                .map(|attribute| attribute.key.as_str())
+                                .collect();
+                            keys.sort_unstable();
+                            assert_eq!(keys, expected);
+                        }
+                    }
+                    AggregatedMetrics::F64(MetricData::Histogram(histogram)) => {
+                        for point in histogram.data_points() {
+                            assert_eq!(
+                                point
+                                    .attributes()
+                                    .map(|attribute| attribute.key.as_str())
+                                    .collect::<Vec<_>>(),
+                                expected
+                            );
+                        }
+                    }
+                    _ => panic!("unexpected policy instrument type"),
+                }
+            }
+        }
+    }
+}
