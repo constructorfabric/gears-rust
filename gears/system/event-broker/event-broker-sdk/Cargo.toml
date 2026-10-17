@@ -53,6 +53,7 @@ serde_json = { workspace = true }
 uuid = { workspace = true, features = ["v4", "v5", "v7", "serde"] }
 chrono = { workspace = true, features = ["clock", "serde"] }
 tracing = { workspace = true }
+toolkit-trace-context = { workspace = true }
 futures-core = { workspace = true }
 futures-util = { workspace = true }
 tokio = { workspace = true, features = ["rt", "sync", "time"] }
@@ -101,3 +102,10 @@ axum = { workspace = true }
 # dev-only, so Cargo permits the cycle.
 cf-gears-event-broker = { path = "../event-broker", features = ["test-utils"] }
 trybuild = { workspace = true }
+# Trace-propagation tests run the producer and consumer inside a live OTel span,
+# wired like production (tracing-opentelemetry over an SDK tracer provider).
+toolkit-trace-context = { workspace = true, features = ["otel"] }
+opentelemetry = { workspace = true }
+opentelemetry_sdk = { workspace = true, features = ["trace"] }
+tracing-opentelemetry = { workspace = true }
+tracing-subscriber = { workspace = true }

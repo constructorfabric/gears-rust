@@ -44,7 +44,15 @@ pub(crate) async fn prepare_event<E: TypedEvent>(
         subject: subject.into_owned(),
         subject_type: GtsTypeId::new(E::SUBJECT_TYPE),
         occurred_at: Utc::now(),
-        trace_parent: event.trace_parent().map(|value| value.into_owned()),
+        // An explicit override wins; otherwise the trace active right now. This
+        // runs where the event is prepared — inside the caller's request, and
+        // for the outbox at enqueue time, inside the caller's transaction — so
+        // the captured trace is the request's, not the background worker's
+        // that publishes the row later (the outbox envelope stores it).
+        trace_parent: event
+            .trace_parent()
+            .map(|value| value.into_owned())
+            .or_else(toolkit_trace_context::current_traceparent),
         data: Some(data),
         partition: None,
         sequence: None,

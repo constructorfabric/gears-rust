@@ -42,6 +42,13 @@ pub trait TypedEvent: Serialize + DeserializeOwned + Send + Sync + 'static {
         None
     }
 
+    /// Overrides the W3C `traceparent` the event is published under.
+    ///
+    /// Returning `None` (the default) lets the producer capture the trace that
+    /// is active when the event is prepared — inside the request that caused
+    /// it, before any outbox delay — so consumers can continue that trace.
+    /// Override only to attribute the event to a different trace; an invalid
+    /// value is rejected by the broker.
     fn trace_parent(&self) -> Option<Cow<'_, str>> {
         None
     }

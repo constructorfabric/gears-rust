@@ -2,6 +2,8 @@
 mod builder;
 #[path = "producer/direct.rs"]
 mod direct;
+#[path = "support/otel.rs"]
+mod otel;
 // The producer-outbox tests run against the real in-process gear harness, so
 // each failure mode has to be provoked on the broker itself: the two
 // partition-key tests need a second catalog event type whose partition key

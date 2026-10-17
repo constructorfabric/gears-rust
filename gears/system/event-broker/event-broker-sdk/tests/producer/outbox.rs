@@ -565,6 +565,58 @@ async fn convenience_start_drains_enqueued_event_to_broker() {
     producer_handle.stop().await;
 }
 
+/// The trace is captured at enqueue, inside the request, and travels in the
+/// outbox row: the background processor that publishes later runs in another
+/// task with no span, yet the stored event names the request's trace.
+#[tokio::test]
+async fn enqueue_captures_the_request_trace_for_the_later_publish() {
+    use tracing::Instrument as _;
+
+    let _otel = crate::otel::install();
+    let (db, broker, harness) = fixture().await;
+    let producer = stateless_producer(db.clone(), broker).await;
+
+    let request = tracing::info_span!("request");
+    let expected = crate::otel::traceparent_of(&request);
+    let (_, envelope) = producer
+        .outbox_envelope(order(None), 4)
+        .instrument(request.clone())
+        .await
+        .unwrap();
+    assert_eq!(envelope_json(&envelope)["trace_parent"], expected.as_str());
+
+    let producer_handle = producer
+        .outbox_queue(QUEUE, toolkit_db::outbox::Partitions::of(4))
+        .unwrap()
+        .start(toolkit_db::outbox::Outbox::builder(db.clone()))
+        .await
+        .unwrap();
+    let conn = db.conn().unwrap();
+    producer_handle
+        .outbox()
+        .enqueue(&conn, order(None))
+        .instrument(request)
+        .await
+        .unwrap()
+        .fire();
+    wait_for_stored(&harness, TOPIC, 1).await;
+
+    let ctx = harness.security_context();
+    let mut stored = Vec::new();
+    for partition in 0..FIXTURE_BROKER_PARTITIONS {
+        stored.extend(
+            harness
+                .backend()
+                .read(ctx, TOPIC, partition, Sequence::NONE, 1024)
+                .await
+                .unwrap(),
+        );
+    }
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].trace_parent.as_deref(), Some(expected.as_str()));
+    producer_handle.stop().await;
+}
+
 #[tokio::test]
 async fn enqueue_batch_drains_every_event_to_broker() {
     let (db, broker, harness) = fixture().await;

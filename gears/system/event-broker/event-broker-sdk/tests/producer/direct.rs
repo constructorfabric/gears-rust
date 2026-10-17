@@ -289,3 +289,109 @@ fn order() -> OrderCreated {
 fn test_tenant() -> Uuid {
     Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap()
 }
+
+/// Same payload and type as [`OrderCreated`], but the event names its own
+/// `traceparent`, as a producer attributing the event to another trace would.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TracedOrderCreated {
+    order_id: Uuid,
+    total_cents: i64,
+    #[serde(skip)]
+    trace_parent: String,
+}
+
+impl TypedEvent for TracedOrderCreated {
+    const TYPE_ID: &'static str = EVENT_TYPE;
+    const SUBJECT_TYPE: &'static str = SUBJECT_TYPE;
+    const SOURCE: &'static str = "order-service";
+
+    fn subject(&self) -> Cow<'_, str> {
+        Cow::Owned(self.order_id.to_string())
+    }
+
+    fn tenant_id(&self) -> Option<Uuid> {
+        Some(test_tenant())
+    }
+
+    fn trace_parent(&self) -> Option<Cow<'_, str>> {
+        Some(Cow::Borrowed(&self.trace_parent))
+    }
+}
+
+/// `traceparent` of every event stored on the tenant partition, in order.
+async fn stored_trace_parents(harness: &EventBrokerHarness) -> Vec<Option<String>> {
+    harness
+        .backend()
+        .read(
+            &SecurityContext::anonymous(),
+            TOPIC,
+            TENANT_PARTITION,
+            Sequence::NONE,
+            1024,
+        )
+        .await
+        .expect("read stored events")
+        .into_iter()
+        .map(|event| event.trace_parent)
+        .collect()
+}
+
+async fn stateless_producer(broker: Arc<dyn event_broker_sdk::api::EventBrokerApi>) -> Producer {
+    Producer::builder()
+        .broker(broker)
+        .security_context(SecurityContext::anonymous())
+        .identity(ProducerIdentity::new().source("order-service"))
+        .deduplication(DirectDeduplication::stateless())
+        .topics([TOPIC])
+        .event_type_patterns(["gts.cf.core.events.event.v1~example.sdk.producer.*"])
+        .prepare_all()
+        .await
+        .unwrap()
+}
+
+/// A publish made inside a traced request carries that request's trace, with
+/// no code in the event type; outside any span it carries none.
+#[tokio::test]
+async fn publish_captures_the_active_trace() {
+    use tracing::Instrument as _;
+
+    let _otel = crate::otel::install();
+    let harness = harness().await;
+    let producer = stateless_producer(harness.broker()).await;
+
+    let request = tracing::info_span!("request");
+    let expected = crate::otel::traceparent_of(&request);
+    producer.publish(order()).instrument(request).await.unwrap();
+    producer.publish(order()).await.unwrap();
+
+    wait_for_stored(&harness, TENANT_PARTITION, 2).await;
+    assert_eq!(
+        stored_trace_parents(&harness).await,
+        vec![Some(expected), None]
+    );
+}
+
+/// An explicit `TypedEvent::trace_parent` wins over the active span.
+#[tokio::test]
+async fn explicit_trace_parent_overrides_the_active_trace() {
+    use tracing::Instrument as _;
+
+    let _otel = crate::otel::install();
+    let harness = harness().await;
+    let producer = stateless_producer(harness.broker()).await;
+    let explicit = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01".to_owned();
+
+    let event = TracedOrderCreated {
+        order_id: Uuid::new_v4(),
+        total_cents: 10,
+        trace_parent: explicit.clone(),
+    };
+    producer
+        .publish(event)
+        .instrument(tracing::info_span!("request"))
+        .await
+        .unwrap();
+
+    wait_for_stored(&harness, TENANT_PARTITION, 1).await;
+    assert_eq!(stored_trace_parents(&harness).await, vec![Some(explicit)]);
+}
