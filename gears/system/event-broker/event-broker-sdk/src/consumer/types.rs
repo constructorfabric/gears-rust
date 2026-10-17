@@ -710,7 +710,9 @@ where
         };
         let offset = event.offset;
 
-        match self.inner.handle(event, attempts).await? {
+        // The handler runs in the trace the event was produced under.
+        let span = super::trace::event_span(&event);
+        match tracing::Instrument::instrument(self.inner.handle(event, attempts), span).await? {
             HandlerOutcome::Success => Ok(BatchHandlerOutcome::AdvanceThrough { offset }),
             HandlerOutcome::Retry { reason } => Ok(BatchHandlerOutcome::Retry { reason }),
         }
@@ -750,6 +752,8 @@ where
             return Ok(HandlerOutcome::Success);
         };
 
-        self.inner.handle(event, attempts, commit).await
+        // The handler runs in the trace the event was produced under.
+        let span = super::trace::event_span(&event);
+        tracing::Instrument::instrument(self.inner.handle(event, attempts, commit), span).await
     }
 }

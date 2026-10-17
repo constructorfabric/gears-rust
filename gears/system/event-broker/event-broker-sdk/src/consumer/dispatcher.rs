@@ -763,10 +763,13 @@ where
             let committed_offset = commit_handle.committed_offset.clone();
             let batch = EventBatch::new(&batch_events);
             let started_at = Instant::now();
-            match self
-                .handler
-                .handle_batch(&batch, attempts, commit_handle)
-                .await
+            // Linked to every producer trace in the batch.
+            let batch_span = super::trace::batch_span(&batch);
+            match tracing::Instrument::instrument(
+                self.handler.handle_batch(&batch, attempts, commit_handle),
+                batch_span,
+            )
+            .await
             {
                 Ok(crate::consumer::HandlerOutcome::Success) => {
                     let committed_offset_result = match committed_offset.lock() {
@@ -1682,7 +1685,14 @@ where
             .await;
             let batch = EventBatch::new(&batch_events);
             let started_at = Instant::now();
-            match self.handler.handle_batch(&batch, attempts).await {
+            // Linked to every producer trace in the batch.
+            let batch_span = super::trace::batch_span(&batch);
+            match tracing::Instrument::instrument(
+                self.handler.handle_batch(&batch, attempts),
+                batch_span,
+            )
+            .await
+            {
                 Ok(
                     outcome @ (BatchHandlerOutcome::Success
                     | BatchHandlerOutcome::AdvanceThrough { .. }),

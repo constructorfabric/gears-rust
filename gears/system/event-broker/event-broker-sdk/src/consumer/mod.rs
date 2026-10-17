@@ -4,6 +4,7 @@ mod dispatcher;
 mod offset_manager;
 mod progress;
 mod runtime;
+mod trace;
 mod type_cache;
 mod types;
 
@@ -20,6 +21,8 @@ mod dispatcher_tests;
 mod offset_manager_tests;
 #[cfg(test)]
 mod progress_tests;
+#[cfg(test)]
+mod trace_tests;
 #[cfg(test)]
 mod type_cache_tests;
 #[cfg(test)]

@@ -29,6 +29,38 @@ pub struct PublishJson<'a> {
     pub data: serde_json::Value,
 }
 
+/// Publish one fixture event carrying `trace_parent`, as a producer that
+/// captured its request's trace would.
+pub async fn publish_json_traced(
+    broker: &Arc<dyn EventBrokerApi>,
+    ctx: &SecurityContext,
+    event_type: &str,
+    subject: &str,
+    trace_parent: &str,
+) {
+    broker
+        .publish(
+            ctx,
+            &Event {
+                id: Uuid::new_v4(),
+                type_id: GtsTypeId::new(event_type),
+                tenant_id: ctx.subject_tenant_id(),
+                source: ctx.subject_tenant_id().to_string(),
+                subject: subject.to_owned(),
+                subject_type: GtsTypeId::new(SHOWCASE_SUBJECT_TYPE),
+                occurred_at: chrono::Utc::now(),
+                trace_parent: Some(trace_parent.to_owned()),
+                data: Some(serde_json::json!({ "kind": "traced" })),
+                partition: None,
+                sequence: None,
+                sequence_time: None,
+                meta: None,
+            },
+        )
+        .await
+        .expect("event published");
+}
+
 /// Where the fixture's event types take their partition key from. The default
 /// points at the tenant, which would land every fixture event on one partition;
 /// these fixtures need to place events on a chosen partition. `/source` is the

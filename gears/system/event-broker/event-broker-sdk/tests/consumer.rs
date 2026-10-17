@@ -1,3 +1,6 @@
+#[path = "support/otel.rs"]
+mod otel;
+
 mod consumer {
     mod common;
     mod doubles;

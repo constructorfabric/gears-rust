@@ -7,7 +7,8 @@ use event_broker_sdk::{
 };
 
 use super::common::{
-    PublishJson, publish_json, topic, topic_fixture, two_topic_fixture, wait_until,
+    PublishJson, publish_json, publish_json_traced, topic, topic_fixture, two_topic_fixture,
+    wait_until,
 };
 
 const TOPIC: &str = gts_id!("cf.core.events.topic.v1~example.mock.showcase.single.v1");
@@ -177,5 +178,68 @@ async fn events_from_two_topics_are_each_attributed_to_their_own_topic() {
     assert_eq!(
         attributed,
         vec![(AUDIT_TOPIC.to_owned(), 0), (ORDERS_TOPIC.to_owned(), 0)]
+    );
+}
+
+/// Records the OTel trace each delivered event is handled in.
+struct TraceRecorder {
+    traces: Arc<Mutex<Vec<String>>>,
+}
+
+#[async_trait]
+impl SingleEventHandler for TraceRecorder {
+    async fn handle(
+        &self,
+        _event: RawEvent,
+        _attempts: u16,
+    ) -> Result<HandlerOutcome, ConsumerError> {
+        use opentelemetry::trace::TraceContextExt as _;
+
+        let trace_id = opentelemetry::Context::current()
+            .span()
+            .span_context()
+            .trace_id()
+            .to_string();
+        self.traces.lock().unwrap().push(trace_id);
+        Ok(HandlerOutcome::Success)
+    }
+}
+
+/// A single-event handler runs in the trace the event was produced under, so
+/// the consumer's work shows up under the request that caused the event.
+#[tokio::test]
+async fn if_i_handle_an_event_i_continue_the_producers_trace() {
+    const PRODUCER_TRACE: &str = "0af7651916cd43dd8448eb211c80319c";
+
+    let _otel = crate::otel::install();
+    let fixture = topic_fixture(TOPIC, EVENT_TYPE, 1).await;
+    let traces = Arc::new(Mutex::new(Vec::new()));
+
+    let handle = ConsumerBuilder::new(fixture.broker.clone())
+        .group(ConsumerGroupRef::auto_anonymous("showcase-single-trace"))
+        .topics([topic(TOPIC)])
+        .offset_manager(InMemoryOffsetManager::new(Fallback::Earliest))
+        .handler(TraceRecorder {
+            traces: traces.clone(),
+        })
+        .start()
+        .await
+        .expect("consumer starts");
+
+    publish_json_traced(
+        &fixture.broker,
+        &fixture.ctx,
+        EVENT_TYPE,
+        "traced-1",
+        &format!("00-{PRODUCER_TRACE}-b7ad6b7169203331-01"),
+    )
+    .await;
+
+    wait_until(|| traces.lock().unwrap().len() == 1).await;
+    handle.stop().await.expect("consumer stops");
+
+    assert_eq!(
+        traces.lock().unwrap().as_slice(),
+        [PRODUCER_TRACE.to_owned()]
     );
 }
