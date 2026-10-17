@@ -34,6 +34,7 @@ fn declaration(classification: &str) -> Arc<Declaration> {
         domain_affinity: None,
         licence_feature: None,
         owner_module: None,
+        display_name: None,
         description: Some("How long audit records are retained.".to_owned()),
         default_value: json!(30),
         has_secret_trait: false,

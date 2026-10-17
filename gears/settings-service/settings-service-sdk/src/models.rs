@@ -194,6 +194,11 @@ pub struct ContributedDeclaration {
     /// Human-readable description.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// Optional human-readable label, 1..256 Unicode characters after
+    /// trimming. Omitted means none: a re-registration without it clears the
+    /// stored one, so the module's registration stays the single source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
     /// Administrative domain the setting belongs to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub domain_affinity: Option<String>,
@@ -230,6 +235,7 @@ impl ContributedDeclaration {
             scope_class,
             mode: None,
             description: None,
+            display_name: None,
             domain_affinity: None,
             licence_feature: None,
             data_classification: None,

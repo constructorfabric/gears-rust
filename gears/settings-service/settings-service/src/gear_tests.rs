@@ -813,6 +813,7 @@ async fn a_review_pass_counts_the_flagged_overrides_by_source_and_says_zero_wher
                     source: "admin_authored".to_owned(),
                     owner_module: None,
                     licence_feature: None,
+                    display_name: None,
                     description: None,
                     created_by: "test".to_owned(),
                 },

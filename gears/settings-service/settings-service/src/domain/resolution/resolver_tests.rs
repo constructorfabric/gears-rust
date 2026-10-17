@@ -552,6 +552,29 @@ mod access {
     }
 }
 
+/// The review listing's rows over `tenants`, under an unrestricted caller.
+async fn review_rows(h: &Harness, tenants: &[Uuid]) -> Vec<crate::domain::value::StoredValue> {
+    use crate::domain::category::visibility::DomainVisibility;
+    use crate::domain::value::ReviewRequest;
+    let conn = h.db.conn().expect("connection");
+    let query = toolkit_odata::ODataQuery::default();
+    h.resolver
+        .review_page(
+            &conn,
+            &ReviewRequest {
+                scope: &AccessScope::allow_all(),
+                visibility: &DomainVisibility::Unrestricted,
+                hidden_for: &[],
+                tenant_ids: tenants,
+                declarations: None,
+                query: &query,
+            },
+        )
+        .await
+        .expect("listing")
+        .items
+}
+
 #[tokio::test]
 async fn a_flagged_override_stays_in_storage_and_is_what_the_administrative_listing_shows() {
     let h = Harness::new().await;
@@ -576,18 +599,13 @@ async fn a_flagged_override_stays_in_storage_and_is_what_the_administrative_list
     // The administrative listing is the other half: it reads rows rather than
     // resolved values, so the flagged one is exactly what it reports, with the
     // detail that explains it.
-    let conn = h.db.conn().expect("connection");
     let (mut tenants, _) = h
         .hierarchy
         .descendants_bfs(t.root, 100)
         .await
         .expect("descendants");
     tenants.push(t.root);
-    let flagged = h
-        .resolver
-        .flagged_overrides(&conn, &[d], &tenants, 1_000)
-        .await
-        .expect("listing");
+    let flagged = review_rows(&h, &tenants).await;
     assert_eq!(flagged.len(), 1);
     assert_eq!(flagged[0].tenant_id, t.a);
     assert_eq!(flagged[0].value, Some(json!("no longer a boolean")));
@@ -609,7 +627,6 @@ async fn the_flagged_listing_stops_at_a_standalone_descendant() {
 
     // The listing walks the caller's subtree as the hierarchy reports it, and
     // the hierarchy does not traverse into a standalone tenant from above.
-    let conn = h.db.conn().expect("connection");
     let (mut tenants, _) = h
         .hierarchy
         .descendants_bfs(t.root, 100)
@@ -617,21 +634,13 @@ async fn the_flagged_listing_stops_at_a_standalone_descendant() {
         .expect("descendants");
     tenants.push(t.root);
     assert!(!tenants.contains(&t.s), "the subtree stops at the seam");
-    let flagged = h
-        .resolver
-        .flagged_overrides(&conn, &[d], &tenants, 1_000)
-        .await
-        .expect("listing");
+    let flagged = review_rows(&h, &tenants).await;
     let listed: Vec<uuid::Uuid> = flagged.iter().map(|r| r.tenant_id).collect();
     assert_eq!(listed, vec![t.a]);
 
     // The row is there; it is simply not this caller's to see. Asked for
     // directly, the standalone tenant's own listing reports it.
-    let own = h
-        .resolver
-        .flagged_overrides(&conn, &[d], &[t.s], 1_000)
-        .await
-        .expect("listing");
+    let own = review_rows(&h, &[t.s]).await;
     assert_eq!(own.len(), 1);
     assert_eq!(own[0].value, Some(json!("bad at s")));
 }
@@ -1113,4 +1122,103 @@ async fn a_subtree_walk_reads_each_class_the_way_a_read_does() {
             .await,
         Err(DomainError::Retired { .. })
     ));
+}
+
+#[tokio::test]
+async fn the_named_keys_a_caller_may_see_come_from_one_read_through_the_pages_own_gates() {
+    use crate::domain::access::TenantAccess;
+    use crate::domain::category::visibility::DomainVisibility;
+    use crate::domain::declaration::repo::DeclarationRepository as _;
+    use crate::infra::storage::declaration_repo::DeclarationRepo;
+
+    let h = Harness::new().await;
+    let open = h.declare("open", scope_class::CASCADING, json!(1)).await;
+    let walled = h.declare("walled", scope_class::CASCADING, json!(1)).await;
+    let concealed = h
+        .declare("concealed", scope_class::CASCADING, json!(1))
+        .await;
+    h.bind_domain(walled, "commercial").await;
+    {
+        use crate::domain::access::AccessRepository as _;
+        let conn = h.db.conn().expect("connection");
+        crate::infra::storage::access_repo::AccessRepo
+            .upsert(
+                &conn,
+                &AccessScope::allow_all(),
+                crate::domain::access::RestrictionDraft {
+                    declaration_id: concealed,
+                    tenant_id: h.tree.a,
+                    access: TenantAccess::Hidden,
+                    set_by: "test".to_owned(),
+                },
+                None,
+            )
+            .await
+            .expect("restriction");
+    }
+    let named: Vec<String> = ["open", "walled", "concealed", "never_declared"]
+        .iter()
+        .map(|n| h.key(n).to_string())
+        .collect();
+    let conn = h.db.conn().expect("connection");
+    let chain = vec![h.tree.root, h.tree.a];
+    let seen = |visibility: DomainVisibility, scope: AccessScope, chain: Vec<Uuid>| {
+        let (conn, named) = (&conn, &named);
+        async move {
+            let mut keys = DeclarationRepo
+                .visible_keys(conn, &scope, &visibility, &chain, named)
+                .await
+                .expect("keys");
+            keys.sort();
+            keys
+        }
+    };
+    let key = |n: &str| h.key(n).to_string();
+
+    // Another domain's administrator, on a chain that hides one setting: only
+    // the undomained, unhidden one; a key never declared is not an answer.
+    assert_eq!(
+        seen(
+            DomainVisibility::Restricted(vec!["infra".to_owned()]),
+            AccessScope::allow_all(),
+            chain.clone()
+        )
+        .await,
+        vec![key("open")]
+    );
+    // The domain's own administrator sees its setting too, still not the hidden.
+    assert_eq!(
+        seen(
+            DomainVisibility::Restricted(vec!["commercial".to_owned()]),
+            AccessScope::allow_all(),
+            chain.clone()
+        )
+        .await,
+        {
+            let mut v = vec![key("open"), key("walled")];
+            v.sort();
+            v
+        }
+    );
+    // A chain with no restriction on it hides nothing.
+    assert_eq!(
+        seen(
+            DomainVisibility::Unrestricted,
+            AccessScope::allow_all(),
+            vec![h.tree.root]
+        )
+        .await
+        .len(),
+        3
+    );
+    // A grant on one declaration leaves the others unseen.
+    assert_eq!(
+        seen(
+            DomainVisibility::Unrestricted,
+            AccessScope::for_resource(open),
+            Vec::new()
+        )
+        .await,
+        vec![key("open")]
+    );
 }

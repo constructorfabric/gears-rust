@@ -62,6 +62,7 @@ pub struct CreateDeclaration {
     pub category_id: Uuid,
     pub default_value: Value,
     pub scope_class: String,
+    pub display_name: Option<String>,
     pub description: Option<String>,
     pub mode: Option<String>,
     pub requires_step_up: Option<bool>,
@@ -84,6 +85,187 @@ pub struct Created {
     pub retired: Option<String>,
 }
 
+/// What the create's first phase found: the composed key, the normalised
+/// display name and the declarations at the key and on its path.
+#[domain_model]
+#[derive(Debug, Clone)]
+struct Located {
+    key: SettingKey,
+    display_name: Option<String>,
+    existing: Option<Declaration>,
+    on_path: Vec<Declaration>,
+}
+
+impl Located {
+    /// The active declaration on the version-stripped path, whatever its major.
+    fn active(&self) -> Option<&Declaration> {
+        self.on_path.iter().find(|d| d.status == "active")
+    }
+
+    /// The retired declaration a create here would revive: the one at the
+    /// composed key, when nothing active is on the path.
+    fn retired(&self) -> Option<&Declaration> {
+        if self.active().is_some() {
+            return None;
+        }
+        self.existing.as_ref().filter(|d| d.status == "retired")
+    }
+}
+
+/// What the create's second phase resolved for the dispatch: the derived
+/// classification and the metadata a new or revived row carries.
+#[domain_model]
+struct Checked {
+    derived: DerivedClassification,
+    metadata: DeclarationMetadata,
+}
+
+/// The problem code of a revival report that has nothing to revive: no retired
+/// declaration at the key, or an active one on its path. It rides the
+/// `NotFound` the report answers, distinct from a missing category's.
+pub const NOTHING_TO_REVIVE: &str = "nothing_to_revive";
+
+/// A body that would revive a retired declaration, as far as the create's
+/// first checks can tell.
+#[domain_model]
+#[derive(Debug, Clone)]
+pub struct RevivalPlan {
+    retired: Declaration,
+    located: Located,
+}
+
+impl RevivalPlan {
+    /// The retired declaration the body would revive.
+    #[must_use]
+    pub fn retired(&self) -> &Declaration {
+        &self.retired
+    }
+}
+
+/// The tenants a report walks, the caller's first and the rest in
+/// breadth-first order, and whether the node budget cut the walk.
+#[domain_model]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Walk {
+    pub tenants: Vec<Uuid>,
+    pub truncated: bool,
+}
+
+/// One retained value a revive would re-validate, as far as it is listed.
+#[domain_model]
+#[derive(Debug, Clone, PartialEq)]
+pub struct RevivalRow {
+    pub tenant_id: Uuid,
+    /// The inline value; `None` for a secret, held by reference.
+    pub value: Option<Value>,
+    /// The classification the row itself is stored under.
+    pub data_classification: String,
+    /// Whether the revive would flag the value: it no longer validates.
+    pub needs_review: bool,
+    /// Why, when it would be flagged.
+    pub needs_review_detail: Option<String>,
+}
+
+/// What a revive would do to the retained values: every row counted, the
+/// first `limit` of them, in the walk's order, listed.
+#[domain_model]
+#[derive(Debug, Clone, PartialEq)]
+pub struct RevivalReport {
+    pub key: String,
+    pub declaration_id: Uuid,
+    /// The stricter of the declaration's stored classification and the body's
+    /// derived one; a listed value is masked by the strictest of this and its
+    /// row's own.
+    pub data_classification: &'static str,
+    /// The first `limit` rows, values and details kept for these alone.
+    pub rows: Vec<RevivalRow>,
+    /// Every row found at the walked tenants.
+    pub total: usize,
+    /// How many of them the revive would flag.
+    pub total_needs_review: usize,
+    /// The tenants walked, the caller included.
+    pub scanned: usize,
+    /// Whether the walk was whole: the counts are all there are.
+    pub complete: bool,
+}
+
+/// The rows of one value hash that were judged: the row's index in the
+/// stored rows, and the verdict.
+type VerdictBucket = Vec<(usize, Option<String>)>;
+
+/// The port the report's read gate is asked through: whether the caller may
+/// read the retired declaration the way the single read would show it — its
+/// grant, administrative domain and `hidden` restriction, the licence
+/// predicate joining in R2. The adapter owns the caller's scope and chain.
+#[async_trait::async_trait]
+pub trait RevivalReadGate: Send + Sync {
+    /// # Errors
+    /// [`DomainError`] when the gate's own reads fail.
+    async fn may_read(&self, declaration: &Declaration) -> Result<bool, DomainError>;
+}
+
+/// Feed `value` to `state` so that equal values hash alike. An object's
+/// members go in key order: `Value` equality ignores the order of an object's
+/// keys, but the object's text keeps it once `serde_json`'s `preserve_order`
+/// feature is on — and a workspace build turns it on through other crates — so
+/// hashing the text would put two equal objects in different buckets. A number
+/// goes as its text, as equal numbers print alike; a float zero's sign is the
+/// one exception, and it costs no more than a second validation.
+fn hash_value<H: std::hash::Hasher>(value: &Value, state: &mut H) {
+    use std::hash::Hash as _;
+    match value {
+        Value::Null => 0_u8.hash(state),
+        Value::Bool(flag) => {
+            1_u8.hash(state);
+            flag.hash(state);
+        }
+        Value::Number(number) => {
+            2_u8.hash(state);
+            number.to_string().hash(state);
+        }
+        Value::String(text) => {
+            3_u8.hash(state);
+            text.hash(state);
+        }
+        Value::Array(items) => {
+            4_u8.hash(state);
+            items.len().hash(state);
+            for item in items {
+                hash_value(item, state);
+            }
+        }
+        Value::Object(members) => {
+            5_u8.hash(state);
+            members.len().hash(state);
+            let mut sorted: Vec<(&String, &Value)> = members.iter().collect();
+            sorted.sort_unstable_by(|a, b| a.0.cmp(b.0));
+            for (key, member) in sorted {
+                key.hash(state);
+                hash_value(member, state);
+            }
+        }
+    }
+}
+
+/// The strictest of any number of classifications: `secret` over `pii` over
+/// `public`, and a string that is none of these ranks as the strictest of
+/// all — fail closed, so an unknown class masks rather than shows.
+#[must_use]
+pub fn strictest_classification<'a>(
+    classifications: impl IntoIterator<Item = &'a str>,
+) -> &'static str {
+    let rank = |classification: &str| match classification {
+        "public" => 0,
+        "pii" => 1,
+        _ => 2,
+    };
+    match classifications.into_iter().map(rank).max().unwrap_or(0) {
+        0 => "public",
+        1 => "pii",
+        _ => "secret",
+    }
+}
+
 /// What the value type's traits and the author's wish resolve to.
 #[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -102,6 +284,39 @@ pub enum FieldClass {
     Immutable,
     /// Loosening a gate or a classification: needs credential step-up.
     StepUp,
+}
+
+/// The longest display name, in Unicode characters after trimming.
+const DISPLAY_NAME_MAX_CHARS: usize = 256;
+
+/// Trim a display name and check it is 1..=256 characters with no control
+/// characters.
+///
+/// Counted in `chars()`, not bytes: the bound is about what a person reads.
+///
+/// # Errors
+/// [`DomainError::Validation`] naming `display_name` when the trimmed value is
+/// empty, longer than the bound, or containing a control character.
+pub fn normalise_display_name(raw: &str) -> Result<String, DomainError> {
+    let trimmed = raw.trim();
+    let length = trimmed.chars().count();
+    if length == 0 || length > DISPLAY_NAME_MAX_CHARS {
+        return Err(validation(
+            "display_name",
+            field::VALIDATION,
+            format!(
+                "`display_name` must be 1 to {DISPLAY_NAME_MAX_CHARS} characters after trimming"
+            ),
+        ));
+    }
+    if trimmed.chars().any(char::is_control) {
+        return Err(validation(
+            "display_name",
+            field::VALIDATION,
+            "`display_name` must not contain control characters",
+        ));
+    }
+    Ok(trimmed.to_owned())
 }
 
 fn validation(field: &str, code: &'static str, message: impl Into<String>) -> DomainError {
@@ -291,6 +506,15 @@ pub fn classify_field(
             }
             FieldClass::Immediate
         }
+        "display_name" => {
+            if !value.is_null() {
+                let Some(raw) = value.as_str() else {
+                    return Err(wrong_shape("a string or null"));
+                };
+                normalise_display_name(raw)?;
+            }
+            FieldClass::Immediate
+        }
         "mode" => match value.as_str() {
             Some("standard" | "advanced") => FieldClass::Immediate,
             _ => return Err(wrong_shape("`standard` or `advanced`")),
@@ -352,6 +576,7 @@ fn snapshot(declaration: &Declaration) -> Value {
         "mode": declaration.mode,
         "status": declaration.status,
         "description": declaration.description,
+        "display_name": declaration.display_name,
         "domain_affinity": declaration.domain_affinity,
         "licence_feature": declaration.licence_feature,
         "data_classification": declaration.data_classification,
@@ -374,6 +599,7 @@ fn optional_string(value: &Value) -> Option<String> {
 // @cpt-dod:cpt-cf-settings-service-dod-setting-declarations-lifecycle:p1
 // @cpt-dod:cpt-cf-settings-service-dod-setting-declarations-contributed-protection:p1
 // @cpt-dod:cpt-cf-settings-service-dod-setting-declarations-audit:p1
+// @cpt-dod:cpt-cf-settings-service-dod-setting-declarations-revival-report:p1
 #[domain_model]
 pub struct DeclarationAdmin<R, Cat, Val, S> {
     declarations: R,
@@ -433,160 +659,14 @@ where
         request: CreateDeclaration,
         actor: &WriteActor,
     ) -> Result<Created, DomainError> {
-        // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-create:p1:inst-decl-create-4
-        // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-create:p1:inst-decl-create-5
-        let category = self
-            .categories
-            .find(conn, scope, request.category_id)
-            .await?
-            .ok_or(DomainError::NotFound {
-                resource: "category",
-            })?;
-        // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-create:p1:inst-decl-create-5
-        // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-create:p1:inst-decl-create-4
-        // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-create:p1:inst-decl-create-6
-        // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-create:p1:inst-decl-create-7
-        // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-reactivate:p1:inst-decl-react-4
-        let key = SettingKey::compose(&request.vendor, category.key.as_str(), &request.name)
-            .map_err(|err| match err {
-                SettingKeyError::InvalidSegment { segment, cause, .. } => validation(
-                    "key",
-                    field::SETTING_KEY_SEGMENT,
-                    format!("segment `{segment}` violates the GTS grammar: {cause}"),
-                ),
-                other => validation("key", field::SETTING_KEY_SEGMENT, other.to_string()),
-            })?;
-        // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-create:p1:inst-decl-create-7
-        // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-create:p1:inst-decl-create-6
-        if !matches!(
-            request.scope_class.as_str(),
-            "global" | "cascading" | "local"
-        ) {
-            return Err(validation(
-                "scope_class",
-                field::SCOPE_CLASS_INVALID,
-                "every declaration names its scope class: `global`, `cascading` or `local`",
-            ));
-        }
-        let existing = self
-            .declarations
-            .find_by_key(conn, scope, key.as_str())
-            .await?;
-        // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-reactivate:p1:inst-decl-react-4
-        // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-evolve:p1:inst-decl-evolve-1
-        // The active declaration on the version-stripped path comes first,
-        // whatever its major: after `v1 → v2` the composed `v1` key is retired,
-        // and looking it up alone would revive it beside the live `v2`.
-        let on_path = self.declarations_on_path(conn, scope, &key).await?;
-        // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-evolve:p1:inst-decl-evolve-1
-        let active = on_path.iter().find(|d| d.status == "active");
-        let retired = if active.is_none() {
-            existing.as_ref().filter(|d| d.status == "retired")
-        } else {
-            None
-        };
-        // Who may change the row at all is judged before anything about the
-        // request is resolved: a gear's declaration answers with its owner,
-        // whatever value type, classification or default the request names —
-        // no registry lookup and no classification rule stands in front of
-        // that answer — and ahead of step-up, which is asked only of a change
-        // that could go through. Nothing keeps a module out of the `settings`
-        // package an admin key is composed with, so its declaration can sit at
-        // this key or on this path.
-        // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-evolve:p1:inst-decl-evolve-8
-        if let Some(active) = active
-            && active.source == "module_contributed"
-        {
-            return Err(conflict(
-                conflict::CONTRIBUTED_IMMUTABLE,
-                format!(
-                    "`{}` is contributed by a gear; it evolves when that gear registers a new \
-                     major",
-                    active.key
-                ),
-            ));
-        }
-        // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-evolve:p1:inst-decl-evolve-8
-        if let Some(retired) = retired {
-            // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-reactivate:p1:inst-decl-react-15
-            // A revive would replace its Schema Default and metadata.
-            Self::refuse_contributed(retired)?;
-            // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-reactivate:p1:inst-decl-react-15
-        }
-        // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-create:p1:inst-decl-create-8
-        // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-create:p1:inst-decl-create-9
-        // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-create:p1:inst-decl-create-10
-        let traits = self
-            .validator
-            .resolve_traits(&request.value_type_id)
-            .await?;
-        let derived = derive_classification(&traits, request.data_classification.as_deref())?;
-        // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-create:p1:inst-decl-create-10
-        // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-create:p1:inst-decl-create-9
-        // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-create:p1:inst-decl-create-8
-        // A revive's own refusals are about the retired row, not the default:
-        // judged first, so a retype is refused as one rather than as a default
-        // that does not fit the type it could never adopt.
-        if let Some(retired) = retired {
-            revive_refusal(retired, &request, &derived)?;
-        }
-        // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-create:p1:inst-decl-create-11
-        // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-create:p1:inst-decl-create-12
-        // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-create:p1:inst-decl-create-13
-        if derived.has_secret_trait && !is_empty_placeholder(&request.default_value) {
-            return Err(validation(
-                "default_value",
-                field::SECRET_DEFAULT_NOT_EMPTY,
-                "a secret setting has no secret default: the placeholder is an empty value \
-                 of the type, and the credential is set as a value at a scope",
-            ));
-        }
-        // Every default is a value of its type — a secret's placeholder too:
-        // empty is not enough, `[]` is no string and `null` only fits a type
-        // that admits it (DESIGN §4.2). The contribution path applies the same
-        // rule.
-        self.validator
-            .validate_value(&request.value_type_id, &request.default_value)
-            .await?
-            .into_result()?;
-        // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-create:p1:inst-decl-create-13
-        // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-create:p1:inst-decl-create-12
-        // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-create:p1:inst-decl-create-11
-        // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-create:p1:inst-decl-create-14
-        let anonymous_exposable = request.anonymous_exposable.unwrap_or(false);
-        if anonymous_exposable && derived.data_classification != "public" {
-            return Err(validation(
-                "anonymous_exposable",
-                field::EXPOSABLE_NOT_SENSITIVE,
-                format!(
-                    "a `{}` setting cannot be exposed on the anonymous surface",
-                    derived.data_classification
-                ),
-            ));
-        }
-        // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-create:p1:inst-decl-create-14
-        // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-create:p1:inst-decl-create-15
-        let mode = match request.mode.as_deref() {
-            Some("advanced") => "advanced",
-            Some("standard") | None => "standard",
-            Some(other) => {
-                return Err(validation(
-                    "mode",
-                    field::VALIDATION,
-                    format!("`{other}` is not a mode; use `standard` or `advanced`"),
-                ));
-            }
-        };
-        let metadata = DeclarationMetadata {
-            mode: mode.to_owned(),
-            description: request.description.clone(),
-            domain_affinity: request.domain_affinity.clone(),
-            licence_feature: request.licence_feature.clone(),
-            data_classification: derived.data_classification.to_owned(),
-            requires_step_up: request.requires_step_up.unwrap_or(true),
-            anonymous_exposable,
-        };
-        // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-create:p1:inst-decl-create-15
+        let located = self.locate(conn, scope, &request).await?;
+        let Checked { derived, metadata } = self.check(&located, &request).await?;
+        let Located {
+            key,
+            existing,
+            on_path,
+            ..
+        } = located;
 
         if let Some(active) = on_path.iter().find(|d| d.status == "active") {
             // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-evolve:p1:inst-decl-evolve-2
@@ -644,6 +724,377 @@ where
         }
     }
 
+    /// Plan a revival report: the create's first checks on the body, whether
+    /// the body would revive a retired declaration at all, and whether the
+    /// caller may read that declaration.
+    ///
+    /// # Errors
+    /// The create's own refusals up to the lookup, as [`Self::create`] answers
+    /// them; [`DomainError::NotFound`] with [`NOTHING_TO_REVIVE`] when no
+    /// retired declaration sits at the key, an active one sits on the path —
+    /// the create would then evolve or duplicate, not revive — or the gate
+    /// refuses the retired declaration to the caller.
+    pub async fn plan_revival<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        request: &CreateDeclaration,
+        gate: &dyn RevivalReadGate,
+    ) -> Result<RevivalPlan, DomainError> {
+        // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-revival-report:p1:inst-decl-revival-3
+        let located = self.locate(conn, scope, request).await?;
+        // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-revival-report:p1:inst-decl-revival-3
+        // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-revival-report:p1:inst-decl-revival-4
+        let nothing = || DomainError::NotFound {
+            resource: NOTHING_TO_REVIVE,
+        };
+        let retired = located.retired().cloned().ok_or_else(nothing)?;
+        // One answer for every way of not being there, so what the caller
+        // may not read is not told apart from what does not exist.
+        if !gate.may_read(&retired).await? {
+            return Err(nothing());
+        }
+        Ok(RevivalPlan { retired, located })
+        // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-revival-report:p1:inst-decl-revival-4
+    }
+
+    /// Report what a revive of the planned declaration would do to the values
+    /// it retained, changing nothing: the create's remaining checks, the leaf
+    /// name, the retained subject-less rows at the walked tenants, each
+    /// re-validated as the revive would re-validate it. Every row is counted;
+    /// the first `limit`, in the walk's order, are listed.
+    ///
+    /// The walk is asked for only here, after every refusal.
+    ///
+    /// # Errors
+    /// The create's refusals up to step-up, as [`Self::create`] answers them;
+    /// [`DomainError::Conflict`] with `leaf_name_taken` when an active
+    /// declaration holds the leaf name in the category;
+    /// [`DomainError::Unavailable`] when the Type Validator cannot answer.
+    pub async fn revival_report<C, F, Fut>(
+        &self,
+        conn: &C,
+        value_scope: &AccessScope,
+        plan: RevivalPlan,
+        request: &CreateDeclaration,
+        limit: usize,
+        walk: F,
+    ) -> Result<RevivalReport, DomainError>
+    where
+        C: DBRunner,
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<Walk, DomainError>>,
+    {
+        let RevivalPlan { retired, located } = plan;
+        // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-revival-report:p1:inst-decl-revival-5
+        let checked = self.check(&located, request).await?;
+        // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-revival-report:p1:inst-decl-revival-5
+        // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-revival-report:p1:inst-decl-revival-6
+        // Unscoped, as the revive's unique index is: a holder outside the
+        // caller's scope still blocks the revive, so it must be found. What
+        // this tells the caller — that the leaf name is taken in the
+        // declaration's own category — the create tells it too, as its insert
+        // collides on the same index.
+        if self
+            .declarations
+            .find_active_by_leaf(
+                conn,
+                &AccessScope::allow_all(),
+                retired.category_id,
+                &retired.leaf_slug,
+            )
+            .await?
+            .is_some_and(|holder| holder.id != retired.id)
+        {
+            return Err(conflict(
+                conflict::LEAF_NAME_TAKEN,
+                format!(
+                    "the leaf name `{}` is held by an active declaration in this category; \
+                     a revive of `{}` would collide with it",
+                    retired.leaf_slug, retired.key
+                ),
+            ));
+        }
+        // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-revival-report:p1:inst-decl-revival-6
+        // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-revival-report:p1:inst-decl-revival-7
+        let walked = walk().await?;
+        // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-revival-report:p1:inst-decl-revival-7
+        // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-revival-report:p1:inst-decl-revival-8
+        let mut stored = self
+            .values
+            .find_in_tenants(conn, value_scope, retired.id, &walked.tenants)
+            .await?;
+        // The walk's position of every tenant, built once: the order is a
+        // sort on an O(1) lookup.
+        let position: std::collections::HashMap<Uuid, usize> = walked
+            .tenants
+            .iter()
+            .enumerate()
+            .map(|(at, tenant)| (*tenant, at))
+            .collect();
+        stored.sort_by_key(|row| position.get(&row.tenant_id).copied().unwrap_or(usize::MAX));
+        // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-revival-report:p1:inst-decl-revival-8
+        // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-revival-report:p1:inst-decl-revival-9
+        // A value shared by many rows — the same override copied down a
+        // tree — is judged once: the verdict depends on the value and the
+        // type alone, so it is reused for every row holding that value. Rows
+        // are found by a hash of the value and confirmed by `Value` equality,
+        // so no second copy of any value is kept; a secret row has no value
+        // here to judge. The hash ignores an object's key order, as `Value`
+        // equality does (see `hash_value`).
+        let mut verdicts: std::collections::HashMap<u64, VerdictBucket> =
+            std::collections::HashMap::new();
+        let mut rows = Vec::with_capacity(limit.min(stored.len()));
+        let mut total_needs_review = 0;
+        for (at, row) in stored.iter().enumerate() {
+            let detail = match &row.value {
+                None => None,
+                Some(value) => {
+                    use std::hash::Hasher as _;
+                    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                    hash_value(value, &mut hasher);
+                    let bucket = verdicts.entry(hasher.finish()).or_default();
+                    let known = bucket
+                        .iter()
+                        .find(|(seen, _)| stored[*seen].value.as_ref() == Some(value))
+                        .map(|(_, verdict)| verdict.clone());
+                    if let Some(known) = known {
+                        known
+                    } else {
+                        let judged = self.revalidate(&retired.value_type_id, row).await?;
+                        bucket.push((at, judged.clone()));
+                        judged
+                    }
+                }
+            };
+            let needs_review = detail.is_some();
+            total_needs_review += usize::from(needs_review);
+            // Values and details are kept for the listed rows alone.
+            if at < limit {
+                rows.push(RevivalRow {
+                    tenant_id: row.tenant_id,
+                    value: row.value.clone(),
+                    data_classification: row.data_classification.clone(),
+                    needs_review,
+                    needs_review_detail: detail,
+                });
+            }
+        }
+        // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-revival-report:p1:inst-decl-revival-9
+        Ok(RevivalReport {
+            key: retired.key.clone(),
+            declaration_id: retired.id,
+            data_classification: strictest_classification([
+                retired.data_classification.as_str(),
+                checked.derived.data_classification,
+            ]),
+            rows,
+            total: stored.len(),
+            total_needs_review,
+            scanned: walked.tenants.len(),
+            complete: !walked.truncated,
+        })
+    }
+
+    /// The create's first phase, which the revival report shares: the
+    /// category, the key composed from the body, its display name and Scope
+    /// Class, the declarations found at the key and on its version-stripped
+    /// path, and the refusal of an active `module_contributed` one on the path.
+    ///
+    /// # Errors
+    /// [`DomainError::NotFound`] on the category; [`DomainError::Validation`]
+    /// for a key segment, display name or Scope Class the rules refuse;
+    /// [`DomainError::Conflict`] for an active contributed declaration on the
+    /// path.
+    async fn locate<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        request: &CreateDeclaration,
+    ) -> Result<Located, DomainError> {
+        // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-create:p1:inst-decl-create-4
+        // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-create:p1:inst-decl-create-5
+        let category = self
+            .categories
+            .find(conn, scope, request.category_id)
+            .await?
+            .ok_or(DomainError::NotFound {
+                resource: "category",
+            })?;
+        // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-create:p1:inst-decl-create-5
+        // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-create:p1:inst-decl-create-4
+        // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-create:p1:inst-decl-create-6
+        // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-create:p1:inst-decl-create-7
+        // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-reactivate:p1:inst-decl-react-4
+        let key = SettingKey::compose(&request.vendor, category.key.as_str(), &request.name)
+            .map_err(|err| match err {
+                SettingKeyError::InvalidSegment { segment, cause, .. } => validation(
+                    "key",
+                    field::SETTING_KEY_SEGMENT,
+                    format!("segment `{segment}` violates the GTS grammar: {cause}"),
+                ),
+                other => validation("key", field::SETTING_KEY_SEGMENT, other.to_string()),
+            })?;
+        let display_name = request
+            .display_name
+            .as_deref()
+            .map(normalise_display_name)
+            .transpose()?;
+        // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-create:p1:inst-decl-create-7
+        // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-create:p1:inst-decl-create-6
+        if !matches!(
+            request.scope_class.as_str(),
+            "global" | "cascading" | "local"
+        ) {
+            return Err(validation(
+                "scope_class",
+                field::SCOPE_CLASS_INVALID,
+                "every declaration names its scope class: `global`, `cascading` or `local`",
+            ));
+        }
+        let existing = self
+            .declarations
+            .find_by_key(conn, scope, key.as_str())
+            .await?;
+        // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-reactivate:p1:inst-decl-react-4
+        // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-evolve:p1:inst-decl-evolve-1
+        // The active declaration on the version-stripped path comes first,
+        // whatever its major: after `v1 → v2` the composed `v1` key is retired,
+        // and looking it up alone would revive it beside the live `v2`.
+        let on_path = self.declarations_on_path(conn, scope, &key).await?;
+        // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-evolve:p1:inst-decl-evolve-1
+        let located = Located {
+            key,
+            display_name,
+            existing,
+            on_path,
+        };
+        // Who may change the row at all is judged before anything about the
+        // request is resolved: a gear's declaration answers with its owner,
+        // whatever value type, classification or default the request names —
+        // no registry lookup and no classification rule stands in front of
+        // that answer — and ahead of step-up, which is asked only of a change
+        // that could go through. Nothing keeps a module out of the `settings`
+        // package an admin key is composed with, so its declaration can sit at
+        // this key or on this path.
+        // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-evolve:p1:inst-decl-evolve-8
+        if let Some(active) = located.active()
+            && active.source == "module_contributed"
+        {
+            return Err(conflict(
+                conflict::CONTRIBUTED_IMMUTABLE,
+                format!(
+                    "`{}` is contributed by a gear; it evolves when that gear registers a new \
+                     major",
+                    active.key
+                ),
+            ));
+        }
+        // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-evolve:p1:inst-decl-evolve-8
+        Ok(located)
+    }
+
+    /// The create's second phase, which the revival report shares: everything
+    /// the create judges before it would ask for step-up — a retired
+    /// `module_contributed` declaration, the value type's traits and the
+    /// derived classification, a revive's own refusals, the Schema Default and
+    /// the remaining body fields.
+    ///
+    /// # Errors
+    /// [`DomainError::Conflict`], [`DomainError::Validation`] and
+    /// [`DomainError::Unavailable`], as the create answers them.
+    async fn check(
+        &self,
+        located: &Located,
+        request: &CreateDeclaration,
+    ) -> Result<Checked, DomainError> {
+        let retired = located.retired();
+        if let Some(retired) = retired {
+            // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-reactivate:p1:inst-decl-react-15
+            // A revive would replace its Schema Default and metadata.
+            Self::refuse_contributed(retired)?;
+            // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-reactivate:p1:inst-decl-react-15
+        }
+        // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-create:p1:inst-decl-create-8
+        // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-create:p1:inst-decl-create-9
+        // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-create:p1:inst-decl-create-10
+        let traits = self
+            .validator
+            .resolve_traits(&request.value_type_id)
+            .await?;
+        let derived = derive_classification(&traits, request.data_classification.as_deref())?;
+        // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-create:p1:inst-decl-create-10
+        // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-create:p1:inst-decl-create-9
+        // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-create:p1:inst-decl-create-8
+        // A revive's own refusals are about the retired row, not the default:
+        // judged first, so a retype is refused as one rather than as a default
+        // that does not fit the type it could never adopt.
+        if let Some(retired) = retired {
+            revive_refusal(retired, request, &derived)?;
+        }
+        // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-reactivate:p1:inst-decl-react-16
+        // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-create:p1:inst-decl-create-11
+        // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-create:p1:inst-decl-create-12
+        // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-create:p1:inst-decl-create-13
+        if derived.has_secret_trait && !is_empty_placeholder(&request.default_value) {
+            return Err(validation(
+                "default_value",
+                field::SECRET_DEFAULT_NOT_EMPTY,
+                "a secret setting has no secret default: the placeholder is an empty value \
+                 of the type, and the credential is set as a value at a scope",
+            ));
+        }
+        // Every default is a value of its type — a secret's placeholder too:
+        // empty is not enough, `[]` is no string and `null` only fits a type
+        // that admits it (DESIGN §4.2). The contribution path applies the same
+        // rule.
+        self.validator
+            .validate_value(&request.value_type_id, &request.default_value)
+            .await?
+            .into_result()?;
+        // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-create:p1:inst-decl-create-13
+        // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-create:p1:inst-decl-create-12
+        // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-create:p1:inst-decl-create-11
+        // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-create:p1:inst-decl-create-14
+        let anonymous_exposable = request.anonymous_exposable.unwrap_or(false);
+        if anonymous_exposable && derived.data_classification != "public" {
+            return Err(validation(
+                "anonymous_exposable",
+                field::EXPOSABLE_NOT_SENSITIVE,
+                format!(
+                    "a `{}` setting cannot be exposed on the anonymous surface",
+                    derived.data_classification
+                ),
+            ));
+        }
+        // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-create:p1:inst-decl-create-14
+        // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-create:p1:inst-decl-create-15
+        let mode = match request.mode.as_deref() {
+            Some("advanced") => "advanced",
+            Some("standard") | None => "standard",
+            Some(other) => {
+                return Err(validation(
+                    "mode",
+                    field::VALIDATION,
+                    format!("`{other}` is not a mode; use `standard` or `advanced`"),
+                ));
+            }
+        };
+        let metadata = DeclarationMetadata {
+            mode: mode.to_owned(),
+            display_name: located.display_name.clone(),
+            description: request.description.clone(),
+            domain_affinity: request.domain_affinity.clone(),
+            licence_feature: request.licence_feature.clone(),
+            data_classification: derived.data_classification.to_owned(),
+            requires_step_up: request.requires_step_up.unwrap_or(true),
+            anonymous_exposable,
+        };
+        // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-create:p1:inst-decl-create-15
+        // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-reactivate:p1:inst-decl-react-16
+        Ok(Checked { derived, metadata })
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn insert_new<C: DBRunner>(
         &self,
@@ -682,6 +1133,7 @@ where
             source: "admin_authored".to_owned(),
             owner_module: None,
             licence_feature: metadata.licence_feature.clone(),
+            display_name: metadata.display_name.clone(),
             description: metadata.description.clone(),
             created_by: actor.subject(),
         };
@@ -1058,6 +1510,7 @@ where
         // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-update:p1:inst-decl-update-10
         let mut metadata = DeclarationMetadata {
             mode: current.mode.clone(),
+            display_name: current.display_name.clone(),
             description: current.description.clone(),
             domain_affinity: current.domain_affinity.clone(),
             licence_feature: current.licence_feature.clone(),
@@ -1068,6 +1521,11 @@ where
         for (name, value) in patch {
             match name.as_str() {
                 "description" => metadata.description = optional_string(value),
+                "display_name" => {
+                    // Validated by `classify_field` before this point; `null`
+                    // clears the label.
+                    metadata.display_name = value.as_str().map(|raw| raw.trim().to_owned());
+                }
                 "domain_affinity" => metadata.domain_affinity = optional_string(value),
                 "licence_feature" => metadata.licence_feature = optional_string(value),
                 "mode" => metadata.mode = value.as_str().unwrap_or("standard").to_owned(),
