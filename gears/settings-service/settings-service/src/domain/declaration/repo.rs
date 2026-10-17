@@ -8,12 +8,13 @@
 use async_trait::async_trait;
 use toolkit_db::secure::DBRunner;
 use toolkit_macros::domain_model;
-use toolkit_odata::{ODataQuery, Page};
+use toolkit_odata::{CursorV1, ODataQuery, Page};
 use toolkit_security::AccessScope;
 use uuid::Uuid;
 
 use crate::domain::category::DomainVisibility;
 use crate::domain::error::DomainError;
+use crate::domain::search::{Corpus, Needle};
 
 /// A declaration as the domain sees it.
 ///
@@ -64,6 +65,9 @@ pub struct Declaration {
 
     /// The contributing module, for module-contributed declarations.
     pub owner_module: Option<String>,
+
+    /// Optional human-readable label; never derived from `leaf_slug`.
+    pub display_name: Option<String>,
 
     /// Optional long-form description.
     pub description: Option<String>,
@@ -131,6 +135,8 @@ pub struct DeclarationDraft {
     pub owner_module: Option<String>,
     /// The licence feature gating the setting, if any.
     pub licence_feature: Option<String>,
+    /// Human-readable label, trimmed.
+    pub display_name: Option<String>,
     /// Human-readable description.
     pub description: Option<String>,
     /// The principal or module that created the row.
@@ -146,6 +152,9 @@ pub struct DeclarationDraft {
 pub struct DeclarationMetadata {
     /// `standard` or `advanced`.
     pub mode: String,
+    /// Human-readable label, trimmed. Presentation only: it never moves
+    /// `last_change_at`.
+    pub display_name: Option<String>,
     /// Human-readable description.
     pub description: Option<String>,
     /// The administrative domain, if any.
@@ -178,6 +187,40 @@ impl DeclarationMetadata {
             || self.licence_feature != current.licence_feature
             || self.domain_affinity != current.domain_affinity
     }
+}
+
+/// What the browse narrowing by text asks the candidate read: the needle, the
+/// classifications it may match a declaration's Schema Default against, and
+/// the spelling of the substring predicate.
+#[domain_model]
+#[derive(Debug, Clone, Copy)]
+pub struct BrowseNarrowing<'a> {
+    /// The validated, trimmed text.
+    pub needle: &'a Needle,
+    /// The corpus the caller's entitlement admits, decided before the read.
+    pub corpus: Corpus,
+    /// Whether the database in use is `PostgreSQL` (`ILIKE`), as against the
+    /// portable `LIKE` spelling. A flag rather than a binding of the
+    /// repository: `DeclarationRepo` is built at about fifty sites and cannot
+    /// read the backend from its connection. A wrong value is SQL in the wrong
+    /// dialect.
+    pub postgres: bool,
+}
+
+/// One candidate of a narrowed browse batch: a declaration, whether its own
+/// text matched, and its place in the listing, from which a cursor continues
+/// after it or before it, so a page can end on any candidate of the batch.
+#[domain_model]
+#[derive(Debug, Clone)]
+pub struct BrowseCandidate {
+    /// The declaration.
+    pub declaration: Declaration,
+    /// Whether the declaration text (`key`, `display_name`, `description`,
+    /// category name, Schema Default) contains the needle.
+    pub text_matched: bool,
+    /// The forward cursor positioned after this row, not yet encoded; the
+    /// same position with `d = "bwd"` is the cursor before it.
+    pub position: CursorV1,
 }
 
 /// Operations on declarations.
@@ -324,10 +367,22 @@ pub trait DeclarationRepository: Send + Sync {
         category_id: Uuid,
     ) -> Result<Vec<Declaration>, DomainError>;
 
+    /// The declarations with these ids, in one read.
+    ///
+    /// # Errors
+    /// [`DomainError`] when the read fails.
+    async fn find_by_ids<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        ids: &[Uuid],
+    ) -> Result<Vec<Declaration>, DomainError>;
+
     /// List declarations for the caller, leaving out those `hidden` for the
     /// tenant whose root-to-self chain is `hidden_for` — in the query, so the
     /// page is cut and counted after the exclusion. An empty chain excludes
-    /// nothing.
+    /// nothing. With `flagged_at`, only the declarations whose own override at
+    /// that tenant is flagged for review — also in the query.
     ///
     /// # Errors
     /// [`DomainError::Validation`] when the query names an unmapped field, uses
@@ -338,6 +393,45 @@ pub trait DeclarationRepository: Send + Sync {
         scope: &AccessScope,
         visibility: &DomainVisibility,
         hidden_for: &[Uuid],
+        flagged_at: Option<Uuid>,
         query: &ODataQuery,
     ) -> Result<Page<Declaration>, DomainError>;
+
+    /// One batch of the narrowed browse: the same page as [`Self::list`], each
+    /// candidate marked with whether its declaration text matched — one read
+    /// over the batch's ids with the search's predicate expressions, never a
+    /// conjunct of the page query — and carrying its position in the
+    /// listing. The `query`'s `filter_hash` is what a cursor minted from a
+    /// position is bound to.
+    ///
+    /// # Errors
+    /// [`DomainError::Validation`] as for [`Self::list`]; [`DomainError`] when
+    /// a read fails.
+    #[allow(clippy::too_many_arguments)]
+    async fn list_candidates<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        visibility: &DomainVisibility,
+        hidden_for: &[Uuid],
+        flagged_at: Option<Uuid>,
+        query: &ODataQuery,
+        narrowing: &BrowseNarrowing<'_>,
+    ) -> Result<Page<BrowseCandidate>, DomainError>;
+
+    /// Which of `keys` name a declaration the caller may see: within the
+    /// caller's grant and administrative domains and not `hidden` on the
+    /// chain `hidden_for` — the three gates of [`Self::list`], in one read
+    /// however many keys are asked.
+    ///
+    /// # Errors
+    /// [`DomainError`] when the read fails.
+    async fn visible_keys<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        visibility: &DomainVisibility,
+        hidden_for: &[Uuid],
+        keys: &[String],
+    ) -> Result<Vec<String>, DomainError>;
 }

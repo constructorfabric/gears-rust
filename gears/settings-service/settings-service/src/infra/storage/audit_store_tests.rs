@@ -11,7 +11,7 @@ use toolkit_security::AccessScope;
 use uuid::Uuid;
 
 use super::AuditStore;
-use crate::audit::{AuditOperation, AuditRecord, AuditSink, AuditValue};
+use crate::audit::{ActorTenant, AuditOperation, AuditRecord, AuditSink, AuditValue};
 use crate::domain::error::DomainError;
 use crate::test_support::sqlite_provider;
 
@@ -22,15 +22,22 @@ async fn db() -> Arc<DBProvider<DbError>> {
 }
 
 fn record(tenant: Uuid, request: &str) -> AuditRecord {
-    AuditRecord::new(KEY, Some(tenant), "admin", AuditOperation::Change, request)
-        .with_pre_image(AuditValue::record(
-            json!(false),
-            crate::audit::ImageClass::Public,
-        ))
-        .with_post_image(AuditValue::record(
-            json!(true),
-            crate::audit::ImageClass::Public,
-        ))
+    AuditRecord::new(
+        KEY,
+        Some(tenant),
+        "admin",
+        ActorTenant::machine(),
+        AuditOperation::Change,
+        request,
+    )
+    .with_pre_image(AuditValue::record(
+        json!(false),
+        crate::audit::ImageClass::Public,
+    ))
+    .with_post_image(AuditValue::record(
+        json!(true),
+        crate::audit::ImageClass::Public,
+    ))
 }
 
 async fn history(
@@ -127,10 +134,18 @@ async fn a_secret_image_is_stored_masked_and_read_back_masked() {
     let db = db().await;
     let tenant = Uuid::new_v4();
     let conn = db.conn().expect("connection");
-    let rec =
-        AuditRecord::new(KEY, Some(tenant), "admin", AuditOperation::Change, "r").with_post_image(
-            AuditValue::record(json!("hunter2"), crate::audit::ImageClass::Secret),
-        );
+    let rec = AuditRecord::new(
+        KEY,
+        Some(tenant),
+        "admin",
+        ActorTenant::machine(),
+        AuditOperation::Change,
+        "r",
+    )
+    .with_post_image(AuditValue::record(
+        json!("hunter2"),
+        crate::audit::ImageClass::Secret,
+    ));
     AuditStore
         .append(&conn, &AccessScope::allow_all(), rec)
         .await
@@ -146,15 +161,22 @@ async fn a_pii_image_keeps_its_class_through_the_store() {
     let db = db().await;
     let tenant = Uuid::new_v4();
     let conn = db.conn().expect("connection");
-    let rec = AuditRecord::new(KEY, Some(tenant), "admin", AuditOperation::Change, "r")
-        .with_pre_image(AuditValue::record(
-            json!("bob@example.com"),
-            crate::audit::ImageClass::Pii,
-        ))
-        .with_post_image(AuditValue::record(
-            json!("alice@example.com"),
-            crate::audit::ImageClass::Pii,
-        ));
+    let rec = AuditRecord::new(
+        KEY,
+        Some(tenant),
+        "admin",
+        ActorTenant::machine(),
+        AuditOperation::Change,
+        "r",
+    )
+    .with_pre_image(AuditValue::record(
+        json!("bob@example.com"),
+        crate::audit::ImageClass::Pii,
+    ))
+    .with_post_image(AuditValue::record(
+        json!("alice@example.com"),
+        crate::audit::ImageClass::Pii,
+    ));
     AuditStore
         .append(&conn, &AccessScope::allow_all(), rec)
         .await
@@ -290,6 +312,7 @@ fn stored_row(
         operation: "change".to_owned(),
         actor: "admin".to_owned(),
         actor_classification: "public".to_owned(),
+        actor_tenant_id: None,
         pre_value,
         post_value: Some(json!({ "kind": "clear", "value": true })),
         outcome: "success".to_owned(),

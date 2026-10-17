@@ -98,6 +98,7 @@ fn row(owner_module: Option<&str>) -> DeclarationModel {
         owner_module: owner_module.map(str::to_owned),
         licence_feature: None,
         status: "retired".to_owned(),
+        display_name: None,
         description: None,
         last_change_at: at,
         created_at: at,

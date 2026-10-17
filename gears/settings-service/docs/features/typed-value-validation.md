@@ -158,7 +158,7 @@ Not applicable. Validation is an internal service invoked by other features rath
 1. [x] - `p2` - **FROM** `valid` **TO** `needs_review` **WHEN** an invalidating value-type upgrade means the stored value no longer validates against the current type - `inst-tvv-state-1`
 2. [x] - `p2` - **FROM** `needs_review` **TO** `valid` **WHEN** a valid value is set at that scope, or the override is reverted - `inst-tvv-state-2`
 
-This wave delivers the `needs_review` and `needs_review_detail` columns, the partial index supporting the administrator's needs-review listing, and the guarantee that a flagged value is excluded from resolution. Both transitions are driven by later features: the flagging side by the Contribution Reconciler on a type upgrade, the clearing side by the Value Writer.
+This wave delivers the `needs_review` and `needs_review_detail` columns, the partial index supporting the review listing (DESIGN §4.3, `GET …/settings/review`), and the guarantee that a flagged value is excluded from resolution. Both transitions are driven by later features: the flagging side by the Contribution Reconciler on a type upgrade, the clearing side by the Value Writer.
 
 ## 5. Definitions of Done
 
@@ -254,7 +254,7 @@ Uniqueness **MUST** be expressed as two partial unique indexes, one per scope sh
 
 - [x] `p2` - **ID**: `cpt-cf-settings-service-dod-typed-value-validation-needs-review`
 
-The system **MUST** carry a non-null `needs_review` boolean with an optional human-readable detail, **MUST** provide the partial index supporting an administrator listing of flagged values, and **MUST** guarantee that a flagged value is excluded from resolution and from apply until corrected.
+The system **MUST** carry a non-null `needs_review` boolean with an optional human-readable detail, **MUST** provide the partial index supporting the review listing (DESIGN §4.3, `GET …/settings/review`), and **MUST** guarantee that a flagged value is excluded from resolution and from apply until corrected.
 
 **Implements**:
 - `cpt-cf-settings-service-state-typed-value-validation-review`
@@ -267,7 +267,7 @@ The system **MUST** carry a non-null `needs_review` boolean with an optional hum
 
 - [x] `p2` - **ID**: `cpt-cf-settings-service-dod-typed-value-validation-needs-review-gauge`
 
-The system **MUST** publish `settings_needs_review_total`, the count of overrides flagged `needs_review`, by declaration source (`admin_authored`, `module_contributed`), refreshed from the store by the gear's lifecycle once a minute. Every source **MUST** be published on every refresh, zero included, so a backlog that has been fixed reads zero rather than its last count, and a failed refresh **MUST** leave the gauge as it was until the next one. A flagged override falls through on read without an error; this gauge is the signal an operator alerts on, and the needs-review listing shows which settings and scopes are affected.
+The system **MUST** publish `settings_needs_review_total`, the count of subject-less overrides flagged `needs_review`, by declaration source (`admin_authored`, `module_contributed`), refreshed from the store by the gear's lifecycle once a minute. Every source **MUST** be published on every refresh, zero included, so a backlog that has been fixed reads zero rather than its last count, and a failed refresh **MUST** leave the gauge as it was until the next one. A flagged override falls through on read without an error; this gauge is the signal an operator alerts on, and the review listing shows which settings and scopes are affected.
 
 **Implements**:
 - `cpt-cf-settings-service-state-typed-value-validation-review`

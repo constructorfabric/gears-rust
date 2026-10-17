@@ -15,9 +15,9 @@ use toolkit_security::AccessScope;
 use uuid::Uuid;
 
 use super::{SettingTypeRegistrar, reason};
-use crate::audit::{AuditOperation, AuditRecord, AuditSink, AuditValue};
+use crate::audit::{ActorTenant, AuditOperation, AuditRecord, AuditSink, AuditValue};
 use crate::domain::category::{CategoryDraft, CategoryKey, CategoryRepository};
-use crate::domain::declaration::admin::is_empty_placeholder;
+use crate::domain::declaration::admin::{is_empty_placeholder, normalise_display_name};
 use crate::domain::declaration::{
     Declaration, DeclarationDraft, DeclarationMetadata, DeclarationRepository,
 };
@@ -110,6 +110,7 @@ impl Derived {
     fn metadata(&self, contributed: &ContributedDeclaration) -> DeclarationMetadata {
         DeclarationMetadata {
             mode: self.mode.to_owned(),
+            display_name: trimmed_display_name(contributed),
             description: contributed.description.clone(),
             domain_affinity: contributed.domain_affinity.clone(),
             licence_feature: contributed.licence_feature.clone(),
@@ -117,6 +118,36 @@ impl Derived {
             requires_step_up: self.requires_step_up,
             anonymous_exposable: self.anonymous_exposable,
         }
+    }
+}
+
+/// The contributed display name as it is stored: trimmed. Already refused when
+/// empty, over-long or carrying a control character by [`check_display_name`],
+/// which runs first.
+fn trimmed_display_name(contributed: &ContributedDeclaration) -> Option<String> {
+    contributed
+        .display_name
+        .as_deref()
+        .map(|raw| raw.trim().to_owned())
+}
+
+/// Refuse a supplied display name that is empty, over-long or carries a
+/// control character after trimming, with the field named so the module sees
+/// which item and why; the other items of the batch continue.
+fn check_display_name(contributed: &ContributedDeclaration) -> Result<(), ItemError> {
+    match contributed
+        .display_name
+        .as_deref()
+        .map(normalise_display_name)
+    {
+        None | Some(Ok(_)) => Ok(()),
+        Some(Err(DomainError::Validation { message, .. })) => {
+            Err(refused(reason::DISPLAY_NAME_INVALID, message))
+        }
+        // Whatever else the normalisation may one day refuse, it refuses the
+        // supplied value: the item is turned away, never failed as a batch and
+        // never let through.
+        Some(Err(other)) => Err(refused(reason::DISPLAY_NAME_INVALID, other.wire_message())),
     }
 }
 
@@ -135,6 +166,7 @@ fn major_of(declaration: &Declaration) -> Option<u32> {
 fn metadata_differs(existing: &Declaration, metadata: &DeclarationMetadata) -> bool {
     existing.mode != metadata.mode
         || existing.description != metadata.description
+        || existing.display_name != metadata.display_name
         || existing.domain_affinity != metadata.domain_affinity
         || existing.licence_feature != metadata.licence_feature
         || existing.data_classification != metadata.data_classification
@@ -151,6 +183,7 @@ fn snapshot(declaration: &Declaration) -> Value {
         "mode": declaration.mode,
         "status": declaration.status,
         "description": declaration.description,
+        "display_name": declaration.display_name,
         "domain_affinity": declaration.domain_affinity,
         "licence_feature": declaration.licence_feature,
         "data_classification": declaration.data_classification,
@@ -240,6 +273,7 @@ where
         let derived = self.derive(contributed).await?;
         // @cpt-end:cpt-cf-settings-service-algo-module-contributions-reconcile:p1:inst-mc-rec-1
         // @cpt-begin:cpt-cf-settings-service-algo-module-contributions-reconcile:p1:inst-mc-rec-2
+        check_display_name(contributed)?;
         self.check_default(contributed).await?;
         // @cpt-end:cpt-cf-settings-service-algo-module-contributions-reconcile:p1:inst-mc-rec-2
 
@@ -542,6 +576,7 @@ where
             source: "module_contributed".to_owned(),
             owner_module: Some(owner_module.to_owned()),
             licence_feature: contributed.licence_feature.clone(),
+            display_name: trimmed_display_name(contributed),
             description: contributed.description.clone(),
             created_by: owner_module.to_owned(),
         };
@@ -765,6 +800,7 @@ where
                         needs_review: detail.is_some(),
                         needs_review_detail: detail,
                         set_by: row.set_by.clone(),
+                        set_by_tenant: row.set_by_tenant,
                     },
                 )
                 .await?;
@@ -896,8 +932,18 @@ where
         pre: Option<Value>,
         post: Option<Value>,
     ) -> Result<(), DomainError> {
-        let mut rec =
-            AuditRecord::new(key.as_str(), None, owner_module, operation, request_id).by_module();
+        // A machine act has no security context to take a tenant from: the
+        // record names no actor tenant, so no tenant reader is shown its actor
+        // and a platform administrator is.
+        let mut rec = AuditRecord::new(
+            key.as_str(),
+            None,
+            owner_module,
+            ActorTenant::machine(),
+            operation,
+            request_id,
+        )
+        .by_module();
         if let Some(pre) = pre {
             rec = rec.with_pre_image(AuditValue::definition(pre));
         }

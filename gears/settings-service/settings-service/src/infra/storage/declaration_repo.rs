@@ -1,19 +1,22 @@
 // Created: 2026-08-26 by Virtuozzo International GmbH
 //! Persistence for declarations.
 
+use std::collections::HashSet;
+
 use async_trait::async_trait;
 use sea_orm::sea_query::{Expr, Query};
 use sea_orm::{ActiveValue::Set, ColumnTrait, EntityTrait, ExprTrait, QueryFilter, QuerySelect};
-use toolkit_db::odata::{LimitCfg, paginate_odata};
+use toolkit_db::odata::{LimitCfg, ODataFieldMapping, encode_cursor_value, paginate_odata};
 use toolkit_db::secure::{DBRunner, SecureEntityExt, SecureUpdateExt};
-use toolkit_odata::{ODataQuery, Page, SortDir};
+use toolkit_odata::{CursorV1, ODataOrderBy, ODataQuery, Page, SortDir};
 use toolkit_security::AccessScope;
 use uuid::Uuid;
 
 use crate::domain::access::TenantAccess;
 use crate::domain::category::visibility::DomainVisibility;
 use crate::domain::declaration::{
-    Declaration, DeclarationDraft, DeclarationMetadata, DeclarationRepository,
+    BrowseCandidate, BrowseNarrowing, Declaration, DeclarationDraft, DeclarationMetadata,
+    DeclarationRepository,
 };
 use crate::domain::error::DomainError;
 use crate::domain::precondition;
@@ -21,6 +24,8 @@ use crate::infra::storage::clock::{now, stamp_after};
 use crate::infra::storage::declaration_odata_mapper::DeclarationODataMapper;
 use crate::infra::storage::entity::declaration::{self, Entity as DeclarationEntity};
 use crate::infra::storage::entity::tenant_permission;
+use crate::infra::storage::search_repo::{Dialect, SearchRepo};
+use crate::infra::storage::value_repo;
 use settings_service_sdk::odata::DeclarationFilterField;
 
 /// Page bounds for declaration listings.
@@ -28,7 +33,7 @@ use settings_service_sdk::odata::DeclarationFilterField;
 /// Larger than categories: a category holds tens of declarations and an
 /// administrator browsing one expects to see it whole, where the category list
 /// itself is short by nature.
-const DECLARATION_LIMIT_CFG: LimitCfg = LimitCfg {
+pub(crate) const DECLARATION_LIMIT_CFG: LimitCfg = LimitCfg {
     default: 50,
     max: 200,
 };
@@ -50,6 +55,7 @@ pub(crate) fn to_domain(model: declaration::Model) -> Declaration {
         domain_affinity: model.domain_affinity,
         licence_feature: model.licence_feature,
         owner_module: model.owner_module,
+        display_name: model.display_name,
         description: model.description,
         default_value: model.default_value,
         has_secret_trait: model.has_secret_trait,
@@ -141,6 +147,60 @@ pub(crate) fn exclude_hidden_for(
     select.filter(declaration::Column::Id.not_in_subquery(hidden))
 }
 
+/// The declarations a browse page may draw on, before the grant: within the
+/// caller's administrative domains, not `hidden` on its chain, and with
+/// `flagged_at` only those whose own override at that tenant is flagged — all
+/// in the query, so a page is cut and counted after them.
+fn gated(
+    visibility: &DomainVisibility,
+    hidden_for: &[Uuid],
+    flagged_at: Option<Uuid>,
+) -> sea_orm::Select<DeclarationEntity> {
+    let mut base = exclude_hidden_for(
+        apply_visibility(DeclarationEntity::find(), visibility),
+        hidden_for,
+    );
+    // @cpt-begin:cpt-cf-settings-service-flow-value-resolution-admin-browse:p1:inst-vr-browse-7
+    // `needs_review eq true` on the browse: only declarations whose own
+    // override at that tenant is flagged — in the page query, so the page
+    // is cut and counted over the narrowed set, never narrowed after.
+    if let Some(tenant) = flagged_at {
+        base = base.filter(
+            declaration::Column::Id.in_subquery(value_repo::flagged_declarations_at(tenant)),
+        );
+    }
+    // @cpt-end:cpt-cf-settings-service-flow-value-resolution-admin-browse:p1:inst-vr-browse-7
+    base
+}
+
+/// The position of one row in a listing, as the forward cursor after it —
+/// built as the toolkit builds the cursors of a page, but left unencoded: a
+/// page needs the cursor of two rows only.
+fn row_position(
+    model: &declaration::Model,
+    order: &ODataOrderBy,
+    filter_hash: Option<&str>,
+) -> Result<CursorV1, DomainError> {
+    let invalid = |detail: String| DomainError::Validation {
+        field: "cursor".to_owned(),
+        code: crate::field::ODATA_QUERY,
+        message: detail,
+    };
+    let values = DeclarationODataMapper::extract_cursor_values(model, order).map_err(invalid)?;
+    let mut keys = Vec::with_capacity(values.len());
+    for (field, value) in values {
+        let kind = DeclarationODataMapper::cursor_kind(field);
+        keys.push(encode_cursor_value(&value, kind).map_err(invalid)?);
+    }
+    Ok(CursorV1 {
+        k: keys,
+        o: order.0.first().map_or(SortDir::Desc, |key| key.dir),
+        s: order.to_signed_tokens(),
+        f: filter_hash.map(str::to_owned),
+        d: "fwd".to_owned(),
+    })
+}
+
 #[async_trait]
 impl DeclarationRepository for DeclarationRepo {
     async fn find_by_key<C: DBRunner>(
@@ -203,6 +263,7 @@ impl DeclarationRepository for DeclarationRepo {
             owner_module: Set(draft.owner_module),
             licence_feature: Set(draft.licence_feature),
             status: Set("active".to_owned()),
+            display_name: Set(draft.display_name),
             description: Set(draft.description),
             last_change_at: Set(at),
             created_at: Set(at),
@@ -234,6 +295,10 @@ impl DeclarationRepository for DeclarationRepo {
             .col_expr(
                 declaration::Column::Description,
                 Expr::value(metadata.description),
+            )
+            .col_expr(
+                declaration::Column::DisplayName,
+                Expr::value(metadata.display_name),
             )
             .col_expr(
                 declaration::Column::DomainAffinity,
@@ -406,21 +471,38 @@ impl DeclarationRepository for DeclarationRepo {
         Ok(rows.into_iter().map(to_domain).collect())
     }
 
+    async fn find_by_ids<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        ids: &[Uuid],
+    ) -> Result<Vec<Declaration>, DomainError> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows = DeclarationEntity::find()
+            .filter(declaration::Column::Id.is_in(ids.iter().copied()))
+            .secure()
+            .scope_with(scope)
+            .all(conn)
+            .await
+            .map_err(db_error)?;
+        Ok(rows.into_iter().map(to_domain).collect())
+    }
+
     async fn list<C: DBRunner>(
         &self,
         conn: &C,
         scope: &AccessScope,
         visibility: &DomainVisibility,
         hidden_for: &[Uuid],
+        flagged_at: Option<Uuid>,
         query: &ODataQuery,
     ) -> Result<Page<Declaration>, DomainError> {
         // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-read:p1:inst-decl-read-6
-        let base = exclude_hidden_for(
-            apply_visibility(DeclarationEntity::find(), visibility),
-            hidden_for,
-        )
-        .secure()
-        .scope_with(scope);
+        let base = gated(visibility, hidden_for, flagged_at)
+            .secure()
+            .scope_with(scope);
 
         // Tiebreaker is `key`, which `uq_declaration_key` makes unique, so a
         // page boundary can neither repeat nor skip a row.
@@ -445,4 +527,128 @@ impl DeclarationRepository for DeclarationRepo {
             page_info: page.page_info,
         })
     }
+
+    async fn list_candidates<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        visibility: &DomainVisibility,
+        hidden_for: &[Uuid],
+        flagged_at: Option<Uuid>,
+        query: &ODataQuery,
+        narrowing: &BrowseNarrowing<'_>,
+    ) -> Result<Page<BrowseCandidate>, DomainError> {
+        let base = gated(visibility, hidden_for, flagged_at)
+            .secure()
+            .scope_with(scope);
+        // The same page query as `list`; the models are kept so the cursors
+        // of every row can be minted from them.
+        let page = paginate_odata::<DeclarationFilterField, DeclarationODataMapper, _, _, _, _>(
+            base,
+            conn,
+            query,
+            ("key", SortDir::Asc),
+            DECLARATION_LIMIT_CFG,
+            |m: declaration::Model| m,
+        )
+        .await
+        .map_err(|err| DomainError::Validation {
+            field: "query".to_owned(),
+            code: crate::field::ODATA_QUERY,
+            message: err.to_string(),
+        })?;
+
+        // The order the page was cut in, as the toolkit derives it.
+        let order = match &query.cursor {
+            Some(cursor) => ODataOrderBy::from_signed_tokens(&cursor.s).map_err(|_| {
+                DomainError::Validation {
+                    field: "cursor".to_owned(),
+                    code: crate::field::ODATA_QUERY,
+                    message: "the cursor does not decode".to_owned(),
+                }
+            })?,
+            None => query.order.clone().ensure_tiebreaker("key", SortDir::Asc),
+        };
+
+        // The declaration text, matched by one read over the batch's ids with
+        // the search's predicate expressions, by id, under the caller's scope —
+        // never a conjunct of the page query, because a row may qualify by its
+        // value alone.
+        // The ids already passed visibility, `hidden` and `flagged_at` in the
+        // page query, so the read needs the ids, the grant and the text only.
+        let ids: Vec<Uuid> = page.items.iter().map(|m| m.id).collect();
+        let matched: HashSet<Uuid> = if ids.is_empty() {
+            HashSet::new()
+        } else {
+            // @cpt-begin:cpt-cf-settings-service-flow-value-resolution-admin-browse:p1:inst-vr-browse-11
+            let dialect = if narrowing.postgres {
+                Dialect::Postgres
+            } else {
+                Dialect::Sqlite
+            };
+            let text = SearchRepo::with_dialect(dialect).declaration_text_matches(
+                narrowing.needle,
+                narrowing.corpus,
+                visibility,
+            );
+            DeclarationEntity::find()
+                .filter(declaration::Column::Id.is_in(ids))
+                .filter(text)
+                .secure()
+                .scope_with(scope)
+                .all(conn)
+                .await
+                .map_err(db_error)?
+                .into_iter()
+                .map(|m| m.id)
+                .collect()
+            // @cpt-end:cpt-cf-settings-service-flow-value-resolution-admin-browse:p1:inst-vr-browse-11
+        };
+
+        let filter_hash = query.filter_hash.as_deref();
+        let mut items = Vec::with_capacity(page.items.len());
+        for model in page.items {
+            let position = row_position(&model, &order, filter_hash)?;
+            let text_matched = matched.contains(&model.id);
+            items.push(BrowseCandidate {
+                declaration: to_domain(model),
+                text_matched,
+                position,
+            });
+        }
+        Ok(Page {
+            items,
+            page_info: page.page_info,
+        })
+    }
+
+    async fn visible_keys<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        visibility: &DomainVisibility,
+        hidden_for: &[Uuid],
+        keys: &[String],
+    ) -> Result<Vec<String>, DomainError> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        // @cpt-begin:cpt-cf-settings-service-flow-value-resolution-admin-browse:p1:inst-vr-browse-9
+        let rows = exclude_hidden_for(
+            apply_visibility(DeclarationEntity::find(), visibility),
+            hidden_for,
+        )
+        .filter(declaration::Column::Key.is_in(keys.iter().cloned()))
+        .secure()
+        .scope_with(scope)
+        .all(conn)
+        .await
+        .map_err(db_error)?;
+        // @cpt-end:cpt-cf-settings-service-flow-value-resolution-admin-browse:p1:inst-vr-browse-9
+        Ok(rows.into_iter().map(|m| m.key).collect())
+    }
 }
+
+#[cfg(test)]
+#[path = "declaration_repo_tests.rs"]
+mod declaration_repo_tests;

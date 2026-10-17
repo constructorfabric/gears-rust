@@ -49,6 +49,7 @@ pub(crate) fn audit_request_id(headers: &axum::http::HeaderMap) -> String {
 pub mod access_dto;
 pub mod access_handlers;
 pub mod access_routes;
+pub mod browse_narrowing;
 pub mod declaration_dto;
 pub mod declaration_handlers;
 pub mod declaration_routes;
@@ -130,6 +131,10 @@ mod if_match_tests;
 mod read_surface_tests;
 
 #[cfg(test)]
+#[path = "browse_narrowing_tests.rs"]
+mod browse_narrowing_tests;
+
+#[cfg(test)]
 #[path = "category_surface_tests.rs"]
 mod category_surface_tests;
 
@@ -144,3 +149,7 @@ mod declaration_surface_tests;
 #[cfg(test)]
 #[path = "value_surface_tests.rs"]
 mod value_surface_tests;
+
+#[cfg(test)]
+#[path = "boundary_surface_tests.rs"]
+mod boundary_surface_tests;

@@ -34,6 +34,7 @@ fn declaration(classification: &str) -> Arc<Declaration> {
         domain_affinity: None,
         licence_feature: None,
         owner_module: None,
+        display_name: None,
         description: Some("How long audit records are retained.".to_owned()),
         default_value: json!(30),
         has_secret_trait: false,
@@ -73,6 +74,7 @@ fn row(tenant: Uuid, value: serde_json::Value, classification: &str) -> StoredVa
         last_change_at: at(1),
         updated_at: at(1),
         set_by: "admin".to_owned(),
+        set_by_tenant: None,
     }
 }
 

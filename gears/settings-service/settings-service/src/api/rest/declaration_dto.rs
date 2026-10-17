@@ -47,6 +47,10 @@ pub struct DeclarationDto {
     /// The contributing module, for module-contributed declarations.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub owner_module: Option<String>,
+    /// Optional human-readable label; omitted when unset, never derived from
+    /// `leaf_slug`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
     /// Optional long-form description.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
@@ -103,6 +107,7 @@ impl From<RenderedDeclaration> for DeclarationDto {
             domain_affinity: d.domain_affinity,
             licence_feature: d.licence_feature,
             owner_module: d.owner_module,
+            display_name: d.display_name,
             description: d.description,
             default_value: d.default_value,
             data_classification: d.data_classification,
@@ -149,6 +154,10 @@ pub struct CreateDeclarationRequest {
     pub default_value: Box<serde_json::value::RawValue>,
     /// `global`, `cascading` or `local`.
     pub scope_class: String,
+    /// Optional human-readable label, 1..256 characters after trimming. An
+    /// explicit `null` reads as unsupplied.
+    #[serde(default)]
+    pub display_name: Option<String>,
     /// Optional long-form description.
     #[serde(default)]
     pub description: Option<String>,
@@ -196,6 +205,7 @@ impl TryFrom<CreateDeclarationRequest> for crate::domain::declaration::CreateDec
             category_id: body.category_id,
             default_value,
             scope_class: body.scope_class,
+            display_name: body.display_name,
             description: body.description,
             mode: body.mode,
             requires_step_up: body.requires_step_up,
@@ -218,6 +228,9 @@ impl TryFrom<CreateDeclarationRequest> for crate::domain::declaration::CreateDec
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 #[toolkit_macros::api_dto(request)]
 pub struct UpdateDeclarationRequest {
+    /// Human-readable label, 1..256 characters after trimming; `null` clears it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
     /// Long-form description; `null` clears it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,

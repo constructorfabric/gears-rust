@@ -6,7 +6,9 @@ use toolkit_db::secure::DBRunner;
 use toolkit_security::AccessScope;
 use uuid::Uuid;
 
-use super::{StoredValue, ValueDraft};
+use toolkit_odata::Page;
+
+use super::{ReviewRequest, StoredValue, ValueDraft};
 use crate::domain::error::DomainError;
 
 /// Persistence operations on stored values.
@@ -39,6 +41,20 @@ pub trait ValueRepository: Send + Sync {
         conn: &C,
         scope: &AccessScope,
         declaration_id: Uuid,
+        tenant_ids: &[Uuid],
+    ) -> Result<Vec<StoredValue>, DomainError>;
+
+    /// The rows of several declarations whose tenant is in `tenant_ids` — a
+    /// browse batch's one read, where [`Self::find_in_tenants`] is one
+    /// declaration's.
+    ///
+    /// # Errors
+    /// [`DomainError`] when the read fails.
+    async fn find_many_in_tenants<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        declaration_ids: &[Uuid],
         tenant_ids: &[Uuid],
     ) -> Result<Vec<StoredValue>, DomainError>;
 
@@ -114,21 +130,20 @@ pub trait ValueRepository: Send + Sync {
         source: &str,
     ) -> Result<u64, DomainError>;
 
-    /// The rows flagged for review among `declaration_ids`, at any of
-    /// `tenant_ids` — the administrative needs-review listing — in
-    /// (declaration, tenant) order and at most `limit + 1` of them, so the
-    /// caller can tell a full answer from one the bound cut.
+    /// A page of the rows flagged for review at the request's tenants, whose
+    /// declaration passes the visibility predicate, the `hidden` exclusion, the
+    /// narrowed grant and the declaration selectors — all in the query — in
+    /// (declaration, tenant) order under a keyset cursor, so a setting flagged
+    /// at more tenants than the page holds continues on the next page.
     ///
     /// # Errors
-    /// [`DomainError`] when the read fails.
-    async fn list_flagged<C: DBRunner>(
+    /// [`DomainError::Validation`] for a cursor that does not decode or was
+    /// minted for another binding; [`DomainError`] when the read fails.
+    async fn list_review<C: DBRunner>(
         &self,
         conn: &C,
-        scope: &AccessScope,
-        declaration_ids: &[Uuid],
-        tenant_ids: &[Uuid],
-        limit: usize,
-    ) -> Result<Vec<StoredValue>, DomainError>;
+        request: &ReviewRequest<'_>,
+    ) -> Result<Page<StoredValue>, DomainError>;
 
     /// Insert a row.
     ///
@@ -165,6 +180,7 @@ pub trait ValueRepository: Send + Sync {
         value: Option<serde_json::Value>,
         secret_ref: Option<String>,
         set_by: &str,
+        set_by_tenant: Option<Uuid>,
         expected: time::OffsetDateTime,
     ) -> Result<StoredValue, DomainError>;
 
