@@ -2794,6 +2794,7 @@ dependencies = [
  "cf-gears-quota-enforcement-storage-plugin",
  "cf-gears-resource-group",
  "cf-gears-rg-tr-plugin",
+ "cf-gears-rules-authz-plugin",
  "cf-gears-service-discovery",
  "cf-gears-settings-service",
  "cf-gears-simple-user-settings",
@@ -3710,6 +3711,32 @@ dependencies = [
  "cf-gears-toolkit-security",
  "cf-gears-types-registry",
  "cf-gears-types-registry-sdk",
+ "inventory",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "cf-gears-rules-authz-plugin"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "cf-gears-authz-resolver-sdk",
+ "cf-gears-event-broker",
+ "cf-gears-event-broker-sdk",
+ "cf-gears-toolkit",
+ "cf-gears-toolkit-canonical-errors",
+ "cf-gears-toolkit-gts",
+ "cf-gears-toolkit-macros",
+ "cf-gears-toolkit-security",
+ "cf-gears-types-registry",
+ "cf-gears-types-registry-sdk",
+ "chrono",
+ "gts",
  "inventory",
  "serde",
  "serde_json",
