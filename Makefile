@@ -781,16 +781,15 @@ test-graph-storage: install-tools
 	$(call print_target_banner)
 	cargo nextest run -p cf-gears-graph-storage -p cf-gears-graph-storage-sdk
 
-## Run the graph-storage gear's PostgreSQL 19 lane: the same conformance
-## suite against the built-in store, plus the SQL/PGQ cases that only a real
-## server can answer. It needs an image carrying PostgreSQL 19 **and**
-## pgvector — `test_containers::postgres_graph()` pins a stock 19beta
-## alpine, which has only the former — so point GEARS_TEST_PG_GRAPH_IMAGE at
-## one until the platform pin carries both. GEARS_TEST_PG_GRAPH_REQUIRED=1
+## Run the graph-storage gear's PostgreSQL lane: the same conformance suite
+## against the built-in store, plus the cases only a real server can answer.
+## It needs PostgreSQL 16+ **with pgvector**, which
+## `test_containers::postgres_graph()` does not carry, so point
+## GEARS_TEST_PG_GRAPH_IMAGE at one — CI uses pgvector/pgvector:0.8.7-pg18. GEARS_TEST_PG_GRAPH_REQUIRED=1
 ## turns "no such image, skipping" into a failure, so CI cannot go green by
 ## running nothing; that is the default here, because a target whose whole
 ## purpose is the database has no business passing without one.
-## Every case in this lane gets its own PostgreSQL instance (two of them are
+## Every case in this lane gets its own PostgreSQL instance (some of them are
 ## operator surgery on server-wide state), and more than a handful at once is
 ## more than Docker and PostgreSQL will take: the pools time out and a
 ## different case fails on each run. nextest runs each case in its own

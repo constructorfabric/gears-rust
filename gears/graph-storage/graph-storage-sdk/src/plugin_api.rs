@@ -465,7 +465,11 @@ pub struct ExpandResponse {
 /// The hop backends of ADR-0005, as the answer reports them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HopBackend {
-    /// One scoped `GRAPH_TABLE` statement.
+    /// The SQL/PGQ (`GRAPH_TABLE`) hop. Retired: no engine reports it any
+    /// more, because `PostgreSQL` 19 GA ships without SQL/PGQ (gears-rust
+    /// #5267). Kept so a `match` over this enum keeps compiling; removed in
+    /// the next breaking release of this SDK.
+    #[deprecated(note = "the SQL/PGQ hop is retired (gears-rust #5267); no engine reports it")]
     Pattern,
     /// Two scoped queries per hop; always available.
     TwoQuery,

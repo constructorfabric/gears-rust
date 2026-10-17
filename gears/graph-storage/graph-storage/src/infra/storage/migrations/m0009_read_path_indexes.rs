@@ -13,6 +13,11 @@
 //! is an index scan (0.4 ms). The partial ones stay: the two-query hop and
 //! adjacency reads name `deleted_at` and keep using them.
 //!
+//! The SQL/PGQ hop is retired (gears-rust #5267), and these two indexes
+//! outlive it on purpose: since they exist, any read of `edge` by endpoint
+//! that does not name `deleted_at` can use them, and dropping them is a
+//! measured decision of its own, not a side effect of removing the hop.
+//!
 //! **A projection filtered on a payload path.** The statement is `tenant AND
 //! deleted_at IS NULL AND gts_node_type_id IN (…) AND payload @> … ORDER BY
 //! node_key LIMIT n`. At a middling selectivity the planner walks

@@ -75,7 +75,7 @@ The gear follows the standard ToolKit gear anatomy: an SDK crate exposing a type
 | `p1` | `cpt-cf-graph-storage-fr-hybrid-search` | Search Service runs both arms independently and fuses with RRF, reporting per-arm ranks |
 | `p1` | `cpt-cf-graph-storage-fr-type-filtering` | GTS family patterns resolved to a set of interned type ids through `GtsIdPattern` and applied as set membership in every search arm; never compiled to SQL text |
 | `p1` | `cpt-cf-graph-storage-fr-read-consistency` | Compound reads (hybrid search, traversal + hydration, projections) execute on one repeatable-read snapshot; responses report the observed graph revision; continuation tokens are revision-bound (Read Consistency Contract) |
-| `p1` | `cpt-cf-graph-storage-fr-graph-traversal` | Traversal Service expands breadth-first through the GraphQueryPort: SQL/PGQ `GRAPH_TABLE` hop patterns from v1 for fixed-depth shapes (direction-explicit, per-hop dedup), iterative scoped hops for variable depth until PG20-class quantifiers, per ADR-0001 |
+| `p1` | `cpt-cf-graph-storage-fr-graph-traversal` | Traversal Service expands breadth-first through the GraphQueryPort, one directed hop at a time with per-hop dedup: the two-query scoped hop (incident edges, then the authorized endpoints) on every supported server. The SQL/PGQ `GRAPH_TABLE` hop of ADR-0001 is retired (ADR-0001 addendum, 2026-10-14, gears-rust #5267) |
 | `p1` | `cpt-cf-graph-storage-fr-neighborhood-projection` | Projection Service returns degree-ordered, budget-truncated neighborhoods with phantom toggle and metric annotations |
 | `p1` | `cpt-cf-graph-storage-fr-tabular-projection` | Projection Service serves OData-filtered, paginated node tables over the payload paths a type declares in its `index` trait, plus labels; paged with the platform `CursorV1` |
 | `p1` | `cpt-cf-graph-storage-fr-soft-delete` | Tombstone on node and edge; incident edges follow the node in one transaction; every read path and every read-path index filters on it (Soft Delete Contract) |
@@ -93,7 +93,7 @@ The gear follows the standard ToolKit gear anatomy: an SDK crate exposing a type
 | `p1` | `cpt-cf-graph-storage-fr-rest-api` | Versioned REST under `/api/graph-storage/v1` with OpenAPI schemas, RFC-9457 problems, documented limits |
 | `p1` | `cpt-cf-graph-storage-fr-sdk-client` | SDK crate with `GraphStorageClientV1` trait registered in ClientHub; local client delegates to domain services |
 | `p2` | `cpt-cf-graph-storage-fr-observability` | Structural tracing spans (batch sizes, arm timings, frontier sizes, cache hits) and OTel metrics, including per-limit saturation counters from the Capacity and Admission Contract; payload content never logged |
-| `p1` | `cpt-cf-graph-storage-fr-readiness` | Per-capability readiness (DB and migrations, server major version and SQL/PGQ availability on it, pgvector, property graph, registries, embedding provider and identity, engine plugins, dynamic indexes) reported as healthy/degraded/unhealthy with named problems; degraded capabilities reject only their own operations (Readiness Matrix) |
+| `p1` | `cpt-cf-graph-storage-fr-readiness` | Per-capability readiness (DB and migrations, pgvector, registries, embedding provider and identity, engine plugins, dynamic indexes) reported as healthy/degraded/unhealthy with named problems; degraded capabilities reject only their own operations (Readiness Matrix) |
 
 #### NFR Allocation
 
@@ -112,11 +112,11 @@ The gear follows the standard ToolKit gear anatomy: an SDK crate exposing a type
 
 | ADR ID | Decision | Materialized By |
 |--------|----------|-----------------|
-| [`cpt-cf-graph-storage-adr-single-postgres-store`](./ADR/0001-cpt-cf-graph-storage-adr-single-postgres-store.md) | Single PostgreSQL 16+ store (pgvector only; SQL/PGQ a probed capability on 19+); graph queries behind the GraphQueryPort with SQL/PGQ active from v1 (fixed-depth shapes) and iterative scoped hops for variable depth; pinned beta image until PG19 GA; Apache AGE not carried into the gear; dedicated traversal mirror as a measured-bottleneck contingency | `cpt-cf-graph-storage-principle-single-source-of-truth`, `cpt-cf-graph-storage-component-traversal-service`, `cpt-cf-graph-storage-component-storage-layer` |
+| [`cpt-cf-graph-storage-adr-single-postgres-store`](./ADR/0001-cpt-cf-graph-storage-adr-single-postgres-store.md) | Single PostgreSQL 16+ store (pgvector only; SQL/PGQ a probed capability on 19+); graph queries behind the GraphQueryPort with SQL/PGQ active from v1 (fixed-depth shapes) and iterative scoped hops for variable depth; pinned beta image until PG19 GA; Apache AGE not carried into the gear; dedicated traversal mirror as a measured-bottleneck contingency **Addendum 2026-10-14:** SQL/PGQ retired, two-query hop on every server (gears-rust #5267) | `cpt-cf-graph-storage-principle-single-source-of-truth`, `cpt-cf-graph-storage-component-traversal-service`, `cpt-cf-graph-storage-component-storage-layer` |
 | [`cpt-cf-graph-storage-adr-unified-node-model`](./ADR/0002-cpt-cf-graph-storage-adr-unified-node-model.md) | One typed node model; owned vs. reference semantics via GTS base types; provenance-gated scope replacement | `cpt-cf-graph-storage-principle-reference-not-replica`, `cpt-cf-graph-storage-principle-provenance-survives-resync`, `cpt-cf-graph-storage-component-ontology-registry`, `cpt-cf-graph-storage-component-ingest-pipeline` |
 | [`cpt-cf-graph-storage-adr-metadata-partitioning`](./ADR/0003-cpt-cf-graph-storage-adr-metadata-partitioning.md) | Common columns + schema-declared indexed/vectorized attributes + payload ceiling with file-storage offload | `cpt-cf-graph-storage-principle-metadata-only-graph`, `cpt-cf-graph-storage-component-ontology-registry`, `cpt-cf-graph-storage-component-projection-service` |
 | [`cpt-cf-graph-storage-adr-embedding-provider`](./ADR/0004-cpt-cf-graph-storage-adr-embedding-provider.md) | Pluggable embedding provider; in-process ONNX default, remote plugin, deterministic fake for CI | `cpt-cf-graph-storage-component-embedding-coordinator`, `cpt-cf-graph-storage-constraint-single-embedding-space` |
-| [`cpt-cf-graph-storage-adr-sqlpgq-access`](./ADR/0005-cpt-cf-graph-storage-adr-sqlpgq-access.md) | SQL/PGQ is emitted from typed input through a function-call table reference (no `sea_query` fork, no hand-written SQL); every identifier comes from a closed vocabulary and every value is bound; a pattern carries the tenant bound and proposes candidates while an ordinary scoped query authorizes them; a scope whose tenants cannot be enumerated falls back to the two-query hop | `cpt-cf-graph-storage-component-traversal-service`, `cpt-cf-graph-storage-component-storage-layer` |
+| [`cpt-cf-graph-storage-adr-sqlpgq-access`](./ADR/0005-cpt-cf-graph-storage-adr-sqlpgq-access.md) | **Superseded 2026-10-14** (the gear no longer emits SQL/PGQ). SQL/PGQ is emitted from typed input through a function-call table reference (no `sea_query` fork, no hand-written SQL); every identifier comes from a closed vocabulary and every value is bound; a pattern carries the tenant bound and proposes candidates while an ordinary scoped query authorizes them; a scope whose tenants cannot be enumerated falls back to the two-query hop | `cpt-cf-graph-storage-component-traversal-service`, `cpt-cf-graph-storage-component-storage-layer` |
 | [`cpt-cf-graph-storage-adr-type-evolution`](./ADR/0006-cpt-cf-graph-storage-adr-type-evolution.md) | A backward-compatible schema change is admitted under the same GTS identifier (types-registry ADR-0003 direction, the gear's own data-backed second ground, a bounded synchronous migration as the third); a byte-identical re-registration converges, an incompatible change is refused naming its location; asking what an edit costs is its own read-only operation | `cpt-cf-graph-storage-component-ontology-registry`, `cpt-cf-graph-storage-fr-type-registration` |
 
 Two decisions this gear depends on are owned by the `graph-analytics` gear and
@@ -162,7 +162,7 @@ flowchart TD
         EXTSTORE["external graph-store plugin"]
         EXTENG["external graph-engine plugin"]
     end
-    PG[("PostgreSQL 16+ with pgvector (19+ for SQL/PGQ)")]
+    PG[("PostgreSQL 16+ with pgvector")]
 
     CLIENT -->|ClientHub local client| DOMAIN
     REST --> DOMAIN
@@ -237,6 +237,8 @@ Every operation has explicit bounds — batch sizes, result limits, traversal de
 #### PostgreSQL with pgvector
 
 - [ ] `p1` - **ID**: `cpt-cf-graph-storage-constraint-postgres-pgvector`
+
+**Retired, 2026-10-14 (ADR-0001 addendum, gears-rust #5267).** PostgreSQL 19 GA ships without SQL/PGQ (reverted in 19 beta 4), so no released server provides it, and the gear no longer probes for it or uses it: every hop is the two-query hop, and `traversal_hop: pgq` is refused at startup. The rest of this subsection is the record of the probed-capability design as built for the 19 betas.
 
 The storage backend is PostgreSQL 16 or later with the pgvector extension. SQL/PGQ is a *probed capability*, not a baseline requirement: on PostgreSQL 19+ with the property graph present the SQL/PGQ traversal backend is selected, and on earlier majors traversal is served by the iterative-CTE and entity-query backends with no functional difference to the caller. Readiness reports the server major and property-graph presence, and takes the gear out of service only when an operator explicitly configured a backend the server cannot provide (§ Readiness Matrix).
 
@@ -1655,7 +1657,7 @@ is invisible to vector search while looking present on every other path.
 
 ### 3.5 External Dependencies
 
-- PostgreSQL 16+ with pgvector (storage; HNSW cosine indexes). PostgreSQL 19+ additionally enables the SQL/PGQ backend (SQL:2023 property-graph queries in core); before PG19 GA that means a pinned beta image with pgvector built from a pinned source revision (upstream PG19 support landed July 2026), which is now a per-deployment choice rather than a gear requirement (ADR-0001).
+- PostgreSQL 16+ with pgvector (storage; HNSW cosine indexes). No SQL/PGQ: the SQL/PGQ backend that PostgreSQL 19 betas enabled is retired, because 19 GA ships without it (ADR-0001 addendum, gears-rust #5267).
 - ONNX Runtime and a MiniLM-class sentence-embedding model (default embedding plugin), or a remote inference endpoint (alternative plugin), per ADR-0004.
 
 ### 3.6 Interactions & Sequences
@@ -1948,6 +1950,8 @@ back off) instead of parsing prose.
 - [x] `p1` - **ID**: `cpt-cf-graph-storage-db-schema`
 
 Single PostgreSQL schema; all tables tenant-scoped; vector dimension fixed by migration and verified at readiness. Index plan: composite edge indexes (tenant, src) / (tenant, dst) / (tenant, gts_edge_type_id); GIN over generated tsvectors; expression/GIN indexes over the payload paths a type declares in its `index` trait; HNSW cosine indexes over embeddings. Every read-path index is partial on `deleted_at IS NULL` (Soft Delete).
+
+**Retired, 2026-10-14:** the gear creates no property graph. `m0002` is a no-op, and `m0010` drops `kb` from a database an earlier release created on a PostgreSQL 19 beta (gears-rust #5267). The paragraph that follows describes what that release did.
 
 The SQL/PGQ property graph is created by a gear migration alongside the tables, so a fresh database on a server that supports it can serve `GRAPH_TABLE` queries without manual setup; the platform migration runner executes that DDL without special handling. *Found while building the prototype:* the migration is conditional — below server major 19 it records that the graph was not created and the runtime probe (§ 2.2) routes every hop to the two-query backend. The graph itself (`kb`) has one vertex label (`node`) and one edge label (`edge`), each carrying the key and scope columns; typing is done by the interned type id as a property, not by one label per GTS type.
 
@@ -2767,8 +2771,6 @@ log instead.
 | Component | State | Blocked operations (canonical rejection) | Operations that remain available | Recovery transition |
 |---|---|---|---|---|
 | Database, migrations | `Unhealthy` — unreachable or migrations unapplied | Everything; gear not ready, no traffic admitted | None | Connectivity restored and migrations applied; probe re-runs on an interval and flips to `Healthy` without restart |
-| Server major / SQL/PGQ | `Degraded` — the declared property graph does not answer | SQL/PGQ backend reported unavailable; nothing rejected | All traversal via the two-query backend; everything else | The capability is probed at startup by attempting a pattern (§ 2.2), so an in-place server upgrade is picked up on the next start once the migration has created the property graph; a loss after startup is learned from the first request that meets it and reported from then on. The *major* is not reported: the attempt says the pattern did not run, not why |
-| Server major / SQL/PGQ | `Unhealthy` — SQL/PGQ explicitly configured, server cannot provide it | Everything; gear not ready, naming the required major | None | Operator upgrades the server or removes the explicit selector; deliberate, because silently substituting backend semantics would hide a deployment error |
 | AuthZ resolver | `Degraded` — elevated latency | Nothing; requests consume more of their deadline | All | Automatic when latency returns below threshold |
 | AuthZ resolver | `Unhealthy` — unreachable | Every authenticated data path fails closed, `unavailable` / `DEPENDENCY_UNAVAILABLE`; gear not ready | Unauthenticated health/readiness endpoints only | Automatic on reconnect; no local state to rebuild |
 | Types registry | `Unhealthy` — unreachable | Type registration and any request needing an unresolved type, `unavailable` / `DEPENDENCY_UNAVAILABLE`; gear not ready | — | Automatic on reconnect; the local type cache is re-validated before flipping to `Healthy` |
@@ -2798,13 +2800,10 @@ rows have no component behind them in this build and are reported as
 (the platform PEP publishes no health surface), the types registry as a runtime
 dependency, dynamic indexes, tenant reconciliation and the metric-annotation
 source — so an operator sees what the gear cannot yet say instead of a green
-light that means nothing. SQL/PGQ is reported by intent. `traversal_hop` defaults to `auto`, a
-preference: on a server without SQL/PGQ it is served by the two-query hop
-and the row is `Degraded`. A named `pgq` is a demand: on such a server the
-row is `Unhealthy`, the gear is not ready, and traversal is refused rather
-than quietly served by another backend. Naming `two_query` states the
-choice and reports healthy. (This used to be `Degraded` in every case,
-because the only value, `pgq`, could not say whether it was meant.) And the embedding
+light that means nothing. There is no SQL/PGQ row: the SQL/PGQ hop is retired (2026-10-14,
+gears-rust #5267), `traversal_hop` takes `auto` or `two_query` — both the
+two-query hop, which needs no server capability — and `pgq` is refused at
+startup by configuration validation rather than reported here. And the embedding
 provider's outage does not yet degrade hybrid search to its lexical arm as the
 row prescribes — a hybrid search whose query cannot be embedded fails
 (`unavailable`), which is honest but not the documented behaviour.
@@ -2818,6 +2817,8 @@ Telemetry is deny-by-default for content. Prohibited in logs, spans, metrics, an
 Every attempted logical mutation writes a payload-free audit record, linked durably to the ingest transaction for committed mutations (table `ingest_audit`): tenant and producer, operation kind, opaque request/trace correlation, idempotency-key digest and request hash, scope-identity digest and generation where applicable, revision before/after, per-entity-family counts (inserted/updated/deleted/unchanged/materialized), and the terminal outcome (commit, replay, conflict, stale, rollback, or problem type). Sampled traces cannot reconstruct a lost-response replay or a wrong scope replacement after the fact; the audit record can.
 
 ### Traversal Backend Sketch
+
+**Retired, 2026-10-14 (ADR-0001 addendum, gears-rust #5267):** the built-in engine has one backend, the two-query hop. PostgreSQL 19 GA ships without SQL/PGQ, and on the reference graph (100k nodes / 500k edges, release build) the pattern hop measured slower than the two-query hop — typed depth-3 traversal p50 ~305 ms against ~113 ms — and returned a different region on a budget-cut hop (#5332). The SQL/PGQ material below is the record of what was built and measured on the 19 betas, kept for a PostgreSQL 20 revisit; the rules for the two-query hop (one union over the endpoint columns, narrow projections, scope on every statement) still bind.
 
 The `GraphQueryPort` is the graph-engine plugin surface (`cpt-cf-graph-storage-contract-graph-engine-plugin`): engines declare capabilities and answer undeclared operations with a typed not-implemented error. The built-in PostgreSQL engine is the default plugin; its execution paths implement the same port contract (seeds, bounded expansion, per-hop filters, budgets, truncation semantics).
 
