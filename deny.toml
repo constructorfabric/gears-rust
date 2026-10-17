@@ -10,6 +10,11 @@
 #   "x86_64-unknown-linux-gnu",
 #   { triple = "wasm32-unknown-unknown", features = ["atomics"] },
 # ]
+# Audit the dependency trees of optional features too. `magika` pulls in
+# ort/ndarray, which the default feature set does not.
+# `all-features = true` is not used yet: it also enables the Windows FIPS
+# provider (rustls-cng-crypto), whose rustls-webpki 0.102 has open advisories.
+features = ["magika"]
 # all-features = true
 # exclude-dev = true
 # exclude-unpublished = false

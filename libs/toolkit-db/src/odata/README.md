@@ -156,7 +156,7 @@ cargo build -p cf-gears-toolkit-db --features sqlite
 
 Or via the Makefile shortcuts, which also cover Postgres and MySQL:
 ```bash
-make test-sqlite   # make test-pg / make test-mysql / make test-db
+make test-integration LANE=toolkit-db-sqlite   # LANE=toolkit-db-pg / LANE=toolkit-db-mysql; all engines: make test-db
 ```
 
 ## Future Enhancements

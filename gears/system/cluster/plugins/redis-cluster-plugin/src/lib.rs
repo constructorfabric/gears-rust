@@ -54,7 +54,7 @@
 //!
 //! Tests: Layer 1 unit tests (no Docker, sub-second), the four wireable
 //! conformance suites, and the Layer 3 scenarios of `docs/TESTING.md` §4.2–§4.6,
-//! run by `make test-cluster-redis` in CI's `integration` job. Both multi-node
+//! run by `make test-integration LANE=cluster-redis` in CI's `integration` job. Both multi-node
 //! fixtures are built and run on every PR: `RD-SPEC-002` on Sentinel,
 //! `RD-SPEC-008`/`009`/`010` and `RD-LOCK-014` on a 3-node Cluster.
 //! `docs/TESTING.md` is the register — counts live there and nowhere else,

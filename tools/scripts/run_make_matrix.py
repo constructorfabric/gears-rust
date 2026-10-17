@@ -22,7 +22,7 @@ Notes:
   - The repo does not define a top-level ``make clean`` target, so reset
     steps use CLEAN_CMD.
   - The runner continues after failures and prints a summary at the end.
-  - Long-running server targets like ``make run`` and ``make mini-chat``
+  - Long-running server targets like ``make run`` and ``make run PRESET=mini-chat``
     are intentionally excluded from presets.
 """
 
@@ -232,10 +232,13 @@ def load_extended(b: MatrixBuilder) -> None:
     b.append("make help", "make fmt", "make validate-gear-names",
              "make check-packaging-metadata", "make check-release-config")
     b.clean()
-    b.append("make test-no-macros", "make test-macros", "make test-sqlite")
+    b.append("make test-no-macros", "make test-macros", "make test-integration LANE=toolkit-db-sqlite")
     b.clean()
-    b.append("make test-pg", "make test-mysql", "make test-users-info-pg",
-             "make test-usage-collector-pg", "make test-cluster-pg",
+    b.append("make test-integration LANE=toolkit-db-pg",
+             "make test-integration LANE=toolkit-db-mysql",
+             "make test-integration LANE=users-info-pg",
+             "make test-integration LANE=usage-collector-pg",
+             "make test-integration LANE=cluster-pg",
              "make test-fips")
     b.clean()
     b.append_gear_steps("clippy", "lint", "build", "test")
@@ -246,7 +249,7 @@ def load_extended(b: MatrixBuilder) -> None:
     b.append("make openapi GEAR=file-parser", "make openapi GEAR=file-storage",
              "make openapi",
              "make e2e-local-smoke", "make e2e-local",
-             "make e2e-mini-chat", "make e2e-usage-collector",
+             "make e2e-local SUITE=mini-chat", "make e2e-usage-collector",
              "make e2e-tr-authz")
     b.trim_trailing_clean()
 
