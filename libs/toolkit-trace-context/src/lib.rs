@@ -18,6 +18,10 @@
 //!   `OTel` span (what the log-correlation formatter and error path stamp).
 //! - [`extract_trace_id`] — the wire-id resolver: active span, else a validated
 //!   inbound `traceparent`.
+//! - [`current_traceparent`] — the active `OTel` span as a W3C `traceparent`
+//!   value, for carriers that are not HTTP headers (e.g. an event envelope).
+//! - [`set_parent_from_traceparent`] / [`link_traceparent`] — continue, or link
+//!   to, a trace carried as a raw `traceparent` string rather than in headers.
 #![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 
 use http::HeaderMap;
@@ -73,6 +77,45 @@ pub fn current_trace_id() -> Option<String> {
 #[must_use]
 pub fn current_trace_id() -> Option<String> {
     None
+}
+
+/// The currently active `OTel` span as a W3C version-`00` `traceparent` value
+/// (`00-{trace_id}-{span_id}-{flags}`), if valid.
+///
+/// For carriers other than HTTP headers, where [`inject_current_span`] does not
+/// apply: an event envelope, a queue message, an outbox row. Capture it while
+/// the originating request's span is current — a value read later from a
+/// background task would name that task's trace instead.
+#[cfg(feature = "otel")]
+#[must_use]
+pub fn current_traceparent() -> Option<String> {
+    use opentelemetry::trace::TraceContextExt as _;
+
+    let context = opentelemetry::Context::current();
+    let span = context.span();
+    let span_context = span.span_context();
+    span_context.is_valid().then(|| {
+        format!(
+            "00-{}-{}-{:02x}",
+            span_context.trace_id(),
+            span_context.span_id(),
+            span_context.trace_flags().to_u8()
+        )
+    })
+}
+
+/// No `OTel` compiled in: there is never a span context to format.
+#[cfg(not(feature = "otel"))]
+#[must_use]
+pub fn current_traceparent() -> Option<String> {
+    None
+}
+
+/// Whether `traceparent` is a valid W3C version-`00` `traceparent` value — the
+/// same check [`parse_trace_id`] applies, for callers that only need the verdict.
+#[must_use]
+pub fn is_valid_traceparent(traceparent: &str) -> bool {
+    parse_trace_id(traceparent).is_some()
 }
 
 /// Resolve the wire `trace_id`: live `OTel` span context (the same source a
@@ -217,6 +260,60 @@ mod imp {
             propagator.inject_context(&cx, &mut HeadersInjector(headers));
         });
     }
+
+    /// Adapter exposing a lone `traceparent` value to the propagator.
+    struct TraceparentExtractor<'a>(&'a str);
+
+    impl Extractor for TraceparentExtractor<'_> {
+        fn get(&self, key: &str) -> Option<&str> {
+            (key == super::TRACEPARENT).then_some(self.0)
+        }
+
+        fn keys(&self) -> Vec<&str> {
+            vec![super::TRACEPARENT]
+        }
+    }
+
+    /// The remote span context a valid `traceparent` names, via the
+    /// process-global propagator. `None` for an invalid value, which is never
+    /// handed to the propagator.
+    fn remote_context(traceparent: &str) -> Option<Context> {
+        parse_trace_id(traceparent)?;
+        Some(global::get_text_map_propagator(|propagator| {
+            propagator.extract(&TraceparentExtractor(traceparent))
+        }))
+    }
+
+    /// Seed `span`'s parent with the trace a raw `traceparent` value names, and
+    /// record `trace_id` / `parent.trace_id` for log correlation. The same
+    /// contract as [`set_parent_from_headers`], for carriers that are not HTTP
+    /// headers. An invalid value is ignored (the span stays a fresh root).
+    pub fn set_parent_from_traceparent(span: &Span, traceparent: &str) {
+        let Some(parent_cx) = remote_context(traceparent) else {
+            return;
+        };
+        _ = span.set_parent(parent_cx);
+        if let Some(trace_id) = parse_trace_id(traceparent) {
+            span.record("trace_id", &trace_id);
+            span.record("parent.trace_id", &trace_id);
+        }
+    }
+
+    /// Add a link from `span` to the trace a raw `traceparent` value names,
+    /// without re-parenting `span`. For work that serves several origins at
+    /// once (a batch of events from different traces), where one parent would
+    /// misattribute the rest. An invalid value is ignored.
+    pub fn link_traceparent(span: &Span, traceparent: &str) {
+        use opentelemetry::trace::TraceContextExt as _;
+
+        let Some(remote) = remote_context(traceparent) else {
+            return;
+        };
+        let span_context = remote.span().span_context().clone();
+        if span_context.is_valid() {
+            span.add_link(span_context);
+        }
+    }
 }
 
 /// Fallback propagation without OpenTelemetry: records the inbound trace id
@@ -241,9 +338,23 @@ mod imp {
 
     /// No-op: OpenTelemetry is disabled, so there is no active context to inject.
     pub fn inject_current_span(_headers: &mut HeaderMap) {}
+
+    /// No OpenTelemetry: cannot continue the trace, but still record
+    /// `trace_id` / `parent.trace_id` from a valid value for log correlation.
+    pub fn set_parent_from_traceparent(span: &Span, traceparent: &str) {
+        if let Some(trace_id) = parse_trace_id(traceparent) {
+            span.record("trace_id", &trace_id);
+            span.record("parent.trace_id", &trace_id);
+        }
+    }
+
+    /// No-op: OpenTelemetry is disabled, so there is no span to link.
+    pub fn link_traceparent(_span: &Span, _traceparent: &str) {}
 }
 
-pub use imp::{inject_current_span, set_parent_from_headers};
+pub use imp::{
+    inject_current_span, link_traceparent, set_parent_from_headers, set_parent_from_traceparent,
+};
 
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
@@ -380,7 +491,10 @@ mod tests {
 #[cfg(feature = "otel")]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod resolver_tests {
-    use super::{current_trace_id, extract_trace_id};
+    use super::{
+        current_trace_id, current_trace_ids, current_traceparent, extract_trace_id,
+        is_valid_traceparent, set_parent_from_traceparent,
+    };
     use http::HeaderMap;
     use opentelemetry::trace::TracerProvider as _;
     use tracing_subscriber::layer::SubscriberExt as _;
@@ -453,5 +567,51 @@ mod resolver_tests {
         );
         assert!(extract_trace_id(&header("not-a-valid-traceparent")).is_none());
         assert!(extract_trace_id(&HeaderMap::new()).is_none());
+    }
+
+    /// Inside an active span, `current_traceparent` is that span as a valid
+    /// version-00 value whose ids are the span's own.
+    #[test]
+    fn current_traceparent_formats_the_active_span() {
+        in_active_span(|| {
+            let (trace_id, span_id) = current_trace_ids().expect("an active span");
+            let traceparent = current_traceparent().expect("an active span has a traceparent");
+            assert!(is_valid_traceparent(&traceparent), "{traceparent}");
+            assert!(
+                traceparent.starts_with(&format!("00-{trace_id}-{span_id}-")),
+                "{traceparent}"
+            );
+        });
+    }
+
+    /// Outside any span there is nothing to format.
+    #[test]
+    fn current_traceparent_is_none_without_a_span() {
+        assert!(current_traceparent().is_none());
+    }
+
+    /// A span parented from a raw `traceparent` continues that trace; an
+    /// invalid value leaves it a fresh root.
+    #[test]
+    fn set_parent_from_traceparent_continues_the_carried_trace() {
+        opentelemetry::global::set_text_map_propagator(
+            opentelemetry_sdk::propagation::TraceContextPropagator::new(),
+        );
+        let carried = format!("00-{OTHER_TRACE}-b7ad6b7169203331-01");
+        in_active_span(|| {
+            let child = tracing::info_span!(
+                "consume",
+                trace_id = tracing::field::Empty,
+                parent.trace_id = tracing::field::Empty
+            );
+            set_parent_from_traceparent(&child, &carried);
+            let continued = child.in_scope(current_trace_id);
+            assert_eq!(continued.as_deref(), Some(OTHER_TRACE));
+
+            let fresh = tracing::info_span!("consume");
+            set_parent_from_traceparent(&fresh, "not-a-traceparent");
+            let own = fresh.in_scope(current_trace_id);
+            assert_ne!(own.as_deref(), Some(OTHER_TRACE));
+        });
     }
 }
