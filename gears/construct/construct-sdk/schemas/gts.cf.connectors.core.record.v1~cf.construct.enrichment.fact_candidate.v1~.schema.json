@@ -1,0 +1,117 @@
+{
+  "$id": "gts://gts.cf.connectors.core.record.v1~cf.construct.enrichment.fact_candidate.v1~",
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "description": "One fact candidate the Enrichment connector proposes for a person: the connector runs the deterministic judgment (identity scoring, decide, tiering) and emits candidates; only fact management writes facts. The discovery dossier stays connector-internal, and the source model's co_sourced flag is dropped on purpose: it is an internal input to the connector's tiering and its effect arrives already folded into trust_tier. The record's subject_id is always set (a candidate is about one person); record provenance = the fact key plus the normalized value, version = a digest of the payload - both content-derived, so a re-push and a re-run of the same judgment dedupe to one record. The connector computes rather than forwards, so the record's observed_at is when the candidate was computed.",
+  "type": "object",
+  "allOf": [
+    {
+      "$ref": "gts://gts.cf.connectors.core.record.v1~"
+    },
+    {
+      "type": "object",
+      "required": [
+        "subject_id"
+      ],
+      "properties": {
+        "type": {
+          "const": "gts.cf.connectors.core.record.v1~cf.construct.enrichment.fact_candidate.v1~"
+        },
+        "payload": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "claim": {
+              "type": "string",
+              "minLength": 1,
+              "description": "The proposed factual statement, as stated by the source."
+            },
+            "fact_type": {
+              "type": "string",
+              "enum": [
+                "role",
+                "news",
+                "award",
+                "board",
+                "publication",
+                "profile",
+                "bio",
+                "mention"
+              ]
+            },
+            "confidence": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1,
+              "description": "The connector's per-candidate judgment, after identity scoring and decide()."
+            },
+            "trust_tier": {
+              "type": "string",
+              "enum": [
+                "found",
+                "saved"
+              ],
+              "description": "Trust classification assigned by the connector's tiering, mapped from today's fact_values.trust_tier. The connector emits no other values."
+            },
+            "source_url": {
+              "type": "string",
+              "format": "uri",
+              "pattern": "^https?://",
+              "description": "The page the claim was grounded against."
+            },
+            "date": {
+              "type": "string",
+              "description": "Date of the fact as carried by its source, never a clock read."
+            },
+            "evidence": {
+              "type": "string",
+              "description": "Free-text evidence snippet supporting the claim."
+            },
+            "citations": {
+              "type": "array",
+              "description": "Grounding: URL plus verbatim quote. Absent means none provided, not verified-empty.",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "source_url": {
+                    "type": "string",
+                    "format": "uri",
+                    "pattern": "^https?://"
+                  },
+                  "chunk_id": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "verbatim_quote": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "char_start": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "char_end": {
+                    "type": "integer",
+                    "minimum": 0
+                  }
+                },
+                "required": [
+                  "source_url",
+                  "chunk_id",
+                  "verbatim_quote"
+                ]
+              }
+            }
+          },
+          "required": [
+            "claim",
+            "fact_type",
+            "confidence",
+            "trust_tier",
+            "source_url"
+          ]
+        }
+      }
+    }
+  ]
+}
