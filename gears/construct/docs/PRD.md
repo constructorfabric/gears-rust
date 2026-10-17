@@ -371,7 +371,7 @@ Before it stores any fact, Construct **MUST** check the content for these specia
 
 - [ ] `p1` - **ID**: `cpt-cf-construct-fr-tenant-isolation`
 
-Every operation **MUST** be confined to the caller's tenant. A read, count, search or error message **MUST NOT** reveal data of another tenant: facts, settings, review requests, audit events or tenant settings. Adversarial tests that seed several tenants with the same subject identifiers and records **MUST** find zero such cases.
+Every operation **MUST** be confined to one tenant, determined as `cpt-cf-construct-fr-access-control` states. A read, count, search or error message **MUST NOT** reveal data of another tenant: facts, settings, review requests, audit events or tenant settings. Adversarial tests that seed several tenants with the same subject identifiers and records **MUST** find zero such cases.
 
 - **Rationale**: One deployment serves many tenants; a leak between them is a personal-data breach.
 - **Actors**: `cpt-cf-construct-actor-platform-auth`, `cpt-cf-construct-actor-graph-storage`, `cpt-cf-construct-actor-audit`
@@ -380,7 +380,7 @@ Every operation **MUST** be confined to the caller's tenant. A read, count, sear
 
 - [ ] `p1` - **ID**: `cpt-cf-construct-fr-access-control`
 
-Every request **MUST** carry a caller identity and a tenant that the platform has authenticated, and Construct **MUST** refuse a request without them. Construct **MUST** take the caller and the tenant only from the platform, never from the content of a record or request. The platform **MUST** authorize every operation. Sending records, reading profiles, managing facts, controlling the profiles one owns, resolving review requests, administering a subject's facts, changing tenant settings and exporting a subject's data **MUST** be separate permissions. Audit events are read in the Audit gear, under its own permissions.
+Every request **MUST** carry a caller identity and a tenant that the platform has authenticated, and Construct **MUST** refuse a request without them. Construct **MUST** take the caller only from the platform, never from the content of a record or request. Construct **MUST NOT** take the tenant from the content of a record. When a request names no tenant, Construct **MUST** take the tenant from the platform. When a request names a tenant, Construct **MUST** refuse it unless the platform authorizes the caller for that tenant. Only record intake accepts a tenant in the request. The platform **MUST** authorize every operation. Sending records, reading profiles, managing facts, controlling the profiles one owns, resolving review requests, administering a subject's facts, changing tenant settings and exporting a subject's data **MUST** be separate permissions. Audit events are read in the Audit gear, under its own permissions.
 
 - **Rationale**: Each actor needs a different level of access; separate permissions let the tenant grant exactly what each needs.
 - **Actors**: `cpt-cf-construct-actor-platform-auth`, `cpt-cf-construct-actor-connector`, `cpt-cf-construct-actor-consumer-app`, `cpt-cf-construct-actor-audit`
@@ -457,7 +457,7 @@ The guardrails **MUST** find special-category content on the reference test set 
 - [ ] `p1` - **ID**: `cpt-cf-construct-contract-person-types`
 
 - **Direction**: provided by Construct
-- **Protocol/Format**: GTS types for the categories of each kind of subject's profile and the facts in them, registered in the types registry and with graph storage. This release ships the person types: `gts.cf.construct.person.identity.v1~`, `gts.cf.construct.person.roles.v1~`, `gts.cf.construct.person.skills.v1~` and `gts.cf.construct.person.preferences.v1~`. A person's subject ID is the UUID of the platform user, `gts.cf.core.am.user.v1~`
+- **Protocol/Format**: GTS types for the categories of each kind of subject's profile and the facts in them, registered with graph storage. This release ships the person types. Each derives from graph storage's owned node, so its registered id carries the family chain: `gts.cf.core.graph.node.v1~cf.core.graph.owned_node.v1~cf.construct.person.identity.v1~`, `gts.cf.core.graph.node.v1~cf.core.graph.owned_node.v1~cf.construct.person.role.v1~`, `gts.cf.core.graph.node.v1~cf.core.graph.owned_node.v1~cf.construct.person.skill.v1~` and `gts.cf.core.graph.node.v1~cf.core.graph.owned_node.v1~cf.construct.person.preference.v1~`. A person's subject ID is the UUID of the platform user, `gts.cf.core.am.user.v1~`
 - **Compatibility**: A published GTS version never changes; facts stored under earlier versions stay readable and servable
 
 ## 8. Use Cases
