@@ -668,12 +668,21 @@ impl WriteCoordinator {
             self.writer.discard(&conn, &gated, &staged).await;
             return Err(err);
         }
-        self.pending
+        let Some(row) = self
+            .pending
             .find(&conn, &AccessScope::allow_all(), pending_id)
             .await?
-            .ok_or_else(|| DomainError::Internal {
-                diagnostic: "the intent row of a stage vanished before its answer".to_owned(),
-            })
+        else {
+            // The only thing that removes a fresh intent row is the purge of
+            // its declaration (the cascade), which won the race against this
+            // stage: the entry just stored is released here — `discard`
+            // tolerates the missing row — and the setting is gone.
+            self.writer.discard(&conn, &gated, &staged).await;
+            return Err(DomainError::NotFound {
+                resource: "declaration",
+            });
+        };
+        Ok(row)
         // @cpt-end:cpt-cf-settings-service-flow-secret-values-stage:p1:inst-sv-stage-5
     }
 

@@ -194,7 +194,8 @@ impl PlatformScope for FixedScope {
 }
 
 /// A setting-type registrar that records the keys it was asked to register,
-/// and can be told to fail.
+/// can be told to fail, and — like the real registry — remembers the value
+/// type registered for each key and refuses a different one for it.
 #[derive(Default)]
 pub struct RecordingRegistrar {
     pub registered: Mutex<Vec<(String, String)>>,
@@ -213,10 +214,22 @@ impl SettingTypeRegistrar for RecordingRegistrar {
                 detail: "types registry down".to_owned(),
             });
         }
-        self.registered
-            .lock()
-            .expect("registrar lock")
-            .push((key.to_string(), value_type_id.to_owned()));
+        let mut registered = self.registered.lock().expect("registrar lock");
+        let key = key.to_string();
+        // The real registrar answers an already-registered key by comparing
+        // the type it holds with the one asked for (`confirm_same_type`).
+        if let Some((_, held)) = registered.iter().find(|(k, _)| *k == key)
+            && held != value_type_id
+        {
+            return Err(DomainError::Conflict {
+                detail: format!(
+                    "the type registered for `{key}` narrows its payload to `gts://{held}`, not \
+                     to `gts://{value_type_id}`; the declaration's value type and its \
+                     registered type would disagree"
+                ),
+            });
+        }
+        registered.push((key, value_type_id.to_owned()));
         Ok(())
     }
 }
@@ -806,6 +819,73 @@ impl ResolutionHarness {
         .await;
     }
 
+    /// The declaration row, as the domain reads it.
+    pub async fn load_declaration(&self, id: Uuid) -> crate::domain::declaration::Declaration {
+        let conn = self.db.conn().expect("connection");
+        let scope = AccessScope::allow_all();
+        DeclarationRepo
+            .find(
+                &conn,
+                &scope,
+                &crate::domain::category::visibility::domain_visibility(&scope),
+                id,
+            )
+            .await
+            .expect("lookup")
+            .expect("row")
+    }
+
+    /// A secret row carrying a subject, inserted through the entity: the write
+    /// API is subject-less, so this is the only way such a row exists here.
+    pub async fn set_subject_secret(&self, declaration_id: Uuid, tenant: Uuid, secret_ref: &str) {
+        use sea_orm::ActiveValue::Set;
+        let conn = self.db.conn().expect("connection");
+        let at = time::OffsetDateTime::now_utc();
+        let active = crate::infra::storage::entity::setting_value::ActiveModel {
+            id: Set(Uuid::new_v4()),
+            declaration_id: Set(declaration_id),
+            tenant_id: Set(tenant),
+            subject_type: Set(Some(crate::domain::stepup::USER_SUBJECT_TYPE.to_owned())),
+            subject_id: Set(Some("subject-1".to_owned())),
+            value: Set(None),
+            secret_ref: Set(Some(secret_ref.to_owned())),
+            data_classification: Set("secret".to_owned()),
+            needs_review: Set(false),
+            needs_review_detail: Set(None),
+            last_change_at: Set(at),
+            created_at: Set(at),
+            updated_at: Set(at),
+            set_by: Set("subject-1".to_owned()),
+        };
+        toolkit_db::secure::secure_insert::<crate::infra::storage::entity::setting_value::Entity>(
+            active,
+            &AccessScope::allow_all(),
+            &conn,
+        )
+        .await
+        .expect("subject row");
+    }
+
+    /// A staged secret for a tenant, as a stage leaves it.
+    pub async fn stage_secret(&self, declaration_id: Uuid, tenant: Uuid, secret_ref: &str) {
+        use crate::domain::secrets::pending::{PendingSecretDraft, PendingSecretRepository};
+        let conn = self.db.conn().expect("connection");
+        crate::infra::storage::pending_secret_repo::PendingSecretRepo
+            .insert(
+                &conn,
+                &AccessScope::allow_all(),
+                PendingSecretDraft {
+                    declaration_id,
+                    tenant_id: tenant,
+                    subject_id: "subject-1".to_owned(),
+                    secret_ref: secret_ref.to_owned(),
+                    expires_at: time::OffsetDateTime::now_utc() + time::Duration::minutes(10),
+                },
+            )
+            .await
+            .expect("staged");
+    }
+
     /// The row as the writer leaves it, `classification` denormalized from
     /// the declaration onto it — the column the corpus and the masking rules
     /// read.
@@ -861,6 +941,41 @@ impl crate::domain::ports::ChangePublisher for RecordingPublisher {
     }
 }
 
+/// A metrics port that keeps every count it was given.
+#[derive(Default)]
+pub struct RecordingMetrics {
+    /// `(operation, result)` of every step-up count, in order.
+    pub step_ups: Mutex<Vec<(&'static str, &'static str)>>,
+    /// The `result` of every purge release count, in order.
+    pub purge_releases: Mutex<Vec<&'static str>>,
+}
+
+impl RecordingMetrics {
+    /// The step-up counts of one operation, in order.
+    pub fn step_ups_of(&self, operation: &str) -> Vec<&'static str> {
+        self.step_ups
+            .lock()
+            .expect("lock")
+            .iter()
+            .filter(|(op, _)| *op == operation)
+            .map(|(_, result)| *result)
+            .collect()
+    }
+}
+
+impl crate::domain::ports::WriteMetrics for RecordingMetrics {
+    fn value_write(&self, _result: &'static str) {}
+    fn step_up(&self, operation: &'static str, result: &'static str) {
+        self.step_ups
+            .lock()
+            .expect("lock")
+            .push((operation, result));
+    }
+    fn purge_release(&self, result: &'static str) {
+        self.purge_releases.lock().expect("lock").push(result);
+    }
+}
+
 /// A step-up verifier whose verdict the test fixes.
 pub struct FixedStepUp {
     pub verdict: Result<(), crate::domain::stepup::StepUpRefusal>,
@@ -902,6 +1017,9 @@ impl crate::domain::stepup::StepUpVerifier for FixedStepUp {
     }
 }
 
+/// The database and the declaration a [`RecordingSecrets`] probe looks for.
+pub type RowProbe = (Arc<DBProvider<DbError>>, Uuid);
+
 /// A Secret Manager that keeps plaintext in memory under deterministic
 /// references and remembers what it was asked to release.
 #[derive(Default)]
@@ -913,6 +1031,11 @@ pub struct RecordingSecrets {
     /// The next store lands in the store and answers with a failure: the
     /// ambiguous outcome of a network that dropped the response.
     pub lose_next_answer: std::sync::atomic::AtomicBool,
+    /// A database and a declaration id: every `delete_secret` then records
+    /// whether the declaration row was still there when the release ran.
+    pub row_probe: Mutex<Option<RowProbe>>,
+    /// What the probe saw at each release, in order.
+    pub row_present_at_release: Mutex<Vec<bool>>,
 }
 
 impl RecordingSecrets {
@@ -1017,6 +1140,24 @@ impl crate::domain::ports::SecretManager for RecordingSecrets {
         secret_ref: &str,
     ) -> Result<(), DomainError> {
         self.check()?;
+        let probe = self.row_probe.lock().expect("secrets lock").clone();
+        if let Some((db, id)) = probe {
+            let conn = db.conn().expect("connection");
+            let scope = AccessScope::allow_all();
+            let row = DeclarationRepo
+                .find(
+                    &conn,
+                    &scope,
+                    &crate::domain::category::visibility::domain_visibility(&scope),
+                    id,
+                )
+                .await
+                .expect("lookup");
+            self.row_present_at_release
+                .lock()
+                .expect("secrets lock")
+                .push(row.is_some());
+        }
         self.entries
             .lock()
             .expect("secrets lock")
@@ -1264,6 +1405,8 @@ impl RestHarness {
             Arc::clone(&types),
         ));
         let step_up_for_writes = Arc::clone(&step_up);
+        // The admin releases through the very store the harness exposes.
+        let secrets = Arc::new(RecordingSecrets::default());
         let admin = Arc::new(crate::domain::declaration::DeclarationAdmin::new(
             crate::infra::storage::declaration_repo::DeclarationRepo,
             crate::infra::storage::category_repo::CategoryRepo,
@@ -1275,6 +1418,9 @@ impl RestHarness {
             step_up,
             crate::infra::storage::audit_store::AuditStore,
             Arc::clone(&inner.cache),
+            crate::infra::storage::pending_secret_repo::PendingSecretRepo,
+            Arc::clone(&secrets) as Arc<dyn crate::domain::ports::SecretManager>,
+            Arc::new(crate::domain::ports::NoMetrics),
         ));
         let router = crate::api::rest::declaration_routes::register_routes(
             router,
@@ -1287,7 +1433,6 @@ impl RestHarness {
         // The write surface. Every port behind it is doubled except the
         // repositories and the audit store, which run for real against the
         // same database the reads use.
-        let secrets = Arc::new(RecordingSecrets::default());
         let published = Arc::new(RecordingPublisher::default());
         let coordinator = write_coordinator(
             &inner,
@@ -1341,7 +1486,29 @@ impl RestHarness {
         caller: SecurityContext,
     ) -> Answer {
         let body = body.map(|json| serde_json::to_vec(&json).expect("serializes"));
-        self.dispatch(method, uri, body, if_match, caller).await
+        self.dispatch(method, uri, body, if_match, caller, None)
+            .await
+    }
+
+    /// The same as `send`, carrying the given `x-request-id`: what an audit
+    /// record and a log line must echo.
+    pub async fn send_with_request_id(
+        &self,
+        method: &str,
+        uri: &str,
+        if_match: Option<&str>,
+        caller: Uuid,
+        request_id: &str,
+    ) -> Answer {
+        self.dispatch(
+            method,
+            uri,
+            None,
+            if_match,
+            context_for(caller),
+            Some(request_id),
+        )
+        .await
     }
 
     /// The same, with the body sent as the exact text given — for a request
@@ -1361,6 +1528,7 @@ impl RestHarness {
             Some(body.as_bytes().to_vec()),
             if_match,
             context_for(caller),
+            None,
         )
         .await
     }
@@ -1372,6 +1540,7 @@ impl RestHarness {
         body: Option<Vec<u8>>,
         if_match: Option<&str>,
         caller: SecurityContext,
+        request_id: Option<&str>,
     ) -> Answer {
         use tower::ServiceExt as _;
         let mut builder = axum::http::Request::builder().method(method).uri(uri);
@@ -1380,6 +1549,9 @@ impl RestHarness {
         }
         if let Some(tag) = if_match {
             builder = builder.header("if-match", tag);
+        }
+        if let Some(request_id) = request_id {
+            builder = builder.header("x-request-id", request_id);
         }
         let payload = body.map_or_else(axum::body::Body::empty, axum::body::Body::from);
         let mut request = builder.body(payload).expect("a well-formed request");

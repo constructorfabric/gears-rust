@@ -214,6 +214,9 @@ pub trait WriteMetrics: Send + Sync {
     fn value_write(&self, result: &'static str);
     /// `settings_step_up_total` by operation and result.
     fn step_up(&self, operation: &'static str, result: &'static str);
+    /// `settings_declaration_purge_secret_releases_total` by `result` (`ok` or
+    /// `failed`): one Credential Store release after a declaration purge.
+    fn purge_release(&self, result: &'static str);
 }
 
 /// What the managed lifecycle's passes report.
@@ -235,4 +238,5 @@ pub struct NoMetrics;
 impl WriteMetrics for NoMetrics {
     fn value_write(&self, _result: &'static str) {}
     fn step_up(&self, _operation: &'static str, _result: &'static str) {}
+    fn purge_release(&self, _result: &'static str) {}
 }

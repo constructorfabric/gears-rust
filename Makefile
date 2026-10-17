@@ -937,7 +937,7 @@ test-rg-pg: install-tools
 ## PostgreSQL refuses can still pass; this lane runs the chain a stand's startup
 ## runs, on the backend it runs it on.
 test-settings-service-pg: install-tools
-	$(call nextest_run,settings-service-pg,-p cf-gears-settings-service --features integration --test pg_migrations_test)
+	$(call nextest_run,settings-service-pg,-p cf-gears-settings-service --features integration --test pg_migrations_test --test pg_declaration_purge_test)
 
 ## Run bss-pricing's Postgres tier (Docker required; each suite spins up its own
 ## postgres container via testcontainers).

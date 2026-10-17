@@ -3780,7 +3780,7 @@ dependencies = [
 
 [[package]]
 name = "cf-gears-settings-service"
-version = "0.1.4"
+version = "0.1.8"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3803,6 +3803,7 @@ dependencies = [
  "cf-gears-toolkit-security",
  "cf-gears-types-registry",
  "cf-gears-types-registry-sdk",
+ "futures-util",
  "http",
  "inventory",
  "jsonschema",
@@ -3821,6 +3822,7 @@ dependencies = [
  "tokio-util",
  "tower",
  "tracing",
+ "tracing-test",
  "utoipa",
  "uuid",
 ]
