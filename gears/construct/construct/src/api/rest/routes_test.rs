@@ -27,6 +27,7 @@ use crate::config::ConstructConfig;
 use crate::domain::service::{Service, ServiceConfig};
 use crate::infra::storage::migrations::Migrator;
 use crate::infra::storage::sea_orm_repo::SeaOrmNoteRepository;
+use crate::test_support::settings_service;
 
 const PATH: &str = "/construct/v1/foundation-notes";
 
@@ -126,7 +127,7 @@ async fn router_with(resolver: Arc<dyn AuthZResolverApi>, tenant_id: Uuid) -> Ro
     let db = inmem_db().await;
     let config = ServiceConfig::try_from(&ConstructConfig::default()).expect("valid config");
     let service: Arc<ConcreteService> = Arc::new(Service::new(
-        Arc::new(DBProvider::new(db)),
+        Arc::new(DBProvider::new(db.clone())),
         Arc::new(SeaOrmNoteRepository::new()),
         PolicyEnforcer::new(resolver),
         config,
@@ -136,7 +137,14 @@ async fn router_with(resolver: Arc<dyn AuthZResolverApi>, tenant_id: Uuid) -> Ro
         .subject_tenant_id(tenant_id)
         .build()
         .unwrap();
-    register_routes(Router::new(), &OpenApiRegistryImpl::new(), service).layer(Extension(ctx))
+    let settings = Arc::new(settings_service(&db, Arc::new(DenyResolver), true));
+    register_routes(
+        Router::new(),
+        &OpenApiRegistryImpl::new(),
+        service,
+        settings,
+    )
+    .layer(Extension(ctx))
 }
 
 /// Sends `body` with the given content type (none when `None`) and returns

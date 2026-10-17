@@ -5,24 +5,39 @@ use crate::domain::service::ServiceConfig;
 /// Default for [`ConstructConfig::max_text_length`], in bytes.
 pub const DEFAULT_MAX_TEXT_LENGTH: usize = 1000;
 
+/// Default for [`ConstructConfig::personalization_default`]: on, so a host
+/// without the settings service takes records for new subjects. A deployment
+/// that wants new subjects to start with personalization off sets it to false.
+pub const DEFAULT_PERSONALIZATION: bool = true;
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ConstructConfig {
     /// Longest foundation note text, in bytes.
     #[serde(default = "default_max_text_length")]
     pub max_text_length: usize,
+    /// Whether personalization is on for a new subject, used only while the
+    /// settings service gives no tenant default: no settings client in the
+    /// host, or the setting not declared there.
+    #[serde(default = "default_personalization")]
+    pub personalization_default: bool,
 }
 
 impl Default for ConstructConfig {
     fn default() -> Self {
         Self {
             max_text_length: default_max_text_length(),
+            personalization_default: DEFAULT_PERSONALIZATION,
         }
     }
 }
 
 fn default_max_text_length() -> usize {
     DEFAULT_MAX_TEXT_LENGTH
+}
+
+fn default_personalization() -> bool {
+    DEFAULT_PERSONALIZATION
 }
 
 /// Upper bound on `max_text_length`: the capacity of `MySQL`'s `TEXT`, the
@@ -75,7 +90,10 @@ mod tests {
 
     #[test]
     fn max_text_length_is_bounded_by_the_text_column() {
-        let with = |max_text_length| ConstructConfig { max_text_length };
+        let with = |max_text_length| ConstructConfig {
+            max_text_length,
+            ..ConstructConfig::default()
+        };
         assert!(with(0).validate().is_err(), "no note fits");
         assert!(with(MAX_TEXT_BYTES + 1).validate().is_err(), "past TEXT");
         with(1).validate().expect("smallest usable");
@@ -108,6 +126,7 @@ mod tests {
         )
         .expect("an empty config is valid");
         assert_eq!(config.max_text_length, DEFAULT_MAX_TEXT_LENGTH);
+        assert!(config.personalization_default, "personalization starts on");
     }
 
     #[test]
@@ -118,7 +137,18 @@ mod tests {
 
     #[test]
     fn invalid_config_does_not_convert() {
-        let zero = ConstructConfig { max_text_length: 0 };
+        let zero = ConstructConfig {
+            max_text_length: 0,
+            ..ConstructConfig::default()
+        };
         assert!(ServiceConfig::try_from(&zero).is_err());
+    }
+
+    #[test]
+    fn personalization_default_is_read() {
+        let config: ConstructConfig =
+            serde_json::from_value(serde_json::json!({ "personalization_default": false }))
+                .expect("known key");
+        assert!(!config.personalization_default);
     }
 }

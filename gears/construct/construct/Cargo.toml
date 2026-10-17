@@ -26,6 +26,9 @@ construct-sdk = { package = "cf-gears-construct-sdk", version = "0.1.0", path = 
 authz-resolver-sdk = { package = "cf-gears-authz-resolver-sdk", version = "0.5.2", path = "../../../gears/system/authz-resolver/authz-resolver-sdk" }
 authz-resolver = { workspace = true }
 
+# Tenant settings (the personalization default for new subjects)
+settings-service-sdk = { workspace = true }
+
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 tracing = { workspace = true }
@@ -34,6 +37,7 @@ serde = { workspace = true }
 utoipa = { workspace = true }
 axum = { workspace = true, features = ["macros"] }
 uuid = { workspace = true }
+tokio = { workspace = true }
 # Database - SeaORM (driver features come from toolkit-db)
 sea-orm = { workspace = true }
 sea-orm-migration = { workspace = true }
@@ -47,7 +51,7 @@ toolkit-security = { workspace = true }
 toolkit-macros = { workspace = true }
 
 [dev-dependencies]
+serde_json = { workspace = true }
 toolkit-db = { workspace = true, features = ["sqlite", "test-support"] }
 toolkit-gts = { workspace = true }
-tokio = { workspace = true }
 tower = { workspace = true, features = ["util"] }

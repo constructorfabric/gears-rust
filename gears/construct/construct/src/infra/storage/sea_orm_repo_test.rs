@@ -2,33 +2,15 @@
 //! insert and the `ScopeError` to `DomainError` mapping.
 
 use construct_sdk::models::FoundationNote;
-use toolkit_db::migration_runner::run_migrations_for_testing;
+use toolkit_db::DbError;
 use toolkit_db::secure::ScopeError;
-use toolkit_db::{ConnectOpts, Db, DbError, connect_db};
 use toolkit_security::AccessScope;
 use uuid::Uuid;
 
-use super::migrations::Migrator;
 use super::sea_orm_repo::{SeaOrmNoteRepository, map_scope_error};
 use crate::domain::error::DomainError;
 use crate::domain::repo::NoteRepository;
-
-async fn inmem_db() -> Db {
-    use sea_orm_migration::MigratorTrait;
-
-    let opts = ConnectOpts {
-        max_conns: Some(1),
-        min_conns: Some(1),
-        ..Default::default()
-    };
-    let db = connect_db("sqlite::memory:", opts)
-        .await
-        .expect("connect in-memory database");
-    run_migrations_for_testing(&db, Migrator::migrations())
-        .await
-        .expect("run migrations");
-    db
-}
+use crate::test_support::inmem_db;
 
 #[tokio::test]
 async fn insert_outside_scope_is_forbidden() {

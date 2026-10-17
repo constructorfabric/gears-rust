@@ -17,10 +17,14 @@ use crate::api::rest::routes;
 use crate::config::ConstructConfig;
 use crate::domain::local_client::LocalClient;
 use crate::domain::service::{Service, ServiceConfig};
+use crate::domain::subject_settings::SubjectSettingsService;
 use crate::infra::storage::sea_orm_repo::SeaOrmNoteRepository;
+use crate::infra::storage::subject_settings_repo::SeaOrmSubjectSettingsRepository;
+use crate::infra::tenant_defaults::SettingsServiceDefaults;
 
 /// Type alias for the concrete service type with ORM repository.
 type ConcreteService = Service<SeaOrmNoteRepository>;
+type ConcreteSettings = SubjectSettingsService<SeaOrmSubjectSettingsRepository>;
 
 /// The Construct gear: a tenant-scoped shell with one route and an in-process client.
 ///
@@ -32,12 +36,14 @@ type ConcreteService = Service<SeaOrmNoteRepository>;
 )]
 pub struct ConstructGear {
     service: OnceLock<Arc<ConcreteService>>,
+    settings: OnceLock<Arc<ConcreteSettings>>,
 }
 
 impl Default for ConstructGear {
     fn default() -> Self {
         Self {
             service: OnceLock::new(),
+            settings: OnceLock::new(),
         }
     }
 }
@@ -77,6 +83,21 @@ impl Gear for ConstructGear {
         let service_config = ServiceConfig::try_from(&cfg)?;
         // @cpt-end:cpt-cf-construct-algo-gear-foundation-start-gear:p1:inst-start-config-range
         // @cpt-begin:cpt-cf-construct-algo-gear-foundation-start-gear:p1:inst-start-service
+        // The settings service is resolved from ClientHub on each read, so its
+        // start order does not matter.
+        // @cpt-begin:cpt-cf-construct-algo-subject-settings-start:p1:inst-settings-start
+        let defaults = SettingsServiceDefaults::new(ctx.client_hub(), cfg.personalization_default)
+            .context("personalization default setting key")?;
+        let settings = Arc::new(SubjectSettingsService::new(
+            Arc::clone(&db),
+            Arc::new(SeaOrmSubjectSettingsRepository::new()),
+            Arc::new(defaults),
+            policy_enforcer.clone(),
+        ));
+        self.settings
+            .set(settings)
+            .map_err(|_| anyhow::anyhow!("{} gear already initialized", Self::MODULE_NAME))?;
+        // @cpt-end:cpt-cf-construct-algo-subject-settings-start:p1:inst-settings-start
         let service = Arc::new(Service::new(db, repo, policy_enforcer, service_config));
         self.service
             .set(Arc::clone(&service))
@@ -109,7 +130,13 @@ impl toolkit::contracts::RestApiCapability for ConstructGear {
             .map(Arc::clone)
             .ok_or_else(|| anyhow::anyhow!("Service not initialized"))?;
 
-        let router = routes::register_routes(router, openapi, service);
+        let settings = self
+            .settings
+            .get()
+            .map(Arc::clone)
+            .ok_or_else(|| anyhow::anyhow!("Subject settings service not initialized"))?;
+
+        let router = routes::register_routes(router, openapi, service, settings);
         info!("Construct gear: REST routes registered");
         Ok(router)
         // @cpt-end:cpt-cf-construct-algo-gear-foundation-start-gear:p1:inst-start-rest

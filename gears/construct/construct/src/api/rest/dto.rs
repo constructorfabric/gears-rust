@@ -1,6 +1,8 @@
 use construct_sdk::models::{FoundationNote, NewFoundationNote};
 use uuid::Uuid;
 
+use crate::domain::subject_settings::SubjectSettings;
+
 /// A foundation note as the API returns it.
 #[derive(Debug)]
 #[toolkit_macros::api_dto(response)]
@@ -41,4 +43,42 @@ impl From<CreateFoundationNoteRequest> for NewFoundationNote {
     fn from(req: CreateFoundationNoteRequest) -> Self {
         Self::new(req.text)
     }
+}
+
+/// A subject's settings as the API returns them.
+///
+/// @cpt-dod:cpt-cf-construct-dod-subject-settings-routes:p1
+#[derive(Debug)]
+#[toolkit_macros::api_dto(response)]
+pub struct SubjectSettingsDto {
+    /// The subject the settings belong to: the caller.
+    #[schema(value_type = String)]
+    pub subject_id: Uuid,
+    /// Whether personalization is on. A subject without stored settings has
+    /// the tenant's default.
+    pub personalization_enabled: bool,
+    /// Whether an erasure of the subject is under way. While it is, nothing is
+    /// personalized, even with personalization on.
+    pub erasure_in_progress: bool,
+}
+
+impl SubjectSettingsDto {
+    #[must_use]
+    pub fn new(subject_id: Uuid, settings: SubjectSettings) -> Self {
+        Self {
+            subject_id,
+            personalization_enabled: settings.personalization_enabled,
+            erasure_in_progress: settings.erasure_in_progress,
+        }
+    }
+}
+
+/// What the subject sends to change its settings. Only personalization can be
+/// changed; an unknown field, such as `erasure_in_progress`, is refused.
+#[derive(Debug)]
+#[toolkit_macros::api_dto(request)]
+#[serde(deny_unknown_fields)]
+pub struct PutSubjectSettingsRequest {
+    /// Turn personalization on or off. Applies from the next request.
+    pub personalization_enabled: bool,
 }

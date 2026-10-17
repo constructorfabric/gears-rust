@@ -87,3 +87,44 @@ fn unavailable_maps_to_503_without_leaking_detail() {
     assert_eq!(problem.status, Some(503));
     assert!(!visible_text(&problem).contains("10.0.0.7"));
 }
+
+const SETTINGS_RESOURCE_TYPE: &str = gts_id!("cf.construct.subject.settings.v1~");
+
+#[test]
+fn settings_errors_about_the_request_name_the_settings_resource() {
+    use crate::api::rest::error::for_settings;
+
+    let cases = [
+        (DomainError::forbidden("subject a may not read b"), 403),
+        (DomainError::NotFound, 404),
+        (
+            DomainError::validation("personalization_enabled", "bad"),
+            400,
+        ),
+    ];
+    for (error, status) in cases {
+        let label = format!("{error:?}");
+        let problem = Problem::from(for_settings(error));
+        assert_eq!(problem.status, Some(status), "{label}");
+        assert_eq!(
+            problem
+                .context
+                .get("resource_type")
+                .and_then(|v| v.as_str()),
+            Some(SETTINGS_RESOURCE_TYPE),
+            "{label}"
+        );
+        assert!(!visible_text(&problem).contains("may not read"), "{label}");
+    }
+}
+
+#[test]
+fn settings_failures_of_the_gear_map_as_everywhere_else() {
+    use crate::api::rest::error::for_settings;
+
+    let unavailable = Problem::from(for_settings(DomainError::Unavailable("down".to_owned())));
+    let internal = Problem::from(for_settings(DomainError::internal("boom")));
+
+    assert_eq!(unavailable.status, Some(503));
+    assert_eq!(internal.status, Some(500));
+}
