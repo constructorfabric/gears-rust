@@ -4901,12 +4901,14 @@ dependencies = [
  "cf-gears-toolkit-odata-macros",
  "cf-gears-toolkit-security",
  "gts",
+ "proptest",
  "rust_decimal",
  "schemars 1.2.1",
  "serde",
  "serde_json",
  "thiserror 2.0.20",
  "time",
+ "tokio",
  "uuid",
 ]
 

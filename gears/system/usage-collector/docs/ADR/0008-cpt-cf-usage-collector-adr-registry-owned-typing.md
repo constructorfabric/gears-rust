@@ -138,7 +138,7 @@ The decision pins seven statements.
    applies to plugin binding.
 7. **Every meter is a derived type of a reserved base.** A declaration this
    gear meters against is a GTS *type*, terminated by `~`, deriving from
-   `gts.cf.core.uc.usage_record.v1~` with exactly one further segment. The base
+   `gts.cf.core.uc.usage_record.v2~` with exactly one further segment. The base
    is abstract, defines the form of an entry, and carries the
    `x-gts-traits-schema` that makes the fold, the canonical unit, and the
    retention policy required of any concrete meter. Derivation is what makes a
@@ -283,7 +283,7 @@ decides for itself what a meter means.
 
 Quota Enforcement resolves under its own provisional GTS base,
 `gts.cf.qe.metric.type.v1~`. Statement 7 settles this gear's half of the
-question: a meter derives from `gts.cf.core.uc.usage_record.v1~`, so the two
+question: a meter derives from `gts.cf.core.uc.usage_record.v2~`, so the two
 are separate families rather than one. A metric declared only under the Quota
 Enforcement base therefore cannot be metered here without a declaration of its
 own under the reserved base.
