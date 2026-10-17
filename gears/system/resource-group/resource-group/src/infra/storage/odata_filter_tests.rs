@@ -187,3 +187,84 @@ fn assert_mapped_tree(
         _ => panic!("tree shape changed"),
     }
 }
+
+fn parse_group_filter(filter: &str) -> ODataQuery {
+    let parsed = parse_filter_string(filter).expect("valid syntax");
+    ODataQuery::default().with_filter(parsed.as_expr().clone())
+}
+
+#[test]
+fn type_codes_in_filter_are_sorted_and_deduplicated() {
+    let query = parse_group_filter(
+        "type in ('b', 'a') or type eq 'a' or not (type ne 'c') and name eq 'x'",
+    );
+    let codes = type_codes_in_filter(&query, GroupFilterField::Type).unwrap();
+    assert_eq!(codes, vec!["a", "b", "c"]);
+
+    let none = type_codes_in_filter(&ODataQuery::default(), GroupFilterField::Type).unwrap();
+    assert!(none.is_empty());
+}
+
+#[test]
+fn type_codes_in_filter_rejects_unsupported_operators_and_non_strings() {
+    for filter in ["type gt 'a'", "type eq 5"] {
+        let query = parse_group_filter(filter);
+        let err = type_codes_in_filter(&query, GroupFilterField::Type).unwrap_err();
+        assert!(
+            matches!(err, DomainError::Validation { .. }),
+            "{filter}: {err:?}"
+        );
+    }
+}
+
+#[test]
+fn resolve_type_filter_substitutes_uuids_and_keeps_error_texts() {
+    use resource_group_sdk::GtsTypePath;
+    let known = resource_group_sdk::TENANT_RG_TYPE_PATH;
+    let uuid = Uuid::now_v7();
+    let resolved = HashMap::from([(known.to_owned(), uuid)]);
+
+    let query = parse_group_filter(&format!("type eq '{known}'"));
+    let node = validate_filter::<GroupFilterField>(query.filter.as_deref().unwrap()).unwrap();
+    match resolve_type_filter(&node, GroupFilterField::Type, &resolved).unwrap() {
+        FilterNode::Binary {
+            value: Value::Uuid(got),
+            ..
+        } => assert_eq!(got, uuid),
+        other => panic!("unexpected node: {other:?}"),
+    }
+
+    let unknown = format!("{known}x.test.ns.nothing.v1~");
+    assert!(GtsTypePath::new(&unknown).is_ok());
+    let node = validate_filter::<GroupFilterField>(
+        parse_group_filter(&format!("type eq '{unknown}'"))
+            .filter
+            .as_deref()
+            .unwrap(),
+    )
+    .unwrap();
+    match resolve_type_filter(&node, GroupFilterField::Type, &resolved).unwrap_err() {
+        DomainError::Validation { message } => assert_eq!(
+            message,
+            format!("invalid $filter: Unknown type in filter: {unknown} (field type)")
+        ),
+        other => panic!("unexpected: {other:?}"),
+    }
+
+    let node = validate_filter::<GroupFilterField>(
+        parse_group_filter("type eq 'not-a-gts'")
+            .filter
+            .as_deref()
+            .unwrap(),
+    )
+    .unwrap();
+    match resolve_type_filter(&node, GroupFilterField::Type, &resolved).unwrap_err() {
+        DomainError::Validation { message } => {
+            assert!(
+                message.starts_with("invalid $filter: field type: "),
+                "{message}"
+            );
+        }
+        other => panic!("unexpected: {other:?}"),
+    }
+}

@@ -86,6 +86,9 @@ heck = { workspace = true }
 integration = ["toolkit-db/pg", "toolkit-db/mysql"]
 
 [dev-dependencies]
+# TEMPORARY(rg-types-in-tr): link the SDKs that declare RG types so their GTS inventory is present.
+resource-group-sdk = { workspace = true }
+account-management-sdk = { workspace = true }
 # Deterministic Tokio time for lease tests.
 tokio = { workspace = true, features = [
     "rt-multi-thread",

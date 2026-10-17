@@ -68,7 +68,6 @@ mod wire_vocabulary_round_trip {
     #[test]
     fn precondition_subject_constants_round_trip_to_violations() {
         for subject in [
-            precondition::ALLOWED_PARENTS_SUBJECT,
             precondition::HIERARCHY_SUBJECT,
             precondition::ACTIVE_REFERENCES_SUBJECT,
             precondition::LIMIT_SUBJECT,
@@ -230,10 +229,6 @@ mod projection_tests {
     #[test]
     fn failed_precondition_projects_typed_subject() {
         let cases = [
-            (
-                precondition::ALLOWED_PARENTS_SUBJECT,
-                Subject::AllowedParents,
-            ),
             (precondition::HIERARCHY_SUBJECT, Subject::Hierarchy),
             (
                 precondition::ACTIVE_REFERENCES_SUBJECT,

@@ -1748,6 +1748,7 @@ name = "cf-gears-account-management-sdk"
 version = "0.7.5"
 dependencies = [
  "async-trait",
+ "cf-gears-resource-group-sdk",
  "cf-gears-tenant-resolver-sdk",
  "cf-gears-toolkit",
  "cf-gears-toolkit-canonical-errors",
@@ -3654,10 +3655,8 @@ dependencies = [
  "cf-gears-toolkit-security",
  "cf-gears-types-registry",
  "cf-gears-types-registry-sdk",
- "gts",
  "http",
  "http-body-util",
- "inventory",
  "jsonschema",
  "opentelemetry",
  "opentelemetry_sdk",
@@ -4790,6 +4789,8 @@ dependencies = [
  "aws-lc-rs",
  "axum",
  "base64 0.22.1",
+ "cf-gears-account-management-sdk",
+ "cf-gears-resource-group-sdk",
  "cf-gears-test-containers",
  "cf-gears-toolkit",
  "cf-gears-toolkit-canonical-errors",

@@ -3,13 +3,12 @@
 //! Resource Group SDK
 //!
 //! This crate provides the public API for the `resource-group` gear:
-//! - `ResourceGroupClient` / `ResourceGroupReadHierarchy` /
-//!   `ResourceGroupTypeBootstrap` traits (boundary returns
-//!   [`toolkit_canonical_errors::CanonicalError`] per [ADR 0005][adr]).
-//!   `ResourceGroupTypeBootstrap` is a narrow, un-gated surface for
-//!   deployment-time type-registry bootstrap from another gear's `init` —
-//!   see its own doc comment for why it bypasses `PolicyEnforcer`.
-//! - Model types for GTS types, groups, memberships
+//! - `ResourceGroupClient` / `ResourceGroupReadHierarchy` traits (boundary
+//!   returns [`toolkit_canonical_errors::CanonicalError`] per [ADR 0005][adr]).
+//!   Resource-group types live in the Types Registry as GTS type schemas
+//!   derived from `gts.cf.core.rg.type.v1~` (see [`gts`]); this crate does
+//!   not manage them.
+//! - Model types for groups and memberships
 //! - [`ResourceGroupError`] — opt-in `From<CanonicalError>` projection
 //!   (see [`error`]) plus its co-located wire vocabulary ([`field`],
 //!   [`precondition`], [`reason`], [`gts`])
@@ -33,13 +32,10 @@ pub mod reason;
 pub mod odata;
 
 // Re-export main types at crate root for convenience
-pub use api::{ResourceGroupClient, ResourceGroupReadHierarchy, ResourceGroupTypeBootstrap};
+pub use api::{ResourceGroupClient, ResourceGroupReadHierarchy};
 pub use error::ResourceGroupError;
-pub use gts::{
-    GROUP_MEMBERSHIP_RESOURCE_TYPE, GROUP_RESOURCE_TYPE, TENANT_RG_TYPE_PATH, TYPE_RESOURCE_TYPE,
-};
+pub use gts::{GROUP_MEMBERSHIP_RESOURCE_TYPE, GROUP_RESOURCE_TYPE, TENANT_RG_TYPE_PATH};
 pub use models::{
-    CreateGroupRequest, CreateTypeRequest, GroupHierarchy, GroupHierarchyWithDepth, GtsTypePath,
-    ResourceGroup, ResourceGroupMembership, ResourceGroupType, ResourceGroupWithDepth,
-    UpdateGroupRequest, UpdateTypeRequest,
+    CreateGroupRequest, GroupHierarchy, GroupHierarchyWithDepth, GtsTypePath, ResourceGroup,
+    ResourceGroupMembership, ResourceGroupWithDepth, UpdateGroupRequest,
 };
