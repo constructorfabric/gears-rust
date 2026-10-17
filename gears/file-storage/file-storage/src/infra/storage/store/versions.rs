@@ -73,19 +73,49 @@ impl Store {
             .await
     }
 
-    /// List a page of a file's versions, newest first (backs `GET /files/{id}/versions`);
-    /// `limit`/`offset` are expected to be clamped by the caller.
+    /// List a page of a file's versions, newest first, keyset-paginated in either direction
+    /// (backs `GET /files/{id}/versions`). `limit` is already clamped by the caller; `cursor`
+    /// is decoded against `versions_binding`, so a cursor from a different file is rejected
+    /// with `400`.
+    ///
+    /// Fetches `limit + 1` rows to detect a further page (no `COUNT`); `finish_page` trims,
+    /// restores canonical order and builds both cursors.
     pub async fn list_versions_page(
         &self,
         file_id: Uuid,
         limit: u64,
-        offset: u64,
-    ) -> Result<Vec<FileVersion>, DomainError> {
+        cursor: Option<&str>,
+    ) -> Result<toolkit_odata::Page<FileVersion>, DomainError> {
+        use crate::domain::pagination;
+
+        let binding = pagination::versions_binding(file_id);
+        let after = cursor
+            .map(|token| {
+                pagination::decode(token, pagination::VERSIONS_ID_FIELD, binding.as_deref())
+            })
+            .transpose()?;
+
         let conn = self.db.conn().map_err(DomainError::from)?;
-        self.repos
+        let rows = self
+            .repos
             .versions
-            .list_by_file(&conn, &AccessScope::allow_all(), file_id, limit, offset)
-            .await
+            .list_by_file_page(
+                &conn,
+                &AccessScope::allow_all(),
+                file_id,
+                limit.saturating_add(1),
+                after,
+            )
+            .await?;
+
+        Ok(pagination::finish_page(
+            rows,
+            limit,
+            after,
+            pagination::VERSIONS_ID_FIELD,
+            binding.as_deref(),
+            |v| (v.created_at, v.version_id),
+        )?)
     }
 
     /// MIME type of the file's current version; `Ok(None)` only when no content is

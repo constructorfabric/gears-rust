@@ -187,7 +187,12 @@ impl Gear for FileStorageGear {
             )
         })?;
 
-        let policy_svc = Arc::new(PolicyService::new(policy_store, authorizer));
+        let policy_svc = Arc::new(PolicyService::new(
+            policy_store,
+            authorizer,
+            cfg.default_page_size,
+            cfg.max_page_size,
+        ));
         self.policy_service.set(policy_svc).map_err(|_| {
             anyhow::anyhow!("{} policy service already initialized", Self::MODULE_NAME)
         })?;

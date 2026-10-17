@@ -100,7 +100,7 @@ async fn build_all(
         "http://sidecar.test".to_owned(),
         3600,
     ));
-    let psvc = Arc::new(PolicyService::new(policy_store, authorizer));
+    let psvc = Arc::new(PolicyService::new(policy_store, authorizer, 50, 1000));
     let dp = DataPlaneService::new(Arc::clone(&svc) as Arc<dyn DataPlanePort>);
     let engine = CleanupEngine::new(
         sweep_store,

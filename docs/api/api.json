@@ -5366,13 +5366,6 @@
         ],
         "type": "object"
       },
-      "FileDtoList": {
-        "description": "List of files (`GET /files`).",
-        "items": {
-          "$ref": "#/components/schemas/FileDto"
-        },
-        "type": "array"
-      },
       "FileParserInfoDto": {
         "description": "REST DTO for file parser info response",
         "properties": {
@@ -9339,6 +9332,24 @@
         ],
         "type": "object"
       },
+      "Page_FileDto": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/FileDto"
+            },
+            "type": "array"
+          },
+          "page_info": {
+            "$ref": "#/components/schemas/PageInfo"
+          }
+        },
+        "required": [
+          "items",
+          "page_info"
+        ],
+        "type": "object"
+      },
       "Page_GroupDto": {
         "properties": {
           "items": {
@@ -9609,6 +9620,24 @@
         ],
         "type": "object"
       },
+      "Page_RetentionRuleDto": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/RetentionRuleDto"
+            },
+            "type": "array"
+          },
+          "page_info": {
+            "$ref": "#/components/schemas/PageInfo"
+          }
+        },
+        "required": [
+          "items",
+          "page_info"
+        ],
+        "type": "object"
+      },
       "Page_ReviewThreadDto": {
         "properties": {
           "items": {
@@ -9812,6 +9841,24 @@
           "items": {
             "items": {
               "$ref": "#/components/schemas/UsersInfoUserDto"
+            },
+            "type": "array"
+          },
+          "page_info": {
+            "$ref": "#/components/schemas/PageInfo"
+          }
+        },
+        "required": [
+          "items",
+          "page_info"
+        ],
+        "type": "object"
+      },
+      "Page_VersionDto": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/VersionDto"
             },
             "type": "array"
           },
@@ -18003,13 +18050,6 @@
         ],
         "type": "object"
       },
-      "RetentionRuleDtoList": {
-        "description": "List of retention rules (`GET /retention-rules`).",
-        "items": {
-          "$ref": "#/components/schemas/RetentionRuleDto"
-        },
-        "type": "array"
-      },
       "ReturnPaymentRequest": {
         "description": "The `POST /payments/{payment_id}/returns` request body: claw a settled\nreceipt back out (the reversal of a money-in). `{payment_id}` (the original\nsettled payment) comes from the PATH; `psp_return_id` is the idempotency key\n(a re-post replays). `money` carries its currency and stored scale;\n`effective_at` `None` ⇒ stamped at post time.",
         "properties": {
@@ -22372,13 +22412,6 @@
           "created_at"
         ],
         "type": "object"
-      },
-      "VersionDtoList": {
-        "description": "List of file versions (`GET /files/{id}/versions`).",
-        "items": {
-          "$ref": "#/components/schemas/VersionDto"
-        },
-        "type": "array"
       },
       "ViolationDto": {
         "description": "One field-level violation.",
@@ -26962,6 +26995,7 @@
     },
     "/api/file-storage/v1/files": {
       "get": {
+        "description": "Keyset pagination in either direction: `limit` (default 25, max 200) and the opaque `cursor` from the previous page's `page_info.next_cursor` or `page_info.prev_cursor`. The response carries `next_cursor` and `prev_cursor`. Canonical order is `created_at desc, file_id desc` -- see docs/api.md.",
         "operationId": "file_storage.list_files",
         "parameters": [
           {
@@ -26983,7 +27017,7 @@
             }
           },
           {
-            "description": "Page size",
+            "description": "Page size (default 25, max 200)",
             "in": "query",
             "name": "limit",
             "required": false,
@@ -26992,12 +27026,12 @@
             }
           },
           {
-            "description": "Offset",
+            "description": "Opaque continuation token from the previous page",
             "in": "query",
-            "name": "offset",
+            "name": "cursor",
             "required": false,
             "schema": {
-              "type": "integer"
+              "type": "string"
             }
           }
         ],
@@ -27006,7 +27040,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/FileDtoList"
+                  "$ref": "#/components/schemas/Page_FileDto"
                 }
               }
             },
@@ -27058,7 +27092,7 @@
             "bearerAuth": []
           }
         ],
-        "summary": "List files for an owner (owner_kind + owner_id required)",
+        "summary": "List files for an owner (owner_kind + owner_id required, cursor pagination)",
         "tags": [
           "File Storage"
         ]
@@ -28362,6 +28396,7 @@
     },
     "/api/file-storage/v1/files/{id}/versions": {
       "get": {
+        "description": "Keyset pagination in either direction: `limit` (default 25, max 200) and the opaque `cursor` from the previous page's `page_info.next_cursor` or `page_info.prev_cursor`. The response carries `next_cursor` and `prev_cursor`. Canonical order is `created_at desc, version_id desc` -- see docs/api.md.",
         "operationId": "file_storage.list_versions",
         "parameters": [
           {
@@ -28374,7 +28409,7 @@
             }
           },
           {
-            "description": "Page size",
+            "description": "Page size (default 25, max 200)",
             "in": "query",
             "name": "limit",
             "required": false,
@@ -28383,12 +28418,12 @@
             }
           },
           {
-            "description": "Offset",
+            "description": "Opaque continuation token from the previous page",
             "in": "query",
-            "name": "offset",
+            "name": "cursor",
             "required": false,
             "schema": {
-              "type": "integer"
+              "type": "string"
             }
           }
         ],
@@ -28397,11 +28432,21 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/VersionDtoList"
+                  "$ref": "#/components/schemas/Page_VersionDto"
                 }
               }
             },
             "description": "Versions"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
           },
           "401": {
             "content": {
@@ -28449,7 +28494,7 @@
             "bearerAuth": []
           }
         ],
-        "summary": "List all versions of a file",
+        "summary": "List a file's versions, newest first (cursor pagination)",
         "tags": [
           "File Storage"
         ]
@@ -28866,17 +28911,48 @@
     },
     "/api/file-storage/v1/retention-rules": {
       "get": {
+        "description": "Keyset pagination in either direction: `limit` (default 25, max 200) and the opaque `cursor` from the previous page's `page_info.next_cursor` or `page_info.prev_cursor`. The response carries `next_cursor` and `prev_cursor`. Canonical order is `created_at desc, rule_id desc` -- see docs/api.md.",
         "operationId": "file_storage.list_retention_rules",
+        "parameters": [
+          {
+            "description": "Page size (default 25, max 200)",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Opaque continuation token from the previous page",
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/RetentionRuleDtoList"
+                  "$ref": "#/components/schemas/Page_RetentionRuleDto"
                 }
               }
             },
             "description": "Retention rules"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
           },
           "401": {
             "content": {
@@ -28914,7 +28990,7 @@
             "bearerAuth": []
           }
         ],
-        "summary": "List all retention rules for the caller's tenant",
+        "summary": "List retention rules for the caller's tenant",
         "tags": [
           "File Storage"
         ]

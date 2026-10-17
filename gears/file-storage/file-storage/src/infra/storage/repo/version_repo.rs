@@ -80,7 +80,10 @@ impl VersionRepo {
         Ok(found.map(Into::into))
     }
 
-    /// List a page of a file's versions, newest first.
+    /// List a page of a file's versions, newest first, offset-paginated.
+    ///
+    /// Ordered `(created_at, version_id)` descending; `version_id` is the tie-breaker for equal
+    /// `created_at`. The REST listing uses `list_by_file_page`.
     pub async fn list_by_file<C: DBRunner>(
         &self,
         conn: &C,
@@ -92,8 +95,61 @@ impl VersionRepo {
         let rows = Entity::find()
             .filter(Column::FileId.eq(file_id))
             .order_by_desc(Column::CreatedAt)
+            .order_by_desc(Column::VersionId)
             .limit(limit)
             .offset(offset)
+            .secure()
+            .scope_with(scope)
+            .all(conn)
+            .await
+            .map_err(DomainError::from)?;
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+
+    /// List a page of a file's versions, newest first, keyset-paginated in either direction
+    /// (backs `GET /files/{id}/versions`). Same canonical order as `list_by_file`; see
+    /// `FileRepo::list_page` for the forward/backward predicates, mirrored on `version_id`.
+    /// Callers fetch `limit + 1` rows to detect a further page.
+    pub async fn list_by_file_page<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        file_id: Uuid,
+        limit: u64,
+        after: Option<crate::domain::pagination::Seek>,
+    ) -> Result<Vec<FileVersion>, DomainError> {
+        use crate::domain::pagination::Direction;
+
+        let mut filter = Condition::all().add(Column::FileId.eq(file_id));
+        let direction = after.map_or(Direction::Forward, |s| s.direction);
+        if let Some(seek) = after {
+            let pred = match direction {
+                Direction::Forward => super::tuple_lt(
+                    (Entity, Column::CreatedAt),
+                    (Entity, Column::VersionId),
+                    seek.created_at,
+                    seek.id,
+                ),
+                Direction::Backward => super::tuple_gt(
+                    (Entity, Column::CreatedAt),
+                    (Entity, Column::VersionId),
+                    seek.created_at,
+                    seek.id,
+                ),
+            };
+            filter = filter.add(pred);
+        }
+        let mut query = Entity::find().filter(filter);
+        query = match direction {
+            Direction::Forward => query
+                .order_by_desc(Column::CreatedAt)
+                .order_by_desc(Column::VersionId),
+            Direction::Backward => query
+                .order_by_asc(Column::CreatedAt)
+                .order_by_asc(Column::VersionId),
+        };
+        let rows = query
+            .limit(limit)
             .secure()
             .scope_with(scope)
             .all(conn)

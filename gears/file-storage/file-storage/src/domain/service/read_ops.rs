@@ -39,15 +39,15 @@ impl FileService {
         Ok((file, meta))
     }
 
-    /// List files for a mandatory owner filter, offset-paginated.
+    /// List files for a mandatory owner filter, cursor-paginated in either direction.
     pub async fn list_files(
         &self,
         ctx: &SecurityContext,
         owner: OwnerFilter,
         limit: Option<u64>,
-        offset: u64,
-    ) -> Result<Vec<File>, DomainError> {
-        // The query is always tenant-scoped, regardless of the PDP's returned constraints.
+        cursor: Option<&str>,
+    ) -> Result<toolkit_odata::Page<File>, DomainError> {
+        // Authorize, then always tenant-scope the query regardless of the PDP's constraints.
         self.authorizer
             .authorize(ctx, actions::READ, "", None)
             .await?;
@@ -59,11 +59,13 @@ impl FileService {
                 .authorize(ctx, actions::ADMIN_POLICY, "", None)
                 .await?;
         }
-        let limit = limit
-            .unwrap_or(self.cfg.default_page_size)
-            .min(self.cfg.max_page_size);
+        let limit = crate::domain::pagination::clamp_limit(
+            limit,
+            self.cfg.default_page_size,
+            self.cfg.max_page_size,
+        )?;
         self.store
-            .list_files(&Self::tenant_scope(ctx), owner, limit, offset)
+            .list_files(&Self::tenant_scope(ctx), owner, limit, cursor)
             .await
     }
 
@@ -126,25 +128,27 @@ impl FileService {
         })
     }
 
-    /// `GET /files/{id}/versions`: newest first, offset-paginated, capped at
-    /// `ServiceConfig::max_page_size`.
+    /// `GET /files/{id}/versions`: list a file's versions, newest first, cursor-paginated and
+    /// capped at `ServiceConfig::max_page_size`.
     pub async fn list_versions(
         &self,
         ctx: &SecurityContext,
         file_id: Uuid,
         limit: Option<u64>,
-        offset: u64,
-    ) -> Result<Vec<FileVersion>, DomainError> {
+        cursor: Option<&str>,
+    ) -> Result<toolkit_odata::Page<FileVersion>, DomainError> {
         let prefetch = Self::tenant_scope(ctx);
         let file = self.store.require_file(&prefetch, file_id).await?;
         let _scope = self
             .authorizer
             .authorize(ctx, actions::READ, &file.gts_file_type, Some(file_id))
             .await?;
-        let limit = limit
-            .unwrap_or(self.cfg.default_page_size)
-            .min(self.cfg.max_page_size);
-        self.store.list_versions_page(file_id, limit, offset).await
+        let limit = crate::domain::pagination::clamp_limit(
+            limit,
+            self.cfg.default_page_size,
+            self.cfg.max_page_size,
+        )?;
+        self.store.list_versions_page(file_id, limit, cursor).await
     }
 
     /// Restore a prior version as current (a rebind: pointer swap, no re-upload).
