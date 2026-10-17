@@ -77,4 +77,4 @@ rcgen = { workspace = true }
 # hash_len. See TODO-4 in README. `pkcs1` (DER parsing of Apple's public
 # key bytes) is a transitive dep, not a feature, so we don't list it here.
 rsa = { version = "0.9", default-features = false, features = ["std"] }
-sha2 = { version = "0.10", default-features = false }
+sha2 = { version = "0.11", default-features = false }

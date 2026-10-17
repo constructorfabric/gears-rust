@@ -765,7 +765,7 @@ ureq = "3.3"
 time = { version = "0.3.47", features = ["serde", "formatting", "parsing"] }
 
 # Cryptographic utilities
-sha2 = "0.10"
+sha2 = "0.11"
 hex = "0.4"
 
 # JWT and authentication
