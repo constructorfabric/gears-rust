@@ -47,8 +47,10 @@ pub fn register_routes(
         .summary("List settings categories")
         .description(
             "List categories visible to the caller, ordered by sort order then name. \
-             Supports OData `$filter` over `key`, `name` and `domain_affinity`, and \
-             `$orderby` over `key` and `name`, with cursor pagination. `$orderby` over \
+             Supports OData `$filter` over `key`, `name`, `domain_affinity` and \
+             `sort_order`, and `$orderby` over `key`, `name` and `sort_order`, each `asc` or \
+             `desc`, with cursor pagination; the default order is sort order then name, and \
+             `name` is appended as the tiebreaker unless it is already named. `$orderby` over \
              `domain_affinity` is refused: it may be empty, and a page cursor cannot carry \
              an empty value. `$select` is not supported and is rejected rather than ignored.",
         )

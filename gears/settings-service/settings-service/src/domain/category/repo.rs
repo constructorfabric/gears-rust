@@ -205,7 +205,9 @@ pub trait CategoryRepository: Send + Sync {
     /// scope, never to the returned page: filtering afterwards yields short
     /// pages and a cursor that skips rows the caller was entitled to.
     ///
-    /// Ordered by `sort_order` then `name` so the cursor is deterministic.
+    /// Ordered by `sort_order` then `name` unless the caller sent an
+    /// `$orderby`, in which case that order applies with `name` appended as the
+    /// tiebreaker, so the cursor is deterministic either way.
     ///
     /// # Errors
     /// [`DomainError::Validation`] when the query references an unmapped field

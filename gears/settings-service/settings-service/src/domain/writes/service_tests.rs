@@ -182,6 +182,7 @@ impl WriteHarness {
                 id,
                 DeclarationMetadata {
                     mode: "standard".to_owned(),
+                    display_name: None,
                     description: None,
                     domain_affinity: None,
                     licence_feature: None,

@@ -21,6 +21,7 @@ use crate::infra::storage::clock::{now, stamp_after};
 use crate::infra::storage::declaration_odata_mapper::DeclarationODataMapper;
 use crate::infra::storage::entity::declaration::{self, Entity as DeclarationEntity};
 use crate::infra::storage::entity::tenant_permission;
+use crate::infra::storage::value_repo;
 use settings_service_sdk::odata::DeclarationFilterField;
 
 /// Page bounds for declaration listings.
@@ -50,6 +51,7 @@ pub(crate) fn to_domain(model: declaration::Model) -> Declaration {
         domain_affinity: model.domain_affinity,
         licence_feature: model.licence_feature,
         owner_module: model.owner_module,
+        display_name: model.display_name,
         description: model.description,
         default_value: model.default_value,
         has_secret_trait: model.has_secret_trait,
@@ -203,6 +205,7 @@ impl DeclarationRepository for DeclarationRepo {
             owner_module: Set(draft.owner_module),
             licence_feature: Set(draft.licence_feature),
             status: Set("active".to_owned()),
+            display_name: Set(draft.display_name),
             description: Set(draft.description),
             last_change_at: Set(at),
             created_at: Set(at),
@@ -234,6 +237,10 @@ impl DeclarationRepository for DeclarationRepo {
             .col_expr(
                 declaration::Column::Description,
                 Expr::value(metadata.description),
+            )
+            .col_expr(
+                declaration::Column::DisplayName,
+                Expr::value(metadata.display_name),
             )
             .col_expr(
                 declaration::Column::DomainAffinity,
@@ -406,21 +413,50 @@ impl DeclarationRepository for DeclarationRepo {
         Ok(rows.into_iter().map(to_domain).collect())
     }
 
+    async fn find_by_ids<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        ids: &[Uuid],
+    ) -> Result<Vec<Declaration>, DomainError> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows = DeclarationEntity::find()
+            .filter(declaration::Column::Id.is_in(ids.iter().copied()))
+            .secure()
+            .scope_with(scope)
+            .all(conn)
+            .await
+            .map_err(db_error)?;
+        Ok(rows.into_iter().map(to_domain).collect())
+    }
+
     async fn list<C: DBRunner>(
         &self,
         conn: &C,
         scope: &AccessScope,
         visibility: &DomainVisibility,
         hidden_for: &[Uuid],
+        flagged_at: Option<Uuid>,
         query: &ODataQuery,
     ) -> Result<Page<Declaration>, DomainError> {
         // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-read:p1:inst-decl-read-6
-        let base = exclude_hidden_for(
+        let mut base = exclude_hidden_for(
             apply_visibility(DeclarationEntity::find(), visibility),
             hidden_for,
-        )
-        .secure()
-        .scope_with(scope);
+        );
+        // @cpt-begin:cpt-cf-settings-service-flow-value-resolution-admin-browse:p1:inst-vr-browse-7
+        // `needs_review eq true` on the browse: only declarations whose own
+        // override at that tenant is flagged — in the page query, so the page
+        // is cut and counted over the narrowed set, never narrowed after.
+        if let Some(tenant) = flagged_at {
+            base = base.filter(
+                declaration::Column::Id.in_subquery(value_repo::flagged_declarations_at(tenant)),
+            );
+        }
+        // @cpt-end:cpt-cf-settings-service-flow-value-resolution-admin-browse:p1:inst-vr-browse-7
+        let base = base.secure().scope_with(scope);
 
         // Tiebreaker is `key`, which `uq_declaration_key` makes unique, so a
         // page boundary can neither repeat nor skip a row.
@@ -444,5 +480,31 @@ impl DeclarationRepository for DeclarationRepo {
             items: page.items.into_iter().map(to_domain).collect(),
             page_info: page.page_info,
         })
+    }
+
+    async fn visible_keys<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        visibility: &DomainVisibility,
+        hidden_for: &[Uuid],
+        keys: &[String],
+    ) -> Result<Vec<String>, DomainError> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        // @cpt-begin:cpt-cf-settings-service-flow-value-resolution-admin-browse:p1:inst-vr-browse-9
+        let rows = exclude_hidden_for(
+            apply_visibility(DeclarationEntity::find(), visibility),
+            hidden_for,
+        )
+        .filter(declaration::Column::Key.is_in(keys.iter().cloned()))
+        .secure()
+        .scope_with(scope)
+        .all(conn)
+        .await
+        .map_err(db_error)?;
+        // @cpt-end:cpt-cf-settings-service-flow-value-resolution-admin-browse:p1:inst-vr-browse-9
+        Ok(rows.into_iter().map(|m| m.key).collect())
     }
 }

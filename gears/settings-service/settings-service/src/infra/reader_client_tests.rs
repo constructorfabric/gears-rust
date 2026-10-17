@@ -327,6 +327,7 @@ async fn a_category_holding_a_row_whose_key_does_not_parse_is_refused_whole_not_
                     source: "admin_authored".to_owned(),
                     owner_module: None,
                     licence_feature: None,
+                    display_name: None,
                     description: None,
                     created_by: "test".to_owned(),
                 },

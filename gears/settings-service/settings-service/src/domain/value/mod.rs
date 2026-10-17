@@ -6,9 +6,57 @@ pub mod repo;
 use serde_json::Value;
 use time::OffsetDateTime;
 use toolkit_macros::domain_model;
+use toolkit_odata::ODataQuery;
+use toolkit_security::AccessScope;
 use uuid::Uuid;
 
+use crate::domain::category::visibility::DomainVisibility;
+
 pub use repo::ValueRepository;
+
+/// What the review listing is asked with, every decision already taken by the
+/// caller: the handler decides, the repository only applies.
+#[domain_model]
+#[derive(Debug, Clone, Copy)]
+pub struct ReviewRequest<'a> {
+    /// The narrowed grant, pushed into the declarations the rows must belong to.
+    pub scope: &'a AccessScope,
+    /// The domains the caller may see.
+    pub visibility: &'a DomainVisibility,
+    /// The caller's root-to-self chain: a declaration `hidden` on it has no
+    /// rows on the page.
+    pub hidden_for: &'a [Uuid],
+    /// The target and its non-standalone descendants: where a flagged row may
+    /// be listed.
+    pub tenant_ids: &'a [Uuid],
+    /// The declaration-selecting `$filter` remainder: `category_id`, `key`.
+    pub declarations: Option<&'a toolkit_odata::ast::Expr>,
+    /// Page size, cursor and the binding the cursor must carry; its own filter
+    /// and order are not read — the listing's order is fixed.
+    pub query: &'a ODataQuery,
+}
+
+/// The binding of a review cursor: the `$filter` as asked and the target, so a
+/// cursor continues only the listing it was minted for.
+///
+/// Compared, never stored: it is a guard against continuing one listing with
+/// another's cursor, not a secret.
+#[must_use]
+pub fn review_binding(target: Uuid, filter: Option<&toolkit_odata::ast::Expr>) -> String {
+    // The library's normalised text, so spelling, spacing and the order of
+    // equal operands do not tell two equal filters apart, and the digest does
+    // not move with a compiler release: FNV-1a over fixed constants.
+    let text = format!(
+        "{target}|{}",
+        filter.map_or_else(String::new, toolkit_odata::normalize_filter_for_hash)
+    );
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in text.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01B3);
+    }
+    format!("{hash:016x}")
+}
 
 /// One row of `setting_values`, as the domain sees it.
 ///
@@ -64,3 +112,7 @@ pub struct ValueDraft {
     /// Who set it.
     pub set_by: String,
 }
+
+#[cfg(test)]
+#[path = "binding_tests.rs"]
+mod binding_tests;
