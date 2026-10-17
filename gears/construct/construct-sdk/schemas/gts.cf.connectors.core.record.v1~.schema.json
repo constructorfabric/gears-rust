@@ -1,0 +1,58 @@
+{
+  "$id": "gts://gts.cf.connectors.core.record.v1~",
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "description": "Abstract base of one observed record inside a connector push. Dedupe and re-push idempotency are keyed on (tenant, connector, provenance, version) - tenant and connector identity from the push envelope, provenance and version from the record. The connector identity is one opaque value derived from the envelope's vendor and package, never the connector's build version. Provenance is the source-formed locator of the observed thing, version identifies its content at observation - re-pushing the same (provenance, version) is a no-op. Producer obligation: version MUST be derived from the observed content (each derived type documents its derivation): a producer obligation, not verifiable by the results API (the derivation input exists only at the source). Post-observation changes at the source are not propagated (forward-only delivery). The top level is frozen (additionalProperties: false): a derived content type refines only the payload member and may tighten required. A record about a person sets subject_id; the results API enforces it where the content requires a person.",
+  "x-gts-abstract": true,
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "id": {
+      "type": "string",
+      "pattern": "^gts\\.[a-z_][a-z0-9_]*(\\.[a-z_][a-z0-9_]*){3}\\.v[0-9]+(\\.[0-9]+)?~([a-z_][a-z0-9_]*(\\.[a-z_][a-z0-9_]*){3}\\.v[0-9]+(\\.[0-9]+)?~)*[a-z_][a-z0-9_]*(\\.[a-z_][a-z0-9_]*){3}\\.v[0-9]+(\\.[0-9]+)?$",
+      "description": "GTS instance identifier: the type chain plus the instance's own final segment without the trailing tilde. Present when the record lives in a GTS store. Forbidden inside a result push - the envelope rejects it, dedupe identity there is (tenant, connector, provenance, version)."
+    },
+    "type": {
+      "type": "string",
+      "format": "gts-type-id",
+      "pattern": "^gts\\.[a-z_][a-z0-9_]*(\\.[a-z_][a-z0-9_]*){3}\\.v[0-9]+(\\.[0-9]+)?~([a-z_][a-z0-9_]*(\\.[a-z_][a-z0-9_]*){3}\\.v[0-9]+(\\.[0-9]+)?~)+$",
+      "x-gts-ref": "gts.cf.connectors.core.record.v1~",
+      "description": "The derived content type this instance conforms to (x-gts-ref: must derive from this base)."
+    },
+    "provenance": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 1024,
+      "description": "Opaque, source-formed locator of the observed thing, stable across re-pushes. E.g. for chat: source + thread id + message id."
+    },
+    "version": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "description": "Identifies the record's content at observation, derived from that content per the producer obligation above."
+    },
+    "subject_id": {
+      "type": "string",
+      "format": "uuid",
+      "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
+      "description": "The person the record is about. Absent only for source-scoped records."
+    },
+    "observed_at": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}[Tt]\\d{2}:\\d{2}:\\d{2}(\\.\\d+)?([Zz]|[+-]\\d{2}:\\d{2})$",
+      "description": "When the connector formed the record. For a forwarding connector, when it observed the record at the source. For a computing connector, when it finished computing the record. Each derived type states in its own description which sense it uses. That narrowing is prose, not a schema restriction."
+    },
+    "payload": {
+      "type": "object",
+      "additionalProperties": true,
+      "description": "The observed content; derived types refine this member."
+    }
+  },
+  "required": [
+    "type",
+    "provenance",
+    "version",
+    "observed_at",
+    "payload"
+  ]
+}

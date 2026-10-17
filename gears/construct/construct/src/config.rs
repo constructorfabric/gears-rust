@@ -1,124 +1,93 @@
 use serde::Deserialize;
+use uuid::Uuid;
 
-use crate::domain::service::ServiceConfig;
-
-/// Default for [`ConstructConfig::max_text_length`], in bytes.
-pub const DEFAULT_MAX_TEXT_LENGTH: usize = 1000;
+/// Default for [`ConstructConfig::personalization_default`]: on, so a host
+/// without the settings service takes records for new subjects. A deployment
+/// that wants new subjects to start with personalization off sets it to false.
+pub const DEFAULT_PERSONALIZATION: bool = true;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ConstructConfig {
-    /// Longest foundation note text, in bytes.
-    #[serde(default = "default_max_text_length")]
-    pub max_text_length: usize,
+    /// Whether personalization is on for a new subject, used only while the
+    /// settings service gives no tenant default: no settings client in the
+    /// host, or the setting not declared there.
+    #[serde(default = "default_personalization")]
+    pub personalization_default: bool,
+    /// Connectors that are off, by connector identity: the subject id of the
+    /// connector's login, as a UUID. Every other connector is on. A value that
+    /// is not a UUID stops the gear from starting, so a typo cannot leave a
+    /// connector on.
+    #[serde(default)]
+    pub connectors_off: Vec<Uuid>,
 }
 
 impl Default for ConstructConfig {
     fn default() -> Self {
         Self {
-            max_text_length: default_max_text_length(),
+            personalization_default: DEFAULT_PERSONALIZATION,
+            connectors_off: Vec::new(),
         }
     }
 }
 
-fn default_max_text_length() -> usize {
-    DEFAULT_MAX_TEXT_LENGTH
-}
-
-/// Upper bound on `max_text_length`: the capacity of `MySQL`'s `TEXT`, the
-/// smallest column any supported backend stores the text in.
-pub const MAX_TEXT_BYTES: usize = 65_535;
-
-impl ConstructConfig {
-    /// Reject limits that would break the gear at request time rather than at
-    /// startup, where a typo is cheap to notice.
-    ///
-    /// @cpt-dod:cpt-cf-construct-dod-gear-foundation-text-validation:p1
-    ///
-    /// # Errors
-    ///
-    /// When `max_text_length` is 0 (every note refused) or above
-    /// [`MAX_TEXT_BYTES`].
-    pub fn validate(&self) -> anyhow::Result<()> {
-        // @cpt-begin:cpt-cf-construct-algo-gear-foundation-start-gear:p1:inst-start-config-fail
-        if self.max_text_length == 0 || self.max_text_length > MAX_TEXT_BYTES {
-            anyhow::bail!(
-                "construct: max_text_length must be between 1 and {MAX_TEXT_BYTES}, got {}",
-                self.max_text_length
-            );
-        }
-        // @cpt-end:cpt-cf-construct-algo-gear-foundation-start-gear:p1:inst-start-config-fail
-        Ok(())
-    }
-}
-
-impl TryFrom<&ConstructConfig> for ServiceConfig {
-    type Error = anyhow::Error;
-
-    /// Build the domain configuration from a config that passed
-    /// [`ConstructConfig::validate`].
-    ///
-    /// # Errors
-    ///
-    /// When validation fails.
-    fn try_from(cfg: &ConstructConfig) -> anyhow::Result<Self> {
-        cfg.validate()?;
-        Ok(Self {
-            max_text_length: cfg.max_text_length,
-        })
-    }
+fn default_personalization() -> bool {
+    DEFAULT_PERSONALIZATION
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde::de::value::{Error, MapDeserializer};
 
-    #[test]
-    fn max_text_length_is_bounded_by_the_text_column() {
-        let with = |max_text_length| ConstructConfig { max_text_length };
-        assert!(with(0).validate().is_err(), "no note fits");
-        assert!(with(MAX_TEXT_BYTES + 1).validate().is_err(), "past TEXT");
-        with(1).validate().expect("smallest usable");
-        ConstructConfig::default().validate().expect("defaults");
-        with(MAX_TEXT_BYTES).validate().expect("the largest text");
+    fn parse(json: serde_json::Value) -> Result<ConstructConfig, serde_json::Error> {
+        serde_json::from_value(json)
     }
 
-    fn parse(key: &'static str) -> Result<ConstructConfig, serde::de::value::Error> {
-        use serde::de::value::MapDeserializer;
-        ConstructConfig::deserialize(MapDeserializer::new([(key, 5_usize)].into_iter()))
+    #[test]
+    fn an_empty_config_takes_the_defaults() {
+        let config = ConstructConfig::deserialize(MapDeserializer::<_, Error>::new(
+            std::iter::empty::<(&str, bool)>(),
+        ))
+        .expect("an empty config is valid");
+        assert!(config.personalization_default);
+        assert!(config.connectors_off.is_empty());
+    }
+
+    #[test]
+    fn both_keys_are_read() {
+        let config = parse(serde_json::json!({
+            "personalization_default": false,
+            "connectors_off": ["8b0b4c4e-0000-4000-8000-000000000001"],
+        }))
+        .expect("known keys");
+        assert!(!config.personalization_default);
+        assert_eq!(config.connectors_off.len(), 1);
     }
 
     #[test]
     fn unknown_keys_are_rejected() {
-        assert_eq!(
-            parse("max_text_length").expect("known key").max_text_length,
-            5
-        );
         assert!(
-            parse("max_text_lenght").is_err(),
+            parse(serde_json::json!({ "personalisation_default": false })).is_err(),
             "typo must not be ignored"
         );
+        assert!(
+            parse(serde_json::json!({ "max_text_length": 10 })).is_err(),
+            "the foundation's key is gone"
+        );
     }
 
     #[test]
-    fn omitted_max_text_length_takes_the_default_through_deserialization() {
-        use serde::de::value::MapDeserializer;
-        let config = ConstructConfig::deserialize(
-            MapDeserializer::<_, serde::de::value::Error>::new(std::iter::empty::<(&str, usize)>()),
-        )
-        .expect("an empty config is valid");
-        assert_eq!(config.max_text_length, DEFAULT_MAX_TEXT_LENGTH);
+    fn a_connector_that_is_not_a_uuid_is_rejected() {
+        assert!(parse(serde_json::json!({ "connectors_off": ["  "] })).is_err());
+        assert!(parse(serde_json::json!({ "connectors_off": ["connector-a"] })).is_err());
     }
 
     #[test]
-    fn default_config_converts_to_the_default_service_limit() {
-        let service = ServiceConfig::try_from(&ConstructConfig::default()).expect("defaults");
-        assert_eq!(service.max_text_length, DEFAULT_MAX_TEXT_LENGTH);
-    }
-
-    #[test]
-    fn invalid_config_does_not_convert() {
-        let zero = ConstructConfig { max_text_length: 0 };
-        assert!(ServiceConfig::try_from(&zero).is_err());
+    fn a_connector_in_another_spelling_is_the_same_connector() {
+        let id = Uuid::new_v4();
+        let upper = id.to_string().to_uppercase();
+        let config = parse(serde_json::json!({ "connectors_off": [upper] })).expect("a UUID");
+        assert_eq!(config.connectors_off, vec![id]);
     }
 }
