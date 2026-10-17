@@ -360,6 +360,28 @@ pub fn validate_cursor_against(
     Ok(())
 }
 
+/// Check that `query`'s cursor, if it has one, continues the listing `query`
+/// asks for.
+///
+/// The filter half of [`validate_cursor_against`], with the hash taken from
+/// [`ODataQuery::effective_filter_hash`] instead of from the caller, so a pager
+/// that mints its cursors with that same hash cannot disagree with the check.
+/// A cursor that recorded a hash is refused when the query omits its filter or
+/// sends a different one; a cursor that recorded none is accepted, as in
+/// [`validate_cursor_against`].
+///
+/// # Errors
+/// Returns `Error::FilterMismatch` if the query's filter is not the one the
+/// cursor recorded.
+pub fn check_cursor_filter(query: &ODataQuery) -> Result<(), Error> {
+    match query.cursor.as_ref().and_then(|cursor| cursor.f.as_deref()) {
+        Some(recorded) if query.effective_filter_hash().as_deref() != Some(recorded) => {
+            Err(Error::FilterMismatch)
+        }
+        _ => Ok(()),
+    }
+}
+
 // Cursor v1
 #[derive(Clone, Debug)]
 pub struct CursorV1 {
@@ -522,6 +544,20 @@ impl ODataQuery {
     #[must_use]
     pub fn filter(&self) -> Option<&ast::Expr> {
         self.filter.as_deref()
+    }
+
+    /// The filter hash a cursor minted for this query records, and the one a
+    /// cursor continuing it must match.
+    ///
+    /// The stamped [`filter_hash`](Self::filter_hash) when there is one (the
+    /// REST extractor stamps it); otherwise, for a query built in-process, the
+    /// hash of its `$filter`, computed the same way. `None` only for a query
+    /// with neither.
+    #[must_use]
+    pub fn effective_filter_hash(&self) -> Option<String> {
+        self.filter_hash
+            .clone()
+            .or_else(|| pagination::short_filter_hash(self.filter.as_deref()))
     }
 
     /// Check if filter is present
