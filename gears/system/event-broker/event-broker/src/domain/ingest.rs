@@ -412,6 +412,7 @@ where
             })?;
 
         subject_type_allowed(&event_type, request.subject_type.as_ref())?;
+        trace_parent_valid(request.trace_parent.as_deref())?;
 
         // A chained/monotonic publish names a registered producer. Resolve it
         // before running the chain check so an unknown `producer_id` - never
@@ -818,6 +819,24 @@ fn subject_type_allowed(event_type: &EventType, subject_type: &str) -> Result<()
                 event_type.id
             ),
         })
+    }
+}
+
+/// `trace_parent`, when present, must be a W3C Trace Context version-`00`
+/// `traceparent` (`DESIGN.md` §3.1, `400 InvalidTraceParent`): consumers seed
+/// their span parent from it, so a malformed value is refused at the edge
+/// rather than stored and handed to every consumer. Absent is fine.
+fn trace_parent_valid(trace_parent: Option<&str>) -> Result<(), DomainError> {
+    match trace_parent {
+        Some(value) if !toolkit_trace_context::is_valid_traceparent(value) => {
+            Err(DomainError::Validation {
+                code: ErrorCode::InvalidTraceParent,
+                message: "trace_parent must be a W3C traceparent \
+                          (00-<32 hex trace-id>-<16 hex parent-id>-<2 hex flags>)"
+                    .to_owned(),
+            })
+        }
+        _ => Ok(()),
     }
 }
 

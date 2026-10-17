@@ -1591,3 +1591,71 @@ async fn publish_event_envelope_encoding_is_checked_before_event_type_lookup() {
         )
     );
 }
+
+/// A publish whose `trace_parent` is set to `value`, against a one-type catalog.
+async fn publish_with_trace_parent(value: serde_json::Value) -> crate::test_support::TestResponse {
+    let harness = EventBrokerHarness::builder()
+        .with_type_registry(StaticTypesRegistry::of(json!([
+            { "id": "gts.cf.core.events.topic.v1~x.eb.tp.topic.v1", "partitions": 1 },
+            {
+                "id": "gts.cf.core.events.event.v1~x.eb.tp.foo.v1~",
+                "topic": "gts.cf.core.events.topic.v1~x.eb.tp.topic.v1",
+                "allowed_subject_types": ["gts.x.eb.tp.subject.v1~"],
+            },
+        ])))
+        .build()
+        .await;
+
+    harness
+        .api_v1()
+        .post_events()
+        .with_body(Json(&json!({
+            "id": Uuid::new_v4(),
+            "type": "gts.cf.core.events.event.v1~x.eb.tp.foo.v1~",
+            "tenant_id": Uuid::new_v4(),
+            "source": "test-trace-parent",
+            "subject": "s-trace-parent",
+            "subject_type": "gts.x.eb.tp.subject.v1~",
+            "occurred_at": Utc::now().to_rfc3339(),
+            "trace_parent": value,
+        })))
+        .send()
+        .await
+}
+
+/// A W3C version-00 `traceparent` is accepted.
+#[tokio::test]
+async fn publish_event_with_valid_trace_parent_returns_202() {
+    let resp = publish_with_trace_parent(json!(
+        "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"
+    ))
+    .await;
+    resp.assert_status(202);
+}
+
+/// A malformed `traceparent` is refused at the edge (`DESIGN.md` §3.1) rather
+/// than stored and handed to every consumer to parent its spans on.
+#[tokio::test]
+async fn publish_event_with_malformed_trace_parent_returns_400() {
+    for value in [
+        "not-a-traceparent",
+        // all-zero trace-id is invalid per W3C
+        "00-00000000000000000000000000000000-b7ad6b7169203331-01",
+        // uppercase is not the lowercase wire form
+        "00-0AF7651916CD43DD8448EB211C80319C-b7ad6b7169203331-01",
+        // short parent-id
+        "00-0af7651916cd43dd8448eb211c80319c-b7ad6b71692033-01",
+    ] {
+        let resp = publish_with_trace_parent(json!(value)).await;
+        resp.assert_status(400);
+        let body = resp.json();
+        assert!(
+            body["detail"]
+                .as_str()
+                .unwrap()
+                .starts_with("InvalidTraceParent:"),
+            "{value}: detail must start with 'InvalidTraceParent:', got: {}",
+            body["detail"]
+        );
+    }
+}
