@@ -7,13 +7,16 @@
 //! omitted on `SQLite`, whose writers serialize) is taken on the plain select
 //! before the secure layer scopes it.
 
-use sea_orm::sea_query::{Condition, Expr, ExprTrait, LockType};
-use sea_orm::{ColumnTrait, EntityTrait, FromQueryResult, Order, QueryFilter, QuerySelect};
+use sea_orm::sea_query::{Condition, Expr, ExprTrait};
+use sea_orm::{
+    ColumnTrait, EntityTrait, FromQueryResult, Order, QueryFilter, QueryOrder, QuerySelect,
+};
 use time::OffsetDateTime;
 use toolkit_db::secure::{DBRunner, ScopeError, SecureEntityExt, SecureUpdateExt, secure_insert};
 use toolkit_security::AccessScope;
 use uuid::Uuid;
 
+use super::RowWait;
 use crate::infra::storage::entity::quota::{self, Column, Entity};
 use crate::infra::storage::quota_mapping::{QuotaUpdate, STATUS_ACTIVE, STATUS_DEACTIVATED};
 
@@ -68,7 +71,8 @@ pub async fn insert(
     secure_insert::<Entity>(row, scope, runner).await
 }
 
-/// The row with `id` inside `scope`, locked for update when `lock` is set.
+/// The row with `id` inside `scope`: unlocked for `None`, otherwise locked for
+/// update with the given behaviour on a held row.
 ///
 /// # Errors
 ///
@@ -77,12 +81,13 @@ pub async fn find_by_id(
     runner: &impl DBRunner,
     scope: &AccessScope,
     id: Uuid,
-    lock: bool,
+    lock: Option<RowWait>,
 ) -> Result<Option<quota::Model>, ScopeError> {
-    let mut select = Entity::find().filter(Column::Id.eq(id));
-    if lock {
-        select = select.lock(LockType::Update);
-    }
+    let select = Entity::find().filter(Column::Id.eq(id));
+    let select = match lock {
+        Some(wait) => wait.apply(select),
+        None => select,
+    };
     select.secure().scope_with(scope).one(runner).await
 }
 
@@ -295,4 +300,45 @@ pub async fn count_active_cap_unbounded(runner: &impl DBRunner) -> Result<u64, S
         )
         .count(runner)
         .await
+}
+
+/// Ids of the active Quotas that apply to one operation: the tenant's Quotas
+/// on `metric` whose bound subject is one of `subjects`, ascending by id.
+///
+/// The read takes no lock. Ids come back in acquisition order (ADR-0002) and
+/// the caller locks them one by one in that order, which is what keeps two
+/// operations over overlapping Quota sets from deadlocking.
+///
+/// # Errors
+///
+/// The scope or database error of the read.
+pub async fn find_applicable_ids(
+    runner: &impl DBRunner,
+    scope: &AccessScope,
+    tenant_id: Uuid,
+    metric: &str,
+    subjects: &[(String, String)],
+) -> Result<Vec<Uuid>, ScopeError> {
+    if subjects.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut pairs = Condition::any();
+    for (projection_type, subject_id) in subjects {
+        pairs = pairs.add(
+            Condition::all()
+                .add(Column::ProjectionType.eq(projection_type.as_str()))
+                .add(Column::SubjectId.eq(subject_id.as_str())),
+        );
+    }
+    let rows = Entity::find()
+        .filter(Column::TenantId.eq(tenant_id))
+        .filter(Column::Metric.eq(metric))
+        .filter(Column::Status.eq(STATUS_ACTIVE))
+        .filter(pairs)
+        .order_by(Column::Id, Order::Asc)
+        .secure()
+        .scope_with(scope)
+        .all(runner)
+        .await?;
+    Ok(rows.into_iter().map(|row| row.id).collect())
 }
