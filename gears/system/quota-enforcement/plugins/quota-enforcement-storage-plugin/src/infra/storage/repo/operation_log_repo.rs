@@ -1,9 +1,9 @@
 //! `qe_operation_log`: append-only, in the mutation's transaction.
 
 use sea_orm::sea_query::Condition;
-use sea_orm::{ActiveValue, ColumnTrait, EntityTrait};
+use sea_orm::{ActiveValue, ColumnTrait, EntityTrait, QueryFilter, QuerySelect};
 use time::OffsetDateTime;
-use toolkit_db::secure::{DBRunner, ScopeError, SecureEntityExt, secure_insert};
+use toolkit_db::secure::{DBRunner, ScopeError, SecureDeleteExt, SecureEntityExt, secure_insert};
 use toolkit_security::AccessScope;
 use uuid::Uuid;
 
@@ -81,4 +81,44 @@ pub async fn entries_for_quota(
         .order_by(Column::OccurredAt, sea_orm::Order::Asc)
         .all(runner)
         .await
+}
+
+/// Operation name of a debit.
+pub const OP_DEBIT: &str = "operation.debit";
+/// Operation name of a credit.
+pub const OP_CREDIT: &str = "operation.credit";
+/// Operation name of a rollback.
+pub const OP_ROLLBACK: &str = "operation.rollback";
+
+/// Delete up to `batch_size` entries older than `before`.
+///
+/// # Errors
+///
+/// The scope or database error of the delete.
+pub async fn reclaim_before(
+    runner: &impl DBRunner,
+    scope: &AccessScope,
+    batch_size: u32,
+    before: OffsetDateTime,
+) -> Result<u64, ScopeError> {
+    let doomed: Vec<Uuid> = Entity::find()
+        .filter(Column::OccurredAt.lt(before))
+        .limit(u64::from(batch_size))
+        .secure()
+        .scope_with(scope)
+        .all(runner)
+        .await?
+        .into_iter()
+        .map(|row| row.id)
+        .collect();
+    if doomed.is_empty() {
+        return Ok(0);
+    }
+    let affected = Entity::delete_many()
+        .filter(Column::Id.is_in(doomed))
+        .secure()
+        .scope_with(scope)
+        .exec(runner)
+        .await?;
+    Ok(affected.rows_affected)
 }
