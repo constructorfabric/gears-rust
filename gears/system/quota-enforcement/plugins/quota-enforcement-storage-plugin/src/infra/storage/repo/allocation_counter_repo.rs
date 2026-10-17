@@ -3,13 +3,13 @@
 //! Lock order is Quota row, then its counter rows (ADR-0002); the lease and
 //! consumption features keep it.
 
-use sea_orm::sea_query::LockType;
-use sea_orm::{ActiveValue, ColumnTrait, EntityTrait, QueryFilter, QuerySelect};
+use sea_orm::{ActiveValue, ColumnTrait, EntityTrait, QueryFilter};
 use time::OffsetDateTime;
 use toolkit_db::secure::{DBRunner, ScopeError, SecureEntityExt, secure_insert};
 use toolkit_security::AccessScope;
 use uuid::Uuid;
 
+use super::RowWait;
 use crate::infra::storage::entity::quota_allocation_counter::{self, Column, Entity};
 
 /// The counter row a new allocation Quota starts with: nothing in flight.
@@ -29,6 +29,7 @@ pub async fn insert_initial(
             quota_id: ActiveValue::Set(quota_id),
             tenant_id: ActiveValue::Set(tenant_id),
             in_flight: ActiveValue::Set(0),
+            highest_crossed_threshold_pct: ActiveValue::Set(None),
             record_version: ActiveValue::Set(1),
             updated_at: ActiveValue::Set(now),
         },
@@ -48,10 +49,10 @@ pub async fn read_in_flight_for_update(
     runner: &impl DBRunner,
     scope: &AccessScope,
     quota_id: Uuid,
+    wait: RowWait,
 ) -> Result<Option<i64>, ScopeError> {
-    let row = Entity::find()
-        .filter(Column::QuotaId.eq(quota_id))
-        .lock(LockType::Update)
+    let row = wait
+        .apply(Entity::find().filter(Column::QuotaId.eq(quota_id)))
         .secure()
         .scope_with(scope)
         .one(runner)

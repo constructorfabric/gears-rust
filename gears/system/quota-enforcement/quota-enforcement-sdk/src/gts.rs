@@ -38,11 +38,8 @@ pub const OPERATION_RESOURCE: &str = gts_id!("cf.core.qe.operation.v1~");
 // Projection contract bases (ADR-0007)
 // ---------------------------------------------------------------------------
 
-// The bases an owner derives its contracts from: one subject projection per
-// scope (`inst-pub-author`), one request contract per metric with its attached
-// constraint contract (`inst-pub-attrs`), and an optional resource projection
-// (`inst-pub-res`). The reviewed llm_gateway examples under
-// `docs/schemas/examples` are the worked owner side of each.
+// Owners derive subject, request/constraint, and optional resource contracts
+// from these bases.
 
 // @cpt-begin:cpt-cf-quota-enforcement-flow-owner-projection-publication:p1:inst-pub-author
 /// Abstract base of the owner-published subject projections. Its required
@@ -193,9 +190,22 @@ inventory::submit! {
 )]
 pub struct QuotaEnforcementStoragePluginSpecV1;
 
-// Singleton coordination has no plugin spec: the gear consumes the platform
-// `cluster` gear's leader election, and the operator selects its backend in the
-// cluster profile YAML (ADR-0006).
+/// GTS plugin specification for notification sinks. Unlike storage, every
+/// registered instance of every vendor receives every event.
+///
+/// Instance id shape:
+/// `gts.cf.toolkit.plugins.plugin.v1~cf.core.qe.notification_sink.v1~<vendor>.<pkg>.<ns>.<name>.v1`
+#[derive(Default)]
+#[gts_type_schema(
+    dir_path = "schemas",
+    base = PluginV1,
+    type_id = gts_id!("cf.toolkit.plugins.plugin.v1~cf.core.qe.notification_sink.v1~"),
+    description = "Quota Enforcement notification sink specification",
+    properties = "",
+)]
+pub struct QuotaNotificationSinkSpecV1;
+
+// Coordination uses the platform cluster profile rather than a plugin spec.
 
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
