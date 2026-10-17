@@ -9,8 +9,10 @@
 //! request has produced it.
 
 use serde_json::{Value, json};
+use uuid::Uuid;
 
-use crate::test_support::RestHarness;
+use crate::domain::access::TenantAccess;
+use crate::test_support::{BOOL, RestHarness};
 
 const CATEGORIES: &str = "/settings-service/v1/categories";
 
@@ -621,4 +623,170 @@ async fn an_update_naming_no_field_is_refused_and_moves_nothing() {
         Some(tag.as_str()),
         "the tag did not move"
     );
+}
+
+// ── Counts ───────────────────────────────────────────────────────────────────
+
+/// The category with `key` on a listing body.
+fn category<'a>(body: &'a Value, key: &str) -> &'a Value {
+    body["items"]
+        .as_array()
+        .expect("a page")
+        .iter()
+        .find(|c| c["key"] == json!(key))
+        .unwrap_or_else(|| panic!("category `{key}` on the page: {body}"))
+}
+
+/// A billing category holding four settings: a standard one, an advanced
+/// one, a retired one, and one hidden from tenant `a`.
+async fn billing_with_four(h: &RestHarness) -> Uuid {
+    let billing = h.inner.add_category("billing").await;
+    for name in ["plain", "deep", "old", "concealed"] {
+        let id = h
+            .inner
+            .declare_in(billing, name, "cascading", json!(true), BOOL, "public")
+            .await;
+        match name {
+            "deep" => h.inner.tag_advanced(id).await,
+            "old" => h.inner.retire(id).await,
+            "concealed" => {
+                h.restrict(id, h.inner.tree.a, TenantAccess::Hidden).await;
+            }
+            _ => {}
+        }
+    }
+    billing
+}
+
+#[tokio::test]
+async fn the_listing_counts_each_categorys_settings_as_the_caller_sees_them() {
+    // The rail shows a number beside each category, and the number has to
+    // agree with the table under it: every setting the caller's browse of
+    // the category lists, whatever its status, split into the advanced ones
+    // a console folds away and the retired ones it marks.
+    let h = RestHarness::new().await;
+    let billing = billing_with_four(&h).await;
+
+    let (status, body) = h.get(CATEGORIES, h.inner.tree.root).await;
+    assert_eq!(status, 200, "{body}");
+    let row = category(&body, "billing");
+    assert_eq!(row["setting_count"], json!(4), "{row}");
+    assert_eq!(row["advanced_count"], json!(1), "{row}");
+    assert_eq!(row["retired_count"], json!(1), "{row}");
+    // The harness's own category holds nothing: zeros, not an absent count.
+    let empty = category(&body, "network");
+    assert_eq!(empty["setting_count"], json!(0), "{empty}");
+    assert_eq!(empty["advanced_count"], json!(0), "{empty}");
+    assert_eq!(empty["retired_count"], json!(0), "{empty}");
+
+    // A setting hidden from tenant `a` is absent from its count as it is
+    // absent from its browse — and the two agree.
+    let (status, body) = h.get(CATEGORIES, h.inner.tree.a).await;
+    assert_eq!(status, 200, "{body}");
+    let row = category(&body, "billing");
+    assert_eq!(
+        row["setting_count"],
+        json!(3),
+        "hidden one not counted: {row}"
+    );
+    assert_eq!(row["advanced_count"], json!(1), "{row}");
+    assert_eq!(row["retired_count"], json!(1), "{row}");
+    let browse = h
+        .items(
+            &format!("/settings-service/v1/settings?$filter=category_id%20eq%20{billing}"),
+            h.inner.tree.a,
+        )
+        .await;
+    assert_eq!(browse.len(), 3, "the table under the rail: {browse:?}");
+}
+
+#[tokio::test]
+async fn a_single_read_carries_the_same_counts_as_the_listing() {
+    let h = RestHarness::new().await;
+    let billing = billing_with_four(&h).await;
+
+    let (status, body) = h
+        .get(&format!("{CATEGORIES}/{billing}"), h.inner.tree.a)
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["setting_count"], json!(3), "{body}");
+    assert_eq!(body["advanced_count"], json!(1), "{body}");
+    assert_eq!(body["retired_count"], json!(1), "{body}");
+}
+
+#[tokio::test]
+async fn a_caller_without_the_value_read_gets_the_categories_and_no_counts() {
+    // A count is an aggregate over settings and is gated as they are: a
+    // caller that may not open any table under the rail is given the rail
+    // without numbers, not numbers for what it cannot open.
+    let h = RestHarness::without_value_read().await;
+    let billing = billing_with_four(&h).await;
+
+    let (status, body) = h.get(CATEGORIES, h.inner.tree.root).await;
+    assert_eq!(status, 200, "{body}");
+    let row = category(&body, "billing");
+    for field in ["setting_count", "advanced_count", "retired_count"] {
+        assert!(
+            row.get(field).is_none(),
+            "no `{field}` for this caller: {row}"
+        );
+    }
+    // The total of categories is not a count of settings and stays.
+    assert_eq!(body["page_info"]["total_count"], json!(2), "{body}");
+
+    let (status, body) = h
+        .get(&format!("{CATEGORIES}/{billing}"), h.inner.tree.root)
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert!(body.get("setting_count").is_none(), "{body}");
+
+    // And the table itself is refused, as it was.
+    let (status, _) = h
+        .get(
+            &format!("/settings-service/v1/settings?$filter=category_id%20eq%20{billing}"),
+            h.inner.tree.root,
+        )
+        .await;
+    assert_eq!(status, 403);
+}
+
+#[tokio::test]
+async fn the_listing_total_is_the_whole_set_not_the_page() {
+    // A cursor says there is more; the total says how much. It is counted
+    // under the page's own filter and never under its cursor, so every page
+    // of one walk reports the same number.
+    let h = RestHarness::new().await;
+    create(&h, "billing", "Invoices").await;
+    create(&h, "logging", "Logging").await;
+    create(&h, "storage", "Storage").await;
+
+    let (status, first) = h
+        .get(&format!("{CATEGORIES}?limit=2"), h.inner.tree.root)
+        .await;
+    assert_eq!(status, 200, "{first}");
+    assert_eq!(first["items"].as_array().map(Vec::len), Some(2));
+    // Three created plus the harness's `network`.
+    assert_eq!(first["page_info"]["total_count"], json!(4), "{first}");
+    let cursor = first["page_info"]["next_cursor"]
+        .as_str()
+        .expect("more pages")
+        .to_owned();
+
+    let (status, second) = h
+        .get(
+            &format!("{CATEGORIES}?limit=2&cursor={cursor}"),
+            h.inner.tree.root,
+        )
+        .await;
+    assert_eq!(status, 200, "{second}");
+    assert_eq!(second["page_info"]["total_count"], json!(4), "{second}");
+
+    let (status, filtered) = h
+        .get(
+            &format!("{CATEGORIES}?$filter=key%20eq%20'billing'"),
+            h.inner.tree.root,
+        )
+        .await;
+    assert_eq!(status, 200, "{filtered}");
+    assert_eq!(filtered["page_info"]["total_count"], json!(1), "{filtered}");
 }

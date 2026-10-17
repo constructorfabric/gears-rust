@@ -18,11 +18,12 @@ use toolkit_macros::domain_model;
 use toolkit_security::AccessScope;
 use uuid::Uuid;
 
-use toolkit_odata::{ODataQuery, Page};
+use toolkit_odata::ODataQuery;
 
 use super::CategoryKey;
 use super::visibility::DomainVisibility;
 use crate::domain::error::DomainError;
+use crate::domain::odata::Listing;
 
 /// A category as the domain sees it.
 #[domain_model]
@@ -206,6 +207,7 @@ pub trait CategoryRepository: Send + Sync {
     /// pages and a cursor that skips rows the caller was entitled to.
     ///
     /// Ordered by `sort_order` then `name` so the cursor is deterministic.
+    /// The listing carries the size of the whole filtered set.
     ///
     /// # Errors
     /// [`DomainError::Validation`] when the query references an unmapped field
@@ -216,7 +218,7 @@ pub trait CategoryRepository: Send + Sync {
         scope: &AccessScope,
         visibility: &DomainVisibility,
         query: &ODataQuery,
-    ) -> Result<Page<Category>, DomainError>;
+    ) -> Result<Listing<Category>, DomainError>;
 
     /// Whether any declaration still references this category.
     ///

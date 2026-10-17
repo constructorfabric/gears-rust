@@ -1368,9 +1368,24 @@ impl DeclarationRepository for JournalingDeclarations {
         visibility: &crate::domain::category::visibility::DomainVisibility,
         hidden_for: &[Uuid],
         query: &toolkit_odata::ODataQuery,
-    ) -> Result<toolkit_odata::Page<Declaration>, crate::domain::error::DomainError> {
+    ) -> Result<crate::domain::odata::Listing<Declaration>, crate::domain::error::DomainError> {
         DeclarationRepo
             .list(conn, scope, visibility, hidden_for, query)
+            .await
+    }
+    async fn tally_by_category<C: toolkit_db::secure::DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        visibility: &crate::domain::category::visibility::DomainVisibility,
+        hidden_for: &[Uuid],
+        category_ids: &[Uuid],
+    ) -> Result<
+        std::collections::HashMap<Uuid, crate::domain::declaration::CategoryTally>,
+        crate::domain::error::DomainError,
+    > {
+        DeclarationRepo
+            .tally_by_category(conn, scope, visibility, hidden_for, category_ids)
             .await
     }
 }

@@ -1,26 +1,30 @@
 // Created: 2026-08-26 by Virtuozzo International GmbH
 //! Persistence for declarations.
 
+use std::collections::HashMap;
+
 use async_trait::async_trait;
 use sea_orm::sea_query::{Expr, Query};
 use sea_orm::{ActiveValue::Set, ColumnTrait, EntityTrait, ExprTrait, QueryFilter, QuerySelect};
-use toolkit_db::odata::{LimitCfg, paginate_odata};
+use toolkit_db::odata::LimitCfg;
 use toolkit_db::secure::{DBRunner, SecureEntityExt, SecureUpdateExt};
-use toolkit_odata::{ODataQuery, Page, SortDir};
+use toolkit_odata::{ODataQuery, SortDir};
 use toolkit_security::AccessScope;
 use uuid::Uuid;
 
 use crate::domain::access::TenantAccess;
 use crate::domain::category::visibility::DomainVisibility;
 use crate::domain::declaration::{
-    Declaration, DeclarationDraft, DeclarationMetadata, DeclarationRepository,
+    CategoryTally, Declaration, DeclarationDraft, DeclarationMetadata, DeclarationRepository,
 };
 use crate::domain::error::DomainError;
+use crate::domain::odata::Listing;
 use crate::domain::precondition;
 use crate::infra::storage::clock::{now, stamp_after};
 use crate::infra::storage::declaration_odata_mapper::DeclarationODataMapper;
 use crate::infra::storage::entity::declaration::{self, Entity as DeclarationEntity};
 use crate::infra::storage::entity::tenant_permission;
+use crate::infra::storage::listing::list_counted;
 use settings_service_sdk::odata::DeclarationFilterField;
 
 /// Page bounds for declaration listings.
@@ -413,19 +417,19 @@ impl DeclarationRepository for DeclarationRepo {
         visibility: &DomainVisibility,
         hidden_for: &[Uuid],
         query: &ODataQuery,
-    ) -> Result<Page<Declaration>, DomainError> {
+    ) -> Result<Listing<Declaration>, DomainError> {
         // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-read:p1:inst-decl-read-6
         let base = exclude_hidden_for(
             apply_visibility(DeclarationEntity::find(), visibility),
             hidden_for,
-        )
-        .secure()
-        .scope_with(scope);
+        );
 
         // Tiebreaker is `key`, which `uq_declaration_key` makes unique, so a
-        // page boundary can neither repeat nor skip a row.
-        let page = paginate_odata::<DeclarationFilterField, DeclarationODataMapper, _, _, _, _>(
+        // page boundary can neither repeat nor skip a row. The total beside
+        // the page is counted under the same base and the same `$filter`.
+        let page = list_counted::<DeclarationFilterField, DeclarationODataMapper, _, _, _, _>(
             base,
+            scope,
             conn,
             query,
             ("key", SortDir::Asc),
@@ -440,9 +444,72 @@ impl DeclarationRepository for DeclarationRepo {
         })?;
         // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-read:p1:inst-decl-read-6
 
-        Ok(Page {
+        Ok(Listing {
             items: page.items.into_iter().map(to_domain).collect(),
             page_info: page.page_info,
+            total_count: page.total_count,
         })
     }
+
+    async fn tally_by_category<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        visibility: &DomainVisibility,
+        hidden_for: &[Uuid],
+        category_ids: &[Uuid],
+    ) -> Result<HashMap<Uuid, CategoryTally>, DomainError> {
+        if category_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        // The same base as `list`, so a category's count is the length of
+        // the browse of it: the caller's scope, its domain visibility and the
+        // settings hidden from it, all in the query. One statement for the
+        // whole page of categories, grouped by what the tally splits on — at
+        // most four rows per category, folded here — rather than a count per
+        // category per facet.
+        let rows = exclude_hidden_for(
+            apply_visibility(DeclarationEntity::find(), visibility),
+            hidden_for,
+        )
+        .filter(declaration::Column::CategoryId.is_in(category_ids.iter().copied()))
+        .secure()
+        .scope_with(scope)
+        .project_all(conn, |q| {
+            q.select_only()
+                .column(declaration::Column::CategoryId)
+                .column(declaration::Column::Mode)
+                .column(declaration::Column::Status)
+                .column_as(Expr::col(declaration::Column::Id).count(), "n")
+                .group_by(declaration::Column::CategoryId)
+                .group_by(declaration::Column::Mode)
+                .group_by(declaration::Column::Status)
+                .into_model::<TallyRow>()
+        })
+        .await
+        .map_err(db_error)?;
+        let mut tallies: HashMap<Uuid, CategoryTally> = HashMap::new();
+        for row in rows {
+            let n = u64::try_from(row.n).unwrap_or_default();
+            let tally = tallies.entry(row.category_id).or_default();
+            tally.settings += n;
+            if row.mode == "advanced" {
+                tally.advanced += n;
+            }
+            if row.status == "retired" {
+                tally.retired += n;
+            }
+        }
+        Ok(tallies)
+    }
+}
+
+/// One group of the tally: the declarations of a category sharing a mode and
+/// a status, and how many there are.
+#[derive(Debug, sea_orm::FromQueryResult)]
+struct TallyRow {
+    category_id: Uuid,
+    mode: String,
+    status: String,
+    n: i64,
 }

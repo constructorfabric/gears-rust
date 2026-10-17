@@ -49,6 +49,9 @@ pub struct SearchPage {
     pub hits: Vec<Hit>,
     /// The cursors of the underlying page of settings.
     pub page_info: PageInfo,
+    /// How many settings match in all — settings, not hits: the walk pages
+    /// settings, and a setting's hits travel with it.
+    pub total_count: u64,
 }
 
 /// The service.
@@ -172,6 +175,7 @@ impl<R: SearchRepository> SearchService<R> {
         Ok(SearchPage {
             hits,
             page_info: page.page_info,
+            total_count: page.total_count,
         })
     }
 }

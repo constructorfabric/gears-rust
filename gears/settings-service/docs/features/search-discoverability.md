@@ -1,5 +1,5 @@
 <!-- Created: 2026-09-17 by Virtuozzo International GmbH -->
-<!-- Updated: 2026-09-23 by Virtuozzo International GmbH -->
+<!-- Updated: 2026-10-08 by Virtuozzo International GmbH -->
 
 # Feature: Search & Discoverability
 
@@ -92,7 +92,7 @@ Search runs over stored rows, not resolved values. An inherited value is a hit a
 8. [x] - `p2` - DB: SELECT the overrides of the page's declarations at the bounded tenants whose text projection matches, within the corpus and never a secret row, one row past the override bound; **IF** more than the bound matched → **RETURN** `400` naming the bound, so a page is never cut short of its hits - `inst-sd-search-8`
 9. [x] - `p2` - Attribute each declaration-level match to the first field that matched — key, description, category name, Schema Default — and emit one hit per matching override naming the tenant and scope where it is set - `inst-sd-search-9`
 10. [x] - `p2` - Exclude every hit whose declaration is `hidden` for the caller, silently, exactly as browse excludes it — in the page query, on the caller's root-to-self chain, so the page is cut after the exclusion and comes back full - `inst-sd-search-10`
-11. [x] - `p2` - **RETURN** `200` with the flat list — each hit carrying its category, its matched field, its declaration's `mode` as a tag, and, where a value matched, that value masked by classification — and the page cursors - `inst-sd-search-11`
+11. [x] - `p2` - **RETURN** `200` with the flat list — each hit carrying its category, its matched field, its declaration's `mode` as a tag, and, where a value matched, that value masked by classification — the page cursors, and `page_info.total_count`, the settings that match in all under the same corpus, filter and exclusions as the page - `inst-sd-search-11`
 
 ## 3. Processes / Business Logic (CDSL)
 

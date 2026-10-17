@@ -1,5 +1,5 @@
 <!-- Created: 2026-08-10 by Virtuozzo International GmbH -->
-<!-- Updated: 2026-09-23 by Virtuozzo International GmbH -->
+<!-- Updated: 2026-10-08 by Virtuozzo International GmbH -->
 
 # Feature: Category Management
 
@@ -33,6 +33,7 @@
   - [Authorization on Category Operations](#authorization-on-category-operations)
   - [Optimistic Concurrency on Mutations](#optimistic-concurrency-on-mutations)
   - [Category Mutation Audit](#category-mutation-audit)
+  - [Category Setting Counts](#category-setting-counts)
 - [6. Acceptance Criteria](#6-acceptance-criteria)
 
 <!-- /toc -->
@@ -41,7 +42,7 @@
 
 ### 1.1 Overview
 
-Category Management provides the flat taxonomy every setting declaration is filed under: create, get, list, update, and delete over a `Category` entity with globally unique `key` and `name`, and a no-orphan deletion rule that refuses to remove a category while any declaration still references it.
+Category Management provides the flat taxonomy every setting declaration is filed under: create, get, list, update, and delete over a `Category` entity with globally unique `key` and `name`, a no-orphan deletion rule that refuses to remove a category while any declaration still references it, and on every read the caller's count of the settings each category holds.
 
 ### 1.2 Purpose
 
@@ -60,7 +61,7 @@ The no-orphan rule protects the invariant that no declaration is ever left point
 | Actor | Role in Feature |
 |-------|-----------------|
 | `cpt-cf-settings-service-actor-platform-admin` | Creates, updates, and deletes categories; category governance is platform-level, not tenant-level |
-| `cpt-cf-settings-service-actor-tenant-admin` | Reads and lists categories, subject to domain filtering and the visibility gate |
+| `cpt-cf-settings-service-actor-tenant-admin` | Reads and lists categories, subject to domain filtering and the visibility gate, each with the count of settings its own browse of the category would list |
 | `cpt-cf-settings-service-actor-authz-resolver` | Supplies the authorization decision and the `AccessScope` constraints applied to reads |
 
 ### 1.4 References
@@ -174,7 +175,7 @@ The no-orphan rule protects the invariant that no declaration is ever left point
 **Actor**: `cpt-cf-settings-service-actor-tenant-admin`
 
 **Success Scenarios**:
-- Category returned with its ETag when visible to the caller
+- Category returned with its ETag when visible to the caller, with the caller's setting counts when it may read values
 
 **Error Scenarios**:
 - Category does not exist, or exists but falls outside the caller's domain or visibility scope
@@ -187,7 +188,8 @@ The no-orphan rule protects the invariant that no declaration is ever left point
 5. [x] - `p1` - **IF** category not found → **RETURN** `404` - `inst-cat-get-5`
 6. [x] - `p1` - Apply the domain and visibility filter to the loaded row - `inst-cat-get-6`
 7. [x] - `p1` - **IF** the category is filtered out → **RETURN** `404` rather than `403`, so a hidden category's existence is not disclosed - `inst-cat-get-7`
-8. [x] - `p1` - **RETURN** `200` with the Category and its ETag - `inst-cat-get-8`
+8. [x] - `p1` - Authorize `read` on the value resource; **IF** allowed → count the category's settings exactly as the listing does, under that decision's constraints, the caller's domain visibility and the `hidden` exclusion on its root-to-self chain, and carry `setting_count`, `advanced_count` and `retired_count`; **ELSE** carry none, since a count of settings is gated as the settings are - `inst-cat-get-9`
+9. [x] - `p1` - **RETURN** `200` with the Category, its counts when carried, and its ETag - `inst-cat-get-8`
 
 ### List Categories
 
@@ -196,7 +198,7 @@ The no-orphan rule protects the invariant that no declaration is ever left point
 **Actor**: `cpt-cf-settings-service-actor-tenant-admin`
 
 **Success Scenarios**:
-- Paginated, domain-filtered, visibility-gated page of categories returned in a stable order
+- Paginated, domain-filtered, visibility-gated page of categories returned in a stable order, each with the caller's setting counts when it may read values, and the total of categories the listing holds
 
 **Error Scenarios**:
 - Unsupported OData filter or ordering expression
@@ -211,7 +213,9 @@ The no-orphan rule protects the invariant that no declaration is ever left point
 6. [x] - `p1` - Derive the domain and visibility predicate from the `AccessScope` constraints - `inst-cat-list-6`
 7. [ ] - `p1` - DB: SELECT categories with the combined predicate applied in the query, ordered by `sort_order` then `name` so the cursor is deterministic - `inst-cat-list-7`
 8. [x] - `p1` - **IF** the supplied cursor is malformed or no longer decodable → **RETURN** `400` - `inst-cat-list-8`
-9. [x] - `p1` - **RETURN** `200` with the page and a next-page cursor when further rows remain - `inst-cat-list-9`
+9. [x] - `p1` - Authorize `read` on the value resource once for the page; **IF** allowed → DB: SELECT, in one grouped statement over the page's categories, the count of declarations per category by `mode` and `status`, under that decision's constraints, the caller's domain visibility and the `hidden` exclusion on its root-to-self chain — the browse's own predicate, so each count equals the browse of its category — and carry `setting_count`, `advanced_count` and `retired_count` on every category, zeros on one holding nothing; **ELSE** (deny, or a decision that cannot be obtained) carry none, since a count of settings is gated as the settings are - `inst-cat-list-10`
+10. [x] - `p1` - Count the categories the whole listing holds under the same predicate as the page, the `$filter` included and the cursor excluded, as `page_info.total_count` - `inst-cat-list-11`
+11. [x] - `p1` - **RETURN** `200` with the page, its counts, `total_count`, and a next-page cursor when further rows remain - `inst-cat-list-9`
 
 ## 3. Processes / Business Logic (CDSL)
 
@@ -380,6 +384,23 @@ The system **MUST** emit an audit record through the Audit Emitter for every suc
 - API: `DELETE /settings-service/v1/categories/{id}`
 - Entities: `Category`
 
+### Category Setting Counts
+
+- [x] `p1` - **ID**: `cpt-cf-settings-service-dod-category-management-counts`
+
+Every category the list and the single read return **MUST** carry `setting_count`, `advanced_count` and `retired_count` for the caller — every declaration the caller's browse of the category would list, whatever its status, and of those the `advanced` and the `retired` ones — counted inside the query under the browse's own predicate: the value `read` decision's constraints, the caller's domain visibility, and the `hidden` exclusion on its root-to-self chain, so the number agrees with the table under it and a setting the caller may not see is in neither. The counts **MUST** be absent, and the read still succeed, for a caller that may not read values. Every listing of the gear **MUST** carry `page_info.total_count`, the size of the filtered set counted without the cursor, except where the items listed are not the set paged.
+
+**Implements**:
+- `cpt-cf-settings-service-flow-category-management-list`
+- `cpt-cf-settings-service-flow-category-management-get`
+
+**Constraints**: `cpt-cf-settings-service-constraint-rbac-policy-enforcer`
+
+**Touches**:
+- API: `GET /settings-service/v1/categories`
+- API: `GET /settings-service/v1/categories/{id}`
+- Entities: `Category`, `SettingDeclaration`, `TenantAccess`
+
 ## 6. Acceptance Criteria
 
 - [ ] Creating a category with unique `key` and `name` returns `201` with an identifier, populated timestamps, and an ETag
@@ -406,6 +427,9 @@ The system **MUST** emit an audit record through the Audit Emitter for every suc
 - [ ] Listing applies the visibility predicate inside the query, so a page is never short by the number of rows filtered out afterwards
 - [ ] Listing with an OData filter on an unmapped field or an unsupported operator returns `400`
 - [ ] Listing with a malformed pagination cursor returns `400`
+- [ ] Every category on the listing and on the single read carries `setting_count`, `advanced_count` and `retired_count` equal to what the caller's browse of the category lists, with a setting hidden from the caller counted in neither, and zeros for a category holding nothing
+- [ ] A caller holding the category `read` but not the value `read` receives `200` with the categories and none of the three counts
+- [ ] `page_info.total_count` is the number of categories the whole listing holds under its filter and is the same on every page of one walk
 - [ ] Every error response is `application/problem+json` carrying `type`, `title`, `status`, and `trace_id`, and every validation failure carries a field-level `errors` array
 - [ ] A category operation whose authorization decision cannot be obtained is denied rather than allowed
 - [ ] Every successful create, update, and delete produces exactly one audit record; the update record names the changed fields with pre-image and post-image, and the delete record carries the pre-image

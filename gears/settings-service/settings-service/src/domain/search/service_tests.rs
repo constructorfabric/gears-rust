@@ -7,7 +7,7 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use serde_json::{Value, json};
 use toolkit_db::secure::DBRunner;
-use toolkit_odata::{ODataQuery, Page, PageInfo};
+use toolkit_odata::{ODataQuery, PageInfo};
 use toolkit_security::AccessScope;
 use uuid::Uuid;
 
@@ -16,6 +16,7 @@ use crate::domain::category::Category;
 use crate::domain::category::visibility::DomainVisibility;
 use crate::domain::declaration::Declaration;
 use crate::domain::error::DomainError;
+use crate::domain::odata::Listing;
 use crate::domain::search::{Corpus, MatchedField, Needle, SearchRepository, SearchRequest};
 use crate::domain::value::StoredValue;
 
@@ -99,14 +100,15 @@ impl SearchRepository for Staged {
         &self,
         _conn: &C,
         _request: &SearchRequest<'_>,
-    ) -> Result<Page<Declaration>, DomainError> {
-        Ok(Page {
+    ) -> Result<Listing<Declaration>, DomainError> {
+        Ok(Listing {
             items: self.declarations.clone(),
             page_info: PageInfo {
                 next_cursor: None,
                 prev_cursor: None,
                 limit: 25,
             },
+            total_count: self.declarations.len() as u64,
         })
     }
 

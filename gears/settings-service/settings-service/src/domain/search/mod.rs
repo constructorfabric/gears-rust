@@ -17,7 +17,7 @@ use toolkit_macros::domain_model;
 use async_trait::async_trait;
 use serde_json::Value;
 use toolkit_db::secure::DBRunner;
-use toolkit_odata::{ODataQuery, Page};
+use toolkit_odata::ODataQuery;
 use toolkit_security::AccessScope;
 use uuid::Uuid;
 
@@ -25,6 +25,7 @@ use crate::domain::category::Category;
 use crate::domain::category::visibility::DomainVisibility;
 use crate::domain::declaration::Declaration;
 use crate::domain::error::DomainError;
+use crate::domain::odata::Listing;
 use crate::domain::value::StoredValue;
 use crate::field;
 
@@ -271,7 +272,8 @@ pub trait SearchRepository: Send + Sync {
     /// never a secret row). The scope and visibility narrow the page as they
     /// narrow browsing; so do the query's `$filter` on `key` and
     /// `category_id`, and `flagged_only`; the query carries `limit`, `cursor`
-    /// and the `filter_hash` the cursor is bound to.
+    /// and the `filter_hash` the cursor is bound to. The listing carries how
+    /// many declarations match in all.
     ///
     /// # Errors
     /// [`DomainError::Validation`] for a cursor that does not decode or was
@@ -281,7 +283,7 @@ pub trait SearchRepository: Send + Sync {
         &self,
         conn: &C,
         request: &SearchRequest<'_>,
-    ) -> Result<Page<Declaration>, DomainError>;
+    ) -> Result<Listing<Declaration>, DomainError>;
 
     /// The overrides of `declaration_ids` set at `tenant_ids` whose text
     /// projection matches `needle`, within `corpus`; never a secret row and

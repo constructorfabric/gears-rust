@@ -1,11 +1,44 @@
 // Created: 2026-08-26 by Virtuozzo International GmbH
-//! Query options this gear declines across every listing, and the fields a
-//! listing orders by.
+//! Query options this gear declines across every listing, the fields a
+//! listing orders by, and the shape every listing answers with.
 
 use toolkit_macros::domain_model;
+use toolkit_odata::PageInfo;
 use toolkit_odata::filter::{FieldKind, FilterField};
 
 use crate::domain::error::DomainError;
+
+/// One page of a listing, with the size of the set it was cut from.
+///
+/// `total_count` is what a client needs that a cursor cannot give it: how
+/// many rows the walk would return in all, for a count beside a heading and
+/// for a scrollbar that is the right length. It is counted under the same
+/// predicate as the page — the caller's scope, the administrative-domain
+/// visibility, the `hidden` exclusion and the `$filter` — and never under the
+/// cursor, so every page of one walk reports the same total; a row the caller
+/// may not see is absent from it as it is absent from the page.
+#[domain_model]
+#[derive(Debug, Clone)]
+pub struct Listing<T> {
+    /// The page.
+    pub items: Vec<T>,
+    /// Its cursors and the page size applied.
+    pub page_info: PageInfo,
+    /// How many rows the whole walk holds, at the time of this read.
+    pub total_count: u64,
+}
+
+impl<T> Listing<T> {
+    /// The same listing with each item mapped — a domain row to its wire
+    /// shape, the cursors and the total untouched.
+    pub fn map_items<U>(self, f: impl FnMut(T) -> U) -> Listing<U> {
+        Listing {
+            items: self.items.into_iter().map(f).collect(),
+            page_info: self.page_info,
+            total_count: self.total_count,
+        }
+    }
+}
 
 /// Refuse the `OData` options no listing here implements.
 ///

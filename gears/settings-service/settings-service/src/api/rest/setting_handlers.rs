@@ -15,6 +15,7 @@ use toolkit_security::{AccessScope, SecurityContext};
 use uuid::Uuid;
 
 use crate::api::authz::{self, resource};
+use crate::api::rest::page_dto::{PageDto, PageInfoDto};
 use crate::api::rest::setting_dto::{
     AuditRecordDto, EffectiveValueDto, SettingItemDto, render, render_flagged, render_record,
 };
@@ -358,9 +359,14 @@ pub async fn browse_settings(
     // @cpt-end:cpt-cf-settings-service-flow-value-resolution-admin-browse:p1:inst-vr-browse-9
 
     // @cpt-begin:cpt-cf-settings-service-flow-value-resolution-admin-browse:p1:inst-vr-browse-10
-    Ok(Json(toolkit_odata::Page {
+    // The total is of the settings the walk pages — counted after the hidden
+    // exclusion as the page is, so it tells the caller nothing the page does
+    // not. Under `needs_review` the items are flagged rows of those settings,
+    // a different set from the one paged, and no total is claimed for them.
+    let total_count = (!filter.needs_review).then_some(page.total_count);
+    Ok(Json(PageDto {
         items,
-        page_info: page.page_info,
+        page_info: PageInfoDto::of(page.page_info, total_count),
     }))
     // @cpt-end:cpt-cf-settings-service-flow-value-resolution-admin-browse:p1:inst-vr-browse-10
 }
@@ -458,9 +464,9 @@ pub async fn get_history(
         .iter()
         .map(|r| render_record(r, values_are_pii, pii))
         .collect();
-    Ok(Json(toolkit_odata::Page {
+    Ok(Json(PageDto {
         items,
-        page_info: page.page_info,
+        page_info: PageInfoDto::of(page.page_info, Some(page.total_count)),
     }))
     // @cpt-end:cpt-cf-settings-service-flow-audit-store-history:p1:inst-as-hist-9
 }

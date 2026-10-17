@@ -63,10 +63,11 @@ pub fn register_routes(
         .query_param_typed("limit", false, "Page size", "integer")
         .query_param("cursor", false, "Cursor for pagination")
         .handler(handlers::browse_settings)
-        .json_response_with_schema::<toolkit_odata::Page<SettingItemDto>>(
+        .json_response_with_schema::<crate::api::rest::page_dto::PageDto<SettingItemDto>>(
             openapi,
             StatusCode::OK,
-            "A page of per-key outcomes with its pagination cursors",
+            "A page of per-key outcomes with its pagination cursors and, except under \
+             `needs_review`, the total of settings the listing holds",
         )
         .with_odata_filter::<SettingFilterField>()
         .with_odata_orderby::<crate::domain::odata::SettingOrderField>()
@@ -142,10 +143,11 @@ pub fn register_routes(
         .query_param_typed("limit", false, "Page size", "integer")
         .query_param("cursor", false, "Cursor for pagination")
         .handler(handlers::get_history)
-        .json_response_with_schema::<toolkit_odata::Page<AuditRecordDto>>(
+        .json_response_with_schema::<crate::api::rest::page_dto::PageDto<AuditRecordDto>>(
             openapi,
             StatusCode::OK,
-            "A page of audit records, newest first, with its pagination cursors",
+            "A page of audit records, newest first, with its pagination cursors and the \
+             total",
         )
         .error_400(openapi)
         .error_401(openapi)
