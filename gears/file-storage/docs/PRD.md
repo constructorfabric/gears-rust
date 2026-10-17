@@ -1314,8 +1314,8 @@ The priority order and the trade-off rule are those of §6.4.
 #### Efficiency
 
 - **Guiding question** — *How quickly and economically can software be built, deployed, and operated?* Content moves
-  between clients, the sidecar and the backend without crossing the control plane; a default upload takes two client
-  requests (multipart: N + 2); Gears call an in-process SDK; storage backends are chosen by configuration.
+  between clients, the sidecar and the backend without crossing the control plane; an upload binds its first content
+  without a separate `bind` request; Gears call an in-process SDK; storage backends are chosen by configuration.
 - **North Star — Total Cost of Ownership (TCO)**: Inherited — cost is modelled at the platform level (§6.2). The gear
   bounds its own cost drivers: bytes transit only the sidecar (`cpt-cf-file-storage-nfr-bandwidth`), memory per
   transfer is bounded by streaming, and cleanup (once a cleanup job exists) is bounded by a time budget.

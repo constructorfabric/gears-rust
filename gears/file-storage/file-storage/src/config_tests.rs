@@ -253,3 +253,233 @@ fn config_default_backend_id_serde_round_trip() {
     let back: FileStorageConfig = serde_json::from_str(&json).unwrap();
     assert_eq!(back.default_backend_id.as_deref(), Some("s3-primary"));
 }
+
+#[test]
+fn default_page_sizes_are_valid_and_within_ceiling() {
+    let cfg = FileStorageConfig::default();
+    assert_eq!(cfg.default_page_size, 25);
+    assert_eq!(cfg.max_page_size, 200);
+    assert!(
+        cfg.max_page_size <= MAX_PAGE_SIZE_CEILING,
+        "the shipped default_max_page_size must not itself exceed the ceiling"
+    );
+}
+
+#[test]
+fn validate_rejects_default_page_size_exceeding_max_page_size() {
+    let cfg = FileStorageConfig {
+        default_page_size: 150,
+        max_page_size: 100,
+        require_signing_key_seed: false,
+        finalize_internal_secret: Some(SecretString::new("test-internal-secret")),
+        ..FileStorageConfig::default()
+    };
+    let err = cfg.validate().expect_err(
+        "default_page_size exceeding max_page_size is a direct self-contradiction \
+         and must be rejected",
+    );
+    assert!(
+        err.to_string().contains("must not exceed max_page_size"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn validate_accepts_default_page_size_equal_to_max_page_size() {
+    let cfg = FileStorageConfig {
+        default_page_size: 100,
+        max_page_size: 100,
+        require_signing_key_seed: false,
+        finalize_internal_secret: Some(SecretString::new("test-internal-secret")),
+        ..FileStorageConfig::default()
+    };
+    assert!(
+        cfg.validate().is_ok(),
+        "default_page_size == max_page_size must be accepted"
+    );
+}
+
+#[test]
+fn validate_accepts_max_page_size_at_ceiling() {
+    let cfg = FileStorageConfig {
+        default_page_size: MAX_PAGE_SIZE_CEILING,
+        max_page_size: MAX_PAGE_SIZE_CEILING,
+        require_signing_key_seed: false,
+        finalize_internal_secret: Some(SecretString::new("test-internal-secret")),
+        ..FileStorageConfig::default()
+    };
+    assert!(
+        cfg.validate().is_ok(),
+        "max_page_size == MAX_PAGE_SIZE_CEILING must be accepted"
+    );
+}
+
+#[test]
+fn validate_rejects_max_page_size_above_ceiling() {
+    let cfg = FileStorageConfig {
+        default_page_size: MAX_PAGE_SIZE_CEILING,
+        max_page_size: MAX_PAGE_SIZE_CEILING + 1,
+        require_signing_key_seed: false,
+        finalize_internal_secret: Some(SecretString::new("test-internal-secret")),
+        ..FileStorageConfig::default()
+    };
+    let err = cfg.validate().expect_err(
+        "max_page_size exceeding MAX_PAGE_SIZE_CEILING must be rejected regardless of what an \
+         operator configures",
+    );
+    assert!(
+        err.to_string().contains("MAX_PAGE_SIZE_CEILING"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn validate_rejects_zero_default_page_size() {
+    let cfg = FileStorageConfig {
+        default_page_size: 0,
+        max_page_size: 100,
+        require_signing_key_seed: false,
+        finalize_internal_secret: Some(SecretString::new("test-internal-secret")),
+        ..FileStorageConfig::default()
+    };
+    let err = cfg
+        .validate()
+        .expect_err("a zero default_page_size must be rejected");
+    assert!(
+        err.to_string().contains("must be at least 1"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn validate_rejects_zero_max_page_size() {
+    let cfg = FileStorageConfig {
+        default_page_size: 25,
+        max_page_size: 0,
+        require_signing_key_seed: false,
+        finalize_internal_secret: Some(SecretString::new("test-internal-secret")),
+        ..FileStorageConfig::default()
+    };
+    let err = cfg
+        .validate()
+        .expect_err("a zero max_page_size must be rejected");
+    assert!(
+        err.to_string().contains("must be at least 1"),
+        "unexpected error: {err}"
+    );
+}
+
+/// Each case sets the key(s) under test on a config that is otherwise valid; `true` = `validate`
+/// must accept it.
+fn assert_validate_cases(cases: Vec<(&str, FileStorageConfig, bool)>) {
+    for (name, cfg, accepted) in cases {
+        let cfg = FileStorageConfig {
+            require_signing_key_seed: false,
+            ..cfg
+        };
+        assert_eq!(
+            cfg.validate().is_ok(),
+            accepted,
+            "{name}: expected {}",
+            if accepted { "accepted" } else { "rejected" }
+        );
+    }
+}
+
+#[test]
+fn finalize_grace_session_ttl_and_complete_lease_defaults_and_overrides() {
+    let cfg = FileStorageConfig::default();
+    assert_eq!(cfg.finalize_token_grace_secs, 3600);
+    assert_eq!(cfg.multipart_session_ttl_secs, 86400);
+    assert!(
+        cfg.multipart_session_ttl_secs > cfg.default_url_ttl_secs,
+        "the stock session lifetime must outlive the per-part URL TTL"
+    );
+    assert!(cfg.multipart_session_ttl_secs <= MAX_MULTIPART_SESSION_TTL_SECS);
+    assert_eq!(cfg.multipart_complete_lease_secs, 120);
+    assert!(cfg.multipart_complete_lease_secs <= MAX_MULTIPART_COMPLETE_LEASE_SECS);
+
+    let cfg: FileStorageConfig = serde_json::from_str(
+        r#"{"finalize_token_grace_secs": 0, "multipart_session_ttl_secs": 3600,
+            "multipart_complete_lease_secs": 30}"#,
+    )
+    .unwrap();
+    assert_eq!(cfg.finalize_token_grace_secs, 0);
+    assert_eq!(cfg.multipart_session_ttl_secs, 3600);
+    assert_eq!(cfg.multipart_complete_lease_secs, 30);
+}
+
+// Guards the saturating `i64` conversion: an unbounded grace would become `i64::MAX` seconds.
+#[test]
+fn validate_finalize_token_grace_bounds() {
+    let with_grace = |secs| FileStorageConfig {
+        finalize_token_grace_secs: secs,
+        ..cfg_with_secret()
+    };
+    assert_validate_cases(vec![
+        (
+            "grace at MAX",
+            with_grace(MAX_FINALIZE_TOKEN_GRACE_SECS),
+            true,
+        ),
+        (
+            "grace above MAX",
+            with_grace(MAX_FINALIZE_TOKEN_GRACE_SECS + 1),
+            false,
+        ),
+        ("zero grace (disabled)", with_grace(0), true),
+    ]);
+}
+
+#[test]
+fn validate_multipart_session_ttl_bounds() {
+    let with_ttl = |url_ttl, session_ttl| FileStorageConfig {
+        default_url_ttl_secs: url_ttl,
+        multipart_session_ttl_secs: session_ttl,
+        ..cfg_with_secret()
+    };
+    let default_url_ttl = FileStorageConfig::default().default_url_ttl_secs;
+    assert_validate_cases(vec![
+        (
+            "shorter than default_url_ttl_secs (self-contradiction)",
+            with_ttl(900, 300),
+            false,
+        ),
+        ("equal to default_url_ttl_secs", with_ttl(900, 900), true),
+        (
+            "at ceiling",
+            with_ttl(default_url_ttl, MAX_MULTIPART_SESSION_TTL_SECS),
+            true,
+        ),
+        (
+            "above ceiling",
+            with_ttl(default_url_ttl, MAX_MULTIPART_SESSION_TTL_SECS + 1),
+            false,
+        ),
+        ("zero", with_ttl(default_url_ttl, 0), false),
+        ("one", with_ttl(1, 1), true),
+    ]);
+}
+
+// The lease must be bounded: an oversized value would delay another caller taking over.
+#[test]
+fn validate_multipart_complete_lease_bounds() {
+    let with_lease = |secs| FileStorageConfig {
+        multipart_complete_lease_secs: secs,
+        ..cfg_with_secret()
+    };
+    assert_validate_cases(vec![
+        (
+            "at ceiling",
+            with_lease(MAX_MULTIPART_COMPLETE_LEASE_SECS),
+            true,
+        ),
+        (
+            "above ceiling",
+            with_lease(MAX_MULTIPART_COMPLETE_LEASE_SECS + 1),
+            false,
+        ),
+        ("zero", with_lease(0), false),
+        ("one", with_lease(1), true),
+    ]);
+}

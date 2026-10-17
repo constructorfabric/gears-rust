@@ -49,6 +49,7 @@ impl From<file_version::Model> for FileVersion {
             backend_id: e.backend_id,
             backend_path: e.backend_path,
             created_at: e.created_at,
+            bound_on_finalize: e.bound_on_finalize,
         }
     }
 }

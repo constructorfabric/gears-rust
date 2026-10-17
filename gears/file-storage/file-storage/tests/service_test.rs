@@ -108,7 +108,10 @@ async fn full_upload_bind_download_lifecycle() {
     let (svc, dp) = build_service().await;
     let ctx = ctx(Uuid::now_v7());
 
-    let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
     assert!(ticket.upload_url.contains("fs-token="), "signed upload URL");
     assert!(ticket.upload_url.starts_with("http://sidecar.test"));
 
@@ -146,9 +149,10 @@ async fn full_upload_bind_download_lifecycle() {
     assert_eq!(bytes, Bytes::from_static(b"hello world"));
 
     let versions = svc
-        .list_versions(&ctx, ticket.file_id, None, 0)
+        .list_versions(&ctx, ticket.file_id, None, None)
         .await
-        .unwrap();
+        .unwrap()
+        .items;
     assert_eq!(versions.len(), 1);
     assert!(versions[0].is_current);
     assert_eq!(versions[0].size, 11);
@@ -165,7 +169,10 @@ async fn full_upload_bind_download_lifecycle() {
 async fn bind_with_wrong_if_match_returns_precondition_failed() {
     let (svc, dp) = build_service().await;
     let ctx = ctx(Uuid::now_v7());
-    let t1 = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let t1 = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
     dp.put_content(
         &ctx,
         t1.file_id,
@@ -213,7 +220,10 @@ async fn tenant_isolation_hides_other_tenants_files() {
     let ctx_a = ctx(Uuid::now_v7());
     let ctx_b = ctx(Uuid::now_v7());
 
-    let t = svc.create_file(&ctx_a, new_file(), None).await.unwrap();
+    let t = svc
+        .create_file(&ctx_a, new_file(), None, false)
+        .await
+        .unwrap();
     let err = svc.get_file(&ctx_b, t.file_id).await.unwrap_err();
     assert!(
         matches!(err, DomainError::FileNotFound { .. }),
@@ -228,7 +238,7 @@ async fn content_type_mismatch_is_rejected() {
     let ctx = ctx(Uuid::now_v7());
     let mut nf = new_file();
     nf.mime_type = "image/png".to_owned();
-    let t = svc.create_file(&ctx, nf, None).await.unwrap();
+    let t = svc.create_file(&ctx, nf, None, false).await.unwrap();
 
     // Declared png, but the bytes are a PDF signature.
     let err = dp
@@ -251,7 +261,10 @@ async fn content_type_mismatch_is_rejected() {
 async fn update_metadata_merges_and_bumps_meta_version() {
     let (svc, _dp) = build_service().await;
     let ctx = ctx(Uuid::now_v7());
-    let t = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let t = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
 
     let patch = CustomMetadataPatch {
         entries: vec![
@@ -285,7 +298,10 @@ async fn update_metadata_merges_and_bumps_meta_version() {
 async fn restore_prior_version_rebinds_pointer() {
     let (svc, dp) = build_service().await;
     let ctx = ctx(Uuid::now_v7());
-    let t1 = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let t1 = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
     dp.put_content(
         &ctx,
         t1.file_id,
@@ -330,7 +346,10 @@ async fn restore_prior_version_rebinds_pointer() {
 async fn delete_file_then_get_returns_not_found() {
     let (svc, _dp) = build_service().await;
     let ctx = ctx(Uuid::now_v7());
-    let t = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let t = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
     svc.delete_file(&ctx, t.file_id, Some("*")).await.unwrap();
     let err = svc.get_file(&ctx, t.file_id).await.unwrap_err();
     assert!(
@@ -344,7 +363,10 @@ async fn download_url_pending_version_is_rejected() {
     let (svc, _dp) = build_service().await;
     let ctx = ctx(Uuid::now_v7());
 
-    let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
 
     let err = svc
         .download_url(&ctx, ticket.file_id, Some(ticket.version_id))
@@ -361,7 +383,10 @@ async fn delete_file_if_match_required_and_enforced() {
     let (svc, dp) = build_service().await;
     let ctx = ctx(Uuid::now_v7());
 
-    let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
     dp.put_content(
         &ctx,
         ticket.file_id,
@@ -413,7 +438,7 @@ async fn list_files_filters_by_owner() {
     let owner = Uuid::now_v7();
     let mut nf = new_file();
     nf.owner_id = owner;
-    let t = svc.create_file(&ctx, nf, None).await.unwrap();
+    let t = svc.create_file(&ctx, nf, None, false).await.unwrap();
 
     let found = svc
         .list_files(
@@ -423,11 +448,11 @@ async fn list_files_filters_by_owner() {
                 owner_id: owner,
             },
             Some(10),
-            0,
+            None,
         )
         .await
         .unwrap();
-    assert!(found.iter().any(|f| f.file_id == t.file_id));
+    assert!(found.items.iter().any(|f| f.file_id == t.file_id));
 
     let empty = svc
         .list_files(
@@ -437,11 +462,11 @@ async fn list_files_filters_by_owner() {
                 owner_id: Uuid::now_v7(),
             },
             Some(10),
-            0,
+            None,
         )
         .await
         .unwrap();
-    assert!(empty.is_empty());
+    assert!(empty.items.is_empty());
 }
 
 /// `list_versions` caps at `max_page_size`, with or without a larger explicit `limit`, and
@@ -456,7 +481,10 @@ async fn list_versions_caps_at_max_page_size() {
     let total = max_page_size + 5;
     let mut created = Vec::with_capacity(usize::try_from(total).expect("total fits usize"));
 
-    let t0 = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let t0 = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
     dp.put_content(
         &ctx,
         t0.file_id,
@@ -487,7 +515,11 @@ async fn list_versions_caps_at_max_page_size() {
         "sanity: seeded max_page_size + 5"
     );
 
-    let page = svc.list_versions(&ctx, t0.file_id, None, 0).await.unwrap();
+    let page = svc
+        .list_versions(&ctx, t0.file_id, None, None)
+        .await
+        .unwrap()
+        .items;
     assert_eq!(page.len() as u64, max_page_size);
 
     let expected: Vec<Uuid> = created
@@ -500,10 +532,10 @@ async fn list_versions_caps_at_max_page_size() {
     assert_eq!(actual, expected, "must be the newest-first page");
 
     let clamped = svc
-        .list_versions(&ctx, t0.file_id, Some(max_page_size + 100), 0)
+        .list_versions(&ctx, t0.file_id, Some(max_page_size + 100), None)
         .await
         .unwrap();
-    assert_eq!(clamped.len() as u64, max_page_size);
+    assert_eq!(clamped.items.len() as u64, max_page_size);
 }
 
 #[tokio::test]
@@ -511,7 +543,10 @@ async fn delete_current_version_is_rejected() {
     let (svc, dp) = build_service().await;
     let ctx = ctx(Uuid::now_v7());
 
-    let t1 = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let t1 = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
     dp.put_content(
         &ctx,
         t1.file_id,
@@ -548,7 +583,11 @@ async fn delete_current_version_is_rejected() {
         "expected Conflict or VersionNotFound, got {err:?}"
     );
 
-    let versions = svc.list_versions(&ctx, t1.file_id, None, 0).await.unwrap();
+    let versions = svc
+        .list_versions(&ctx, t1.file_id, None, None)
+        .await
+        .unwrap()
+        .items;
     assert!(
         versions.iter().any(|v| v.version_id == t1.version_id),
         "current version must survive the rejected delete"
@@ -564,7 +603,10 @@ async fn delete_version_then_bind_cannot_dangle() {
     let (svc, dp, store) = build_service_with_page_sizes(50, 1000).await;
     let ctx = ctx(Uuid::now_v7());
 
-    let t1 = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let t1 = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
     dp.put_content(
         &ctx,
         t1.file_id,
@@ -636,7 +678,10 @@ async fn download_url_token_carries_version_mime_and_etag() {
     let (svc, dp) = build_service().await;
     let ctx = ctx(Uuid::now_v7());
 
-    let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
     dp.put_content(
         &ctx,
         ticket.file_id,
@@ -673,4 +718,104 @@ async fn download_url_token_carries_version_mime_and_etag() {
         claims.etag, dl.etag,
         "one source of truth as the ticket's own etag"
     );
+}
+
+#[tokio::test]
+async fn create_file_bare_persists_multiple_custom_metadata_entries() {
+    let (svc, _dp) = build_service().await;
+    let ctx = ctx(Uuid::now_v7());
+    let mut nf = new_file();
+    nf.custom_metadata = vec![
+        CustomMetadataEntry {
+            key: "k1".to_owned(),
+            value: "v1".to_owned(),
+        },
+        CustomMetadataEntry {
+            key: "k2".to_owned(),
+            value: "v2".to_owned(),
+        },
+    ];
+
+    let file_id = svc
+        .create_file_bare(&ctx, nf)
+        .await
+        .expect("create_file_bare with multiple metadata entries must succeed");
+
+    let (file, meta) = svc
+        .get_file_with_metadata(&ctx, file_id)
+        .await
+        .expect("get_file_with_metadata");
+    assert!(file.content_id.is_none(), "a bare file has no content");
+    assert_eq!(
+        meta.len(),
+        2,
+        "both custom-metadata entries must be persisted"
+    );
+    assert!(meta.iter().any(|e| e.key == "k1" && e.value == "v1"));
+    assert!(meta.iter().any(|e| e.key == "k2" && e.value == "v2"));
+}
+
+#[tokio::test]
+async fn compensate_failed_multipart_initiate_missing_file_is_noop() {
+    let (svc, _dp, store) = build_service_with_page_sizes(50, 1000).await;
+    let ctx = ctx(Uuid::now_v7());
+    let phantom_file_id = Uuid::now_v7();
+
+    svc.compensate_failed_multipart_initiate(&ctx, phantom_file_id)
+        .await;
+
+    let audit_rows = store.list_audit(phantom_file_id).await.expect("list_audit");
+    assert!(
+        audit_rows.is_empty(),
+        "compensating a file that never existed must not write any audit row"
+    );
+}
+
+#[tokio::test]
+async fn compensate_failed_multipart_initiate_with_existing_version_is_noop() {
+    let (svc, _dp, store) = build_service_with_page_sizes(50, 1000).await;
+    let ctx = ctx(Uuid::now_v7());
+
+    let file_id = svc
+        .create_file_bare(&ctx, new_file())
+        .await
+        .expect("create_file_bare");
+    svc.presign_version(&ctx, file_id)
+        .await
+        .expect("presign_version registers a pending version");
+
+    svc.compensate_failed_multipart_initiate(&ctx, file_id)
+        .await;
+
+    store
+        .get_file(&toolkit_security::AccessScope::allow_all(), file_id)
+        .await
+        .expect("get_file")
+        .expect("the file must still exist -- the orphan guard must have declined");
+    let versions = store.list_versions(file_id).await.expect("list_versions");
+    assert_eq!(
+        versions.len(),
+        1,
+        "the version added by presign_version must remain untouched"
+    );
+}
+
+#[tokio::test]
+async fn compensate_failed_multipart_initiate_deletes_the_orphan_bare_file() {
+    let (svc, _dp, store) = build_service_with_page_sizes(50, 1000).await;
+    let ctx = ctx(Uuid::now_v7());
+
+    let file_id = svc
+        .create_file_bare(&ctx, new_file())
+        .await
+        .expect("create_file_bare");
+
+    svc.compensate_failed_multipart_initiate(&ctx, file_id)
+        .await;
+
+    let file = store
+        .get_file(&toolkit_security::AccessScope::allow_all(), file_id)
+        .await
+        .expect("get_file");
+    assert!(file.is_none(), "the version-less orphan must be deleted");
 }

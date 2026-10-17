@@ -1,4 +1,4 @@
-//! `VersionRepo::get` direct-predicate test on a real SQLite DB.
+//! `VersionRepo` direct-predicate tests on a real SQLite DB (`get`, `get_manifests`).
 
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::doc_markdown)]
 
@@ -70,6 +70,7 @@ fn new_version(file_id: Uuid, version_id: Uuid, size: i64) -> FileVersion {
         backend_id: "mem".to_owned(),
         backend_path: format!("/{file_id}/{version_id}"),
         created_at: now,
+        bound_on_finalize: false,
     }
 }
 
@@ -133,4 +134,108 @@ async fn version_repo_get_returns_correct_row_among_many() {
         cross.is_none(),
         "a version_id belonging to file_a must not resolve under file_b"
     );
+}
+
+/// `VersionRepo::get_manifests` must return every requested version's
+/// manifest even when the id list spans more than one `max_bind_params_for`
+/// chunk (30 000 on `SQLite`, minus `GET_MANIFESTS_RESERVED_PARAMS`).
+#[tokio::test]
+async fn get_manifests_returns_all_results_across_multiple_chunks() {
+    use file_storage::infra::storage::entity::file::{
+        ActiveModel as FileActiveModel, Entity as FileEntity,
+    };
+    use file_storage::infra::storage::entity::file_version::{
+        ActiveModel as FileVersionActiveModel, Entity as FileVersionEntity,
+    };
+    use file_storage::infra::storage::entity::version_hash_manifest::{
+        ActiveModel as ManifestActiveModel, Entity as ManifestEntity,
+    };
+    use sea_orm::Set;
+    use toolkit_db::secure::secure_insert_many;
+
+    const N: usize = 35_000;
+
+    let db = db().await;
+    let conn = db.conn().expect("conn");
+    let scope = AccessScope::allow_all();
+    let versions = VersionRepo::new();
+    let now = OffsetDateTime::now_utc();
+    let tenant_id = Uuid::now_v7();
+
+    let version_ids: Vec<Uuid> = (0..N).map(|_| Uuid::now_v7()).collect();
+    let file_ids: Vec<Uuid> = (0..N).map(|_| Uuid::now_v7()).collect();
+
+    let file_models: Vec<FileActiveModel> = file_ids
+        .iter()
+        .map(|&file_id| FileActiveModel {
+            file_id: Set(file_id),
+            tenant_id: Set(tenant_id),
+            owner_kind: Set("user".to_owned()),
+            owner_id: Set(Uuid::now_v7()),
+            name: Set("f.bin".to_owned()),
+            gts_file_type: Set(GTS.to_owned()),
+            content_id: Set(None),
+            meta_version: Set(0),
+            created_at: Set(now),
+            last_modified_at: Set(now),
+        })
+        .collect();
+    secure_insert_many::<FileEntity>(file_models, &scope, &conn)
+        .await
+        .expect("seed parent files rows");
+
+    let version_models: Vec<FileVersionActiveModel> = file_ids
+        .iter()
+        .zip(version_ids.iter())
+        .map(|(&file_id, &version_id)| FileVersionActiveModel {
+            file_id: Set(file_id),
+            version_id: Set(version_id),
+            mime_type: Set("application/octet-stream".to_owned()),
+            size: Set(1024),
+            hash_algorithm: Set("SHA-256".to_owned()),
+            hash_value: Set(vec![0u8; 32]),
+            hash_mode: Set("multipart-composite-sha256".to_owned()),
+            part_count: Set(Some(2)),
+            status: Set("available".to_owned()),
+            is_current: Set(false),
+            backend_id: Set("mem".to_owned()),
+            backend_path: Set(format!("/{file_id}/{version_id}")),
+            created_at: Set(now),
+            bound_on_finalize: Set(false),
+        })
+        .collect();
+    secure_insert_many::<FileVersionEntity>(version_models, &scope, &conn)
+        .await
+        .expect("seed parent file_versions rows");
+
+    let models: Vec<ManifestActiveModel> = version_ids
+        .iter()
+        .map(|&version_id| ManifestActiveModel {
+            version_id: Set(version_id),
+            manifest: Set(format!("{{\"version_id\":\"{version_id}\"}}")),
+            created_at: Set(now),
+        })
+        .collect();
+    secure_insert_many::<ManifestEntity>(models, &scope, &conn)
+        .await
+        .expect("seed manifest rows");
+
+    let manifests = versions
+        .get_manifests(&conn, &scope, &version_ids)
+        .await
+        .expect("get_manifests must not error across chunk boundaries");
+
+    assert_eq!(
+        manifests.len(),
+        N,
+        "every seeded version_id must have a manifest entry back, regardless \
+         of how many chunks the id list was split into"
+    );
+    for &version_id in &version_ids {
+        assert_eq!(
+            manifests.get(&version_id),
+            Some(&format!("{{\"version_id\":\"{version_id}\"}}")),
+            "manifest content must round-trip for {version_id}"
+        );
+    }
 }

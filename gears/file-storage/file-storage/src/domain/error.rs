@@ -4,6 +4,11 @@ use thiserror::Error;
 use toolkit_macros::domain_model;
 use uuid::Uuid;
 
+/// `DomainError::Conflict` message for a session already aborted by cleanup; `Conflict` has no
+/// sub-kind, so the raise site and `MultipartService` both match on this constant.
+pub const MULTIPART_SESSION_RECLAIMED_BY_CLEANUP_MESSAGE: &str =
+    "multipart session is no longer completing (aborted by cleanup)";
+
 /// Domain-specific errors. Mapped to RFC-9457 Problem at the REST boundary
 /// (`api/rest/error.rs`).
 #[domain_model]
@@ -19,7 +24,13 @@ pub enum DomainError {
     RetentionRuleNotFound { rule_id: Uuid },
 
     #[error("Database error: {message}")]
-    Database { message: String },
+    Database {
+        message: String,
+        /// The original driver error, type-erased so the domain stays free of `sea_orm`; the store reads
+        /// it back to retry lock contention.
+        #[source]
+        source: Option<std::sync::Arc<dyn std::error::Error + Send + Sync>>,
+    },
 
     #[error("Validation failed: {field}: {message}")]
     Validation { field: String, message: String },
@@ -96,6 +107,11 @@ pub enum DomainError {
     /// 409 — backend migration was requested for a versioned file (>1 version).
     #[error("File {file_id} has multiple versions and cannot be migrated between backends")]
     VersionedFileMigrationNotSupported { file_id: Uuid },
+
+    /// A cursor-pagination failure from `domain::pagination`; mapped via `toolkit_odata`'s own
+    /// `Error -> CanonicalError` so reason codes match every other cursor consumer.
+    #[error("{0}")]
+    Cursor(toolkit_odata::Error),
 }
 
 impl DomainError {
@@ -120,6 +136,17 @@ impl DomainError {
     pub fn database(message: impl Into<String>) -> Self {
         Self::Database {
             message: message.into(),
+            source: None,
+        }
+    }
+
+    pub(crate) fn database_with_source(
+        message: impl Into<String>,
+        source: impl std::error::Error + Send + Sync + 'static,
+    ) -> Self {
+        Self::Database {
+            message: message.into(),
+            source: Some(std::sync::Arc::new(source)),
         }
     }
 

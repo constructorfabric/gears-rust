@@ -11,6 +11,7 @@ const OWNER: &str = "00000000-0000-0000-0000-0000000000b1";
 const FILE: &str = "00000000-0000-0000-0000-0000000000c1";
 const VERSION: &str = "00000000-0000-0000-0000-0000000000d1";
 const GTS: &str = gts_id!("cf.fstorage.file.type.v1~x.test.file.type.v1~");
+const UPLOAD: &str = "00000000-0000-0000-0000-0000000000f2";
 const HASH32: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
 fn stmt(db: &DatabaseConnection, sql: impl Into<String>) -> Statement {
@@ -93,6 +94,273 @@ async fn migration_up_down_up_roundtrip() {
         .execute_raw(stmt(&db, "SELECT * FROM files LIMIT 0"))
         .await;
     assert!(back.is_ok(), "files must exist again after re-up: {back:?}");
+}
+
+async fn index_exists(db: &DatabaseConnection, name: &str) -> bool {
+    count(
+        db,
+        &format!(
+            "SELECT COUNT(*) AS c FROM sqlite_master WHERE type = 'index' AND name = '{name}'"
+        ),
+    )
+    .await
+        == 1
+}
+
+/// Whether `SELECT <cols> FROM <table>` plans, i.e. every column exists.
+async fn columns_exist(db: &DatabaseConnection, table: &str, cols: &str) -> bool {
+    db.execute_raw(stmt(db, format!("SELECT {cols} FROM {table} LIMIT 0")))
+        .await
+        .is_ok()
+}
+
+const UPLOAD_FLOW_MULTIPART_COLS: [&str; 6] = [
+    "auto_bind",
+    "lease_until",
+    "lease_owner",
+    "complete_result",
+    "backend_id",
+    "backend_path",
+];
+
+/// A `multipart_uploads` row in `state` (`declared_size` bytes in `part_size` parts).
+async fn insert_session(db: &DatabaseConnection, state: &str, declared_size: u32, part_size: u32) {
+    db.execute_raw(stmt(
+        db,
+        format!(
+            "INSERT INTO multipart_uploads \
+             (upload_id, file_id, version_id, backend_upload_handle, state, declared_mime, \
+              mime_validated, declared_size, part_size, expires_at) \
+             VALUES ('{UPLOAD}', '{FILE}', '{VERSION}', 'handle-1', '{state}', 'text/plain', \
+                     1, {declared_size}, {part_size}, '2999-01-01T00:00:00Z')"
+        ),
+    ))
+    .await
+    .expect("insert multipart session");
+}
+
+async fn insert_part(db: &DatabaseConnection, part_number: u8, size: u32) {
+    db.execute_raw(stmt(
+        db,
+        format!(
+            "INSERT INTO multipart_upload_parts \
+             (upload_id, part_number, backend_etag, part_hash, size) \
+             VALUES ('{UPLOAD}', {part_number}, 'etag-{part_number}', X'{HASH32}', {size})"
+        ),
+    ))
+    .await
+    .expect("insert part");
+}
+
+/// Every migration before upload_flow: the "old" schema, without `bound_on_finalize` etc.
+async fn pre_upload_flow_db() -> DatabaseConnection {
+    let db = Database::connect("sqlite::memory:")
+        .await
+        .expect("connect in-memory sqlite");
+    db.execute_raw(stmt(&db, "PRAGMA foreign_keys = ON;"))
+        .await
+        .expect("enable foreign keys");
+    Migrator::up(&db, Some(8))
+        .await
+        .expect("apply every migration before upload_flow");
+    db
+}
+
+/// One up/down/up run over the last migration (upload_flow): it exists after `up()`, `down()` really
+/// drops its column/index/columns and folds a `completing` session into `aborted` (keeping the
+/// parts and the pre-existing columns), and re-`up()` restores it. Also asserts the `up()` indexes.
+#[tokio::test]
+async fn upload_flow_down_actually_drops_the_new_column_and_index() {
+    let db = migrated_db().await;
+    let mp_cols = UPLOAD_FLOW_MULTIPART_COLS.join(", ");
+
+    assert!(
+        columns_exist(&db, "file_versions", "bound_on_finalize").await,
+        "bound_on_finalize must exist after the full up()"
+    );
+    assert!(
+        index_exists(&db, "idempotency_keys_file_idx").await,
+        "idempotency_keys_file_idx must exist after up()"
+    );
+    assert!(
+        columns_exist(&db, "multipart_uploads", &mp_cols).await,
+        "the six multipart_uploads columns (incl. auto_bind) must exist after the full up()"
+    );
+
+    insert_file(&db, FILE).await;
+    insert_session(&db, "completing", 5, 5).await;
+    insert_part(&db, 1, 5).await;
+
+    // The last migration is upload_flow.
+    Migrator::down(&db, Some(1))
+        .await
+        .expect("roll back upload_flow");
+
+    assert!(
+        !columns_exist(&db, "file_versions", "bound_on_finalize").await,
+        "bound_on_finalize must be gone after a real (non-no-op) down()"
+    );
+    assert!(
+        !index_exists(&db, "idempotency_keys_file_idx").await,
+        "idempotency_keys_file_idx must be dropped by down()"
+    );
+    for col in UPLOAD_FLOW_MULTIPART_COLS {
+        assert!(
+            !columns_exist(&db, "multipart_uploads", col).await,
+            "{col} must be gone after a real (non-no-op) down()"
+        );
+    }
+    // The pre-existing multipart_uploads columns and indexes survive the mirrored rebuild.
+    assert!(
+        columns_exist(
+            &db,
+            "multipart_uploads",
+            "declared_size, part_size, mime_validated, created_at, expires_at"
+        )
+        .await,
+        "pre-existing columns must remain"
+    );
+    assert!(index_exists(&db, "multipart_uploads_file_idx").await);
+    assert!(index_exists(&db, "multipart_uploads_expired_idx").await);
+    // The previous migration (listing_indexes) is untouched.
+    assert!(index_exists(&db, "files_owner_listing_v2_idx").await);
+
+    assert_eq!(
+        count(
+            &db,
+            &format!(
+                "SELECT COUNT(*) AS c FROM multipart_uploads WHERE upload_id = '{UPLOAD}' \
+                 AND state = 'aborted' AND declared_size = 5 AND part_size = 5"
+            )
+        )
+        .await,
+        1,
+        "a completing session must be folded into aborted by down()"
+    );
+    assert_eq!(
+        count(&db, "SELECT COUNT(*) AS c FROM multipart_upload_parts").await,
+        1,
+        "parts must survive the down() rebuild"
+    );
+    let bad = db
+        .execute_raw(stmt(
+            &db,
+            format!(
+                "UPDATE multipart_uploads SET state = 'completing' WHERE upload_id = '{UPLOAD}'"
+            ),
+        ))
+        .await;
+    assert!(bad.is_err(), "the narrowed CHECK must reject completing");
+
+    Migrator::up(&db, Some(1))
+        .await
+        .expect("re-apply upload_flow");
+    assert!(
+        columns_exist(&db, "file_versions", "bound_on_finalize").await,
+        "bound_on_finalize must exist again after re-up()"
+    );
+    assert!(index_exists(&db, "idempotency_keys_file_idx").await);
+    assert!(
+        columns_exist(&db, "multipart_uploads", &mp_cols).await,
+        "the multipart_uploads columns must exist again after re-up()"
+    );
+}
+
+/// `up()` over the old schema: an existing version backfills `bound_on_finalize = false`, and the
+/// `multipart_uploads` rebuild keeps sessions, parts, indexes and cascades, widening the state
+/// CHECK to admit `completing`.
+#[tokio::test]
+async fn upload_flow_up_backfills_and_preserves_existing_rows() {
+    let db = pre_upload_flow_db().await;
+
+    insert_file(&db, FILE).await;
+    insert_version(&db, FILE, VERSION, 1).await;
+    insert_session(&db, "completed", 300, 100).await;
+    insert_part(&db, 1, 100).await;
+    insert_part(&db, 2, 200).await;
+
+    Migrator::up(&db, None)
+        .await
+        .expect("apply the remaining migration (upload_flow)");
+
+    assert_eq!(
+        count(
+            &db,
+            &format!(
+                "SELECT COUNT(*) AS c FROM file_versions WHERE version_id = '{VERSION}' \
+                 AND bound_on_finalize = 0"
+            )
+        )
+        .await,
+        1,
+        "a version that existed before this migration must default bound_on_finalize to false"
+    );
+    assert_eq!(
+        count(
+            &db,
+            &format!(
+                "SELECT COUNT(*) AS c FROM multipart_upload_parts WHERE upload_id = '{UPLOAD}'"
+            )
+        )
+        .await,
+        2,
+        "both parts must survive the multipart_uploads rebuild"
+    );
+    assert_eq!(
+        count(
+            &db,
+            &format!(
+                "SELECT COUNT(*) AS c FROM multipart_uploads WHERE upload_id = '{UPLOAD}' \
+                 AND state = 'completed' AND mime_validated = 1 AND declared_size = 300 \
+                 AND part_size = 100 AND declared_mime = 'text/plain' \
+                 AND backend_upload_handle = 'handle-1'"
+            )
+        )
+        .await,
+        1,
+        "the session row, with every pre-existing column value, must survive the rebuild"
+    );
+    assert!(
+        index_exists(&db, "multipart_uploads_file_idx").await,
+        "multipart_uploads_file_idx must be recreated by the rebuild"
+    );
+    assert!(
+        index_exists(&db, "multipart_uploads_expired_idx").await,
+        "multipart_uploads_expired_idx must be recreated by the rebuild"
+    );
+
+    // The widened state CHECK admits `completing`; an unknown state is still rejected.
+    db.execute_raw(stmt(
+        &db,
+        format!("UPDATE multipart_uploads SET state = 'completing' WHERE upload_id = '{UPLOAD}'"),
+    ))
+    .await
+    .expect("completing must satisfy the widened state CHECK");
+    let bad = db
+        .execute_raw(stmt(
+            &db,
+            format!("UPDATE multipart_uploads SET state = 'bogus' WHERE upload_id = '{UPLOAD}'"),
+        ))
+        .await;
+    assert!(bad.is_err(), "an unknown state must violate the CHECK");
+
+    // The rebuilt FK still cascades: deleting the file removes its sessions and their parts.
+    db.execute_raw(stmt(
+        &db,
+        format!("DELETE FROM files WHERE file_id = '{FILE}'"),
+    ))
+    .await
+    .expect("delete file");
+    assert_eq!(
+        count(&db, "SELECT COUNT(*) AS c FROM multipart_uploads").await,
+        0,
+        "the rebuilt multipart_uploads must keep ON DELETE CASCADE from files"
+    );
+    assert_eq!(
+        count(&db, "SELECT COUNT(*) AS c FROM multipart_upload_parts").await,
+        0,
+        "parts must cascade with their session"
+    );
 }
 
 #[tokio::test]

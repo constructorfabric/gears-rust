@@ -120,14 +120,12 @@ retained — they simply move into the sidecar, which is platform-controlled inf
 * a single client protocol independent of backend.
 
 A **read** is therefore two HTTP requests: a control request (obtain a signed GET URL) plus a data
-request against the sidecar. A **write** using the staged, manual-bind flow is more: **presign (control) →
-`PUT` (data) → finalize (data→control, a token-authenticated callback) → `bind` (control)** — three
-control-plane touches and one data-plane touch, not the two-request model this ADR originally described
-(see the Implementation note above). *Amendment:* the default `bind: "auto"` path (same Implementation
-note) folds the client-issued `bind` into the same finalize transaction the sidecar's callback already
-triggers, so the client itself only ever makes **two** requests — create (presign) and `PUT` — for a
-brand-new file's first content; the three-control-plane-touch count above still describes the manual-bind
-staged flow and a version bound after the fact.
+request against the sidecar. A **write** using the staged, manual-bind flow is **presign (control) →
+`PUT` (data) → finalize (data→control, a token-authenticated callback) → `bind` (control)** (see the
+Implementation note above). *Amendment:* the default `bind: "auto"` path (same Implementation note) folds
+the client-issued `bind` into the same finalize transaction the sidecar's callback already triggers, so for
+a brand-new file's first content the client itself only issues the create (presign) request and the `PUT`;
+the staged flow above still describes manual bind and a version bound after the fact.
 
 Signed URLs are **Ed25519, stateless** (S3-presigned-style): the control plane signs with a private
 key and is the **sole minter**; the sidecar verifies with the public key and can never forge a URL.

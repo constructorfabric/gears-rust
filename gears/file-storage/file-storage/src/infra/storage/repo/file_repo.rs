@@ -67,24 +67,62 @@ impl FileRepo {
         Ok(found.map(Into::into))
     }
 
-    /// List files for a mandatory owner filter, newest first, offset-paginated.
-    pub async fn list<C: DBRunner>(
+    /// List files for a mandatory owner filter, newest first, keyset-paginated in either
+    /// direction.
+    ///
+    /// Ordered `(created_at, file_id)` descending: `created_at` alone is not unique, so
+    /// `file_id` (the primary key) is the tie-breaker that makes page boundaries deterministic.
+    ///
+    /// `after`, when `Some`, restricts the result to rows strictly past that position (`None`
+    /// starts from the newest row). `Seek::direction` picks the predicate and query order:
+    /// - `Forward`: `(created_at, file_id) < after`, canonical order, rows returned as-is.
+    /// - `Backward`: mirrored predicate and ascending order, so `LIMIT` keeps the rows closest
+    ///   to the cursor; `domain::pagination::finish_page` reverses them back.
+    ///
+    /// Callers fetch `limit + 1` rows to detect a further page; this method runs whatever
+    /// `limit` it gets.
+    pub async fn list_page<C: DBRunner>(
         &self,
         conn: &C,
         scope: &AccessScope,
         owner: OwnerFilter,
         limit: u64,
-        offset: u64,
+        after: Option<crate::domain::pagination::Seek>,
     ) -> Result<Vec<File>, DomainError> {
-        let rows = Entity::find()
-            .filter(
-                Condition::all()
-                    .add(Column::OwnerKind.eq(owner.owner_kind.as_str()))
-                    .add(Column::OwnerId.eq(owner.owner_id)),
-            )
-            .order_by_desc(Column::CreatedAt)
+        use crate::domain::pagination::Direction;
+
+        let mut filter = Condition::all()
+            .add(Column::OwnerKind.eq(owner.owner_kind.as_str()))
+            .add(Column::OwnerId.eq(owner.owner_id));
+        let direction = after.map_or(Direction::Forward, |s| s.direction);
+        if let Some(seek) = after {
+            let pred = match direction {
+                Direction::Forward => super::tuple_lt(
+                    (Entity, Column::CreatedAt),
+                    (Entity, Column::FileId),
+                    seek.created_at,
+                    seek.id,
+                ),
+                Direction::Backward => super::tuple_gt(
+                    (Entity, Column::CreatedAt),
+                    (Entity, Column::FileId),
+                    seek.created_at,
+                    seek.id,
+                ),
+            };
+            filter = filter.add(pred);
+        }
+        let mut query = Entity::find().filter(filter);
+        query = match direction {
+            Direction::Forward => query
+                .order_by_desc(Column::CreatedAt)
+                .order_by_desc(Column::FileId),
+            Direction::Backward => query
+                .order_by_asc(Column::CreatedAt)
+                .order_by_asc(Column::FileId),
+        };
+        let rows = query
             .limit(limit)
-            .offset(offset)
             .secure()
             .scope_with(scope)
             .all(conn)

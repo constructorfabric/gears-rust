@@ -12,6 +12,8 @@ use crate::infra::content::hash_mode::HashMode;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MultipartUploadState {
     InProgress,
+    /// A `complete` holds the lease and is assembling; after `lease_until` the next `complete` takes over.
+    Completing,
     Completed,
     Aborted,
 }
@@ -21,6 +23,7 @@ impl MultipartUploadState {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::InProgress => "in_progress",
+            Self::Completing => "completing",
             Self::Completed => "completed",
             Self::Aborted => "aborted",
         }
@@ -30,6 +33,7 @@ impl MultipartUploadState {
     pub fn parse(s: &str) -> Option<Self> {
         match s {
             "in_progress" => Some(Self::InProgress),
+            "completing" => Some(Self::Completing),
             "completed" => Some(Self::Completed),
             "aborted" => Some(Self::Aborted),
             _ => None,
@@ -52,14 +56,121 @@ pub struct MultipartUploadSession {
     pub declared_size: u64,
     /// Server-chosen plan unit (bytes, uniform except the final part).
     pub part_size: u64,
+    pub auto_bind: bool,
+    pub lease_until: Option<OffsetDateTime>,
+    /// Persisted `StoredCompleteResult` JSON once `Completed`; a re-complete replays it.
+    pub complete_result: Option<String>,
+    pub backend_id: String,
+    /// Backend object path; lets expired-session cleanup work after the `file_versions` row is gone.
+    pub backend_path: String,
     pub created_at: OffsetDateTime,
     pub expires_at: OffsetDateTime,
+}
+
+/// Outcome of `complete_multipart_upload`: finished, or another caller holds the lease (`202`).
+#[allow(unknown_lints, de0309_must_have_domain_model)]
+#[derive(Debug, Clone)]
+pub enum MultipartCompleteOutcome {
+    Completed(CompletedMultipartUpload),
+    Completing { retry_after_secs: u64 },
+}
+
+impl MultipartCompleteOutcome {
+    /// Unwrap `Completed`, for tests and single-completer contexts.
+    ///
+    /// # Panics
+    /// Panics when the outcome is [`Self::Completing`].
+    #[must_use]
+    pub fn unwrap_completed(self) -> CompletedMultipartUpload {
+        match self {
+            Self::Completed(c) => c,
+            Self::Completing { .. } => {
+                panic!("complete is still in progress (completion lease held elsewhere)")
+            }
+        }
+    }
+}
+
+/// Serializable snapshot of a successful complete response, persisted in the same transaction
+/// that flips the session to `completed`; carries no `manifest` (re-read from `version_hash_manifest`).
+#[domain_model]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct StoredCompleteResult {
+    pub version_id: Uuid,
+    pub size: i64,
+    pub content_hash: String,
+    pub hash_mode: String,
+    pub part_count: i32,
+    pub bind_state: String,
+    pub etag: Option<String>,
+    pub current_etag: Option<String>,
+}
+
+impl StoredCompleteResult {
+    #[must_use]
+    pub fn from_completed(c: &CompletedMultipartUpload) -> Self {
+        Self {
+            version_id: c.version_id,
+            size: c.size,
+            content_hash: hex::encode(&c.content_hash),
+            hash_mode: c.hash_mode.as_str().to_owned(),
+            part_count: c.part_count,
+            bind_state: c.bind_state.as_str().to_owned(),
+            etag: c.etag.clone(),
+            current_etag: c.current_etag.clone(),
+        }
+    }
+
+    /// Rebuild the response (`manifest` supplied by the caller). `None` for an unparsable or
+    /// inconsistent snapshot; the caller rebuilds from the version row.
+    #[must_use]
+    pub fn into_completed(self, manifest: Option<String>) -> Option<CompletedMultipartUpload> {
+        let hash_mode = HashMode::parse(&self.hash_mode)?;
+        let bind_state = match self.bind_state.as_str() {
+            "bound" => BindState::Bound,
+            "conflict" => BindState::Conflict,
+            "manual" => BindState::Manual,
+            _ => return None,
+        };
+        // An inconsistent snapshot is untrustworthy, so `None`. One part is `whole-sha256` with no
+        // manifest (ADR-0006); 2+ parts are `multipart-composite-sha256` with one; anything else is corruption.
+        match hash_mode {
+            HashMode::WholeSha256 if self.part_count != 1 || manifest.is_some() => return None,
+            HashMode::MultipartCompositeSha256 if self.part_count < 2 || manifest.is_none() => {
+                return None;
+            }
+            _ => {}
+        }
+        let consistent = match bind_state {
+            BindState::Bound => self.etag.is_some() && self.current_etag.is_none(),
+            BindState::Conflict => self.etag.is_none() && self.current_etag.is_some(),
+            BindState::Manual => self.etag.is_none() && self.current_etag.is_none(),
+        };
+        if !consistent {
+            return None;
+        }
+        let content_hash = hex::decode(&self.content_hash)
+            .ok()
+            .filter(|d| d.len() == 32)?;
+        Some(CompletedMultipartUpload {
+            version_id: self.version_id,
+            size: self.size,
+            hash_algorithm: crate::infra::content::hash::ALGORITHM,
+            content_hash,
+            hash_mode,
+            part_count: self.part_count,
+            manifest,
+            bind_state,
+            etag: self.etag,
+            current_etag: self.current_etag,
+        })
+    }
 }
 
 /// Result of a successful `complete_multipart_upload`.
 ///
 /// `manifest` lets a client re-verify the composite hash without a second round-trip
-/// (~90 bytes per part, ~1 MiB at the 10k-part ceiling).
+/// (~90 bytes per part, ~1 MiB at the [`MAX_PART_COUNT`] ceiling).
 #[domain_model]
 #[derive(Debug, Clone)]
 pub struct CompletedMultipartUpload {
@@ -67,13 +178,80 @@ pub struct CompletedMultipartUpload {
     pub size: i64,
     /// Always `"SHA-256"`.
     pub hash_algorithm: &'static str,
-    /// Composite root: `sha256(manifest)`.
     pub content_hash: Vec<u8>,
-    /// Always [`HashMode::MultipartCompositeSha256`] for this completion path.
     pub hash_mode: HashMode,
     pub part_count: i32,
-    /// Wire-format manifest text (`Manifest::to_wire_string`).
-    pub manifest: String,
+    pub manifest: Option<String>,
+    pub bind_state: BindState,
+    pub etag: Option<String>,
+    /// Current content `ETag` when the bind CAS was lost (`Conflict` only); the `If-Match` for a manual rebind.
+    pub current_etag: Option<String>,
+}
+
+/// Bind outcome shared by multipart `complete` (`bind_state`) and single-part `PUT` (`X-FS-Bound`).
+/// `Conflict` means the auto-bind CAS lost but the upload still SUCCEEDED; a manual `bind` makes it live.
+#[domain_model]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BindState {
+    Bound,
+    Conflict,
+    Manual,
+}
+
+impl BindState {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Bound => "bound",
+            Self::Conflict => "conflict",
+            Self::Manual => "manual",
+        }
+    }
+}
+
+#[must_use]
+pub fn resolve_bind_state(
+    file_id: Uuid,
+    content_id: Option<Uuid>,
+    version_id: Uuid,
+    auto_bind: bool,
+) -> (BindState, Option<String>, Option<String>) {
+    if content_id == Some(version_id) {
+        (
+            BindState::Bound,
+            Some(crate::domain::etag::content_etag(file_id, version_id)),
+            None,
+        )
+    } else if auto_bind {
+        (
+            BindState::Conflict,
+            None,
+            content_id.map(|cid| crate::domain::etag::content_etag(file_id, cid)),
+        )
+    } else {
+        (BindState::Manual, None, None)
+    }
+}
+
+/// Retry counterpart of [`resolve_bind_state`] for a single-part finalize: replays the original
+/// decision from the persisted `bound_on_finalize` flag, since a rebind may have moved the pointer
+/// (a retry must not turn `Bound` into `Conflict`); `false` falls back to the live read.
+#[must_use]
+pub fn replay_finalize_bind_state(
+    file_id: Uuid,
+    content_id: Option<Uuid>,
+    version_id: Uuid,
+    bound_on_finalize: bool,
+    auto_bind: bool,
+) -> (BindState, Option<String>, Option<String>) {
+    if bound_on_finalize {
+        return (
+            BindState::Bound,
+            Some(crate::domain::etag::content_etag(file_id, version_id)),
+            None,
+        );
+    }
+    resolve_bind_state(file_id, content_id, version_id, auto_bind)
 }
 
 /// Result of `GET /files/{id}/multipart/{upload_id}`: session state plus received and
@@ -172,6 +350,10 @@ pub const DEFAULT_MIN_PART_SIZE: u64 = 5 * 1024 * 1024;
 /// arithmetic as defense-in-depth.
 pub const MAX_PART_SIZE: u64 = 5 * 1024 * 1024 * 1024;
 
+/// Hard ceiling on the parts of one plan, enforced by `compute_plan` (ADR-0006: unbounded
+/// manifests must not be possible). `10_000` matches S3's limit.
+pub const MAX_PART_COUNT: u64 = 10_000;
+
 /// One raw part entry from `compute_plan`: `(part_number, offset, size)`.
 pub type RawPartEntry = (u32, u64, u64);
 
@@ -179,11 +361,13 @@ pub type RawPartEntry = (u32, u64, u64);
 /// `MultipartService`). Returns `(part_size, parts)`.
 ///
 /// `part_size = max(preferred, backend_min)` rounded up to a multiple of the minimum;
-/// `parts = ceil(declared_size / part_size)`; the last part holds the remainder.
+/// `parts = ceil(declared_size / part_size)`, widening `part_size` (up to [`MAX_PART_SIZE`]) to
+/// stay within [`MAX_PART_COUNT`]. Runs before allocating the plan, so an attacker-controlled
+/// `declared_size` cannot drive allocation.
 ///
 /// # Errors
-/// Returns [`DomainError::Validation`] if the part-size arithmetic overflows `u64`
-/// (defense-in-depth; callers validate `preferred_part_size` first).
+/// Returns [`DomainError::Validation`] on `u64` overflow or if even [`MAX_PART_SIZE`] cannot fit
+/// `declared_size` within [`MAX_PART_COUNT`] parts.
 pub fn compute_plan(
     declared_size: u64,
     preferred_part_size: Option<u64>,
@@ -192,7 +376,7 @@ pub fn compute_plan(
     let min = backend_min_part_size.unwrap_or(DEFAULT_MIN_PART_SIZE);
     let preferred = preferred_part_size.unwrap_or(min);
     let raw = preferred.max(min);
-    let part_size = round_up_to(raw, min).ok_or_else(|| {
+    let mut part_size = round_up_to(raw, min).ok_or_else(|| {
         DomainError::validation(
             "preferred_part_size",
             format!("part-size computation overflowed for preferred={preferred}, min={min}"),
@@ -201,6 +385,21 @@ pub fn compute_plan(
 
     if declared_size == 0 {
         return Ok((part_size, vec![(1, 0, 0)]));
+    }
+
+    if declared_size.div_ceil(part_size) > MAX_PART_COUNT {
+        let minimal_required = declared_size.div_ceil(MAX_PART_COUNT);
+        if minimal_required > MAX_PART_SIZE {
+            return Err(DomainError::validation(
+                "declared_size",
+                format!(
+                    "declared_size {declared_size} bytes is too large for multipart upload on \
+                     this backend: even at the maximum part size of {MAX_PART_SIZE} bytes it \
+                     would require more than {MAX_PART_COUNT} parts"
+                ),
+            ));
+        }
+        part_size = minimal_required.max(part_size).min(MAX_PART_SIZE);
     }
 
     let n_parts = declared_size.div_ceil(part_size);
@@ -249,5 +448,255 @@ mod tests {
     fn compute_plan_returns_validation_error_on_overflowing_preferred_part_size() {
         let err = compute_plan(u64::MAX, Some(u64::MAX), None).unwrap_err();
         assert!(matches!(err, DomainError::Validation { .. }));
+    }
+
+    #[test]
+    fn compute_plan_rejects_absurd_declared_size_without_allocating() {
+        let err = compute_plan(u64::MAX, None, None).unwrap_err();
+        assert!(
+            matches!(err, DomainError::Validation { .. }),
+            "expected Validation, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn compute_plan_widens_part_size_to_stay_within_max_part_count() {
+        // 15,000 parts at DEFAULT_MIN_PART_SIZE would exceed MAX_PART_COUNT.
+        let declared_size = 15_000 * DEFAULT_MIN_PART_SIZE;
+        let (part_size, parts) = compute_plan(declared_size, Some(DEFAULT_MIN_PART_SIZE), None)
+            .expect("must widen instead of rejecting");
+
+        assert!(
+            part_size > DEFAULT_MIN_PART_SIZE,
+            "part_size must have been widened above the caller's preferred value, got {part_size}"
+        );
+        assert!(
+            part_size <= MAX_PART_SIZE,
+            "widened part_size must never exceed MAX_PART_SIZE, got {part_size}"
+        );
+        assert!(
+            (parts.len() as u64) <= MAX_PART_COUNT,
+            "plan must fit within MAX_PART_COUNT parts, got {}",
+            parts.len()
+        );
+        let total: u64 = parts.iter().map(|(_, _, size)| *size).sum();
+        assert_eq!(
+            total, declared_size,
+            "sum of part sizes must equal declared_size"
+        );
+    }
+
+    #[test]
+    fn compute_plan_rejects_declared_size_beyond_max_part_size_times_max_part_count() {
+        let declared_size = MAX_PART_SIZE * MAX_PART_COUNT + 1;
+        let err = compute_plan(declared_size, None, None).unwrap_err();
+        assert!(
+            matches!(err, DomainError::Validation { .. }),
+            "expected Validation, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn compute_plan_accepts_declared_size_exactly_at_the_boundary() {
+        let declared_size = MAX_PART_SIZE * MAX_PART_COUNT;
+        let (part_size, parts) =
+            compute_plan(declared_size, None, None).expect("boundary value must be accepted");
+        assert_eq!(part_size, MAX_PART_SIZE);
+        assert_eq!(parts.len() as u64, MAX_PART_COUNT);
+    }
+
+    /// Baseline snapshot that the negative tests below mutate one field away from.
+    fn stored_bound() -> StoredCompleteResult {
+        StoredCompleteResult {
+            version_id: Uuid::now_v7(),
+            size: 11,
+            content_hash: hex::encode([0u8; 32]),
+            hash_mode: HashMode::WholeSha256.as_str().to_owned(),
+            part_count: 1,
+            bind_state: BindState::Bound.as_str().to_owned(),
+            etag: Some("\"etag-value\"".to_owned()),
+            current_etag: None,
+        }
+    }
+
+    /// A snapshot differing from [`stored_bound`] in the given fields.
+    fn stored(
+        hash_mode: HashMode,
+        part_count: i32,
+        bind_state: BindState,
+        etag: Option<&str>,
+        current_etag: Option<&str>,
+    ) -> StoredCompleteResult {
+        StoredCompleteResult {
+            hash_mode: hash_mode.as_str().to_owned(),
+            part_count,
+            bind_state: bind_state.as_str().to_owned(),
+            etag: etag.map(str::to_owned),
+            current_etag: current_etag.map(str::to_owned),
+            ..stored_bound()
+        }
+    }
+
+    const MANIFEST: Option<&str> = Some("v1,0:aa");
+
+    #[test]
+    fn into_completed_accepts_valid_snapshots_unchanged() {
+        use HashMode::{MultipartCompositeSha256 as Composite, WholeSha256 as Whole};
+
+        let cases = [
+            ("whole-sha256 bound", stored_bound(), None),
+            (
+                "composite conflict",
+                stored(
+                    Composite,
+                    3,
+                    BindState::Conflict,
+                    None,
+                    Some("\"current-etag\""),
+                ),
+                MANIFEST,
+            ),
+            (
+                "manual requires neither etag nor current_etag",
+                stored(Whole, 1, BindState::Manual, None, None),
+                None,
+            ),
+        ];
+        for (name, stored, manifest) in cases {
+            let completed = stored
+                .clone()
+                .into_completed(manifest.map(str::to_owned))
+                .unwrap_or_else(|| panic!("{name}: a valid snapshot must be accepted"));
+            assert_eq!(completed.hash_mode.as_str(), stored.hash_mode, "{name}");
+            assert_eq!(completed.part_count, stored.part_count, "{name}");
+            assert_eq!(completed.bind_state.as_str(), stored.bind_state, "{name}");
+            assert_eq!(completed.etag, stored.etag, "{name}");
+            assert_eq!(completed.current_etag, stored.current_etag, "{name}");
+            assert_eq!(completed.manifest.as_deref(), manifest, "{name}");
+        }
+    }
+
+    #[test]
+    fn into_completed_rejects_inconsistent_snapshots() {
+        use HashMode::{MultipartCompositeSha256 as Composite, WholeSha256 as Whole};
+
+        let cases = [
+            (
+                "whole-sha256 with part_count != 1",
+                StoredCompleteResult {
+                    part_count: 2,
+                    ..stored_bound()
+                },
+                None,
+            ),
+            ("whole-sha256 with a manifest", stored_bound(), MANIFEST),
+            (
+                "composite with zero part_count",
+                stored(Composite, 0, BindState::Bound, Some("\"etag-value\""), None),
+                MANIFEST,
+            ),
+            (
+                "bound without an etag",
+                StoredCompleteResult {
+                    etag: None,
+                    ..stored_bound()
+                },
+                None,
+            ),
+            (
+                "conflict without a current_etag",
+                stored(Composite, 2, BindState::Conflict, None, None),
+                MANIFEST,
+            ),
+            (
+                "bound with a current_etag",
+                StoredCompleteResult {
+                    current_etag: Some("\"other\"".to_owned()),
+                    ..stored_bound()
+                },
+                None,
+            ),
+            (
+                "conflict with an etag",
+                stored(
+                    Composite,
+                    2,
+                    BindState::Conflict,
+                    Some("\"new\""),
+                    Some("\"cur\""),
+                ),
+                MANIFEST,
+            ),
+            (
+                "manual with an etag",
+                stored(Whole, 1, BindState::Manual, Some("\"new\""), None),
+                None,
+            ),
+            (
+                "manual with a current_etag",
+                stored(Whole, 1, BindState::Manual, None, Some("\"current\"")),
+                None,
+            ),
+            (
+                "content_hash not a 32-byte digest",
+                StoredCompleteResult {
+                    content_hash: hex::encode([0u8; 1]),
+                    ..stored_bound()
+                },
+                None,
+            ),
+            // One-part plans finalize as `whole-sha256`, so a one-part composite is never written.
+            (
+                "one-part composite with a manifest",
+                stored(Composite, 1, BindState::Manual, None, None),
+                MANIFEST,
+            ),
+            (
+                "one-part composite without a manifest",
+                stored(Composite, 1, BindState::Manual, None, None),
+                None,
+            ),
+            (
+                "multi-part composite without a manifest",
+                stored(Composite, 2, BindState::Manual, None, None),
+                None,
+            ),
+        ];
+        for (name, stored, manifest) in cases {
+            assert!(
+                stored.into_completed(manifest.map(str::to_owned)).is_none(),
+                "{name}: must fall back, not be accepted as-is"
+            );
+        }
+    }
+
+    #[test]
+    fn multipart_upload_state_completing_as_str_is_stable_wire_spelling() {
+        assert_eq!(MultipartUploadState::Completing.as_str(), "completing");
+        assert_eq!(
+            MultipartUploadState::parse("completing"),
+            Some(MultipartUploadState::Completing)
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "completion lease held elsewhere")]
+    fn unwrap_completed_panics_while_completion_lease_is_held() {
+        let outcome = MultipartCompleteOutcome::Completing {
+            retry_after_secs: 5,
+        };
+        drop(outcome.unwrap_completed());
+    }
+
+    #[test]
+    fn stored_complete_result_with_unknown_bind_state_fails_to_rehydrate() {
+        let stored = StoredCompleteResult {
+            bind_state: "not-a-real-state".to_owned(),
+            ..stored_bound()
+        };
+        assert!(
+            stored.into_completed(None).is_none(),
+            "an unrecognized bind_state must fail to rehydrate rather than silently default"
+        );
     }
 }

@@ -1,10 +1,12 @@
 //! Policy and retention-rule intent methods.
 
 use time::OffsetDateTime;
+use toolkit_db::secure::TxConfig;
 use toolkit_security::AccessScope;
 use uuid::Uuid;
 
 use crate::domain::error::DomainError;
+use crate::domain::error_convert::db_err;
 use crate::domain::policy::{
     PolicyBody, PolicyScope, RetentionRuleBody, RetentionScope, StoredPolicy, StoredRetentionRule,
 };
@@ -50,7 +52,11 @@ impl Store {
         let body = body.clone();
         self.db
             .db()
-            .transaction_ref_mapped(move |tx| {
+            .transaction_with_retry(TxConfig::default(), db_err, move |tx| {
+                let policies = policies.clone();
+                let scope = scope.clone();
+                let policy_scope = policy_scope.clone();
+                let body = body.clone();
                 Box::pin(async move {
                     policies
                         .upsert(
@@ -81,7 +87,50 @@ impl Store {
             .await
     }
 
-    /// Fetch a retention rule by `rule_id`.
+    /// List retention rules for a tenant, keyset-paginated in either direction.
+    ///
+    /// Fetches `limit + 1` rows to detect a further page (no `COUNT`); `finish_page` trims,
+    /// restores canonical order and builds both cursors. The cursor carries no binding
+    /// fingerprint (`f: None`) because the listing has no client filter.
+    pub async fn list_retention_rules_page(
+        &self,
+        scope: &AccessScope,
+        tenant_id: Uuid,
+        limit: u64,
+        cursor: Option<&str>,
+    ) -> Result<toolkit_odata::Page<StoredRetentionRule>, DomainError> {
+        use crate::domain::pagination;
+
+        let after = cursor
+            .map(|token| pagination::decode(token, pagination::RETENTION_RULES_ID_FIELD, None))
+            .transpose()?;
+
+        let conn = self.db.conn().map_err(DomainError::from)?;
+        let rows = self
+            .repos
+            .retention_rules
+            .list_page(
+                &conn,
+                scope,
+                crate::infra::storage::repo::RetentionRuleListParams {
+                    tenant_id,
+                    limit: limit.saturating_add(1),
+                    after,
+                },
+            )
+            .await?;
+
+        Ok(pagination::finish_page(
+            rows,
+            limit,
+            after,
+            pagination::RETENTION_RULES_ID_FIELD,
+            None,
+            |r| (r.created_at, r.rule_id),
+        )?)
+    }
+
+    /// Fetch a single retention rule by `rule_id`.
     pub async fn get_retention_rule(
         &self,
         scope: &AccessScope,

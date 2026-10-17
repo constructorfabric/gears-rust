@@ -4,6 +4,7 @@
 <!-- toc -->
 
 - [Two planes](#two-planes)
+- [Changes for 0.2.x clients](#changes-for-02x-clients)
 - [P1 — Control plane (`/api/file-storage/v1`)](#p1--control-plane-apifile-storagev1)
 - [P1 — Sidecar (signed-URL authorized)](#p1--sidecar-signed-url-authorized)
 - [Data-plane callbacks (sidecar → control plane, s2s token-authenticated)](#data-plane-callbacks-sidecar--control-plane-s2s-token-authenticated)
@@ -56,6 +57,37 @@ Encoding conventions:
 - All error responses follow RFC 7807 (`application/problem+json`).
 - `file_id` and `version_id` are UUIDs. A backend object lives at `/{file_id}/{version_id}` and is immutable.
 
+## Changes for 0.2.x clients
+
+Breaking changes to the three list endpoints — `GET /files`, `GET /files/{id}/versions`, `GET /retention-rules`
+(details in [Cursor pagination](#cursor-pagination) and [P2 — Retention rules](#p2--retention-rules)):
+
+- Each now returns `{"items": [...], "page_info": {"next_cursor", "prev_cursor", "limit"}}` instead of a bare JSON
+  array.
+- The `cursor` query parameter (taken from `page_info.next_cursor` or `page_info.prev_cursor`) replaces `offset`.
+  `offset`, and any other unrecognized query parameter, is rejected with `400`.
+- `limit=0` is rejected with `400`. The default page size is 25 and the maximum is 200; a larger `limit` is
+  clamped down to 200.
+- `GET /retention-rules` is now paginated.
+
+Breaking changes to the upload flow (details in the `POST /files` notes, "Single-part bind outcome headers", and the
+multipart section below):
+
+- `POST /files` takes `bind` (`"auto"` default | `"manual"`) and an optional `multipart` block (`declared_size`,
+  `preferred_part_size`). When the server plan has two or more parts, the response carries the parts plan instead of
+  `upload_url`; a one-part plan still returns `upload_url`. `idempotency_key` together with `multipart` is a `400`.
+- `UploadTicketDto.upload_url` is now optional (absent when the parts plan is returned).
+- With `bind: "auto"` the upload itself binds the first content, so clients must stop issuing a separate `bind` for
+  it. Single-part: `X-FS-Bound` / `ETag` / `X-FS-Current-ETag` on the sidecar `PUT` response; multipart:
+  `bind_state` / `etag` / `current_etag` in the `complete` response. An absent `X-FS-Bound` means "not bound".
+- `complete` may answer `202` (`{"state": "completing", "retry_after_secs": N}` plus a `Retry-After` header) while
+  another caller holds the completion lease; re-issue it. A repeated `complete` on a finished session replays the
+  stored result with `200` instead of `409`.
+- `concurrency` is removed from the multipart initiate request and response.
+- `manifest` in the `complete` response is optional (absent for a one-part plan), and `GET /files/{id}/versions`
+  items carry `manifest` for composite versions.
+- An idempotent `POST /files` replay with a different `bind` is a `409`.
+
 ## P1 — Control plane (`/api/file-storage/v1`)
 
 ```text
@@ -105,8 +137,8 @@ Notes:
   `POST /files/{id}/multipart` call, and no orphan single-part pending version. Resume is unchanged:
   `GET /files/{id}/multipart/{upload_id}` (the `upload_id` now arrives from `POST /files`). A plan that collapses to
   one part falls back to the single-part `upload_url` path below. `bind: "auto"` (default) makes the upload itself
-  bind the first content — see the `X-FS-Bound` contract and the `complete` `bind_state` field below — for a total of
-  **2 requests** single-part and **N+2** multipart; `bind: "manual"` keeps the staged flow (explicit `bind`, see
+  bind the first content — see the `X-FS-Bound` contract and the `complete` `bind_state` field below — with no
+  separate `bind` request; `bind: "manual"` keeps the staged flow (explicit `bind`, see
   "Upload, bind, and the conflict retry" below).
 - `POST /files/{id}/versions` takes **no** request body and does **not** read `If-Match`.
 - `GET /files` **requires** both `owner_kind` and `owner_id` query params (`400` if either is missing/invalid). A
@@ -315,7 +347,7 @@ each part write in the multipart case — see `D2`).
   leading bytes (magic-byte sniffing) and persisted, and the version is marked `available`.
 - **Response**: `204 No Content`. Errors: `400` (validation/size mismatch or no object), `403` (bad/expired/mismatched
   token, **or** missing/mismatched `x-fs-internal-token` — see above), `404` (version not found), `409` (already
-  finalized), `500` (a permanent backend fault reading the object's length or prefix), `503` (a transient one —
+  finalized with different content), `500` (a permanent backend fault reading the object's length or prefix), `503` (a transient one —
   network, timeout, backend overload — carries `Retry-After`).
 - For a `bind: "manual"` upload (and `POST /files/{id}/versions`, which never auto-binds) this endpoint does **not**
   bind the version as current — `POST /files/{id}/bind` remains a separate, explicit client call. For the default
@@ -622,8 +654,8 @@ is `404` — identical to transferring a `file_id` that never existed.
 
 Content is an immutable blob per version; a file's live content is the `content_id` pointer, swapped under optimistic
 CAS. This section spells out the **`bind: "manual"`** flow (and `POST /files/{id}/versions`, which never auto-binds):
-presign (control) → `PUT` (data) → finalize (data-plane callback) → bind (control) — three control-plane touches and
-one data-plane touch, the last control touch an explicit, separate client call. **`bind: "auto"` (the default for
+presign (control) → `PUT` (data) → finalize (data-plane callback) → bind (control), the last step an explicit,
+separate client call. **`bind: "auto"` (the default for
 `POST /files`) skips step 4**: finalize itself swaps `content_id` inline, under the same CAS, and reports the
 outcome via the `X-FS-Bound` header (single-part) / `complete`'s `bind_state` field (multipart) instead of requiring
 a separate `bind` call — see "Single-part bind outcome headers" and "Bind inside complete" above (§P1 control plane
@@ -938,11 +970,14 @@ access or carry substantially more per-request state in the token than it does t
     version's upload has not been finalized. This route's OpenAPI registration in `routes.rs` declares only
     `401`/`403`/`404`/`500`, so this `409` is not represented in the generated OpenAPI schema even though the domain
     code returns it.
-  - **sidecar `PUT` (replay)**: a `PUT` to an `upload_url` whose `backend_path` already holds a published blob (a
-    genuine token replay after the version was already finalized, as opposed to a benign retry of the same in-flight
-    upload) gets `409 Conflict` from the sidecar itself — `publish_exclusive`'s create-exclusive write refuses to
-    overwrite the existing object, and the live bytes are never touched. A benign retry (the earlier publish landed
-    but finalize had not yet run) instead converges to `200` once finalize succeeds on this attempt.
+  - **sidecar `PUT` (replay)**: a `PUT` to an `upload_url` whose `backend_path` already holds a published blob —
+    `publish_exclusive`'s create-exclusive write refuses to overwrite it, so the live bytes are never touched, and the
+    sidecar still calls finalize with this attempt's size/hash. If finalize succeeds (a benign retry of an upload
+    whose finalize never landed, or whose response was lost) the `PUT` converges to `200` with the original bind
+    headers. If the control plane rejects the callback with a `4xx` (e.g. different bytes, so the hash does not match
+    the already-`available` version) the sidecar answers `409 Conflict` — this `PUT` took no effect. With no control
+    plane configured a replay is also `409` (nothing can confirm it matches the stored object). A transport failure
+    or a control-plane `5xx` is `502`, as for a first upload.
 
   Note: `update_metadata` (`PATCH /files/{id}`) declares a `409` response in its OpenAPI registration
   (`routes.rs`), but no domain code path returns `DomainError::Conflict` for this handler — its only failure mode
@@ -975,7 +1010,8 @@ access or carry substantially more per-request state in the token than it does t
   `check_quota_bytes` are a permissive no-op and this `429` cause cannot currently occur. See
   [operations.md](./operations.md#storage-quota-not-enforced).
 - `502 Bad Gateway` — the sidecar's own response to the client when its finalize or report-part callback to the
-  control plane fails (transport error after retries, or the control plane rejects the callback with a 4xx/5xx). This
+  control plane fails (transport error after retries, or the control plane rejects the callback with a 4xx/5xx; on a
+  replayed `PUT` a control-plane `4xx` is reported as `409` instead). This
   is a **retry signal**: the callback failure does not mean the bytes failed to land — see "Data-plane callbacks"
   above (`FS_SIDECAR_FINALIZE_TIMEOUT_SECS`/`FS_SIDECAR_FINALIZE_CONNECT_TIMEOUT_SECS`) for the retry/timeout
   configuration and the decision between `200`, `409`, and `502` on a replayed `PUT`.

@@ -20,11 +20,11 @@ Two scenarios, mirroring `lifecycle/test_file_storage_lifecycle.py`'s
 single-part flow (adapted for S3) plus a new multipart flow:
 
 1. `test_s3_single_part_full_lifecycle` — create -> presign -> PUT
-   (client -> sidecar -> S3) -> finalize (sidecar s2s callback) -> bind ->
+   (client -> sidecar -> S3) -> finalize (sidecar s2s callback, auto-bind) ->
    download-url -> GET bytes -> assert round-trip.
-2. `test_s3_multipart_full_lifecycle` -- initiate -> PUT >= 2 parts
-   (client -> sidecar -> S3, sidecar reports each part back to the control
-   plane) -> complete -> bind -> download -> assert the assembled bytes are
+2. `test_s3_multipart_full_lifecycle` -- create with multipart intent -> PUT
+   >= 2 parts (client -> sidecar -> S3, sidecar reports each part back to the
+   control plane) -> complete (auto-bind) -> download -> assert the assembled bytes are
    byte-for-byte correct.
 
 Both flows create the file via `POST /files` (as normal), but since this
@@ -57,7 +57,7 @@ _LAST_PART_SIZE = 1 * 1024 * 1024
 MULTIPART_PAYLOAD = (b"A" * _PART_SIZE) + (b"B" * _LAST_PART_SIZE)
 
 
-def _create_file(client: httpx.Client, gts_file_type: str) -> dict:
+def _create_file(client: httpx.Client, gts_file_type: str, **extra) -> dict:
     owner_id = str(uuid.uuid4())
     create_body = {
         "owner_kind": "user",
@@ -65,6 +65,7 @@ def _create_file(client: httpx.Client, gts_file_type: str) -> dict:
         "name": f"s3-lifecycle-test-{uuid.uuid4()}.bin",
         "gts_file_type": gts_file_type,
         "mime_type": "application/octet-stream",
+        **extra,
     }
     r = client.post(f"{API_BASE}/files", json=create_body)
     assert r.status_code == 201, f"POST /files failed: {r.status_code}\n{r.text}"
@@ -77,7 +78,7 @@ def test_s3_single_part_full_lifecycle(
     lifecycle_s3_auth_headers: dict,
     gts_file_type: str,
 ):
-    """Single-part S3 lifecycle: create -> upload -> bind -> download.
+    """Single-part S3 lifecycle: create -> upload (auto-bind) -> download.
 
     Seam coverage:
     * `default_backend_id` config wiring routes new uploads to the S3 backend
@@ -113,16 +114,27 @@ def test_s3_single_part_full_lifecycle(
     assert upload_resp.status_code == 200, (
         f"PUT {upload_url!r} failed: {upload_resp.status_code}\n{upload_resp.text}"
     )
+    # api.md §"Single-part bind outcome headers": the sidecar's own PUT
+    # response must forward the won-CAS outcome transparently -- the real
+    # cross-process HTTP hop (sidecar → control-plane finalize → sidecar →
+    # client), not just the control-plane handler's own response.
+    assert upload_resp.headers.get("x-fs-bound") == "true", (
+        f"Expected X-FS-Bound: true on a won auto-bind, got headers: {dict(upload_resp.headers)}"
+    )
+    assert upload_resp.headers.get("etag"), (
+        f"Expected an ETag header on a won auto-bind, got headers: {dict(upload_resp.headers)}"
+    )
 
-    # ── 3. Bind the version (first bind — no If-Match required) ──────────
-    bind_resp = client.post(
-        f"{API_BASE}/files/{file_id}/bind",
-        json={"version_id": version_id},
+    # ── 3. The upload already bound the content (auto-bind) ──────────────
+    # `bind: "auto"` is the default, so the sidecar's finalize callback swaps
+    # the content pointer in the same transaction that marks the version
+    # available. A separate `POST /bind` is no longer part of this flow (it
+    # would be rejected without `If-Match`, content being already bound).
+    bound_resp = client.get(f"{API_BASE}/files/{file_id}")
+    assert bound_resp.status_code == 200, (
+        f"GET /files/{file_id} failed: {bound_resp.status_code}\n{bound_resp.text}"
     )
-    assert bind_resp.status_code == 200, (
-        f"POST /files/{file_id}/bind failed: {bind_resp.status_code}\n{bind_resp.text}"
-    )
-    bound_file = bind_resp.json()
+    bound_file = bound_resp.json()
     assert bound_file.get("content_id") == version_id
 
     # ── 4. Get a signed download URL from the control plane ───────────────
@@ -152,11 +164,11 @@ def test_s3_multipart_full_lifecycle(
     lifecycle_s3_auth_headers: dict,
     gts_file_type: str,
 ):
-    """Multipart S3 lifecycle: create -> initiate -> PUT parts -> complete ->
-    bind -> download.
+    """Multipart S3 lifecycle: create (multipart intent) -> PUT parts ->
+    complete (auto-bind) -> download.
 
     Seam coverage:
-    * `POST /files/{id}/multipart` (server-authoritative parts plan) picks
+    * `POST /files` multipart intent (server-authoritative parts plan) picks
       the S3 backend (again via `default_backend_id`, since there is no
       per-request backend selector on this endpoint either — see
       `conftest.py`'s docstring).
@@ -175,26 +187,18 @@ def test_s3_multipart_full_lifecycle(
         follow_redirects=False,
     )
 
-    # ── 1. Create the file (establishes file_id; its own v1 upload ticket
-    #        is intentionally unused — the multipart flow mints its own
-    #        version) ──────────────────────────────────────────────────────
-    ticket = _create_file(client, gts_file_type)
+    # ── 1. Create the file with a multipart intent: the response carries the
+    #        server-authoritative parts plan (>= 2 parts for this size), so no
+    #        separate `POST /files/{id}/multipart` round-trip is needed. ─────
+    ticket = _create_file(
+        client,
+        gts_file_type,
+        multipart={"declared_size": len(MULTIPART_PAYLOAD)},
+    )
     file_id: str = ticket["file_id"]
-
-    # ── 2. Initiate a multipart upload and get the server-authoritative
-    #        parts plan ────────────────────────────────────────────────────
-    initiate_resp = client.post(
-        f"{API_BASE}/files/{file_id}/multipart",
-        json={
-            "declared_mime": "application/octet-stream",
-            "declared_size": len(MULTIPART_PAYLOAD),
-        },
-    )
-    assert initiate_resp.status_code == 200, (
-        f"POST /files/{file_id}/multipart failed: "
-        f"{initiate_resp.status_code}\n{initiate_resp.text}"
-    )
-    plan = initiate_resp.json()
+    plan = ticket.get("multipart")
+    assert plan is not None, f"expected a multipart parts plan in: {ticket!r}"
+    assert "upload_url" not in ticket, f"multipart ticket must not carry upload_url: {ticket!r}"
     upload_id = plan["upload_id"]
     version_id = plan["version_id"]
     parts = plan["parts"]
@@ -230,15 +234,17 @@ def test_s3_multipart_full_lifecycle(
         f"{complete_resp.status_code}\n{complete_resp.text}"
     )
 
-    # ── 5. Bind the newly-completed version ────────────────────────────────
-    bind_resp = client.post(
-        f"{API_BASE}/files/{file_id}/bind",
-        json={"version_id": version_id},
+    # ── 5. The complete already bound the content (auto-bind) ─────────────
+    complete_body = complete_resp.json()
+    assert complete_body.get("bind_state") == "bound", (
+        f"expected bind_state == 'bound' on a won auto-bind, got: {complete_body!r}"
     )
-    assert bind_resp.status_code == 200, (
-        f"POST /files/{file_id}/bind failed: {bind_resp.status_code}\n{bind_resp.text}"
+    assert complete_body.get("etag"), f"expected an etag on a won auto-bind: {complete_body!r}"
+    bound_resp = client.get(f"{API_BASE}/files/{file_id}")
+    assert bound_resp.status_code == 200, (
+        f"GET /files/{file_id} failed: {bound_resp.status_code}\n{bound_resp.text}"
     )
-    assert bind_resp.json().get("content_id") == version_id
+    assert bound_resp.json().get("content_id") == version_id
 
     # ── 6. Download and assert the fully-assembled object is byte-exact ───
     dl_ticket_resp = client.get(f"{API_BASE}/files/{file_id}/download-url")

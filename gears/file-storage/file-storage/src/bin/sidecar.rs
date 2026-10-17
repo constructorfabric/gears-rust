@@ -31,8 +31,13 @@
 //! After a successful single-part `PUT` the sidecar posts a finalize callback to
 //! `POST {control_url}/api/file-storage/v1/files/{file_id}/versions/{version_id}/finalize`
 //! with the signed token and the size and SHA-256 it measured while streaming. It answers
-//! `200 OK` only if the callback succeeds; otherwise `502 Bad Gateway`, and the client
-//! retries (the backend write overwrites, so retrying is safe).
+//! `200 OK` only if the callback succeeds; otherwise `502 Bad Gateway`. The control plane's
+//! bind outcome is echoed on the `200` (`X-FS-Bound` + `ETag` / `X-FS-Current-ETag`).
+//!
+//! The blob is published create-exclusive and never overwritten. A retry finds the object
+//! already there (`created: false`) and still calls finalize: `200` on success, `409` if the
+//! control plane rejects it, `502` on transport failure or 5xx. With no control plane a replay
+//! gets `409` (nothing can confirm it matches); a first upload stays `200`.
 
 use std::borrow::Cow;
 use std::net::SocketAddr;
@@ -309,10 +314,15 @@ fn extract_token(q: &TokenQuery, headers: &HeaderMap) -> Option<String> {
 
 /// `PUT` upload: verifies the token (op=PUT) and streams the body to the backend.
 ///
-/// The body is never buffered whole: `StorageBackend::put_stream` writes and hashes chunks
-/// as they arrive and aborts mid-stream once `claims.upload.max_size` is exceeded.
+/// The body is never buffered whole: `publish_exclusive` writes and hashes chunks as they
+/// arrive and aborts mid-stream once `claims.upload.max_size` is exceeded.
 /// `exact_size`/`expected_hash` are final only after the stream is drained, so they are
-/// checked after `put_stream` returns.
+/// checked after it returns.
+///
+/// `created: false` means an earlier PUT with the same token already published the object
+/// (left untouched); finalize is still called with this attempt's size/hash. A control-plane
+/// rejection (4xx) or no control plane gives `409` (this PUT took no effect); transport
+/// failure or 5xx gives `502`.
 async fn upload(
     State(state): State<SidecarState>,
     Path((file_id, version_id)): Path<(Uuid, Uuid)>,
@@ -350,8 +360,8 @@ async fn upload(
         body.into_data_stream()
             .map(|r| r.map_err(std::io::Error::other)),
     );
-    let (bytes_written, digest) = match backend
-        .put_stream(&claims.backend_path, byte_stream, claims.upload.max_size)
+    let outcome = match backend
+        .publish_exclusive(&claims.backend_path, byte_stream, claims.upload.max_size)
         .await
     {
         Ok(v) => v,
@@ -360,22 +370,35 @@ async fn upload(
             return (StatusCode::PAYLOAD_TOO_LARGE, "exceeds max_size").into_response();
         }
         Err(e) => {
-            tracing::error!(error = %e, "backend put_stream failed");
+            tracing::error!(error = %e, "backend publish_exclusive failed");
             return (StatusCode::INTERNAL_SERVER_ERROR, "backend error").into_response();
         }
     };
+    let (bytes_written, digest, created) = (outcome.bytes_written, outcome.digest, outcome.created);
 
     if claims
         .upload
         .exact_size
         .is_some_and(|exact| bytes_written != exact)
     {
-        return (StatusCode::BAD_REQUEST, "size does not match exact_size").into_response();
+        return reject_upload_bad_content(
+            backend.as_ref(),
+            &claims,
+            created,
+            "size does not match exact_size",
+        )
+        .await;
     }
     if let Some(expected) = &claims.upload.expected_hash {
         let got = format!("{}:{}", hash::ALGORITHM, hex::encode(digest));
         if !expected.eq_ignore_ascii_case(&got) {
-            return (StatusCode::BAD_REQUEST, "content hash mismatch").into_response();
+            return reject_upload_bad_content(
+                backend.as_ref(),
+                &claims,
+                created,
+                "content hash mismatch",
+            )
+            .await;
         }
     }
 
@@ -385,9 +408,19 @@ async fn upload(
     #[allow(clippy::cast_precision_loss)]
     state.metrics.record_ingress_bytes(bytes_written as f64);
 
+    // Replay without a control plane: nothing can confirm the bytes match.
+    if !created && state.control_base_url.is_empty() {
+        return (
+            StatusCode::CONFLICT,
+            "content already published for this version",
+        )
+            .into_response();
+    }
+
     // Tell the control plane the bytes landed (the signed token proves the upload was
     // pre-authorized); `claims.request_id` is echoed as `x-request-id` for log correlation.
-    if let Err(rejection) = finalize_with_control_plane(
+    // A converged replay gets the same echo as the original.
+    match finalize_with_control_plane(
         &state,
         &token,
         &claims.request_id,
@@ -398,17 +431,62 @@ async fn upload(
     )
     .await
     {
-        return rejection.into_response();
+        Ok(echo) => uploaded_response(&echo),
+        // Replay: a control-plane rejection means this PUT took no effect; transport/5xx keep the first-upload status.
+        Err(rejection) if !created && rejection.control_plane_rejected => (
+            StatusCode::CONFLICT,
+            "content already published for this version",
+        )
+            .into_response(),
+        Err(rejection) => rejection.into_response(),
     }
+}
 
-    (StatusCode::OK, "uploaded").into_response()
+/// Build the `200 uploaded` response, echoing the auto-bind outcome headers.
+fn uploaded_response(echo: &FinalizeEcho) -> Response {
+    let mut resp = (StatusCode::OK, "uploaded").into_response();
+    for (name, value) in [
+        ("x-fs-bound", &echo.bound),
+        ("etag", &echo.etag),
+        ("x-fs-current-etag", &echo.current_etag),
+    ] {
+        if let Some(v) = value
+            && let Ok(v) = HeaderValue::from_str(v)
+        {
+            resp.headers_mut().insert(name, v);
+        }
+    }
+    resp
+}
+
+/// Rejects an upload that failed the post-publish `exact_size`/`expected_hash` check with `400`,
+/// first deleting the object `publish_exclusive` wrote **iff this request created it** (a
+/// leftover would block a corrected retry until orphan cleanup). Deletion is best-effort; with
+/// `created == false` another request owns the object and nothing is deleted.
+async fn reject_upload_bad_content(
+    backend: &dyn StorageBackend,
+    claims: &Claims,
+    created: bool,
+    reason: &'static str,
+) -> Response {
+    if created && let Err(e) = backend.delete(&claims.backend_path).await {
+        tracing::warn!(
+            error = %e,
+            backend_path = %claims.backend_path,
+            "failed to clean up freshly-published object after post-validation failure; \
+             path stays poisoned until orphan reconciliation reclaims it"
+        );
+    }
+    (StatusCode::BAD_REQUEST, reason).into_response()
 }
 
 /// A failed upload step: the status and plain-text body the client receives. Kept small
 /// (unlike a built `Response`) to stay under `clippy::result_large_err`.
+#[derive(Debug)]
 struct Rejection {
     status: StatusCode,
     body: Cow<'static, str>,
+    control_plane_rejected: bool,
 }
 
 impl Rejection {
@@ -416,6 +494,7 @@ impl Rejection {
         Self {
             status,
             body: body.into(),
+            control_plane_rejected: false,
         }
     }
 }
@@ -433,14 +512,33 @@ fn finalize_body(size: i64, hash_hex: &str) -> Vec<u8> {
         .into_bytes()
 }
 
+/// Auto-bind outcome from the finalize response, copied onto the sidecar's `200`; all `None` for
+/// manual-bind tokens.
+#[derive(Debug, Default, Clone)]
+struct FinalizeEcho {
+    bound: Option<String>,
+    etag: Option<String>,
+    current_etag: Option<String>,
+}
+
 async fn interpret_finalize_response(
     resp: reqwest::Response,
     file_id: Uuid,
     version_id: Uuid,
-) -> Result<(), Rejection> {
+) -> Result<FinalizeEcho, Rejection> {
     if resp.status().is_success() {
         tracing::debug!(%file_id, %version_id, "finalize callback succeeded");
-        return Ok(());
+        let hdr = |name: &str| {
+            resp.headers()
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned)
+        };
+        return Ok(FinalizeEcho {
+            bound: hdr("x-fs-bound"),
+            etag: hdr("etag"),
+            current_etag: hdr("x-fs-current-etag"),
+        });
     }
     let status = resp.status();
     let body_text = resp.text().await.unwrap_or_default();
@@ -451,7 +549,10 @@ async fn interpret_finalize_response(
         "control-plane finalize callback returned error"
     );
     // Status/body stay in the log: the control plane's raw error must not reach the client.
-    Err(Rejection::new(StatusCode::BAD_GATEWAY, "finalize failed"))
+    Err(Rejection {
+        control_plane_rejected: status.is_client_error(),
+        ..Rejection::new(StatusCode::BAD_GATEWAY, "finalize failed")
+    })
 }
 
 /// Max attempts (including the first) per callback POST. Only transport-level connect/timeout
@@ -520,9 +621,9 @@ async fn finalize_with_control_plane(
     version_id: Uuid,
     size: i64,
     hash_hex: &str,
-) -> Result<(), Rejection> {
+) -> Result<FinalizeEcho, Rejection> {
     if state.control_base_url.is_empty() {
-        return Ok(());
+        return Ok(FinalizeEcho::default());
     }
 
     let url = format!(
