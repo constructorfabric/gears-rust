@@ -15,7 +15,8 @@ use super::{
 use crate::config::MetricsConfig;
 use crate::domain::ports::lifecycle_gauges::{LifecycleCounts, LifecycleGaugeSink};
 use crate::domain::ports::metrics::{
-    DenialReason, QeMetrics, REASON_LABEL, SURFACE_LABEL, ValidationReason, ValidationSurface,
+    DenialReason, OperationKind, QeMetrics, REASON_LABEL, RetentionTable, SURFACE_LABEL,
+    ValidationReason, ValidationSurface,
 };
 use crate::infra::lifecycle_gauges::{
     LifecycleGaugeCell, QUOTA_CAP_UNBOUNDED_TOTAL, QUOTA_CAP_ZERO_TOTAL,
@@ -213,6 +214,20 @@ fn every_reason_label_is_a_distinct_snake_case_token() {
     );
     let reasons: Vec<&str> = ValidationReason::ALL.iter().map(|r| r.as_label()).collect();
     assert_distinct_snake_case(&reasons);
+    // The hot path's two label sets are closed for the same reason: a denial
+    // reason authored in a CEL policy, or an operation kind, must never widen
+    // the cardinality of an instrument.
+    let operations: Vec<&str> = OperationKind::ALL.iter().map(|o| o.as_label()).collect();
+    assert_distinct_snake_case(&operations);
+    assert_eq!(operations, ["debit", "credit", "rollback", "preview"]);
+    let tables: Vec<&str> = RetentionTable::ALL.iter().map(|t| t.as_str()).collect();
+    assert_distinct_snake_case(&tables);
+    assert_eq!(tables, ["idempotency", "operation_log"]);
+    assert_eq!(
+        DenialReason::from_decision_reason("SOMETHING_A_POLICY_AUTHORED").as_label(),
+        "engine_denied",
+        "an engine-authored reason collapses instead of opening the label set"
+    );
 }
 
 #[test]
@@ -305,4 +320,84 @@ fn lifecycle_gauges_honour_the_configured_prefix() {
         Some(1)
     );
     assert_eq!(gauge_last_u64(&exporter, QUOTA_CAP_ZERO_TOTAL), None);
+}
+
+#[test]
+fn policy_engine_instruments_use_only_documented_labels() {
+    use crate::domain::ports::metrics::{EngineLabel, PolicyTransition};
+    use quota_enforcement_sdk::engine::DebitPlanInvariant;
+    let (provider, exporter) = local_provider();
+    let adapter = QeMetricsMeter::new(
+        &provider.meter("qe-policy-test"),
+        &MetricsConfig::default(),
+        cell(),
+    );
+    adapter.record_engine_bootstrap_failure(EngineLabel::Cel);
+    adapter.record_engine_evaluation(EngineLabel::Cel, std::time::Duration::from_millis(1));
+    adapter.record_plan_violation(
+        EngineLabel::Cel,
+        DebitPlanInvariant::AmountExceedsRequestAmount,
+    );
+    adapter.record_policy_transition(PolicyTransition::Rollback);
+    adapter.record_policy_conflict();
+    provider.force_flush().expect("flush");
+    assert_eq!(
+        counter_sum(
+            &exporter,
+            "engine_bootstrap_failures_total",
+            Some(("engine_id", "cel"))
+        ),
+        Some(1)
+    );
+    assert_eq!(
+        counter_sum(
+            &exporter,
+            "policy_version_transitions_total",
+            Some(("transition_kind", "rollback"))
+        ),
+        Some(1)
+    );
+    assert_eq!(
+        counter_sum(&exporter, "policy_version_conflict_rejections_total", None),
+        Some(1)
+    );
+    for resource in exporter.get_finished_metrics().expect("metrics") {
+        for scope in resource.scope_metrics() {
+            for metric in scope.metrics() {
+                let expected: &[&str] = match metric.name() {
+                    "engine_bootstrap_failures_total" | "engine_evaluation_seconds" => {
+                        &["engine_id"]
+                    }
+                    "debit_plan_invariant_violations_total" => &["engine_id", "invariant"],
+                    "policy_version_transitions_total" => &["transition_kind"],
+                    "policy_version_conflict_rejections_total" => &[],
+                    _ => continue,
+                };
+                match metric.data() {
+                    AggregatedMetrics::U64(MetricData::Sum(sum)) => {
+                        for point in sum.data_points() {
+                            let mut keys: Vec<_> = point
+                                .attributes()
+                                .map(|attribute| attribute.key.as_str())
+                                .collect();
+                            keys.sort_unstable();
+                            assert_eq!(keys, expected);
+                        }
+                    }
+                    AggregatedMetrics::F64(MetricData::Histogram(histogram)) => {
+                        for point in histogram.data_points() {
+                            assert_eq!(
+                                point
+                                    .attributes()
+                                    .map(|attribute| attribute.key.as_str())
+                                    .collect::<Vec<_>>(),
+                                expected
+                            );
+                        }
+                    }
+                    _ => panic!("unexpected policy instrument type"),
+                }
+            }
+        }
+    }
 }

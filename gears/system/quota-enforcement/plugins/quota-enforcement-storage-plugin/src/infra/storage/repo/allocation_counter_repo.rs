@@ -29,6 +29,7 @@ pub async fn insert_initial(
             quota_id: ActiveValue::Set(quota_id),
             tenant_id: ActiveValue::Set(tenant_id),
             in_flight: ActiveValue::Set(0),
+            highest_crossed_threshold_pct: ActiveValue::Set(None),
             record_version: ActiveValue::Set(1),
             updated_at: ActiveValue::Set(now),
         },

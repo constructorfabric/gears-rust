@@ -35,16 +35,41 @@ pub enum DenialReason {
     InvalidArgument,
     /// Bootstrap has not completed.
     NotReady,
+    /// An applicable Quota would be exceeded.
+    QuotaExceeded,
+    /// No active Quota covers the metric, so nothing was recorded.
+    NoApplicableQuota,
+    /// The policy's engine denied for a reason of its own. Engine reasons are
+    /// authored in policy and are unbounded, so they collapse into this one
+    /// label rather than opening the label set to arbitrary strings.
+    EngineDenied,
 }
 
 impl DenialReason {
     /// Every value, for conformance tests.
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 7] = [
         Self::PermissionDenied,
         Self::PdpUnavailable,
         Self::InvalidArgument,
         Self::NotReady,
+        Self::QuotaExceeded,
+        Self::NoApplicableQuota,
+        Self::EngineDenied,
     ];
+
+    /// The label of a decision's closed reason token.
+    ///
+    /// Anything an engine authored that is not one of the two tokens the
+    /// platform defines counts as an engine denial, which keeps the label set
+    /// closed however a policy is written.
+    #[must_use]
+    pub fn from_decision_reason(reason: &str) -> Self {
+        match reason {
+            quota_enforcement_sdk::NO_APPLICABLE_QUOTA => Self::NoApplicableQuota,
+            "QUOTA_EXCEEDED" => Self::QuotaExceeded,
+            _ => Self::EngineDenied,
+        }
+    }
 
     /// Stable label value.
     #[must_use]
@@ -54,6 +79,64 @@ impl DenialReason {
             Self::PdpUnavailable => "pdp_unavailable",
             Self::InvalidArgument => "invalid_argument",
             Self::NotReady => "not_ready",
+            Self::QuotaExceeded => "quota_exceeded",
+            Self::NoApplicableQuota => "no_applicable_quota",
+            Self::EngineDenied => "engine_denied",
+        }
+    }
+}
+
+/// Closed `operation` set of the hot-path latency histogram and the replay
+/// counter.
+#[domain_model]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OperationKind {
+    /// Charge against every applicable Quota.
+    Debit,
+    /// Return consumption to one Quota.
+    Credit,
+    /// Reverse a committed debit.
+    Rollback,
+    /// Evaluate without mutating.
+    Preview,
+}
+
+impl OperationKind {
+    /// Every value, for conformance tests.
+    pub const ALL: [Self; 4] = [Self::Debit, Self::Credit, Self::Rollback, Self::Preview];
+
+    /// Stable label value.
+    #[must_use]
+    pub const fn as_label(self) -> &'static str {
+        match self {
+            Self::Debit => "debit",
+            Self::Credit => "credit",
+            Self::Rollback => "rollback",
+            Self::Preview => "preview",
+        }
+    }
+}
+
+/// Closed `table` set of the retention counters.
+#[domain_model]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetentionTable {
+    /// Replay records.
+    Idempotency,
+    /// The operation ledger.
+    OperationLog,
+}
+
+impl RetentionTable {
+    /// Every value, for conformance tests.
+    pub const ALL: [Self; 2] = [Self::Idempotency, Self::OperationLog];
+
+    /// Stable label value.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Idempotency => "idempotency",
+            Self::OperationLog => "operation_log",
         }
     }
 }
@@ -215,7 +298,23 @@ impl fmt::Display for ValidationReason {
 
 /// Gear-specific instruments. Implemented on the platform meter in
 /// `infra::metrics`; a no-op double serves tests.
+// @cpt-dod:cpt-cf-quota-enforcement-dod-policy-engine-telemetry:p1
 pub trait QeMetrics: Send + Sync {
+    /// Registration or persisted-artifact bootstrap failure.
+    fn record_engine_bootstrap_failure(&self, engine: EngineLabel);
+    /// Evaluation duration on both success and failure.
+    fn record_engine_evaluation(&self, engine: EngineLabel, elapsed: std::time::Duration);
+    /// Rejected engine decision by closed invariant label.
+    fn record_plan_violation(
+        &self,
+        engine: EngineLabel,
+        invariant: quota_enforcement_sdk::engine::DebitPlanInvariant,
+    );
+    /// One committed transition, excluding no-op retries.
+    fn record_policy_transition(&self, transition: PolicyTransition);
+    /// One rejected optimistic concurrency check.
+    fn record_policy_conflict(&self);
+
     /// `denial_total{reason}` += 1.
     fn record_denial(&self, reason: DenialReason);
 
@@ -228,6 +327,19 @@ pub trait QeMetrics: Send + Sync {
 
     /// `admitted_metric_violations_total{surface}` += 1.
     fn record_admitted_metric_violation(&self, surface: ValidationSurface);
+
+    /// `evaluation_seconds{operation}` observes one hot-path call, on success
+    /// and on failure alike: a slow refusal is as interesting as a slow commit.
+    fn record_evaluation(&self, operation: OperationKind, elapsed: std::time::Duration);
+
+    /// `idempotency_replays_total{operation}` += 1.
+    fn record_idempotency_replay(&self, operation: OperationKind);
+
+    /// `retention_reclaimed_total{table}` += `rows`.
+    fn record_retention_reclaimed(&self, table: RetentionTable, rows: u64);
+
+    /// `retention_sweep_failures_total{table}` += 1.
+    fn record_retention_failure(&self, table: RetentionTable);
 }
 
 /// Records nothing. For tests and pre-init contexts.
@@ -236,6 +348,17 @@ pub trait QeMetrics: Send + Sync {
 pub struct NoopMetrics;
 
 impl QeMetrics for NoopMetrics {
+    fn record_engine_bootstrap_failure(&self, _: EngineLabel) {}
+    fn record_engine_evaluation(&self, _: EngineLabel, _: std::time::Duration) {}
+    fn record_plan_violation(
+        &self,
+        _: EngineLabel,
+        _: quota_enforcement_sdk::engine::DebitPlanInvariant,
+    ) {
+    }
+    fn record_policy_transition(&self, _: PolicyTransition) {}
+    fn record_policy_conflict(&self) {}
+
     fn record_denial(&self, _reason: DenialReason) {}
 
     fn record_contract_validation_failure(
@@ -246,4 +369,65 @@ impl QeMetrics for NoopMetrics {
     }
 
     fn record_admitted_metric_violation(&self, _surface: ValidationSurface) {}
+    fn record_evaluation(&self, _operation: OperationKind, _elapsed: std::time::Duration) {}
+    fn record_idempotency_replay(&self, _operation: OperationKind) {}
+    fn record_retention_reclaimed(&self, _table: RetentionTable, _rows: u64) {}
+    fn record_retention_failure(&self, _table: RetentionTable) {}
+}
+
+/// Bounded deployment engine labels; unknown submitted strings cannot enter metrics.
+#[domain_model]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EngineLabel {
+    /// Built-in deterministic selection.
+    MostRestrictiveWins,
+    /// Sandboxed CEL.
+    Cel,
+}
+impl EngineLabel {
+    /// Static telemetry value.
+    #[must_use]
+    pub const fn as_label(self) -> &'static str {
+        match self {
+            Self::MostRestrictiveWins => "most-restrictive-wins",
+            Self::Cel => "cel",
+        }
+    }
+
+    /// The label of a registered engine id, or `None` for an id outside the
+    /// bounded built-in set. The bound is what keeps operator-submitted strings
+    /// out of metric labels: an unknown id is refused at registration, never
+    /// interpolated into a label.
+    #[must_use]
+    pub fn from_id(id: &str) -> Option<Self> {
+        [Self::MostRestrictiveWins, Self::Cel]
+            .into_iter()
+            .find(|label| label.as_label() == id)
+    }
+}
+
+/// Committed policy transition labels.
+#[domain_model]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PolicyTransition {
+    /// Policy creation.
+    Create,
+    /// A new version.
+    Update,
+    /// Reactivation of historical version.
+    Rollback,
+    /// Soft deletion.
+    Delete,
+}
+impl PolicyTransition {
+    /// Static telemetry value.
+    #[must_use]
+    pub const fn as_label(self) -> &'static str {
+        match self {
+            Self::Create => "create",
+            Self::Update => "update",
+            Self::Rollback => "rollback",
+            Self::Delete => "delete",
+        }
+    }
 }

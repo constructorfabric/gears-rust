@@ -13,10 +13,13 @@
 
 use std::sync::Arc;
 
-use quota_enforcement_sdk::{BootstrapBundle, ConfigDefaults, StorageError};
+use quota_enforcement_sdk::{BootstrapBundle, ConfigDefaults, PolicyScope, StorageError};
 use toolkit_macros::domain_model;
+use toolkit_security::SecurityContext;
 
-use super::ports::{FoundationStore, QuotaStore, SeedReport, StoreError};
+use super::ports::{
+    ConsumptionStore, FoundationStore, PolicyStore, QuotaStore, SeedReport, StoreError,
+};
 
 const LOG_TARGET: &str = "qe.storage";
 
@@ -26,13 +29,25 @@ const LOG_TARGET: &str = "qe.storage";
 pub struct StoragePlugin {
     store: Arc<dyn FoundationStore>,
     pub(super) quotas: Arc<dyn QuotaStore>,
+    pub(super) policies: Arc<dyn PolicyStore>,
+    pub(super) consumption: Arc<dyn ConsumptionStore>,
 }
 
 impl StoragePlugin {
     /// Bind the plugin to its stores.
     #[must_use]
-    pub fn new(store: Arc<dyn FoundationStore>, quotas: Arc<dyn QuotaStore>) -> Self {
-        Self { store, quotas }
+    pub fn new(
+        store: Arc<dyn FoundationStore>,
+        quotas: Arc<dyn QuotaStore>,
+        policies: Arc<dyn PolicyStore>,
+        consumption: Arc<dyn ConsumptionStore>,
+    ) -> Self {
+        Self {
+            store,
+            quotas,
+            policies,
+            consumption,
+        }
     }
 
     /// Verify the schema major and seed the default configuration rows.
@@ -80,7 +95,53 @@ impl StoragePlugin {
             .seed_configuration_defaults(&bundle.config_defaults)
             .await?;
         // @cpt-end:cpt-cf-quota-enforcement-flow-gear-bootstrap:p1:inst-boot-seed-config
+
+        self.seed_global_policy(bundle).await?;
         Ok(report)
+    }
+
+    /// Seed the `global` policy when the caller supplied one and the scope is
+    /// empty.
+    ///
+    /// Idempotent by re-reading the scope rather than by catching a unique
+    /// violation, so an operator who has since updated or rolled back the
+    /// global policy keeps their version: a later bootstrap finds the scope
+    /// occupied and writes nothing. Concurrent replicas that both find it
+    /// empty are arbitrated by the live-scope unique index, and the loser
+    /// treats `PolicyScopeOccupied` as success for the same reason.
+    ///
+    /// Engine registration happens before this runs, so no active policy can
+    /// reference an unregistered engine.
+    async fn seed_global_policy(&self, bundle: &BootstrapBundle) -> Result<(), StorageError> {
+        let Some(draft) = bundle.global_policy.clone() else {
+            return Ok(());
+        };
+        if self
+            .policies
+            .read_policy(&PolicyScope::Global)
+            .await?
+            .is_some()
+        {
+            return Ok(());
+        }
+        // Bootstrap has no principal; the nil subject records that absence.
+        match self
+            .policies
+            .create_policy(&SecurityContext::anonymous(), draft, &[])
+            .await
+        {
+            Ok(seeded) => {
+                tracing::info!(
+                    target: LOG_TARGET,
+                    engine_id = %seeded.engine_id,
+                    "seeded the global resolution policy"
+                );
+                Ok(())
+            }
+            // A concurrent replica won the race; its row is as good as ours.
+            Err(StorageError::PolicyScopeOccupied { .. }) => Ok(()),
+            Err(error) => Err(error),
+        }
     }
 
     /// The installed contract major, if any.

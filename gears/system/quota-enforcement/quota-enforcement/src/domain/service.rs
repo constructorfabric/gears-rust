@@ -10,9 +10,23 @@ use super::attribution::Attribution;
 use super::bootstrap::Bound;
 use super::catalog::ProjectionContractCatalog;
 use super::error::{Dependency, DomainError};
+use super::policies::PolicyRuntimeLimits;
 use super::ports::coordination::SingletonCoordinator;
 use super::quotas::{QuotaLimits, QuotaManagement};
 use super::readiness::Readiness;
+
+/// Process-local runtime bounds of the hot path, passed at construction
+/// because they are neither PDP state nor bootstrap dependencies.
+#[domain_model]
+#[derive(Debug, Clone, Copy)]
+pub struct OperationsRuntime {
+    /// Replay records the cache holds.
+    pub cache_entries: usize,
+    /// How long a cached record may answer.
+    pub cache_ttl: std::time::Duration,
+    /// How many preparations one operation may trigger.
+    pub preparation_max_attempts: std::num::NonZeroU32,
+}
 
 /// Composition root of the domain. Handlers and the in-process client reach
 /// every dependency through it.
@@ -21,18 +35,37 @@ pub struct Service {
     admission: Admission,
     readiness: Arc<Readiness>,
     limits: QuotaLimits,
+    policy_limits: PolicyRuntimeLimits,
     bound: OnceLock<Bound>,
+    policy_schemas: OnceLock<super::policies::schemas::CatalogPolicySchemas>,
+    operations: super::operations::IdempotencyCache,
+    evaluation: quota_enforcement_sdk::engine::EvaluationLimits,
+    preparation_max_attempts: std::num::NonZeroU32,
 }
 
 impl Service {
     /// Assemble the service. Dependencies are bound later by bootstrap.
     #[must_use]
-    pub fn new(admission: Admission, readiness: Arc<Readiness>, limits: QuotaLimits) -> Self {
+    pub fn new(
+        admission: Admission,
+        readiness: Arc<Readiness>,
+        limits: QuotaLimits,
+        policy_limits: PolicyRuntimeLimits,
+        operations: OperationsRuntime,
+    ) -> Self {
         Self {
             admission,
             readiness,
             limits,
+            policy_limits,
             bound: OnceLock::new(),
+            policy_schemas: OnceLock::new(),
+            operations: super::operations::IdempotencyCache::new(
+                operations.cache_entries,
+                operations.cache_ttl,
+            ),
+            evaluation: policy_limits.evaluation,
+            preparation_max_attempts: operations.preparation_max_attempts,
         }
     }
 
@@ -54,6 +87,12 @@ impl Service {
     ///
     /// Returns [`DomainError::Internal`] when dependencies were bound before.
     pub fn bind(&self, bound: Bound) -> Result<(), DomainError> {
+        self.policy_schemas
+            .set(super::policies::schemas::CatalogPolicySchemas::new(
+                Arc::clone(&bound.catalog),
+                self.policy_limits.snapshot,
+            ))
+            .map_err(|_| DomainError::Internal("dependencies were already bound".into()))?;
         self.bound
             .set(bound)
             .map_err(|_| DomainError::Internal("dependencies were already bound".to_owned()))
@@ -116,6 +155,57 @@ impl Service {
             &bound.catalog,
             self.admission.metrics(),
         ))
+    }
+
+    /// The shared operator policy lifecycle.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DomainError::NotReady`] before bootstrap publishes the dependencies.
+    pub fn policies(&self) -> Result<super::policies::PolicyManagement<'_>, DomainError> {
+        let bound = self.bound.get().ok_or(DomainError::NotReady {
+            dependency: Dependency::Storage,
+        })?;
+        let schemas = self.policy_schemas.get().ok_or(DomainError::NotReady {
+            dependency: Dependency::Catalog,
+        })?;
+        Ok(super::policies::PolicyManagement {
+            admission: &self.admission,
+            storage: bound.storage.as_ref(),
+            engines: &bound.engines,
+            cache: &bound.artifacts,
+            schemas,
+            metrics: self.admission.metrics(),
+            limits: self.policy_limits.authoring,
+        })
+    }
+
+    /// The consumption hot path: debit, credit, rollback, preview.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DomainError::NotReady`] before bootstrap completed.
+    pub fn operations(&self) -> Result<super::operations::Operations<'_>, DomainError> {
+        let bound = self.bound.get().ok_or(DomainError::NotReady {
+            dependency: Dependency::Storage,
+        })?;
+        Ok(super::operations::Operations {
+            admission: &self.admission,
+            attribution: Attribution::new(
+                &self.admission,
+                &bound.catalog,
+                self.admission.metrics(),
+            ),
+            catalog: &bound.catalog,
+            classifications: &bound.classifications,
+            storage: bound.storage.as_ref(),
+            engines: Arc::clone(&bound.engines),
+            artifacts: Arc::clone(&bound.artifacts),
+            idempotency: &self.operations,
+            metrics: self.admission.metrics_handle(),
+            evaluation: self.evaluation,
+            preparation_max_attempts: self.preparation_max_attempts,
+        })
     }
 
     /// The Quota lifecycle: create, update, deactivate, read.

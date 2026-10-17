@@ -1,11 +1,14 @@
 //! Configuration for `[quota-enforcement]`. Read once at `Gear::init`.
 
+use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 use std::time::Duration;
 
 use gts::GtsTypeId;
 use serde::Deserialize;
 
 use crate::domain::catalog::CatalogConfig;
+use crate::domain::policies::schemas::SnapshotLimits;
+use crate::domain::policies::{EvaluationLimits, PolicyLimits, PolicyRuntimeLimits};
 use crate::domain::quotas::{GaugeTiming, QuotaLimits};
 
 /// Gear configuration.
@@ -29,8 +32,14 @@ pub struct QuotaEnforcementConfig {
     pub catalog: CatalogSection,
     /// Bounds of the Quota lifecycle surface.
     pub quotas: QuotasSection,
+    /// Bounds of the resolution-policy surface.
+    pub policies: PoliciesSection,
     /// Timing of the lifecycle-gauge refresh.
     pub gauges: GaugesSection,
+    /// Bounds of the consumption hot path.
+    pub operations: OperationsSection,
+    /// Timing of the retention sweeper.
+    pub retention: RetentionSection,
 }
 
 impl Default for QuotaEnforcementConfig {
@@ -43,7 +52,10 @@ impl Default for QuotaEnforcementConfig {
             metrics: MetricsConfig::default(),
             catalog: CatalogSection::default(),
             quotas: QuotasSection::default(),
+            policies: PoliciesSection::default(),
             gauges: GaugesSection::default(),
+            operations: OperationsSection::default(),
+            retention: RetentionSection::default(),
         }
     }
 }
@@ -71,7 +83,10 @@ impl QuotaEnforcementConfig {
         self.metrics.validate()?;
         self.catalog.validate()?;
         self.quotas.validate()?;
-        self.gauges.validate()
+        self.policies.validate()?;
+        self.gauges.validate()?;
+        self.operations.validate()?;
+        self.retention.validate()
     }
 
     /// Budget for a sweep body to stop after leadership loss or shutdown.
@@ -340,6 +355,166 @@ impl QuotasSection {
     }
 }
 
+/// Bounds of the resolution-policy surface (`[quota-enforcement.policies]`).
+///
+/// `evaluation_timeout_upper_ms` is also a database lock-hold knob: an engine
+/// evaluates while the evaluation transaction holds Quota rows, so the clamp
+/// bounds evaluation's contribution to that hold. It does not bound
+/// compilation, lock acquisition, or the transaction as a whole.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct PoliciesSection {
+    /// Ceiling a policy's requested `timeout_ms` is clamped to at each
+    /// evaluation (feature default 5 ms). Applied when the budget is built,
+    /// never persisted, so lowering it takes effect on the next evaluation
+    /// after the process loads the new value.
+    pub evaluation_timeout_upper_ms: u64,
+    /// Operations an engine may charge in one evaluation before it reports
+    /// `CostExceeded`.
+    pub evaluation_cost_limit: u64,
+    /// Largest serialized `engine_config` accepted at create or update.
+    pub config_max_bytes: usize,
+    /// Largest comment or description, in bytes.
+    pub comment_max_bytes: usize,
+    /// Largest page a version-history request may ask for.
+    pub list_max_limit: u32,
+    /// Compiled artifacts kept in process; the oldest is evicted past this.
+    pub artifact_cache_entries: usize,
+    /// Attempts to prepare a missing artifact and retry the evaluation
+    /// transaction before failing with a canonical error.
+    pub preparation_max_attempts: u32,
+    /// Artifact compilations that may run at once. Compilation is unbounded
+    /// CPU work off the transaction path; this caps what a cold cache can
+    /// spend at once.
+    pub preparation_max_concurrency: usize,
+    /// Largest persisted schema snapshot, in bytes. `most-restrictive-wins`
+    /// persists an empty one; only `cel` carries a closure.
+    pub snapshot_max_bytes: usize,
+    /// Distinct resolved schemas one snapshot may hold.
+    pub snapshot_max_schemas: usize,
+    /// Deepest JSON nesting a resolved schema may reach.
+    pub snapshot_max_depth: usize,
+}
+
+impl Default for PoliciesSection {
+    fn default() -> Self {
+        Self {
+            evaluation_timeout_upper_ms: 5,
+            evaluation_cost_limit: 10_000,
+            config_max_bytes: 16_384,
+            comment_max_bytes: 1_024,
+            list_max_limit: 50,
+            artifact_cache_entries: 512,
+            preparation_max_attempts: 3,
+            preparation_max_concurrency: 4,
+            snapshot_max_bytes: 65_536,
+            snapshot_max_schemas: 32,
+            snapshot_max_depth: 32,
+        }
+    }
+}
+
+impl PoliciesSection {
+    /// Longest evaluation clamp an operator may configure. Evaluation runs
+    /// under database row locks; a full second is already generous.
+    pub const MAX_EVALUATION_TIMEOUT_MS: u64 = 1_000;
+    /// Largest `engine_config` any deployment may accept.
+    pub const MAX_CONFIG_BYTES: usize = 1_048_576;
+    /// Largest schema snapshot any deployment may persist per version.
+    pub const MAX_SNAPSHOT_BYTES: usize = 4_194_304;
+
+    /// Reject bounds the gear cannot serve with.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error naming the field that is out of its range.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        self.to_limits().map(|_| ())
+    }
+
+    /// The domain view of the bounds. Validation and conversion are one step,
+    /// so a zero cannot reach a `NonZero` field by any other path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error naming the field that is zero or above its ceiling.
+    pub fn to_limits(&self) -> anyhow::Result<PolicyRuntimeLimits> {
+        fn at_least_one_u64(field: &str, value: u64) -> anyhow::Result<NonZeroU64> {
+            NonZeroU64::new(value).ok_or_else(|| {
+                anyhow::anyhow!("[quota-enforcement.policies].{field} must be at least 1")
+            })
+        }
+        fn at_least_one_u32(field: &str, value: u32) -> anyhow::Result<NonZeroU32> {
+            NonZeroU32::new(value).ok_or_else(|| {
+                anyhow::anyhow!("[quota-enforcement.policies].{field} must be at least 1")
+            })
+        }
+        fn at_least_one_usize(field: &str, value: usize) -> anyhow::Result<NonZeroUsize> {
+            NonZeroUsize::new(value).ok_or_else(|| {
+                anyhow::anyhow!("[quota-enforcement.policies].{field} must be at least 1")
+            })
+        }
+
+        let upper_timeout_ms = at_least_one_u64(
+            "evaluation_timeout_upper_ms",
+            self.evaluation_timeout_upper_ms,
+        )?;
+        if upper_timeout_ms.get() > Self::MAX_EVALUATION_TIMEOUT_MS {
+            anyhow::bail!(
+                "[quota-enforcement.policies].evaluation_timeout_upper_ms must be at most {}",
+                Self::MAX_EVALUATION_TIMEOUT_MS
+            );
+        }
+        at_least_one_usize("config_max_bytes", self.config_max_bytes)?;
+        if self.config_max_bytes > Self::MAX_CONFIG_BYTES {
+            anyhow::bail!(
+                "[quota-enforcement.policies].config_max_bytes must be at most {}",
+                Self::MAX_CONFIG_BYTES
+            );
+        }
+        at_least_one_usize("comment_max_bytes", self.comment_max_bytes)?;
+        at_least_one_u32("list_max_limit", self.list_max_limit)?;
+        at_least_one_usize("snapshot_max_bytes", self.snapshot_max_bytes)?;
+        if self.snapshot_max_bytes > Self::MAX_SNAPSHOT_BYTES {
+            anyhow::bail!(
+                "[quota-enforcement.policies].snapshot_max_bytes must be at most {}",
+                Self::MAX_SNAPSHOT_BYTES
+            );
+        }
+        at_least_one_usize("snapshot_max_schemas", self.snapshot_max_schemas)?;
+        at_least_one_usize("snapshot_max_depth", self.snapshot_max_depth)?;
+
+        Ok(PolicyRuntimeLimits {
+            evaluation: EvaluationLimits {
+                upper_timeout_ms,
+                cost_limit: at_least_one_u64("evaluation_cost_limit", self.evaluation_cost_limit)?,
+            },
+            authoring: PolicyLimits {
+                config_bytes: self.config_max_bytes,
+                comment_bytes: self.comment_max_bytes,
+                list_limit: self.list_max_limit,
+            },
+            snapshot: SnapshotLimits {
+                bytes: self.snapshot_max_bytes,
+                schemas: self.snapshot_max_schemas,
+                depth: self.snapshot_max_depth,
+            },
+            artifact_cache_entries: at_least_one_usize(
+                "artifact_cache_entries",
+                self.artifact_cache_entries,
+            )?,
+            preparation_max_attempts: at_least_one_u32(
+                "preparation_max_attempts",
+                self.preparation_max_attempts,
+            )?,
+            preparation_max_concurrency: at_least_one_usize(
+                "preparation_max_concurrency",
+                self.preparation_max_concurrency,
+            )?,
+        })
+    }
+}
+
 /// Timing of the lifecycle-gauge refresh (`[quota-enforcement.gauges]`). The
 /// elected replica reads the active-Quota counts every `refresh_secs`, bounds
 /// each read by `refresh_deadline_secs`, and withdraws the published sample
@@ -409,3 +584,114 @@ impl GaugesSection {
 #[cfg_attr(coverage_nightly, coverage(off))]
 #[path = "config_tests.rs"]
 mod config_tests;
+
+/// Bounds of the consumption hot path (`[quota-enforcement.operations]`).
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct OperationsSection {
+    /// Replay records the in-process cache holds before evicting the least
+    /// recently used one.
+    pub idempotency_cache_entries: usize,
+    /// How long a cached record may answer a replay, in milliseconds. An entry
+    /// never outlives the record's own retention whatever this says.
+    pub idempotency_cache_ttl_ms: u64,
+}
+
+impl Default for OperationsSection {
+    fn default() -> Self {
+        Self {
+            idempotency_cache_entries: 4096,
+            // The P1 reference default of the idempotency-replay algorithm.
+            idempotency_cache_ttl_ms: 5_000,
+        }
+    }
+}
+
+impl OperationsSection {
+    /// Reject bounds the hot path cannot serve with.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error naming the field that is out of its range.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.idempotency_cache_entries == 0 {
+            anyhow::bail!(
+                "[quota-enforcement.operations].idempotency_cache_entries must be at least 1"
+            );
+        }
+        if self.idempotency_cache_ttl_ms == 0 {
+            anyhow::bail!(
+                "[quota-enforcement.operations].idempotency_cache_ttl_ms must be at least 1"
+            );
+        }
+        Ok(())
+    }
+
+    /// How long a cached record may answer.
+    #[must_use]
+    pub const fn idempotency_cache_ttl(&self) -> Duration {
+        Duration::from_millis(self.idempotency_cache_ttl_ms)
+    }
+}
+
+/// Timing of the retention sweeper (`[quota-enforcement.retention]`).
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct RetentionSection {
+    /// Seconds between sweeps.
+    pub interval_secs: u64,
+    /// Rows one delete statement reclaims.
+    pub batch_size: u32,
+    /// Days operation-log rows are kept. Idempotency retention is
+    /// per-`(tenant, metric)` configuration the storage plugin reads itself.
+    pub operation_log_retention_days: u32,
+}
+
+impl Default for RetentionSection {
+    fn default() -> Self {
+        Self {
+            interval_secs: 300,
+            batch_size: 1_000,
+            operation_log_retention_days: 30,
+        }
+    }
+}
+
+impl RetentionSection {
+    /// Reject timings the sweeper cannot run with.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error naming the field that is out of its range.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.interval_secs == 0 {
+            anyhow::bail!("[quota-enforcement.retention].interval_secs must be at least 1");
+        }
+        if self.batch_size == 0 {
+            anyhow::bail!("[quota-enforcement.retention].batch_size must be at least 1");
+        }
+        if self.operation_log_retention_days == 0 {
+            anyhow::bail!(
+                "[quota-enforcement.retention].operation_log_retention_days must be at least 1"
+            );
+        }
+        Ok(())
+    }
+
+    /// The domain view of the sweeper timing.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a bound is zero, which [`Self::validate`] has
+    /// already rejected at startup.
+    pub fn to_timing(&self) -> anyhow::Result<crate::domain::operations::RetentionTiming> {
+        Ok(crate::domain::operations::RetentionTiming {
+            interval: Duration::from_secs(self.interval_secs),
+            batch_size: std::num::NonZeroU32::new(self.batch_size)
+                .ok_or_else(|| anyhow::anyhow!("retention batch size must be at least 1"))?,
+            operation_log_retention: time::Duration::days(i64::from(
+                self.operation_log_retention_days,
+            )),
+        })
+    }
+}

@@ -5,11 +5,16 @@ use std::collections::HashSet;
 
 use async_trait::async_trait;
 use quota_enforcement_sdk::{
-    ActiveQuotaCounts, ConfigDefaults, DeactivateOutcome, NotificationEvent, PageRequest,
-    PageResult, ProjectionBinding, Quota, QuotaDraft, QuotaFilter, QuotaId, QuotaPatch,
+    ActiveQuotaCounts, ApplicableQuotas, AppliedMutation, ConfigDefaults, DeactivateOutcome,
+    EvaluatedDebit, EvaluatedMutation, IdempotencyRecord, IdempotencyScope, IdempotencyWrite,
+    NotificationEvent, PageRequest, PageResult, PartialIdempotencyWrite, PolicyDraft, PolicyId,
+    PolicyScope, PolicyUpdate, PolicyVersion, PolicyVersionMeta, ProjectionBinding, Quota,
+    QuotaDraft, QuotaFilter, QuotaId, QuotaPatch, QuotaSnapshot, RollbackTarget, StorageError,
+    TransitionOutcome,
 };
+use time::OffsetDateTime;
 use toolkit_macros::domain_model;
-use toolkit_security::AccessScope;
+use toolkit_security::{AccessScope, SecurityContext};
 use uuid::Uuid;
 
 /// What a `seed_defaults` call did.
@@ -190,4 +195,214 @@ pub trait QuotaStore: Send + Sync {
 
     /// Active-Quota counts behind the lifecycle gauges.
     async fn read_active_quota_counts(&self) -> Result<ActiveQuotaCounts, StoreError>;
+}
+
+/// The consumption primitives: counter mutations, their replay records, and the
+/// snapshot read.
+///
+/// Like [`PolicyStore`], this port speaks the contract's own `StorageError`
+/// rather than [`StoreError`]: its failure modes are the contract's, so a
+/// translation layer would only restate them.
+#[async_trait]
+pub trait ConsumptionStore: Send + Sync {
+    /// Evaluate the applicable policy against the locked rows and apply the
+    /// plan it produced, atomically with the record and the events.
+    ///
+    /// # Errors
+    ///
+    /// The contract's variants for `apply_debit_plan`.
+    async fn apply_debit_plan(
+        &self,
+        ctx: &SecurityContext,
+        scope: &AccessScope,
+        mutation: &EvaluatedMutation<'_>,
+        events: &[NotificationEvent],
+    ) -> Result<TransitionOutcome<EvaluatedDebit>, StorageError>;
+
+    /// Return consumption to one Quota, deriving the idempotency scope under
+    /// the row lock.
+    ///
+    /// # Errors
+    ///
+    /// The contract's variants for `apply_credit`.
+    async fn apply_credit(
+        &self,
+        ctx: &SecurityContext,
+        scope: &AccessScope,
+        quota_id: QuotaId,
+        amount: u64,
+        idempotency: &PartialIdempotencyWrite,
+        events: &[NotificationEvent],
+    ) -> Result<TransitionOutcome<AppliedMutation>, StorageError>;
+
+    /// Reverse the committed debit the target names, against its acquisition
+    /// period.
+    ///
+    /// # Errors
+    ///
+    /// The contract's variants for `apply_rollback`.
+    async fn apply_rollback(
+        &self,
+        ctx: &SecurityContext,
+        scope: &AccessScope,
+        target: &RollbackTarget,
+        idempotency: &IdempotencyWrite,
+        events: &[NotificationEvent],
+    ) -> Result<TransitionOutcome<AppliedMutation>, StorageError>;
+
+    /// Per-Quota state of one applicable set, materializing a missing current
+    /// period row and nothing else (the I3 exception).
+    ///
+    /// # Errors
+    ///
+    /// `Unavailable` when the backend cannot answer.
+    async fn read_quota_snapshot(
+        &self,
+        ctx: &SecurityContext,
+        scope: &AccessScope,
+        applicable: &ApplicableQuotas,
+    ) -> Result<Vec<QuotaSnapshot>, StorageError>;
+
+    /// The unexpired record under `scope_of`, if one exists.
+    ///
+    /// # Errors
+    ///
+    /// `Unavailable` when the backend cannot answer.
+    async fn lookup_idempotency(
+        &self,
+        scope_of: &IdempotencyScope,
+    ) -> Result<Option<IdempotencyRecord>, StorageError>;
+
+    /// Delete up to `batch_size` records expired before `before`.
+    ///
+    /// # Errors
+    ///
+    /// `Unavailable` when the backend cannot answer.
+    async fn reclaim_expired_idempotency(
+        &self,
+        batch_size: u32,
+        before: OffsetDateTime,
+    ) -> Result<u64, StorageError>;
+
+    /// Delete up to `batch_size` operation-log rows older than `before`.
+    ///
+    /// # Errors
+    ///
+    /// `Unavailable` when the backend cannot answer.
+    async fn reclaim_operation_log(
+        &self,
+        batch_size: u32,
+        before: OffsetDateTime,
+    ) -> Result<u64, StorageError>;
+}
+
+/// Versioned platform policies. Every mutation is one transaction that moves
+/// the version state, the header pointer, the audit row and the outbox entry
+/// together, so no reader observes a pointer that disagrees with the states.
+///
+/// Policy rows are platform-plane: they carry no tenant and no owner, so unlike
+/// [`QuotaStore`] these methods take neither an [`AccessScope`] nor an
+/// [`Actor`]. Operator authorization happens in the gear, above this port.
+#[async_trait]
+pub trait PolicyStore: Send + Sync {
+    /// Create version 1 at an unoccupied scope.
+    ///
+    /// # Errors
+    /// `PolicyScopeOccupied` when a live policy holds the exact scope; a
+    /// backend failure commits no version, audit row or event.
+    async fn create_policy(
+        &self,
+        ctx: &SecurityContext,
+        draft: PolicyDraft,
+        events: &[NotificationEvent],
+    ) -> Result<PolicyVersion, StorageError>;
+
+    /// Create the next version above the high-water mark, under the header lock.
+    ///
+    /// # Errors
+    /// `PolicyNotFound`, `PolicyDeleted`, `VersionConflict`, or a backend
+    /// failure. Nothing is written unless the whole transition commits.
+    async fn update_policy(
+        &self,
+        ctx: &SecurityContext,
+        policy_id: PolicyId,
+        update: PolicyUpdate,
+        events: &[NotificationEvent],
+    ) -> Result<PolicyVersion, StorageError>;
+
+    /// Reactivate a retained, non-terminal version.
+    ///
+    /// # Errors
+    /// `PolicyNotFound`, `PolicyDeleted`, `UnknownPolicyVersion`,
+    /// `VersionRolledBack`, or a backend failure. Replaying the already-active
+    /// target is `NoOp`, not an error, and writes no audit row or event.
+    async fn rollback_policy(
+        &self,
+        ctx: &SecurityContext,
+        policy_id: PolicyId,
+        target_version: u32,
+        comment: Option<String>,
+        events: &[NotificationEvent],
+    ) -> Result<TransitionOutcome<PolicyVersion>, StorageError>;
+
+    /// Soft-delete a narrow-scope policy, clearing its pointer and retaining
+    /// its history.
+    ///
+    /// # Errors
+    /// `CannotDeleteSeededGlobalPolicy`, `PolicyNotFound`, or a backend
+    /// failure. A repeat against an already-deleted policy is `NoOp`.
+    async fn delete_policy(
+        &self,
+        ctx: &SecurityContext,
+        policy_id: PolicyId,
+        comment: Option<String>,
+        events: &[NotificationEvent],
+    ) -> Result<TransitionOutcome<()>, StorageError>;
+
+    /// The active version at the exact `scope`, with no fallback to a broader
+    /// one: selecting `global` for an unoccupied metric scope is an evaluation
+    /// decision, and callers also use this to ask whether a scope is occupied.
+    ///
+    /// # Errors
+    /// A backend or payload-decoding failure. An unoccupied scope is `Ok(None)`.
+    async fn read_policy(&self, scope: &PolicyScope)
+    -> Result<Option<PolicyVersion>, StorageError>;
+
+    /// The active version of one policy ID.
+    ///
+    /// # Errors
+    /// A backend or payload-decoding failure. A missing or deleted ID is
+    /// `Ok(None)`.
+    async fn read_active_policy_by_id(
+        &self,
+        policy_id: &PolicyId,
+    ) -> Result<Option<PolicyVersion>, StorageError>;
+
+    /// Every active policy, for the bootstrap engine and catalogue scan.
+    /// Caller-less by contract: an internal platform read, not a list API.
+    ///
+    /// # Errors
+    /// A backend or payload-decoding failure.
+    async fn read_active_policies(&self) -> Result<Vec<PolicyVersion>, StorageError>;
+
+    /// One retained version, terminal states included.
+    ///
+    /// # Errors
+    /// A backend or payload-decoding failure. A missing version is `Ok(None)`.
+    async fn read_policy_version(
+        &self,
+        policy_id: &PolicyId,
+        version: u32,
+    ) -> Result<Option<PolicyVersion>, StorageError>;
+
+    /// One bounded page of version history, ascending by version.
+    ///
+    /// # Errors
+    /// `PolicyNotFound` for an ID that was never created, `InvalidCursor` for a
+    /// cursor this listing did not issue, or a backend failure.
+    async fn list_policy_versions(
+        &self,
+        policy_id: &PolicyId,
+        page: PageRequest,
+    ) -> Result<PageResult<PolicyVersionMeta>, StorageError>;
 }

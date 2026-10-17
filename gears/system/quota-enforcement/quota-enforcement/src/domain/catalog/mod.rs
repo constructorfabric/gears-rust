@@ -9,10 +9,12 @@
 //! - [`membership`]: the reference check Quota and Policy writes run.
 
 pub mod builder;
+pub mod classifications;
 pub mod membership;
 pub mod model;
 
 pub use builder::{CatalogBuilder, CatalogConfig};
+pub use classifications::MetricClassifications;
 pub use membership::check_projection_reference;
 pub use model::{
     CatalogMiss, CompiledContract, ConstraintContract, MetricRequestContract,

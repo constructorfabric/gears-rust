@@ -32,6 +32,9 @@ serde_json = { workspace = true }
 schemars = { workspace = true }
 time = { workspace = true }
 
+# Canonical digests: the idempotency subject key and the request payload hash
+aws-lc-rs = { workspace = true }
+
 # GTS types. `inventory` carries the QE-owned GTS definitions into the
 # process-wide registry seed (`toolkit_gts::InventoryTypeSchema`).
 gts = { workspace = true }

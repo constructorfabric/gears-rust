@@ -1,6 +1,4 @@
-//! Domain types referenced by the quota-enforcement plugin contracts.
-//!
-//! Type-stability rules (DESIGN section 3.1):
+//! Domain types used by quota-enforcement contracts.
 //!
 //! - Every enum is closed at the SDK boundary. Deserialization rejects an
 //!   unknown value instead of a fallback variant.
@@ -8,14 +6,14 @@
 //!   `PeriodType`) serialize as their full GTS instance id. Storage rows and
 //!   events carry that form.
 //! - Timestamps serialize as RFC 3339 in UTC.
-//! - Input shapes (`QuotaDraft`, `QuotaPatch`, `PolicyDraft`, `PolicyUpdate`)
-//!   reject unknown fields.
+//! - Input shapes reject unknown fields.
 
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::str::FromStr;
 
+use aws_lc_rs::digest::{Context, SHA256};
 use gts::{GtsId, GtsIdError, GtsInstanceId, GtsTypeId};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -280,6 +278,99 @@ digest_newtype!(
     /// SHA-256 of the canonical sorted-JSON request payload.
     PayloadHash
 );
+digest_newtype!(
+    /// SHA-256 of the authorized metric, mapped subjects, and resource. A
+    /// rollback uses it to prove authorization for the original mutation.
+    AttributionDigest
+);
+
+/// Returns JSON with object keys sorted at every depth, independent of
+/// `serde_json`'s `preserve_order` feature.
+fn canonical_json(value: &Value) -> Value {
+    match value {
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(key, nested)| (key.clone(), canonical_json(nested)))
+                .collect::<BTreeMap<_, _>>()
+                .into_iter()
+                .collect(),
+        ),
+        Value::Array(items) => Value::Array(items.iter().map(canonical_json).collect()),
+        other => other.clone(),
+    }
+}
+
+/// SHA-256 over the canonical JSON form of `payload`.
+fn hash_canonical<T: Serialize>(payload: &T) -> Result<[u8; 32], serde_json::Error> {
+    let value = canonical_json(&serde_json::to_value(payload)?);
+    let bytes = serde_json::to_vec(&value)?;
+    let mut hasher = Context::new(&SHA256);
+    hasher.update(&bytes);
+    Ok(finish(hasher))
+}
+
+/// The 32 digest bytes, as an array rather than the slice `finish` returns.
+fn finish(hasher: Context) -> [u8; 32] {
+    let digest = hasher.finish();
+    let mut bytes = [0; 32];
+    bytes.copy_from_slice(digest.as_ref());
+    bytes
+}
+
+impl PayloadHash {
+    /// Digest of a request payload in its canonical form: key order and the
+    /// `preserve_order` feature do not change the result, array order does
+    /// (PRD section 5.8).
+    ///
+    /// # Errors
+    ///
+    /// Returns the serialization error when `payload` cannot become JSON, for
+    /// example a map with non-string keys or a type whose `Serialize` fails.
+    pub fn of_canonical<T: Serialize>(payload: &T) -> Result<Self, serde_json::Error> {
+        hash_canonical(payload).map(Self::from_bytes)
+    }
+}
+
+impl AttributionDigest {
+    /// Digest of the authorized attribution document, canonically.
+    ///
+    /// # Errors
+    ///
+    /// Returns the serialization error when `properties` cannot become JSON.
+    pub fn of_canonical<T: Serialize>(properties: &T) -> Result<Self, serde_json::Error> {
+        hash_canonical(properties).map(Self::from_bytes)
+    }
+}
+
+impl IdempotencySubjectKey {
+    /// Fingerprints sorted, deduplicated `(projection_type, subject_id)` pairs.
+    ///
+    /// Length prefixes prevent boundary collisions. Input order and duplicates
+    /// do not affect the result.
+    #[must_use]
+    pub fn of(subjects: &[SubjectRef]) -> Self {
+        let pairs: BTreeSet<(&str, &str)> = subjects
+            .iter()
+            .map(|subject| {
+                (
+                    subject.projection_type.as_ref(),
+                    subject.subject_id.as_str(),
+                )
+            })
+            .collect();
+        let mut hasher = Context::new(&SHA256);
+        for (projection_type, subject_id) in pairs {
+            for field in [projection_type, subject_id] {
+                // Catalogue limits keep lengths within `u32`; saturation remains
+                // deterministic for defensive callers.
+                let len = u32::try_from(field.len()).unwrap_or(u32::MAX);
+                hasher.update(&len.to_be_bytes());
+                hasher.update(field.as_bytes());
+            }
+        }
+        Self::from_bytes(finish(hasher))
+    }
+}
 
 /// An unknown value was supplied for a closed enum or a fixed-width digest.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -586,13 +677,8 @@ impl ContractRef {
     }
 }
 
-/// A well-known instance of the scope-discriminator type
-/// `gts.cf.core.qe.scope.v1~` (ADR-0007). The value is an identity-only
-/// discriminator: it names no `SecurityContext` accessor, and the gear compares
-/// instance ids directly.
-///
-/// The invariant "an instance of the scope type" holds for every value: the
-/// constructors validate it, and deserialization goes through [`Self::parse`].
+/// A validated instance of the `gts.cf.core.qe.scope.v1~` discriminator.
+/// Deserialization preserves the same invariant as [`Self::parse`].
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize)]
 #[serde(try_from = "String")]
 pub struct SubjectScope(GtsInstanceId);
@@ -715,13 +801,10 @@ pub struct SubjectClaim {
     pub id: String,
 }
 
-/// An optional resource projection on the wire (ADR-0007): the complete
-/// `{type, id?, metadata}` document validated against the owner contract.
+/// An optional `{type, id?, metadata}` resource projection.
 ///
-/// `id` and `metadata` distinguish omission from an explicit `null`: the
-/// resource base allows an omitted `id` and requires a string when present, and
-/// requires `metadata`. An omitted field is `None`; `null` fails
-/// deserialization; `None` is never written as `null`.
+/// Optional fields distinguish omission from `null`; explicit `null` is
+/// rejected and omitted values are not serialized.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ResourceProjection {
@@ -744,14 +827,11 @@ pub struct ResourceProjection {
     pub metadata: Option<Map<String, Value>>,
 }
 
-/// The caller-supplied attribution of one subject-based evaluation request
-/// (debit, reserve, preview, each batch item). Untrusted until the PDP
-/// authorizes the complete tuple for the authenticated service principal.
+/// Caller-supplied attribution for an evaluation request. It remains untrusted
+/// until the PDP authorizes the complete tuple.
 ///
-/// `metadata` is required on the wire, including `{}` when the request
-/// contract declares no properties; it is `Option` only so the gear can tell an
-/// omitted object from a present one and reject the omission instead of
-/// defaulting it. `null` fails deserialization for every optional field.
+/// `metadata` is represented as [`Option`] only to distinguish omission; the
+/// service requires it on the wire and rejects `null`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EvaluationAttribution {
@@ -889,26 +969,17 @@ pub struct Quota {
 }
 
 impl Quota {
-    /// Largest cap any surface accepts. Caps live in `0..=i64::MAX` so every
-    /// storage backend holds them in a signed 64-bit column: the REST surface
-    /// takes a signed integer and rejects negatives, the SDK checks `u64`
-    /// values against this bound (`CAP_OUT_OF_RANGE`), SQL carries a check
-    /// constraint.
+    /// Largest cap accepted by the API and signed 64-bit storage backends.
     pub const MAX_CAP: u64 = i64::MAX.unsigned_abs();
 }
 
-/// The public read shape of a Quota: the stored record plus what the gear
-/// computes at read time. Every Quota read and list returns it, over REST and
-/// in process alike (quota-lifecycle feature). Storage never produces it; its
-/// `read_quotas` returns the bare [`Quota`].
+/// Public Quota read shape: the stored record plus computed state.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QuotaView {
     /// The stored record.
     #[serde(flatten)]
     pub quota: Quota,
-    /// Server-computed: the response's clock reading lies within
-    /// `validity_window`, an absent bound being unbounded on its side. One
-    /// clock reading per response.
+    /// Whether the response clock lies within `validity_window`.
     pub currently_within_window: bool,
     /// Registry-reported kind of the metric at read time. `None` only when
     /// the registry no longer knows the metric; the record stays readable and
@@ -930,10 +1001,8 @@ impl QuotaView {
     }
 }
 
-/// Public create input of a Quota (`QuotaManagerClientV1::create_quota`): a
-/// [`QuotaDraft`] without the constraint contract, which the gear resolves from
-/// the catalogue and snapshots itself. The gear validates every field before
-/// storage sees a draft.
+/// Public Quota create input. The service resolves and snapshots the constraint
+/// contract before constructing a [`QuotaDraft`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct QuotaSpec {
@@ -1226,6 +1295,143 @@ pub struct Decision {
     pub diagnostics: BTreeMap<String, Value>,
 }
 
+/// Denial reason of an operation whose metric no active Quota covers. The one
+/// denial that persists nothing (PRD section 5.5).
+pub const NO_APPLICABLE_QUOTA: &str = "NO_APPLICABLE_QUOTA";
+
+impl Decision {
+    /// An allowed decision carrying `plan` and no diagnostics.
+    #[must_use]
+    pub fn allowed_with_plan(plan: DebitPlan) -> Self {
+        Self {
+            result: DecisionResult::Allowed,
+            debit_plan: plan,
+            diagnostics: BTreeMap::new(),
+        }
+    }
+
+    /// The denial reason, or `None` when the decision allowed the operation.
+    #[must_use]
+    pub fn denied_reason(&self) -> Option<&str> {
+        self.result.denied_reason()
+    }
+
+    /// Whether this decision is the denial that records nothing.
+    #[must_use]
+    pub fn is_no_applicable_quota(&self) -> bool {
+        self.denied_reason() == Some(NO_APPLICABLE_QUOTA)
+    }
+}
+
+impl DecisionResult {
+    /// The denial reason, or `None` for [`Self::Allowed`].
+    #[must_use]
+    pub fn denied_reason(&self) -> Option<&str> {
+        match self {
+            Self::Allowed => None,
+            Self::Denied { reason, .. } => Some(reason),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Consumer requests
+// ---------------------------------------------------------------------------
+
+// None of the four request shapes rejects unknown fields. A caller that echoes
+// a Decision back into its next request must be ignored, not failed
+// (PRD section 3.4), and serde has no ignore-only-these mode. The nested
+// `attribution` keeps its own strictness, so a misspelled attribution field is
+// still an error.
+
+/// Charge a metric against every Quota that applies to the attribution.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DebitRequest {
+    /// Who and what is being charged.
+    pub attribution: EvaluationAttribution,
+    /// Requested amount. Signed on the wire so that zero and negative values
+    /// reach the domain as `INVALID_AMOUNT` rather than failing
+    /// deserialization with an unactionable 422.
+    pub amount: i64,
+    /// Client-supplied idempotency key.
+    pub idempotency_key: String,
+}
+
+/// Return consumption to one Quota. Corrective and operator-facing: it names a
+/// Quota by id and evaluates no policy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreditRequest {
+    /// Authorized target tenant.
+    pub tenant_id: TenantId,
+    /// The Quota to credit.
+    pub quota_id: QuotaId,
+    /// Amount to return. See [`DebitRequest::amount`] for the signedness.
+    pub amount: i64,
+    /// Client-supplied idempotency key.
+    pub idempotency_key: String,
+}
+
+/// Reverse a committed debit.
+///
+/// The attribution is the reversed debit's, not a new one: the server
+/// re-authorizes it, recomputes the subject key the debit was recorded under
+/// (a caller may never supply one), and requires the stored record to carry the
+/// same authorized attribution.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RollbackRequest {
+    /// Attribution of the debit being reversed.
+    pub attribution: EvaluationAttribution,
+    /// Idempotency key the original debit was committed under.
+    pub original_idempotency_key: String,
+    /// Client-supplied key of this rollback.
+    pub idempotency_key: String,
+}
+
+/// Evaluate without mutating anything.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PreviewRequest {
+    /// Who and what would be charged.
+    pub attribution: EvaluationAttribution,
+    /// Amount to test. See [`DebitRequest::amount`] for the signedness.
+    pub amount: i64,
+}
+
+/// A decision that was never applied. Structurally a [`Decision`] plus the flag
+/// that says so, so a caller can parse both responses the same way.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DecisionPreview {
+    /// The verdict, flattened: `result`, `debit_plan`, and `diagnostics` sit at
+    /// the top level next to `preview`.
+    #[serde(flatten)]
+    pub decision: Decision,
+    /// Always `true`. Present so a dry run can never be mistaken for a commit.
+    pub preview: bool,
+}
+
+impl DecisionPreview {
+    /// Mark `decision` as a dry run.
+    #[must_use]
+    pub const fn of(decision: Decision) -> Self {
+        Self {
+            decision,
+            preview: true,
+        }
+    }
+}
+
+/// The one conversion site between the wire's signed amount and the unsigned
+/// amount every counter uses. `None` for zero and negatives, which the domain
+/// reports as `INVALID_AMOUNT`.
+#[must_use]
+pub const fn positive_amount(amount: i64) -> Option<u64> {
+    if amount <= 0 {
+        None
+    } else {
+        // Non-negative after the guard, so the conversion is exact.
+        Some(amount.unsigned_abs())
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Idempotency
 // ---------------------------------------------------------------------------
@@ -1243,22 +1449,16 @@ pub struct IdempotencyScope {
     pub key: String,
 }
 
-/// What a mutating primitive persists as the idempotency record, in the same
-/// transaction as the mutation (invariants I1 and I2).
+/// The caller's half of an idempotency record: the key and the digest a replay
+/// is compared against. What is recorded under it — the decision and the policy
+/// that produced it — is the transaction's own, never the caller's, so a replay
+/// returns what actually happened (invariants I1 and I2).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IdempotencyWrite {
     /// Full scope.
     pub scope: IdempotencyScope,
     /// Canonical payload digest for replay comparison.
     pub payload_hash: PayloadHash,
-    /// The outcome to replay verbatim.
-    pub decision: Decision,
-    /// Engine that produced the decision.
-    pub engine_id: String,
-    /// Policy that produced the decision.
-    pub policy_id: PolicyId,
-    /// Policy version that produced the decision.
-    pub policy_version: u32,
 }
 
 /// A stored idempotency record.
@@ -1270,12 +1470,18 @@ pub struct IdempotencyRecord {
     pub payload_hash: PayloadHash,
     /// Schema-versioned decision blob (top-level `__version`).
     pub decision_blob: Value,
-    /// Engine that produced the decision.
-    pub engine_id: String,
-    /// Policy that produced the decision.
-    pub policy_id: PolicyId,
-    /// Policy version that produced the decision.
-    pub policy_version: u32,
+    /// Engine that produced the decision. Absent for a primitive that
+    /// evaluates no policy, such as an operator credit.
+    pub engine_id: Option<String>,
+    /// Policy that produced the decision, when one was selected.
+    pub policy_id: Option<PolicyId>,
+    /// Version of that policy, when one was selected.
+    pub policy_version: Option<u32>,
+    /// The attribution the operation was authorized under. Present on debit
+    /// records, which rollback must prove it was authorized to reverse; absent
+    /// on credit and rollback records, which reverse nothing themselves.
+    #[serde(default)]
+    pub attribution_hash: Option<AttributionDigest>,
     /// Record creation time.
     #[serde(with = "rfc3339")]
     pub created_at: OffsetDateTime,
@@ -1284,9 +1490,90 @@ pub struct IdempotencyRecord {
     pub expires_at: OffsetDateTime,
 }
 
+impl IdempotencyRecord {
+    /// The recorded decision, decoded from the schema-versioned blob. The
+    /// top-level `__version` key is ignored by [`Decision`]'s deserializer, so
+    /// an additive P2 or P3 blob still decodes here.
+    ///
+    /// # Errors
+    ///
+    /// Returns the deserialization error when the blob is not a Decision.
+    pub fn decision(&self) -> Result<Decision, serde_json::Error> {
+        serde_json::from_value(self.decision_blob.clone())
+    }
+}
+
+/// Schema version written as the `__version` key of a stored decision blob.
+pub const DECISION_BLOB_VERSION: u32 = 1;
+
+/// The caller's half of an idempotency record whose subject key is not knowable
+/// before the transaction.
+///
+/// Credit addresses one Quota by id; its subject pair is only readable from the
+/// locked row, and the caller may not supply or narrow a subject key
+/// (PRD section 5.8). The plugin completes the scope under that lock.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PartialIdempotencyWrite {
+    /// Authorized target tenant.
+    pub tenant_id: TenantId,
+    /// Client-supplied key.
+    pub key: String,
+    /// Canonical payload digest for replay comparison.
+    pub payload_hash: PayloadHash,
+}
+
+impl PartialIdempotencyWrite {
+    /// Complete the scope with what the transaction read under the row lock.
+    #[must_use]
+    pub fn complete(
+        self,
+        subject_key: IdempotencySubjectKey,
+        operation_type: OperationType,
+    ) -> IdempotencyWrite {
+        IdempotencyWrite {
+            scope: IdempotencyScope {
+                tenant_id: self.tenant_id,
+                subject_key,
+                operation_type,
+                key: self.key,
+            },
+            payload_hash: self.payload_hash,
+        }
+    }
+}
+
+/// The committed debit a rollback reverses.
+///
+/// The scope locates the record; the digest proves the caller was authorized
+/// for that operation's metric and resource, not merely for some operation over
+/// the same subjects. A record whose stored digest differs is reported absent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RollbackTarget {
+    /// Full scope of the original debit, with operation type
+    /// [`OperationType::Debit`].
+    pub original: IdempotencyScope,
+    /// The attribution the rollback caller was authorized under, which must
+    /// equal the original debit's.
+    pub authorized: AttributionDigest,
+}
+
 // ---------------------------------------------------------------------------
 // Events and mutation results
 // ---------------------------------------------------------------------------
+
+/// Ownership of an event. Platform policy events have no tenant identity.
+/// Tenant events retain their top-level `tenant_id` on the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "scope", rename_all = "snake_case", deny_unknown_fields)]
+pub enum NotificationScope {
+    /// A tenant-owned Quota, lease, or consumption event.
+    Tenant {
+        /// Owning tenant.
+        tenant_id: TenantId,
+    },
+    /// A platform-wide policy event, independent of the operator's tenant.
+    Platform,
+}
 
 /// Same-transaction outbox event (invariant I11).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1295,8 +1582,9 @@ pub struct NotificationEvent {
     pub event_id: EventId,
     /// Catalog kind.
     pub kind: NotificationEventKind,
-    /// Owning tenant.
-    pub tenant_id: TenantId,
+    /// Explicit ownership scope; platform events never carry a synthetic tenant.
+    #[serde(flatten)]
+    pub scope: NotificationScope,
     /// Target Quota, when applicable.
     #[serde(default)]
     pub quota_id: Option<QuotaId>,
@@ -1382,11 +1670,90 @@ pub struct ExpiredLease {
 pub struct BatchDebitItem {
     /// The item's applicable subject set.
     pub applicable: ApplicableQuotas,
-    /// The item's debit plan.
-    pub plan: DebitPlan,
+    /// The item's requested amount. The plan is the transaction's to compute.
+    pub amount: u64,
+    /// Validated request projection value for this item.
+    pub request: Value,
+    /// Validated resource projection value, `null` when the item has none.
+    pub resource: Value,
+    /// The attribution this item was authorized under, recorded with it so a
+    /// later rollback can prove it reverses its own operation.
+    pub authorized: AttributionDigest,
     /// Optional per-item idempotency scope.
     #[serde(default)]
     pub item_scope: Option<IdempotencyScope>,
+}
+
+/// What an evaluated mutation committed: the decision the transaction's own
+/// engine invocation produced, and the counters the applied plan left behind.
+/// A denial commits no counter change and still occupies the idempotency key,
+/// so replaying a denial denies again.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvaluatedDebit {
+    /// The decision the transaction evaluated, validated before any mutation.
+    pub decision: Decision,
+    /// Counter state after the plan. Empty on a denial, and empty on a replay:
+    /// a replay moves nothing, and the stored decision is the whole answer.
+    pub mutation: MutationResult,
+    /// Whether an idempotency record now holds this outcome, and until when.
+    pub retention: Retention,
+}
+
+/// Whether a mutating primitive recorded its outcome under the idempotency
+/// key, and how long a replay will find it.
+///
+/// A denial with reason [`NO_APPLICABLE_QUOTA`] persists nothing at all
+/// (no record, no audit row), because provisioning a Quota must change the
+/// answer rather than replay the denial. Every other outcome is recorded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Retention {
+    /// A record holds this outcome until `expires_at`. A caching replica must
+    /// not answer from memory past that instant: the database treats the key
+    /// as new from then on.
+    Recorded {
+        /// Retention deadline of the record.
+        #[serde(with = "rfc3339")]
+        expires_at: OffsetDateTime,
+    },
+    /// Nothing was persisted. The same request re-evaluates from scratch and
+    /// must not be cached.
+    Unrecorded,
+}
+
+impl Retention {
+    /// The retention deadline, or `None` when nothing was recorded.
+    #[must_use]
+    pub const fn expires_at(&self) -> Option<OffsetDateTime> {
+        match self {
+            Self::Recorded { expires_at } => Some(*expires_at),
+            Self::Unrecorded => None,
+        }
+    }
+}
+
+/// What a corrective mutation committed: credit and rollback, which evaluate no
+/// policy and are always allowed once their guards pass.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppliedMutation {
+    /// The recorded decision. Always [`DecisionResult::Allowed`]; its plan
+    /// carries the amounts moved.
+    pub decision: Decision,
+    /// Counter state after the mutation.
+    pub mutation: MutationResult,
+    /// Retention deadline of the record written with it.
+    #[serde(with = "rfc3339")]
+    pub expires_at: OffsetDateTime,
+}
+
+/// What an evaluated lease acquisition committed. A denied acquisition holds
+/// nothing and carries no token.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvaluatedLease {
+    /// The decision the transaction evaluated.
+    pub decision: Decision,
+    /// The acquired lease, absent when the decision denied the operation.
+    pub token: Option<LeaseToken>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1460,10 +1827,91 @@ pub enum PolicyScope {
     },
 }
 
+/// Whether a policy transition actually moved state, or replayed a settled one.
+///
+/// A replayed rollback onto the already-active target, or a repeated delete of
+/// an already-deleted policy, commits no audit row and enqueues no event. The
+/// caller must therefore not count a `policy_version_transitions_total` for it,
+/// which is why the distinction is a variant rather than a flag: matching is
+/// the only way to reach the value.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransitionOutcome<T> {
+    /// State moved; the audit row and events committed with it.
+    Applied(T),
+    /// Nothing changed; no audit row and no event were written.
+    NoOp(T),
+}
+
+impl<T> TransitionOutcome<T> {
+    /// The value either way, discarding whether it moved.
+    pub fn into_inner(self) -> T {
+        match self {
+            Self::Applied(value) | Self::NoOp(value) => value,
+        }
+    }
+
+    /// Borrow the value either way.
+    pub const fn get(&self) -> &T {
+        match self {
+            Self::Applied(value) | Self::NoOp(value) => value,
+        }
+    }
+
+    /// Whether state actually moved, and so whether a transition may be counted.
+    pub const fn is_applied(&self) -> bool {
+        matches!(self, Self::Applied(_))
+    }
+}
+
+/// Public create input. Actor identity and validation snapshots are server-owned.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PolicySpec {
+    /// Scope.
+    pub scope: PolicyScope,
+    /// Registered engine identifier.
+    pub engine_id: String,
+    /// Engine-validated configuration.
+    pub engine_config: Value,
+    /// Per-policy evaluation timeout in milliseconds.
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+    /// Operator description.
+    #[serde(default)]
+    pub description: Option<String>,
+    /// Version comment.
+    #[serde(default)]
+    pub comment: Option<String>,
+}
+
+/// Public update input. Creates a new immutable version after operator admission.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PolicyPatch {
+    /// Expected current version. Lost-update protection.
+    pub if_match_version: u32,
+    /// New engine identifier.
+    #[serde(default)]
+    pub engine_id: Option<String>,
+    /// New engine configuration.
+    #[serde(default)]
+    pub engine_config: Option<Value>,
+    /// New timeout in milliseconds.
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+    /// Version comment.
+    #[serde(default)]
+    pub comment: Option<String>,
+}
+
 /// Create input for a Policy.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PolicyDraft {
+    /// Server-resolved engine schema closure; empty for MRW.
+    #[serde(default)]
+    pub schema_snapshot: crate::engine::PolicySchemaSnapshot,
     /// Scope.
     pub scope: PolicyScope,
     /// Registered engine identifier.
@@ -1487,6 +1935,9 @@ pub struct PolicyDraft {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PolicyUpdate {
+    /// Server-resolved engine schema closure; empty for MRW.
+    #[serde(default)]
+    pub schema_snapshot: Option<crate::engine::PolicySchemaSnapshot>,
     /// Expected current version. Lost-update protection.
     pub if_match_version: u32,
     /// New engine identifier.
@@ -1508,6 +1959,9 @@ pub struct PolicyUpdate {
 /// One immutable Policy version.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PolicyVersion {
+    /// Server-resolved engine schema closure; empty for MRW.
+    #[serde(default)]
+    pub schema_snapshot: crate::engine::PolicySchemaSnapshot,
     /// Stable policy identifier.
     pub policy_id: PolicyId,
     /// Monotonic version number, first version is 1.
@@ -1518,7 +1972,8 @@ pub struct PolicyVersion {
     pub engine_id: String,
     /// Engine configuration.
     pub engine_config: Value,
-    /// Evaluation timeout in milliseconds.
+    /// Requested timeout in milliseconds; `None` uses the default.
+    /// Clamp against the loaded operator bound on each evaluation.
     pub timeout_ms: Option<u64>,
     /// Operator description.
     pub description: Option<String>,
