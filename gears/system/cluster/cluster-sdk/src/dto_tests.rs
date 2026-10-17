@@ -206,6 +206,30 @@ fn cache_entry_round_trip_is_lossless_one_way_and_drops_the_expiry_the_other() {
 }
 
 #[test]
+fn lease_token_domain_round_trip_drops_the_client_local_deadline() {
+    use super::LeaseToken as WireLeaseToken;
+    use crate::lease::LeaseToken;
+
+    // A deadline-armed domain token under a scoped name, as a `scoped()` view mints
+    // it: name/owner/fence plus the client-local deadline the renewal task manages.
+    let token = LeaseToken::new("event-broker/ledger", "owner-a", 7)
+        .with_deadline(tokio::time::Instant::now());
+
+    // Through its wire mirror and back, name/owner/fence survive — the scoped name
+    // intact, which is what lets another replica renew it (invariant I7) — but the
+    // `deadline` is gone: it is a replica-local liveness bound, not a shared record
+    // field, so it cannot ride the wire. Pins that a later change cannot leak it.
+    let restored = LeaseToken::from(WireLeaseToken::from(token));
+    assert_eq!(restored.name, "event-broker/ledger");
+    assert_eq!(restored.owner, "owner-a");
+    assert_eq!(restored.fence, 7);
+    assert!(
+        restored.deadline.is_none(),
+        "deadline is replica-local and must not ride the wire"
+    );
+}
+
+#[test]
 fn leader_status_round_trips_through_its_mirror() {
     use super::WireLeaderStatus;
     use crate::leader::LeaderStatus;

@@ -1663,3 +1663,230 @@ async fn a_wedged_remote_consumer_is_told_it_lagged() {
     drop(watch);
     let _stopped = shutdown.send(());
 }
+
+// ---------------------------------------------------------------------------
+// Blocking `Lock` across a server-side wait clamp.
+//
+// The gear clamps any single blocking wait (`MAX_LOCK_WAIT`, two minutes) so no
+// wire caller can park a polling task for an unbounded time. The SDK client owns
+// the other half of that contract: it re-issues `Lock` until the *caller's* own
+// timeout, so a Profile-3 `lock(name, ttl, 10min)` waits as long as a Profile-1 one
+// (invariant I1). The real clamp is two minutes, too long to test against, so this
+// fake server clamps at `FAKE_WAIT_CLAMP` and answers the way the gear does: a
+// codec-encoded `LockTimeout` once its own (clamped) wait runs out.
+// ---------------------------------------------------------------------------
+
+/// The fake server's per-RPC wait clamp, standing in for the gear's two minutes.
+const FAKE_WAIT_CLAMP: Duration = Duration::from_millis(100);
+
+/// What the fake lock server does with each blocking `Lock`.
+#[derive(Clone, Copy)]
+enum LockMode {
+    /// Waits out its clamp and times out on the first `clamped` calls, then grants.
+    GrantAfter { clamped: u64 },
+    /// Always waits out its clamp and times out: the name never frees.
+    NeverFree,
+    /// Refuses at once with the waiter-cap backpressure error.
+    Saturated,
+}
+
+struct FakeLock {
+    mode: LockMode,
+    /// The `timeout_ms` of every `Lock` RPC received, in order.
+    asked: Arc<std::sync::Mutex<Vec<u64>>>,
+}
+
+#[tonic::async_trait]
+impl stubs::lock::distributed_lock_api_server::DistributedLockApi for FakeLock {
+    async fn try_lock(
+        &self,
+        _request: tonic::Request<stubs::lock::TryLockRequest>,
+    ) -> Result<tonic::Response<stubs::lock::LockAcquired>, tonic::Status> {
+        Err(tonic::Status::unimplemented("not under test"))
+    }
+
+    async fn lock(
+        &self,
+        request: tonic::Request<stubs::lock::LockRequest>,
+    ) -> Result<tonic::Response<stubs::lock::LockAcquired>, tonic::Status> {
+        let req = request.into_inner();
+        let call = {
+            let mut asked = self.asked.lock().expect("asked");
+            asked.push(req.timeout_ms);
+            u64::try_from(asked.len()).expect("few calls")
+        };
+        let wait = Duration::from_millis(req.timeout_ms).min(FAKE_WAIT_CLAMP);
+        let timed_out = || {
+            cluster_sdk::to_status(ClusterError::LockTimeout {
+                name: req.name.clone(),
+                waited: wait,
+            })
+        };
+        match self.mode {
+            LockMode::Saturated => Err(cluster_sdk::to_status(ClusterError::Provider {
+                kind: cluster_sdk::ProviderErrorKind::ResourceExhausted,
+                message: "too many concurrent blocking Lock waiters".to_owned(),
+            })),
+            LockMode::GrantAfter { clamped } if call > clamped => Ok(tonic::Response::new(
+                stubs::lock::LockAcquired::from(dto::LockAcquired {
+                    token: dto::LeaseToken {
+                        name: req.name.clone(),
+                        owner: "unauthenticated".to_owned(),
+                        fence: 9,
+                    },
+                }),
+            )),
+            LockMode::GrantAfter { .. } | LockMode::NeverFree => {
+                tokio::time::sleep(wait).await;
+                Err(timed_out())
+            }
+        }
+    }
+
+    async fn renew(
+        &self,
+        _request: tonic::Request<stubs::lock::LeaseRef>,
+    ) -> Result<tonic::Response<stubs::lock::RenewResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("not under test"))
+    }
+
+    async fn release(
+        &self,
+        _request: tonic::Request<stubs::lock::LeaseRef>,
+    ) -> Result<tonic::Response<stubs::lock::ReleaseResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("not under test"))
+    }
+}
+
+async fn serve_fake_lock(
+    mode: LockMode,
+) -> (
+    Arc<std::sync::Mutex<Vec<u64>>>,
+    Arc<dyn cluster_sdk::DistributedLockBackend>,
+    tokio::sync::oneshot::Sender<()>,
+) {
+    let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let service = FakeLock {
+        mode,
+        asked: Arc::clone(&asked),
+    };
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("binds");
+    let addr = listener.local_addr().expect("has an address");
+    let (shutdown, shutdown_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        Server::builder()
+            .add_service(
+                stubs::lock::distributed_lock_api_server::DistributedLockApiServer::new(service),
+            )
+            .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async {
+                let _stopped = shutdown_rx.await;
+            })
+            .await
+            .expect("the fake server runs");
+    });
+    let lock = RemoteClusterClient::connect_lazy(&format!("http://{addr}"), None)
+        .expect("a valid endpoint")
+        .lock_backend(PROFILE)
+        .expect("a handle");
+    (asked, lock, shutdown)
+}
+
+#[tokio::test]
+async fn a_server_clamped_blocking_lock_is_reissued_until_it_is_granted() {
+    let (asked, lock, shutdown) = serve_fake_lock(LockMode::GrantAfter { clamped: 2 }).await;
+
+    let token = lock
+        .acquire_waiting("ledger", "", Duration::from_secs(5), Duration::from_secs(5))
+        .await
+        .expect("two clamped waits are re-issued, and the third Lock is granted");
+    assert_eq!(token.name, "ledger");
+
+    let asked = asked.lock().expect("asked").clone();
+    assert_eq!(
+        asked.len(),
+        3,
+        "one Lock per clamped wait, plus the one that granted"
+    );
+    // Each re-issue carries only the caller's *remaining* budget, never a fresh one,
+    // so the total wait cannot exceed the caller's timeout.
+    assert!(
+        asked[0] <= 5_000 && asked[0] > 4_900,
+        "first Lock asks for the whole budget: {asked:?}"
+    );
+    assert!(
+        asked.windows(2).all(|pair| pair[1] < pair[0]),
+        "each re-issue asks for strictly less than the last: {asked:?}"
+    );
+    let _stopped = shutdown.send(());
+}
+
+#[tokio::test]
+async fn a_blocking_lock_still_times_out_on_the_callers_own_deadline() {
+    let (asked, lock, shutdown) = serve_fake_lock(LockMode::NeverFree).await;
+    let timeout = Duration::from_millis(350);
+
+    let started = std::time::Instant::now();
+    let outcome = lock
+        .acquire_waiting("ledger", "", Duration::from_secs(5), timeout)
+        .await;
+    let elapsed = started.elapsed();
+    let asked = asked.lock().expect("asked").clone();
+
+    // What each RPC's server measured, recomputed from what the client asked for.
+    // Pinned exactly rather than against the wall clock: the gaps between RPCs
+    // (round trips, timer slop) come out of the caller's budget but no server
+    // measures them, so on a loaded runner the sum falls short of `timeout` by an
+    // unbounded amount.
+    let server_measured: Duration = asked
+        .iter()
+        .map(|&ms| Duration::from_millis(ms).min(FAKE_WAIT_CLAMP))
+        .sum();
+    assert!(
+        matches!(
+            outcome,
+            Err(ClusterError::LockTimeout { ref name, waited })
+                if name == "ledger"
+                    && waited == server_measured
+                    && waited > FAKE_WAIT_CLAMP
+                    && waited <= timeout
+        ),
+        "the genuine timeout's `waited` is the sum of the server-measured waits \
+         ({server_measured:?} over {asked:?}), which covers every RPC and not one clamp, \
+         got {outcome:?}"
+    );
+    assert!(
+        elapsed >= timeout && elapsed < timeout + Duration::from_secs(1),
+        "the wait spans the caller's timeout, not one server clamp and not unbounded: {elapsed:?}"
+    );
+    let calls = asked.len();
+    assert!(
+        (3..=6).contains(&calls),
+        "a 350 ms budget over 100 ms clamps is about four Lock RPCs, not a busy loop: {calls}"
+    );
+    let _stopped = shutdown.send(());
+}
+
+#[tokio::test]
+async fn backpressure_ends_a_blocking_lock_without_a_reissue() {
+    let (asked, lock, shutdown) = serve_fake_lock(LockMode::Saturated).await;
+
+    let outcome = lock
+        .acquire_waiting("ledger", "", Duration::from_secs(5), Duration::from_secs(5))
+        .await;
+    assert!(
+        matches!(
+            outcome,
+            Err(ClusterError::Provider {
+                kind: cluster_sdk::ProviderErrorKind::ResourceExhausted,
+                ..
+            })
+        ),
+        "the waiter-cap refusal reaches the caller typed, got {outcome:?}"
+    );
+    assert_eq!(
+        asked.lock().expect("asked").len(),
+        1,
+        "only a clamped LockTimeout is re-issued; backpressure is the caller's to back off on"
+    );
+    let _stopped = shutdown.send(());
+}

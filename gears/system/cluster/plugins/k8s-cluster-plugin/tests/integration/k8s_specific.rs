@@ -361,11 +361,16 @@ const OP_VALUES: &[&str] = &[
     "scan_prefix",
     "watch",
     "watch_prefix",
-    // lock
+    // lock: the guard path
     "try_lock",
     "lock",
     "renew",
     "release",
+    // lock: the store-owned token path (every Profile-3 lock RPC)
+    "acquire",
+    "acquire_waiting",
+    "token_renew",
+    "token_release",
 ];
 
 /// The bounded `result` label vocabulary (`cluster_sdk::observability::result`).
@@ -445,7 +450,10 @@ fn metric_labels(
 /// stay inside their bounded sets. Load-bearing here because all three primitives are
 /// native — nothing emits on this plugin's behalf (DESIGN §9). The lock family is the
 /// signal this test exists to guard: it emitted nothing until the lock backend was
-/// wired to the metrics sink.
+/// wired to the metrics sink. Both halves of the lock are driven, and each must
+/// report under its own `op` labels (`try_lock`/`lock`/`renew`/`release` for the
+/// guard path, `acquire`/`acquire_waiting`/`token_renew`/`token_release` for the
+/// token path).
 #[tokio::test]
 async fn k8s_spec_016_full_catalog_emitted_with_bounded_labels() {
     use cluster_sdk::ClusterMetrics;
@@ -519,6 +527,27 @@ async fn k8s_spec_016_full_catalog_emitted_with_bounded_labels() {
         .expect("lock");
     g2.release().await.expect("release");
 
+    // Drive the token path too. It reports under its own op labels, apart from the
+    // guard path's, the same split every other lock backend draws.
+    let token = lock
+        .acquire("t", "owner-a", Duration::from_secs(30))
+        .await
+        .expect("acquire");
+    lock.renew(&token, Duration::from_secs(30))
+        .await
+        .expect("token renew");
+    lock.release(&token).await.expect("token release");
+    let waited = lock
+        .acquire_waiting(
+            "t2",
+            "owner-a",
+            Duration::from_secs(30),
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("acquire_waiting");
+    lock.release(&waited).await.expect("token release");
+
     // Drive leader elect + transition + resign.
     let leader = handle.leader_election();
     let watch = leader.elect("svc").await.expect("elect");
@@ -552,6 +581,29 @@ async fn k8s_spec_016_full_catalog_emitted_with_bounded_labels() {
         assert!(
             series.contains(expected),
             "K8S-SPEC-016: `{expected}` must be emitted; saw {series:?}"
+        );
+    }
+
+    // Both halves of the lock report under their own op labels: the guard path's
+    // and the token path's are each present, so neither is folded into the other.
+    let lock_ops: BTreeSet<&str> = triples
+        .iter()
+        .filter(|(n, k, _)| n == "cluster_lock_ops" && k == "op")
+        .map(|(_, _, v)| v.as_str())
+        .collect();
+    for expected in [
+        "try_lock",
+        "lock",
+        "renew",
+        "release",
+        "acquire",
+        "acquire_waiting",
+        "token_renew",
+        "token_release",
+    ] {
+        assert!(
+            lock_ops.contains(expected),
+            "K8S-SPEC-016: lock op `{expected}` must be emitted; saw {lock_ops:?}"
         );
     }
 

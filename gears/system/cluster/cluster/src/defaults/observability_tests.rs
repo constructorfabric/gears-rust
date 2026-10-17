@@ -69,6 +69,48 @@ async fn lock_records_acquire_and_contention() {
     );
 }
 
+/// The token path records under its **own** `op` labels, distinct from the guard
+/// path's: `acquire`/`acquire_waiting`/`token_renew`/`token_release` rather than
+/// `try_lock`/`lock`/`renew`/`release`. Every Profile-3 lock RPC takes the token
+/// path, so an operator watching remote lock RPCs fail while the in-process guard
+/// path is healthy needs the two apart. Every native backend (Redis, Postgres,
+/// k8s) draws the same split, so moving a profile between backends keeps the same
+/// label set.
+#[tokio::test]
+async fn the_token_path_records_its_own_op_labels() {
+    let rec = Arc::new(Rec::default());
+    let backend = CasBasedDistributedLockBackend::new(MemoryCache::linearizable())
+        .expect("linearizable cache")
+        .with_observability("test", Arc::clone(&rec) as _);
+    let ttl = Duration::from_secs(30);
+
+    let token = backend
+        .acquire("ledger", "owner-a", ttl)
+        .await
+        .expect("free lock acquires");
+    backend.renew(&token, ttl).await.expect("renew");
+    backend.release(&token).await.expect("release");
+    let waited = backend
+        .acquire_waiting("ledger", "owner-a", ttl, Duration::from_secs(1))
+        .await
+        .expect("free lock acquires");
+    backend.release(&waited).await.expect("release");
+
+    let ops = rec.lock_ops.lock().unwrap().clone();
+    assert_eq!(
+        ops,
+        [
+            ("acquire", "ok"),
+            ("token_renew", "ok"),
+            ("token_release", "ok"),
+            ("acquire_waiting", "ok"),
+            ("token_release", "ok"),
+        ]
+        .map(|(op, result)| (op.to_owned(), result.to_owned())),
+        "the token path must not report under the guard path's labels"
+    );
+}
+
 #[tokio::test]
 async fn leader_records_acquired_transition() {
     let rec = Arc::new(Rec::default());

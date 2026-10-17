@@ -90,6 +90,10 @@ profile set, fixed at `start` and changed only by an explicit reload (DESIGN.md 
 | `cluster.lock.lock` | `DistributedLockV1::lock` | `provider`, `lock` |
 | `cluster.lock.renew` | `LockGuard::renew` | `provider`, `lock` |
 | `cluster.lock.release` | `LockGuard::release` | `provider`, `lock` |
+| `cluster.lock.acquire` | `DistributedLockBackend::acquire`: the token-path acquire every Profile-3 `TryLock` RPC takes | `provider`, `lock` |
+| `cluster.lock.acquire_waiting` | `DistributedLockBackend::acquire_waiting`: the blocking token-path acquire every Profile-3 `Lock` RPC takes | `provider`, `lock` |
+| `cluster.lock.token_renew` | `DistributedLockBackend::renew`: a token-path renewal (`Renew` RPC) | `provider`, `lock` |
+| `cluster.lock.token_release` | `DistributedLockBackend::release`: a token-path release (`Release` RPC) | `provider`, `lock` |
 
 ## 5. Metrics
 
@@ -108,7 +112,14 @@ profile set, fixed at `start` and changed only by an explicit reload (DESIGN.md 
 The `op` label is a bounded set of facade operations: cache —
 `get`/`put`/`delete`/`contains`/`put_if_absent`/`compare_and_swap`/`watch`/`watch_prefix`
 plus the backend-internal `compare_and_delete`/`scan_prefix`; lock —
-`try_lock`/`lock`/`renew`/`release`.
+`try_lock`/`lock`/`renew`/`release` for the in-process guard path, and
+`acquire`/`acquire_waiting`/`token_renew`/`token_release` for the store-owned token
+path that serves every Profile-3 lock RPC. The two halves share one lease and one
+implementation per backend but report under separate labels, so an operator can
+tell failing lock RPCs from a healthy in-process guard path. Every lock backend
+(the CAS-based default, Postgres, Redis, k8s) draws the same split, so a profile
+moved between backends keeps one label set. A dashboard that wants "all
+acquisitions" selects `op=~"try_lock|acquire"`.
 
 ### 5.1 OpenTelemetry instrument names and the `_total` suffix
 

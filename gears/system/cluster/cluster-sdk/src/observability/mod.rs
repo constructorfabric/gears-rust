@@ -61,10 +61,29 @@ pub mod spans {
     pub const LOCK_TRY_LOCK: &str = "cluster.lock.try_lock";
     /// Span covering `DistributedLockV1::lock`.
     pub const LOCK_LOCK: &str = "cluster.lock.lock";
-    /// Span covering `LockGuard::renew`.
+    /// Span covering the guard path's `LockGuard::renew` (the in-process guard task's
+    /// background renewal).
     pub const LOCK_RENEW: &str = "cluster.lock.renew";
-    /// Span covering `LockGuard::release`.
+    /// Span covering the guard path's `LockGuard::release`.
     pub const LOCK_RELEASE: &str = "cluster.lock.release";
+    /// Span covering `DistributedLockBackend::acquire` — the token-path (store-owned
+    /// lease) acquire a gear serves over the wire, kept distinct from the in-process
+    /// `try_lock` so an operator can tell a failing Profile-3 lock RPC from a healthy
+    /// in-process guard.
+    pub const LOCK_ACQUIRE: &str = "cluster.lock.acquire";
+    /// Span covering `DistributedLockBackend::acquire_waiting` — the blocking
+    /// token-path acquire, the counterpart of [`LOCK_ACQUIRE`] and kept distinct from
+    /// the in-process `lock`.
+    pub const LOCK_ACQUIRE_WAITING: &str = "cluster.lock.acquire_waiting";
+    /// Span covering `DistributedLockBackend::renew` — the token-path renewal a gear
+    /// serves over the wire, kept distinct from the guard task's [`LOCK_RENEW`] so a
+    /// failing Profile-3 renew RPC is separable from a healthy in-process guard renew
+    /// (the same split [`LOCK_ACQUIRE`] draws for acquire).
+    pub const LOCK_TOKEN_RENEW: &str = "cluster.lock.token_renew";
+    /// Span covering `DistributedLockBackend::release` — the token-path release,
+    /// the counterpart of [`LOCK_TOKEN_RENEW`] and kept distinct from the guard task's
+    /// [`LOCK_RELEASE`].
+    pub const LOCK_TOKEN_RELEASE: &str = "cluster.lock.token_release";
 }
 
 /// Prometheus metric names (underscored lowercase). Labels are restricted to

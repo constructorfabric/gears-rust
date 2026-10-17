@@ -13,6 +13,7 @@
 //! - a *permanent* descriptor error is returned rather than deferred.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use super::{
     NOTHING_WIRED, RESOLVE_DESCRIPTOR_TIMEOUT, bind, process_client, unbound_cache,
@@ -23,6 +24,8 @@ use crate::cache::{
 };
 use crate::client::ClusterClient;
 use crate::error::ClusterError;
+use crate::leader::ElectionConfig;
+use crate::lease::LeaseToken;
 use crate::test_support::{StubClusterClient, with_nothing_derivable};
 use async_trait::async_trait;
 use toolkit::client_hub::ClientHub;
@@ -201,6 +204,93 @@ async fn an_unbound_cache_backend_answers_every_operation_with_profile_not_bound
     assert!(backend.watch("k").await.err().is_some_and(not_bound));
     assert!(backend.watch_prefix("k").await.err().is_some_and(not_bound));
     assert!(backend.scan_prefix("k").await.err().is_some_and(not_bound));
+    assert!(backend.probe().await.err().is_some_and(not_bound));
+}
+
+/// The lock half of the sweep. The store-owned-lease methods are *required* on the
+/// trait now, so the unbound backend must implement them. Each one has to answer
+/// `ProfileNotBound`. A stray `Ok` would let an unwired Profile-1 consumer acquire a
+/// lease that exists nowhere.
+#[tokio::test]
+async fn an_unbound_lock_backend_answers_every_operation_with_profile_not_bound() {
+    let backend = unbound_lock(PROFILE);
+    let ttl = Duration::from_secs(30);
+    // A token this backend never minted: no acquisition here succeeds, so that is
+    // the only kind `renew`/`release` can ever see.
+    let token = LeaseToken::new("ledger", "owner-a", 1);
+
+    let not_bound = |err| matches!(err, ClusterError::ProfileNotBound { profile: "orders" });
+    assert!(
+        backend
+            .try_lock("ledger", ttl)
+            .await
+            .err()
+            .is_some_and(not_bound)
+    );
+    assert!(
+        backend
+            .lock("ledger", ttl, ttl)
+            .await
+            .err()
+            .is_some_and(not_bound)
+    );
+    assert!(
+        backend
+            .acquire("ledger", "owner-a", ttl)
+            .await
+            .err()
+            .is_some_and(not_bound)
+    );
+    assert!(
+        backend
+            .acquire_waiting("ledger", "owner-a", ttl, ttl)
+            .await
+            .err()
+            .is_some_and(not_bound)
+    );
+    assert!(
+        backend
+            .renew(&token, ttl)
+            .await
+            .err()
+            .is_some_and(not_bound)
+    );
+    assert!(backend.release(&token).await.err().is_some_and(not_bound));
+    assert!(backend.probe().await.err().is_some_and(not_bound));
+}
+
+/// The leader-election half of the sweep. `join` must *error* rather than return a
+/// follower's `Ok(None)`: to a consumer, `Ok(None)` looks like an ordinary lost
+/// election, and would hide that nothing is wired at all.
+#[tokio::test]
+async fn an_unbound_leader_election_backend_answers_every_operation_with_profile_not_bound() {
+    let backend = unbound_leader_election(PROFILE);
+    let token = LeaseToken::new("primary", "cand-a", 1);
+
+    let not_bound = |err| matches!(err, ClusterError::ProfileNotBound { profile: "orders" });
+    assert!(backend.elect("primary").await.err().is_some_and(not_bound));
+    assert!(
+        backend
+            .elect_with_config("primary", ElectionConfig::default())
+            .await
+            .err()
+            .is_some_and(not_bound)
+    );
+    assert!(
+        backend
+            .join("primary", "cand-a", ElectionConfig::default())
+            .await
+            .err()
+            .is_some_and(not_bound)
+    );
+    assert!(
+        backend
+            .renew(&token, Duration::from_secs(30))
+            .await
+            .err()
+            .is_some_and(not_bound)
+    );
+    assert!(backend.resign(&token).await.err().is_some_and(not_bound));
     assert!(backend.probe().await.err().is_some_and(not_bound));
 }
 

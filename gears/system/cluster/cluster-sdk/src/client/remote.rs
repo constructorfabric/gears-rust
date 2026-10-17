@@ -36,9 +36,10 @@
 //! TCP/TLS connection and nothing else. No per-call deadline is set, for two
 //! reasons that pull the same way:
 //!
-//! - `Lock` waits **server-side** for up to the caller's `timeout_ms` (§6.5), so
-//!   any client deadline shorter than that would sever an acquisition the server
-//!   was about to grant;
+//! - `Lock` waits **server-side** for up to the caller's `timeout_ms` (§6.5),
+//!   clamped per RPC and re-issued by `RemoteLockBackend` until the caller's
+//!   deadline, so any client deadline shorter than that would sever an
+//!   acquisition the server was about to grant;
 //! - a watch is long-lived and must carry no RPC timeout at all (§6.10).
 //!
 //! A default unary deadline belongs with the policy stack §12.9 sketches, which
