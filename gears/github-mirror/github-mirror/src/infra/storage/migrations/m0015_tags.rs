@@ -25,7 +25,7 @@ CREATE TABLE IF NOT EXISTS gm_tags (
             sea_orm::DatabaseBackend::MySql => {
                 r"
 CREATE TABLE IF NOT EXISTS gm_tags (
-    tenant_id VARCHAR(36) NOT NULL,
+    tenant_id BINARY(16) NOT NULL,
     repo_id BIGINT NOT NULL,
     name VARCHAR(512) NOT NULL,
     commit_sha VARCHAR(64) NOT NULL,

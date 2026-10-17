@@ -45,6 +45,7 @@ async fn migrations_apply_and_roll_back_on_a_clean_database() {
         "gm_entity_fingerprints",
         "gm_repo_sync_status",
         "gm_http_cache",
+        "gm_logical_conversations",
     ] {
         assert!(
             manager.has_table(table).await.unwrap(),
@@ -146,6 +147,7 @@ async fn migrations_apply_and_roll_back_on_a_clean_database() {
         "gm_entity_fingerprints",
         "gm_repo_sync_status",
         "gm_http_cache",
+        "gm_logical_conversations",
     ] {
         assert!(
             manager.has_column(table, "tenant_id").await.unwrap(),
@@ -218,6 +220,7 @@ async fn migrations_apply_and_roll_back_on_a_clean_database() {
         "gm_entity_fingerprints",
         "gm_repo_sync_status",
         "gm_http_cache",
+        "gm_logical_conversations",
     ] {
         assert!(
             !manager.has_table(table).await.unwrap(),
@@ -229,10 +232,11 @@ async fn migrations_apply_and_roll_back_on_a_clean_database() {
     // so there is nothing further to assert for the individual columns.
 }
 
-/// The last ten migrations are the cache table and the nine that only add
-/// columns, so they are the first ten to roll back. Undoing exactly those leaves every table in place, which
-/// is what makes their `down()` bodies observable: replace one with `Ok(())`
-/// and its column survives here.
+/// The last fourteen migrations only add columns (`m0045` also its own table;
+/// `m0047` changes nothing outside MariaDB), so they are the first fourteen to
+/// roll back. Undoing exactly those leaves
+/// every mirrored table in place, which is what makes their `down()` bodies
+/// observable: replace one with `Ok(())` and its column survives here.
 #[tokio::test]
 async fn the_additive_migrations_drop_their_columns_on_rollback() {
     let conn = Database::connect("sqlite::memory:")
@@ -240,7 +244,7 @@ async fn the_additive_migrations_drop_their_columns_on_rollback() {
         .expect("in-memory database must connect");
 
     Migrator::up(&conn, None).await.expect("up must succeed");
-    Migrator::down(&conn, Some(10))
+    Migrator::down(&conn, Some(14))
         .await
         .expect("rolling back the additive migrations must succeed");
 
@@ -262,6 +266,11 @@ async fn the_additive_migrations_drop_their_columns_on_rollback() {
         ("gm_issues", "labels_json"),
         ("gm_issues", "author_json"),
         ("gm_pull_requests", "requested_reviewers_json"),
+        ("gm_comments", "conversation_id"),
+        ("gm_review_comments", "conversation_id"),
+        ("gm_review_comments", "snippet_before"),
+        ("gm_review_comments", "snippet_after"),
+        ("gm_sync_watermarks", "stage_etags"),
     ] {
         assert!(
             manager.has_table(table).await.unwrap(),
@@ -272,4 +281,8 @@ async fn the_additive_migrations_drop_their_columns_on_rollback() {
             "{table}.{column} must be gone after its migration's down()"
         );
     }
+    assert!(
+        !manager.has_table("gm_logical_conversations").await.unwrap(),
+        "gm_logical_conversations must be gone after its migration's down()"
+    );
 }

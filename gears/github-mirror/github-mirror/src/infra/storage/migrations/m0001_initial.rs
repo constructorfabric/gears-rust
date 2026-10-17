@@ -34,7 +34,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_gm_repositories_tenant_full_name
             sea_orm::DatabaseBackend::MySql => {
                 r"
 CREATE TABLE IF NOT EXISTS gm_repositories (
-    tenant_id VARCHAR(36) NOT NULL,
+    tenant_id BINARY(16) NOT NULL,
     id BIGINT NOT NULL,
     owner VARCHAR(255) NOT NULL,
     name VARCHAR(255) NOT NULL,

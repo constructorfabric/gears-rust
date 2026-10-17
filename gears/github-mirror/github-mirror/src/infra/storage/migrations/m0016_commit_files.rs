@@ -31,7 +31,7 @@ CREATE TABLE IF NOT EXISTS gm_commit_files (
             sea_orm::DatabaseBackend::MySql => {
                 r"
 CREATE TABLE IF NOT EXISTS gm_commit_files (
-    tenant_id VARCHAR(36) NOT NULL,
+    tenant_id BINARY(16) NOT NULL,
     repo_id BIGINT NOT NULL,
     commit_sha VARCHAR(64) NOT NULL,
     filename VARCHAR(640) NOT NULL,

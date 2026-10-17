@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use chrono::{DateTime, Duration, Utc};
@@ -5,6 +6,7 @@ use toolkit_macros::domain_model;
 use toolkit_security::AccessScope;
 use uuid::Uuid;
 
+use super::mirror_worker::SweptEnd;
 use super::task::Family;
 use crate::domain::error::DomainError;
 use crate::domain::repo::{SyncWatermarkRecord, SyncWatermarkRepository};
@@ -79,6 +81,7 @@ pub fn high_water(seen: &[&str], threshold: Option<DateTime<Utc>>) -> Option<Dat
 pub struct SweepStart {
     pub updated_after: Option<DateTime<Utc>>,
     pub page1_etag: Option<String>,
+    pub stage_etags: BTreeMap<String, String>,
     pub last_head_sha: Option<String>,
 }
 
@@ -112,6 +115,10 @@ impl SweepWatermark {
         Ok(SweepStart {
             updated_after: stop_threshold(stored.as_ref(), force),
             page1_etag: stored.as_ref().and_then(|w| w.page1_etag.clone()),
+            stage_etags: stored
+                .as_ref()
+                .map(|w| w.stage_etags.clone())
+                .unwrap_or_default(),
             last_head_sha: stored.and_then(|w| w.last_head_sha),
         })
     }
@@ -142,6 +149,10 @@ impl SweepWatermark {
                         .as_ref()
                         .and_then(|w| w.last_seen_updated_at.clone()),
                     page1_etag: stored.as_ref().and_then(|w| w.page1_etag.clone()),
+                    stage_etags: stored
+                        .as_ref()
+                        .map(|w| w.stage_etags.clone())
+                        .unwrap_or_default(),
                     last_head_sha: stored.and_then(|w| w.last_head_sha),
                     sweep_in_progress: true,
                     candidate_high_water: candidate,
@@ -168,8 +179,7 @@ impl SweepWatermark {
         tenant_id: Uuid,
         repo_id: i64,
         family: Family,
-        page1_etag: Option<String>,
-        head_sha: Option<String>,
+        end: SweptEnd,
     ) -> Result<(), DomainError> {
         let Some(stored) = self
             .watermark_store
@@ -191,8 +201,9 @@ impl SweepWatermark {
                 tenant_id,
                 SyncWatermarkRecord {
                     last_seen_updated_at,
-                    page1_etag: page1_etag.or_else(|| stored.page1_etag.clone()),
-                    last_head_sha: head_sha.or_else(|| stored.last_head_sha.clone()),
+                    page1_etag: end.page1_etag.or_else(|| stored.page1_etag.clone()),
+                    stage_etags: end.stage_etags,
+                    last_head_sha: end.head_sha.or_else(|| stored.last_head_sha.clone()),
                     sweep_in_progress: false,
                     candidate_high_water: None,
                     ..stored

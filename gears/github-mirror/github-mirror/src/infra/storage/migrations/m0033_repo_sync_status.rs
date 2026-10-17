@@ -29,11 +29,11 @@ CREATE INDEX IF NOT EXISTS idx_gm_repo_sync_status_tenant_status
             sea_orm::DatabaseBackend::MySql => {
                 r"
 CREATE TABLE IF NOT EXISTS gm_repo_sync_status (
-    tenant_id VARCHAR(36) NOT NULL,
+    tenant_id BINARY(16) NOT NULL,
     repo_full_name VARCHAR(512) NOT NULL,
     repo_id BIGINT,
     status VARCHAR(32) NOT NULL,
-    last_session_id VARCHAR(36),
+    last_session_id BINARY(16),
     last_synced_at VARCHAR(64),
     PRIMARY KEY (tenant_id, repo_full_name),
     KEY idx_gm_repo_sync_status_tenant_status (tenant_id, status)

@@ -31,7 +31,7 @@ CREATE TABLE IF NOT EXISTS gm_entity_fingerprints (
             sea_orm::DatabaseBackend::MySql => {
                 r"
 CREATE TABLE IF NOT EXISTS gm_entity_fingerprints (
-    tenant_id VARCHAR(36) NOT NULL,
+    tenant_id BINARY(16) NOT NULL,
     repo_id BIGINT NOT NULL,
     family VARCHAR(64) NOT NULL,
     entity_id VARCHAR(128) NOT NULL,

@@ -17,6 +17,7 @@ pub(crate) enum DbConnectOptions {
     /// Connect options for a PostgreSQL database.
     #[cfg(feature = "pg")]
     Postgres(sqlx::postgres::PgConnectOptions),
+    /// Connect options for a MySQL or MariaDB database.
     #[cfg(feature = "mysql")]
     MySql(sqlx::mysql::MySqlConnectOptions),
 }

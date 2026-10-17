@@ -29,7 +29,7 @@ CREATE TABLE IF NOT EXISTS gm_sync_watermarks (
             sea_orm::DatabaseBackend::MySql => {
                 r"
 CREATE TABLE IF NOT EXISTS gm_sync_watermarks (
-    tenant_id VARCHAR(36) NOT NULL,
+    tenant_id BINARY(16) NOT NULL,
     repo_id BIGINT NOT NULL,
     family VARCHAR(64) NOT NULL,
     last_seen_updated_at VARCHAR(64),

@@ -18,6 +18,7 @@ use url::form_urlencoded;
 
 use crate::api::rest::routes::ConcreteService;
 use crate::domain::error::DomainError;
+use crate::domain::ports::github::ForceMode;
 use crate::domain::repo::{
     IssueState, ListingDirection, ListingFilter, ListingSort, PageWindow, RepoRunStatus,
 };
@@ -45,8 +46,12 @@ const MAX_PER_PAGE: u64 = 100;
 /// response-header size.
 const MAX_FILTER_VALUE: usize = 64;
 
-/// `?force=true` bypasses the HTTP cache (PRD §5.2 force mode): every request
-/// goes out without its stored validator, so nothing is served from cache.
+/// `?force_full=true` walks every listing and refines every entity, ignoring
+/// the watermarks and fingerprints earlier runs stored, but still asks GitHub
+/// "has this page changed?" so unchanged pages cost nothing. `?force=true`
+/// does that and also bypasses the HTTP cache (PRD §5.2 force mode): every
+/// request goes out without its stored validator, so nothing is served from
+/// cache.
 ///
 /// The remaining fields narrow what the run collects (PRD §5.4, §5.19). Any
 /// field left out keeps the gear's configured default, and `include`
@@ -55,6 +60,7 @@ const MAX_FILTER_VALUE: usize = 64;
 pub struct SyncQuery {
     /// Bypass the HTTP cache and re-read the whole repository from GitHub.
     pub force: Option<bool>,
+    pub force_full: Option<bool>,
     /// Comma-separated object types to collect, e.g.
     /// `issues,pull_requests,commits`. Omit to collect the configured set.
     pub include: Option<String>,
@@ -85,7 +91,7 @@ impl SyncQuery {
 
         let mut scope = default;
         if let Some(include) = self.include.as_deref() {
-            scope.objects = objects_from_include(include)?;
+            scope.objects = SyncScope::parse_list(include)?;
         }
         if let Some(mode) = self.actions_scope.as_deref() {
             scope.collection.actions = CollectionMode::parse(mode)?;
@@ -114,36 +120,6 @@ impl SyncQuery {
     }
 }
 
-/// Build an object scope enabling exactly the comma-separated types named.
-fn objects_from_include(include: &str) -> Result<SyncScope, DomainError> {
-    let mut scope = SyncScope::none();
-    for raw in include.split(',') {
-        let name = raw.trim().to_ascii_lowercase();
-        if name.is_empty() {
-            continue;
-        }
-        match name.as_str() {
-            "issues" => scope.issues = true,
-            "pull_requests" | "pulls" => scope.pull_requests = true,
-            "commits" => scope.commits = true,
-            "releases" => scope.releases = true,
-            "branches" => scope.branches = true,
-            "labels" => scope.labels = true,
-            "milestones" => scope.milestones = true,
-            "github_actions" | "actions" => scope.github_actions = true,
-            "contributors" => scope.contributors = true,
-            "security" => scope.security = true,
-            other => {
-                return Err(DomainError::Validation {
-                    field: "include".to_owned(),
-                    message: format!("unknown object type `{other}`"),
-                });
-            }
-        }
-    }
-    Ok(scope)
-}
-
 /// `?owner=X` clears everything mirrored for that owner; `?repo=owner/name`
 /// narrows it to one repository.
 #[derive(Debug, Default, Deserialize)]
@@ -162,6 +138,7 @@ pub struct ResumeQuery {
     pub repo: Option<String>,
     /// Run each resumed sync in force mode.
     pub force: Option<bool>,
+    pub force_full: Option<bool>,
 }
 
 /// `?status=in_progress` narrows a run-status listing.
@@ -439,7 +416,10 @@ pub async fn sync_repository(
             &owner,
             &name,
             scope,
-            query.force.unwrap_or(false),
+            ForceMode::from_flags(
+                query.force.unwrap_or(false),
+                query.force_full.unwrap_or(false),
+            ),
             since,
         )
         .await?;
@@ -746,7 +726,7 @@ pub async fn list_review_threads(
 ) -> ApiResult<JsonPage<ReviewThreadDto>> {
     validate_repo_path(&owner, &name)?;
     let page: Page<_> = svc
-        .list_review_threads(&ctx, &owner, &name, number, &query)
+        .list_review_threads(&ctx, &owner, &name, number, &query, None)
         .await?;
     Ok(Json(page.map_items(ReviewThreadDto::from)))
 }
@@ -1029,7 +1009,14 @@ pub async fn resume_syncs(
     Query(query): Query<ResumeQuery>,
 ) -> ApiResult<(StatusCode, JsonBody<ResumeAcceptedDto>)> {
     let outcome = svc
-        .resume_incomplete_syncs(&ctx, query.repo.as_deref(), query.force.unwrap_or(false))
+        .resume_incomplete_syncs(
+            &ctx,
+            query.repo.as_deref(),
+            ForceMode::from_flags(
+                query.force.unwrap_or(false),
+                query.force_full.unwrap_or(false),
+            ),
+        )
         .await?;
     Ok((
         StatusCode::ACCEPTED,

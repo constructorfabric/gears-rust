@@ -87,6 +87,15 @@ struct Inner {
     /// Tasks ever enqueued per phase. Only ever grows: it is the denominator
     /// the progress estimate divides by.
     enqueued: HashMap<BucketKey, u64>,
+    failed: HashMap<Uuid, u64>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TaskCounts {
+    pub pending: u64,
+    pub running: u64,
+    pub done: u64,
+    pub failed: u64,
 }
 
 impl Inner {
@@ -246,8 +255,38 @@ impl TaskQueue {
             }
             TaskStatus::Done | TaskStatus::Failed => {}
         }
+        if status == TaskStatus::Failed
+            && matches!(task.status, TaskStatus::Pending | TaskStatus::Running)
+        {
+            *inner.failed.entry(task.run.session_id).or_insert(0) += 1;
+        }
         if let Some(stored) = inner.by_id.get_mut(&task_id) {
             stored.status = status;
+        }
+    }
+
+    #[must_use]
+    pub fn status_counts(&self, session_id: Uuid) -> TaskCounts {
+        let inner = self.lock();
+        let per_phase = |counts: &HashMap<BucketKey, u64>| -> u64 {
+            TaskPhase::iter()
+                .filter_map(|phase| counts.get(&(session_id, phase)))
+                .sum()
+        };
+        let pending = TaskPhase::iter()
+            .map(|phase| inner.pending_in(session_id, phase))
+            .sum();
+        let running = per_phase(&inner.running);
+        let failed = inner.failed.get(&session_id).copied().unwrap_or(0);
+        let done = per_phase(&inner.enqueued)
+            .saturating_sub(pending)
+            .saturating_sub(running)
+            .saturating_sub(failed);
+        TaskCounts {
+            pending,
+            running,
+            done,
+            failed,
         }
     }
 
@@ -350,6 +389,78 @@ mod tests {
             2,
             "two tenants asking for the same issue must not collapse into one task"
         );
+    }
+
+    #[test]
+    fn status_counts_follow_each_task_from_pending_to_done_or_failed() {
+        let session = Uuid::new_v4();
+        let queue = TaskQueue::new();
+        for id in ["1", "2", "3", "4"] {
+            queue.enqueue_task(&refinement_task(session, id, TaskPriority::NORMAL));
+        }
+        assert_eq!(
+            queue.status_counts(session),
+            TaskCounts {
+                pending: 4,
+                ..TaskCounts::default()
+            }
+        );
+
+        let first = queue
+            .claim_next_task_in(session, &all_phases())
+            .expect("a pending task must be claimable");
+        let second = queue
+            .claim_next_task_in(session, &all_phases())
+            .expect("a pending task must be claimable");
+        assert_eq!(
+            queue.status_counts(session),
+            TaskCounts {
+                pending: 2,
+                running: 2,
+                ..TaskCounts::default()
+            }
+        );
+
+        queue.complete_task(first.id);
+        queue.fail_task(second.id);
+        assert_eq!(
+            queue.status_counts(session),
+            TaskCounts {
+                pending: 2,
+                running: 0,
+                done: 1,
+                failed: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn a_task_finished_twice_is_counted_once() {
+        let session = Uuid::new_v4();
+        let queue = TaskQueue::new();
+        queue.enqueue_task(&discovery_task(session));
+        let task = queue
+            .claim_next_task_in(session, &all_phases())
+            .expect("the discovery task must be claimable");
+
+        queue.fail_task(task.id);
+        queue.fail_task(task.id);
+
+        assert_eq!(
+            queue.status_counts(session),
+            TaskCounts {
+                failed: 1,
+                ..TaskCounts::default()
+            }
+        );
+    }
+
+    #[test]
+    fn status_counts_of_another_session_are_zero() {
+        let queue = TaskQueue::new();
+        queue.enqueue_task(&discovery_task(Uuid::new_v4()));
+
+        assert_eq!(queue.status_counts(Uuid::new_v4()), TaskCounts::default());
     }
 
     #[test]

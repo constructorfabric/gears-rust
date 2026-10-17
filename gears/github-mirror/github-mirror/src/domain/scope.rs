@@ -70,6 +70,57 @@ impl Default for SyncScope {
 }
 
 impl SyncScope {
+    /// The scope enabling exactly the comma-separated object types named,
+    /// with the PRD's aliases (`prs`, `pulls`, `actions`, `gha`).
+    ///
+    /// # Errors
+    /// `Validation` naming the first type that is not one of them.
+    pub fn parse_list(list: &str) -> Result<Self, DomainError> {
+        let mut scope = Self::none();
+        for raw in list.split(',') {
+            let name = raw.trim().to_ascii_lowercase();
+            if name.is_empty() {
+                continue;
+            }
+            match name.as_str() {
+                "issues" => scope.issues = true,
+                "pull_requests" | "pulls" | "prs" => scope.pull_requests = true,
+                "commits" => scope.commits = true,
+                "releases" => scope.releases = true,
+                "branches" => scope.branches = true,
+                "labels" => scope.labels = true,
+                "milestones" => scope.milestones = true,
+                "github_actions" | "actions" | "gha" => scope.github_actions = true,
+                "contributors" => scope.contributors = true,
+                "security" => scope.security = true,
+                other => {
+                    return Err(DomainError::Validation {
+                        field: "include".to_owned(),
+                        message: format!("unknown object type `{other}`"),
+                    });
+                }
+            }
+        }
+        Ok(scope)
+    }
+
+    /// This scope with every type enabled in `excluded` turned off.
+    #[must_use]
+    pub fn without(self, excluded: Self) -> Self {
+        Self {
+            issues: self.issues && !excluded.issues,
+            pull_requests: self.pull_requests && !excluded.pull_requests,
+            commits: self.commits && !excluded.commits,
+            releases: self.releases && !excluded.releases,
+            branches: self.branches && !excluded.branches,
+            labels: self.labels && !excluded.labels,
+            milestones: self.milestones && !excluded.milestones,
+            github_actions: self.github_actions && !excluded.github_actions,
+            contributors: self.contributors && !excluded.contributors,
+            security: self.security && !excluded.security,
+        }
+    }
+
     /// A scope with every object type disabled.
     #[must_use]
     pub fn none() -> Self {
@@ -189,6 +240,8 @@ pub struct CollectionScope {
     /// Timeline events. Off by default, as in the reference: a high-volume,
     /// low-signal feed that costs one request per issue (PRD §5.2).
     pub timeline: CollectionMode,
+    /// Code context kept with each inline review comment.
+    pub inline_comment_snippets: InlineCommentSnippets,
 }
 
 impl Default for CollectionScope {
@@ -197,8 +250,84 @@ impl Default for CollectionScope {
             actions: CollectionMode::Open,
             reactions: CollectionMode::Open,
             timeline: CollectionMode::None,
+            inline_comment_snippets: InlineCommentSnippets::default(),
         }
     }
+}
+
+/// Code lines cut from a review comment's `diff_hunk` around the commented
+/// line (PRD §5.19's `--inline-comment-snippet-before/after`): a count per
+/// side, `-1` for the whole side, `0` for none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct InlineCommentSnippets {
+    pub before: i32,
+    pub after: i32,
+}
+
+impl InlineCommentSnippets {
+    /// # Errors
+    /// `Validation` unless both sides are `-1` or a line count.
+    pub fn validate(self) -> Result<(), DomainError> {
+        if self.before < -1 || self.after < -1 {
+            return Err(DomainError::Validation {
+                field: "inline_comment_snippets".to_owned(),
+                message: "must be -1 (all) or a non-negative line count".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn covers(self, other: Self) -> bool {
+        side_covers(self.before, other.before) && side_covers(self.after, other.after)
+    }
+
+    /// The lines of `diff_hunk` above and below its last line, the commented
+    /// one, with the `@@` header and the diff markers removed; `None` on a
+    /// side that asks for nothing or has nothing.
+    #[must_use]
+    pub fn cut(self, diff_hunk: Option<&str>) -> (Option<String>, Option<String>) {
+        if self.before == 0 && self.after == 0 {
+            return (None, None);
+        }
+        let Some(hunk) = diff_hunk else {
+            return (None, None);
+        };
+        let lines: Vec<&str> = hunk
+            .lines()
+            .filter(|line| !line.starts_with("@@"))
+            .map(|line| line.strip_prefix([' ', '+', '-']).unwrap_or(line))
+            .collect();
+        let Some(origin) = lines.len().checked_sub(1) else {
+            return (None, None);
+        };
+        let (above, from_origin) = lines.split_at(origin);
+        let below = from_origin.get(1..).unwrap_or(&[]);
+        (take_last(above, self.before), take_first(below, self.after))
+    }
+}
+
+fn side_covers(mine: i32, theirs: i32) -> bool {
+    mine == -1 || (theirs != -1 && mine >= theirs)
+}
+
+fn take_last(source: &[&str], n: i32) -> Option<String> {
+    let selected = match usize::try_from(n) {
+        Ok(0) => return None,
+        Ok(n) => source.get(source.len().saturating_sub(n)..).unwrap_or(&[]),
+        Err(_) => source,
+    };
+    (!selected.is_empty()).then(|| selected.join("\n"))
+}
+
+fn take_first(source: &[&str], n: i32) -> Option<String> {
+    let selected = match usize::try_from(n) {
+        Ok(0) => return None,
+        Ok(n) => source.get(..n.min(source.len())).unwrap_or(&[]),
+        Err(_) => source,
+    };
+    (!selected.is_empty()).then(|| selected.join("\n"))
 }
 
 impl CollectionScope {
@@ -223,7 +352,8 @@ impl ScopeConfig {
     /// # Errors
     /// Whatever [`SyncScope::validate`] returns.
     pub fn validate(&self) -> Result<(), DomainError> {
-        self.objects.validate()
+        self.objects.validate()?;
+        self.collection.inline_comment_snippets.validate()
     }
 
     #[must_use]
@@ -247,6 +377,10 @@ impl ScopeConfig {
             (self.collection.timeline, other.collection.timeline),
         ];
         objects.iter().all(|&(mine, theirs)| mine || !theirs)
+            && self
+                .collection
+                .inline_comment_snippets
+                .covers(other.collection.inline_comment_snippets)
             && modes.iter().all(|&(mine, theirs)| {
                 [true, false]
                     .into_iter()
@@ -318,6 +452,7 @@ mod tests {
             actions: CollectionMode::None,
             reactions,
             timeline,
+            inline_comment_snippets: InlineCommentSnippets::default(),
         };
         let cases = [
             (CollectionMode::All, CollectionMode::None, true, true),
