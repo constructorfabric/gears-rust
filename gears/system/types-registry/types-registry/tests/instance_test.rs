@@ -97,6 +97,56 @@ fn worker(db: &Arc<DBProvider<DbError>>) -> DBProvider<WorkerError> {
     DBProvider::new(db.db())
 }
 
+#[tokio::test]
+async fn x_gts_ref_checks_instance_values_without_requiring_registered_targets() {
+    let db = test_db().await;
+    let target = gts_id!("cf.core.inst.target.v1~");
+    let mut schema = conforming_schema();
+    schema["properties"]["name"]["x-gts-ref"] = json!(target);
+    let op = submit(&db, "ref-type", TYPE_ID, schema).await;
+    let tuning = Tuning {
+        limits: &common::limits(),
+        worker: &common::worker_settings(),
+        metrics: &common::metrics(),
+        allow_compatibility_force: false,
+    };
+    let outcome = run_operation(&stores(), &worker(&db), &allow_all(), tuning, op, LATER)
+        .await
+        .expect("the worker itself must not fail");
+    assert_eq!(
+        outcome.items[0].status,
+        domain_enums::OperationItemStatus::Succeeded,
+        "x-gts-ref must not require the target to be registered: {:?}",
+        outcome.items[0].failure,
+    );
+
+    for (key, value, expected_failure) in [
+        ("invalid-ref", "not-a-gts-id", true),
+        ("wrong-ref", TYPE_ID, true),
+        ("matching-ref", target, false),
+    ] {
+        let op = submit(&db, key, INSTANCE_ID, json!({ "name": value })).await;
+        let outcome = run_operation(&stores(), &worker(&db), &allow_all(), tuning, op, LATER)
+            .await
+            .expect("the worker itself must not fail");
+        let item = &outcome.items[0];
+        if expected_failure {
+            assert_eq!(item.status, domain_enums::OperationItemStatus::Failed);
+            assert_eq!(
+                item.failure.as_ref().expect("failure").reason,
+                AdmissionFailureReason::InvalidValue,
+            );
+        } else {
+            assert_eq!(
+                item.status,
+                domain_enums::OperationItemStatus::Succeeded,
+                "a matching identifier needs no registered target: {:?}",
+                item.failure,
+            );
+        }
+    }
+}
+
 /// Admit the conforming type, then run one operation and return its outcome.
 async fn admit_type_then(
     db: &Arc<DBProvider<DbError>>,

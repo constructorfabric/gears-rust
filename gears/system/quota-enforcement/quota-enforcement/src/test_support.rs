@@ -30,7 +30,7 @@ use cluster_sdk::{
     ClusterError, ClusterProfile, ElectionConfig, LeaderElectionBackend, LeaderElectionFeatures,
     LeaderStatus, LeaderWatch,
 };
-use gts::{GTS_ID_URI_PREFIX, GtsId, GtsInstanceId, GtsStore, GtsTypeId};
+use gts::{GTS_ID_URI_PREFIX, GtsId, GtsInstanceId, GtsRefValidation, GtsStore, GtsTypeId};
 use quota_enforcement_sdk::testing::InMemoryStorage;
 use quota_enforcement_sdk::{
     METRIC_BASE_TYPE, MetricId, MetricKind, OwnedDefinition, QuotaEnforcementStoragePluginSpecV1,
@@ -884,8 +884,8 @@ pub fn plugin_instance_document(fixture: &PluginFixture) -> Value {
 }
 
 /// Resolves `documents` the way the production adapter does: a local
-/// `GtsStore` holding the QE bases plus every document, then `validate_schema`
-/// per type document. Instances are skipped.
+/// `GtsStore` holding the QE bases plus every document, then validation with
+/// the registry's pattern-only `x-gts-ref` policy. Instances are skipped.
 pub fn resolve_documents(documents: &[Value]) -> Vec<RegisteredType> {
     let mut store = GtsStore::new();
     let mut ids = Vec::new();
@@ -901,7 +901,7 @@ pub fn resolve_documents(documents: &[Value]) -> Vec<RegisteredType> {
     ids.into_iter()
         .map(|id| {
             let resolved = store
-                .validate_schema(&id)
+                .validate_schema_with(&id, GtsRefValidation::None)
                 .unwrap_or_else(|e| panic!("{id}: {e}"));
             let mut ancestors: Vec<GtsTypeId> = GtsId::try_new(&id)
                 .expect("type id")

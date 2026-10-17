@@ -67,6 +67,31 @@ async fn a_derived_contract_resolves_with_its_traits_dialect_and_inlined_parent(
 }
 
 #[tokio::test]
+async fn scope_reference_syntax_and_prefix_are_enforced() {
+    for scope in ["not-an-id", METRIC_TOKENS] {
+        let mut documents = llm_gateway_documents();
+        let projection = documents
+            .iter_mut()
+            .find(|doc| doc["$id"] == format!("gts://{LLM_USER_PROJECTION}"))
+            .expect("user projection");
+        projection["x-gts-traits"]["scope"] = json!(scope);
+        let registry = adapter(mock_registry(&documents, &[]));
+
+        let err = registry
+            .type_schema(&type_id(LLM_USER_PROJECTION))
+            .await
+            .expect_err("the scope must match its x-gts-ref constraint");
+        match err {
+            DomainError::TypesRegistryUnavailable(reason) => {
+                assert!(reason.contains("trait"), "{scope}: {reason}");
+                assert!(reason.contains("scope"), "{scope}: {reason}");
+            }
+            other => panic!("expected drift for {scope}, got {other:?}"),
+        }
+    }
+}
+
+#[tokio::test]
 async fn local_and_mixin_references_are_resolved_transitively() {
     let documents = vec![mixin_type_document(), mixin_request_document(METRIC_TOKENS)];
     let registry = adapter(mock_registry(&documents, &[]));

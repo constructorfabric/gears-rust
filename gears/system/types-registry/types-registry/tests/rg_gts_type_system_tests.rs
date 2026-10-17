@@ -395,7 +395,8 @@ async fn test_vendor_isolation_across_rg_types() {
 async fn test_valid_tenant_root_no_metadata() {
     let service = setup_rg_type_system();
     let t1 = json!({
-        "id": gts_id!("cf.core.rg.type.v1~y.core.tn.tenant.v1~cf.core._.t1.v1"),
+        "id": "60dc8608-b9e7-5d80-a415-f4aa82bc2528",
+        "gtsId": gts_id!("cf.core.rg.type.v1~y.core.tn.tenant.v1~cf.core._.t1.v1"),
         "name": "T1",
         "parent_id": null,
         "tenant_id": "11111111-1111-1111-1111-111111111111",
@@ -413,7 +414,8 @@ async fn test_valid_tenant_root_no_metadata() {
 async fn test_valid_tenant_with_metadata_custom_domain() {
     let service = setup_rg_type_system();
     let t9 = json!({
-        "id": gts_id!("cf.core.rg.type.v1~y.core.tn.tenant.v1~cf.core._.t9.v1"),
+        "id": "25ee425d-2d17-59f9-be85-55261200564b",
+        "gtsId": gts_id!("cf.core.rg.type.v1~y.core.tn.tenant.v1~cf.core._.t9.v1"),
         "name": "T9",
         "parent_id": null,
         "tenant_id": "99999999-9999-9999-9999-999999999999",
@@ -432,7 +434,8 @@ async fn test_valid_tenant_with_metadata_custom_domain() {
 async fn test_valid_tenant_with_metadata_barrier() {
     let service = setup_rg_type_system();
     let t7 = json!({
-        "id": gts_id!("cf.core.rg.type.v1~y.core.tn.tenant.v1~cf.core._.t7.v1"),
+        "id": "7d34f500-449c-5eb3-94bf-18695b183b4d",
+        "gtsId": gts_id!("cf.core.rg.type.v1~y.core.tn.tenant.v1~cf.core._.t7.v1"),
         "name": "T7",
         "parent_id": "11111111-1111-1111-1111-111111111111",
         "tenant_id": "77777777-7777-7777-7777-777777777777",
@@ -451,7 +454,8 @@ async fn test_valid_tenant_with_metadata_barrier() {
 async fn test_valid_department_with_metadata() {
     let service = setup_rg_type_system();
     let d2 = json!({
-        "id": gts_id!("cf.core.rg.type.v1~w.core.org.department.v1~cf.core._.d2.v1"),
+        "id": "f3c830df-ff58-5792-9118-99bcfce32b13",
+        "gtsId": gts_id!("cf.core.rg.type.v1~w.core.org.department.v1~cf.core._.d2.v1"),
         "name": "D2",
         "parent_id": "11111111-1111-1111-1111-111111111111",
         "tenant_id": "11111111-1111-1111-1111-111111111111",
@@ -470,7 +474,8 @@ async fn test_valid_department_with_metadata() {
 async fn test_valid_branch_with_metadata() {
     let service = setup_rg_type_system();
     let b3 = json!({
-        "id": gts_id!("cf.core.rg.type.v1~cf.core.rg.branch.v1~cf.core._.b3.v1"),
+        "id": "06f976b5-e57c-50f9-9def-ef3e8e7255c4",
+        "gtsId": gts_id!("cf.core.rg.type.v1~cf.core.rg.branch.v1~cf.core._.b3.v1"),
         "name": "B3",
         "parent_id": "22222222-2222-2222-2222-222222222222",
         "tenant_id": "11111111-1111-1111-1111-111111111111",
@@ -489,7 +494,8 @@ async fn test_valid_branch_with_metadata() {
 async fn test_valid_user_instance() {
     let service = setup_rg_type_system();
     let user = json!({
-        "id": gts_id!("cf.core.idp.user.v1~z.core._.idp_user1.v1"),
+        "id": "93d2b0c4-0b75-5e81-98b0-fb07b057e1ab",
+        "gtsId": gts_id!("cf.core.idp.user.v1~z.core._.idp_user1.v1"),
         "email": "alice@example.com",
         "display_name": "Alice"
     });
@@ -501,7 +507,8 @@ async fn test_valid_user_instance() {
 async fn test_valid_course_instance() {
     let service = setup_rg_type_system();
     let course = json!({
-        "id": gts_id!("cf.core.lms.course.v1~z.core._.lms_course1.v1"),
+        "id": "6e3d20ec-4afc-5987-890f-f5424c856f9c",
+        "gtsId": gts_id!("cf.core.lms.course.v1~z.core._.lms_course1.v1"),
         "title": "Introduction to GTS"
     });
     let results = service.register(vec![course]);
@@ -516,7 +523,8 @@ async fn test_valid_course_instance() {
 async fn test_tenant_missing_required_name() {
     let service = setup_rg_type_system();
     let bad = json!({
-        "id": gts_id!("cf.core.rg.type.v1~y.core.tn.tenant.v1~cf.core._.bad1.v1"),
+        "id": "9e7c635c-44a0-56b5-b069-a5fd03d1818a",
+        "gtsId": gts_id!("cf.core.rg.type.v1~y.core.tn.tenant.v1~cf.core._.bad1.v1"),
         "parent_id": null,
         "tenant_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
         "depth": 0
@@ -528,7 +536,8 @@ async fn test_tenant_missing_required_name() {
 async fn test_tenant_name_too_long() {
     let service = setup_rg_type_system();
     let bad = json!({
-        "id": gts_id!("cf.core.rg.type.v1~y.core.tn.tenant.v1~cf.core._.bad2.v1"),
+        "id": "8b984dbc-30b2-520a-9f5d-e961612ea2d2",
+        "gtsId": gts_id!("cf.core.rg.type.v1~y.core.tn.tenant.v1~cf.core._.bad2.v1"),
         "name": "X".repeat(256),
         "parent_id": null,
         "tenant_id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
@@ -541,7 +550,8 @@ async fn test_tenant_name_too_long() {
 async fn test_tenant_empty_name() {
     let service = setup_rg_type_system();
     let bad = json!({
-        "id": gts_id!("cf.core.rg.type.v1~y.core.tn.tenant.v1~cf.core._.bad3.v1"),
+        "id": "9c76ea2e-510e-5fa9-b3a3-3d5e7754abc3",
+        "gtsId": gts_id!("cf.core.rg.type.v1~y.core.tn.tenant.v1~cf.core._.bad3.v1"),
         "name": "",
         "parent_id": null,
         "tenant_id": "cccccccc-cccc-cccc-cccc-cccccccccccc",
@@ -554,7 +564,8 @@ async fn test_tenant_empty_name() {
 async fn test_user_missing_required_email() {
     let service = setup_rg_type_system();
     let bad = json!({
-        "id": gts_id!("cf.core.idp.user.v1~z.core._.bad_user1.v1"),
+        "id": "c2d1045b-a094-522e-b6f1-13281bcf2a3b",
+        "gtsId": gts_id!("cf.core.idp.user.v1~z.core._.bad_user1.v1"),
         "display_name": "Bob"
     });
     assert!(service.register(vec![bad])[0].is_err(), "Missing email");
@@ -564,7 +575,8 @@ async fn test_user_missing_required_email() {
 async fn test_course_missing_required_title() {
     let service = setup_rg_type_system();
     let bad = json!({
-        "id": gts_id!("cf.core.lms.course.v1~z.core._.bad_course.v1")
+        "id": "f7f042c9-0f9c-5e4c-a526-0c29cb2e3a18",
+        "gtsId": gts_id!("cf.core.lms.course.v1~z.core._.bad_course.v1")
     });
     assert!(service.register(vec![bad])[0].is_err(), "Missing title");
 }
@@ -577,7 +589,8 @@ async fn test_course_missing_required_title() {
 async fn test_metadata_department_category_too_long() {
     let service = setup_rg_type_system();
     let bad = json!({
-        "id": gts_id!("cf.core.rg.type.v1~w.core.org.department.v1~cf.core._.bad_cat.v1"),
+        "id": "c8f98ade-fe1e-54c5-bbda-b33df0c4340e",
+        "gtsId": gts_id!("cf.core.rg.type.v1~w.core.org.department.v1~cf.core._.bad_cat.v1"),
         "name": "Bad Dept",
         "parent_id": "11111111-1111-1111-1111-111111111111",
         "tenant_id": "11111111-1111-1111-1111-111111111111",
@@ -594,7 +607,8 @@ async fn test_metadata_department_category_too_long() {
 async fn test_metadata_department_short_description_too_long() {
     let service = setup_rg_type_system();
     let bad = json!({
-        "id": gts_id!("cf.core.rg.type.v1~w.core.org.department.v1~cf.core._.bad_desc.v1"),
+        "id": "822f1ccd-14ef-5e0a-ab3f-376d2068aabf",
+        "gtsId": gts_id!("cf.core.rg.type.v1~w.core.org.department.v1~cf.core._.bad_desc.v1"),
         "name": "Bad Dept",
         "parent_id": "11111111-1111-1111-1111-111111111111",
         "tenant_id": "11111111-1111-1111-1111-111111111111",
@@ -611,7 +625,8 @@ async fn test_metadata_department_short_description_too_long() {
 async fn test_metadata_tenant_barrier_wrong_type() {
     let service = setup_rg_type_system();
     let bad = json!({
-        "id": gts_id!("cf.core.rg.type.v1~y.core.tn.tenant.v1~cf.core._.bad_barrier.v1"),
+        "id": "385413b2-519b-5d4f-a410-1e2a0393d4a3",
+        "gtsId": gts_id!("cf.core.rg.type.v1~y.core.tn.tenant.v1~cf.core._.bad_barrier.v1"),
         "name": "Bad Barrier",
         "parent_id": null,
         "tenant_id": "dddddddd-dddd-dddd-dddd-dddddddddddd",
@@ -628,7 +643,8 @@ async fn test_metadata_tenant_barrier_wrong_type() {
 async fn test_metadata_tenant_unknown_field_rejected() {
     let service = setup_rg_type_system();
     let bad = json!({
-        "id": gts_id!("cf.core.rg.type.v1~y.core.tn.tenant.v1~cf.core._.bad_unknown.v1"),
+        "id": "d3383c03-38cc-5a12-a916-1465c1c193ac",
+        "gtsId": gts_id!("cf.core.rg.type.v1~y.core.tn.tenant.v1~cf.core._.bad_unknown.v1"),
         "name": "Unknown Field Tenant",
         "parent_id": null,
         "tenant_id": "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee",
@@ -649,7 +665,8 @@ async fn test_top_level_custom_field_passes_gts_but_app_layer_rejects() {
     // not at GTS level. GTS only validates metadata sub-object.
     let service = setup_rg_type_system();
     let instance = json!({
-        "id": gts_id!("cf.core.rg.type.v1~y.core.tn.tenant.v1~cf.core._.flat_ok.v1"),
+        "id": "e8184edf-e9dd-55ce-861f-ce55bdb44ecf",
+        "gtsId": gts_id!("cf.core.rg.type.v1~y.core.tn.tenant.v1~cf.core._.flat_ok.v1"),
         "name": "Flat Field Tenant",
         "parent_id": null,
         "tenant_id": "ffffffff-ffff-ffff-ffff-ffffffffffff",
@@ -723,36 +740,42 @@ async fn test_full_hierarchy_batch() {
 
     let instances = vec![
         json!({
-            "id": gts_id!("cf.core.rg.type.v1~y.core.tn.tenant.v1~cf.core._.t1.v1"),
+            "id": "60dc8608-b9e7-5d80-a415-f4aa82bc2528",
+            "gtsId": gts_id!("cf.core.rg.type.v1~y.core.tn.tenant.v1~cf.core._.t1.v1"),
             "name": "T1", "parent_id": null,
             "tenant_id": "11111111-1111-1111-1111-111111111111", "depth": 0
         }),
         json!({
-            "id": gts_id!("cf.core.rg.type.v1~w.core.org.department.v1~cf.core._.d2.v1"),
+            "id": "f3c830df-ff58-5792-9118-99bcfce32b13",
+            "gtsId": gts_id!("cf.core.rg.type.v1~w.core.org.department.v1~cf.core._.d2.v1"),
             "name": "D2", "parent_id": "11111111-1111-1111-1111-111111111111",
             "tenant_id": "11111111-1111-1111-1111-111111111111", "depth": 1,
             "metadata": { "category": "finance", "short_description": "Mega Department" }
         }),
         json!({
-            "id": gts_id!("cf.core.rg.type.v1~cf.core.rg.branch.v1~cf.core._.b3.v1"),
+            "id": "06f976b5-e57c-50f9-9def-ef3e8e7255c4",
+            "gtsId": gts_id!("cf.core.rg.type.v1~cf.core.rg.branch.v1~cf.core._.b3.v1"),
             "name": "B3", "parent_id": "22222222-2222-2222-2222-222222222222",
             "tenant_id": "11111111-1111-1111-1111-111111111111", "depth": 2,
             "metadata": { "location": "Building A, Floor 3" }
         }),
         json!({
-            "id": gts_id!("cf.core.rg.type.v1~y.core.tn.tenant.v1~cf.core._.t7.v1"),
+            "id": "7d34f500-449c-5eb3-94bf-18695b183b4d",
+            "gtsId": gts_id!("cf.core.rg.type.v1~y.core.tn.tenant.v1~cf.core._.t7.v1"),
             "name": "T7", "parent_id": "11111111-1111-1111-1111-111111111111",
             "tenant_id": "77777777-7777-7777-7777-777777777777", "depth": 1,
             "metadata": { "self_managed": true }
         }),
         json!({
-            "id": gts_id!("cf.core.rg.type.v1~w.core.org.department.v1~cf.core._.d8.v1"),
+            "id": "18a0a156-9e80-563d-b4ea-9da8925cacdc",
+            "gtsId": gts_id!("cf.core.rg.type.v1~w.core.org.department.v1~cf.core._.d8.v1"),
             "name": "D8", "parent_id": "77777777-7777-7777-7777-777777777777",
             "tenant_id": "77777777-7777-7777-7777-777777777777", "depth": 2,
             "metadata": { "category": "hr" }
         }),
         json!({
-            "id": gts_id!("cf.core.rg.type.v1~y.core.tn.tenant.v1~cf.core._.t9.v1"),
+            "id": "25ee425d-2d17-59f9-be85-55261200564b",
+            "gtsId": gts_id!("cf.core.rg.type.v1~y.core.tn.tenant.v1~cf.core._.t9.v1"),
             "name": "T9", "parent_id": null,
             "tenant_id": "99999999-9999-9999-9999-999999999999", "depth": 0,
             "metadata": { "custom_domain": "t9.example.com" }
@@ -794,7 +817,8 @@ async fn test_config_mode_accepts_invalid_then_ready_rejects() {
 
     // Invalid tenant: missing name (accepted in config mode)
     let bad = json!({
-        "id": gts_id!("cf.core.rg.type.v1~y.core.tn.tenant.v1~cf.core._.bad_cfg.v1"),
+        "id": "be2e1318-b43a-542b-8cdd-6e1d3ee875b1",
+        "gtsId": gts_id!("cf.core.rg.type.v1~y.core.tn.tenant.v1~cf.core._.bad_cfg.v1"),
         "parent_id": null, "tenant_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", "depth": 0
     });
     assert!(

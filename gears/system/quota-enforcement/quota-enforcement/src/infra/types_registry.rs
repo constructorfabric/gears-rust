@@ -22,7 +22,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use gts::{GtsInstanceId, GtsStore, GtsTypeId, extract_gts_refs};
+use gts::{GtsInstanceId, GtsRefValidation, GtsStore, GtsTypeId, extract_gts_refs};
 use quota_enforcement_sdk::OwnedDefinition;
 use serde_json::Value;
 use toolkit_canonical_errors::CanonicalError;
@@ -149,8 +149,10 @@ fn resolve(
             .register_schema(id, raw)
             .map_err(|e| drift(root, &e.to_string()))?;
     }
+    // The closure holds schema dependencies, not x-gts-ref targets. Match the
+    // registry's pattern-only policy; the catalogue checks target membership.
     let resolved = store
-        .validate_schema(root.type_id.as_ref())
+        .validate_schema_with(root.type_id.as_ref(), GtsRefValidation::None)
         .map_err(|e| drift(root, &e.to_string()))?;
     Ok(RegisteredType {
         id: root.type_id.clone(),

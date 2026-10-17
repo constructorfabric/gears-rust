@@ -37,7 +37,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use gts::{GtsEntity, GtsId, GtsStore, StoreError};
+use gts::{GtsEntity, GtsId, GtsRefValidation, GtsStore, ResolvedType, StoreError};
 use serde_json::Value;
 use thiserror::Error;
 use toolkit_db::DbTx;
@@ -98,6 +98,21 @@ impl std::fmt::Debug for UnitStore {
 }
 
 impl UnitStore {
+    /// Validate with the registry's non-resolving `x-gts-ref` policy
+    /// (`cpt-cf-types-registry-fr-ref-tracking`).
+    /// Pattern and value checks still apply; target presence is not a dependency.
+    ///
+    /// # Errors
+    /// Returns the GTS validation error, including circular references: managed
+    /// schemas must materialize fully, while GTS also accepts recursive schemas.
+    pub fn validate_schema(&mut self, type_id: &str) -> Result<ResolvedType, StoreError> {
+        let mut resolved = self
+            .store
+            .validate_schema_with(type_id, GtsRefValidation::None)?;
+        resolved.schema = self.store.resolve_schema_refs(&resolved.schema)?;
+        Ok(resolved)
+    }
+
     /// Retained committed document by identifier; `None` for overlay candidates
     /// and entities absent from the closure.
     #[must_use]
