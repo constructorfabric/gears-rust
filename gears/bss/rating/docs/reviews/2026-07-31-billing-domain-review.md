@@ -1,9 +1,15 @@
-<!-- Related: ../DESIGN.md, ../DECISIONS.md, ../SEAMS.md, ../design/ | Owners: BSS Rating team -->
+<!-- Related: ../DESIGN.md, ../DECISIONS.md, ../UPSTREAM_REQS.md, ../DECOMPOSITION.md | Owners: BSS Rating team -->
 
 # Rating gear — billing-domain review (2026-07-31)
 
-**Scope**: the 16 slice designs ([`../design/`](../design/)) + [`../PRD.md`](../PRD.md),
-[`../DESIGN.md`](../DESIGN.md), [`../SEAMS.md`](../SEAMS.md), [`../DECISIONS.md`](../DECISIONS.md),
+> **Historical record.** This review cites the documentation layout of its date: slice numbers
+> (`01`–`16`), `design/NN-*.md` and `SEAMS.md` rows. Since 2026-10-06 the slice addresses resolve
+> through [`../DECOMPOSITION.md`](../DECOMPOSITION.md#4-contract-address-index) §4, the seam keys
+> (K, O, W, M, P, B, G, SB) through [DESIGN §3.5](../DESIGN.md#adopted-pricing-semantics), and the
+> dependency rows through [`../UPSTREAM_REQS.md`](../UPSTREAM_REQS.md). The text below is unchanged.
+
+**Scope**: the 16 slice designs ([`../design/`](../DECOMPOSITION.md#4-contract-address-index)) + [`../PRD.md`](../PRD.md),
+[`../DESIGN.md`](../DESIGN.md), [`../SEAMS.md`](../UPSTREAM_REQS.md), [`../DECISIONS.md`](../DECISIONS.md),
 `ADR/`, cross-checked against the adopted pricing design set. Reviewed as a **billing system**:
 rating semantics, money-affecting rules, idempotency, cross-gear contracts.
 **Method**: 7 parallel finders produced **175 candidates**; 8 refutation passes verified each
