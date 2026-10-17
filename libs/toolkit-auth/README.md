@@ -91,6 +91,40 @@ out-of-band.
 
 See `examples/` for more patterns (OIDC discovery, token invalidation, shared token, form auth).
 
+## Lazy acquisition
+
+Use `Token::new_lazy(config)?` to construct a handle without contacting the
+identity provider. The first `get()`, `wait_ready()` or `invalidate()` starts
+acquisition. `get()` never waits for network I/O: before the first attempt
+completes it returns `TokenError::Unavailable`; after a failed attempt it returns
+the last acquisition error, including its HTTP status and operation.
+
+Async callers can use `token.wait_ready().await` to obtain a cached token or wait
+for the current or next scheduled attempt. All callers observing an attempt get
+its token or error, even if another retry completes before they resume. A call
+during backoff waits for the next attempt rather than bypassing the delay.
+Cancelling an individual wait does not cancel shared acquisition. Wrap the future
+in `tokio::time::timeout` when a caller needs a deadline.
+
+One watcher retries initial discovery and token acquisition after 1, 2, 4, 8, 16,
+then at most 30 seconds between attempts. These delays are independent of
+`min_refresh_period`; HTTP request duration and transport retries are additional.
+After the first success it uses the existing refresh schedule and backoff.
+Clones share the watcher; dropping the last handle cancels pending work.
+Construction without an active Tokio runtime returns `TokenError::ConfigError`.
+`Token::new(config).await` retains its eager, fail-fast behavior.
+
+### HTTP error migration
+
+Rejected HTTP responses now produce the non-exhaustive
+`TokenError::HttpStatus { operation, status, .. }` variant rather than `Http(String)`.
+This changes error classification for callers matching only `Http(..)`, even
+though their code still compiles. Handle both variants, or use
+`TokenError::status()` when classification depends on the response status.
+`HttpOperation::{Discovery, TokenRequest}` identifies the failed operation without
+parsing messages. Response bodies and headers are discarded. Transport failures
+still use `TokenError::Http` and have no HTTP response status.
+
 ## License
 
 Licensed under Apache-2.0.

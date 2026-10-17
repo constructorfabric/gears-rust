@@ -1,4 +1,6 @@
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::OnceCell;
 
 use base64::{Engine as _, engine::general_purpose};
 use http::header::AUTHORIZATION;
@@ -6,7 +8,7 @@ use url::Url;
 use zeroize::Zeroizing;
 
 use super::config::OAuthClientConfig;
-use super::error::TokenError;
+use super::error::{HttpOperation, TokenError};
 use super::token_watcher::FetchedToken;
 use super::types::ClientAuthMethod;
 use toolkit_utils::SecretString;
@@ -16,9 +18,11 @@ use toolkit_utils::SecretString;
 ///
 /// Called by [`super::token_watcher::TokenWatcher`] for both the initial fetch
 /// and background refreshes.
+#[derive(Clone)]
 pub struct OAuthTokenSource {
     client: toolkit_http::HttpClient,
-    token_endpoint: Url,
+    token_endpoint: Arc<OnceCell<Url>>,
+    issuer_url: Option<Url>,
     client_id: String,
     client_secret: SecretString,
     /// Pre-joined scopes (space-separated), or `None` when the scope list is
@@ -36,15 +40,17 @@ impl OAuthTokenSource {
     ///
     /// # Errors
     ///
-    /// Returns [`TokenError::ConfigError`] if `token_endpoint` is `None`.
+    /// Returns [`TokenError::ConfigError`] if both endpoint options are absent.
     ///
     /// Returns [`TokenError::Http`] if the underlying `HttpClient` fails to
     /// build.
     pub fn new(config: &OAuthClientConfig) -> Result<Self, TokenError> {
-        let token_endpoint = config
-            .token_endpoint
-            .clone()
-            .ok_or_else(|| TokenError::ConfigError("token_endpoint is required".into()))?;
+        if config.token_endpoint.is_none() && config.issuer_url.is_none() {
+            return Err(TokenError::ConfigError(
+                "token_endpoint or issuer_url is required".into(),
+            ));
+        }
+        let token_endpoint = Arc::new(OnceCell::new_with(config.token_endpoint.clone()));
 
         let http_config = config
             .http_config
@@ -53,9 +59,7 @@ impl OAuthTokenSource {
 
         let client = toolkit_http::HttpClientBuilder::with_config(http_config)
             .build()
-            .map_err(|e| {
-                TokenError::Http(crate::http_error::format_http_error(&e, "OAuth2 token"))
-            })?;
+            .map_err(|e| TokenError::from_http(&e, HttpOperation::TokenRequest))?;
 
         let scopes = if config.scopes.is_empty() {
             None
@@ -66,6 +70,7 @@ impl OAuthTokenSource {
         Ok(Self {
             client,
             token_endpoint,
+            issuer_url: config.issuer_url.clone(),
             client_id: config.client_id.clone(),
             client_secret: config.client_secret.clone(),
             scopes,
@@ -82,6 +87,15 @@ impl OAuthTokenSource {
     /// Perform a single token exchange and return a [`FetchedToken`] suitable
     /// for caching by the [`super::token_watcher::TokenWatcher`].
     pub(crate) async fn request_token(&mut self) -> Result<FetchedToken, TokenError> {
+        let endpoint = self
+            .token_endpoint
+            .get_or_try_init(|| async {
+                let issuer = self.issuer_url.as_ref().ok_or_else(|| {
+                    TokenError::ConfigError("token_endpoint or issuer_url is required".into())
+                })?;
+                super::discovery::discover_token_endpoint(&self.client, issuer).await
+            })
+            .await?;
         // -- build form fields ---------------------------------------------------
         let mut fields: Vec<(&str, &str)> = vec![("grant_type", "client_credentials")];
 
@@ -99,7 +113,7 @@ impl OAuthTokenSource {
         }
 
         // -- build request -------------------------------------------------------
-        let mut builder = self.client.post(self.token_endpoint.as_str());
+        let mut builder = self.client.post(endpoint.as_str());
 
         // For Basic auth, credentials go into the Authorization header.
         // Wrap intermediates in `Zeroizing` so the plaintext is scrubbed on drop.
@@ -121,26 +135,18 @@ impl OAuthTokenSource {
 
         let response = builder
             .form(fields.as_slice())
-            .map_err(|e| {
-                TokenError::Http(crate::http_error::format_http_error(&e, "OAuth2 token"))
-            })?
+            .map_err(|e| TokenError::from_http(&e, HttpOperation::TokenRequest))?
             .send()
             .await
-            .map_err(|e| {
-                TokenError::Http(crate::http_error::format_http_error(&e, "OAuth2 token"))
-            })?;
+            .map_err(|e| TokenError::from_http(&e, HttpOperation::TokenRequest))?;
 
         // -- check status, then parse response ------------------------------------
         let token_resp: super::types::TokenResponse = response
             .error_for_status()
-            .map_err(|e| {
-                TokenError::Http(crate::http_error::format_http_error(&e, "OAuth2 token"))
-            })?
+            .map_err(|e| TokenError::from_http(&e, HttpOperation::TokenRequest))?
             .json()
             .await
-            .map_err(|e| {
-                TokenError::Http(crate::http_error::format_http_error(&e, "OAuth2 token"))
-            })?;
+            .map_err(|e| TokenError::from_http(&e, HttpOperation::TokenRequest))?;
 
         // -- validate token_type -------------------------------------------------
         if let Some(ref tt) = token_resp.token_type
@@ -468,9 +474,8 @@ mod tests {
         assert!(
             matches!(
                 err,
-                TokenError::Http(ref msg)
-                    if msg.contains("OAuth2 token")
-                        && msg.contains("401")
+                TokenError::HttpStatus { operation: HttpOperation::TokenRequest, .. }
+                    if err.status() == Some(http::StatusCode::UNAUTHORIZED)
             ),
             "expected Http error with OAuth2 token prefix and 401, got: {err}"
         );

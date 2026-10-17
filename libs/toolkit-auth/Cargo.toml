@@ -47,6 +47,8 @@ toolkit-utils = { workspace = true, features = ["serde"] }
 zeroize = { workspace = true }
 
 [dev-dependencies]
+# Virtual time for deterministic watcher lifecycle tests.
+tokio = { workspace = true, features = ["test-util"] }
 bytes = { workspace = true }
 http-body-util = { workspace = true }
 httpmock = { workspace = true }
