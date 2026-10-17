@@ -1,0 +1,38 @@
+# Constructor Studio Gears Kit - project-specific path facade.
+# Kit-owned, user-editable mapping from a logical "where does X live in this
+# project" name to the real path(s) this repository actually uses for it.
+#
+# Why this file exists: several kit-owned prompt files used to hardcode real
+# paths from the constructorfabric/gears-rust repository itself — a canonical
+# reference-implementation gear, the dev/example server binary's registration
+# surface, and the FIPS-sensitive library crates — detectable via plain
+# string literals in `git status`-scoping commands and "study this gear"
+# instructions. A kit installed standalone into a different project has none
+# of these at those same paths (or possibly at all), so a hardcoded reference
+# would break the same way the commands in ci-commands.toml did.
+#
+# A standalone install should edit THIS file to point each entry at this
+# project's own equivalent, or leave it empty ("" / []) when this project has
+# no equivalent concept at all — never edit codebase/rules.md,
+# design-led-rules.md, or modules/code-stage-router.md to do this.
+
+# The canonical, fully-worked reference gear to study when implementing a new
+# layer (SDK crate vs. gear crate). Leave empty ("") if this project has no
+# single canonical example gear to point at — the layout chapter cited
+# alongside this ({toolkit_unified_system}/02_gear_layout_and_sdk_pattern.md)
+# still applies on its own, just without a worked example to compare against.
+reference_gear_path = "examples/toolkit/users-info"
+
+# The dev/example server binary a new or changed gear must be registered
+# into (feature-gated compilation + runtime wiring). Used only to widen the
+# `git status` scope GearsCodeDispatchContext checks for "was the
+# registration surface touched" — leave empty ("") if this project has no
+# single such binary (e.g. every gear ships its own binary, or registration
+# isn't a separate step at all here).
+example_server_path = "apps/cf-gears-example-server"
+
+# Library crates whose own changes should be treated as FIPS-relevant (routes
+# to {ci_commands}'s test_fips operation). A list of git-status path
+# prefixes/globs; leave as an empty list ([]) if this project has no
+# FIPS-relevant library concept at all.
+fips_lib_paths = ["libs/toolkit/", "libs/toolkit-http/", "libs/rustls-*/"]

@@ -968,4 +968,4 @@ When reviewing PRs that add or change PRD/requirements documents, additionally f
 - [ ] Alignment with best industry standard practices for large SaaS systems and platforms
 - [ ] Critical assessment of requirements quality — challenge vague, overlapping, or untestable items
 - [ ] Split findings by checklist category and rate each 1-10
-- [ ] Ensure requirements are aligned with the project's existing architecture (`docs/ARCHITECTURE_MANIFEST.md`)
+- [ ] Ensure requirements are aligned with the project's existing architecture (`{architecture_manifest}`)

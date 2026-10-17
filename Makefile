@@ -536,7 +536,12 @@ cfs-ensure:
 	fi
 
 ## Repair ignored/generated Constructor Studio runtime files before validation.
-cfs-repair: cfs-ensure
+# Depends on ensure-submodules because `cfs init`/`cfs generate-agents` loads
+# every registered kit resource eagerly, including the gears kit's
+# guidelines/DNA/languages/RUST.md - an uninitialized submodule makes that
+# path missing and cfs fails with a wall of "source path ... does not exist"
+# errors instead of this target's own clear one.
+cfs-repair: cfs-ensure ensure-submodules
 	$(call print_target_banner)
 	$(CFS) init --yes
 
