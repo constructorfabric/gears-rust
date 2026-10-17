@@ -1983,7 +1983,7 @@ dependencies = [
  "async-trait",
  "aws-lc-rs",
  "axum",
- "base64 0.22.1",
+ "base64 0.23.1",
  "cf-gears-bss-approvals-sdk",
  "cf-gears-bss-rest",
  "cf-gears-toolkit",
@@ -2371,7 +2371,7 @@ dependencies = [
  "async-trait",
  "aws-lc-rs",
  "axum",
- "base64 0.22.1",
+ "base64 0.23.1",
  "cf-gears-account-management-sdk",
  "cf-gears-toolkit",
  "cf-gears-toolkit-canonical-errors",
@@ -2829,7 +2829,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "axum",
- "base64 0.22.1",
+ "base64 0.23.1",
  "bytes",
  "cf-gears-file-parser-sdk",
  "cf-gears-toolkit",
@@ -2872,7 +2872,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "axum",
- "base64 0.22.1",
+ "base64 0.23.1",
  "bytes",
  "cf-gears-authz-resolver",
  "cf-gears-authz-resolver-sdk",
@@ -3149,7 +3149,7 @@ version = "0.1.7"
 dependencies = [
  "anyhow",
  "async-trait",
- "base64 0.22.1",
+ "base64 0.23.1",
  "cf-gears-account-management-sdk",
  "cf-gears-credstore",
  "cf-gears-credstore-sdk",
@@ -3263,7 +3263,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "axum",
- "base64 0.22.1",
+ "base64 0.23.1",
  "bytes",
  "cf-gears-authn-resolver",
  "cf-gears-authn-resolver-sdk",
@@ -3511,7 +3511,7 @@ version = "0.2.13"
 dependencies = [
  "anyhow",
  "async-trait",
- "base64 0.22.1",
+ "base64 0.23.1",
  "cf-gears-authn-resolver",
  "cf-gears-authn-resolver-sdk",
  "cf-gears-toolkit",
@@ -3609,7 +3609,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
- "base64 0.22.1",
+ "base64 0.23.1",
  "cf-gears-quota-enforcement-sdk",
  "cf-gears-test-containers",
  "cf-gears-toolkit",
@@ -3785,7 +3785,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "axum",
- "base64 0.22.1",
+ "base64 0.23.1",
  "cf-gears-authn-resolver-sdk",
  "cf-gears-authz-resolver-sdk",
  "cf-gears-credstore",
@@ -4246,7 +4246,7 @@ version = "0.7.11"
 dependencies = [
  "arc-swap",
  "async-trait",
- "base64 0.22.1",
+ "base64 0.23.1",
  "bytes",
  "cf-gears-toolkit-http",
  "cf-gears-toolkit-utils",
@@ -4601,7 +4601,7 @@ dependencies = [
 name = "cf-gears-toolkit-odata"
 version = "0.9.7"
 dependencies = [
- "base64 0.22.1",
+ "base64 0.23.1",
  "bigdecimal",
  "cf-gears-toolkit-canonical-errors",
  "cf-gears-toolkit-gts",
@@ -4678,7 +4678,7 @@ dependencies = [
 name = "cf-gears-toolkit-security"
 version = "0.11.0"
 dependencies = [
- "base64 0.22.1",
+ "base64 0.23.1",
  "cf-gears-toolkit-gts",
  "parking_lot",
  "postcard",
@@ -4789,7 +4789,7 @@ dependencies = [
  "async-trait",
  "aws-lc-rs",
  "axum",
- "base64 0.22.1",
+ "base64 0.23.1",
  "cf-gears-test-containers",
  "cf-gears-toolkit",
  "cf-gears-toolkit-canonical-errors",
@@ -4915,7 +4915,7 @@ name = "cf-k8s-cluster-plugin"
 version = "0.1.2"
 dependencies = [
  "async-trait",
- "base64 0.22.1",
+ "base64 0.23.1",
  "cf-gears-cluster-conformance",
  "cf-gears-cluster-sdk",
  "cf-gears-toolkit",
@@ -11692,7 +11692,7 @@ checksum = "7bd22781911de0ca6debda95f073c8f18bec65d1a94f1fa9573f3102e514cea4"
 dependencies = [
  "ahash 0.8.12",
  "annotate-snippets",
- "base64 0.22.1",
+ "base64 0.21.7",
  "encoding_rs_io",
  "getrandom 0.3.4",
  "granit-parser 0.0.7",
