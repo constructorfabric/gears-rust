@@ -6,8 +6,11 @@ use authz_resolver_sdk::AuthZResolverApi;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use axum::{Extension, Router};
-use quota_enforcement_sdk::testing::InMemoryStorage;
-use quota_enforcement_sdk::{PageRequest, QuotaFilter, QuotaManagerClientV1};
+use quota_enforcement_sdk::testing::{DrainReport, InMemoryStorage, RecordingSink, quota_draft};
+use quota_enforcement_sdk::{
+    PageRequest, QuotaEnforcementStoragePluginV1, QuotaFilter, QuotaManagerClientV1, SubjectRef,
+};
+use quota_enforcement_storage_plugin::StoragePluginGear;
 use serde_json::json;
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
@@ -26,7 +29,8 @@ use crate::test_support::{
     ClusterFixture, FailingPdp, LLM_MODEL_RESOURCE, LLM_TENANT_PROJECTION, LLM_USER_PROJECTION,
     OtherProfile, PermitTenantsPdp, ctx as security_ctx, hub_with_registry, in_process_registry,
     llm_gateway_documents, metric_base_documents, plugin_instance_document, register_pdp,
-    register_storage, storage_instance, tenant, wire_cluster, wire_cluster_with,
+    register_sink, register_storage, sink_instance, storage_instance, tenant, wire_cluster,
+    wire_cluster_with,
 };
 
 struct StaticConfigProvider {
@@ -198,6 +202,25 @@ async fn init_then_serve_bootstraps_signals_ready_and_stops_on_cancel() {
     }
     let sample = cell.load().expect("sample");
     assert_eq!(sample.cap_zero, 0);
+
+    // The third election: the lease sweeper leads too, and its first cycle
+    // publishes the (empty) unreclaimed backlog.
+    let backlog = gear.lease_backlog().expect("backlog cell after init");
+    while backlog.load().is_none() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the lease sweeper never published a backlog sample"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(
+        backlog
+            .load()
+            .expect("sample")
+            .iter()
+            .all(|(_, unreclaimed)| *unreclaimed == 0),
+        "nothing has expired, so every metric reports zero"
+    );
     assert_eq!(sample.cap_unbounded, 0);
 
     // One REST round trip through the gear's own route registration.
@@ -231,6 +254,11 @@ async fn init_then_serve_bootstraps_signals_ready_and_stops_on_cancel() {
         .expect("read through the in-process client");
     assert!(page.items.is_empty());
 
+    // Delivery started before the ready signal: a committed event is
+    // dispatched (acknowledged, with no sink registered).
+    commit_one_event(storage.as_ref()).await;
+    assert_eq!(storage.drain_notifications().await.delivered, 1);
+
     let check = gear.healthcheck(&ctx).expect("health check after init");
     let result = check.check().await;
     assert_eq!(
@@ -245,6 +273,129 @@ async fn init_then_serve_bootstraps_signals_ready_and_stops_on_cancel() {
         .expect("serve task joins")
         .expect("serve returns Ok on shutdown");
     assert!(cell.load().is_none(), "shutdown withdraws the gauge sample");
+    commit_one_event(storage.as_ref()).await;
+    assert_eq!(
+        storage.drain_notifications().await,
+        DrainReport::default(),
+        "shutdown stopped delivery"
+    );
+    fixture.stop().await;
+}
+
+/// Commit one Quota and its `quota-changed` event through `storage`.
+async fn commit_one_event(
+    storage: &dyn QuotaEnforcementStoragePluginV1,
+) -> quota_enforcement_sdk::NotificationEvent {
+    let event = crate::domain::quotas::events::quota_changed(
+        tenant(),
+        None,
+        None,
+        crate::domain::quotas::events::ChangeKind::Created,
+        time::OffsetDateTime::now_utc(),
+    );
+    storage
+        .create_quota(
+            &security_ctx(),
+            &toolkit_security::AccessScope::allow_all(),
+            quota_draft(
+                SubjectRef {
+                    projection_type: gts::GtsTypeId::new(LLM_USER_PROJECTION),
+                    subject_id: format!("u-{}", Uuid::new_v4()),
+                },
+                Some(10),
+            ),
+            std::slice::from_ref(&event),
+        )
+        .await
+        .expect("committed");
+    event
+}
+
+/// The published SQL storage plugin's context: its config and an in-memory
+/// `SQLite` database with its migrations applied.
+async fn sql_plugin_ctx(hub: Arc<ClientHub>) -> GearCtx {
+    use quota_enforcement_storage_plugin::infra::storage::Migrator;
+    use sea_orm_migration::MigratorTrait as _;
+
+    let cfg = json!({ "quota-enforcement-storage-plugin": { "config": { "vendor": "acme" } } });
+    let ctx = GearCtx::new(
+        StoragePluginGear::MODULE_NAME,
+        Uuid::from_u128(2),
+        Arc::new(StaticConfigProvider { root: cfg }),
+        hub,
+        CancellationToken::new(),
+    );
+    let opts = toolkit_db::ConnectOpts {
+        max_conns: Some(1),
+        min_conns: Some(1),
+        ..toolkit_db::ConnectOpts::default()
+    };
+    let db = toolkit_db::connect_db("sqlite::memory:", opts)
+        .await
+        .expect("in-memory sqlite");
+    toolkit_db::migration_runner::run_migrations_for_testing(&db, Migrator::migrations())
+        .await
+        .expect("migrations");
+    ctx.with_db(toolkit_db::DBProvider::new(db))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn serve_delivers_what_the_published_sql_plugin_commits_to_a_registered_sink() {
+    let sink_fixture = sink_instance("cf.core._.qe_sink_audit.v1", "acme");
+    let mut documents = llm_gateway_documents();
+    documents.extend(metric_base_documents());
+    documents.push(plugin_instance_document(&sink_fixture));
+    let hub = hub_with_registry(in_process_registry(documents));
+    register_pdp(
+        &hub,
+        Arc::new(PermitTenantsPdp::new(vec![tenant().as_uuid()])),
+    );
+    let sink = Arc::new(RecordingSink::new("audit"));
+    register_sink(&hub, &sink_fixture, sink.clone());
+    let fixture = wire_cluster(&hub);
+
+    // The SQL plugin publishes its instance and client into the same hub; the
+    // gear's binding selects it by vendor like any other storage plugin.
+    let plugin = StoragePluginGear::default();
+    plugin
+        .init(&sql_plugin_ctx(hub.clone()).await)
+        .await
+        .expect("plugin init");
+    let gear = Arc::new(QuotaEnforcementGear::default());
+    gear.init(&make_ctx(hub)).await.expect("init");
+    let (tx, rx) = oneshot::channel();
+    let cancel = CancellationToken::new();
+    let handle = tokio::spawn(
+        gear.clone()
+            .serve(cancel.clone(), ReadySignal::from_sender(tx)),
+    );
+    rx.await.expect("ready");
+
+    let storage = gear
+        .service()
+        .expect("service")
+        .storage()
+        .expect("storage bound");
+    let event = commit_one_event(storage.as_ref()).await;
+    // Well within the reconciler's idle minute: the commit's wake did it.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    while sink.received().is_empty() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the event never reached the sink"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let received = sink.received();
+    assert_eq!(received.len(), 1);
+    assert_eq!(received[0].1.event_id, event.event_id);
+    assert!(!received[0].0.is_anonymous());
+
+    cancel.cancel();
+    handle
+        .await
+        .expect("serve task joins")
+        .expect("serve returns Ok on shutdown");
     fixture.stop().await;
 }
 
@@ -421,5 +572,154 @@ async fn a_second_init_fails_and_the_health_check_exists_only_after_init() {
     assert!(gear.healthcheck(&ctx).is_some());
     let err = gear.init(&ctx).await.expect_err("second init");
     assert!(err.to_string().contains("already initialized"), "{err}");
+    fixture.stop().await;
+}
+
+/// Permits the test tenant, until it is narrowed to another tenant only.
+struct NarrowingPdp {
+    narrowed: std::sync::atomic::AtomicBool,
+}
+
+#[async_trait::async_trait]
+impl AuthZResolverApi for NarrowingPdp {
+    async fn evaluate(
+        &self,
+        _ctx: toolkit_security::PlatformSecurityContext,
+        _request: authz_resolver_sdk::models::EvaluationRequest,
+    ) -> Result<authz_resolver_sdk::models::EvaluationResponse, CanonicalError> {
+        use authz_resolver_sdk::constraints::{Constraint, InPredicate, Predicate};
+        let visible = if self.narrowed.load(std::sync::atomic::Ordering::SeqCst) {
+            Uuid::from_u128(0x0bad)
+        } else {
+            tenant().as_uuid()
+        };
+        Ok(authz_resolver_sdk::models::EvaluationResponse {
+            decision: true,
+            context: authz_resolver_sdk::models::EvaluationResponseContext {
+                constraints: vec![Constraint {
+                    predicates: vec![Predicate::In(InPredicate::new(
+                        toolkit_security::pep_properties::OWNER_TENANT_ID,
+                        vec![visible],
+                    ))],
+                }],
+                ..authz_resolver_sdk::models::EvaluationResponseContext::default()
+            },
+        })
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_bulk_envelope_over_the_sql_plugin_replays_only_while_its_targets_stay_visible() {
+    let mut documents = llm_gateway_documents();
+    documents.extend(metric_base_documents());
+    let hub = hub_with_registry(in_process_registry(documents));
+    let pdp = Arc::new(NarrowingPdp {
+        narrowed: std::sync::atomic::AtomicBool::new(false),
+    });
+    register_pdp(&hub, pdp.clone());
+    let fixture = wire_cluster(&hub);
+    let plugin = StoragePluginGear::default();
+    plugin
+        .init(&sql_plugin_ctx(hub.clone()).await)
+        .await
+        .expect("plugin init");
+    let gear = Arc::new(QuotaEnforcementGear::default());
+    gear.init(&make_ctx(hub.clone())).await.expect("init");
+    let (tx, rx) = oneshot::channel();
+    let cancel = CancellationToken::new();
+    let handle = tokio::spawn(
+        gear.clone()
+            .serve(cancel.clone(), ReadySignal::from_sender(tx)),
+    );
+    rx.await.expect("ready");
+
+    let client = hub
+        .get::<dyn QuotaManagerClientV1>()
+        .expect("manager client");
+    let spec = |subject: &str| quota_enforcement_sdk::QuotaSpec {
+        tenant_id: tenant(),
+        subject: SubjectRef {
+            projection_type: gts::GtsTypeId::new(LLM_USER_PROJECTION),
+            subject_id: subject.to_owned(),
+        },
+        metric: quota_enforcement_sdk::MetricId::parse(crate::test_support::METRIC_TOKENS)
+            .expect("metric"),
+        quota_type: quota_enforcement_sdk::QuotaType::Consumption,
+        period: Some(quota_enforcement_sdk::PeriodType::Month),
+        enforcement_mode: quota_enforcement_sdk::EnforcementMode::Hard,
+        cap: Some(100),
+        notification_thresholds: Vec::new(),
+        validity_window: None,
+        fail_open_hint: false,
+        metadata: json!({ "regions": ["eu"], "weight": 5 })
+            .as_object()
+            .cloned()
+            .expect("object"),
+        source: quota_enforcement_sdk::QuotaSource::Operator,
+    };
+    let created = client
+        .bulk_create_quotas(
+            &security_ctx(),
+            quota_enforcement_sdk::BulkCreateQuotasRequest {
+                tenant_id: tenant(),
+                idempotency_key: "pack".to_owned(),
+                items: vec![
+                    quota_enforcement_sdk::BulkCreateItem {
+                        idempotency_key: None,
+                        spec: spec("u1"),
+                    },
+                    quota_enforcement_sdk::BulkCreateItem {
+                        idempotency_key: None,
+                        spec: spec("u2"),
+                    },
+                ],
+            },
+        )
+        .await
+        .expect("bulk create over the SQL plugin");
+    let update = quota_enforcement_sdk::BulkUpdateQuotasRequest {
+        tenant_id: tenant(),
+        idempotency_key: "raise".to_owned(),
+        items: created
+            .items
+            .iter()
+            .map(|item| quota_enforcement_sdk::BulkUpdateItem {
+                idempotency_key: None,
+                quota_id: item.quota_id,
+                patch: quota_enforcement_sdk::QuotaPatch {
+                    cap: Some(quota_enforcement_sdk::CapPatch::Bounded(200)),
+                    ..quota_enforcement_sdk::QuotaPatch::default()
+                },
+            })
+            .collect(),
+    };
+    let updated = client
+        .bulk_update_quotas(&security_ctx(), update.clone())
+        .await
+        .expect("bulk update");
+    assert_eq!(
+        client
+            .bulk_update_quotas(&security_ctx(), update.clone())
+            .await
+            .expect("replay"),
+        updated
+    );
+
+    // The caller's scope no longer covers the tenant: not found, pointed at
+    // the first target, never the stored outcome.
+    pdp.narrowed
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let err = client
+        .bulk_update_quotas(&security_ctx(), update)
+        .await
+        .expect_err("hidden targets");
+    assert!(matches!(err, CanonicalError::NotFound { .. }), "{err:?}");
+    assert!(err.detail().starts_with("items[0]"), "{}", err.detail());
+
+    cancel.cancel();
+    handle
+        .await
+        .expect("serve task joins")
+        .expect("serve returns Ok on shutdown");
     fixture.stop().await;
 }

@@ -2,8 +2,8 @@
 //! mutation (invariant I11; PRD section 5.15 event catalogue).
 //!
 //! The gear builds the event and hands it to the storage primitive, which
-//! enqueues it in the mutation's transaction. Dispatch belongs to the
-//! notifications feature.
+//! enqueues it in the mutation's transaction; the storage plugin's pipeline
+//! hands it to the dispatcher (`domain::notifications`) once it commits.
 
 use quota_enforcement_sdk::{
     EventId, NotificationEvent, NotificationEventKind, QuotaId, SubjectRef, TenantId,
@@ -49,7 +49,7 @@ pub fn quota_changed(
     NotificationEvent {
         event_id: EventId::generate(),
         kind: NotificationEventKind::QuotaChanged,
-        tenant_id,
+        scope: quota_enforcement_sdk::NotificationScope::Tenant { tenant_id },
         quota_id,
         policy_id: None,
         subject,

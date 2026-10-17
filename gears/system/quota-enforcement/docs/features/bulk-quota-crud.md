@@ -98,7 +98,7 @@ batch scale; no dedicated bulk use case exists in the PRD)
 
 ### Bulk Create Quotas
 
-- [ ] `p2` - **ID**: `cpt-cf-quota-enforcement-flow-bulk-create`
+- [x] `p2` - **ID**: `cpt-cf-quota-enforcement-flow-bulk-create`
 
 No dedicated sequence exists: per DECOMPOSITION §2.10 the bulk endpoints follow the single-item sequences
 (`cpt-cf-quota-enforcement-seq-quota-create`) with an envelope wrapper.
@@ -112,35 +112,30 @@ No dedicated sequence exists: per DECOMPOSITION §2.10 the bulk endpoints follow
 - A replay of the same envelope idempotency key returns the original outcome without re-applying
 
 **Error Scenarios**:
-- More items than the configured maximum: `BULK_TOO_LARGE` before any item is validated
+- More than 500 items: `BULK_TOO_LARGE` before any authorization call; no items (`BATCH_EMPTY`) or a blank envelope
+  key (`IDEMPOTENCY_KEY_REQUIRED`) is refused at the same point
+- More items than the configured maximum (default 50): `BULK_TOO_LARGE` after the authorization and the replay
+  lookup and before any item is validated, so a committed envelope still replays after the maximum is lowered
+- A blank item key: `IDEMPOTENCY_KEY_REQUIRED` at its index; an item key used twice: `BATCH_ITEM_KEY_DUPLICATE` at the
+  second occurrence's index
+- The envelope key already used for a different item list: `IDEMPOTENCY_PAYLOAD_MISMATCH`, whatever the items target
+- A draft naming another tenant than the envelope's `tenant_id`: `BATCH_TENANT_MIXED` attributed to the draft
+- A replay whose created Quotas are no longer visible under the caller's current create scope: a PDP denial
+  attributed to the first such item, never the stored outcome
 - Any draft fails the single-item validation chain (unknown metric, negative cap, `type = rate`, metadata violation,
   projection outside the catalogue, a `subject_id` that violates the declared scope discriminator): the envelope
   fails with that item's canonical error, attributed by index and reason, and no Quota from the batch is persisted
 
 **Steps**:
-1. [ ] - `p2` - Caller sends `POST /v1/quota-enforcement/quotas/bulk-create` with an envelope carrying the envelope
-   idempotency key and the list of Quota drafts; each draft names its explicit target `(projection_type, subject_id)`
-   under PDP scope exactly as the single-item create, and foundation admission
-   (`cpt-cf-quota-enforcement-flow-authorized-admission`) has attached `SecurityContext` and `AccessScope`
-   (`cpt-cf-quota-enforcement-fr-bulk-quota-crud`) - `inst-qbc-request`
-2. [ ] - `p2` - Run `cpt-cf-quota-enforcement-algo-bulk-envelope` with the create items; an exact replay
-   short-circuits to the stored outcome - `inst-qbc-envelope`
-3. [ ] - `p2` - **FOR EACH** draft in submission order, outside the storage transaction: run the quota-lifecycle
-   validation chain unchanged (`cpt-cf-quota-enforcement-algo-quota-draft-validation`,
-   `cpt-cf-quota-enforcement-algo-metric-validation`, the projection-contracts membership check invoked by the
-   single-item create flow, the subject-scope validation of the single-item create flow, and
-   `cpt-cf-quota-enforcement-algo-quota-metadata-validation` when the draft carries `metadata`) - `inst-qbc-validate`
-4. [ ] - `p2` - DB: apply every create inside the single envelope transaction of
-   `cpt-cf-quota-enforcement-algo-bulk-envelope`; each item produces the same persisted effects as the single-item
-   create (`cpt-cf-quota-enforcement-flow-quota-create`): the `quotas` row with a server-assigned UUIDv7 `quota_id`
-   and status `active`, the allocation-counter materialization for allocation type, the
-   `quota-changed (change_kind='created')` event (I11), and the operation-log entry (I1) - `inst-qbc-apply`
-5. [ ] - `p2` - **RETURN** the outcome identifying every created Quota; the response is the stored envelope outcome
-   that later replays of the same key return verbatim - `inst-qbc-return`
+1. [x] - `p2` - Caller sends `POST /v1/quota-enforcement/quotas/bulk-create` with an envelope carrying its one `tenant_id`, the envelope idempotency key, and the list of Quota drafts, each with an optional item key; each draft names its explicit target `(projection_type, subject_id)` under PDP scope exactly as the single-item create, and foundation admission (`cpt-cf-quota-enforcement-flow-authorized-admission`) has attached `SecurityContext` and `AccessScope` (`cpt-cf-quota-enforcement-fr-bulk-quota-crud`) - `inst-qbc-request`
+2. [x] - `p2` - Run `cpt-cf-quota-enforcement-algo-bulk-envelope` with the create items; an exact replay short-circuits to the stored outcome - `inst-qbc-envelope`
+3. [x] - `p2` - **FOR EACH** draft in submission order, outside the storage transaction: run the quota-lifecycle validation chain unchanged (`cpt-cf-quota-enforcement-algo-quota-draft-validation`, `cpt-cf-quota-enforcement-algo-metric-validation`, the projection-contracts membership check invoked by the single-item create flow, the subject-scope validation of the single-item create flow, and `cpt-cf-quota-enforcement-algo-quota-metadata-validation` when the draft carries `metadata`) - `inst-qbc-validate`
+4. [x] - `p2` - DB: apply every create inside the single envelope transaction of `cpt-cf-quota-enforcement-algo-bulk-envelope`; each item produces the same persisted effects as the single-item create (`cpt-cf-quota-enforcement-flow-quota-create`): the `quotas` row with a server-assigned UUIDv7 `quota_id` and status `active`, the allocation-counter materialization for allocation type, the `quota-changed (change_kind='created')` event (I11), and the operation-log entry (I1) - `inst-qbc-apply`
+5. [x] - `p2` - **RETURN** the outcome identifying every created Quota; the response is the stored envelope outcome that later replays of the same key return verbatim - `inst-qbc-return`
 
 ### Bulk Update Quotas
 
-- [ ] `p2` - **ID**: `cpt-cf-quota-enforcement-flow-bulk-update`
+- [x] `p2` - **ID**: `cpt-cf-quota-enforcement-flow-bulk-update`
 
 **Actor**: `cpt-cf-quota-enforcement-actor-quota-manager` (and
 `cpt-cf-quota-enforcement-actor-platform-operator` through the same endpoint)
@@ -155,31 +150,32 @@ No dedicated sequence exists: per DECOMPOSITION §2.10 the bulk endpoints follow
   canonical error, attributed by index and reason, and no patch from the batch is applied
 - Any item's cap reduction lands below the consumed or in-flight amount at commit time: the envelope rolls back with
   `CAP_BELOW_CONSUMED` attributed to the item
+- More than 500 items: `BULK_TOO_LARGE` before any authorization call; no items (`BATCH_EMPTY`) or a blank envelope
+  key (`IDEMPOTENCY_KEY_REQUIRED`) is refused at the same point
+- More items than the configured maximum (default 50): `BULK_TOO_LARGE` after the authorization and the replay
+  lookup and before any item is validated, so a committed envelope still replays after the maximum is lowered
+- A blank item key: `IDEMPOTENCY_KEY_REQUIRED` at its index; an item key used twice: `BATCH_ITEM_KEY_DUPLICATE` at the
+  second occurrence's index
+- The envelope key already used for a different item list: `IDEMPOTENCY_PAYLOAD_MISMATCH`, whatever the items target
+- A Quota named by two items: `BULK_QUOTA_DUPLICATE` attributed to the second
+- A Quota outside the envelope's `tenant_id` or outside the item's `AccessScope`: `NotFound` attributed to the item,
+  never reported as another tenant's
+- A replay whose targets are no longer all visible under their items' current scopes: `NotFound` attributed to the
+  first hidden target, never the stored outcome; a target deactivated since the commit stays visible and the replay
+  answers
 
 **Steps**:
-1. [ ] - `p2` - Caller sends `POST /v1/quota-enforcement/quotas/bulk-update` with an envelope carrying the envelope
-   idempotency key and the `{id, patch}` items (`cpt-cf-quota-enforcement-fr-bulk-quota-crud`) - `inst-qbu-request`
-2. [ ] - `p2` - Run `cpt-cf-quota-enforcement-algo-bulk-envelope` with the update items; an exact replay
-   short-circuits to the stored outcome - `inst-qbu-envelope`
-3. [ ] - `p2` - **FOR EACH** item in submission order, outside the storage transaction: apply the single-item update
-   gates unchanged (`cpt-cf-quota-enforcement-flow-quota-update`): the `rate` rejection before the breaking-change
-   gate, the breaking-change rejection for metric, type, period, or subject, then
-   `cpt-cf-quota-enforcement-algo-quota-draft-validation`, `cpt-cf-quota-enforcement-algo-metric-validation`, and
-   `cpt-cf-quota-enforcement-algo-quota-metadata-validation` when the patch carries `metadata` - `inst-qbu-validate`
-4. [ ] - `p2` - DB: apply every patch inside the single envelope transaction of
-   `cpt-cf-quota-enforcement-algo-bulk-envelope`; each item keeps the single-item commit-time semantics: every
-   storage-side guard of the single-item update (the Quota exists and is still active, and the cap-vs-consumed guard)
-   is evaluated at the moment the envelope transaction commits, in-tx with a row-level lock (I6), and each item appends its operation-log entry (I1) and enqueues `quota-changed (change_kind='updated')`
-   (I11) - `inst-qbu-apply`
-5. [ ] - `p2` - **IF** any item trips a commit-time guard such as `CAP_BELOW_CONSUMED` - `inst-qbu-guard-if`
-   1. [ ] - `p2` - Roll back the entire envelope and **RETURN** the item's canonical error attributed by index and
-      reason; no patch from the batch survives - `inst-qbu-guard`
-6. [ ] - `p2` - **RETURN** the committed outcome; every quota ID and subject reference is preserved exactly as under
-   the single-item update - `inst-qbu-return`
+1. [x] - `p2` - Caller sends `POST /v1/quota-enforcement/quotas/bulk-update` with an envelope carrying its one `tenant_id`, the envelope idempotency key, and the `{quota_id, patch}` items, each with an optional item key (`cpt-cf-quota-enforcement-fr-bulk-quota-crud`) - `inst-qbu-request`
+2. [x] - `p2` - Run `cpt-cf-quota-enforcement-algo-bulk-envelope` with the update items; an exact replay short-circuits to the stored outcome - `inst-qbu-envelope`
+3. [x] - `p2` - **FOR EACH** item in submission order, outside the storage transaction: apply the single-item update gates unchanged (`cpt-cf-quota-enforcement-flow-quota-update`): the `rate` rejection before the breaking-change gate, the breaking-change rejection for metric, type, period, or subject, then `cpt-cf-quota-enforcement-algo-quota-draft-validation`, `cpt-cf-quota-enforcement-algo-metric-validation`, and `cpt-cf-quota-enforcement-algo-quota-metadata-validation` when the patch carries `metadata` - `inst-qbu-validate`
+4. [x] - `p2` - DB: apply every patch inside the single envelope transaction of `cpt-cf-quota-enforcement-algo-bulk-envelope`; each item keeps the single-item commit-time semantics: every storage-side guard of the single-item update (the Quota exists and is still active, and the cap-vs-consumed guard) is evaluated at the moment the envelope transaction commits, in-tx with a row-level lock (I6), and each item appends its operation-log entry (I1) and enqueues `quota-changed (change_kind='updated')` (I11) - `inst-qbu-apply`
+5. [x] - `p2` - **IF** any item trips a commit-time guard such as `CAP_BELOW_CONSUMED` - `inst-qbu-guard-if`
+   1. [x] - `p2` - Roll back the entire envelope and **RETURN** the item's canonical error attributed by index and reason; no patch from the batch survives - `inst-qbu-guard`
+6. [x] - `p2` - **RETURN** the committed outcome; every quota ID and subject reference is preserved exactly as under the single-item update - `inst-qbu-return`
 
 ### Bulk Deactivate Quotas
 
-- [ ] `p2` - **ID**: `cpt-cf-quota-enforcement-flow-bulk-deactivate`
+- [x] `p2` - **ID**: `cpt-cf-quota-enforcement-flow-bulk-deactivate`
 
 **Actor**: `cpt-cf-quota-enforcement-actor-quota-manager` (and
 `cpt-cf-quota-enforcement-actor-platform-operator` through the same endpoint)
@@ -194,34 +190,31 @@ No dedicated sequence exists: per DECOMPOSITION §2.10 the bulk endpoints follow
   deactivated
 - Any listed Quota is already deactivated: the envelope fails with `QUOTA_DEACTIVATED` attributed by index; the other
   Quotas stay active and no second cascade runs
+- More than 500 items: `BULK_TOO_LARGE` before any authorization call; no items (`BATCH_EMPTY`) or a blank envelope
+  key (`IDEMPOTENCY_KEY_REQUIRED`) is refused at the same point
+- More items than the configured maximum (default 50): `BULK_TOO_LARGE` after the authorization and the replay
+  lookup and before any item is validated, so a committed envelope still replays after the maximum is lowered
+- A blank item key: `IDEMPOTENCY_KEY_REQUIRED` at its index; an item key used twice: `BATCH_ITEM_KEY_DUPLICATE` at the
+  second occurrence's index
+- The envelope key already used for a different item list: `IDEMPOTENCY_PAYLOAD_MISMATCH`, whatever the items target
+- A Quota named by two items: `BULK_QUOTA_DUPLICATE` attributed to the second
+- A Quota outside the envelope's `tenant_id` or outside the item's `AccessScope`: `NotFound` attributed to the item
+- A replay whose targets are no longer all visible under their items' current scopes: `NotFound` attributed to the
+  first hidden target, never the stored outcome
 
 **Steps**:
-1. [ ] - `p2` - Caller sends `POST /v1/quota-enforcement/quotas/bulk-deactivate` with an envelope carrying the
-   envelope idempotency key and the list of quota IDs (`cpt-cf-quota-enforcement-fr-bulk-quota-crud`) - `inst-qbd-request`
-2. [ ] - `p2` - Run `cpt-cf-quota-enforcement-algo-bulk-envelope` with the deactivate items; an exact replay
-   short-circuits to the stored outcome - `inst-qbd-envelope`
-3. [ ] - `p2` - DB: apply every deactivation inside the single envelope transaction of
-   `cpt-cf-quota-enforcement-algo-bulk-envelope`; each item runs the single-item cascade semantics unchanged
-   (`cpt-cf-quota-enforcement-flow-quota-deactivate`): mark the Quota deactivated, mark every active lease against it
-   resolved-by-deactivation, decrement the lease-capacity counters, return held capacity to the acquisition-period
-   counters, and append the operation-log entry (I1) - `inst-qbd-cascade`
-4. [ ] - `p2` - Enqueue `quota-changed (change_kind='deactivated')` per Quota plus one
-   `lease-resolved-by-deactivation` event per affected lease, for every Quota in the batch, in the same transaction
-   (I11); the entire batch's lease-resolution events are emitted atomically with the deactivation transaction
-   (`cpt-cf-quota-enforcement-fr-bulk-quota-crud`) - `inst-qbd-events`
-5. [ ] - `p2` - The batch-level cascade never partially completes: either every listed Quota is deactivated with
-   every one of its active leases resolved, or none is; the resolved leases follow the
-   `cpt-cf-quota-enforcement-state-lease` transition to `ResolvedByDeactivation` recorded by the lease-operations
-   feature - `inst-qbd-atomic`
-6. [ ] - `p2` - **RETURN** the outcome carrying the per-Quota resolved-lease summaries (the single-item
-   `DeactivateOutcome { resolved_leases }` information for each item) so the gateway can attribute telemetry exactly
-   as for the single-item deactivation - `inst-qbd-return`
+1. [x] - `p2` - Caller sends `POST /v1/quota-enforcement/quotas/bulk-deactivate` with an envelope carrying its one `tenant_id`, the envelope idempotency key, and the list of quota IDs, each with an optional item key (`cpt-cf-quota-enforcement-fr-bulk-quota-crud`) - `inst-qbd-request`
+2. [x] - `p2` - Run `cpt-cf-quota-enforcement-algo-bulk-envelope` with the deactivate items; an exact replay short-circuits to the stored outcome - `inst-qbd-envelope`
+3. [x] - `p2` - DB: apply every deactivation inside the single envelope transaction of `cpt-cf-quota-enforcement-algo-bulk-envelope`; each item runs the single-item cascade semantics unchanged (`cpt-cf-quota-enforcement-flow-quota-deactivate`): mark the Quota deactivated, mark every active lease against it resolved-by-deactivation, decrement the lease-capacity counters, return held capacity to the acquisition-period counters, and append the operation-log entry (I1) - `inst-qbd-cascade`
+4. [x] - `p2` - Enqueue `quota-changed (change_kind='deactivated')` per Quota plus one `lease-resolved-by-deactivation` event per affected lease, for every Quota in the batch, in the same transaction (I11); the entire batch's lease-resolution events are emitted atomically with the deactivation transaction (`cpt-cf-quota-enforcement-fr-bulk-quota-crud`) - `inst-qbd-events`
+5. [x] - `p2` - The batch-level cascade never partially completes: either every listed Quota is deactivated with every one of its active leases resolved, or none is; the resolved leases follow the `cpt-cf-quota-enforcement-state-lease` transition to `ResolvedByDeactivation` recorded by the lease-operations feature - `inst-qbd-atomic`
+6. [x] - `p2` - **RETURN** the outcome carrying the per-Quota resolved-lease summaries (the single-item `DeactivateOutcome { resolved_leases }` information for each item) so the gateway can attribute telemetry exactly as for the single-item deactivation - `inst-qbd-return`
 
 ## 3. Processes / Business Logic (CDSL)
 
 ### Bulk Envelope Execution
 
-- [ ] `p2` - **ID**: `cpt-cf-quota-enforcement-algo-bulk-envelope`
+- [x] `p2` - **ID**: `cpt-cf-quota-enforcement-algo-bulk-envelope`
 
 **Input**: one bulk envelope (operation kind `bulk_create_quotas`, `bulk_update_quotas`, or `bulk_deactivate_quotas`)
 with its required envelope idempotency key, optional per-item idempotency keys, and the items; the `SecurityContext`
@@ -231,48 +224,26 @@ and `AccessScope` attached by foundation admission
 (`Problem`) with per-item attribution and no persisted change
 
 **Steps**:
-1. [ ] - `p2` - DB: `lookup_idempotency` on the envelope key under the idempotency machinery established by the
-   consumption-operations feature (`cpt-cf-quota-enforcement-algo-idempotency-replay`, consumed unchanged for the
-   three bulk operation types); on an exact replay **RETURN** the stored outcome without re-applying
-   (`cpt-cf-quota-enforcement-fr-bulk-quota-crud`); a divergent payload under the same envelope scope returns
-   `IDEMPOTENCY_PAYLOAD_MISMATCH` (409) leaving the original record untouched; the replay short-circuit precedes the
-   size check, so an exact replay returns the stored outcome even after an operator lowers the maximum batch size
-   (section 7 note) - `inst-qbe-idem`
-2. [ ] - `p2` - **IF** the item count exceeds the operator-configurable maximum batch size (default 50 items per
-   batch) - `inst-qbe-size-if`
-   1. [ ] - `p2` - **RETURN** `BULK_TOO_LARGE` (`DomainError::BulkTooLarge`, canonical `InvalidArgument`, 400) as an
-      actionable error before any item is validated - `inst-qbe-size`
-3. [ ] - `p2` - Accept per-item idempotency keys when supplied: they identify items individually in outcomes and
-   diagnostics; the PRD assigns them individual identification only, so no per-item replay semantics exist
-   (`cpt-cf-quota-enforcement-fr-bulk-quota-crud`) - `inst-qbe-item-keys`
-4. [ ] - `p2` - Enforce the same PDP authorization, tenant-isolation, and trust-boundary rules as the single-item
-   counterparts (`cpt-cf-quota-enforcement-fr-authorization`, `cpt-cf-quota-enforcement-fr-tenant-isolation`, PRD
-   §3.4): admission runs on the envelope request through the foundation Gateway, every item's explicit target
-   identity must fall inside the caller's `AccessScope`, and the `AccessScope` is forwarded into every storage call
-   for in-transaction consumption - `inst-qbe-authz`
-5. [ ] - `p2` - **FOR EACH** item in submission order: run the per-item validation of the single-item counterpart, as
-   referenced by the calling flow, outside the storage transaction (the quota-lifecycle minimum-lock-window rule) - `inst-qbe-validate`
-6. [ ] - `p2` - **IF** any item fails validation - `inst-qbe-invalid-if`
-   1. [ ] - `p2` - **RETURN** the failing item's canonical error with the offending item(s) identified by index and
-      reason, carried as `errors[].reason` tokens inside the RFC 9457 `Problem` envelope per the DESIGN error model;
-      nothing is persisted, so the caller can retry with corrections under a new envelope key - `inst-qbe-invalid`
-7. [ ] - `p2` - DB: **TRY** apply every item in a single storage transaction: per-item mutation with its single-item
-   side effects (operation-log entry I1, outbox events I11), row locks on the affected Quota set taken in ascending
-   lexicographic `quota_id` order (`cpt-cf-quota-enforcement-adr-acquisition-ordering`, which applies uniformly to
-   every mutation primitive), and the envelope idempotency record persisted inside the same transaction; commit - `inst-qbe-apply`
-8. [ ] - `p2` - **CATCH** any per-item failure inside the transaction (commit-time guards, storage errors) - `inst-qbe-catch`
-   1. [ ] - `p2` - Roll back the entire batch, persist nothing (no envelope idempotency record survives a rollback),
-      and **RETURN** the canonical error attributing the offending item(s) by index and reason; a retry under the
-      same envelope key is re-executed because the failed envelope applied nothing - `inst-qbe-rollback`
-9. [ ] - `p2` - **RETURN** the committed outcome; the bulk endpoints are pure-CRUD surfaces, so they never produce a
-   Decision shape, and every failure surfaces as a `Problem` (DESIGN §3.3); partial success is not a permitted
-   outcome in any branch - `inst-qbe-return`
+1. [x] - `p2` - **IF** the item count exceeds the fixed ceiling of 500 items, which no configuration can raise - `inst-qbe-ceiling-if`
+   1. [x] - `p2` - **RETURN** `BULK_TOO_LARGE` before any authorization call, so the PDP work one envelope can cause stays bounded; an envelope with no items (`BATCH_EMPTY`) or a blank envelope key (`IDEMPOTENCY_KEY_REQUIRED`) is refused at the same point, and these are the only input-validation refusals that precede the configured size check - `inst-qbe-ceiling`
+2. [x] - `p2` - Enforce the same PDP authorization, tenant-isolation, and trust-boundary rules as the single-item counterparts (`cpt-cf-quota-enforcement-fr-authorization`, `cpt-cf-quota-enforcement-fr-tenant-isolation`, PRD §3.4): a bulk create is one tenant-level create check for the envelope tenant, and every bulk update or deactivate item gets the resource-level check of its single-item operation; each item's `AccessScope` is forwarded into its storage calls, and a PDP denial here can precede the configured size check - `inst-qbe-authz`
+3. [x] - `p2` - DB: `lookup_idempotency` on the envelope key under the management-envelope scope `(tenant, fingerprint of the empty subject set, bulk operation type, key)` with the replay machinery of the consumption-operations feature (`cpt-cf-quota-enforcement-algo-idempotency-replay`); on an exact replay **RETURN** the stored outcome without re-applying once every update or deactivate target is still visible under its item's current scope and every Quota a create recorded is visible under the current create scope; a target no longer visible is `NotFound` for its item, never the stored outcome; a divergent payload under the same envelope scope returns `IDEMPOTENCY_PAYLOAD_MISMATCH` (409) leaving the original record untouched - `inst-qbe-idem`
+4. [x] - `p2` - **IF** the item count exceeds the operator-configurable maximum batch size (default 50 items per batch, at most the 500-item ceiling) - `inst-qbe-size-if`
+   1. [x] - `p2` - **RETURN** `BULK_TOO_LARGE` (`DomainError::BulkTooLarge`, canonical `InvalidArgument`, 400) as an actionable error before any item is validated; the check follows the replay, so a committed envelope stays replayable after an operator lowers the maximum (section 7 note) - `inst-qbe-size`
+5. [x] - `p2` - Accept per-item idempotency keys when supplied: they identify items individually in outcomes and diagnostics and carry no replay of their own (`cpt-cf-quota-enforcement-fr-bulk-quota-crud`); a blank or repeated item key, or a Quota named twice in an update or deactivate envelope, is refused at the index of the second occurrence - `inst-qbe-item-keys`
+6. [x] - `p2` - **FOR EACH** item in submission order: every draft must name the envelope tenant, then the per-item validation of the single-item counterpart, as referenced by the calling flow, runs outside the storage transaction (the quota-lifecycle minimum-lock-window rule) - `inst-qbe-validate`
+7. [x] - `p2` - **IF** any item fails validation - `inst-qbe-invalid-if`
+   1. [x] - `p2` - **RETURN** the first failing item's canonical error in submission order, identified by index and reason as `items[index]` inside the RFC 9457 `Problem` envelope per the DESIGN error model; nothing is persisted, so the caller can retry with corrections under a new envelope key - `inst-qbe-invalid`
+8. [x] - `p2` - DB: **TRY** apply every item in a single storage transaction: every targeted Quota row is locked first, in ascending lexicographic `quota_id` order and whatever its status (`cpt-cf-quota-enforcement-adr-acquisition-ordering`), then the envelope's idempotency stripe, then the record is read again; items then run in submission order with their single-item side effects (operation-log entry I1, outbox events I11), and the envelope idempotency record is persisted inside the same transaction; commit - `inst-qbe-apply`
+9. [x] - `p2` - **CATCH** any per-item failure inside the transaction (commit-time guards, storage errors) - `inst-qbe-catch`
+   1. [x] - `p2` - Roll back the entire batch, persist nothing (no envelope idempotency record survives a rollback), and **RETURN** the canonical error attributing the first offending item in submission order by index and reason; a retry under the same envelope key is re-executed because the failed envelope applied nothing - `inst-qbe-rollback`
+10. [x] - `p2` - **RETURN** the committed outcome: one summary per item in submission order (index, item key, `quota_id`, the committed `record_version` of an update, the resolved leases of a deactivation), which the envelope record stores and a replay returns verbatim; the bulk endpoints are pure-CRUD surfaces that never produce a Decision shape, and partial success is not a permitted outcome in any branch - `inst-qbe-return`
 
 ## 4. States (CDSL)
 
 ### Bulk Envelope State Machine
 
-- [ ] `p2` - **ID**: `cpt-cf-quota-enforcement-state-bulk-envelope`
+- [x] `p2` - **ID**: `cpt-cf-quota-enforcement-state-bulk-envelope`
 
 The lifecycle of one bulk envelope; the Quota entity's own state machine is owned by the quota-lifecycle feature
 (`cpt-cf-quota-enforcement-state-quota-lifecycle`) and is not re-specified here.
@@ -282,13 +253,9 @@ The lifecycle of one bulk envelope; the Quota entity's own state machine is owne
 **Initial State**: Validating
 
 **Transitions**:
-1. [ ] - `p2` - **FROM** Validating **TO** Applying **WHEN** the envelope idempotency lookup misses, the size check
-   passes, and every item passes its single-item validation chain; an exact replay short-circuits to the stored
-   outcome without entering Applying - `inst-qbs-enter`
-2. [ ] - `p2` - **FROM** Applying **TO** Committed **WHEN** every item's mutation succeeds inside the single
-   transaction; the per-item side effects, the batch's events, and the envelope idempotency record commit together - `inst-qbs-commit`
-3. [ ] - `p2` - **FROM** Applying **TO** RolledBack **WHEN** any item's mutation fails inside the transaction; the
-   entire batch rolls back, no counter, Quota, or lease change survives, and no envelope idempotency record persists - `inst-qbs-rollback`
+1. [x] - `p2` - **FROM** Validating **TO** Applying **WHEN** the envelope idempotency lookup misses, the size check passes, and every item passes its single-item validation chain; an exact replay short-circuits to the stored outcome without entering Applying - `inst-qbs-enter`
+2. [x] - `p2` - **FROM** Applying **TO** Committed **WHEN** every item's mutation succeeds inside the single transaction; the per-item side effects, the batch's events, and the envelope idempotency record commit together - `inst-qbs-commit`
+3. [x] - `p2` - **FROM** Applying **TO** RolledBack **WHEN** any item's mutation fails inside the transaction; the entire batch rolls back, no counter, Quota, or lease change survives, and no envelope idempotency record persists - `inst-qbs-rollback`
 
 Committed and RolledBack are terminal for the envelope; the idempotency record persisted by the Committed outcome then
 follows the idempotency-record lifecycle owned by the consumption-operations feature.
@@ -297,7 +264,7 @@ follows the idempotency-record lifecycle owned by the consumption-operations fea
 
 ### Bulk Endpoints and Envelope Validation
 
-- [ ] `p2` - **ID**: `cpt-cf-quota-enforcement-dod-bulk-endpoints`
+- [x] `p2` - **ID**: `cpt-cf-quota-enforcement-dod-bulk-endpoints`
 
 The system **MUST** deliver the three bulk endpoints `POST /v1/quota-enforcement/quotas/bulk-create`,
 `POST /v1/quota-enforcement/quotas/bulk-update`, and `POST /v1/quota-enforcement/quotas/bulk-deactivate` as an
@@ -327,7 +294,7 @@ single-item counterparts (`cpt-cf-quota-enforcement-fr-authorization`,
 
 ### All-or-Nothing Envelope Atomicity and Replay
 
-- [ ] `p2` - **ID**: `cpt-cf-quota-enforcement-dod-bulk-atomicity`
+- [x] `p2` - **ID**: `cpt-cf-quota-enforcement-dod-bulk-atomicity`
 
 The system **MUST** apply every bulk envelope all-or-nothing in a single storage transaction: atomically create every
 listed Quota or none, atomically apply every patch or none, and atomically deactivate every listed Quota or none;
@@ -356,7 +323,7 @@ consumed unchanged.
 
 ### Bulk Deactivation Lease Resolution
 
-- [ ] `p2` - **ID**: `cpt-cf-quota-enforcement-dod-bulk-deactivate-cascade`
+- [x] `p2` - **ID**: `cpt-cf-quota-enforcement-dod-bulk-deactivate-cascade`
 
 The system **MUST** resolve leases atomically across every Quota deactivated in a batch: each affected Quota's active
 leases are resolved-by-deactivation per the quota-lifecycle deactivation rules
@@ -425,34 +392,33 @@ no lease semantics are re-specified here.
   `cpt-cf-quota-enforcement-algo-quota-metadata-validation`), the deactivation cascade, and the lease state machine
   are consumed unchanged and never re-specified here. The idempotency replay mechanism is the consumption-operations
   feature's; this feature only registers the three bulk operation types with it.
-- **Upstream alignment items (tracked upstream prerequisites)**:
-  - The DESIGN storage-plugin trait names only single-item Quota CRUD primitives; the DESIGN §4.3
-    future-considerations table says
-    the storage plugin "already exposes transactional batch primitives via the `apply_batch_debit` precedent" for
-    this P2 surface, but no bulk Quota primitive is named. This document requires the single-transaction semantics
-    and does not invent a plugin method name; the concrete primitive shape (one new batch primitive following the
-    `apply_batch_debit` precedent, or the existing single-item primitives composed under one transaction) is a
-    tracked upstream DESIGN item.
-  - The DESIGN SDK trait `QuotaManagerClientV1` carries no bulk methods, and the DESIGN REST inventory defers the
-    three endpoints as P2. This document uses the PRD operation names (`bulk_create_quotas`, `bulk_update_quotas`,
-    `bulk_deactivate_quotas`) as logical operation names only; the SDK trait extension and the request/response DTO
-    definitions are tracked upstream DESIGN items, and no new Rust type or method name is introduced here.
-  - PRD §5.8 defines the idempotency scope `(tenant_id, idempotency_subject_key, operation_type, key)` and its subject-slot rules for
-    the consumption write operations; Quota CRUD operations carry no single-item idempotency key, and the PRD does
-    not define the subject slot for a management envelope whose items can span multiple subjects. This document
-    reuses the established machinery under the three bulk operation types and leaves the envelope scope's
-    subject-slot rule as a tracked upstream PRD/DESIGN item; it does not invent one.
-- **Deliberately unpinned behavior**: the PRD pins neither the ordering of the replay lookup against the size check
-  nor validation coverage after the first failing item. This document places the replay short-circuit first, matching
-  the batch-debit precedent, so a committed envelope stays replayable after an operator lowers the size limit; whether
-  validation continues past the first failing item to attribute several items at once is left to the implementation
-  ("item(s)" in the PRD permits both), and no test may depend on it. The PRD likewise does not order the size check
-  against per-item validation; this document places the size check before any item is validated, and the flow,
-  algorithm, and DoD statements follow that placement. The PRD is also silent on duplicate quota IDs or
-  identical drafts within one envelope; that behavior is left to the implementation. The PRD text "replay returns the
-  original outcome without re-applying" is read here as covering committed envelopes: a rolled-back envelope persists
-  no idempotency record and applied nothing, so a retry under the same key is re-executed, matching the
-  batch-debit canonical-error precedent.
+- **Contract shapes** (settled with the design owner): the storage plugin gains three typed primitives, one per
+  bulk operation, each applying its envelope in one plugin-owned transaction that reuses the single-item
+  transaction bodies; an item-specific failure inside it is reported wrapped with the item's index, and a failure of
+  the envelope as a whole (the backend, a payload mismatch, contention) is reported as is. `QuotaManagerClientV1`
+  gains the three bulk calls, and REST and the in-process client enter the same domain methods. DESIGN records the
+  names.
+- **Envelope idempotency scope**: a management envelope names its target Quotas explicitly and resolves no
+  subjects, so its scope is the tenant, the fingerprint of the empty subject set, the bulk operation type, and the
+  key (PRD §5.8): a key is unique per tenant and bulk operation, and a changed item list under the same key is a
+  payload divergence even when it targets other subjects. PDP authorization and the item scopes apply before any
+  stored outcome is returned.
+- **One tenant per envelope**: the request names its tenant; every draft must carry it, and an update or deactivate
+  target outside that tenant or outside its item's scope is `NotFound`, never reported as foreign. A workflow spanning
+  tenants sends one envelope per tenant.
+- **Order of checks**: the fixed 500-item ceiling and the envelope's own shape come first, before any authorization
+  call; then the PDP, then the replay, then the configured limit, then the item checks in submission order. The
+  replay precedes the configured limit, matching the batch-debit precedent, so a committed envelope stays replayable
+  after an operator lowers the limit; the ceiling bounds the authorization work an oversized envelope can cause.
+  Validation stops at the first failing item. A Quota named twice or an item key used twice is refused at the second
+  occurrence; identical create drafts are distinct Quotas and allowed. The PRD text "replay returns the original
+  outcome without re-applying" covers committed envelopes: a rolled-back envelope persists no idempotency record and
+  applied nothing, so a retry under the same key is re-executed, matching the batch-debit canonical-error precedent.
+- **Concurrency**: the envelope's idempotency stripe is taken without waiting and retried within the contention
+  budget, as every record writer does — the strictest budget configured for the items' metrics, read before the
+  transaction (a Quota's metric never changes); the budget bounds that stripe contention only, while the Quota and counter row
+  locks wait exactly as single-item Quota CRUD does. At the zero default a concurrent writer of the same key is
+  refused with `LEASE_CONTENTION_TIMEOUT`, and its retry replays the winner's outcome.
 - **No NFR ownership**: the DECOMPOSITION NFR allocation assigns no NFR to this feature, and DECOMPOSITION §2.10
   lists none; this document adds no latency, throughput, or availability promise. The blast radius of a misconfigured
   caller is bounded by the maximum batch size per the PRD rationale.
@@ -460,8 +426,8 @@ no lease semantics are re-specified here.
   outside the storage transaction and holds no in-process lock across an await point, and row serialization inside
   the envelope transaction is delegated to the storage plugin under the ADR-0002 ordering. The envelope payloads are
   plain data reusing the quota-lifecycle entity shapes (`QuotaDraft`, `QuotaPatch`, `QuotaId`), which are Send + Sync
-  compatible. Error attribution maps onto the closed `DomainError` enum and the canonical `Problem` envelope; no new
-  error variant is introduced (`DomainError::BulkTooLarge` already exists in the DESIGN error model).
+  compatible. Error attribution maps onto the closed `DomainError` enum and the canonical `Problem` envelope: an item's
+  error keeps its own canonical category and names the item as `items[index]`.
 - **Rollout / rollback**: the endpoints are additive REST surface over the existing schema major version; no
   migration accompanies them, and disabling the endpoints returns callers to per-Quota CRUD with operator-side
   compensation, which is the documented P1 fallback per the PRD rationale.

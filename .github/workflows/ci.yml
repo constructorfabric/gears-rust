@@ -428,6 +428,9 @@ jobs:
         if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
         run: tools/scripts/with_rust_annotations.sh make test-cluster-pg
 
+      - name: Test quota-enforcement storage plugin (pg integration)
+        run: make test-quota-enforcement-pg
+
       - name: Test k8s-cluster-plugin (k3s L2+L3 integration)
         if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
         # k3s runs in a **privileged** container (testcontainers-modules sets it);
@@ -1067,6 +1070,9 @@ jobs:
       #      `test-cluster-pg`.
       #   4. The k8s-cluster-plugin L2/L3 k3s suites. These live behind
       #      `required-features = ["integration"]`.
+      #   5. The quota-enforcement storage plugin's PostgreSQL suites. These
+      #      live behind `#![cfg(feature = "postgres")]`. Keep in sync with
+      #      `test-quota-enforcement-pg`.
       #
       # The per-binary k3s loop (one container per binary, cleaned between —
       # nextest's process-per-test would start ~70 of them) lives in the
@@ -1104,6 +1110,10 @@ jobs:
           # Pass 4: k8s-cluster-plugin k3s suites (cargo test: no JUnit).
           fresh_report
           "$W" make coverage-cluster-k8s
+          # Pass 5: quota-enforcement storage plugin PostgreSQL suites (real
+          # Postgres via testcontainers).
+          fresh_report
+          "$W" cargo llvm-cov nextest --no-report -p cf-gears-quota-enforcement-storage-plugin --features postgres
           # Merge into the single report that gets uploaded.
           cargo llvm-cov report --lcov --output-path lcov.info
 

@@ -18,15 +18,16 @@ plugin:
   `update_quota`, `deactivate_quota`, `read_quotas`) and the two
   platform-plane reads (`read_active_projection_bindings`,
   `read_active_quota_counts`) of the contract,
-- the enqueue side of the notification outbox (invariant I11),
+- the notification outbox: the enqueue side (invariant I11) and the one
+  pipeline that drains it into the gear's dispatcher,
 - the migrations for all of it.
 
-The plugin gear binds to its database, applies the migrations, and validates
-its configuration. It does **not** yet publish a `QuotaEnforcementStoragePluginV1`
-client. The contract names primitives that later features deliver, and the
-foundation Definition of Done forbids a partial implementation. The client
-registration lands with the last storage primitive. Until then the Quota
-primitives are reached through `StoragePlugin` by tests only.
+The plugin gear binds to its database, applies the migrations, validates its
+configuration, and publishes the plugin: the `cf.core._.qe_db_storage.v1`
+instance of `QuotaEnforcementStoragePluginSpecV1` in the types registry, under
+the configured `vendor` and `priority`, and the scoped
+`QuotaEnforcementStoragePluginV1` client in `ClientHub`. The gear selects it
+by vendor.
 
 ## Quota tables
 
@@ -56,11 +57,19 @@ deactivation cascade, which today resolves no lease.
 The toolkit outbox runs under the table prefix `qe_outbox` (tables
 `qe_outbox_body`, `qe_outbox_incoming`, ...). Events go to the queue
 `qe_notifications` over eight partitions, one tenant always on one partition,
-with the event kind as the payload type. The plugin only enqueues: the handle
-(`StoragePluginGear::notification_outbox()`) stays unbound until the
-notification dispatcher starts the pipeline and binds it. An unbound handle
-fails every mutation as `Unavailable` and the transaction rolls back, so no
-mutation can commit without its events.
+with the event kind as the payload type. An enqueue's wake fires only once
+its transaction commits, so a committed event is picked up at once and a
+rolled-back or retried attempt wakes nothing.
+
+`start_notification_delivery` starts the one pipeline, once per plugin
+instance: a leased handler that decodes each claimed event and hands it to the
+gear's dispatcher with its failed attempts and the lease time left, then acks,
+dead-letters, or retries it as the dispatcher decides. A row that does not
+decode is dead-lettered and reported. The handle
+(`StoragePluginGear::notification_outbox()`) stays unbound until then: an
+enqueue of events on an unbound handle fails the mutation as `Unavailable` and
+the transaction rolls back, so no event can be lost before delivery starts.
+An enqueue of no events succeeds, so bootstrap runs before delivery starts.
 
 ## Configuration tables
 
