@@ -107,9 +107,10 @@ Measured at first production release unless stated otherwise:
 - Every `is_licensed` check on the platform is answered from a governed grant store, with a typed denial reason, and
   every failure denies: a store, registry, PDP, or trust-material fault costs a capability, never leaks one.
 - One module, any admission: the service assembles behind the admission plugin its assembler chooses — one that trusts
-  authorized callers, one that admits only vendor-signed artifacts, or one of their own — with the same domain model,
-  lifecycle, check semantics, and management semantics under all of them, differing only in how root grants arrive,
-  and no code linked that the chosen plugin does not need.
+  authorized callers, one that admits only vendor-signed artifacts, or one of their own. Domain model, lifecycle,
+  check semantics, and management semantics are the same under all of them. Only the channel of vendor decisions on
+  root grants differs: issue, suspend, reinstate, revoke, and renew come as an API call or as signed evidence. No code
+  is linked that the chosen plugin does not need.
 - The platform vendor issues, suspends, revokes, and renews licenses through the management API without code changes
   or redeployment.
 - Every grant, binding, and delegation is attributable to an actor in the audit ledger.
@@ -166,8 +167,8 @@ Measured at first production release unless stated otherwise:
 - **Role**: The administrative surface over licensing: shows a tenant what it holds and what is unbound, answers who may
   delegate what to whom before an operation is attempted, and turns grants and sub-grants into something an
   administrator can act on.
-- **Interface and direction**: inbound — a client of the management API, its check-explain read, and the ledger; it
-  holds no licensing state of its own.
+- **Interface and direction**: inbound — a client of the management API and its check-explain read; it holds no
+  licensing state of its own.
 - **When unavailable**: administration stops; grants, checks, and bindings are unaffected.
 
 #### Subscriptions
@@ -189,20 +190,20 @@ Runtime, lifecycle, and integration patterns are inherited from
 The check boundary and the tenant-bounded model are fixed by the
 [license-resolver PRD](../../license-resolver/docs/PRD.md). Gear-specific constraints:
 
-- **One model, many admissions.** What a deployment may do follows from the admission plugin it links: grant
-  parameters from an authorized caller, a vendor-signed artifact in the envelope format, or a carrier added later.
-  Domain model, lifecycle, check semantics, and management semantics are identical under all of them; only how root
-  grants arrive differs, and that is the plugin's. The security-relevant distinction is a property of the plugin, not
-  a count of builds: *untrusted* is any build whose plugin admits nothing without a vendor signature — the case for a
-  host whose operator has root over host, database, and clock; *trusted* is any build that accepts unsigned evidence
-  and takes its own store as the authority.
-- **Threat model of the untrusted build.** The adversary is the operator, with root over host, database, and clock.
-  The vendor holds two things: the signature on root grants — resource, holder, subject scope, validity, conditions,
-  how deep a subject grant may be bound or handed on — and the condition evaluator compiled into the binary. The
-  operator holds everything else: bindings and delegations, the tenant hierarchy, and the subject and resource
-  `metadata` a check arrives with. Editing those redistributes licenses but never multiplies them (two live bindings
-  deny as a whole), and feeds conditions whatever input the operator chooses. Patching the binary, hiding rows from
-  the instance's own queries, DRM-grade obfuscation, and hardware attestation are out of the threat model.
+- **One model, many admissions.** What a deployment may do follows from the admission plugin it links: grant parameters
+  from an authorized caller, a vendor-signed artifact in the envelope format, or a carrier added later. Domain model,
+  lifecycle, check semantics, and management semantics are identical under all of them; only the channel of vendor
+  decisions on root grants (an API call or signed evidence) differs, and that is the plugin's. The security-relevant
+  distinction is a property of the plugin, not a count of builds: *untrusted* is any build whose plugin admits nothing
+  without a vendor signature — the case for a host whose operator has root over host, database, and clock; *trusted* is
+  any build that accepts unsigned evidence and takes its own store as the authority.
+- **Threat model of the untrusted build.** The adversary is the operator, with root over host, database, and clock. The
+  vendor holds two things: the signature on root grants — resource, holder, subject scope, validity, conditions, how
+  deep a subject grant may be bound or handed on — and the condition evaluator compiled into the binary. The operator
+  holds everything else: bindings and delegations, the tenant hierarchy, and the subject and resource `metadata` a check
+  arrives with. Editing those redistributes licenses within the signed root but never multiplies them (two live bindings
+  deny as a whole), and feeds conditions whatever input the operator chooses. Patching the binary, hiding rows from the
+  instance's own queries, DRM-grade obfuscation, and hardware attestation are out of the threat model.
 - **Trust is compiled in, and split.** Signing lives outside this module — no build of it holds a private key, only
   the public material it verifies against. Verification lives inside it: the admission plugin and its trust anchors are
   linked into the enforcement binary, because a check the operator can replace or intercept proves nothing. Both sides
@@ -227,8 +228,8 @@ The check boundary and the tenant-bounded model are fixed by the
   later by the holder (user seats in phase 1; agents or other types later).
 - Binding of subject grants by the holder and their delegation to sub-tenants, with accept / reject / recall / return.
 - License packs: sets of grants issued and managed as one.
-- Managing those grants: a REST API and an in-process SDK client for platform modules, and an append-only audit
-  ledger.
+- Managing those grants: a REST API and an in-process SDK client for platform modules, and an audit event for every
+  change, delivered to a separate audit module.
 - Admission plugin contract; trust-bundle rotation, freshness (TTL + renewal), revocation lists, and clock-rollback
   defenses for untrusted builds.
 
@@ -264,14 +265,16 @@ The check boundary and the tenant-bounded model are fixed by the
 - [ ] `p1` - **ID**: `cpt-cf-license-enforcement-fr-backend-check`
 
 The system **MUST** implement `LicenseResolverPluginClient::is_licensed` and answer `granted: true` if and only if at
-least one grant in the request's tenant scope (a) is usable per `cpt-cf-license-enforcement-fr-grant-lifecycle`, and
-so is every grant in its parent grant chain up to the root, (b) targets a resource that covers the requested one — a
-grant on a resource type covers every instance of that type; a grant with an instance id covers only that instance,
-(c) has a subject scope that covers the requested subject per `cpt-cf-license-enforcement-fr-subject-scope`, (d) is
-within its validity window at evaluation time, (e) has all its conditions satisfied by the request `metadata`, and (f)
-if it is a sub-grant, is a subset of its parent at every link of the chain per
-`cpt-cf-license-enforcement-fr-delegation`. Evaluation **MUST** be deterministic and follow one documented order; the
-check path **MUST NOT** mutate state.
+least one grant in the request's tenant scope (a) is usable per `cpt-cf-license-enforcement-fr-grant-lifecycle`, and so
+is every grant in its parent grant chain up to the root, (b) targets a resource that covers the requested one — a grant
+on a resource type covers every instance of that type; a grant with an instance id covers only that instance, (c) has a
+subject scope that covers the requested subject per `cpt-cf-license-enforcement-fr-subject-scope`, (d) is within its
+validity window at evaluation time, (e) has all its conditions satisfied by the request `metadata`, and (f) if it is a
+sub-grant, is a subset of its parent at every link of the chain per `cpt-cf-license-enforcement-fr-delegation`. For the
+links below the root, delegation keeps (a) and (f) true at write time. In an untrusted build the operator holds
+delegations (§3), so the check proves them only against the signed root: an edited chain can move a license within the
+root, never beyond it. Evaluation **MUST** be deterministic and follow one documented order; the check path **MUST NOT**
+change grants, bindings, or their lifecycle state.
 
 - **Rationale**: This is the module's reason to exist; determinism and a documented order make denials explainable and
   identical across code paths.
@@ -284,8 +287,9 @@ check path **MUST NOT** mutate state.
 A grant's subject scope **MUST** be one of: **subject** — one subject of an admitted contract type, whose id is either
 fixed at admission or bound later by the holder (`cpt-cf-license-enforcement-fr-subject-binding`), matching only a
 check for that exact subject and matching nothing while unbound; **tenant-wide** — every subject of the types the
-Resource contract admits within the holder tenant, optionally restricted to a listed subset of those types, matching
-any check whose subject type is one of them or derives from one. A grant with subject scope is a **subject grant**.
+Resource contract admits within the holder tenant, optionally restricted to a subset of those types by the linked
+evaluator, matching any check whose subject type is one of them or derives from one. A grant with subject scope is 
+a **subject grant**.
 Every subject type named in a scope **MUST** be in the `admitted_subjects` of the grant's Resource contract
 (`cpt-cf-license-enforcement-fr-type-references`). A check whose subject is not covered **MUST** deny, telling "the
 tenant holds usable subject grants for the resource, none bound to this subject" apart from "no grant covers the
@@ -301,7 +305,7 @@ resource".
 
 Every denial **MUST** carry a typed reason, chosen by the documented evaluation order, that lets the caller tell these
 cases apart: no grant covers the resource in the tenant; grants cover it but none is bound to the subject; the grant
-is not yet valid, expired, or past its termination date; it is suspended, revoked, or awaiting acceptance; a condition
+is not yet valid, expired, or past its grace window; it is suspended, terminated, or awaiting acceptance; a condition
 is unmet; and, in builds that verify artifacts, the signature does not verify, the signing key is untrusted, the
 artifact is stale, the clock or a sequence has regressed, or a grant is duplicated. The reason **MUST** appear in
 `LicenseDecision.diagnostics`, telemetry, the management API's check-explain read, and in the audit ledger for the
@@ -357,14 +361,14 @@ be inside the signed payload. Adding a resource or subject type **MUST** require
 
 A grant **MUST** carry an immutable server-assigned id, the target resource (a registered Resource contract type and an
 optional instance id), the holder tenant, the subject scope, a validity window (`not_before`, `expires_at`, optional
-`terminates_at` closing a grace window; a sub-grant may instead inherit its parent's window), optional conditions,
+`grace_until` closing a grace window; a sub-grant may instead inherit its parent's window), optional conditions,
 holder permissions (whether the holder may `bind`, the maximum chain depth below this grant — zero means it may
 not `delegate` — and whether the grant requires acceptance when it is created), optional recipient rules, for a
 sub-grant its parent grant reference and delegation id, an optional pack reference, a reference to the
 evidence it descends from, a monotonic version, its lifecycle state, and — for a root grant admitted from an
 artifact — its signature envelope. A subject grant additionally carries its binding: none (the grant is
 unbound), a subject id, or the sub-grant delegated from it; it **MUST** have at most one binding at any time, and
-at most one **live** child sub-grant (one not revoked).
+at most one **live** child sub-grant (one not terminated).
 
 - **Rationale**: One grant shape covers every commercial form: a site license is a tenant-wide grant, N named-subject
   licenses are N grants, and conservation is a property of the binding rather than an invariant to defend.
@@ -395,18 +399,20 @@ Sub-grants are not admitted: they derive from an admitted root grant per `cpt-cf
 - [ ] `p1` - **ID**: `cpt-cf-license-enforcement-fr-grant-lifecycle`
 
 A grant's lifecycle **MUST** distinguish at least: usable (in force, or expired within its grace window); awaiting the
-holder's acceptance; suspended; revoked, which no verb reverses; and expired beyond grace. Only a usable grant satisfies
-a check. Transitions **MUST** be explicit verbs: `issue` (usable at once or awaiting acceptance, per the grant's
-acceptance requirement), `accept` and `reject` by the holder (a rejected grant is revoked), `suspend`, `reinstate`,
-`revoke`, and `renew`, and for sub-grants `recall` by the grantor and `return` by a holder whose chain ends unbound;
-both revoke the sub-grant and everything below it, unbind any subject at the end of the chain, and return the parent's
-binding to none. `renew` extends a grant's validity window, the grant keeping its identity; any grant not revoked can be
-renewed, and sub-grants that inherit its validity follow. In an untrusted build a root grant is renewed only by a
-renewed artifact from the vendor. Expiry **MUST** be derived from time, not from a stored transition: past `expires_at`
-a grant with a `terminates_at` still satisfies a check, with a grace diagnostic, until that date and then denies as
-terminated; without one it denies as expired. Suspension, revocation, expiry, and termination of a grant **MUST** apply
-to every grant below it in the parent grant chain without changing their stored state. Revoked grants **MUST** be
-retained for audit.
+holder's acceptance; suspended; terminated, which no verb reverses and which records why the grant ended (revoked,
+recalled, returned, rejected, or replaced); and expired beyond grace. Only a usable grant satisfies a check. Transitions
+**MUST** be explicit verbs: `issue` (usable at once or awaiting acceptance, per the grant's acceptance requirement),
+`accept` and `reject` by the holder (a rejected grant is terminated), `suspend`, `reinstate`, `revoke`, and `renew`, and
+for sub-grants `recall` by the grantor and `return` by a holder whose chain ends unbound; both terminate the sub-grant
+and everything below it, unbind any subject at the end of the chain, and return the parent's binding to none. `renew`
+extends a grant's validity window, the grant keeping its identity; any grant not terminated can be renewed, and
+sub-grants that inherit its validity follow. In an untrusted build a root grant is renewed only by a renewed artifact
+from the vendor. Expiry **MUST** be derived from time, not from a stored transition: past `expires_at` a grant with a
+`grace_until` still satisfies a check, with a grace diagnostic, until that date and then denies as grace expired;
+without one it denies as expired. Suspension, termination, expiry, and the end of grace of a grant **MUST** apply to
+every grant below it in the parent grant chain; a check derives this from the chain. Revocation also terminates every
+grant below it in the same operation. Only a verb terminates a grant. An expired grant keeps its stored state and can be
+renewed at any time. Terminated grants **MUST** be retained for audit.
 
 - **Rationale**: Distinct situations and explicit verbs let consumers and operators tell *why* a grant does not apply;
   a state the check derives cannot be flipped by editing a row.
@@ -432,19 +438,18 @@ admission and id shape.
 
 - [ ] `p1` - **ID**: `cpt-cf-license-enforcement-fr-delegation`
 
-The holder of subject grants whose maximum depth is above zero (delegable grants) **MUST** be able to `delegate`
-any number of its unbound ones to a recipient tenant, atomically creating one sub-grant per grant in the recipient's
-scope, awaiting acceptance or usable at once per the grant's acceptance requirement, and setting each parent's binding
-to its sub-grant; the delegating holder is the sub-grants' **grantor**. The sub-grants of one `delegate` **MUST**
-share a **delegation id**, and `accept`, `reject`, `return`, and `recall` addressed to a delegation **MUST** apply to
-all its sub-grants atomically. The recipient **MUST** be a descendant of the holder in the tenant hierarchy as
-`tenant-resolver` reports it at that moment, and **MUST** satisfy the grant's recipient rules, if any. A sub-grant
-**MUST** be a subset of its parent: same resource, subject scope, and evidence; validity inheriting or within the
-parent's; conditions the parent's plus optionally its own; holder permissions no wider than the parent's with a
-maximum depth one less; depth within the root's maximum. A sub-grant is itself a subject grant and may be bound or
-delegated on under the same rules, so one root grant is a chain with one binding at its end. Reject, return, recall,
-and the revocation of a sub-grant **MUST** return the parent's binding to none. Tenant-wide grants are not delegable
-in phase 1 (§13).
+The holder of subject grants whose maximum depth is above zero (delegable grants) **MUST** be able to `delegate` any
+number of its unbound ones to a recipient tenant, atomically creating one sub-grant per grant in the recipient's scope,
+awaiting acceptance or usable at once per the grant's acceptance requirement, and setting each parent's binding to its
+sub-grant; the delegating holder is the sub-grants' **grantor**. The sub-grants of one `delegate` **MUST** share a
+**delegation id**, and `accept`, `reject`, `return`, and `recall` addressed to a delegation **MUST** apply to all its
+sub-grants atomically. The recipient **MUST** be a descendant of the holder in the tenant hierarchy as `tenant-resolver`
+reports it at that moment, and **MUST** satisfy the grant's recipient rules, if any. A sub-grant **MUST** be a subset of
+its parent: same resource, subject scope, and evidence; validity inheriting or within the parent's; conditions the
+parent's plus optionally its own; holder permissions no wider than the parent's with a maximum depth one less; depth
+within the root's maximum. A sub-grant is itself a subject grant and may be bound or delegated on under the same rules,
+so one root grant is a chain with one binding at its end. Reject, return, and recall **MUST** return the parent's
+binding to none. A sub-grant whose window ended does not block its parent: binding or delegating the parent recalls it.
 
 - **Rationale**: One binding per grant, at every link, conserves the count without arithmetic; subset rules keep a
   sub-grant from ever widening the license it descends from.
@@ -468,8 +473,8 @@ rejected with a typed error.
 - [ ] `p1` - **ID**: `cpt-cf-license-enforcement-fr-precedence`
 
 The vendor **MUST** be able to replace a grant or Pack by a new issuance in one operation: the replaced grants are
-revoked, and each binding they carried moves to an unbound grant of the replacement on the same resource that admits the
-subject or the delegation; a delegated binding moves with every sub-grant below it, which then descend from the
+terminated, and each binding they carried moves to an unbound grant of the replacement on the same resource that admits
+the subject or the delegation; a delegated binding moves with every sub-grant below it, which then descend from the
 replacement's evidence and stay usable throughout, so a plan change never opens a denial window. A replacement that
 cannot carry over every binding **MUST** be rejected as a whole, naming the bindings without a successor; the holder
 unbinds first or the vendor replaces with grants that can carry them.
@@ -519,7 +524,8 @@ return RFC-9457 problems.
 - [ ] `p1` - **ID**: `cpt-cf-license-enforcement-fr-idempotent-mutations`
 
 Every mutating management operation **MUST** accept a client idempotency token; a replay with the same token and
-payload **MUST** return the original result, and a replay with a different payload **MUST** be rejected as a conflict.
+payload within the idempotency window **MUST** return the original result, and a replay with a different payload
+**MUST** be rejected as a conflict. The idempotency window is a configuration parameter of the module.
 Every managed resource **MUST** carry a monotonic version, and callers **MUST** be able to condition a mutation on it.
 
 - **Rationale**: Retries under at-least-once delivery must never double-issue or double-bind.
@@ -531,13 +537,13 @@ Every managed resource **MUST** carry a monotonic version, and callers **MUST** 
 - [ ] `p1` - **ID**: `cpt-cf-license-enforcement-fr-pdp-gated-management`
 
 Every management operation **MUST** be authorized through the PDP before execution, with tenant scope taken from
-`SecurityContext` and never from the payload, and the PDP's constraints applied in the same transaction as the
-mutation. A tenant administrator **MUST** be limited to grants their tenant holds (accept, reject, bind, unbind,
-delegate, return; and recall and renew of the sub-grants it delegated, within its own window) and **MUST NOT** be able
-to issue, suspend, reinstate, revoke, or renew a root grant; those verbs and Pack issuance are vendor operations. A
-grantor **MUST** be able to read the state and binding of the sub-grants it delegated across the tenant boundary, and
-nothing else about the recipient tenant; the vendor **MUST** be able to read the full delegation tree and ledger of
-every grant it issued.
+`SecurityContext` and the PDP's constraints applied in the same transaction as the mutation. A holder or recipient
+tenant in the payload **MUST** be accepted only inside that scope. A tenant administrator **MUST** be limited to grants
+their tenant holds (accept, reject, bind, unbind, delegate, return; and recall and renew of the sub-grants it delegated,
+within its own window) and **MUST NOT** be able to issue, suspend, reinstate, revoke, or renew a root grant; those verbs
+and Pack issuance are vendor operations. A grantor **MUST** be able to read the state and binding of the sub-grants it
+delegated across the tenant boundary, and nothing else about the recipient tenant; the vendor **MUST** be able to read
+the full delegation tree of every grant it issued.
 
 - **Rationale**: The management API is where a licensing service can be turned into a minting service; PDP gating with
   in-transaction constraints is the platform's defense in depth.
@@ -547,10 +553,10 @@ every grant it issued.
 
 - [ ] `p1` - **ID**: `cpt-cf-license-enforcement-fr-audit-ledger`
 
-The system **MUST** append a record to an append-only ledger (not cryptographically tamper-evident, §4.2) for every
-lifecycle transition, binding, delegation, artifact import, and verification failure at import, carrying actor,
-tenant, timestamp, verb, denial reason where applicable, and before/after values, and **MUST** expose it read-only,
-tenant-scoped, with retention of the ledger and of revoked grants configurable by the operator.
+The system **MUST** emit, without loss, a record for every lifecycle transition, binding, delegation, artifact import,
+and verification failure at import, carrying actor, tenant, timestamp, verb, denial reason where applicable, and
+before/after values, to a separate audit module. Retention of terminated grants **MUST** be configurable by the
+operator.
 
 - **Rationale**: Licensing disputes and revenue reconciliation are settled from the ledger, not from current state.
 - **Actors**: `cpt-cf-license-enforcement-actor-platform-vendor`, `cpt-cf-license-enforcement-actor-tenant-admin`
@@ -629,7 +635,7 @@ as a clock rollback when the clock falls behind that mark. This catches a clock 
 replayed material; it does not catch a clock rolled back together with the storage that holds the mark, nor a clock
 that stands still. The tolerated skew is fixed by the build.
 
-- **Rationale**: A clock set back must not by itself resurrect expired or revoked grants; a tolerance the operator
+- **Rationale**: A clock set back must not by itself resurrect expired or terminated grants; a tolerance the operator
   could widen would be a grant the operator can extend; and the limits of a software-only clock defence belong in
   the requirement, not in a footnote.
 - **Actors**: `cpt-cf-license-enforcement-actor-license-resolver`
@@ -673,9 +679,11 @@ No failure of storage, types registry, PDP, trust-bundle loading, or clock sanit
 - [ ] `p1` - **ID**: `cpt-cf-license-enforcement-nfr-tenant-isolation`
 
 Every check and every management read or write **MUST** be scoped to the tenant derived from `SecurityContext` (or the
-resolver's request context), with the single documented exception of a grantor reading the sub-grants it delegated.
+resolver's request context) and, as the PDP constraints allow, its descendants, with the single documented exception of
+a grantor reading the sub-grants it delegated.
 
-- **Threshold**: 0 cross-tenant reads or grant matches in isolation tests; tenant id never taken from payloads.
+- **Threshold**: 0 cross-tenant reads or grant matches in isolation tests; a tenant id from a payload (holder or
+  recipient) is accepted only inside that scope, as `tenant-resolver` reports it.
 - **Rationale**: A cross-tenant grant match licenses one customer with another's purchase.
 - **Architecture Allocation**: See DESIGN.md § NFR Allocation.
 
@@ -720,8 +728,9 @@ closed allow-list that includes at least one FIPS 140-3 approved algorithm; the 
 The same grant set, request, trust bundle, and evaluation time **MUST** always produce the same decision and reason
 code, and condition evaluation **MUST** be bounded by a per-check budget.
 
-- **Threshold**: 100% replay agreement across nodes; condition evaluation aborts (deny) past a configurable budget,
-  default 5ms.
+- **Threshold**: 100% replay agreement across nodes; condition evaluation denies past a per-check budget that the
+  evaluator counts in evaluation steps; a wall-clock guard, configurable, default 5ms, fails the check closed as an
+  error, not as a decision.
 - **Rationale**: Replayable decisions are what make the audit ledger and check-explain trustworthy.
 - **Architecture Allocation**: See DESIGN.md § NFR Allocation.
 
@@ -768,7 +777,7 @@ freshness TTL of each artifact and indefinitely for one without.
 - **Type**: REST API mounted into `api-gateway`, and the same operations as an in-process Rust client
   (`LicenseEnforcementClient` in `license-enforcement-sdk`, resolved via ClientHub) for platform modules.
 - **Stability**: unstable until first release, then stable.
-- **Description**: Packs, grants, sub-grants, lifecycle verbs, check-explain, ledger read; one semantics and one
+- **Description**: Packs, grants, sub-grants, lifecycle verbs, check-explain; one semantics and one
   authorization under both transports.
 - **Breaking Change Policy**: Path-versioned REST, additive fields non-breaking; SDK follows the crate's major
   version.
@@ -828,7 +837,7 @@ freshness TTL of each artifact and indefinitely for one without.
    S2, which accepts and binds them to its own users.
 4. A check for `user U` in S finds the sub-grant bound to U, walks to its root grant in T, finds every link usable
    and a subset of its parent, and grants.
-5. Later, T recalls the delegation: subjects bound in S and S2 are unbound, S2's sub-grants and S's are revoked,
+5. Later, T recalls the delegation: subjects bound in S and S2 are unbound, S2's sub-grants and S's are terminated,
    and all 40 root grants return to binding none.
 
 **Postconditions**:
@@ -836,8 +845,8 @@ freshness TTL of each artifact and indefinitely for one without.
   than 100 subjects.
 
 **Alternative Flows**:
-- **S rejects**: the sub-grants are revoked and all 40 parent grants return to binding none immediately.
-- **S returns 5 unbound grants**: their sub-grants are revoked, T has 35 unbound grants.
+- **S rejects**: the sub-grants are terminated and all 40 parent grants return to binding none immediately.
+- **S returns 5 unbound grants**: their sub-grants are terminated, T has 35 unbound grants.
 - **S tries to return a grant it has bound**: rejected; S unbinds first or T recalls.
 - **T tries to delegate 80 before step 1**: rejected, only 70 grants are unbound.
 - **Vendor suspends T's pack**: every check down the chain denies as suspended; no stored state below changes.
@@ -898,8 +907,8 @@ freshness TTL of each artifact and indefinitely for one without.
 - **Artifact replayed after a newer one was imported**: rejected as a version regression; nothing is stored.
 - **Operator copies a bound grant row for a second subject**: the grant has two live bindings; both subjects deny as
   duplicated.
-- **Operator flips a revoked root grant's stored state to usable**: the check derives the state from the revocation
-  list and still denies as revoked.
+- **Operator flips a terminated root grant's stored state to usable**: the check derives the state from the revocation
+  list and still denies as terminated.
 
 ## 9. Acceptance Criteria
 
@@ -914,7 +923,8 @@ freshness TTL of each artifact and indefinitely for one without.
 - [ ] Every management mutation is idempotent by client token, versioned, and PDP-authorized with tenant scope from
   `SecurityContext`; a tenant administrator cannot issue, suspend, revoke, or renew a root grant.
 - [ ] Return moves only unbound grants; renewing a root grant extends every sub-grant that inherits its validity.
-- [ ] Replacing a grant revokes it and carries its bindings over in one operation; no check in between denies.
+- [ ] Replacing a grant terminates it with the reason replaced and carries its bindings over in one operation; no
+  check in between denies.
 - [ ] Registering a new resource or subject contract type requires no code change in this module.
 - [ ] No root grant reaches the store except through the linked admission plugin; an untrusted build's plugin verifies
   before admitting, rejects replayed and version-regressed artifacts, and leaves no parameter-based create
@@ -922,9 +932,9 @@ freshness TTL of each artifact and indefinitely for one without.
 - [ ] An untrusted build denies missing, tampered, unknown-key, stale, and clock-regressed artifacts with the matching
   reason, and exposes no configuration that relaxes this; a build without the untrusted opt-in links
   none of that code.
-- [ ] In an untrusted build, editing a stored grant, sub-grant, binding, or lifecycle state other than through a
-  permitted holder decision leaves every check's answer unchanged or turns it into a denial; a duplicated grant or
-  sub-grant denies as duplicated. Removing or rolling back stored trust material, revocation material, or the
+- [ ] In an untrusted build, an edit of a stored grant, sub-grant, binding, or lifecycle state outside a permitted
+  holder decision never gives a grant that is wider than its signed root. A duplicated grant or sub-grant denies as
+  duplicated. Removing or rolling back stored trust material, revocation material, or the
   high-water marks defers a suspension or revocation at most until the artifact's freshness TTL lapses; a rollback
   of storage together with the clock is outside the defence (§5.6).
 - [ ] Applying a trust bundle that revokes an issuing key, or letting an artifact's TTL lapse, denies the grants
@@ -967,7 +977,7 @@ freshness TTL of each artifact and indefinitely for one without.
 | Tenant hierarchy semantics differ from delegation needs (depth, moves) | Delegation blocked or sub-grants orphaned on tenant re-parenting | Bound depth; treat re-parenting as recall + re-delegate; open question §13 |
 | Signature format frozen too early | Every issued artifact must be re-issued on change | Envelope version in the signed input; multiple versions verifiable at once |
 | Trust-material distribution to air-gapped sites is operationally heavy | Stale anchors, undeliverable revocations | File-based distribution owned by the plugin; explicit documentation of what cannot be revoked |
-| Builds with different admission plugins diverge into different products | Doubled maintenance, inconsistent semantics | One domain model, lifecycle, and management semantics for every plugin; only how root grants arrive varies, enforced by shared tests |
+| Builds with different admission plugins diverge into different products | Doubled maintenance, inconsistent semantics | One domain model, lifecycle, and management semantics for every plugin; only the channel of vendor decisions on root grants (an API call or signed evidence) varies, enforced by shared tests |
 | Plan changes surprise customers | Denial window or lost bindings | Atomic replacement with binding carry-over |
 | Denial-reason vocabulary grows ad hoc | Consumers break on unknown reasons | Vocabulary owned by DESIGN, additive only; consumers tolerate unknown reasons; documented evaluation order |
 
@@ -979,7 +989,7 @@ freshness TTL of each artifact and indefinitely for one without.
   bounded by a count of sub-tenants? — Owner: platform vendor; target: after v1.
 - What happens to sub-grants when the recipient tenant is re-parented or deleted? — Owner: license-enforcement and
   tenant-resolver maintainers; target: DESIGN.
-- Retention period for revoked grants and the ledger; default proposed 400 days. — Owner: platform vendor; target:
+- Retention period for terminated grants; default proposed 400 days. — Owner: platform vendor; target:
   DESIGN.
 
 ## 14. Traceability
