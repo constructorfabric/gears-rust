@@ -762,13 +762,15 @@ test-pg: install-tools
 	$(call nextest_run,toolkit-db-pg,-p cf-gears-toolkit-db --features pg$(comma)integration)
 
 ## Run the SQL/PGQ lane: toolkit-db's unit suites under the `pgq` feature (the
-## secure graph builder and its tests compile only there), the PostgreSQL 19
-## integration suite (tests/pg, Docker required; a testcontainers PG19) and the
-## trybuild guards. `pgq` implies `pg`, so without the filter this would re-run
-## every PG18 Docker suite `make test-pg` just ran; the filter keeps only what
-## this lane adds. The PG19 suite skips itself while the pre-GA image is
-## unavailable; CI sets GEARS_TEST_PG_GRAPH_REQUIRED=1 so there the skip is a
-## failure — do the same locally once the image is expected to be present.
+## secure graph builder and its tests compile only there), the integration
+## suite (tests/pg, Docker required) and the trybuild guards. `pgq` implies
+## `pg`, so without the filter this would re-run every PG18 Docker suite
+## `make test-pg` just ran; the filter keeps only what this lane adds. The
+## integration suite needs SQL/PGQ, which only PostgreSQL 19 beta 1–3 have
+## (reverted in 19 beta 4, absent from GA): it runs on the beta tag
+## test-containers pins and skips with a named reason once Docker Hub
+## withdraws it. GEARS_TEST_PG_GRAPH_REQUIRED=1 turns that skip into a failure,
+## for a run that is meant to exercise it (gears-rust #5343).
 test-pgq: install-tools
 	$(call print_target_banner)
 	$(call nextest_run,toolkit-db-pgq,-p cf-gears-toolkit-db --features pgq$(comma)integration \

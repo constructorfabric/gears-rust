@@ -496,16 +496,16 @@ jobs:
         if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
         run: tools/scripts/with_rust_annotations.sh make test-pg
 
-      - name: Test toolkit-db (pgq unit + PG19 integration)
+      - name: Test toolkit-db (pgq unit + trybuild; PG19 beta integration when available)
         if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
         # Compiles and runs everything behind the `pgq` feature — the secure
-        # graph builder, its unit suites and the trybuild guards — and the
-        # PostgreSQL 19 integration suite. Locally that suite skips itself while
-        # the pre-GA PG19 image is unavailable; here the skip is a failure, so
-        # the isolation suite cannot pass green and empty (see
-        # libs/test-containers::graph_lane_required).
-        env:
-          GEARS_TEST_PG_GRAPH_REQUIRED: "1"
+        # graph builder, its unit suites and the trybuild guards, which assert
+        # the rendered SQL and need no server. The integration suite needs a
+        # server with SQL/PGQ, and only PostgreSQL 19 beta 1–3 have one:
+        # SQL/PGQ was reverted in 19 beta 4 and GA ships without it, so it runs
+        # while `test_containers::POSTGRES_GRAPH_TAG` (a beta) is still on
+        # Docker Hub and skips with a named reason once it is withdrawn. It is
+        # not required for that reason (gears-rust #5343, secure-orm ADR-0002).
         run: tools/scripts/with_rust_annotations.sh make test-pgq
 
       - name: Test toolkit-db (mysql integration)
