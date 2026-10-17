@@ -3780,12 +3780,13 @@ dependencies = [
 
 [[package]]
 name = "cf-gears-settings-service"
-version = "0.1.4"
+version = "0.1.7"
 dependencies = [
  "anyhow",
  "async-trait",
  "axum",
  "base64 0.22.1",
+ "cf-gears-account-management-sdk",
  "cf-gears-authn-resolver-sdk",
  "cf-gears-authz-resolver-sdk",
  "cf-gears-credstore",
@@ -3803,6 +3804,8 @@ dependencies = [
  "cf-gears-toolkit-security",
  "cf-gears-types-registry",
  "cf-gears-types-registry-sdk",
+ "futures-util",
+ "gts",
  "http",
  "inventory",
  "jsonschema",
@@ -3821,6 +3824,7 @@ dependencies = [
  "tokio-util",
  "tower",
  "tracing",
+ "tracing-test",
  "utoipa",
  "uuid",
 ]

@@ -1,5 +1,5 @@
 Created:  2026-07-28 by Virtuozzo International GmbH
-Updated:  2026-09-23 by Virtuozzo International GmbH
+Updated:  2026-10-15 by Virtuozzo International GmbH
 
 # Technical Design — Settings Service
 
@@ -115,7 +115,7 @@ The service is delivered as a **Constructor Fabric Gear** — the platform's uni
 | `cpt-cf-settings-service-fr-authn-role-gating` | Bearer token via the AuthN Resolver, then a fail-closed `PolicyEnforcer` decision; step-up on a write to a declaration that requires it and on behavior-affecting declaration actions |
 | `cpt-cf-settings-service-fr-per-setting-access` | §4.8 *Authorization Model*: a value operation names the setting's own key as the resource, so a grant covers one setting, a wildcarded subtree, or — on the base type — all of them; lists resolve it in two steps (*Listing under a narrowed grant*) |
 | `cpt-cf-settings-service-fr-file-valued-settings` | §3 *Files*: a `file-reference`-trait value is an inline reference (`value`, §4.1) to a file in the `file-storage` gear, never the bytes. **Validated for shape only** — the two-field object `{ file_id, version_id }`, both required — with existence, content type, size and caller entitlement deliberately unchecked, so this service takes no dependency on `file-storage`. The reference is always pinned to a version, so a `bind` under it changes nothing until the setting is repointed; content is never indexed (§4.2 *Search*); `secret` + `file-reference` is rejected (`422`) while `pii` is carried. |
-| `cpt-cf-settings-service-fr-audit-mutations` | Audit Emitter writes synchronously inside the mutation transaction, fail-closed; canonical `resource` id makes history an exact-match query |
+| `cpt-cf-settings-service-fr-audit-mutations` | Audit Emitter writes synchronously inside the mutation transaction, fail-closed; canonical `resource` id makes history an exact-match query; the history read adds `actor_name` beside `actor`, resolved from Account Management by the Actor Name Resolver, never for a masked actor and never failing the read (§4.2 *Actor Name Resolver*, §4.3) |
 | `cpt-cf-settings-service-fr-feature-license-gating` | `licence_feature` checked through the License Resolver on administrative read paths only; the in-process reader is not gated |
 | `cpt-cf-settings-service-fr-standard-advanced-mode` | `mode` on the declaration, carried on every declaration and browse item as a tag; no server-side filtering — a client groups locally; the preference lives with the console (§4.3) |
 | `cpt-cf-settings-service-fr-search-discoverability` | Trigram GIN indexes over key/description/category/value with classification split into the index predicates |
@@ -157,13 +157,15 @@ The service is delivered as a **Constructor Fabric Gear** — the platform's uni
 │  settings-service     │ REST, authz, validate, set, search  │
 │  ┌──────────────────────────────────────────────────────┐   │
 │  │ Domain: resolver · writer · validator ·              │   │
-│  │         scope-class engine · secret manager          │   │
+│  │         scope-class engine · secret manager ·        │   │
+│  │         actor-name resolver                          │   │
 │  ├──────────────────────────────────────────────────────┤   │
 │  │ Infrastructure: effective-value cache · audit emitter│   │
 │  └──────────────────────────────────────────────────────┘   │
 ├─────────────────────────────────────────────────────────────┤
 │  External │ types-registry · tenant-resolver · authz/authn  │
 │           │ credstore · event-broker · audit · license      │
+│           │ account-management (opt.)                       │
 ├─────────────────────────────────────────────────────────────┤
 │  Storage  │ PostgreSQL (declarations, values, audit)        │
 └─────────────────────────────────────────────────────────────┘
@@ -173,9 +175,9 @@ The service is delivered as a **Constructor Fabric Gear** — the platform's uni
 |-------|---------------|------------|
 | SDK | Public trait definitions, transport-agnostic models, errors, shared GTS type ids | Rust crate (`settings-service-sdk`) |
 | Gear | REST surface, authorization, declaration lifecycle, value writes, resolution, search | Rust crate (`settings-service`), ToolKit gear, Axum |
-| Domain | Effective-value resolution, Scope Class behaviour, the value write path, type validation, secret handling | In-process Rust modules |
+| Domain | Effective-value resolution, Scope Class behaviour, the value write path, type validation, secret handling, actor display-name resolution (with its per-caller name cache) | In-process Rust modules |
 | Infrastructure | Hot-path effective-value cache with signal-driven invalidation; fail-closed audit emission | In-memory cache, Event Broker client |
-| External | Type and trait resolution, tenant ancestry, authentication and authorization decisions, secret storage, event transport, entitlement | `types-registry`, `tenant-resolver`, `authn-resolver`, `authz-resolver`, `credstore`, `event-broker`, `license-resolver`. Audit is **not** external in R1 — the store is gear-local (§4.2 *Audit Emitter*) |
+| External | Type and trait resolution, tenant ancestry, authentication and authorization decisions, secret storage, event transport, entitlement | `types-registry`, `tenant-resolver`, `authn-resolver`, `authz-resolver`, `credstore`, `event-broker`, `license-resolver`; optionally `account-management` (actor names on the history read). Audit is **not** external in R1 — the store is gear-local (§4.2 *Audit Emitter*) |
 | Storage | Declarations, categories, values, audit records | PostgreSQL via `toolkit-db`, reached through `SecureConn` (§4.8 *The Data Path*) |
 
 #### Context View
@@ -197,6 +199,7 @@ C4Context
  System(license_resolver, "License Resolver", "Feature/licence entitlement gating")
  System(credstore, "Credential Store", "the credstore backend: secret-trait value storage")
  System(event_broker, "Event Broker", "Change-lifecycle events; tenant_deleted consumption")
+ System(account_management, "Account Management", "Optional: display names of history actors, read per history page")
  SystemDb(settings_db, "Settings Database", "PostgreSQL: declarations, values, audit")
  }
 
@@ -214,6 +217,7 @@ C4Context
  Rel(settings_service, license_resolver, "check feature/licence entitlement (read paths)", "in-process (ClientHub)")
  Rel(settings_service, credstore, "store/resolve secret values (machine path)", "credstore API")
  Rel(settings_service, event_broker, "publish change/lifecycle events + activation signals (change_notification per subscriber, cache_invalidate broadcast); consume tenant_deleted", "Event Broker")
+ Rel(settings_service, account_management, "read actor display names for a history page (optional; names read null when absent)", "in-process (ClientHub)")
  Rel(modules, event_broker, "subscribe to change_notification; ack activation", "Event Broker")
 ```
 
@@ -236,6 +240,7 @@ C4Container
  Container_Ext(license_resolver, "License Resolver", "ClientHub", "Feature/licence entitlement gating")
  Container_Ext(credstore, "Credential Store", "credstore API", "the credstore backend secret-value storage")
  Container_Ext(event_broker, "Event Broker", "Event Broker", "Publish/consume + cross-instance cache invalidation")
+ Container_Ext(account_management, "Account Management", "ClientHub", "Optional: display names of history actors")
 
  Rel(rest, domain, "delegates", "in-process")
  Rel(clienthub, cache, "reads", "in-process")
@@ -250,6 +255,7 @@ C4Container
  Rel(domain, license_resolver, "feature/licence entitlement", "ClientHub")
  Rel(domain, credstore, "store/resolve secret values (machine path)", "credstore API")
  Rel(domain, event_broker, "publish/consume; cross-instance invalidation", "Event Broker")
+ Rel(domain, account_management, "actor names for a history page (optional)", "ClientHub")
 ```
 
 ## 2. Goals / Non-Goals
@@ -469,6 +475,12 @@ The AuthZ Resolver gates read/mutate against `gts.cf.core.settings.*` resources.
 - [ ] `p1` - **ID**: `cpt-cf-settings-service-constraint-licence-entitlement-fail-closed`
 
 Visibility gating by `licence_feature` uses the the License Resolver via `LicenseResolverApi` (in-process ClientHub): given the caller `Context` and a `licence_feature`, it returns allow/deny, **fail-closed** (deny on error). Applied on REST read/browse/search paths only — not the in-process Settings Reader hot path.
+
+#### Account Management (optional)
+
+- [ ] `p2` - **ID**: `cpt-cf-settings-service-constraint-account-management-optional`
+
+Account Management (AM) is a **soft** dependency, used only to put a display name on the actor of a history record (§4.2 *Actor Name Resolver*). The gear depends on `account-management-sdk` as a crate, but AM is not a required runtime dependency: the client is looked up in `ClientHub` at each lookup, so gear registration order cannot turn names off, and a deployment without AM reads every name as `null`. AM is called with the caller's own `SecurityContext`, in the record's tenant and in the caller's own tenant (§4.2 *Actor Name Resolver*) — no privileged context and no added permission; AM decides what the caller may see. An AM failure never fails a history read.
 
 #### Audit & events
 
@@ -718,6 +730,7 @@ graph TD
  writer["Value Writer<br/><small>validate · step-up · commit · publish change_notification + cache_invalidate</small>"]
  secrets["Secret Manager<br/><small>store · mask · resolve (machine-only)</small>"]
  search["Search"]
+ actorname["Actor Name Resolver<br/><small>history actor names · per-caller cache</small>"]
  scopeclass["Scope Class Engine"]
  end
 
@@ -735,6 +748,7 @@ graph TD
  licence[/"License Resolver<br/><small>ClientHub · entitlement</small>"/]
  credstore[("Credential Store<br/><small>the credstore backend</small>")]
  broker[/"Event Broker<br/><small>publish/consume</small>"/]
+ am[/"Account Management<br/><small>ClientHub · optional</small>"/]
  pg[("PostgreSQL")]
  end
 
@@ -743,6 +757,8 @@ graph TD
  rest_api -->|delegates| writer
  rest_api -->|delegates| search
  rest_api -->|reads| resolver
+ rest_api -->|history page actors| actorname
+ actorname -->|list_users<br/><small>caller context · optional</small>| am
  reader_api -->|hot read| cache
  reader_api -.->|miss| resolver
  reader_api -->|resolve plaintext<br/><small>authorized · audited</small>| secrets
@@ -794,7 +810,7 @@ graph TD
 |-----------|-------|--------|--------------|
 | `create_category` | `CreateCategoryRequest`, `Context` | `Category` | Authorize `create` on `gts.cf.core.settings.category.v1~` (category governance is per-resource-type CRUD — create/read/update/delete — per §4.8). Reject duplicate `key`/`name` (`409`). Insert; audit. (`cpt-cf-settings-service-fr-settings-category-model`) |
 | `update_category` | `id`, `UpdateCategoryRequest`, `Context` | `Category` | Authorize `update` on `gts.cf.core.settings.category.v1~`. Partial update (`name`, `description`, `domain_affinity`, `sort_order`, `icon`). Requires `If-Match` (optimistic concurrency, §4.3). |
-| `delete_category` | `id`, `Context` | — | Authorize `delete` on `gts.cf.core.settings.category.v1~`. Reject (`409 CategoryNotEmpty`) if any declaration row references it — **including `retired` ones** (a retired declaration still occupies the category and its values are retained, §4.2 *Declaration Management*; no-orphan, `cpt-cf-settings-service-fr-settings-category-model`). Hard-delete only when no declaration row remains. Authoritative guard is the declaration→category FK `ON DELETE RESTRICT` (§4.7), which blocks regardless of `status`. |
+| `delete_category` | `id`, `Context` | — | Authorize `delete` on `gts.cf.core.settings.category.v1~`. Reject (`409 CategoryNotEmpty`) if any declaration row references it — **including `retired` ones** (a retired declaration still occupies the category and its values are retained, §4.2 *Declaration Management*; no-orphan, `cpt-cf-settings-service-fr-settings-category-model`). Hard-delete only when no declaration row remains. The `409` carries the number of declaration rows still referencing the category, retired ones included (counted again after the refused transaction has rolled back, on a fresh connection — a failed statement leaves a PostgreSQL transaction unusable) — the total regardless of the caller's visibility: the refusal itself already discloses that the category is not empty, and the administrator needs the true number to clear it. Authoritative guard is the declaration→category FK `ON DELETE RESTRICT` (§4.7), which blocks regardless of `status`. |
 | `get_category` / `list_categories` | filter, `Context` | `Category` / `Category[]` | Domain-filtered, visibility-gated, paginated. |
 
 #### Component: Declaration Management
@@ -1143,6 +1159,48 @@ The corpus covers only Schema Defaults and overrides the caller may **already re
 
 **Cache bound — the working set is capped.** The cache holds at most **`cache_max_entries`** entries (default 500,000 — the sizing anchor in §7; a zero is refused at init). Entries are kept in store order beside the map: every store first drops the entries at the head that are past `cache_ttl_seconds`, so a cold entry does not wait for its own lookup to be evicted, and at capacity the store evicts from the head — under one TTL the entry nearest to expiry, which is what a background sweep would remove, done lazily and in amortized constant time. Deliberately not an LRU: with a 30 s TTL the two policies barely differ, and recency bookkeeping would add work to every hit under the lock. Subtree eviction tests tenant membership against a set built once, so a hierarchy or access change costs one pass over the cache, not one per tenant per entry.
 
+#### Component: Actor Name Resolver
+
+- [ ] `p2` - **ID**: `cpt-cf-settings-service-component-actor-name-resolver`
+
+Puts a display name beside the actor of each history record (`cpt-cf-settings-service-fr-audit-mutations`, `cpt-cf-settings-service-actor-compliance-reviewer`). It is a read-side helper of the history endpoint (§4.3). It writes nothing: mutation responses carry no actor name, and the audit record is unchanged. The display name and the optional Account Management dependency are required by the PRD: `cpt-cf-settings-service-fr-audit-mutations` (PRD §5.7) states the name rules, and `cpt-cf-settings-service-actor-account-management` (PRD §2.2) declares the dependency as optional.
+
+**Dependencies:** Account Management through `AccountManagementClient` (`account-management-sdk`), looked up in `ClientHub` — optional (`cpt-cf-settings-service-constraint-account-management-optional`).
+
+**Operations:**
+
+| Operation | Input | Output | Key Behavior |
+|-----------|-------|--------|--------------|
+| `names_for_page` | the page's records, caller `SecurityContext` | `actor_name` per record | One lookup per page, below. |
+
+**What a record reads.** `actor_name` is:
+
+- `null` when `actor_masked` is true. A masked actor never gets a name, and no lookup is made for it.
+- `null` when `actor` is not a user id. A module actor's public module name is already in `actor`. The kinds are told apart by shape: a UUID-shaped `actor` is a user id, the nil UUID is the system context, and anything else is a module name.
+- `"System"` for the nil id, the platform's system context, when it is unmasked, with no lookup.
+- Otherwise the user's name from AM, or `null` when AM refuses the read, finds no such user visible to the caller, fails, answers too late, or is not deployed. A history read never fails because of AM.
+
+The name is the display name, then first and last name, then the username. A blank value counts as absent.
+
+**Lookup.** The resolver groups the page's user-id actors by the tenant to ask AM in. The first group is the record's `tenant_id`, or the caller's own tenant (`ctx.subject_tenant_id()`) for a record without one (a definition record). The caller's own tenant is also a second group for every actor, since an ancestor administrator who set a descendant's value is listed in an ancestor tenant, not in the record's. The resolver sends one `AccountManagementClient::list_users` id-set query per (tenant, chunk), always with the caller's own `SecurityContext`. AM decides whether this caller may list that tenant's users; the resolver uses no privileged context and adds no permission. Identical groups collapse into one, so a caller reading its own scope asks AM once. The caller's-tenant group asks only for the actors the record-tenant group left unresolved. The actors of a chunk that failed, timed out or hit the budget in round 1 stay unresolved and are asked in round 2 if budget remains, since a failure in the record's tenant says nothing about the caller's tenant; after round 2 whatever is still unresolved reads `null`. The audit record stores no actor tenant, which is why the lookup tenant is derived this way.
+
+The visibility boundary holds in both directions:
+
+- An administrator of an ancestor or of the platform may read a descendant scope's history (the read itself is authorized by the PDP and row-scoped to the caller's constraints on `audit_records`, §4.8 *The Data Path*). That caller gets the names of the scope's administrators when AM lets the caller list that tenant's users, and `null` otherwise.
+- A tenant administrator reading a record an ancestor administrator wrote reads `null` for it. The ancestor is listed in no tenant the caller may ask, so an ancestor's display name is never shown to a subordinate tenant. The ancestor's `actor` id is carried like any audit actor and masked per its classification (§4.8).
+
+This relies on AM allowing an ancestor administrator to list a descendant tenant's users. Where it does not, names read `null` and nothing leaks.
+
+**One lookup per page.** The resolver collects the page's actor ids, deduplicates them, and reads them in chunks of 200 per tenant group (`IdpUserPagination::MAX_TOP`). The two tenant groups run as two rounds: the record-tenant group first, then the caller's-tenant group on the ids the first round left unresolved, sequentially and inside the same remaining budget; at most 4 chunks run at once within a round. All of it is inside one budget for the page: at most 1 s, and never more than what remains of the page's 2 s deadline. Whatever is unresolved when the budget ends reads `null`. The cap of 4 concurrent chunks is per page request. The process-wide bound is the per-page budget times the number of concurrent history reads; there is deliberately no global cap.
+
+**Cache.** A resolved name is kept in process memory for 5 minutes, for the caller AM gave it to and nobody else: the key is (caller tenant, caller subject, actor). A refused, absent or failed lookup is not kept, so a new user's name shows on the next read. A context without a real subject gets no lookup and keeps nothing (a defensive guard: the history route is authenticated, so this does not occur on the stated surface). The cache holds at most 10,000 names; a full cache drops its expired names, then all. A rename shows within 5 minutes. The 5-minute window is also the accepted staleness bound for a narrowed visibility or for a user erased or anonymized in AM: for at most 5 minutes a caller may still read a name AM would no longer give. No name is stored in the database.
+
+A slow AM costs each page at most the budget, under the concurrency cap. There is deliberately no cross-request circuit breaker and no negative cache, so a recovered AM is used again on the next read. Administrative history traffic is low enough for that.
+
+**Observability.** A chunk whose names degrade — an AM error, the budget, malformed paging, a query that cannot be built — logs one warn line with the reason kind and the id count only: no id, no profile, no error text, because actor ids are PII. Each lookup pass also counts once in `settings_actor_name_lookups_total` by `result`, with no actor identifier (§7). `ok` means every chunk answered inside the budget, or every actor was a cache hit and no AM call was made; refused or not-found answers count as `ok`, because they are AM's answers. `degraded` means at least one chunk errored, timed out, or hit a paging or query failure. `skipped` means no lookup was made for the page: no user-id actor to look up, AM absent from ClientHub, or a context without a real subject. The duration histogram carries the same `result` values. Refused and not-found answers are AM's normal answers and log nothing.
+
+**Latency.** The lookup runs on the history read path, which carries the 2 s p95 target of the scoped audit query (`cpt-cf-settings-service-nfr-scale-growth`, §7). The page carries one deadline of 2 s from the start of the request. The name lookup runs after the audit query and gets the smaller of its own 1 s ceiling and what remains of the page deadline, so the page never exceeds 2 s because of names. In the normal case, a local index query taking milliseconds, the lookup still has its full 1 s. The budget is a ceiling, not the expected cost: cache hits and a single AM round trip are the normal case. Names degrade to `null` rather than delay the page past the deadline.
+
 #### Component: Audit Emitter
 
 - [ ] `p1` - **ID**: `cpt-cf-settings-service-component-audit-emitter`
@@ -1241,7 +1299,7 @@ All REST APIs follow the shared DNA REST contract: `snake_case` JSON; UUIDv7 IDs
 | Condition | Error | Description |
 |-----------|-------|-------------|
 | Category exists | `404` | Not found |
-| Category empty | `409 CategoryNotEmpty` | Must contain no declarations (`cpt-cf-settings-service-fr-settings-category-model`) |
+| Category empty | `409 CategoryNotEmpty` | Must contain no declarations, active or retired; the `409` reports how many still reference it, on the pre-check and on the foreign-key path alike (`cpt-cf-settings-service-fr-settings-category-model`) |
 | Actor authorized | `403` | `delete` on `gts.cf.core.settings.category.v1~` |
 
 #### REST API — Setting Declarations
@@ -1423,7 +1481,9 @@ A `set` request mints a **`change_set_id`**, and consumer activation is tracked 
 
 **History reads the gear's own audit store.** `GET /settings-service/v1/settings/{key}/history` resolves the `(key, scope)` to the canonical audit resource id (`cf.settings:{key}@{tenant_id}`, §4.2 *Audit Emitter*) and queries `audit_records` (§4.7) on `(declaration_key, tenant_id)`, paginated and newest first. The **same formatter** produces the id on the write side and resolves it here, so the two cannot drift. Masking is already in the stored record — a `secret`-classified value was never written in plaintext — so the read applies no second masking implementation, and there is no reveal path to open. Tenant scoping is the ordinary row-scoped path, not a forwarded concern.
 
-This also makes the scoped-query target (§7, p95 ≤ 2 s over the online window) a local index lookup on `idx_audit_scoped` rather than a synchronous call into another service — a target that was optimistic when it depended on a cross-service read-through.
+**Each history record carries `actor_name`.** The wire record has `actor` (masked when the identity is PII the caller may not see), `actor_masked`, and `actor_name: string | null`. `actor_masked` is computed per request: the actor identity is classified `pii` and the caller is not entitled to unmasked PII (§4.8); `actor` then carries the mask token. `actor_name` is `null` for a masked actor and for a module actor, `"System"` for the nil id, and otherwise the user's display name from Account Management, or `null` when it cannot be had. It is resolved server-side once per page, in the record's tenant and in the caller's own tenant, with the caller's own context (§4.2 *Actor Name Resolver*), so a caller sees only the names Account Management lets that caller see. The history read never fails because of Account Management (§4.2 *Actor Name Resolver*). The field exists on the read only; no name is stored in `audit_records`.
+
+This also makes the scoped-query target (§7, p95 ≤ 2 s over the online window) a local index lookup on `idx_audit_scoped` rather than a synchronous call into another service — a target that was optimistic when it depended on a cross-service read-through. The optional actor-name lookup is the one cross-service call left on this path; it is bounded by ≤ 1 s and by the remaining page deadline, and degrades to `null` names instead of delaying the page (§4.2 *Actor Name Resolver*).
 
 > **R2: read-through as well, not instead.** Once the platform Audit Subsystem exists and the outbox handler posts to it (§4.2 *Audit Emitter*), long-term and cross-gear queries belong there; this endpoint keeps serving the online window locally. If a deployment ever chooses to serve history from the subsystem instead, correctness relies only on its `resource` filter supporting **exact match** on this instance-level identifier — no prefix or wildcard is needed, since the requirement is per-(setting, scope), one id per query. That contract is worth confirming with the Audit team when the subsystem is designed; it is no longer a dependency this gear's first release carries.
 
@@ -1545,6 +1605,8 @@ On the gateway path, deciding what is safe to expose remains the gateway's respo
 ### 4.6 Interactions & Sequences
 
 The two sequences below are the design's load-bearing interactions: the **administrator write path** (validated, step-up-gated, committed per change) and the **consumer read path** (in-process, cache-first, resolved along the scope chain). Component names in *italics* refer to §4.2.
+
+Two further sequences follow: the **file-valued setting** (two client calls) and the **history read with actor names**.
 
 #### Validate and set a value
 
@@ -1671,6 +1733,52 @@ sequenceDiagram
 ```
 
 Two things follow from the shape of this flow. An orphan is possible by construction — step 1 can succeed and step 2 never happen, leaving a file nothing references — and that is `file-storage`'s retention concern, not this service's (§3 *Files*, *The reference does not own the file*). And the reverse is equally possible: step 2 can name a file that step 1 never created, because the reference is stored without being checked. A setting pointing at nothing is written successfully and fails at the consumer's fetch (§3 *Files*).
+
+#### Read a setting's history with actor names
+
+- [ ] `p2` - **ID**: `cpt-cf-settings-service-seq-history-actor-names`
+
+The history read is a local index query. The actor names are added afterwards by one bounded lookup that never fails the page. A masked actor, a module actor and the nil id are never looked up (§4.2 *Actor Name Resolver*).
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Adm as Admin client
+    participant API as REST door
+    participant AZ as AuthZ / row scope
+    participant DB as audit_records
+    participant ANR as Actor Name Resolver
+    participant NC as name cache
+    participant AM as Account Management
+
+    Adm->>API: GET /settings-service/v1/settings/{key}/history (authenticated)
+    API->>AZ: PDP decision: may this caller read audit records?
+    AZ-->>API: allowed, with the caller's constraints
+    API->>DB: page query on idx_audit_scoped (declaration_key, tenant_id),<br/>row-scoped to the caller's constraints
+    DB-->>API: records
+    API->>API: compute actor_masked per record
+    API->>ANR: names_for_page(records, caller context)
+    ANR->>ANR: collect unmasked user-id actors, group by tenant, deduplicate
+    ANR->>NC: cache hits first (caller tenant, caller subject, actor)
+    NC-->>ANR: names found
+    Note over ANR,AM: one list_users id-set query per (tenant, chunk), at most 4 at once,<br/>under the remaining page deadline (at most 1 s)
+    ANR->>AM: round 1: list_users(ids) in the record's tenant, caller's own SecurityContext
+    ANR->>AM: round 2: list_users(unresolved ids) in the caller's tenant group,<br/>sequential, inside the same remaining budget
+    alt chunk answered
+        AM-->>ANR: users
+        ANR->>NC: keep the resolved names for this caller
+        Note over ANR: names filled
+    else actor refused or not found
+        AM-->>ANR: refused / not found
+        Note over ANR: actor_name null, not cached, no warn line
+    else chunk failed, timed out or budget hit
+        AM--xANR: error / no answer in time
+        Note over ANR: actor_name null for that chunk after round 2, one warn line (reason kind, id count),<br/>its actors stay unresolved for round 2 while budget remains, counter result=degraded
+    end
+    Note over ANR: A page mixes outcomes: resolved names are filled and cached,<br/>the rest read null, and any failed chunk makes the pass degraded
+    ANR-->>API: actor_name per record
+    API-->>Adm: 200 page (in every branch)
+```
 
 ### 4.7 Database schemas & tables
 
@@ -1805,7 +1913,7 @@ The gear-local audit store (§4.2 *Audit Emitter*). Append-only: no `UPDATE`, no
 | `declaration_key` | text | No | — | Denormalized from `resource` so the scoped query is an index lookup rather than a string match |
 | `tenant_id` | UUID | Yes | — | Scope as an id, matching `setting_values` (§4.1), and **`NULL` for a record about a definition** — a declaration or a category, which is platform-wide and sits at no scope. The rationale that makes platform scope the root tenant's id on `setting_values` (*Why the root tenant rather than `NULL`*, below) does not carry here: it turns on a scoped read having to **find** the row, and a definition's record is one no per-`(setting, scope)` read is looking for. Borrowing a tenant for it would have meant a Tenant Resolver lookup from inside the writing transaction, which is what stopped contributing gears from booting (§5.1) |
 | `operation` | text | No | — | Check: `create`, `change`, `revert`, `remove`, `clone`, `secret_use`, `stage` — the last for a secret staged ahead of the batch that commits it (§4.7 *Table `pending_secrets`*). The spellings are the stored and the wire form and are permanent once shipped: adding one is compatible (the check is widened by migration; readers treat the field as an open string set), renaming or removing one is breaking, and the service fails a read on a stored value it does not know rather than defaulting it — the same for `outcome` and `actor_classification` |
-| `actor` | text | No | — | Acting subject |
+| `actor` | text | No | — | Acting subject, one of three kinds: an administrator's subject id as a UUID string (classification `pii`); a contributing module's name (`public`); or the nil UUID for the platform's system context, which no write path produces today; should one appear, it is classified like any non-module actor (`pii`) and reads "System" in history only when unmasked, never looked up. The display name is not stored; the history read adds it as `actor_name` (§4.2 *Actor Name Resolver*) |
 | `actor_classification` | `DataClassification` | No | — | The actor identity is itself classified (§4.2 *Audit Emitter*) |
 | `pre_value` / `post_value` | JSONB | Yes | — | Masked before the record is built; a `secret`-classified value is never written in plaintext |
 | `outcome` | text | No | — | Check: `success`, `failure` |
@@ -1814,7 +1922,7 @@ The gear-local audit store (§4.2 *Audit Emitter*). Append-only: no `UPDATE`, no
 | `occurred_at` | `timestamptz` | No | current timestamp | |
 | `retain_until` | `timestamptz` | Yes | — | Retention horizon; `NULL` ⇒ the store's configured default (§4.2 *Audit Emitter*) |
 
-**Indexes:** `idx_audit_scoped` (`declaration_key`, `tenant_id`, `occurred_at DESC`) — serves the per-(setting, scope) history read directly, which is what makes its p95 a local index lookup rather than a cross-service call (§7); `idx_audit_retention` (`retain_until`) `WHERE retain_until IS NOT NULL` and `idx_audit_default_horizon` (`occurred_at`) `WHERE retain_until IS NULL`, for pruning — the second is the one nearly every record leaves by, so the daily pass reads a day's rows rather than the table. The pass deletes in bounded batches, each its own commit, capped per tick: a batch selects its ids through the horizon indexes and deletes them by primary key, since one `DELETE … WHERE id IN (subquery)` is planned by PostgreSQL as a scan of the whole table; a backlog after an outage clears over several ticks rather than in one long statement.
+**Indexes:** `idx_audit_scoped` (`declaration_key`, `tenant_id`, `occurred_at DESC`) — serves the per-(setting, scope) history read directly, which makes the audit query itself a local index lookup; the optional, budget-bounded actor-name lookup (§4.2 *Actor Name Resolver*) is the one cross-service call on that path; `idx_audit_retention` (`retain_until`) `WHERE retain_until IS NOT NULL` and `idx_audit_default_horizon` (`occurred_at`) `WHERE retain_until IS NULL`, for pruning — the second is the one nearly every record leaves by, so the daily pass reads a day's rows rather than the table. The pass deletes in bounded batches, each its own commit, capped per tick: a batch selects its ids through the horizon indexes and deletes them by primary key, since one `DELETE … WHERE id IN (subquery)` is planned by PostgreSQL as a scan of the whole table; a backlog after an outage clears over several ticks rather than in one long statement.
 
 **Invariants:** append-only in the mutation's own transaction — the record and the change it audits share one commit and cannot diverge (§4.2 *Audit Emitter*) — and append-only at the store: a trigger carried by the gear's migration refuses every `UPDATE`, and on PostgreSQL a `DELETE` while an explicit `retain_until` hold is in force or while the record is younger than the greater of the platform minimum of twelve months and the configured retention, which the gear writes into the one-row `settings_audit_policy`, seeded by a migration at the minimum and left in place by that migration's rollback, before every retention pass — a guard against a mistake in code, not against a privileged database writer, which is for database roles and R2's off-box copy; retention pruning of expired rows is the one delete the table sees. Rows are written through the same `AccessScope`-scoped path as every other write, so an audit row is never visible outside its tenant.
 
@@ -1959,7 +2067,7 @@ Three rules keep it reviewable:
 | Audit | Every mutation writes an immutable audit record (`cpt-cf-settings-service-fr-audit-mutations`). |
 | Secret confidentiality | `secret`-trait values are stored by reference in the Credential Store (the credstore backend); masked on every **administrative** read/search/list/audit path, with **no human reveal path**. Plaintext is returned only through the **machine-only** reader path (`resolve_secret`, §4.5), authorized per setting against the calling service and audited as a secret-use event; never cached in plaintext (§4.2 *Secret Manager*, *Cache & Invalidation*). |
 | File confidentiality | A `file-reference` value carries an id, never content, so nothing in this service masks or proxies a file — and nothing here checks it either. Access to the file is enforced entirely by `file-storage` on its own control and data planes, for every reader including the one that wrote the reference (§3 *Files*). |
-| Data classification | Every setting value carries `public` / `pii` / `secret` (§4.1). `pii` is unmasked only for a caller authorized for unmasked PII, and masked in every other administrative read and in audit/report output; `secret` has no human path at all. Search enforces the classes **before matching**: the classification predicate in the query keeps withheld content out of every match, count and snippet, whatever plan the planner picks. **Timing is guaranteed for `secret` only** — its content is absent from the searchable column altogether — since the split index predicates are an access path, not a barrier (§4.2 *Search*, §4.6). Audit actor identities are classified the same way (§4.2 *Audit Emitter*). |
+| Data classification | Every setting value carries `public` / `pii` / `secret` (§4.1). `pii` is unmasked only for a caller authorized for unmasked PII, and masked in every other administrative read and in audit/report output; `secret` has no human path at all. Search enforces the classes **before matching**: the classification predicate in the query keeps withheld content out of every match, count and snippet, whatever plan the planner picks. **Timing is guaranteed for `secret` only** — its content is absent from the searchable column altogether — since the split index predicates are an access path, not a barrier (§4.2 *Search*, §4.6). Audit actor identities are classified the same way (§4.2 *Audit Emitter*). A masked actor never gets a display name, and resolved names are cached per caller only (§4.2 *Actor Name Resolver*). The name is a transient read-side projection of the classified actor identity and falls under the same platform retention and privacy policy as the identity itself: never persisted — held only in the per-caller, 5-minute in-process cache (§4.2 *Actor Name Resolver*) — and never logged. |
 | Input validation | GTS type + trait validation on every value; Scope Class / overridability checks; scope-path validation; namespaced-key check for contributed declarations. |
 | Contributed-declaration protection | Module-contributed declarations are immutable to admins (values only). |
 | Optimistic concurrency | Every mutating call requires `If-Match`, so a concurrent edit fails `412` instead of overwriting (§4.2 *Value Writer*). |
@@ -2014,7 +2122,7 @@ The Settings Service is **supplied as a Constructor Fabric Gear** — a composab
 
 **`deps = [types_registry]`.** The one gear this service calls during its **own** init: registering the settings GTS schemas (Bootstrap, §4.8) is a real call, so types-registry must already be up. R2 adds `event_broker`, when the `tenant_deleted` subscription is taken out at init.
 
-**Everything else via `#[toolkit::consumes]`** — `authz-resolver` (`AuthZResolverClient`, with the SDK's `PolicyEnforcer` built over it), `tenant-resolver` (`TenantResolverClient`), `credstore` (`CredStoreClientV1`), `event-broker` (`EventBrokerApi`) in R1, and `simple-user-settings` (`SimpleUserSettingsClientV1`, the per-user mode preference — §4.3) plus `license-resolver` from R2. All are used on the **request** path, never during our init, so the client is resolved when first needed rather than eagerly. `consumes` wires it without an ordering edge, and — unlike simply omitting the name — keeps the dependency's `inventory::submit!` registration linked and registers a directory-resolving proxy in the out-of-process profiles. In R1, which is Embedded-only (§2.3), the wiring short-circuits to the co-located implementation and readiness flips immediately.
+**Everything else via `#[toolkit::consumes]`** — `authz-resolver` (`AuthZResolverClient`, with the SDK's `PolicyEnforcer` built over it), `tenant-resolver` (`TenantResolverClient`), `credstore` (`CredStoreClientV1`), `event-broker` (`EventBrokerApi`) in R1, `account-management` (`AccountManagementClient`, from `account-management-sdk` — optional at runtime: actor names on the history read, so a deployment without it reads every name as `null`), and `simple-user-settings` (`SimpleUserSettingsClientV1`, the per-user mode preference — §4.3) plus `license-resolver` from R2. All are used on the **request** path, never during our init, so the client is resolved when first needed rather than eagerly. `consumes` wires it without an ordering edge, and — unlike simply omitting the name — keeps the dependency's `inventory::submit!` registration linked and registers a directory-resolving proxy in the out-of-process profiles. In R1, which is Embedded-only (§2.3), the wiring short-circuits to the co-located implementation and readiness flips immediately.
 
 **Must be built first:** `license-resolver` — the gear is documentation only, there is no crate to depend on, and the platform implements licence validation at base-licence level with per-feature entitlement still pending. A platform **audit** gear exists under no name at all. R1 waits on neither (§2.3): licence gating ships in R2, and audit is a gear-local store written inside the mutation's own transaction (§4.2 *Audit Emitter*). **No IdP gear dependency** — the step-up re-authentication happens **browser ↔ IdP** (the apply request arrives already bearing a fresh token); the gear hands that token to the **platform's AuthN resolver** — fetched from `ClientHub` at first use, never during init, and deliberately not in `deps` — and reads its claims once the resolver has vouched for it (§4.2 *Value Writer*), so the IdP is not a per-write runtime dependency and the gear configures no key-set address at all. Step-up verification is a **`StepUpVerifier`** port this gear declares — default binding = the AuthN-resolver verifier (§4.2 *Value Writer*); a deployment may bind a non-OIDC or added-factor verifier **without gear code** — but never an always-satisfied one: the mechanism is pluggable, the requirement is not (§4.2 *Value Writer*). |
 | Capabilities | `db`, `rest`, `stateful` — the last for the one long-running task this gear owns, the managed-lifecycle tick that sweeps staged secrets nobody claimed (§4.7 *Table `pending_secrets`*) |
@@ -2101,6 +2209,7 @@ Decisions taken during design, with the alternative that was rejected and the re
 - **GTS Registry unavailable** — the Registry is on the **validate** path (resolving a setting's **value type** to check a value at write time; registering **value types**, and the setting's own type when its declaration is created, §4.7), not on the effective-value **read** hot path (values resolve from local tables) and not on setting listing (settings are DB rows, §4.3). If the Registry is slow or down: **creating a setting fails-closed** if its referenced value type cannot be resolved/validated or its own type cannot be registered; **setting a value also fails-closed**, since the value is validated against its value type via the Registry; value-type registration and gear reconcile **retry** with backoff idempotently; existing value reads and setting listing are unaffected. Validation verdicts MUST NOT be cached to "ride out" an outage, to avoid accepting values against a stale type.
 - **Audit availability bounds write availability — by design, and the coupling is narrower than it looks** — every mutation records its audit entry as its last, fail-closed step (§4.2 *Audit Emitter*), so a write is only as available as the audit sink. In R1 that sink is the gear's **own table in the mutation's own transaction** (§2.3): "audit store unavailable" means the gear's own database is unavailable, in which case the write could not commit either — there is no second dependency on the write path. R2 keeps the local record and enqueues it into ToolKit's transactional outbox, whose handler posts it onward, so the external audit subsystem's availability never bounds a write. A best-effort asynchronous record was considered and rejected: a mutation whose audit entry may be lost is not an audited mutation (`cpt-cf-settings-service-fr-audit-mutations`).
 - **Deadline and retry of the fail-closed dependency calls** — every AuthN Resolver, AuthZ Resolver (PEP) and credstore call this gear makes is a **single in-process `ClientHub` call** under the API gateway's request deadline (about 30 s), which ToolKit owns and gears are told not to duplicate with transport middleware of their own. There is **no retry and no backoff** in this gear: each call is one shot, and a dependency that does not answer in time fails the request closed (§4.2 *Value Writer*, *Secret Manager*; PRD §Actors). A remote binding's transport timeout belongs to the wiring and to the callee's own client, not to this document — a number here would be an unenforceable copy of a setting that lives elsewhere.
+- **Account Management for actor names** — the history read's name lookup is a single-shot call to AM with no retry and deliberately no circuit breaker or negative cache; its cost is bounded per page (≤ 1 s, 4 chunks) but not process-wide, and a cached name may outlive a visibility change or an erasure in AM by up to 5 minutes (§4.2 *Actor Name Resolver*). A slow or absent AM degrades names to `null` and never fails the read.
 - **Secret storage model — OPEN** — credential store (the credstore backend) by reference vs. inline envelope encryption in the persistence layer (§4.2 *Secret Manager*). The credstore approach is the working choice for stronger isolation and reuse of the existing deployment; confirm with persistence/security owners.
 
 ## 6. Open Questions
@@ -2111,6 +2220,8 @@ Decisions taken during design, with the alternative that was rejected and the re
 
 ### 6.2 Design-Specific Questions
 
+- **Descendant user listing in Account Management — OPEN.** Whether Account Management lets an ancestor administrator list a descendant tenant's users is not settled (§4.2 *Actor Name Resolver*). If it does not, descendant actor names read `null` and nothing leaks. Owner: Account Management.
+- **PRD amendment for actor names — RESOLVED.** The PRD now requires the display name on the history read (`cpt-cf-settings-service-fr-audit-mutations`, §5.7, with the §9 acceptance criterion) and declares Account Management an optional system actor and dependency (`cpt-cf-settings-service-actor-account-management`, §2.2 and §10).
 - **Atomic commit of a group of interdependent settings — OPEN (external requirement).** The write model (§4.2 *Value Writer*) commits **per change**: each change lands in its own transaction, a failed one stores nothing, and already-committed ones stay committed. The gears PRD requirement `cpt-cf-settings-service-fr-dependency-group-declaration` introduces a **Dependency Group** — a declared set of interdependent settings with a cross-setting constraint over their combined values, set all-or-nothing, with the **resulting configuration** of the scope validated before commit. **No pair of settings with such an invariant has been identified in the platform** — neither the PRD nor any story states such a requirement — so the mechanism is **deferred rather than designed**: the PRD carries the requirement at `p3`, in scope, and it will be specified once product confirms concrete setting pairs. What must be settled if product confirms the requirement: (a) the concrete setting pairs that need the invariant, without which there is nothing to specify a constraint language against; (b) the representation of the constraint itself (expression language / JSON Schema over a tuple / a GTS type) and its validation at declaration time; (c) the atomicity boundary — one Postgres transaction covers inline values only, while a group containing a `secret`-classified setting also touches the Credential Store and cannot be atomic in general (§4.2 *Secret Manager*); (d) whether a group may span admin-authored and contributed settings, and settings of different gears; (e) behaviour when a member override is flagged `needs_review` (it is excluded from resolution, so the whole group becomes inapplicable — §4.2 *Value Resolver*). This is phasing, not divergence: the requirement stands at `p3` and the items above are its design agenda. Note that (c) and (e) are substantive limits rather than gaps to be filled — a group spanning a `secret`-classified setting cannot be made atomic by any schema or contract change, and group membership interacts with `needs_review` exclusion by construction — so whatever is specified later will have to live with both.
 - **No `StepUpVerifier` binding exists yet — RESOLVED.** The binding ships with the value write path (`infra/step_up.rs`): the platform's AuthN resolver authenticates the presented token, and the gear checks `sub`, `auth_time` and `acr`/`amr` on the token it vouched for. A deployment configures at most the freshness window and the issuer/audience pins; with no `step_up` section the verifier is bound with the defaults, and there is no bypass flag by design. What remains outside this gear is an IdP that emits `auth_time`/`acr`/`amr` and the admin console's redirect on the challenge.
 - **Verified caller identity for the SDK traits — DECIDED for R2, not open.** The machine-only plaintext path (§4.2 *Secret Manager* `resolve_plaintext`, §4.5 `resolve_secret`) authorizes the calling service **per setting** and attributes a **secret-use** audit record to it, and `register_declarations` / `retire_declarations` take `owner_module` on trust. Both want an identity the caller cannot choose for itself. What that means differs by binding, and conflating the two is what made this look open. **In-process there is nothing to verify**: an `Arc<dyn Trait>` call carries no caller, and whoever reached `ClientHub` already shares the address space — the process is the boundary (§4.8). **Out-of-process the identity exists and is specified**: the platform's accepted two-plane ADR carries a `SecurityContext` from a user or **S2S client-credentials** JWT with per-hop re-validation, and `AuthNResolverClient::exchange_client_credentials` is on the public trait today. The remaining work is this gear's own — require that context on both traits and bind `owner_module` to its verified `subject_id` rather than accepting a string — and it is scoped to R2, which is where the remote binding is first allowed (§2.3, §4.8). Until then R1 fails at startup on a remote `client_wiring`, so the gap cannot be reached by configuration. What stays genuinely undecided is narrower: **which** identity the per-setting `resolve_secret` check authorizes against, since a verified `subject_id` is a service principal rather than a module name, and the mapping between the two is not written anywhere yet. Owner: this design, with the platform AuthN model as given; resolve before these traits are bound outside the host process.
@@ -2128,13 +2239,15 @@ All metrics exposed as Prometheus scrape targets.
 |--------|--------|------|--------|-------------|------------------|
 | **Efficiency** | `settings_changes_committed_total` | Counter | `change_type`, `outcome` | Changes committed, by type and outcome | — |
 | **Performance** | `settings_effective_read_duration_seconds` | Histogram | `source` (`cache`,`resolve`), `scope_class` | Effective-value read latency (hot path) | cache p95 ≤ 2ms |
-| **Performance** | `settings_rest_request_duration_seconds` | Histogram | `method`, `endpoint`, `status_code` | REST API request latency | p95 ≤ 50ms |
+| **Performance** | `settings_rest_request_duration_seconds` | Histogram | `method`, `endpoint`, `status_code` | REST API request latency; covers the effective-value and mutating routes, `GET …/history` falls under the "Scoped audit query (p95)" row (≤ 2 s) | p95 ≤ 50ms |
 | **Performance** | `settings_cache_hit_ratio` | Gauge | `scope_class` | Effective-value cache hit ratio | ≥ 0.95 |
 | **Reliability** | `settings_service_up` | Gauge | `instance` | Liveness; availability SLO computed externally over 30 days (§7 *NFR Mapping & Scale Model*) | — |
 | **Reliability** | `settings_value_writes_total` | Counter | `result` (`stored`,`rejected`) | Per-change write outcomes; rejections feed durable notifications | — |
 | **Reliability** | `settings_value_write_failure_ratio` | Gauge | — | Write failure rate, derived from `settings_value_writes_total` — the **aggregate operator-facing** signal, distinct from the per-administrator `event_value_change_failed` notification. Published to the shared platform dashboards with an **alert-routing rule** for platform-wide failure conditions (e.g. a bad value-type rollout failing writes across many unrelated admins and scopes), which a per-admin notification cannot surface | alert on sustained > 1% |
 | **Security** | `settings_audit_events_total` | Counter | `kind` (`mutation`,`secret_use`) | Audit volume emitted by this service — capacity tracking against the declared annual bound (§7 *NFR Mapping & Scale Model*) | — |
 | **Reliability** | `settings_needs_review_total` | Gauge | `source` (`admin_authored`,`module_contributed`) | Overrides flagged `needs_review` awaiting an admin fix (stuck-needs-review detector, §4.2 *Value Resolver*/§4.7). A flagged override falls through on read without an error, so this is the operator's signal; refreshed once a minute by the gear's lifecycle, every source published each time, zero included, so a fixed backlog reads zero. Which settings and scopes are affected is the needs-review listing's to show (§4.3) | — |
+| **Reliability** | `settings_actor_name_lookups_total` | Counter | `result` (`ok` = every chunk answered inside the budget, refused or not-found included; `degraded` = a chunk errored, timed out, or hit a paging or query failure; `skipped` = no lookup made) | Actor-name lookup passes on the history read, one per pass; carries no actor identifiers (§4.2 *Actor Name Resolver*) | — |
+| **Performance** | `settings_actor_name_lookup_duration_seconds` | Histogram | `result` (same values as the counter) | Duration of one actor-name lookup pass | p95 ≤ 1 s |
 | **Reliability** | `settings_audit_retention_passes_total` | Counter | `result` (`ok`,`failed`) | Daily audit retention passes (§4.7 `audit_records`). A failed pass and one with nothing to prune both delete nothing; this tells them apart — alert on `failed`, or on no `ok` for two days | — |
 | **Reliability** | `settings_audit_records_pruned_total` | Counter | — | Audit records deleted past their retention horizon | — |
 | **Reliability** | `settings_resolve_failures_total` | Counter | `reason` (`unavailable`) | Reader resolve failures — surfaces consumer-visible degradation (§4.5). `needs_review` is not a resolve failure — it falls through (§4.2 *Value Resolver*). | — |
@@ -2150,14 +2263,14 @@ All metrics exposed as Prometheus scrape targets.
 |-----|--------|--------|-------------|
 | Effective-value read — cache hit (p95) | ≤ 2 ms | `cpt-cf-settings-service-nfr-performance-read-cache` | `settings_effective_read_duration_seconds{source="cache"}`; in-process reader hot path |
 | Effective-value read — cache miss/resolve (p95) | ≤ 15 ms | `cpt-cf-settings-service-nfr-performance-read-cache` | Same histogram `source="resolve"`; ancestry walk + DB read |
-| REST API latency (p95 / p99) | ≤ 50 ms / ≤ 100 ms | `cpt-cf-settings-service-nfr-performance-read-cache` | `settings_rest_request_duration_seconds` |
+| REST API latency (p95 / p99) | ≤ 50 ms / ≤ 100 ms | `cpt-cf-settings-service-nfr-performance-read-cache` | `settings_rest_request_duration_seconds`; covers the effective-value and mutating routes. `GET …/history` is governed by the "Scoped audit query (p95)" row (≤ 2 s, including the actor-name lookup) |
 | Cache hit ratio | ≥ 0.95 | `cpt-cf-settings-service-nfr-performance-read-cache` | `settings_cache_hit_ratio`; invalidation only on change |
 | Write success | ≥ 99.9% of value writes | `cpt-cf-settings-service-nfr-reliability-validated-set` | `settings_value_writes_total`; a rejected change is resubmittable |
 | Availability | 99.95% over rolling 30-day window | `cpt-cf-settings-service-nfr-reliability-validated-set` | Aggregated `settings_service_up`; PostgreSQL HA + service replicas |
 | Change-failure alerting | A platform-wide change-failure condition raises an alert | `cpt-cf-settings-service-nfr-reliability-validated-set` | `settings_value_write_failure_ratio` on the shared platform dashboards + an alert-routing rule (§7 *Feature Metrics*) — aggregate, not per-administrator |
 | Audit volume | ≥ 50,000,000 audit events per **platform instance** per year (aggregate) | `cpt-cf-settings-service-fr-audit-mutations` | `settings_audit_events_total`; capacity per §7 *NFR Mapping & Scale Model*. **Requirement on the platform Audit Subsystem**, which owns the store — this service emits and must not be throttled by it |
 | Audit online retention | ≥ 12 months, configurable | `cpt-cf-settings-service-fr-audit-mutations` | Enforced by this gear over `audit_records` (§4.7): each record carries `retain_until`, absent one the configured default applies, and pruning runs over `idx_audit_retention`. Once records are shipped (R2) the platform's own retention and anonymization policy governs the copy held there (§4.2 *Audit Emitter*) |
-| Scoped audit query (p95) | ≤ 2 s over the online window | `cpt-cf-settings-service-fr-audit-mutations` | `GET /settings-service/v1/settings/{key}/history` (§4.3) — a read-through, so the bound is a **requirement on the Audit Subsystem query API**, confirmed with the Audit team alongside the exact-match `resource` filter |
+| Scoped audit query (p95) | ≤ 2 s over the online window | `cpt-cf-settings-service-fr-audit-mutations` | `GET /settings-service/v1/settings/{key}/history` (§4.3) — served from the gear's own `audit_records` on `idx_audit_scoped` (§4.3, §4.7), budgeted ≤ 1 s p95 for the query plus ≤ 1 s for the optional actor-name lookup, bounded by the remaining page deadline (§4.2 *Actor Name Resolver*) |
 | Scope isolation | Zero cross-tenant / cross-scope leaks | `cpt-cf-settings-service-fr-tenant-scope-enforcement`, `cpt-cf-settings-service-nfr-scope-isolation` | Server-side scope enforcement; verified by integration + E2E isolation tests (§7 *Testing Architecture*) |
 | Secret confidentiality | Zero plaintext on any administrative/human path (read/search/list/audit); plaintext only via the machine-only reader path | `cpt-cf-settings-service-fr-typed-value-validation`, `cpt-cf-settings-service-nfr-performance-read-cache` | Masking on every administrative path; credential-store storage; **100%** of machine plaintext resolutions audited as secret-use (§4.2 *Secret Manager*); verified by API/E2E secret tests (§7 *Testing Architecture*) |
 
@@ -2320,6 +2433,7 @@ The targets above are validated against these order-of-magnitude bounds. They ar
 | Audit sink | `MockAuditSink` | Capture audit records to assert mutations are audited |
 | GTS Registry | `MockGtsValidator` | Deterministic type validation |
 | Tenant Resolver | `MockTenantResolver` | Deterministic ancestry |
+| `AccountManagementClient` | `MockAccountManagementClient` (answers by id; counts calls; variants: absent from ClientHub, erroring, slow past the budget) | Deterministic name resolution without AM |
 | IdP step-up | `MockStepUpVerifier` (pass/fail) | Exercise step-up gating on a value write and on the behavior-affecting declaration actions retire/reactivate (§4.2 *Declaration Management*, *Value Writer*) |
 | Step-up verifier is a resolved binding | two `MockStepUpVerifier` instances standing in for different mechanisms | The verifier is ClientHub-resolved rather than hard-coded — swapping the binding changes **which** check runs, and the write is refused whenever the bound verifier rejects, whichever one is bound. No binding that always succeeds is exercised as a supported configuration: the requirement is not deployment-optional (§4.2 *Value Writer*) |
 | Credential Store | `MockSecretManager` | Deterministic store/mask/resolve without the credstore backend |
@@ -2365,6 +2479,21 @@ The targets above are validated against these order-of-magnitude bounds. They ar
 | Licence/feature gating across read paths | `GET /settings-service/v1/settings/{key}`, `GET /settings-service/v1/search`, `GET /settings-service/v1/categories`, `GET /settings-service/v1/declarations` | Un-entitled caller (`MockLicenseResolverApi` deny) gets gated setting/category excluded on every read/search/list path; fail-closed on decision error (`cpt-cf-settings-service-fr-feature-license-gating`) |
 | Domain-affinity filtering | `GET /settings-service/v1/categories`, `GET /settings-service/v1/declarations` | Results filtered to the admin's current domain; cross-domain hidden; platform-admin "All domains" view returns all |
 | Audit written on every mutation | `POST`/`PATCH`/`PUT`/`DELETE` | Each mutating call writes an audit record (actor, target, pre/post masked, request id) captured via `MockAuditSink` (`cpt-cf-settings-service-fr-audit-mutations`) |
+| History page names its actors | a history page of records by several users, one of them repeated | One lookup pass per page: one id-set query per (tenant, chunk), over the deduplicated ids; each record carries the user's name in `actor_name` (`cpt-cf-settings-service-fr-audit-mutations`) |
+| Masked actor reads `null` | a history page for a caller not entitled to unmasked PII | `actor_masked` is true and `actor_name` is `null`; no lookup is made for that actor |
+| Module actor reads `null` | a record written by a contributing module | `actor` is the module name and `actor_name` is `null`; no lookup is made |
+| Nil id reads "System" | a record whose actor is the nil id (unmasked caller) | `actor_name` is `"System"`; no lookup is made |
+| Account Management absent or failing | no client in `ClientHub`; a client that errors; a client that outlasts the budget | `200` with every `actor_name` `null`; the page returns within the budget |
+| Ancestor administrator reads a descendant scope's history | a descendant scope's records written by its administrator, and one written by an ancestor administrator; read by the ancestor, then by the descendant administrator | The ancestor gets the descendant administrators' names; the descendant administrator reads `null` for the ancestor's record. For a record in the descendant scope that an ancestor administrator wrote, the ancestor reader gets that administrator's name from the caller's-tenant round. The `MockAccountManagementClient` answers per tenant and records that the caller's-tenant query carries only the ids the record-tenant query left unresolved; a lookup that uses only the record's tenant, or re-sends resolved ids, fails the scenario |
+| Large page is read in chunks | more than 200 distinct actors on one page | Read in chunks of 200, at most 4 at once |
+| Lookup outlasts the budget | a client slower than the 1 s budget | Unresolved names are `null`, the resolved ones are set |
+| Cache is bounded | more than 10,000 distinct names | The cache holds at most 10,000 names; a full cache drops expired names, then all |
+| A context without a subject keeps nothing in the cache (defensive guard) | a context with no real subject reads a page | No AM call is made, names are `null`, nothing is cached, `result=skipped` |
+| Name fallback order | a user with a display name; one with only first and last; one with only a username; one with all blank | Display name, then first and last, then username; blank values are skipped; all blank reads `null` |
+| Definition record is looked up in the caller's tenant | a definition record (no `tenant_id`) by a user id | The lookup asks AM in the caller's own tenant |
+| Degraded chunk logs no identity | a chunk that fails | One warn line with the reason kind and the id count; no id and no profile text |
+| Cached name is per caller | the same actor read twice by one caller, then by another caller | The second read of the first caller makes no lookup; the other caller makes its own |
+| Refused or absent name is not cached | a lookup refused or finding no user, then the user becoming visible | The next read looks up again and shows the name |
 | Mode never filters | a category holding both `standard` and `advanced` settings | Browse and search return every setting with its `mode`; no request parameter changes the set (`cpt-cf-settings-service-fr-standard-advanced-mode`) |
 | History per setting/scope | `GET /settings-service/v1/settings/{key}/history` | Pre/post values returned (`cpt-cf-settings-service-fr-audit-mutations`) |
 | AuthZ deny / unauthenticated | any | `403` / `401` |
@@ -2419,6 +2548,7 @@ Concurrent writes to the same setting and scope exist. Tests:
 | Cache hit ratio ≥ 0.95 | `cpt-cf-settings-service-nfr-performance-read-cache` | Integration | Invalidation only on a write; assert ratio over a read workload |
 | Write success ≥ 99.9% | `cpt-cf-settings-service-nfr-reliability-validated-set` | API + E2E | Write outcome counters; rejection and stale-write paths |
 | Availability 99.95% | `cpt-cf-settings-service-nfr-reliability-validated-set` | Ops / runtime | Aggregated `settings_service_up`; HA validated operationally |
+| History p95 ≤ 2 s | `cpt-cf-settings-service-nfr-scale-growth` | API + load test | History page timed with a healthy AM and with a slow AM (mock client that outlasts the budget; lookup ≤ 1 s, bounded by the remaining page deadline): stays ≤ 2 s and names degrade to `null` |
 | Scope isolation — zero leaks | `cpt-cf-settings-service-fr-tenant-scope-enforcement`, `cpt-cf-settings-service-nfr-scope-isolation` | Integration + E2E | DB isolation tests + cross-tenant E2E scenarios |
 
 ## 8. Traceability

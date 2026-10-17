@@ -930,14 +930,15 @@ coverage-cluster-k8s:
 test-rg-pg: install-tools
 	$(call nextest_run,rg-pg,-p cf-gears-resource-group --features integration)
 
-## Run the settings-service gear's PostgreSQL migration suite (Docker required;
+## Run the settings-service gear's PostgreSQL suites: the migration chain and the
+## refused category delete (Docker required;
 ## spins up its own postgres container via testcontainers -- see
 ## gears/settings-service/settings-service/tests/pg_migrations_test.rs). The
 ## suites beside the gear's migrations run on SQLite, where a statement
 ## PostgreSQL refuses can still pass; this lane runs the chain a stand's startup
 ## runs, on the backend it runs it on.
 test-settings-service-pg: install-tools
-	$(call nextest_run,settings-service-pg,-p cf-gears-settings-service --features integration --test pg_migrations_test)
+	$(call nextest_run,settings-service-pg,-p cf-gears-settings-service --features integration --test pg_migrations_test --test pg_category_delete_test)
 
 ## Run bss-pricing's Postgres tier (Docker required; each suite spins up its own
 ## postgres container via testcontainers).

@@ -144,3 +144,7 @@ mod declaration_surface_tests;
 #[cfg(test)]
 #[path = "value_surface_tests.rs"]
 mod value_surface_tests;
+
+#[cfg(test)]
+#[path = "history_actor_names_tests.rs"]
+mod history_actor_names_tests;

@@ -391,6 +391,9 @@ pub struct AuditRecordDto {
     pub actor: String,
     /// Whether `actor` carries the mask token.
     pub actor_masked: bool,
+    /// The actor's current name, `"System"` for the nil id, or `null` when the
+    /// actor is masked, a module, or no name could be had.
+    pub actor_name: Option<String>,
     /// The value before, as recorded; a secret was recorded masked.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pre_value: Option<Value>,
@@ -458,6 +461,7 @@ pub fn render_record(
             record.actor.clone()
         },
         actor_masked,
+        actor_name: None,
         pre_value: recorded(record.pre_image.as_ref(), values_are_pii, may_read_pii),
         post_value: recorded(record.post_image.as_ref(), values_are_pii, may_read_pii),
         values_masked,

@@ -228,6 +228,22 @@ pub trait LifecycleMetrics: Send + Sync {
     fn retention_pass(&self, result: &'static str, pruned: u64);
 }
 
+/// What the actor name lookup of a history page reports.
+pub trait ActorNameMetrics: Send + Sync {
+    /// One lookup pass: `settings_actor_name_lookups_total` and
+    /// `settings_actor_name_lookup_duration_seconds` by `result` (`ok`,
+    /// `degraded` or `skipped`). No actor identifier is ever a label.
+    fn pass(&self, result: &'static str, duration: std::time::Duration);
+}
+
+/// Reports nothing; the test binding.
+#[domain_model]
+pub struct NoActorNameMetrics;
+
+impl ActorNameMetrics for NoActorNameMetrics {
+    fn pass(&self, _result: &'static str, _duration: std::time::Duration) {}
+}
+
 /// Counts nothing; the test binding.
 #[domain_model]
 pub struct NoMetrics;

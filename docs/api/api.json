@@ -968,6 +968,13 @@
             "description": "Whether `actor` carries the mask token.",
             "type": "boolean"
           },
+          "actor_name": {
+            "description": "The actor's current name, `\"System\"` for the nil id, or `null` when the\nactor is masked, a module, or no name could be had.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "change_set_id": {
             "description": "The change set the mutation was produced under.",
             "format": "uuid",

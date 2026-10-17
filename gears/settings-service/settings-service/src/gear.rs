@@ -64,6 +64,7 @@ pub struct SettingsService {
     config: OnceLock<Arc<SettingsServiceConfig>>,
     db: OnceLock<Arc<DBProvider<DbError>>>,
     enforcer: OnceLock<Arc<PolicyEnforcer>>,
+    names: OnceLock<Arc<crate::infra::actor_names::ActorNameResolver>>,
     types: OnceLock<Arc<dyn TypesRegistryClient>>,
     validator: OnceLock<Arc<dyn TypeValidator>>,
     categories: OnceLock<
@@ -95,6 +96,7 @@ impl Default for SettingsService {
             config: OnceLock::new(),
             db: OnceLock::new(),
             enforcer: OnceLock::new(),
+            names: OnceLock::new(),
             types: OnceLock::new(),
             validator: OnceLock::new(),
             categories: OnceLock::new(),
@@ -410,6 +412,17 @@ impl SettingsService {
             .ok_or_else(|| anyhow::anyhow!("{} gear not initialized", Self::MODULE_NAME))
     }
 
+    /// The actor name resolver, once initialization has run.
+    ///
+    /// # Errors
+    /// Returns an error when called before [`Gear::init`].
+    pub fn names(&self) -> anyhow::Result<Arc<crate::infra::actor_names::ActorNameResolver>> {
+        self.names
+            .get()
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("{} gear not initialized", Self::MODULE_NAME))
+    }
+
     /// The GTS types registry, once initialization has run.
     ///
     /// A declaration's value type lives in the registry, not here: the read
@@ -545,6 +558,15 @@ impl Gear for SettingsService {
         let hub = ctx.client_hub();
         self.enforcer
             .set(Arc::new(PolicyEnforcer::from_hub(Arc::clone(&hub))))
+            .map_err(|_| anyhow::anyhow!("{} gear already initialized", Self::MODULE_NAME))?;
+        // Actor names on the history read: AM is found in the hub at each pass.
+        self.names
+            .set(Arc::new(
+                crate::infra::actor_names::ActorNameResolver::from_hub(
+                    Arc::clone(&hub),
+                    Arc::new(crate::infra::actor_name_metrics::OtelActorNameMetrics::new()),
+                ),
+            ))
             .map_err(|_| anyhow::anyhow!("{} gear already initialized", Self::MODULE_NAME))?;
         let platform_scope: Arc<dyn PlatformScope> =
             Arc::new(crate::infra::platform_scope::HubPlatformScope::new(hub));
@@ -799,6 +821,7 @@ impl RestApiCapability for SettingsService {
             self.resolver()?,
             self.db()?,
             self.enforcer()?,
+            self.names()?,
         );
         let router = crate::api::rest::value_routes::register_routes(
             router,
