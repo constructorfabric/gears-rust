@@ -260,7 +260,7 @@ batch-debit feature's `mode = independent` rejection untouched.
 - API: `POST /v1/quota-enforcement/quotas`, `PATCH /v1/quota-enforcement/quotas/{id}` (acceptance of `type = rate`;
   no new route)
 - DB: `cpt-cf-quota-enforcement-db-schema` (`quotas` optional `rate_spec` field)
-- Entities: `Quota`, `QuotaDraft`, `QuotaPatch`
+- Entities: `Quota`, `QuotaDraft`, `QuotaUpdate`, `QuotaPatch`
 
 ### Rate Admission through the Orchestrator
 

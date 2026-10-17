@@ -15,38 +15,89 @@
 //! Singleton coordination for the sweepers is not a contract of this SDK: the
 //! gear consumes the platform `cluster` gear's leader election (ADR-0006).
 //!
-//! The manager client trait ([`QuotaManagerClientV1`]) carries the Quota
-//! lifecycle; the consumer and operator traits land with their features.
+//! Three client contracts serve callers, in process or over REST ([`rest`]):
+//! [`QuotaManagerApi`] (Quota lifecycle and credit), [`QuotaEnforcementApi`]
+//! (consumption, leases, snapshots) and [`QuotaOperatorApi`] (policies).
 //!
 //! Enable the `test-util` feature for a complete in-memory double of the
 //! storage contract in [`testing`].
 #![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 
+pub mod bulk;
 pub mod client;
+pub mod engine;
 pub mod gts;
 pub mod models;
+pub mod notifications;
+pub mod period;
+pub mod rest;
 pub mod storage_plugin;
+pub mod thresholds;
 
 #[cfg(feature = "test-util")]
 pub mod testing;
 
-pub use client::{QuotaEnforcementError, QuotaManagerClientV1};
+pub use bulk::{
+    BulkCreateEntry, BulkCreateEnvelope, BulkCreateItem, BulkCreateQuotasRequest, BulkCreated,
+    BulkCreatedItem, BulkDeactivateEntry, BulkDeactivateEnvelope, BulkDeactivateItem,
+    BulkDeactivateQuotasRequest, BulkDeactivated, BulkDeactivatedItem, BulkRecord, BulkUpdateEntry,
+    BulkUpdateEnvelope, BulkUpdateItem, BulkUpdateQuotasRequest, BulkUpdated, BulkUpdatedItem,
+};
+pub use client::{
+    DeletePolicyRequest, ListPolicyVersionsRequest, QuotaEnforcementApi, QuotaEnforcementError,
+    QuotaManagerApi, QuotaOperatorApi, ReadPolicyRequest, ReadQuotasRequest, RollbackPolicyRequest,
+    UpdatePolicyRequest, UpdateQuotaRequest, quota_enforcement_api_ir, quota_manager_api_ir,
+    quota_operator_api_ir,
+};
+pub use engine::{
+    EngineConfigError, EngineError, EngineValidationInput, EnvironmentInputs, EvaluationBudget,
+    EvaluationContext, EvaluationFailure, EvaluationMeter, EvaluationOutcome, EvaluationQuota,
+    MetricEnvironmentSchema, PolicySchemaSnapshot, QuotaResolutionEngineV1, QuotaScopeTier,
+    ValidatedConfig,
+};
 pub use gts::{
     CONSTRAINT_BASE, LEASE_RESOURCE, METRIC_BASE_TYPE, OPERATION_RESOURCE, OwnedDefinition,
-    POLICY_RESOURCE, QUOTA_RESOURCE, QuotaEnforcementStoragePluginSpecV1, REQUEST_BASE,
-    RESOURCE_BASE, SCOPE_TENANT, SCOPE_TYPE, SCOPE_USER, SUBJECT_BASE, owned_definitions,
+    POLICY_RESOURCE, QUOTA_RESOURCE, QuotaEnforcementStoragePluginSpecV1,
+    QuotaNotificationSinkSpecV1, REQUEST_BASE, RESOURCE_BASE, SCOPE_TENANT, SCOPE_TYPE, SCOPE_USER,
+    SUBJECT_BASE, owned_definitions,
 };
 pub use models::{
-    ActiveQuotaCounts, ApplicableQuotas, BatchDebitItem, BootstrapBundle, CapPatch, ConfigDefaults,
-    ContractRef, CounterSnapshot, DeactivateOutcome, DebitPlan, Decision, DecisionResult,
-    EnforcementMode, EvaluationAttribution, EventId, ExpiredLease, IdempotencyRecord,
-    IdempotencyScope, IdempotencySubjectKey, IdempotencyWrite, LeaseHold, LeaseState, LeaseToken,
-    MetricId, MetricKind, MutationResult, NotificationEvent, NotificationEventKind, OperationType,
-    PageRequest, PageResult, PayloadHash, PeriodId, PeriodType, PeriodWindow, PolicyDraft,
-    PolicyId, PolicyScope, PolicyUpdate, PolicyVersion, PolicyVersionMeta, PolicyVersionState,
+    AcquireLeaseOutcome, AcquireLeaseRequest, ActiveQuotaCounts, ApplicableQuotas, AppliedMutation,
+    ApportionError, AttributionDigest, BatchDebitItem, BatchDebitRequest, BatchDecision,
+    BatchItemOutcome, BatchItemRequest, BatchMode, BatchRecord, BatchResult, BootstrapBundle,
+    CapPatch, CommitLeaseRequest, ConfigDefaults, ContractRef, CounterSnapshot, CreditRequest,
+    DECISION_BLOB_VERSION, DeactivateOutcome, DebitPlan, DebitRequest, Decision, DecisionPreview,
+    DecisionResult, EnforcementMode, EvaluatedDebit, EvaluatedLease, EvaluationAttribution,
+    EventId, ExpiredLease, IdempotencyRecord, IdempotencyScope, IdempotencySubjectKey,
+    IdempotencyWrite, LeaseHold, LeaseState, LeaseToken, MetricId, MetricKind, MutationResult,
+    NO_APPLICABLE_QUOTA, NotificationEvent, NotificationEventKind, NotificationScope,
+    OperationType, PageRequest, PageResult, PartialIdempotencyWrite, PayloadHash, PeriodId,
+    PeriodType, PeriodWindow, PolicyDraft, PolicyId, PolicyPatch, PolicyScope, PolicySpec,
+    PolicyUpdate, PolicyVersion, PolicyVersionMeta, PolicyVersionState, PreviewRequest,
     ProjectionBinding, Quota, QuotaDebitPlan, QuotaDraft, QuotaFilter, QuotaId, QuotaPatch,
-    QuotaSnapshot, QuotaSource, QuotaSpec, QuotaStatus, QuotaType, QuotaView, ResourceProjection,
-    ScopeError, SubjectClaim, SubjectRef, SubjectScope, TenantId, ThresholdCrossing, UnknownValue,
-    ValidityWindow, ValidityWindowPatch,
+    QuotaSnapshot, QuotaSource, QuotaSpec, QuotaStatus, QuotaType, QuotaUpdate, QuotaView,
+    ReleaseLeaseRequest, ResourceProjection, Retention, RollbackRequest, RollbackTarget,
+    RollbackableOperation, ScopeError, SnapshotRequest, SnapshotSubject, SubjectClaim, SubjectRef,
+    SubjectScope, TenantId, ThresholdCrossing, TransitionOutcome, UnknownValue, ValidityWindow,
+    ValidityWindowPatch, apportion, positive_amount,
 };
-pub use storage_plugin::{CONTRACT_MAJOR, QuotaEnforcementStoragePluginV1, StorageError};
+pub use notifications::{
+    DeliveryOutcome, DispatchError, NotificationDeliveryHandle, NotificationDeliveryV1, QuotaEvent,
+    QuotaNotificationSinkV1,
+};
+pub use rest::{
+    QuotaEnforcementApiRest, QuotaManagerApiRest, QuotaOperatorApiRest,
+    quota_enforcement_api_rest_http_binding, quota_manager_api_rest_http_binding,
+    quota_operator_api_rest_http_binding,
+};
+#[cfg(feature = "rest-client")]
+pub use rest::{
+    QuotaEnforcementApiRestClient, QuotaEnforcementApiRestResolvingClient,
+    QuotaManagerApiRestClient, QuotaManagerApiRestResolvingClient, QuotaOperatorApiRestClient,
+    QuotaOperatorApiRestResolvingClient,
+};
+pub use storage_plugin::{
+    BatchEntry, BatchTimer, CONTRACT_MAJOR, EvaluatedBatch, EvaluatedMutation,
+    QuotaEnforcementStoragePluginV1, StorageError,
+};
+pub use thresholds::threshold_crossings;

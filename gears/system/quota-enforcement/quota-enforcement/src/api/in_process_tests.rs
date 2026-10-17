@@ -6,8 +6,8 @@ use authz_resolver_sdk::PolicyEnforcer;
 use gts::GtsTypeId;
 use quota_enforcement_sdk::testing::InMemoryStorage;
 use quota_enforcement_sdk::{
-    EnforcementMode, MetricId, PageRequest, PeriodType, QuotaFilter, QuotaManagerClientV1,
-    QuotaPatch, QuotaSource, QuotaSpec, QuotaStatus, QuotaType, SubjectRef,
+    EnforcementMode, MetricId, PageRequest, PeriodType, QuotaFilter, QuotaManagerApi, QuotaSource,
+    QuotaSpec, QuotaStatus, QuotaType, QuotaUpdate, SubjectRef,
 };
 use serde_json::json;
 use toolkit_canonical_errors::{CanonicalError, Problem};
@@ -16,7 +16,7 @@ use super::InProcessQuotaManager;
 use crate::domain::Service;
 use crate::domain::admission::Admission;
 use crate::domain::bootstrap::Bound;
-use crate::domain::catalog::{CatalogBuilder, CatalogConfig};
+use crate::domain::catalog::{CatalogBuilder, CatalogConfig, MetricClassifications};
 use crate::domain::quotas::QuotaLimits;
 use crate::domain::readiness::Readiness;
 use crate::test_support::{
@@ -52,8 +52,12 @@ fn spec() -> QuotaSpec {
 }
 
 fn unbound_service() -> Arc<Service> {
+    unbound_service_with(Arc::new(PermitTenantsPdp::new(vec![tenant().as_uuid()])))
+}
+
+fn unbound_service_with(pdp: Arc<dyn authz_resolver_sdk::AuthZResolverApi>) -> Arc<Service> {
     let metrics = Arc::new(RecordingMetrics::default());
-    let enforcer = PolicyEnforcer::new(Arc::new(PermitTenantsPdp::new(vec![tenant().as_uuid()])));
+    let enforcer = PolicyEnforcer::new(pdp);
     Arc::new(Service::new(
         Admission::new(enforcer, metrics),
         Arc::new(Readiness::new()),
@@ -61,12 +65,31 @@ fn unbound_service() -> Arc<Service> {
             metadata_max_bytes: 4096,
             list_max_limit: 500,
             list_max_ids: 100,
+            bulk_max_items: 50,
+        },
+        crate::test_support::policy_limits(),
+        crate::domain::service::OperationsRuntime {
+            cache_entries: 16,
+            cache_ttl: std::time::Duration::from_secs(5),
+            preparation_max_attempts: std::num::NonZeroU32::new(3).expect("attempts"),
+            leases: crate::domain::operations::LeaseLimits::default(),
+            batch: crate::domain::operations::BatchLimits::default(),
+            snapshot: crate::domain::operations::SnapshotLimits::default(),
         },
     ))
 }
 
 async fn bound_service() -> Arc<Service> {
-    let service = unbound_service();
+    bound_service_over(Arc::new(InMemoryStorage::new())).await
+}
+
+/// [`bound_service`] over a storage the caller prepared, e.g. bootstrapped
+/// with the global policy so operations can evaluate.
+async fn bound_service_over(storage: Arc<InMemoryStorage>) -> Arc<Service> {
+    bind(unbound_service(), storage).await
+}
+
+async fn bind(service: Arc<Service>, storage: Arc<InMemoryStorage>) -> Arc<Service> {
     let registry = Arc::new(FakeContractRegistry::llm_gateway());
     let metrics = RecordingMetrics::default();
     let catalog = CatalogBuilder::new(registry.as_ref(), &metrics)
@@ -78,11 +101,23 @@ async fn bound_service() -> Arc<Service> {
         .expect("catalogue");
     service
         .bind(Bound {
-            storage: Arc::new(InMemoryStorage::new()),
+            engines: Arc::new(crate::domain::engines::builtin_registry().expect("engines")),
+            artifacts: Arc::new(crate::domain::engines::PolicyArtifactCache::new(
+                std::num::NonZeroUsize::new(256).expect("capacity"),
+                std::num::NonZeroUsize::new(2).expect("permits"),
+            )),
+            storage,
             coordinator: Arc::new(NoopCoordinator),
             catalog: Arc::new(catalog),
             registry,
             metric_registry: Arc::new(FakeMetricRegistry::classified()),
+            classifications: Arc::new(MetricClassifications::from_pairs([(
+                MetricId::parse(METRIC_TOKENS).expect("metric"),
+                crate::domain::ports::metric_registry::MetricDescriptor {
+                    kind: quota_enforcement_sdk::MetricKind::Counter,
+                    mode: crate::domain::ports::metric_registry::MetricMode::QuotaGated,
+                },
+            )])),
         })
         .expect("bind");
     service
@@ -101,7 +136,13 @@ async fn before_bootstrap_every_call_is_not_ready() {
         .expect_err("not ready");
     assert_eq!(status(err), 503);
     let err = client
-        .read_quotas(&ctx(), QuotaFilter::default(), PageRequest::default())
+        .read_quotas(
+            &ctx(),
+            quota_enforcement_sdk::ReadQuotasRequest {
+                filter: QuotaFilter::default(),
+                page: PageRequest::default(),
+            },
+        )
         .await
         .expect_err("not ready");
     assert_eq!(status(err), 503);
@@ -114,16 +155,24 @@ async fn the_client_round_trips_through_the_same_domain_path_as_rest() {
     client
         .update_quota(
             &ctx(),
-            id,
-            QuotaPatch {
-                fail_open_hint: Some(true),
-                ..QuotaPatch::default()
+            quota_enforcement_sdk::UpdateQuotaRequest {
+                quota_id: id,
+                patch: QuotaUpdate {
+                    fail_open_hint: Some(true),
+                    ..QuotaUpdate::default()
+                },
             },
         )
         .await
         .expect("update returns unit");
     let page = client
-        .read_quotas(&ctx(), QuotaFilter::default(), PageRequest::default())
+        .read_quotas(
+            &ctx(),
+            quota_enforcement_sdk::ReadQuotasRequest {
+                filter: QuotaFilter::default(),
+                page: PageRequest::default(),
+            },
+        )
         .await
         .expect("read");
     assert_eq!(page.items.len(), 1);
@@ -139,11 +188,13 @@ async fn the_client_round_trips_through_the_same_domain_path_as_rest() {
     let page = client
         .read_quotas(
             &ctx(),
-            QuotaFilter {
-                status: Some(QuotaStatus::Deactivated),
-                ..QuotaFilter::default()
+            quota_enforcement_sdk::ReadQuotasRequest {
+                filter: QuotaFilter {
+                    status: Some(QuotaStatus::Deactivated),
+                    ..QuotaFilter::default()
+                },
+                page: PageRequest::default(),
             },
-            PageRequest::default(),
         )
         .await
         .expect("read deactivated");
@@ -163,8 +214,10 @@ async fn domain_rejections_arrive_as_canonical_errors() {
     let err = client
         .update_quota(
             &ctx(),
-            quota_enforcement_sdk::QuotaId::generate(),
-            QuotaPatch::default(),
+            quota_enforcement_sdk::UpdateQuotaRequest {
+                quota_id: quota_enforcement_sdk::QuotaId::generate(),
+                patch: QuotaUpdate::default(),
+            },
         )
         .await
         .expect_err("an empty patch is rejected before the lookup");
@@ -172,27 +225,425 @@ async fn domain_rejections_arrive_as_canonical_errors() {
 }
 
 #[tokio::test]
-async fn a_caller_supplied_constraint_contract_is_rejected_before_the_lookup() {
-    let client = InProcessQuotaManager::new(bound_service().await);
-    let id = client.create_quota(&ctx(), spec()).await.expect("created");
+async fn credit_is_a_manager_operation_through_the_same_domain_path() {
+    let client = InProcessQuotaManager::new(unbound_service());
     let err = client
-        .update_quota(
+        .credit(
             &ctx(),
-            id,
-            QuotaPatch {
-                metadata: Some(serde_json::Map::new()),
-                constraint_contract: Some(quota_enforcement_sdk::ContractRef {
-                    type_id: type_id(crate::test_support::LLM_TOKEN_CONSTRAINT),
-                    version: 1,
-                }),
-                ..QuotaPatch::default()
+            quota_enforcement_sdk::CreditRequest {
+                tenant_id: tenant(),
+                quota_id: quota_enforcement_sdk::QuotaId::generate(),
+                amount: 1,
+                idempotency_key: "c1".to_owned(),
             },
         )
         .await
-        .expect_err("the gear alone names the accepted contract");
-    assert!(
-        format!("{err:?}").contains("CONSTRAINT_CONTRACT_NOT_CALLER_SUPPLIED"),
-        "{err:?}"
+        .expect_err("not ready");
+    assert_eq!(status(err), 503);
+
+    let client = InProcessQuotaManager::new(bound_service().await);
+    let id = client.create_quota(&ctx(), spec()).await.expect("create");
+    let decision = client
+        .credit(
+            &ctx(),
+            quota_enforcement_sdk::CreditRequest {
+                tenant_id: tenant(),
+                quota_id: id,
+                amount: 1,
+                idempotency_key: "c1".to_owned(),
+            },
+        )
+        .await
+        .expect("credit");
+    assert_eq!(
+        decision.result,
+        quota_enforcement_sdk::DecisionResult::Allowed
     );
-    assert_eq!(status(err), 400);
+}
+
+fn policy_spec() -> quota_enforcement_sdk::PolicySpec {
+    quota_enforcement_sdk::PolicySpec {
+        scope: quota_enforcement_sdk::PolicyScope::Metric {
+            metric: MetricId::parse(METRIC_TOKENS).expect("metric"),
+        },
+        engine_id: "most-restrictive-wins".to_owned(),
+        engine_config: json!({}),
+        timeout_ms: None,
+        description: None,
+        comment: Some("v1".to_owned()),
+    }
+}
+
+fn attribution() -> quota_enforcement_sdk::EvaluationAttribution {
+    quota_enforcement_sdk::EvaluationAttribution {
+        tenant_id: tenant(),
+        metric: METRIC_TOKENS.to_owned(),
+        subjects: vec![quota_enforcement_sdk::SubjectClaim {
+            kind: quota_enforcement_sdk::SCOPE_USER.to_owned(),
+            id: "u1".to_owned(),
+        }],
+        metadata: Some(
+            json!({ "region": "eu" })
+                .as_object()
+                .cloned()
+                .expect("object"),
+        ),
+        resource: None,
+    }
+}
+
+#[tokio::test]
+async fn before_bootstrap_every_operator_and_enforcement_call_is_not_ready() {
+    use quota_enforcement_sdk::{QuotaEnforcementApi, QuotaOperatorApi};
+    let service = unbound_service();
+    let operator = super::InProcessQuotaOperator::new(Arc::clone(&service));
+    let enforcement = super::InProcessQuotaEnforcement::new(service);
+    let id = quota_enforcement_sdk::PolicyId::new("p");
+    let token = quota_enforcement_sdk::LeaseToken::new(uuid::Uuid::from_u128(1));
+    let patch = quota_enforcement_sdk::PolicyPatch {
+        if_match_version: 1,
+        engine_id: None,
+        engine_config: None,
+        timeout_ms: None,
+        comment: None,
+    };
+
+    let refusals = [
+        operator.create_policy(&ctx(), policy_spec()).await.err(),
+        operator
+            .update_policy(
+                &ctx(),
+                quota_enforcement_sdk::UpdatePolicyRequest {
+                    id: id.clone(),
+                    patch,
+                },
+            )
+            .await
+            .err(),
+        operator
+            .rollback_policy(
+                &ctx(),
+                quota_enforcement_sdk::RollbackPolicyRequest {
+                    id: id.clone(),
+                    target_version: 1,
+                    comment: None,
+                },
+            )
+            .await
+            .err(),
+        operator
+            .delete_policy(
+                &ctx(),
+                quota_enforcement_sdk::DeletePolicyRequest {
+                    id: id.clone(),
+                    comment: None,
+                },
+            )
+            .await
+            .err(),
+        operator
+            .read_policy(
+                &ctx(),
+                quota_enforcement_sdk::ReadPolicyRequest {
+                    id: id.clone(),
+                    version: None,
+                },
+            )
+            .await
+            .err(),
+        operator
+            .list_policy_versions(
+                &ctx(),
+                quota_enforcement_sdk::ListPolicyVersionsRequest {
+                    id,
+                    page: PageRequest::default(),
+                },
+            )
+            .await
+            .err(),
+        enforcement
+            .debit(
+                &ctx(),
+                quota_enforcement_sdk::DebitRequest {
+                    attribution: attribution(),
+                    amount: 1,
+                    idempotency_key: "d".to_owned(),
+                },
+            )
+            .await
+            .err(),
+        enforcement
+            .rollback(
+                &ctx(),
+                quota_enforcement_sdk::RollbackRequest {
+                    attribution: attribution(),
+                    original_operation: quota_enforcement_sdk::RollbackableOperation::Debit,
+                    original_idempotency_key: "d".to_owned(),
+                    idempotency_key: "r".to_owned(),
+                },
+            )
+            .await
+            .err(),
+        enforcement
+            .evaluate_preview(
+                &ctx(),
+                quota_enforcement_sdk::PreviewRequest {
+                    attribution: attribution(),
+                    amount: 1,
+                },
+            )
+            .await
+            .err(),
+        enforcement
+            .acquire_lease(
+                &ctx(),
+                quota_enforcement_sdk::AcquireLeaseRequest {
+                    attribution: attribution(),
+                    amount: 1,
+                    ttl_secs: Some(60),
+                    idempotency_key: "a".to_owned(),
+                },
+            )
+            .await
+            .err(),
+        enforcement
+            .commit_lease(
+                &ctx(),
+                quota_enforcement_sdk::CommitLeaseRequest {
+                    tenant_id: tenant(),
+                    token,
+                    actual_amount: None,
+                    idempotency_key: "c".to_owned(),
+                },
+            )
+            .await
+            .err(),
+        enforcement
+            .release_lease(
+                &ctx(),
+                quota_enforcement_sdk::ReleaseLeaseRequest {
+                    tenant_id: tenant(),
+                    token,
+                    idempotency_key: "l".to_owned(),
+                },
+            )
+            .await
+            .err(),
+    ];
+    for (index, refusal) in refusals.into_iter().enumerate() {
+        let err = refusal.unwrap_or_else(|| panic!("call {index} answered before bootstrap"));
+        assert_eq!(status(err), 503, "call {index}");
+    }
+}
+
+#[tokio::test]
+async fn the_operator_client_drives_a_policy_through_its_versions() {
+    use quota_enforcement_sdk::QuotaOperatorApi;
+    let service = bind(
+        unbound_service_with(Arc::new(crate::test_support::PermitUnconstrainedPdp)),
+        Arc::new(InMemoryStorage::new()),
+    )
+    .await;
+    let operator = super::InProcessQuotaOperator::new(service);
+    let created = operator
+        .create_policy(&ctx(), policy_spec())
+        .await
+        .expect("create");
+    let id = created.policy_id.clone();
+    let updated = operator
+        .update_policy(
+            &ctx(),
+            quota_enforcement_sdk::UpdatePolicyRequest {
+                id: id.clone(),
+                patch: quota_enforcement_sdk::PolicyPatch {
+                    if_match_version: created.version,
+                    engine_id: None,
+                    engine_config: None,
+                    timeout_ms: Some(50),
+                    comment: Some("v2".to_owned()),
+                },
+            },
+        )
+        .await
+        .expect("update");
+    assert_eq!(updated.version, 2);
+    assert_eq!(
+        operator
+            .read_policy(
+                &ctx(),
+                quota_enforcement_sdk::ReadPolicyRequest {
+                    id: id.clone(),
+                    version: Some(1),
+                },
+            )
+            .await
+            .expect("read v1")
+            .version,
+        1
+    );
+    let history = operator
+        .list_policy_versions(
+            &ctx(),
+            quota_enforcement_sdk::ListPolicyVersionsRequest {
+                id: id.clone(),
+                page: PageRequest {
+                    limit: 10,
+                    cursor: None,
+                },
+            },
+        )
+        .await
+        .expect("history");
+    assert_eq!(history.items.len(), 2);
+    let rolled_back = operator
+        .rollback_policy(
+            &ctx(),
+            quota_enforcement_sdk::RollbackPolicyRequest {
+                id: id.clone(),
+                target_version: 1,
+                comment: Some("back".to_owned()),
+            },
+        )
+        .await
+        .expect("rollback");
+    assert_eq!(
+        rolled_back.timeout_ms, None,
+        "v1's configuration is active again"
+    );
+    operator
+        .delete_policy(
+            &ctx(),
+            quota_enforcement_sdk::DeletePolicyRequest {
+                id: id.clone(),
+                comment: None,
+            },
+        )
+        .await
+        .expect("delete");
+    let err = operator
+        .read_policy(
+            &ctx(),
+            quota_enforcement_sdk::ReadPolicyRequest { id, version: None },
+        )
+        .await
+        .expect_err("a deleted policy has no active version");
+    assert!(status(err) >= 400);
+}
+
+#[tokio::test]
+async fn the_enforcement_client_debits_previews_rolls_back_and_settles_leases() {
+    use quota_enforcement_sdk::{AcquireLeaseOutcome, DecisionResult, QuotaEnforcementApi};
+    let storage = Arc::new(InMemoryStorage::new());
+    {
+        use quota_enforcement_sdk::QuotaEnforcementStoragePluginV1;
+        let mut bundle = quota_enforcement_sdk::testing::bundle_with_global_policy();
+        if let Some(policy) = bundle.global_policy.as_mut() {
+            policy.engine_id = "most-restrictive-wins".to_owned();
+        }
+        storage.bootstrap(&bundle).await.expect("bootstrap");
+    }
+    let service = bound_service_over(Arc::clone(&storage)).await;
+    let quota = InProcessQuotaManager::new(Arc::clone(&service))
+        .create_quota(&ctx(), spec())
+        .await
+        .expect("quota");
+    let client = super::InProcessQuotaEnforcement::new(service);
+
+    let preview = client
+        .evaluate_preview(
+            &ctx(),
+            quota_enforcement_sdk::PreviewRequest {
+                attribution: attribution(),
+                amount: 10,
+            },
+        )
+        .await
+        .expect("preview");
+    assert!(preview.preview);
+    assert_eq!(storage.consumed(quota), 0, "a preview moves nothing");
+
+    let debit = client
+        .debit(
+            &ctx(),
+            quota_enforcement_sdk::DebitRequest {
+                attribution: attribution(),
+                amount: 10,
+                idempotency_key: "d1".to_owned(),
+            },
+        )
+        .await
+        .expect("debit");
+    assert_eq!(debit.result, DecisionResult::Allowed);
+    assert_eq!(storage.consumed(quota), 10);
+
+    client
+        .rollback(
+            &ctx(),
+            quota_enforcement_sdk::RollbackRequest {
+                attribution: attribution(),
+                original_operation: quota_enforcement_sdk::RollbackableOperation::Debit,
+                original_idempotency_key: "d1".to_owned(),
+                idempotency_key: "rb1".to_owned(),
+            },
+        )
+        .await
+        .expect("rollback");
+    assert_eq!(
+        storage.consumed(quota),
+        0,
+        "the rollback reversed the debit"
+    );
+
+    let acquire = |key: &str| quota_enforcement_sdk::AcquireLeaseRequest {
+        attribution: attribution(),
+        amount: 30,
+        ttl_secs: Some(60),
+        idempotency_key: key.to_owned(),
+    };
+    let AcquireLeaseOutcome::Acquired {
+        token: committed, ..
+    } = client
+        .acquire_lease(&ctx(), acquire("a1"))
+        .await
+        .expect("acquire")
+    else {
+        panic!("the first lease fits");
+    };
+    let AcquireLeaseOutcome::Acquired {
+        token: released, ..
+    } = client
+        .acquire_lease(&ctx(), acquire("a2"))
+        .await
+        .expect("acquire")
+    else {
+        panic!("the second lease fits");
+    };
+    client
+        .commit_lease(
+            &ctx(),
+            quota_enforcement_sdk::CommitLeaseRequest {
+                tenant_id: tenant(),
+                token: committed,
+                actual_amount: Some(12),
+                idempotency_key: "c1".to_owned(),
+            },
+        )
+        .await
+        .expect("commit");
+    client
+        .release_lease(
+            &ctx(),
+            quota_enforcement_sdk::ReleaseLeaseRequest {
+                tenant_id: tenant(),
+                token: released,
+                idempotency_key: "r1".to_owned(),
+            },
+        )
+        .await
+        .expect("release");
+    assert_eq!(
+        storage.consumed(quota),
+        12,
+        "only the committed share stays"
+    );
 }

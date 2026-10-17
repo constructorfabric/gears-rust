@@ -9,8 +9,8 @@
 
 use gts::GtsTypeId;
 use quota_enforcement_sdk::{
-    CapPatch, EnforcementMode, PageRequest, PeriodType, Quota, QuotaFilter, QuotaId, QuotaPatch,
-    QuotaSource, QuotaSpec, QuotaStatus, QuotaType, SubjectRef, TenantId, ValidityWindow,
+    CapPatch, EnforcementMode, PageRequest, PeriodType, Quota, QuotaFilter, QuotaId, QuotaSource,
+    QuotaSpec, QuotaStatus, QuotaType, QuotaUpdate, SubjectRef, TenantId, ValidityWindow,
     ValidityWindowPatch,
 };
 use serde_json::{Map, Value};
@@ -140,16 +140,10 @@ pub struct UpdateQuotaRequest {
     pub fail_open_hint: Option<bool>,
 }
 
-impl TryFrom<QuotaPatch> for UpdateQuotaRequest {
+impl TryFrom<QuotaUpdate> for UpdateQuotaRequest {
     type Error = DomainError;
 
-    fn try_from(patch: QuotaPatch) -> Result<Self, Self::Error> {
-        if patch.constraint_contract.is_some() {
-            return Err(DomainError::InvalidArgument {
-                field: "constraint_contract",
-                reason: tokens::CONSTRAINT_CONTRACT_NOT_CALLER_SUPPLIED,
-            });
-        }
+    fn try_from(patch: QuotaUpdate) -> Result<Self, Self::Error> {
         let cap = match patch.cap {
             None => Presence::Absent,
             Some(CapPatch::Unbounded) => Presence::Null,

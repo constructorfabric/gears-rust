@@ -726,7 +726,7 @@ OPENAPI_BUILD_FEATURE_ARGS := $(if $(GEAR),$(GEAR_OPENAPI_FEATURE_ARGS),$(OPENAP
 
 # -------- Tests --------
 
-.PHONY: test test-no-macros test-macros test-sqlite test-pg test-pgq test-mysql test-db test-users-info-pg test-usage-collector-pg test-usage-collector-ch test-types-registry-db test-oagw-db test-cluster-pg test-cluster-redis test-cluster-k8s coverage-cluster-k8s test-rg-pg test-settings-service-pg test-pricing-pg test-coord-pg test-products-pg test-ledger-pg test-fixtures-narrow test-fips
+.PHONY: test test-no-macros test-macros test-sqlite test-pg test-pgq test-mysql test-db test-users-info-pg test-usage-collector-pg test-usage-collector-ch test-quota-enforcement-pg test-types-registry-db test-oagw-db test-cluster-pg test-cluster-redis test-cluster-k8s coverage-cluster-k8s test-rg-pg test-settings-service-pg test-pricing-pg test-coord-pg test-products-pg test-ledger-pg test-fixtures-narrow test-fips
 
 # Run all tests, or a single gear when GEAR=<gear> is set.
 # When GEAR= is set, cargo gears ls packages finds matching crates + their
@@ -835,6 +835,14 @@ test-usage-collector-ch: install-tools
 	$(call print_target_banner)
 	$(call nextest_run,usage-collector-ch,-p cf-gears-clickhouse-usage-collector-plugin \
 		--features clickhouse --run-ignored all --no-fail-fast,CH_REQUIRE_DOCKER=1)
+
+## Run the Quota Enforcement storage plugin's PostgreSQL suites (Docker required;
+## each test spins up its own postgres container via testcontainers). These hold
+## the plugin's concurrency proofs — row locks, NOWAIT stripes, idempotency
+## races — that SQLite cannot show. A missing Docker fails the run, not skips it.
+test-quota-enforcement-pg: install-tools
+	$(call print_target_banner)
+	cargo nextest run -p cf-gears-quota-enforcement-storage-plugin --features postgres
 
 ## Run types-registry PostgreSQL + MySQL integration tests (Docker required;
 ## each test spins up its own postgres or mysql container via testcontainers).

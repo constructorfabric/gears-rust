@@ -2,4 +2,5 @@
 //! outbox on `toolkit-db`.
 
 pub mod outbox;
+mod outbox_handler;
 pub mod storage;
