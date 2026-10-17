@@ -12,3 +12,6 @@ mod dto_test;
 
 #[cfg(test)]
 mod routes_test;
+
+#[cfg(test)]
+mod settings_routes_test;
