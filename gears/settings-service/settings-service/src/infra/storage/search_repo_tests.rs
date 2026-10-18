@@ -607,3 +607,66 @@ async fn a_boolean_value_is_found_by_its_word_on_this_backend_too() {
         "and never by the integers SQLite would otherwise project"
     );
 }
+
+#[tokio::test]
+async fn a_declaration_without_a_domain_is_searched_under_its_categorys() {
+    // Search reaches declarations through the same visibility predicate as the
+    // declaration list: one with no domain of its own is in its category's
+    // domain, and its own domain overrides the category's.
+    let h = ResolutionHarness::new().await;
+    let billing = h.add_category("billing").await;
+    h.bind_category_domain(billing, Some("commercial")).await;
+    for name in ["zeta_inherited", "zeta_own"] {
+        h.declare_in(billing, name, "cascading", json!(false), BOOL, "public")
+            .await;
+    }
+    let own = h
+        .resolver
+        .find_declaration(&h.db.conn().expect("connection"), &h.key("zeta_own"))
+        .await
+        .expect("a read")
+        .expect("declared")
+        .id;
+    h.bind_domain(own, "infrastructure").await;
+    h.declare("zeta_open", "cascading", json!(false)).await;
+
+    let found = |domains: &'static [&'static str]| {
+        let h = &h;
+        async move {
+            let conn = h.db.conn().expect("connection");
+            let n = needle("zeta");
+            let mut q = query(50);
+            q.filter_hash = Some(cursor_binding(&n, h.tree.root, Corpus::Public, None));
+            let mut keys: Vec<String> = repo()
+                .declarations(
+                    &conn,
+                    &SearchRequest {
+                        scope: &AccessScope::allow_all(),
+                        visibility: &DomainVisibility::Restricted(
+                            domains.iter().map(|d| (*d).to_owned()).collect(),
+                        ),
+                        needle: &n,
+                        corpus: Corpus::Public,
+                        tenant_ids: &[h.tree.root],
+                        hidden_for: &[],
+                        override_limit: 1_000,
+                        flagged_only: false,
+                        query: &q,
+                    },
+                )
+                .await
+                .expect("search runs")
+                .items
+                .into_iter()
+                .map(|d| d.leaf_slug)
+                .collect();
+            keys.sort();
+            keys
+        }
+    };
+    assert_eq!(found(&["infrastructure"]).await, ["zeta_open", "zeta_own"]);
+    assert_eq!(
+        found(&["commercial"]).await,
+        ["zeta_inherited", "zeta_open"]
+    );
+}

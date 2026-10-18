@@ -178,12 +178,17 @@ pub async fn get_setting(
         .effective_access(&conn, effective.declaration_id, caller)
         .await?
         .is_hidden();
-    if hidden
-        || !visibility::is_visible(
+    // The cached value carries the declaration's own domain; its category's,
+    // which an undomained declaration takes, is read with this request.
+    let admitted = resolver
+        .domain_admits(
+            &conn,
             &visibility::domain_visibility(&scope),
+            effective.declaration_id,
             effective.domain_affinity.as_deref(),
         )
-    {
+        .await?;
+    if hidden || !admitted {
         return Err(DomainError::NotFound {
             resource: "declaration",
         }
@@ -413,18 +418,27 @@ pub async fn get_history(
     // A retired declaration keeps its history and is read like an active one;
     // absence, and a declaration outside the caller's administrative domain,
     // are 404.
-    let declaration = resolver
-        .find_declaration(&conn, &key)
-        .await?
-        .filter(|d| {
-            visibility::is_visible(
-                &visibility::domain_visibility(&scope),
-                d.domain_affinity.as_deref(),
-            )
-        })
-        .ok_or(DomainError::NotFound {
-            resource: "declaration",
-        })?;
+    let found = resolver.find_declaration(&conn, &key).await?;
+    let declaration = match found {
+        Some(declaration)
+            if resolver
+                .domain_admits(
+                    &conn,
+                    &visibility::domain_visibility(&scope),
+                    declaration.id,
+                    declaration.domain_affinity.as_deref(),
+                )
+                .await? =>
+        {
+            declaration
+        }
+        _ => {
+            return Err(DomainError::NotFound {
+                resource: "declaration",
+            }
+            .into());
+        }
+    };
     // @cpt-end:cpt-cf-settings-service-flow-audit-store-history:p1:inst-as-hist-5
     // @cpt-begin:cpt-cf-settings-service-flow-audit-store-history:p1:inst-as-hist-6
     // Hidden from the target tenant: 404 rather than 403, so a hidden setting's

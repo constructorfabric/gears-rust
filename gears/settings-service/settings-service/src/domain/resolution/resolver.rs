@@ -590,6 +590,24 @@ where
             .await
     }
 
+    /// Whether `visibility` admits the declaration `declaration_id`, whose own
+    /// domain is `own` — its category's when it has none, read now rather than
+    /// from the effective-value cache.
+    ///
+    /// # Errors
+    /// [`DomainError`] when the category's domain cannot be read.
+    pub async fn domain_admits<C: DBRunner>(
+        &self,
+        conn: &C,
+        visibility: &crate::domain::category::DomainVisibility,
+        declaration_id: Uuid,
+        own: Option<&str>,
+    ) -> Result<bool, DomainError> {
+        self.declarations
+            .admits(conn, visibility, declaration_id, own)
+            .await
+    }
+
     /// A tenant's root-to-self chain, as the access rules read it: the one
     /// tenant-resolver call a write makes, at its gate.
     ///

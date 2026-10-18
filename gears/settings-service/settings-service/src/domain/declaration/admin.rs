@@ -435,10 +435,17 @@ where
     ) -> Result<Created, DomainError> {
         // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-create:p1:inst-decl-create-4
         // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-create:p1:inst-decl-create-5
+        // A category outside the caller's administrative domain is absent, as
+        // its read is: a create there would file a declaration that takes the
+        // category's domain, which its author could then neither read nor
+        // write, and an evolve or revive there would change one it cannot see.
         let category = self
             .categories
             .find(conn, scope, request.category_id)
             .await?
+            .filter(|category| {
+                visibility::is_visible(&actor.visibility, category.domain_affinity.as_deref())
+            })
             .ok_or(DomainError::NotFound {
                 resource: "category",
             })?;

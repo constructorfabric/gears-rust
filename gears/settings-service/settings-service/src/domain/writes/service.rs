@@ -24,7 +24,7 @@ use uuid::Uuid;
 use super::{image_of, value_state_tag};
 use crate::audit::{AuditOperation, AuditRecord, AuditSink, AuditValue, ImageClass};
 use crate::domain::access::{AccessRepository, TenantAccess};
-use crate::domain::category::{DomainVisibility, is_visible};
+use crate::domain::category::DomainVisibility;
 use crate::domain::declaration::{Declaration, DeclarationRepository};
 use crate::domain::error::DomainError;
 use crate::domain::ports::{ChangePublisher, SecretManager, ValueEvent, WriteMetrics};
@@ -412,7 +412,16 @@ where
         // Outside the caller's administrative domain is absent, as it is to
         // the read: a write must neither disclose nor change what a read of
         // the setting hides. Every write reaches the declaration through here.
-        if !is_visible(&actor.visibility, declaration.domain_affinity.as_deref()) {
+        if !self
+            .resolver
+            .domain_admits(
+                conn,
+                &actor.visibility,
+                declaration.id,
+                declaration.domain_affinity.as_deref(),
+            )
+            .await?
+        {
             return Err(DomainError::NotFound {
                 resource: "declaration",
             });
