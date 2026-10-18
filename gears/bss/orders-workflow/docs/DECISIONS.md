@@ -6488,6 +6488,167 @@ outcome (`design/05` §2).
 
 **Propagated**: `design/05-provisioning-intents.md` §2; `UPSTREAM_REQS.md` `SUB-O10`; D-195.
 
+### D-212 (H) An unresolved create keeps the unwind open: withdrawn, or held on a manual task, never counted as reconciled
+
+**Accepted (2026-10-18).** *(PR #4787 review, diffora; amends D-209's fallback)*
+
+**Decision**: `compensate-order` step 3 does not stamp `reconciliation_complete_at` while a forward
+intent of the version is `submitted` or `unresolved`. An intent that reached the sweep floor with
+no known outcome is withdrawn once through slice 05's intent port (`SUB-O12`): `withdrawn` is a
+terminal failure that created nothing; a refusal because the request was already applied names the
+subscription, which the freeze of step 5 lists as a subject. While the withdrawal has no known
+outcome the pass answers `in-progress`; once it reaches its own floor or 5 submission failures the
+pass raises an `intent-unresolved` manual task and answers `pending-escalation`, so the order stays
+non-terminal. The task's `retry` re-arms one on-demand read and submits nothing, and is offered
+while the fence is open.
+
+**Rationale**: slice 05 ends scheduled reads at the floor by recording the intent `unresolved`, so
+"nothing remains non-terminal inside the floor" became true and step 3 completed; the freeze lists
+only created subscriptions, steps 5–7 verified an empty subject set and `report-outcome` reported
+the order cancelled while an accepted create could be a live subscription. PRD §6.4 requires
+escalation "until operational compensation reaches a known outcome"; the floor is not one.
+
+**Propagated**: `design/06-saga-and-compensation.md` §3.6 (`inst-co-step3`, the stage table, the
+`SUB-O12` note), §3.7 (`reconciliation_complete_at`), §4.7 item 1; `design/07-manual-tasks.md`
+§2.2 (`intent-unresolved` inside the unwind); `UPSTREAM_REQS.md` §2.1 (`SUB-O12`); D-209, D-215.
+
+### D-213 (M) The activation-deadline guard applies only to lines the call would submit
+
+**Accepted (2026-10-18).** *(PR #4787 review, diffora; refines D-194)*
+
+**Decision**: `dispatch-wave2-activate` answers `bindingExpired: true` only when at least one line
+of `lineRefs` would be submitted by the call — not skipped by step 3 as already carrying an intent
+row under its current attempt — and the plan's `activation_deadline_at` is at or before database
+time. A call that would submit nothing, including the empty `lineRefs[]` completion call the
+definition sends once every line is activated, is answered by recorded state alone.
+
+**Rationale**: the definition reaches `report-outcome completed` only through a wave-2 answer whose
+`pending[]`, `failed[]` and `lapsed[]` are empty (`design/10` §4.1). When every activation was
+accepted before the deadline and confirmed after it, that completion call met the deadline check
+before the skip pass and was refused `bindingExpired`, and the unwind compensated a successfully
+activated order. Subscriptions enforces the deadline at every real activation (Lifecycle D-162),
+so nothing is lost by scoping the early check to lines that are actually sent.
+
+**Propagated**: `design/05-provisioning-intents.md` §3.6 (`inst-pi-wave2-guard`), §4.4 (*The
+run-time barrier guard*); D-194.
+
+### D-214 (M) `reconcile-intent` recovers a lost acceptance: request id, instant and ordinal, exactly once
+
+**Accepted (2026-10-18).** *(PR #4787 review, diffora; amends D-153's sole-writer rule)*
+
+**Decision**: when the status read returns a transition request for a row whose
+`transition_request_id` is null — the submit reached Subscriptions and the dispatcher's settlement
+was lost — `reconcile-intent` records `transition_request_id`, `accepted_at` and `execution_seq`
+in the unit of work that records the read, under the row lock with the predicate
+`transition_request_id IS NULL`, so the ordinal is assigned exactly once and never reassigned.
+That one row's ordinal reflects discovery order, which the walk tolerates because acquisition
+lines are independent (D-196).
+
+**Rationale**: the acceptance columns were written only by the dispatcher in the settlement of the
+inserting call, and the platform's same-key re-run skips a row that exists. A create whose
+settlement was lost reached the freeze of `06` step 5 with `subscription_id` set and no
+`execution_seq`, and the freeze needs the ordinal for `compensation_sequence`.
+
+**Propagated**: `design/05-provisioning-intents.md` §3.6 (`inst-ri-read`), §3.7 (`execution_seq`,
+*Ownership*), §4.4 (*Ordinal*); D-153.
+
+### D-215 (H) A compensation task is terminal by this gear's record, never by Lifecycle's state
+
+**Accepted (2026-10-18).** *(PR #4787 review, diffora; completes D-208's unwind)*
+
+**Decision**: the `retry` of a compensation-reason task (`draft-void-failed`,
+`activated-cancel-failed`), and of an `intent-unresolved` task raised inside the unwind (D-212),
+is refused `order-fenced` only when the instance's `terminal_outcome` is set or the version's
+fence row carries `no_active_verified_at`; it is offered while the fence is open and the leg's
+record is not `succeeded`. `resolve-manual-task` re-checks those two columns in its own
+transaction and reads nothing from Lifecycle for it.
+
+**Rationale**: the constraint refused compensation retries "on a terminal order", defined by
+Lifecycle's terminal states. On every terminal-event unwind — `OrderCancelled`, `OrderExpired`
+and the operator-forced failure of D-208 — Lifecycle holds the order terminal before this gear
+cancels the activated subscriptions, so an `activated-cancel-failed` task raised there, a live
+billing subscription behind it, had no operator action for as long as the cleanup ran, and D-208
+requires that task to stay actionable. The fence is the authority over its own unwind (D-106).
+
+**Propagated**: `design/07-manual-tasks.md` §2.2 (*A Fenced or Terminal Order Accepts No New
+Fulfillment*), §3.6 (`inst-rmt-fence`), §4.4 (actions matrix); D-208.
+
+### D-216 (M) The consumed early resume records its hold in `reconciled_by_event_id`, never in `triggering_event_id`
+
+**Accepted (2026-10-18).** *(PR #4787 review, diffora; refines D-141)*
+
+**Decision**: `apply-hold` closes a `resume_ahead` row with `closed_reason =
+reconciled-out-of-order` and `reconciled_by_event_id = holdEventId`; `triggering_event_id` stays
+null on every `resume_ahead` row, and only the `open` row the same hold inserts carries the event
+id under `UNIQUE (order_id, triggering_event_id)`.
+
+**Rationale**: when an early resume met a hold Lifecycle still held (D-141), step 2 closed the
+early row with the hold's event id and step 3 inserted the open row with the same id in the same
+transaction; the unique index refused the insert, the unit of work failed, and every retry failed
+the same way, so the suspension could never be recorded.
+
+**Propagated**: `design/08-hold-and-cancel.md` §2.2, §3.6 (`inst-ah-consume-ahead`), §3.7
+(`owf_process_suspension` columns and constraints); D-141.
+
+### D-217 (M) The workflow-cancel key carries a request generation that advances on a refusal
+
+**Accepted (2026-10-18).** *(PR #4787 review, diffora; completes D-115 and the §4.4 re-check)*
+
+**Decision**: the cancel route's key is recomposed as
+`{tenant}:{orderId}:{orderVersion}:cancel:{subject_id}:{generation}`, where `generation` is the
+count of the version's `owf_cancel_request` rows already `refused`, read in the accepting
+transaction and stored on the row as `request_generation`. A client retry of a recorded, delivered
+or consumed request replays under the unchanged generation; after a refusal
+(`authority-withdrawn` at either re-check point, or `preFulfillment`) the same subject's next POST
+is a new command with its own snapshot and `requestRef`.
+
+**Rationale**: `design/09` §4.4 resolves a withdrawn authority by "re-submitting the command under a
+fresh authorization", but the key identified the immutable refused request for the key's lifetime,
+so the operator whose authority was restored could not obtain the fresh snapshot the re-check
+requires. The retry route already folds a version into its key for the same reason.
+
+**Propagated**: `design/09-read-and-authz.md` §3.3 (cancel route), §3.7 (`owf_cancel_request`),
+§4.4; D-115.
+
+### D-218 (M) The wave-2 reread takes its next round from the read's `settledRounds[]`
+
+**Accepted (2026-10-18).** *(PR #4787 review, diffora; completes D-120 and D-125)*
+
+**Decision**: `reconcile-intent` lists in `settledRounds[]` the `wave` and `nextDispatchRound` of
+every dead dispatch key its run settled `success` from lookup. The definition's `wave2Reread`
+export takes `wave2Round` from the wave-2 entry when one is present, so the settled round is spent
+before the barrier re-evaluates the eligible lines and the next wave-2 call goes out under the
+next round. Wave 1 is unchanged: `awaitReread1` re-issues the same key and body and the stored
+answer carries `nextDispatchRound`.
+
+**Rationale**: after an accepted dispatch lost its worker, the read settled the key and advanced
+the family's round in Orders' record, but the definition kept the old round, because it took a
+round only from a dispatch answer and the wave-2 reread returned to the barrier instead of
+re-issuing. The barrier re-evaluated to a different `lineRefs[]`, the next call presented the
+settled round with a different body, and the `idempotency-key-conflict` 409 routed back to the
+read forever.
+
+**Propagated**: `design/05-provisioning-intents.md` §3.3 (`reconcile-intent` output), §3.6
+(`inst-ri-settle-key`), §4.5 item 3; `design/10-process-definition.md` §3.6 (`wave2Reread`) and
+its description; D-120.
+
+### D-219 (M) The compensation leg retry rides the SLA tick, counted, never a competing `PT1H` branch
+
+**Accepted (2026-10-18).** *(PR #4787 review, diffora; applies D-133's tick counting to the unwind)*
+
+**Decision**: `awaitCompensationResolution` has no `retryLeg` branch. Its `PT5M` `waitSla` tick
+increments `retryTicks`, and every 12th tick routes to `retryLegDue`, which resets the counter and
+runs the next `compensate-order` pass; every other tick runs `slaCheckUnwind` as before.
+`waitRetryLeg` is retired from the waits table.
+
+**Rationale**: the fork competed a `PT5M` SLA tick against a `PT1H` retry branch and the SLA
+tick's `slaCheckUnwind` re-entered the fork, restarting both timers, so the retry branch never won
+and an escalated leg was retried only by an operator or a cancel. A counter in context survives
+the restart; it is the pattern `heldTicks` already uses for held polls (D-133).
+
+**Propagated**: `design/10-process-definition.md` §3.6 (waits table,
+`awaitCompensationResolution`, `afterCompensationResolution`, `retryLegDue`); D-133, D-142.
+
 ## Open Questions
 
 ### Q-01: Which durable-execution substrate backs the process — the OSS Workflow Engine or a BSS-local mechanism?
@@ -6837,6 +6998,7 @@ register relies on is cited to a serverless-runtime file and line or registered 
 | D-209 | 05 Provisioning intents, 06 Saga (Subscriptions #5131 received, 2026-10-12) | `PRD.md` §6.3, §9.2, §13; `design/05`, `design/06`; `UPSTREAM_REQS.md` §2.1, §4 |
 | D-210 | cross-cutting (review findings, 2026-10-12) | `ADR/0011`, `ADR/0012`, `ADR/0013`; `design/01`, `design/08`; `UPSTREAM_REQS.md` §2.9 |
 | D-211 | 05 Provisioning intents (actual start read back, 2026-10-18) | `design/05`; `UPSTREAM_REQS.md` `SUB-O10`; D-195 |
+| D-212–D-219 | cross-cutting (PR #4787 review findings, 2026-10-18) | `design/05` §3.3, §3.6, §3.7, §4.4, §4.5; `design/06` §3.6, §3.7, §4.7; `design/07` §2.2, §3.6, §4.4; `design/08` §2.2, §3.6, §3.7; `design/09` §3.3, §3.7, §4.4; `design/10` §3.6; `UPSTREAM_REQS.md` §2.1 |
 | D-200–D-205 | cross-cutting (Seam Atlas alignment, 2026-10-02) | `UPSTREAM_REQS.md` §2.1, §2.2, §2.4, §2.5, §4; `PRD.md` §9.1, §13, §15, §16; `design/05` §3.3; `design/06` §4.8 |
 | D-05–D-08 | 02 Triggers and start | `design/02-triggers-and-start.md` |
 | D-09–D-14 | 03 Approval execution | `design/03-approval-execution.md` |
@@ -7018,6 +7180,14 @@ register relies on is cited to a serverless-runtime file and line or registered 
 | D-209 | H Subscriptions #5131 received: resubmit-then-void replaces `settle_create`, no caller start instant, composition by reference, withdrawal, `order_compensation` | `PRD.md` §6.3, §9.2, §13; `design/05`; `design/06`; `UPSTREAM_REQS.md` §2.1, §4 item 21 |
 | D-210 | M Receipt ordinal in ADR-0011; publish fence at readiness; D-53 as a 90-day review interval; ADR-0013 line counts | `ADR/0011`–`0013`; `design/01` §3.8; `design/08` §2.2; `UPSTREAM_REQS.md` §2.9 |
 | D-211 | M The actual start is read back from Subscriptions' applied transition, never supplied (Lifecycle D-217) | `design/05` §2; `UPSTREAM_REQS.md` `SUB-O10`; D-195 |
+| D-212 | H An unresolved create keeps the unwind open: withdrawn or held on an `intent-unresolved` task, never counted as reconciled | `design/06` §3.6, §3.7, §4.7; `design/07` §2.2; D-209 |
+| D-213 | M The activation-deadline guard applies only to lines the call would submit; the empty completion call is answered by recorded state | `design/05` §3.6, §4.4; D-194 |
+| D-214 | M `reconcile-intent` recovers a lost acceptance (request id, instant, `execution_seq`) exactly once | `design/05` §3.6, §3.7, §4.4; D-153 |
+| D-215 | H A compensation task is terminal by this gear's record (`terminal_outcome`, `no_active_verified_at`), never by Lifecycle's state | `design/07` §2.2, §3.6, §4.4; D-208 |
+| D-216 | M The consumed early resume records its hold in `reconciled_by_event_id`; `triggering_event_id` stays unique to the open row | `design/08` §2.2, §3.6, §3.7; D-141 |
+| D-217 | M The workflow-cancel key carries a request generation that advances on a refusal | `design/09` §3.3, §3.7, §4.4; D-115 |
+| D-218 | M The wave-2 reread takes its next round from the read's `settledRounds[]` | `design/05` §3.3, §3.6, §4.5; `design/10` §3.6; D-120 |
+| D-219 | M The compensation leg retry rides the SLA tick, counted in `retryTicks`, never a competing `PT1H` branch | `design/10` §3.6; D-133 |
 
-Highest decision number used: **D-211**; highest question number: **Q-14**. Numbering is one continuous sequence across the whole
+Highest decision number used: **D-219**; highest question number: **Q-14**. Numbering is one continuous sequence across the whole
 register; there are no parts.

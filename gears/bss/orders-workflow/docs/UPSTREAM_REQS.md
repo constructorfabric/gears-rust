@@ -250,7 +250,11 @@ request, usable as the superseding action for that intent instead of a second su
   reach a terminal outcome on its own, which can stall compensation and cancellation fencing.
 - **Agreement status**: answered in Subscriptions PR #5131 (`fr-intent-protocol` item 2): a request
   accepted but not applied is withdrawn and ends `failed` with reason `withdrawn`; an outstanding OSS
-  work order is cancelled with a compensating deprovision first. Pending merge (D-209).
+  work order is cancelled with a compensating deprovision first. Pending merge (D-209). The
+  withdrawal is now load-bearing for the cancellation fence: an intent that reaches the sweep
+  floor with no known outcome is withdrawn rather than waited out, and until the withdrawal or an
+  authoritative read answers, the unwind stays open on a manual task (`design/06` §3.6 step 3,
+  D-212).
 - **Source**: replaces the PRD's local `SUB-O7` (§6.3 retry/duplicate protocol, §6.4 cancellation
   fencing). Raised against `gears/bss/subscriptions/docs/SEAMS.md`, which has no such entry today.
 

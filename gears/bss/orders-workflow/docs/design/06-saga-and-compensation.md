@@ -764,7 +764,7 @@ Output: `compensationState`, `nextPass`, `taskRefs[]`
 
 1. [ ] - `p1` - Lock the fence row for `(order_id, order_version)`; **IF** none: **RETURN** `permanent-failure` with `fence-not-claimed` - `inst-co-fence-guard`
 2. [ ] - `p1` - **IF** a previous pass's registry record is `in_flight` with a dead lease: settle it through `settle-from-lookup` (`lookupOutcome = failure`, `per-attempt-timeout`, the record's `lease_holder`) in-process before continuing - `inst-co-settle-prior`
-3. [ ] - `p1` - **Step 3.** **IF** `reconciliation_complete_at` is null: for each intent step 2 identified that is not terminal, call slice 05's `reconcile-intent` unit in-process (a late success is a created subscription); **IF** any remains non-terminal inside the sweep floor: settle, **RETURN** `in-progress`, `nextPass = pass + 1` — an accepted in-flight intent is waited out, never re-submitted (`SUB-O12`, §4.6); **ELSE** stamp `reconciliation_complete_at` - `inst-co-step3`
+3. [ ] - `p1` - **Step 3.** **IF** `reconciliation_complete_at` is null: for each intent step 2 identified that is not terminal, call slice 05's `reconcile-intent` unit in-process (a late success is a created subscription); **IF** any remains non-terminal inside the sweep floor: settle, **RETURN** `in-progress`, `nextPass = pass + 1` — an accepted in-flight intent is waited out, never re-submitted (`SUB-O12`, §4.6); **IF** any forward intent of the version is `unresolved` (the sweep floor reached with no known outcome, [`05 §4.2`](./05-provisioning-intents.md#42-reconciliation-sweep-schedule-working-baseline)): it is **not** reconciled, and the floor is no answer — submit its withdrawal once through slice 05's intent port (`SUB-O12`, §3.6 *Upstream dependency answered*), recording the withdrawal intent on the row: `withdrawn` is a terminal failure that created nothing; a refusal because the request was already applied names the subscription it created, which `reconcile-intent` records on the row and the freeze of step 5 lists as a subject; while the withdrawal itself has no known outcome, settle and **RETURN** `in-progress`; once the withdrawal has reached its own sweep floor or 5 submission failures, call slice 07's manual-task creation port with reason `intent-unresolved` for the line in this unit of work, record `manual_task_id` on the intent and **RETURN** `pending-escalation` with the task in `taskRefs`, `nextPass = pass + 1` — the order stays non-terminal, and an operator's `retry` re-arms the row for one on-demand read (`05 §3.7`) without submitting anything; `reconciliation_complete_at` is stamped only when no forward intent of the version is `submitted` or `unresolved`, because an unreadable accepted create may be a live subscription and reporting the order cancelled over it would assert to Lifecycle what this gear has not verified (decision D-212); **ELSE** stamp `reconciliation_complete_at` - `inst-co-step3`
 4. [ ] - `p1` - **Re-check before the first leg.** **IF** the fence row's `trigger` is `cancel` **AND** no compensating leg of the run has been submitted: call slice 08's cancel-authority port `recheck_cancel_authority(correlationId, cancelRequestRef, pre-compensation)` ([`08 §3.2`](./08-hold-and-cancel.md#32-component-model)); **IF** it answers `withdrawn`: stamp `reauthorization_required_at` on the fence row, settle, **RETURN** `pending-escalation` with the port's `authority-withdrawn` task in `taskRefs`, `nextPass = pass + 1`; **IF** `reauthorization_required_at` is set: **RETURN** the same without submitting a leg; a PDP outage is `retryable-failure` - `inst-co-reauthorize`
 5. [ ] - `p1` - **Freeze.** **IF** no `owf_compensation_record` exists for the run: insert one row per subject — every subscription created for the version (including late successes and slice 05's unmatched confirmations recorded against it) plus every override-attached subscription slice 07 verified — with `compensation_sequence` from `execution_seq` (or the override's verification instant), `outcome` null; the `UNIQUE (order_id, order_version, compensation_sequence)` constraint makes the freeze total and a replay of it an absorbed no-op - `inst-co-freeze`
 6. [ ] - `p1` - **Step 4, the walk.** **FOR EACH** record with `outcome` not `succeeded`, in descending `compensation_sequence`, while the remaining deadline covers one leg: - `inst-co-walk`
@@ -876,7 +876,7 @@ definition construct: a definition sees lines and waves, not the ordinal.
 |------|-----------|--------|-------------|
 | 1 — stop | `run-cancellation-fence` | Phase → `compensating` (slice 05's dispatch operations refuse); slice 03's closure port cancels open gates and closes an open park; slice 08's suspension closure port closes an open suspension | `dispatch_stopped_at` |
 | 2 — identify | `run-cancellation-fence` | Every accepted non-terminal intent and every `in_flight`/`open` dispatch registry record of the version | `in_flight_identified_at` |
-| 3 — reconcile | `compensate-order` | Each identified intent reconciled to a terminal outcome through slice 05's `reconcile-intent`; a late success counts as created | `reconciliation_complete_at` |
+| 3 — reconcile | `compensate-order` | Each identified intent reconciled to a terminal outcome through slice 05's `reconcile-intent`; a late success counts as created; an `unresolved` forward intent is withdrawn (`SUB-O12`) and, failing that, held on an `intent-unresolved` manual task — never counted as reconciled (D-212) | `reconciliation_complete_at` |
 | 4 — compensate | `compensate-order` | The walk over every subject, including late successes and override-attached subscriptions | `all_compensated_at` |
 | 5 — verify | `compensate-order` | Every record `succeeded` | `no_active_verified_at` |
 
@@ -895,10 +895,15 @@ in-flight intent with its **withdrawal** — never a second submit. Subscription
 submitter and ends `failed` with reason `withdrawn`; where an OSS work order is already outstanding
 the request terminates only after that work order is cancelled with a compensating deprovision;
 an applied request cannot be withdrawn and is handled by the compensation walk instead. Step 3
-therefore records a `withdrawn` outcome like any other terminal failure of the intent. Until #5131
+therefore records a `withdrawn` outcome like any other terminal failure of the intent, and an
+intent that reaches the sweep floor `unresolved` is withdrawn the same way rather than waited out
+(decision D-212). Until #5131
 merges, step 3 keeps its fallback — wait for the accepted intent to reach a terminal outcome, at
 worst the sweep floor (30 reads or 23 h) — and never invents a second-submit workaround, which the
-caller-side duplicate protocol forbids (decision D-209).
+caller-side duplicate protocol forbids (decision D-209). The floor is not a terminal outcome
+under either path: an intent still `unresolved` holds step 3 open on an `intent-unresolved` manual
+task until an authoritative read or a confirmed withdrawal resolves it (D-212), so the fallback
+can delay a cancellation but never lets it complete over an unreadable create.
 
 ### 3.7 Database schemas & tables
 
@@ -995,7 +1000,7 @@ D-104) — purged row-wise through a `created_at` index; the `retention-purge` w
 | `dispatch_stopped_at` | timestamp | Step 1 completion |
 | `in_flight_identified_at` | timestamp | Step 2 completion |
 | `in_flight_count` | integer | Intents and registry records step 2 identified |
-| `reconciliation_complete_at` | timestamp, nullable | Step 3 completion |
+| `reconciliation_complete_at` | timestamp, nullable | Step 3 completion; never set while a forward intent of the version is `submitted` or `unresolved` (D-212) |
 | `all_compensated_at` | timestamp, nullable | Step 4 completion — every subject has a settled outcome |
 | `no_active_verified_at` | timestamp, nullable | Step 5 completion — every record `succeeded` |
 | `reported_at` / `reported_outcome` | timestamp / enum, nullable | Set by `report-outcome` when the outcome is recorded |
@@ -1046,7 +1051,7 @@ definition is what re-invokes it for a live one.
 
 Independently of the definition's fence (ADR-0012 *Run-time guards*):
 
-1. [ ] - `p1` - `compensate-order` **MUST** refuse `fence-not-claimed` without an `owf_cancellation_fence` row for the version, and **MUST NOT** freeze subjects before `reconciliation_complete_at` is set - `inst-g06-fence-first`
+1. [ ] - `p1` - `compensate-order` **MUST** refuse `fence-not-claimed` without an `owf_cancellation_fence` row for the version, and **MUST NOT** freeze subjects before `reconciliation_complete_at` is set, which it **MUST NOT** stamp while a forward intent of the version is `submitted` or `unresolved` (D-212) - `inst-g06-fence-first`
 2. [ ] - `p1` - `report-outcome` **MUST** refuse `outcome-not-reportable` for `failed`, `cancelled`, `superseded` or `terminal-event` while `no_active_verified_at` is null, and for `completed` while slice 04's completion predicate does not hold or a fence row exists - `inst-g06-report-gate`
 3. [ ] - `p1` - `report-outcome` **MUST** be the only caller of `fulfillment-acknowledgement` and `workflow-cancel` in this gear, and **MUST** take its mode from the fence row's trigger, never from the input alone - `inst-g06-sole-reporter`
 4. [ ] - `p1` - On `superseded` or `terminal-event`, `report-outcome` **MUST** make no Lifecycle call - `inst-g06-no-call-modes`

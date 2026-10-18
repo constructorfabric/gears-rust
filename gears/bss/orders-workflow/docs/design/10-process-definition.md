@@ -761,7 +761,8 @@ it only for records pinned after the write (decision D-134).
 | `waitSla` in `awaitOperatorAfterPark` — the ceiling task's SLA | (d) | `PT5M` | `resolve-manual-task` `trigger: sla-check` scoped to `ceilingTaskRef` (07), under that task's own `slaRound` (D-129) | `resolution` — `escalated` or `none` only: an order-scope task escalates and is never exhausted (`07 §4.2`) |
 | `waitResumePoll` — the resume wait's read of the hold | (e) | `PT15M` | `apply-resume` `trigger: poll` (08), under the next `resumePollRound` (D-130) | `resumeOutcome` |
 | held poll — every other wait while a suspension is recorded (`pollHeld`) | (a), (b) | none of its own: it rides the wait's tick, counted in `heldTicks` — every 30th `PT30S` tick of `waitPoll`, every 3rd `PT5M` tick (`waitTtlMargin`, `waitHeldReflect`, `waitEligibility`, `waitHeld`), every `PT1H` tick (`waitExpected`), every 15th `PT1M` tick of a `held` deferral (`waitDeferral1`, `waitDeferral2`), about `PT15M` (`PT1H` in `awaitExpected`), and once on leaving the park loop. `gateLoop` and `outageArm` do not poll: a hold there enters the resume wait, and their `PT30S` tick keeps the escalation fire's lateness bound of D-123 (D-133) | `apply-resume` `trigger: poll` (08), under the next `resumePollRound`, then the tick's own re-check | `resumeOutcome`, `failedTaskRefs` |
-| `waitRepoll`, `waitRetryLeg` — compensation re-poll (the tick branch of `awaitRepoll`, D-142) and leg retry | (c) | `PT30S`, `PT1H` | `compensate-order` (06) | `compensationState` |
+| `waitRepoll` — compensation re-poll (the tick branch of `awaitRepoll`, D-142) | (c) | `PT30S` | `compensate-order` (06) | `compensationState` |
+| leg retry in `awaitCompensationResolution` | (c) | none of its own: it rides the `PT5M` `waitSla` tick, counted in `retryTicks` — every 12th tick, the hour of `06 §3.6` — because a competing `PT1H` branch of a fork the SLA tick restarts every `PT5M` would never win (D-219) | `compensate-order` (06), the next pass | `compensationState` |
 
 Q-11 (i) now asks only whether the plugin accepts a runtime-expression duration as an extension
 (§4.5); until it is answered, and after it unless a new version says otherwise, the re-check loop
@@ -1604,9 +1605,9 @@ The fulfillment stage, the `do` list of `process.fulfillment`:
 - wave2Reread:                         # 05 §4.5 item 3: read, route what it found, then wait in the barrier loop, whose poll re-issues nothing blind (D-120)
     timeout: step
     try:
-      - call: { step: reconcile-intent }   # body: ref + sweepRound
+      - call: { step: reconcile-intent }   # body: ref + sweepRound; output includes settledRounds[] (wave + nextDispatchRound) for every dead dispatch key the read settled (05 §3.6 inst-ri-settle-key)
     catch: *transient
-    export: { as: '${ $context + { sweepFailed: .failed, sweepUnresolved: .unresolved, redispatch: .redispatch, sweepAttempt: ($context.sweepRound | tostring), sweepRound: .nextSweepRound } }' }
+    export: { as: '${ $context + { sweepFailed: .failed, sweepUnresolved: .unresolved, redispatch: .redispatch, sweepAttempt: ($context.sweepRound | tostring), sweepRound: .nextSweepRound, wave2Round: (([ (.settledRounds // [])[] | select(.wave == "wave2_activate") | .nextDispatchRound ] | first) // $context.wave2Round) } }' }   # D-218: the settled key's round is spent; the barrier re-evaluates eligibleLineRefs, and the next wave-2 call carries the next round — never the settled round with a different body, which would be idempotency-key-conflict on every poll
 - onWave2Reread:
     switch:
       - failed: { when: '${ (($context.sweepFailed + $context.sweepUnresolved) | length) > 0 }', then: sweepFailure }
@@ -1784,7 +1785,13 @@ next answer; `pendingLapsed` accumulates the lapsed lines until `rebuildLapsed` 
 before the call is re-issued, and that read is routed like the poll arm's: its `failed[]` and
 `unresolved[]` go to fragment (c), its round is passed back, and wave 1 is re-issued under the
 unchanged key only after the `PT30S` `waitReread1`, while wave 2 waits in the barrier loop
-(decision D-120). **Re-dispatch after a retry** (decision D-119). An operator's line retry mints
+(decision D-120). Wave 2 also takes its next `dispatchRound` from the read's `settledRounds[]`:
+where the read settled the dead wave-2 key from lookup (`05 §3.6` `inst-ri-settle-key`), that
+round is spent, the barrier re-evaluates the eligible lines, and the next call goes out under the
+next round rather than re-presenting the settled round with a different `lineRefs[]`, which would
+be `idempotency-key-conflict` and loop through the read forever (decision D-218). Wave 1 needs no
+such export: `awaitReread1` re-issues the unchanged key and body, and the stored answer carries
+`nextDispatchRound`. **Re-dispatch after a retry** (decision D-119). An operator's line retry mints
 the line's next wave attempt in Orders' record when its intent is recorded `failed`, and the next
 `attempt` of its wave's dispatch family, which the failure stage files by `retryWave` as
 `wave1AttemptKey` or `wave2AttemptKey`; each wave call passes only its own and spends it once the
@@ -2032,15 +2039,15 @@ report):
       compete: true
       branches:
         - resolution: { do: [ ‹task-resolution arm of awaitResolution› ] }   # sets arm: resolution, taskRef, requestRef
-        - sla:        { do: [ { waitSla: { wait: PT5M } }, { arm: { set: { arm: sla } } } ] }
-        - retryLeg:   { do: [ { waitRetryLeg: { wait: PT1H } }, { arm: { set: { arm: retry } } } ] }   # inside the sweep floor
+        - sla:        { do: [ { waitSla: { wait: PT5M } }, { arm: { set: { arm: sla, retryTicks: '${ ($context.retryTicks // 0) + 1 }' } } } ] }   # the leg retry rides this tick, counted in retryTicks (D-219): a competing PT1H branch never won, because the fork restarts every PT5M
         - cancel:     { do: [ ‹cancel arm of (d)› ] }   # authorize-cancel, then the fence absorbs and promotes, then compensate
 - afterCompensationResolution:
     switch:
       - resolution: { when: '${ .arm == "resolution" }', then: enterResolveCompensationTask }
+      - retry:      { when: '${ .arm == "sla" and $context.retryTicks >= 12 }', then: retryLegDue }   # every 12th PT5M tick, the hour of 06 §3.6: the next pass, inside the sweep floor; already-settled legs are absorbed (D-219)
       - sla:        { when: '${ .arm == "sla" }',        then: slaCheckUnwind }
-      - retry:      { when: '${ .arm == "retry" }',      then: compensate }    # the next pass; already-settled legs are absorbed
       - other:      { then: leave }                                          # cancel
+- retryLegDue: { set: { retryTicks: 0 }, then: compensate }   # the SLA re-check this tick skipped runs on the next; the operation escalates on the task's stored deadline, so a tick is never a remainder (07 §4.8 item 3)
 - slaCheckUnwind:
     timeout: step
     try:

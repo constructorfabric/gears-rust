@@ -252,7 +252,8 @@ permanently. The operations therefore reconcile the pair by state:
   `resume_event_id` and answers `resume-ahead-recorded`; nothing is re-armed, because nothing was
   paused, and the event is not discarded.
 - `apply-hold` while a `resume_ahead` row exists: consumes it (`closed_reason =
-  reconciled-out-of-order`), pauses no window, leaves `suspended` false, and answers
+  reconciled-out-of-order`, the hold recorded in `reconciled_by_event_id`, D-216), pauses no
+  window, leaves `suspended` false, and answers
   `reconciled-out-of-order`, so the definition does not enter the resume wait.
 - A redelivered `OrderResumed` is an absorbed duplicate under its key and, below the key, under
   `UNIQUE (order_id, resume_event_id)`.
@@ -702,7 +703,7 @@ conditions are re-evaluated by level after resume by `evaluate-activation-eligib
 **`apply-hold` — inside the operation**:
 
 1. [ ] - `p1` - Lock the `owf_process_instance` row; **IF** `phase` is `compensating` **RETURN** `holdOutcome = not-applicable` and record the event in `owf_step_log` - `inst-ah-phase`
-2. [ ] - `p1` - **IF** a `resume_ahead` row exists for the order: read the order through the Lifecycle PDP-authorized order read, and **IF** the read is unavailable answer `retryable-failure`; set the row `closed` with `closed_reason = reconciled-out-of-order`, `triggering_event_id = holdEventId`, `closed_at = now()`; **IF** the order is not `on_hold`, **RETURN** `reconciled-out-of-order`; otherwise the early resume belonged to an earlier hold, so continue at step 3 and record this one (decision D-141) - `inst-ah-consume-ahead`
+2. [ ] - `p1` - **IF** a `resume_ahead` row exists for the order: read the order through the Lifecycle PDP-authorized order read, and **IF** the read is unavailable answer `retryable-failure`; set the row `closed` with `closed_reason = reconciled-out-of-order`, `reconciled_by_event_id = holdEventId`, `closed_at = now()` — never `triggering_event_id`, which `UNIQUE (order_id, triggering_event_id)` reserves for the open row step 3 inserts under this same event (decision D-216); **IF** the order is not `on_hold`, **RETURN** `reconciled-out-of-order`; otherwise the early resume belonged to an earlier hold, so continue at step 3 and record this one (decision D-141) - `inst-ah-consume-ahead`
 3. [ ] - `p1` - Insert the `open` row with `triggering_event_id`, `suspended_at = now()` (database time) and `paused_gate_refs = gateRefs`; **IF** the partial unique index refuses it, **RETURN** `absorbed-duplicate` with the existing row's `suspensionRef` and change nothing - `inst-ah-insert`
 4. [ ] - `p1` - Set `owf_process_instance.suspended = true` and, **IF** `phase` is `started`, the phase projection `started → suspended` through the envelope; a `parked` phase stays `parked`, and its `unpark` restores `suspended` (`01 §3.7`) - `inst-ah-predicate`
 5. [ ] - `p1` - Call the gate-window port `pause_windows(correlationId, gateRefs, hold)`; the port captures each armed window's remainder into `owf_approval_gate.window_remaining_ms` - `inst-ah-pause`
@@ -826,7 +827,8 @@ cancelled uses the `escalate` task resolution, which routes the decision to a Se
 | seller_tenant_id | uuid | Selling party axis; a suspension is visible on the seller-scoped operator surfaces |
 | state | enum | `open \| closed \| resume_ahead`. Transitions: `open → closed`, `resume_ahead → closed`. No other transition exists |
 | closed_reason | enum, nullable | `resumed` (by `apply-resume` on its event) · `resumed-by-read` (by `apply-resume` on `trigger: poll`, once the Lifecycle read shows the order no longer held; D-130) · `reconciled-out-of-order` (a `resume_ahead` row consumed by `apply-hold`) · `cancelled-from-hold` · `superseded-from-hold` · `terminated-from-hold` (through the suspension closure port, from `run-cancellation-fence`'s trigger). Null while `open` or `resume_ahead` |
-| triggering_event_id | uuid, nullable | `OrderHeld` event id; null on a `resume_ahead` row until a hold consumes it |
+| triggering_event_id | uuid, nullable | `OrderHeld` event id of the suspension this row records; always null on a `resume_ahead` row, including after a hold consumes it (D-216) |
+| reconciled_by_event_id | uuid, nullable | The `OrderHeld` event id of the hold that consumed this `resume_ahead` row (`closed_reason = reconciled-out-of-order`); null otherwise. Kept apart from `triggering_event_id` so the open row that hold inserts in the same transaction is the only row carrying its id under `UNIQUE (order_id, triggering_event_id)` (D-216) |
 | resume_event_id | uuid, nullable | `OrderResumed` event id that closed (or pre-recorded) this row; on a `resumed-by-read` row null until that resume's event arrives and is attached to it (`inst-ar-ahead`) |
 | correlation_id | uuid | Process correlation id |
 | paused_gate_refs | uuid[], NOT NULL, DEFAULT `{}` | The `owf_approval_gate` rows whose windows `apply-hold` paused through the port; `apply-resume` re-arms exactly these. References only; the remainder is on the gate |
@@ -845,7 +847,8 @@ suspension per order"; `UNIQUE (order_id, triggering_event_id) WHERE triggering_
 NULL`; `UNIQUE (order_id, resume_event_id) WHERE resume_event_id IS NOT NULL`; CHECK `state =
 'open'` implies `suspended_at IS NOT NULL AND triggering_event_id IS NOT NULL AND closed_at IS
 NULL`; CHECK `state = 'resume_ahead'` implies `resume_event_id IS NOT NULL AND suspended_at IS
-NULL`; CHECK `state = 'closed'` implies `closed_at IS NOT NULL AND closed_reason IS NOT NULL`;
+NULL AND triggering_event_id IS NULL`; CHECK `reconciled_by_event_id IS NOT NULL` implies
+`closed_reason = 'reconciled-out-of-order'` (D-216); CHECK `state = 'closed'` implies `closed_at IS NOT NULL AND closed_reason IS NOT NULL`;
 CHECK `(closed_reason IN ('resumed', 'resumed-by-read')) = (resumed_at IS NOT NULL)`.
 
 **Additional info**: **Ownership**: written only by `apply-hold` (insert of `open`, consumption of
