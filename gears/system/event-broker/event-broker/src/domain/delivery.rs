@@ -30,8 +30,8 @@ use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
 use crate::domain::authz::{
-    CONSUMER_GROUP_RESOURCE, EVENT_TYPE_RESOURCE, TOPIC_RESOURCE, tenant_authorized,
-    with_forbidden_code,
+    CONSUMER_GROUP_FAMILY_RESOURCE, consumer_group_resource, event_type_interest_resource,
+    tenant_authorized, topic_resource, with_forbidden_code,
 };
 use crate::domain::backend::BackendResolver;
 use crate::domain::consumer_group_coordinator::{ConsumerGroupCoordinator, TopicInterest};
@@ -361,7 +361,7 @@ where
     }
 
     /// Checks `action` (`"define"`/`"consume"`/`"manage"`) against
-    /// `CONSUMER_GROUP_RESOURCE` for `group_id` via PEP - the permission
+    /// the named group's own id (`consumer_group_resource`) via PEP - the permission
     /// half of the Consumer Group Lifecycle authorization split (`Named`
     /// groups; `Anonymous` groups use `tenant_authorized` instead).
     ///
@@ -378,7 +378,7 @@ where
         self.policy_enforcer
             .access_scope_with(
                 ctx,
-                &CONSUMER_GROUP_RESOURCE,
+                &consumer_group_resource(group_id),
                 action,
                 None,
                 &AccessRequest::new()
@@ -448,7 +448,7 @@ where
             self.policy_enforcer
                 .access_scope_with(
                     ctx,
-                    &TOPIC_RESOURCE,
+                    &topic_resource(&interest.topic),
                     "consume",
                     None,
                     &AccessRequest::new()
@@ -463,7 +463,7 @@ where
                 self.policy_enforcer
                     .access_scope_with(
                         ctx,
-                        &EVENT_TYPE_RESOURCE,
+                        &event_type_interest_resource(pattern),
                         "consume",
                         None,
                         &AccessRequest::new()
@@ -836,7 +836,7 @@ where
         self.policy_enforcer
             .access_scope_with(
                 ctx,
-                &CONSUMER_GROUP_RESOURCE,
+                &CONSUMER_GROUP_FAMILY_RESOURCE,
                 "define",
                 None,
                 &AccessRequest::new().require_constraints(false),

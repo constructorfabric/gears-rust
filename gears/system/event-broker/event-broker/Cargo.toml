@@ -86,7 +86,7 @@ utoipa = { workspace = true }
 authz-resolver-sdk = { workspace = true }
 authz-resolver = { workspace = true }
 types-registry = { workspace = true }
-# `domain/authz.rs`'s `TOPIC_RESOURCE`/`EVENT_TYPE_RESOURCE` consts invoke
+# `domain/authz.rs` builds PEP resources from `toolkit_gts` ids and invokes
 # `gts_id!(...)` for real (unlike `api/rest/error.rs`'s
 # `#[resource_error(gts_id!(...))]`, which never macro-expands its inner
 # `gts_id!(...)` token - the outer attribute macro parses it as a literal

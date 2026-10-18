@@ -10,7 +10,7 @@ use toolkit_gts::GtsInstanceId;
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
-use crate::domain::authz::{EVENT_TYPE_RESOURCE, tenant_authorized};
+use crate::domain::authz::{event_type_resource, tenant_authorized};
 use crate::domain::backend::BackendResolver;
 use crate::domain::error::{DomainError, ErrorCode};
 use event_broker_sdk::models::EventType;
@@ -372,7 +372,9 @@ where
         self.policy_enforcer
             .access_scope_with(
                 ctx,
-                &EVENT_TYPE_RESOURCE,
+                // The event's own type, so a grant can confine a producer to
+                // its own event types (`docs/DESIGN.md` §3.3).
+                &event_type_resource(&request.r#type),
                 "produce",
                 None,
                 &AccessRequest::new()
