@@ -184,7 +184,8 @@ Subscriptions' `create` and activation intent **MUST** accept an explicit start 
 on it as much as Lifecycle does: the activation intent this gear issues must carry the actual
 activation instant, because a line deferred past its quoted service-activation date **MUST NOT**
 be backdated (PRD §6.1, §6.2 wave-2 activation). The instant mapping (Lifecycle D-165, this gear's
-D-195): the actual activation instant this gear supplies is `serviceActivatedAt`;
+D-195): the actual activation instant is `serviceActivatedAt`, assigned by Subscriptions at the
+`activate` commit and read back by this gear, never supplied by it (D-209, D-211);
 `customerAcceptedAt` is mapped from Lifecycle's acceptance record, which the receiver reads through
 Lifecycle's version read rather than copying a timestamp from the intent; `contractEffectiveAt`
 comes from the referenced Contract, never from an order date. `start_at` wins over any instant
@@ -200,7 +201,7 @@ Subscriptions would compute internally (Lifecycle `…-upreq-subscription-start-
   dates unenforceable from the order side.
 - **Source**: `gears/bss/orders-lifecycle/docs/UPSTREAM_REQS.md` §2.1
   (`upreq-subscription-start-instant`, `SUB-O10`); consumed by PRD §6.1/§6.2 wave-2 activation.
-- **Withdrawn (D-209)**: Subscriptions PR #5131 reshapes `SUB-O10`: the start is `serviceActivatedAt`,
+- **Withdrawn (D-209)**, which supersedes the `start_at` wins wording above: Subscriptions PR #5131 reshapes `SUB-O10`: the start is `serviceActivatedAt`,
   stamped at the `activate` commit, and never taken from the order or the caller. That meets the
   intent without a caller-supplied instant, because this gear dispatches activation only at expected
   fulfillment time; this gear therefore sends no start instant. Lifecycle's own

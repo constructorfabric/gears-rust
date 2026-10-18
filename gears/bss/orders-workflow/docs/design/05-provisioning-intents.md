@@ -199,6 +199,17 @@ is; it is not completion, and no line is acknowledged on it. A transition read b
 `oss_unconfirmed` is the failure outcome `wave2-activation-failed`, on the ordinary path of §3.6
 `inst-ri-terminal`. A draft-create reaching Subscriptions' `draft` is `draft_created`.
 
+**The actual start is read back, never supplied** (decision D-211, Lifecycle D-217). A transition
+read back as `applied` carries `serviceActivatedAt`: the instant T that Subscriptions' guarded
+`activate` commit assigned once the required readiness confirmations were in. This gear records
+that value with the intent's status, and wherever it reports a line's actual start it reports this
+recorded value. It never takes a start instant from a confirmation, a provider callback, its own
+clock or the order: the OSS ready time is Subscriptions' evidence, not the commercial start, and
+this gear sends no start instant (D-209). Because T is fixed by the receiver's commit and read back
+from its durable state, a delayed or replayed confirmation can at most cause one more read
+returning the same T, and a re-read after a lost acknowledgement returns the same `applied`
+transition and the same T, never a new one.
+
 **ADRs**: `cpt-cf-bss-orders-workflow-adr-two-wave-activation-barrier`,
 `cpt-cf-bss-orders-workflow-adr-references-not-payloads`
 

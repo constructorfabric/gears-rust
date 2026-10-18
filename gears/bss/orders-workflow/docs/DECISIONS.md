@@ -6061,7 +6061,8 @@ and the actual instant as start. (3) Status mapping: Subscriptions' `applied` is
 `max_concurrent_active`, provenance per `(payer, overlap_scope_key)`, drafts excluded — over the
 registry-owned `SUB-G1` key stored on the order line, never derived here. (5) `SUB-O11`'s refusal
 kinds include the binding comparison, the deadline, a lost protection and a source-version
-mismatch. (6) Instants: the actual activation is `serviceActivatedAt`; `customerAcceptedAt` is
+mismatch. (6) Instants: the actual activation is `serviceActivatedAt`, assigned by Subscriptions at
+the `activate` commit and read back with the `applied` status (D-211); `customerAcceptedAt` is
 mapped from Lifecycle's acceptance record by the receiver; `contractEffectiveAt` comes from the
 Contract.
 
@@ -6466,6 +6467,27 @@ while the gear reports ready.
 **Propagated**: `ADR/0011`, `ADR/0012`, `ADR/0013` (amendment notes); `design/01-foundation.md` §3.8;
 `design/08-hold-and-cancel.md` §2.2; `UPSTREAM_REQS.md` §2.9; D-53.
 
+### D-211 (M) The actual start is read back from Subscriptions' applied transition, never supplied
+
+**Accepted (2026-10-18).** *(aligns with Orders Lifecycle D-217 and Subscriptions PR #5131, SUB-D-05; amends D-195 item (6))*
+
+**Decision**: the actual activation instant is the `serviceActivatedAt` T that Subscriptions'
+guarded `activate` commit assigns once the required readiness confirmations are in. This gear reads
+T back with the `applied` status (`SUB-O13`), records it with the intent's status and reports that
+recorded value wherever it reports a line's actual start. It never takes a start instant from a
+confirmation, a provider callback, its own clock or the order; the OSS ready time is evidence, not
+the commercial start, and this gear sends no start instant (D-209). A delayed or replayed
+confirmation can at most cause one more read returning the same T, and a re-read after a lost
+acknowledgement returns the same `applied` transition and the same T.
+
+**Rationale**: the PR #5259 follow-up review asked Orders Lifecycle, Subscriptions and this gear to
+agree one start instant; Lifecycle D-217 adopted the activate commit, and this gear executes the
+activation, so it must not derive a different instant from a callback or its own clock. Reading T
+from the receiver's durable state is the status-read rule this gear already applies to every
+outcome (`design/05` §2).
+
+**Propagated**: `design/05-provisioning-intents.md` §2; `UPSTREAM_REQS.md` `SUB-O10`; D-195.
+
 ## Open Questions
 
 ### Q-01: Which durable-execution substrate backs the process — the OSS Workflow Engine or a BSS-local mechanism?
@@ -6814,6 +6836,7 @@ register relies on is cited to a serverless-runtime file and line or registered 
 | D-208 | cross-cutting (Lifecycle D-179…D-186 received, 2026-10-05) | `PRD.md` §6.1, §6.3, §12; `design/02`, `design/06`, `design/10`; `UPSTREAM_REQS.md` §2.1, §2.4, §4 |
 | D-209 | 05 Provisioning intents, 06 Saga (Subscriptions #5131 received, 2026-10-12) | `PRD.md` §6.3, §9.2, §13; `design/05`, `design/06`; `UPSTREAM_REQS.md` §2.1, §4 |
 | D-210 | cross-cutting (review findings, 2026-10-12) | `ADR/0011`, `ADR/0012`, `ADR/0013`; `design/01`, `design/08`; `UPSTREAM_REQS.md` §2.9 |
+| D-211 | 05 Provisioning intents (actual start read back, 2026-10-18) | `design/05`; `UPSTREAM_REQS.md` `SUB-O10`; D-195 |
 | D-200–D-205 | cross-cutting (Seam Atlas alignment, 2026-10-02) | `UPSTREAM_REQS.md` §2.1, §2.2, §2.4, §2.5, §4; `PRD.md` §9.1, §13, §15, §16; `design/05` §3.3; `design/06` §4.8 |
 | D-05–D-08 | 02 Triggers and start | `design/02-triggers-and-start.md` |
 | D-09–D-14 | 03 Approval execution | `design/03-approval-execution.md` |
@@ -6994,6 +7017,7 @@ register relies on is cited to a serverless-runtime file and line or registered 
 | D-208 | H Lifecycle D-179…D-186 received: forced-failure trigger and unwind, overdue owner, resource-tenant tuple, consumer contract and corpus | `PRD.md` §6.1, §6.3, §12; `design/02` §4.8; `design/06` §4.9; `design/10`; `UPSTREAM_REQS.md` §2.1, §2.4, §4 item 20 |
 | D-209 | H Subscriptions #5131 received: resubmit-then-void replaces `settle_create`, no caller start instant, composition by reference, withdrawal, `order_compensation` | `PRD.md` §6.3, §9.2, §13; `design/05`; `design/06`; `UPSTREAM_REQS.md` §2.1, §4 item 21 |
 | D-210 | M Receipt ordinal in ADR-0011; publish fence at readiness; D-53 as a 90-day review interval; ADR-0013 line counts | `ADR/0011`–`0013`; `design/01` §3.8; `design/08` §2.2; `UPSTREAM_REQS.md` §2.9 |
+| D-211 | M The actual start is read back from Subscriptions' applied transition, never supplied (Lifecycle D-217) | `design/05` §2; `UPSTREAM_REQS.md` `SUB-O10`; D-195 |
 
-Highest decision number used: **D-210**; highest question number: **Q-14**. Numbering is one continuous sequence across the whole
+Highest decision number used: **D-211**; highest question number: **Q-14**. Numbering is one continuous sequence across the whole
 register; there are no parts.
