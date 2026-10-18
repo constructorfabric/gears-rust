@@ -40,7 +40,7 @@ pub use event_broker_sdk::api::Position;
 use crate::domain::error::{DomainError, ErrorCode};
 use crate::domain::model::{Interest, Sequence, Subscription};
 use crate::domain::notify::DeliveryNotifier;
-use crate::domain::streaming::filter::{EventFilter, InterestFilter};
+use crate::domain::streaming::filter::{AuthorizedInterestFilter, EventFilter};
 use crate::domain::streaming::lease::StreamLeases;
 use crate::domain::streaming::progress::ProgressConfig;
 use crate::domain::streaming::read::{MaxBytes, MaxEvents, ReadLimit};
@@ -625,8 +625,11 @@ where
             })?;
 
         // Compiled per open, not per event.
-        let filter: Arc<dyn EventFilter> =
-            Arc::new(InterestFilter::compile(&subscription.interests));
+        let filter: Arc<dyn EventFilter> = Arc::new(AuthorizedInterestFilter::new(
+            &subscription.interests,
+            self.policy_enforcer.clone(),
+            ctx.clone(),
+        ));
 
         // Subscribing takes the membership handle with it: the session holds
         // both, so dropping the stream both stops reading and reports the

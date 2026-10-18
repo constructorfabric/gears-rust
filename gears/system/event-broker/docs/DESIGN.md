@@ -1962,10 +1962,20 @@ Wildcards in the resource pattern are supported on every cell above.
 | JOIN, `consume` on a topic | the topic id, e.g. `gts.cf.core.events.topic.v1~vendor.events.tenants.v1` | `topic_id` |
 | JOIN, `consume` on an exact event-type interest | that event type | `event_type_id` |
 | JOIN, `consume` on a wildcard interest (`…vendor.audit.*`) | the event base type `gts.cf.core.events.event.v1~` | `event_type_id` (the pattern) |
+| delivery, `consume` on each matching event | the event's concrete type | `event_type_id` |
 | JOIN on a named group, `consume` | the group id | `consumer_group_id` |
 | create a group, `define` | the family `gts.cf.core.events.consumer_group.v1~` (no group exists yet) | — |
 
 A wildcard pattern is not a GTS identifier, and a decision point that parses the resource type as one would reject it, so a wildcard interest is checked on the event base type: only a grant on the whole event family allows it, unless the decision point evaluates the pattern in `event_type_id` and finds that a grant covers it. Tenant scope stays its own check on `gts.cf.core.events.request.v1~`.
+
+A successful JOIN does not grant every type a selector can match. A bare type
+selector also matches derived types, whose permissions may differ. Before
+queuing each matching event, delivery asks the PEP for `consume` on that event's
+concrete type using the stream caller's security context. Denied events are
+filtered out and count as examined, not delivered. An evaluation failure closes
+the stream with `teardown` without emitting or advancing the reported frontier
+for the current batch, allowing it to be replayed after recovery. Decisions are
+not cached across events; this adds one PEP evaluation per matching event.
 
 **Subject_type is enforced on two independent dimensions**:
 1. **Authorization** (the `subject_type:produce` / `subject_type:consume` permission above) — *capability*: can the principal write or read events whose subject is of this type?
