@@ -19,6 +19,7 @@ use crate::domain::error::DomainError;
 use crate::domain::precondition;
 use crate::infra::storage::clock::{now, stamp_after};
 use crate::infra::storage::declaration_odata_mapper::DeclarationODataMapper;
+use crate::infra::storage::entity::category;
 use crate::infra::storage::entity::declaration::{self, Entity as DeclarationEntity};
 use crate::infra::storage::entity::tenant_permission;
 use settings_service_sdk::odata::DeclarationFilterField;
@@ -99,21 +100,42 @@ fn db_error(err: impl std::fmt::Display) -> DomainError {
 
 /// The domain-affinity arm of the visibility rule, as a query predicate.
 ///
-/// The null arm is what keeps an undomained declaration universally visible;
-/// without it every declaration with no domain vanishes for every scoped
-/// administrator.
+/// A declaration's domain is its own `domain_affinity` or, when it has none,
+/// its category's — the category's is the default its own overrides. So a
+/// declaration with a domain is visible when that domain is permitted, and one
+/// without is visible when its category has no domain or a permitted one. The
+/// category arm is a subquery read with the page, never a copy taken when the
+/// declaration was written, so a category's domain change applies at once. The
+/// null arms are what keep an undomained declaration in an undomained category
+/// universally visible; without them every such declaration vanishes for every
+/// scoped administrator.
 pub(crate) fn apply_visibility(
     select: sea_orm::Select<DeclarationEntity>,
     visibility: &DomainVisibility,
 ) -> sea_orm::Select<DeclarationEntity> {
+    // @cpt-begin:cpt-cf-settings-service-algo-category-management-visibility-filter:p1:inst-cat-visfilter-6
     match visibility {
         DomainVisibility::Unrestricted => select,
-        DomainVisibility::Restricted(domains) => select.filter(
-            declaration::Column::DomainAffinity
-                .is_null()
-                .or(declaration::Column::DomainAffinity.is_in(domains.clone())),
-        ),
+        DomainVisibility::Restricted(domains) => {
+            let permitted_categories = Query::select()
+                .column(category::Column::Id)
+                .from(category::Entity)
+                .and_where(
+                    category::Column::DomainAffinity
+                        .is_null()
+                        .or(category::Column::DomainAffinity.is_in(domains.clone())),
+                )
+                .to_owned();
+            select.filter(
+                declaration::Column::DomainAffinity
+                    .is_in(domains.clone())
+                    .or(declaration::Column::DomainAffinity
+                        .is_null()
+                        .and(declaration::Column::CategoryId.in_subquery(permitted_categories))),
+            )
+        }
     }
+    // @cpt-end:cpt-cf-settings-service-algo-category-management-visibility-filter:p1:inst-cat-visfilter-6
 }
 
 /// Leave out every declaration `hidden` for a caller whose root-to-self chain
@@ -143,6 +165,31 @@ pub(crate) fn exclude_hidden_for(
 
 #[async_trait]
 impl DeclarationRepository for DeclarationRepo {
+    async fn category_domain<C: DBRunner>(
+        &self,
+        conn: &C,
+        declaration_id: Uuid,
+    ) -> Result<Option<Option<String>>, DomainError> {
+        // The category of one declaration, read with the request: never a copy
+        // kept on the declaration, which a change of the category's domain
+        // would leave behind.
+        let filed_under = Query::select()
+            .column(declaration::Column::CategoryId)
+            .from(declaration::Entity)
+            .and_where(declaration::Column::Id.eq(declaration_id))
+            .to_owned();
+        let found = category::Entity::find()
+            .filter(category::Column::Id.in_subquery(filed_under))
+            .secure()
+            .scope_with(&AccessScope::allow_all())
+            .one(conn)
+            .await
+            .map_err(db_error)?;
+        // The foreign key makes a found declaration's category a found row, so
+        // no row means no declaration.
+        Ok(found.map(|category| category.domain_affinity))
+    }
+
     async fn find_by_key<C: DBRunner>(
         &self,
         conn: &C,
@@ -446,3 +493,7 @@ impl DeclarationRepository for DeclarationRepo {
         })
     }
 }
+
+#[cfg(test)]
+#[path = "declaration_domain_tests.rs"]
+mod declaration_domain_tests;

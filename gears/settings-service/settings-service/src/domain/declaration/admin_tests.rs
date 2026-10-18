@@ -1532,3 +1532,37 @@ async fn a_revive_that_cannot_happen_says_why_before_the_default_is_judged() {
         other => panic!("the revive's own refusal first, got {other:?}"),
     }
 }
+
+#[tokio::test]
+async fn a_category_outside_the_callers_domain_is_absent_to_a_create() {
+    // A declaration filed there would take the category's domain, so its
+    // author could neither read nor write it: the category answers as its own
+    // read does, and nothing is created.
+    let h = Harness::verified().await;
+    h.base
+        .bind_category_domain(h.base.category_id(), Some("infrastructure"))
+        .await;
+    let within = |domain: &str| WriteActor {
+        visibility: crate::domain::category::DomainVisibility::Restricted(vec![domain.to_owned()]),
+        ..admin_actor()
+    };
+
+    let err = h
+        .create(h.request("retry_policy"), &within("commercial"))
+        .await
+        .expect_err("a create outside the category's domain");
+    assert!(
+        matches!(
+            err,
+            DomainError::NotFound {
+                resource: "category"
+            }
+        ),
+        "{err:?}"
+    );
+    assert!(h.audit.records().is_empty(), "nothing was created");
+
+    h.create(h.request("retry_policy"), &within("infrastructure"))
+        .await
+        .expect("inside the category's domain");
+}

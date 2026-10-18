@@ -710,6 +710,34 @@ impl ResolutionHarness {
             .expect("metadata");
     }
 
+    /// Bind a category to an administrative domain, or clear it with `None`:
+    /// the domain its undomained declarations take.
+    pub async fn bind_category_domain(&self, category_id: Uuid, domain: Option<&str>) {
+        use crate::domain::category::Patch;
+        let conn = self.db.conn().expect("connection");
+        let current = CategoryRepo
+            .find(&conn, &AccessScope::allow_all(), category_id)
+            .await
+            .expect("category read")
+            .expect("a category");
+        CategoryRepo
+            .update(
+                &conn,
+                &AccessScope::allow_all(),
+                category_id,
+                crate::domain::category::CategoryPatch {
+                    name: None,
+                    description: Patch::Keep,
+                    domain_affinity: domain.map_or(Patch::Clear, |d| Patch::Set(d.to_owned())),
+                    sort_order: None,
+                    icon: Patch::Keep,
+                },
+                current.updated_at,
+            )
+            .await
+            .expect("category domain");
+    }
+
     /// Bind a declaration to an administrative domain, the rest of its
     /// metadata as `declare` leaves it.
     pub async fn bind_domain(&self, declaration_id: Uuid, domain: &str) {

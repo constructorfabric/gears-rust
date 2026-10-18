@@ -106,7 +106,7 @@ The hardest constraint here is not any single field but the rule connecting them
 2. [x] - `p1` - Authorize `create` on `gts.cf.core.settings.declaration.v1~` through the `PolicyEnforcer` PEP - `inst-decl-create-2`
 3. [x] - `p1` - **IF** the decision is deny or cannot be obtained → **RETURN** `403` - `inst-decl-create-3`
 4. [x] - `p1` - DB: SELECT the target category WHERE id = {category_id} - `inst-decl-create-4`
-5. [x] - `p1` - **IF** the category does not exist → **RETURN** `404` - `inst-decl-create-5`
+5. [x] - `p1` - **IF** the category does not exist, or lies outside the caller's administrative domain → **RETURN** `404` - `inst-decl-create-5`
 6. [x] - `p1` - Invoke setting instance key construction using `value_type_id`, `vendor`, the category's slug, and the leaf `name` - `inst-decl-create-6`
 7. [x] - `p1` - **IF** any segment violates the GTS grammar → **RETURN** `400` naming the offending segment - `inst-decl-create-7`
 8. [x] - `p1` - Resolve the value type's trait set through the Type Validator trait - `inst-decl-create-8`

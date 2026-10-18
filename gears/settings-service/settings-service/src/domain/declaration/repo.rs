@@ -13,6 +13,7 @@ use toolkit_security::AccessScope;
 use uuid::Uuid;
 
 use crate::domain::category::DomainVisibility;
+use crate::domain::category::visibility::is_visible;
 use crate::domain::error::DomainError;
 
 /// A declaration as the domain sees it.
@@ -183,6 +184,46 @@ impl DeclarationMetadata {
 /// Operations on declarations.
 #[async_trait]
 pub trait DeclarationRepository: Send + Sync {
+    /// The `domain_affinity` of the category the declaration `declaration_id`
+    /// is filed under — `Some(None)` when that category has none — or `None`
+    /// when no such declaration exists.
+    ///
+    /// # Errors
+    /// [`DomainError`] when the read fails.
+    async fn category_domain<C: DBRunner>(
+        &self,
+        conn: &C,
+        declaration_id: Uuid,
+    ) -> Result<Option<Option<String>>, DomainError>;
+
+    /// Whether `visibility` admits the declaration `declaration_id`, whose own
+    /// domain is `own`: on its own domain when it has one, on its category's
+    /// when it has none — the category's is the default its own overrides.
+    /// The category is read here, at the request, and only when the answer
+    /// depends on it: an unrestricted caller and a declaration with its own
+    /// domain need no read. A declaration that is not there is not admitted,
+    /// as the page query would return no row for it.
+    ///
+    /// # Errors
+    /// [`DomainError`] when the category's domain cannot be read.
+    async fn admits<C: DBRunner>(
+        &self,
+        conn: &C,
+        visibility: &DomainVisibility,
+        declaration_id: Uuid,
+        own: Option<&str>,
+    ) -> Result<bool, DomainError> {
+        // @cpt-begin:cpt-cf-settings-service-algo-category-management-visibility-filter:p1:inst-cat-visfilter-6
+        if matches!(visibility, DomainVisibility::Unrestricted) || own.is_some() {
+            return Ok(is_visible(visibility, own));
+        }
+        Ok(match self.category_domain(conn, declaration_id).await? {
+            Some(inherited) => is_visible(visibility, inherited.as_deref()),
+            None => false,
+        })
+        // @cpt-end:cpt-cf-settings-service-algo-category-management-visibility-filter:p1:inst-cat-visfilter-6
+    }
+
     /// The declaration at exactly this key, whatever its status.
     async fn find_by_key<C: DBRunner>(
         &self,

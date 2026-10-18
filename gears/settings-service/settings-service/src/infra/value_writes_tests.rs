@@ -1890,3 +1890,50 @@ async fn a_secret_write_with_a_stale_or_missing_tag_never_reaches_the_store() {
     .expect("current tag");
     assert_eq!(h.stores(), stores_after_first + 1);
 }
+
+#[tokio::test]
+async fn a_declaration_without_a_domain_is_written_under_its_categorys() {
+    // A declaration with no domain of its own is in its category's: a write
+    // from outside that domain answers as the read does, and stores nothing.
+    let h = Harness::new().await;
+    let d = h.declare("inherited", scope_class::CASCADING).await;
+    h.base
+        .bind_category_domain(h.base.category_id(), Some("infrastructure"))
+        .await;
+    let root = h.base.tree.root;
+    let within = |domain: &str| WriteActor {
+        visibility: DomainVisibility::Restricted(vec![domain.to_owned()]),
+        ..actor(root)
+    };
+
+    let err = h
+        .set(
+            &within("commercial"),
+            "inherited",
+            None,
+            json!(true),
+            Some("absent"),
+        )
+        .await
+        .expect_err("a set from outside the category's domain");
+    assert!(
+        matches!(
+            err,
+            DomainError::NotFound {
+                resource: "declaration"
+            }
+        ),
+        "{err:?}"
+    );
+    assert!(h.rows(d).await.is_empty(), "nothing stored");
+
+    h.set(
+        &within("infrastructure"),
+        "inherited",
+        None,
+        json!(true),
+        Some("absent"),
+    )
+    .await
+    .expect("inside the category's domain");
+}

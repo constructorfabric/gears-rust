@@ -248,7 +248,7 @@ The no-orphan rule protects the invariant that no declaration is ever left point
 
 - [x] `p1` - **ID**: `cpt-cf-settings-service-algo-category-management-visibility-filter`
 
-**Input**: Caller `AccessScope` constraints, and a loaded category row or a pending query
+**Input**: Caller `AccessScope` constraints, and a loaded category or declaration row or a pending query
 
 **Output**: Filtered row, or an augmented query predicate
 
@@ -257,7 +257,8 @@ The no-orphan rule protects the invariant that no declaration is ever left point
 2. [x] - `p1` - **IF** the scope carries no domain restriction → **RETURN** the input unchanged; a domain constraint that is present but carries no usable domain name is not the absence of one, and restricts to undomained categories only - `inst-cat-visfilter-2`
 3. [x] - `p1` - Build a predicate matching categories whose `domain_affinity` is null or falls within the permitted domain set, so an undomained category stays universally visible - `inst-cat-visfilter-3`
 4. [x] - `p1` - Apply the predicate inside the query rather than as a post-filter, so pagination counts and cursors reflect only visible rows - `inst-cat-visfilter-4`
-5. [x] - `p1` - **RETURN** the filtered row or the augmented query predicate - `inst-cat-visfilter-5`
+5. [x] - `p1` - For a declaration, apply the same predicate to its effective domain — its own `domain_affinity`, or its category's when it has none, the category's being the default its own overrides: inside the page query for the declaration list, browse and search, and, for a declaration loaded by key, by reading its category's domain at the request rather than from the effective-value cache, so a category's domain change applies at once - `inst-cat-visfilter-6`
+6. [x] - `p1` - **RETURN** the filtered row or the augmented query predicate - `inst-cat-visfilter-5`
 
 ## 4. States (CDSL)
 
@@ -402,6 +403,7 @@ The system **MUST** emit an audit record through the Audit Emitter for every suc
 - [ ] Getting a category outside the caller's permitted domain returns `404` rather than `403`
 - [ ] A category with null `domain_affinity` is visible to a caller whose `AccessScope` restricts domains
 - [ ] A domain constraint whose values cannot be read as domain names restricts the caller to undomained categories rather than lifting the restriction
+- [x] A declaration with no `domain_affinity` in a category bound to another domain is absent to a domain-restricted caller on the declaration read and list, browse, search, the settings read and history, every value write and the tenant-access operations, and present to a caller of the category's domain and to an unrestricted caller; a declaration's own domain overrides its category's, and a category's domain change applies at the next request
 - [ ] Listing returns categories ordered by `sort_order` then `name`, and that order is reproduced across cursor pages
 - [ ] Listing applies the visibility predicate inside the query, so a page is never short by the number of rows filtered out afterwards
 - [ ] Listing with an OData filter on an unmapped field or an unsupported operator returns `400`

@@ -1260,6 +1260,13 @@ struct JournalingDeclarations(Journal);
 
 #[async_trait::async_trait]
 impl DeclarationRepository for JournalingDeclarations {
+    async fn category_domain<C: toolkit_db::secure::DBRunner>(
+        &self,
+        conn: &C,
+        declaration_id: uuid::Uuid,
+    ) -> Result<Option<Option<String>>, crate::domain::error::DomainError> {
+        DeclarationRepo.category_domain(conn, declaration_id).await
+    }
     async fn find_by_key<C: toolkit_db::secure::DBRunner>(
         &self,
         conn: &C,

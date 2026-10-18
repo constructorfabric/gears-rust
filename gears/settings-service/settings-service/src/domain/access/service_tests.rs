@@ -689,3 +689,57 @@ async fn clearing_removes_one_row_and_leaves_an_ancestor_s_in_force() {
     assert_eq!(free.effective.access, TenantAccess::Overridable);
     assert!(free.effective.supplied_by.is_none());
 }
+
+#[tokio::test]
+async fn a_declaration_without_a_domain_is_restricted_under_its_categorys() {
+    // The permissions of a declaration with no domain of its own follow its
+    // category's domain, as its read does.
+    let h = Harness::new().await;
+    h.base
+        .declare("inherited", scope_class::CASCADING, json!(false))
+        .await;
+    h.base
+        .bind_category_domain(h.base.category_id(), Some("infrastructure"))
+        .await;
+    let t = &h.base.tree;
+    let conn = h.base.db.conn().expect("connection");
+    let key = h.key("inherited");
+    let within = |domain: &str| AccessActor {
+        visibility: DomainVisibility::Restricted(vec![domain.to_owned()]),
+        ..actor(t.root)
+    };
+
+    let refused = h
+        .service
+        .set(
+            &conn,
+            &within("commercial"),
+            &key,
+            t.a,
+            TenantAccess::Hidden,
+            Some(ABSENT_RESTRICTION_TAG),
+        )
+        .await;
+    assert!(
+        matches!(
+            refused,
+            Err(DomainError::NotFound {
+                resource: "declaration"
+            })
+        ),
+        "{refused:?}"
+    );
+    assert!(h.audit.records().is_empty(), "nothing was written");
+
+    h.service
+        .set(
+            &conn,
+            &within("infrastructure"),
+            &key,
+            t.a,
+            TenantAccess::Hidden,
+            Some(ABSENT_RESTRICTION_TAG),
+        )
+        .await
+        .expect("inside the category's domain");
+}

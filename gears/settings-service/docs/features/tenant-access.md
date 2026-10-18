@@ -357,7 +357,7 @@ An access change **MUST** evict the setting's cached entries for the target tena
 - [x] Setting or clearing a restriction evicts the cached entries of the target tenant and its descendants
 - [x] Restriction rows survive a retire and revive of their declaration unchanged
 - [x] `PUT` and `DELETE` on a retired setting's permissions return `410` and change nothing, while `GET` still returns the row it retains
-- [x] A declaration outside the caller's administrative domain is absent to read, set, clear and list, and an undomained one is visible to every domain-restricted caller
+- [x] A declaration outside the caller's administrative domain — its own, or its category's when it has none — is absent to read, set, clear and list, and one with no domain of its own in an undomained category is visible to every domain-restricted caller
 - [x] A restriction listing over a caller subtree past the subtree budget is refused `400` naming the bound; an access change on such a subtree evicts the setting key-wide
 - [x] Every restriction change leaves an audit record with the previous and the new row
 - [x] A restriction's setter is masked in the write's answer, the read and the listing without the PII entitlement and shown with it, and the change's audit images carry the pair and its access but not the setter

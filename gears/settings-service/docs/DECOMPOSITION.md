@@ -89,7 +89,7 @@ One requirement is counted as covered while being split across releases: `cpt-cf
 | tenant-deleted cleanup (DESIGN §4.4) | R2 | consumed once Account Management publishes the signal |
 | `cpt-cf-settings-service-fr-consumer-activation` | R3 | [DESIGN-activation](./DESIGN-activation.md) — subscription, filtered notification, delivery until confirmed |
 | `cpt-cf-settings-service-fr-dependency-group-declaration` — enforcement | R3 | the all-or-nothing set of a group's members; the group **declaration** is in 2.3 |
-| `cpt-cf-settings-service-fr-domain-affinity-filtering` | R3 | reads and search filtered by the caller's administrative domain |
+| `cpt-cf-settings-service-fr-domain-affinity-filtering` | R3 | the domain constraint reaching the gear: `domain_affinity` declared as a PEP property of the category, declaration and value resources and kept out of the row-level secure filter, and a policy that grants an administrator a domain (DESIGN §4.8 *Administrative domain*); the gear's own filters — categories by their domain, declarations by theirs or their category's — apply wherever a category or a declaration is loaded: the category and declaration features, and the settings read, browse, history, search, value write and tenant-access features |
 
 ## 2. Entries
 

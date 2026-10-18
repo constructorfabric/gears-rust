@@ -19,7 +19,7 @@ use super::{
     evict_access_change, may_restrict, restriction_tag, strictest,
 };
 use crate::audit::{AuditOperation, AuditRecord, AuditSink, AuditValue, ImageClass};
-use crate::domain::category::{DomainVisibility, is_visible};
+use crate::domain::category::DomainVisibility;
 use crate::domain::declaration::{Declaration, DeclarationRepository};
 use crate::domain::error::DomainError;
 use crate::domain::platform_scope::PlatformScope;
@@ -145,7 +145,16 @@ where
             .find_by_key(conn, &AccessScope::allow_all(), key.as_str())
             .await?
             .ok_or_else(absent)?;
-        if !is_visible(&actor.visibility, declaration.domain_affinity.as_deref()) {
+        if !self
+            .declarations
+            .admits(
+                conn,
+                &actor.visibility,
+                declaration.id,
+                declaration.domain_affinity.as_deref(),
+            )
+            .await?
+        {
             return Err(absent());
         }
         if self
