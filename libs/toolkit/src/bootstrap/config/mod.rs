@@ -470,8 +470,8 @@ fn reject_legacy_tracing_key(figment: &figment::Figment) -> Result<()> {
          \x20 tracing.metrics       -> opentelemetry.metrics\n\
          \x20 tracing.exporter      -> opentelemetry.exporter (shared) or \
          opentelemetry.tracing.exporter\n\
-         \x20 tracing.sampler, .propagation, .http, .logs_correlation \
-         -> opentelemetry.tracing.*\n\
+         \x20 tracing.sampler, .logs_correlation -> opentelemetry.tracing.*\n\
+         \x20 tracing.propagation, .http        -> (removed; never read by code)\n\
          \n\
          Environment overrides use the same path, so APP__TRACING__* becomes \
          APP__OPENTELEMETRY__*. See docs/TRACING_SETUP.md."
