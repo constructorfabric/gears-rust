@@ -271,6 +271,15 @@ export RUST_BACKTRACE=full
 ```
 
 
+### 2.6.1. Git Hooks
+
+The first `make` run installs git hooks from `.githooks/` as symlinks into your git hooks directory (it respects `core.hooksPath` and never overwrites an existing hook). They run the checks that most often fail in CI, scoped to what changed:
+
+- `pre-commit` (staged files): rustfmt, `cfs validate`, offline lychee link check, CRLF.
+- `pre-push` (changes vs `origin/main`): clippy on affected packages, architecture lints (`cargo gears lint --dylint`), forbidden words (needs bash >= 4 and jq: `brew install bash jq` on macOS).
+
+A check whose tool is not installed is skipped with a notice. Bypass with `git commit --no-verify` / `git push --no-verify`. Opt out with `GEARS_NO_HOOKS=1` and remove with `make uninstall-hooks`. In other repos sharing the same hooks directory the hooks do nothing.
+
 ### 2.7. Sign Your Commits (DCO)
 
 This project uses the Developer Certificate of Origin (DCO) version 1.1.

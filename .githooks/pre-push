@@ -1,0 +1,75 @@
+#!/bin/sh
+# pre-push hook, auto-installed by any `make` run (see install.sh). Checks what the push adds vs main.
+set -eu
+# The symlink may live in a hooks dir shared by many repos (global core.hooksPath):
+# no-op outside gears-rust, and always run the current repo's own copy (stdin is kept).
+root=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0
+[ -f "$root/.githooks/lib.sh" ] || exit 0
+[ "$0" -ef "$root/.githooks/pre-push" ] || exec "$root/.githooks/pre-push" "$@"
+cd "$root"
+. "$root/.githooks/lib.sh"
+HOOK_CMD=push
+
+zeros=0000000000000000000000000000000000000000
+IFS='
+'
+set -f
+
+# pkg_of <file>: name of the nearest enclosing non-root Cargo package, if any.
+pkg_of() {
+    d=$(dirname "$1")
+    while [ "$d" != "." ] && [ "$d" != "/" ]; do
+        if [ -f "$d/Cargo.toml" ] && grep -q '^\[package\]' "$d/Cargo.toml"; then
+            sed -n '/^\[package\]/,/^\[/s/^name *= *"\(.*\)".*/\1/p' "$d/Cargo.toml" | head -n 1
+            return
+        fi
+        d=$(dirname "$d")
+    done
+}
+
+check_ref() {
+    sha=$1
+    base_ref=origin/main
+    git rev-parse --verify -q "$base_ref" >/dev/null || base_ref=main
+    git rev-parse --verify -q "$base_ref" >/dev/null || { echo "hook: skipping all checks: neither origin/main nor main found"; return 0; }
+    base=$(git merge-base "$sha" "$base_ref") || { echo "hook: skipping all checks: no merge-base with $base_ref"; return 0; }
+    changed=$(git diff --name-only "$base" "$sha")
+    [ -n "$changed" ] || return 0
+
+    pkgs=""
+    for f in $changed; do
+        p=$(pkg_of "$f")
+        [ -z "$p" ] || pkgs="$pkgs
+$p"
+    done
+    pkgs=$(printf '%s\n' "$pkgs" | sed '/^$/d' | sort -u)
+
+    # clippy also surfaces compile errors; flags mirror CI (Makefile CLIPPY_FLAGS)
+    if [ -n "$pkgs" ] && need clippy cargo "https://rustup.rs"; then
+        args=""
+        for p in $pkgs; do args="$args -p $p"; done
+        # shellcheck disable=SC2086
+        run clippy "run: cargo clippy$args --all-targets --all-features" \
+            cargo clippy $args --all-targets --all-features -- -D warnings -D clippy::perf
+    fi
+
+    # Workspace-wide, as `make dylint` (cargo-gears has no CI-equivalent package filter)
+    if printf '%s\n' "$changed" | grep -Eq '(\.rs|(^|/)Cargo\.toml)$' \
+        && need dylint cargo-gears "cargo install --locked cargo-gears"; then
+        run dylint "run: make dylint" cargo gears lint --dylint
+    fi
+
+    # the script needs jq and bash >= 4 (mapfile); macOS ships bash 3.2
+    if need forbidden-words jq "brew install jq / apt install jq" \
+        && need forbidden-words "bash>=4" "brew install bash"; then
+        run forbidden-words "remove the forbidden words reported above" \
+            .github/scripts/check-forbidden-words.sh "$base" "$sha"
+    fi
+}
+
+while IFS=' ' read -r _lref lsha _rref _rsha; do
+    [ "$lsha" != "$zeros" ] || continue
+    check_ref "$lsha"
+done
+
+finish

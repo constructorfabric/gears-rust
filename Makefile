@@ -1,5 +1,10 @@
 CI := 1
 
+# Auto-install git hooks on any make run (idempotent, silent unless it installs something;
+# skipped in CI or with GEARS_NO_HOOKS=1; see .githooks/install.sh).
+_HOOKS_MSG := $(shell sh $(dir $(lastword $(MAKEFILE_LIST))).githooks/install.sh --quiet 2>/dev/null)
+$(if $(_HOOKS_MSG),$(info $(_HOOKS_MSG)))
+
 # Python helper scripts must run inside a repository-managed virtual environment.
 # PYTHON_BOOTSTRAP is used only to create that environment; PYTHON is the venv interpreter.
 PYTHON_BOOTSTRAP ?= $(shell command -v python3 2>/dev/null || command -v python 2>/dev/null || echo python3)
@@ -224,7 +229,7 @@ help: py-env
 
 # -------- Set up --------
 
-.PHONY: setup install-tools check-prereq-local cfs-ensure cfs-validate cfs-repair cfs-validate-kit-local py-env
+.PHONY: setup install-tools install-hooks uninstall-hooks check-prereq-local cfs-ensure cfs-validate cfs-repair cfs-validate-kit-local py-env
 
 py-env: $(PY_ENV_STAMP)
 	$(call print_target_banner)
@@ -237,8 +242,18 @@ $(PY_ENV_STAMP): $(PY_REQUIREMENTS)
 	@mkdir -p $(dir $(PY_ENV_STAMP))
 	@cat $(PY_REQUIREMENTS) > $(PY_ENV_STAMP)
 
+## Install git hooks (pre-commit, pre-push) as symlinks into the git hooks dir
+install-hooks:
+	$(call print_target_banner)
+	@sh .githooks/install.sh
+
+## Remove the git hooks installed by install-hooks (only symlinks into .githooks)
+uninstall-hooks:
+	$(call print_target_banner)
+	@sh .githooks/install.sh --uninstall
+
 ## Install all required development tools
-setup: .setup-stamp py-env
+setup: .setup-stamp py-env install-hooks
 	$(call print_target_banner)
 
 # Re-run setup whenever the tool list changes (Makefile is the source of truth),

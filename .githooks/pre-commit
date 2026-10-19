@@ -1,0 +1,51 @@
+#!/bin/sh
+# pre-commit hook, auto-installed by any `make` run (see install.sh). Checks staged files only.
+set -eu
+# The symlink may live in a hooks dir shared by many repos (global core.hooksPath):
+# no-op outside gears-rust, and always run the current repo's own copy.
+root=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0
+[ -f "$root/.githooks/lib.sh" ] || exit 0
+[ "$0" -ef "$root/.githooks/pre-commit" ] || exec "$root/.githooks/pre-commit" "$@"
+cd "$root"
+. "$root/.githooks/lib.sh"
+HOOK_CMD=commit
+
+# Newline-separated path lists; split on newlines only, no globbing.
+IFS='
+'
+set -f
+staged=$(git diff --cached --name-only --diff-filter=ACMR)
+[ -n "$staged" ] || exit 0
+pick() { printf '%s\n' "$staged" | grep -E "$1" || true; }
+
+# rustfmt (checks the working-tree copy of each staged file)
+rs=$(pick '\.rs$')
+if [ -n "$rs" ] && need rustfmt rustfmt "rustup component add rustfmt"; then
+    # shellcheck disable=SC2086
+    run rustfmt "run: cargo fmt" rustfmt --check --edition 2024 $rs
+fi
+
+# CFS: `cfs validate` only. `make cfs-validate` runs `cfs init --yes` first,
+# which rewrites files and must not happen mid-commit.
+cfs=$(pick '^(\.cf-studio/|\.cf-studio-kit\.toml$|studio-kit-gears/.*\.md$|docs/.*\.md$|gears/.*/docs/.*\.md$|libs/.*/docs/.*\.md$)')
+if [ -n "$cfs" ] && need cfs cfs "pipx install git+https://github.com/constructorfabric/studio.git"; then
+    run cfs "run: cfs validate and fix the reported artifacts" cfs validate
+fi
+
+# lychee, offline: catches broken relative links / missing files without network
+md=$(pick '\.md$' | grep -v '^docs/web-docs/' || true)
+if [ -n "$md" ] && need lychee lychee "cargo install lychee"; then
+    # shellcheck disable=SC2086
+    run lychee "fix the broken links above" lychee --offline --no-progress --config lychee.toml $md
+fi
+
+# CRLF (same rule as .github/workflows/crlf-check.yml)
+crlf_check() {
+    # shellcheck disable=SC2086
+    bad=$(git ls-files --eol -- $nonwin | grep 'i/crlf' || true)
+    [ -z "$bad" ] || { printf '%s\n' "$bad"; return 1; }
+}
+nonwin=$(printf '%s\n' "$staged" | grep -Ev '\.(bat|ps1)$' || true)
+[ -z "$nonwin" ] || run crlf "convert to LF (dos2unix <file>) and re-stage" crlf_check
+
+finish
