@@ -107,7 +107,7 @@ use timescaledb_usage_collector_plugin as _;
 
 #[cfg(feature = "clickhouse-usage-collector")]
 use clickhouse_usage_collector_plugin as _;
-#[cfg(feature = "quota-enforcement")]
+#[cfg(any(feature = "quota-enforcement", feature = "bss-rating"))]
 use cluster as _;
 #[cfg(feature = "quota-enforcement")]
 use quota_enforcement as _;
@@ -128,3 +128,6 @@ use policy_engine as _;
 
 #[cfg(feature = "bss-approvals")]
 use bss_approvals as _;
+
+#[cfg(feature = "bss-rating")]
+use bss_rating as _;

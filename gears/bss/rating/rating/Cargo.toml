@@ -1,0 +1,90 @@
+[package]
+name = "cf-gears-bss-rating"
+edition.workspace = true
+license.workspace = true
+description = "BSS Rating gear: deterministic rating of commercial facts and usage into billable items"
+
+[lib]
+name = "bss_rating"
+
+[lints]
+workspace = true
+
+[features]
+# ClientHub provider test doubles (DESIGN 11 §4.12): fakes of the upstream contracts that exist on
+# `main`, so every feature can be accepted against them before the providers do. Never linked into
+# a production build; a double never stands in for a production contract.
+test-providers = [
+  "dep:bss-pricing-sdk",
+  "dep:cluster",
+  "dep:standalone-cluster-plugin",
+]
+
+[dependencies]
+bss-rating-sdk = { workspace = true }
+bss-pricing-sdk = { workspace = true, optional = true }
+# `FakeClusterLeaders` binds its leader-election backend through the real cluster wiring over the
+# standalone in-memory cache, as the cluster SDK resolves backends only through a process client.
+cluster = { workspace = true, optional = true }
+standalone-cluster-plugin = { workspace = true, optional = true }
+
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+time = { workspace = true, features = ["serde-well-known"] }
+uuid = { workspace = true }
+# FIPS-validated SHA-256 for payload and request digests, as pricing's `digest.rs`.
+aws-lc-rs = { workspace = true }
+tracing = { workspace = true }
+
+# Gear runtime: `db` enables `DatabaseCapability`.
+toolkit = { workspace = true, features = ["db"] }
+toolkit-db = { workspace = true, features = ["pg", "sqlite"] }
+toolkit-db-macros = { workspace = true }
+toolkit-macros = { workspace = true }
+toolkit-security = { workspace = true }
+toolkit-canonical-errors = { workspace = true, features = ["axum", "utoipa"] }
+# `AuthzPermissionV1` + `gts_instance!` for the permission catalog; the expansion names `gts`.
+toolkit-gts = { workspace = true }
+gts = { workspace = true }
+sea-orm = { workspace = true, features = ["sqlx-postgres", "sqlx-sqlite"] }
+sea-orm-migration = { workspace = true }
+
+# PEP (`PolicyEnforcer`, `ResourceType`, `AccessRequest`) and the GTS label registration.
+authz-resolver-sdk = { workspace = true }
+types-registry-sdk = { workspace = true }
+# Gear crates named by `#[toolkit::gear(deps = [types_registry, authz_resolver])]`.
+authz-resolver = { workspace = true }
+types-registry = { workspace = true }
+# Advisory leadership through `LeaderElectionV1` (ADR-0008, R-27). The SDK only: no `deps = [cluster]`
+# edge, as quota-enforcement.
+cluster-sdk = { workspace = true }
+
+# REST surface.
+axum = { workspace = true }
+utoipa = { workspace = true, features = ["time"] }
+
+tokio = { workspace = true, features = ["time", "macros", "rt"] }
+tokio-util = { workspace = true }
+# Literal Prometheus names on the global meter; no-op until the host wires an exporter.
+opentelemetry = { workspace = true, features = ["metrics"] }
+
+[dev-dependencies]
+bss-rating = { package = "cf-gears-bss-rating", path = ".", features = ["test-providers"] }
+bss-rating-sdk = { workspace = true, features = ["golden"] }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "test-util"] }
+tower = { workspace = true }
+tempfile = { workspace = true }
+# `json!` keeps member order, so the digest tests see unsorted objects and prove the sort; a
+# build of this crate alone would otherwise get sorted maps from `serde_json`.
+serde_json = { workspace = true, features = ["preserve_order"] }
+# The metric names and labels the alerts use, read back from an in-memory exporter.
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
+# `OutboxMessage::created_at`, to hand the placeholder queue worker a message.
+chrono = { workspace = true }
+# PostgreSQL tests (`tests/postgres_*.rs`, ignored by default): the pinned image and the
+# `testcontainers` re-export.
+test-containers = { workspace = true }
+testcontainers-modules = { workspace = true }

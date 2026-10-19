@@ -1,0 +1,33 @@
+# Crates that must stay free of I/O: no async runtime, database, HTTP stack or ClientHub anywhere in
+# their normal dependency tree. `make check-pure-crates` (tools/scripts/check_pure_crates.py) runs
+# `cargo tree` for each package and fails when a denied crate appears.
+
+[[crate]]
+package = "cf-gears-bss-rating-core"
+# gears/bss/rating/docs/DESIGN.md §1.3: an evaluation replays byte-identically years later, so
+# nothing that reads a clock, a database or the network may take part in it.
+reason = "BSS Rating evaluation core is pure (rating DESIGN §1.3)"
+deny = [
+  "tokio",
+  "tokio-util",
+  "sea-orm",
+  "sea-orm-migration",
+  "sqlx",
+  "http",
+  "axum",
+  "hyper",
+  "reqwest",
+  "tonic",
+  # ClientHub and the gear runtime.
+  "cf-gears-toolkit",
+  "cf-gears-toolkit-db",
+  "cf-gears-toolkit-contract",
+  # Randomness: an evaluation that draws a random value cannot replay byte-identically.
+  "rand",
+  "rand_core",
+  "getrandom",
+  # Calendar crates with a wall-clock reader. `chrono` reads the clock only behind its `clock`
+  # feature, which `cargo tree -e normal` does not show, so it is denied whole; the core takes
+  # instants as arguments.
+  "chrono",
+]
