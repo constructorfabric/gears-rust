@@ -5,7 +5,7 @@ use crate::test_support::{FailingEnqueuer, bound_outbox, enqueued_messages, test
 use quota_enforcement_sdk::PolicySchemaSnapshot;
 use quota_enforcement_sdk::testing::test_metric;
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
-use toolkit_db::secure::SecureUpdateExt;
+use toolkit_db::secure::{SecureEntityExt, SecureUpdateExt};
 
 fn context() -> SecurityContext {
     SecurityContext::anonymous()
@@ -612,4 +612,40 @@ async fn transitions_on_an_unknown_policy_or_version_are_refused_and_write_nothi
         "and creates no version"
     );
     handle.stop().await;
+}
+
+#[tokio::test]
+async fn audit_rows_read_back_in_transition_order() {
+    let db = test_db().await;
+    let (_handle, outbox) = bound_outbox(&db).await;
+    let store = SqlPolicyStore::new(db.clone(), outbox);
+    let id = store
+        .create_policy(&context(), draft(), &[])
+        .await
+        .expect("create")
+        .policy_id;
+    // Across an hour boundary, where text timestamps once sorted 10:05 first.
+    let morning = time::macros::datetime!(2026-10-16 9:05 UTC);
+    let conn = db.conn().expect("conn");
+    for (version, at) in [(2, morning), (3, morning + time::Duration::hours(1))] {
+        repo::append_audit(&conn, audit_row(&id, version, "updated", "op", None, at))
+            .await
+            .expect("audit");
+    }
+    let versions: Vec<i64> = policy_operation_log::Entity::find()
+        .filter(policy_operation_log::Column::PolicyId.eq(id.to_string()))
+        .filter(policy_operation_log::Column::Version.gt(1))
+        .secure()
+        .scope_with(&toolkit_security::AccessScope::allow_all())
+        .order_by(
+            policy_operation_log::Column::OccurredAt,
+            sea_orm::Order::Asc,
+        )
+        .all(&conn)
+        .await
+        .expect("read")
+        .into_iter()
+        .map(|row| row.version)
+        .collect();
+    assert_eq!(versions, vec![2, 3]);
 }

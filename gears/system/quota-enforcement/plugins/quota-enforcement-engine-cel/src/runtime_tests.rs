@@ -14,7 +14,7 @@ fn runtime() -> Result<Runtime, EngineError> {
     })
 }
 
-fn eval(source: &str) -> Result<Value, EngineError> {
+fn parse(source: &str) -> Result<SpannedExpr, EngineError> {
     let parsed = cel_core::parse(source);
     if let Some(error) = parsed.errors.first() {
         return Err(EngineError::Internal(format!(
@@ -22,10 +22,53 @@ fn eval(source: &str) -> Result<Value, EngineError> {
             error.message
         )));
     }
-    let expr = parsed
+    parsed
         .ast
-        .ok_or_else(|| EngineError::Internal("test expression produced no AST".into()))?;
-    runtime()?.eval(&expr)
+        .ok_or_else(|| EngineError::Internal("test expression produced no AST".into()))
+}
+
+fn eval(source: &str) -> Result<Value, EngineError> {
+    runtime()?.eval(&parse(source)?)
+}
+
+/// `source` against one bound `record`, under a budget of `limit` units.
+fn eval_bounded(source: &str, record: Value, limit: u64) -> Result<Value, EngineError> {
+    let limit = NonZeroU64::new(limit)
+        .ok_or_else(|| EngineError::Internal("test budget must be nonzero".into()))?;
+    let mut runtime = Runtime {
+        meter: EvaluationBudget::new(None, limit, limit)?.start(),
+        variables: BTreeMap::from([("record".to_owned(), record)]),
+    };
+    runtime.eval(&parse(source)?)
+}
+
+fn large_record() -> Value {
+    json!({ "region": "eu", "blob": "x".repeat(4000) })
+}
+
+#[test]
+fn a_field_read_charges_the_field_not_the_whole_record() -> Result<(), EngineError> {
+    assert_eq!(
+        eval_bounded(r#"record.region == "eu""#, large_record(), 20)?,
+        json!(true)
+    );
+    assert_eq!(
+        eval_bounded("has(record.region)", large_record(), 20)?,
+        json!(true)
+    );
+    Ok(())
+}
+
+#[test]
+fn copying_a_large_value_is_still_charged() {
+    assert_eq!(
+        eval_bounded("record", large_record(), 20),
+        Err(EngineError::CostExceeded)
+    );
+    assert_eq!(
+        eval_bounded("record.blob", large_record(), 20),
+        Err(EngineError::CostExceeded)
+    );
 }
 
 #[test]
@@ -165,4 +208,48 @@ fn runtime_reports_map_call_and_node_errors() {
         let error = eval(source).expect_err("invalid runtime operation must fail");
         assert!(error.to_string().contains(message), "{source}: {error}");
     }
+}
+
+#[test]
+fn a_value_passed_through_ternaries_or_a_bind_is_charged_once() -> Result<(), EngineError> {
+    let nested = r#"true ? (true ? (true ? record.blob : "") : "") : """#;
+    assert!(eval_bounded(nested, large_record(), 80)?.is_string());
+    let bound = "cel.bind(x, record.blob, x)";
+    assert!(eval_bounded(bound, large_record(), 140)?.is_string());
+    Ok(())
+}
+
+fn range(n: usize) -> String {
+    let items: Vec<String> = (0..n).map(|i| i.to_string()).collect();
+    format!("[{}]", items.join(","))
+}
+
+#[test]
+fn an_appended_list_keeps_the_list_byte_bound() {
+    // 300 copies of a 4 KB string pass 1 MiB in total, each well within 64 KiB.
+    let past_bytes = format!("{}.map(i, record.blob)", range(300));
+    assert_eq!(
+        eval_bounded(&past_bytes, large_record(), 1_000_000),
+        Err(EngineError::CostExceeded)
+    );
+    let within = format!("{}.map(i, record.region)", range(300));
+    assert_eq!(
+        eval_bounded(&within, large_record(), 1_000_000).map(|v| v.as_array().map(Vec::len)),
+        Ok(Some(300))
+    );
+}
+
+#[test]
+fn a_step_that_reads_the_accumulator_keeps_its_meaning() -> Result<(), EngineError> {
+    assert_eq!(eval("[1, 2].map(x, size(__result__))")?, json!([0, 1]));
+    assert_eq!(
+        eval("[1, 2, 3].filter(x, size(__result__) < 2)")?,
+        json!([1, 2])
+    );
+    // The inner `__result__` is the inner accumulator, so the outer map still appends in place.
+    assert_eq!(
+        eval("[[1, 2], [3]].map(l, l.map(i, size(__result__)))")?,
+        json!([[0, 1], [0]])
+    );
+    Ok(())
 }

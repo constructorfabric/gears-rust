@@ -60,7 +60,7 @@ use serde_json::{Map, Value, json};
 
 use check::{Checker, Kind, Shape};
 use quota_enforcement_sdk::EnvironmentInputs;
-use runtime::{Runtime, measure};
+use runtime::{Runtime, cost};
 
 /// The registered identifier of this engine.
 pub const ENGINE_ID: &str = "cel";
@@ -346,7 +346,9 @@ fn bind_environment(
             )?,
         );
         value.insert("arbitration".into(), quota.arbitration.clone());
-        quotas.push(Value::Object(value));
+        let value = Value::Object(value);
+        runtime::measure(&value)?;
+        quotas.push(value);
     }
     let bindings = [
         ("request", context.request.clone()),
@@ -355,7 +357,7 @@ fn bind_environment(
         ("quotas", Value::Array(quotas)),
     ];
     for (name, value) in bindings {
-        runtime.meter.charge(measure(&value)?)?;
+        runtime.meter.charge(cost(&value)?)?;
         runtime.variables.insert(name.to_owned(), value);
     }
     Ok(())

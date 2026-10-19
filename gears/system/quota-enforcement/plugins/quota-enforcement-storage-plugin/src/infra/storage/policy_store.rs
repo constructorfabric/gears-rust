@@ -177,18 +177,30 @@ async fn audit(
 ) -> Result<(), TxError> {
     repo::append_audit(
         runner,
-        policy_operation_log::ActiveModel {
-            id: Set(uuid::Uuid::now_v7().to_string()),
-            policy_id: Set(id.to_string()),
-            version: Set(i64::from(version)),
-            operation: Set(kind.into()),
-            actor: Set(actor.into()),
-            comment: Set(comment),
-            occurred_at: Set(OffsetDateTime::now_utc().to_string()),
-        },
+        audit_row(id, version, kind, actor, comment, OffsetDateTime::now_utc()),
     )
     .await?;
     Ok(())
+}
+
+/// One transition audit row, stamped `at`.
+fn audit_row(
+    id: &PolicyId,
+    version: u32,
+    kind: &str,
+    actor: &str,
+    comment: Option<String>,
+    at: OffsetDateTime,
+) -> policy_operation_log::ActiveModel {
+    policy_operation_log::ActiveModel {
+        id: Set(uuid::Uuid::now_v7().to_string()),
+        policy_id: Set(id.to_string()),
+        version: Set(i64::from(version)),
+        operation: Set(kind.into()),
+        actor: Set(actor.into()),
+        comment: Set(comment),
+        occurred_at: Set(at),
+    }
 }
 
 /// Keyset cursor of a policy history page: the last returned version number as
@@ -396,12 +408,16 @@ impl SqlPolicyStore {
                             policy_id: id.clone(),
                         }
                     })?;
+                    // @cpt-begin:cpt-cf-quota-enforcement-flow-policy-rollback:p1:inst-prd-deleted-if
+                    // @cpt-begin:cpt-cf-quota-enforcement-flow-policy-rollback:p1:inst-prd-deleted
                     let active =
                         header
                             .active_version
                             .ok_or_else(|| StorageError::PolicyDeleted {
                                 policy_id: id.clone(),
                             })?;
+                    // @cpt-end:cpt-cf-quota-enforcement-flow-policy-rollback:p1:inst-prd-deleted
+                    // @cpt-end:cpt-cf-quota-enforcement-flow-policy-rollback:p1:inst-prd-deleted-if
                     // @cpt-begin:cpt-cf-quota-enforcement-flow-policy-rollback:p1:inst-prd-unknown-if
                     // @cpt-begin:cpt-cf-quota-enforcement-flow-policy-rollback:p1:inst-prd-unknown
                     let row = repo::version(tx, id.as_str(), i64::from(target))

@@ -10,8 +10,8 @@ use authz_resolver_sdk::{AuthZResolverApi, PolicyEnforcer};
 use gts::GtsTypeId;
 use quota_enforcement_sdk::testing::InMemoryStorage;
 use quota_enforcement_sdk::{
-    MetricId, PageRequest, PolicyId, PolicyPatch, PolicyScope, PolicySpec, PolicyVersionState,
-    QuotaEnforcementStoragePluginV1,
+    MetricId, PolicyDraft, PolicyId, PolicyPatch, PolicySchemaSnapshot, PolicyScope, PolicySpec,
+    PolicyUpdate, PolicyVersionState, QuotaEnforcementStoragePluginV1,
 };
 use serde_json::json;
 
@@ -20,8 +20,8 @@ use crate::domain::catalog::{
 };
 use crate::domain::engines::{PolicyArtifactCache, builtin_registry};
 use crate::domain::error::DomainError;
-use crate::domain::policies::PolicySchemas;
 use crate::domain::policies::schemas::CatalogPolicySchemas;
+use crate::domain::policies::{PolicyRuntimeLimits, PolicySchemas};
 use crate::domain::ports::metrics::PolicyTransition;
 use crate::domain::{Admission, Bound, Readiness, Service};
 use crate::test_support::{
@@ -39,12 +39,16 @@ struct Harness {
 }
 
 async fn harness(pdp: Arc<dyn AuthZResolverApi>) -> Harness {
+    harness_with(pdp, policy_limits()).await
+}
+
+async fn harness_with(pdp: Arc<dyn AuthZResolverApi>, limits: PolicyRuntimeLimits) -> Harness {
     let metrics = Arc::new(RecordingMetrics::default());
     let service = Arc::new(Service::new(
         Admission::new(PolicyEnforcer::new(pdp), metrics.clone()),
         Arc::new(Readiness::new()),
         test_limits(),
-        policy_limits(),
+        limits,
         crate::domain::service::OperationsRuntime {
             cache_entries: 16,
             cache_ttl: std::time::Duration::from_secs(5),
@@ -98,6 +102,10 @@ fn permitted() -> Arc<dyn AuthZResolverApi> {
 
 fn tokens() -> MetricId {
     MetricId::parse(METRIC_TOKENS).expect("metric")
+}
+
+fn other() -> MetricId {
+    MetricId::parse(METRIC_OTHER).expect("metric")
 }
 
 fn mrw(scope: PolicyScope) -> PolicySpec {
@@ -448,7 +456,7 @@ async fn the_global_policy_cannot_be_deleted_and_history_pages_are_bounded() {
     ));
 
     let page = policies
-        .list(&ctx(), &PolicyId::global(), PageRequest::first(10))
+        .list(&ctx(), &PolicyId::global(), Some(10), None)
         .await
         .expect("history");
     assert_eq!(page.items.len(), 1);
@@ -456,7 +464,7 @@ async fn the_global_policy_cannot_be_deleted_and_history_pages_are_bounded() {
         assert!(
             matches!(
                 policies
-                    .list(&ctx(), &PolicyId::global(), PageRequest::first(limit))
+                    .list(&ctx(), &PolicyId::global(), Some(limit), None)
                     .await,
                 Err(DomainError::InvalidPolicy {
                     reason: "INVALID_PAGE",
@@ -466,6 +474,147 @@ async fn the_global_policy_cannot_be_deleted_and_history_pages_are_bounded() {
             "limit {limit} is outside the configured bound"
         );
     }
+}
+
+/// A CEL version whose stored schema closure no longer matches the catalogue.
+fn stale_cel_draft() -> PolicyDraft {
+    PolicyDraft {
+        schema_snapshot: PolicySchemaSnapshot::default(),
+        scope: PolicyScope::Metric { metric: tokens() },
+        engine_id: "cel".to_owned(),
+        engine_config: json!({ "expr": r#"{ "allow": true }"# }),
+        timeout_ms: None,
+        description: None,
+        comment: None,
+        created_by: "operator".to_owned(),
+    }
+}
+
+fn stale_cel_update(if_match_version: u32) -> PolicyUpdate {
+    PolicyUpdate {
+        schema_snapshot: Some(PolicySchemaSnapshot::default()),
+        if_match_version,
+        engine_id: None,
+        engine_config: None,
+        timeout_ms: None,
+        comment: None,
+        created_by: "operator".to_owned(),
+    }
+}
+
+#[tokio::test]
+async fn a_terminal_rollback_target_is_reported_before_catalogue_drift() {
+    let h = harness(permitted()).await;
+    let policies = h.service.policies().expect("bound");
+
+    let deleted = h
+        .storage
+        .create_policy(&ctx(), stale_cel_draft(), &[])
+        .await
+        .expect("v1")
+        .policy_id;
+    h.storage
+        .update_policy(&ctx(), deleted.clone(), stale_cel_update(1), &[])
+        .await
+        .expect("v2");
+    h.storage
+        .delete_policy(&ctx(), deleted.clone(), None, &[])
+        .await
+        .expect("delete");
+    let err = policies.rollback(&ctx(), deleted, 1, None).await;
+    assert!(
+        matches!(err, Err(DomainError::PolicyDeleted { .. })),
+        "{err:?}"
+    );
+
+    let rolled = h
+        .storage
+        .create_policy(
+            &ctx(),
+            PolicyDraft {
+                scope: PolicyScope::Metric { metric: other() },
+                ..stale_cel_draft()
+            },
+            &[],
+        )
+        .await
+        .expect("v1")
+        .policy_id;
+    h.storage
+        .update_policy(&ctx(), rolled.clone(), stale_cel_update(1), &[])
+        .await
+        .expect("v2");
+    h.storage
+        .rollback_policy(&ctx(), rolled.clone(), 1, None, &[])
+        .await
+        .expect("v2 rolled back");
+    let err = policies.rollback(&ctx(), rolled, 2, None).await;
+    assert!(
+        matches!(err, Err(DomainError::VersionRolledBack { version: 2, .. })),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_deleted_policy_reports_deletion_for_a_rolled_back_or_unknown_target() {
+    let h = harness(permitted()).await;
+    let policies = h.service.policies().expect("bound");
+    let id = policies
+        .create(&ctx(), mrw(PolicyScope::Metric { metric: tokens() }))
+        .await
+        .expect("v1")
+        .policy_id;
+    policies
+        .update(&ctx(), id.clone(), patch(1))
+        .await
+        .expect("v2");
+    policies
+        .rollback(&ctx(), id.clone(), 1, None)
+        .await
+        .expect("v2 rolled back");
+    policies
+        .delete(&ctx(), id.clone(), None)
+        .await
+        .expect("delete");
+    for target in [2, 9] {
+        let err = policies.rollback(&ctx(), id.clone(), target, None).await;
+        assert!(
+            matches!(err, Err(DomainError::PolicyDeleted { .. })),
+            "target {target}: {err:?}"
+        );
+    }
+    let never = PolicyId::new(uuid::Uuid::now_v7().to_string());
+    let err = policies.rollback(&ctx(), never, 1, None).await;
+    assert!(
+        matches!(err, Err(DomainError::PolicyNotFound { .. })),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_omitted_history_limit_is_the_platform_default_within_the_configured_bound() {
+    let limits = crate::config::PoliciesSection {
+        list_max_limit: 500,
+        ..crate::config::PoliciesSection::default()
+    }
+    .to_limits()
+    .expect("limits");
+    let h = harness_with(permitted(), limits).await;
+    let policies = h.service.policies().expect("bound");
+    let id = policies
+        .create(&ctx(), mrw(PolicyScope::Metric { metric: tokens() }))
+        .await
+        .expect("v1")
+        .policy_id;
+    for version in 1..=100 {
+        policies
+            .update(&ctx(), id.clone(), patch(version))
+            .await
+            .expect("next version");
+    }
+    let page = policies.list(&ctx(), &id, None, None).await.expect("page");
+    assert_eq!(page.items.len(), 100);
+    assert!(page.next_cursor.is_some());
 }
 
 #[tokio::test]
@@ -490,10 +639,7 @@ async fn a_denied_operator_never_reaches_storage() {
     let id = PolicyId::global();
     let denials = [
         policies.read(&ctx(), &id, None).await.err(),
-        policies
-            .list(&ctx(), &id, PageRequest::first(10))
-            .await
-            .err(),
+        policies.list(&ctx(), &id, Some(10), None).await.err(),
         policies.update(&ctx(), id.clone(), patch(1)).await.err(),
         policies.rollback(&ctx(), id.clone(), 1, None).await.err(),
         policies.delete(&ctx(), id.clone(), None).await.err(),

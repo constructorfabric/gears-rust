@@ -5,8 +5,7 @@ use axum::http::{StatusCode, Uri};
 use axum::response::IntoResponse;
 use axum::{Extension, Router};
 use quota_enforcement_sdk::{
-    MetricId, PageRequest, PolicyId, PolicyPatch, PolicyScope, PolicySpec, PolicyVersion,
-    PolicyVersionMeta,
+    MetricId, PolicyId, PolicyPatch, PolicyScope, PolicySpec, PolicyVersion, PolicyVersionMeta,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -315,14 +314,7 @@ async fn history(
 ) -> ApiResult<axum::Json<PolicyHistoryDto>> {
     let page = service
         .policies()?
-        .list(
-            &ctx,
-            &PolicyId::new(id),
-            PageRequest {
-                limit: query.limit.unwrap_or(PageRequest::DEFAULT_LIMIT),
-                cursor: query.cursor,
-            },
-        )
+        .list(&ctx, &PolicyId::new(id), query.limit, query.cursor)
         .await?;
     Ok(axum::Json(PolicyHistoryDto {
         items: page.items.into_iter().map(Into::into).collect(),

@@ -688,3 +688,105 @@ fn the_bounded_profile_admits_its_own_functions_and_collections() {
         assert!(compile(&expr).is_ok(), "refused: {expr}");
     }
 }
+
+/// The gear's default `evaluation_cost_limit`.
+const SHIPPED_COST_LIMIT: u64 = 10_000;
+
+#[test]
+fn the_prd_policies_fit_the_shipped_cost_limit_with_a_realistic_quota_set() -> TestResult {
+    let owned: Vec<QuotaSnapshot> = (0..20)
+        .map(|i| quota(Some(10_000), i * 10))
+        .collect::<Result<_, _>>()?;
+    let arbitration = json!({ "regions": ["eu", "us"], "weight": 3 });
+    let quotas: Vec<_> = owned
+        .iter()
+        .enumerate()
+        .map(|(i, q)| {
+            let tier = if i == 0 {
+                QuotaScopeTier::User
+            } else {
+                QuotaScopeTier::Tenant
+            };
+            (q, tier, arbitration.clone())
+        })
+        .collect();
+    for (name, expr) in [("split", SPLIT), ("region gate", REGION_GATE)] {
+        let decision = evaluate(
+            expr,
+            &Scenario {
+                quotas: &quotas,
+                amount: 50,
+                request: json!({ "region": "eu" }),
+                cost_limit: SHIPPED_COST_LIMIT,
+                metric: METRIC,
+            },
+        )
+        .map_err(|e| format!("{name}: {e}"))?;
+        assert_eq!(decision.result, DecisionResult::Allowed, "{name}");
+    }
+    Ok(())
+}
+
+/// Twenty quotas whose arbitration data each sits near the default 4 KiB
+/// metadata bound: together past one value's 64 KiB, each well within it.
+fn heavy_quotas() -> Result<Vec<QuotaSnapshot>, Box<dyn std::error::Error>> {
+    (0..20).map(|_| quota(Some(10_000), 0)).collect()
+}
+
+fn heavy_arbitration() -> Value {
+    json!({ "regions": ["eu", "us"], "weight": 3, "note": "x".repeat(3500) })
+}
+
+#[test]
+fn a_large_quota_set_binds_within_the_shipped_cost_limit() -> TestResult {
+    let owned = heavy_quotas()?;
+    let quotas: Vec<_> = owned
+        .iter()
+        .map(|q| (q, QuotaScopeTier::Tenant, heavy_arbitration()))
+        .collect();
+    let decision = evaluate(
+        r#"{ "debit_plan": [ { "id": quotas[0].id, "amount": amount } ] }"#,
+        &Scenario {
+            quotas: &quotas,
+            amount: 5,
+            request: json!({ "region": "eu" }),
+            cost_limit: SHIPPED_COST_LIMIT,
+            metric: METRIC,
+        },
+    )?;
+    assert_eq!(decision.result, DecisionResult::Allowed);
+    Ok(())
+}
+
+#[test]
+fn the_prd_policies_filter_a_large_quota_set_within_the_shipped_cost_limit() -> TestResult {
+    let owned = heavy_quotas()?;
+    let quotas: Vec<_> = owned
+        .iter()
+        .enumerate()
+        .map(|(i, q)| {
+            let tier = if i == 0 {
+                QuotaScopeTier::User
+            } else {
+                QuotaScopeTier::Tenant
+            };
+            (q, tier, heavy_arbitration())
+        })
+        .collect();
+    for (name, expr, debited) in [("split", SPLIT, 2), ("region gate", REGION_GATE, 20)] {
+        let decision = evaluate(
+            expr,
+            &Scenario {
+                quotas: &quotas,
+                amount: 5,
+                request: json!({ "region": "eu" }),
+                cost_limit: SHIPPED_COST_LIMIT,
+                metric: METRIC,
+            },
+        )
+        .map_err(|e| format!("{name}: {e}"))?;
+        assert_eq!(decision.result, DecisionResult::Allowed, "{name}");
+        assert_eq!(decision.debit_plan.len(), debited, "{name}");
+    }
+    Ok(())
+}

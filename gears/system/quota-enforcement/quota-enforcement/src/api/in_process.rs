@@ -247,7 +247,11 @@ impl quota_enforcement_sdk::QuotaOperatorClientV1 for InProcessQuotaOperator {
         id: quota_enforcement_sdk::PolicyId,
         page: PageRequest,
     ) -> Result<PageResult<quota_enforcement_sdk::PolicyVersionMeta>, QuotaEnforcementError> {
-        Ok(self.service.policies()?.list(ctx, &id, page).await?)
+        Ok(self
+            .service
+            .policies()?
+            .list(ctx, &id, Some(page.limit), page.cursor)
+            .await?)
     }
 }
 

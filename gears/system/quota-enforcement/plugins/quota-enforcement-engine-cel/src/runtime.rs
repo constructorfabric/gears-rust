@@ -1,8 +1,11 @@
 //! Metered evaluator for the explicitly accepted CEL AST profile.
 //!
-//! Every node charges the [`EvaluationMeter`] before it runs and every produced
-//! value is measured against the value bounds, so the budget is enforced from
-//! inside the evaluation rather than by a timeout that cannot preempt it.
+//! Every node charges the [`EvaluationMeter`] before it runs, every produced
+//! value is measured against the value bounds, and every byte copied or created
+//! is charged, so the budget is enforced from inside the evaluation rather than
+//! by a timeout that cannot preempt it. Moving a value costs nothing beyond its
+//! node: reads borrow along variable and field chains, and `map` and `filter`
+//! append to their result in place.
 //! Integer arithmetic is checked; overflow and division by zero are type
 //! errors, never wraps.
 use std::collections::BTreeMap;
@@ -11,12 +14,16 @@ use cel_core::types::{BinaryOp, ComprehensionData, Expr, SpannedExpr, UnaryOp};
 use quota_enforcement_sdk::{EngineError, EvaluationMeter};
 use serde_json::{Map, Value};
 
-/// Largest value, measured as JSON bytes, an expression may build or be given.
+/// Largest map or string, measured as JSON bytes, an expression may build or be given.
 pub const MAX_VALUE_BYTES: usize = 64 * 1024;
+/// Largest list as a whole, such as the quota set or a `filter` over it.
+pub const MAX_LIST_BYTES: usize = 1024 * 1024;
 /// Most elements one list or map may hold.
 pub const MAX_ITEMS: usize = 1024;
 /// Deepest nesting one value may reach.
 pub const MAX_DEPTH: usize = 48;
+/// Bytes copied or created that are charged as one unit, the cost of one node.
+pub const BYTES_PER_UNIT: u64 = 64;
 
 /// An evaluation-time type error.
 pub fn error(message: &str) -> EngineError {
@@ -24,9 +31,19 @@ pub fn error(message: &str) -> EngineError {
 }
 
 /// Check size and depth before cloning external values or traversing recursive
-/// JSON. The measure is also the cost charged for carrying the value.
+/// JSON, returning the size in bytes.
 pub fn measure(value: &Value) -> Result<u64, EngineError> {
-    let mut pending = vec![(value, 0)];
+    measure_from(value, 0)
+}
+
+/// [`measure`] for a value nested `depth` levels deep.
+fn measure_from(value: &Value, depth: usize) -> Result<u64, EngineError> {
+    let max_bytes = if value.is_array() {
+        MAX_LIST_BYTES
+    } else {
+        MAX_VALUE_BYTES
+    };
+    let mut pending = vec![(value, depth)];
     let mut bytes = 0_usize;
     while let Some((value, depth)) = pending.pop() {
         if depth > MAX_DEPTH {
@@ -58,11 +75,123 @@ pub fn measure(value: &Value) -> Result<u64, EngineError> {
             }
             _ => {}
         }
-        if bytes > MAX_VALUE_BYTES {
+        if bytes > max_bytes {
             return Err(EngineError::CostExceeded);
         }
     }
     u64::try_from(bytes).map_err(|_| EngineError::CostExceeded)
+}
+
+/// Check `value` against the bounds and return its size in budget units.
+pub fn cost(value: &Value) -> Result<u64, EngineError> {
+    Ok(measure(value)?.div_ceil(BYTES_PER_UNIT))
+}
+
+/// The element a `map` or `filter` step appends to its accumulator.
+enum Append<'a> {
+    /// `accu + [element]`.
+    Always(&'a SpannedExpr),
+    /// `cond ? accu + [element] : accu`.
+    When(&'a SpannedExpr, &'a SpannedExpr),
+}
+
+fn is_ident(expr: &SpannedExpr, name: &str) -> bool {
+    matches!(&expr.node, Expr::Ident(n) if n == name)
+}
+
+fn appended<'a>(step: &'a SpannedExpr, accu: &str) -> Option<&'a SpannedExpr> {
+    match &step.node {
+        Expr::Binary {
+            op: BinaryOp::Add,
+            left,
+            right,
+        } if is_ident(left, accu) => match &right.node {
+            Expr::List(items) => match items.as_slice() {
+                [item] if !item.optional => Some(&item.expr),
+                _ => None,
+            },
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Recognise the append step of the `map` and `filter` expansions, unless the
+/// operator's own expression reads the accumulator, which in-place appending hides.
+fn append_step<'a>(step: &'a SpannedExpr, accu: &str) -> Option<Append<'a>> {
+    let append = match &step.node {
+        Expr::Ternary {
+            cond,
+            then_expr,
+            else_expr,
+        } if is_ident(else_expr, accu) => appended(then_expr, accu).map(|e| Append::When(cond, e)),
+        _ => appended(step, accu).map(Append::Always),
+    }?;
+    let read = match &append {
+        Append::Always(element) => reads(element, accu),
+        Append::When(cond, element) => reads(cond, accu) || reads(element, accu),
+    };
+    (!read).then_some(append)
+}
+
+/// Whether `expr` may read the variable `name`; unknown nodes count as a read.
+fn reads(expr: &SpannedExpr, name: &str) -> bool {
+    match &expr.node {
+        Expr::Null | Expr::Bool(_) | Expr::Int(_) | Expr::String(_) => false,
+        Expr::Ident(n) | Expr::RootIdent(n) => n == name,
+        Expr::List(items) => items.iter().any(|item| reads(&item.expr, name)),
+        Expr::Map(entries) => entries
+            .iter()
+            .any(|entry| reads(&entry.key, name) || reads(&entry.value, name)),
+        Expr::Unary { expr, .. }
+        | Expr::Member { expr, .. }
+        | Expr::MemberTestOnly { expr, .. } => reads(expr, name),
+        Expr::Binary { left, right, .. } => reads(left, name) || reads(right, name),
+        Expr::Ternary {
+            cond,
+            then_expr,
+            else_expr,
+        } => reads(cond, name) || reads(then_expr, name) || reads(else_expr, name),
+        Expr::Index { expr, index, .. } => reads(expr, name) || reads(index, name),
+        Expr::Call { expr, args } => reads(expr, name) || args.iter().any(|a| reads(a, name)),
+        Expr::Bind {
+            var_name,
+            init,
+            body,
+        } => reads(init, name) || (var_name != name && reads(body, name)),
+        // An inner comprehension that rebinds `name` shadows it past its range and init.
+        Expr::Comprehension(c) => {
+            reads(&c.iter_range, name)
+                || reads(&c.accu_init, name)
+                || (c.accu_var != name
+                    && c.iter_var != name
+                    && (reads(&c.loop_condition, name)
+                        || reads(&c.loop_step, name)
+                        || reads(&c.result, name)))
+        }
+        _ => true,
+    }
+}
+
+fn field(value: &Value, name: &str) -> Option<Value> {
+    value.as_object().and_then(|m| m.get(name)).cloned()
+}
+
+fn element(collection: &Value, index: &Value) -> Result<Option<Value>, EngineError> {
+    Ok(match collection {
+        Value::Array(items) => {
+            let at = usize::try_from(integer(index)?).map_err(|_| error("negative index"))?;
+            items.get(at).cloned()
+        }
+        Value::Object(map) => map
+            .get(
+                index
+                    .as_str()
+                    .ok_or_else(|| error("map index must be a string"))?,
+            )
+            .cloned(),
+        _ => None,
+    })
 }
 
 fn integer(value: &Value) -> Result<i64, EngineError> {
@@ -149,7 +278,7 @@ pub struct Runtime {
 }
 
 impl Runtime {
-    /// Evaluate `expr`, charging one unit per node plus the measure of every
+    /// Evaluate `expr`, charging one unit per node plus the size of every
     /// value produced.
     pub fn eval(&mut self, expr: &SpannedExpr) -> Result<Value, EngineError> {
         self.meter.charge(1)?;
@@ -206,30 +335,34 @@ impl Runtime {
                     return Ok(Value::Bool(true));
                 }
                 let right = self.eval(right)?;
-                self.binary(*op, left, right)?
+                Self::binary(*op, left, right)?
             }
+            // Pass-through nodes return a value its producer already checked and charged.
             Expr::Ternary {
                 cond,
                 then_expr,
                 else_expr,
             } => {
-                if boolean(&self.eval(cond)?)? {
-                    self.eval(then_expr)?
+                return if boolean(&self.eval(cond)?)? {
+                    self.eval(then_expr)
                 } else {
-                    self.eval(else_expr)?
-                }
+                    self.eval(else_expr)
+                };
             }
-            Expr::Member { expr, field, .. } => self
-                .eval(expr)?
-                .as_object()
-                .and_then(|m| m.get(field))
-                .cloned()
-                .ok_or_else(|| error("missing CEL field"))?,
-            Expr::MemberTestOnly { expr, field } => Value::Bool(
-                self.eval(expr)?
-                    .as_object()
-                    .is_some_and(|m| m.contains_key(field)),
-            ),
+            Expr::Member {
+                expr, field: name, ..
+            } => match self.path(expr) {
+                Some(base) => field(base, name),
+                None => field(&self.eval(expr)?, name),
+            }
+            .ok_or_else(|| error("missing CEL field"))?,
+            Expr::MemberTestOnly { expr, field: name } => {
+                let has = |base: &Value| base.as_object().is_some_and(|m| m.contains_key(name));
+                Value::Bool(match self.path(expr) {
+                    Some(base) => has(base),
+                    None => has(&self.eval(expr)?),
+                })
+            }
             Expr::Index { expr, index, .. } => self.index(expr, index)?,
             Expr::Call { expr, args } => self.call_expr(expr, args)?,
             Expr::Bind {
@@ -241,31 +374,43 @@ impl Runtime {
                 let previous = self.variables.insert(var_name.clone(), value);
                 let result = self.eval(body);
                 self.restore(var_name, previous);
-                result?
+                return result;
             }
-            Expr::Comprehension(c) => self.comprehension(c)?,
+            Expr::Comprehension(c) => return self.comprehension(c),
             _ => return Err(error("unsupported compiled CEL node")),
         };
-        self.meter.charge(measure(&value)?)?;
+        // Reads, literals and calls copy or create bytes; everything else moves them.
+        let copies = match &expr.node {
+            Expr::Ident(_)
+            | Expr::RootIdent(_)
+            | Expr::Member { .. }
+            | Expr::Index { .. }
+            | Expr::String(_)
+            | Expr::Call { .. } => true,
+            Expr::Binary { .. } => value.is_string(),
+            _ => false,
+        };
+        let bytes = measure(&value)?;
+        if copies {
+            self.meter.charge(bytes.div_ceil(BYTES_PER_UNIT))?;
+        }
         Ok(value)
     }
 
-    fn index(&mut self, expr: &SpannedExpr, index: &SpannedExpr) -> Result<Value, EngineError> {
-        let value = self.eval(expr)?;
-        let index = self.eval(index)?;
-        let found = match value {
-            Value::Array(items) => {
-                let at = usize::try_from(integer(&index)?).map_err(|_| error("negative index"))?;
-                items.get(at).cloned()
-            }
-            Value::Object(map) => map
-                .get(
-                    index
-                        .as_str()
-                        .ok_or_else(|| error("map index must be a string"))?,
-                )
-                .cloned(),
+    /// Borrow the value a variable or field chain names, without copying it.
+    fn path(&self, expr: &SpannedExpr) -> Option<&Value> {
+        match &expr.node {
+            Expr::Ident(name) | Expr::RootIdent(name) => self.variables.get(name),
+            Expr::Member { expr, field, .. } => self.path(expr)?.as_object()?.get(field),
             _ => None,
+        }
+    }
+
+    fn index(&mut self, expr: &SpannedExpr, index: &SpannedExpr) -> Result<Value, EngineError> {
+        let index = self.eval(index)?;
+        let found = match self.path(expr) {
+            Some(collection) => element(collection, &index)?,
+            None => element(&self.eval(expr)?, &index)?,
         };
         found.ok_or_else(|| error("index outside collection"))
     }
@@ -284,7 +429,7 @@ impl Runtime {
         for arg in args {
             values.push(self.eval(arg)?);
         }
-        self.call(name, &values)
+        Self::call(name, &values)
     }
 
     /// A macro expansion: iterate the range, charging one unit per element on
@@ -307,6 +452,9 @@ impl Runtime {
             Value::Object(m) => m.into_iter().map(|(key, _)| Value::String(key)).collect(),
             _ => return Err(error("comprehension requires collection")),
         };
+        if let Some(append) = append_step(&c.loop_step, &c.accu_var) {
+            return self.accumulate(c, values, &append);
+        }
         for value in values {
             self.meter.charge(1)?;
             self.variables.insert(c.iter_var.clone(), value);
@@ -319,6 +467,57 @@ impl Runtime {
         self.eval(&c.result)
     }
 
+    /// `map` and `filter`: push onto an owned list with a running size, so the
+    /// growing result is never copied or measured again.
+    fn accumulate(
+        &mut self,
+        c: &ComprehensionData,
+        values: Vec<Value>,
+        append: &Append<'_>,
+    ) -> Result<Value, EngineError> {
+        let Some(Value::Array(mut items)) = self.variables.remove(&c.accu_var) else {
+            return Err(error("map and filter accumulate a list"));
+        };
+        let mut bytes = measure(&Value::Array(Vec::new()))?;
+        for item in &items {
+            bytes = bytes
+                .checked_add(measure_from(item, 1)?)
+                .ok_or(EngineError::CostExceeded)?;
+        }
+        for value in values {
+            self.meter.charge(1)?;
+            self.variables.insert(c.iter_var.clone(), value);
+            if !boolean(&self.eval(&c.loop_condition)?)? {
+                break;
+            }
+            let element = match append {
+                Append::Always(element) => Some(*element),
+                Append::When(cond, element) => boolean(&self.eval(cond)?)?.then_some(*element),
+            };
+            // The step's own nodes: `+` and the one-element list, plus the ternary.
+            self.meter.charge(if matches!(append, Append::When(..)) {
+                3
+            } else {
+                2
+            })?;
+            let Some(element) = element else { continue };
+            let item = self.eval(element)?;
+            bytes = bytes
+                .checked_add(measure_from(&item, 1)?)
+                .ok_or(EngineError::CostExceeded)?;
+            if items.len() >= MAX_ITEMS || bytes > MAX_LIST_BYTES as u64 {
+                return Err(EngineError::CostExceeded);
+            }
+            items.push(item);
+        }
+        if is_ident(&c.result, &c.accu_var) {
+            return Ok(Value::Array(items));
+        }
+        self.variables
+            .insert(c.accu_var.clone(), Value::Array(items));
+        self.eval(&c.result)
+    }
+
     fn restore(&mut self, name: &str, value: Option<Value>) {
         if let Some(value) = value {
             self.variables.insert(name.to_owned(), value);
@@ -327,12 +526,7 @@ impl Runtime {
         }
     }
 
-    fn binary(&mut self, op: BinaryOp, left: Value, right: Value) -> Result<Value, EngineError> {
-        self.meter.charge(
-            measure(&left)?
-                .checked_add(measure(&right)?)
-                .ok_or(EngineError::CostExceeded)?,
-        )?;
+    fn binary(op: BinaryOp, left: Value, right: Value) -> Result<Value, EngineError> {
         match op {
             BinaryOp::Eq => Ok(Value::Bool(left == right)),
             BinaryOp::Ne => Ok(Value::Bool(left != right)),
@@ -347,10 +541,7 @@ impl Runtime {
         }
     }
 
-    fn call(&mut self, name: &str, values: &[Value]) -> Result<Value, EngineError> {
-        for value in values {
-            self.meter.charge(measure(value)?)?;
-        }
+    fn call(name: &str, values: &[Value]) -> Result<Value, EngineError> {
         match (name, values) {
             ("size", [v]) => {
                 let n = match v {

@@ -166,6 +166,15 @@ async fn create_read_update_rollback_and_history_round_trip() {
 }
 
 #[tokio::test]
+async fn history_without_a_limit_returns_the_first_page_within_the_configured_bound() {
+    let app = operator_app().await;
+    let id = created(&app, metric_policy()).await;
+    let (status, body) = send(&app, Method::GET, &format!("/policies/{id}/versions"), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["items"].as_array().map(Vec::len), Some(1), "{body}");
+}
+
+#[tokio::test]
 async fn server_owned_fields_and_unknown_engines_are_rejected_at_the_edge() {
     let app = operator_app().await;
     for spoofed in ["created_by", "schema_snapshot", "compiled_artifact"] {

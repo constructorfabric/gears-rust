@@ -18,6 +18,24 @@ This is a deliberately restricted CEL execution profile, not a claim that
 before wiring this engine into the registry. Retained policies keep source and
 schemas, never evaluator binaries.
 
+## Evaluation cost
+
+`evaluation_cost_limit` counts units: one per evaluated node and comprehension
+iteration, plus one per 64 bytes copied or created. Binding the inputs charges
+their size once. Reads copy, so a variable, field or index read charges the value
+it returns; reads borrow along the chain, so `q.tier` charges the field, not `q`.
+String literals, string concatenation and function results charge their size.
+Values that are only moved charge their node alone: list and map literals, other
+operators, ternaries, `cel.bind`, and comprehension results. `map` and `filter`
+append to their result in place, so the result is never copied while it grows; an
+expression that reads the generated accumulator `__result__` is evaluated step by
+step instead, with the same result.
+
+Bounds are checked on every produced value, whatever it is charged. A list may
+hold 1 MiB in total, such as the quota set or a `filter` over it. A map or a string
+may hold 64 KiB, and so may each bound quota. Every list or map holds at most 1024
+items, and nesting stops at depth 48.
+
 ## Environment and decision record
 
 The documents fix the typed input triple `{request, resource, arbitration}`
