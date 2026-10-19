@@ -52,18 +52,14 @@ How should the Application Manager hand audit events to the audit plugin so that
 
 Chosen option: "In-process audit plugin trait, same-transaction outbox, at-least-once delivery", because it keeps the request outcome independent of audit availability, gives a durable record before any dispatch, and matches the mechanism of Quota Enforcement and License Enforcement.
 
-The decision has these parts:
+The decision:
 
-* **Event catalog.** Three events: `accepted`, `finished` and `refused`.
-  * `accepted` is committed to the outbox before any dispatch.
-  * `finished` is written in the same transaction as the registry write or delete.
-  * `refused` covers requests refused synchronously, before dispatch.
-* **Event identity.** Every event carries an event id and the operation id or request id it belongs to.
-* **Dispatcher.** A dispatcher (`cpt-cf-application-manager-component-audit-dispatcher`) delivers each event to the single registered audit plugin at least once, in order per operation.
-* **Plugin obligations.** The plugin is idempotent by event id. It owns retention, purge, erasure and exposure; exposure is off by default (`cpt-cf-application-manager-interface-audit-plugin-api`).
-* **No audit reads.** The gear never exposes audit data.
+* Audit events reach the audit plugin through an in-process plugin trait (`cpt-cf-application-manager-interface-audit-plugin-api`), with exactly one audit plugin registered.
+* Each event is written to the transactional outbox in the same transaction as the change it describes. The `finished` event commits with the operation's final report (`cpt-cf-application-manager-entity-operation`).
+* The audit dispatcher (`cpt-cf-application-manager-component-audit-dispatcher`) delivers events at least once, and the plugin deduplicates by event id.
 
-Decision scope: this ADR covers how audit events are produced, stored until delivery, and delivered. It does not decide dispatch order ([ADR 0003](./0003-cpt-cf-application-manager-adr-validate-all-then-dispatch.md)), the HTTP status of outcomes ([ADR 0006](./0006-cpt-cf-application-manager-adr-outcome-http-mapping.md)), or what the registry stores ([ADR 0005](./0005-cpt-cf-application-manager-adr-minimal-application-registry.md)).
+The event content and ordering are required by `cpt-cf-application-manager-fr-audit-event`, `cpt-cf-application-manager-fr-audit-ordering` and `cpt-cf-application-manager-nfr-audit-completeness`. The event catalog, delivery rules and plugin obligations are in [DESIGN](../DESIGN.md).
+
 
 ### Consequences
 
@@ -78,7 +74,7 @@ Decision scope: this ADR covers how audit events are produced, stored until deli
 ### Confirmation
 
 * A test that no dispatch happens without a committed `accepted` event.
-* A test that the `finished` event commits together with the registry write or delete, and rolls back with it.
+* A test that the `finished` event commits together with the operation's final report, and rolls back with it.
 * A test that redelivery of an event is harmless to an idempotent plugin.
 * A test that seeds succeed while the audit plugin is down, and that events are delivered after it returns.
 * Inspection that the public surface offers no operation that returns audit data.
@@ -110,7 +106,7 @@ The gear calls the audit plugin before dispatch and after the outcome, each atte
 
 The gear keeps its own append-only ledger, as License Enforcement does.
 
-* Good, because writes are atomic with the registry and never depend on a plugin.
+* Good, because writes are atomic with the operation record and never depend on a plugin.
 * Bad, because the gear would own retention, purge, erasure and exposure of full manifests.
 * Bad, because environments could not choose their own audit backend.
 * Bad, because a ledger invites an audit read API on the gear.
@@ -120,13 +116,12 @@ The gear keeps its own append-only ledger, as License Enforcement does.
 Audit events are published to the platform event broker and consumers record them.
 
 * Good, because producers and consumers are decoupled.
-* Bad, because the broker is not available yet, so the option is deferred.
+* Bad, because the platform event broker is not available.
 * Bad, because publication still needs an outbox for atomicity with the change.
 
 ## More Information
 
 * Review this decision when the platform event broker is available, or when an environment needs more than one audit sink.
-* Related decisions: [ADR 0003](./0003-cpt-cf-application-manager-adr-validate-all-then-dispatch.md), [ADR 0005](./0005-cpt-cf-application-manager-adr-minimal-application-registry.md), [ADR 0006](./0006-cpt-cf-application-manager-adr-outcome-http-mapping.md).
 * Platform plugin model background: [ClientHub and plugins](../../../../../docs/toolkit_unified_system/03_clienthub_and_plugins.md).
 
 ## Traceability
@@ -137,7 +132,7 @@ Audit events are published to the platform event broker and consumers record the
 This decision directly addresses the following requirements or design elements:
 
 * `cpt-cf-application-manager-fr-audit-event` — defines the event catalog and the content each event carries.
-* `cpt-cf-application-manager-fr-audit-ordering` — `accepted` is committed before dispatch; `finished` commits with the registry change.
+* `cpt-cf-application-manager-fr-audit-ordering` — `accepted` is committed before dispatch; `finished` commits with the operation's final report.
 * `cpt-cf-application-manager-nfr-audit-completeness` — every request yields durable events, and an audit outage does not block seeding.
 * `cpt-cf-application-manager-component-audit-dispatcher` — delivers events at least once, in order per operation ([DESIGN](../DESIGN.md)).
 * `cpt-cf-application-manager-interface-audit-plugin-api` — the plugin trait that receives events and owns retention, purge, erasure and exposure ([DESIGN](../DESIGN.md)).
