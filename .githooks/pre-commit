@@ -5,26 +5,41 @@ set -eu
 # no-op outside gears-rust, and always run the current repo's own copy.
 root=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0
 [ -f "$root/.githooks/lib.sh" ] || exit 0
+# Local git config is installation state that the repo's tracked files cannot provide.
+[ "$(git config --local --bool --get gears.hooks 2>/dev/null)" = true ] || exit 0
 [ "$0" -ef "$root/.githooks/pre-commit" ] || exec "$root/.githooks/pre-commit" "$@"
 cd "$root"
 . "$root/.githooks/lib.sh"
 HOOK_CMD=commit
 
-# Newline-separated path lists; split on newlines only, no globbing.
+# Newline-separated path lists; split on newlines only, no globbing
+# (paths containing newlines are not supported).
 IFS='
 '
 set -f
-staged=$(git diff --cached --name-only --diff-filter=ACMR)
+staged=$(git -c core.quotePath=false diff --cached --name-only --diff-filter=ACMR)
 [ -n "$staged" ] || exit 0
 pick() { printf '%s\n' "$staged" | grep -E "$1" || true; }
 
-# rustfmt (checks the working-tree copy of each staged file)
+# rustfmt checks the staged blob of each file (from the repo root, so rustfmt.toml applies)
+fmt_check() {
+    rc=0
+    for f in $rs; do
+        # stdin mode may exit 0 even when it prints a diff, so also look for the diff itself
+        if ! out=$(git show ":$f" | rustfmt --check --edition 2024 2>&1) || printf '%s\n' "$out" | grep -q '^Diff in '; then
+            printf '%s\n%s\n' "$f" "$out"
+            rc=1
+        fi
+    done
+    return "$rc"
+}
 rs=$(pick '\.rs$')
 if [ -n "$rs" ] && need rustfmt rustfmt "rustup component add rustfmt"; then
-    # shellcheck disable=SC2086
-    run rustfmt "run: cargo fmt" rustfmt --check --edition 2024 $rs
+    run rustfmt "run: cargo fmt" fmt_check
 fi
 
+# cfs and lychee below judge the working-tree copy by design: link targets and CFS artifacts
+# are whole-tree properties; CI checks the commit.
 # CFS: `cfs validate` only. `make cfs-validate` runs `cfs init --yes` first,
 # which rewrites files and must not happen mid-commit.
 cfs=$(pick '^(\.cf-studio/|\.cf-studio-kit\.toml$|studio-kit-gears/.*\.md$|docs/.*\.md$|gears/.*/docs/.*\.md$|libs/.*/docs/.*\.md$)')

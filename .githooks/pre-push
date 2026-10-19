@@ -5,6 +5,8 @@ set -eu
 # no-op outside gears-rust, and always run the current repo's own copy (stdin is kept).
 root=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0
 [ -f "$root/.githooks/lib.sh" ] || exit 0
+# Local git config is installation state that the repo's tracked files cannot provide.
+[ "$(git config --local --bool --get gears.hooks 2>/dev/null)" = true ] || exit 0
 [ "$0" -ef "$root/.githooks/pre-push" ] || exec "$root/.githooks/pre-push" "$@"
 cd "$root"
 . "$root/.githooks/lib.sh"
@@ -33,7 +35,8 @@ check_ref() {
     git rev-parse --verify -q "$base_ref" >/dev/null || base_ref=main
     git rev-parse --verify -q "$base_ref" >/dev/null || { echo "hook: skipping all checks: neither origin/main nor main found"; return 0; }
     base=$(git merge-base "$sha" "$base_ref") || { echo "hook: skipping all checks: no merge-base with $base_ref"; return 0; }
-    changed=$(git diff --name-only "$base" "$sha")
+    # paths containing newlines are not supported
+    changed=$(git -c core.quotePath=false diff --name-only "$base" "$sha")
     [ -n "$changed" ] || return 0
 
     pkgs=""
@@ -44,18 +47,40 @@ $p"
     done
     pkgs=$(printf '%s\n' "$pkgs" | sed '/^$/d' | sort -u)
 
+    # Root files that change what every package compiles with: clippy the whole workspace
+    ws_re='^(Cargo\.toml|Cargo\.lock|clippy\.toml|rust-toolchain\.toml|\.cargo/config\.toml)$'
+    ws=""
+    ! printf '%s\n' "$changed" | grep -Eq "$ws_re" || ws=1
+
+    # by design these check the working tree (a snapshot worktree would rebuild the workspace
+    # on every push); CI is the gate
+    tree_ok=1
+    if [ "$sha" != "$(git rev-parse HEAD)" ]; then
+        echo "hook: skipping clippy and dylint: pushed $(git rev-parse --short "$sha") is not the checked-out HEAD (they check the working tree)"
+        tree_ok=""
+    elif [ -n "$(git status --porcelain --untracked-files=no -- '*.rs' '*Cargo.toml' Cargo.lock)" ]; then
+        echo "hook: note: uncommitted Rust/Cargo changes; clippy and dylint check the working tree, not exactly the pushed commit"
+    fi
+
     # clippy also surfaces compile errors; flags mirror CI (Makefile CLIPPY_FLAGS)
-    if [ -n "$pkgs" ] && need clippy cargo "https://rustup.rs"; then
-        # IFS is newline-only here, so build the -p list as positional args
-        set --
-        for p in $pkgs; do set -- "$@" -p "$p"; done
-        # shellcheck disable=SC2086
-        run clippy "run: cargo clippy $(printf -- '-p %s ' $pkgs)--all-targets --all-features" \
-            cargo clippy "$@" --all-targets --all-features -- -D warnings -D clippy::perf
+    if [ -n "$tree_ok" ] && { [ -n "$pkgs" ] || [ -n "$ws" ]; } \
+        && need clippy clippy "rustup component add clippy"; then
+        if [ -n "$ws" ]; then
+            run clippy "run: cargo clippy --workspace --all-targets --all-features" \
+                cargo clippy --workspace --all-targets --all-features -- -D warnings -D clippy::perf
+        else
+            # IFS is newline-only here, so build the -p list as positional args
+            set --
+            for p in $pkgs; do set -- "$@" -p "$p"; done
+            # shellcheck disable=SC2086
+            run clippy "run: cargo clippy $(printf -- '-p %s ' $pkgs)--all-targets --all-features" \
+                cargo clippy "$@" --all-targets --all-features -- -D warnings -D clippy::perf
+        fi
     fi
 
     # Workspace-wide, as `make dylint` (cargo-gears has no CI-equivalent package filter)
-    if printf '%s\n' "$changed" | grep -Eq '(\.rs|(^|/)Cargo\.toml)$' \
+    if [ -n "$tree_ok" ] \
+        && printf '%s\n' "$changed" | grep -Eq '(\.rs|(^|/)Cargo\.toml)$|^(Cargo\.lock|clippy\.toml|rust-toolchain\.toml|\.cargo/config\.toml)$' \
         && need dylint cargo-gears "cargo install --locked cargo-gears"; then
         run dylint "run: make dylint" cargo gears lint --dylint
     fi

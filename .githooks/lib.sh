@@ -3,13 +3,15 @@
 PATH="$HOME/.local/bin:$PATH"
 failed=0
 
-# have <tool>: succeeds if the tool is on PATH.
+# have <tool>: succeeds if the tool works. clippy/rustfmt are probed by running them:
+# the rustup proxies exist on PATH even when the component is not installed.
 have() {
-    if [ "$1" = "bash>=4" ]; then
-        bash -c '[ "${BASH_VERSINFO[0]}" -ge 4 ]' 2>/dev/null
-    else
-        command -v "$1" >/dev/null 2>&1
-    fi
+    case "$1" in
+        "bash>=4") bash -c '[ "${BASH_VERSINFO[0]}" -ge 4 ]' 2>/dev/null ;;
+        clippy) cargo clippy --version >/dev/null 2>&1 ;;
+        rustfmt) rustfmt --version >/dev/null 2>&1 ;;
+        *) command -v "$1" >/dev/null 2>&1 ;;
+    esac
 }
 
 # need <check> <tool> <install cmd>: succeeds if present, else prints a skip notice.
