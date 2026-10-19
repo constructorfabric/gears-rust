@@ -7,7 +7,8 @@ root=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0
 [ -f "$root/.githooks/lib.sh" ] || exit 0
 # Local git config is installation state that the repo's tracked files cannot provide.
 [ "$(git config --local --bool --get gears.hooks 2>/dev/null)" = true ] || exit 0
-[ "$0" -ef "$root/.githooks/pre-push" ] || exec "$root/.githooks/pre-push" "$@"
+# Re-exec this clone's own copy once (`test -ef` is not POSIX, so an env flag stops the recursion).
+[ -n "${GEARS_HOOK_SELF:-}" ] || { GEARS_HOOK_SELF=1; export GEARS_HOOK_SELF; exec "$root/.githooks/pre-push" "$@"; }
 cd "$root"
 . "$root/.githooks/lib.sh"
 HOOK_CMD=push
