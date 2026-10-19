@@ -4783,6 +4783,7 @@ dependencies = [
  "http",
  "opentelemetry",
  "opentelemetry_sdk",
+ "tokio",
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",

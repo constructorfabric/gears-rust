@@ -694,6 +694,81 @@ async fn trace_context_middleware_continues_inbound_w3c_trace() {
     );
 }
 
+/// A gateway-supplied `x-request-id` must be installed as the task-local
+/// carrier for the whole downstream pipeline, so a gear handler (and any
+/// `toolkit-http` call it makes) sees the edge id.
+#[tokio::test]
+async fn trace_context_middleware_installs_request_id_carrier() {
+    use std::sync::Mutex;
+
+    use axum::routing::get;
+
+    let captured: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let captured_handler = Arc::clone(&captured);
+
+    let app = Router::new()
+        .route(
+            "/x",
+            get(move || {
+                let captured_handler = Arc::clone(&captured_handler);
+                async move {
+                    *captured_handler.lock().unwrap() = toolkit_trace_context::current_request_id();
+                    StatusCode::OK
+                }
+            }),
+        )
+        .layer(from_fn(trace_context_middleware));
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/x")
+                .header("x-request-id", "edge-req-1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        captured.lock().unwrap().as_deref(),
+        Some("edge-req-1"),
+        "the inbound x-request-id must be scoped for downstream propagation"
+    );
+}
+
+/// With no inbound `x-request-id` the carrier stays empty — a gear reached
+/// without the gateway mints nothing.
+#[tokio::test]
+async fn trace_context_middleware_without_header_leaves_carrier_empty() {
+    use std::sync::Mutex;
+
+    use axum::routing::get;
+
+    let captured: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let captured_handler = Arc::clone(&captured);
+
+    let app = Router::new()
+        .route(
+            "/x",
+            get(move || {
+                let captured_handler = Arc::clone(&captured_handler);
+                async move {
+                    *captured_handler.lock().unwrap() = toolkit_trace_context::current_request_id();
+                    StatusCode::OK
+                }
+            }),
+        )
+        .layer(from_fn(trace_context_middleware));
+
+    let resp = app
+        .oneshot(Request::builder().uri("/x").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(captured.lock().unwrap().is_none());
+}
+
 /// The fix depends on the canonical-error layer running *inside* the trace span,
 /// which is a property of the layering order in [`layer_gear_router`], not of
 /// `trace_context_middleware` alone. Build the router the production way and,

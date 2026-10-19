@@ -27,6 +27,7 @@ otel = ["dep:opentelemetry", "dep:tracing-opentelemetry"]
 
 [dependencies]
 http = { workspace = true }
+tokio = { workspace = true }
 tracing = { workspace = true }
 opentelemetry = { workspace = true, optional = true }
 tracing-opentelemetry = { workspace = true, optional = true }
