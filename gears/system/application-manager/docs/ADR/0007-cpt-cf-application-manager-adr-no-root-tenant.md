@@ -1,7 +1,7 @@
 ---
 status: accepted
 date: 2026-10-15
-description: The gear uses no root tenant; its registry and operation records are unrestricted, and the PDP decides platform-level permission with no context tenant
+description: The gear uses no root tenant; its operation records are unrestricted, and the PDP decides platform-level permission with no context tenant
 ---
 <!-- Created: 2026-10-05 by Constructor Tech -->
 # Use No Root Tenant; the PDP Decides Platform-Level Permission
@@ -16,7 +16,7 @@ description: The gear uses no root tenant; its registry and operation records ar
   - [Consequences](#consequences)
   - [Confirmation](#confirmation)
 - [Pros and Cons of the Options](#pros-and-cons-of-the-options)
-  - [No root tenant: unrestricted registry, PDP decides with no context tenant](#no-root-tenant-unrestricted-registry-pdp-decides-with-no-context-tenant)
+  - [No root tenant: unrestricted entities, PDP decides with no context tenant](#no-root-tenant-unrestricted-entities-pdp-decides-with-no-context-tenant)
   - [Resolve the root tenant at startup with a bounded retry](#resolve-the-root-tenant-at-startup-with-a-bounded-retry)
   - [Resolve the root tenant lazily per request](#resolve-the-root-tenant-lazily-per-request)
   - [Root tenant id set in gear configuration](#root-tenant-id-set-in-gear-configuration)
@@ -29,7 +29,7 @@ description: The gear uses no root tenant; its registry and operation records ar
 
 ## Context and Problem Statement
 
-The application registry and the operation records are platform-wide: they belong to the environment, not to a tenant. Scoping them to the platform root tenant would require the gear to look the root tenant up through the tenant resolver at startup. The tenant directory creates that tenant in its own start phase, so the lookup can run before the tenant exists. That causes first-start races and needs a startup retry loop. Deciding who may act at platform level is the job of the authorization plugin, as in other services; for example, usage-collector gates its platform-global catalog writes through the PDP. Should the gear carry a root tenant at all, or should the PDP alone decide platform-level permission?
+The operation records are platform-wide: they belong to the environment, not to a tenant. Scoping them to the platform root tenant would require the gear to look the root tenant up through the tenant resolver at startup. The tenant directory creates that tenant in its own start phase, so the lookup can run before the tenant exists. That causes first-start races and needs a startup retry loop. Deciding who may act at platform level is the job of the authorization plugin, as in other services; for example, usage-collector gates its platform-global catalog writes through the PDP. Should the gear carry a root tenant at all, or should the PDP alone decide platform-level permission?
 
 ## Decision Drivers
 
@@ -40,18 +40,18 @@ The application registry and the operation records are platform-wide: they belon
 
 ## Considered Options
 
-* No root tenant: unrestricted registry, PDP decides with no context tenant
+* No root tenant: unrestricted entities, PDP decides with no context tenant
 * Resolve the root tenant at startup with a bounded retry
 * Resolve the root tenant lazily per request
 * Root tenant id set in gear configuration
 
 ## Decision Outcome
 
-Chosen option: "No root tenant: unrestricted registry, PDP decides with no context tenant", because it removes the tenant-resolver dependency and the start-order problem, and leaves platform-level permission to the one component that owns permission decisions.
+Chosen option: "No root tenant: unrestricted entities, PDP decides with no context tenant", because it removes the tenant-resolver dependency and the start-order problem, and leaves platform-level permission to the one component that owns permission decisions.
 
 The decision has these parts:
 
-* **Unrestricted entities.** The registry and the operation records are unrestricted secure-ORM entities with no `owner_tenant_id` and no other tenant column.
+* **Unrestricted entities.** The operation records are unrestricted secure-ORM entities with no `owner_tenant_id` and no other tenant column.
 * **PDP decision per action.** Every action is a PDP decision with no context tenant and no owner tenant. The decision carries `application_id` where the action concerns one application.
 * **Decision handling.** A permit with no constraints allows the action. A deny refuses it. A permit with any constraint fails closed and the request ends as not permitted.
 * **Startup.** Startup makes no tenant lookup and has no retry.
@@ -65,15 +65,15 @@ The decision has these parts:
 
 ### Confirmation
 
-* Inspection of the entity scoping declaration: the registry and operation records are declared unrestricted and have no tenant column.
+* Inspection of the entity scoping declaration: the operation records are declared unrestricted and have no tenant column.
 * Tests that PDP decisions are requested with no context tenant.
 * A test that a permit carrying constraints is refused as not permitted.
 
 ## Pros and Cons of the Options
 
-### No root tenant: unrestricted registry, PDP decides with no context tenant
+### No root tenant: unrestricted entities, PDP decides with no context tenant
 
-Store platform-wide data unscoped and ask the PDP for every action without a tenant.
+Store operation records unscoped and ask the PDP for every action without a tenant.
 
 * Good, because startup needs no tenant lookup, so no race and no retry.
 * Good, because one component owns permission decisions.
@@ -107,10 +107,6 @@ Configure the root tenant id and use it for scoping.
 
 ## More Information
 
-Related decisions:
-
-* [ADR 0005](./0005-cpt-cf-application-manager-adr-minimal-application-registry.md): the registry this decision leaves unscoped; its table carries no tenant column.
-
 Review and supersession: revisit this decision if per-tenant installs enter scope or if the platform defines a single root tenant that is guaranteed to exist before this gear starts.
 
 ## Traceability
@@ -121,6 +117,5 @@ Review and supersession: revisit this decision if per-tenant installs enter scop
 This decision directly addresses the following requirements or design elements:
 
 * `cpt-cf-application-manager-fr-authorization` — every action is a PDP decision with no context tenant; a permit with constraints fails closed.
-* `cpt-cf-application-manager-nfr-platform-scope` — registry and operation records are one platform-wide set with no tenant scoping.
+* `cpt-cf-application-manager-nfr-platform-scope` — operation records are one platform-wide set with no tenant scoping.
 * `cpt-cf-application-manager-fr-startup-checks` — startup makes no tenant lookup and has no retry.
-* `cpt-cf-application-manager-adr-minimal-application-registry` — related decision: the registry that carries no tenant column.

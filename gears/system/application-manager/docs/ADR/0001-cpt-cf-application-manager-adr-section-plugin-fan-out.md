@@ -50,7 +50,7 @@ A manifest carries one section per kind of seeded data, and each kind is owned b
 
 Chosen option: "Fan-out to every section plugin, discovered once at startup into an in-memory key map", because it is the only option that matches the meaning of a manifest: all sections are required, so all section plugins take part, and each section goes to the section plugin that owns its key. It also moves key and priority conflicts, and discovery failures, to startup, and keeps the seed and uninstall paths free of registry traffic.
 
-Decision scope: this ADR covers how section plugins are found, keyed and ordered inside the Application Manager. It does not decide where schemas come from ([ADR 0002](./0002-cpt-cf-application-manager-adr-plugin-served-section-schemas.md)), how validation and dispatch proceed ([ADR 0003](./0003-cpt-cf-application-manager-adr-validate-all-then-dispatch.md)), the audit plugin (the single registered audit plugin, see [ADR 0004](./0004-cpt-cf-application-manager-adr-audit-via-plugin.md)), or how outcomes are reported over HTTP ([ADR 0006](./0006-cpt-cf-application-manager-adr-outcome-http-mapping.md)).
+Decision scope: this ADR covers how section plugins are found, keyed and ordered inside the Application Manager. Schema sources are decided in [ADR 0002](./0002-cpt-cf-application-manager-adr-plugin-served-section-schemas.md) and the audit plugin in [ADR 0004](./0004-cpt-cf-application-manager-adr-audit-via-plugin.md). Outcome precedence and HTTP mapping are defined in [DESIGN §3.3](../DESIGN.md#33-api-contracts).
 
 ### Consequences
 
@@ -58,23 +58,12 @@ Decision scope: this ADR covers how section plugins are found, keyed and ordered
 * At startup the Application Manager lists the plugin type's instances once, resolves each one by scoped lookup, reads its key, and builds an in-memory key-to-plugin map and a dispatch order sorted by priority, lowest value first. Both are fixed until the next start. The key set is small and bounded, so an in-memory map is sufficient.
 * Startup fails on a repeated key, a repeated priority, a plugin whose key or priority cannot be read, or an unreachable types-registry. A registry that answers with no section plugins is valid: the key set is empty and a valid manifest has an empty set of sections.
 * The seed, uninstall and discovery-of-keys paths never touch the types-registry and never select a plugin per request. Listing section keys needs no plugin call (`cpt-cf-application-manager-fr-discovery`).
-* Adding or removing a section plugin takes effect on restart. Seeding is unavailable during that restart and callers retry (`cpt-cf-application-manager-nfr-availability`). The strict rules apply at once, with no default sections and no grace period (`cpt-cf-application-manager-fr-plugin-rollout`).
+* Adding or removing a section plugin takes effect on restart (`cpt-cf-application-manager-constraint-restart-for-plugin-change`). Seeding is unavailable during that restart (`cpt-cf-application-manager-nfr-availability`). The strict rules apply at once, with no default sections and no grace period.
 * A priority change that reorders dispatch is treated as intentional; the Application Manager does not warn about it.
-* Reviewer-visible trade-off: a section plugin that is registered but broken blocks startup for the whole gear. This is accepted as the deploy-time failure the drivers ask for.
-* Concurrent requests for the same application id are resolved in [DESIGN §4.2](../DESIGN.md#42-concurrent-requests-for-the-same-application): they are left to the section plugins, the system adds no coordination, the last registry writer wins, and both requests are audited.
-
-Impact by concern:
-
-* Performance: no per-request discovery cost; per-request cost is the ordered plugin calls already bounded by the plugin time limit.
-* Security: routing depends only on the startup-built map, so a manifest cannot select or add a section plugin. A key that no section plugin owns makes the manifest invalid. No section plugin is called before authorization (`cpt-cf-application-manager-nfr-authorized-before-plugin`).
-* Reliability: a stale or changing plugin set cannot appear mid-request; the trade is that plugin changes need a restart.
-* Data: the map and order are process memory only; nothing is persisted for this decision.
-* Integration: uses the standard plugin registration model; section plugin authors need no Application Manager change.
-* Operations: conflicts surface in startup logs and failed rollouts, not in seed failures. No runbook is defined here.
-* Testing: see Confirmation.
-* Compliance: no direct compliance effect.
-* UX: no end-user UX effect; there is no end-user UI.
-* Business: new kinds of seeded data do not wait on a shared gear change.
+* A section plugin that is registered but broken blocks startup for the whole gear. This is the deploy-time failure the drivers ask for.
+* Concurrent requests for the same application id are not coordinated by the section plugins. A unique index admits one open operation per application, and a second request is refused as conflict ([DESIGN §4.1](../DESIGN.md#41-concurrent-requests-for-the-same-application), `cpt-cf-application-manager-fr-one-operation-per-application`).
+* Routing depends only on the startup-built map, so a manifest cannot select or add a section plugin. A key that no section plugin owns makes the manifest invalid. No section plugin is called before authorization (`cpt-cf-application-manager-nfr-authorized-before-plugin`).
+* There is no per-request discovery cost. The map and order are process memory only.
 
 ### Confirmation
 
@@ -82,7 +71,6 @@ Impact by concern:
 * A test with a section plugin added and then removed, with no change to gear code, demonstrates `cpt-cf-application-manager-fr-plugin-extensibility`.
 * A test with a counting registry double shows that no types-registry call happens during seed, uninstall or listing keys.
 * Dispatch-order tests confirm lowest priority value first on seed and on uninstall.
-* Review of record: the [DESIGN](../DESIGN.md) describes the init flow as this ADR states.
 
 ## Pros and Cons of the Options
 
@@ -118,8 +106,6 @@ Enumerate and resolve section plugins from the types-registry on each request.
 
 ## More Information
 
-* Review: revisit if section plugins must be added without a restart, or if the key set stops being small and bounded. Such a change would supersede this ADR.
-* Related decisions: [ADR 0002](./0002-cpt-cf-application-manager-adr-plugin-served-section-schemas.md), [ADR 0003](./0003-cpt-cf-application-manager-adr-validate-all-then-dispatch.md), [ADR 0004](./0004-cpt-cf-application-manager-adr-audit-via-plugin.md), [ADR 0005](./0005-cpt-cf-application-manager-adr-minimal-application-registry.md), [ADR 0006](./0006-cpt-cf-application-manager-adr-outcome-http-mapping.md).
 * Platform context: [ClientHub and plugins](../../../../../docs/toolkit_unified_system/03_clienthub_and_plugins.md).
 
 ## Traceability
@@ -135,10 +121,9 @@ This decision directly addresses the following requirements or design elements:
 * `cpt-cf-application-manager-fr-startup-checks` — discovery failures and conflicts stop startup.
 * `cpt-cf-application-manager-fr-required-sections` — every registered key is required, so every section plugin participates.
 * `cpt-cf-application-manager-fr-plugin-extensibility` — plugins are added or removed with no gear code change.
-* `cpt-cf-application-manager-fr-plugin-rollout` — the strict rules apply at once after the restart.
+* `cpt-cf-application-manager-fr-one-operation-per-application` — concurrent requests for one application are refused as conflict.
+* `cpt-cf-application-manager-constraint-restart-for-plugin-change` — plugin changes take effect on restart.
 * `cpt-cf-application-manager-nfr-availability` — seeding is unavailable during the restart a plugin change needs.
 * `cpt-cf-application-manager-nfr-bounded-request-time` — no discovery cost per request.
 * `cpt-cf-application-manager-nfr-authorized-before-plugin` — routing is fixed at startup and no section plugin is called before authorization.
 * `cpt-cf-application-manager-contract-section-plugin` — the contract exposes the key and the registered priority read at startup.
-* `cpt-cf-application-manager-actor-section-plugin` and `cpt-cf-application-manager-actor-section-plugin-author` — the actors who register plugins under this model.
-* `cpt-cf-application-manager-usecase-plugin-change` — the use case of adding or removing a section plugin.
