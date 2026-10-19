@@ -36,6 +36,8 @@ The Application Manager must give every environment one trusted entry point wher
   - [First Seed](#first-seed)
   - [Re-Seed or Upgrade](#re-seed-or-upgrade)
   - [Uninstall an Application](#uninstall-an-application)
+  - [Seed Refused or Partly Failed](#seed-refused-or-partly-failed)
+  - [Discover the Manifest Shape](#discover-the-manifest-shape)
 - [9. Acceptance Criteria](#9-acceptance-criteria)
 - [10. Dependencies](#10-dependencies)
 - [11. Assumptions](#11-assumptions)
@@ -107,7 +109,7 @@ Each goal is met when its success check holds at the first stable release and at
 - **Every seed and uninstall is traced.** Success check: every seed and uninstall request that reaches the system, including a failed one, has an audit event in the audit ledger. The only exception is a refusal whose audit event could not be recorded, and that failure is logged and signalled (`cpt-cf-application-manager-nfr-audit-completeness`).
 - **New kinds of seeded data need no gear change.** Success check: a section plugin is added and removed with no change to the Application Manager's code (`cpt-cf-application-manager-fr-plugin-extensibility`).
 - **Manifests can be built from discovery.** Success check: a manifest built only from the combined schema that discovery returns passes validation.
-- **Failures are actionable.** Success check: every failed request states its outcome category, and the caller can tell what to fix, retry, or request without reading the audit ledger.
+- **Failures are actionable.** Success check: every failed request states its outcome category, and the caller can tell what to fix, retry, or request.
 
 There is no formal user-satisfaction metric, because the user group is small, known, and internal.
 
@@ -125,7 +127,9 @@ There is no formal user-satisfaction metric, because the user group is small, kn
 | Seed | Submitting a manifest for an application. The system checks it and dispatches each section to its section plugin. |
 | Uninstall | Asking every section plugin to remove an application by its id. |
 | Operation | The background run of one accepted seed or uninstall request. It has a status (accepted, running, completed, or interrupted) and, once final, a report. A request that fails a quick check is a refusal: it gets an answer at once and no operation. |
-| Outcome category | The single overall result of a seed or uninstall request, such as succeeded or invalid manifest (`cpt-cf-application-manager-fr-outcome-categories`). |
+| Outcome category | The single overall result of a seed or uninstall request that is not interrupted, such as succeeded or invalid manifest (`cpt-cf-application-manager-fr-outcome-categories`). |
+| Run window | The time an operation may run before it is interrupted. It is bounded and follows from the operator-set section-plugin time limit and the number of section plugins. |
+| Request id | The id that links a refusal or an operation report to its audit events; for an accepted request it is the operation id. |
 | Audit ledger | The append-only table that holds the audit events of every seed and uninstall request (`cpt-cf-application-manager-fr-audit-event`). |
 
 ## 2. Actors
@@ -149,12 +153,26 @@ There is no formal user-satisfaction metric, because the user group is small, kn
 
 - **Role**: An authenticated subject, either a service or an operator, that acts for an application. It sends manifests and uninstall requests, reads discovery and operations when permitted, and never receives calls from the system.
 
+#### Section Plugin
+
+**ID**: `cpt-cf-application-manager-actor-section-plugin`
+
+- **Role**: A platform plugin that owns one section key, serves its schema, and applies and removes its section. Called by the system.
+
+#### Platform Access Control
+
+**ID**: `cpt-cf-application-manager-actor-platform-access-control`
+
+- **Role**: Decides whether a caller may seed, uninstall, read schemas, or read operations. Called by the system.
+
 ### 2.3 Actor Context
 
 ```mermaid
 flowchart LR
     SC["Seeding Caller"] -->|"seed, uninstall, discover, read operation"| AM["Application Manager"]
     OP["Operator"] -->|"seed, uninstall, discover, read operation"| AM
+    AM -->|"get schema, apply, remove"| SP["Section Plugin"]
+    AM -->|"check permission"| PAC["Platform Access Control"]
 ```
 
 ## 3. Operational Concept & Environment
@@ -165,7 +183,6 @@ flowchart LR
 
 - The Application Manager works platform-wide. The whole environment shares one set of seeded applications, with no per-tenant view.
 - Every actor, including an operator acting by hand, reaches the gear only as an authenticated subject through the platform's standard authentication. The gear has no login of its own. The platform turns away requests that fail its own checks, and those never reach the gear.
-- The system **MUST** state, as a rule of the seeding interface, that manifests must not carry secrets, such as passwords or keys. The system cannot detect them, so keeping them out is each seeding team's responsibility.
 - The system **MUST NOT** write manifest content into its own logs, diagnostics, or error text.
 - Section plugins own section data. The system owns operation records and the audit ledger.
 - The interfaces are machine-facing, with no end-user screens.
@@ -193,14 +210,13 @@ flowchart LR
 - Per-tenant installs.
 - Giving meaning to versions or to re-seeds. Section plugins decide.
 - Replaying or driving re-seeds. Each application's seeding caller is responsible.
-- Rollback across several section plugins. It may come in a later phase.
-- Idempotency keys on seed and uninstall requests. They may come in a later phase.
-- Retry rules after a failed, partly failed, or interrupted request. They may come in a later phase.
-- Validation rules for adding or removing a section plugin. They may come in a later phase.
-- A registry of seeded applications, and listing it. It may come in a later phase.
-- Reconciliation of section-plugin state with what is seeded. It may come in a later phase.
-- Reading or exposing audit data. It may come in a later phase.
-- An audit event schema on the platform event broker. It may come in a later phase.
+- Rollback across several section plugins.
+- Idempotency keys on seed and uninstall requests.
+- Retry rules after a failed, partly failed, or interrupted request.
+- Validation rules for adding or removing a section plugin.
+- A registry of seeded applications, and listing it.
+- Reconciliation of section-plugin state with what is seeded.
+- Reading or exposing audit data.
 - Resuming or cancelling operations.
 
 ## 5. Functional Requirements
@@ -222,7 +238,7 @@ The system **MUST** accept a manifest made of an envelope and a set of sections,
 
 - [ ] `p1` - **ID**: `cpt-cf-application-manager-fr-application-id`
 
-The system **MUST** accept any non-empty text within the stated limits (a configurable maximum length, no control characters) as an application id and as a version. It **MUST NOT** parse the id, normalise it, or check its format, and **MUST** compare ids only by exact text. A manifest whose id or version breaks the limits **MUST** be refused at once as invalid manifest, before any operation starts.
+The system **MUST** accept any non-empty text within the stated limits (a maximum length set by the operator, no control characters) as an application id and as a version. It **MUST NOT** parse the id, normalise it, or check its format, and **MUST** compare ids only by exact text. A manifest whose id or version breaks the limits **MUST** be refused at once as invalid manifest, before any operation starts. A missing or invalid maximum length setting stops the system from starting.
 
 - **Rationale**: Application teams already have their own names. Treating the id as opaque avoids a second naming scheme.
 - **Actors**: `cpt-cf-application-manager-actor-seeding-caller`
@@ -267,7 +283,7 @@ The system **MUST** use the priority that each section plugin announces to fix t
 
 - [ ] `p1` - **ID**: `cpt-cf-application-manager-fr-startup-checks`
 
-The system **MUST** fail to start on any plugin-set or configuration problem. It **MUST NOT** read an unreachable plugin registration facility as "no section plugins". When the facility answers with no section plugins, the system **MUST** start with an empty set of section keys.
+The system **MUST** fail to start on any plugin-set or configuration problem: the plugin registration facility cannot answer; a section plugin's key or priority cannot be read; a key is invalid; two section plugins share a key; two share a priority; or a setting is missing or invalid. It **MUST NOT** read an unreachable plugin registration facility as "no section plugins". When the facility answers with no section plugins, the system **MUST** start with an empty set of section keys.
 
 - **Rationale**: Problems must show up at deploy time, when an operator is watching, and not later at seed time.
 - **Actors**: `cpt-cf-application-manager-actor-operator`
@@ -307,18 +323,7 @@ The system **MUST** let a kind of seeded data be added or removed only by adding
 
 - [ ] `p1` - **ID**: `cpt-cf-application-manager-fr-async-operations`
 
-The system **MUST** run every accepted seed and uninstall request as an operation. It **MUST** first make quick checks and refuse a request that fails one at once, with its outcome category, without creating an operation and without calling any section plugin. An accepted request **MUST** get an operation id, and the system **MUST** answer with it before any plugin call. An operation **MUST** be in one of four states: accepted, running, completed, or interrupted. Every operation **MUST** reach a final state, completed or interrupted, within a bounded run window. The system **MUST NOT** resume an interrupted operation.
-
-```mermaid
-stateDiagram-v2
-    [*] --> Accepted: passes the quick checks
-    Accepted --> Running: work starts
-    Running --> Completed: outcome decided
-    Accepted --> Interrupted: run window ends
-    Running --> Interrupted: run window ends
-    Completed --> [*]
-    Interrupted --> [*]
-```
+The system **MUST** run every accepted seed and uninstall request as an operation. It **MUST** first make quick checks and refuse a request that fails one at once, with its outcome category, without creating an operation and without calling any section plugin. An accepted request **MUST** get an operation id, and the system **MUST** answer with it before any section-plugin call. An operation **MUST** be in one of four states: accepted, running, completed, or interrupted. Every operation **MUST** reach a final state, completed or interrupted, within a bounded run window. The system **MUST NOT** resume an interrupted operation.
 
 - **Rationale**: A seed calls every section plugin in turn, so it can take longer than the platform request deadline. Quick checks still answer at once, and the run window gives every operation a known end.
 - **Actors**: `cpt-cf-application-manager-actor-seeding-caller`, `cpt-cf-application-manager-actor-operator`
@@ -345,9 +350,9 @@ After validation succeeds, the system **MUST** dispatch sections to their sectio
 
 - [ ] `p1` - **ID**: `cpt-cf-application-manager-fr-pass-through`
 
-The system **MUST** give each section plugin only its own section, with the same data the caller sent, together with the envelope. It **MUST NOT** compare, merge, or keep history of sections between seeds, and **MUST NOT** keep per-section state.
+The system **MUST** give each section plugin only its own section, unchanged, with the envelope. It **MUST NOT** compare or merge sections, or keep section state between seeds.
 
-- **Rationale**: Domain meaning belongs to section plugins. Passing data through unchanged keeps the Application Manager free of domain logic.
+- **Rationale**: Domain meaning belongs to section plugins, so the system holds no domain logic.
 - **Actors**: `cpt-cf-application-manager-actor-seeding-caller`
 
 #### Section-Plugin-Owned Rollback and Re-Seed Semantics
@@ -363,12 +368,12 @@ The system **MUST** leave rollback, replace-or-update behaviour, idempotency, an
 
 - [ ] `p1` - **ID**: `cpt-cf-application-manager-fr-outcome-categories`
 
-The system **MUST** report every seed and uninstall request as exactly one of these outcome categories. An interrupted operation has none.
+The system **MUST** report every seed and uninstall request that is not interrupted as exactly one of these outcome categories. An interrupted operation has no outcome category.
 
 - succeeded: every section, or every section plugin for uninstall, succeeded;
 - invalid manifest: the manifest failed validation, and nothing is dispatched;
 - plugin rejected: a section plugin refused its section as unacceptable;
-- not permitted: the caller lacks a needed permission, at platform level or in a section plugin;
+- not permitted: platform access control refuses the caller, or a section plugin refuses it for an extra permission of its own;
 - conflict: another operation for the same application is accepted or running;
 - internal failure: a section plugin failed unexpectedly or exceeded the time limit, or the system itself failed unexpectedly;
 - temporarily unavailable: a needed dependency could not answer, nothing is dispatched, and the caller can retry.
@@ -380,16 +385,16 @@ The system **MUST** report every seed and uninstall request as exactly one of th
 
 - [ ] `p1` - **ID**: `cpt-cf-application-manager-fr-outcome-precedence`
 
-When several outcome categories apply, the system **MUST** pick one by a fixed precedence, so the same situation always gives the same answer. It **MUST NOT** tell a caller not permitted or conflict when it could not check permission or running operations. After dispatch, when section plugins fail in different ways, the system **MUST** report the most actionable failure.
+When several outcome categories apply, the system **MUST** pick one by a fixed precedence, so the same situation always gives the same answer. It **MUST NOT** tell a caller not permitted or conflict when it could not check permission or running operations.
 
-- **Rationale**: A fixed answer points the caller to the most important fix first and never hides an outage behind a wrong category.
+- **Rationale**: A fixed answer gives the same result for the same situation and never hides an outage behind a wrong category.
 - **Actors**: `cpt-cf-application-manager-actor-seeding-caller`, `cpt-cf-application-manager-actor-operator`
 
 #### Response Content
 
 - [ ] `p1` - **ID**: `cpt-cf-application-manager-fr-response-content`
 
-Every refusal and every operation report **MUST** let the caller act without reading the audit ledger. It **MUST** carry the outcome category, what to fix, retry, or request, and the id that links the result to its audit events. A refusal for conflict **MUST** name the running operation. A report **MUST** give the outcome of each section, or of each section plugin for uninstall, and every problem with its location for invalid manifest. The report of an interrupted operation **MUST** say so and give the section outcomes recorded so far.
+Every refusal and every operation report **MUST** carry the outcome category, what to fix, retry, or request, and the request id. A refusal for conflict **MUST** name the running operation. A report **MUST** give the outcome of each section, or of each section plugin for uninstall, and every problem with its location for invalid manifest. The report of an interrupted operation **MUST** say so and give the section outcomes recorded so far.
 
 - **Rationale**: Per-section results let callers act on partial failures, and the link to the audit events supports investigation.
 - **Actors**: `cpt-cf-application-manager-actor-seeding-caller`, `cpt-cf-application-manager-actor-operator`
@@ -398,9 +403,9 @@ Every refusal and every operation report **MUST** let the caller act without rea
 
 - [ ] `p1` - **ID**: `cpt-cf-application-manager-fr-bounded-plugin-calls`
 
-The system **MUST** apply one configurable time limit to every plugin call. It **MUST NOT** cancel or undo work that a section plugin has started. A section that exceeds the time limit **MUST** count as an internal failure, and dispatch **MUST** continue with the remaining sections.
+The system **MUST** apply one configurable time limit to every section-plugin call. It **MUST NOT** cancel or undo work that a section plugin has started. A section that exceeds the time limit **MUST** count as an internal failure, and dispatch **MUST** continue with the remaining sections.
 
-- **Rationale**: One slow plugin must not hang a whole request, and operators must be able to tune the limit.
+- **Rationale**: One slow section plugin must not hang a whole request, and operators must be able to tune the limit.
 - **Actors**: `cpt-cf-application-manager-actor-operator`
 - **Verification Method**: Inspection: the section plugin contract offers no way to cancel or undo work.
 
@@ -430,7 +435,7 @@ The system **MUST** let an authorized caller uninstall an application by its id,
 
 - [ ] `p1` - **ID**: `cpt-cf-application-manager-fr-discovery`
 
-The system **MUST** let an authorized caller list the current section keys, read the current schema for one section key, and read the combined schema for a whole manifest. Schemas **MUST** be served live from the section plugins and returned with their schema version. When a section plugin cannot answer, the read **MUST** end as temporarily unavailable.
+The system **MUST** let an authorized caller list the current section keys, read the current schema for one section key, and read the combined schema for a whole manifest. Schemas **MUST** be served live from the section plugins and returned with their schema version. When a section plugin cannot answer, the read **MUST** end as temporarily unavailable. Reads end as not permitted, not found, or temporarily unavailable, and the outcome categories of seed and uninstall do not apply to reads.
 
 - **Rationale**: Application teams need to know what to put in a manifest before they seed.
 - **Actors**: `cpt-cf-application-manager-actor-seeding-caller`, `cpt-cf-application-manager-actor-operator`
@@ -439,7 +444,7 @@ The system **MUST** let an authorized caller list the current section keys, read
 
 - [ ] `p1` - **ID**: `cpt-cf-application-manager-fr-operation-read`
 
-The system **MUST** let a caller with the read-operations permission read an operation by its id and get its status, and its report once it is final. The permission **MUST** be separate from the seed and uninstall permissions. An unknown or purged id **MUST** end as not found. A read **MUST NOT** call any plugin and **MUST NOT** return manifest bodies, section content, or the caller subject. The system **MUST** keep each operation record for an operator-set retention period after the operation is final, then purge it.
+The system **MUST** let a caller with the read operations permission read an operation by its id and get its status, and its report once it is final. The permission **MUST** be separate from the seed and uninstall permissions. An unknown or purged id **MUST** end as not found. A read **MUST NOT** call any section plugin and **MUST NOT** return manifest bodies, section content, or the caller subject. The system **MUST** keep each operation record for an operator-set retention period after the operation is final, then purge it. Reads end as not permitted, not found, or temporarily unavailable, and the outcome categories of seed and uninstall do not apply to reads.
 
 - **Rationale**: An accepted request ends in the background, so callers need a way to learn how it ended. A separate permission lets operators decide who may see results without granting the right to seed.
 - **Actors**: `cpt-cf-application-manager-actor-seeding-caller`, `cpt-cf-application-manager-actor-operator`
@@ -460,7 +465,7 @@ The system **MUST** accept requests only from subjects authenticated through the
 
 - [ ] `p1` - **ID**: `cpt-cf-application-manager-fr-authorization`
 
-The system **MUST** have platform access control decide, separately for seed, uninstall, schema reading, and operation reading, whether the caller may act. It holds no tenant scope and no access rules of its own. A section plugin that needs an extra permission **MUST** be able to refuse a request as not permitted.
+The system **MUST** have platform access control decide, separately for each of four permissions, whether the caller may act: seed, uninstall, read schemas, and read operations. It holds no tenant scope and no access rules of its own. A section plugin that needs an extra permission **MUST** be able to refuse a request as not permitted.
 
 - **Rationale**: Seeding and uninstalling change what other services believe is installed, so they must be tightly controlled.
 - **Actors**: `cpt-cf-application-manager-actor-seeding-caller`, `cpt-cf-application-manager-actor-operator`
@@ -469,7 +474,7 @@ The system **MUST** have platform access control decide, separately for seed, un
 
 - [ ] `p1` - **ID**: `cpt-cf-application-manager-fr-audit-event`
 
-The system **MUST** record an audit event for every seed and uninstall request that reaches the system, including a refused one, in its audit ledger. The audit ledger **MUST** be an append-only table, and it **MUST** be the only place where the system keeps audit events.
+The system **MUST** record an audit event for every seed and uninstall request that reaches the system, including a refused one, in its audit ledger. The audit ledger **MUST** be an append-only table, and it **MUST** be the only place where the system keeps audit events. The only exception is a refusal whose audit event could not be recorded (`cpt-cf-application-manager-fr-audit-ordering`).
 
 - **Rationale**: One trail of every request lets operators trace what happened. An append-only table means a recorded audit event is never changed or removed.
 - **Actors**: `cpt-cf-application-manager-actor-operator`
@@ -496,7 +501,7 @@ The system **MUST NOT** dispatch anything for a request until its accepted event
 
 - [ ] `p1` - **ID**: `cpt-cf-application-manager-nfr-audit-completeness`
 
-Every seed and uninstall request that reaches the system **MUST** have its audit events in the audit ledger, whatever its outcome.
+Every seed and uninstall request that reaches the system **MUST** have its audit events in the audit ledger, whatever its outcome. The only exception is a refusal whose audit event could not be recorded (`cpt-cf-application-manager-fr-audit-ordering`).
 
 - **Threshold**: In every test run, the audit events in the audit ledger match the operations created, the operations that reached a final state, and the refusals, with no gaps. No audit event exists for a change that did not commit. The only request without an audit event is a refusal whose event could not be recorded, and that failure is logged and signalled.
 - **Rationale**: An audit ledger with gaps cannot be trusted.
@@ -508,7 +513,7 @@ Every seed and uninstall request that reaches the system **MUST** have its audit
 
 The system **MUST** treat all seeded applications as one platform-wide set, **MUST NOT** make operation records owned by or visible per tenant, and **MUST** make them reachable only through the platform's access checks.
 
-- **Threshold**: No operation record read or write skips the access check. No per-tenant copy of operation records exists.
+- **Threshold**: No operation record read or write made on behalf of a caller skips the access check. No per-tenant copy of operation records exists.
 - **Rationale**: Installed applications are a property of the environment, not of a tenant.
 - **Verification Method**: Inspection of the public surface and of data ownership, plus tests on every action.
 
@@ -518,28 +523,28 @@ The system **MUST** treat all seeded applications as one platform-wide set, **MU
 
 The system **MUST NOT** call any section plugin, for schema, dispatch, or removal, for a caller who is not authorized for that action.
 
-- **Threshold**: Zero section-plugin calls for requests that end as not permitted or whose permission could not be checked, in tests on every action.
+- **Threshold**: Zero section-plugin calls for requests that platform access control refuses or cannot check, in tests on every action.
 - **Rationale**: Callers without permission must not trigger section-plugin work or probe section-plugin schemas.
 
 #### Bounded Plugin Call Time
 
 - [ ] `p1` - **ID**: `cpt-cf-application-manager-nfr-bounded-call-time`
 
-The system **MUST** stop waiting for any plugin call once the time limit has passed. Operators **MUST** be able to set the time limit by configuration, and the system **MUST NOT** hardcode it.
+The system **MUST** stop waiting for any section-plugin call once the time limit has passed. Operators **MUST** be able to set the time limit by configuration, and the system **MUST NOT** hardcode it.
 
-- **Threshold**: Every plugin call ends within the time limit. Changing the setting changes the limit with no code change. A missing or invalid setting stops the system from starting.
-- **Rationale**: A stuck plugin must not block seeding callers for an unbounded time.
+- **Threshold**: Every section-plugin call ends within the time limit. Changing the setting changes the limit with no code change. A missing or invalid setting stops the system from starting.
+- **Rationale**: A stuck section plugin must not block seeding callers for an unbounded time.
 
 #### Bounded Request Time
 
-- [ ] `p2` - **ID**: `cpt-cf-application-manager-nfr-bounded-request-time`
+- [ ] `p1` - **ID**: `cpt-cf-application-manager-nfr-bounded-request-time`
 
 The system **MUST** answer every seed and uninstall request within the platform request deadline, with a refusal or with an operation id, and **MUST** bring every operation to a final state within its run window.
 
 - **Threshold**: With test plugins that always reach the time limit, every immediate answer comes within the platform request deadline, and every operation is completed or interrupted by the end of its run window.
 - **Rationale**: Deployment pipelines need a predictable upper bound for a seed, and the platform ends any request that runs past its deadline.
 
-#### Validation Failure Leaves Section Plugins Untouched
+#### No Dispatch on Invalid, Unavailable, or Conflicting Requests
 
 - [ ] `p1` - **ID**: `cpt-cf-application-manager-nfr-no-partial-on-invalid`
 
@@ -552,16 +557,16 @@ The system **MUST NOT** dispatch anything to any section plugin for a request th
 
 - [ ] `p2` - **ID**: `cpt-cf-application-manager-nfr-availability`
 
-The system **MUST** be available whenever deploys can happen in its environment. Seeding is unavailable while a section-plugin change restarts the gear.
+The system **MUST** meet the platform availability baseline. Seeding is unavailable while a section-plugin change restarts the gear.
 
-- **Threshold**: No gear-specific availability percentage applies. The platform baseline applies.
+- **Threshold**: No gear-specific availability percentage applies. The platform baseline applies, and seeding resumes once the restart completes.
 - **Rationale**: Deploys must not wait on this gear.
 
 #### Operational Signals
 
 - [ ] `p2` - **ID**: `cpt-cf-application-manager-nfr-operational-signals`
 
-The system **MUST** give operators a visible signal for audit events that failed to record, for startup failures, and for repeated section-plugin timeouts. It **MUST** make counts of each outcome category, of plugin-call timeouts, and of interrupted operations observable.
+The system **MUST** give operators a visible signal for audit events that failed to record, for startup failures, and for section-plugin timeouts that reach an operator-set count. It **MUST** make counts of each outcome category, of section-plugin-call timeouts, and of interrupted operations observable.
 
 - **Threshold**: Each signal condition raises an operator-visible signal in tests, and the counts can be read by operators.
 - **Rationale**: Operators must notice failures early.
@@ -571,7 +576,7 @@ The system **MUST** give operators a visible signal for audit events that failed
 - Per-tenant isolation: not applicable, because the gear is platform-wide.
 - High-volume throughput targets: not applicable, because the set of section keys is small and seeds are infrequent deploy-time requests.
 - Rate limiting at gear level: not applicable, because callers are trusted subjects. Platform request protection applies.
-- Retention and cleanup of audit data: out of scope for this phase.
+- Retention and cleanup of audit data: out of scope.
 - Response caching of schemas: excluded on purpose, because every seed must use fresh schemas.
 - MFA, SSO, and session management: not applicable, because the gear has no interactive sessions.
 - Safety: not applicable, because the gear only handles information.
@@ -590,7 +595,7 @@ The system **MUST** give operators a visible signal for audit events that failed
 
 - **Type**: REST API
 - **Stability**: unstable, until the first stable release.
-- **Description**: Lets an authorized seeding caller submit a manifest and uninstall an application by its id. An accepted request returns an operation id at once. A refused request returns its outcome category, what to fix, and the running operation id for conflict.
+- **Description**: Lets an authorized seeding caller submit a manifest and uninstall an application by its id. An accepted request returns an operation id at once. A refused request returns its outcome category, what to fix, retry, or request, the request id, and the running operation id for conflict.
 - **Breaking Change Policy**: Additive changes are backward compatible. Changes to the manifest envelope, outcome categories, or operation states need a major version bump and notice to application teams.
 
 #### Operations Interface
@@ -599,7 +604,7 @@ The system **MUST** give operators a visible signal for audit events that failed
 
 - **Type**: REST API
 - **Stability**: unstable, until the first stable release.
-- **Description**: Lets a caller with the read-operations permission read an operation by its id: its status and, once final, its report.
+- **Description**: Lets a caller with the read operations permission read an operation by its id: its status and, once final, its report.
 - **Breaking Change Policy**: Additive changes are backward compatible. Changes to operation states, outcome categories, or report content need a major version bump and notice to application teams.
 
 #### Discovery Interface
@@ -618,12 +623,12 @@ The system **MUST** give operators a visible signal for audit events that failed
 - [ ] `p1` - **ID**: `cpt-cf-application-manager-contract-section-plugin`
 
 - **Direction**: required from client
-- **Actors**: `cpt-cf-application-manager-actor-operator`
+- **Actors**: `cpt-cf-application-manager-actor-section-plugin`
 - **Protocol/Format**: Platform plugin model. Each section plugin:
   - announces one section key and one priority at startup;
   - serves the schema for its section, with a schema version that changes whenever the schema content changes;
   - applies its section for an application, and removes an application on uninstall;
-  - reports failures as rejected, not permitted, or internal;
+  - reports failures as plugin rejected, not permitted, or internal failure;
   - uses its own service credentials, never the caller's.
 - **Compatibility**: Changes to the contract need coordinated updates of all section plugins. A schema change applies from the next seed, with no restart.
 
@@ -691,36 +696,87 @@ The system **MUST** give operators a visible signal for audit events that failed
 
 - The operation is completed.
 
+### Seed Refused or Partly Failed
+
+- [ ] `p2` - **ID**: `cpt-cf-application-manager-usecase-seed-failed`
+
+**Actor**: `cpt-cf-application-manager-actor-seeding-caller`
+
+**Preconditions**:
+
+- The caller is authorized to seed.
+
+**Main Flow**:
+
+1. The seeding caller submits a manifest.
+2. If the system refuses the request, it returns the outcome category at once, with what to fix, retry, or request.
+3. If the request is accepted and some sections fail, the caller reads the operation and sees each section outcome in the report.
+4. The caller fixes the problem and seeds again.
+
+**Postconditions**:
+
+- The caller knows the outcome category, or the outcome of each section, and what to do next.
+
+### Discover the Manifest Shape
+
+- [ ] `p2` - **ID**: `cpt-cf-application-manager-usecase-discovery`
+
+**Actor**: `cpt-cf-application-manager-actor-seeding-caller`
+
+**Preconditions**:
+
+- The caller is authorized to read schemas.
+
+**Main Flow**:
+
+1. The caller lists the section keys.
+2. The caller reads the combined schema for a whole manifest.
+3. The caller builds a manifest from the combined schema.
+
+**Postconditions**:
+
+- The manifest passes validation.
+
 ## 9. Acceptance Criteria
 
-- [ ] An accepted seed or uninstall returns an operation id before any plugin call (`cpt-cf-application-manager-fr-async-operations`).
+- [ ] An accepted seed or uninstall returns an operation id before any section-plugin call (`cpt-cf-application-manager-fr-async-operations`).
 - [ ] A request that fails a quick check gets its outcome category at once, creates no operation, calls no section plugin, and has a refused event in the audit ledger.
 - [ ] A valid manifest with every required section completes as succeeded, and sections are dispatched in priority order.
 - [ ] A manifest with a missing, unknown, or invalid section, or with an invalid id or version, reports invalid manifest, dispatches nothing, and lists each problem with its location.
 - [ ] When one section plugin fails, the others still receive their sections, and the report shows each section outcome.
 - [ ] A section plugin that exceeds the time limit is an internal failure and does not block the remaining sections.
-- [ ] An uninstall asks every section plugin to remove the application, even one never seeded, and continues after failures.
-- [ ] A caller refused by access control causes no section-plugin call, and each of seed, uninstall, schema reading, and operation reading needs its own permission.
+- [ ] A request to which several outcome categories apply always gets the same single category (`cpt-cf-application-manager-fr-outcome-precedence`).
+- [ ] When permission or running operations cannot be checked, the answer is temporarily unavailable, never not permitted or conflict.
+- [ ] A section plugin that refuses its section as unacceptable gives plugin rejected, and a section plugin that refuses for an extra permission of its own gives not permitted, after platform access control has permitted the request (`cpt-cf-application-manager-fr-outcome-categories`).
+- [ ] An uninstall asks every section plugin to remove the application, in priority order, even one never seeded, and continues after failures (`cpt-cf-application-manager-fr-uninstall`).
+- [ ] A caller refused by access control causes no section-plugin call, and each of the seed, uninstall, read schemas, and read operations permissions is separate.
 - [ ] A second request for an application with an accepted or running operation is refused as conflict naming that operation, while other applications proceed.
-- [ ] Reading an operation returns its status and, once final, its report, ends as not found for an unknown or purged id, and makes no plugin call.
+- [ ] Reading an operation returns its status and, once final, its report, ends as not found for an unknown or purged id, and makes no section-plugin call.
 - [ ] An operation that is not final at the end of its run window is reported as interrupted and is not resumed.
 - [ ] When access control or storage cannot answer, the request is refused as temporarily unavailable and nothing is dispatched.
-- [ ] Every seed and uninstall request that reaches the system, including a refused one, has its audit events in the audit ledger, and no audit event exists for a change that did not commit (`cpt-cf-application-manager-nfr-audit-completeness`).
+- [ ] Every seed and uninstall request that reaches the system, including a refused one, has its audit events in the audit ledger (except a refusal whose audit event could not be recorded), and no audit event exists for a change that did not commit (`cpt-cf-application-manager-nfr-audit-completeness`).
 - [ ] Audit events are only ever appended to the audit ledger, and no other place keeps them (`cpt-cf-application-manager-fr-audit-event`).
 - [ ] Nothing is dispatched until the accepted event is recorded in the audit ledger, the finished event is recorded together with the final report, and a refusal whose event cannot be recorded still returns its category and is logged and signalled (`cpt-cf-application-manager-fr-audit-ordering`).
-- [ ] The system fails to start on a duplicate key or priority, an unreachable plugin registration facility, or invalid configuration, and starts with an empty key set when no section plugin exists.
+- [ ] The system fails to start when the plugin registration facility cannot answer, a section plugin's key or priority cannot be read, a key is invalid, two section plugins share a key, two share a priority, or a setting is missing or invalid, and starts with an empty key set when no section plugin exists.
+- [ ] After a failed dispatch the system undoes nothing (`cpt-cf-application-manager-fr-plugin-owned-semantics`).
+- [ ] A schema read that a section plugin cannot answer ends as temporarily unavailable, and a read for an unknown section key ends as not found (`cpt-cf-application-manager-fr-discovery`).
 - [ ] Discovery returns live section keys and schemas, and a manifest built from the combined schema passes validation.
 - [ ] Inspection shows no way to read manifests, no way to resume or cancel an operation, and no manifest content in logs.
+- [ ] Every refusal and every operation report carries the outcome category, what to fix, retry, or request, and the request id (`cpt-cf-application-manager-fr-response-content`).
+- [ ] Each section plugin gets only its own section, unchanged, with the envelope, and no per-section state is kept (`cpt-cf-application-manager-fr-pass-through`).
+- [ ] Application ids are compared as exact text and never parsed, and the version is passed to section plugins unchanged (`cpt-cf-application-manager-fr-application-id`, `cpt-cf-application-manager-fr-opaque-version`).
+- [ ] Discovery returns each schema with its schema version (`cpt-cf-application-manager-fr-discovery`).
+- [ ] Each listed operational signal is raised in tests, and the counts can be read (`cpt-cf-application-manager-nfr-operational-signals`).
 
 ## 10. Dependencies
 
 | Dependency | Description | Criticality |
 |------------|-------------|-------------|
-| Section plugins | Each provides its section key and priority at startup, its current schema with a schema version, application of its section on seed, and removal of an application on uninstall, and answers with success, rejected, not permitted, or internal failure. | p1 |
-| Platform access control | A permit or deny for each seed, uninstall, schema-read, and operation-read request, given the caller subject and the action. | p1 |
+| Section plugins | Each provides its section key and priority at startup, its current schema with a schema version, application of its section on seed, and removal of an application on uninstall, and answers with success, plugin rejected, not permitted, or internal failure. | p1 |
+| Platform access control | A permit or deny for each seed, uninstall, read schemas, and read operations request, given the caller subject and the action. | p1 |
 | Plugin registration facility | The list of section plugins at startup. | p1 |
 | Platform storage | Storage for operation records and the audit ledger. | p1 |
-| Platform error format | The standard format for failed responses, able to carry the outcome category, what to fix, the running operation id, and the id that links the result to its audit events. | p1 |
+| Platform error format | The standard format for failed responses, able to carry the outcome category, what to fix, the running operation id, and the request id. | p1 |
 | Platform observability facility | A place to send operational logs, metrics, and operator signals. | p2 |
 
 ## 11. Assumptions
@@ -728,17 +784,18 @@ The system **MUST** give operators a visible signal for audit events that failed
 - The set of section keys is small and bounded, and fixed while the Application Manager runs.
 - Seeding callers authenticate through the platform, and their credentials are provisioned outside this gear.
 - Seeding happens at deploy time and not on user request paths.
-- Seeding callers read an operation at a moderate pace and hold the read-operations permission.
+- Seeding callers read an operation at a moderate pace and hold the read operations permission.
 - Operators set the operation retention long enough for callers to read each operation after it ends.
+- Seeding callers keep secrets, such as passwords or keys, out of manifests. The system does not detect or remove them.
 
 ## 12. Risks
 
 | Risk | Impact | Mitigation |
 |------|--------|------------|
-| A section plugin is slow or down during seeding | Seeds end as temporarily unavailable or as internal failures | Configurable time limit, per-section results in the report, and retry by seeding again |
-| Partial success leaves section plugins out of step | Some services see the application and others do not | Section-plugin-owned rollback, per-section results, the audit ledger, and retry |
+| A section plugin is slow or down during seeding | A seed ends as temporarily unavailable when the section plugin cannot serve its schema, or its section ends as an internal failure when the section plugin fails during dispatch | Configurable time limit, per-section results in the report, and retry by seeding again |
+| Partial success leaves section plugins out of step | Some services see the application and others do not | Section-plugin-owned rollback, per-section results, and retry |
 | A priority change reorders dispatch | A section plugin that relies on another's data sees a different order | Order changes are intentional, and section-plugin authors document how they choose a priority |
-| A manifest carries a secret | The secret could reach logs or the audit ledger only through what the system records | The rule that manifests must not carry secrets, and the rule that the system does not write manifest content into its own logs |
+| A manifest carries a secret | The secret could reach the system's logs, diagnostics, or error text | The seeding callers' responsibility to keep secrets out of manifests (see Assumptions), and the rule that the system does not write manifest content into its own logs |
 | An operation is interrupted | The application is left partly seeded or removed | The report shows the section outcomes so far, the caller seeds or uninstalls again, and operators see a count of interrupted operations |
 | The platform error format cannot carry the added refusal content | A caller refused as conflict cannot tell which operation to wait for | The format is raised with the platform owners, and operation reports still carry the full result |
 
