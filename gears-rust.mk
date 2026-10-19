@@ -140,7 +140,7 @@ dylint-oagw-cluster:
 	$(call check_tool,cargo-gears)
 	cargo gears lint --dylint -P cf-gears-oagw -F cluster
 
-.PHONY: ensure-submodules lychee web-docs-check geiger gts-docs docker-pins validate-gear-names pr-review-lint pr-review-test check-packaging-metadata check-release-config check-release-resolver
+.PHONY: ensure-submodules lychee web-docs-check geiger gts-docs docker-pins validate-gear-names pr-review-lint pr-review-test check-packaging-metadata check-pure-crates check-release-config check-release-resolver
 
 ## Verify git submodules (e.g. guidelines/DNA) are initialized; fails otherwise.
 ensure-submodules:
@@ -215,6 +215,11 @@ pr-review-test: py-env
 check-packaging-metadata: py-env
 	$(call print_target_banner)
 	@$(PYTHON) tools/scripts/check_packaging_metadata.py
+
+## Check that pure crates (tools/scripts/pure_crates.toml) reach no I/O crate through cargo tree
+check-pure-crates: py-env
+	$(call print_target_banner)
+	@$(PYTHON) tools/scripts/check_pure_crates.py
 
 ## Validate that examples/apps/tools are unpublishable and release-plz.toml matches the workspace
 check-release-config: py-env
@@ -459,7 +464,7 @@ test-eb-kafka: install-tools
 TOOLKIT_DB_LANES := toolkit-db-sqlite toolkit-db-pg toolkit-db-pgq toolkit-db-mysql
 INTEGRATION_LANES := $(TOOLKIT_DB_LANES) users-info-pg usage-collector-pg usage-collector-ch \
 	types-registry-db oagw-db oagw-cluster cluster-pg cluster-redis rg-pg settings-service-pg \
-	pricing-pg coord-pg products-pg ledger-pg orders-pg eb-gear-db
+	pricing-pg coord-pg products-pg ledger-pg orders-pg eb-gear-db rating-pg
 
 ## toolkit-db on SQLite; the examples must still build after the tests.
 lane_args_toolkit-db-sqlite = -p cf-gears-toolkit-db --features sqlite,integration
@@ -656,6 +661,14 @@ lane_args_ledger-pg = -p cf-gears-bss-ledger --run-ignored ignored-only -E 'not 
 ## lib tests. The unit tier (`make test`) keeps the tests that need neither.
 ## `--no-fail-fast` for the reason the pricing lane gives.
 lane_args_orders-pg = -p cf-gears-bss-orders --features gate-dev-stubs --run-ignored all --no-fail-fast
+
+## bss-rating's Postgres tier (Docker required; testcontainers).
+##
+## The foundation's races SQLite's single writer cannot show — two first arrivals of one
+## inbox key, two releases of one entry, concurrent failures of one exception subject — and
+## the PostgreSQL half of its schema checks. Same `--run-ignored ignored-only` shape and
+## `--no-fail-fast` reason as pricing.
+lane_args_rating-pg = -p cf-gears-bss-rating --run-ignored ignored-only -E 'binary(/^postgres_/)' --no-fail-fast
 
 # run_lane(lane): the lane's nextest run, then its post command if it has one.
 run_lane = $(call nextest_run,$(1),$(lane_args_$(1)),$(lane_env_$(1)))$(if $(lane_post_$(1)),$(newline)$(lane_post_$(1)))
