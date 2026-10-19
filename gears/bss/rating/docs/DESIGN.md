@@ -878,7 +878,7 @@ The constraints each contract namespace adds are defined here and specified norm
 
 | Concept | Identifier | Mutability | Created by |
 |---|---|---|---|
-| Inbox entry | `(tenant_id, source, business_id, version)` | insert-only; state transitions `accepted → applied \| quarantined` | every non-usage intake path (T-D-56) |
+| Inbox entry | `entry_id` (`UUIDv5` of the key `(tenant_id, source, business_id, version)` and the payload digest) | insert-only except `state`; `accepted → applied`, a new key or a digest conflict `→ quarantined`, `quarantined → applied \| discarded` by an audited release (feature 01 §4.1) | every non-usage intake path (T-D-56) |
 | Usage capture | `(tenant_id, usage_record_id)` | raw entry insert-only; contribution state transitions (§4.2) | feed readers (T-D-61) |
 | Source checkpoint | `source_id` (canonical feed source identity, §3.7) | CAS-updated | feed readers / recovery sweeps |
 | Source loss | `(tenant_id, loss_id)` | `open → narrowed → pending_approval → resolved` | feed readers, reconciler (T-D-62) |
@@ -1623,7 +1623,11 @@ The components each contract namespace adds are defined here and specified norma
   their OpenAPI schemas), mapped to and from the `rating-sdk` types, as the platform's REST pattern
   does (`docs/toolkit_unified_system/04_rest_operation_builder.md`); the SDK types carry no HTTP or
   schema concerns, and the money fields of the DTOs follow §3.3 canonical text. The OpenAPI is
-  generated from the OperationBuilder registration. No usage ingestion endpoint. Collections use keyset cursors (`cursor`, `limit`,
+  generated from the OperationBuilder registration. A custom method `{id}:<verb>` in the table is
+  served as the sub-resource `{id}/<verb>` while axum 0.8 pins `matchit = "=0.8.4"`, which cannot
+  split `{param}:suffix` in one segment (the in-tree fallback, as account-management's
+  `/tenants/{tenant_id}/suspend`); the path the router matches is the path the OpenAPI publishes,
+  and the colon form is adopted when axum bumps matchit. No usage ingestion endpoint. Collections use keyset cursors (`cursor`, `limit`,
   default 100, maximum 500), not offsets; `$filter` (OData subset: `eq`, `in`, `and`, on the listed
   fields) where shown. Every route returns `401` unauthenticated, `403` `PermissionDenied`, `404`
   for objects outside the caller's scope (indistinguishable from absent), `400` `InvalidArgument`,
@@ -2543,9 +2547,17 @@ V68 and V76, each marked `[PostgreSQL]` in its feature — runs on PostgreSQL on
 SQLite's single writer gives the serial outcome those vectors also accept.
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-rating-dbtable-inbox`
-  `bss_rating__inbox` — PK `(tenant_id, source, business_id, version)`; `payload_digest`, `payload`
-  (jsonb), `received_via` (`pull` \| `event`), `state` (`accepted` \| `applied` \| `quarantined` \| `discarded`),
-  `quarantine_reason`, `received_at`, `applied_at`. Insert-only except `state`. `source ∈ {fact,
+  `bss_rating__inbox` — PK `entry_id` = `UUIDv5(NS_RATING_INBOX, tenant_id | source | business_id |
+  version | payload_digest)`, so one arrival names one entry; key `(tenant_id, source, business_id,
+  version)`; `payload_digest`, `payload` (jsonb), `received_via` (`pull` \| `event`), `state`
+  (`accepted` \| `applied` \| `quarantined` \| `discarded`), `quarantine_reason`
+  (`digest_conflict` \| `unsupported_schema_version`), `conflict_of?`, `received_at`, `applied_at`.
+  Unique `uq_bss_rating__inbox__key_digest (tenant_id, source, business_id, version,
+  payload_digest)`; one primary entry per key, `uq_bss_rating__inbox__primary (tenant_id, source,
+  business_id, version) WHERE conflict_of IS NULL`. A same-key arrival with another digest is
+  stored as its own `quarantined` entry with `conflict_of` = the primary entry, which stays
+  untouched, so nothing is applied and the conflicting payload is kept for the operator; the
+  release route's `{id}` is the `entry_id`. Insert-only except `state` (with `applied_at`). `source ∈ {fact,
   segment, scope, coverage, subscription_version, billing_hint}` (commitment pools are deferred with price adjustments (T-D-81); `subscription_version` drives derived coverage, T-D-82); usage records and invalidations are not inbox
   sources — their capture and deduplication are `bss_rating__usage_record` (T-D-61).
 - [ ] `p1` - **ID**: `cpt-cf-bss-rating-dbtable-source-checkpoint`
@@ -2886,7 +2898,8 @@ SQLite's single writer gives the serial outcome those vectors also accept.
   `request_digest`, `response` (jsonb), `created_at`; kept 7 days.
 - [ ] `p1` - **ID**: `cpt-cf-bss-rating-dbtable-operator-audit`
   `bss_rating__operator_audit` — PK `(tenant_id, audit_id)`; `actor`, `operation_id`, `target_kind`,
-  `target_id`, `request_digest`, `reason`, `approved_by?`, `at`. Insert-only, written in the same
+  `target_id`, `request_digest`, `reason`, `approved_by?`, `request_id?` (the caller's
+  `x-request-id`), `at`. Insert-only, written in the same
   transaction as every action marked "audited" in §3.3 and §4.8 (retry, release, re-rate, cancel,
   policy writes, `delay_only` acceptances (`target_kind = delay_only_acceptance`, `target_id` =
   the `acceptance_id`), source-loss reconciliation submissions, resolve, approve and reject, hold place and release); kept with the financial
@@ -3458,7 +3471,7 @@ Resource types (GTS, registered by Rating):
 | `get_snapshot` | REST `snapshots.get`; inside `get_run` | Billing, operator | `result × read` | caller's scope | PDP scope; `(tenant_id, snapshot_id)` lookup | — |
 | `request_rerate`, `get_rerate_run`, cancel | SDK; REST `reratings.*` | operator | `rerate × execute` / `read` | caller's scope; the selector must lie inside it | PDP scope | run row: `tenant_id`, `requested_by`; target rows per tenant |
 | `OrderEvaluationV1::evaluate` | SDK | Orders service identity | `evaluation × evaluate` | the request's seller tenant, in scope | none (the request carries its exact bindings; no pricing read) | — |
-| Pricing reads (`resolve`, `price`) | background (rater, fact intake, re-rate) | Rating service identity `bss-rating.system`, with a `SecurityContext` built **per work item** for the work item's seller tenant (`subject_tenant_id` = seller; Orders D-160 pattern) | pricing `plan:read` (resolve) and `price:read` (price) — granted per seller tenant by deployment; a system-looking subject has no bypass (pricing D-424, D-510 E3) | pricing asks the PDP for the caller's tenant only (`TenantMode::RootOnly`, pricing D-523), so `CatalogRef.tenant_id` **must equal** `subject_tenant_id`; a different tenant is denied with 403 | Rating writes the copy under that tenant | the binding of record |
+| Pricing reads (`resolve`, `price`) | background (rater, fact intake, re-rate) | Rating service identity `bss-rating.system` acting in the work item's seller tenant (`subject_tenant_id` = seller): an authenticated per-seller service principal (target, Orders D-194, T-D-83); interim, a `SecurityContext` built **per work item** (the construction Orders D-160 used) | pricing `plan:read` (resolve) and `price:read` (price) — granted per seller tenant by deployment; a system-looking subject has no bypass (pricing D-424, D-510 E3) | pricing asks the PDP for the caller's tenant only (`TenantMode::RootOnly`, pricing D-523), so `CatalogRef.tenant_id` **must equal** `subject_tenant_id`; a different tenant is denied with 403 | Rating writes the copy under that tenant | the binding of record |
 | Products derived-declaration read (R-31) | background | Rating service identity | Products `sku:read` (today REST only); every products read is limited to the caller's own tenant (P-D-265) | the work item's seller tenant | Rating writes the copy under that tenant | the declaration copy |
 | exceptions list / retry, inbox release | REST | operator | `usage × read` / `retry` / `release` (audited) | caller's scope | PDP scope | exception and inbox rows keep their `tenant_id` |
 | finalization policy read / write; `delay_only` acceptance | REST | seller operator; the acceptance by a Finance/Product approver other than the policy writer | `finalization_policy × read` / `write` / `accept_delay_only` (audited) | caller's scope; `owner_scope = seller` only | PDP scope | the policy row's `tenant_id` |
@@ -3475,6 +3488,16 @@ Resource types (GTS, registered by Rating):
 subject, request id). Negative tests (§4.13) cover: an id from another tenant (snapshot, run,
 policy, exception) returns `404`; a selector outside scope returns `403`; a seller writer cannot
 create a platform default; a worker processing tenant A's item cannot read tenant B's rows.
+
+**Service identity (T-D-83).** Rating's service identity is a platform-authenticated service
+principal provisioned per tenant it works for, as Orders' D-194 (which supersedes D-160) specifies:
+the AuthN Resolver's S2S client-credentials exchange yields its subject id, type and tenant, and a
+work item's tenant selects which principal acts, never a tenant written into a hand-built
+`SecurityContext`. Until that lands (with the first feature that calls Pricing), the service grant
+builds `bss-rating.system`'s context per work item with the item's tenant as the subject tenant.
+That interim check is only as strong as the deployment's policy for `bss-rating.system`: a policy
+that grants subjects their home tenant would grant it every tenant, so a deployment grants it per
+tenant explicitly and never by home tenant.
 
 ### 4.9 NFR mapping
 
@@ -6764,9 +6787,11 @@ only pricing input. All three methods are safe reads with no idempotency key:
 | `price(ctx, PriceQuery{catalog, price_id}) -> Result<ImmutablePrice, CanonicalError>` | verify a stored binding during replay (`money_digest`) | pricing `price:read` |
 | `current_revision(ctx, PlanQuery{catalog, plan_id}) -> Result<RevisionRef, CanonicalError>` | operator diagnostics only; Rating never chooses a revision — the fact names it | pricing `plan:read` |
 
-Rating calls as the system subject `bss-rating.system`, building its `SecurityContext` per work item
-with `subject_tenant_id` = the work item's seller tenant, as Orders does (Orders D-160); resolve reads
-SKU versions as pricing's own system actor, so Rating needs no Products grant for it (pricing D-424).
+Rating calls as `bss-rating.system` acting in the work item's seller tenant (`subject_tenant_id` = the
+seller): an authenticated per-seller service principal (Orders D-194, T-D-83), which replaces the
+interim `SecurityContext` built per work item (the construction of Orders D-160, superseded there);
+resolve reads SKU versions as pricing's own system actor, so Rating needs no Products grant for it
+(pricing D-424).
 Pricing asks the PDP for the caller's tenant only (`TenantMode::RootOnly`, pricing D-523,
 `pricing/src/authz.rs`), so `CatalogRef.tenant_id` must equal `subject_tenant_id`; a catalog of
 another tenant is denied. Products applies the same rule to the derived-declaration read

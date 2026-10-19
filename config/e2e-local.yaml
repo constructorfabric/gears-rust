@@ -262,13 +262,17 @@ gears:
     config:
       listen_addr: "uds:///tmp/cf-gears-grpc-e2e"
 
-  # Linked by --features oagw-embedded. OAGW on a database keeps its proxy
-  # cache's change log in the `oagw` profile (ADR-0020); standalone suffices
+  # Linked by --features oagw-embedded or bss-rating. OAGW on a database keeps
+  # its proxy cache's change log in the `oagw` profile (ADR-0020); Rating elects
+  # its leader-only jobs in the `bss-rating` profile (R-27). Standalone suffices
   # for one process.
   cluster:
     config:
       profiles:
         oagw:
+          cache:
+            provider: standalone
+        bss-rating:
           cache:
             provider: standalone
 
@@ -547,6 +551,15 @@ gears:
     # a `config` object the gear does not serve.
     config:
       sources: ["pricing", "products"]
+
+  bss-rating:
+    # The Rating foundation: the inbox, the exception register, operation keys and
+    # the operator audit, plus the outbox work queues. Its leader-only jobs (the
+    # exception sweeper) elect on the `bss-rating` profile of the `cluster` entry
+    # above; every event source stays disabled by default.
+    database:
+      server: "sqlite_users"
+      file: "bss_rating.db"
 
   simple-user-settings:
     # Gear-specific database configuration

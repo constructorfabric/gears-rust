@@ -1,0 +1,12 @@
+{
+  "applied_at": "2026-10-19T12:00:00Z",
+  "business_id": "fact-1",
+  "entry_id": "00000000-0000-0000-0000-000000000001",
+  "payload_digest": "abababababababababababababababababababababababababababababababab",
+  "received_at": "2026-10-19T12:00:00Z",
+  "received_via": "pull",
+  "source": "fact",
+  "state": "applied",
+  "tenant_id": "00000000-0000-0000-0000-00000000000a",
+  "version": 3
+}
