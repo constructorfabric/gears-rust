@@ -1,11 +1,13 @@
 //! `ValueRepository` over `setting_values`.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use async_trait::async_trait;
 use sea_orm::ExprTrait as _;
 use sea_orm::sea_query::Expr;
-use sea_orm::{ActiveValue::Set, ColumnTrait, EntityTrait, QueryFilter, QuerySelect, QueryTrait};
+use sea_orm::{
+    ActiveValue::Set, ColumnTrait, EntityTrait, QueryFilter, QuerySelect, QueryTrait, RelationTrait,
+};
 use settings_service_sdk::odata::DeclarationFilterField;
 use toolkit_db::odata::{LimitCfg, filter_node_to_condition, paginate_odata};
 use toolkit_db::secure::{DBRunner, SecureDeleteExt, SecureEntityExt, SecureUpdateExt};
@@ -55,6 +57,14 @@ struct ListedRow {
     tenant_id: Uuid,
     value: Option<serde_json::Value>,
     data_classification: String,
+}
+
+/// One group of the values inventory: the rows whose declaration has one scope
+/// class, and how many there are.
+#[derive(Debug, sea_orm::FromQueryResult)]
+struct ScopeClassRow {
+    scope_class: String,
+    n: i64,
 }
 
 /// Converts a stored setting value row to the domain type.
@@ -441,6 +451,55 @@ impl ValueRepository for ValueRepo {
             .count(conn)
             .await
             .map_err(db_error)
+    }
+
+    async fn count_by_scope_kind<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        root: Uuid,
+    ) -> Result<HashMap<(String, &'static str), u64>, DomainError> {
+        use crate::domain::resolution::scope_kind;
+        use crate::infra::storage::entity::declaration;
+        // One grouped count per kind, each over the join to the declaration
+        // for its class. The kind is a filter, not a grouping expression: a
+        // bound parameter in a `GROUP BY` does not match the same parameter in
+        // the select list on PostgreSQL.
+        let mut counts = HashMap::new();
+        for (kind, at_root) in [(scope_kind::PLATFORM, true), (scope_kind::TENANT, false)] {
+            let rows = ValueEntity::find()
+                .filter(subjectless())
+                .filter(if at_root {
+                    setting_value::Column::TenantId.eq(root)
+                } else {
+                    setting_value::Column::TenantId.ne(root)
+                })
+                .secure()
+                .scope_with(scope)
+                .project_all(conn, |q| {
+                    q.select_only()
+                        .join(
+                            sea_orm::JoinType::InnerJoin,
+                            setting_value::Relation::Declaration.def(),
+                        )
+                        .column(declaration::Column::ScopeClass)
+                        .column_as(
+                            Expr::col((ValueEntity, setting_value::Column::Id)).count(),
+                            "n",
+                        )
+                        .group_by(declaration::Column::ScopeClass)
+                        .into_model::<ScopeClassRow>()
+                })
+                .await
+                .map_err(db_error)?;
+            for row in rows {
+                counts.insert(
+                    (row.scope_class, kind),
+                    u64::try_from(row.n).unwrap_or_default(),
+                );
+            }
+        }
+        Ok(counts)
     }
 
     async fn list_review<C: DBRunner>(

@@ -1053,3 +1053,34 @@ async fn the_listing_total_is_the_whole_set_not_the_page() {
     assert_eq!(status, 200, "{filtered}");
     assert_eq!(filtered["page_info"]["total_count"], json!(1), "{filtered}");
 }
+
+#[tokio::test]
+async fn a_refused_tally_probe_counts_no_authorization_denial() {
+    // The category list asks for the value read only to decide whether to add
+    // counts; a refusal there is answered by omitting them, so it is not an
+    // enforcement refusal and counts nothing. The refusal that does fail a
+    // request is counted, which is what shows the counter is wired.
+    let h = RestHarness::without_value_read().await;
+    let billing = billing_with_four(&h).await;
+
+    let (status, body) = h.get(CATEGORIES, h.inner.tree.root).await;
+    assert_eq!(status, 200, "{body}");
+    let (status, body) = h
+        .get(&format!("{CATEGORIES}/{billing}"), h.inner.tree.root)
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert!(
+        h.security.denials().is_empty(),
+        "a probe is not a refusal: {:?}",
+        h.security.denials()
+    );
+
+    let (status, _) = h
+        .get(
+            &format!("/settings-service/v1/settings?$filter=category_id%20eq%20{billing}"),
+            h.inner.tree.root,
+        )
+        .await;
+    assert_eq!(status, 403);
+    assert_eq!(h.security.denials(), vec![("read", "denied")]);
+}

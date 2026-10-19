@@ -2753,3 +2753,38 @@ async fn a_failed_entry_carries_the_display_name_and_a_not_found_one_has_none() 
         items[0]
     );
 }
+
+#[tokio::test]
+async fn a_masked_read_by_a_caller_without_the_entitlement_counts_no_authorization_denial() {
+    // The unmasked-read entitlement is a probe answered by masking: the
+    // request is not refused, so nothing is counted. A request that is refused
+    // is counted, which is what shows the counter is wired.
+    let h = RestHarness::without_pii_entitlement().await;
+    let id = h
+        .inner
+        .declare_typed("contact_email", "cascading", json!(""), TEXT, "pii")
+        .await;
+    h.inner
+        .set(id, h.inner.tree.root, json!("someone@example.test"))
+        .await;
+    let uri = format!(
+        "/settings-service/v1/settings/{}",
+        encoded(&h, "contact_email")
+    );
+
+    let (status, body) = h.get(&uri, h.inner.tree.root).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["value"], json!(MASK_TOKEN));
+    assert!(
+        h.security.denials().is_empty(),
+        "the entitlement probe is not a refusal: {:?}",
+        h.security.denials()
+    );
+
+    let denying = RestHarness::denying().await;
+    let (status, _) = denying
+        .get("/settings-service/v1/settings", denying.inner.tree.root)
+        .await;
+    assert_eq!(status, 403);
+    assert_eq!(denying.security.denials(), vec![("read", "denied")]);
+}

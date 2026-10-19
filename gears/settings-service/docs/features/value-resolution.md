@@ -37,6 +37,7 @@
   - [Distinct Resolution Outcomes](#distinct-resolution-outcomes)
   - [Read-Path Cache](#read-path-cache)
   - [Cache Time-to-Live Backstop](#cache-time-to-live-backstop)
+  - [Read-Path Metrics](#read-path-metrics)
   - [Hierarchy-Change Invalidation](#hierarchy-change-invalidation)
   - [Administrative Read Surface](#administrative-read-surface)
   - [Review Listing](#review-listing)
@@ -114,6 +115,8 @@ Three properties matter more than the walk itself.
 10. [x] - `p1` - **IF** the setting is secret-backed → return the value in its masked handle form, never plaintext - `inst-vr-resolve-10`
 11. [x] - `p1` - Populate the cache entry for `(key, scope)` with the resolved value and its source trace — only if no invalidation of the key or the scope has landed since the miss, compared by the generation captured then, so a read that began before a write does not resurrect the value it read for another time-to-live - `inst-vr-resolve-11`
 12. [x] - `p1` - **RETURN** the effective value carrying `key`, `scope`, `value`, `source`, `source_scope`, `traits`, the inheritance trail, and `fallback` with `fallback_source` and `fallback_scope` - `inst-vr-resolve-12`
+13. [x] - `p1` - On every exit of this flow with a value, **IF** the read serves the reader boundary — `get_effective`, or one key of `get_effective_bulk` — → report the cache outcome to the reader, which records `settings_effective_read_duration_seconds` with `source` `cache` for a hit — from step 3, or found again after the declaration load — or `resolve` for a value resolved by steps 4–12, with `scope_class` from the effective value, which carries its declaration's class through the cache entry, over the span from the lookup of step 2 to the outcome, the ancestry walk included when this key is the first to need it, and one `settings_cache_lookups_total` lookup by `result` `hit` or `miss` and `scope_class`; a not-found or retired outcome records nothing. The administrative read, the write path's own resolves and the secret path record nothing - `inst-vr-resolve-13`
+14. [x] - `p1` - On every exit of this flow with an unavailable or internal outcome — the platform-scope read before step 2, step 4, step 7, step 8 or step 9 — **IF** the read serves the reader boundary → count `settings_resolve_failures_total` by `reason` (`unavailable`, `internal`) with no lookup and no duration, as the reader does for a failure of its own connection (`unavailable`) or of the projection of a resolved value (`internal`) - `inst-vr-resolve-14`
 
 ### Resolve Effective Values in Bulk
 
@@ -135,6 +138,7 @@ Three properties matter more than the walk itself.
    1. [x] - `p1` - Resolve it independently, reusing the shared ancestry - `inst-vr-bulk-4`
    2. [x] - `p1` - Record either the resolved effective value or that key's own failure outcome - `inst-vr-bulk-5`
 4. [x] - `p1` - **RETURN** one outcome per key, never collapsing the batch to a single failure because one key failed - `inst-vr-bulk-6`
+5. [x] - `p1` - On every exit of this flow, **IF** the read fails as a whole before any key resolves — the connection, the platform-scope read, the category enumeration — with an unavailable or internal outcome → count one `settings_resolve_failures_total` by `reason` for the request; a validation refusal of the request counts nothing; a key that resolves or fails on its own — a chain walk that fails, being lazy, fails each cascading key that needed it — counts by steps 13–14 of the single resolve flow - `inst-vr-bulk-7`
 
 ### Read Effective Source Trail
 
@@ -316,6 +320,7 @@ Three properties matter more than the walk itself.
 2. [x] - `p1` - **IF** no entry exists → **RETURN** a miss - `inst-vr-cache-2`
 3. [x] - `p1` - **IF** the entry is older than the configured time-to-live → evict it and **RETURN** a miss, so a missed invalidation self-heals within that bound - `inst-vr-cache-3`
 4. [x] - `p1` - **RETURN** the entry together with the source trace it was stored with - `inst-vr-cache-4`
+5. [x] - `p1` - On every exit of this algorithm, report the outcome — hit, or miss including a time-to-live eviction — to the caller, which counts the lookup only when the read serves the reader boundary and resolves to a value, once per key, so a bulk read counts each key - `inst-vr-cache-5`
 
 ### Cache Invalidation
 
@@ -450,6 +455,22 @@ The cache **MUST** own a configurable time-to-live and **MUST** evict entries ol
 
 **Implements**:
 - `cpt-cf-settings-service-algo-value-resolution-cache-read`
+
+**Touches**:
+- Entities: cache entry
+
+### Read-Path Metrics
+
+- [x] `p1` - **ID**: `cpt-cf-settings-service-dod-value-resolution-read-metrics`
+
+The system **MUST** record `settings_effective_read_duration_seconds` by `source` and `scope_class` for every reader-boundary read — `get_effective` and each key of `get_effective_bulk` — at the reader boundary from the resolver's report of the key's cache outcome, scope class and span, **MUST** count each such lookup that resolves to a value on `settings_cache_lookups_total` by `result` and `scope_class` so the hit ratio can be derived, **MUST** count an unavailable or internal outcome on `settings_resolve_failures_total` by `reason` with no lookup and no duration — a bulk read that fails as a whole before any key resolves counting one failure for the request, a validation refusal nothing — **MUST** record nothing for a not-found or retired outcome and nothing for the administrative read, the write path's own resolves or the secret path, and **MUST** use the bucket boundaries the DESIGN fixes; no metric **MAY** carry a key, tenant or value.
+
+**Implements**:
+- `cpt-cf-settings-service-flow-value-resolution-resolve`
+- `cpt-cf-settings-service-algo-value-resolution-cache-read`
+- `cpt-cf-settings-service-flow-value-resolution-resolve-bulk`
+
+**Constraints**: `cpt-cf-settings-service-constraint-secrets-by-reference`
 
 **Touches**:
 - Entities: cache entry
@@ -600,3 +621,13 @@ The system **MUST** implement `SettingsReaderClient` over the resolver — `get_
 - [x] An OData expression on an unmapped field returns `400` rather than an unfiltered page
 - [x] `SettingsReaderClient` is resolvable from `ClientHub` after init, and a configuration naming a remote binding for it fails startup
 - [x] A browse page item carries `display_name` when its declaration has one and omits it otherwise; `GET /settings-service/v1/settings/{key}`, `GET /settings-service/v1/public/settings`, `get_effective` and `get_effective_bulk` never carry it
+- [x] A reader-boundary cache hit records the effective-read histogram with `source` `cache` and one `hit` lookup under the declaration's `scope_class`
+- [x] A reader-boundary miss that resolves records `source` `resolve` and one `miss` lookup
+- [x] An unavailable dependency counts one resolve failure by `reason` `unavailable` and an internal failure one by `internal`, each with no lookup and no duration
+- [x] A not-found outcome and a retired outcome record nothing
+- [x] A bulk read of N keys that resolve counts N lookups
+- [x] The administrative read of the same key records no histogram, no lookup and no failure
+- [x] A resolve on the write path and a secret resolution record no histogram, no lookup and no failure
+- [x] A bulk read that fails as a whole before any key resolves counts one resolve failure for the request, and one refused for its size or scope counts nothing
+- [x] A failure of the reader's own connection counts one resolve failure by `reason` `unavailable`, and a projection failure after a resolved value one by `internal`
+- [x] The read histogram's boundaries are `0.001, 0.002, 0.005, 0.01, 0.015, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5` seconds

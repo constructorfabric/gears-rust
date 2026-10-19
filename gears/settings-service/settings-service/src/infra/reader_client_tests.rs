@@ -13,7 +13,7 @@ use super::ReaderClient;
 use crate::domain::resolution::scope_class;
 use crate::domain::secrets::SecretResolver;
 use crate::test_support::{
-    AllowAllGate, RecordingAudit, RecordingSecrets, ResolutionHarness, SECRET,
+    AllowAllGate, RecordingAudit, RecordingReadMetrics, RecordingSecrets, ResolutionHarness, SECRET,
 };
 
 type Reader = ReaderClient<
@@ -26,6 +26,26 @@ type Reader = ReaderClient<
 /// The reader over the harness, with a fake store and an open gate; the
 /// store and the audit sink come back for inspection.
 fn reader_with(h: &ResolutionHarness) -> (Reader, Arc<RecordingSecrets>, Arc<RecordingAudit>) {
+    let (reader, secrets, audit, _) = metered_with(h);
+    (reader, secrets, audit)
+}
+
+/// The reader over the harness, with the recording `ReadMetrics` it reports
+/// to.
+fn metered(h: &ResolutionHarness) -> (Reader, Arc<RecordingReadMetrics>) {
+    let (reader, _, _, metrics) = metered_with(h);
+    (reader, metrics)
+}
+
+fn metered_with(
+    h: &ResolutionHarness,
+) -> (
+    Reader,
+    Arc<RecordingSecrets>,
+    Arc<RecordingAudit>,
+    Arc<RecordingReadMetrics>,
+) {
+    let metrics = Arc::new(RecordingReadMetrics::default());
     let secrets = Arc::new(RecordingSecrets::default());
     let audit = Arc::new(RecordingAudit::default());
     let resolver = Arc::new(SecretResolver::new(
@@ -33,11 +53,18 @@ fn reader_with(h: &ResolutionHarness) -> (Reader, Arc<RecordingSecrets>, Arc<Rec
         Arc::clone(&secrets) as Arc<dyn crate::domain::ports::SecretManager>,
         Arc::new(AllowAllGate),
         Arc::clone(&audit),
+        Arc::new(crate::domain::ports::NoMetrics),
     ));
     (
-        ReaderClient::new(Arc::clone(&h.db), Arc::clone(&h.resolver), resolver),
+        ReaderClient::new(
+            Arc::clone(&h.db),
+            Arc::clone(&h.resolver),
+            resolver,
+            Arc::clone(&metrics) as Arc<dyn crate::domain::ports::ReadMetrics>,
+        ),
         secrets,
         audit,
+        metrics,
     )
 }
 
@@ -558,4 +585,452 @@ async fn a_handle_issued_before_the_secret_was_configured_resolves_to_whatever_i
         .await
         .expect("resolved");
     assert_eq!(plaintext.expose_secret(), "s3cret");
+}
+
+// ---- Read metrics: recorded here, at the reader boundary, from the
+// resolver's report.
+
+fn read_request(h: &ResolutionHarness, name: &str, tenant: uuid::Uuid) -> GetEffectiveRequest {
+    GetEffectiveRequest {
+        key: h.key(name),
+        scope: scope_of(tenant),
+    }
+}
+
+#[tokio::test]
+async fn a_cache_hit_records_the_cache_source_and_one_hit_lookup_under_the_declarations_class() {
+    let h = ResolutionHarness::new().await;
+    let d = h
+        .declare("strict", scope_class::CASCADING, json!(false))
+        .await;
+    h.set(d, h.tree.a, json!(true)).await;
+    // The first resolve fills the cache.
+    h.resolve(
+        "strict",
+        crate::domain::resolution::ScopeTarget::Tenant(h.tree.b),
+    )
+    .await
+    .expect("resolves");
+    let (reader, metrics) = metered(&h);
+
+    reader
+        .get_effective(
+            &SecurityContext::anonymous(),
+            read_request(&h, "strict", h.tree.b),
+        )
+        .await
+        .expect("resolves");
+
+    assert_eq!(metrics.lookups(), vec![("hit", scope_class::CASCADING)]);
+    let reads = metrics.reads();
+    assert_eq!(reads.len(), 1, "{reads:?}");
+    assert_eq!((reads[0].0, reads[0].1), ("cache", scope_class::CASCADING));
+    assert!(metrics.failures().is_empty());
+}
+
+#[tokio::test]
+async fn a_miss_that_resolves_records_the_resolve_source_and_one_miss_lookup() {
+    let h = ResolutionHarness::new().await;
+    let d = h
+        .declare("strict", scope_class::CASCADING, json!(false))
+        .await;
+    h.set(d, h.tree.a, json!(true)).await;
+    let (reader, metrics) = metered(&h);
+
+    reader
+        .get_effective(
+            &SecurityContext::anonymous(),
+            read_request(&h, "strict", h.tree.b),
+        )
+        .await
+        .expect("resolves");
+
+    assert_eq!(metrics.lookups(), vec![("miss", scope_class::CASCADING)]);
+    let reads = metrics.reads();
+    assert_eq!(reads.len(), 1, "{reads:?}");
+    assert_eq!(
+        (reads[0].0, reads[0].1),
+        ("resolve", scope_class::CASCADING)
+    );
+    assert!(
+        reads[0].2 > 0.0,
+        "the span of a resolve is not zero: {reads:?}"
+    );
+}
+
+#[tokio::test]
+async fn the_class_label_follows_the_declaration_for_every_scope_class() {
+    let h = ResolutionHarness::new().await;
+    for (name, class) in [
+        ("g", scope_class::GLOBAL),
+        ("c", scope_class::CASCADING),
+        ("l", scope_class::LOCAL),
+    ] {
+        h.declare(name, class, json!(false)).await;
+    }
+    let (reader, metrics) = metered(&h);
+    for name in ["g", "c", "l"] {
+        reader
+            .get_effective(
+                &SecurityContext::anonymous(),
+                read_request(&h, name, h.tree.b),
+            )
+            .await
+            .expect("resolves");
+    }
+    assert_eq!(
+        metrics.lookups(),
+        vec![
+            ("miss", scope_class::GLOBAL),
+            ("miss", scope_class::CASCADING),
+            ("miss", scope_class::LOCAL),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn an_unavailable_dependency_counts_one_unavailable_failure_and_no_lookup_or_duration() {
+    let h = ResolutionHarness::new().await;
+    h.declare("strict", scope_class::CASCADING, json!(false))
+        .await;
+    h.hierarchy.set_unavailable(true);
+    let (reader, metrics) = metered(&h);
+
+    let err = reader
+        .get_effective(
+            &SecurityContext::anonymous(),
+            read_request(&h, "strict", h.tree.b),
+        )
+        .await
+        .expect_err("the walk cannot run");
+
+    assert!(matches!(
+        SettingsError::from(err),
+        SettingsError::Unavailable { .. }
+    ));
+    assert_eq!(metrics.failures(), vec!["unavailable"]);
+    assert!(metrics.lookups().is_empty());
+    assert!(metrics.reads().is_empty());
+}
+
+#[tokio::test]
+async fn an_internal_failure_counts_one_internal_failure_and_no_lookup_or_duration() {
+    let h = ResolutionHarness::new().await;
+    h.declare("odd", scope_class::CASCADING, json!(false)).await;
+    // The tenant resolver answers with a fault of its own, not an outage.
+    h.hierarchy.set_broken(true);
+    let (reader, metrics) = metered(&h);
+
+    let err = reader
+        .get_effective(
+            &SecurityContext::anonymous(),
+            read_request(&h, "odd", h.tree.b),
+        )
+        .await
+        .expect_err("the walk cannot run");
+
+    assert!(
+        matches!(
+            err,
+            toolkit_canonical_errors::CanonicalError::Internal { .. }
+        ),
+        "{err:?}"
+    );
+    assert_eq!(metrics.failures(), vec!["internal"]);
+    assert!(metrics.lookups().is_empty());
+    assert!(metrics.reads().is_empty());
+}
+
+#[tokio::test]
+async fn a_not_found_and_a_retired_outcome_record_nothing() {
+    let h = ResolutionHarness::new().await;
+    let gone = h.declare("gone", scope_class::LOCAL, json!(1)).await;
+    h.retire(gone).await;
+    let live = h.declare("live", scope_class::LOCAL, json!(1)).await;
+    let _ = live;
+    let (reader, metrics) = metered(&h);
+
+    reader
+        .get_effective(
+            &SecurityContext::anonymous(),
+            read_request(&h, "ghost", h.tree.b),
+        )
+        .await
+        .expect_err("not found");
+    reader
+        .get_effective(
+            &SecurityContext::anonymous(),
+            read_request(&h, "gone", h.tree.b),
+        )
+        .await
+        .expect_err("retired");
+    assert!(
+        metrics.is_silent(),
+        "an answer is not a failure: {:?} {:?} {:?}",
+        metrics.lookups(),
+        metrics.reads(),
+        metrics.failures()
+    );
+
+    // The recorder is wired: a read that resolves is counted.
+    reader
+        .get_effective(
+            &SecurityContext::anonymous(),
+            read_request(&h, "live", h.tree.b),
+        )
+        .await
+        .expect("resolves");
+    assert_eq!(metrics.lookups().len(), 1);
+}
+
+#[tokio::test]
+async fn a_failure_of_the_readers_own_connection_is_unavailable_and_counts_one_failure() {
+    let h = ResolutionHarness::new().await;
+    h.declare("flag", scope_class::GLOBAL, json!(false)).await;
+    let (reader, metrics) = metered(&h);
+    let reader = Arc::new(reader);
+    let request = read_request(&h, "flag", h.tree.b);
+
+    // A connection asked for from inside a transaction is refused: the one
+    // way the reader's own `conn()` fails without a contrived database.
+    let outcome =
+        h.db.transaction(move |_tx| {
+            Box::pin(async move {
+                Ok::<_, toolkit_db::DbError>(
+                    reader
+                        .get_effective(&SecurityContext::anonymous(), request)
+                        .await,
+                )
+            })
+        })
+        .await
+        .expect("the transaction itself runs");
+
+    let err = outcome.expect_err("no connection");
+    assert!(
+        matches!(SettingsError::from(err), SettingsError::Unavailable { .. }),
+        "a dependency that cannot answer is unavailable, not the service's own fault"
+    );
+    assert_eq!(metrics.failures(), vec!["unavailable"]);
+    assert!(metrics.lookups().is_empty() && metrics.reads().is_empty());
+}
+
+#[tokio::test]
+async fn a_bulk_read_of_n_keys_that_resolve_counts_n_lookups() {
+    let h = ResolutionHarness::new().await;
+    for name in ["one", "two", "three"] {
+        h.declare(name, scope_class::CASCADING, json!(1)).await;
+    }
+    let (reader, metrics) = metered(&h);
+
+    let outcomes = reader
+        .get_effective_bulk(
+            &SecurityContext::anonymous(),
+            BulkSelector::Keys(vec![h.key("one"), h.key("two"), h.key("three")]),
+            scope_of(h.tree.b),
+        )
+        .await
+        .expect("served");
+
+    assert!(outcomes.iter().all(|o| o.result.is_ok()));
+    assert_eq!(metrics.lookups(), vec![("miss", scope_class::CASCADING); 3]);
+    assert_eq!(metrics.reads().len(), 3);
+    assert!(metrics.failures().is_empty());
+}
+
+#[tokio::test]
+async fn a_bulk_read_whose_platform_scope_cannot_be_read_counts_one_failure_for_the_request() {
+    let h = ResolutionHarness::new().await;
+    for name in ["one", "two", "three"] {
+        h.declare(name, scope_class::CASCADING, json!(1)).await;
+    }
+    h.platform.go_down();
+    let (reader, metrics) = metered(&h);
+
+    reader
+        .get_effective_bulk(
+            &SecurityContext::anonymous(),
+            BulkSelector::Keys(vec![h.key("one"), h.key("two"), h.key("three")]),
+            scope_of(h.tree.b),
+        )
+        .await
+        .expect_err("no key can be resolved without the root");
+
+    assert_eq!(
+        metrics.failures(),
+        vec!["unavailable"],
+        "one for the request, not one per key"
+    );
+    assert!(metrics.lookups().is_empty() && metrics.reads().is_empty());
+}
+
+#[tokio::test]
+async fn a_bulk_whose_category_cannot_be_enumerated_counts_one_internal_failure() {
+    use toolkit_security::AccessScope;
+
+    use crate::domain::declaration::{DeclarationDraft, DeclarationRepository};
+    use crate::infra::storage::declaration_repo::DeclarationRepo;
+    use crate::test_support::BOOL;
+
+    let h = ResolutionHarness::new().await;
+    h.declare("good", scope_class::LOCAL, json!(1)).await;
+    {
+        let conn = h.db.conn().expect("connection");
+        DeclarationRepo
+            .insert(
+                &conn,
+                &AccessScope::allow_all(),
+                DeclarationDraft {
+                    key: "not a key".to_owned(),
+                    leaf_slug: "broken".to_owned(),
+                    value_type_id: BOOL.to_owned(),
+                    category_id: h.category_id(),
+                    default_value: json!(false),
+                    scope_class: scope_class::LOCAL.to_owned(),
+                    mode: "standard".to_owned(),
+                    requires_step_up: false,
+                    anonymous_exposable: false,
+                    domain_affinity: None,
+                    has_secret_trait: false,
+                    data_classification: "public".to_owned(),
+                    source: "admin_authored".to_owned(),
+                    owner_module: None,
+                    licence_feature: None,
+                    display_name: None,
+                    description: None,
+                    created_by: "test".to_owned(),
+                },
+            )
+            .await
+            .expect("the row is stored as given");
+    }
+    let (reader, metrics) = metered(&h);
+
+    reader
+        .get_effective_bulk(
+            &SecurityContext::anonymous(),
+            BulkSelector::Category(h.category_id().to_string()),
+            scope_of(h.tree.a),
+        )
+        .await
+        .expect_err("refused whole");
+
+    assert_eq!(metrics.failures(), vec!["internal"]);
+    assert!(metrics.lookups().is_empty() && metrics.reads().is_empty());
+}
+
+#[tokio::test]
+async fn a_bulk_whose_chain_walk_is_unavailable_counts_one_failure_per_cascading_key() {
+    let h = ResolutionHarness::new().await;
+    h.declare("first", scope_class::CASCADING, json!(1)).await;
+    h.declare("second", scope_class::CASCADING, json!(2)).await;
+    h.declare("flat", scope_class::GLOBAL, json!(3)).await;
+    h.hierarchy.set_unavailable(true);
+    let (reader, metrics) = metered(&h);
+
+    let outcomes = reader
+        .get_effective_bulk(
+            &SecurityContext::anonymous(),
+            BulkSelector::Keys(vec![h.key("first"), h.key("flat"), h.key("second")]),
+            scope_of(h.tree.b),
+        )
+        .await
+        .expect("the request is served; each key answers for itself");
+
+    assert!(outcomes[0].result.is_err());
+    assert!(
+        outcomes[1].result.is_ok(),
+        "a global setting never asks for ancestry"
+    );
+    assert!(outcomes[2].result.is_err());
+    assert_eq!(
+        metrics.failures(),
+        vec!["unavailable", "unavailable"],
+        "the walk is lazy and per key"
+    );
+    assert_eq!(metrics.lookups(), vec![("miss", scope_class::GLOBAL)]);
+    assert_eq!(metrics.reads().len(), 1);
+}
+
+#[tokio::test]
+async fn a_bulk_read_refused_for_its_size_or_scope_counts_nothing() {
+    use settings_service_sdk::api::BULK_LIMIT;
+    let h = ResolutionHarness::new().await;
+    h.declare("one", scope_class::LOCAL, json!(1)).await;
+    let (reader, metrics) = metered(&h);
+
+    reader
+        .get_effective_bulk(
+            &SecurityContext::anonymous(),
+            BulkSelector::Keys(vec![h.key("one"); BULK_LIMIT + 1]),
+            scope_of(h.tree.a),
+        )
+        .await
+        .expect_err("past the bound");
+    reader
+        .get_effective_bulk(
+            &SecurityContext::anonymous(),
+            BulkSelector::Keys(vec![h.key("one")]),
+            "tenant-a".to_owned(),
+        )
+        .await
+        .expect_err("not a path");
+    assert!(metrics.is_silent());
+
+    // The recorder is wired: a served request is counted.
+    reader
+        .get_effective_bulk(
+            &SecurityContext::anonymous(),
+            BulkSelector::Keys(vec![h.key("one")]),
+            scope_of(h.tree.a),
+        )
+        .await
+        .expect("served");
+    assert_eq!(metrics.lookups().len(), 1);
+}
+
+#[tokio::test]
+async fn the_administrative_read_and_the_secret_path_record_nothing_on_the_read_metrics() {
+    let h = ResolutionHarness::new().await;
+    let (reader, secrets, _, metrics) = metered_with(&h);
+    h.declare("flag", scope_class::CASCADING, json!(false))
+        .await;
+    let d = h
+        .declare_typed(
+            "api_token",
+            scope_class::CASCADING,
+            json!(""),
+            SECRET,
+            "secret",
+        )
+        .await;
+    secrets.seed("seeded", "hunter2");
+    h.set_secret(d, h.tree.a, "seeded").await;
+
+    // The administrative read is the resolver's own `resolve`.
+    h.resolve(
+        "flag",
+        crate::domain::resolution::ScopeTarget::Tenant(h.tree.b),
+    )
+    .await
+    .expect("resolves");
+    // The machine path resolves again inside the secret resolver.
+    let handle =
+        crate::domain::secrets::issue_handle(h.key("api_token").as_str(), &scope_of(h.tree.b));
+    let plaintext = reader
+        .resolve_secret(&SecurityContext::anonymous(), handle)
+        .await
+        .expect("resolved");
+    assert_eq!(plaintext.expose_secret(), "hunter2");
+    assert!(metrics.is_silent());
+
+    // The recorder is wired: the reader's own read is counted.
+    reader
+        .get_effective(
+            &SecurityContext::anonymous(),
+            read_request(&h, "flag", h.tree.b),
+        )
+        .await
+        .expect("resolves");
+    assert_eq!(metrics.lookups().len(), 1);
 }

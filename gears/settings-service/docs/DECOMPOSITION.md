@@ -110,6 +110,7 @@ One requirement is counted as covered while being split across releases: `cpt-cf
   - AuthN and AuthZ: the `PolicyEnforcer` PEP pattern, `AccessScope` derived from PDP constraints, and the `StepUpVerifier` port — declared in the domain, adapted in infra — whose default binding has the platform's AuthN resolver authenticate a presented step-up token and checks its claims; it is bound in 2.8, the first path that refuses without it, and picked up there by the behavior-affecting declaration actions of 2.3
   - Audit Emitter: the `AuditSink` port taking the mutation's own transaction and `AccessScope`, and event publication; the gear-local binding is entry 2.6, and the tracing stand-in until then exercises the emitter's callers without satisfying the audit DoD
   - Deployment-owned bootstrap configuration delivered through ToolKit config at gear init (DESIGN §4.9), never as a managed setting
+  - Metrics: the telemetry ports, `settings_authz_denial_total`, `settings_service_up` and the two inventory gauges
 
 - **Out of scope**:
   - Every domain service and its REST handlers, which are features 2.2 through 2.10
@@ -225,6 +226,7 @@ One requirement is counted as covered while being split across releases: `cpt-cf
   - Purge of a retired admin-authored declaration: step-up and `If-Match` gated, one transaction that takes the row for update and hard-deletes it with its values, tenant permissions and staged secrets by `ON DELETE CASCADE`, then releases their Credential Store entries after commit through the Secret Manager port, best-effort (`cpt-cf-settings-service-seq-declaration-purge`)
   - Dependency Group and cross-setting constraint **declaration**
   - Declaration REST surface, visibility- and domain-gated with the predicate applied inside the query, returning the `key`, its `value_type_id`, and resolved traits for client rendering, and leaving the seam through which the licence predicate joins in R2
+  - Metrics: the step-up count on declaration actions
 
 - **Out of scope**:
   - Module-contributed declarations and the Contribution Reconciler, which own the contributed write path (2.10)
@@ -342,6 +344,7 @@ One requirement is counted as covered while being split across releases: `cpt-cf
   - `cache_ttl_seconds` backstop, default 30 s, owned by this cache
   - `cache_max_entries` bound, default 500,000 — the sizing anchor — with the entries nearest to expiry evicted first and expired entries dropped on any store
   - Hierarchy-change eviction for cascading declarations, noting that the Tenant Resolver does not publish that signal today so the TTL is currently the only backstop after a re-parent
+  - Metrics: the read-path metrics of the reader boundary
 
 - **Out of scope**:
   - The cross-replica `cache_invalidate` broadcast and its bounded-staleness guarantee, which ship in R2 when several replicas become the normal case (`cpt-cf-settings-service-fr-replica-coherence`)
@@ -402,6 +405,7 @@ One requirement is counted as covered while being split across releases: `cpt-cf
   - `GET /settings-service/v1/settings/{key}/history` querying `(declaration_key, tenant_id)` on `idx_audit_scoped`, paginated, newest first, with no second masking implementation and no reveal path
   - `idx_audit_retention` on `retain_until` for pruning; `retain_until` carried on every record from the start, the store's configured default applying when absent
   - Retiring the `TracingAuditEmitter` and closing the audit DoDs 2.1 and 2.2 left open
+  - Metrics: `settings_audit_events_total`
 
 - **Out of scope**:
   - Shipping records to the platform Audit Subsystem through the transactional outbox, which is R2 and an addition behind the same port
@@ -502,6 +506,7 @@ One requirement is counted as covered while being split across releases: `cpt-cf
   - A `change_set_id` minted per `set` request and carried on the audit records it produces
   - Publication of `event_value_changed` and `event_value_change_failed` through the Change Publisher port; in R1 no consumer notification and no cross-replica broadcast are bound, so the local eviction is the write's only cache effect and a second host would be stale for at most `cache_ttl_seconds`
   - The `settings_step_up_total` counter by operation and result, and the set-path metrics `cpt-cf-settings-service-nfr-ops-set-monitoring` requires
+  - Metrics: `settings_changes_committed_total`
 
 - **Out of scope**:
   - Writes by an authorized service principal through the SDK `set_value`, which is R2 (`cpt-cf-settings-service-fr-service-writes`); the gate table's machine column — refusal on a `requires_step_up` declaration — is enforced here
@@ -567,6 +572,7 @@ One requirement is counted as covered while being split across releases: `cpt-cf
   - `delete_secret` when an override is removed or superseded
   - Staging a secret ahead of the step-up redirect: `POST /settings/{key}/secret-stage` validates and stores the plaintext as a set would and answers with a single-use `pending_id`; the batch names it in place of the value and adopts the entry without a second store leg; expired stages are swept with their entries (DESIGN §5 *A secret staged across the step-up redirect*, §4.7 `pending_secrets`)
   - The placeholder-default rule, already enforced by 2.3 on the declaration side: a secret setting resolves to its empty placeholder, never to a credential
+  - Metrics: `settings_secret_use_total`
 
 - **Out of scope**:
   - Verified machine caller identity, without which the machine path enforces only the deployment trust boundary and attributes secret use to the caller's declared module (DESIGN §6); R2

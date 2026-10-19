@@ -21,12 +21,14 @@ use crate::audit::{ActorTenant, AuditOperation, AuditRecord, AuditSink, AuditVal
 use crate::domain::category::DomainVisibility;
 use crate::domain::declaration::{Declaration, DeclarationRepository};
 use crate::domain::error::DomainError;
-use crate::domain::ports::StepUpOperation;
+use crate::domain::ports::{StepUpOperation, labels};
 use crate::domain::resolution::{EffectiveValue, ScopeTarget};
 use crate::domain::secrets::pending::{
     self as pending, Claim, PendingSecret, PendingSecretRepository,
 };
-use crate::domain::writes::service::{ImpactPage, ImpactReport, StepUpPolicy, ValidationReport};
+use crate::domain::writes::service::{
+    ImpactPage, ImpactReport, StepUpPolicy, ValidationReport, change_type_of,
+};
 use crate::domain::writes::{
     Change, Committed, Gated, StagePrecondition, Staged, ValueWriter, WriteActor,
 };
@@ -128,6 +130,17 @@ fn requested_change(op: Option<&str>, value: Option<Value>) -> Result<Change, Do
     }
 }
 
+/// The kind of change a batch entry asks for, from its text alone: `None` for
+/// an operation that is not one, or a value that does not suit it, since the
+/// kind cannot then be told.
+fn batch_change_type(op: Option<&str>, has_value: bool) -> Option<&'static str> {
+    match (op.unwrap_or(OP_SET), has_value) {
+        (OP_SET, true) => Some(labels::SET),
+        (OP_REVERT, false) => Some(labels::REVERT),
+        _ => None,
+    }
+}
+
 /// One batch's answer: a change set id and one outcome per change.
 #[derive(Debug)]
 pub struct BatchOutcome {
@@ -143,6 +156,7 @@ pub struct WriteCoordinator {
     writer: Arc<ConcreteWriter>,
     pending: PendingSecretRepo,
     declarations: DeclarationRepo,
+    audit: AuditStore,
 }
 
 fn conn_error(err: &DbError) -> DomainError {
@@ -152,14 +166,20 @@ fn conn_error(err: &DbError) -> DomainError {
 }
 
 impl WriteCoordinator {
-    /// Over this database and writer.
+    /// Over this database and writer; `audit` is the counting store the
+    /// stage's own record is appended through.
     #[must_use]
-    pub fn new(db: Arc<DBProvider<DbError>>, writer: Arc<ConcreteWriter>) -> Self {
+    pub fn new(
+        db: Arc<DBProvider<DbError>>,
+        writer: Arc<ConcreteWriter>,
+        audit: AuditStore,
+    ) -> Self {
         Self {
             db,
             writer,
             pending: PendingSecretRepo,
             declarations: DeclarationRepo,
+            audit,
         }
     }
 
@@ -209,7 +229,14 @@ impl WriteCoordinator {
                 // for, or the caller's own.
                 let tenant_id = requested.unwrap_or_else(|| actor.ctx.subject_tenant_id());
                 self.writer
-                    .after_rejection(key.as_str(), tenant_id, actor, &err, change_set_id)
+                    .after_rejection(
+                        key.as_str(),
+                        tenant_id,
+                        actor,
+                        &err,
+                        change_set_id,
+                        Some(change_type_of(&change)),
+                    )
                     .await;
                 return Err(err);
             }
@@ -230,6 +257,22 @@ impl WriteCoordinator {
         change: Change,
         if_match: Option<&str>,
         change_set_id: Uuid,
+    ) -> Result<Committed, DomainError> {
+        let change_type = change_type_of(&change);
+        self.commit_as(actor, gated, change, if_match, change_set_id, change_type)
+            .await
+    }
+
+    /// [`Self::commit`] counted under `change_type` — a clone commits as a
+    /// set and counts as a clone.
+    async fn commit_as(
+        &self,
+        actor: &WriteActor,
+        gated: Gated,
+        change: Change,
+        if_match: Option<&str>,
+        change_set_id: Uuid,
+        change_type: &'static str,
     ) -> Result<Committed, DomainError> {
         let key = gated.declaration.key.clone();
         let tenant_id = gated.tenant_id;
@@ -252,7 +295,14 @@ impl WriteCoordinator {
             Ok(staged) => staged,
             Err(err) => {
                 self.writer
-                    .after_rejection(&key, tenant_id, actor, &err, change_set_id)
+                    .after_rejection(
+                        &key,
+                        tenant_id,
+                        actor,
+                        &err,
+                        change_set_id,
+                        Some(change_type),
+                    )
                     .await;
                 return Err(err);
             }
@@ -284,13 +334,22 @@ impl WriteCoordinator {
             .await;
         match outcome {
             Ok(committed) => {
-                self.writer.after_commit(&committed, actor).await;
+                self.writer
+                    .after_commit(&committed, actor, Some(change_type))
+                    .await;
                 Ok(committed)
             }
             Err(err) => {
                 self.writer.discard(&conn, &gated, &staged).await;
                 self.writer
-                    .after_rejection(&key, tenant_id, actor, &err, change_set_id)
+                    .after_rejection(
+                        &key,
+                        tenant_id,
+                        actor,
+                        &err,
+                        change_set_id,
+                        Some(change_type),
+                    )
                     .await;
                 Err(err)
             }
@@ -358,6 +417,10 @@ impl WriteCoordinator {
         }
         let mut verified = if ConcreteWriter::any_requires_step_up(&declarations) {
             if !actor.is_interactive() {
+                // @cpt-begin:cpt-cf-settings-service-flow-value-writes-batch:p1:inst-vw-batch-11
+                self.writer
+                    .count_service_principal_refusal(StepUpOperation::Batch);
+                // @cpt-end:cpt-cf-settings-service-flow-value-writes-batch:p1:inst-vw-batch-11
                 return Err(DomainError::Unauthorized {
                     resource: settings_service_sdk::gts::VALUE_SCHEMA,
                 });
@@ -393,6 +456,7 @@ impl WriteCoordinator {
                             actor,
                             &refused.error,
                             change_set_id,
+                            None,
                         )
                         .await;
                     results.push(Err(refused.error));
@@ -406,6 +470,7 @@ impl WriteCoordinator {
                 value,
                 if_match,
             } = change;
+            let change_type = batch_change_type(op.as_deref(), value.is_some());
             let gated = self
                 .writer
                 .gate(
@@ -449,6 +514,7 @@ impl WriteCoordinator {
                                 actor,
                                 &err,
                                 change_set_id,
+                                change_type,
                             )
                             .await;
                         Err(err)
@@ -461,7 +527,14 @@ impl WriteCoordinator {
                 Err(err) => {
                     let tenant_id = tenant.unwrap_or_else(|| actor.ctx.subject_tenant_id());
                     self.writer
-                        .after_rejection(key.as_str(), tenant_id, actor, &err, change_set_id)
+                        .after_rejection(
+                            key.as_str(),
+                            tenant_id,
+                            actor,
+                            &err,
+                            change_set_id,
+                            change_type,
+                        )
                         .await;
                     Err(err)
                 }
@@ -649,6 +722,7 @@ impl WriteCoordinator {
         let key_owned = gated.declaration.key.clone();
         let tenant_id = gated.tenant_id;
         let actor_owned = actor.clone();
+        let audit = self.audit.clone();
         let outcome = self
             .db
             .db()
@@ -663,9 +737,7 @@ impl WriteCoordinator {
                         actor_owned.request_id.clone(),
                     )
                     .with_post_image(AuditValue::Masked);
-                    AuditStore
-                        .append(tx, &AccessScope::allow_all(), record)
-                        .await
+                    audit.append(tx, &AccessScope::allow_all(), record).await
                 })
             })
             .await;
@@ -791,7 +863,10 @@ impl WriteCoordinator {
         // @cpt-end:cpt-cf-settings-service-flow-value-writes-clone:p1:inst-vw-clone-2
         let conn = self.db.conn().map_err(|e| conn_error(&e))?;
         // @cpt-begin:cpt-cf-settings-service-flow-value-writes-clone:p1:inst-vw-clone-3
-        let gated = self
+        // One change set for the clone, minted before the gate so a refusal
+        // there is published under it, as it is for a set.
+        let change_set_id = Uuid::new_v4();
+        let gated = match self
             .writer
             .gate(
                 &conn,
@@ -801,17 +876,45 @@ impl WriteCoordinator {
                 StepUpPolicy::Verify,
                 StepUpOperation::Clone,
             )
-            .await?;
+            .await
+        {
+            Ok(gated) => gated,
+            Err(err) => {
+                let tenant_id = to.unwrap_or_else(|| actor.ctx.subject_tenant_id());
+                self.writer
+                    .after_rejection(
+                        key.as_str(),
+                        tenant_id,
+                        actor,
+                        &err,
+                        change_set_id,
+                        Some(labels::CLONE),
+                    )
+                    .await;
+                return Err(err);
+            }
+        };
         // @cpt-end:cpt-cf-settings-service-flow-value-writes-clone:p1:inst-vw-clone-3
         // @cpt-begin:cpt-cf-settings-service-flow-value-writes-clone:p1:inst-vw-clone-4
         // Copying a secret reference would couple the target to the source
         // credential's lifecycle; a secret is set at the target instead.
         if gated.declaration.data_classification == "secret" {
-            return Err(DomainError::Validation {
+            let err = DomainError::Validation {
                 field: "key".to_owned(),
                 code: field::SECRET_NOT_CLONEABLE,
                 message: format!("`{key}` is secret-classified and cannot be cloned"),
-            });
+            };
+            self.writer
+                .after_rejection(
+                    key.as_str(),
+                    gated.tenant_id,
+                    actor,
+                    &err,
+                    change_set_id,
+                    Some(labels::CLONE),
+                )
+                .await;
+            return Err(err);
         }
         // @cpt-end:cpt-cf-settings-service-flow-value-writes-clone:p1:inst-vw-clone-4
         // @cpt-begin:cpt-cf-settings-service-flow-value-writes-clone:p1:inst-vw-clone-5
@@ -819,12 +922,13 @@ impl WriteCoordinator {
         // @cpt-end:cpt-cf-settings-service-flow-value-writes-clone:p1:inst-vw-clone-5
         // @cpt-begin:cpt-cf-settings-service-flow-value-writes-clone:p1:inst-vw-clone-6
         // The effective value, copied once: no continuing link to the source.
-        self.commit(
+        self.commit_as(
             actor,
             gated,
             Change::Set(effective.value.clone()),
             if_match,
-            Uuid::new_v4(),
+            change_set_id,
+            labels::CLONE,
         )
         .await
         // @cpt-end:cpt-cf-settings-service-flow-value-writes-clone:p1:inst-vw-clone-6

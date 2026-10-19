@@ -24,6 +24,7 @@ fn entry(key: &str, tenant: Uuid) -> Arc<EffectiveValue> {
         fallback_scope: None,
         traits: json!({}),
         trail: Vec::new(),
+        scope_class: "cascading",
         data_classification: "public".to_owned(),
         domain_affinity: None,
         secret_backed: false,

@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 use toolkit_macros::domain_model;
 
 use serde_json::Value;
@@ -12,8 +13,8 @@ use uuid::Uuid;
 
 use super::cache::Generation;
 use super::{
-    EffectiveCache, EffectiveValue, OwnRow, ScopeTarget, Subtree, TenantHierarchy, TrailEntry,
-    scope_class, scope_path,
+    EffectiveCache, EffectiveValue, OwnRow, ReaderRead, ScopeTarget, Subtree, TenantHierarchy,
+    TrailEntry, scope_class, scope_path,
 };
 use crate::domain::access::{AccessRepository, EffectiveAccess, strictest};
 use crate::domain::declaration::{Declaration, DeclarationRepository};
@@ -293,14 +294,26 @@ fn index(rows: Vec<StoredValue>) -> HashMap<Uuid, StoredValue> {
 }
 
 /// The effective value a walk produced, with the declaration's own facts.
+///
+/// # Errors
+/// [`DomainError::Internal`] when the declaration carries an unknown scope
+/// class; the walk refused one already, so this maps the same column once,
+/// onto the constant the cache entry carries.
 fn effective_value(
     declaration: &Declaration,
     root: Uuid,
     tenant: Uuid,
     walk: Walk,
     traits: Value,
-) -> EffectiveValue {
-    EffectiveValue {
+) -> Result<EffectiveValue, DomainError> {
+    let class =
+        scope_class::label_of(&declaration.scope_class).ok_or_else(|| DomainError::Internal {
+            diagnostic: format!(
+                "declaration `{}` carries the unknown scope class `{}`",
+                declaration.key, declaration.scope_class
+            ),
+        })?;
+    Ok(EffectiveValue {
         key: declaration.key.clone(),
         declaration_id: declaration.id,
         scope: scope_path(tenant, root),
@@ -313,13 +326,14 @@ fn effective_value(
         fallback_scope: walk.fallback_tenant.map(|t| scope_path(t, root)),
         traits,
         trail: walk.trail,
+        scope_class: class,
         data_classification: declaration.data_classification.clone(),
         domain_affinity: declaration.domain_affinity.clone(),
         secret_backed: walk.secret_backed,
         declaration_last_change_at: declaration.last_change_at,
         resolved_row_last_change_at: walk.resolved_row_last_change_at,
         own_row: walk.own_row,
-    }
+    })
 }
 
 /// One declaration's outcome in a batch.
@@ -354,6 +368,20 @@ fn inspected_tenants(
                 declaration.key
             ),
         }),
+    }
+}
+
+/// The reader's report on a value: where it was answered from and the span
+/// since `started`.
+fn report(value: Arc<EffectiveValue>, hit: bool, started: Instant) -> ReaderRead {
+    ReaderRead {
+        value,
+        source: if hit {
+            crate::domain::ports::labels::CACHE
+        } else {
+            crate::domain::ports::labels::RESOLVE
+        },
+        elapsed: started.elapsed(),
     }
 }
 
@@ -493,6 +521,72 @@ where
         self.resolve_shared(conn, key, &mut ancestry).await
     }
 
+    /// [`Self::resolve`] for the reader boundary: the value with the report
+    /// the reader records — the cache outcome and the span.
+    ///
+    /// The span starts at the cache lookup, after the root tenant is known,
+    /// and ends at the outcome, so the chain walk falls inside it.
+    ///
+    /// # Errors
+    /// As [`Self::resolve`], passed through unchanged.
+    pub async fn resolve_for_reader<C: DBRunner>(
+        &self,
+        conn: &C,
+        key: &SettingKey,
+        target: ScopeTarget,
+    ) -> Result<ReaderRead, DomainError> {
+        let root = self.platform.root_tenant().await?;
+        let mut ancestry = Ancestry::new(root, target);
+        let started = Instant::now();
+        let (value, hit) = self.resolve_shared_traced(conn, key, &mut ancestry).await?;
+        // @cpt-begin:cpt-cf-settings-service-flow-value-resolution-resolve:p1:inst-vr-resolve-13
+        Ok(report(value, hit, started))
+        // @cpt-end:cpt-cf-settings-service-flow-value-resolution-resolve:p1:inst-vr-resolve-13
+    }
+
+    /// [`Self::resolve_bulk`] for the reader boundary: one report per key that
+    /// resolves. The one body of the bulk resolution; [`Self::resolve_bulk`]
+    /// delegates here and drops the reports.
+    ///
+    /// The ancestry is shared and walked lazily, so the walk falls inside the
+    /// span of the first key that needs it.
+    ///
+    /// # Errors
+    /// As [`Self::resolve_bulk`].
+    pub async fn resolve_bulk_for_reader<C: DBRunner>(
+        &self,
+        conn: &C,
+        keys: &[SettingKey],
+        target: ScopeTarget,
+    ) -> Result<Vec<(SettingKey, Result<ReaderRead, DomainError>)>, DomainError> {
+        // @cpt-begin:cpt-cf-settings-service-flow-value-resolution-resolve-bulk:p1:inst-vr-bulk-1
+        // @cpt-begin:cpt-cf-settings-service-flow-value-resolution-resolve-bulk:p1:inst-vr-bulk-2
+        // Without the root no key can be resolved: the batch's failure, not
+        // each key's.
+        let root = self.platform.root_tenant().await?;
+        let mut ancestry = Ancestry::new(root, target);
+        // @cpt-end:cpt-cf-settings-service-flow-value-resolution-resolve-bulk:p1:inst-vr-bulk-2
+        // @cpt-end:cpt-cf-settings-service-flow-value-resolution-resolve-bulk:p1:inst-vr-bulk-1
+        let mut out = Vec::with_capacity(keys.len());
+        // @cpt-begin:cpt-cf-settings-service-flow-value-resolution-resolve-bulk:p1:inst-vr-bulk-3
+        for key in keys {
+            let started = Instant::now();
+            // @cpt-begin:cpt-cf-settings-service-flow-value-resolution-resolve-bulk:p1:inst-vr-bulk-4
+            let outcome = self.resolve_shared_traced(conn, key, &mut ancestry).await;
+            // @cpt-end:cpt-cf-settings-service-flow-value-resolution-resolve-bulk:p1:inst-vr-bulk-4
+            // @cpt-begin:cpt-cf-settings-service-flow-value-resolution-resolve:p1:inst-vr-resolve-13
+            let outcome = outcome.map(|(value, hit)| report(value, hit, started));
+            // @cpt-end:cpt-cf-settings-service-flow-value-resolution-resolve:p1:inst-vr-resolve-13
+            // @cpt-begin:cpt-cf-settings-service-flow-value-resolution-resolve-bulk:p1:inst-vr-bulk-5
+            out.push((key.clone(), outcome));
+            // @cpt-end:cpt-cf-settings-service-flow-value-resolution-resolve-bulk:p1:inst-vr-bulk-5
+        }
+        // @cpt-end:cpt-cf-settings-service-flow-value-resolution-resolve-bulk:p1:inst-vr-bulk-3
+        // @cpt-begin:cpt-cf-settings-service-flow-value-resolution-resolve-bulk:p1:inst-vr-bulk-6
+        Ok(out)
+        // @cpt-end:cpt-cf-settings-service-flow-value-resolution-resolve-bulk:p1:inst-vr-bulk-6
+    }
+
     /// Resolve several settings at one target, sharing one ancestry walk.
     ///
     /// One outcome per key: a key that fails leaves the others intact, and a
@@ -507,28 +601,12 @@ where
         keys: &[SettingKey],
         target: ScopeTarget,
     ) -> Result<Vec<(SettingKey, Result<Arc<EffectiveValue>, DomainError>)>, DomainError> {
-        // @cpt-begin:cpt-cf-settings-service-flow-value-resolution-resolve-bulk:p1:inst-vr-bulk-1
-        // @cpt-begin:cpt-cf-settings-service-flow-value-resolution-resolve-bulk:p1:inst-vr-bulk-2
-        // Without the root no key can be resolved: the batch's failure, not
-        // each key's.
-        let root = self.platform.root_tenant().await?;
-        let mut ancestry = Ancestry::new(root, target);
-        // @cpt-end:cpt-cf-settings-service-flow-value-resolution-resolve-bulk:p1:inst-vr-bulk-2
-        // @cpt-end:cpt-cf-settings-service-flow-value-resolution-resolve-bulk:p1:inst-vr-bulk-1
-        let mut out = Vec::with_capacity(keys.len());
-        // @cpt-begin:cpt-cf-settings-service-flow-value-resolution-resolve-bulk:p1:inst-vr-bulk-3
-        for key in keys {
-            // @cpt-begin:cpt-cf-settings-service-flow-value-resolution-resolve-bulk:p1:inst-vr-bulk-4
-            let outcome = self.resolve_shared(conn, key, &mut ancestry).await;
-            // @cpt-end:cpt-cf-settings-service-flow-value-resolution-resolve-bulk:p1:inst-vr-bulk-4
-            // @cpt-begin:cpt-cf-settings-service-flow-value-resolution-resolve-bulk:p1:inst-vr-bulk-5
-            out.push((key.clone(), outcome));
-            // @cpt-end:cpt-cf-settings-service-flow-value-resolution-resolve-bulk:p1:inst-vr-bulk-5
-        }
-        // @cpt-end:cpt-cf-settings-service-flow-value-resolution-resolve-bulk:p1:inst-vr-bulk-3
-        // @cpt-begin:cpt-cf-settings-service-flow-value-resolution-resolve-bulk:p1:inst-vr-bulk-6
-        Ok(out)
-        // @cpt-end:cpt-cf-settings-service-flow-value-resolution-resolve-bulk:p1:inst-vr-bulk-6
+        Ok(self
+            .resolve_bulk_for_reader(conn, keys, target)
+            .await?
+            .into_iter()
+            .map(|(key, outcome)| (key, outcome.map(|read| read.value)))
+            .collect())
     }
 
     /// Resolve declarations already loaded — a browse page — at one target,
@@ -693,15 +771,13 @@ where
                     match known {
                         Err(err) => Err(same_detail(err)),
                         Ok(value) => {
-                            let effective = Arc::new(effective_value(
-                                declaration,
-                                root,
-                                tenant,
-                                walk,
-                                value.clone(),
-                            ));
-                            self.cache.populate(Arc::clone(&effective), *seen);
-                            Ok(effective)
+                            effective_value(declaration, root, tenant, walk, value.clone()).map(
+                                |effective| {
+                                    let effective = Arc::new(effective);
+                                    self.cache.populate(Arc::clone(&effective), *seen);
+                                    effective
+                                },
+                            )
                         }
                     }
                 }
@@ -1010,10 +1086,25 @@ where
         key: &SettingKey,
         ancestry: &mut Ancestry,
     ) -> Result<Arc<EffectiveValue>, DomainError> {
+        self.resolve_shared_traced(conn, key, ancestry)
+            .await
+            .map(|(value, _)| value)
+    }
+
+    /// [`Self::resolve_shared`] that also says whether the cache answered —
+    /// at the first lookup or again after the declaration load.
+    async fn resolve_shared_traced<C: DBRunner>(
+        &self,
+        conn: &C,
+        key: &SettingKey,
+        ancestry: &mut Ancestry,
+    ) -> Result<(Arc<EffectiveValue>, bool), DomainError> {
         // @cpt-begin:cpt-cf-settings-service-flow-value-resolution-resolve:p1:inst-vr-resolve-2
         // @cpt-begin:cpt-cf-settings-service-flow-value-resolution-resolve:p1:inst-vr-resolve-3
         if let Some(hit) = self.cache.get(key.as_str(), ancestry.tenant) {
-            return Ok(hit);
+            // @cpt-begin:cpt-cf-settings-service-algo-value-resolution-cache-read:p1:inst-vr-cache-5
+            return Ok((hit, true));
+            // @cpt-end:cpt-cf-settings-service-algo-value-resolution-cache-read:p1:inst-vr-cache-5
         }
         // @cpt-end:cpt-cf-settings-service-flow-value-resolution-resolve:p1:inst-vr-resolve-3
         // @cpt-end:cpt-cf-settings-service-flow-value-resolution-resolve:p1:inst-vr-resolve-2
@@ -1055,18 +1146,21 @@ where
         Ok(declaration)
     }
 
-    /// `seen` is the generation the caller captured on its own cache miss;
-    /// a caller that loaded the declaration some other way captures it here,
-    /// on this miss, which is the earliest point it has.
+    /// The value with whether the cache answered. `seen` is the generation
+    /// the caller captured on its own cache miss; a caller that loaded the
+    /// declaration some other way captures it here, on this miss, which is the
+    /// earliest point it has.
     async fn resolve_loaded<C: DBRunner>(
         &self,
         conn: &C,
         declaration: &Declaration,
         ancestry: &mut Ancestry,
         seen: Option<Generation>,
-    ) -> Result<Arc<EffectiveValue>, DomainError> {
+    ) -> Result<(Arc<EffectiveValue>, bool), DomainError> {
         if let Some(hit) = self.cache.get(&declaration.key, ancestry.tenant) {
-            return Ok(hit);
+            // @cpt-begin:cpt-cf-settings-service-algo-value-resolution-cache-read:p1:inst-vr-cache-5
+            return Ok((hit, true));
+            // @cpt-end:cpt-cf-settings-service-algo-value-resolution-cache-read:p1:inst-vr-cache-5
         }
         let seen = seen.unwrap_or_else(|| self.cache.generation(&declaration.key, ancestry.tenant));
         // @cpt-begin:cpt-cf-settings-service-flow-value-resolution-resolve:p1:inst-vr-resolve-6
@@ -1096,12 +1190,14 @@ where
             ancestry.tenant,
             walk,
             traits,
-        ));
+        )?);
         // @cpt-begin:cpt-cf-settings-service-flow-value-resolution-resolve:p1:inst-vr-resolve-11
         self.cache.populate(Arc::clone(&effective), seen);
         // @cpt-end:cpt-cf-settings-service-flow-value-resolution-resolve:p1:inst-vr-resolve-11
         // @cpt-begin:cpt-cf-settings-service-flow-value-resolution-resolve:p1:inst-vr-resolve-12
-        Ok(effective)
+        // @cpt-begin:cpt-cf-settings-service-algo-value-resolution-cache-read:p1:inst-vr-cache-5
+        Ok((effective, false))
+        // @cpt-end:cpt-cf-settings-service-algo-value-resolution-cache-read:p1:inst-vr-cache-5
         // @cpt-end:cpt-cf-settings-service-flow-value-resolution-resolve:p1:inst-vr-resolve-12
     }
 

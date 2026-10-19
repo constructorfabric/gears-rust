@@ -378,6 +378,7 @@ pub fn tests_entry(key: &str, tenant: Uuid) -> EffectiveValue {
         fallback_scope: None,
         traits: serde_json::json!({}),
         trail: Vec::new(),
+        scope_class: scope_class::CASCADING,
         data_classification: "public".to_owned(),
         domain_affinity: None,
         secret_backed: false,

@@ -444,3 +444,37 @@ async fn a_down_store_answers_unavailable_without_the_stores_own_text() {
         err.wire_message()
     );
 }
+
+// ---- The per-setting gate counts its refusal as an authorization denial.
+
+#[tokio::test]
+async fn a_gate_refusal_counts_one_authz_denial_under_read_and_a_permit_counts_none() {
+    use crate::domain::ports::SecretResolveGate;
+    use crate::test_support::{
+        RecordingSecurityMetrics, allowing_enforcer, context_for, denying_enforcer,
+    };
+
+    let metrics = Arc::new(RecordingSecurityMetrics::default());
+    let caller = context_for(Uuid::new_v4());
+
+    let permit = super::PepSecretGate::new(
+        Arc::new(allowing_enforcer()),
+        Arc::clone(&metrics) as Arc<dyn crate::domain::ports::SecurityMetrics>,
+    );
+    permit
+        .may_resolve(&caller, Uuid::new_v4())
+        .await
+        .expect("permitted");
+    assert!(metrics.denials().is_empty());
+
+    let refuse = super::PepSecretGate::new(
+        Arc::new(denying_enforcer()),
+        Arc::clone(&metrics) as Arc<dyn crate::domain::ports::SecurityMetrics>,
+    );
+    let err = refuse
+        .may_resolve(&caller, Uuid::new_v4())
+        .await
+        .expect_err("refused");
+    assert!(matches!(err, DomainError::Unauthorized { .. }), "{err:?}");
+    assert_eq!(metrics.denials(), vec![("read", "denied")]);
+}
