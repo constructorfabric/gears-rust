@@ -2426,6 +2426,76 @@ dependencies = [
 ]
 
 [[package]]
+name = "cf-gears-bss-rating"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "aws-lc-rs",
+ "axum",
+ "cf-gears-authz-resolver",
+ "cf-gears-authz-resolver-sdk",
+ "cf-gears-bss-pricing-sdk",
+ "cf-gears-bss-rating",
+ "cf-gears-bss-rating-golden",
+ "cf-gears-bss-rating-sdk",
+ "cf-gears-cluster",
+ "cf-gears-cluster-sdk",
+ "cf-gears-standalone-cluster-plugin",
+ "cf-gears-test-containers",
+ "cf-gears-toolkit",
+ "cf-gears-toolkit-canonical-errors",
+ "cf-gears-toolkit-db",
+ "cf-gears-toolkit-db-macros",
+ "cf-gears-toolkit-gts",
+ "cf-gears-toolkit-macros",
+ "cf-gears-toolkit-security",
+ "cf-gears-types-registry",
+ "cf-gears-types-registry-sdk",
+ "chrono",
+ "gts",
+ "opentelemetry",
+ "opentelemetry_sdk",
+ "proptest",
+ "sea-orm",
+ "sea-orm-migration",
+ "serde",
+ "serde_json",
+ "strum 0.27.2",
+ "tempfile",
+ "testcontainers-modules",
+ "thiserror 2.0.21",
+ "time",
+ "tokio",
+ "tokio-util",
+ "tower",
+ "tracing",
+ "utoipa",
+ "uuid",
+]
+
+[[package]]
+name = "cf-gears-bss-rating-core"
+version = "0.0.0"
+
+[[package]]
+name = "cf-gears-bss-rating-golden"
+version = "0.0.0"
+dependencies = [
+ "proptest",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
+name = "cf-gears-bss-rating-sdk"
+version = "0.0.0"
+dependencies = [
+ "cf-gears-toolkit-canonical-errors",
+]
+
+[[package]]
 name = "cf-gears-bss-rest"
 version = "0.0.0"
 dependencies = [
@@ -2908,6 +2978,7 @@ dependencies = [
  "cf-gears-bss-rate-provider",
  "cf-gears-bss-rate-provider-ecb-plugin",
  "cf-gears-bss-rate-provider-http-json-plugin",
+ "cf-gears-bss-rating",
  "cf-gears-clickhouse-usage-collector-plugin",
  "cf-gears-cluster",
  "cf-gears-credstore",

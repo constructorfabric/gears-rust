@@ -530,6 +530,23 @@ gears:
     config:
       sources: ["pricing", "products"]
 
+  bss-rating:
+    # The Rating foundation: the inbox, the exception register, operation keys and
+    # the operator audit, plus the outbox work queues. Its leader-only jobs (the
+    # exception sweeper) elect on the `bss-rating` cluster profile bound below;
+    # every event source stays disabled by default.
+    database:
+      server: "sqlite_users"
+      file: "bss_rating.db"
+
+  # The platform cluster gear, linked by the bss-rating feature: Rating's
+  # `bss-rating` profile on the in-process standalone cache (R-27).
+  cluster:
+    config:
+      profiles:
+        bss-rating:
+          cache: { provider: standalone }
+
   simple-user-settings:
     # Gear-specific database configuration
     database:
