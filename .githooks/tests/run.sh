@@ -96,10 +96,16 @@ assert "uninstall removes own link" test ! -e "$r/.git/hooks/pre-commit"
 assert "uninstall unsets marker" no_marker "$r"
 
 mkrepo u2; mkdir -p "$r/.git/hooks"; hook "$r" install.sh
-ln -sf /some/other/.githooks/pre-commit "$r/.git/hooks/pre-commit"
+# Foreign target must exist: Git Bash `ln -s` copies the target and fails on a missing one.
+mkdir -p "$T/other/.githooks"; echo '#!/bin/sh' > "$T/other/.githooks/pre-commit"
+ln -sf "$T/other/.githooks/pre-commit" "$r/.git/hooks/pre-commit"
 hook "$r" install.sh --uninstall
-assert "uninstall keeps foreign link" test -L "$r/.git/hooks/pre-commit"
-assert "uninstall reports foreign link" grep -q 'not this clone' "$T/out"
+assert "uninstall keeps foreign link" test -e "$r/.git/hooks/pre-commit"
+if [ -L "$r/.git/hooks/pre-commit" ]; then
+    assert "uninstall reports foreign link" grep -q 'not this clone' "$T/out"
+else
+    skip "uninstall reports foreign link" "ln -s made a copy here"
+fi
 
 mkrepo u3; mkdir -p "$r/.git/hooks"
 cp "$r/.githooks/pre-commit" "$r/.git/hooks/pre-commit"
