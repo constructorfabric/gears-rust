@@ -28,6 +28,15 @@ is_copy() { [ -f "$1" ] && [ ! -L "$1" ] && cmp -s "$1" "$top/.githooks/$2"; }
 
 if [ "$mode" = "--uninstall" ]; then
     git config --local --unset gears.hooks 2>/dev/null || true
+    # A copy serves every clone sharing the hooks dir (core.hooksPath): remove copies only from
+    # this clone's own <git-common-dir>/hooks. The unset marker already disables hooks here.
+    common=$(git rev-parse --git-common-dir)
+    case "$common" in
+        /* | [A-Za-z]:/* | [A-Za-z]:\\*) ;;
+        *) common="$top/$common" ;;
+    esac
+    own_hooks=$(cd "$common" && pwd -P)/hooks
+    [ "$(cd "$hooks" 2>/dev/null && pwd -P)" = "$own_hooks" ] || shared=1
 else
     git config --local gears.hooks true || failed "gears.hooks marker"
 fi
@@ -43,6 +52,9 @@ for h in pre-commit pre-push; do
                 *) continue ;;
             esac
         elif ! is_copy "$link" "$h"; then
+            continue
+        elif [ -n "${shared:-}" ]; then
+            echo "kept $link (copy in a shared hooks dir; hooks are disabled for this clone)"
             continue
         fi
         if rm "$link"; then echo "removed $link"; else failed "$link"; fi

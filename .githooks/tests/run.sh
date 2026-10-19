@@ -115,6 +115,13 @@ assert "install does not skip identical copy" test -z "$(grep SKIP "$T/out")"
 hook "$r" install.sh --uninstall
 assert "uninstall removes identical copy" test ! -e "$r/.git/hooks/pre-commit"
 
+# Another clone may use a copy in a shared hooks dir: uninstall keeps it.
+mkrepo u3s; mkdir -p "$T/shared-copy"; git -C "$r" config core.hooksPath "$T/shared-copy"
+cp "$r/.githooks/pre-commit" "$T/shared-copy/pre-commit"
+hook "$r" install.sh --uninstall
+assert "uninstall keeps copy in shared hooks dir" test -e "$T/shared-copy/pre-commit"
+assert "uninstall reports kept shared copy" grep -q 'shared hooks dir' "$T/out"
+
 mkrepo u4; mkdir -p "$r/.git/hooks"; echo '#!/bin/sh' > "$r/.git/hooks/pre-commit"
 hook "$r" install.sh
 assert "install skips foreign regular file" grep -q '^SKIP: .*pre-commit' "$T/out"
