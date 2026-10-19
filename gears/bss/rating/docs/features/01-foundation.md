@@ -95,19 +95,19 @@ Actor labels grant nothing; every operation goes through the operation matrix of
 **Error Scenarios**: same key with a different digest (quarantine and page); unverified producer identity or a payload tenant outside Rating's grant (refused); unsupported schema version (quarantined, never dropped).
 
 **Steps**:
-1. [ ] - `p1` - Verify the producer identity for the source and check the payload's owning tenant against Rating's grant - `inst-ia-verify`
-2. [ ] - `p1` - BEGIN with a scope narrowed to that tenant; `Inbox::accept(tx, source, business_id, version, digest, payload, via)` - `inst-ia-accept`
-3. [ ] - `p1` - **IF** the key is new, insert the row `accepted` and hand it to the owning feature's apply step in the same transaction - `inst-ia-new`
-4. [ ] - `p1` - **IF** the key exists with the same digest, do nothing - `inst-ia-duplicate`
-5. [ ] - `p1` - **IF** the key exists with a different digest, mark it `quarantined` with its reason and page - `inst-ia-conflict`
+1. [x] - `p1` - Verify the producer identity for the source and check the payload's owning tenant against Rating's grant - `inst-ia-verify`
+2. [x] - `p1` - BEGIN with a scope narrowed to that tenant; `Inbox::accept(tx, source, business_id, version, payload, via)`; the digest is Rating's SHA-256 of the payload's canonical JSON, never a value the caller supplies, so a changed payload under a reused producer digest is a conflict - `inst-ia-accept`
+3. [x] - `p1` - **IF** the key is new, insert the row `accepted` and hand it to the owning feature's apply step in the same transaction - `inst-ia-new`
+4. [x] - `p1` - **IF** the key exists with the same digest, do nothing - `inst-ia-duplicate`
+5. [x] - `p1` - **IF** the key exists with a different digest, store the arrival as its own `quarantined` entry (reason `digest_conflict`, `conflict_of` = the key's primary entry, which stays untouched), open its exception and page - `inst-ia-conflict`
 6. [ ] - `p1` - **IF** the entry came from an event consumer, commit its offset in this transaction (`LocalDbOffsetManager`) - `inst-ia-offset`
-7. [ ] - `p1` - COMMIT; **RETURN** the inbox state - `inst-ia-return`
+7. [x] - `p1` - COMMIT; **RETURN** the inbox state - `inst-ia-return`
 
 Canonical: [11 §4.11](../DESIGN.md#contract-11-4-11); usage entries never use this inbox ([Usage Capture](04-usage-intake.md)).
 
 ### 2.2 Release a quarantined inbox entry
 
-- [ ] `p1` - **ID**: `cpt-cf-bss-rating-flow-foundation-inbox-release`
+- [x] `p1` - **ID**: `cpt-cf-bss-rating-flow-foundation-inbox-release`
 
 **Actor**: `cpt-cf-bss-rating-actor-platform-operator`
 
@@ -116,10 +116,10 @@ Canonical: [11 §4.11](../DESIGN.md#contract-11-4-11); usage entries never use t
 **Error Scenarios**: entry not quarantined (`400 FailedPrecondition`); entry outside the caller's scope (`404`); missing permission (`403`).
 
 **Steps**:
-1. [ ] - `p1` - Receive `POST /bss-rating/v1/inbox/{id}:release` with `{reason, resolution}` - `inst-ir-receive`
-2. [ ] - `p1` - Authorize `usage × release` and bind the PDP scope; an entry outside it is `404` - `inst-ir-authorize`
-3. [ ] - `p1` - **IF** the entry is not `quarantined`, refuse `400 FailedPrecondition` - `inst-ir-state`
-4. [ ] - `p1` - Apply or discard per the resolution, record actor, subject and request id, and **RETURN** `InboxEntryView` - `inst-ir-apply`
+1. [x] - `p1` - Receive `POST /bss-rating/v1/inbox/{id}/release` (the custom method `{id}:release`, served as a sub-resource, DESIGN §3.3) with `{reason, resolution}`; the reason is 1-1000 characters once trimmed, without control characters, and the domain checks it for every audited action whatever the entry point - `inst-ir-receive`
+2. [x] - `p1` - Authorize `usage × release` and bind the PDP scope; an entry outside it is `404` - `inst-ir-authorize`
+3. [x] - `p1` - **IF** the entry is not `quarantined`, refuse `400 FailedPrecondition` - `inst-ir-state`
+4. [x] - `p1` - Apply or discard per the resolution, record actor, subject and request id, and **RETURN** `InboxEntryView` - `inst-ir-apply`
 
 The route, status codes and idempotency rule are owned by DESIGN §3.3; the list and retry routes of the exception register are served by [Operations](11-operations.md).
 
@@ -127,68 +127,68 @@ The route, status codes and idempotency rule are owned by DESIGN §3.3; the list
 
 ### 3.1 Authorize and scope every operation
 
-- [ ] `p1` - **ID**: `cpt-cf-bss-rating-algo-foundation-authorize`
+- [x] `p1` - **ID**: `cpt-cf-bss-rating-algo-foundation-authorize`
 
 **Input**: an operation of the DESIGN §4.8 matrix, the caller's `SecurityContext`, any tenant selector, or the `tenant_id` persisted on a work item.
 
 **Output**: an `AccessScope` bound to every repository call, or a refusal.
 
-1. [ ] - `p1` - Evaluate the operation's PDP check (deny by default); a PDP outage refuses - `inst-az-pdp`
-2. [ ] - `p1` - Treat a tenant argument or filter as a selector that narrows the granted scope; a selector outside it returns `403` on collection reads and `404` on object reads - `inst-az-selector`
-3. [ ] - `p1` - For background work, bind a scope narrowed to the work item's persisted `tenant_id`; never run an unscoped query (the one exception is the retention purge's `window_result` partition drop, a DDL operation that runs only after every tenant's hold check, DESIGN §4.12) - `inst-az-worker`
-4. [ ] - `p1` - **IF** the action is `retry`, `release`, `execute`, `resolve`, hold `place` / `release` or a policy `write`, record the audit entry (actor, subject, request id) - `inst-az-audit`
-5. [ ] - `p1` - **RETURN** the scope; repositories use `SecureConn` with it - `inst-az-return`
+1. [x] - `p1` - Evaluate the operation's PDP check (deny by default); a PDP outage refuses - `inst-az-pdp`
+2. [x] - `p1` - Treat a tenant argument or filter as a selector that narrows the granted scope; a selector outside it returns `403` on collection reads and `404` on object reads - `inst-az-selector`
+3. [x] - `p1` - For background work, bind a scope narrowed to the work item's persisted `tenant_id`: the service grant, which the PDP evaluates as `usage × read` for Rating's service identity (`bss-rating.system`) acting in that tenant (interim: a context built per work item; target: an authenticated per-tenant service principal, DESIGN §4.8, T-D-83); never run an unscoped query (the one exception is the retention purge's `window_result` partition drop, a DDL operation that runs only after every tenant's hold check, DESIGN §4.12; a sweeper's tenant discovery reads the `tenant_id` column alone) - `inst-az-worker`
+4. [x] - `p1` - **IF** the action is `retry`, `release`, `execute` (re-rate create and cancel), `resolve` (source-loss resolve and submit reconciliation), `approve` (source-loss approve and reject), hold `place` / `release`, `accept_delay_only` or a policy `write`, record the audit entry (actor, subject, request id); DESIGN §4.8's operation matrix is the normative list - `inst-az-audit`
+5. [x] - `p1` - **RETURN** the scope; repositories use `SecureConn` with it - `inst-az-return`
 
 ### 3.2 Record and settle an operation idempotency key
 
-- [ ] `p1` - **ID**: `cpt-cf-bss-rating-algo-foundation-operation-key`
+- [x] `p1` - **ID**: `cpt-cf-bss-rating-algo-foundation-operation-key`
 
 **Input**: a command carrying an `Idempotency-Key` (re-rate creation, policy and hold creation).
 
 **Output**: the original receipt on a retry, a conflict on a different body, or a new operation.
 
-1. [ ] - `p1` - Look up `bss_rating__operation (tenant_id, actor, key)` in the command's transaction - `inst-ok-lookup`
-2. [ ] - `p1` - **IF** found with the same `request_digest`, **RETURN** the stored response - `inst-ok-replay`
-3. [ ] - `p1` - **IF** found with a different digest, refuse `409 AlreadyExists` - `inst-ok-conflict`
-4. [ ] - `p1` - Otherwise insert the key with the response in the same transaction as the command's effect; keep it 7 days - `inst-ok-insert`
+1. [x] - `p1` - Look up `bss_rating__operation (tenant_id, actor, key)` in the command's transaction - `inst-ok-lookup`
+2. [x] - `p1` - **IF** found with the same `request_digest`, **RETURN** the stored response - `inst-ok-replay`
+3. [x] - `p1` - **IF** found with a different digest, refuse `409 AlreadyExists` - `inst-ok-conflict`
+4. [x] - `p1` - Otherwise insert the key with the response in the same transaction as the command's effect; keep it 7 days - `inst-ok-insert`
 
 ### 3.3 Record and sweep exceptions
 
-- [ ] `p1` - **ID**: `cpt-cf-bss-rating-algo-foundation-exceptions`
+- [x] `p1` - **ID**: `cpt-cf-bss-rating-algo-foundation-exceptions`
 
 **Input**: a failure classified by a pipeline feature (`subject_kind`, `subject_ref`, `reason_code`).
 
 **Output**: one open exception per `(tenant_id, subject_kind, subject_ref, reason_code)`.
 
-1. [ ] - `p1` - Upsert the open exception, incrementing `attempts` and `last_attempt_at` - `inst-ex-upsert`
-2. [ ] - `p1` - Run the exception sweeper every 15 minutes as the Cluster leader `exception-sweep` (`LeaderElectionV1`, scoped `bss-rating`); it re-enqueues retryable subjects (for example `awaiting_attribution`, `invalidation_target_unknown`) - `inst-ex-sweep`
-3. [ ] - `p1` - Mark an exception resolved with its resolution when its subject succeeds or an operator resolves it - `inst-ex-resolve`
+1. [x] - `p1` - Upsert the open exception, incrementing `attempts` and `last_attempt_at` - `inst-ex-upsert`
+2. [x] - `p1` - Run the exception sweeper every 15 minutes as the Cluster leader `exception-sweep` (`LeaderElectionV1`, scoped `bss-rating`); it re-enqueues retryable subjects (for example `awaiting_attribution`, `invalidation_target_unknown`), walking keyset pages of tenants and of each tenant's open exceptions until it has visited every retryable one, so subjects whose retries keep failing never hold others back - `inst-ex-sweep`
+3. [x] - `p1` - Mark an exception resolved with its resolution when its subject succeeds or an operator resolves it - `inst-ex-resolve`
 
 ### 3.4 Hold an advisory leadership
 
-- [ ] `p1` - **ID**: `cpt-cf-bss-rating-algo-foundation-lease`
+- [x] `p1` - **ID**: `cpt-cf-bss-rating-algo-foundation-lease`
 
 **Input**: a leadership name under the `bss-rating` scope (`.scoped("bss-rating")`; each leaf matches `[A-Za-z0-9_-]`): `usage-feed-{source_uuid}`, `scheduler-{shard}`, `recovery-{shard}`, `reconcile-{shard}`, `verify-{shard}`, `exception-sweep`, `purge`.
 
 **Output**: leadership held, or not (the task waits).
 
-1. [ ] - `p1` - Join the election through the Rating-local `LeaseProvider` port, backed by the Cluster `LeaderElectionV1` facade (`scoped("bss-rating")`, `elect`) resolved through Rating's `ClusterProfile` (R-27, ADR-0008) - `inst-ls-acquire`
-2. [ ] - `p1` - Let the `LeaderWatch` renew the leadership; on loss, stop the task's work after the current transaction - `inst-ls-renew`
-3. [ ] - `p1` - Hold no lock guard across non-cluster I/O: feed reads, Pricing calls and database transactions run as the leader, never inside a `DistributedLockV1` guard's critical section (Cluster ADR-002); every write is a conditional database write (cursor CAS, unique keys), so a stale leader's write fails. No lease fence is stored or compared (Cluster ADR-012) - `inst-ls-fence`
+1. [x] - `p1` - Join the election through the Rating-local `LeaseProvider` port, backed by the Cluster `LeaderElectionV1` facade (`scoped("bss-rating")`, `elect`) resolved through Rating's `ClusterProfile` (R-27, ADR-0008) - `inst-ls-acquire`
+2. [x] - `p1` - Let the `LeaderWatch` renew the leadership; on loss, stop the task's work after the current transaction - `inst-ls-renew`
+3. [x] - `p1` - Hold no lock guard across non-cluster I/O: feed reads, Pricing calls and database transactions run as the leader, never inside a `DistributedLockV1` guard's critical section (Cluster ADR-002); every write is a conditional database write (cursor CAS, unique keys), so a stale leader's write fails. No lease fence is stored or compared (Cluster ADR-012) - `inst-ls-fence`
 
 Leadership only saves work; correctness stays with the database CAS and unique keys (DESIGN §3.8). A transitional `bss-coord` adapter is allowed behind the same port only if R-27 approves it.
 
 ### 3.5 Gate event intake and keep V1 compatible
 
-- [ ] `p2` - **ID**: `cpt-cf-bss-rating-algo-foundation-contract-gates`
+- [x] `p2` - **ID**: `cpt-cf-bss-rating-algo-foundation-contract-gates`
 
 **Input**: the configured event sources; a change to a Rating-owned contract.
 
 **Output**: event consumers started only where enabled; contract changes accepted only if additive.
 
-1. [ ] - `p1` - Start an event consumer for a source only when configuration enables it, which requires the owner's adopted contract (DESIGN §3.3 event table, T-D-71); every source is disabled by default and pull reads stay authoritative - `inst-cg-events`
-2. [ ] - `p1` - Fail CI when a golden JSON fixture of a V1 DTO, REST response or canonical form (`wk1`, `rsnap1`; the per-event `ek1` form no longer exists, T-D-75) changes non-additively - `inst-cg-golden`
-3. [ ] - `p1` - Map every SDK error to `CanonicalError` and every REST error to RFC 9457 problem details - `inst-cg-errors`
+1. [x] - `p1` - Start an event consumer for a source only when configuration enables it, which requires the owner's adopted contract (DESIGN §3.3 event table, T-D-71); every source is disabled by default and pull reads stay authoritative - `inst-cg-events`
+2. [x] - `p1` - Fail CI when a golden JSON fixture of a V1 DTO, REST response or canonical form (`wk1`, `rsnap1`; the per-event `ek1` form no longer exists, T-D-75) changes non-additively - `inst-cg-golden`
+3. [x] - `p1` - Map every SDK error to `CanonicalError` and every REST error to RFC 9457 problem details - `inst-cg-errors`
 
 <a id="register-procedures"></a>
 
@@ -203,24 +203,24 @@ The normative procedures of the former slice documents that this feature impleme
 
 ### 4.1 Inbox entry
 
-- [ ] `p1` - **ID**: `cpt-cf-bss-rating-state-foundation-inbox`
+- [x] `p1` - **ID**: `cpt-cf-bss-rating-state-foundation-inbox`
 
 **States**: `accepted`, `applied`, `quarantined`, `discarded`.
 
 **Initial State**: `accepted`.
 
 **Transitions**:
-1. [ ] - `p1` - **FROM** — **TO** `accepted` **WHEN** a new key is accepted - `inst-is-accept`
-2. [ ] - `p1` - **FROM** `accepted` **TO** `applied` **WHEN** the owning feature applies it in the same transaction - `inst-is-apply`
-3. [ ] - `p1` - **FROM** — **TO** `quarantined` **WHEN** the key exists with a different digest, or the schema version is unsupported - `inst-is-quarantine`
-4. [ ] - `p1` - **FROM** `quarantined` **TO** `applied` **WHEN** an operator releases it with resolution `apply` - `inst-is-release`
-5. [ ] - `p1` - **FROM** `quarantined` **TO** `discarded` **WHEN** an operator releases it with resolution `discard` (audited); the payload is kept for its retention and never applied - `inst-is-discard`
+1. [x] - `p1` - **FROM** — **TO** `accepted` **WHEN** a new key is accepted - `inst-is-accept`
+2. [x] - `p1` - **FROM** `accepted` **TO** `applied` **WHEN** the owning feature applies it in the same transaction - `inst-is-apply`
+3. [x] - `p1` - **FROM** — **TO** `quarantined` **WHEN** the key exists with a different digest, or the schema version is unsupported - `inst-is-quarantine`
+4. [x] - `p1` - **FROM** `quarantined` **TO** `applied` **WHEN** an operator releases it with resolution `apply` - `inst-is-release`
+5. [x] - `p1` - **FROM** `quarantined` **TO** `discarded` **WHEN** an operator releases it with resolution `discard` (audited); the payload is kept for its retention and never applied - `inst-is-discard`
 
 ## 5. Definitions of Done
 
 ### 5.1 Gear module, namespace and queues
 
-- [ ] `p1` - **ID**: `cpt-cf-bss-rating-dod-foundation-module`
+- [x] `p1` - **ID**: `cpt-cf-bss-rating-dod-foundation-module`
 
 The system **MUST** provide the `cf-gears-bss-rating` module with the `stateful` lifecycle, the `bss_rating` namespace and its naming grammar (T-D-60), the migration framework and the first migration of the tables it owns (inbox, exception, operation, operator audit; every other table is created by its owning feature, DECOMPOSITION §1 table ownership rule), and the `rating.child_work`, `rating.rollup` and `rating.delivery.e{feed_epoch}` outbox queues (one delivery queue per feed epoch) under the `bss_rating__outbox` prefix, with `rating-core` kept free of I/O dependencies by a CI deny-list.
 
@@ -232,7 +232,7 @@ The system **MUST** provide the `cf-gears-bss-rating` module with the `stateful`
 
 ### 5.2 Tenancy, authorization and audit
 
-- [ ] `p1` - **ID**: `cpt-cf-bss-rating-dod-foundation-authz`
+- [x] `p1` - **ID**: `cpt-cf-bss-rating-dod-foundation-authz`
 
 The system **MUST** register the GTS resource types of DESIGN §4.8, enforce the operation matrix for SDK, REST, consumers and workers alike, scope every repository call with a PDP-compiled `AccessScope`, answer cross-tenant object ids with `404`, and audit every privileged action.
 
@@ -244,7 +244,7 @@ The system **MUST** register the GTS resource types of DESIGN §4.8, enforce the
 
 ### 5.3 Inbox, exceptions and operation keys
 
-- [ ] `p1` - **ID**: `cpt-cf-bss-rating-dod-foundation-inbox`
+- [x] `p1` - **ID**: `cpt-cf-bss-rating-dod-foundation-inbox`
 
 The system **MUST** accept every non-usage upstream fact through the inbox with digest-based duplicate absorption and quarantine, support audited release, record failures in the exception register with one open row per subject and reason, and settle `Idempotency-Key` commands through the operation store.
 
@@ -252,13 +252,13 @@ The system **MUST** accept every non-usage upstream fact through the inbox with 
 
 **Constraints**: `cpt-cf-bss-rating-constraint-in-process-contracts`.
 
-**Touches**: API: `POST /bss-rating/v1/inbox/{id}:release`; `cpt-cf-bss-rating-dbtable-inbox`, `cpt-cf-bss-rating-dbtable-exception`, `bss_rating__operation`.
+**Touches**: API: `POST /bss-rating/v1/inbox/{id}/release`; `cpt-cf-bss-rating-dbtable-inbox`, `cpt-cf-bss-rating-dbtable-exception`, `bss_rating__operation`.
 
 ### 5.4 Contract gates and provider test doubles
 
-- [ ] `p2` - **ID**: `cpt-cf-bss-rating-dod-foundation-contracts`
+- [x] `p2` - **ID**: `cpt-cf-bss-rating-dod-foundation-contracts`
 
-The system **MUST** ship `cf-gears-bss-rating-sdk` with golden DTO fixtures and the additive-only V1 rule, keep every event path disabled until its contract is adopted, and register the provider test doubles of [11 §4.12](#contract-11-4-12) behind the `test-providers` feature so every other feature is accepted against them; a double never stands in for a production contract.
+The system **MUST** ship `cf-gears-bss-rating-sdk` with golden DTO fixtures and the additive-only V1 rule, keep every event path disabled until its contract is adopted, and register the provider test doubles of [11 §4.12](#contract-11-4-12) behind the `test-providers` feature so every other feature is accepted against them — the doubles of the contracts that exist (`PricingReadV1`, `LeaderElectionV1`, the PDP) with the foundation, each other one with the feature that designs its adapter (§7 "Ships with"); a double never stands in for a production contract.
 
 **Implements**: `cpt-cf-bss-rating-algo-foundation-contract-gates`, `cpt-cf-bss-rating-algo-test-doubles-cc`.
 
@@ -266,19 +266,19 @@ The system **MUST** ship `cf-gears-bss-rating-sdk` with golden DTO fixtures and 
 
 **Touches**: `cpt-cf-bss-rating-interface-events`; `rating-sdk`; ClientHub registrations.
 
-Observability: `rating_inbox_quarantined_total{source}`, `rating_dependency_errors_total` and the `rating.inbox.accept` span (DESIGN §4.7).
+Observability: `rating_inbox_quarantined_total{source}` (counted once the quarantine commits), `rating_dependency_errors_total{dependency, code}`, the exception sweeper's `rating_exception_sweeps_total{outcome}`, `rating_exception_sweep_retries_total{result}` and `rating_exception_sweep_duration_seconds`, and the `rating.inbox.accept` span (DESIGN §4.7).
 
 ## 6. Acceptance Criteria
 
-- [ ] A fact accepted twice with the same digest produces one inbox row and one applied effect; with a different digest it is quarantined and paged, and nothing is applied.
-- [ ] A fact whose payload tenant is outside Rating's grant, or whose producer identity does not verify, is refused and writes nothing.
-- [ ] Releasing an entry that is not quarantined returns `400 FailedPrecondition`; a release is audited with actor, subject and request id.
-- [ ] A retried command with the same `Idempotency-Key` and body returns the original receipt; the same key with a different body returns `409 AlreadyExists`.
-- [ ] A worker processing tenant A's item cannot read tenant B's rows; no repository call runs without a scope.
-- [ ] A zombie lease holder's checkpoint write fails its CAS; losing a lease only wastes work.
+- [x] A fact accepted twice with the same digest produces one inbox row and one applied effect; with a different digest it is quarantined and paged, and nothing is applied.
+- [x] A fact whose payload tenant is outside Rating's grant, or whose producer identity does not verify, is refused and writes nothing.
+- [x] Releasing an entry that is not quarantined returns `400 FailedPrecondition`; a release is audited with actor, subject and request id.
+- [x] A retried command with the same `Idempotency-Key` and body returns the original receipt; the same key with a different body returns `409 AlreadyExists`.
+- [x] A worker processing tenant A's item cannot read tenant B's rows; no repository call runs without a scope.
+- [x] A zombie leader's conditional write fails its CAS — here the inbox state CAS, with two concurrent leaders through `FakeClusterLeaders`; the checkpoint cursor CAS is accepted with [Usage Capture](04-usage-intake.md) — and losing a lease only wastes work.
 - [ ] Every event source is disabled in the default configuration, and with every source disabled the pull paths of every feature still complete.
-- [ ] A non-additive change to a V1 DTO fails the golden-fixture CI job.
-- [ ] `rating-core` builds with no tokio, sea-orm, http or ClientHub dependency.
+- [x] A non-additive change to a V1 DTO fails the golden-fixture CI job.
+- [x] `rating-core` builds with no tokio, sea-orm, http or ClientHub dependency.
 
 Acceptance vectors owned by this feature (DESIGN §4.13 index):
 
@@ -304,16 +304,20 @@ Until providers exist, Rating ships ClientHub-registered fakes behind a `test-pr
 each driven by the shared fixture vectors (Atlas exit criterion: one provider-side and one
 consumer-side test per contract with the same fixture ids):
 
-| Fake | Implements | Fixtures |
-|---|---|---|
-| `FakePricingCatalog` | `PricingReadV1::{resolve, price, current_revision}` over pricing's golden contract files (`pricing/tests/contract/*.json`) and seam fixtures (`pricing/tests/seam_fixtures/*.json`): signup and renewal bindings, uncovered cells, `ends_on`, refusals (T-D-73) | pricing goldens, F23–F25 band tables |
-| `FakeDerivedUsageTypes` | the requested Products declaration read (R-31) over `bss_products_sdk::derived` declarations | cloudlet seam fixtures |
-| `FakeUsageFeed` | the collector's documented `read_usage_feed` (cursor, `Oldest`, `until`, invalidation entries, `CursorBeyondRetention`) | F02, F03, F06, F26, F30 |
-| `FakeSubscriptionsBilling` | Atlas C04 events and reads | F04, F17, F18, F28, F33, F35 |
-| `FakeCoverage` | coverage declarations / inventory | F05, F06, F30 |
-| `RecordingBilling` | consumes `BillableItemDeliveryV1`, applies C08 rules (stale revision ignored, equal-revision conflict quarantined) | F14, F15, F27, F32, V16 |
-| `FakeClusterLeaders` | a `LeaderElectionV1` over a fake backend, with forced leadership loss and two concurrent leaders | V09, stale-leader cases |
-| `FakeCollectorReconciliation` | per `(tenant, GTS type, day)` counts and sums for source-loss repair | V05, V06 |
+| Fake | Implements | Fixtures | Ships with |
+|---|---|---|---|
+| `FakePricingCatalog` | `PricingReadV1::{resolve, price, current_revision}`, scripted per query with the calls recorded; loaded from pricing's golden contract files (`pricing/tests/contract/*.json`) and seam fixtures (`pricing/tests/seam_fixtures/*.json`): signup and renewal bindings, uncovered cells, `ends_on`, refusals (T-D-73) | pricing goldens, F23–F25 band tables | 01 (the scripted double); the golden loading with [Facts and Scheduling](06-fact-scheduling.md) |
+| `FakePdp` | `AuthZResolverApi`: grants each subject its own tenant; denies an action, a tenant outside the grant, or the whole PDP on demand | V23, V24 | 01 |
+| `FakeDerivedUsageTypes` | the requested Products declaration read (R-31) over `bss_products_sdk::derived` declarations | cloudlet seam fixtures | [06](06-fact-scheduling.md) |
+| `FakeUsageFeed` | the collector's documented `read_usage_feed` (cursor, `Oldest`, `until`, invalidation entries, `CursorBeyondRetention`) | F02, F03, F06, F26, F30 | [04](04-usage-intake.md) |
+| `FakeSubscriptionsBilling` | Atlas C04 events and reads | F04, F17, F18, F28, F33, F35 | [05](05-attribution-counters.md), [06](06-fact-scheduling.md) |
+| `FakeCoverage` | coverage declarations / inventory | F05, F06, F30 | [05](05-attribution-counters.md) |
+| `RecordingBilling` | consumes `BillableItemDeliveryV1`, applies C08 rules (stale revision ignored, equal-revision conflict quarantined) | F14, F15, F27, F32, V16 | [09](09-rollup-delivery.md) |
+| `FakeClusterLeaders` | a `LeaderElectionV1` over a fake backend bound through the cluster wiring, with forced leadership loss and two concurrent leaders | V09, stale-leader cases | 01 |
+| `FakeCollectorReconciliation` | per `(tenant, GTS type, day)` counts and sums for source-loss repair | V05, V06 | [11](11-operations.md) |
+
+A double whose contract has no Rating-side port yet ships with the feature that designs that
+port, so the port and its double are reviewed together and no feature inherits a guessed shape.
 
 The fakes also drive the state-transition and concurrency vectors of DESIGN §4.13 (V01–V83; V17 and V27 retired; the Billing golden rows of the money vectors run against a Billing test double until Billing exists); no
 vector depends on an upstream contract being implemented. Fakes never stand in for a production

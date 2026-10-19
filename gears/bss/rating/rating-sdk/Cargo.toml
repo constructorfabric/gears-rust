@@ -1,0 +1,15 @@
+[package]
+name = "cf-gears-bss-rating-sdk"
+edition.workspace = true
+license.workspace = true
+description = "BSS Rating SDK: the transport-agnostic V1 contract (canonical errors; traits and DTOs arrive with the features that serve them)"
+
+[lib]
+name = "bss_rating_sdk"
+
+[lints]
+workspace = true
+
+[dependencies]
+# `CanonicalError` is the error of every SDK method; `#[resource_error]` expands against it.
+toolkit-canonical-errors = { workspace = true }
