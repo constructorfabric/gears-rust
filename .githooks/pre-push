@@ -46,11 +46,12 @@ $p"
 
     # clippy also surfaces compile errors; flags mirror CI (Makefile CLIPPY_FLAGS)
     if [ -n "$pkgs" ] && need clippy cargo "https://rustup.rs"; then
-        args=""
-        for p in $pkgs; do args="$args -p $p"; done
+        # IFS is newline-only here, so build the -p list as positional args
+        set --
+        for p in $pkgs; do set -- "$@" -p "$p"; done
         # shellcheck disable=SC2086
-        run clippy "run: cargo clippy$args --all-targets --all-features" \
-            cargo clippy $args --all-targets --all-features -- -D warnings -D clippy::perf
+        run clippy "run: cargo clippy $(printf -- '-p %s ' $pkgs)--all-targets --all-features" \
+            cargo clippy "$@" --all-targets --all-features -- -D warnings -D clippy::perf
     fi
 
     # Workspace-wide, as `make dylint` (cargo-gears has no CI-equivalent package filter)
