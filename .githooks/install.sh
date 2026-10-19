@@ -7,8 +7,13 @@
 mode=${1:-}
 [ -z "${GEARS_NO_HOOKS:-}" ] && [ -z "${CI:-}" ] || [ "$mode" = "--uninstall" ] || exit 0
 top=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0
-hooks=$(git rev-parse --path-format=absolute --git-path hooks 2>/dev/null) || exit 0
 cd "$top" || exit 0
+hooks=$(git rev-parse --git-path hooks 2>/dev/null) || exit 0
+# --git-path is relative to the cwd (the top) unless absolute, incl. Windows drive paths
+case "$hooks" in
+    /* | [A-Za-z]:/* | [A-Za-z]:\\*) ;;
+    *) hooks="$top/$hooks" ;;
+esac
 [ -f .githooks/lib.sh ] || exit 0
 
 fail=0
@@ -17,6 +22,9 @@ failed() {
     [ "$mode" = "--quiet" ] || echo "install.sh: failed to install $1" >&2
     fail=1
 }
+
+# is_copy <link> <hook>: a regular file identical to our hook (Git Bash's ln -s may copy).
+is_copy() { [ -f "$1" ] && [ ! -L "$1" ] && cmp -s "$1" "$top/.githooks/$2"; }
 
 if [ "$mode" = "--uninstall" ]; then
     git config --local --unset gears.hooks 2>/dev/null || true
@@ -27,14 +35,20 @@ fi
 for h in pre-commit pre-push; do
     link="$hooks/$h"
     if [ "$mode" = "--uninstall" ]; then
-        target=$(readlink "$link" 2>/dev/null) || continue
-        case "$target" in
-            "$top/.githooks/$h") rm "$link" && echo "removed $link" || failed "$link" ;;
-            */.githooks/"$h") echo "kept $link -> $target (not this clone)" ;;
-        esac
+        if [ -L "$link" ]; then
+            target=$(readlink "$link" 2>/dev/null) || continue
+            case "$target" in
+                "$top/.githooks/$h") ;;
+                */.githooks/"$h") echo "kept $link -> $target (not this clone)"; continue ;;
+                *) continue ;;
+            esac
+        elif ! is_copy "$link" "$h"; then
+            continue
+        fi
+        if rm "$link"; then echo "removed $link"; else failed "$link"; fi
         continue
     fi
-    if [ -e "$link" ] && [ ! -L "$link" ]; then
+    if [ -e "$link" ] && [ ! -L "$link" ] && ! is_copy "$link" "$h"; then
         [ "$mode" = "--quiet" ] || echo "SKIP: $link exists and is not a symlink; call $top/.githooks/$h from it manually"
         continue
     fi

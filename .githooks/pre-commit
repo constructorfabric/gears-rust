@@ -35,7 +35,8 @@ fmt_check() {
 }
 rs=$(pick '\.rs$')
 if [ -n "$rs" ] && need rustfmt rustfmt "rustup component add rustfmt"; then
-    run rustfmt "run: cargo fmt" fmt_check
+    step rustfmt
+    fmt_check || fail rustfmt "run: cargo fmt"
 fi
 
 # cfs and lychee below judge the working-tree copy by design: link targets and CFS artifacts
@@ -44,23 +45,30 @@ fi
 # which rewrites files and must not happen mid-commit.
 cfs=$(pick '^(\.cf-studio/|\.cf-studio-kit\.toml$|studio-kit-gears/.*\.md$|docs/.*\.md$|gears/.*/docs/.*\.md$|libs/.*/docs/.*\.md$)')
 if [ -n "$cfs" ] && need cfs cfs "pipx install git+https://github.com/constructorfabric/studio.git"; then
-    run cfs "run: cfs validate and fix the reported artifacts" cfs validate
+    step cfs
+    cfs validate || fail cfs "run: cfs validate and fix the reported artifacts"
 fi
 
 # lychee, offline: catches broken relative links / missing files without network
 md=$(pick '\.md$' | grep -v '^docs/web-docs/' || true)
 if [ -n "$md" ] && need lychee lychee "cargo install lychee"; then
-    # shellcheck disable=SC2086
-    run lychee "fix the broken links above" lychee --offline --no-progress --config lychee.toml $md
+    set --
+    for f in $md; do set -- "$@" "$f"; done
+    step lychee
+    lychee --offline --no-progress --config lychee.toml "$@" || fail lychee "fix the broken links above"
 fi
 
 # CRLF (same rule as .github/workflows/crlf-check.yml)
 crlf_check() {
-    # shellcheck disable=SC2086
-    bad=$(git ls-files --eol -- $nonwin | grep 'i/crlf' || true)
+    set --
+    for f in $nonwin; do set -- "$@" "$f"; done
+    bad=$(git ls-files --eol -- "$@" | grep 'i/crlf' || true)
     [ -z "$bad" ] || { printf '%s\n' "$bad"; return 1; }
 }
 nonwin=$(printf '%s\n' "$staged" | grep -Ev '\.(bat|ps1)$' || true)
-[ -z "$nonwin" ] || run crlf "convert to LF (dos2unix <file>) and re-stage" crlf_check
+if [ -n "$nonwin" ]; then
+    step crlf
+    crlf_check || fail crlf "convert to LF (dos2unix <file>) and re-stage"
+fi
 
 finish

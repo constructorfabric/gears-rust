@@ -1,0 +1,49 @@
+name: Git Hooks
+
+on:
+  pull_request:
+    paths:
+      - '.githooks/**'
+      - '.github/workflows/githooks.yml'
+  push:
+    branches: [main]
+    paths:
+      - '.githooks/**'
+      - '.github/workflows/githooks.yml'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  shellcheck:
+    name: ShellCheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Run shellcheck
+        run: |
+          shellcheck --version
+          shellcheck -s sh -x .githooks/install.sh .githooks/lib.sh .githooks/pre-commit .githooks/pre-push .githooks/tests/run.sh
+
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Run hook tests
+        shell: bash
+        run: sh .githooks/tests/run.sh

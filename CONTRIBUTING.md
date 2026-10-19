@@ -280,6 +280,8 @@ The first `make` run installs git hooks from `.githooks/` as symlinks into your 
 
 A check whose tool is not installed is skipped with a notice. Bypass with `git commit --no-verify` / `git push --no-verify`. Opt out with `GEARS_NO_HOOKS=1` and remove with `make uninstall-hooks`. The hooks run only in clones where `make` (or `make install-hooks`) ran once, which records `gears.hooks=true` in that clone's local git config; `make uninstall-hooks` disables them for that clone. In other repos sharing the same hooks directory (global `core.hooksPath`) the hooks do nothing.
 
+When editing `.githooks`, run `shellcheck -s sh -x .githooks/*.sh .githooks/pre-commit .githooks/pre-push` and `sh .githooks/tests/run.sh`; CI runs both (the tests on Linux, macOS and Windows Git Bash). Install shellcheck with `brew install shellcheck` / `apt install shellcheck` / `scoop install shellcheck` (it is not part of `make setup`).
+
 ### 2.7. Sign Your Commits (DCO)
 
 This project uses the Developer Certificate of Origin (DCO) version 1.1.

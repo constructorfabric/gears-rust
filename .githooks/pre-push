@@ -66,15 +66,17 @@ $p"
     if [ -n "$tree_ok" ] && { [ -n "$pkgs" ] || [ -n "$ws" ]; } \
         && need clippy clippy "rustup component add clippy"; then
         if [ -n "$ws" ]; then
-            run clippy "run: cargo clippy --workspace --all-targets --all-features" \
-                cargo clippy --workspace --all-targets --all-features -- -D warnings -D clippy::perf
+            step clippy
+            cargo clippy --workspace --all-targets --all-features -- -D warnings -D clippy::perf ||
+                fail clippy "run: cargo clippy --workspace --all-targets --all-features"
         else
             # IFS is newline-only here, so build the -p list as positional args
             set --
-            for p in $pkgs; do set -- "$@" -p "$p"; done
-            # shellcheck disable=SC2086
-            run clippy "run: cargo clippy $(printf -- '-p %s ' $pkgs)--all-targets --all-features" \
-                cargo clippy "$@" --all-targets --all-features -- -D warnings -D clippy::perf
+            pflags=""
+            for p in $pkgs; do set -- "$@" -p "$p"; pflags="$pflags-p $p "; done
+            step clippy
+            cargo clippy "$@" --all-targets --all-features -- -D warnings -D clippy::perf ||
+                fail clippy "run: cargo clippy ${pflags}--all-targets --all-features"
         fi
     fi
 
@@ -82,14 +84,16 @@ $p"
     if [ -n "$tree_ok" ] \
         && printf '%s\n' "$changed" | grep -Eq '(\.rs|(^|/)Cargo\.toml)$|^(Cargo\.lock|clippy\.toml|rust-toolchain\.toml|\.cargo/config\.toml)$' \
         && need dylint cargo-gears "cargo install --locked cargo-gears"; then
-        run dylint "run: make dylint" cargo gears lint --dylint
+        step dylint
+        cargo gears lint --dylint || fail dylint "run: make dylint"
     fi
 
     # the script needs jq and bash >= 4 (mapfile); macOS ships bash 3.2
     if need forbidden-words jq "brew install jq / apt install jq" \
         && need forbidden-words "bash>=4" "brew install bash"; then
-        run forbidden-words "remove the forbidden words reported above" \
-            .github/scripts/check-forbidden-words.sh "$base" "$sha"
+        step forbidden-words
+        .github/scripts/check-forbidden-words.sh "$base" "$sha" ||
+            fail forbidden-words "remove the forbidden words reported above"
     fi
 }
 

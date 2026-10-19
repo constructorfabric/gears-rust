@@ -21,14 +21,13 @@ need() {
     return 1
 }
 
-# run <check> <fix hint> <cmd...>: runs the command, records failure, never aborts.
-run() {
-    check=$1; hint=$2; shift 2
-    echo "hook: $check"
-    if ! "$@"; then
-        echo "hook: FAILED $check -- $hint (bypass: git $HOOK_CMD --no-verify)"
-        failed=1
-    fi
+# step <check>: announces a check; follow with `cmd || fail <check> <fix hint>`.
+step() { echo "hook: $1"; }
+
+# fail <check> <fix hint>: records the failure, never aborts.
+fail() {
+    echo "hook: FAILED $1 -- $2 (bypass: git $HOOK_CMD --no-verify)"
+    failed=1
 }
 
 # finish: exit non-zero if any check failed.
