@@ -79,6 +79,10 @@ bss-orders = [
 ]
 bss-pricing = ["dep:bss_pricing", "bss-products"]
 bss-approvals = ["dep:bss_approvals"]
+# Rating elects its leader-only jobs on the platform cluster gear (ADR-0008), so the gear is linked
+# with it (and grpc-hub, which cluster requires), as quota-enforcement is. Linking cluster-sdk
+# without a co-located cluster gear would wire the remote client and need a cluster endpoint.
+bss-rating = ["dep:bss_rating", "dep:cluster", "grpc-hub"]
 # The admission gate links its default engine plugin, policy-engine.
 admission-control = ["dep:admission-control", "policy-engine"]
 policy-engine = ["dep:policy-engine"]
@@ -165,6 +169,7 @@ event_broker = { package = "cf-gears-event-broker", path = "../../gears/system/e
 standalone-cluster-plugin = { package = "cf-gears-standalone-cluster-plugin", path = "../../gears/system/cluster/plugins/standalone-cluster-plugin", optional = true }
 sqlite-event-broker-plugin = { package = "cf-gears-sqlite-event-broker-plugin", path = "../../gears/system/event-broker/plugins/sqlite-event-broker-plugin", optional = true }
 bss_approvals = { package = "cf-gears-bss-approvals", path = "../../gears/bss/approvals/approvals", optional = true }
+bss_rating = { package = "cf-gears-bss-rating", path = "../../gears/bss/rating/rating", optional = true }
 
 # Optional Admission Control gear
 admission-control = { package = "cf-gears-admission-control", path = "../../gears/system/admission-control/admission-control", optional = true }

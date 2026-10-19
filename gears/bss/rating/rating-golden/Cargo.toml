@@ -1,0 +1,22 @@
+[package]
+name = "cf-gears-bss-rating-golden"
+edition.workspace = true
+license.workspace = true
+description = "BSS Rating golden-fixture checker: the additive-only V1 rule for the contract tests of the Rating crates (not published)"
+# Test tooling only: the Rating crates take it as a dev-dependency, which cargo strips on publish,
+# so it never reaches the SDK's public surface.
+publish = false
+
+[lib]
+name = "bss_rating_golden"
+
+[lints]
+workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+tempfile = { workspace = true }
