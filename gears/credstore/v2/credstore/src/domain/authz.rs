@@ -70,4 +70,3 @@ pub fn scope_admits_tenant(scope: &AccessScope, tenant: Uuid) -> bool {
         .iter()
         .any(|c| constraint_admits_tenant(c, tenant))
 }
-
