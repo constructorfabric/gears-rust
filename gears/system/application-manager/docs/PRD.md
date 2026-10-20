@@ -143,7 +143,7 @@ There is no formal user-satisfaction metric, because the user group is small, kn
 **ID**: `cpt-cf-application-manager-actor-operator`
 
 - **Role**: Runs the platform, deploys section-plugin changes, and sets configuration. Can also act as a seeding caller by hand, for example to re-seed or to uninstall an application.
-- **Needs**: To follow an operation and read how it ended. To know which section keys a manifest needs. To get a clear signal when something in the gear fails.
+- **Needs**: To follow an operation and read how it ended. To read the audit events of a request. To know which section keys a manifest needs. To get a clear signal when something in the gear fails.
 
 ### 2.2 System Actors
 
@@ -163,14 +163,14 @@ There is no formal user-satisfaction metric, because the user group is small, kn
 
 **ID**: `cpt-cf-application-manager-actor-platform-access-control`
 
-- **Role**: Decides whether a caller may seed, uninstall, read schemas, or read operations. Called by the system.
+- **Role**: Decides whether a caller may seed, uninstall, read schemas, read operations, or read audit events. Called by the system.
 
 ### 2.3 Actor Context
 
 ```mermaid
 flowchart LR
     SC["Seeding Caller"] -->|"seed, uninstall, discover, read operation"| AM["Application Manager"]
-    OP["Operator"] -->|"seed, uninstall, discover, read operation"| AM
+    OP["Operator"] -->|"seed, uninstall, discover, read operation, read audit"| AM
     AM -->|"get schema, apply, remove"| SP["Section Plugin"]
     AM -->|"check permission"| PAC["Platform Access Control"]
 ```
@@ -216,7 +216,7 @@ flowchart LR
 - Validation rules for adding or removing a section plugin.
 - A registry of seeded applications, and listing it.
 - Reconciliation of section-plugin state with what is seeded.
-- Reading or exposing audit data.
+- Deciding who may read audit events; platform access control owns that.
 - Resuming or cancelling operations.
 
 ## 5. Functional Requirements
@@ -465,7 +465,7 @@ The system **MUST** accept requests only from subjects authenticated through the
 
 - [ ] `p1` - **ID**: `cpt-cf-application-manager-fr-authorization`
 
-The system **MUST** have platform access control decide, separately for each of four permissions, whether the caller may act: seed, uninstall, read schemas, and read operations. It holds no tenant scope and no access rules of its own. A section plugin that needs an extra permission **MUST** be able to refuse a request as not permitted.
+The system **MUST** have platform access control decide, separately for each of five permissions, whether the caller may act: seed, uninstall, read schemas, read operations, and read audit. It holds no tenant scope and no access rules of its own. A section plugin that needs an extra permission **MUST** be able to refuse a request as not permitted.
 
 - **Rationale**: Seeding and uninstalling change what other services believe is installed, so they must be tightly controlled.
 - **Actors**: `cpt-cf-application-manager-actor-seeding-caller`, `cpt-cf-application-manager-actor-operator`
@@ -479,6 +479,15 @@ The system **MUST** record an audit event for every seed and uninstall request t
 - **Rationale**: One trail of every request lets operators trace what happened. An append-only table means a recorded audit event is never changed or removed.
 - **Actors**: `cpt-cf-application-manager-actor-operator`
 - **Verification Method**: Inspection: audit events are only ever appended to the audit ledger, and no other place keeps them.
+
+#### Reading Audit Events
+
+- [ ] `p1` - **ID**: `cpt-cf-application-manager-fr-audit-read`
+
+The system **MUST** let a caller with the read audit permission read the audit events of one request by its request id. An unknown id **MUST** end as not found. A read **MUST NOT** call any section plugin. Reads end as not permitted, not found, or temporarily unavailable. Which callers hold the permission is decided by platform access control and is outside this system.
+
+- **Rationale**: Operators trace a request from its audit events without direct access to storage.
+- **Actors**: `cpt-cf-application-manager-actor-operator`
 
 #### Audit Before Dispatch
 
@@ -511,9 +520,9 @@ Every seed and uninstall request that reaches the system **MUST** have its audit
 
 - [ ] `p1` - **ID**: `cpt-cf-application-manager-nfr-platform-scope`
 
-The system **MUST** treat all seeded applications as one platform-wide set, **MUST NOT** make operation records owned by or visible per tenant, and **MUST** make them reachable only through the platform's access checks.
+The system **MUST** treat all seeded applications as one platform-wide set, **MUST NOT** make operation records and audit events owned by or visible per tenant, and **MUST** make them reachable only through the platform's access checks.
 
-- **Threshold**: No operation record read or write made on behalf of a caller skips the access check. No per-tenant copy of operation records exists.
+- **Threshold**: No read or write of an operation record or audit event made on behalf of a caller skips the access check. No per-tenant copy of operation records or audit events exists.
 - **Rationale**: Installed applications are a property of the environment, not of a tenant.
 - **Verification Method**: Inspection of the public surface and of data ownership, plus tests on every action.
 
@@ -604,7 +613,7 @@ The system **MUST** give operators a visible signal for audit events that failed
 
 - **Type**: REST API
 - **Stability**: unstable, until the first stable release.
-- **Description**: Lets a caller with the read operations permission read an operation by its id: its status and, once final, its report.
+- **Description**: Lets a caller with the read operations permission read an operation by its id: its status and, once final, its report. Lets a caller with the read audit permission read the audit events of a request by its request id.
 - **Breaking Change Policy**: Additive changes are backward compatible. Changes to operation states, outcome categories, or report content need a major version bump and notice to application teams.
 
 #### Discovery Interface
@@ -749,9 +758,10 @@ The system **MUST** give operators a visible signal for audit events that failed
 - [ ] When permission or running operations cannot be checked, the answer is temporarily unavailable, never not permitted or conflict.
 - [ ] A section plugin that refuses its section as unacceptable gives plugin rejected, and a section plugin that refuses for an extra permission of its own gives not permitted, after platform access control has permitted the request (`cpt-cf-application-manager-fr-outcome-categories`).
 - [ ] An uninstall asks every section plugin to remove the application, in priority order, even one never seeded, and continues after failures (`cpt-cf-application-manager-fr-uninstall`).
-- [ ] A caller refused by access control causes no section-plugin call, and each of the seed, uninstall, read schemas, and read operations permissions is separate.
+- [ ] A caller refused by access control causes no section-plugin call, and each of the seed, uninstall, read schemas, read operations, and read audit permissions is separate.
 - [ ] A second request for an application with an accepted or running operation is refused as conflict naming that operation, while other applications proceed.
 - [ ] Reading an operation returns its status and, once final, its report, ends as not found for an unknown or purged id, and makes no section-plugin call.
+- [ ] Reading the audit events of a request by its request id returns them, ends as not found for an unknown id, and makes no section-plugin call (`cpt-cf-application-manager-fr-audit-read`).
 - [ ] An operation that is not final at the end of its run window is reported as interrupted and is not resumed.
 - [ ] When access control or storage cannot answer, the request is refused as temporarily unavailable and nothing is dispatched.
 - [ ] Every seed and uninstall request that reaches the system, including a refused one, has its audit events in the audit ledger (except a refusal whose audit event could not be recorded), and no audit event exists for a change that did not commit (`cpt-cf-application-manager-nfr-audit-completeness`).
@@ -773,7 +783,7 @@ The system **MUST** give operators a visible signal for audit events that failed
 | Dependency | Description | Criticality |
 |------------|-------------|-------------|
 | Section plugins | Each provides its section key and priority at startup, its current schema with a schema version, application of its section on seed, and removal of an application on uninstall, and answers with success, plugin rejected, not permitted, or internal failure. | p1 |
-| Platform access control | A permit or deny for each seed, uninstall, read schemas, and read operations request, given the caller subject and the action. | p1 |
+| Platform access control | A permit or deny for each seed, uninstall, read schemas, read operations, and read audit request, given the caller subject and the action. | p1 |
 | Plugin registration facility | The list of section plugins at startup. | p1 |
 | Platform storage | Storage for operation records and the audit ledger. | p1 |
 | Platform error format | The standard format for failed responses, able to carry the outcome category, what to fix, the running operation id, and the request id. | p1 |

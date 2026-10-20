@@ -51,7 +51,7 @@ Chosen option: "Platform-level permission with unrestricted records", because st
 
 ### Consequences
 
-* Policy authors grant each of the four actions explicitly at platform level; policy content and its correctness belong to the authz resolver and its plugin.
+* Policy authors grant each of the five actions explicitly at platform level; policy content and its correctness belong to the authz resolver and its plugin.
 * The repository applies no tenant filter, and records are reached only through the gear's routes after a permit.
 
 ### Confirmation
