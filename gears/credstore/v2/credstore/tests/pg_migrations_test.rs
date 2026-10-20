@@ -33,7 +33,9 @@ use std::collections::BTreeSet;
 use credstore_v2::infra::storage::migrations::m0002_value_versions::{
     VALUE_MIGRATION_COPY_DONE_PHASES, VALUE_MIGRATION_STATE_TABLE, VALUES_NOT_MIGRATED,
 };
-use credstore_v2::infra::storage::migrations::{Migrator, m0001_initial_schema, m0002_value_versions};
+use credstore_v2::infra::storage::migrations::{
+    Migrator, m0001_initial_schema, m0002_value_versions,
+};
 use sea_orm::{ConnectionTrait, Database, DatabaseConnection, DbErr, Statement};
 use sea_orm_migration::{MigrationTrait, MigratorTrait, SchemaManager};
 use testcontainers::runners::AsyncRunner;
