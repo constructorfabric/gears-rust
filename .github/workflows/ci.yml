@@ -326,7 +326,7 @@ jobs:
       # is a warning here and the job is already red from the step above.
       - name: Upload Rust test results
         if: ${{ !cancelled() }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: rust-tests-${{ runner.os }}
           path: test-results/*.xml
@@ -528,7 +528,7 @@ jobs:
       # is a warning here and the job is already red from the step above.
       - name: Upload Rust test results
         if: ${{ !cancelled() }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: rust-tests-integration
           path: test-results/*.xml
@@ -1126,7 +1126,7 @@ jobs:
       # available, even when Codecov is unavailable or rejects the upload.
       - name: Upload LCOV artifact
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: rust-coverage-lcov
           path: lcov.info
