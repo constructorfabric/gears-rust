@@ -65,7 +65,7 @@ hook() {
 }
 marker() { git -C "$1" config --local --get gears.hooks; }
 is_true() { [ "$(marker "$1")" = true ]; }
-no_marker() { [ -z "$(marker "$1")" ]; }
+is_false() { [ "$(marker "$1")" = false ]; }
 # link_hook <hook> <where>: symlink to the source hook, falling back to a copy (Git Bash).
 link_hook() { ln -sf "$1" "$2" 2>/dev/null || cp "$1" "$2"; }
 
@@ -88,12 +88,21 @@ mkrepo i2
 hook "$r" install.sh --quiet
 assert "install --quiet exits 0" test "$rc" = 0
 assert "install --quiet installs hooks" test -e "$r/.git/hooks/pre-push"
+assert "install --quiet on fresh repo sets marker" is_true "$r"
 
 # ---- uninstall ----
 mkrepo u1; hook "$r" install.sh
 hook "$r" install.sh --uninstall
 assert "uninstall removes own link" test ! -e "$r/.git/hooks/pre-commit"
-assert "uninstall unsets marker" no_marker "$r"
+assert "uninstall sets marker to false" is_false "$r"
+hook "$r" install.sh --quiet
+assert "--quiet after uninstall creates no pre-commit" test ! -e "$r/.git/hooks/pre-commit"
+assert "--quiet after uninstall creates no pre-push" test ! -e "$r/.git/hooks/pre-push"
+assert "--quiet after uninstall keeps marker false" is_false "$r"
+hook "$r" install.sh
+assert "plain install after uninstall re-creates pre-commit" test -e "$r/.git/hooks/pre-commit"
+assert "plain install after uninstall re-creates pre-push" test -e "$r/.git/hooks/pre-push"
+assert "plain install after uninstall sets marker true" is_true "$r"
 
 mkrepo u2; mkdir -p "$r/.git/hooks"; hook "$r" install.sh
 # Foreign target must exist: Git Bash `ln -s` copies the target and fails on a missing one.

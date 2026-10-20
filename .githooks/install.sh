@@ -1,6 +1,8 @@
 #!/bin/sh
 # Symlinks .githooks/{pre-commit,pre-push} into the git hooks dir (honours core.hooksPath)
 # and records the opt-in marker `gears.hooks=true` in this clone's local git config.
+# --uninstall records the opt-out `gears.hooks=false`, which --quiet (the auto-install) respects;
+# a plain install.sh sets the marker back to true.
 # Usage: install.sh [--quiet | --uninstall]
 # Installs missing links only; never overwrites a real file. No-op when GEARS_NO_HOOKS=1,
 # in CI, or outside a git work tree. --quiet never fails (the gears-rust.mk auto-install runs it).
@@ -15,6 +17,8 @@ case "$hooks" in
     *) hooks="$top/$hooks" ;;
 esac
 [ -f .githooks/lib.sh ] || exit 0
+# Explicit opt-out (make uninstall-hooks): the auto-install must not undo it.
+[ "$mode" != "--quiet" ] || [ "$(git config --local --bool --get gears.hooks 2>/dev/null)" != false ] || exit 0
 
 fail=0
 # failed <link>: report (unless --quiet) and remember the failure.
@@ -27,9 +31,9 @@ failed() {
 is_copy() { [ -f "$1" ] && [ ! -L "$1" ] && cmp -s "$1" "$top/.githooks/$2"; }
 
 if [ "$mode" = "--uninstall" ]; then
-    git config --local --unset gears.hooks 2>/dev/null || true
+    git config --local gears.hooks false || failed "gears.hooks marker"
     # A copy serves every clone sharing the hooks dir (core.hooksPath): remove copies only from
-    # this clone's own <git-common-dir>/hooks. The unset marker already disables hooks here.
+    # this clone's own <git-common-dir>/hooks. The false marker already disables hooks here.
     common=$(git rev-parse --git-common-dir)
     case "$common" in
         /* | [A-Za-z]:/* | [A-Za-z]:\\*) ;;

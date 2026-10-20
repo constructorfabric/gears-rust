@@ -6,4 +6,4 @@ The source for that page is [docs/web-docs/build-with-gears/index.mdx](docs/web-
 
 ## Git hooks
 
-The first `make` run installs git hooks (rustfmt, CFS, link and CRLF checks on commit; clippy, architecture lints and forbidden words on push). The hooks run only in clones where `make` ran once; `make uninstall-hooks` disables them for that clone. Opt out with `GEARS_NO_HOOKS=1`, bypass with `--no-verify`. Details: [CONTRIBUTING.md](CONTRIBUTING.md#261-git-hooks).
+The first `make` run installs git hooks (rustfmt, CFS, link and CRLF checks on commit; clippy, architecture lints and forbidden words on push). The hooks run only in clones where `make` ran once; `make uninstall-hooks` disables them for that clone persistently (`make install-hooks` turns them back on). Opt out with `GEARS_NO_HOOKS=1`, bypass with `--no-verify`. Details: [CONTRIBUTING.md](CONTRIBUTING.md#261-git-hooks).
