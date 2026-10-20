@@ -1,0 +1,79 @@
+# Dependabot sweeper: merges safe, green Dependabot PRs and heals or escalates red ones.
+#
+# Why a schedule sweeper: the "Protect main" ruleset requires one approving review but NO
+# status checks, and auto-merge is disabled, so nothing stops a red PR from being merged.
+# The script (.github/scripts/dependabot_sweeper.py) is therefore the gate and evaluates
+# checks strictly: no checks, or any pending/unknown check, means wait; any failure means red.
+#
+# Why an App token: merges made with GITHUB_TOKEN do not trigger `push` workflows on main
+# (CI, release-plz). A GitHub App installation token does, so live mode needs one.
+#
+# "Eligible" means: every dependency in the head commit's `updated-dependencies:` block is a
+# semver patch or minor update, except cargo 0.x minors (breaking in cargo, e.g. base64
+# 0.22 -> 0.23). Entries without an update-type (docker / github_actions digest and SHA
+# bumps) are eligible; for cargo they are not. Anything unparseable, any major bump, or any
+# PR with a non-dependabot commit is never merged. Ineligible PRs get `deps:needs-migration`.
+# Red PRs whose last commit is older than 72h get one `@dependabot recreate`
+# (`deps:recreated`), then `deps:needs-migration`. Caps per run: 3 merges, 3 recreates.
+#
+# Rollout switch: the workflow runs dry-run (read-only GITHUB_TOKEN, table in the job summary)
+# until an admin creates the App, sets repo variable DEPS_BOT_APP_ID and secret
+# DEPS_BOT_PRIVATE_KEY, and sets repo variable DEPENDABOT_SWEEPER_MODE=live. A manual run
+# with `live: true` also goes live (only if the App id is set).
+name: Dependabot Sweeper
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+    inputs:
+      live:
+        description: "Perform merges, approvals, comments and labels (default: dry-run)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  # Dry-run reads PRs and their checks with GITHUB_TOKEN; writes use the App token.
+  pull-requests: read
+  checks: read
+
+concurrency:
+  group: dependabot-sweeper
+  cancel-in-progress: false
+
+jobs:
+  sweep:
+    name: Sweep Dependabot PRs
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      LIVE: ${{ (inputs.live == true || vars.DEPENDABOT_SWEEPER_MODE == 'live') && vars.DEPS_BOT_APP_ID != '' }}
+    steps:
+      # Default branch only: never check out or run PR code.
+      - name: Checkout default branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
+      - name: Mint GitHub App token
+        id: app-token
+        if: env.LIVE == 'true'
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          app-id: ${{ vars.DEPS_BOT_APP_ID }}
+          private-key: ${{ secrets.DEPS_BOT_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+
+      - name: Sweep
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token || github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          if [ "$LIVE" = "true" ]; then
+            python3 .github/scripts/dependabot_sweeper.py --live
+          else
+            python3 .github/scripts/dependabot_sweeper.py
+          fi
