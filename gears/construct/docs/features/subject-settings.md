@@ -36,7 +36,7 @@
 
 ### 1.1 Overview
 
-Subject Settings keeps, per subject, whether personalization is on and whether an erasure of the subject is under way. Record Intake, Admission and the Profile Reader read these two states. A subject Construct holds no row for starts with the tenant's personalization default, a tenant setting in the settings service. The subject reads and changes its own setting through two routes. This document describes the part of the feature that Story 5.7.1 builds: the table, the read that other features call, the tenant default, and the subject's settings routes.
+Subject Settings keeps, per subject, whether personalization is on and whether an erasure of the subject is under way. Record Intake, Admission and the Profile Reader read these two states. A subject without a stored row has the tenant's personalization default, a tenant setting in the settings service. The subject reads and changes its own setting through two routes. This document describes the part of the feature that Story 5.7.1 builds: the table, the read that other features call, the tenant default, and the subject's settings routes.
 
 ### 1.2 Purpose
 
@@ -206,7 +206,7 @@ The system **MUST** supply to the runtime a migration, `m002_subject_settings`, 
 - DB Table: `construct__subject_settings` (`cpt-cf-construct-dbtable-subject-settings`)
 - Entities: Subject Settings (`cpt-cf-construct-entity-subject-settings`)
 
-**Verified by**: `every_backend_keys_the_table_by_tenant_then_subject`, `every_backend_declares_the_erasure_default`, `mysql_ddl_uses_binary_uuid_columns`, `identifiers_are_namespaced_and_within_63_bytes` (migration), and `stored_settings_round_trip`, `subject_without_a_row_is_not_found`, `row_of_another_tenant_is_not_found`, `same_subject_keeps_one_row_per_tenant`, `erasure_flag_defaults_to_cleared_when_the_insert_leaves_it_out`, `second_row_for_the_same_tenant_and_subject_is_refused`, `a_scope_over_several_tenants_reads_only_the_named_tenants_row` (repository). The SQLite DDL runs in every repository and service test, so the default and the primary key are shown there by behavior. The MySQL and PostgreSQL DDL is only asserted as text. No test: the `down` step, and running the migration twice.
+**Verified by**: `every_backend_keys_the_table_by_tenant_then_subject`, `every_backend_declares_the_erasure_default`, `mysql_ddl_uses_binary_uuid_columns`, `identifiers_are_namespaced_and_within_63_bytes`, `sqlite_ddl_is_safe_to_run_twice` (migration), and `stored_settings_round_trip`, `subject_without_a_row_is_not_found`, `row_of_another_tenant_is_not_found`, `same_subject_keeps_one_row_per_tenant`, `erasure_flag_defaults_to_cleared_when_the_insert_leaves_it_out`, `second_row_for_the_same_tenant_and_subject_is_refused`, `a_scope_over_several_tenants_reads_only_the_named_tenants_row` (repository). The SQLite DDL runs in every repository and service test, so the default and the primary key are shown there by behavior. The MySQL and PostgreSQL DDL uses the same `IF NOT EXISTS` form and is only asserted as text, so running it twice is not shown on those backends. No test: the `down` step.
 
 ### Settings Read
 
