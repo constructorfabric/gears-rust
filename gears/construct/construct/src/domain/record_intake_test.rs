@@ -166,6 +166,46 @@ async fn a_record_that_breaks_its_type_is_refused_with_the_place_and_nothing_is_
 }
 
 #[tokio::test]
+async fn a_record_of_a_type_about_a_person_without_a_subject_is_refused() {
+    let db = inmem_db().await;
+    let fixture = IntakeFixture::default();
+    let intake = fixture.build(&db);
+    let mut record = chat_record(Uuid::new_v4(), "chat/t/1", "v1");
+    record.as_object_mut().unwrap().remove("subject_id");
+
+    let result = intake.submit(&connector(), Uuid::new_v4(), record).await;
+
+    let Err(DomainError::Refused(refusal)) = result else {
+        panic!("expected a refusal, got {result:?}");
+    };
+    assert_eq!(refusal.reason, RefusalReason::SchemaViolation);
+    assert_eq!(
+        refusal.type_id.as_deref(),
+        Some(construct_sdk::gts::CHAT_MESSAGE_TYPE)
+    );
+    assert_eq!(refusal.place, Place::pointer("/subject_id"));
+    assert_eq!(refusal.rule, "required");
+    assert!(fixture.received().is_empty());
+    assert_eq!(stored_record_ids(&db).await, 0);
+}
+
+#[tokio::test]
+async fn the_type_schema_is_checked_before_the_subject() {
+    let db = inmem_db().await;
+    let intake = IntakeFixture::default().build(&db);
+    let mut record = chat_record(Uuid::new_v4(), "chat/t/1", "v1");
+    record.as_object_mut().unwrap().remove("subject_id");
+    record["payload"].as_object_mut().unwrap().remove("text");
+
+    let result = intake.submit(&connector(), Uuid::new_v4(), record).await;
+
+    let Err(DomainError::Refused(refusal)) = result else {
+        panic!("expected a refusal, got {result:?}");
+    };
+    assert_eq!(refusal.place, Place::pointer("/payload/text"));
+}
+
+#[tokio::test]
 async fn a_connector_that_is_off_is_refused() {
     let db = inmem_db().await;
     let ctx = connector();
@@ -296,7 +336,7 @@ async fn a_record_without_a_subject_skips_the_subject_checks() {
         ..IntakeFixture::default()
     };
     let intake = fixture.build(&db);
-    // The rolos-cyber example of a source-scoped record, without its store id.
+    // A source-scoped record: a course catalog has no subject.
     let catalog = json!({
         "type": construct_sdk::gts::MASTERY_COURSE_CATALOG_TYPE,
         "provenance": "lms-eu/course-101",

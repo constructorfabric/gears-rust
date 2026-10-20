@@ -405,24 +405,33 @@ pub fn example_records() -> Vec<serde_json::Value> {
 pub fn sdk_record_type_schemas() -> Vec<types_registry_sdk::GtsTypeSchema> {
     use types_registry_sdk::{GtsTypeId, GtsTypeSchema};
 
+    let registered =
+        toolkit_gts::all_inventory_type_schemas().expect("the inventory schemas parse");
+    let schema = |type_id: &str| -> serde_json::Value {
+        registered
+            .iter()
+            .find(|schema| schema["$id"] == format!("gts://{type_id}"))
+            .cloned()
+            .expect("the SDK submits every record type")
+    };
     let base = Arc::new(
         GtsTypeSchema::try_new(
             GtsTypeId::new(construct_sdk::gts::RECORD_BASE_TYPE),
-            serde_json::from_str(construct_sdk::gts::RECORD_BASE_SCHEMA).expect("base schema"),
+            schema(construct_sdk::gts::RECORD_BASE_TYPE),
             None,
             None,
         )
         .expect("base type"),
     );
     let mut schemas = vec![(*base).clone()];
-    for record_type in construct_sdk::gts::RECORD_TYPES
-        .iter()
-        .filter(|record_type| record_type.type_id != construct_sdk::gts::RECORD_BASE_TYPE)
+    for type_id in construct_sdk::gts::RECORD_TYPES
+        .into_iter()
+        .filter(|type_id| *type_id != construct_sdk::gts::RECORD_BASE_TYPE)
     {
         schemas.push(
             GtsTypeSchema::try_new(
-                GtsTypeId::new(record_type.type_id),
-                serde_json::from_str(record_type.schema).expect("derived schema"),
+                GtsTypeId::new(type_id),
+                schema(type_id),
                 None,
                 Some(Arc::clone(&base)),
             )

@@ -115,14 +115,223 @@ async fn a_missing_payload_member_of_the_derived_type_is_named() {
 }
 
 #[tokio::test]
-async fn a_type_that_requires_a_subject_refuses_a_record_without_one() {
+async fn a_passing_record_gets_whether_its_type_requires_a_subject() {
+    let types = types();
+    for record in example_records() {
+        let type_id = record["type"].as_str().unwrap().to_owned();
+
+        let rules = types.check(&record).await.expect("the example passes");
+
+        assert_eq!(
+            rules.subject_required,
+            type_id != construct_sdk::gts::MASTERY_COURSE_CATALOG_TYPE,
+            "{type_id}"
+        );
+    }
+}
+
+/// A type registered outside the SDK, deriving from `parent` and stating no
+/// traits of its own, or the given ones.
+fn registered_elsewhere(type_id: &str, parent: &str, traits: Option<Value>) -> GtsTypeSchema {
+    let parent = sdk_record_type_schemas()
+        .into_iter()
+        .find(|schema| schema.type_id.as_ref() == parent)
+        .expect("an SDK type");
+    let mut schema =
+        json!({ "allOf": [{ "$ref": format!("gts://{parent}", parent = parent.type_id) }] });
+    if let Some(traits) = traits {
+        schema["x-gts-traits"] = traits;
+    }
+    GtsTypeSchema::try_new(
+        GtsTypeId::new(type_id),
+        schema,
+        None,
+        Some(Arc::new(parent)),
+    )
+    .expect("a derived type")
+}
+
+async fn rules_for(extra: GtsTypeSchema, record: &Value) -> bool {
+    types_with_one_more(extra)
+        .check(record)
+        .await
+        .expect("the record passes")
+        .subject_required
+}
+
+#[tokio::test]
+async fn a_type_derived_from_a_person_type_requires_a_subject() {
+    let derived = "gts.cf.connectors.core.record.v1~cf.construct.chat.message.v1~acme.chat.export.message.v1~";
     let mut record = chat();
-    record.as_object_mut().unwrap().remove("subject_id");
+    record["type"] = json!(derived);
 
-    let refused = refusal(&record).await;
+    assert!(rules_for(registered_elsewhere(derived, CHAT, None), &record).await);
+}
 
-    assert_eq!(refused.place, Place::pointer("/subject_id"));
-    assert_eq!(refused.rule, "required");
+#[tokio::test]
+async fn a_type_derived_from_the_course_catalog_inherits_that_no_subject_is_needed() {
+    let catalog = construct_sdk::gts::MASTERY_COURSE_CATALOG_TYPE;
+    let derived = format!("{catalog}acme.lms.catalog.course.v1~");
+    let mut record = example(catalog);
+    record["type"] = json!(derived);
+
+    assert!(!rules_for(registered_elsewhere(&derived, catalog, None), &record).await);
+}
+
+#[tokio::test]
+async fn a_new_record_type_that_states_no_traits_requires_a_subject() {
+    let new_type = "gts.cf.connectors.core.record.v1~acme.crm.contact.note.v1~";
+    let mut record = chat();
+    record["type"] = json!(new_type);
+
+    let base = construct_sdk::gts::RECORD_BASE_TYPE;
+    assert!(rules_for(registered_elsewhere(new_type, base, None), &record).await);
+}
+
+#[tokio::test]
+async fn a_malformed_subject_trait_requires_a_subject() {
+    // Derived from the catalog, whose `false` must not stand in for the
+    // malformed value.
+    let catalog = construct_sdk::gts::MASTERY_COURSE_CATALOG_TYPE;
+    let derived = format!("{catalog}acme.lms.catalog.course.v1~");
+    let mut record = example(catalog);
+    record["type"] = json!(derived);
+    let traits = json!({ "subject_required": "no" });
+
+    assert!(
+        rules_for(
+            registered_elsewhere(&derived, catalog, Some(traits)),
+            &record
+        )
+        .await
+    );
+}
+
+#[tokio::test]
+async fn a_type_derived_from_a_person_type_cannot_turn_the_subject_off() {
+    let derived = format!("{CHAT}acme.chat.export.message.v1~");
+    let mut record = chat();
+    record["type"] = json!(derived);
+    let traits = json!({ "subject_required": false });
+
+    assert!(rules_for(registered_elsewhere(&derived, CHAT, Some(traits)), &record).await);
+}
+
+#[tokio::test]
+async fn a_type_derived_from_the_course_catalog_can_require_a_subject() {
+    let catalog = construct_sdk::gts::MASTERY_COURSE_CATALOG_TYPE;
+    let derived = format!("{catalog}acme.lms.catalog.enrolment.v1~");
+    let mut record = example(catalog);
+    record["type"] = json!(derived);
+    let traits = json!({ "subject_required": true });
+
+    assert!(
+        rules_for(
+            registered_elsewhere(&derived, catalog, Some(traits)),
+            &record
+        )
+        .await
+    );
+}
+
+/// One valid example record of `type_id`.
+fn example(type_id: &str) -> Value {
+    example_records()
+        .into_iter()
+        .find(|record| record["type"] == type_id)
+        .expect("an example of every derived type")
+}
+
+#[tokio::test]
+async fn every_generated_constraint_refuses_a_record_that_breaks_it() {
+    use construct_sdk::gts::{
+        ENRICHMENT_FACT_CANDIDATE_TYPE as FACT, MASTERY_COURSE_CATALOG_TYPE as CATALOG,
+        MASTERY_STUDENT_MASTERY_TYPE as MASTERY,
+    };
+    let long = |n: usize| Some(json!("x".repeat(n)));
+    let empty = || Some(json!(""));
+    let extra = || Some(json!(1));
+    // The member to set (or, with `None`, to remove), and the rule its place
+    // breaks.
+    let cases: Vec<(&str, &str, Option<Value>, &str)> = vec![
+        // The envelope.
+        (CHAT, "/provenance", long(1025), "maxLength"),
+        (CHAT, "/provenance", empty(), "minLength"),
+        (CHAT, "/version", long(257), "maxLength"),
+        (CHAT, "/subject_id", Some(json!("not a uuid")), "pattern"),
+        // Chat message.
+        (CHAT, "/payload/message_id", empty(), "minLength"),
+        // Fact candidate.
+        (FACT, "/payload/claim", empty(), "minLength"),
+        (FACT, "/payload/claim", None, "required"),
+        (FACT, "/payload/confidence", Some(json!(1.5)), "maximum"),
+        (FACT, "/payload/confidence", Some(json!(-0.1)), "minimum"),
+        (
+            FACT,
+            "/payload/source_url",
+            Some(json!("ftp://x")),
+            "pattern",
+        ),
+        (FACT, "/payload/extra", extra(), "additionalProperties"),
+        (
+            FACT,
+            "/payload/citations/0/extra",
+            extra(),
+            "additionalProperties",
+        ),
+        // Course catalog.
+        (CATALOG, "/payload/course_id", empty(), "minLength"),
+        (CATALOG, "/payload/course_id", None, "required"),
+        (CATALOG, "/payload/concepts", Some(json!([])), "minItems"),
+        (CATALOG, "/payload/extra", extra(), "additionalProperties"),
+        // Student mastery.
+        (MASTERY, "/payload/model_name", empty(), "minLength"),
+        (MASTERY, "/payload/model_name", None, "required"),
+        (MASTERY, "/payload/model_version", Some(json!(0)), "minimum"),
+        (MASTERY, "/payload/concepts", Some(json!([])), "minItems"),
+        (
+            MASTERY,
+            "/payload/concepts/0/score",
+            Some(json!(1.2)),
+            "maximum",
+        ),
+        (
+            MASTERY,
+            "/payload/concepts/0/score",
+            Some(json!(-0.1)),
+            "minimum",
+        ),
+        (MASTERY, "/payload/extra", extra(), "additionalProperties"),
+    ];
+    let types = types();
+    for (type_id, pointer, value, rule) in cases {
+        let mut record = example(type_id);
+        let (parent, member) = pointer.rsplit_once('/').expect("a pointer");
+        let target = if parent.is_empty() {
+            record.as_object_mut()
+        } else {
+            record.pointer_mut(parent).and_then(Value::as_object_mut)
+        }
+        .expect("the member's parent is an object");
+        match value {
+            Some(value) => target.insert(member.to_owned(), value),
+            None => target.remove(member),
+        };
+
+        let refused = refused_by(&types, &record).await;
+
+        assert_eq!(
+            refused.reason,
+            RefusalReason::SchemaViolation,
+            "{type_id} {pointer}"
+        );
+        assert_eq!(
+            refused.place,
+            Place::pointer(pointer),
+            "{type_id} {pointer}"
+        );
+        assert_eq!(refused.rule, rule, "{type_id} {pointer}");
+    }
 }
 
 #[tokio::test]

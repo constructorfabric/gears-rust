@@ -269,12 +269,20 @@ impl DropEvent {
     }
 }
 
+/// What a record's type asks of the record beyond its schema.
+#[domain_model]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TypeRules {
+    /// The type is about one person, so a record of it must name its subject.
+    pub subject_required: bool,
+}
+
 /// Checks a record against its GTS type and the types it derives from.
 #[async_trait]
 pub trait RecordTypes: Send + Sync {
-    /// `Ok(())` when the record passes. A broken rule is
+    /// The type's rules when the record passes its schema. A broken rule is
     /// [`DomainError::Refused`]; any other error means the check could not run.
-    async fn check(&self, record: &Value) -> Result<(), DomainError>;
+    async fn check(&self, record: &Value) -> Result<TypeRules, DomainError>;
 }
 
 /// Whether a connector is on for a tenant, a tenant setting. The connector is
@@ -463,11 +471,27 @@ impl<I: RecordIdRepository + 'static, S: SubjectSettingsRepository + 'static>
         // @cpt-end:cpt-cf-construct-algo-record-intake-check-record:p1:inst-check-id
 
         // @cpt-begin:cpt-cf-construct-algo-record-intake-check-record:p1:inst-check-type
-        self.ports.types.check(record).await?;
+        let rules = self.ports.types.check(record).await?;
         // @cpt-end:cpt-cf-construct-algo-record-intake-check-record:p1:inst-check-type
 
+        let envelope = Envelope::read(record)?;
+
+        // @cpt-begin:cpt-cf-construct-algo-record-intake-check-record:p1:inst-check-subject
+        // A derived schema cannot require `subject_id`, so the type's trait
+        // says it, and it is checked here, after the schema.
+        if rules.subject_required && envelope.subject_id.is_none() {
+            return Err(Refusal::new(
+                RefusalReason::SchemaViolation,
+                Some(&envelope.type_id),
+                Place::pointer("/subject_id"),
+                "required",
+            )
+            .into());
+        }
+        // @cpt-end:cpt-cf-construct-algo-record-intake-check-record:p1:inst-check-subject
+
         // @cpt-begin:cpt-cf-construct-algo-record-intake-check-record:p1:inst-check-envelope
-        Ok(Envelope::read(record)?)
+        Ok(envelope)
         // @cpt-end:cpt-cf-construct-algo-record-intake-check-record:p1:inst-check-envelope
     }
 

@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use construct_sdk::gts::{RECORD_BASE_SCHEMA, RECORD_BASE_TYPE};
+use construct_sdk::gts::{RECORD_BASE_TYPE, SUBJECT_REQUIRED_TRAIT, record_base_schema};
 use jsonschema::error::ValidationErrorKind;
 use jsonschema::{Draft, ValidationError, Validator};
 use serde_json::Value;
@@ -12,7 +12,7 @@ use toolkit_canonical_errors::CanonicalError;
 use types_registry_sdk::{GtsTypeSchema, TypesRegistryClient};
 
 use crate::domain::error::{DomainError, is_retryable};
-use crate::domain::record_intake::{Place, RecordTypes, Refusal, RefusalReason};
+use crate::domain::record_intake::{Place, RecordTypes, Refusal, RefusalReason, TypeRules};
 
 /// How long one type lookup may take before it counts as the types registry
 /// being unavailable.
@@ -24,7 +24,8 @@ pub const DEFAULT_LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
 /// gear knows without the registry; then its type is looked up, must be
 /// concrete and must derive from the base; then the record is checked against
 /// that type's effective schema, which includes the base. The first broken
-/// rule is reported, with its place as a JSON pointer. A value from the record
+/// rule is reported, with its place as a JSON pointer. A passing record gets
+/// its type's rules, read from the type's traits across its chain. A value from the record
 /// is never repeated: the type is named only once the envelope has accepted
 /// it as a well-formed type id.
 ///
@@ -42,13 +43,12 @@ pub struct RegistryRecordTypes {
 impl RegistryRecordTypes {
     /// # Errors
     ///
-    /// When the base schema this gear ships does not compile, which is a
-    /// defect in this gear.
+    /// When the base schema the SDK generates does not compile, which is a
+    /// defect in the SDK.
     pub fn new(hub: Arc<ClientHub>) -> anyhow::Result<Self> {
-        let base: Value = serde_json::from_str(RECORD_BASE_SCHEMA)?;
         Ok(Self {
             hub,
-            envelope: compile(&base)?,
+            envelope: compile(&record_base_schema())?,
             lookup_timeout: DEFAULT_LOOKUP_TIMEOUT,
             compiled: Mutex::new(HashMap::new()),
         })
@@ -140,6 +140,33 @@ fn compile(schema: &Value) -> anyhow::Result<Validator> {
         .map_err(|err| anyhow::anyhow!("record schema does not compile: {}", err.masked()))
 }
 
+/// The rules a type states in its traits. A subject is required when any type
+/// in the chain below the base says so, because a type derived from a person
+/// type cannot stop being about a person. Otherwise the trait is resolved
+/// across the chain, its own value winning, and a missing or malformed trait
+/// requires a subject.
+fn rules_of(schema: &GtsTypeSchema) -> TypeRules {
+    let own_value = |type_schema: &GtsTypeSchema| {
+        type_schema
+            .traits
+            .as_ref()
+            .and_then(|traits| traits.get(SUBJECT_REQUIRED_TRAIT))
+            .and_then(Value::as_bool)
+    };
+    let about_a_person = schema
+        .ancestors()
+        .filter(|type_schema| type_schema.type_id.as_ref() != RECORD_BASE_TYPE)
+        .any(|type_schema| own_value(type_schema) == Some(true));
+    let resolved = schema
+        .effective_traits()
+        .get(SUBJECT_REQUIRED_TRAIT)
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    TypeRules {
+        subject_required: about_a_person || resolved,
+    }
+}
+
 /// The first rule the record breaks, if any.
 fn first_violation(
     validator: &Validator,
@@ -182,7 +209,7 @@ fn violation(err: &ValidationError<'_>, type_id: Option<&str>) -> Refusal {
 
 #[async_trait]
 impl RecordTypes for RegistryRecordTypes {
-    async fn check(&self, record: &Value) -> Result<(), DomainError> {
+    async fn check(&self, record: &Value) -> Result<TypeRules, DomainError> {
         // @cpt-begin:cpt-cf-construct-algo-record-intake-check-record:p1:inst-check-base
         // The type is not named: it may be the very member that is broken.
         first_violation(&self.envelope, record, None)?;
@@ -224,7 +251,9 @@ impl RecordTypes for RegistryRecordTypes {
 
         // @cpt-begin:cpt-cf-construct-algo-record-intake-check-record:p1:inst-check-schema
         let validator = self.validator_for(type_id, &schema)?;
-        first_violation(&validator, record, Some(type_id))
+        first_violation(&validator, record, Some(type_id))?;
         // @cpt-end:cpt-cf-construct-algo-record-intake-check-record:p1:inst-check-schema
+
+        Ok(rules_of(&schema))
     }
 }
