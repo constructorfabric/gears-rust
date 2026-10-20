@@ -18,8 +18,8 @@ use crate::domain::sensitive_data::{
 use crate::domain::subject_settings::SubjectSettings;
 use crate::test_support::{
     AdmissionFixture, FixedRules, FixedSubjectSettings, RecordingAdmissionEvents, RecordingEvents,
-    SubstringCheck, add_entity, by_a_person, connector_plan, open_rules, processing_context,
-    remove_entity, replace_property, spans,
+    SubstringCheck, add_entity, add_value, by_a_person, connector_plan, open_rules,
+    processing_context, remove_entity, replace_property, spans,
 };
 
 const SECRET: &str = "a value that must not reach an event";
@@ -41,7 +41,15 @@ fn admitted(outcome: AdmissionOutcome) -> AdmittedPlan {
 }
 
 fn at(step: usize, property: usize) -> ValueRef {
-    ValueRef { step, property }
+    piece(step, property, 0)
+}
+
+fn piece(step: usize, property: usize, piece: usize) -> ValueRef {
+    ValueRef {
+        step,
+        property,
+        piece,
+    }
 }
 
 fn found(kind: SensitiveDataKind, at: ValueRef, spans: Vec<std::ops::Range<usize>>) -> Verdict {
@@ -757,4 +765,102 @@ async fn checks_then_admission_store_nothing_the_checks_block() {
             Property::new("name", "Ada")
         ]
     );
+}
+
+/// The verdicts of test checks for `needle`s, run on `plan` as processing does.
+async fn checked(plan: &Plan, checks: &[(SensitiveDataKind, &'static str)]) -> Vec<Verdict> {
+    let runner = SensitiveDataChecks::new(
+        checks
+            .iter()
+            .map(|&(kind, needle)| {
+                Arc::new(SubstringCheck { kind, needle }) as Arc<dyn SensitiveDataCheck>
+            })
+            .collect(),
+        Arc::new(RecordingEvents::default()),
+    );
+    let Checked::Verdicts(verdicts) = runner.run(plan).await else {
+        panic!("the checks answered");
+    };
+    verdicts
+}
+
+#[tokio::test]
+async fn a_redaction_inside_an_object_keeps_the_json_and_the_other_fields() {
+    let fixture = AdmissionFixture::default();
+    let plan = connector_plan(vec![add_value(
+        "identity",
+        "contact_note",
+        serde_json::json!({ "note": "call +49 30 1234 now", "label": "work" }),
+    )]);
+    let verdicts = checked(&plan, &[(SensitiveDataKind::Contacts, "+49 30 1234")]).await;
+
+    let admitted = admitted(admit(&fixture, plan, &verdicts).await);
+
+    assert_eq!(
+        admitted.plan.steps[0].change.properties()[0].value,
+        serde_json::json!({ "note": "call  now", "label": "work" })
+    );
+    assert_eq!(admitted.redacted.len(), 1);
+    assert!(admitted.blocked.is_empty());
+}
+
+#[tokio::test]
+async fn a_found_number_cannot_be_redacted_so_its_value_is_blocked() {
+    let fixture = AdmissionFixture::default();
+    let plan = connector_plan(vec![add_value(
+        "identity",
+        "phone",
+        serde_json::json!({ "number": 4_930_123 }),
+    )]);
+    let verdicts = checked(&plan, &[(SensitiveDataKind::Contacts, "4930123")]).await;
+
+    let admitted = admitted(admit(&fixture, plan, &verdicts).await);
+
+    assert!(admitted.plan.steps.is_empty(), "the value is not stored");
+    assert_eq!(admitted.blocked.len(), 1);
+    assert_eq!(admitted.blocked[0].kind, SensitiveDataKind::Contacts);
+    assert!(admitted.redacted.is_empty());
+}
+
+#[tokio::test]
+async fn one_blocked_piece_drops_its_whole_value_and_reports_no_redaction_in_it() {
+    let fixture = AdmissionFixture::default();
+    let plan = connector_plan(vec![Step {
+        entity_kind: "note".to_owned(),
+        change: Change::AddEntity {
+            key: crate::domain::plan::NodeKey("n".to_owned()),
+            properties: vec![
+                Property::new(
+                    "health_note",
+                    serde_json::json!({ "text": "has asthma", "call": "ring +49 30 1234" }),
+                ),
+                Property::new("hobby", "chess"),
+            ],
+        },
+        confidence: Some(0.9),
+    }]);
+    let verdicts = checked(
+        &plan,
+        &[
+            (SensitiveDataKind::Health, "asthma"),
+            (SensitiveDataKind::Contacts, "+49 30 1234"),
+        ],
+    )
+    .await;
+
+    let admitted = admitted(admit(&fixture, plan, &verdicts).await);
+
+    assert_eq!(
+        admitted.plan.steps[0].change.properties(),
+        &[Property::new("hobby", "chess")]
+    );
+    assert_eq!(admitted.blocked.len(), 1);
+    assert_eq!(admitted.blocked[0].kind, SensitiveDataKind::Health);
+    assert!(
+        admitted.redacted.is_empty(),
+        "the redacted value was not stored"
+    );
+    let events = fixture.events.taken();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].0, "blocked");
 }

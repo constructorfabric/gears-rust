@@ -36,7 +36,9 @@ The PRD requires Construct to keep special-category data out of the profile (`cp
 
 **The kinds and their actions.** The ten sensitive-data kinds and the action for each come from the DESIGN's Sensitive-Data Verdict entity (`cpt-cf-construct-entity-sensitive-data-verdict`). Personal IDs, finance, contacts and location are redacted. Health, biometrics, credentials, politics, sex and other protected data are blocked. The action belongs to the kind, not to the check, so a check cannot weaken it.
 
-**The verdict.** A check answers for its own kind with the values it found content in, named by their place in the plan: the step and the property. For a kind that redacts, the answer also gives the byte ranges of the found content in the value. A value the answer does not name is allowed. A check answers about the values the plan would store; a removal stores nothing and is not checked.
+**The text pieces.** A value is JSON, as the node stores it: plain text, or an object of fields such as a skill's name and level. The checks see each value's text pieces: every string and every number inside it, as text. The keys of an object are its type's field names and are not checked; booleans and nulls carry no text. So a check never sees JSON syntax, and a redaction can never break it.
+
+**The verdict.** A check answers for its own kind with the text pieces it found content in, named by their place in the plan: the step, the property and the piece. For a kind that redacts, the answer also gives the byte ranges of the found content in the piece. A piece the answer does not name is allowed. A check answers about the values the plan would store; a removal stores nothing and is not checked.
 
 **The plan.** The checks read a plan only through the list of values it would store. The Plan type is defined here and agreed with Story 5.2 (the Planner, ROL-17080), which builds plans on it; see [Admission](./admission.md), 1.2.
 
@@ -82,7 +84,7 @@ The PRD requires Construct to keep special-category data out of the profile (`cp
 **Output**: One verdict per check, or a dropped record.
 
 **Steps**:
-1. [x] - `p1` - Take the values the plan would store, each with its place in the plan (step and property). A removal has none - `inst-run-values`
+1. [x] - `p1` - Take the text pieces of the values the plan would store, each with its place in the plan (step, property and piece). A removal has none - `inst-run-values`
 2. [x] - `p1` - Run every check on the values at the same time, and wait for all of them. There is no switch to turn the checks off; a deployment chooses only which checks exist - `inst-run-parallel`
 3. [x] - `p1` - **IF** a check fails, or answers for another kind or about a value the plan does not hold: for a plan built from a record, write the drop event (`cpt-cf-construct-algo-record-intake-drop-event`) with stage `checks` and reason `check_failed`; then **RETURN** dropped. A plan with no record behind it gets no drop event; its caller gets the dropped answer and audits it. The warning in the log names the kind, never a value - `inst-run-failed`
 4. [x] - `p1` - **RETURN** the verdicts - `inst-run-return`
@@ -98,7 +100,7 @@ None. The checks keep no state.
 
 - [x] `p1` - **ID**: `cpt-cf-construct-dod-sensitive-data-checks-interface`
 
-The system **MUST** define one check interface per sensitive-data kind that answers with a verdict naming the values with found content and, for a kind that redacts, the byte ranges of that content. It **MUST** run every check on the values a plan would store, in parallel, with no switch to turn them off, and **MUST** drop the plan when a check fails or gives an answer that does not fit the plan, with the content-free drop event of Record Intake (stage `checks`) for a plan built from a record. The action of each kind **MUST** be the DESIGN's. A test check that can block **MUST** exist; a deployment **MAY** run no check until the real ones exist, and this part wires in none.
+The system **MUST** define one check interface per sensitive-data kind that answers with a verdict naming the text pieces with found content and, for a kind that redacts, the byte ranges of that content. It **MUST** run every check on the text pieces of the values a plan would store, never on keys or JSON syntax, in parallel, with no switch to turn them off, and **MUST** drop the plan when a check fails or gives an answer that does not fit the plan, with the content-free drop event of Record Intake (stage `checks`) for a plan built from a record. The action of each kind **MUST** be the DESIGN's. A test check that can block **MUST** exist; a deployment **MAY** run no check until the real ones exist, and this part wires in none.
 
 **Implements**:
 - `cpt-cf-construct-algo-sensitive-data-checks-run`
@@ -106,7 +108,7 @@ The system **MUST** define one check interface per sensitive-data kind that answ
 **Touches**:
 - Entities: Sensitive-Data Verdict (`cpt-cf-construct-entity-sensitive-data-verdict`), Plan (`cpt-cf-construct-entity-plan`)
 
-**Verified by**: `every_kind_has_the_action_the_design_gives_it`, `the_values_are_those_the_plan_would_store_and_removals_have_none`, `without_checks_every_value_is_allowed`, `each_check_answers_for_the_values_it_found_content_in`, `the_checks_run_in_parallel` (three checks that each wait for the other two), `a_failed_check_drops_the_record_with_a_drop_event`, `a_failed_check_on_a_plan_without_a_record_drops_it_without_a_record_event`, `an_answer_for_another_kind_drops_the_record`, `a_finding_in_a_value_the_plan_does_not_hold_drops_the_record` (runner), and `checks_then_admission_store_nothing_the_checks_block` (with Admission). The checks are test checks that match a fixed text; no real check exists.
+**Verified by**: `every_kind_has_the_action_the_design_gives_it`, `the_values_are_those_the_plan_would_store_and_removals_have_none`, `an_object_value_gives_its_strings_and_numbers_but_not_its_keys`, `without_checks_every_value_is_allowed`, `each_check_answers_for_the_values_it_found_content_in`, `the_checks_run_in_parallel` (three checks that each wait for the other two), `a_failed_check_drops_the_record_with_a_drop_event`, `a_failed_check_on_a_plan_without_a_record_drops_it_without_a_record_event`, `an_answer_for_another_kind_drops_the_record`, `a_finding_in_a_value_the_plan_does_not_hold_drops_the_record` (runner), and `checks_then_admission_store_nothing_the_checks_block` (with Admission). The checks are test checks that match a fixed text; no real check exists.
 
 ## 6. Acceptance Criteria
 

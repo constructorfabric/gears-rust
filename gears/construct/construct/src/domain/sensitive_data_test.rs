@@ -14,8 +14,8 @@ use crate::domain::sensitive_data::{
     Action, Checked, Found, SensitiveDataCheck, SensitiveDataChecks, SensitiveDataKind, Verdict,
 };
 use crate::test_support::{
-    FailingCheck, FixedCheck, RecordingEvents, SubstringCheck, add_entity, connector_plan,
-    remove_entity, replace_property, spans,
+    FailingCheck, FixedCheck, RecordingEvents, SubstringCheck, add_entity, add_value,
+    connector_plan, remove_entity, replace_property, spans,
 };
 
 fn checks(list: Vec<Arc<dyn SensitiveDataCheck>>) -> (SensitiveDataChecks, Arc<RecordingEvents>) {
@@ -25,7 +25,15 @@ fn checks(list: Vec<Arc<dyn SensitiveDataCheck>>) -> (SensitiveDataChecks, Arc<R
 }
 
 fn at(step: usize, property: usize) -> ValueRef {
-    ValueRef { step, property }
+    piece(step, property, 0)
+}
+
+fn piece(step: usize, property: usize, piece: usize) -> ValueRef {
+    ValueRef {
+        step,
+        property,
+        piece,
+    }
 }
 
 #[test]
@@ -234,4 +242,22 @@ async fn a_finding_in_a_value_the_plan_does_not_hold_drops_the_record() {
 
     assert_eq!(runner.run(&plan).await, Checked::Dropped);
     assert_eq!(drops.taken().len(), 1);
+}
+
+#[test]
+fn an_object_value_gives_its_strings_and_numbers_but_not_its_keys() {
+    let plan = connector_plan(vec![add_value(
+        "skill",
+        "skills",
+        serde_json::json!({ "name": "Python", "years": 5, "current": true, "tags": ["rust", "c"] }),
+    )]);
+
+    let values = plan.values();
+
+    let mut texts: Vec<&str> = values.iter().map(|v| v.text.as_str()).collect();
+    texts.sort_unstable();
+    assert_eq!(texts, ["5", "Python", "c", "rust"]);
+    assert!(values.iter().all(|v| v.at.value() == (0, 0)));
+    let pieces: Vec<usize> = values.iter().map(|v| v.at.piece).collect();
+    assert_eq!(pieces, [0, 1, 2, 3]);
 }

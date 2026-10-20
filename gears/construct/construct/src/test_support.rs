@@ -646,6 +646,19 @@ pub fn add_entity(kind: &str, properties: &[(&str, &str)]) -> Step {
     }
 }
 
+/// A model's step that adds an entity of `kind` with one property whose value
+/// is `value`, such as an object of fields.
+pub fn add_value(kind: &str, name: &str, value: serde_json::Value) -> Step {
+    Step {
+        entity_kind: kind.to_owned(),
+        change: Change::AddEntity {
+            key: NodeKey(Uuid::new_v4().to_string()),
+            properties: vec![Property::new(name, value)],
+        },
+        confidence: Some(0.9),
+    }
+}
+
 /// A model's step that gives an existing property of `kind` a new value.
 pub fn replace_property(kind: &str, name: &str, value: &str) -> Step {
     Step {
