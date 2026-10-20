@@ -10,7 +10,7 @@ use crate::infra::error_conv::{is_check_violation, is_serialization_failure, is_
 
 /// Classify a raw [`DbErr`] into a typed [`DomainError`].
 #[allow(clippy::needless_pass_by_value)]
-pub(crate) fn classify_db_err_to_domain(db_err: DbErr) -> DomainError {
+pub(super) fn classify_db_err_to_domain(db_err: DbErr) -> DomainError {
     if is_unique_violation(&db_err) {
         return DomainError::Conflict;
     }

@@ -42,7 +42,7 @@ fn domain_db_err(e: &DomainError) -> Option<&DbErr> {
 /// [`SecretRepo`](crate::domain::secret::repo::SecretRepo).
 pub struct SecretRepoImpl {
     /// Database provider used to open connections and transactions for secret queries.
-    pub(crate) db: Arc<CredstoreDbProvider>,
+    pub(super) db: Arc<CredstoreDbProvider>,
 }
 
 impl SecretRepoImpl {
@@ -78,7 +78,7 @@ impl SecretRepoImpl {
 /// `now()` on `PostgreSQL`, an ISO-8601 `strftime` on `SQLite` (timestamps are
 /// TEXT there). Never bound from the process, so instances with skewed clocks
 /// agree on when a lease is over.
-pub(crate) fn db_now_sql(backend: DbBackend) -> &'static str {
+pub(super) fn db_now_sql(backend: DbBackend) -> &'static str {
     match backend {
         DbBackend::Sqlite => "strftime('%Y-%m-%dT%H:%M:%fZ', 'now')",
         _ => "now()",
@@ -86,7 +86,7 @@ pub(crate) fn db_now_sql(backend: DbBackend) -> &'static str {
 }
 
 /// The `(op, selector, version)` columns of a debt row for `task`.
-pub(crate) fn task_to_columns(
+pub(super) fn task_to_columns(
     task: &CleanupTask,
 ) -> (DbCleanupOp, Option<DbDestroySelector>, Option<String>) {
     match task {
@@ -107,7 +107,7 @@ pub(crate) fn task_to_columns(
 /// Map a `credstore_store_cleanup` row to the domain [`CleanupDebt`]. A
 /// combination of columns the writer never produces (a purge with a
 /// selector, a destroy without one) is storage corruption.
-pub(crate) fn entity_to_debt(m: entity::store_cleanup::Model) -> Result<CleanupDebt, DomainError> {
+pub(super) fn entity_to_debt(m: entity::store_cleanup::Model) -> Result<CleanupDebt, DomainError> {
     let corrupt = |what: &str| DomainError::Internal {
         diagnostic: format!("credstore_store_cleanup out-of-domain {what}"),
         cause: None,
@@ -127,7 +127,7 @@ pub(crate) fn entity_to_debt(m: entity::store_cleanup::Model) -> Result<CleanupD
 /// Map an entity row to the domain [`SecretRow`]. The `SMALLINT` columns are
 /// typed by the storage enums, so a code outside the stored domain never gets
 /// this far: the column decode rejects it.
-pub(crate) fn entity_to_model(m: entity::secrets::Model) -> SecretRow {
+pub(super) fn entity_to_model(m: entity::secrets::Model) -> SecretRow {
     SecretRow {
         id: m.id,
         tenant_id: TenantId(m.tenant_id),

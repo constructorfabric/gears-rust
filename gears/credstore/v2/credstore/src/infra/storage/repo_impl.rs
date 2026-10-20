@@ -1,7 +1,7 @@
 // Updated: 2026-10-06 by Constructor Tech
 //! `SeaORM`-backed implementation of [`SecretRepo`] (ADR-0006).
 
-pub mod helpers;
+mod helpers;
 mod intents;
 mod reads;
 mod verify;
