@@ -193,25 +193,25 @@ The no-orphan rule protects the invariant that no declaration is ever left point
 
 ### List Categories
 
-- [ ] `p1` - **ID**: `cpt-cf-settings-service-flow-category-management-list`
+- [x] `p1` - **ID**: `cpt-cf-settings-service-flow-category-management-list`
 
 **Actor**: `cpt-cf-settings-service-actor-tenant-admin`
 
 **Success Scenarios**:
-- Paginated, domain-filtered, visibility-gated page of categories returned in a stable order, each with the caller's setting counts when it may read values, and the total of categories the listing holds
+- Paginated, domain-filtered, visibility-gated page of categories returned in a stable order — the default display order, or the order the caller asked for — each with the caller's setting counts when it may read values, and the total of categories the listing holds
 
 **Error Scenarios**:
 - Unsupported OData filter or ordering expression
 - Malformed or expired pagination cursor
 
 **Steps**:
-1. [x] - `p1` - Actor sends GET /settings-service/v1/categories with optional OData `$filter`, `$orderby` over `key` or `name`, and a pagination cursor; `$orderby` over `domain_affinity` is refused `400 odata_unsortable_field` because it may be empty and a page cursor cannot carry an empty value, and `$select` is refused `400` rather than ignored - `inst-cat-list-1`
+1. [x] - `p1` - Actor sends GET /settings-service/v1/categories with optional OData `$filter`, `$orderby` over `key`, `name` or `sort_order`, each `asc` or `desc`, and a pagination cursor; `$orderby` over `domain_affinity` is refused `400 odata_unsortable_field` because it may be empty and a page cursor cannot carry an empty value, and `$select` is refused `400` rather than ignored - `inst-cat-list-1`
 2. [x] - `p1` - Authorize `read` on `gts.cf.core.settings.category.v1~` and obtain the `AccessScope` constraints - `inst-cat-list-2`
 3. [x] - `p1` - **IF** the decision is deny or cannot be obtained → **RETURN** `403` - `inst-cat-list-3`
 4. [x] - `p1` - Parse the OData expressions against the category field mapping - `inst-cat-list-4`
 5. [x] - `p1` - **IF** an expression references an unmapped field or an unsupported operator → **RETURN** `400` - `inst-cat-list-5`
 6. [x] - `p1` - Derive the domain and visibility predicate from the `AccessScope` constraints - `inst-cat-list-6`
-7. [ ] - `p1` - DB: SELECT categories with the combined predicate applied in the query, ordered by `sort_order` then `name` so the cursor is deterministic - `inst-cat-list-7`
+7. [x] - `p1` - DB: SELECT categories with the combined predicate applied in the query, ordered by `sort_order` then `name` so the cursor is deterministic, or by the `$orderby` the caller sent with `name asc` appended as the tiebreaker unless `name` is already an order key - `inst-cat-list-7`
 8. [x] - `p1` - **IF** the supplied cursor is malformed or no longer decodable → **RETURN** `400` - `inst-cat-list-8`
 9. [x] - `p1` - Authorize `read` on the value resource once for the page; **IF** allowed → DB: SELECT, in one grouped statement over the page's categories, the count of declarations per category by `mode` and `status`, under that decision's constraints, the caller's domain visibility and the `hidden` exclusion on its root-to-self chain — the browse's own predicate, so each count equals the browse of its category — and carry `setting_count`, `advanced_count` and `retired_count` on every category, zeros on one holding nothing; **ELSE** (deny, or a decision that cannot be obtained) carry none, since a count of settings is gated as the settings are - `inst-cat-list-10`
 10. [x] - `p1` - Count the categories the whole listing holds under the same predicate as the page, the `$filter` included and the cursor excluded, as `page_info.total_count` - `inst-cat-list-11`
@@ -286,7 +286,7 @@ The system **MUST** persist categories in a `categories` table with a UUID prima
 
 - [x] `p1` - **ID**: `cpt-cf-settings-service-dod-category-management-crud`
 
-The system **MUST** expose create, get, list, update, and delete over categories. Partial update **MUST** be restricted to `name`, `description`, `domain_affinity`, `sort_order`, and `icon`, and `key` **MUST** be rejected as immutable, because settings are keyed through the category slug and an in-place change would silently re-key every setting in the category.
+The system **MUST** expose create, get, list, update, and delete over categories. Partial update **MUST** be restricted to `name`, `description`, `domain_affinity`, `sort_order`, and `icon`, and `key` **MUST** be rejected as immutable, because settings are keyed through the category slug and an in-place change would silently re-key every setting in the category. The list **MUST** come back ordered by `sort_order` then `name` unless the caller orders it, **MUST** accept `$orderby` over `key`, `name` and `sort_order`, each `asc` or `desc`, with `name asc` appended as the tiebreaker, and **MUST** accept `$filter` over `sort_order` beside `key`, `name` and `domain_affinity`.
 
 **Implements**:
 - `cpt-cf-settings-service-flow-category-management-create`
@@ -423,7 +423,12 @@ Every category the list and the single read return **MUST** carry `setting_count
 - [ ] Getting a category outside the caller's permitted domain returns `404` rather than `403`
 - [ ] A category with null `domain_affinity` is visible to a caller whose `AccessScope` restricts domains
 - [ ] A domain constraint whose values cannot be read as domain names restricts the caller to undomained categories rather than lifting the restriction
-- [ ] Listing returns categories ordered by `sort_order` then `name`, and that order is reproduced across cursor pages
+- [x] Listing returns categories ordered by `sort_order` then `name`, and that order is reproduced across cursor pages
+- [x] Listing with `$orderby=sort_order asc` returns the same order as the default
+- [x] Listing with `$orderby=sort_order desc` reverses the weights only, with categories of equal weight still in `name` ascending order
+- [x] The `$orderby=sort_order desc` order is reproduced across cursor pages when categories of equal weight straddle a page boundary
+- [x] Listing with `$filter=sort_order eq N` returns only the categories with that weight
+- [x] Listing with `$orderby=domain_affinity` returns `400 odata_unsortable_field`
 - [ ] Listing applies the visibility predicate inside the query, so a page is never short by the number of rows filtered out afterwards
 - [ ] Listing with an OData filter on an unmapped field or an unsupported operator returns `400`
 - [ ] Listing with a malformed pagination cursor returns `400`

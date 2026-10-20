@@ -62,6 +62,7 @@ pub struct CreateDeclaration {
     pub category_id: Uuid,
     pub default_value: Value,
     pub scope_class: String,
+    pub display_name: Option<String>,
     pub description: Option<String>,
     pub mode: Option<String>,
     pub requires_step_up: Option<bool>,
@@ -102,6 +103,39 @@ pub enum FieldClass {
     Immutable,
     /// Loosening a gate or a classification: needs credential step-up.
     StepUp,
+}
+
+/// The longest display name, in Unicode characters after trimming.
+const DISPLAY_NAME_MAX_CHARS: usize = 256;
+
+/// Trim a display name and check it is 1..=256 characters with no control
+/// characters.
+///
+/// Counted in `chars()`, not bytes: the bound is about what a person reads.
+///
+/// # Errors
+/// [`DomainError::Validation`] naming `display_name` when the trimmed value is
+/// empty, longer than the bound, or containing a control character.
+pub fn normalise_display_name(raw: &str) -> Result<String, DomainError> {
+    let trimmed = raw.trim();
+    let length = trimmed.chars().count();
+    if length == 0 || length > DISPLAY_NAME_MAX_CHARS {
+        return Err(validation(
+            "display_name",
+            field::VALIDATION,
+            format!(
+                "`display_name` must be 1 to {DISPLAY_NAME_MAX_CHARS} characters after trimming"
+            ),
+        ));
+    }
+    if trimmed.chars().any(char::is_control) {
+        return Err(validation(
+            "display_name",
+            field::VALIDATION,
+            "`display_name` must not contain control characters",
+        ));
+    }
+    Ok(trimmed.to_owned())
 }
 
 fn validation(field: &str, code: &'static str, message: impl Into<String>) -> DomainError {
@@ -291,6 +325,15 @@ pub fn classify_field(
             }
             FieldClass::Immediate
         }
+        "display_name" => {
+            if !value.is_null() {
+                let Some(raw) = value.as_str() else {
+                    return Err(wrong_shape("a string or null"));
+                };
+                normalise_display_name(raw)?;
+            }
+            FieldClass::Immediate
+        }
         "mode" => match value.as_str() {
             Some("standard" | "advanced") => FieldClass::Immediate,
             _ => return Err(wrong_shape("`standard` or `advanced`")),
@@ -352,6 +395,7 @@ fn snapshot(declaration: &Declaration) -> Value {
         "mode": declaration.mode,
         "status": declaration.status,
         "description": declaration.description,
+        "display_name": declaration.display_name,
         "domain_affinity": declaration.domain_affinity,
         "licence_feature": declaration.licence_feature,
         "data_classification": declaration.data_classification,
@@ -456,6 +500,11 @@ where
                 ),
                 other => validation("key", field::SETTING_KEY_SEGMENT, other.to_string()),
             })?;
+        let display_name = request
+            .display_name
+            .as_deref()
+            .map(normalise_display_name)
+            .transpose()?;
         // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-create:p1:inst-decl-create-7
         // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-create:p1:inst-decl-create-6
         if !matches!(
@@ -579,6 +628,7 @@ where
         };
         let metadata = DeclarationMetadata {
             mode: mode.to_owned(),
+            display_name,
             description: request.description.clone(),
             domain_affinity: request.domain_affinity.clone(),
             licence_feature: request.licence_feature.clone(),
@@ -682,6 +732,7 @@ where
             source: "admin_authored".to_owned(),
             owner_module: None,
             licence_feature: metadata.licence_feature.clone(),
+            display_name: metadata.display_name.clone(),
             description: metadata.description.clone(),
             created_by: actor.subject(),
         };
@@ -1058,6 +1109,7 @@ where
         // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-update:p1:inst-decl-update-10
         let mut metadata = DeclarationMetadata {
             mode: current.mode.clone(),
+            display_name: current.display_name.clone(),
             description: current.description.clone(),
             domain_affinity: current.domain_affinity.clone(),
             licence_feature: current.licence_feature.clone(),
@@ -1068,6 +1120,11 @@ where
         for (name, value) in patch {
             match name.as_str() {
                 "description" => metadata.description = optional_string(value),
+                "display_name" => {
+                    // Validated by `classify_field` before this point; `null`
+                    // clears the label.
+                    metadata.display_name = value.as_str().map(|raw| raw.trim().to_owned());
+                }
                 "domain_affinity" => metadata.domain_affinity = optional_string(value),
                 "licence_feature" => metadata.licence_feature = optional_string(value),
                 "mode" => metadata.mode = value.as_str().unwrap_or("standard").to_owned(),

@@ -9,8 +9,12 @@ use toolkit_db::odata::{FieldToColumn, ODataFieldMapping};
 
 use settings_service_sdk::odata::CategoryFilterField;
 
+use crate::domain::odata::ReviewOrderField;
 use crate::infra::storage::entity::category::{
     Column as CategoryColumn, Entity as CategoryEntity, Model as CategoryModel,
+};
+use crate::infra::storage::entity::setting_value::{
+    Column as ValueColumn, Entity as ValueEntity, Model as ValueModel,
 };
 
 /// `OData` mapper for categories.
@@ -27,6 +31,7 @@ impl FieldToColumn<CategoryFilterField> for CategoryODataMapper {
             CategoryFilterField::Key => CategoryColumn::Key,
             CategoryFilterField::Name => CategoryColumn::Name,
             CategoryFilterField::DomainAffinity => CategoryColumn::DomainAffinity,
+            CategoryFilterField::SortOrder => CategoryColumn::SortOrder,
         }
     }
 }
@@ -41,6 +46,33 @@ impl ODataFieldMapping<CategoryFilterField> for CategoryODataMapper {
             CategoryFilterField::Key => model.key.clone().into(),
             CategoryFilterField::Name => model.name.clone().into(),
             CategoryFilterField::DomainAffinity => model.domain_affinity.clone().into(),
+            CategoryFilterField::SortOrder => model.sort_order.into(),
+        }
+    }
+}
+
+/// `OData` mapper for the review listing's keyset: the value row's declaration
+/// and tenant.
+pub struct ReviewODataMapper;
+
+impl FieldToColumn<ReviewOrderField> for ReviewODataMapper {
+    type Column = ValueColumn;
+
+    fn map_field(field: ReviewOrderField) -> ValueColumn {
+        match field {
+            ReviewOrderField::DeclarationId => ValueColumn::DeclarationId,
+            ReviewOrderField::TenantId => ValueColumn::TenantId,
+        }
+    }
+}
+
+impl ODataFieldMapping<ReviewOrderField> for ReviewODataMapper {
+    type Entity = ValueEntity;
+
+    fn extract_cursor_value(model: &ValueModel, field: ReviewOrderField) -> sea_orm::Value {
+        match field {
+            ReviewOrderField::DeclarationId => model.declaration_id.into(),
+            ReviewOrderField::TenantId => model.tenant_id.into(),
         }
     }
 }

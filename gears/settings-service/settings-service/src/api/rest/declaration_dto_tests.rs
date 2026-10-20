@@ -3,7 +3,7 @@
 
 use serde_json::json;
 
-use super::DeclarationDto;
+use super::{CreateDeclarationRequest, DeclarationDto, UpdateDeclarationRequest};
 use crate::domain::declaration::Declaration;
 use crate::domain::declaration::service::RenderedDeclaration;
 use uuid::Uuid;
@@ -22,6 +22,7 @@ fn rendered(traits: serde_json::Value) -> RenderedDeclaration {
             domain_affinity: None,
             licence_feature: None,
             owner_module: None,
+            display_name: None,
             description: None,
             default_value: json!(true),
             has_secret_trait: false,
@@ -95,4 +96,59 @@ fn absent_optionals_are_omitted_rather_than_null() {
     ] {
         assert!(wire.get(omitted).is_none(), "`{omitted}` must be omitted");
     }
+}
+
+#[test]
+fn a_display_name_is_serialized_when_set_and_omitted_when_not() {
+    // Absent means absent: a client derives its own label from `leaf_slug`, so
+    // the wire must not carry a `null` or an empty string in its place.
+    let mut with = rendered(json!({}));
+    with.declaration.display_name = Some("Minimum TLS version".to_owned());
+    let wire = serde_json::to_value(DeclarationDto::from(with)).expect("serializes");
+    assert_eq!(wire["display_name"], json!("Minimum TLS version"));
+
+    let without =
+        serde_json::to_value(DeclarationDto::from(rendered(json!({})))).expect("serializes");
+    assert!(
+        without.get("display_name").is_none(),
+        "an unset display name has no key: {without}"
+    );
+}
+
+#[test]
+fn a_create_request_accepts_a_display_name_and_hands_it_to_the_domain() {
+    let body = r#"{"value_type_id": "gts.cf.core.settings.type_bool_flag.v1~",
+        "vendor": "acme", "name": "tls", "category_id": "00000000-0000-0000-0000-000000000000",
+        "default_value": true, "scope_class": "cascading",
+        "display_name": "Minimum TLS version"}"#;
+    let request: CreateDeclarationRequest = serde_json::from_str(body).expect("accepted");
+    assert_eq!(request.display_name.as_deref(), Some("Minimum TLS version"));
+    let domain = crate::domain::declaration::CreateDeclaration::try_from(request)
+        .expect("a well-formed request converts");
+    assert_eq!(domain.display_name.as_deref(), Some("Minimum TLS version"));
+}
+
+#[test]
+fn a_create_request_without_a_display_name_or_with_null_reads_as_unsupplied() {
+    // An explicit `null` on create counts as unsupplied, the same as omission.
+    for tail in ["", r#", "display_name": null"#] {
+        let body = format!(
+            r#"{{"value_type_id": "gts.cf.core.settings.type_bool_flag.v1~",
+            "vendor": "acme", "name": "tls", "category_id": "00000000-0000-0000-0000-000000000000",
+            "default_value": true, "scope_class": "cascading"{tail}}}"#
+        );
+        let request: CreateDeclarationRequest = serde_json::from_str(&body).expect("accepted");
+        assert!(request.display_name.is_none(), "{tail}");
+    }
+}
+
+#[test]
+fn an_update_request_documents_the_display_name_and_reads_an_absent_one_as_absent() {
+    // The handler reads the raw object for absent-versus-null; this shape only
+    // publishes the field.
+    let request: UpdateDeclarationRequest =
+        serde_json::from_value(json!({ "display_name": "Minimum TLS version" })).expect("accepted");
+    assert_eq!(request.display_name.as_deref(), Some("Minimum TLS version"));
+    let empty: UpdateDeclarationRequest = serde_json::from_value(json!({})).expect("accepted");
+    assert!(empty.display_name.is_none(), "an absent field stays absent");
 }

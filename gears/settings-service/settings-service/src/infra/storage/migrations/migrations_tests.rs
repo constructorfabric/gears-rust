@@ -10,7 +10,7 @@
 //! reachable. What is testable in-crate is that the harness hands over a list
 //! that actually applies.
 
-use sea_orm::{Database, DatabaseBackend, DbBackend};
+use sea_orm::{ConnectionTrait, Database, DatabaseBackend, DbBackend, Statement};
 use sea_orm_migration::MigratorTrait;
 
 use super::Migrator;
@@ -40,6 +40,7 @@ fn the_harness_declares_its_migrations_in_order() {
             "m20260925_000001_audit_records_default_horizon_index".to_owned(),
             "m20260925_000002_audit_retention_policy".to_owned(),
             "m20260925_000003_audit_retention_policy_seed".to_owned(),
+            "m20261014_000001_declaration_display_name".to_owned(),
         ]
     );
 }
@@ -86,6 +87,116 @@ async fn applying_twice_is_a_no_op() {
     assert_eq!(after_first, after_second);
 }
 
+/// The columns of `setting_declarations` as SQLite reports them: name, and
+/// whether the column refuses NULL.
+async fn declaration_columns(db: &sea_orm::DatabaseConnection) -> Vec<(String, bool)> {
+    db.query_all_raw(Statement::from_string(
+        DbBackend::Sqlite,
+        "PRAGMA table_info(setting_declarations)",
+    ))
+    .await
+    .expect("table_info is readable")
+    .iter()
+    .map(|row| {
+        (
+            row.try_get::<String>("", "name").expect("a column name"),
+            row.try_get::<i64>("", "notnull").expect("a notnull flag") != 0,
+        )
+    })
+    .collect()
+}
+
+#[tokio::test]
+async fn the_display_name_column_is_added_nullable_and_old_rows_read_null() {
+    // A declaration written before the column existed has no label, and must
+    // read as "unset" rather than as an empty string, or the surface would
+    // start emitting a blank `display_name` for every pre-existing setting.
+    let db = Database::connect("sqlite::memory:")
+        .await
+        .expect("in-memory sqlite connects");
+    let total = u32::try_from(Migrator::migrations().len()).expect("a small list");
+    Migrator::up(&db, Some(total - 1))
+        .await
+        .expect("everything before the display-name migration applies");
+    assert!(
+        !declaration_columns(&db)
+            .await
+            .iter()
+            .any(|(name, _)| name == "display_name"),
+        "the column must not exist before its migration"
+    );
+
+    db.execute_unprepared(
+        "INSERT INTO categories (id, key, name, created_at, updated_at)
+         VALUES ('cat', 'network', 'Network', '1970-01-01 00:00:00', '1970-01-01 00:00:00')",
+    )
+    .await
+    .expect("category seeds");
+    db.execute_unprepared(
+        "INSERT INTO setting_declarations
+           (id, key, leaf_slug, value_type_id, category_id, default_value,
+            scope_class, mode, status, data_classification, source,
+            last_change_at, created_at, updated_at, created_by)
+         VALUES ('old-id',
+                 'gts.cf.core.settings.setting_type.v1~acme.settings.network.old.v1~',
+                 'old', 'gts.cf.core.settings.type_bool_flag.v1~', 'cat', 'true', 'local',
+                 'standard', 'active', 'public', 'admin_authored',
+                 '1970-01-01 00:00:00', '1970-01-01 00:00:00',
+                 '1970-01-01 00:00:00', 'fixture')",
+    )
+    .await
+    .expect("a row from before the column seeds");
+
+    Migrator::up(&db, None)
+        .await
+        .expect("the display-name migration applies");
+
+    let columns = declaration_columns(&db).await;
+    let column = columns
+        .iter()
+        .find(|(name, _)| name == "display_name")
+        .expect("the display_name column exists after the migration");
+    assert!(!column.1, "display_name must be nullable");
+
+    let row = db
+        .query_one_raw(Statement::from_string(
+            DbBackend::Sqlite,
+            "SELECT display_name FROM setting_declarations WHERE id = 'old-id'",
+        ))
+        .await
+        .expect("readable")
+        .expect("the old row is still there");
+    assert_eq!(
+        row.try_get::<Option<String>>("", "display_name")
+            .expect("a nullable column"),
+        None,
+        "a row from before the column reads NULL"
+    );
+}
+
+#[tokio::test]
+async fn sqlite_gets_no_trigram_index_for_display_name() {
+    // The trigram index is a PostgreSQL extension feature; SQLite has no such
+    // thing, and a migration that tried to create it there would fail to boot.
+    let db = Database::connect("sqlite::memory:")
+        .await
+        .expect("in-memory sqlite connects");
+    Migrator::up(&db, None).await.expect("migrations apply");
+
+    let found = db
+        .query_all_raw(Statement::from_string(
+            DbBackend::Sqlite,
+            "SELECT name FROM sqlite_master
+             WHERE type = 'index' AND name = 'idx_declarations_display_name_trgm'",
+        ))
+        .await
+        .expect("readable");
+    assert!(
+        found.is_empty(),
+        "SQLite must not carry the PostgreSQL-only trigram index"
+    );
+}
+
 #[test]
 fn no_domain_table_is_created_here() {
     // DECOMPOSITION entry 2.1: "Migration harness and shared schema
@@ -113,3 +224,73 @@ fn no_domain_table_is_created_here() {
 /// The initial migration's own source, so the assertion above reads what ships
 /// rather than a copy that could drift from it.
 const MIGRATION_SOURCE: &str = include_str!("m20260812_000001_initial.rs");
+
+#[tokio::test]
+async fn rolling_the_display_name_migration_back_drops_the_column_and_keeps_the_row() {
+    // A rollback has to take only the label: the declaration it was written on
+    // survives with every other column, and applying the migration again adds
+    // the column back empty rather than resurrecting the dropped text.
+    let db = Database::connect("sqlite::memory:")
+        .await
+        .expect("in-memory sqlite connects");
+    Migrator::up(&db, None).await.expect("migrations apply");
+    db.execute_unprepared(
+        "INSERT INTO categories (id, key, name, created_at, updated_at)
+         VALUES ('cat', 'network', 'Network', '1970-01-01 00:00:00', '1970-01-01 00:00:00')",
+    )
+    .await
+    .expect("category seeds");
+    db.execute_unprepared(
+        "INSERT INTO setting_declarations
+           (id, key, leaf_slug, value_type_id, category_id, default_value,
+            scope_class, mode, status, data_classification, source,
+            last_change_at, created_at, updated_at, created_by, display_name)
+         VALUES ('row-id',
+                 'gts.cf.core.settings.setting_type.v1~acme.settings.network.kept.v1~',
+                 'kept', 'gts.cf.core.settings.type_bool_flag.v1~', 'cat', 'true', 'local',
+                 'standard', 'active', 'public', 'admin_authored',
+                 '1970-01-01 00:00:00', '1970-01-01 00:00:00',
+                 '1970-01-01 00:00:00', 'fixture', 'Kept label')",
+    )
+    .await
+    .expect("a labelled row seeds");
+
+    Migrator::down(&db, Some(1)).await.expect("one step back");
+
+    assert!(
+        !declaration_columns(&db)
+            .await
+            .iter()
+            .any(|(name, _)| name == "display_name"),
+        "the rollback drops the column"
+    );
+    let row = db
+        .query_one_raw(Statement::from_string(
+            DbBackend::Sqlite,
+            "SELECT leaf_slug, default_value FROM setting_declarations WHERE id = 'row-id'",
+        ))
+        .await
+        .expect("readable")
+        .expect("the declaration survived the rollback");
+    assert_eq!(
+        row.try_get::<String>("", "leaf_slug").expect("slug"),
+        "kept",
+        "the other columns are intact"
+    );
+
+    Migrator::up(&db, None).await.expect("re-applied");
+    let row = db
+        .query_one_raw(Statement::from_string(
+            DbBackend::Sqlite,
+            "SELECT display_name FROM setting_declarations WHERE id = 'row-id'",
+        ))
+        .await
+        .expect("readable")
+        .expect("the declaration is still there");
+    assert_eq!(
+        row.try_get::<Option<String>>("", "display_name")
+            .expect("a nullable column"),
+        None,
+        "the column comes back empty"
+    );
+}

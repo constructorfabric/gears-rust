@@ -654,7 +654,9 @@ where
     /// A page of declarations for the administrative browse, under the
     /// caller's scope constraints and administrative-domain visibility, with
     /// the settings `hidden` for the caller — whose root-to-self chain is
-    /// `hidden_for` — left out in the query, so the page comes back full.
+    /// `hidden_for` — left out in the query, so the page comes back full. With
+    /// `flagged_at`, only the settings whose own override at that tenant is
+    /// flagged for review — narrowed in the same query.
     ///
     /// # Errors
     /// [`DomainError::Validation`] on an unmapped field or unsupported
@@ -664,11 +666,12 @@ where
         conn: &C,
         scope: &AccessScope,
         hidden_for: &[Uuid],
+        flagged_at: Option<Uuid>,
         query: &toolkit_odata::ODataQuery,
     ) -> Result<crate::domain::odata::Listing<Declaration>, DomainError> {
         let visible = crate::domain::category::visibility::domain_visibility(scope);
         self.declarations
-            .list(conn, scope, &visible, hidden_for, query)
+            .list(conn, scope, &visible, hidden_for, flagged_at, query)
             .await
     }
 
@@ -694,26 +697,53 @@ where
             .await
     }
 
-    /// The overrides flagged for review among `declaration_ids` at any of
-    /// `tenant_ids` — the administrative needs-review listing.
+    /// Which of `keys` name a declaration the caller may see — the page's own
+    /// three gates (grant, administrative domain, `hidden` on the caller's
+    /// chain `hidden_for`), in one read.
     ///
     /// # Errors
     /// [`DomainError`] when the read fails.
-    pub async fn flagged_overrides<C: DBRunner>(
+    pub async fn visible_keys<C: DBRunner>(
         &self,
         conn: &C,
-        declaration_ids: &[Uuid],
-        tenant_ids: &[Uuid],
-        limit: usize,
-    ) -> Result<Vec<StoredValue>, DomainError> {
-        self.values
-            .list_flagged(
-                conn,
-                &AccessScope::allow_all(),
-                declaration_ids,
-                tenant_ids,
-                limit,
-            )
+        scope: &AccessScope,
+        hidden_for: &[Uuid],
+        keys: &[String],
+    ) -> Result<Vec<String>, DomainError> {
+        let visible = crate::domain::category::visibility::domain_visibility(scope);
+        self.declarations
+            .visible_keys(conn, scope, &visible, hidden_for, keys)
+            .await
+    }
+
+    /// A page of the override rows flagged for review at the request's tenants
+    /// — the review listing — in (declaration, tenant) order under a keyset
+    /// cursor, the declarations' visibility, `hidden` exclusion, grant and
+    /// selectors applied in the query.
+    ///
+    /// # Errors
+    /// [`DomainError::Validation`] on a cursor that does not decode or was
+    /// minted for another listing; [`DomainError`] when the read fails.
+    pub async fn review_page<C: DBRunner>(
+        &self,
+        conn: &C,
+        request: &crate::domain::value::ReviewRequest<'_>,
+    ) -> Result<toolkit_odata::Page<StoredValue>, DomainError> {
+        self.values.list_review(conn, request).await
+    }
+
+    /// The declarations with these ids, in one read — the rows of a page
+    /// already passed the visibility predicates, so none is withheld here.
+    ///
+    /// # Errors
+    /// [`DomainError`] when the read fails.
+    pub async fn declarations_by_ids<C: DBRunner>(
+        &self,
+        conn: &C,
+        ids: &[Uuid],
+    ) -> Result<Vec<Declaration>, DomainError> {
+        self.declarations
+            .find_by_ids(conn, &AccessScope::allow_all(), ids)
             .await
     }
 

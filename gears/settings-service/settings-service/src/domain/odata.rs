@@ -107,27 +107,33 @@ impl FilterField for DeclarationOrderField {
     }
 }
 
-/// The fields `GET /categories` orders by: its filter fields less the optional
-/// `domain_affinity`, for the reason [`DeclarationOrderField`] gives.
+/// The fields `GET /categories` orders by: its filter fields (`key`, `name`,
+/// `sort_order`) less the optional `domain_affinity`, for the reason
+/// [`DeclarationOrderField`] gives.
 #[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CategoryOrderField {
     Key,
     Name,
+    SortOrder,
 }
 
 impl FilterField for CategoryOrderField {
-    const FIELDS: &'static [Self] = &[Self::Key, Self::Name];
+    const FIELDS: &'static [Self] = &[Self::Key, Self::Name, Self::SortOrder];
 
     fn name(&self) -> &'static str {
         match self {
             Self::Key => "key",
             Self::Name => "name",
+            Self::SortOrder => "sort_order",
         }
     }
 
     fn kind(&self) -> FieldKind {
-        FieldKind::String
+        match self {
+            Self::Key | Self::Name => FieldKind::String,
+            Self::SortOrder => FieldKind::I64,
+        }
     }
 }
 
@@ -158,6 +164,33 @@ impl FilterField for SettingOrderField {
             Self::Key => FieldKind::String,
             Self::CategoryId => FieldKind::Uuid,
         }
+    }
+}
+
+/// The fields the review listing is keyset-paged by: the order is fixed —
+/// declaration, then tenant, which `uq_value_scope` makes unique for
+/// subject-less rows — and these are not a surface a caller can order by
+/// (`$orderby` is refused), only what the cursor carries. Both are non-null
+/// identifiers and compare as UUIDs.
+#[domain_model]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ReviewOrderField {
+    DeclarationId,
+    TenantId,
+}
+
+impl FilterField for ReviewOrderField {
+    const FIELDS: &'static [Self] = &[Self::DeclarationId, Self::TenantId];
+
+    fn name(&self) -> &'static str {
+        match self {
+            Self::DeclarationId => "declaration_id",
+            Self::TenantId => "tenant_id",
+        }
+    }
+
+    fn kind(&self) -> FieldKind {
+        FieldKind::Uuid
     }
 }
 

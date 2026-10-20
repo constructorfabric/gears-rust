@@ -34,13 +34,17 @@ pub struct SearchHitDto {
     pub declaration_id: Uuid,
     /// The setting's leaf name.
     pub leaf_slug: String,
+    /// The declaration's display name, when it has one; omitted when unset,
+    /// never derived from `leaf_slug`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
     /// The declaration's description, when it has one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     /// The category the setting is filed under.
     pub category: SearchCategoryDto,
-    /// Which field matched: `key`, `description`, `category_name`,
-    /// `default_value` or `value`.
+    /// Which field matched: `key`, `display_name`, `description`,
+    /// `category_name`, `default_value` or `value`.
     pub matched_field: String,
     /// `standard` or `advanced`, from the declaration. A tag for grouping,
     /// never a filter — no hit is withheld by it.
@@ -54,8 +58,8 @@ pub struct SearchHitDto {
     pub tenant_id: Option<Uuid>,
     /// The matched stored value — the override for a `value` hit, the Schema
     /// Default for a `default_value` hit — masked by classification exactly
-    /// as a read would mask it. Absent for a hit on the key, description or
-    /// category name.
+    /// as a read would mask it. Absent for a hit on the key, display name,
+    /// description or category name.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub value: Option<Value>,
 }
@@ -104,6 +108,7 @@ pub fn render_hit(hit: &Hit, root: Uuid, may_read_pii: bool) -> SearchHitDto {
         key: d.key.clone(),
         declaration_id: d.id,
         leaf_slug: d.leaf_slug.clone(),
+        display_name: d.display_name.clone(),
         description: d.description.clone(),
         category,
         matched_field: hit.matched.as_str().to_owned(),

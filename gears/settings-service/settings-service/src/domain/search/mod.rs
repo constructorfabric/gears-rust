@@ -2,8 +2,8 @@
 //! Cross-field search over the settings hub: what may be matched, and how.
 //!
 //! Search runs over **stored rows**, never resolved values (DESIGN §4.2
-//! *Search*): a declaration's key, description and category name, its Schema
-//! Default, and the overrides explicitly set inside the caller's visible
+//! *Search*): a declaration's key, display name, description and category
+//! name, its Schema Default, and the overrides explicitly set inside the caller's visible
 //! subtree. Authorization is applied to the **corpus** before matching, not to
 //! the output, because a match's existence, a count and a hit each disclose
 //! content on their own. This module holds the vocabulary that rule is stated
@@ -154,6 +154,7 @@ impl Corpus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum MatchedField {
     Key,
+    DisplayName,
     Description,
     CategoryName,
     DefaultValue,
@@ -166,6 +167,7 @@ impl MatchedField {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Key => "key",
+            Self::DisplayName => "display_name",
             Self::Description => "description",
             Self::CategoryName => "category_name",
             Self::DefaultValue => "default_value",
@@ -223,6 +225,8 @@ pub struct SearchRequest<'a> {
     pub needle: &'a Needle,
     /// The classifications the caller may match against.
     pub corpus: Corpus,
+    /// The tenant the search is made at: where `flagged_only` looks.
+    pub target: Uuid,
     /// The target and its non-standalone descendants: where an override may
     /// be matched.
     pub tenant_ids: &'a [Uuid],
@@ -232,9 +236,9 @@ pub struct SearchRequest<'a> {
     /// The most matching override rows a page fetches; more than that and the
     /// search is refused rather than cut short of its hits.
     pub override_limit: usize,
-    /// `needs_review eq true`: only settings with an override flagged for
-    /// review at one of the tenants — a narrowing of the corpus, in the page
-    /// query, where browse switches its listing instead.
+    /// `needs_review eq true`: only settings whose own override at the target
+    /// (`target`) is flagged for review: a narrowing in the page query, the
+    /// one the browse applies.
     pub flagged_only: bool,
     /// Page size, cursor, the declaration-selecting `$filter` remainder and
     /// the binding the cursor must carry.
@@ -266,7 +270,7 @@ pub fn too_many_hits(limit: usize) -> DomainError {
 #[async_trait]
 pub trait SearchRepository: Send + Sync {
     /// A page of **active** declarations, ordered by key, that match the
-    /// request's needle on key, description, the name of their category, their
+    /// request's needle on key, display name, description, the name of their category, their
     /// Schema Default (within the corpus and not JSON `null`), or an override
     /// explicitly set at one of the request's tenants (within the corpus,
     /// never a secret row). The scope and visibility narrow the page as they

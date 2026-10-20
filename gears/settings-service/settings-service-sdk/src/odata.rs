@@ -14,10 +14,11 @@ use toolkit_odata_macros::ODataFilterable;
 
 /// The filterable surface of a category.
 ///
-/// Deliberately narrow. `description` and `icon` are presentation, and
-/// `sort_order` is an ordering weight rather than something to select on; none
-/// of them answers a question an administrator asks of a list. A field can be
-/// added later without breaking a caller, whereas removing one cannot.
+/// Deliberately narrow. `description` and `icon` are presentation and answer no
+/// question an administrator asks of a list, so they are left out. `sort_order`
+/// is declared because the listing orders by it; a declared field is filterable
+/// as well. A field can be added later without breaking a caller, whereas
+/// removing one cannot.
 #[derive(ODataFilterable)]
 pub struct CategoryQuery {
     /// The stable slug — an exact-match lookup by the key a setting embeds.
@@ -32,6 +33,11 @@ pub struct CategoryQuery {
     /// listing is built around.
     #[odata(filter(kind = "String"))]
     pub domain_affinity: String,
+
+    /// The display weight. Declared so the listing can order by it, and
+    /// therefore also filterable.
+    #[odata(filter(kind = "I64"))]
+    pub sort_order: i64,
 }
 
 /// The generated filter-field enum for categories.
@@ -89,8 +95,10 @@ pub use DeclarationQueryFilterField as DeclarationFilterField;
 /// Written by hand rather than derived because `needs_review` is a boolean and
 /// the derive knows only strings and UUIDs. The three fields are the whole
 /// vocabulary: `category_id` and `key` select declarations — `key in (…)` is
-/// the bulk read by key set — and `needs_review eq true` switches the listing
-/// to the flagged override rows in the caller's subtree. `tenant` is resolution
+/// the bulk read by key set — and `needs_review eq true` narrows the page to
+/// the settings whose own override at the target tenant is flagged for review;
+/// the rows themselves, across the target's subtree, are the review listing's,
+/// which takes the same grammar without `needs_review`. `tenant` is resolution
 /// context and deliberately not a field here: it is a query parameter, so a
 /// filter on it is refused as unknown rather than silently narrowing a page.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -122,3 +130,40 @@ impl toolkit_odata::filter::FilterField for SettingFilterField {
         }
     }
 }
+
+/// The filter surface of the review listing:
+/// `GET /settings-service/v1/settings/review`.
+///
+/// Browse's grammar without `needs_review`: every row the listing serves is
+/// flagged for review already, so the field selects nothing there and is
+/// refused rather than accepted as a no-op. `category_id` and `key` select
+/// declarations exactly as they do on browse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ReviewFilterField {
+    /// The full setting key.
+    Key,
+    /// The owning category.
+    CategoryId,
+}
+
+impl toolkit_odata::filter::FilterField for ReviewFilterField {
+    const FIELDS: &'static [Self] = &[Self::Key, Self::CategoryId];
+
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Key => "key",
+            Self::CategoryId => "category_id",
+        }
+    }
+
+    fn kind(&self) -> toolkit_odata::filter::FieldKind {
+        match self {
+            Self::Key => toolkit_odata::filter::FieldKind::String,
+            Self::CategoryId => toolkit_odata::filter::FieldKind::Uuid,
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "odata_tests.rs"]
+mod odata_tests;

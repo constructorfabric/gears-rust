@@ -154,7 +154,10 @@ impl<R: DeclarationRepository> DeclarationService<R> {
         let visible = visibility::domain_visibility(scope);
         // The declaration surface is the platform administrator's; no tenant
         // restriction hides a declaration from it, only the domain visibility.
-        let page = self.repo.list(conn, scope, &visible, &[], query).await?;
+        let page = self
+            .repo
+            .list(conn, scope, &visible, &[], None, query)
+            .await?;
         Ok(Listing {
             items: self.render(page.items).await,
             page_info: page.page_info,

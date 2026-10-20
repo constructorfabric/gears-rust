@@ -51,9 +51,11 @@ pub fn register_routes(
         .summary("List settings categories")
         .description(
             "List categories visible to the caller, ordered by sort order then name. \
-             Supports OData `$filter` over `key`, `name` and `domain_affinity`, and \
-             `$orderby` over `key` and `name`, with cursor pagination; `page_info.total_count` \
-             is how many categories the whole listing holds. `$orderby` over \
+             Supports OData `$filter` over `key`, `name`, `domain_affinity` and \
+             `sort_order`, and `$orderby` over `key`, `name` and `sort_order`, each `asc` or \
+             `desc`, with cursor pagination; the default order is sort order then name, and \
+             `name` is appended as the tiebreaker unless it is already named; \
+             `page_info.total_count` is how many categories the whole listing holds. `$orderby` over \
              `domain_affinity` is refused: it may be empty, and a page cursor cannot carry \
              an empty value. `$select` is not supported and is rejected rather than ignored. \
              Each category carries `setting_count`, `advanced_count` and `retired_count` -- \

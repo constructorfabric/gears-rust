@@ -181,7 +181,7 @@ impl<R: SearchRepository> SearchService<R> {
 }
 
 /// The field a declaration-level hit is attributed to: the first that contains
-/// the needle, in the order a client is told about them — key, description,
+/// the needle, in the order a client is told about them — key, display name, description,
 /// category name, Schema Default. `None` when none does, which is the case
 /// for a declaration on the page only because an override matched.
 ///
@@ -197,6 +197,13 @@ pub fn declaration_match(
     // @cpt-begin:cpt-cf-settings-service-algo-search-discoverability-attribution:p2:inst-sd-attr-1
     if needle.matches(&declaration.key) {
         return Some(MatchedField::Key);
+    }
+    if declaration
+        .display_name
+        .as_deref()
+        .is_some_and(|d| needle.matches(d))
+    {
+        return Some(MatchedField::DisplayName);
     }
     if declaration
         .description

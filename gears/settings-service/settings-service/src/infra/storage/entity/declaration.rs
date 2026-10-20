@@ -96,6 +96,9 @@ pub struct Model {
     /// overrides remain, excluded from resolution.
     pub status: String,
 
+    /// Optional human-readable label, 1..256 characters, never derived.
+    pub display_name: Option<String>,
+
     /// Optional long-form description.
     pub description: Option<String>,
 

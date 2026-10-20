@@ -144,6 +144,7 @@ pub async fn search_settings(
                 visibility: &domain_visibility,
                 needle: &needle,
                 corpus,
+                target: target_tenant,
                 tenant_ids: &tenant_ids,
                 hidden_for: &caller_chain,
                 override_limit: SEARCH_OVERRIDE_LIMIT,

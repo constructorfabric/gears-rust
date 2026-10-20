@@ -9,7 +9,7 @@ use toolkit_security::AccessScope;
 use uuid::Uuid;
 
 use toolkit_db::odata::LimitCfg;
-use toolkit_odata::{ODataQuery, SortDir};
+use toolkit_odata::{ODataOrderBy, ODataQuery, OrderKey, SortDir};
 
 use crate::domain::category::visibility::DomainVisibility;
 use crate::domain::category::{
@@ -319,17 +319,29 @@ impl CategoryRepository for CategoryRepo {
         }
         // @cpt-end:cpt-cf-settings-service-algo-category-management-visibility-filter:p1:inst-cat-visfilter-4
 
-        // Tiebreaker is `name`, which is unique, so a page boundary can neither
-        // repeat nor skip a row.
+        // @cpt-begin:cpt-cf-settings-service-flow-category-management-list:p1:inst-cat-list-7
+        // A request with neither `$orderby` nor a cursor gets `sort_order asc`
+        // injected as its order. A continuation carries its order inside the
+        // cursor and must not be touched, or the page boundary would move.
         //
-        // Note this is the *whole* default order, not a tiebreaker after
-        // `sort_order`: `ensure_tiebreaker` appends, and every order key must
-        // resolve through `CategoryFilterField`, which deliberately omits
-        // `sort_order`. The FEATURE asks for `sort_order` then `name`
-        // (`inst-cat-list-7`); delivering that means declaring `sort_order` on
-        // the OData surface, which is a decision the narrow-surface rule in
-        // `settings-service-sdk/src/odata.rs` owns. Left unimplemented and
-        // unticked rather than quietly redefined.
+        // The paginator appends the `name asc` tiebreaker when `name` is not
+        // already an order key. `name` is unique, so a page boundary can
+        // neither repeat nor skip a row; the default order is therefore
+        // `sort_order asc, name asc`, and a caller's `$orderby` is passed
+        // through unchanged with the same tiebreaker behind it.
+        let default_ordered;
+        let query = if query.order.is_empty() && query.cursor.is_none() {
+            let mut q = query.clone();
+            q.order = ODataOrderBy(vec![OrderKey {
+                field: "sort_order".to_owned(),
+                dir: SortDir::Asc,
+            }]);
+            default_ordered = q;
+            &default_ordered
+        } else {
+            query
+        };
+        // @cpt-end:cpt-cf-settings-service-flow-category-management-list:p1:inst-cat-list-7
         // @cpt-begin:cpt-cf-settings-service-flow-category-management-list:p1:inst-cat-list-4
         // @cpt-begin:cpt-cf-settings-service-flow-category-management-list:p1:inst-cat-list-5
         // @cpt-begin:cpt-cf-settings-service-flow-category-management-list:p1:inst-cat-list-8
@@ -345,7 +357,9 @@ impl CategoryRepository for CategoryRepo {
             scope,
             conn,
             query,
+            // @cpt-begin:cpt-cf-settings-service-flow-category-management-list:p1:inst-cat-list-7
             ("name", SortDir::Asc),
+            // @cpt-end:cpt-cf-settings-service-flow-category-management-list:p1:inst-cat-list-7
             CATEGORY_LIMIT_CFG,
             |m: category::Model| m,
         )

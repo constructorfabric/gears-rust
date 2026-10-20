@@ -37,6 +37,80 @@ async fn create(h: &RestHarness, key: &str, name: &str) -> (String, String) {
     (id, etag)
 }
 
+/// Create a category with an explicit ordering weight.
+async fn create_weighted(h: &RestHarness, key: &str, name: &str, sort_order: i32) {
+    let answer = h
+        .send(
+            "POST",
+            CATEGORIES,
+            Some(json!({ "key": key, "name": name, "sort_order": sort_order })),
+            None,
+            h.inner.tree.root,
+        )
+        .await;
+    assert_eq!(answer.status, 201, "{}", answer.body);
+}
+
+/// Three categories whose weight disagrees with their name: `beta` and `zeta`
+/// weigh 1, `alpha` weighs 2, so ordering by weight is not ordering by name and
+/// a listing that dropped the weight would be caught.
+async fn create_weighted_trio(h: &RestHarness) {
+    create_weighted(h, "alpha", "Alpha", 2).await;
+    create_weighted(h, "beta", "Beta", 1).await;
+    create_weighted(h, "zeta", "Zeta", 1).await;
+}
+
+/// The keys of a listing page, with the harness's own `network` fixture left out.
+fn weighted_keys(body: &Value) -> Vec<String> {
+    body["items"]
+        .as_array()
+        .expect("a page")
+        .iter()
+        .filter_map(|c| c["key"].as_str())
+        .filter(|key| *key != "network")
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Follow a listing two rows at a time and answer every page's keys, in order.
+///
+/// The harness's `network` fixture is kept, because it decides where the page
+/// boundary falls: callers assert that the `beta`/`zeta` tie straddles it, so
+/// the cursor has to carry the tiebreak. A continuation sends the cursor alone:
+/// the cursor carries the order it was minted under, and the platform refuses
+/// `$orderby` beside it.
+async fn pages_across(h: &RestHarness, query: &str) -> Vec<Vec<String>> {
+    let mut pages = Vec::new();
+    let mut uri = format!("{CATEGORIES}?limit=2{query}");
+    for page in 0..6 {
+        let (status, body) = h.get(&uri, h.inner.tree.root).await;
+        assert_eq!(status, 200, "page {page}: {body}");
+        pages.push(
+            body["items"]
+                .as_array()
+                .expect("a page")
+                .iter()
+                .filter_map(|c| c["key"].as_str())
+                .map(str::to_owned)
+                .collect(),
+        );
+        match body["page_info"]["next_cursor"].as_str() {
+            Some(cursor) => uri = format!("{CATEGORIES}?limit=2&cursor={cursor}"),
+            None => return pages,
+        }
+    }
+    panic!("the listing did not end within six pages: {pages:?}");
+}
+
+/// Assert the pages are exactly `expected`, so a tie split by a boundary is visible.
+fn assert_pages(pages: &[Vec<String>], expected: &[&[&str]], why: &str) {
+    let want: Vec<Vec<String>> = expected
+        .iter()
+        .map(|p| p.iter().map(|k| (*k).to_owned()).collect())
+        .collect();
+    assert_eq!(pages, want.as_slice(), "{why}: {pages:?}");
+}
+
 // ── Create ───────────────────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -232,7 +306,7 @@ async fn the_listing_refuses_the_odata_option_it_does_not_implement() {
 async fn the_listing_refuses_to_order_by_a_column_that_may_be_empty() {
     // `domain_affinity` is optional, and a page cursor has no spelling for an
     // empty sort value: the second page would be refused. It is not offered
-    // for ordering; the name and the key are.
+    // for ordering; the name, the key and the weight are.
     let h = RestHarness::new().await;
     let answer = h
         .send(
@@ -250,7 +324,7 @@ async fn the_listing_refuses_to_order_by_a_column_that_may_be_empty() {
         "{}",
         answer.body
     );
-    for field in ["name", "key"] {
+    for field in ["name", "key", "sort_order"] {
         let answer = h
             .send(
                 "GET",
@@ -282,6 +356,156 @@ async fn the_listing_carries_the_categories_that_exist() {
     assert!(keys.contains(&"billing"), "{keys:?}");
     assert!(keys.contains(&"logging"), "{keys:?}");
     assert!(keys.contains(&"network"), "{keys:?}");
+}
+
+#[tokio::test]
+async fn the_listing_defaults_to_weight_then_name() {
+    // Weight is the order an administrator curated; name only breaks a tie.
+    // `alpha` sorts first by name but weighs most, so it must come last here.
+    let h = RestHarness::new().await;
+    create_weighted_trio(&h).await;
+
+    let (status, body) = h.get(CATEGORIES, h.inner.tree.root).await;
+    assert_eq!(status, 200, "{body}");
+    let keys = weighted_keys(&body);
+    assert_eq!(
+        keys,
+        vec!["beta", "zeta", "alpha"],
+        "weight first, name within a weight: {keys:?}"
+    );
+}
+
+#[tokio::test]
+async fn ordering_by_sort_order_ascending_is_the_default_order() {
+    let h = RestHarness::new().await;
+    create_weighted_trio(&h).await;
+
+    let (status, default) = h.get(CATEGORIES, h.inner.tree.root).await;
+    assert_eq!(status, 200, "{default}");
+    let (status, explicit) = h
+        .get(
+            &format!("{CATEGORIES}?$orderby=sort_order%20asc"),
+            h.inner.tree.root,
+        )
+        .await;
+    assert_eq!(status, 200, "{explicit}");
+    assert_eq!(
+        weighted_keys(&explicit),
+        weighted_keys(&default),
+        "an explicit ascending weight is what the listing does anyway"
+    );
+    assert_eq!(weighted_keys(&explicit), vec!["beta", "zeta", "alpha"]);
+}
+
+#[tokio::test]
+async fn ordering_by_sort_order_descending_reverses_the_weights_but_not_the_ties() {
+    // Only the weight flips; equal weights stay in name order so the listing is
+    // total and a cursor can resume inside a tie.
+    let h = RestHarness::new().await;
+    create_weighted_trio(&h).await;
+
+    let (status, body) = h
+        .get(
+            &format!("{CATEGORIES}?$orderby=sort_order%20desc"),
+            h.inner.tree.root,
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(weighted_keys(&body), vec!["alpha", "beta", "zeta"]);
+}
+
+#[tokio::test]
+async fn a_descending_weight_order_holds_across_pages_when_a_tie_straddles_the_boundary() {
+    // With `limit=2` the pages are `alpha, beta` and `zeta, network`: `beta` and
+    // `zeta` weigh the same and the boundary falls between them, so the cursor
+    // must resume inside the tie rather than skip or repeat it.
+    let h = RestHarness::new().await;
+    create_weighted_trio(&h).await;
+
+    let pages = pages_across(&h, "&$orderby=sort_order%20desc").await;
+    assert_pages(
+        &pages,
+        &[&["alpha", "beta"], &["zeta", "network"]],
+        "the tie straddles the boundary and no row is lost or repeated",
+    );
+}
+
+#[tokio::test]
+async fn the_default_order_holds_across_pages_when_a_tie_straddles_the_boundary() {
+    // The harness's `network` fixture weighs 0 and is served first, so the pages
+    // are `network, beta` and `zeta, alpha`: the `beta`/`zeta` tie straddles the
+    // boundary.
+    let h = RestHarness::new().await;
+    create_weighted_trio(&h).await;
+
+    let pages = pages_across(&h, "").await;
+    assert_pages(
+        &pages,
+        &[&["network", "beta"], &["zeta", "alpha"]],
+        "the tie straddles the boundary and no row is lost or repeated",
+    );
+}
+
+#[tokio::test]
+async fn a_filter_on_sort_order_narrows_to_that_weight() {
+    let h = RestHarness::new().await;
+    create_weighted_trio(&h).await;
+
+    let (status, body) = h
+        .get(
+            &format!("{CATEGORIES}?$filter=sort_order%20eq%201"),
+            h.inner.tree.root,
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(weighted_keys(&body), vec!["beta", "zeta"]);
+}
+
+#[tokio::test]
+async fn a_fractional_weight_in_a_filter_is_truncated_by_the_shared_odata_library() {
+    // This is toolkit-db behaviour inherited through the declared I64 kind: the
+    // library truncates `1.9` to `1`. It is recorded here so a change in the
+    // library is noticed, not because the gear endorses the behaviour.
+    let h = RestHarness::new().await;
+    create_weighted_trio(&h).await;
+
+    let (status, body) = h
+        .get(
+            &format!("{CATEGORIES}?$filter=sort_order%20eq%201.9"),
+            h.inner.tree.root,
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        weighted_keys(&body),
+        vec!["beta", "zeta"],
+        "`eq 1.9` answers the weight-1 page, as `eq 1` does"
+    );
+}
+
+#[tokio::test]
+async fn naming_the_tiebreaker_already_is_accepted_without_breaking_the_cursor() {
+    // `name` is already an order key here, so the service must not append it a
+    // second time: a duplicated key makes the cursor ambiguous.
+    let h = RestHarness::new().await;
+    create_weighted_trio(&h).await;
+    let query = "&$orderby=sort_order%20desc,name%20asc";
+
+    let (status, body) = h
+        .get(
+            &format!("{CATEGORIES}?$orderby=sort_order%20desc,name%20asc"),
+            h.inner.tree.root,
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(weighted_keys(&body), vec!["alpha", "beta", "zeta"]);
+
+    let pages = pages_across(&h, query).await;
+    assert_pages(
+        &pages,
+        &[&["alpha", "beta"], &["zeta", "network"]],
+        "one boundary followed, the tie straddling it",
+    );
 }
 
 // ── Update ───────────────────────────────────────────────────────────────────

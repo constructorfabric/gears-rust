@@ -68,6 +68,9 @@ pub struct Declaration {
     /// The contributing module, for module-contributed declarations.
     pub owner_module: Option<String>,
 
+    /// Optional human-readable label; never derived from `leaf_slug`.
+    pub display_name: Option<String>,
+
     /// Optional long-form description.
     pub description: Option<String>,
 
@@ -134,6 +137,8 @@ pub struct DeclarationDraft {
     pub owner_module: Option<String>,
     /// The licence feature gating the setting, if any.
     pub licence_feature: Option<String>,
+    /// Human-readable label, trimmed.
+    pub display_name: Option<String>,
     /// Human-readable description.
     pub description: Option<String>,
     /// The principal or module that created the row.
@@ -149,6 +154,9 @@ pub struct DeclarationDraft {
 pub struct DeclarationMetadata {
     /// `standard` or `advanced`.
     pub mode: String,
+    /// Human-readable label, trimmed. Presentation only: it never moves
+    /// `last_change_at`.
+    pub display_name: Option<String>,
     /// Human-readable description.
     pub description: Option<String>,
     /// The administrative domain, if any.
@@ -348,7 +356,9 @@ pub trait DeclarationRepository: Send + Sync {
     /// List declarations for the caller, leaving out those `hidden` for the
     /// tenant whose root-to-self chain is `hidden_for` — in the query, so the
     /// page is cut and counted after the exclusion. An empty chain excludes
-    /// nothing. The listing carries the size of the whole filtered set.
+    /// nothing. The listing carries the size of the whole filtered set. With
+    /// `flagged_at`, only the declarations whose own override at that tenant
+    /// is flagged for review — also in the query.
     ///
     /// # Errors
     /// [`DomainError::Validation`] when the query names an unmapped field, uses
@@ -359,8 +369,36 @@ pub trait DeclarationRepository: Send + Sync {
         scope: &AccessScope,
         visibility: &DomainVisibility,
         hidden_for: &[Uuid],
+        flagged_at: Option<Uuid>,
         query: &ODataQuery,
     ) -> Result<Listing<Declaration>, DomainError>;
+
+    /// Which of `keys` name a declaration the caller may see: within the
+    /// caller's grant and administrative domains and not `hidden` on the
+    /// chain `hidden_for` — the three gates of [`Self::list`], in one read
+    /// however many keys are asked.
+    ///
+    /// # Errors
+    /// [`DomainError`] when the read fails.
+    async fn visible_keys<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        visibility: &DomainVisibility,
+        hidden_for: &[Uuid],
+        keys: &[String],
+    ) -> Result<Vec<String>, DomainError>;
+
+    /// The declarations with these ids, in one read.
+    ///
+    /// # Errors
+    /// [`DomainError`] when the read fails.
+    async fn find_by_ids<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        ids: &[Uuid],
+    ) -> Result<Vec<Declaration>, DomainError>;
 
     /// Count the declarations of each of `category_ids` as [`Self::list`]
     /// would list them for the same caller — the same scope, visibility and
