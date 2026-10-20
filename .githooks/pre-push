@@ -1,0 +1,107 @@
+#!/bin/sh
+# pre-push hook, auto-installed by any `make` run (see install.sh). Checks what the push adds vs main.
+set -eu
+# The symlink may live in a hooks dir shared by many repos (global core.hooksPath):
+# no-op outside gears-rust, and always run the current repo's own copy (stdin is kept).
+root=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0
+[ -f "$root/.githooks/lib.sh" ] || exit 0
+# Local git config is installation state that the repo's tracked files cannot provide.
+[ "$(git config --local --bool --get gears.hooks 2>/dev/null)" = true ] || exit 0
+# Re-exec this clone's own copy once (`test -ef` is not POSIX, so an env flag stops the recursion).
+[ -n "${GEARS_HOOK_SELF:-}" ] || { GEARS_HOOK_SELF=1; export GEARS_HOOK_SELF; exec "$root/.githooks/pre-push" "$@"; }
+cd "$root"
+. "$root/.githooks/lib.sh"
+HOOK_CMD=push
+
+zeros=0000000000000000000000000000000000000000
+IFS='
+'
+set -f
+
+# pkg_of <file>: name of the nearest enclosing non-root Cargo package, if any.
+pkg_of() {
+    d=$(dirname "$1")
+    while [ "$d" != "." ] && [ "$d" != "/" ]; do
+        if [ -f "$d/Cargo.toml" ] && grep -q '^\[package\]' "$d/Cargo.toml"; then
+            sed -n '/^\[package\]/,/^\[/s/^name *= *"\(.*\)".*/\1/p' "$d/Cargo.toml" | head -n 1
+            return
+        fi
+        d=$(dirname "$d")
+    done
+}
+
+check_ref() {
+    sha=$1
+    base_ref=origin/main
+    git rev-parse --verify -q "$base_ref" >/dev/null || base_ref=main
+    git rev-parse --verify -q "$base_ref" >/dev/null || { echo "hook: skipping all checks: neither origin/main nor main found"; return 0; }
+    base=$(git merge-base "$sha" "$base_ref") || { echo "hook: skipping all checks: no merge-base with $base_ref"; return 0; }
+    # paths containing newlines are not supported
+    changed=$(git -c core.quotePath=false diff --name-only "$base" "$sha")
+    [ -n "$changed" ] || return 0
+
+    pkgs=""
+    for f in $changed; do
+        p=$(pkg_of "$f")
+        [ -z "$p" ] || pkgs="$pkgs
+$p"
+    done
+    pkgs=$(printf '%s\n' "$pkgs" | sed '/^$/d' | sort -u)
+
+    # Root files that change what every package compiles with: clippy the whole workspace
+    ws_re='^(Cargo\.toml|Cargo\.lock|clippy\.toml|rust-toolchain\.toml|\.cargo/config(\.toml)?)$'
+    ws=""
+    ! printf '%s\n' "$changed" | grep -Eq "$ws_re" || ws=1
+
+    # by design these check the working tree (a snapshot worktree would rebuild the workspace
+    # on every push); CI is the gate
+    tree_ok=1
+    if [ "$sha" != "$(git rev-parse HEAD)" ]; then
+        echo "hook: skipping clippy and dylint: pushed $(git rev-parse --short "$sha") is not the checked-out HEAD (they check the working tree)"
+        tree_ok=""
+    elif [ -n "$(git status --porcelain --untracked-files=no -- '*.rs' '*Cargo.toml' Cargo.lock)" ]; then
+        echo "hook: note: uncommitted Rust/Cargo changes; clippy and dylint check the working tree, not exactly the pushed commit"
+    fi
+
+    # clippy also surfaces compile errors; flags mirror CI (CLIPPY_FLAGS in .gears-dna/gears.mk)
+    if [ -n "$tree_ok" ] && { [ -n "$pkgs" ] || [ -n "$ws" ]; } \
+        && need clippy clippy "rustup component add clippy"; then
+        if [ -n "$ws" ]; then
+            step clippy
+            cargo clippy --workspace --all-targets --all-features -- -D warnings -D clippy::perf ||
+                fail clippy "run: cargo clippy --workspace --all-targets --all-features"
+        else
+            # IFS is newline-only here, so build the -p list as positional args
+            set --
+            pflags=""
+            for p in $pkgs; do set -- "$@" -p "$p"; pflags="$pflags-p $p "; done
+            step clippy
+            cargo clippy "$@" --all-targets --all-features -- -D warnings -D clippy::perf ||
+                fail clippy "run: cargo clippy ${pflags}--all-targets --all-features"
+        fi
+    fi
+
+    # Workspace-wide, as `make dylint` (cargo-gears has no CI-equivalent package filter)
+    if [ -n "$tree_ok" ] \
+        && printf '%s\n' "$changed" | grep -Eq '(\.rs|(^|/)Cargo\.toml)$|^(Cargo\.lock|clippy\.toml|rust-toolchain\.toml|\.cargo/config(\.toml)?)$' \
+        && need dylint cargo-gears "cargo install --locked cargo-gears"; then
+        step dylint
+        cargo gears lint --dylint || fail dylint "run: make dylint"
+    fi
+
+    # the script needs jq, bash >= 4 (mapfile) and grep -P; macOS ships bash 3.2 and BSD grep
+    if need forbidden-words jq "brew install jq / apt install jq" \
+        && need forbidden-words "bash>=4" "brew install bash" \
+        && need forbidden-words "grep -P" "brew install grep"; then
+        step forbidden-words
+        .github/scripts/check-forbidden-words.sh "$base" "$sha" ||
+            fail forbidden-words "remove the forbidden words reported above"
+    fi
+}
+
+while IFS=' ' read -r _lref lsha _rref _rsha; do
+    [ "$lsha" != "$zeros" ] || continue
+    check_ref "$lsha"
+done
+
+finish

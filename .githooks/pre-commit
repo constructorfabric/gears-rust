@@ -1,0 +1,75 @@
+#!/bin/sh
+# pre-commit hook, auto-installed by any `make` run (see install.sh). Checks staged files only.
+set -eu
+# The symlink may live in a hooks dir shared by many repos (global core.hooksPath):
+# no-op outside gears-rust, and always run the current repo's own copy.
+root=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0
+[ -f "$root/.githooks/lib.sh" ] || exit 0
+# Local git config is installation state that the repo's tracked files cannot provide.
+[ "$(git config --local --bool --get gears.hooks 2>/dev/null)" = true ] || exit 0
+# Re-exec this clone's own copy once (`test -ef` is not POSIX, so an env flag stops the recursion).
+[ -n "${GEARS_HOOK_SELF:-}" ] || { GEARS_HOOK_SELF=1; export GEARS_HOOK_SELF; exec "$root/.githooks/pre-commit" "$@"; }
+cd "$root"
+. "$root/.githooks/lib.sh"
+HOOK_CMD=commit
+
+# Newline-separated path lists; split on newlines only, no globbing
+# (paths containing newlines are not supported).
+IFS='
+'
+set -f
+staged=$(git -c core.quotePath=false diff --cached --name-only --diff-filter=ACMR)
+[ -n "$staged" ] || exit 0
+pick() { printf '%s\n' "$staged" | grep -E "$1" || true; }
+
+# rustfmt checks the staged blob of each file (from the repo root, so rustfmt.toml applies)
+fmt_check() {
+    rc=0
+    for f in $rs; do
+        # stdin mode may exit 0 even when it prints a diff, so also look for the diff itself
+        if ! out=$(git show ":$f" | rustfmt --check --edition 2024 2>&1) || printf '%s\n' "$out" | grep -q '^Diff in '; then
+            printf '%s\n%s\n' "$f" "$out"
+            rc=1
+        fi
+    done
+    return "$rc"
+}
+rs=$(pick '\.rs$')
+if [ -n "$rs" ] && need rustfmt rustfmt "rustup component add rustfmt"; then
+    step rustfmt
+    fmt_check || fail rustfmt "run: cargo fmt"
+fi
+
+# cfs and lychee below judge the working-tree copy by design: link targets and CFS artifacts
+# are whole-tree properties; CI checks the commit.
+# CFS: `cfs validate` only. `make cfs-validate` runs `cfs init --yes` first,
+# which rewrites files and must not happen mid-commit.
+cfs=$(pick '^(\.cf-studio/|\.cf-studio-kit\.toml$|studio-kit-gears/.*\.md$|docs/.*\.md$|gears/.*/docs/.*\.md$|libs/.*/docs/.*\.md$)')
+if [ -n "$cfs" ] && need cfs cfs "pipx install git+https://github.com/constructorfabric/studio.git"; then
+    step cfs
+    cfs validate || fail cfs "run: cfs validate and fix the reported artifacts"
+fi
+
+# lychee, offline: catches broken relative links / missing files without network
+md=$(pick '\.md$' | grep -v '^docs/web-docs/' || true)
+if [ -n "$md" ] && need lychee lychee "cargo install lychee"; then
+    set --
+    for f in $md; do set -- "$@" "$f"; done
+    step lychee
+    lychee --offline --no-progress --config lychee.toml "$@" || fail lychee "fix the broken links above"
+fi
+
+# CRLF (same rule as .github/workflows/crlf-check.yml)
+crlf_check() {
+    set --
+    for f in $nonwin; do set -- "$@" "$f"; done
+    bad=$(git ls-files --eol -- "$@" | grep 'i/crlf' || true)
+    [ -z "$bad" ] || { printf '%s\n' "$bad"; return 1; }
+}
+nonwin=$(printf '%s\n' "$staged" | grep -Ev '\.(bat|ps1)$' || true)
+if [ -n "$nonwin" ]; then
+    step crlf
+    crlf_check || fail crlf "convert to LF (dos2unix <file>) and re-stage"
+fi
+
+finish
