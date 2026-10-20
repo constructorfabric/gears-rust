@@ -49,7 +49,7 @@ Chosen option: "Append-only ledger table written in the same transactions", beca
 * The accepted event commits in the acceptance transaction, the finished event in the final transaction, and a refused event in its own transaction before the refusal answers.
 * A refusal whose event cannot be recorded keeps its category and is logged and signalled.
 * Rows hold only the fields of `cpt-cf-application-manager-entity-audit-event-content`, are unrestricted ([ADR 0005](./0005-cpt-cf-application-manager-adr-platform-level-access.md)), and are kept without a purge.
-* Operators read the ledger by direct database access; the gear never reads it.
+* Operators read a request's events through the gear's audit read after a `read_audit` permit; the gear never decides from them.
 
 ### Consequences
 
@@ -59,7 +59,7 @@ Chosen option: "Append-only ledger table written in the same transactions", beca
 
 ### Confirmation
 
-* Inspection: only the operation repository touches the table, and only inserts.
+* Inspection: only the operation repository writes the table, and only inserts.
 * A table-driven test over every outcome category, the interruption step, and the supervisor completion compares ledger rows with operations and refusals, including the digest of an out-of-limit id or version.
 * The accepted event and the operation record commit or fail together, and nothing is dispatched before they commit.
 

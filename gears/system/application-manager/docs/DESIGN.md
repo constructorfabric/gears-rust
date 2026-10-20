@@ -76,6 +76,7 @@ The plugin set is fixed at startup ([ADR 0001](./ADR/0001-cpt-cf-application-man
 | `cpt-cf-application-manager-fr-authentication` | Every route is `.authenticated()`; plugins get a token-less caller identity (`cpt-cf-application-manager-entity-caller-identity`). |
 | `cpt-cf-application-manager-fr-authorization` | Gear-level and plugin-level authorization in [§3.3](#33-api-contracts). |
 | `cpt-cf-application-manager-fr-audit-event` | `cpt-cf-application-manager-dbtable-audit-ledger`, `cpt-cf-application-manager-component-operation-repository`. |
+| `cpt-cf-application-manager-fr-audit-read` | `cpt-cf-application-manager-component-read-service`. |
 | `cpt-cf-application-manager-fr-audit-ordering` | `cpt-cf-application-manager-principle-trace-before-change`. |
 | `cpt-cf-application-manager-interface-seeding` | `cpt-cf-application-manager-interface-rest-api`. |
 | `cpt-cf-application-manager-interface-operations` | `cpt-cf-application-manager-interface-rest-api`. |
@@ -186,7 +187,7 @@ The gear stops waiting for a plugin call at the time limit and never cancels or 
 
 - [ ] `p2` - **ID**: `cpt-cf-application-manager-principle-minimal-state`
 
-The gear keeps only operation records and the audit ledger, and neither holds manifest content. The ledger is a record for people who debug a request; the gear never reads it or decides from it.
+The gear keeps only operation records and the audit ledger, and neither holds manifest content. The ledger is a record for people who debug a request; the gear serves it through the audit read and never decides from it.
 
 **ADRs**: `cpt-cf-application-manager-adr-audit-ledger`, `cpt-cf-application-manager-adr-platform-level-access`
 
@@ -382,9 +383,9 @@ graph LR
 
 **Why**: Reads record no audit event and decide no category, so they stay apart from the orchestrator.
 
-**Scope**: After a `read_schema` or `read_operation` permit, it lists keys from memory, fetches live schemas, or reads one operation record, interrupting it first when expired.
+**Scope**: After a `read_schema` or `read_operation` permit, it lists keys from memory, fetches live schemas, or reads one operation record, interrupting it first when expired. After a `read_audit` permit, it reads the audit events of one request.
 
-**Boundaries**: It caches no schema, never reads the audit ledger, and returns no manifest content or caller subject.
+**Boundaries**: It caches no schema and returns no manifest content or caller subject.
 
 **Related**: `cpt-cf-application-manager-component-operation-repository`, `cpt-cf-application-manager-component-section-plugin-router`, `cpt-cf-application-manager-component-schema-validator`.
 
@@ -432,7 +433,7 @@ graph LR
 
 **Scope**: Runs every storage step and transaction of [§3.6](#36-interactions--sequences) and [§3.7](#37-database-schemas--tables), each bounded by `storage_call_timeout`, and reports "storage cannot answer", "index violated", and "operation final" as distinct results.
 
-**Boundaries**: It decides no category, runs no schedule, and never reads, updates, or deletes a ledger row.
+**Boundaries**: It decides no category, runs no schedule, and never updates or deletes a ledger row.
 
 **Related**: `cpt-cf-application-manager-component-request-orchestrator`, `cpt-cf-application-manager-component-operation-sweeper`.
 
@@ -473,11 +474,12 @@ graph LR
 | `DELETE` | `/application-manager/v1/applications/{application_id}` | Uninstall by id in one percent-encoded segment | `uninstall` |
 | `POST` | `/application-manager/v1/applications:uninstall` | Uninstall with `application_id` in the body | `uninstall` |
 | `GET` | `/application-manager/v1/operations/{operation_id}` | Read one operation | `read_operation` |
+| `GET` | `/application-manager/v1/audit-events?request_id={request_id}` | Audit events of one request | `read_audit` |
 | `GET` | `/application-manager/v1/section-keys` | List section keys in priority order | `read_schema` |
 | `GET` | `/application-manager/v1/section-keys/{section_key}/schema` | One live schema with its schema version | `read_schema` |
 | `GET` | `/application-manager/v1/manifest-schema` | The live combined schema with every schema version | `read_schema` |
 
-All routes are unstable, `.authenticated()`, and `.no_license_required()`; seed, uninstall, the operation read, and the combined-schema read are bound to gateway rate-limit and in-flight zones. An accepted request gets 202 with `operation_id`, `status` `accepted`, and a `Location` header. The operation read returns the record and, once final, the outcome report.
+All routes are unstable, `.authenticated()`, and `.no_license_required()`; seed, uninstall, the operation read, the audit read, and the combined-schema read are bound to gateway rate-limit and in-flight zones. An accepted request gets 202 with `operation_id`, `status` `accepted`, and a `Location` header. The operation read returns the record and, once final, the outcome report.
 
 **Outcome table.** The one normative statement of outcome categories, precedence, and HTTP mapping. The first matching rank decides.
 
@@ -499,7 +501,7 @@ All routes are unstable, `.authenticated()`, and `.no_license_required()`; seed,
 
 Storage is consulted only for a permitted caller. Sections are checked only inside the operation, so a seed with envelope and section problems ends at rank 4 and lists the section problems once the envelope is valid. An interrupted operation has no category. A gear defect is not ranked: the refused event records internal failure. The seeding documentation publishes the Retriable column as the guidance of `cpt-cf-application-manager-fr-response-content`.
 
-**Refusal bodies.** Canonical Problems with no extension member. The `detail` carries the request id; temporarily unavailable carries `REFUSAL_RETRY_AFTER_SECONDS`; not permitted names the action; conflict has reason `application_busy` and names the open operation; invalid manifest lists field violations (location, rule token, message). Reads end as 403, 404 (unknown key, or unknown, malformed, or purged operation id), or 503. Plugin `Internal` text, PDP internals, and storage errors are only logged; plugin `Rejected` and `NotPermitted` detail is returned cut at `PLUGIN_DETAIL_MAX_BYTES`.
+**Refusal bodies.** Canonical Problems with no extension member. The `detail` carries the request id; temporarily unavailable carries `REFUSAL_RETRY_AFTER_SECONDS`; not permitted names the action; conflict has reason `application_busy` and names the open operation; invalid manifest lists field violations (location, rule token, message). Reads end as 403, 404 (unknown key, unknown, malformed, or purged operation id, or unknown or malformed request id), or 503. Plugin `Internal` text, PDP internals, and storage errors are only logged; plugin `Rejected` and `NotPermitted` detail is returned cut at `PLUGIN_DETAIL_MAX_BYTES`.
 
 **Authorization.** Two levels:
 
@@ -512,6 +514,7 @@ Storage is consulted only for a permitted caller. Sections are checked only insi
 | `uninstall` | Uninstall | Both uninstall forms |
 | `read_operation` | Read operations | Read an operation |
 | `read_schema` | Read schemas | The three discovery reads |
+| `read_audit` | Read audit | Read audit events |
 
 - [ ] `p2` - **ID**: `cpt-cf-application-manager-interface-section-plugin-api`
 
@@ -537,7 +540,7 @@ Additive changes within `v1` are compatible; any other change is a new GTS type 
 | Dependency Gear | Interface Used | Purpose |
 |---|---|---|
 | types-registry | `TypesRegistryClient` | Register the plugin GTS type in `init`; list instances once at `start` |
-| authz-resolver | PolicyEnforcer | Decisions for the four actions |
+| authz-resolver | PolicyEnforcer | Decisions for the five actions |
 | api-gateway | Platform REST host | Authentication, `SecurityContext`, request protection, readiness, routing |
 | Section plugin gears | `cpt-cf-application-manager-interface-section-plugin-api` | Keys, schemas, `apply`, `remove` |
 
