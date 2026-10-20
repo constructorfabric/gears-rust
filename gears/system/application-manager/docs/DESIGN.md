@@ -102,7 +102,7 @@ The plugin set is fixed at startup ([ADR 0001](./ADR/0001-cpt-cf-application-man
 |---|---|
 | `cpt-cf-application-manager-adr-section-plugin-fan-out` | Every section plugin takes part; plugins are discovered once at startup. |
 | `cpt-cf-application-manager-adr-plugin-served-section-schemas` | Plugins serve live schemas, fetched on every seed; the whole manifest is validated before dispatch. |
-| `cpt-cf-application-manager-adr-async-operations` | Background operations with a bounded synchronous phase and a run window; plugin calls are abandoned, never cancelled. |
+| `cpt-cf-application-manager-adr-async-operations` | Background operations with a bounded synchronous phase and a run window; a plugin call is stopped at its time limit. |
 | `cpt-cf-application-manager-adr-audit-ledger` | An append-only ledger table written in the transaction of the change it describes. |
 | `cpt-cf-application-manager-adr-platform-level-access` | Platform-level permission with no tenant; unrestricted records. |
 
@@ -135,7 +135,7 @@ The gear uses the platform layer model ([gear layout and SDK pattern](../../../.
 
 ### 2.1 Design Principles
 
-When principles conflict, the earlier one in this list wins: Trace Before Change; Honest, Deterministic Outcomes; Validate Everything, Then Dispatch; Bounded Waiting, No Cancellation; Pass Through, Never Interpret; Plugin Set Fixed at Startup; Minimal State.
+When principles conflict, the earlier one in this list wins: Trace Before Change; Honest, Deterministic Outcomes; Validate Everything, Then Dispatch; Bounded Waiting; Pass Through, Never Interpret; Plugin Set Fixed at Startup; Minimal State.
 
 #### Pass Through, Never Interpret
 
@@ -175,11 +175,11 @@ No plugin receives anything until the operation and its accepted event have comm
 
 Every seed and uninstall ends in exactly one category from the outcome table in [§3.3](#33-api-contracts). The gear fails closed, and every write to an operation is guarded, so an operation has one final state.
 
-#### Bounded Waiting, No Cancellation
+#### Bounded Waiting
 
 - [ ] `p2` - **ID**: `cpt-cf-application-manager-principle-bounded-waiting`
 
-The gear stops waiting for a plugin call at the time limit and never cancels or undoes plugin work. Request tasks are detached from the HTTP request.
+The gear drops a plugin call at the time limit and dispatches the next section. The section plugin keeps its own data consistent, for example with a transaction, and the gear never undoes plugin work. Request tasks are detached from the HTTP request.
 
 **ADRs**: `cpt-cf-application-manager-adr-async-operations`
 
@@ -373,7 +373,7 @@ graph LR
 
 **Scope**: Runs each seed and uninstall as a supervised request task through [§3.6](#36-interactions--sequences), decides the category by the outcome table, and performs the supervisor completion. The task completes even when the HTTP request is dropped.
 
-**Boundaries**: It holds no plugin set or schema logic, writes no table itself, and never cancels, undoes, or resumes work.
+**Boundaries**: It holds no plugin set or schema logic, writes no table itself, and never undoes or resumes work.
 
 **Related**: `cpt-cf-application-manager-component-operation-repository`, `cpt-cf-application-manager-component-schema-validator`, `cpt-cf-application-manager-component-section-plugin-router`.
 
@@ -417,9 +417,9 @@ graph LR
 
 - [ ] `p2` - **ID**: `cpt-cf-application-manager-component-plugin-call-guard`
 
-**Why**: Dropping a timed-out future would cancel it; the guard makes "stop waiting, never cancel" uniform.
+**Why**: One slow plugin must not hold up the rest of the dispatch; the guard makes "drop at the time limit" uniform.
 
-**Scope**: Runs each call detached, waits up to `plugin_call_timeout`, logs a late result by metadata, enforces `plugin_max_in_flight` per plugin (`not_sent`), and turns panics and transport errors into internal errors.
+**Scope**: Runs each call up to `plugin_call_timeout` and drops it at the limit, enforces `plugin_max_in_flight` per plugin (`not_sent`), and turns panics and transport errors into internal errors.
 
 **Boundaries**: It does not decide what a timeout means for its caller.
 
@@ -736,7 +736,7 @@ flowchart LR
     R2 --> DB
 ```
 
-Replicas share only the database, and each runs its own sweeper under the status guard. An operation runs on the replica that accepted it; any replica can read or interrupt it. The healthcheck is not ready until the startup result is published. On `stop`, the gear sets the stopping flag, drains request tasks, stops the sweeper, and drains detached plugin calls until the host's stop deadline.
+Replicas share only the database, and each runs its own sweeper under the status guard. An operation runs on the replica that accepted it; any replica can read or interrupt it. The healthcheck is not ready until the startup result is published. On `stop`, the gear sets the stopping flag, drains request tasks until the host's stop deadline, and stops the sweeper.
 
 ## 4. Additional context
 
@@ -744,7 +744,7 @@ Replicas share only the database, and each runs its own sweeper under the status
 
 **Logs** carry the correlation id, trace id, action, category, section key, and call kind, never section, manifest, or schema content. For application ids and versions, logs carry only the byte length and SHA-256 digest; spans follow the same rule.
 
-**Metrics** count synchronous answers, operations by category and interruption, durations, plugin call timeouts, cap refusals, and late calls, request tasks in flight, audit events recorded and not recorded, unavailable dependencies, unusable schemas, sweeps and purges, and startup failures. Section keys are labels; application and operation ids never are.
+**Metrics** count synchronous answers, operations by category and interruption, durations, plugin call timeouts and cap refusals, request tasks in flight, audit events recorded and not recorded, unavailable dependencies, unusable schemas, sweeps and purges, and startup failures. Section keys are labels; application and operation ids never are.
 
 **Signals** for operator thresholds: audit events not recorded, rising interruptions, repeated timeouts or cap refusals per key, an unusable schema, an unavailable dependency, failing sweeps, request tasks at the cap, a run window margin warning, and a startup failure.
 
@@ -761,7 +761,7 @@ Settings live under `gears.application-manager.config`. Each is required with no
 | `plugin_call_timeout` | Time limit of every plugin call; unit of the run window | Positive duration |
 | `run_window_margin` | Added to the run window | Positive, at least 2 × `storage_call_timeout` |
 | `operation_retention` | Lifetime of a final operation record | Positive duration |
-| `plugin_max_in_flight` | Calls in flight per plugin instance, detached ones included | Positive integer |
+| `plugin_max_in_flight` | Calls in flight per plugin instance | Positive integer |
 | `max_request_tasks` | Seed and uninstall request tasks per replica | Positive integer |
 | `max_envelope_text_length` | Maximum bytes of the application id and version | Positive, at most `APPLICATION_ID_MAX_BYTES` |
 | `pdp_call_timeout` | Deadline of one PDP decision | Positive duration |
@@ -777,7 +777,7 @@ Constants: `APPLICATION_ID_MAX_BYTES`, `SCHEMA_VERSION_MAX_BYTES`, `SERVED_SCHEM
 
 - **Eager plugin discovery**: every plugin instance is discovered once at `start`, with no lazy resolution or `choose_plugin_instance` ([ADR 0001](./ADR/0001-cpt-cf-application-manager-adr-section-plugin-fan-out.md); platform plugin model owners).
 - **Platform-level access**: unrestricted entities and tenant-free PDP decisions ([ADR 0005](./ADR/0005-cpt-cf-application-manager-adr-platform-level-access.md); authz-resolver and secure ORM owners).
-- **Detached work**: plugin calls and request tasks do not take the shutdown token, because plugin work is never cancelled (ToolKit lifecycle owners).
+- **Detached work**: request tasks do not take the shutdown token, so an accepted operation is not cut short by a stop (ToolKit lifecycle owners).
 - **Hand-implemented lifecycle**: the gear implements `RunnableCapability`, so a failed startup check fails the start phase (ToolKit lifecycle owners).
 - **In-process plugins only**, until the platform guarantees plugins register before dependants start (platform plugin model owners).
 - **Gateway deadline**: the gateway does not expose its 30s deadline, so the gear pins it as `GATEWAY_REQUEST_DEADLINE` (api-gateway owners).
