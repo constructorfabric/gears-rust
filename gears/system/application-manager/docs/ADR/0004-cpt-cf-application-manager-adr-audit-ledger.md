@@ -61,6 +61,7 @@ Chosen option: "Append-only ledger table written in the same transactions", beca
 
 * Inspection: only the operation repository writes the table, and only inserts.
 * A table-driven test over every outcome category, the interruption step, and the supervisor completion compares ledger rows with operations and refusals, including the digest of an out-of-limit id or version.
+* A failure-injection test: when a refused event cannot be recorded, the refusal keeps its category and the missing event is logged and signalled; every other refusal leaves a refused event.
 * The accepted event and the operation record commit or fail together, and nothing is dispatched before they commit.
 
 ## Pros and Cons of the Options
