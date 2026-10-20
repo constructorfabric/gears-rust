@@ -15,6 +15,7 @@ use toolkit_security::AccessScope;
 use uuid::Uuid;
 
 use crate::domain::category::DomainVisibility;
+use crate::domain::declaration::kinds::{DataClassification, DeclarationStatus};
 use crate::domain::error::DomainError;
 use crate::domain::odata::Listing;
 
@@ -98,6 +99,28 @@ pub struct Declaration {
 
     /// Row version, refreshed by every write including metadata edits.
     pub updated_at: time::OffsetDateTime,
+}
+
+impl Declaration {
+    /// The lifecycle status. A stored status that is neither `active` nor
+    /// `retired` reads as retired — fail closed, so it never resolves.
+    #[must_use]
+    pub fn status(&self) -> DeclarationStatus {
+        DeclarationStatus::from_stored(&self.status)
+    }
+
+    /// Whether the declaration is active.
+    #[must_use]
+    pub fn is_active(&self) -> bool {
+        self.status().is_active()
+    }
+
+    /// The data classification. A stored class that is none of the three
+    /// reads as `secret` — fail closed, so it masks rather than shows.
+    #[must_use]
+    pub fn classification(&self) -> DataClassification {
+        DataClassification::from_stored(&self.data_classification)
+    }
 }
 
 /// A declaration about to be inserted, every column decided.
@@ -352,6 +375,26 @@ pub trait DeclarationRepository: Send + Sync {
         scope: &AccessScope,
         category_id: Uuid,
     ) -> Result<Vec<Declaration>, DomainError>;
+
+    /// The active declaration of a category that holds `leaf_slug`, if any —
+    /// the one a revive of a retired declaration with that leaf would collide
+    /// with.
+    ///
+    /// # Errors
+    /// [`DomainError`] when the read fails.
+    async fn find_active_by_leaf<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        category_id: Uuid,
+        leaf_slug: &str,
+    ) -> Result<Option<Declaration>, DomainError> {
+        Ok(self
+            .find_by_category(conn, scope, category_id)
+            .await?
+            .into_iter()
+            .find(|d| d.status == "active" && d.leaf_slug == leaf_slug))
+    }
 
     /// List declarations for the caller, leaving out those `hidden` for the
     /// tenant whose root-to-self chain is `hidden_for` — in the query, so the

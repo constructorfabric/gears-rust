@@ -2,10 +2,15 @@
 //! Setting declarations.
 
 pub mod admin;
+pub mod kinds;
 pub mod repo;
 pub mod service;
 
-pub use admin::{CreateDeclaration, Created, DeclarationAdmin, FieldClass};
+pub use admin::{
+    CreateDeclaration, Created, DeclarationAdmin, FieldClass, NOTHING_TO_REVIVE, RevivalPlan,
+    RevivalReadGate, RevivalReport, RevivalRow, Walk, strictest_classification,
+};
+pub use kinds::{DataClassification, DeclarationStatus, UnknownKind};
 pub use repo::{
     CategoryTally, Declaration, DeclarationDraft, DeclarationMetadata, DeclarationRepository,
 };

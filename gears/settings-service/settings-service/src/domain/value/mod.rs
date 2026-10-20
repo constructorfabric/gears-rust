@@ -91,6 +91,32 @@ pub struct StoredValue {
     pub set_by: String,
 }
 
+/// The columns of a subject-less row that a revival report's listing reads —
+/// the tenant, the value and the classification — and nothing else.
+#[domain_model]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListedValue {
+    /// The tenant whose scope the value is set at.
+    pub tenant_id: Uuid,
+    /// The inline value; `None` for a secret, held by reference.
+    pub value: Option<Value>,
+    /// The classification the row is stored under.
+    pub data_classification: String,
+}
+
+/// One distinct `(value, classification)` of a declaration's rows over a set
+/// of tenants, with how many rows hold it.
+#[domain_model]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DistinctValue {
+    /// The inline value; `None` for the secret rows, held by reference.
+    pub value: Option<Value>,
+    /// The classification the rows are stored under.
+    pub data_classification: String,
+    /// How many rows hold this pair.
+    pub count: u64,
+}
+
 /// What a write supplies to create a row.
 #[domain_model]
 #[derive(Debug, Clone, PartialEq, Eq)]

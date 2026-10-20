@@ -131,6 +131,17 @@ impl From<DomainError> for CanonicalError {
                     .with_resource(resource)
                     .create()
             }
+            // The revival report's own 404, told from a missing category's by
+            // its stable code in the resource name; it says nothing more of
+            // why, so a retired declaration the caller may not read answers
+            // as one that is not there.
+            DomainError::NotFound { resource }
+                if resource == crate::domain::declaration::NOTHING_TO_REVIVE =>
+            {
+                SettingsResource::not_found("nothing_to_revive: no retired declaration to revive")
+                    .with_resource(resource)
+                    .create()
+            }
             DomainError::NotFound { resource } => {
                 SettingsResource::not_found(format!("no such {resource}"))
                     .with_resource(resource)

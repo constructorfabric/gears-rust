@@ -417,6 +417,25 @@ impl DeclarationRepository for DeclarationRepo {
         Ok(rows.into_iter().map(to_domain).collect())
     }
 
+    async fn find_active_by_leaf<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        category_id: Uuid,
+        leaf_slug: &str,
+    ) -> Result<Option<Declaration>, DomainError> {
+        let found = DeclarationEntity::find()
+            .filter(declaration::Column::CategoryId.eq(category_id))
+            .filter(declaration::Column::LeafSlug.eq(leaf_slug))
+            .filter(declaration::Column::Status.eq("active"))
+            .secure()
+            .scope_with(scope)
+            .one(conn)
+            .await
+            .map_err(db_error)?;
+        Ok(found.map(to_domain))
+    }
+
     async fn list<C: DBRunner>(
         &self,
         conn: &C,

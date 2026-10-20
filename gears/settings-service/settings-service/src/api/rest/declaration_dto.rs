@@ -274,6 +274,61 @@ pub struct CreatedDeclarationDto {
     pub evolved: bool,
 }
 
+/// One retained value a revive of the retired declaration would re-validate.
+#[derive(Debug, Clone, PartialEq)]
+#[toolkit_macros::api_dto(response)]
+pub struct RevivalValueDto {
+    /// The tenant the value is stored at.
+    pub tenant_id: uuid::Uuid,
+    /// Its scope path: `/` for the root tenant, `/tenants/{id}` otherwise.
+    pub scope: String,
+    /// The stored value, or the mask token when `masked`.
+    #[schema(value_type = Value)]
+    pub value: Value,
+    /// Whether the value is the mask token rather than the stored value.
+    pub masked: bool,
+    /// Whether a revive would flag the value, and why; the detail is
+    /// withheld whenever the value is masked.
+    #[serde(flatten)]
+    pub review: NeedsReviewDto,
+}
+
+/// A review verdict on one value: whether it is flagged, and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[toolkit_macros::api_dto(response)]
+pub struct NeedsReviewDto {
+    /// Whether a revive would flag the value: it no longer validates against
+    /// the type. A secret is never flagged, and a value flagged earlier that
+    /// validates again is reported clear.
+    pub needs_review: bool,
+    /// Why, when `needs_review`; absent whenever the value is masked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub needs_review_detail: Option<String>,
+}
+
+/// What a revive of a retired declaration would do to the values it retained:
+/// advisory, stored nowhere, and not consulted by the revive.
+#[derive(Debug, Clone, PartialEq)]
+#[toolkit_macros::api_dto(response)]
+pub struct RevivalReportDto {
+    /// The declaration's key.
+    pub key: String,
+    /// The retired declaration's id.
+    pub declaration_id: uuid::Uuid,
+    /// The first `limit` retained values within the caller's administration,
+    /// in the walk's breadth-first order.
+    pub values: Vec<RevivalValueDto>,
+    /// How many retained values were found, listed or not.
+    pub total: u64,
+    /// How many of them a revive would flag.
+    pub total_needs_review: u64,
+    /// How many tenants were walked, the caller's own included.
+    pub scanned: u64,
+    /// `false` when the subtree node budget cut the walk: the counts are then
+    /// lower bounds.
+    pub complete: bool,
+}
+
 #[cfg(test)]
 #[path = "declaration_dto_tests.rs"]
 mod declaration_dto_tests;
