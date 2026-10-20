@@ -403,11 +403,11 @@ Every refusal and every operation report **MUST** carry the outcome category, wh
 
 - [ ] `p1` - **ID**: `cpt-cf-application-manager-fr-bounded-plugin-calls`
 
-The system **MUST** apply one configurable time limit to every section-plugin call. It **MUST NOT** cancel or undo work that a section plugin has started. A section that exceeds the time limit **MUST** count as an internal failure, and dispatch **MUST** continue with the remaining sections.
+The system **MUST** apply one configurable time limit to every section-plugin call and **MUST** stop a call that exceeds it. A section that exceeds the time limit **MUST** count as an internal failure, and dispatch **MUST** continue with the remaining sections. Keeping a section's data consistent when its call is stopped is the section plugin's responsibility, for example by doing its work in one transaction.
 
 - **Rationale**: One slow section plugin must not hang a whole request, and operators must be able to tune the limit.
 - **Actors**: `cpt-cf-application-manager-actor-operator`
-- **Verification Method**: Inspection: the section plugin contract offers no way to cancel or undo work.
+- **Verification Method**: Test: a section plugin that exceeds the time limit has its call stopped, its section ends as an internal failure, and the next section is dispatched.
 
 #### Dependency Failures at Run Time
 
