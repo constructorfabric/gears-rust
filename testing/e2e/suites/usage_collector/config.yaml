@@ -1,6 +1,6 @@
 # E2E configuration for the usage-collector gear.
 #
-# Used by `make e2e-usage-collector-timescaledb` (and so by the
+# Used by `make e2e-usage-collector BACKEND=timescaledb` (and so by the
 # `make e2e-usage-collector` aggregate), which builds a dedicated binary and
 # starts a TimescaleDB container. NOT part of config/e2e-features.txt or the
 # shared `make e2e-local` run. Colocated with the suite (its conftest loads it)

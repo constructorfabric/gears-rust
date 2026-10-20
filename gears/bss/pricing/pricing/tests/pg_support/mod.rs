@@ -93,7 +93,7 @@
 //! so this gear's suites do not normally contend for the shared server; two
 //! concurrent `cargo test` invocations would." **The premise was true and the
 //! conclusion was not**, because nothing runs this tier with `cargo test`:
-//! `make test-pricing-pg` runs `cargo nextest`, and nextest gives every *test*
+//! `make test-integration LANE=pricing-pg` runs `cargo nextest`, and nextest gives every *test*
 //! its own process. It is not four binaries in sequence contending never — it is
 //! as many processes as the runner has cores, racing for one fixed container
 //! name, on every run.

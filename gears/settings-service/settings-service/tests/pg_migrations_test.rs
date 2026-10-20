@@ -15,7 +15,7 @@
 //! stand's startup goes through, so what applies here is what boots. Docker
 //! required: without it the suite skips, unless
 //! `SETTINGS_SERVICE_PG_REQUIRE_DOCKER=1` turns the skip into a failure, as CI
-//! sets it. Run via `make test-settings-service-pg` or:
+//! sets it. Run via `make test-integration LANE=settings-service-pg` or:
 //!
 //! ```sh
 //! cargo nextest run -p cf-gears-settings-service --features integration --test pg_migrations_test

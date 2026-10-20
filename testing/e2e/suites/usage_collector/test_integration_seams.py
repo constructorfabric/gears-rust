@@ -3,7 +3,7 @@
 Each test targets exactly one seam that only manifests over real HTTP against
 a real storage backend. Storage SQL, aggregation internals, domain validation
 and DTO conversion are covered by unit tests and by
-`make test-usage-collector-pg` — not here.
+`make test-integration LANE=usage-collector-pg` — not here.
 
 Backend-agnostic by construction: these bodies talk HTTP only, and
 `make e2e-usage-collector` runs the whole module against both the TimescaleDB

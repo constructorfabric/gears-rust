@@ -8,7 +8,7 @@
 //!
 //! # Why not a container per test
 //!
-//! `make test-usage-collector-ch` runs under nextest, which gives every *test*
+//! `make test-integration LANE=usage-collector-ch` runs under nextest, which gives every *test*
 //! its own process. A container per test was some seventy `clickhouse-server`
 //! boots per run, and on a machine running several pipelines at once those
 //! boots are what the suite spent its time on. A fresh **database** per test

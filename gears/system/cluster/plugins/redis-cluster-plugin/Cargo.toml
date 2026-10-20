@@ -36,7 +36,7 @@ workspace = true
 # directly; every reference to them lives in `tests/`, so enabling this feature
 # has no effect on the plugin's own compiled artifact. Run with
 # `cargo test -p cf-redis-cluster-plugin --features integration`, or
-# `make test-cluster-redis`.
+# `make test-integration LANE=cluster-redis`.
 integration = ["dep:testcontainers", "dep:testcontainers-modules"]
 
 # Every entry below carries the reason it is here, since several are less

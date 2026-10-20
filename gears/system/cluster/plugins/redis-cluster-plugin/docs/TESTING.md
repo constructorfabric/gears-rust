@@ -3,7 +3,7 @@
 > **Status: implemented, with §8 as the register of what is not.** The suite is
 > **280 tests** — 211 unit, three conformance suites, and the 63 Layer 3 scenarios
 > of §4.2–§4.6 — running green in about ten seconds of test time via
-> `make test-cluster-redis`, which is wired into `ci.yml`'s `integration` job. This
+> `make test-integration LANE=cluster-redis`, which is wired into `ci.yml`'s `integration` job. This
 > is the test plan for `cf-redis-cluster-plugin`, paired with
 > [DESIGN.md](./DESIGN.md), and it originated as the design deliverable of
 > [#4373](https://github.com/constructorfabric/gears-rust/issues/4373).
@@ -549,8 +549,8 @@ with the rest of the suite, so they cost no wall clock against the run as a whol
 | Layer | Trigger | Approx. duration |
 |---|---|---|
 | L1 unit tests | Every PR — `cargo test -p cf-redis-cluster-plugin --lib`, no Docker | 211 tests, sub-second |
-| L2 conformance + L3 integration, over eight single-node shapes plus two multi-node topologies | Every PR touching Rust — `make test-cluster-redis`, in `ci.yml`'s `integration` job | 280 tests total in ~10 s of test time, ~35 s including the build |
-| L3 Sentinel and Cluster topologies (`RD-SPEC-002`, `008..010`, `RD-LOCK-014`) | Every PR, in the same `make test-cluster-redis` run | 5 tests, and **no wall-clock cost** — `nextest` overlaps their containers with the single-node ones, so the suite still finishes in about ten seconds |
+| L2 conformance + L3 integration, over eight single-node shapes plus two multi-node topologies | Every PR touching Rust — `make test-integration LANE=cluster-redis`, in `ci.yml`'s `integration` job | 280 tests total in ~10 s of test time, ~35 s including the build |
+| L3 Sentinel and Cluster topologies (`RD-SPEC-002`, `008..010`, `RD-LOCK-014`) | Every PR, in the same `make test-integration LANE=cluster-redis` run | 5 tests, and **no wall-clock cost** — `nextest` overlaps their containers with the single-node ones, so the suite still finishes in about ten seconds |
 | ~~L4 fault injection and failover~~ (`RD-FAULT-001..008`) | **Never — not built**; §5 and §8 | — |
 
 The 280 are 211 unit tests, 66 Layer 3 test functions, and the three conformance
@@ -561,8 +561,8 @@ two functions — `RD-LIFE-006`'s silent-drop and panicking-drop halves are the
 worked example — so scenario count and test count are deliberately different
 numbers, and this is the only place either is written down.
 
-`make test-cluster-redis` passes `--retries 1`, for the reason
-`make test-cluster-pg` does: container setup is load-sensitive on a busy CI host,
+`make test-integration LANE=cluster-redis` passes `--retries 1`, for the reason
+`make test-integration LANE=cluster-pg` does: container setup is load-sensitive on a busy CI host,
 and a genuine logic regression fails both attempts, so the retry absorbs Docker
 churn without masking one.
 

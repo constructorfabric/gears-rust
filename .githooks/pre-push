@@ -63,7 +63,7 @@ $p"
         echo "hook: note: uncommitted Rust/Cargo changes; clippy and dylint check the working tree, not exactly the pushed commit"
     fi
 
-    # clippy also surfaces compile errors; flags mirror CI (Makefile CLIPPY_FLAGS)
+    # clippy also surfaces compile errors; flags mirror CI (CLIPPY_FLAGS in .gears-dna/gears.mk)
     if [ -n "$tree_ok" ] && { [ -n "$pkgs" ] || [ -n "$ws" ]; } \
         && need clippy clippy "rustup component add clippy"; then
         if [ -n "$ws" ]; then

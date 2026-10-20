@@ -1,5 +1,5 @@
 # Shared helpers for .githooks/pre-commit and .githooks/pre-push (sourced, POSIX sh).
-# Same PATH tweak as the Makefile: pipx installs cfs into ~/.local/bin.
+# Same PATH tweak as .gears-dna/gears.mk: pipx installs cfs into ~/.local/bin.
 PATH="$HOME/.local/bin:$PATH"
 failed=0
 

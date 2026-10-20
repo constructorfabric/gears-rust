@@ -17,7 +17,7 @@ workspace = true
 
 [features]
 # `tests/pg_migrations_test.rs`: the migration chain on a real PostgreSQL via
-# testcontainers, Docker required (`make test-settings-service-pg`). Brings the
+# testcontainers, Docker required (`make test-integration LANE=settings-service-pg`). Brings the
 # PostgreSQL driver in for that lane only; the lib leaves the backend to the
 # server that hosts it.
 integration = ["toolkit-db/pg"]

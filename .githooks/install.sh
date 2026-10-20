@@ -3,7 +3,7 @@
 # and records the opt-in marker `gears.hooks=true` in this clone's local git config.
 # Usage: install.sh [--quiet | --uninstall]
 # Installs missing links only; never overwrites a real file. No-op when GEARS_NO_HOOKS=1,
-# in CI, or outside a git work tree. --quiet never fails (the Makefile auto-install runs it).
+# in CI, or outside a git work tree. --quiet never fails (the gears-rust.mk auto-install runs it).
 mode=${1:-}
 [ -z "${GEARS_NO_HOOKS:-}" ] && [ -z "${CI:-}" ] || [ "$mode" = "--uninstall" ] || exit 0
 top=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0

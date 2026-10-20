@@ -42,7 +42,7 @@
 //! (container lifetime via an owned `Drop`, why skipping is right locally
 //! but wrong in CI).
 //!
-//! Requires the `integration` feature. Run via `make test-rg-pg` or:
+//! Requires the `integration` feature. Run via `make test-integration LANE=rg-pg` or:
 //!
 //! ```sh
 //! cargo nextest run -p cf-gears-resource-group --features integration --test pg_smoke_test
