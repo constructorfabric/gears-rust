@@ -22,7 +22,7 @@ pub const SECRET_TYPE_PROP: &str = "secret_type";
 pub const REFERENCE_PROP: &str = "reference";
 
 /// The row properties a PDP may constrain besides the tenant.
-pub const ROW_PROPS: [&str; 2] = [SECRET_TYPE_PROP, REFERENCE_PROP];
+const ROW_PROPS: [&str; 2] = [SECRET_TYPE_PROP, REFERENCE_PROP];
 
 // ── Scope algebra over the tenant and row properties ────────────────────────
 

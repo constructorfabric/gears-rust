@@ -6,14 +6,14 @@ use toolkit_db::contention::is_retryable_contention;
 
 /// Backend-agnostic adapter. Probes `PostgreSQL` and `SQLite` (the two
 /// supported backends); `MySQL` is unsupported.
-pub(crate) fn is_serialization_failure(err: &DbErr) -> bool {
+pub(super) fn is_serialization_failure(err: &DbErr) -> bool {
     is_retryable_contention(DbBackend::Postgres, err)
         || is_retryable_contention(DbBackend::Sqlite, err)
 }
 
 /// Returns `true` iff `err` represents a `CHECK` constraint violation on
 /// either supported backend.
-pub(crate) fn is_check_violation(err: &DbErr) -> bool {
+pub(super) fn is_check_violation(err: &DbErr) -> bool {
     let msg = err.to_string().to_lowercase();
     msg.contains("check constraint")
         || msg.contains("check_violation")
@@ -23,7 +23,7 @@ pub(crate) fn is_check_violation(err: &DbErr) -> bool {
 }
 
 /// Returns `true` iff `err` is a unique-constraint violation.
-pub(crate) fn is_unique_violation(err: &DbErr) -> bool {
+pub(super) fn is_unique_violation(err: &DbErr) -> bool {
     matches!(
         err.sql_err(),
         Some(sea_orm::SqlErr::UniqueConstraintViolation(_))
