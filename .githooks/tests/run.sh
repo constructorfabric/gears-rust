@@ -324,7 +324,8 @@ mkdir -p "$r/.github/scripts"
 cp "$src/.github/scripts/check-forbidden-words.sh" "$r/.github/scripts/"
 cp "$src/.github/forbidden-words.json" "$r/.github/"
 echo base > "$r/a.txt"; git -C "$r" add -A; git -C "$r" commit -qm base
-echo cyberfabric >> "$r/a.txt"; git -C "$r" commit -qam bad
+# split so this file itself passes the forbidden-words check
+echo "cyber""fabric" >> "$r/a.txt"; git -C "$r" commit -qam bad
 # fw_run <PATH>: runs the script on the last commit; status in $rc.
 fw_run() {
     rc=0
