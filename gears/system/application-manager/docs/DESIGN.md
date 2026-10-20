@@ -742,7 +742,7 @@ Replicas share only the database, and each runs its own sweeper under the status
 
 ### 4.1 Observability
 
-**Logs** carry the correlation id, trace id, action, application id and version, category, section key, and call kind, never section, manifest, or schema content. Ids and versions are escaped and cut at `LOG_TEXT_MAX_BYTES`, with length and SHA-256 digest; spans follow the same rule.
+**Logs** carry the correlation id, trace id, action, category, section key, and call kind, never section, manifest, or schema content. For application ids and versions, logs carry only the byte length and SHA-256 digest; spans follow the same rule.
 
 **Metrics** count synchronous answers, operations by category and interruption, durations, plugin call timeouts, cap refusals, and late calls, request tasks in flight, audit events recorded and not recorded, unavailable dependencies, unusable schemas, sweeps and purges, and startup failures. Section keys are labels; application and operation ids never are.
 
