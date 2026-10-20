@@ -30,7 +30,8 @@ use crate::domain::record_intake::{
 };
 use crate::domain::sensitive_data::{Found, SensitiveDataCheck, SensitiveDataKind, Verdict};
 use crate::domain::subject_settings::{
-    SubjectKey, SubjectSettings, SubjectSettingsReader, SubjectSettingsService, TenantDefaults,
+    SettingsLookup, SubjectKey, SubjectSettings, SubjectSettingsReader, SubjectSettingsService,
+    TenantDefaults,
 };
 use crate::infra::connector_switch::ConfigConnectorSwitch;
 use crate::infra::record_types::RegistryRecordTypes;
@@ -84,6 +85,29 @@ impl AuthZResolverApi for AllowResolver {
                 ..Default::default()
             },
         })
+    }
+}
+
+/// Allows every request like [`AllowResolver`] and adds an owner constraint for
+/// the caller, as a policy that says "owner only" would.
+pub struct OwnerOnlyResolver;
+
+#[async_trait]
+impl AuthZResolverApi for OwnerOnlyResolver {
+    async fn evaluate(
+        &self,
+        ctx: PlatformSecurityContext,
+        request: EvaluationRequest,
+    ) -> Result<EvaluationResponse, CanonicalError> {
+        let caller = request.subject.id;
+        let mut response = AllowResolver.evaluate(ctx, request).await?;
+        for constraint in &mut response.context.constraints {
+            constraint.predicates.push(Predicate::In(InPredicate::new(
+                pep_properties::OWNER_ID,
+                [caller],
+            )));
+        }
+        Ok(response)
     }
 }
 
@@ -203,6 +227,24 @@ pub async fn seed_subject_settings(db: &Db, key: SubjectKey, settings: SubjectSe
     .expect("insert subject settings");
 }
 
+/// A lookup read as "the stored row, or none": for tests whose scope covers
+/// the key, so the lookup is `Stored` or `Absent`.
+pub trait CoveredLookup {
+    fn stored(self) -> Option<SubjectSettings>;
+}
+
+impl CoveredLookup for SettingsLookup {
+    fn stored(self) -> Option<SubjectSettings> {
+        match self {
+            Self::Stored(settings) => Some(settings),
+            Self::Absent => None,
+            Self::Refused(refusal) => {
+                panic!("the scope should cover the key, got {refusal:?}")
+            }
+        }
+    }
+}
+
 /// One request to the policy service: resource type, action, the context
 /// tenant and the tenant named as the owner of the resource.
 pub type AskedOfPolicyService = (String, String, Option<Uuid>, Option<String>);
@@ -292,8 +334,7 @@ pub fn received_chat_record(tenant_id: Uuid, subject_id: Uuid) -> ReceivedRecord
     }
 }
 
-/// One valid record of each derived type: the rolos-cyber examples
-/// (`docs/construct/GTS/examples/valid/`) without their store `id`.
+/// One valid record of each derived type.
 pub fn example_records() -> Vec<serde_json::Value> {
     let subject = "5d1f2c3a-8b4e-4c6d-9a1b-2c3d4e5f6a7b";
     vec![

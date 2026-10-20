@@ -6,20 +6,24 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use authz_resolver_sdk::{
     AuthZResolverApi, PolicyEnforcer,
-    models::{EvaluationRequest, EvaluationResponse},
+    constraints::{Constraint, InPredicate, Predicate},
+    models::{EvaluationRequest, EvaluationResponse, EvaluationResponseContext},
 };
 use toolkit::api::canonical_prelude::CanonicalError;
+use toolkit_db::secure::DBRunner;
 use toolkit_db::{DBProvider, Db};
-use toolkit_security::{PlatformSecurityContext, SecurityContext, pep_properties};
+use toolkit_security::{AccessScope, PlatformSecurityContext, SecurityContext, pep_properties};
 use uuid::Uuid;
 
 use crate::domain::error::DomainError;
 use crate::domain::subject_settings::{
-    SubjectKey, SubjectSettings, SubjectSettingsService, TenantDefaults,
+    Refusal, SettingsLookup, SubjectKey, SubjectSettings, SubjectSettingsRepository,
+    SubjectSettingsService, TenantDefaults, UncheckablePredicate,
 };
 use crate::infra::storage::subject_settings_repo::SeaOrmSubjectSettingsRepository;
 use crate::test_support::{
-    AllowResolver, DenyResolver, context_in, context_of, inmem_db, seed_subject_settings,
+    AllowResolver, DenyResolver, OwnerOnlyResolver, context_in, context_of, inmem_db,
+    seed_subject_settings,
 };
 
 type ConcreteService = SubjectSettingsService<SeaOrmSubjectSettingsRepository>;
@@ -70,9 +74,9 @@ impl TenantDefaults for UnavailableDefaults {
     }
 }
 
-/// One request to the policy service: resource type, action, resource id and
-/// the tenant named as the owner of the resource.
-type AskedOfPolicyService = (String, String, Option<Uuid>, Option<String>);
+/// One request to the policy service: resource type, action, resource id, the
+/// tenant named as the owner of the resource, and its owner.
+type AskedOfPolicyService = (String, String, Option<Uuid>, Option<String>, Option<String>);
 
 /// Records what the service asks the policy service for, then allows it like
 /// `AllowResolver`.
@@ -96,6 +100,12 @@ impl AuthZResolverApi for RecordingResolver {
                 .resource
                 .properties
                 .get(pep_properties::OWNER_TENANT_ID)
+                .and_then(|v| v.as_str())
+                .map(str::to_owned),
+            request
+                .resource
+                .properties
+                .get(pep_properties::OWNER_ID)
                 .and_then(|v| v.as_str())
                 .map(str::to_owned),
         ));
@@ -270,10 +280,11 @@ async fn service_asks_for_the_subject_settings_resource_and_the_tenant() {
     assert_eq!(
         *resolver.asked.lock().unwrap(),
         vec![(
-            "construct.subject_settings".to_owned(),
+            SETTINGS_TYPE.to_owned(),
             "get".to_owned(),
             Some(subject),
             Some(tenant.to_string()),
+            Some(subject.to_string()),
         )]
     );
 }
@@ -488,10 +499,228 @@ async fn a_change_asks_for_the_update_action() {
     assert_eq!(
         asked.first(),
         Some(&(
-            "construct.subject_settings".to_owned(),
+            SETTINGS_TYPE.to_owned(),
             "update".to_owned(),
             Some(subject),
             Some(tenant.to_string()),
+            Some(subject.to_string()),
         ))
+    );
+}
+
+/// The settings' GTS type id, pinned: the policy resource type and the
+/// resource type of the settings routes' errors.
+const SETTINGS_TYPE: &str = "gts.cf.construct.subject.settings.v1~";
+
+#[tokio::test]
+async fn an_owner_only_policy_lets_the_owner_read_and_change() {
+    let db = inmem_db().await;
+    let svc = service_with(&db, Arc::new(OwnerOnlyResolver), StubDefaults::new(true));
+    let (tenant, subject) = (Uuid::new_v4(), Uuid::new_v4());
+    let ctx = context_of(subject, tenant);
+
+    let stored = svc
+        .set_personalization(&ctx, subject, false)
+        .await
+        .expect("the owner constraint covers the owner's row");
+    let read = svc.owner_settings(&ctx, subject).await.expect("read");
+
+    assert_eq!(stored, SubjectSettings::new_subject(false));
+    assert_eq!(read, stored);
+}
+
+/// The read without the owner check, under a policy that constrains on the
+/// caller as owner: another caller's scope cannot hold the subject's row, so the
+/// read is refused instead of answering the tenant's default.
+#[tokio::test]
+async fn an_owner_constraint_for_another_caller_is_refused() {
+    let db = inmem_db().await;
+    let svc = service_with(&db, Arc::new(OwnerOnlyResolver), StubDefaults::new(true));
+    let (tenant, subject) = (Uuid::new_v4(), Uuid::new_v4());
+    seed_subject_settings(
+        &db,
+        SubjectKey {
+            tenant_id: tenant,
+            subject_id: subject,
+        },
+        ERASING,
+    )
+    .await;
+
+    let as_another = svc.settings(&context_in(tenant), subject).await;
+
+    assert_not_covered(as_another, tenant, subject);
+}
+
+/// Allows the request and answers with the one constraint `scope` builds from
+/// it: a policy whose scope may leave out the row the request names.
+struct ScopedResolver(fn(&EvaluationRequest) -> Vec<Predicate>);
+
+#[async_trait]
+impl AuthZResolverApi for ScopedResolver {
+    async fn evaluate(
+        &self,
+        _ctx: PlatformSecurityContext,
+        request: EvaluationRequest,
+    ) -> Result<EvaluationResponse, CanonicalError> {
+        Ok(EvaluationResponse {
+            decision: true,
+            context: EvaluationResponseContext {
+                constraints: vec![Constraint {
+                    predicates: (self.0)(&request),
+                }],
+                ..Default::default()
+            },
+        })
+    }
+}
+
+fn another_tenant(_request: &EvaluationRequest) -> Vec<Predicate> {
+    vec![Predicate::In(InPredicate::new(
+        pep_properties::OWNER_TENANT_ID,
+        [Uuid::new_v4()],
+    ))]
+}
+
+fn another_resource(request: &EvaluationRequest) -> Vec<Predicate> {
+    let tenant = request
+        .resource
+        .properties
+        .get(pep_properties::OWNER_TENANT_ID)
+        .and_then(|v| v.as_str())
+        .and_then(|s| Uuid::parse_str(s).ok())
+        .expect("the request names the owner tenant");
+    vec![
+        Predicate::In(InPredicate::new(pep_properties::OWNER_TENANT_ID, [tenant])),
+        Predicate::In(InPredicate::new(
+            pep_properties::RESOURCE_ID,
+            [Uuid::new_v4()],
+        )),
+    ]
+}
+
+/// The refusal of a read whose scope does not cover the key, recognised by its
+/// message: not any `Forbidden`, which the enforcer's own compile failure would
+/// also give.
+fn assert_not_covered(read: Result<SubjectSettings, DomainError>, tenant: Uuid, subject: Uuid) {
+    match read {
+        Err(DomainError::Forbidden(message)) => {
+            assert!(
+                message.contains("the policy scope does not cover them"),
+                "{message}"
+            );
+            assert!(message.contains(&tenant.to_string()), "{message}");
+            assert!(message.contains(&subject.to_string()), "{message}");
+        }
+        other => panic!("expected the scope refusal, got {other:?}"),
+    }
+}
+
+/// A scope that leaves the key out is refused before anything is read, with or
+/// without a stored row: the answer does not tell whether the subject has
+/// settings.
+#[tokio::test]
+async fn a_scope_that_does_not_cover_the_key_is_refused_with_or_without_a_row() {
+    for leave_out in [another_tenant, another_resource] {
+        for stored in [true, false] {
+            let db = inmem_db().await;
+            let svc = service_with(
+                &db,
+                Arc::new(ScopedResolver(leave_out)),
+                StubDefaults::new(true),
+            );
+            let (tenant, subject) = (Uuid::new_v4(), Uuid::new_v4());
+            if stored {
+                seed_subject_settings(
+                    &db,
+                    SubjectKey {
+                        tenant_id: tenant,
+                        subject_id: subject,
+                    },
+                    ERASING,
+                )
+                .await;
+            }
+
+            let read = svc.settings(&context_in(tenant), subject).await;
+
+            assert_not_covered(read, tenant, subject);
+        }
+    }
+}
+
+/// A repository whose lookup refuses every key as undecidable, to reach the
+/// service's refusal for a predicate the read cannot check.
+struct UndecidableRepository;
+
+#[async_trait]
+impl SubjectSettingsRepository for UndecidableRepository {
+    async fn find<C: DBRunner>(
+        &self,
+        _conn: &C,
+        _scope: &AccessScope,
+        _key: SubjectKey,
+    ) -> Result<SettingsLookup, DomainError> {
+        Ok(SettingsLookup::Refused(Refusal::Undecidable(
+            UncheckablePredicate::TenantSubtree,
+        )))
+    }
+
+    async fn set_personalization<C: DBRunner>(
+        &self,
+        _conn: &C,
+        _scope: &AccessScope,
+        _key: SubjectKey,
+        _personalization_enabled: bool,
+    ) -> Result<(), DomainError> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn an_undecidable_scope_is_refused_with_a_message_naming_the_predicate() {
+    let db = inmem_db().await;
+    let svc = SubjectSettingsService::new(
+        Arc::new(DBProvider::new(db.clone())),
+        Arc::new(UndecidableRepository),
+        StubDefaults::new(true),
+        PolicyEnforcer::new(Arc::new(AllowResolver)),
+    );
+    let (tenant, subject) = (Uuid::new_v4(), Uuid::new_v4());
+    let ctx = context_in(tenant);
+
+    let read = svc.settings(&ctx, subject).await;
+
+    match read {
+        Err(DomainError::Forbidden(message)) => {
+            assert!(message.contains("tenant-subtree predicate"), "{message}");
+            assert!(message.contains(&ctx.subject_id().to_string()), "{message}");
+            assert!(message.contains(&tenant.to_string()), "{message}");
+            assert!(message.contains(&subject.to_string()), "{message}");
+        }
+        other => panic!("expected the undecidable refusal, got {other:?}"),
+    }
+}
+
+/// A write the secure ORM accepted whose read-back the coverage check refuses
+/// means the two disagree: an internal error, not a refusal of the caller.
+#[tokio::test]
+async fn a_refused_read_back_after_an_accepted_write_is_an_internal_error() {
+    let db = inmem_db().await;
+    let svc = SubjectSettingsService::new(
+        Arc::new(DBProvider::new(db.clone())),
+        Arc::new(UndecidableRepository),
+        StubDefaults::new(true),
+        PolicyEnforcer::new(Arc::new(AllowResolver)),
+    );
+    let (tenant, subject) = (Uuid::new_v4(), Uuid::new_v4());
+
+    let change = svc
+        .set_personalization(&context_of(subject, tenant), subject, false)
+        .await;
+
+    assert!(
+        matches!(change, Err(DomainError::Internal(_))),
+        "got {change:?}"
     );
 }

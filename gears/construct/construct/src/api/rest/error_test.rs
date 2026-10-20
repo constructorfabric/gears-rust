@@ -157,8 +157,6 @@ fn unavailable_maps_to_503_without_leaking_detail() {
     assert!(!visible_text(&problem).contains("10.0.0.7"));
 }
 
-const SETTINGS_RESOURCE_TYPE: &str = gts_id!("cf.construct.subject.settings.v1~");
-
 #[test]
 fn settings_errors_about_the_request_name_the_settings_resource() {
     use crate::api::rest::error::for_settings;
@@ -175,7 +173,7 @@ fn settings_errors_about_the_request_name_the_settings_resource() {
                 .context
                 .get("resource_type")
                 .and_then(|v| v.as_str()),
-            Some(SETTINGS_RESOURCE_TYPE),
+            Some(crate::domain::subject_settings::SUBJECT_SETTINGS_TYPE),
             "{label}"
         );
         assert!(!visible_text(&problem).contains("may not read"), "{label}");
