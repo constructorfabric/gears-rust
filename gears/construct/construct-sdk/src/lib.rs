@@ -22,6 +22,7 @@ pub mod api;
 pub mod gts;
 pub mod models;
 pub mod person_types;
+pub mod profile_types;
 pub mod reason;
 
 pub use api::ConstructClientV1;
