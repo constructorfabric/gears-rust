@@ -148,10 +148,6 @@ class Misc(unittest.TestCase):
             s.Gh("o/r", False).write("pr", "merge", "1")
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class HumanEdits(unittest.TestCase):
     def commit(self, login, headline):
         return {"authors": [{"login": login}], "messageHeadline": headline}
@@ -166,3 +162,7 @@ class HumanEdits(unittest.TestCase):
 
     def test_real_human_commit_is_human_edit(self):
         self.assertTrue(s.is_human_edit(self.commit("someone", "fix: adapt call sites")))
+
+
+if __name__ == "__main__":
+    unittest.main()
