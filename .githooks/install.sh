@@ -4,8 +4,8 @@
 # --uninstall records the opt-out `gears.hooks=false`, which --quiet (the auto-install) respects;
 # a plain install.sh sets the marker back to true.
 # Usage: install.sh [--quiet | --uninstall]
-# Installs missing links only; never overwrites a real file. No-op when GEARS_NO_HOOKS=1,
-# in CI, or outside a git work tree. --quiet never fails (the gears-rust.mk auto-install runs it).
+# Installs missing links and refreshes stale copies of our own hooks; never overwrites a foreign
+# file. No-op when GEARS_NO_HOOKS=1, in CI, or outside a git work tree. --quiet never fails (the gears-rust.mk auto-install runs it).
 mode=${1:-}
 [ -z "${GEARS_NO_HOOKS:-}" ] && [ -z "${CI:-}" ] || [ "$mode" = "--uninstall" ] || exit 0
 top=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0
@@ -27,8 +27,8 @@ failed() {
     fail=1
 }
 
-# is_copy <link> <hook>: a regular file identical to our hook (Git Bash's ln -s may copy).
-is_copy() { [ -f "$1" ] && [ ! -L "$1" ] && cmp -s "$1" "$top/.githooks/$2"; }
+# is_ours <file>: a regular file carrying our hook markers, current or stale (Git Bash's ln -s copies).
+is_ours() { [ -f "$1" ] && [ ! -L "$1" ] && grep -q GEARS_HOOK_SELF "$1" && grep -q '\.githooks/lib\.sh' "$1"; }
 
 if [ "$mode" = "--uninstall" ]; then
     git config --local gears.hooks false || failed "gears.hooks marker"
@@ -55,7 +55,7 @@ for h in pre-commit pre-push; do
                 */.githooks/"$h") echo "kept $link -> $target (not this clone)"; continue ;;
                 *) continue ;;
             esac
-        elif ! is_copy "$link" "$h"; then
+        elif ! is_ours "$link"; then
             continue
         elif [ -n "${shared:-}" ]; then
             echo "kept $link (copy in a shared hooks dir; hooks are disabled for this clone)"
@@ -64,8 +64,20 @@ for h in pre-commit pre-push; do
         if rm "$link"; then echo "removed $link"; else failed "$link"; fi
         continue
     fi
-    if [ -e "$link" ] && [ ! -L "$link" ] && ! is_copy "$link" "$h"; then
-        [ "$mode" = "--quiet" ] || echo "SKIP: $link exists and is not a symlink; call $top/.githooks/$h from it manually"
+    if [ -e "$link" ] && [ ! -L "$link" ]; then
+        if ! is_ours "$link"; then
+            [ "$mode" = "--quiet" ] || echo "SKIP: $link exists and is not a symlink; call $top/.githooks/$h from it manually"
+            continue
+        elif cmp -s "$link" "$top/.githooks/$h"; then
+            [ "$mode" = "--quiet" ] || echo "ok: $link"
+            continue
+        fi
+        # stale copy of an older hook: replace it
+        if ln -sf "$top/.githooks/$h" "$link"; then
+            [ "$mode" = "--quiet" ] || echo "updated $link"
+        else
+            failed "$link"
+        fi
         continue
     fi
     # Present (live) link: leave it; dangling link (clone removed): replace.

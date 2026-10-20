@@ -49,7 +49,7 @@ $p"
     pkgs=$(printf '%s\n' "$pkgs" | sed '/^$/d' | sort -u)
 
     # Root files that change what every package compiles with: clippy the whole workspace
-    ws_re='^(Cargo\.toml|Cargo\.lock|clippy\.toml|rust-toolchain\.toml|\.cargo/config\.toml)$'
+    ws_re='^(Cargo\.toml|Cargo\.lock|clippy\.toml|rust-toolchain\.toml|\.cargo/config(\.toml)?)$'
     ws=""
     ! printf '%s\n' "$changed" | grep -Eq "$ws_re" || ws=1
 
@@ -83,15 +83,16 @@ $p"
 
     # Workspace-wide, as `make dylint` (cargo-gears has no CI-equivalent package filter)
     if [ -n "$tree_ok" ] \
-        && printf '%s\n' "$changed" | grep -Eq '(\.rs|(^|/)Cargo\.toml)$|^(Cargo\.lock|clippy\.toml|rust-toolchain\.toml|\.cargo/config\.toml)$' \
+        && printf '%s\n' "$changed" | grep -Eq '(\.rs|(^|/)Cargo\.toml)$|^(Cargo\.lock|clippy\.toml|rust-toolchain\.toml|\.cargo/config(\.toml)?)$' \
         && need dylint cargo-gears "cargo install --locked cargo-gears"; then
         step dylint
         cargo gears lint --dylint || fail dylint "run: make dylint"
     fi
 
-    # the script needs jq and bash >= 4 (mapfile); macOS ships bash 3.2
+    # the script needs jq, bash >= 4 (mapfile) and grep -P; macOS ships bash 3.2 and BSD grep
     if need forbidden-words jq "brew install jq / apt install jq" \
-        && need forbidden-words "bash>=4" "brew install bash"; then
+        && need forbidden-words "bash>=4" "brew install bash" \
+        && need forbidden-words "grep -P" "brew install grep"; then
         step forbidden-words
         .github/scripts/check-forbidden-words.sh "$base" "$sha" ||
             fail forbidden-words "remove the forbidden words reported above"

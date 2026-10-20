@@ -36,6 +36,10 @@ GEARS_JUNIT_ENRICH := tools/scripts/junit_enrich.py
 # Keep in sync with the `Install cargo-shear` step in shear-nightly.yml.
 SHEAR_VERSION ?= 1.13.1
 
+# shellcheck-py version installed into the venv by `make setup` (ships the shellcheck binary).
+# Keep in sync with the `Install shellcheck` step in githooks.yml.
+SHELLCHECK_PY_VERSION ?= 0.11.0.1
+
 CI := 1
 
 # Auto-install git hooks on any make run (idempotent, silent unless it installs something;
@@ -49,10 +53,13 @@ $(if $(_HOOKS_MSG),$(info $(_HOOKS_MSG)))
 PY_ENV_DIR ?= .venv
 ifeq ($(OS),Windows_NT)
 PYTHON ?= $(PY_ENV_DIR)/Scripts/python
+SHELLCHECK ?= $(PY_ENV_DIR)/Scripts/shellcheck
 else
 PYTHON ?= $(PY_ENV_DIR)/bin/python
+SHELLCHECK ?= $(PY_ENV_DIR)/bin/shellcheck
 endif
-PY_ENV_STAMP := $(PY_ENV_DIR)/.requirements-stamp
+# The stamp name carries the shellcheck pin, so bumping SHELLCHECK_PY_VERSION re-runs py-env.
+PY_ENV_STAMP := $(PY_ENV_DIR)/.requirements-stamp-shellcheck-$(SHELLCHECK_PY_VERSION)
 PY_REQUIREMENTS := testing/requirements.txt testing/e2e/requirements.txt
 
 OPENAPI_PORT ?= 8087
@@ -79,7 +86,7 @@ OPENAPI_SERVER_FEATURE_ARGS ?= $(E2E_SERVER_FEATURE_ARGS)
 
 # -------- Set up --------
 
-.PHONY: setup py-env install-hooks uninstall-hooks
+.PHONY: setup py-env shellcheck install-hooks uninstall-hooks
 
 py-env: $(PY_ENV_STAMP)
 	$(call print_target_banner)
@@ -89,8 +96,14 @@ $(PY_ENV_STAMP): $(PY_REQUIREMENTS)
 	$(PYTHON_BOOTSTRAP) -m venv $(PY_ENV_DIR)
 	$(PYTHON) -m pip install --upgrade pip
 	$(PYTHON) -m pip install -r testing/requirements.txt -r testing/e2e/requirements.txt
+	$(PYTHON) -m pip install shellcheck-py==$(SHELLCHECK_PY_VERSION)
 	@mkdir -p $(dir $(PY_ENV_STAMP))
 	@cat $(PY_REQUIREMENTS) > $(PY_ENV_STAMP)
+
+## Lint the git hook scripts with the pinned shellcheck (installed by setup)
+shellcheck: py-env
+	$(call print_target_banner)
+	@$(SHELLCHECK) -s sh -x .githooks/install.sh .githooks/lib.sh .githooks/pre-commit .githooks/pre-push .githooks/tests/run.sh
 
 ## Install git hooks (pre-commit, pre-push) as symlinks into the git hooks dir
 install-hooks:

@@ -37,6 +37,7 @@ echo "cargo $*" >> "$STUB_LOG"
 exit 0
 STUB
 chmod +x "$T/stubs/"*
+real_path=$PATH
 PATH="$T/stubs:$PATH"
 
 nfail=0
@@ -48,6 +49,11 @@ assert() { name=$1; shift; if "$@"; then pass "$name"; else fail "$name"; fi; }
 
 case $(uname -s) in MINGW* | MSYS* | CYGWIN*) windows=1 ;; *) windows="" ;; esac
 have_rustfmt=""; rustfmt --version >/dev/null 2>&1 && have_rustfmt=1
+# Real tools, as seen before the stubs were put on PATH.
+have_bash4=""; PATH=$real_path bash -c '[ "${BASH_VERSINFO[0]}" -ge 4 ]' 2>/dev/null && have_bash4=1
+have_jq=""; PATH=$real_path command -v jq >/dev/null 2>&1 && have_jq=1
+have_pcre=""
+{ printf 'a\n' | PATH=$real_path grep -qP a || printf 'a\n' | PATH=$real_path ggrep -qP a; } 2>/dev/null && have_pcre=1
 
 # mkrepo <name>: fresh repo $r with a copy of .githooks (no tests dir).
 mkrepo() {
@@ -124,6 +130,26 @@ assert "install does not skip identical copy" test -z "$(grep SKIP "$T/out")"
 hook "$r" install.sh --uninstall
 assert "uninstall removes identical copy" test ! -e "$r/.git/hooks/pre-commit"
 
+# A copy of an older hook version (Git Bash) is still ours: install refreshes it, uninstall removes it.
+mkrepo u5; mkdir -p "$r/.git/hooks"
+cp "$r/.githooks/pre-commit" "$r/.git/hooks/pre-commit"; echo '# old version' >> "$r/.git/hooks/pre-commit"
+hook "$r" install.sh
+assert "install reports updated stale copy" grep -q "^updated .*pre-commit" "$T/out"
+assert "install refreshes stale copy" cmp -s "$r/.git/hooks/pre-commit" "$r/.githooks/pre-commit"
+assert "install does not skip stale copy" test -z "$(grep SKIP "$T/out")"
+rm -f "$r/.git/hooks/pre-commit"
+cp "$r/.githooks/pre-commit" "$r/.git/hooks/pre-commit"; echo '# old version' >> "$r/.git/hooks/pre-commit"
+hook "$r" install.sh --uninstall
+assert "uninstall removes stale copy" test ! -e "$r/.git/hooks/pre-commit"
+
+mkrepo u6; mkdir -p "$r/.git/hooks"; printf '#!/bin/sh\necho mine\n' > "$r/.git/hooks/pre-push"
+cp "$r/.git/hooks/pre-push" "$T/foreign-copy"
+hook "$r" install.sh
+assert "install skips foreign file" grep -q '^SKIP: .*pre-push' "$T/out"
+assert "install leaves foreign file untouched" cmp -s "$r/.git/hooks/pre-push" "$T/foreign-copy"
+hook "$r" install.sh --uninstall
+assert "uninstall leaves foreign file untouched" cmp -s "$r/.git/hooks/pre-push" "$T/foreign-copy"
+
 # Another clone may use a copy in a shared hooks dir: uninstall keeps it.
 mkrepo u3s; mkdir -p "$T/shared-copy"; git -C "$r" config core.hooksPath "$T/shared-copy"
 cp "$r/.githooks/pre-commit" "$T/shared-copy/pre-commit"
@@ -136,6 +162,23 @@ hook "$r" install.sh
 assert "install skips foreign regular file" grep -q '^SKIP: .*pre-commit' "$T/out"
 hook "$r" install.sh --uninstall
 assert "uninstall keeps foreign regular file" test -f "$r/.git/hooks/pre-commit"
+
+# ---- make auto-install (the parse-time lines of gears-rust.mk, verbatim) ----
+if ! command -v make >/dev/null 2>&1; then
+    skip "make auto-install: installs hooks" "no make"
+    skip "make auto-install: respects uninstall" "no make"
+else
+    mkrepo m1
+    grep -E '^(_HOOKS_MSG :=|\$\(if \$\(_HOOKS_MSG\))' "$src/gears-rust.mk" > "$r/Makefile"
+    printf 'all:\n\t@:\n' >> "$r/Makefile"
+    (cd "$r" && make) > "$T/out" 2>&1
+    assert "make auto-install: installs hooks" test -e "$r/.git/hooks/pre-push"
+    assert "make auto-install: sets marker" is_true "$r"
+    hook "$r" install.sh --uninstall
+    (cd "$r" && make) > "$T/out" 2>&1
+    assert "make auto-install: respects uninstall (no links)" test ! -e "$r/.git/hooks/pre-commit"
+    assert "make auto-install: respects uninstall (marker)" is_false "$r"
+fi
 
 # ---- unwritable hooks dir ----
 mkrepo w1; mkdir -p "$r/.git/hooks"; chmod 555 "$r/.git/hooks"
@@ -246,5 +289,60 @@ git -C "$r" checkout -q -- pk/src/lib.rs
 FAIL_CLIPPY=1 push "$(head_sha)"
 assert "pre-push: cargo without clippy -> skip notice" grep -q 'skipping clippy: clippy not found' "$T/out"
 assert "pre-push: cargo without clippy exits 0" test "$rc" = 0
+
+# Stubs standing in for BSD grep (stock macOS): -P is rejected, anything else runs the real grep.
+mkdir "$T/nopgrep"
+cat > "$T/nopgrep/grep" <<STUB
+#!/bin/sh
+for a in "\$@"; do
+    case \$a in --) break ;; -P | -[a-zA-Z]*P*) exit 2 ;; esac
+done
+exec "$(command -v grep)" "\$@"
+STUB
+printf '#!/bin/sh\nexit 2\n' > "$T/nopgrep/ggrep"
+chmod +x "$T/nopgrep/"*
+
+# pre-push: without a working grep -P the forbidden-words step is skipped, not run or failed
+if [ -z "$have_bash4" ]; then
+    skip "pre-push: no grep -P skips forbidden-words" "needs bash >= 4"
+else
+    printf '#!/bin/sh\necho ran > "%s/fw-ran"\n' "$T" > "$r/.github/scripts/check-forbidden-words.sh"
+    saved_path=$PATH; PATH="$T/nopgrep:$PATH"
+    push "$(head_sha)"
+    PATH=$saved_path
+    assert "pre-push: no grep -P prints skip notice" grep -q 'skipping forbidden-words: grep -P not found' "$T/out"
+    assert "pre-push: no grep -P does not run the script" test ! -e "$T/fw-ran"
+    assert "pre-push: no grep -P exits 0" test "$rc" = 0
+fi
+
+# ---- check-forbidden-words.sh (the real script) ----
+fw_ok=1
+[ -n "$have_bash4" ] || { fw_ok=""; fw_why="needs bash >= 4"; }
+[ -n "$have_jq" ] || { fw_ok=""; fw_why="needs jq"; }
+mkrepo fw; r="$T/fw"
+mkdir -p "$r/.github/scripts"
+cp "$src/.github/scripts/check-forbidden-words.sh" "$r/.github/scripts/"
+cp "$src/.github/forbidden-words.json" "$r/.github/"
+echo base > "$r/a.txt"; git -C "$r" add -A; git -C "$r" commit -qm base
+echo cyberfabric >> "$r/a.txt"; git -C "$r" commit -qam bad
+# fw_run <PATH>: runs the script on the last commit; status in $rc.
+fw_run() {
+    rc=0
+    (cd "$r" && PATH=$1 bash .github/scripts/check-forbidden-words.sh HEAD~1 HEAD) > "$T/out" 2>&1 || rc=$?
+}
+if [ -z "$fw_ok" ]; then
+    skip "forbidden-words: violation found with PCRE grep" "$fw_why"
+    skip "forbidden-words: grep without -P fails loudly" "$fw_why"
+else
+    if [ -n "$have_pcre" ]; then
+        fw_run "$real_path"
+        assert "forbidden-words: violation found with PCRE grep" test "$rc" = 1
+    else
+        skip "forbidden-words: violation found with PCRE grep" "no grep -P here"
+    fi
+    fw_run "$T/nopgrep:$real_path"
+    assert "forbidden-words: grep without -P exits 2, not 0" test "$rc" = 2
+    assert "forbidden-words: grep without -P names the problem" grep -q 'needs grep -P' "$T/out"
+fi
 
 [ "$nfail" = 0 ] || { echo "$nfail case(s) failed"; exit 1; }

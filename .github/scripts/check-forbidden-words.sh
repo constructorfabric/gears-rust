@@ -18,6 +18,17 @@ CONFIG_FILE=".github/forbidden-words.json"
 [[ -f "$CONFIG_FILE" ]] || { echo "::notice::No forbidden-words.json; skipping check"; exit 0; }
 command -v jq >/dev/null 2>&1 || { echo "::error::jq is required"; exit 2; }
 
+# Patterns are PCRE: BSD grep (stock macOS) has no -P, so fail loudly instead of matching nothing.
+GREP='grep'
+if ! printf 'a\n' | grep -qP 'a' 2>/dev/null; then
+  if printf 'a\n' | ggrep -qP 'a' 2>/dev/null; then
+    GREP=ggrep
+  else
+    echo "::error::check-forbidden-words.sh needs grep -P (GNU grep; macOS: brew install grep)"
+    exit 2
+  fi
+fi
+
 rule_count=$(jq '(.rules // []) | length' "$CONFIG_FILE")
 [[ "$rule_count" -gt 0 ]] || { echo "No rules defined; nothing to check."; exit 0; }
 
@@ -85,10 +96,19 @@ for file in "${CHANGED_FILES[@]}"; do
       [[ -z "$entry" ]] && continue
       lineno="${entry%%:*}"
       content="${entry#*:}"
-      if printf '%s' "$content" | grep -q "${grep_opts[@]}" -- "$pattern" 2>/dev/null; then
-        printf '::error file=%s,line=%s::Forbidden phrase: %s\n' "$file" "$lineno" "$message"
-        violations=$((violations + 1))
-      fi
+      grep_rc=0
+      "$GREP" -q "${grep_opts[@]}" -- "$pattern" <<< "$content" || grep_rc=$?
+      case "$grep_rc" in
+        0)
+          printf '::error file=%s,line=%s::Forbidden phrase: %s\n' "$file" "$lineno" "$message"
+          violations=$((violations + 1))
+          ;;
+        1) ;;
+        *)
+          echo "::error::grep failed (exit $grep_rc) on rule $r, pattern: $pattern"
+          exit 2
+          ;;
+      esac
     done <<< "$added_lines"
   done
 done
