@@ -1724,7 +1724,7 @@ pub async fn bound_service_over(
         .expect("catalogue");
     service
         .bind(crate::domain::Bound {
-            engines: Arc::new(crate::domain::engines::builtin_registry().expect("engines")),
+            engines: Arc::new(crate::domain::engines::linked_registry().expect("engines")),
             artifacts: Arc::new(crate::domain::engines::PolicyArtifactCache::new(
                 std::num::NonZeroUsize::new(256).expect("capacity"),
                 std::num::NonZeroUsize::new(2).expect("permits"),

@@ -509,34 +509,32 @@ impl QeMetrics for NoopMetrics {
     fn record_outbox_rejection(&self) {}
 }
 
-/// Bounded deployment engine labels; unknown submitted strings cannot enter metrics.
+/// The telemetry label of a linked engine: its own `id()`.
+///
+/// Only a `&'static str` builds one, so the label set is the engines compiled
+/// into the binary; an operator-submitted `engine_id` (a runtime `String`)
+/// cannot become a label.
 #[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EngineLabel {
-    /// Built-in deterministic selection.
-    MostRestrictiveWins,
-    /// Sandboxed CEL.
-    Cel,
-}
+pub struct EngineLabel(&'static str);
+
 impl EngineLabel {
+    /// The label of a linked engine.
+    #[must_use]
+    pub fn of(engine: &dyn quota_enforcement_sdk::QuotaResolutionEngineV1) -> Self {
+        Self(engine.id())
+    }
+
+    /// The label for an engine id that came from a linked engine's `id()`.
+    #[must_use]
+    pub(crate) const fn from_linked_id(id: &'static str) -> Self {
+        Self(id)
+    }
+
     /// Static telemetry value.
     #[must_use]
     pub const fn as_label(self) -> &'static str {
-        match self {
-            Self::MostRestrictiveWins => "most-restrictive-wins",
-            Self::Cel => "cel",
-        }
-    }
-
-    /// The label of a registered engine id, or `None` for an id outside the
-    /// bounded built-in set. The bound is what keeps operator-submitted strings
-    /// out of metric labels: an unknown id is refused at registration, never
-    /// interpolated into a label.
-    #[must_use]
-    pub fn from_id(id: &str) -> Option<Self> {
-        [Self::MostRestrictiveWins, Self::Cel]
-            .into_iter()
-            .find(|label| label.as_label() == id)
+        self.0
     }
 }
 

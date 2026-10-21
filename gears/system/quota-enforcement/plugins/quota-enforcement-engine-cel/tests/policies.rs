@@ -790,3 +790,18 @@ fn the_prd_policies_filter_a_large_quota_set_within_the_shipped_cost_limit() -> 
     }
     Ok(())
 }
+
+#[test]
+fn a_rejected_deep_expression_is_refused_on_a_small_caller_stack() -> TestResult {
+    // A bracket-free operator chain fills the source bound; the rejected tree
+    // must not be dropped recursively on the caller's stack.
+    let expr = format!("{{ \"allow\": {}true }}", "!".repeat(8000));
+    let refused = std::thread::Builder::new()
+        .stack_size(512 * 1024)
+        .spawn(move || compile(&expr).err().map(|e| e.message))?
+        .join()
+        .map_err(|_| "the compile thread panicked")?;
+    let message = refused.ok_or("a chain past the AST bounds was accepted")?;
+    assert!(message.contains("AST bounds"), "{message}");
+    Ok(())
+}

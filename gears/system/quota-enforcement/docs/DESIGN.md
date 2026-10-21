@@ -326,8 +326,9 @@ scale per `cpt-cf-quota-enforcement-nfr-subject-scale` while retaining bounded p
 
 - [ ] `p1` - **ID**: `cpt-cf-quota-enforcement-constraint-in-process-engine-registration`
 
-Engine plugins are registered statically in-process at gearootstrap. P1 ships `most-restrictive-wins` and `cel`;
-additional engines link into the binary at build time. Runtime registration of new Engines (dynamic loading, RPC
+Engine plugins are registered in-process at gear bootstrap from the Engines linked into the binary. P1 ships
+`most-restrictive-wins` and `cel`; an additional Engine, from this repository or outside it, registers by being linked
+into the server binary at build time, with no QE change. Runtime registration of new Engines (dynamic loading, RPC
 engines) is out of P1 scope per PRD §5.9. Configuration of an Engine is done via the Quota Resolution Policy
 (`engine_config` field) — the registration set is fixed at deploy time.
 
@@ -694,7 +695,7 @@ support). Realises `cpt-cf-quota-enforcement-constraint-in-process-engine-regist
 
 ##### Responsibility scope
 
-Compile-time linkage of built-in Engines; bootstrap-time fail-fast registration (`engine_bootstrap_failures_total`
+Collecting every Engine linked into the binary; bootstrap-time fail-fast registration (`engine_bootstrap_failures_total`
 increments on failure); ID → Engine resolution at evaluation time.
 
 ##### Responsibility boundaries
@@ -1312,6 +1313,15 @@ The backend behind the election is the operator's choice in the cluster profile 
 
 `ValidatedConfig` (`Any + Send + Sync`) exposes `as_any()`, so each Engine downcasts to its own concrete config type,
 and `inputs()`, the environment inputs the config reads, which narrows the schema snapshot a Policy keeps.
+
+**Registration.** An Engine crate registers itself with `quota_enforcement_sdk::register_engine!`, passing a
+constructor that returns `Arc<dyn QuotaResolutionEngineV1>`; the SDK collects the registrations at link time and
+`linked_engines()` yields them in no particular order. At bootstrap the gear builds `EngineRegistry` from every linked
+Engine, keyed and ordered by `id()`, and a second Engine under an existing id fails bootstrap (`DuplicateEngine`) instead
+of replacing it. The gear lists no Engine by name: linking a crate into the server binary is the whole registration, so
+an Engine maintained outside this repository needs only `quota-enforcement-sdk` and a `use <engine_crate> as _;` in the
+binary that should carry it. A linked Engine evaluates and is measured exactly like a built-in: its telemetry label is
+its own `id()`, which is fixed when the binary is built, so the `engine_id` label set stays bounded.
 
 **`EngineError`** closed enum: `Timeout`, `CostExceeded`, `TypeError(String)`, `InvalidConfig(String)`,
 `Internal(String)`. All variants are caught by the orchestrator and lifted into `DomainError` for canonicalisation per

@@ -18,7 +18,7 @@ use serde_json::json;
 use crate::domain::catalog::{
     CatalogBuilder, CatalogConfig, MetricClassifications, ProjectionContractCatalog,
 };
-use crate::domain::engines::{PolicyArtifactCache, builtin_registry};
+use crate::domain::engines::{PolicyArtifactCache, linked_registry};
 use crate::domain::error::DomainError;
 use crate::domain::policies::schemas::CatalogPolicySchemas;
 use crate::domain::policies::{PolicyRuntimeLimits, PolicySchemas};
@@ -77,7 +77,7 @@ async fn harness_with(pdp: Arc<dyn AuthZResolverApi>, limits: PolicyRuntimeLimit
     ));
     service
         .bind(Bound {
-            engines: Arc::new(builtin_registry().expect("engines")),
+            engines: Arc::new(linked_registry().expect("engines")),
             artifacts: Arc::clone(&artifacts),
             storage: storage.clone(),
             coordinator: Arc::new(NoopCoordinator),
@@ -723,7 +723,7 @@ async fn a_contract_read_through_brackets_is_persisted_and_the_version_rebuilds_
     schemas
         .check_activation(&stored)
         .expect("the persisted closure still matches the catalogue");
-    builtin_registry()
+    linked_registry()
         .expect("engines")
         .get(&stored.engine_id)
         .expect("cel")

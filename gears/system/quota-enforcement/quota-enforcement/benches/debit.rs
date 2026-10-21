@@ -21,7 +21,7 @@ use std::time::Duration;
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use quota_enforcement::domain::engines::{
-    EngineRegistry, PolicyArtifactCache, PreparedEvaluation, builtin_registry,
+    EngineRegistry, PolicyArtifactCache, PreparedEvaluation, linked_registry,
 };
 use quota_enforcement::domain::operations::IdempotencyCache;
 use quota_enforcement::domain::operations::idempotency::ReplayRecord;
@@ -127,7 +127,7 @@ fn seeded(runtime: &Runtime, quotas: usize) -> (Arc<InMemoryStorage>, Vec<QuotaI
 /// the steady state a hot path runs in.
 fn deployment() -> (Arc<EngineRegistry>, Arc<PolicyArtifactCache>) {
     (
-        Arc::new(builtin_registry().expect("engines")),
+        Arc::new(linked_registry().expect("engines")),
         Arc::new(PolicyArtifactCache::new(
             std::num::NonZeroUsize::new(64).expect("capacity"),
             std::num::NonZeroUsize::new(4).expect("permits"),

@@ -1,4 +1,4 @@
-//! Static engine registration and bounded immutable artifact storage.
+//! Link-time engine registration and bounded immutable artifact storage.
 //! Active pointers never enter the cache. Compilation is the caller's work,
 //! outside database transactions and outside this module's short mutex sections.
 use std::collections::{BTreeMap, VecDeque};
@@ -6,6 +6,9 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use parking_lot::Mutex;
+// The built-in engines register themselves; these keep them linked.
+use quota_enforcement_engine_cel as _;
+use quota_enforcement_engine_most_restrictive as _;
 use quota_enforcement_sdk::engine::{EngineError, EvaluationFailure};
 use quota_enforcement_sdk::{PolicyId, QuotaResolutionEngineV1, ValidatedConfig};
 
@@ -265,11 +268,7 @@ pub fn evaluate_prepared(
             policy_id: context.policy.policy_id.clone(),
             version: context.policy.version,
         })?;
-    // Registration refuses an engine without a label, so this cannot fail for
-    // a registered engine; the error is defence in depth, not a hot-path branch.
-    let label = EngineLabel::from_id(engine.id()).ok_or_else(|| {
-        EngineError::Internal("registered engine lacks deployment telemetry label".into())
-    })?;
+    let label = EngineLabel::of(engine.as_ref());
     let started = std::time::Instant::now();
     let decision = engine.evaluate(context, artifact.as_ref());
     metrics.record_engine_evaluation(label, started.elapsed());
@@ -463,15 +462,12 @@ impl<'a> PreparedEvaluation<'a> {
     }
 }
 
-/// Construct the statically linked deployment registry before seeding policies.
+/// Build the registry from every engine linked into this binary, before
+/// seeding policies.
 /// # Errors
 /// Duplicate engine identifiers fail bootstrap.
-pub fn builtin_registry() -> Result<EngineRegistry, DuplicateEngine> {
-    let engines: Vec<Arc<dyn QuotaResolutionEngineV1>> = vec![
-        Arc::new(quota_enforcement_engine_most_restrictive::MostRestrictiveWins),
-        Arc::new(quota_enforcement_engine_cel::CelEngine),
-    ];
-    EngineRegistry::new(engines)
+pub fn linked_registry() -> Result<EngineRegistry, DuplicateEngine> {
+    EngineRegistry::new(quota_enforcement_sdk::linked_engines())
 }
 
 /// Lift an evaluation failure into the domain error DESIGN section 3.3 maps:

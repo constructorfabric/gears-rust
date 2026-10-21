@@ -16,8 +16,8 @@ use serde_json::{Value, json};
 use time::OffsetDateTime;
 
 use super::{
-    DuplicateEngine, EngineRegistry, PolicyArtifactCache, builtin_registry, evaluate_prepared,
-    lift_evaluation,
+    DuplicateEngine, EngineRegistry, PolicyArtifactCache, evaluate_prepared, lift_evaluation,
+    linked_registry,
 };
 use crate::domain::error::DomainError;
 use crate::domain::ports::metrics::EngineLabel;
@@ -114,8 +114,8 @@ impl QuotaResolutionEngineV1 for RogueEngine {
 }
 
 #[test]
-fn the_builtin_registry_links_both_engines_and_refuses_a_duplicate_id() {
-    let registry = builtin_registry().expect("built-ins");
+fn the_linked_registry_holds_both_built_ins_and_refuses_a_duplicate_id() {
+    let registry = linked_registry().expect("built-ins");
     assert_eq!(
         registry.ids().collect::<Vec<_>>(),
         vec!["cel", "most-restrictive-wins"],
@@ -159,7 +159,7 @@ fn the_artifact_cache_is_bounded_fifo_and_keeps_the_first_publication() {
 
 #[test]
 fn a_prepared_evaluation_records_latency_and_a_miss_asks_for_preparation() {
-    let registry = builtin_registry().expect("built-ins");
+    let registry = linked_registry().expect("built-ins");
     let cache = PolicyArtifactCache::new(
         NonZeroUsize::new(8).expect("capacity"),
         NonZeroUsize::new(2).expect("permits"),
@@ -214,7 +214,87 @@ fn a_prepared_evaluation_records_latency_and_a_miss_asks_for_preparation() {
     );
     let evaluations = metrics.engine_evaluations.lock();
     assert_eq!(evaluations.len(), 1);
-    assert_eq!(evaluations[0].0, EngineLabel::MostRestrictiveWins);
+    assert_eq!(
+        evaluations[0].0,
+        EngineLabel::from_linked_id("most-restrictive-wins")
+    );
+}
+
+/// An engine linked from outside the repository: it debits the request
+/// against the first applicable Quota.
+struct AcmeEngine;
+
+impl QuotaResolutionEngineV1 for AcmeEngine {
+    fn id(&self) -> &'static str {
+        "acme-arbitration"
+    }
+
+    fn validate_config(
+        &self,
+        _input: EngineValidationInput<'_>,
+    ) -> Result<Arc<dyn ValidatedConfig>, EngineConfigError> {
+        Ok(Arc::new(NoConfig))
+    }
+
+    fn evaluate(
+        &self,
+        context: &EvaluationContext<'_>,
+        _config: &dyn ValidatedConfig,
+    ) -> Result<Decision, EngineError> {
+        let quota = context.quotas.first().ok_or(EngineError::CostExceeded)?;
+        Ok(Decision {
+            result: DecisionResult::Allowed,
+            debit_plan: std::iter::once((
+                quota.snapshot.quota_id,
+                QuotaDebitPlan {
+                    amount: context.amount,
+                },
+            ))
+            .collect(),
+            diagnostics: std::collections::BTreeMap::new(),
+        })
+    }
+}
+
+#[test]
+fn an_engine_outside_the_built_ins_evaluates_under_its_own_label() {
+    let registry = EngineRegistry::new(vec![
+        Arc::new(AcmeEngine) as Arc<dyn QuotaResolutionEngineV1>
+    ])
+    .expect("one engine");
+    let cache = PolicyArtifactCache::new(
+        NonZeroUsize::new(8).expect("capacity"),
+        NonZeroUsize::new(2).expect("permits"),
+    );
+    cache.publish(PolicyId::global(), 1, Arc::new(NoConfig));
+    let metrics = RecordingMetrics::default();
+    let policy = policy("acme-arbitration");
+    let quota = snapshot(100);
+    let quotas = [EvaluationQuota {
+        snapshot: &quota,
+        tier: QuotaScopeTier::User,
+        arbitration: &Value::Null,
+    }];
+    let context = EvaluationContext {
+        policy: &policy,
+        metric: &metric(),
+        amount: 7,
+        time: OffsetDateTime::UNIX_EPOCH,
+        quotas: &quotas,
+        request: &Value::Null,
+        resource: &Value::Null,
+        budget: budget(),
+    };
+
+    let outcome = evaluate_prepared(&registry, &cache, &context, &metrics)
+        .expect("a linked engine evaluates like a built-in");
+    assert_eq!(
+        outcome.decision().debit_plan.get(&quota.quota_id),
+        Some(&QuotaDebitPlan { amount: 7 })
+    );
+    let evaluations = metrics.engine_evaluations.lock();
+    assert_eq!(evaluations.len(), 1);
+    assert_eq!(evaluations[0].0.as_label(), "acme-arbitration");
 }
 
 #[test]
@@ -252,7 +332,7 @@ fn a_decision_outside_the_applicable_set_is_refused_and_counted() {
     assert_eq!(
         metrics.plan_violations.lock().as_slice(),
         &[(
-            EngineLabel::Cel,
+            EngineLabel::from_linked_id("cel"),
             DebitPlanInvariant::QuotaIdOutsideApplicableSet
         )]
     );
@@ -347,7 +427,7 @@ async fn a_missing_artifact_is_prepared_outside_the_transaction_and_the_mutation
 
     let storage = InMemoryStorage::new();
     let seeded = seed_global(&storage).await;
-    let engines = builtin_registry().expect("engines");
+    let engines = linked_registry().expect("engines");
     let artifacts = Arc::new(PolicyArtifactCache::new(
         NonZeroUsize::new(4).expect("capacity"),
         NonZeroUsize::new(2).expect("permits"),
@@ -392,7 +472,7 @@ async fn a_version_that_never_becomes_available_exhausts_the_bounded_retry_budge
 
     let storage = InMemoryStorage::new();
     seed_global(&storage).await;
-    let engines = builtin_registry().expect("engines");
+    let engines = linked_registry().expect("engines");
     let artifacts = Arc::new(PolicyArtifactCache::new(
         NonZeroUsize::new(4).expect("capacity"),
         NonZeroUsize::new(2).expect("permits"),

@@ -205,7 +205,7 @@ plugin `bootstrap()` seeding step
 **Output**: a populated `EngineRegistry` and the seeded `global` Policy, or failed gear readiness
 
 **Steps**:
-1. [x] - `p1` - Register `most-restrictive-wins` and `cel` in the static in-process `EngineRegistry` at gear bootstrap; Engines link into the binary at build time and there is no runtime registration (`cpt-cf-quota-enforcement-constraint-in-process-engine-registration`) - `inst-ebs-register`
+1. [x] - `p1` - Register every Engine linked into the binary, `most-restrictive-wins` and `cel` included, in the in-process `EngineRegistry` at gear bootstrap; Engines link into the binary at build time and there is no runtime registration (`cpt-cf-quota-enforcement-constraint-in-process-engine-registration`) - `inst-ebs-register`
 2. [x] - `p1` - **IF** any built-in Engine declared in the deployment manifest fails to register - `inst-ebs-fail-if`
    1. [x] - `p1` - Fail readiness and serve nothing; emit a structured log entry and increment `engine_bootstrap_failures_total` by `engine_id`; never silently fall back to a different Engine for Policies that referenced the failed one; recovery is fixing the registration failure and restarting the gear; this step extends `cpt-cf-quota-enforcement-flow-gear-bootstrap` from the foundation feature - `inst-ebs-fail`
 3. [x] - `p1` - DB: after Engine registration succeeds, seed the `global` Policy idempotently when missing, inside the storage plugin `bootstrap()` seeding step: `policy_id = global, policy_version = 1, version_state = active, engine_id = most-restrictive-wins, engine_config = {}` - `inst-ebs-seed`

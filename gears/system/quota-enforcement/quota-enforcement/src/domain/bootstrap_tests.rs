@@ -668,7 +668,7 @@ async fn an_active_policy_whose_config_no_longer_compiles_fails_readiness_and_is
     failed_on(&h, Dependency::Engine);
     assert_eq!(
         h.metrics.engine_bootstrap_failures.lock().as_slice(),
-        &[EngineLabel::MostRestrictiveWins]
+        &[EngineLabel::from_linked_id("most-restrictive-wins")]
     );
 }
 

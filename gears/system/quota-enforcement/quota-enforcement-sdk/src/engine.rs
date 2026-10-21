@@ -341,6 +341,53 @@ pub trait QuotaResolutionEngineV1: Send + Sync {
     ) -> Result<crate::Decision, EngineError>;
 }
 
+/// A linked engine, collected when the gear builds its registry.
+///
+/// An engine crate submits one with [`register_engine!`](crate::register_engine);
+/// linking the crate into the server binary is the whole registration.
+pub struct EngineRegistration {
+    constructor: fn() -> std::sync::Arc<dyn QuotaResolutionEngineV1>,
+}
+
+impl EngineRegistration {
+    /// Register the engine that `constructor` builds.
+    #[must_use]
+    pub const fn new(constructor: fn() -> std::sync::Arc<dyn QuotaResolutionEngineV1>) -> Self {
+        Self { constructor }
+    }
+
+    /// Build the registered engine.
+    #[must_use]
+    pub fn engine(&self) -> std::sync::Arc<dyn QuotaResolutionEngineV1> {
+        (self.constructor)()
+    }
+}
+
+inventory::collect!(EngineRegistration);
+
+/// Every engine registered by a crate linked into this binary, in no
+/// particular order.
+pub fn linked_engines() -> impl Iterator<Item = std::sync::Arc<dyn QuotaResolutionEngineV1>> {
+    inventory::iter::<EngineRegistration>
+        .into_iter()
+        .map(EngineRegistration::engine)
+}
+
+/// Register an engine with the quota-enforcement gear of whatever binary links
+/// this crate. The argument builds the engine:
+///
+/// ```ignore
+/// quota_enforcement_sdk::register_engine!(|| std::sync::Arc::new(MyEngine));
+/// ```
+#[macro_export]
+macro_rules! register_engine {
+    ($constructor:expr $(,)?) => {
+        $crate::__inventory::submit! {
+            $crate::EngineRegistration::new($constructor)
+        }
+    };
+}
+
 /// One metric's persisted CEL environment schema.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]

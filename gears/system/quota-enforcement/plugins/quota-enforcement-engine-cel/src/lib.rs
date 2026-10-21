@@ -53,8 +53,8 @@ use std::sync::Arc;
 use cel_core::types::SpannedExpr;
 use quota_enforcement_sdk::{
     Decision, DecisionResult, EngineConfigError, EngineError, EngineValidationInput,
-    EvaluationContext, MetricId, QuotaDebitPlan, QuotaId, QuotaResolutionEngineV1, QuotaScopeTier,
-    ValidatedConfig,
+    EvaluationContext, MetricId, PolicySchemaSnapshot, QuotaDebitPlan, QuotaId,
+    QuotaResolutionEngineV1, QuotaScopeTier, ValidatedConfig,
 };
 use serde_json::{Map, Value, json};
 
@@ -88,6 +88,8 @@ const PARSER_STACK_BYTES: usize = 64 << 20;
 /// The statically linked CEL engine.
 #[derive(Debug, Default)]
 pub struct CelEngine;
+
+quota_enforcement_sdk::register_engine!(|| Arc::new(CelEngine));
 
 /// The immutable compiled artifact: the expanded AST and the metrics whose
 /// environments it was checked against. Persisted policies keep the source and
@@ -123,51 +125,7 @@ impl QuotaResolutionEngineV1 for CelEngine {
     ) -> Result<Arc<dyn ValidatedConfig>, EngineConfigError> {
         let source = expression_source(input.raw)?;
         guard_nesting(source)?;
-        // @cpt-begin:cpt-cf-quota-enforcement-algo-cel-engine:p1:inst-cel-parse
-        let parsed = parse_bounded(source)?;
-        if let Some(error) = parsed.errors.first() {
-            return Err(check::at(
-                source,
-                error.span.start,
-                &format!("parse error: {}", error.message),
-            ));
-        }
-        let expr = parsed
-            .ast
-            .ok_or_else(|| check::config_error("expression is empty"))?;
-        // @cpt-end:cpt-cf-quota-enforcement-algo-cel-engine:p1:inst-cel-parse
-        if input.schemas.environments.is_empty() {
-            return Err(check::config_error(
-                "a cel policy needs at least one admitted metric environment",
-            ));
-        }
-        // Checked against every admitted metric, so a global policy is only
-        // accepted when it type-checks under each environment it may be
-        // selected for. A metric outside this set is refused at evaluation.
-        // @cpt-begin:cpt-cf-quota-enforcement-algo-cel-engine:p1:inst-cel-static
-        let mut metrics = Vec::with_capacity(input.schemas.environments.len());
-        let mut inputs = EnvironmentInputs::NONE;
-        for environment in &input.schemas.environments {
-            let variables = environment_variables(&environment.schema)?;
-            let mut checker = Checker {
-                source,
-                variables,
-                nodes: 0,
-                inputs: EnvironmentInputs::NONE,
-            };
-            checker.check_decision(&expr, 0)?;
-            inputs.request |= checker.inputs.request;
-            inputs.resource |= checker.inputs.resource;
-            inputs.arbitration |= checker.inputs.arbitration;
-            metrics.push(environment.metric.clone());
-        }
-        // @cpt-end:cpt-cf-quota-enforcement-algo-cel-engine:p1:inst-cel-static
-        Ok(Arc::new(Artifact {
-            source: Arc::from(source),
-            expr,
-            metrics,
-            inputs,
-        }))
+        Ok(Arc::new(compile_on_parser_stack(source, input.schemas)?))
     }
 
     fn evaluate(
@@ -307,18 +265,71 @@ fn guard_nesting(source: &str) -> Result<(), EngineConfigError> {
     Ok(())
 }
 
-/// Run the parser on its own generously sized stack, so an expression the
-/// nesting guard cannot see through (an operator chain) fails as a parse error
-/// rather than aborting the process.
-fn parse_bounded(source: &str) -> Result<cel_core::ParseResult, EngineConfigError> {
+/// Parse and check on the parser's own generously sized stack, so an operator
+/// chain the nesting guard cannot see through fails cleanly rather than
+/// aborting the process. Only an accepted tree, which the checker bounds,
+/// leaves the thread; a rejected one is dropped there.
+fn compile_on_parser_stack(
+    source: &str,
+    schemas: &PolicySchemaSnapshot,
+) -> Result<Artifact, EngineConfigError> {
     std::thread::scope(|scope| {
         std::thread::Builder::new()
             .name("cel-parse".to_owned())
             .stack_size(PARSER_STACK_BYTES)
-            .spawn_scoped(scope, || cel_core::parse(source))
+            .spawn_scoped(scope, || compile(source, schemas))
             .map_err(|_| check::config_error("parser thread could not be started"))?
             .join()
-            .map_err(|_| check::config_error("expression could not be parsed within bounds"))
+            .map_err(|_| check::config_error("expression could not be parsed within bounds"))?
+    })
+}
+
+/// Parse `source` and type-check it under every admitted metric environment.
+fn compile(source: &str, schemas: &PolicySchemaSnapshot) -> Result<Artifact, EngineConfigError> {
+    // @cpt-begin:cpt-cf-quota-enforcement-algo-cel-engine:p1:inst-cel-parse
+    let parsed = cel_core::parse(source);
+    if let Some(error) = parsed.errors.first() {
+        return Err(check::at(
+            source,
+            error.span.start,
+            &format!("parse error: {}", error.message),
+        ));
+    }
+    let expr = parsed
+        .ast
+        .ok_or_else(|| check::config_error("expression is empty"))?;
+    // @cpt-end:cpt-cf-quota-enforcement-algo-cel-engine:p1:inst-cel-parse
+    if schemas.environments.is_empty() {
+        return Err(check::config_error(
+            "a cel policy needs at least one admitted metric environment",
+        ));
+    }
+    // Checked against every admitted metric, so a global policy is only
+    // accepted when it type-checks under each environment it may be
+    // selected for. A metric outside this set is refused at evaluation.
+    // @cpt-begin:cpt-cf-quota-enforcement-algo-cel-engine:p1:inst-cel-static
+    let mut metrics = Vec::with_capacity(schemas.environments.len());
+    let mut inputs = EnvironmentInputs::NONE;
+    for environment in &schemas.environments {
+        let variables = environment_variables(&environment.schema)?;
+        let mut checker = Checker {
+            source,
+            variables,
+            nodes: 0,
+            inputs: EnvironmentInputs::NONE,
+        };
+        checker.check_decision(&expr, 0)?;
+        inputs.request |= checker.inputs.request;
+        inputs.resource |= checker.inputs.resource;
+        inputs.arbitration |= checker.inputs.arbitration;
+        metrics.push(environment.metric.clone());
+    }
+    // @cpt-end:cpt-cf-quota-enforcement-algo-cel-engine:p1:inst-cel-static
+    Ok(Artifact {
+        source: Arc::from(source),
+        expr,
+        metrics,
+        inputs,
     })
 }
 
