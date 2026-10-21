@@ -356,7 +356,8 @@ async fn before_bootstrap_every_operator_and_enforcement_call_is_not_ready() {
                 &ctx(),
                 quota_enforcement_sdk::ListPolicyVersionsRequest {
                     id,
-                    page: PageRequest::default(),
+                    limit: None,
+                    cursor: None,
                 },
             )
             .await
@@ -486,15 +487,26 @@ async fn the_operator_client_drives_a_policy_through_its_versions() {
             &ctx(),
             quota_enforcement_sdk::ListPolicyVersionsRequest {
                 id: id.clone(),
-                page: PageRequest {
-                    limit: 10,
-                    cursor: None,
-                },
+                limit: Some(10),
+                cursor: None,
             },
         )
         .await
         .expect("history");
     assert_eq!(history.items.len(), 2);
+    // A caller that leaves the page size to the server gets its default.
+    let defaulted = operator
+        .list_policy_versions(
+            &ctx(),
+            quota_enforcement_sdk::ListPolicyVersionsRequest {
+                id: id.clone(),
+                limit: None,
+                cursor: None,
+            },
+        )
+        .await
+        .expect("history at the server's default page size");
+    assert_eq!(defaulted.items.len(), 2);
     let rolled_back = operator
         .rollback_policy(
             &ctx(),

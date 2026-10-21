@@ -253,12 +253,7 @@ impl quota_enforcement_sdk::QuotaOperatorApi for InProcessQuotaOperator {
         Ok(self
             .service
             .policies()?
-            .list(
-                ctx,
-                &request.id,
-                Some(request.page.limit),
-                request.page.cursor,
-            )
+            .list(ctx, &request.id, request.limit, request.cursor)
             .await?)
     }
 }

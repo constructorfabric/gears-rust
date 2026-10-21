@@ -433,10 +433,8 @@ async fn each_contract_round_trips_as_the_caller_the_token_names() {
             &ctx,
             ListPolicyVersionsRequest {
                 id: PolicyId::new("p1"),
-                page: PageRequest {
-                    limit: 1,
-                    cursor: None,
-                },
+                limit: None,
+                cursor: None,
             },
         )
         .await

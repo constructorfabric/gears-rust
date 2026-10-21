@@ -443,8 +443,12 @@ pub struct ReadPolicyRequest {
 pub struct ListPolicyVersionsRequest {
     /// The policy whose history to read.
     pub id: PolicyId,
-    /// Which page of it.
-    pub page: PageRequest,
+    /// Page size; the server's default, within its configured bound, when absent.
+    #[serde(default)]
+    pub limit: Option<u32>,
+    /// Opaque continuation cursor from a previous page.
+    #[serde(default)]
+    pub cursor: Option<String>,
 }
 
 // Tag traits `#[toolkit::rest_contract]` requires on the HTTP body types.
