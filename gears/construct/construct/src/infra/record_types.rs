@@ -179,6 +179,12 @@ fn first_violation(
     }
 }
 
+/// One member name as a JSON pointer token (RFC 6901): `~` becomes `~0`, then
+/// `/` becomes `~1`, so a name with either still points at itself.
+fn pointer_token(name: &str) -> String {
+    name.replace('~', "~0").replace('/', "~1")
+}
+
 /// A refusal for one schema error: the place is the instance path, narrowed to
 /// the member for a missing or an unexpected property, and the rule is the
 /// keyword that failed.
@@ -187,12 +193,12 @@ fn violation(err: &ValidationError<'_>, type_id: Option<&str>) -> Refusal {
     match err.kind() {
         ValidationErrorKind::Required { property } => {
             if let Some(name) = property.as_str() {
-                pointer = format!("{pointer}/{name}");
+                pointer = format!("{pointer}/{}", pointer_token(name));
             }
         }
         ValidationErrorKind::AdditionalProperties { unexpected } => {
             if let Some(name) = unexpected.first() {
-                pointer = format!("{pointer}/{name}");
+                pointer = format!("{pointer}/{}", pointer_token(name));
             }
         }
         _ => {}

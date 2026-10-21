@@ -102,6 +102,17 @@ async fn an_unexpected_member_is_named() {
 }
 
 #[tokio::test]
+async fn an_unexpected_member_with_a_slash_or_tilde_is_named_as_one_member() {
+    let mut record = chat();
+    record["a/b~c"] = json!("x");
+
+    let refused = refusal(&record).await;
+
+    assert_eq!(refused.place, Place::pointer("/a~1b~0c"));
+    assert_eq!(refused.rule, "additionalProperties");
+}
+
+#[tokio::test]
 async fn a_missing_payload_member_of_the_derived_type_is_named() {
     let mut record = chat();
     record["payload"].as_object_mut().unwrap().remove("text");

@@ -43,7 +43,7 @@ This document splits the Construct design (`cpt-cf-construct-design-construct-ge
 
 The DESIGN's largest component, subject control, is split across four features. Subject Control owns the component; Subject Settings, the Review Queue and Administrator Fact Management extend it.
 
-**The gear foundation is built.** The backend shell already exists in `gears/construct/construct` and `gears/construct/construct-sdk`. The feature `cpt-cf-construct-feature-gear-foundation` describes that code as it is. Its FEATURE document is [features/gear-foundation.md](./features/gear-foundation.md), and the shell code carries `@cpt` markers for it. It is a placeholder, not a DESIGN element. Its note table and entity have no DESIGN id and are not counted as Data. It registers its REST route with OperationBuilder (the toolkit's builder for REST operations) and its client in ClientHub (the platform's registry of in-process clients).
+**The gear foundation is built.** The backend shell already exists in `gears/construct/construct` and `gears/construct/construct-sdk`. The feature `cpt-cf-construct-feature-gear-foundation` describes that code as it is. Its FEATURE document is [features/gear-foundation.md](./features/gear-foundation.md), and the shell code carries `@cpt` markers for it. It is a placeholder, not a DESIGN element. It first carried a placeholder note route, client operations, entity and table, with no DESIGN id and not counted as Data; Record Intake retired them. Later features register their REST routes with OperationBuilder (the toolkit's builder for REST operations) and extend its client in ClientHub (the platform's registry of in-process clients).
 
 **Interfaces and contracts.** The REST API (`cpt-cf-construct-interface-rest-api`) is realized by the features that add routes. The MCP tools (`cpt-cf-construct-interface-mcp-tools`) are realized by Agent Access over MCP. The Rust SDK (`cpt-cf-construct-interface-rust-sdk`) has one primary owner, the Gear Foundation, which holds the client trait; each later feature extends it. The interface, contract and topology ids in this paragraph are tracked in prose and have no checkbox line. The deployment topology (`cpt-cf-construct-topology-deployment`) is Construct running as a gear on the platform. Record Intake takes the connector record types (`cpt-cf-construct-contract-gts-record`), and the Profile Writer uses Construct's person types (`cpt-cf-construct-contract-person-types`). Both are GTS (Global Type System) types, the platform's versioned and registered type identifiers.
 
@@ -89,16 +89,16 @@ The DESIGN's largest component, subject control, is split across four features. 
 
 - [ ] `p1` - **ID**: `cpt-cf-construct-feature-gear-foundation`
 
-- **Purpose**: The gear shell on which every other feature is built. It gives Construct the standard gear anatomy, one authenticated route, tenant-scoped storage and a client in ClientHub. It proves the platform pattern that all later features copy: caller and tenant come from the platform, and each operation has its own permission. It already exists in code.
+- **Purpose**: The gear shell on which every other feature is built. It gives Construct the standard gear anatomy, a first authenticated route (a placeholder, retired by Record Intake), tenant-scoped storage and a client in ClientHub. It proves the platform pattern that all later features copy: caller and tenant come from the platform, and each operation has its own permission. It already exists in code.
 
 - **Depends On**: None
 
 - **Scope**:
   - The SDK crate in `construct-sdk` (package `cf-gears-construct-sdk`) with the client trait `ConstructClientV1` and its models, and the gear crate in `construct` (package `cf-gears-construct`) with API, domain and infrastructure layers (`cpt-cf-construct-adr-construct-is-a-gear`)
-  - One authenticated REST route that creates a foundation note in the caller's tenant, registered with OperationBuilder (the toolkit's builder for REST operations)
-  - A tenant-scoped entity `FoundationNote` over the secure ORM (the toolkit's tenant-scoped database layer), with migrations the gear supplies at runtime
-  - The table `construct__foundation_notes`. Database objects follow the `construct__` naming prefix of the object-namespacing ADR
-  - A client registered in ClientHub (the platform's registry of in-process clients) for in-process callers, with operations to create and to read one note
+  - One authenticated REST route that creates a foundation note in the caller's tenant, registered with OperationBuilder (the toolkit's builder for REST operations); retired by Record Intake
+  - A tenant-scoped entity `FoundationNote` over the secure ORM (the toolkit's tenant-scoped database layer), with migrations the gear supplies at runtime; retired by Record Intake
+  - The table `construct__foundation_notes`. Database objects follow the `construct__` naming prefix of the object-namespacing ADR. Record Intake's migration drops it
+  - A client registered in ClientHub (the platform's registry of in-process clients) for in-process callers, with operations to create and to read one note; Record Intake replaced the note operations with its own
   - One permission per operation, checked through the AuthZ resolver, and the tenant taken only from the security context
   - RFC 9457 Problem errors through the toolkit error mapping
 
@@ -122,14 +122,14 @@ The DESIGN's largest component, subject control, is split across four features. 
   - None.
 
 - **Domain Model Entities**:
-  - `FoundationNote` (placeholder, no DESIGN id)
+  - `FoundationNote` (placeholder, no DESIGN id; retired by Record Intake)
 
 - **Design Components**:
 
   - None. The shell is not a DESIGN component. It realizes `cpt-cf-construct-adr-construct-is-a-gear` and the gear anatomy of `cpt-cf-construct-tech-rust-gear`.
 
 - **API**:
-  - POST /construct/v1/foundation-notes (as registered in code; the DESIGN's public paths carry an `/api` prefix that a deployment sets in the gateway's `prefix_path`)
+  - POST /construct/v1/foundation-notes, retired by Record Intake (it was registered in code; the DESIGN's public paths carry an `/api` prefix that a deployment sets in the gateway's `prefix_path`)
 
 - **Sequences**:
 
@@ -137,7 +137,7 @@ The DESIGN's largest component, subject control, is split across four features. 
 
 - **Data**:
 
-  - None. `construct__foundation_notes` is a placeholder without a DESIGN id and is not counted as Data.
+  - None. `construct__foundation_notes` was a placeholder without a DESIGN id and is not counted as Data; Record Intake's migration drops it.
 
 ### 2.2 Model Client - HIGH
 
