@@ -1,0 +1,82 @@
+{
+  "$id": "gts://gts.cf.connectors.core.record.v1~cf.construct.mastery.student_mastery.v1~",
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "allOf": [
+    {
+      "$ref": "gts://gts.cf.connectors.core.record.v1~"
+    },
+    {
+      "properties": {
+        "payload": {
+          "additionalProperties": false,
+          "properties": {
+            "concepts": {
+              "description": "Per-concept mastery, keyed by the concept's stable within-course\nindex. Each `concept_index` appears at most once; the schema cannot\nexpress that, so the producer must guarantee it.",
+              "items": {
+                "additionalProperties": false,
+                "description": "One concept's mastery estimate.",
+                "properties": {
+                  "concept_index": {
+                    "description": "The concept's stable index within the course.",
+                    "format": "uint32",
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "score": {
+                    "description": "The mastery estimate, a probability in [0, 1].",
+                    "format": "double",
+                    "maximum": 1,
+                    "minimum": 0,
+                    "type": "number"
+                  },
+                  "signal_count": {
+                    "description": "How many observations the estimate rests on.",
+                    "format": "uint32",
+                    "minimum": 0,
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "concept_index",
+                  "score",
+                  "signal_count"
+                ],
+                "type": "object"
+              },
+              "minItems": 1,
+              "type": "array"
+            },
+            "course_id": {
+              "description": "The external course identifier, stable across systems. Not an\ninternal UUID.",
+              "minLength": 1,
+              "type": "string"
+            },
+            "model_name": {
+              "description": "The evaluation model that produced these scores. A student may have\nmastery under more than one model.",
+              "minLength": 1,
+              "type": "string"
+            },
+            "model_version": {
+              "description": "The model's version. Optional.",
+              "format": "uint32",
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "course_id",
+            "model_name",
+            "concepts"
+          ],
+          "type": "object"
+        }
+      },
+      "type": "object"
+    }
+  ],
+  "description": "One student's computed concept mastery for one course under one model: the finished result the Mastery connector pushes. subject_id is always set (the record is about the student, its value the student's platform user uuid). The payload carries scores keyed by concept_index only; the concept name and description are joined on read from the course catalog record, which the connector pushes separately, not with this per-student push. provenance = the (course, model, student) locator, stable across re-pushes; version = a digest of the concept scores, so an identical recompute dedupes to one record and a changed recompute is a new version the receiving side upserts onto the same provenance. observed_at = the connector-side timestamp when the compute finished, not a watermark over the events read. The result is authoritative: the receiving side validates it against this type and stores it as-is, with no retain-or-drop decision.",
+  "type": "object",
+  "x-gts-traits": {
+    "subject_required": true
+  }
+}

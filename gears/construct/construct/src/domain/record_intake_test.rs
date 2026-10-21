@@ -523,7 +523,11 @@ async fn until_the_planner_exists_a_record_is_received_and_dropped_with_an_event
     assert_eq!(dropped[0].connector, ctx.subject_id().to_string());
     assert_eq!(
         dropped[0].record_key,
-        crate::domain::record_intake::record_key(&ctx.subject_id().to_string(), "chat/t/1", "v1")
+        crate::domain::record_intake::RecordKey::of(crate::domain::record_intake::IdentityParts {
+            connector: &ctx.subject_id().to_string(),
+            provenance: "chat/t/1",
+            version: "v1",
+        })
     );
 }
 
@@ -663,4 +667,33 @@ async fn an_observed_at_that_is_no_real_date_is_refused_with_its_place() {
     assert_eq!(refusal.place, Place::pointer("/observed_at"));
     assert!(fixture.received().is_empty());
     assert_eq!(stored_record_ids(&db).await, 0);
+}
+
+/// The subject rule across a type's chain, the record's type first and the
+/// base last.
+#[test]
+fn the_subject_rule_resolves_across_the_type_chain() {
+    use crate::domain::record_intake::{SubjectTrait as S, TypeTraits};
+
+    let required = |chain: &[S]| {
+        TypeTraits {
+            subject_chain: chain.to_vec(),
+        }
+        .subject_required()
+    };
+
+    // The base alone decides when nothing below it declares the trait.
+    assert!(required(&[S::Unset, S::On]));
+    assert!(!required(&[S::Unset, S::Off]));
+    // The closest declared value wins.
+    assert!(!required(&[S::Off, S::On]));
+    assert!(!required(&[S::Unset, S::Off, S::On]));
+    // A type derived from a person type stays about a person.
+    assert!(required(&[S::Off, S::On, S::On]));
+    assert!(required(&[S::Off, S::Unset, S::On, S::Off]));
+    // A malformed value requires a subject.
+    assert!(required(&[S::Malformed, S::Off, S::Off]));
+    // With nothing declared, the SDK's default: a subject is required.
+    assert!(required(&[S::Unset, S::Unset]));
+    assert!(required(&[]));
 }

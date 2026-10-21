@@ -13,7 +13,9 @@ The `cf-gears-construct-sdk` crate provides:
   defined as Rust structs with `#[gts_type_schema]`, which generates their
   schemas and registers them in the types registry at link time. Whether a
   type requires `subject_id` is its GTS trait `subject_required`
-  (`gts::RecordTraits`), on unless the type turns it off.
+  (`gts::RecordTraits`), on unless the type turns it off. The generated record
+  schemas are committed under `schemas/`; a test fails when they drift (run it
+  with `UPDATE_SCHEMAS=1` after an intended change).
 - The person types (`person_types`) — one GTS graph node type per category of a person's profile
 
 ```rust,ignore

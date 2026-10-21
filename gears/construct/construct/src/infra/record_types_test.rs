@@ -134,7 +134,7 @@ async fn a_passing_record_gets_whether_its_type_requires_a_subject() {
         let rules = types.check(&record).await.expect("the example passes");
 
         assert_eq!(
-            rules.subject_required,
+            rules.subject_required(),
             type_id != construct_sdk::gts::MASTERY_COURSE_CATALOG_TYPE,
             "{type_id}"
         );
@@ -167,7 +167,7 @@ async fn rules_for(extra: GtsTypeSchema, record: &Value) -> bool {
         .check(record)
         .await
         .expect("the record passes")
-        .subject_required
+        .subject_required()
 }
 
 #[tokio::test]
@@ -199,8 +199,9 @@ async fn a_new_record_type_that_states_no_traits_requires_a_subject() {
     assert!(rules_for(registered_elsewhere(new_type, base, None), &record).await);
 }
 
+#[tracing_test::traced_test]
 #[tokio::test]
-async fn a_malformed_subject_trait_requires_a_subject() {
+async fn a_malformed_subject_trait_requires_a_subject_and_is_logged() {
     // Derived from the catalog, whose `false` must not stand in for the
     // malformed value.
     let catalog = construct_sdk::gts::MASTERY_COURSE_CATALOG_TYPE;
@@ -216,6 +217,10 @@ async fn a_malformed_subject_trait_requires_a_subject() {
         )
         .await
     );
+    assert!(logs_contain(
+        "record type declares a trait that is not a boolean"
+    ));
+    assert!(logs_contain(&derived), "the log names the type");
 }
 
 #[tokio::test]
@@ -257,6 +262,13 @@ fn example(type_id: &str) -> Value {
 /// rule its place then breaks.
 type BrokenConstraint = (&'static str, &'static str, Option<Value>, &'static str);
 
+/// A chained type id that matches the envelope's pattern but is longer than
+/// its cap of 1024 characters.
+fn long_type_id() -> Value {
+    let segments = "acme.x.y.z.v1~".repeat(80);
+    json!(format!("{CHAT}{segments}"))
+}
+
 #[tokio::test]
 async fn every_generated_constraint_refuses_a_record_that_breaks_it() {
     use construct_sdk::gts::{
@@ -271,6 +283,7 @@ async fn every_generated_constraint_refuses_a_record_that_breaks_it() {
         (CHAT, "/provenance", long(1025), "maxLength"),
         (CHAT, "/provenance", empty(), "minLength"),
         (CHAT, "/version", long(257), "maxLength"),
+        (CHAT, "/type", Some(long_type_id()), "maxLength"),
         (CHAT, "/subject_id", Some(json!("not a uuid")), "pattern"),
         // Chat message.
         (CHAT, "/payload/message_id", empty(), "minLength"),
@@ -315,6 +328,48 @@ async fn every_generated_constraint_refuses_a_record_that_breaks_it() {
             "minimum",
         ),
         (MASTERY, "/payload/extra", extra(), "additionalProperties"),
+        // Items of the payloads' lists.
+        (FACT, "/payload/citations/0/chunk_id", None, "required"),
+        (
+            FACT,
+            "/payload/citations/0/verbatim_quote",
+            empty(),
+            "minLength",
+        ),
+        (
+            FACT,
+            "/payload/citations/0/source_url",
+            Some(json!("ftp://x")),
+            "pattern",
+        ),
+        (CATALOG, "/payload/sections/0/title", None, "required"),
+        (CATALOG, "/payload/sections/0/title", empty(), "minLength"),
+        (
+            CATALOG,
+            "/payload/sections/0/extra",
+            extra(),
+            "additionalProperties",
+        ),
+        (CATALOG, "/payload/concepts/0/name", None, "required"),
+        (CATALOG, "/payload/concepts/0/name", empty(), "minLength"),
+        (
+            CATALOG,
+            "/payload/concepts/0/extra",
+            extra(),
+            "additionalProperties",
+        ),
+        (
+            MASTERY,
+            "/payload/concepts/0/signal_count",
+            None,
+            "required",
+        ),
+        (
+            MASTERY,
+            "/payload/concepts/0/extra",
+            extra(),
+            "additionalProperties",
+        ),
     ];
     let types = types();
     for (type_id, pointer, value, rule) in cases {
@@ -632,5 +687,61 @@ proptest! {
             .expect("runtime");
         let result = runtime.block_on(types().check(&record));
         prop_assert!(!matches!(result, Err(DomainError::Database(_))));
+    }
+}
+
+/// Every example record, with all its optional payload members present, reads
+/// into its typed envelope and writes back to the same JSON, and passes its
+/// schema, so the Rust types and the generated schemas describe one wire
+/// format. Optional members must be present: `gts-macros` 0.12 reads every
+/// payload member as required and writes an absent one as `null` (see
+/// `construct_sdk::gts`).
+#[tokio::test]
+async fn every_example_reads_into_its_typed_envelope_and_back() {
+    use construct_sdk::gts::{
+        ChatMessageV1, CourseCatalogV1, ENRICHMENT_FACT_CANDIDATE_TYPE, FactCandidateV1,
+        MASTERY_COURSE_CATALOG_TYPE, MASTERY_STUDENT_MASTERY_TYPE, RecordV1, StudentMasteryV1,
+    };
+
+    fn round_trip<P>(record: &Value) -> Value
+    where
+        P: toolkit_gts::GtsSchema,
+        RecordV1<P>: serde::Serialize + serde::de::DeserializeOwned,
+    {
+        let typed: RecordV1<P> = serde_json::from_value(record.clone())
+            .unwrap_or_else(|err| panic!("{}: {err}", record["type"]));
+        serde_json::to_value(&typed).expect("writes")
+    }
+
+    let types = types();
+    let examples = example_records();
+    assert_eq!(examples.len(), 4, "one example per derived type");
+    for mut record in examples {
+        let type_id = record["type"].as_str().expect("a type").to_owned();
+        let payload = &mut record["payload"];
+        match type_id.as_str() {
+            ENRICHMENT_FACT_CANDIDATE_TYPE => {
+                payload["evidence"] = json!("Listed on the faculty page.");
+            }
+            MASTERY_COURSE_CATALOG_TYPE => {
+                for concept in payload["concepts"].as_array_mut().expect("concepts") {
+                    concept["description"] = json!("A concept of the course.");
+                }
+            }
+            _ => {}
+        }
+        types
+            .check(&record)
+            .await
+            .unwrap_or_else(|err| panic!("{type_id}: {err:?}"));
+
+        let written = match type_id.as_str() {
+            CHAT => round_trip::<ChatMessageV1>(&record),
+            ENRICHMENT_FACT_CANDIDATE_TYPE => round_trip::<FactCandidateV1>(&record),
+            MASTERY_COURSE_CATALOG_TYPE => round_trip::<CourseCatalogV1>(&record),
+            MASTERY_STUDENT_MASTERY_TYPE => round_trip::<StudentMasteryV1>(&record),
+            other => panic!("no typed envelope for {other}"),
+        };
+        assert_eq!(written, record, "{type_id}");
     }
 }

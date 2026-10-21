@@ -92,4 +92,56 @@ mod tests {
             .await
             .expect("a second run is a no-op");
     }
+
+    /// A row stored before the upgrade keeps its tenant, key, connector and
+    /// subject, and its key still refuses a second row, so a resend of a
+    /// record received before the upgrade is still a repeat.
+    #[tokio::test]
+    async fn a_row_stored_before_the_upgrade_still_makes_a_resend_a_repeat() {
+        use sea_orm_migration::sea_orm::{ConnectionTrait, Statement};
+
+        use crate::domain::record_intake::{IdentityParts, RecordKey};
+
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("in-memory sqlite connects");
+        Migrator::up(&db, Some(3)).await.expect("up to m003");
+        let key = RecordKey::of(IdentityParts {
+            connector: "connector-a",
+            provenance: "chat_engine/thread-42/msg-7",
+            version: "v1",
+        });
+        db.execute_unprepared(&format!(
+            "INSERT INTO {TABLE} (tenant_id, record_key, connector, provenance, version, \
+             subject_id, received_at) VALUES ('tenant-a', '{key}', 'connector-a', \
+             'chat_engine/thread-42/msg-7', 'v1', 'subject-a', '2026-10-21T10:00:00Z')"
+        ))
+        .await
+        .expect("a row under m003");
+
+        Migrator::up(&db, None).await.expect("the upgrade");
+
+        let row = db
+            .query_one_raw(Statement::from_string(
+                db.get_database_backend(),
+                format!("SELECT tenant_id, record_key, connector, subject_id FROM {TABLE}"),
+            ))
+            .await
+            .expect("query")
+            .expect("the row survives");
+        let column = |name: &str| row.try_get::<String>("", name).expect(name);
+        assert_eq!(column("tenant_id"), "tenant-a");
+        assert_eq!(column("record_key"), key.as_str());
+        assert_eq!(column("connector"), "connector-a");
+        assert_eq!(column("subject_id"), "subject-a");
+
+        let again = db
+            .execute_unprepared(&format!(
+                "INSERT INTO {TABLE} (tenant_id, record_key, connector, subject_id, \
+                 received_at) VALUES ('tenant-a', '{key}', 'connector-a', 'subject-a', \
+                 '2026-10-21T11:00:00Z')"
+            ))
+            .await;
+        assert!(again.is_err(), "the key refuses a second row: {again:?}");
+    }
 }

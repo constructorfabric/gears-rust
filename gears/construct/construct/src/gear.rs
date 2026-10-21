@@ -87,7 +87,10 @@ impl Gear for ConstructGear {
         let hub = ctx.client_hub();
         // Everything that can fail runs before either service is stored, so a
         // failed start leaves the gear uninitialized and a retry can succeed.
-        let types = Arc::new(RegistryRecordTypes::new(Arc::clone(&hub))?);
+        let types = Arc::new(
+            RegistryRecordTypes::new(Arc::clone(&hub))
+                .context("construct-sdk record base schema")?,
+        );
         // @cpt-begin:cpt-cf-construct-algo-subject-settings-start:p1:inst-settings-start
         let defaults = SettingsServiceDefaults::new(Arc::clone(&hub), cfg.personalization_default)
             .context("personalization default setting key")?;

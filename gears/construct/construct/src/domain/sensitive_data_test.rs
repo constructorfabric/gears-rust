@@ -186,11 +186,11 @@ async fn a_failed_check_drops_the_record_with_a_drop_event() {
     assert_eq!(events[0].connector, "connector-a");
     assert_eq!(
         events[0].record_key,
-        crate::domain::record_intake::record_key(
-            "connector-a",
-            "chat_engine/thread-42/msg-7",
-            "v1"
-        )
+        crate::domain::record_intake::RecordKey::of(crate::domain::record_intake::IdentityParts {
+            connector: "connector-a",
+            provenance: "chat_engine/thread-42/msg-7",
+            version: "v1",
+        })
     );
 }
 

@@ -39,7 +39,7 @@ impl RecordIdRepository for SeaOrmRecordIdRepository {
     ) -> Result<IdInsert, DomainError> {
         let row = entity::ActiveModel {
             tenant_id: ActiveValue::Set(id.tenant_id),
-            record_key: ActiveValue::Set(id.key()),
+            record_key: ActiveValue::Set(id.key.as_str().to_owned()),
             connector: ActiveValue::Set(id.connector),
             subject_id: ActiveValue::Set(id.subject_id),
             received_at: ActiveValue::Set(OffsetDateTime::now_utc()),

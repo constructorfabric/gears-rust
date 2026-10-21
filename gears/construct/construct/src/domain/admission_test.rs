@@ -133,11 +133,11 @@ async fn personalization_off_drops_the_plan() {
     assert_eq!(event.connector, "connector-a");
     assert_eq!(
         event.record_key,
-        crate::domain::record_intake::record_key(
-            "connector-a",
-            "chat_engine/thread-42/msg-7",
-            "v1"
-        )
+        crate::domain::record_intake::RecordKey::of(crate::domain::record_intake::IdentityParts {
+            connector: "connector-a",
+            provenance: "chat_engine/thread-42/msg-7",
+            version: "v1",
+        })
     );
     assert_eq!(event.type_id, construct_sdk::gts::CHAT_MESSAGE_TYPE);
 }

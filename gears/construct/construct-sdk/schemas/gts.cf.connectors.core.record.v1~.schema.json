@@ -1,0 +1,73 @@
+{
+  "$id": "gts://gts.cf.connectors.core.record.v1~",
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "additionalProperties": false,
+  "description": "Abstract base of one observed record inside a connector push. Dedupe and re-push idempotency are keyed on (tenant, connector, provenance, version) - tenant and connector identity from the push envelope, provenance and version from the record. The connector identity is one opaque value derived from the envelope's vendor and package, never the connector's build version. Provenance is the source-formed locator of the observed thing, version identifies its content at observation - re-pushing the same (provenance, version) is a no-op. Producer obligation: version MUST be derived from the observed content (each derived type documents its derivation): a producer obligation, not verifiable by the results API (the derivation input exists only at the source). Post-observation changes at the source are not propagated (forward-only delivery). The top level is frozen (additionalProperties: false): a derived content type refines only the payload member. A record about a person sets subject_id; a type states whether its records are about a person in the trait subject_required, on unless the type turns it off, and the results API enforces it. A record pushed to the results API carries no id.",
+  "properties": {
+    "observed_at": {
+      "description": "When the connector formed the record. For a forwarding connector, when\nit observed the record at the source. For a computing connector, when\nit finished computing the record. Each derived type states in its own\ndescription which sense it uses.",
+      "format": "date-time",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}[Tt]\\d{2}:\\d{2}:\\d{2}(\\.\\d+)?([Zz]|[+-]\\d{2}:\\d{2})$",
+      "type": "string"
+    },
+    "payload": {
+      "type": "object"
+    },
+    "provenance": {
+      "description": "Opaque, source-formed locator of the observed thing, stable across\nre-pushes. E.g. for chat: source + thread id + message id.",
+      "maxLength": 1024,
+      "minLength": 1,
+      "type": "string"
+    },
+    "subject_id": {
+      "description": "The person the record is about. Absent only for source-scoped records.",
+      "format": "uuid",
+      "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
+      "type": "string"
+    },
+    "type": {
+      "allOf": [
+        {
+          "description": "GTS type identifier",
+          "format": "gts-type-id",
+          "title": "GTS Type ID",
+          "type": "string",
+          "x-gts-ref": "gts.*"
+        }
+      ],
+      "description": "The derived content type this instance conforms to; it must derive\nfrom this base.",
+      "maxLength": 1024,
+      "pattern": "^gts\\.[a-z_][a-z0-9_]*(\\.[a-z_][a-z0-9_]*){3}\\.v[0-9]+(\\.[0-9]+)?~([a-z_][a-z0-9_]*(\\.[a-z_][a-z0-9_]*){3}\\.v[0-9]+(\\.[0-9]+)?~)+$",
+      "x-gts-ref": "gts.cf.connectors.core.record.v1~"
+    },
+    "version": {
+      "description": "Identifies the record's content at observation, derived from that\ncontent per the producer obligation.",
+      "maxLength": 256,
+      "minLength": 1,
+      "type": "string"
+    }
+  },
+  "required": [
+    "type",
+    "provenance",
+    "version",
+    "observed_at",
+    "payload"
+  ],
+  "type": "object",
+  "x-gts-abstract": true,
+  "x-gts-traits": {
+    "subject_required": true
+  },
+  "x-gts-traits-schema": {
+    "additionalProperties": false,
+    "properties": {
+      "subject_required": {
+        "default": true,
+        "description": "Whether a record of this type is about one person and so must set\n`subject_id`. On unless the type turns it off.",
+        "type": "boolean"
+      }
+    },
+    "type": "object"
+  }
+}

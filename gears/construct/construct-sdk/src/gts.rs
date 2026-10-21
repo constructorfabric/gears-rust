@@ -14,6 +14,14 @@
 //! enforces. It is on unless a type turns it off, so a type that says nothing
 //! requires a subject.
 //!
+//! The payload structs define the schemas; reading records into them has a
+//! limit. `gts-macros` 0.12 (de)serializes a derived struct with its own code,
+//! which ignores `#[serde(default)]` and `skip_serializing_if`: it reads every
+//! payload member as required and writes an absent optional one as `null`,
+//! which the schema refuses. A record whose payload leaves an optional member
+//! out is valid but cannot be read into its payload struct. Intake checks the
+//! JSON against the schemas and never reads the payload structs.
+//!
 //! @cpt-dod:cpt-cf-construct-dod-record-intake-types:p1
 
 use gts::{GtsSchema, GtsTypeId};
@@ -79,6 +87,7 @@ pub fn record_base_schema() -> serde_json::Value {
     Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, GtsTraitsSchema,
 )]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct RecordTraits {
     /// Whether a record of this type is about one person and so must set
     /// `subject_id`. On unless the type turns it off.
@@ -88,6 +97,15 @@ pub struct RecordTraits {
 
 fn subject_required_default() -> bool {
     true
+}
+
+// The traits of a type that declares none: a subject is required.
+impl Default for RecordTraits {
+    fn default() -> Self {
+        Self {
+            subject_required: subject_required_default(),
+        }
+    }
 }
 
 /// The traits of a record type that is about one person.
@@ -115,6 +133,7 @@ pub struct RecordV1<P: GtsSchema> {
     #[serde(rename = "type")]
     #[schemars(extend(
         "x-gts-ref" = gts_id!("cf.connectors.core.record.v1~"),
+        "maxLength" = 1024,
         "pattern" = r"^gts\.[a-z_][a-z0-9_]*(\.[a-z_][a-z0-9_]*){3}\.v[0-9]+(\.[0-9]+)?~([a-z_][a-z0-9_]*(\.[a-z_][a-z0-9_]*){3}\.v[0-9]+(\.[0-9]+)?~)+$"
     ))]
     pub gts_type: GtsTypeId,
@@ -150,9 +169,10 @@ pub struct RecordV1<P: GtsSchema> {
     pub payload: P,
 }
 
-/// Where a chat message was exported from. More export sources may come.
+/// Where a chat message was exported from. The values are fixed for
+/// `chat.message.v1~`: a registered type version does not change, so a new
+/// source needs a new version of the type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[non_exhaustive]
 #[serde(rename_all = "snake_case")]
 #[schemars(inline)]
 pub enum ChatSource {
@@ -194,9 +214,10 @@ pub struct ChatMessageV1 {
     pub text: String,
 }
 
-/// The kind of fact a candidate proposes. More kinds may come.
+/// The kind of fact a candidate proposes. The values are fixed for
+/// `enrichment.fact_candidate.v1~`: a new kind needs a new version of the
+/// type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[non_exhaustive]
 #[serde(rename_all = "snake_case")]
 #[schemars(inline)]
 pub enum FactType {

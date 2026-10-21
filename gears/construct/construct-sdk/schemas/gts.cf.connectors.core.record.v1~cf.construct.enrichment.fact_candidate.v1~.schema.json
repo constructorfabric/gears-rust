@@ -1,0 +1,124 @@
+{
+  "$id": "gts://gts.cf.connectors.core.record.v1~cf.construct.enrichment.fact_candidate.v1~",
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "allOf": [
+    {
+      "$ref": "gts://gts.cf.connectors.core.record.v1~"
+    },
+    {
+      "properties": {
+        "payload": {
+          "additionalProperties": false,
+          "properties": {
+            "citations": {
+              "description": "Grounding: URL plus verbatim quote. Absent means none provided, not\nverified-empty.",
+              "items": {
+                "additionalProperties": false,
+                "description": "Grounding of a fact candidate: URL plus verbatim quote.",
+                "properties": {
+                  "char_end": {
+                    "description": "Where the quote ends in the chunk; see `char_start`.",
+                    "format": "uint64",
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "char_start": {
+                    "description": "Where the quote starts in the chunk. The source does not define the\nunit or whether `char_end` is inclusive; Construct does not read\neither.",
+                    "format": "uint64",
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "chunk_id": {
+                    "description": "The connector's id of the page chunk the quote is from.",
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "source_url": {
+                    "description": "The page the quote is from.",
+                    "format": "uri",
+                    "pattern": "^https?://",
+                    "type": "string"
+                  },
+                  "verbatim_quote": {
+                    "description": "The quote, verbatim.",
+                    "minLength": 1,
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "source_url",
+                  "chunk_id",
+                  "verbatim_quote"
+                ],
+                "type": "object"
+              },
+              "type": "array"
+            },
+            "claim": {
+              "description": "The proposed factual statement, as stated by the source.",
+              "minLength": 1,
+              "type": "string"
+            },
+            "confidence": {
+              "description": "The connector's per-candidate judgment, after identity scoring and\n`decide()`.",
+              "format": "double",
+              "maximum": 1,
+              "minimum": 0,
+              "type": "number"
+            },
+            "date": {
+              "description": "Date of the fact as carried by its source, never a clock read.",
+              "type": "string"
+            },
+            "evidence": {
+              "description": "Free-text evidence snippet supporting the claim.",
+              "type": "string"
+            },
+            "fact_type": {
+              "description": "The kind of fact a candidate proposes. The values are fixed for\n`enrichment.fact_candidate.v1~`: a new kind needs a new version of the\ntype.",
+              "enum": [
+                "role",
+                "news",
+                "award",
+                "board",
+                "publication",
+                "profile",
+                "bio",
+                "mention"
+              ],
+              "type": "string"
+            },
+            "source_url": {
+              "description": "The page the claim was grounded against.",
+              "format": "uri",
+              "pattern": "^https?://",
+              "type": "string"
+            },
+            "trust_tier": {
+              "description": "Trust classification assigned by the connector's tiering. The\nconnector emits no other values.",
+              "enum": [
+                "found",
+                "saved"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "claim",
+            "fact_type",
+            "confidence",
+            "trust_tier",
+            "source_url"
+          ],
+          "type": "object"
+        }
+      },
+      "type": "object"
+    }
+  ],
+  "description": "One fact candidate the Enrichment connector proposes for a person: the connector runs the deterministic judgment (identity scoring, decide, tiering) and emits candidates; only fact management writes facts. The discovery dossier stays connector-internal, and the source model's co_sourced flag is dropped on purpose: it is an internal input to the connector's tiering and its effect arrives already folded into trust_tier. The record's subject_id is always set (a candidate is about one person); record provenance = the fact key plus the normalized value, version = a digest of the payload - both content-derived, so a re-push and a re-run of the same judgment dedupe to one record. The connector computes rather than forwards, so the record's observed_at is when the candidate was computed.",
+  "type": "object",
+  "x-gts-traits": {
+    "subject_required": true
+  }
+}
