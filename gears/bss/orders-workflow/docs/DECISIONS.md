@@ -4079,7 +4079,7 @@ calls, left 07 out of 08's dependencies, and hid the 06↔07, 06↔09, 07↔09 a
 following it could not compile 06 (OW2-84). ADR-0002's own table also ordered `10` before `01`,
 while `design/README.md` and `design/10` put the foundation first. **Precedent**: Orders
 Lifecycle builds capture and local transition tests against an `EventBrokerApi` double before the
-broker exists (`orders-lifecycle/docs/features/README.md`, *Phase 0/1*); ADR-0002's rule "a slice
+broker exists (`orders-lifecycle/docs/DECOMPOSITION.md` §3.1, *Phase 0/1*); ADR-0002's rule "a slice
 depends only on a slice earlier in the build order" is kept, with the stated back-edges as its
 only exceptions. Rejected: splitting every port trait into a separate build step ahead of all
 slices, which adds a build stage for a handful of edges.
@@ -4148,7 +4148,7 @@ operations (Lifecycle `design/05-preconditions.md` §3.7, D-133). The snapshot o
 row with its revision, never re-read, is Lifecycle's `design/03-gate-and-pin.md` §4.2 item 8.
 Within this gear, the load follows `owf_step_operation`: one transaction, audited on change.
 **Rejected**: Pricing's runtime tenant configuration plane, `GET/PUT` routes under their own PDP
-resource (Pricing `design/05-governance.md`). It fits a seller-edited commercial surface, but here
+resource (Pricing's former `design/05-governance.md`, retired by the PriceBook rewrite; now `DESIGN.md` §1.2 `nfr-authz`). It fits a seller-edited commercial surface, but here
 it would add routes, a catalogue resource and grants for rarely changed values, the trade-off
 Lifecycle D-133 rejected for its elections. Also rejected: the platform Settings Service
 (`gears/settings-service`), which has no implementation and would need an upstream ask, as

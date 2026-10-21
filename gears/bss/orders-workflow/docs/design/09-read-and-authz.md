@@ -398,7 +398,7 @@ PDP as request context and never validated locally
 
 **Resource/action catalogue (normative).** Labels are GTS ids `gts.cf.bss.orders_workflow.<noun>.v1~`
 in this gear's namespace (`01 §4.7`), registered with the platform PDP in Pricing's shape
-([`05-governance.md` *AuthZ Resource and Action Catalog*](../../../pricing/docs/design/05-governance.md#authz-resource-and-action-catalog-normative)),
+(Pricing [`DESIGN.md` §1.2 *Architecture Drivers*](../../../pricing/docs/DESIGN.md#12-architecture-drivers), `cpt-cf-bss-pricing-nfr-authz`; the catalogue section of Pricing's former `05-governance.md` was retired by the PriceBook rewrite, and the catalogue shape this gear follows is Lifecycle's),
 each action on its real object. Per row, the **PDP properties** column names the resource
 properties the adapter supplies with every decision and the `ResourceType` advertises as
 `supported_properties`; the PDP constrains on them and `SecureConn` maps them to the row's columns
