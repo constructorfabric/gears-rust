@@ -6649,6 +6649,122 @@ the restart; it is the pattern `heldTicks` already uses for held polls (D-133).
 **Propagated**: `design/10-process-definition.md` §3.6 (waits table,
 `awaitCompensationResolution`, `afterCompensationResolution`, `retryLegDue`); D-133, D-142.
 
+### D-220 (H) A not-found read past the key lifetime proves nothing: the intent is `unresolved`, and `never-dispatched` needs a confirmed non-application
+
+**Accepted (2026-10-21).** *(PR #4787 proposal of 2026-10-18, item 3; amends `design/05` §4.4 and D-153's retry rule)*
+
+**Decision**: past the key lifetime the sweep stays read-only and no longer drives a not-found
+intent to `failed` with reason `never-dispatched`. The row is recorded `unresolved` with
+`not_found_at` kept and listed in `unresolved[]`, so the definition raises an `intent-unresolved`
+task. It leaves `unresolved` only on evidence: a later read that returns the request, or
+Subscriptions' confirmed non-application of the scoped attempt through the new ask `SUB-O17`
+(closed-attempt fence with retained terminal lookup), which alone records `never-dispatched` and
+releases the line to a new attempt or a successor draft. The re-arm port's on-demand read is that
+close-and-lookup once the ask lands. Inside the key lifetime D-209's same-key resend is unchanged.
+
+**Rationale**: a missing record does not prove that a delayed request cannot execute or be applied
+once the de-duplication window closes; authorizing a new key from that uncertainty could create a
+second subscription. The catalogue reason stays, but only a receiver-side fact may record it.
+
+**Propagated**: `design/05-provisioning-intents.md` §3.2 (*Responsibility boundaries*), §3.3
+(`reasons`), §3.7 (`status`), §4.1 (`SUB-O17`), §4.4; `UPSTREAM_REQS.md` §2.1 (`SUB-O17`); D-153,
+D-209.
+
+### D-221 (M) The scheduled date means begin preparation, and the three deadlines reconcile one operation
+
+**Accepted (2026-10-21).** *(PR #4787 proposal item 6; restates D-165, D-195, D-211)*
+
+**Decision**: `expected_fulfillment_at` means *begin connection and preparation*: Subscriptions'
+activation prepares the service from it and commits the actual start once readiness is in, so the
+barrier promises neither a ready service at that instant nor simultaneous completion across lines,
+and nothing forecasts provisioning duration to start earlier. The dispatch call's deadline bounds
+the submit, the asynchronous activation duration is Subscriptions' and is observed only through the
+status read, and this gear's waiting bound is the sweep floor inside the overdue window; an expiry
+of any of the three reconciles the same operation and is neither an activation failure nor
+permission to submit another activation.
+
+**Rationale**: the proposal asked for these distinctions to be explicit; the design already behaved
+this way (acceptance is not completion, `approved` is not `applied`, the start is read back) but
+stated the semantics of the scheduled instant and of the three bounds nowhere in one place.
+
+**Propagated**: `design/04-fulfillment-plan.md` §3.7 (`expected_fulfillment_at`);
+`design/05-provisioning-intents.md` §4.2 (*Three deadlines, one operation*); D-165, D-195, D-211.
+
+### D-222 (L) An executable scenario on the selected runtime is an implementation-planning item, not a merge condition
+
+**Accepted (2026-10-21).** *(PR #4787 proposal item 9)*
+
+**Decision**: implementation planning includes a small executable scenario on the actual
+serverless-runtime Temporal integration with controllable doubles for Lifecycle, Subscriptions and
+Payments, exercising the paths Q-11 and the §2.9 readiness asks leave assumed: event retention
+between listens, retry exhaustion and re-drive, history growth over a long scheduled wait, worker
+restart during waits and cancellation between listener registrations. Accelerated runs are labelled
+as such. This is recorded next to Q-11 and does not condition the merge of this design set.
+
+**Rationale**: the proposal recommends it and says it is neither a claim that those capabilities
+were tested nor a merge condition; Q-11 already lists the same assumptions as readiness items.
+
+**Propagated**: Q-11 (*Implementation-planning note*).
+
+### D-223 (H) Financial readiness through Billing, protected purchase before capture, and cancellation while waiting for payment are recorded as owners' asks; D-194 and the Payments read stand until decided
+
+**Accepted (2026-10-21).** *(PR #4787 proposal items 1, 2 and 5)*
+
+**Decision**: three proposals change seams other gears own and are recorded as asks with owners
+rather than designed here: financial readiness answered by Billing as a four-way result with
+pay-later terms from Pricing's `billing_timing` (§2.2, with Lifecycle's begin-fulfillment guard
+moving with it); durable capacity and accepted-term protection before capture, with Lifecycle
+separating an assessment expiry from protected coverage (§2.2, §2.4); and a seller-policy
+payment-wait deadline with Lifecycle's pre-fulfillment cancellation arbitration and a
+Billing/Payments stop-or-reconcile answer (§2.2, §2.4). The design keeps the Payments
+authorization read of `design/04` §3.5, the single `activation_deadline_at` of D-194 and the
+`in_fulfillment` cancellation seam of D-109, each annotated with the pending ask. PRD amendment 22
+is a candidate and is not applied.
+
+**Rationale**: the consumer cannot re-home a read or split a deadline the owners have not agreed;
+designing against an unagreed contract is what D-202's withdrawn `settle_create` taught. Recording
+the asks keeps the proposal's ownership rules intact — nothing moves into Workflow — and lets each
+owner answer in its own register.
+
+**Propagated**: `design/04-fulfillment-plan.md` §3.5 (*Proposed re-homing*),
+§3.7 (`activation_deadline_at`); `design/09-read-and-authz.md` §3.3 (cancel route);
+`UPSTREAM_REQS.md` §2.2 (three asks), §2.4 (two asks), §2.5, §4 item 22; D-109, D-194.
+
+### D-224 (M) The named-user approval criterion is asked of the shared library; the stand-in is never bound to a profile that requires approval
+
+**Accepted (2026-10-21).** *(PR #4787 proposal item 7; extends D-197, Q-14)*
+
+**Decision**: the shared `cf-gears-bss-approval` library is asked for a second approval-condition
+type, decisions by explicitly named users bound to the unit's generation, with Orders connected to
+the common BSS Approvals Inbox through its source interface and no second authoritative queue.
+Until it lands, `design/03`'s inbox projection remains the enforcement point. The stand-in adapter
+that answers "approval not required" **MUST NOT** be bound to a seller profile whose policy
+requires a real approval; that binding is a configuration refusal at readiness.
+
+**Rationale**: the proposal's rule is that the owner-side decision path enforces the criterion and
+that the stand-in must not enable a profile needing real approval. The first is the library's to
+build; the second is this gear's and costs one readiness check.
+
+**Propagated**: `design/03-approval-execution.md` §2.2 (*The approval policy adapter is the policy
+owner*); `UPSTREAM_REQS.md` §2.3; D-197, Q-14.
+
+### D-225 (M) The approval valuation basis is the policy's explicit choice, computed by Rating and retained by Lifecycle; the figure's representation follows the shared money type
+
+**Accepted (2026-10-21).** *(PR #4787 proposal item 8; extends D-198)*
+
+**Decision**: the versioned approval policy chooses its basis explicitly — full contractual
+commitment for a fixed term by default, authorized budget, forecast or "unavailable" for variable
+usage, unknown never read as zero — Rating computes it, Lifecycle retains it with basis, currency,
+term and provenance, and this gear forwards it without computation (D-198). `tcv_minor` gives way
+to the shared exact major-unit money representation when Lifecycle's storage does. Recorded as an
+ask on Rating and Lifecycle; the request payload of `design/03` §3.3 changes only when they answer.
+
+**Rationale**: this gear computes no amount and stores none, so the basis and the representation
+are the owners' choices; the design says what it forwards and from whom.
+
+**Propagated**: `design/03-approval-execution.md` §3.3 (*Valuation basis, open*);
+`UPSTREAM_REQS.md` §2.4, §2.5; D-198.
+
 ## Open Questions
 
 ### Q-01: Which durable-execution substrate backs the process — the OSS Workflow Engine or a BSS-local mechanism?
@@ -6891,6 +7007,13 @@ withdrawn), and only a lost resume is recovered: by the stopgap poll of D-130 in
 stage's resume wait, and by the same poll in every other wait that holds a recorded suspension
 (D-133); (vi) assumed, and a readiness item, because no CI test can observe it.
 
+**Implementation-planning note (D-222, 2026-10-21)**: before the first production definition is
+published, implementation builds a small executable scenario on the actual serverless-runtime
+Temporal integration with controllable doubles for Lifecycle, Subscriptions and Payments, covering
+(iv) and (vi) above, retry exhaustion and re-drive, history growth over a long scheduled wait,
+worker restart during waits and cancellation between listener registrations; accelerated runs are
+labelled as such. Not a merge condition of this design set.
+
 **Review trigger**: the platform readiness gate (`…-upreq-serverless-runtime-readiness-gate`).
 
 ### Q-12: Engine-history isolation, retention and residency — the pending half of Q-01
@@ -6998,6 +7121,7 @@ register relies on is cited to a serverless-runtime file and line or registered 
 | D-209 | 05 Provisioning intents, 06 Saga (Subscriptions #5131 received, 2026-10-12) | `PRD.md` §6.3, §9.2, §13; `design/05`, `design/06`; `UPSTREAM_REQS.md` §2.1, §4 |
 | D-210 | cross-cutting (review findings, 2026-10-12) | `ADR/0011`, `ADR/0012`, `ADR/0013`; `design/01`, `design/08`; `UPSTREAM_REQS.md` §2.9 |
 | D-211 | 05 Provisioning intents (actual start read back, 2026-10-18) | `design/05`; `UPSTREAM_REQS.md` `SUB-O10`; D-195 |
+| D-220–D-225 | cross-cutting (PR #4787 proposal of 2026-10-18, received 2026-10-21) | `design/03` §2.2, §3.3; `design/04` §3.5, §3.7; `design/05` §3.2, §3.3, §3.7, §4.1, §4.2, §4.4; `design/09` §3.3; `UPSTREAM_REQS.md` §2.1–§2.5, §4 item 22; Q-11 |
 | D-212–D-219 | cross-cutting (PR #4787 review findings, 2026-10-18) | `design/05` §3.3, §3.6, §3.7, §4.4, §4.5; `design/06` §3.6, §3.7, §4.7; `design/07` §2.2, §3.6, §4.4; `design/08` §2.2, §3.6, §3.7; `design/09` §3.3, §3.7, §4.4; `design/10` §3.6; `UPSTREAM_REQS.md` §2.1 |
 | D-200–D-205 | cross-cutting (Seam Atlas alignment, 2026-10-02) | `UPSTREAM_REQS.md` §2.1, §2.2, §2.4, §2.5, §4; `PRD.md` §9.1, §13, §15, §16; `design/05` §3.3; `design/06` §4.8 |
 | D-05–D-08 | 02 Triggers and start | `design/02-triggers-and-start.md` |
@@ -7188,6 +7312,12 @@ register relies on is cited to a serverless-runtime file and line or registered 
 | D-217 | M The workflow-cancel key carries a request generation that advances on a refusal | `design/09` §3.3, §3.7, §4.4; D-115 |
 | D-218 | M The wave-2 reread takes its next round from the read's `settledRounds[]` | `design/05` §3.3, §3.6, §4.5; `design/10` §3.6; D-120 |
 | D-219 | M The compensation leg retry rides the SLA tick, counted in `retryTicks`, never a competing `PT1H` branch | `design/10` §3.6; D-133 |
+| D-220 | H A not-found read past the key lifetime leaves the intent `unresolved`; `never-dispatched` only on a `SUB-O17`-confirmed non-application | `design/05` §3.2, §3.3, §3.7, §4.1, §4.4; `UPSTREAM_REQS.md` §2.1; D-153, D-209 |
+| D-221 | M The scheduled date means begin preparation; dispatch deadline, activation duration and waiting bound reconcile one operation | `design/04` §3.7; `design/05` §4.2; D-165, D-195, D-211 |
+| D-222 | L An executable scenario on the selected runtime is an implementation-planning item, not a merge condition | Q-11 |
+| D-223 | H Financial readiness through Billing, protected purchase before capture and payment-wait cancellation recorded as owners' asks; D-194, D-109 and the Payments read stand | `design/04` §3.5, §3.7; `design/09` §3.3; `UPSTREAM_REQS.md` §2.2, §2.4, §2.5, §4 item 22 |
+| D-224 | M Named-user approval criterion asked of the shared library and the common inbox; the stand-in is never bound to a profile that requires approval | `design/03` §2.2; `UPSTREAM_REQS.md` §2.3; D-197, Q-14 |
+| D-225 | M Approval valuation basis is the policy's explicit choice, computed by Rating and retained by Lifecycle; shared money representation | `design/03` §3.3; `UPSTREAM_REQS.md` §2.4, §2.5; D-198 |
 
-Highest decision number used: **D-219**; highest question number: **Q-14**. Numbering is one continuous sequence across the whole
+Highest decision number used: **D-225**; highest question number: **Q-14**. Numbering is one continuous sequence across the whole
 register; there are no parts.

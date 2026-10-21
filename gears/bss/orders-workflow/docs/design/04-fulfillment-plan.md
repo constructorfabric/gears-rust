@@ -627,6 +627,16 @@ again), whose resume, amendment and cancel arms consume what the operation obser
 |------------------|-----------------|----------|
 | Payments | **outbound read-by-request** of the authorization outcome (`authorized` / `pending` / `failed`) for the order's idempotent authorization request identity | The begin-fulfillment money gate (§2.1) and the freshness input of the pre-activation re-check (§3.7 `payment_auth_observed_at`). |
 
+**Proposed re-homing, open (D-223).** The PR #4787 proposal of 2026-10-18 asks that financial
+readiness for the order version be answered by **Billing**, from the accepted settlement terms and
+Payments' authoritative facts, as a four-way result (nothing required · satisfied · pending or
+unknown · definitive refusal with reason), with pay-later terms taken from Pricing's per-item
+`billing_timing` and the whole-order gate retained. This gear would consume that result exactly as
+it consumes the authorization outcome today and would still initiate no payment, session or
+invoice. It is recorded as `cpt-cf-bss-orders-workflow-upreq-financial-readiness-through-billing`
+(`UPSTREAM_REQS.md` §2.2) and needs Lifecycle's begin-fulfillment guard to move with it; until
+Billing and Lifecycle agree it, this read stays as written.
+
 **Direction, restated.** The previous revision of this slice settled the direction as an inbound
 report with a `payment-auth-wait` timer as the wake-up. Under ADR-0011 the wake-up is a definition
 `wait` arm, and the Lifecycle register asks Payments for exactly this shape — "an idempotent
@@ -987,8 +997,8 @@ No table is lost; no table in this slice holds a timer.
 | partial_failure_policy | text nullable | `remediate` \| `fail_fast`, pinned by `construct-and-freeze-plan` (§2.2); NULL only before construction. |
 | overdue_window_ms | bigint nullable | The seller's overdue window, pinned by `construct-and-freeze-plan` with the policy (§2.2, business default 24 h); the overdue deadline is `expected_fulfillment_at` + this value, read by `07`'s `raise-overdue-escalation`; NULL only before construction (decision D-134). |
 | seller_policy_revision | jsonb nullable | The `sellerPolicyRevision` of the pinned `partial_failure_policy` and `overdue_window_ms`: the (`policy_id`, `policy_revision`) of each `owf_seller_policy` row the seller-policy port used (`01 §3.7`); written with them and resolved through `owf_configuration_revision` for the row's whole retention; NULL only before construction (decisions D-140, D-160). |
-| expected_fulfillment_at | timestamptz nullable | `max(construction time, latest service-activation date among lines)`; returned as `expectedFulfillmentAt`. |
-| activation_deadline_at | timestamptz nullable | The earliest `activation_deadline` among the version's lines, copied from the `get_version` read at freeze (exclusive instant, Lifecycle D-152); the value `dispatch-wave2-activate`'s guard checks before each activation submit (`05 §3.6`). Never returned to the definition (decision D-194). |
+| expected_fulfillment_at | timestamptz nullable | `max(construction time, latest service-activation date among lines)`; returned as `expectedFulfillmentAt`. The instant means *begin connection and preparation*: Subscriptions' activation prepares the service from it and commits the actual start once readiness is in (D-195, D-211), so the barrier promises neither a ready service at that instant nor simultaneous completion across lines, and nothing forecasts provisioning duration to start earlier (decision D-221). |
+| activation_deadline_at | timestamptz nullable | The earliest `activation_deadline` among the version's lines, copied from the `get_version` read at freeze (exclusive instant, Lifecycle D-152); the value `dispatch-wave2-activate`'s guard checks before each activation submit (`05 §3.6`). Never returned to the definition (decision D-194). The PR #4787 proposal asks Lifecycle, Pricing and Subscriptions to separate an *assessment* expiry from *protected* future coverage so that a purchase whose accepted commitment covers its scheduled start is not invalidated by an old assessment deadline (`UPSTREAM_REQS.md` §2.4, D-223); until that ask is decided, this is the deadline Lifecycle D-152 defines and D-194 stands. |
 | construction_recheck | jsonb nullable | The advisory construction-time observation: `clear` \| `collision` \| `divergence` \| `unevaluable`, per-line codes, observed instant. Never read by a gate. |
 | recheck_defer_count | integer | Consecutive `defer` outcomes of `re-check-pre-activation`; DEFAULT 0. |
 | recheck_first_defer_at | timestamptz nullable | Database time of the first `defer` in the current ladder. |

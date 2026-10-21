@@ -576,7 +576,7 @@ for a line with no row). No new key is minted and nothing is resubmitted (§4.4,
 
 ##### Responsibility boundaries
 
-Never resubmits: it only re-reads. The one exception is the hand-back of a never-dispatched intent
+Never resubmits: it only re-reads. The one exception is the hand-back of a not-yet-sent intent
 inside the key lifetime, which it performs by reopening the step key through `settle-from-lookup`
 so that the **dispatch operation's** re-run sends it (§4.4) — the sweep itself still calls no
 submit. Never invents a key on a caller's behalf. Never writes a dead-letter record; the floor ends
@@ -731,7 +731,7 @@ operation's round. Every step key is recomposed server-side from the body
 | `idempotency_key` | instance-scoped: `{tenant}:{correlationId}:reconcile-intent:{sweepRound}`; the worker's in-process run is not a step call and carries no step key — its settlements are keyed by `settle-from-lookup`'s own family |
 | `declared_event` | `OrderFulfillmentStepCompleted`, one per line whose task reaches a terminal state in the unit of work; none when no line does |
 | `compensation` | none |
-| `reasons` | `wave1-create-failed`, `wave2-activation-failed`, `never-dispatched` (per line, in `failed[]`), `intent-unresolved` (per line, in `unresolved[]`; registered in `01 §4.9`, §4.6), `not-found` (an unmatched hint), `circuit-breaker-open`, `per-attempt-timeout`, `idempotency-key-mismatch` |
+| `reasons` | `wave1-create-failed`, `wave2-activation-failed`, `never-dispatched` (per line, in `failed[]`; only on a `SUB-O17`-confirmed non-application, D-220), `intent-unresolved` (per line, in `unresolved[]`; registered in `01 §4.9`, §4.6), `not-found` (an unmatched hint), `circuit-breaker-open`, `per-attempt-timeout`, `idempotency-key-mismatch` |
 | `audit_kind` | `sweep` (and `sweep-settlement`, written by `settle-from-lookup` in the same unit of work where it settles a stuck key) |
 | `retry_class` | `retryable-on: transient` |
 | `deadline` | 10 s |
@@ -1022,7 +1022,7 @@ by row locks, not an in-memory controller). It writes no `owf_durable_timer` row
 | `accepted_at` | timestamptz nullable | Database time of acceptance. |
 | `execution_seq` | bigint nullable | Monotonic per-order ordinal assigned at **acceptance**; 06's `compensation_sequence` is fed from it. ADR-0005 says "assigned … when the intent is dispatched"; acceptance is the refinement, because an intent never accepted created nothing to compensate. Where the dispatcher's settlement was lost, `reconcile-intent` assigns it at the read that recovers the acceptance (`inst-ri-read`, D-214); that one row's ordinal then reflects discovery order, which the walk tolerates because acquisition lines are independent (`06`, D-196). |
 | `subscription_id` | text nullable | The subscription created or acted on, from the status read; mirrored onto `owf_fulfillment_task.subscription_id`. |
-| `status` | enum(`submitted`, `draft_created`, `activated`, `voided`, `cancelled`, `lapsed`, `failed`, `unresolved`) | `lapsed` — a `draft_create` whose draft the re-read found voided by a cause not this gear's; `unresolved` — the sweep floor reached with no known outcome (replaces `dead_lettered`). |
+| `status` | enum(`submitted`, `draft_created`, `activated`, `voided`, `cancelled`, `lapsed`, `failed`, `unresolved`) | `lapsed` — a `draft_create` whose draft the re-read found voided by a cause not this gear's; `unresolved` — the sweep floor reached with no known outcome, or a not-found answer past the key lifetime (§4.4, D-220); replaces `dead_lettered`. |
 | `sweep_ladder` | enum(`in_sla`, `general`) | Selected by `(wave, intent_kind)`: `in_sla` only for `intent_kind = activation` (§4.2). |
 | `sweep_tier` | integer | Current rung. |
 | `sweep_reads` | integer | Status reads performed; the floor trips on it. |
@@ -1157,6 +1157,7 @@ where they differ from the register the register is amended (`UPSTREAM_REQS.md`)
 | `SUB-O13` | Answered in #5131 (lookup by order identity lacks `intentKind` and `wave_attempt`; residual) | Status-read of a non-terminal intent, by transition-request id or by the full lookup tuple `orderId` + `orderVersion` + order-line + wave + `intentKind` + `wave_attempt` (equivalently, by the intent idempotency key). The register's four-component tuple cannot distinguish a lapsed draft, its rebuilt successor and a void (amended in `UPSTREAM_REQS.md`, D-97). | PRD `SUB-O8` |
 | `SUB-O14` | Answered in #5131 | `correlationId` propagation along the Subscriptions → Policy Engine → OSS path. | PRD `SUB-O9` |
 | `SUB-O16` | Answered in #5131 (event name still open) | Identity-envelope echo on every confirmation and failure event: the union of the register's list (`correlationId`, the intent idempotency key, the asserting principal) and this slice's (`orderId`, `orderVersion`, `orderLineId`, wave, the opaque binding reference). `subscriptionId` is no longer needed on the echo, because it is taken from the `SUB-O13` read (§2.1). | none — new |
+| `SUB-O17` | **Open** (raised 2026-10-21, D-220; PR #4787 proposal item 3) | Closed-attempt fence and retained terminal lookup: by the full scoped identity (`SUB-O13`'s tuple), close a scoped attempt so that a delayed create or activation for it is refused, answer whether the attempt was applied (with its original result) or confirmed never applied, and retain that answer beyond the de-duplication window. Serialized with application at the point of effect. Prerequisite for recording `never-dispatched` past the key lifetime (§4.4) and for authorizing a successor draft (`rebuild-wave1`). | new |
 
 `PRD.md:349` states the echo as an obligation ("confirmations and failure events **MUST** echo
 …"), but an obligation on a foreign aggregate is an upstream ask. Under this slice's wake-up rule
@@ -1198,6 +1199,16 @@ magnitude, and it is selected by **`(wave, intent_kind)`**, not by `wave` alone:
 |-------|----------|------------|
 | Sweep floor | **30 reads or 23 h from `created_at`, whichever comes first** | Applies to both ladders. 23 h sits inside the 24 h overdue window so the sweep has always resolved an intent or handed it to a manual task before the overdue escalation fires. At the floor the intent becomes `unresolved`, scheduled reads stop, and `reconcile-intent` reports it in `unresolved[]` so the definition's failure arm creates a manual task (`intent-unresolved`); on-demand reads — a confirmation hint, the fence of 06, a manual `retry` (which re-arms the `unresolved` row for one scheduled read, §3.7; a read that is still non-terminal returns it to `unresolved` and lists it again, D-119) — continue. There is no dead-letter terminus (`01 §4.8`). |
 | Worker page size | **500 rows per pass, 30 s transaction budget** | Keeps one pass from holding a long transaction against the process tables. |
+
+**Three deadlines, one operation** (decision D-221). The dispatch call's deadline (10 s, §3.3) bounds
+the *submit*; the asynchronous activation duration — account, environment and access readiness
+before Subscriptions' guarded commit (D-195, D-211) — is Subscriptions' and is observed only
+through the status read; and this gear's *waiting* bound is the sweep floor above, inside the
+overdue window of `04`. An expiry of any of the three reconciles the **same** operation: it is
+neither an activation failure nor permission to submit another activation, and the overdue window
+is non-terminal (`07 §2.2`). Policy on expiry is to keep waiting on the `intent-unresolved` task,
+escalate, or request cancellation through the unwind — never a second attempt while the first may
+be live (§4.4).
 | Jitter | full jitter on every `next_sweep_at` | An unjittered interval re-reads every in-flight intent in lockstep and the sweep becomes the load spike it exists to recover from. |
 
 Three properties make this a derivation. First, the in-SLA ladder **MUST** fit inside the 15-minute
@@ -1262,23 +1273,32 @@ throttle-induced delay never extends the per-operation deadline (`01 §4.12`).
   key is safe by construction: `reconcile-intent` sets `not_found_at`, reports the line in
   `redispatch[]`, and — where the dispatching step key is `in_flight` with a dead lease — settles
   it `absent` through `settle-from-lookup`, leaving it `open` for the dispatch operation's re-run;
-  the dispatch operation, not the sweep, sends it. **Past the key lifetime** the sweep is read-only:
-  the intent is driven to `failed` with reason `never-dispatched`, the task advances to `failed`,
-  and the pinned partial-failure policy takes over. A not-found answer is never read as "it
-  succeeded and we missed the confirmation".
+  the dispatch operation, not the sweep, sends it. **Past the key lifetime** the sweep is read-only,
+  and a not-found answer proves nothing: a delayed request may still be executing, or may yet be
+  applied once the de-duplication window has closed, so the intent is **not** driven to `failed`
+  by inference (decision D-220). The row is recorded `unresolved` with `not_found_at` kept, is
+  listed in `unresolved[]` so the definition's failure arm raises an `intent-unresolved` task, and
+  leaves `unresolved` only on evidence: a later read that returns the request, whose result is
+  recovered like any other outcome (`inst-ri-read`), or Subscriptions' confirmed non-application
+  of the scoped attempt (`SUB-O17`, §4.1), which the re-arm port's on-demand read requests once
+  that ask lands and which alone records `failed` with reason `never-dispatched`. A not-found
+  answer is never read as "it succeeded and we missed the confirmation", and never as "it cannot
+  execute".
 - **Read-only past the lifetime.** No operation of this slice **MAY** submit under an intent key
   whose `key_expires_at` has passed; a next attempt for that line is a new key, minted by
   `rebuild-wave1` (lapsed draft) or an operator's line retry once the intent is recorded `failed`
-  (`never-dispatched` included).
+  (`never-dispatched` included, which only a confirmed non-application records, D-220).
 - **A retry mints a new intent key only for a failed intent.** An operator's line `retry`
   (`07 §3.6` `inst-rmt-retry`) **MUST** mint the line's next wave attempt when, and only when, the
   line's current intent of that wave is recorded `failed` — a synchronous refusal, a failure the
-  status read confirmed, or `never-dispatched` — because Subscriptions replays a refusal under its
+  status read confirmed, or `never-dispatched` confirmed through `SUB-O17` (D-220) — because Subscriptions replays a refusal under its
   key (§2.2) and a failed intent has no live effect. It **MUST NOT** mint one for a line whose
   intent is `submitted` or `unresolved`, which may be live downstream: a second submit under a new
   key is forbidden (`01 §4.5`). Such a line keeps its key; a line with no row is sent under it by
   the next dispatch, a `submitted` row stays the sweep's, and an `unresolved` row is re-armed for
-  one on-demand read through the re-arm port `rearm_unresolved` (§3.2). The retry also mints the next `attempt` of the wave's dispatch family, which
+  one on-demand read through the re-arm port `rearm_unresolved` (§3.2) — for a row `unresolved` on a
+  past-lifetime not-found, that read is the `SUB-O17` close-and-lookup, so the retry resolves it one
+  way or the other (D-220). The retry also mints the next `attempt` of the wave's dispatch family, which
   keys only the next call of that wave (`01 §3.3` *Rounds and attempts* rule 3): the round of an
   exhausted call is still `open` under a fingerprint that named other lines, and re-presenting it
   with a different `lineRefs[]` would be `idempotency-key-conflict` (`01 §4.3`). Per-line attempts

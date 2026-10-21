@@ -219,7 +219,14 @@ one in place today, and the **library** adapter over the built `cf-gears-bss-app
 transactions and which this gear intends to embed the same way; its gate-to-unit mapping is open
 question Q-14 and is not designed here. The verdict is computed by neither Orders gear's order
 logic (Lifecycle R2): the adapter is the policy authority, and every verdict names it. See §4 for
-the full disclosure of what the stand-in makes inert.
+the full disclosure of what the stand-in makes inert. The stand-in **MUST NOT** be bound to a
+seller profile whose policy requires a real approval: that binding is a configuration refusal at
+readiness, never a silent "not required" (decision D-224). The named-assignee enforcement this
+slice's inbox projection performs today is asked of the shared `cf-gears-bss-approval` library
+as a second approval-condition type, decided by explicitly named users and bound to the unit's
+generation, with Orders connected to the common BSS Approvals Inbox through its source interface
+and no second authoritative queue (`cpt-cf-bss-orders-workflow-upreq-approval-named-user-criterion`,
+`UPSTREAM_REQS.md` §2.3, D-224); the library adapter of Q-14 takes that path when it lands.
 
 **ADRs**: `cpt-cf-bss-orders-workflow-adr-fail-closed-verdict-park`
 
@@ -437,6 +444,17 @@ remainder.
 gate of the instance to `cancelled` and closes an open park with `resolution = order-terminated`;
 it is called by `run-cancellation-fence` (slice 06) in fencing step 1 on the supersede, cancel and
 terminal-event paths, inside that operation's unit of work.
+
+**Valuation basis, open (D-225).** The figure below is Rating's net pre-tax annualised TCV because
+that is what Lifecycle stores (Lifecycle D-154, D-167). The PR #4787 proposal asks that the
+versioned approval policy choose its basis explicitly — the full contractual commitment for a fixed
+committed term by default, an authorized budget, a forecast or "unavailable" for variable usage,
+never unknown read as zero — that Rating compute it, Lifecycle retain it with the version, and that
+`tcv_minor` give way to the shared exact major-unit money representation with basis, currency,
+term and provenance preserved and no implicit FX. This gear forwards whatever Lifecycle stores and
+computes nothing (D-198), so the ask sits with Rating and Lifecycle
+(`cpt-cf-bss-orders-workflow-upreq-approval-valuation-basis`, `UPSTREAM_REQS.md` §2.4, §2.5); the
+payload shape here changes only when they answer.
 
 **Request payload contents.** The §9.2 expectations contract requires the request to carry enough
 for the approval authority to decide without fetching the order back, and requires the submission

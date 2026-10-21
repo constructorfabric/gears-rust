@@ -482,6 +482,36 @@ lookup, and so a callback that echoes nothing this gear issued is rejectable as 
 - **Source**: PRD §6.3 (provisioning-intent confirmations), §9.1 (actor authenticity). Raised
   against `gears/bss/subscriptions/docs/SEAMS.md`, which has no such entry.
 
+#### `SUB-O17` — closed-attempt fence and retained terminal lookup (new, D-220; PR #4787 proposal item 3)
+
+- [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-upreq-closed-attempt-fence`
+
+Subscriptions **MUST** let this gear, by the full scoped identity `SUB-O13` already names (tenant,
+`orderId`, `orderVersion`, `orderLineId`, wave, `intentKind`, `wave_attempt`), **close** a scoped
+attempt so that a delayed create or activation for it is refused, and **answer** whether the
+attempt was applied (returning its original result) or is confirmed never applied. The closure and
+the application **MUST** serialize at the point of effect — a version field alone is insufficient —
+and the answer **MUST** be retained beyond the transport de-duplication window of the *Create
+de-duplication lifetime* ask above. Closing one line closes no other line, and already dispatched
+external work is retained until its outcome and cleanup are settled.
+
+- **Rationale**: a status read that answers "no such transition request" past the key lifetime
+  proves only that nothing is recorded *now*; a delayed request may still execute or be applied
+  after the window. This gear therefore no longer infers `never-dispatched` from it
+  (`design/05` §4.4, D-220) and holds the row `unresolved` on a manual task. Only a confirmed
+  non-application, or the recovered original result, can release that line to a new attempt or a
+  successor draft (`rebuild-wave1`).
+- **Consequence if it does not land**: a line whose request was lost past the key lifetime stays
+  `unresolved` until an operator unwinds or cancels the order; no replacement attempt is ever
+  authorized from uncertainty, and the order cannot complete through that line.
+- **Relation to D-209**: D-209's resubmit-then-void route stands **inside** the de-duplication
+  window. This ask is the explicit alternative the proposal names for cancellation and recovery
+  **outside** it, with versioned attempt fencing; retention and retirement rules are its
+  prerequisites, and no retention policy or numeric default is proposed here.
+- **Agreement status**: open; raised 2026-10-21 from the PR #4787 proposal (item 3).
+- **Source**: PRD §6.3 (retry/duplicate protocol), §6.4 (cancellation fencing). Raised against
+  `gears/bss/subscriptions/docs/SEAMS.md`.
+
 ### 2.2 Payments
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-upreq-payment-authorization-outcome`
@@ -515,6 +545,75 @@ payer, amount | postpaid) → Authorized | Pending { request_ref } | Failed { re
 `get(request_ref)`, with a fail-closed fixture answering `authorized` for postpaid payers. Lifecycle
 `UPSTREAM_REQS.md` §2.5 carries the same shape and accepts the minting. The Seam Atlas's
 `AdmissionReadV1` (its D05) is not consumed by either gear (Lifecycle D-175).
+
+#### Financial readiness read through Billing (new, D-223; PR #4787 proposal item 1)
+
+- [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-upreq-financial-readiness-through-billing`
+
+**Billing** determines financial readiness for a specific order version from the accepted
+settlement terms and Payments' authoritative facts, and answers one of four: nothing is required
+before execution · the required condition is satisfied · the condition is pending or its result is
+unknown · a definitive refusal with a reason. Billing and Payments own initiation, provider
+interaction and durable payment recovery; the UI opens the financial flow and shows its status; a
+browser redirect is not payment proof and closing the browser must not lose the request. This gear
+consumes the result as the whole-order financial gate — a pending prerequisite on one line blocks
+the order — re-readable during normal waiting and after restart, and it creates no payment,
+session or invoice and calculates no eligibility. Pay-later terms come from Pricing's per-item
+`billing_timing` (SKU version or tenant default); advance billing neither proves collection nor
+requires payment before service; usage-based terms proceed without an invented postpay-approval
+step unless policy requires one.
+
+- **Owning upstream gear**: Billing (no register in this repository), with Payments; Lifecycle's
+  begin-fulfillment guard reads the same fact and must move with it (§2.4).
+- **Why this gear cannot satisfy it alone**: today `evaluate-payment-auth-eligibility` reads the
+  authorization outcome from Payments directly (`design/04` §3.5); re-homing the read is a seam
+  decision of the owners, not of the consumer.
+- **Consequence if it does not land**: the authorization-outcome ask above stays the only
+  financial gate, and permission to begin fulfillment remains undistinguished from final
+  permission to activate paid service.
+- **Agreement status**: open; raised 2026-10-21. PRD amendment candidate 22 (§4).
+- **Source**: PR #4787 proposal of 2026-10-18, item 1; PRD §6.3.
+
+#### Protected purchase: capacity and accepted-term protection before capture (new, D-223; PR #4787 proposal item 2)
+
+- [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-upreq-protected-purchase-before-capture`
+
+For a protected acquisition, durable capacity and accepted-term protection **MUST** exist for every
+line a capture covers before the financial owner executes the capture. Lifecycle owns the
+capture-versus-cancellation decision; this gear delivers the order and protection authority and
+recovers the hand-off; Billing and Payments execute and recover the financial operation under its
+original identity. An acquisition's own reservation never counts as an unrelated overlap, and an
+exhaustion or unwind path (`overlap-read-unevaluable`, a voided draft) **MUST** retain
+reservation, commercial and financial obligations until the agreed settlement or release
+conditions hold — never a silent release of a paid place.
+
+- **Owning upstream gears**: Billing and Payments (capture), Lifecycle (decision and the
+  assessment-versus-coverage split, §2.4), Pricing and Subscriptions (the protection itself).
+- **Consequence if it does not land**: this gear keeps D-194 — an elapsed `activation_deadline_at`
+  unwinds the order — and the spawn-signal prerequisite as the only protection; a paid place can be
+  released by a draft that lapsed or an occupancy read that failed.
+- **Agreement status**: open; raised 2026-10-21.
+- **Source**: PR #4787 proposal item 2; `design/04` §3.7 (`activation_deadline_at`), `design/06`
+  §4.8.
+
+#### Stop or reconcile the original payment on an accepted cancellation (new, D-223; PR #4787 proposal item 5)
+
+- [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-upreq-cancellation-reaches-payments`
+
+An accepted cancellation **MUST** durably reach Billing and Payments to stop or reconcile the
+original payment, answering confirmed stopped · already collected · pending or unknown. Sending a
+stop request is not proof of stopping; collection may win the race and require a refund or another
+financial remedy, and a late financial result **MUST** remain recoverable after the order process
+closes without restarting a cancelled order. This gear owns the consequence for execution; Billing
+and Payments own the consequence for money, and this gear may finish operational cancellation
+before a refund completes once the outstanding financial work has a durable, accepted owner.
+
+- **Owning upstream gear**: Billing and Payments; the pre-fulfillment cancellation it follows is
+  Lifecycle's (§2.4).
+- **Consequence if it does not land**: `report-outcome` records the operational outcome and no
+  financial remedy has an owner.
+- **Agreement status**: open; raised 2026-10-21.
+- **Source**: PR #4787 proposal item 5; `design/06` §3.6 (`report-outcome`), `design/09` §3.3.
 
 ### 2.3 Approval policy adapter
 
@@ -565,6 +664,32 @@ decision reaches this gear's `listen` like any other (D-189 as clarified).
 - **Source**: PRD §9.2 (External Integration Contracts), §6.2 (approval execution), §13
   Dependencies (approval policy adapter, `p1`); `DECISIONS.md` D-189 (request-key lifetime and
   read by request key).
+
+#### Named-user approval criterion and the common Approvals Inbox (new, D-224; PR #4787 proposal item 7)
+
+- [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-upreq-approval-named-user-criterion`
+
+The shared `cf-gears-bss-approval` library **MUST** support a second approval-condition type beside
+the numeric quorum: a decision by explicitly named users, where another user's vote cannot
+substitute merely because they hold a general approval permission, bound to the unit's version or
+generation so a former assignee's delayed decision cannot satisfy a changed criterion; a missing or
+ineligible assignee requires explicit handling, never automatic approval. Orders starts with one
+predefined "order approval" stage and one named user configured in the seller's tenant scope, only
+when approval is required; this gear supplies the criterion and the library persists and enforces
+it on the owner-side decision path, retaining the author and submitter exclusion. RBAC controls who
+may assign or replace the approver, and assignment-management permission grants no approval
+authority. Orders connects to the common BSS Approvals Inbox through its source interface with the
+request kinds extended — no second authoritative queue and no path that bypasses the library
+criterion. Whether a future list of named people must approve in full or in part stays open.
+
+- **Why this gear cannot satisfy it alone**: `design/03` enforces the named assignee today inside
+  its own inbox projection (`assigned_principal`), which is exactly the second path the proposal
+  retires once the library carries the criterion; the stand-in that answers "not required" must
+  never be bound to a profile that requires real approval (`design/03` §2.2, D-224).
+- **Consequence if it does not land**: the slice 03 projection remains the enforcement point and
+  Orders approvals stay outside the common inbox.
+- **Agreement status**: open; raised 2026-10-21. Q-14 (gate-to-unit mapping) follows it.
+- **Source**: PR #4787 proposal item 7; PRD §9.2.
 
 ### 2.4 Orders Lifecycle
 
@@ -720,9 +845,71 @@ Escalation* and §6.1 *Process Termination on Terminal Order Events*, acceptance
 corpus as the first consumer; and the D-179 occupancy tuple by the overlap-presence read of §2.1.
 Both D-182 items and the corpus are production release prerequisites on Lifecycle's side.
 
+#### Pre-fulfillment cancellation while waiting on financial readiness (new, D-223; PR #4787 proposal item 5)
+
+- [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-upreq-prefulfillment-cancel-arbitration`
+
+While financial readiness is pending the order remains `approved`, and this gear's cancellation
+seam starts from `in_fulfillment` (`design/09` §3.3, D-109). Orders Lifecycle **MUST** support a
+pre-fulfillment cancellation and arbitrate it against beginning fulfillment, so that a seller
+policy's payment-wait deadline — observed by this gear, which requests the Lifecycle action — can
+end in cancellation or manual review without competing transitions; the deadline **MUST** align
+with Lifecycle's existing expiry policy. Once fulfillment has begun, the existing authorized
+cancellation and compensation path applies. A late financial result after a review-and-wait
+outcome is accounted for under Lifecycle policy if the order is still eligible, and never restarts
+a cancelled order.
+
+- **Consequence if it does not land**: no payment-wait deadline exists in this design or the PRD;
+  an order waiting on readiness is cancelled only through Lifecycle's own `POST /cancel` by an
+  operator.
+- **Agreement status**: open; raised 2026-10-21. PRD amendment candidate 22 (§4).
+- **Source**: PR #4787 proposal item 5; `design/09` §3.3.
+
+#### Assessment expiry distinct from protected coverage (new, D-223; PR #4787 proposal item 2)
+
+- [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-upreq-assessment-expiry-vs-protected-coverage`
+
+Orders Lifecycle, with Pricing and Subscriptions, **MUST** distinguish an assessment expiry, a
+protected future coverage and the final activation permission, so that an old assessment deadline
+does not invalidate a purchase whose accepted commitment covers its scheduled start, while a
+genuine final-permission expiry still prevents activation and requires recovery or remedy. The
+checks at plan construction, the pre-activation re-check and dispatch (`design/04` §3.6,
+`design/05` §3.6) change together with their Lifecycle, Pricing and Subscriptions counterparts.
+
+- **Consequence if it does not land**: `activation_deadline_at` stays the single deadline of
+  Lifecycle D-152 and D-194 stands: an elapsed deadline unwinds the order under either policy.
+- **Agreement status**: open; raised 2026-10-21.
+- **Source**: PR #4787 proposal item 2; Lifecycle D-152, D-162.
+
+#### Valuation basis chosen by the approval policy; exact money representation (new, D-225; PR #4787 proposal item 8)
+
+- [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-upreq-approval-valuation-basis`
+
+The versioned approval policy **MUST** be able to choose its valuation basis explicitly, rather than
+this gear silently forwarding one: for a fixed committed term the full contractual commitment by
+default (not the first installment or an assumed twelve months), other bases by explicit selection,
+and for variable usage an authorized budget, a forecast or "unavailable" — unknown is never zero,
+and a forecast or budget is neither a spending cap nor a payment authorization. Rating (or the
+designated valuation owner) computes the amount; Lifecycle retains it with the order version with
+basis, currency, term and provenance and no implicit FX conversion; this gear forwards the
+evidence. `tcv_minor` transport and storage give way to the shared exact major-unit money
+representation, keeping exact, display and posting-estimate values distinct. Changed order content
+follows the existing reassessment and re-approval rules.
+
+- **Owning upstream gears**: Rating (computation, §2.5), Lifecycle (retention and `get_version`).
+- **Consequence if it does not land**: the approval request carries Rating's net pre-tax
+  annualised TCV in minor units as today (`design/03` §3.3, D-198).
+- **Agreement status**: open; raised 2026-10-21.
+- **Source**: PR #4787 proposal item 8; Lifecycle D-154, D-167.
+
 ### 2.5 Pricing, Products and Rating
 
-No ask. Since D-193, D-196 and D-198 this gear raises nothing on Pricing, Products or Rating and
+Two asks since 2026-10-21, both received from the PR #4787 proposal and both answered by Pricing
+and Rating only through Lifecycle's stored facts: the reuse of the per-item `billing_timing` as the
+pay-later input of the Billing readiness ask (§2.2, D-223), and the alternative valuation bases of
+`…-upreq-approval-valuation-basis` (§2.4, D-225), which Rating computes and Lifecycle retains. This
+gear still calls neither. Otherwise no ask: since D-193, D-196 and D-198 this gear raises nothing
+else on Pricing, Products or Rating and
 calls none of them: the plan revision, the selected items, the accepted price bindings
 (`OrderPin`), the SKU versions, the overlap keys, the totals and the TCV are Lifecycle's stored
 facts, read through `get_version` (§2.4). What this section records instead:
@@ -1450,6 +1637,7 @@ then have to accept.
 | `p1` (critical) | `…-upreq-overlap-presence-read`, `…-upreq-compensation-cancel-reason`, `…-upreq-explicit-start-instant`, `…-upreq-settle-create`, `…-upreq-in-flight-rejection`, `…-upreq-cancel-accepted-transition`, `…-upreq-nonterminal-status-read`, `…-upreq-provisioning-latency-budget`, `…-upreq-identity-envelope-echo`, `…-upreq-payment-authorization-outcome`, `…-upreq-generic-approval-expectations-contract`, `…-upreq-submitted-ttl-visibility`, `…-upreq-lifecycle-thin-events`, `…-upreq-lifecycle-workflow-key-retention`, `…-upreq-pii-classification-ruling`, `…-upreq-event-broker-shared-prerequisites`, `…-upreq-pdp-policy-integration` |
 | `p1` (critical), platform path | `…-upreq-serverless-runtime-readiness-gate`, `…-upreq-serverless-runtime-event-triggers-gts`, `…-upreq-serverless-runtime-consumed-event-member-storage`, `…-upreq-serverless-runtime-pdp-guarded-call`, `…-upreq-serverless-runtime-attempt-and-deadline-propagation`, `…-upreq-serverless-runtime-history-residency-retention`, `…-upreq-serverless-runtime-definition-versioning-validation-hook`, `…-upreq-serverless-runtime-trigger-version-selection`, `…-upreq-serverless-runtime-signals`, `…-upreq-serverless-runtime-event-retention-between-listens`, `…-upreq-serverless-runtime-history-growth`, `…-upreq-serverless-runtime-invocation-control-restriction`, `…-upreq-serverless-runtime-dead-letter-operator-visibility` |
 | `p2` (important) | `…-upreq-correlation-propagation`, `…-upreq-serverless-runtime-failure-handler-target`, `…-upreq-lifecycle-failure-reason-coverage` |
+| `p1` (critical), **open since 2026-10-21** — the PR #4787 proposal (D-220, D-223–D-225); each has a stated fallback the design keeps until the owner answers | `…-upreq-closed-attempt-fence` (`SUB-O17`), `…-upreq-financial-readiness-through-billing`, `…-upreq-protected-purchase-before-capture`, `…-upreq-cancellation-reaches-payments`, `…-upreq-approval-named-user-criterion`, `…-upreq-prefulfillment-cancel-arbitration`, `…-upreq-assessment-expiry-vs-protected-coverage`, `…-upreq-approval-valuation-basis` |
 
 `cpt-cf-bss-orders-workflow-upreq-pdp-policy-integration` is `p1` because every caller-driven
 operation fails closed until the catalogue, roles and the `assigned_principal` approver grant are
@@ -1678,6 +1866,13 @@ it would shorten (D-105).
    add-ons, term, auto-renewal and co-term date are resolved by Subscriptions from the referenced
    order version, and point the provisioning contract at Subscriptions' `contract-orders-intents`.
    Applied to the PRD on 2026-10-12.
+22. **§6.1, §6.3, §6.4, §9.2 and §13 — the PR #4787 proposal of 2026-10-18 (D-223…D-225), candidate.**
+   Should the owners accept the asks of §2.2, §2.3 and §2.4 raised on 2026-10-21, the PRD **MUST**
+   name Billing as the owner of financial readiness and its four-way answer (§6.3, §13), add the
+   seller-policy payment-wait deadline and the pre-fulfillment cancellation it requests (§6.4), name
+   the named-user approval criterion and the common Approvals Inbox (§9.2), and state the approval
+   valuation basis as the policy's explicit choice (§9.2). **Not applied**: these are candidates
+   pending the owners' answers, and nothing in the PRD changes until they land.
 
 ## 5. Traceability
 
