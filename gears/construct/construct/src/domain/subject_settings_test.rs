@@ -17,13 +17,13 @@ use uuid::Uuid;
 
 use crate::domain::error::DomainError;
 use crate::domain::subject_settings::{
-    ScopeRefusal, SettingsLookup, SettingsOutOfScope, SubjectKey, SubjectSettings,
+    ScopeRefusal, SettingsLookup, SettingsOutOfScope, SettingsWrite, SubjectKey, SubjectSettings,
     SubjectSettingsRepository, SubjectSettingsService, TenantDefaults, UncheckablePredicate,
 };
 use crate::infra::storage::subject_settings_repo::SeaOrmSubjectSettingsRepository;
 use crate::test_support::{
-    AllowResolver, DenyResolver, OwnerOnlyResolver, context_in, context_of, inmem_db,
-    seed_subject_settings,
+    AllowResolver, CoveredLookup, DenyResolver, OwnerOnlyResolver, context_in, context_of,
+    inmem_db, seed_subject_settings,
 };
 
 type ConcreteService = SubjectSettingsService<SeaOrmSubjectSettingsRepository>;
@@ -607,11 +607,8 @@ fn assert_not_covered(read: Result<SubjectSettings, DomainError>, tenant: Uuid, 
         Err(DomainError::OutOfScope(refused)) => {
             assert_eq!(refused.refusal, ScopeRefusal::NotCovered, "{refused}");
             assert_eq!(
-                refused.key,
-                SubjectKey {
-                    tenant_id: tenant,
-                    subject_id: subject,
-                },
+                (refused.tenant_id, refused.subject_id),
+                (tenant, subject),
                 "{refused}"
             );
         }
@@ -652,6 +649,43 @@ async fn a_scope_that_does_not_cover_the_key_is_refused_with_or_without_a_row() 
     }
 }
 
+/// A change whose scope leaves the key out is refused before anything is
+/// written, with the same refusal as the read; a stored row keeps its values.
+#[tokio::test]
+async fn a_change_the_scope_does_not_cover_is_refused_and_writes_nothing() {
+    for leave_out in [another_tenant, another_resource] {
+        for stored in [true, false] {
+            let db = inmem_db().await;
+            let svc = service_with(
+                &db,
+                Arc::new(ScopedResolver(leave_out)),
+                StubDefaults::new(true),
+            );
+            let (tenant, subject) = (Uuid::new_v4(), Uuid::new_v4());
+            let key = SubjectKey {
+                tenant_id: tenant,
+                subject_id: subject,
+            };
+            if stored {
+                seed_subject_settings(&db, key, ERASING).await;
+            }
+
+            let change = svc
+                .set_personalization(&context_of(subject, tenant), subject, true)
+                .await;
+
+            assert_not_covered(change, tenant, subject);
+            let conn = db.conn().expect("connection");
+            let row = SeaOrmSubjectSettingsRepository::new()
+                .find(&conn, &AccessScope::for_tenant(tenant), key)
+                .await
+                .expect("find")
+                .stored();
+            assert_eq!(row, stored.then_some(ERASING), "stored {stored}");
+        }
+    }
+}
+
 /// A repository whose lookup refuses every key as undecidable, to reach the
 /// service's refusal for a predicate the read cannot check.
 struct UndecidableRepository;
@@ -675,8 +709,8 @@ impl SubjectSettingsRepository for UndecidableRepository {
         _scope: &AccessScope,
         _key: SubjectKey,
         _personalization_enabled: bool,
-    ) -> Result<(), DomainError> {
-        Ok(())
+    ) -> Result<SettingsWrite, DomainError> {
+        Ok(SettingsWrite::Written)
     }
 }
 
@@ -703,11 +737,8 @@ async fn an_undecidable_scope_is_refused_with_a_message_naming_the_predicate() {
             );
             assert_eq!(refused.caller, ctx.subject_id(), "{refused}");
             assert_eq!(
-                refused.key,
-                SubjectKey {
-                    tenant_id: tenant,
-                    subject_id: subject,
-                },
+                (refused.tenant_id, refused.subject_id),
+                (tenant, subject),
                 "{refused}"
             );
             assert!(
@@ -732,18 +763,16 @@ fn the_scope_refusal_names_the_callers_tenant_and_the_keys_tenant() {
     let refused = SettingsOutOfScope {
         caller,
         caller_tenant,
-        key: SubjectKey {
-            tenant_id: tenant,
-            subject_id: subject,
-        },
+        tenant_id: tenant,
+        subject_id: subject,
         refusal: ScopeRefusal::NotCovered,
     };
 
     assert_eq!(
         refused.to_string(),
         format!(
-            "caller {caller} of tenant {caller_tenant} may not read the settings of subject \
-             {subject} in tenant {tenant}: the policy scope does not cover them"
+            "caller {caller} of tenant {caller_tenant} may not read or change the settings of \
+             subject {subject} in tenant {tenant}: the policy scope does not cover them"
         )
     );
 }

@@ -378,7 +378,11 @@ async fn a_connector_authorized_only_for_its_own_tenant_cannot_write_into_anothe
 
         match &result {
             Err(DomainError::OutOfScope(refused)) => {
-                assert_eq!(refused.key, key, "stored {stored}: {refused}");
+                assert_eq!(
+                    (refused.tenant_id, refused.subject_id),
+                    (tenant, subject),
+                    "stored {stored}: {refused}"
+                );
                 assert_eq!(refused.refusal, ScopeRefusal::NotCovered, "{refused}");
                 assert_eq!(refused.caller_tenant, ctx.subject_tenant_id(), "{refused}");
             }

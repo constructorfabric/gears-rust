@@ -6,8 +6,8 @@ use uuid::Uuid;
 
 use super::subject_settings_repo::{SeaOrmSubjectSettingsRepository, coverage};
 use crate::domain::subject_settings::{
-    ScopeRefusal, SettingsLookup, SubjectKey, SubjectSettings, SubjectSettingsRepository,
-    UncheckablePredicate,
+    ScopeRefusal, SettingsLookup, SettingsWrite, SubjectKey, SubjectSettings,
+    SubjectSettingsRepository, UncheckablePredicate,
 };
 use crate::test_support::{
     CoveredLookup, inmem_db, insert_subject_settings, seed_subject_settings,
@@ -345,7 +345,7 @@ async fn setting_personalization_keeps_the_erasure_flag_of_an_existing_row() {
 }
 
 #[tokio::test]
-async fn setting_personalization_outside_the_scope_is_forbidden() {
+async fn setting_personalization_outside_the_scope_is_refused_before_the_write() {
     let db = inmem_db().await;
     let conn = db.conn().expect("connection");
     let repo = SeaOrmSubjectSettingsRepository::new();
@@ -360,7 +360,7 @@ async fn setting_personalization_outside_the_scope_is_forbidden() {
     )
     .await;
 
-    let err = repo
+    let written = repo
         .set_personalization(
             &conn,
             &AccessScope::for_tenant(own),
@@ -371,11 +371,12 @@ async fn setting_personalization_outside_the_scope_is_forbidden() {
             true,
         )
         .await
-        .expect_err("a row of another tenant is outside the scope");
+        .expect("set");
 
-    assert!(
-        matches!(err, crate::domain::error::DomainError::Forbidden(_)),
-        "got {err:?}"
+    assert_eq!(
+        written,
+        SettingsWrite::OutOfScope(ScopeRefusal::NotCovered),
+        "a row of another tenant is outside the scope"
     );
     let untouched = repo
         .find(
@@ -393,7 +394,7 @@ async fn setting_personalization_outside_the_scope_is_forbidden() {
 }
 
 #[tokio::test]
-async fn setting_personalization_under_another_owner_is_forbidden() {
+async fn setting_personalization_under_another_owner_is_refused_before_the_write() {
     let db = inmem_db().await;
     let conn = db.conn().expect("connection");
     let repo = SeaOrmSubjectSettingsRepository::new();
@@ -408,14 +409,15 @@ async fn setting_personalization_under_another_owner_is_forbidden() {
         ScopeFilter::in_uuids(pep_properties::OWNER_ID, vec![other]),
     ]));
 
-    let err = repo
+    let written = repo
         .set_personalization(&conn, &others_scope, key, true)
         .await
-        .expect_err("the subject's row is outside another owner's scope");
+        .expect("set");
 
-    assert!(
-        matches!(err, crate::domain::error::DomainError::Forbidden(_)),
-        "got {err:?}"
+    assert_eq!(
+        written,
+        SettingsWrite::OutOfScope(ScopeRefusal::NotCovered),
+        "the subject's row is outside another owner's scope"
     );
     let untouched = repo
         .find(&conn, &AccessScope::for_tenant(tenant), key)
@@ -647,8 +649,8 @@ fn constraints_combine_as_or_with_undecidable_below_covered() {
 /// the check to the SQL it predicts on both paths.
 #[tokio::test]
 async fn coverage_agrees_with_the_secure_orm_on_every_small_scope() {
-    use sea_orm::{ColumnTrait, Condition, EntityTrait};
-    use toolkit_db::secure::SecureEntityExt;
+    use sea_orm::{ActiveValue, ColumnTrait, Condition, EntityTrait};
+    use toolkit_db::secure::{SecureEntityExt, SecureInsertExt};
 
     use super::subject_settings_entity::{self as entity, Entity};
 
@@ -707,13 +709,30 @@ async fn coverage_agrees_with_the_secure_orm_on_every_small_scope() {
             sql_sees_the_row,
             "read: {checked:?} (secure ORM: {row:?})"
         );
-        let write = SeaOrmSubjectSettingsRepository::new()
-            .set_personalization(&conn, checked, key, false)
-            .await;
+        // The secure ORM's own check of an insert of the key's row, not run.
+        let row = entity::ActiveModel {
+            tenant_id: ActiveValue::Set(tenant),
+            subject_id: ActiveValue::Set(subject),
+            personalization_enabled: ActiveValue::Set(false),
+            erasure_in_progress: ActiveValue::NotSet,
+        };
+        let orm_write = Entity::insert(row.clone())
+            .secure()
+            .scope_with_model(checked, &row)
+            .map(|_| ());
         assert_eq!(
             coverage(checked, key).is_ok(),
-            write.is_ok(),
-            "write: {checked:?} (secure ORM: {write:?})"
+            orm_write.is_ok(),
+            "write: {checked:?} (secure ORM: {orm_write:?})"
+        );
+        let written = SeaOrmSubjectSettingsRepository::new()
+            .set_personalization(&conn, checked, key, false)
+            .await
+            .expect("set");
+        assert_eq!(
+            written == SettingsWrite::Written,
+            orm_write.is_ok(),
+            "repository write: {checked:?} ({written:?})"
         );
     }
 }

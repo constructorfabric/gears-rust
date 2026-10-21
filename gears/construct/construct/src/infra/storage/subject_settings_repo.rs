@@ -7,8 +7,8 @@ use toolkit_security::{AccessScope, ScopeConstraint, ScopeFilter, ScopeValue};
 
 use crate::domain::error::DomainError;
 use crate::domain::subject_settings::{
-    ScopeRefusal, SettingsLookup, SubjectKey, SubjectSettings, SubjectSettingsRepository,
-    UncheckablePredicate,
+    ScopeRefusal, SettingsLookup, SettingsWrite, SubjectKey, SubjectSettings,
+    SubjectSettingsRepository, UncheckablePredicate,
 };
 
 use super::scope_error::map_scope_error;
@@ -154,7 +154,11 @@ impl SubjectSettingsRepository for SeaOrmSubjectSettingsRepository {
         scope: &AccessScope,
         key: SubjectKey,
         personalization_enabled: bool,
-    ) -> Result<(), DomainError> {
+    ) -> Result<SettingsWrite, DomainError> {
+        if let Err(refusal) = coverage(scope, key) {
+            return Ok(SettingsWrite::OutOfScope(refusal));
+        }
+
         // The erasure flag is left out of the insert, so a new row takes the
         // column default (no erasure under way), and out of the update, so an
         // existing row keeps it.
@@ -181,6 +185,6 @@ impl SubjectSettingsRepository for SeaOrmSubjectSettingsRepository {
             .await
             .map_err(map_scope_error)?;
         // @cpt-end:cpt-cf-construct-flow-subject-settings-change:p1:inst-change-store
-        Ok(())
+        Ok(SettingsWrite::Written)
     }
 }

@@ -12,6 +12,7 @@ use uuid::Uuid;
 
 use super::DbProvider;
 use super::error::DomainError;
+pub use super::settings_scope::{ScopeRefusal, SettingsOutOfScope, UncheckablePredicate};
 
 /// GTS type id of a subject's settings: the authorization resource type, and
 /// the resource type the settings routes' errors name.
@@ -73,39 +74,6 @@ pub struct SubjectKey {
     pub subject_id: Uuid,
 }
 
-/// A predicate kind the read cannot check against a key without the database.
-#[domain_model]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UncheckablePredicate {
-    Group,
-    GroupSubtree,
-    TenantSubtree,
-    /// A filter kind this gear does not know.
-    Unknown,
-}
-
-impl std::fmt::Display for UncheckablePredicate {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Self::Group => "group",
-            Self::GroupSubtree => "group-subtree",
-            Self::TenantSubtree => "tenant-subtree",
-            Self::Unknown => "unknown",
-        })
-    }
-}
-
-/// Why a policy scope does not let the read see one key's row.
-#[domain_model]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ScopeRefusal {
-    /// The scope does not cover the key, whether or not a row exists.
-    NotCovered,
-    /// The scope holds a predicate that cannot be checked against the key
-    /// without the database. Treated as not covering, so the read fails closed.
-    Undecidable(UncheckablePredicate),
-}
-
 /// What a lookup of one subject's settings under a policy scope found. A row
 /// the scope leaves out is never reported as absent, so it can never turn into
 /// the tenant's default.
@@ -117,6 +85,18 @@ pub enum SettingsLookup {
     /// The scope covers the key and there is no row: a new subject.
     Absent,
     /// The scope does not let the read see the key's row.
+    OutOfScope(ScopeRefusal),
+}
+
+/// What a write of one subject's settings under a policy scope did. A key the
+/// scope leaves out is refused before anything is written, with the same
+/// decision as the read.
+#[domain_model]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingsWrite {
+    /// The scope covers the key and the row is stored.
+    Written,
+    /// The scope does not let the write reach the key's row; nothing is stored.
     OutOfScope(ScopeRefusal),
 }
 
@@ -134,14 +114,15 @@ pub trait SubjectSettingsRepository: Send + Sync {
 
     /// Store the subject's personalization setting, creating the row when
     /// there is none. A new row starts with no erasure under way; an existing
-    /// row keeps its erasure flag. The scope must cover the row.
+    /// row keeps its erasure flag. Whether the scope covers the key is decided
+    /// as in `find`, before anything is written.
     async fn set_personalization<C: DBRunner>(
         &self,
         conn: &C,
         scope: &AccessScope,
         key: SubjectKey,
         personalization_enabled: bool,
-    ) -> Result<(), DomainError>;
+    ) -> Result<SettingsWrite, DomainError>;
 }
 
 /// Owner only: a subject reads and changes only its own settings. Another
@@ -163,43 +144,13 @@ fn ensure_owner(ctx: &SecurityContext, subject_id: Uuid) -> Result<(), DomainErr
     // @cpt-end:cpt-cf-construct-algo-subject-settings-owner-only:p1:inst-owner-refuse
 }
 
-/// A read refused because the caller's policy scope leaves the key out. It
-/// names the caller, the caller's tenant, the key and why, so the log tells a
-/// scope refusal from a policy denial: on Record Intake's path the key's tenant
-/// is the one the connector names, not the connector's own.
-#[domain_model]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SettingsOutOfScope {
-    pub caller: Uuid,
-    pub caller_tenant: Uuid,
-    pub key: SubjectKey,
-    pub refusal: ScopeRefusal,
-}
-
-impl std::fmt::Display for SettingsOutOfScope {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "caller {} of tenant {} may not read the settings of subject {} in tenant {}: ",
-            self.caller, self.caller_tenant, self.key.subject_id, self.key.tenant_id
-        )?;
-        match self.refusal {
-            ScopeRefusal::NotCovered => f.write_str("the policy scope does not cover them"),
-            ScopeRefusal::Undecidable(predicate) => write!(
-                f,
-                "the policy scope holds a {predicate} predicate, which the read cannot check, \
-                 so it does not count as covering them"
-            ),
-        }
-    }
-}
-
-/// The refusal of a read whose scope leaves the key out.
+/// The refusal of a read or a write whose scope leaves the key out.
 fn out_of_scope(ctx: &SecurityContext, key: SubjectKey, refusal: ScopeRefusal) -> DomainError {
     DomainError::OutOfScope(SettingsOutOfScope {
         caller: ctx.subject_id(),
         caller_tenant: ctx.subject_tenant_id(),
-        key,
+        tenant_id: key.tenant_id,
+        subject_id: key.subject_id,
         refusal,
     })
 }
@@ -376,14 +327,22 @@ impl<R: SubjectSettingsRepository + 'static> SubjectSettingsService<R> {
         // @cpt-end:cpt-cf-construct-flow-subject-settings-change:p1:inst-change-scope
 
         let repo = Arc::clone(&self.repo);
+        let ctx = ctx.clone();
         // One transaction for the write and its read-back, so the answer is
         // this request's write even when the subject sends two at once.
         DBProvider::<DomainError>::new(self.db.db())
             .transaction(move |tx| {
                 Box::pin(async move {
                     // @cpt-begin:cpt-cf-construct-flow-subject-settings-change:p1:inst-change-store
-                    repo.set_personalization(tx, &scope, key, personalization_enabled)
-                        .await?;
+                    match repo
+                        .set_personalization(tx, &scope, key, personalization_enabled)
+                        .await?
+                    {
+                        SettingsWrite::Written => {}
+                        SettingsWrite::OutOfScope(refusal) => {
+                            return Err(out_of_scope(&ctx, key, refusal));
+                        }
+                    }
                     // @cpt-end:cpt-cf-construct-flow-subject-settings-change:p1:inst-change-store
                     // @cpt-begin:cpt-cf-construct-flow-subject-settings-change:p1:inst-change-return
                     match repo.find(tx, &scope, key).await? {
@@ -392,8 +351,8 @@ impl<R: SubjectSettingsRepository + 'static> SubjectSettingsService<R> {
                             "subject settings row missing after the write: tenant {}, subject {}",
                             key.tenant_id, key.subject_id
                         ))),
-                        // The write passed the scope, so a refused read-back
-                        // means the coverage check and the secure ORM disagree.
+                        // The write was decided covered with the same scope
+                        // and key, so a refused read-back is a defect.
                         SettingsLookup::OutOfScope(refusal) => Err(DomainError::internal(format!(
                             "subject settings read-back refused after an accepted write \
                              ({refusal:?}): tenant {}, subject {}",

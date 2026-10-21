@@ -171,24 +171,47 @@ mod tests {
             .expect("row before the second run");
         conn.execute_unprepared(ddl).await.expect("second run");
 
-        let row = conn
-            .query_one_raw(Statement::from_string(
+        let select = |subject: &str| {
+            Statement::from_string(
                 DatabaseBackend::Sqlite,
-                "SELECT personalization_enabled, erasure_in_progress \
-                 FROM construct__subject_settings WHERE tenant_id = 't' AND subject_id = 's'"
-                    .to_owned(),
-            ))
+                format!(
+                    "SELECT personalization_enabled, erasure_in_progress \
+                     FROM construct__subject_settings \
+                     WHERE tenant_id = 't' AND subject_id = '{subject}'"
+                ),
+            )
+        };
+        let kept = conn
+            .query_one_raw(select("s"))
             .await
             .expect("select")
             .expect("the row survives the second run");
-        let personalization = row
-            .try_get::<bool>("", "personalization_enabled")
-            .expect("personalization flag");
-        let erasure = row
-            .try_get::<bool>("", "erasure_in_progress")
-            .expect("erasure flag");
-        assert!(!personalization, "the row keeps its value");
-        assert!(!erasure, "the column default survives the second run");
+        assert!(
+            !kept
+                .try_get::<bool>("", "personalization_enabled")
+                .expect("personalization flag"),
+            "the row keeps its value"
+        );
+
+        // A row stored after the second run, without the erasure flag, takes
+        // the column default the table has now.
+        conn.execute_unprepared(
+            "INSERT INTO construct__subject_settings \
+             (tenant_id, subject_id, personalization_enabled) VALUES ('t', 'u', 1)",
+        )
+        .await
+        .expect("row after the second run");
+        let fresh = conn
+            .query_one_raw(select("u"))
+            .await
+            .expect("select")
+            .expect("the new row");
+        assert!(
+            !fresh
+                .try_get::<bool>("", "erasure_in_progress")
+                .expect("erasure flag"),
+            "the column default survives the second run"
+        );
         assert!(
             conn.execute_unprepared(insert).await.is_err(),
             "the primary key survives the second run"
