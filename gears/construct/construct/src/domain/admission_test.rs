@@ -386,6 +386,45 @@ async fn the_value_cap_counts_characters_not_bytes() {
 }
 
 #[tokio::test]
+async fn the_value_cap_measures_a_value_as_a_whole_not_each_piece() {
+    let fixture = AdmissionFixture {
+        rules: crate::domain::admission::AdmissionRules {
+            max_value_chars: 4,
+            ..open_rules()
+        },
+        ..AdmissionFixture::default()
+    };
+    // Three pieces of 2 characters each: every piece fits, the value does not.
+    let plan = connector_plan(vec![add_value(
+        "skill",
+        "skills",
+        serde_json::json!({ "name": "Go", "level": "C1", "since": "21" }),
+    )]);
+
+    let outcome = admit(&fixture, plan, &[]).await;
+
+    assert_dropped(&fixture, &outcome, DropReason::WriteCapExceeded);
+}
+
+#[tokio::test]
+async fn the_value_cap_counts_no_keys() {
+    let fixture = AdmissionFixture {
+        rules: crate::domain::admission::AdmissionRules {
+            max_value_chars: 4,
+            ..open_rules()
+        },
+        ..AdmissionFixture::default()
+    };
+    let plan = connector_plan(vec![add_value(
+        "skill",
+        "skills",
+        serde_json::json!({ "a_long_field_name": "Go", "level": "C1" }),
+    )]);
+
+    admitted(admit(&fixture, plan, &[]).await);
+}
+
+#[tokio::test]
 async fn a_dropped_plan_writes_no_block_event_even_with_block_verdicts() {
     let fixture = AdmissionFixture {
         settings: SubjectSettings {

@@ -14,7 +14,7 @@ use toolkit_security::{AccessScope, SecurityContext};
 use uuid::Uuid;
 
 use super::error::DomainError;
-use super::plan::{Origin, Plan, Step, ValueRef, text_piece_mut};
+use super::plan::{Origin, Plan, Step, ValueRef, text_piece_mut, text_pieces};
 use super::record_intake::{DropEvent, DropReason, DropStage, IntakeEvents};
 use super::sensitive_data::{Action, SensitiveDataKind, Verdict};
 use super::subject_settings::{SubjectKey, SubjectSettingsReader};
@@ -50,7 +50,8 @@ pub struct AdmissionRules {
     pub entity_kinds: Allowed<String>,
     /// The most steps one plan may hold.
     pub max_steps: usize,
-    /// The longest value, in characters, a plan may store.
+    /// The longest value a plan may store, in characters of its text: every
+    /// string and number in it together, never the keys.
     pub max_value_chars: usize,
 }
 
@@ -257,10 +258,17 @@ fn broken_rule(plan: &Plan, rules: &AdmissionRules) -> Option<DropReason> {
     // @cpt-end:cpt-cf-construct-algo-admission-admit:p1:inst-admit-kinds
 
     // @cpt-begin:cpt-cf-construct-algo-admission-admit:p1:inst-admit-caps
-    let too_long = plan
-        .values()
-        .iter()
-        .any(|value| value.text.chars().count() > rules.max_value_chars);
+    // A value is measured as a whole, so an object of many short pieces cannot
+    // pass a cap that each piece alone would.
+    let too_long = plan.steps.iter().any(|step| {
+        step.change.properties().iter().any(|property| {
+            text_pieces(&property.value)
+                .iter()
+                .map(|piece| piece.chars().count())
+                .sum::<usize>()
+                > rules.max_value_chars
+        })
+    });
     if plan.steps.len() > rules.max_steps || too_long {
         return Some(DropReason::WriteCapExceeded);
     }
