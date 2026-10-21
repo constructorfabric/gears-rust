@@ -98,11 +98,11 @@ To scale, the Task Engine uses **sharding** inside its own database model (hot-r
 * PostgreSQL, MariaDB/MySQL, and SQLite can all serve as the operational database when they meet the transaction rules.
 * The operational database holds everything the engine needs to make a decision. The engine never reads an eventually consistent system to decide a claim, a lease, or a limit.
 * All task payloads (input, context, output, entries, events) stay inside the operational database, within the PRD size limit (64 KB per payload). The Task Engine does not become a file store.
-* Search, analytics, and history can be offloaded to other gears. These gears receive data through published lifecycle events, not by sharing the Task Engine database.
-* If a search, analytics, or history gear is slow or down, task creation, claim, heartbeat, retries, waits, and completion still work.
+* Search and analytics can be offloaded to other gears. These gears receive data through published lifecycle events, not by sharing the Task Engine database.
+* If a search or analytics gear is slow or down, task creation, claim, heartbeat, retries, waits, and completion still work.
 * The default deployment needs only the Task Engine and one supported database.
 * There is no runtime plugin ABI and no plugin version to manage.
-* History and archiving are **out of scope for now**. Later, a deployment MAY add an optional history/archiving plugin that stores **only completed tasks** and is read back transparently through the existing task read APIs. The current release ships no such plugin, and adding it would need a new ADR.
+* History and archiving are out of scope for now. Later, a deployment MAY add an optional history/archiving plugin that stores **only completed tasks** and is read back transparently through the existing task read APIs. The current release ships no such plugin, and adding it would need a new ADR.
 * Moving task execution to an outside engine in the future needs a new ADR.
 
 ### Confirmation
