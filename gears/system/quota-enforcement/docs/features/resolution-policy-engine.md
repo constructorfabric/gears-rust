@@ -163,12 +163,14 @@ consumption-operations feature), `cpt-cf-quota-enforcement-usecase-region-gated-
 
 **Steps**:
 1. [x] - `p1` - Operator sends `POST /v1/quota-enforcement/policies/{id}/rollback` with `target_version` and optional `comment` - `inst-prd-rollback-request`
-2. [x] - `p1` - **IF** `target_version` does not exist - `inst-prd-unknown-if`
+2. [x] - `p1` - **IF** the Policy is deleted - `inst-prd-deleted-if`
+   1. [x] - `p1` - **RETURN** `POLICY_DELETED` (400), whatever `target_version` names; a deleted Policy's versions are never re-activated - `inst-prd-deleted`
+3. [x] - `p1` - **IF** `target_version` does not exist - `inst-prd-unknown-if`
    1. [x] - `p1` - **RETURN** `UNKNOWN_POLICY_VERSION` - `inst-prd-unknown`
-3. [x] - `p1` - **IF** `target_version` is in `rolled_back` state, or the Policy is deleted - `inst-prd-rb-if`
-   1. [x] - `p1` - **RETURN** `VERSION_ROLLED_BACK`, or `POLICY_DELETED` (400) for a deleted Policy; terminal versions are never re-activated - `inst-prd-rb`
-4. [x] - `p1` - DB: when `target_version` is already the active version (a retry), return it unchanged with no state transition, audit row, event, or `policy_version_transitions_total` increment; otherwise, the target being `superseded`, atomically make `target_version` active again, transition the previously-active version to `rolled_back` (terminal), move the latest-pointer, and enqueue `policy-changed` with `change_kind = updated` (rollback is a latest-pointer move; `rolled_back` is a `version_state` value, not a notification discriminator) - `inst-prd-rollback-apply`
-5. [x] - `p1` - **RETURN** `200 OK` with the new active `PolicyVersion`; increment `policy_version_transitions_total` - `inst-prd-rollback-return`
+4. [x] - `p1` - **IF** `target_version` is in `rolled_back` state - `inst-prd-rb-if`
+   1. [x] - `p1` - **RETURN** `VERSION_ROLLED_BACK`; terminal versions are never re-activated - `inst-prd-rb`
+5. [x] - `p1` - DB: when `target_version` is already the active version (a retry), return it unchanged with no state transition, audit row, event, or `policy_version_transitions_total` increment; otherwise, the target being `superseded`, atomically make `target_version` active again, transition the previously-active version to `rolled_back` (terminal), move the latest-pointer, and enqueue `policy-changed` with `change_kind = updated` (rollback is a latest-pointer move; `rolled_back` is a `version_state` value, not a notification discriminator) - `inst-prd-rollback-apply`
+6. [x] - `p1` - **RETURN** `200 OK` with the new active `PolicyVersion`; increment `policy_version_transitions_total` - `inst-prd-rollback-return`
 
 ### Policy Delete
 
@@ -203,7 +205,7 @@ plugin `bootstrap()` seeding step
 **Output**: a populated `EngineRegistry` and the seeded `global` Policy, or failed gear readiness
 
 **Steps**:
-1. [x] - `p1` - Register `most-restrictive-wins` and `cel` in the static in-process `EngineRegistry` at gear bootstrap; Engines link into the binary at build time and there is no runtime registration (`cpt-cf-quota-enforcement-constraint-in-process-engine-registration`) - `inst-ebs-register`
+1. [x] - `p1` - Register every Engine linked into the binary, `most-restrictive-wins` and `cel` included, in the in-process `EngineRegistry` at gear bootstrap; Engines link into the binary at build time and there is no runtime registration (`cpt-cf-quota-enforcement-constraint-in-process-engine-registration`) - `inst-ebs-register`
 2. [x] - `p1` - **IF** any built-in Engine declared in the deployment manifest fails to register - `inst-ebs-fail-if`
    1. [x] - `p1` - Fail readiness and serve nothing; emit a structured log entry and increment `engine_bootstrap_failures_total` by `engine_id`; never silently fall back to a different Engine for Policies that referenced the failed one; recovery is fixing the registration failure and restarting the gear; this step extends `cpt-cf-quota-enforcement-flow-gear-bootstrap` from the foundation feature - `inst-ebs-fail`
 3. [x] - `p1` - DB: after Engine registration succeeds, seed the `global` Policy idempotently when missing, inside the storage plugin `bootstrap()` seeding step: `policy_id = global, policy_version = 1, version_state = active, engine_id = most-restrictive-wins, engine_config = {}` - `inst-ebs-seed`

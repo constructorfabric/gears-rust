@@ -50,10 +50,10 @@ pub use client::{
     quota_operator_api_ir,
 };
 pub use engine::{
-    EngineConfigError, EngineError, EngineValidationInput, EnvironmentInputs, EvaluationBudget,
-    EvaluationContext, EvaluationFailure, EvaluationMeter, EvaluationOutcome, EvaluationQuota,
-    MetricEnvironmentSchema, PolicySchemaSnapshot, QuotaResolutionEngineV1, QuotaScopeTier,
-    ValidatedConfig,
+    EngineConfigError, EngineError, EngineRegistration, EngineValidationInput, EnvironmentInputs,
+    EvaluationBudget, EvaluationContext, EvaluationFailure, EvaluationMeter, EvaluationOutcome,
+    EvaluationQuota, MetricEnvironmentSchema, PolicySchemaSnapshot, QuotaResolutionEngineV1,
+    QuotaScopeTier, ValidatedConfig, linked_engines,
 };
 pub use gts::{
     CONSTRAINT_BASE, LEASE_RESOURCE, METRIC_BASE_TYPE, OPERATION_RESOURCE, OwnedDefinition,
@@ -101,3 +101,7 @@ pub use storage_plugin::{
     QuotaEnforcementStoragePluginV1, StorageError,
 };
 pub use thresholds::threshold_crossings;
+
+// The engine registration macro reaches `inventory` through the SDK.
+#[doc(hidden)]
+pub use inventory as __inventory;

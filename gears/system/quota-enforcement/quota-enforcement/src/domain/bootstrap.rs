@@ -21,7 +21,7 @@ use quota_enforcement_sdk::{
 use toolkit_macros::domain_model;
 
 use super::catalog::{CatalogBuilder, CatalogConfig, ProjectionContractCatalog};
-use super::engines::{EngineRegistry, PolicyArtifactCache, builtin_registry};
+use super::engines::{EngineRegistry, PolicyArtifactCache, linked_registry};
 use super::error::{Dependency, DomainError};
 use super::notifications::{
     DeliveryLifecycle, DispatchLimits, NotificationDispatcher, dispatcher_context,
@@ -294,12 +294,11 @@ impl Bootstrap {
     /// is a readiness failure, never an overwrite, and it is counted against
     /// the engine that collided.
     fn engine_runtime(&self) -> Result<EngineRuntime, (Dependency, DomainError)> {
-        let engines = builtin_registry().map_err(|e| {
+        let engines = linked_registry().map_err(|e| {
             // @cpt-begin:cpt-cf-quota-enforcement-algo-engine-bootstrap-seed:p1:inst-ebs-fail-if
             // @cpt-begin:cpt-cf-quota-enforcement-algo-engine-bootstrap-seed:p1:inst-ebs-fail
-            if let Some(label) = EngineLabel::from_id(e.engine_id) {
-                self.metrics.record_engine_bootstrap_failure(label);
-            }
+            self.metrics
+                .record_engine_bootstrap_failure(EngineLabel::from_linked_id(e.engine_id));
             tracing::error!(
                 target: LOG_TARGET,
                 engine_id = e.engine_id,
@@ -396,9 +395,8 @@ impl Bootstrap {
                     schemas: &version.schema_snapshot,
                 })
                 .map_err(|e| {
-                    if let Some(label) = EngineLabel::from_id(engine.id()) {
-                        self.metrics.record_engine_bootstrap_failure(label);
-                    }
+                    self.metrics
+                        .record_engine_bootstrap_failure(EngineLabel::of(engine.as_ref()));
                     (Dependency::Engine, DomainError::Internal(e.to_string()))
                 })?;
             artifacts.publish(version.policy_id, version.version, artifact);

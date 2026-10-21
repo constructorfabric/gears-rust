@@ -337,10 +337,13 @@ fn policy_engine_instruments_use_only_documented_labels() {
         &MetricsConfig::default(),
         cell(),
     );
-    adapter.record_engine_bootstrap_failure(EngineLabel::Cel);
-    adapter.record_engine_evaluation(EngineLabel::Cel, std::time::Duration::from_millis(1));
+    adapter.record_engine_bootstrap_failure(EngineLabel::from_linked_id("cel"));
+    adapter.record_engine_evaluation(
+        EngineLabel::from_linked_id("cel"),
+        std::time::Duration::from_millis(1),
+    );
     adapter.record_plan_violation(
-        EngineLabel::Cel,
+        EngineLabel::from_linked_id("cel"),
         DebitPlanInvariant::AmountExceedsRequestAmount,
     );
     adapter.record_policy_transition(PolicyTransition::Rollback);

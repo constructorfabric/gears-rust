@@ -418,7 +418,8 @@ pub struct PoliciesSection {
     /// after the process loads the new value.
     pub evaluation_timeout_upper_ms: u64,
     /// Operations an engine may charge in one evaluation before it reports
-    /// `CostExceeded`.
+    /// `CostExceeded`. For CEL, one unit is one evaluated node or 64 bytes of
+    /// data copied or created.
     pub evaluation_cost_limit: u64,
     /// Largest serialized `engine_config` accepted at create or update.
     pub config_max_bytes: usize,

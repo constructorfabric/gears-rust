@@ -171,7 +171,7 @@ impl MigrationTrait for Migration {
                     .col(ColumnDef::new(QePolicyOperationLog::Comment).text().null())
                     .col(
                         ColumnDef::new(QePolicyOperationLog::OccurredAt)
-                            .text()
+                            .timestamp_with_time_zone()
                             .not_null(),
                     )
                     .foreign_key(

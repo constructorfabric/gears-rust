@@ -12,6 +12,8 @@ use serde_json::json;
 #[derive(Debug, Default)]
 pub struct MostRestrictiveWins;
 
+quota_enforcement_sdk::register_engine!(|| Arc::new(MostRestrictiveWins));
+
 #[derive(Debug)]
 struct EmptyConfig;
 

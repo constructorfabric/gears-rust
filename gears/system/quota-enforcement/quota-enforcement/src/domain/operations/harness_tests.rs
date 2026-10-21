@@ -20,7 +20,7 @@ use crate::domain::attribution::Attribution;
 use crate::domain::catalog::{
     CatalogBuilder, CatalogConfig, MetricClassifications, ProjectionContractCatalog,
 };
-use crate::domain::engines::{PolicyArtifactCache, builtin_registry};
+use crate::domain::engines::{PolicyArtifactCache, linked_registry};
 use crate::domain::ports::metric_registry::{MetricDescriptor, MetricMode};
 use crate::test_support::{
     FakeContractRegistry, LLM_TENANT_PROJECTION, LLM_USER_PROJECTION, METRIC_TOKENS,
@@ -116,7 +116,7 @@ impl Harness {
             storage,
             classifications,
             cache: IdempotencyCache::new(16, std::time::Duration::from_secs(5)),
-            engines: Arc::new(builtin_registry().expect("engines")),
+            engines: Arc::new(linked_registry().expect("engines")),
             artifacts: Arc::new(PolicyArtifactCache::new(
                 std::num::NonZeroUsize::new(8).expect("capacity"),
                 std::num::NonZeroUsize::new(2).expect("permits"),

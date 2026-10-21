@@ -1,5 +1,6 @@
 //! Platform policy persistence, with no synthetic tenant ownership.
 use sea_orm::entity::prelude::*;
+use time::OffsetDateTime;
 use toolkit_db_macros::Scopable;
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Scopable)]
 #[sea_orm(table_name = "qe_policy_operation_log")]
@@ -12,7 +13,7 @@ pub struct Model {
     pub operation: String,
     pub actor: String,
     pub comment: Option<String>,
-    pub occurred_at: String,
+    pub occurred_at: OffsetDateTime,
 }
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
 pub enum Relation {}

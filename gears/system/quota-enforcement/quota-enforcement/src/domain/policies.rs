@@ -13,7 +13,8 @@ use quota_enforcement_sdk::{
     EngineValidationInput, EnvironmentInputs, EventId, NotificationEvent, NotificationEventKind,
     NotificationScope, PageRequest, PageResult, PolicyDraft, PolicyId, PolicyPatch,
     PolicySchemaSnapshot, PolicyScope, PolicySpec, PolicyUpdate, PolicyVersion, PolicyVersionMeta,
-    QuotaEnforcementStoragePluginV1, StorageError, TransitionOutcome, ValidatedConfig,
+    PolicyVersionState, QuotaEnforcementStoragePluginV1, StorageError, TransitionOutcome,
+    ValidatedConfig,
 };
 use serde_json::json;
 use std::num::{NonZeroU32, NonZeroUsize};
@@ -243,6 +244,16 @@ impl PolicyManagement<'_> {
             .admission
             .admit_operator(ctx, actions::POLICY_ROLLBACK)
             .await?;
+        // Storage's order (deleted, unknown, rolled back), before catalogue drift can mask it.
+        if self.storage.read_active_policy_by_id(&id).await?.is_none() {
+            // Every policy keeps version 1, so its absence means the id never existed.
+            let error = if self.storage.read_policy_version(&id, 1).await?.is_some() {
+                StorageError::PolicyDeleted { policy_id: id }
+            } else {
+                StorageError::PolicyNotFound { policy_id: id }
+            };
+            return Err(error.into());
+        }
         let version = self
             .storage
             .read_policy_version(&id, target)
@@ -253,6 +264,13 @@ impl PolicyManagement<'_> {
                     version: target,
                 })
             })?;
+        if version.state == PolicyVersionState::RolledBack {
+            return Err(StorageError::VersionRolledBack {
+                policy_id: id,
+                version: target,
+            }
+            .into());
+        }
         self.schemas.check_activation(&version)?;
         let artifact = self
             .compile(
@@ -338,15 +356,21 @@ impl PolicyManagement<'_> {
         }
     }
 
-    /// Read immutable history with the storage-issued opaque cursor.
+    /// Read immutable history with the storage-issued opaque cursor. An absent
+    /// `limit` means the platform default, within the configured maximum.
     /// # Errors
     /// Admission, invalid pagination, missing policy, or backend failure.
     pub async fn list(
         &self,
         ctx: &SecurityContext,
         id: &PolicyId,
-        page: PageRequest,
+        limit: Option<u32>,
+        cursor: Option<String>,
     ) -> Result<PageResult<PolicyVersionMeta>, DomainError> {
+        let page = PageRequest {
+            limit: limit.unwrap_or(PageRequest::DEFAULT_LIMIT.min(self.limits.list_limit)),
+            cursor,
+        };
         if page.limit == 0
             || page.limit > self.limits.list_limit
             || page.cursor.as_ref().is_some_and(|s| s.len() > 1024)
