@@ -1029,6 +1029,50 @@ async fn a_redaction_inside_an_object_keeps_the_json_and_the_other_fields() {
 }
 
 #[tokio::test]
+async fn two_pieces_of_one_value_give_one_event_per_kind() {
+    let fixture = AdmissionFixture::default();
+    let plan = connector_plan(vec![
+        add_value(
+            "note",
+            "health",
+            serde_json::json!({ "a": "has asthma", "b": "asthma since 2001" }),
+        ),
+        add_value(
+            "note",
+            "contact",
+            serde_json::json!({ "a": "call +49 30 1234", "b": "or +49 30 1234 at night" }),
+        ),
+    ]);
+    let verdicts = checked(
+        &plan,
+        &[
+            (SensitiveDataKind::Health, "asthma"),
+            (SensitiveDataKind::Contacts, "+49 30 1234"),
+        ],
+    )
+    .await;
+
+    let admitted = admitted(admit(&fixture, plan, &verdicts).await);
+
+    // The result keeps the detail per piece; the events count values.
+    assert_eq!(admitted.blocked.len(), 2, "two blocked pieces");
+    assert_eq!(admitted.redacted.len(), 2, "two redacted pieces");
+    let events: Vec<(&str, SensitiveDataKind)> = fixture
+        .events
+        .taken()
+        .iter()
+        .map(|(action, event)| (*action, event.kind))
+        .collect();
+    assert_eq!(
+        events,
+        [
+            ("blocked", SensitiveDataKind::Health),
+            ("redacted", SensitiveDataKind::Contacts),
+        ]
+    );
+}
+
+#[tokio::test]
 async fn a_found_number_cannot_be_redacted_so_its_value_is_blocked() {
     let fixture = AdmissionFixture::default();
     let plan = connector_plan(vec![add_value(

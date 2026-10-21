@@ -214,11 +214,19 @@ impl Admission {
             origin: admitted.plan.origin.clone(),
             kind,
         };
-        for enforced in &admitted.blocked {
-            self.ports.events.blocked(event(enforced.kind));
+        // One event per value and kind, not per piece: two pieces of one value
+        // that a kind blocks are one blocked value for that kind.
+        let per_value = |enforced: &[Enforced]| {
+            enforced
+                .iter()
+                .map(|e| (e.at.property_ref(), e.kind))
+                .collect::<BTreeSet<_>>()
+        };
+        for (_, kind) in per_value(&admitted.blocked) {
+            self.ports.events.blocked(event(kind));
         }
-        for enforced in &admitted.redacted {
-            self.ports.events.redacted(event(enforced.kind));
+        for (_, kind) in per_value(&admitted.redacted) {
+            self.ports.events.redacted(event(kind));
         }
         // @cpt-end:cpt-cf-construct-algo-admission-enforce:p1:inst-enforce-events
     }

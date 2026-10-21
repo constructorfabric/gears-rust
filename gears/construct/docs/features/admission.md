@@ -170,7 +170,7 @@ The system **MUST** write one content-free event for each blocked value and kind
 **Implements**:
 - `cpt-cf-construct-algo-admission-enforce`
 
-**Verified by**: `a_block_is_logged_with_its_kind`, `a_redaction_is_logged_with_its_kind`, `an_admission_drop_is_logged_in_the_record_drop_shape_without_content` (capture the log), `a_plan_without_a_record_has_no_record_drop_event`, and the recorded events in `a_blocked_value_is_not_stored_the_rest_is_and_the_result_says_so` (no content) and `a_redacted_value_keeps_its_step_without_the_found_content`.
+**Verified by**: `two_pieces_of_one_value_give_one_event_per_kind`, `a_block_is_logged_with_its_kind`, `a_redaction_is_logged_with_its_kind`, `an_admission_drop_is_logged_in_the_record_drop_shape_without_content` (capture the log), `a_plan_without_a_record_has_no_record_drop_event`, and the recorded events in `a_blocked_value_is_not_stored_the_rest_is_and_the_result_says_so` (no content) and `a_redacted_value_keeps_its_step_without_the_found_content`.
 
 ## 6. Acceptance Criteria
 
