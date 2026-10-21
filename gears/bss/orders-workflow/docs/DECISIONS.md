@@ -6765,6 +6765,137 @@ are the owners' choices; the design says what it forwards and from whom.
 **Propagated**: `design/03-approval-execution.md` §3.3 (*Valuation basis, open*);
 `UPSTREAM_REQS.md` §2.4, §2.5; D-198.
 
+### D-226 (H) Financial readiness is a four-way port answer behind `evaluate-payment-auth-eligibility`; the Payments read is its first provider
+
+**Accepted (2026-10-21).** *(PR #4787 proposal item 1, this gear's side; extends D-89, D-113)*
+
+**Decision**: `evaluate-payment-auth-eligibility` reads the order version's financial readiness
+through a **financial-readiness port** answering `not-required` · `satisfied` · `pending` (pending or
+unknown) · `refused` with a reason. The Payments authorization read is the provider today
+(`authorized` → `satisfied`, `pending` → `pending`, `failed` → `refused`); Billing's readiness read
+replaces it when that ask lands (D-223), with no change to the operation, the definition or the
+route. `not-required` and `satisfied` are `eligible`; `refused` is `eligible` with the refusal
+carried to `begin-fulfillment`, where Lifecycle alone evaluates tolerance (D-89); `pending` waits
+with the existing wake-ups and is re-read after restart. The port is the whole-order gate.
+`re-check-pre-activation` re-reads the port where the provider is Billing: `refused` aborts with
+`financial-readiness-withdrawn`, `pending` is `not-dispatchable`, so a tolerated process-level
+failure never stands in for service-admission evidence. The plan row records `readiness_outcome`,
+`readiness_reason` and `readiness_provider` beside `payment_auth_outcome`. This gear creates no
+payment, session or invoice, reads no `billing_timing`, and never reads a browser redirect as
+readiness.
+
+**Rationale**: the proposal's ownership rules are kept — Billing and Payments own initiation and
+recovery — while the consumer's side is fixed now: the answer shape, the wait, the re-read, the two
+permissions. The provider swap is a port binding, not a redesign.
+
+**Propagated**: `design/04-fulfillment-plan.md` §2.1 (*Payment authorization*), §3.3 (`output`),
+§3.6 (`inst-pa-read-outcome`, `inst-pa-persist-observation`, `inst-pa-if-pending`,
+`inst-pa-return-eligible`, `inst-rc-if-stale`), §3.7; `design/10-process-definition.md` §3.6
+(`eligibility` export); `design/01-foundation.md` §4.9 (`financial-readiness-withdrawn`); D-89,
+D-223.
+
+### D-227 (M) Two deadlines, the acquisition's own reservation, and obligations retained on every unwind
+
+**Accepted (2026-10-21).** *(PR #4787 proposal item 2, this gear's side; refines D-194)*
+
+**Decision**: the frozen plan carries `assessment_deadline_at` (Lifecycle's assessment expiry,
+NULL until `get_version` provides it) apart from `activation_deadline_at` (the final activation
+permission: the earliest protected-coverage end where Lifecycle provides coverage, else the earliest
+`activation_deadline`). The assessment deadline is advisory — elapsed, the pre-activation re-check
+re-reads the bindings and aborts only on a refusal or divergence Lifecycle reports — and only the
+activation deadline unwinds (D-194 as refined). The re-check's overlap read passes the version's
+own binding references as `ownBindingRefs` and treats an occupancy naming only them as no
+collision. On every failure or cancel of a protected acquisition, `report-outcome` carries
+`retainedObligations[]` — the lines' binding references — stating that this gear voided or
+cancelled only what it created and released no reservation, binding or payment; the
+capture-versus-cancellation decision is Lifecycle's and the financial remedy Billing's. The
+readiness read names the order version as the protection authority the provider verifies.
+
+**Rationale**: the proposal separates assessment expiry, protected coverage and final permission,
+and forbids a silent release of a paid place; each has a consumer-side rule this gear can state
+now, and the split costs one nullable column until Lifecycle fills it.
+
+**Propagated**: `design/04-fulfillment-plan.md` §3.6 (`inst-rc-compose-lifecycle`,
+`inst-rc-if-stale`), §3.7 (`assessment_deadline_at`, `activation_deadline_at`);
+`design/06-saga-and-compensation.md` §3.6 (`report-outcome` step 3); `UPSTREAM_REQS.md` §2.1
+(`SUB-O5` clause), §2.2, §2.4; D-194.
+
+### D-228 (H) The payment wait is a seller-policy deadline; expiry requests Lifecycle's pre-fulfillment cancel or raises a review task, and never touches money
+
+**Accepted (2026-10-21).** *(PR #4787 proposal item 5, this gear's side; extends D-109, D-134, D-140)*
+
+**Decision**: `owf_seller_policy` gains `payment_wait_window_ms` and `payment_wait_expiry_action`
+(`request-cancel` · `manual-review`; platform defaults 7 days and `manual-review`). On the first
+`pending` readiness observation the plan row pins `payment_wait_deadline_at` and the action; every
+`pending` answer reports `paymentWaitExpired`. The definition routes an expired wait once:
+`request-cancel` calls the new protected `request-prefulfillment-cancel` (slice 08), which asks
+Lifecycle's workflow-mediated pre-fulfillment cancel with reason `payment-wait-expired` under a
+lifecycle-transition key and answers `requested`, `not-admissible` or `unsupported`;
+`manual-review`, and `unsupported`, raise one order-scope `payment-wait-expired` task while the
+eligibility wait keeps polling, so a late readiness still proceeds and `begin-fulfillment` closes
+the task. Lifecycle arbitrates the cancel against beginning fulfillment and carries it to Billing;
+this gear records nothing about money and ends the instance only on `OrderCancelled`, with nothing
+to compensate. A seller window may not exceed Lifecycle's `approved` expiry. The operator's cancel
+of an `approved` order stays Lifecycle's own route (D-109).
+
+**Rationale**: the gap the proposal names is real — nothing could end an order waiting on money —
+and the consumer's side needs only a policy value, a pinned deadline, one operation and one task;
+the arbitration and the financial consequence stay with their owners, and the fallback fails
+closed into review.
+
+**Propagated**: `design/01-foundation.md` §3.7 (`owf_seller_policy`), §4.9
+(`payment-wait-expired`); `design/04-fulfillment-plan.md` §3.3, §3.6
+(`inst-pa-persist-observation`, `inst-pa-if-pending`), §3.7; `design/07-manual-tasks.md` §3.3
+(callers table), §4.4; `design/08-hold-and-cancel.md` §3.3 (`request-prefulfillment-cancel`);
+`design/10-process-definition.md` §3.6 (`onEligibility`, `paymentWaitRoute`,
+`requestPrefulfillmentCancel`, `paymentWaitReview`); `UPSTREAM_REQS.md` §2.2, §2.4; D-109, D-223.
+
+### D-229 (M) The named-user condition travels with the request; generation-bound reassignment; an unresolved assignee parks
+
+**Accepted (2026-10-21).** *(PR #4787 proposal item 7, this gear's side; extends D-56, D-197, D-224)*
+
+**Decision**: `open-gates` reads the one named user the seller's tenant-scoped configuration
+assigns to the predefined "order approval" stage, sets `gate_generation = 1` and carries an approval
+condition `{ type: named-users, subjects, generation }` in the request beside the quorum. A missing
+or ineligible assignee opens no gate and parks the version as `assignee-unresolved`, never
+"approval not required". A new route `POST …/approver-inbox/gates/{gateId}/assign` under the
+distinct pair `approval_gate × assign` bumps the generation and re-submits the condition under the
+unchanged request key; assigning grants no approval authority. `record-decision` refuses
+`not-assignee` and `stale-generation` as recorded refusals — a consistency guard on this gear's
+record, never a second authority: the library decides the condition, and the inbox projection
+becomes the source adapter of the common BSS Approvals Inbox when it exists, with the local routes
+as the fallback surface.
+
+**Rationale**: the proposal's rule is one authoritative decision path and no auto-approval on a
+missing assignee; the consumer's side — the condition, the generation, the assign pair, the park —
+is this gear's to fix now, and the library ask (D-224) carries only what this gear cannot do.
+
+**Propagated**: `design/03-approval-execution.md` §3.2 (*Approver Inbox Projection*), §3.3
+(`record-decision` reasons, assign route), §3.6 (`open-gates` step 2), §3.7 (`gate_generation`);
+`design/09-read-and-authz.md` §3.1 (`approval_gate × assign`); `design/01-foundation.md` §4.9
+(`assignee-unresolved`, `not-assignee`, `stale-generation`); `UPSTREAM_REQS.md` §2.3; D-56, D-224.
+
+### D-230 (M) The approval request carries a valuation for the policy's chosen basis, or `unavailable`, in the shared money representation
+
+**Accepted (2026-10-21).** *(PR #4787 proposal item 8, this gear's side; extends D-198, D-225)*
+
+**Decision**: `owf_seller_policy.approval_valuation_basis` names the basis
+(`annualised-net-pretax` default, `full-term-commitment`, `first-installment`, `authorized-budget`,
+`forecast`). `open-gates` reads the figure Lifecycle stores for that basis through `get_version`
+and carries `valuation_basis`, `valuation_amount` (shared exact major-unit money), `currency`,
+`valuation_term` and `valuation_provenance`, or `valuation_available = false`, forwarded as
+*unavailable* and never as zero; the approval authority decides what an unavailable figure
+requires. `tcv_minor`, `currency_minor_digits` and their minor-unit representation are retired from
+`owf_approval_request` and `owf_approval_gate`; today's only stored basis is carried into the
+representation by its stored scale, a change of representation and not a computation (D-198).
+
+**Rationale**: the consumer can fix what it forwards and how, now; what Rating computes and
+Lifecycle stores per basis is their ask (D-225).
+
+**Propagated**: `design/01-foundation.md` §3.7 (`approval_valuation_basis`);
+`design/03-approval-execution.md` §3.3 (*Request payload contents*), §3.7 (`owf_approval_request`,
+`owf_approval_gate`); `UPSTREAM_REQS.md` §2.4, §2.5; D-198, D-225.
+
 ## Open Questions
 
 ### Q-01: Which durable-execution substrate backs the process — the OSS Workflow Engine or a BSS-local mechanism?
@@ -7121,6 +7252,7 @@ register relies on is cited to a serverless-runtime file and line or registered 
 | D-209 | 05 Provisioning intents, 06 Saga (Subscriptions #5131 received, 2026-10-12) | `PRD.md` §6.3, §9.2, §13; `design/05`, `design/06`; `UPSTREAM_REQS.md` §2.1, §4 |
 | D-210 | cross-cutting (review findings, 2026-10-12) | `ADR/0011`, `ADR/0012`, `ADR/0013`; `design/01`, `design/08`; `UPSTREAM_REQS.md` §2.9 |
 | D-211 | 05 Provisioning intents (actual start read back, 2026-10-18) | `design/05`; `UPSTREAM_REQS.md` `SUB-O10`; D-195 |
+| D-226–D-230 | cross-cutting (PR #4787 proposal, this gear's side, 2026-10-21) | `design/01` §3.7, §4.9; `design/03` §3.2, §3.3, §3.6, §3.7; `design/04` §2.1, §3.3, §3.6, §3.7; `design/06` §3.6; `design/07` §3.3, §4.4; `design/08` §3.3; `design/09` §3.1; `design/10` §3.6; `UPSTREAM_REQS.md` §2.1–§2.5 |
 | D-220–D-225 | cross-cutting (PR #4787 proposal of 2026-10-18, received 2026-10-21) | `design/03` §2.2, §3.3; `design/04` §3.5, §3.7; `design/05` §3.2, §3.3, §3.7, §4.1, §4.2, §4.4; `design/09` §3.3; `UPSTREAM_REQS.md` §2.1–§2.5, §4 item 22; Q-11 |
 | D-212–D-219 | cross-cutting (PR #4787 review findings, 2026-10-18) | `design/05` §3.3, §3.6, §3.7, §4.4, §4.5; `design/06` §3.6, §3.7, §4.7; `design/07` §2.2, §3.6, §4.4; `design/08` §2.2, §3.6, §3.7; `design/09` §3.3, §3.7, §4.4; `design/10` §3.6; `UPSTREAM_REQS.md` §2.1 |
 | D-200–D-205 | cross-cutting (Seam Atlas alignment, 2026-10-02) | `UPSTREAM_REQS.md` §2.1, §2.2, §2.4, §2.5, §4; `PRD.md` §9.1, §13, §15, §16; `design/05` §3.3; `design/06` §4.8 |
@@ -7318,6 +7450,11 @@ register relies on is cited to a serverless-runtime file and line or registered 
 | D-223 | H Financial readiness through Billing, protected purchase before capture and payment-wait cancellation recorded as owners' asks; D-194, D-109 and the Payments read stand | `design/04` §3.5, §3.7; `design/09` §3.3; `UPSTREAM_REQS.md` §2.2, §2.4, §2.5, §4 item 22 |
 | D-224 | M Named-user approval criterion asked of the shared library and the common inbox; the stand-in is never bound to a profile that requires approval | `design/03` §2.2; `UPSTREAM_REQS.md` §2.3; D-197, Q-14 |
 | D-225 | M Approval valuation basis is the policy's explicit choice, computed by Rating and retained by Lifecycle; shared money representation | `design/03` §3.3; `UPSTREAM_REQS.md` §2.4, §2.5; D-198 |
+| D-226 | H Financial readiness is a four-way port answer behind `evaluate-payment-auth-eligibility`; Payments today, Billing when it lands; the re-check re-reads it as final permission | `design/04` §2.1, §3.3, §3.6, §3.7; `design/10` §3.6; `design/01` §4.9; D-89, D-223 |
+| D-227 | M `assessment_deadline_at` advisory beside `activation_deadline_at`; own reservation excluded on the overlap read; `retainedObligations[]` on every unwind report | `design/04` §3.6, §3.7; `design/06` §3.6; `UPSTREAM_REQS.md` §2.1, §2.2, §2.4; D-194 |
+| D-228 | H Seller-policy payment wait; expiry runs `request-prefulfillment-cancel` or raises `payment-wait-expired`; nothing about money | `design/01` §3.7, §4.9; `design/04` §3.3, §3.6, §3.7; `design/07` §3.3, §4.4; `design/08` §3.3; `design/10` §3.6; D-109, D-223 |
+| D-229 | M Named-user condition in the request, `gate_generation`, `approval_gate × assign`, `not-assignee` / `stale-generation`, park on `assignee-unresolved`; projection is the common inbox's source adapter | `design/03` §3.2, §3.3, §3.6, §3.7; `design/09` §3.1; `design/01` §4.9; D-56, D-224 |
+| D-230 | M Valuation for the policy's chosen basis or `unavailable`, shared money representation; `tcv_minor` retired from the approval tables | `design/01` §3.7; `design/03` §3.3, §3.7; D-198, D-225 |
 
-Highest decision number used: **D-225**; highest question number: **Q-14**. Numbering is one continuous sequence across the whole
+Highest decision number used: **D-230**; highest question number: **Q-14**. Numbering is one continuous sequence across the whole
 register; there are no parts.

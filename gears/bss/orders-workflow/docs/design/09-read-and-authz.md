@@ -666,6 +666,7 @@ routing table against; the step row is expanded per `operation` value by §3.1.
 | `POST /bss-orders-workflow/v1/fulfillment-operator/dead-letters/{recordId}/discard` — *pending* | `dead_letter × discard` | triage row id; prefetched axes |
 | `GET /bss-orders-workflow/v1/approver-inbox/gates` | `approval_gate × read_inbox` | list; constraint `assigned_principal = subject_id` required |
 | `POST /bss-orders-workflow/v1/approver-inbox/gates/{gateId}/decision` | `approval_gate × approve` | `gate_id`; prefetched axes and `assigned_principal`; submitter barred locally (D-56) |
+| `POST /bss-orders-workflow/v1/approver-inbox/gates/{gateId}/assign` | `approval_gate × assign` | `gate_id`; prefetched axes; `assignee`. A distinct pair from `approve`: assignment management grants no approval authority, and an assigning subject that is not itself the assignee is refused `not-assignee` at the decision route (D-229) |
 | `GET /bss-orders-workflow/v1/fulfillment-plan/{orderId}/{orderVersion}` | `fulfillment_task × read` | `order_id`; prefetched axes; the caller's gate orders (`A*`) |
 
 **Removed rows.** `POST /bss-orders-workflow/v1/workflows/{orderId}/tasks/{taskId}/resolve` is

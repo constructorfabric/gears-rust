@@ -450,20 +450,25 @@ that is what Lifecycle stores (Lifecycle D-154, D-167). The PR #4787 proposal as
 versioned approval policy choose its basis explicitly — the full contractual commitment for a fixed
 committed term by default, an authorized budget, a forecast or "unavailable" for variable usage,
 never unknown read as zero — that Rating compute it, Lifecycle retain it with the version, and that
-`tcv_minor` give way to the shared exact major-unit money representation with basis, currency,
-term and provenance preserved and no implicit FX. This gear forwards whatever Lifecycle stores and
-computes nothing (D-198), so the ask sits with Rating and Lifecycle
-(`cpt-cf-bss-orders-workflow-upreq-approval-valuation-basis`, `UPSTREAM_REQS.md` §2.4, §2.5); the
-payload shape here changes only when they answer.
+the minor-unit TCV give way to the shared exact major-unit money representation with basis,
+currency, term and provenance preserved and no implicit FX. This gear forwards whatever Lifecycle
+stores and computes nothing (D-198), so the computation and the storage sit with Rating and
+Lifecycle (`cpt-cf-bss-orders-workflow-upreq-approval-valuation-basis`, `UPSTREAM_REQS.md` §2.4,
+§2.5). This gear's side is settled (D-230): the payload below carries the basis the seller's
+policy chose, the figure in the shared representation or `unavailable`, and the approval
+condition; what grows when Rating and Lifecycle answer is the set of bases a figure exists for.
 
 **Request payload contents.** The §9.2 expectations contract requires the request to carry enough
 for the approval authority to decide without fetching the order back, and requires the submission
 to be idempotent at the receiving end too. The payload therefore carries, in addition to order and
-party context: the **TCV** — the net pre-tax, annualised total-contract-value figure Rating computed
-and Lifecycle stored verbatim with the order version, in integer minor units with its currency and
-`currency_minor_digits` (Lifecycle D-154, D-167) — read non-authoritatively through Lifecycle's
+party context: the **valuation** — the figure Rating computed and Lifecycle stored verbatim with
+the order version for the basis the seller's approval policy chose (`valuation_basis`, D-230),
+with its currency, term and provenance in the shared exact money representation, or `unavailable`
+when Lifecycle stores none for that basis — read non-authoritatively through Lifecycle's
 `get_version(orderId, orderVersion)` per seam R4 inside `open-gates` and passed through without
-computation, conversion or adjustment by this gear (decision D-198); and the **request idempotency
+computation, conversion or adjustment by this gear (decision D-198; today the only stored basis is
+the annualised net pre-tax TCV of Lifecycle D-154 and D-167); the approval **condition** of D-229;
+and the **request idempotency
 key** itself, so the receiving implementation can absorb a redelivery on the same key rather than
 relying on this gear's registry alone. A request missing either is refused before submission
 rather than submitted incomplete; a submitted version carries its TCV by Lifecycle's own gate, so
@@ -586,6 +591,21 @@ routing configuration by `open-gates`; a gate that carries none is **not listed 
 is surfaced instead through the operator queue, because an unassigned gate is a routing-configuration
 defect, not a gate belonging to whoever asks first.
 
+**One authoritative decision path, and the common inbox** (D-229). The criterion is enforced on the
+owner side: the decision route forwards every decision to the approval policy adapter, whose
+library implementation decides the named-user condition, and `record-decision` applies the same
+two refusals (`not-assignee`, `stale-generation`) as a consistency guard on this gear's record,
+never as a second authority. When the common BSS Approvals Inbox exists, this projection is its
+**source adapter** — it answers the inbox's source interface for the `order approval` request kind
+with the assigned units and routes decisions through the same adapter — and the local routes below
+remain only as the fallback surface; there is no second authoritative queue and no path that
+bypasses the library criterion. Reassignment is `POST
+/bss-orders-workflow/v1/approver-inbox/gates/{gateId}/assign` under `approval_gate × assign`
+(`09 §3.1`), an RBAC-controlled pair distinct from `approve`: it bumps `gate_generation`, re-submits
+the condition under the gate's unchanged request key, and grants the assigning subject no approval
+authority. A gate whose assignee is missing or ineligible at `open-gates` is never auto-approved:
+it parks as `assignee-unresolved` (§4.1).
+
 **Separation of duties at the decision endpoint.** The identity that submitted the order is
 refused at `POST /bss-orders-workflow/v1/approver-inbox/gates/{gateId}/decision` — `submitter-barred`
 (403, `PermissionDenied`), a distinct `error_code` from the out-of-scope refusal, which is
@@ -694,7 +714,7 @@ calls a downstream, 5 s for a record-only one.
 | `obtain-verdict` | `protected` | ref + `round` (0 on first entry, else the previous answer's `nextRound`) | `verdict` ∈ `required` · `not-required` · `unobtainable`; `parkRef` and `parkReason` (the §3.7 enum) only on `unobtainable`; `nextRound` | instance-scoped `{tenant}:{correlationId}:obtain-verdict:{orderVersion}:{round}`; every answer, `unobtainable` included, is a settled success of its round ([`01 §3.3` *Rounds and attempts*](./01-foundation.md#rounds-and-attempts-the-one-rule-for-re-invokable-operations), §4.4) | none | none | `per-attempt-timeout`, `idempotency-key-conflict`, `version-mismatch` | `step-completion` | `retryable-on: transient` | 10 s |
 | `reflect-verdict` | `protected` | ref + `stage` ∈ `requirement` · `gate-outcome`, `round` (0 on each stage's first entry, else that stage's previous `nextRound`), `attemptKey` (nullable; the `attempt` `retry-step` minted for an `approval-reflection-refused` task's retry) | `reflected` ∈ `pending_approval` · `approved` · `rejected` · `held` (Lifecycle refused `not-admissible` and the order read shows `on_hold`, a settled success) · `moved` (Lifecycle refused `version-conflict`, or `not-admissible` and the order read shows a terminal state: the order moved on, a settled success the definition waits out on its lifecycle arm, [Lifecycle `04 §4.4`](../../../orders-lifecycle/docs/features/04-versioning.md#44-stale-results-normative)) · `refused` (every other Lifecycle refusal of the reflection, a settled success whose `refusalReason` carries the Lifecycle reason and which the definition routes to the order-scope task `approval-reflection-refused`, §4.4, decision D-190); a Lifecycle `not-admissible` of an order the read shows at this version in the stage's target state is the transition already applied and answers that state like a committed reflection ([`01 §3.3` *Rounds and attempts*](./01-foundation.md#rounds-and-attempts-the-one-rule-for-re-invokable-operations) rule 4, decision D-188); `refusalReason` (on `refused` only); `nextRound` | step: instance-scoped `{tenant}:{correlationId}:reflect-verdict:{orderVersion}:{stage}:{round}[:{attempt}]`; seam: lifecycle-transition `{tenant}:{orderId}:{orderVersion}:{trigger}:{round}[:{attempt}]` with `trigger` one of the four `reflect-approval-*` (§4.4, [`01 §3.3` *Rounds and attempts*](./01-foundation.md#rounds-and-attempts-the-one-rule-for-re-invokable-operations)) | none (Lifecycle emits `OrderApproved` / `OrderRejected`) | none | `version-mismatch` (a missing or terminal instance only), `gate-not-open`, `circuit-breaker-open`, `per-attempt-timeout`, `idempotency-key-conflict` | `step-completion` | `retryable-on: transient` | 10 s |
 | `open-gates` | `composable` | ref + `position` (0 on first entry, else `record-decision`'s `nextPosition`) | `gateRefs[]`, `position`, `escalationRound = 0` | step: instance-scoped `{tenant}:{correlationId}:open-gates:{orderVersion}:{position}`; downstream: approval-request `{tenant}:{orderId}:{orderVersion}:{gateId}` per gate | `OrderApprovalRequested`, one per gate opened in the settlement transaction | none — gates are closed by the closure port, not by an undo | `circuit-breaker-open`, `per-attempt-timeout`, `idempotency-key-conflict`, `version-mismatch` | `step-completion` | `retryable-on: transient` | 10 s |
-| `record-decision` | `protected` | ref + `gateRef`, `decisionEventId`, `outcome` ∈ `approved` · `rejected` | `applied` (boolean), `gateState` ∈ `approved` · `rejected` · `next-position` · `pending`, `nextPosition` (on `next-position`) | instance-scoped `{tenant}:{correlationId}:record-decision:{gateRef}:{decisionEventId}` | none | none | `gate-not-open`, `submitter-barred` (both recorded refusals, §4.4), `not-found`, `circuit-breaker-open`, `idempotency-key-conflict`, `version-mismatch` | `step-completion` | `retryable-on: transient` | 10 s |
+| `record-decision` | `protected` | ref + `gateRef`, `decisionEventId`, `outcome` ∈ `approved` · `rejected` | `applied` (boolean), `gateState` ∈ `approved` · `rejected` · `next-position` · `pending`, `nextPosition` (on `next-position`) | instance-scoped `{tenant}:{correlationId}:record-decision:{gateRef}:{decisionEventId}` | none | none | `gate-not-open`, `submitter-barred`, `not-assignee` (the deciding subject is not in the gate's condition subjects), `stale-generation` (the decision names a `seen_generation` other than the gate's; all four recorded refusals, §4.4, D-229), `not-found`, `circuit-breaker-open`, `idempotency-key-conflict`, `version-mismatch` | `step-completion` | `retryable-on: transient` | 10 s |
 | `arm-park-escalation` | `composable` | ref + `parkRef`, `round` (0 on the park's first check, else the previous `nextRound`) | `due: true\|false` — database time against the park row's stored `escalation_due_at`, the answer the definition's re-check loop switches on (`10 §3.6` (a)), and `false` once the park has escalated; `nextRound`. Every answer is a settled success of its round, so the next re-check runs under the next key ([`01 §3.3` *Rounds and attempts*](./01-foundation.md#rounds-and-attempts-the-one-rule-for-re-invokable-operations)) | instance-scoped `{tenant}:{correlationId}:arm-park-escalation:{parkRef}:{round}` | none | none | `not-found`, `version-mismatch` | `step-completion` | `retryable-on: transient` | 5 s |
 | `escalate-gate` | `composable` | ref + `position`, `mode` ∈ `fire` · `probe`, `round` (the `escalationRound` or `probeRound` last returned) | `due: true\|false` — database time against the stored deadline (`fire`: the gate's escalation deadline, never due while a `pause_causes` member is set; `probe` on `outage`: the outage-threshold deadline); the outage arm switches on the `probe` answer, while a `fire` escalates inside the operation and the definition routes nothing on its `due`, calling the probe next on the same tick (`10 §3.6` (a), D-123); `fire` with `due: false` escalates nothing and is a settled success of its round; every answer returns the next round ([`01 §3.3` *Rounds and attempts*](./01-foundation.md#rounds-and-attempts-the-one-rule-for-re-invokable-operations)) — `fire`: `escalationRound`; `probe`: `serviceState` ∈ `available` · `outage`, `probeRound`. The definition reads only `due` and `serviceState` (and the round it passes back); no remaining duration is returned | instance-scoped `{tenant}:{correlationId}:escalate-gate:{orderVersion}:{position}:{mode}:{round}` | `OrderApprovalEscalated`, one per gate escalated in the settlement transaction (`fire` only) | none | `gate-not-open`, `per-attempt-timeout` (the escalation command's delivery, retried under the same key), `version-mismatch`; an open breaker is an answer, never a refusal (§3.6 `inst-eg-fire-outage`) | `escalation` (`fire`); `step-completion` (`probe`) | `retryable-on: transient` | 10 s |
 
@@ -717,6 +737,7 @@ park paths, so no version may drop them there (decision D-135).
 |--------|------|-------------|-----------|
 | `GET` | `/bss-orders-workflow/v1/approver-inbox/gates` | List gates whose `assigned_principal` is the calling `subject_id` — the PDP constraint `assigned_principal = subject_id`, compiled to the `AccessScope` the query runs under (`09 §3.1`); keyset-paginated, page size default 50 and maximum 200; empty in phase 1 since no real gate opens | unstable |
 | `POST` | `/bss-orders-workflow/v1/approver-inbox/gates/{gateId}/decision` | Submit approve/reject with a mandatory catalogue `reason` and an optional free-text `justification`, for a gate in the caller's scope and in state `open`. **`Idempotency-Key` is REQUIRED**, recomposed server-side as `{tenant}:{gateId}:decision:{subject_id}` (`idempotency-key-mismatch` otherwise); `not-found` (404) if the gate is outside the caller's PDP scope — the same `assigned_principal = subject_id` constraint as the inbox, applied inside the decision statement, and a 403 would confirm the gate exists (`09 §4.4`); `submitter-barred` (403) if the caller is the order's submitting identity (`owf_approval_request.submitter_subject_id`, §3.2); `gate-not-open` (409) if the gate is not `open`, enforced by the `state = 'open'` predicate in the same statement, which is why this endpoint carries no `If-Match` | unstable |
+| `POST` | `/bss-orders-workflow/v1/approver-inbox/gates/{gateId}/assign` | Reassign the gate's named approver. `approval_gate × assign` (`09 §3.1`), `If-Match` REQUIRED on the gate's `row_version`, `Idempotency-Key` `{tenant}:{gateId}:assign:{row_version}`; bumps `gate_generation` and re-submits the condition to the approval authority under the gate's request key (D-229). `202` with the new generation | unstable |
 
 | `EVENT` | The approval decision event — the decision-callback topic | Consumed by the definition's `listen` in `gateLoop` (`10 §3.6` (a)), correlated on `orderId` and `orderVersion`, then recorded by `record-decision`; it is in the closed `listen` set of [`10 §2.2`](./10-process-definition.md#the-closed-trigger-set). Authenticity is the broker produce grant on that topic under platform-root tenancy (Lifecycle D-95), never a consumer-side publisher check. The event **MUST** carry references only — `orderId`, `orderVersion`, `gateId`, `decisionEventId`, the outcome enum — because the platform's history keeps what a `listen` consumes; the reason, the deciding authority and the deciding subject are read by `record-decision` from the decision record by `decisionEventId`. That shape and the read are a §9.2 clause and an upstream ask on the approval service (`../UPSTREAM_REQS.md` §2.9) | unstable |
 
@@ -877,9 +898,9 @@ sequenceDiagram
 **Algorithm: `open-gates`**
 
 1. [ ] - `p1` - Resolve the instance and require a cache row with `verdict = required` whose `reflected_at` is set; refuse `version-mismatch` otherwise - `inst-og-resolve`
-2. [ ] - `p1` - **IF** no gate row exists for the version: read the routing configuration, derive every `gateId` as UUIDv5 over (`orderId`, `orderVersion`, `party`), insert every gate — `open` at the lowest position, `planned` elsewhere — with `assigned_principal`, and with `escalation_window_ms` resolved from the seller's policy through the foundation's seller-policy port ([`01 §3.7`](./01-foundation.md#table-owf_seller_policy), decision D-140) — the window it names for the gate's party, else the seller's default window (72 h unless the policy says otherwise) — and pinned on the gate row, so a later policy write does not move it (decision D-134) - `inst-og-plan`
+2. [ ] - `p1` - **IF** no gate row exists for the version: read the routing configuration, derive every `gateId` as UUIDv5 over (`orderId`, `orderVersion`, `party`), insert every gate — `open` at the lowest position, `planned` elsewhere — with `assigned_principal`, and with `escalation_window_ms` resolved from the seller's policy through the foundation's seller-policy port ([`01 §3.7`](./01-foundation.md#table-owf_seller_policy), decision D-140) — the window it names for the gate's party, else the seller's default window (72 h unless the policy says otherwise) — and pinned on the gate row, so a later policy write does not move it (decision D-134) **Named assignee and condition** (D-229): for the predefined "order approval" stage, read the one named user the seller's tenant-scoped configuration assigns (the `assigned_principal`), set `gate_generation = 1`, and carry in the request an approval **condition** `{ type: named-users, subjects: [assigned_principal], generation: gate_generation }` beside the quorum the library already knows; **IF** the configuration names no eligible assignee, open no gate and answer as `obtain-verdict`'s `unobtainable` does — park with `parkReason = assignee-unresolved` (§4.1, fail-closed) — never "approval not required" - `inst-og-plan`
 3. [ ] - `p1` - Require every gate at a position below `position` to be `approved` and the gates at `position` to be `planned` or `open`; refuse `version-mismatch` otherwise - `inst-og-position`
-4. [ ] - `p1` - **FOR EACH** gate at `position`: read the version's stored TCV — `tcv_minor`, `currency`, `currency_minor_digits` — through Lifecycle `get_version(orderId, orderVersion)` (R4, D-198) and the submitting subject; look the request up through the approval policy adapter's `lookup_by_key` under its approval-request key and, **IF** one is held under it, adopt it rather than submit again — a re-run whose earlier call submitted but never settled, including a successor re-run after the step key aged out, finds the request that call made — **ELSE** submit the request under the approval-request key; a look-up the service does not answer is `retryable-failure`, never a blind resubmission (decision D-189); the look-up answers the request's state and opened instant, and **MATCH** it: an `open` or a decided request is adopted, a decided one because the service re-publishes its decision event until `record-decision` reads it by `decisionEventId` (`../UPSTREAM_REQS.md` §2.3), so the decision reaches the gate loop's `listen` and `record-decision`'s guards like any other and no other path decides a gate; a `cancelled` request is not adopted and the operation settles `permanent-failure` with `version-mismatch`, since the request key carries no attempt and no other key exists for the gate; insert the request row; set `state = open` and `window_armed_at = now`; for a submitted request set `opened_at = now` and `window_remaining_ms = escalation_window_ms`, and for an adopted one set `opened_at` = the adopted request's opened instant and `window_remaining_ms = max(0, escalation_window_ms − (now − opened_at))`, the pinned window counted from when the request opened, never from the adoption (decision D-189) - `inst-og-submit`
+4. [ ] - `p1` - **FOR EACH** gate at `position`: read the version's stored valuation for the policy's chosen basis — `valuation_basis`, `valuation_amount`, `currency`, `valuation_term`, `valuation_provenance`, or its absence as `valuation_available = false` (D-230) — through Lifecycle `get_version(orderId, orderVersion)` (R4, D-198) and the submitting subject; look the request up through the approval policy adapter's `lookup_by_key` under its approval-request key and, **IF** one is held under it, adopt it rather than submit again — a re-run whose earlier call submitted but never settled, including a successor re-run after the step key aged out, finds the request that call made — **ELSE** submit the request under the approval-request key; a look-up the service does not answer is `retryable-failure`, never a blind resubmission (decision D-189); the look-up answers the request's state and opened instant, and **MATCH** it: an `open` or a decided request is adopted, a decided one because the service re-publishes its decision event until `record-decision` reads it by `decisionEventId` (`../UPSTREAM_REQS.md` §2.3), so the decision reaches the gate loop's `listen` and `record-decision`'s guards like any other and no other path decides a gate; a `cancelled` request is not adopted and the operation settles `permanent-failure` with `version-mismatch`, since the request key carries no attempt and no other key exists for the gate; insert the request row; set `state = open` and `window_armed_at = now`; for a submitted request set `opened_at = now` and `window_remaining_ms = escalation_window_ms`, and for an adopted one set `opened_at` = the adopted request's opened instant and `window_remaining_ms = max(0, escalation_window_ms − (now − opened_at))`, the pinned window counted from when the request opened, never from the adoption (decision D-189) - `inst-og-submit`
 5. [ ] - `p1` - Enqueue one `OrderApprovalRequested` per opened gate and **RETURN** the gate references, `position`, and `escalationRound = 0`; the window stays in the record, and the definition learns of its end only from `escalate-gate`'s `due` - `inst-og-return`
 
 **Description**: Repeated by the definition for every sequence position, each call naming the
@@ -1110,6 +1131,7 @@ the evidence of who exempted a commercial decision from approval — purged row-
 | order_version | int | Order version this gate was opened for |
 | party_ref | text | The approving party this gate represents, as identified by the routing configuration — a role or body, not a person |
 | assigned_principal | text, nullable | The `SecurityContext` principal this gate is assigned to; the inbox filters on this column, never on `party_ref` (§3.2). Never crosses to the definition |
+| gate_generation | bigint, NOT NULL | Starts at 1 at `open-gates`; bumped by the assign route on every reassignment, and re-submitted to the approval authority under the gate's unchanged request key as the condition's `generation`. A decision whose `seen_generation` differs is refused `stale-generation` by `record-decision` (D-229) |
 | sequence_index | int | Routing position, default 0. Gates sharing a value open together; a gate opens only once every lower value is `approved` (§4.3) |
 | state | enum | `planned`, `open`, `approved`, `rejected`, `cancelled` — the complete set; `decided` is not a value |
 | escalation_window_ms | bigint | The window for this gate, resolved by `open-gates` from the seller's policy (the party's window, else the seller default, 72 h) and pinned here; a policy write reaches only gates planned after it (decision D-134) |
@@ -1168,9 +1190,12 @@ approver-surface scoping). `decision_reason` is a catalogue value and is what th
 | resource_tenant_id | uuid | Resource recipient; the tenant isolation axis for this table |
 | seller_tenant_id | uuid | Selling party |
 | correlation_id | uuid | The process correlation id, for cross-reference only, not dedup |
-| tcv_minor | bigint | The order version's TCV — net pre-tax, annualised, Rating-computed and Lifecycle-stored (Lifecycle D-154, D-167) — as read through `get_version`, in integer minor units, carried verbatim; this gear performs no price computation or conversion (seam R4, decision D-198) |
-| currency | text | Currency of `tcv_minor`; a figure without one is not a figure |
-| currency_minor_digits | smallint | The scale of `tcv_minor`, as Lifecycle stores it from the book; carried, never applied |
+| valuation_basis | enum | `annualised-net-pretax` \| `full-term-commitment` \| `first-installment` \| `authorized-budget` \| `forecast` — the basis the seller's approval policy chose (`01 §3.7` `owf_seller_policy.approval_valuation_basis`, D-230) |
+| valuation_amount | numeric, nullable | The figure Lifecycle stores for that basis, in the shared exact major-unit money representation, carried verbatim; NULL exactly when `valuation_available = false`. Today Lifecycle stores only the annualised net pre-tax TCV in minor units (Lifecycle D-154, D-167), carried into the representation by its stored scale — a change of representation, never a computation or conversion (seam R4, D-198) |
+| valuation_available | boolean | `false` when Lifecycle stores no figure for the chosen basis; forwarded as *unavailable*, never as zero — the approval authority decides what an unavailable figure requires (D-230) |
+| currency | text | Currency of `valuation_amount`; a figure without one is not a figure |
+| valuation_term | jsonb, nullable | The term the figure covers as Lifecycle stores it (`kind` ∈ `fixed` · `variable`, `months`), carried for provenance |
+| valuation_provenance | jsonb | `{ computed_by: rating, order_version, computed_at }` as Lifecycle stores it; no FX conversion is ever applied here |
 | submitter_subject_id | uuid | Opaque subject id of the identity that submitted the order, from Lifecycle `get_version`; the separation-of-duties comparand of §3.2 (D-61 minimisation: no name, no email) |
 | submitted_at | timestamptz | Submission time |
 | request_payload | jsonb | Order context, requesting party, gate identifier, and the request idempotency key echoed for the receiver's own dedup |
@@ -1178,24 +1203,25 @@ approver-surface scoping). `decision_reason` is a catalogue value and is what th
 **PK**: `gate_id`
 
 **Constraints**: `gate_id` foreign key to `owf_approval_gate`; `resource_tenant_id` NOT NULL;
-`tcv_minor`, `currency`, `currency_minor_digits` and `submitter_subject_id` NOT NULL — the §9.2
-contract requires the approval authority to see the order's value, so a request cannot be
-submitted without it; a submitted version always carries one (Lifecycle's gate refuses a
+`valuation_basis`, `valuation_available`, `currency`, `valuation_provenance` and `submitter_subject_id` NOT NULL,
+`valuation_amount` NOT NULL exactly when `valuation_available` (D-230) — the §9.2
+contract requires the approval authority to see the order's value or its explicit absence, so a request cannot be
+submitted without one; a submitted version always carries one (Lifecycle's gate refuses a
 submit without totals), so an absent figure is a contract violation, refused, never `not_required`.
 
 **Additional info**: **Ownership**: inserted only by `open-gates`. **Mutability**: append-only; no
 UPDATE grant. **Tenant axis**: `resource_tenant_id` (isolation), `seller_tenant_id`. One request row
 per gate; the idempotency key that guarantees single submission lives on `owf_approval_gate` and is
 echoed into `request_payload` for the receiving service, not stored twice as a column here.
-`tcv_minor` is non-authoritative: it is a snapshot for the approver's benefit, and Orders
+`valuation_amount` is non-authoritative: it is a snapshot for the approver's benefit, and Orders
 Lifecycle remains the system of record for price; it never crosses to the definition (ADR-0013).
 **Retention**: ≥ 400 days, purged row-wise through a `submitted_at` index; not partitioned (`01 §3.7`, D-104).
 
 **Example**:
 
-| gate_id | resource_tenant_id | correlation_id | tcv_minor | currency | currency_minor_digits | submitted_at |
-|--------|--------|--------|--------|--------|--------|--------|
-| gate-1 | tnt-001 | corr-abc | 4800000 | USD | 2 | 2026-09-10T10:05:00Z |
+| gate_id | resource_tenant_id | correlation_id | valuation_basis | valuation_amount | valuation_available | currency | submitted_at |
+|--------|--------|--------|--------|--------|--------|--------|--------|
+| gate-1 | tnt-001 | corr-abc | annualised-net-pretax | 48000.00 | true | USD | 2026-09-10T10:05:00Z |
 
 #### Table: owf_approval_park
 

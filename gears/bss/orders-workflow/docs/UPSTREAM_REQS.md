@@ -114,6 +114,11 @@ answers are agreed here but are not canonical until that PR merges:
 
 #### Overlap-presence read (inherited; answered in #5131)
 
+> **Clause added 2026-10-21 (D-227)**: the read **MUST** accept the caller's own binding references
+> (`ownBindingRefs`) and exclude the acquisition's own reservation from the occupancy it reports,
+> so a protected purchase is never read as colliding with itself (`design/04` §3.6
+> `inst-rc-compose-lifecycle`). Open on #5131.
+
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-upreq-overlap-presence-read`
 
 Subscriptions **MUST** expose an overlap-occupancy read: given the distinct
@@ -571,6 +576,12 @@ step unless policy requires one.
 - **Consequence if it does not land**: the authorization-outcome ask above stays the only
   financial gate, and permission to begin fulfillment remains undistinguished from final
   permission to activate paid service.
+- **What this gear needs, exactly (D-226)**: one read, `financial_readiness(orderId, orderVersion)
+  → { outcome ∈ not-required | satisfied | pending | refused, reason?, observed_at }`, idempotent
+  and re-readable at any time, answered for the order version as a whole; the request names the
+  order version whose accepted bindings Lifecycle holds (the protection authority, D-227) and
+  nothing else. This gear's financial-readiness port (`design/04` §2.1) is already shaped on that
+  answer and runs on the Payments authorization read until Billing provides it.
 - **Agreement status**: open; raised 2026-10-21. PRD amendment candidate 22 (§4).
 - **Source**: PR #4787 proposal of 2026-10-18, item 1; PRD §6.3.
 
@@ -592,6 +603,12 @@ conditions hold — never a silent release of a paid place.
 - **Consequence if it does not land**: this gear keeps D-194 — an elapsed `activation_deadline_at`
   unwinds the order — and the spawn-signal prerequisite as the only protection; a paid place can be
   released by a draft that lapsed or an occupancy read that failed.
+- **What this gear needs, exactly (D-227)**: nothing to call. It conveys the order version as the
+  protection authority on the readiness read (above), excludes the acquisition's own reservation on
+  the `SUB-O5` overlap read (`ownBindingRefs`, §2.1), and on any failure or cancel of a protected
+  acquisition reports `retainedObligations[]` — the lines' binding references — with the statement
+  that it released nothing but what it created (`design/06` §3.6 `report-outcome`). Lifecycle's
+  capture-versus-cancellation decision and Billing's remedy act on that report.
 - **Agreement status**: open; raised 2026-10-21.
 - **Source**: PR #4787 proposal item 2; `design/04` §3.7 (`activation_deadline_at`), `design/06`
   §4.8.
@@ -612,6 +629,10 @@ before a refund completes once the outstanding financial work has a durable, acc
   Lifecycle's (§2.4).
 - **Consequence if it does not land**: `report-outcome` records the operational outcome and no
   financial remedy has an owner.
+- **What this gear needs, exactly (D-228)**: nothing to call. The accepted pre-fulfillment
+  cancellation is Lifecycle's (§2.4) and Lifecycle carries it to Billing; this gear's
+  `request-prefulfillment-cancel` (`design/08` §3.3) records no financial fact and ends the instance
+  only on `OrderCancelled`.
 - **Agreement status**: open; raised 2026-10-21.
 - **Source**: PR #4787 proposal item 5; `design/06` §3.6 (`report-outcome`), `design/09` §3.3.
 
@@ -688,6 +709,13 @@ criterion. Whether a future list of named people must approve in full or in part
   never be bound to a profile that requires real approval (`design/03` §2.2, D-224).
 - **Consequence if it does not land**: the slice 03 projection remains the enforcement point and
   Orders approvals stay outside the common inbox.
+- **What this gear needs, exactly (D-229)**: an approval condition type `named-users { subjects[],
+  generation }` accepted beside the quorum on unit submission and re-submission under the unchanged
+  request key; `approve` / `reject` taking `seen_generation` and refusing a stale one; the
+  submitter exclusion retained; and a source interface of the common inbox that this gear's
+  projection can implement for the `order approval` kind (`design/03` §3.2, §3.3). This gear
+  already carries the condition, the `gate_generation`, the `assign` route and the two recorded
+  refusals (`not-assignee`, `stale-generation`), and parks a gate whose assignee is unresolved.
 - **Agreement status**: open; raised 2026-10-21. Q-14 (gate-to-unit mapping) follows it.
 - **Source**: PR #4787 proposal item 7; PRD §9.2.
 
@@ -862,6 +890,13 @@ a cancelled order.
 - **Consequence if it does not land**: no payment-wait deadline exists in this design or the PRD;
   an order waiting on readiness is cancelled only through Lifecycle's own `POST /cancel` by an
   operator.
+- **What this gear needs, exactly (D-228)**: one workflow-mediated transition,
+  `cancel_prefulfillment(orderId, orderVersion, reason, idempotency key)` admissible from `approved`
+  while fulfillment has not begun, answering `requested` (Lifecycle arbitrates against
+  `begin_fulfillment` and against its own expiry, and publishes `OrderCancelled` if the cancel
+  wins) or `not-admissible`; and the `approved` expiry policy value, so a seller's
+  `payment_wait_window_ms` can be validated not to exceed it (`design/01` §3.7). This gear's
+  operation and its `unsupported` fallback into manual review exist today (`design/08` §3.3).
 - **Agreement status**: open; raised 2026-10-21. PRD amendment candidate 22 (§4).
 - **Source**: PR #4787 proposal item 5; `design/09` §3.3.
 
@@ -878,6 +913,12 @@ checks at plan construction, the pre-activation re-check and dispatch (`design/0
 
 - **Consequence if it does not land**: `activation_deadline_at` stays the single deadline of
   Lifecycle D-152 and D-194 stands: an elapsed deadline unwinds the order under either policy.
+- **What this gear needs, exactly (D-227)**: on `get_version`, per line, the accepted binding
+  reference, a `coverage_until` instant (protected future coverage) and, per version, an
+  `assessment_expires_at`; this gear pins `activation_deadline_at` from the earliest coverage end and
+  `assessment_deadline_at` from the assessment expiry, treats the latter as advisory and the former
+  as the final permission (`design/04` §3.6, §3.7). Until the fields exist, `activation_deadline`
+  alone fills the former and the latter stays NULL.
 - **Agreement status**: open; raised 2026-10-21.
 - **Source**: PR #4787 proposal item 2; Lifecycle D-152, D-162.
 
@@ -899,6 +940,12 @@ follows the existing reassessment and re-approval rules.
 - **Owning upstream gears**: Rating (computation, §2.5), Lifecycle (retention and `get_version`).
 - **Consequence if it does not land**: the approval request carries Rating's net pre-tax
   annualised TCV in minor units as today (`design/03` §3.3, D-198).
+- **What this gear needs, exactly (D-230)**: on `get_version`, a valuation per supported basis —
+  `{ basis, amount (shared exact major-unit money), currency, term { kind, months? }, provenance {
+  computed_by, computed_at } }` — or an explicit absence for a basis Rating did not compute. This
+  gear's `owf_seller_policy.approval_valuation_basis`, its `valuation_*` columns and its
+  `unavailable` forwarding exist today (`design/01` §3.7, `design/03` §3.3, §3.7); only the
+  annualised net pre-tax figure is available until Lifecycle stores more.
 - **Agreement status**: open; raised 2026-10-21.
 - **Source**: PR #4787 proposal item 8; Lifecycle D-154, D-167.
 

@@ -1298,18 +1298,38 @@ The fulfillment stage, the `do` list of `process.fulfillment`:
       - heldReport:      { when: '${ $context.stageLoop == "heldReport" }',             then: reportCompleted }   # the completion report under its next round
       - planFailFast:    { when: '${ $context.stageLoop == "planFailFast" }',           then: planFailFast }   # from the failure stage: an exhausted plan task passes begin-fulfillment before its unwind (D-109)
       - fresh:           { then: initEligibility }
-- initEligibility: { set: { eligibilityTrigger: initial, requestRef: null, evaluationSeq: 0, barrierSeq: 0, recheckSeq: 0, wave1Round: 0, wave2Round: 0, rebuildRound: 0, sweepRound: 0, spawnRound: 0, reportRound: 0, planAttempt: 0, wave1Failed: [], wave2Failed: [], pendingLapsed: [], spawned: false, planFailed: false, wave1AttemptKey: null, wave2AttemptKey: null } }
+- initEligibility: { set: { eligibilityTrigger: initial, requestRef: null, evaluationSeq: 0, paymentWaitHandled: false, prefulfillmentCancelRound: 0, barrierSeq: 0, recheckSeq: 0, wave1Round: 0, wave2Round: 0, rebuildRound: 0, sweepRound: 0, spawnRound: 0, reportRound: 0, planAttempt: 0, wave1Failed: [], wave2Failed: [], pendingLapsed: [], spawned: false, planFailed: false, wave1AttemptKey: null, wave2AttemptKey: null } }
 - eligibility:                          # protected (04)
     timeout: step
     try:
       - call: { step: evaluate-payment-auth-eligibility }   # body: ref + trigger: $context.eligibilityTrigger, requestRef: $context.requestRef, evaluationSeq: $context.evaluationSeq
     catch: *transient
-    export: { as: '${ $context + { eligibility: .eligibility, eligibilitySeq: (if .eligibility == "eligible" then $context.evaluationSeq else $context.eligibilitySeq end), evaluationSeq: .nextEvaluationSeq } }' }
+    export: { as: '${ $context + { eligibility: .eligibility, readiness: .readiness, eligibilitySeq: (if .eligibility == "eligible" then $context.evaluationSeq else $context.eligibilitySeq end), evaluationSeq: .nextEvaluationSeq, paymentWaitExpired: (.paymentWaitExpired // false), paymentWaitAction: .paymentWaitAction } }' }   # readiness is the port's four-way answer (04 §2.1, D-226); eligible covers not-required, satisfied and refused — Lifecycle judges a refusal at begin-fulfillment (D-89)
 - onEligibility:
     switch:
       - planFailed: { when: '${ $context.eligibility == "eligible" and $context.planFailed }', then: enterPlanFailFast }   # a failed plan waiting to pass begin-fulfillment (D-109)
       - eligible: { when: '${ $context.eligibility == "eligible" }', then: enterPlan }
+      - waitExpired: { when: '${ $context.paymentWaitExpired and ($context.paymentWaitHandled | not) }', then: paymentWaitRoute }   # D-228: the seller's payment-wait deadline passed while readiness is pending; routed once
       - waiting:  { then: enterEligibilityWait }   # pending: a settled success that selects the wait; the order stays approved
+- paymentWaitRoute:                     # D-228: the pinned expiry action; the order stays approved either way
+    switch:
+      - requestCancel: { when: '${ $context.paymentWaitAction == "request-cancel" }', then: requestPrefulfillmentCancel }
+      - review:        { then: paymentWaitReview }
+- requestPrefulfillmentCancel:          # protected (08): Lifecycle's workflow-mediated pre-fulfillment cancel, under its own lifecycle-transition key; Workflow calls nothing on Billing
+    timeout: step
+    try:
+      - call: { step: request-prefulfillment-cancel }   # body: ref + reason: payment-wait-expired, round: $context.prefulfillmentCancelRound; output: cancelOutcome ∈ requested | not-admissible | unsupported, nextRound
+    catch: *transient
+    export: { as: '${ $context + { prefulfillmentCancel: .cancelOutcome, prefulfillmentCancelRound: .nextRound } }' }
+- onPrefulfillmentCancel:
+    switch:
+      - requested:   { when: '${ $context.prefulfillmentCancel == "requested" }', then: markPaymentWaitHandled }   # Lifecycle arbitrates; its OrderCancelled reaches the eligibility fork's lifecycle arm and the terminal-event path ends the instance with nothing to compensate
+      - unsupported: { when: '${ $context.prefulfillmentCancel == "unsupported" }', then: paymentWaitReview }   # the Lifecycle ask has not landed: fail closed into review, never a silent wait
+      - other:       { then: markPaymentWaitHandled }   # not-admissible: fulfillment began or the version moved; the next evaluation says which
+- paymentWaitReview:                    # D-228 manual-review: one order-scope task; the eligibility wait keeps polling, so a late readiness still proceeds and begin-fulfillment closes the task
+    set: { failureScope: order, failureSubjects: '${ [ { subjectRef: $context.orderId, reason: "payment-wait-expired", cause: "payment-wait-deadline-elapsed" } ] }', sourceStep: evaluate-payment-auth-eligibility, sourceAttempt: '${ $context.evaluationSeq | tostring }', taskReturnStage: fulfillment, taskReturnLoop: awaitEligibilityChange, paymentWaitHandled: true, nextStage: failure, stageLoop: null }
+    then: exit
+- markPaymentWaitHandled: { set: { paymentWaitHandled: true }, then: enterEligibilityWait }
 - enterEligibilityWait: { set: { stageLoop: awaitEligibilityChange, holdPauses: false } }
 - awaitEligibilityChange:
     fork:
