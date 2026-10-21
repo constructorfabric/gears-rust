@@ -242,6 +242,10 @@ fn example(type_id: &str) -> Value {
         .expect("an example of every derived type")
 }
 
+/// A record type, the member to set (or, with `None`, to remove), and the
+/// rule its place then breaks.
+type BrokenConstraint = (&'static str, &'static str, Option<Value>, &'static str);
+
 #[tokio::test]
 async fn every_generated_constraint_refuses_a_record_that_breaks_it() {
     use construct_sdk::gts::{
@@ -251,9 +255,7 @@ async fn every_generated_constraint_refuses_a_record_that_breaks_it() {
     let long = |n: usize| Some(json!("x".repeat(n)));
     let empty = || Some(json!(""));
     let extra = || Some(json!(1));
-    // The member to set (or, with `None`, to remove), and the rule its place
-    // breaks.
-    let cases: Vec<(&str, &str, Option<Value>, &str)> = vec![
+    let cases: Vec<BrokenConstraint> = vec![
         // The envelope.
         (CHAT, "/provenance", long(1025), "maxLength"),
         (CHAT, "/provenance", empty(), "minLength"),
