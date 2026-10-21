@@ -8,7 +8,7 @@ use tokio::sync::Barrier;
 
 use crate::domain::error::DomainError;
 use crate::domain::plan::Origin;
-use crate::domain::plan::{PlanValue, ValueRef};
+use crate::domain::plan::{PlanValue, PropertyRef, ValueRef};
 use crate::domain::record_intake::{DropReason, DropStage, IntakeEvents};
 use crate::domain::sensitive_data::{
     Action, Checked, Found, SensitiveDataCheck, SensitiveDataChecks, SensitiveDataKind, Verdict,
@@ -249,15 +249,48 @@ fn an_object_value_gives_its_strings_and_numbers_but_not_its_keys() {
     let plan = connector_plan(vec![add_value(
         "skill",
         "skills",
-        serde_json::json!({ "name": "Python", "years": 5, "current": true, "tags": ["rust", "c"] }),
+        // Keys in alphabetical order, so the walk order is the same whether or
+        // not serde_json keeps insertion order.
+        serde_json::json!({ "current": true, "name": "Python", "tags": ["rust", "c"], "years": 5 }),
     )]);
 
     let values = plan.values();
 
-    let mut texts: Vec<&str> = values.iter().map(|v| v.text.as_str()).collect();
-    texts.sort_unstable();
-    assert_eq!(texts, ["5", "Python", "c", "rust"]);
-    assert!(values.iter().all(|v| v.at.value() == (0, 0)));
-    let pieces: Vec<usize> = values.iter().map(|v| v.at.piece).collect();
-    assert_eq!(pieces, [0, 1, 2, 3]);
+    // The pieces in walk order, each with its text: the boolean has none, the
+    // array's items come in their order, the number comes as its text.
+    let pieces: Vec<(usize, &str)> = values
+        .iter()
+        .map(|v| (v.at.piece, v.text.as_str()))
+        .collect();
+    assert_eq!(pieces, [(0, "Python"), (1, "rust"), (2, "c"), (3, "5")]);
+    assert!(values.iter().all(|v| v.at.property_ref()
+        == PropertyRef {
+            step: 0,
+            property: 0
+        }));
+}
+
+#[tokio::test]
+async fn a_finding_in_a_piece_its_value_does_not_have_drops_the_record() {
+    let (runner, drops) = checks(vec![Arc::new(FixedCheck(
+        SensitiveDataKind::Health,
+        Verdict {
+            kind: SensitiveDataKind::Health,
+            found: vec![Found {
+                at: ValueRef {
+                    step: 0,
+                    property: 0,
+                    piece: 1,
+                },
+                spans: Vec::new(),
+            }],
+        },
+    ))]);
+    // One string, so the value has piece 0 only.
+    let plan = connector_plan(vec![add_entity("note", &[("text", "hello")])]);
+
+    assert_eq!(runner.run(&plan).await, Checked::Dropped);
+    let events = drops.taken();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].reason, DropReason::CheckFailed);
 }

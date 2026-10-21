@@ -687,13 +687,54 @@ async fn a_redact_kind_without_a_range_blocks_the_value_even_when_another_kind_h
         admitted.plan.steps[0].change.properties(),
         &[Property::new("other", "kept")]
     );
-    assert!(
-        fixture
-            .events
-            .taken()
-            .iter()
-            .all(|(action, _)| *action == "blocked"),
-        "only block events"
+    let events: Vec<(&str, SensitiveDataKind)> = fixture
+        .events
+        .taken()
+        .iter()
+        .map(|(action, event)| (*action, event.kind))
+        .collect();
+    assert_eq!(
+        events,
+        [
+            ("blocked", SensitiveDataKind::Contacts),
+            ("blocked", SensitiveDataKind::Location),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_verdict_on_a_piece_the_value_does_not_have_blocks_the_value() {
+    let fixture = AdmissionFixture::default();
+    let plan = connector_plan(vec![add_entity(
+        "note",
+        &[("text", "hello"), ("other", "kept")],
+    )]);
+
+    // The value has piece 0 only; a redaction for piece 3 cannot be placed.
+    let admitted = admitted(
+        admit(
+            &fixture,
+            plan,
+            &[found(
+                SensitiveDataKind::Contacts,
+                piece(0, 0, 3),
+                spans(&[(0, 2)]),
+            )],
+        )
+        .await,
+    );
+
+    assert_eq!(
+        admitted.blocked,
+        vec![Enforced {
+            at: piece(0, 0, 3),
+            kind: SensitiveDataKind::Contacts
+        }]
+    );
+    assert!(admitted.redacted.is_empty());
+    assert_eq!(
+        admitted.plan.steps[0].change.properties(),
+        &[Property::new("other", "kept")]
     );
 }
 
@@ -944,7 +985,9 @@ async fn a_found_number_cannot_be_redacted_so_its_value_is_blocked() {
         "phone",
         serde_json::json!({ "number": 4_930_123 }),
     )]);
-    let verdicts = checked(&plan, &[(SensitiveDataKind::Contacts, "4930123")]).await;
+    // Part of the number only: redacting it as text would leave "123" behind,
+    // so the value is blocked only because a number cannot be redacted.
+    let verdicts = checked(&plan, &[(SensitiveDataKind::Contacts, "4930")]).await;
 
     let admitted = admitted(admit(&fixture, plan, &verdicts).await);
 

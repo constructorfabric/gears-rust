@@ -210,11 +210,22 @@ pub struct ValueRef {
 }
 
 impl ValueRef {
-    /// The value the piece belongs to: its step and property.
+    /// The property whose value the piece belongs to.
     #[must_use]
-    pub fn value(self) -> (usize, usize) {
-        (self.step, self.property)
+    pub fn property_ref(self) -> PropertyRef {
+        PropertyRef {
+            step: self.step,
+            property: self.property,
+        }
     }
+}
+
+/// Where a property sits in a plan: the step and the property within it.
+#[domain_model]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct PropertyRef {
+    pub step: usize,
+    pub property: usize,
 }
 
 /// One text piece a plan would store, as the sensitive-data checks see it: a
@@ -251,39 +262,98 @@ impl Plan {
     }
 }
 
-/// The text pieces of a value, depth first: every string, and every number as
-/// its text. Booleans and nulls carry no text.
-#[must_use]
-pub fn text_pieces(value: &Value) -> Vec<String> {
-    fn walk(value: &Value, out: &mut Vec<String>) {
+/// One text piece of a value: where it sits, as a JSON pointer into the value
+/// (RFC 6901), and its text.
+struct Piece {
+    pointer: String,
+    text: String,
+}
+
+/// The one walk that numbers the text pieces of a value, depth first: every
+/// string, and every number as its text. Booleans and nulls carry no text.
+/// [`text_pieces`] and [`text_piece_mut`] both use it, so a piece index means
+/// the same piece in both.
+fn pieces(value: &Value) -> Vec<Piece> {
+    fn walk(value: &Value, pointer: &mut String, out: &mut Vec<Piece>) {
         match value {
-            Value::String(text) => out.push(text.clone()),
-            Value::Number(number) => out.push(number.to_string()),
-            Value::Array(items) => items.iter().for_each(|item| walk(item, out)),
-            Value::Object(fields) => fields.values().for_each(|field| walk(field, out)),
+            Value::String(text) => out.push(Piece {
+                pointer: pointer.clone(),
+                text: text.clone(),
+            }),
+            Value::Number(number) => out.push(Piece {
+                pointer: pointer.clone(),
+                text: number.to_string(),
+            }),
+            Value::Array(items) => {
+                for (index, item) in items.iter().enumerate() {
+                    let len = pointer.len();
+                    pointer.push('/');
+                    pointer.push_str(&index.to_string());
+                    walk(item, pointer, out);
+                    pointer.truncate(len);
+                }
+            }
+            Value::Object(fields) => {
+                for (key, field) in fields {
+                    let len = pointer.len();
+                    pointer.push('/');
+                    pointer.push_str(&key.replace('~', "~0").replace('/', "~1"));
+                    walk(field, pointer, out);
+                    pointer.truncate(len);
+                }
+            }
             Value::Bool(_) | Value::Null => {}
         }
     }
     let mut out = Vec::new();
-    walk(value, &mut out);
+    walk(value, &mut String::new(), &mut out);
     out
 }
 
-/// The `index`th text piece of a value, in the order of [`text_pieces`].
-pub(crate) fn text_piece_mut(value: &mut Value, index: usize) -> Option<&mut Value> {
-    fn walk<'v>(value: &'v mut Value, index: usize, seen: &mut usize) -> Option<&'v mut Value> {
+/// The text pieces of a value, in the order of the one walk that numbers them.
+#[must_use]
+pub fn text_pieces(value: &Value) -> Vec<String> {
+    pieces(value).into_iter().map(|piece| piece.text).collect()
+}
+
+/// The number of characters in all text pieces of a value together, counted
+/// without copying them, and only as far as `limit`: the count stops once it
+/// passes it.
+#[must_use]
+pub fn text_chars_up_to(value: &Value, limit: usize) -> usize {
+    fn walk(value: &Value, limit: usize, count: &mut usize) {
+        if *count > limit {
+            return;
+        }
         match value {
-            Value::String(_) | Value::Number(_) => {
-                let here = *seen;
-                *seen += 1;
-                (here == index).then_some(value)
-            }
-            Value::Array(items) => items.iter_mut().find_map(|item| walk(item, index, seen)),
-            Value::Object(fields) => fields
-                .values_mut()
-                .find_map(|field| walk(field, index, seen)),
-            Value::Bool(_) | Value::Null => None,
+            Value::String(text) => *count += text.chars().count(),
+            Value::Number(number) => *count += number.to_string().len(),
+            Value::Array(items) => items.iter().for_each(|item| walk(item, limit, count)),
+            Value::Object(fields) => fields.values().for_each(|field| walk(field, limit, count)),
+            Value::Bool(_) | Value::Null => {}
         }
     }
-    walk(value, index, &mut 0)
+    let mut count = 0;
+    walk(value, limit, &mut count);
+    count
+}
+
+/// One text piece, open for redaction: a string can be edited, a number
+/// cannot. A caller gets no handle that could change the shape of the value,
+/// so the numbering of the other pieces stays put.
+#[domain_model]
+#[derive(Debug)]
+pub(crate) enum PieceMut<'v> {
+    Text(&'v mut String),
+    Number,
+}
+
+/// The `index`th text piece of a value, as the one walk numbers it.
+pub(crate) fn text_piece_mut(value: &mut Value, index: usize) -> Option<PieceMut<'_>> {
+    let pointer = pieces(value).into_iter().nth(index)?.pointer;
+    match value.pointer_mut(&pointer)? {
+        Value::String(text) => Some(PieceMut::Text(text)),
+        Value::Number(_) => Some(PieceMut::Number),
+        _ => None,
+    }
 }

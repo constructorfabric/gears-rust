@@ -25,6 +25,8 @@ pub mod subject_settings;
 #[cfg(test)]
 mod admission_test;
 #[cfg(test)]
+mod plan_test;
+#[cfg(test)]
 mod record_intake_test;
 #[cfg(test)]
 mod sensitive_data_test;
