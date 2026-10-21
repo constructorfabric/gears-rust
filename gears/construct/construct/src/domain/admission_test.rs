@@ -650,6 +650,99 @@ async fn a_redacted_value_keeps_its_step_without_the_found_content() {
 }
 
 #[tokio::test]
+async fn a_redact_kind_without_a_range_blocks_the_value_even_when_another_kind_has_one() {
+    let fixture = AdmissionFixture::default();
+    let plan = connector_plan(vec![add_entity(
+        "note",
+        &[("text", "call +49 30 1234 in Berlin"), ("other", "kept")],
+    )]);
+
+    let admitted = admitted(
+        admit(
+            &fixture,
+            plan,
+            &[
+                found(SensitiveDataKind::Contacts, at(0, 0), spans(&[(5, 16)])),
+                found(SensitiveDataKind::Location, at(0, 0), Vec::new()),
+            ],
+        )
+        .await,
+    );
+
+    assert_eq!(
+        admitted.blocked,
+        vec![
+            Enforced {
+                at: at(0, 0),
+                kind: SensitiveDataKind::Contacts
+            },
+            Enforced {
+                at: at(0, 0),
+                kind: SensitiveDataKind::Location
+            },
+        ]
+    );
+    assert!(admitted.redacted.is_empty(), "no kind is reported redacted");
+    assert_eq!(
+        admitted.plan.steps[0].change.properties(),
+        &[Property::new("other", "kept")]
+    );
+    assert!(
+        fixture
+            .events
+            .taken()
+            .iter()
+            .all(|(action, _)| *action == "blocked"),
+        "only block events"
+    );
+}
+
+#[tokio::test]
+async fn a_redaction_in_a_replace_dropped_whole_is_not_reported() {
+    let fixture = AdmissionFixture::default();
+    let replace_entity = Step {
+        entity_kind: "employer".to_owned(),
+        change: Change::ReplaceEntity {
+            old: crate::domain::plan::NodeKey("old".to_owned()),
+            key: crate::domain::plan::NodeKey("new".to_owned()),
+            properties: vec![
+                Property::new("contact", "call +49 30 1234"),
+                Property::new("diagnosis", "asthma"),
+            ],
+        },
+        confidence: Some(0.9),
+    };
+    let plan = connector_plan(vec![replace_entity]);
+
+    let admitted = admitted(
+        admit(
+            &fixture,
+            plan,
+            &[
+                found(SensitiveDataKind::Contacts, at(0, 0), spans(&[(5, 16)])),
+                found(SensitiveDataKind::Health, at(0, 1), Vec::new()),
+            ],
+        )
+        .await,
+    );
+
+    assert_eq!(admitted.dropped_steps, vec![0]);
+    assert!(admitted.plan.steps.is_empty());
+    assert!(
+        admitted.redacted.is_empty(),
+        "nothing of the step was stored"
+    );
+    assert!(
+        fixture
+            .events
+            .taken()
+            .iter()
+            .all(|(action, _)| *action != "redacted"),
+        "no redaction event for a dropped step"
+    );
+}
+
+#[tokio::test]
 async fn overlapping_redactions_of_two_kinds_both_apply() {
     let fixture = AdmissionFixture::default();
     let plan = connector_plan(vec![add_entity("note", &[("text", "abcdefghij")])]);

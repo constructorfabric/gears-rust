@@ -43,7 +43,7 @@ The PRD requires that nothing reaches the profile unless deterministic rules let
 2. Source trust: the tenant trusts the connector named in the plan's origin.
 3. The confidence floor: every step of a model's plan carries a confidence at or above the floor. A step without one, or with one that is not a number, is below it.
 4. Allowed entity kinds: every step that stores a value has an allowed entity kind. A removal passes, so a subject's entity of a kind no longer allowed can still go.
-5. Write caps: the plan holds no more steps than the cap, and no text piece of a value is longer than the cap, in characters.
+5. Write caps: the plan holds no more steps than the step cap, and no value is longer than the value cap, counting all text pieces of one value together (every string and number in it, never the keys), in characters.
 
 **Plans written by people.** A reviewer's corrected value and an administrator's added or edited fact have no model and no connector. They skip source trust and the confidence floor, and go through every other rule and the verdicts. DECOMPOSITION 2.7 leaves this to this document. An agent's plan comes from the model, so the confidence floor applies; it names no connector, so source trust has nothing to check.
 
@@ -121,7 +121,7 @@ The PRD requires that nothing reaches the profile unless deterministic rules let
 **Steps**:
 1. [x] - `p1` - For each text piece a verdict names, collect the kinds that block it, and the ranges of each kind that redacts it - `inst-enforce-collect`
 2. [x] - `p1` - **IF** any kind blocks the piece, its value is blocked, for each of those kinds - `inst-enforce-block`
-3. [x] - `p1` - Otherwise remove every range of every redacting kind from the piece. **IF** the piece is a number, a kind named no range, a range is empty, out of the piece or not on a character boundary, or only white space is left, its value is blocked for the redacting kinds; otherwise the piece is redacted for them. A redaction in a value that is blocked is not reported - `inst-enforce-redact`
+3. [x] - `p1` - Otherwise remove every range of every redacting kind from the piece. **IF** the piece is a number, any redacting kind named no range (another kind's ranges do not stand in for it), a range is empty, out of the piece or not on a character boundary, or only white space is left, its value is blocked for the redacting kinds; otherwise the piece is redacted for them. A redaction in a value that is blocked, or in a step dropped whole, is not reported - `inst-enforce-redact`
 4. [x] - `p1` - Drop each blocked value from its step. **IF** the step is a replace, drop the whole step, so the old value stays; **IF** the step keeps no value, drop it - `inst-enforce-steps`
 5. [x] - `p1` - Write one event for each blocked value and kind, and one for each redacted value and kind. An event names the tenant, the subject, the origin and the kind, never the value - `inst-enforce-events`
 6. [x] - `p1` - Until the Audit gear ships, the events go to the structured log at warn level under the target `construct::audit`, as `value_blocked` and `value_redacted` - `inst-enforce-log`
@@ -159,7 +159,7 @@ The system **MUST** enforce the verdicts on the affected values only: block drop
 **Touches**:
 - Entities: Sensitive-Data Verdict (`cpt-cf-construct-entity-sensitive-data-verdict`), Plan (`cpt-cf-construct-entity-plan`)
 
-**Verified by**: `a_blocked_value_is_not_stored_the_rest_is_and_the_result_says_so`, `a_step_that_keeps_no_value_is_dropped`, `a_replace_whose_new_value_is_blocked_is_dropped_whole_so_the_old_value_stays`, `every_value_blocked_leaves_an_admitted_plan_with_nothing_to_store`, `a_redacted_value_keeps_its_step_without_the_found_content`, `overlapping_redactions_of_two_kinds_both_apply`, `block_wins_over_redact_on_the_same_value`, `a_value_that_cannot_be_redacted_as_asked_is_blocked`, `a_redaction_inside_an_object_keeps_the_json_and_the_other_fields`, `a_found_number_cannot_be_redacted_so_its_value_is_blocked`, `one_blocked_piece_drops_its_whole_value_and_reports_no_redaction_in_it`, `a_plan_written_by_a_person_goes_through_the_verdicts`, `checks_then_admission_store_nothing_the_checks_block`.
+**Verified by**: `a_blocked_value_is_not_stored_the_rest_is_and_the_result_says_so`, `a_step_that_keeps_no_value_is_dropped`, `a_replace_whose_new_value_is_blocked_is_dropped_whole_so_the_old_value_stays`, `every_value_blocked_leaves_an_admitted_plan_with_nothing_to_store`, `a_redacted_value_keeps_its_step_without_the_found_content`, `overlapping_redactions_of_two_kinds_both_apply`, `block_wins_over_redact_on_the_same_value`, `a_value_that_cannot_be_redacted_as_asked_is_blocked`, `a_redact_kind_without_a_range_blocks_the_value_even_when_another_kind_has_one`, `a_redaction_in_a_replace_dropped_whole_is_not_reported`, `a_redaction_inside_an_object_keeps_the_json_and_the_other_fields`, `a_found_number_cannot_be_redacted_so_its_value_is_blocked`, `one_blocked_piece_drops_its_whole_value_and_reports_no_redaction_in_it`, `a_plan_written_by_a_person_goes_through_the_verdicts`, `checks_then_admission_store_nothing_the_checks_block`.
 
 ### Block and Redaction Events
 

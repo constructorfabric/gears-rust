@@ -335,10 +335,15 @@ fn enforce(mut plan: Plan, verdicts: &[Verdict]) -> AdmittedPlan {
         }
         // @cpt-end:cpt-cf-construct-algo-admission-enforce:p1:inst-enforce-block
         // @cpt-begin:cpt-cf-construct-algo-admission-enforce:p1:inst-enforce-redact
+        // Every redacting kind must say what to remove: a kind with no range
+        // cannot be redacted, and another kind's ranges must not hide that.
+        let every_kind_has_spans = treatment.redact.values().all(|spans| !spans.is_empty());
         let spans: Vec<Range<usize>> = treatment.redact.values().flatten().cloned().collect();
         let kinds = treatment.redact.keys().map(|&kind| Enforced { at, kind });
         let kept = match piece {
-            Value::String(text) => redact(text, &spans).filter(|kept| !kept.trim().is_empty()),
+            Value::String(text) if every_kind_has_spans => {
+                redact(text, &spans).filter(|kept| !kept.trim().is_empty())
+            }
             _ => None,
         };
         if let Some(kept) = kept {
@@ -379,8 +384,12 @@ fn enforce(mut plan: Plan, verdicts: &[Verdict]) -> AdmittedPlan {
     }
     // @cpt-end:cpt-cf-construct-algo-admission-enforce:p1:inst-enforce-steps
 
-    // A redaction in a value that another piece blocked stored nothing.
-    redacted.retain(|enforced| !blocked_values.contains(&enforced.at.value()));
+    // A redaction in a value that another piece blocked, or in a step dropped
+    // whole, stored nothing. `dropped_steps` is in ascending order.
+    redacted.retain(|enforced| {
+        !blocked_values.contains(&enforced.at.value())
+            && dropped_steps.binary_search(&enforced.at.step).is_err()
+    });
     blocked.sort();
     redacted.sort();
     AdmittedPlan {
