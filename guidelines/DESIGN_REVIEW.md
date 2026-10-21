@@ -434,8 +434,8 @@ Driven by: #<n>[, #<m>]. <1–2 sentences.> Must fix before merge: #… Tracked 
 
 | Check | Documents |
 |---|---|
-| C1 | [PRD checklist](../docs/checklists/PRD.md), [DESIGN checklist](../docs/checklists/DESIGN.md) |
-| C2 | [ADR checklist](../docs/checklists/ADR.md), [DESIGN checklist](../docs/checklists/DESIGN.md) |
+| C1 | [PRD checklist](../studio-kit-gears/artifacts/PRD/checklist.md), [DESIGN checklist](../studio-kit-gears/artifacts/DESIGN/checklist.md) |
+| C2 | [ADR checklist](../studio-kit-gears/artifacts/ADR/checklist.md), [DESIGN checklist](../studio-kit-gears/artifacts/DESIGN/checklist.md) |
 | C3 | [Gears catalog](../docs/GEARS.md), [Architecture manifest](../docs/ARCHITECTURE_MANIFEST.md), [ToolKit overview](../docs/toolkit_unified_system/README.md) |
 | C4 | [PLID](DNA/public-interface/PLID.md), [Rust SDK](../docs/arch/rust-sdk/README.md), [Gear SDK pattern](../docs/toolkit_unified_system/02_gear_layout_and_sdk_pattern.md), [ClientHub](../docs/toolkit_unified_system/03_clienthub_and_plugins.md), [Out-of-process SDK pattern](../docs/toolkit_unified_system/09_oop_grpc_sdk_pattern.md), [Contract binding DESIGN](../docs/arch/toolkit-contract-binding/DESIGN.md) |
 | C5, C14 | [Authorization DESIGN](../docs/arch/authorization/DESIGN.md), [Authorization ADRs](../docs/arch/authorization/ADR/), [ToolKit authn/authz/Secure ORM](../docs/toolkit_unified_system/06_authn_authz_secure_orm.md) |
@@ -445,9 +445,9 @@ Driven by: #<n>[, #<m>]. <1–2 sentences.> Must fix before merge: #… Tracked 
 | C9 | TODO: task-engine contracts, durable task queue reference docs |
 | C10 | [ToolKit plugins](../docs/TOOLKIT_PLUGINS.md), [ClientHub and plugins](../docs/toolkit_unified_system/03_clienthub_and_plugins.md) |
 | C11 | [Gears Serverless catalog](../docs/GEARS.md#serverless), [Serverless Runtime DESIGN](../gears/serverless-runtime/docs/DESIGN.md), [Serverless SDK DESIGN](../gears/serverless-runtime/serverless-sdk/docs/DESIGN.md) |
-| C12 | [LLM Gateway DESIGN](../gears/llm-gateway/docs/DESIGN.md), [OAGW DESIGN](../gears/system/oagw/docs/DESIGN.md), [Security guidelines](SECURITY.md) |
+| C12 | [LLM Gateway PRD](../gears/llm-gateway/docs/PRD.md), [OAGW DESIGN](../gears/system/oagw/docs/DESIGN.md), [Security guidelines](SECURITY.md) |
 | C13 | [Database naming ADR](../docs/arch/database/ADR/0001-cpt-cf-database-adr-object-namespacing.md), [ToolKit database patterns](../docs/toolkit_unified_system/11_database_patterns.md), [Secure CTE ADR](../docs/arch/secure-orm/ADR/0001-secure-cte-policy.md), [Secure property graph ADR](../docs/arch/secure-orm/ADR/0002-secure-property-graph-policy.md) |
 | C15 | [Throttling DESIGN](../docs/arch/throttling/DESIGN.md), [OData](../docs/toolkit_unified_system/07_odata_pagination_select_filter.md), [ToolKit database patterns](../docs/toolkit_unified_system/11_database_patterns.md) |
 | C16 | [Cluster DESIGN](../gears/system/cluster/docs/DESIGN.md), [No remote call in critical section](../gears/system/cluster/docs/ADR/002-async-boundary-no-remote-in-critical-section.md), [Leader-election safety](../gears/system/cluster/docs/ADR/009-leader-election-backend-safety.md) |
 | C17–C19 | [ToolKit database patterns](../docs/toolkit_unified_system/11_database_patterns.md), [ToolKit DB](../libs/toolkit-db/README.md), [Transactional outbox](../libs/toolkit-db/src/outbox/README.md), [Graph Storage DESIGN](../gears/graph-storage/docs/DESIGN.md), [File Storage DESIGN](../gears/file-storage/docs/DESIGN.md), TODO: task-engine contracts, [Event Broker DESIGN](../gears/system/event-broker/docs/DESIGN.md) |
-| C20 | [DESIGN checklist](../docs/checklists/DESIGN.md) |
+| C20 | [DESIGN checklist](../studio-kit-gears/artifacts/DESIGN/checklist.md) |
