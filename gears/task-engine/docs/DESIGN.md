@@ -1104,15 +1104,21 @@ sequenceDiagram
     TE-->>W: 200 OK {wait_condition} (lease ended; worker is free)
 
     Note over TE,EB: TE Event Consumer joined via stable consumer group (event_broker_sdk::ConsumerBuilder)
-    EB->>TE: Deliver event {type, subject} (TxConsumerHandler, at-least-once)
+    EB->>TE: Deliver event {type, tenant, subject, subject_type} (TxConsumerHandler, at-least-once)
     Note over TE,DB: Single transaction (wait resolution + offset commit)
-    TE->>DB: SELECT active event wait conditions matching type/subject
-    TE->>TE: Evaluate CEL match_expression (if present)
-    TE->>DB: UPDATE wait_condition state=satisfied
-    TE->>DB: UPDATE task state=queued, resume_pending=true
-    TE->>DB: producer_outbox.enqueue(WaitConditionSatisfied, TaskResumed)
-    TE->>DB: commit offset (LocalDbOffsetManager); COMMIT
-    TE-->>TE: Signal newTask
+    TE->>DB: SELECT pending event waits WHERE event_type matches AND owner_tenant_id = event tenant
+    TE->>TE: Keep rows where event_subject_id / event_subject_type match (when set); evaluate CEL match_expression (if present)
+    TE->>DB: UPDATE matched wait_condition state=satisfied, resolved_payload=event
+    alt wait group now complete (any: first match; all: every condition satisfied)
+        TE->>DB: (any mode) UPDATE sibling conditions state=cancelled
+        TE->>DB: UPDATE task state=queued, resume_pending=true
+        TE->>DB: producer_outbox.enqueue(WaitConditionSatisfied, TaskResumed)
+        TE->>DB: commit offset (LocalDbOffsetManager); COMMIT
+        TE-->>TE: Signal newTask
+    else group still has pending conditions (all mode)
+        TE->>DB: producer_outbox.enqueue(WaitConditionSatisfied)
+        TE->>DB: commit offset (LocalDbOffsetManager); COMMIT
+    end
     Note over TE,EB: event_broker_sdk DbProducer delivers to EB (at-least-once, deduped)
 ```
 
