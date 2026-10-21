@@ -3,11 +3,11 @@ use sea_orm::{ActiveValue, ColumnTrait, Condition, EntityTrait};
 use toolkit_db::secure::{
     DBRunner, ScopableEntity, SecureEntityExt, SecureInsertExt, SecureOnConflict,
 };
-use toolkit_security::{AccessScope, ScopeConstraint, ScopeFilter};
+use toolkit_security::{AccessScope, ScopeConstraint, ScopeFilter, ScopeValue};
 
 use crate::domain::error::DomainError;
 use crate::domain::subject_settings::{
-    Refusal, SettingsLookup, SubjectKey, SubjectSettings, SubjectSettingsRepository,
+    ScopeRefusal, SettingsLookup, SubjectKey, SubjectSettings, SubjectSettingsRepository,
     UncheckablePredicate,
 };
 
@@ -42,33 +42,36 @@ fn key_value(column: entity::Column, key: SubjectKey) -> Option<uuid::Uuid> {
 /// One filter against the key. The property is mapped to its column by the
 /// entity itself (`ScopableEntity::resolve_property`), so this cannot disagree
 /// with the column the secure ORM filters on.
-fn filter_coverage(filter: &ScopeFilter, key: SubjectKey) -> Result<(), Refusal> {
+fn filter_coverage(filter: &ScopeFilter, key: SubjectKey) -> Result<(), ScopeRefusal> {
     let Some(expected) =
         SubjectSettingsEntity::resolve_property(filter.property()).and_then(|c| key_value(c, key))
     else {
-        return Err(Refusal::NotCovered);
+        return Err(ScopeRefusal::NotCovered);
     };
     match filter {
         ScopeFilter::Eq(_) | ScopeFilter::In(_) => {
+            // Only a UUID value matches. The secure ORM binds a string value as
+            // text and compares values by kind, so a UUID held as a string
+            // covers nothing there either.
             if filter
                 .values()
                 .iter()
-                .any(|value| value.as_uuid() == Some(expected))
+                .any(|value| matches!(value, ScopeValue::Uuid(u) if *u == expected))
             {
                 Ok(())
             } else {
-                Err(Refusal::NotCovered)
+                Err(ScopeRefusal::NotCovered)
             }
         }
-        ScopeFilter::InGroup(_) => Err(Refusal::Undecidable(UncheckablePredicate::Group)),
-        ScopeFilter::InGroupSubtree(_) => {
-            Err(Refusal::Undecidable(UncheckablePredicate::GroupSubtree))
-        }
-        ScopeFilter::InTenantSubtree(_) => {
-            Err(Refusal::Undecidable(UncheckablePredicate::TenantSubtree))
-        }
+        ScopeFilter::InGroup(_) => Err(ScopeRefusal::Undecidable(UncheckablePredicate::Group)),
+        ScopeFilter::InGroupSubtree(_) => Err(ScopeRefusal::Undecidable(
+            UncheckablePredicate::GroupSubtree,
+        )),
+        ScopeFilter::InTenantSubtree(_) => Err(ScopeRefusal::Undecidable(
+            UncheckablePredicate::TenantSubtree,
+        )),
         // `ScopeFilter` is `#[non_exhaustive]`: a kind added later fails closed.
-        _ => Err(Refusal::Undecidable(UncheckablePredicate::Unknown)),
+        _ => Err(ScopeRefusal::Undecidable(UncheckablePredicate::Unknown)),
     }
 }
 
@@ -76,28 +79,28 @@ fn filter_coverage(filter: &ScopeFilter, key: SubjectKey) -> Result<(), Refusal>
 /// any undecidable filter and it cannot be decided. A constraint without
 /// filters cannot be built today (`ScopeConstraint` refuses one); if one ever
 /// arrives it covers nothing, as the secure ORM refuses it too.
-fn constraint_coverage(constraint: &ScopeConstraint, key: SubjectKey) -> Result<(), Refusal> {
+fn constraint_coverage(constraint: &ScopeConstraint, key: SubjectKey) -> Result<(), ScopeRefusal> {
     if constraint.is_empty() {
-        return Err(Refusal::NotCovered);
+        return Err(ScopeRefusal::NotCovered);
     }
     let mut undecidable = None;
     for filter in constraint.filters() {
         match filter_coverage(filter, key) {
             Ok(()) => {}
-            Err(Refusal::NotCovered) => return Err(Refusal::NotCovered),
-            Err(Refusal::Undecidable(kind)) => undecidable = undecidable.or(Some(kind)),
+            Err(ScopeRefusal::NotCovered) => return Err(ScopeRefusal::NotCovered),
+            Err(ScopeRefusal::Undecidable(kind)) => undecidable = undecidable.or(Some(kind)),
         }
     }
-    undecidable.map_or(Ok(()), |kind| Err(Refusal::Undecidable(kind)))
+    undecidable.map_or(Ok(()), |kind| Err(ScopeRefusal::Undecidable(kind)))
 }
 
 /// Whether `scope` covers the row of `key`. Constraints are OR-ed: one
 /// covering constraint is enough. Otherwise an undecidable constraint makes
 /// the scope undecidable, and the read fails closed either way.
-pub(crate) fn coverage(scope: &AccessScope, key: SubjectKey) -> Result<(), Refusal> {
+pub(crate) fn coverage(scope: &AccessScope, key: SubjectKey) -> Result<(), ScopeRefusal> {
     // @cpt-begin:cpt-cf-construct-algo-subject-settings-read:p1:inst-read-cover
     if scope.is_deny_all() {
-        return Err(Refusal::NotCovered);
+        return Err(ScopeRefusal::NotCovered);
     }
     if scope.is_unconstrained() {
         return Ok(());
@@ -106,11 +109,11 @@ pub(crate) fn coverage(scope: &AccessScope, key: SubjectKey) -> Result<(), Refus
     for constraint in scope.constraints() {
         match constraint_coverage(constraint, key) {
             Ok(()) => return Ok(()),
-            Err(Refusal::NotCovered) => {}
-            Err(Refusal::Undecidable(kind)) => undecidable = undecidable.or(Some(kind)),
+            Err(ScopeRefusal::NotCovered) => {}
+            Err(ScopeRefusal::Undecidable(kind)) => undecidable = undecidable.or(Some(kind)),
         }
     }
-    Err(undecidable.map_or(Refusal::NotCovered, Refusal::Undecidable))
+    Err(undecidable.map_or(ScopeRefusal::NotCovered, ScopeRefusal::Undecidable))
     // @cpt-end:cpt-cf-construct-algo-subject-settings-read:p1:inst-read-cover
 }
 
@@ -123,7 +126,7 @@ impl SubjectSettingsRepository for SeaOrmSubjectSettingsRepository {
         key: SubjectKey,
     ) -> Result<SettingsLookup, DomainError> {
         if let Err(refusal) = coverage(scope, key) {
-            return Ok(SettingsLookup::Refused(refusal));
+            return Ok(SettingsLookup::OutOfScope(refusal));
         }
 
         // @cpt-begin:cpt-cf-construct-algo-subject-settings-read:p1:inst-read-select

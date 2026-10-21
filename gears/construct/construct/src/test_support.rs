@@ -238,7 +238,7 @@ impl CoveredLookup for SettingsLookup {
         match self {
             Self::Stored(settings) => Some(settings),
             Self::Absent => None,
-            Self::Refused(refusal) => {
+            Self::OutOfScope(refusal) => {
                 panic!("the scope should cover the key, got {refusal:?}")
             }
         }

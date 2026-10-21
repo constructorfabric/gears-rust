@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 use crate::domain::error::DomainError;
 use crate::domain::record_intake::{IntakeOutcome, Place, RefusalReason};
-use crate::domain::subject_settings::{SubjectKey, SubjectSettings};
+use crate::domain::subject_settings::{ScopeRefusal, SubjectKey, SubjectSettings};
 use crate::test_support::{
     DenyResolver, ErroringResolver, IntakeFixture, OwnTenantOnlyResolver, PendingResolver,
     RecordingResolver, chat_record, inmem_db, seed_subject_settings, stored_record_ids,
@@ -353,27 +353,40 @@ async fn a_connector_without_permission_is_refused_before_the_record_is_checked(
 
 #[tokio::test]
 async fn a_connector_authorized_only_for_its_own_tenant_cannot_write_into_another() {
-    let db = inmem_db().await;
-    let fixture = IntakeFixture {
-        resolver: Arc::new(OwnTenantOnlyResolver),
-        ..IntakeFixture::default()
-    };
-    let intake = fixture.build(&db);
+    // With or without a stored opt-out in the named tenant: the subject's
+    // settings there are outside the connector's scope, so the record is
+    // refused before anything is read or written.
+    for stored in [false, true] {
+        let db = inmem_db().await;
+        let fixture = IntakeFixture {
+            resolver: Arc::new(OwnTenantOnlyResolver),
+            ..IntakeFixture::default()
+        };
+        let intake = fixture.build(&db);
+        let (ctx, tenant, subject) = (connector(), Uuid::new_v4(), Uuid::new_v4());
+        let key = SubjectKey {
+            tenant_id: tenant,
+            subject_id: subject,
+        };
+        if stored {
+            seed_subject_settings(&db, key, SubjectSettings::new_subject(false)).await;
+        }
 
-    let result = intake
-        .submit(
-            &connector(),
-            Uuid::new_v4(),
-            chat_record(Uuid::new_v4(), "chat/t/1", "v1"),
-        )
-        .await;
+        let result = intake
+            .submit(&ctx, tenant, chat_record(subject, "chat/t/1", "v1"))
+            .await;
 
-    assert!(
-        matches!(result, Err(DomainError::Forbidden(_))),
-        "got {result:?}"
-    );
-    assert!(fixture.received().is_empty());
-    assert_eq!(stored_record_ids(&db).await, 0);
+        match &result {
+            Err(DomainError::OutOfScope(refused)) => {
+                assert_eq!(refused.key, key, "stored {stored}: {refused}");
+                assert_eq!(refused.refusal, ScopeRefusal::NotCovered, "{refused}");
+                assert_eq!(refused.caller_tenant, ctx.subject_tenant_id(), "{refused}");
+            }
+            other => panic!("stored {stored}: expected the scope refusal, got {other:?}"),
+        }
+        assert!(fixture.received().is_empty());
+        assert_eq!(stored_record_ids(&db).await, 0);
+    }
 }
 
 async fn submit_with_policy(

@@ -17,8 +17,8 @@ use uuid::Uuid;
 
 use crate::domain::error::DomainError;
 use crate::domain::subject_settings::{
-    Refusal, SettingsLookup, SubjectKey, SubjectSettings, SubjectSettingsRepository,
-    SubjectSettingsService, TenantDefaults, UncheckablePredicate,
+    ScopeRefusal, SettingsLookup, SettingsOutOfScope, SubjectKey, SubjectSettings,
+    SubjectSettingsRepository, SubjectSettingsService, TenantDefaults, UncheckablePredicate,
 };
 use crate::infra::storage::subject_settings_repo::SeaOrmSubjectSettingsRepository;
 use crate::test_support::{
@@ -600,17 +600,20 @@ fn another_resource(request: &EvaluationRequest) -> Vec<Predicate> {
 }
 
 /// The refusal of a read whose scope does not cover the key, recognised by its
-/// message: not any `Forbidden`, which the enforcer's own compile failure would
+/// variant: not any `Forbidden`, which the enforcer's own compile failure would
 /// also give.
 fn assert_not_covered(read: Result<SubjectSettings, DomainError>, tenant: Uuid, subject: Uuid) {
     match read {
-        Err(DomainError::Forbidden(message)) => {
-            assert!(
-                message.contains("the policy scope does not cover them"),
-                "{message}"
+        Err(DomainError::OutOfScope(refused)) => {
+            assert_eq!(refused.refusal, ScopeRefusal::NotCovered, "{refused}");
+            assert_eq!(
+                refused.key,
+                SubjectKey {
+                    tenant_id: tenant,
+                    subject_id: subject,
+                },
+                "{refused}"
             );
-            assert!(message.contains(&tenant.to_string()), "{message}");
-            assert!(message.contains(&subject.to_string()), "{message}");
         }
         other => panic!("expected the scope refusal, got {other:?}"),
     }
@@ -661,7 +664,7 @@ impl SubjectSettingsRepository for UndecidableRepository {
         _scope: &AccessScope,
         _key: SubjectKey,
     ) -> Result<SettingsLookup, DomainError> {
-        Ok(SettingsLookup::Refused(Refusal::Undecidable(
+        Ok(SettingsLookup::OutOfScope(ScopeRefusal::Undecidable(
             UncheckablePredicate::TenantSubtree,
         )))
     }
@@ -692,14 +695,57 @@ async fn an_undecidable_scope_is_refused_with_a_message_naming_the_predicate() {
     let read = svc.settings(&ctx, subject).await;
 
     match read {
-        Err(DomainError::Forbidden(message)) => {
-            assert!(message.contains("tenant-subtree predicate"), "{message}");
-            assert!(message.contains(&ctx.subject_id().to_string()), "{message}");
-            assert!(message.contains(&tenant.to_string()), "{message}");
-            assert!(message.contains(&subject.to_string()), "{message}");
+        Err(DomainError::OutOfScope(refused)) => {
+            assert_eq!(
+                refused.refusal,
+                ScopeRefusal::Undecidable(UncheckablePredicate::TenantSubtree),
+                "{refused}"
+            );
+            assert_eq!(refused.caller, ctx.subject_id(), "{refused}");
+            assert_eq!(
+                refused.key,
+                SubjectKey {
+                    tenant_id: tenant,
+                    subject_id: subject,
+                },
+                "{refused}"
+            );
+            assert!(
+                refused.to_string().contains("tenant-subtree predicate"),
+                "{refused}"
+            );
         }
         other => panic!("expected the undecidable refusal, got {other:?}"),
     }
+}
+
+/// The refusal names the caller's tenant and the tenant of the refused key,
+/// which differ on Record Intake's path.
+#[test]
+fn the_scope_refusal_names_the_callers_tenant_and_the_keys_tenant() {
+    let (caller, caller_tenant, tenant, subject) = (
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+    );
+    let refused = SettingsOutOfScope {
+        caller,
+        caller_tenant,
+        key: SubjectKey {
+            tenant_id: tenant,
+            subject_id: subject,
+        },
+        refusal: ScopeRefusal::NotCovered,
+    };
+
+    assert_eq!(
+        refused.to_string(),
+        format!(
+            "caller {caller} of tenant {caller_tenant} may not read the settings of subject \
+             {subject} in tenant {tenant}: the policy scope does not cover them"
+        )
+    );
 }
 
 /// A write the secure ORM accepted whose read-back the coverage check refuses

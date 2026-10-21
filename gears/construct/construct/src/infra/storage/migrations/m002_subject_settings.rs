@@ -150,9 +150,10 @@ mod tests {
         }
     }
 
-    /// The `SQLite` DDL runs twice on one database without an error, and the
-    /// table still holds its primary key afterwards. `MySQL` and `PostgreSQL`
-    /// use the same `IF NOT EXISTS` form, asserted as text above.
+    /// The `SQLite` DDL runs twice on one database without an error: a row
+    /// stored after the first run is still there after the second, and the
+    /// table keeps its primary key and column default. `MySQL` and
+    /// `PostgreSQL` use the same `IF NOT EXISTS` form, asserted as text above.
     #[tokio::test]
     async fn sqlite_ddl_is_safe_to_run_twice() {
         use sea_orm::{ConnectionTrait, Database, Statement};
@@ -162,26 +163,35 @@ mod tests {
             .expect("connect in-memory database");
         let ddl = ddl_for(DatabaseBackend::Sqlite).expect("sqlite ddl");
 
+        let insert = "INSERT INTO construct__subject_settings \
+                      (tenant_id, subject_id, personalization_enabled) VALUES ('t', 's', 0)";
         conn.execute_unprepared(ddl).await.expect("first run");
+        conn.execute_unprepared(insert)
+            .await
+            .expect("row before the second run");
         conn.execute_unprepared(ddl).await.expect("second run");
 
-        let insert = "INSERT INTO construct__subject_settings \
-                      (tenant_id, subject_id, personalization_enabled) VALUES ('t', 's', 1)";
-        conn.execute_unprepared(insert).await.expect("first row");
+        let row = conn
+            .query_one_raw(Statement::from_string(
+                DatabaseBackend::Sqlite,
+                "SELECT personalization_enabled, erasure_in_progress \
+                 FROM construct__subject_settings WHERE tenant_id = 't' AND subject_id = 's'"
+                    .to_owned(),
+            ))
+            .await
+            .expect("select")
+            .expect("the row survives the second run");
+        let personalization = row
+            .try_get::<bool>("", "personalization_enabled")
+            .expect("personalization flag");
+        let erasure = row
+            .try_get::<bool>("", "erasure_in_progress")
+            .expect("erasure flag");
+        assert!(!personalization, "the row keeps its value");
+        assert!(!erasure, "the column default survives the second run");
         assert!(
             conn.execute_unprepared(insert).await.is_err(),
             "the primary key survives the second run"
         );
-        let erasure = conn
-            .query_one_raw(Statement::from_string(
-                DatabaseBackend::Sqlite,
-                "SELECT erasure_in_progress FROM construct__subject_settings".to_owned(),
-            ))
-            .await
-            .expect("select")
-            .expect("one row")
-            .try_get::<bool>("", "erasure_in_progress")
-            .expect("erasure flag");
-        assert!(!erasure, "the column default survives the second run");
     }
 }

@@ -1,12 +1,12 @@
 //! Repository tests for subject settings on an in-memory `SQLite` database:
 //! the stored row round-trips, and the tenant scope hides other tenants' rows.
 
-use toolkit_security::{AccessScope, ScopeConstraint, ScopeFilter, pep_properties};
+use toolkit_security::{AccessScope, ScopeConstraint, ScopeFilter, ScopeValue, pep_properties};
 use uuid::Uuid;
 
 use super::subject_settings_repo::{SeaOrmSubjectSettingsRepository, coverage};
 use crate::domain::subject_settings::{
-    Refusal, SettingsLookup, SubjectKey, SubjectSettings, SubjectSettingsRepository,
+    ScopeRefusal, SettingsLookup, SubjectKey, SubjectSettings, SubjectSettingsRepository,
     UncheckablePredicate,
 };
 use crate::test_support::{
@@ -549,7 +549,7 @@ async fn find_decides_coverage_from_the_key_with_the_secure_orm_rules() {
                 repo.find(&conn, not_covering_scope, key)
                     .await
                     .expect("find"),
-                SettingsLookup::Refused(Refusal::NotCovered),
+                SettingsLookup::OutOfScope(ScopeRefusal::NotCovered),
                 "{label}"
             );
         }
@@ -593,7 +593,7 @@ async fn find_decides_coverage_from_the_key_with_the_secure_orm_rules() {
                 repo.find(&conn, &undecidable_scope, key)
                     .await
                     .expect("find"),
-                SettingsLookup::Refused(Refusal::Undecidable(kind)),
+                SettingsLookup::OutOfScope(ScopeRefusal::Undecidable(kind)),
             );
         }
     }
@@ -637,7 +637,7 @@ fn constraints_combine_as_or_with_undecidable_below_covered() {
             ]),
             key
         ),
-        Err(Refusal::Undecidable(UncheckablePredicate::Group))
+        Err(ScopeRefusal::Undecidable(UncheckablePredicate::Group))
     );
 }
 
@@ -674,6 +674,12 @@ async fn coverage_agrees_with_the_secure_orm_on_every_small_scope() {
         }
         filters.push(ScopeFilter::eq(property, hit));
         filters.push(ScopeFilter::eq(property, miss));
+        // The key's UUIDs held as strings, as a caller could build by hand.
+        filters.push(ScopeFilter::eq(property, hit.to_string()));
+        filters.push(ScopeFilter::r#in(
+            property,
+            vec![ScopeValue::from(hit.to_string().to_uppercase())],
+        ));
     }
     let mut scopes = Vec::new();
     for first in &filters {

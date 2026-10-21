@@ -98,7 +98,7 @@ impl std::fmt::Display for UncheckablePredicate {
 /// Why a policy scope does not let the read see one key's row.
 #[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Refusal {
+pub enum ScopeRefusal {
     /// The scope does not cover the key, whether or not a row exists.
     NotCovered,
     /// The scope holds a predicate that cannot be checked against the key
@@ -117,7 +117,7 @@ pub enum SettingsLookup {
     /// The scope covers the key and there is no row: a new subject.
     Absent,
     /// The scope does not let the read see the key's row.
-    Refused(Refusal),
+    OutOfScope(ScopeRefusal),
 }
 
 #[async_trait]
@@ -163,22 +163,45 @@ fn ensure_owner(ctx: &SecurityContext, subject_id: Uuid) -> Result<(), DomainErr
     // @cpt-end:cpt-cf-construct-algo-subject-settings-owner-only:p1:inst-owner-refuse
 }
 
-/// The refusal of a read whose scope leaves the key out. It names the
-/// caller, the caller's tenant and the subject, and why: a scope that does not
-/// cover the key, or one with a predicate the read cannot check.
-fn out_of_scope(ctx: &SecurityContext, subject_id: Uuid, refusal: Refusal) -> DomainError {
-    let why = match refusal {
-        Refusal::NotCovered => "the policy scope does not cover them".to_owned(),
-        Refusal::Undecidable(predicate) => format!(
-            "the policy scope holds a {predicate} predicate, which the read cannot check, \
-             so it does not count as covering them"
-        ),
-    };
-    DomainError::forbidden(format!(
-        "caller {} of tenant {} may not read the settings of subject {subject_id}: {why}",
-        ctx.subject_id(),
-        ctx.subject_tenant_id()
-    ))
+/// A read refused because the caller's policy scope leaves the key out. It
+/// names the caller, the caller's tenant, the key and why, so the log tells a
+/// scope refusal from a policy denial: on Record Intake's path the key's tenant
+/// is the one the connector names, not the connector's own.
+#[domain_model]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SettingsOutOfScope {
+    pub caller: Uuid,
+    pub caller_tenant: Uuid,
+    pub key: SubjectKey,
+    pub refusal: ScopeRefusal,
+}
+
+impl std::fmt::Display for SettingsOutOfScope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "caller {} of tenant {} may not read the settings of subject {} in tenant {}: ",
+            self.caller, self.caller_tenant, self.key.subject_id, self.key.tenant_id
+        )?;
+        match self.refusal {
+            ScopeRefusal::NotCovered => f.write_str("the policy scope does not cover them"),
+            ScopeRefusal::Undecidable(predicate) => write!(
+                f,
+                "the policy scope holds a {predicate} predicate, which the read cannot check, \
+                 so it does not count as covering them"
+            ),
+        }
+    }
+}
+
+/// The refusal of a read whose scope leaves the key out.
+fn out_of_scope(ctx: &SecurityContext, key: SubjectKey, refusal: ScopeRefusal) -> DomainError {
+    DomainError::OutOfScope(SettingsOutOfScope {
+        caller: ctx.subject_id(),
+        caller_tenant: ctx.subject_tenant_id(),
+        key,
+        refusal,
+    })
 }
 
 /// The tenant settings a new subject starts from. The tenant settings live in
@@ -282,8 +305,8 @@ impl<R: SubjectSettingsRepository + 'static> SubjectSettingsService<R> {
             // @cpt-end:cpt-cf-construct-algo-subject-settings-read:p1:inst-read-stored
             SettingsLookup::Absent => {}
             // @cpt-begin:cpt-cf-construct-algo-subject-settings-read:p1:inst-read-cover
-            SettingsLookup::Refused(refusal) => {
-                return Err(out_of_scope(ctx, key.subject_id, refusal));
+            SettingsLookup::OutOfScope(refusal) => {
+                return Err(out_of_scope(ctx, key, refusal));
             } // @cpt-end:cpt-cf-construct-algo-subject-settings-read:p1:inst-read-cover
         }
 
@@ -371,7 +394,7 @@ impl<R: SubjectSettingsRepository + 'static> SubjectSettingsService<R> {
                         ))),
                         // The write passed the scope, so a refused read-back
                         // means the coverage check and the secure ORM disagree.
-                        SettingsLookup::Refused(refusal) => Err(DomainError::internal(format!(
+                        SettingsLookup::OutOfScope(refusal) => Err(DomainError::internal(format!(
                             "subject settings read-back refused after an accepted write \
                              ({refusal:?}): tenant {}, subject {}",
                             key.tenant_id, key.subject_id

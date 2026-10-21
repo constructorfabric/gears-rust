@@ -68,6 +68,13 @@ pub fn for_settings(e: DomainError) -> CanonicalError {
                 .create()
         }
         // @cpt-end:cpt-cf-construct-algo-subject-settings-owner-only:p1:inst-owner-refuse-return
+        // A read the policy scope leaves out is refused the same way.
+        DomainError::OutOfScope(refusal) => {
+            tracing::warn!(msg = %refusal, "construct subject settings access forbidden");
+            SubjectSettingsError::permission_denied()
+                .with_reason("ACCESS_DENIED")
+                .create()
+        }
         // The settings routes refuse no record; a refusal here is mapped like
         // any other error.
         e @ (DomainError::Refused(_)
@@ -90,6 +97,12 @@ impl From<DomainError> for CanonicalError {
             // @cpt-begin:cpt-cf-construct-algo-gear-foundation-map-errors:p1:inst-map-forbidden-return
             DomainError::Forbidden(msg) => {
                 tracing::warn!(msg = %msg, "construct access forbidden");
+                RecordError::permission_denied()
+                    .with_reason("ACCESS_DENIED")
+                    .create()
+            }
+            DomainError::OutOfScope(refusal) => {
+                tracing::warn!(msg = %refusal, "construct access forbidden");
                 RecordError::permission_denied()
                     .with_reason("ACCESS_DENIED")
                     .create()
