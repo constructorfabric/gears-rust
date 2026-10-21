@@ -2,12 +2,12 @@
 
 use std::sync::Arc;
 
-use axum::extract::Path;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::{Extension, Json};
 use bytes::Bytes;
 use sea_orm_migration::MigratorTrait;
+use toolkit::api::rest::extract::Path;
 use toolkit_db::migration_runner::run_migrations_for_testing;
 use toolkit_db::{ConnectOpts, DBProvider, DbError, connect_db};
 use toolkit_gts::gts_id;
@@ -165,7 +165,10 @@ fn backend_path(file_id: Uuid, version_id: Uuid) -> String {
 async fn finalize_without_prior_put_is_rejected() {
     let (svc, _backend, store) = build_service().await;
     let ctx = ctx(Uuid::now_v7());
-    let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
 
     let err = svc
         .finalize_upload(&ctx, ticket.file_id, ticket.version_id, 100, vec![0u8; 32])
@@ -189,7 +192,10 @@ async fn finalize_without_prior_put_is_rejected() {
 async fn finalize_size_mismatch_is_rejected() {
     let (svc, backend, store) = build_service().await;
     let ctx = ctx(Uuid::now_v7());
-    let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
 
     let path = backend_path(ticket.file_id, ticket.version_id);
     backend
@@ -225,7 +231,10 @@ async fn finalize_size_mismatch_is_rejected() {
 async fn finalize_persists_reported_hash() {
     let (svc, backend, store) = build_service().await;
     let ctx = ctx(Uuid::now_v7());
-    let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
 
     let path = backend_path(ticket.file_id, ticket.version_id);
     backend
@@ -258,7 +267,10 @@ async fn finalize_persists_reported_hash() {
 async fn finalize_matching_size_and_hash_succeeds() {
     let (svc, backend, store) = build_service().await;
     let ctx = ctx(Uuid::now_v7());
-    let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
 
     let known_bytes = Bytes::from_static(b"hello, world!");
     let path = backend_path(ticket.file_id, ticket.version_id);
@@ -292,7 +304,10 @@ async fn finalize_matching_size_and_hash_succeeds() {
 async fn finalize_by_token_without_prior_put_is_rejected() {
     let (svc, _backend, store) = build_service().await;
     let ctx = ctx(Uuid::now_v7());
-    let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
 
     // Claims mirror what `handlers::finalize_version` builds after verifying a signed token.
     let claims = Claims {
@@ -307,6 +322,7 @@ async fn finalize_by_token_without_prior_put_is_rejected() {
         request_id: "test-request-id".to_owned(),
         content_type: String::new(),
         etag: String::new(),
+        bind_on_finalize: false,
     };
 
     let err = svc
@@ -347,7 +363,10 @@ async fn version_repo_finalize_twice_second_call_returns_false() {
     let svc = FileService::new(store, backends, issuer, authorizer, cfg, None, None);
 
     let ctx = ctx(Uuid::now_v7());
-    let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
     let file_id = ticket.file_id;
 
     let conn = db.conn().expect("conn");
@@ -369,6 +388,7 @@ async fn version_repo_finalize_twice_second_call_returns_false() {
         backend_id: "mem".to_owned(),
         backend_path: backend_path(file_id, version_id),
         created_at: time::OffsetDateTime::now_utc(),
+        bound_on_finalize: false,
     };
     repo.insert(&conn, &scope, &pending)
         .await
@@ -430,7 +450,10 @@ async fn version_repo_finalize_twice_second_call_returns_false() {
 async fn finalize_upload_after_already_available_returns_conflict() {
     let (svc, backend, store) = build_service().await;
     let ctx = ctx(Uuid::now_v7());
-    let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
 
     let known_bytes = Bytes::from_static(b"hello, world!");
     let path = backend_path(ticket.file_id, ticket.version_id);
@@ -480,7 +503,7 @@ async fn finalize_rejects_content_not_matching_declared_mime() {
     let (svc, backend, store) = build_service().await;
     let ctx = ctx(Uuid::now_v7());
     let ticket = svc
-        .create_file(&ctx, new_file_with_mime("image/png"), None)
+        .create_file(&ctx, new_file_with_mime("image/png"), None, false)
         .await
         .unwrap();
 
@@ -526,7 +549,12 @@ async fn finalize_persists_validated_mime() {
     let (svc, backend, store) = build_service().await;
     let ctx = ctx(Uuid::now_v7());
     let ticket = svc
-        .create_file(&ctx, new_file_with_mime("image/png; charset=binary"), None)
+        .create_file(
+            &ctx,
+            new_file_with_mime("image/png; charset=binary"),
+            None,
+            false,
+        )
         .await
         .unwrap();
 
@@ -565,7 +593,10 @@ async fn finalize_persists_validated_mime() {
 async fn finalize_streams_readback_without_buffering_whole_blob() {
     let (svc, backend, store) = build_service().await;
     let ctx = ctx(Uuid::now_v7());
-    let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
 
     // 4 MiB of non-uniform content, well beyond a single chunk.
     let large_bytes: Vec<u8> = (0..4 * 1024 * 1024)
@@ -604,7 +635,10 @@ async fn finalize_with_internal_secret_required_rejects_missing_header() {
     let issuer = Arc::new(Issuer::generate(3600).expect("issuer"));
     let (svc, _msvc, _backend, _store) = build_full_service_with_issuer(Arc::clone(&issuer)).await;
     let ctx = ctx(Uuid::now_v7());
-    let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
 
     let claims = Claims {
         op: Op::Put,
@@ -618,13 +652,17 @@ async fn finalize_with_internal_secret_required_rejects_missing_header() {
         request_id: "test-request-id".to_owned(),
         content_type: String::new(),
         etag: String::new(),
+        bind_on_finalize: false,
     };
     let token = issuer
         .issue(claims, time::OffsetDateTime::now_utc())
         .expect("issue token");
 
     let verifier = Arc::new(svc.verifier());
-    let finalize_auth = Arc::new(FinalizeAuth::new("interim-shared-secret".to_owned()));
+    let finalize_auth = Arc::new(FinalizeAuth::new(
+        "interim-shared-secret".to_owned(),
+        time::Duration::ZERO,
+    ));
     // Deliberately no `x-fs-internal-token` header.
     let headers = headers_with_token(&token);
 
@@ -658,7 +696,10 @@ async fn finalize_with_internal_secret_required_accepts_matching_header() {
     let issuer = Arc::new(Issuer::generate(3600).expect("issuer"));
     let (svc, _msvc, backend, store) = build_full_service_with_issuer(Arc::clone(&issuer)).await;
     let ctx = ctx(Uuid::now_v7());
-    let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
 
     let known_bytes = Bytes::from_static(b"hello, world!");
     let path = backend_path(ticket.file_id, ticket.version_id);
@@ -679,6 +720,7 @@ async fn finalize_with_internal_secret_required_accepts_matching_header() {
         request_id: "test-request-id".to_owned(),
         content_type: String::new(),
         etag: String::new(),
+        bind_on_finalize: false,
     };
     let token = issuer
         .issue(claims, time::OffsetDateTime::now_utc())
@@ -686,7 +728,7 @@ async fn finalize_with_internal_secret_required_accepts_matching_header() {
 
     let verifier = Arc::new(svc.verifier());
     let secret = "interim-shared-secret";
-    let finalize_auth = Arc::new(FinalizeAuth::new(secret.to_owned()));
+    let finalize_auth = Arc::new(FinalizeAuth::new(secret.to_owned(), time::Duration::ZERO));
 
     let mut headers = headers_with_token(&token);
     headers.insert(
@@ -731,7 +773,10 @@ async fn report_part_with_internal_secret_required_rejects_missing_header() {
     let issuer = Arc::new(Issuer::generate(3600).expect("issuer"));
     let (svc, msvc, _backend, _store) = build_full_service_with_issuer(Arc::clone(&issuer)).await;
     let ctx = ctx(Uuid::now_v7());
-    let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
 
     let upload_id = Uuid::now_v7();
     let part_number = 1u32;
@@ -753,13 +798,17 @@ async fn report_part_with_internal_secret_required_rejects_missing_header() {
         request_id: "test-request-id".to_owned(),
         content_type: String::new(),
         etag: String::new(),
+        bind_on_finalize: false,
     };
     let token = issuer
         .issue(claims, time::OffsetDateTime::now_utc())
         .expect("issue token");
 
     let verifier = Arc::new(svc.verifier());
-    let finalize_auth = Arc::new(FinalizeAuth::new("interim-shared-secret".to_owned()));
+    let finalize_auth = Arc::new(FinalizeAuth::new(
+        "interim-shared-secret".to_owned(),
+        time::Duration::ZERO,
+    ));
     // Deliberately no `x-fs-internal-token` header.
     let headers = headers_with_token(&token);
 

@@ -322,6 +322,7 @@ fn download_token_with_meta(
         request_id: "test-request-id".to_owned(),
         content_type: content_type.to_owned(),
         etag: etag.to_owned(),
+        bind_on_finalize: false,
     };
     issuer
         .issue(claims, OffsetDateTime::now_utc())
@@ -711,6 +712,7 @@ fn upload_token(
         request_id: "test-request-id".to_owned(),
         content_type: String::new(),
         etag: String::new(),
+        bind_on_finalize: false,
     };
     issuer
         .issue(claims, OffsetDateTime::now_utc())
@@ -748,6 +750,7 @@ fn multipart_part_token(
         request_id: "test-request-id".to_owned(),
         content_type: String::new(),
         etag: String::new(),
+        bind_on_finalize: false,
     };
     issuer
         .issue(claims, OffsetDateTime::now_utc())
@@ -933,6 +936,7 @@ async fn write_multipart_part_native_undersized_returns_400() {
         request_id: "test-request-id".to_owned(),
         content_type: String::new(),
         etag: String::new(),
+        bind_on_finalize: false,
     };
 
     let err = write_multipart_part_native(&backend, &claims, 1, Body::from(b"short".to_vec()))
@@ -967,6 +971,7 @@ async fn write_multipart_part_offset_object_undersized_returns_400() {
         request_id: "test-request-id".to_owned(),
         content_type: String::new(),
         etag: String::new(),
+        bind_on_finalize: false,
     };
 
     let err =
@@ -1109,6 +1114,7 @@ fn part_claims(backend_id: &str, backend_path: &str, size: u64, backend_handle: 
         request_id: "test-request-id".to_owned(),
         content_type: String::new(),
         etag: String::new(),
+        bind_on_finalize: false,
     }
 }
 

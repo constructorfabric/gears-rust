@@ -113,7 +113,10 @@ impl CleanupEngine {
         result.abandoned_pending_deleted += pending_deleted;
         result.abandoned_files_deleted += files_deleted;
 
-        result.expired_multipart_aborted += self.sweep_expired_multipart(now).await;
+        // Step 2 can reclaim a zero-version orphan that step 1 declined while this session looked active (FS-05).
+        let (expired_aborted, files_deleted_by_step2) = self.sweep_expired_multipart(now).await;
+        result.expired_multipart_aborted += expired_aborted;
+        result.abandoned_files_deleted += files_deleted_by_step2;
 
         result.retention_expired_deleted += self.sweep_retention_expiry(now).await;
 
@@ -358,22 +361,21 @@ impl CleanupEngine {
         Some(file)
     }
 
-    /// Whether `file_id` has a not-yet-expired multipart session that blocks orphan-file
-    /// deletion.
+    /// Whether `file_id` has an active (`in_progress` or `completing`) multipart session that blocks
+    /// orphan-file deletion.
     ///
     /// Step 1 keys only on a pending version's age, so a live session can have its backing
     /// version reclaimed in the same pass. Deleting the file then would cascade
-    /// (`ON DELETE CASCADE`) to the `in_progress` `multipart_uploads` row and silently destroy
-    /// the upload. Blocking leaves the file for a later pass, after the session is
-    /// aborted or completed. A lookup failure counts as blocking (errs toward not deleting).
+    /// (`ON DELETE CASCADE`) to the session row and destroy the upload. A lookup failure counts as
+    /// blocking (errs toward not deleting).
     async fn has_blocking_multipart_session(&self, file_id: Uuid) -> bool {
-        match self.store.has_in_progress_multipart_for_file(file_id).await {
+        match self.store.has_active_multipart_for_file(file_id).await {
             Ok(blocking) => blocking,
             Err(e) => {
                 tracing::warn!(
                     error = ?e,
                     %file_id,
-                    "cleanup: failed to check in-progress multipart sessions while \
+                    "cleanup: failed to check active multipart sessions while \
                      checking for orphaned file"
                 );
                 true
@@ -381,8 +383,9 @@ impl CleanupEngine {
         }
     }
 
-    /// Abort in-progress multipart sessions whose `expires_at` has passed.
-    async fn sweep_expired_multipart(&self, now: OffsetDateTime) -> usize {
+    /// Abort in-progress (or lease-lapsed `completing`) sessions past `expires_at`. Returns
+    /// `(sessions_aborted, orphan_files_reclaimed)`.
+    async fn sweep_expired_multipart(&self, now: OffsetDateTime) -> (usize, usize) {
         let sessions = match self.store.list_expired_multipart_uploads(now).await {
             Ok(s) => s,
             Err(e) => {
@@ -390,24 +393,30 @@ impl CleanupEngine {
                     error = ?e,
                     "cleanup: failed to list expired multipart uploads"
                 );
-                return 0;
+                return (0, 0);
             }
         };
 
-        let mut count = 0_usize;
+        let mut aborted_count = 0_usize;
+        let mut files_count = 0_usize;
         for session in sessions {
-            count += self.abort_expired_multipart_session(session).await;
+            let (aborted, files) = self.abort_expired_multipart_session(session).await;
+            aborted_count += aborted;
+            files_count += files;
         }
-        count
+        (aborted_count, files_count)
     }
 
-    /// Abort one expired multipart session: win the `in_progress -> aborted` CAS *first*, and
-    /// only then clean up the backend handle and pending version.
+    /// Abort one expired session: win the `-> aborted` CAS *first*, only then clean up the backend
+    /// handle and pending version. Returns `(sessions_aborted, orphan_files_reclaimed)`, each 0 or 1.
     ///
     /// A concurrent `complete_multipart_upload` races on the same session-row CAS and only
     /// one wins. If the sweep loses (`Ok(false)`), the version may already be bound by the
     /// complete and must be left untouched.
-    async fn abort_expired_multipart_session(&self, session: MultipartUploadSession) -> usize {
+    async fn abort_expired_multipart_session(
+        &self,
+        session: MultipartUploadSession,
+    ) -> (usize, usize) {
         let audit_tenant_id = self
             .store
             .get_file(session.file_id)
@@ -435,8 +444,8 @@ impl CleanupEngine {
         {
             Ok(true) => {
                 // Won the CAS: no concurrent complete can bind this version now.
-                self.cleanup_expired_session_version(&session).await;
-                1
+                let files_reclaimed = self.cleanup_expired_session_version(&session).await;
+                (1, files_reclaimed)
             }
             Ok(false) => {
                 // A concurrent complete/abort won; after a complete the version is bound.
@@ -445,33 +454,41 @@ impl CleanupEngine {
                     "cleanup: skipping version cleanup, session no longer in_progress \
                      (concurrent complete/abort won the race)"
                 );
-                0
+                (0, 0)
             }
             Err(e) => {
                 tracing::warn!(error = ?e, upload_id = %session.upload_id,
                     "cleanup: failed to mark expired multipart upload as aborted");
-                0
+                (0, 0)
             }
         }
     }
 
     /// Abort the backend upload and delete the pending version row of an expired session; both
-    /// best-effort.
+    /// best-effort. Then check whether the parent file is now a permanent zero-version orphan
+    /// (FS-05). Returns `1` if the orphan file was also reclaimed.
+    ///
+    /// The version row may already be gone, but the backend abort must still run or an S3 multipart
+    /// upload leaks: it uses the session's stored `backend_id`/`backend_path`.
     ///
     /// `pub` only so a unit test can drive the narrow interleaving window deterministically;
     /// otherwise called only after `abort_expired_multipart_session` has won the session CAS.
-    pub async fn cleanup_expired_session_version(&self, session: &MultipartUploadSession) {
-        let Ok(Some(ver)) = self
+    pub async fn cleanup_expired_session_version(&self, session: &MultipartUploadSession) -> usize {
+        let ver = self
             .store
             .get_version(session.file_id, session.version_id)
             .await
-        else {
-            return;
-        };
+            .ok()
+            .flatten();
 
+        // Version row first, then the session's stored pair.
+        let (backend_id, backend_path) = ver.as_ref().map_or_else(
+            || (session.backend_id.clone(), session.backend_path.clone()),
+            |v| (v.backend_id.clone(), v.backend_path.clone()),
+        );
         self.backend_abort_multipart_best_effort(
-            &ver.backend_id,
-            &ver.backend_path,
+            &backend_id,
+            &backend_path,
             &session.backend_upload_handle,
             session.upload_id,
         )
@@ -504,6 +521,9 @@ impl CleanupEngine {
                 "cleanup: failed to delete pending version for expired multipart"
             );
         }
+
+        // The session is `aborted`, so a zero-version parent that step 1 declined is now reclaimable.
+        self.maybe_delete_orphaned_file(session.file_id).await
     }
 
     /// Tell a backend to abort a multipart upload handle; log and ignore errors.

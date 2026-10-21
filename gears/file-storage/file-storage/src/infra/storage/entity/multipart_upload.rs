@@ -27,6 +27,24 @@ pub struct Model {
     /// Server-chosen part size (bytes); with `declared_size` it reconstitutes the
     /// parts plan without persisting per-part rows.
     pub part_size: i64,
+    /// Whether `complete` binds the finalized version itself; `false` = client binds.
+    #[sea_orm(default_value = false)]
+    pub auto_bind: bool,
+    /// Completion-lease expiry (`completing` only); a later `complete` takes over after it.
+    #[sea_orm(nullable)]
+    pub lease_until: Option<OffsetDateTime>,
+    /// Opaque id of the lease holder (diagnostics + scoped release).
+    #[sea_orm(nullable)]
+    pub lease_owner: Option<String>,
+    /// Persisted `StoredCompleteResult` JSON once `completed`.
+    #[sea_orm(nullable)]
+    pub complete_result: Option<String>,
+    /// Backend the upload targets, set at initiate. Nullable in the schema only.
+    #[sea_orm(nullable)]
+    pub backend_id: Option<String>,
+    /// Backend object path, same provenance as `backend_id`.
+    #[sea_orm(nullable)]
+    pub backend_path: Option<String>,
     pub created_at: OffsetDateTime,
     pub expires_at: OffsetDateTime,
 }

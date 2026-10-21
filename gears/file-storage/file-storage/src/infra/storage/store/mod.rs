@@ -37,6 +37,7 @@ pub use crate::infra::storage::repo::{AuditRow, FileEventRow};
 
 /// An idempotency-key row persisted in the **same** transaction as the file creation,
 /// so a committed `POST /files` always leaves a replay record.
+#[derive(Clone)]
 pub struct IdempotencyInsert {
     pub tenant_id: Uuid,
     pub owner_kind: String,
@@ -199,5 +200,6 @@ pub(super) fn pending_version(
         backend_id: backend_id.to_owned(),
         backend_path: backend_path.to_owned(),
         created_at: now,
+        bound_on_finalize: false,
     }
 }

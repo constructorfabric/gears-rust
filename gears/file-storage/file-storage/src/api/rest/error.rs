@@ -159,7 +159,7 @@ impl From<DomainError> for CanonicalError {
                 .create()
             }
             // Delegates to `toolkit_odata`'s own `Error -> CanonicalError` mapping.
-            DomainError::Cursor(err) => CanonicalError::from(err.clone()),
+            DomainError::Pagination(err) => CanonicalError::from(err.clone()),
         }
     }
 }

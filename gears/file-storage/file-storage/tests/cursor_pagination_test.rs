@@ -313,7 +313,7 @@ async fn files_cursor_rejects_a_different_owner() {
         .await
         .expect_err("a cursor issued for a different owner must be rejected");
     assert!(
-        matches!(err, DomainError::Cursor(_)),
+        matches!(err, DomainError::Pagination(_)),
         "expected a cursor error, got {err:?}"
     );
 }
@@ -372,7 +372,7 @@ async fn files_backward_cursor_rejects_a_different_owner() {
         .await
         .expect_err("a backward cursor issued for a different owner must be rejected");
     assert!(
-        matches!(err, DomainError::Cursor(_)),
+        matches!(err, DomainError::Pagination(_)),
         "expected a cursor error, got {err:?}"
     );
 }
@@ -402,7 +402,7 @@ async fn build_files_harness() -> (Arc<FileService>, SecurityContext, Uuid) {
     ));
     let tenant = Uuid::now_v7();
     let owner = Uuid::now_v7();
-    svc.create_file(&ctx(tenant, owner), new_file(owner), None)
+    svc.create_file(&ctx(tenant, owner), new_file(owner), None, false)
         .await
         .expect("seed one file");
     (svc, ctx(tenant, owner), owner)
@@ -482,6 +482,7 @@ fn new_version(file_id: Uuid, version_id: Uuid, created_at: OffsetDateTime) -> F
         backend_id: "mem".to_owned(),
         backend_path: format!("/{file_id}/{version_id}"),
         created_at,
+        bound_on_finalize: false,
     }
 }
 
@@ -653,7 +654,7 @@ async fn versions_cursor_rejects_a_different_file() {
         .await
         .expect_err("a cursor issued for a different file must be rejected");
     assert!(
-        matches!(err, DomainError::Cursor(_)),
+        matches!(err, DomainError::Pagination(_)),
         "expected a cursor error, got {err:?}"
     );
 }
@@ -702,7 +703,7 @@ async fn versions_backward_cursor_rejects_a_different_file() {
         .await
         .expect_err("a backward cursor issued for a different file must be rejected");
     assert!(
-        matches!(err, DomainError::Cursor(_)),
+        matches!(err, DomainError::Pagination(_)),
         "expected a cursor error, got {err:?}"
     );
 }
@@ -944,7 +945,7 @@ async fn retention_rules_cursor_with_wrong_order_field_is_rejected() {
         .list_retention_rules(&ctx(tenant, subject), Some(2), Some(cur(&bogus)))
         .await
         .expect_err("a cursor built for a different listing's order must be rejected");
-    assert!(matches!(err, DomainError::Cursor(_)));
+    assert!(matches!(err, DomainError::Pagination(_)));
 }
 
 /// Same as above for a backward cursor.
@@ -963,7 +964,7 @@ async fn retention_rules_backward_cursor_with_wrong_order_field_is_rejected() {
         .list_retention_rules(&ctx(tenant, subject), Some(2), Some(cur(&bogus)))
         .await
         .expect_err("a backward cursor built for a different listing's order must be rejected");
-    assert!(matches!(err, DomainError::Cursor(_)));
+    assert!(matches!(err, DomainError::Pagination(_)));
 }
 
 // --- REST query-string contract: `$top`/`$skiptoken` synonyms and rejected options ---
@@ -1025,7 +1026,7 @@ async fn files_top_is_a_synonym_of_limit() {
 #[tokio::test]
 async fn files_skiptoken_is_a_synonym_of_cursor() {
     let (svc, subject, owner) = build_files_harness().await;
-    svc.create_file(&subject, new_file(owner), None)
+    svc.create_file(&subject, new_file(owner), None, false)
         .await
         .expect("seed a second file");
     let router = files_router(subject, svc);
@@ -1252,7 +1253,7 @@ async fn build_storages_harness() -> (Router, Uuid) {
     let tenant = Uuid::now_v7();
     let owner = Uuid::now_v7();
     for _ in 0..2 {
-        svc.create_file(&ctx(tenant, owner), new_file(owner), None)
+        svc.create_file(&ctx(tenant, owner), new_file(owner), None, false)
             .await
             .expect("seed file");
     }

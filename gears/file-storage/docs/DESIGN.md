@@ -56,10 +56,9 @@ token-authenticated HTTP callback — within a trusted network boundary, or over
 encryption when it crosses an untrusted network — the sidecar makes after a successful `PUT` — the same signed
 `fs-token` is its sole authorization, with no separate app-token or on-behalf-of delegation — flipping the version
 `pending → available`). In the default `bind: "auto"` flow of `POST /files` that same finalize also binds the new
-file's first content inline, so the write is two client requests (`POST /files` + `PUT`). With `bind: "manual"` —
+file's first content inline, so the client writes with just `POST /files` + `PUT`. With `bind: "manual"` —
 and for `POST /files/{id}/versions` uploads, which never auto-bind — a `bind` (control — a separate, later request
-the client issues to swap the file's `content_id` pointer under `If-Match`) follows, for three control-plane touches
-and one data-plane touch. See §3.2 (`bind-service`, `sidecar-gateway`) for the finalize contract and §3.6 for the
+the client issues to swap the file's `content_id` pointer under `If-Match`) follows. See §3.2 (`bind-service`, `sidecar-gateway`) for the finalize contract and §3.6 for the
 sequence diagram.
 
 The P1 architecture is deliberately narrow:
@@ -139,7 +138,7 @@ See [PRD.md](./PRD.md) §1 "Overview" and §1.3 "Goals":
 | `cpt-cf-file-storage-fr-signed-urls`                   | Control plane mints an Ed25519-signed compact token (PASETO `v4.public`-equivalent codec, sole issuer); sidecar verifies with the public key; AND-combined claims (`op`, `file_id`, `version_id`, `backend_id`, `backend_path`, `exp`, upload size/hash) carried in the query (`?fs-token=`) or a header — `ip`/token-claim predicates are a documented, not-yet-implemented extension point — see §4.5 |
 | `cpt-cf-file-storage-fr-file-versioning`               | `file_versions` table (P1); each version a distinct immutable object `/{file_id}/{version_id}`; current = `content_id` pointer; restore = re-bind a prior `version_id`; backend-agnostic |
 | `cpt-cf-file-storage-fr-multipart-upload`              | P2 resumable multipart upload, owned by the `multipart-coordinator` component: `POST .../multipart` computes a server-authoritative parts plan (one signed sidecar URL per part); the sidecar streams each part without buffering; `complete` assembles and hashes the parts (offset-manifest composite, ADR-0006) and finalizes the version; `abort`/`introspect` round out the session lifecycle |
-| `cpt-cf-file-storage-fr-auto-bind`                     | `bind: "auto"` (default) has the control plane's finalize handler (the sidecar's callback) bind the first content itself under a `content_id IS NULL` CAS, in the same transaction as the `pending → available` flip — the dominant single-file upload is 2 requests (`POST /files` + `PUT`); `bind: "manual"` keeps the separate, client-issued `bind` request |
+| `cpt-cf-file-storage-fr-auto-bind`                     | `bind: "auto"` (default) has the control plane's finalize handler (the sidecar's callback) bind the first content itself under a `content_id IS NULL` CAS, in the same transaction as the `pending → available` flip — a single-file upload is `POST /files` + `PUT` with no separate `bind`; `bind: "manual"` keeps the separate, client-issued `bind` request |
 | `cpt-cf-file-storage-fr-multipart-complete-lease`      | `complete_multipart_upload` is idempotent and returns `202 {state: "completing", retry_after_secs}` while another caller holds the completion lease, instead of a second concurrent assembly running; a retry (including after a page reload) replays the persisted result |
 | `cpt-cf-file-storage-fr-sidecar-callbacks`             | The sidecar's `finalize`/`report-part` callbacks are token-authenticated HTTP `POST`s back to the control plane's `bind-service`, within a trusted network boundary or over TLS/equivalent authenticated encryption when crossing an untrusted network — no FS SDK call, no app-token, no on-behalf-of delegation; the previously-verified signed token is the callback's sole authorization |
 | `cpt-cf-file-storage-fr-callback-internal-token`       | A mandatory interim gear-local shared-secret second factor (`x-fs-internal-token`, `FinalizeAuth`) layered on top of the signed upload token for the finalize/report-part callbacks; a stop-gap until the platform's `internal_auth` profiles are deployable in this gear |
@@ -730,9 +729,11 @@ and `meta_version`. (The pointer-swap CAS itself is driven by `bind-service`; th
   return `{items, page_info: {next_cursor, prev_cursor, limit}}` (`toolkit_odata::Page<T>`), never a bare JSON array —
   `prev_cursor` is `null` only on the first page of a walk (no cursor supplied) or once a backward walk has reached
   its end; a backward page (`cursor` set to a previous `prev_cursor`) is still returned in the same canonical
-  order, never reversed. Page parameters are parsed by the `toolkit::api::odata::OData` extractor, the platform's
-  single point for them: it rejects `$skip` and every other unsupported `$` parameter, and the gear additionally
-  rejects `$filter`/`$orderby`/`$select` (not implemented) and any plain key a listing does not take. List a
+  order, never reversed. The four listings share one extractor
+  that examines the query keys, so the response never depends on their values: it rejects `$filter`/`$orderby`/`$select` (not
+  implemented) at any value, every other unsupported `$` option, any plain key a listing does not take, and a repeated
+  plain key, all violations in one response. Only then does it hand the parsing of `limit`/`$top` and
+  `cursor`/`$skiptoken` to `toolkit::api::odata::extract_odata_query`. List a
   file's versions ordered by `created_at DESC, version_id DESC` (same tie-breaker reasoning), same keyset model
 - Reject PRD-defined constraints at this layer when they are not enforceable as DB constraints (e.g., GTS format
   validation regex, tenant policy delta in P2)
@@ -977,8 +978,9 @@ Concrete request/response shapes (envelope fields, error codes, idempotency) are
 
 - [x] `p1` - **ID**: `cpt-cf-file-storage-interface-api-contracts`
 
-The full HTTP surface — endpoint list, multipart envelope shape, conditional headers, Range semantics, response header
-schema, status codes — is documented in **[api.md](./api.md)**. The summary:
+The control-plane endpoint list and request/response schemas are in the generated OpenAPI (`docs/api/api.json`);
+conditional headers, Range semantics, response header schema, status codes and the sidecar protocol are documented in
+**[api.md](./api.md)**. The summary:
 
 - **Technology**: control-plane REST (axum + OperationBuilder for JSON), no GraphQL, no gRPC; the sidecar serves a
   signed-URL HTTP content surface. Versioned per `cpt-cf-file-storage-interface-rest-api`
@@ -1069,8 +1071,7 @@ schema, status codes — is documented in **[api.md](./api.md)**. The summary:
 **Actors**: `cpt-cf-file-storage-actor-platform-user`, `cpt-cf-file-storage-actor-cf-gears`
 
 The staged (`bind: "manual"`) write path is **presign (control) → `PUT` (data) → finalize (data→control callback) →
-`bind` (control)** — three control-plane touches and one data-plane touch. `finalize` and `bind` are two distinct
-steps: `finalize` flips a version `pending → available`
+`bind` (control)**. `finalize` and `bind` are distinct steps: `finalize` flips a version `pending → available`
 and is called by the **sidecar**, authorized solely by the same signed upload token (`fs-token`) — no FS SDK call, no
 app-token, no on-behalf-of delegation. For `bind: "manual"`, `bind` swaps the file's `content_id` pointer under
 `If-Match` and is called by the client, as a separate request after a successful upload. The sidecar itself never
@@ -1080,7 +1081,7 @@ control plane's finalize handler performs the pointer swap inline instead of wai
 **Auto-bind on finalize for a NEW file's first content.** `POST /files` defaults to
 `bind: "auto"`, which bakes a `bind_on_finalize` claim into the upload token: the finalize callback then also swaps
 `content_id` — in the same transaction as the `pending → available` flip, under a strict `content_id IS NULL` CAS —
-making the dominant single-file upload exactly **2 requests** (`POST /files` + `PUT`). The `PUT` response reports the
+so a single-file upload is just `POST /files` + `PUT`, with no separate `bind`. The `PUT` response reports the
 outcome via fixed headers the sidecar forwards transparently from the finalize response: `X-FS-Bound: true` +
 `ETag: <new>` on a won CAS, `X-FS-Bound: conflict` + `X-FS-Current-ETag: <current>` on a lost one (e.g. two
 create-tokens minted for one new file — the client resolves with a manual `bind`, no re-upload). This is a
@@ -1395,14 +1396,14 @@ The file row holds **no bytes and no per-content fields** (mime, size, hash, bac
 - `(tenant_id, owner_kind, owner_id, created_at DESC, file_id DESC)` — covers `GET /files` listing
   (sorted `ORDER BY created_at DESC, file_id DESC`; the `file_id` tie-breaker keeps two
   keyset-paginated pages from skipping or repeating a row when they share a `created_at` instant).
-  `files_owner_listing_v2_idx`, shipped in `m20260924_000001_upload_flow_redesign`,
+  `files_owner_listing_v2_idx`, shipped in `m20261008_000001_listing_indexes`,
   superseding the released `files_owner_listing_idx (tenant_id, owner_kind, owner_id, created_at DESC)`
   (`m20260624_000001_p1_initial`), dropped in the same migration
 - `(tenant_id, gts_file_type)` — supports per-type queries
 - partial index on `(created_at, file_id) WHERE content_id IS NULL` — supports the cleanup engine's
   versionless-orphan-file sweep (a `POST /files` multipart create that crashed between the bare file insert and the
-  pending-version insert; `files_versionless_sweep_idx`, see `docs/operations.md`'s
-  cleanup-sweep section)
+  pending-version insert; `files_versionless_sweep_idx`, which comes with a later migration together with the cleanup
+  job that uses it)
 
 #### Table: `file_versions`
 
@@ -1426,7 +1427,7 @@ and is immutable.
 | `backend_id`      | `text`                                | `BackendConfig` that holds the bytes (platform YAML config in P1)            |
 | `backend_path`    | `text`                                | Opaque per-driver path (`/{file_id}/{version_id}` convention)                |
 | `created_at`      | `timestamptz`                         | Version creation time                                                        |
-| `bound_on_finalize` | `boolean`                            | `true` once this version's OWN finalize call has won a `bind_on_finalize` CAS (set in the same transaction as that CAS); replayed by a later idempotent finalize retry instead of re-deriving the bind outcome from a live read of `files.content_id`. Added in `m20260924_000001_upload_flow_redesign` |
+| `bound_on_finalize` | `boolean`                            | `true` once this version's OWN finalize call has won a `bind_on_finalize` CAS (set in the same transaction as that CAS); replayed by a later idempotent finalize retry instead of re-deriving the bind outcome from a live read of `files.content_id`. Added in `m20261014_000001_upload_flow` |
 
 **PK**: `(file_id, version_id)` at the DB level. The SeaORM entity declares `version_id` alone as its primary key
 (globally unique), keeping updates/deletes keyed off a single PK column.
@@ -1437,7 +1438,7 @@ and is immutable.
   pre-registered versions (P2); matches `file_versions_pending_idx` (created in `m20260624_000001_p1_initial`)
 - `(file_id, created_at, version_id)` — covers `GET /files/{id}/versions`'s `file_id = ?` filter plus its
   `created_at DESC` sort (the composite PK alone serves the filter but not the sort, and versions are never
-  pruned in P1/P2, so a long-lived file's version count is unbounded); `file_versions_file_created_idx`, shipped in `m20260924_000001_upload_flow_redesign`
+  pruned in P1/P2, so a long-lived file's version count is unbounded); `file_versions_file_created_idx`, shipped in `m20261008_000001_listing_indexes`
 
 **Constraints**: `backend_id`/`backend_path` immutable per version (a content write makes a **new** version; the P2
 `backend-migrator` may relocate a version's bytes after a verified copy). The ETag is derived from
@@ -1737,7 +1738,7 @@ The NFR table above traces each platform NFR to its design response. Mapped onto
 
 | Vector | Design mechanisms | Observable signals |
 | --- | --- | --- |
-| **Efficiency** | Control/data-plane split (ADR-0003) keeps content off the control plane; streaming without buffering on both upload and download (§4.3); default `bind: "auto"` collapses single-part upload to 2 requests, `N+2` for multipart; in-process SDK trait (`sdk-facade`) avoids a network hop for consuming Gears; storage backends selected by static config, no rebuild (Backend Configuration Source, PRD.md §5.8) | `record_ingress_bytes`, `record_egress_bytes` — bytes actually moved through the sidecar, the proxy for transfer/egress cost |
+| **Efficiency** | Control/data-plane split (ADR-0003) keeps content off the control plane; streaming without buffering on both upload and download (§4.3); default `bind: "auto"` drops the separate `bind` request from an upload; in-process SDK trait (`sdk-facade`) avoids a network hop for consuming Gears; storage backends selected by static config, no rebuild (Backend Configuration Source, PRD.md §5.8) | `record_ingress_bytes`, `record_egress_bytes` — bytes actually moved through the sidecar, the proxy for transfer/egress cost |
 | **Reliability** | Finalize-then-bind: a version is `pending` until the sidecar's token-authenticated finalize verifies the reported size against the stored object and flips it to `available`; multipart `complete` is serialized under a completion lease with idempotent replay; `DELETE` locks the `files` row (`SELECT ... FOR UPDATE`) then re-reads its versions before removing them, closing a concurrent-presign race; transient sidecar/backend faults surface as `503` + `Retry-After` rather than a hard failure; the P2 cleanup engine (not scheduled yet) is meant to reclaim orphans/abandoned sessions past their `expires_at` grace window; signing-key rotation is zero-outage via an accepted set of previous public keys | `record_operation(op, result)` — success/failure per operation, the failed-workflow-rate proxy; `record_backend_error(backend_id, op)`; `record_sweep_result(...)` — cleanup/orphan-reconciliation outcomes |
 | **Performance** | Streaming I/O end to end (no full-file buffering) on both planes; keyset cursor pagination, navigable in either direction (`created_at DESC, file_id DESC`), keeps list latency independent of page depth; covering/partial Postgres indexes back the metadata-latency and cleanup-sweep queries; `Range` translated to backend-native range where the backend supports it | `record_request(route, method, status, latency_ms)` — the per-route latency histogram behind the p95 metadata/transfer NFRs |
 | **Security** | Tenant-scoped authz via `SecureConn`/`SecurityContext.tenant_id` makes a cross-tenant row invisible before it could even be evaluated; `ADMIN_POLICY` scope gates creating/listing files under any owner other than the caller's own; content access is authorized only by a control-plane-minted, sidecar-verified Ed25519-signed token (§4.5); the callback second-factor secret (`x-fs-internal-token`) is held as a non-logged secret and redacted wherever config is dumped | `record_quota_denied(op)`; `403` statuses surfaced through `record_request(..., status, ...)` |
@@ -1756,7 +1757,7 @@ methods: `record_operation`, `record_backend_error`, `record_quota_denied`, `rec
 | Efficiency | TCO to build and operate a feature, Gear, or product | Platform cost model; gear cost drivers bounded by the control/data-plane split, streaming |
 | Efficiency | Lead time for change | One additive migration per change, upgrade and rollback in `operations.md` |
 | Efficiency | Cost per delivered feature | Platform delivery metrics |
-| Efficiency | Infrastructure cost per transaction/workflow | `record_ingress_bytes`, `record_egress_bytes`; fixed number of control-plane calls per upload (2, or N + 2 for multipart) |
+| Efficiency | Infrastructure cost per transaction/workflow | `record_ingress_bytes`, `record_egress_bytes`; a fixed set of control-plane calls per upload, with no separate `bind` |
 | Efficiency | Infrastructure cost per tenant/service | `record_egress_bytes` — observed; storage usage per owner and tenant via the `usage-collector` contract — not observed yet (integration not wired; no deployment configures a usage reporter) |
 | Reliability | MTTR | Stateless control plane and sidecar restart without recovery work; finalize-then-bind leaves no half-applied state to repair |
 | Reliability | MTBF | Platform monitoring |
@@ -1996,8 +1997,8 @@ mediated by the LMS.
    outcome goes back to the sidecar in the callback response.
 7. The sidecar returns `200` to the browser once finalize succeeds, forwarding the bind outcome as response
    headers: `X-FS-Bound: true` + `ETag: <new content ETag>` when the compare-and-set won — the upload is now the
-   file's live content, with no separate `bind` call. Total for the write: two client requests (`POST /files` and
-   the `PUT`); finalize is the sidecar's own callback.
+   file's live content, with no separate `bind` call. The client issues only `POST /files` and the `PUT`; finalize
+   is the sidecar's own callback.
 
 > If the compare-and-set lost — the file already had content when finalize ran, e.g. a concurrent writer bound
 > another version first — the `PUT` still returns `200`, now with `X-FS-Bound: conflict` and
@@ -2009,8 +2010,7 @@ mediated by the LMS.
 `content_id`, and the `PUT` response carries no `X-FS-Bound` header; the LMS backend makes a separate
 `POST /files/{id}/bind { version_id }` request to make the upload the file's live content. `If-Match` may be
 omitted on the first bind of a file that has no content yet, and is required to rebind already-bound content
-(otherwise `400`). Total for the write: three control-plane requests (presign, finalize, bind) and one data-plane
-request (the `PUT`).
+(otherwise `400`).
 
 #### Phase 2 — Display in the browser
 
