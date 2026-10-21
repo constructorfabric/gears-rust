@@ -290,7 +290,10 @@ fn meets_floor(step: &Step, floor: f32) -> bool {
 #[derive(Default)]
 struct Treatment {
     block: BTreeSet<SensitiveDataKind>,
-    redact: BTreeMap<SensitiveDataKind, Vec<Range<usize>>>,
+    /// The ranges of each redacting kind, or `None` once any of its findings
+    /// on the piece named no range: such a kind cannot be redacted, and its
+    /// other findings' ranges must not hide that.
+    redact: BTreeMap<SensitiveDataKind, Option<Vec<Range<usize>>>>,
 }
 
 impl Treatment {
@@ -363,11 +366,17 @@ fn collect(verdicts: &[Verdict]) -> BTreeMap<ValueRef, Treatment> {
                 Action::Block => {
                     treatment.block.insert(verdict.kind);
                 }
-                Action::Redact => treatment
-                    .redact
-                    .entry(verdict.kind)
-                    .or_default()
-                    .extend(found.spans.iter().cloned()),
+                Action::Redact => {
+                    let ranges = treatment
+                        .redact
+                        .entry(verdict.kind)
+                        .or_insert_with(|| Some(Vec::new()));
+                    if found.spans.is_empty() {
+                        *ranges = None;
+                    } else if let Some(ranges) = ranges {
+                        ranges.extend(found.spans.iter().cloned());
+                    }
+                }
             }
         }
     }
@@ -418,10 +427,15 @@ fn redact_piece(piece: PieceMut<'_>, treatment: &Treatment) -> bool {
     let PieceMut::Text(text) = piece else {
         return false;
     };
-    if treatment.redact.values().any(Vec::is_empty) {
+    let Some(spans) = treatment
+        .redact
+        .values()
+        .map(Option::as_deref)
+        .collect::<Option<Vec<&[Range<usize>]>>>()
+    else {
         return false;
-    }
-    let spans: Vec<Range<usize>> = treatment.redact.values().flatten().cloned().collect();
+    };
+    let spans: Vec<Range<usize>> = spans.concat();
     match redact(text, &spans).filter(|kept| !kept.trim().is_empty()) {
         Some(kept) => {
             *text = kept;

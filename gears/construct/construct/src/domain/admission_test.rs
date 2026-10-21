@@ -739,6 +739,57 @@ async fn a_verdict_on_a_piece_the_value_does_not_have_blocks_the_value() {
 }
 
 #[tokio::test]
+async fn one_kind_naming_a_piece_twice_once_without_a_range_blocks_the_value() {
+    let fixture = AdmissionFixture::default();
+    let plan = connector_plan(vec![add_entity(
+        "note",
+        &[
+            ("text", "call +49 30 1234 or mail ada@example.com"),
+            ("other", "kept"),
+        ],
+    )]);
+
+    // Two findings of one kind on one piece: the first has a range, the
+    // second has none, so the second's content cannot be removed.
+    let admitted = admitted(
+        admit(
+            &fixture,
+            plan,
+            &[Verdict {
+                kind: SensitiveDataKind::Contacts,
+                found: vec![
+                    Found {
+                        at: at(0, 0),
+                        spans: spans(&[(5, 16)]),
+                    },
+                    Found {
+                        at: at(0, 0),
+                        spans: Vec::new(),
+                    },
+                ],
+            }],
+        )
+        .await,
+    );
+
+    assert_eq!(
+        admitted.blocked,
+        vec![Enforced {
+            at: at(0, 0),
+            kind: SensitiveDataKind::Contacts
+        }]
+    );
+    assert!(
+        admitted.redacted.is_empty(),
+        "the kind is not reported redacted"
+    );
+    assert_eq!(
+        admitted.plan.steps[0].change.properties(),
+        &[Property::new("other", "kept")]
+    );
+}
+
+#[tokio::test]
 async fn a_redaction_in_a_replace_dropped_whole_is_not_reported() {
     let fixture = AdmissionFixture::default();
     let replace_entity = Step {
