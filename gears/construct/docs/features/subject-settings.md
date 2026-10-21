@@ -36,7 +36,7 @@
 
 ### 1.1 Overview
 
-Subject Settings keeps, per subject, whether personalization is on and whether an erasure of the subject is under way. Record Intake, Admission and the Profile Reader read these two states. A subject without a stored row has the tenant's personalization default, a tenant setting in the settings service. The subject reads and changes its own setting through two routes. This document describes the part of the feature that Story 5.7.1 builds: the table, the read that other features call, the tenant default, and the subject's settings routes.
+Subject Settings keeps, per subject, whether personalization is on and whether an erasure of the subject is under way. Record Intake, Admission and the Profile Reader read these two states. A subject without a stored row has the tenant's personalization default, a tenant setting in the settings service. The subject reads and changes its own setting through two routes. This document describes the first part of the feature: the table, the read that other features call, the tenant default, and the subject's settings routes.
 
 ### 1.2 Purpose
 
@@ -46,12 +46,12 @@ The table has one row per tenant and subject: the tenant id, the subject id, per
 
 The subject reads and changes its personalization setting through `GET` and `PUT /api/construct/v1/subjects/{subject_id}/settings` (the code registers `/construct/v1/...`; the gateway adds the prefix). Owner only: the path names the caller, or the call is refused with 403. A change applies from the next request. It never touches the erasure flag: turning personalization on during an erasure stores the choice, and the erasure keeps everything off until it is done, as the DESIGN says.
 
-**Out of scope** in this part (Story 5.7.1):
+**Out of scope** in this part:
 
-- The settings in the subject's view and in the export, which belong to Subject Control (Story 5.7.8).
+- The settings in the subject's view and in the export, which belong to Subject Control.
 - SDK client methods for settings.
-- Marking and clearing the erasure. Erasure (Story 5.7.9) owns that; the column exists so that it can.
-- Declaring the personalization default in the settings service. Nothing declares Construct's settings there yet (Story 5.11 decides whether the settings service runs in Construct's host). Until it does, the config key `personalization_default` (default on) stands in for the tenant setting.
+- Marking and clearing the erasure. Erasure owns that; the column exists so that it can.
+- Declaring the personalization default in the settings service. Nothing declares Construct's settings there yet, and whether the settings service runs in Construct's host is not decided. Until it does, the config key `personalization_default` (default on) stands in for the tenant setting.
 - Retiring the foundation's placeholder route, client operations and table. Record Intake does that.
 - Refusing records, dropping plans and hiding facts when personalization is off or an erasure is under way. Record Intake, Admission and the Profile Reader do that.
 
