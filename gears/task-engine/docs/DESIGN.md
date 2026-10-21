@@ -53,7 +53,19 @@ The architecture follows a **DDD-Light layered design** (SDK → API/Transport �
 
 All five subsystems are implemented as **domain traits within a single `task-engine` crate**, communicating in-process via trait calls. An **SDK crate** (`task-engine-sdk`) exposes the public API surface (client trait, domain models, error types, GTS type definitions) for integration by other gears.
 
-**ID**: `cpt-cf-task-engine-design-execution-backend` — Per [ADR/0001-pluggable-execution-backends.md](ADR/0001-pluggable-execution-backends.md), delivery of runnable work to workers sits behind a narrow, versioned execution-backend interface (dispatch, cancel, inspect, observations, health, worker transport); every semantic above stays in the core and the task-domain database remains the source of truth. This DESIGN specifies the **native database backend** (guarded-update claim, long-poll, signals — §3.2, §4.6) with possible alternative storages in the future (ClickHouse, Elasticsearch). External adapters (Temporal, Hatchet, Conductor OSS) are not planned for now.
+**ID**: `cpt-cf-task-engine-design-operational-core` — Per [ADR/0001-pluggable-execution-backends.md](ADR/0001-pluggable-execution-backends.md), the Task Engine runs all task execution directly in one operational core and one database. It does not use execution plugins, storage plugins, or an external workflow engine. The core keeps the single source of truth and uses atomic database transactions for admission, claim, leases, and the event outbox.
+
+**One true store (the main relational database):**
+- The main relational database (PostgreSQL, MariaDB/MySQL, or SQLite) holds all task state: status, claiming, leases, wait conditions, concurrency counters, timers, and all task payloads (within the PRD limit of 64 KB per payload).
+- If a database transaction fails, the whole operation fails. No other system can change an execution decision.
+- Cleanup is done by the background Retention Service (§3.2). If data is lost, it is restored from database backups and migrations, never rebuilt from another system.
+
+**Offload heavy work to other gears (not plugins):**
+- A deployment MAY run a separate search gear, analytics gear, or history/archive gear. They receive data from the Task Engine through published lifecycle events (Event Broker, §3.2), not by sharing the Task Engine database.
+- These other gears never hold the true task state and never take part in claim, lease, or concurrency decisions.
+- If any of these gears is slow or down, task creation, claim, heartbeat, retries, waits, and completion still work.
+
+**Scaling:** the Task Engine scales inside its own model — hot-row sharding for counters, shard keys for background loops (§4.6), and task domains to route task types to separate databases (§3.8). It does not scale by adding plugins. In the first release, only the main relational database is required; search, analytics, and history offload to other gears is future work under PRD §4.3.
 
 ### 1.2 Architecture Drivers
 
@@ -75,7 +87,7 @@ All five subsystems are implemented as **domain traits within a single `task-eng
 
 **Architecture Decision Records**:
 
-- `cpt-cf-task-engine-adr-pluggable-execution-backends` — Task Engine core with pluggable execution backends; native database backend by default. See [ADR/0001-pluggable-execution-backends.md](ADR/0001-pluggable-execution-backends.md).
+- `cpt-cf-task-engine-adr-implementation-architecture` — Single operational core in one database; no execution or storage plugins; heavy search, analytics, and history offloaded to other gears via events. See [ADR/0001-pluggable-execution-backends.md](ADR/0001-pluggable-execution-backends.md).
 - `cpt-cf-task-engine-adr-state-machine` — Task state machine design with 10 states, terminal/non-terminal classification, and valid transition matrix. See [ADR/0002-task-state-machine.md](ADR/0002-task-state-machine.md).
 - `cpt-cf-task-engine-adr-timer-architecture` — Persistent timer wheel with database-backed timers and multi-worker processing. See [ADR/0003-timer-architecture.md](ADR/0003-timer-architecture.md).
 - `cpt-cf-task-engine-adr-wait-condition-model` — Wait conditions as fixed domain model elements (not GTS-extensible), with three built-in kinds. See [ADR/0004-wait-condition-model.md](ADR/0004-wait-condition-model.md).
@@ -655,6 +667,7 @@ Key methods:
 - `create_task(ctx, def) → Result<Task>`
 - `complete_task(ctx, id, result) → Result<Task>`
 - `cancel_task(ctx, id, mode) → Result<Task>`
+- `update_tags(ctx, id, set, remove) → Result<Task>`
 - `checkpoint(ctx, id, data) → Result<Task>`
 - `start_task(ctx, id) → Result<Task>`
 
@@ -736,11 +749,13 @@ Maintenance sequence (per domain):
 2. System-cancel: force-cancel non-terminal tasks beyond hard retention *before* their partition is dropped
 3. Expire: `DROP` partitions of `te_tasks`, `te_task_state`, `te_events`, `te_task_entries` whose entire range is older than the **longest** effective retention configured in the domain (global default, any type or tenant policy), so a drop can never remove data that a longer tenant/type policy (e.g. legal hold) still requires; then delete the dropped tasks' `te_dedup` rows (`created_at` older than the same horizon), since `te_dedup` is not partitioned
 4. Per-type / per-tenant policies **shorter** than that horizon are applied by bounded `DELETE` (together with the tasks' `te_dedup` rows)
-5. Slot reconciliation: recompute `te_concurrency_slots.used` from the authoritative `claimed`+`running` count and correct drift (see §3.7)
+5. Capacity reconciliation: read the latest runtime configuration version, update the local concurrency and queue-depth limits for this domain in one transaction, save the applied version number, and retry if this step fails. Then recalculate `te_concurrency_slots.used` from the actual number of tasks in `claimed` and `running` states and fix any drift (see §3.7)
 
 Outbox row pruning is handled by the Event Broker SDK producer / `toolkit_db::outbox` vacuum stage, not the Retention Service. All Retention Service loops run under the advisory-lock leader (§3.8) so only one instance performs maintenance.
 
 On SQLite (dev/test/low-volume) partitioning is unavailable, so retention falls back to batched `DELETE` of terminal tasks, entries, events, and orphaned wait conditions/timers. Each step runs in a loop with configurable batch size and retry logic.
+
+**Priority aging** (PRD §5.2 `fr-priority-aging`): when `priority_aging.enabled`, a singleton maintenance loop (under the `te-maintenance` leader, §3.8) periodically raises the effective `priority` of `queued` tasks whose queued age exceeds `threshold_minutes`, by `boost_amount` per pass, bounded to the highest priority. It writes `te_task_state.priority` in a bounded guarded batch per tick and emits no event; because claim ordering is `(priority, created_at, task_id)` (§4.6), boosted tasks dispatch sooner, preventing starvation. Disabled by default (`enabled: false`).
 
 ##### Event Producer (`event_broker_sdk::DbProducer`)
 
@@ -760,7 +775,13 @@ Event **wait conditions** (§3.2 WaitConditionService, §3.6 Event Wait sequence
 Design:
 - At startup, `event_consumer.rs` builds a `ConsumerBuilder` (`EventBrokerApi` from `ClientHub`) bound to a **stable consumer group** (`gts.cf.core.events.consumer_group.v1~cf.core.tasks.task_engine.v1`) so exactly one instance in the cluster processes each partition and offsets survive restarts. Parallelism is configurable (`event_consumer.slots`).
 - Subscription interest is **narrow**: it subscribes only to the topics/`event_type_patterns` that active event wait conditions reference. The set is derived at startup from distinct `event_type` values in `te_wait_conditions` (kind = event, state = pending) and refreshed when a new event-wait subscribes to a previously unseen `event_type`. `tenant_depth`/`barrier_mode` follow the wait condition's owning tenant.
-- The handler is **transactional** — it implements the SDK `TxConsumerHandler` with the `LocalDbOffsetManager` (`WithTx` mode) so wait-condition resolution and offset commit happen in **one transaction**: match candidates via `ix_te_waits_event_type` on `event_type` **and** `owner_tenant_id` = the event's tenant (an event never satisfies another tenant's wait), evaluate the optional CEL `match_expression` (ADR-0007), set `state_code = satisfied` and `resolved_payload` = the event payload, transition the task (`waiting → queued`, `resume_pending = true`), `producer_outbox.enqueue(WaitConditionSatisfied, TaskResumed)`, commit offset, emit `newTask` signal. This gives exactly-once effect on the engine side even though broker delivery is at-least-once.
+- The consumer handler runs inside one database transaction using the Event Broker SDK `TxConsumerHandler` (`LocalDbOffsetManager`, `WithTx` mode). First, it finds candidate conditions using `event_type` and checks that `owner_tenant_id` equals the event tenant (events from one tenant never match another tenant's wait). Next, it checks subject filters: if `event_subject_id` is set, it must equal the event subject; if `event_subject_type` is set, it must equal the event subject type. If the condition also defines a CEL `match_expression` (ADR-0007), that expression is evaluated. When a condition matches, the engine marks that condition row `satisfied` and saves the event payload into `resolved_payload`.
+
+  `WaitConditionService` then checks whether the task can wake up:
+  - In `any` mode: the first satisfied condition wakes the task. Any sibling conditions still waiting are marked `cancelled`.
+  - In `all` mode: all conditions in the group must be satisfied before the task wakes up.
+
+  If the group is now complete, the transaction moves the task from `waiting` to `queued` (with `resume_pending = true`), saves `WaitConditionSatisfied` and `TaskResumed` into the outbox, commits the consumer offset, and signals `newTask`. If other conditions are still pending (for example in `all` mode), the transaction only saves `WaitConditionSatisfied` and commits the offset; the task stays safely in `waiting`. This keeps event processing exactly-once on the engine side.
 - Handler outcomes drive redelivery: transient failures return `Retry` (SDK backoff); a non-matching event advances the offset (`Success`) without side effects.
 - The consumer runs under `WithLifecycle` with a `CancellationToken`; on shutdown it stops the `ConsumerHandle` (drain in-flight, commit offsets) before DB pools close.
 
@@ -850,6 +871,7 @@ All authenticated endpoints below use `.authenticated()` + `.require_license_fea
 | `POST` | `/tasks/{id}/complete` | Complete with result | `claim` |
 | `POST` | `/tasks/{id}/cancel` | Cancel task | `cancel` |
 | `POST` | `/tasks/{id}/reassign` | Hand a `claimed`/`running` task to another assignee: guarded update issues a fresh `lease_token` and `lease_epoch + 1` (fencing the previous holder) and returns the new lease, which the caller hands to the new assignee; state, `attempt`, slots and deadlines are unchanged | `update` |
+| `PATCH` | `/tasks/{id}/tags` | Add, change, or remove tags on an existing task. Takes `set` (tags to add or replace) and `remove` (tag keys to delete). Fails if the same key appears in both `set` and `remove`. Any key not listed is left unchanged. Returns the updated task | `update` |
 | `POST` | `/tasks/{id}/dependencies` | Add predecessors (cycle and domain re-validation, §4.6) | `update` |
 | `DELETE` | `/tasks/{id}/dependencies/{predecessor_id}` | Remove a predecessor | `update` |
 
@@ -901,7 +923,8 @@ All authenticated endpoints below use `.authenticated()` + `.require_license_fea
 |---|---|---|---|
 | `GET` | `/admin/dlq` | List dead-letter queue tasks | `admin` |
 | `POST` | `/admin/dlq/{id}/reenqueue` | Re-enqueue DLQ task | `admin` |
-| `POST` | `/admin/config` | Update runtime config (emits `configUpdated`). Persisted as versioned rows in `te_runtime_config` (key, value JSON, version) in the default domain's database and overlaid on file config; every node reloads it within `runtime_config_poll_secs`. Changed limits are also written to `te_concurrency_slots` / `te_queue_backlog.limit_value` in the same request, so enforcement changes cluster-wide at once | `admin` |
+| `POST` | `/admin/config` | Save a new runtime configuration version into `te_runtime_config` in the default domain database, and publish `configUpdated` in the same transaction. Returns `202 Accepted` with the version number. Because each task domain has its own database, the limits cannot update everywhere in one transaction. Instead, each domain's background maintenance job reads new versions and updates its local `te_concurrency_slots` and `te_queue_backlog` limits, records the applied version locally, and retries if a step fails | `admin` |
+| `GET` | `/admin/config/{version}` | Check if a config version has been applied across all domains, showing which domains are updated and which are still pending | `admin` |
 
 **DLQ inspection task-domain scope** (PRD §5.8/§5.19): `GET /admin/dlq` is a read/inspection path. Without a task-type/domain filter it **fans out across all task domains** and merges results (same cross-domain fan-out as untyped listing, §4.6); with a type/domain filter it is scoped to that one domain. `configUpdated` (from `/admin/config`) is written to the local event log/outbox like other events.
 
@@ -963,7 +986,7 @@ Mapping of Task-Engine failure conditions to canonical categories (`gts.cf.core.
 | GTS registry unreachable and the type is not cached | `service_unavailable` | 503 |
 | Cross-domain claim / parent-child / dependency; dependency cycle | `invalid_argument` | 400 |
 | Claim assigned nothing and ≥ 1 eligible task was skipped because a concurrency dimension was at capacity (`context.reason = "CONCURRENCY_LIMIT"`, `Retry-After`) | `resource_exhausted` | 429 |
-| Queue depth limit reached on creation / move / re-enqueue (dimension `queue`, `tenant`, `engine`, or `deferred`; no usage figures disclosed) | `resource_exhausted` (`context.reason = "QUEUE_DEPTH_LIMIT"`, `Retry-After`) | 429 |
+| Queue depth limit reached on creation / move / re-enqueue (dimension `queue`, `tenant`, `domain_global`, or `deferred`; no usage figures disclosed) | `resource_exhausted` (`context.reason = "QUEUE_DEPTH_LIMIT"`, `Retry-After`) | 429 |
 | `cancellable=false` on a supersede type; `authz_scope` requested but `AccessScope` not canonicalizable → `internal` | `invalid_argument` | 400 |
 | Dedup hit but existing task not readable by caller | `permission_denied` (no task identifier) | 403 |
 | Supersede submission with a lower order value than the group's latest | `failed_precondition` (`context.reason = "STALE_ORDER"`) | 400 |
@@ -1274,7 +1297,7 @@ Queue-depth counters (PRD §5.2 Queue Depth Limits). Same mechanism as `te_concu
 
 **Admission** reserves each applicable dimension, in the lock order of `te_concurrency_slots` → Lock ordering (backlog rows are always locked last), with `UPDATE … SET used = used + 1 WHERE … AND (limit_value = 0 OR used < limit_value)` in the create transaction; any `rows_affected == 0` aborts the transaction (rolling back the other dimensions and the insert). **Re-entry** (retry, lease requeue, wait resume) increments unconditionally; **exit** decrements. Because every counter change shares a transaction with the state change, drift can only come from bugs or manual edits and is corrected by the same periodic reconciliation job as concurrency slots (recount of `queued` / deferred tasks per scope; warning metric on non-trivial drift).
 
-**Task-domain scope**: the table lives in each task domain's database (§3.8) and counts only that domain's tasks, so every limit is enforced **per domain** (PRD §5.2 Queue Depth Limits). Because domain routing can be by type pattern, one queue's tasks may land in several domains and its limit then applies independently in each (the same property `te_concurrency_slots` already has). At startup the engine compares configured queue patterns against the domain patterns and logs a warning (and sets a `te_queue_multi_domain` gauge) when a queue can resolve to more than one domain; type-pattern splits cannot be proven statically and remain an operator responsibility.
+**Task-domain scope**: each task domain stores its own counters in its own database (§3.8), and every limit is enforced per domain (PRD §5.2). During startup, `domain_router` checks queue routing and task-type routing rules together. If a queue could route to multiple domains, or if its task types would split across domains, startup stops with an error naming the bad queue, task types, and domains. This guarantees each queue lives in one domain only, with one clear set of queue-depth and concurrency counters.
 
 #### `te_dedup`
 
@@ -1653,7 +1676,7 @@ gears:
 | `te_claim_duration_seconds` | Histogram | — | Claim latency (excl. long-poll wait) |
 | `te_queue_depth` | Gauge | `queue` | Queued tasks per queue |
 | `te_queue_executing` | Gauge | `queue` | Running tasks per queue |
-| `te_queue_depth_rejections_total` | Counter | `queue`, `dimension` | Admissions refused with `QUEUE_DEPTH_LIMIT` (`dimension` = `queue`/`tenant`/`engine`/`deferred`; no tenant label — bounded cardinality) |
+| `te_queue_depth_rejections_total` | Counter | `queue`, `dimension` | Admissions refused with `QUEUE_DEPTH_LIMIT` (`dimension` = `queue`/`tenant`/`domain_global`/`deferred`; no tenant label — bounded cardinality) |
 | `te_queue_depth_limit` | Gauge | `queue` | Effective per-queue `queue_max_queue_depth` (alerting on `te_queue_depth / te_queue_depth_limit`) |
 | `te_dedup_hits_total` | Counter | `type` | Creations answered by an existing derived identity |
 | `te_tasks_superseded_total` | Counter | `type`, `mode` | Tasks cancelled by supersession |
@@ -2089,24 +2112,23 @@ Read path:
 Consistent with PRD §4.2:
 
 - **Workflow orchestration** (DAG engine, conditional branching, saga patterns)
-- **UI or dashboard**
 - **Message broker replacement**
 - **File/blob storage** for task artifacts
-- **Approval wait condition** (not planned; approval gates compose with `approval-service` via an event wait condition on its approval status-changed event — PRD §4.2)
 - **Custom payload search** (searching within task-type-specific JSON payloads)
-- **Per-tenant database sharding** (horizontal partitioning by tenant)
-- **Cross-tenant administrative queries**
 - **Slow-query tracing** (platform-wide concern)
 
 ### 4.8 Future Developments
 
 - **Recurring / cron tasks** (p2): Cron-like schedules with overlap policies (skip, enqueue, cancel-previous)
+- **History / archiving plugin** (out of scope for now): an optional plugin that offloads **only completed (terminal) tasks** to a long-term history/archive store and serves them back transparently through the existing task read APIs. Not part of the current release; adding it would require an ADR update (ADR-0001)
+- **Approval wait condition**
 - **Cluster-backed signal propagation**: optional push-based latency optimization on top of the queue watcher (§3.2 Signal System) via Cluster gear pub/sub; would extend the Cluster usage scoped in PRD §1.4, so it requires a PRD change
+- **Per-tenant database sharding** (horizontal partitioning by tenant)
+- **Cross-tenant administrative queries**
 - **SSE event streaming**: Real-time task lifecycle events via Server-Sent Events
 - **Custom payload indexing**: Searchable fields within task-type-specific JSON payloads via GTS-driven index declarations
 - **Sticky assignment**: Preferring the same worker for retried tasks
 - **Cluster-wide global rate limit** (PRD §5.21): a single cross-node RPS cap; needs a shared distributed counter, so deferred
-- **Priority aging**: Automatic priority boosting for starved tasks (p3, infrastructure in place)
 - **gRPC worker client** - a streaming worker transport added alongside the REST long-poll claim (§4.6 Task Assignment), which stays the baseline.
 
 ## 5. Traceability
@@ -2121,7 +2143,7 @@ Consistent with PRD §4.2:
 | `cpt-cf-task-engine-fr-derived-dedup` | §3.2 TaskService; §3.7 `te_dedup`; §4.1 `dedup`; §4.5 Derived dedup / supersession security; §4.6 Task Creation Admission |
 | `cpt-cf-task-engine-fr-task-supersede` | §3.1 State Machine (supersession row); §3.7 `te_supersede_heads`; §4.5; §4.6 Task Creation Admission |
 | `cpt-cf-task-engine-fr-task-cancel` | §3.1 State Machine (cancel transitions); §3.2 TaskService |
-| `cpt-cf-task-engine-fr-tags` | §3.1 Tag entity; §3.7 `te_tags` table |
+| `cpt-cf-task-engine-fr-tags` | §3.1 Tag entity; §3.2 TaskService (`update_tags`); §3.3 tag mutation endpoint; §3.7 `te_tags` table |
 | `cpt-cf-task-engine-fr-resource-refs` | §3.1 ResourceRef entity; §3.3 Search Parameters (`resource_refs` filter); §3.7 `te_resource_refs`; §3.2 Event Producer (payload); §4.1 `max_resource_refs_per_task` |
 | `cpt-cf-task-engine-fr-task-checkpoint` | §3.2 TaskService (checkpoint); §3.6 Interactions |
 | `cpt-cf-task-engine-fr-priority-dispatch` | §3.2 QueueService; §4.6 Task Assignment algorithm |
@@ -2133,7 +2155,7 @@ Consistent with PRD §4.2:
 | `cpt-cf-task-engine-fr-queue-introspection` | §3.2 QueueService; §3.3 Queue Endpoints |
 | `cpt-cf-task-engine-fr-delayed-enqueue` | §3.1 State Machine (scheduled state); §3.2 TimerService |
 | `cpt-cf-task-engine-fr-timeouts` | §3.1 State Transition Table; §3.2 TimerService; ADR-0003 |
-| `cpt-cf-task-engine-fr-priority-aging` | §4.1 Configuration (priority_aging); §4.8 Future |
+| `cpt-cf-task-engine-fr-priority-aging` | §3.2 RetentionService (Priority aging); §4.1 Configuration (priority_aging) |
 | `cpt-cf-task-engine-fr-wait-conditions` | §3.1 WaitCondition entity; §3.2 WaitConditionService; ADR-0004 |
 | `cpt-cf-task-engine-fr-wait-timer` | §3.1 TimerWait; §3.2 WaitConditionService |
 | `cpt-cf-task-engine-fr-wait-event` | §3.1 EventWait; §3.2 WaitConditionService; §3.6 Event Wait sequence |
@@ -2191,7 +2213,7 @@ Consistent with PRD §4.2:
 
 ### 5.2 ADRs
 
-- [ADR/0001-pluggable-execution-backends.md](ADR/0001-pluggable-execution-backends.md) — `cpt-cf-task-engine-adr-pluggable-execution-backends`. Core semantics separated from a narrow execution-backend interface.
+- [ADR/0001-pluggable-execution-backends.md](ADR/0001-pluggable-execution-backends.md) — `cpt-cf-task-engine-adr-implementation-architecture`. Single operational core in one database; no execution or storage plugins; heavy search, analytics, and history offloaded to other gears via events (§1.1).
 - [ADR/0002-task-state-machine.md](ADR/0002-task-state-machine.md) — `cpt-cf-task-engine-adr-state-machine`. 10-state task lifecycle with terminal/non-terminal classification and explicit transition matrix.
 - [ADR/0003-timer-architecture.md](ADR/0003-timer-architecture.md) — `cpt-cf-task-engine-adr-timer-architecture`. Persistent timer wheel with database-backed timers and multi-worker processing.
 - [ADR/0004-wait-condition-model.md](ADR/0004-wait-condition-model.md) — `cpt-cf-task-engine-adr-wait-condition-model`. Wait conditions as fixed domain model elements with three built-in kinds.

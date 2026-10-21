@@ -1,11 +1,10 @@
 ---
 status: accepted
 date: 2026-10-07
-description: "Choose native Task Engine execution with modular, integrated storage infrastructure."
+description: "Build the Task Engine as one simple operational core in its own database. Send search, analytics, and history to other gears."
 ---
 
-# Implement Task Engine as a Modular Gear with Integrated Storage Infrastructure
-
+# Build the Task Engine as a Single Operational Core
 
 <!-- toc -->
 
@@ -16,70 +15,67 @@ description: "Choose native Task Engine execution with modular, integrated stora
   - [Consequences](#consequences)
   - [Confirmation](#confirmation)
 - [Pros and Cons of the Options](#pros-and-cons-of-the-options)
-  - [Reuse an Existing Execution Service Behind a Thin Task Engine Wrapper](#reuse-an-existing-execution-service-behind-a-thin-task-engine-wrapper)
-  - [Implement Task Engine as a Fixed DB-only Monolithic Gear](#implement-task-engine-as-a-fixed-db-only-monolithic-gear)
-  - [Implement Task Engine Core with Pluggable Execution Backends](#implement-task-engine-core-with-pluggable-execution-backends)
-  - [Modular Gear with Integrated Storage Infrastructure](#modular-gear-with-integrated-storage-infrastructure)
+  - [Option 1: Wrap an Existing Engine](#option-1-wrap-an-existing-engine)
+  - [Option 2: Single Core with Infrastructure Adapters](#option-2-single-core-with-infrastructure-adapters)
+  - [Option 3: Tiny Gateway with Pluggable Execution Backends](#option-3-tiny-gateway-with-pluggable-execution-backends)
+  - [Option 4: Single Operational Core Without Plugins](#option-4-single-operational-core-without-plugins)
 - [More Information](#more-information)
 - [Traceability](#traceability)
 
 <!-- /toc -->
 
 **ID**: `cpt-cf-task-engine-adr-implementation-architecture`
+
 ## Context and Problem Statement
 
-The Task Engine requires durable distributed task execution together with Gears-specific semantics including GTS typing, multi-tenant authorization, queue admission, concurrency control, leases and fencing, durable waits, retries, dependencies, deduplication, supersession, progress, search, retention, and task-domain routing.
+The Task Engine must run distributed tasks in a safe way. It must also provide many Gears capabilities: GTS typing, multi-tenant authorization, queue admission, concurrency limits, leases and fencing, durable waits, retries, dependencies, deduplication, supersession, progress, search, retention, and task-domain routing.
 
-The architectural decision is whether to delegate execution to an existing task/workflow service, implement everything as one fixed monolithic gear, introduce pluggable execution backends, or keep execution native while allowing the gear itself to integrate different storage technologies through narrow infrastructure abstractions.
+We must decide where task execution lives. There are four choices:
+
+1. Use an existing task engine and wrap it.
+2. Build one core and add storage adapters for different databases.
+3. Build a tiny gateway and let each deployment plug in its own execution backend.
+4. Build one simple core in our own database and send extra jobs (search, analytics, history) to other gears.
 
 ## Decision Drivers
 
-* Preserve the Task Engine PRD semantics without adapting them to the execution model of a third-party workflow or task engine.
-* Maintain one authoritative representation of task execution state.
-* Preserve atomic transactions for task admission, concurrency reservation, assignment, leases, dependencies, deduplication, supersession, timers, and event outbox writes where required.
-* Keep the default deployment lightweight and avoid requiring a separate execution cluster.
-* Support PostgreSQL, MariaDB/MySQL, and SQLite through the existing ToolKit database abstraction where their capabilities satisfy Task Engine requirements.
-* Support the reference capacity profile, including up to 500 million retained tasks and 100,000 active tasks.
-* Allow large payloads, historical task data, analytics data, and search indexes to be moved out of the operational database.
-* Allow to scale the volume being processed with ClickHouse, Elasticsearch/OpenSearch, object storage, distributed cache, or future infrastructure technologies without changing Task Engine domain semantics.
-* Avoid runtime plugin infrastructure where normal compile-time Rust modules and dependency injection are sufficient.
-* Allow storage layout and infrastructure topology to evolve independently from the public Task Engine API.
-* Minimize runtime dependencies, network hops, reconciliation logic, and failure modes on the execution hot path.
+* Keep one source of truth for task state.
+* Keep task admission, claim, leases, and the event outbox in one atomic transaction.
+* Keep the default deployment small. Do not require an extra server to run tasks.
+* Support PostgreSQL, MariaDB/MySQL, and SQLite through the ToolKit database layer.
+* Support the target size: up to 500 million stored tasks and 100,000 active tasks.
+* Keep the design as simple as possible for now.
 
 ## Considered Options
 
-1. Reuse an existing execution service behind a thin Task Engine wrapper
-2. Implement Task Engine as a fixed monolithic DB-only gear
-3. Implement Task Engine core with pluggable execution backends
-4. Implement Task Engine as a monolith gear with multiple integrated storage infrastructures
+1. **Wrap an existing engine** — put Temporal, Hatchet, or Conductor OSS behind a thin API.
+2. **Single core with infrastructure adapters** — one core, with custom storage adapters for different infrastructures (SQL, NoSQL).
+3. **Tiny gateway with pluggable execution backends** — a small gateway, and each deployment uses its own executor (SQL, NoSQL).
+4. **Single operational core without plugins** — our own execution in one database; the simplest design; scale with sharding and send search, analytics, and history to other gears.
 
 ## Decision Outcome
 
-Chosen option: "4. Implement Task Engine as a monolith gear with multiple integrated storage infrastructures", because Task Engine itself must own the correctness-critical execution semantics, while storage responsibilities have clear and useful boundaries that can be implemented by different technologies without duplicating the Task Engine state machine.
+Chosen option: **Option 4 — Single operational core without plugins.**
 
-The Task Engine SHALL implement scheduling, claiming, retries, waits, leases, dependencies, concurrency, deduplication, supersession, and worker coordination directly.
+We choose this option because it is the simplest design and it keeps one source of truth. The Task Engine runs all task logic itself in one database. We do not add a plugin layer so far and we do not add a second system that also holds task state.
 
-The gear SHALL remain one deployed Task Engine subsystem rather than delegating execution to interchangeable task-engine plugins.
+The Task Engine runs these jobs directly in its own core and its own database:
 
-Internally, the implementation SHALL separate domain/application logic from infrastructure implementations.
-
-Task Engine Core owns:
-
-* task lifecycle and state transitions;
-* GTS task, queue, entry and tag identifiers and payload validation;
+* task lifecycle and state changes;
+* GTS task, queue, entry, and tag identifiers, and payload validation;
 * authentication context, tenant resolution, PDP authorization, and `AccessScope`;
 * task admission and queue-depth limits;
-* queue-, tenant-, type-, and global concurrency accounting;
+* queue, tenant, type, and global concurrency counting;
 * atomic claim and assignment;
-* logical execution attempts;
+* execution attempts;
 * leases, lease tokens, and lease epochs;
 * heartbeat and worker liveness;
 * timeout processing;
 * retry and dead-letter behavior;
 * timer, event, and input wait conditions;
-* parent/child relationships and predecessor dependencies;
+* parent/child and predecessor dependencies;
 * cancellation;
-* caller idempotency, derived deduplication, and supersession;
+* idempotency, derived deduplication, and supersession;
 * progress and checkpoints;
 * task entries;
 * lifecycle event history and Event Broker integration;
@@ -89,299 +85,161 @@ Task Engine Core owns:
 * task-domain routing;
 * REST API and Rust SDK.
 
-Infrastructure responsibilities are separated by role:
+The Task Engine does **not** add internal plugins for storage. If a deployment needs heavy search, large-scale analytics, or long-term history, it uses **other gears** for those jobs. For example, it can send lifecycle events to an analytics or history gear through the Event Broker. These other gears never hold the true task state and never take part in claim, lease, or concurrency decisions.
 
-* **Operational store** — correctness-critical state used by execution and transactions.
-* **Payload store** — large or opaque content not required directly for transactional execution.
-* **Search store** — optional derived index optimized for querying or full-text search.
-* **Analytics store** — optional sink optimized for aggregations and large analytical scans.
-* **Historical archive** — optional storage for cold terminal task data and long retention.
-* **Cache / notification infrastructure** — optional acceleration mechanisms that do not own canonical task state.
-
-These are internal infrastructure abstractions, not runtime execution plugins.
+To scale, the Task Engine uses **sharding** inside its own database model (hot-row sharding for counters, shard keys for background loops). It does not scale by adding plugins.
 
 ### Consequences
 
-* Task execution does not depend on Temporal, Hatchet, Conductor OSS, or another external workflow/task execution engine.
-* The Task Engine relational operational database remains authoritative for all correctness-critical task state.
-* Scheduling, claiming, queue ordering, concurrency accounting, leases, retries, waits, dependencies, and timers operate directly against Task Engine-controlled state.
-* No duplicate execution representation is required in another task execution service.
-* No external execution-engine outbox, submission reconciliation, orphan-job recovery, or backend-state synchronization is required for normal execution.
-* PostgreSQL, MariaDB/MySQL, and SQLite MAY implement the operational-store role when they satisfy the required transactional semantics.
-* The operational store MUST contain all state needed to make task execution decisions without consulting eventually consistent secondary systems.
-* Status, queue, priority, attempts, leases, concurrency counters, dependencies, active waits, timers, deduplication state, supersession state, and other execution-critical metadata MUST remain in the operational store.
-* Large or opaque content MAY be stored through a narrow `PayloadStore` infrastructure contract.
-* Candidate externally stored content includes task input, task output, immutable task-entry payloads, event payloads, historical checkpoints, and other large opaque JSON content.
-* Small or frequently accessed payloads MAY remain inline in the operational database.
-* The implementation SHOULD support configurable inline-vs-external storage based on payload size or content category.
-* A committed operational record MUST NOT reference external payload content that failed to persist.
-* External immutable payloads SHOULD therefore be written before the transaction committing their reference.
-* Failed operational transactions MAY leave unreferenced payloads, which MUST be safe to garbage-collect later.
-* External payload references SHOULD carry enough integrity metadata to validate retrieved content, such as size, content type, compression method, and checksum.
-* Current mutable context/checkpoint state SHOULD remain operational unless DESIGN explicitly adopts immutable versioned external payloads with atomic reference replacement.
-* ClickHouse MAY be used for append-heavy analytics, historical lifecycle records, archived terminal tasks, or large immutable content where its access characteristics are appropriate.
-* ClickHouse MUST NOT participate in atomic task claiming, lease ownership, concurrency reservation, or similar correctness-critical operations.
-* Elasticsearch/OpenSearch MAY be used as a derived search index.
-* Elasticsearch/OpenSearch MUST NOT be authoritative for task state.
-* Elasticsearch/OpenSearch SHOULD only store large payload content when that content must actually be indexed or searched; it is not the default generic payload store.
-* Object storage or another blob-oriented implementation MAY implement `PayloadStore` for large opaque content.
-* Historical terminal records MAY eventually be moved from the operational database into a `TaskHistoryArchive` implementation to reduce the operational working set.
-* The Task Engine query layer MAY combine operational and archived storage when a request spans both hot and historical data.
-* Secondary search, analytics, and archive systems MAY be eventually consistent unless a specific requirement states otherwise.
-* Failure of optional analytics or search infrastructure MUST NOT stop task creation, claiming, heartbeat, retries, waits, or completion.
-* Failure of a configured external payload store MAY reject operations requiring new external payload persistence but MUST NOT corrupt already committed Task Engine state.
-* Infrastructure implementations SHOULD be compiled Rust modules or crates selected by configuration and dependency injection rather than runtime-loaded plugins.
-* A stable binary plugin ABI is not introduced by this decision.
-* The default deployment SHOULD require only the Task Engine and a supported operational database.
-* Optional infrastructure MUST be introduced only when it provides a measurable capacity, performance, search, retention, or cost benefit.
-* Internal module boundaries MUST allow infrastructure implementations to change without changing Task Engine domain behavior or the public API.
-* Moving execution semantics to an external task/workflow engine in the future requires a separate ADR.
+* The Task Engine does not depend on Temporal, Hatchet, Conductor OSS, or any other outside execution engine.
+* The relational database is the one true source for all task state.
+* Claim, queue order, concurrency counting, leases, retries, waits, dependencies, and timers all run as direct database transactions.
+* There is no second copy of running work in another system. There is no need for reconciliation or orphan-job repair.
+* PostgreSQL, MariaDB/MySQL, and SQLite can all serve as the operational database when they meet the transaction rules.
+* The operational database holds everything the engine needs to make a decision. The engine never reads an eventually consistent system to decide a claim, a lease, or a limit.
+* All task payloads (input, context, output, entries, events) stay inside the operational database, within the PRD size limit (64 KB per payload). The Task Engine does not become a file store.
+* Search, analytics, and history can be offloaded to other gears. These gears receive data through published lifecycle events, not by sharing the Task Engine database.
+* If a search, analytics, or history gear is slow or down, task creation, claim, heartbeat, retries, waits, and completion still work.
+* The default deployment needs only the Task Engine and one supported database.
+* There is no runtime plugin ABI and no plugin version to manage.
+* History and archiving are **out of scope for now**. Later, a deployment MAY add an optional history/archiving plugin that stores **only completed tasks** and is read back transparently through the existing task read APIs. The current release ships no such plugin, and adding it would need a new ADR.
+* Moving task execution to an outside engine in the future needs a new ADR.
 
 ### Confirmation
 
-Compliance with this ADR is confirmed through architecture review, code review, integration tests, failure-mode tests, and storage-specific conformance tests.
+We confirm this decision through architecture review, code review, integration tests, failure-mode tests, and capacity tests.
 
-Architecture review MUST verify that:
+Architecture review MUST check that:
 
-* exactly one authoritative operational representation exists for task execution state;
-* scheduling and execution correctness do not depend on ClickHouse, Elasticsearch/OpenSearch, object storage, or another secondary store;
-* domain/application logic does not directly depend on infrastructure-specific APIs;
-* infrastructure interfaces represent narrow capabilities rather than generic database operations;
-* optional infrastructure failure cannot corrupt authoritative Task Engine state;
-* no external execution service is required for normal operation.
+* there is exactly one true store for task state;
+* claim and execution never depend on an outside or eventually consistent system;
+* no outside execution engine is needed for normal work;
+* search, analytics, and history offload happens through events to other gears, not through a shared database.
 
-Operational-store tests MUST verify:
+Operational-store tests MUST check:
 
 * atomic task admission;
-* atomic queue-depth accounting;
+* atomic queue-depth counting;
 * atomic concurrency reservation;
-* duplicate claim prevention;
+* no double claim;
 * lease fencing;
 * retry and timeout recovery;
 * dependency correctness;
 * deduplication and supersession correctness;
-* task recovery after process restart.
+* task recovery after a restart.
 
-Payload-store tests MUST verify:
-
-* payload persistence and retrieval;
-* payload integrity validation;
-* correct reconstruction of inline and external payloads;
-* failure before operational reference commit when payload persistence fails;
-* safe garbage collection of orphaned objects;
-* tenant isolation and authorization of externalized content.
-
-Search and analytics tests MUST verify:
-
-* secondary-store outage does not stop execution;
-* derived data can be rebuilt from authoritative state or events where required;
-* eventual consistency does not alter execution semantics.
-
-Capacity testing MUST validate the selected storage topology against the PRD reference profile.
+Capacity tests MUST check the design against the PRD target size (500 million stored tasks, 100,000 active tasks), including sharded counters and background loops.
 
 ## Pros and Cons of the Options
 
-### Reuse an Existing Execution Service Behind a Thin Task Engine Wrapper
+### Option 1: Wrap an Existing Engine
 
-Use Temporal, Hatchet, Conductor OSS, or a comparable system as the primary execution engine, while Task Engine exposes Gears-facing APIs and adds missing platform semantics.
+Use Temporal, Hatchet, or Conductor OSS as the main engine. The Task Engine is a thin API in front of it and adds the missing Gears rules.
 
-* Good, because existing engines provide mature worker dispatch, retries, scheduling, timers, crash recovery, and operational tooling.
-* Good, because initial implementation of generic execution mechanics may be smaller.
-* Good, because mature external systems have significant production experience.
-* Neutral, because Hatchet and Conductor are closer to the Task Engine's task model than Temporal, while Temporal provides broader durable-workflow semantics.
-* Bad, because no evaluated engine directly implements the required GTS, authorization, tenant hierarchy, queue admission, in-transaction events, concurrency limits, lease epoch, deduplication, supersession, task entries, and Task Engine query model.
-* Bad, because capabilities above turns the supposedly thin wrapper into a substantial stateful Task Engine control plane with its own canonical database and state.
-* Bad, because runnable work is represented both in Task Engine and in the external engine.
-* Bad, because there is no single ACID transaction covering the Task Engine database and an external execution service.
-* Bad, because reliable integration therefore requires outbox processing, idempotent submission, reconciliation, orphan detection, and repair.
-* Bad, because deployment availability depends on more services and network paths.
-* Bad, because delegating enough behavior to gain substantial performance or capacity benefits would require changing ownership of retries, waits, timers, leases, or concurrency and therefore changing the PRD semantics.
+* Good, because the engine already has a mature scheduler, retries, timers, and crash recovery.
+* Good, because there is less generic execution code to write.
+* Bad, because our rules still need our own database in front — task entries, queue depth, dedup and suspension records, tenant-scoped queries and joins, lease epoch, and outbox events.
+* Bad, because we would still run an extra server, and there is no edge support.
+* Bad, because there are two sources of truth, so we must reconcile them.
 
-### Implement Task Engine as a Fixed DB-only Monolithic Gear
+**Rejected.**
 
-Implement all domain semantics, execution logic, persistence, search, payload storage, analytics, and historical retention using one fixed integrated storage architecture.
+### Option 2: Single Core with Infrastructure Adapters
 
-* Good, because the implementation is conceptually simple and has minimal abstraction overhead.
-* Good, because all functionality can be optimized for one known persistence technology.
-* Good, because there are few configuration permutations and a small integration-test matrix.
-* Good, because execution correctness can use direct database transactions.
-* Bad, because operational state, large payloads, historical data, search indexes, and analytics have very different storage characteristics and volume.
-* Bad, because one storage technology must serve transactional, analytical, search, and blob-like workloads simultaneously.
-* Bad, because hundreds of millions of retained historical tasks and large payloads can increase operational database size, index size, backup volume, replication load, and working-set pressure.
-* Bad, because introducing ClickHouse, Elasticsearch/OpenSearch, or object storage later would require invasive changes if infrastructure boundaries were not designed from the beginning.
-* Bad, because large-content offload and historical archival provide meaningful capacity benefits even though execution itself remains native.
-* Bad, because fixing infrastructure choices in the domain/application implementation creates unnecessary coupling.
+Build one core and add custom storage adapters for different infrastructures (SQL, NoSQL). The adapters also provide large payloads, analytics, search, and history.
 
-### Implement Task Engine Core with Pluggable Execution Backends
+* Good, because any logic can be customized through adapters.
+* Good, because large payloads, analytics, search, and history go through the infrastructure adapters.
+* Bad, because the implementation becomes complex and the test coverage is hard to keep.
+* Bad, because we still build and run the scheduler ourselves, so the adapter layer adds cost without removing our main work.
 
-Keep Task Engine semantics in a common core and define an execution-backend API implemented by native PostgreSQL, Hatchet, Conductor OSS, Temporal, or other engines.
+**Rejected.**
 
-* Good, because execution infrastructure could theoretically be replaced without changing public Task Engine APIs.
-* Good, because deployments could choose between a lightweight native implementation and an external execution system.
-* Good, because external task engines could provide mature worker-dispatch functionality.
-* Neutral, because Task Engine Core would still implement most PRD-defined behavior regardless of backend.
-* Bad, because very little useful responsibility remains in the backend if Task Engine Core owns lifecycle, attempts, retries, waits, leases, concurrency, dependencies, deduplication, and search.
-* Bad, because the native relational backend would mostly wrap state already stored by Task Engine.
-* Bad, because external backends create a second durable representation of queued/running work.
-* Bad, because this requires synchronization and reconciliation between Task Engine and backend state.
-* Bad, because backend semantics differ materially in retries, priority, concurrency, worker polling, cancellation, waits, and task identity.
-* Bad, because a sufficiently narrow backend interface provides too little value to justify the additional abstraction and runtime system.
-* Bad, because a wider backend interface duplicates significant portions of Task Engine semantics and creates backend-dependent behavior.
-* Bad, because the architecture optimizes for hypothetical execution-engine replacement rather than demonstrated Task Engine scaling concerns.
+### Option 3: Tiny Gateway with Pluggable Execution Backends
 
-### Modular Gear with Integrated Storage Infrastructure
+Build a small gateway. Each deployment plugs in its own executor (SQL, NoSQL).
 
-Implement task execution natively inside the Task Engine gear while defining narrow internal infrastructure interfaces for operational persistence, payload storage, search, analytics, caching, and historical archive.
+* Good, because it looks flexible and powerful on paper.
+* Bad, because the plugin API must be a lowest-common-denominator, so it loses power.
+* Bad, because the state machine is duplicated per backend.
+* Bad, because the plugin ABI is complicated.
+* Bad, because we still build and run the scheduler ourselves, now in different storages.
 
-* Good, because there remains one authoritative Task Engine state machine and one execution model.
-* Good, because execution-critical operations retain local transactional semantics.
-* Good, because no external execution-engine synchronization is required.
-* Good, because large content can be moved out of the operational database without changing task lifecycle semantics.
-* Good, because ClickHouse can be used for append-heavy historical or analytical workloads where it provides meaningful capacity and query benefits.
-* Good, because Elasticsearch/OpenSearch can be introduced specifically for search use cases rather than being forced into transactional storage.
-* Good, because object storage can be introduced for large opaque payloads without affecting claim, lease, retry, or concurrency logic.
-* Good, because a narrow `PayloadStore` contract can externalize a large percentage of physical bytes while leaving correctness-critical state in the relational store.
-* Good, because the operational database working set can remain focused on active and recent tasks.
-* Good, because historical terminal data can later be archived independently from active task execution.
-* Good, because storage choices can evolve without introducing an execution plugin ABI.
-* Good, because compile-time Rust modules and dependency injection are sufficient for infrastructure variation.
-* Good, because optional secondary stores can fail independently without stopping core execution.
-* Good, because each infrastructure abstraction can expose semantics appropriate to its role instead of forcing all databases behind a generic CRUD interface.
-* Good, because this architecture directly addresses the most likely scaling pressure in the reference profile: very large retained task and payload volume with a much smaller active working set.
-* Neutral, because multiple storage technologies increase deployment and operational complexity when optional stores are enabled.
-* Neutral, because secondary data projections may be eventually consistent.
-* Bad, because the gear must implement synchronization or archival pipelines for optional search, analytics, or historical stores.
-* Bad, because externalized payloads introduce additional reads for tasks whose content is not inline.
-* Bad, because multi-store deployments require explicit failure-handling, observability, retention, and backup strategies for each enabled infrastructure component.
-* Bad, because infrastructure abstractions and conformance tests add some implementation complexity compared with a fixed single-database implementation.
+**Rejected.**
+
+### Option 4: Single Operational Core Without Plugins
+
+Build one core engine in one database. Keep execution native. Scale with sharding. Send search, analytics, and history to other gears.
+
+* Good, because there is a single core engine with atomic transactions for admission, claim, leases, and outbox.
+* Good, because it is the simplest possible implementation.
+* Good, because there is one source of truth and no reconciliation.
+* Good, because the default deployment is small: only the engine and one database.
+* Neutral, because we offload heavy search, analytics, and archiving to other gears when a deployment needs them.
+* Bad, because task-engine clients will need to interact with other gears for search, analytics, and history.
+* Bad, because we still build and run the scheduler ourselves (true for every option except Option 1).
+
+**Chosen.**
 
 ## More Information
 
-This decision separates **execution architecture** from **storage architecture**.
-
-Execution remains native:
+The design keeps execution and the true state in one place:
 
 ```text
 Worker
    |
    v
-Task Engine
+Task Engine Core
    |
    v
-Operational Store
+Operational Database (PostgreSQL / MariaDB/MySQL / SQLite)
 ```
 
-Storage may be specialized:
+Heavy, non-critical work is sent to other gears through events. These gears do not hold task state:
 
 ```text
-                         Task Engine
-
-            +-------------------------------+
-            | Domain / Application          |
-            |                               |
-            | lifecycle / claim / retries   |
-            | waits / leases / concurrency  |
-            | dependencies / GTS / AuthZ    |
-            +---------------+---------------+
-                            |
-                    Infrastructure ports
-                            |
-       +--------------------+----------------------+
-       |                    |                      |
-       v                    v                      v
- Operational Store      Payload Store        Search / Analytics
- PostgreSQL             Object Storage       Elasticsearch
- MariaDB/MySQL          ClickHouse           OpenSearch
- SQLite                 Inline DB            ClickHouse
+Task Engine Core
+   |
+   | lifecycle events (Event Broker)
+   v
+Other gears (optional):
+   - search gear      (text / rich search over task data)
+   - analytics gear   (reports, metrics, aggregates)
+   - history gear     (long-term archive of old tasks)
 ```
 
-Infrastructure abstractions SHOULD be capability-specific.
-
-Examples:
+The Task Engine scales inside its own model:
 
 ```text
-TaskRepository
-TaskClaimStore
-PayloadStore
-TaskSearch
-TaskAnalyticsSink
-TaskHistoryArchive
-WorkerWakeup
+- hot-row sharding for concurrency and queue-depth counters
+- shard keys for timer and lease background loops
+- task domains to route task types to separate databases
 ```
 
-A generic interface such as:
-
-```text
-Database::insert()
-Database::update()
-Database::query()
-Database::lock()
-```
-
-SHOULD NOT be introduced as the abstraction between fundamentally different database technologies.
-
-The likely storage model is:
-
-```text
-Operational database:
-    100% correctness-critical state
-    100% indexed operational metadata
-    small/hot payloads
-
-PayloadStore:
-    large input/output
-    immutable entries/events
-    other opaque large content
-
-ClickHouse:
-    analytics
-    lifecycle history
-    archived terminal tasks
-    optionally large immutable structured content
-
-Elasticsearch/OpenSearch:
-    derived searchable representation
-    payload contents only when full-text/content search is required
-```
-
-A hybrid inline/external payload policy is expected:
-
-```text
-small payload
-    -> operational database
-
-large payload
-    -> PayloadStore
-    -> operational row stores PayloadRef
-```
-
-This allows a narrow infrastructure contract to move a substantial portion of physical data volume away from the operational database while keeping all execution semantics local and transactional.
-
-For the reference scale of up to 500 million retained tasks, reducing the amount of payload and cold historical content stored in the operational database is expected to provide a more direct scalability benefit than delegating task dispatch to another execution engine.
+For the target size (up to 500 million stored tasks), sharding and task domains give the needed scale while keeping the design simple and keeping one source of truth.
 
 ## Traceability
 
 - **PRD**: [PRD.md](../PRD.md)
 - **DESIGN**: [DESIGN.md](../DESIGN.md)
 
-This decision directly addresses the following requirements or design elements:
+This decision supports these requirements and design elements:
 
-* `cpt-cf-task-engine-fr-task-create` — creation, validation, timers, admission, and event persistence remain Task Engine-controlled transactional operations.
-* `cpt-cf-task-engine-fr-structured-io` — structured input and output may be stored inline or through `PayloadStore` while preserving the same Task Engine contract.
-* `cpt-cf-task-engine-fr-task-checkpoint` — current checkpoint/context remains execution state; storage representation may vary only where atomic Task Engine semantics are retained.
-* `cpt-cf-task-engine-fr-task-entries` — immutable entry payloads may be externalized while entry metadata and authorization remain Task Engine-controlled.
-* `cpt-cf-task-engine-fr-queue-concurrency` — concurrency remains authoritative in the operational store.
-* `cpt-cf-task-engine-fr-queue-depth` — admission remains atomic with operational Task Engine state.
-* `cpt-cf-task-engine-fr-wait-conditions` — wait state remains native Task Engine state.
-* `cpt-cf-task-engine-fr-assignment` — assignment and attempt semantics remain native Task Engine behavior.
-* `cpt-cf-task-engine-fr-lease-fencing` — lease correctness does not depend on a secondary store.
-* `cpt-cf-task-engine-fr-retry` — retry lifecycle remains represented in the authoritative operational database.
-* `cpt-cf-task-engine-fr-dependencies` — dependency updates and unblocking remain transactional Task Engine operations.
-* `cpt-cf-task-engine-fr-task-domains` — each operational task domain retains its authoritative relational storage while secondary infrastructure may specialize payload, search, analytics, or archive responsibilities.
-* `cpt-cf-task-engine-nfr-throughput` — native claim and execution avoid external execution-engine hops.
-* `cpt-cf-task-engine-nfr-search-latency` — optional specialized search infrastructure may be used where required to satisfy large-scale query targets.
-* `cpt-cf-task-engine-nfr-capacity` — payload offload and historical archival reduce the size and working set of the operational store at the reference scale.
-* `cpt-cf-task-engine-nfr-compression` — compression remains applicable to inline and externalized payload representations.
-* `cpt-cf-task-engine-nfr-tenant-isolation` — all storage roles remain reachable only through Task Engine-controlled tenant-scoped access.
-* `cpt-cf-task-engine-nfr-security` — authorization remains independent of which infrastructure implementation stores payloads or derived data.
-* `cpt-cf-task-engine-usecase-create-execute` — execution stays inside the Task Engine gear while content storage is independently configurable.
+* `cpt-cf-task-engine-fr-task-create` — creation, validation, timers, admission, and event writes stay inside Task Engine transactions.
+* `cpt-cf-task-engine-fr-structured-io` — task input and output stay inside the operational database within the size limit.
+* `cpt-cf-task-engine-fr-task-checkpoint` — checkpoint and context stay as execution state in the operational database.
+* `cpt-cf-task-engine-fr-task-entries` — entries stay inside Task Engine control and storage.
+* `cpt-cf-task-engine-fr-queue-concurrency` — concurrency stays authoritative in the operational database.
+* `cpt-cf-task-engine-fr-queue-depth` — admission stays atomic with operational state.
+* `cpt-cf-task-engine-fr-wait-conditions` — wait state stays native Task Engine state.
+* `cpt-cf-task-engine-fr-assignment` — assignment and attempt logic stay native.
+* `cpt-cf-task-engine-fr-lease-fencing` — lease correctness does not depend on any other system.
+* `cpt-cf-task-engine-fr-retry` — retry state stays in the operational database.
+* `cpt-cf-task-engine-fr-dependencies` — dependency updates stay transactional.
+* `cpt-cf-task-engine-fr-task-domains` — each task domain keeps its own operational database; sharding and routing give scale.
+* `cpt-cf-task-engine-nfr-throughput` — native claim and execution avoid extra network hops.
+* `cpt-cf-task-engine-nfr-search-latency` — a separate search gear can serve large-scale search when needed.
+* `cpt-cf-task-engine-nfr-capacity` — sharding, task domains, and offload to other gears keep the operational database within the target size.
+* `cpt-cf-task-engine-nfr-tenant-isolation` — all task data stays behind Task Engine tenant-scoped access.
+* `cpt-cf-task-engine-nfr-security` — authorization stays inside the Task Engine core.
+* `cpt-cf-task-engine-usecase-create-execute` — execution stays inside the Task Engine gear.
