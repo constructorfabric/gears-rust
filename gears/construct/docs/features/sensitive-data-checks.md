@@ -28,7 +28,7 @@
 
 ### 1.1 Overview
 
-The Sensitive-Data Checks (`cpt-cf-construct-component-sensitive-data-checks`) look for special-category content in the values a plan would store, before anything is stored. There is one check per sensitive-data kind, and each check answers with a verdict: for each value, content found or not. Admission enforces the verdicts. This document describes Story 5.7.3, which builds the interface, the runner that runs the checks in parallel, and a test check that can block. **No real check exists yet.** Until the owner of the checks is settled, a deployment runs none, so every value is allowed (see 1.2).
+The Sensitive-Data Checks (`cpt-cf-construct-component-sensitive-data-checks`) look for special-category content in the values a plan would store, before anything is stored. There is one check per sensitive-data kind, and each check answers with a verdict: for each value, content found or not. Admission enforces the verdicts. This part builds the interface, the runner that runs the checks in parallel, and a test check that can block. **No real check exists yet.** Until the owner of the checks is settled, a deployment runs none, so every value is allowed (see 1.2).
 
 ### 1.2 Purpose
 
@@ -40,9 +40,9 @@ The PRD requires Construct to keep special-category data out of the profile (`cp
 
 **The verdict.** A check answers for its own kind with the text pieces it found content in, named by their place in the plan: the step, the property and the piece. For a kind that redacts, the answer also gives the byte ranges of the found content in the piece. A piece the answer does not name is allowed. A check answers about the values the plan would store; a removal stores nothing and is not checked.
 
-**The plan.** The checks read a plan only through the list of values it would store. The Plan type is defined here and agreed with Story 5.2 (the Planner, ROL-17080), which builds plans on it; see [Admission](./admission.md), 1.2.
+**The plan.** The checks read a plan only through the list of values it would store. The Plan type is defined here, and the Planner builds plans in it; see [Admission](./admission.md), 1.2.
 
-**Known gap: no real check in production.** The checks need an owner: who builds the pattern and model checks is still open, and no story builds them yet. Until that is settled, a deployment wires in no check, so every value is allowed. This matches avatar today, whose administrator path has no guardrails either. Failing closed instead would mean Construct stores nothing anywhere until the real checks exist: no administrator adds, and no working round trip in Story 5.12. Nothing reaches storage through this feature yet in any case: until the Planner exists, intake refuses every record.
+**Known gap: no real check in production.** The checks need an owner: who builds the pattern and model checks is still open, and nothing builds them yet. Until that is settled, a deployment wires in no check, so every value is allowed. Failing closed instead would mean Construct stores nothing anywhere until the real checks exist: no administrator adds, and no working round trip from a record to a stored fact. Nothing reaches storage through this feature yet in any case: until the Planner exists, the hand-off stub drops every received record.
 
 **Out of scope**:
 
@@ -67,7 +67,7 @@ The PRD requires Construct to keep special-category data out of the profile (`cp
 - **PRD**: [PRD.md](../PRD.md)
 - **Design**: [DESIGN.md](../DESIGN.md), the Sensitive-Data Checks component and the Sensitive-Data Verdict entity
 - **Decomposition**: [DECOMPOSITION.md](../DECOMPOSITION.md), entry 2.6
-- **Dependencies**: `cpt-cf-construct-feature-planner` (the plan; defined here, agreed with Story 5.2), `cpt-cf-construct-feature-model-client` (for the model checks, which do not exist yet)
+- **Dependencies**: `cpt-cf-construct-feature-planner` (the plan; defined here, and the Planner builds on it), `cpt-cf-construct-feature-model-client` (for the model checks, which do not exist yet)
 
 ## 2. Actor Flows (CDSL)
 

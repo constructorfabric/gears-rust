@@ -1,7 +1,6 @@
 //! The plan: the steps that change one subject's profile.
 //!
-//! This shape is agreed with Story 5.2 (the Planner, ROL-17080), which builds
-//! plans on it. The Sensitive-Data Checks and Admission read a plan only
+//! The Planner builds plans in this shape. The Sensitive-Data Checks and Admission read a plan only
 //! through [`Plan::values`], [`Origin::written_by_a_person`], and each step's
 //! entity kind, confidence and [`Change::stores_values`].
 
