@@ -444,20 +444,21 @@ A failed finalize/report-part callback (after the sidecar's retry budget, see `p
 `CALLBACK_MAX_ATTEMPTS` in `src/bin/sidecar.rs`) returns `502 Bad Gateway` to the client. The backend write itself
 is **create-exclusive, not overwrite-safe**: `StorageBackend::publish_exclusive` writes only the *first* time a
 given backend path is empty — a retried `PUT` to the same signed URL never overwrites bytes already landed there,
-it reports `created: false` and leaves the stored blob untouched. The documented recovery is still to retry the
-`PUT`: if the earlier publish landed but finalize never ran, this retry's measured bytes match what's already
-stored and the handler answers `200` (a benign retry has converged) via a fresh finalize attempt. If the version
-was already finalized, the outcome converges **regardless of the token's bind mode**: a replay whose size and
-content hash match the stored version is answered `200` — for a token carrying the `bind_on_finalize` claim
+it reports `created: false` and leaves the stored blob untouched. The documented recovery is still to retry the `PUT`
+with the same bytes: the sidecar reads the stored object back and compares its hash with the retry's. If the earlier
+publish landed but finalize never ran, a matching retry finalizes and the handler answers `200` (a benign retry has
+converged); a retry whose bytes differ from the stored object is answered `409` and finalizes nothing. A replayed
+`PUT` therefore re-reads the whole stored object. If the version was already finalized, the outcome converges
+**regardless of the token's bind mode**: a replay whose size and content hash match the stored version is answered
+`200` — for a token carrying the `bind_on_finalize` claim
 (auto-bind `POST /files` path) the `X-FS-Bound`/`ETag` headers are recomputed against the file's *current*
 `content_id`, so a concurrent bind in between can still flip `bound`↔`conflict` (F4 in the concurrency-and-failure
 model, and `write.rs`'s already-available replay branch); a manual-bind token converges the same way, simply with no
-bind-outcome headers to report, exactly as on the first call. A mismatched replay (different size or hash) is
-answered `400` (hash/size check) — never a silent overwrite. `409` ("version already finalized") is now reserved for
-a genuine **concurrent** double-finalize — two callbacks racing before either has observed the other's
-already-`available` status — not for an ordinary sequential retry, which converges as above. For the finalize case
-specifically, the version may already be correctly finalized server-side even though the client saw a transient
-`502` on a preceding attempt (re-verify via `GET /files/{id}/versions` before assuming failure).
+bind-outcome headers to report, exactly as on the first call. A mismatched replay (different size or hash) is answered
+`409` — never a silent overwrite. Two finalize callbacks racing for the same version converge the same way: the one
+that loses the `pending → available` CAS re-reads the version and applies the same size/hash comparison. For the
+finalize case specifically, the version may already be correctly finalized server-side even though the client saw a
+transient `502` on a preceding attempt (re-verify via `GET /files/{id}/versions` before assuming failure).
 
 ## Cleanup (not running yet)
 

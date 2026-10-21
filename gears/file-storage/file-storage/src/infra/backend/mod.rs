@@ -53,7 +53,7 @@ pub(crate) fn build_manifest_and_root(
 /// plus whether the write landed.
 ///
 /// `created: false` means `path` already held a blob, left untouched. `bytes_written` and
-/// `digest` always describe this attempt's bytes, so callers can check idempotency without re-reading.
+/// `digest` always describe this attempt's bytes, not the stored blob's.
 #[derive(Debug, Clone, Copy)]
 pub struct PublishOutcome {
     pub bytes_written: u64,

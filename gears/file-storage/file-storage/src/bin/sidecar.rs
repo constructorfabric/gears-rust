@@ -325,9 +325,10 @@ fn extract_token(q: &TokenQuery, headers: &HeaderMap) -> Option<String> {
 /// A body read error is `400`, not a backend failure.
 ///
 /// `created: false` means an earlier PUT with the same token already published the object
-/// (left untouched); finalize is still called with this attempt's size/hash. A control-plane
-/// rejection (4xx) or no control plane gives `409` (this PUT took no effect); transport
-/// failure or 5xx gives `502`.
+/// (left untouched). The stored object is then read back and hashed, and finalize is called
+/// with this attempt's size/hash only if the stored bytes are this attempt's bytes. Different
+/// stored bytes, a control-plane rejection (4xx) or no control plane give `409` (this PUT took
+/// no effect); a failed read-back gives `500`; transport failure or 5xx gives `502`.
 async fn upload(
     State(state): State<SidecarState>,
     Path((file_id, version_id)): Path<(Uuid, Uuid)>,
@@ -399,13 +400,11 @@ async fn upload(
     #[allow(clippy::cast_precision_loss)]
     state.metrics.record_ingress_bytes(bytes_written as f64);
 
-    // Replay without a control plane: nothing can confirm the bytes match.
-    if !created && state.control_base_url.is_empty() {
-        return (
-            StatusCode::CONFLICT,
-            "content already published for this version",
-        )
-            .into_response();
+    if !created
+        && let Some(rejection) =
+            reject_unconfirmed_replay(&state, backend.as_ref(), &claims, digest).await
+    {
+        return rejection;
     }
 
     // Tell the control plane the bytes landed (the signed token proves the upload was
@@ -731,6 +730,52 @@ async fn report_part_with_control_plane(
             Err(Rejection::new(StatusCode::BAD_GATEWAY, "report failed"))
         }
     }
+}
+
+/// A replay (`created == false`) may finalize only once the stored bytes are confirmed to be
+/// this attempt's bytes: a still-`pending` version has no recorded hash for finalize to compare
+/// against. Returns the response that ends the request otherwise.
+async fn reject_unconfirmed_replay(
+    state: &SidecarState,
+    backend: &dyn StorageBackend,
+    claims: &Claims,
+    digest: [u8; 32],
+) -> Option<Response> {
+    // Without a control plane nothing can confirm the bytes match.
+    if state.control_base_url.is_empty() {
+        return Some(
+            (
+                StatusCode::CONFLICT,
+                "content already published for this version",
+            )
+                .into_response(),
+        );
+    }
+    match stored_digest(backend, &claims.backend_path).await {
+        Ok(stored) if stored == digest => None,
+        Ok(_) => Some(
+            (
+                StatusCode::CONFLICT,
+                "content already published for this version",
+            )
+                .into_response(),
+        ),
+        Err(e) => {
+            tracing::error!(error = %e, "reading back the published object for a replay failed");
+            Some((StatusCode::INTERNAL_SERVER_ERROR, "backend error").into_response())
+        }
+    }
+}
+
+/// SHA-256 of the blob stored at `path`, streamed chunk by chunk.
+async fn stored_digest(backend: &dyn StorageBackend, path: &str) -> Result<[u8; 32], DomainError> {
+    let mut stream = backend.get_stream(path).await?;
+    let mut hasher = hash::Hasher::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| DomainError::backend(backend.id(), e.to_string()))?;
+        hasher.update(&chunk);
+    }
+    Ok(hash::digest_to_array(hasher.finalize()))
 }
 
 /// Streams the upload body into the backend, create-exclusive. Mid-stream `max_size` is

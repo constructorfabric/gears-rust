@@ -297,10 +297,11 @@ each part write in the multipart case — see `D2`).
   request body's `size`, or if no blob is present at that path at all (upload never completed). The reported
   SHA-256 is persisted as is. The version's `mime_type` is re-validated/resolved from a ranged read of the object's
   leading bytes (magic-byte sniffing) and persisted, and the version is marked `available`.
-- **Response**: `204 No Content`. Errors: `400` (validation/size mismatch or no object), `403` (bad/expired/mismatched
-  token, **or** missing/mismatched `x-fs-internal-token` — see above), `404` (version not found), `409` (already
-  finalized with different content), `500` (a permanent backend fault reading the object's length or prefix), `503` (a transient one —
-  network, timeout, backend overload — carries `Retry-After`).
+- **Response**: `204 No Content`. Errors: `400` (validation/size mismatch, no object, or a replay against an
+  already-`available` version with a different size or hash), `403` (bad/expired/mismatched token, **or**
+  missing/mismatched `x-fs-internal-token` — see above), `404` (version not found), `500` (a permanent backend fault
+  reading the object's length or prefix), `503` (a transient one — network, timeout, backend overload — carries
+  `Retry-After`).
 - For a `bind: "manual"` upload (and `POST /files/{id}/versions`, which never auto-binds) this endpoint does **not**
   bind the version as current — `POST /files/{id}/bind` remains a separate, explicit client call. For the default
   `bind: "auto"` it binds inline under the same CAS and reports the outcome instead — see "Single-part bind outcome
@@ -864,13 +865,14 @@ access or carry substantially more per-request state in the token than it does t
     `401`/`403`/`404`/`500`, so this `409` is not represented in the generated OpenAPI schema even though the domain
     code returns it.
   - **sidecar `PUT` (replay)**: a `PUT` to an `upload_url` whose `backend_path` already holds a published blob —
-    `publish_exclusive`'s create-exclusive write refuses to overwrite it, so the live bytes are never touched, and the
-    sidecar still calls finalize with this attempt's size/hash. If finalize succeeds (a benign retry of an upload
-    whose finalize never landed, or whose response was lost) the `PUT` converges to `200` with the original bind
-    headers. If the control plane rejects the callback with a `4xx` (e.g. different bytes, so the hash does not match
-    the already-`available` version) the sidecar answers `409 Conflict` — this `PUT` took no effect. With no control
-    plane configured a replay is also `409` (nothing can confirm it matches the stored object). A transport failure
-    or a control-plane `5xx` is `502`, as for a first upload.
+    `publish_exclusive`'s create-exclusive write refuses to overwrite it, so the live bytes are never touched. The
+    sidecar then reads the stored object back and hashes it: if the stored bytes differ from this attempt's bytes it
+    answers `409 Conflict` without calling finalize — this `PUT` took no effect, and a still-`pending` version is never
+    finalized with a digest of bytes that were not stored. Otherwise it calls finalize with this attempt's size/hash.
+    If finalize succeeds (a benign retry of an upload whose finalize never landed, or whose response was lost) the
+    `PUT` converges to `200` with the original bind headers; a control-plane `4xx` is also `409`. With no control
+    plane configured a replay is `409` (nothing can confirm it matches the stored object). A failed read-back is
+    `500`; a transport failure or a control-plane `5xx` is `502`, as for a first upload.
 
   Note: `update_metadata` (`PATCH /files/{id}`) declares a `409` response in its OpenAPI registration
   (`routes.rs`), but no domain code path returns `DomainError::Conflict` for this handler — its only failure mode
