@@ -330,14 +330,13 @@ pub struct CourseConcept {
     dir_path = "schemas",
     base = RecordV1,
     type_id = gts_id!("cf.connectors.core.record.v1~cf.construct.mastery.course_catalog.v1~"),
-    description = "One course's concept catalog: the human-readable labels the Mastery connector pushes so avatar's dashboard can name the scores it renders. Under Model Y the catalog tables (mastery_courses.title, mastery_sections, mastery_concepts) stay user-facing in avatar, but the connector's extraction becomes their only writer, through this push. Course-scoped, not per-student: it carries no subject_id, and it is pushed on (re)extraction rather than on every student result, so the catalog is not repeated on every score push. provenance is the course locator, stable across re-pushes; version is a digest of the catalog content, so an unchanged re-extraction dedupes and a changed one is a new version the receiving side upserts onto the same course. observed_at is the connector-side timestamp when extraction finished. The concept_index and section_index here share the namespace the RESULT record's scores are keyed by, so a re-extraction that renumbers them must republish the catalog and the affected results together; the receiving side (ROL-16821) applies them consistently.",
+    description = "One course's concept catalog: the human-readable labels the Mastery connector pushes so a dashboard can name the scores it renders. The connector's extraction is the only writer of these labels, through this push. Course-scoped, not per-student: it carries no subject_id, and it is pushed on (re)extraction rather than on every student result, so the catalog is not repeated on every score push. provenance is the course locator, stable across re-pushes; version is a digest of the catalog content, so an unchanged re-extraction dedupes and a changed one is a new version the receiving side upserts onto the same course. observed_at is the connector-side timestamp when extraction finished. The concept_index and section_index here share the namespace the student mastery record's scores are keyed by, so a re-extraction that renumbers them must republish the catalog and the affected student mastery records together; the receiving side applies them consistently.",
     properties = "course_id,title,sections,concepts",
     traits = serde_json::json!({ SUBJECT_REQUIRED_TRAIT: false })
 )]
 pub struct CourseCatalogV1 {
-    /// The external course identifier, stable across both databases and the
-    /// resolution key together with the contract's tenant. Not either
-    /// database's internal UUID.
+    /// The external course identifier, stable across systems and the
+    /// resolution key together with the tenant. Not an internal UUID.
     #[schemars(length(min = 1))]
     pub course_id: String,
     /// The course title the dashboard shows. Optional: the source may not
@@ -378,13 +377,13 @@ pub struct ConceptScore {
     dir_path = "schemas",
     base = RecordV1,
     type_id = gts_id!("cf.connectors.core.record.v1~cf.construct.mastery.student_mastery.v1~"),
-    description = "One student's computed concept mastery for one course under one model: the finished result the Mastery connector pushes. subject_id is always set (the record is about the student, its value the student's platform user uuid). The payload carries scores keyed by concept_index only; the concept name and description are joined on read from avatar's own concepts table, which stays user-facing and is kept populated by the connector's separate course_catalog record, not by this per-student push. provenance = the (course, model, student) locator, stable across re-pushes; version = a digest of the concept scores, so an identical recompute dedupes to one record and a changed recompute is a new version the receiving side upserts onto the same provenance. observed_at = the connector-side timestamp when the compute finished, not a watermark over the events read. The result is authoritative: the receiving side validates it against this type and stores it as-is, with no retain-or-drop decision.",
+    description = "One student's computed concept mastery for one course under one model: the finished result the Mastery connector pushes. subject_id is always set (the record is about the student, its value the student's platform user uuid). The payload carries scores keyed by concept_index only; the concept name and description are joined on read from the course catalog record, which the connector pushes separately, not with this per-student push. provenance = the (course, model, student) locator, stable across re-pushes; version = a digest of the concept scores, so an identical recompute dedupes to one record and a changed recompute is a new version the receiving side upserts onto the same provenance. observed_at = the connector-side timestamp when the compute finished, not a watermark over the events read. The result is authoritative: the receiving side validates it against this type and stores it as-is, with no retain-or-drop decision.",
     properties = "course_id,model_name,model_version,concepts",
     traits = about_a_person()
 )]
 pub struct StudentMasteryV1 {
-    /// The external course identifier, stable across both databases. Not
-    /// either database's internal UUID.
+    /// The external course identifier, stable across systems. Not an
+    /// internal UUID.
     #[schemars(length(min = 1))]
     pub course_id: String,
     /// The evaluation model that produced these scores. A student may have

@@ -38,7 +38,7 @@
 
 ### 1.1 Overview
 
-Record Intake is the single entry for connectors (`cpt-cf-construct-component-results-api`). A connector sends one record per request for one tenant. Intake checks the record against its GTS type and the types it derives from, checks that the connector is on and, for a record about a subject, that personalization is on with no erasure under way. It then keeps the record's identity, so that a resend is a repeat, hands the record to background processing, and answers received, repeat or refused at once. Until the Planner (Story 5.2) delivers the processing, a stub drops every received record with a content-free drop event. This document describes Story 5.7.2.
+Record Intake is the single entry for connectors (`cpt-cf-construct-component-results-api`). A connector sends one record per request for one tenant. Intake checks the record against its GTS type and the types it derives from, checks that the connector is on and, for a record about a subject, that personalization is on with no erasure under way. It then keeps the record's identity, so that a resend is a repeat, hands the record to background processing, and answers received, repeat or refused at once. Until the Planner delivers the processing, a stub drops every received record with a content-free drop event.
 
 ### 1.2 Purpose
 
@@ -56,12 +56,12 @@ The PRD requires Construct to take records one at a time, check each against its
 
 **Out of scope**:
 
-- The Planner's entry point and background processing; a stub that drops every record with a drop event stands in (Story 5.2).
-- Connectors on or off in the settings service. This feature reads the switch through a small interface whose first version takes the deployment config (every connector on unless configured off), the fallback Story 5.11 names; declaring and reading it in the settings service waits for 5.11.
+- The Planner's entry point and background processing; a stub that drops every record with a drop event stands in.
+- Connectors on or off in the settings service. This feature reads the switch through a small interface whose first version takes the deployment config (every connector on unless configured off); declaring and reading it in the settings service waits until it is decided whether the settings service runs in Construct's host.
 - Writing drop events to the Audit gear, which does not exist yet; they go to the structured log.
 - Erasure and retention of record identities.
 - How the personalization check, the identity insert and the later write stay in step when personalization is turned off between them; Admission's own check covers the write, and the DESIGN leaves the rest to later features.
-- Moving the connector side (the chat connector still sends a list to `/results/records`) to this wire format, Story 3.3 (ROL-16816).
+- Moving the connector side (the chat connector still sends a list to `/results/records`) to this wire format.
 
 **Requirements**: `cpt-cf-construct-fr-record-intake`, `cpt-cf-construct-fr-settings` (shared: records refused while personalization is off or an erasure is under way), `cpt-cf-construct-fr-access-control` (the tenant named at intake), `cpt-cf-construct-fr-tenant-isolation`.
 

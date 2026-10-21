@@ -161,7 +161,7 @@ pub enum DropStage {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum DropReason {
-    /// No planner is wired in yet (until Story 5.2).
+    /// No planner is wired in yet.
     NoPlanner,
     /// Processing could not finish.
     ProcessingFailed,

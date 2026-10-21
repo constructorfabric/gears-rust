@@ -2,7 +2,7 @@
 
 Record intake for connectors: a connector sends one record per request for one tenant, and Construct checks it against its GTS type and answers at once with received, repeat or refused. A received record is handed to background processing in the same transaction that keeps its identity.
 
-**Until the Planner exists (Story 5.2), every received record is dropped.** A record that passes the checks is answered `202`, its identity is kept, and a content-free drop event is logged; nothing from the record is processed. A resend of the same record is a repeat.
+**Until the Planner exists, every received record is dropped.** A record that passes the checks is answered `202`, its identity is kept, and a content-free drop event is logged; nothing from the record is processed. A resend of the same record is a repeat.
 
 **Features:**
 - One authenticated route, `POST /construct/v1/records?tenant=<tenant id>`, with one permission check (`construct.record` / `send`) for the named tenant

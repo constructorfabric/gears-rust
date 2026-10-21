@@ -9,8 +9,8 @@ use crate::domain::record_intake::ConnectorSwitch;
 
 /// [`ConnectorSwitch`] from the deployment config: every connector is on unless
 /// the config lists it as off. This is the first version, until the settings
-/// service holds connectors on or off as a tenant setting (Story 5.11 decides
-/// whether it runs in Construct's host); the domain sees only the switch, so
+/// service holds connectors on or off as a tenant setting (whether it runs in
+/// Construct's host is not decided yet); the domain sees only the switch, so
 /// the change does not reach it.
 ///
 /// @cpt-dod:cpt-cf-construct-dod-record-intake-connector-switch:p1
