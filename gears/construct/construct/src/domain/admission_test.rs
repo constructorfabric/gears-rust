@@ -131,8 +131,14 @@ async fn personalization_off_drops_the_plan() {
     assert_eq!(event.tenant_id, plan.tenant_id);
     assert_eq!(event.subject_id, Some(plan.subject_id));
     assert_eq!(event.connector, "connector-a");
-    assert_eq!(event.provenance, "chat_engine/thread-42/msg-7");
-    assert_eq!(event.version, "v1");
+    assert_eq!(
+        event.record_key,
+        crate::domain::record_intake::record_key(
+            "connector-a",
+            "chat_engine/thread-42/msg-7",
+            "v1"
+        )
+    );
     assert_eq!(event.type_id, construct_sdk::gts::CHAT_MESSAGE_TYPE);
 }
 

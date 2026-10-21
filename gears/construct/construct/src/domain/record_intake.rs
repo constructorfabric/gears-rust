@@ -103,9 +103,10 @@ impl Envelope {
     }
 }
 
-/// The identity intake keeps of a received record: the tenant, the connector,
-/// the record's provenance and version, and the subject it names. It holds no
-/// content.
+/// The identity of a received record: the tenant, the connector, the record's
+/// provenance and version, and the subject it names. Only its [`Self::key`] is
+/// stored or logged: a provenance can hold record content (a fact candidate's
+/// is the fact key and its value).
 #[domain_model]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecordId {
@@ -114,6 +115,31 @@ pub struct RecordId {
     pub provenance: String,
     pub version: String,
     pub subject_id: Option<Uuid>,
+}
+
+impl RecordId {
+    /// The record key: see [`record_key`].
+    #[must_use]
+    pub fn key(&self) -> String {
+        record_key(&self.connector, &self.provenance, &self.version)
+    }
+}
+
+/// The key of a record identity: the SHA-256, in hex, of its connector,
+/// provenance and version, each preceded by its length in bytes (8 bytes,
+/// big-endian). The lengths make the encoding injective, so no two different
+/// identities hash the same input, whatever bytes the parts hold, NUL included.
+/// The key is what intake stores and what a drop event names, so neither
+/// carries the provenance or the version.
+#[must_use]
+pub fn record_key(connector: &str, provenance: &str, version: &str) -> String {
+    let mut hash = aws_lc_rs::digest::Context::new(&aws_lc_rs::digest::SHA256);
+    for part in [connector, provenance, version] {
+        let bytes = part.as_bytes();
+        hash.update(&(bytes.len() as u64).to_be_bytes());
+        hash.update(bytes);
+    }
+    hex::encode(hash.finish())
 }
 
 /// What inserting a record identity found.
@@ -209,8 +235,9 @@ impl DropReason {
 }
 
 /// A content-free event for a dropped record: the tenant, the subject, the
-/// connector, the record's identity (provenance and version), its type, the
-/// stage that dropped it and why. It carries no record content. Record intake
+/// connector, the record key (never the provenance or the version, which can
+/// hold content), its type, the stage that dropped it and why. It carries no
+/// record content. Record intake
 /// owns its shape; the Planner, the Sensitive-Data Checks, Admission and the
 /// Profile Writer emit it.
 #[domain_model]
@@ -219,8 +246,7 @@ pub struct DropEvent {
     pub tenant_id: Uuid,
     pub subject_id: Option<Uuid>,
     pub connector: String,
-    pub provenance: String,
-    pub version: String,
+    pub record_key: String,
     pub type_id: String,
     pub stage: DropStage,
     pub reason: DropReason,
@@ -233,8 +259,11 @@ impl DropEvent {
             tenant_id: record.tenant_id,
             subject_id: record.envelope.subject_id,
             connector: record.connector.clone(),
-            provenance: record.envelope.provenance.clone(),
-            version: record.envelope.version.clone(),
+            record_key: record_key(
+                &record.connector,
+                &record.envelope.provenance,
+                &record.envelope.version,
+            ),
             type_id: record.envelope.type_id.clone(),
             stage,
             reason,
@@ -260,8 +289,7 @@ impl DropEvent {
             tenant_id: plan.tenant_id,
             subject_id: Some(plan.subject_id),
             connector: connector.clone(),
-            provenance: provenance.clone(),
-            version: version.clone(),
+            record_key: record_key(connector, provenance, version),
             type_id: type_id.clone(),
             stage,
             reason,

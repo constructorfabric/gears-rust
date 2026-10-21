@@ -9,6 +9,7 @@ use super::intake_events::LogIntakeEvents;
 use super::planner_stub::DroppingHandOff;
 use crate::domain::record_intake::{
     DropEvent, DropReason, DropStage, Envelope, IntakeEvents, ReceivedRecord, RecordHandOff,
+    record_key,
 };
 use crate::test_support::RecordingEvents;
 
@@ -62,8 +63,14 @@ fn a_drop_event_names_the_record_its_stage_and_its_reason() {
     assert_eq!(event.tenant_id, record.tenant_id);
     assert_eq!(event.subject_id, record.envelope.subject_id);
     assert_eq!(event.connector, record.connector);
-    assert_eq!(event.provenance, record.envelope.provenance);
-    assert_eq!(event.version, record.envelope.version);
+    assert_eq!(
+        event.record_key,
+        record_key(
+            &record.connector,
+            &record.envelope.provenance,
+            &record.envelope.version
+        )
+    );
     assert_eq!(event.type_id, record.envelope.type_id);
     assert_eq!(event.stage, DropStage::Admission);
     assert_eq!(event.reason, DropReason::ProcessingFailed);
@@ -114,8 +121,20 @@ fn the_drop_event_is_logged_without_record_content() {
     assert!(logs_contain("event=\"record_dropped\""));
     assert!(logs_contain(&format!("tenant_id={}", record.tenant_id)));
     assert!(logs_contain(&format!("subject_id={subject}")));
-    assert!(logs_contain("provenance=chat_engine/thread-42/msg-7"));
-    assert!(logs_contain("version=v1"));
+    assert!(logs_contain(&format!(
+        "record_key={}",
+        record_key(
+            &record.connector,
+            &record.envelope.provenance,
+            &record.envelope.version
+        )
+    )));
+    assert!(
+        !logs_contain("chat_engine/thread-42/msg-7"),
+        "no provenance"
+    );
+    assert!(!logs_contain("provenance"), "no provenance field");
+    assert!(!logs_contain("version"), "no version field");
     assert!(logs_contain("stage=\"planner\""));
     assert!(logs_contain("reason=\"no_planner\""));
     assert!(

@@ -4,7 +4,7 @@
 use toolkit_security::AccessScope;
 use uuid::Uuid;
 
-use super::record_ids_repo::{SeaOrmRecordIdRepository, record_key};
+use super::record_ids_repo::SeaOrmRecordIdRepository;
 use crate::domain::error::DomainError;
 use crate::domain::record_intake::{IdInsert, RecordId, RecordIdRepository};
 use crate::test_support::{inmem_db, stored_record_ids};
@@ -79,7 +79,7 @@ async fn an_insert_outside_the_scope_is_forbidden_and_stores_nothing() {
 #[test]
 fn the_key_separates_the_parts_of_the_identity() {
     let tenant = Uuid::new_v4();
-    let key = |c, p, v| record_key(&id(tenant, c, p, v));
+    let key = |c, p, v| id(tenant, c, p, v).key();
 
     assert_eq!(key("c", "p", "v"), key("c", "p", "v"));
     assert_eq!(key("c", "p", "v").len(), 64);

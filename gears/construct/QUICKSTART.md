@@ -91,7 +91,7 @@ Response `202`:
 The log shows the drop event, without the record's content:
 
 ```text
-record dropped event="record_dropped" tenant_id=00000000-df51-5b42-9538-d2b56b7ee953 subject_id=5d1f2c3a-8b4e-4c6d-9a1b-2c3d4e5f6a7b connector=11111111-6a88-4768-9dfc-6bcd5187d9ed provenance=chat_engine/thread-42/msg-7 version=2026-09-10T09:13:00Z record_type=gts.cf.connectors.core.record.v1~cf.construct.chat.message.v1~ stage="planner" reason="no_planner"
+record dropped event="record_dropped" tenant_id=00000000-df51-5b42-9538-d2b56b7ee953 subject_id=5d1f2c3a-8b4e-4c6d-9a1b-2c3d4e5f6a7b connector=11111111-6a88-4768-9dfc-6bcd5187d9ed record_key=ec8d74b4e17e2460d53844da5611d8930e4cd83f8152997413b3c973059be4ad record_type=gts.cf.connectors.core.record.v1~cf.construct.chat.message.v1~ stage="planner" reason="no_planner"
 ```
 
 The same request again answers `200`, and no second drop event is written:

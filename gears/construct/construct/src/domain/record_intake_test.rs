@@ -522,8 +522,8 @@ async fn until_the_planner_exists_a_record_is_received_and_dropped_with_an_event
     assert_eq!(dropped[0].subject_id, Some(subject));
     assert_eq!(dropped[0].connector, ctx.subject_id().to_string());
     assert_eq!(
-        (dropped[0].provenance.as_str(), dropped[0].version.as_str()),
-        ("chat/t/1", "v1")
+        dropped[0].record_key,
+        crate::domain::record_intake::record_key(&ctx.subject_id().to_string(), "chat/t/1", "v1")
     );
 }
 

@@ -48,7 +48,7 @@ The PRD requires Construct to take records one at a time, check each against its
 
 **The tenant and the connector.** A connector serves many tenants with one login, so it names the tenant in the `tenant` query parameter, never in the record (`cpt-cf-construct-fr-access-control`, as amended with this feature). The AuthZ resolver must authorize the connector for that tenant: intake asks for the resource type `construct.record` with the action `send`, passes the named tenant as the context tenant (root only) and as the owner tenant, and every later step runs under the scope this one decision returns. The connector identity is the subject id of the connector's login. The subject's settings are read only in the named tenant, also when the scope covers more than one tenant.
 
-**The record identity.** One row per tenant and record identity in `construct__record_ids` (`cpt-cf-construct-dbtable-record-ids`). The identity is (tenant, connector, provenance, version), as the record base type states. Inserting it is the repeat check, so two copies sent at once cannot both be received. The table holds no record content.
+**The record identity.** One row per tenant and record identity in `construct__record_ids` (`cpt-cf-construct-dbtable-record-ids`). The identity is (tenant, connector, provenance, version), as the record base type states, and it is kept only as its record key: the SHA-256 of connector, provenance and version. A provenance can hold record content (a fact candidate's is the fact key and its value), so the table stores neither the provenance nor the version, and no log line names them. Inserting the key is the repeat check, so two copies sent at once cannot both be received. The table holds no record content.
 
 **Taking a record.** The identity insert and the hand-off run in one transaction, which commits only after processing took the record. A hand-off that refuses (the Planner's full queue) rolls the identity back and answers `503`, so the connector can send the record again. A request cancelled before the commit, by a client that goes away or the gateway's timeout, leaves no identity behind either. A request cancelled while the commit is under way can leave the record handed off without its identity; a resend is then processed twice, which the Profile Writer's idempotent write tolerates.
 
@@ -111,7 +111,7 @@ The PRD requires Construct to take records one at a time, check each against its
 4. [x] - `p1` - Run `cpt-cf-construct-algo-record-intake-check-record` on the record. **IF** it is refused, **RETURN** the refusal (`422`) - `inst-submit-refused`
 5. [x] - `p1` - **IF** the connector is off for the tenant, **RETURN** a refusal `CONNECTOR_OFF` - `inst-submit-connector`
 6. [x] - `p1` - **IF** the record names a subject, read the subject's settings in the named tenant under the scope of step 3 (`cpt-cf-construct-algo-subject-settings-read`). **IF** that scope does not cover the subject's settings, **RETURN** forbidden (`403`): a row the scope leaves out never becomes the tenant's default. **IF** an erasure is under way, **RETURN** a refusal `ERASURE_IN_PROGRESS`; **IF** personalization is off, **RETURN** a refusal `PERSONALIZATION_OFF`. A record without a subject skips this step - `inst-submit-subject`
-7. [x] - `p1` - DB: in one transaction, INSERT the identity (tenant, the SHA-256 of connector, provenance and version, the parts, the subject and the time received) into `construct__record_ids` through the secure ORM, checked against the scope of step 3 - `inst-submit-insert`
+7. [x] - `p1` - DB: in one transaction, INSERT the identity (tenant, the record key, the connector, the subject and the time received) into `construct__record_ids` through the secure ORM, checked against the scope of step 3 - `inst-submit-insert`
 8. [x] - `p1` - **IF** the identity is there already, **RETURN** repeat (`200`) - `inst-submit-repeat`
 9. [x] - `p1` - Otherwise hand the record to processing (`cpt-cf-construct-algo-record-intake-hand-off`). **IF** processing refuses it, roll the transaction back and **RETURN** unavailable (`503`). Otherwise commit and **RETURN** received (`202`) - `inst-submit-received`
 10. [x] - `p1` - API: write the outcome as `{"outcome": "received" | "repeat"}` with its status; map an error inside a span that names the tenant and the connector, so its one log line names them too - `inst-submit-answer`
@@ -154,7 +154,7 @@ The PRD requires Construct to take records one at a time, check each against its
 
 **Input**: A received record that processing drops, the stage that drops it, and the reason.
 
-**Output**: One content-free event: tenant, subject, connector, record identity (provenance and version), record type, stage (`planner`, `checks`, `admission`, `writer`) and reason: `no_planner` and `processing_failed`, and, from the Sensitive-Data Checks and Admission (Story 5.7.3), `check_failed`, `personalization_off`, `erasure_in_progress`, `untrusted_source`, `below_confidence_floor`, `entity_kind_not_allowed` and `write_cap_exceeded`. A plan with no record behind it (an agent's, a reviewer's or an administrator's) has no drop event; its caller gets the reason in the result.
+**Output**: One content-free event: tenant, subject, connector, record key (never the provenance or the version), record type, stage (`planner`, `checks`, `admission`, `writer`) and reason: `no_planner` and `processing_failed`, and, from the Sensitive-Data Checks and Admission, `check_failed`, `personalization_off`, `erasure_in_progress`, `untrusted_source`, `below_confidence_floor`, `entity_kind_not_allowed` and `write_cap_exceeded`. A plan with no record behind it (an agent's, a reviewer's or an administrator's) has no drop event; its caller gets the reason in the result.
 
 **Steps**:
 1. [x] - `p1` - Write the event to the structured log at warn level under the target `construct::audit`, until the Audit gear ships. The subject is a plain id, only when the record names one; no record content is written. The Planner, the Sensitive-Data Checks, Admission and the Profile Writer emit it - `inst-drop-event-log`
@@ -198,7 +198,7 @@ Intake **MUST** authorize the connector for the named tenant once, refuse a reco
 
 - [x] `p1` - **ID**: `cpt-cf-construct-dod-record-intake-storage`
 
-The system **MUST** supply a migration, `m003_record_ids`, that creates `construct__record_ids` (tenant, record key, connector, provenance, version, optional subject, time received) with the primary key (tenant, record key) and the index `idx_construct__record_ids__subject`, and drops the foundation's placeholder table `construct__foundation_notes`. `initial_001` is not edited. The record key is the SHA-256, in hex, of the connector, the provenance and the version, each prefixed with its length as an 8-byte big-endian integer so that no two identities give the same input, because the identity can be longer than a MySQL key. The entity is tenant-scoped for the secure ORM.
+The system **MUST** supply a migration, `m003_record_ids`, that creates `construct__record_ids` (tenant, record key, connector, provenance, version, optional subject, time received) with the primary key (tenant, record key) and the index `idx_construct__record_ids__subject`, and drops the foundation's placeholder table `construct__foundation_notes`, and a migration, `m004_record_ids_key_only`, that drops the provenance and version columns, since a provenance can hold record content; it is safe to run twice. `initial_001` and `m003_record_ids` are not edited. The record key is the SHA-256, in hex, of the connector, the provenance and the version, each prefixed with its length as an 8-byte big-endian integer so that no two identities give the same input, because the identity can be longer than a MySQL key. The entity is tenant-scoped for the secure ORM.
 
 **Implements**:
 - `cpt-cf-construct-flow-record-intake-submit`
@@ -206,7 +206,7 @@ The system **MUST** supply a migration, `m003_record_ids`, that creates `constru
 **Touches**:
 - DB Table: `construct__record_ids` (`cpt-cf-construct-dbtable-record-ids`), `construct__foundation_notes` (dropped)
 
-**Verified by**: `every_backend_keys_the_table_by_tenant_then_record_key`, `the_placeholder_note_table_is_dropped` (runs the migrations on SQLite and checks the table is gone), `identifiers_are_namespaced_and_within_63_bytes`, `the_names_sort_in_the_order_the_migrations_must_run` (migrations), `a_new_identity_is_inserted`, `a_second_insert_of_the_same_identity_is_a_repeat`, `an_insert_outside_the_scope_is_forbidden_and_stores_nothing`, `the_key_separates_the_parts_of_the_identity` (repository). The SQLite DDL runs in every test; the MySQL and PostgreSQL DDL is only asserted as text. No test: the `down` step.
+**Verified by**: `every_backend_keys_the_table_by_tenant_then_record_key`, `the_placeholder_note_table_is_dropped` (runs the migrations on SQLite and checks the table is gone), `the_identity_table_keeps_no_provenance_or_version` (runs the migrations on SQLite, checks the two columns are gone and the step runs twice), `identifiers_are_namespaced_and_within_63_bytes`, `the_names_sort_in_the_order_the_migrations_must_run` (migrations), `a_new_identity_is_inserted`, `a_second_insert_of_the_same_identity_is_a_repeat`, `an_insert_outside_the_scope_is_forbidden_and_stores_nothing`, `the_key_separates_the_parts_of_the_identity` (repository). The SQLite DDL runs in every test; the MySQL and PostgreSQL DDL is only asserted as text. No test: the `down` step.
 
 ### Connector Switch
 
@@ -234,7 +234,7 @@ A received record **MUST** go to processing through one interface that returns a
 
 - [x] `p1` - **ID**: `cpt-cf-construct-dod-record-intake-drop-event`
 
-The system **MUST** define one content-free drop event (tenant, subject, connector, record identity, stage, reason) and write it to the structured log until the Audit gear ships.
+The system **MUST** define one content-free drop event (tenant, subject, connector, record key, record type, stage, reason), which names neither the provenance nor the version and write it to the structured log until the Audit gear ships.
 
 **Implements**:
 - `cpt-cf-construct-algo-record-intake-drop-event`
