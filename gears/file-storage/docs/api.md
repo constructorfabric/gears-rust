@@ -285,6 +285,11 @@ refuses to start without `FS_SIDECAR_INTERNAL_TOKEN`; see `docs/ADR/0003-…-sid
 section for the mechanism (interim gear-local shared secret). A client-visible `fs-token` alone can not drive these
 two routes.
 
+**Token expiry.** Both routes accept the `fs-token` for up to `finalize_token_grace_secs` past its `exp` (default
+1 h, `0` enforces `exp` strictly, capped at 7 days), so an upload that outlives the token's TTL can still finalize
+or report its parts. The grace applies only to these callbacks: the sidecar checks `exp` strictly when a `PUT`
+starts.
+
 
 **`D1` finalize** — called once after a successful single-part `PUT` (or, from the sidecar's own perspective, after
 each part write in the multipart case — see `D2`).
@@ -298,10 +303,10 @@ each part write in the multipart case — see `D2`).
   SHA-256 is persisted as is. The version's `mime_type` is re-validated/resolved from a ranged read of the object's
   leading bytes (magic-byte sniffing) and persisted, and the version is marked `available`.
 - **Response**: `204 No Content`. Errors: `400` (validation/size mismatch, no object, or a replay against an
-  already-`available` version with a different size or hash), `403` (bad/expired/mismatched token, **or**
-  missing/mismatched `x-fs-internal-token` — see above), `404` (version not found), `500` (a permanent backend fault
-  reading the object's length or prefix), `503` (a transient one — network, timeout, backend overload — carries
-  `Retry-After`).
+  already-`available` version with a different size or hash), `403` (bad/mismatched token, a token expired beyond
+  the grace, **or** missing/mismatched `x-fs-internal-token` — see above), `404` (version not found), `500` (a
+  permanent backend fault reading the object's length or prefix), `503` (a transient one — network, timeout, backend
+  overload — carries `Retry-After`).
 - For a `bind: "manual"` upload (and `POST /files/{id}/versions`, which never auto-binds) this endpoint does **not**
   bind the version as current — `POST /files/{id}/bind` remains a separate, explicit client call. For the default
   `bind: "auto"` it binds inline under the same CAS and reports the outcome instead — see "Single-part bind outcome
@@ -317,9 +322,9 @@ populates `multipart_upload_parts`, the table `complete` assembles from.
   later as an opaque `400` at `complete`, charged against whichever caller happens to call `complete`, not the one
   that reported the bad hash.
 - **Response**: `204 No Content`. Errors: `400` (malformed/wrong-length `hash_hex`, or a reported `size` that does not
-  match the per-part size minted into the token at initiate time), `403` (bad/expired/mismatched token, **or**
-  missing/mismatched `x-fs-internal-token` — see above), `404`, `409` (the session is no longer
-  `in_progress` — already completed/aborted/expired), `500`.
+  match the per-part size minted into the token at initiate time), `403` (bad/mismatched token, a token expired
+  beyond the grace, **or** missing/mismatched `x-fs-internal-token` — see above), `404`, `409` (the session is no
+  longer `in_progress` — already completed/aborted/expired), `500`.
 
 ## P2 — Multipart upload
 
