@@ -94,13 +94,16 @@ pub fn type_traits_columns(query: Select<gts_type::Entity>) -> Select<gts_type::
         .column(gts_type::Column::EffectiveTraits)
 }
 
-/// An edge's own id and the two nodes it holds: what a delete needs to
-/// tombstone it and to check its endpoints are visible.
+/// An edge's own id, the two nodes it holds and whether it is tombstoned:
+/// what a delete needs to tombstone it and to check its endpoints are
+/// visible, in one read, so a revive that commits after the read cannot
+/// change the answer halfway.
 #[derive(Debug, sea_orm::FromQueryResult)]
 pub struct EdgeEnds {
     pub id: i64,
     pub src_node_id: i64,
     pub dst_node_id: i64,
+    pub deleted_at: Option<time::OffsetDateTime>,
 }
 
 pub fn edge_ends_columns(query: Select<edge::Entity>) -> Select<edge::Entity> {
@@ -109,6 +112,7 @@ pub fn edge_ends_columns(query: Select<edge::Entity>) -> Select<edge::Entity> {
         .column(edge::Column::Id)
         .column(edge::Column::SrcNodeId)
         .column(edge::Column::DstNodeId)
+        .column(edge::Column::DeletedAt)
 }
 
 /// The scope that owns an edge, for a write that matched nothing to say
@@ -137,16 +141,21 @@ pub fn node_state_columns(query: Select<node::Entity>) -> Select<node::Entity> {
     query.select_only().column(node::Column::DeletedAt)
 }
 
-/// Whether an edge is tombstoned: what a delete that lost its
-/// compare-and-set asks, to tell a row already deleted from a key now held by
-/// another.
+/// Which row holds an edge key and whether it is tombstoned: what a delete
+/// that lost its compare-and-set asks, to tell a row already deleted, or
+/// deleted and revived, from a key now held by another row; and the ids a
+/// node delete tombstones its incident edges by.
 #[derive(Debug, sea_orm::FromQueryResult)]
 pub struct EdgeState {
+    pub id: i64,
     pub deleted_at: Option<time::OffsetDateTime>,
 }
 
 pub fn edge_state_columns(query: Select<edge::Entity>) -> Select<edge::Entity> {
-    query.select_only().column(edge::Column::DeletedAt)
+    query
+        .select_only()
+        .column(edge::Column::Id)
+        .column(edge::Column::DeletedAt)
 }
 
 /// A registered type without its schema.
@@ -301,20 +310,20 @@ mod tests {
     }
 
     #[test]
-    fn an_edges_ends_read_three_columns() {
+    fn an_edges_ends_read_four_columns() {
         holds(
             &rendered(&edge_ends_columns(edge::Entity::find())),
             &WIDE_EDGE,
-            &["id", "src_node_id", "dst_node_id"],
+            &["id", "src_node_id", "dst_node_id", "deleted_at"],
         );
     }
 
     #[test]
-    fn an_edges_state_reads_one_column() {
+    fn an_edges_state_reads_two_columns() {
         holds(
             &rendered(&edge_state_columns(edge::Entity::find())),
             &WIDE_EDGE,
-            &["deleted_at"],
+            &["id", "deleted_at"],
         );
     }
 
