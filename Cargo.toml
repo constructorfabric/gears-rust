@@ -50,6 +50,8 @@ debug = true
 
 [workspace]
 members = [
+    "gears/system/durable-execution/durable-execution",
+    "gears/system/durable-execution/durable-execution-sdk",
     "apps/cf-gears-example-server",
     "apps/cf-gears-flight-control",
     "tools/gts-analyze",
@@ -198,6 +200,8 @@ members = [
     "gears/system/event-broker/plugins/sqlite-event-broker-plugin",
     "gears/system/admission-control/admission-control-sdk",
     "gears/system/admission-control/admission-control",
+    "gears/system/policy-engine/policy-engine-sdk",
+    "gears/system/policy-engine/policy-engine",
 ]
 exclude = ["tools/fuzz"]
 resolver = "3"
@@ -332,6 +336,13 @@ verbose_file_reads = "deny"
 [workspace.dependencies]
 cel-core = "=0.5.1"
 quota-enforcement-engine-cel = { package = "cf-gears-quota-enforcement-engine-cel", version = "0.1.0", path = "gears/system/quota-enforcement/plugins/quota-enforcement-engine-cel" }
+durable-execution = { package = "cf-gears-durable-execution", version = "0.1.0", path = "gears/system/durable-execution/durable-execution" }
+durable-execution-sdk = { package = "cf-gears-durable-execution-sdk", version = "0.1.0", path = "gears/system/durable-execution/durable-execution-sdk" }
+apalis = { version = "=1.0.0-rc.10", default-features = false, features = ["tracing", "limit"] }
+apalis-core = "=1.0.0-rc.10"
+# Keep SQLx runtime/TLS settings in the workspace. The adapter's default
+# tokio-comp feature enables rustls/ring alongside our aws-lc-rs provider.
+apalis-postgres = { version = "=1.0.0-rc.9", default-features = false, features = ["migrate"] }
 # libs
 toolkit = { package = "cf-gears-toolkit", version = "0.10.0", path = "libs/toolkit" }
 toolkit-http = { package = "cf-gears-toolkit-http", version = "0.6.18", path = "libs/toolkit-http" }
@@ -374,8 +385,8 @@ rustls-cng-crypto = { version = "0.1", default-features = false, features = ["fi
 # field of SEC1 (rather than derived from the scalar in non-FIPS code),
 # preserving the FIPS-validated boundary at corecrypto for every
 # cryptographic operation. See ADR 0004.
-pkcs8 = "0.10"
-sec1 = { version = "0.7", default-features = false, features = ["alloc", "der"] }
+pkcs8 = "0.11"
+sec1 = { version = "0.8", default-features = false, features = ["alloc", "der"] }
 
 toolkit-contract = { package = "cf-gears-toolkit-contract", version = "0.4.0", path = "libs/toolkit-contract" }
 toolkit-contract-macros = { package = "cf-gears-toolkit-contract-macros", version = "0.1.6", path = "libs/toolkit-contract-macros" }
@@ -461,8 +472,8 @@ bss-money = { package = "cf-gears-bss-money", version = "0.1.0", path = "gears/b
 aws-lc-rs = "1.17"
 
 # settings-service
-settings-service-sdk = { package = "cf-gears-settings-service-sdk", version = "0.1.0", path = "gears/settings-service/settings-service-sdk" }
-settings-service = { package = "cf-gears-settings-service", version = "0.1.4", path = "gears/settings-service/settings-service" }
+settings-service-sdk = { package = "cf-gears-settings-service-sdk", version = "0.2.0", path = "gears/settings-service/settings-service-sdk" }
+settings-service = { package = "cf-gears-settings-service", version = "0.1.6", path = "gears/settings-service/settings-service" }
 
 # credstore
 credstore-sdk = { package = "cf-gears-credstore-sdk", version = "0.2.17", path = "gears/credstore/credstore-sdk" }
@@ -515,6 +526,7 @@ async-stream = { version = "0.3" }
 # High-performance data structures
 dashmap = "6.1"
 arc-swap = "1.7"
+lru = "0.18.2"
 
 # Security
 zeroize = { version = "1", features = ["derive"] }
@@ -901,9 +913,11 @@ license-resolver-sdk = { package = "cf-gears-license-resolver-sdk", version = "0
 license-resolver = { package = "cf-gears-license-resolver", version = "0.1.5", path = "gears/system/license-resolver/license-resolver" }
 static-license-plugin = { package = "cf-gears-static-license-plugin", version = "0.1.5", path = "gears/system/license-resolver/plugins/static-license-plugin" }
 
-# Admission control
+# Admission control + policy engine
 admission-control-sdk = { package = "cf-gears-admission-control-sdk", version = "0.1.0", path = "gears/system/admission-control/admission-control-sdk" }
 admission-control = { package = "cf-gears-admission-control", version = "0.1.0", path = "gears/system/admission-control/admission-control" }
+policy-engine-sdk = { package = "cf-gears-policy-engine-sdk", version = "0.1.0", path = "gears/system/policy-engine/policy-engine-sdk" }
+policy-engine = { package = "cf-gears-policy-engine", version = "0.1.0", path = "gears/system/policy-engine/policy-engine" }
 # Rego interpreter backing `toolkit-policy-evaluation`. Never enable `mimalloc` /
 # `allocator-memory-limits` (they assign a global allocator), `http`, `uuid`
 # or `opa-runtime`. Pinned exactly: the denylists and structural guards are

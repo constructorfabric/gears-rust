@@ -19,8 +19,10 @@ fn pkcs8_to_pkcs1_rsa(pkcs8: &PrivateKeyDer<'_>) -> PrivateKeyDer<'static> {
         PrivateKeyDer::Pkcs8(p) => p.secret_pkcs8_der(),
         other => panic!("expected PKCS#8 input, got {other:?}"),
     };
-    let info = pkcs8::PrivateKeyInfo::try_from(bytes).expect("parse PKCS#8");
-    PrivateKeyDer::Pkcs1(PrivatePkcs1KeyDer::from(info.private_key.to_vec()))
+    let info = pkcs8::PrivateKeyInfoRef::try_from(bytes).expect("parse PKCS#8");
+    PrivateKeyDer::Pkcs1(PrivatePkcs1KeyDer::from(
+        info.private_key.as_bytes().to_vec(),
+    ))
 }
 
 /// Loading + immediate usability: after `new`, the key must offer at

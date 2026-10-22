@@ -91,8 +91,8 @@ Two backend plugins currently exist: `static-credstore-plugin` (in-memory,
 for dev/test, feature `static-credstore`) and `vault-credstore-plugin`
 (Vault/OpenBao KV v2, the production-grade reference implementation,
 feature `vault-credstore`, vendor `"openbao"`) — see its
-[README](plugins/vault-credstore-plugin/README.md) for local setup against
-OpenBao, and its [docs](plugins/vault-credstore-plugin/docs/DESIGN.md) for the
+`plugins/vault-credstore-plugin/README.md` for local setup against
+OpenBao, and its `plugins/vault-credstore-plugin/docs/DESIGN.md` for the
 mount requirements, token delivery and ACL policy.
 
 ## PDP actions and permissions

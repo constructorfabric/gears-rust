@@ -469,7 +469,7 @@ The system **MUST** return the following error codes for proxy and management op
 
 ## 6. Non-Functional Requirements
 
-> **Global baselines**: Project-wide NFRs (performance, security, reliability, scalability) defined in root PRD and [guidelines/](../guidelines/). Document only gear-specific NFRs here: **exclusions** from defaults or **standalone** requirements.
+> **Global baselines**: Project-wide NFRs (performance, security, reliability, scalability) defined in root PRD and [guidelines/](../../../../guidelines/). Document only gear-specific NFRs here: **exclusions** from defaults or **standalone** requirements.
 >
 > **Testing strategy**: NFRs verified via automated benchmarks, security scans, and monitoring unless otherwise specified.
 

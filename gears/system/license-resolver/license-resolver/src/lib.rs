@@ -1,7 +1,7 @@
 //! License Resolver Gear
 //!
 //! Realizes the single `is_licensed` check of
-//! [`LicenseResolverClient`](license_resolver_sdk::LicenseResolverClient): it
+//! [`LicenseResolverApi`](license_resolver_sdk::LicenseResolverApi): it
 //! validates the request against the licensing contracts it declares, discovers
 //! a backend plugin via types-registry (vendor + priority), and delegates.
 //!

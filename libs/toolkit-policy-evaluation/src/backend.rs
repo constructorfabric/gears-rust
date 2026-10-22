@@ -190,8 +190,9 @@ pub trait CompiledDocument: Send + Sync + fmt::Debug {
 
     /// Evaluates the document's entrypoint against `ctx` under `bound`.
     ///
-    /// Returns the entrypoint's value converted to JSON; an entrypoint that
-    /// is undefined for this input yields [`serde_json::Value::Null`].
+    /// Returns the entrypoint's value converted to JSON, or `None` when the
+    /// entrypoint is undefined for this input. A defined `null` value is
+    /// `Some(Value::Null)`, never confused with an undefined rule.
     ///
     /// # Errors
     ///
@@ -205,7 +206,7 @@ pub trait CompiledDocument: Send + Sync + fmt::Debug {
         &self,
         ctx: &EvaluationContext,
         bound: CostBound,
-    ) -> Result<serde_json::Value, EvaluationError>;
+    ) -> Result<Option<serde_json::Value>, EvaluationError>;
 }
 
 /// A policy-language backend: syntax validation separate from evaluation,

@@ -79,6 +79,7 @@ impl Harness {
             category_id: self.base.category_id(),
             default_value: json!(false),
             scope_class: "cascading".to_owned(),
+            display_name: None,
             description: Some("a demo setting".to_owned()),
             mode: None,
             requires_step_up: None,
@@ -399,6 +400,7 @@ async fn the_row_write_itself_is_conditional_on_the_version_the_tag_was_compared
     let all = AccessScope::allow_all();
     let metadata = || DeclarationMetadata {
         mode: current.mode.clone(),
+        display_name: None,
         description: Some("moved".to_owned()),
         domain_affinity: None,
         licence_feature: None,
@@ -658,6 +660,7 @@ async fn contributed_at_the_admin_key(h: &Harness, name: &str) -> Uuid {
                 source: "module_contributed".to_owned(),
                 owner_module: Some("module-x".to_owned()),
                 licence_feature: None,
+                display_name: None,
                 description: None,
                 created_by: "module-x".to_owned(),
             },
@@ -1156,6 +1159,7 @@ fn every_field_falls_into_exactly_one_class() {
         domain_affinity: None,
         licence_feature: None,
         owner_module: None,
+        display_name: None,
         description: None,
         default_value: json!(false),
         has_secret_trait: false,
@@ -1531,4 +1535,390 @@ async fn a_revive_that_cannot_happen_says_why_before_the_default_is_judged() {
         ),
         other => panic!("the revive's own refusal first, got {other:?}"),
     }
+}
+
+// ── The display name ─────────────────────────────────────────────────────────
+
+/// The declaration `classify_field` is asked about, without a label.
+fn classified_declaration() -> Declaration {
+    Declaration {
+        id: Uuid::new_v4(),
+        key: "gts.cf.core.settings.setting_type.v1~acme.settings.network.x.v1~".to_owned(),
+        leaf_slug: "x".to_owned(),
+        value_type_id: BOOL.to_owned(),
+        category_id: Uuid::new_v4(),
+        scope_class: "cascading".to_owned(),
+        mode: "standard".to_owned(),
+        status: "active".to_owned(),
+        domain_affinity: None,
+        licence_feature: None,
+        owner_module: None,
+        display_name: None,
+        description: None,
+        default_value: json!(false),
+        has_secret_trait: false,
+        data_classification: "pii".to_owned(),
+        requires_step_up: true,
+        anonymous_exposable: false,
+        source: "admin_authored".to_owned(),
+        last_change_at: time::OffsetDateTime::now_utc(),
+        updated_at: time::OffsetDateTime::now_utc(),
+    }
+}
+
+/// Whether a refusal is the validation error that names `display_name`.
+fn names_display_name(err: &DomainError) -> bool {
+    matches!(err, DomainError::Validation { field, .. } if field == "display_name")
+}
+
+#[test]
+fn a_display_name_edit_is_immediate_and_null_clears_it() {
+    // A label changes no effective value, so it applies at once like the
+    // description, and an explicit null is the way to remove it.
+    let declaration = classified_declaration();
+    let padded_to_the_bound = format!("  {}  ", "x".repeat(256));
+    for value in [
+        json!("Minimum TLS version"),
+        json!("x"),
+        json!("\u{451}".repeat(256)),
+        json!(padded_to_the_bound),
+        json!(null),
+    ] {
+        assert_eq!(
+            classify_field("display_name", &value, &declaration).expect("classified"),
+            FieldClass::Immediate,
+            "{value}"
+        );
+    }
+}
+
+#[test]
+fn a_display_name_of_the_wrong_shape_or_length_is_a_validation_error_naming_it() {
+    // The bound is counted in characters after trimming, not bytes: 256 `ё`
+    // are 512 bytes and pass, 257 characters do not.
+    let declaration = classified_declaration();
+    for value in [
+        json!(7),
+        json!(true),
+        json!(["x"]),
+        json!({}),
+        json!(""),
+        json!("   "),
+        json!("x".repeat(257)),
+        json!("\u{451}".repeat(257)),
+    ] {
+        let err = classify_field("display_name", &value, &declaration).expect_err("refused");
+        assert!(names_display_name(&err), "{value}: {err:?}");
+    }
+}
+
+#[tokio::test]
+async fn a_created_display_name_is_stored_trimmed_and_an_absent_one_stays_null() {
+    // The trimmed value is what is stored and what search matches. Nothing is
+    // derived from the leaf name when the label is left out.
+    let h = Harness::new().await;
+    let mut request = h.request("with_label");
+    request.display_name = Some("  Minimum TLS version  ".to_owned());
+    let created = h.create(request, &admin_actor()).await.expect("created");
+    assert_eq!(
+        created.declaration.display_name.as_deref(),
+        Some("Minimum TLS version")
+    );
+    assert_eq!(
+        h.load(created.declaration.id).await.display_name.as_deref(),
+        Some("Minimum TLS version")
+    );
+
+    let bare = h
+        .create(h.request("without_label"), &admin_actor())
+        .await
+        .expect("created");
+    assert_eq!(bare.declaration.display_name, None, "never derived");
+}
+
+#[tokio::test]
+async fn a_create_with_an_empty_or_over_long_display_name_is_refused_naming_it() {
+    let h = Harness::new().await;
+    for (n, bad) in ["", "   ", &"x".repeat(257)].into_iter().enumerate() {
+        let mut request = h.request(&format!("refused_{n}"));
+        request.display_name = Some(bad.to_owned());
+        let err = h
+            .create(request, &admin_actor())
+            .await
+            .expect_err("refused");
+        assert!(names_display_name(&err), "{n}: {err:?}");
+    }
+}
+
+#[tokio::test]
+async fn a_display_name_is_set_cleared_and_left_alone_by_a_patch() {
+    // Absent is unchanged, present sets, null clears: the three states a
+    // partial update has to tell apart.
+    let h = Harness::new().await;
+    let created = h
+        .create(h.request("labelled"), &admin_actor())
+        .await
+        .expect("created");
+    let id = created.declaration.id;
+
+    let tag = etag_of(&h.load(id).await);
+    let set = h
+        .update(
+            id,
+            Some(tag.as_str()),
+            json!({"display_name": "Minimum TLS version"}),
+            &admin_actor(),
+        )
+        .await
+        .expect("set");
+    assert_eq!(set.display_name.as_deref(), Some("Minimum TLS version"));
+
+    let tag = etag_of(&set);
+    let untouched = h
+        .update(
+            id,
+            Some(tag.as_str()),
+            json!({"description": "another"}),
+            &admin_actor(),
+        )
+        .await
+        .expect("a patch without the field");
+    assert_eq!(
+        untouched.display_name.as_deref(),
+        Some("Minimum TLS version"),
+        "absent from the body means unchanged"
+    );
+
+    let tag = etag_of(&untouched);
+    let cleared = h
+        .update(
+            id,
+            Some(tag.as_str()),
+            json!({"display_name": null}),
+            &admin_actor(),
+        )
+        .await
+        .expect("cleared");
+    assert_eq!(cleared.display_name, None, "an explicit null clears it");
+}
+
+#[tokio::test]
+async fn a_display_name_edit_moves_the_edit_tag_and_not_the_value_resolution_tag() {
+    // Same rule as `mode` and `description`: a label changes no resolution, so
+    // `last_change_at` stays and only the tag a console holds moves.
+    let h = Harness::new().await;
+    let created = h
+        .create(h.request("labelled"), &admin_actor())
+        .await
+        .expect("created");
+    let before = h.load(created.declaration.id).await;
+    let tag = etag_of(&before);
+
+    let after = h
+        .update(
+            before.id,
+            Some(tag.as_str()),
+            json!({"display_name": "Label"}),
+            &admin_actor(),
+        )
+        .await
+        .expect("edited");
+    assert!(after.updated_at > before.updated_at, "the tag moved");
+    assert_eq!(after.last_change_at, before.last_change_at);
+}
+
+#[tokio::test]
+async fn a_patch_with_an_invalid_display_name_is_refused_and_changes_nothing() {
+    let h = Harness::new().await;
+    let mut request = h.request("labelled");
+    request.display_name = Some("Keep me".to_owned());
+    let created = h.create(request, &admin_actor()).await.expect("created");
+    let id = created.declaration.id;
+
+    for bad in [json!(""), json!("   "), json!("x".repeat(257)), json!(3)] {
+        let tag = etag_of(&h.load(id).await);
+        let err = h
+            .update(
+                id,
+                Some(tag.as_str()),
+                json!({ "display_name": bad }),
+                &admin_actor(),
+            )
+            .await
+            .expect_err("refused");
+        assert!(names_display_name(&err), "{bad}: {err:?}");
+    }
+    assert_eq!(
+        h.load(id).await.display_name.as_deref(),
+        Some("Keep me"),
+        "a refused edit leaves the stored label"
+    );
+}
+
+#[tokio::test]
+async fn a_contributed_declarations_display_name_is_not_admin_editable() {
+    // The owning gear is the sole authority over its metadata; its label
+    // arrives by re-registration, never by `PATCH`.
+    let h = Harness::verified().await;
+    let id = h
+        .base
+        .declare_labelled(
+            "contributed",
+            crate::domain::resolution::scope_class::CASCADING,
+            json!(true),
+            "Module label",
+        )
+        .await;
+    let tag = etag_of(&h.load(id).await);
+
+    for patch in [
+        json!({"display_name": "mine now"}),
+        json!({"display_name": null}),
+    ] {
+        let err = h
+            .update(id, Some(tag.as_str()), patch.clone(), &admin_actor())
+            .await
+            .expect_err("contributed");
+        assert_contributed_immutable(err, &patch.to_string());
+    }
+    assert_eq!(
+        h.load(id).await.display_name.as_deref(),
+        Some("Module label")
+    );
+}
+
+#[test]
+fn a_display_name_with_a_control_character_is_a_validation_error_naming_it() {
+    // A label is one line of text a console renders; NUL, line breaks, tabs
+    // and the C1 range are refused, whatever the surrounding text.
+    let declaration = classified_declaration();
+    for value in [
+        json!("a\u{0}b"),
+        json!("a\nb"),
+        json!("a\tb"),
+        json!("a\u{85}b"),
+        json!("a\u{7f}b"),
+    ] {
+        let err = classify_field("display_name", &value, &declaration).expect_err("refused");
+        assert!(names_display_name(&err), "{value}: {err:?}");
+    }
+}
+
+#[tokio::test]
+async fn a_create_with_a_control_character_in_the_display_name_is_refused_naming_it() {
+    let h = Harness::new().await;
+    let mut request = h.request("control");
+    request.display_name = Some("a\u{0}b".to_owned());
+    let err = h
+        .create(request, &admin_actor())
+        .await
+        .expect_err("refused");
+    assert!(names_display_name(&err), "{err:?}");
+}
+
+#[tokio::test]
+async fn a_patch_stores_the_trimmed_boundary_value_and_a_one_character_value() {
+    // The accepted boundary holds on a PATCH as on a create: 256 multi-byte
+    // characters pass once the padding is trimmed, and the stored row carries
+    // the trimmed value; a single character is enough.
+    let h = Harness::new().await;
+    let created = h
+        .create(h.request("boundary"), &admin_actor())
+        .await
+        .expect("created");
+    let id = created.declaration.id;
+    let core = "\u{451}".repeat(256);
+
+    let tag = etag_of(&h.load(id).await);
+    let padded = h
+        .update(
+            id,
+            Some(tag.as_str()),
+            json!({"display_name": format!("  {core}\t ")}),
+            &admin_actor(),
+        )
+        .await
+        .expect("accepted");
+    assert_eq!(padded.display_name.as_deref(), Some(core.as_str()));
+    assert_eq!(
+        h.load(id).await.display_name.as_deref(),
+        Some(core.as_str()),
+        "the stored row carries the trimmed value"
+    );
+
+    let tag = etag_of(&padded);
+    let one = h
+        .update(
+            id,
+            Some(tag.as_str()),
+            json!({"display_name": "x"}),
+            &admin_actor(),
+        )
+        .await
+        .expect("accepted");
+    assert_eq!(one.display_name.as_deref(), Some("x"));
+}
+
+/// The `display_name` a recorded image carries, whatever its class wrapper.
+fn image_display_name(image: Option<&crate::audit::AuditValue>) -> Value {
+    let image = serde_json::to_value(image.expect("an image")).expect("serialises");
+    image["value"]["display_name"].clone()
+}
+
+#[tokio::test]
+async fn the_audit_images_carry_the_display_name_before_and_after_each_edit() {
+    // The record is the only trace of a label edit, so both snapshots must
+    // hold it: trimmed on create, old and new on a change, null once cleared.
+    let h = Harness::new().await;
+    let mut request = h.request("audited");
+    request.display_name = Some("  Old label  ".to_owned());
+    let created = h.create(request, &admin_actor()).await.expect("created");
+    let id = created.declaration.id;
+
+    let tag = etag_of(&h.load(id).await);
+    let renamed = h
+        .update(
+            id,
+            Some(tag.as_str()),
+            json!({"display_name": "New label"}),
+            &admin_actor(),
+        )
+        .await
+        .expect("renamed");
+    let tag = etag_of(&renamed);
+    h.update(
+        id,
+        Some(tag.as_str()),
+        json!({"display_name": null}),
+        &admin_actor(),
+    )
+    .await
+    .expect("cleared");
+
+    let records = h.audit.records();
+    assert_eq!(records.len(), 3, "{records:?}");
+    assert_eq!(
+        image_display_name(records[0].post_image.as_ref()),
+        json!("Old label"),
+        "the create post-image carries the trimmed label"
+    );
+    assert_eq!(
+        image_display_name(records[1].pre_image.as_ref()),
+        json!("Old label"),
+        "the change pre-image carries the old label"
+    );
+    assert_eq!(
+        image_display_name(records[1].post_image.as_ref()),
+        json!("New label"),
+        "the change post-image carries the new label"
+    );
+    assert_eq!(
+        image_display_name(records[2].pre_image.as_ref()),
+        json!("New label")
+    );
+    assert_eq!(
+        image_display_name(records[2].post_image.as_ref()),
+        Value::Null,
+        "clearing records null"
+    );
 }

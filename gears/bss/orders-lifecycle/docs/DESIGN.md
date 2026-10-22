@@ -4333,7 +4333,7 @@ normative statement of both, which this section defers to rather than repeats. N
 from it.
 
 **Canonical audit hash v1 (D-99).** This is the authoritative byte contract for
-`orders_transition_audit`, following Pricing's [domain/audit.rs](../../pricing/pricing/src/domain/audit.rs) framing pattern but not its
+`orders_transition_audit`, following Pricing's `domain/audit.rs` framing pattern but not its
 field set or domain tag. It does not introduce hashing for `orders_read_access_log`.
 
 * Algorithm: SHA-256 through the platform-approved cryptographic provider. Store digest bytes
@@ -4592,10 +4592,10 @@ wording; no event-payload widening reopens it.
 
 **Golden conformance corpus `orders-events` (specified here, not built).** The consumer obligations
 are verified by one shared corpus rather than by each consumer's own reading of this table, following
-the joint golden fixture precedent: [`gears/bss/fixtures`](../../fixtures/README.md) holds hand-authored
+the joint golden fixture precedent: `gears/bss/fixtures` holds hand-authored
 TOML under `corpus/<family>/` with a `_family.toml` manifest and a dev-only
 `bss-fixtures-conformance` runner, and Pricing gates publish-contract sign-off on its joint proration
-fixture ([`pricing/docs/design/06-consumer-contracts.md`](../../pricing/docs/design/06-consumer-contracts.md)
+fixture (`pricing/docs/design/06-consumer-contracts.md`
 K5 and its conformance criterion). `orders-events` is a new family there: one TOML case per row below,
 each a script of deliveries (envelopes) and stubbed Orders read responses, with the expected effect
 log. Because an event handler is not an arithmetic subject, the runner gains a sibling evaluator
@@ -9567,7 +9567,7 @@ Pricing's trusted system-context pattern.
 **Trusted internal maintenance (Pricing pattern).** The five Orders-owned workers—per-state
 expiry, draft auto-void, idempotency cleanup, retention purge and audit verification/checkpointing—
 operate under configured system authority without a per-pass or per-row PDP decision. This is
-an explicit exception to blanket PDP-derived scopes, modeled on Pricing's [infra/jobs.rs](../../pricing/pricing/src/infra/jobs.rs):
+an explicit exception to blanket PDP-derived scopes, modeled on Pricing's `infra/jobs.rs`:
 bounded cross-tenant candidate scans may use `AccessScope::allow_all()`, but each subsequent
 operation must narrow to its actual target and applicable scope. It is not an exception for
 REST, public SDK calls, administrative requests, Orders Workflow calls or failed user requests.
@@ -9593,8 +9593,8 @@ only inside this worker exception. Never carry a broad discovery scope into a wr
 remain mandatory; a lease is coordination, not authorization.
 
 **Structural scope separation (D-184).** The narrowing rule above is enforced by type and lint,
-not by review alone. Pricing's discover-broad-then-narrow convention ([infra/jobs.rs:42-47](../../pricing/pricing/src/infra/jobs.rs);
-`list_due` under `allow_all` at [jobs/window_activation.rs:413](../../pricing/pricing/src/infra/jobs/window_activation.rs) vs `for_tenant` before the write at `:453`)
+not by review alone. Pricing's discover-broad-then-narrow convention (`infra/jobs.rs:42-47`;
+`list_due` under `allow_all` at `jobs/window_activation.rs:413` vs `for_tenant` before the write at `:453`)
 is the pattern being hardened; Ledger's `expire_due_all` ([approval_repo.rs:310-331](../../ledger/ledger/src/infra/storage/repo/approval_repo.rs)), a
 cross-tenant `UPDATE` executed directly under `allow_all`, is evidence that the convention alone
 drifts. The toolkit has no read-only scope type: one `&AccessScope` is accepted by
@@ -9776,7 +9776,7 @@ with the existing provider/toolkit APIs before deciding whether any upstream ext
 necessary. No mandatory new proposed-value validation API is selected by this decision.
 
 **Implementation and verification plan (Pricing pattern).** Pricing records shared PEP/catalog
-enforcement in [pricing/docs/design/05-governance.md](../../pricing/docs/design/05-governance.md)'s RBAC & Isolation definition of done and
+enforcement in `pricing/docs/design/05-governance.md`'s RBAC & Isolation definition of done and
 §9 acceptance criteria. Its [pricing/tests/rest_authz.rs](../../pricing/pricing/tests/rest_authz.rs) provides route-set coverage and
 explicitly separates gear enforcement tests from the PDP-owned role matrix. Orders adopts
 that separation, not a new authorization framework:

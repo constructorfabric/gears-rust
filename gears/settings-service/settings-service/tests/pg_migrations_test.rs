@@ -15,7 +15,7 @@
 //! stand's startup goes through, so what applies here is what boots. Docker
 //! required: without it the suite skips, unless
 //! `SETTINGS_SERVICE_PG_REQUIRE_DOCKER=1` turns the skip into a failure, as CI
-//! sets it. Run via `make test-settings-service-pg` or:
+//! sets it. Run via `make test-integration LANE=settings-service-pg` or:
 //!
 //! ```sh
 //! cargo nextest run -p cf-gears-settings-service --features integration --test pg_migrations_test
@@ -223,4 +223,56 @@ async fn the_chain_applies_on_an_empty_database_and_moves_the_rows_written_befor
         .expect("a restart finds nothing outstanding");
     assert_eq!(again.applied, 0);
     assert_eq!(value_types(&fixture.conn).await, after);
+}
+
+/// The display-name migration on the backend it is written for: the column
+/// is a nullable `character varying(256)`, and the trigram index that the
+/// search `LIKE` leans on exists.
+#[tokio::test]
+async fn the_display_name_column_and_its_trigram_index_exist_after_the_chain() {
+    let Some(fixture) = pg_fixture().await else {
+        return;
+    };
+    run_migrations_for_testing(&fixture.db, Migrator::migrations())
+        .await
+        .expect("the chain applies on an empty database");
+
+    let column = fixture
+        .conn
+        .query_one_raw(Statement::from_string(
+            fixture.conn.get_database_backend(),
+            "SELECT data_type, character_maximum_length, is_nullable
+             FROM information_schema.columns
+             WHERE table_name = 'setting_declarations' AND column_name = 'display_name'",
+        ))
+        .await
+        .expect("readable")
+        .expect("the display_name column exists");
+    assert_eq!(
+        column.try_get::<String>("", "data_type").expect("a type"),
+        "character varying"
+    );
+    assert_eq!(
+        column
+            .try_get::<i32>("", "character_maximum_length")
+            .expect("a length"),
+        256
+    );
+    assert_eq!(
+        column.try_get::<String>("", "is_nullable").expect("a flag"),
+        "YES",
+        "display_name must be nullable"
+    );
+
+    let index = fixture
+        .conn
+        .query_all_raw(Statement::from_string(
+            fixture.conn.get_database_backend(),
+            "SELECT indexname FROM pg_indexes
+             WHERE tablename = 'setting_declarations'
+               AND indexname = 'idx_declarations_display_name_trgm'",
+        ))
+        .await
+        .expect("readable");
+    assert_eq!(index.len(), 1, "the trigram index on display_name exists");
 }

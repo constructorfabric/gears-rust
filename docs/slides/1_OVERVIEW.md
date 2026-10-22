@@ -698,7 +698,7 @@ make check           # full quality gate: fmt + clippy + test + security
 make all             # build + check + SQLite integration + E2E + OpenAPI
 make test            # unit tests (workspace)
 make test GEAR=file-parser  # unit tests for one gear + SDK scope
-make test-sqlite     # integration tests (SQLite, no external DB)
+make test-integration LANE=toolkit-db-sqlite  # integration tests (SQLite, no external DB)
 make e2e-local       # E2E — builds + starts server automatically
 make e2e-local SUITE=file-parser  # suite E2E scope + default E2E target
 make coverage-unit   # unit-test coverage

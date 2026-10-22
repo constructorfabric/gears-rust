@@ -83,7 +83,7 @@ The 8 host features below are **ordered by core-first** (§2.1–2.4) followed b
 
 - **Data**: n/a (no persistence)
 
-### 2.2 [Function Registry](features/function-registry.md) - HIGH
+### 2.2 Function Registry - HIGH
 
 - [ ] `p1` - **ID**: `cpt-cf-serverless-runtime-feature-function-registry`
 
@@ -129,7 +129,7 @@ The 8 host features below are **ordered by core-first** (§2.1–2.4) followed b
 
 - **Data**: Function-definition persistence (concrete table/migration in F-02 FEATURE.md).
 
-### 2.3 [REST Surface](features/rest-surface.md) - HIGH
+### 2.3 REST Surface - HIGH
 
 - [ ] `p1` - **ID**: `cpt-cf-serverless-runtime-feature-rest-surface`
 
@@ -172,7 +172,7 @@ The 8 host features below are **ordered by core-first** (§2.1–2.4) followed b
   - `cpt-cf-serverless-runtime-seq-invocation-flow`
 - **Data**: n/a (delegated to F-02 / F-07 / F-04)
 
-### 2.4 [Plugin Dispatcher + Invocation Index](features/plugin-dispatcher.md) - HIGH
+### 2.4 Plugin Dispatcher + Invocation Index - HIGH
 
 - [ ] `p1` - **ID**: `cpt-cf-serverless-runtime-feature-plugin-dispatcher`
 
@@ -215,7 +215,7 @@ The 8 host features below are **ordered by core-first** (§2.1–2.4) followed b
 
 - **Data**: Invocation-index persistence (concrete table/migration in F-04 FEATURE.md).
 
-### 2.5 [JSON-RPC Transport](features/jsonrpc-transport.md) - HIGH
+### 2.5 JSON-RPC Transport - HIGH
 
 - [ ] `p1` - **ID**: `cpt-cf-serverless-runtime-feature-jsonrpc-transport`
 
@@ -254,7 +254,7 @@ The 8 host features below are **ordered by core-first** (§2.1–2.4) followed b
   - `cpt-cf-serverless-runtime-seq-jsonrpc-invocation`
 - **Data**: n/a (transport-only)
 
-### 2.6 [MCP Server](features/mcp-server.md) - HIGH
+### 2.6 MCP Server - HIGH
 
 - [ ] `p1` - **ID**: `cpt-cf-serverless-runtime-feature-mcp-server`
 
@@ -295,7 +295,7 @@ The 8 host features below are **ordered by core-first** (§2.1–2.4) followed b
   - `cpt-cf-serverless-runtime-seq-mcp-sampling`
 - **Data**: n/a (session state held in-memory + invocation_index)
 
-### 2.7 [Tenant Policy Management](features/tenant-policy.md) - HIGH
+### 2.7 Tenant Policy Management - HIGH
 
 - [ ] `p1` - **ID**: `cpt-cf-serverless-runtime-feature-tenant-policy`
 
@@ -339,7 +339,7 @@ The 8 host features below are **ordered by core-first** (§2.1–2.4) followed b
 
 - **Data**: Tenant-policy persistence (concrete table/migration in F-07 FEATURE.md).
 
-### 2.8 [Audit Aggregation + RFC-9457 Error Mapping](features/audit-error-mapping.md) - HIGH
+### 2.8 Audit Aggregation + RFC-9457 Error Mapping - HIGH
 
 - [ ] `p1` - **ID**: `cpt-cf-serverless-runtime-feature-audit-error-mapping`
 

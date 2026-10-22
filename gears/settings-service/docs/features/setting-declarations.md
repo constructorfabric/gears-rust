@@ -1,5 +1,5 @@
 <!-- Created: 2026-08-10 by Virtuozzo International GmbH -->
-<!-- Updated: 2026-09-24 by Virtuozzo International GmbH -->
+<!-- Updated: 2026-10-08 by Virtuozzo International GmbH -->
 
 # Feature: Setting Declarations and Scope Class
 
@@ -96,19 +96,20 @@ The hardest constraint here is not any single field but the rule connecting them
 - Actor not authorized, or the decision cannot be obtained
 - Target category does not exist
 - A key segment violates the GTS grammar
+- `display_name` empty or whitespace-only after trimming, longer than 256 Unicode characters, or containing a control character
 - Schema Default fails validation against the value type
 - A non-empty Schema Default supplied on a secret-trait value type
 - `secret` classification supplied by the author on a non-secret value type
 - Duplicate `key`, or a leaf slug already held by an active declaration in the category
 
 **Steps**:
-1. [x] - `p1` - Actor sends POST /settings-service/v1/declarations with `value_type_id`, `vendor`, leaf `name`, `category_id`, `default_value`, `scope_class`, and optional `description`, `mode`, `requires_step_up`, `anonymous_exposable`, `domain_affinity`, `licence_feature`, `data_classification` - `inst-decl-create-1`
+1. [x] - `p1` - Actor sends POST /settings-service/v1/declarations with `value_type_id`, `vendor`, leaf `name`, `category_id`, `default_value`, `scope_class`, and optional `display_name`, `description`, `mode`, `requires_step_up`, `anonymous_exposable`, `domain_affinity`, `licence_feature`, `data_classification` - `inst-decl-create-1`
 2. [x] - `p1` - Authorize `create` on `gts.cf.core.settings.declaration.v1~` through the `PolicyEnforcer` PEP - `inst-decl-create-2`
 3. [x] - `p1` - **IF** the decision is deny or cannot be obtained → **RETURN** `403` - `inst-decl-create-3`
 4. [x] - `p1` - DB: SELECT the target category WHERE id = {category_id} - `inst-decl-create-4`
 5. [x] - `p1` - **IF** the category does not exist → **RETURN** `404` - `inst-decl-create-5`
 6. [x] - `p1` - Invoke setting instance key construction using `value_type_id`, `vendor`, the category's slug, and the leaf `name` - `inst-decl-create-6`
-7. [x] - `p1` - **IF** any segment violates the GTS grammar → **RETURN** `400` naming the offending segment - `inst-decl-create-7`
+7. [x] - `p1` - **IF** any segment violates the GTS grammar → **RETURN** `400` naming the offending segment; **IF** `display_name` is present and not `null` **AND**, after trimming, it is empty, longer than 256 Unicode characters or contains a control character → **RETURN** `400` naming the field; an explicit `null` counts as unsupplied, and the trimmed value is what the rest of the flow stores - `inst-decl-create-7`
 8. [x] - `p1` - Resolve the value type's trait set through the Type Validator trait - `inst-decl-create-8`
 9. [x] - `p1` - Invoke classification and secret-trait derivation using the resolved traits and any author-supplied `data_classification` - `inst-decl-create-9`
 10. [x] - `p1` - **IF** derivation rejects the combination → **RETURN** `400` - `inst-decl-create-10`
@@ -118,11 +119,11 @@ The hardest constraint here is not any single field but the rule connecting them
 14. [x] - `p1` - **IF** `anonymous_exposable` is requested **AND** the derived `data_classification` is `secret` or `pii` → **RETURN** `400`, because the two classifications that must never leave are excluded from the anonymous surface in the schema as well as here - `inst-decl-create-14`
 15. [x] - `p1` - Set `source` to `admin_authored`, `status` to `active`, `mode` to its default when unsupplied, `requires_step_up` to `true` when unsupplied, and `created_by` from the authenticated principal - `inst-decl-create-15`
 16. [x] - `p1` - Register the composed setting type in the types registry — derived from the Settings base, composed with the `value_type_id`, and carrying no `default` — before the row is inserted; registration is idempotent, so a retry after a failed create reuses the type rather than minting a second one - `inst-decl-create-16`
-17. [x] - `p1` - DB: INSERT INTO setting_declarations with the constructed `key`, `leaf_slug`, `value_type_id`, `category_id`, and derived columns - `inst-decl-create-17`
+17. [x] - `p1` - DB: INSERT INTO setting_declarations with the constructed `key`, `leaf_slug`, `value_type_id`, `category_id`, `display_name` (trimmed, `NULL` when unsupplied), and derived columns - `inst-decl-create-17`
 18. [x] - `p1` - **IF** unique violation on `uq_declaration_key` → **RETURN** `409` - `inst-decl-create-18`
 19. [x] - `p1` - **IF** unique violation on `uq_declaration_category_slug` → **RETURN** `409` stating the leaf name is held by an active declaration in this category - `inst-decl-create-19`
 20. [x] - `p1` - Emit a declaration-created audit record - `inst-decl-create-20`
-21. [x] - `p1` - **RETURN** `201` with the declaration, its `key`, its `value_type_id`, and its resolved traits - `inst-decl-create-21`
+21. [x] - `p1` - **RETURN** `201` with the declaration, its `key`, its `value_type_id`, its `display_name` when set (omitted otherwise, never derived from `leaf_slug`), and its resolved traits - `inst-decl-create-21`
 
 ### Update Declaration Metadata
 
@@ -137,22 +138,23 @@ The hardest constraint here is not any single field but the rule connecting them
 - Declaration is `module_contributed` and therefore not admin-editable
 - Request carries a behavior-affecting field
 - Request loosens `data_classification` without a step-up assertion
+- `display_name` empty or whitespace-only after trimming, longer than 256 Unicode characters, or containing a control character
 - `If-Match` absent or stale
 
 **Steps**:
-1. [x] - `p1` - Actor sends PATCH /settings-service/v1/declarations/{id} with `If-Match` and any of `description`, `mode`, `domain_affinity`, `licence_feature`, `requires_step_up`, `anonymous_exposable`, `data_classification` - `inst-decl-update-1`
+1. [x] - `p1` - Actor sends PATCH /settings-service/v1/declarations/{id} with `If-Match` and any of `display_name`, `description`, `mode`, `domain_affinity`, `licence_feature`, `requires_step_up`, `anonymous_exposable`, `data_classification` - `inst-decl-update-1`
 2. [x] - `p1` - Authorize `update` on `gts.cf.core.settings.declaration.v1~` - `inst-decl-update-2`
 3. [x] - `p1` - **IF** the decision is deny or cannot be obtained → **RETURN** `403` - `inst-decl-update-3`
 4. [x] - `p1` - DB: SELECT the declaration WHERE id = {id} - `inst-decl-update-4`
 5. [x] - `p1` - **IF** not found → **RETURN** `404` - `inst-decl-update-5`
 6. [x] - `p1` - **IF** `source` is `module_contributed` → **RETURN** `409 ContributedDeclarationImmutable`, because gear declarations change only through their owning module - `inst-decl-update-6`
 7. [x] - `p1` - Evaluate the `If-Match` precondition; **IF** absent → **RETURN** `428`; **IF** stale → **RETURN** `412` - `inst-decl-update-7`
-8. [x] - `p1` - Invoke declaration mutation class resolution over every field present in the request - `inst-decl-update-8`
+8. [x] - `p1` - Invoke declaration mutation class resolution over every field present in the request; a `400` the resolution returns for a field's shape or length is the response - `inst-decl-update-8`
 9. [x] - `p1` - **IF** any field resolves to the immutable class → **RETURN** `400` naming the field and stating that the change is expressible only as a replacement declaration - `inst-decl-update-9`
 10. [x] - `p1` - **IF** any field resolves to the step-up class → require a valid credential step-up assertion - `inst-decl-update-10`
 11. [x] - `p1` - **IF** step-up is required and absent or invalid → **RETURN** `403` - `inst-decl-update-11`
 12. [x] - `p1` - **IF** the request enables `anonymous_exposable` on a declaration whose `data_classification` is `secret` or `pii` → **RETURN** `400`, preserving the database check as the backstop - `inst-decl-update-12`
-13. [x] - `p1` - DB: UPDATE setting_declarations SET {supplied metadata}, `updated_at` = now(), and `last_change_at` = now() only when a field that changes what a reader is served changed — classification, step-up, anonymous exposure, licence feature, domain affinity; a description or mode edit leaves the definition recency alone — WHERE id = {id} AND `updated_at` = {the version the tag was compared against}; **IF** no row matched → **RETURN** `412`; invalidate the local cache for the key — inside the transaction and again once it commits, as retire does — since the cached effective value carries the declaration's classification and domain affinity - `inst-decl-update-13`
+13. [x] - `p1` - DB: UPDATE setting_declarations SET {supplied metadata} (an explicit `null` clears a nullable field — `display_name`, `description`, `domain_affinity`, `licence_feature` — and an absent field is unchanged, and a supplied `display_name` is stored trimmed), `updated_at` = now(), and `last_change_at` = now() only when a field that changes what a reader is served changed — classification, step-up, anonymous exposure, licence feature, domain affinity; a description, display name or mode edit leaves the definition recency alone — WHERE id = {id} AND `updated_at` = {the version the tag was compared against}; **IF** no row matched → **RETURN** `412`; invalidate the local cache for the key — inside the transaction and again once it commits, as retire does — since the cached effective value carries the declaration's classification and domain affinity - `inst-decl-update-13`
 14. [x] - `p1` - Emit a declaration-updated audit record with pre-image and post-image - `inst-decl-update-14`
 15. [x] - `p1` - **RETURN** `200` with the updated declaration and a refreshed ETag - `inst-decl-update-15`
 
@@ -275,7 +277,7 @@ The hardest constraint here is not any single field but the rule connecting them
 **Actor**: `cpt-cf-settings-service-actor-tenant-admin`
 
 **Success Scenarios**:
-- A single declaration, or a filtered page of declarations, returned with resolved traits for client rendering
+- A single declaration, or a filtered page of declarations, returned with resolved traits and `display_name` when set, for client rendering
 
 **Error Scenarios**:
 - Declaration outside the caller's visibility, domain, or licence gate
@@ -290,7 +292,7 @@ The hardest constraint here is not any single field but the rule connecting them
 6. [x] - `p1` - DB: SELECT declarations with the combined predicate applied inside the query - `inst-decl-read-6`
 7. [x] - `p1` - **IF** a single-declaration read is filtered out → **RETURN** `404` rather than `403`, so a gated declaration's existence is not disclosed - `inst-decl-read-7`
 8. [x] - `p1` - Resolve each returned declaration's trait set for client rendering - `inst-decl-read-8`
-9. [x] - `p1` - **RETURN** `200` with the declaration or page, each carrying `key`, `value_type_id`, and resolved traits - `inst-decl-read-9`
+9. [x] - `p1` - **RETURN** `200` with the declaration or page, each carrying `key`, `value_type_id`, resolved traits, and `display_name` when set (omitted otherwise, never derived from `leaf_slug`); a page carries `page_info.total_count`, the declarations the whole listing holds under its filter and visibility, counted without the cursor - `inst-decl-read-9`
 
 ## 3. Processes / Business Logic (CDSL)
 
@@ -316,11 +318,11 @@ The hardest constraint here is not any single field but the rule connecting them
 
 **Input**: The set of fields present in an update request, and the declaration's current `data_classification`
 
-**Output**: A per-field class of immediate, immutable, or step-up-gated
+**Output**: A per-field class of immediate, immutable, or step-up-gated, or a `400` naming a field whose shape or length is wrong
 
 **Steps**:
 1. [x] - `p1` - **FOR EACH** field present in the request - `inst-decl-mutcls-1`
-   1. [x] - `p1` - **IF** the field is `description`, `mode`, `domain_affinity`, or `licence_feature`, or it tightens a gate — sets `requires_step_up` true or `anonymous_exposable` false → classify as immediate - `inst-decl-mutcls-2`
+   1. [x] - `p1` - **IF** the field is `display_name`, `description`, `mode`, `domain_affinity`, or `licence_feature`, or it tightens a gate — sets `requires_step_up` true or `anonymous_exposable` false → classify as immediate; a `display_name` must be `null` or a string of 1..256 Unicode characters after trimming with no control character, and any other shape, length or content → **RETURN** `400` naming the field - `inst-decl-mutcls-2`
    2. [x] - `p1` - **IF** the field is `default_value`, the value type, or `scope_class` → classify as immutable, because each would change a live setting's resolution without any gate - `inst-decl-mutcls-3`
    3. [x] - `p1` - **IF** the field is `data_classification` **AND** the change tightens from `public` toward `pii` → classify as immediate - `inst-decl-mutcls-4`
    4. [x] - `p1` - **IF** the field is `data_classification` **AND** the change loosens from `pii` toward `public` → classify as step-up-gated, because it un-masks content previously withheld - `inst-decl-mutcls-5`
@@ -369,7 +371,7 @@ The hardest constraint here is not any single field but the rule connecting them
 
 - [x] `p1` - **ID**: `cpt-cf-settings-service-dod-setting-declarations-entity-schema`
 
-The system **MUST** persist declarations in a `setting_declarations` table carrying `key` unique via `uq_declaration_key`, `leaf_slug` unique per category **among active declarations** via the partial `uq_declaration_category_slug`, a non-null `category_id` foreign key to `categories` declared `ON DELETE RESTRICT`, a **non-null** `default_value`, `requires_step_up` defaulting to `true`, `anonymous_exposable` defaulting to `false`, and check constraints enforcing the `scope_class`, `mode`, `status`, `source`, and `data_classification` vocabularies. Two cross-field checks **MUST** hold in the database, not only in application code: an `anonymous_exposable` declaration may not be classified `secret` or `pii`, and `data_classification` being `secret` must be equivalent to `has_secret_trait`.
+The system **MUST** persist declarations in a `setting_declarations` table carrying `key` unique via `uq_declaration_key`, `leaf_slug` unique per category **among active declarations** via the partial `uq_declaration_category_slug`, a non-null `category_id` foreign key to `categories` declared `ON DELETE RESTRICT`, a nullable `display_name` `varchar(256)` whose 1..256-Unicode-characters-after-trimming bound is enforced in the domain layer, added by an additive migration with no backfill so that pre-existing rows read as absent, with its trigram index `idx_declarations_display_name_trgm` on PostgreSQL only, a **non-null** `default_value`, `requires_step_up` defaulting to `true`, `anonymous_exposable` defaulting to `false`, and check constraints enforcing the `scope_class`, `mode`, `status`, `source`, and `data_classification` vocabularies. Two cross-field checks **MUST** hold in the database, not only in application code: an `anonymous_exposable` declaration may not be classified `secret` or `pii`, and `data_classification` being `secret` must be equivalent to `has_secret_trait`.
 
 **Implements**:
 - `cpt-cf-settings-service-flow-setting-declarations-create`
@@ -439,7 +441,7 @@ The system **MUST** derive `has_secret_trait` from the value type's resolved tra
 
 - [x] `p1` - **ID**: `cpt-cf-settings-service-dod-setting-declarations-mutation-classes`
 
-The system **MUST** partition declaration changes into descriptive metadata applied immediately under `update` permission plus `If-Match` — the write itself conditional on the version the tag was compared against — behavior-affecting fields rejected as immutable, and behavior-affecting actions gated by credential step-up. `data_classification` tightening **MUST** be immediate while loosening **MUST** require step-up. No declaration edit may change a live setting's effective resolution without a gate, and an unrecognized field **MUST** be treated as immutable rather than immediate. A metadata change **MUST** evict the key's cached effective values, so a reclassification masks on the next read rather than when the cache TTL runs out.
+The system **MUST** partition declaration changes into descriptive metadata (`display_name`, `description`, `mode`, `domain_affinity`, `licence_feature`) applied immediately under `update` permission plus `If-Match` — the write itself conditional on the version the tag was compared against — behavior-affecting fields rejected as immutable, and behavior-affecting actions gated by credential step-up. `data_classification` tightening **MUST** be immediate while loosening **MUST** require step-up. No declaration edit may change a live setting's effective resolution without a gate, and an unrecognized field **MUST** be treated as immutable rather than immediate. A metadata change **MUST** evict the key's cached effective values, so a reclassification masks on the next read rather than when the cache TTL runs out.
 
 **Implements**:
 - `cpt-cf-settings-service-algo-setting-declarations-mutation-class`
@@ -502,7 +504,7 @@ The system **MUST** let an authorized author declare a named Dependency Group ov
 
 - [ ] `p1` - **ID**: `cpt-cf-settings-service-dod-setting-declarations-read-surface`
 
-Declaration reads **MUST** be visibility- and domain-gated with the predicate applied inside the query, **MUST** leave the seam through which the licence gate joins that predicate in R2, **MUST** return the setting `key`, its `value_type_id`, and the resolved trait set for client rendering, and **MUST** report a gated single-declaration read as absent rather than forbidden.
+Declaration reads **MUST** be visibility- and domain-gated with the predicate applied inside the query, **MUST** leave the seam through which the licence gate joins that predicate in R2, **MUST** return the setting `key`, its `value_type_id`, and the resolved trait set for client rendering, **MUST** return `display_name` when set and omit it otherwise, never deriving one from `leaf_slug`, and **MUST** report a gated single-declaration read as absent rather than forbidden.
 
 **Implements**:
 - `cpt-cf-settings-service-flow-setting-declarations-read`
@@ -573,3 +575,8 @@ The system **MUST** emit an audit record through the Audit Emitter for every dec
 - [ ] A declaration read outside the caller's visibility, domain, or licence gate returns `404` rather than `403`
 - [ ] Every declaration read returns the `key`, the `value_type_id`, and the resolved trait set
 - [x] Every create, update, retire, and reactivate produces exactly one audit record, and update and retire records carry pre-images
+- [x] Creating a declaration with a `display_name` returns it in the `201` body and on every later declaration read, creating one without it omits the field, and nothing derives a `display_name` from `leaf_slug`
+- [x] A `display_name` empty or whitespace-only after trimming, longer than 256 Unicode characters, or containing a control character, is refused `400` naming the field on create and on `PATCH`, while 1 and 256 Unicode characters (multi-byte included) are accepted, and a value exceeding 256 only by surrounding whitespace is accepted and stored trimmed
+- [x] A `PATCH` with `display_name` sets it, with `display_name: null` clears it, and without the field leaves it unchanged, and the edit refreshes `updated_at` and the ETag without moving `last_change_at`
+- [x] A `PATCH` of `display_name` on a `module_contributed` declaration returns `409 ContributedDeclarationImmutable`
+- [x] A declaration row that predates the `display_name` column reads as having no display name

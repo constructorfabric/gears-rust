@@ -96,6 +96,11 @@ pub enum DomainError {
     /// 409 — backend migration was requested for a versioned file (>1 version).
     #[error("File {file_id} has multiple versions and cannot be migrated between backends")]
     VersionedFileMigrationNotSupported { file_id: Uuid },
+
+    /// A cursor-pagination failure from `domain::pagination`; mapped via `toolkit_odata`'s own
+    /// `Error -> CanonicalError` so reason codes match every other cursor consumer.
+    #[error("{0}")]
+    Cursor(toolkit_odata::Error),
 }
 
 impl DomainError {

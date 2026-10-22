@@ -512,7 +512,7 @@ Workspace changes this plugin requires:
   `ClusterCacheEntry` type (DESIGN §2.6). Also absent today.
 - `testcontainers-modules`' **`k3s`** feature added to its existing workspace
   entry, whose feature list is currently `postgres` and `mysql`.
-- A `make test-cluster-k8s` target mirroring `test-cluster-pg`
+- A `make test-cluster-k8s` target mirroring the `cluster-pg` lane of `make test-integration`
   (`cargo nextest run -p cf-k8s-cluster-plugin --features integration --retries 1`).
 
 The k3s container requires **privileged mode**, which is the one CI capability

@@ -7,8 +7,8 @@ use file_storage::domain::error::DomainError;
 use toolkit::api::canonical_prelude::CanonicalError;
 use uuid::Uuid;
 
-/// Number of `DomainError` variants; a backstop for `all_variant_instances` staying in sync.
-const EXPECTED_VARIANT_COUNT: usize = 24;
+/// Guards `expected_status` and `all_variant_instances` against a new variant being forgotten.
+const EXPECTED_VARIANT_COUNT: usize = 25;
 
 /// Expected HTTP status per variant, per the canonical-error taxonomy (`status_code()`).
 /// No wildcard arm on purpose.
@@ -23,7 +23,9 @@ fn expected_status(err: &DomainError) -> u16 {
         | DomainError::PolicyMimeNotAllowed { .. }
         | DomainError::PolicySizeExceeded { .. }
         | DomainError::PolicyMetadataExceeded { .. }
-        | DomainError::MultipartNotSupported { .. } => 400,
+        | DomainError::MultipartNotSupported { .. }
+        // Delegated to `toolkit_odata`: every cursor failure is `InvalidArgument` -> 400.
+        | DomainError::Cursor(_) => 400,
         DomainError::TokenInvalid { .. } | DomainError::Forbidden => 403,
         DomainError::FileNotFound { .. }
         | DomainError::VersionNotFound { .. }
@@ -116,6 +118,7 @@ fn all_variant_instances() -> Vec<DomainError> {
         DomainError::VersionedFileMigrationNotSupported {
             file_id: Uuid::nil(),
         },
+        DomainError::Cursor(toolkit_odata::Error::InvalidCursor),
     ]
 }
 

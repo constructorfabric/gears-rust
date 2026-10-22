@@ -1,5 +1,6 @@
 //! Backend migration, backend discovery, and `DataPlanePort` implementation.
 
+use toolkit_odata::CursorV1;
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
@@ -155,10 +156,27 @@ impl FileService {
         Ok(())
     }
 
-    /// `GET /storages`: configured backends and their capabilities.
-    #[must_use]
-    pub fn list_backends(&self) -> Vec<(String, BackendCapabilities)> {
-        self.backends.list()
+    /// `GET /storages`: configured backends and their capabilities, cursor-paginated in either
+    /// direction in `id asc` order and capped at `ServiceConfig::max_page_size`.
+    ///
+    /// # Errors
+    /// `DomainError::Cursor` for `limit == Some(0)` or a cursor of another listing.
+    pub(crate) fn list_backends(
+        &self,
+        limit: Option<u64>,
+        cursor: Option<CursorV1>,
+    ) -> Result<toolkit_odata::Page<(String, BackendCapabilities)>, DomainError> {
+        use crate::domain::pagination;
+
+        let limit =
+            pagination::clamp_limit(limit, self.cfg.default_page_size, self.cfg.max_page_size)?;
+        let after = cursor.map(pagination::storage_seek).transpose()?;
+        Ok(pagination::page_by_id(
+            self.backends.list(),
+            limit,
+            after,
+            |(id, _)| id.as_str(),
+        )?)
     }
 
     /// `GET /storages/{id}`.

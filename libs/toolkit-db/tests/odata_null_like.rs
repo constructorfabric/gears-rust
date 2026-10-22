@@ -14,7 +14,7 @@
 //! found nothing. Postgres defaults to the backslash, which is why only one dialect showed it.
 //!
 //! The rendering tests run in every build; the execution suite runs under the `integration`
-//! feature on each backend compiled in (`make test-sqlite`, `make test-pg`).
+//! feature on each backend compiled in (`make test-integration LANE=toolkit-db-sqlite`, `make test-integration LANE=toolkit-db-pg`).
 
 use sea_orm::entity::prelude::*;
 use sea_orm::{DbBackend, QueryFilter, QueryTrait};

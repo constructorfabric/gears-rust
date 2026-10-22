@@ -11,6 +11,7 @@
 use uuid::Uuid;
 
 use crate::domain::category::{Category, CategoryDraft, CategoryKey, CategoryPatch, Patch, bounds};
+use crate::domain::declaration::CategoryTally;
 use crate::domain::error::DomainError;
 
 /// A category as returned to a caller.
@@ -38,6 +39,22 @@ pub struct CategoryDto {
     /// Optional icon reference.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub icon: Option<String>,
+    /// How many settings the category holds for the caller: every declaration
+    /// a browse of the category would list for it, whatever the status, so the
+    /// number beside the category agrees with the table under it. Present when
+    /// the caller may read values; absent, with the two below, when it may not
+    /// — as the settings themselves would be.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub setting_count: Option<u64>,
+    /// Of those, the settings tagged `advanced` — what a console shows apart
+    /// from the standard ones, folded away by default, and must still account
+    /// for rather than omit silently.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub advanced_count: Option<u64>,
+    /// Of those, the settings `retired`: still filed under the category and
+    /// listed by its browse under their own outcome.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retired_count: Option<u64>,
 }
 
 impl From<Category> for CategoryDto {
@@ -53,7 +70,21 @@ impl From<Category> for CategoryDto {
             domain_affinity: category.domain_affinity,
             sort_order: category.sort_order,
             icon: category.icon,
+            setting_count: None,
+            advanced_count: None,
+            retired_count: None,
         }
+    }
+}
+
+impl CategoryDto {
+    /// The same category with its settings counted for the caller.
+    #[must_use]
+    pub fn with_tally(mut self, tally: CategoryTally) -> Self {
+        self.setting_count = Some(tally.settings);
+        self.advanced_count = Some(tally.advanced);
+        self.retired_count = Some(tally.retired);
+        self
     }
 }
 

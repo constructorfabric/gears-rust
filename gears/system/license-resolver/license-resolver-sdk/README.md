@@ -6,14 +6,18 @@ read-only, plugin-delegating resolver that answers a single question:
 
 ## What this crate provides
 
-- `LicenseResolverClient` — the public API trait, one method:
-  `is_licensed(LicenseCheckRequest) -> LicenseDecision`.
-- `LicenseResolverPluginClient` — the backend plugin trait (same signature).
+- `LicenseResolverApi` — the public API contract, one method:
+  `is_licensed(PlatformSecurityContext, LicenseCheckRequest) -> LicenseDecision`,
+  errors as `CanonicalError`. `LicenseResolverApiRest` projects it to
+  `POST /license-resolver/v1/is-licensed`; feature `rest-client` emits the
+  client, `rest-server` the routes for the gear.
+- `LicenseResolverPluginClient` — the in-process backend plugin trait:
+  `is_licensed(LicenseCheckRequest) -> LicenseDecision`, errors as
+  `LicenseResolverError`.
 - `LicenseCheckRequest` / `LicenseDecision` and the `Subject` / `Resource` /
   `LicenseCheckContext` contract objects.
-- `LicenseResolverError` — the typed error enum with a default mapping to the
-  canonical RFC-9457 error (`impl From<LicenseResolverError> for CanonicalError`;
-  render a `Problem` via `Problem::from_error(&err.into())`). A not-granted answer
+- `LicenseResolverError` — the typed error enum of the plugin trait, with the
+  mapping to `CanonicalError` that `LicenseResolverApi` returns. A not-granted answer
   is **not** an error (`LicenseDecision { granted: false }`).
 - `LicenseResolverPluginSpecV1` — the GTS plugin spec used for discovery.
 - The licensing base types `gts.cf.core.lic.subj.v1~` / `gts.cf.core.lic.res.v1~`

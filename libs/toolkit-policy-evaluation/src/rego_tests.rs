@@ -274,24 +274,33 @@ fn denylist_screen_catches_clock_and_random_everywhere() {
 // ---- evaluation ---------------------------------------------------------------
 
 #[test]
-fn evaluation_returns_true_false_and_null_for_undefined() {
+fn evaluation_returns_true_false_and_none_for_undefined() {
     let source = "package p\n\ncondition if input.action == \"create\"\n";
     let doc = compile(source);
     assert_eq!(
         doc.evaluate(&ctx(json!({"action": "create"})), GENEROUS)
             .unwrap(),
-        json!(true)
+        Some(json!(true))
     );
     assert_eq!(
         doc.evaluate(&ctx(json!({"action": "delete"})), GENEROUS)
             .unwrap(),
-        serde_json::Value::Null
+        None
     );
 
     let doc = compile("package p\n\ndefault condition := false\n\ncondition if input.ok\n");
     assert_eq!(
         doc.evaluate(&ctx(json!({"ok": false})), GENEROUS).unwrap(),
-        json!(false)
+        Some(json!(false))
+    );
+}
+
+#[test]
+fn an_explicit_null_is_a_value_not_an_undefined_rule() {
+    let doc = compile("package p\n\ncondition := null\n");
+    assert_eq!(
+        doc.evaluate(&ctx(json!({})), GENEROUS).unwrap(),
+        Some(serde_json::Value::Null)
     );
 }
 
@@ -303,20 +312,17 @@ fn evaluation_sees_input_and_injected_timestamp_only() {
         .unwrap();
     assert_eq!(
         value,
-        json!({
+        Some(json!({
             "properties": {"n": 1},
             "evaluated_at": "2026-09-23T12:00:00Z",
             "evaluated_at_ns": 1_790_164_800_000_000_000_i64,
-        })
+        }))
     );
 
     // No data document is ever loaded: anything outside the document's own
     // package is undefined.
     let doc = compile("package p\n\ncondition := data.tenants\n");
-    assert_eq!(
-        doc.evaluate(&ctx(json!({})), GENEROUS).unwrap(),
-        serde_json::Value::Null
-    );
+    assert_eq!(doc.evaluate(&ctx(json!({})), GENEROUS).unwrap(), None);
 }
 
 #[test]
@@ -325,8 +331,8 @@ fn evaluation_is_deterministic() {
         "package p\n\ncondition := {\"t\": input.evaluated_at_ns, \"s\": sort([x | some x in input.xs])}\n",
     );
     let input = ctx(json!({"xs": [3, 1, 2]}));
-    let first = doc.evaluate(&input, GENEROUS).unwrap();
-    let second = doc.evaluate(&input, GENEROUS).unwrap();
+    let first = doc.evaluate(&input, GENEROUS).unwrap().unwrap();
+    let second = doc.evaluate(&input, GENEROUS).unwrap().unwrap();
     assert_eq!(first, second);
     assert_eq!(first["s"], json!([1, 2, 3]));
 }
@@ -399,7 +405,7 @@ fn evaluation_is_thread_safe() {
                 for i in 0..50_i64 {
                     let n = thread * 1000 + i;
                     let value = doc.evaluate(&ctx(json!({"n": n})), GENEROUS).unwrap();
-                    assert_eq!(value, json!(n * 2));
+                    assert_eq!(value, Some(json!(n * 2)));
                 }
             })
         })
@@ -549,14 +555,14 @@ fn with_input_and_data_document_targets_are_supported() {
     let doc = compile("package p\n\ncondition if { input.x == 2 with input.x as 2 }\n");
     assert_eq!(
         doc.evaluate(&ctx(json!({"x": 1})), GENEROUS).unwrap(),
-        json!(true)
+        Some(json!(true))
     );
     let doc = compile(
         "package p\n\nimport input.subject as who\n\ncondition if { who.id == \"a\" with input as {\"subject\": {\"id\": \"a\"}} }\n",
     );
     assert_eq!(
         doc.evaluate(&ctx(json!({})), GENEROUS).unwrap(),
-        json!(true)
+        Some(json!(true))
     );
     compile("package p\n\nv := 1\n\ncondition if { data.p.v == 2 with data.p.v as 2 }\n");
 }
@@ -679,7 +685,7 @@ fn a_hundred_deep_expression_still_compiles_and_evaluates() {
             .evaluate(&ctx(json!({})), GENEROUS)
             .unwrap()
     });
-    assert_eq!(value, json!(100));
+    assert_eq!(value, Some(json!(100)));
 
     let refs = chain("input", ".a", 100, "", false);
     on_small_stack(move || {
@@ -867,7 +873,7 @@ fn a_dependency_chain_at_the_cap_compiles_and_evaluates_one_past_it_is_refused()
             .evaluate(&ctx(json!({})), GENEROUS)
             .unwrap()
     });
-    assert_eq!(value, json!(true));
+    assert_eq!(value, Some(json!(true)));
 
     let past_cap = rule_chain(MAX_RULE_DEPENDENCY_DEPTH + 1);
     let compiled =
@@ -1021,13 +1027,13 @@ fn results_json_cannot_represent_are_failures() {
     );
     assert_eq!(
         doc.evaluate(&ctx(json!({})), GENEROUS).unwrap(),
-        json!({
+        Some(json!({
             "f": 1.5,
             "u": u64::MAX,
             "i": i64::MIN,
             "s": [1, 2, 3],
             "n": null,
-        })
+        }))
     );
 }
 
@@ -1042,6 +1048,7 @@ fn deep_results_convert_without_recursion() {
     let value = on_small_stack(move || {
         compile("package p\n\ncondition := input.v\n")
             .evaluate(&input, GENEROUS)
+            .unwrap()
             .unwrap()
     });
     let mut depth = 0;
@@ -1069,6 +1076,7 @@ fn a_result_exactly_at_the_max_depth_still_converts() {
         compile("package p\n\ncondition := input.v\n")
             .evaluate(&input, GENEROUS)
             .unwrap()
+            .unwrap()
     });
     let mut depth = 0;
     let mut current = &value;
@@ -1092,5 +1100,61 @@ fn results_nested_past_the_max_depth_are_unrepresentable() {
         EvaluationError::Failed {
             message: "unrepresentable result".to_owned(),
         }
+    );
+}
+
+// ---- compile_screened ---------------------------------------------------------
+
+#[test]
+fn compile_screened_accepts_a_clean_document() {
+    let doc = super::compile_screened(
+        &RegoBackend::new(),
+        "clean.rego",
+        "package p\n\ncondition := input.action == \"create\"\n",
+        "condition",
+    )
+    .unwrap();
+    assert_eq!(
+        doc.evaluate(&ctx(json!({"action": "create"})), GENEROUS),
+        Ok(Some(json!(true)))
+    );
+}
+
+#[test]
+fn compile_screened_names_every_denylisted_builtin() {
+    let err = super::compile_screened(
+        &RegoBackend::new(),
+        "clock.rego",
+        "package p\n\ncondition := time.now_ns() > rand.intn(\"k\", 10)\n",
+        "condition",
+    )
+    .unwrap_err();
+    assert_eq!(
+        err,
+        super::ScreenedCompileError::Denylisted {
+            builtins: set(&["rand.intn", "time.now_ns"])
+        }
+    );
+    assert_eq!(
+        err.to_string(),
+        "references denylisted builtin(s): rand.intn, time.now_ns"
+    );
+}
+
+#[test]
+fn compile_screened_reports_compile_errors() {
+    let err = super::compile_screened(
+        &RegoBackend::new(),
+        "bad.rego",
+        "package p\n\ncondition :=",
+        "condition",
+    )
+    .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            super::ScreenedCompileError::Compile(CompileError::Syntax { .. })
+        ),
+        "{err:?}"
     );
 }

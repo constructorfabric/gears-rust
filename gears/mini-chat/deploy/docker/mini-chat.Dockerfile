@@ -2,7 +2,7 @@
 # Stage 1: Builder
 # Should match rust-toolchain.toml; a stale pin here just makes rustup
 # download a second toolchain on every build.
-FROM rust:1.99.0-bookworm@sha256:59037199c44290f2befcdd58dcc540164763fc296950255aaefeef096a1866b0 AS builder
+FROM rust:1.99.1-bookworm@sha256:e12566d5abc17a0da741628782cdb504b68b8961f5bfcf677936bf3e8b32de29 AS builder
 
 # Build arguments
 ARG CARGO_FEATURES=mini-chat,static-authn,static-authz,single-tenant,static-credstore,k8s

@@ -267,6 +267,20 @@ pub trait PolicyStore: Send + Sync {
         tenant_id: Uuid,
     ) -> Result<Vec<StoredRetentionRule>, DomainError>;
 
+    /// List retention rules for a tenant, cursor-paginated in either direction. Items are always in
+    /// canonical order (`created_at DESC, rule_id DESC`); `cursor` resumes in the direction it carries.
+    ///
+    /// # Errors
+    /// A cursor error (`domain::pagination`) for a mismatched or malformed
+    /// `cursor`, or the underlying store error.
+    async fn list_retention_rules_page(
+        &self,
+        scope: &AccessScope,
+        tenant_id: Uuid,
+        limit: u64,
+        cursor: Option<toolkit_odata::CursorV1>,
+    ) -> Result<toolkit_odata::Page<StoredRetentionRule>, DomainError>;
+
     /// Insert a new retention rule. Returns the assigned `rule_id`.
     async fn insert_retention_rule(
         &self,

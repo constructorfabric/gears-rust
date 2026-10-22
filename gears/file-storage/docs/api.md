@@ -4,6 +4,7 @@
 <!-- toc -->
 
 - [Two planes](#two-planes)
+- [Changes for 0.2.x clients](#changes-for-02x-clients)
 - [P1 — Control plane (`/api/file-storage/v1`)](#p1--control-plane-apifile-storagev1)
 - [P1 — Sidecar (signed-URL authorized)](#p1--sidecar-signed-url-authorized)
 - [Data-plane callbacks (sidecar → control plane, s2s token-authenticated)](#data-plane-callbacks-sidecar--control-plane-s2s-token-authenticated)
@@ -56,6 +57,25 @@ Encoding conventions:
 - All error responses follow RFC 7807 (`application/problem+json`).
 - `file_id` and `version_id` are UUIDs. A backend object lives at `/{file_id}/{version_id}` and is immutable.
 
+## Changes for 0.2.x clients
+
+Breaking changes to the four list endpoints — `GET /files`, `GET /files/{id}/versions`, `GET /retention-rules`,
+`GET /storages` (details in [Cursor pagination](#cursor-pagination) and [P2 — Retention rules](#p2--retention-rules)):
+
+- Each now returns `{"items": [...], "page_info": {"next_cursor", "prev_cursor", "limit"}}` instead of a bare JSON
+  array.
+- The `cursor` query parameter (taken from `page_info.next_cursor` or `page_info.prev_cursor`) replaces `offset`.
+  `offset`, and any other unrecognized query parameter, is rejected with `400`.
+- `limit=0` is rejected with `400`. The default page size is 25; a `limit` above the configured
+  `max_page_size` (200 by default, never more than 200) is clamped down to it.
+- `GET /retention-rules` is now paginated.
+- `GET /storages` now returns `{"items": [{id, capabilities}], "page_info": ...}` instead of a bare JSON array and
+  is paginated by cursor.
+- `$top` and `$skiptoken` are accepted as synonyms of `limit` and `cursor`; passing both spellings of one parameter in
+  the same request is a `400`.
+- `$skip`, `$filter`, `$orderby`, `$select` and every other `$` parameter except `$top` and `$skiptoken` are
+  rejected with `400`.
+
 ## P1 — Control plane (`/api/file-storage/v1`)
 
 ```text
@@ -69,7 +89,7 @@ Encoding conventions:
 8.  GET    /files                           list files (owner_kind + owner_id required; cursor-paginated; `{items, page_info}` incl. custom_metadata)
 9.  GET    /files/{id}/versions             list versions (version_id, size, hash, hash_mode, part_count?, manifest?, created_at, is_current; cursor-paginated)
 10. DELETE /files/{id}/versions/{version_id} delete a single, non-current version                          — 409 if current
-11. GET    /storages                        list storages + capabilities inline
+11. GET    /storages                        list storages + capabilities inline; cursor-paginated
 12. GET    /storages/{storage_id}           one storage + capabilities
 13. GET    /policy                          get the stored policy for a scope (?scope=tenant|user)
 14. PUT    /policy                          upsert the policy for a scope
@@ -84,7 +104,8 @@ Encoding conventions:
 Notes:
 - There is **no** `HEAD /files/{id}` route on the control plane.
 - `GET /storages` and `GET /storages/{storage_id}` require the caller's `READ` authorization scope (`403`
-  otherwise).
+  otherwise). `GET /storages` returns `{items: [{id, capabilities}], page_info}` in `id asc` order, paginated like the
+  other listings — see [Cursor pagination](#cursor-pagination).
 - `POST /files` request body (`application/json`, `CreateFileReq`): `{ "owner_kind": "user"|"app", "owner_id":
   "<uuid>", "name": "<string>", "gts_file_type": "<gts uri>", "mime_type": "<string>", "custom_metadata":
   [{"key": "...", "value": "..."}] (optional, default []), "idempotency_key": "<string>" (optional),
@@ -121,14 +142,15 @@ Notes:
   `created_at DESC` with `file_id DESC` as a deterministic tie-breaker — `created_at` has only millisecond
   resolution, so rows can share an instant, and without the tie-breaker a page boundary could skip or repeat a row
   at that boundary. See [Cursor pagination](#cursor-pagination) below for the full model.
-- All three listing endpoints (`GET /files`, `GET /files/{id}/versions`, `GET /retention-rules`) page via
-  `?limit`/`?cursor` — see [Cursor pagination](#cursor-pagination). The effective limit on every request is
-  `min(requested-or-default, configured max_page_size)`: `default_page_size` (25 by default) is used when `?limit`
-  is omitted, and `max_page_size` (200 by default) is a **hard ceiling** — `MAX_PAGE_SIZE_CEILING` = 200 — that a
-  configured `max_page_size` can never exceed regardless of what an operator sets, enforced at config-validation
-  time (gear init fails if `max_page_size` is configured above it), independent of and in addition to the ordinary
-  `default_page_size ≤ max_page_size` sanity check. A caller can therefore never receive more than the configured
-  `max_page_size` items in one page, and that configured value itself can never exceed 200.
+- All four listing endpoints (`GET /files`, `GET /files/{id}/versions`, `GET /retention-rules`, `GET /storages`) page
+  via `?limit`/`?cursor` (synonyms `?$top`/`?$skiptoken`) — see [Cursor pagination](#cursor-pagination). The
+  effective limit on every request is `min(requested-or-default, configured max_page_size)`: `default_page_size`
+  (25 by default) is used when `?limit` is omitted, and `max_page_size` (200 by default) is a **hard ceiling** —
+  `MAX_PAGE_SIZE_CEILING` = 200 — that a configured `max_page_size` can never exceed regardless of what an operator
+  sets, enforced at config-validation time (gear init fails if `max_page_size` is configured above it), independent
+  of and in addition to the ordinary `default_page_size ≤ max_page_size` sanity check. A caller can therefore never
+  receive more than the configured `max_page_size` items in one page, and that configured value itself can never
+  exceed 200.
 - `POST /files` and `POST /files/{id}/versions` return `{ file_id, version_id, upload_url }` (the control plane
   creates a `pending` `file_versions` row for `version_id` before returning the URL). The client `PUT`s the bytes to
   `upload_url` on the sidecar; the sidecar streams them to the backend, measuring size + SHA-256, then calls the
@@ -183,15 +205,32 @@ Notes:
 
 ## Cursor pagination
 
-Every list endpoint in this gear — `GET /files`, `GET /files/{id}/versions`, `GET /retention-rules` — shares one
-pagination model (platform-wide convention, `guidelines/DNA/REST/QUERYING.md` /
+Every list endpoint in this gear — `GET /files`, `GET /files/{id}/versions`, `GET /retention-rules`,
+`GET /storages` — shares one pagination model (platform-wide convention, `guidelines/DNA/REST/QUERYING.md` /
 PLID-52.06):
 
-- **Request**: `limit` (integer, default 25, min 1, max 200 — `limit=0` is a `400`; a `limit` above 200 is silently
-  clamped down to 200, `limit.min(max_page_size)`) and `cursor` (an opaque string — the previous page's
-  `page_info.next_cursor` to page forward, or its `page_info.prev_cursor` to page backward). No other query
-  parameter is accepted — an unrecognized key (including the pre-redesign `offset`) is rejected as a `400`, not
-  silently ignored.
+- **Request**: `limit` (integer, default 25, min 1, max 200; also accepted as `$top`) and `cursor` (an opaque
+  string — the previous page's `page_info.next_cursor` to page forward, or its `page_info.prev_cursor` to page
+  backward; also accepted as `$skiptoken`). The two spellings of a parameter are the same parameter.
+  - Both spellings of one parameter in the same request (`limit` with `$top`, or `cursor` with `$skiptoken`) are a
+    `400` with reason `INVALID_QUERY_PARAMS`.
+  - `limit=0` (or `$top=0`) is a `400` with reason `INVALID_LIMIT`, reported on the field `$top` for either
+    spelling. A value above the configured maximum (`max_page_size`, 200 by default, never more than 200) is
+    not an error — it is silently clamped down to that maximum.
+  - Plain (non-`$`) keys accepted: `owner_kind` and `owner_id` (both required), `limit`, `cursor` on `GET /files`;
+    `limit` and `cursor` on `GET /files/{id}/versions`, `GET /retention-rules` and `GET /storages`. Any other plain
+    key (including the pre-redesign `offset`) is a `400` with reason `UNSUPPORTED_QUERY_PARAM`; the error names the
+    key and lists the accepted parameters. Unknown keys are never silently ignored.
+  - Of the `$` parameters only `$top` and `$skiptoken` are accepted. `$skip` is a `400 UNSUPPORTED_QUERY_PARAM`
+    with a hint that pagination is cursor-based: pass the previous page's `next_cursor` as `$skiptoken` (synonym of
+    `cursor`); there is no offset pagination. `$filter`, `$orderby` and `$select` are likewise a `400` (not
+    implemented: the order is fixed and there is no projection). Every other OData system parameter (`$count`,
+    `$expand`, `$search`, `$format`, ...) is a `400 UNSUPPORTED_QUERY_PARAM` too; for `$count` the error adds that a
+    page never carries a total. An unknown `$` key (a typo such as `$filtre`) is a `400`.
+  - Names are case-sensitive: `$Top` is a `400` whose error says the parameter is accepted only as `$top`.
+  - All unsupported `$` parameters in one request are reported together in a single response.
+  - Platform rules: `guidelines/DNA/REST/QUERYING.md`; toolkit reference:
+    [`07_odata_pagination_select_filter.md`](../../../docs/toolkit_unified_system/07_odata_pagination_select_filter.md).
 - **Response**: `{"items": [...], "page_info": {"next_cursor": <string|null>, "prev_cursor": <string|null>, "limit":
   N}}`. There is no `total`/count field — pagination never runs a `COUNT` query. `items` is always in this
   endpoint's canonical order (below), regardless of which cursor the request navigated with — a backward page is
@@ -201,7 +240,8 @@ PLID-52.06):
   once a walk in that direction has reached its end.
 - **Canonical order and tie-break**: fixed per endpoint, not client-selectable (no `$orderby`) — `created_at desc,
   file_id desc` for `/files`, `created_at desc, version_id desc` for `/files/{id}/versions`, `created_at desc,
-  rule_id desc` for `/retention-rules`. The id-column tie-break exists because `created_at` has only
+  rule_id desc` for `/retention-rules`, `id asc` for `/storages` (backend ids are unique and set by configuration, so
+  no separate tie-break is needed there). The id-column tie-break exists because `created_at` has only
   millisecond resolution: two rows created in the same instant would otherwise have no defined relative order
   across two page requests, and a page boundary drawn through such a run could skip or repeat a row.
 - **Keyset semantics under concurrent writes**: a cursor encodes the exact `(created_at, id)` position of the row
@@ -223,7 +263,9 @@ PLID-52.06):
   different `file_id` for `/files/{id}/versions`; `/retention-rules` has no such binding) — this applies to a
   `prev_cursor` exactly as it does to a `next_cursor`. `GET /files/{id}/versions` additionally rejects a cursor
   issued for a different file, and `GET /files` a cursor issued for a different `(owner_kind, owner_id)` pair,
-  regardless of which direction the cursor navigates.
+  regardless of which direction the cursor navigates. All of this applies to a cursor passed under either spelling
+  (`cursor` or `$skiptoken`). `/storages` has no filter binding either (it has no filters), like `/retention-rules`; a
+  cursor issued by another listing is rejected there with `ORDER_MISMATCH`.
 
 ## P1 — Sidecar (signed-URL authorized)
 
@@ -886,11 +928,12 @@ access or carry substantially more per-request state in the token than it does t
 - `304 Not Modified` — `If-None-Match` matched the current ETag (control-plane `GET /files/{id}` only — not
   implemented on the sidecar, see "Response headers" above).
 - `400 Bad Request` — malformed request (invalid JSON, missing required fields; e.g. `GET /files` missing
-  `owner_kind`/`owner_id`, or `GET /policy?scope=user` missing `scope_owner_id`); an `exact_size` upload whose final
-  length is short, or an undersized multipart part (sidecar, `PUT`); a content hash mismatch against the
-  `expected_hash` claim (sidecar, `PUT`); a malformed/wrong-length `hash_hex` on the `D1`/`D2` callbacks, or a
-  reported multipart-part `size` that does not match the token's claim (control plane); a retention rule failing
-  semantic validation (all three predicates absent, a zero-day age/inactivity field, or a missing
+  `owner_kind`/`owner_id`, or `GET /policy?scope=user` missing `scope_owner_id`); an unsupported, misspelled or
+  duplicated query parameter on a listing, or `limit=0` (see [Cursor pagination](#cursor-pagination)); an
+  `exact_size` upload whose final length is short, or an undersized multipart part (sidecar, `PUT`); a content hash
+  mismatch against the `expected_hash` claim (sidecar, `PUT`); a malformed/wrong-length `hash_hex` on the `D1`/`D2`
+  callbacks, or a reported multipart-part `size` that does not match the token's claim (control plane); a retention
+  rule failing semantic validation (all three predicates absent, a zero-day age/inactivity field, or a missing
   `scope_target_id` for `user`/`file` scope); the declared file size exceeds
   the effective policy size limit (control plane, `create_file`/`presign_version`/multipart `initiate`); an
   `If-Match`/`If-Match-Metadata` precondition mismatch on control-plane `bind`/`DELETE`/`PATCH`/multipart `complete`,

@@ -237,7 +237,7 @@ Other tests:
 ```bash
 make test            # unit tests (workspace)
 make test GEAR=file-parser  # unit tests for one gear and its SDK crate
-make test-sqlite     # integration tests (SQLite, no external DB required)
+make test-integration LANE=toolkit-db-sqlite  # integration tests (SQLite, no external DB required)
 make e2e-local       # end-to-end tests (builds + starts server automatically)
 make e2e-local SUITE=file-parser  # suite E2E scope plus the default E2E target
 make e2e-docker      # end-to-end tests (builds + starts server in Docker)

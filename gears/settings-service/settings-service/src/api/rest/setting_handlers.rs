@@ -15,22 +15,22 @@ use toolkit_security::{AccessScope, SecurityContext};
 use uuid::Uuid;
 
 use crate::api::authz::{self, resource};
+use crate::api::rest::page_dto::{PageDto, PageInfoDto};
 use crate::api::rest::setting_dto::{
-    AuditRecordDto, EffectiveValueDto, SettingItemDto, render, render_flagged, render_record,
+    AuditRecordDto, EffectiveValueDto, ReviewItemDto, SettingItemDto, render, render_flagged,
+    render_record,
 };
 use crate::api::rest::setting_filter::interpret;
 pub(crate) use crate::api::rest::setting_filter::unsupported;
 use crate::domain::category::visibility;
 use crate::domain::error::DomainError;
 use crate::domain::resolution::{SUBTREE_BUDGET, ScopeTarget, subtree_too_large};
+use crate::domain::value::{ReviewRequest, review_binding};
 use crate::field;
 use crate::gear::ConcreteResolver;
 use crate::log_text::LogSafe;
 
 const READ: &str = "read";
-/// The most flagged rows one needs-review page reads; past it the page is
-/// refused with the bound named, never cut.
-pub const REVIEW_ROW_LIMIT: usize = 1_000;
 
 /// The entitlement that unmasks `pii` values on the administrative surface.
 const READ_UNMASKED: &str = "read_unmasked";
@@ -249,6 +249,13 @@ pub async fn browse_settings(
         filter_hash: query.filter_hash.clone(),
         select: None,
     };
+    // @cpt-begin:cpt-cf-settings-service-flow-value-resolution-admin-browse:p1:inst-vr-browse-7
+    // `needs_review eq true` narrows the page, it does not switch the listing:
+    // only the settings whose own override at the target is flagged, decided
+    // in the page query below from the target's own rows — no subtree walk,
+    // no rows read here. The rows themselves are the review listing's.
+    let flagged_at = filter.needs_review.then(|| target.tenant_id(root));
+    // @cpt-end:cpt-cf-settings-service-flow-value-resolution-admin-browse:p1:inst-vr-browse-7
     // @cpt-begin:cpt-cf-settings-service-flow-value-resolution-admin-browse:p1:inst-vr-browse-6
     // A setting hidden from the caller leaves the page silently, never
     // marked — in the query, on the caller's own chain, so the page is cut
@@ -256,113 +263,242 @@ pub async fn browse_settings(
     // the caller that something sits in the gap.
     let caller_chain = resolver.chain_of(ctx.subject_tenant_id()).await?;
     let page = resolver
-        .list_declarations(&conn, &scope, &caller_chain, &declarations_query)
+        .list_declarations(
+            &conn,
+            &scope,
+            &caller_chain,
+            flagged_at,
+            &declarations_query,
+        )
         .await?;
     // @cpt-end:cpt-cf-settings-service-flow-value-resolution-admin-browse:p1:inst-vr-browse-6
     let has_pii = page.items.iter().any(|d| d.data_classification == "pii");
 
-    let mut items: Vec<SettingItemDto> = if filter.needs_review {
-        // @cpt-begin:cpt-cf-settings-service-flow-value-resolution-admin-browse:p1:inst-vr-browse-7
-        // Rows, not resolved values: the flagged overrides of the page's
-        // declarations whose tenant lies in the caller's subtree, standalone
-        // descendants excluded by the hierarchy.
-        let target_tenant = target.tenant_id(root);
-        // Under the subtree budget: a listing the budget would cut is refused
-        // with the bound named, never answered partially.
-        let (mut tenants, truncated) = resolver
-            .hierarchy()
-            .descendants_bfs(target_tenant, SUBTREE_BUDGET)
-            .await?;
-        if truncated {
-            return Err(subtree_too_large("tenant", "target's").into());
-        }
-        tenants.push(target_tenant);
-        let ids: Vec<Uuid> = page.items.iter().map(|d| d.id).collect();
-        let rows = resolver
-            .flagged_overrides(&conn, &ids, &tenants, REVIEW_ROW_LIMIT)
-            .await?;
-        // A page cut short of its flagged rows would hide what needs review;
-        // refused with the bound named instead, for the caller to narrow.
-        if rows.len() > REVIEW_ROW_LIMIT {
-            return Err(DomainError::Validation {
-                field: "limit".to_owned(),
-                code: field::REVIEW_TOO_MANY_ROWS,
-                message: format!(
-                    "more than {REVIEW_ROW_LIMIT} flagged rows on this page; lower `limit`, or \
-                     narrow `tenant` or the categories"
-                ),
+    // @cpt-begin:cpt-cf-settings-service-flow-value-resolution-admin-browse:p1:inst-vr-browse-8
+    // The same resolution narrowed or not: a flagged own override is reported
+    // on the resolved item through `needs_review` and its detail, and the
+    // value served is the fallthrough.
+    let outcomes = resolver
+        .resolve_declarations(&conn, &page.items, target)
+        .await;
+    let names_a_setter = outcomes.iter().any(|outcome| {
+        outcome
+            .as_ref()
+            .is_ok_and(|effective| effective.trail.iter().any(|entry| entry.set_by.is_some()))
+    });
+    let pii = (has_pii || names_a_setter) && may_read_pii(&enforcer, &ctx).await;
+    let mut items: Vec<SettingItemDto> = page
+        .items
+        .iter()
+        .zip(outcomes)
+        .map(|(declaration, outcome)| match outcome {
+            Ok(effective) => SettingItemDto::resolved(render(&effective, pii))
+                .with_mode(&declaration.mode)
+                .with_display_name(declaration.display_name.as_deref()),
+            Err(err) => {
+                if let Some(diagnostic) = err.internal_diagnostic() {
+                    tracing::error!(
+                        key = %declaration.key,
+                        diagnostic = %LogSafe(diagnostic),
+                        "a browse entry failed internally"
+                    );
+                }
+                SettingItemDto::failed(&declaration.key, &err)
+                    .with_mode(&declaration.mode)
+                    .with_display_name(declaration.display_name.as_deref())
             }
-            .into());
-        }
-        // Every flagged row names who set it.
-        let pii = (has_pii || !rows.is_empty()) && may_read_pii(&enforcer, &ctx).await;
-        // The page's declarations by id, built once: each row finds its own in
-        // constant time rather than by a scan of the page.
-        let by_id: std::collections::HashMap<Uuid, &crate::domain::declaration::Declaration> =
-            page.items.iter().map(|d| (d.id, d)).collect();
-        rows.iter()
-            .filter_map(|row| {
-                let declaration = by_id.get(&row.declaration_id)?;
-                Some(
-                    SettingItemDto::flagged(render_flagged(&declaration.key, row, root, pii))
-                        .with_mode(&declaration.mode),
-                )
-            })
-            .collect()
-        // @cpt-end:cpt-cf-settings-service-flow-value-resolution-admin-browse:p1:inst-vr-browse-7
-    } else {
-        // @cpt-begin:cpt-cf-settings-service-flow-value-resolution-admin-browse:p1:inst-vr-browse-8
-        let outcomes = resolver
-            .resolve_declarations(&conn, &page.items, target)
-            .await;
-        let names_a_setter = outcomes.iter().any(|outcome| {
-            outcome
-                .as_ref()
-                .is_ok_and(|effective| effective.trail.iter().any(|entry| entry.set_by.is_some()))
-        });
-        let pii = (has_pii || names_a_setter) && may_read_pii(&enforcer, &ctx).await;
-        page.items
-            .iter()
-            .zip(outcomes)
-            .map(|(declaration, outcome)| match outcome {
-                Ok(effective) => {
-                    SettingItemDto::resolved(render(&effective, pii)).with_mode(&declaration.mode)
-                }
-                Err(err) => {
-                    if let Some(diagnostic) = err.internal_diagnostic() {
-                        tracing::error!(
-                            key = %declaration.key,
-                            diagnostic = %LogSafe(diagnostic),
-                            "a browse entry failed internally"
-                        );
-                    }
-                    SettingItemDto::failed(&declaration.key, &err).with_mode(&declaration.mode)
-                }
-            })
-            .collect()
-        // @cpt-end:cpt-cf-settings-service-flow-value-resolution-admin-browse:p1:inst-vr-browse-8
-    };
+        })
+        .collect();
+    // @cpt-end:cpt-cf-settings-service-flow-value-resolution-admin-browse:p1:inst-vr-browse-8
 
     // @cpt-begin:cpt-cf-settings-service-flow-value-resolution-admin-browse:p1:inst-vr-browse-9
     // A named key with no declaration, or one the caller may not see, gets its
     // own entry — on the final page, where its absence is known to be final.
+    // Under the narrowing a visible key whose own override is not flagged is
+    // absent from the page because the narrowing excluded it, not because it
+    // does not exist: it gets no entry, and only a key with no declaration the
+    // caller may see is reported `not_found`.
     if let Some(keys) = &filter.keys
         && page.page_info.next_cursor.is_none()
     {
-        for key in keys {
-            if !items.iter().any(|item| &item.key == key) {
-                items.push(SettingItemDto::not_found(key));
+        let absent: Vec<String> = keys
+            .iter()
+            .filter(|key| !items.iter().any(|item| &item.key == *key))
+            .cloned()
+            .collect();
+        // One read for every absent key, through the page's own gates, so a
+        // key the caller may not see is answered as one that does not exist.
+        let visible = if flagged_at.is_some() {
+            resolver
+                .visible_keys(&conn, &scope, &caller_chain, &absent)
+                .await?
+        } else {
+            Vec::new()
+        };
+        for key in absent {
+            if visible.contains(&key) {
+                continue;
             }
+            items.push(SettingItemDto::not_found(&key));
         }
     }
     // @cpt-end:cpt-cf-settings-service-flow-value-resolution-admin-browse:p1:inst-vr-browse-9
 
     // @cpt-begin:cpt-cf-settings-service-flow-value-resolution-admin-browse:p1:inst-vr-browse-10
+    // The total is of the settings the walk pages — counted after the hidden
+    // exclusion as the page is, and under `needs_review eq true` over the
+    // narrowed set, since the narrowing is in the page query — so it tells the
+    // caller nothing the page does not.
+    Ok(Json(PageDto {
+        items,
+        page_info: PageInfoDto::of(page.page_info, Some(page.total_count)),
+    }))
+    // @cpt-end:cpt-cf-settings-service-flow-value-resolution-admin-browse:p1:inst-vr-browse-10
+}
+
+// @cpt-dod:cpt-cf-settings-service-dod-value-resolution-review-listing:p1
+/// `GET /settings-service/v1/settings/review?tenant={tenant_id}` with `OData`
+/// `$filter`, `limit` and a cursor.
+///
+/// # Errors
+/// 400 on a malformed `tenant`, a `$filter` naming `needs_review`, an unmapped
+/// field or an unsupported operator, `$orderby` or `$select`, a cursor minted
+/// under another filter or target, or a subtree past the budget; 403 when the
+/// caller may not read values or the target is outside its subtree or
+/// standalone; 503 when a dependency cannot answer.
+pub async fn list_review(
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(resolver): Extension<Arc<ConcreteResolver>>,
+    Extension(db): Extension<Arc<toolkit_db::DBProvider<toolkit_db::DbError>>>,
+    Extension(enforcer): Extension<Arc<authz_resolver_sdk::PolicyEnforcer>>,
+    Query(params): Query<TenantParam>,
+    OData(query): OData,
+) -> ApiResult<impl IntoResponse> {
+    // @cpt-begin:cpt-cf-settings-service-flow-value-resolution-review-list:p1:inst-vr-review-1
+    let requested = parse_tenant(params.tenant.as_deref())?;
+    crate::domain::odata::reject_unsupported_options(&query, "the review listing")?;
+    // The order is fixed — declaration, then tenant — which a keyset cursor
+    // needs; a requested one is refused rather than ignored.
+    if !query.order.0.is_empty() {
+        return Err(DomainError::Validation {
+            field: "$orderby".to_owned(),
+            code: field::ODATA_UNSUPPORTED_OPTION,
+            message: "$orderby is not supported on the review listing; it is ordered by \
+                      setting, then tenant"
+                .to_owned(),
+        }
+        .into());
+    }
+    let filter = interpret(query.filter.as_deref())?;
+    // `needs_review` is the listing itself, not something to narrow it by.
+    if filter.needs_review {
+        return Err(unsupported(
+            "`needs_review` is not a filter of the review listing: every row it lists is \
+             flagged for review",
+        )
+        .into());
+    }
+    // @cpt-end:cpt-cf-settings-service-flow-value-resolution-review-list:p1:inst-vr-review-1
+    // @cpt-begin:cpt-cf-settings-service-flow-value-resolution-review-list:p1:inst-vr-review-2
+    // One decision on the value resource for the whole page; its constraints
+    // narrow the settings the rows may belong to, in the page query.
+    let scope: AccessScope =
+        authz::access_scope(&enforcer, &ctx, &resource::VALUE, READ, None).await?;
+    // @cpt-end:cpt-cf-settings-service-flow-value-resolution-review-list:p1:inst-vr-review-2
+    // @cpt-begin:cpt-cf-settings-service-flow-value-resolution-review-list:p1:inst-vr-review-3
+    let target = gate_target(&resolver, &ctx, requested).await?;
+    // @cpt-end:cpt-cf-settings-service-flow-value-resolution-review-list:p1:inst-vr-review-3
+    let root = resolver.root_tenant().await?;
+    let target_tenant = target.tenant_id(root);
+    // @cpt-begin:cpt-cf-settings-service-flow-value-resolution-review-list:p1:inst-vr-review-4
+    // The rows of the target's subtree, standalone descendants excluded by the
+    // hierarchy and at most the subtree budget of tenants: a subtree the
+    // budget cuts would hide rows silently, so the request is refused with the
+    // bound named.
+    let (mut tenant_ids, truncated) = resolver
+        .hierarchy()
+        .descendants_bfs(target_tenant, SUBTREE_BUDGET)
+        .await?;
+    if truncated {
+        return Err(subtree_too_large("tenant", "target's").into());
+    }
+    tenant_ids.push(target_tenant);
+    // @cpt-end:cpt-cf-settings-service-flow-value-resolution-review-list:p1:inst-vr-review-4
+
+    // @cpt-begin:cpt-cf-settings-service-flow-value-resolution-review-list:p1:inst-vr-review-5
+    // The cursor is bound to the `$filter` as asked and to the target; the
+    // page read compares it before any row is read, and a cursor minted under
+    // another filter or another target is refused 400.
+    let mut query = query;
+    query.filter_hash = Some(review_binding(target_tenant, query.filter.as_deref()));
+    // @cpt-end:cpt-cf-settings-service-flow-value-resolution-review-list:p1:inst-vr-review-5
+
+    let conn = db.conn().map_err(|e| conn_error(&e))?;
+    // A setting hidden from the caller has no rows here, silently: excluded in
+    // the page query on the caller's own chain, as the browse excludes it.
+    let caller_chain = resolver.chain_of(ctx.subject_tenant_id()).await?;
+    let domain_visibility = visibility::domain_visibility(&scope);
+    // Inst-vr-review-6 is the page read itself, in the value repository.
+    let page = resolver
+        .review_page(
+            &conn,
+            &ReviewRequest {
+                scope: &scope,
+                visibility: &domain_visibility,
+                hidden_for: &caller_chain,
+                tenant_ids: &tenant_ids,
+                declarations: filter.declarations.as_ref(),
+                query: &query,
+            },
+        )
+        .await?;
+
+    // @cpt-begin:cpt-cf-settings-service-flow-value-resolution-review-list:p1:inst-vr-review-7
+    // The page's declarations in one batch, each row finding its own in
+    // constant time.
+    let mut ids: Vec<Uuid> = page.items.iter().map(|row| row.declaration_id).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    let by_id: std::collections::HashMap<Uuid, crate::domain::declaration::Declaration> = resolver
+        .declarations_by_ids(&conn, &ids)
+        .await?
+        .into_iter()
+        .map(|d| (d.id, d))
+        .collect();
+    // @cpt-end:cpt-cf-settings-service-flow-value-resolution-review-list:p1:inst-vr-review-7
+    // @cpt-begin:cpt-cf-settings-service-flow-value-resolution-review-list:p1:inst-vr-review-8
+    // Every row names who set it, an administrator's identity, so the
+    // entitlement is asked whenever the page has a row.
+    let pii = !page.items.is_empty() && may_read_pii(&enforcer, &ctx).await;
+    let items: Vec<ReviewItemDto> = page
+        .items
+        .iter()
+        .filter_map(|row| {
+            // The page query joins each row to a visible declaration, so a
+            // miss here means the declaration went away between the two
+            // reads; the row is skipped, and the gap is said aloud because
+            // the page is shorter than its cursor claims.
+            let Some(declaration) = by_id.get(&row.declaration_id) else {
+                tracing::warn!(
+                    declaration_id = %row.declaration_id,
+                    tenant = %row.tenant_id,
+                    "a review row lost its declaration between the page and the declaration reads"
+                );
+                return None;
+            };
+            Some(
+                render_flagged(&declaration.key, &declaration.mode, row, root, pii)
+                    .with_display_name(declaration.display_name.as_deref()),
+            )
+        })
+        .collect();
+    // @cpt-end:cpt-cf-settings-service-flow-value-resolution-review-list:p1:inst-vr-review-8
+    // @cpt-begin:cpt-cf-settings-service-flow-value-resolution-review-list:p1:inst-vr-review-9
     Ok(Json(toolkit_odata::Page {
         items,
         page_info: page.page_info,
     }))
-    // @cpt-end:cpt-cf-settings-service-flow-value-resolution-admin-browse:p1:inst-vr-browse-10
+    // @cpt-end:cpt-cf-settings-service-flow-value-resolution-review-list:p1:inst-vr-review-9
 }
 
 #[cfg(test)]
@@ -458,9 +594,9 @@ pub async fn get_history(
         .iter()
         .map(|r| render_record(r, values_are_pii, pii))
         .collect();
-    Ok(Json(toolkit_odata::Page {
+    Ok(Json(PageDto {
         items,
-        page_info: page.page_info,
+        page_info: PageInfoDto::of(page.page_info, Some(page.total_count)),
     }))
     // @cpt-end:cpt-cf-settings-service-flow-audit-store-history:p1:inst-as-hist-9
 }

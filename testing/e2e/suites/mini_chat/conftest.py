@@ -1022,11 +1022,11 @@ def _check_mini_chat_binary():
 
     In CI, make e2e-local runs all gears against the shared server.
     Mini-chat needs its own binary (different features), built separately
-    via make e2e-mini-chat. Without E2E_BINARY, skip gracefully.
+    via make e2e-local SUITE=mini-chat. Without E2E_BINARY, skip gracefully.
     """
     if not os.environ.get("E2E_BINARY"):
         pytest.skip(
-            "E2E_BINARY not set — run mini-chat tests via: make e2e-mini-chat",
+            "E2E_BINARY not set — run mini-chat tests via: make e2e-local SUITE=mini-chat",
             allow_module_level=True,
         )
 

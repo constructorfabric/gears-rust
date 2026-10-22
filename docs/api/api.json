@@ -1499,6 +1499,15 @@
       "CategoryDto": {
         "description": "A category as returned to a caller.\n\nField naming is `snake_case`, applied by `#[toolkit_macros::api_dto]` rather\nthan chosen here: every gear's DTOs serialize the same way, so a client does\nnot have to know which service produced a payload.",
         "properties": {
+          "advanced_count": {
+            "description": "Of those, the settings tagged `advanced` — what a console shows apart\nfrom the standard ones, folded away by default, and must still account\nfor rather than omit silently.",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "description": {
             "description": "Optional long-form description.",
             "type": [
@@ -1532,6 +1541,24 @@
           "name": {
             "description": "Display name.",
             "type": "string"
+          },
+          "retired_count": {
+            "description": "Of those, the settings `retired`: still filed under the category and\nlisted by its browse under their own outcome.",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "setting_count": {
+            "description": "How many settings the category holds for the caller: every declaration\na browse of the category would list for it, whatever the status, so the\nnumber beside the category agrees with the table under it. Present when\nthe caller may read values; absent, with the two below, when it may not\n— as the settings themselves would be.",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "sort_order": {
             "description": "Ordering weight; lower sorts first.",
@@ -2653,6 +2680,152 @@
         ],
         "type": "object"
       },
+      "CountedPageInfoDto": {
+        "description": "The cursors, the page size, and the size of the set the page was cut from.\n\nAliased to `CountedPageInfoDto` in the `OpenAPI` schema: types-registry\nalso exposes a `PageInfoDto`, of another shape, and every gear registers\ninto the one `OpenAPI` registry of the server, where the bare ident would\ncollide in `components.schemas`.",
+        "properties": {
+          "limit": {
+            "description": "The page size applied, which is the default when the caller named none.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "next_cursor": {
+            "description": "The cursor of the next page; `null` on the last one.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "prev_cursor": {
+            "description": "The cursor of the previous page; `null` on the first one.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "total_count": {
+            "description": "How many rows the walk holds in all, counted under the page's own\npredicate — the caller's scope, the visibility rules and the `$filter`,\nnever the cursor — at the time of the read, so every page of one walk\nreports the same total. Absent on the one listing whose items are not\nthe set it pages: the needs-review browse, which pages declarations\nand lists their flagged rows.",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "limit"
+        ],
+        "type": "object"
+      },
+      "CountedPage_AuditRecordDto": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/AuditRecordDto"
+            },
+            "type": "array"
+          },
+          "page_info": {
+            "$ref": "#/components/schemas/CountedPageInfoDto"
+          }
+        },
+        "required": [
+          "items",
+          "page_info"
+        ],
+        "type": "object"
+      },
+      "CountedPage_CategoryDto": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/CategoryDto"
+            },
+            "type": "array"
+          },
+          "page_info": {
+            "$ref": "#/components/schemas/CountedPageInfoDto"
+          }
+        },
+        "required": [
+          "items",
+          "page_info"
+        ],
+        "type": "object"
+      },
+      "CountedPage_DeclarationDto": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/DeclarationDto"
+            },
+            "type": "array"
+          },
+          "page_info": {
+            "$ref": "#/components/schemas/CountedPageInfoDto"
+          }
+        },
+        "required": [
+          "items",
+          "page_info"
+        ],
+        "type": "object"
+      },
+      "CountedPage_RestrictionDto": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/RestrictionDto"
+            },
+            "type": "array"
+          },
+          "page_info": {
+            "$ref": "#/components/schemas/CountedPageInfoDto"
+          }
+        },
+        "required": [
+          "items",
+          "page_info"
+        ],
+        "type": "object"
+      },
+      "CountedPage_SearchHitDto": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/SearchHitDto"
+            },
+            "type": "array"
+          },
+          "page_info": {
+            "$ref": "#/components/schemas/CountedPageInfoDto"
+          }
+        },
+        "required": [
+          "items",
+          "page_info"
+        ],
+        "type": "object"
+      },
+      "CountedPage_SettingItemDto": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/SettingItemDto"
+            },
+            "type": "array"
+          },
+          "page_info": {
+            "$ref": "#/components/schemas/CountedPageInfoDto"
+          }
+        },
+        "required": [
+          "items",
+          "page_info"
+        ],
+        "type": "object"
+      },
       "CpuInfoDto": {
         "properties": {
           "cores": {
@@ -2800,6 +2973,13 @@
           },
           "description": {
             "description": "Optional long-form description.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "display_name": {
+            "description": "Optional human-readable label, 1..256 characters after trimming. An\nexplicit `null` reads as unsupplied.",
             "type": [
               "string",
               "null"
@@ -3943,6 +4123,13 @@
           },
           "description": {
             "description": "Optional long-form description.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "display_name": {
+            "description": "Optional human-readable label; omitted when unset, never derived from\n`leaf_slug`.",
             "type": [
               "string",
               "null"
@@ -5366,13 +5553,6 @@
         ],
         "type": "object"
       },
-      "FileDtoList": {
-        "description": "List of files (`GET /files`).",
-        "items": {
-          "$ref": "#/components/schemas/FileDto"
-        },
-        "type": "array"
-      },
       "FileParserInfoDto": {
         "description": "REST DTO for file parser info response",
         "properties": {
@@ -5420,61 +5600,6 @@
           "timezone",
           "granularity",
           "fy_start"
-        ],
-        "type": "object"
-      },
-      "FlaggedOverrideDto": {
-        "description": "An override flagged for review, as the needs-review listing reports it.",
-        "properties": {
-          "etag": {
-            "description": "The override's value state tag — what a write correcting this row\npresents in `If-Match`.",
-            "type": "string"
-          },
-          "key": {
-            "description": "The setting key.",
-            "type": "string"
-          },
-          "last_change_at": {
-            "description": "When the override last changed.",
-            "type": "string"
-          },
-          "masked": {
-            "description": "Whether `value` carries the mask token.",
-            "type": "boolean"
-          },
-          "needs_review_detail": {
-            "description": "Why the override no longer validates.",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "scope": {
-            "description": "Its scope path.",
-            "type": "string"
-          },
-          "set_by": {
-            "description": "Who set it: an administrator's identity, masked for a caller not\nauthorized for unmasked PII.",
-            "type": "string"
-          },
-          "tenant_id": {
-            "description": "The tenant whose override is flagged.",
-            "format": "uuid",
-            "type": "string"
-          },
-          "value": {
-            "description": "The stored value, masked by classification."
-          }
-        },
-        "required": [
-          "key",
-          "tenant_id",
-          "scope",
-          "value",
-          "masked",
-          "last_change_at",
-          "set_by",
-          "etag"
         ],
         "type": "object"
       },
@@ -7339,6 +7464,120 @@
         ],
         "type": "object"
       },
+      "LicenseCheckContext": {
+        "description": "The request's tenant context — the isolation scope of a check.\n\nBuilt from the caller's `SecurityContext` with\n[`from_security_context`](Self::from_security_context). Minimal today\n(tenant scope only); the extension point for future contextual evaluation\nsemantics. Every resolution is scoped to this tenant.\n\nUnknown fields are ignored, so a contextual input can be added without\nbreaking callers or older readers — but only one that satisfies **absence\nmust not grant more than presence**. An input that cannot is a new version of\nthe licensing contract, not an optional field (see \"Envelope evolution\" in\nthe module's DESIGN doc).",
+        "properties": {
+          "tenant_id": {
+            "description": "The tenant the check is scoped to. No cross-tenant resolution.",
+            "format": "uuid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "tenant_id"
+        ],
+        "type": "object"
+      },
+      "LicenseCheckRequest": {
+        "description": "The single input to a check — the contract's growth surface.\n\nNew inputs are added as fields here, never as new method parameters. Because\nthat growth is expected, the type is `#[non_exhaustive]` and is built through\n[`new`](Self::new), so adding an input stays additive instead of breaking\nevery caller's struct literal. Contextual inputs belong on\n[`LicenseCheckContext`].\n\nUnknown fields are **ignored** here too, under the same rule as\n[`LicenseCheckContext`].",
+        "properties": {
+          "context": {
+            "$ref": "#/components/schemas/LicenseCheckContext",
+            "description": "The tenant isolation scope (caller-derived from its `SecurityContext`)."
+          },
+          "resource": {
+            "$ref": "#/components/schemas/LicenseResource",
+            "description": "The licensable thing being checked."
+          },
+          "subject": {
+            "$ref": "#/components/schemas/LicenseSubject",
+            "description": "Whom the license is checked for."
+          }
+        },
+        "required": [
+          "subject",
+          "resource",
+          "context"
+        ],
+        "type": "object"
+      },
+      "LicenseDecision": {
+        "description": "The result of a check.\n\nA negative answer is **not** an error — it is `LicenseDecision { granted:\nfalse, .. }`. [`diagnostics`](Self::diagnostics) is non-authoritative debug\ninfo about how the decision was reached (e.g. backend id, matched grant,\ndenial cause) and MUST NOT be required to interpret the boolean.\n\nUnknown fields are **ignored**; adding one is non-breaking in both directions\nbecause [`granted`](Self::granted) is authoritative on its own.",
+        "properties": {
+          "diagnostics": {
+            "additionalProperties": {},
+            "description": "Advisory, string-keyed debug information. Never authoritative.",
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": "object"
+          },
+          "granted": {
+            "description": "Whether the resource is licensed to the subject at the time of the call.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "granted"
+        ],
+        "type": "object"
+      },
+      "LicenseResource": {
+        "additionalProperties": false,
+        "description": "The resource of a check — the licensable thing.\n\nAn instance of a derived Resource contract type (base\n`gts.cf.core.lic.res.v1~`). Without [`id`](Self::id) the check targets the\nwhole resource type (e.g. gating a `POST`); with it, a specific instance. Its\nwire shape is pinned by [`LicenseResourceV1`](crate::gts::LicenseResourceV1).",
+        "properties": {
+          "id": {
+            "description": "Optional instance id — a well-known name or a UUID (natural key);\nnon-empty, at most 255 characters per the base schema.\nAbsent = whole-type check; how that is answered is the backend's policy.",
+            "maxLength": 255,
+            "minLength": 1,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "metadata": {
+            "description": "Licensing-relevant properties conforming to the derived contract's\nmetadata schema. Semantically opaque to the resolver; shape-validated\nthen forwarded to the plugin unchanged.\n\nRequired on the wire, so an omitted `metadata` is non-conforming and\n**must not** be defaulted to `{}` here. Pass an empty map when the\ncontract declares no metadata.",
+            "type": "object"
+          },
+          "type": {
+            "description": "The derived Resource contract type this object instantiates (e.g.\n`gts.cf.core.lic.res.v1~cf.genai.llm_gateway.model_usage.v1~`). Wire key\n`type`; the resolver resolves its schema to validate `metadata` and read\n`admitted_subjects`.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "metadata"
+        ],
+        "type": "object"
+      },
+      "LicenseSubject": {
+        "additionalProperties": false,
+        "description": "The subject of a check — whom the license is checked for.\n\nAn instance of a derived Subject contract type (base\n`gts.cf.core.lic.subj.v1~`). Polymorphic: a tenant, a user, or any future\nsubject type — the resolver never assumes the subject is a tenant. Its wire\nshape is pinned by [`LicenseSubjectV1`](crate::gts::LicenseSubjectV1).",
+        "properties": {
+          "id": {
+            "description": "Optional instance id — a well-known name or a UUID (natural key);\nnon-empty, at most 255 characters per the base schema.\nAbsent for a type-level subject.",
+            "maxLength": 255,
+            "minLength": 1,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "metadata": {
+            "description": "Licensing-relevant properties conforming to the derived contract's\nmetadata schema. Semantically opaque to the resolver; shape-validated\nthen forwarded to the plugin unchanged.\n\nRequired on the wire, so an omitted `metadata` is non-conforming and\n**must not** be defaulted to `{}` here. Pass an empty map when the\ncontract declares no metadata.",
+            "type": "object"
+          },
+          "type": {
+            "description": "The derived Subject contract type this object instantiates (e.g.\n`gts.cf.core.lic.subj.v1~cf.genai.llm_gateway.user.v1~`). Wire key\n`type`; the resolver resolves its schema to validate `metadata`.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "metadata"
+        ],
+        "type": "object"
+      },
       "LifecycleNextDto": {
         "description": "A lifecycle change that takes effect on `from` (P-D-249).",
         "properties": {
@@ -8991,47 +9230,11 @@
         ],
         "type": "object"
       },
-      "Page_AuditRecordDto": {
-        "properties": {
-          "items": {
-            "items": {
-              "$ref": "#/components/schemas/AuditRecordDto"
-            },
-            "type": "array"
-          },
-          "page_info": {
-            "$ref": "#/components/schemas/PageInfo"
-          }
-        },
-        "required": [
-          "items",
-          "page_info"
-        ],
-        "type": "object"
-      },
       "Page_BalanceDto": {
         "properties": {
           "items": {
             "items": {
               "$ref": "#/components/schemas/BalanceDto"
-            },
-            "type": "array"
-          },
-          "page_info": {
-            "$ref": "#/components/schemas/PageInfo"
-          }
-        },
-        "required": [
-          "items",
-          "page_info"
-        ],
-        "type": "object"
-      },
-      "Page_CategoryDto": {
-        "properties": {
-          "items": {
-            "items": {
-              "$ref": "#/components/schemas/CategoryDto"
             },
             "type": "array"
           },
@@ -9153,24 +9356,6 @@
         ],
         "type": "object"
       },
-      "Page_DeclarationDto": {
-        "properties": {
-          "items": {
-            "items": {
-              "$ref": "#/components/schemas/DeclarationDto"
-            },
-            "type": "array"
-          },
-          "page_info": {
-            "$ref": "#/components/schemas/PageInfo"
-          }
-        },
-        "required": [
-          "items",
-          "page_info"
-        ],
-        "type": "object"
-      },
       "Page_DisputeView": {
         "properties": {
           "items": {
@@ -9212,6 +9397,24 @@
           "items": {
             "items": {
               "$ref": "#/components/schemas/ExceptionView"
+            },
+            "type": "array"
+          },
+          "page_info": {
+            "$ref": "#/components/schemas/PageInfo"
+          }
+        },
+        "required": [
+          "items",
+          "page_info"
+        ],
+        "type": "object"
+      },
+      "Page_FileDto": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/FileDto"
             },
             "type": "array"
           },
@@ -9477,11 +9680,29 @@
         ],
         "type": "object"
       },
-      "Page_RestrictionDto": {
+      "Page_RetentionRuleDto": {
         "properties": {
           "items": {
             "items": {
-              "$ref": "#/components/schemas/RestrictionDto"
+              "$ref": "#/components/schemas/RetentionRuleDto"
+            },
+            "type": "array"
+          },
+          "page_info": {
+            "$ref": "#/components/schemas/PageInfo"
+          }
+        },
+        "required": [
+          "items",
+          "page_info"
+        ],
+        "type": "object"
+      },
+      "Page_ReviewItemDto": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/ReviewItemDto"
             },
             "type": "array"
           },
@@ -9513,47 +9734,29 @@
         ],
         "type": "object"
       },
-      "Page_SearchHitDto": {
-        "properties": {
-          "items": {
-            "items": {
-              "$ref": "#/components/schemas/SearchHitDto"
-            },
-            "type": "array"
-          },
-          "page_info": {
-            "$ref": "#/components/schemas/PageInfo"
-          }
-        },
-        "required": [
-          "items",
-          "page_info"
-        ],
-        "type": "object"
-      },
-      "Page_SettingItemDto": {
-        "properties": {
-          "items": {
-            "items": {
-              "$ref": "#/components/schemas/SettingItemDto"
-            },
-            "type": "array"
-          },
-          "page_info": {
-            "$ref": "#/components/schemas/PageInfo"
-          }
-        },
-        "required": [
-          "items",
-          "page_info"
-        ],
-        "type": "object"
-      },
       "Page_SkuListItem": {
         "properties": {
           "items": {
             "items": {
               "$ref": "#/components/schemas/SkuListItem"
+            },
+            "type": "array"
+          },
+          "page_info": {
+            "$ref": "#/components/schemas/PageInfo"
+          }
+        },
+        "required": [
+          "items",
+          "page_info"
+        ],
+        "type": "object"
+      },
+      "Page_StorageDto": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/StorageDto"
             },
             "type": "array"
           },
@@ -9698,6 +9901,24 @@
           "items": {
             "items": {
               "$ref": "#/components/schemas/UsersInfoUserDto"
+            },
+            "type": "array"
+          },
+          "page_info": {
+            "$ref": "#/components/schemas/PageInfo"
+          }
+        },
+        "required": [
+          "items",
+          "page_info"
+        ],
+        "type": "object"
+      },
+      "Page_VersionDto": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/VersionDto"
             },
             "type": "array"
           },
@@ -17889,13 +18110,6 @@
         ],
         "type": "object"
       },
-      "RetentionRuleDtoList": {
-        "description": "List of retention rules (`GET /retention-rules`).",
-        "items": {
-          "$ref": "#/components/schemas/RetentionRuleDto"
-        },
-        "type": "array"
-      },
       "ReturnPaymentRequest": {
         "description": "The `POST /payments/{payment_id}/returns` request body: claw a settled\nreceipt back out (the reversal of a money-in). `{payment_id}` (the original\nsettled payment) comes from the PATH; `psp_return_id` is the idempotency key\n(a re-post replays). `money` carries its currency and stored scale;\n`effective_at` `None` ⇒ stamped at post time.",
         "properties": {
@@ -18284,6 +18498,73 @@
         ],
         "type": "object"
       },
+      "ReviewItemDto": {
+        "description": "One flagged override row, as `GET /settings-service/v1/settings/review`\nlists it: the row at the scope that holds it, where it must be fixed — not\na resolved value.",
+        "properties": {
+          "display_name": {
+            "description": "The declaration's display name; omitted when it has none, never derived\nfrom the key.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "etag": {
+            "description": "The override's value state tag — what a write correcting this row\npresents in `If-Match`.",
+            "type": "string"
+          },
+          "key": {
+            "description": "The setting key.",
+            "type": "string"
+          },
+          "last_change_at": {
+            "description": "When the override last changed.",
+            "type": "string"
+          },
+          "masked": {
+            "description": "Whether `value` carries the mask token.",
+            "type": "boolean"
+          },
+          "mode": {
+            "description": "`standard` or `advanced`, from the declaration.",
+            "type": "string"
+          },
+          "needs_review_detail": {
+            "description": "Why the override no longer validates.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "scope": {
+            "description": "Its scope path: `/` or `/tenants/{id}`.",
+            "type": "string"
+          },
+          "set_by": {
+            "description": "Who set it: an administrator's identity, masked for a caller not\nauthorized for unmasked PII.",
+            "type": "string"
+          },
+          "tenant_id": {
+            "description": "The tenant whose override is flagged.",
+            "format": "uuid",
+            "type": "string"
+          },
+          "value": {
+            "description": "The stored value, masked by classification."
+          }
+        },
+        "required": [
+          "key",
+          "mode",
+          "tenant_id",
+          "scope",
+          "value",
+          "masked",
+          "last_change_at",
+          "set_by",
+          "etag"
+        ],
+        "type": "object"
+      },
       "ReviewThreadDto": {
         "description": "A mirrored PR review conversation thread, served by the extended API.",
         "properties": {
@@ -18485,6 +18766,13 @@
               "null"
             ]
           },
+          "display_name": {
+            "description": "The declaration's display name, when it has one; omitted when unset,\nnever derived from `leaf_slug`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "key": {
             "description": "The setting key.",
             "type": "string"
@@ -18494,7 +18782,7 @@
             "type": "string"
           },
           "matched_field": {
-            "description": "Which field matched: `key`, `description`, `category_name`,\n`default_value` or `value`.",
+            "description": "Which field matched: `key`, `display_name`, `description`,\n`category_name`, `default_value` or `value`.",
             "type": "string"
           },
           "mode": {
@@ -18517,7 +18805,7 @@
             ]
           },
           "value": {
-            "description": "The matched stored value — the override for a `value` hit, the Schema\nDefault for a `default_value` hit — masked by classification exactly\nas a read would mask it. Absent for a hit on the key, description or\ncategory name."
+            "description": "The matched stored value — the override for a `value` hit, the Schema\nDefault for a `default_value` hit — masked by classification exactly\nas a read would mask it. Absent for a hit on the key, display name,\ndescription or category name."
           }
         },
         "required": [
@@ -18901,6 +19189,13 @@
               "null"
             ]
           },
+          "display_name": {
+            "description": "The declaration's display name; omitted when it has none, never derived\nfrom the key.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "effective": {
             "oneOf": [
               {
@@ -18909,17 +19204,6 @@
               {
                 "$ref": "#/components/schemas/EffectiveValueDto",
                 "description": "The effective value, when `outcome` is `resolved`."
-              }
-            ]
-          },
-          "flagged": {
-            "oneOf": [
-              {
-                "type": "null"
-              },
-              {
-                "$ref": "#/components/schemas/FlaggedOverrideDto",
-                "description": "The flagged override, when `outcome` is `needs_review`."
               }
             ]
           },
@@ -18935,7 +19219,7 @@
             ]
           },
           "outcome": {
-            "description": "`resolved`, `needs_review`, `not_found`, `retired`, `unavailable` or\n`error`.",
+            "description": "`resolved`, `not_found`, `retired`, `unavailable` or `error`.",
             "type": "string"
           }
         },
@@ -19813,13 +20097,6 @@
           "capabilities"
         ],
         "type": "object"
-      },
-      "StorageDtoList": {
-        "description": "List of configured storage backends (`GET /storages`).",
-        "items": {
-          "$ref": "#/components/schemas/StorageDto"
-        },
-        "type": "array"
       },
       "StreamMessageRequest": {
         "description": "Request body for `POST /v1/chats/{id}/messages:stream`.",
@@ -21286,6 +21563,13 @@
               "null"
             ]
           },
+          "display_name": {
+            "description": "Human-readable label, 1..256 characters after trimming; `null` clears it.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "domain_affinity": {
             "description": "Administrative domain; `null` clears it.",
             "type": [
@@ -22258,13 +22542,6 @@
           "created_at"
         ],
         "type": "object"
-      },
-      "VersionDtoList": {
-        "description": "List of file versions (`GET /files/{id}/versions`).",
-        "items": {
-          "$ref": "#/components/schemas/VersionDto"
-        },
-        "type": "array"
       },
       "ViolationDto": {
         "description": "One field-level violation.",
@@ -26848,6 +27125,7 @@
     },
     "/api/file-storage/v1/files": {
       "get": {
+        "description": "Keyset pagination in either direction: `limit` (default 25, max 200) and the opaque `cursor` from the previous page's `page_info.next_cursor` or `page_info.prev_cursor`. The response carries `next_cursor` and `prev_cursor`. Canonical order is `created_at desc, file_id desc` -- see docs/api.md. `$top` and `$skiptoken` are synonyms of `limit` and `cursor`; `$filter`, `$orderby`, `$select` and every other `$` parameter are rejected with 400.",
         "operationId": "file_storage.list_files",
         "parameters": [
           {
@@ -26869,7 +27147,7 @@
             }
           },
           {
-            "description": "Page size",
+            "description": "Page size (default 25, max 200); alias `$top`",
             "in": "query",
             "name": "limit",
             "required": false,
@@ -26878,12 +27156,12 @@
             }
           },
           {
-            "description": "Offset",
+            "description": "Opaque continuation token from the previous page; alias `$skiptoken`",
             "in": "query",
-            "name": "offset",
+            "name": "cursor",
             "required": false,
             "schema": {
-              "type": "integer"
+              "type": "string"
             }
           }
         ],
@@ -26892,7 +27170,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/FileDtoList"
+                  "$ref": "#/components/schemas/Page_FileDto"
                 }
               }
             },
@@ -26944,7 +27222,7 @@
             "bearerAuth": []
           }
         ],
-        "summary": "List files for an owner (owner_kind + owner_id required)",
+        "summary": "List files for an owner (owner_kind + owner_id required, cursor pagination)",
         "tags": [
           "File Storage"
         ]
@@ -28248,6 +28526,7 @@
     },
     "/api/file-storage/v1/files/{id}/versions": {
       "get": {
+        "description": "Keyset pagination in either direction: `limit` (default 25, max 200) and the opaque `cursor` from the previous page's `page_info.next_cursor` or `page_info.prev_cursor`. The response carries `next_cursor` and `prev_cursor`. Canonical order is `created_at desc, version_id desc` -- see docs/api.md. `$top` and `$skiptoken` are synonyms of `limit` and `cursor`; `$filter`, `$orderby`, `$select` and every other `$` parameter are rejected with 400.",
         "operationId": "file_storage.list_versions",
         "parameters": [
           {
@@ -28260,7 +28539,7 @@
             }
           },
           {
-            "description": "Page size",
+            "description": "Page size (default 25, max 200); alias `$top`",
             "in": "query",
             "name": "limit",
             "required": false,
@@ -28269,12 +28548,12 @@
             }
           },
           {
-            "description": "Offset",
+            "description": "Opaque continuation token from the previous page; alias `$skiptoken`",
             "in": "query",
-            "name": "offset",
+            "name": "cursor",
             "required": false,
             "schema": {
-              "type": "integer"
+              "type": "string"
             }
           }
         ],
@@ -28283,11 +28562,21 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/VersionDtoList"
+                  "$ref": "#/components/schemas/Page_VersionDto"
                 }
               }
             },
             "description": "Versions"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
           },
           "401": {
             "content": {
@@ -28335,7 +28624,7 @@
             "bearerAuth": []
           }
         ],
-        "summary": "List all versions of a file",
+        "summary": "List a file's versions, newest first (cursor pagination)",
         "tags": [
           "File Storage"
         ]
@@ -28752,17 +29041,48 @@
     },
     "/api/file-storage/v1/retention-rules": {
       "get": {
+        "description": "Keyset pagination in either direction: `limit` (default 25, max 200) and the opaque `cursor` from the previous page's `page_info.next_cursor` or `page_info.prev_cursor`. The response carries `next_cursor` and `prev_cursor`. Canonical order is `created_at desc, rule_id desc` -- see docs/api.md. `$top` and `$skiptoken` are synonyms of `limit` and `cursor`; `$filter`, `$orderby`, `$select` and every other `$` parameter are rejected with 400.",
         "operationId": "file_storage.list_retention_rules",
+        "parameters": [
+          {
+            "description": "Page size (default 25, max 200); alias `$top`",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Opaque continuation token from the previous page; alias `$skiptoken`",
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/RetentionRuleDtoList"
+                  "$ref": "#/components/schemas/Page_RetentionRuleDto"
                 }
               }
             },
             "description": "Retention rules"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
           },
           "401": {
             "content": {
@@ -28800,7 +29120,7 @@
             "bearerAuth": []
           }
         ],
-        "summary": "List all retention rules for the caller's tenant",
+        "summary": "List retention rules for the caller's tenant",
         "tags": [
           "File Storage"
         ]
@@ -28960,17 +29280,48 @@
     },
     "/api/file-storage/v1/storages": {
       "get": {
+        "description": "Keyset pagination in either direction: `limit` (default 25, max 200) and the opaque `cursor` from the previous page's `page_info.next_cursor` or `page_info.prev_cursor`. The response carries `next_cursor` and `prev_cursor`. Canonical order is `id asc` -- see docs/api.md. `$top` and `$skiptoken` are synonyms of `limit` and `cursor`; `$filter`, `$orderby`, `$select` and every other `$` parameter are rejected with 400.",
         "operationId": "file_storage.list_storages",
+        "parameters": [
+          {
+            "description": "Page size (default 25, max 200); alias `$top`",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Opaque continuation token from the previous page; alias `$skiptoken`",
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/StorageDtoList"
+                  "$ref": "#/components/schemas/Page_StorageDto"
                 }
               }
             },
             "description": "Backends"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
           },
           "401": {
             "content": {
@@ -29008,7 +29359,7 @@
             "bearerAuth": []
           }
         ],
-        "summary": "List configured storage backends and capabilities",
+        "summary": "List configured storage backends and capabilities (cursor pagination)",
         "tags": [
           "File Storage"
         ]
@@ -53155,6 +53506,109 @@
         ]
       }
     },
+    "/license-resolver/v1/is-licensed": {
+      "post": {
+        "operationId": "license_resolver_api_rest_is_licensed",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LicenseCheckRequest"
+              }
+            }
+          },
+          "description": "",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LicenseDecision"
+                }
+              }
+            },
+            "description": ""
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "429": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Too Many Requests"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          }
+        },
+        "security": [
+          {
+            "internalToken": []
+          }
+        ]
+      }
+    },
     "/mini-chat/v1/chats": {
       "get": {
         "operationId": "mini_chat.list_chats",
@@ -61085,7 +61539,7 @@
     },
     "/settings-service/v1/categories": {
       "get": {
-        "description": "List categories visible to the caller, ordered by sort order then name. Supports OData `$filter` over `key`, `name` and `domain_affinity`, and `$orderby` over `key` and `name`, with cursor pagination. `$orderby` over `domain_affinity` is refused: it may be empty, and a page cursor cannot carry an empty value. `$select` is not supported and is rejected rather than ignored.",
+        "description": "List categories visible to the caller, ordered by sort order then name. Supports OData `$filter` over `key`, `name`, `domain_affinity` and `sort_order`, and `$orderby` over `key`, `name` and `sort_order`, each `asc` or `desc`, with cursor pagination; the default order is sort order then name, and `name` is appended as the tiebreaker unless it is already named; `page_info.total_count` is how many categories the whole listing holds. `$orderby` over `domain_affinity` is refused: it may be empty, and a page cursor cannot carry an empty value. `$select` is not supported and is rejected rather than ignored. Each category carries `setting_count`, `advanced_count` and `retired_count` -- the settings the caller's browse of the category would list, every status, and of those the `advanced` and the `retired` ones -- when the caller may read values; a caller without that read gets the categories and no counts.",
         "operationId": "settings_service.list_categories",
         "parameters": [
           {
@@ -61107,7 +61561,7 @@
             }
           },
           {
-            "description": "OData v4 filter expression\n- key: eq|ne|contains|startswith|endswith|in\n- name: eq|ne|contains|startswith|endswith|in\n- domain_affinity: eq|ne|contains|startswith|endswith|in",
+            "description": "OData v4 filter expression\n- key: eq|ne|contains|startswith|endswith|in\n- name: eq|ne|contains|startswith|endswith|in\n- domain_affinity: eq|ne|contains|startswith|endswith|in\n- sort_order: eq|ne|gt|ge|lt|le|in",
             "in": "query",
             "name": "$filter",
             "required": false,
@@ -61116,7 +61570,7 @@
             }
           },
           {
-            "description": "OData v4 orderby expression\n- key asc\n- key desc\n- name asc\n- name desc",
+            "description": "OData v4 orderby expression\n- key asc\n- key desc\n- name asc\n- name desc\n- sort_order asc\n- sort_order desc",
             "in": "query",
             "name": "$orderby",
             "required": false,
@@ -61130,11 +61584,11 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Page_CategoryDto"
+                  "$ref": "#/components/schemas/CountedPage_CategoryDto"
                 }
               }
             },
-            "description": "A page of categories with its pagination cursors"
+            "description": "A page of categories with its pagination cursors and the total"
           },
           "400": {
             "content": {
@@ -61221,6 +61675,15 @@
               "startswith",
               "endswith",
               "in"
+            ],
+            "sort_order": [
+              "eq",
+              "ne",
+              "gt",
+              "ge",
+              "lt",
+              "le",
+              "in"
             ]
           }
         },
@@ -61229,7 +61692,9 @@
             "key asc",
             "key desc",
             "name asc",
-            "name desc"
+            "name desc",
+            "sort_order asc",
+            "sort_order desc"
           ]
         }
       },
@@ -61464,7 +61929,7 @@
         ]
       },
       "get": {
-        "description": "Fetch one category by id. A category outside the caller's administrative domain answers 404 rather than 403, so a hidden category's existence is not disclosed. The response carries the category's ETag, which a later PATCH or DELETE must echo in `If-Match`.",
+        "description": "Fetch one category by id. A category outside the caller's administrative domain answers 404 rather than 403, so a hidden category's existence is not disclosed. The response carries the category's ETag, which a later PATCH or DELETE must echo in `If-Match`, and the same setting counts the listing carries, when the caller may read values.",
         "operationId": "settings_service.get_category",
         "parameters": [
           {
@@ -61759,11 +62224,11 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Page_DeclarationDto"
+                  "$ref": "#/components/schemas/CountedPage_DeclarationDto"
                 }
               }
             },
-            "description": "A page of declarations with its pagination cursors"
+            "description": "A page of declarations with its pagination cursors and the total"
           },
           "400": {
             "content": {
@@ -62456,7 +62921,7 @@
     },
     "/settings-service/v1/search": {
       "get": {
-        "description": "Cross-field search over every category the caller may see. Matches a setting's key, description, category name, Schema Default and the overrides explicitly set inside the target's subtree, under the same authorization, target, visibility and `hidden` rules as browsing; results come back flat and ordered by key, each hit with its category, the field that matched -- one of `key`, `description`, `category_name`, `default_value` or `value` -- and its declaration's `mode` as a tag that withholds nothing. A hit on the key, description, category name or default belongs to the declaration and carries no scope; a hit on an override names the scope and tenant where it is set. Search runs over stored rows, not resolved values: an inherited value is a hit where it was set, and a default is a hit on its declaration. `tenant` bounds the override corpus to that subtree and is resolution context as everywhere else. `q` is a case-insensitive substring of at least two characters and at most two hundred; shorter or longer is refused 400. A `secret` value is never matched, so an empty result says nothing about it; a `pii` value is matched only for a caller entitled to read it unmasked. A page holds up to `limit` settings; a setting with several matching overrides contributes one hit per override. `$filter` takes the grammar `GET /settings` takes - `category_id eq`, `key eq`, `key in (...)` and `needs_review eq true`, joined by `and` - and narrows the corpus in the query, so the cursor pages the filtered set; `needs_review eq true` keeps the settings with an override flagged for review in the target's subtree. `$orderby` and `$select` are refused.",
+        "description": "Cross-field search over every category the caller may see. Matches a setting's key, display name, description, category name, Schema Default and the overrides explicitly set inside the target's subtree, under the same authorization, target, visibility and `hidden` rules as browsing; results come back flat and ordered by key, each hit with its category, the field that matched -- one of `key`, `display_name`, `description`, `category_name`, `default_value` or `value` -- and its declaration's `mode` as a tag that withholds nothing. A hit on the key, display name, description, category name or default belongs to the declaration and carries no scope; a hit on an override names the scope and tenant where it is set. Search runs over stored rows, not resolved values: an inherited value is a hit where it was set, and a default is a hit on its declaration. `tenant` bounds the override corpus to that subtree and is resolution context as everywhere else. `q` is a case-insensitive substring of at least two characters and at most two hundred; shorter or longer is refused 400. A `secret` value is never matched, so an empty result says nothing about it; a `pii` value is matched only for a caller entitled to read it unmasked. A page holds up to `limit` settings; a setting with several matching overrides contributes one hit per override. `$filter` takes the grammar `GET /settings` takes - `category_id eq`, `key eq`, `key in (...)` and `needs_review eq true`, joined by `and` - and narrows the corpus in the query, so the cursor pages the filtered set; `needs_review eq true` keeps the settings whose own override at the target is flagged for review; the value of a flagged override is never a match. `$orderby` and `$select` are refused.",
         "operationId": "settings_service.search_settings",
         "parameters": [
           {
@@ -62510,11 +62975,11 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Page_SearchHitDto"
+                  "$ref": "#/components/schemas/CountedPage_SearchHitDto"
                 }
               }
             },
-            "description": "A page of hits, ordered by key, with its pagination cursors"
+            "description": "A page of hits, ordered by key, with its pagination cursors and the total of matching settings"
           },
           "400": {
             "content": {
@@ -62601,7 +63066,7 @@
     },
     "/settings-service/v1/settings": {
       "get": {
-        "description": "Resolve a page of settings at one scope. `tenant` is resolution context, never a filter: omitted, it is the caller's own tenant, which for a platform administrator is the root and therefore platform scope; a tenant outside the caller's subtree, or a standalone descendant, answers 403. OData `$filter` supports `category_id eq`, `key eq`, `key in (...)` and `needs_review eq true`, joined by `and`; an unmapped field or unsupported operator answers 400 rather than an unfiltered page. `$orderby` takes `key` and `category_id`; any other field answers 400. Each item carries its own outcome, so a named key that does not exist is reported in its entry, never as a failure of the request. `needs_review eq true` lists the flagged override rows in the caller's subtree instead of resolved values. Values are masked by classification.",
+        "description": "Resolve a page of settings at one scope. `tenant` is resolution context, never a filter: omitted, it is the caller's own tenant, which for a platform administrator is the root and therefore platform scope; a tenant outside the caller's subtree, or a standalone descendant, answers 403. OData `$filter` supports `category_id eq`, `key eq`, `key in (...)` and `needs_review eq true`, joined by `and`; an unmapped field or unsupported operator answers 400 rather than an unfiltered page. `$orderby` takes `key` and `category_id`; any other field answers 400. Each item carries its own outcome, so a named key that does not exist is reported in its entry, never as a failure of the request. `needs_review eq true` narrows the page to the settings whose own override at the target tenant is flagged for review, still resolved values with the flag beside them, paged and counted over the narrowed set; a named key that is visible but not flagged is absent from it. The flagged rows of the target's subtree are `GET /settings-service/v1/settings/review`. Values are masked by classification.",
         "operationId": "settings_service.browse_settings",
         "parameters": [
           {
@@ -62655,11 +63120,11 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Page_SettingItemDto"
+                  "$ref": "#/components/schemas/CountedPage_SettingItemDto"
                 }
               }
             },
-            "description": "A page of per-key outcomes with its pagination cursors"
+            "description": "A page of per-key outcomes with its pagination cursors and the total of settings the listing holds under its filter"
           },
           "400": {
             "content": {
@@ -62851,6 +63316,138 @@
         ]
       }
     },
+    "/settings-service/v1/settings/review": {
+      "get": {
+        "description": "The override rows flagged for review at the target tenant and its descendants, one item per row at the scope that holds it - the place it must be fixed - not one resolved value per setting. Ordered by setting, then tenant, and paged by a row-level cursor: a setting flagged at more tenants than `limit` continues on the next page, and the cursor is bound to the `$filter` and the target, so it is refused 400 under another. `tenant` follows the read surface: omitted, the caller's own tenant; a tenant outside the caller's subtree or a standalone descendant answers 403, and standalone descendants' rows are not listed. `$filter` takes `category_id eq`, `key eq` and `key in (...)`, joined by `and`; `needs_review` is refused 400, as is any other field or operator, and a named key with no flagged row simply has no item. `$orderby` and `$select` are refused 400. `limit` defaults to 50 and is capped at 200. A target whose subtree exceeds the budget answers 400 `subtree_too_large`, never a partial listing. A setting hidden from the caller has no rows here. Values are masked by classification - a `secret` never shows its value or its reference - and the setter's identity is masked for a caller without the PII entitlement.",
+        "operationId": "settings_service.list_review",
+        "parameters": [
+          {
+            "description": "Target tenant id; omitted, the caller's own tenant",
+            "in": "query",
+            "name": "tenant",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Page size",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Cursor for pagination",
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "OData v4 filter expression\n- key: eq|ne|contains|startswith|endswith|in\n- category_id: eq|ne|in",
+            "in": "query",
+            "name": "$filter",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Page_ReviewItemDto"
+                }
+              }
+            },
+            "description": "A page of flagged override rows with its pagination cursors"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "List values needing review",
+        "tags": [
+          "settings-values"
+        ],
+        "x-odata-filter": {
+          "allowedFields": {
+            "category_id": [
+              "eq",
+              "ne",
+              "in"
+            ],
+            "key": [
+              "eq",
+              "ne",
+              "contains",
+              "startswith",
+              "endswith",
+              "in"
+            ]
+          }
+        }
+      }
+    },
     "/settings-service/v1/settings/{key}": {
       "get": {
         "description": "Resolve one setting at a scope: the value masked by classification, its source and source scope, the value type's traits, the inheritance trail with per-entry setter identity, a leak-safe `last_change_at`, the scope's own review flag when its override is flagged, and in `ETag` the value state tag a write at that scope must present. A key with no declaration answers 404; a retired declaration answers 410 with the `SETTING_RETIRED` precondition; a target outside the caller's subtree or a standalone descendant answers 403.",
@@ -63023,11 +63620,11 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Page_AuditRecordDto"
+                  "$ref": "#/components/schemas/CountedPage_AuditRecordDto"
                 }
               }
             },
-            "description": "A page of audit records, newest first, with its pagination cursors"
+            "description": "A page of audit records, newest first, with its pagination cursors and the total"
           },
           "400": {
             "content": {
@@ -63679,7 +64276,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Page_RestrictionDto"
+                  "$ref": "#/components/schemas/CountedPage_RestrictionDto"
                 }
               }
             },

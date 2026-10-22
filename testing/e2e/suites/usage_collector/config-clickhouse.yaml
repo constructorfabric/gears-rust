@@ -4,7 +4,7 @@
 # same tenants,
 # tokens, tree and API surface, so the same test bodies run unchanged against
 # either backend. Only the storage plugin differs (the ClickHouse plugin needs
-# no cluster gear). Used by `make e2e-usage-collector-clickhouse` (and so by the
+# no cluster gear). Used by `make e2e-usage-collector BACKEND=clickhouse` (and so by the
 # `make e2e-usage-collector` aggregate), which builds a dedicated binary per
 # backend and starts the matching container. NOT part of
 # config/e2e-features.txt or the shared `make e2e-local` run.

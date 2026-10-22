@@ -19,14 +19,19 @@ workspace = true
 
 [dependencies]
 # Local dependencies
-license-resolver-sdk = { workspace = true }
+license-resolver-sdk = { workspace = true, features = ["rest-client", "rest-server"] }
 types-registry-sdk = { workspace = true }
 types-registry = { workspace = true }
 
 # ToolKit dependencies
 toolkit = { workspace = true }
 toolkit-canonical-errors = { workspace = true }
+toolkit-contract = { workspace = true, features = ["runtime-client", "rest-server"] }
 toolkit-macros = { workspace = true }
+toolkit-security = { workspace = true }
+
+# `register_rest` hands an `axum::Router` to the SDK's generated routes.
+axum = { workspace = true }
 
 # GTS types
 gts = { workspace = true }

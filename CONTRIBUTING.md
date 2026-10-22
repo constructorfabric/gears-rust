@@ -143,12 +143,16 @@ workflow → select your branch.
 
 To check offline instead, run `make shear`. It needs `cargo-shear` on your `PATH`
 (`make setup` installs it, pinned to the version CI uses) plus the nightly toolchain
-named by `RUST_NIGHTLY` in the Makefile, which rustup downloads on first use. Budget
+named by `RUST_NIGHTLY` in `gears.mk`, which rustup downloads on first use. Budget
 about an hour for the scan.
 
 Always include unit tests when introducing new code.
 
 ### 2.4. Run Code Quality Checks
+
+The `Makefile` is a driver: it includes `gears-rust.mk` (the targets of this
+repository) and `.gears-dna/gears.mk` (shared rules that other gear projects reuse). See
+[the gears.mk guide](.gears-dna/docs/GEARS_MK.md) when adding or changing make targets.
 
 Build and run all the quality checks:
 

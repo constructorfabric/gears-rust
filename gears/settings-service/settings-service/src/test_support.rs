@@ -601,6 +601,46 @@ impl ResolutionHarness {
             .await
     }
 
+    /// Declare a public boolean-shaped setting carrying a `display_name`, as a
+    /// module's contribution would: the one field `declare` leaves unset.
+    pub async fn declare_labelled(
+        &self,
+        name: &str,
+        scope_class: &str,
+        default: Value,
+        display_name: &str,
+    ) -> Uuid {
+        let conn = self.db.conn().expect("connection");
+        DeclarationRepo
+            .insert(
+                &conn,
+                &AccessScope::allow_all(),
+                DeclarationDraft {
+                    key: self.key(name).to_string(),
+                    leaf_slug: name.to_owned(),
+                    value_type_id: BOOL.to_owned(),
+                    category_id: self.category_id,
+                    default_value: default,
+                    scope_class: scope_class.to_owned(),
+                    mode: "standard".to_owned(),
+                    requires_step_up: true,
+                    anonymous_exposable: false,
+                    domain_affinity: None,
+                    has_secret_trait: false,
+                    data_classification: "public".to_owned(),
+                    source: "module_contributed".to_owned(),
+                    owner_module: Some("test".to_owned()),
+                    licence_feature: None,
+                    display_name: Some(display_name.to_owned()),
+                    description: None,
+                    created_by: "test".to_owned(),
+                },
+            )
+            .await
+            .expect("declaration")
+            .id
+    }
+
     pub async fn declare_typed(
         &self,
         name: &str,
@@ -675,6 +715,7 @@ impl ResolutionHarness {
                     source: "module_contributed".to_owned(),
                     owner_module: Some("test".to_owned()),
                     licence_feature: None,
+                    display_name: None,
                     description: None,
                     created_by: "test".to_owned(),
                 },
@@ -696,6 +737,7 @@ impl ResolutionHarness {
                 declaration_id,
                 crate::domain::declaration::DeclarationMetadata {
                     mode: "standard".to_owned(),
+                    display_name: None,
                     description: None,
                     domain_affinity: None,
                     licence_feature: None,
@@ -721,6 +763,7 @@ impl ResolutionHarness {
                 declaration_id,
                 crate::domain::declaration::DeclarationMetadata {
                     mode: "standard".to_owned(),
+                    display_name: None,
                     description: None,
                     domain_affinity: Some(domain.to_owned()),
                     licence_feature: None,
@@ -730,6 +773,32 @@ impl ResolutionHarness {
                 },
                 None,
                 true,
+            )
+            .await
+            .expect("metadata");
+    }
+
+    /// Tag a declaration `advanced`, the rest of its metadata as `declare`
+    /// leaves it.
+    pub async fn tag_advanced(&self, declaration_id: Uuid) {
+        let conn = self.db.conn().expect("connection");
+        DeclarationRepo
+            .update_metadata(
+                &conn,
+                &AccessScope::allow_all(),
+                declaration_id,
+                crate::domain::declaration::DeclarationMetadata {
+                    mode: "advanced".to_owned(),
+                    display_name: None,
+                    description: None,
+                    domain_affinity: None,
+                    licence_feature: None,
+                    data_classification: "public".to_owned(),
+                    requires_step_up: true,
+                    anonymous_exposable: false,
+                },
+                None,
+                false,
             )
             .await
             .expect("metadata");
@@ -778,6 +847,27 @@ impl ResolutionHarness {
     pub async fn set_flagged(&self, declaration_id: Uuid, tenant: Uuid, value: Value) {
         self.write(declaration_id, tenant, Some(value), None, true, "public")
             .await;
+    }
+
+    /// An override that stopped validating, carrying the classification the
+    /// writer would denormalize from its declaration: what a review row of a
+    /// `pii` setting must be masked by.
+    pub async fn set_flagged_classified(
+        &self,
+        declaration_id: Uuid,
+        tenant: Uuid,
+        value: Value,
+        classification: &str,
+    ) {
+        self.write(
+            declaration_id,
+            tenant,
+            Some(value),
+            None,
+            true,
+            classification,
+        )
+        .await;
     }
 
     /// A secret override that stopped validating: held by reference, as every
@@ -1119,6 +1209,32 @@ impl authz_resolver_sdk::AuthZResolverApi for AllowButMasked {
     }
 }
 
+/// A policy decision point that allows every action but reading values.
+///
+/// The caller it stands for holds the category right and not the settings
+/// one — a taxonomy author, say — and so may list the rail but not open any
+/// table under it. What such a caller must not receive is a count of what it
+/// could not open.
+struct AllowButValues;
+
+#[async_trait]
+impl authz_resolver_sdk::AuthZResolverApi for AllowButValues {
+    async fn evaluate(
+        &self,
+        _ctx: toolkit_security::PlatformSecurityContext,
+        request: authz_resolver_sdk::models::EvaluationRequest,
+    ) -> Result<
+        authz_resolver_sdk::models::EvaluationResponse,
+        toolkit::api::canonical_prelude::CanonicalError,
+    > {
+        let values = request.resource.resource_type == settings_service_sdk::gts::VALUE_SCHEMA;
+        Ok(authz_resolver_sdk::models::EvaluationResponse {
+            decision: !(values && request.action.name == "read"),
+            context: authz_resolver_sdk::models::EvaluationResponseContext::default(),
+        })
+    }
+}
+
 /// A policy decision point that denies everything.
 struct DenyAll;
 
@@ -1191,6 +1307,12 @@ impl RestHarness {
         Self::build(Arc::new(AllowButMasked), Arc::new(FixedStepUp::verified())).await
     }
 
+    /// The same surface for a caller that may read categories and
+    /// declarations but not values.
+    pub async fn without_value_read() -> Self {
+        Self::build(Arc::new(AllowButValues), Arc::new(FixedStepUp::verified())).await
+    }
+
     /// The same surface where the caller's last re-authentication is too old,
     /// for the tests that assert the second gate.
     pub async fn stale_step_up() -> Self {
@@ -1221,6 +1343,7 @@ impl RestHarness {
             axum::Router::new(),
             &openapi,
             categories,
+            Arc::clone(&inner.resolver),
             Arc::clone(&inner.db),
             Arc::clone(&enforcer),
         );

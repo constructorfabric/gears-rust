@@ -16,6 +16,14 @@ impl From<DbError> for DomainError {
     }
 }
 
+/// The cursor codec returns `toolkit_odata::Error` directly, so callers can `?` it into
+/// `DomainError` (see `DomainError::Cursor`).
+impl From<toolkit_odata::Error> for DomainError {
+    fn from(e: toolkit_odata::Error) -> Self {
+        Self::Cursor(e)
+    }
+}
+
 #[allow(unknown_lints, de1302_error_from_to_string)]
 impl From<ScopeError> for DomainError {
     fn from(e: ScopeError) -> Self {

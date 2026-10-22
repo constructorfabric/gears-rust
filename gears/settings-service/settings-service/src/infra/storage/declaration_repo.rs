@@ -1,26 +1,31 @@
 // Created: 2026-08-26 by Virtuozzo International GmbH
 //! Persistence for declarations.
 
+use std::collections::HashMap;
+
 use async_trait::async_trait;
 use sea_orm::sea_query::{Expr, Query};
 use sea_orm::{ActiveValue::Set, ColumnTrait, EntityTrait, ExprTrait, QueryFilter, QuerySelect};
-use toolkit_db::odata::{LimitCfg, paginate_odata};
+use toolkit_db::odata::LimitCfg;
 use toolkit_db::secure::{DBRunner, SecureEntityExt, SecureUpdateExt};
-use toolkit_odata::{ODataQuery, Page, SortDir};
+use toolkit_odata::{ODataQuery, SortDir};
 use toolkit_security::AccessScope;
 use uuid::Uuid;
 
 use crate::domain::access::TenantAccess;
 use crate::domain::category::visibility::DomainVisibility;
 use crate::domain::declaration::{
-    Declaration, DeclarationDraft, DeclarationMetadata, DeclarationRepository,
+    CategoryTally, Declaration, DeclarationDraft, DeclarationMetadata, DeclarationRepository,
 };
 use crate::domain::error::DomainError;
+use crate::domain::odata::Listing;
 use crate::domain::precondition;
 use crate::infra::storage::clock::{now, stamp_after};
 use crate::infra::storage::declaration_odata_mapper::DeclarationODataMapper;
 use crate::infra::storage::entity::declaration::{self, Entity as DeclarationEntity};
 use crate::infra::storage::entity::tenant_permission;
+use crate::infra::storage::listing::list_counted;
+use crate::infra::storage::value_repo;
 use settings_service_sdk::odata::DeclarationFilterField;
 
 /// Page bounds for declaration listings.
@@ -50,6 +55,7 @@ pub(crate) fn to_domain(model: declaration::Model) -> Declaration {
         domain_affinity: model.domain_affinity,
         licence_feature: model.licence_feature,
         owner_module: model.owner_module,
+        display_name: model.display_name,
         description: model.description,
         default_value: model.default_value,
         has_secret_trait: model.has_secret_trait,
@@ -203,6 +209,7 @@ impl DeclarationRepository for DeclarationRepo {
             owner_module: Set(draft.owner_module),
             licence_feature: Set(draft.licence_feature),
             status: Set("active".to_owned()),
+            display_name: Set(draft.display_name),
             description: Set(draft.description),
             last_change_at: Set(at),
             created_at: Set(at),
@@ -234,6 +241,10 @@ impl DeclarationRepository for DeclarationRepo {
             .col_expr(
                 declaration::Column::Description,
                 Expr::value(metadata.description),
+            )
+            .col_expr(
+                declaration::Column::DisplayName,
+                Expr::value(metadata.display_name),
             )
             .col_expr(
                 declaration::Column::DomainAffinity,
@@ -412,20 +423,31 @@ impl DeclarationRepository for DeclarationRepo {
         scope: &AccessScope,
         visibility: &DomainVisibility,
         hidden_for: &[Uuid],
+        flagged_at: Option<Uuid>,
         query: &ODataQuery,
-    ) -> Result<Page<Declaration>, DomainError> {
+    ) -> Result<Listing<Declaration>, DomainError> {
         // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-read:p1:inst-decl-read-6
-        let base = exclude_hidden_for(
+        let mut base = exclude_hidden_for(
             apply_visibility(DeclarationEntity::find(), visibility),
             hidden_for,
-        )
-        .secure()
-        .scope_with(scope);
+        );
+        // @cpt-begin:cpt-cf-settings-service-flow-value-resolution-admin-browse:p1:inst-vr-browse-7
+        // `needs_review eq true` on the browse: only declarations whose own
+        // override at that tenant is flagged — in the page query, so the page
+        // is cut and counted over the narrowed set, never narrowed after.
+        if let Some(tenant) = flagged_at {
+            base = base.filter(
+                declaration::Column::Id.in_subquery(value_repo::flagged_declarations_at(tenant)),
+            );
+        }
+        // @cpt-end:cpt-cf-settings-service-flow-value-resolution-admin-browse:p1:inst-vr-browse-7
 
         // Tiebreaker is `key`, which `uq_declaration_key` makes unique, so a
-        // page boundary can neither repeat nor skip a row.
-        let page = paginate_odata::<DeclarationFilterField, DeclarationODataMapper, _, _, _, _>(
+        // page boundary can neither repeat nor skip a row. The total beside
+        // the page is counted under the same base and the same `$filter`.
+        let page = list_counted::<DeclarationFilterField, DeclarationODataMapper, _, _, _, _>(
             base,
+            scope,
             conn,
             query,
             ("key", SortDir::Asc),
@@ -440,9 +462,117 @@ impl DeclarationRepository for DeclarationRepo {
         })?;
         // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-read:p1:inst-decl-read-6
 
-        Ok(Page {
+        Ok(Listing {
             items: page.items.into_iter().map(to_domain).collect(),
             page_info: page.page_info,
+            total_count: page.total_count,
         })
     }
+
+    async fn visible_keys<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        visibility: &DomainVisibility,
+        hidden_for: &[Uuid],
+        keys: &[String],
+    ) -> Result<Vec<String>, DomainError> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        // @cpt-begin:cpt-cf-settings-service-flow-value-resolution-admin-browse:p1:inst-vr-browse-9
+        let rows = exclude_hidden_for(
+            apply_visibility(DeclarationEntity::find(), visibility),
+            hidden_for,
+        )
+        .filter(declaration::Column::Key.is_in(keys.iter().cloned()))
+        .secure()
+        .scope_with(scope)
+        .all(conn)
+        .await
+        .map_err(db_error)?;
+        // @cpt-end:cpt-cf-settings-service-flow-value-resolution-admin-browse:p1:inst-vr-browse-9
+        Ok(rows.into_iter().map(|m| m.key).collect())
+    }
+
+    async fn find_by_ids<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        ids: &[Uuid],
+    ) -> Result<Vec<Declaration>, DomainError> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows = DeclarationEntity::find()
+            .filter(declaration::Column::Id.is_in(ids.iter().copied()))
+            .secure()
+            .scope_with(scope)
+            .all(conn)
+            .await
+            .map_err(db_error)?;
+        Ok(rows.into_iter().map(to_domain).collect())
+    }
+
+    async fn tally_by_category<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        visibility: &DomainVisibility,
+        hidden_for: &[Uuid],
+        category_ids: &[Uuid],
+    ) -> Result<HashMap<Uuid, CategoryTally>, DomainError> {
+        if category_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        // The same base as `list`, so a category's count is the length of
+        // the browse of it: the caller's scope, its domain visibility and the
+        // settings hidden from it, all in the query. One statement for the
+        // whole page of categories, grouped by what the tally splits on — at
+        // most four rows per category, folded here — rather than a count per
+        // category per facet.
+        let rows = exclude_hidden_for(
+            apply_visibility(DeclarationEntity::find(), visibility),
+            hidden_for,
+        )
+        .filter(declaration::Column::CategoryId.is_in(category_ids.iter().copied()))
+        .secure()
+        .scope_with(scope)
+        .project_all(conn, |q| {
+            q.select_only()
+                .column(declaration::Column::CategoryId)
+                .column(declaration::Column::Mode)
+                .column(declaration::Column::Status)
+                .column_as(Expr::col(declaration::Column::Id).count(), "n")
+                .group_by(declaration::Column::CategoryId)
+                .group_by(declaration::Column::Mode)
+                .group_by(declaration::Column::Status)
+                .into_model::<TallyRow>()
+        })
+        .await
+        .map_err(db_error)?;
+        let mut tallies: HashMap<Uuid, CategoryTally> = HashMap::new();
+        for row in rows {
+            let n = u64::try_from(row.n).unwrap_or_default();
+            let tally = tallies.entry(row.category_id).or_default();
+            tally.settings += n;
+            if row.mode == "advanced" {
+                tally.advanced += n;
+            }
+            if row.status == "retired" {
+                tally.retired += n;
+            }
+        }
+        Ok(tallies)
+    }
+}
+
+/// One group of the tally: the declarations of a category sharing a mode and
+/// a status, and how many there are.
+#[derive(Debug, sea_orm::FromQueryResult)]
+struct TallyRow {
+    category_id: Uuid,
+    mode: String,
+    status: String,
+    n: i64,
 }

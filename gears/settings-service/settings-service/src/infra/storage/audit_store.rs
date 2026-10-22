@@ -8,10 +8,10 @@
 use async_trait::async_trait;
 use sea_orm::{ActiveValue::Set, ColumnTrait, EntityTrait, QueryFilter, QuerySelect};
 use time::{Duration, OffsetDateTime};
-use toolkit_db::odata::{FieldToColumn, LimitCfg, ODataFieldMapping, paginate_odata};
+use toolkit_db::odata::{FieldToColumn, LimitCfg, ODataFieldMapping};
 use toolkit_db::secure::{DBRunner, SecureDeleteExt, SecureEntityExt, SecureUpdateExt};
 use toolkit_odata::filter::{FieldKind, FilterField};
-use toolkit_odata::{ODataQuery, Page, SortDir};
+use toolkit_odata::{ODataQuery, SortDir};
 use toolkit_security::AccessScope;
 use uuid::Uuid;
 
@@ -20,7 +20,9 @@ use crate::audit::{
     StoredAuditRecord,
 };
 use crate::domain::error::DomainError;
+use crate::domain::odata::Listing;
 use crate::infra::storage::entity::audit_record::{self, Entity as AuditEntity};
+use crate::infra::storage::listing::list_counted;
 
 /// Page bounds of the history read.
 const HISTORY_LIMIT_CFG: LimitCfg = LimitCfg {
@@ -199,7 +201,8 @@ impl AuditSink for AuditStore {
 }
 
 impl AuditStore {
-    /// The history of one setting at one scope, newest first, cursor-paginated.
+    /// The history of one setting at one scope, newest first, cursor-paginated,
+    /// with how many records the pair holds in all.
     ///
     /// An index lookup on `(declaration_key, tenant_id)`; `query` contributes
     /// only `limit` and `cursor`, the order being fixed.
@@ -214,7 +217,7 @@ impl AuditStore {
         declaration_key: &str,
         tenant_id: Uuid,
         query: &ODataQuery,
-    ) -> Result<Page<StoredAuditRecord>, DomainError> {
+    ) -> Result<Listing<StoredAuditRecord>, DomainError> {
         // @cpt-begin:cpt-cf-settings-service-flow-audit-store-history:p1:inst-as-hist-7
         // The scope's own records, plus the setting's scopeless ones. A
         // declaration event belongs to no tenant and would otherwise be
@@ -228,9 +231,7 @@ impl AuditStore {
                 sea_orm::Condition::any()
                     .add(audit_record::Column::TenantId.eq(tenant_id))
                     .add(audit_record::Column::TenantId.is_null()),
-            )
-            .secure()
-            .scope_with(scope);
+            );
         let paged = ODataQuery {
             filter: None,
             order: toolkit_odata::ODataOrderBy(vec![toolkit_odata::OrderKey {
@@ -245,8 +246,9 @@ impl AuditStore {
             filter_hash: Some(history_binding(declaration_key, tenant_id)),
             select: None,
         };
-        let page = paginate_odata::<AuditFilterField, AuditODataMapper, _, _, _, _>(
+        let page = list_counted::<AuditFilterField, AuditODataMapper, _, _, _, _>(
             base,
+            scope,
             conn,
             &paged,
             ("id", SortDir::Desc),
@@ -265,9 +267,10 @@ impl AuditStore {
             .into_iter()
             .map(to_domain)
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(Page {
+        Ok(Listing {
             items,
             page_info: page.page_info,
+            total_count: page.total_count,
         })
     }
 

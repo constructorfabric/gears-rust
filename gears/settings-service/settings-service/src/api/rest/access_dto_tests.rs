@@ -32,6 +32,7 @@ fn declaration() -> Declaration {
         domain_affinity: None,
         licence_feature: None,
         owner_module: None,
+        display_name: None,
         description: None,
         default_value: json!(true),
         has_secret_trait: false,

@@ -567,4 +567,4 @@ The system **MUST** support storing up to 100 million total resources across all
 
 - **Design**: [DESIGN.md](./DESIGN.md)
 - **ADRs**: [ADR/](./ADR/)
-- **Features**: [features/](./features/)
+- **Features**: `features/`

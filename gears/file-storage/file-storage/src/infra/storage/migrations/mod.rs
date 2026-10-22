@@ -9,10 +9,12 @@ mod m20260706_000001_idempotency_subject_id;
 mod m20260706_000002_idempotency_request_hash;
 mod m20260706_000003_policies_unique_scope;
 mod m20260707_000001_content_hash_modes;
+mod m20261008_000001_listing_indexes;
 
 /// File-storage migrator: control-plane tables, policy/retention/multipart/idempotency/outbox
 /// tables, multipart plan columns, idempotency `subject_id` and `request_hash`, unique
-/// policy-scope indexes, and content-hash modes (`hash_mode`, `version_hash_manifest`).
+/// policy-scope indexes, content-hash modes (`hash_mode`, `version_hash_manifest`), and the
+/// keyset indexes for the cursor-paginated listings.
 pub struct Migrator;
 
 #[async_trait::async_trait]
@@ -26,6 +28,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260706_000002_idempotency_request_hash::Migration),
             Box::new(m20260706_000003_policies_unique_scope::Migration),
             Box::new(m20260707_000001_content_hash_modes::Migration),
+            Box::new(m20261008_000001_listing_indexes::Migration),
         ]
     }
 }

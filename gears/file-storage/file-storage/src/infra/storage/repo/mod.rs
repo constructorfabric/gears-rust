@@ -25,7 +25,44 @@ pub use policy_repo::PolicyRepo;
 pub use retention_rule_repo::RetentionRuleRepo;
 pub use version_repo::VersionRepo;
 
+use sea_orm::ExprTrait;
+use sea_orm::sea_query::{Expr, IntoColumnRef};
+
 use crate::domain::policy::{RetentionRuleBody, RetentionScope};
+
+// Keyset predicates use row-value comparisons: Postgres uses `(a, b) < (x, y)` as an index
+// range bound, whereas the `a < x OR (a = x AND b < y)` expansion only filters after the scan.
+fn keyset_pair(
+    a: impl IntoColumnRef,
+    b: impl IntoColumnRef,
+    va: impl Into<sea_orm::Value>,
+    vb: impl Into<sea_orm::Value>,
+) -> (Expr, Expr) {
+    (
+        Expr::tuple([Expr::col(a), Expr::col(b)]),
+        Expr::tuple([Expr::val(va), Expr::val(vb)]),
+    )
+}
+
+fn tuple_lt(
+    a: impl IntoColumnRef,
+    b: impl IntoColumnRef,
+    va: impl Into<sea_orm::Value>,
+    vb: impl Into<sea_orm::Value>,
+) -> Expr {
+    let (cols, vals) = keyset_pair(a, b, va, vb);
+    cols.lt(vals)
+}
+
+fn tuple_gt(
+    a: impl IntoColumnRef,
+    b: impl IntoColumnRef,
+    va: impl Into<sea_orm::Value>,
+    vb: impl Into<sea_orm::Value>,
+) -> Expr {
+    let (cols, vals) = keyset_pair(a, b, va, vb);
+    cols.gt(vals)
+}
 
 /// Row types returned by the audit / file-event outbox repositories (defined here so
 /// callers do not reach into `entity::*`).
@@ -40,6 +77,14 @@ pub struct InsertRetentionRule<'a> {
     pub scope_target_id: Option<uuid::Uuid>,
     pub body: &'a RetentionRuleBody,
     pub now: time::OffsetDateTime,
+}
+
+/// Parameters for `RetentionRuleRepo::list_page`.
+pub(crate) struct RetentionRuleListParams {
+    pub tenant_id: uuid::Uuid,
+    /// Already `limit + 1`; this method does not know the `Page` `has_more` convention.
+    pub limit: u64,
+    pub after: Option<crate::domain::pagination::Seek>,
 }
 
 /// All repositories, bundled so `Store` depends on one collaborator.

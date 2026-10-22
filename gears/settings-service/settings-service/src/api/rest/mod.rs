@@ -54,6 +54,7 @@ pub mod declaration_handlers;
 pub mod declaration_routes;
 pub mod dto;
 pub mod handlers;
+pub mod page_dto;
 pub mod routes;
 pub mod search_dto;
 pub mod search_handlers;

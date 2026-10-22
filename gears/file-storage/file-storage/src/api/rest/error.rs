@@ -158,6 +158,8 @@ impl From<DomainError> for CanonicalError {
                 .with_reason("VERSIONED_FILE_MIGRATION_NOT_SUPPORTED")
                 .create()
             }
+            // Delegates to `toolkit_odata`'s own `Error -> CanonicalError` mapping.
+            DomainError::Cursor(err) => CanonicalError::from(err.clone()),
         }
     }
 }

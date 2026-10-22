@@ -50,11 +50,19 @@ async def test_list_storages_returns_capabilities(base_url, api_base, auth_heade
         r = await client.get(f"{base_url}{api_base}/storages", headers=auth_headers)
     assert r.status_code == 200, f"expected 200, got {r.status_code}: {r.text}"
     assert r.headers.get("content-type", "").startswith("application/json")
-    # Lock the wire format: GET /storages returns a top-level JSON array
-    # (Json(Vec<StorageDto>)). Accepting alternative envelopes here would let a
-    # breaking shape change slip through this seam.
+    # Lock the wire format: GET /storages returns a cursor page
+    # (Page<StorageDto>: `{items, page_info}`), never a bare JSON array.
+    # Accepting alternative envelopes here would let a breaking shape change
+    # slip through this seam.
     data = r.json()
-    assert isinstance(data, list), f"GET /storages must return a JSON array, got: {data!r}"
+    assert isinstance(data, dict), f"GET /storages must return a page object, got: {data!r}"
+    items = data.get("items")
+    assert isinstance(items, list) and items, f"GET /storages must list at least one backend, got: {data!r}"
+    for item in items:
+        assert isinstance(item.get("id"), str), f"backend without a string id: {item!r}"
+        assert isinstance(item.get("capabilities"), dict), f"backend without capabilities: {item!r}"
+    page_info = data.get("page_info")
+    assert isinstance(page_info, dict) and "limit" in page_info, f"missing page_info.limit in: {data!r}"
 
 
 @pytest.mark.asyncio
