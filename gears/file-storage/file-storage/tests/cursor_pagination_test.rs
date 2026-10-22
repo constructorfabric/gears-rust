@@ -1057,14 +1057,35 @@ async fn files_both_spellings_of_one_parameter_are_rejected() {
     let both_limits = assert_rejected(
         &router,
         format!("{BASE}/files?owner_kind=user&owner_id={owner}&limit=1&$top=1"),
-        &[("query", "INVALID_QUERY_PARAMS")],
+        &[("$top", "INVALID_QUERY_PARAMS")],
     )
     .await;
     assert_eq!(both_limits["status"], 400);
     assert_rejected(
         &router,
         format!("{BASE}/files?owner_kind=user&owner_id={owner}&cursor=X&$skiptoken=X"),
-        &[("query", "INVALID_QUERY_PARAMS")],
+        &[("$skiptoken", "INVALID_QUERY_PARAMS")],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn files_repeated_page_parameters_are_reported_with_other_violations() {
+    let (svc, subject, owner) = build_files_harness().await;
+    let router = files_router(subject, svc);
+    assert_rejected(
+        &router,
+        format!("{BASE}/files?owner_kind=user&owner_id={owner}&$top=1&$top=2&$filter=x"),
+        &[
+            ("$top", "INVALID_QUERY_PARAMS"),
+            ("$filter", "UNSUPPORTED_QUERY_PARAM"),
+        ],
+    )
+    .await;
+    assert_rejected(
+        &router,
+        format!("{BASE}/files?owner_kind=user&owner_id={owner}&limit=1&limit=2"),
+        &[("$top", "INVALID_QUERY_PARAMS")],
     )
     .await;
 }

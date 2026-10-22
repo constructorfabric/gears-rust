@@ -122,7 +122,9 @@ section keeps only the behavior the schema does not express.
   exactly like an auto-bind one, simply with no `X-FS-Bound`/`ETag` headers to report (as on the first call). An
   auto-bind retry that WON the CAS on its original call replays that exact `X-FS-Bound: true` + `ETag` outcome, even
   if the file's content has legitimately moved on to a different version since — never the current pointer's
-  `conflict`, which would contradict what the original call already returned. With
+  `conflict`, which would contradict what the original call already returned. An auto-bind retry that LOST the CAS is re-read
+  against the current pointer instead: `conflict` with the current ETag, or `bound` if this version has since been
+  bound manually. With
   `bind: "manual"` (or `POST /files/{id}/versions`, which never auto-binds), the client follows up
   with an explicit `POST /files/{id}/bind` (see "Upload, bind, and the conflict retry" below).
 - **Version listing and hashes.** `GET /files/{id}/versions` is ordered `created_at DESC` with `version_id DESC` as
@@ -135,13 +137,16 @@ section keeps only the behavior the schema does not express.
   §"Client-Side Manifest Re-Verification"). A multipart upload whose plan had exactly **one part** finalizes as
   `whole-sha256` (ADR-0006 single-part amendment), so it too carries no `part_count`/`manifest` here. `?limit`
   itself is **not** additionally capped for this. Instead, the manifests actually attached to a page are bounded by
-  a 4 MiB aggregate budget: if attaching the next `multipart-composite-sha256` version's manifest, in page order,
-  would push the running total over budget, the page is cut short right before that version (the version
-  already-included even if its own single manifest exceeds the budget alone, so the listing always makes forward
-  progress). Such a page can therefore come back shorter than `?limit` with more versions still to list — but
-  `page_info.next_cursor` is **always** set on a budget-truncated page (rebuilt from the last version actually
-  returned, even when the underlying keyset query itself had reached the true end), so a client that simply follows
-  `next_cursor` resumes correctly with no special case of its own.
+  a 4 MiB aggregate budget, counted from the request's cursor outward (page order for a first or forward page, the
+  reverse for a backward page): if attaching the next `multipart-composite-sha256` version's manifest would push the
+  running total over budget, the page is cut short right before that version. The version nearest the cursor is
+  always included, even if its own manifest alone exceeds the budget, so the listing always makes progress, and the
+  cut is always at the page's edge farthest from the cursor. Such a page can come back shorter than `?limit` with
+  more versions still to list — but the cursor for the direction of travel (`page_info.next_cursor` paging forward,
+  `page_info.prev_cursor` paging backward) is **always** set on a budget-truncated page, rebuilt from the version at
+  the cut, even when the underlying keyset query itself had reached the end in that direction. The cursor for the
+  opposite direction is built from the row next to the request's cursor, which the cut never removes. A client that
+  follows the cursor of its own direction resumes with no gap and no duplicate, and needs no special case.
 - `GET /files/{id}/download-url` pins the current `content_id` by default; `?version_id=<v>` pins a specific
   version. `GET /files/{id}` supports `If-None-Match` → `304` (see "Conditional headers").
 - Restoring a prior version is `POST /files/{id}/bind` with that `version_id` (a pointer swap, no re-upload). Bind
@@ -158,8 +163,9 @@ PLID-52.06):
 - **Request**: `limit` (integer, default 25, min 1, max 200; also accepted as `$top`) and `cursor` (an opaque
   string — the previous page's `page_info.next_cursor` to page forward, or its `page_info.prev_cursor` to page
   backward; also accepted as `$skiptoken`). The two spellings of a parameter are the same parameter.
-  - Both spellings of one parameter in the same request (`limit` with `$top`, or `cursor` with `$skiptoken`) are a
-    `400` with reason `INVALID_QUERY_PARAMS`.
+  - A page parameter given more than once — repeated, or under both spellings (`limit` with `$top`, `cursor` with
+    `$skiptoken`) — is a `400` with reason `INVALID_QUERY_PARAMS`, reported on its `$` field (`$top` or
+    `$skiptoken`) whichever spellings were sent.
   - `limit=0` (or `$top=0`) is a `400` with reason `INVALID_LIMIT`, reported on the field `$top` for either
     spelling. A value above the configured maximum (`max_page_size`, 200 by default, never more than 200) is
     not an error — it is silently clamped down to that maximum.
@@ -174,7 +180,8 @@ PLID-52.06):
     `$expand`, `$search`, `$format`, ...) is a `400 UNSUPPORTED_QUERY_PARAM` too; for `$count` the error adds that a
     page never carries a total. An unknown `$` key (a typo such as `$filtre`) is a `400`.
   - Names are case-sensitive: `$Top` is a `400` whose error says the parameter is accepted only as `$top`.
-  - Every unsupported or repeated key in one request, plain or `$`, is reported together in a single response.
+  - Every unsupported key and every repeated parameter (under either spelling) in one request is reported together
+    in a single response.
   - Platform rules: `guidelines/DNA/REST/QUERYING.md`; toolkit reference:
     [`07_odata_pagination_select_filter.md`](../../../docs/toolkit_unified_system/07_odata_pagination_select_filter.md).
 - **Response**: `{"items": [...], "page_info": {"next_cursor": <string|null>, "prev_cursor": <string|null>, "limit":

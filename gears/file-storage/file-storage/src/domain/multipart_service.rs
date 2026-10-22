@@ -737,7 +737,7 @@ impl MultipartService {
                 upload_id = %session.upload_id,
                 "multipart complete_result snapshot failed to parse or is internally \
                  inconsistent (unrecognized hash_mode/bind_state spelling, or a field \
-                 combination resolve_bind_state/complete_multipart_upload never actually \
+                 combination replay_bind_state/complete_multipart_upload never actually \
                  produces); falling back to rebuilding the response from the version row"
             );
         }
@@ -764,10 +764,11 @@ impl MultipartService {
                     session.version_id, version.hash_mode
                 ))
             })?;
-        let (bind_state, bind_etag, current_etag) = crate::domain::multipart::resolve_bind_state(
+        let (bind_state, bind_etag, current_etag) = crate::domain::multipart::replay_bind_state(
             file.file_id,
             file.content_id,
             session.version_id,
+            version.bound_on_finalize,
             session.auto_bind,
         );
         Ok(CompletedMultipartUpload {
@@ -834,7 +835,14 @@ impl MultipartService {
         if let Some(v) = self.store.get_version(file_id, session.version_id).await?
             && v.status == file_storage_sdk::VersionStatus::Available
         {
-            let completed = self.replay_completed(file_id, session).await?;
+            // The winner wrote `complete_result` in the transaction that made the version available;
+            // re-read the session so the replay serves that snapshot verbatim.
+            let fresh = self
+                .store
+                .get_multipart_upload(upload_id)
+                .await?
+                .ok_or_else(|| DomainError::multipart_upload_not_found(upload_id))?;
+            let completed = self.replay_completed(file_id, &fresh).await?;
             self.finish_session(ctx, session, lease_owner, &completed)
                 .await?;
             return Ok(completed);
@@ -1119,7 +1127,14 @@ impl MultipartService {
         if let Some(v) = converged_version
             && v.status == file_storage_sdk::VersionStatus::Available
         {
-            let completed = self.replay_completed(file_id, session).await?;
+            // The winner wrote `complete_result` in the transaction that made the version available;
+            // re-read the session so the replay serves that snapshot verbatim.
+            let fresh = self
+                .store
+                .get_multipart_upload(upload_id)
+                .await?
+                .ok_or_else(|| DomainError::multipart_upload_not_found(upload_id))?;
+            let completed = self.replay_completed(file_id, &fresh).await?;
             self.finish_session(ctx, session, lease_owner, &completed)
                 .await?;
             return Ok(completed);

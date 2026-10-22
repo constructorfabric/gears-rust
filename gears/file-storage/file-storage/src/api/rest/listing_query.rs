@@ -17,7 +17,7 @@ use toolkit_odata::errors::OdataError;
 
 /// Reason code of every rejected listing query key.
 const UNSUPPORTED_QUERY_PARAM: &str = "UNSUPPORTED_QUERY_PARAM";
-/// Reason code of a plain key given more than once.
+/// Reason code of a parameter given more than once, repeated or under both spellings.
 const INVALID_QUERY_PARAMS: &str = "INVALID_QUERY_PARAMS";
 
 /// The plain (non-`$`) query keys a listing accepts, besides the `$` options of `OData`.
@@ -86,6 +86,15 @@ fn unsupported_system_option_detail(key: &str) -> String {
     }
 }
 
+/// The `$` name of the page parameter a key spells (`limit`/`$top`, `cursor`/`$skiptoken`).
+fn page_parameter(key: &str) -> Option<&'static str> {
+    match key {
+        "limit" | "$top" => Some("$top"),
+        "cursor" | "$skiptoken" => Some("$skiptoken"),
+        _ => None,
+    }
+}
+
 /// The violation of one key given `occurrences` times, if any.
 fn violation_of<K: ListingKeys>(key: &str, occurrences: usize) -> Option<(&'static str, String)> {
     if key.starts_with('$') {
@@ -122,12 +131,36 @@ fn reject_bad_keys<K: ListingKeys>(pairs: &[(String, String)]) -> Result<(), Can
     let mut seen: Vec<&str> = Vec::new();
     let mut violations: Vec<(&str, &'static str, String)> = Vec::new();
     for key in pairs.iter().map(|(key, _)| key.as_str()) {
-        if seen.contains(&key) {
+        // A page parameter is one parameter whichever spelling is sent.
+        let identity = page_parameter(key).unwrap_or(key);
+        if seen.contains(&identity) {
             continue;
         }
-        seen.push(key);
-        let occurrences = pairs.iter().filter(|(k, _)| k == key).count();
-        if let Some((reason, detail)) = violation_of::<K>(key, occurrences) {
+        seen.push(identity);
+        let spellings: Vec<&str> = pairs
+            .iter()
+            .map(|(k, _)| k.as_str())
+            .filter(|k| page_parameter(k).unwrap_or(k) == identity)
+            .collect();
+        if let Some(canonical) = page_parameter(key) {
+            if spellings.len() > 1 {
+                let mut sent: Vec<String> = Vec::new();
+                for spelling in spellings {
+                    let quoted = format!("`{spelling}`");
+                    if !sent.contains(&quoted) {
+                        sent.push(quoted);
+                    }
+                }
+                violations.push((
+                    canonical,
+                    INVALID_QUERY_PARAMS,
+                    format!(
+                        "`{canonical}` is given more than once (sent as {})",
+                        sent.join(", ")
+                    ),
+                ));
+            }
+        } else if let Some((reason, detail)) = violation_of::<K>(key, spellings.len()) {
             violations.push((key, reason, detail));
         }
     }

@@ -690,7 +690,7 @@ impl FileService {
                 hex::encode(&version.hash_value),
             ));
         }
-        let (bind_state, etag, current_etag) = crate::domain::multipart::replay_finalize_bind_state(
+        let (bind_state, etag, current_etag) = crate::domain::multipart::replay_bind_state(
             version.file_id,
             content_id,
             version.version_id,

@@ -193,12 +193,12 @@ impl BindState {
     }
 }
 
-#[must_use]
-pub fn resolve_bind_state(
+/// Live read of the pointer for an auto-bind upload that lost the CAS: `Bound` if the file now
+/// points at this version (e.g. a manual bind), else `Conflict` with the current ETag.
+fn resolve_bind_state(
     file_id: Uuid,
     content_id: Option<Uuid>,
     version_id: Uuid,
-    auto_bind: bool,
 ) -> (BindState, Option<String>, Option<String>) {
     if content_id == Some(version_id) {
         (
@@ -206,22 +206,21 @@ pub fn resolve_bind_state(
             Some(crate::domain::etag::content_etag(file_id, version_id)),
             None,
         )
-    } else if auto_bind {
+    } else {
         (
             BindState::Conflict,
             None,
             content_id.map(|cid| crate::domain::etag::content_etag(file_id, cid)),
         )
-    } else {
-        (BindState::Manual, None, None)
     }
 }
 
-/// Retry counterpart of [`resolve_bind_state`] for a single-part finalize: replays the original
-/// decision from the persisted `bound_on_finalize` flag, since a rebind may have moved the pointer
-/// (a retry must not turn `Bound` into `Conflict`); `false` falls back to the live read.
+/// Bind outcome a replay reports (a single-part finalize retry or a multipart complete rebuilt
+/// from the version row): a bind won at finalize replays as `Bound` from the persisted
+/// `bound_on_finalize` flag (a retry must not turn `Bound` into `Conflict`), a manual upload
+/// never reports a bind outcome, and an auto-bind upload that lost the CAS reads the live pointer.
 #[must_use]
-pub fn replay_finalize_bind_state(
+pub fn replay_bind_state(
     file_id: Uuid,
     content_id: Option<Uuid>,
     version_id: Uuid,
@@ -235,7 +234,10 @@ pub fn replay_finalize_bind_state(
             None,
         );
     }
-    resolve_bind_state(file_id, content_id, version_id, auto_bind)
+    if !auto_bind {
+        return (BindState::Manual, None, None);
+    }
+    resolve_bind_state(file_id, content_id, version_id)
 }
 
 /// Result of `GET /files/{id}/multipart/{upload_id}`: session state plus received and

@@ -179,6 +179,26 @@ async fn replay_completed_fallback_rebuilds_result_from_version_row() {
     }
 }
 
+/// A manual session never reports a bind outcome from the fallback either, even after the version
+/// was bound by hand (the pointer then equals the session's version).
+#[tokio::test]
+async fn replay_completed_fallback_of_a_manual_session_stays_manual_after_manual_bind() {
+    let env = build_env().await;
+    let (file_id, plan) = env.session_with_part(b"Hello, World!", false).await;
+    let first = env.complete(file_id, plan.upload_id).await;
+    assert_eq!(first.bind_state, BindState::Manual);
+    env.svc
+        .bind(&env.ctx, file_id, plan.version_id, None)
+        .await
+        .unwrap();
+
+    null_complete_result(&env.dsn, plan.upload_id).await;
+    let replay = env.complete(file_id, plan.upload_id).await;
+    assert_eq!(replay.bind_state, BindState::Manual);
+    assert_eq!(replay.etag, None);
+    assert_eq!(replay.current_etag, None);
+}
+
 #[tokio::test]
 async fn complete_takeover_finishes_without_reassembly_when_version_already_available() {
     let env = build_env().await;

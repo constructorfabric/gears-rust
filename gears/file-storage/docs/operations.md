@@ -451,9 +451,10 @@ converged); a retry whose bytes differ from the stored object is answered `409` 
 `PUT` therefore re-reads the whole stored object. If the version was already finalized, the outcome converges
 **regardless of the token's bind mode**: a replay whose size and content hash match the stored version is answered
 `200` — for a token carrying the `bind_on_finalize` claim
-(auto-bind `POST /files` path) the `X-FS-Bound`/`ETag` headers are recomputed against the file's *current*
-`content_id`, so a concurrent bind in between can still flip `bound`↔`conflict` (F4 in the concurrency-and-failure
-model, and `write.rs`'s already-available replay branch); a manual-bind token converges the same way, simply with no
+(auto-bind `POST /files` path) a bind won at finalize replays as `bound` from the persisted `bound_on_finalize`
+flag, while a lost CAS is re-read against the file's *current* `content_id`, so a manual bind of this same version in
+between reads as `bound`, never the reverse (F4 in the concurrency-and-failure model); a manual-bind token converges
+the same way, simply with no
 bind-outcome headers to report, exactly as on the first call. A mismatched replay (different size or hash) is answered
 `409` — never a silent overwrite. Two finalize callbacks racing for the same version converge the same way: the one
 that loses the `pending → available` CAS re-reads the version and applies the same size/hash comparison. For the
