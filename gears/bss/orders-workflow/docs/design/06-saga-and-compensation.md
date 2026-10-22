@@ -1212,7 +1212,10 @@ so a fence re-run after day one replays the stored outcome rather than refusing 
 refusal registry [Lifecycle `01 §4.7`](../../../orders-lifecycle/docs/features/01-foundation.md#refusal-reasons-are-derived-gts-error-types))
 as below. A permanent failure is not caught by the definition and faults the invocation
 (`10 §3.6` (c)), which the liveness pass raises as an `invocation-dead` task (`01 §4.16`), so
-no row is left to a builder's choice (decision D-111).
+no row is left to a builder's choice (decision D-111). The statuses in the rows (503, 409) name how
+Lifecycle's REST surface renders each answer; in process the answer is the typed `OrdersError`, and
+the rows match its variant and reason token, with any variant not listed taking the *a 5xx* row
+(decision D-231).
 
 | Lifecycle answer | When it can arise | `report-outcome` answers |
 |------------------|-------------------|--------------------------|

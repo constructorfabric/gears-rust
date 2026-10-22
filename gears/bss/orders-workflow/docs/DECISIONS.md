@@ -6896,6 +6896,43 @@ Lifecycle stores per basis is their ask (D-225).
 `design/03-approval-execution.md` §3.3 (*Request payload contents*), §3.7 (`owf_approval_request`,
 `owf_approval_gate`); `UPSTREAM_REQS.md` §2.4, §2.5; D-198, D-225.
 
+### D-231 (M) Lifecycle's SDK answers are the typed `OrdersError`; the step operations match its variant and reason, and an unknown variant is never success
+
+**Accepted (2026-10-22).** *(mirrors Lifecycle D-219 and D-220, PR #5259 code review; refines D-111, D-193)*
+
+**Decision**: the step operations call Lifecycle in process through `OrdersLifecycleWorkflowV1`
+(D-193), and Lifecycle's SDK error no longer carries an HTTP Problem (Lifecycle D-219). Each
+answer is matched on the typed `OrdersError` and its `reason()`:
+
+- `Refused(reason)` and `Settled { reason, diagnostics }` are Lifecycle refusals; the tables of
+  `design/03`, `design/04` §3.6, `design/05` and `design/06` §4.9 key on that `reason` token
+  (`version-conflict`, `not-admissible`, `still-processing`, …), unchanged. `diagnostics` is the
+  typed `RefusalDiagnostics` (`state`, `trigger`, `current_version`, `draft_revision`, …), not a
+  `Problem.context`; where a row reads the order instead, it still reads it through `get`.
+- `Unavailable` and `OutcomeUnknown` are the transient rows (*Unavailable (503), a timeout*); an
+  unknown outcome is resolved by the same-key retry, never inferred.
+- `Internal` and `Integration` are the rows' *a 5xx*.
+- `Other { canonical }`, and any variant Lifecycle adds later (`OrdersError` is `#[non_exhaustive]`,
+  Lifecycle D-220), take the same *a 5xx* row through a wildcard arm: `retryable-failure` with the
+  key left open, so an unknown answer is never settled as success and is bounded by the
+  definition's retry policy and the invocation fault of `10 §3.6` (c).
+
+The HTTP statuses the tables name (503, 409) describe how Lifecycle's REST surface renders the same
+answers; they are not what the SDK returns. The accepted `OrderPin` read through `get_version`
+reports decode failures as `CodecError::Malformed(kind)`, an unauthored billing cycle as
+`Incomplete` (Lifecycle D-220); a pin that does not decode is the *a 5xx* row. The other D-220
+changes (`SalesPath`, `verify_selection`, `TermIntent` in microseconds) touch no member this gear
+reads.
+
+**Rationale**: Lifecycle moved the HTTP mapping into its REST layer (ToolKit TOOLKIT-ERR-002,
+platform ADR-0005), so a consumer that matched an HTTP status or a `Problem` would not compile
+against the SDK; the reason tokens are the stable contract and stay the key. A wildcard that
+retries rather than fails keeps today's handling of an unexpected 5xx and never turns an unknown
+answer into a settled outcome.
+
+**Propagated**: `DESIGN.md` §3.4 (Orders Lifecycle row); `design/06-saga-and-compensation.md` §4.9;
+Lifecycle `DECISIONS.md` D-219, D-220.
+
 ## Open Questions
 
 ### Q-01: Which durable-execution substrate backs the process — the OSS Workflow Engine or a BSS-local mechanism?
@@ -7252,6 +7289,7 @@ register relies on is cited to a serverless-runtime file and line or registered 
 | D-209 | 05 Provisioning intents, 06 Saga (Subscriptions #5131 received, 2026-10-12) | `PRD.md` §6.3, §9.2, §13; `design/05`, `design/06`; `UPSTREAM_REQS.md` §2.1, §4 |
 | D-210 | cross-cutting (review findings, 2026-10-12) | `ADR/0011`, `ADR/0012`, `ADR/0013`; `design/01`, `design/08`; `UPSTREAM_REQS.md` §2.9 |
 | D-211 | 05 Provisioning intents (actual start read back, 2026-10-18) | `design/05`; `UPSTREAM_REQS.md` `SUB-O10`; D-195 |
+| D-231 | cross-cutting (Lifecycle D-219, D-220 mirror, 2026-10-22) | `DESIGN.md` §3.4; `design/06` §4.9 |
 | D-226–D-230 | cross-cutting (PR #4787 proposal, this gear's side, 2026-10-21) | `design/01` §3.7, §4.9; `design/03` §3.2, §3.3, §3.6, §3.7; `design/04` §2.1, §3.3, §3.6, §3.7; `design/06` §3.6; `design/07` §3.3, §4.4; `design/08` §3.3; `design/09` §3.1; `design/10` §3.6; `UPSTREAM_REQS.md` §2.1–§2.5 |
 | D-220–D-225 | cross-cutting (PR #4787 proposal of 2026-10-18, received 2026-10-21) | `design/03` §2.2, §3.3; `design/04` §3.5, §3.7; `design/05` §3.2, §3.3, §3.7, §4.1, §4.2, §4.4; `design/09` §3.3; `UPSTREAM_REQS.md` §2.1–§2.5, §4 item 22; Q-11 |
 | D-212–D-219 | cross-cutting (PR #4787 review findings, 2026-10-18) | `design/05` §3.3, §3.6, §3.7, §4.4, §4.5; `design/06` §3.6, §3.7, §4.7; `design/07` §2.2, §3.6, §4.4; `design/08` §2.2, §3.6, §3.7; `design/09` §3.3, §3.7, §4.4; `design/10` §3.6; `UPSTREAM_REQS.md` §2.1 |
@@ -7455,6 +7493,7 @@ register relies on is cited to a serverless-runtime file and line or registered 
 | D-228 | H Seller-policy payment wait; expiry runs `request-prefulfillment-cancel` or raises `payment-wait-expired`; nothing about money | `design/01` §3.7, §4.9; `design/04` §3.3, §3.6, §3.7; `design/07` §3.3, §4.4; `design/08` §3.3; `design/10` §3.6; D-109, D-223 |
 | D-229 | M Named-user condition in the request, `gate_generation`, `approval_gate × assign`, `not-assignee` / `stale-generation`, park on `assignee-unresolved`; projection is the common inbox's source adapter | `design/03` §3.2, §3.3, §3.6, §3.7; `design/09` §3.1; `design/01` §4.9; D-56, D-224 |
 | D-230 | M Valuation for the policy's chosen basis or `unavailable`, shared money representation; `tcv_minor` retired from the approval tables | `design/01` §3.7; `design/03` §3.3, §3.7; D-198, D-225 |
+| D-231 | M Lifecycle SDK answers are the typed `OrdersError` (Lifecycle D-219, D-220); match variant and reason; an unknown variant is the *a 5xx* row, never success | `DESIGN.md` §3.4; `design/06` §4.9; D-111, D-193 |
 
-Highest decision number used: **D-230**; highest question number: **Q-14**. Numbering is one continuous sequence across the whole
+Highest decision number used: **D-231**; highest question number: **Q-14**. Numbering is one continuous sequence across the whole
 register; there are no parts.
