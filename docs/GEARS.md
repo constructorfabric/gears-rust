@@ -127,8 +127,8 @@ Maintain a catalog of available models with tenant-level availability and approv
 - [ ] p3 - auto-approval configuration per tenant/provider
 - [ ] p4 - model lifecycle tracking (deprecated, archived)
 #### More details
-- [PRD](../gears/model-registry/docs/PRD.md)
-- [Design](../gears/model-registry/docs/DESIGN.md)
+- TODO: PRD
+- TODO: Design
 - [API](../gears/model-registry/README.md)
 - TODO: SDK link
 
