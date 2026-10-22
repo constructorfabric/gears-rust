@@ -17,6 +17,8 @@ on:
       - '**/Cargo.toml'
       - 'Cargo.lock'
       - 'Makefile'
+      - '.gears-dna/gears.mk'
+      - 'gears-rust.mk'
       - 'config/quickstart.yaml'
       - 'config/e2e-features.txt'
       - 'docs/api/api.json'

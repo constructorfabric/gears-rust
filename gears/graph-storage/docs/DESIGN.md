@@ -829,7 +829,7 @@ accumulate, so a leaf restating `index` restates all of it.
 ##### Files and verification
 
 The schemas above are kept as registrable files under
-[`schemas/`](./schemas/), with the worked producer types in
+[`schemas/`](../graph-storage/schemas/), with the worked producer types in
 [`graph-storage/schemas/examples/`](../graph-storage/schemas/examples/) under the fictional `acme` vendor.
 This section is the normative narrative; those files are the same content in the
 form the types-registry accepts, so the chain can be validated mechanically

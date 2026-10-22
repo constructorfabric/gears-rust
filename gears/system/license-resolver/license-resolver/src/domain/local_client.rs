@@ -4,9 +4,11 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use license_resolver_sdk::{
-    LicenseCheckRequest, LicenseDecision, LicenseResolverClient, LicenseResolverError,
+    LicenseCheckRequest, LicenseDecision, LicenseResolverApi, LicenseResolverError,
 };
+use toolkit_canonical_errors::CanonicalError;
 use toolkit_macros::domain_model;
+use toolkit_security::PlatformSecurityContext;
 
 use super::Service;
 
@@ -26,15 +28,16 @@ impl LicenseResolverLocalClient {
 }
 
 #[async_trait]
-impl LicenseResolverClient for LicenseResolverLocalClient {
+impl LicenseResolverApi for LicenseResolverLocalClient {
     async fn is_licensed(
         &self,
+        _ctx: PlatformSecurityContext,
         request: LicenseCheckRequest,
-    ) -> Result<LicenseDecision, LicenseResolverError> {
+    ) -> Result<LicenseDecision, CanonicalError> {
         self.svc
             .is_licensed(request)
             .await
-            .map_err(LicenseResolverError::from)
+            .map_err(|e| LicenseResolverError::from(e).into())
     }
 }
 

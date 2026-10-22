@@ -37,6 +37,7 @@ pub use models::{
 };
 pub use plugin_api::{
     AdmissionEnginePluginClientV1, EngineFailure, EngineFailureCondition, EngineRequest,
-    EngineResult,
+    EngineResult, EngineResultBuilder, EngineResultViolation, MAX_DOCUMENT_NAME_LEN,
+    MAX_ENGINE_FINDINGS, MAX_REASON_CODE_LEN,
 };
 pub use toolkit_canonical_errors::{self, CanonicalError, Problem};

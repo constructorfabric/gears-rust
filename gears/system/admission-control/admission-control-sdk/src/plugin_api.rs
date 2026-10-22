@@ -97,6 +97,167 @@ pub enum EngineResult {
     },
 }
 
+/// Most denials plus shadow denials one engine result may carry: the gate
+/// publishes an event for each.
+pub const MAX_ENGINE_FINDINGS: usize = 64;
+
+/// Longest engine reason code, in bytes. It is returned to the calling gear.
+pub const MAX_REASON_CODE_LEN: usize = 128;
+
+/// Longest policy document name, in bytes. It is copied into events.
+pub const MAX_DOCUMENT_NAME_LEN: usize = 256;
+
+/// A bound of the gate–engine contract an [`EngineResult`] breaks; the gate
+/// refuses such a result as could-not-run `internal`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum EngineResultViolation {
+    /// More than [`MAX_ENGINE_FINDINGS`] denials plus shadow denials.
+    TooManyFindings,
+    /// A reason code that is not 1 to [`MAX_REASON_CODE_LEN`] printable
+    /// ASCII bytes.
+    ReasonCode,
+    /// A document name that is empty, longer than [`MAX_DOCUMENT_NAME_LEN`]
+    /// bytes or holds a control character.
+    DocumentName,
+}
+
+impl EngineResultViolation {
+    /// Stable `snake_case` label.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::TooManyFindings => "too_many_findings",
+            Self::ReasonCode => "reason_code",
+            Self::DocumentName => "document_name",
+        }
+    }
+}
+
+impl fmt::Display for EngineResultViolation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl EngineResult {
+    /// A denial with `reason_code` that names no document, such as one an
+    /// engine decides before evaluating any document.
+    #[must_use]
+    pub fn deny(reason_code: impl Into<String>) -> Self {
+        Self::Deny {
+            reason_code: reason_code.into(),
+            denials: Vec::new(),
+            shadow_denials: Vec::new(),
+        }
+    }
+
+    /// The first contract bound this result breaks, if any: at most
+    /// [`MAX_ENGINE_FINDINGS`] findings, a reason code of 1 to
+    /// [`MAX_REASON_CODE_LEN`] printable ASCII bytes, and document names of 1
+    /// to [`MAX_DOCUMENT_NAME_LEN`] bytes without control characters.
+    #[must_use]
+    pub fn bounds_violation(&self) -> Option<EngineResultViolation> {
+        let (reason_code, denials, shadow) = match self {
+            Self::Permit { shadow_denials } => (None, &[][..], &shadow_denials[..]),
+            Self::Deny {
+                reason_code,
+                denials,
+                shadow_denials,
+            } => (
+                Some(reason_code.as_str()),
+                &denials[..],
+                &shadow_denials[..],
+            ),
+        };
+        if denials.len().saturating_add(shadow.len()) > MAX_ENGINE_FINDINGS {
+            return Some(EngineResultViolation::TooManyFindings);
+        }
+        if reason_code.is_some_and(|code| {
+            code.is_empty()
+                || code.len() > MAX_REASON_CODE_LEN
+                || !code.bytes().all(|b| b.is_ascii_graphic())
+        }) {
+            return Some(EngineResultViolation::ReasonCode);
+        }
+        let bad_name = |reference: &PolicyReference| {
+            let name = &reference.document_name;
+            name.is_empty()
+                || name.len() > MAX_DOCUMENT_NAME_LEN
+                || name.chars().any(char::is_control)
+        };
+        if denials.iter().chain(shadow).any(bad_name) {
+            return Some(EngineResultViolation::DocumentName);
+        }
+        None
+    }
+}
+
+/// Builds an [`EngineResult`] from the documents that denied: a denial of an
+/// enforcing document denies, one of a non-enforcing document is a shadow
+/// denial. Both keep the order they were recorded in.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EngineResultBuilder {
+    denials: Vec<PolicyReference>,
+    shadow_denials: Vec<PolicyReference>,
+}
+
+impl EngineResultBuilder {
+    /// A builder with nothing recorded.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Records that the document `reference` denied; `enforce` says whether
+    /// its denial is enforced or only a shadow denial.
+    pub fn record_denial(&mut self, reference: PolicyReference, enforce: bool) {
+        if enforce {
+            self.denials.push(reference);
+        } else {
+            self.shadow_denials.push(reference);
+        }
+    }
+
+    /// Whether an enforced denial was recorded.
+    #[must_use]
+    pub fn is_denied(&self) -> bool {
+        !self.denials.is_empty()
+    }
+
+    /// Number of denials plus shadow denials recorded.
+    #[must_use]
+    pub fn finding_count(&self) -> usize {
+        self.denials.len() + self.shadow_denials.len()
+    }
+
+    /// A denial with `reason_code` when an enforced denial was recorded,
+    /// otherwise a permit; both carry the shadow denials.
+    ///
+    /// Findings past [`MAX_ENGINE_FINDINGS`] are dropped, shadow denials
+    /// first, so the result never breaks that bound and the verdict never
+    /// changes. Callers wanting a record of what was dropped compare
+    /// [`Self::finding_count`] against the bound first.
+    #[must_use]
+    pub fn finish(self, reason_code: impl Into<String>) -> EngineResult {
+        let Self {
+            mut denials,
+            mut shadow_denials,
+        } = self;
+        denials.truncate(MAX_ENGINE_FINDINGS);
+        shadow_denials.truncate(MAX_ENGINE_FINDINGS - denials.len());
+        if denials.is_empty() {
+            EngineResult::Permit { shadow_denials }
+        } else {
+            EngineResult::Deny {
+                reason_code: reason_code.into(),
+                denials,
+                shadow_denials,
+            }
+        }
+    }
+}
+
 /// Failure condition an engine reports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]

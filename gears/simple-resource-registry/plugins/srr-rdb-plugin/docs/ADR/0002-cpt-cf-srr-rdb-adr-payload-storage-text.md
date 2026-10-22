@@ -71,7 +71,7 @@ This plugin treats the payload as an opaque blob. If payload-level querying or f
 
 - **Plugin PRD**: [../PRD.md](../PRD.md)
 - **Plugin DESIGN**: [../DESIGN.md](../DESIGN.md)
-- **Parent PRD**: [../../../docs/PRD.md](../../../docs/PRD.md)
+- **Parent PRD**: [../../../docs/PRD.md](../../../../docs/PRD.md)
 
 This decision directly relates to:
 

@@ -1,5 +1,5 @@
 <!-- Created: 2026-08-10 by Virtuozzo International GmbH -->
-<!-- Updated: 2026-09-23 by Virtuozzo International GmbH -->
+<!-- Updated: 2026-10-08 by Virtuozzo International GmbH -->
 
 # Feature: Effective Value Resolution, Defaults and Cache
 
@@ -20,6 +20,7 @@
   - [Read Effective Source Trail](#read-effective-source-trail)
   - [Read an Effective Value Administratively](#read-an-effective-value-administratively)
   - [Browse Effective Values](#browse-effective-values)
+  - [List Values Needing Review](#list-values-needing-review)
 - [3. Processes / Business Logic (CDSL)](#3-processes--business-logic-cdsl)
   - [Scope Class Resolution Dispatch](#scope-class-resolution-dispatch)
   - [Needs-Review Fallthrough](#needs-review-fallthrough)
@@ -38,6 +39,7 @@
   - [Cache Time-to-Live Backstop](#cache-time-to-live-backstop)
   - [Hierarchy-Change Invalidation](#hierarchy-change-invalidation)
   - [Administrative Read Surface](#administrative-read-surface)
+  - [Review Listing](#review-listing)
   - [In-Process Reader Binding](#in-process-reader-binding)
 - [6. Acceptance Criteria](#6-acceptance-criteria)
 
@@ -47,7 +49,7 @@
 
 ### 1.1 Overview
 
-Resolves the effective value of a setting for a scope by dispatching on its scope class, returns the value together with the source and the inheritance trail that produced it, and serves the whole thing from a local in-process cache with eviction on write and a time-based backstop. Also carries the administrative read surface over the same resolver: the single read with its recency and trail, and the browse that lists effective values by category or key set and the overrides that need review.
+Resolves the effective value of a setting for a scope by dispatching on its scope class, returns the value together with the source and the inheritance trail that produced it, and serves the whole thing from a local in-process cache with eviction on write and a time-based backstop. Also carries the administrative read surface over the same resolver: the single read with its recency and trail, and the browse that lists effective values by category or key set, narrowed on request to the settings whose own value at the scope needs review; the values needing review across a subtree are the review listing's.
 
 ### 1.2 Purpose
 
@@ -61,7 +63,7 @@ Three properties matter more than the walk itself.
 
 **Not-found is deliberately two different things.** A retired declaration resolves as a distinct positive fact, so a gear reading through its own upgrade window can tell "the platform withdrew this setting" from "this key was never declared" and drop the dependency rather than retry. A genuinely absent declaration conflates two sub-cases the service cannot distinguish — the owning gear has not registered yet, or the key never existed — and it must not guess between them.
 
-**Requirements**: `cpt-cf-settings-service-fr-cascading-inheritance`, `cpt-cf-settings-service-fr-defaults-revert`, `cpt-cf-settings-service-fr-bulk-effective-read`, `cpt-cf-settings-service-nfr-performance-read-cache`, `cpt-cf-settings-service-nfr-efficiency-live-read`, `cpt-cf-settings-service-nfr-scope-isolation`
+**Requirements**: `cpt-cf-settings-service-fr-cascading-inheritance`, `cpt-cf-settings-service-fr-defaults-revert`, `cpt-cf-settings-service-fr-bulk-effective-read`, `cpt-cf-settings-service-fr-typed-value-validation` (its needs-review narrowing and review-listing clause; the validation itself is entry 2.4's), `cpt-cf-settings-service-nfr-performance-read-cache`, `cpt-cf-settings-service-nfr-efficiency-live-read`, `cpt-cf-settings-service-nfr-scope-isolation`
 
 **Principles**: `cpt-cf-settings-service-principle-single-ancestry-source`, `cpt-cf-settings-service-principle-fail-closed`
 
@@ -81,7 +83,7 @@ Three properties matter more than the walk itself.
 - **DECOMPOSITION**: [DECOMPOSITION.md](../DECOMPOSITION.md) entry 2.5
 - **Dependencies**: entry 2.4 typed value validation, since the resolution chain terminates in a validated Schema Default and every value it walks is a validated typed value; entry 2.3 for the declaration model and its scope class; entry 2.1 for persistence, the reader trait, and the error taxonomy; entry 2.7 for the effective tenant access the administrative reads consult — until it lands, no restriction rows exist and every setting is visible.
 - **Sequences**: `cpt-cf-settings-service-seq-effective-value-read`
-- **Not applicable**: Cross-field search is R1 but its own feature, entry 2.11 (search-discoverability.md). The `mode` tag is served here on every browse item, and there is no mode filter and no `hidden_advanced_count`: mode is a tag a client groups by, never a filter (DESIGN §2.3). Licence gating and the anonymous read surface are R2 and out of scope here. The cross-replica `cache_invalidate` broadcast and its bounded-staleness guarantee ship with R2, when several replicas become the normal case. Tenant override writes, the cascading-impact report, and the validate-before-set check belong to the Value Writer of entry 2.8. Secret plaintext resolution is owned by the Secret Manager; this feature returns a secret-trait value in its masked handle form. The revert **action** is a value write like any other; only the resolution semantics of defaults are here.
+- **Not applicable**: Cross-field search is R1 but its own feature, entry 2.11 (search-discoverability.md). The `mode` tag and, when set, the declaration's `display_name` (omitted when unset, never derived) are served here on every browse item, while the single read, the public read and the SDK readers (`get_effective`, `get_effective_bulk`) are value-only and carry neither; there is no mode filter and no `hidden_advanced_count`: mode is a tag a client groups by, never a filter (DESIGN §2.3). Licence gating and the anonymous read surface are R2 and out of scope here. The cross-replica `cache_invalidate` broadcast and its bounded-staleness guarantee ship with R2, when several replicas become the normal case. Tenant override writes, the cascading-impact report, and the validate-before-set check belong to the Value Writer of entry 2.8. Secret plaintext resolution is owned by the Secret Manager; this feature returns a secret-trait value in its masked handle form. The revert **action** is a value write like any other; only the resolution semantics of defaults are here.
 
 ## 2. Actor Flows (CDSL)
 
@@ -192,25 +194,51 @@ Three properties matter more than the walk itself.
 **Actor**: `cpt-cf-settings-service-actor-tenant-admin`
 
 **Success Scenarios**:
-- A page of effective values at one scope, by category or by a named key set, each item carrying its own outcome
-- The overrides in the caller's subtree that need review, when the filter asks for them
+- A page of effective values at one scope, by category or by a named key set, each item carrying its own outcome, with the total of settings the listing holds
+- Only the settings whose own override at the target needs review, when the filter asks for them, in the same page shape
 
 **Error Scenarios**:
 - An OData expression on an unmapped field or unsupported operator
+- `needs_review eq false` in the filter
 - The target outside the caller's subtree
-- The `needs_review` filter over a target whose subtree exceeds the subtree budget
 
 **Steps**:
-1. [x] - `p1` - Actor sends GET /settings-service/v1/settings with optional `tenant`, OData `$filter` over `category_id`, `key in (…)` or `needs_review eq true`, `$orderby` over `key` or `category_id` — any other field is refused `400 odata_unsortable_field`, since the page is a page of declarations and an order must be one of their columns that is never empty — and a pagination cursor; `tenant` and scope are resolution context, never filters - `inst-vr-browse-1`
+1. [x] - `p1` - Actor sends GET /settings-service/v1/settings with optional `tenant`, OData `$filter` over `category_id eq`, `key eq`, `key in (…)` or `needs_review eq true`, `$orderby` over `key` or `category_id` — any other field is refused `400 odata_unsortable_field`, since the page is a page of declarations and an order must be one of their columns that is never empty — and a pagination cursor; `tenant` and scope are resolution context, never filters - `inst-vr-browse-1`
 2. [x] - `p1` - Authorize `read` once on the settings base type; **IF** allowed → the caller's grant covers every setting and no further decision is needed for the page - `inst-vr-browse-2`
 3. [x] - `p1` - **ELSE** assemble the page under the narrowed grant: fetch a candidate batch wider than the page, evaluate the candidates in one batch decision, keep what is allowed, and refill until the page is full or the candidates run out; a setting the caller may not read is absent from the page and the count, never marked - `inst-vr-browse-3`
 4. [x] - `p1` - Confirm the target is within the caller's subtree and not standalone; **IF** not → **RETURN** `403` - `inst-vr-browse-4`
-5. [x] - `p1` - **IF** the OData expression references an unmapped field or an unsupported operator → **RETURN** `400` rather than ignoring it - `inst-vr-browse-5`
+5. [x] - `p1` - **IF** the OData expression references an unmapped field or an unsupported operator → **RETURN** `400` rather than ignoring it; `needs_review eq false` is refused the same way, since it is not a narrowing - `inst-vr-browse-5`
 6. [x] - `p1` - Exclude every setting whose effective tenant access for the caller is `hidden`, silently and from the count — in the page query itself, as `NOT IN` the declarations a `hidden` row on the caller's root-to-self chain names, so the page is cut and counted after the exclusion and comes back full rather than shortened; an administrator above the target still sees what it restricted - `inst-vr-browse-6`
-7. [x] - `p1` - **IF** the filter asks for `needs_review` → DB: SELECT the flagged override rows for declarations in the page whose tenant lies in the caller's subtree, excluding standalone descendants, through `idx_values_needs_review`, at most one thousand of them — a page with more is refused `400 review_too_many_rows` naming the bound, never cut — and return them with their detail, the setter identity masked for a caller not authorized for unmasked PII; this lists rows, not resolved values; the subtree is obtained under the shared subtree budget, and **IF** the budget cuts it → **RETURN** `400` naming the bound rather than a silently partial listing - `inst-vr-browse-7`
-8. [x] - `p1` - **ELSE** obtain the ancestor chain once and resolve every item in the page against it, masking each value and its fallback by classification, so one page answers the whole table — the value a scope holds and what it would hold without it - `inst-vr-browse-8`
-9. [x] - `p1` - **IF** the filter named a key set → report a key the caller may not see or that does not exist in its own entry with its own outcome, never as a failure of the request - `inst-vr-browse-9`
-10. [x] - `p1` - **RETURN** `200` with the page and its cursors - `inst-vr-browse-10`
+7. [x] - `p1` - **IF** the filter asks for `needs_review` → narrow the page query to the declarations holding a subject-less override at the target tenant flagged for review, through `idx_values_needs_review`, so the cursor pages the narrowed set - `inst-vr-browse-7`
+8. [x] - `p1` - Obtain the ancestor chain once and resolve every item in the page against it, masking each value and its fallback by classification, so one page answers the whole table — the value a scope holds and what it would hold without it; a narrowed item carries `needs_review` and its detail beside the fallthrough value - `inst-vr-browse-8`
+9. [x] - `p1` - **IF** the filter named a key set → report a key the caller may not see or that does not exist in its own entry with its own outcome, never as a failure of the request; under `needs_review eq true` a visible key whose own override is not flagged is absent, not `not_found` - `inst-vr-browse-9`
+10. [x] - `p1` - **RETURN** `200` with the page, its cursors and `page_info.total_count` — the settings the walk holds for the caller, counted after the hidden exclusion under the same filter and without the cursor, so every page of one walk reports the same number — each item carrying its declaration's `mode` tag and its `display_name` when set (omitted otherwise, never derived) - `inst-vr-browse-10`
+
+### List Values Needing Review
+
+- [x] `p1` - **ID**: `cpt-cf-settings-service-flow-value-resolution-review-list`
+
+**Actor**: `cpt-cf-settings-service-actor-tenant-admin`
+
+**Success Scenarios**:
+- Every flagged subject-less override at the target and its non-standalone descendants, one item per setting and tenant, paged by cursor over the rows
+
+**Error Scenarios**:
+- `needs_review` in the filter, an unmapped field or unsupported operator, `$orderby` or `$select`
+- The target outside the caller's subtree or standalone
+- A subtree past the subtree budget
+- A cursor replayed under another filter
+
+**Steps**:
+1. [x] - `p1` - Actor sends GET /settings-service/v1/settings/review with optional `tenant`, OData `$filter` over `category_id eq`, `key eq`, `key in (…)`, `limit` and a cursor; **IF** the filter names `needs_review`, an unmapped field or an unsupported operator, or `$orderby` or `$select` is present → **RETURN** `400` - `inst-vr-review-1`
+2. [x] - `p1` - Authorize `read` once on the settings base type; **IF** the decision is deny or cannot be obtained → **RETURN** `403`; under a narrowed grant carry its constraints into the page query as browse does, so a setting the caller may not read is absent from the page, never marked - `inst-vr-review-2`
+3. [x] - `p1` - Target gate: **IF** the target is outside the caller's subtree or standalone → **RETURN** `403` - `inst-vr-review-3`
+4. [x] - `p1` - Budget walk: walk the target's descendants under the subtree budget, excluding standalone ones; **IF** the walk is cut → **RETURN** `400 subtree_too_large` naming the bound - `inst-vr-review-4`
+5. [x] - `p1` - **IF** the cursor was minted under another filter or another target → **RETURN** `400`, before any row is read - `inst-vr-review-5`
+6. [x] - `p1` - DB: SELECT a page of the subject-less rows flagged for review at the target or one of the walked tenants, through `idx_values_needs_review`, whose declaration passes the visibility predicate, the caller's `hidden` exclusion, the narrowed grant's constraints and the filter's declaration selectors in the query, ordered by declaration then tenant with a keyset cursor bound to the filter and the target — so a setting flagged at more tenants than `limit` continues on the next page - `inst-vr-review-6`
+7. [x] - `p1` - DB: SELECT the page's declarations in one batch for `key`, `display_name` and `mode` - `inst-vr-review-7`
+8. [x] - `p1` - Mask each row's value by its declaration's classification and the setter identity for a caller without the PII entitlement - `inst-vr-review-8`
+9. [x] - `p1` - **RETURN** `200` with one item per row — `key`, `display_name` when set, `mode`, `tenant_id`, `scope`, `value`, `masked`, `needs_review_detail`, `last_change_at`, `set_by`, `etag` — and the page cursors - `inst-vr-review-9`
 
 ## 3. Processes / Business Logic (CDSL)
 
@@ -423,7 +451,7 @@ The cache **MUST** evict the affected subtree's cascading entries on a tenant hi
 
 - [x] `p1` - **ID**: `cpt-cf-settings-service-dod-value-resolution-rest-read-surface`
 
-The system **MUST** serve `GET /settings-service/v1/settings/{key}` and `GET /settings-service/v1/settings` on the resolver, authorized by `read` on the setting's key — one decision on the base type where the grant covers everything, batch evaluation of candidates under a narrowed grant — confined to the caller's own tenant or a non-standalone descendant, with a hidden setting reported as absent and excluded from listings and counts. The single read **MUST** carry `value`, `source`, `source_scope`, `traits`, the inheritance trail with setter identity, a leak-safe `last_change_at`, the scope's own review flag, and the value state tag in `ETag`; values **MUST** be masked by classification. The browse **MUST** support selection by category and by key set with per-key outcomes, and the needs-review listing over the caller's subtree.
+The system **MUST** serve `GET /settings-service/v1/settings/{key}` and `GET /settings-service/v1/settings` on the resolver, authorized by `read` on the setting's key — one decision on the base type where the grant covers everything, batch evaluation of candidates under a narrowed grant — confined to the caller's own tenant or a non-standalone descendant, with a hidden setting reported as absent and excluded from listings and counts. The single read **MUST** carry `value`, `source`, `source_scope`, `traits`, the inheritance trail with setter identity, a leak-safe `last_change_at`, the scope's own review flag, and the value state tag in `ETag`; values **MUST** be masked by classification. The browse **MUST** support selection by category and by key set with per-key outcomes, and, under `$filter=needs_review eq true`, narrowed to the settings whose own override at the target is flagged, in the same shape. Every browse item **MUST** carry its declaration's `display_name` when set and omit it otherwise, never deriving one, while the single read is value-only and does not carry it.
 
 **Implements**:
 - `cpt-cf-settings-service-flow-value-resolution-admin-read`
@@ -435,6 +463,21 @@ The system **MUST** serve `GET /settings-service/v1/settings/{key}` and `GET /se
 - API: `GET /settings-service/v1/settings/{key}`
 - API: `GET /settings-service/v1/settings`
 - Entities: `EffectiveValue`, `TenantAccess`
+
+### Review Listing
+
+- [x] `p1` - **ID**: `cpt-cf-settings-service-dod-value-resolution-review-listing`
+
+The system **MUST** serve `GET /settings-service/v1/settings/review` on the resolver under browse's authorization, target, visibility and `hidden` rules, listing every subject-less override flagged for review at the target and its non-standalone descendants, one item per setting and tenant carrying `key`, `display_name` when set, `mode`, `tenant_id`, `scope`, the masked `value` and `masked`, `needs_review_detail`, `last_change_at`, `set_by` (masked without the PII entitlement) and the `etag`; **MUST** page by keyset cursor over the flagged rows themselves in a fixed order (declaration, then tenant), with no row bound, so a setting flagged at many tenants spans pages, the cursor bound to the filter and the target and a cursor replayed under another filter or target refused `400`; **MUST** read the page's declarations in one batch; **MUST** refuse a subtree past the subtree budget with the bound named rather than answer incomplete; and **MUST** refuse `needs_review` in its filter, and `$orderby` and `$select`, with `400`. Subject-scoped values are outside this listing in this release.
+
+**Implements**:
+- `cpt-cf-settings-service-flow-value-resolution-review-list`
+
+**Constraints**: `cpt-cf-settings-service-constraint-rbac-policy-enforcer`, `cpt-cf-settings-service-constraint-optimistic-concurrency`
+
+**Touches**:
+- API: `GET /settings-service/v1/settings/review`
+- Entities: `SettingValue`, `TenantAccess`
 
 ### In-Process Reader Binding
 
@@ -489,16 +532,30 @@ The system **MUST** implement `SettingsReaderClient` over the resolver — `get_
 - [x] A read whose own override is flagged returns the fallthrough value together with `needs_review` and its detail
 - [x] A read of a hidden setting returns `404`; a read for a tenant outside the subtree or a standalone descendant returns `403`
 - [x] A browse page is cut after the hidden exclusion: with a hidden setting among the candidates the page still holds `limit` visible settings and its cursor continues past the hidden one
-- [x] The `needs_review` browse over a target whose subtree exceeds the subtree budget is refused `400` naming the bound
+- [x] The review listing over a target whose subtree exceeds the subtree budget is refused `400` naming the bound
 - [x] A read of a secret setting returns the mask token; a `pii` value is masked without the entitlement and unmasked with it
-- [x] The setter identity on the trail and in the needs-review listing is masked without the PII entitlement and unmasked with it, whatever the value's own classification
+- [x] The setter identity on the trail and in the review listing is masked without the PII entitlement and unmasked with it, whatever the value's own classification
 - [x] A scope with its own override carries as `fallback` the nearest valid ancestor's value, `fallback_source` `inherited` and `fallback_scope` naming that ancestor; with no ancestor override, the Schema Default, `schema_default`, and no scope — and the fallback equals what the scope resolves to once its own row is gone
 - [x] A scope without its own override carries a `fallback` equal to its `value`, with the same source and scope
 - [x] A `local` setting with an override falls back to the Schema Default whatever an ancestor holds; a `global` setting falls back to the Schema Default at the platform and to the platform row at a tenant; a flagged ancestor is skipped by the fallback exactly as by resolution
 - [x] A secret setting's `fallback` is masked exactly as its `value`, by one decision on the declaration's classification
 - [x] A standalone tenant's fallback comes from its own chain and never from a sibling; the browse page and the bulk read carry the same fallback fields as the single read
 - [x] `GET /settings-service/v1/settings?$filter=key in (…)` returns one entry per key, a hidden or non-existent key carrying its own outcome
-- [x] `GET /settings-service/v1/settings?$filter=needs_review eq true` lists the flagged overrides in the caller's subtree with their detail and none from a standalone descendant
+- [x] `GET /settings-service/v1/settings/review` lists the flagged overrides at the target and its descendants with their detail and none from a standalone descendant
+- [x] `GET /settings-service/v1/settings?$filter=needs_review eq true` returns only the settings whose own override at the target is flagged, each resolved to its fallthrough value with `needs_review` and its detail
+- [x] A narrowed browse page has the same item shape as an unfiltered page, and its cursor pages the narrowed set without a repeat or a gap
+- [x] A setting flagged only below the target is absent from the narrowed browse page
+- [x] The review listing refuses `needs_review` in its `$filter` with `400`
+- [x] A setting flagged at more tenants than `limit` continues on the next review page in the same order, nothing repeated or skipped
+- [x] Every review item carries `key`, `display_name` when set, `mode`, `tenant_id`, `scope`, `value`, `masked`, `needs_review_detail`, `last_change_at`, `set_by` and `etag`
+- [x] Browse with `needs_review eq false` returns `400`
+- [x] Browse `needs_review eq true` with `key in (…)` naming a visible key whose own override is not flagged omits that key without a `not_found` entry
+- [x] The review listing omits a hidden setting's rows and answers `403` for a target outside the caller's subtree or standalone
+- [x] The review listing refuses `$orderby` and `$select` with `400`
+- [x] A review-listing cursor replayed under another filter or another target is refused `400`
+- [x] A key named in the review listing's `$filter` that has no flagged row in the subtree yields no item and no per-key outcome
+- [x] A `secret` value on the review listing is the mask token; a `pii` value and the setter identity are masked without the entitlement and unmasked with it
 - [ ] Under a base-type grant a page costs one authorization decision; under a narrowed grant denied settings are absent from the page and the count and the page comes back full
 - [x] An OData expression on an unmapped field returns `400` rather than an unfiltered page
 - [x] `SettingsReaderClient` is resolvable from `ClientHub` after init, and a configuration naming a remote binding for it fails startup
+- [x] A browse page item carries `display_name` when its declaration has one and omits it otherwise; `GET /settings-service/v1/settings/{key}`, `GET /settings-service/v1/public/settings`, `get_effective` and `get_effective_bulk` never carry it

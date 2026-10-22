@@ -97,9 +97,9 @@ This feature exists so safety-critical behavior — fail-closed authentication, 
 - **PRD**: [PRD.md](../PRD.md) -- Actors §2, Pluggable Storage §5.4, Security & Data Governance §5.8, NFR catalog §6
 - **Design**: [DESIGN.md](../DESIGN.md) -- Plugin Host (§3.2), UsageType Catalog (§3.2), Contract Surfaces (§3.3), Deployment Topology (§3.8), PRD→DESIGN Realization (§5.3)
 - **Decomposition**: [DECOMPOSITION.md](../DECOMPOSITION.md) -- §2.1 Gear Foundation & Pluggable Storage; §4.3 Plugin discovery and dispatch
-- **ADR**: [ADR-0001](../ADR/0001-pdp-centric-authorization.md) -- PDP-Centric Authorization; [ADR-0002](../ADR/0002-pluggable-storage.md) -- Pluggable Storage; [ADR-0006](../ADR/0006-contract-stability.md) -- Contract Stability; [ADR-0012](../ADR/0012-unified-plugin-catalog-and-gts-id-reference.md) -- Unified plugin-DB usage-type catalog and `gts_id` reference model (supersedes ADR-0007 / ADR-0009 / ADR-0010)
-- **Plugin SPI reference**: [plugin-spi.md](../plugin-spi.md)
-- **SDK trait reference**: [sdk-trait.md](../sdk-trait.md)
+- **ADR**: [ADR-0001](../ADR/0001-cpt-cf-usage-collector-adr-pdp-centric-authorization.md) -- PDP-Centric Authorization; [ADR-0002](../ADR/0002-cpt-cf-usage-collector-adr-pluggable-storage.md) -- Pluggable Storage; [ADR-0005](../ADR/0005-cpt-cf-usage-collector-adr-contract-stability.md) -- Contract Stability; ADR-0012 -- Unified plugin-DB usage-type catalog and `gts_id` reference model (supersedes ADR-0007 / ADR-0009 / ADR-0010)
+- **Plugin SPI reference**: `plugin-spi.md`
+- **SDK trait reference**: `sdk-trait.md`
 - **REST contract**: [usage-collector-v1.yaml](../usage-collector-v1.yaml)
 - **Dependencies**: None
 

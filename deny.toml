@@ -10,6 +10,11 @@
 #   "x86_64-unknown-linux-gnu",
 #   { triple = "wasm32-unknown-unknown", features = ["atomics"] },
 # ]
+# Audit the dependency trees of optional features too. `magika` pulls in
+# ort/ndarray, which the default feature set does not.
+# `all-features = true` is not used yet: it also enables the Windows FIPS
+# provider (rustls-cng-crypto), whose rustls-webpki 0.102 has open advisories.
+features = ["magika"]
 # all-features = true
 # exclude-dev = true
 # exclude-unpublished = false
@@ -44,6 +49,9 @@ ignore = [
   "RUSTSEC-2026-0187", # lopdf <0.42 unbounded-recursion DoS on crafted PDFs — transitive via kreuzberg→cf-gears-file-parser→cf-gears-example-server (example app only, never parses untrusted PDFs). No usable fix: kreuzberg 4.9.x pins lopdf "^0.41" (<0.42) and the fix landed in 0.42.0; 5.x drops the bundled-pdfium feature we use. Remove once kreuzberg ships a release allowing lopdf >=0.42.
   "RUSTSEC-2026-0194", # quick-xml <0.41 quadratic-runtime DoS on crafted start tags — transitive via kreuzberg (biblib/calamine/kreuzberg)→cf-gears-file-parser→cf-gears-example-server (example app only, never parses untrusted XML). No usable fix: all dependents pin quick-xml <0.41 (kreuzberg 4.9.8 pins "0.40.1") and the fix landed in 0.41.0; 5.x drops the bundled-pdfium feature we use. Remove once kreuzberg ships a release allowing quick-xml >=0.41.
   "RUSTSEC-2026-0195", # quick-xml <0.41 unbounded namespace-declaration allocation (NsReader) memory-exhaustion DoS — same transitive path/justification as RUSTSEC-2026-0194 (kreuzberg→file-parser→example-server, example app only). No usable fix below quick-xml 0.41.0. Remove once kreuzberg allows quick-xml >=0.41.
+  "RUSTSEC-2026-0367", # zip <9 keeps SUID/SGID/sticky bits from a ZIP's external_attributes on extraction to disk — transitive via docx-rust 0.1.11 (zip ^4), calamine 0.35 (zip 7) and kreuzberg 4.9.8 (zip 8)→cf-gears-file-parser→cf-gears-example-server (example app only). Not reachable: file-parser reads DOCX/XLSX entries in memory through those crates and never calls ZipArchive::extract or ZipStreamReader::extract, and no code of ours extracts an archive to disk. No usable fix: docx-rust pins zip ^4 and has had no release since 0.1.11; calamine 0.37 and kreuzberg 4.10 allow zip 9 but disagree on quick-xml (=0.41.0 vs ^0.42). Remove once docx-rust allows zip >=9, or once DOCX parsing moves off docx-rust.
+  "RUSTSEC-2026-0368", # zip <9 ZipArchive::extract creates symlinks whose attacker-controlled targets point outside the destination directory — same transitive path and justification as RUSTSEC-2026-0367 (in-memory entry reads only, extract never called). Remove with it.
+  "RUSTSEC-2026-0369", # zip <9 extract applies Unix permissions through symlinks without confining the target — same transitive path and justification as RUSTSEC-2026-0367 (in-memory entry reads only, extract never called). Remove with it.
 ]
 
 # Note:

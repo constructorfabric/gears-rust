@@ -2,7 +2,7 @@
 """Mini-Chat smoke test script (stdlib only).
 
 Prerequisites:
-  1. Server is running:  make mini-chat
+  1. Server is running:  make run PRESET=mini-chat
   2. Set your API key in config/mini-chat.yaml
      (static-credstore-plugin -> secrets -> value)
 

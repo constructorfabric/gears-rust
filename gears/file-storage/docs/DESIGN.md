@@ -131,7 +131,7 @@ See [PRD.md](./PRD.md) §1 "Overview" and §1.3 "Goals":
 | `cpt-cf-file-storage-fr-update-metadata`               | Control `PATCH /files/{id}` JSON Merge Patch on metadata; bumps `meta_version`/`last_modified_at` and leaves `content_id`/ETag intact |
 | `cpt-cf-file-storage-fr-retention-indefinite`          | No background purge in P1; files live until owner deletes                                                                                                                |
 | `cpt-cf-file-storage-fr-backend-abstraction`           | `StorageBackend` async trait (in the **sidecar**) with capability sub-traits; backend types: `local-filesystem`, an opt-in in-memory backend, `s3-compatible`                                                                 |
-| `cpt-cf-file-storage-fr-backend-capabilities`          | `BackendCapabilities` struct per driver, exposed via `GET /storages`; **no `versioning_native`** (versioning is FileStorage-level); `multipart_native` is active for `s3-compatible`/in-memory, inactive for `local-filesystem`; `encryption_native` inactive (P3)                     |
+| `cpt-cf-file-storage-fr-backend-capabilities`          | `BackendCapabilities` struct per driver, exposed via `GET /storages` (cursor-paginated `{items, page_info}`, order `id asc`); **no `versioning_native`** (versioning is FileStorage-level); `multipart_native` is active for `s3-compatible`/in-memory, inactive for `local-filesystem`; `encryption_native` inactive (P3)                     |
 | `cpt-cf-file-storage-fr-backend-config-source`         | Platform gear YAML config (`gear_config`) loaded at gear startup → in-memory `BackendRegistry`; sidecar loads its own equivalent set from `FS_SIDECAR_*` env vars; surfaced read-only via `/storages`                                                                     |
 | `cpt-cf-file-storage-fr-rest-api`                      | Control-plane Axum router under `/api/file-storage/v1`: metadata, listing, version bind, and signed-URL issuance via OperationBuilder — **no content endpoints** (content lives on the sidecar)                                                   |
 | `cpt-cf-file-storage-fr-range-requests`                | See §4.1 Random Read Access for the full mechanics                                                                                                                       |
@@ -722,14 +722,17 @@ and `meta_version`. (The pointer-swap CAS itself is driven by `bind-service`; th
   writes do **not** bump `meta_version`; metadata-only updates bump `meta_version` and `last_modified_at`
 - Enforce tenant boundary via SecureConn — every query/mutation passes through the request's `SecurityContext`
 - Tenant + mandatory owner filter on `GET /files`; keyset cursor pagination, navigable in either direction
-  (`limit`/`cursor` query params, default 25, max 200, capped by `FileStorageConfig::max_page_size`);
+  (`limit`/`cursor` query params, synonyms `$top`/`$skiptoken`, default 25, max 200, capped by
+  `FileStorageConfig::max_page_size`);
   ordered `created_at DESC, file_id DESC` (the `file_id` tie-breaker keeps the keyset page boundary stable across
   rows sharing a `created_at` instant), index-backed by `(tenant_id, owner_kind, owner_id, created_at DESC, file_id
-  DESC)`. `GET /files`, `GET /files/{id}/versions`, and `GET /retention-rules` all return
-  `{items, page_info: {next_cursor, prev_cursor, limit}}` (`toolkit_odata::Page<T>`), never a bare JSON array —
+  DESC)`. `GET /files`, `GET /files/{id}/versions`, `GET /retention-rules`, and `GET /storages` (order `id asc`) all
+  return `{items, page_info: {next_cursor, prev_cursor, limit}}` (`toolkit_odata::Page<T>`), never a bare JSON array —
   `prev_cursor` is `null` only on the first page of a walk (no cursor supplied) or once a backward walk has reached
   its end; a backward page (`cursor` set to a previous `prev_cursor`) is still returned in the same canonical
-  order, never reversed. OData `$filter`/`$orderby` is not implemented. List a
+  order, never reversed. Page parameters are parsed by the `toolkit::api::odata::OData` extractor, the platform's
+  single point for them: it rejects `$skip` and every other unsupported `$` parameter, and the gear additionally
+  rejects `$filter`/`$orderby`/`$select` (not implemented) and any plain key a listing does not take. List a
   file's versions ordered by `created_at DESC, version_id DESC` (same tie-breaker reasoning), same keyset model
 - Reject PRD-defined constraints at this layer when they are not enforceable as DB constraints (e.g., GTS format
   validation regex, tenant policy delta in P2)

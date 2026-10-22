@@ -1,63 +1,58 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use construct_sdk::{ConstructClientV1, FoundationNote, NewFoundationNote};
+use construct_sdk::{ConstructClientV1, RecordOutcome};
 use toolkit_canonical_errors::CanonicalError;
 use toolkit_macros::domain_model;
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
-use crate::domain::repo::NoteRepository;
-use crate::domain::service::Service;
+use crate::domain::record_intake::{IntakeOutcome, RecordIdRepository, RecordIntakeService};
+use crate::domain::subject_settings::SubjectSettingsRepository;
 
 #[domain_model]
-pub struct LocalClient<R: NoteRepository + 'static> {
-    service: Arc<Service<R>>,
+pub struct LocalClient<I, S>
+where
+    I: RecordIdRepository + 'static,
+    S: SubjectSettingsRepository + 'static,
+{
+    intake: Arc<RecordIntakeService<I, S>>,
 }
 
-impl<R: NoteRepository + 'static> LocalClient<R> {
+impl<I, S> LocalClient<I, S>
+where
+    I: RecordIdRepository + 'static,
+    S: SubjectSettingsRepository + 'static,
+{
     #[must_use]
-    pub fn new(service: Arc<Service<R>>) -> Self {
-        Self { service }
+    pub fn new(intake: Arc<RecordIntakeService<I, S>>) -> Self {
+        Self { intake }
     }
 }
 
-/// @cpt-dod:cpt-cf-construct-dod-gear-foundation-client:p1
+/// @cpt-dod:cpt-cf-construct-dod-record-intake-client:p1
 #[async_trait]
-impl<R: NoteRepository + 'static> ConstructClientV1 for LocalClient<R> {
-    async fn create_note(
+impl<I, S> ConstructClientV1 for LocalClient<I, S>
+where
+    I: RecordIdRepository + 'static,
+    S: SubjectSettingsRepository + 'static,
+{
+    async fn submit_record(
         &self,
         ctx: &SecurityContext,
-        note: NewFoundationNote,
-    ) -> Result<FoundationNote, CanonicalError> {
-        // @cpt-begin:cpt-cf-construct-flow-gear-foundation-client-note:p1:inst-client-create
-        // @cpt-begin:cpt-cf-construct-flow-gear-foundation-client-note:p1:inst-client-create-run
-        self.service
-            .create_note(ctx, note)
+        tenant_id: Uuid,
+        record: serde_json::Value,
+    ) -> Result<RecordOutcome, CanonicalError> {
+        // @cpt-begin:cpt-cf-construct-flow-record-intake-submit:p1:inst-submit-client
+        let outcome = self
+            .intake
+            .submit(ctx, tenant_id, record)
             .await
-            // @cpt-end:cpt-cf-construct-flow-gear-foundation-client-note:p1:inst-client-create-run
-            // @cpt-begin:cpt-cf-construct-flow-gear-foundation-client-note:p1:inst-client-map
-            // @cpt-begin:cpt-cf-construct-flow-gear-foundation-client-note:p1:inst-client-map-return
-            .map_err(CanonicalError::from)
-        // @cpt-end:cpt-cf-construct-flow-gear-foundation-client-note:p1:inst-client-map-return
-        // @cpt-end:cpt-cf-construct-flow-gear-foundation-client-note:p1:inst-client-map
-        // @cpt-end:cpt-cf-construct-flow-gear-foundation-client-note:p1:inst-client-create
-    }
-
-    async fn get_note(
-        &self,
-        ctx: &SecurityContext,
-        id: Uuid,
-    ) -> Result<FoundationNote, CanonicalError> {
-        // @cpt-begin:cpt-cf-construct-flow-gear-foundation-client-note:p1:inst-client-get
-        self.service
-            .get_note(ctx, id)
-            .await
-            // @cpt-begin:cpt-cf-construct-flow-gear-foundation-client-note:p1:inst-client-map
-            // @cpt-begin:cpt-cf-construct-flow-gear-foundation-client-note:p1:inst-client-map-return
-            .map_err(CanonicalError::from)
-        // @cpt-end:cpt-cf-construct-flow-gear-foundation-client-note:p1:inst-client-map-return
-        // @cpt-end:cpt-cf-construct-flow-gear-foundation-client-note:p1:inst-client-map
-        // @cpt-end:cpt-cf-construct-flow-gear-foundation-client-note:p1:inst-client-get
+            .map_err(CanonicalError::from)?;
+        Ok(match outcome {
+            IntakeOutcome::Received => RecordOutcome::Received,
+            IntakeOutcome::Repeat => RecordOutcome::Repeat,
+        })
+        // @cpt-end:cpt-cf-construct-flow-record-intake-submit:p1:inst-submit-client
     }
 }

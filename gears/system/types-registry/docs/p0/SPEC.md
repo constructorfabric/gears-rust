@@ -223,14 +223,14 @@ make ci                  # full gate: fmt, clippy, test, deny, dylint, lychee
 
 cargo test -p cf-gears-types-registry
 cargo test -p cf-gears-types-registry-sdk
-make test-types-registry-db  # this gear's PostgreSQL + MySQL container suites
+make test-integration LANE=types-registry-db  # this gear's PostgreSQL + MySQL container suites
 
 make dylint              # architecture lints — DE01xx/DE02xx/DE08xx apply here
 make e2e-local           # REST surface end to end
 ```
 
 Definition of done for any slice: `make ci` green, the plain gear tests green on SQLite,
-and `make test-types-registry-db` green on PostgreSQL and MySQL. SQLite-only is not
+and `make test-integration LANE=types-registry-db` green on PostgreSQL and MySQL. SQLite-only is not
 sufficient — `constraint-multi-backend` is a correctness requirement, and the lock and CAS
 paths differ per backend.
 
@@ -1716,7 +1716,7 @@ Follow `12_unit_testing.md`, with one exception for real outbox-delivery tests:
      Test the handler shell directly without waiting.
 - **Whole passing suite under 5 s.** Per-wait failure deadlines do not replace this budget.
 - Each test builds its own **SQLite `:memory:`** database and fresh service instances; no
-  shared state, parallel-safe. `make test-types-registry-db` on PostgreSQL and MySQL covers the
+  shared state, parallel-safe. `make test-integration LANE=types-registry-db` on PostgreSQL and MySQL covers the
   backend-specific lock, CAS and range-bound paths.
 - Pure logic is `#[test]`, not `#[tokio::test]`.
 - **Verify state with direct entity queries**, never only through a service read — a
@@ -1728,7 +1728,7 @@ Follow `12_unit_testing.md`, with one exception for real outbox-delivery tests:
 - Error variants asserted with `assert!(matches!(...), "…got: {err:?}")`.
 
 Target 90%+ coverage. The plain SQLite gear tests plus
-`make test-types-registry-db` on PostgreSQL and MySQL are part of done, not a follow-up.
+`make test-integration LANE=types-registry-db` on PostgreSQL and MySQL are part of done, not a follow-up.
 
 **Unit** — acceptance check ordering, fingerprint computation, family key derivation
 (`vM~` / `vM.n~` → one key), shape and contiguity rules, dialect spelling set,
@@ -1905,7 +1905,7 @@ references.
 - Validate at the admission boundary before touching storage.
 - Enforce idempotency uniqueness and `resource_version` CAS in the database, never in
   process memory.
-- Run `make ci`, the plain SQLite gear tests, and `make test-types-registry-db` for
+- Run `make ci`, the plain SQLite gear tests, and `make test-integration LANE=types-registry-db` for
   PostgreSQL/MySQL before calling a slice done.
 - Sign commits (`git commit -s`), Conventional Commits format.
 - Name every deliberate simplification at the point where it bites, with its bound and
@@ -1966,7 +1966,7 @@ references.
 1. A gear's Type Schemas and Instances survive a process restart with authored content
    and all three effective artifacts byte-identical.
 2. `make ci` and the plain gear tests green on SQLite;
-   `make test-types-registry-db` green on PostgreSQL and MySQL.
+   `make test-integration LANE=types-registry-db` green on PostgreSQL and MySQL.
 3. Registration returns `202` + operation; polling reaches a terminal state with one
    outcome per candidate GTS identifier.
 4. Replaying an `Idempotency-Key` with the same fingerprint writes nothing and returns

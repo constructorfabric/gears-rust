@@ -17,7 +17,7 @@ block hierarchy traversal from parent tenants (unless explicitly ignored).
 
 ## Public API
 
-The gear registers [`TenantResolverClient`](tenant_resolver-sdk/src/api.rs) in ClientHub:
+The gear registers [`TenantResolverClient`](tenant-resolver-sdk/src/api.rs) in ClientHub:
 
 - `get_tenant(ctx, id)` — Retrieve single tenant by ID
 - `get_root_tenant(ctx)` — Retrieve the root tenant (the unique tenant with no parent)
@@ -149,7 +149,7 @@ Note: Sibling order within the same parent is not guaranteed.
 
 ### Models
 
-See [`models.rs`](tenant_resolver-sdk/src/models.rs): `TenantId`, `TenantInfo`, `TenantRef`, `TenantStatus`, `BarrierMode`, `GetTenantsOptions`, `GetAncestorsOptions`, `GetAncestorsResponse`, `GetDescendantsOptions`, `GetDescendantsResponse`, `IsAncestorOptions`
+See [`models.rs`](tenant-resolver-sdk/src/models.rs): `TenantId`, `TenantInfo`, `TenantRef`, `TenantStatus`, `BarrierMode`, `GetTenantsOptions`, `GetAncestorsOptions`, `GetAncestorsResponse`, `GetDescendantsOptions`, `GetDescendantsResponse`, `IsAncestorOptions`
 
 **`TenantInfo`** — Full tenant information (for `get_tenant`, `get_tenants`):
 - `id` — Unique tenant identifier
@@ -165,21 +165,21 @@ See [`models.rs`](tenant_resolver-sdk/src/models.rs): `TenantId`, `TenantInfo`, 
 
 ### Errors
 
-See [`error.rs`](tenant_resolver-sdk/src/error.rs): `TenantNotFound`, `Unauthorized`, `NoPluginAvailable`, `ServiceUnavailable`, `Internal`
+See [`error.rs`](tenant-resolver-sdk/src/error.rs): `TenantNotFound`, `Unauthorized`, `NoPluginAvailable`, `ServiceUnavailable`, `Internal`
 
 ## Plugin API
 
-Plugins implement [`TenantResolverPluginClient`](tenant_resolver-sdk/src/plugin_api.rs) and register via GTS.
+Plugins implement [`TenantResolverPluginClient`](tenant-resolver-sdk/src/plugin_api.rs) and register via GTS.
 
 Gears include two plugins out of the box:
-- [`static_tr_plugin`](plugins/static_tr_plugin/) — Config-based plugin with hierarchical tenant support
-- [`single_tenant_tr_plugin`](plugins/single_tenant_tr_plugin/) — Zero-config plugin for single-tenant deployments
+- [`static_tr_plugin`](plugins/static-tr-plugin/) — Config-based plugin with hierarchical tenant support
+- [`single_tenant_tr_plugin`](plugins/single-tenant-tr-plugin/) — Zero-config plugin for single-tenant deployments
 
 ## Configuration
 
 ### Tenant Resolver Gear
 
-See [`config.rs`](tenant_resolver/src/config.rs)
+See [`config.rs`](tenant-resolver/src/config.rs)
 
 ```yaml
 gears:
@@ -189,7 +189,7 @@ gears:
 
 ### Static Plugin
 
-See [`config.rs`](plugins/static_tr_plugin/src/config.rs)
+See [`config.rs`](plugins/static-tr-plugin/src/config.rs)
 
 ```yaml
 gears:

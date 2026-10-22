@@ -12,6 +12,7 @@ workspace = true
 
 [features]
 default = []
+durable-execution = ["dep:durable-execution"]
 file-parser = ["dep:file_parser"]
 github-mirror = ["dep:github_mirror"]
 simple-user-settings = ["dep:simple_user_settings"]
@@ -68,7 +69,9 @@ magika = ["file_parser/magika"]
 bss-products = ["dep:bss_products"]
 bss-pricing = ["dep:bss_pricing", "bss-products"]
 bss-approvals = ["dep:bss_approvals"]
-admission-control = ["dep:admission-control"]
+# The admission gate links its default engine plugin, policy-engine.
+admission-control = ["dep:admission-control", "policy-engine"]
+policy-engine = ["dep:policy-engine"]
 
 [dependencies]
 mimalloc = { workspace = true }
@@ -76,6 +79,7 @@ mimalloc = { workspace = true }
 toolkit = { workspace = true, features = ["bootstrap"] }
 
 # System gears
+durable-execution = { workspace = true, optional = true }
 api_gateway = { package = "cf-gears-api-gateway", path = "../../gears/system/api-gateway" }
 api_egress = { package = "cf-gears-oagw", path = "../../gears/system/oagw/oagw", optional = true }
 grpc_hub = { package = "cf-gears-grpc-hub", path = "../../gears/system/grpc-hub", optional = true }
@@ -151,6 +155,9 @@ bss_approvals = { package = "cf-gears-bss-approvals", path = "../../gears/bss/ap
 
 # Optional Admission Control gear
 admission-control = { package = "cf-gears-admission-control", path = "../../gears/system/admission-control/admission-control", optional = true }
+
+# Optional Policy Engine gear (an admission-control engine plugin)
+policy-engine = { package = "cf-gears-policy-engine", path = "../../gears/system/policy-engine/policy-engine", optional = true }
 
 # Optional example module
 users-info = { path = "../../examples/toolkit/users-info/users-info", optional = true }

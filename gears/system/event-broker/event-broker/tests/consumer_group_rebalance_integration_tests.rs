@@ -215,12 +215,42 @@ fn event_frame_json(
 
 /// Reads frames off `reader`, skipping heartbeats - the delivery loop's
 /// heartbeat cadence is timing-dependent and irrelevant to the frames this
-/// test actually cares about.
+/// test actually cares about. Panics if no non-heartbeat frame arrives within
+/// `timeout`.
+///
+/// `timeout` bounds the whole wait, not each individual read: a single deadline
+/// spans every heartbeat skipped, so a steady heartbeat stream can't keep
+/// re-arming the clock and turn a never-arriving frame into an indefinite hang
+/// (matching `next_meaningful_frame`).
 async fn next_non_heartbeat(reader: &mut SseFrameReader, timeout: Duration) -> (String, Value) {
+    let deadline = tokio::time::Instant::now() + timeout;
     loop {
-        let (kind, data) = reader.next_frame(timeout).await;
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let (kind, data) = reader.next_frame(remaining).await;
         if kind != "heartbeat" {
             return (kind, data);
+        }
+    }
+}
+
+/// The next non-heartbeat frame within `window`, or `None` if only heartbeats
+/// (or nothing) arrive - the non-panicking, heartbeat-skipping counterpart of
+/// `next_non_heartbeat`. `window` is a wall-clock bound across any heartbeats
+/// inside it, so quiescence detection doesn't depend on the heartbeat cadence.
+async fn next_meaningful_frame(
+    reader: &mut SseFrameReader,
+    window: Duration,
+) -> Option<(String, Value)> {
+    let deadline = tokio::time::Instant::now() + window;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return None;
+        }
+        match reader.try_next_frame(remaining).await {
+            None => return None,
+            Some((kind, _)) if kind == "heartbeat" => {}
+            Some(frame) => return Some(frame),
         }
     }
 }
@@ -703,22 +733,35 @@ async fn setup(test_tag: &str) -> TestFixture {
     let topic = format!("gts.cf.core.events.topic.v1~x.eb.{test_tag}.rollout.v1");
     let event_type = format!("gts.cf.core.events.event.v1~x.eb.{test_tag}.foo.v1~");
     let subject_type = format!("gts.x.eb.{test_tag}.subject.v1~");
-    let server = TestServer::start(vec![
-        json!({ "id": topic, "partitions": PARTITION_COUNT, }),
-        json!({
-            "id": event_type,
-            "topic_id": topic,
-            "allowed_subject_types": [subject_type],
-            // The member the pointer below names has to be one this type
-            // declares: the broker checks that when it admits the type, so a
-            // pointer at an undeclared member would drop the type rather than
-            // fail on every publish of it.
-            "data_schema": { "type": "object", "properties": { "pk": { "type": "string" } } },
-            // Steering a publish to a partition means varying the member the
-            // type names, so this type names the payload member the test sets.
-            "partition_key": "/data/pk",
-        }),
-    ])
+    // A 1s heartbeat (vs the 5s default). The server has no proactive disconnect
+    // watcher, so it notices a member that departs by dropping its connection no
+    // later than the next frame it fails to write - a heartbeat, for an idle
+    // stream. These tests set `session_timeout = PT1S` to reap fast, so with the
+    // 5s default that detection alone could outlast `drive_to_quiescence`'s
+    // window - the race that flaked `*_via_disconnect` on slow CI (notably
+    // Windows, slower to observe a peer FIN on an idle response). 1s realigns
+    // detection with the 1s timeout. Production is unaffected: there
+    // `session_timeout` (30s) dwarfs the heartbeat, so the latency is immaterial.
+    // `*_via_delete` reaps synchronously and does not depend on this.
+    let server = TestServer::start_with_heartbeat(
+        vec![
+            json!({ "id": topic, "partitions": PARTITION_COUNT, }),
+            json!({
+                "id": event_type,
+                "topic_id": topic,
+                "allowed_subject_types": [subject_type],
+                // The member the pointer below names has to be one this type
+                // declares: the broker checks that when it admits the type, so a
+                // pointer at an undeclared member would drop the type rather than
+                // fail on every publish of it.
+                "data_schema": { "type": "object", "properties": { "pk": { "type": "string" } } },
+                // Steering a publish to a partition means varying the member the
+                // type names, so this type names the payload member the test sets.
+                "partition_key": "/data/pk",
+            }),
+        ],
+        Some(1),
+    )
     .await;
     let client = reqwest::Client::new();
     let tenant_id = Uuid::new_v4();
@@ -806,9 +849,12 @@ async fn join_member(
 /// Member `id` leaves the group - via an explicit `DELETE` when
 /// `via_delete`, or purely by dropping its connection (relying on the
 /// `session_timeout` grace-period timer) otherwise. Either way `members` no
-/// longer tracks it, and dropping its `Member` (and therefore its `reader`)
-/// closes its side of the connection - the trigger `tx.closed()` needs to
-/// detect a disconnect in the timer-based case.
+/// longer tracks it, and dropping its `Member` (and so its `reader`) closes the
+/// client side of the connection. In the timer-based case the server has no
+/// proactive disconnect watcher, so it detects this no later than the next
+/// heartbeat it fails to write: that drops the stream's `MembershipHandle`,
+/// whose `Drop` moves the member to `Disconnected` and starts the
+/// `session_timeout` the sweeper then reaps on.
 async fn depart(f: &TestFixture, members: &mut Vec<Member>, id: Uuid, via_delete: bool) {
     if via_delete {
         let resp = f
@@ -829,10 +875,10 @@ async fn depart(f: &TestFixture, members: &mut Vec<Member>, id: Uuid, via_delete
     members.retain(|m| m.id != id);
 }
 
-/// Drains whatever `topology`/`control` frames arrive for the tracked
-/// `members` until a full sweep produces none, re-JOINing (as a
-/// well-behaved consumer would) whenever a `terminal` control frame closes
-/// a member out.
+/// Drains `topology`/`control` frames for the tracked `members` until the group
+/// falls quiet - no member emits one for a whole `quiet_window` - re-JOINing (as
+/// a well-behaved consumer would) whenever a `terminal` control frame closes a
+/// member out.
 ///
 /// Deliberately does NOT pre-compute "the" expected split from the CURRENT
 /// live membership and compare a `topology` frame's exact body against it:
@@ -849,24 +895,34 @@ async fn depart(f: &TestFixture, members: &mut Vec<Member>, id: Uuid, via_delete
 /// this race - is still checked byte-for-byte. `verify_gap_free_and_final_state`
 /// below is what asserts the exact final split once everything has settled.
 async fn drive_to_quiescence(f: &TestFixture, members: &mut Vec<Member>) {
-    let poll_timeout = Duration::from_secs(2);
-    let mut quiet_rounds = 0;
-    for round in 0..40 {
-        let mut changed = false;
+    // Quiescence = no member emits a topology/control frame for a whole
+    // `quiet_window`. Heartbeats are ignored, so this is independent of the
+    // heartbeat cadence. The window must exceed the worst-case disconnect ->
+    // session_timeout -> sweep -> rebalance latency, or it settles before a
+    // pending disconnect rebalance lands - the race that flaked `*_via_disconnect`.
+    // With the 1s heartbeat that latency is ~3-4s; a fault-injection sweep (a
+    // simulated slow disconnect detection) put the break-even right at this
+    // window, so 10s is ~2.5-3x the real latency - comfortable headroom for a
+    // loaded runner without being so long it drags the suite. Tracked as one
+    // group-wide "time since last meaningful frame", so confirming a settled
+    // group costs ~one window total regardless of member count; `poll` only sets
+    // how often each reader is drained within it.
+    let quiet_window = Duration::from_secs(10);
+    let poll = Duration::from_millis(500);
+    let overall_deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+    let mut last_meaningful = tokio::time::Instant::now();
+    loop {
+        if members.is_empty() {
+            tokio::time::sleep(poll).await;
+        }
         let mut i = 0;
         while i < members.len() {
-            let frame = loop {
-                match members[i].reader.try_next_frame(poll_timeout).await {
-                    None => break None,
-                    Some((kind, _)) if kind == "heartbeat" => {}
-                    Some(frame) => break Some(frame),
-                }
-            };
-            let Some((kind, data)) = frame else {
+            let Some((kind, data)) = next_meaningful_frame(&mut members[i].reader, poll).await
+            else {
                 i += 1;
                 continue;
             };
-            changed = true;
+            last_meaningful = tokio::time::Instant::now();
             match kind.as_str() {
                 "topology" => {
                     let new_version = data["topology_version"].as_i64().expect("topology_version");
@@ -947,17 +1003,14 @@ async fn drive_to_quiescence(f: &TestFixture, members: &mut Vec<Member>) {
                 ),
             }
         }
-        if changed {
-            quiet_rounds = 0;
-        } else {
-            quiet_rounds += 1;
-            if quiet_rounds >= 3 {
-                return;
-            }
+        // Settled once a whole `quiet_window` has passed with no member emitting
+        // anything but heartbeats.
+        if tokio::time::Instant::now().duration_since(last_meaningful) >= quiet_window {
+            return;
         }
         assert!(
-            round < 39,
-            "group did not reach quiescence within the round budget"
+            tokio::time::Instant::now() < overall_deadline,
+            "group did not reach quiescence within the time budget"
         );
     }
 }

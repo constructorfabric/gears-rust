@@ -398,14 +398,16 @@ bounded within that tenant (the current tenant-bounded model — see §11).
 
 - [ ] `p1` - **ID**: `cpt-cf-license-resolver-interface-client`
 
-- **Type**: Rust trait (`LicenseResolverClient`)
+- **Type**: Rust trait (`LicenseResolverApi`), available in process and over an internal REST endpoint
 - **Stability**: stable
 - **Description**: The public client contract exposing the **single** method
   `is_licensed(request: LicenseCheckRequest) -> LicenseDecision` — the point-in-time check of whether a resource is
-  licensed to a subject. `LicenseCheckRequest` bundles the Subject and Resource contract objects (instances of
-  registered derived licensing types, each carrying its contract type + optional id + schematized `metadata`) and the
-  tenant context (caller-derived from `SecurityContext`). A request that does not conform to its registered contracts is
-  rejected with a validation error, distinct from a not-granted decision. There is no listing or enumeration method.
+  licensed to a subject. A consumer in the same process calls it directly; a consumer in another process calls the
+  same method over REST. The REST endpoint is reachable only by platform services, not by external clients. 
+  `LicenseCheckRequest` bundles the Subject and Resource contract objects (instances of registered derived licensing 
+  types, each carrying its contract type + optional id + schematized `metadata`) and the tenant context 
+  (caller-derived from `SecurityContext`). A request that does not conform to its registered contracts is rejected 
+  with a validation error, distinct from a not-granted decision. There is no listing or enumeration method.
 - **Breaking Change Policy**: Major version bump required to change the `LicenseCheckRequest`/`LicenseDecision` shape (a
   backward-compatible new optional request field is not breaking), the identity model (contract GTS type + optional
   instance id), or the decision/error semantics. Individual licensing contracts evolve under
@@ -418,8 +420,8 @@ bounded within that tenant (the current tenant-bounded model — see §11).
 - [ ] `p2` - **ID**: `cpt-cf-license-resolver-contract-plugin`
 
 - **Direction**: required from backend plugin
-- **Protocol/Format**: Plugin trait (`LicenseResolverPluginClient`) mirroring the `is_licensed` signature, discovered
-  via the GTS types registry plugin spec.
+- **Protocol/Format**: In-process plugin trait (`LicenseResolverPluginClient`) with the same `is_licensed` request and
+  decision, discovered via the GTS types registry plugin spec.
 - **Compatibility**: Plugin spec is GTS-versioned; the plugin contract tracks the public client contract's major
   version.
 
@@ -529,4 +531,4 @@ Links to related specification artifacts.
 
 - **Design**: [DESIGN.md](./DESIGN.md)
 - **ADRs**: [ADR/](./ADR/)
-- **Features**: [features/](./features/)
+- **Features**: `features/`

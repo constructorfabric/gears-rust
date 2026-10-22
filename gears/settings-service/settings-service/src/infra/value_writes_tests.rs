@@ -185,6 +185,7 @@ impl Harness {
                 id,
                 DeclarationMetadata {
                     mode: "standard".to_owned(),
+                    display_name: None,
                     description: None,
                     domain_affinity: None,
                     licence_feature: None,
@@ -211,6 +212,7 @@ impl Harness {
                 id,
                 DeclarationMetadata {
                     mode: "standard".to_owned(),
+                    display_name: None,
                     description: None,
                     domain_affinity: Some(domain.to_owned()),
                     licence_feature: None,

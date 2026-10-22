@@ -275,7 +275,7 @@ the other.
 ### TODO-4 — Verified PSS salt length contract
 
 **Status: resolved (informational).** Apple's
-[`SecKey.h`](file:///Library/Developer/CommandLineTools/SDKs/MacOSX14.4.sdk/System/Library/Frameworks/Security.framework/Versions/A/Headers/SecKey.h)
+`SecKey.h` (macOS SDK, `Security.framework`)
 documents `kSecKeyAlgorithmRSASignatureMessagePSSSHA{256,384,512}` with
 `saltLength = 32/48/64` (digest length), matching RFC 8446 §4.2.3 and
 RFC 8017 §9.1. Keeping this entry as a regression-watch trigger — if a

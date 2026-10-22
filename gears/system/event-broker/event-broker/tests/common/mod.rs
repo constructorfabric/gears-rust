@@ -110,7 +110,12 @@ fn split_fixtures(entities: &[Value]) -> (Vec<Value>, Vec<(String, i64)>) {
 /// Builds the `types-registry` `entities:` list as a YAML flow sequence of
 /// JSON-object literals (YAML is a superset of JSON for values) - avoids
 /// hand-crafting indentation-sensitive block-style YAML per entity.
-fn config_yaml(home_dir: &Path, port: u16, entities: &[Value]) -> String {
+fn config_yaml(
+    home_dir: &Path,
+    port: u16,
+    entities: &[Value],
+    heartbeat_secs: Option<u32>,
+) -> String {
     let (documents, partitions) = split_fixtures(entities);
     let entities_json: Vec<String> = documents
         .iter()
@@ -124,6 +129,12 @@ fn config_yaml(home_dir: &Path, port: u16, entities: &[Value]) -> String {
         )
         .expect("writing to a String never fails");
     }
+    // `None` means the default the production uses: 5s.
+    // The `streaming:` block below is always spelled out in full because
+    // `StreamingConfig` is `deny_unknown_fields` with no per-field defaults, so a
+    // partial block won't deserialize; every field other than the heartbeat is
+    // its `StreamingConfig::default()` value, so pinning them changes nothing.
+    let heartbeat_interval_secs = heartbeat_secs.unwrap_or(5);
     format!(
         r#"
 server:
@@ -170,6 +181,12 @@ gears:
     config:
       mode: standalone
       default_storage_backend: "gts.cf.core.events.backend.v1~cf.core.backend.sqlite.v1~"
+      streaming:
+        heartbeat_interval_secs: {heartbeat_interval_secs}
+        read_batch_max_events: 256
+        read_batch_max_bytes: 1048576
+        progress_drift_threshold: 1000
+        progress_min_interval_secs: 30
       # The event log lives in the backend's own database, beside the gear's
       # rather than inside it - the gear's keeps ingest and delivery metadata.
       # A file rather than `:memory:` because the restart test asserts events
@@ -207,9 +224,14 @@ fn spawn_server(
     home_dir: &Path,
     port: u16,
     entities: &[Value],
+    heartbeat_secs: Option<u32>,
 ) -> (Child, Arc<Mutex<Vec<String>>>) {
     let config_path = home_dir.join("config.yaml");
-    std::fs::write(&config_path, config_yaml(home_dir, port, entities)).expect("write config");
+    std::fs::write(
+        &config_path,
+        config_yaml(home_dir, port, entities, heartbeat_secs),
+    )
+    .expect("write config");
 
     let mut child = Command::new(bin_path())
         .arg("--config")
@@ -271,6 +293,9 @@ pub struct TestServer {
     base_url: String,
     home_dir: TempDir,
     entities: Vec<Value>,
+    /// The heartbeat cadence this server was booted with, re-applied on
+    /// `restart` so a restarted server keeps whatever a test configured.
+    heartbeat_secs: Option<u32>,
 }
 
 impl TestServer {
@@ -278,9 +303,18 @@ impl TestServer {
     /// config (the same `entities:` mechanism `config/event-broker-
     /// standalone.yaml` documents) - typically topic/event-type fixtures.
     pub async fn start(entities: Vec<Value>) -> Self {
+        Self::start_with_heartbeat(entities, None).await
+    }
+
+    /// Boots with an explicit idle heartbeat cadence (seconds); `None` keeps the
+    /// 5s default. The server has no proactive disconnect watcher, so it notices
+    /// a subscriber that departs by dropping its connection no later than the next
+    /// frame it fails to write - a heartbeat, for an idle stream. A short cadence
+    /// bounds that detection latency, which a disconnect-departure test relies on.
+    pub async fn start_with_heartbeat(entities: Vec<Value>, heartbeat_secs: Option<u32>) -> Self {
         let home_dir = TempDir::new().expect("tempdir");
         let port = alloc_port();
-        let (mut child, logs) = spawn_server(home_dir.path(), port, &entities);
+        let (mut child, logs) = spawn_server(home_dir.path(), port, &entities, heartbeat_secs);
         let base_url = format!("http://127.0.0.1:{port}");
         wait_for_ready(&mut child, &base_url, &logs).await;
         Self {
@@ -289,6 +323,7 @@ impl TestServer {
             base_url,
             home_dir,
             entities,
+            heartbeat_secs,
         }
     }
 
@@ -304,7 +339,12 @@ impl TestServer {
         self.child.kill().await.expect("kill for restart");
         drop(self.child.wait().await);
         let port = alloc_port();
-        let (mut child, logs) = spawn_server(self.home_dir.path(), port, &self.entities);
+        let (mut child, logs) = spawn_server(
+            self.home_dir.path(),
+            port,
+            &self.entities,
+            self.heartbeat_secs,
+        );
         let base_url = format!("http://127.0.0.1:{port}");
         wait_for_ready(&mut child, &base_url, &logs).await;
         self.child = child;

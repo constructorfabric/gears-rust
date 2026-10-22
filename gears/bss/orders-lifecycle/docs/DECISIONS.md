@@ -1528,12 +1528,12 @@ stay open; neither this decision nor Pricing's existence proves Orders implement
 
 **Verified precedent**: Pricing upstream `main` at
 `8aca4d6df17c90f8ecb8b0195e4db4ec40921937` (checked 2026-09-21).
-[`Pricing Governance`](../../pricing/docs/design/05-governance.md#audit-trail-and-retention)
+`Pricing Governance`
 records D-14/D-135. The implemented
 [`audit writer`](../../pricing/pricing/src/infra/storage/repo/audit_repo.rs) receives the caller's
-transaction; the [migration](../../pricing/pricing/src/infra/storage/migrations/m20260821_000007_create_pricing_audit_log.rs)
+transaction; the migration `m20260821_000007_create_pricing_audit_log.rs`
 creates the segmented chain and UPDATE/DELETE rejection triggers;
-[`audit_read`](../../pricing/pricing/src/infra/audit_read.rs) provides authorized local retrieval.
+`audit_read` provides authorized local retrieval.
 These are architectural precedents, not public SDKs to import from Pricing internals.
 
 | Concern | Pricing precedent | Orders alignment or explicit difference |
@@ -1600,7 +1600,7 @@ frozen resource-tenant binding and no gaps. Refusals remain standalone hashes, n
 unknown-target refusals do not invent a tenant. Hash binding grants no access permissions.
 
 **Pricing alignment**: reuse the encoding discipline in
-[`Pricing domain/audit.rs`](../../pricing/pricing/src/domain/audit.rs), not its exact bytes or
+`Pricing domain/audit.rs`, not its exact bytes or
 private helper code. Orders has its own tag, columns and version and starts at 1 rather than
 Pricing's 0. There is no tenant-wide chain lock and no broker dependency in verification.
 

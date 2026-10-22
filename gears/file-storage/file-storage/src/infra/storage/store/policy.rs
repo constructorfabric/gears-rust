@@ -81,7 +81,50 @@ impl Store {
             .await
     }
 
-    /// Fetch a retention rule by `rule_id`.
+    /// List retention rules for a tenant, keyset-paginated in either direction.
+    ///
+    /// Fetches `limit + 1` rows to detect a further page (no `COUNT`); `finish_page` trims,
+    /// restores canonical order and builds both cursors. The cursor carries no binding
+    /// fingerprint (`f: None`) because the listing has no client filter.
+    pub(crate) async fn list_retention_rules_page(
+        &self,
+        scope: &AccessScope,
+        tenant_id: Uuid,
+        limit: u64,
+        cursor: Option<toolkit_odata::CursorV1>,
+    ) -> Result<toolkit_odata::Page<StoredRetentionRule>, DomainError> {
+        use crate::domain::pagination;
+
+        let after = cursor
+            .map(|cursor| pagination::seek(cursor, pagination::RETENTION_RULES_ID_FIELD, None))
+            .transpose()?;
+
+        let conn = self.db.conn().map_err(DomainError::from)?;
+        let rows = self
+            .repos
+            .retention_rules
+            .list_page(
+                &conn,
+                scope,
+                crate::infra::storage::repo::RetentionRuleListParams {
+                    tenant_id,
+                    limit: limit.saturating_add(1),
+                    after,
+                },
+            )
+            .await?;
+
+        Ok(pagination::finish_page(
+            rows,
+            limit,
+            after,
+            pagination::RETENTION_RULES_ID_FIELD,
+            None,
+            |r| (r.created_at, r.rule_id),
+        )?)
+    }
+
+    /// Fetch a single retention rule by `rule_id`.
     pub async fn get_retention_rule(
         &self,
         scope: &AccessScope,

@@ -2,8 +2,8 @@
 
 > **Companion documents:**
 > - [DESIGN.md](./DESIGN.md) — implementation design for this plugin
-> - [TESTING-STRATEGY.md](../../docs/TESTING-STRATEGY.md) — platform-wide cluster testing strategy (layers, tooling, CI cadence)
-> - [Scenario Catalog](../../docs/scenarios/README.md) — `SC-*` IDs referenced below
+> - [TESTING-STRATEGY.md](../../../docs/TESTING-STRATEGY.md) — platform-wide cluster testing strategy (layers, tooling, CI cadence)
+> - [Scenario Catalog](../../../docs/scenarios/README.md) — `SC-*` IDs referenced below
 
 <!-- toc -->
 
@@ -36,7 +36,7 @@
 > plugin. Scenario IDs cited below (`SC-*`) are drawn from `docs/scenarios/` as
 > of its current state.
 
-The Postgres plugin testing strategy follows the four-layer pyramid from the platform-wide [TESTING-STRATEGY.md](../../docs/TESTING-STRATEGY.md):
+The Postgres plugin testing strategy follows the four-layer pyramid from the platform-wide [TESTING-STRATEGY.md](../../../docs/TESTING-STRATEGY.md):
 
 ```
 L4  Fault injection (Toxiproxy, controlled disconnects)  — nightly
@@ -326,7 +326,7 @@ These tests run nightly. They require a Toxiproxy sidecar alongside the Postgres
 | Layer | Trigger | Approx. duration |
 |---|---|---|
 | L1 unit tests | Every PR | < 5 seconds |
-| L2 + L3 integration (testcontainers) | Every PR touching Rust — `make test-cluster-pg`, in `ci.yml`'s `integration` job | ~15–20 seconds |
+| L2 + L3 integration (testcontainers) | Every PR touching Rust — `make test-integration LANE=cluster-pg`, in `ci.yml`'s `integration` job | ~15–20 seconds |
 | L4 fault injection (Toxiproxy) | Nightly; manually triggered for pre-release | ~10–20 minutes |
 
 L3 tests are gated behind the `integration` feature flag so they do not run in workspaces that have not provisioned a Docker daemon:
@@ -336,7 +336,7 @@ L3 tests are gated behind the `integration` feature flag so they do not run in w
 integration = ["testcontainers", "testcontainers-modules"]
 ```
 
-Run locally with `make test-cluster-pg`, which is exactly what CI runs. Prefer it
+Run locally with `make test-integration LANE=cluster-pg`, which is exactly what CI runs. Prefer it
 over `cargo test -p cf-postgres-cluster-plugin --features integration`: nextest
 parallelizes across the test binaries, so the same 150 tests take ~15s rather
 than ~77s.

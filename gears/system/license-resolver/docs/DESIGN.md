@@ -68,7 +68,7 @@ Requirements from PRD that significantly influence architecture decisions.
 
 | Requirement                                           | Design Response                                                                                                                                                                                                                                                                                                                                                                                                               |
 |-------------------------------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `cpt-cf-license-resolver-fr-is-licensed-check`        | A single `is_licensed` method on the public `LicenseResolverClient` contract (`cpt-cf-license-resolver-component-sdk-contract`); the main-module gateway (`cpt-cf-license-resolver-component-main-gateway`) realizes it by delegating to the selected plugin.                                                                                                                                                                 |
+| `cpt-cf-license-resolver-fr-is-licensed-check`        | A single `is_licensed` method on the public `LicenseResolverApi` contract (`cpt-cf-license-resolver-component-sdk-contract`); the main-module gateway (`cpt-cf-license-resolver-component-main-gateway`) realizes it by delegating to the selected plugin.                                                                                                                                                                    |
 | `cpt-cf-license-resolver-fr-subject-identity`         | The Subject is an instance of a derived Subject contract type (§3.1): contract GTS type (required) + optional id + schematized `metadata`; carried into the check and propagated to the plugin.                                                                                                                                                                                                                                 |
 | `cpt-cf-license-resolver-fr-resource-identity`        | The Resource is an instance of a derived Resource contract type (§3.1): contract GTS type (required) + optional instance id + schematized `metadata`; without the id the check targets the whole type, with it a specific resource; principle `cpt-cf-license-resolver-principle-gts-typed-resource-identity`.                                                                                                                  |
 | `cpt-cf-license-resolver-fr-contract-registration`    | Licensing base types owned by this module, defined in its SDK contract crate (§3.1, §3.2); a module that wants license enforcement registers its derived Subject and Resource types in the types registry — its published licensing surface; this module MAY provide helpers for registering the well-known `SecurityContext` subjects (`user`, `tenant`); principle `cpt-cf-license-resolver-principle-validated-contracts`. |
@@ -102,10 +102,11 @@ Requirements from PRD that significantly influence architecture decisions.
 |  Consuming module (caller)                                |
 | builds LicenseCheckRequest(subject, resource, metadata, ctx)|
 +----------------------------+------------------------------+
-                             | LicenseResolverClient.is_licensed
+                             | LicenseResolverApi.is_licensed
+                             | (in process, or REST from another process)
                              v
 +-----------------------------------------------------------+
-|  SDK contract crate  (LicenseResolverClient,              |
+|  SDK contract crate  (LicenseResolverApi + REST,          |
 |    LicenseResolverPluginClient, DTOs, error enum, GTS)    |
 +----------------------------+------------------------------+
                              v
@@ -311,7 +312,7 @@ Both fields are forwarded to the backend plugin unchanged; it interprets them to
 ### 3.2 Component Model
 
 ```text
-            LicenseResolverClient.is_licensed
+            LicenseResolverApi.is_licensed
    caller ------------------------------------> [Main module: gateway/selector]
                                                    |  1. validates request vs registered
                                                    |     contracts (schemas + admitted
@@ -334,12 +335,12 @@ Both fields are forwarded to the backend plugin unchanged; it interprets them to
 
 - **Why**: Provides the stable, transport-agnostic contract shared by callers and plugins so neither depends on the
   other's internals.
-- **Responsibility scope**: Defines the public `LicenseResolverClient` trait and the `LicenseResolverPluginClient`
-  trait (both with the single `is_licensed` method), the licensing base types
+- **Responsibility scope**: Defines the public `LicenseResolverApi` contract with its REST projection and the
+  `LicenseResolverPluginClient` trait (both with the single `is_licensed` method), the licensing base types
   (`gts.cf.core.lic.subj.v1~` / `…res.v1~`, incl. the `admitted_subjects` trait schema), optionally helpers that other
   modules use to register the well-known `SecurityContext`-derived Subject types (`user`, `tenant`), the DTOs
-  (`Subject` / `Resource` contract objects, `LicenseCheckContext`, `LicenseDecision`), the `LicenseResolverError` enum,
-  and the GTS plugin spec used for discovery.
+  (`Subject` / `Resource` contract objects, `LicenseCheckContext`, `LicenseDecision`), the `LicenseResolverError` enum of
+  the plugin trait with its mapping to the canonical error, and the GTS plugin spec used for discovery.
 - **Responsibility boundaries**: Holds no logic, no state, and no plugin selection; defines no domain types (externally
   owned) and registers no derived contract types itself (those are registered by the modules that want license
   enforcement); exposes no listing/enumeration method.
@@ -352,13 +353,13 @@ Both fields are forwarded to the backend plugin unchanged; it interprets them to
 
 - **Why**: Realizes the public contract while keeping callers decoupled from any specific backend, centralizing plugin
   discovery, selection, delegation, and fail-closed error mapping.
-- **Responsibility scope**: Implements `LicenseResolverClient`; receives a `LicenseCheckRequest`, scopes by its
-  `context` (tenant), **validates the request against the registered contracts** — structural (contract schemas,
-  contract-type presence) and compatibility (`admitted_subjects` trait), with schemas resolved from the types registry
-  and cached — then discovers plugin instances via the plugin GTS spec, selects one by vendor + priority (memoizing the
-  selection), resolves the scoped plugin client via ClientHub, propagates the `LicenseCheckRequest` unchanged,
-  delegates the `is_licensed` check, and maps validation and plugin/registry failures to the canonical
-  `LicenseResolverError`.
+- **Responsibility scope**: Implements `LicenseResolverApi` and hosts its REST endpoint; receives a
+  `LicenseCheckRequest`, scopes by its `context` (tenant), **validates the request against the registered contracts** —
+  structural (contract schemas, contract-type presence) and compatibility (`admitted_subjects` trait), with schemas
+  resolved from the types registry and cached — then discovers plugin instances via the plugin GTS spec, selects one by
+  vendor + priority (memoizing the selection), resolves the scoped plugin client via ClientHub, propagates the
+  `LicenseCheckRequest` unchanged, delegates the `is_licensed` check, and maps validation and plugin/registry failures
+  to `LicenseResolverError` and from it to the canonical error.
 - **Responsibility boundaries**: Owns no grant store and makes no licensing decision itself — it validates shape and
   routes; it never interprets what contract properties *mean* and never decides licensability (`metadata` and identity
   fields are shape-validated, then passed through unchanged to the plugin, which owns the licensable-type catalog and
@@ -389,23 +390,32 @@ Both fields are forwarded to the backend plugin unchanged; it interprets them to
 
 ### 3.3 API Contracts
 
-The module exposes one public client trait and requires one plugin trait, described in prose only (no code).
+The module exposes one public contract and requires one plugin trait, described in prose only (no code).
 
 - **Public interface (PRD)**: `cpt-cf-license-resolver-interface-client`
 - **Plugin contract (PRD)**: `cpt-cf-license-resolver-contract-plugin`
-- **Technology**: Rust traits over the ToolKit ClientHub (in-process); transport-agnostic SDK models.
+- **Technology**: the public contract is a `#[toolkit::contract]`: in process through the ToolKit ClientHub, and over
+  REST through its projection. The plugin trait is in process only. SDK models are transport-agnostic.
 
-**Public client — `LicenseResolverClient`** (realizes PRD `cpt-cf-license-resolver-interface-client`): exposes the
+**Public client — `LicenseResolverApi`** (realizes PRD `cpt-cf-license-resolver-interface-client`): exposes the
 single method `is_licensed(request: LicenseCheckRequest) -> LicenseDecision`. `LicenseCheckRequest` bundles `subject`
 and `resource` — instances of registered derived licensing contract types, each carrying its contract GTS type
 (required), an optional id, and schematized `metadata` (shape-validated, semantically uninterpreted, forwarded to the
 plugin) — and `context` (a `LicenseCheckContext` carrying the tenant scope). The caller builds `context` from its
-`SecurityContext`, exactly as authz-resolver's `PolicyEnforcer` builds an `EvaluationRequest` — the resolver method
-itself takes no separate `SecurityContext`. There is no listing or enumeration method.
+`SecurityContext`, exactly as authz-resolver's `PolicyEnforcer` builds an `EvaluationRequest`. The method also takes a
+`PlatformSecurityContext`, as authz-resolver's `evaluate` does: it carries no identity and does not scope the check.
+There is no listing or enumeration method.
 
-**Plugin client — `LicenseResolverPluginClient`** (realizes PRD `cpt-cf-license-resolver-contract-plugin`): mirrors the
-public signature with the same single `is_licensed` method, discovered via the GTS types-registry plugin spec and
-resolved as a scoped client. It tracks the public contract's major version.
+**REST endpoint**: `POST /license-resolver/v1/is-licensed`, body `LicenseCheckRequest`, response `LicenseDecision`,
+errors as RFC-9457 `Problem`. The SDK generates the client and the server routes from the contract. The endpoint is
+internal: the calling service authenticates with its service credential, and the api-gateway does not expose the
+endpoint to external clients. The resolver trusts `context` from an authenticated service, as the in-process call
+does.
+
+**Plugin client — `LicenseResolverPluginClient`** (realizes PRD `cpt-cf-license-resolver-contract-plugin`): the same
+single `is_licensed` method over `LicenseCheckRequest` and `LicenseDecision`, returning `LicenseResolverError`, in
+process only, discovered via the GTS types-registry plugin spec and resolved as a scoped client. It tracks the public
+contract's major version.
 
 **Operation summary**:
 
@@ -413,11 +423,9 @@ resolved as a scoped client. It tracks the public contract's major version.
 |---------------|-----------------------------------------------------------------------------|-----------------------------------------------|-----------|
 | `is_licensed` | `LicenseCheckRequest` (subject + resource contract objects, tenant context) | `LicenseDecision` (granted + diagnostics map) | stable    |
 
-**Error model — `LicenseResolverError`**: the SDK returns this typed enum. It also provides a **default mapping** of
-each variant to a canonical RFC-9457 error (`Problem`) — the table below — but whether to apply that mapping is the
-**caller's** responsibility: a caller may surface the canonical `Problem` as-is, or match on the typed variant and
-handle it its own way. Canonical categories and their GTS error type ids come from the platform error catalog
-(`toolkit-canonical-errors`).
+**Error model — `LicenseResolverError`**: the plugin trait returns this typed enum, and the gateway maps its own
+failures to it. `LicenseResolverApi` returns the canonical error that the SDK mapping in the table below produces from
+it. Canonical categories and their GTS error type ids come from the platform error catalog (`toolkit-canonical-errors`).
 
 | Variant                      | Meaning                                                                                                                  | Default canonical error — GTS error type id                                            |
 |------------------------------|--------------------------------------------------------------------------------------------------------------------------|----------------------------------------------------------------------------------------|
@@ -446,7 +454,7 @@ read-only, there are no mutation / "not found" write errors.
 - No circular dependencies; the main module depends on `types-registry` but not on any plugin crate.
 - Always use SDK clients / scoped ClientHub for inter-module communication.
 - Plugins are consumed only through the main module's public contract.
-- The `LicenseCheckRequest` (including its tenant context) is propagated unchanged across all in-process calls.
+- The `LicenseCheckRequest` (including its tenant context) is propagated unchanged across all calls.
 
 ### 3.5 External Dependencies
 
@@ -490,7 +498,7 @@ sequenceDiagram
     else backend answers
         P -->> G: LicenseDecision(granted, diagnostics)
     end
-    G -->> C: LicenseDecision | LicenseResolverError
+    G -->> C: LicenseDecision | canonical error
 ```
 
 **Description**: The consuming module projects its domain objects into instances of the registered contract types and
@@ -509,8 +517,8 @@ data lives in the backend plugin.
 
 ### 3.8 Deployment Topology
 
-Not applicable because the resolver is read-only and stateless: it is an in-process library module with no dedicated
-infrastructure, datastore, or network topology of its own.
+Not applicable because the resolver is read-only and stateless: it runs inside the platform server process and has no
+dedicated infrastructure or datastore. Its REST endpoint is served by that process.
 
 ## 4. Additional context
 

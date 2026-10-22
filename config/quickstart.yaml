@@ -234,21 +234,63 @@ gears:
       # one. See the plugin README for a worked rule set.
       grants: []
 
-  # Requires --features admission-control.
+  # Requires --features admission-control (which links policy-engine too).
   # Admission gate for platform operations (gears/system/admission-control).
-  # `engine` is omitted on purpose: with no engine configured the gate refuses
-  # every operation with could-not-run. Add `engine: { vendor: "<vendor>" }`
-  # (optionally `instance_id: "<GTS instance id>"`) once an engine plugin is
-  # linked; a configured engine that cannot be resolved fails startup.
-  # Refusals are published best-effort to the event broker when one is linked
-  # (dropped otherwise). Timeouts are in milliseconds; unknown keys fail
-  # startup.
+  # policy-engine is the gate's default engine: `engine.vendor` must match
+  # policy-engine's own `engine_plugin.vendor` below, or the gate cannot
+  # resolve it and startup fails. Optionally pin one instance with
+  # `instance_id: "<GTS instance id>"`. Without `engine` the gate refuses
+  # every operation with could-not-run. Refusals are published best-effort to
+  # the event broker when one is linked (dropped otherwise). Timeouts are in
+  # milliseconds; unknown keys fail startup.
   admission-control:
     config:
+      engine:
+        vendor: "constructorfabric"
       engine_timeout_ms: 100
       max_properties: 256
       max_context_bytes: 65536
       event_queue_capacity: 1024
+
+  # Requires --features policy-engine (implied by admission-control).
+  # The gate's default engine (gears/system/policy-engine): evaluates
+  # built-in policies, then the tenant policy documents it stores, on the
+  # shared evaluation facility. Depends on types-registry, tenant-resolver and
+  # authz-resolver only, so it starts even without the gate. Every other
+  # setting keeps its documented default (timeouts, compile cache size,
+  # content limits) - see gears/system/policy-engine/policy-engine/src/config.rs.
+  # Unknown keys and invalid built-in policies fail startup.
+  policy-engine:
+    database:
+      server: "sqlite_users"
+      file: "policy_engine.db"
+    config:
+      engine_plugin:
+        # Must match the `engine.vendor` selected in the admission-control
+        # section above for the gate to resolve this instance.
+        vendor: "constructorfabric"
+        priority: 100
+      # Built-in policies apply to every request whatever the tenant, before
+      # tenant policy, in this order; the first denial refuses with
+      # BUILTIN_POLICY_DENIED. Each is validated like a tenant document: Rego
+      # defining the boolean rule `deny`, no denylisted builtins, and every
+      # concrete (non-wildcard) resource type known to types-registry.
+      builtin_policies:
+        # Refuses creating or renaming a resource whose `name` property
+        # starts with a reserved prefix.
+        - id: "reserved-name-prefix"
+          description: "Resource names starting with a reserved platform prefix cannot be created or renamed"
+          resource_types: ["gts.cf.core.*"]
+          actions: ["create", "rename"]
+          content: |
+            package builtin.reserved_name_prefix
+
+            reserved_prefixes := ["cf-", "system-"]
+
+            deny if {
+                some prefix in reserved_prefixes
+                startswith(input.properties.name, prefix)
+            }
 
   account-management:
     database:

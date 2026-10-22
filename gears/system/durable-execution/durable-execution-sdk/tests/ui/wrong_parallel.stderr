@@ -1,0 +1,15 @@
+error[E0277]: the trait bound `(cf_gears_durable_execution_sdk::workflow::Step<u32, u32>, cf_gears_durable_execution_sdk::workflow::Step<String, String>): workflow::sealed::Parallel<u32>` is not satisfied
+ --> tests/ui/wrong_parallel.rs:4:61
+  |
+4 |     let _ = WorkflowBuilder::<u32>::new("typed.invalid.v1").parallel((
+  |                                                             ^^^^^^^^ unsatisfied trait bound
+  |
+  = help: the trait `workflow::sealed::Parallel<u32>` is not implemented for `(cf_gears_durable_execution_sdk::workflow::Step<u32, u32>, cf_gears_durable_execution_sdk::workflow::Step<String, String>)`
+  = help: the following other types implement trait `workflow::sealed::Parallel<I>`:
+            (cf_gears_durable_execution_sdk::workflow::Step<I, A>, cf_gears_durable_execution_sdk::workflow::Step<I, B>)
+            (cf_gears_durable_execution_sdk::workflow::Step<I, A>, cf_gears_durable_execution_sdk::workflow::Step<I, B>, cf_gears_durable_execution_sdk::workflow::Step<I, C>)
+            (cf_gears_durable_execution_sdk::workflow::Step<I, A>, cf_gears_durable_execution_sdk::workflow::Step<I, B>, cf_gears_durable_execution_sdk::workflow::Step<I, C>, cf_gears_durable_execution_sdk::workflow::Step<I, D>)
+            (cf_gears_durable_execution_sdk::workflow::Step<I, A>, cf_gears_durable_execution_sdk::workflow::Step<I, B>, cf_gears_durable_execution_sdk::workflow::Step<I, C>, cf_gears_durable_execution_sdk::workflow::Step<I, D>, cf_gears_durable_execution_sdk::workflow::Step<I, E>)
+            (cf_gears_durable_execution_sdk::workflow::Step<I, A>, cf_gears_durable_execution_sdk::workflow::Step<I, B>, cf_gears_durable_execution_sdk::workflow::Step<I, C>, cf_gears_durable_execution_sdk::workflow::Step<I, D>, cf_gears_durable_execution_sdk::workflow::Step<I, E>, cf_gears_durable_execution_sdk::workflow::Step<I, F>)
+            (cf_gears_durable_execution_sdk::workflow::Step<I, A>, cf_gears_durable_execution_sdk::workflow::Step<I, B>, cf_gears_durable_execution_sdk::workflow::Step<I, C>, cf_gears_durable_execution_sdk::workflow::Step<I, D>, cf_gears_durable_execution_sdk::workflow::Step<I, E>, cf_gears_durable_execution_sdk::workflow::Step<I, F>, cf_gears_durable_execution_sdk::workflow::Step<I, G>)
+            (cf_gears_durable_execution_sdk::workflow::Step<I, A>, cf_gears_durable_execution_sdk::workflow::Step<I, B>, cf_gears_durable_execution_sdk::workflow::Step<I, C>, cf_gears_durable_execution_sdk::workflow::Step<I, D>, cf_gears_durable_execution_sdk::workflow::Step<I, E>, cf_gears_durable_execution_sdk::workflow::Step<I, F>, cf_gears_durable_execution_sdk::workflow::Step<I, G>, cf_gears_durable_execution_sdk::workflow::Step<I, H>)

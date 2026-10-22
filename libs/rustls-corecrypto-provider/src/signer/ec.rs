@@ -50,7 +50,7 @@
 
 use std::sync::Arc;
 
-use pkcs8::{ObjectIdentifier, PrivateKeyInfo};
+use pkcs8::{ObjectIdentifier, PrivateKeyInfoRef};
 use rustls::Error;
 use rustls::SignatureAlgorithm;
 use rustls::SignatureScheme;
@@ -235,7 +235,7 @@ impl Signer for EcSigner {
 // =========================================================================
 
 fn extract_x963_from_pkcs8(pkcs8_der: &[u8]) -> Result<(Zeroizing<Vec<u8>>, EcCurve), Error> {
-    let info = PrivateKeyInfo::try_from(pkcs8_der)
+    let info = PrivateKeyInfoRef::try_from(pkcs8_der)
         .map_err(|e| Error::General(format!("PKCS#8 parse failed: {e}")))?;
     if info.algorithm.oid != ID_EC_PUBLIC_KEY {
         return Err(Error::General(format!(
@@ -258,7 +258,7 @@ fn extract_x963_from_pkcs8(pkcs8_der: &[u8]) -> Result<(Zeroizing<Vec<u8>>, EcCu
     })?;
 
     // The privateKey OCTET STRING contains the SEC1 ECPrivateKey DER.
-    build_x963_from_sec1_with_curve(info.private_key, curve)
+    build_x963_from_sec1_with_curve(info.private_key.as_bytes(), curve)
 }
 
 fn extract_x963_from_sec1(sec1_der: &[u8]) -> Result<(Zeroizing<Vec<u8>>, EcCurve), Error> {

@@ -78,7 +78,7 @@ jobs:
         run: python3 tools/scripts/resolve_release.py
 
   image:
-    name: Image ${{ needs.resolve.outputs.component }} ${{ needs.resolve.outputs.version }}
+    name: Image (${{ inputs.component }} ${{ inputs.version }})
     needs: resolve
     if: needs.resolve.outputs.has_image == 'true'
     runs-on: ubuntu-latest
@@ -114,10 +114,10 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Install cosign
-        uses: sigstore/cosign-installer@1aa8e0f2454b781fbf0fbf306a4c9533a0c57409 # v3.7.0
+        uses: sigstore/cosign-installer@dc72c7d5c4d10cd6bcb8cf6e3fd625a9e5e537da # v3.7.0
 
       - name: Build and push
         id: build
@@ -145,7 +145,7 @@ jobs:
           echo "Signed \`$REF\`" >> "$GITHUB_STEP_SUMMARY"
 
   chart:
-    name: Chart ${{ needs.resolve.outputs.component }} ${{ needs.resolve.outputs.version }}
+    name: Chart (${{ inputs.component }} ${{ inputs.version }})
     needs: [resolve, image]
     # Image-bearing components publish the chart only after the image job
     # succeeds; the chart-only toolkit-platform has no image job (skipped), so
@@ -170,18 +170,28 @@ jobs:
           ref: ${{ needs.resolve.outputs.ref }}
           persist-credentials: false
 
-      - name: Install Helm and yq
-        uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
-        with:
-          tool: helm,yq
+      - name: Install Helm
+        env:
+          HELM_VERSION: "3.18.4"
+          HELM_SHA256: "f8180838c23d7c7d797b208861fecb591d9ce1690d8704ed1e4cb8e2add966c1"
+        run: |
+          curl -fsSL -o /tmp/helm.tgz \
+            "https://get.helm.sh/helm-v${HELM_VERSION}-linux-amd64.tar.gz"
+          echo "${HELM_SHA256}  /tmp/helm.tgz" | sha256sum -c -
+          sudo tar -xzf /tmp/helm.tgz -C /usr/local/bin --strip-components=1 linux-amd64/helm
+          helm version
 
       - name: Install cosign
-        uses: sigstore/cosign-installer@1aa8e0f2454b781fbf0fbf306a4c9533a0c57409 # v3.7.0
+        uses: sigstore/cosign-installer@dc72c7d5c4d10cd6bcb8cf6e3fd625a9e5e537da # v3.7.0
 
       - name: Log in to GHCR
         env:
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: echo "$GHCR_TOKEN" | helm registry login ghcr.io --username "${{ github.actor }}" --password-stdin
+        run: |
+          # helm login for `helm push`; cosign login (writes ~/.docker/config.json)
+          # so `cosign sign` can push the signature artifact to the same repo.
+          echo "$GHCR_TOKEN" | helm registry login ghcr.io --username "${{ github.actor }}" --password-stdin
+          echo "$GHCR_TOKEN" | cosign login ghcr.io --username "${{ github.actor }}" --password-stdin
 
       - name: Resolve chart dependencies
         run: bash tools/scripts/update-helm-deps.sh

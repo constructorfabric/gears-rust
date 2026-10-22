@@ -5,8 +5,9 @@ use std::time::Duration;
 
 use admission_control_sdk::{
     AdmissionEnginePluginClientV1, AdmissionRequest, EngineFailure, EngineRequest, EngineResult,
-    FailureCondition, PROPERTY_MAX_DEPTH, PolicyReference, RefusalCause, RefusalEvent,
-    RefusalEventCause, SizeBound, Verdict,
+    FailureCondition, MAX_DOCUMENT_NAME_LEN, MAX_ENGINE_FINDINGS, MAX_REASON_CODE_LEN,
+    PROPERTY_MAX_DEPTH, PolicyReference, RefusalCause, RefusalEvent, RefusalEventCause, SizeBound,
+    Verdict,
 };
 use async_trait::async_trait;
 use parking_lot::Mutex;
@@ -16,7 +17,7 @@ use uuid::Uuid;
 
 use super::{
     AdmissionService, EngineHandle, EngineSource, EngineUnavailable, EventEnvelope, EventSink,
-    MAX_DOCUMENT_NAME_LEN, MAX_ENGINE_FINDINGS, MAX_REASON_CODE_LEN, ServiceSettings,
+    ServiceSettings,
 };
 use crate::infra::metrics::AdmissionControlMetrics;
 

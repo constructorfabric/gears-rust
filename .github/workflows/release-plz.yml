@@ -217,7 +217,7 @@ jobs:
         run: python3 tools/scripts/resolve_release.py plan
 
   publish:
-    name: Publish
+    name: Publish (${{ matrix.entry.component }} ${{ matrix.entry.version }})
     needs: plan-publish
     if: needs.plan-publish.outputs.any == 'true'
     permissions:

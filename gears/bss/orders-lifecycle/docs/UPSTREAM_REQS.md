@@ -545,8 +545,8 @@ tolerance, C4 no reconstruction, C5 durably pending work on an unavailable or de
 with their declared per-event applicability rule. **Passing the corpus is the integration
 sign-off gate** for each of the three; no consumer integration is accepted on a reading of the
 contract alone. Precedent: Pricing gates publish-contract sign-off on the joint proration golden
-fixture ([`../../pricing/docs/design/06-consumer-contracts.md`](../../pricing/docs/design/06-consumer-contracts.md)
-K5), held in [`gears/bss/fixtures`](../../fixtures/README.md). The corpus is specified in this gear
+fixture (`../../pricing/docs/design/06-consumer-contracts.md`
+K5), held in `gears/bss/fixtures`. The corpus is specified in this gear
 and built with the first consumer integration (Workflow); Orders states the cases, each consumer
 owns its evaluator. The platform supplies no consumer-side processed-event store: the Event Broker
 consumer contract places de-duplication on the consumer

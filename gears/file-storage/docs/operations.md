@@ -30,7 +30,8 @@ A genuinely zero-config deployment is dev/test-only (set `require_signing_key_se
 `FileStorageConfig::validate()` (called at gear init, before anything is wired up) rejects invalid configurations —
 missing-secret/zero-value guards (`default_url_ttl_secs`, `multipart_session_ttl_secs`,
 `multipart_complete_lease_secs`, `migrate_timeout_secs` or `migrate_lease_margin_secs` equal to `0`, instead of
-silently using one second; `signing_key_seed` absent while required; `finalize_internal_secret` absent or empty);
+silently using one second; `default_page_size` or `max_page_size` equal to `0`; `signing_key_seed` absent while
+required; `finalize_internal_secret` absent or empty);
 absolute ceilings (`finalize_token_grace_secs` above `MAX_FINALIZE_TOKEN_GRACE_SECS`, 7 days; `max_page_size` above
 `MAX_PAGE_SIZE_CEILING`, 200; `max_url_ttl_secs` above `MAX_URL_TTL_CEILING`, 30 days; `multipart_session_ttl_secs`
 above `MAX_MULTIPART_SESSION_TTL_SECS`, 30 days; `multipart_complete_lease_secs` above
@@ -186,11 +187,12 @@ respectively, matching the platform-wide cursor-pagination convention (`guidelin
 have a proven need for larger pages and the DB/latency budget supports it. **Misconfiguration risk**: a very large
 `max_page_size` lets a caller force an expensive, unbounded-feeling listing query; a `default_page_size` larger than
 `max_page_size` would be self-contradictory — `FileStorageConfig::validate()` rejects this combination at startup.
+A `0` in either field is rejected at startup too: it would make every listing return an empty page with no cursor.
 `max_page_size` also has its own absolute ceiling, `MAX_PAGE_SIZE_CEILING` (`200`, the same value as the shipped
 default): `validate()` rejects any configured `max_page_size` above it, independent of the `default_page_size`
 check, since it is otherwise the only bound on a single listing request's row count and response size. A caller-supplied
-`limit` above `max_page_size` is not rejected — it is silently clamped down to `max_page_size` (`limit.min(max)`); only
-`limit == 0` is a `400`.
+`limit` (or its synonym `$top`) above `max_page_size` is not rejected — it is silently clamped down to `max_page_size`
+(`limit.min(max)`); only `limit == 0` / `$top=0` is a `400`.
 
 ### `storage_root`
 Local filesystem root for the default `local-fs` backend (default `./.file-storage-data`, i.e. **relative to the

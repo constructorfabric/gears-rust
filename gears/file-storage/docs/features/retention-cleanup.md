@@ -115,8 +115,8 @@ documented as a process in §3 instead.
 
 **Success Scenarios**:
 - A caller holding `ADMIN_POLICY` receives every retention rule (any scope) belonging to their tenant,
-  one cursor-paginated page at a time, navigable in either direction (`limit`/`cursor`, default 25, max 200;
-  canonical order `created_at desc, rule_id desc`)
+  one cursor-paginated page at a time, navigable in either direction (`limit`/`cursor`, aliases
+  `$top`/`$skiptoken`, default 25, max 200; canonical order `created_at desc, rule_id desc`)
 - A non-admin caller receives only the rules they may see: all `Tenant`-scope rules, `User`-scope
   rules that target themselves, and `File`-scope rules whose target file they own (owner compared
   as the `(owner_kind, owner_id)` pair, not `owner_id` alone — `user` and `app` are disjoint owner
@@ -134,7 +134,8 @@ documented as a process in §3 instead.
 
 **Error Scenarios**:
 - Caller lacks `READ` — `403`
-- Malformed/mismatched `cursor`, an unsupported query parameter (e.g. the old `offset`), or `limit=0` — `400`
+- Malformed/mismatched `cursor`, an unsupported query parameter (e.g. the old `offset`, `$skip`, `$filter`,
+  `$orderby`, `$select`), both spellings of one parameter in the same request, or `limit=0` — `400`
 
 **Steps**:
 1. [x] - `p1` - Client: GET /api/file-storage/v1/retention-rules?limit=&cursor= - `inst-retention-list-request`
@@ -604,5 +605,6 @@ from the guard.
   today because the rule set is small relative to the number of files, but it is an unbounded read that would need
   its own pagination if the number of tenants/rules grows large enough to matter; deferred until that is observed
   in practice. The REST-facing `GET /retention-rules` listing is cursor-paginated in either direction
-  (`limit`/`cursor`, canonical order `created_at desc, rule_id desc`, non-admin visibility filter
-  applied in SQL) — this remaining limitation is scoped to the sweep's own data-plane read, not the public API.
+  (`limit`/`cursor`, aliases `$top`/`$skiptoken`, canonical order `created_at desc, rule_id desc`, non-admin
+  visibility filter applied in SQL) — this remaining limitation is scoped to the sweep's own data-plane read, not
+  the public API.

@@ -13,16 +13,21 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 use toolkit::api::canonical_prelude::*;
+// Aliased so the listing handlers can bind the canonical `Query` extractor (a malformed query
+// string gives a canonical `400`) without shadowing `axum::extract::Query`.
+use toolkit::api::rest::extract::Query as CanonicalQuery;
+use toolkit_odata::ODataQuery;
+use toolkit_odata::errors::OdataError;
 use toolkit_security::SecurityContext;
 
 use file_storage_sdk::{CustomMetadataPatch, NewFile, OwnerFilter, OwnerKind};
 
 use super::dto::{
     BindReq, CreateFileReq, CreateRetentionRuleReq, DownloadTicketDto, EffectivePolicyDto, FileDto,
-    FileDtoList, InitiateMultipartReq, MigrateBackendReq, MissingPartDto, MultipartCompleteDto,
+    InitiateMultipartReq, MigrateBackendReq, MissingPartDto, MultipartCompleteDto,
     MultipartPartPlanDto, MultipartPlanDto, MultipartStatusDto, PolicyDto, ReceivedPartDto,
-    RetentionRuleDto, RetentionRuleDtoList, SetPolicyReq, StorageDto, StorageDtoList,
-    TransferOwnershipReq, UpdateMetadataReq, UploadTicketDto, VersionDto, VersionDtoList,
+    RetentionRuleDto, SetPolicyReq, StorageDto, TransferOwnershipReq, UpdateMetadataReq,
+    UploadTicketDto, VersionDto,
 };
 use crate::domain::error::DomainError;
 use crate::domain::etag;
@@ -38,26 +43,95 @@ type MultiSvc = Extension<Arc<MultipartService>>;
 type PolicySvc = Extension<Arc<PolicyService>>;
 type Ctx = Extension<SecurityContext>;
 
-/// Query params for `GET /files`.
+/// The owner pair of `GET /files`; other keys are policed by `reject_unknown_plain_keys` (plain
+/// keys) and the `OData` extractor (`$` keys), so unknown fields are not denied here.
 #[derive(Debug, Deserialize)]
-pub struct ListQuery {
+pub struct OwnerQuery {
     pub owner_kind: String,
     pub owner_id: Uuid,
-    pub limit: Option<u64>,
-    pub offset: Option<u64>,
+}
+
+/// Reason code of every rejected listing query option.
+const UNSUPPORTED_QUERY_PARAM: &str = "UNSUPPORTED_QUERY_PARAM";
+
+/// Plain (non-`$`) query keys `GET /files` accepts.
+const FILES_QUERY_KEYS: &[&str] = &["owner_kind", "owner_id", "limit", "cursor"];
+/// Plain query keys of the other listings.
+const LISTING_QUERY_KEYS: &[&str] = &["limit", "cursor"];
+
+/// Reject every plain key a listing does not take, so a misspelt or stale parameter (e.g.
+/// `offset`) is a `400` instead of being silently ignored. `$` keys are the `OData` extractor's
+/// business and are skipped here.
+///
+/// Every offending key is reported in one response, once, in wire order.
+fn reject_unknown_plain_keys(
+    pairs: &[(String, String)],
+    accepted: &[&str],
+) -> Result<(), CanonicalError> {
+    let mut offending: Vec<&str> = Vec::new();
+    for key in pairs.iter().map(|(key, _)| key.as_str()) {
+        if !key.starts_with('$') && !accepted.contains(&key) && !offending.contains(&key) {
+            offending.push(key);
+        }
+    }
+
+    let mut offenders = offending.into_iter();
+    let Some(first) = offenders.next() else {
+        return Ok(());
+    };
+
+    let detail = |key: &str| {
+        format!(
+            "`{key}` is not a parameter of this listing; it takes {} (`$top` and `$skiptoken` \
+             are synonyms of `limit` and `cursor`)",
+            accepted.join(", ")
+        )
+    };
+    let mut violations = OdataError::invalid_argument().with_field_violation(
+        first,
+        detail(first),
+        UNSUPPORTED_QUERY_PARAM,
+    );
+    for key in offenders {
+        violations = violations.with_field_violation(key, detail(key), UNSUPPORTED_QUERY_PARAM);
+    }
+    Err(violations.create())
+}
+
+/// Reject the `OData` options the extractor binds but no listing here supports: the order is
+/// fixed, nothing is filterable and items have no field projection.
+fn reject_unsupported_options(query: &ODataQuery) -> Result<(), CanonicalError> {
+    let mut unsupported: Vec<(&str, &str)> = Vec::new();
+    if query.has_filter() {
+        unsupported.push(("$filter", "filtering is not supported by this listing"));
+    }
+    if !query.order.is_empty() {
+        unsupported.push(("$orderby", "the order of this listing is fixed"));
+    }
+    if query.has_select() {
+        unsupported.push(("$select", "this listing has no field projection"));
+    }
+
+    let mut options = unsupported.into_iter();
+    let Some((first, first_detail)) = options.next() else {
+        return Ok(());
+    };
+
+    let mut violations = OdataError::invalid_argument().with_field_violation(
+        first,
+        first_detail,
+        UNSUPPORTED_QUERY_PARAM,
+    );
+    for (option, detail) in options {
+        violations = violations.with_field_violation(option, detail, UNSUPPORTED_QUERY_PARAM);
+    }
+    Err(violations.create())
 }
 
 /// Query params for `GET /files/{id}/download-url`.
 #[derive(Debug, Deserialize)]
 pub struct DownloadQuery {
     pub version_id: Option<Uuid>,
-}
-
-/// Query params for `GET /files/{id}/versions`.
-#[derive(Debug, Deserialize)]
-pub struct ListVersionsQuery {
-    pub limit: Option<u64>,
-    pub offset: Option<u64>,
 }
 
 fn header_str(headers: &HeaderMap, name: &str) -> Option<String> {
@@ -206,36 +280,37 @@ pub async fn get_file(
 pub async fn list_files(
     Extension(ctx): Ctx,
     Extension(svc): Svc,
-    Query(q): Query<ListQuery>,
-) -> ApiResult<JsonBody<FileDtoList>> {
-    let owner_kind = OwnerKind::parse(&q.owner_kind)
+    CanonicalQuery(pairs): CanonicalQuery<Vec<(String, String)>>,
+    CanonicalQuery(owner): CanonicalQuery<OwnerQuery>,
+    OData(query): OData,
+) -> ApiResult<JsonPage<FileDto>> {
+    reject_unknown_plain_keys(&pairs, FILES_QUERY_KEYS)?;
+    reject_unsupported_options(&query)?;
+    let owner_kind = OwnerKind::parse(&owner.owner_kind)
         .ok_or_else(|| DomainError::validation("owner_kind", "must be 'user' or 'app'"))?;
     let owner = OwnerFilter {
         owner_kind,
-        owner_id: q.owner_id,
+        owner_id: owner.owner_id,
     };
-    let files = svc
-        .list_files(&ctx, owner, q.limit, q.offset.unwrap_or(0))
+    let page = svc
+        .list_files(&ctx, owner, query.limit, query.cursor)
         .await?;
-    let items = files
-        .into_iter()
-        .map(|f| FileDto::from_parts(f, vec![]))
-        .collect();
-    Ok(Json(FileDtoList(items)))
+    Ok(Json(page.map_items(|f| FileDto::from_parts(f, vec![]))))
 }
 
 pub async fn list_versions(
     Extension(ctx): Ctx,
     Extension(svc): Svc,
     Path(file_id): Path<Uuid>,
-    Query(q): Query<ListVersionsQuery>,
-) -> ApiResult<JsonBody<VersionDtoList>> {
-    let versions = svc
-        .list_versions(&ctx, file_id, q.limit, q.offset.unwrap_or(0))
+    CanonicalQuery(pairs): CanonicalQuery<Vec<(String, String)>>,
+    OData(query): OData,
+) -> ApiResult<JsonPage<VersionDto>> {
+    reject_unknown_plain_keys(&pairs, LISTING_QUERY_KEYS)?;
+    reject_unsupported_options(&query)?;
+    let page = svc
+        .list_versions(&ctx, file_id, query.limit, query.cursor)
         .await?;
-    Ok(Json(VersionDtoList(
-        versions.into_iter().map(VersionDto::from).collect(),
-    )))
+    Ok(Json(page.map_items(VersionDto::from)))
 }
 
 pub async fn download_url(
@@ -294,13 +369,15 @@ pub async fn delete_version(
     Ok(no_content().into_response())
 }
 
-pub async fn list_storages(Extension(svc): Svc) -> ApiResult<JsonBody<StorageDtoList>> {
-    let items = svc
-        .list_backends()
-        .into_iter()
-        .map(|(id, caps)| StorageDto::new(id, caps))
-        .collect();
-    Ok(Json(StorageDtoList(items)))
+pub async fn list_storages(
+    Extension(svc): Svc,
+    CanonicalQuery(pairs): CanonicalQuery<Vec<(String, String)>>,
+    OData(query): OData,
+) -> ApiResult<JsonPage<StorageDto>> {
+    reject_unknown_plain_keys(&pairs, LISTING_QUERY_KEYS)?;
+    reject_unsupported_options(&query)?;
+    let page = svc.list_backends(query.limit, query.cursor)?;
+    Ok(Json(page.map_items(|(id, caps)| StorageDto::new(id, caps))))
 }
 
 pub async fn get_storage(
@@ -369,15 +446,19 @@ pub async fn get_effective_policy(
     Ok(Json(EffectivePolicyDto::from(ep)))
 }
 
-/// `GET /retention-rules` — list all retention rules for the caller's tenant.
+/// `GET /retention-rules` — list retention rules for the caller's tenant, cursor-paginated.
 pub async fn list_retention_rules(
     Extension(ctx): Ctx,
     Extension(svc): PolicySvc,
-) -> ApiResult<JsonBody<RetentionRuleDtoList>> {
-    let rules = svc.list_retention_rules(&ctx).await?;
-    Ok(Json(RetentionRuleDtoList(
-        rules.into_iter().map(RetentionRuleDto::from).collect(),
-    )))
+    CanonicalQuery(pairs): CanonicalQuery<Vec<(String, String)>>,
+    OData(query): OData,
+) -> ApiResult<JsonPage<RetentionRuleDto>> {
+    reject_unknown_plain_keys(&pairs, LISTING_QUERY_KEYS)?;
+    reject_unsupported_options(&query)?;
+    let page = svc
+        .list_retention_rules(&ctx, query.limit, query.cursor)
+        .await?;
+    Ok(Json(page.map_items(RetentionRuleDto::from)))
 }
 
 /// `POST /retention-rules` — create a new retention rule.

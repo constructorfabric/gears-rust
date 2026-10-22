@@ -6,7 +6,9 @@ use std::sync::Arc;
 use axum::Router;
 use http::StatusCode;
 use toolkit::api::OpenApiRegistry;
-use toolkit::api::operation_builder::{LicenseFeature, OperationBuilder};
+use toolkit::api::operation_builder::{
+    AuthState, HandlerSlot, LicenseFeature, LicenseState, OperationBuilder,
+};
 use toolkit_gts::gts_id;
 
 use super::dto;
@@ -28,6 +30,45 @@ impl AsRef<str> for License {
 }
 
 impl LicenseFeature for License {}
+
+/// Description of a cursor-paginated listing; `order` is its canonical order.
+fn listing_description(order: &str) -> String {
+    format!(
+        "Keyset pagination in either direction: `limit` (default 25, max 200) and the \
+         opaque `cursor` from the previous page's `page_info.next_cursor` or \
+         `page_info.prev_cursor`. The response carries `next_cursor` and `prev_cursor`. Canonical order is \
+         `{order}` -- see docs/api.md. `$top` and `$skiptoken` are synonyms of \
+         `limit` and `cursor`; `$filter`, `$orderby`, `$select` and every other `$` parameter are \
+         rejected with 400."
+    )
+}
+
+/// The page parameters every listing declares; the `OData` extractor also binds their
+/// `$top`/`$skiptoken` spellings.
+trait PageParams {
+    fn page_params(self) -> Self;
+}
+
+impl<H, R, S, A, L> PageParams for OperationBuilder<H, R, S, A, L>
+where
+    H: HandlerSlot<S>,
+    A: AuthState,
+    L: LicenseState,
+{
+    fn page_params(self) -> Self {
+        self.query_param_typed(
+            "limit",
+            false,
+            "Page size (default 25, max 200); alias `$top`",
+            "integer",
+        )
+        .query_param(
+            "cursor",
+            false,
+            "Opaque continuation token from the previous page; alias `$skiptoken`",
+        )
+    }
+}
 
 /// Register all file-storage control-plane routes and attach the services.
 #[allow(clippy::needless_pass_by_value, clippy::too_many_lines)]
@@ -160,13 +201,19 @@ pub(crate) fn register_routes(
         .operation_id("file_storage.list_versions")
         .authenticated()
         .require_license_features::<License>([])
-        .summary("List all versions of a file")
+        .summary("List a file's versions, newest first (cursor pagination)")
+        .description(listing_description("created_at desc, version_id desc"))
         .tag(API_TAG)
         .path_param("id", "File UUID")
-        .query_param_typed("limit", false, "Page size", "integer")
-        .query_param_typed("offset", false, "Offset", "integer")
+        .page_params()
         .handler(handlers::list_versions)
-        .json_response_with_schema::<dto::VersionDtoList>(openapi, StatusCode::OK, "Versions")
+        .json_response_with_schema::<toolkit_odata::Page<dto::VersionDto>>(
+            openapi,
+            StatusCode::OK,
+            "Versions",
+        )
+        // 400: bad cursor, unsupported query parameter or option, or `limit=0`.
+        .error_400(openapi)
         .error_401(openapi)
         .error_403(openapi)
         .error_404(openapi)
@@ -246,19 +293,24 @@ pub(crate) fn register_routes(
         .error_500(openapi)
         .register(router, openapi);
 
-    // GET /files — list (mandatory owner filter, offset pagination)
+    // GET /files — list (mandatory owner filter, cursor pagination)
     router = OperationBuilder::get(format!("{BASE}/files"))
         .operation_id("file_storage.list_files")
         .authenticated()
         .require_license_features::<License>([])
-        .summary("List files for an owner (owner_kind + owner_id required)")
+        .summary("List files for an owner (owner_kind + owner_id required, cursor pagination)")
+        .description(listing_description("created_at desc, file_id desc"))
         .tag(API_TAG)
         .query_param("owner_kind", true, "'user' or 'app'")
         .query_param("owner_id", true, "Owner UUID")
-        .query_param_typed("limit", false, "Page size", "integer")
-        .query_param_typed("offset", false, "Offset", "integer")
+        .page_params()
         .handler(handlers::list_files)
-        .json_response_with_schema::<dto::FileDtoList>(openapi, StatusCode::OK, "Files")
+        .json_response_with_schema::<toolkit_odata::Page<dto::FileDto>>(
+            openapi,
+            StatusCode::OK,
+            "Files",
+        )
+        // 400: bad cursor, unsupported query parameter or option, `limit=0`, or invalid `owner_kind`.
         .error_400(openapi)
         .error_401(openapi)
         .error_403(openapi)
@@ -269,10 +321,18 @@ pub(crate) fn register_routes(
         .operation_id("file_storage.list_storages")
         .authenticated()
         .require_license_features::<License>([])
-        .summary("List configured storage backends and capabilities")
+        .summary("List configured storage backends and capabilities (cursor pagination)")
+        .description(listing_description("id asc"))
         .tag(API_TAG)
+        .page_params()
         .handler(handlers::list_storages)
-        .json_response_with_schema::<dto::StorageDtoList>(openapi, StatusCode::OK, "Backends")
+        .json_response_with_schema::<toolkit_odata::Page<dto::StorageDto>>(
+            openapi,
+            StatusCode::OK,
+            "Backends",
+        )
+        // 400: bad cursor, unsupported query parameter or option, or `limit=0`.
+        .error_400(openapi)
         .error_401(openapi)
         .error_403(openapi)
         .error_500(openapi)
@@ -358,14 +418,18 @@ pub(crate) fn register_routes(
         .operation_id("file_storage.list_retention_rules")
         .authenticated()
         .require_license_features::<License>([])
-        .summary("List all retention rules for the caller's tenant")
+        .summary("List retention rules for the caller's tenant")
+        .description(listing_description("created_at desc, rule_id desc"))
         .tag(API_TAG)
+        .page_params()
         .handler(handlers::list_retention_rules)
-        .json_response_with_schema::<dto::RetentionRuleDtoList>(
+        .json_response_with_schema::<toolkit_odata::Page<dto::RetentionRuleDto>>(
             openapi,
             StatusCode::OK,
             "Retention rules",
         )
+        // 400: bad cursor, unsupported query parameter or option, or `limit=0`.
+        .error_400(openapi)
         .error_401(openapi)
         .error_403(openapi)
         .error_500(openapi)
@@ -558,3 +622,7 @@ pub(crate) fn register_routes(
         .layer(axum::Extension(multipart_service))
         .layer(axum::Extension(service))
 }
+
+#[cfg(test)]
+#[path = "routes_tests.rs"]
+mod routes_tests;

@@ -219,15 +219,23 @@ fn source_name(source: settings_service_sdk::EffectiveSource) -> String {
     .to_owned()
 }
 
-/// An override flagged for review, as the needs-review listing reports it.
+/// One flagged override row, as `GET /settings-service/v1/settings/review`
+/// lists it: the row at the scope that holds it, where it must be fixed — not
+/// a resolved value.
 #[derive(Debug, Clone, PartialEq)]
 #[toolkit_macros::api_dto(response)]
-pub struct FlaggedOverrideDto {
+pub struct ReviewItemDto {
     /// The setting key.
     pub key: String,
+    /// The declaration's display name; omitted when it has none, never derived
+    /// from the key.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    /// `standard` or `advanced`, from the declaration.
+    pub mode: String,
     /// The tenant whose override is flagged.
     pub tenant_id: Uuid,
-    /// Its scope path.
+    /// Its scope path: `/` or `/tenants/{id}`.
     pub scope: String,
     /// The stored value, masked by classification.
     pub value: Value,
@@ -246,21 +254,34 @@ pub struct FlaggedOverrideDto {
     pub etag: String,
 }
 
-/// Render a flagged row for the listing.
+impl ReviewItemDto {
+    /// The same row, tagged with its declaration's display name, if any.
+    #[must_use]
+    pub fn with_display_name(mut self, display_name: Option<&str>) -> Self {
+        self.display_name = display_name.map(str::to_owned);
+        self
+    }
+}
+
+/// Render a flagged row for the review listing, under the declaration's
+/// `mode`. Its display name is the caller's to add, as on a browse entry.
 #[must_use]
 pub fn render_flagged(
     key: &str,
+    mode: &str,
     row: &StoredValue,
     root: Uuid,
     may_read_pii: bool,
-) -> FlaggedOverrideDto {
+) -> ReviewItemDto {
     let stored = row
         .value
         .clone()
         .unwrap_or_else(|| Value::String(MASK_TOKEN.to_owned()));
     let (value, masked) = mask(&stored, &row.data_classification, may_read_pii);
-    FlaggedOverrideDto {
+    ReviewItemDto {
         key: key.to_owned(),
+        display_name: None,
+        mode: mode.to_owned(),
         tenant_id: row.tenant_id,
         scope: scope_path(row.tenant_id, root),
         value,
@@ -285,15 +306,11 @@ pub fn render_flagged(
 pub struct SettingItemDto {
     /// The setting key.
     pub key: String,
-    /// `resolved`, `needs_review`, `not_found`, `retired`, `unavailable` or
-    /// `error`.
+    /// `resolved`, `not_found`, `retired`, `unavailable` or `error`.
     pub outcome: String,
     /// The effective value, when `outcome` is `resolved`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub effective: Option<EffectiveValueDto>,
-    /// The flagged override, when `outcome` is `needs_review`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub flagged: Option<FlaggedOverrideDto>,
     /// What went wrong, for the failure outcomes.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
@@ -302,6 +319,10 @@ pub struct SettingItemDto {
     /// every page carries every setting and a client groups them itself.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mode: Option<String>,
+    /// The declaration's display name; omitted when it has none, never derived
+    /// from the key.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
 }
 
 impl SettingItemDto {
@@ -312,6 +333,13 @@ impl SettingItemDto {
         self
     }
 
+    /// The same entry, tagged with its declaration's display name, if any.
+    #[must_use]
+    pub fn with_display_name(mut self, display_name: Option<&str>) -> Self {
+        self.display_name = display_name.map(str::to_owned);
+        self
+    }
+
     /// A resolved entry.
     #[must_use]
     pub fn resolved(effective: EffectiveValueDto) -> Self {
@@ -319,22 +347,9 @@ impl SettingItemDto {
             key: effective.key.clone(),
             outcome: "resolved".to_owned(),
             effective: Some(effective),
-            flagged: None,
             detail: None,
             mode: None,
-        }
-    }
-
-    /// A flagged-override entry.
-    #[must_use]
-    pub fn flagged(flagged: FlaggedOverrideDto) -> Self {
-        Self {
-            key: flagged.key.clone(),
-            outcome: "needs_review".to_owned(),
-            effective: None,
-            flagged: Some(flagged),
-            detail: None,
-            mode: None,
+            display_name: None,
         }
     }
 
@@ -352,9 +367,9 @@ impl SettingItemDto {
             key: key.to_owned(),
             outcome: outcome.to_owned(),
             effective: None,
-            flagged: None,
             detail: Some(err.wire_message()),
             mode: None,
+            display_name: None,
         }
     }
 

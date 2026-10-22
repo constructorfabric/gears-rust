@@ -237,7 +237,7 @@ mod browse_entry {
     use time::OffsetDateTime;
     use uuid::Uuid;
 
-    use crate::api::rest::setting_dto::{SettingItemDto, render_flagged};
+    use crate::api::rest::setting_dto::{ReviewItemDto, SettingItemDto, render_flagged};
     use crate::domain::error::DomainError;
     use crate::domain::resolution::MASK_TOKEN;
     use crate::domain::value::StoredValue;
@@ -298,7 +298,6 @@ mod browse_entry {
             assert_eq!(item.outcome, expected);
             assert_eq!(item.key, "k");
             assert!(item.effective.is_none());
-            assert!(item.flagged.is_none());
             assert!(item.detail.is_some(), "the entry says why");
         }
     }
@@ -334,16 +333,85 @@ mod browse_entry {
         assert_eq!(tagged.outcome, "not_found", "the tag changes nothing else");
     }
 
+    /// The wire shapes' source, read at compile time.
+    const SOURCE: &str = include_str!("setting_dto.rs");
+
+    #[test]
+    fn a_setting_item_has_no_flagged_field_and_no_needs_review_outcome() {
+        // The flagged-row item is retired: a flagged own override is reported
+        // on the resolved item, through `needs_review` and its detail, and the
+        // rows themselves are the review listing's. The wire shape of an item
+        // carries neither the key nor the outcome that belonged to it.
+        let wire = serde_json::to_value(SettingItemDto::not_found("k")).expect("serializes");
+        assert!(wire.get("flagged").is_none(), "{wire}");
+        assert_ne!(wire["outcome"], json!("needs_review"), "{wire}");
+
+        // The type itself is the other half: nothing here can construct one.
+        for retired in [
+            "pub flagged:",
+            "pub fn flagged(",
+            "\"needs_review\".to_owned()",
+        ] {
+            assert!(
+                !SOURCE.contains(retired),
+                "`{retired}` belongs to the retired outcome"
+            );
+        }
+    }
+
+    #[test]
+    fn a_review_item_serializes_the_row_and_omits_a_display_name_it_has_not_got() {
+        let tenant = Uuid::from_u128(4);
+        let item = ReviewItemDto {
+            key: "k".to_owned(),
+            display_name: None,
+            mode: "standard".to_owned(),
+            tenant_id: tenant,
+            scope: format!("/tenants/{tenant}"),
+            value: json!("kept"),
+            masked: false,
+            needs_review_detail: Some("no longer a port".to_owned()),
+            last_change_at: "1970-01-01T00:03:20Z".to_owned(),
+            set_by: "tenant-admin".to_owned(),
+            etag: "200000000000".to_owned(),
+        };
+
+        let wire = serde_json::to_value(&item).expect("serializes");
+        assert_eq!(
+            wire,
+            json!({
+                "key": "k",
+                "mode": "standard",
+                "tenant_id": tenant.to_string(),
+                "scope": format!("/tenants/{tenant}"),
+                "value": "kept",
+                "masked": false,
+                "needs_review_detail": "no longer a port",
+                "last_change_at": "1970-01-01T00:03:20Z",
+                "set_by": "tenant-admin",
+                "etag": "200000000000",
+            }),
+            "exactly the row's fields, and no `display_name` while it is unset"
+        );
+
+        let labelled = ReviewItemDto {
+            display_name: Some("Minimum TLS version".to_owned()),
+            ..item
+        };
+        let wire = serde_json::to_value(&labelled).expect("serializes");
+        assert_eq!(wire["display_name"], json!("Minimum TLS version"), "{wire}");
+    }
+
     #[test]
     fn a_flagged_override_is_masked_and_keeps_why_it_was_flagged() {
         let tenant = Uuid::from_u128(4);
         let root = Uuid::from_u128(1);
 
-        let shown = render_flagged("k", &stored("public", tenant), root, true);
+        let shown = render_flagged("k", "standard", &stored("public", tenant), root, true);
         assert_eq!(shown.value, json!("kept"));
         assert!(!shown.masked);
         assert_eq!(
-            render_flagged("k", &stored("public", tenant), root, false).set_by,
+            render_flagged("k", "standard", &stored("public", tenant), root, false).set_by,
             MASK_TOKEN,
             "the setter is masked without the entitlement"
         );
@@ -359,7 +427,7 @@ mod browse_entry {
 
         // A flagged secret is still a secret: the review listing shows that
         // one exists and needs attention, never what it holds.
-        let secret = render_flagged("k", &stored("secret", tenant), root, true);
+        let secret = render_flagged("k", "standard", &stored("secret", tenant), root, true);
         assert_eq!(secret.value, json!(MASK_TOKEN));
         assert!(secret.masked);
         assert_eq!(
@@ -378,7 +446,7 @@ mod browse_entry {
         row.value = None;
         row.secret_ref = Some("settings/abc/def".to_owned());
 
-        let dto = render_flagged("k", &row, Uuid::from_u128(1), true);
+        let dto = render_flagged("k", "standard", &row, Uuid::from_u128(1), true);
         assert_eq!(dto.value, json!(MASK_TOKEN));
         assert!(dto.masked);
         let wire = serde_json::to_string(&dto).expect("serializes");

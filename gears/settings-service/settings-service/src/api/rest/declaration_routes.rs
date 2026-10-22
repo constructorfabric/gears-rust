@@ -96,10 +96,10 @@ pub fn register_routes(
         .query_param_typed("limit", false, "Page size", "integer")
         .query_param("cursor", false, "Cursor for pagination")
         .handler(handlers::list_declarations::<DeclarationRepo>)
-        .json_response_with_schema::<toolkit_odata::Page<DeclarationDto>>(
+        .json_response_with_schema::<crate::api::rest::page_dto::PageDto<DeclarationDto>>(
             openapi,
             StatusCode::OK,
-            "A page of declarations with its pagination cursors",
+            "A page of declarations with its pagination cursors and the total",
         )
         .with_odata_filter::<DeclarationFilterField>()
         .with_odata_orderby::<crate::domain::odata::DeclarationOrderField>()

@@ -3,7 +3,7 @@
 //!
 //! Two dialects, one shape. On `PostgreSQL` every predicate is `ILIKE` over
 //! exactly the expression a trigram GIN index is built on — `key`,
-//! `description`, `categories.name`, `(default_value #>> '{}')`,
+//! `display_name`, `description`, `categories.name`, `(default_value #>> '{}')`,
 //! `(value #>> '{}')` — with the classification predicate the split index
 //! pairs of DESIGN §4.7 carry, so each half of a pair serves its own corpus.
 //! On `SQLite` the same predicates are `LIKE` scans; the gear's single-node
@@ -18,9 +18,9 @@ use sea_orm::{
     ColumnTrait, Condition, DbBackend, EntityTrait, ExprTrait, QueryFilter, QueryOrder,
     QuerySelect, QueryTrait,
 };
-use toolkit_db::odata::{LimitCfg, paginate_odata};
+use toolkit_db::odata::LimitCfg;
 use toolkit_db::secure::{DBRunner, SecureEntityExt};
-use toolkit_odata::{Page, SortDir};
+use toolkit_odata::SortDir;
 use toolkit_security::AccessScope;
 use uuid::Uuid;
 
@@ -28,12 +28,14 @@ use crate::domain::category::Category;
 use crate::domain::category::visibility::DomainVisibility;
 use crate::domain::declaration::Declaration;
 use crate::domain::error::DomainError;
+use crate::domain::odata::Listing;
 use crate::domain::search::{Corpus, Needle, SearchRepository, SearchRequest};
 use crate::domain::value::StoredValue;
 use crate::infra::storage::declaration_odata_mapper::DeclarationODataMapper;
 use crate::infra::storage::entity::category::{self, Entity as CategoryEntity};
 use crate::infra::storage::entity::declaration::{self, Entity as DeclarationEntity};
 use crate::infra::storage::entity::setting_value::{self, Entity as ValueEntity};
+use crate::infra::storage::listing::list_counted;
 use crate::infra::storage::{category_repo, declaration_repo, value_repo};
 use settings_service_sdk::odata::DeclarationFilterField;
 
@@ -151,6 +153,9 @@ impl SearchRepo {
     /// pair, whose predicate this is.
     fn value_matches(self, corpus: Corpus, tenant_ids: &[Uuid], pattern: &str) -> Condition {
         Condition::all()
+            // A flagged override is not served — resolution falls through it —
+            // so what it holds is not a match.
+            .add(setting_value::Column::NeedsReview.eq(false))
             .add(setting_value::Column::SecretRef.is_null())
             .add(value_repo::subjectless())
             .add(
@@ -175,7 +180,7 @@ impl SearchRepository for SearchRepo {
         &self,
         conn: &C,
         request: &SearchRequest<'_>,
-    ) -> Result<Page<Declaration>, DomainError> {
+    ) -> Result<Listing<Declaration>, DomainError> {
         // @cpt-begin:cpt-cf-settings-service-flow-search-discoverability-search:p2:inst-sd-search-7
         let pattern = request.needle.like_pattern();
 
@@ -226,6 +231,7 @@ impl SearchRepository for SearchRepo {
 
         let matched = Condition::any()
             .add(self.contains("setting_declarations.key", &pattern))
+            .add(self.contains("setting_declarations.display_name", &pattern))
             .add(self.contains("setting_declarations.description", &pattern))
             .add(declaration::Column::CategoryId.in_subquery(categories.into_query()))
             .add(default_matches)
@@ -237,27 +243,27 @@ impl SearchRepository for SearchRepo {
         )
         .filter(declaration::Column::Status.eq("active"))
         .filter(matched);
-        // `needs_review eq true`, in the query: only settings with an override
-        // flagged for review at one of the bounded tenants. A page filtered
-        // afterwards would page the unfiltered set, which is the defect a
-        // filter in the query exists to avoid.
+        // `needs_review eq true`, in the query: only settings whose own
+        // override at the target is flagged for review — the same narrowing the
+        // browse applies. A page filtered afterwards would page the unfiltered
+        // set, which is the defect a filter in the query exists to avoid.
         if request.flagged_only {
-            let flagged = ValueEntity::find()
-                .select_only()
-                .column(setting_value::Column::DeclarationId)
-                .filter(setting_value::Column::NeedsReview.eq(true))
-                .filter(setting_value::Column::TenantId.is_in(request.tenant_ids.iter().copied()))
-                .filter(value_repo::subjectless());
-            base = base.filter(declaration::Column::Id.in_subquery(flagged.into_query()));
+            base = base.filter(
+                declaration::Column::Id
+                    .in_subquery(value_repo::flagged_declarations_at(request.target)),
+            );
         }
-        let base = base.secure().scope_with(request.scope);
 
         // Tiebreaker `key`, unique, so a page boundary neither repeats nor
         // skips a row. The query carries the page, the `$filter` remainder on
         // `key` and `category_id` — browse's grammar, on the declaration
-        // columns — and the binding the cursor must match.
-        let page = paginate_odata::<DeclarationFilterField, DeclarationODataMapper, _, _, _, _>(
+        // columns — and the binding the cursor must match. The total beside
+        // the page counts the settings that match in all, under the same
+        // corpus and the same exclusions, so it discloses nothing a page of
+        // hits does not.
+        let page = list_counted::<DeclarationFilterField, DeclarationODataMapper, _, _, _, _>(
             base,
+            request.scope,
             conn,
             request.query,
             ("key", SortDir::Asc),
@@ -271,13 +277,14 @@ impl SearchRepository for SearchRepo {
             message: err.to_string(),
         })?;
 
-        Ok(Page {
+        Ok(Listing {
             items: page
                 .items
                 .into_iter()
                 .map(declaration_repo::to_domain)
                 .collect(),
             page_info: page.page_info,
+            total_count: page.total_count,
         })
         // @cpt-end:cpt-cf-settings-service-flow-search-discoverability-search:p2:inst-sd-search-7
     }

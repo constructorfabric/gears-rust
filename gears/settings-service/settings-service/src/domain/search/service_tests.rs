@@ -7,7 +7,7 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use serde_json::{Value, json};
 use toolkit_db::secure::DBRunner;
-use toolkit_odata::{ODataQuery, Page, PageInfo};
+use toolkit_odata::{ODataQuery, PageInfo};
 use toolkit_security::AccessScope;
 use uuid::Uuid;
 
@@ -16,6 +16,7 @@ use crate::domain::category::Category;
 use crate::domain::category::visibility::DomainVisibility;
 use crate::domain::declaration::Declaration;
 use crate::domain::error::DomainError;
+use crate::domain::odata::Listing;
 use crate::domain::search::{Corpus, MatchedField, Needle, SearchRepository, SearchRequest};
 use crate::domain::value::StoredValue;
 
@@ -41,6 +42,7 @@ fn declaration(
         domain_affinity: None,
         licence_feature: None,
         owner_module: None,
+        display_name: None,
         description: description.map(str::to_owned),
         default_value: default,
         has_secret_trait: classification == "secret",
@@ -99,14 +101,15 @@ impl SearchRepository for Staged {
         &self,
         _conn: &C,
         _request: &SearchRequest<'_>,
-    ) -> Result<Page<Declaration>, DomainError> {
-        Ok(Page {
+    ) -> Result<Listing<Declaration>, DomainError> {
+        Ok(Listing {
             items: self.declarations.clone(),
             page_info: PageInfo {
                 next_cursor: None,
                 prev_cursor: None,
                 limit: 25,
             },
+            total_count: self.declarations.len() as u64,
         })
     }
 
@@ -150,6 +153,7 @@ async fn run(service: &SearchService<Staged>, raw: &str, corpus: Corpus) -> Vec<
                 visibility: &DomainVisibility::Unrestricted,
                 needle: &needle,
                 corpus,
+                target: harness.tree.root,
                 tenant_ids: &[harness.tree.root],
                 hidden_for: &[],
                 override_limit: 1_000,
@@ -373,6 +377,7 @@ async fn a_page_whose_matching_overrides_exceed_the_bound_is_refused_not_cut() {
         visibility: &DomainVisibility::Unrestricted,
         needle: &needle,
         corpus: Corpus::Public,
+        target: harness.tree.root,
         tenant_ids: &tenants,
         hidden_for: &[],
         override_limit,
@@ -400,4 +405,86 @@ async fn a_page_whose_matching_overrides_exceed_the_bound_is_refused_not_cut() {
         .await
         .expect("within the bound");
     assert_eq!(page.hits.len(), 3);
+}
+
+/// A declaration carrying a display name, otherwise as `declaration` builds it.
+fn labelled(name: &str, display_name: &str, description: Option<&str>) -> Declaration {
+    Declaration {
+        display_name: Some(display_name.to_owned()),
+        ..declaration(name, description, json!("direct"), "public")
+    }
+}
+
+#[test]
+fn a_needle_found_only_in_the_display_name_is_attributed_to_it() {
+    // The label is the text a console shows, so it is what a person types into
+    // the search box; a hit on it has to say so rather than fall through to a
+    // field that did not match.
+    let needle = Needle::parse("tls").expect("a needle");
+    let d = labelled("relay", "Minimum TLS version", None);
+    assert_eq!(
+        declaration_match(&d, Some(&category("Network")), &needle, Corpus::Public),
+        Some(MatchedField::DisplayName)
+    );
+}
+
+#[test]
+fn the_display_name_outranks_the_description_but_not_the_key() {
+    // Attribution follows the told order: key, display name, description.
+    let needle = Needle::parse("proxy").expect("a needle");
+    let cat = category("Network");
+    let both_label_and_description = labelled("relay", "Proxy host", Some("Use a proxy"));
+    assert_eq!(
+        declaration_match(
+            &both_label_and_description,
+            Some(&cat),
+            &needle,
+            Corpus::Public
+        ),
+        Some(MatchedField::DisplayName),
+        "the display name outranks the description that also matched"
+    );
+    let both_key_and_label = labelled("proxy_host", "Proxy host", None);
+    assert_eq!(
+        declaration_match(&both_key_and_label, Some(&cat), &needle, Corpus::Public),
+        Some(MatchedField::Key),
+        "the key outranks the display name that also matched"
+    );
+}
+
+#[test]
+fn a_declaration_without_a_display_name_never_matches_on_one() {
+    // An absent label is absent, not an empty or derived one: a needle that
+    // only the slug-derived label would contain must not attribute to it.
+    let needle = Needle::parse("host").expect("a needle");
+    let d = declaration("relay", None, json!("direct"), "public");
+    assert_eq!(
+        declaration_match(&d, Some(&category("Network")), &needle, Corpus::Public),
+        None
+    );
+}
+
+#[test]
+fn the_display_name_field_is_spelt_display_name_and_sits_between_key_and_description() {
+    // The wire vocabulary is closed and its order is the attribution order; a
+    // variant inserted in the wrong place would silently reorder both.
+    assert_eq!(MatchedField::DisplayName.as_str(), "display_name");
+    assert!(MatchedField::Key < MatchedField::DisplayName);
+    assert!(MatchedField::DisplayName < MatchedField::Description);
+}
+
+#[tokio::test]
+async fn a_display_name_hit_is_a_declaration_level_hit_with_no_row() {
+    let d = labelled("relay", "Minimum TLS version", None);
+    let service = SearchService::new(Staged {
+        declarations: vec![d],
+        categories: vec![category("Network")],
+        ..Staged::default()
+    });
+    let hits = run(&service, "tls", Corpus::Public).await;
+    assert_eq!(
+        hits,
+        vec![("relay".to_owned(), MatchedField::DisplayName, None)],
+        "the label belongs to the declaration, so the hit carries no scope"
+    );
 }

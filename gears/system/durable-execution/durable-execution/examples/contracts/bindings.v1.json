@@ -1,0 +1,47 @@
+{
+  "saga": false,
+  "name": "notifications.invoice-email.v1",
+  "activities": [
+    {
+      "compensation": null,
+      "fanout": null,
+      "id": "send_invoice",
+      "timeout": {
+        "secs": 60,
+        "nanos": 0
+      },
+      "retry": {
+        "max_attempts": 10,
+        "initial_delay": {
+          "secs": 15,
+          "nanos": 0
+        },
+        "max_delay": {
+          "secs": 300,
+          "nanos": 0
+        }
+      }
+    }
+  ],
+  "stages": [
+    {
+      "kind": "sequential",
+      "step": "send_invoice"
+    }
+  ],
+  "flow": {
+    "version": 1,
+    "inputs": {
+      "send_invoice": {
+        "source": "run_input"
+      }
+    },
+    "dependencies": {
+      "send_invoice": []
+    },
+    "output": {
+      "source": "checkpoint",
+      "value": "send_invoice"
+    }
+  }
+}

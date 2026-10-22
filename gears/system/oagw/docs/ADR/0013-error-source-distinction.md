@@ -289,7 +289,7 @@ Content-Type: application/problem+json
 
 ## Links
 
-- [Plain HTTP Example](../examples/1.http.positive.md)
+- [Plain HTTP Example](../../scenarios/protocols/http/examples/positive-example-01-http-request-response.md)
 - [Kong X-Kong-Upstream-Status header](https://developer.konghq.com/gateway/configuration/#headers)
 - [Apigee X-Apigee-fault-source header](https://docs.apigee.com/api-platform/troubleshoot/runtime/503-service-unavailable-backend-server)
 

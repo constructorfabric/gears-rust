@@ -984,7 +984,7 @@ freshness TTL of each artifact and indefinitely for one without.
 
 ## 14. Traceability
 
-- **Design**: [DESIGN.md](./DESIGN.md)
-- **ADRs**: [ADR/](./ADR/)
-- **Features**: [features/](./features/)
+- **Design**: `DESIGN.md`
+- **ADRs**: `ADR/`
+- **Features**: `features/`
 - **Upstream contract**: [license-resolver PRD](../../license-resolver/docs/PRD.md)

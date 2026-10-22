@@ -35,16 +35,6 @@ use toolkit_security::SecurityContext;
 use tracing::Instrument as _;
 use uuid::Uuid;
 
-/// Most denials plus shadow denials one engine result may carry: each becomes
-/// an event.
-pub const MAX_ENGINE_FINDINGS: usize = 64;
-
-/// Longest engine reason code, in bytes. It is returned to the calling gear.
-pub const MAX_REASON_CODE_LEN: usize = 128;
-
-/// Longest policy document name, in bytes. It is copied into events.
-pub const MAX_DOCUMENT_NAME_LEN: usize = 256;
-
 /// The broker-envelope fields every event of one operation is published
 /// under. They are not repeated in the event's payload.
 #[domain_model]
@@ -421,77 +411,42 @@ impl AdmissionService {
 }
 
 /// The judgment for an engine's answer. An answer this gate does not know,
-/// or one past the bounds, breaks the gate–engine contract and is
-/// could-not-run `internal`.
+/// or one past the contract bounds ([`EngineResult::bounds_violation`]),
+/// breaks the gate–engine contract and is could-not-run `internal`.
 fn accept_engine_result(engine: &EngineHandle, result: EngineResult) -> Judgment {
-    let (denial, shadow) = match result {
-        EngineResult::Permit { shadow_denials } => (None, shadow_denials),
+    if let Some(violation) = result.bounds_violation() {
+        // The offending value is not logged: it is engine output that failed
+        // the bounds meant to keep it out of records.
+        tracing::warn!(
+            engine_id = %engine.id,
+            violation = violation.as_str(),
+            "admission engine result out of bounds"
+        );
+        return Judgment::could_not_run(FailureCondition::Internal);
+    }
+    match result {
+        EngineResult::Permit { shadow_denials } => Judgment::Permit {
+            shadow: shadow_denials,
+        },
         EngineResult::Deny {
             reason_code,
             denials,
             shadow_denials,
-        } => (Some((reason_code, denials)), shadow_denials),
+        } => Judgment::Refuse {
+            cause: RefusalCause::Policy {
+                reason_code,
+                denials,
+            },
+            shadow: shadow_denials,
+        },
         _ => {
             tracing::warn!(
                 engine_id = %engine.id,
                 "admission engine answered with a result this gate does not know"
             );
-            return Judgment::could_not_run(FailureCondition::Internal);
+            Judgment::could_not_run(FailureCondition::Internal)
         }
-    };
-    let (reason_code, denials) = match &denial {
-        Some((reason_code, denials)) => (Some(reason_code.as_str()), &denials[..]),
-        None => (None, &[][..]),
-    };
-    if let Some(violation) = out_of_bounds(reason_code, denials, &shadow) {
-        // The offending value is not logged: it is engine output that failed
-        // the bounds meant to keep it out of records.
-        tracing::warn!(
-            engine_id = %engine.id,
-            violation,
-            "admission engine result out of bounds"
-        );
-        return Judgment::could_not_run(FailureCondition::Internal);
     }
-    match denial {
-        None => Judgment::Permit { shadow },
-        Some((reason_code, denials)) => Judgment::Refuse {
-            cause: RefusalCause::Policy {
-                reason_code,
-                denials,
-            },
-            shadow,
-        },
-    }
-}
-
-/// Which bound an engine result violates, if any: at most
-/// [`MAX_ENGINE_FINDINGS`] findings, a reason code of 1 to
-/// [`MAX_REASON_CODE_LEN`] printable ASCII bytes, and document names of 1 to
-/// [`MAX_DOCUMENT_NAME_LEN`] bytes without control characters.
-fn out_of_bounds(
-    reason_code: Option<&str>,
-    denials: &[PolicyReference],
-    shadow: &[PolicyReference],
-) -> Option<&'static str> {
-    if denials.len().saturating_add(shadow.len()) > MAX_ENGINE_FINDINGS {
-        return Some("too_many_findings");
-    }
-    if reason_code.is_some_and(|code| {
-        code.is_empty()
-            || code.len() > MAX_REASON_CODE_LEN
-            || !code.bytes().all(|b| b.is_ascii_graphic())
-    }) {
-        return Some("reason_code");
-    }
-    let bad_name = |reference: &PolicyReference| {
-        let name = &reference.document_name;
-        name.is_empty() || name.len() > MAX_DOCUMENT_NAME_LEN || name.chars().any(char::is_control)
-    };
-    if denials.iter().chain(shadow).any(bad_name) {
-        return Some("document_name");
-    }
-    None
 }
 
 /// Whether any value in `properties` is nested deeper than `max` (a property's

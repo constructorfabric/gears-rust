@@ -482,7 +482,7 @@ against a live PostgreSQL 19 beta 2 server by @vasylcf (probe branch
 - **PostgreSQL 19 is pre-GA.** The image-tag half of this blocker is resolved: every fixture
   now starts through [`libs/test-containers`](../../../../libs/test-containers/src/lib.rs),
   which pins `POSTGRES_GRAPH_TAG` for the SQL/PGQ lane and exposes `postgres_graph()` to start
-  it. Live coverage is `libs/toolkit-db/tests/pg/secure_graph.rs`, run by `make test-pgq` and
+  it. Live coverage is `libs/toolkit-db/tests/pg/secure_graph.rs`, run by `make test-integration LANE=toolkit-db-pgq` and
   by the CI `integration` job with `GEARS_TEST_PG_GRAPH_REQUIRED=1`, so an unavailable image
   fails that lane rather than letting the isolation suite pass vacuously; locally the default
   is still a skip while the tag is a pre-GA beta that Docker Hub may withdraw at GA.

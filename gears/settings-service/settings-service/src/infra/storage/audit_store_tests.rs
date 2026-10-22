@@ -38,7 +38,7 @@ async fn history(
     tenant: Uuid,
     limit: Option<u64>,
     cursor: Option<toolkit_odata::CursorV1>,
-) -> toolkit_odata::Page<crate::audit::StoredAuditRecord> {
+) -> crate::domain::odata::Listing<crate::audit::StoredAuditRecord> {
     let conn = db.conn().expect("connection");
     AuditStore
         .history(

@@ -163,6 +163,7 @@ Owns the `admit` sequence (§3.6): context check, identifier validation, size bo
 call under `engine_timeout_ms`, result mapping, event emission and verdict. An engine result past the gate's bounds
 (more than 64 denials plus shadow denials, a reason code that is not 1–128 printable ASCII bytes, a document name that is
 empty, over 256 bytes or holds a control character) breaks the gate–engine contract and is could-not-run `internal`.
+The bounds and their check are part of the SDK, so an engine can build results that stay within them.
 Registered in ClientHub through the local client.
 
 #### Engine Client
