@@ -21,12 +21,20 @@ workspace = true
 
 [dependencies]
 async-trait = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
+# `RecordV1::observed_at` (de)serialises as RFC 3339
+time = { workspace = true, features = ["serde-well-known"] }
 uuid = { workspace = true }
+
+# The connector record types, defined as Rust structs that generate their
+# GTS type schemas
+gts = { workspace = true }
+schemars = { workspace = true }
 
 toolkit = { workspace = true }
 toolkit-canonical-errors = { workspace = true }
-# Link-time registration of the connector record types
+# `#[gts_type_schema]`, which also registers the record types at link time
 toolkit-gts = { workspace = true }
 toolkit-macros = { workspace = true }
 toolkit-security = { workspace = true }

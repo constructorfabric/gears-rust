@@ -130,7 +130,7 @@ profile read.
 3. [ ] - `p1` - Each value is one entity of its category with one property, and the step's entity kind is the
    category's plain name. An add is a new entity, a remove removes the entity, and a replace is one step with a new
    entity in place of the old one, so the old value goes in the same write - `inst-build-replace`
-4. [ ] - `p1` - A text value is stored as it is; any other value as its JSON - `inst-build-values`
+4. [ ] - `p1` - A value is stored as JSON, as the node stores it: a text value as a JSON string, an object of fields as that object - `inst-build-values`
 5. [ ] - `p1` - The plan holds the tenant and the subject, the profile version it was built on, none for a subject
    without a profile yet, and its origin - `inst-build-origin`
 6. [ ] - `p1` - Each step carries the confidence the model gave it - `inst-build-confidence`

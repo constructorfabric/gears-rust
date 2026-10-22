@@ -8,14 +8,14 @@ use tokio::sync::Barrier;
 
 use crate::domain::error::DomainError;
 use crate::domain::plan::Origin;
-use crate::domain::plan::{PlanValue, ValueRef};
+use crate::domain::plan::{PlanValue, PropertyRef, ValueRef};
 use crate::domain::record_intake::{DropReason, DropStage, IntakeEvents};
 use crate::domain::sensitive_data::{
     Action, Checked, Found, SensitiveDataCheck, SensitiveDataChecks, SensitiveDataKind, Verdict,
 };
 use crate::test_support::{
-    FailingCheck, FixedCheck, RecordingEvents, SubstringCheck, add_entity, connector_plan,
-    remove_entity, replace_property, spans,
+    FailingCheck, FixedCheck, RecordingEvents, SubstringCheck, add_entity, add_value,
+    connector_plan, remove_entity, replace_property, spans,
 };
 
 fn checks(list: Vec<Arc<dyn SensitiveDataCheck>>) -> (SensitiveDataChecks, Arc<RecordingEvents>) {
@@ -25,7 +25,15 @@ fn checks(list: Vec<Arc<dyn SensitiveDataCheck>>) -> (SensitiveDataChecks, Arc<R
 }
 
 fn at(step: usize, property: usize) -> ValueRef {
-    ValueRef { step, property }
+    piece(step, property, 0)
+}
+
+fn piece(step: usize, property: usize, piece: usize) -> ValueRef {
+    ValueRef {
+        step,
+        property,
+        piece,
+    }
 }
 
 #[test]
@@ -184,8 +192,14 @@ async fn a_failed_check_drops_the_record_with_a_drop_event() {
     assert_eq!(events[0].tenant_id, plan.tenant_id);
     assert_eq!(events[0].subject_id, Some(plan.subject_id));
     assert_eq!(events[0].connector, "connector-a");
-    assert_eq!(events[0].provenance, "chat_engine/thread-42/msg-7");
-    assert_eq!(events[0].version, "v1");
+    assert_eq!(
+        events[0].record_key,
+        crate::domain::record_intake::RecordKey::of(crate::domain::record_intake::IdentityParts {
+            connector: "connector-a",
+            provenance: "chat_engine/thread-42/msg-7",
+            version: "v1",
+        })
+    );
 }
 
 #[tokio::test]
@@ -228,4 +242,55 @@ async fn a_finding_in_a_value_the_plan_does_not_hold_drops_the_record() {
 
     assert_eq!(runner.run(&plan).await, Checked::Dropped);
     assert_eq!(drops.taken().len(), 1);
+}
+
+#[test]
+fn an_object_value_gives_its_strings_and_numbers_but_not_its_keys() {
+    let plan = connector_plan(vec![add_value(
+        "skill",
+        "skills",
+        // Keys in alphabetical order, so the walk order is the same whether or
+        // not serde_json keeps insertion order.
+        serde_json::json!({ "current": true, "name": "Python", "tags": ["rust", "c"], "years": 5 }),
+    )]);
+
+    let values = plan.values();
+
+    // The pieces in walk order, each with its text: the boolean has none, the
+    // array's items come in their order, the number comes as its text.
+    let pieces: Vec<(usize, &str)> = values
+        .iter()
+        .map(|v| (v.at.piece, v.text.as_str()))
+        .collect();
+    assert_eq!(pieces, [(0, "Python"), (1, "rust"), (2, "c"), (3, "5")]);
+    assert!(values.iter().all(|v| v.at.property_ref()
+        == PropertyRef {
+            step: 0,
+            property: 0
+        }));
+}
+
+#[tokio::test]
+async fn a_finding_in_a_piece_its_value_does_not_have_drops_the_record() {
+    let (runner, drops) = checks(vec![Arc::new(FixedCheck(
+        SensitiveDataKind::Health,
+        Verdict {
+            kind: SensitiveDataKind::Health,
+            found: vec![Found {
+                at: ValueRef {
+                    step: 0,
+                    property: 0,
+                    piece: 1,
+                },
+                spans: Vec::new(),
+            }],
+        },
+    ))]);
+    // One string, so the value has piece 0 only.
+    let plan = connector_plan(vec![add_entity("note", &[("text", "hello")])]);
+
+    assert_eq!(runner.run(&plan).await, Checked::Dropped);
+    let events = drops.taken();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].reason, DropReason::CheckFailed);
 }

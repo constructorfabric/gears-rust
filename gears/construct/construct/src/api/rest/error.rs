@@ -2,6 +2,7 @@ use toolkit_canonical_errors::{CanonicalError, Http, resource_error};
 
 use crate::domain::error::DomainError;
 use crate::domain::record_intake::Refusal;
+use crate::domain::settings_scope::SettingsOutOfScope;
 
 /// Errors about connector records. The resource type is the record base type.
 #[resource_error(gts_id!("cf.connectors.core.record.v1~"))]
@@ -47,6 +48,20 @@ pub fn for_rest(e: DomainError) -> CanonicalError {
     }
 }
 
+/// Logs a subject settings read or write the caller's policy scope leaves out,
+/// with its ids as fields and an event of its own, so it is not taken for a
+/// policy denial. The ids stay out of the answer.
+fn log_out_of_scope(refused: &SettingsOutOfScope) {
+    tracing::warn!(
+        caller = %refused.caller,
+        caller_tenant = %refused.caller_tenant,
+        tenant_id = %refused.tenant_id,
+        subject_id = %refused.subject_id,
+        refusal = ?refused.refusal,
+        "construct subject settings out of the policy scope"
+    );
+}
+
 /// Errors about a subject's settings.
 #[resource_error(gts_id!("cf.construct.subject.settings.v1~"))]
 pub struct SubjectSettingsError;
@@ -68,6 +83,13 @@ pub fn for_settings(e: DomainError) -> CanonicalError {
                 .create()
         }
         // @cpt-end:cpt-cf-construct-algo-subject-settings-owner-only:p1:inst-owner-refuse-return
+        // A read the policy scope leaves out is refused the same way.
+        DomainError::OutOfScope(refused) => {
+            log_out_of_scope(&refused);
+            SubjectSettingsError::permission_denied()
+                .with_reason("ACCESS_DENIED")
+                .create()
+        }
         // The settings routes refuse no record; a refusal here is mapped like
         // any other error.
         e @ (DomainError::Refused(_)
@@ -90,6 +112,12 @@ impl From<DomainError> for CanonicalError {
             // @cpt-begin:cpt-cf-construct-algo-gear-foundation-map-errors:p1:inst-map-forbidden-return
             DomainError::Forbidden(msg) => {
                 tracing::warn!(msg = %msg, "construct access forbidden");
+                RecordError::permission_denied()
+                    .with_reason("ACCESS_DENIED")
+                    .create()
+            }
+            DomainError::OutOfScope(refused) => {
+                log_out_of_scope(&refused);
                 RecordError::permission_denied()
                     .with_reason("ACCESS_DENIED")
                     .create()

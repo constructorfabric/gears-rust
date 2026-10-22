@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use authz_resolver_sdk::PolicyEnforcer;
 use authz_resolver_sdk::models::TenantMode;
 use authz_resolver_sdk::pep::{AccessRequest, ResourceType};
+use construct_sdk::gts::RecordTraits;
 use serde_json::Value;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
@@ -103,17 +104,89 @@ impl Envelope {
     }
 }
 
-/// The identity intake keeps of a received record: the tenant, the connector,
-/// the record's provenance and version, and the subject it names. It holds no
-/// content.
+/// The parts of a record identity, by name, so they cannot be swapped: the
+/// connector and the record's provenance and version, as the record base type
+/// states. They are only hashed into a [`RecordKey`]; nothing stores or logs
+/// them, since a provenance can hold record content (a fact candidate's is the
+/// fact key and its value).
+#[domain_model]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IdentityParts<'a> {
+    pub connector: &'a str,
+    pub provenance: &'a str,
+    pub version: &'a str,
+}
+
+/// The key of a record identity: the SHA-256, in hex, of its connector,
+/// provenance and version, each preceded by its length in bytes (8 bytes,
+/// big-endian). The lengths make the encoding injective, so no two different
+/// identities hash the same input, whatever bytes the parts hold, NUL included.
+/// It is the only form of the identity intake stores or a drop event names.
+/// The encoding must not change: the parts are not stored, so a stored key
+/// cannot be computed again.
+#[domain_model]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct RecordKey(String);
+
+impl RecordKey {
+    /// The key of an identity.
+    #[must_use]
+    pub fn of(parts: IdentityParts<'_>) -> Self {
+        let mut hash = aws_lc_rs::digest::Context::new(&aws_lc_rs::digest::SHA256);
+        for part in [parts.connector, parts.provenance, parts.version] {
+            let bytes = part.as_bytes();
+            hash.update(&(bytes.len() as u64).to_be_bytes());
+            hash.update(bytes);
+        }
+        Self(hex::encode(hash.finish()))
+    }
+
+    /// The key of a received record's identity.
+    #[must_use]
+    pub fn of_record(record: &ReceivedRecord) -> Self {
+        Self::of(IdentityParts {
+            connector: &record.connector,
+            provenance: &record.envelope.provenance,
+            version: &record.envelope.version,
+        })
+    }
+
+    /// The key in hex, 64 characters.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for RecordKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// What intake stores of a received record: its tenant, its [`RecordKey`],
+/// the connector and the subject it names. It holds neither the provenance
+/// nor the version, so no repository can store them.
 #[domain_model]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecordId {
     pub tenant_id: Uuid,
+    pub key: RecordKey,
     pub connector: String,
-    pub provenance: String,
-    pub version: String,
     pub subject_id: Option<Uuid>,
+}
+
+impl RecordId {
+    /// The identity intake stores for a received record.
+    #[must_use]
+    pub fn of_record(record: &ReceivedRecord) -> Self {
+        Self {
+            tenant_id: record.tenant_id,
+            key: RecordKey::of_record(record),
+            connector: record.connector.clone(),
+            subject_id: record.envelope.subject_id,
+        }
+    }
 }
 
 /// What inserting a record identity found.
@@ -161,7 +234,7 @@ pub enum DropStage {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum DropReason {
-    /// No planner is wired in yet (until Story 5.2).
+    /// No planner is wired in yet.
     NoPlanner,
     /// Processing could not finish.
     ProcessingFailed,
@@ -209,8 +282,9 @@ impl DropReason {
 }
 
 /// A content-free event for a dropped record: the tenant, the subject, the
-/// connector, the record's identity (provenance and version), its type, the
-/// stage that dropped it and why. It carries no record content. Record intake
+/// connector, the record key (never the provenance or the version, which can
+/// hold content), its type, the stage that dropped it and why. It carries no
+/// record content. Record intake
 /// owns its shape; the Planner, the Sensitive-Data Checks, Admission and the
 /// Profile Writer emit it.
 #[domain_model]
@@ -219,8 +293,7 @@ pub struct DropEvent {
     pub tenant_id: Uuid,
     pub subject_id: Option<Uuid>,
     pub connector: String,
-    pub provenance: String,
-    pub version: String,
+    pub record_key: RecordKey,
     pub type_id: String,
     pub stage: DropStage,
     pub reason: DropReason,
@@ -233,8 +306,7 @@ impl DropEvent {
             tenant_id: record.tenant_id,
             subject_id: record.envelope.subject_id,
             connector: record.connector.clone(),
-            provenance: record.envelope.provenance.clone(),
-            version: record.envelope.version.clone(),
+            record_key: RecordKey::of_record(record),
             type_id: record.envelope.type_id.clone(),
             stage,
             reason,
@@ -260,8 +332,11 @@ impl DropEvent {
             tenant_id: plan.tenant_id,
             subject_id: Some(plan.subject_id),
             connector: connector.clone(),
-            provenance: provenance.clone(),
-            version: version.clone(),
+            record_key: RecordKey::of(IdentityParts {
+                connector,
+                provenance,
+                version,
+            }),
             type_id: type_id.clone(),
             stage,
             reason,
@@ -269,12 +344,61 @@ impl DropEvent {
     }
 }
 
+/// One type's own value of the GTS trait `subject_required`, as it declares
+/// it, before anything is inherited.
+#[domain_model]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubjectTrait {
+    /// The type does not declare it.
+    Unset,
+    On,
+    Off,
+    /// The type declares something that is not a boolean.
+    Malformed,
+}
+
+/// What a record's type and the types it derives from state about the record
+/// beyond its schema: each type's own trait values, the record's type first
+/// and the record base type last.
+#[domain_model]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TypeTraits {
+    pub subject_chain: Vec<SubjectTrait>,
+}
+
+impl TypeTraits {
+    /// Whether a record of the type must name its subject. A type derived from
+    /// a type about a person stays about a person: any type below the base
+    /// that turns the trait on requires a subject, whatever its descendants
+    /// say. Otherwise the closest declared value wins, a malformed one
+    /// requires a subject, and with none the SDK's default applies.
+    #[must_use]
+    pub fn subject_required(&self) -> bool {
+        let below_base = self
+            .subject_chain
+            .split_last()
+            .map_or(&[][..], |(_, below)| below);
+        if below_base.contains(&SubjectTrait::On) {
+            return true;
+        }
+        match self
+            .subject_chain
+            .iter()
+            .find(|value| **value != SubjectTrait::Unset)
+        {
+            Some(SubjectTrait::Off) => false,
+            Some(SubjectTrait::On | SubjectTrait::Malformed) => true,
+            Some(SubjectTrait::Unset) | None => RecordTraits::default().subject_required,
+        }
+    }
+}
+
 /// Checks a record against its GTS type and the types it derives from.
 #[async_trait]
 pub trait RecordTypes: Send + Sync {
-    /// `Ok(())` when the record passes. A broken rule is
+    /// The type's traits when the record passes its schema. A broken rule is
     /// [`DomainError::Refused`]; any other error means the check could not run.
-    async fn check(&self, record: &Value) -> Result<(), DomainError>;
+    async fn check(&self, record: &Value) -> Result<TypeTraits, DomainError>;
 }
 
 /// Whether a connector is on for a tenant, a tenant setting. The connector is
@@ -422,13 +546,7 @@ impl<I: RecordIdRepository + 'static, S: SubjectSettingsRepository + 'static>
             .transaction_ref_mapped(move |tx| {
                 Box::pin(async move {
                     // @cpt-begin:cpt-cf-construct-flow-record-intake-submit:p1:inst-submit-insert
-                    let id = RecordId {
-                        tenant_id: received.tenant_id,
-                        connector: received.connector.clone(),
-                        provenance: received.envelope.provenance.clone(),
-                        version: received.envelope.version.clone(),
-                        subject_id: received.envelope.subject_id,
-                    };
+                    let id = RecordId::of_record(&received);
                     let inserted = ids.insert(tx, &scope, id).await?;
                     // @cpt-end:cpt-cf-construct-flow-record-intake-submit:p1:inst-submit-insert
                     match inserted {
@@ -463,11 +581,27 @@ impl<I: RecordIdRepository + 'static, S: SubjectSettingsRepository + 'static>
         // @cpt-end:cpt-cf-construct-algo-record-intake-check-record:p1:inst-check-id
 
         // @cpt-begin:cpt-cf-construct-algo-record-intake-check-record:p1:inst-check-type
-        self.ports.types.check(record).await?;
+        let traits = self.ports.types.check(record).await?;
         // @cpt-end:cpt-cf-construct-algo-record-intake-check-record:p1:inst-check-type
 
+        let envelope = Envelope::read(record)?;
+
+        // @cpt-begin:cpt-cf-construct-algo-record-intake-check-record:p1:inst-check-subject
+        // A derived schema cannot require `subject_id`, so the type's trait
+        // says it, and it is checked here, after the schema.
+        if traits.subject_required() && envelope.subject_id.is_none() {
+            return Err(Refusal::new(
+                RefusalReason::SchemaViolation,
+                Some(&envelope.type_id),
+                Place::pointer("/subject_id"),
+                "required",
+            )
+            .into());
+        }
+        // @cpt-end:cpt-cf-construct-algo-record-intake-check-record:p1:inst-check-subject
+
         // @cpt-begin:cpt-cf-construct-algo-record-intake-check-record:p1:inst-check-envelope
-        Ok(Envelope::read(record)?)
+        Ok(envelope)
         // @cpt-end:cpt-cf-construct-algo-record-intake-check-record:p1:inst-check-envelope
     }
 

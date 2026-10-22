@@ -18,8 +18,8 @@ use crate::domain::sensitive_data::{
 use crate::domain::subject_settings::SubjectSettings;
 use crate::test_support::{
     AdmissionFixture, FixedRules, FixedSubjectSettings, RecordingAdmissionEvents, RecordingEvents,
-    SubstringCheck, add_entity, by_a_person, connector_plan, open_rules, processing_context,
-    remove_entity, replace_property, spans,
+    SubstringCheck, add_entity, add_value, by_a_person, connector_plan, open_rules,
+    processing_context, remove_entity, replace_property, spans,
 };
 
 const SECRET: &str = "a value that must not reach an event";
@@ -41,7 +41,15 @@ fn admitted(outcome: AdmissionOutcome) -> AdmittedPlan {
 }
 
 fn at(step: usize, property: usize) -> ValueRef {
-    ValueRef { step, property }
+    piece(step, property, 0)
+}
+
+fn piece(step: usize, property: usize, piece: usize) -> ValueRef {
+    ValueRef {
+        step,
+        property,
+        piece,
+    }
 }
 
 fn found(kind: SensitiveDataKind, at: ValueRef, spans: Vec<std::ops::Range<usize>>) -> Verdict {
@@ -131,8 +139,14 @@ async fn personalization_off_drops_the_plan() {
     assert_eq!(event.tenant_id, plan.tenant_id);
     assert_eq!(event.subject_id, Some(plan.subject_id));
     assert_eq!(event.connector, "connector-a");
-    assert_eq!(event.provenance, "chat_engine/thread-42/msg-7");
-    assert_eq!(event.version, "v1");
+    assert_eq!(
+        event.record_key,
+        crate::domain::record_intake::RecordKey::of(crate::domain::record_intake::IdentityParts {
+            connector: "connector-a",
+            provenance: "chat_engine/thread-42/msg-7",
+            version: "v1",
+        })
+    );
     assert_eq!(event.type_id, construct_sdk::gts::CHAT_MESSAGE_TYPE);
 }
 
@@ -372,6 +386,45 @@ async fn the_value_cap_counts_characters_not_bytes() {
 }
 
 #[tokio::test]
+async fn the_value_cap_measures_a_value_as_a_whole_not_each_piece() {
+    let fixture = AdmissionFixture {
+        rules: crate::domain::admission::AdmissionRules {
+            max_value_chars: 4,
+            ..open_rules()
+        },
+        ..AdmissionFixture::default()
+    };
+    // Three pieces of 2 characters each: every piece fits, the value does not.
+    let plan = connector_plan(vec![add_value(
+        "skill",
+        "skills",
+        serde_json::json!({ "name": "Go", "level": "C1", "since": "21" }),
+    )]);
+
+    let outcome = admit(&fixture, plan, &[]).await;
+
+    assert_dropped(&fixture, &outcome, DropReason::WriteCapExceeded);
+}
+
+#[tokio::test]
+async fn the_value_cap_counts_no_keys() {
+    let fixture = AdmissionFixture {
+        rules: crate::domain::admission::AdmissionRules {
+            max_value_chars: 4,
+            ..open_rules()
+        },
+        ..AdmissionFixture::default()
+    };
+    let plan = connector_plan(vec![add_value(
+        "skill",
+        "skills",
+        serde_json::json!({ "a_long_field_name": "Go", "level": "C1" }),
+    )]);
+
+    admitted(admit(&fixture, plan, &[]).await);
+}
+
+#[tokio::test]
 async fn a_dropped_plan_writes_no_block_event_even_with_block_verdicts() {
     let fixture = AdmissionFixture {
         settings: SubjectSettings {
@@ -597,6 +650,191 @@ async fn a_redacted_value_keeps_its_step_without_the_found_content() {
 }
 
 #[tokio::test]
+async fn a_redact_kind_without_a_range_blocks_the_value_even_when_another_kind_has_one() {
+    let fixture = AdmissionFixture::default();
+    let plan = connector_plan(vec![add_entity(
+        "note",
+        &[("text", "call +49 30 1234 in Berlin"), ("other", "kept")],
+    )]);
+
+    let admitted = admitted(
+        admit(
+            &fixture,
+            plan,
+            &[
+                found(SensitiveDataKind::Contacts, at(0, 0), spans(&[(5, 16)])),
+                found(SensitiveDataKind::Location, at(0, 0), Vec::new()),
+            ],
+        )
+        .await,
+    );
+
+    assert_eq!(
+        admitted.blocked,
+        vec![
+            Enforced {
+                at: at(0, 0),
+                kind: SensitiveDataKind::Contacts
+            },
+            Enforced {
+                at: at(0, 0),
+                kind: SensitiveDataKind::Location
+            },
+        ]
+    );
+    assert!(admitted.redacted.is_empty(), "no kind is reported redacted");
+    assert_eq!(
+        admitted.plan.steps[0].change.properties(),
+        &[Property::new("other", "kept")]
+    );
+    let events: Vec<(&str, SensitiveDataKind)> = fixture
+        .events
+        .taken()
+        .iter()
+        .map(|(action, event)| (*action, event.kind))
+        .collect();
+    assert_eq!(
+        events,
+        [
+            ("blocked", SensitiveDataKind::Contacts),
+            ("blocked", SensitiveDataKind::Location),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_verdict_on_a_piece_the_value_does_not_have_blocks_the_value() {
+    let fixture = AdmissionFixture::default();
+    let plan = connector_plan(vec![add_entity(
+        "note",
+        &[("text", "hello"), ("other", "kept")],
+    )]);
+
+    // The value has piece 0 only; a redaction for piece 3 cannot be placed.
+    let admitted = admitted(
+        admit(
+            &fixture,
+            plan,
+            &[found(
+                SensitiveDataKind::Contacts,
+                piece(0, 0, 3),
+                spans(&[(0, 2)]),
+            )],
+        )
+        .await,
+    );
+
+    assert_eq!(
+        admitted.blocked,
+        vec![Enforced {
+            at: piece(0, 0, 3),
+            kind: SensitiveDataKind::Contacts
+        }]
+    );
+    assert!(admitted.redacted.is_empty());
+    assert_eq!(
+        admitted.plan.steps[0].change.properties(),
+        &[Property::new("other", "kept")]
+    );
+}
+
+#[tokio::test]
+async fn one_kind_naming_a_piece_twice_once_without_a_range_blocks_the_value() {
+    let fixture = AdmissionFixture::default();
+    let plan = connector_plan(vec![add_entity(
+        "note",
+        &[
+            ("text", "call +49 30 1234 or mail ada@example.com"),
+            ("other", "kept"),
+        ],
+    )]);
+
+    // Two findings of one kind on one piece: the first has a range, the
+    // second has none, so the second's content cannot be removed.
+    let admitted = admitted(
+        admit(
+            &fixture,
+            plan,
+            &[Verdict {
+                kind: SensitiveDataKind::Contacts,
+                found: vec![
+                    Found {
+                        at: at(0, 0),
+                        spans: spans(&[(5, 16)]),
+                    },
+                    Found {
+                        at: at(0, 0),
+                        spans: Vec::new(),
+                    },
+                ],
+            }],
+        )
+        .await,
+    );
+
+    assert_eq!(
+        admitted.blocked,
+        vec![Enforced {
+            at: at(0, 0),
+            kind: SensitiveDataKind::Contacts
+        }]
+    );
+    assert!(
+        admitted.redacted.is_empty(),
+        "the kind is not reported redacted"
+    );
+    assert_eq!(
+        admitted.plan.steps[0].change.properties(),
+        &[Property::new("other", "kept")]
+    );
+}
+
+#[tokio::test]
+async fn a_redaction_in_a_replace_dropped_whole_is_not_reported() {
+    let fixture = AdmissionFixture::default();
+    let replace_entity = Step {
+        entity_kind: "employer".to_owned(),
+        change: Change::ReplaceEntity {
+            old: crate::domain::plan::NodeKey("old".to_owned()),
+            key: crate::domain::plan::NodeKey("new".to_owned()),
+            properties: vec![
+                Property::new("contact", "call +49 30 1234"),
+                Property::new("diagnosis", "asthma"),
+            ],
+        },
+        confidence: Some(0.9),
+    };
+    let plan = connector_plan(vec![replace_entity]);
+
+    let admitted = admitted(
+        admit(
+            &fixture,
+            plan,
+            &[
+                found(SensitiveDataKind::Contacts, at(0, 0), spans(&[(5, 16)])),
+                found(SensitiveDataKind::Health, at(0, 1), Vec::new()),
+            ],
+        )
+        .await,
+    );
+
+    assert_eq!(admitted.dropped_steps, vec![0]);
+    assert!(admitted.plan.steps.is_empty());
+    assert!(
+        admitted.redacted.is_empty(),
+        "nothing of the step was stored"
+    );
+    assert!(
+        fixture
+            .events
+            .taken()
+            .iter()
+            .all(|(action, _)| *action != "redacted"),
+        "no redaction event for a dropped step"
+    );
+}
+
+#[tokio::test]
 async fn overlapping_redactions_of_two_kinds_both_apply() {
     let fixture = AdmissionFixture::default();
     let plan = connector_plan(vec![add_entity("note", &[("text", "abcdefghij")])]);
@@ -751,4 +989,148 @@ async fn checks_then_admission_store_nothing_the_checks_block() {
             Property::new("name", "Ada")
         ]
     );
+}
+
+/// The verdicts of test checks for `needle`s, run on `plan` as processing does.
+async fn checked(plan: &Plan, checks: &[(SensitiveDataKind, &'static str)]) -> Vec<Verdict> {
+    let runner = SensitiveDataChecks::new(
+        checks
+            .iter()
+            .map(|&(kind, needle)| {
+                Arc::new(SubstringCheck { kind, needle }) as Arc<dyn SensitiveDataCheck>
+            })
+            .collect(),
+        Arc::new(RecordingEvents::default()),
+    );
+    let Checked::Verdicts(verdicts) = runner.run(plan).await else {
+        panic!("the checks answered");
+    };
+    verdicts
+}
+
+#[tokio::test]
+async fn a_redaction_inside_an_object_keeps_the_json_and_the_other_fields() {
+    let fixture = AdmissionFixture::default();
+    let plan = connector_plan(vec![add_value(
+        "identity",
+        "contact_note",
+        serde_json::json!({ "note": "call +49 30 1234 now", "label": "work" }),
+    )]);
+    let verdicts = checked(&plan, &[(SensitiveDataKind::Contacts, "+49 30 1234")]).await;
+
+    let admitted = admitted(admit(&fixture, plan, &verdicts).await);
+
+    assert_eq!(
+        admitted.plan.steps[0].change.properties()[0].value,
+        serde_json::json!({ "note": "call  now", "label": "work" })
+    );
+    assert_eq!(admitted.redacted.len(), 1);
+    assert!(admitted.blocked.is_empty());
+}
+
+#[tokio::test]
+async fn two_pieces_of_one_value_give_one_event_per_kind() {
+    let fixture = AdmissionFixture::default();
+    let plan = connector_plan(vec![
+        add_value(
+            "note",
+            "health",
+            serde_json::json!({ "a": "has asthma", "b": "asthma since 2001" }),
+        ),
+        add_value(
+            "note",
+            "contact",
+            serde_json::json!({ "a": "call +49 30 1234", "b": "or +49 30 1234 at night" }),
+        ),
+    ]);
+    let verdicts = checked(
+        &plan,
+        &[
+            (SensitiveDataKind::Health, "asthma"),
+            (SensitiveDataKind::Contacts, "+49 30 1234"),
+        ],
+    )
+    .await;
+
+    let admitted = admitted(admit(&fixture, plan, &verdicts).await);
+
+    // The result keeps the detail per piece; the events count values.
+    assert_eq!(admitted.blocked.len(), 2, "two blocked pieces");
+    assert_eq!(admitted.redacted.len(), 2, "two redacted pieces");
+    let events: Vec<(&str, SensitiveDataKind)> = fixture
+        .events
+        .taken()
+        .iter()
+        .map(|(action, event)| (*action, event.kind))
+        .collect();
+    assert_eq!(
+        events,
+        [
+            ("blocked", SensitiveDataKind::Health),
+            ("redacted", SensitiveDataKind::Contacts),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_found_number_cannot_be_redacted_so_its_value_is_blocked() {
+    let fixture = AdmissionFixture::default();
+    let plan = connector_plan(vec![add_value(
+        "identity",
+        "phone",
+        serde_json::json!({ "number": 4_930_123 }),
+    )]);
+    // Part of the number only: redacting it as text would leave "123" behind,
+    // so the value is blocked only because a number cannot be redacted.
+    let verdicts = checked(&plan, &[(SensitiveDataKind::Contacts, "4930")]).await;
+
+    let admitted = admitted(admit(&fixture, plan, &verdicts).await);
+
+    assert!(admitted.plan.steps.is_empty(), "the value is not stored");
+    assert_eq!(admitted.blocked.len(), 1);
+    assert_eq!(admitted.blocked[0].kind, SensitiveDataKind::Contacts);
+    assert!(admitted.redacted.is_empty());
+}
+
+#[tokio::test]
+async fn one_blocked_piece_drops_its_whole_value_and_reports_no_redaction_in_it() {
+    let fixture = AdmissionFixture::default();
+    let plan = connector_plan(vec![Step {
+        entity_kind: "note".to_owned(),
+        change: Change::AddEntity {
+            key: crate::domain::plan::NodeKey("n".to_owned()),
+            properties: vec![
+                Property::new(
+                    "health_note",
+                    serde_json::json!({ "text": "has asthma", "call": "ring +49 30 1234" }),
+                ),
+                Property::new("hobby", "chess"),
+            ],
+        },
+        confidence: Some(0.9),
+    }]);
+    let verdicts = checked(
+        &plan,
+        &[
+            (SensitiveDataKind::Health, "asthma"),
+            (SensitiveDataKind::Contacts, "+49 30 1234"),
+        ],
+    )
+    .await;
+
+    let admitted = admitted(admit(&fixture, plan, &verdicts).await);
+
+    assert_eq!(
+        admitted.plan.steps[0].change.properties(),
+        &[Property::new("hobby", "chess")]
+    );
+    assert_eq!(admitted.blocked.len(), 1);
+    assert_eq!(admitted.blocked[0].kind, SensitiveDataKind::Health);
+    assert!(
+        admitted.redacted.is_empty(),
+        "the redacted value was not stored"
+    );
+    let events = fixture.events.taken();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].0, "blocked");
 }
