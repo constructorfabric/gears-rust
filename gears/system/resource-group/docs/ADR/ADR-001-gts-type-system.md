@@ -1,5 +1,5 @@
 ---
-status: accepted
+status: partially superseded by ADR-002
 date: 2026-03-16
 decision-makers: Constructor Fabric Steering Committee
 ---
@@ -41,7 +41,7 @@ decision-makers: Constructor Fabric Steering Committee
   - [Root Tenant T9 (custom domain)](#root-tenant-t9-custom-domain)
   - [Department D8 (under T7)](#department-d8-under-t7)
 - [Example Hierarchy](#example-hierarchy)
-- [DB Schema Summary](#db-schema-summary)
+- [DB Schema Summary (historical, superseded by ADR-002)](#db-schema-summary-historical-superseded-by-adr-002)
 - [Implementation Findings](#implementation-findings)
   - [Finding 1: `x-gts-traits` mandatory on base contract](#finding-1-x-gts-traits-mandatory-on-base-contract)
   - [Finding 2: GTS segment format — strict 4-token rule](#finding-2-gts-segment-format--strict-4-token-rule)
@@ -51,6 +51,8 @@ decision-makers: Constructor Fabric Steering Committee
 <!-- /toc -->
 
 **ID**: `cpt-cf-resource-group-adr-p1-gts-type-system`
+
+> **Partially superseded by [ADR-002](./ADR-002-types-in-types-registry.md).** The choice of GTS with the traits pattern, the base contract `gts.cf.core.rg.type.v1~`, the chained type identifiers and the `metadata` object pattern remain in force. Everything about RG-owned type storage is superseded and kept below as history only: the local type tables, SMALLINT surrogate keys, junction tables, the `gts_type_path` domain, the type CRUD API and the init-time registration. RG types now live in Types Registry and RG stores the Types Registry Registry Reference (UUID) with no foreign key. The trait names in the current model are `can_be_root`, `allowed_parent_types` and `allowed_membership_types`; the names `allowed_parents` and `allowed_memberships` below are the original ones. The `x-gts-constraints` placement invariant shown below is documentation only and is not part of the current base type.
 
 ## Context and Problem Statement
 
@@ -538,7 +540,7 @@ Notes:
 - R4 appears twice: as **course** in B3 and as **user** in T1 (different `gts_type_id`)
 - R8 appears twice: as **user** in D8 and T7 (same type, two group memberships)
 
-## DB Schema Summary
+## DB Schema Summary (historical, superseded by ADR-002)
 
 | Table | Description |
 |---|---|

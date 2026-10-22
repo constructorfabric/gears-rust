@@ -14,9 +14,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use resource_group_sdk::{
-    CreateGroupRequest, CreateTypeRequest, ResourceGroup, ResourceGroupClient,
-    ResourceGroupMembership, ResourceGroupType, ResourceGroupWithDepth, UpdateGroupRequest,
-    UpdateTypeRequest,
+    CreateGroupRequest, ResourceGroup, ResourceGroupClient, ResourceGroupMembership,
+    ResourceGroupWithDepth, UpdateGroupRequest,
 };
 use toolkit_canonical_errors::CanonicalError;
 use toolkit_odata::{ODataQuery, Page};
@@ -41,38 +40,6 @@ impl SlowRgClient {
 
 #[async_trait]
 impl ResourceGroupClient for SlowRgClient {
-    async fn create_type(
-        &self,
-        _ctx: &SecurityContext,
-        _request: CreateTypeRequest,
-    ) -> Result<ResourceGroupType, CanonicalError> {
-        unreachable!()
-    }
-    async fn get_type(
-        &self,
-        _ctx: &SecurityContext,
-        _code: &str,
-    ) -> Result<ResourceGroupType, CanonicalError> {
-        unreachable!()
-    }
-    async fn list_types(
-        &self,
-        _ctx: &SecurityContext,
-        _query: &ODataQuery,
-    ) -> Result<Page<ResourceGroupType>, CanonicalError> {
-        unreachable!()
-    }
-    async fn update_type(
-        &self,
-        _ctx: &SecurityContext,
-        _code: &str,
-        _request: UpdateTypeRequest,
-    ) -> Result<ResourceGroupType, CanonicalError> {
-        unreachable!()
-    }
-    async fn delete_type(&self, _ctx: &SecurityContext, _code: &str) -> Result<(), CanonicalError> {
-        unreachable!()
-    }
     async fn create_group(
         &self,
         _ctx: &SecurityContext,

@@ -13,11 +13,15 @@ use toolkit_db::outbox::OutboxHandle;
 use toolkit_db::{DBProvider, DbError};
 use toolkit_gts::{all_inventory_instances, all_inventory_type_schemas};
 use tracing::{debug, info};
-use types_registry_sdk::{RegisterResult, RegisterSummary, TypesRegistryClient};
+use types_registry_sdk::{
+    PlatformTypesRegistryApi, PlatformTypesRegistryApiExt, PublisherContext, ReconcileOptions,
+    ReconcileReport, RegisterResult, RegisterSummary, TypesRegistryApi, TypesRegistryClient,
+};
 
 use crate::config::TypesRegistryConfig;
 use crate::domain::admission::OperationDispatch;
 use crate::domain::legacy_local_client::TypesRegistryLocalClient;
+use crate::domain::local_client::LocalClient;
 use crate::domain::policy::RegistrationPolicy;
 use crate::domain::ports::Stores;
 use crate::domain::ports::metrics::AdmissionMetrics;
@@ -112,6 +116,93 @@ impl TypesRegistryGear {
     }
 }
 
+/// TEMPORARY(rg-types-in-tr): one desired registry entity.
+type DesiredEntity = (gts::GtsId, serde_json::Value);
+
+/// TEMPORARY(rg-types-in-tr): collects linked resource-group inventory entries keyed by GTS id.
+/// Returns `None` when there is nothing to seed.
+fn collect_resource_group_inventory(
+    service: &TypesRegistryService,
+    batch_limit: usize,
+) -> anyhow::Result<Option<Vec<DesiredEntity>>> {
+    const RG_PREFIX: &str = "gts.cf.core.rg.";
+
+    let mut entries = all_inventory_type_schemas()?;
+    entries.extend(all_inventory_instances()?);
+    let mut desired = Vec::new();
+    for entry in entries {
+        let Some(raw) = service.extract_gts_id(&entry) else {
+            continue;
+        };
+        if raw.starts_with(RG_PREFIX) {
+            desired.push((gts::GtsId::try_new(&raw)?, entry));
+        }
+    }
+    if desired.is_empty() {
+        return Ok(None);
+    }
+    // Base and derived types must be admitted together, so no chunking.
+    anyhow::ensure!(
+        desired.len() <= batch_limit,
+        "resource-group inventory ({}) exceeds limits.batch_candidates ({batch_limit}); seeding skipped",
+        desired.len()
+    );
+    Ok(Some(desired))
+}
+
+/// TEMPORARY(rg-types-in-tr): logs a failed seeding attempt with its per-entity outcomes.
+fn log_seed_failure(e: &toolkit_canonical_errors::CanonicalError) {
+    tracing::error!(error = %e, "Failed to seed resource-group GTS inventory");
+    if let Some(report) = ReconcileReport::from_canonical(e) {
+        for (id, outcome) in &report.outcomes {
+            tracing::error!(gts_id = %id, outcome = ?outcome, "Seeding outcome");
+        }
+    }
+}
+
+/// TEMPORARY(rg-types-in-tr): reconciles the desired entities and logs the outcome.
+async fn reconcile_seed(client: &LocalClient, desired: &[DesiredEntity]) {
+    let Ok(version) = env!("CARGO_PKG_VERSION").parse() else {
+        tracing::error!("Invalid types-registry package version; seeding skipped");
+        return;
+    };
+    let publisher = PublisherContext {
+        name: "types-registry".to_owned(),
+        version,
+    };
+    let api: &dyn PlatformTypesRegistryApi = client;
+    let result = api
+        .reconcile_entities_and_await(
+            &toolkit_security::PlatformSecurityContext::outbound_marker(),
+            &publisher,
+            desired,
+            &ReconcileOptions::default(),
+            &CancellationToken::new(),
+        )
+        .await;
+    match result {
+        Ok(_) => info!(
+            count = desired.len(),
+            "Seeded resource-group GTS inventory into the database"
+        ),
+        Err(e) => log_seed_failure(&e),
+    }
+}
+
+/// TEMPORARY(rg-types-in-tr): seeds linked resource-group inventory entries into the database.
+/// Failures are logged and never fail boot.
+async fn seed_resource_group_inventory(
+    service: &TypesRegistryService,
+    client: &LocalClient,
+    batch_limit: usize,
+) {
+    match collect_resource_group_inventory(service, batch_limit) {
+        Ok(Some(desired)) => reconcile_seed(client, &desired).await,
+        Ok(None) => {}
+        Err(e) => tracing::error!(error = %e, "Failed to collect resource-group GTS inventory"),
+    }
+}
+
 #[async_trait]
 impl Gear for TypesRegistryGear {
     async fn init(&self, ctx: &GearCtx) -> anyhow::Result<()> {
@@ -147,6 +238,7 @@ impl Gear for TypesRegistryGear {
         let gts_config = cfg.to_gts_config();
         let static_entities = cfg.entities.clone();
         let cfg_for_registry = cfg.clone();
+        let batch_limit = cfg.limits.batch_candidates;
         let type_schemas_cache_cfg = cfg.local_client.cache.type_schemas.to_cache_config();
         let instances_cache_cfg = cfg.local_client.cache.instances.to_cache_config();
 
@@ -207,6 +299,17 @@ impl Gear for TypesRegistryGear {
         if let Some(db) = ctx.db() {
             self.wire_admission(&db, registration_policy, cfg_for_registry, metrics)
                 .await?;
+
+            // TEMPORARY(rg-types-in-tr): minimal stand-in for P0 T31 (docs/p0/todo.md). Seeds only the resource-group inventory and publishes the new local contracts; drop when T31 lands.
+            if let Some(registry) = self.registry.get() {
+                let client = Arc::new(LocalClient::new(Arc::clone(registry)));
+                seed_resource_group_inventory(&service, &client, batch_limit).await;
+                ctx.client_hub().register::<dyn PlatformTypesRegistryApi>(
+                    client.clone() as Arc<dyn PlatformTypesRegistryApi>
+                );
+                ctx.client_hub()
+                    .register::<dyn TypesRegistryApi>(client as Arc<dyn TypesRegistryApi>);
+            }
         } else {
             tracing::warn!(
                 "types_registry has no database bound: POST /entities, GET /operations/{{id}} and \

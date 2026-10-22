@@ -26,16 +26,12 @@ use core::fmt;
 // `violations[].subject` discriminators.
 // ---------------------------------------------------------------------------
 
-/// Removing allowed parents / disabling root placement would break
-/// existing group-hierarchy relationships.
-pub const ALLOWED_PARENTS_SUBJECT: &str = "allowed_parents";
-
 /// The write would introduce a cycle in the group hierarchy
 /// (cycle-detected).
 pub const HIERARCHY_SUBJECT: &str = "hierarchy";
 
-/// A type still has groups of this type (active references) and cannot
-/// be deleted.
+/// The group still has child groups or active memberships (active
+/// references) and cannot be deleted.
 pub const ACTIVE_REFERENCES_SUBJECT: &str = "active_references";
 
 /// A configured limit (depth, width, …) would be exceeded
@@ -73,8 +69,6 @@ pub const STATE_TYPE: &str = "STATE";
 /// fires for a future subject, keeping the projection forward-compatible.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Subject {
-    /// See [`ALLOWED_PARENTS_SUBJECT`].
-    AllowedParents,
     /// See [`HIERARCHY_SUBJECT`] — denotes a detected cycle.
     Hierarchy,
     /// See [`ACTIVE_REFERENCES_SUBJECT`].
@@ -94,7 +88,6 @@ impl Subject {
     #[must_use]
     pub fn from_wire(s: &str) -> Self {
         match s {
-            ALLOWED_PARENTS_SUBJECT => Self::AllowedParents,
             HIERARCHY_SUBJECT => Self::Hierarchy,
             ACTIVE_REFERENCES_SUBJECT => Self::ActiveReferences,
             LIMIT_SUBJECT => Self::Limit,
@@ -108,7 +101,6 @@ impl Subject {
     #[must_use]
     pub fn as_wire(&self) -> &str {
         match self {
-            Self::AllowedParents => ALLOWED_PARENTS_SUBJECT,
             Self::Hierarchy => HIERARCHY_SUBJECT,
             Self::ActiveReferences => ACTIVE_REFERENCES_SUBJECT,
             Self::Limit => LIMIT_SUBJECT,
@@ -131,7 +123,6 @@ mod tests {
     #[test]
     fn subject_round_trips_each_constant() {
         for (wire, expected) in [
-            (ALLOWED_PARENTS_SUBJECT, Subject::AllowedParents),
             (HIERARCHY_SUBJECT, Subject::Hierarchy),
             (ACTIVE_REFERENCES_SUBJECT, Subject::ActiveReferences),
             (LIMIT_SUBJECT, Subject::Limit),
