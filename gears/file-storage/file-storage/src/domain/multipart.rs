@@ -193,32 +193,43 @@ impl BindState {
     }
 }
 
-/// Live read of the pointer for an auto-bind upload that lost the CAS: `Bound` if the file now
-/// points at this version (e.g. a manual bind), else `Conflict` with the current ETag.
-fn resolve_bind_state(
-    file_id: Uuid,
-    content_id: Option<Uuid>,
-    version_id: Uuid,
-) -> (BindState, Option<String>, Option<String>) {
-    if content_id == Some(version_id) {
-        (
-            BindState::Bound,
-            Some(crate::domain::etag::content_etag(file_id, version_id)),
-            None,
-        )
-    } else {
-        (
-            BindState::Conflict,
-            None,
-            content_id.map(|cid| crate::domain::etag::content_etag(file_id, cid)),
-        )
+/// How a bind attempt came out, as the caller decided it; [`BindDecision::outcome`] is the one
+/// mapping to the reported `(bind_state, etag, current_etag)` for first calls and replays alike.
+#[domain_model]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BindDecision {
+    /// This version is the file's content: `Bound` with this version's `ETag`.
+    Bound,
+    /// Auto-bind lost the CAS: `Conflict` with the `ETag` of the pointer that won.
+    Conflict { current_etag: Option<String> },
+    /// The upload never asked to bind: no bind outcome.
+    Manual,
+}
+
+impl BindDecision {
+    #[must_use]
+    pub fn outcome(
+        self,
+        file_id: Uuid,
+        version_id: Uuid,
+    ) -> (BindState, Option<String>, Option<String>) {
+        match self {
+            Self::Bound => (
+                BindState::Bound,
+                Some(crate::domain::etag::content_etag(file_id, version_id)),
+                None,
+            ),
+            Self::Conflict { current_etag } => (BindState::Conflict, None, current_etag),
+            Self::Manual => (BindState::Manual, None, None),
+        }
     }
 }
 
 /// Bind outcome a replay reports (a single-part finalize retry or a multipart complete rebuilt
 /// from the version row): a bind won at finalize replays as `Bound` from the persisted
 /// `bound_on_finalize` flag (a retry must not turn `Bound` into `Conflict`), a manual upload
-/// never reports a bind outcome, and an auto-bind upload that lost the CAS reads the live pointer.
+/// never reports a bind outcome, and an auto-bind upload that lost the CAS reads the live pointer
+/// (`Bound` if the file now points at this version, else `Conflict` with the current `ETag`).
 #[must_use]
 pub fn replay_bind_state(
     file_id: Uuid,
@@ -227,17 +238,18 @@ pub fn replay_bind_state(
     bound_on_finalize: bool,
     auto_bind: bool,
 ) -> (BindState, Option<String>, Option<String>) {
-    if bound_on_finalize {
-        return (
-            BindState::Bound,
-            Some(crate::domain::etag::content_etag(file_id, version_id)),
-            None,
-        );
-    }
-    if !auto_bind {
-        return (BindState::Manual, None, None);
-    }
-    resolve_bind_state(file_id, content_id, version_id)
+    let decision = if bound_on_finalize {
+        BindDecision::Bound
+    } else if !auto_bind {
+        BindDecision::Manual
+    } else if content_id == Some(version_id) {
+        BindDecision::Bound
+    } else {
+        BindDecision::Conflict {
+            current_etag: content_id.map(|cid| crate::domain::etag::content_etag(file_id, cid)),
+        }
+    };
+    decision.outcome(file_id, version_id)
 }
 
 /// Result of `GET /files/{id}/multipart/{upload_id}`: session state plus received and

@@ -652,23 +652,23 @@ impl FileService {
                 current_etag: None,
             });
         }
-        Ok(if outcome.bound {
-            FinalizeByTokenOutcome {
-                bind_state: Some(crate::domain::multipart::BindState::Bound),
-                etag: Some(etag::content_etag(file_id, version_id)),
-                current_etag: None,
-            }
+        let decision = if outcome.bound {
+            crate::domain::multipart::BindDecision::Bound
         } else {
             // Lost the `content_id IS NULL` CAS; report the winning pointer for a manual bind.
             let fresh = self
                 .store
                 .require_file(&AccessScope::allow_all(), file_id)
                 .await?;
-            FinalizeByTokenOutcome {
-                bind_state: Some(crate::domain::multipart::BindState::Conflict),
-                etag: None,
+            crate::domain::multipart::BindDecision::Conflict {
                 current_etag: etag::etag_for(&fresh),
             }
+        };
+        let (bind_state, bind_etag, current_etag) = decision.outcome(file_id, version_id);
+        Ok(FinalizeByTokenOutcome {
+            bind_state: Some(bind_state),
+            etag: bind_etag,
+            current_etag,
         })
     }
 

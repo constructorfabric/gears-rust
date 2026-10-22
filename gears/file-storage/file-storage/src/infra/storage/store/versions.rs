@@ -14,7 +14,7 @@ use crate::domain::audit::{AuditEntry, FileEvent};
 use crate::domain::error::DomainError;
 use crate::domain::error_convert::db_err;
 use crate::domain::etag;
-use crate::domain::multipart::{BindState, MultipartUploadState, StoredCompleteResult};
+use crate::domain::multipart::{BindDecision, MultipartUploadState, StoredCompleteResult};
 use crate::domain::ports::{
     AutoBindOnFinalize, FinalizeMultipartOutcome, FinalizeVersionOutcome, MultipartFinishSnapshot,
 };
@@ -301,12 +301,8 @@ impl Store {
                         auto_bind_in_tx(&repos, tx, file_id, finish.version_id, auto_bind, now)
                             .await?;
 
-                    let (bind_state, result_etag, current_etag) = if bound {
-                        (
-                            BindState::Bound,
-                            Some(etag::content_etag(file_id, finish.version_id)),
-                            None,
-                        )
+                    let decision = if bound {
+                        BindDecision::Bound
                     } else if auto_bind_requested {
                         let fresh =
                             repos.files.get(tx, &scope, file_id).await?.ok_or_else(|| {
@@ -314,10 +310,14 @@ impl Store {
                                     "file row missing during multipart finalize's fresh-etag read",
                                 )
                             })?;
-                        (BindState::Conflict, None, etag::etag_for(&fresh))
+                        BindDecision::Conflict {
+                            current_etag: etag::etag_for(&fresh),
+                        }
                     } else {
-                        (BindState::Manual, None, None)
+                        BindDecision::Manual
                     };
+                    let (bind_state, result_etag, current_etag) =
+                        decision.outcome(file_id, finish.version_id);
 
                     let stored = StoredCompleteResult {
                         version_id: finish.version_id,

@@ -179,12 +179,14 @@ impl FileService {
         cursor: Option<toolkit_odata::CursorV1>,
     ) -> Result<toolkit_odata::Page<(FileVersion, Option<String>)>, DomainError> {
         let binding = pagination::versions_binding(file_id);
+        let mut page = self
+            .list_versions(ctx, file_id, limit, cursor.clone())
+            .await?;
+        // `list_versions` authorizes the caller and validates the cursor first; only then read its direction.
         let direction = cursor
-            .clone()
             .map(|c| pagination::seek(c, pagination::VERSIONS_ID_FIELD, binding.as_deref()))
             .transpose()?
             .map_or(Direction::Forward, |seek| seek.direction);
-        let mut page = self.list_versions(ctx, file_id, limit, cursor).await?;
 
         let fetched_len = page.items.len();
         if direction == Direction::Backward {

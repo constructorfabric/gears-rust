@@ -19,7 +19,7 @@ use crate::domain::authz::{Authorizer, actions};
 use crate::domain::error::{DomainError, MULTIPART_SESSION_RECLAIMED_BY_CLEANUP_MESSAGE};
 use crate::domain::etag;
 use crate::domain::multipart::{
-    BindState, CompletedMultipartUpload, DEFAULT_MIN_PART_SIZE, MAX_PART_SIZE, MissingPart,
+    BindDecision, CompletedMultipartUpload, DEFAULT_MIN_PART_SIZE, MAX_PART_SIZE, MissingPart,
     MultipartCompleteOutcome, MultipartPart, MultipartPartPlan, MultipartPlan,
     MultipartUploadSession, MultipartUploadState, MultipartUploadStatus, ReceivedPart,
     StoredCompleteResult, compute_plan,
@@ -1068,17 +1068,16 @@ impl MultipartService {
         }
         // The bind decision and `current_etag` come from the finalize transaction, not a post-commit
         // read that could see a later rebind.
-        let (bind_state, bind_etag, current_etag) = if bound {
-            (
-                BindState::Bound,
-                Some(etag::content_etag(file_id, session.version_id)),
-                None,
-            )
+        let decision = if bound {
+            BindDecision::Bound
         } else if session.auto_bind {
-            (BindState::Conflict, None, finalize_outcome.current_etag)
+            BindDecision::Conflict {
+                current_etag: finalize_outcome.current_etag,
+            }
         } else {
-            (BindState::Manual, None, None)
+            BindDecision::Manual
         };
+        let (bind_state, bind_etag, current_etag) = decision.outcome(file_id, session.version_id);
 
         let result = CompletedMultipartUpload {
             version_id: session.version_id,

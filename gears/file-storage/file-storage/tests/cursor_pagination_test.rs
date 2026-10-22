@@ -659,6 +659,58 @@ async fn versions_cursor_rejects_a_different_file() {
     );
 }
 
+/// A caller who cannot see the file gets the same answer as without a cursor, even when the cursor
+/// was issued for another file: access is checked before the cursor is parsed.
+#[tokio::test]
+async fn versions_with_manifests_checks_access_before_the_cursor() {
+    let db = build_db().await;
+    let store = Store::new(Arc::clone(&db));
+    let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("mem"));
+    let backends = BackendRegistry::new(vec![backend], "mem").expect("registry");
+    let issuer = Arc::new(Issuer::generate(3600).expect("issuer"));
+    let authorizer: Arc<dyn Authorizer> = Arc::new(TenantOnlyAuthorizer);
+    let svc = FileService::new(
+        store.clone(),
+        backends,
+        issuer,
+        authorizer,
+        base_config(),
+        None,
+        None,
+    );
+
+    let tenant = Uuid::now_v7();
+    let owner = Uuid::now_v7();
+    let now = OffsetDateTime::now_utc();
+    let (file_a, _) = seed_file_and_versions(&db, tenant, owner, &[now, now]).await;
+    let (file_b, _) = seed_file_and_versions(&db, tenant, owner, &[now]).await;
+
+    let page = svc
+        .list_versions(&ctx(tenant, owner), file_a, Some(1), None)
+        .await
+        .expect("first page");
+    let foreign_cursor = page.page_info.next_cursor.expect("more pages remain");
+
+    let outsider = ctx(Uuid::now_v7(), Uuid::now_v7());
+    let without_cursor = svc
+        .list_versions_with_manifests(&outsider, file_b, Some(1), None)
+        .await
+        .expect_err("an outsider must not see the file");
+    let with_cursor = svc
+        .list_versions_with_manifests(&outsider, file_b, Some(1), Some(cur(&foreign_cursor)))
+        .await
+        .expect_err("an outsider must not see the file");
+    assert!(
+        !matches!(with_cursor, DomainError::Pagination(_)),
+        "access must be checked before the cursor, got {with_cursor:?}"
+    );
+    assert_eq!(
+        std::mem::discriminant(&with_cursor),
+        std::mem::discriminant(&without_cursor),
+        "with a cursor: {with_cursor:?}, without: {without_cursor:?}"
+    );
+}
+
 #[tokio::test]
 async fn versions_backward_cursor_rejects_a_different_file() {
     let db = build_db().await;
