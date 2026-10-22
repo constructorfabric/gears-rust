@@ -3,9 +3,10 @@ use time::OffsetDateTime;
 use toolkit_db_macros::Scopable;
 use uuid::Uuid;
 
-/// The identity of one received record. `record_key` is the SHA-256, in hex,
-/// of the connector, the provenance and the version; the parts are kept beside
-/// it. No record content is stored.
+/// The identity of one received record, kept as its `record_key`
+/// ([`crate::domain::record_intake::record_key`]) with the connector and the
+/// subject. The provenance and the version are not stored, since a provenance
+/// can hold record content.
 ///
 /// @cpt-dod:cpt-cf-construct-dod-record-intake-storage:p1
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Scopable)]
@@ -17,8 +18,6 @@ pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
     pub record_key: String,
     pub connector: String,
-    pub provenance: String,
-    pub version: String,
     pub subject_id: Option<Uuid>,
     pub received_at: OffsetDateTime,
 }

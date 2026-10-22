@@ -62,12 +62,13 @@ toolkit-db = { workspace = true, features = ["sqlite"] }
 toolkit-db-macros = { workspace = true }
 toolkit-canonical-errors = { workspace = true, features = ["axum"] }
 toolkit-security = { workspace = true }
+# GTS type ids (gts_id!)
+toolkit-gts = { workspace = true }
 toolkit-macros = { workspace = true }
 
 [dev-dependencies]
 types-registry-sdk = { workspace = true, features = ["test-util"] }
 toolkit-db = { workspace = true, features = ["sqlite", "test-support"] }
-toolkit-gts = { workspace = true }
 tower = { workspace = true, features = ["util"] }
 proptest = { workspace = true }
 tracing-test = { workspace = true }

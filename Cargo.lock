@@ -2638,8 +2638,12 @@ dependencies = [
  "cf-gears-toolkit-gts",
  "cf-gears-toolkit-macros",
  "cf-gears-toolkit-security",
+ "gts",
  "jsonschema",
+ "schemars 1.2.1",
+ "serde",
  "serde_json",
+ "time",
  "uuid",
 ]
 
