@@ -46,3 +46,7 @@ pub(crate) fn db_err(e: &DomainError) -> Option<&DbErr> {
         _ => None,
     }
 }
+
+#[cfg(test)]
+#[path = "error_convert_tests.rs"]
+mod error_convert_tests;

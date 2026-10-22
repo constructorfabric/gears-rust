@@ -494,3 +494,7 @@ fn manifest_budget_cutoff(
     }
     versions.len()
 }
+
+#[cfg(test)]
+#[path = "read_ops_tests.rs"]
+mod read_ops_tests;
