@@ -452,10 +452,10 @@ converged); a retry whose bytes differ from the stored object is answered `409` 
 **regardless of the token's bind mode**: a replay whose size and content hash match the stored version is answered
 `200` — for a token carrying the `bind_on_finalize` claim
 (auto-bind `POST /files` path) a bind won at finalize replays as `bound` from the persisted `bound_on_finalize`
-flag, while a lost CAS is re-read against the file's *current* `content_id`, so a manual bind of this same version in
-between reads as `bound`, never the reverse (F4 in the concurrency-and-failure model); a manual-bind token converges
-the same way, simply with no
-bind-outcome headers to report, exactly as on the first call. A mismatched replay (different size or hash) is answered
+flag (only a won bind is sticky), while a lost CAS follows the file's *current* `content_id` on every replay: `bound`
+while the file points at this version, `conflict` with the current ETag otherwise (F4 in the concurrency-and-failure
+model); a manual-bind token converges the same way, simply with no bind-outcome headers to report, exactly as on
+the first call. A mismatched replay (different size or hash) is answered
 `409` — never a silent overwrite. Two finalize callbacks racing for the same version converge the same way: the one
 that loses the `pending → available` CAS re-reads the version and applies the same size/hash comparison. For the
 finalize case specifically, the version may already be correctly finalized server-side even though the client saw a

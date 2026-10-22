@@ -122,9 +122,9 @@ section keeps only the behavior the schema does not express.
   exactly like an auto-bind one, simply with no `X-FS-Bound`/`ETag` headers to report (as on the first call). An
   auto-bind retry that WON the CAS on its original call replays that exact `X-FS-Bound: true` + `ETag` outcome, even
   if the file's content has legitimately moved on to a different version since — never the current pointer's
-  `conflict`, which would contradict what the original call already returned. An auto-bind retry that LOST the CAS is re-read
-  against the current pointer instead: `conflict` with the current ETag, or `bound` if this version has since been
-  bound manually. With
+  `conflict`, which would contradict what the original call already returned. An auto-bind retry that LOST the CAS
+  follows the current pointer instead: `bound` while the file points at this version (e.g. after a manual bind of it),
+  `conflict` with the current ETag otherwise. With
   `bind: "manual"` (or `POST /files/{id}/versions`, which never auto-binds), the client follows up
   with an explicit `POST /files/{id}/bind` (see "Upload, bind, and the conflict retry" below).
 - **Version listing and hashes.** `GET /files/{id}/versions` is ordered `created_at DESC` with `version_id DESC` as
