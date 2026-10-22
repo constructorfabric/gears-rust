@@ -52,6 +52,12 @@ The PRD requires Construct to take records one at a time, check each against its
 
 **Taking a record.** The identity insert and the hand-off run in one transaction, which commits only after processing took the record. A hand-off that refuses (the Planner's full queue) rolls the identity back and answers `503`, so the connector can send the record again. A request cancelled before the commit, by a client that goes away or the gateway's timeout, leaves no identity behind either. A request cancelled while the commit is under way can leave the record handed off without its identity; a resend is then processed twice, which the Profile Writer's idempotent write tolerates.
 
+**What a connector can rely on.** `202` is best effort, not durable acceptance (DESIGN, Results API): the record's content stays only in memory, so a record lost after it was taken, by a stopped instance or a drop, is a repeat on resend. A connector that must have a record processed keeps its copy and sends it again with a new identity. A refusal stores nothing, so the same record can be sent again; whether a resend can succeed depends on the reason in the answer (`construct_sdk::reason`):
+
+- `SCHEMA_VIOLATION`, `ID_IN_PUSH`, `NOT_A_RECORD_TYPE` and `ABSTRACT_TYPE` are final for the record: only a corrected record can pass.
+- `UNKNOWN_TYPE` and `CONNECTOR_OFF` can clear: once the type is registered, or the tenant turns the connector on.
+- `PERSONALIZATION_OFF` and `ERASURE_IN_PROGRESS` are final for the record, though the state behind them can change: a connector **MUST NOT** send such a record again, so data from a time the subject opted out, or data an erasure removed, never comes back. Construct does not remember refusals, so it cannot enforce this; it is the connector's rule.
+
 **Until the Planner exists.** The stub takes every record and drops it, with a drop event: intake answers `202` and keeps the identity, as the story asks. A record received while the stub is wired in is not processed, and a resend after the Planner ships is a repeat; a connector that needs such a record processed sends it with a new version.
 
 **Out of scope**:
@@ -62,6 +68,7 @@ The PRD requires Construct to take records one at a time, check each against its
 - Erasure and retention of record identities.
 - How the personalization check, the identity insert and the later write stay in step when personalization is turned off between them; Admission's own check covers the write, and the DESIGN leaves the rest to later features.
 - Moving the connector side (the chat connector still sends a list to `/results/records`) to this wire format.
+- Binding a record to a connector contract. Intake takes no contract reference and checks none: the AuthZ resolver binds the connector to the tenant, and the subject's settings stand for consent. Two consequences stay open: a connector authorized for a tenant can send records about any subject in it, and once an erasure has finished and removed the record identities, a replay of the subject's records is taken again. Per-subject binding could come later as a policy on the subject, and the replay is the Erasure feature's.
 
 **Requirements**: `cpt-cf-construct-fr-record-intake`, `cpt-cf-construct-fr-settings` (shared: records refused while personalization is off or an erasure is under way), `cpt-cf-construct-fr-access-control` (the tenant named at intake), `cpt-cf-construct-fr-tenant-isolation`.
 
