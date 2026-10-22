@@ -150,7 +150,7 @@ async fn won_bind_replays_as_bound_after_the_file_is_rebound() {
     );
 }
 
-/// A lost CAS replays against the live pointer: `Conflict` with the current ETag, then `Bound`
+/// A lost CAS replays against the live pointer: `Conflict` with the current `ETag`, then `Bound`
 /// once this very version has been bound by hand.
 #[tokio::test]
 async fn lost_cas_replay_reads_the_live_pointer() {
