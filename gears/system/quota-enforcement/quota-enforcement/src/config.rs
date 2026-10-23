@@ -7,6 +7,7 @@ use gts::GtsTypeId;
 use serde::Deserialize;
 
 use crate::domain::catalog::CatalogConfig;
+use crate::domain::notifications::DispatchLimits;
 use crate::domain::policies::schemas::SnapshotLimits;
 use crate::domain::policies::{EvaluationLimits, PolicyLimits, PolicyRuntimeLimits};
 use crate::domain::quotas::{GaugeTiming, QuotaLimits};
@@ -36,6 +37,16 @@ pub struct QuotaEnforcementConfig {
     pub policies: PoliciesSection,
     /// Timing of the lifecycle-gauge refresh.
     pub gauges: GaugesSection,
+    /// Bounds of the consumption hot path.
+    pub operations: OperationsSection,
+    /// Timing of the retention sweeper.
+    pub retention: RetentionSection,
+    /// The lease TTL window and the lease sweeper's timing.
+    pub leases: LeasesSection,
+    /// Bounds of the snapshot read.
+    pub snapshot: SnapshotSection,
+    /// Retry and timeout bounds of notification dispatch.
+    pub notifications: NotificationsSection,
 }
 
 impl Default for QuotaEnforcementConfig {
@@ -50,6 +61,11 @@ impl Default for QuotaEnforcementConfig {
             quotas: QuotasSection::default(),
             policies: PoliciesSection::default(),
             gauges: GaugesSection::default(),
+            operations: OperationsSection::default(),
+            retention: RetentionSection::default(),
+            leases: LeasesSection::default(),
+            snapshot: SnapshotSection::default(),
+            notifications: NotificationsSection::default(),
         }
     }
 }
@@ -78,7 +94,12 @@ impl QuotaEnforcementConfig {
         self.catalog.validate()?;
         self.quotas.validate()?;
         self.policies.validate()?;
-        self.gauges.validate()
+        self.gauges.validate()?;
+        self.operations.validate()?;
+        self.retention.validate()?;
+        self.leases.validate()?;
+        self.snapshot.validate()?;
+        self.notifications.validate()
     }
 
     /// Budget for a sweep body to stop after leadership loss or shutdown.
@@ -253,6 +274,11 @@ impl CatalogSection {
     }
 }
 
+/// The most items any bulk Quota envelope may carry, whatever the operator
+/// configures. Checked before any authorization call, so the PDP work one
+/// envelope can cause stays bounded.
+pub const BULK_MAX_ITEMS_CEILING: usize = crate::domain::quotas::BULK_MAX_ITEMS_CEILING;
+
 /// Bounds of the Quota lifecycle surface (`[quota-enforcement.quotas]`).
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
@@ -274,6 +300,9 @@ pub struct QuotasSection {
     pub list_max_limit: u32,
     /// Largest number of explicit ids one list request may name.
     pub list_max_ids: usize,
+    /// Most items one bulk create, update, or deactivate may carry (PRD
+    /// section 5.2, default 50). At most [`BULK_MAX_ITEMS_CEILING`].
+    pub bulk_max_items: usize,
 }
 
 impl Default for QuotasSection {
@@ -285,6 +314,7 @@ impl Default for QuotasSection {
             metric_cache_stale_grace_secs: 300,
             list_max_limit: 500,
             list_max_ids: 100,
+            bulk_max_items: 50,
         }
     }
 }
@@ -321,6 +351,11 @@ impl QuotasSection {
         if self.list_max_ids == 0 {
             anyhow::bail!("[quota-enforcement.quotas].list_max_ids must be at least 1");
         }
+        if self.bulk_max_items == 0 || self.bulk_max_items > BULK_MAX_ITEMS_CEILING {
+            anyhow::bail!(
+                "[quota-enforcement.quotas].bulk_max_items must be in 1..={BULK_MAX_ITEMS_CEILING}"
+            );
+        }
         Ok(())
     }
 
@@ -331,6 +366,7 @@ impl QuotasSection {
             metadata_max_bytes: self.metadata_max_bytes,
             list_max_limit: self.list_max_limit,
             list_max_ids: self.list_max_ids,
+            bulk_max_items: self.bulk_max_items,
         }
     }
 
@@ -577,3 +613,337 @@ impl GaugesSection {
 #[cfg_attr(coverage_nightly, coverage(off))]
 #[path = "config_tests.rs"]
 mod config_tests;
+
+/// Bounds of the snapshot read (`[quota-enforcement.snapshot]`).
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct SnapshotSection {
+    /// The most rows one page returns, and the page size when a request names
+    /// none. No request may ask for more.
+    pub page_size: u32,
+    /// The most subjects one request may name.
+    pub max_filters: usize,
+}
+
+impl SnapshotSection {
+    /// The largest `page_size` an operator may configure: the most rows the
+    /// storage plugin serves in one page.
+    pub const PAGE_SIZE_CEILING: u32 = 500;
+    /// The largest `max_filters` an operator may configure, so one request
+    /// cannot carry an impractical PDP document or storage query.
+    pub const MAX_FILTERS_CEILING: usize = 500;
+
+    /// Reject bounds outside their ranges.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error naming the field that is out of its range.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.page_size == 0 || self.page_size > Self::PAGE_SIZE_CEILING {
+            anyhow::bail!(
+                "[quota-enforcement.snapshot].page_size must be in 1..={}",
+                Self::PAGE_SIZE_CEILING
+            );
+        }
+        if self.max_filters == 0 || self.max_filters > Self::MAX_FILTERS_CEILING {
+            anyhow::bail!(
+                "[quota-enforcement.snapshot].max_filters must be in 1..={}",
+                Self::MAX_FILTERS_CEILING
+            );
+        }
+        Ok(())
+    }
+
+    /// The snapshot read's bounds.
+    #[must_use]
+    pub const fn to_limits(&self) -> crate::domain::operations::SnapshotLimits {
+        crate::domain::operations::SnapshotLimits {
+            page_size: self.page_size,
+            max_filters: self.max_filters,
+        }
+    }
+}
+
+impl Default for SnapshotSection {
+    fn default() -> Self {
+        Self {
+            page_size: 100,
+            max_filters: 100,
+        }
+    }
+}
+
+/// Retry and timeout bounds of notification dispatch
+/// (`[quota-enforcement.notifications]`).
+///
+/// An event whose delivery keeps failing transiently is dead-lettered once it
+/// has failed `max_attempts` times: the first delivery counts 0, so that is
+/// `max_attempts + 1` calls in all, spread over `ToolKit`'s retry backoff.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct NotificationsSection {
+    /// Failed deliveries after which a still-failing event is dead-lettered.
+    pub max_attempts: u16,
+    /// Budget, in milliseconds, for one sink to take one event. A call is
+    /// also cut short when the outbox lease has less time left.
+    pub sink_timeout_ms: u64,
+}
+
+impl NotificationsSection {
+    /// The largest `max_attempts`: `ToolKit` counts attempts in an `i16`.
+    pub const MAX_ATTEMPTS_CEILING: u16 = i16::MAX.unsigned_abs();
+    /// The largest `sink_timeout_ms`, below the outbox lease's usable budget
+    /// (a 30-second lease less 2 seconds of headroom), so a sink that uses
+    /// its whole timeout does not cost the lease.
+    pub const SINK_TIMEOUT_CEILING_MS: u64 = 27_999;
+
+    /// Reject bounds outside their ranges.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error naming the field that is out of its range.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.max_attempts == 0 || self.max_attempts > Self::MAX_ATTEMPTS_CEILING {
+            anyhow::bail!(
+                "[quota-enforcement.notifications].max_attempts must be in 1..={}",
+                Self::MAX_ATTEMPTS_CEILING
+            );
+        }
+        if self.sink_timeout_ms == 0 || self.sink_timeout_ms > Self::SINK_TIMEOUT_CEILING_MS {
+            anyhow::bail!(
+                "[quota-enforcement.notifications].sink_timeout_ms must be in 1..={}",
+                Self::SINK_TIMEOUT_CEILING_MS
+            );
+        }
+        Ok(())
+    }
+
+    /// Budget for one sink to take one event.
+    #[must_use]
+    pub const fn sink_timeout(&self) -> Duration {
+        Duration::from_millis(self.sink_timeout_ms)
+    }
+
+    /// The dispatcher's bounds.
+    #[must_use]
+    pub const fn to_limits(&self) -> DispatchLimits {
+        DispatchLimits {
+            max_attempts: self.max_attempts,
+            sink_timeout: self.sink_timeout(),
+        }
+    }
+}
+
+impl Default for NotificationsSection {
+    fn default() -> Self {
+        Self {
+            max_attempts: 10,
+            sink_timeout_ms: 2000,
+        }
+    }
+}
+
+/// Bounds of the consumption hot path (`[quota-enforcement.operations]`).
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct OperationsSection {
+    /// Replay records the in-process cache holds before evicting the least
+    /// recently used one.
+    pub idempotency_cache_entries: usize,
+    /// How long a cached record may answer a replay, in milliseconds. An entry
+    /// never outlives the record's own retention whatever this says.
+    pub idempotency_cache_ttl_ms: u64,
+    /// Most items one batch debit may carry.
+    pub max_batch_items: usize,
+    /// Batch-level evaluation timeout, in milliseconds. It supersedes each
+    /// item's per-policy timeout for the batch as a whole.
+    pub batch_timeout_ms: u64,
+}
+
+impl Default for OperationsSection {
+    fn default() -> Self {
+        Self {
+            idempotency_cache_entries: 4096,
+            // The P1 reference default of the idempotency-replay algorithm.
+            idempotency_cache_ttl_ms: 5_000,
+            max_batch_items: 100,
+            batch_timeout_ms: 250,
+        }
+    }
+}
+
+impl OperationsSection {
+    /// Reject bounds the hot path cannot serve with.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error naming the field that is out of its range.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.idempotency_cache_entries == 0 {
+            anyhow::bail!(
+                "[quota-enforcement.operations].idempotency_cache_entries must be at least 1"
+            );
+        }
+        if self.idempotency_cache_ttl_ms == 0 {
+            anyhow::bail!(
+                "[quota-enforcement.operations].idempotency_cache_ttl_ms must be at least 1"
+            );
+        }
+        if self.max_batch_items == 0 {
+            anyhow::bail!("[quota-enforcement.operations].max_batch_items must be at least 1");
+        }
+        if self.batch_timeout_ms == 0 {
+            anyhow::bail!("[quota-enforcement.operations].batch_timeout_ms must be at least 1");
+        }
+        Ok(())
+    }
+
+    /// The batch debit's bounds.
+    #[must_use]
+    pub const fn to_batch_limits(&self) -> crate::domain::operations::BatchLimits {
+        crate::domain::operations::BatchLimits {
+            max_items: self.max_batch_items,
+            timeout: Duration::from_millis(self.batch_timeout_ms),
+        }
+    }
+
+    /// How long a cached record may answer.
+    #[must_use]
+    pub const fn idempotency_cache_ttl(&self) -> Duration {
+        Duration::from_millis(self.idempotency_cache_ttl_ms)
+    }
+}
+
+/// Timing of the retention sweeper (`[quota-enforcement.retention]`).
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct RetentionSection {
+    /// Seconds between sweeps.
+    pub interval_secs: u64,
+    /// Rows one delete statement reclaims.
+    pub batch_size: u32,
+    /// Days operation-log rows are kept. Idempotency retention is
+    /// per-`(tenant, metric)` configuration the storage plugin reads itself.
+    pub operation_log_retention_days: u32,
+}
+
+impl Default for RetentionSection {
+    fn default() -> Self {
+        Self {
+            interval_secs: 300,
+            batch_size: 1_000,
+            operation_log_retention_days: 30,
+        }
+    }
+}
+
+impl RetentionSection {
+    /// Reject timings the sweeper cannot run with.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error naming the field that is out of its range.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.interval_secs == 0 {
+            anyhow::bail!("[quota-enforcement.retention].interval_secs must be at least 1");
+        }
+        if self.batch_size == 0 {
+            anyhow::bail!("[quota-enforcement.retention].batch_size must be at least 1");
+        }
+        if self.operation_log_retention_days == 0 {
+            anyhow::bail!(
+                "[quota-enforcement.retention].operation_log_retention_days must be at least 1"
+            );
+        }
+        Ok(())
+    }
+
+    /// The domain view of the sweeper timing.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a bound is zero, which [`Self::validate`] has
+    /// already rejected at startup.
+    pub fn to_timing(&self) -> anyhow::Result<crate::domain::operations::RetentionTiming> {
+        Ok(crate::domain::operations::RetentionTiming {
+            interval: Duration::from_secs(self.interval_secs),
+            batch_size: std::num::NonZeroU32::new(self.batch_size)
+                .ok_or_else(|| anyhow::anyhow!("retention batch size must be at least 1"))?,
+            operation_log_retention: time::Duration::days(i64::from(
+                self.operation_log_retention_days,
+            )),
+        })
+    }
+}
+
+/// The lease TTL window and the lease sweeper's timing
+/// (`[quota-enforcement.leases]`).
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct LeasesSection {
+    /// Shortest TTL an acquisition may ask for, in seconds.
+    pub min_ttl_secs: u64,
+    /// Longest TTL an acquisition may ask for, in seconds.
+    pub max_ttl_secs: u64,
+    /// Seconds between lease sweeps.
+    pub sweep_interval_secs: u64,
+    /// Leases one reclamation transaction transitions.
+    pub sweep_batch_size: u32,
+}
+
+impl Default for LeasesSection {
+    fn default() -> Self {
+        Self {
+            min_ttl_secs: 1,
+            max_ttl_secs: 3_600,
+            sweep_interval_secs: 60,
+            sweep_batch_size: 1_000,
+        }
+    }
+}
+
+impl LeasesSection {
+    /// Reject a window or timing the lease path cannot run with.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error naming the field that is out of its range.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.min_ttl_secs == 0 {
+            anyhow::bail!("[quota-enforcement.leases].min_ttl_secs must be at least 1");
+        }
+        if self.max_ttl_secs < self.min_ttl_secs {
+            anyhow::bail!("[quota-enforcement.leases].max_ttl_secs must be at least min_ttl_secs");
+        }
+        if self.sweep_interval_secs == 0 {
+            anyhow::bail!("[quota-enforcement.leases].sweep_interval_secs must be at least 1");
+        }
+        if self.sweep_batch_size == 0 {
+            anyhow::bail!("[quota-enforcement.leases].sweep_batch_size must be at least 1");
+        }
+        Ok(())
+    }
+
+    /// The TTL window acquisitions are checked against.
+    #[must_use]
+    pub const fn to_limits(&self) -> crate::domain::operations::LeaseLimits {
+        crate::domain::operations::LeaseLimits {
+            min_ttl: Duration::from_secs(self.min_ttl_secs),
+            max_ttl: Duration::from_secs(self.max_ttl_secs),
+        }
+    }
+
+    /// The domain view of the sweeper timing.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the batch size is zero, which [`Self::validate`]
+    /// has already rejected at startup.
+    pub fn to_sweep_timing(&self) -> anyhow::Result<crate::domain::operations::LeaseSweepTiming> {
+        Ok(crate::domain::operations::LeaseSweepTiming {
+            interval: Duration::from_secs(self.sweep_interval_secs),
+            batch_size: std::num::NonZeroU32::new(self.sweep_batch_size)
+                .ok_or_else(|| anyhow::anyhow!("lease sweep batch size must be at least 1"))?,
+        })
+    }
+}

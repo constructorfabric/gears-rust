@@ -21,7 +21,7 @@ workspace = true
 [features]
 # Exposes `pub mod testing`: a complete in-memory double of the storage plugin
 # contract. Test-only; never enable in a production build.
-test-util = ["dep:parking_lot"]
+test-util = ["dep:parking_lot", "dep:tokio"]
 
 [dependencies]
 async-trait = { workspace = true }
@@ -31,6 +31,9 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 schemars = { workspace = true }
 time = { workspace = true }
+
+# Canonical digests: the idempotency subject key and the request payload hash
+aws-lc-rs = { workspace = true }
 
 # GTS types. `inventory` carries the QE-owned GTS definitions into the
 # process-wide registry seed (`toolkit_gts::InventoryTypeSchema`).
@@ -44,6 +47,8 @@ toolkit-security = { workspace = true }
 toolkit-canonical-errors = { workspace = true }
 
 parking_lot = { workspace = true, optional = true }
+# The in-memory double's drain lock, held across a delivery callback.
+tokio = { workspace = true, features = ["sync"], optional = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt", "macros"] }
+tokio = { workspace = true, features = ["rt", "macros", "sync", "time"] }

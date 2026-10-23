@@ -2,8 +2,9 @@
 //!
 //! `init` wires the PEP boundary, the domain service, the in-process manager
 //! client, and the cluster coordination binding. The lifecycle entry runs the
-//! fail-closed bootstrap before the ready signal, then hosts the leader-only
-//! lifecycle-gauge refresh under a child token. The REST surface mounts into
+//! fail-closed bootstrap before the ready signal, which ends by starting
+//! notification delivery, then hosts the leader-only sweepers under child
+//! tokens, and stops delivery on shutdown. The REST surface mounts into
 //! the platform `api-gateway`; the readiness check reports the bootstrap state
 //! and the cluster requirements verdict.
 //!
@@ -38,6 +39,7 @@ use crate::domain::{
     LifecycleGaugeRefresher, PluginBinding, Readiness, Service, SingletonScope,
 };
 use crate::infra::cluster_coordination::{ClusterCoordinationBinding, ElectionTiming};
+use crate::infra::lease_backlog::LeaseBacklogCell;
 use crate::infra::lifecycle_gauges::LifecycleGaugeCell;
 use crate::infra::metric_registry::CachedMetricRegistry;
 use crate::infra::metrics;
@@ -65,11 +67,19 @@ pub struct QuotaEnforcementGear {
     gauges: OnceLock<GaugeWiring>,
 }
 
-/// What the lifecycle entry needs to host the gauge refresh.
+/// What the lifecycle entry needs to host its leader-only tasks.
 struct GaugeWiring {
     cell: Arc<LifecycleGaugeCell>,
     timing: GaugeTiming,
     stop_timeout: Duration,
+    /// Telemetry sink of the retention sweeper.
+    metrics: Arc<dyn QeMetrics>,
+    /// Timing of the retention sweeper.
+    retention: crate::domain::operations::RetentionTiming,
+    /// The sample cell of `lease_unreclaimed_expired`.
+    lease_backlog: Arc<LeaseBacklogCell>,
+    /// Timing of the lease sweeper.
+    lease_sweep: crate::domain::operations::LeaseSweepTiming,
 }
 
 impl Default for QuotaEnforcementGear {
@@ -97,6 +107,13 @@ impl QuotaEnforcementGear {
         self.gauges.get().map(|wiring| wiring.cell.clone())
     }
 
+    /// The lease backlog sample cell, once `init` ran. Holds a sample only
+    /// while this replica leads the lease sweeper.
+    #[must_use]
+    pub fn lease_backlog(&self) -> Option<Arc<LeaseBacklogCell>> {
+        self.gauges.get().map(|wiring| wiring.lease_backlog.clone())
+    }
+
     /// Lifecycle entry: bootstrap, signal ready, host the leader-only gauge
     /// refresh, then stop on shutdown.
     ///
@@ -116,13 +133,25 @@ impl QuotaEnforcementGear {
         ready: ReadySignal,
     ) -> anyhow::Result<()> {
         let (service, bootstrap, gauges) = self.initialised()?;
-        let bound = bootstrap_or_shutdown(bootstrap, &cancel).await?;
+        let delivery = bootstrap.delivery();
+        let bound = bootstrap_or_stop(bootstrap, &cancel, gauges.stop_timeout).await?;
         let refresher = LifecycleGaugeRefresher::new(
             bound.storage.clone(),
             bound.metric_registry.clone(),
             gauges.cell.clone() as Arc<dyn LifecycleGaugeSink>,
             gauges.timing,
         );
+        let sweeper = Arc::new(crate::domain::operations::RetentionSweeper::new(
+            bound.storage.clone(),
+            Arc::clone(&gauges.metrics),
+            gauges.retention,
+        ));
+        let lease_sweeper = Arc::new(crate::domain::operations::LeaseSweeper::new(
+            bound.storage.clone(),
+            Arc::clone(&bound.classifications),
+            gauges.lease_backlog.clone() as Arc<dyn crate::domain::ports::LeaseBacklogSink>,
+            gauges.lease_sweep,
+        ));
         let coordinator = bound.coordinator.clone();
         service
             .bind(bound)
@@ -131,10 +160,40 @@ impl QuotaEnforcementGear {
         ready.notify();
         info!(target: LOG_TARGET, "quota-enforcement is ready");
 
-        let gauge_task = spawn_gauge_refresh(coordinator, refresher, cancel.child_token());
+        let gauge_task = spawn_leader_task(
+            coordinator.clone(),
+            SingletonScope::LifecycleGauges,
+            refresher.leader_work(),
+            cancel.child_token(),
+        );
+        // @cpt-begin:cpt-cf-quota-enforcement-algo-retention-sweep:p1:inst-ret-elect
+        let retention_task = spawn_leader_task(
+            coordinator.clone(),
+            SingletonScope::RetentionSweeper,
+            sweeper.leader_work(),
+            cancel.child_token(),
+        );
+        // @cpt-end:cpt-cf-quota-enforcement-algo-retention-sweep:p1:inst-ret-elect
+        // @cpt-begin:cpt-cf-quota-enforcement-algo-lease-sweep:p1:inst-swp-elect
+        let lease_task = spawn_leader_task(
+            coordinator,
+            SingletonScope::LeaseSweeper,
+            lease_sweeper.leader_work(),
+            cancel.child_token(),
+        );
+        // @cpt-end:cpt-cf-quota-enforcement-algo-lease-sweep:p1:inst-swp-elect
         cancel.cancelled().await;
         info!(target: LOG_TARGET, "quota-enforcement is stopping");
-        join_gauge_refresh(gauge_task, gauges.stop_timeout).await;
+        stop_background(
+            [
+                ("lifecycle gauge", gauge_task),
+                ("retention sweeper", retention_task),
+                ("lease sweeper", lease_task),
+            ],
+            &delivery,
+            gauges.stop_timeout,
+        )
+        .await;
         Ok(())
     }
 }
@@ -165,38 +224,72 @@ async fn bootstrap_or_shutdown(
     }
 }
 
+/// [`bootstrap_or_shutdown`], stopping notification delivery when it fails: a
+/// shutdown can interrupt bootstrap after delivery started.
+async fn bootstrap_or_stop(
+    bootstrap: &Bootstrap,
+    cancel: &CancellationToken,
+    stop_timeout: Duration,
+) -> anyhow::Result<Bound> {
+    let outcome = bootstrap_or_shutdown(bootstrap, cancel).await;
+    if outcome.is_err() {
+        stop_delivery(&bootstrap.delivery(), stop_timeout).await;
+    }
+    outcome
+}
+
+/// A leader-only task: its election's outcome once it stops.
+type LeaderTask = tokio::task::JoinHandle<Result<(), crate::domain::DomainError>>;
+
 /// Leader-only: the elected replica refreshes and publishes the gauge sample;
 /// every other replica publishes nothing. Leadership loss cancels the child
 /// token and the refresher withdraws its sample.
-fn spawn_gauge_refresh(
+fn spawn_leader_task(
     coordinator: Arc<dyn crate::domain::SingletonCoordinator>,
-    refresher: Arc<LifecycleGaugeRefresher>,
+    scope: SingletonScope,
+    work: crate::domain::ports::coordination::LeaderWork,
     shutdown: CancellationToken,
-) -> tokio::task::JoinHandle<Result<(), crate::domain::DomainError>> {
-    tokio::spawn(async move {
-        coordinator
-            .run_while_leader(
-                SingletonScope::LifecycleGauges,
-                shutdown,
-                refresher.leader_work(),
-            )
-            .await
-    })
+) -> LeaderTask {
+    tokio::spawn(async move { coordinator.run_while_leader(scope, shutdown, work).await })
 }
 
-/// Wait for the gauge task to stop within `budget`; a slow or failed stop is
+/// Wait for a leader task to stop within `budget`; a slow or failed stop is
 /// logged, never an error of the lifecycle entry.
-async fn join_gauge_refresh(
-    task: tokio::task::JoinHandle<Result<(), crate::domain::DomainError>>,
-    budget: Duration,
-) {
+async fn join_leader_task(name: &str, task: LeaderTask, budget: Duration) {
     let failure = match tokio::time::timeout(budget, task).await {
         Ok(Ok(Ok(()))) => return,
-        Ok(Ok(Err(err))) => format!("lifecycle gauge election ended with an error: {err}"),
-        Ok(Err(join)) => format!("lifecycle gauge task did not finish cleanly: {join}"),
-        Err(_elapsed) => format!("lifecycle gauge task did not stop within {budget:?}"),
+        Ok(Ok(Err(err))) => format!("{name} election ended with an error: {err}"),
+        Ok(Err(join)) => format!("{name} task did not finish cleanly: {join}"),
+        Err(_elapsed) => format!("{name} task did not stop within {budget:?}"),
     };
     tracing::warn!(target: LOG_TARGET, "{failure}");
+}
+
+/// Stop the leader tasks, then notification delivery, each within `budget`.
+async fn stop_background(
+    tasks: [(&str, LeaderTask); 3],
+    delivery: &crate::domain::notifications::DeliveryLifecycle,
+    budget: Duration,
+) {
+    for (name, task) in tasks {
+        join_leader_task(name, task, budget).await;
+    }
+    stop_delivery(delivery, budget).await;
+}
+
+/// Stop notification delivery within `budget`; events it did not finish stay
+/// queued for the next processor. A slow stop is logged, never an error of
+/// the lifecycle entry.
+async fn stop_delivery(
+    delivery: &crate::domain::notifications::DeliveryLifecycle,
+    budget: Duration,
+) {
+    if tokio::time::timeout(budget, delivery.stop()).await.is_err() {
+        tracing::warn!(
+            target: LOG_TARGET,
+            "notification delivery did not stop within {budget:?}"
+        );
+    }
 }
 
 #[async_trait]
@@ -210,9 +303,7 @@ impl Gear for QuotaEnforcementGear {
         cfg.validate()?;
         tracing::Span::current().record("storage_vendor", cfg.storage_vendor.as_str());
 
-        // PEP boundary: the PDP client is a hard dependency. Without it the gear
-        // fails init and never serves a permissive decision. Whether the PDP
-        // behind the client answers is bootstrap's probe.
+        // The PDP client is mandatory; bootstrap separately probes reachability.
         let hub = ctx.client_hub();
         let authz: Arc<dyn AuthZResolverApi> = hub
             .get::<dyn AuthZResolverApi>()
@@ -221,9 +312,7 @@ impl Gear for QuotaEnforcementGear {
         // The SDK default is a hang guard, far above the admission latency budget.
         let enforcer = PolicyEnforcer::new(authz).with_deadline(cfg.pdp_deadline());
 
-        // The projection contract catalogue is built from the types registry at
-        // bootstrap; without the client there is no catalogue to publish. The
-        // same client answers metric identity and classification for writes.
+        // Bootstrap builds the projection catalogue from this registry client.
         let registry: Arc<dyn TypesRegistryClient> = hub
             .get::<dyn TypesRegistryClient>()
             .with_context(|| format!("{} requires a types-registry client", Self::MODULE_NAME))?;
@@ -242,8 +331,9 @@ impl Gear for QuotaEnforcementGear {
         ));
 
         let gauge_cell = Arc::new(LifecycleGaugeCell::default());
+        let lease_backlog = Arc::new(LeaseBacklogCell::default());
         let metrics: Arc<dyn QeMetrics> =
-            metrics::build_default_adapter(&cfg.metrics, gauge_cell.clone());
+            metrics::build_default_adapter(&cfg.metrics, gauge_cell.clone(), lease_backlog.clone());
         let readiness = Arc::new(Readiness::new());
         let admission = Admission::new(enforcer, metrics.clone());
         let policy_limits = cfg
@@ -255,10 +345,21 @@ impl Gear for QuotaEnforcementGear {
             readiness.clone(),
             cfg.quotas.to_limits(),
             policy_limits,
+            crate::domain::service::OperationsRuntime {
+                cache_entries: cfg.operations.idempotency_cache_entries,
+                cache_ttl: cfg.operations.idempotency_cache_ttl(),
+                preparation_max_attempts: policy_limits.preparation_max_attempts,
+                leases: cfg.leases.to_limits(),
+                batch: cfg.operations.to_batch_limits(),
+                snapshot: cfg.snapshot.to_limits(),
+            },
         ));
-        // The in-process manager client enters the domain where REST does.
+        // In-process clients share the REST domain boundary.
         hub.register::<dyn quota_enforcement_sdk::QuotaOperatorClientV1>(Arc::new(
             crate::api::in_process::InProcessQuotaOperator::new(service.clone()),
+        ));
+        hub.register::<dyn quota_enforcement_sdk::QuotaEnforcementClientV1>(Arc::new(
+            crate::api::in_process::InProcessQuotaEnforcement::new(service.clone()),
         ));
         hub.register::<dyn QuotaManagerClientV1>(Arc::new(InProcessQuotaManager::new(
             service.clone(),
@@ -278,14 +379,28 @@ impl Gear for QuotaEnforcementGear {
             pdp_probe,
             catalog,
             metric_registry,
-            BootstrapReporting { metrics, readiness },
+            BootstrapReporting {
+                metrics: Arc::clone(&metrics),
+                readiness,
+            },
             policy_limits,
-        );
+        )
+        .with_dispatch(cfg.notifications.to_limits());
 
         let gauges = GaugeWiring {
             cell: gauge_cell,
             timing: cfg.gauges.to_timing(),
             stop_timeout: cfg.sweeper_stop_timeout(),
+            metrics: Arc::clone(&metrics),
+            retention: cfg
+                .retention
+                .to_timing()
+                .context("[quota-enforcement.retention] is not a valid sweeper timing")?,
+            lease_backlog,
+            lease_sweep: cfg
+                .leases
+                .to_sweep_timing()
+                .context("[quota-enforcement.leases] is not a valid sweeper timing")?,
         };
         set_once(&self.gauges, gauges)?;
         set_once(&self.hub, hub)?;
@@ -327,10 +442,7 @@ impl RestApiCapability for QuotaEnforcementGear {
 
     fn healthcheck(&self, _ctx: &GearCtx) -> Option<Arc<dyn Healthcheck>> {
         let service = self.service.get()?;
-        // The cluster SDK's readiness contributor re-validates the profile
-        // requirements when the resolve deferred them, and reports a process
-        // with no cluster client wired at all. It has to be returned from a
-        // gear's `healthcheck()`; the SDK cannot register it itself.
+        // The cluster contributor reports deferred profile or wiring failures.
         let cluster = self
             .hub
             .get()

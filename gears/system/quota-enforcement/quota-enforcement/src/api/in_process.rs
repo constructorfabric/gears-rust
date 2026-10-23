@@ -1,5 +1,6 @@
 //! The in-process `QuotaManagerClientV1`: the SDK client trait over the domain
-//! service, registered in `ClientHub` at `init`.
+//! service, registered in `ClientHub` at `init`. It carries Quota management
+//! and credit, the management-plane counter correction.
 //!
 //! It enters the domain exactly where REST does (`Service::quotas`), so both
 //! transports share one admission boundary. Before bootstrap binds the
@@ -9,13 +10,18 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use quota_enforcement_sdk::{
-    DeactivateOutcome, PageRequest, PageResult, QuotaEnforcementError, QuotaFilter, QuotaId,
-    QuotaManagerClientV1, QuotaPatch, QuotaSpec, QuotaView,
+    BulkCreateQuotasRequest, BulkCreated, BulkDeactivateQuotasRequest, BulkDeactivated,
+    BulkUpdateQuotasRequest, BulkUpdated, DeactivateOutcome, PageRequest, PageResult,
+    QuotaEnforcementError, QuotaFilter, QuotaId, QuotaManagerClientV1, QuotaPatch, QuotaSpec,
+    QuotaView,
 };
 use toolkit_security::SecurityContext;
 
 use crate::domain::Service;
-use crate::domain::quotas::{CreateQuotaRequest, ListQuotasRequest, UpdateQuotaRequest};
+use crate::domain::quotas::{
+    BulkCreateItem, BulkCreateRequest, BulkDeactivateItem, BulkDeactivateRequest, BulkUpdateItem,
+    BulkUpdateRequest, CreateQuotaRequest, ListQuotasRequest, UpdateQuotaRequest,
+};
 
 /// The gear's own implementation of the manager client.
 pub struct InProcessQuotaManager {
@@ -75,6 +81,102 @@ impl QuotaManagerClientV1 for InProcessQuotaManager {
             .list(ctx, ListQuotasRequest::from((filter, page)))
             .await?)
     }
+
+    async fn credit(
+        &self,
+        ctx: &SecurityContext,
+        request: quota_enforcement_sdk::CreditRequest,
+    ) -> Result<quota_enforcement_sdk::Decision, QuotaEnforcementError> {
+        Ok(self.service.operations()?.credit(ctx, request).await?)
+    }
+
+    async fn bulk_create_quotas(
+        &self,
+        ctx: &SecurityContext,
+        request: BulkCreateQuotasRequest,
+    ) -> Result<BulkCreated, QuotaEnforcementError> {
+        let quotas = self.service.quotas()?;
+        let items = create_items(request.items);
+        Ok(quotas
+            .bulk_create(
+                ctx,
+                BulkCreateRequest {
+                    tenant_id: request.tenant_id,
+                    idempotency_key: request.idempotency_key,
+                    items,
+                },
+            )
+            .await?)
+    }
+
+    async fn bulk_update_quotas(
+        &self,
+        ctx: &SecurityContext,
+        request: BulkUpdateQuotasRequest,
+    ) -> Result<BulkUpdated, QuotaEnforcementError> {
+        let quotas = self.service.quotas()?;
+        let items = update_items(request.items);
+        Ok(quotas
+            .bulk_update(
+                ctx,
+                BulkUpdateRequest {
+                    tenant_id: request.tenant_id,
+                    idempotency_key: request.idempotency_key,
+                    items,
+                },
+            )
+            .await?)
+    }
+
+    async fn bulk_deactivate_quotas(
+        &self,
+        ctx: &SecurityContext,
+        request: BulkDeactivateQuotasRequest,
+    ) -> Result<BulkDeactivated, QuotaEnforcementError> {
+        let quotas = self.service.quotas()?;
+        Ok(quotas
+            .bulk_deactivate(
+                ctx,
+                BulkDeactivateRequest {
+                    tenant_id: request.tenant_id,
+                    idempotency_key: request.idempotency_key,
+                    items: request
+                        .items
+                        .into_iter()
+                        .map(|item| BulkDeactivateItem {
+                            idempotency_key: item.idempotency_key,
+                            quota_id: item.quota_id,
+                        })
+                        .collect(),
+                },
+            )
+            .await?)
+    }
+}
+
+/// The domain items of a bulk create. A spec that does not narrow to a
+/// request carries its error to the item checks, after the envelope's own.
+fn create_items(items: Vec<quota_enforcement_sdk::BulkCreateItem>) -> Vec<BulkCreateItem> {
+    items
+        .into_iter()
+        .map(|item| BulkCreateItem {
+            idempotency_key: item.idempotency_key,
+            request: CreateQuotaRequest::try_from(item.spec),
+        })
+        .collect()
+}
+
+/// The domain items of a bulk update; a patch that does not narrow carries its
+/// error likewise.
+fn update_items(items: Vec<quota_enforcement_sdk::BulkUpdateItem>) -> Vec<BulkUpdateItem> {
+    items
+        .into_iter()
+        .map(|item| BulkUpdateItem {
+            idempotency_key: item.idempotency_key,
+            quota_id: item.quota_id,
+            request: UpdateQuotaRequest::try_from(item.patch),
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -150,5 +252,103 @@ impl quota_enforcement_sdk::QuotaOperatorClientV1 for InProcessQuotaOperator {
             .policies()?
             .list(ctx, &id, Some(page.limit), page.cursor)
             .await?)
+    }
+}
+
+/// The gear's own implementation of the consumer client.
+///
+/// It enters the domain at the same admission step the REST surface does, so
+/// an in-process caller and an HTTP caller share one authorization boundary.
+pub struct InProcessQuotaEnforcement {
+    service: Arc<Service>,
+}
+
+impl InProcessQuotaEnforcement {
+    /// Wrap the domain service.
+    #[must_use]
+    pub fn new(service: Arc<Service>) -> Self {
+        Self { service }
+    }
+}
+
+#[async_trait]
+impl quota_enforcement_sdk::QuotaEnforcementClientV1 for InProcessQuotaEnforcement {
+    async fn debit(
+        &self,
+        ctx: &SecurityContext,
+        request: quota_enforcement_sdk::DebitRequest,
+    ) -> Result<quota_enforcement_sdk::Decision, QuotaEnforcementError> {
+        Ok(self.service.operations()?.debit(ctx, request).await?)
+    }
+
+    async fn rollback(
+        &self,
+        ctx: &SecurityContext,
+        request: quota_enforcement_sdk::RollbackRequest,
+    ) -> Result<quota_enforcement_sdk::Decision, QuotaEnforcementError> {
+        Ok(self.service.operations()?.rollback(ctx, request).await?)
+    }
+
+    async fn evaluate_preview(
+        &self,
+        ctx: &SecurityContext,
+        request: quota_enforcement_sdk::PreviewRequest,
+    ) -> Result<quota_enforcement_sdk::DecisionPreview, QuotaEnforcementError> {
+        Ok(self.service.operations()?.preview(ctx, request).await?)
+    }
+
+    async fn acquire_lease(
+        &self,
+        ctx: &SecurityContext,
+        request: quota_enforcement_sdk::AcquireLeaseRequest,
+    ) -> Result<quota_enforcement_sdk::AcquireLeaseOutcome, QuotaEnforcementError> {
+        Ok(self
+            .service
+            .operations()?
+            .acquire_lease(ctx, request)
+            .await?)
+    }
+
+    async fn commit_lease(
+        &self,
+        ctx: &SecurityContext,
+        request: quota_enforcement_sdk::CommitLeaseRequest,
+    ) -> Result<quota_enforcement_sdk::Decision, QuotaEnforcementError> {
+        Ok(self
+            .service
+            .operations()?
+            .commit_lease(ctx, request)
+            .await?)
+    }
+
+    async fn release_lease(
+        &self,
+        ctx: &SecurityContext,
+        request: quota_enforcement_sdk::ReleaseLeaseRequest,
+    ) -> Result<quota_enforcement_sdk::Decision, QuotaEnforcementError> {
+        Ok(self
+            .service
+            .operations()?
+            .release_lease(ctx, request)
+            .await?)
+    }
+
+    async fn batch_debit(
+        &self,
+        ctx: &SecurityContext,
+        request: quota_enforcement_sdk::BatchDebitRequest,
+    ) -> Result<quota_enforcement_sdk::BatchDecision, QuotaEnforcementError> {
+        Ok(self.service.operations()?.batch_debit(ctx, request).await?)
+    }
+
+    async fn snapshot(
+        &self,
+        ctx: &SecurityContext,
+        request: quota_enforcement_sdk::SnapshotRequest,
+    ) -> Result<
+        quota_enforcement_sdk::PageResult<quota_enforcement_sdk::QuotaSnapshot>,
+        QuotaEnforcementError,
+    > {
+        Ok(self.service.operations()?.snapshot(ctx, request).await?)
     }
 }

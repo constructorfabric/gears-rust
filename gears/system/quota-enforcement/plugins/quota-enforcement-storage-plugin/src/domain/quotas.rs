@@ -1,8 +1,6 @@
 //! The Quota primitives of the storage contract, forwarded to the
-//! [`QuotaStore`] port with the contract's signatures. The eventual
-//! `impl QuotaEnforcementStoragePluginV1 for StoragePlugin` delegates here;
-//! until every primitive of the trait exists the client stays unpublished and
-//! these methods are reached by tests only.
+//! [`QuotaStore`] port with the contract's signatures. The
+//! `impl QuotaEnforcementStoragePluginV1 for StoragePlugin` delegates here.
 //!
 //! The security context contributes the actor of the operation log; the access
 //! scope is what the PDP authorized, re-applied by `SecureORM` on every row.
@@ -10,8 +8,10 @@
 use std::collections::HashSet;
 
 use quota_enforcement_sdk::{
-    ActiveQuotaCounts, DeactivateOutcome, NotificationEvent, PageRequest, PageResult,
+    ActiveQuotaCounts, BulkCreateEnvelope, BulkCreated, BulkDeactivateEnvelope, BulkDeactivated,
+    BulkUpdateEnvelope, BulkUpdated, DeactivateOutcome, NotificationEvent, PageRequest, PageResult,
     ProjectionBinding, Quota, QuotaDraft, QuotaFilter, QuotaId, QuotaPatch, StorageError,
+    TransitionOutcome,
 };
 use toolkit_security::{AccessScope, SecurityContext};
 
@@ -79,6 +79,54 @@ impl StoragePlugin {
     ) -> Result<DeactivateOutcome, StorageError> {
         self.quotas
             .deactivate_quota(&actor_of(ctx), scope, quota_id, events)
+            .await
+            .map_err(StorageError::from_store)
+    }
+
+    /// Create every draft of `envelope` in one transaction, or none.
+    ///
+    /// # Errors
+    ///
+    /// As the contract documents for `bulk_create_quotas`.
+    pub async fn bulk_create_quotas(
+        &self,
+        ctx: &SecurityContext,
+        envelope: &BulkCreateEnvelope,
+    ) -> Result<TransitionOutcome<BulkCreated>, StorageError> {
+        self.quotas
+            .bulk_create_quotas(&actor_of(ctx), envelope)
+            .await
+            .map_err(StorageError::from_store)
+    }
+
+    /// Apply every patch of `envelope` in one transaction, or none.
+    ///
+    /// # Errors
+    ///
+    /// As the contract documents for `bulk_update_quotas`.
+    pub async fn bulk_update_quotas(
+        &self,
+        ctx: &SecurityContext,
+        envelope: &BulkUpdateEnvelope,
+    ) -> Result<TransitionOutcome<BulkUpdated>, StorageError> {
+        self.quotas
+            .bulk_update_quotas(&actor_of(ctx), envelope)
+            .await
+            .map_err(StorageError::from_store)
+    }
+
+    /// Deactivate every Quota of `envelope` in one transaction, or none.
+    ///
+    /// # Errors
+    ///
+    /// As the contract documents for `bulk_deactivate_quotas`.
+    pub async fn bulk_deactivate_quotas(
+        &self,
+        ctx: &SecurityContext,
+        envelope: &BulkDeactivateEnvelope,
+    ) -> Result<TransitionOutcome<BulkDeactivated>, StorageError> {
+        self.quotas
+            .bulk_deactivate_quotas(&actor_of(ctx), envelope)
             .await
             .map_err(StorageError::from_store)
     }
