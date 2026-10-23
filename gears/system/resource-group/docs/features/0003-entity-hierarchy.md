@@ -103,6 +103,7 @@ Groups are the core nodes of the resource group hierarchy. This feature implemen
 - Child group created under existing parent with full closure path rows
 
 **Error Scenarios**:
+- Caller-supplied `id` on ordinary creation → InvalidArgument (400), for every tenant and type
 - Invalid type → Validation error
 - Parent not found → NotFound
 - Parent type not in allowed_parents → InvalidParentType
@@ -132,6 +133,13 @@ Groups are the core nodes of the resource group hierarchy. This feature implemen
 9. [x] - `p1` - DB: COMMIT - `inst-create-group-9`
 10. [x] - `p1` - **IF** serialization conflict → rollback and retry (bounded retry policy) - `inst-create-group-10`
 11. [x] - `p1` - **RETURN** created ResourceGroup with id, type, name, metadata, hierarchy - `inst-create-group-11`
+
+Ordinary creation uses server-generated UUIDv7 IDs. Deterministic tenant defaults
+use `ResourceGroupDefaults::ensure_default_group`: derive the ID from the context
+tenant, enforce create authorization, and confirm a conflicting existing ID only
+through scoped get plus tenant/type/name/root identity checks. Configuration
+seeding remains internal and refuses mismatched existing identities. See the
+[identifier migration guide](../explicit-id-migration.md).
 
 ### Update Group
 

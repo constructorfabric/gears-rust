@@ -2744,7 +2744,7 @@ async fn get_group_unscoped_missing_is_not_found() {
     );
 }
 
-/// Creating a group with an id that is already taken yields
+/// Trusted configuration seeding with an id that is already taken yields
 /// `GroupAlreadyExists`, not a generic database error. The second create runs
 /// in a different tenant, so this pins the group id as globally unique rather
 /// than unique per tenant.
@@ -2756,8 +2756,6 @@ async fn group_create_duplicate_id_is_already_exists() {
 
     let tenant_a = Uuid::now_v7();
     let tenant_b = Uuid::now_v7();
-    let ctx_a = common::make_ctx(tenant_a);
-    let ctx_b = common::make_ctx(tenant_b);
     let root_type = common::create_root_type(&type_svc, "dupid").await;
 
     let id = Uuid::now_v7();
@@ -2766,12 +2764,12 @@ async fn group_create_duplicate_id_is_already_exists() {
     };
 
     group_svc
-        .create_group(&ctx_a, req("First"), tenant_a)
+        .create_group_unscoped(req("First"), tenant_a)
         .await
         .expect("first create should succeed");
 
     let err = group_svc
-        .create_group(&ctx_b, req("Second"), tenant_b)
+        .create_group_unscoped(req("Second"), tenant_b)
         .await
         .expect_err("the id is taken globally, so another tenant cannot reuse it");
 
@@ -2803,7 +2801,6 @@ async fn group_create_duplicate_id_same_tenant_is_already_exists() {
     let group_svc = common::make_group_service(db.clone());
 
     let tenant = Uuid::now_v7();
-    let ctx = common::make_ctx(tenant);
     let root_type = common::create_root_type(&type_svc, "dupidsame").await;
 
     let id = Uuid::now_v7();
@@ -2812,12 +2809,12 @@ async fn group_create_duplicate_id_same_tenant_is_already_exists() {
     };
 
     group_svc
-        .create_group(&ctx, req("First"), tenant)
+        .create_group_unscoped(req("First"), tenant)
         .await
         .expect("first create should succeed");
 
     let err = group_svc
-        .create_group(&ctx, req("Second"), tenant)
+        .create_group_unscoped(req("Second"), tenant)
         .await
         .expect_err("the id is already taken in this tenant");
 
@@ -3181,6 +3178,7 @@ impl GroupRepositoryTrait for ParentFlippingGroupRepo {
     async fn insert<C: DBRunner>(
         &self,
         db: &C,
+        scope: &AccessScope,
         id: Uuid,
         parent_id: Option<Uuid>,
         gts_type_id: i16,
@@ -3189,7 +3187,16 @@ impl GroupRepositoryTrait for ParentFlippingGroupRepo {
         tenant_id: Uuid,
     ) -> Result<RgModel, DomainError> {
         self.inner
-            .insert(db, id, parent_id, gts_type_id, name, metadata, tenant_id)
+            .insert(
+                db,
+                scope,
+                id,
+                parent_id,
+                gts_type_id,
+                name,
+                metadata,
+                tenant_id,
+            )
             .await
     }
 

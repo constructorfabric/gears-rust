@@ -47,8 +47,6 @@ macro_rules! rg_type_id {
     };
 }
 
-const ALREADY_EXISTS_TYPE: &str = gts_uri!("cf.core.errors.err.v1~cf.core.err.already_exists.v1~");
-
 // ── Noop OpenAPI Registry for tests ─────────────────────────────────────
 
 struct NoopOpenApiRegistry;
@@ -498,62 +496,52 @@ async fn get_group_not_found_returns_404() {
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
-/// POST group with an already-taken id returns 409 with a problem body.
+/// Explicit IDs are rejected before insertion, including a foreign tenant's
+/// predictable default ID. Repeating the attempt cannot reserve the UUID.
 #[tokio::test]
-async fn create_group_duplicate_id_returns_409() {
+async fn create_group_explicit_id_returns_400_without_reserving_it() {
     let (router, type_svc) = build_test_router().await;
     let tenant_id = Uuid::now_v7();
-    let type_code = rg_type_id!("test.dupid.{}.v1~", Uuid::now_v7().as_simple());
+    let victim_id = Uuid::now_v7();
+    let id = resource_group_sdk::default_group::default_group_id(victim_id);
+    let root_type = common::create_root_type(&type_svc, "explicitid").await;
 
-    type_svc
-        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
-            code: type_code.clone(),
-            can_be_root: true,
-            allowed_parent_types: vec![],
-            allowed_membership_types: vec![],
-            metadata_schema: None,
-        })
-        .await
-        .unwrap();
-
-    let id = Uuid::now_v7();
-    let payload = |name: &str| {
-        serde_json::json!({
+    for target in [None, Some(tenant_id), Some(victim_id)] {
+        let mut payload = serde_json::json!({
             "id": id,
-            "type": type_code,
-            "name": name
-        })
-    };
+            "type": root_type.code,
+            "name": "Squat"
+        });
+        if let Some(target) = target {
+            payload["tenant_id"] = serde_json::json!(target);
+        }
+        let req = json_request(
+            "POST",
+            "/resource-group/v1/groups",
+            Some(payload),
+            tenant_id,
+        );
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = response_body(resp).await;
+        assert_eq!(body["status"], 400);
+        assert_eq!(
+            body["type"],
+            gts_uri!("cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~")
+        );
+    }
 
     let req = json_request(
-        "POST",
-        "/resource-group/v1/groups",
-        Some(payload("First")),
+        "GET",
+        &format!("/resource-group/v1/groups/{id}"),
+        None,
         tenant_id,
     );
-    let resp = router.clone().oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::CREATED);
-
-    let req = json_request(
-        "POST",
-        "/resource-group/v1/groups",
-        Some(payload("Second")),
-        tenant_id,
-    );
-    let resp = router.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::CONFLICT);
-
-    let body = response_body(resp).await;
-    assert_eq!(body["type"], ALREADY_EXISTS_TYPE, "problem type: {body}");
-    assert_eq!(body["status"], 409, "problem status: {body}");
     assert_eq!(
-        body["context"]["resource_name"],
-        id.to_string(),
-        "problem resource_name: {body}"
+        router.oneshot(req).await.unwrap().status(),
+        StatusCode::NOT_FOUND
     );
 }
-
-// ── Error format tests (RFC 9457 Problem Details) ───────────────────────
 
 #[tokio::test]
 async fn error_response_has_problem_fields() {

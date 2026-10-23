@@ -387,6 +387,13 @@ The gear **MUST** provide API operations for:
 - move entity to new parent (subtree move)
 - delete entity
 
+Ordinary entity creation **MUST** allocate IDs server-side and **MUST NOT**
+accept caller-chosen IDs: the identifier space is global across tenants and
+types. A deterministic tenant-default operation **MUST** derive its ID from
+the authorized context tenant and verify the identity of any existing row.
+Trusted deployment seeding **MAY** use configured fixed IDs, but **MUST NOT**
+adopt an existing row whose owning tenant or structural identity differs.
+
 Entity fields (GTS-aligned naming):
 
 - `id` (UUID) — group identifier

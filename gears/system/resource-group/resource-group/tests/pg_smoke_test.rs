@@ -495,3 +495,54 @@ async fn pg_membership_filters_resolve_gts_and_accept_quoted_uuid() {
         assert_eq!(page.items[0].resource_id, "expected");
     }
 }
+
+/// Real PostgreSQL uniqueness races must converge, and a legacy foreign PK
+/// collision must remain a conflict rather than being adopted after retry.
+#[tokio::test]
+async fn default_group_ensure_converges_and_rejects_legacy_foreign_collision() {
+    use resource_group::domain::error::DomainError;
+    use resource_group_sdk::{
+        CreateGroupRequest, EnsureDefaultGroupRequest, default_group::default_group_id,
+    };
+
+    let Some(fixture) = pg_fixture().await else {
+        return;
+    };
+    let types = common::make_type_service(fixture.db.clone());
+    let groups = common::make_group_service(fixture.db.clone());
+    let ty = common::create_root_type(&types, "pgdefault").await;
+    let tenant = Uuid::now_v7();
+    let ctx = common::make_ctx(tenant);
+    let request = || EnsureDefaultGroupRequest {
+        code: ty.code.clone(),
+        metadata: None,
+    };
+    let (first, second) = tokio::join!(
+        groups.ensure_default_group(&ctx, request()),
+        groups.ensure_default_group(&ctx, request()),
+    );
+    let first = first.expect("first concurrent ensure");
+    let second = second.expect("second concurrent ensure");
+    assert_eq!(first.id, default_group_id(tenant));
+    assert_eq!(second.id, first.id);
+
+    let victim = Uuid::now_v7();
+    let foreign_id = default_group_id(victim);
+    groups
+        .create_group_unscoped(
+            CreateGroupRequest::new(&ty.code, "default").with_id(Some(foreign_id)),
+            tenant,
+        )
+        .await
+        .expect("legacy foreign row");
+    let error = groups
+        .ensure_default_group(&common::make_ctx(victim), request())
+        .await
+        .unwrap_err();
+    assert!(matches!(error, DomainError::GroupAlreadyExists { id } if id == foreign_id));
+    let existing = groups
+        .get_group(&ctx, foreign_id)
+        .await
+        .expect("foreign row untouched");
+    assert_eq!(existing.hierarchy.tenant_id, tenant);
+}

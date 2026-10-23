@@ -86,9 +86,12 @@ pub trait GroupRepositoryTrait: Send + Sync + 'static {
 
     // -- Write operations --
 
+    /// Insert a group only if its complete row identity satisfies the supplied
+    /// scope. Trusted provisioning callers must explicitly choose their scope.
     async fn insert<C: DBRunner>(
         &self,
         db: &C,
+        scope: &AccessScope,
         id: Uuid,
         parent_id: Option<Uuid>,
         gts_type_id: i16,

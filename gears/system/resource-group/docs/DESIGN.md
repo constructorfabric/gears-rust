@@ -516,6 +516,23 @@ REST API field projection notes:
 
 Type list `$filter` fields: `code` (eq, ne, in).
 
+**Group identifier ownership**:
+
+Group IDs form one global primary-key space across all tenants and group types.
+Ordinary REST and SDK creation reject explicit IDs and generate UUIDv7 IDs.
+Tenant-default creation uses the authenticated `ResourceGroupDefaults` SDK
+capability: it derives `UUIDv5(ctx.subject_tenant_id(), "resource-group:default")`,
+fixes the name to `default`, requires root placement and a non-tenant type, and
+checks the complete granted create scope against the inserted row, including
+tenant and resource-ID predicates with AND/OR semantics. Confirming an existing row
+requires a scoped read and matching tenant/type/name/parent identity. Foreign or
+mismatched collisions fail closed without modifying the existing row.
+
+Trusted configuration seeding retains its internal unscoped path and checks the
+identity of existing fixed-ID rows before skipping them. See the
+[identifier migration guide](explicit-id-migration.md) for the breaking v1
+security tightening and coordinated consumer rollout.
+
 **Integration read API** (stable):
 
 `ResourceGroupReadHierarchy` is a narrow read-only contract for in-process plugin consumers — the AuthZ resolver plugin, the tenant-resolver RG plugin, and an in-process AuthZ PDP. It carries hierarchy walks (`get_group_descendants` / `get_group_ancestors`), flat OData-filtered group listing (`list_groups`), single-group existence lookup (`get_group`), and membership listing (`list_memberships`). All other consumers use `ResourceGroupClient`, which includes the same reads plus full CRUD.

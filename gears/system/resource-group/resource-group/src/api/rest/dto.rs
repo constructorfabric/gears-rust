@@ -171,7 +171,8 @@ pub struct GroupWithDepthDto {
 #[derive(Debug, Clone)]
 #[toolkit_macros::api_dto(request)]
 pub struct CreateGroupDto {
-    /// Optional caller-supplied ID. If omitted, the server generates a UUID.
+    /// Reserved for compatibility: any supplied ID is rejected.
+    /// Omit this field to receive a server-generated UUID.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<Uuid>,
     /// GTS chained type path. Must have prefix `gts.cf.core.rg.type.v1~`.

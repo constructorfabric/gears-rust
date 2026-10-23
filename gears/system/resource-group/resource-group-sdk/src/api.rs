@@ -15,6 +15,27 @@ use crate::models::{
     ResourceGroupType, ResourceGroupWithDepth, UpdateGroupRequest, UpdateTypeRequest,
 };
 
+/// Authenticated capability for deterministic tenant default-group creation.
+///
+/// Resolve through `ClientHub` separately from [`ResourceGroupClient`]. Unlike
+/// configuration bootstrap this surface never bypasses authorization. It is
+/// bound to `ctx.subject_tenant_id()` and requires `create` permission there,
+/// plus `get` permission when confirming an existing group. No caller-supplied
+/// UUID, derivation key, or target-tenant override is accepted.
+#[async_trait]
+pub trait ResourceGroupDefaults: Send + Sync {
+    /// Create or confirm the context tenant's canonical default group.
+    ///
+    /// An existing group must have the same tenant, type, canonical name, and
+    /// root placement. A conflicting identity fails closed without mutation;
+    /// concurrent ensures of the same identity converge on the same group.
+    async fn ensure_default_group(
+        &self,
+        ctx: &SecurityContext,
+        request: crate::models::EnsureDefaultGroupRequest,
+    ) -> Result<ResourceGroup, CanonicalError>;
+}
+
 /// Client trait for resource-group type management.
 ///
 /// Consumers obtain this from `ClientHub`:
@@ -73,7 +94,8 @@ pub trait ResourceGroupClient: Send + Sync {
 
     // -- Group lifecycle --
 
-    /// Create a new resource group.
+    /// Create a new resource group with a server-generated UUID.
+    /// Caller-supplied IDs are rejected for every group type.
     async fn create_group(
         &self,
         ctx: &SecurityContext,

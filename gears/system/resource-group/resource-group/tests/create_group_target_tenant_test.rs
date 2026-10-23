@@ -458,13 +458,9 @@ async fn explicit_id_with_foreign_tenant_id_returns_validation_error() {
     assert!(matches!(err, DomainError::Validation { .. }));
 }
 
-/// Positive control for the guardrail above: an explicit `id` combined with
-/// a target tenant that equals the caller's own tenant is *not* a
-/// cross-tenant combination and must still succeed -- the own
-/// (separately tracked, unresolved) id-capture question is untouched by
-/// this guardrail.
+/// Own-tenant creation cannot reserve an arbitrary globally unique ID.
 #[tokio::test]
-async fn explicit_id_with_same_tenant_still_succeeds() {
+async fn explicit_id_with_same_tenant_is_rejected() {
     let db = common::test_db().await;
     let type_svc = common::make_type_service(db.clone());
     let group_svc = common::make_group_service(db.clone());
@@ -473,7 +469,7 @@ async fn explicit_id_with_same_tenant_still_succeeds() {
     let root_type = common::create_root_type(&type_svc, "vhp2162h").await;
     let id = Uuid::now_v7();
 
-    let group = group_svc
+    let err = group_svc
         .create_group(
             &ctx,
             CreateGroupRequest::new(root_type.code, "IdPlusSameTenant".to_owned())
@@ -482,9 +478,9 @@ async fn explicit_id_with_same_tenant_still_succeeds() {
             tenant_id,
         )
         .await
-        .expect("id + same-tenant target must still succeed");
+        .expect_err("own-tenant creation must not reserve caller-chosen IDs");
 
-    assert_eq!(group.id, id);
+    assert!(matches!(err, DomainError::Validation { .. }));
 }
 
 /// Seeding always calls `create_group_unscoped` with `req.tenant_id: None`

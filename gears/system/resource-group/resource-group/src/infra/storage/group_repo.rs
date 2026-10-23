@@ -563,6 +563,7 @@ impl GroupRepositoryTrait for GroupRepository {
     async fn insert<C: DBRunner>(
         &self,
         db: &C,
+        scope: &AccessScope,
         id: Uuid,
         parent_id: Option<Uuid>,
         gts_type_id: i16,
@@ -570,8 +571,6 @@ impl GroupRepositoryTrait for GroupRepository {
         metadata: Option<&serde_json::Value>,
         tenant_id: Uuid,
     ) -> Result<rg_entity::Model, DomainError> {
-        let scope = system_scope();
-
         let model = rg_entity::ActiveModel {
             id: Set(id),
             parent_id: Set(parent_id),
@@ -586,7 +585,7 @@ impl GroupRepositoryTrait for GroupRepository {
         // taken. The insert returns the persisted row, so re-reading it by
         // id afterwards was a second `resource_group` SELECT per create for
         // data already in hand (RG-08).
-        toolkit_db::secure::secure_insert::<ResourceGroupEntity>(model, &scope, db)
+        toolkit_db::secure::secure_insert::<ResourceGroupEntity>(model, scope, db)
             .await
             .map_err(|e| map_insert_error(&e, id, parent_id))
     }
@@ -1256,7 +1255,11 @@ impl GroupRepositoryTrait for GroupRepository {
 /// `parent_id` is the `parent_id` value that row was inserted with (used for
 /// the foreign-key answer below).
 fn map_insert_error(e: &ScopeError, id: Uuid, parent_id: Option<Uuid>) -> DomainError {
-    if e.is_unique_violation() {
+    if let ScopeError::Denied(message) = e {
+        DomainError::AccessDenied {
+            message: (*message).to_owned(),
+        }
+    } else if e.is_unique_violation() {
         DomainError::group_already_exists(id)
     } else if e.is_foreign_key_violation() {
         // The parent this create read a moment ago is gone: a

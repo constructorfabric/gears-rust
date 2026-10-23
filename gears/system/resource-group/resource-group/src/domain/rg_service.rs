@@ -8,11 +8,12 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use resource_group_sdk::ResourceGroupClient;
 use resource_group_sdk::models::{
-    CreateGroupRequest, CreateTypeRequest, ResourceGroup, ResourceGroupMembership,
-    ResourceGroupType, ResourceGroupWithDepth, UpdateGroupRequest, UpdateTypeRequest,
+    CreateGroupRequest, CreateTypeRequest, EnsureDefaultGroupRequest, ResourceGroup,
+    ResourceGroupMembership, ResourceGroupType, ResourceGroupWithDepth, UpdateGroupRequest,
+    UpdateTypeRequest,
 };
+use resource_group_sdk::{ResourceGroupClient, ResourceGroupDefaults};
 use toolkit_canonical_errors::CanonicalError;
 use toolkit_odata::{ODataQuery, Page};
 use toolkit_security::SecurityContext;
@@ -243,6 +244,22 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait, MR: MembershipRepository
     ) -> Result<Page<ResourceGroupMembership>, CanonicalError> {
         self.membership_service
             .list_memberships(ctx, query)
+            .await
+            .map_err(CanonicalError::from)
+    }
+}
+
+#[async_trait]
+impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait, MR: MembershipRepositoryTrait>
+    ResourceGroupDefaults for RgService<GR, TR, MR>
+{
+    async fn ensure_default_group(
+        &self,
+        ctx: &SecurityContext,
+        request: EnsureDefaultGroupRequest,
+    ) -> Result<ResourceGroup, CanonicalError> {
+        self.group_service
+            .ensure_default_group(ctx, request)
             .await
             .map_err(CanonicalError::from)
     }

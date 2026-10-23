@@ -400,7 +400,7 @@ types-registry = { package = "cf-gears-types-registry", version = "0.4.0", path 
 authn-resolver = { package = "cf-gears-authn-resolver", version = "0.2.37", path = "gears/system/authn-resolver/authn-resolver" }
 authz-resolver = { package = "cf-gears-authz-resolver", version = "0.2.5", path = "gears/system/authz-resolver/authz-resolver" }
 tenant-resolver = { package = "cf-gears-tenant-resolver", version = "0.1.41", path = "gears/system/tenant-resolver/tenant-resolver" }
-resource-group = { package = "cf-gears-resource-group", version = "0.4.5", path = "gears/system/resource-group/resource-group" }
+resource-group = { package = "cf-gears-resource-group", version = "0.5.0", path = "gears/system/resource-group/resource-group" }
 credstore = { package = "cf-gears-credstore", version = "0.5.2", path = "gears/credstore/credstore" }
 oagw = { package = "cf-gears-oagw", version = "0.5.5", path = "gears/system/oagw/oagw" }
 account-management = { package = "cf-gears-account-management", version = "0.10.0", path = "gears/system/account-management/account-management" }
@@ -423,7 +423,7 @@ cluster-sdk = { package = "cf-gears-cluster-sdk", version = "0.2.8", path = "gea
 types-registry-sdk = { package = "cf-gears-types-registry-sdk", version = "0.3.9", path = "gears/system/types-registry/types-registry-sdk" }
 tenant-resolver-sdk = { package = "cf-gears-tenant-resolver-sdk", version = "0.4.5", path = "gears/system/tenant-resolver/tenant-resolver-sdk" }
 authz-resolver-sdk = { package = "cf-gears-authz-resolver-sdk", version = "0.5.2", path = "gears/system/authz-resolver/authz-resolver-sdk" }
-resource-group-sdk = { package = "cf-gears-resource-group-sdk", version = "0.3.5", path = "gears/system/resource-group/resource-group-sdk" }
+resource-group-sdk = { package = "cf-gears-resource-group-sdk", version = "0.4.0", path = "gears/system/resource-group/resource-group-sdk" }
 oagw-sdk = { package = "cf-gears-oagw-sdk", version = "0.5.15", path = "gears/system/oagw/oagw-sdk" }
 usage-collector-sdk = { package = "cf-gears-usage-collector-sdk", version = "0.3.14", path = "gears/system/usage-collector/usage-collector-sdk" }
 quota-enforcement-engine-most-restrictive = { package = "cf-gears-quota-enforcement-engine-most-restrictive", version = "0.1.0", path = "gears/system/quota-enforcement/plugins/quota-enforcement-engine-most-restrictive" }

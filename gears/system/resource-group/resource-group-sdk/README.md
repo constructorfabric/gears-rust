@@ -48,6 +48,27 @@ let same = rg.get_group(&ctx, group.id).await?;
 optional fields (as `tenant_id` was, below) without breaking existing
 callers.
 
+### Tenant default groups
+
+Ordinary `create_group` rejects caller-supplied IDs. For a deterministic default,
+use the separately registered, authenticated capability:
+
+```rust
+use resource_group_sdk::{ResourceGroupDefaults, EnsureDefaultGroupRequest};
+
+let defaults = hub.get::<dyn ResourceGroupDefaults>()?;
+let group = defaults.ensure_default_group(&ctx, EnsureDefaultGroupRequest {
+    code: type_code,
+    metadata: None,
+}).await?;
+```
+
+The ID is derived from `ctx.subject_tenant_id()`; the caller cannot override the
+tenant or choose an arbitrary ID. Existing groups must match the expected tenant,
+type, `default` name, and root placement. See the
+[identifier ownership migration](../docs/explicit-id-migration.md) for rollout,
+compatibility, and legacy-collision remediation.
+
 ### Hierarchy Traversal
 
 ```rust
@@ -100,6 +121,10 @@ match rg.get_group(&ctx, id).await {
 This crate has no separate `CHANGELOG` — notable pre-1.0 API changes are
 recorded here.
 
+- **0.4.0**: ordinary creation rejects explicit IDs. `ResourceGroupDefaults`
+  provides authenticated, tenant-bound default ensure and `default_group_id`
+  preserves existing deterministic identities. Consumers supplying IDs must
+  migrate before upgrading; see the migration guide above.
 - **0.3.0**: `CreateGroupRequest` gained an optional `tenant_id` field and
   became `#[non_exhaustive]` with a `::new` constructor plus `with_*`
   setters (see Group Lifecycle above). Per pre-1.0 SemVer, adding a field to
