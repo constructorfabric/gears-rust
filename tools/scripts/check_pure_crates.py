@@ -8,8 +8,10 @@ directly or transitively. For each listed package this runs
 
     cargo tree -p <package> -e normal --prefix none --format {p}
 
-and fails when any package name in that tree is on the crate's deny list. Dev and
-build dependencies are not part of what the crate links, so they are not checked.
+and fails when any package name in that tree is on the crate's deny list, or, when
+the entry has an `allow` list, is not on it (an engine generation's isolation rule).
+Dev and build dependencies are not part of what the crate links, so they are not
+checked.
 
 Exit codes:
   0 - Every listed crate is clean
@@ -58,17 +60,25 @@ def check(config: Dict) -> List[str]:
     for entry in config.get("crate", []):
         package = entry["package"]
         denied = set(entry["deny"])
+        reason = entry.get("reason", "see pure_crates.toml")
         try:
-            found = tree_packages(package) & denied
+            tree = tree_packages(package)
         except subprocess.CalledProcessError as error:
             failures.append(f"{package}: cargo tree failed: {error.stderr.strip()}")
             continue
+        found = tree & denied
         if found:
             failures.append(
-                f"{package} must stay pure ({entry.get('reason', 'see pure_crates.toml')}); "
+                f"{package} must stay pure ({reason}); "
                 f"its dependency tree reaches: {', '.join(sorted(found))}"
             )
-        else:
+        unlisted = tree - set(entry["allow"]) if "allow" in entry else set()
+        if unlisted:
+            failures.append(
+                f"{package} may depend only on its allow list ({reason}); "
+                f"its dependency tree also reaches: {', '.join(sorted(unlisted))}"
+            )
+        if not found and not unlisted:
             print(f"ok: {package} reaches none of {len(denied)} denied crates")
     return failures
 

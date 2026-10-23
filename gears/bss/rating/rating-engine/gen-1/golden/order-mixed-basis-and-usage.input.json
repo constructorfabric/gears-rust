@@ -1,0 +1,200 @@
+{
+  "description": "A rolling yearly 120 and a two-month 10 give TCV 140 on a mixed basis; a usage item is rates only, its minimum fee reported, excluded from TCV.",
+  "vectors": [],
+  "entry": "evaluate_order",
+  "input": {
+    "assessment_id": "00000000-0000-0000-0000-00000000a55e",
+    "currency": "EUR",
+    "contract_ref": null,
+    "lines": [
+      {
+        "line_id": "00000000-0000-0000-0000-00000000a001",
+        "plan_revision_id": "00000000-0000-0000-0000-000000000007",
+        "term": {
+          "kind": "rolling"
+        },
+        "cycle": "year",
+        "items": [
+          {
+            "item_id": "00000000-0000-0000-0000-000000010003",
+            "quantity": "1",
+            "binding": {
+              "item_id": "00000000-0000-0000-0000-000000010003",
+              "price_book_entry_id": "00000000-0000-0000-0000-000000030001",
+              "dimension_key": null,
+              "dimension_value": null,
+              "sku_id": "00000000-0000-0000-0000-000000040001",
+              "sku_version": 1,
+              "sku_code": "PRO",
+              "sku_name": "Pro plan",
+              "unit": null,
+              "meter": null,
+              "price": {
+                "price_id": "00000000-0000-0000-0000-000000030003",
+                "price_book_entry_id": "00000000-0000-0000-0000-000000030001",
+                "money_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "currency": {
+                  "code": "EUR",
+                  "scale": 2
+                },
+                "model": {
+                  "model": "flat",
+                  "amount": "120"
+                },
+                "minimum_fee": null,
+                "effective_from": "2026-01-01",
+                "ends_on": null,
+                "state": "approved"
+              },
+              "kind": "recurring",
+              "recurring_period": "year",
+              "via_default": false,
+              "usage_policy": null,
+              "invoice": {
+                "template": "Pro plan, {period}",
+                "template_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "template_source": "entry",
+                "gl_code": "4000",
+                "tax_category": "std",
+                "timing": "advance",
+                "rounding": "half_even"
+              }
+            }
+          }
+        ]
+      },
+      {
+        "line_id": "00000000-0000-0000-0000-00000000a002",
+        "plan_revision_id": "00000000-0000-0000-0000-000000000007",
+        "term": {
+          "kind": "fixed_periods",
+          "count": 2
+        },
+        "cycle": "month",
+        "items": [
+          {
+            "item_id": "00000000-0000-0000-0000-000000010001",
+            "quantity": "1",
+            "binding": {
+              "item_id": "00000000-0000-0000-0000-000000010001",
+              "price_book_entry_id": "00000000-0000-0000-0000-000000030001",
+              "dimension_key": null,
+              "dimension_value": null,
+              "sku_id": "00000000-0000-0000-0000-000000040001",
+              "sku_version": 1,
+              "sku_code": "PRO",
+              "sku_name": "Pro plan",
+              "unit": null,
+              "meter": null,
+              "price": {
+                "price_id": "00000000-0000-0000-0000-000000030001",
+                "price_book_entry_id": "00000000-0000-0000-0000-000000030001",
+                "money_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "currency": {
+                  "code": "EUR",
+                  "scale": 2
+                },
+                "model": {
+                  "model": "flat",
+                  "amount": "10"
+                },
+                "minimum_fee": null,
+                "effective_from": "2026-01-01",
+                "ends_on": null,
+                "state": "approved"
+              },
+              "kind": "recurring",
+              "recurring_period": "month",
+              "via_default": false,
+              "usage_policy": null,
+              "invoice": {
+                "template": "Pro plan, {period}",
+                "template_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "template_source": "entry",
+                "gl_code": "4000",
+                "tax_category": "std",
+                "timing": "advance",
+                "rounding": "half_even"
+              }
+            }
+          },
+          {
+            "item_id": "00000000-0000-0000-0000-000000010002",
+            "quantity": "1",
+            "binding": {
+              "item_id": "00000000-0000-0000-0000-000000010002",
+              "price_book_entry_id": "00000000-0000-0000-0000-000000030001",
+              "dimension_key": null,
+              "dimension_value": null,
+              "sku_id": "00000000-0000-0000-0000-000000040001",
+              "sku_version": 1,
+              "sku_code": "PRO",
+              "sku_name": "Pro plan",
+              "unit": "vm-hour",
+              "meter": {
+                "usage_type_id": "products.derived/vm-hours@1",
+                "version": "1"
+              },
+              "price": {
+                "price_id": "00000000-0000-0000-0000-000000020002",
+                "price_book_entry_id": "00000000-0000-0000-0000-000000030001",
+                "money_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "currency": {
+                  "code": "EUR",
+                  "scale": 2
+                },
+                "model": {
+                  "model": "volume",
+                  "tiers": [
+                    {
+                      "up_to": "10",
+                      "rate": "0.02"
+                    },
+                    {
+                      "up_to": null,
+                      "rate": "0.015"
+                    }
+                  ]
+                },
+                "minimum_fee": "30",
+                "effective_from": "2026-01-01",
+                "ends_on": null,
+                "state": "approved"
+              },
+              "kind": "usage",
+              "recurring_period": null,
+              "via_default": false,
+              "usage_policy": {
+                "policy_id": "00000000-0000-0000-0000-000000060001",
+                "version": 1,
+                "digest": "9999999999999999999999999999999999999999999999999999999999999999",
+                "rating_window": "billing_cycle",
+                "aggregation_scope": "subscription_line",
+                "reset": "rating_window_start",
+                "partial_window": "actual_quantity_full_thresholds",
+                "fold": "sum"
+              },
+              "invoice": {
+                "template": "Pro plan, {period}",
+                "template_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "template_source": "entry",
+                "gl_code": "4000",
+                "tax_category": "std",
+                "timing": "advance",
+                "rounding": "half_even"
+              }
+            }
+          }
+        ]
+      }
+    ],
+    "budget": {
+      "reduced_digits": 256,
+      "scratch_digits": 512
+    },
+    "engine": {
+      "engine_generation": 1,
+      "engine_digest": "<engine_digest>"
+    }
+  }
+}

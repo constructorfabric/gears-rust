@@ -1,0 +1,351 @@
+{
+  "outcome": {
+    "lines": [
+      {
+        "line_key": "00000000-0000-0000-0000-00000000000f|products.derived/vm-hours@1|=|usage|4000/std|2",
+        "slice_start": "2026-09-01T00:00:00Z",
+        "slice_end": "2026-09-15T00:00:00Z",
+        "item_id": "00000000-0000-0000-0000-000000010001",
+        "dimension_key": null,
+        "dimension_value": null,
+        "sku_id": "00000000-0000-0000-0000-000000040001",
+        "sku_version": 1,
+        "plan_id": "00000000-0000-0000-0000-000000000006",
+        "revision_id": "00000000-0000-0000-0000-000000000007",
+        "price_id": "00000000-0000-0000-0000-000000020001",
+        "price_book_entry_id": "00000000-0000-0000-0000-000000030001",
+        "charge_kind": "usage",
+        "model_kind": "volume",
+        "quantity": "80",
+        "billable_quantity": "80",
+        "band_offset": "0",
+        "exact_amount": {
+          "numerator": "64",
+          "denominator": "1",
+          "currency": "EUR",
+          "currency_scale": 2
+        },
+        "currency": "EUR",
+        "currency_scale": 2,
+        "unit": "vm-hour",
+        "gl_code": "4000",
+        "tax_category": "std",
+        "invoice_line_template": "Pro plan, {period}",
+        "performance_obligation_ref": null,
+        "ssp_snapshot_pointer": null,
+        "snapshot": {
+          "plan_id": "00000000-0000-0000-0000-000000000006",
+          "revision_id": "00000000-0000-0000-0000-000000000007",
+          "resolve_date": "2026-09-01",
+          "bindings": [
+            {
+              "item_id": "00000000-0000-0000-0000-000000010001",
+              "dimension_value": null,
+              "price_id": "00000000-0000-0000-0000-000000020001",
+              "price_book_entry_id": "00000000-0000-0000-0000-000000030001",
+              "money_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "sku_id": "00000000-0000-0000-0000-000000040001",
+              "sku_version": 1,
+              "usage_rating_policy": {
+                "policy_id": "00000000-0000-0000-0000-000000060001",
+                "version": 1,
+                "digest": "9999999999999999999999999999999999999999999999999999999999999999"
+              },
+              "invoice_inputs": {
+                "template": "Pro plan, {period}",
+                "template_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "template_source": "entry",
+                "gl_code": "4000",
+                "tax_category": "std",
+                "timing": "advance",
+                "rounding": "half_even"
+              },
+              "meter": {
+                "usage_type_id": "products.derived/vm-hours@1",
+                "version": "1"
+              },
+              "derived_declaration_digest": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+            }
+          ],
+          "binding_digest": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+          "fact_id": "00000000-0000-0000-0000-00000000000f",
+          "fact_version": 1,
+          "accepted_binding": {
+            "item_id": "00000000-0000-0000-0000-000000010001",
+            "dimension_value": null,
+            "price_id": "00000000-0000-0000-0000-000000020001"
+          },
+          "engine_generation": 1,
+          "engine_digest": "<engine_digest>"
+        },
+        "lineage": {
+          "price_id": "00000000-0000-0000-0000-000000020001",
+          "money_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "resolve_date": "2026-09-01",
+          "via_default": false,
+          "steps": [
+            {
+              "step": "bind",
+              "pre": null,
+              "post": null
+            },
+            {
+              "step": "meter",
+              "pre": null,
+              "post": null
+            },
+            {
+              "step": "model",
+              "pre": null,
+              "post": {
+                "numerator": "64",
+                "denominator": "1",
+                "currency": "EUR",
+                "currency_scale": 2
+              }
+            },
+            {
+              "step": "non_negative",
+              "pre": {
+                "numerator": "64",
+                "denominator": "1",
+                "currency": "EUR",
+                "currency_scale": 2
+              },
+              "post": {
+                "numerator": "64",
+                "denominator": "1",
+                "currency": "EUR",
+                "currency_scale": 2
+              }
+            },
+            {
+              "step": "precision",
+              "pre": {
+                "numerator": "64",
+                "denominator": "1",
+                "currency": "EUR",
+                "currency_scale": 2
+              },
+              "post": {
+                "numerator": "64",
+                "denominator": "1",
+                "currency": "EUR",
+                "currency_scale": 2
+              }
+            }
+          ],
+          "proration": null,
+          "band_placement": {
+            "offset": "0",
+            "selecting_total": "130",
+            "segments": [
+              {
+                "band": 1,
+                "quantity": "80",
+                "rate": "0.8"
+              }
+            ]
+          },
+          "granules": [
+            {
+              "granule_start": "2026-09-05T08:00:00Z",
+              "output": "80"
+            }
+          ],
+          "clamped_from": null
+        }
+      },
+      {
+        "line_key": "00000000-0000-0000-0000-00000000000f|products.derived/vm-hours@1|=|usage|4000/std|2",
+        "slice_start": "2026-09-15T00:00:00Z",
+        "slice_end": "2026-10-01T00:00:00Z",
+        "item_id": "00000000-0000-0000-0000-000000010001",
+        "dimension_key": null,
+        "dimension_value": null,
+        "sku_id": "00000000-0000-0000-0000-000000040001",
+        "sku_version": 1,
+        "plan_id": "00000000-0000-0000-0000-000000000006",
+        "revision_id": "00000000-0000-0000-0000-000000000007",
+        "price_id": "00000000-0000-0000-0000-000000020002",
+        "price_book_entry_id": "00000000-0000-0000-0000-000000030001",
+        "charge_kind": "usage",
+        "model_kind": "volume",
+        "quantity": "50",
+        "billable_quantity": "50",
+        "band_offset": "80",
+        "exact_amount": {
+          "numerator": "35",
+          "denominator": "1",
+          "currency": "EUR",
+          "currency_scale": 2
+        },
+        "currency": "EUR",
+        "currency_scale": 2,
+        "unit": "vm-hour",
+        "gl_code": "4000",
+        "tax_category": "std",
+        "invoice_line_template": "Pro plan, {period}",
+        "performance_obligation_ref": null,
+        "ssp_snapshot_pointer": null,
+        "snapshot": {
+          "plan_id": "00000000-0000-0000-0000-000000000006",
+          "revision_id": "00000000-0000-0000-0000-000000000007",
+          "resolve_date": "2026-09-15",
+          "bindings": [
+            {
+              "item_id": "00000000-0000-0000-0000-000000010001",
+              "dimension_value": null,
+              "price_id": "00000000-0000-0000-0000-000000020002",
+              "price_book_entry_id": "00000000-0000-0000-0000-000000030001",
+              "money_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "sku_id": "00000000-0000-0000-0000-000000040001",
+              "sku_version": 1,
+              "usage_rating_policy": {
+                "policy_id": "00000000-0000-0000-0000-000000060001",
+                "version": 1,
+                "digest": "9999999999999999999999999999999999999999999999999999999999999999"
+              },
+              "invoice_inputs": {
+                "template": "Pro plan, {period}",
+                "template_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "template_source": "entry",
+                "gl_code": "4000",
+                "tax_category": "std",
+                "timing": "advance",
+                "rounding": "half_even"
+              },
+              "meter": {
+                "usage_type_id": "products.derived/vm-hours@1",
+                "version": "1"
+              },
+              "derived_declaration_digest": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+            }
+          ],
+          "binding_digest": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+          "fact_id": "00000000-0000-0000-0000-00000000000f",
+          "fact_version": 1,
+          "accepted_binding": null,
+          "engine_generation": 1,
+          "engine_digest": "<engine_digest>"
+        },
+        "lineage": {
+          "price_id": "00000000-0000-0000-0000-000000020002",
+          "money_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "resolve_date": "2026-09-15",
+          "via_default": false,
+          "steps": [
+            {
+              "step": "bind",
+              "pre": null,
+              "post": null
+            },
+            {
+              "step": "meter",
+              "pre": null,
+              "post": null
+            },
+            {
+              "step": "model",
+              "pre": null,
+              "post": {
+                "numerator": "35",
+                "denominator": "1",
+                "currency": "EUR",
+                "currency_scale": 2
+              }
+            },
+            {
+              "step": "non_negative",
+              "pre": {
+                "numerator": "35",
+                "denominator": "1",
+                "currency": "EUR",
+                "currency_scale": 2
+              },
+              "post": {
+                "numerator": "35",
+                "denominator": "1",
+                "currency": "EUR",
+                "currency_scale": 2
+              }
+            },
+            {
+              "step": "precision",
+              "pre": {
+                "numerator": "35",
+                "denominator": "1",
+                "currency": "EUR",
+                "currency_scale": 2
+              },
+              "post": {
+                "numerator": "35",
+                "denominator": "1",
+                "currency": "EUR",
+                "currency_scale": 2
+              }
+            }
+          ],
+          "proration": null,
+          "band_placement": {
+            "offset": "80",
+            "selecting_total": "130",
+            "segments": [
+              {
+                "band": 1,
+                "quantity": "50",
+                "rate": "0.7"
+              }
+            ]
+          },
+          "granules": [
+            {
+              "granule_start": "2026-09-20T08:00:00Z",
+              "output": "50"
+            }
+          ],
+          "clamped_from": null
+        }
+      }
+    ],
+    "obligations": [],
+    "price_totals": [
+      {
+        "price_id": "00000000-0000-0000-0000-000000020001",
+        "currency_scale": 2,
+        "rated": {
+          "numerator": "64",
+          "denominator": "1",
+          "currency": "EUR",
+          "currency_scale": 2
+        },
+        "covered": [
+          {
+            "start": "2026-09-01T00:00:00Z",
+            "end": "2026-09-15T00:00:00Z"
+          }
+        ],
+        "period_seconds": 2592000,
+        "minimum_fee": null
+      },
+      {
+        "price_id": "00000000-0000-0000-0000-000000020002",
+        "currency_scale": 2,
+        "rated": {
+          "numerator": "35",
+          "denominator": "1",
+          "currency": "EUR",
+          "currency_scale": 2
+        },
+        "covered": [
+          {
+            "start": "2026-09-15T00:00:00Z",
+            "end": "2026-10-01T00:00:00Z"
+          }
+        ],
+        "period_seconds": 2592000,
+        "minimum_fee": null
+      }
+    ]
+  }
+}

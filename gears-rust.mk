@@ -140,7 +140,7 @@ dylint-oagw-cluster:
 	$(call check_tool,cargo-gears)
 	cargo gears lint --dylint -P cf-gears-oagw -F cluster
 
-.PHONY: ensure-submodules lychee web-docs-check geiger gts-docs docker-pins validate-gear-names pr-review-lint pr-review-test check-packaging-metadata check-pure-crates check-release-config check-release-resolver
+.PHONY: ensure-submodules lychee web-docs-check geiger gts-docs docker-pins validate-gear-names pr-review-lint pr-review-test check-packaging-metadata check-pure-crates check-engine-generations check-release-config check-release-resolver
 
 ## Verify git submodules (e.g. guidelines/DNA) are initialized; fails otherwise.
 ensure-submodules:
@@ -220,6 +220,11 @@ check-packaging-metadata: py-env
 check-pure-crates: py-env
 	$(call print_target_banner)
 	@$(PYTHON) tools/scripts/check_pure_crates.py
+
+## Check that BSS Rating engine generations still match their vendored copies and registry pins
+check-engine-generations: py-env
+	$(call print_target_banner)
+	@$(PYTHON) tools/scripts/vendor_engine_generation.py check $(wildcard gears/bss/rating/rating-engine/gen-*)
 
 ## Validate that examples/apps/tools are unpublishable and release-plz.toml matches the workspace
 check-release-config: py-env

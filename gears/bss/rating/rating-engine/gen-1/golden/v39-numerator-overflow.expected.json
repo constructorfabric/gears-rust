@@ -1,0 +1,6 @@
+{
+  "error": {
+    "reason_code": "precision_overflow",
+    "detail": "line amount: the amount has a numerator of 85 digits and a denominator of 1 (bounds: abs(numerator) < 10^84, denominator < 10^64)"
+  }
+}

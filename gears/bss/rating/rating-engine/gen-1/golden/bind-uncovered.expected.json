@@ -1,0 +1,6 @@
+{
+  "error": {
+    "reason_code": "price_uncovered",
+    "detail": "item 00000000-0000-0000-0000-000000010001 value None has no approved price on 2026-09-01; never free"
+  }
+}
