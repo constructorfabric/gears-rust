@@ -20,7 +20,8 @@ build whenever feasible.
 | **Integration** | Cross-crate or DB-backed logic (SQLite, Postgres, MySQL) | `cargo test -p <pkg> --features integration` | `#[cfg(feature = "integration")]` | Every PR (`ci.yml` — `integration` job, Ubuntu) |
 | **E2E** | Full HTTP request → response through a running server | pytest + httpx against `cf-gears-example-server` | n/a (Python tests) | PRs to `main`, nightly schedule (`e2e.yml`) |
 | **Fuzz** | Parser / validator robustness against arbitrary input | `cargo-fuzz` (libFuzzer) | nightly toolchain | PRs + nightly (`clusterfuzzlite.yml`) |
-| **Static analysis** | Architectural rules, unsafe code, dependency licenses | clippy, `cargo gears lint`, cargo-deny, cargo-kani, cargo-geiger | varies | Every PR (`ci.yml` — `test`, `security`, `lint` jobs) |
+| **Static analysis** | Architectural rules, dependency licenses | clippy, `cargo gears lint`, cargo-deny | varies | Every PR (`ci.yml` — `clippy`, `security`, `lint` jobs; see §9 for the exact job per tool) |
+| **Static analysis (local-only)** | Unsafe code / formal invariants, dependency `unsafe` audit | cargo-kani, cargo-geiger | varies | Not invoked by any workflow today — local/manual only (see §9) |
 
 Additional testing categories such as performance (#4054), upgrade / migration (#4117), and long-haul (#4118) or soak testing are expected to be added over time, but they are not yet implemented or enforced as part of the current project test matrix.
 
@@ -453,36 +454,152 @@ Gear runtime settings are YAML-driven under `gears:<gear_name>:` with a `config`
 
 ## 7.3 CI Pipeline Summary
 
+`ci.yml` itself path-filters which of its jobs run (job `changes`, via
+`dorny/paths-filter`) — this is the authoritative source for what triggers what; the
+table below mirrors it, don't let this doc drift from `.github/workflows/*.yml` again.
+
+Every "(only when X changed)" job below (`test-fips`, `test-graph-storage`,
+`test-onnx-embedding`, `test-magika`, `security`) **also** runs on two additional,
+component-independent signals it shares with every other such job: any
+`**/Cargo.toml`/`Cargo.lock`/`deny.toml` change (the `deps` filter output) or any
+`.github/workflows/**` change (the `ci` filter output) — plus `workflow_dispatch` and a
+fail-open run if the `changes` job itself doesn't succeed. These two are omitted from each
+job's own parenthetical below to avoid repeating them five times; they apply to all five.
+
+`clippy`/`test`/`integration`/`coverage` are gated too — each has its own
+`if: ... rust=='true' || ci=='true' ...` condition, same shape as the five jobs above (plus
+`workflow_dispatch`/changes-job-failed fail-open) — just keyed on the broader `rust` filter
+(any `**/*.rs`, `**/Cargo.toml`, `Cargo.lock`, `Makefile`, `rust-toolchain.toml`, `.cargo/**`,
+`release-plz.toml`, or `testing/e2e/lib/sidecars.py`)
+instead of a narrow component path. Only `lint` genuinely has no `if:` at all. "(always)"
+below means "whenever this workflow runs at all" **only** for `lint`; every other job's
+"(always)" instead means "on `rust` or `ci`, which in practice covers almost every
+non-doc-only PR" — call it out explicitly rather than reusing the same word for two
+different guarantees.
+
 ```
 PR opened / updated
-  ├── ci.yml
-  │     ├── test          — fmt + clippy + unit tests (Ubuntu, macOS, Windows)
-  │     ├── integration   — DB integration tests (Ubuntu)
-  │     ├── test-fips     — FIPS verification / platform-specific FIPS test lanes
-  │     ├── security      — cargo-deny
-  │     ├── coverage      — cargo-llvm-cov → Codecov upload
-  │     ├── lint          — custom architectural lints (cargo gears lint)
-  │     └── cypilot       — artifact / specification validation
+  ├── ci.yml (workflow-level `paths-ignore: ['**/*.md', 'docs/**']` skips this
+  │           entire workflow — every job below, not just individual ones —
+  │           for a PR touching only Markdown/docs paths)
+  │     ├── clippy             — workspace clippy, 2-pass (rust or ci filter, not unconditional
+  │     │                         — see note above)
+  │     ├── test                — unit + in-process integration tests only, NOT fmt/clippy
+  │     │                         (those are the dedicated `clippy` job above and the separate
+  │     │                         `fmt.yml` workflow below; Ubuntu, macOS, Windows; rust or ci)
+  │     ├── integration         — DB/Docker integration tests (Ubuntu; rust or ci)
+  │     ├── test-fips           — FIPS build/test, 3 OSes (only when `libs/toolkit/**`,
+  │     │                         `libs/toolkit-http/**`, or `libs/rustls-*/**` changed)
+  │     ├── test-graph-storage  — graph-storage gear's own suite (only when
+  │     │                         `gears/graph-storage/**` changed)
+  │     ├── test-onnx-embedding — ONNX plugin + `--features onnx` check (only when
+  │     │                         `gears/graph-storage/{onnx-embedding-plugin,graph-storage-sdk,graph-storage}/**` changed)
+  │     ├── test-magika         — magika feature lane (only when `gears/file-parser/**` changed)
+  │     ├── security            — `make deny` (only when `**/Cargo.toml`, `Cargo.lock`,
+  │     │                         or `deny.toml` changed)
+  │     ├── coverage            — cargo-llvm-cov → Codecov upload (rust or ci; advisory)
+  │     ├── lint                — custom architectural lints (`cargo gears lint`; always — the
+  │     │                         one job above with no `if:` at all, not even rust/ci-gated)
+  │     └── cfs                 — unconditional `uses: ./.github/workflows/cfs.yml` reusable-
+  │                               workflow call; see `cfs.yml` below for what this actually runs
+  │                               and its own, *separate* independent trigger
   │
-  ├── fmt.yml             — dedicated cargo fmt validation for Rust changes
-  ├── docs.yml            — Markdown link checking for docs changes
-  ├── gts-validation.yml  — GTS identifier validation for docs / schema changes
-  └── e2e.yml (PRs to main only)
+  ├── cfs.yml              — `make cfs-validate` + `cfs-validate-kits`. Runs through two
+  │                          independent paths, not one: the `cfs` job above (inside `ci.yml`,
+  │                          so skipped along with every other job there by `ci.yml`'s own
+  │                          doc-paths-ignore) **and** its own separate `pull_request` trigger
+  │                          on `**/*.md`, `docs/**`, `gears/**/{docs,src,tests}/**`,
+  │                          `.cf-studio/config/**`, `.cf-studio-kit.toml`, `studio-kit-gears/**`,
+  │                          or `Makefile` (which explicitly *includes* doc-only paths) —
+  │                          **but only for a PR targeting `main`**: cfs.yml's own trigger is
+  │                          `branches: [main]`, narrower than `ci.yml`'s `[main, develop]`.
+  │                          Net effect, for a PR targeting `main`: a doc-only PR still gets CFS
+  │                          validation (via the second path, since the first is skipped); a PR
+  │                          touching only `libs/**`/`tools/**`/`apps/**` (outside the second
+  │                          trigger's own path list) gets it once, from the first path only; a
+  │                          PR that also touches `gears/**/{docs,src,tests}/**` (or any of the
+  │                          second trigger's other paths) gets it from *both* paths at once —
+  │                          two separate workflow runs for the same check, not deduped. For a
+  │                          PR targeting `develop`, only the first path can ever fire (the
+  │                          second never triggers on that base branch at all) — so a doc-only
+  │                          PR to `develop` gets **no** CFS validation from either path, the
+  │                          opposite of the `main` case above
+  ├── fmt.yml              — dedicated cargo fmt validation for Rust changes
+  ├── api_contracts.yml    — OpenAPI spec freshness (`make openapi`) + oasdiff breaking-change
+  │                          gate, on any `**/*.rs`, `**/Cargo.toml`, `Cargo.lock`, `Makefile`,
+  │                          or `config/quickstart.yaml` change (broader trigger than it sounds —
+  │                          not just REST-touching files)
+  ├── gts-validation.yml   — GTS identifier validation, on `**/*.md`/`*.json`/`*.yaml`/`*.yml`,
+  │                          `docs/**`, or `guidelines/**` changes (doc/schema paths — a
+  │                          GTS identifier touched only in `.rs` code does not trigger this)
+  ├── clusterfuzzlite.yml  — PR-triggered libFuzzer/ASan run, on `**/*.rs`, `**/Cargo.toml`,
+  │                          `Cargo.lock`, or `rust-toolchain.toml` changes (NOT nightly-only)
+  ├── docs.yml              — Markdown/web-docs link checking, doc-path changes only
+  ├── web-docs-check.yml   — same purpose, but its own trigger also includes
+  │                          `tools/scripts/docs-preview.sh`, `Makefile`, and its own
+  │                          workflow file — not doc-path-only like docs.yml
+  ├── crlf-check.yml       — repo-wide CRLF line-ending check
+  ├── forbidden-words.yml  — disallowed-term scan
+  ├── dco-signoff.yml      — DCO sign-off presence check
+  ├── helm.yml             — Helm chart lint/template, Helm-path changes only
+  └── e2e.yml (PRs to main only; its own `paths-ignore: ['**/*.md', 'docs/**',
+  │            'guidelines/**']` skips it entirely for a PR touching only those paths)
         └── e2e           — full E2E suite (local mode), plus mini-chat, TR/AuthZ
-                            and usage-collector E2E lanes
+                            and usage-collector E2E lanes — runs on every other PR to
+                            main regardless of what the rest of the diff touches
 
-Additional quality workflows
-  ├── codeql.yml          — security and quality code scanning
-  ├── pr-governance.yml   — review-governance automation
-  └── pr-reviewer-check.yml — reviewer assignment hygiene
+Additional quality / automation workflows (not per-PR correctness gates for ordinary
+CODE changes): codeql.yml (security/quality scanning), pr-governance.yml and
+pr-reviewer-check.yml (both currently disabled), test-report.yml, code-ranker.yml,
+release-plz.yml, scorecard.yml, cache_cleanup.yml, notify-docs.yml, pr-dashboard.yml.
 
-Nightly (schedule)
+Nightly / scheduled only
+  ├── shear-nightly.yml    — workspace unused-dependency scan (`make shear`); advisory,
+  │                          opens/closes a tracking issue on failure/recovery
   ├── e2e.yml              — full E2E + specialized E2E lanes (auto-creates issue on failure)
-  ├── clusterfuzzlite      — fuzz testing
-  ├── codeql.yml           — scheduled code scanning
-  ├── pr-governance.yml    — governance / follow-up automation
-  └── pr-reviewer-check.yml — reviewer assignment checks
+  ├── clippy-nightly.yml   — full feature-matrix clippy (`clippy-deep`)
+  └── codeql.yml           — scheduled code scanning
 ```
+
+---
+
+## 7.4 Local CI Routing — what to run for what you changed
+
+Don't run the whole pipeline locally for every change. Route by what the diff actually
+touches, mirroring `ci.yml`'s own `changes` job (the one source of truth for these
+conditions — if it drifts from this table, trust the workflow file).
+
+The `gears` Studio kit's `GearsCodeClose`/`GearsCodeChainSweep` units execute this table's
+logic automatically, but the actual command string each row below runs is not hardcoded in
+this table or in the kit's own prompt files — it's looked up from
+`studio-kit-gears/scripts/ci-commands.toml` (`{ci_commands}`), a small, user-editable
+facade that exists specifically so a standalone install of this kit, into a project whose
+build system doesn't match this repo's own Makefile, can repoint every command below
+without touching any kit logic. The commands shown in this table are this repository's own
+current defaults in that file, kept here for human readability — if they ever drift from
+`ci-commands.toml`, trust that file.
+
+| Changed | Run locally | Matches CI job |
+|---|---|---|
+| `**/Cargo.toml`, `Cargo.lock`, or `deny.toml` | `make deny` | `ci.yml` / `security` |
+| `**/Cargo.toml` or `Cargo.lock` changed | `make shear` | `shear-nightly.yml` (advisory, nightly-only in CI — catching it locally is stricter, not redundant). A version bump can also surface this if it drops the last caller of a transitive dep; a plain `git status` can't tell "added/removed" from "bumped" apart, so this routes off the same dependency-changed signal as `make deny` rather than trying to distinguish them |
+| Any `.rs` file, when the gear exposes REST endpoints via the example server | `make openapi GEAR=<gear>` | `api_contracts.yml` (CI's own trigger is broader — any `.rs`/Cargo/Makefile change — so this local heuristic is narrower than CI; a change outside REST-facing files can still occasionally need it) |
+| GTS identifiers, type schemas, well-known instances, or `x-gts-traits` touched in code (even without touching a `.md`/`.json`/`.yaml`/`.yml` file) | `make gts-docs` | `gts-validation.yml` only triggers on doc/schema file paths, not on `.rs` changes alone — running this locally for GTS-touching code changes is **stricter** than what CI gates on today |
+| `libs/toolkit/**`, `libs/toolkit-http/**`, or `libs/rustls-*/**` | `make test-fips` | `ci.yml` / `test-fips` |
+| `gears/graph-storage/**` | `make test-graph-storage` | `ci.yml` / `test-graph-storage` — its `graph_storage` filter is the unqualified `gears/graph-storage/**` glob, so an onnx-plugin/SDK-only change triggers this job too, not just `test-onnx-embedding` below (the PostgreSQL lane, `test-graph-storage-pg`, needs a pinned Postgres+pgvector image and isn't part of this quick local check) |
+| `gears/graph-storage/{onnx-embedding-plugin,graph-storage-sdk,graph-storage}/**` (CI's filter includes the bare core crate too, to catch its `#[cfg(feature = "onnx")]` wiring breaking) | `cargo test -p cf-gears-graph-storage-onnx-embedding-plugin` (no Makefile wrapper yet); additionally `cargo check -p cf-gears-graph-storage --features onnx` for a core-crate-only change — cheap, no external downloads, and the one check that actually covers that path | `ci.yml` / `test-onnx-embedding` runs a third step this quick local check does not cover — `cargo test -p cf-gears-graph-storage --lib --features onnx gear::`, the gear's own ONNX provider-wiring test — since it needs the downloaded ONNX runtime + model/tokenizer CI provisions; run it too (with `ORT_DYLIB_PATH` set, same as the file-parser row below) for a full local reproduction of this lane |
+| `gears/file-parser/**` | Requires `ORT_DYLIB_PATH` pointed at a real ONNX Runtime shared library **before** running — without it, the test hangs forever instead of failing cleanly (`ort`'s own behavior against a missing/incompatible runtime; see `gears/file-parser/docs/ADR/0001-*.md`), so always wrap with a timeout (CI itself backstops with `timeout-minutes: 10`): `ORT_DYLIB_PATH=<path-to-libonnxruntime.{so,dylib}> timeout 600 cargo test -p cf-gears-file-parser --features magika` (no Makefile wrapper yet; CI fetches its own copy of the library — see `ci.yml`'s `test-magika` job for the exact version/fetch steps if you don't already have one installed); CI's job also ends with `make deny-magika` (`cargo deny --features magika check`) — run that too, it's cheap and needs no runtime | `ci.yml` / `test-magika` |
+| `**/Cargo.toml`, `Cargo.lock`, `deny.toml`, or any `.github/workflows/**` file | in CI, this re-runs **every** row above (`test-fips`, `test-graph-storage`, `test-onnx-embedding`, `test-magika`, `security`) — not just `make deny`/`make shear` from the first row. Running all of them locally for a lockfile bump or workflow-file edit is the safe match; skipping them is a real local/CI gap, not just belt-and-suspenders | `ci.yml`'s shared `deps`/`ci` filter outputs, which every job above's own `if:` OR's in alongside its own component path |
+
+`GearsCodeChainSweep`'s fuller close-out pass (not an ordinary per-slice check) also always
+runs `make e2e-local GEAR=<gear>` for the gear it's closing, unconditionally — unlike every
+row above, this one has no diff-based trigger condition: `run_e2e.py --gear <gear>` discovers
+every E2E suite whose resolved Cargo features include that gear and no-ops cleanly when none
+do, so there is nothing to route on. Matches `e2e.yml`'s local-mode E2E lane, scoped to one
+gear instead of the full suite.
+
+None of these replace `make gear-ci GEAR=<gear>` + `make dylint` (always required) — they're
+additive, triggered only when their own condition is true.
 
 ---
 
@@ -512,11 +629,11 @@ The CI `lint` job applies the architecture lints to the workspace on every PR.
 
 | Tool | Purpose | Command | CI job |
 |------|---------|---------|--------|
-| **clippy** | Lint for correctness and performance | `make clippy` | `test` |
-| **rustfmt** | Formatting enforcement | `make fmt` | `test` |
+| **clippy** | Lint for correctness and performance | `make clippy` | `clippy` (ci.yml) |
+| **rustfmt** | Formatting enforcement | `make fmt` | `fmt.yml` (separate workflow, not a `ci.yml` job) |
 | **cargo gears lint** | Project-specific architectural lints (layer separation, DTO placement) | `cargo gears lint` | `lint` |
 | **cargo-deny** | License compliance, advisories, banned crates | `make deny` | `security` |
-| **cargo-kani** | Formal verification of unsafe code and invariants | `make kani` | `test` (via `safety`) |
+| **cargo-kani** | Formal verification of unsafe code and invariants | `make kani` | none — not invoked by any workflow today; local/manual only despite `make safety` bundling it |
 | **cargo-geiger** | Audit of `unsafe` usage in dependencies | `make geiger` | manual |
 
 ---

@@ -134,6 +134,15 @@ ensure-submodules:
 		echo "ERROR: Uninitialized git submodules detected. Run 'git submodule update --init --recursive'." && exit 1; \
 	fi
 
+# cfs-repair (defined in .gears-dna/gears.mk, not edited here - see its own
+# "do not edit a copy" header) additionally depends on ensure-submodules:
+# `cfs init`/`cfs generate-agents` load every registered kit resource eagerly
+# and fail outright if one points inside an unfetched submodule. Make merges
+# a target's prerequisites across multiple rule definitions as long as only
+# one carries a recipe, so this extends cfs-repair without forking the
+# vendored file.
+cfs-repair: ensure-submodules
+
 # Run markdown checks with 'lychee'.
 # Mirrors the pre-commit hook's scope: every tracked .md outside docs/web-docs (that tree has
 # Starlight route-relative links, see web-docs-check). git ls-files does not descend into the
