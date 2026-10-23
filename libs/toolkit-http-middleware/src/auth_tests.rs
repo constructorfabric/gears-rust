@@ -247,9 +247,10 @@ async fn public_route_without_auth_passes_through() {
 }
 
 #[tokio::test]
-async fn public_route_revalidates_present_token() {
+async fn public_route_ignores_a_presented_token() {
+    // As on the gateway: an anonymous operation answers the same whoever asks.
     let (status, _) = send(app(true), Some("Bearer forged-token")).await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(status, StatusCode::OK);
 }
 
 #[tokio::test]
@@ -762,14 +763,10 @@ async fn a_lone_credential_of_the_other_plane_is_dropped_unvalidated() {
         let result = call(app, Method::GET, path, None, Some("forged")).await;
         assert_reason(&result, "MISSING_BEARER", path);
         assert_eq!(calls.get(), (0, 0), "{path}");
-        // Without a tenant plane the handler runs, without the token or a platform context.
+        // Without a tenant plane the route is refused; the handler never runs.
         let (app, calls) = counted_route_app(false, true);
-        let (status, _, body) = call(app, Method::GET, path, None, Some(SA_GOOD)).await;
-        assert_eq!(
-            (status, body.as_str()),
-            (StatusCode::OK, "platform=false token_header=false"),
-            "{path}"
-        );
+        let result = call(app, Method::GET, path, None, Some(SA_GOOD)).await;
+        assert_reason(&result, "TENANT_AUTH_NOT_CONFIGURED", path);
         assert_eq!(calls.get(), (0, 0), "{path}");
     }
     // Anonymous routes keep validating a lone credential of either plane.
@@ -887,18 +884,165 @@ async fn anonymous_routes_get_a_security_context_with_or_without_a_tenant_plane(
     .await;
     assert_eq!(
         (status, body.as_str()),
-        (StatusCode::OK, "subject"),
-        "a validated bearer replaces the anonymous context"
+        (StatusCode::OK, "anonymous"),
+        "a valid bearer is ignored: the context stays anonymous"
     );
-    let result = call(
-        platform_route_app(true, true),
+    let (app, calls) = counted_route_app(true, true);
+    let (status, _, body) = call(app, Method::GET, "/anon", Some(BEARER_FORGED), None).await;
+    assert_eq!(
+        (status, body.as_str()),
+        (StatusCode::OK, "anonymous"),
+        "a forged bearer is ignored, not validated"
+    );
+    assert_eq!(
+        calls.get(),
+        (0, 0),
+        "the bearer is never sent to the authenticator"
+    );
+}
+
+/// [`TenantPlane::Absent`]: tenant and unlisted routes are refused, the others keep their plane.
+#[tokio::test]
+async fn without_a_tenant_plane_tenant_routes_are_refused() {
+    for path in ["/auth", "/unlisted"] {
+        for bearer in [None, Some(BEARER_TENANT)] {
+            let result = call(
+                platform_route_app(false, true),
+                Method::GET,
+                path,
+                bearer,
+                None,
+            )
+            .await;
+            assert_reason(
+                &result,
+                "TENANT_AUTH_NOT_CONFIGURED",
+                &format!("{path} {bearer:?}"),
+            );
+        }
+    }
+    let (status, _, body) = call(
+        platform_route_app(false, true),
         Method::GET,
         "/anon",
-        Some(BEARER_FORGED),
+        None,
         None,
     )
     .await;
-    assert_401(&result, "a presented bearer is still validated");
+    assert_eq!((status, body.as_str()), (StatusCode::OK, "anonymous"));
+    let (status, _, _) = call(
+        platform_route_app(false, true),
+        Method::GET,
+        "/p",
+        None,
+        Some(SA_GOOD),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a platform route keeps its own plane"
+    );
+}
+
+/// [`TenantPlane::Absent`] guards only what a handler serves: a method or a path nothing
+/// serves keeps its `405` or `404`, while the served tenant and unlisted routes are refused.
+#[tokio::test]
+async fn without_a_tenant_plane_an_unserved_request_keeps_its_status() {
+    for (method, path, expected) in [
+        (Method::DELETE, "/auth", StatusCode::METHOD_NOT_ALLOWED),
+        (Method::POST, "/anon", StatusCode::METHOD_NOT_ALLOWED),
+        (Method::DELETE, "/p", StatusCode::METHOD_NOT_ALLOWED),
+        (Method::GET, "/nowhere", StatusCode::NOT_FOUND),
+        (Method::GET, "/auth", StatusCode::UNAUTHORIZED),
+        (Method::GET, "/unlisted", StatusCode::UNAUTHORIZED),
+    ] {
+        let (status, _, body) = call(
+            platform_route_app(false, false),
+            method.clone(),
+            path,
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(status, expected, "{method} {path}: {body}");
+    }
+    let response = platform_route_app(false, false)
+        .oneshot(
+            HttpRequest::builder()
+                .method(Method::DELETE)
+                .uri("/auth")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response
+            .headers()
+            .get(header::ALLOW)
+            .map(http::HeaderValue::as_bytes),
+        Some(&b"GET, HEAD"[..]),
+        "the 405 names the declared methods"
+    );
+
+    // A listener with no routes at all has nothing to guard and still answers.
+    let empty = layer_route_auth_with(
+        Router::new(),
+        RouteAuthPolicy::default(),
+        TenantPlane::Absent,
+        None,
+    );
+    let (status, _, _) = call(empty, Method::GET, "/anything", None, None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// [`TenantPlane::Disabled`] (development): the default tenant context on non-platform
+/// routes, never on a platform one.
+#[tokio::test]
+async fn a_disabled_tenant_plane_runs_with_the_default_context() {
+    let policy: RouteAuthPolicy = [
+        (Method::GET, "/p".to_owned(), RouteAuth::Platform),
+        (Method::GET, "/auth".to_owned(), RouteAuth::Authenticated),
+    ]
+    .into_iter()
+    .collect();
+    let app = || {
+        layer_route_auth_with(
+            Router::new()
+                .route("/p", get(platform_echo))
+                .route("/auth", get(anon_echo))
+                .route("/unlisted", get(anon_echo)),
+            policy.clone(),
+            TenantPlane::Disabled,
+            None,
+        )
+    };
+    for path in ["/auth", "/unlisted"] {
+        let (status, _, body) = call(app(), Method::GET, path, None, None).await;
+        assert_eq!(
+            (status, body.as_str()),
+            (StatusCode::OK, "subject"),
+            "{path}"
+        );
+    }
+    let result = call(app(), Method::GET, "/p", Some(BEARER_TENANT), None).await;
+    assert_reason(
+        &result,
+        "MISSING_INTERNAL_TOKEN",
+        "a synthetic tenant context admits nothing",
+    );
+    // Admitted by a validated internal token, the platform handler still sees no tenant
+    // context: `Disabled` never synthesises one on a platform route.
+    let with_internal = layer_route_auth_with(
+        Router::new().route("/p", get(platform_echo)),
+        policy.clone(),
+        TenantPlane::Disabled,
+        Some(DynInternalAuthenticator::new(StubInternalAuthenticator)),
+    );
+    let (status, _, body) = call(with_internal, Method::GET, "/p", None, Some(SA_GOOD)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(!body.ends_with("+tenant"), "no tenant context: {body}");
 }
 
 #[tokio::test]

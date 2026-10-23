@@ -49,7 +49,7 @@ use url::Url;
 
 use cf_system_sdks::directory::{DirectoryClient, RegisterInstanceInfo, ServiceEndpoint};
 use toolkit_canonical_errors::CanonicalError;
-use toolkit_http_middleware::{RouteAuthPolicy, layer_route_auth};
+use toolkit_http_middleware::{RouteAuthPolicy, TenantPlane, layer_route_auth_with};
 use toolkit_security::{DynBearerAuthenticator, DynInternalAuthenticator};
 
 use super::readiness::ReadinessState;
@@ -117,6 +117,11 @@ pub struct OopServeOptions {
     /// Platform-plane authenticator; when `Some`, `internal_auth_middleware` is
     /// installed on gear routes (runs before the tenant plane).
     pub internal_authenticator: Option<DynInternalAuthenticator>,
+    /// Development only (`oop_http.auth_disabled`): without a tenant authenticator,
+    /// non-platform routes run with the default tenant `SecurityContext` instead of
+    /// being refused, and a missing internal authenticator is a warning rather than
+    /// a startup refusal. Platform routes still require a validated platform caller.
+    pub auth_disabled: bool,
     /// Stable addressing labels (k8s `matchLabels` style) advertised with this
     /// instance's directory registration for label-based selection.
     pub labels: BTreeMap<String, String>,
@@ -149,8 +154,16 @@ impl OopServeOptions {
             directory,
             bearer_authenticator: None,
             internal_authenticator: None,
+            auth_disabled: false,
             labels: BTreeMap::new(),
         }
+    }
+
+    /// Development only: see [`Self::auth_disabled`].
+    #[must_use]
+    pub fn with_auth_disabled(mut self, auth_disabled: bool) -> Self {
+        self.auth_disabled = auth_disabled;
+        self
     }
 
     /// Set the gear version (used for registration + `OpenAPI` version).
@@ -488,15 +501,20 @@ fn layer_gear_router(
     drain_guard: DrainGuard,
     options: &OopServeOptions,
 ) -> Router {
-    // Policy, both auth planes (each only when injected) and the platform gate, in the
-    // order `cpt-cf-adr-two-plane-auth` requires. A missing internal authenticator fails
-    // closed for platform routes only; without a tenant authenticator, tenant routes are
-    // served without bearer validation (the bearer authenticator is optional, see
-    // `resolve_bearer_authenticator`).
-    let mut gear = layer_route_auth(
+    // Policy, both auth planes and the platform gate, in the order
+    // `cpt-cf-adr-two-plane-auth` requires. Both planes fail closed: platform routes
+    // without an internal authenticator, tenant and unlisted routes without a bearer
+    // authenticator (unless `auth_disabled`). `check_route_auth` refuses to start
+    // before that can happen for a declared tenant operation.
+    let tenant = match (&options.bearer_authenticator, options.auth_disabled) {
+        (Some(bearer), _) => TenantPlane::Authenticator(bearer.clone()),
+        (None, true) => TenantPlane::Disabled,
+        (None, false) => TenantPlane::Absent,
+    };
+    let mut gear = layer_route_auth_with(
         gear_router,
         route_auth,
-        options.bearer_authenticator.clone(),
+        tenant,
         options.internal_authenticator.clone(),
     );
 
@@ -765,11 +783,44 @@ impl OopHttpServer {
                 "tenant-plane authenticator installed (security_context_middleware enabled)"
             );
         } else {
-            tracing::warn!(
+            tracing::info!(
                 gear = %self.options.gear_name,
-                "no tenant-plane authenticator registered in ClientHub; tenant plane not installed"
+                "no tenant-plane authenticator registered in ClientHub"
             );
         }
+    }
+
+    /// Refuse to serve tenant operations without a bearer authenticator (unless
+    /// `auth_disabled`): a startup error names the cause instead of a listener that
+    /// refuses every tenant request. Platform operations without an internal
+    /// authenticator only warn: the platform gate already refuses each request, and a
+    /// linked gear's platform route nobody calls must not stop the process.
+    ///
+    /// # Errors
+    /// When tenant operations are declared and no tenant authenticator is available.
+    pub(super) fn check_route_auth(&self, route_auth: &RouteAuthPolicy) -> anyhow::Result<()> {
+        let gear = &self.options.gear_name;
+        let tenant = route_auth.tenant_routes();
+        if !tenant.is_empty()
+            && self.options.bearer_authenticator.is_none()
+            && !self.options.auth_disabled
+        {
+            anyhow::bail!(
+                "gear '{gear}' serves tenant operations but no tenant authenticator is \
+                 available (link authn-resolver, or set oop_http.auth_disabled for \
+                 development): {tenant:?}"
+            );
+        }
+        let platform = route_auth.platform_routes();
+        if !platform.is_empty() && self.options.internal_authenticator.is_none() {
+            tracing::warn!(
+                gear = %gear,
+                routes = ?platform,
+                "platform operations are served without oop_http.internal_auth; \
+                 every request to them is refused with 401"
+            );
+        }
+        Ok(())
     }
 
     /// Atomically publish the composed gear routes (with auth policy) and their

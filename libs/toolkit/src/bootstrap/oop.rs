@@ -731,6 +731,7 @@ async fn build_oop_serve_options(
         directory,
         bearer_authenticator: None,
         internal_authenticator,
+        auth_disabled: cfg.auth_disabled,
         labels: cfg.labels.clone(),
     })
 }

@@ -1312,6 +1312,15 @@ async fn context_free_handler() -> &'static str {
     "ok"
 }
 
+/// An anonymous route's handler: whether its context is the anonymous one.
+async fn axis_public_handler(Extension(ctx): Extension<SecurityContext>) -> &'static str {
+    if ctx.is_anonymous() {
+        "anonymous"
+    } else {
+        "subject"
+    }
+}
+
 pub struct TestAxisGear;
 
 #[async_trait]
@@ -1359,7 +1368,7 @@ impl RestApiCapability for TestAxisGear {
         let router = OperationBuilder::get(AXIS_PUBLIC_PATH)
             .operation_id("test_axis.public")
             .anonymous()
-            .handler(context_free_handler)
+            .handler(axis_public_handler)
             .text_response(http::StatusCode::OK, "OK", "text/plain")
             .register(router, openapi);
         Ok(OperationBuilder::post(AXIS_ECHO_PATH)
@@ -2012,4 +2021,20 @@ async fn platform_identity_throttling_with_auth_disabled() {
     assert_eq!(status, StatusCode::OK, "{body}");
     let (status, body, _) = call(Some(AXIS_INTERNAL_SECRET)).await;
     assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+}
+
+/// As on an out-of-process listener: a bearer on an anonymous route is ignored,
+/// valid or forged, and the handler gets the anonymous context.
+#[tokio::test]
+async fn a_bearer_on_an_anonymous_route_is_ignored_at_the_gateway() {
+    for bearer in [None, Some(AXIS_BEARER), Some("forged")] {
+        let router = create_axis_router(axis_config(true)).await;
+        let (status, body, _) =
+            axis_call(router, Method::GET, AXIS_PUBLIC_PATH, bearer, None).await;
+        assert_eq!(
+            (status, body.as_str()),
+            (StatusCode::OK, "anonymous"),
+            "bearer {bearer:?}"
+        );
+    }
 }

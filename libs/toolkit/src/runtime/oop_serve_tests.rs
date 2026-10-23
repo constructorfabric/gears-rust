@@ -374,6 +374,8 @@ async fn e2e_startup_readiness_transition_and_graceful_shutdown() {
         directory: Arc::clone(&directory),
         bearer_authenticator: None,
         internal_authenticator: None,
+        // No authenticator: the raw routes run only in development mode.
+        auth_disabled: true,
         labels: std::collections::BTreeMap::new(),
     };
 
@@ -460,6 +462,7 @@ async fn attach_forwards_configured_labels_to_directory_registration() {
         directory: Arc::clone(&directory) as Arc<dyn DirectoryClient>,
         bearer_authenticator: None,
         internal_authenticator: None,
+        auth_disabled: false,
         labels: labels.clone(),
     };
 
@@ -515,6 +518,7 @@ async fn ephemeral_listen_port_updates_advertise_uri() {
         directory: Arc::new(E2eDirectory::default()),
         bearer_authenticator: None,
         internal_authenticator: None,
+        auth_disabled: false,
         labels: std::collections::BTreeMap::new(),
     };
 
@@ -559,6 +563,7 @@ async fn user_advertise_uri_is_not_overwritten_by_ephemeral_bind_port() {
         directory: Arc::new(E2eDirectory::default()),
         bearer_authenticator: None,
         internal_authenticator: None,
+        auth_disabled: false,
         labels: std::collections::BTreeMap::new(),
     };
 
@@ -604,6 +609,8 @@ async fn gear_handler_receives_connect_info_through_fallback() {
         directory: Arc::new(E2eDirectory::default()),
         bearer_authenticator: None,
         internal_authenticator: None,
+        // No authenticator: the raw routes run only in development mode.
+        auth_disabled: true,
         labels: std::collections::BTreeMap::new(),
     };
 
@@ -725,13 +732,15 @@ async fn canonical_error_layer_runs_inside_the_trace_span_when_composed() {
     let _guard = tracing::subscriber::set_default(subscriber);
 
     let readiness = readiness(Vec::<String>::new());
+    // No authenticator: the unlisted route runs only in development mode.
     let options = OopServeOptions::new(
         "order-gear".to_owned(),
         "i-1".to_owned(),
         "http://localhost".to_owned(),
         free_addr(),
         Arc::new(E2eDirectory::default()),
-    );
+    )
+    .with_auth_disabled(true);
     let app = layer_gear_router(
         Router::new().route("/boom", get(boom)),
         RouteAuthPolicy::default(),
@@ -1018,5 +1027,128 @@ async fn platform_routes_fail_closed_without_an_authenticator() {
             StatusCode::UNAUTHORIZED,
             "no platform plane (tenant plane {bearer_plane}), {method}"
         );
+    }
+}
+
+/// `auth_disabled` is only the fallback for a missing tenant authenticator: with one
+/// installed, a tenant route still needs a valid bearer, and gets its real subject.
+#[tokio::test]
+async fn an_installed_tenant_authenticator_wins_over_auth_disabled() {
+    use crate::api::{OpenApiRegistryImpl, OperationBuilder};
+
+    async fn subject(axum::Extension(ctx): axum::Extension<SecurityContext>) -> String {
+        ctx.subject_id().to_string()
+    }
+
+    let app = || {
+        let registry = OpenApiRegistryImpl::new();
+        let router = OperationBuilder::get("/axis/v1/auth")
+            .operation_id("axis.auth")
+            .authenticated()
+            .no_license_required()
+            .handler(subject)
+            .text_response(StatusCode::OK, "OK", "text/plain")
+            .register(Router::new(), &registry);
+        let options = OopServeOptions::new(
+            "axis-gear".to_owned(),
+            "i-1".to_owned(),
+            "http://localhost".to_owned(),
+            free_addr(),
+            Arc::new(E2eDirectory::default()),
+        )
+        .with_bearer_authenticator(Some(DynBearerAuthenticator::new(AxisBearer)))
+        .with_auth_disabled(true);
+        let policy = route_auth_policy(registry.operation_specs.iter());
+        layer_gear_router(
+            router,
+            policy,
+            DrainGuard::new(readiness(Vec::<String>::new())),
+            &options,
+        )
+    };
+    for bearer in [None, Some("Bearer forged-token")] {
+        let (status, _) = axis_status(app(), Method::GET, "/axis/v1/auth", bearer, None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "bearer {bearer:?}");
+    }
+    let resp = app()
+        .oneshot(
+            Request::builder()
+                .uri("/axis/v1/auth")
+                .header(axum::http::header::AUTHORIZATION, AXIS_BEARER)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(
+        body.as_ref(),
+        uuid::Uuid::from_u128(1).to_string().as_bytes()
+    );
+}
+
+/// A worker refuses to start serving tenant operations it cannot check, and says why.
+/// Platform operations without an internal authenticator start: each request fails
+/// closed (`platform_routes_fail_closed_without_an_authenticator`).
+#[tokio::test]
+async fn a_worker_refuses_to_serve_tenant_operations_it_cannot_check() {
+    use toolkit_security::RouteAuth::{Anonymous, Authenticated, Platform};
+    let policy = |auth: toolkit_security::RouteAuth| -> RouteAuthPolicy {
+        [(Method::GET, "/op".to_owned(), auth)]
+            .into_iter()
+            .collect()
+    };
+    let start = |bearer: bool, internal: bool, auth_disabled: bool| async move {
+        let options = OopServeOptions::new(
+            "worker".to_owned(),
+            "i-1".to_owned(),
+            "http://localhost".to_owned(),
+            free_addr(),
+            Arc::new(E2eDirectory::default()),
+        )
+        .with_bearer_authenticator(bearer.then(|| DynBearerAuthenticator::new(AllowAuthN)))
+        .with_internal_authenticator(internal.then(|| DynInternalAuthenticator::new(AllowInternal)))
+        .with_auth_disabled(auth_disabled);
+        let cancel = CancellationToken::new();
+        let server =
+            super::OopHttpServer::start(readiness(Vec::<String>::new()), options, cancel.clone())
+                .await
+                .expect("server should bind on ephemeral port");
+        (server, cancel)
+    };
+    // (tenant authenticator, internal authenticator, auth_disabled, route, refusal names)
+    let cases = [
+        (
+            false,
+            true,
+            false,
+            Authenticated,
+            Some("tenant authenticator"),
+        ),
+        (true, false, false, Platform, None),
+        (true, true, false, Authenticated, None),
+        (true, true, false, Platform, None),
+        (false, false, false, Anonymous, None),
+        (false, false, true, Authenticated, None),
+        (false, false, true, Platform, None),
+    ];
+    for (bearer, internal, auth_disabled, auth, refusal) in cases {
+        let (server, cancel) = start(bearer, internal, auth_disabled).await;
+        let result = server.check_route_auth(&policy(auth));
+        let case =
+            format!("bearer={bearer} internal={internal} auth_disabled={auth_disabled} {auth:?}");
+        match refusal {
+            Some(names) => {
+                let error = result.expect_err(&case).to_string();
+                assert!(error.contains(names), "{case}: {error}");
+            }
+            None => result.unwrap_or_else(|e| panic!("{case}: {e}")),
+        }
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(5), server.join())
+            .await
+            .expect("server should shut down promptly after cancel")
+            .expect("server shuts down");
     }
 }
