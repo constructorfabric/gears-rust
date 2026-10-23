@@ -1,12 +1,12 @@
 ---
-description: "Technical design of the Application Manager gear: operations, whole-manifest validation, ordered dispatch to section plugins, and the append-only audit ledger."
+description: "Technical design of the Application Manager gear: operations, whole-manifest validation, ordered dispatch to section plugins, and the append-only request history."
 ---
 
 <!-- Created: 2026-10-05 by Constructor Tech -->
 
 # Technical Design — Application Manager
 
-How the Application Manager runs each seed and uninstall as an operation: quick synchronous checks, an operation id, whole-manifest validation, ordered dispatch to section plugins, and an append-only audit ledger. Written for gear implementers and section-plugin authors.
+How the Application Manager runs each seed and uninstall as an operation: quick synchronous checks, an operation id, whole-manifest validation, ordered dispatch to section plugins, and an append-only request history. Written for gear implementers and section-plugin authors.
 
 - [ ] `p3` - **ID**: `cpt-cf-application-manager-design-overview`
 
@@ -40,9 +40,9 @@ How the Application Manager runs each seed and uninstall as an operation: quick 
 
 ### 1.1 Architectural Vision
 
-The Application Manager is a thin orchestrating gear on the ToolKit gear model. It owns one manifest envelope, one operations table, one append-only audit ledger, and one fixed sequence of checks, audit inserts, and plugin calls. All domain meaning lives in section plugins, and the gear never talks to the systems they provision.
+The Application Manager is a thin orchestrating gear on the ToolKit gear model. It owns one manifest envelope, one operations table, one append-only request history, and one fixed sequence of checks, history inserts, and plugin calls. All domain meaning lives in section plugins, and the gear never talks to the systems they provision.
 
-The plugin set is fixed at startup ([ADR 0001](./ADR/0001-cpt-cf-application-manager-adr-section-plugin-fan-out.md)). Every seed fetches live schemas and validates the whole manifest before it dispatches anything ([ADR 0002](./ADR/0002-cpt-cf-application-manager-adr-plugin-served-section-schemas.md)). Seed and uninstall run as background operations within a run window ([ADR 0003](./ADR/0003-cpt-cf-application-manager-adr-async-operations.md)). Audit events go to an append-only ledger in the transaction of the change they describe ([ADR 0004](./ADR/0004-cpt-cf-application-manager-adr-audit-ledger.md)). Permission is platform-level and records are unrestricted ([ADR 0005](./ADR/0005-cpt-cf-application-manager-adr-platform-level-access.md)).
+The plugin set is fixed at startup ([ADR 0001](./ADR/0001-cpt-cf-application-manager-adr-section-plugin-fan-out.md)). Every seed fetches live schemas and validates the whole manifest before it dispatches anything ([ADR 0002](./ADR/0002-cpt-cf-application-manager-adr-plugin-served-section-schemas.md)). Seed and uninstall run as background operations within a run window ([ADR 0003](./ADR/0003-cpt-cf-application-manager-adr-async-operations.md)). History events go to the append-only request history in the transaction of the change they describe ([ADR 0004](./ADR/0004-cpt-cf-application-manager-adr-request-history.md)). Permission is platform-level and records are unrestricted ([ADR 0005](./ADR/0005-cpt-cf-application-manager-adr-platform-level-access.md)).
 
 ### 1.2 Architecture Drivers
 
@@ -75,9 +75,9 @@ The plugin set is fixed at startup ([ADR 0001](./ADR/0001-cpt-cf-application-man
 | `cpt-cf-application-manager-fr-operation-read` | `cpt-cf-application-manager-component-read-service`, `cpt-cf-application-manager-component-operation-sweeper`. |
 | `cpt-cf-application-manager-fr-authentication` | Every route is `.authenticated()`; plugins get a token-less caller identity (`cpt-cf-application-manager-entity-caller-identity`). |
 | `cpt-cf-application-manager-fr-authorization` | Gear-level and plugin-level authorization in [§3.3](#33-api-contracts). |
-| `cpt-cf-application-manager-fr-audit-event` | `cpt-cf-application-manager-dbtable-audit-ledger`, `cpt-cf-application-manager-component-operation-repository`. |
-| `cpt-cf-application-manager-fr-audit-read` | `cpt-cf-application-manager-component-read-service`. |
-| `cpt-cf-application-manager-fr-audit-ordering` | `cpt-cf-application-manager-principle-trace-before-change`. |
+| `cpt-cf-application-manager-fr-history-event` | `cpt-cf-application-manager-dbtable-request-history`, `cpt-cf-application-manager-component-operation-repository`. |
+| `cpt-cf-application-manager-fr-history-read` | `cpt-cf-application-manager-component-read-service`. |
+| `cpt-cf-application-manager-fr-history-ordering` | `cpt-cf-application-manager-principle-trace-before-change`. |
 | `cpt-cf-application-manager-interface-seeding` | `cpt-cf-application-manager-interface-rest-api`. |
 | `cpt-cf-application-manager-interface-operations` | `cpt-cf-application-manager-interface-rest-api`. |
 | `cpt-cf-application-manager-interface-discovery` | `cpt-cf-application-manager-interface-rest-api`. |
@@ -87,7 +87,7 @@ The plugin set is fixed at startup ([ADR 0001](./ADR/0001-cpt-cf-application-man
 
 | NFR ID | Allocated To | Design Response |
 |---|---|---|
-| `cpt-cf-application-manager-nfr-audit-completeness` | `cpt-cf-application-manager-component-operation-repository` | Every path ends in a refused event or in the acceptance transaction, and every final state writes its finished event with the report ([§3.7](#37-database-schemas--tables)). |
+| `cpt-cf-application-manager-nfr-history-completeness` | `cpt-cf-application-manager-component-operation-repository` | Every path ends in a refused event or in the acceptance transaction, and every final state writes its finished event with the report ([§3.7](#37-database-schemas--tables)). |
 | `cpt-cf-application-manager-nfr-platform-scope` | `cpt-cf-application-manager-component-operation-repository` | Unrestricted entities with no tenant column, reached only through the gear ([ADR 0005](./ADR/0005-cpt-cf-application-manager-adr-platform-level-access.md)). |
 | `cpt-cf-application-manager-nfr-authorized-before-plugin` | `cpt-cf-application-manager-component-request-orchestrator`, `cpt-cf-application-manager-component-read-service` | The gear-level decision precedes the conflict read, the acceptance, and every plugin call. |
 | `cpt-cf-application-manager-nfr-bounded-call-time` | `cpt-cf-application-manager-component-plugin-call-guard` | Every plugin call goes through the guard ([§4.2](#42-configuration)). |
@@ -103,7 +103,7 @@ The plugin set is fixed at startup ([ADR 0001](./ADR/0001-cpt-cf-application-man
 | `cpt-cf-application-manager-adr-section-plugin-fan-out` | Every section plugin takes part; plugins are discovered once at startup. |
 | `cpt-cf-application-manager-adr-plugin-served-section-schemas` | Plugins serve live schemas, fetched on every seed; the whole manifest is validated before dispatch. |
 | `cpt-cf-application-manager-adr-async-operations` | Background operations with a bounded synchronous phase and a run window; a plugin call is stopped at its time limit. |
-| `cpt-cf-application-manager-adr-audit-ledger` | An append-only ledger table written in the transaction of the change it describes. |
+| `cpt-cf-application-manager-adr-request-history` | An append-only history table written in the transaction of the change it describes. |
 | `cpt-cf-application-manager-adr-platform-level-access` | Platform-level permission with no tenant; unrestricted records. |
 
 ### 1.3 Architecture Layers
@@ -114,7 +114,7 @@ flowchart TB
     INF["infra"] -.->|"implements domain ports"| DOM
     INF --> SP["Section plugins"]
     INF --> PDP["Platform access control"]
-    INF --> DB[("Platform database: operations and audit ledger")]
+    INF --> DB[("Platform database: operations and request history")]
     INF -->|"startup only"| TR["Types registry"]
     SP -. implements .-> SDK["application-manager-sdk"]
     DOM -. uses .-> SDK
@@ -167,7 +167,7 @@ Dispatch starts only after every check of [§3.6](#36-interactions--sequences) h
 
 No plugin receives anything until the operation and its accepted event have committed, at the write points of [§3.7](#37-database-schemas--tables).
 
-**ADRs**: `cpt-cf-application-manager-adr-audit-ledger`
+**ADRs**: `cpt-cf-application-manager-adr-request-history`
 
 #### Honest, Deterministic Outcomes
 
@@ -187,9 +187,9 @@ The gear drops a plugin call at the time limit and dispatches the next section. 
 
 - [ ] `p2` - **ID**: `cpt-cf-application-manager-principle-minimal-state`
 
-The gear keeps only operation records and the audit ledger, and neither holds manifest content. The ledger is a record for people who debug a request; the gear serves it through the audit read and never decides from it.
+The gear keeps only operation records and the request history, and neither holds manifest content. The request history is a record for people who debug a request; the gear serves it through the history read and never decides from it.
 
-**ADRs**: `cpt-cf-application-manager-adr-audit-ledger`, `cpt-cf-application-manager-adr-platform-level-access`
+**ADRs**: `cpt-cf-application-manager-adr-request-history`, `cpt-cf-application-manager-adr-platform-level-access`
 
 ### 2.2 Constraints
 
@@ -209,7 +209,7 @@ Authentication belongs to the platform pipeline, and the gear is supported only 
 
 **ADRs**: `cpt-cf-application-manager-adr-platform-level-access`
 
-#### Secure ORM for Operations and the Audit Ledger
+#### Secure ORM for Operations and the Request History
 
 - [ ] `p2` - **ID**: `cpt-cf-application-manager-constraint-secure-orm`
 
@@ -227,9 +227,9 @@ Every error response is a canonical Problem with no extension member ([canonical
 
 - [ ] `p2` - **ID**: `cpt-cf-application-manager-constraint-no-manifest-content`
 
-Manifest content lives only in memory. Operation records, ledger rows, logs, traces, metrics, and error text carry only the fields that `cpt-cf-application-manager-entity-outcome-report`, `cpt-cf-application-manager-entity-audit-event-content`, and [§4.1](#41-observability) name, and errors never carry values.
+Manifest content lives only in memory. Operation records, history rows, logs, traces, metrics, and error text carry only the fields that `cpt-cf-application-manager-entity-outcome-report`, `cpt-cf-application-manager-entity-history-event-content`, and [§4.1](#41-observability) name, and errors never carry values.
 
-**ADRs**: `cpt-cf-application-manager-adr-audit-ledger`
+**ADRs**: `cpt-cf-application-manager-adr-request-history`
 
 #### Restart for Plugin Changes
 
@@ -306,9 +306,9 @@ stateDiagram-v2
 
 **Caller identity.** Subject id, subject type, subject tenant id, and token scopes from the `SecurityContext`, with no bearer token. Every plugin call receives it. The SDK turns it back into a token-less `SecurityContext` for a plugin's own PolicyEnforcer check.
 
-- [ ] `p2` - **ID**: `cpt-cf-application-manager-entity-audit-event-content`
+- [ ] `p2` - **ID**: `cpt-cf-application-manager-entity-history-event-content`
 
-**Audit event content.** A request has one refused event, or an accepted event followed by a finished event; an acceptance that timed out after it committed has all three. Each event id is a time-ordered UUID assigned at receive. The request id is the operation id of an accepted request and the correlation id of its events.
+**History event content.** A request has one refused event, or an accepted event followed by a finished event; an acceptance that timed out after it committed has all three. Each event id is a time-ordered UUID assigned at receive. The request id is the operation id of an accepted request and the correlation id of its events.
 
 | Field | Accepted | Finished | Refused |
 |---|---|---|---|
@@ -319,7 +319,7 @@ stateDiagram-v2
 | Caller identity and receive time | Yes | No | Yes |
 | Result | None | Category or interrupted marker; problem count and rule tokens; section outcome per key of the key set, with schema versions; unavailable items | Category; problem count and rule tokens; busy operation id; or unavailable items |
 
-Ledger rows carry no other manifest content: no section body, no problem location or message, and no plugin detail.
+History rows carry no other manifest content: no section body, no problem location or message, and no plugin detail.
 
 - [ ] `p2` - **ID**: `cpt-cf-application-manager-entity-schema-version`
 
@@ -369,7 +369,7 @@ graph LR
 
 - [ ] `p1` - **ID**: `cpt-cf-application-manager-component-request-orchestrator`
 
-**Why**: Precedence, acceptance, audit ordering, and dispatch must run as one sequence on every path.
+**Why**: Precedence, acceptance, history ordering, and dispatch must run as one sequence on every path.
 
 **Scope**: Runs each seed and uninstall as a supervised request task through [§3.6](#36-interactions--sequences), decides the category by the outcome table, and performs the supervisor completion. The task completes even when the HTTP request is dropped.
 
@@ -381,9 +381,9 @@ graph LR
 
 - [ ] `p2` - **ID**: `cpt-cf-application-manager-component-read-service`
 
-**Why**: Reads record no audit event and decide no category, so they stay apart from the orchestrator.
+**Why**: Reads record no history event and decide no category, so they stay apart from the orchestrator.
 
-**Scope**: After a `read_schema` or `read_operation` permit, it lists keys from memory, fetches live schemas, or reads one operation record, interrupting it first when expired. After a `read_audit` permit, it reads the audit events of one request.
+**Scope**: After a `read_schema` or `read_operation` permit, it lists keys from memory, fetches live schemas, or reads one operation record, interrupting it first when expired. After a `read_history` permit, it reads the history events of one request.
 
 **Boundaries**: It caches no schema and returns no manifest content or caller subject.
 
@@ -429,11 +429,11 @@ graph LR
 
 - [ ] `p2` - **ID**: `cpt-cf-application-manager-component-operation-repository`
 
-**Why**: The only writer of operation records and of the audit ledger, and the owner of the status guard.
+**Why**: The only writer of operation records and of the request history, and the owner of the status guard.
 
 **Scope**: Runs every storage step and transaction of [§3.6](#36-interactions--sequences) and [§3.7](#37-database-schemas--tables), each bounded by `storage_call_timeout`, and reports "storage cannot answer", "index violated", and "operation final" as distinct results.
 
-**Boundaries**: It decides no category, runs no schedule, and never updates or deletes a ledger row.
+**Boundaries**: It decides no category, runs no schedule, and never updates or deletes a history row.
 
 **Related**: `cpt-cf-application-manager-component-request-orchestrator`, `cpt-cf-application-manager-component-operation-sweeper`.
 
@@ -445,7 +445,7 @@ graph LR
 
 **Scope**: On every replica, every `SWEEP_INTERVAL` it interrupts up to `MAINTENANCE_BATCH_SIZE` expired open operations, and every `PURGE_INTERVAL` it purges final records past `operation_retention`. A failed step is logged and runs again next interval.
 
-**Boundaries**: It makes no plugin call, never deletes an open record, and never purges the ledger.
+**Boundaries**: It makes no plugin call, never deletes an open record, and never purges the request history.
 
 **Related**: `cpt-cf-application-manager-component-operation-repository`.
 
@@ -474,12 +474,12 @@ graph LR
 | `DELETE` | `/application-manager/v1/applications/{application_id}` | Uninstall by id in one percent-encoded segment | `uninstall` |
 | `POST` | `/application-manager/v1/applications:uninstall` | Uninstall with `application_id` in the body | `uninstall` |
 | `GET` | `/application-manager/v1/operations/{operation_id}` | Read one operation | `read_operation` |
-| `GET` | `/application-manager/v1/audit-events?request_id={request_id}` | Audit events of one request | `read_audit` |
+| `GET` | `/application-manager/v1/request-history?request_id={request_id}` | History events of one request | `read_history` |
 | `GET` | `/application-manager/v1/section-keys` | List section keys in priority order | `read_schema` |
 | `GET` | `/application-manager/v1/section-keys/{section_key}/schema` | One live schema with its schema version | `read_schema` |
 | `GET` | `/application-manager/v1/manifest-schema` | The live combined schema with every schema version | `read_schema` |
 
-All routes are unstable, `.authenticated()`, and `.no_license_required()`; seed, uninstall, the operation read, the audit read, and the combined-schema read are bound to gateway rate-limit and in-flight zones. An accepted request gets 202 with `operation_id`, `status` `accepted`, and a `Location` header. The operation read returns the record and, once final, the outcome report.
+All routes are unstable, `.authenticated()`, and `.no_license_required()`; seed, uninstall, the operation read, the history read, and the combined-schema read are bound to gateway rate-limit and in-flight zones. An accepted request gets 202 with `operation_id`, `status` `accepted`, and a `Location` header. The operation read returns the record and, once final, the outcome report.
 
 **Outcome table.** The one normative statement of outcome categories, precedence, and HTTP mapping. The first matching rank decides.
 
@@ -514,7 +514,7 @@ Storage is consulted only for a permitted caller. Sections are checked only insi
 | `uninstall` | Uninstall | Both uninstall forms |
 | `read_operation` | Read operations | Read an operation |
 | `read_schema` | Read schemas | The three discovery reads |
-| `read_audit` | Read audit | Read audit events |
+| `read_history` | Read history | Read history events |
 
 - [ ] `p2` - **ID**: `cpt-cf-application-manager-interface-section-plugin-api`
 
@@ -550,7 +550,7 @@ The gear declares `deps = [types_registry, authz_resolver]` and the capabilities
 
 | Dependency | Interface Used | Purpose |
 |---|---|---|
-| Platform database | SeaORM through SecureConn, migrations | The operations and audit ledger tables |
+| Platform database | SeaORM through SecureConn, migrations | The operations and request history tables |
 | Platform telemetry | ToolKit tracing, metrics, structured logging | Logs, metrics, traces, signals |
 
 ### 3.6 Interactions & Sequences
@@ -575,7 +575,7 @@ sequenceDiagram
     participant API as REST API
     participant O as Request orchestrator
     participant PDP as Platform access control
-    participant R as Repository and audit ledger
+    participant R as Repository and request history
     C ->> API: seed or uninstall
     Note over API: request id, event ids, receive time
     alt not ready, stopping, or no free permit
@@ -622,7 +622,7 @@ sequenceDiagram
     participant O as Request orchestrator
     participant V as Schema validator
     participant P as Section plugins
-    participant R as Repository and audit ledger
+    participant R as Repository and request history
     O ->> R: mark running
     par every section plugin
         O ->> P: schema
@@ -705,9 +705,9 @@ Both tables are created by the gear's migrations on PostgreSQL, MySQL, and SQLit
 
 A unique index on `application_id` over `accepted` and `running` rows admits one open operation per application across replicas (partial index on PostgreSQL and SQLite, stored generated column on MySQL); an expired one is interrupted by the next acceptance. Indexes on (`status`, `run_deadline`) and `finished_at` serve the sweep and purge.
 
-#### Table: audit_ledger
+#### Table: request_history
 
-**ID**: `cpt-cf-application-manager-dbtable-audit-ledger`
+**ID**: `cpt-cf-application-manager-dbtable-request-history`
 
 | Column | Type | Description |
 |---|---|---|
@@ -716,7 +716,7 @@ A unique index on `application_id` over `accepted` and `running` rows admits one
 | `correlation_id` | UUID | The request id; indexed |
 | `action` | enum | `seed` or `uninstall` |
 | `written_at` | timestamp | Write time |
-| `content` | JSON | `cpt-cf-application-manager-entity-audit-event-content` |
+| `content` | JSON | `cpt-cf-application-manager-entity-history-event-content` |
 
 The table is insert-only, unrestricted, and kept without a purge. The operation repository is its only writer, at three write points:
 
@@ -744,9 +744,9 @@ Replicas share only the database, and each runs its own sweeper under the status
 
 **Logs** carry the correlation id, trace id, action, category, section key, and call kind, never section, manifest, or schema content. For application ids and versions, logs carry only the byte length and SHA-256 digest; spans follow the same rule.
 
-**Metrics** count synchronous answers, operations by category and interruption, durations, plugin call timeouts and cap refusals, request tasks in flight, audit events recorded and not recorded, unavailable dependencies, unusable schemas, sweeps and purges, and startup failures. Section keys are labels; application and operation ids never are.
+**Metrics** count synchronous answers, operations by category and interruption, durations, plugin call timeouts and cap refusals, request tasks in flight, history events recorded and not recorded, unavailable dependencies, unusable schemas, sweeps and purges, and startup failures. Section keys are labels; application and operation ids never are.
 
-**Signals** for operator thresholds: audit events not recorded, rising interruptions, repeated timeouts or cap refusals per key, an unusable schema, an unavailable dependency, failing sweeps, request tasks at the cap, a run window margin warning, and a startup failure.
+**Signals** for operator thresholds: history events not recorded, rising interruptions, repeated timeouts or cap refusals per key, an unusable schema, an unavailable dependency, failing sweeps, request tasks at the cap, a run window margin warning, and a startup failure.
 
 **Startup failure reasons**: `types_registry_unreachable`, `priority_unreadable`, `plugin_client_unresolved`, `section_key_unavailable`, `invalid_section_key`, `duplicate_section_key`, `equal_priority`, `invalid_setting`.
 
@@ -790,6 +790,6 @@ Constants: `APPLICATION_ID_MAX_BYTES`, `SCHEMA_VERSION_MAX_BYTES`, `SERVED_SCHEM
   - `cpt-cf-application-manager-adr-section-plugin-fan-out` — [0001](./ADR/0001-cpt-cf-application-manager-adr-section-plugin-fan-out.md)
   - `cpt-cf-application-manager-adr-plugin-served-section-schemas` — [0002](./ADR/0002-cpt-cf-application-manager-adr-plugin-served-section-schemas.md)
   - `cpt-cf-application-manager-adr-async-operations` — [0003](./ADR/0003-cpt-cf-application-manager-adr-async-operations.md)
-  - `cpt-cf-application-manager-adr-audit-ledger` — [0004](./ADR/0004-cpt-cf-application-manager-adr-audit-ledger.md)
+  - `cpt-cf-application-manager-adr-request-history` — [0004](./ADR/0004-cpt-cf-application-manager-adr-request-history.md)
   - `cpt-cf-application-manager-adr-platform-level-access` — [0005](./ADR/0005-cpt-cf-application-manager-adr-platform-level-access.md)
 - **Platform baselines**: [Architecture Manifest](../../../../docs/ARCHITECTURE_MANIFEST.md), [ClientHub and plugins](../../../../docs/toolkit_unified_system/03_clienthub_and_plugins.md), [lifecycle](../../../../docs/toolkit_unified_system/08_lifecycle_stateful_tasks.md), [canonical error system](../../../../docs/arch/errors/DESIGN.md), [AuthN, AuthZ and secure ORM](../../../../docs/toolkit_unified_system/06_authn_authz_secure_orm.md)
