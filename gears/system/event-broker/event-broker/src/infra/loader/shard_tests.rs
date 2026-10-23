@@ -35,7 +35,7 @@ use crate::infra::partition_cache::segment::Segment;
 
 use super::attach::{AttachRequest, attach_readers};
 use super::scheduler::{DemandScheduler, SchedulerPolicy};
-use super::shard::ShardLoader;
+use super::shard::{ShardLoader, pays_tick};
 use super::source::{EventSource, SourceError};
 use super::topics::{TopicManager, TopicPolicy};
 
@@ -315,4 +315,70 @@ async fn the_loader_reclaims_spans_a_reader_has_passed() {
     );
 
     drop(slots);
+}
+
+struct UnavailableSource(AtomicI64);
+impl EventSource for UnavailableSource {
+    async fn read(
+        &self,
+        _key: &PartitionKey,
+        _after: Sequence,
+        _max_events: usize,
+    ) -> Result<Vec<Event>, SourceError> {
+        self.0.fetch_add(1, Ordering::Relaxed);
+        Err(SourceError::Unavailable)
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn backend_failures_wait_for_the_tick_instead_of_spinning() {
+    let topics = Arc::new(TopicManager::new(TopicPolicy::default()));
+    let partition = topics.attach(&PartitionKey::new(gts(TOPIC), 0));
+    let _reader = partition.cache().track_reader(Sequence::assigned(0));
+    let source = Arc::new(UnavailableSource(AtomicI64::new(0)));
+    let scheduler = Arc::new(DemandScheduler::new(
+        Arc::clone(&source),
+        Arc::clone(&topics),
+        SchedulerPolicy::with_pool(1).build(),
+    ));
+    let stop = CancellationToken::new();
+    let task = ShardLoader::new(scheduler, topics, Duration::from_millis(50)).spawn(stop.clone());
+    for _ in 0..30 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        source.0.load(Ordering::Relaxed),
+        1,
+        "no retries while paused before the tick"
+    );
+    tokio::time::advance(Duration::from_millis(50)).await;
+    for _ in 0..30 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        source.0.load(Ordering::Relaxed),
+        2,
+        "one retry after the tick"
+    );
+    stop.cancel();
+    task.await.expect("loader cancels while waiting");
+}
+
+#[test]
+fn one_failing_partition_does_not_throttle_the_healthy_ones() {
+    // fetches issued, events fetched, failures
+    assert!(pays_tick(0, 0, 0), "an idle round waits");
+    assert!(pays_tick(1, 0, 1), "a round that only failed waits");
+    assert!(
+        !pays_tick(3, 40, 1),
+        "a round that delivered does not wait for its failing partition"
+    );
+    assert!(
+        !pays_tick(2, 0, 0),
+        "empty fetches rely on the empty-tail backoff"
+    );
+    assert!(
+        !pays_tick(2, 10, 0),
+        "a productive round goes again at once"
+    );
 }

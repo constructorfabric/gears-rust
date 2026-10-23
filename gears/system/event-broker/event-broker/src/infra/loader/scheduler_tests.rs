@@ -347,3 +347,32 @@ async fn an_empty_tail_backs_off_instead_of_asking_every_round() {
         source.reads()
     );
 }
+
+#[tokio::test(start_paused = true)]
+async fn empty_popular_tail_does_not_starve_a_late_replay_reader() {
+    let source = Arc::new(Synthetic::new(Duration::ZERO));
+    let loader = scheduler(Arc::clone(&source), 16);
+    let partition = loader.topics().attach(&key(0));
+    source.append(&key(0), 1, 40);
+    let _tail_readers: Vec<_> = (0..3)
+        .map(|_| partition.cache().track_reader(Sequence::assigned(40)))
+        .collect();
+    // Reconnected live tabs are older and more numerous than the replay reader.
+    // Their empty fetches must count as attempts, not accumulate unbounded credit.
+    for _ in 0..8 {
+        assert_eq!(loader.run_round().await.events_fetched(), 0);
+        tokio::time::advance(Duration::from_millis(50)).await;
+    }
+    let replay = partition.cache().track_reader(Sequence::NONE);
+    loader.run_round().await;
+    tokio::time::advance(Duration::from_millis(50)).await;
+    loader.run_round().await;
+    let PartitionRead::Hit { events, .. } = replay.read(read_limit()) else {
+        panic!("an empty popular tail starved the replay reader");
+    };
+    assert_eq!(events.len(), 40);
+    assert_eq!(
+        events.iter().next().and_then(|event| event.sequence),
+        Some(Sequence::assigned(1))
+    );
+}

@@ -1,5 +1,5 @@
 //! Per-`(topic, partition)` bookkeeping: the next broker-logical sequence to
-//! assign, the outbox-retry dedup's `last_chain_sequence`, and the partition's
+//! assign, the last producer chain sequence stored, and the partition's
 //! event count and stored byte total.
 //!
 //! Backend-internal state, not tenant-scoped data - a topic can carry events
@@ -17,9 +17,10 @@ pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
     pub partition: i32,
     pub next_sequence: i64,
-    /// `NULL` until the first chained/monotonic-mode event lands in this
-    /// `(topic, partition)` - stateless-mode events never update this,
-    /// matching stateless mode's documented "no broker-side dedup".
+    /// The chain sequence of the last chained/monotonic-mode event stored in
+    /// this `(topic, partition)`; `NULL` until one lands. A record only: a
+    /// partition carries several producers' chains, so retries are
+    /// recognised by event id instead.
     pub last_chain_sequence: Option<i64>,
     /// Events currently stored in this partition, maintained by counting rows
     /// as they land and as they are removed - never derived by subtracting one

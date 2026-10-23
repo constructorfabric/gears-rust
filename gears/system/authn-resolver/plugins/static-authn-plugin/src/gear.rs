@@ -42,7 +42,7 @@ impl Default for StaticAuthNPlugin {
 impl Gear for StaticAuthNPlugin {
     async fn init(&self, ctx: &GearCtx) -> anyhow::Result<()> {
         // Load configuration
-        let cfg: StaticAuthNPluginConfig = ctx.config_or_default()?;
+        let cfg: StaticAuthNPluginConfig = ctx.config_expanded_or_default()?;
         if matches!(cfg.mode, crate::config::AuthNMode::AcceptAll) {
             tracing::warn!(
                 "Static AuthN plugin is running in `accept_all` mode - \

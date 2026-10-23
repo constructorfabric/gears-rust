@@ -10,13 +10,10 @@
 //! doesn't exist yet and are deferred to a follow-up `OpenSpec` change (see
 //! `eb-rest-handlers`'s design.md "Streaming/rebalance scope").
 //!
-//! The event-delivery loop wakes on `domain::notify::DeliveryNotifier`
-//! (design.md D6: a `ClusterCacheV1`-backed, payload-free notification the
-//! ingest outbox publishes after a successful persist - see that module's
-//! own doc comment for the exact mechanism and a correction against D6's
-//! literal per-`(topic, partition)`-key wording) rather than a busy-poll.
-//! Still bounded by `heartbeat_interval` each iteration, so idle-heartbeat
-//! cadence is unaffected by whether a notification ever arrives.
+//! Current streams attach partition-cache readers through the loader. Its bounded
+//! tail polling fills spans and wakes the session's local readiness notification.
+//! The retained `DeliveryNotifier` port is not called by this stream implementation;
+//! do not infer native Cluster prefix-watch delivery from that trait bound.
 
 use std::sync::Arc;
 use std::time::Duration;

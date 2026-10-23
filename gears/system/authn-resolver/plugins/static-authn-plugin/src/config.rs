@@ -7,7 +7,7 @@ use uuid::Uuid;
 use toolkit_security::constants::{DEFAULT_SUBJECT_ID, DEFAULT_TENANT_ID};
 
 /// Plugin configuration.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, toolkit_macros::ExpandVars)]
 #[serde(default, deny_unknown_fields)]
 pub struct StaticAuthNPluginConfig {
     /// Vendor name for GTS instance registration.
@@ -23,9 +23,14 @@ pub struct StaticAuthNPluginConfig {
     pub default_identity: IdentityConfig,
 
     /// Static token-to-identity mappings for `static_tokens` mode.
+    ///
+    /// Secret fields expand `${NAME}` / `${NAME:-default}` from the environment
+    /// at init (see the README); a literal `${NAME}` must come from a variable.
+    #[expand_vars]
     pub tokens: Vec<TokenMapping>,
 
     /// S2S credential-to-identity mappings for `exchange_client_credentials`.
+    #[expand_vars]
     pub s2s_credentials: Vec<S2sCredentialMapping>,
 }
 
@@ -84,22 +89,24 @@ impl Default for IdentityConfig {
 }
 
 /// Maps a static token to a specific identity.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, toolkit_macros::ExpandVars)]
 #[serde(deny_unknown_fields)]
 pub struct TokenMapping {
     /// The bearer token value to match.
+    #[expand_vars]
     pub token: SecretString,
     /// The identity to return when this token is presented.
     pub identity: IdentityConfig,
 }
 
 /// Maps S2S client credentials to a specific identity.
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Deserialize, toolkit_macros::ExpandVars)]
 #[serde(deny_unknown_fields)]
 pub struct S2sCredentialMapping {
     /// `OAuth2` client identifier.
     pub client_id: String,
     /// Client secret (redacted in `Debug` output).
+    #[expand_vars]
     pub client_secret: SecretString,
     /// The identity to return when these credentials are presented.
     /// When omitted, uses the default identity (`DEFAULT_SUBJECT_ID` / `DEFAULT_TENANT_ID`).
@@ -108,6 +115,7 @@ pub struct S2sCredentialMapping {
     /// Bearer token to attach to the `SecurityContext` after a successful S2S exchange.
     /// When `None`, no token is set on the resulting context (redacted in `Debug` output).
     #[serde(default)]
+    #[expand_vars]
     pub bearer_token: Option<SecretString>,
 }
 
@@ -124,3 +132,7 @@ impl std::fmt::Debug for S2sCredentialMapping {
             .finish()
     }
 }
+
+#[cfg(test)]
+#[path = "config_tests.rs"]
+mod tests;

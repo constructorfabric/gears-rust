@@ -295,6 +295,7 @@ impl<S: EventSource + 'static> DemandScheduler<S> {
             report.suppressed_in_flight += 1;
             return None;
         }
+        partition.cache().record_fetch_attempt(chosen.after());
         partition.touch(round);
         Some(chosen)
     }
@@ -320,6 +321,9 @@ impl<S: EventSource + 'static> DemandScheduler<S> {
                 .await
         };
 
+        tracing::trace!(topic = %partition.key().topic, partition = partition.key().partition,
+            after = after.as_i64(), events = outcome.as_ref().map_or(0, Vec::len),
+            "partition backend read completed");
         let result = match outcome {
             Ok(events) if events.is_empty() => {
                 // Not an error, and not proof of anything: the sequence may not
@@ -335,7 +339,11 @@ impl<S: EventSource + 'static> DemandScheduler<S> {
                 partition.poll().found_events(policy.poll());
                 Outcome::Fetched(count)
             }
-            Err(_) => Outcome::Failed,
+            Err(error) => {
+                tracing::debug!(topic = %partition.key().topic, partition = partition.key().partition,
+                    reason = ?error, "partition backend read failed");
+                Outcome::Failed
+            }
         };
 
         partition.release();

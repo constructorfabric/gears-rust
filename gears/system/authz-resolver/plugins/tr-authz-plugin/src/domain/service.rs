@@ -147,6 +147,26 @@ impl Service {
             return Self::deny();
         }
 
+        // A decision-only check (`require_constraints = false`: CREATE, per the
+        // request model) on no particular resource keeps the tenant/hierarchy
+        // decision above but drops the owner predicate the PEP declared it
+        // cannot compile. A single-resource request, and any request naming a
+        // group selector, keeps its constraints and fails closed as before: a
+        // PEP that sends these flags on a GET/UPDATE/DELETE still gets its
+        // row fence.
+        if response.decision
+            && request.resource.id.is_none()
+            && !request.context.require_constraints
+            && request.context.supported_properties.is_empty()
+            && !request.resource.properties.contains_key("group_ids")
+            && !request
+                .resource
+                .properties
+                .contains_key("ancestor_group_ids")
+        {
+            response.context.constraints.clear();
+        }
+
         response
     }
 

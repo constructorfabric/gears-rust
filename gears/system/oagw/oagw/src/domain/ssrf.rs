@@ -223,6 +223,43 @@ impl SsrfGuard {
         self.extra_deny.iter().any(|cidr| cidr.contains(ip))
     }
 
+    /// Check a DNS result for an endpoint. An explicit hostname exemption also
+    /// covers that hostname's private resolved addresses (a cluster service's
+    /// RFC 1918 or ULA address, say), but never a loopback, unspecified,
+    /// link-local, multicast or cloud-metadata one: a rebound or hijacked
+    /// exempted name must not reach the metadata endpoint. Only `allow_cidrs`
+    /// admits those. Ordinary hostnames undergo the full IP check on every
+    /// resolution to prevent DNS rebinding.
+    #[must_use]
+    pub fn is_resolved_ip_blocked(&self, host: &str, ip: IpAddr) -> bool {
+        if !self.enabled {
+            return false;
+        }
+        if self.is_exempt_hostname(host) {
+            return !self.allow.iter().any(|cidr| cidr.contains(ip)) && is_never_exempt_ip(ip);
+        }
+        self.is_hostname_blocked(host).is_some() || self.is_ip_blocked(ip)
+    }
+
+    /// Why [`Self::is_resolved_ip_blocked`] refused `ip` for `host`: the
+    /// hostname's deny pattern when the name itself is denied, otherwise the
+    /// address's reason.
+    #[must_use]
+    pub fn resolved_block_reason<'a>(&'a self, host: &str, ip: IpAddr) -> &'a str {
+        if self.is_exempt_hostname(host) {
+            return "loopback, link-local or metadata address: allow_hostnames does not exempt it";
+        }
+        self.is_hostname_blocked(host)
+            .unwrap_or_else(|| self.ip_block_reason(ip))
+    }
+
+    fn is_exempt_hostname(&self, host: &str) -> bool {
+        let normalized = host.strip_suffix('.').unwrap_or(host).to_ascii_lowercase();
+        self.allow_hostnames
+            .iter()
+            .any(|pattern| hostname_matches(&normalized, pattern))
+    }
+
     /// Human-readable block reason, or `"allowed"`.
     #[must_use]
     pub fn ip_block_reason(&self, ip: IpAddr) -> &str {
@@ -322,6 +359,69 @@ pub fn is_ssrf_blocked_ip(ip: IpAddr) -> bool {
         IpAddr::V4(v4) => is_ssrf_blocked_ipv4(v4),
         IpAddr::V6(v6) => is_ssrf_blocked_ipv6(v6),
     }
+}
+
+/// Addresses an `allow_hostnames` exemption never lifts: loopback,
+/// unspecified / "this network", link-local (where most cloud metadata
+/// endpoints live), multicast and broadcast, and the metadata endpoints outside
+/// link-local. IPv6 forms that embed an IPv4 address are judged by it.
+fn is_never_exempt_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => is_never_exempt_ipv4(v4),
+        IpAddr::V6(v6) => {
+            if let Some(v4) = embedded_ipv4(v6) {
+                return is_never_exempt_ipv4(v4);
+            }
+            let s = v6.segments();
+            v6 == Ipv6Addr::LOCALHOST
+                || v6 == Ipv6Addr::UNSPECIFIED
+                || (s[0] & 0xFFC0) == 0xFE80
+                || (s[0] & 0xFF00) == 0xFF00
+                // AWS IMDS over IPv6.
+                || v6 == Ipv6Addr::new(0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x0254)
+        }
+    }
+}
+
+fn is_never_exempt_ipv4(ip: Ipv4Addr) -> bool {
+    let o = ip.octets();
+    o[0] == 127
+        || o[0] == 0
+        || (o[0] == 169 && o[1] == 254)
+        || (o[0] & 0xF0) == 0xE0
+        || ip == Ipv4Addr::BROADCAST
+        // Alibaba Cloud metadata, inside the shared 100.64.0.0/10 space.
+        || ip == Ipv4Addr::new(100, 100, 100, 200)
+}
+
+/// The IPv4 address an IPv6 address carries: mapped, compatible, translated,
+/// NAT64 or 6to4.
+fn embedded_ipv4(ip: Ipv6Addr) -> Option<Ipv4Addr> {
+    if let Some(v4) = ip.to_ipv4() {
+        // Mapped (`::ffff:a.b.c.d`) and compatible (`::a.b.c.d`); `::1` and `::`
+        // are judged as IPv6 instead.
+        if ip != Ipv6Addr::LOCALHOST && ip != Ipv6Addr::UNSPECIFIED {
+            return Some(v4);
+        }
+        return None;
+    }
+    let s = ip.segments();
+    let tail = || Ipv4Addr::new((s[6] >> 8) as u8, s[6] as u8, (s[7] >> 8) as u8, s[7] as u8);
+    if s[..4] == [0, 0, 0, 0] && s[4] == 0xFFFF && s[5] == 0 {
+        return Some(tail());
+    }
+    if s[0] == 0x0064 && s[1] == 0xFF9B && s[2..6] == [0, 0, 0, 0] {
+        return Some(tail());
+    }
+    if s[0] == 0x2002 {
+        return Some(Ipv4Addr::new(
+            (s[1] >> 8) as u8,
+            s[1] as u8,
+            (s[2] >> 8) as u8,
+            s[2] as u8,
+        ));
+    }
+    None
 }
 
 /// Hostnames blocked at config time. Cloud metadata IPs (169.254.169.254)
@@ -1295,6 +1395,92 @@ mod tests {
     }
 
     #[test]
+    fn resolved_ip_exemption_is_scoped_to_configured_hostname() {
+        let e = guard(SsrfPolicy {
+            allow_hostnames: vec!["demo-echo.demo.svc.cluster.local".into()],
+            ..Default::default()
+        });
+        let private = "10.111.56.200".parse().unwrap();
+        assert!(!e.is_resolved_ip_blocked("DEMO-ECHO.demo.svc.cluster.local.", private));
+        assert!(e.is_resolved_ip_blocked("other.demo.svc.cluster.local", private));
+        assert!(e.is_resolved_ip_blocked("demo-echo.demo.svc.cluster.local.attacker.org", private));
+        assert!(e.is_resolved_ip_blocked("public.example", "169.254.169.254".parse().unwrap()));
+        assert!(e.is_ip_blocked(private));
+    }
+
+    #[test]
+    fn an_exempted_hostname_never_reaches_loopback_link_local_or_metadata() {
+        let e = guard(SsrfPolicy {
+            allow_hostnames: vec!["svc.cluster.local".into()],
+            ..Default::default()
+        });
+        let host = "svc.cluster.local";
+        for private in [
+            "10.1.2.3",
+            "172.16.0.9",
+            "192.168.4.4",
+            "100.64.0.1",
+            "fd12::1",
+        ] {
+            assert!(
+                !e.is_resolved_ip_blocked(host, private.parse().unwrap()),
+                "{private}: the exemption lifts the private-range deny"
+            );
+        }
+        for never in [
+            "169.254.169.254",
+            "169.254.1.1",
+            "127.0.0.1",
+            "0.0.0.0",
+            "224.0.0.1",
+            "255.255.255.255",
+            "100.100.100.200",
+            "::1",
+            "::",
+            "fe80::1",
+            "ff02::1",
+            "fd00:ec2::254",
+            "::ffff:169.254.169.254",
+            "64:ff9b::a9fe:a9fe",
+            "2002:a9fe:a9fe::",
+        ] {
+            assert!(
+                e.is_resolved_ip_blocked(host, never.parse().unwrap()),
+                "{never}: an exempted name must not reach it"
+            );
+        }
+        assert!(
+            e.resolved_block_reason(host, "169.254.169.254".parse().unwrap())
+                .contains("allow_hostnames"),
+            "the reason names the exemption it did not honour"
+        );
+    }
+
+    #[test]
+    fn allow_cidrs_still_admit_a_never_exempt_address_for_an_exempted_name() {
+        let e = guard(SsrfPolicy {
+            allow_hostnames: vec!["localhost".into()],
+            allow_cidrs: vec!["127.0.0.0/8".into()],
+            ..Default::default()
+        });
+        assert!(!e.is_resolved_ip_blocked("localhost", "127.0.0.1".parse().unwrap()));
+        assert!(e.is_resolved_ip_blocked("localhost", "169.254.169.254".parse().unwrap()));
+    }
+
+    #[test]
+    fn resolved_ip_applies_suffix_exemptions_and_hostname_denials() {
+        let e = guard(SsrfPolicy {
+            allow_hostnames: vec![".safe.internal".into()],
+            extra_deny_hostnames: vec!["blocked.example".into()],
+            ..Default::default()
+        });
+        assert!(!e.is_resolved_ip_blocked("svc.safe.internal", "10.0.0.1".parse().unwrap()));
+        assert!(e.is_resolved_ip_blocked("svc.unsafe.internal", "10.0.0.1".parse().unwrap()));
+        assert!(e.is_resolved_ip_blocked("blocked.example", "8.8.8.8".parse().unwrap()));
+        assert!(!e.is_resolved_ip_blocked("public.example", "8.8.8.8".parse().unwrap()));
+    }
+
+    #[test]
     fn guard_ip_block_reason_extra_deny() {
         let e = guard(SsrfPolicy {
             enabled: true,
@@ -1321,6 +1507,25 @@ mod tests {
     // ===================================================================
     // hostname_matches tests
     // ===================================================================
+
+    #[test]
+    fn a_denied_hostname_is_the_reason_its_public_address_is_refused() {
+        let guard = SsrfGuard::from_config(&SsrfPolicy {
+            extra_deny_hostnames: vec![".blocked.example".into()],
+            ..Default::default()
+        })
+        .unwrap();
+        let public: IpAddr = "93.184.216.34".parse().unwrap();
+        assert!(guard.is_resolved_ip_blocked("api.blocked.example", public));
+        assert_eq!(
+            guard.resolved_block_reason("api.blocked.example", public),
+            ".blocked.example"
+        );
+        assert_eq!(
+            guard.resolved_block_reason("api.example", public),
+            "allowed"
+        );
+    }
 
     #[test]
     fn hostname_matches_exact() {

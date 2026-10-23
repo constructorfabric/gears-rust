@@ -10,7 +10,10 @@ gdl_version = "1.0"
 #
 #   id             <- name = "event-broker"
 #   runtime_caps   <- capabilities = [rest, stateful]
-#   colocated_deps <- deps = [cluster, types_registry]   (link-time; uncuttable)
+#   colocated_deps <- deps = [types_registry]   (link-time; uncuttable)
+#
+# Not `cluster`: EB reaches it through the cluster SDK, linked or over gRPC, so
+# the product places it (cluster DESIGN.md section 3.17.7).
 #   lifecycle      <- lifecycle(entry = "serve", stop_timeout = "30s")
 #
 # Other projected fields are refused by GBX0210; deps drift is GBX0214.
@@ -19,7 +22,7 @@ gdl_version = "1.0"
 AUTHZ_SDK = cargo(crate_name = "cf-gears-authz-resolver-sdk", lib = "authz_resolver_sdk", path = "../authz-resolver/authz-resolver-sdk", features = ["rest-client"])
 
 gear(
-    deps = ["cluster", "types-registry"],
+    deps = ["types-registry"],
     # The authorization resolver is consumed, not linked: local when co-located,
     # REST with the platform token otherwise.
     consumes = [consume(contract = "AuthZResolverApi", rust = "authz_resolver_sdk::AuthZResolverApi", sdk = AUTHZ_SDK)],

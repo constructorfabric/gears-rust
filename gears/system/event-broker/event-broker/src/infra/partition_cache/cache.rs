@@ -957,6 +957,18 @@ impl PartitionCache {
         derive(&summaries, &wants, frontier)
     }
 
+    /// Selection, including an empty speculative tail fetch, serves a demand's
+    /// turn. Only readers that were not selected should keep gaining priority.
+    /// Otherwise an older popular empty tail and a new backfill accrue credit
+    /// at the same rate, so the backfill can never overtake the tail.
+    pub(crate) fn record_fetch_attempt(&self, after: Sequence) {
+        for state in self.readers.snapshot() {
+            if state.offset.load(Ordering::Relaxed) == after.as_i64() {
+                state.starved_rounds.store(0, Ordering::Relaxed);
+            }
+        }
+    }
+
     /// Events resident ahead of `offset`.
     ///
     /// Counted across every segment that reaches past it, never derived from the

@@ -21,7 +21,7 @@ use std::sync::{Arc, OnceLock};
 use async_trait::async_trait;
 use chrono::Utc;
 use cluster_sdk::ClusterCacheV1;
-use cluster_sdk::cache::{PutRequest, Ttl};
+use cluster_sdk::cache::{CacheWatch, CacheWatchEvent, PutRequest, Ttl};
 use sea_orm::sea_query::Expr;
 use sea_orm::{ColumnTrait, Condition, EntityTrait, QueryFilter, Set};
 use toolkit_db::DBProvider;
@@ -145,6 +145,7 @@ pub struct Storage {
     /// This process's instance id - what a group marker names as the group's
     /// owner.
     instance_id: Uuid,
+    notification_warning: toolkit::telemetry::ThrottledLog,
 }
 
 impl Storage {
@@ -160,6 +161,9 @@ impl Storage {
             cache: OnceLock::new(),
             outbox: OnceLock::new(),
             instance_id,
+            notification_warning: toolkit::telemetry::ThrottledLog::new(
+                std::time::Duration::from_secs(60),
+            ),
         }
     }
 
@@ -544,6 +548,32 @@ impl IdempotencyGuard for Storage {
     }
 }
 
+/// A failed or closed watch consumes the remaining polling interval. Returning
+/// immediately would turn unsupported prefix watches into a busy delivery loop.
+async fn wait_for_watch<E: std::fmt::Debug>(
+    deadline: tokio::time::Instant,
+    subscribe: impl std::future::Future<Output = Result<CacheWatch, E>>,
+    warning: &toolkit::telemetry::ThrottledLog,
+) {
+    let mut watch = match tokio::time::timeout_at(deadline, subscribe).await {
+        Ok(Ok(watch)) => watch,
+        Ok(Err(err)) => {
+            if warning.should_log() {
+                tracing::warn!(?err, "notification watch unavailable; using timed polling");
+            }
+            tokio::time::sleep_until(deadline).await;
+            return;
+        }
+        Err(_) => return,
+    };
+    if matches!(
+        tokio::time::timeout_at(deadline, watch.recv()).await,
+        Ok(None | Some(CacheWatchEvent::Closed(_)))
+    ) {
+        tokio::time::sleep_until(deadline).await;
+    }
+}
+
 #[async_trait]
 impl DeliveryNotifier for Storage {
     async fn wait_for_notification(&self, timeout: std::time::Duration) {
@@ -558,29 +588,12 @@ impl DeliveryNotifier for Storage {
             tokio::time::sleep_until(deadline).await;
             return;
         };
-        let mut watch = match tokio::time::timeout_at(
+        wait_for_watch(
             deadline,
             cache.watch_prefix(NOTIFICATION_PREFIX),
+            &self.notification_warning,
         )
-        .await
-        {
-            Ok(Ok(watch)) => watch,
-            Ok(Err(err)) => {
-                tracing::warn!(
-                    ?err,
-                    "notification watch_prefix failed; falling back to timeout"
-                );
-                return;
-            }
-            Err(_elapsed) => return,
-        };
-        // A `Lagged`/`Reset` event still just means "something changed, go
-        // re-check", same as a real `Event`, and an elapsed deadline just
-        // means "nothing changed in time" - either way there's nothing
-        // further to do with the result.
-        match tokio::time::timeout_at(deadline, watch.recv()).await {
-            Ok(_) | Err(_) => {}
-        }
+        .await;
     }
 }
 
@@ -768,6 +781,87 @@ mod tests {
     use types_registry_sdk::testing::{MockTypesRegistryClient, make_test_instance};
 
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn unavailable_watch_waits_for_the_poll_deadline() {
+        let started = tokio::time::Instant::now();
+        let deadline = started + std::time::Duration::from_secs(2);
+        let warning = toolkit::telemetry::ThrottledLog::new(std::time::Duration::from_secs(60));
+        wait_for_watch(
+            deadline,
+            async { Err::<CacheWatch, _>("unsupported") },
+            &warning,
+        )
+        .await;
+        assert_eq!(tokio::time::Instant::now(), deadline);
+        assert!(
+            !warning.should_log(),
+            "repeated failures must not flood logs"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn closed_watch_waits_for_the_remaining_shared_deadline() {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        let warning = toolkit::telemetry::ThrottledLog::new(std::time::Duration::from_secs(60));
+        wait_for_watch(
+            deadline,
+            async {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                let (sender, watch) = CacheWatch::channel(1);
+                drop(sender);
+                Ok::<_, &str>(watch)
+            },
+            &warning,
+        )
+        .await;
+        assert_eq!(tokio::time::Instant::now(), deadline);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_subscribe_outliving_the_deadline_returns_at_the_deadline() {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        let warning = toolkit::telemetry::ThrottledLog::new(std::time::Duration::from_secs(60));
+        wait_for_watch(
+            deadline,
+            async {
+                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                let (_sender, watch) = CacheWatch::channel(1);
+                Ok::<_, &str>(watch)
+            },
+            &warning,
+        )
+        .await;
+        assert_eq!(
+            tokio::time::Instant::now(),
+            deadline,
+            "the subscribe is abandoned at the deadline, not awaited"
+        );
+        assert!(
+            warning.should_log(),
+            "a slow subscribe is not a failure to warn about"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn watch_change_wakes_before_the_poll_deadline() {
+        let started = tokio::time::Instant::now();
+        let deadline = started + std::time::Duration::from_secs(2);
+        let warning = toolkit::telemetry::ThrottledLog::new(std::time::Duration::from_secs(60));
+        let (sender, watch) = CacheWatch::channel(1);
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            sender
+                .send(CacheWatchEvent::Reset)
+                .await
+                .expect("receiver alive");
+        });
+        wait_for_watch(deadline, async { Ok::<_, &str>(watch) }, &warning).await;
+        assert_eq!(
+            tokio::time::Instant::now() - started,
+            std::time::Duration::from_millis(20)
+        );
+    }
 
     const TEST_INSTANCE_ID: Uuid = Uuid::from_u128(0x5eed);
     use crate::domain::idempotency::ProducerChainCheck;
