@@ -1,4 +1,3 @@
-// Created: 2026-10-15 by Virtuozzo International GmbH
 //! The revival report: what a revive of a retired declaration would do to the
 //! values it retained, answered without doing it.
 //!

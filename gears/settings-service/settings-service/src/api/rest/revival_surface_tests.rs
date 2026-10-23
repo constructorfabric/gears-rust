@@ -1,4 +1,3 @@
-// Created: 2026-10-15 by Virtuozzo International GmbH
 //! The revival report driven as a client drives it.
 //!
 //! Before an administrator re-declares a retired setting, the report says which

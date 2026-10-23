@@ -1,4 +1,3 @@
-// Created: 2026-09-17 by Virtuozzo International GmbH
 //! The search queries, in the dialect of the database in use.
 //!
 //! Two dialects, one shape. On `PostgreSQL` every predicate is `ILIKE` over

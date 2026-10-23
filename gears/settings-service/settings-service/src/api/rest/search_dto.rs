@@ -1,4 +1,3 @@
-// Created: 2026-09-17 by Virtuozzo International GmbH
 //! Wire shape of the search surface.
 
 use serde_json::Value;

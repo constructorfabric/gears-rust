@@ -1,4 +1,3 @@
-// Created: 2026-08-26 by Virtuozzo International GmbH
 //! Declaration route registration.
 //!
 //! Every route is built through `OperationBuilder` rather than mounted on the

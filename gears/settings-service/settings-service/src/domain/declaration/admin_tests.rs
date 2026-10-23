@@ -1,4 +1,3 @@
-// Created: 2026-09-08 by Virtuozzo International GmbH
 //! Administrative authoring over the resolution harness: what is composed,
 //! what is derived, what is refused, and what needs a fresh authentication.
 

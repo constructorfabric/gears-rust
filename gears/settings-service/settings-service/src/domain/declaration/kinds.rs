@@ -1,4 +1,3 @@
-// Created: 2026-10-21 by Virtuozzo International GmbH
 //! The closed vocabularies a declaration carries as strings in storage and on
 //! the wire: its data classification and its lifecycle status.
 //!

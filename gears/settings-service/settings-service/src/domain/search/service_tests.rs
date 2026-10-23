@@ -1,4 +1,3 @@
-// Created: 2026-09-17 by Virtuozzo International GmbH
 //! Attribution: which field a hit is told about, and that a row the database
 //! returned is never dropped on the way to the client.
 

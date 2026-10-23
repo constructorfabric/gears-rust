@@ -1,4 +1,3 @@
-// Created: 2026-10-21 by Virtuozzo International GmbH
 use super::*;
 
 #[test]

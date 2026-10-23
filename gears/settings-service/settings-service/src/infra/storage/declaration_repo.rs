@@ -1,4 +1,3 @@
-// Created: 2026-08-26 by Virtuozzo International GmbH
 //! Persistence for declarations.
 
 use std::collections::HashMap;

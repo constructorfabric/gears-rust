@@ -1,4 +1,3 @@
-// Created: 2026-09-06 by Virtuozzo International GmbH
 //! Stored setting values: the rows the resolver walks and the write path fills.
 
 pub mod repo;

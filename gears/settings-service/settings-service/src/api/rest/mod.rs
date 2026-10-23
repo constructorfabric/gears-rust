@@ -1,4 +1,3 @@
-// Created: 2026-08-13 by Virtuozzo International GmbH
 //! REST surface.
 
 /// The `If-Match` tag a mutation presents, read the same way on every

@@ -1,4 +1,3 @@
-// Created: 2026-08-12 by Virtuozzo International GmbH
 //! The gear scaffold and its initialization.
 //!
 //! `init` validates the deployment configuration fail-closed, acquires the

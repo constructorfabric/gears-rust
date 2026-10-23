@@ -1,4 +1,3 @@
-// Created: 2026-08-12 by Virtuozzo International GmbH
 // @cpt-dod:cpt-cf-settings-service-dod-gear-foundation-problem-mapping:p1
 //! The single conversion from [`DomainError`] to the platform error type.
 //!

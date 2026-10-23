@@ -1,4 +1,3 @@
-// Created: 2026-09-06 by Virtuozzo International GmbH
 //! The Value Resolver: cache-first, then a dispatch on scope class.
 
 use std::collections::HashMap;

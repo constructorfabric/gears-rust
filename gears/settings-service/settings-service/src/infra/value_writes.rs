@@ -1,4 +1,3 @@
-// Created: 2026-09-07 by Virtuozzo International GmbH
 // @cpt-dod:cpt-cf-settings-service-dod-value-writes-batch:p1
 //! The write coordinator: one transaction per change, commit, evict, publish.
 //!

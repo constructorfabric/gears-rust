@@ -1,4 +1,3 @@
-// Created: 2026-09-24 by Virtuozzo International GmbH
 //! The value repository over an in-memory database: what a row-level
 //! operation answers when the row it names is not there.
 

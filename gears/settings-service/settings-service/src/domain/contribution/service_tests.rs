@@ -1,4 +1,3 @@
-// Created: 2026-09-06 by Virtuozzo International GmbH
 //! The reconciler, run through the SDK contract over an in-memory database.
 //!
 //! Every test goes through `SettingsContributionClient` — the door a gear uses

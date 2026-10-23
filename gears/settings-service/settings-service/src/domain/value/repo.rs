@@ -1,4 +1,3 @@
-// Created: 2026-09-06 by Virtuozzo International GmbH
 //! Persistence port over `setting_values`.
 
 use async_trait::async_trait;
