@@ -1,0 +1,6 @@
+{
+  "error": {
+    "reason_code": "fx_not_supported",
+    "detail": "billing currency USD differs from the price currency EUR; nothing is converted"
+  }
+}

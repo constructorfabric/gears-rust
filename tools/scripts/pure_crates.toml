@@ -1,0 +1,79 @@
+# Crates that must stay free of I/O: no async runtime, database, HTTP stack or ClientHub anywhere in
+# their normal dependency tree. `make check-pure-crates` (tools/scripts/check_pure_crates.py) runs
+# `cargo tree` for each package and fails when a denied crate appears, or, for an entry with an
+# `allow` list, when any crate outside that list appears.
+
+[[crate]]
+package = "cf-gears-bss-rating-core"
+# gears/bss/rating/docs/DESIGN.md §1.3: an evaluation replays byte-identically years later, so
+# nothing that reads a clock, a database or the network may take part in it.
+reason = "BSS Rating evaluation core is pure (rating DESIGN §1.3)"
+deny = [
+  "tokio",
+  "tokio-util",
+  "sea-orm",
+  "sea-orm-migration",
+  "sqlx",
+  "http",
+  "axum",
+  "hyper",
+  "reqwest",
+  "tonic",
+  # ClientHub and the gear runtime.
+  "cf-gears-toolkit",
+  "cf-gears-toolkit-db",
+  "cf-gears-toolkit-contract",
+]
+
+[[crate]]
+package = "cf-gears-bss-rating-engine-gen-1"
+# gears/bss/rating/docs/ADR/0006: a generation depends only on its vendored copies, the registry
+# crates of its numeric closure (pinned in vendor/LOCK.toml until the freeze vendors them) and the
+# non-numeric allowlist, so that a workspace upgrade cannot change a released generation.
+reason = "BSS Rating engine generation 1 is frozen evaluation code (rating ADR-0006)"
+deny = [
+  "tokio",
+  "tokio-util",
+  "sea-orm",
+  "sea-orm-migration",
+  "sqlx",
+  "http",
+  "axum",
+  "hyper",
+  "reqwest",
+  "tonic",
+  "cf-gears-toolkit",
+  "cf-gears-toolkit-db",
+  "cf-gears-toolkit-contract",
+]
+allow = [
+  # The vendored copies.
+  "cf-gears-bss-rating-gen1-money",
+  "cf-gears-bss-rating-gen1-derived",
+  # The numeric closure, pinned by vendor/LOCK.toml.
+  "rust_decimal",
+  "bigdecimal",
+  "num-bigint",
+  "num-integer",
+  "num-traits",
+  "arrayvec",
+  "libm",
+  # The non-numeric allowlist and what it pulls in.
+  "serde",
+  "serde_core",
+  "serde_derive",
+  "thiserror",
+  "thiserror-impl",
+  "time",
+  "time-core",
+  "time-macros",
+  "deranged",
+  "num-conv",
+  "powerfmt",
+  "uuid",
+  # Compile-time only: the derive macros' parser.
+  "proc-macro2",
+  "quote",
+  "syn",
+  "unicode-ident",
+]

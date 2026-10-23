@@ -1,0 +1,19 @@
+# Engine generation 1's copy of `bss_products_sdk::derived` (gears/bss/products/products-sdk),
+# written by hand beside the sources `tools/scripts/vendor_engine_generation.py` copies verbatim into
+# `src/` (rating ADR-0006). The module is a crate of its own here: the rest of products-sdk does not
+# run inside evaluation, and the renamed crate links beside the workspace's own products-sdk.
+[package]
+name = "cf-gears-bss-rating-gen1-derived"
+edition = "2024"
+license = "Apache-2.0"
+description = "BSS Rating engine generation 1: frozen copy of the Products derived-usage evaluator"
+publish = false
+
+[lib]
+name = "rating_gen1_derived"
+
+[dependencies]
+rust_decimal = { version = "=1.41.0", features = ["serde"] }
+
+[dev-dependencies]
+proptest = "1"
