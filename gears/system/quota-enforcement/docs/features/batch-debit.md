@@ -95,7 +95,7 @@ DECOMPOSITION §2.7).
 
 ### Batch Debit
 
-- [ ] `p1` - **ID**: `cpt-cf-quota-enforcement-flow-batch-debit`
+- [x] `p1` - **ID**: `cpt-cf-quota-enforcement-flow-batch-debit`
 
 Realises `cpt-cf-quota-enforcement-seq-batch-debit`.
 
@@ -123,50 +123,25 @@ Realises `cpt-cf-quota-enforcement-seq-batch-debit`.
   error, fail-closed, no counter mutation
 
 **Steps**:
-1. [ ] - `p1` - Caller sends `POST /v1/quota-enforcement/operations/batch-debit` with a `BatchDebitRequest` carrying
-   the envelope idempotency key, the required `mode` field, and the items; each item carries caller-supplied
-   attribution, one operation-level metadata object, an optional resource, a positive integer `amount`, and its own idempotency key for individual identification
-   (`cpt-cf-quota-enforcement-fr-batch-debit`); foundation admission
-   (`cpt-cf-quota-enforcement-flow-authorized-admission`) and per-item ingress validation
-   (`cpt-cf-quota-enforcement-flow-ingress-validation`, which covers each batch item) have already run - `inst-bde-request`
-2. [ ] - `p1` - **IF** any item carries `amount <= 0` or a blank or duplicated item idempotency key, or the envelope is empty or names more than one tenant - `inst-bde-amount-if`
-   1. [ ] - `p1` - **RETURN** an envelope-level canonical `InvalidArgument` (`INVALID_AMOUNT` or `IDEMPOTENCY_KEY_REQUIRED` naming the offending item index, `BATCH_ITEM_KEY_DUPLICATE`, `BATCH_EMPTY`, or `BATCH_TENANT_MIXED`), regardless of `mode`, before idempotency lookup or any other
-      pipeline step; no envelope or per-item idempotency record is persisted, no operation-log entry is written, no
-      counter is mutated - `inst-bde-amount`
-3. [ ] - `p1` - Consume each item's PDP-authorized, catalogue-mapped subject set via
-   `cpt-cf-quota-enforcement-algo-subject-resolution` (projection-contracts feature; consumed, never re-specified),
-   mirroring the canonical pipeline (`cpt-cf-quota-enforcement-algo-evaluation-pipeline`), which maps subjects
-   before its idempotency lookup; canonicalize the sorted, deduplicated union of all item sets into the envelope's
-   `IdempotencySubjectKey` per `cpt-cf-quota-enforcement-fr-idempotency` - `inst-bde-resolve`
-4. [ ] - `p1` - DB: `lookup_idempotency(scope)` with the envelope's typed `IdempotencyScope`; on an exact replay
-   **RETURN** the stored `BatchDecision` verbatim per
-   `cpt-cf-quota-enforcement-algo-idempotency-replay` (consumption-operations feature), which this feature consumes
-   unchanged for its operation type; this replay short-circuit takes precedence over the `mode` and size checks, so an
-   exact replay returns the stored outcome even after an operator lowers the maximum batch size (PRD §5.7 replay
-   guarantee); a divergent payload returns `IDEMPOTENCY_PAYLOAD_MISMATCH` (409) - `inst-bde-idem`
-5. [ ] - `p1` - **IF** `mode = independent` - `inst-bde-mode-if`
-   1. [ ] - `p1` - **RETURN** `NOT_YET_IMPLEMENTED` (`DomainError::NotYetImplemented`, canonical `Unimplemented`, 501);
-      partial-success bulk semantics are deferred to P2 per PRD §5.7 - `inst-bde-mode`
-6. [ ] - `p1` - **IF** the item count exceeds the operator-configurable maximum batch size (default 100 items per
-   batch) - `inst-bde-size-if`
-   1. [ ] - `p1` - **RETURN** `BULK_TOO_LARGE` (`DomainError::BulkTooLarge`, canonical `InvalidArgument`) before any
-      item is evaluated - `inst-bde-size`
-7. [ ] - `p1` - Run `cpt-cf-quota-enforcement-algo-batch-envelope-evaluation` under the batch-level evaluation
-   timeout - `inst-bde-envelope`
-8. [ ] - `p1` - **IF** the envelope outcome is `Denied` - `inst-bde-denied-if`
-   1. [ ] - `p1` - **RETURN** the batch-level `Denied` verdict as an HTTP 200 `BatchDecision` body with per-item
-      statuses included for diagnostic purposes only and every counter unchanged; `Denied` is a deterministic over-cap
-      signal, so a retry is futile until a credit or period rollover (PRD §5.7) - `inst-bde-denied`
-9. [ ] - `p1` - **RETURN** the batch-level outcome with the per-item array preserving submission order; a
-   `BatchDecision` (HTTP 200) and a `Problem` (canonical error) are mutually exclusive outcomes, and a retry of a
-   canonical error under the same envelope key is replay-safe; the SDK path is
-   `QuotaEnforcementClientV1::batch_debit(req)` returning `BatchDecision` - `inst-bde-return`
+1. [x] - `p1` - Caller sends `POST /v1/quota-enforcement/operations/batch-debit` with a `BatchDebitRequest` carrying the envelope idempotency key, the required `mode` field, and the items; each item carries caller-supplied attribution, one operation-level metadata object, an optional resource, a positive integer `amount`, and its own idempotency key for individual identification (`cpt-cf-quota-enforcement-fr-batch-debit`); foundation admission (`cpt-cf-quota-enforcement-flow-authorized-admission`) and per-item ingress validation (`cpt-cf-quota-enforcement-flow-ingress-validation`, which covers each batch item) have already run - `inst-bde-request`
+2. [x] - `p1` - **IF** any item carries `amount <= 0` or a blank or duplicated item idempotency key, or the envelope is empty or names more than one tenant - `inst-bde-amount-if`
+   1. [x] - `p1` - **RETURN** an envelope-level canonical `InvalidArgument` (`INVALID_AMOUNT` or `IDEMPOTENCY_KEY_REQUIRED` naming the offending item index, `BATCH_ITEM_KEY_DUPLICATE`, `BATCH_EMPTY`, or `BATCH_TENANT_MIXED`), regardless of `mode`, before idempotency lookup or any other pipeline step; no envelope or per-item idempotency record is persisted, no operation-log entry is written, no counter is mutated - `inst-bde-amount`
+3. [x] - `p1` - Consume each item's PDP-authorized, catalogue-mapped subject set via `cpt-cf-quota-enforcement-algo-subject-resolution` (projection-contracts feature; consumed, never re-specified), mirroring the canonical pipeline (`cpt-cf-quota-enforcement-algo-evaluation-pipeline`), which maps subjects before its idempotency lookup; canonicalize the sorted, deduplicated union of all item sets into the envelope's `IdempotencySubjectKey` per `cpt-cf-quota-enforcement-fr-idempotency` - `inst-bde-resolve`
+4. [x] - `p1` - DB: `lookup_idempotency(scope)` with the envelope's typed `IdempotencyScope`; on an exact replay **RETURN** the stored `BatchDecision` verbatim per `cpt-cf-quota-enforcement-algo-idempotency-replay` (consumption-operations feature), which this feature consumes unchanged for its operation type; this replay short-circuit takes precedence over the `mode` and size checks, so an exact replay returns the stored outcome even after an operator lowers the maximum batch size (PRD §5.7 replay guarantee); a divergent payload returns `IDEMPOTENCY_PAYLOAD_MISMATCH` (409) - `inst-bde-idem`
+5. [x] - `p1` - **IF** `mode = independent` - `inst-bde-mode-if`
+   1. [x] - `p1` - **RETURN** `NOT_YET_IMPLEMENTED` (`DomainError::NotYetImplemented`, canonical `Unimplemented`, 501); partial-success bulk semantics are deferred to P2 per PRD §5.7 - `inst-bde-mode`
+6. [x] - `p1` - **IF** the item count exceeds the operator-configurable maximum batch size (default 100 items per batch) - `inst-bde-size-if`
+   1. [x] - `p1` - **RETURN** `BULK_TOO_LARGE` (`DomainError::BulkTooLarge`, canonical `InvalidArgument`) before any item is evaluated - `inst-bde-size`
+7. [x] - `p1` - Run `cpt-cf-quota-enforcement-algo-batch-envelope-evaluation` under the batch-level evaluation timeout - `inst-bde-envelope`
+8. [x] - `p1` - **IF** the envelope outcome is `Denied` - `inst-bde-denied-if`
+   1. [x] - `p1` - **RETURN** the batch-level `Denied` verdict as an HTTP 200 `BatchDecision` body with per-item statuses included for diagnostic purposes only and every counter unchanged; `Denied` is a deterministic over-cap signal, so a retry is futile until a credit or period rollover (PRD §5.7) - `inst-bde-denied`
+9. [x] - `p1` - **RETURN** the batch-level outcome with the per-item array preserving submission order; a `BatchDecision` (HTTP 200) and a `Problem` (canonical error) are mutually exclusive outcomes, and a retry of a canonical error under the same envelope key is replay-safe; the SDK path is `QuotaEnforcementClientV1::batch_debit(req)` returning `BatchDecision` - `inst-bde-return`
 
 ## 3. Processes / Business Logic (CDSL)
 
 ### Batch Envelope Evaluation
 
-- [ ] `p1` - **ID**: `cpt-cf-quota-enforcement-algo-batch-envelope-evaluation`
+- [x] `p1` - **ID**: `cpt-cf-quota-enforcement-algo-batch-envelope-evaluation`
 
 **Input**: a validated `BatchDebitRequest` with `mode = atomic` whose envelope idempotency lookup missed, the per-item
 applicable-subject sets already resolved in the flow (`inst-bde-resolve`), `SecurityContext`, the `AccessScope`
@@ -176,65 +151,29 @@ returned by `PolicyEnforcer`, the published `ProjectionContractCatalog`
 mutation
 
 **Steps**:
-1. [ ] - `p1` - Consume each item's complete applicable-subject set as resolved in the flow before the envelope
-   idempotency lookup (`inst-bde-resolve`, via `cpt-cf-quota-enforcement-algo-subject-resolution`,
-   projection-contracts feature; consumed, never re-specified); no further resolution runs here - `inst-bev-resolve`
-2. [ ] - `p1` - DB: begin the single backend transaction; compute the union of applicable Quotas across all items and
-   run one locked read on that union in lexicographic `quota_id` order
-   (`cpt-cf-quota-enforcement-adr-acquisition-ordering`); this union locked read replaces the single-operation
-   locked-read stage of `cpt-cf-quota-enforcement-algo-evaluation-pipeline`, `EvaluationContext` metadata is captured
-   at this locked-read step (ADR-0003), and lazy period-row materialization runs here when a boundary was crossed - `inst-bev-union`
-3. [ ] - `p1` - Arm the batch-level evaluation timeout: a single operator-configurable flat duration
-   (deployment-default 250 ms) that supersedes per-Policy Engine timeouts for the batch as a whole
-   (`cpt-cf-quota-enforcement-fr-batch-debit`); DESIGN §3.3 models it as the envelope tokio timeout
-   (`DomainError::BatchTimeout`); a tokio timeout is observed only at an await point and the per-item Engine call is
-   synchronous and I/O-free, so the tokio timeout guards the await-bearing stages while the item loop checks the
-   armed deadline cooperatively between items (step 4); the timer arms once the envelope's rows are locked, and the
-   write phase and the commit sit outside it and are never cancelled, so a batch is never reported timed out after
-   its effects committed - `inst-bev-timeout`
-4. [ ] - `p1` - **FOR EACH** item in submission order - `inst-bev-loop`
-   1. [ ] - `p1` - Compare the current instant against the armed deadline; **IF** the deadline is exceeded, stop the
-      loop and take the timeout branch (step 5) with `DomainError::BatchTimeout` - `inst-bev-deadline`
-   2. [ ] - `p1` - Invoke the Engine boundary (`cpt-cf-quota-enforcement-algo-engine-boundary`,
-      resolution-policy-engine feature) unchanged against the item's own applicable-Quotas set, with the item's
-      evaluation observing counter state that reflects the application of every previously-evaluated item in the same
-      batch (PRD §5.7 normative; otherwise the Engine cannot produce a correct Debit Plan) - `inst-bev-evaluate`
-   3. [ ] - `p1` - **IF** the item targets a Quota whose metric is classified `Direct`, the item fails with
-      `METRIC_NOT_QUOTA_GATED` exactly as on the single-item pipeline, and the envelope fails with that canonical
-      error (PRD §3.2) - `inst-bev-gated`
-   4. [ ] - `p1` - Record the item's `Decision` or canonical error at the item's submission index in the per-item
-      array - `inst-bev-record`
-5. [ ] - `p1` - **IF** the armed deadline is exceeded before evaluation completes (the cooperative check trips between
-   items, or the tokio timeout fires at an await-bearing stage) - `inst-bev-fire-if`
-   1. [ ] - `p1` - Roll back the entire transaction and **RETURN** a canonical `DeadlineExceeded` error with
-      `reason = "BATCH_TIMEOUT"` carried in the envelope, with no counter mutations and no idempotency record; the
-      caller retries with the same envelope key (replay-safe) or, if persistent, with a smaller batch under a new
-      envelope key - `inst-bev-fire`
-6. [ ] - `p1` - **IF** every item evaluates to `Allowed` - `inst-bev-apply-if`
-   1. [ ] - `p1` - DB: `apply_batch_debit(envelope_idem_key, items, events)`: apply the union of all per-item
-      `debit_plan`s atomically, persist the envelope idempotency record (the full `BatchDecision` blob; Engine and
-      Policy attribution is recorded per item, because a multi-metric batch can resolve a different Policy per item,
-      and the record-level multi-Policy attribution shape is a tracked upstream DESIGN item, section 7), append the
-      operation-log `batch_debit` entry, and enqueue the outbox events, all inside the same transaction (I11); commit;
-      concurrent multi-Quota mutation follows the ADR-0002 acquisition ordering - `inst-bev-apply`
-7. [ ] - `p1` - **IF** any item evaluated to `Denied` - `inst-bev-denied-if`
-   1. [ ] - `p1` - DB: commit the `Denied` outcome through `apply_batch_debit(envelope_idem_key, items, events)` with
-      an empty union: no counter moves, and the envelope idempotency record (the `Denied` `BatchDecision` with
-      per-item statuses) persists inside the committed transaction, matching the single-debit precedent where a
-      `Denied` Decision persists its idempotency record with an empty plan, so an exact replay returns the original
-      verdict (PRD §5.8; the DESIGN-sequence alignment is a tracked upstream item, section 7) - `inst-bev-denied`
-8. [ ] - `p1` - **IF** any item failed with a canonical error - `inst-bev-error-if`
-   1. [ ] - `p1` - Roll back the entire envelope, persist nothing, and **RETURN** the canonical error (fail-closed,
-      no counter mutation); the same-envelope-key retry is re-evaluated - `inst-bev-error`
-9. [ ] - `p1` - **RETURN** the `BatchDecision`; the orchestrator emits the established pipeline stage spans and
-   counters unchanged, and no new instrument, label dimension, or per-item attribution is introduced (PRD §5.16
-   closed catalogue) - `inst-bev-return`
+1. [x] - `p1` - Consume each item's complete applicable-subject set as resolved in the flow before the envelope idempotency lookup (`inst-bde-resolve`, via `cpt-cf-quota-enforcement-algo-subject-resolution`, projection-contracts feature; consumed, never re-specified); no further resolution runs here - `inst-bev-resolve`
+2. [x] - `p1` - DB: begin the single backend transaction; compute the union of applicable Quotas across all items and run one locked read on that union in lexicographic `quota_id` order (`cpt-cf-quota-enforcement-adr-acquisition-ordering`); this union locked read replaces the single-operation locked-read stage of `cpt-cf-quota-enforcement-algo-evaluation-pipeline`, `EvaluationContext` metadata is captured at this locked-read step (ADR-0003), and lazy period-row materialization runs here when a boundary was crossed - `inst-bev-union`
+3. [x] - `p1` - Arm the batch-level evaluation timeout: a single operator-configurable flat duration (deployment-default 250 ms) that supersedes per-Policy Engine timeouts for the batch as a whole (`cpt-cf-quota-enforcement-fr-batch-debit`); DESIGN §3.3 models it as the envelope tokio timeout (`DomainError::BatchTimeout`); a tokio timeout is observed only at an await point and the per-item Engine call is synchronous and I/O-free, so the tokio timeout guards the await-bearing stages while the item loop checks the armed deadline cooperatively between items (step 4); the timer arms once the envelope's rows are locked, and the write phase and the commit sit outside it and are never cancelled, so a batch is never reported timed out after its effects committed - `inst-bev-timeout`
+4. [x] - `p1` - **FOR EACH** item in submission order - `inst-bev-loop`
+   1. [x] - `p1` - Compare the current instant against the armed deadline; **IF** the deadline is exceeded, stop the loop and take the timeout branch (step 5) with `DomainError::BatchTimeout` - `inst-bev-deadline`
+   2. [x] - `p1` - Invoke the Engine boundary (`cpt-cf-quota-enforcement-algo-engine-boundary`, resolution-policy-engine feature) unchanged against the item's own applicable-Quotas set, with the item's evaluation observing counter state that reflects the application of every previously-evaluated item in the same batch (PRD §5.7 normative; otherwise the Engine cannot produce a correct Debit Plan) - `inst-bev-evaluate`
+   3. [x] - `p1` - **IF** the item targets a Quota whose metric is classified `Direct`, the item fails with `METRIC_NOT_QUOTA_GATED` exactly as on the single-item pipeline, and the envelope fails with that canonical error (PRD §3.2) - `inst-bev-gated`
+   4. [x] - `p1` - Record the item's `Decision` or canonical error at the item's submission index in the per-item array - `inst-bev-record`
+5. [x] - `p1` - **IF** the armed deadline is exceeded before evaluation completes (the cooperative check trips between items, or the tokio timeout fires at an await-bearing stage) - `inst-bev-fire-if`
+   1. [x] - `p1` - Roll back the entire transaction and **RETURN** a canonical `DeadlineExceeded` error with `reason = "BATCH_TIMEOUT"` carried in the envelope, with no counter mutations and no idempotency record; the caller retries with the same envelope key (replay-safe) or, if persistent, with a smaller batch under a new envelope key - `inst-bev-fire`
+6. [x] - `p1` - **IF** every item evaluates to `Allowed` - `inst-bev-apply-if`
+   1. [x] - `p1` - DB: `apply_batch_debit(envelope_idem_key, items, events)`: apply the union of all per-item `debit_plan`s atomically, persist the envelope idempotency record (the full `BatchDecision` blob; Engine and Policy attribution is recorded per item, because a multi-metric batch can resolve a different Policy per item, and the record-level multi-Policy attribution shape is a tracked upstream DESIGN item, section 7), append the operation-log `batch_debit` entry, and enqueue the outbox events, all inside the same transaction (I11); commit; concurrent multi-Quota mutation follows the ADR-0002 acquisition ordering - `inst-bev-apply`
+7. [x] - `p1` - **IF** any item evaluated to `Denied` - `inst-bev-denied-if`
+   1. [x] - `p1` - DB: commit the `Denied` outcome through `apply_batch_debit(envelope_idem_key, items, events)` with an empty union: no counter moves, and the envelope idempotency record (the `Denied` `BatchDecision` with per-item statuses) persists inside the committed transaction, matching the single-debit precedent where a `Denied` Decision persists its idempotency record with an empty plan, so an exact replay returns the original verdict (PRD §5.8; the DESIGN-sequence alignment is a tracked upstream item, section 7) - `inst-bev-denied`
+8. [x] - `p1` - **IF** any item failed with a canonical error - `inst-bev-error-if`
+   1. [x] - `p1` - Roll back the entire envelope, persist nothing, and **RETURN** the canonical error (fail-closed, no counter mutation); the same-envelope-key retry is re-evaluated - `inst-bev-error`
+9. [x] - `p1` - **RETURN** the `BatchDecision`; the orchestrator emits the established pipeline stage spans and counters unchanged, and no new instrument, label dimension, or per-item attribution is introduced (PRD §5.16 closed catalogue) - `inst-bev-return`
 
 ## 4. States (CDSL)
 
 ### Batch Envelope State Machine
 
-- [ ] `p1` - **ID**: `cpt-cf-quota-enforcement-state-batch-envelope`
+- [x] `p1` - **ID**: `cpt-cf-quota-enforcement-state-batch-envelope`
 
 The lifecycle of one envelope within its single backend transaction; `BatchItem` is an in-memory entity per DESIGN and
 no new persisted state is introduced.
@@ -244,18 +183,10 @@ no new persisted state is introduced.
 **Initial State**: Validating
 
 **Transitions**:
-1. [ ] - `p1` - **FROM** Validating **TO** Evaluating **WHEN** the amount validation passes, the envelope idempotency
-   lookup misses, and the `mode` and size checks pass; an exact replay short-circuits to the stored `BatchDecision`
-   without entering Evaluating - `inst-best-enter`
-2. [ ] - `p1` - **FROM** Evaluating **TO** Applied **WHEN** every item evaluates to `Allowed` within the batch-level
-   timeout; the union of per-item `debit_plan`s, the envelope idempotency record, the operation-log entry, and the
-   outbox events commit in one transaction (I11) - `inst-best-applied`
-3. [ ] - `p1` - **FROM** Evaluating **TO** DeniedRecorded **WHEN** any item evaluates to `Denied` within the
-   batch-level timeout; the transaction commits through `apply_batch_debit` with an empty union, so no counter moves
-   and only the envelope idempotency record (the `Denied` `BatchDecision`) persists - `inst-best-denied`
-4. [ ] - `p1` - **FROM** Evaluating **TO** RolledBack **WHEN** any item fails with a canonical error or the
-   batch-level timeout fires; the transaction rolls back, no counter mutation survives, and no envelope idempotency
-   record persists - `inst-best-rollback`
+1. [x] - `p1` - **FROM** Validating **TO** Evaluating **WHEN** the amount validation passes, the envelope idempotency lookup misses, and the `mode` and size checks pass; an exact replay short-circuits to the stored `BatchDecision` without entering Evaluating - `inst-best-enter`
+2. [x] - `p1` - **FROM** Evaluating **TO** Applied **WHEN** every item evaluates to `Allowed` within the batch-level timeout; the union of per-item `debit_plan`s, the envelope idempotency record, the operation-log entry, and the outbox events commit in one transaction (I11) - `inst-best-applied`
+3. [x] - `p1` - **FROM** Evaluating **TO** DeniedRecorded **WHEN** any item evaluates to `Denied` within the batch-level timeout; the transaction commits through `apply_batch_debit` with an empty union, so no counter moves and only the envelope idempotency record (the `Denied` `BatchDecision`) persists - `inst-best-denied`
+4. [x] - `p1` - **FROM** Evaluating **TO** RolledBack **WHEN** any item fails with a canonical error or the batch-level timeout fires; the transaction rolls back, no counter mutation survives, and no envelope idempotency record persists - `inst-best-rollback`
 
 Applied, DeniedRecorded, and RolledBack are terminal for the envelope; the idempotency record persisted by the Applied
 and DeniedRecorded outcomes then follows the Idempotency Record state machine owned by the consumption-operations
@@ -265,7 +196,7 @@ feature.
 
 ### Batch Debit Endpoint and Envelope Validation
 
-- [ ] `p1` - **ID**: `cpt-cf-quota-enforcement-dod-batch-debit-endpoint`
+- [x] `p1` - **ID**: `cpt-cf-quota-enforcement-dod-batch-debit-endpoint`
 
 The system **MUST** deliver `POST /v1/quota-enforcement/operations/batch-debit` on `QuotaEnforcementService` (per the
 DESIGN service surface; see the section 7 note on the DECOMPOSITION sharer list) and the SDK method
@@ -291,7 +222,7 @@ Decision-shaped request fields are silently ignored per the PRD §3.4 trust boun
 
 ### Atomic Envelope Evaluation
 
-- [ ] `p1` - **ID**: `cpt-cf-quota-enforcement-dod-batch-atomic-envelope`
+- [x] `p1` - **ID**: `cpt-cf-quota-enforcement-dod-batch-atomic-envelope`
 
 The system **MUST** extend `EvaluationOrchestrator`
 (`cpt-cf-quota-enforcement-component-evaluation-orchestrator`, established by the consumption-operations feature) with
@@ -321,7 +252,7 @@ PDP, and synchronization between concurrent instances stays delegated to the sto
 
 ### Envelope Idempotency and Batch Timeout
 
-- [ ] `p1` - **ID**: `cpt-cf-quota-enforcement-dod-batch-idempotency-timeout`
+- [x] `p1` - **ID**: `cpt-cf-quota-enforcement-dod-batch-idempotency-timeout`
 
 The system **MUST** enforce envelope idempotency under the established scope
 `IdempotencyScope { tenant_id, subject_key, operation_type, idem_key }`, where `subject_key` fingerprints the canonical

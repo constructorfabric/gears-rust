@@ -5,11 +5,14 @@ use std::collections::HashSet;
 
 use async_trait::async_trait;
 use quota_enforcement_sdk::{
-    ActiveQuotaCounts, ConfigDefaults, DeactivateOutcome, NotificationEvent, PageRequest,
-    PageResult, PolicyDraft, PolicyId, PolicyScope, PolicyUpdate, PolicyVersion, PolicyVersionMeta,
-    ProjectionBinding, Quota, QuotaDraft, QuotaFilter, QuotaId, QuotaPatch, StorageError,
-    TransitionOutcome,
+    ActiveQuotaCounts, ApplicableQuotas, AppliedMutation, ConfigDefaults, DeactivateOutcome,
+    EvaluatedDebit, EvaluatedLease, EvaluatedMutation, ExpiredLease, IdempotencyRecord,
+    IdempotencyScope, IdempotencyWrite, LeaseToken, MetricId, NotificationEvent, PageRequest,
+    PageResult, PartialIdempotencyWrite, PolicyDraft, PolicyId, PolicyScope, PolicyUpdate,
+    PolicyVersion, PolicyVersionMeta, ProjectionBinding, Quota, QuotaDraft, QuotaFilter, QuotaId,
+    QuotaPatch, QuotaSnapshot, RollbackTarget, StorageError, TransitionOutcome,
 };
+use time::OffsetDateTime;
 use toolkit_macros::domain_model;
 use toolkit_security::{AccessScope, SecurityContext};
 use uuid::Uuid;
@@ -129,6 +132,22 @@ pub struct Actor {
 }
 
 /// Schema metadata and the platform-default configuration rows.
+/// The plugin's one notification outbox pipeline.
+#[async_trait]
+pub trait NotificationPipeline: Send + Sync {
+    /// Start the pipeline, handing every claimed event to `delivery`, and bind
+    /// it for enqueueing.
+    ///
+    /// # Errors
+    ///
+    /// `Internal` when it was already started; `Unavailable` when the backend
+    /// cannot start it.
+    async fn start(
+        &self,
+        delivery: std::sync::Arc<dyn quota_enforcement_sdk::NotificationDeliveryV1>,
+    ) -> Result<Box<dyn quota_enforcement_sdk::NotificationDeliveryHandle>, StorageError>;
+}
+
 #[async_trait]
 pub trait FoundationStore: Send + Sync {
     /// The installed contract major, if the schema was ever bootstrapped.
@@ -192,6 +211,134 @@ pub trait QuotaStore: Send + Sync {
 
     /// Active-Quota counts behind the lifecycle gauges.
     async fn read_active_quota_counts(&self) -> Result<ActiveQuotaCounts, StoreError>;
+}
+
+/// The consumption primitives: counter mutations, their replay records, and the
+/// snapshot read.
+///
+/// Like [`PolicyStore`], this port speaks the contract's own `StorageError`
+/// rather than [`StoreError`]: its failure modes are the contract's, so a
+/// translation layer would only restate them.
+#[async_trait]
+pub trait ConsumptionStore: Send + Sync {
+    /// Evaluate the applicable policy against the locked rows and apply the
+    /// plan it produced, atomically with the record and the events.
+    ///
+    /// # Errors
+    ///
+    /// The contract's variants for `apply_debit_plan`.
+    async fn apply_debit_plan(
+        &self,
+        ctx: &SecurityContext,
+        scope: &AccessScope,
+        mutation: &EvaluatedMutation<'_>,
+        events: &[NotificationEvent],
+    ) -> Result<TransitionOutcome<EvaluatedDebit>, StorageError>;
+
+    /// Evaluate and apply an atomic batch under one envelope key.
+    ///
+    /// # Errors
+    ///
+    /// The contract's variants for `apply_batch_debit`.
+    async fn apply_batch_debit(
+        &self,
+        ctx: &SecurityContext,
+        scope: &AccessScope,
+        batch: &quota_enforcement_sdk::EvaluatedBatch<'_>,
+        events: &[NotificationEvent],
+    ) -> Result<TransitionOutcome<Vec<quota_enforcement_sdk::EvaluatedDebit>>, StorageError>;
+
+    /// Return consumption to one Quota, deriving the idempotency scope under
+    /// the row lock.
+    ///
+    /// # Errors
+    ///
+    /// The contract's variants for `apply_credit`.
+    async fn apply_credit(
+        &self,
+        ctx: &SecurityContext,
+        scope: &AccessScope,
+        quota_id: QuotaId,
+        amount: u64,
+        idempotency: &PartialIdempotencyWrite,
+        events: &[NotificationEvent],
+    ) -> Result<TransitionOutcome<AppliedMutation>, StorageError>;
+
+    /// Reverse the committed debit the target names, against its acquisition
+    /// period.
+    ///
+    /// # Errors
+    ///
+    /// The contract's variants for `apply_rollback`.
+    async fn apply_rollback(
+        &self,
+        ctx: &SecurityContext,
+        scope: &AccessScope,
+        target: &RollbackTarget,
+        idempotency: &IdempotencyWrite,
+        events: &[NotificationEvent],
+    ) -> Result<TransitionOutcome<AppliedMutation>, StorageError>;
+
+    /// Per-Quota state of one applicable set, creating the current window's
+    /// row of a valid consumption Quota that lacks one and nothing else (the
+    /// I3 exception).
+    ///
+    /// # Errors
+    ///
+    /// `Unavailable` when the backend cannot answer.
+    async fn read_quota_snapshot(
+        &self,
+        ctx: &SecurityContext,
+        scope: &AccessScope,
+        applicable: &ApplicableQuotas,
+    ) -> Result<Vec<QuotaSnapshot>, StorageError>;
+
+    /// One page of the per-Quota state of many applicable sets, each Quota
+    /// once, in `quota_id` order, under the same I3 exception.
+    ///
+    /// # Errors
+    ///
+    /// `InvalidCursor` for a cursor this plugin did not issue; `Unavailable`
+    /// when the backend cannot answer.
+    async fn bulk_read_quota_snapshot(
+        &self,
+        ctx: &SecurityContext,
+        scope: &AccessScope,
+        pairs: &[ApplicableQuotas],
+        page: PageRequest,
+    ) -> Result<PageResult<QuotaSnapshot>, StorageError>;
+
+    /// The unexpired record under `scope_of`, if one exists.
+    ///
+    /// # Errors
+    ///
+    /// `Unavailable` when the backend cannot answer.
+    async fn lookup_idempotency(
+        &self,
+        scope_of: &IdempotencyScope,
+    ) -> Result<Option<IdempotencyRecord>, StorageError>;
+
+    /// Delete up to `batch_size` records expired before `before`.
+    ///
+    /// # Errors
+    ///
+    /// `Unavailable` when the backend cannot answer.
+    async fn reclaim_expired_idempotency(
+        &self,
+        batch_size: u32,
+        before: OffsetDateTime,
+    ) -> Result<u64, StorageError>;
+
+    /// Delete up to `batch_size` operation-log rows older than `before`.
+    ///
+    /// # Errors
+    ///
+    /// `Unavailable` when the backend cannot answer.
+    async fn reclaim_operation_log(
+        &self,
+        batch_size: u32,
+        before: OffsetDateTime,
+    ) -> Result<u64, StorageError>;
 }
 
 /// Versioned platform policies. Every mutation is one transaction that moves
@@ -303,4 +450,77 @@ pub trait PolicyStore: Send + Sync {
         policy_id: &PolicyId,
         page: PageRequest,
     ) -> Result<PageResult<PolicyVersionMeta>, StorageError>;
+}
+
+/// The lease primitives: the two-phase hold, its settlements, and the
+/// reclamation of the holds that outlived their TTL.
+///
+/// Separate from [`ConsumptionStore`] because these are a different contract
+/// group, and implemented by the same adapter because they settle against the
+/// same counters and idempotency records.
+#[async_trait]
+pub trait LeaseStore: Send + Sync {
+    /// Evaluate the policy under the Quota locks and hold the resulting plan.
+    ///
+    /// # Errors
+    ///
+    /// The contract's variants for `acquire_lease`.
+    async fn acquire_lease(
+        &self,
+        ctx: &SecurityContext,
+        scope: &AccessScope,
+        mutation: &EvaluatedMutation<'_>,
+        ttl: std::time::Duration,
+    ) -> Result<TransitionOutcome<EvaluatedLease>, StorageError>;
+
+    /// Convert an active lease into a debit for what was used, returning the
+    /// rest to the acquisition period.
+    ///
+    /// # Errors
+    ///
+    /// The contract's variants for `commit_lease`.
+    async fn commit_lease(
+        &self,
+        ctx: &SecurityContext,
+        scope: &AccessScope,
+        token: LeaseToken,
+        actual_amount: Option<u64>,
+        idempotency: &PartialIdempotencyWrite,
+        events: &[NotificationEvent],
+    ) -> Result<TransitionOutcome<AppliedMutation>, StorageError>;
+
+    /// Return an active lease's full held capacity, committing no debit.
+    ///
+    /// # Errors
+    ///
+    /// The contract's variants for `release_lease`.
+    async fn release_lease(
+        &self,
+        ctx: &SecurityContext,
+        scope: &AccessScope,
+        token: LeaseToken,
+        idempotency: &PartialIdempotencyWrite,
+        events: &[NotificationEvent],
+    ) -> Result<TransitionOutcome<AppliedMutation>, StorageError>;
+
+    /// Transition expired leases and give back whatever they still hold.
+    ///
+    /// # Errors
+    ///
+    /// `Unavailable` when the backend cannot answer.
+    async fn reclaim_expired_leases(
+        &self,
+        batch_size: u32,
+        before: OffsetDateTime,
+    ) -> Result<Vec<ExpiredLease>, StorageError>;
+
+    /// Expired leases nobody has reclaimed, by metric, behind the gauge.
+    ///
+    /// # Errors
+    ///
+    /// `Unavailable` when the backend cannot answer.
+    async fn count_expired_unreclaimed_leases(
+        &self,
+        before: OffsetDateTime,
+    ) -> Result<Vec<(MetricId, u64)>, StorageError>;
 }

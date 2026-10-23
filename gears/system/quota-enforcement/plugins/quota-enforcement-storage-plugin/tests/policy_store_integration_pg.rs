@@ -27,7 +27,7 @@ use toolkit_security::SecurityContext;
 
 use quota_enforcement_storage_plugin::infra::storage::Migrator;
 use quota_enforcement_storage_plugin::{
-    NotificationEnqueuer, QeOutbox, SqlPolicyStore, start_outbox,
+    NotificationOutbox, QeOutbox, SqlPolicyStore, start_undelivered_outbox,
 };
 
 struct PgHarness {
@@ -110,12 +110,12 @@ impl PgHarness {
         run_migrations_for_testing(&db, Migrator::migrations())
             .await
             .expect("migrations");
-        let outbox = start_outbox(db.clone()).await.expect("outbox");
+        let outbox = start_undelivered_outbox(db.clone()).await.expect("outbox");
         let enqueuer = Arc::new(QeOutbox::new());
         enqueuer
             .bind(Arc::clone(outbox.outbox()))
             .expect("bind once");
-        let enqueuer: Arc<dyn NotificationEnqueuer> = enqueuer;
+        let enqueuer: Arc<dyn NotificationOutbox> = enqueuer;
         Self {
             store: SqlPolicyStore::new(db, enqueuer),
             outbox,

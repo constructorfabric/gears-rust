@@ -25,12 +25,15 @@ use super::tokens;
 pub enum PluginKind {
     /// `QuotaEnforcementStoragePluginV1`.
     Storage,
+    /// `QuotaNotificationSinkV1`.
+    NotificationSink,
 }
 
 impl fmt::Display for PluginKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Self::Storage => "storage",
+            Self::NotificationSink => "notification sink",
         })
     }
 }
@@ -51,6 +54,8 @@ pub enum Dependency {
     Catalog,
     /// The statically registered resolution engines and their artifacts.
     Engine,
+    /// The registered notification sinks.
+    NotificationSinks,
 }
 
 impl Dependency {
@@ -64,6 +69,7 @@ impl Dependency {
             Self::TypesRegistry => "types_registry",
             Self::Catalog => "catalog",
             Self::Engine => "engine",
+            Self::NotificationSinks => "notification_sinks",
         }
     }
 }
@@ -252,6 +258,43 @@ pub enum DomainError {
     /// The acquisition contention timeout elapsed.
     #[error("acquisition contention timeout elapsed")]
     LeaseContentionTimeout,
+    /// A batch's evaluation outlasted the batch-level timeout; nothing was
+    /// written.
+    #[error("batch evaluation exceeded the batch timeout")]
+    BatchTimeout,
+
+    // --- batch debit ---
+    /// One batch item's field is invalid; the whole envelope is refused.
+    #[error("invalid batch item {index} {field}: {reason}")]
+    InvalidBatchItem {
+        /// The item's position in the request.
+        index: usize,
+        /// The item field.
+        field: &'static str,
+        /// Closed `UPPER_SNAKE` reason token.
+        reason: &'static str,
+    },
+    // --- snapshot reads ---
+    /// A snapshot request is refused: its shape before the PDP, or a subject
+    /// the catalogue does not map after it. `index` names the subject when the
+    /// refusal is about one.
+    #[error("invalid snapshot {field}: {reason}")]
+    InvalidSnapshot {
+        /// The subject's position in the request, when one is at fault.
+        index: Option<usize>,
+        /// The request or subject field.
+        field: &'static str,
+        /// Closed `UPPER_SNAKE` reason token.
+        reason: &'static str,
+    },
+    /// The batch has more items than the configured maximum.
+    #[error("batch of {items} items exceeds the maximum of {max}")]
+    BulkTooLarge {
+        /// Items submitted.
+        items: usize,
+        /// The configured maximum.
+        max: usize,
+    },
     /// Commit amount exceeds the reserved amount.
     #[error("commit amount {actual} exceeds reserved amount {reserved}")]
     OverCommitNotAuthorized {
@@ -434,12 +477,18 @@ impl DomainError {
 }
 
 /// 1:1 lift of the storage contract errors (DESIGN section 3.3).
+// @cpt-algo:cpt-cf-quota-enforcement-algo-evaluation-pipeline:p1
 impl From<StorageError> for DomainError {
     fn from(err: StorageError) -> Self {
         match err {
+            StorageError::LeaseNotFound { token } => Self::NotFound {
+                kind: ResourceKind::Lease,
+                id: token.to_string(),
+            },
             StorageError::LeaseNotActive { token } => Self::LeaseNotActive { token },
             StorageError::LeaseInflightLimitExceeded => Self::LeaseInflightLimitExceeded,
             StorageError::LeaseContentionTimeout => Self::LeaseContentionTimeout,
+            StorageError::BatchTimeout => Self::BatchTimeout,
             StorageError::OverCommitNotAuthorized { reserved, actual } => {
                 Self::OverCommitNotAuthorized { reserved, actual }
             }
@@ -466,6 +515,11 @@ impl From<StorageError> for DomainError {
                 id: id.to_string(),
             },
             StorageError::QuotaDeactivated { id } => Self::QuotaDeactivated { id: id.to_string() },
+            // Keep missing, non-mutating, and unauthorized operations indistinguishable.
+            StorageError::OperationNotFound { key } => Self::NotFound {
+                kind: ResourceKind::Operation,
+                id: key,
+            },
             StorageError::PeriodClosed => Self::PeriodClosed,
             StorageError::MetricNotRegistered { metric } => Self::MetricNotRegistered { metric },
             StorageError::MetricNotQuotaGated { metric } => Self::MetricNotQuotaGated { metric },
@@ -480,19 +534,18 @@ impl From<StorageError> for DomainError {
                 field: "cursor",
                 reason: tokens::CURSOR_INVALID,
             },
-            // The transaction evaluated and refused; the same closed failures the
-            // gear lifts when it evaluates outside one.
+            // The transaction has already rolled back this evaluation failure.
+            // @cpt-begin:cpt-cf-quota-enforcement-algo-evaluation-pipeline:p1:inst-pipe-fail
             StorageError::EvaluationFailed { engine_id, failure } => {
                 super::engines::lift_evaluation(&engine_id, failure)
             }
-            // The caller prepares the artifact and retries. Reaching this lift
-            // means the bounded retry budget was spent: an internal condition.
+            // @cpt-end:cpt-cf-quota-enforcement-algo-evaluation-pipeline:p1:inst-pipe-fail
+            // Reaching this lift means the preparation retry budget was exhausted.
             StorageError::PreparationRequired { policy_id, version } => Self::Internal(format!(
                 "artifact for policy {policy_id} version {version} was never prepared"
             )),
             StorageError::Unavailable(detail) => Self::BackendUnavailable(detail),
-            // Detected at bootstrap and fatal there. A runtime occurrence is a
-            // contract violation of the plugin, hence internal.
+            // A post-bootstrap mismatch violates the storage contract.
             StorageError::SchemaVersionMismatch {
                 installed,
                 expected,

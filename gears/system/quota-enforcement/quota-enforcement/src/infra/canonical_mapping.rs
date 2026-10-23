@@ -63,6 +63,14 @@ impl From<DomainError> for CanonicalError {
             DomainError::InvalidArgument { field, reason } => QuotaResource::invalid_argument()
                 .with_field_violation(field, format!("invalid argument {field}: {reason}"), reason)
                 .create(),
+            DomainError::InvalidBatchItem { .. }
+            | DomainError::BulkTooLarge { .. }
+            | DomainError::BatchTimeout => batch(err),
+            DomainError::InvalidSnapshot {
+                index,
+                field,
+                reason,
+            } => snapshot_violation(index, field, reason),
             DomainError::ProjectionNotRegistered { projection } => {
                 QuotaResource::invalid_argument()
                     .with_field_violation(
@@ -159,23 +167,7 @@ impl From<DomainError> for CanonicalError {
                 .create(),
 
             // --- 404 NotFound ---
-            DomainError::NotFound { kind, id } => {
-                let detail = format!("{kind} {id} not found");
-                match kind {
-                    ResourceKind::Quota => {
-                        QuotaResource::not_found(detail).with_resource(id).create()
-                    }
-                    ResourceKind::Policy => {
-                        PolicyResource::not_found(detail).with_resource(id).create()
-                    }
-                    ResourceKind::Lease => {
-                        LeaseResource::not_found(detail).with_resource(id).create()
-                    }
-                    ResourceKind::Operation => OperationResource::not_found(detail)
-                        .with_resource(id)
-                        .create(),
-                }
-            }
+            DomainError::NotFound { kind, id } => not_found(kind, id),
 
             // --- 409 Aborted (safe to retry) ---
             DomainError::IdempotencyPayloadMismatch => {
@@ -264,6 +256,27 @@ impl From<DomainError> for CanonicalError {
 mod canonical_mapping_tests;
 
 /// The lifts of the quota-lifecycle rejections decided before storage.
+/// A Quota or operation `detail` leads with its `UNKNOWN_*` token.
+fn not_found(kind: ResourceKind, id: String) -> CanonicalError {
+    let detail = format!("{kind} {id} not found");
+    match kind {
+        ResourceKind::Quota => QuotaResource::not_found(format!(
+            "{}: {detail}",
+            crate::domain::tokens::UNKNOWN_QUOTA
+        ))
+        .with_resource(id)
+        .create(),
+        ResourceKind::Policy => PolicyResource::not_found(detail).with_resource(id).create(),
+        ResourceKind::Lease => LeaseResource::not_found(detail).with_resource(id).create(),
+        ResourceKind::Operation => OperationResource::not_found(format!(
+            "{}: {detail}",
+            crate::domain::tokens::UNKNOWN_OPERATION
+        ))
+        .with_resource(id)
+        .create(),
+    }
+}
+
 fn quota_lifecycle(err: DomainError) -> CanonicalError {
     match err {
         // --- 400 InvalidArgument ---
@@ -306,6 +319,61 @@ fn quota_lifecycle(err: DomainError) -> CanonicalError {
             "{}: {feature} is not yet implemented",
             reason::NOT_YET_IMPLEMENTED
         ))
+        .create(),
+        other => CanonicalError::from(other),
+    }
+}
+
+/// A refused snapshot request, naming the subject when one is at fault. A
+/// snapshot reads Quota records, so the violation is the Quota resource's.
+fn snapshot_violation(
+    index: Option<usize>,
+    field: &'static str,
+    reason: &'static str,
+) -> CanonicalError {
+    let at = index.map_or_else(
+        || field.to_owned(),
+        |index| format!("subjects[{index}].{field}"),
+    );
+    QuotaResource::invalid_argument()
+        .with_field_violation(
+            at.clone(),
+            format!("invalid argument {at}: {reason}"),
+            reason,
+        )
+        .create()
+}
+
+/// The batch debit's envelope rejections and its timeout.
+fn batch(err: DomainError) -> CanonicalError {
+    match err {
+        // --- 400 InvalidArgument ---
+        DomainError::InvalidBatchItem {
+            index,
+            field,
+            reason,
+        } => {
+            let at = format!("items[{index}].{field}");
+            OperationResource::invalid_argument()
+                .with_field_violation(
+                    at.clone(),
+                    format!("invalid argument {at}: {reason}"),
+                    reason,
+                )
+                .create()
+        }
+        DomainError::BulkTooLarge { items, max } => OperationResource::invalid_argument()
+            .with_field_violation(
+                "items",
+                format!("a batch of {items} items exceeds the maximum of {max}"),
+                "BULK_TOO_LARGE",
+            )
+            .create(),
+        // --- 504 DeadlineExceeded ---
+        // The builder has no reason slot; the token leads the detail.
+        DomainError::BatchTimeout => OperationResource::deadline_exceeded(
+            "BATCH_TIMEOUT: batch evaluation exceeded the batch timeout; nothing was written",
+        )
         .create(),
         other => CanonicalError::from(other),
     }

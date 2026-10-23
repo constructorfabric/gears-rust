@@ -300,20 +300,25 @@ pub fn evaluate_prepared(
 /// configuration, so a version that cannot be compiled cannot spin.
 #[domain_model]
 pub struct PreparedEvaluation<'a> {
-    engines: &'a EngineRegistry,
-    artifacts: &'a Arc<PolicyArtifactCache>,
-    metrics: &'a dyn super::ports::metrics::QeMetrics,
+    engines: Arc<EngineRegistry>,
+    artifacts: Arc<PolicyArtifactCache>,
+    metrics: Arc<dyn super::ports::metrics::QeMetrics>,
     storage: &'a dyn quota_enforcement_sdk::QuotaEnforcementStoragePluginV1,
     attempts: std::num::NonZeroU32,
 }
 
 impl<'a> PreparedEvaluation<'a> {
     /// Bind the deployment's engines, artifact cache and preparation budget.
+    ///
+    /// The engines, the cache and the metrics sink arrive as handles rather
+    /// than borrows because the callback [`Self::evaluator`] builds outlives
+    /// this value: a storage plugin moves it into the future that runs inside
+    /// its transaction, and such a future may not name a caller's lifetime.
     #[must_use]
     pub fn new(
-        engines: &'a EngineRegistry,
-        artifacts: &'a Arc<PolicyArtifactCache>,
-        metrics: &'a dyn super::ports::metrics::QeMetrics,
+        engines: Arc<EngineRegistry>,
+        artifacts: Arc<PolicyArtifactCache>,
+        metrics: Arc<dyn super::ports::metrics::QeMetrics>,
         storage: &'a dyn quota_enforcement_sdk::QuotaEnforcementStoragePluginV1,
         attempts: std::num::NonZeroU32,
     ) -> Self {
@@ -327,17 +332,16 @@ impl<'a> PreparedEvaluation<'a> {
     }
 
     /// The synchronous callback storage invokes inside its transaction.
-    pub fn evaluator(
-        &self,
-    ) -> impl for<'ctx> Fn(
-        &quota_enforcement_sdk::EvaluationContext<'ctx>,
-    ) -> Result<
-        quota_enforcement_sdk::engine::EvaluationOutcome,
-        EvaluationFailure,
-    > + Send
-    + Sync
-    + '_ {
-        move |context| evaluate_prepared(self.engines, self.artifacts, context, self.metrics)
+    #[must_use]
+    pub fn evaluator(&self) -> Arc<quota_enforcement_sdk::engine::TransactionEvaluator> {
+        let engines = Arc::clone(&self.engines);
+        let artifacts = Arc::clone(&self.artifacts);
+        let metrics = Arc::clone(&self.metrics);
+        Arc::new(
+            move |context: &quota_enforcement_sdk::EvaluationContext<'_>| {
+                evaluate_prepared(&engines, &artifacts, context, metrics.as_ref())
+            },
+        )
     }
 
     /// Call storage, preparing what a rolled-back attempt asked for and trying
@@ -346,7 +350,27 @@ impl<'a> PreparedEvaluation<'a> {
     /// # Errors
     /// The mutation's own storage failure, or an internal error when the
     /// preparation budget is spent without the artifact becoming available.
-    pub async fn run<T, Fut>(&self, mut call: impl FnMut() -> Fut) -> Result<T, DomainError>
+    pub async fn run<T, Fut>(&self, call: impl FnMut() -> Fut) -> Result<T, DomainError>
+    where
+        Fut: std::future::Future<Output = Result<T, quota_enforcement_sdk::StorageError>>,
+    {
+        self.run_within(None, call).await
+    }
+
+    /// [`Self::run`] under a batch timer. Once an attempt has armed it, a
+    /// preparation waits no longer than what remains of it, and one the timer
+    /// outlasts answers `BatchTimeout`. Only the preparation is bounded: each
+    /// storage call runs its write and commit to the end. An abandoned
+    /// preparation still publishes its artifact ([`Self::prepare`]).
+    ///
+    /// # Errors
+    /// As [`Self::run`], and `BatchTimeout` when the armed timer runs out
+    /// during a preparation.
+    pub async fn run_within<T, Fut>(
+        &self,
+        timer: Option<&quota_enforcement_sdk::BatchTimer>,
+        mut call: impl FnMut() -> Fut,
+    ) -> Result<T, DomainError>
     where
         Fut: std::future::Future<Output = Result<T, quota_enforcement_sdk::StorageError>>,
     {
@@ -366,7 +390,13 @@ impl<'a> PreparedEvaluation<'a> {
                 )));
             }
             prepared += 1;
-            self.prepare(&failure.0, failure.1).await?;
+            let preparation = self.prepare(&failure.0, failure.1);
+            match timer.and_then(quota_enforcement_sdk::BatchTimer::armed_remaining) {
+                Some(left) => tokio::time::timeout(left, preparation)
+                    .await
+                    .map_err(|_| DomainError::BatchTimeout)??,
+                None => preparation.await?,
+            }
         }
     }
 
@@ -385,7 +415,7 @@ impl<'a> PreparedEvaluation<'a> {
     /// abandoned caller still leaves the artifact behind it.
     async fn prepare(&self, policy_id: &PolicyId, version: u32) -> Result<(), DomainError> {
         let key = (policy_id.clone(), version);
-        let gate = GateGuard::enter(self.artifacts, key).await;
+        let gate = GateGuard::enter(&self.artifacts, key).await;
         if self.artifacts.get(policy_id, version).is_some() {
             // Someone else compiled it while this task waited.
             return Ok(());
@@ -408,7 +438,7 @@ impl<'a> PreparedEvaluation<'a> {
         })?);
         let permit = self.artifacts.compile_permit().await?;
         let engine_id = persisted.engine_id.clone();
-        let cache = Arc::clone(self.artifacts);
+        let cache = Arc::clone(&self.artifacts);
         // Compilation is unbounded CPU work: parsing alone runs on a thread of
         // its own inside the engine. Keep it off the runtime's workers.
         let compiled = tokio::task::spawn_blocking(move || {
