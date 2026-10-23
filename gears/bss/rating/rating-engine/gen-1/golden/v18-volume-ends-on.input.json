@@ -1,0 +1,311 @@
+{
+  "description": "A temporary price ends on 09-15 inside the window: a second slice priced by the successor, the band axis continues at 80; volume rates 64 and 35.",
+  "vectors": [
+    "V18"
+  ],
+  "input": {
+    "child": {
+      "child_id": "00000000-0000-0000-0000-0000000000c0",
+      "kind": "usage_window",
+      "window": {
+        "window_start": "2026-09-01T00:00:00Z",
+        "window_end": "2026-10-01T00:00:00Z",
+        "served_from": "2026-09-01T00:00:00Z",
+        "served_to": "2026-10-01T00:00:00Z"
+      },
+      "aggregation_key": {
+        "tenant_axes": {
+          "seller_tenant_id": "00000000-0000-0000-0000-00000000000a",
+          "payer_tenant_id": "00000000-0000-0000-0000-00000000000b",
+          "resource_tenant_id": "00000000-0000-0000-0000-00000000000c"
+        },
+        "subscription_id": "00000000-0000-0000-0000-000000000005",
+        "sub_line_key": "plan#1",
+        "item_id": "00000000-0000-0000-0000-000000010001",
+        "meter": "products.derived/vm-hours@1",
+        "dimension_key": null,
+        "scope": {
+          "kind": "subscription_line"
+        }
+      }
+    },
+    "fact": {
+      "fact_id": "00000000-0000-0000-0000-00000000000f",
+      "fact_version": 1,
+      "kind": "usage",
+      "subscription_id": "00000000-0000-0000-0000-000000000005",
+      "sub_line_key": "plan#1",
+      "currency": "EUR",
+      "period": {
+        "start": "2026-09-01T00:00:00Z",
+        "end": "2026-10-01T00:00:00Z"
+      },
+      "served": {
+        "start": "2026-09-01T00:00:00Z",
+        "end": "2026-10-01T00:00:00Z"
+      },
+      "plan_revision_id": "00000000-0000-0000-0000-000000000007",
+      "accepted": [
+        {
+          "item_id": "00000000-0000-0000-0000-000000010001",
+          "dimension_value": null,
+          "price_id": "00000000-0000-0000-0000-000000020001"
+        }
+      ],
+      "quantity": null,
+      "suspensions": [],
+      "suspension_posture": "continue",
+      "adjustments": [],
+      "bundle": null
+    },
+    "pricing": {
+      "plan_id": "00000000-0000-0000-0000-000000000006",
+      "revision_id": "00000000-0000-0000-0000-000000000007",
+      "pins": [
+        {
+          "item_id": "00000000-0000-0000-0000-000000010001",
+          "dimension_value": null,
+          "price_id": "00000000-0000-0000-0000-000000020001"
+        }
+      ],
+      "binding_of_record": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "resolves": [
+        {
+          "resolve_date": "2026-09-01",
+          "binding_digest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+          "cells": [
+            {
+              "selection": {
+                "item_id": "00000000-0000-0000-0000-000000010001",
+                "dimension_value": null
+              },
+              "binding": {
+                "item_id": "00000000-0000-0000-0000-000000010001",
+                "price_book_entry_id": "00000000-0000-0000-0000-000000030001",
+                "dimension_key": null,
+                "dimension_value": null,
+                "sku_id": "00000000-0000-0000-0000-000000040001",
+                "sku_version": 1,
+                "sku_code": "PRO",
+                "sku_name": "Pro plan",
+                "unit": "vm-hour",
+                "meter": {
+                  "usage_type_id": "products.derived/vm-hours@1",
+                  "version": "1"
+                },
+                "price": {
+                  "price_id": "00000000-0000-0000-0000-000000020001",
+                  "price_book_entry_id": "00000000-0000-0000-0000-000000030001",
+                  "money_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                  "currency": {
+                    "code": "EUR",
+                    "scale": 2
+                  },
+                  "model": {
+                    "model": "volume",
+                    "tiers": [
+                      {
+                        "up_to": "100",
+                        "rate": "1"
+                      },
+                      {
+                        "up_to": null,
+                        "rate": "0.8"
+                      }
+                    ]
+                  },
+                  "minimum_fee": null,
+                  "effective_from": "2026-01-01",
+                  "ends_on": "2026-09-15",
+                  "state": "approved"
+                },
+                "kind": "usage",
+                "recurring_period": null,
+                "via_default": false,
+                "usage_policy": {
+                  "policy_id": "00000000-0000-0000-0000-000000060001",
+                  "version": 1,
+                  "digest": "9999999999999999999999999999999999999999999999999999999999999999",
+                  "rating_window": "billing_cycle",
+                  "aggregation_scope": "subscription_line",
+                  "reset": "rating_window_start",
+                  "partial_window": "actual_quantity_full_thresholds",
+                  "fold": "sum"
+                },
+                "invoice": {
+                  "template": "Pro plan, {period}",
+                  "template_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                  "template_source": "entry",
+                  "gl_code": "4000",
+                  "tax_category": "std",
+                  "timing": "advance",
+                  "rounding": "half_even"
+                }
+              }
+            }
+          ]
+        },
+        {
+          "resolve_date": "2026-09-15",
+          "binding_digest": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+          "cells": [
+            {
+              "selection": {
+                "item_id": "00000000-0000-0000-0000-000000010001",
+                "dimension_value": null
+              },
+              "binding": {
+                "item_id": "00000000-0000-0000-0000-000000010001",
+                "price_book_entry_id": "00000000-0000-0000-0000-000000030001",
+                "dimension_key": null,
+                "dimension_value": null,
+                "sku_id": "00000000-0000-0000-0000-000000040001",
+                "sku_version": 1,
+                "sku_code": "PRO",
+                "sku_name": "Pro plan",
+                "unit": "vm-hour",
+                "meter": {
+                  "usage_type_id": "products.derived/vm-hours@1",
+                  "version": "1"
+                },
+                "price": {
+                  "price_id": "00000000-0000-0000-0000-000000020002",
+                  "price_book_entry_id": "00000000-0000-0000-0000-000000030001",
+                  "money_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                  "currency": {
+                    "code": "EUR",
+                    "scale": 2
+                  },
+                  "model": {
+                    "model": "volume",
+                    "tiers": [
+                      {
+                        "up_to": "100",
+                        "rate": "0.9"
+                      },
+                      {
+                        "up_to": null,
+                        "rate": "0.7"
+                      }
+                    ]
+                  },
+                  "minimum_fee": null,
+                  "effective_from": "2026-01-01",
+                  "ends_on": null,
+                  "state": "approved"
+                },
+                "kind": "usage",
+                "recurring_period": null,
+                "via_default": false,
+                "usage_policy": {
+                  "policy_id": "00000000-0000-0000-0000-000000060001",
+                  "version": 1,
+                  "digest": "9999999999999999999999999999999999999999999999999999999999999999",
+                  "rating_window": "billing_cycle",
+                  "aggregation_scope": "subscription_line",
+                  "reset": "rating_window_start",
+                  "partial_window": "actual_quantity_full_thresholds",
+                  "fold": "sum"
+                },
+                "invoice": {
+                  "template": "Pro plan, {period}",
+                  "template_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                  "template_source": "entry",
+                  "gl_code": "4000",
+                  "tax_category": "std",
+                  "timing": "advance",
+                  "rounding": "half_even"
+                }
+              }
+            }
+          ]
+        }
+      ]
+    },
+    "derived": {
+      "code": "vm-hours",
+      "version": 1,
+      "digest": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "declaration": {
+        "output_unit": "vm-hour",
+        "granularity": "hour",
+        "inputs": [
+          {
+            "name": "vm",
+            "usage_type_ref": "gts.cf.core.uc.usage_record.v1~cf.test.usage.vm_hours.v1",
+            "granule_fold": "sum",
+            "max_hold_seconds": null,
+            "unit": "vm-hour"
+          }
+        ],
+        "formula": {
+          "op": "input",
+          "name": "vm"
+        },
+        "output_scale": 12,
+        "output_round": "half_even"
+      }
+    },
+    "subscription": {
+      "subscription_id": "00000000-0000-0000-0000-000000000005",
+      "subscription_version": 1,
+      "tenant_axes": {
+        "seller_tenant_id": "00000000-0000-0000-0000-00000000000a",
+        "payer_tenant_id": "00000000-0000-0000-0000-00000000000b",
+        "resource_tenant_id": "00000000-0000-0000-0000-00000000000c"
+      },
+      "plan_id": "00000000-0000-0000-0000-000000000006",
+      "plan_revision_id": "00000000-0000-0000-0000-000000000007",
+      "quantity_intervals": [],
+      "brand": null
+    },
+    "quantities": {
+      "layout_version": 1,
+      "slices": [
+        {
+          "slice_start": "2026-09-01T00:00:00Z",
+          "slice_end": "2026-09-15T00:00:00Z",
+          "q": "80",
+          "q_version": 1,
+          "granules": [
+            {
+              "granule_start": "2026-09-05T08:00:00Z",
+              "inputs": [
+                {
+                  "usage_type_ref": "gts.cf.core.uc.usage_record.v1~cf.test.usage.vm_hours.v1",
+                  "q": "80"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "slice_start": "2026-09-15T00:00:00Z",
+          "slice_end": "2026-10-01T00:00:00Z",
+          "q": "50",
+          "q_version": 1,
+          "granules": [
+            {
+              "granule_start": "2026-09-20T08:00:00Z",
+              "inputs": [
+                {
+                  "usage_type_ref": "gts.cf.core.uc.usage_record.v1~cf.test.usage.vm_hours.v1",
+                  "q": "50"
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    "group_context": null,
+    "budget": {
+      "reduced_digits": 256,
+      "scratch_digits": 512
+    },
+    "engine": {
+      "engine_generation": 1,
+      "engine_digest": "<engine_digest>"
+    }
+  }
+}

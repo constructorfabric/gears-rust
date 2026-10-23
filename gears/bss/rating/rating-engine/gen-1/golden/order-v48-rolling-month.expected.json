@@ -1,0 +1,127 @@
+{
+  "order": {
+    "assessment_id": "00000000-0000-0000-0000-00000000a55e",
+    "currency": "EUR",
+    "currency_scale": 2,
+    "lines": [
+      {
+        "line_id": "00000000-0000-0000-0000-00000000a001",
+        "items": [
+          {
+            "item_id": "00000000-0000-0000-0000-000000010001",
+            "price_id": "00000000-0000-0000-0000-000000030001",
+            "charge_kind": "recurring",
+            "cycle": "month",
+            "rated": {
+              "exact": "0.333",
+              "display": "0.33"
+            },
+            "minimum_fee": null,
+            "minimum_fee_applied": false,
+            "gross": {
+              "exact": "0.333",
+              "display": "0.33"
+            },
+            "discount_status": "unavailable",
+            "net": {
+              "exact": "0.333",
+              "display": "0.33"
+            },
+            "usage_rates": null
+          }
+        ],
+        "rows": [
+          {
+            "charge_kind": "recurring",
+            "amount_status": "committed",
+            "gross": {
+              "exact": "3.996",
+              "display": "4"
+            },
+            "discount_status": "unavailable",
+            "net": {
+              "exact": "3.996",
+              "display": "4"
+            },
+            "amount_basis": "rolling_annualized",
+            "recurring_by_cycle": [
+              {
+                "cycle": "month",
+                "gross": {
+                  "exact": "0.333",
+                  "display": "0.33"
+                },
+                "net": {
+                  "exact": "0.333",
+                  "display": "0.33"
+                }
+              }
+            ]
+          }
+        ],
+        "horizon": {
+          "term": {
+            "kind": "rolling"
+          },
+          "cycle": "month",
+          "periods": 12,
+          "basis": "rolling_annualized"
+        }
+      }
+    ],
+    "order": [
+      {
+        "charge_kind": "recurring",
+        "amount_status": "committed",
+        "gross": {
+          "exact": "3.996",
+          "display": "4"
+        },
+        "discount_status": "unavailable",
+        "net": {
+          "exact": "3.996",
+          "display": "4"
+        },
+        "amount_basis": "rolling_annualized",
+        "recurring_by_cycle": [
+          {
+            "cycle": "month",
+            "gross": {
+              "exact": "0.333",
+              "display": "0.33"
+            },
+            "net": {
+              "exact": "0.333",
+              "display": "0.33"
+            }
+          }
+        ]
+      }
+    ],
+    "tcv": {
+      "amount": {
+        "exact": "3.996",
+        "display": "4"
+      },
+      "basis": "rolling_annualized",
+      "evidence": [
+        {
+          "line_id": "00000000-0000-0000-0000-00000000a001",
+          "horizon": {
+            "term": {
+              "kind": "rolling"
+            },
+            "cycle": "month",
+            "periods": 12,
+            "basis": "rolling_annualized"
+          }
+        }
+      ]
+    },
+    "tcv_withheld": [],
+    "engine": {
+      "engine_generation": 1,
+      "engine_digest": "<engine_digest>"
+    }
+  }
+}

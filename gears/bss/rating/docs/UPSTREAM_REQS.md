@@ -72,7 +72,7 @@ required changes, now carried as aliases on the `upreq` IDs below.
 | bss-ledger | §2.8 | none (Billing posts) |
 | Finance / FX | §2.9 | `delay_only` finalization; cross-currency billing is deferred, not requested now (R-07, T-D-81) |
 | Contracts, Promotions | §2.10 | nothing now: contract overlays, commitments and coupons are deferred, not requested now (R-11, T-D-81) |
-| Orders Lifecycle | §2.11 | pre-purchase evaluation (R-24) |
+| Orders | §2.11 | purchase evaluation (R-24, T-D-83) |
 | platform (event broker, Cluster Plane) | §2.12 | first deployment (R-27); event paths |
 | account-management | §2.13 | tenant deletion |
 | shared fixtures | §2.14 | none (the joint corpus was deleted; pricing golden contracts replace it) |
@@ -848,8 +848,8 @@ The owner of `cf-gears-bss-money` (`gears/bss/libs/money`) **MUST** add to
   one text and one digest); `BigInt` is re-exported as `bss_money::exact::BigInt`. `Display`
   stays for messages only.
 - **Register aliases**: DECISIONS R-35, T-D-80.
-- **Acceptance signal**: the remaining additions are on `main`; Rating's generation vendors that
-  release (ADR-0006).
+- **Acceptance signal**: the remaining additions are on `main`; Rating's generation uses that
+  release in place (T-D-84).
 
 ### 2.9 Finance and FX
 
@@ -962,34 +962,33 @@ Orders Lifecycle is a **consumer** of a Rating-provided contract, not a provider
 
 | # | Contract | Evidence | Status |
 |---|---|---|---|
-| G-6 | Order-time evaluation: one batched ClientHub call over the exact accepted chain matrix — request `{assessment_id, resolve_date, tenant axes, lines[{line_id, plan_revision_id, items[{item_id, quantity, chains[{dim_value, binding}]}]}]}`, response per item/line/order gross/net/discount, three charge kinds, minimum-fee application, currency/scale/rounding, net pre-tax TCV (×12 `month`, ×1 `year`), integer minor units (retired by the money ADR: display totals become major-unit decimals marked as estimates, T-D-80); no renewal walk; failure `evaluation-unavailable`; Atlas C06 `acceptance_ref`/`ExactAmount` not consumed (Orders D-154, D-167) | `gears/bss/orders-lifecycle/docs/UPSTREAM_REQS.md:303-351`; `DESIGN.md:6705-6726`; `DECISIONS.md:3143, 3161` | **adopted** by Rating as T-D-79 (proposed); Orders confirms |
-| G-15 | Accepted order pin `OrderPin` (`orders_order_line.order_pin`): `plan_revision_id`, `book_id`, currency/scale/rounding, `items[]` with `sku_version`, descriptor snapshot and `chains[]{dim_value, uncovered, binding}`; at activation Subscriptions resolves with the consumed slots as pins and stores the result as the first period's pins, else refuses `accepted-price-mismatch` (D-162) | `gears/bss/orders-lifecycle/docs/DESIGN.md:6511-6604`; `DECISIONS.md:3153, 3156` | DOCUMENTED (Orders and Subscriptions have no code) |
+| G-6 | Purchase evaluation (Orders D-197, selected 2026-10-05): one batched, nonbinding ClientHub `SafeRead` over the exact selected native Pricing bindings — request: assessment identity, resolve date and input digest, seller/resource/payer axes, payer-backed market, contract reference, per line Term (D-193), `BillingTerms` and `start_at`, per item the selected binding and an explicit quantity; response: per item/line/order gross/net/discount with promotion availability, three charge kinds, cycle-labelled recurring components, currency and scale (no rounding mode), every amount exact and as a major-unit display estimate, exclusions, one order TCV with `tcv_basis` (`finite_term` \| `rolling_annualized` \| `mixed`); Preview alone may withhold the TCV; any failure is `evaluation-unavailable`, never a partial or guessed answer. Stored totals (D-216, 2026-10-18): canonical decimal text, at most 28 significant and 28 fractional digits, one row per scope and charge kind | `gears/bss/orders/docs/DESIGN.md` `contract-03-rating-purchase-evaluation`, §4.4; `DECISIONS.md` D-197, D-216; `UPSTREAM_REQS.md` §2.2; `orders/src/infra/storage/migrations/01_schema.sql:224-262` | **adopted** by Rating as T-D-83 (`evaluate_order` built); the SDK provider, grants and profile declaration are open (R-24) |
+| G-15 | Accepted order pin: since D-192 (2026-10-05) the complete frozen Pricing receipt (query, bindings, digests) with the D-190 hold, replacing the `OrderPin` chains of D-162 | `gears/bss/orders/docs/DESIGN.md` (D-192 pin, D-190 hold); `DECISIONS.md` D-188…D-192 | DOCUMENTED; Orders' storage is built, Subscriptions has no code |
 
-Orders' acceptance model lags Pricing on `main`: Orders D-162/D-177/Q-32 say Pricing has no receipt,
-no hold and no `SellabilityV1` (`gears/bss/orders-lifecycle/docs/DECISIONS.md:3156, 3171, 3311`),
-while `pricing-sdk/src/acceptance.rs` defines and registers them (P-27). This is Orders' and
-Pricing's to reconcile; Rating only consumes the bindings that reach it through Subscriptions'
-facts. Orders also calls `pricingSnapshotRef` a retired term (`orders-lifecycle/docs/PRD.md:127`).
+Orders has since adopted Pricing's receipt and hold (Orders D-188, D-190, D-192, which close Q-32;
+`pricing-sdk/src/acceptance.rs`, P-27). Rating consumes the bindings that reach it through
+Subscriptions' facts, and the selected bindings of a purchase evaluation (G-6). Orders now calls
+`pricingSnapshotRef` a downstream composite owned by Rating (`gears/bss/orders/docs/PRD.md:128`).
 
 #### Pre-purchase evaluation request shape and priority
 
-- [ ] `p2` - **ID**: `cpt-cf-bss-rating-upreq-orders-evaluation-dto`
+- [ ] `p1` - **ID**: `cpt-cf-bss-rating-upreq-orders-evaluation-dto`
 
-Orders Lifecycle **MUST** confirm Rating's adoption of its D-167 request and response (T-D-79):
-the response returns every amount as `{exact, display}` (`display` the HALF_EVEN rounding of
-`exact` at the currency scale, marked as a non-authoritative estimate) and a TCV `posting_estimate`
-built from per-period rounded figures (DESIGN 11 §4.10) (T-D-80; the money ADR
-retires integer minor units, so the storage those Orders documents describe moves to that decimal); and both gears **MUST** agree the priority of
-`cpt-cf-bss-rating-fr-pre-purchase-evaluation` (p1 for Orders, which also asks it to lose its
-catalog-version prefix).
+Orders **MUST** keep its D-197 purchase evaluation contract and its D-216 stored totals as the DTO
+Rating serves (T-D-83), and settle what they leave open: the quantity mapping per charge kind
+(Orders Q-03; Rating applies an explicit per-item quantity to `per_unit` only), the vocabulary of
+`amount_basis`, `period_evidence` and `tcv_evidence` (Rating returns the `tcv_basis` values and a
+per-line horizon `{term, cycle, periods, basis}`), and the trait name (Orders proposes
+`RatingPurchaseEvaluationV1`). Orders' own residues still name a rounding mode and minor units
+(Orders DESIGN §4.4, UPSTREAM_REQS §2.2, PRD), which D-216 retires.
 
-- **Rationale**: Rating adopted Orders' shape instead of Atlas C06 (overlay ticket T3); the remaining
-  difference is that Rating's amounts are exact and Orders' documents still store integer minor
-  units verbatim, which the money ADR replaces with major-unit decimals marked as estimates.
+- **Rationale**: Orders specified the contract (D-197) and the stored format (D-216), and both gears
+  rate it `p1`; Rating adopted it in place of its D-167 adoption (T-D-79) and of Atlas C06 (overlay
+  ticket T3). What remains is delivery and the open vocabulary above.
 - **Source**: `gears/bss/rating` — [11 §4.10](./DESIGN.md#contract-11-4-10); feature [`10-order-evaluation`](./features/10-order-evaluation.md).
-- **Status**: Rating side adopted (T-D-79, proposed); Orders confirmation open.
+- **Status**: Rating side adopted (T-D-83, `evaluate_order` built); Orders' open items listed above.
 - **Register aliases**: DECISIONS R-24; overlay ticket T3.
-- **Acceptance signal**: both gears' documents name the same DTO and priority.
+- **Acceptance signal**: both gears' documents name the same DTO, vocabulary and priority.
 
 #### Orders purchase evaluation target — D-197 (2026-10-05)
 
@@ -998,7 +997,7 @@ The selected [Orders R11 contract](../../orders/docs/DESIGN.md#contract-03-ratin
 - [ ] Deliver SDK/provider, supported profiles, grants and exact request/response schemas.
 - [ ] Prove finite/rolling/mixed terms, rounding/models, usage versus zero, authorization, Preview-only withholding and receipt-equality/replay scenarios against real providers.
 
-This is an adopted planning target, not runtime conformance or producer-owner signoff; the gear remains docs-only. Historical seam entries remain historical outside this narrow amendment.
+This is an adopted planning target, not runtime conformance or producer-owner signoff. Rating adopted it as T-D-83: `rating-core`'s `evaluate_order` implements the arithmetic (feature 02 §3.8); the SDK provider does not exist yet. Historical seam entries remain historical outside this narrow amendment.
 
 
 #### Orders asynchronous start compatibility (Lifecycle D-201)
@@ -1127,7 +1126,7 @@ list. The Atlas was audited against `diffora/gears-rust @ 01f670fa4e5c`. Status 
 | C03 Subscriptions fulfilment | Subscriptions → Workflow, Orders | activation validates billing terms and usage policy | PROPOSED; pricing defines `BillingTerms` as Subscriptions-owned (S-10); Orders D-162 activation check | Contested | consumed indirectly (the fact's pricing inputs, `…-upreq-subscriptions-fact-pricing-inputs`) |
 | C04 billable facts, attribution, sealed composition | Subscriptions → Rating, Billing | `BillableFactPublished`, `BillableSetSealed`, `AttributionSegmentChanged`, `UsageScopeSealed`, `SubscriptionBillingReadV1` | PROPOSED; S-2 documented, S-3/S-7/S-8 absent; per-period pins decided (SUB-D-29) but carried on no fact (S-9); conflicts R-20, R-25 | Atlas only | adopted as TARGET (T-D-49, T-D-57, T-D-73) |
 | C05 usage feed, coverage, inventory | Collector, IRM → Rating, Subscriptions | `UsageFeedV1`, V2 interval writes, invalidations, `MeterCoverageReadV1`, `ResourceHistoryV1`, finalization rule, boundary splits | feed: the collector's own design supersedes it (U-1…U-3, overlay: withdraw `UsageFeedV1`); coverage/inventory ABSENT (U-10/U-11) | Uncovered | collector feed adopted (R-01); finalization rule and boundary splits adopted (T-D-52, T-D-53); coverage owner open (R-21, T6) |
-| C06 pre-purchase evaluation | Rating → Orders | `OrderEvaluationV1::evaluate` | PROPOSED; Orders asks its own shape instead (D-167, G-6) | Contested | Rating adopts Orders' D-167 shape, not C06's (T-D-54 refined by T-D-79) |
+| C06 pre-purchase evaluation | Rating → Orders | `OrderEvaluationV1::evaluate` | PROPOSED; Orders selected its own shape instead (D-197, D-216, G-6) | Contested | Rating adopts Orders' D-197 shape, not C06's (T-D-54 refined by T-D-83) |
 | C07 deterministic run + replacement delivery | Rating → Billing | `RatingRunReadV1`, `RatingRunControlV1`, `WindowEvaluationKey`, `WindowResult`, `WindowManifest`, `BillableItemDeliveryV1`, input-generation CAS | Rating-owned | One-sided | adopted (T-D-49, T-D-50, T-D-58); exact amounts in major units (T-D-51 as amended by T-D-80); durable re-rate targets and freshness-gated roll-up (T-D-63, T-D-64) |
 | C08 Billing acceptance + posting | Billing, Ledger | per-fact heads, aggregate rounding, ordered posting obligations | PROPOSED; no Billing gear | One-sided | Rating's dependency (`…-upreq-billing-delivery-consumer`) |
 | C09 event names + recovery | per producer | event vocabulary, recovery reads, retention ≥ largest delay + outage | PROPOSED; the broker delivers (A-3) but no producer Rating consumes has a typed payload | Contested | adopted as inbox sources (T-D-56); producer contracts requested (`…-upreq-event-contracts`), Rating's delivery event specified (T-D-71) |
@@ -1141,8 +1140,8 @@ names for CURRENT; the hint enum is `open | frozen | posted` (C09).
 
 | Priority | Requirements |
 |----------|-------------|
-| `p1` (critical) | `…-upreq-usage-feed-v1`, `…-upreq-coverage-declarations`, `…-upreq-resource-history`, `…-upreq-pricing-read-grant`, `…-upreq-products-derived-declaration-read`, `…-upreq-subscriptions-versioned-facts`, `…-upreq-subscriptions-fact-pricing-inputs`, `…-upreq-subscriptions-usage-fact`, `…-upreq-subscriptions-attribution-segments`, `…-upreq-subscriptions-scope-proofs`, `…-upreq-subscriptions-recovery-reads`, `…-upreq-billing-delivery-consumer`, `…-upreq-billing-invoice-line-contract`, `…-upreq-billing-period-ownership`, `…-upreq-delay-only-acceptance`, `…-upreq-cluster-coordination-backend`, `…-upreq-bss-money-exact-api` |
-| `p2` (important) | `…-upreq-usage-reconciliation-access` (an operator path covers it until then), `…-upreq-usage-feed-scope-digest`, `…-upreq-usage-type-declaration-read`, `…-upreq-pricing-proration-confirmation`, `…-upreq-pricing-numeric-limits`, `…-upreq-products-derived-output-limits`, `…-upreq-level-meter-rule`, `…-upreq-subscriptions-ends-on-cut`, `…-upreq-subscriptions-one-time-rating`, `…-upreq-accepted-binding-naming`, `…-upreq-orders-evaluation-dto`, `…-upreq-event-contracts` |
+| `p1` (critical) | `…-upreq-usage-feed-v1`, `…-upreq-coverage-declarations`, `…-upreq-resource-history`, `…-upreq-pricing-read-grant`, `…-upreq-products-derived-declaration-read`, `…-upreq-subscriptions-versioned-facts`, `…-upreq-subscriptions-fact-pricing-inputs`, `…-upreq-subscriptions-usage-fact`, `…-upreq-subscriptions-attribution-segments`, `…-upreq-subscriptions-scope-proofs`, `…-upreq-subscriptions-recovery-reads`, `…-upreq-billing-delivery-consumer`, `…-upreq-billing-invoice-line-contract`, `…-upreq-billing-period-ownership`, `…-upreq-delay-only-acceptance`, `…-upreq-cluster-coordination-backend`, `…-upreq-bss-money-exact-api`, `…-upreq-orders-evaluation-dto` |
+| `p2` (important) | `…-upreq-usage-reconciliation-access` (an operator path covers it until then), `…-upreq-usage-feed-scope-digest`, `…-upreq-usage-type-declaration-read`, `…-upreq-pricing-proration-confirmation`, `…-upreq-pricing-numeric-limits`, `…-upreq-products-derived-output-limits`, `…-upreq-level-meter-rule`, `…-upreq-subscriptions-ends-on-cut`, `…-upreq-subscriptions-one-time-rating`, `…-upreq-accepted-binding-naming`, `…-upreq-event-contracts` |
 | `p3` (nice-to-have) | `…-upreq-dimension-encoding`, `…-upreq-billing-ledger-item-granularity`, `…-upreq-ledger-credit-note-wording`, `…-upreq-tenant-deletion-signal` |
 | deferred, not requested now (2026-10-12) | `…-upreq-fx-rate-snapshots`, `…-upreq-contracts-inputs`, `…-upreq-promotions-coupon-snapshots` (price adjustments, DECOMPOSITION §2.3) |
 | closed (2026-10-08) | `…-upreq-pricing-meter-binding`, `…-upreq-pricing-validator-hook`, `…-upreq-pricing-aggregation-scope`, `…-upreq-lifetime-settlement-model`, `…-upreq-fixtures-band-scale` (§2.15) |
@@ -1158,6 +1157,6 @@ production dependency.
 - **DESIGN**: [`DESIGN.md`](./DESIGN.md) §0 (labels), §3.3 (event contracts), §3.5 (external dependencies), §4.6, §4.10 (launch capability matrix).
 - **Decisions**: [`DECISIONS.md`](./DECISIONS.md) — R-01, R-03…R-07, R-09, R-11, R-12, R-16, R-17, R-19…R-35; T-D-18, T-D-33, T-D-36…T-D-39, T-D-50, T-D-51, T-D-52, T-D-56, T-D-57, T-D-62, T-D-71, T-D-73…T-D-80.
 - **Cross-BSS money ADR** ([BSS ADR-0001](../../docs/ADR/0001-cpt-cf-bss-adr-exact-decimal-boundaries.md), merged on `main` at `510ce99f0`): money form, limits, storage and rounding (T-D-80, ADR-0005).
-- **Dependency evidence** (2026-10-08): pricing `gears/bss/pricing` (D-384…D-427, D-437, D-467, D-501…D-514, D-520, D-521), products `gears/bss/products` (P-D-229…P-D-259, upstream P-D-265), subscriptions SUB-D-28/29, orders-lifecycle D-154/D-162/D-167.
+- **Dependency evidence** (2026-10-08): pricing `gears/bss/pricing` (D-384…D-427, D-437, D-467, D-501…D-514, D-520, D-521), products `gears/bss/products` (P-D-229…P-D-259, upstream P-D-265), subscriptions SUB-D-28/29, orders-lifecycle D-154/D-162/D-167; re-checked 2026-10-27 against orders (`gears/bss/orders`) D-188…D-197 and D-216.
 - **Decomposition**: [`DECOMPOSITION.md`](./DECOMPOSITION.md) §3.1 (which feature each ask blocks).
-- **Downstream register**: Orders Lifecycle's asks of Rating are in `gears/bss/orders-lifecycle/docs/UPSTREAM_REQS.md` §2.2.
+- **Downstream register**: Orders' asks of Rating are in `gears/bss/orders/docs/UPSTREAM_REQS.md` §2.2.

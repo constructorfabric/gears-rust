@@ -1,0 +1,265 @@
+{
+  "order": {
+    "assessment_id": "00000000-0000-0000-0000-00000000a55e",
+    "currency": "EUR",
+    "currency_scale": 2,
+    "lines": [
+      {
+        "line_id": "00000000-0000-0000-0000-00000000a001",
+        "items": [
+          {
+            "item_id": "00000000-0000-0000-0000-000000010003",
+            "price_id": "00000000-0000-0000-0000-000000030003",
+            "charge_kind": "recurring",
+            "cycle": "year",
+            "rated": {
+              "exact": "120",
+              "display": "120"
+            },
+            "minimum_fee": null,
+            "minimum_fee_applied": false,
+            "gross": {
+              "exact": "120",
+              "display": "120"
+            },
+            "discount_status": "unavailable",
+            "net": {
+              "exact": "120",
+              "display": "120"
+            },
+            "usage_rates": null
+          }
+        ],
+        "rows": [
+          {
+            "charge_kind": "recurring",
+            "amount_status": "committed",
+            "gross": {
+              "exact": "120",
+              "display": "120"
+            },
+            "discount_status": "unavailable",
+            "net": {
+              "exact": "120",
+              "display": "120"
+            },
+            "amount_basis": "rolling_annualized",
+            "recurring_by_cycle": [
+              {
+                "cycle": "year",
+                "gross": {
+                  "exact": "120",
+                  "display": "120"
+                },
+                "net": {
+                  "exact": "120",
+                  "display": "120"
+                }
+              }
+            ]
+          }
+        ],
+        "horizon": {
+          "term": {
+            "kind": "rolling"
+          },
+          "cycle": "year",
+          "periods": 1,
+          "basis": "rolling_annualized"
+        }
+      },
+      {
+        "line_id": "00000000-0000-0000-0000-00000000a002",
+        "items": [
+          {
+            "item_id": "00000000-0000-0000-0000-000000010001",
+            "price_id": "00000000-0000-0000-0000-000000030001",
+            "charge_kind": "recurring",
+            "cycle": "month",
+            "rated": {
+              "exact": "10",
+              "display": "10"
+            },
+            "minimum_fee": null,
+            "minimum_fee_applied": false,
+            "gross": {
+              "exact": "10",
+              "display": "10"
+            },
+            "discount_status": "unavailable",
+            "net": {
+              "exact": "10",
+              "display": "10"
+            },
+            "usage_rates": null
+          },
+          {
+            "item_id": "00000000-0000-0000-0000-000000010002",
+            "price_id": "00000000-0000-0000-0000-000000020002",
+            "charge_kind": "usage",
+            "cycle": null,
+            "rated": null,
+            "minimum_fee": {
+              "exact": "30",
+              "display": "30"
+            },
+            "minimum_fee_applied": false,
+            "gross": null,
+            "discount_status": "unavailable",
+            "net": null,
+            "usage_rates": {
+              "model": {
+                "model": "volume",
+                "tiers": [
+                  {
+                    "up_to": "10",
+                    "rate": "0.02"
+                  },
+                  {
+                    "up_to": null,
+                    "rate": "0.015"
+                  }
+                ]
+              },
+              "unit": "vm-hour",
+              "rating_window": "billing_cycle"
+            }
+          }
+        ],
+        "rows": [
+          {
+            "charge_kind": "recurring",
+            "amount_status": "committed",
+            "gross": {
+              "exact": "20",
+              "display": "20"
+            },
+            "discount_status": "unavailable",
+            "net": {
+              "exact": "20",
+              "display": "20"
+            },
+            "amount_basis": "finite_term",
+            "recurring_by_cycle": [
+              {
+                "cycle": "month",
+                "gross": {
+                  "exact": "10",
+                  "display": "10"
+                },
+                "net": {
+                  "exact": "10",
+                  "display": "10"
+                }
+              }
+            ]
+          },
+          {
+            "charge_kind": "usage",
+            "amount_status": "uncommitted_usage",
+            "gross": null,
+            "discount_status": "unavailable",
+            "net": null,
+            "amount_basis": null,
+            "recurring_by_cycle": []
+          }
+        ],
+        "horizon": {
+          "term": {
+            "kind": "fixed_periods",
+            "count": 2
+          },
+          "cycle": "month",
+          "periods": 2,
+          "basis": "finite_term"
+        }
+      }
+    ],
+    "order": [
+      {
+        "charge_kind": "recurring",
+        "amount_status": "committed",
+        "gross": {
+          "exact": "140",
+          "display": "140"
+        },
+        "discount_status": "unavailable",
+        "net": {
+          "exact": "140",
+          "display": "140"
+        },
+        "amount_basis": "mixed",
+        "recurring_by_cycle": [
+          {
+            "cycle": "month",
+            "gross": {
+              "exact": "10",
+              "display": "10"
+            },
+            "net": {
+              "exact": "10",
+              "display": "10"
+            }
+          },
+          {
+            "cycle": "year",
+            "gross": {
+              "exact": "120",
+              "display": "120"
+            },
+            "net": {
+              "exact": "120",
+              "display": "120"
+            }
+          }
+        ]
+      },
+      {
+        "charge_kind": "usage",
+        "amount_status": "uncommitted_usage",
+        "gross": null,
+        "discount_status": "unavailable",
+        "net": null,
+        "amount_basis": null,
+        "recurring_by_cycle": []
+      }
+    ],
+    "tcv": {
+      "amount": {
+        "exact": "140",
+        "display": "140"
+      },
+      "basis": "mixed",
+      "evidence": [
+        {
+          "line_id": "00000000-0000-0000-0000-00000000a001",
+          "horizon": {
+            "term": {
+              "kind": "rolling"
+            },
+            "cycle": "year",
+            "periods": 1,
+            "basis": "rolling_annualized"
+          }
+        },
+        {
+          "line_id": "00000000-0000-0000-0000-00000000a002",
+          "horizon": {
+            "term": {
+              "kind": "fixed_periods",
+              "count": 2
+            },
+            "cycle": "month",
+            "periods": 2,
+            "basis": "finite_term"
+          }
+        }
+      ]
+    },
+    "tcv_withheld": [],
+    "engine": {
+      "engine_generation": 1,
+      "engine_digest": "<engine_digest>"
+    }
+  }
+}

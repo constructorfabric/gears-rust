@@ -1,0 +1,178 @@
+{
+  "outcome": {
+    "lines": [
+      {
+        "line_key": "00000000-0000-0000-0000-00000000000f|00000000-0000-0000-0000-000000010001|=|recurring|4000/std|2",
+        "slice_start": "2026-09-01T00:00:00Z",
+        "slice_end": "2026-10-01T00:00:00Z",
+        "item_id": "00000000-0000-0000-0000-000000010001",
+        "dimension_key": null,
+        "dimension_value": null,
+        "sku_id": "00000000-0000-0000-0000-000000040001",
+        "sku_version": 1,
+        "plan_id": "00000000-0000-0000-0000-000000000006",
+        "revision_id": "00000000-0000-0000-0000-000000000007",
+        "price_id": "00000000-0000-0000-0000-000000020001",
+        "price_book_entry_id": "00000000-0000-0000-0000-000000030001",
+        "charge_kind": "recurring",
+        "model_kind": "per_unit",
+        "quantity": "1",
+        "billable_quantity": "1",
+        "band_offset": null,
+        "exact_amount": {
+          "numerator": "1",
+          "denominator": "8",
+          "currency": "EUR",
+          "currency_scale": 2
+        },
+        "currency": "EUR",
+        "currency_scale": 2,
+        "unit": null,
+        "gl_code": "4000",
+        "tax_category": "std",
+        "invoice_line_template": "Pro plan, {period}",
+        "performance_obligation_ref": null,
+        "ssp_snapshot_pointer": null,
+        "snapshot": {
+          "plan_id": "00000000-0000-0000-0000-000000000006",
+          "revision_id": "00000000-0000-0000-0000-000000000007",
+          "resolve_date": "2026-09-01",
+          "bindings": [
+            {
+              "item_id": "00000000-0000-0000-0000-000000010001",
+              "dimension_value": null,
+              "price_id": "00000000-0000-0000-0000-000000020001",
+              "price_book_entry_id": "00000000-0000-0000-0000-000000030001",
+              "money_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "sku_id": "00000000-0000-0000-0000-000000040001",
+              "sku_version": 1,
+              "usage_rating_policy": null,
+              "invoice_inputs": {
+                "template": "Pro plan, {period}",
+                "template_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "template_source": "entry",
+                "gl_code": "4000",
+                "tax_category": "std",
+                "timing": "advance",
+                "rounding": "half_even"
+              },
+              "meter": null,
+              "derived_declaration_digest": null
+            }
+          ],
+          "binding_digest": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+          "fact_id": "00000000-0000-0000-0000-00000000000f",
+          "fact_version": 1,
+          "accepted_binding": {
+            "item_id": "00000000-0000-0000-0000-000000010001",
+            "dimension_value": null,
+            "price_id": "00000000-0000-0000-0000-000000020001"
+          },
+          "engine_generation": 1,
+          "engine_digest": "<engine_digest>"
+        },
+        "lineage": {
+          "price_id": "00000000-0000-0000-0000-000000020001",
+          "money_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "resolve_date": "2026-09-01",
+          "via_default": false,
+          "steps": [
+            {
+              "step": "bind",
+              "pre": null,
+              "post": null
+            },
+            {
+              "step": "meter",
+              "pre": null,
+              "post": null
+            },
+            {
+              "step": "model",
+              "pre": null,
+              "post": {
+                "numerator": "1",
+                "denominator": "8",
+                "currency": "EUR",
+                "currency_scale": 2
+              }
+            },
+            {
+              "step": "prorate",
+              "pre": {
+                "numerator": "1",
+                "denominator": "8",
+                "currency": "EUR",
+                "currency_scale": 2
+              },
+              "post": {
+                "numerator": "1",
+                "denominator": "8",
+                "currency": "EUR",
+                "currency_scale": 2
+              }
+            },
+            {
+              "step": "non_negative",
+              "pre": {
+                "numerator": "1",
+                "denominator": "8",
+                "currency": "EUR",
+                "currency_scale": 2
+              },
+              "post": {
+                "numerator": "1",
+                "denominator": "8",
+                "currency": "EUR",
+                "currency_scale": 2
+              }
+            },
+            {
+              "step": "precision",
+              "pre": {
+                "numerator": "1",
+                "denominator": "8",
+                "currency": "EUR",
+                "currency_scale": 2
+              },
+              "post": {
+                "numerator": "1",
+                "denominator": "8",
+                "currency": "EUR",
+                "currency_scale": 2
+              }
+            }
+          ],
+          "proration": {
+            "covered_seconds": 2592000,
+            "period_seconds": 2592000
+          },
+          "band_placement": null,
+          "granules": [],
+          "clamped_from": null
+        }
+      }
+    ],
+    "obligations": [],
+    "price_totals": [
+      {
+        "price_id": "00000000-0000-0000-0000-000000020001",
+        "currency_scale": 2,
+        "rated": {
+          "numerator": "1",
+          "denominator": "8",
+          "currency": "EUR",
+          "currency_scale": 2
+        },
+        "covered": [
+          {
+            "start": "2026-09-01T00:00:00Z",
+            "end": "2026-10-01T00:00:00Z"
+          }
+        ],
+        "period_seconds": 2592000,
+        "minimum_fee": null
+      }
+    ]
+  }
+}

@@ -257,6 +257,18 @@ jobs:
       - name: Validate packaging metadata (readme/license-file paths)
         run: make check-packaging-metadata
 
+      # Pure crates (the BSS Rating evaluation core and its engine generations) must reach
+      # no tokio, sea-orm, http or ClientHub through their dependency tree (tools/scripts/pure_crates.toml).
+      - name: Pure crates stay free of I/O dependencies
+        if: runner.os == 'Linux'
+        run: make check-pure-crates
+
+      # A BSS Rating engine generation is frozen: its vendored copies must match vendor/LOCK.toml
+      # and the workspace must still resolve its numeric closure to the pinned versions (ADR-0006).
+      - name: Engine generations match their vendored code
+        if: runner.os == 'Linux'
+        run: make check-engine-generations
+
       - name: Validate release configuration (publish flags, release-plz.toml)
         run: make check-release-config
 

@@ -1,0 +1,6 @@
+{
+  "error": {
+    "reason_code": "binding_mismatch",
+    "detail": "the period-start resolve binds item 00000000-0000-0000-0000-000000010001 value None to price 00000000-0000-0000-0000-000000020001; the fact accepted 00000000-0000-0000-0000-000000020999"
+  }
+}

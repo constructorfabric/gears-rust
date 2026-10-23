@@ -1,0 +1,64 @@
+{
+  "floor": [
+    {
+      "price_id": "00000000-0000-0000-0000-000000020001",
+      "currency_scale": 2,
+      "minimum_fee": {
+        "numerator": "30",
+        "denominator": "1",
+        "currency": "EUR",
+        "currency_scale": 2
+      },
+      "covered_seconds": 1296000,
+      "period_seconds": 2592000,
+      "rated": {
+        "numerator": "5",
+        "denominator": "1",
+        "currency": "EUR",
+        "currency_scale": 2
+      },
+      "floor": {
+        "numerator": "15",
+        "denominator": "1",
+        "currency": "EUR",
+        "currency_scale": 2
+      },
+      "topup": {
+        "numerator": "10",
+        "denominator": "1",
+        "currency": "EUR",
+        "currency_scale": 2
+      }
+    },
+    {
+      "price_id": "00000000-0000-0000-0000-000000020001",
+      "currency_scale": 3,
+      "minimum_fee": {
+        "numerator": "30",
+        "denominator": "1",
+        "currency": "EUR",
+        "currency_scale": 3
+      },
+      "covered_seconds": 1296000,
+      "period_seconds": 2592000,
+      "rated": {
+        "numerator": "5",
+        "denominator": "1",
+        "currency": "EUR",
+        "currency_scale": 3
+      },
+      "floor": {
+        "numerator": "15",
+        "denominator": "1",
+        "currency": "EUR",
+        "currency_scale": 3
+      },
+      "topup": {
+        "numerator": "10",
+        "denominator": "1",
+        "currency": "EUR",
+        "currency_scale": 3
+      }
+    }
+  ]
+}

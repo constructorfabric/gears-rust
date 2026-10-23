@@ -1,0 +1,6 @@
+{
+  "error": {
+    "reason_code": "derived_formula_inexact",
+    "detail": "the Add result 100000000000000000000.0000000001 is not exactly a rust_decimal Decimal (a 96-bit coefficient at a scale of at most 28), so Products would round it before the declared rounding"
+  }
+}

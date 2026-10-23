@@ -1,0 +1,134 @@
+{
+  "description": "An uncovered usage cell has no binding and so no derived declaration: it fails price_uncovered in the bind step, never free (DESIGN §3.1).",
+  "vectors": [
+    "V33"
+  ],
+  "input": {
+    "child": {
+      "child_id": "00000000-0000-0000-0000-0000000000c0",
+      "kind": "usage_window",
+      "window": {
+        "window_start": "2026-09-01T00:00:00Z",
+        "window_end": "2026-10-01T00:00:00Z",
+        "served_from": "2026-09-01T00:00:00Z",
+        "served_to": "2026-10-01T00:00:00Z"
+      },
+      "aggregation_key": {
+        "tenant_axes": {
+          "seller_tenant_id": "00000000-0000-0000-0000-00000000000a",
+          "payer_tenant_id": "00000000-0000-0000-0000-00000000000b",
+          "resource_tenant_id": "00000000-0000-0000-0000-00000000000c"
+        },
+        "subscription_id": "00000000-0000-0000-0000-000000000005",
+        "sub_line_key": "plan#1",
+        "item_id": "00000000-0000-0000-0000-000000010001",
+        "meter": "",
+        "dimension_key": null,
+        "scope": {
+          "kind": "subscription_line"
+        }
+      }
+    },
+    "fact": {
+      "fact_id": "00000000-0000-0000-0000-00000000000f",
+      "fact_version": 1,
+      "kind": "usage",
+      "subscription_id": "00000000-0000-0000-0000-000000000005",
+      "sub_line_key": "plan#1",
+      "currency": "EUR",
+      "period": {
+        "start": "2026-09-01T00:00:00Z",
+        "end": "2026-10-01T00:00:00Z"
+      },
+      "served": {
+        "start": "2026-09-01T00:00:00Z",
+        "end": "2026-10-01T00:00:00Z"
+      },
+      "plan_revision_id": "00000000-0000-0000-0000-000000000007",
+      "accepted": [
+        {
+          "item_id": "00000000-0000-0000-0000-000000010001",
+          "dimension_value": null,
+          "price_id": "00000000-0000-0000-0000-000000020001"
+        }
+      ],
+      "quantity": null,
+      "suspensions": [],
+      "suspension_posture": "continue",
+      "adjustments": [],
+      "bundle": null
+    },
+    "pricing": {
+      "plan_id": "00000000-0000-0000-0000-000000000006",
+      "revision_id": "00000000-0000-0000-0000-000000000007",
+      "pins": [
+        {
+          "item_id": "00000000-0000-0000-0000-000000010001",
+          "dimension_value": null,
+          "price_id": "00000000-0000-0000-0000-000000020001"
+        }
+      ],
+      "binding_of_record": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "resolves": [
+        {
+          "resolve_date": "2026-09-01",
+          "binding_digest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+          "cells": [
+            {
+              "selection": {
+                "item_id": "00000000-0000-0000-0000-000000010001",
+                "dimension_value": null
+              },
+              "binding": null
+            }
+          ]
+        }
+      ]
+    },
+    "derived": null,
+    "subscription": {
+      "subscription_id": "00000000-0000-0000-0000-000000000005",
+      "subscription_version": 1,
+      "tenant_axes": {
+        "seller_tenant_id": "00000000-0000-0000-0000-00000000000a",
+        "payer_tenant_id": "00000000-0000-0000-0000-00000000000b",
+        "resource_tenant_id": "00000000-0000-0000-0000-00000000000c"
+      },
+      "plan_id": "00000000-0000-0000-0000-000000000006",
+      "plan_revision_id": "00000000-0000-0000-0000-000000000007",
+      "quantity_intervals": [],
+      "brand": null
+    },
+    "quantities": {
+      "layout_version": 1,
+      "slices": [
+        {
+          "slice_start": "2026-09-01T00:00:00Z",
+          "slice_end": "2026-10-01T00:00:00Z",
+          "q": "8",
+          "q_version": 1,
+          "granules": [
+            {
+              "granule_start": "2026-09-02T08:00:00Z",
+              "inputs": [
+                {
+                  "usage_type_ref": "gts.cf.core.uc.usage_record.v1~cf.test.usage.vm_hours.v1",
+                  "q": "8"
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    "group_context": null,
+    "budget": {
+      "reduced_digits": 256,
+      "scratch_digits": 512
+    },
+    "engine": {
+      "engine_generation": 1,
+      "engine_digest": "<engine_digest>"
+    }
+  }
+}
