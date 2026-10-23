@@ -58,6 +58,7 @@ The steps, states, and formulas are in [DESIGN §3.6](../DESIGN.md#36-interactio
 * The gear owns an operations table, a status guard, a supervisor, and a sweeper.
 * Plugins keep their data consistent when a call is stopped, for example by doing the work in one transaction.
 * Plugins tolerate repeated `apply` and `remove`, because callers retry with a new request.
+* A call started just before the run deadline can overlap the next operation of its application by up to `plugin_call_timeout`; plugins tolerate it like a repeated call.
 * An operation whose replica stops blocks its application until its run deadline.
 
 ### Confirmation
