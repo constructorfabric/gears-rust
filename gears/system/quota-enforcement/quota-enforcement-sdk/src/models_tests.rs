@@ -6,12 +6,15 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 use super::{
-    ActiveQuotaCounts, CapPatch, ContractRef, Decision, DecisionResult, EnforcementMode,
-    EvaluationAttribution, IdempotencySubjectKey, LeaseState, MetricId, MetricKind,
-    NotificationEventKind, OperationType, PageRequest, PageResult, PeriodType, PolicyId,
-    PolicyScope, ProjectionBinding, Quota, QuotaDebitPlan, QuotaDraft, QuotaId, QuotaPatch,
-    QuotaSource, QuotaSpec, QuotaStatus, QuotaType, QuotaView, ResourceProjection, ScopeError,
-    SubjectRef, SubjectScope, TenantId, UnknownValue, ValidityWindow,
+    ActiveQuotaCounts, AttributionDigest, CapPatch, ContractRef, DECISION_BLOB_VERSION,
+    DebitRequest, Decision, DecisionPreview, DecisionResult, EnforcementMode,
+    EvaluationAttribution, IdempotencyRecord, IdempotencyScope, IdempotencySubjectKey, LeaseState,
+    MetricId, MetricKind, NO_APPLICABLE_QUOTA, NotificationEventKind, OperationType, PageRequest,
+    PageResult, PartialIdempotencyWrite, PayloadHash, PeriodType, PolicyId, PolicyScope,
+    ProjectionBinding, Quota, QuotaDebitPlan, QuotaDraft, QuotaId, QuotaPatch, QuotaSource,
+    QuotaSpec, QuotaStatus, QuotaType, QuotaView, ResourceProjection, Retention,
+    RollbackableOperation, ScopeError, SubjectRef, SubjectScope, TenantId, UnknownValue,
+    ValidityWindow, apportion, positive_amount,
 };
 use crate::gts::{SCOPE_TENANT, SCOPE_TYPE, SCOPE_USER};
 
@@ -313,6 +316,25 @@ fn quota_patch_default_is_empty_and_any_field_makes_it_non_empty() {
         serde_json::from_value(json!({ "cap": { "bounded": 10 } })).expect("parse patch");
     assert_eq!(parsed.cap, Some(CapPatch::Bounded(10)));
     assert!(serde_json::from_value::<QuotaPatch>(json!({ "metric": "x" })).is_err());
+}
+
+#[test]
+fn a_client_update_cannot_carry_a_constraint_contract() {
+    let contract = json!({ "type_id": "gts.cf.core.qe.constraint.v1~", "version": 1 });
+    let single = json!({
+        "quota_id": QuotaId::generate(),
+        "patch": { "metadata": {}, "constraint_contract": contract },
+    });
+    let err = serde_json::from_value::<crate::UpdateQuotaRequest>(single)
+        .expect_err("the gear alone names the contract");
+    assert!(err.to_string().contains("constraint_contract"), "{err}");
+    let item = json!({
+        "quota_id": QuotaId::generate(),
+        "patch": { "metadata": {}, "constraint_contract": contract },
+    });
+    let err = serde_json::from_value::<crate::BulkUpdateItem>(item)
+        .expect_err("the gear alone names the contract");
+    assert!(err.to_string().contains("constraint_contract"), "{err}");
 }
 
 #[test]
@@ -735,4 +757,472 @@ fn public_policy_inputs_reject_server_owned_fields() {
         spoofed[field] = json!("caller controlled");
         assert!(serde_json::from_value::<super::PolicyPatch>(spoofed).is_err());
     }
+}
+
+// --- digests ---------------------------------------------------------------
+
+fn subject(projection: &str, id: &str) -> SubjectRef {
+    SubjectRef {
+        projection_type: GtsTypeId::new(projection),
+        subject_id: id.to_owned(),
+    }
+}
+
+#[test]
+fn a_subject_key_ignores_the_order_and_multiplicity_of_its_pairs() {
+    let tenant = subject("gts.cf.core.qe.subj.v1~acme.tenant.v1", "t-1");
+    let user = subject("gts.cf.core.qe.subj.v1~acme.user.v1", "u-9");
+
+    let one = IdempotencySubjectKey::of(&[tenant.clone(), user.clone()]);
+    let other = IdempotencySubjectKey::of(&[user, tenant.clone(), tenant]);
+
+    assert_eq!(one, other);
+}
+
+#[test]
+fn a_subject_key_separates_fields_that_would_otherwise_concatenate_alike() {
+    let split_one = IdempotencySubjectKey::of(&[subject("gts.cf.core.qe.subj.v1~a.xy.v1", "z")]);
+    let split_other = IdempotencySubjectKey::of(&[subject("gts.cf.core.qe.subj.v1~a.x.v1", "yz")]);
+
+    assert_ne!(
+        split_one, split_other,
+        "length prefixes keep the encoding injective"
+    );
+}
+
+#[test]
+fn different_subject_sets_fingerprint_differently() {
+    let one = IdempotencySubjectKey::of(&[subject("gts.cf.core.qe.subj.v1~acme.tenant.v1", "t-1")]);
+    let other =
+        IdempotencySubjectKey::of(&[subject("gts.cf.core.qe.subj.v1~acme.tenant.v1", "t-2")]);
+
+    assert_ne!(one, other);
+}
+
+#[test]
+fn the_empty_subject_set_still_fingerprints_deterministically() {
+    assert_eq!(
+        IdempotencySubjectKey::of(&[]),
+        IdempotencySubjectKey::of(&[])
+    );
+}
+
+#[test]
+fn a_subject_key_is_pinned_to_its_byte_form() {
+    // Golden vector: one pair, each field length-prefixed big-endian.
+    let expected = {
+        use aws_lc_rs::digest::{Context, SHA256};
+        let mut hasher = Context::new(&SHA256);
+        for field in ["gts.cf.core.qe.subj.v1~acme.tenant.v1", "t-1"] {
+            hasher.update(
+                &u32::try_from(field.len())
+                    .expect("short field")
+                    .to_be_bytes(),
+            );
+            hasher.update(field.as_bytes());
+        }
+        {
+            let digest = hasher.finish();
+            let mut bytes = [0; 32];
+            bytes.copy_from_slice(digest.as_ref());
+            IdempotencySubjectKey::from_bytes(bytes)
+        }
+    };
+
+    assert_eq!(
+        IdempotencySubjectKey::of(&[subject("gts.cf.core.qe.subj.v1~acme.tenant.v1", "t-1")]),
+        expected
+    );
+}
+
+#[test]
+fn a_payload_hash_ignores_key_insertion_order_at_every_depth() {
+    let one = json!({"b": 1, "a": {"y": 2, "x": 3}});
+    let other = json!({"a": {"x": 3, "y": 2}, "b": 1});
+
+    assert_eq!(
+        PayloadHash::of_canonical(&one).expect("serializable"),
+        PayloadHash::of_canonical(&other).expect("serializable")
+    );
+}
+
+#[test]
+fn a_payload_hash_respects_array_order_which_carries_meaning() {
+    let one = json!({"subjects": ["a", "b"]});
+    let other = json!({"subjects": ["b", "a"]});
+
+    assert_ne!(
+        PayloadHash::of_canonical(&one).expect("serializable"),
+        PayloadHash::of_canonical(&other).expect("serializable")
+    );
+}
+
+#[test]
+fn a_payload_hash_distinguishes_the_amount_it_covers() {
+    let one = json!({"amount": 1});
+    let other = json!({"amount": 2});
+
+    assert_ne!(
+        PayloadHash::of_canonical(&one).expect("serializable"),
+        PayloadHash::of_canonical(&other).expect("serializable")
+    );
+}
+
+#[test]
+fn an_attribution_digest_is_canonical_in_the_same_way() {
+    let one = json!({"metric": "m", "subjects": [{"kind": "tenant", "id": "t-1"}]});
+    let other = json!({"subjects": [{"id": "t-1", "kind": "tenant"}], "metric": "m"});
+
+    assert_eq!(
+        AttributionDigest::of_canonical(&one).expect("serializable"),
+        AttributionDigest::of_canonical(&other).expect("serializable")
+    );
+    assert_ne!(
+        AttributionDigest::of_canonical(&one)
+            .expect("serializable")
+            .to_hex(),
+        AttributionDigest::of_canonical(&json!({"metric": "other"}))
+            .expect("serializable")
+            .to_hex()
+    );
+}
+
+// --- consumer requests -----------------------------------------------------
+
+#[test]
+fn a_debit_request_ignores_decision_shaped_fields_a_caller_echoed_back() {
+    let request: DebitRequest = serde_json::from_value(json!({
+        "attribution": {
+            "tenant_id": "00000000-0000-0000-0000-000000000001",
+            "metric": "gts.cf.core.qe.metric_type.v1~acme.tokens.v1",
+            "subjects": [{"kind": "gts.cf.core.qe.scope.v1~cf.core.qe.tenant.v1", "id": "t-1"}],
+            "metadata": {}
+        },
+        "amount": 5,
+        "idempotency_key": "k-1",
+        "result": {"outcome": "allowed"},
+        "debit_plan": {},
+        "diagnostics": {"engine": "noise"}
+    }))
+    .expect("server-derived fields are ignored, never rejected");
+
+    assert_eq!(request.amount, 5);
+    assert_eq!(request.idempotency_key, "k-1");
+}
+
+#[test]
+fn an_attribution_inside_a_request_keeps_rejecting_its_own_unknown_fields() {
+    let error = serde_json::from_value::<DebitRequest>(json!({
+        "attribution": {
+            "tenant_id": "00000000-0000-0000-0000-000000000001",
+            "metric": "gts.cf.core.qe.metric_type.v1~acme.tokens.v1",
+            "subjects": [],
+            "metadata": {},
+            "tenant": "typo"
+        },
+        "amount": 5,
+        "idempotency_key": "k-1"
+    }))
+    .expect_err("a misspelled attribution field is still an error");
+
+    assert!(error.to_string().contains("tenant"), "{error}");
+}
+
+#[test]
+fn a_signed_amount_reaches_the_domain_instead_of_failing_deserialization() {
+    let request: DebitRequest = serde_json::from_value(json!({
+        "attribution": {
+            "tenant_id": "00000000-0000-0000-0000-000000000001",
+            "metric": "gts.cf.core.qe.metric_type.v1~acme.tokens.v1",
+            "subjects": [],
+            "metadata": {}
+        },
+        "amount": -3,
+        "idempotency_key": "k-1"
+    }))
+    .expect("a negative amount parses so the domain can answer INVALID_AMOUNT");
+
+    assert_eq!(request.amount, -3);
+    assert_eq!(positive_amount(request.amount), None);
+    assert_eq!(positive_amount(0), None);
+    assert_eq!(positive_amount(7), Some(7));
+    assert_eq!(positive_amount(i64::MAX), Some(9_223_372_036_854_775_807));
+}
+
+#[test]
+fn a_preview_flattens_the_decision_next_to_its_marker() {
+    let preview = DecisionPreview::of(Decision::allowed_with_plan(BTreeMap::new()));
+
+    let value = serde_json::to_value(&preview).expect("serializable");
+    let mut keys: Vec<&str> = value
+        .as_object()
+        .expect("an object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+
+    assert_eq!(
+        keys,
+        vec!["debit_plan", "diagnostics", "preview", "result"],
+        "the decision is flattened next to the marker, adding no envelope"
+    );
+    assert_eq!(value["preview"], json!(true));
+}
+
+// --- idempotency records ---------------------------------------------------
+
+#[test]
+fn a_partial_write_completes_into_the_scope_the_transaction_derived() {
+    let partial = PartialIdempotencyWrite {
+        tenant_id: TenantId::new(Uuid::from_u128(1)),
+        key: "k-1".to_owned(),
+        payload_hash: PayloadHash::of_canonical(&json!({"amount": 5})).expect("serializable"),
+    };
+    let subject_key =
+        IdempotencySubjectKey::of(&[subject("gts.cf.core.qe.subj.v1~acme.tenant.v1", "t-1")]);
+
+    let write = partial.clone().complete(subject_key, OperationType::Credit);
+
+    assert_eq!(write.scope.tenant_id, TenantId::new(Uuid::from_u128(1)));
+    assert_eq!(write.scope.subject_key, subject_key);
+    assert_eq!(write.scope.operation_type, OperationType::Credit);
+    assert_eq!(write.scope.key, "k-1");
+    assert_eq!(write.payload_hash, partial.payload_hash);
+}
+
+#[test]
+fn a_versioned_blob_decodes_into_the_decision_it_recorded() {
+    let record = IdempotencyRecord {
+        scope: IdempotencyScope {
+            tenant_id: TenantId::new(Uuid::from_u128(1)),
+            subject_key: IdempotencySubjectKey::of(&[]),
+            operation_type: OperationType::Debit,
+            key: "k-1".to_owned(),
+        },
+        payload_hash: PayloadHash::of_canonical(&json!({})).expect("serializable"),
+        decision_blob: json!({
+            "__version": DECISION_BLOB_VERSION,
+            "result": {"outcome": "allowed"},
+            "debit_plan": {},
+            "diagnostics": {}
+        }),
+        engine_id: None,
+        policy_id: None,
+        policy_version: None,
+        attribution_hash: None,
+        created_at: ts(0),
+        expires_at: ts(86_400),
+    };
+
+    let decision = record.decision().expect("the blob decodes");
+
+    assert_eq!(decision.result, DecisionResult::Allowed);
+    assert_eq!(decision.denied_reason(), None);
+}
+
+#[test]
+fn a_denial_reports_its_reason_and_whether_it_records_anything() {
+    let denied = Decision {
+        result: DecisionResult::Denied {
+            violated_quota_ids: Vec::new(),
+            reason: NO_APPLICABLE_QUOTA.to_owned(),
+        },
+        debit_plan: BTreeMap::new(),
+        diagnostics: BTreeMap::new(),
+    };
+
+    assert_eq!(denied.denied_reason(), Some(NO_APPLICABLE_QUOTA));
+    assert!(denied.is_no_applicable_quota());
+    assert!(!Decision::allowed_with_plan(BTreeMap::new()).is_no_applicable_quota());
+}
+
+#[test]
+fn retention_reports_the_deadline_only_when_something_was_recorded() {
+    assert_eq!(
+        Retention::Recorded {
+            expires_at: ts(86_400)
+        }
+        .expires_at(),
+        Some(ts(86_400))
+    );
+    assert_eq!(Retention::Unrecorded.expires_at(), None);
+}
+
+// --- commit apportionment --------------------------------------------------
+
+/// The reserved amount a plan was acquired under. Never zero: an acquisition
+/// rejects a non-positive amount long before it reaches storage.
+fn reserved(amount: u64) -> std::num::NonZeroU64 {
+    std::num::NonZeroU64::new(amount).expect("a lease reserves a positive amount")
+}
+
+#[test]
+fn a_commit_charges_the_ceiling_of_its_share_and_never_more_than_a_hold_holds() {
+    // A plan need not hold the reserved amount on every Quota, and may hold
+    // less than it in total; using one unit still charges one.
+    assert_eq!(apportion(&[1], 1, reserved(10)), Ok(vec![1]));
+    // Rounding up rather than to nearest: half a unit used is a unit charged.
+    assert_eq!(apportion(&[3], 1, reserved(2)), Ok(vec![2]));
+    // Whole units split exactly, so no remainder is handed out.
+    assert_eq!(apportion(&[10, 10], 6, reserved(10)), Ok(vec![6, 6]));
+    assert_eq!(apportion(&[10, 5, 5], 6, reserved(10)), Ok(vec![6, 3, 3]));
+    // The unit that rounding creates goes to one hold, not to every hold: the
+    // charged total is the ceiling of the whole, not the sum of ceilings.
+    assert_eq!(apportion(&[1, 1], 1, reserved(2)), Ok(vec![1, 0]));
+    assert_eq!(apportion(&[1, 1, 1], 1, reserved(3)), Ok(vec![1, 0, 0]));
+    // Committing everything keeps every hold whole, and committing nothing
+    // returns every hold.
+    assert_eq!(apportion(&[7, 2], 9, reserved(9)), Ok(vec![7, 2]));
+    assert_eq!(apportion(&[7, 2], 0, reserved(9)), Ok(vec![0, 0]));
+    assert_eq!(apportion(&[], 5, reserved(5)), Ok(Vec::new()));
+}
+
+#[test]
+fn the_apportioned_shares_conserve_the_charged_total_for_every_plan() {
+    // Exhaustive over small plans: the three invariants the commit path relies
+    // on hold for every shape the engine contract permits, not only the ones
+    // spelled out above.
+    for reserved_amount in 1_u64..8 {
+        for actual in 0..=reserved_amount {
+            for first in 0_u64..6 {
+                for second in 0_u64..6 {
+                    for third in 0_u64..6 {
+                        let holds = [first, second, third];
+                        let kept =
+                            apportion(&holds, actual, reserved(reserved_amount)).expect("in range");
+                        let total_held: u64 = holds.iter().sum();
+                        let expected = u64::try_from(
+                            (u128::from(total_held) * u128::from(actual))
+                                .div_ceil(u128::from(reserved_amount)),
+                        )
+                        .expect("a share of the held total fits");
+                        assert_eq!(
+                            kept.iter().sum::<u64>(),
+                            expected,
+                            "holds {holds:?} of {reserved_amount}, committing {actual}"
+                        );
+                        for (kept, held) in kept.iter().zip(&holds) {
+                            assert!(
+                                kept <= held,
+                                "a hold is never charged more than it holds: {holds:?}"
+                            );
+                        }
+                        assert_eq!(
+                            actual > 0 && total_held > 0,
+                            kept.iter().sum::<u64>() > 0,
+                            "any use charges a unit, and no use charges none: {holds:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn apportionment_refuses_an_over_commit_and_reports_overflow_instead_of_panicking() {
+    assert_eq!(
+        apportion(&[10], 11, reserved(10)),
+        Err(crate::models::ApportionError::OverCommit)
+    );
+    // The product of two `u64::MAX`-sized values leaves `u128`; the caller
+    // learns that rather than losing the transaction to a panic.
+    assert_eq!(
+        apportion(&[u64::MAX, u64::MAX], u64::MAX, reserved(u64::MAX)),
+        Err(crate::models::ApportionError::Overflow)
+    );
+}
+
+#[test]
+fn a_rollback_names_the_namespace_of_the_operation_it_reverses() {
+    // A debit and a lease commit can hold the same key over the same subjects,
+    // so the selector is what tells them apart.
+    assert_eq!(
+        RollbackableOperation::Debit.operation_type(),
+        OperationType::Debit
+    );
+    assert_eq!(
+        RollbackableOperation::LeaseCommit.operation_type(),
+        OperationType::Commit
+    );
+    assert_eq!(
+        RollbackableOperation::default(),
+        RollbackableOperation::Debit
+    );
+    // A request written before leases existed still means a debit.
+    let legacy: crate::models::RollbackRequest = serde_json::from_value(json!({
+        "attribution": {
+            "tenant_id": "00000000-0000-0000-0000-000000000001",
+            "metric": "gts.cf.core.qe.metric_type.v1~acme.tokens.v1",
+            "subjects": [],
+            "metadata": {}
+        },
+        "original_idempotency_key": "k-0",
+        "idempotency_key": "k-1"
+    }))
+    .expect("the selector defaults");
+    assert_eq!(legacy.original_operation, RollbackableOperation::Debit);
+}
+
+#[test]
+fn a_batch_is_denied_when_any_item_is_and_keeps_every_item_in_order() {
+    let allowed = crate::Decision::allowed_with_plan(std::collections::BTreeMap::new());
+    let denied = crate::Decision {
+        result: crate::DecisionResult::Denied {
+            violated_quota_ids: Vec::new(),
+            reason: "QUOTA_EXCEEDED".to_owned(),
+        },
+        debit_plan: std::collections::BTreeMap::new(),
+        diagnostics: std::collections::BTreeMap::new(),
+    };
+    let keys = || ["a".to_owned(), "b".to_owned(), "c".to_owned()];
+
+    let mixed = crate::BatchDecision::of(keys(), vec![allowed.clone(), denied, allowed.clone()]);
+    assert_eq!(mixed.result, crate::BatchResult::Denied);
+    let order: Vec<&str> = mixed
+        .items
+        .iter()
+        .map(|i| i.idempotency_key.as_str())
+        .collect();
+    assert_eq!(order, ["a", "b", "c"]);
+
+    let clean = crate::BatchDecision::of(keys(), vec![allowed.clone(), allowed.clone(), allowed]);
+    assert_eq!(clean.result, crate::BatchResult::Allowed);
+}
+
+#[test]
+fn a_batch_record_carries_its_schema_version() {
+    let record = crate::BatchRecord::new(Vec::new());
+    let value = serde_json::to_value(&record).expect("serialize");
+    assert_eq!(
+        value["__version"],
+        serde_json::json!(crate::BatchRecord::VERSION)
+    );
+    let back: crate::BatchRecord = serde_json::from_value(value).expect("deserialize");
+    assert_eq!(back, record);
+}
+
+#[test]
+fn a_batch_timer_is_armed_once_and_shared_by_every_attempt() {
+    let timer = crate::BatchTimer::new(std::time::Duration::from_mins(1));
+    assert!(!timer.expired(), "an unarmed timer has not run out");
+    assert_eq!(
+        timer.armed_remaining(),
+        None,
+        "an unarmed timer bounds nothing"
+    );
+    let first = timer.arm();
+    assert!(timer.armed_remaining().is_some_and(|left| left <= first));
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    let second = timer.arm();
+    assert!(
+        second < first,
+        "the second attempt gets what is left, not a fresh budget"
+    );
+
+    let spent = crate::BatchTimer::new(std::time::Duration::ZERO);
+    assert!(spent.arm().is_zero());
+    assert!(spent.expired());
+    assert_eq!(spent.armed_remaining(), Some(std::time::Duration::ZERO));
 }

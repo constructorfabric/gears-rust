@@ -1,8 +1,9 @@
 use std::time::Duration;
 
 use super::{
-    CatalogSection, ElectionTimingConfig, GaugesSection, MetricsConfig, PoliciesSection,
-    QuotaEnforcementConfig, QuotasSection,
+    CatalogSection, ElectionTimingConfig, GaugesSection, LeasesSection, MetricsConfig,
+    NotificationsSection, OperationsSection, PoliciesSection, QuotaEnforcementConfig,
+    QuotasSection, SnapshotSection,
 };
 
 #[test]
@@ -428,5 +429,196 @@ fn the_gauges_section_keeps_the_sample_fresher_than_the_refresh_interval() {
         serde_json::from_str::<QuotaEnforcementConfig>(r#"{ "quotas": { "max_bytes": 1 } }"#)
             .is_err(),
         "unknown keys are rejected"
+    );
+}
+
+#[test]
+fn the_lease_section_defaults_to_the_platform_window_and_rejects_a_bad_one() {
+    let section = LeasesSection::default();
+    section.validate().expect("defaults are valid");
+    let limits = section.to_limits();
+    assert_eq!(limits.min_ttl, Duration::from_secs(1));
+    assert_eq!(limits.max_ttl, Duration::from_hours(1));
+    assert_eq!(
+        section.to_sweep_timing().expect("timing").interval,
+        Duration::from_mins(1)
+    );
+
+    for bad in [
+        LeasesSection {
+            min_ttl_secs: 0,
+            ..LeasesSection::default()
+        },
+        LeasesSection {
+            min_ttl_secs: 10,
+            max_ttl_secs: 9,
+            ..LeasesSection::default()
+        },
+        LeasesSection {
+            sweep_interval_secs: 0,
+            ..LeasesSection::default()
+        },
+        LeasesSection {
+            sweep_batch_size: 0,
+            ..LeasesSection::default()
+        },
+    ] {
+        assert!(bad.validate().is_err(), "{bad:?} must be rejected");
+    }
+}
+
+#[test]
+fn the_batch_bounds_default_to_the_platform_values_and_reject_zero() {
+    let section = OperationsSection::default();
+    section.validate().expect("defaults are valid");
+    let limits = section.to_batch_limits();
+    assert_eq!(limits.max_items, 100);
+    assert_eq!(limits.timeout, Duration::from_millis(250));
+    assert_eq!(limits, crate::domain::operations::BatchLimits::default());
+
+    for bad in [
+        OperationsSection {
+            max_batch_items: 0,
+            ..OperationsSection::default()
+        },
+        OperationsSection {
+            batch_timeout_ms: 0,
+            ..OperationsSection::default()
+        },
+    ] {
+        assert!(bad.validate().is_err(), "{bad:?} must be rejected");
+    }
+}
+
+#[test]
+fn the_snapshot_bounds_default_to_the_platform_values_and_stay_in_range() {
+    let section = SnapshotSection::default();
+    section.validate().expect("defaults are valid");
+    let limits = section.to_limits();
+    assert_eq!(limits.page_size, 100);
+    assert_eq!(limits.max_filters, 100);
+    assert_eq!(limits, crate::domain::operations::SnapshotLimits::default());
+    SnapshotSection {
+        page_size: SnapshotSection::PAGE_SIZE_CEILING,
+        max_filters: SnapshotSection::MAX_FILTERS_CEILING,
+    }
+    .validate()
+    .expect("the ceilings themselves are allowed");
+
+    for bad in [
+        SnapshotSection {
+            page_size: 0,
+            ..SnapshotSection::default()
+        },
+        SnapshotSection {
+            page_size: SnapshotSection::PAGE_SIZE_CEILING + 1,
+            ..SnapshotSection::default()
+        },
+        SnapshotSection {
+            max_filters: 0,
+            ..SnapshotSection::default()
+        },
+        SnapshotSection {
+            max_filters: SnapshotSection::MAX_FILTERS_CEILING + 1,
+            ..SnapshotSection::default()
+        },
+    ] {
+        assert!(bad.validate().is_err(), "{bad:?} must be rejected");
+    }
+}
+
+#[test]
+fn the_notification_bounds_default_to_ten_attempts_and_two_seconds_and_stay_in_range() {
+    let section = NotificationsSection::default();
+    section.validate().expect("defaults are valid");
+    assert_eq!(section.max_attempts, 10);
+    assert_eq!(section.sink_timeout(), Duration::from_secs(2));
+    NotificationsSection {
+        max_attempts: 1,
+        sink_timeout_ms: 1,
+    }
+    .validate()
+    .expect("the floors themselves are allowed");
+    NotificationsSection {
+        max_attempts: 32_767,
+        sink_timeout_ms: NotificationsSection::SINK_TIMEOUT_CEILING_MS,
+    }
+    .validate()
+    .expect("the ceilings themselves are allowed");
+
+    for bad in [
+        NotificationsSection {
+            max_attempts: 0,
+            ..NotificationsSection::default()
+        },
+        NotificationsSection {
+            max_attempts: 32_768,
+            ..NotificationsSection::default()
+        },
+        NotificationsSection {
+            sink_timeout_ms: 0,
+            ..NotificationsSection::default()
+        },
+        NotificationsSection {
+            sink_timeout_ms: 28_000,
+            ..NotificationsSection::default()
+        },
+    ] {
+        assert!(bad.validate().is_err(), "{bad:?} must be rejected");
+    }
+}
+
+#[test]
+fn the_notification_bounds_are_read_from_their_own_section() {
+    let config: QuotaEnforcementConfig = serde_json::from_value(serde_json::json!({
+        "notifications": { "max_attempts": 3, "sink_timeout_ms": 500 }
+    }))
+    .expect("parse");
+    assert_eq!(
+        config.notifications,
+        NotificationsSection {
+            max_attempts: 3,
+            sink_timeout_ms: 500,
+        }
+    );
+    config.validate().expect("valid");
+}
+
+#[test]
+fn client_wiring_declares_each_contract_and_defaults_to_local() {
+    use toolkit_contract::wiring::ClientWiring;
+
+    let absent = QuotaEnforcementConfig::default();
+    assert!(absent.client_wiring.quota_manager_api.is_none());
+    assert!(absent.client_wiring.quota_enforcement_api.is_none());
+    assert!(absent.client_wiring.quota_operator_api.is_none());
+
+    let split: QuotaEnforcementConfig = serde_json::from_str(
+        r#"{ "client_wiring": {
+            "quota_manager_api": { "transport": "rest", "endpoint": "http://qe:8080" },
+            "quota_enforcement_api": { "transport": "rest", "endpoint": "http://qe:8080" },
+            "quota_operator_api": { "transport": "local" }
+        } }"#,
+    )
+    .expect("a split deployment's wiring parses");
+    assert!(matches!(
+        split.client_wiring.quota_manager_api,
+        Some(ClientWiring::Rest { .. })
+    ));
+    assert!(matches!(
+        split.client_wiring.quota_enforcement_api,
+        Some(ClientWiring::Rest { .. })
+    ));
+    assert!(matches!(
+        split.client_wiring.quota_operator_api,
+        Some(ClientWiring::Local)
+    ));
+
+    assert!(
+        serde_json::from_str::<QuotaEnforcementConfig>(
+            r#"{ "client_wiring": { "quota_manager_client_v1": { "transport": "local" } } }"#
+        )
+        .is_err(),
+        "a contract key QE does not provide is a boot failure, not an ignored setting"
     );
 }

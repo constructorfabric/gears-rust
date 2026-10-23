@@ -6,6 +6,8 @@ pub mod bootstrap;
 pub mod catalog;
 pub mod engines;
 pub mod error;
+pub mod notifications;
+pub mod operations;
 pub mod pep;
 pub mod plugins;
 pub mod policies;

@@ -42,6 +42,7 @@ fn limits() -> QuotaLimits {
         metadata_max_bytes: 4096,
         list_max_limit: 500,
         list_max_ids: 100,
+        bulk_max_items: 50,
     }
 }
 
@@ -186,19 +187,24 @@ fn idem(op: OperationType, key: &str) -> IdempotencyWrite {
 /// A counter mutation through the shared convention: the transaction selects
 /// the policy and evaluates, so these tests state an amount, not a plan.
 async fn debit(storage: &InMemoryStorage, amount: u64, write: &IdempotencyWrite) {
-    let evaluator = quota_enforcement_sdk::testing::ScriptedEvaluator::new();
-    let call = |context: &quota_enforcement_sdk::EvaluationContext<'_>| evaluator.evaluate(context);
+    let evaluator = std::sync::Arc::new(quota_enforcement_sdk::testing::ScriptedEvaluator::new());
+    let call: std::sync::Arc<quota_enforcement_sdk::engine::TransactionEvaluator> =
+        std::sync::Arc::new(
+            move |context: &quota_enforcement_sdk::EvaluationContext<'_>| {
+                evaluator.evaluate(context)
+            },
+        );
     storage
-        .apply_debit_plan(&ctx(), &scope(), &evaluated(amount, write, &call), &[])
+        .apply_debit_plan(&ctx(), &scope(), &evaluated(amount, write, call), &[])
         .await
         .expect("debit");
 }
 
-fn evaluated<'a>(
+fn evaluated(
     amount: u64,
-    write: &'a IdempotencyWrite,
-    call: &'a quota_enforcement_sdk::engine::TransactionEvaluator<'a>,
-) -> quota_enforcement_sdk::EvaluatedMutation<'a> {
+    write: &IdempotencyWrite,
+    call: std::sync::Arc<quota_enforcement_sdk::engine::TransactionEvaluator>,
+) -> quota_enforcement_sdk::EvaluatedMutation<'_> {
     quota_enforcement_sdk::EvaluatedMutation {
         applicable: applicable(),
         amount,
@@ -207,6 +213,7 @@ fn evaluated<'a>(
         user_projection: None,
         limits: test_limits_clamp(),
         idempotency: write,
+        authorized: quota_enforcement_sdk::AttributionDigest::from_bytes([7; 32]),
         evaluate: call,
     }
 }
@@ -775,14 +782,19 @@ async fn ac11_deactivation_resolves_active_leases_once_and_is_terminal() {
         .expect("bootstrap");
     let id = h.create(request()).await;
     let write = idem(OperationType::Reserve, "r");
-    let evaluator = quota_enforcement_sdk::testing::ScriptedEvaluator::new();
-    let call = |context: &quota_enforcement_sdk::EvaluationContext<'_>| evaluator.evaluate(context);
+    let evaluator = std::sync::Arc::new(quota_enforcement_sdk::testing::ScriptedEvaluator::new());
+    let call: std::sync::Arc<quota_enforcement_sdk::engine::TransactionEvaluator> =
+        std::sync::Arc::new(
+            move |context: &quota_enforcement_sdk::EvaluationContext<'_>| {
+                evaluator.evaluate(context)
+            },
+        );
     let acquired = h
         .storage
         .acquire_lease(
             &ctx(),
             &scope(),
-            &evaluated(60, &write, &call),
+            &evaluated(60, &write, call),
             std::time::Duration::from_mins(1),
         )
         .await
@@ -1039,9 +1051,9 @@ async fn the_in_process_conversions_keep_caps_in_range() {
         .await
         .expect("accepted end to end");
     assert_eq!(view.quota.cap, Some(quota_enforcement_sdk::Quota::MAX_CAP));
-    let patch = quota_enforcement_sdk::QuotaPatch {
+    let patch = quota_enforcement_sdk::QuotaUpdate {
         cap: Some(CapPatch::Bounded(u64::MAX)),
-        ..quota_enforcement_sdk::QuotaPatch::default()
+        ..quota_enforcement_sdk::QuotaUpdate::default()
     };
     let err = UpdateQuotaRequest::try_from(patch).expect_err("above i64::MAX");
     assert_eq!(

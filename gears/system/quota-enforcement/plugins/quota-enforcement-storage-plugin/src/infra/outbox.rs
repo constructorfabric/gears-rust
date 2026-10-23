@@ -2,20 +2,38 @@
 //! `NotificationEvent`s in the transaction that writes its rows, through the
 //! toolkit outbox under the plugin's own table prefix.
 //!
-//! The plugin only enqueues. The dispatcher that drains the queue arrives with
-//! the notification feature, which registers the queue's handler on the same
-//! prefix and binds the handle through [`QeOutbox::bind`]. Until a handle is
-//! bound every enqueue fails [`EnqueueError::NotBound`] and the transaction
-//! rolls back, so no mutation can commit without its events; that is harmless
-//! while the storage client is unpublished and must be wired before it is.
+//! The plugin owns the one pipeline of the notification queue:
+//! [`start_notification_pipeline`] declares the queue with its leased handler
+//! (the gear dispatcher's delivery callback behind it) before the outbox
+//! starts, then binds that outbox through [`QeOutbox::bind`]. Until then a
+//! non-empty enqueue fails [`EnqueueError::NotBound`] and its transaction
+//! rolls back, so no mutation commits an event that nothing would deliver; an
+//! empty enqueue succeeds unbound, so bootstrap can run before delivery.
+//!
+//! Every enqueue hands back its outbox `Wake`. A store collects the wakes of
+//! one transaction attempt in an [`AttemptWakes`] and fires them only once the
+//! attempt commits; a rolled-back or abandoned attempt discards them.
 
-use std::sync::{Arc, OnceLock};
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+use std::task::{Context, Poll};
+use std::time::Duration;
 
 use async_trait::async_trait;
-use quota_enforcement_sdk::{NotificationEvent, NotificationScope, TenantId};
+use quota_enforcement_sdk::{
+    NotificationDeliveryHandle, NotificationDeliveryV1, NotificationEvent, NotificationScope,
+    StorageError, TenantId,
+};
 use toolkit_db::Db;
-use toolkit_db::outbox::{Outbox, OutboxError, OutboxHandle, OutboxMessageId, Records};
+use toolkit_db::outbox::{
+    Outbox, OutboxError, OutboxHandle, Partitions, Records, Wake, WorkerTuning,
+};
 use toolkit_db::secure::DBRunner;
+
+use super::outbox_handler::NotificationHandler;
+use crate::domain::ports::NotificationPipeline;
 
 pub use crate::infra::storage::migrations::OUTBOX_TABLE_PREFIX;
 
@@ -25,6 +43,9 @@ pub const NOTIFICATION_QUEUE: &str = "qe_notifications";
 /// Partitions of [`NOTIFICATION_QUEUE`]; a tenant always lands on one
 /// partition, so its events stay ordered.
 pub const NOTIFICATION_PARTITIONS: u16 = 8;
+
+/// Idle poll of a partition processor; a commit wakes only its own replica.
+pub const NOTIFICATION_POLL_INTERVAL: Duration = Duration::from_secs(10);
 
 /// Why an enqueue failed inside the caller's transaction.
 #[derive(Debug, thiserror::Error)]
@@ -40,8 +61,23 @@ pub enum EnqueueError {
     Outbox(#[from] OutboxError),
 }
 
-/// Enqueues notification events on the caller's runner, so they commit with
-/// the rows that caused them.
+/// The outbox a store enqueues into. Every enqueue returns the `Wake` that
+/// announces it, for the transaction attempt that made it to fire after
+/// commit.
+#[async_trait]
+pub trait NotificationOutbox: Send + Sync {
+    /// Enqueue `events` in order on the caller's runner. Nothing is written
+    /// when any event fails; an empty slice writes nothing and needs no bound
+    /// outbox.
+    async fn enqueue(
+        &self,
+        runner: &(dyn DBRunner + Sync),
+        events: &[NotificationEvent],
+    ) -> Result<Wake, EnqueueError>;
+}
+
+/// Enqueues notification events inside one transaction attempt, so they
+/// commit with the rows that caused them.
 #[async_trait]
 pub trait NotificationEnqueuer: Send + Sync {
     /// Enqueue `events` in order. Nothing is written when any event fails.
@@ -49,8 +85,98 @@ pub trait NotificationEnqueuer: Send + Sync {
         &self,
         runner: &(dyn DBRunner + Sync),
         events: &[NotificationEvent],
-    ) -> Result<Vec<OutboxMessageId>, EnqueueError>;
+    ) -> Result<(), EnqueueError>;
 }
+
+/// The wakes of one transaction attempt's enqueues, fired only if the
+/// attempt commits.
+///
+/// A store begins one per attempt and hands its [`Self::enqueuer`] into the
+/// transaction; the attempt's future is wrapped with [`SettleWakes::settling`],
+/// which fires the collected wakes on `Ok` and discards them on `Err` (a
+/// rollback, a lost race, a refused lock that is retried). A retried
+/// operation therefore fires the wakes of its committing attempt only.
+pub struct AttemptWakes {
+    outbox: Arc<dyn NotificationOutbox>,
+    wake: Mutex<Wake>,
+}
+
+impl AttemptWakes {
+    /// A collector for one attempt over `outbox`.
+    #[must_use]
+    pub fn begin(outbox: &Arc<dyn NotificationOutbox>) -> Arc<Self> {
+        Arc::new(Self {
+            outbox: Arc::clone(outbox),
+            wake: Mutex::new(Wake::empty()),
+        })
+    }
+
+    /// The enqueuer the attempt's transaction uses.
+    #[must_use]
+    pub fn enqueuer(self: &Arc<Self>) -> Arc<dyn NotificationEnqueuer> {
+        Arc::clone(self) as Arc<dyn NotificationEnqueuer>
+    }
+
+    /// Fire the collected wakes when the attempt committed, else discard them.
+    fn settle(&self, committed: bool) {
+        let wake = std::mem::replace(
+            &mut *self.wake.lock().unwrap_or_else(PoisonError::into_inner),
+            Wake::empty(),
+        );
+        if committed {
+            wake.fire();
+        } else {
+            wake.discard();
+        }
+    }
+}
+
+#[async_trait]
+impl NotificationEnqueuer for AttemptWakes {
+    async fn enqueue_all(
+        &self,
+        runner: &(dyn DBRunner + Sync),
+        events: &[NotificationEvent],
+    ) -> Result<(), EnqueueError> {
+        let wake = self.outbox.enqueue(runner, events).await?;
+        *self.wake.lock().unwrap_or_else(PoisonError::into_inner) += wake;
+        Ok(())
+    }
+}
+
+/// A transaction attempt that settles its [`AttemptWakes`] when it resolves.
+pub struct Settling<F> {
+    attempt: Pin<Box<F>>,
+    wakes: Option<Arc<AttemptWakes>>,
+}
+
+impl<F, T, E> Future for Settling<F>
+where
+    F: Future<Output = Result<T, E>>,
+{
+    type Output = Result<T, E>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let outcome = std::task::ready!(self.attempt.as_mut().poll(cx));
+        if let Some(wakes) = self.wakes.take() {
+            wakes.settle(outcome.is_ok());
+        }
+        Poll::Ready(outcome)
+    }
+}
+
+/// Settle an attempt's wakes when its transaction resolves.
+pub trait SettleWakes<T, E>: Future<Output = Result<T, E>> + Sized {
+    /// This attempt, firing `wakes` if it commits and discarding them if not.
+    fn settling(self, wakes: Arc<AttemptWakes>) -> Settling<Self> {
+        Settling {
+            attempt: Box::pin(self),
+            wakes: Some(wakes),
+        }
+    }
+}
+
+impl<F, T, E> SettleWakes<T, E> for F where F: Future<Output = Result<T, E>> {}
 
 /// The outbox handle is bound once the pipeline starts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -95,16 +221,20 @@ impl QeOutbox {
 }
 
 #[async_trait]
-impl NotificationEnqueuer for QeOutbox {
-    async fn enqueue_all(
+// @cpt-flow:cpt-cf-quota-enforcement-flow-sink-delivery:p1
+impl NotificationOutbox for QeOutbox {
+    async fn enqueue(
         &self,
         runner: &(dyn DBRunner + Sync),
         events: &[NotificationEvent],
-    ) -> Result<Vec<OutboxMessageId>, EnqueueError> {
-        let outbox = self.outbox.get().ok_or(EnqueueError::NotBound)?;
+    ) -> Result<Wake, EnqueueError> {
+        // @cpt-begin:cpt-cf-quota-enforcement-flow-sink-delivery:p1:inst-del-enqueue
+        // Nothing to write needs no pipeline: bootstrap seeds before delivery
+        // starts.
         let Some(first) = events.first() else {
-            return Ok(Vec::new());
+            return Ok(Wake::empty());
         };
+        let outbox = self.outbox.get().ok_or(EnqueueError::NotBound)?;
         // Every event names its own kind, so the batch default is only the
         // fallback each entity overrides. Nothing traces the batch: a
         // notification is already identified by its own event id.
@@ -119,26 +249,130 @@ impl NotificationEnqueuer for QeOutbox {
             };
             batch = batch.push_with_type(partition, payload, event.kind.as_str());
         }
-        let wake = outbox.enqueue_batch(runner, batch.build()?).await?;
-        let ids = wake.ids().to_vec();
-        // A wake must be fired after the caller's transaction commits, and
-        // this call runs inside it. No handler consumes the queue yet, so the
-        // wake is dropped and the outbox reconciler picks the committed rows
-        // up later. Firing it on commit is part of the dispatcher's definition
-        // of done (notifications feature, `dod-dispatcher`).
-        wake.discard();
-        Ok(ids)
+        // Fired by the caller's attempt once its transaction commits.
+        Ok(outbox.enqueue_batch(runner, batch.build()?).await?)
+        // @cpt-end:cpt-cf-quota-enforcement-flow-sink-delivery:p1:inst-del-enqueue
     }
 }
 
-/// Start the outbox pipeline on `db` with the notification queue registered
-/// and no handler: enough to enqueue. The dispatcher registers its handler
-/// on the same prefix when it lands.
+/// Why the notification pipeline did not start.
+#[derive(Debug, thiserror::Error)]
+pub enum PipelineError {
+    /// The toolkit outbox failed to start.
+    #[error(transparent)]
+    Outbox(#[from] OutboxError),
+    /// A pipeline was already bound to this plugin's outbox handle.
+    #[error(transparent)]
+    AlreadyBound(#[from] AlreadyBound),
+}
+
+/// Start the one pipeline of the notification queue: declare the queue with
+/// its leased handler, which hands every claimed event to `delivery`, start
+/// the outbox, and bind it to `outbox` for enqueueing.
+///
+/// # Errors
+///
+/// [`PipelineError::AlreadyBound`] when `outbox` is already bound: the plugin
+/// never runs a second pipeline. The toolkit error of the start otherwise.
+// @cpt-dod:cpt-cf-quota-enforcement-dod-dispatcher:p1
+// @cpt-state:cpt-cf-quota-enforcement-state-outbox-event:p1
+pub async fn start_notification_pipeline(
+    db: Db,
+    outbox: &QeOutbox,
+    delivery: Arc<dyn NotificationDeliveryV1>,
+) -> Result<OutboxHandle, PipelineError> {
+    if outbox.is_bound() {
+        return Err(AlreadyBound.into());
+    }
+    // @cpt-begin:cpt-cf-quota-enforcement-flow-sink-delivery:p1:inst-del-alo
+    // @cpt-begin:cpt-cf-quota-enforcement-state-outbox-event:p1:inst-obst-reclaim
+    // The default lease drops a handler future at its cancel point, so another
+    // processor re-claims what an expired holder was delivering; the
+    // framework's vacuum workers reclaim delivered rows.
+    let handle = Outbox::builder(db)
+        .table_prefix(OUTBOX_TABLE_PREFIX)?
+        .processor_tuning(
+            WorkerTuning::processor_default().idle_interval(NOTIFICATION_POLL_INTERVAL),
+        )
+        .queue(NOTIFICATION_QUEUE, Partitions::of(NOTIFICATION_PARTITIONS))
+        .leased(NotificationHandler::new(delivery))
+        .start()
+        .await?;
+    // @cpt-end:cpt-cf-quota-enforcement-state-outbox-event:p1:inst-obst-reclaim
+    // @cpt-end:cpt-cf-quota-enforcement-flow-sink-delivery:p1:inst-del-alo
+    outbox.bind(Arc::clone(handle.outbox()))?;
+    Ok(handle)
+}
+
+/// The SQL plugin's one notification pipeline: its database and the outbox
+/// handle every store enqueues through.
+pub struct SqlNotificationPipeline {
+    db: Db,
+    outbox: Arc<QeOutbox>,
+    started: AtomicBool,
+}
+
+impl SqlNotificationPipeline {
+    /// The pipeline over `db`, binding `outbox` when it starts.
+    #[must_use]
+    pub fn new(db: Db, outbox: Arc<QeOutbox>) -> Self {
+        Self {
+            db,
+            outbox,
+            started: AtomicBool::new(false),
+        }
+    }
+}
+
+#[async_trait]
+impl NotificationPipeline for SqlNotificationPipeline {
+    async fn start(
+        &self,
+        delivery: Arc<dyn NotificationDeliveryV1>,
+    ) -> Result<Box<dyn NotificationDeliveryHandle>, StorageError> {
+        // Claimed before anything starts, so two concurrent calls can never
+        // both run a pipeline.
+        if self.started.swap(true, Ordering::SeqCst) || self.outbox.is_bound() {
+            return Err(StorageError::Internal(
+                "the notification pipeline is already started".to_owned(),
+            ));
+        }
+        match start_notification_pipeline(self.db.clone(), &self.outbox, delivery).await {
+            Ok(handle) => Ok(Box::new(PipelineHandle(handle))),
+            Err(error) => {
+                self.started.store(false, Ordering::SeqCst);
+                tracing::warn!(
+                    target: "qe.storage",
+                    error = %error,
+                    "the notification pipeline failed to start"
+                );
+                Err(StorageError::Unavailable(
+                    "the notification pipeline failed to start".to_owned(),
+                ))
+            }
+        }
+    }
+}
+
+/// A started pipeline; stopping it cancels its workers and waits for them.
+struct PipelineHandle(OutboxHandle);
+
+#[async_trait]
+impl NotificationDeliveryHandle for PipelineHandle {
+    async fn stop(self: Box<Self>) {
+        self.0.stop().await;
+    }
+}
+
+/// Start the outbox on `db` with the notification queue registered and **no
+/// handler**, for tests that inspect enqueued rows: nothing ever drains them.
+/// Production starts the queue only through [`start_notification_pipeline`].
 ///
 /// # Errors
 ///
 /// The toolkit error of the start or the queue registration.
-pub async fn start_outbox(db: Db) -> Result<OutboxHandle, OutboxError> {
+#[cfg(any(test, feature = "test-util"))]
+pub async fn start_undelivered_outbox(db: Db) -> Result<OutboxHandle, OutboxError> {
     let handle = Outbox::builder(db.clone())
         .table_prefix(OUTBOX_TABLE_PREFIX)?
         .start()

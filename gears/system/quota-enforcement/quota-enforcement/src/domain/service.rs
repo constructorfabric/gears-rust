@@ -15,6 +15,25 @@ use super::ports::coordination::SingletonCoordinator;
 use super::quotas::{QuotaLimits, QuotaManagement};
 use super::readiness::Readiness;
 
+/// Process-local runtime bounds of the hot path, passed at construction
+/// because they are neither PDP state nor bootstrap dependencies.
+#[domain_model]
+#[derive(Debug, Clone, Copy)]
+pub struct OperationsRuntime {
+    /// Replay records the cache holds.
+    pub cache_entries: usize,
+    /// How long a cached record may answer.
+    pub cache_ttl: std::time::Duration,
+    /// How many preparations one operation may trigger.
+    pub preparation_max_attempts: std::num::NonZeroU32,
+    /// The TTL window lease acquisitions are checked against.
+    pub leases: super::operations::LeaseLimits,
+    /// The batch debit's item limit and timeout.
+    pub batch: super::operations::BatchLimits,
+    /// The snapshot read's page size and subject bound.
+    pub snapshot: super::operations::SnapshotLimits,
+}
+
 /// Composition root of the domain. Handlers and the in-process client reach
 /// every dependency through it.
 #[domain_model]
@@ -25,6 +44,12 @@ pub struct Service {
     policy_limits: PolicyRuntimeLimits,
     bound: OnceLock<Bound>,
     policy_schemas: OnceLock<super::policies::schemas::CatalogPolicySchemas>,
+    operations: super::operations::IdempotencyCache,
+    evaluation: quota_enforcement_sdk::engine::EvaluationLimits,
+    preparation_max_attempts: std::num::NonZeroU32,
+    leases: super::operations::LeaseLimits,
+    batch: super::operations::BatchLimits,
+    snapshot: super::operations::SnapshotLimits,
 }
 
 impl Service {
@@ -35,6 +60,7 @@ impl Service {
         readiness: Arc<Readiness>,
         limits: QuotaLimits,
         policy_limits: PolicyRuntimeLimits,
+        operations: OperationsRuntime,
     ) -> Self {
         Self {
             admission,
@@ -43,6 +69,15 @@ impl Service {
             policy_limits,
             bound: OnceLock::new(),
             policy_schemas: OnceLock::new(),
+            operations: super::operations::IdempotencyCache::new(
+                operations.cache_entries,
+                operations.cache_ttl,
+            ),
+            evaluation: policy_limits.evaluation,
+            preparation_max_attempts: operations.preparation_max_attempts,
+            leases: operations.leases,
+            batch: operations.batch,
+            snapshot: operations.snapshot,
         }
     }
 
@@ -154,6 +189,37 @@ impl Service {
             schemas,
             metrics: self.admission.metrics(),
             limits: self.policy_limits.authoring,
+        })
+    }
+
+    /// The consumption hot path: debit, credit, rollback, preview, and leases.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DomainError::NotReady`] before bootstrap completed.
+    pub fn operations(&self) -> Result<super::operations::Operations<'_>, DomainError> {
+        let bound = self.bound.get().ok_or(DomainError::NotReady {
+            dependency: Dependency::Storage,
+        })?;
+        Ok(super::operations::Operations {
+            admission: &self.admission,
+            attribution: Attribution::new(
+                &self.admission,
+                &bound.catalog,
+                self.admission.metrics(),
+            ),
+            catalog: &bound.catalog,
+            classifications: &bound.classifications,
+            storage: bound.storage.as_ref(),
+            engines: Arc::clone(&bound.engines),
+            artifacts: Arc::clone(&bound.artifacts),
+            idempotency: &self.operations,
+            metrics: self.admission.metrics_handle(),
+            evaluation: self.evaluation,
+            preparation_max_attempts: self.preparation_max_attempts,
+            leases: self.leases,
+            batch: self.batch,
+            snapshot: self.snapshot,
         })
     }
 

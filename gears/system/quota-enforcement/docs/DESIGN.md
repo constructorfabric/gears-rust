@@ -594,7 +594,7 @@ through `EvaluationOrchestrator` into the storage plugin (phase-2). Does not own
 
 Public S2S surface for eight consumer operations: `debit`, `rollback`, `reserve`, `commit`, `release`, `batch_debit`,
 `evaluate_preview`, and `snapshot`, plus the management-plane `credit`, which is served on the same surface but
-authorized as its own action and exposed in the SDK on `QuotaManagerClientV1` only.
+authorized as its own action and exposed in the SDK on `QuotaManagerApi` only.
 
 ##### Responsibility scope
 
@@ -1047,7 +1047,7 @@ Identifiers under the `gts.cf.core.qe.*` package:
 | Contract lifecycle preconditions: `ProjectionNotResolvable`, `ContractSnapshotUnavailable`, `ConstraintContractMismatch`, `PolicyContractPairIncompatible`                                                                                                                                       | `FailedPrecondition` | 400  | stable precondition reason; Quota/Policy write rejected before persistence                                                                         |
 | Semantic precondition: `ThresholdsRequireBoundedCap`, `CapBelowConsumed`, `LeaseNotActive`, `OverCommitNotAuthorized`, `PeriodClosed`, `MetricNotQuotaGated`, `MetricNotRegistered`, `QuotaDeactivated`, `UnknownEngine`, `CannotDeleteSeededGlobalPolicy`, `UnknownPolicyVersion`, `VersionRolledBack` | `FailedPrecondition` | 400  | matching `UPPER_SNAKE` token (precondition violation)                                                                                              |
 | `PdpDenied`                                                                                                                                                                                                                                                                                             | `PermissionDenied`   | 403  | —                                                                                                                                                  |
-| `NotFound { kind, id }`                                                                                                                                                                                                                                                                                 | `NotFound`           | 404  | `kind` selects `type` and its `UNKNOWN_*` token (`UNKNOWN_QUOTA`, `UNKNOWN_OPERATION`); `id` populates `resource_name`                              |
+| `NotFound { kind, id }`                                                                                                                                                                                                                                                                                 | `NotFound`           | 404  | `kind` selects `type`; a Quota or operation `detail` leads with its token (`UNKNOWN_QUOTA`, `UNKNOWN_OPERATION`); `id` populates `resource_name`    |
 | Concurrency conflict: `IdempotencyPayloadMismatch`, `VersionConflict`, `LeaseContentionTimeout`                                                                                                                                                                                                         | `Aborted`            | 409  | matching `UPPER_SNAKE` token; safe to retry                                                                                                        |
 | `LeaseInflightLimitExceeded`, `EngineCostExceeded`                                                                                                                                                                                                                                                      | `ResourceExhausted`  | 429  | `LEASE_INFLIGHT_LIMIT_EXCEEDED` (`subject = "(tenant, metric)"`); `ENGINE_COST_EXCEEDED` (`subject = "engine"`)                                    |
 | `NotYetImplemented`                                                                                                                                                                                                                                                                                     | `Unimplemented`      | 501  | —                                                                                                                                                  |
@@ -1087,7 +1087,7 @@ Three traits split by actor role; every method is async, takes a `SecurityContex
 engine, notification sink) is bound `Send + Sync + 'static` so it registers in ToolKit's
 `ClientHub` (`ClientHub::register` requires those bounds), and async trait methods return `Send` futures.
 
-**`QuotaEnforcementClientV1`** — Quota Consumer surface:
+**`QuotaEnforcementApi`** — Quota Consumer surface:
 
 | Method                                    | Returns                     | Realises                                                                                                                                                                                                                                                      |
 | ----------------------------------------- | --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -1104,36 +1104,44 @@ engine, notification sink) is bound `Send + Sync + 'static` so it registers in T
 `Denied { decision: Decision }`. A bare `LeaseToken` return cannot represent a `Denied` reserve, which PRD §3.4
 requires to surface as a Decision verdict at HTTP 200, never as an error.
 
-**`QuotaManagerClientV1`** — Quota Manager surface:
+**`QuotaManagerApi`** — Quota Manager surface:
 
 | Method                                      | Returns                         | Realises                                                                                                                                          |
 | ------------------------------------------- | ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `create_quota(spec: QuotaSpec)`             | `QuotaId`                       | `cpt-cf-quota-enforcement-fr-quota-lifecycle`; the public create shape carries no `constraint_contract`, the gear fills it from the catalogue        |
-| `update_quota(id, patch)`                   | `()`                            | `cpt-cf-quota-enforcement-fr-quota-lifecycle`                                                                                                     |
+| `update_quota(req: UpdateQuotaRequest)`     | `()`                            | `cpt-cf-quota-enforcement-fr-quota-lifecycle`; the update shape `QuotaUpdate` carries no `constraint_contract`, the gear fills it with `metadata`    |
 | `deactivate_quota(id)`                      | `DeactivateOutcome`             | `cpt-cf-quota-enforcement-fr-quota-lifecycle` (cascade resolved leases)                                                                           |
-| `read_quotas(filter, page)`                 | `PageResult<QuotaView>`         | `cpt-cf-quota-enforcement-fr-quota-lifecycle`; the public read shape is the stored `Quota` plus the server-computed `currently_within_window` (one clock reading per response) and the current `metric_kind` (`null` when the registry no longer knows the metric); storage `read_quotas` keeps returning `PageResult<Quota>` |
+| `read_quotas(req: ReadQuotasRequest)`       | `PageResult<QuotaView>`         | `cpt-cf-quota-enforcement-fr-quota-lifecycle`; the public read shape is the stored `Quota` plus the server-computed `currently_within_window` (one clock reading per response) and the current `metric_kind` (`null` when the registry no longer knows the metric); storage `read_quotas` keeps returning `PageResult<Quota>` |
 | `credit(req: CreditRequest)`                | `Decision`                      | `cpt-cf-quota-enforcement-fr-credit` (management-plane counter correction, authorized as its own action) |
 | `evaluate_preview(req: ManagementPreviewRequest)` | `DecisionPreview`          | Explicit target under manager PDP scope; `cpt-cf-quota-enforcement-fr-evaluate-preview`                                                           |
 | `snapshot(req: ManagementSnapshotRequest)`  | `PageResult<QuotaSnapshot>`      | Explicit target under manager PDP scope; snapshot read requirements                                                                                |
 
-**`QuotaOperatorClientV1`** — Platform Operator surface. Quota Resolution Policy lifecycle methods are
+**`QuotaOperatorApi`** — Platform Operator surface. Quota Resolution Policy lifecycle methods are
 operator-only per `cpt-cf-quota-enforcement-fr-authorization` and deliberately absent from
-`QuotaManagerClientV1`; explicit-target reads and previews are available on both surfaces under different PDP grants:
+`QuotaManagerApi`; explicit-target reads and previews are available on both surfaces under different PDP grants:
 
 | Method                                      | Returns                         | Realises                                                                                                                                          |
 | ------------------------------------------- | ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `create_policy(p: PolicyDraft)`             | `PolicyVersion`                 | `cpt-cf-quota-enforcement-fr-quota-resolution-policy-versioning`; an active Policy at the same scope is rejected with `PolicyScopeOccupied` (409 `POLICY_SCOPE_OCCUPIED`)                                                                                  |
-| `update_policy(scope, if_match_version, p)` | `PolicyVersion`                 | same — creates new immutable version; `if_match_version` enforces lost-update protection (PRD §5.9), rejected with `VERSION_CONFLICT` on mismatch |
-| `rollback_policy(scope, target)`            | `PolicyVersion`                 | same — rollback to prior version                                                                                                                  |
-| `delete_policy(scope)`                      | `()`                            | same — soft-delete, narrow-scope only                                                                                                             |
-| `list_policy_versions(scope, page)`         | `PageResult<PolicyVersionMeta>` | same                                                                                                                                              |
+| `update_policy(req: UpdatePolicyRequest)`   | `PolicyVersion`                 | same — creates new immutable version; `if_match_version` enforces lost-update protection (PRD §5.9), rejected with `VERSION_CONFLICT` on mismatch |
+| `rollback_policy(req: RollbackPolicyRequest)` | `PolicyVersion`                 | same — rollback to prior version                                                                                                                  |
+| `delete_policy(req: DeletePolicyRequest)`   | `()`                            | same — soft-delete, narrow-scope only                                                                                                             |
+| `list_policy_versions(req: ListPolicyVersionsRequest)` | `PageResult<PolicyVersionMeta>` | same                                                                                                                                              |
 | `evaluate_preview(req: ManagementPreviewRequest)` | `DecisionPreview`        | Explicit target under operator PDP scope                                                                                                          |
 | `snapshot(req: ManagementSnapshotRequest)`  | `PageResult<QuotaSnapshot>`     | Explicit target under operator PDP scope                                                                                                          |
 
-All three traits are implemented by `quota-enforcement-sdk-rest-client` (HTTP transport) and by
-`quota-enforcement-sdk-in-process` (direct in-process call when QE is bundled in the caller's binary). Cross-gear
-callers MUST use the SDK and MUST NOT depend on the QE gateway's internal types
-(`cpt-cf-quota-enforcement-constraint-toolkit`).
+Each trait is a ToolKit `#[toolkit::contract]` (`version = "v1"`); a method with more than one argument takes one
+request struct, so every method maps to one JSON body. The gear provides each contract with
+`#[toolkit::provides(transports = [local, rest])]`: by default `ClientHub` holds the in-process implementation, and
+`client_wiring.<contract>` in the gear configuration can wire a generated REST client instead. The SDK's
+`#[toolkit::rest_contract]` projections (`rest` module; features `rest-client` and `rest-server`) generate those
+clients and the server routes: `POST /quota-enforcement/v1/...`, one route per method, internal (not exposed at the
+edge) and authenticated. They run on the tenant plane: the client forwards the caller's bearer token, the route
+rebuilds the `SecurityContext` from the re-validated token, so the PDP judges the original caller. The gear serves
+these routes from its own domain service, never from the `ClientHub` client, and they sit beside the public REST
+API above, which is unchanged. Retries follow the idempotency key: reads and keyed writes are retryable, unkeyed
+writes (Quota create, update and deactivate, and every policy write) are not. Cross-gear callers MUST use the SDK
+and MUST NOT depend on the QE gateway's internal types (`cpt-cf-quota-enforcement-constraint-toolkit`).
 
 #### Storage Plugin Trait
 
@@ -1192,7 +1200,10 @@ runtime, so it has no `DomainError` lift target. The full `DomainError` enum liv
 - **I2. Idempotency** — replay returns the original outcome verbatim; mismatched payload under same `idem_key` returns
   `IdempotencyPayloadMismatch`.
 - **I3. Read-only** — `read_*`, `list_*`, `lookup_idempotency` MUST NOT write persistent state.
-  **Lazy period-row creation in `read_quota_snapshot`** is the single permitted exception.
+  **Lazy period-row creation in the snapshot reads** (`read_quota_snapshot`, `bulk_read_quota_snapshot`) is the
+  single permitted exception: the current window's row of an active consumption Quota within its validity window,
+  with nothing settled and no event emitted; closing the elapsed period belongs to the mutating operation that crosses
+  the boundary.
 - **I4. Lease lazy expiry** — read and write paths treat any lease with `expiry_at <= now()` as released regardless of
   physical row presence.
 - **I5. Period attribution** — lease `commit` / `release` (and TTL auto-release) attribute counter mutation to the
@@ -2076,19 +2087,22 @@ sequenceDiagram
     participant EO as EvaluationOrchestrator
     participant SP as StoragePlugin
 
-    EO ->> SP: read_quota_snapshot(applicable, metric)
-    Note over SP: For each consumption Quota:<br/>SELECT counter row FOR period_end > now() OR row missing
+    EO ->> SP: mutating primitive (debit / lease commit / lease release), in its transaction
+    Note over SP: For each consumption Quota it touches:<br/>lock the latest counter row, compare period_end with now()
     alt current period row exists
-        SP -->> EO: Vec<QuotaSnapshot>
-    else period boundary crossed (lazy detection, I3 exception)
-        SP ->> SP: BEGIN nested or piggyback tx<br/>1. Mark closing-period row is_settled=true after every active lease with<br/>   acquisition_period=closing has resolved (settlement window per `cpt-cf-quota-enforcement-adr-settlement-window-emit`)<br/>2. INSERT new period row (consumed=0, highest_crossed_threshold_pct=NULL)<br/>3. Enqueue period-rollover event (closing_consumed, closing_cap, new_period_boundary)
-        SP -->> EO: Vec<QuotaSnapshot> (with new period row)
+        SP ->> SP: apply the mutation to the current row
+    else period boundary crossed (lazy detection)
+        SP ->> SP: same tx<br/>1. Mark closing-period row is_settled=true after every active lease with<br/>   acquisition_period=closing has resolved (settlement window per `cpt-cf-quota-enforcement-adr-settlement-window-emit`)<br/>2. INSERT new period row (consumed=0, highest_crossed_threshold_pct=NULL)<br/>3. Enqueue period-rollover event (closing_consumed, closing_cap, new_period_boundary)<br/>4. apply the mutation to the new row
     end
+    SP -->> EO: MutationResult
+    Note over EO,SP: A snapshot read (read_quota_snapshot / bulk_read_quota_snapshot) that meets a crossed boundary<br/>only creates the current window's row of a Quota within its validity window (the I3 exception):<br/>it settles nothing and emits no event; the next mutating operation closes the period
 ```
 
-**Description.** Lazy period detection (`cpt-cf-quota-enforcement-fr-period-rollover`). On any evaluate that observes
-`now() >= period_end` for a consumption Quota, the storage plugin atomically materialises the new period row, emits the
-`period-rollover` event for the closing period, and resets the threshold marker. The new `quota_consumption_counters`
+**Description.** Lazy period detection (`cpt-cf-quota-enforcement-fr-period-rollover`). On any mutating operation that
+observes `now() >= period_end` for a consumption Quota, the storage plugin atomically settles the closing period,
+materialises the new period row, emits the `period-rollover` event for the closing period, and resets the threshold
+marker. A snapshot read that observes the same boundary creates only the new period row, and only for a Quota within
+its validity window (I3); settlement and the event with the closing figures wait for the next mutating operation. The new `quota_consumption_counters`
 row MUST carry `highest_crossed_threshold_pct = NULL` per storage-plugin invariant **I13** (PRD §5.15: "the marker
 resets at period rollover so thresholds can fire again in the new period"; threshold-emission rule of
 `cpt-cf-quota-enforcement-fr-notification-plugin`). During the settlement window (between `period_end` and the moment
