@@ -258,7 +258,7 @@ The system **MUST** treat the application version as opaque text. It **MUST NOT*
 
 The system **MUST** require a section for every section key, and **MUST** treat as invalid a manifest with a missing section or with a key that no section plugin owns. The result **MUST** name the missing or unknown keys. When no section plugin exists, a valid manifest has an empty set of sections.
 
-- **Rationale**: Strict rules keep every section plugin in step with every application and make a wrong manifest visible at once.
+- **Rationale**: Strict rules keep every section plugin in step with every application and make a wrong manifest visible at once. Adding a section plugin therefore fails every next seed whose manifest lacks the new section, on purpose: each seeding caller must add that section to its manifest before seeding again.
 - **Actors**: `cpt-cf-application-manager-actor-seeding-caller`
 
 #### Unique Section Keys
@@ -332,7 +332,7 @@ The system **MUST** run every accepted seed and uninstall request as an operatio
 
 - [ ] `p1` - **ID**: `cpt-cf-application-manager-fr-one-operation-per-application`
 
-The system **MUST** run at most one seed or uninstall operation per application at a time. While an operation for an application is accepted or running, a new request for the same application **MUST** be refused at once as conflict, and the refusal **MUST** name the running operation. Operations for different applications **MUST NOT** wait for each other.
+The system **MUST** run at most one seed or uninstall operation per application at a time. While an operation for an application is accepted or running, a new request for the same application **MUST** be refused at once as conflict, and the refusal **MUST** name the running operation. Operations for different applications **MUST NOT** wait for each other. A section-plugin call that an operation started before the end of its run window **MAY** still be running when the next operation for the application starts.
 
 - **Rationale**: Overlapping operations for one application would interleave dispatches to the section plugins. One operation at a time gives each application one clear current state.
 - **Actors**: `cpt-cf-application-manager-actor-seeding-caller`, `cpt-cf-application-manager-actor-operator`

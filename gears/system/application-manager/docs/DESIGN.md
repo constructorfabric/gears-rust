@@ -296,7 +296,7 @@ stateDiagram-v2
     Interrupted --> [*]
 ```
 
-- **Run deadline.** Set at acceptance ([§4.2](#42-configuration)). No plugin call starts after it.
+- **Run deadline.** Set at acceptance ([§4.2](#42-configuration)). No plugin call starts after it; a call started before it can run up to `plugin_call_timeout` past it, and can overlap the next operation of the same application.
 - **Status guard.** Writes match only an open record before its deadline; the interruption step matches only one past it. The first final write wins.
 - **Interruption step.** One transaction sets interrupted, keeps the section outcomes so far, and inserts the finished event. The sweeper, the operation read, and the acceptance run it on an expired open operation, which covers a lost task and a failed final transaction.
 - **Supervisor completion.** When a request task fails after acceptance, the operation goes Running, then Completed as internal failure, with `not_dispatched` for plugins not yet called.
