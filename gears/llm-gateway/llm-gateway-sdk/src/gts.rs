@@ -10,6 +10,11 @@
 //! (e.g. `gts.cf.genai.model.info.v1~cf.genai._.openai.v1~`). The gateway
 //! resolves the model, reads its `gts_type`, and picks the plugin whose
 //! `provider_type` matches (ties broken on `PluginV1.priority`).
+//!
+//! The instance's `tool_namespace` is the prefix of the provider-specific
+//! tools the plugin accepts (`openai` for `openai:shell`); a provider tool
+//! whose prefix does not match is rejected with `validation_error`
+//! (`cpt-cf-llm-gateway-fr-provider-tools-v1`).
 
 use gts::GtsTypeId;
 use toolkit::gts::PluginV1;
@@ -36,6 +41,7 @@ use toolkit_gts::gts_type_schema;
 ///     priority: 100,
 ///     properties: LlmGatewayProviderPluginSpecV1 {
 ///         provider_type: GtsTypeId::new("gts.cf.genai.model.info.v1~cf.genai._.openai.v1~"),
+///         tool_namespace: "openai".to_owned(),
 ///     },
 /// };
 ///
@@ -46,11 +52,14 @@ use toolkit_gts::gts_type_schema;
     base = PluginV1,
     type_id = gts_id!("cf.toolkit.plugins.plugin.v1~cf.llmgw.provider.plugin.v1~"),
     description = "LLM Gateway provider plugin specification",
-    properties = "provider_type",
+    properties = "provider_type,tool_namespace",
 )]
 pub struct LlmGatewayProviderPluginSpecV1 {
     /// Model Registry provider identity this plugin serves — the model-info
     /// `gts_type` (e.g. `gts.cf.genai.model.info.v1~cf.genai._.openai.v1~`).
     /// Matched against `ModelInfoV1.gts_type` during plugin resolution.
     pub provider_type: GtsTypeId,
+    /// Prefix of the provider-specific tools this plugin accepts (e.g.
+    /// `openai` for `openai:shell`).
+    pub tool_namespace: String,
 }

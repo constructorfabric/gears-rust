@@ -67,6 +67,10 @@ pub enum OutputItem {
     /// Binary data output (Gears extension).
     #[serde(rename = "cf_gears:data")]
     Data(DataOutput),
+    /// A web search the provider ran for the Gateway web search tool,
+    /// normalized across providers (`cpt-cf-llm-gateway-fr-web-search-v1`).
+    #[serde(rename = "cf:web_search_call")]
+    WebSearchCall(WebSearchCallOutput),
     /// An item `type` the core does not own, preserved verbatim.
     #[serde(untagged)]
     Other(Extension),
@@ -203,6 +207,35 @@ pub struct DataOutput {
     pub url: Option<String>,
 }
 
+/// Normalized web search call output item (`cf:web_search_call`).
+#[derive(
+    Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
+)]
+pub struct WebSearchCallOutput {
+    /// Unique item identifier.
+    pub id: String,
+    /// Item lifecycle status.
+    pub status: ItemStatus,
+    /// Search queries the provider ran, when it reports them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub queries: Vec<String>,
+    /// Sources the provider found, when it reports them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub results: Vec<WebSearchResult>,
+}
+
+/// One web search result.
+#[derive(
+    Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
+)]
+pub struct WebSearchResult {
+    /// Result URL.
+    pub url: String,
+    /// Result title, when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+}
+
 // ---------------------------------------------------------------------------
 // Shared item helpers
 // ---------------------------------------------------------------------------
@@ -282,6 +315,20 @@ mod tests {
         });
         let item: OutputItem = serde_json::from_value(wire.clone()).unwrap();
         assert!(matches!(item, OutputItem::FunctionCall(_)));
+        assert_eq!(serde_json::to_value(&item).unwrap(), wire);
+    }
+
+    #[test]
+    fn web_search_call_output_roundtrips() {
+        let wire = serde_json::json!({
+            "type": "cf:web_search_call",
+            "id": "ws_1",
+            "status": "completed",
+            "queries": ["rust serde"],
+            "results": [{ "url": "https://serde.rs", "title": "Serde" }]
+        });
+        let item: OutputItem = serde_json::from_value(wire.clone()).unwrap();
+        assert!(matches!(item, OutputItem::WebSearchCall(_)));
         assert_eq!(serde_json::to_value(&item).unwrap(), wire);
     }
 

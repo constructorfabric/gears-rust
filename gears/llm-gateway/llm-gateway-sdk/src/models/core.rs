@@ -8,6 +8,8 @@
 
 use std::collections::HashMap;
 
+use rust_decimal::Decimal;
+
 use crate::models::{items, tools};
 
 // ---------------------------------------------------------------------------
@@ -18,6 +20,11 @@ use crate::models::{items, tools};
 ///
 /// Aside from `model`, every field is optional; an absent field defers to the
 /// gateway/provider default.
+///
+/// The body has no fields for provider-side conversation state
+/// (`previous_response_id`, `store`): the Gateway is stateless and consumers
+/// send the full context with every request
+/// (`cpt-cf-llm-gateway-fr-chat-completion-v1`).
 #[derive(
     Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
 )]
@@ -60,6 +67,9 @@ pub struct CreateResponseBody {
     /// Maximum number of tool calls (schema minimum 1).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_tool_calls: Option<u32>,
+    /// Sampling seed for reproducible generation, where the provider supports it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub seed: Option<i64>,
     /// Presence penalty.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub presence_penalty: Option<f64>,
@@ -72,9 +82,16 @@ pub struct CreateResponseBody {
     /// Context-truncation strategy.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub truncation: Option<TruncationStrategy>,
-    /// Streaming options.
+    /// Stream the response as server-sent events (`cpt-cf-llm-gateway-fr-streaming-v1`).
+    /// The terminal event always carries usage.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub stream_options: Option<StreamOptions>,
+    pub stream: Option<bool>,
+    /// Gateway extension: drop generic parameters the resolved model does not
+    /// support instead of rejecting the request with `unsupported_parameter`.
+    /// Every dropped parameter is listed in the response `ignored_parameters`
+    /// (`cpt-cf-llm-gateway-fr-generation-parameters-v1`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub drop_unsupported_params: Option<bool>,
     /// Service-tier hint for processing priority.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub service_tier: Option<ServiceTier>,
@@ -85,9 +102,13 @@ pub struct CreateResponseBody {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub safety_identifier: Option<String>,
     /// Prompt cache key for reuse across requests (schema maximum 64 chars).
+    /// A cache-control hint: dropped without an error when the provider has no
+    /// equivalent, and listed in `ignored_parameters`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt_cache_key: Option<String>,
-    /// Provider-/plugin-specific parameters not covered by core fields.
+    /// Provider-specific parameters with no generic equivalent. Which of them
+    /// may be forwarded is governed by the model's `allow_extra_params` in
+    /// Model Registry.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(skip)]
     pub extra_fields: Option<HashMap<String, serde_json::Value>>,
@@ -114,23 +135,6 @@ pub enum IncludeField {
     /// Include output-text log-probabilities.
     #[serde(rename = "message.output_text.logprobs")]
     MessageOutputTextLogprobs,
-}
-
-/// Streaming options controlling what the event stream carries.
-#[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Default,
-    serde::Serialize,
-    serde::Deserialize,
-    schemars::JsonSchema,
-)]
-pub struct StreamOptions {
-    /// Emit a final usage event at the end of the stream.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub include_usage: Option<bool>,
 }
 
 // ---------------------------------------------------------------------------
@@ -199,6 +203,31 @@ pub struct ResponseResource {
     pub safety_identifier: Option<String>,
     /// Prompt cache key.
     pub prompt_cache_key: Option<String>,
+    /// Gateway extension: request parameters that were not applied — dropped
+    /// under `drop_unsupported_params`, or unsupported cache-control hints.
+    /// Dropping is never silent (`cpt-cf-llm-gateway-fr-generation-parameters-v1`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ignored_parameters: Vec<String>,
+    /// Gateway extension: provider originals behind the normalized fields.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_details: Option<ProviderDetails>,
+}
+
+/// Provider originals kept beside the normalized response fields
+/// (`cpt-cf-llm-gateway-fr-completion-status-v1`,
+/// `cpt-cf-llm-gateway-fr-request-traceability-v1`).
+#[derive(
+    Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
+)]
+pub struct ProviderDetails {
+    /// The provider's original stop reason (e.g. `end_turn`, `length`,
+    /// `MAX_TOKENS`), from which `status` and `incomplete_details.reason`
+    /// were normalized.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop_reason: Option<String>,
+    /// Request identifier assigned by the provider, when available.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_request_id: Option<String>,
 }
 
 /// Response lifecycle status.
@@ -219,27 +248,64 @@ pub enum ResponseStatus {
     Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
 )]
 pub struct IncompleteDetails {
-    /// Machine-readable reason.
+    /// Machine-readable reason: [`IncompleteDetails::MAX_OUTPUT_TOKENS`] or
+    /// [`IncompleteDetails::CONTENT_FILTER`]
+    /// (`cpt-cf-llm-gateway-fr-completion-status-v1`).
     pub reason: String,
+}
+
+impl IncompleteDetails {
+    /// Output truncated by the output token limit.
+    pub const MAX_OUTPUT_TOKENS: &'static str = "max_output_tokens";
+    /// Output blocked by the provider's content policy.
+    pub const CONTENT_FILTER: &'static str = "content_filter";
 }
 
 // ---------------------------------------------------------------------------
 // Embeddings
 // ---------------------------------------------------------------------------
 
-/// Embedding request.
+/// Embedding request (`cpt-cf-llm-gateway-fr-embeddings-v1`).
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 pub struct EmbeddingRequest {
     /// Model identifier from the Model Registry.
     pub model: String,
     /// Text or array of texts to embed.
     pub input: EmbeddingInput,
-    /// Desired output dimensions, if the model supports it.
+    /// Output vector size. Never dropped: if the model cannot produce exactly
+    /// this size, the request is rejected with `unsupported_parameter`, even
+    /// when `drop_unsupported_params` is set.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dimensions: Option<u32>,
-    /// Output encoding format.
+    /// Whether the inputs are search queries or documents (e.g. Google
+    /// `task_type`, Voyage `input_type`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_type: Option<EmbeddingInputType>,
+    /// Output encoding format. Supported for every model: the Gateway converts
+    /// the vectors when the provider does not return the requested format.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub encoding_format: Option<EncodingFormat>,
+    /// Drop unsupported generic parameters (except `dimensions`) instead of
+    /// rejecting the request; dropped ones are listed in `ignored_parameters`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub drop_unsupported_params: Option<bool>,
+    /// Provider-specific parameters with no generic equivalent, gated by the
+    /// model's `allow_extra_params` in Model Registry.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(skip)]
+    pub extra_fields: Option<HashMap<String, serde_json::Value>>,
+}
+
+/// Kind of text being embedded.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum EmbeddingInputType {
+    /// A search query.
+    Query,
+    /// A document to be retrieved.
+    Document,
 }
 
 /// Embedding `input`: a single text or a batch of texts.
@@ -265,12 +331,21 @@ pub enum EncodingFormat {
 /// Embedding response.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 pub struct EmbeddingResponse {
+    /// Gateway request identifier, also the idempotency key of the usage
+    /// record (`cpt-cf-llm-gateway-fr-request-traceability-v1`).
+    pub id: String,
     /// Model used for embedding.
     pub model: String,
     /// Embedding results.
     pub data: Vec<EmbeddingData>,
-    /// Token usage.
+    /// Usage: AI credit cost, generic token usage, provider raw usage.
     pub usage: Usage,
+    /// Parameters dropped under `drop_unsupported_params`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ignored_parameters: Vec<String>,
+    /// Provider originals (`provider_request_id`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_details: Option<ProviderDetails>,
 }
 
 /// A single embedding result.
@@ -296,9 +371,10 @@ pub enum EmbeddingVector {
 // Usage
 // ---------------------------------------------------------------------------
 
-/// Token usage.
+/// Usage of one request (`cpt-cf-llm-gateway-fr-usage-tracking-v1`): cost in
+/// AI credits, generic token usage, and the provider's raw usage.
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
+    Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
 )]
 pub struct Usage {
     /// Input tokens consumed.
@@ -311,6 +387,29 @@ pub struct Usage {
     pub input_tokens_details: InputTokensDetails,
     /// Breakdown of output token usage.
     pub output_tokens_details: OutputTokensDetails,
+    /// Gateway extension: call cost in AI credits, computed by the provider
+    /// plugin from the pricing in the model's provider settings. A JSON
+    /// string on the wire (`"0.0125"`) so the amount never passes through a
+    /// float.
+    #[serde(default, with = "rust_decimal::serde::str")]
+    #[schemars(with = "String")]
+    pub cost: Decimal,
+    /// Gateway extension: the provider-specific raw usage structure, as the
+    /// provider returned it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_raw: Option<serde_json::Value>,
+    /// Gateway extension: `false` when usage could not be determined reliably
+    /// (interrupted stream, consumer disconnect).
+    #[serde(default = "default_true")]
+    pub complete: bool,
+    /// Gateway extension: `true` when the amounts are an estimate rather
+    /// than provider-reported usage. Only set together with `complete = false`.
+    #[serde(default)]
+    pub estimated: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// Input token usage breakdown.
@@ -335,15 +434,36 @@ pub struct OutputTokensDetails {
 // ResponseError
 // ---------------------------------------------------------------------------
 
-/// Error object within a response resource.
+/// Error object within a response resource, carried by the terminal
+/// `response.failed` event of a stream.
+///
+/// `code` is the same normalized code as [`LlmGatewayError::code`]
+/// (`cpt-cf-llm-gateway-fr-provider-error-normalization-v1`).
+///
+/// [`LlmGatewayError::code`]: crate::errors::LlmGatewayError::code
 #[derive(
-    Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
+    Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
 )]
 pub struct ResponseError {
     /// Machine-readable error code.
     pub code: String,
     /// Human-readable error message.
     pub message: String,
+    /// Gateway extension: offending request parameter, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub param: Option<String>,
+    /// Gateway extension: the provider's original error code.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_code: Option<String>,
+    /// Gateway extension: the provider's original error message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_message: Option<String>,
+    /// Gateway extension: request identifier assigned by the provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_request_id: Option<String>,
+    /// Gateway extension: seconds to wait before retrying (`rate_limited`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_after: Option<u64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -410,7 +530,11 @@ pub enum TextVerbosity {
 // ReasoningConfig
 // ---------------------------------------------------------------------------
 
-/// Reasoning controls.
+/// Reasoning controls (`cpt-cf-llm-gateway-fr-reasoning-v1`).
+///
+/// Reasoning is disabled with `effort = none`. An option the model does not
+/// support (e.g. `budget_tokens` on an effort-only provider) is rejected with
+/// `capability_not_supported`.
 #[derive(
     Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
 )]
@@ -421,6 +545,10 @@ pub struct ReasoningConfig {
     /// Reasoning summary mode.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub summary: Option<ReasoningSummary>,
+    /// Gateway extension: reasoning token budget, for providers that take a
+    /// budget (e.g. Anthropic `thinking.budget_tokens`, Google `thinkingBudget`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub budget_tokens: Option<u32>,
 }
 
 /// Reasoning effort level.
@@ -471,7 +599,7 @@ pub enum ToolChoice {
 pub enum ToolChoiceMode {
     /// Provider picks whether and which tool to call.
     Auto,
-    /// Provider must call exactly one tool.
+    /// Model must call at least one tool.
     Required,
     /// No tool calling.
     None,
@@ -512,31 +640,6 @@ pub enum TruncationStrategy {
 pub enum ServiceTier {
     Auto,
     Default,
-}
-
-// ---------------------------------------------------------------------------
-// Fallback
-// ---------------------------------------------------------------------------
-
-/// Provider fallback configuration.
-#[derive(
-    Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
-)]
-pub struct FallbackConfig {
-    /// Ordered list of fallback model identifiers.
-    pub models: Vec<String>,
-    /// Fallback execution strategy.
-    pub strategy: FallbackStrategy,
-}
-
-/// Strategy for provider fallback.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
-)]
-#[serde(rename_all = "lowercase")]
-pub enum FallbackStrategy {
-    Sequential,
-    Parallel,
 }
 
 // ---------------------------------------------------------------------------
@@ -692,6 +795,85 @@ mod tests {
         );
 
         assert_eq!(serde_json::to_value(&body).unwrap(), wire);
+    }
+
+    #[test]
+    fn create_response_body_gateway_extensions_roundtrip() {
+        let wire = serde_json::json!({
+            "model": "gpt",
+            "input": "Hello",
+            "seed": 7,
+            "reasoning": { "effort": "high", "budget_tokens": 2048 },
+            "stream": true,
+            "drop_unsupported_params": true
+        });
+        let body: CreateResponseBody = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(body.stream, Some(true));
+        assert_eq!(body.drop_unsupported_params, Some(true));
+        assert_eq!(body.reasoning.as_ref().unwrap().budget_tokens, Some(2048));
+        assert_eq!(serde_json::to_value(&body).unwrap(), wire);
+    }
+
+    #[test]
+    fn usage_carries_cost_as_string_and_raw_provider_usage() {
+        let wire = serde_json::json!({
+            "input_tokens": 10,
+            "output_tokens": 5,
+            "total_tokens": 15,
+            "input_tokens_details": { "cached_tokens": 2 },
+            "output_tokens_details": { "reasoning_tokens": 1 },
+            "cost": "0.0125",
+            "provider_raw": { "prompt_tokens": 10, "completion_tokens": 5 },
+            "complete": true,
+            "estimated": false
+        });
+        let usage: Usage = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(usage.cost, Decimal::new(125, 4));
+        assert_eq!(serde_json::to_value(&usage).unwrap(), wire);
+    }
+
+    #[test]
+    fn usage_extensions_default_to_complete_zero_cost() {
+        let usage: Usage = serde_json::from_value(serde_json::json!({
+            "input_tokens": 1,
+            "output_tokens": 1,
+            "total_tokens": 2,
+            "input_tokens_details": { "cached_tokens": 0 },
+            "output_tokens_details": { "reasoning_tokens": 0 }
+        }))
+        .unwrap();
+        assert_eq!(usage.cost, Decimal::ZERO);
+        assert!(usage.complete);
+        assert!(!usage.estimated);
+        assert!(usage.provider_raw.is_none());
+    }
+
+    #[test]
+    fn embedding_request_with_input_type_roundtrip() {
+        let wire = serde_json::json!({
+            "model": "embed",
+            "input": ["a", "b"],
+            "dimensions": 256,
+            "input_type": "query",
+            "encoding_format": "base64",
+            "drop_unsupported_params": true
+        });
+        let req: EmbeddingRequest = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(req.input_type, Some(EmbeddingInputType::Query));
+        assert_eq!(serde_json::to_value(&req).unwrap(), wire);
+    }
+
+    #[test]
+    fn response_resource_provider_details_roundtrip() {
+        let details = ProviderDetails {
+            stop_reason: Some("end_turn".into()),
+            provider_request_id: Some("req_1".into()),
+        };
+        let value = serde_json::to_value(&details).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({ "stop_reason": "end_turn", "provider_request_id": "req_1" })
+        );
     }
 
     #[test]

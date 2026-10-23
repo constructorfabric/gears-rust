@@ -28,13 +28,29 @@ pub enum Tool {
     /// An inline GTS schema definition.
     #[serde(rename = "inline_gts")]
     InlineGts(ToolInlineGts),
+    /// The provider-agnostic Gateway web search tool. The provider plugin maps
+    /// it to the provider's native web search; the Gateway never runs searches
+    /// itself (`cpt-cf-llm-gateway-fr-web-search-v1`).
+    #[serde(rename = "cf:web_search")]
+    WebSearch(WebSearchTool),
     /// The built-in image-generation tool (Gears extension).
     #[serde(rename = "cf_gears:image_generation")]
     ImageGeneration(ImageGenerationTool),
-    /// A tool `type` the core does not own, preserved verbatim.
+    /// A tool `type` the core does not own, preserved verbatim. Provider-specific
+    /// tools are namespaced by provider (`<provider>:<tool>`, e.g.
+    /// `openai:shell`) and forwarded to the matching plugin
+    /// (`cpt-cf-llm-gateway-fr-provider-tools-v1`).
     #[serde(untagged)]
     Other(Extension),
 }
+
+/// Gateway web search tool (`cf:web_search`). It has no options; results and
+/// citations come back as `cf:web_search_call` output items and
+/// `url_citation` annotations.
+#[derive(
+    Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
+)]
+pub struct WebSearchTool;
 
 /// Function tool.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
@@ -169,4 +185,32 @@ pub enum ImageOutputFormat {
 pub enum ImageResponseFormat {
     Base64,
     Url,
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn web_search_tool_roundtrips() {
+        let wire = serde_json::json!({ "type": "cf:web_search" });
+        let tool: Tool = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(tool, Tool::WebSearch(WebSearchTool));
+        assert_eq!(serde_json::to_value(&tool).unwrap(), wire);
+    }
+
+    #[test]
+    fn provider_tool_is_preserved_verbatim() {
+        let wire = serde_json::json!({ "type": "openai:shell", "env": "default" });
+        let tool: Tool = serde_json::from_value(wire.clone()).unwrap();
+        let Tool::Other(ext) = &tool else {
+            panic!("expected Other");
+        };
+        assert_eq!(ext.kind(), Some("openai:shell"));
+        assert_eq!(serde_json::to_value(&tool).unwrap(), wire);
+    }
 }
