@@ -1,5 +1,5 @@
 Created:  2026-07-20 by Virtuozzo International GmbH
-Updated:  2026-10-08 by Virtuozzo International GmbH
+Updated:  2026-10-22 by Virtuozzo International GmbH
 
 # PRD — Settings Service
 
@@ -185,8 +185,8 @@ The platform has no configuration service yet: each gear owns its own configurat
 
 **ID**: `cpt-cf-settings-service-actor-event-broker`
 
-- **Role**: Platform event delivery service. It carries the two signals a set produces — the change notification each subscribed consuming gear receives, and the coherence signal every Settings Service replica receives ([§5.5](#55-validate-and-set-values)). Settings Service offers **no request interface as an alternative path for either signal**: they are published, never fetched. A consumer's activation outcome travels the other way and does **not** come back through the broker: it is reported through the Settings Service SDK ([§7.1](#71-public-api-surface)).
-- **Integration Direction**: Outbound — Settings Service publishes change notifications and replica coherence signals to the broker. The broker never reads or writes settings.
+- **Role**: Platform event delivery service. It carries the two signals a set produces — the change notification each subscribed consuming gear receives, and the coherence signal every Settings Service replica receives ([§5.5](#55-validate-and-set-values)). Settings Service offers **no request interface as an alternative path for either signal**: they are published, never fetched. A consumer's activation outcome is reported through the Settings Service SDK ([§7.1](#71-public-api-surface)).
+- **Integration Direction**: Outbound — Settings Service publishes change notifications and replica coherence signals to the broker; each Settings Service replica also receives the coherence signal. The broker never reads or writes settings.
 - **Availability Expectation**: **Not** required when a value is set. A broker outage **MUST NOT** fail a set, **MUST NOT** lose an outstanding activation (it stays outstanding and is delivered once the broker returns), and **MUST NOT** leave a replica indefinitely stale, because bounded replica staleness ([§6.1](#61-gear-specific-nfrs)) does not depend on any single signal arriving. Values already stored stay in effect and readable throughout.
 
 #### Tenant Resolver
