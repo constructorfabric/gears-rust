@@ -408,7 +408,7 @@ test-graph-storage-pg: install-tools
 TOOLKIT_DB_LANES := toolkit-db-sqlite toolkit-db-pg toolkit-db-pgq toolkit-db-mysql
 INTEGRATION_LANES := $(TOOLKIT_DB_LANES) users-info-pg usage-collector-pg usage-collector-ch \
 	types-registry-db oagw-db cluster-pg cluster-redis rg-pg settings-service-pg \
-	pricing-pg coord-pg products-pg ledger-pg
+	pricing-pg coord-pg products-pg ledger-pg orders-pg
 
 ## toolkit-db on SQLite; the examples must still build after the tests.
 lane_args_toolkit-db-sqlite = -p cf-gears-toolkit-db --features sqlite,integration
@@ -584,6 +584,16 @@ lane_args_products-pg = -p cf-gears-bss-products --run-ignored ignored-only -E '
 ## prints a cost. It is excluded by name, so do not add it back.
 ## `--no-fail-fast` for the reason the pricing lane gives.
 lane_args_ledger-pg = -p cf-gears-bss-ledger --run-ignored ignored-only -E 'not test(grain_fold_timing)' --no-fail-fast
+
+## bss-orders' Postgres tier (Docker required; testcontainers).
+##
+## Same `--run-ignored ignored-only` shape as ledger and products: every Orders test that starts a
+## PostgreSQL container is `#[ignore]` with the Docker reason — the lib's `infra::storage::tests`
+## modules and the gear-boot tests in `gear::tests` — and the attribute marks nothing else, so
+## there is no binary or name filter. The unit tier keeps the config, codec and REST-surface tests
+## that need no container (D-224).
+## `--no-fail-fast` for the reason the pricing lane gives.
+lane_args_orders-pg = -p cf-gears-bss-orders --run-ignored ignored-only --no-fail-fast
 
 # run_lane(lane): the lane's nextest run, then its post command if it has one.
 run_lane = $(call nextest_run,$(1),$(lane_args_$(1)),$(lane_env_$(1)))$(if $(lane_post_$(1)),$(newline)$(lane_post_$(1)))
