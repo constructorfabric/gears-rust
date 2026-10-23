@@ -1,0 +1,55 @@
+{
+  "description": "A fact covering half its period applies half the fee: floor 15.",
+  "vectors": [
+    "V34"
+  ],
+  "entry": "minimum_fee_floor",
+  "input": [
+    {
+      "price_id": "00000000-0000-0000-0000-000000020001",
+      "currency_scale": 2,
+      "rated": {
+        "numerator": "5",
+        "denominator": "1",
+        "currency": "EUR",
+        "currency_scale": 2
+      },
+      "covered": [
+        {
+          "start": "2026-09-01T00:00:00Z",
+          "end": "2026-09-16T00:00:00Z"
+        }
+      ],
+      "period_seconds": 2592000,
+      "minimum_fee": {
+        "numerator": "30",
+        "denominator": "1",
+        "currency": "EUR",
+        "currency_scale": 2
+      }
+    },
+    {
+      "price_id": "00000000-0000-0000-0000-000000020001",
+      "currency_scale": 2,
+      "rated": {
+        "numerator": "5",
+        "denominator": "1",
+        "currency": "EUR",
+        "currency_scale": 2
+      },
+      "covered": [
+        {
+          "start": "2026-09-01T00:00:00Z",
+          "end": "2026-09-16T00:00:00Z"
+        }
+      ],
+      "period_seconds": 2592000,
+      "minimum_fee": {
+        "numerator": "30",
+        "denominator": "1",
+        "currency": "EUR",
+        "currency_scale": 2
+      }
+    }
+  ]
+}

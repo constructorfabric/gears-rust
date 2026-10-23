@@ -1,0 +1,6 @@
+{
+  "error": {
+    "reason_code": "adjustment_unsupported",
+    "detail": "the fact names Coupon \"WELCOME10\"; price adjustments are deferred and never applied by default"
+  }
+}

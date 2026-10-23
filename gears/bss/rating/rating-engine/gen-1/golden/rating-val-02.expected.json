@@ -1,0 +1,6 @@
+{
+  "error": {
+    "reason_code": "non_injective_mapping",
+    "detail": "items 00000000-0000-0000-0000-000000010001 and 00000000-0000-0000-0000-000000010002 map to the same recurring target and dimension value None (rating-val-02)"
+  }
+}

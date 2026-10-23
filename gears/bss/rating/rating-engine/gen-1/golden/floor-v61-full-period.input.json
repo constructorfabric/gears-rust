@@ -1,0 +1,32 @@
+{
+  "description": "A recurring 10.00 with minimum_fee 30.00 over the full period: top-up 20.",
+  "vectors": [
+    "V61"
+  ],
+  "entry": "minimum_fee_floor",
+  "input": [
+    {
+      "price_id": "00000000-0000-0000-0000-000000020001",
+      "currency_scale": 2,
+      "rated": {
+        "numerator": "10",
+        "denominator": "1",
+        "currency": "EUR",
+        "currency_scale": 2
+      },
+      "covered": [
+        {
+          "start": "2026-09-01T00:00:00Z",
+          "end": "2026-10-01T00:00:00Z"
+        }
+      ],
+      "period_seconds": 2592000,
+      "minimum_fee": {
+        "numerator": "30",
+        "denominator": "1",
+        "currency": "EUR",
+        "currency_scale": 2
+      }
+    }
+  ]
+}

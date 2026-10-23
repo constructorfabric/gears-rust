@@ -1,0 +1,6 @@
+{
+  "error": {
+    "reason_code": "unsupported_primitive",
+    "detail": "price 00000000-0000-0000-0000-000000020002 prices a Usage item with a model the sale profile does not take (pricing D-504)"
+  }
+}

@@ -299,7 +299,7 @@ Rating's cross-gear seams are designed against two sources that do not agree eve
 > window, aggregation scope, reset and fold come from the binding's `UsageRatingPolicy` (T-D-75);
 > usage meters are Products' derived usage types, which Rating evaluates per UTC hour (T-D-76).
 > Recurring proration (T-D-77) and the minimum-fee floor (T-D-78) are Rating's arithmetic, and order
-> evaluation follows Orders' contract (T-D-79). What still blocks live rating is upstream: pins,
+> evaluation follows Orders' contract (Orders D-197, D-216; T-D-83). What still blocks live rating is upstream: pins,
 > plan revision, quantity and `BillingTerms` on the facts (Subscriptions, docs only) and a typed read
 > of derived usage declarations (Products, R-31).
 
@@ -433,7 +433,7 @@ the retention period (§4.1).
 | Requirement | Design response |
 |---|---|
 | `cpt-cf-bss-rating-fr-deterministic-evaluation-api` | `rating_core::evaluate(&EvaluationInput) -> Result<EvaluationOutcome, EvaluationError>` (§3.3). |
-| `cpt-cf-bss-rating-fr-pre-purchase-evaluation` | `OrderEvaluationV1::evaluate` — pure, non-authoritative, usage excluded, over the exact bindings of Orders' accepted chain matrix (T-D-54, T-D-79, §3.3); priority and DTO confirmation R-24. |
+| `cpt-cf-bss-rating-fr-pre-purchase-evaluation` | `OrderEvaluationV1::evaluate` — pure, non-authoritative, usage excluded, over the selected Pricing bindings of Orders' purchase evaluation request (Orders D-197, D-216; T-D-54, T-D-83, §3.3); delivery prerequisites R-24. |
 | `cpt-cf-bss-rating-fr-single-outcome-determinism` | Every child result records an input manifest and `input_digest` (§4.1); `rating-core` is pure. |
 | `cpt-cf-bss-rating-fr-snapshot-carry` | Every line references a content-addressed `bss_rating__snapshot`; provenance carries `{plan_id, revision_id, sku_id, sku_version, price_book_entry_id, price_id}` (§3.7, §4.1). |
 | `cpt-cf-bss-rating-fr-idempotency` | Usage dedup on the collector record id + natural key; child results by `(child_id, window_revision)`; parent results by `(fact_id, result_revision)`; delivery by `delivery_id` (§4.2). |
@@ -1041,7 +1041,7 @@ does) or persist anything; the minimum-fee floor runs at roll-up, not here.
 - `cpt-cf-bss-rating-component-period-plan-change` — calls (slices and proration)
 - `cpt-cf-bss-rating-component-governance-asc606` — calls (pass-through identifiers)
 - `cpt-cf-bss-rating-component-unit-synthesis` — called by (`Rater`)
-- `cpt-cf-bss-rating-component-consumer-contracts` — called by (`evaluate_order`, T-D-79)
+- `cpt-cf-bss-rating-component-consumer-contracts` — called by (`evaluate_order`, T-D-83)
 
 #### Selection and eligibility
 
@@ -1189,7 +1189,8 @@ maps it, so the domain never sees a wire type ([contract 11](#contract-11)).
 
 The boundary adapters for Subscriptions, Pricing, Products and Billing, the REST surface and its
 authorization, the `Inbox` for non-usage facts (dedup on `(tenant, source, business_id, version)`
-and digest, quarantine on conflict), and order evaluation on Orders' accepted bindings (T-D-79).
+and digest, quarantine on conflict), and purchase evaluation on the bindings Orders selected
+(Orders D-197; T-D-83).
 Runtime components: `Inbox`, `OrderEvaluator`.
 
 ##### Responsibility boundaries
@@ -1366,7 +1367,7 @@ status": **R** required domain abstraction, **M** concrete module/type to implem
 | `BillingHintSink` | M | `BillingPeriodStateChanged` → `bss_rating__billing_hint` | `bss_rating__billing_hint` | own | `(billing_group_id, state_version)` | ignore unknown | — | observational only |
 | `Reconciler` | M | sweeps (§4.6) → repairs/requeue/exceptions | — | small transactions | — | — | — | `rating_reconciliation_mismatch_total{check}` |
 | `RerateService` | M | operator selector → `bss_rating__rerate_run` (frozen target `{target_engine_generation, rebind, rebind_as_of}`) + `bss_rating__rerate_target` rows + durable intent on each child | `bss_rating__rerate_run`, `bss_rating__rerate_target` | acceptance transaction; enumeration batches | `Idempotency-Key` → `run_id`; `(run_id, child_id)` | rate-limited enqueue | resumable from `rerate_target` state, never from timestamps | `rating_rerate_children_total` |
-| `OrderEvaluator` | M | `OrderEvaluationRequest` (Orders' accepted chain matrix with its exact bindings, T-D-79) → `OrderEvaluation` | none | none | pure; no `resolve` call | typed error; unsupported cycle → `InvalidArgument` | — | `rating_order_evaluation_seconds` |
+| `OrderEvaluator` | M | `OrderEvaluationRequest` (Orders' purchase evaluation request: the selected Pricing binding and quantity of each item, Term and `BillingTerms` per line; Orders D-197, T-D-83) → `OrderEvaluation` | none | none | pure; no `resolve` call | typed error, which Orders maps to `evaluation-unavailable`; a Preview line without term or cycle withholds only the TCV | — | `rating_order_evaluation_seconds` |
 
 Abstractions removed by earlier revisions are not part of this design; the decisions that removed
 them are T-D-45, T-D-47, T-D-50, T-D-57, T-D-73 and T-D-75, and their former names are in this
@@ -1412,7 +1413,7 @@ The components each contract namespace adds are defined here and specified norma
     carries the fact's served extent, each binding's `ends_on` (the binding's
     own end: `temporary_until` or an explicit close, pricing D-425 — never `effective_to`), the
     quantity changes and Subscriptions' term changes on the fact version.
-  - `window_geometry(&UsageRatingPolicy, fact_served_extent, billing_period) -> Vec<RatingWindow>`
+  - `window_geometry(&UsageRatingPolicy, FactExtent{served, period}) -> Vec<RatingWindow>`
     — pure; the expected child set of a fact (`RatingWindow = {window_start, window_end,
     served_from, served_to}`): `CalendarHour{Utc}` gives the UTC hours of the served extent,
     `BillingCycle` gives the fact's billing period (T-D-75).
@@ -1420,7 +1421,7 @@ The components each contract namespace adds are defined here and specified norma
     `Core*` types, in [01 §3.1](#contract-01-3-1). `pricing` is the binding of record (T-D-73),
     with one resolve per resolve date; `derived` is the declaration of the binding's `meter`
     (T-D-76); a window group's other members are context only (T-D-67, §4.3). The outcome returns
-    the rated lines and, per price and currency scale, the exact rated sum, the covered seconds and
+    the rated lines and, per price and currency scale, the exact rated sum, the covered time and
     the minimum fee that roll-up floors (T-D-78). It carries no digest: the pipeline computes
     `input_digest` (14 §4.3), so the core needs no hash crate.
   - **Exact numbers** (T-D-66, T-D-80; money ADR rules 2–6). One wire and storage form, separate
@@ -1446,7 +1447,7 @@ The components each contract namespace adds are defined here and specified norma
     `ExactQuantity` of up to 60 + 28 digits; and `canonical_fraction` with its strict parser
     `parse_fraction` (the `numerator` / `denominator` strings of the wire, storage and digests).
     With them the core writes `47/400` (V35), reloads a numerator above `i128` and takes a
-    40-digit `Q`; a generation vendors the crate release that has them (§4.1).
+    40-digit `Q`; a generation uses the crate in place (§4.1, T-D-84).
 
     **Why the bounds suffice** (money ADR rule 3; Rating's proposal until Billing accepts the delivery
     bounds, R-32). The producers publish today: pricing money is a `rust_decimal::Decimal` (scale
@@ -1530,14 +1531,18 @@ The components each contract namespace adds are defined here and specified norma
     floored by its own covered fraction and topped up on its own line, so nothing is converted and
     nothing fails (T-D-78; R-30).
   - `evaluate_order(&OrderEvaluationInput) -> Result<OrderEvaluation, EvaluationError>` — same
-    arithmetic over the order's exact bindings, separate DTO (T-D-54, T-D-79).
+    arithmetic over the bindings Orders selected, separate DTO (T-D-54, T-D-83; Orders D-197):
+    recurring items per cycle and over the line's term, one-time items once, usage as rates; every
+    amount as exact and display decimal text ([11 §4.10](#contract-11-4-10)).
+  - `minimum_fee_floor(&[PriceTotal]) -> Result<Vec<FloorPart>, EvaluationError>` — pure; the floor
+    of every price of a fact from its children's price totals, per price and `currency_scale`, at
+    roll-up (T-D-78, 09 §4.2).
   - Golden vectors per retained generation (Rating-authored; the joint `bss-fixtures` corpus was
     deleted with pricing phase 4); the pricing adapter is tested against pricing's golden consumer
     contracts (`pricing/tests/contract/*.json`) and the arithmetic against pricing's `amount_for`
-    oracle (`pricing/src/domain/money.rs`) only on cases where **every intermediate** of `amount_for` is
-    exact in `rust_decimal`, not merely its result (feature 02 §6: `3.0000000000000000000000000001`
-    units with `package_size` 3 bill 2 blocks in Rating, while `amount_for`'s rounded division
-    gives 1)
+    oracle (`pricing/src/domain/money.rs`), which now computes over `bss_money::exact::ExactAmount`
+    (pricing `958b5e2f1`), so it is exact on every case it accepts: `3.0000000000000000000000000001`
+    units with `package_size` 3 bill 2 blocks in both
     (the money ADR's "compare exact price formulas with the producer's golden test cases"); Rating
     re-implements those formulas over exact fractions and never calls `amount_for` to price.
 
@@ -1562,20 +1567,22 @@ The components each contract namespace adds are defined here and specified norma
   - `RatingRunControlV1::get_rerate_run(ctx, run_id) -> Option<RerateRunView>` — the durable handle:
     state, frozen target, counts by per-child state.
   - `OrderEvaluationV1::evaluate(ctx, OrderEvaluationRequest) -> Result<OrderEvaluation,
-    CanonicalError>` (Orders D-154, D-167; T-D-54, T-D-79) — no persistence, no idempotency key, no
-    `resolve` call: it prices the exact bindings the order carries (no renewal walk).
-    The request is Orders' accepted chain matrix — `{assessment_id, resolve_date, tenant_axes,
-    contract?, market, lines: [{line_id, plan_revision_id, term: Rolling | FixedPeriods{count},
-    cycle: month | year, items: [{item_id, quantity, chains: [{dim_value, binding}]}]}]}` — and the response is
-    `OrderEvaluation{assessment_id, estimate: true, currency, currency_scale, lines, order_totals, tcv,
-    promotion_status}`, every amount both exact (`ExactMoney`, major units) and as a display decimal
-    in major units rounded HALF_EVEN at `currency_scale` and marked as a non-authoritative estimate,
-    plus a TCV `posting_estimate` ([11 §4.10](#contract-11-4-10)) (money ADR rule 7; evaluation is never a billing input, so Billing's rounding is untouched). Discounts, promotions, brand and indicative tax are `unavailable`, never a zero
-    discount (promotions deferred, pricing D-409); usage is shown as rates and excluded; `tcv` is net
-    pre-tax, ×12 for `month`, ×1 for `year`, other cycles refused. The full shape is
-    [contract 11 §4.10](#contract-11-4-10); `contract?`, `market`, `term` and `cycle` are Rating's additions
-    to Orders' D-167 request, pending R-24. It replaces the Atlas C06 DTO (`plan_id`, `price_ids[]`,
-    `catalog_version`).
+    CanonicalError>` (Orders D-197, D-216; T-D-54, T-D-83; Orders names it
+    `RatingPurchaseEvaluationV1`) — one batched, nonbinding evaluation of an order before any
+    subscription exists: no persistence, no idempotency key, no `resolve` call and no successor
+    walk; it prices the selected Pricing binding of each item as given. The request carries the
+    assessment identity and digest, the seller, resource and payer axes, the market and contract
+    reference, and per line its Term (`rolling` | `fixed_periods{count}`; `missing` only on
+    Preview), `BillingTerms` and, per item, the selected binding and an explicit quantity. The
+    response carries, per item, line and order, rows by charge kind with exact and display gross and
+    net, `discount_status`, `amount_status` (`committed` | `uncommitted_usage`), `amount_basis` and
+    `recurring_by_cycle`, and one TCV on the order's `recurring` row with `tcv_basis` and per-line
+    evidence ([contract 11 §4.10](#contract-11-4-10)). Every amount is exact canonical decimal text in
+    major units and a display estimate rounded HALF_EVEN at `currency_scale` (money ADR rule 7,
+    Orders D-216); evaluation is never a billing input, so Billing's rounding is untouched. Discounts
+    and promotions are `unavailable`, never a guessed zero (pricing D-409); usage is rates only and
+    excluded; brand and tax are declared exclusions. It replaces the Atlas C06 DTO (`plan_id`,
+    `price_ids[]`, `catalog_version`) and the D-167 chain matrix.
   - **`BillableItemDeliveryV1`** (Atlas C07, adapted per T-D-51/T-D-58):
     `{ delivery_id, run_id, fact_id, fact_version, result_revision, previous_result_revision?,
     billing_group_id, billing_group_kind: published | derived, tenant_axes: {seller_tenant_id,
@@ -1745,7 +1752,7 @@ The interfaces each contract namespace adds are defined here and specified norma
 ### 3.4 Internal Dependencies
 
 `rating` → `rating-core` → the generation crates `cf-gears-bss-rating-engine-gen-<n>`, each with
-its vendored copies of the Products evaluator, `bss_money` and `rust_decimal` (§4.1; no I/O traits). `rating-core` does **not** depend on `bss-pricing-sdk`: the pricing adapter in `rating` maps
+the shared `bss_money` and its vendored copies of the Products evaluator and `rust_decimal` (§4.1; no I/O traits). `rating-core` does **not** depend on `bss-pricing-sdk`: the pricing adapter in `rating` maps
 its types into `rating-core`'s own frozen input types (§3.2). `rating-sdk` depends on neither. Inside the pipeline: `Inbox` → (`UsageFeedReader` →
 `UsageRepo` → `Attributor` → `CounterMaterializer`) and (`FactIntake` → `WindowScheduler`) → work
 queue → `Rater` (`PricingBindingStore`, `DerivedDeclarationStore`, `EvidenceGate`,
@@ -1766,7 +1773,7 @@ each owner are owned by [`UPSTREAM_REQS.md`](./UPSTREAM_REQS.md) (last column).
 | subscriptions | facts with the period's pins, plan revision, quantity and billing terms; subscription versions, attribution, scope proofs | none — docs only, no code (docs: `BillableItemCreated`; SUB-D-29 says bindings pin price ids per period and renewal resolves with them, but names no store or wire) | Atlas C04: `BillableFactPublished`, `BillableSetSealed`, `AttributionSegmentChanged`, `UsageScopeSealed`; `SubscriptionBillingReadV1::{facts, period_facts, segments_since, scope_for_window, bindings}` | event + pull | **ASSUMED / MISSING** (R-03, R-20, R-25) | [§2.6](./UPSTREAM_REQS.md#26-subscriptions) |
 | Billing (no gear) | consumes deliveries; publishes period hints | none | `BillableItemDeliveryV1`, `RatingRunReadV1`; `BillingPeriodStateChanged` hint (Atlas C07/C08/C09) | event + pull | **ABSENT** (R-04, R-05) | [§2.7](./UPSTREAM_REQS.md#27-billing) |
 | bss-ledger | none directly | Billing posts with `pricing_snapshot_ref = snapshot_id` | unchanged | — | fields **CONFIRMED** | [§2.8](./UPSTREAM_REQS.md#28-bss-ledger-and-the-shared-money-crate) |
-| Orders Lifecycle | consumes `OrderEvaluationV1` | none — docs only (Orders ADR-0008; D-154, D-167: a batched evaluation over the accepted chain matrix and TCV; Orders' DESIGN still stores resolved totals as integer minor units, `orders-lifecycle/docs/DESIGN.md:518, 3127`) | Orders' D-167 request and response (T-D-79), display totals as major-unit decimals marked as estimates (T-D-80; the money ADR asks Orders to drop integer minor units) | sync SDK | **ASSUMED** (R-24) | [§2.11](./UPSTREAM_REQS.md#211-orders-lifecycle) |
+| Orders (`gears/bss/orders`) | consumes `OrderEvaluationV1` (Orders' proposed `RatingPurchaseEvaluationV1`) | Orders D-197 (selected 2026-10-05): one batched, nonbinding evaluation of the selected Pricing bindings, Rating owning every aggregate; D-216 (2026-10-18): Orders stores each total as exact and display decimal text (`orders/src/infra/storage/migrations/01_schema.sql:224-262`) | Orders' D-197 request and response (T-D-83) | sync SDK | **SELECTED**, provider, grants and profile missing (R-24) | [§2.11](./UPSTREAM_REQS.md#211-orders-lifecycle) |
 | Contracts | contract overrides, pools, balances, effects | first-draft PRD only | UNKNOWN / EXTERNAL CONTRACT REQUIRED | — | **deferred, not requested now** (R-11, T-D-81) | [§2.10](./UPSTREAM_REQS.md#210-contracts-and-promotions) |
 | Promotions | promotion snapshots | owned by Pricing and deferred (pricing D-409); `resolve` returns no promotion | UNKNOWN / EXTERNAL CONTRACT REQUIRED | — | **deferred, not requested now** (R-11, T-D-81) | [§2.10](./UPSTREAM_REQS.md#210-contracts-and-promotions) |
 | FX / Finance | rate snapshots | `RateProviderV1::fetch_latest` in the ledger SDK, fed by the `rate-provider` adapter gear; the Ledger is its only consumer | pinnable rate snapshot (J-8) | — | **deferred, not requested now** (R-07, T-D-81) | [§2.9](./UPSTREAM_REQS.md#29-finance-and-fx) |
@@ -3104,25 +3111,30 @@ engine is retained as code:
   arithmetic budget, error classification) is a new module `rating_core::engine::gen_<n>`; a
   released generation's module is frozen. Refactors that keep semantics stay within a generation and
   must pass its golden vectors bit-for-bit.
-- **Vendored evaluation code** (ADR-0006). Every external crate whose code runs inside evaluation
-  is vendored into the generation as source when the generation is released:
-  `bss_products_sdk::derived` (the derived-meter evaluator: formula evaluation, granule rounding,
-  overflow), `bss_money`'s exact and money modules (exact fractions, canonical text, `CurrencySpec`,
-  `PostedMoney`), and the registry
-  crates they compute with, `rust_decimal` (the decimal semantics of pricing money and of Products'
-  evaluator) and the big-integer crate behind `bss_money`. Each copy is a renamed path crate
-  (`rating-gen<n>-derived`, `rating-gen<n>-money`, `rating-gen<n>-decimal`, …) under the
-  generation's frozen tree, taken from the exact release the workspace resolved (for a registry
-  crate, the release whose `Cargo.lock` checksum is recorded with it), with its licence. A renamed
-  path crate is a distinct crate to Cargo, so old and new copies link side by side; a later upgrade
-  of the workspace's own `rust_decimal`, `bss_money` or `bss-products-sdk` changes no released
+- **Vendored evaluation code** (ADR-0006). Every external crate whose code runs inside evaluation,
+  except the shared money crate, is vendored into the generation as source when the generation is
+  released: `bss_products_sdk::derived` (the derived-meter evaluator: formula evaluation, granule
+  rounding, overflow) and the registry crates the evaluation computes with, `rust_decimal` (the
+  decimal semantics of pricing money and of Products' evaluator) and the big-integer crate behind
+  `bss_money`. Each copy is a renamed path crate (`rating-gen<n>-derived`, `rating-gen<n>-decimal`,
+  …) under the generation's frozen tree, taken from the exact release the workspace resolved (for a
+  registry crate, the release whose `Cargo.lock` checksum is recorded with it), with its licence. A
+  renamed path crate is a distinct crate to Cargo, so old and new copies link side by side; a later
+  upgrade of the workspace's own `rust_decimal` or `bss-products-sdk` changes no released
   generation. Change detection through `Cargo.lock` alone would not work: Cargo records no checksum
   for path crates, and it refuses two semver-compatible versions of one registry crate.
+- **`bss_money` in place** (T-D-84; money ADR rule 2: one crate, no Rating copy). A generation's
+  exact fractions, their canonical text, `CurrencySpec` and the canonical decimal text are the
+  shared crate's. `vendor/LOCK.toml` records the SHA-256 of its library sources, so CI fails on a
+  change to them until the generation is re-locked, and every retained generation's golden corpus
+  guards the outcomes; the generation's own `ArithmeticBudget` (§3.3) bounds every operand. How a
+  released generation holds the crate is settled before generation 1 is frozen.
 - Each generation is its own crate (`cf-gears-bss-rating-engine-gen-<n>`), re-exported by
   `rating-core` as `engine::gen_<n>`. A CI check (`cargo tree`) fails a generation crate that depends
-  on anything outside its vendored copies and the allowlisted non-numeric crates (`serde`, `uuid`,
-  `time`, `thiserror`). The vendored set is the full transitive closure of the numeric code: besides
-  the derived evaluator, `bss_money` and `rust_decimal`, the crates they pull in as resolved
+  on anything outside its vendored copies, `bss_money` and the allowlisted non-numeric crates
+  (`serde`, `uuid`, `time`, `thiserror`). The vendored set is the full transitive closure of the
+  numeric code: besides the derived evaluator and `rust_decimal`, the crates they and `bss_money`
+  pull in as resolved
   (`bigdecimal`, `num-bigint`, `num-integer`, `num-traits`, `arrayvec`, `libm`). Each generation crate defines its own
   frozen input and output types (`CoreResolve`, `CoreCell`, `CoreBinding`, `CorePrice`,
   `CorePriceModel`, `CoreUsagePolicy`, `CoreInvoiceInputs`, `EvaluationInput`,
@@ -3131,7 +3143,8 @@ engine is retained as code:
   generation crates, never the reverse, and maps the pipeline's values into the dispatched
   generation's types, numbers as canonical text. No workspace type crosses into a generation.
 - `engine_digest` = SHA-256 over the generation's frozen source tree, which includes the vendored
-  copies, and its golden-vector outputs. It is computed at build time and recorded in
+  copies and `vendor/LOCK.toml` (the recorded sources of `bss_money` and the registry pins), and its
+  golden-vector outputs. It is computed at build time and recorded in
   `bss_rating__engine_generation` by the migration that releases it. Adopting an upstream fix is a
   new generation with new vendored copies and golden vectors. Each instance verifies at start-up
   that every generation referenced by a retained result is compiled in with a matching digest;
@@ -3457,7 +3470,7 @@ Resource types (GTS, registered by Rating):
 | `deliveries_since` | SDK | Billing service identity | `result × read` on the requested `tenant_id` | the `tenant_id` argument, which must be in scope | PDP scope ∩ `{tenant_id}` | — |
 | `get_snapshot` | REST `snapshots.get`; inside `get_run` | Billing, operator | `result × read` | caller's scope | PDP scope; `(tenant_id, snapshot_id)` lookup | — |
 | `request_rerate`, `get_rerate_run`, cancel | SDK; REST `reratings.*` | operator | `rerate × execute` / `read` | caller's scope; the selector must lie inside it | PDP scope | run row: `tenant_id`, `requested_by`; target rows per tenant |
-| `OrderEvaluationV1::evaluate` | SDK | Orders service identity | `evaluation × evaluate` | the request's seller tenant, in scope | none (the request carries its exact bindings; no pricing read) | — |
+| `OrderEvaluationV1::evaluate` | SDK | Orders service identity (Orders D-194 service grant) | `evaluation × evaluate` | the request's seller, resource and payer axes, each in scope; the market is never authority (Orders D-197) | none (the request carries its selected bindings; no pricing read) | — |
 | Pricing reads (`resolve`, `price`) | background (rater, fact intake, re-rate) | Rating service identity `bss-rating.system`, with a `SecurityContext` built **per work item** for the work item's seller tenant (`subject_tenant_id` = seller; Orders D-160 pattern) | pricing `plan:read` (resolve) and `price:read` (price) — granted per seller tenant by deployment; a system-looking subject has no bypass (pricing D-424, D-510 E3) | pricing asks the PDP for the caller's tenant only (`TenantMode::RootOnly`, pricing D-523), so `CatalogRef.tenant_id` **must equal** `subject_tenant_id`; a different tenant is denied with 403 | Rating writes the copy under that tenant | the binding of record |
 | Products derived-declaration read (R-31) | background | Rating service identity | Products `sku:read` (today REST only); every products read is limited to the caller's own tenant (P-D-265) | the work item's seller tenant | Rating writes the copy under that tenant | the declaration copy |
 | exceptions list / retry, inbox release | REST | operator | `usage × read` / `retry` / `release` (audited) | caller's scope | PDP scope | exception and inbox rows keep their `tenant_id` |
@@ -3558,7 +3571,7 @@ decisions another owner must take; Rating-owned choices are T-D rows and need no
 | Source-loss repair | launch for days the collector still holds: reconciliation figures from Rating's own read or submitted by an operator, and an operator backfill inside the backfill window | `…-upreq-usage-reconciliation-access` (Rating's own read, access UNKNOWN; the operator path needs no grant) | an open loss keeps the children that can hold a tainted day pending; a retention loss lies past the collector's retention, so only `accepted_loss` with a second approver releases them |
 | Minimum-fee floor | launch: Rating applies it at roll-up (T-D-38, T-D-78) | — (`minimum_fee` on every binding) | — |
 | Recurring proration | launch: covered UTC seconds (T-D-77) | R-30 (confirmation) | — |
-| Order evaluation | after R-24 (Orders confirms the D-167 DTO, T-D-79) | R-24 (Orders) | `ServiceUnavailable` |
+| Order evaluation | after the prerequisites of Orders D-197: the SDK provider, grants and supported-profile declaration (T-D-83) | R-24 (delivery) | `ServiceUnavailable` |
 | Event intake and the delivery event | disabled | each owner adopts the §3.3 event contract | pull reads |
 | Billing consumption | needs a Billing gear | R-04, R-05 | deliveries accumulate; pull available |
 | Cross-instance coordination | launch | R-27 (Cluster profile or approved adapter) | — |
@@ -3875,7 +3888,7 @@ DESIGN §3.7).
 | Requirement | Design Response |
 |-------------|-----------------|
 | `cpt-cf-bss-rating-fr-deterministic-evaluation-api` | `evaluate(&EvaluationInput) -> Result<EvaluationOutcome, EvaluationError>` (§3.3); replay-safe by construction (§4.2). |
-| `cpt-cf-bss-rating-fr-pre-purchase-evaluation` | `evaluate_order` over the order's exact bindings (Orders D-167: per line `plan_revision_id` and per item `quantity` and `chains[{dim_value, binding}]`; no subscription version, no renewal walk, no `resolve` call), same arithmetic, separate DTO; served by `OrderEvaluationV1::evaluate`, non-authoritative, nothing persisted (T-D-54, T-D-79, [11 §4.10](#contract-11-4-10)). |
+| `cpt-cf-bss-rating-fr-pre-purchase-evaluation` | `evaluate_order` over the order's selected bindings (Orders D-197: per line the Term and `BillingTerms.cycle`, per item its quantity and selected Pricing binding; no subscription version, no renewal walk, no `resolve` call), same arithmetic, separate DTO; served by `OrderEvaluationV1::evaluate`, non-authoritative, nothing persisted (T-D-54, T-D-83, [11 §4.10](#contract-11-4-10)). |
 | `cpt-cf-bss-rating-fr-evaluation-order` | Steps 1–5 are called in a fixed sequence in code; there is no configuration surface that reorders them (§3.6). |
 | `cpt-cf-bss-rating-fr-single-outcome-determinism` | Determinism is stated over the child window and its versioned input tuple (§4.2); the pipeline records an `input_digest` per result. |
 | `cpt-cf-bss-rating-fr-snapshot-carry` | Every `RatedLine` carries a snapshot body and `{sku_id, sku_version, plan_id, revision_id, price_id, price_book_entry_id}` from its binding; the pipeline stores it content-addressed (§4.3). |
@@ -4033,7 +4046,9 @@ A `price_id` is not part of a `line_key`: a binding that moves at an `ends_on` k
   (usage children: Products' `DerivedUsageDeclaration` at the binding's `MeterRef`, with its digest,
   T-D-76), `subscription: SubscriptionVersion` (tenant axes, plan links, quantity intervals,
   brand), `quantities: ChildQuantities` (per slice `(slice_start, slice_end, q: ExactQuantity,
-  q_version)`, `layout_version`; for a usage child, per raw input type and UTC-hour granule),
+  q_version)`, `layout_version`; for a usage child, per raw input type and UTC-hour granule, and
+  `q` is the exact sum of the granules' derived outputs, which `evaluate` recomputes; the slices
+  are exactly the cuts of `split_points`, else `layout_mismatch`),
   `group_context: Option<GroupContext>`, `budget: ArithmeticBudget`, `engine: EngineId
   {engine_generation, engine_digest}`. This is the only definition; DESIGN §3.3 points here. Every
   instant in it is a whole UTC second (09 §4.1).
@@ -4076,8 +4091,9 @@ A `price_id` is not part of a `line_key`: a binding that moves at an `ends_on` k
   the pipeline per evaluation and stored immutably (`bss_rating__group_context`); part of the
   `input_digest`. Its quantities are **context only** — they place this member on the band axis
   (graduated, package) or choose the band of the group total (volume); the member bills only its
-  own `quantities`. Since T-D-75 a group exists only for counter continuation inside one rating
-  window across a price or plan change (T-D-36).
+  own `quantities`. A member quantity below zero is `negative_window_quantity`, as the member's
+  own is. Since T-D-75 a group exists only for counter continuation inside one rating window
+  across a price or plan change (T-D-36).
 - **`ExactQuantity`**, **`ArithmeticBudget`** — exact decimal quantity and the per-operand bit
   budget checked before each multiply/divide (DESIGN §3.3); the budget belongs to the engine
   generation.
@@ -4089,10 +4105,14 @@ A `price_id` is not part of a `line_key`: a binding that moves at an `ends_on` k
   no child (T-D-18).
 - **`EvaluationOutcome`** — `lines: Vec<RatedLine>`, `obligations` (always empty: true-up
   obligations are deferred with price adjustments), and `price_totals: [PriceTotal{price_id,
-  currency_scale, rated: ExactMoney, covered_seconds, period_seconds, minimum_fee:
-  Option<ExactMoney>}]`, one per price and currency scale the child rated. Roll-up sums them over
-  the fact's children and floors each price at `minimum_fee × covered_fraction(p, s)`, with
-  `covered_fraction(p, s)` = the sum of `covered_seconds` / `period_seconds` (T-D-78, V52). The outcome
+  currency_scale, rated: ExactMoney, covered: [Interval], period_seconds, minimum_fee:
+  Option<ExactMoney>}]`, one per price and currency scale the child rated; `covered` is the time
+  the price's slices cover (suspended time of a paused recurring line excluded) as ordered,
+  disjoint UTC intervals. Roll-up hands the totals of all the fact's children to
+  `minimum_fee_floor`, which floors each price at `minimum_fee × covered_fraction(p, s)`, with
+  `covered_fraction(p, s)` = the UTC seconds of the union of `covered` / `period_seconds`: an
+  `ends_on` handover floors each price by its own share (V52), and two dimension values bound to
+  one price share one floor (V34) (T-D-78). The outcome
   carries no digest: the pipeline computes `input_digest`, the SHA-256 of the canonical
   serialization of the input (14 §4.3).
 - **`RatedLine`** — `line_key` (T-D-58: `{fact_id}|{meter or charge component}|{dimension_key}={dimension_value}|
@@ -4154,8 +4174,9 @@ A `price_id` is not part of a `line_key`: a binding that moves at an `ends_on` k
 `EngineRegistry::get(engine_generation) -> Option<&dyn Engine>`; the functions below are methods
 of one generation.
 
-`evaluate(&EvaluationInput) -> Result<EvaluationOutcome, EvaluationError>` — the only
-money-producing function. Same input ⇒ same bytes. Errors are the closed set of §4.4.
+`evaluate(&EvaluationInput) -> Result<EvaluationOutcome, EvaluationError>` — the only function that
+rates a child (`evaluate_order` prices a purchase, `minimum_fee_floor` floors a fact's prices at
+roll-up; neither rates a child). Same input ⇒ same bytes. Errors are the closed set of §4.4.
 
 **Contract**: `cpt-cf-bss-rating-interface-reresolve-fnd` (`p2`), defined in [§3.3 Namespace interfaces](#register-interfaces).
 
@@ -4165,9 +4186,12 @@ build a new `EvaluationInput` for the child and call `evaluate` again; the resul
 ([contract 15](#contract-15)). Corrections reuse the binding of record; Rating
 re-binds only on an administrative re-rate with `rebind` or on a new fact version whose pricing query (revision, period, pins) changed (T-D-73). No delta is computed.
 
-`evaluate_order(&OrderEvaluationInput) -> Result<OrderEvaluation, EvaluationError>` — pre-purchase
-evaluation over the order's exact bindings (T-D-54, T-D-79, [11 §4.10](#contract-11-4-10)); same step functions, separate DTO,
-usage excluded from TCV.
+`evaluate_order(&OrderEvaluationInput) -> Result<OrderEvaluation, EvaluationError>` — purchase
+evaluation over the bindings Orders selected (T-D-54, T-D-83, [11 §4.10](#contract-11-4-10)); the same model formulas and
+minimum-fee floor, separate DTO, usage excluded from TCV.
+
+`minimum_fee_floor(&[PriceTotal]) -> Result<Vec<FloorPart>, EvaluationError>` — the step-4 floor
+roll-up applies over the price totals of a fact's children (09 §4.2).
 
 `split_points(&SplitInput) -> Vec<OffsetDateTime>` — pure; `SplitInput` = rating window, the
 child's bindings (each binding's `ends_on`), the fact's term slices (TARGET) and — for recurring lines — the
@@ -4290,7 +4314,8 @@ binding it is given:
   exact-arithmetic rules, the arithmetic budget, error classification) is a new frozen module
   `engine::gen_<n>`, retained and compiled in for as long as any retained result references it.
   `engine_digest` = SHA-256 over the generation's frozen source tree, which includes its vendored
-  copies of the external evaluation crates, and its golden-vector outputs (DESIGN §4.1,
+  copies of the external evaluation crates and the recorded sources of `bss_money`, and its
+  golden-vector outputs (DESIGN §4.1,
   ADR-0006), recorded by the releasing migration and verified at start-up. Dispatch is by `engine_generation`:
   new work uses the current generation and records it as the child's engine-of-record; input
   corrections use the engine-of-record; only an administrative re-rate moves it, to the run's frozen
@@ -4400,10 +4425,10 @@ window Rating cannot rate (T-D-73, T-D-75; R-12, R-28 closed).
 | `adjustment_unsupported` | an input names a contract override, commitment pool, reservation, coupon or promotion | price adjustments are deferred (DECOMPOSITION §2.3; R-07, R-11, pricing D-409); never a default | 01 |
 | `fx_not_supported` | the billing currency differs from the binding's price currency | native-currency launch; FX deferred with price adjustments (T-D-81) (R-07) | 01 |
 | `intra_window_policy_change` | a binding's `usage_rating_policy` changes inside a `CalendarHour` window | Subscriptions schedules incompatible changes at the next UTC hour (pricing D-510 E4) | 09 |
-| `precision_overflow` | a reduced `ExactMoney` exceeds its wire/storage bound (`abs(numerator) < 10^84`, `denominator < 10^64`), or an intermediate operand exceeds the `ArithmeticBudget` (checked before each multiply/divide), or in `evaluate_order` a display decimal has no `PostedMoney` form | deterministic for the generation; raised before persistence or delivery | 01 |
+| `precision_overflow` | a reduced `ExactMoney` exceeds its wire/storage bound (`abs(numerator) < 10^84`, `denominator < 10^64`), or an intermediate operand exceeds the `ArithmeticBudget` (checked before each multiply/divide), or in `evaluate_order` an amount is not decimal text of at most 28 significant and 28 fractional digits (Orders D-216) | deterministic for the generation; raised before persistence or delivery | 01 |
 | `quantity_out_of_range` | an `ExactQuantity` computed inside evaluation (slice, window or group total) exceeds 60 integer or 28 fractional digits | never rounded or saturated; records stay counted | 01 |
 | `engine_unavailable` | the requested `engine_generation` is not compiled in or its digest differs | never substituted; deploy a build that contains it | 01 |
-| `layout_mismatch` | counters were laid out under split points other than those the evaluation computes | pipeline re-materializes, then retries | 13 |
+| `layout_mismatch` | counters were laid out under split points other than those the evaluation computes, or a slice quantity is not the committed quantity in force or its granules' derived sum, or a window-group context does not add up | pipeline re-materializes, then retries | 13 |
 | `period_geometry_mismatch` | fact period bounds differ from the fact's `BillingTerms` geometry | Subscriptions/Rating period divergence | 09 |
 | `money_contract_violation` | the money crate returned an error the core's call sites exclude: `Money` from `canonical_at_scale`, `DivisionByZero` (every divisor is checked first: an empty period is `period_geometry_mismatch`, and Pricing refuses a zero package size), or `EmptyWeights`, `NegativeWeight` or `TooManyTerms` (allocation and posted sums, which the core never calls) | engine defect; deterministic, no result | 01 |
 
@@ -4420,8 +4445,8 @@ window Rating cannot rate (T-D-73, T-D-75; R-12, R-28 closed).
 | `resource_scope_not_supported` | the binding's `aggregation_scope = resource` | LAUNCH-GATED until scope proofs list resources (T-D-75, R-21); `FactIntake` creates such children failed, so the core never receives the binding | 14 |
 
 **Money-crate errors** (`bss_money::exact::ExactError`), one row each: `ArithmeticLimit` →
-`precision_overflow`; `Money(MoneyError)` from `round_half_even` in `evaluate_order`'s display
-decimals (the amount has no `PostedMoney` form) → `precision_overflow`; `Money(ScaleOutOfRange |
+`precision_overflow`; `Money(MoneyError)` from `round_half_even_exact` in `evaluate_order`'s display
+decimals → `precision_overflow`; `Money(ScaleOutOfRange |
 InvalidPostingIncrement)` from `canonical_at_scale`, which the core calls only at the binding's valid
 scale on a value already rounded to it, and `DivisionByZero`, `EmptyWeights`, `NegativeWeight` and
 `TooManyTerms` → `money_contract_violation`. `derived_declaration_unavailable` is a pending reason,
@@ -4447,7 +4472,7 @@ evaluation errors: they keep a child `pending` without calling the core ([14 §4
 
 - **PRD**: §6.1, §6.3 `fr-evaluation-order`, §7.1, §17.1.
 - **Design**: DESIGN §3.1, §3.3, §4.1, §4.2.
-- **Decisions**: T-D-04, T-D-11, T-D-37, T-D-38, T-D-39, T-D-42, T-D-44, T-D-46, T-D-51, T-D-54, T-D-58, T-D-63, T-D-65, T-D-66, T-D-67, T-D-73, T-D-74, T-D-75, T-D-76, T-D-78, T-D-79, R-06, R-16, R-18 (closed by T-D-37), R-29, R-31 — [`DECISIONS.md`](DECISIONS.md).
+- **Decisions**: T-D-04, T-D-11, T-D-37, T-D-38, T-D-39, T-D-42, T-D-44, T-D-46, T-D-51, T-D-54, T-D-58, T-D-63, T-D-65, T-D-66, T-D-67, T-D-73, T-D-74, T-D-75, T-D-76, T-D-78, T-D-79, T-D-83, R-06, R-16, R-18 (closed by T-D-37), R-29, R-31 — [`DECISIONS.md`](DECISIONS.md).
 - **Dependencies on main**: pricing `PricingReadV1` and `AcceptedBinding` (`pricing-sdk/src/read.rs:80-291`), pricing D-384–D-389, D-397, D-419–D-425, D-501; products `bss_products_sdk::derived` (P-D-229, P-D-259).
 - **Contracts**: UPSTREAM_REQS P-15, P-16, P-17 — [`UPSTREAM_REQS.md`](UPSTREAM_REQS.md).
 - **ADR**: [`../ADR/0001-cpt-cf-bss-rating-adr-scope-key-adoption.md`](ADR/0001-cpt-cf-bss-rating-adr-scope-key-adoption.md) (superseded by T-D-73).
@@ -4763,8 +4788,8 @@ D-504 refuses phases in a new sale). What remains:
 - **One-time charges**: Subscriptions bills them and deduplicates per phase-entry occurrence
   `(tenantId, subscriptionId, phaseEntryId, componentOccurrenceId, chargeLineId)` (SUB-D-28,
   T-D-36); they are not rated while T-D-18 stands (reversal proposed, R-19).
-- **Order-evaluation contexts** (`OrderEvaluationV1`): the order's exact bindings, no walk
-  (T-D-79).
+- **Order-evaluation contexts** (`OrderEvaluationV1`): the bindings Orders selected, no walk
+  (Orders D-197; T-D-83).
 - **Binding cross-check** (R-18 closed by T-D-37): when the fact carries an accepted binding, the
   binding Pricing resolves for the fact's pins **on the period start** must be that binding;
   otherwise the child fails closed `binding_mismatch`. A slice after an `ends_on` uses the successor
@@ -4806,7 +4831,7 @@ Removed: `no_eligible_window`, `selection_ambiguity`, `missing_phase_context`, `
 - **PRD**: §6.3 `fr-base-catalog-selection`, `fr-evaluation-order` (step 1); §6.5; §17.1 step 1.
 - **Dependencies on main**: pricing D-384–D-386, D-394, D-397, D-419–D-425, D-501, D-504; SUB-D-28, SUB-D-29; Orders D-162.
 - **Contracts**: UPSTREAM_REQS P-15, P-16, S-1 — [`UPSTREAM_REQS.md`](UPSTREAM_REQS.md).
-- **Decisions**: T-D-18, T-D-36, T-D-37, T-D-73, T-D-79, R-18 (closed), R-19 — [`DECISIONS.md`](DECISIONS.md).
+- **Decisions**: T-D-18, T-D-36, T-D-37, T-D-73, T-D-79, T-D-83, R-18 (closed), R-19 — [`DECISIONS.md`](DECISIONS.md).
 - **ADR**: [`../ADR/0001-cpt-cf-bss-rating-adr-scope-key-adoption.md`](ADR/0001-cpt-cf-bss-rating-adr-scope-key-adoption.md) (superseded by T-D-73).
 - **Related contracts**: [contract 01](#contract-01), [contract 03](#contract-03).
 
@@ -5244,15 +5269,15 @@ two hours with `q = 8` and `q = 12` rate independently to 0.34 in volume, never 
      `ExactQuantity` — never by `evaluate_window`, which sums in `rust_decimal` (`checked_add`) and
      would round once the sum passes 28 significant digits; the two agree wherever
      `evaluate_window`'s result is exact. Products evaluates `Add`, `Sub`, `Mul` and `DivConst`
-     with `rust_decimal` checked operations, which round a result that needs more than 28
-     significant digits or 28 fractional digits before the declared `output_round` (rust_decimal
+     with `rust_decimal` checked operations, which round a result that needs more than a 96-bit
+     coefficient or 28 fractional digits before the declared `output_round` (rust_decimal
      1.41: `1e20 + 1e-10` gives `100000000000000000000.00000000`); that undeclared intermediate rounding is Products' to remove
      (`…-upreq-products-derived-output-limits`, R-33). Until it is, Rating **gates** it (money ADR
      rule 4; T-D-80): per granule, `DerivedExactnessGuard` re-evaluates the declaration's expression
      tree (`Input`, `Const`, `Add`, `Sub`, `Mul`, `DivConst`, `Max`, `Min`, and the declared `Ceil`,
      `Floor`, `Round`) over exact fractions and requires every `Add`, `Sub`, `Mul` and `DivConst`
-     result to be exactly representable as a `rust_decimal::Decimal` (at most 28 significant and 28
-     fractional digits; `Max`, `Min` and the declared roundings return an operand or a declared
+     result to be exactly representable as a `rust_decimal::Decimal` (a coefficient of at most
+     `2^96 − 1` at a scale of at most 28; `Max`, `Min` and the declared roundings return an operand or a declared
      rounding and need no check). If one is not — `DivConst(x, 3)` of a value not divisible by 3, a
      product needing 31 fractional digits, or `1e20 + 1e-10` — the child fails `derived_formula_inexact` before `derived::evaluate`'s output
      is used; nothing is rounded beyond what the declaration states. The guard is part of the engine
@@ -5960,7 +5985,7 @@ plan floor or cap (D-467), and commitments are deferred with price adjustments (
 pipeline uses it to lay out counter slices before evaluation ([contract 13](#contract-13)), and `evaluate` recomputes
 it from the same inputs and fails with `layout_mismatch` if the counters were laid out under a
 different result (the rater then re-materializes the window).
-`rating_core::window_geometry(&UsageRatingPolicy, fact_served_extent, billing_period)` (§3.3) returns the expected child windows of a
+`rating_core::window_geometry(&UsageRatingPolicy, FactExtent{served, period})` (§3.3) returns the expected child windows of a
 fact from the binding's `usage_rating_policy.rating_window` ([14 §4.4](features/06-fact-scheduling.md#contract-14-4-4)).
 
 <!-- /contract -->
@@ -6567,7 +6592,7 @@ is disabled until its producer and consumer adopt the same contract (DESIGN §3.
 | `cpt-cf-bss-rating-contract-promotions-coupon` | Deferred ([price adjustments](deferred/price-adjustments-design.md), T-D-81); a coupon input fails `adjustment_unsupported` (R-11). |
 | `cpt-cf-bss-rating-contract-billing-periodstate` | §4.6 — delivery, recovery reads, period hint. |
 | `cpt-cf-bss-rating-contract-contracts-input` | Deferred ([price adjustments](deferred/price-adjustments-design.md), T-D-81); a contract input fails `adjustment_unsupported` (R-11). |
-| `cpt-cf-bss-rating-fr-pre-purchase-evaluation` | §4.10 — `OrderEvaluationV1` over Orders' accepted chain matrix (T-D-79). |
+| `cpt-cf-bss-rating-fr-pre-purchase-evaluation` | §4.10 — `OrderEvaluationV1` over the bindings Orders selected (Orders D-197, D-216; T-D-83). |
 | `cpt-cf-bss-rating-fr-snapshot-carry` | §4.7. |
 
 <a id="contract-11-nfr-allocation"></a>
@@ -6684,7 +6709,7 @@ trait resolved from ClientHub at gear `init`.
 **Contract**: `cpt-cf-bss-rating-interface-contracts-input-cc` (`p1`), defined in [§3.3 Namespace interfaces](#register-interfaces).
   Contracts — §4.9 (no source).
 **Contract**: `cpt-cf-bss-rating-interface-order-evaluation-cc` (`p1`), defined in [§3.3 Namespace interfaces](#register-interfaces).
-  `OrderEvaluationV1` — §4.10 (Orders D-167, T-D-79).
+  `OrderEvaluationV1` — §4.10 (Orders D-197, D-216; T-D-83).
 
 <!-- /contract -->
 
@@ -6989,42 +7014,65 @@ current behaviour.
 - [ ] `p1` - **ID**: `cpt-cf-bss-rating-design-order-evaluation-cc`
 
 `OrderEvaluationV1::evaluate(ctx, OrderEvaluationRequest) -> Result<OrderEvaluation,
-CanonicalError>` (T-D-54 as refined by T-D-79), Rating-provided, consumed by Orders Lifecycle at
-submit and amendment as "one logical batched pre-purchase evaluation over the exact selected
-bindings" (Orders D-154, D-167; `orders-lifecycle/docs/UPSTREAM_REQS.md:303-351`). Orders does not
-consume the Atlas C06 DTO (`acceptance_ref`, `ExactAmount`, `catalog_version`); this contract
-replaces it. Orders confirms it under R-24; until then the call returns `ServiceUnavailable`
-(DESIGN §4.10).
+CanonicalError>` (T-D-54 as refined by T-D-83), Rating-provided, consumed by Orders at Preview,
+submit and amendment as one batched, nonbinding evaluation of the exact selected Pricing bindings
+(Orders D-197, selected 2026-10-05; Orders DESIGN `contract-03-rating-purchase-evaluation`; Orders
+UPSTREAM_REQS §2.2). Orders names the trait `RatingPurchaseEvaluationV1` and lists its delivery
+prerequisites: the SDK provider, the D-194 service grant, the supported-profile declaration and
+joint evidence against real providers (R-24). Until they hold, the call returns
+`ServiceUnavailable` (DESIGN §4.10). The pure arithmetic is `evaluate_order` of the current engine
+generation (01 §3.3).
 
-- **Request**: `{assessment_id, resolve_date, tenant_axes{seller, resource, payer}, contract?,
-  market, lines: [{line_id, plan_revision_id, term: Rolling | FixedPeriods{count}, cycle: month | year,
-  items: [{item_id,
-  quantity, chains: [{dim_value, binding}]}]}]}` — each `binding` is pricing's binding verbatim from
-  the order pin (Orders `OrderPin`, `orders-lifecycle/docs/DESIGN.md:6511-6526`). Rating prices exactly these bindings:
-  no renewal walk and no `resolve` call.
-  `contract?`, `market`, `term` and `cycle` are Rating's additions to Orders' D-167 request (Orders lists them
-  as request context, `orders-lifecycle/docs/UPSTREAM_REQS.md:306-309`), pending R-24.
-- **Response**: `OrderEvaluation{assessment_id, estimate: true, currency, currency_scale, lines: [{line_id,
-  items: [{item_id, charge_kind, gross, discount, net, minimum_fee_applied?, usage_flagged,
-  usage_rates?[{price_id, unit, model, tiers?, rating_window}]}], totals}], order_totals, tcv,
-  promotion_status}`; a recurring item's amounts are per `cycle`, which must equal the bindings'
-  `recurring_period` (else `InvalidArgument`). Every amount is returned twice:
-  exact (`ExactMoney`, major units) and as a display decimal in major units rounded HALF_EVEN at
-  `currency_scale`, canonical text, with the response marked `estimate: true` (money ADR rules 2,
-  7). The one rule (cited by T-D-79, feature 10 and UPSTREAM_REQS): every amount is `{exact: ExactMoney, display}` with `display = round_half_even(exact, currency_scale)` (money ADR rule 7: a display total carries its exact value); `tcv` additionally carries `posting_estimate` = the sum over items of `periods × round_half_even(item per-cycle net)` plus the rounded one-time nets — what Billing would post with one invoice line per item and period. Displayed lines need
-  not add up to a displayed total. The display form is what Orders may persist; Orders' documents (`orders-lifecycle/docs/UPSTREAM_REQS.md:317, 347`, `PRD.md:1090`) still
-  name integer minor units, which the money ADR retires (R-24). Order evaluation is never a billing
-  input, so Billing's rounding rule is untouched.
-- **TCV**: net pre-tax, usage excluded, one-time counted once; rolling terms annualised ×12 for
-  `month` and ×1 for `year` (the two periods the PriceBook supports); `FixedPeriods{count}` =
-  `count × recurring net + one-time net`; any other cycle is refused (`InvalidArgument`). Orders never
-  sums lines: Rating returns the whole-order totals.
-- **Rules**: one-time preview synthesizes no rating unit; a recurring price's minimum fee is
-  applied per cycle and counted in TCV, and a usage price's minimum fee is reported, not applied,
-  because consumption is unknown (T-D-78, `minimum_fee_applied`); promotions, brand and indicative tax are unavailable and reported as such, never as
-  a zero discount; usage is shown as rates (incl. hourly band tables and the rating window) and
-  excluded from TCV — never a predicted consumption (Atlas F01, F10). A missing or inconsistent input
-  is a typed error that Orders maps to `evaluation-unavailable`.
+- **Request** (Orders D-197 "Request identity", "Authority/context", "Commercial inputs"): the
+  schema and profile version, `assessment_id`, the assessment instant and UTC `resolve_date`, the
+  canonical input digest; the seller, resource and payer axes, each authorized, the payer-backed
+  `market` and the `contract` reference; per line `line_id`, `plan_id`, `plan_revision_id`, the
+  Term (`rolling` | `fixed_periods{count}`, Orders D-193; `missing` only on Preview, D-189),
+  the complete `BillingTerms` with its digest and `start_at`; per item `item_id`, its selected
+  native Pricing binding (an `AcceptedBinding`, one per item, with the producer's digests) and an
+  explicit quantity — never an implicit per-item or plan multiplier. Rating prices exactly these
+  bindings: no successor lookup, no `resolve` call, no SKU or default refresh. A receipt Pricing
+  issues later must carry the same selection, quantity, market, terms and bindings (Orders D-188).
+- **Response** (Orders D-197 "Monetary result", D-216): the echoed identity and digest, the
+  supported profile and the evaluation policy (the engine generation); `currency` and the one
+  `currency_scale` of the order's bindings (no rounding mode); per item its charge kind, cycle,
+  the model's amount, `minimum_fee` and whether it applied, gross and net, and for usage its rates
+  (model, unit, `rating_window`); per line and per order one row per charge kind with gross and
+  net, `discount_status`, `amount_status` (`committed`; `uncommitted_usage` for usage, which has no
+  amount — distinct from a zero-priced charge), `amount_basis` and `recurring_by_cycle` (per-cycle
+  figures, never summed across cycles); one TCV on the order's `recurring` row, present even for a
+  one-time-only or usage-only order, with `tcv_basis` and per-line horizon evidence. Every amount is
+  `{exact, display}`: `exact` is canonical decimal text in major units (at most 28 significant and
+  28 fractional digits, D-216; an amount beyond it fails `precision_overflow`) and `display` the
+  HALF_EVEN rounding of `exact` at `currency_scale`, in canonical text (money ADR rule 7: a display
+  estimate carries its exact value and is never a payment instruction). Displayed lines need not
+  add up to a displayed total. Order evaluation is never a billing input.
+- **Amounts** (T-D-83): a recurring item is priced per cycle (`flat` → `amount`, `per_unit` →
+  `unit_amount × quantity`) and floored per cycle at its `minimum_fee` (covered fraction 1,
+  T-D-78); a one-time item once, floored the same way; a usage item has no amount, and its
+  `minimum_fee` is reported, not applied, because consumption is unknown. There is no
+  activation-time proration: the total is indicative (Orders D-197).
+- **Horizon and TCV**: a line's recurring aggregate is its per-cycle sum times the periods of its
+  term — `count` for `fixed_periods`, 12 for a rolling `month`, 1 for a rolling `year` — on the
+  basis `finite_term` or `rolling_annualized`; the order's is the sum of its lines', on the basis
+  its lines with recurring amounts share, or `mixed` (an order without recurring amounts takes its
+  lines' terms). TCV = the order's recurring aggregate plus its one-time amounts, net,
+  pre-tax, usage excluded. Annualization is this product's policy, not a universal TCV definition;
+  TCV is not deal value (Orders D-197).
+- **Preview**: a line whose term or cycle is missing withholds its recurring aggregate and the TCV,
+  and is listed (`tcv_withheld`); every other figure is still returned (Orders D-195). A line
+  without recurring items has a known zero recurring aggregate, so it withholds only the TCV.
+- **Refusals**: a missing or inconsistent input is a typed error that Orders maps to
+  `evaluation-unavailable`, never a partial answer or a guessed zero: a contract reference
+  (`adjustment_unsupported`; contract terms are deferred, T-D-81), a binding in another currency
+  (`fx_not_supported`) or at another stored scale (`binding_currency_mismatch`), a price that is
+  not approved (`price_uncovered`), a model outside the sale profile — `flat` or `per_unit` for
+  recurring and one-time items; `per_unit`, `volume` or `graduated` for usage (pricing D-504) —
+  or a term of zero periods (`unsupported_primitive`), a recurring period other than the line's
+  billing cycle (`period_geometry_mismatch`), an item listed twice (`non_injective_mapping`).
+- **Discounts**: `unavailable`, never a guessed zero, while promotions are deferred (pricing
+  D-409); net equals gross. Brand-scoped terms and indicative tax are declared exclusions (Orders
+  §4.5).
 - Pure: no persistence, no idempotency key, no reservation, never a billing input.
 
 <!-- /contract -->
@@ -7089,7 +7137,7 @@ replaces it. Orders confirms it under R-24; until then the call returns `Service
 - **DESIGN**: §3.3, §3.5, §4.1.
 - **UPSTREAM_REQS**: §B–§G, §J, §L.
 - **Decisions**: T-D-18, T-D-37, T-D-38, T-D-41, T-D-42, T-D-48, T-D-50, T-D-54, T-D-56, T-D-61,
-  T-D-63, T-D-65, T-D-70, T-D-71, T-D-73, T-D-74, T-D-76, T-D-78, T-D-79; open R-01, R-03…R-05, R-20, R-24,
+  T-D-63, T-D-65, T-D-70, T-D-71, T-D-73, T-D-74, T-D-76, T-D-78, T-D-79 (superseded by T-D-83), T-D-83; open R-01, R-03…R-05, R-20, R-24,
   R-25, R-27, R-29, R-31; deferred R-07, R-11; closed R-02, R-17, R-18, R-22.
 
 <!-- /contract -->

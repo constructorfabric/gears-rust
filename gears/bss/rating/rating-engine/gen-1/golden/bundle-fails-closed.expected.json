@@ -1,0 +1,6 @@
+{
+  "error": {
+    "reason_code": "unsupported_primitive",
+    "detail": "the line names bundle \"starter-bundle\"; bundle summing is dormant (pricing D-411)"
+  }
+}

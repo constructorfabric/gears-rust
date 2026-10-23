@@ -1,0 +1,6 @@
+{
+  "error": {
+    "reason_code": "unsupported_primitive",
+    "detail": "usage price 00000000-0000-0000-0000-000000020001 carries a minimum fee on a CalendarHourUtc, SubscriptionLine-scoped window; no floor is agreed there (R-34)"
+  }
+}

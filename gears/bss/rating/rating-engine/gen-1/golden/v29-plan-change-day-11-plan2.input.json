@@ -1,0 +1,165 @@
+{
+  "description": "plan#2 (60.00 a month) covers the rest; the two covered fractions sum to 1.",
+  "vectors": [
+    "V29"
+  ],
+  "input": {
+    "child": {
+      "child_id": "00000000-0000-0000-0000-0000000000c0",
+      "kind": "period_line",
+      "window": {
+        "window_start": "2026-09-01T00:00:00Z",
+        "window_end": "2026-10-01T00:00:00Z",
+        "served_from": "2026-09-11T00:00:00Z",
+        "served_to": "2026-10-01T00:00:00Z"
+      },
+      "aggregation_key": {
+        "tenant_axes": {
+          "seller_tenant_id": "00000000-0000-0000-0000-00000000000a",
+          "payer_tenant_id": "00000000-0000-0000-0000-00000000000b",
+          "resource_tenant_id": "00000000-0000-0000-0000-00000000000c"
+        },
+        "subscription_id": "00000000-0000-0000-0000-000000000005",
+        "sub_line_key": "plan#2",
+        "item_id": "00000000-0000-0000-0000-000000010001",
+        "meter": null,
+        "dimension_key": null,
+        "scope": {
+          "kind": "subscription_line"
+        }
+      }
+    },
+    "fact": {
+      "fact_id": "00000000-0000-0000-0000-00000000000f",
+      "fact_version": 1,
+      "kind": "recurring",
+      "subscription_id": "00000000-0000-0000-0000-000000000005",
+      "sub_line_key": "plan#2",
+      "currency": "EUR",
+      "period": {
+        "start": "2026-09-01T00:00:00Z",
+        "end": "2026-10-01T00:00:00Z"
+      },
+      "served": {
+        "start": "2026-09-11T00:00:00Z",
+        "end": "2026-10-01T00:00:00Z"
+      },
+      "plan_revision_id": "00000000-0000-0000-0000-000000000007",
+      "accepted": [
+        {
+          "item_id": "00000000-0000-0000-0000-000000010001",
+          "dimension_value": null,
+          "price_id": "00000000-0000-0000-0000-000000020001"
+        }
+      ],
+      "quantity": "1",
+      "suspensions": [],
+      "suspension_posture": "continue",
+      "adjustments": [],
+      "bundle": null
+    },
+    "pricing": {
+      "plan_id": "00000000-0000-0000-0000-000000000006",
+      "revision_id": "00000000-0000-0000-0000-000000000007",
+      "pins": [
+        {
+          "item_id": "00000000-0000-0000-0000-000000010001",
+          "dimension_value": null,
+          "price_id": "00000000-0000-0000-0000-000000020001"
+        }
+      ],
+      "binding_of_record": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "resolves": [
+        {
+          "resolve_date": "2026-09-01",
+          "binding_digest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+          "cells": [
+            {
+              "selection": {
+                "item_id": "00000000-0000-0000-0000-000000010001",
+                "dimension_value": null
+              },
+              "binding": {
+                "item_id": "00000000-0000-0000-0000-000000010001",
+                "price_book_entry_id": "00000000-0000-0000-0000-000000030001",
+                "dimension_key": null,
+                "dimension_value": null,
+                "sku_id": "00000000-0000-0000-0000-000000040001",
+                "sku_version": 1,
+                "sku_code": "PRO",
+                "sku_name": "Pro plan",
+                "unit": null,
+                "meter": null,
+                "price": {
+                  "price_id": "00000000-0000-0000-0000-000000020001",
+                  "price_book_entry_id": "00000000-0000-0000-0000-000000030001",
+                  "money_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                  "currency": {
+                    "code": "EUR",
+                    "scale": 2
+                  },
+                  "model": {
+                    "model": "flat",
+                    "amount": "60"
+                  },
+                  "minimum_fee": null,
+                  "effective_from": "2026-01-01",
+                  "ends_on": null,
+                  "state": "approved"
+                },
+                "kind": "recurring",
+                "recurring_period": "month",
+                "via_default": false,
+                "usage_policy": null,
+                "invoice": {
+                  "template": "Pro plan, {period}",
+                  "template_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                  "template_source": "entry",
+                  "gl_code": "4000",
+                  "tax_category": "std",
+                  "timing": "advance",
+                  "rounding": "half_even"
+                }
+              }
+            }
+          ]
+        }
+      ]
+    },
+    "derived": null,
+    "subscription": {
+      "subscription_id": "00000000-0000-0000-0000-000000000005",
+      "subscription_version": 1,
+      "tenant_axes": {
+        "seller_tenant_id": "00000000-0000-0000-0000-00000000000a",
+        "payer_tenant_id": "00000000-0000-0000-0000-00000000000b",
+        "resource_tenant_id": "00000000-0000-0000-0000-00000000000c"
+      },
+      "plan_id": "00000000-0000-0000-0000-000000000006",
+      "plan_revision_id": "00000000-0000-0000-0000-000000000007",
+      "quantity_intervals": [],
+      "brand": null
+    },
+    "quantities": {
+      "layout_version": 1,
+      "slices": [
+        {
+          "slice_start": "2026-09-11T00:00:00Z",
+          "slice_end": "2026-10-01T00:00:00Z",
+          "q": "1",
+          "q_version": 1,
+          "granules": []
+        }
+      ]
+    },
+    "group_context": null,
+    "budget": {
+      "reduced_digits": 256,
+      "scratch_digits": 512
+    },
+    "engine": {
+      "engine_generation": 1,
+      "engine_digest": "<engine_digest>"
+    }
+  }
+}
