@@ -102,7 +102,7 @@ impl From<RenderedDeclaration> for DeclarationDto {
             category_id: d.category_id,
             scope_class: d.scope_class,
             mode: d.mode,
-            status: d.status,
+            status: d.status.as_str().to_owned(),
             domain_affinity: d.domain_affinity,
             licence_feature: d.licence_feature,
             owner_module: d.owner_module,

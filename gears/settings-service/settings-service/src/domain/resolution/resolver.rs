@@ -516,7 +516,7 @@ where
         target: ScopeTarget,
         subtree: &Subtree,
     ) -> Result<Vec<SubtreeValue>, DomainError> {
-        if declaration.status == "retired" {
+        if declaration.status.is_retired() {
             return Err(DomainError::Retired {
                 key: declaration.key.clone(),
             });
@@ -832,7 +832,7 @@ where
         // @cpt-begin:cpt-cf-settings-service-flow-value-resolution-resolve:p1:inst-vr-resolve-6
         // A positive fact, distinct from not-found; the retained values stay
         // in the table and are not returned.
-        if declaration.status == "retired" {
+        if declaration.status.is_retired() {
             return Err(DomainError::Retired {
                 key: declaration.key.clone(),
             });

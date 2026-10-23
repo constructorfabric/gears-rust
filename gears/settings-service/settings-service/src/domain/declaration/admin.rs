@@ -100,7 +100,7 @@ struct Located {
 impl Located {
     /// The active declaration on the version-stripped path, whatever its major.
     fn active(&self) -> Option<&Declaration> {
-        self.on_path.iter().find(|d| d.is_active())
+        self.on_path.iter().find(|d| d.status.is_active())
     }
 
     /// The retired declaration a create here would revive: the one at the
@@ -109,7 +109,7 @@ impl Located {
         if self.active().is_some() {
             return None;
         }
-        self.existing.as_ref().filter(|d| d.status().is_retired())
+        self.existing.as_ref().filter(|d| d.status.is_retired())
     }
 }
 
@@ -528,7 +528,7 @@ fn snapshot(declaration: &Declaration) -> Value {
         "default_value": declaration.default_value,
         "scope_class": declaration.scope_class,
         "mode": declaration.mode,
-        "status": declaration.status,
+        "status": declaration.status.as_str(),
         "description": declaration.description,
         "display_name": declaration.display_name,
         "domain_affinity": declaration.domain_affinity,
@@ -622,7 +622,7 @@ where
             ..
         } = located;
 
-        if let Some(active) = on_path.iter().find(|d| d.is_active()) {
+        if let Some(active) = on_path.iter().find(|d| d.status.is_active()) {
             // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-evolve:p1:inst-decl-evolve-2
             // A request matching the active declaration is not evolution: a
             // retry after a lost response must not mint a major by accident,
@@ -656,7 +656,7 @@ where
 
         match existing {
             // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-reactivate:p1:inst-decl-react-6
-            Some(active) if active.is_active() => Err(conflict(
+            Some(active) if active.status.is_active() => Err(conflict(
                 conflict::KEY_CONFLICT,
                 format!(
                     "`{}` is an active declaration; metadata changes use PATCH",
@@ -1207,13 +1207,7 @@ where
         }
         if let Err(err) = self
             .declarations
-            .set_status(
-                conn,
-                scope,
-                retired.id,
-                DeclarationStatus::Active.as_str(),
-                None,
-            )
+            .set_status(conn, scope, retired.id, DeclarationStatus::Active, None)
             .await
         {
             return Err(match err {
@@ -1329,13 +1323,7 @@ where
         // all the unique index admits.
         // @cpt-begin:cpt-cf-settings-service-state-setting-declarations-lifecycle:p1:inst-decl-state-5
         self.declarations
-            .set_status(
-                conn,
-                scope,
-                active.id,
-                DeclarationStatus::Retired.as_str(),
-                None,
-            )
+            .set_status(conn, scope, active.id, DeclarationStatus::Retired, None)
             .await?;
         // @cpt-end:cpt-cf-settings-service-state-setting-declarations-lifecycle:p1:inst-decl-state-5
         let retired = self.reload(conn, scope, &active.key).await?;
@@ -1648,7 +1636,7 @@ where
         // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-retire:p1:inst-decl-retire-9
         precondition::evaluate(if_match, &etag_of(&current))?;
         // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-retire:p1:inst-decl-retire-9
-        if current.status().is_retired() {
+        if current.status.is_retired() {
             return Ok(current);
         }
         // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-retire:p1:inst-decl-retire-10
@@ -1663,7 +1651,7 @@ where
                 conn,
                 scope,
                 id,
-                DeclarationStatus::Retired.as_str(),
+                DeclarationStatus::Retired,
                 Some(current.updated_at),
             )
             .await?;

@@ -52,8 +52,8 @@ pub struct Declaration {
     /// `standard` or `advanced`.
     pub mode: String,
 
-    /// `active` or `retired`.
-    pub status: String,
+    /// The lifecycle status: active, or retired and out of resolution.
+    pub status: DeclarationStatus,
 
     /// The administrative domain, when the declaration is bound to one.
     pub domain_affinity: Option<String>,
@@ -101,19 +101,6 @@ pub struct Declaration {
 }
 
 impl Declaration {
-    /// The lifecycle status. A stored status that is neither `active` nor
-    /// `retired` reads as retired — fail closed, so it never resolves.
-    #[must_use]
-    pub fn status(&self) -> DeclarationStatus {
-        DeclarationStatus::from_stored(&self.status)
-    }
-
-    /// Whether the declaration is active.
-    #[must_use]
-    pub fn is_active(&self) -> bool {
-        self.status().is_active()
-    }
-
     /// The data classification. A stored class that is none of the three
     /// reads as `secret` — fail closed, so it masks rather than shows.
     #[must_use]
@@ -296,7 +283,7 @@ pub trait DeclarationRepository: Send + Sync {
         conn: &C,
         scope: &AccessScope,
         id: Uuid,
-        status: &str,
+        status: DeclarationStatus,
         expected: Option<time::OffsetDateTime>,
     ) -> Result<(), DomainError>;
 
@@ -392,7 +379,7 @@ pub trait DeclarationRepository: Send + Sync {
             .find_by_category(conn, scope, category_id)
             .await?
             .into_iter()
-            .find(|d| d.status == "active" && d.leaf_slug == leaf_slug))
+            .find(|d| d.status.is_active() && d.leaf_slug == leaf_slug))
     }
 
     /// List declarations for the caller, leaving out those `hidden` for the

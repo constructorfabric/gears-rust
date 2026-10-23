@@ -15,6 +15,7 @@ use crate::domain::access::TenantAccess;
 use crate::domain::category::visibility::DomainVisibility;
 use crate::domain::declaration::{
     CategoryTally, Declaration, DeclarationDraft, DeclarationMetadata, DeclarationRepository,
+    DeclarationStatus,
 };
 use crate::domain::error::DomainError;
 use crate::domain::odata::Listing;
@@ -50,7 +51,7 @@ pub(crate) fn to_domain(model: declaration::Model) -> Declaration {
         category_id: model.category_id,
         scope_class: model.scope_class,
         mode: model.mode,
-        status: model.status,
+        status: DeclarationStatus::from_stored(&model.status),
         domain_affinity: model.domain_affinity,
         licence_feature: model.licence_feature,
         owner_module: model.owner_module,
@@ -207,7 +208,7 @@ impl DeclarationRepository for DeclarationRepo {
             source: Set(draft.source),
             owner_module: Set(draft.owner_module),
             licence_feature: Set(draft.licence_feature),
-            status: Set("active".to_owned()),
+            status: Set(DeclarationStatus::Active.as_str().to_owned()),
             display_name: Set(draft.display_name),
             description: Set(draft.description),
             last_change_at: Set(at),
@@ -287,12 +288,12 @@ impl DeclarationRepository for DeclarationRepo {
         conn: &C,
         scope: &AccessScope,
         id: Uuid,
-        status: &str,
+        status: DeclarationStatus,
         expected: Option<time::OffsetDateTime>,
     ) -> Result<(), DomainError> {
         let at = stamp_after(expected);
         let update = DeclarationEntity::update_many()
-            .col_expr(declaration::Column::Status, Expr::value(status.to_owned()))
+            .col_expr(declaration::Column::Status, Expr::value(status.as_str()))
             .col_expr(declaration::Column::LastChangeAt, Expr::value(at))
             .col_expr(declaration::Column::UpdatedAt, Expr::value(at))
             .filter(declaration::Column::Id.eq(id));
@@ -426,7 +427,7 @@ impl DeclarationRepository for DeclarationRepo {
         let found = DeclarationEntity::find()
             .filter(declaration::Column::CategoryId.eq(category_id))
             .filter(declaration::Column::LeafSlug.eq(leaf_slug))
-            .filter(declaration::Column::Status.eq("active"))
+            .filter(declaration::Column::Status.eq(DeclarationStatus::Active.as_str()))
             .secure()
             .scope_with(scope)
             .one(conn)
@@ -577,7 +578,7 @@ impl DeclarationRepository for DeclarationRepo {
             if row.mode == "advanced" {
                 tally.advanced += n;
             }
-            if row.status == "retired" {
+            if row.status == DeclarationStatus::Retired.as_str() {
                 tally.retired += n;
             }
         }

@@ -25,7 +25,7 @@ use uuid::Uuid;
 
 use crate::domain::category::Category;
 use crate::domain::category::visibility::DomainVisibility;
-use crate::domain::declaration::Declaration;
+use crate::domain::declaration::{Declaration, DeclarationStatus};
 use crate::domain::error::DomainError;
 use crate::domain::odata::Listing;
 use crate::domain::search::{Corpus, Needle, SearchRepository, SearchRequest};
@@ -240,7 +240,7 @@ impl SearchRepository for SearchRepo {
             declaration_repo::apply_visibility(DeclarationEntity::find(), request.visibility),
             request.hidden_for,
         )
-        .filter(declaration::Column::Status.eq("active"))
+        .filter(declaration::Column::Status.eq(DeclarationStatus::Active.as_str()))
         .filter(matched);
         // `needs_review eq true`, in the query: only settings whose own
         // override at the target is flagged for review — the same narrowing the

@@ -3,8 +3,8 @@
 use serde_json::json;
 
 use super::{CreateDeclarationRequest, DeclarationDto, UpdateDeclarationRequest};
-use crate::domain::declaration::Declaration;
 use crate::domain::declaration::service::RenderedDeclaration;
+use crate::domain::declaration::{Declaration, DeclarationStatus};
 use uuid::Uuid;
 
 fn rendered(traits: serde_json::Value) -> RenderedDeclaration {
@@ -17,7 +17,7 @@ fn rendered(traits: serde_json::Value) -> RenderedDeclaration {
             category_id: Uuid::nil(),
             scope_class: "local".to_owned(),
             mode: "standard".to_owned(),
-            status: "active".to_owned(),
+            status: DeclarationStatus::Active,
             domain_affinity: None,
             licence_feature: None,
             owner_module: None,

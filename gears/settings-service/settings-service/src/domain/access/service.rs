@@ -89,7 +89,7 @@ fn absent() -> DomainError {
 /// retired declaration refuses it as retired. The rows it keeps across the
 /// retire stay readable — they are what a revive brings back.
 fn refuse_retired(declaration: &Declaration) -> Result<(), DomainError> {
-    if declaration.status == "retired" {
+    if declaration.status.is_retired() {
         return Err(DomainError::Retired {
             key: declaration.key.clone(),
         });

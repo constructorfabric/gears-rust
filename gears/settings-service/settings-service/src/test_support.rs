@@ -33,7 +33,7 @@ use serde_json::json;
 use toolkit_security::{AccessScope, SecurityContext};
 
 use crate::domain::category::{CategoryDraft, CategoryKey, CategoryRepository};
-use crate::domain::declaration::{DeclarationDraft, DeclarationRepository};
+use crate::domain::declaration::{DeclarationDraft, DeclarationRepository, DeclarationStatus};
 use crate::domain::resolution::{EffectiveCache, ScopeTarget, ValueResolver};
 use crate::domain::value::{ValueDraft, ValueRepository};
 use crate::infra::storage::access_repo::AccessRepo;
@@ -810,7 +810,7 @@ impl ResolutionHarness {
                 &conn,
                 &AccessScope::allow_all(),
                 declaration_id,
-                "retired",
+                DeclarationStatus::Retired,
                 None,
             )
             .await

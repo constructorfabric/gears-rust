@@ -9,7 +9,7 @@ use super::{render_readout, render_restriction};
 use crate::domain::access::{
     ABSENT_RESTRICTION_TAG, AccessReadout, EffectiveAccess, Restriction, TenantAccess,
 };
-use crate::domain::declaration::Declaration;
+use crate::domain::declaration::{Declaration, DeclarationStatus};
 use crate::domain::resolution::MASK_TOKEN;
 
 const KEY: &str = "gts.cf.core.settings.setting_type.v1~acme.settings.network.proxy.v1~";
@@ -27,7 +27,7 @@ fn declaration() -> Declaration {
         category_id: Uuid::nil(),
         scope_class: "cascading".to_owned(),
         mode: "standard".to_owned(),
-        status: "active".to_owned(),
+        status: DeclarationStatus::Active,
         domain_affinity: None,
         licence_feature: None,
         owner_module: None,

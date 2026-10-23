@@ -13,7 +13,9 @@ use uuid::Uuid;
 
 use super::{CreateDeclaration, DeclarationAdmin, FieldClass, classify_field, etag_of};
 use crate::audit::AuditOperation;
-use crate::domain::declaration::{Declaration, DeclarationDraft, DeclarationRepository};
+use crate::domain::declaration::{
+    Declaration, DeclarationDraft, DeclarationRepository, DeclarationStatus,
+};
 use crate::domain::error::DomainError;
 use crate::domain::stepup::{StepUpRefusal, StepUpVerifier, USER_SUBJECT_TYPE};
 use crate::domain::value::ValueRepository;
@@ -185,7 +187,7 @@ async fn a_create_composes_the_key_registers_the_type_and_records_it() {
     );
     assert_eq!(d.leaf_slug, "retry_policy");
     assert_eq!(d.source, "admin_authored");
-    assert_eq!(d.status, "active");
+    assert_eq!(d.status, DeclarationStatus::Active);
     assert!(d.owner_module.is_none());
     // Unsupplied gates take their protective defaults.
     assert!(d.requires_step_up);
@@ -420,7 +422,13 @@ async fn the_row_write_itself_is_conditional_on_the_version_the_tag_was_compared
         "{refused:?}"
     );
     let refused = DeclarationRepo
-        .set_status(&conn, &all, current.id, "retired", Some(stale))
+        .set_status(
+            &conn,
+            &all,
+            current.id,
+            DeclarationStatus::Retired,
+            Some(stale),
+        )
         .await
         .expect_err("moved");
     assert!(
@@ -428,16 +436,22 @@ async fn the_row_write_itself_is_conditional_on_the_version_the_tag_was_compared
         "{refused:?}"
     );
     let kept = h.load(current.id).await;
-    assert_eq!(kept.status, "active");
+    assert_eq!(kept.status, DeclarationStatus::Active);
     assert_eq!(kept.description.as_deref(), Some("a demo setting"));
 
     // At the version read, the write lands; without a version — a caller
     // under its own transaction, like a revive — it is unconditional.
     DeclarationRepo
-        .set_status(&conn, &all, current.id, "retired", Some(current.updated_at))
+        .set_status(
+            &conn,
+            &all,
+            current.id,
+            DeclarationStatus::Retired,
+            Some(current.updated_at),
+        )
         .await
         .expect("current version");
-    assert_eq!(h.load(current.id).await.status, "retired");
+    assert_eq!(h.load(current.id).await.status, DeclarationStatus::Retired);
     DeclarationRepo
         .update_metadata(&conn, &all, current.id, metadata(), None, true)
         .await
@@ -623,7 +637,7 @@ async fn a_contributed_declaration_is_not_admin_editable_or_retirable() {
         ),
         other => panic!("{other:?}"),
     }
-    assert_eq!(h.load(id).await.status, "active");
+    assert_eq!(h.load(id).await.status, DeclarationStatus::Active);
 }
 
 /// A module's declaration at the key an administrative create composes.
@@ -718,7 +732,7 @@ async fn a_retired_contributed_declaration_is_not_revived_by_an_administrative_c
         assert_contributed_immutable(err, what);
     }
     let row = h.load(id).await;
-    assert_eq!(row.status, "retired");
+    assert_eq!(row.status, DeclarationStatus::Retired);
     assert_eq!(row.default_value, json!(true));
     assert_eq!(row.owner_module.as_deref(), Some("module-x"));
     assert!(h.audit.records().is_empty(), "nothing audited");
@@ -737,7 +751,7 @@ async fn an_active_contributed_declaration_is_not_evolved_by_an_administrative_c
         assert_contributed_immutable(err, what);
     }
     let row = h.load(id).await;
-    assert_eq!(row.status, "active");
+    assert_eq!(row.status, DeclarationStatus::Active);
     assert_eq!(row.default_value, json!(true));
     assert!(
         h.by_key(&row.key.replace(".v1~", ".v2~")).await.is_none(),
@@ -761,7 +775,7 @@ async fn retire_needs_step_up_keeps_every_value_and_answers_with_the_retired_row
         .await
         .expect_err("step-up");
     assert!(matches!(err, DomainError::StepUpRequired { .. }), "{err:?}");
-    assert_eq!(h.load(id).await.status, "active");
+    assert_eq!(h.load(id).await.status, DeclarationStatus::Active);
 
     // With one: retired, values retained.
     let h = Harness::verified().await;
@@ -787,7 +801,7 @@ async fn retire_needs_step_up_keeps_every_value_and_answers_with_the_retired_row
         .retire(id, Some(tag.as_str()), &admin_actor())
         .await
         .expect("retired");
-    assert_eq!(retired.status, "retired");
+    assert_eq!(retired.status, DeclarationStatus::Retired);
     let conn = h.base.db.conn().expect("connection");
     assert!(
         ValueRepo
@@ -825,7 +839,7 @@ async fn re_declaring_a_retired_key_revives_it_with_its_values() {
         .expect("revived");
     assert!(revived.reactivated);
     assert_eq!(revived.declaration.id, id, "the row keeps its identity");
-    assert_eq!(revived.declaration.status, "active");
+    assert_eq!(revived.declaration.status, DeclarationStatus::Active);
     let conn = h.base.db.conn().expect("connection");
     assert!(
         ValueRepo
@@ -891,7 +905,7 @@ async fn a_revive_may_not_flip_the_secret_boundary_or_the_scope_class() {
     }
 
     // Nothing was reactivated, and the retained value is as it was.
-    assert_eq!(h.load(id).await.status, "retired");
+    assert_eq!(h.load(id).await.status, DeclarationStatus::Retired);
     let conn = h.base.db.conn().expect("connection");
     let row = ValueRepo
         .find_one(&conn, &AccessScope::allow_all(), id, tenant)
@@ -935,7 +949,7 @@ async fn a_revive_may_not_retype_the_setting_because_its_registered_type_cannot_
     // Nothing was reactivated, retyped or re-registered, and the retained
     // value is as it was.
     let row = h.load(id).await;
-    assert_eq!(row.status, "retired");
+    assert_eq!(row.status, DeclarationStatus::Retired);
     assert_eq!(row.value_type_id, BOOL);
     assert_eq!(row.default_value, json!(false));
     assert_eq!(h.registrar.registered.lock().expect("lock").len(), 1);
@@ -1155,7 +1169,7 @@ fn every_field_falls_into_exactly_one_class() {
         category_id: Uuid::new_v4(),
         scope_class: "cascading".to_owned(),
         mode: "standard".to_owned(),
-        status: "active".to_owned(),
+        status: DeclarationStatus::Active,
         domain_affinity: None,
         licence_feature: None,
         owner_module: None,
@@ -1350,10 +1364,10 @@ async fn a_behaviour_change_on_an_active_path_evolves_it_to_the_next_major() {
     assert!(v2.key.ends_with(".retry_policy.v2~"), "{}", v2.key);
     assert_ne!(v2.id, v1.id, "a new declaration, not the old row retyped");
     assert_eq!(v2.value_type_id, TEXT);
-    assert_eq!(v2.status, "active");
+    assert_eq!(v2.status, DeclarationStatus::Active);
     assert_eq!(
         h.load(v1.id).await.status,
-        "retired",
+        DeclarationStatus::Retired,
         "exactly one major is active"
     );
     assert_eq!(evolved.retired.as_deref(), Some(v1.key.as_str()));
@@ -1433,8 +1447,12 @@ async fn evolution_follows_the_active_major_and_a_repeat_of_it_mints_nothing() {
         .expect("to v3")
         .declaration;
     assert!(v3.key.ends_with(".retry_policy.v3~"), "{}", v3.key);
-    assert_eq!(h.load(v2.id).await.status, "retired");
-    assert_eq!(h.load(v1.id).await.status, "retired", "v1 stays retired");
+    assert_eq!(h.load(v2.id).await.status, DeclarationStatus::Retired);
+    assert_eq!(
+        h.load(v1.id).await.status,
+        DeclarationStatus::Retired,
+        "v1 stays retired"
+    );
     assert!(h.by_key(&v3.key.replace(".v3~", ".v4~")).await.is_none());
 }
 
@@ -1478,7 +1496,7 @@ async fn evolution_needs_step_up_and_may_not_cross_the_secret_boundary() {
         .await
         .expect_err("no step-up");
     assert!(matches!(err, DomainError::StepUpRequired { .. }), "{err:?}");
-    assert_eq!(h.load(v1.id).await.status, "active");
+    assert_eq!(h.load(v1.id).await.status, DeclarationStatus::Active);
 
     // Values stored inline are not re-interpreted as secret references.
     let h = Harness::verified().await;
@@ -1502,7 +1520,11 @@ async fn evolution_needs_step_up_and_may_not_cross_the_secret_boundary() {
         ),
         other => panic!("{other:?}"),
     }
-    assert_eq!(h.load(v1.id).await.status, "active", "nothing moved");
+    assert_eq!(
+        h.load(v1.id).await.status,
+        DeclarationStatus::Active,
+        "nothing moved"
+    );
     assert!(h.by_key(&v1.key.replace(".v1~", ".v2~")).await.is_none());
 }
 
@@ -1549,7 +1571,7 @@ fn classified_declaration() -> Declaration {
         category_id: Uuid::new_v4(),
         scope_class: "cascading".to_owned(),
         mode: "standard".to_owned(),
-        status: "active".to_owned(),
+        status: DeclarationStatus::Active,
         domain_affinity: None,
         licence_feature: None,
         owner_module: None,
@@ -2021,7 +2043,7 @@ async fn a_validator_that_goes_down_at_the_row_re_validation_fails_the_report_un
 
     // Advisory: the declaration is still retired and nothing was audited
     // beyond the create and the retire.
-    assert_eq!(h.load(id).await.status, "retired");
+    assert_eq!(h.load(id).await.status, DeclarationStatus::Retired);
     assert_eq!(h.audit.operations(), vec!["create", "remove"]);
 }
 
