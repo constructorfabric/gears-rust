@@ -142,9 +142,26 @@ pub async fn seed_groups<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait>(
         // @cpt-begin:cpt-cf-resource-group-algo-entity-hier-seed-groups:p1:inst-seed-groups-2a
         match group_service.get_group_unscoped(seed.id).await {
             // @cpt-end:cpt-cf-resource-group-algo-entity-hier-seed-groups:p1:inst-seed-groups-2a
-            Ok(_existing) => {
+            Ok(existing) => {
+                // A global ID match is not proof of seed ownership. Never adopt
+                // a pre-existing foreign or otherwise mismatched group.
+                let expected_tenant = if seed
+                    .code
+                    .starts_with(resource_group_sdk::TENANT_RG_TYPE_PATH)
+                {
+                    seed.id
+                } else {
+                    seed.tenant_id
+                };
+                if existing.hierarchy.tenant_id != expected_tenant
+                    || existing.code != seed.code
+                    || existing.name != seed.name
+                    || existing.hierarchy.parent_id != seed.parent_id
+                {
+                    return Err(DomainError::group_already_exists(seed.id));
+                }
                 // @cpt-begin:cpt-cf-resource-group-algo-entity-hier-seed-groups:p1:inst-seed-groups-2b
-                // Group exists AND definition matches → skip (unchanged)
+                // Group exists AND identity matches → skip (unchanged)
                 result.unchanged += 1;
                 // @cpt-end:cpt-cf-resource-group-algo-entity-hier-seed-groups:p1:inst-seed-groups-2b
             }

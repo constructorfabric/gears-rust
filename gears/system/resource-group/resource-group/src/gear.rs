@@ -6,7 +6,8 @@ use std::sync::{Arc, OnceLock};
 use async_trait::async_trait;
 use authz_resolver_sdk::{AuthZResolverApi, PolicyEnforcer};
 use resource_group_sdk::{
-    ResourceGroupClient, ResourceGroupReadHierarchy, ResourceGroupTypeBootstrap,
+    ResourceGroupClient, ResourceGroupDefaults, ResourceGroupReadHierarchy,
+    ResourceGroupTypeBootstrap,
 };
 use sea_orm_migration::MigrationTrait;
 use toolkit::api::OpenApiRegistry;
@@ -152,13 +153,15 @@ impl Gear for ResourceGroup {
             .ok_or_else(|| anyhow::anyhow!("{} group_service not initialized", Self::MODULE_NAME))?
             .clone();
 
-        let rg_client: Arc<dyn ResourceGroupClient> = Arc::new(RgService::new(
+        let rg_client = Arc::new(RgService::new(
             type_svc.clone(),
             group_svc.clone(),
             membership_service.clone(),
         ));
         ctx.client_hub()
-            .register::<dyn ResourceGroupClient>(rg_client);
+            .register::<dyn ResourceGroupClient>(rg_client.clone());
+        ctx.client_hub()
+            .register::<dyn ResourceGroupDefaults>(rg_client);
 
         let read_client: Arc<dyn ResourceGroupReadHierarchy> =
             Arc::new(RgReadService::new(group_svc, membership_service));

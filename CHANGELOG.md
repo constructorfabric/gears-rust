@@ -9,6 +9,17 @@ release-plz updates this file in the Release PR.
 
 ## [Unreleased]
 
+### Breaking
+
+- Resource-group 0.5.0 / SDK 0.4.0 reject caller-supplied IDs on ordinary REST
+  and SDK creation to prevent cross-tenant reservation of the global group
+  primary key. Omit `id` for a server-generated UUID, or migrate deterministic
+  tenant defaults to the authenticated `ResourceGroupDefaults` capability.
+  Existing default UUIDs are preserved. Trusted configuration seeding remains
+  available and now refuses mismatched existing identities. See the
+  [migration guide](gears/system/resource-group/docs/explicit-id-migration.md)
+  for coordinated consumer rollout and existing-collision remediation.
+
 ### Fixed
 
 - Resource-group filters accept quoted UUIDs and resolve membership GTS type paths

@@ -70,3 +70,11 @@ cargo test -p cf-gears-resource-group
 ## License
 
 Apache-2.0
+
+## Group identifier ownership
+
+Ordinary REST and SDK creation allocate UUIDv7 IDs server-side; supplying `id`
+returns `InvalidArgument` (HTTP 400). Deterministic tenant defaults use the
+separate authenticated `ResourceGroupDefaults` SDK capability. See the
+[migration guide](../docs/explicit-id-migration.md) before upgrading consumers
+that currently supply explicit IDs.

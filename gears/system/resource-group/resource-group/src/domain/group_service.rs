@@ -28,7 +28,8 @@ use std::sync::Arc;
 
 use authz_resolver_sdk::pep::{PolicyEnforcer, ResourceType};
 use resource_group_sdk::models::{
-    CreateGroupRequest, GroupHierarchy, ResourceGroup, ResourceGroupWithDepth, UpdateGroupRequest,
+    CreateGroupRequest, EnsureDefaultGroupRequest, GroupHierarchy, ResourceGroup,
+    ResourceGroupWithDepth, UpdateGroupRequest,
 };
 use resource_group_sdk::{GROUP_RESOURCE_TYPE, TENANT_RG_TYPE_PATH};
 use toolkit_db::secure::{DBRunner, Db, TxConfig};
@@ -233,11 +234,85 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
     }
 
     // @cpt-flow:cpt-cf-resource-group-flow-entity-hier-create-group:p1
-    /// Create a new resource group.
+    /// Create a new resource group with a server-generated UUID.
     ///
+    /// Caller-supplied IDs are rejected regardless of tenant or group type.
     /// Runs inside a `SERIALIZABLE` transaction with bounded retry (max 3 attempts)
     /// to ensure invariant checks and closure table mutations are atomic.
     pub async fn create_group(
+        &self,
+        ctx: &SecurityContext,
+        req: CreateGroupRequest,
+        tenant_id: Uuid,
+    ) -> Result<ResourceGroup, DomainError> {
+        // IDs share one global primary-key space across tenants and types. Even
+        // an otherwise authorized own-tenant insert must not reserve a UUID a
+        // different tenant needs for deterministic bootstrap.
+        if req.id.is_some() {
+            return Err(DomainError::validation(
+                "Caller-supplied group IDs are not accepted; use default-group ensure \
+                 for tenant defaults",
+            ));
+        }
+        self.create_group_authorized(ctx, req, tenant_id).await
+    }
+
+    /// Ensure the context tenant's canonical default group without accepting an
+    /// arbitrary ID. Only this method supplies a derived ID to the authorized
+    /// creation path; trusted configuration seeding has its own separate path.
+    ///
+    /// Existing metadata is preserved. A pre-existing foreign collision or a
+    /// changed identity fails closed and requires operator remediation.
+    ///
+    /// # Errors
+    /// Returns validation/type errors for invalid input, authorization errors
+    /// for denied or unavailable policy decisions, and `GroupAlreadyExists`
+    /// for a conflicting identity. Storage failures propagate unchanged.
+    pub async fn ensure_default_group(
+        &self,
+        ctx: &SecurityContext,
+        req: EnsureDefaultGroupRequest,
+    ) -> Result<ResourceGroup, DomainError> {
+        if req.code.starts_with(TENANT_RG_TYPE_PATH) {
+            return Err(DomainError::validation(
+                "A default group cannot be a tenant type",
+            ));
+        }
+        let tenant_id = ctx.subject_tenant_id();
+        let id = resource_group_sdk::default_group::default_group_id(tenant_id);
+        let create = CreateGroupRequest::new(req.code.clone(), "default")
+            .with_id(Some(id))
+            .with_metadata(req.metadata);
+
+        // Authorize even on the idempotent path. Confirm only a primary-key
+        // conflict, never mask outages, validation failures, or PDP denials.
+        match self.create_group_authorized(ctx, create, tenant_id).await {
+            Ok(group) => Ok(group),
+            Err(DomainError::GroupAlreadyExists { .. }) => {
+                match self.get_group(ctx, id).await {
+                    Ok(group)
+                        if group.hierarchy.tenant_id == tenant_id
+                            && group.code == req.code
+                            && group.name == "default"
+                            && group.hierarchy.parent_id.is_none() =>
+                    {
+                        Ok(group)
+                    }
+                    Ok(_) | Err(DomainError::GroupNotFound { .. }) => {
+                        // Do not disclose the conflicting row's tenant or metadata.
+                        Err(DomainError::group_already_exists(id))
+                    }
+                    Err(err) => Err(err),
+                }
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    /// Shared authorization and transactional creation for server-chosen IDs.
+    /// Keep private: public callers must use ordinary creation or default ensure,
+    /// neither of which accepts an arbitrary UUID.
+    async fn create_group_authorized(
         &self,
         ctx: &SecurityContext,
         req: CreateGroupRequest,
@@ -283,17 +358,6 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         // caller (platform admin / onboarding) target a different tenant.
         let target_tenant_id = req.tenant_id.unwrap_or(tenant_id);
 
-        // Guardrail: explicit id + cross-tenant target is rejected while
-        // identifier ownership policy is undecided.
-        if req.id.is_some() && target_tenant_id != tenant_id {
-            return Err(DomainError::validation(
-                "id and tenant_id cannot both be set on group creation: an explicit id \
-                 combined with a cross-tenant target is not accepted while identifier \
-                 ownership policy is undecided"
-                    .to_owned(),
-            ));
-        }
-
         // AuthZ gate with provisioning context
         let scope =
             self.enforcer
@@ -301,7 +365,7 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
                     ctx,
                     &RG_GROUP_RESOURCE,
                     "create",
-                    None,
+                    req.id,
                     &authz_resolver_sdk::pep::enforcer::AccessRequest::default()
                         .resource_properties(std::collections::HashMap::from([
                             ("is_tenant".to_owned(), serde_json::Value::Bool(is_tenant)),
@@ -325,9 +389,9 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         // it against the compiled `AccessScope` rather than trusting the
         // PDP's `decision: true` alone: a policy that grants "create"
         // unconditionally must not become an unbounded cross-tenant create.
-        // Skipped when the target is the caller's own tenant, so the common
-        // path is unchanged.
-        if target_tenant_id != tenant_id {
+        // Default ensure also checks its home tenant: a granted create scope
+        // for some other tenant must not authorize a deterministic reservation.
+        if target_tenant_id != tenant_id || req.id.is_some() {
             let permitted = scope.is_unconstrained()
                 || scope.contains_uuid(pep_properties::OWNER_TENANT_ID, target_tenant_id);
             if !permitted {

@@ -238,7 +238,9 @@ pub struct ResourceGroupWithDepth {
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub struct CreateGroupRequest {
-    /// Optional caller-supplied ID (used by seeding for stable identity).
+    /// Fixed ID for trusted configuration seeding only.
+    /// Ordinary `ResourceGroupClient::create_group` rejects `Some`; use
+    /// `ResourceGroupDefaults::ensure_default_group` for tenant defaults.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<Uuid>,
     /// GTS chained type code. Must have prefix `gts.cf.core.rg.type.v1~`.
@@ -283,7 +285,8 @@ impl CreateGroupRequest {
         }
     }
 
-    /// Set the caller-supplied ID (used by seeding for stable identity).
+    /// Set a fixed ID for trusted configuration seeding.
+    /// Ordinary group creation rejects an explicit ID.
     #[must_use]
     pub fn with_id(mut self, id: Option<Uuid>) -> Self {
         self.id = id;
@@ -311,6 +314,20 @@ impl CreateGroupRequest {
         self.metadata = metadata;
         self
     }
+}
+
+/// Ensure the canonical root default group in the context's tenant.
+///
+/// The caller cannot choose an ID, name, parent, or target tenant. The service
+/// derives the ID from the authenticated context, fixes the name to `default`,
+/// and requires a non-tenant type that permits root groups. Metadata is applied
+/// only on creation; an existing group's metadata is never overwritten.
+#[derive(Debug, Clone)]
+pub struct EnsureDefaultGroupRequest {
+    /// Registered non-tenant GTS group type expected for this tenant's default.
+    pub code: String,
+    /// Initial metadata, validated against the type schema on creation.
+    pub metadata: Option<serde_json::Value>,
 }
 
 /// Request body for updating a resource group (full replacement via PUT).
