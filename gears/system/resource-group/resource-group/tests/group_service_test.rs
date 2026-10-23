@@ -3178,6 +3178,7 @@ impl GroupRepositoryTrait for ParentFlippingGroupRepo {
     async fn insert<C: DBRunner>(
         &self,
         db: &C,
+        scope: &AccessScope,
         id: Uuid,
         parent_id: Option<Uuid>,
         gts_type_id: i16,
@@ -3186,7 +3187,16 @@ impl GroupRepositoryTrait for ParentFlippingGroupRepo {
         tenant_id: Uuid,
     ) -> Result<RgModel, DomainError> {
         self.inner
-            .insert(db, id, parent_id, gts_type_id, name, metadata, tenant_id)
+            .insert(
+                db,
+                scope,
+                id,
+                parent_id,
+                gts_type_id,
+                name,
+                metadata,
+                tenant_id,
+            )
             .await
     }
 

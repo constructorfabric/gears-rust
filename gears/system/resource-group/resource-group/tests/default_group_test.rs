@@ -251,7 +251,7 @@ async fn ensure_rejects_a_grant_for_a_different_tenant() {
     let ctx = common::make_ctx(Uuid::now_v7());
     assert!(matches!(
         groups.ensure_default_group(&ctx, request(&ty.code)).await,
-        Err(DomainError::TenantNotFound { .. })
+        Err(DomainError::AccessDenied { .. })
     ));
     assert!(matches!(
         groups
@@ -390,6 +390,104 @@ async fn ensure_propagates_create_and_confirm_denials_and_outages() {
                     Err(DomainError::GroupNotFound { .. })
                 ));
             }
+        }
+    }
+}
+
+/// Return the exact grant constraints so tests exercise enforcement at the
+/// insert, rather than relying on a policy decision that already filters IDs.
+struct DefaultGrant(Vec<Constraint>);
+
+#[async_trait]
+impl AuthZResolverApi for DefaultGrant {
+    async fn evaluate(
+        &self,
+        _ctx: PlatformSecurityContext,
+        _request: EvaluationRequest,
+    ) -> Result<EvaluationResponse, CanonicalError> {
+        Ok(EvaluationResponse {
+            decision: true,
+            context: EvaluationResponseContext {
+                constraints: self.0.clone(),
+                deny_reason: None,
+            },
+        })
+    }
+}
+
+/// Create grants must match a whole conjunction. Separate alternatives cannot
+/// contribute one matching predicate each; a complete matching alternative can.
+#[tokio::test]
+async fn ensure_enforces_complete_insert_scope() {
+    let tenant = Uuid::now_v7();
+    let foreign = Uuid::now_v7();
+    let id = default_group_id(tenant);
+    let excluded = Uuid::now_v7();
+    let grant = |owner, resource| Constraint {
+        predicates: vec![
+            Predicate::In(InPredicate::new(pep_properties::OWNER_TENANT_ID, [owner])),
+            Predicate::In(InPredicate::new(pep_properties::RESOURCE_ID, [resource])),
+        ],
+    };
+    let cases = [
+        ("excluded ID", vec![grant(tenant, excluded)], false),
+        ("matching conjunction", vec![grant(tenant, id)], true),
+        (
+            "no complete alternative",
+            vec![grant(tenant, excluded), grant(foreign, id)],
+            false,
+        ),
+        (
+            "matching alternative",
+            vec![grant(tenant, excluded), grant(tenant, id)],
+            true,
+        ),
+        (
+            "ID-only grant",
+            vec![Constraint {
+                predicates: vec![Predicate::In(InPredicate::new(
+                    pep_properties::RESOURCE_ID,
+                    [id],
+                ))],
+            }],
+            true,
+        ),
+    ];
+    for (label, constraints, allowed) in cases {
+        let db = common::test_db().await;
+        let types = common::make_type_service(db.clone());
+        let ty = common::create_root_type(&types, "compounddefault").await;
+        let groups = GroupService::new(
+            db,
+            QueryProfile::default(),
+            PolicyEnforcer::new(Arc::new(DefaultGrant(constraints))),
+            Arc::new(GroupRepository),
+            Arc::new(TypeRepository),
+            common::make_types_registry(),
+        );
+        let ctx = common::make_ctx(tenant);
+        let result = groups.ensure_default_group(&ctx, request(&ty.code)).await;
+        if allowed {
+            let created = result.unwrap_or_else(|err| panic!("{label}: {err}"));
+            assert_eq!(created.id, id, "{label}");
+            // The same grant must also authorize scoped confirmation.
+            let confirmed = groups
+                .ensure_default_group(&ctx, request(&ty.code))
+                .await
+                .unwrap();
+            assert_eq!(confirmed.id, id, "{label}");
+        } else {
+            assert!(
+                matches!(result, Err(DomainError::AccessDenied { .. })),
+                "{label}: {result:?}"
+            );
+            assert!(
+                matches!(
+                    groups.get_group_unscoped(id).await,
+                    Err(DomainError::GroupNotFound { .. })
+                ),
+                "{label}: unauthorized row persisted"
+            );
         }
     }
 }

@@ -389,9 +389,7 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         // it against the compiled `AccessScope` rather than trusting the
         // PDP's `decision: true` alone: a policy that grants "create"
         // unconditionally must not become an unbounded cross-tenant create.
-        // Default ensure also checks its home tenant: a granted create scope
-        // for some other tenant must not authorize a deterministic reservation.
-        if target_tenant_id != tenant_id || req.id.is_some() {
+        if target_tenant_id != tenant_id {
             let permitted = scope.is_unconstrained()
                 || scope.contains_uuid(pep_properties::OWNER_TENANT_ID, target_tenant_id);
             if !permitted {
@@ -403,6 +401,17 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
                 return Err(DomainError::tenant_not_found(target_tenant_id));
             }
         }
+
+        // Default ensure supplies a server-derived ID. Enforce its complete
+        // grant against the inserted row, including ID restrictions and AND/OR
+        // combinations; a tenant appearing somewhere in a scope is insufficient.
+        // Ordinary creation retains its provisioning semantics (tenant-type
+        // creation establishes a new tenant ID outside the caller's tenant).
+        let insert_scope = if req.id.is_some() {
+            scope
+        } else {
+            toolkit_security::AccessScope::allow_all()
+        };
 
         let profile = self.profile.clone();
         let db = self.db.db();
@@ -416,6 +425,7 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         let result = db
             .transaction_with_retry(TxConfig::serializable(), DomainError::db_err, |tx| {
                 let req = req.clone();
+                let insert_scope = insert_scope.clone();
                 let profile = profile.clone();
                 let group_repo = group_repo.clone();
                 let type_repo = type_repo.clone();
@@ -426,6 +436,7 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
                         tx,
                         &req,
                         target_tenant_id,
+                        &insert_scope,
                         &profile,
                     )
                     .await
@@ -997,8 +1008,16 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
             let group_repo = group_repo.clone();
             let type_repo = type_repo.clone();
             Box::pin(async move {
-                Self::create_group_inner(&*group_repo, &*type_repo, tx, &req, tenant_id, &profile)
-                    .await
+                Self::create_group_inner(
+                    &*group_repo,
+                    &*type_repo,
+                    tx,
+                    &req,
+                    tenant_id,
+                    &toolkit_security::AccessScope::allow_all(),
+                    &profile,
+                )
+                .await
             })
         })
         .await
@@ -1019,6 +1038,7 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         tx: &impl DBRunner,
         req: &CreateGroupRequest,
         tenant_id: Uuid,
+        insert_scope: &toolkit_security::AccessScope,
         profile: &QueryProfile,
     ) -> Result<ResourceGroup, DomainError> {
         // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-3
@@ -1125,6 +1145,7 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
             let model = group_repo
                 .insert(
                     tx,
+                    insert_scope,
                     group_id,
                     Some(parent_id),
                     type_id,
@@ -1197,6 +1218,7 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
             let model = group_repo
                 .insert(
                     tx,
+                    insert_scope,
                     group_id,
                     None,
                     type_id,

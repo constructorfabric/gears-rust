@@ -523,7 +523,8 @@ Ordinary REST and SDK creation reject explicit IDs and generate UUIDv7 IDs.
 Tenant-default creation uses the authenticated `ResourceGroupDefaults` SDK
 capability: it derives `UUIDv5(ctx.subject_tenant_id(), "resource-group:default")`,
 fixes the name to `default`, requires root placement and a non-tenant type, and
-checks the granted create scope against that tenant. Confirming an existing row
+checks the complete granted create scope against the inserted row, including
+tenant and resource-ID predicates with AND/OR semantics. Confirming an existing row
 requires a scoped read and matching tenant/type/name/parent identity. Foreign or
 mismatched collisions fail closed without modifying the existing row.
 
