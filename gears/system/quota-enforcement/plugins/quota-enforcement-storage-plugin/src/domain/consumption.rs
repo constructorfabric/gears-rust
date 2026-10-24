@@ -3,8 +3,8 @@
 //!
 //! Like the Quota primitives, these are inherent methods rather than a trait
 //! implementation: the `ClientHub` client stays unpublished until every primitive
-//! of the contract exists, so leases, batch debit and the bulk snapshot read
-//! are still missing.
+//! of the contract exists, and batch debit and the bulk snapshot read are still
+//! missing.
 
 use quota_enforcement_sdk::{
     ApplicableQuotas, AppliedMutation, EvaluatedDebit, EvaluatedMutation, IdempotencyRecord,
@@ -38,6 +38,23 @@ impl StoragePlugin {
     ) -> Result<TransitionOutcome<EvaluatedDebit>, StorageError> {
         self.consumption
             .apply_debit_plan(ctx, scope, mutation, events)
+            .await
+    }
+
+    /// Evaluate and apply an atomic batch under one envelope key.
+    ///
+    /// # Errors
+    ///
+    /// As the contract documents for `apply_batch_debit`.
+    pub async fn apply_batch_debit(
+        &self,
+        ctx: &SecurityContext,
+        scope: &AccessScope,
+        batch: &quota_enforcement_sdk::EvaluatedBatch<'_>,
+        events: &[NotificationEvent],
+    ) -> Result<TransitionOutcome<Vec<EvaluatedDebit>>, StorageError> {
+        self.consumption
+            .apply_batch_debit(ctx, scope, batch, events)
             .await
     }
 

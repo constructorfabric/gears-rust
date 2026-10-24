@@ -458,6 +458,19 @@ impl crate::domain::ConsumptionStore for FakeConsumptionStore {
         Err(unreached())
     }
 
+    async fn apply_batch_debit(
+        &self,
+        _ctx: &SecurityContext,
+        _scope: &AccessScope,
+        _batch: &quota_enforcement_sdk::EvaluatedBatch<'_>,
+        _events: &[NotificationEvent],
+    ) -> Result<
+        quota_enforcement_sdk::TransitionOutcome<Vec<quota_enforcement_sdk::EvaluatedDebit>>,
+        StorageError,
+    > {
+        Err(unreached())
+    }
+
     async fn apply_credit(
         &self,
         _ctx: &SecurityContext,
@@ -522,4 +535,63 @@ impl crate::domain::ConsumptionStore for FakeConsumptionStore {
 
 fn unreached() -> StorageError {
     StorageError::Internal("the consumption store is not part of this test".to_owned())
+}
+
+/// A lease store that answers nothing, for the bootstrap and CRUD tests that
+/// construct a plugin but never take a hold. The lease paths have their own
+/// suites against the real adapter.
+#[derive(Default)]
+pub struct FakeLeaseStore;
+
+#[async_trait]
+impl crate::domain::ports::LeaseStore for FakeLeaseStore {
+    async fn acquire_lease(
+        &self,
+        _ctx: &SecurityContext,
+        _scope: &AccessScope,
+        _mutation: &quota_enforcement_sdk::EvaluatedMutation<'_>,
+        _ttl: std::time::Duration,
+    ) -> Result<TransitionOutcome<quota_enforcement_sdk::EvaluatedLease>, StorageError> {
+        Err(StorageError::Internal(
+            "no lease store in this test".to_owned(),
+        ))
+    }
+
+    async fn commit_lease(
+        &self,
+        _ctx: &SecurityContext,
+        _scope: &AccessScope,
+        token: quota_enforcement_sdk::LeaseToken,
+        _actual_amount: Option<u64>,
+        _idempotency: &quota_enforcement_sdk::PartialIdempotencyWrite,
+        _events: &[NotificationEvent],
+    ) -> Result<TransitionOutcome<quota_enforcement_sdk::AppliedMutation>, StorageError> {
+        Err(StorageError::LeaseNotFound { token })
+    }
+
+    async fn release_lease(
+        &self,
+        _ctx: &SecurityContext,
+        _scope: &AccessScope,
+        token: quota_enforcement_sdk::LeaseToken,
+        _idempotency: &quota_enforcement_sdk::PartialIdempotencyWrite,
+        _events: &[NotificationEvent],
+    ) -> Result<TransitionOutcome<quota_enforcement_sdk::AppliedMutation>, StorageError> {
+        Err(StorageError::LeaseNotFound { token })
+    }
+
+    async fn reclaim_expired_leases(
+        &self,
+        _batch_size: u32,
+        _before: time::OffsetDateTime,
+    ) -> Result<Vec<quota_enforcement_sdk::ExpiredLease>, StorageError> {
+        Ok(Vec::new())
+    }
+
+    async fn count_expired_unreclaimed_leases(
+        &self,
+        _before: time::OffsetDateTime,
+    ) -> Result<Vec<(quota_enforcement_sdk::MetricId, u64)>, StorageError> {
+        Ok(Vec::new())
+    }
 }

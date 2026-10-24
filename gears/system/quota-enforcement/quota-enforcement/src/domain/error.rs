@@ -252,6 +252,30 @@ pub enum DomainError {
     /// The acquisition contention timeout elapsed.
     #[error("acquisition contention timeout elapsed")]
     LeaseContentionTimeout,
+    /// A batch's evaluation outlasted the batch-level timeout; nothing was
+    /// written.
+    #[error("batch evaluation exceeded the batch timeout")]
+    BatchTimeout,
+
+    // --- batch debit ---
+    /// One batch item's field is invalid; the whole envelope is refused.
+    #[error("invalid batch item {index} {field}: {reason}")]
+    InvalidBatchItem {
+        /// The item's position in the request.
+        index: usize,
+        /// The item field.
+        field: &'static str,
+        /// Closed `UPPER_SNAKE` reason token.
+        reason: &'static str,
+    },
+    /// The batch has more items than the configured maximum.
+    #[error("batch of {items} items exceeds the maximum of {max}")]
+    BulkTooLarge {
+        /// Items submitted.
+        items: usize,
+        /// The configured maximum.
+        max: usize,
+    },
     /// Commit amount exceeds the reserved amount.
     #[error("commit amount {actual} exceeds reserved amount {reserved}")]
     OverCommitNotAuthorized {
@@ -438,9 +462,14 @@ impl DomainError {
 impl From<StorageError> for DomainError {
     fn from(err: StorageError) -> Self {
         match err {
+            StorageError::LeaseNotFound { token } => Self::NotFound {
+                kind: ResourceKind::Lease,
+                id: token.to_string(),
+            },
             StorageError::LeaseNotActive { token } => Self::LeaseNotActive { token },
             StorageError::LeaseInflightLimitExceeded => Self::LeaseInflightLimitExceeded,
             StorageError::LeaseContentionTimeout => Self::LeaseContentionTimeout,
+            StorageError::BatchTimeout => Self::BatchTimeout,
             StorageError::OverCommitNotAuthorized { reserved, actual } => {
                 Self::OverCommitNotAuthorized { reserved, actual }
             }
