@@ -42,7 +42,7 @@ EVENT_TYPE = "gts.cf.core.events.event.v1~cf.e2e.event_broker.restart.v1~"
 
 def _patch_restart_config(config_text: str, home_dir: str) -> str:
     config_text = config_text.replace(
-        'home_dir: "~/.cf-gears-event-broker"', f'home_dir: "{home_dir}"'
+        'home_dir: "~/.cf-gears-event-broker"', f'home_dir: "{Path(home_dir).as_posix()}"'
     )
     # Two databases now, and the premise of this test is that they behave
     # differently across a restart. Consumer groups and cursors survive because
@@ -52,7 +52,7 @@ def _patch_restart_config(config_text: str, home_dir: str) -> str:
     # so a restart re-opens this test's own copies of them.
     patched = config_text.replace(
         'path: "~/.cf-gears-event-broker/event-broker/event_log.db"',
-        f'path: "{home_dir}/event-broker/event_log.db"',
+        f'path: "{Path(home_dir).as_posix()}/event-broker/event_log.db"',
     )
     # Asserted rather than assumed: this test proves events survive a restart,
     # and they only do because the backend's database is a file. If the
