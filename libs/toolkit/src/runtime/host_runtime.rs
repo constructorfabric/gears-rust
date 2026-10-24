@@ -1533,8 +1533,13 @@ impl HostRuntime {
             // before `attach` layers security_context_middleware. (The platform
             // plane is built eagerly at bootstrap from `oop_http.internal_auth`.)
             server.resolve_bearer_authenticator(&self.client_hub);
-            self.compose_oop_router(server.options(), &hc_registry)
-                .await
+            let composed = self
+                .compose_oop_router(server.options(), &hc_registry)
+                .await?;
+            // A declared operation whose plane has no validator would refuse every
+            // request; stop here, before serving, and say why.
+            server.check_route_auth(&composed.2)?;
+            Ok(composed)
         }
         .await;
 

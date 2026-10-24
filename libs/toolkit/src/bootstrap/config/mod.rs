@@ -172,6 +172,13 @@ pub struct OopHttpConfig {
     /// Set `true` only for single-host / local-dev.
     #[serde(default)]
     pub allow_loopback_advertise: bool,
+    /// Development only: serve without a tenant authenticator. Non-platform routes
+    /// run with the default tenant `SecurityContext`, as `api-gateway`'s
+    /// `auth_disabled` does; platform routes still need a validated internal token.
+    /// An installed tenant authenticator still wins. Off by default: a worker serving
+    /// tenant operations without an authenticator refuses to start.
+    #[serde(default)]
+    pub auth_disabled: bool,
     /// Platform-plane (`InternalAuthenticator`) configuration. When present it
     /// drives both the *inbound* HTTP validator on the gear's own routes and
     /// the *outbound* credential attached to the gear's `DirectoryService`
