@@ -1,0 +1,28 @@
+[package]
+name = "cf-gears-bss-rating-core"
+edition.workspace = true
+license.workspace = true
+description = "BSS Rating evaluation core: the pure, I/O-free evaluation steps, engine generations and exact arithmetic"
+
+[lib]
+name = "bss_rating_core"
+
+[lints]
+workspace = true
+
+# Purity rule (DESIGN §1.3): no tokio, sea-orm, http or ClientHub anywhere in the normal
+# dependency tree. `make check-pure-crates` enforces it in CI from `tools/scripts/pure_crates.toml`;
+# add a dependency here only if it keeps that check green.
+[dependencies]
+# Every retained engine generation is compiled in (ADR-0006); the newest is current.
+bss-rating-engine-gen-1 = { workspace = true }
+# The canonical serialization of an input, which the pipeline hashes into `input_digest`.
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+# The arithmetic oracle (`amount_for`) and pricing's golden contract and seam fixtures.
+bss-money = { workspace = true, features = ["exact"] }
+bss-pricing = { workspace = true }
+rust_decimal = { workspace = true }

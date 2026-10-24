@@ -1,0 +1,51 @@
+# What engine generation 1 vendors (rating ADR-0006, DESIGN §4.1).
+#
+# `tools/scripts/vendor_engine_generation.py vendor gears/bss/rating/rating-engine/gen-1` copies the
+# first-party sources below byte for byte into `vendor/<to>/` and records them, with the registry
+# crates of the numeric closure, in `vendor/LOCK.toml`; `... check ...` fails CI when either drifts.
+# The vendored crates' `Cargo.toml` and the `derived` wrapper `src/lib.rs` are written by hand: a
+# renamed path crate needs its own manifest, and the copied files stay verbatim.
+#
+# Until generation 1 is frozen (after R-35 gives `bss_money` the exact-fraction API), the registry
+# crates are pinned by version and `Cargo.lock` checksum instead of copied. Freezing copies them
+# here as renamed path crates too, so that a later workspace upgrade cannot reach this generation.
+
+generation = 1
+package = "cf-gears-bss-rating-engine-gen-1"
+
+# `bss_money`: exact fractions, `CurrencySpec`, `PostedMoney` and the canonical decimal text.
+[[copy]]
+from = "gears/bss/libs/money"
+to = "money"
+files = [
+  "src/lib.rs",
+  "src/money.rs",
+  "src/money_tests.rs",
+  "src/exact.rs",
+  "src/exact_tests.rs",
+  "src/allocate.rs",
+  "src/allocate_tests.rs",
+  "src/iso.rs",
+  "src/iso_tests.rs",
+  "src/serde_text.rs",
+  "src/serde_text_tests.rs",
+]
+
+# `bss_products_sdk::derived`: the derived-meter evaluator (formula, granule rounding, overflow).
+[[copy]]
+from = "gears/bss/products/products-sdk"
+to = "derived"
+files = ["src/derived.rs", "src/derived_tests.rs"]
+
+# The registry crates the vendored code computes with, as `cargo metadata` resolves them for this
+# generation. Each is recorded with the version and checksum `Cargo.lock` holds.
+[registry]
+crates = [
+  "rust_decimal",
+  "bigdecimal",
+  "num-bigint",
+  "num-integer",
+  "num-traits",
+  "arrayvec",
+  "libm",
+]

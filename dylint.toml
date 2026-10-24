@@ -18,6 +18,10 @@ hasher_allowed_paths = [
     # stable, DNS-safe Lease/CRD object name from a coordination name. Not a
     # security or integrity hash — no FIPS boundary — so RustCrypto sha2 is fine.
     "gears/system/cluster/plugins/k8s-cluster-plugin/src/naming.rs",
+    # SHA-256 over a BSS Rating engine generation's frozen source tree (rating ADR-0006): the
+    # `engine_digest` its build script compiles in and its digest tests recompute. A build-time
+    # identity of evaluation code, never in a runtime path and no FIPS boundary, so sha2 is fine.
+    "gears/bss/rating/rating-engine/gen-1/build/tree_digest.rs",
 ]
 
 # DE1101: Tests must be in separate files.
