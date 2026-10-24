@@ -181,6 +181,9 @@ members = [
     "gears/bss/ledger/ledger-sdk",
     "gears/bss/pricing/pricing",
     "gears/bss/pricing/pricing-sdk",
+    "gears/bss/rating/rating",
+    "gears/bss/rating/rating-sdk",
+    "gears/bss/rating/rating-core",
     "gears/bss/products/products",
     "gears/bss/products/products-sdk",
     "gears/bss/approvals/approvals",
@@ -449,6 +452,11 @@ bss-pricing-sdk = { package = "cf-gears-bss-pricing-sdk", path = "gears/bss/pric
 # Products' seam suite boots this gear beside `bss-products` on one hub.
 # Dev-only consumer; no `version` for the same WIP reason as the SDK above.
 bss-pricing = { package = "cf-gears-bss-pricing", path = "gears/bss/pricing/pricing" }
+# The Rating gear, its SDK and its pure evaluation core. Same WIP posture as pricing: no
+# `version`, because none of the three crates is a release artifact yet.
+bss-rating-sdk = { package = "cf-gears-bss-rating-sdk", path = "gears/bss/rating/rating-sdk" }
+bss-rating-core = { package = "cf-gears-bss-rating-core", path = "gears/bss/rating/rating-core" }
+bss-rating = { package = "cf-gears-bss-rating", path = "gears/bss/rating/rating" }
 # The products registry SDK. Same posture as pricing-sdk above: no `version`,
 # because neither crate is a release artifact and the gear that consumes it is
 # not published either.

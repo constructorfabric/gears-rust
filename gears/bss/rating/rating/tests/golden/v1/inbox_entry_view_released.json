@@ -1,0 +1,13 @@
+{
+  "business_id": "fact-1",
+  "conflict_of": "00000000-0000-0000-0000-000000000001",
+  "entry_id": "00000000-0000-0000-0000-000000000002",
+  "payload_digest": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+  "quarantine_reason": "digest_conflict",
+  "received_at": "2026-10-19T12:01:00Z",
+  "received_via": "event",
+  "source": "fact",
+  "state": "discarded",
+  "tenant_id": "00000000-0000-0000-0000-00000000000a",
+  "version": 3
+}

@@ -250,6 +250,12 @@ jobs:
       - name: Validate packaging metadata (readme/license-file paths)
         run: make check-packaging-metadata
 
+      # Pure crates (the BSS Rating evaluation core) must reach no tokio, sea-orm,
+      # http or ClientHub through their dependency tree (tools/scripts/pure_crates.toml).
+      - name: Pure crates stay free of I/O dependencies
+        if: runner.os == 'Linux'
+        run: make check-pure-crates
+
       - name: Validate release configuration (publish flags, release-plz.toml)
         run: make check-release-config
 
@@ -431,6 +437,12 @@ jobs:
       - name: Test bss-ledger with Postgres (integration)
         if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
         run: tools/scripts/with_rust_annotations.sh make test-integration LANE=ledger-pg
+
+      # bss-rating's Postgres tier: the inbox, exception and release races of the
+      # foundation. Without this step the tier compiles here and runs nowhere.
+      - name: Test bss-rating with Postgres (integration)
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        run: tools/scripts/with_rust_annotations.sh make test-integration LANE=rating-pg
 
       - name: Test redis-cluster-plugin (redis integration)
         if: ${{ !cancelled() && steps.setup.outcome == 'success' }}

@@ -1,0 +1,32 @@
+[package]
+name = "cf-gears-bss-rating-sdk"
+edition.workspace = true
+license.workspace = true
+description = "BSS Rating SDK: the transport-agnostic V1 contract (exact money and quantities as canonical text, keyset paging, canonical errors)"
+
+[lib]
+name = "bss_rating_sdk"
+
+[lints]
+workspace = true
+
+[features]
+# The additive-only checker for golden JSON fixtures (DESIGN §3.3, T-D-71). Contract tests of this
+# crate and of the gear use it; production code never does.
+golden = ["dep:serde_json"]
+
+[dependencies]
+# `num_bigint` for the reduced-fraction check of `ExactMoney`, as `bss_money` uses it.
+bigdecimal = { workspace = true }
+# The currency code and posting-scale rules of the one BSS money representation (money ADR).
+bss-money = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true, optional = true }
+thiserror = { workspace = true }
+# `CanonicalError` is the error of every SDK method; `#[resource_error]` expands against it.
+toolkit-canonical-errors = { workspace = true }
+
+[dev-dependencies]
+bss-rating-sdk = { package = "cf-gears-bss-rating-sdk", path = ".", features = ["golden"] }
+proptest = { workspace = true }
+serde_json = { workspace = true }
