@@ -18,6 +18,7 @@ description: "Store task payloads as opaque binary blobs, S2-compressed above a 
   - [Option 1: Native JSON columns](#option-1-native-json-columns)
   - [Option 2: Database-level compression](#option-2-database-level-compression)
   - [Option 3: Application-level S2 compression with a magic header](#option-3-application-level-s2-compression-with-a-magic-header)
+  - [Option 4: Application-level zstd with a format byte](#option-4-application-level-zstd-with-a-format-byte)
 - [More Information](#more-information)
 - [Traceability](#traceability)
 
@@ -44,12 +45,15 @@ We must decide how to store payloads so that storage stays small, behavior is id
 1. **Native JSON columns** — store payloads as JSONB / JSON columns.
 2. **Database-level compression** — rely on TOAST, InnoDB page compression, or similar.
 3. **Application-level S2 compression with a magic header** — compress blobs above `compression_threshold_bytes` with S2 (Snappy-compatible) and prefix them with a 4-byte marker.
+4. **Application-level zstd with a format byte** — compress blobs with zstd (optionally with a trained dictionary) and prefix them with a version byte that names the codec.
 
 ## Decision Outcome
 
 Chosen option: **Option 3 — Application-level S2 compression with a magic header.**
 
 All payload columns are opaque `Binary` columns (`BYTEA` / `LONGBLOB` / `BLOB`). On write, a value larger than `compression_threshold_bytes` is stored as the magic prefix followed by its S2 encoding; otherwise it is stored raw. On read, a value that starts with the prefix is decompressed; any other value is returned as-is.
+
+> **TODO (verify before implementation)**: (1) S2 is mainly a Go library — confirm a maintained Rust implementation exists, or use plain Snappy (`snap` crate) or zstd (Option 4). (2) Benchmark S2/Snappy against zstd level 1 on real payloads, on PostgreSQL with TOAST compression on and off. (3) Consider adding a codec byte after the magic prefix so the codec can change without a migration.
 
 The PRD payload size limit (64 KB) is measured on the uncompressed canonical JSON, before compression, so the limit does not depend on how well a payload compresses.
 
@@ -104,6 +108,18 @@ Blobs are stored in `Binary` columns. Values above the threshold (default 1 KiB)
 * Bad, because the database cannot inspect or redact fields inside payloads.
 
 **Chosen.**
+
+### Option 4: Application-level zstd with a format byte
+
+Same opaque binary column; the prefix carries a codec id so the codec can change later without rewriting old rows.
+
+* Good, because zstd usually gives a better ratio on JSON than Snappy-family codecs, especially with a dictionary.
+* Good, because the Rust `zstd` crate is mature and widely used.
+* Good, because a codec byte makes later changes cheap.
+* Bad, because it costs more CPU than S2 at higher levels (level 1 is close).
+* Neutral, because PostgreSQL TOAST may already compress large values, so the gain must be measured per backend.
+
+**Rejected for now — see the TODO in Decision Outcome.**
 
 ## More Information
 

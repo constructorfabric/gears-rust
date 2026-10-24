@@ -1,5 +1,5 @@
 ---
-status: accepted
+status: proposed
 date: 2026-10-24
 description: "Claim tasks with a plain scoped read plus a guarded conditional update through the ToolKit secure ORM, reserve slots with single-statement conditional updates, and shard hot rows and background loops instead of using row locks or dialect SQL."
 ---
@@ -18,6 +18,7 @@ description: "Claim tasks with a plain scoped read plus a guarded conditional up
   - [Option 1: SELECT ... FOR UPDATE SKIP LOCKED](#option-1-select--for-update-skip-locked)
   - [Option 2: Leader-serialized claims](#option-2-leader-serialized-claims)
   - [Option 3: Optimistic guarded update with k-way merge](#option-3-optimistic-guarded-update-with-k-way-merge)
+  - [Option 4: Candidate spreading without row locks](#option-4-candidate-spreading-without-row-locks)
 - [More Information](#more-information)
 - [Traceability](#traceability)
 
@@ -33,12 +34,15 @@ Many workers on many nodes claim tasks from shared queues at the same time. Two 
 
 The ToolKit secure ORM (`SecureSelect`) does not expose row-locking clauses (`FOR UPDATE`, `SKIP LOCKED`); only advisory locks are available to gears. `SKIP LOCKED` exists only inside the `toolkit-db` outbox internals and is not available for tenant-scoped claims.
 
+> **TODO(toolkit)**: ask the ToolKit owners whether `SecureSelect` can expose `FOR UPDATE SKIP LOCKED` for PostgreSQL and MySQL 8 (or a scoped escape hatch for claim queries). This is a framework limit, not a reason against `SKIP LOCKED` itself.
+
 ## Decision Drivers
 
 * No double claim, on any backend.
 * Exact claim order `(priority, created_at, task_id)` across all requested queues.
 * No dialect-specific SQL; must work through the secure ORM and on SQLite.
 * Claim latency within the PRD targets (p50 50 ms, p99 200 ms).
+* Claim throughput on one queue must grow with the number of workers, not collapse.
 * Hot rows (counters) and background loops must not become single bottlenecks.
 
 ## Considered Options
@@ -46,10 +50,11 @@ The ToolKit secure ORM (`SecureSelect`) does not expose row-locking clauses (`FO
 1. **SELECT ... FOR UPDATE SKIP LOCKED** — lock candidate rows and skip locked ones.
 2. **Leader-serialized claims** — route all claims through one leader node.
 3. **Optimistic guarded update with k-way merge** — read per-queue heads without locks, merge them by claim order, then claim with `UPDATE ... WHERE state_code = queued`; exactly one racing worker sees `rows_affected == 1`.
+4. **Candidate spreading without row locks** — keep the optimistic guarded update, but each claimer starts at a random (or `hash(worker_id)`-based) position within the first `claim_scan_limit` candidates instead of the head.
 
 ## Decision Outcome
 
-Chosen option: **Option 3 — Optimistic guarded update with k-way merge.**
+Chosen option: **Option 3 — Optimistic guarded update with k-way merge**, as a provisional choice that works with today's ToolKit. It is expected to be replaced by Option 1 (where ToolKit allows) or combined with Option 4 once the TODO above is resolved.
 
 Claims use lock-free optimistic concurrency. The engine reads candidate heads with plain scoped `SELECT`s, merges them in claim order, and attempts each candidate with one guarded update that requires `state_code = queued`, reserves concurrency slots with `used = used + 1 WHERE used < limit_value`, sets the lease (`lease_token`, `lease_epoch + 1`, `lease_until`), and increments `attempt`, all in one transaction and in the fixed lock order of DESIGN §3.7. A guard matching zero rows means another worker won; the engine tries the next candidate.
 
@@ -82,11 +87,13 @@ Tests MUST check that:
 
 The classic PostgreSQL/MySQL queue pattern.
 
-* Good, because it is well known and fast on PostgreSQL.
-* Bad, because the secure ORM does not expose it to gears.
-* Bad, because SQLite has no equivalent, so it needs dialect branching.
+* Good, because it is the standard PostgreSQL queue pattern (River, Oban, graphile-worker, pgmq).
+* Good, because claimers skip rows that others hold, so workers spread over the head and claims do not serialize on one row.
+* Good, because it keeps exact head order for the rows that are free.
+* Bad, because the secure ORM does not expose it to gears today (see TODO(toolkit) above).
+* Bad, because SQLite has no equivalent, so SQLite keeps the optimistic path (one writer, so no contention there).
 
-**Rejected.**
+**Preferred if ToolKit can expose it — see the TODO above.**
 
 ### Option 2: Leader-serialized claims
 
@@ -105,10 +112,21 @@ Each requested queue's head page (`claim_scan_limit` rows, index-ordered by `(pr
 * Good, because it behaves identically on every backend, including SQLite.
 * Good, because it uses only the secure ORM surface.
 * Good, because ordering is exact across queues and independent of the order queues are listed.
-* Neutral, because contention produces lost races that cost an extra candidate attempt.
+* Bad, because every claimer targets the same head row: on a busy queue N−1 workers wait for one row lock and then lose, so claims serialize per queue (head-row contention).
 * Bad, because the cost is bounded by `claim_max_queues × claim_scan_limit`, so those limits must exist.
 
-**Chosen.**
+**Chosen for now (works today); not final.**
+
+### Option 4: Candidate spreading without row locks
+
+Workers aim at different rows, so most guarded updates succeed on the first try. Strict head order becomes "one of the first k".
+
+* Good, because it removes most head-row contention with no ToolKit change and works on every backend.
+* Good, because it combines well with batch claims.
+* Bad, because claim order is no longer exact: a task may be claimed before up to k−1 older or higher-priority tasks; this must be checked against PRD §5.2 / §5.6.
+* Neutral, because SQLite (single writer) gains nothing and can keep head order.
+
+**Candidate — see the TODO above.**
 
 ## More Information
 

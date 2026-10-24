@@ -17,6 +17,7 @@ description: "Support exactly four wait-condition kinds (timer, event, input, ch
 - [Pros and Cons of the Options](#pros-and-cons-of-the-options)
   - [Option 1: GTS-extensible wait-condition type](#option-1-gts-extensible-wait-condition-type)
   - [Option 2: Fixed kinds: timer, event, input, children](#option-2-fixed-kinds-timer-event-input-children)
+  - [Option 3: Callback token](#option-3-callback-token)
 - [More Information](#more-information)
 - [Traceability](#traceability)
 
@@ -42,6 +43,7 @@ We must decide whether wait conditions are an open, extensible type (for example
 
 1. **GTS-extensible wait-condition type** — a GTS base type that gears derive new wait kinds from, with their own matching logic.
 2. **Fixed kinds: timer, event, input, children** — four engine-owned kinds stored as a stable enum, combined in ALL/ANY groups.
+3. **Callback token** — the task stops and hands out an opaque token; an external system resumes it by calling back with the token, as in AWS Step Functions `waitForTaskToken`.
 
 ## Decision Outcome
 
@@ -100,6 +102,18 @@ New kinds are registered at runtime with their own schema and resolver.
 * Bad, because a genuinely new kind needs an engine change and a new ADR.
 
 **Chosen.**
+
+### Option 3: Callback token
+
+One generic resume mechanism instead of typed kinds; time and event waits are left to the caller.
+
+* Good, because the engine needs no event subscription and no matching logic.
+* Good, because it is a well-known pattern.
+* Bad, because every external system must store and return the token, so it cannot react to existing platform events.
+* Bad, because time waits and children waits still need engine support.
+* Neutral, because the `input` kind already covers the call-back case with a typed payload.
+
+**Rejected.**
 
 ## More Information
 

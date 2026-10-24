@@ -19,6 +19,7 @@ description: "Match incoming events to event wait conditions by type, tenant, an
   - [Option 2: JSONPath / equality filter maps](#option-2-jsonpath--equality-filter-maps)
   - [Option 3: Embedded scripting language](#option-3-embedded-scripting-language)
   - [Option 4: CEL with creation-time validation and evaluation limits](#option-4-cel-with-creation-time-validation-and-evaluation-limits)
+  - [Option 5: JSON Logic or JMESPath filters](#option-5-json-logic-or-jmespath-filters)
 - [More Information](#more-information)
 - [Traceability](#traceability)
 
@@ -46,6 +47,7 @@ We must decide how callers express payload conditions and how the engine evaluat
 2. **JSONPath / equality filter maps** — a list of field-path equality checks.
 3. **Embedded scripting language** — run caller scripts (for example Lua or JavaScript).
 4. **CEL with creation-time validation and evaluation limits** — an optional CEL `match_expression`, parsed and checked at creation, evaluated after the cheap filters with a time limit and AST limits.
+5. **JSON Logic or JMESPath filters** — a JSON-encoded filter language evaluated against the event.
 
 ## Decision Outcome
 
@@ -53,7 +55,9 @@ Chosen option: **Option 4 — CEL with creation-time validation and evaluation l
 
 An event wait condition stores `event_type`, optional `event_subject_id` and `event_subject_type`, and an optional CEL `match_expression`. The expression is parsed and validated when the wait is created; an invalid or over-complex expression is rejected with `invalid_argument`. Complexity is bounded by maximum AST node count and depth.
 
-When an event arrives, the consumer selects pending event waits by `event_type`, keeps only those whose `owner_tenant_id` equals the event tenant, applies the subject filters, and evaluates the expression last. Evaluation is time-bounded (default 10 ms). A timeout or evaluation error counts as no match for that event. A matching condition is marked `satisfied` in the consumer transaction (ADR-0004).
+When an event arrives, the consumer selects pending event waits by `event_type`, keeps only those whose `owner_tenant_id` equals the event tenant, applies the subject filters, and evaluates the expression last. Evaluation is time-bounded (default 10 ms).
+
+> **TODO (decide)**: DESIGN does not yet say what happens when evaluation times out or fails. Options: treat it as no match (the offset advances and the event is lost for this wait), or fail the wait condition so the task is not left waiting for an event it can never match. Pick one and update DESIGN §4.5 CEL expression safety. A matching condition is marked `satisfied` in the consumer transaction (ADR-0004).
 
 ### Consequences
 
@@ -113,6 +117,17 @@ CEL is a non-Turing-complete, side-effect-free expression language. The engine f
 * Bad, because it adds the `cel-interpreter` dependency.
 
 **Chosen.**
+
+### Option 5: JSON Logic or JMESPath filters
+
+Callers send a structured filter document instead of an expression string.
+
+* Good, because the filter is plain JSON and easy to validate.
+* Good, because evaluation is simple and bounded.
+* Bad, because typing and functions are weaker than CEL.
+* Bad, because the Event Broker already uses CEL for subscription filters (`gts.cf.core.events.filter.v1~cf.core.expression.cel.v1`), so a second language would split the platform.
+
+**Rejected.**
 
 ## More Information
 

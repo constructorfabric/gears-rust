@@ -19,6 +19,7 @@ description: "Store low-frequency deadlines as durable timer rows processed by a
   - [Option 2: External scheduler](#option-2-external-scheduler)
   - [Option 3: Every deadline as a durable timer row](#option-3-every-deadline-as-a-durable-timer-row)
   - [Option 4: Persistent sharded timer wheel plus lease scan](#option-4-persistent-sharded-timer-wheel-plus-lease-scan)
+  - [Option 5: Due-time columns polled by index scans](#option-5-due-time-columns-polled-by-index-scans)
 - [More Information](#more-information)
 - [Traceability](#traceability)
 
@@ -46,6 +47,7 @@ Heartbeats recur every few seconds for every running task. If each heartbeat rew
 2. **External scheduler** — delegate deadlines to an external scheduling service.
 3. **Every deadline as a durable timer row** — persist every deadline, including heartbeat, as a `te_timers` row.
 4. **Persistent sharded timer wheel plus lease scan** — durable `te_timers` rows for low-frequency absolute deadlines; deadline columns on `te_task_state` enforced by a periodic lease scan for assignment, heartbeat, and execution.
+5. **Due-time columns polled by index scans** — no timer table: every deadline is an indexed column on the task-state table, found by sharded range scans, as in River or Oban `scheduled_at`.
 
 ## Decision Outcome
 
@@ -119,6 +121,18 @@ All deadlines are rows; claim, start, and every heartbeat delete and insert time
 * Bad, because the scan interval bounds accuracy, so it must be sized against the NFR.
 
 **Chosen.**
+
+### Option 5: Due-time columns polled by index scans
+
+Lifetime, SLA, scheduled, queue, cancel-grace, and wait deadlines become columns or child rows with partial indexes, polled like the lease scan.
+
+* Good, because there is no separate timer table and no timer-row inserts or deletes.
+* Good, because it reuses the lease-scan pattern already chosen for heartbeat, assignment, and execution.
+* Bad, because it needs one partial index per deadline type on the hottest table.
+* Bad, because per-wait-condition timeouts do not map to one column per task.
+* Neutral, because it could replace the timer table later for some deadline types without changing the API.
+
+**Rejected for now.**
 
 ## More Information
 

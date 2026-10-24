@@ -18,6 +18,7 @@ description: "Count queue, tenant, and task-type concurrency in database slot ro
   - [Option 1: Count at claim time with COUNT(*)](#option-1-count-at-claim-time-with-count)
   - [Option 2: Distributed in-memory semaphores via Cluster](#option-2-distributed-in-memory-semaphores-via-cluster)
   - [Option 3: Database slot rows with guarded atomic reservation](#option-3-database-slot-rows-with-guarded-atomic-reservation)
+  - [Option 4: One row per slot](#option-4-one-row-per-slot)
 - [More Information](#more-information)
 - [Traceability](#traceability)
 
@@ -44,6 +45,7 @@ We must decide where these limits are counted and how a reservation stays consis
 1. **Count at claim time with COUNT(*)** — count `claimed`+`running` tasks per dimension on every claim.
 2. **Distributed in-memory semaphores via Cluster** — keep slot counts in a Cluster-gear distributed cache.
 3. **Database slot rows with guarded atomic reservation** — one `te_concurrency_slots` row per dimension scope, reserved with `used = used + 1 WHERE used < limit_value` in the claim transaction.
+4. **One row per slot** — a fixed set of slot rows per limit; a claim takes a free slot row with a guarded update and records the owning task.
 
 ## Decision Outcome
 
@@ -107,6 +109,18 @@ Optionally hot-row sharded; reconciled periodically from actual `claimed`+`runni
 * Bad, because slot rows need a reconciliation loop to correct drift.
 
 **Chosen.**
+
+### Option 4: One row per slot
+
+Instead of a `used` counter, a limit of N has N rows; each row is free or held by one task.
+
+* Good, because a held slot names its task, so drift cannot happen and no reconciliation is needed.
+* Good, because claims on different free rows do not contend on one counter row.
+* Bad, because a limit change must add or delete rows, and shrinking a limit with held slots is complex.
+* Bad, because large or unlimited limits (thousands of slots, or 0) need many rows or a special case.
+* Bad, because finding a free row adds a read to every claim.
+
+**Rejected.**
 
 ## More Information
 

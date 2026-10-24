@@ -18,6 +18,7 @@ description: "Model every task as one of 10 explicit states with a fixed transit
   - [Option 1: Free-form status string](#option-1-free-form-status-string)
   - [Option 2: Minimal state set with flags](#option-2-minimal-state-set-with-flags)
   - [Option 3: Explicit 10-state machine with a transition matrix](#option-3-explicit-10-state-machine-with-a-transition-matrix)
+  - [Option 4: Lean state model with a ready-at column](#option-4-lean-state-model-with-a-ready-at-column)
 - [More Information](#more-information)
 - [Traceability](#traceability)
 
@@ -44,6 +45,7 @@ We must decide how task state is represented and changed, so that every actor se
 1. **Free-form status string** — store a status text column and let each code path decide what to write.
 2. **Minimal state set with flags** — a few coarse states (pending/active/done) plus boolean flags for waiting, blocked, scheduled, dead-lettered.
 3. **Explicit 10-state machine with a transition matrix** — ten named states, a closed transition matrix, and one guarded conditional update per transition.
+4. **Lean state model with a ready-at column** — fewer states, as in SQS-style queues: `pending` (with `ready_at`, covering delayed and blocked work), `running` (claimed or started), and the terminal states.
 
 ## Decision Outcome
 
@@ -109,6 +111,18 @@ States: `scheduled`, `blocked`, `queued`, `claimed`, `running`, `waiting` (non-t
 * Bad, because adding a state later requires a new ADR and a migration of the enum.
 
 **Chosen.**
+
+### Option 4: Lean state model with a ready-at column
+
+Delay and dependency blocking become a `ready_at` value and a blocked flag instead of states; claim and start are one state.
+
+* Good, because there are fewer states and transitions to test.
+* Good, because it matches common queue libraries (River, Oban, graphile-worker).
+* Bad, because assignment timeout needs a separate 'not started yet' marker anyway.
+* Bad, because blocked and delayed tasks become hard to tell apart in search, metrics, and queue-depth accounting (PRD §5.2 counts them separately).
+* Bad, because `waiting` (a parked task with no lease) still needs its own state.
+
+**Rejected.**
 
 ## More Information
 
