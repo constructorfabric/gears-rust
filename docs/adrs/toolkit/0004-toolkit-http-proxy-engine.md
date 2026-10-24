@@ -60,17 +60,18 @@ The question: keep Pingora, fork it, or own a small engine for the part we use?
 
 ## Decision Outcome
 
-Chosen option: "In-house engine on `hyper::client::conn`", because it is the only option that puts TLS under `toolkit-http`'s FIPS hardening, removes Pingora (and with it the tokio pin and its `ring` path) from the graph, and lets the engine connect to an already resolved, SSRF-filtered address while presenting the original host name, which hyper-util's client cannot do without workarounds.
+Chosen option: "In-house engine on `hyper::client::conn` (HTTP/1.1) and `h2` (HTTP/2)", because it is the only option that puts TLS under `toolkit-http`'s FIPS hardening, removes Pingora (and with it the tokio pin and its `ring` path) from the graph, and lets the engine connect to an already resolved, SSRF-filtered address while presenting the original host name, which hyper-util's client cannot do without workarounds.
 
 ### Engine Shape
 
 `libs/toolkit-http-proxy` (`cf-gears-toolkit-http-proxy`):
 
 - **`ProxyClient`**: `send(target, request)` and `upgrade(target, request)`. A `Target` carries the resolved socket address, the server name (SNI, certificate check, default authority), the transport and a protocol policy (`Auto`, `Http1Only`, `Http2Only`). The engine never resolves names.
-- **Pool**: keyed by address, server name and transport, so connections with different SNI are never shared. HTTP/1.1: LIFO idle stack; a connection returns only after its response body reached its clean end. HTTP/2: one multiplexed connection per key with a generation number (a failure on an old connection never evicts its replacement) and an active-stream count (the reaper never detaches a busy connection).
+- **Protocols**: HTTP/1.1 on `hyper::client::conn::http1`; HTTP/2 on the `h2` crate directly. The engine uploads HTTP/2 request bodies itself and queues only as much DATA as the peer's flow-control window allows, so nothing piles up in a send buffer behind a closed window; trailers are forwarded both ways.
+- **Pool**: keyed by address, server name and transport, so connections with different SNI are never shared. HTTP/1.1: LIFO idle stack; a connection returns only after its response body reached its clean end. HTTP/2: one multiplexed connection per key with a generation number (a failure on an old connection never evicts its replacement) and an active-stream count covering both the upload and the response (the reaper never detaches a busy connection).
 - **ALPN**: TLS targets offer `h2` and `http/1.1`; the negotiated protocol is cached per host (TTL, bounded, evicted on HTTP/2 connection errors) so later connections offer only what the host speaks.
 - **Retry**: at most once, only on a reused connection, only when hyper hands the request back unsent. A request that may have reached the upstream is never replayed.
-- **Timeouts**: connect (TCP and TLS separately), response head and per-body-frame idle (`read_timeout`), and an upload-stall watchdog (`write_timeout`) that severs the connection when the request body stops making progress.
+- **Timeouts**: connect (TCP and TLS separately), response head and per-body-frame idle (`read_timeout`), and `write_timeout`: a socket write or flush pending that long (the upstream stopped reading) severs the connection; an HTTP/2 stream whose window stays closed that long is reset (`CANCEL`) without touching its siblings. Every socket sits behind a kill switch, so the engine can sever connections owned by background tasks.
 - **`balance`**: `BackendPool` with pluggable `Resolver` (system DNS with retries), `AddressFilter` (SSRF), `HealthCheck` (TCP by default; first probe immediately, then periodic), `Balancer` (round-robin), background DNS refresh, passive `mark_unhealthy`.
 - **`Observer`** hook for metrics and logs without an OpenTelemetry dependency in the engine.
 
@@ -88,7 +89,7 @@ OAGW keeps its own request pipeline and maps engine error kinds onto its error m
 | Malformed or oversized response heads | hyper strict parsing; at most 128 header fields; read buffer capped at 256 KiB. | `malformed_response_heads_are_rejected` |
 | CRLF injection via percent-decoded paths (CVE-2026-75922 class) | The request target is passed through undecoded; `http` types reject CR/LF/NUL. | `percent_encoded_crlf_reaches_the_wire_encoded` |
 | Cross-SNI connection reuse | Pool key includes the server name. | `tests/client.rs::pool_is_keyed_by_server_name` |
-| HTTP/2 Bomb (CVE-2026-49975: HPACK indexed references + zero-window stall) | `max_header_list_size` 64 KiB counted on decoded size with 32 octets per field; header table 4 KiB; upload-stall watchdog and 64 KiB per-stream send buffer; connections are severed at the socket. | `hpack_indexed_reference_bomb_is_contained`, `zero_window_slowloris_hits_the_read_timeout`, `early_h2_response_with_zero_window_upload_is_torn_down` |
+| HTTP/2 Bomb (CVE-2026-49975: HPACK indexed references + zero-window stall) | `max_header_list_size` 64 KiB counted on decoded size with 32 octets per field; header table 4 KiB; uploads queue only what the window allows and a stream whose window stays closed for `write_timeout` is reset; a socket that stops accepting writes is severed. | `hpack_indexed_reference_bomb_is_contained`, `zero_window_slowloris_hits_the_read_timeout`, `early_h2_response_with_zero_window_upload_is_torn_down`, `early_h1_response_with_unread_upload_severs_the_connection` |
 | CONTINUATION flood, Rapid Reset, MadeYouReset, unbounded empty DATA (RUSTSEC-2024-0332, RUSTSEC-2026-0258) | `h2 >= 0.4.16` pinned in the workspace; reset-stream limits configured; read timeouts bound everything else. | `continuation_flood_is_contained`, `empty_data_frame_flood_is_contained` |
 | SSRF / DNS rebinding | The engine connects only to the address it is given; `BackendPool` filters every resolved address. | `balance_tests.rs::filter_*`, OAGW `endpoint_selector_tests.rs::selector_ssrf_*` |
 
@@ -105,9 +106,9 @@ Every `rustls::ClientConfig` comes from `toolkit_http::{native,webpki,custom}_ro
 * `toolkit-http` exports its TLS builders (`native_roots_client_config`, `webpki_roots_client_config`, new `custom_roots_client_config`) and `TlsConfig` types; they are now public API.
 * Pingora, `pingora-memory-cache`, `httparse` and Pingora's transitive `ring`, `prometheus 0.13` and `protobuf 2` leave the graph; the `RUSTSEC-2024-0437` ignore in `deny.toml` goes.
 * The workspace tokio pin and the matching Dependabot ignore are removed.
-* The workspace depends on `h2 = "0.4.16"` directly, to pin the minimum version and classify HTTP/2 errors.
+* The workspace depends on `h2 = "0.4.16"` directly: the engine drives HTTP/2 with it, and the version floor carries the CONTINUATION, MadeYouReset and empty-DATA fixes.
 * Gateways own a security-critical component; changes to `libs/toolkit-http-proxy` need the security regression suite to stay green and a security review.
-* Follow-ups: forward trailers (gRPC) through the SDK body type; migrate `toolkit-gateway::Forwarder` to stream request bodies (#4488); review the inbound server's HTTP/2 limits.
+* Follow-ups: carry trailers (gRPC) through OAGW's SDK body type (the engine already forwards them); migrate `toolkit-gateway::Forwarder` to stream request bodies (#4488); review the inbound server's HTTP/2 limits.
 
 ### Confirmation
 
@@ -135,6 +136,7 @@ Every `rustls::ClientConfig` comes from `toolkit_http::{native,webpki,custom}_ro
 
 * Good, because it is maintained by hyper's authors and widely used (reqwest).
 * Neutral, because pooling, ALPN and retries of canceled requests come for free.
+* Bad, because its HTTP/2 path hands the request body to an internal pipe task that buffers DATA beyond the peer's window; uploads stalled by a zero window cannot be observed or bounded.
 * Bad, because its connector sees only the URI: connecting to a pre-resolved, SSRF-filtered address while presenting the original name needs a side channel.
 * Bad, because pool keys, retry semantics, protocol hints and per-connection teardown are not under our control.
 
@@ -142,7 +144,7 @@ Every `rustls::ClientConfig` comes from `toolkit_http::{native,webpki,custom}_ro
 
 * Good, because TLS, pooling, retries, limits and teardown are explicit and testable.
 * Good, because it removes the bridge: no serialization, no pipe, no per-request spawn.
-* Good, because hyper, h2 and rustls carry the protocol work.
+* Good, because hyper (HTTP/1.1), h2 and rustls carry the protocol work, while uploads, flow control and teardown stay under the engine's control.
 * Bad, because we own the pool and its edge cases (mitigated by the regression suites).
 
 ## More Information

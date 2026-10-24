@@ -2,9 +2,9 @@
 
 //! Upstream proxy engine for `ToolKit` gateways.
 //!
-//! A pooled HTTP/1.1 + HTTP/2 client built directly on `hyper::client::conn`
-//! and `tokio-rustls`, meant to sit behind a reverse proxy's own request
-//! pipeline:
+//! A pooled HTTP/1.1 + HTTP/2 client built on `hyper::client::conn::http1`,
+//! the `h2` crate and `tokio-rustls`, meant to sit behind a reverse proxy's
+//! own request pipeline:
 //!
 //! - **No DNS inside the engine.** A [`Target`] carries an already resolved
 //!   (and, for gateways, SSRF-filtered) socket address plus the server name
@@ -22,7 +22,11 @@
 //!   a LIFO idle stack per HTTP/1.1 host. A connection only returns to the
 //!   pool after its response body was read to the end.
 //! - **Safe retry.** A request is retried at most once, only on a reused
-//!   connection, and only when hyper hands the request back unsent.
+//!   connection, and only when the request provably never left.
+//! - **Bounded uploads.** HTTP/2 bodies are queued only as fast as the
+//!   peer's flow-control window opens; a window closed for `write_timeout`
+//!   resets the stream, and a socket that stops accepting writes for
+//!   `write_timeout` is severed.
 //! - **Framing hygiene.** Outbound framing is always generated from the body
 //!   (see [`sanitize`]); hop-by-hop, `Expect` and `HTTP2-Settings` headers
 //!   never reach the upstream, and protocol upgrades are tunnelled only after
