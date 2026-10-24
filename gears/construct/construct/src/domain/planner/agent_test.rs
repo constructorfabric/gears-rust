@@ -246,6 +246,9 @@ async fn the_model_gets_the_record_and_the_profile_as_data_but_no_id() {
             assert!(!text.contains(&id), "{text} shows {id}");
         }
         assert!(!text.contains("gts."), "{text} shows a type id");
+        for source_id in ["msg-7", "thread-42"] {
+            assert!(!text.contains(source_id), "{text} shows {source_id}");
+        }
     }
 }
 
