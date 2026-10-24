@@ -1,5 +1,5 @@
 {
-  "$id": "gts://gts.cf.core.uc.usage_record.v1~",
+  "$id": "gts://gts.cf.core.uc.usage_record.v2~",
   "$schema": "http://json-schema.org/draft-07/schema#",
   "title": "Usage Collector Usage Record",
   "description": "Abstract base type for every meter the Usage Collector accepts entries against. It pins two things at once: the structural contract of one accepted ledger entry (the `properties` below), and, through `x-gts-traits-schema`, the declaration attributes a concrete meter must supply. A usage type is not a separate entity - it is a derived type of this base, refining `metadata` and resolving the traits. Declarations are owned by `types-registry`; this gear mints none and holds no catalog. Entry semantics (invalidation invariants, dedup identity, retention arithmetic) live in the gear's domain model and are not restated here.",
@@ -49,9 +49,11 @@
         "enum": ["SUM", "COUNT", "MAX", "MIN", "LATEST"]
       },
       "canonical_unit": {
-        "description": "The canonical metering unit bound to this meter. One unit per type, immutable for its lifetime. Quantities persist and travel in this unit; no path converts, scales, or rounds them. The enumeration is the normative published unit list - a declaration naming a unit outside it is rejected at registration rather than at ingestion. Adding a unit is an additive change.",
+        "description": "The canonical metering unit bound to this meter. One unit per type, immutable for its lifetime. Quantities persist and travel in this unit; no path converts, scales, or rounds them. The units in `examples` are the published list, but the list is guidance rather than a closed set: registration checks only that a unit is present and within length, so a declaration naming a unit outside the list is admitted. Validating membership is not implemented.",
         "type": "string",
-        "enum": ["bytes", "byte-hours", "count", "seconds"]
+        "minLength": 1,
+        "maxLength": 64,
+        "examples": ["bytes", "byte-hours", "count", "seconds"]
       },
       "retention": {
         "description": "ISO 8601 duration. How long entries of this meter are retained, measured from each entry's `window_end` rather than from acceptance. It MUST be at least the configured backfill window plus one operational replay horizon. It bounds the idempotency horizon as well as the data: an identity stays visible for at least this span, and ingestion never reaches past it. Honouring it is an operator and storage-plugin deployment obligation, not gear-level enforcement.",
@@ -90,10 +92,10 @@
       "format": "gts-identifier",
       "minLength": 1,
       "maxLength": 512,
-      "pattern": "^gts\\.cf\\.core\\.uc\\.usage_record\\.v1~[^\\x00-\\x1F\\x7F~]+~$",
+      "pattern": "^gts\\.cf\\.core\\.uc\\.usage_record\\.v2~[^\\x00-\\x1F\\x7F~]+~$",
       "examples": [
-        "gts.cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1~",
-        "gts.cf.core.uc.usage_record.v1~example.metering._.stored_volume.v1~"
+        "gts.cf.core.uc.usage_record.v2~cf.mini_chat._.tokens_consumed.v1~",
+        "gts.cf.core.uc.usage_record.v2~example.metering._.stored_volume.v1~"
       ]
     },
     "entry_type": {

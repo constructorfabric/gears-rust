@@ -306,8 +306,8 @@ This decision directly addresses the following requirements or design elements:
   the product-level half of this decision: a registry outage or restart must
   not stop ingestion for a GTS type already in use, and recovery of a lost
   declaration is best-effort. The PRD states that need and nothing about how it
-  is met. The mirror, the restore, the two cases where recovery does not apply,
-  and the retirement of all three are design mechanism and live here.
+  is met. The mirror, the restore, the cases where recovery does not apply, and
+  the retirement path are design mechanism and live here.
 - `cpt-cf-usage-collector-fr-usage-type-declaration` — the prohibition on a
   second catalog "that has to be kept in step with the registry". The mirror
   does not breach it, though not because declarations never change: retention is
