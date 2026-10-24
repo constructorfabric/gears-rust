@@ -541,7 +541,7 @@ Reference schemas for every entity below live under [`schemas/`](./schemas/) (`t
 | GTS entity | Kind | Usage |
 |---|---|---|
 | `gts.cf.core.tasks.task.v1~` | Base type | Task type base. Concrete task types are **derived at runtime by consuming gears** (not shipped here); determines input/output schemas; may declare concurrency limits, a derived dedup identity (`dedup`) with optional supersession (`supersede`), and progress settings (`progress_events`: `none`/`milestones`/`all`, `progress_flush_interval_secs`) via traits. |
-| `gts.cf.core.tasks.queue.v1~` | Base type | Queue. Well-known instances (`default`, `system`, `dead_letter`) define concurrency, queue depth limit (`queue_max_queue_depth`), timeouts, retry, DLQ, worker blacklist (`blacklist_failure_threshold`, `blacklist_duration_minutes`), and optional default progress settings (`progress_events`, `progress_flush_interval_secs`). |
+| `gts.cf.core.tasks.queue.v1~` | Base type | Queue. `kind` is `dispatch` (default) or `dead_letter`. A `dead_letter` queue (well-known instance `dead_letter`) only holds parked `dead_lettered` tasks: it is never claimable and declares no dispatch settings; the `dead_lettered` state says the task ended and can be re-enqueued, the queue says where it is parked (DLQ listing, metrics, PDP queue constraints). Dispatch queues (well-known instances `default`, `system`) define concurrency, queue depth limit (`queue_max_queue_depth`), timeouts, retry, DLQ, worker blacklist (`blacklist_failure_threshold`, `blacklist_duration_minutes`), and optional default progress settings (`progress_events`, `progress_flush_interval_secs`). |
 | `gts.cf.core.tasks.entry.v1~` | Base type | Task entry type base, with pre-defined derived kinds `entry_work`/`entry_observation`/`entry_issue`/`entry_note`/`entry_measurement`. |
 | `gts.cf.core.events.event.v1~cf.core.tasks.<event>.v1~` | Derived types (×22) | Lifecycle event types — derived from the Event Broker base event type `gts.cf.core.events.event.v1~`; each narrows `data` to its payload contract and fixes the `topic`, `partition_key`, and `allowed_subject_types` traits. See §3.2 Event Producer. |
 | `gts.cf.core.events.topic.v1~cf.core.tasks.task_events.v1` | Instance | Outbound lifecycle-events topic (instance of the Event Broker topic type). Retention `P30D` is the broker **replay horizon**, deliberately shorter than task retention (100 days): a consumer that falls further behind loses broker events but can recover the authoritative history from `GET /tasks/{id}/events` (`te_events`, kept for the task's full retention). |
@@ -1906,6 +1906,7 @@ try_claim_once(queues):
   # All statements use the secure ORM (SecureConn + SeaORM). No FOR UPDATE, no SKIP LOCKED, no dialect SQL —
   # claim is lock-free optimistic concurrency (ADR-0008). Ordering is GLOBAL across the requested queues:
   # (priority ASC, created_at ASC, task_id ASC); the order in which the worker lists queues is irrelevant.
+  reject 400 invalid_argument if any queue has kind = dead_letter         # DLQs are never dispatched (PRD §5.8)
   queues = dedupe(queues) minus queues `worker` is blacklisted on    # ≤ claim_max_queues (checked at parse: 400)
   skipped_for_capacity = false
   ex = Exclusions{}            # scopes found saturated during THIS claim, all keyed so they apply across queues:

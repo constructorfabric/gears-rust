@@ -5,7 +5,7 @@
 {
   "$id": "gts://gts.cf.core.tasks.queue.v1~",
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "description": "Queue base type. A queue is a named dispatch channel; every queue is registered as a GTS well-known instance of this type. The registration carries concurrency limits, a default priority, default timeout values, a default retry policy, optional queue-depth and worker-blacklist settings, optional default progress settings, and an optional dead-letter queue reference. A queue and its dead-letter queue MUST resolve to the same task domain (PRD cpt-cf-task-engine-fr-dead-letter). Values declared here are defaults that operators MAY override in the Task Engine config file by GTS queue pattern (most specific pattern wins). Trait/field keys use snake_case per platform GTS convention.",
+  "description": "Queue base type. A queue is a named dispatch channel; every queue is registered as a GTS well-known instance of this type. The registration carries concurrency limits, a default priority, default timeout values, a default retry policy, optional queue-depth and worker-blacklist settings, optional default progress settings, and an optional dead-letter queue reference. A queue of kind 'dead_letter' is not a dispatch channel: it only holds parked dead_lettered tasks, is never claimable, and declares no dispatch settings. A queue and its dead-letter queue MUST resolve to the same task domain (PRD cpt-cf-task-engine-fr-dead-letter). Values declared here are defaults that operators MAY override in the Task Engine config file by GTS queue pattern (most specific pattern wins). Trait/field keys use snake_case per platform GTS convention.",
   "type": "object",
   "additionalProperties": false,
   "properties": {
@@ -19,6 +19,15 @@
       "type": "string",
       "maxLength": 1024,
       "pattern": "^[\\x20-\\x7E]*$"
+    },
+    "kind": {  // dispatch | dead_letter
+      "description": "'dispatch' (default): a normal queue that workers claim from. 'dead_letter': holds parked dead_lettered tasks only (PRD cpt-cf-task-engine-fr-dead-letter); it is never dispatched, a claim naming it is rejected 400 invalid_argument, and it MUST NOT declare any dispatch setting (concurrency, priority, timeouts, retry, depth, blacklist, progress, fairness, dead_letter_queue).",
+      "type": "string",
+      "enum": [
+        "dispatch",
+        "dead_letter"
+      ],
+      "default": "dispatch"
     },
     "global_concurrency_limit": {
       "description": "Maximum number of simultaneously executing (claimed + running) tasks from this queue across all tenants. 0 means unlimited (PRD cpt-cf-task-engine-fr-queue-concurrency).",
@@ -183,7 +192,7 @@
       "default": "round_robin"
     },
     "dead_letter_queue": {
-      "description": "Optional GTS identifier of the queue that tasks are dead-lettered into when they exhaust retries or exceed their lifetime. MUST resolve to the same task domain as this queue. Absent means failing tasks transition to 'failed' instead of being dead-lettered.",
+      "description": "Optional GTS identifier of the queue that tasks are dead-lettered into when they exhaust retries or exceed their lifetime. MUST reference a queue of kind 'dead_letter' (checked by the engine when it resolves the queue) and MUST resolve to the same task domain as this queue. Absent means failing tasks transition to 'failed' instead of being dead-lettered.",
       "type": [
         "string",
         "null"
@@ -193,11 +202,42 @@
     }
   },
   "required": [
-    "id",
-    "global_concurrency_limit",
-    "per_tenant_concurrency_limit",
-    "default_priority",
-    "timeouts",
-    "retry_policy"
-  ]
+    "id"
+  ],
+  "if": {
+    "properties": {
+      "kind": {
+        "const": "dead_letter"
+      }
+    },
+    "required": [
+      "kind"
+    ]
+  },
+  "then": {
+    "$comment": "Dead-letter queues carry no dispatch settings.",
+    "properties": {
+      "global_concurrency_limit": false,
+      "per_tenant_concurrency_limit": false,
+      "default_priority": false,
+      "timeouts": false,
+      "retry_policy": false,
+      "queue_max_queue_depth": false,
+      "blacklist_failure_threshold": false,
+      "blacklist_duration_minutes": false,
+      "progress_events": false,
+      "progress_flush_interval_secs": false,
+      "tenant_fairness": false,
+      "dead_letter_queue": false
+    }
+  },
+  "else": {
+    "required": [
+      "global_concurrency_limit",
+      "per_tenant_concurrency_limit",
+      "default_priority",
+      "timeouts",
+      "retry_policy"
+    ]
+  }
 }
