@@ -925,3 +925,139 @@ async fn k8s_cache_015_scan_prefix_filters_and_excludes_expired() {
 
     handle.stop().await;
 }
+
+/// `result` as an error string, unless it is `Ok`, a `CasConflict`, or a retryable
+/// provider error (e.g. `put` running out of retries, DESIGN §6.1).
+fn unexpected<T>(result: Result<T, ClusterError>) -> Option<String> {
+    match result {
+        Ok(_) | Err(ClusterError::CasConflict { .. }) => None,
+        Err(err @ ClusterError::Provider { .. }) if err.is_retryable() => None,
+        Err(other) => Some(format!("{other:?}")),
+    }
+}
+
+type DynCache = std::sync::Arc<dyn cluster_sdk::cache::ClusterCacheBackend>;
+
+/// Writes per writer task in the race scenarios.
+const RACE_OPS: usize = 100;
+
+/// Runs `writers` tasks of `ops` writes each against the key `race` while two
+/// tasks keep deleting it, and returns the unexpected errors.
+async fn race_against_delete<F, Fut>(
+    cache: &DynCache,
+    writers: usize,
+    ops: usize,
+    write: F,
+) -> Vec<String>
+where
+    F: Fn(DynCache, usize) -> Fut + Clone + Send + 'static,
+    Fut: std::future::Future<Output = Result<(), ClusterError>> + Send,
+{
+    let stop = tokio_util::sync::CancellationToken::new();
+    let mut deleters = Vec::new();
+    for _ in 0..2 {
+        let cache = cache.clone();
+        let stop = stop.clone();
+        deleters.push(tokio::spawn(async move {
+            while !stop.is_cancelled() {
+                let _deleted = cache.delete("race").await;
+            }
+        }));
+    }
+    let mut tasks = Vec::new();
+    for w in 0..writers {
+        let cache = cache.clone();
+        let write = write.clone();
+        tasks.push(tokio::spawn(async move {
+            let mut errors = Vec::new();
+            for i in 0..ops {
+                errors.extend(unexpected(write(cache.clone(), w * ops + i).await));
+            }
+            errors
+        }));
+    }
+    let mut errors = Vec::new();
+    for t in tasks {
+        errors.extend(t.await.expect("writer task"));
+    }
+    stop.cancel();
+    for d in deleters {
+        d.await.expect("deleter task");
+    }
+    errors
+}
+
+/// `K8S-CACHE-018`: a `put` racing a `delete` on the same key never fails with a
+/// non-retryable error (DESIGN §6.1).
+#[tokio::test]
+async fn k8s_cache_018_put_racing_delete_upserts() {
+    let ns = common::fresh_namespace("cache-018").await;
+    let client = ns.client.clone();
+    let handle = K8sCachePlugin::builder(ns.cache_config_with(json!({})))
+        .with_client(client)
+        .build_and_start()
+        .await
+        .expect("cache starts");
+    let cache = handle.cache();
+
+    let errors = race_against_delete(&cache, 8, RACE_OPS, |cache, i| async move {
+        let value = i.to_be_bytes();
+        cache
+            .put(PutRequest {
+                key: "race",
+                value: &value,
+                ttl: Ttl::Indefinite,
+            })
+            .await
+    })
+    .await;
+    assert!(
+        errors.is_empty(),
+        "K8S-CACHE-018: put racing delete must upsert; {} unexpected errors, first: {:?}",
+        errors.len(),
+        errors.first()
+    );
+
+    handle.stop().await;
+}
+
+/// `K8S-CACHE-019`: a `compare_and_swap` racing a `delete` on the same key fails
+/// only with `CasConflict` or a retryable error (DESIGN §6.1).
+#[tokio::test]
+async fn k8s_cache_019_cas_racing_delete_conflicts() {
+    let ns = common::fresh_namespace("cache-019").await;
+    let client = ns.client.clone();
+    let handle = K8sCachePlugin::builder(ns.cache_config_with(json!({})))
+        .with_client(client)
+        .build_and_start()
+        .await
+        .expect("cache starts");
+    let cache = handle.cache();
+
+    let errors = race_against_delete(&cache, 8, RACE_OPS, |cache, i| async move {
+        let value = i.to_be_bytes();
+        match cache.get("race").await? {
+            Some(entry) => cache
+                .compare_and_swap("race", entry.version, &value, Ttl::Indefinite)
+                .await
+                .map(drop),
+            None => cache
+                .put_if_absent(PutRequest {
+                    key: "race",
+                    value: &value,
+                    ttl: Ttl::Indefinite,
+                })
+                .await
+                .map(drop),
+        }
+    })
+    .await;
+    assert!(
+        errors.is_empty(),
+        "K8S-CACHE-019: CAS racing delete must conflict; {} unexpected errors, first: {:?}",
+        errors.len(),
+        errors.first()
+    );
+
+    handle.stop().await;
+}
