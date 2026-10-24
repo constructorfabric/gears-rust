@@ -197,7 +197,7 @@ Tenant-owned tables (`te_tasks`, `te_task_state`, `te_task_entries`, `te_wait_co
 
 **ID**: `cpt-cf-task-engine-principle-gts-typed`
 
-**GTS-typed extensibility**: Task types, entry types, and queues are GTS entities. New extensible types are registerable without DDL changes. Engine-owned finite sets such as task states, result codes, wait condition kinds, timer types, timer statuses, dependency modes, and concurrency dimensions are closed SDK/domain enums, not GTS entities. Tags are free-form tenant-scoped strings, not GTS entities (PRD §5.1). Extension data lives in JSONB columns.
+**GTS-typed extensibility**: Task types, entry types, and queues are GTS entities. New extensible types are registerable without DDL changes. Engine-owned finite sets such as task states, result codes, wait condition kinds, timer types, timer statuses, dependency modes, and concurrency dimensions are closed SDK/domain enums, not GTS entities. Tags are free-form tenant-scoped strings, not GTS entities (PRD §5.1). Extension data (input, context, output) lives in compressed binary columns (ADR-0006, §3.7 Portable JSON Storage Contract).
 
 **ID**: `cpt-cf-task-engine-principle-tenant-scope`
 
@@ -540,7 +540,7 @@ Reference schemas for every entity below live under [`schemas/`](./schemas/) (`t
 
 | GTS entity | Kind | Usage |
 |---|---|---|
-| `gts.cf.core.tasks.task.v1~` | Base type | Task type base. Concrete task types are **derived at runtime by consuming gears** (not shipped here); determines input/output schemas; may declare concurrency limits, a derived dedup identity (`dedup`) with optional supersession (`supersede`), and progress settings (`progress_events`: `none`/`milestones`/`all`, `progress_flush_interval_secs`) via traits. |
+| `gts.cf.core.tasks.task.v1~` | Base type | Task type base. Concrete task types are **derived at runtime by consuming gears** (not shipped here); determines input/output schemas; may declare concurrency limits, a derived dedup identity (`dedup`) with optional supersession (`supersede`), progress settings (`progress_events`: `none`/`milestones`/`all`, `progress_flush_interval_secs`), and type defaults (`default_queue`, `timeouts`, `retry_policy`, `retention_days`) via traits. |
 | `gts.cf.core.tasks.queue.v1~` | Base type | Queue. `kind` is `dispatch` (default) or `dead_letter`. A `dead_letter` queue (well-known instance `dead_letter`) only holds parked `dead_lettered` tasks: it is never claimable and declares no dispatch settings; the `dead_lettered` state says the task ended and can be re-enqueued, the queue says where it is parked (DLQ listing, metrics, PDP queue constraints). Dispatch queues (well-known instances `default`, `system`) define concurrency, queue depth limit (`queue_max_queue_depth`), timeouts, retry, DLQ, worker blacklist (`blacklist_failure_threshold`, `blacklist_duration_minutes`), and optional default progress settings (`progress_events`, `progress_flush_interval_secs`). |
 | `gts.cf.core.tasks.entry.v1~` | Base type | Task entry type base, with pre-defined derived kinds `entry_work`/`entry_observation`/`entry_issue`/`entry_note`/`entry_measurement`. |
 | `gts.cf.core.events.event.v1~cf.core.tasks.<event>.v1~` | Derived types (×22) | Lifecycle event types — derived from the Event Broker base event type `gts.cf.core.events.event.v1~`; each narrows `data` to its payload contract and fixes the `topic`, `partition_key`, and `allowed_subject_types` traits. See §3.2 Event Producer. |
@@ -557,7 +557,7 @@ Reference schemas for every entity below live under [`schemas/`](./schemas/) (`t
 
 #### Hybrid Storage Model (GTS + Engine Enums)
 
-Task types use a **hybrid storage model**: base fields (state, priority, queue, timestamps, owner, assignment) live in indexed relational columns for efficient querying. Type-specific extension data (input, context, output) is stored in JSONB columns. The `type_id` column stores the deterministic UUID derived from the GTS type identifier via `gts_schema_with_refs_as_string()`. This enables new task types to be registered without DDL changes — only GTS type registration is required.
+Task types use a **hybrid storage model**: base fields (state, priority, queue, timestamps, owner, assignment) live in indexed relational columns for efficient querying. Type-specific extension data (input, context, output) is stored in compressed binary columns (ADR-0006, §3.7 Portable JSON Storage Contract). The `type_id` column stores the deterministic UUID derived from the GTS type identifier via `gts_schema_with_refs_as_string()`. This enables new task types to be registered without DDL changes — only GTS type registration is required.
 
 Engine-owned finite sets **MUST** use stable SDK enum discriminants and compact numeric database columns (`u8` in domain models; `TINYINT` where supported, `SMALLINT` for PostgreSQL portability). Hot predicates **MUST NOT** store state, result code, timer type, timer status, wait kind, or dependency mode as strings or GTS UUIDs.
 
@@ -666,6 +666,8 @@ Core lifecycle orchestrator. Owns task creation, validation, state transitions, 
 
 Responsibilities:
 - Accept task definitions, validate against GTS registry, generate IDs, persist
+- Resolve type defaults (PRD §5.12 Type defaults resolution) before admission and store the result on the task: queue = request → type `default_queue` → `default`; each timeout field = request → type `timeouts` → queue effective value; retry policy (whole) = request → type `retry_policy` → queue effective value. Later trait or queue changes do not affect existing tasks. A type that declares `dedup.scope = authz_scope` is non-creatable until the ToolKit item below is resolved
+  - TODO(toolkit): confirm `AccessScope` exposes a stable serialized form of its compiled constraints (PRD §11 Assumptions, §13 Open Questions); until then `authz_scope` is rejected `invalid_argument`
 - Record `created_by` = `SecurityContext.subject_id` of the create request (server-set, never caller-supplied)
 - Enforce idempotency via the caller-supplied key (REST `Idempotency-Key` header → `idempotency_key`; SDK `CreateTaskRequest.idempotency_key`), unique within `(owner_tenant_id, created_by)`. Missing key → `invalid_argument` with transport override `428`. Duplicate key, equal payload (canonical-JSON compare of type/queue/input/context), task in **any** state → `already_exists` `409` with `context.resource_name` = existing task ID; the SDK surfaces this as `CreateTaskOutcome::Existing(task)`. Same key, **different** payload → `invalid_argument` `400` (field violation on `idempotency_key`). Dedup bounded by retention (§4.5)
 - **Derived dedup identity** (types declaring the `dedup` trait): compute the identity from the *validated* input after authorization (§4.6 Task Creation Admission); the `Idempotency-Key` header is not required and, if present, is **ignored** (not stored, not checked; SDKs and gateways attach it automatically). Occupancy lives in `te_dedup` (§3.7); a hit returns `already_exists` `409` + `resource_name`, but only if the caller's `AccessScope` can read the existing task (else `permission_denied` `403`, no identifier)
@@ -768,7 +770,7 @@ Background cleanup. Runs as a `WithLifecycle` stateful task with `CancellationTo
 
 On the PostgreSQL/MySQL production profile, retention is realized primarily by **dropping whole history partitions** rather than row deletion, on the live / history layout of §3.7 (live non-terminal tasks are never in a partition). See [ADR/0009-retention-partitioning.md](ADR/0009-retention-partitioning.md).
 
-**Retention clock**: a task's data expires at `terminal_at + effective_retention` (tenant policy → most-specific type policy → global default, PRD §5.14). Non-terminal tasks never expire by retention; they are bounded only by their lifetime timeout and by `hard_retention_days`.
+**Retention clock**: a task's data expires at `terminal_at + effective_retention` (tenant policy → most-specific config type pattern → type `retention_days` trait → global default, PRD §5.14). Non-terminal tasks never expire by retention; they are bounded only by their lifetime timeout and by `hard_retention_days`.
 
 **Drop horizon** (`drop_horizon_days`, default = `global_retention_days`): the age, measured on the task creation time of the partition range, after which a history partition is dropped. It is deliberately the **common** retention, not the longest one, so one long policy can never block dropping for the whole domain.
 
