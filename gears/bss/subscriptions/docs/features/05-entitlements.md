@@ -35,7 +35,7 @@ description: "Commercial posture derived from committed terms and lifecycle, pub
 
 Derive the commercial posture from committed terms and lifecycle, commit it atomically with the transition, publish it to Entitlements, and expose the readiness and materialization state Entitlements reports.
 
-Subscriptions supplies the desired commercial rights and records the observations Entitlements reports against the matching revision. Entitlements owns the readiness manifest, adapters and provider integration. Subscriptions does not take over materialization or point-of-use enforcement.
+Subscriptions supplies the desired commercial rights and records the observations Entitlements reports against the matching revision. Entitlements owns the readiness manifest, the adapters and the provider integration; see the [Entitlements DESIGN](../../../entitlements/docs/DESIGN.md). Subscriptions does not take over materialization or point-of-use enforcement.
 
 ### 1.2 Purpose
 
@@ -52,7 +52,7 @@ Subscriptions supplies the desired commercial rights and records the observation
 
 ### 1.4 References
 
-- **PRD:** [PRD.md](../PRD.md); **Design:** [entitlement contract](../DESIGN.md#335-entitlement-and-retention-contracts).
+- **PRD:** [PRD.md](../PRD.md); **Design:** [entitlement contract](../DESIGN.md#335-entitlement-and-retention-contracts); [Entitlements DESIGN](../../../entitlements/docs/DESIGN.md#331-commercial-posture-contract).
 - **Build prerequisites:** [foundation](01-foundation.md) and [composition](02-composition.md), as allocated in [DECOMPOSITION.md](../DECOMPOSITION.md).
 - **Provider prerequisites / integration acceptance:** Entitlements accepts the selected adapter against its capability profile before a capability is enabled. Cross-lifecycle handoff verification is an integration acceptance step, not a build dependency on each lifecycle feature.
 
@@ -120,7 +120,7 @@ Atomically commit active status, own-reservation conversion, fresh local `servic
 
 All rights essential for initial usable service must be ready before this commit. The post-commit outbox may reconcile the same satisfied assignment or deliver nonessential/ongoing changes; it cannot be the first action that makes required initial access usable. Initial readiness is not an uptime guarantee, and later service failure does not reopen or backdate the completed acquisition.
 
-Entitlements owns manifest construction, trusted producer selection, provider uncertainty handling and cleanup; Subscriptions enforces the consumer contract above.
+The manifest, the observation envelope, producer rules, uncertainty handling and cleanup are specified in [Entitlements: readiness manifest and observation envelope](../../../entitlements/docs/features/02-initial-readiness.md#readiness-manifest-and-observation-envelope).
 
 **Trial coverage and readiness.** A credit trial requires a durable Billing commitment for one reserved grant, exact accepted scope/terms and the saved activation operation/preparation generation. Subscriptions carries its authenticated reference and digest as `trialCoverage` in preparation posture; it is covered by the posture digest and held-readiness binding. Entitlements verifies the commitment and the selected profile's ability to prepare and retain usable access without waiting for later Billing recording.
 
