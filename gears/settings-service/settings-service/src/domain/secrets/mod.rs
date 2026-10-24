@@ -1,4 +1,3 @@
-// Created: 2026-09-07 by Virtuozzo International GmbH
 //! Secret values: the opaque handle a consumer holds and the machine-only
 //! resolution behind it.
 //!

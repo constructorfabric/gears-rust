@@ -221,7 +221,7 @@ One requirement is counted as covered while being split across releases: `cpt-cf
   - Rejecting a non-empty `default_value` on a secret-trait type
   - The two people-gating flags: `requires_step_up`, defaulting to the protective `true`, and `anonymous_exposable`, defaulting to `false` and refused — in the handler and by a schema check — on a `secret` or `pii` classification
   - The mutation-class discipline: descriptive metadata immediate under `update` plus `If-Match`; behavior-affecting fields (`default_value`, value type, `scope_class`) immutable and rejected with `400`; retire and reactivate immediate but step-up gated through the port delivered in 2.1 and bound in 2.8; classification tightening immediate, loosening step-up gated; clearing `requires_step_up` or enabling `anonymous_exposable` step-up gated whatever the flag currently says
-  - Retire as soft-delete setting `status = retired`, retaining values in `setting_values` while excluding them from resolution, with re-declare-to-revive recovery and evolve-by-re-declaring to the next free major on the same version-stripped path
+  - Retire as soft-delete setting `status = retired`, retaining values in `setting_values` while excluding them from resolution, with re-declare-to-revive recovery, a read-only report of the retained values a revive would bring back, and evolve-by-re-declaring to the next free major on the same version-stripped path
   - Dependency Group and cross-setting constraint **declaration**
   - Declaration REST surface, visibility- and domain-gated with the predicate applied inside the query, returning the `key`, its `value_type_id`, and resolved traits for client rendering, and leaving the seam through which the licence predicate joins in R2
 
@@ -258,6 +258,7 @@ One requirement is counted as covered while being split across releases: `cpt-cf
 
 - **API**:
   - POST /settings-service/v1/declarations
+  - POST /settings-service/v1/declarations/revival-preview
   - GET /settings-service/v1/declarations
   - GET /settings-service/v1/declarations/{id}
   - PATCH /settings-service/v1/declarations/{id}

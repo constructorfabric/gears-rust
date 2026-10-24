@@ -1,4 +1,3 @@
-// Created: 2026-09-07 by Virtuozzo International GmbH
 // @cpt-dod:cpt-cf-settings-service-dod-tenant-access-operations:p1
 // @cpt-dod:cpt-cf-settings-service-dod-tenant-access-concurrency:p1
 // @cpt-dod:cpt-cf-settings-service-dod-tenant-access-eviction:p1
@@ -90,7 +89,7 @@ fn absent() -> DomainError {
 /// retired declaration refuses it as retired. The rows it keeps across the
 /// retire stay readable — they are what a revive brings back.
 fn refuse_retired(declaration: &Declaration) -> Result<(), DomainError> {
-    if declaration.status == "retired" {
+    if declaration.status.is_retired() {
         return Err(DomainError::Retired {
             key: declaration.key.clone(),
         });

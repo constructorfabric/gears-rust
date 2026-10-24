@@ -1,4 +1,3 @@
-// Created: 2026-08-12 by Virtuozzo International GmbH
 //! Deployment-owned bootstrap configuration for the settings-service gear.
 //!
 //! # Why this struct has no `Default`

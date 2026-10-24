@@ -8771,6 +8771,26 @@
         ],
         "type": "object"
       },
+      "NeedsReviewDto": {
+        "description": "A review verdict on one value: whether it is flagged, and why.",
+        "properties": {
+          "needs_review": {
+            "description": "Whether a revive would flag the value: it no longer validates against\nthe type. A secret is never flagged, and a value flagged earlier that\nvalidates again is reported clear.",
+            "type": "boolean"
+          },
+          "needs_review_detail": {
+            "description": "Why, when `needs_review`; absent whenever the value is masked.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "needs_review"
+        ],
+        "type": "object"
+      },
       "NewUserPasswordDto": {
         "description": "Mirrors [`NewUserPassword`](account_management_sdk::NewUserPassword).\n`value` is redacted in `Debug`; do not log this struct directly.",
         "properties": {
@@ -18631,6 +18651,95 @@
           "comments_count"
         ],
         "type": "object"
+      },
+      "RevivalReportDto": {
+        "description": "What a revive of a retired declaration would do to the values it retained:\nadvisory, stored nowhere, and not consulted by the revive.",
+        "properties": {
+          "complete": {
+            "description": "`false` when the subtree node budget cut the walk: the counts are then\nlower bounds.",
+            "type": "boolean"
+          },
+          "declaration_id": {
+            "description": "The retired declaration's id.",
+            "format": "uuid",
+            "type": "string"
+          },
+          "key": {
+            "description": "The declaration's key.",
+            "type": "string"
+          },
+          "scanned": {
+            "description": "How many tenants were walked, the caller's own included.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total": {
+            "description": "How many retained values were found, listed or not.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total_needs_review": {
+            "description": "How many of them a revive would flag.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "values": {
+            "description": "The first `limit` retained values within the caller's administration,\nin the walk's breadth-first order.",
+            "items": {
+              "$ref": "#/components/schemas/RevivalValueDto"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "key",
+          "declaration_id",
+          "values",
+          "total",
+          "total_needs_review",
+          "scanned",
+          "complete"
+        ],
+        "type": "object"
+      },
+      "RevivalValueDto": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/NeedsReviewDto",
+            "description": "Whether a revive would flag the value, and why; the detail is\nwithheld whenever the value is masked."
+          },
+          {
+            "properties": {
+              "masked": {
+                "description": "Whether the value is the mask token rather than the stored value.",
+                "type": "boolean"
+              },
+              "scope": {
+                "description": "Its scope path: `/` for the root tenant, `/tenants/{id}` otherwise.",
+                "type": "string"
+              },
+              "tenant_id": {
+                "description": "The tenant the value is stored at.",
+                "format": "uuid",
+                "type": "string"
+              },
+              "value": {
+                "description": "The stored value, or the mask token when `masked`."
+              }
+            },
+            "required": [
+              "tenant_id",
+              "scope",
+              "value",
+              "masked"
+            ],
+            "type": "object"
+          }
+        ],
+        "description": "One retained value a revive of the retired declaration would re-validate."
       },
       "RouteResponse": {
         "properties": {
@@ -62664,6 +62773,145 @@
           }
         ],
         "summary": "Declare a setting",
+        "tags": [
+          "settings-declarations"
+        ]
+      }
+    },
+    "/settings-service/v1/declarations/revival-preview": {
+      "post": {
+        "description": "Advisory: takes the body of the create that would revive a retired declaration and reports the values it retained at the caller's tenant and its descendants, each re-validated as the revive would re-validate it, without changing anything. Nothing is stored, no step-up is asked, no audit record is written and no cache is touched, and a revive neither requires a report nor consults one. The coverage is the caller's own administration: the caller's tenant and its descendants under the subtree node budget, standalone descendants and their subtrees left out of the list and the counts; `complete` is `false` when the budget cut the walk, and the counts are then lower bounds. `values` lists the first `limit` (default 100, above 500 clamped, below 1 refused) in the walk's breadth-first order, `total` and `total_needs_review` count every value found. A value is masked by the strictest of its row's own classification, the declaration's and the one the body derives, and its detail is withheld whenever it is masked. A body the create's JSON extractor refuses is answered as the create answers it (`400`, `415`, `422`), once both decisions are made; the create's own refusals are answered in the create's order; a body that would not revive a retired declaration, or a retired declaration the caller may not read, is `404` with the code `nothing_to_revive`, the same answer either way. Reactivation is a separate request: `POST` of the same body to the declarations collection, which needs step-up, and values written in between are not in the report. A standalone tenant is a barrier: its subtree is administered from within, and an administrator above it neither sees nor is told of values stored there, though the revive re-validates them too.",
+        "operationId": "settings_service.report_revival",
+        "parameters": [
+          {
+            "description": "How many values to list",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateDeclarationRequest"
+              }
+            }
+          },
+          "description": "The declaration body a revive would be sent",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RevivalReportDto"
+                }
+              }
+            },
+            "description": "The retained values a revive would re-validate"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "415": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "The body is not sent as `application/json`, as the create answers it"
+          },
+          "422": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "The body is JSON but not a declaration to create, as the create answers it"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Report what reviving a retired declaration would do to its values",
         "tags": [
           "settings-declarations"
         ]

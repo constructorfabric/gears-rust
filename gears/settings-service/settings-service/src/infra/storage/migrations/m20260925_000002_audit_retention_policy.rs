@@ -1,4 +1,3 @@
-// Created: 2026-09-25 by Virtuozzo International GmbH
 // @cpt-dod:cpt-cf-settings-service-dod-audit-store-table:p1
 //! The audit trigger learns the configured retention, not only the minimum.
 //!

@@ -1,4 +1,3 @@
-// Created: 2026-08-13 by Virtuozzo International GmbH
 //! Category management.
 
 pub mod bounds;

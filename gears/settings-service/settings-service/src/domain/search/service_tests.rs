@@ -1,4 +1,3 @@
-// Created: 2026-09-17 by Virtuozzo International GmbH
 //! Attribution: which field a hit is told about, and that a row the database
 //! returned is never dropped on the way to the client.
 
@@ -14,7 +13,7 @@ use uuid::Uuid;
 use super::{SearchService, declaration_match};
 use crate::domain::category::Category;
 use crate::domain::category::visibility::DomainVisibility;
-use crate::domain::declaration::Declaration;
+use crate::domain::declaration::{Declaration, DeclarationStatus};
 use crate::domain::error::DomainError;
 use crate::domain::odata::Listing;
 use crate::domain::search::{Corpus, MatchedField, Needle, SearchRepository, SearchRequest};
@@ -38,7 +37,7 @@ fn declaration(
         category_id: Uuid::from_u128(7),
         scope_class: "cascading".to_owned(),
         mode: "standard".to_owned(),
-        status: "active".to_owned(),
+        status: DeclarationStatus::Active,
         domain_affinity: None,
         licence_feature: None,
         owner_module: None,

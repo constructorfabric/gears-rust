@@ -1,4 +1,3 @@
-// Created: 2026-09-17 by Virtuozzo International GmbH
 //! What the write handlers read off a request before any service runs, and
 //! the one response they build themselves: the RFC 9470 challenge.
 
