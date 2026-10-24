@@ -76,8 +76,9 @@ impl Default for PoolConfig {
 pub struct H1Limits {
     /// Maximum number of response header fields.
     pub max_headers: usize,
-    /// Maximum read buffer, which also caps the size of a response head.
-    /// hyper enforces a floor of 8 KiB.
+    /// Maximum read buffer, which also caps the size of a response head
+    /// (checked between reads, so a head delivered in one read may exceed it
+    /// by at most one buffer growth step). hyper enforces a floor of 8 KiB.
     pub max_buf_size: usize,
 }
 
