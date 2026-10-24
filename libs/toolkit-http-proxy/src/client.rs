@@ -6,17 +6,16 @@ use std::time::Duration;
 
 use http::{HeaderValue, Request, Response, StatusCode, Uri, Version, header};
 use http_body::Body as _;
-use http_body_util::BodyExt as _;
 use hyper::body::Incoming;
-use hyper::client::conn::{http1, http2};
+use hyper::client::conn::http1;
 use hyper::upgrade::Upgraded;
-use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
-use tokio_util::sync::CancellationToken;
+use hyper_util::rt::TokioIo;
 
-use crate::body::{Hold, OnEnd, ProxyBody, ResponseBody, TrackedBody, UploadProgress};
+use crate::body::{Hold, OnEnd, ProxyBody, ResponseBody};
 use crate::config::ProxyClientConfig;
 use crate::connect::{KillableIo, connect};
 use crate::error::{ErrorKind, ProxyError};
+use crate::http2::{self, H2Body, H2Sender, Started};
 use crate::observe::{ConnectionInfo, NoopObserver, Observer};
 use crate::pool::{ConnHandle, H2Lease, Pool, PoolKey, reap_loop};
 use crate::protocol_cache::{CachedProtocol, ProtocolCache};
@@ -43,7 +42,7 @@ pub enum UpgradeOutcome {
 /// Pooled HTTP/1.1 + HTTP/2 client for proxying to upstreams.
 ///
 /// Cheap to clone. Create it inside a Tokio runtime: it spawns a pool
-/// reaper and one task per connection.
+/// reaper and tasks per connection.
 #[derive(Clone)]
 pub struct ProxyClient {
     inner: Arc<Inner>,
@@ -56,12 +55,11 @@ struct Inner {
     protocols: ProtocolCache,
     observer: Arc<dyn Observer>,
     h1: http1::Builder,
-    h2: http2::Builder<TokioExecutor>,
 }
 
 enum Sender {
     H1(http1::SendRequest<ProxyBody>),
-    H2(http2::SendRequest<ProxyBody>),
+    H2(H2Sender),
 }
 
 /// A connection ready to carry one exchange.
@@ -94,7 +92,7 @@ struct Retry {
 }
 
 enum DispatchError {
-    /// hyper handed the request back: nothing reached the upstream.
+    /// The request provably never left: it comes back for a retry.
     Unsent(Box<Request<ProxyBody>>, ProxyError),
     Failed(ProxyError),
 }
@@ -129,22 +127,6 @@ impl ProxyClient {
         h1.max_headers(cfg.h1.max_headers)
             .max_buf_size(cfg.h1.max_buf_size);
 
-        let mut h2 = http2::Builder::new(TokioExecutor::new());
-        h2.timer(TokioTimer::new())
-            .max_header_list_size(cfg.h2.max_header_list_size)
-            .header_table_size(cfg.h2.header_table_size)
-            .max_frame_size(cfg.h2.max_frame_size)
-            .initial_stream_window_size(cfg.h2.initial_stream_window_size)
-            .initial_connection_window_size(cfg.h2.initial_connection_window_size)
-            .adaptive_window(false)
-            .max_concurrent_reset_streams(cfg.h2.max_concurrent_reset_streams)
-            .max_pending_accept_reset_streams(cfg.h2.max_pending_accept_reset_streams)
-            .max_local_error_reset_streams(cfg.h2.max_local_error_reset_streams)
-            .max_send_buf_size(cfg.h2.max_send_buf_size)
-            .keep_alive_interval(cfg.h2.keep_alive_interval)
-            .keep_alive_timeout(cfg.h2.keep_alive_timeout)
-            .keep_alive_while_idle(true);
-
         Ok(Self {
             inner: Arc::new(Inner {
                 protocols: ProtocolCache::new(cfg.protocol_cache_ttl),
@@ -153,7 +135,6 @@ impl ProxyClient {
                 pool,
                 observer,
                 h1,
-                h2,
             }),
         })
     }
@@ -189,8 +170,7 @@ impl ProxyClient {
     ) -> Result<Response<ResponseBody>, ProxyError> {
         let (mut parts, body) = req.into_parts();
         sanitize::sanitize_request_headers(&mut parts.headers, RequestKind::Regular);
-        let (body, progress) = TrackedBody::new(body);
-        let mut req = Request::from_parts(parts, body.boxed_unsync());
+        let mut req = Request::from_parts(parts, body);
         let key = PoolKey::of(target);
 
         let mut retry: Option<Retry> = None;
@@ -198,7 +178,7 @@ impl ProxyClient {
             let acquired = self.acquire(target, &key, retry).await?;
             let reused = acquired.reused;
             let generation = acquired.conn.generation;
-            match self.dispatch(target, &key, acquired, req, &progress).await {
+            match self.dispatch(target, &key, acquired, req).await {
                 Ok(resp) => return Ok(resp),
                 // At most one retry, only for a reused connection, only when
                 // the request provably never left: a stale keep-alive
@@ -249,18 +229,23 @@ impl ProxyClient {
         .await?;
         let connect_time = connected.elapsed;
         let handle = self.inner.pool.new_handle();
-        let io = TokioIo::new(KillableIo::new(connected.stream, &handle.kill));
+        // No write-stall budget: an upgraded tunnel's pace belongs to its
+        // peers (the WebSocket relay has its own idle handling).
+        let io = TokioIo::new(KillableIo::new(connected.stream, &handle.kill, None));
         let (mut tx, conn) = self
             .inner
             .h1
             .handshake::<_, ProxyBody>(io)
             .await
             .map_err(ProxyError::from_hyper)?;
-        tokio::spawn(drive(
-            "http1-upgrade",
-            conn.with_upgrades(),
-            handle.kill.clone(),
-        ));
+        // The connection task ends when hyper hands the socket to `Upgraded`;
+        // the handle must stay alive (not cancelled) for the tunnel's sake.
+        tokio::spawn(async move {
+            if let Err(e) = conn.with_upgrades().await {
+                tracing::debug!(error = %e, "upstream upgrade connection closed with error");
+            }
+            drop(handle);
+        });
         self.inner.observer.on_connection(&ConnectionInfo {
             target,
             reused: false,
@@ -273,7 +258,7 @@ impl ProxyClient {
             .await?
             .map_err(ProxyError::from_hyper)?;
         if resp.status() != StatusCode::SWITCHING_PROTOCOLS {
-            return Ok(UpgradeOutcome::Rejected(self.finish(resp, None, None)));
+            return Ok(UpgradeOutcome::Rejected(self.finish_h1(resp, None)));
         }
         sanitize::validate_websocket_switch(resp.headers())?;
         let io = hyper::upgrade::on(&mut resp)
@@ -287,12 +272,7 @@ impl ProxyClient {
         })
     }
 
-    fn finish(
-        &self,
-        resp: Response<Incoming>,
-        on_end: Option<OnEnd>,
-        hold: Option<Hold>,
-    ) -> Response<ResponseBody> {
+    fn finish_h1(&self, resp: Response<Incoming>, on_end: Option<OnEnd>) -> Response<ResponseBody> {
         let (mut head, body) = resp.into_parts();
         // RFC 9112 §6.3: a response carrying both framings must not leave
         // its connection reusable, whatever hyper decided.
@@ -302,7 +282,20 @@ impl ProxyClient {
         sanitize::sanitize_response_headers(&mut head.headers, head.status);
         Response::from_parts(
             head,
-            ResponseBody::new(body, self.inner.cfg.read_timeout, on_end, hold),
+            ResponseBody::http1(body, self.inner.cfg.read_timeout, on_end),
+        )
+    }
+
+    fn finish_h2(
+        &self,
+        resp: Response<h2::RecvStream>,
+        hold: Option<Hold>,
+    ) -> Response<ResponseBody> {
+        let (mut head, body) = resp.into_parts();
+        sanitize::sanitize_response_headers(&mut head.headers, head.status);
+        Response::from_parts(
+            head,
+            ResponseBody::http2(H2Body::new(body), self.inner.cfg.read_timeout, hold),
         )
     }
 
@@ -365,18 +358,24 @@ impl ProxyClient {
         if let Some(lease) = pool.lease(&slot, avoid) {
             return Ok(leased(lease, true, None));
         }
-        if plan == Plan::Negotiate
-            && self.inner.protocols.get(target) == Some(CachedProtocol::Http1Only)
-        {
-            // A concurrent connect just learned this host is HTTP/1.1 only;
-            // don't keep HTTP/2 setup serialised behind HTTP/1.1 connects.
-            drop(connecting);
-            if retry.is_none()
-                && let Some((tx, conn)) = self.checkout_h1(key).await
-            {
-                return Ok(reused_h1(tx, conn));
+        if plan == Plan::Negotiate {
+            let cached_h1 = self.inner.protocols.get(target) == Some(CachedProtocol::Http1Only);
+            if cached_h1 || slot.h1_hint() {
+                // This host speaks HTTP/1.1: don't keep HTTP/2 setup
+                // serialised behind HTTP/1.1 connects.
+                drop(connecting);
+                if retry.is_none()
+                    && let Some((tx, conn)) = self.checkout_h1(key).await
+                {
+                    return Ok(reused_h1(tx, conn));
+                }
+                let offer = if cached_h1 {
+                    AlpnOffer::H1
+                } else {
+                    AlpnOffer::H2AndH1
+                };
+                return self.connect_new(target, key, offer).await;
             }
-            return self.connect_new(target, key, AlpnOffer::H1).await;
         }
         let offer = if plan == Plan::Negotiate {
             AlpnOffer::H2AndH1
@@ -451,27 +450,23 @@ impl ProxyClient {
                 CachedProtocol::Http1Only
             };
             inner.protocols.record(target, learned);
+            inner.pool.h2_slot(key).set_h1_hint(!connected.alpn_h2);
         }
 
         let handle = inner.pool.new_handle();
-        let io = TokioIo::new(KillableIo::new(connected.stream, &handle.kill));
+        let io = KillableIo::new(connected.stream, &handle.kill, inner.cfg.write_timeout);
         if use_h2 {
-            let (tx, conn) = inner
-                .h2
-                .handshake::<_, ProxyBody>(io)
-                .await
-                .map_err(ProxyError::from_hyper)?;
-            tokio::spawn(drive("http2", conn, handle.kill.clone()));
+            let sender = http2::handshake(io, &inner.cfg.h2, &handle.kill).await?;
             let slot = inner.pool.h2_slot(key);
-            let lease = inner.pool.store_h2(&slot, tx, handle);
+            let lease = inner.pool.store_h2(&slot, sender, handle);
             Ok(leased(lease, false, connect_time))
         } else {
             let (tx, conn) = inner
                 .h1
-                .handshake::<TokioIo<KillableIo>, ProxyBody>(io)
+                .handshake::<TokioIo<KillableIo>, ProxyBody>(TokioIo::new(io))
                 .await
                 .map_err(ProxyError::from_hyper)?;
-            tokio::spawn(drive("http1", conn, handle.kill.clone()));
+            tokio::spawn(drive("http1", conn, handle.clone()));
             Ok(Acquired {
                 sender: Sender::H1(tx),
                 conn: handle,
@@ -488,7 +483,6 @@ impl ProxyClient {
         key: &PoolKey,
         acquired: Acquired,
         req: Request<ProxyBody>,
-        progress: &Arc<UploadProgress>,
     ) -> Result<Response<ResponseBody>, DispatchError> {
         let inner = &self.inner;
         let Acquired {
@@ -510,7 +504,7 @@ impl ProxyClient {
         });
         let req = shape(req, target, version).map_err(DispatchError::Failed)?;
 
-        let outcome = match sender {
+        match sender {
             Sender::H1(mut tx) => {
                 let res = self.read_timeout(tx.try_send_request(req)).await;
                 match res {
@@ -519,9 +513,9 @@ impl ProxyClient {
                         // reaches its clean end; a dropped or failed body
                         // closes it instead.
                         let pool = Arc::clone(&inner.pool);
-                        let (key, pooled) = (key.clone(), conn.clone());
-                        let on_end: OnEnd = Box::new(move || pool.checkin_h1(key, tx, pooled));
-                        Ok(self.finish(resp, Some(on_end), None))
+                        let key = key.clone();
+                        let on_end: OnEnd = Box::new(move || pool.checkin_h1(key, tx, conn));
+                        Ok(self.finish_h1(resp, Some(on_end)))
                     }
                     Ok(Err(mut e)) => Err(match e.take_message() {
                         Some(back) => DispatchError::Unsent(
@@ -533,45 +527,38 @@ impl ProxyClient {
                     Err(timeout) => Err(DispatchError::Failed(timeout)),
                 }
             }
-            Sender::H2(mut tx) => {
-                let res = self.read_timeout(tx.try_send_request(req)).await;
-                match res {
-                    Ok(Ok(resp)) => Ok(self.finish(resp, None, hold)),
-                    Ok(Err(mut e)) => {
-                        let back = e.take_message();
-                        let err = ProxyError::from_hyper(e.into_error());
+            Sender::H2(tx) => {
+                let started = self
+                    .read_timeout(http2::start(tx, req, inner.cfg.write_timeout, hold.clone()))
+                    .await
+                    .map_err(DispatchError::Failed)?;
+                let response = match started {
+                    Started::Sent(response) => response,
+                    Started::Unsent(back, err) => {
+                        // The connection refused a new stream: forget it so
+                        // the retry (or the next request) opens another.
+                        inner.pool.drop_h2(key, conn.generation);
+                        return Err(DispatchError::Unsent(back, err));
+                    }
+                };
+                match self.read_timeout(response).await {
+                    Ok(Ok(resp)) => Ok(self.finish_h2(resp, hold)),
+                    Ok(Err(e)) => {
                         // Only a dead connection is forgotten (and only this
                         // generation of it); a stream-level reset leaves the
                         // connection serving its other streams.
-                        if back.is_some() || tx.is_closed() {
+                        if http2::is_connection_error(&e) {
                             inner.pool.drop_h2(key, conn.generation);
-                            if err.kind() == ErrorKind::Http2 {
-                                // The host may have broken HTTP/2: renegotiate.
-                                inner.protocols.evict(target);
-                            }
+                            inner.protocols.evict(target);
                         }
-                        Err(match back {
-                            Some(back) => DispatchError::Unsent(Box::new(back), err),
-                            None => DispatchError::Failed(err),
-                        })
+                        let err =
+                            http2::from_h2(&e, "upstream HTTP/2 exchange failed").with_source(e);
+                        Err(DispatchError::Failed(err))
                     }
                     Err(timeout) => Err(DispatchError::Failed(timeout)),
                 }
             }
-        };
-
-        // The response head may arrive (or the head timeout fire) while the
-        // request body is still uploading. If the upload then stops making
-        // progress — e.g. the upstream holds the flow-control window at
-        // zero — tear the connection down instead of parking the upload
-        // forever.
-        if !progress.is_done()
-            && !matches!(outcome, Err(DispatchError::Unsent(..)))
-            && let Some(budget) = inner.cfg.write_timeout
-        {
-            tokio::spawn(watch_upload(Arc::clone(progress), conn.kill, budget));
         }
-        outcome
     }
 }
 
@@ -579,7 +566,7 @@ fn leased(lease: H2Lease, reused: bool, connect_time: Option<Duration>) -> Acqui
     Acquired {
         sender: Sender::H2(lease.sender),
         conn: lease.conn,
-        hold: Some(Box::new(lease.active)),
+        hold: Some(Arc::new(lease.active)),
         reused,
         connect_time,
     }
@@ -592,30 +579,6 @@ fn reused_h1(sender: http1::SendRequest<ProxyBody>, conn: ConnHandle) -> Acquire
         hold: None,
         reused: true,
         connect_time: None,
-    }
-}
-
-/// Kill the connection if the upload makes no progress for `budget`.
-async fn watch_upload(progress: Arc<UploadProgress>, kill: CancellationToken, budget: Duration) {
-    let mut seen = progress.frames();
-    loop {
-        tokio::select! {
-            () = kill.cancelled() => return,
-            () = tokio::time::sleep(budget) => {}
-        }
-        if progress.is_done() {
-            return;
-        }
-        let now = progress.frames();
-        if now == seen {
-            tracing::warn!(
-                ?budget,
-                "request upload stalled; closing the upstream connection"
-            );
-            kill.cancel();
-            return;
-        }
-        seen = now;
     }
 }
 
@@ -672,8 +635,9 @@ fn shape(
     Ok(Request::from_parts(parts, body))
 }
 
-/// Run a connection task until it ends or is killed, logging how it ended.
-async fn drive<F, E>(kind: &'static str, conn: F, kill: CancellationToken)
+/// Run an HTTP/1.1 connection task until it ends or is killed, logging how
+/// it ended; either way the connection is marked dead.
+async fn drive<F, E>(kind: &'static str, conn: F, handle: ConnHandle)
 where
     F: Future<Output = Result<(), E>>,
     E: std::fmt::Display,
@@ -684,10 +648,11 @@ where
                 tracing::debug!(kind, error = %e, "upstream connection closed with error");
             }
         }
-        () = kill.cancelled() => {
+        () = handle.kill.cancelled() => {
             tracing::debug!(kind, "upstream connection closed by the engine");
         }
     }
+    handle.kill.cancel();
 }
 
 #[cfg(test)]

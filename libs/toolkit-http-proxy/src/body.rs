@@ -3,7 +3,6 @@
 use std::future::Future as _;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::task::{Context, Poll, ready};
 use std::time::Duration;
 
@@ -16,6 +15,7 @@ use hyper::body::Incoming;
 use tokio::time::{Instant, Sleep};
 
 use crate::error::{ErrorKind, ProxyError};
+use crate::http2::H2Body;
 
 /// Boxed error used for request bodies.
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -51,141 +51,39 @@ where
     StreamBody::new(stream.map_ok(Frame::data).map_err(Into::into)).boxed_unsync()
 }
 
-// ---------------------------------------------------------------------------
-// Upload progress
-// ---------------------------------------------------------------------------
-
-/// How far the request body upload got; shared with the stall watchdog.
-#[derive(Debug, Default)]
-pub struct UploadProgress {
-    done: AtomicBool,
-    frames: AtomicU64,
-}
-
-impl UploadProgress {
-    pub fn is_done(&self) -> bool {
-        self.done.load(Ordering::Acquire)
-    }
-
-    pub fn frames(&self) -> u64 {
-        self.frames.load(Ordering::Acquire)
-    }
-}
-
-/// Largest data frame handed to the connection at once.
-///
-/// hyper's HTTP/2 pipe takes the next frame as soon as the stream has any
-/// send capacity and parks it whole in the stream's send buffer. Bounding
-/// frames keeps that parked amount small and, more importantly, makes the
-/// pipe wait for flow-control capacity between frames, which is what lets
-/// the stall watchdog see a zero-window upstream.
-const MAX_UPLOAD_FRAME: usize = 64 * 1024;
-
-/// Request body wrapper recording upload progress.
-///
-/// Splits large data frames (see [`MAX_UPLOAD_FRAME`]) and never reports
-/// `is_end_stream` early: hyper then polls once more after the last data
-/// frame, and that final `None` marks the upload done.
-pub struct TrackedBody {
-    inner: ProxyBody,
-    /// Rest of a data frame larger than [`MAX_UPLOAD_FRAME`].
-    pending: Bytes,
-    progress: Arc<UploadProgress>,
-    empty: bool,
-    ended: bool,
-}
-
-impl TrackedBody {
-    pub fn new(inner: ProxyBody) -> (Self, Arc<UploadProgress>) {
-        let progress = Arc::new(UploadProgress::default());
-        let empty = inner.is_end_stream();
-        if empty {
-            progress.done.store(true, Ordering::Release);
-        }
-        (
-            Self {
-                inner,
-                pending: Bytes::new(),
-                progress: Arc::clone(&progress),
-                empty,
-                ended: false,
-            },
-            progress,
-        )
-    }
-
-    fn next_piece(&mut self) -> Bytes {
-        let take = self.pending.len().min(MAX_UPLOAD_FRAME);
-        self.progress.frames.fetch_add(1, Ordering::AcqRel);
-        self.pending.split_to(take)
-    }
-}
-
-impl Body for TrackedBody {
-    type Data = Bytes;
-    type Error = BoxError;
-
-    fn poll_frame(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<Frame<Bytes>, BoxError>>> {
-        let this = self.get_mut();
-        if !this.pending.is_empty() {
-            return Poll::Ready(Some(Ok(Frame::data(this.next_piece()))));
-        }
-        if this.ended {
-            return Poll::Ready(None);
-        }
-        let frame = ready!(Pin::new(&mut this.inner).poll_frame(cx));
-        match frame {
-            Some(Ok(frame)) => match frame.into_data() {
-                Ok(data) => {
-                    this.pending = data;
-                    Poll::Ready(Some(Ok(Frame::data(this.next_piece()))))
-                }
-                Err(other) => Poll::Ready(Some(Ok(other))),
-            },
-            // A failed body ends the exchange; hyper aborts the request.
-            Some(Err(e)) => {
-                this.ended = true;
-                this.progress.done.store(true, Ordering::Release);
-                Poll::Ready(Some(Err(e)))
-            }
-            None => {
-                this.ended = true;
-                this.progress.done.store(true, Ordering::Release);
-                Poll::Ready(None)
-            }
-        }
-    }
-
-    fn is_end_stream(&self) -> bool {
-        self.empty || (self.ended && self.pending.is_empty())
-    }
-
-    fn size_hint(&self) -> SizeHint {
-        let inner = self.inner.size_hint();
-        let pending = self.pending.len() as u64;
-        let mut hint = SizeHint::new();
-        hint.set_lower(inner.lower().saturating_add(pending));
-        if let Some(upper) = inner.upper() {
-            hint.set_upper(upper.saturating_add(pending));
-        }
-        hint
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Response body
-// ---------------------------------------------------------------------------
-
 /// Runs once when a response body reached its clean end (returns an
 /// HTTP/1.1 connection to the pool).
 pub type OnEnd = Box<dyn FnOnce() + Send>;
 
-/// Kept alive for as long as the response body is (e.g. the HTTP/2
-/// active-stream count).
-pub type Hold = Box<dyn Send + Sync>;
+/// Kept alive while an exchange runs (e.g. the HTTP/2 active-stream count,
+/// shared with the upload task).
+pub type Hold = Arc<dyn Send + Sync>;
+
+enum Inner {
+    H1(Incoming),
+    H2(H2Body),
+}
+
+impl Inner {
+    fn is_end_stream(&self) -> bool {
+        match self {
+            Self::H1(body) => body.is_end_stream(),
+            Self::H2(body) => body.is_end_stream(),
+        }
+    }
+
+    fn poll_frame(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, ProxyError>>> {
+        match self {
+            Self::H1(body) => Pin::new(body)
+                .poll_frame(cx)
+                .map(|f| f.map(|r| r.map_err(ProxyError::from_body))),
+            Self::H2(body) => body.poll_frame(cx),
+        }
+    }
+}
 
 /// Upstream response body with an optional per-frame idle timeout.
 ///
@@ -193,18 +91,26 @@ pub type Hold = Box<dyn Send + Sync>;
 /// to its end; dropping the body earlier, a read error or an idle timeout
 /// closes the connection instead. Dropping an HTTP/2 body resets just its
 /// stream. An idle timeout is terminal: the error is reported once and the
-/// body ends.
+/// body ends. HTTP/2 trailers are forwarded as trailer frames.
 pub struct ResponseBody {
-    inner: Option<Incoming>,
+    inner: Option<Inner>,
     idle: Option<Duration>,
     deadline: Option<Pin<Box<Sleep>>>,
     on_end: Option<OnEnd>,
-    _hold: Option<Hold>,
+    hold: Option<Hold>,
 }
 
 impl ResponseBody {
-    pub(crate) fn new(
-        inner: Incoming,
+    pub(crate) fn http1(inner: Incoming, idle: Option<Duration>, on_end: Option<OnEnd>) -> Self {
+        Self::new(Inner::H1(inner), idle, on_end, None)
+    }
+
+    pub(crate) fn http2(inner: H2Body, idle: Option<Duration>, hold: Option<Hold>) -> Self {
+        Self::new(Inner::H2(inner), idle, None, hold)
+    }
+
+    fn new(
+        inner: Inner,
         idle: Option<Duration>,
         on_end: Option<OnEnd>,
         hold: Option<Hold>,
@@ -214,25 +120,28 @@ impl ResponseBody {
             idle,
             deadline: None,
             on_end,
-            _hold: hold,
+            hold,
         };
         // Bodiless responses (HEAD, 204, 304, `Content-Length: 0`) are often
         // never polled: release right away.
-        if body.inner.as_ref().is_some_and(Body::is_end_stream) {
+        if body.inner.as_ref().is_some_and(Inner::is_end_stream) {
             body.release();
         }
         body
     }
 
+    /// The exchange ended cleanly.
     fn release(&mut self) {
+        self.hold = None;
         if let Some(on_end) = self.on_end.take() {
             on_end();
         }
     }
 
-    /// Abandon the exchange: the connection is not reused.
+    /// Abandon the exchange: the connection (HTTP/1.1) is not reused.
     fn abandon(&mut self) {
         self.on_end = None;
+        self.hold = None;
         self.inner = None;
         self.deadline = None;
     }
@@ -250,7 +159,7 @@ impl Body for ResponseBody {
         let Some(inner) = this.inner.as_mut() else {
             return Poll::Ready(None);
         };
-        match Pin::new(&mut *inner).poll_frame(cx) {
+        match inner.poll_frame(cx) {
             Poll::Ready(frame) => {
                 if let (Some(idle), Some(deadline)) = (this.idle, this.deadline.as_mut()) {
                     deadline.as_mut().reset(Instant::now() + idle);
@@ -262,7 +171,7 @@ impl Body for ResponseBody {
                     Some(Err(_)) => this.abandon(),
                     Some(Ok(_)) => {}
                 }
-                Poll::Ready(frame.map(|r| r.map_err(ProxyError::from_body)))
+                Poll::Ready(frame)
             }
             Poll::Pending => {
                 let Some(idle) = this.idle else {
@@ -282,13 +191,15 @@ impl Body for ResponseBody {
     }
 
     fn is_end_stream(&self) -> bool {
-        self.inner.as_ref().is_none_or(Body::is_end_stream)
+        self.inner.as_ref().is_none_or(Inner::is_end_stream)
     }
 
     fn size_hint(&self) -> SizeHint {
-        self.inner
-            .as_ref()
-            .map_or_else(|| SizeHint::with_exact(0), Body::size_hint)
+        match &self.inner {
+            None => SizeHint::with_exact(0),
+            Some(Inner::H1(body)) => body.size_hint(),
+            Some(Inner::H2(_)) => SizeHint::default(),
+        }
     }
 }
 

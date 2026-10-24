@@ -265,3 +265,27 @@ fn round_robin_skips_unhealthy_and_handles_empty() {
     let rr = RoundRobin::default();
     assert_eq!(rr.pick(&[]), None);
 }
+
+#[tokio::test]
+async fn round_robin_shares_evenly_around_unhealthy_members() {
+    let down = Arc::new(Down::default());
+    let mut o = opts(Arc::new(TableResolver::default()));
+    o.health_check = Some(down.clone());
+    let pool = BackendPool::build(
+        vec![
+            seed("10.0.0.1", 80),
+            seed("10.0.0.2", 80),
+            seed("10.0.0.3", 80),
+        ],
+        o,
+    )
+    .await;
+    *down.0.lock() = vec!["10.0.0.2:80".parse().unwrap()];
+    pool.run_health_checks().await;
+    let mut counts: HashMap<SocketAddr, usize> = HashMap::new();
+    for _ in 0..300 {
+        *counts.entry(pool.select().unwrap().1).or_default() += 1;
+    }
+    assert_eq!(counts.len(), 2);
+    assert!(counts.values().all(|&n| n == 150), "{counts:?}");
+}

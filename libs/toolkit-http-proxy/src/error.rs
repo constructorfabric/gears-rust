@@ -30,6 +30,9 @@ pub enum ErrorKind {
     InvalidCertificate,
     /// No response head, or no body frame, within the read timeout.
     ReadTimeout,
+    /// The upstream stopped accepting request data (socket or HTTP/2
+    /// flow control) for longer than the write timeout.
+    WriteTimeout,
     /// The connection closed before a complete response was received.
     ConnectionClosed,
     /// Reading the response failed mid-stream.
@@ -59,6 +62,7 @@ impl ErrorKind {
             Self::TlsHandshake => "tls_handshake",
             Self::InvalidCertificate => "invalid_certificate",
             Self::ReadTimeout => "read_timeout",
+            Self::WriteTimeout => "write_timeout",
             Self::ConnectionClosed => "connection_closed",
             Self::Read => "read",
             Self::Write => "write",
@@ -169,11 +173,11 @@ fn classify_hyper(err: &hyper::Error) -> ErrorKind {
     }
     if let Some(h2) = find_source::<h2::Error>(err) {
         if let Some(io) = h2.get_io() {
-            return classify_io(io.kind());
+            return classify_io(io);
         }
         return ErrorKind::Http2;
     }
-    if err.is_parse() || err.is_parse_status() || err.is_parse_too_large() {
+    if err.is_parse() || err.is_parse_status() {
         return ErrorKind::Protocol;
     }
     if err.is_body_write_aborted() {
@@ -183,7 +187,7 @@ fn classify_hyper(err: &hyper::Error) -> ErrorKind {
         return ErrorKind::InvalidRequest;
     }
     if let Some(io) = find_source::<io::Error>(err) {
-        return classify_io(io.kind());
+        return classify_io(io);
     }
     if err.is_incomplete_message() || err.is_canceled() || err.is_closed() {
         return ErrorKind::ConnectionClosed;
@@ -191,8 +195,20 @@ fn classify_hyper(err: &hyper::Error) -> ErrorKind {
     ErrorKind::Read
 }
 
-fn classify_io(kind: io::ErrorKind) -> ErrorKind {
-    match kind {
+/// Marker carried by the `io::Error` a socket write stall produces.
+#[derive(Debug, thiserror::Error)]
+#[error("upstream stopped accepting data within the write timeout")]
+pub struct WriteStall;
+
+/// Classify an I/O error from an established connection.
+pub fn classify_io(err: &io::Error) -> ErrorKind {
+    if err
+        .get_ref()
+        .is_some_and(<dyn StdError + Send + Sync>::is::<WriteStall>)
+    {
+        return ErrorKind::WriteTimeout;
+    }
+    match err.kind() {
         io::ErrorKind::ConnectionReset
         | io::ErrorKind::ConnectionAborted
         | io::ErrorKind::BrokenPipe

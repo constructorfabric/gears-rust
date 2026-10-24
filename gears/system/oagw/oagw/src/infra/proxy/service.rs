@@ -802,8 +802,18 @@ impl DataPlaneService for DataPlaneServiceImpl {
         )?;
 
         // 8b. Engine target: the LB's pre-resolved address, or DNS with the
-        // SSRF policy for target-host / single-endpoint selection.
-        let target = self.engine.target(&selected, &instance_uri).await?;
+        // SSRF policy for target-host / single-endpoint selection. The
+        // request timeout covers resolution and the exchange together.
+        let deadline = tokio::time::Instant::now() + self.request_timeout;
+        let target = tokio::time::timeout_at(deadline, self.engine.target(&selected, &instance_uri))
+            .await
+            .map_err(|_| DomainError::RequestTimeout {
+                detail: format!(
+                    "resolving {} timed out after {:?}",
+                    endpoint.host, self.request_timeout
+                ),
+                instance: instance_uri.clone(),
+            })??;
 
         let response_header_rules = upstream
             .headers
@@ -829,6 +839,7 @@ impl DataPlaneService for DataPlaneServiceImpl {
             return self
                 .handle_websocket_upgrade(
                     &target,
+                    deadline,
                     &method,
                     &url,
                     &outbound_headers,
@@ -842,6 +853,7 @@ impl DataPlaneService for DataPlaneServiceImpl {
         let upstream_result = self
             .forward(
                 &target,
+                deadline,
                 &method,
                 &url,
                 &outbound_headers,
@@ -927,9 +939,11 @@ impl DataPlaneServiceImpl {
     /// answered `101 Switching Protocols`. Response guards and the response
     /// pipeline run on the 101; the tunnel travels to the handler in the
     /// response extensions.
+    #[allow(clippy::too_many_arguments)]
     async fn handle_websocket_upgrade(
         &self,
         target: &toolkit_http_proxy::Target,
+        deadline: tokio::time::Instant,
         method: &http::Method,
         url: &str,
         outbound_headers: &HeaderMap,
@@ -945,16 +959,13 @@ impl DataPlaneServiceImpl {
         let req = build_outbound_request(method, url, headers, empty_body(), instance_uri)?;
 
         let upgrade_timeout = self.request_timeout;
-        let outcome =
-            tokio::time::timeout(upgrade_timeout, self.engine.client().upgrade(target, req))
-                .await
-                .map_err(|_| DomainError::RequestTimeout {
-                    detail: format!(
-                        "WebSocket upgrade to {url} timed out after {upgrade_timeout:?}"
-                    ),
-                    instance: instance_uri.to_string(),
-                })?
-                .map_err(|e| map_proxy_error(&e, instance_uri))?;
+        let outcome = tokio::time::timeout_at(deadline, self.engine.client().upgrade(target, req))
+            .await
+            .map_err(|_| DomainError::RequestTimeout {
+                detail: format!("WebSocket upgrade to {url} timed out after {upgrade_timeout:?}"),
+                instance: instance_uri.to_string(),
+            })?
+            .map_err(|e| map_proxy_error(&e, instance_uri))?;
 
         let (response, io) = match outcome {
             UpgradeOutcome::Switched { response, io } => (response, io),
@@ -1026,6 +1037,7 @@ impl DataPlaneServiceImpl {
     async fn forward(
         &self,
         target: &toolkit_http_proxy::Target,
+        deadline: tokio::time::Instant,
         method: &http::Method,
         url: &str,
         outbound_headers: &HeaderMap,
@@ -1046,7 +1058,8 @@ impl DataPlaneServiceImpl {
             build_outbound_request(method, url, outbound_headers.clone(), body, instance_uri)?;
 
         let timeout = self.request_timeout;
-        let outcome = tokio::time::timeout(timeout, self.engine.client().send(target, req)).await;
+        let outcome =
+            tokio::time::timeout_at(deadline, self.engine.client().send(target, req)).await;
 
         // A failure on our side of the body wins over whatever the upstream
         // made of the aborted request.

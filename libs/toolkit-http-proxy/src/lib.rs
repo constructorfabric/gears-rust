@@ -34,6 +34,7 @@ mod client;
 mod config;
 mod connect;
 mod error;
+mod http2;
 mod observe;
 mod pool;
 mod protocol_cache;

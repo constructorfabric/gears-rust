@@ -11,10 +11,10 @@ use tokio_util::sync::{CancellationToken, WaitForCancellationFutureOwned};
 use rustls_pki_types::ServerName;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
-use tokio::time::Instant;
+use tokio::time::{Instant, Sleep};
 use tokio_rustls::client::TlsStream;
 
-use crate::error::{ErrorKind, ProxyError};
+use crate::error::{ErrorKind, ProxyError, WriteStall};
 use crate::target::{Target, Transport};
 use crate::tls::{AlpnOffer, TlsConnectors};
 
@@ -82,31 +82,71 @@ pub async fn connect(
     }
 }
 
-/// A connected stream the engine can sever at any time.
+/// A connected stream the engine can sever at any time, with a write-stall
+/// budget.
 ///
-/// hyper drives HTTP/2 connections from tasks the engine does not own, so
-/// dropping a connection future is not enough to close the socket. Once the
-/// token is cancelled, every read and write fails (and a task parked on the
-/// socket is woken to observe it), which tears the connection and all its
-/// streams down.
+/// Connection tasks run on their own (hyper's HTTP/1.1 dispatcher, the
+/// HTTP/2 driver), so dropping a handle is not enough to close a socket.
+/// Once the token is cancelled every operation fails, and any operation that
+/// is parked registers for the cancellation wake-up, so the owning task
+/// observes it promptly. A write or flush that stays pending for longer than
+/// the write timeout (the upstream stopped reading) fails with a
+/// [`WriteStall`] error and severs the connection.
 pub struct KillableIo {
     inner: Stream,
     kill: CancellationToken,
     cancelled: Pin<Box<WaitForCancellationFutureOwned>>,
+    write_timeout: Option<Duration>,
+    write_stall: Option<Pin<Box<Sleep>>>,
 }
 
 impl KillableIo {
-    pub fn new(inner: Stream, kill: &CancellationToken) -> Self {
+    pub fn new(inner: Stream, kill: &CancellationToken, write_timeout: Option<Duration>) -> Self {
         Self {
             inner,
             kill: kill.clone(),
             cancelled: Box::pin(kill.clone().cancelled_owned()),
+            write_timeout,
+            write_stall: None,
         }
     }
 
-    /// Registers for wake-up on cancellation; used when the socket is idle.
+    /// Registers for the cancellation wake-up; true once cancelled.
     fn killed(&mut self, cx: &mut Context<'_>) -> bool {
         self.cancelled.as_mut().poll(cx).is_ready()
+    }
+
+    /// Bookkeeping for a write-side operation that returned `poll`.
+    fn on_write<T>(
+        &mut self,
+        cx: &mut Context<'_>,
+        poll: Poll<io::Result<T>>,
+    ) -> Poll<io::Result<T>> {
+        match poll {
+            Poll::Ready(res) => {
+                self.write_stall = None;
+                Poll::Ready(res)
+            }
+            Poll::Pending => {
+                if self.killed(cx) {
+                    return Poll::Ready(Err(aborted()));
+                }
+                if let Some(limit) = self.write_timeout {
+                    let timer = self
+                        .write_stall
+                        .get_or_insert_with(|| Box::pin(tokio::time::sleep(limit)));
+                    if timer.as_mut().poll(cx).is_ready() {
+                        self.write_stall = None;
+                        self.kill.cancel();
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            WriteStall,
+                        )));
+                    }
+                }
+                Poll::Pending
+            }
+        }
     }
 }
 
@@ -124,6 +164,9 @@ impl AsyncRead for KillableIo {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         let this = self.get_mut();
+        if this.kill.is_cancelled() {
+            return Poll::Ready(Err(aborted()));
+        }
         match Pin::new(&mut this.inner).poll_read(cx, buf) {
             Poll::Pending if this.killed(cx) => Poll::Ready(Err(aborted())),
             other => other,
@@ -141,7 +184,8 @@ impl AsyncWrite for KillableIo {
         if this.kill.is_cancelled() {
             return Poll::Ready(Err(aborted()));
         }
-        Pin::new(&mut this.inner).poll_write(cx, buf)
+        let poll = Pin::new(&mut this.inner).poll_write(cx, buf);
+        this.on_write(cx, poll)
     }
 
     fn poll_write_vectored(
@@ -153,7 +197,8 @@ impl AsyncWrite for KillableIo {
         if this.kill.is_cancelled() {
             return Poll::Ready(Err(aborted()));
         }
-        Pin::new(&mut this.inner).poll_write_vectored(cx, bufs)
+        let poll = Pin::new(&mut this.inner).poll_write_vectored(cx, bufs);
+        this.on_write(cx, poll)
     }
 
     fn is_write_vectored(&self) -> bool {
@@ -161,11 +206,20 @@ impl AsyncWrite for KillableIo {
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+        let this = self.get_mut();
+        if this.kill.is_cancelled() {
+            return Poll::Ready(Err(aborted()));
+        }
+        let poll = Pin::new(&mut this.inner).poll_flush(cx);
+        this.on_write(cx, poll)
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+        let this = self.get_mut();
+        match Pin::new(&mut this.inner).poll_shutdown(cx) {
+            Poll::Pending if this.killed(cx) => Poll::Ready(Err(aborted())),
+            other => other,
+        }
     }
 }
 

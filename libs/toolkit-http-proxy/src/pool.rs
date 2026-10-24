@@ -17,16 +17,17 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use dashmap::DashMap;
-use hyper::client::conn::{http1, http2};
+use hyper::client::conn::http1;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use crate::body::ProxyBody;
 use crate::config::PoolConfig;
+use crate::http2::H2Sender;
 use crate::target::{Target, Transport};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -60,7 +61,7 @@ struct IdleH1 {
 }
 
 struct H2Entry {
-    sender: http2::SendRequest<ProxyBody>,
+    sender: H2Sender,
     conn: ConnHandle,
 }
 
@@ -71,11 +72,25 @@ pub struct H2Slot {
     pub connecting: tokio::sync::Mutex<()>,
     last_used: AtomicU64,
     active: AtomicUsize,
+    /// The last negotiation on this key ended on HTTP/1.1: don't hold
+    /// `connecting` across further HTTP/1.1 connects (works with the
+    /// protocol cache disabled too).
+    h1_hint: AtomicBool,
+}
+
+impl H2Slot {
+    pub fn h1_hint(&self) -> bool {
+        self.h1_hint.load(Ordering::Relaxed)
+    }
+
+    pub fn set_h1_hint(&self, h1: bool) {
+        self.h1_hint.store(h1, Ordering::Relaxed);
+    }
 }
 
 /// An HTTP/2 sender checked out for one exchange.
 pub struct H2Lease {
-    pub sender: http2::SendRequest<ProxyBody>,
+    pub sender: H2Sender,
     pub conn: ConnHandle,
     pub active: ActiveStream,
 }
@@ -170,6 +185,7 @@ impl Pool {
                 connecting: tokio::sync::Mutex::new(()),
                 last_used: AtomicU64::new(0),
                 active: AtomicUsize::new(0),
+                h1_hint: AtomicBool::new(false),
             })
         }))
     }
@@ -185,7 +201,7 @@ impl Pool {
     pub fn lease(&self, slot: &Arc<H2Slot>, not_gen: Option<u64>) -> Option<H2Lease> {
         let mut guard = slot.entry.lock();
         let entry = guard.as_ref()?;
-        if entry.sender.is_closed() || entry.conn.kill.is_cancelled() {
+        if entry.conn.kill.is_cancelled() {
             *guard = None;
             return None;
         }
@@ -202,12 +218,7 @@ impl Pool {
     }
 
     /// Install a new HTTP/2 connection in `slot` and lease it.
-    pub fn store_h2(
-        &self,
-        slot: &Arc<H2Slot>,
-        sender: http2::SendRequest<ProxyBody>,
-        conn: ConnHandle,
-    ) -> H2Lease {
+    pub fn store_h2(&self, slot: &Arc<H2Slot>, sender: H2Sender, conn: ConnHandle) -> H2Lease {
         slot.last_used.store(self.now_secs(), Ordering::Relaxed);
         slot.active.fetch_add(1, Ordering::Relaxed);
         *slot.entry.lock() = Some(H2Entry {
@@ -252,7 +263,7 @@ impl Pool {
                 now.saturating_sub(slot.last_used.load(Ordering::Relaxed)) >= idle.as_secs();
             if guard
                 .as_ref()
-                .is_some_and(|e| e.sender.is_closed() || (unused && !busy))
+                .is_some_and(|e| e.conn.kill.is_cancelled() || (unused && !busy))
             {
                 *guard = None;
             }

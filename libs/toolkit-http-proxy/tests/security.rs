@@ -440,6 +440,7 @@ const HEADERS: u8 = 0x1;
 const SETTINGS: u8 = 0x4;
 const WINDOW_UPDATE: u8 = 0x8;
 const CONTINUATION: u8 = 0x9;
+const RST_STREAM: u8 = 0x3;
 const END_STREAM: u8 = 0x1;
 const END_HEADERS: u8 = 0x4;
 const ACK: u8 = 0x1;
@@ -660,18 +661,32 @@ async fn ambiguous_response_framing_drops_length_and_connection() {
 #[tokio::test]
 async fn early_h2_response_with_zero_window_upload_is_torn_down() {
     // The upstream answers immediately but never opens the window, so the
-    // upload would hang forever after the response.
-    let closed = Arc::new(tokio::sync::Notify::new());
-    let notify = closed.clone();
+    // upload would hang forever after the response. The engine must reset
+    // the stream (and only the stream).
+    let reset = Arc::new(tokio::sync::Notify::new());
+    let notify = reset.clone();
     let addr = h2_server(&[0x00, 0x04, 0, 0, 0, 0], move |mut s| {
         let notify = notify.clone();
         async move {
             let _ = s
                 .write_all(&frame(HEADERS, END_HEADERS | END_STREAM, 1, &[0x88]))
                 .await;
-            // Returns once the client drops the connection.
-            drain(&mut s, Duration::from_secs(5)).await;
-            notify.notify_one();
+            loop {
+                let mut h = [0u8; 9];
+                if s.read_exact(&mut h).await.is_err() {
+                    return;
+                }
+                let len = usize::from(h[0]) << 16 | usize::from(h[1]) << 8 | usize::from(h[2]);
+                let mut payload = vec![0u8; len];
+                if s.read_exact(&mut payload).await.is_err() {
+                    return;
+                }
+                let stream = u32::from_be_bytes([h[5], h[6], h[7], h[8]]) & 0x7fff_ffff;
+                if h[3] == RST_STREAM && stream == 1 {
+                    notify.notify_one();
+                    return;
+                }
+            }
         }
     })
     .await;
@@ -686,7 +701,51 @@ async fn early_h2_response_with_zero_window_upload_is_torn_down() {
         .unwrap();
     assert_eq!(resp.status(), 200);
     drop(resp);
-    within(Duration::from_secs(3), closed.notified()).await;
+    within(Duration::from_secs(3), reset.notified()).await;
+}
+
+#[tokio::test]
+async fn early_h1_response_with_unread_upload_severs_the_connection() {
+    // The upstream answers right away and never reads the body: once the
+    // socket buffers fill, the upload's writes stay pending.
+    let closed = Arc::new(tokio::sync::Notify::new());
+    let notify = closed.clone();
+    let (addr, _) = raw(move |mut s, _| {
+        let notify = notify.clone();
+        async move {
+            if read_head(&mut s).await.is_none() {
+                return;
+            }
+            let _ = s
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .await;
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            // Now drain: the client must have given up on the connection.
+            let mut buf = vec![0u8; 1 << 20];
+            loop {
+                match tokio::time::timeout(Duration::from_secs(5), s.read(&mut buf)).await {
+                    Ok(Ok(0) | Err(_)) => {
+                        notify.notify_one();
+                        return;
+                    }
+                    Ok(Ok(_)) => {}
+                    Err(_) => return,
+                }
+            }
+        }
+    })
+    .await;
+    let mut cfg = support::test_config();
+    cfg.write_timeout = Some(Duration::from_millis(300));
+    let c = ProxyClient::new(cfg).unwrap();
+    let chunk = Bytes::from(vec![b'x'; 1 << 20]);
+    let body = stream::iter((0..256).map(move |_| Ok::<_, std::io::Error>(chunk.clone())));
+    let req = Request::post("/").body(stream_body(body)).unwrap();
+    let resp = within(Duration::from_secs(3), c.send(&plain(addr), req))
+        .await
+        .unwrap();
+    assert_eq!(resp.into_body().collect().await.unwrap().to_bytes(), "ok");
+    within(Duration::from_secs(5), closed.notified()).await;
 }
 
 #[tokio::test]

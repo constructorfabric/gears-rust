@@ -20,10 +20,10 @@ pub struct ProxyClientConfig {
     /// connection, and for each response body frame after that.
     /// `None` disables both (callers then own all timeouts).
     pub read_timeout: Option<Duration>,
-    /// Upload stall budget: when the request body makes no progress for
-    /// this long after the response head arrived (e.g. the upstream holds
-    /// the flow-control window at zero), the connection is torn down.
-    /// `None` disables the watchdog.
+    /// Upload stall budget. A socket write or flush pending this long (the
+    /// upstream stopped reading) severs the connection; an HTTP/2 stream
+    /// whose flow-control window stays closed this long is reset. `None`
+    /// disables both.
     pub write_timeout: Option<Duration>,
     /// How long a negotiated protocol is remembered per host. Zero disables
     /// the cache (every new TLS connection offers `h2` and `http/1.1`).

@@ -78,7 +78,8 @@ pub trait Balancer: Send + Sync {
     fn pick(&self, members: &[Member]) -> Option<usize>;
 }
 
-/// Round-robin over healthy members.
+/// Round-robin over the healthy members: each healthy member gets an equal
+/// share, however the unhealthy ones are placed.
 #[derive(Debug, Default)]
 pub struct RoundRobin {
     next: AtomicUsize,
@@ -86,14 +87,17 @@ pub struct RoundRobin {
 
 impl Balancer for RoundRobin {
     fn pick(&self, members: &[Member]) -> Option<usize> {
-        let len = members.len();
-        if len == 0 {
+        let healthy = members.iter().filter(|m| m.is_healthy()).count();
+        if healthy == 0 {
             return None;
         }
-        let start = self.next.fetch_add(1, Ordering::Relaxed);
-        (0..len)
-            .map(|i| start.wrapping_add(i) % len)
-            .find(|&i| members[i].is_healthy())
+        let nth = self.next.fetch_add(1, Ordering::Relaxed) % healthy;
+        members
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| m.is_healthy())
+            .nth(nth)
+            .map(|(i, _)| i)
     }
 }
 
