@@ -25,7 +25,7 @@ fn expected_status(err: &DomainError) -> u16 {
         | DomainError::PolicyMetadataExceeded { .. }
         | DomainError::MultipartNotSupported { .. }
         // Delegated to `toolkit_odata`: every cursor failure is `InvalidArgument` -> 400.
-        | DomainError::Cursor(_) => 400,
+        | DomainError::Pagination(_) => 400,
         DomainError::TokenInvalid { .. } | DomainError::Forbidden => 403,
         DomainError::FileNotFound { .. }
         | DomainError::VersionNotFound { .. }
@@ -54,6 +54,7 @@ fn all_variant_instances() -> Vec<DomainError> {
         },
         DomainError::Database {
             message: "db down".into(),
+            source: None,
         },
         DomainError::Validation {
             field: "name".into(),
@@ -118,7 +119,7 @@ fn all_variant_instances() -> Vec<DomainError> {
         DomainError::VersionedFileMigrationNotSupported {
             file_id: Uuid::nil(),
         },
-        DomainError::Cursor(toolkit_odata::Error::InvalidCursor),
+        DomainError::Pagination(toolkit_odata::Error::InvalidCursor),
     ]
 }
 

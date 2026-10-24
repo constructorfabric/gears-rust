@@ -444,20 +444,22 @@ A failed finalize/report-part callback (after the sidecar's retry budget, see `p
 `CALLBACK_MAX_ATTEMPTS` in `src/bin/sidecar.rs`) returns `502 Bad Gateway` to the client. The backend write itself
 is **create-exclusive, not overwrite-safe**: `StorageBackend::publish_exclusive` writes only the *first* time a
 given backend path is empty — a retried `PUT` to the same signed URL never overwrites bytes already landed there,
-it reports `created: false` and leaves the stored blob untouched. The documented recovery is still to retry the
-`PUT`: if the earlier publish landed but finalize never ran, this retry's measured bytes match what's already
-stored and the handler answers `200` (a benign retry has converged) via a fresh finalize attempt. If the version
-was already finalized, the outcome converges **regardless of the token's bind mode**: a replay whose size and
-content hash match the stored version is answered `200` — for a token carrying the `bind_on_finalize` claim
-(auto-bind `POST /files` path) the `X-FS-Bound`/`ETag` headers are recomputed against the file's *current*
-`content_id`, so a concurrent bind in between can still flip `bound`↔`conflict` (F4 in the concurrency-and-failure
-model, and `write.rs`'s already-available replay branch); a manual-bind token converges the same way, simply with no
-bind-outcome headers to report, exactly as on the first call. A mismatched replay (different size or hash) is
-answered `400` (hash/size check) — never a silent overwrite. `409` ("version already finalized") is now reserved for
-a genuine **concurrent** double-finalize — two callbacks racing before either has observed the other's
-already-`available` status — not for an ordinary sequential retry, which converges as above. For the finalize case
-specifically, the version may already be correctly finalized server-side even though the client saw a transient
-`502` on a preceding attempt (re-verify via `GET /files/{id}/versions` before assuming failure).
+it reports `created: false` and leaves the stored blob untouched. The documented recovery is still to retry the `PUT`
+with the same bytes: the sidecar reads the stored object back and compares its hash with the retry's. If the earlier
+publish landed but finalize never ran, a matching retry finalizes and the handler answers `200` (a benign retry has
+converged); a retry whose bytes differ from the stored object is answered `409` and finalizes nothing. A replayed
+`PUT` therefore re-reads the whole stored object. If the version was already finalized, the outcome converges
+**regardless of the token's bind mode**: a replay whose size and content hash match the stored version is answered
+`200` — for a token carrying the `bind_on_finalize` claim
+(auto-bind `POST /files` path) a bind won at finalize replays as `bound` from the persisted `bound_on_finalize`
+flag (only a won bind is sticky), while a lost CAS follows the file's *current* `content_id` on every replay: `bound`
+while the file points at this version, `conflict` with the current ETag otherwise (F4 in the concurrency-and-failure
+model); a manual-bind token converges the same way, simply with no bind-outcome headers to report, exactly as on
+the first call. A mismatched replay (different size or hash) is answered
+`409` — never a silent overwrite. Two finalize callbacks racing for the same version converge the same way: the one
+that loses the `pending → available` CAS re-reads the version and applies the same size/hash comparison. For the
+finalize case specifically, the version may already be correctly finalized server-side even though the client saw a
+transient `502` on a preceding attempt (re-verify via `GET /files/{id}/versions` before assuming failure).
 
 ## Cleanup (not running yet)
 
@@ -577,15 +579,16 @@ See the `idempotency_keys` table (`m20260701_000001_p2_initial`, extended by `m2
 
 ## Upgrading from v0.2.x and rolling back
 
-This release adds one additive migration, `m20260924_000001_upload_flow_redesign`: new `multipart_uploads` columns
+This release adds two additive migrations, applied in this order: `m20261008_000001_listing_indexes` (the
+`file_versions_file_created_idx` and `files_owner_listing_v2_idx` listing indexes, the latter superseding
+`files_owner_listing_idx`) and `m20261014_000001_upload_flow`. The second adds new `multipart_uploads` columns
 — `auto_bind`, `lease_until`, `lease_owner`, `complete_result`, `backend_id`, `backend_path` — and the `completing`
-state in its CHECK (on SQLite it rebuilds `multipart_uploads`, carrying rows and parts over), plus indexes only
-(`idempotency_keys_file_idx`, `multipart_uploads_sweep_idx`, `files_versionless_sweep_idx`,
-`file_versions_file_created_idx`, `files_owner_listing_v2_idx` superseding `files_owner_listing_idx`). Existing rows
-keep working: new columns are nullable or default to the old behaviour, and `backend_id`/`backend_path` are
-backfilled from the session's version. No released migration changes.
+state in its CHECK (on SQLite it rebuilds `multipart_uploads`, carrying rows and parts over), plus the
+`idempotency_keys_file_idx` index and the `file_versions.bound_on_finalize` column. Existing rows keep working: new
+columns are nullable or default to the old behaviour. The sweep indexes for the cleanup job (`multipart_uploads_sweep_idx`,
+`files_versionless_sweep_idx`) come with a later migration, not this release. No released migration changes.
 
-**Mixed-version window.** Run the migration once, then roll the fleet. An older (v0.2.x) instance tolerates the new
+**Mixed-version window.** Run the migrations once, then roll the fleet. An older (v0.2.x) instance tolerates the new
 schema, with two exceptions to keep short: it rejects a multipart session in the new `completing` state as
 `invalid multipart upload state` (a `complete` in flight on a new instance), and it never auto-binds. Roll the
 control plane and the sidecars together — the sidecar forwards the new finalize headers and the control plane
@@ -593,9 +596,11 @@ accepts the new token grace — and keep the window as short as a normal rolling
 
 **Rolling back the binary.** An older binary refuses to start against a database that has migrations it does not
 know (sea-orm reports `Migration file of version '…' is missing`), so the order is: with the **new** binary, run
-`m20260924_000001_upload_flow_redesign` down, then deploy the old binary. Its `down()` drops the new columns, so
-sessions in `completing` and stored completion snapshots are lost; finish or abort in-flight multipart uploads
-before rolling back. Files and versions themselves are untouched by either direction.
+`m20261014_000001_upload_flow` down, then `m20261008_000001_listing_indexes` down (reverse of the apply order), then
+deploy the old binary. The down step of `m20261014_000001_upload_flow` folds any session in `completing` into
+`aborted` (the narrow pre-upgrade CHECK cannot hold it), narrows the CHECK again, and drops the new columns and the
+index, so stored completion snapshots, leases and the `bound_on_finalize` flag are lost; finish or abort in-flight
+multipart uploads before rolling back. Files and versions themselves are untouched by either direction.
 
 ## Storage quota (not enforced)
 

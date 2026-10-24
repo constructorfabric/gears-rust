@@ -257,7 +257,7 @@ mode-aware per `cpt-cf-file-storage-algo-content-hash-modes-verify`.
 
 - [x] `p2` - **ID**: `cpt-cf-file-storage-dod-content-hash-modes-docs`
 
-The system **MUST** correct `DESIGN.md`'s stale hash-design passages and `docs/api.md`'s metadata/upload response
+The system **MUST** correct `DESIGN.md`'s stale hash-design passages and the OpenAPI spec's (`docs/api/api.json`) metadata/upload response
 shapes to surface `hash_mode`, `part_count`, and (for multipart-composite versions) `manifest` once implemented;
 `SECURITY.md` requires no addendum under this design (§10 below — SHA-256 only, nothing FIPS-relevant to add).
 

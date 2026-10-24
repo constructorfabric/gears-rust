@@ -72,6 +72,18 @@ impl FileDto {
     }
 }
 
+/// Multipart intent on `POST /files`: opens the multipart session and returns the parts plan
+/// in the same response, saving the separate `POST /files/{id}/multipart` round-trip.
+#[derive(Debug, Clone)]
+#[toolkit_macros::api_dto(request)]
+pub struct CreateMultipartIntentDto {
+    /// Declared total file size in bytes (validated against policy/quota at create time).
+    pub declared_size: u64,
+    /// Preferred part size in bytes (hint); the server-computed plan is authoritative.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preferred_part_size: Option<u64>,
+}
+
 /// Request to create a file (`POST /files`).
 #[derive(Debug, Clone)]
 #[toolkit_macros::api_dto(request)]
@@ -86,8 +98,19 @@ pub struct CreateFileReq {
     pub custom_metadata: Vec<MetadataEntryDto>,
     /// Optional idempotency key: within the same `(owner_kind, owner_id)`, a retry with
     /// the same key returns the original response without creating a new file.
+    /// Not supported together with `multipart` (rejected with 400).
     #[serde(default)]
     pub idempotency_key: Option<String>,
+    /// Optional multipart intent. When the server-computed plan has **two or more parts**,
+    /// the response carries the parts plan (`UploadTicketDto::multipart`) instead of a
+    /// single-part `upload_url`; a one-part plan falls back to `upload_url`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub multipart: Option<CreateMultipartIntentDto>,
+    /// Bind mode for the first content: `"auto"` (default; the upload itself binds under a
+    /// `content_id IS NULL` CAS) or `"manual"` (an explicit `POST /files/{id}/bind`
+    /// afterwards). Not part of the idempotency request hash.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bind: Option<String>,
 }
 
 impl CreateFileReq {
@@ -98,13 +121,20 @@ impl CreateFileReq {
     }
 }
 
-/// Result of create / presign: identity + the signed upload URL.
+/// Result of create / presign: identity plus exactly one of a single-part signed upload
+/// URL or a multipart parts plan (`multipart` only when requested and the plan has >=2 parts).
 #[derive(Debug, Clone)]
 #[toolkit_macros::api_dto(response)]
 pub struct UploadTicketDto {
     pub file_id: Uuid,
     pub version_id: Uuid,
-    pub upload_url: String,
+    /// Single-part signed sidecar URL (absent when `multipart` is present).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upload_url: Option<String>,
+    /// Multipart plan (absent on the single-part path); same shape as the
+    /// `POST /files/{id}/multipart` response.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub multipart: Option<MultipartPlanDto>,
 }
 
 /// Result of `GET /files/{id}/download-url`.
@@ -147,14 +177,21 @@ pub struct VersionDto {
     /// Number of parts for `multipart-composite-sha256`; omitted for `whole-sha256`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub part_count: Option<i32>,
+    /// Part manifest text of a `multipart-composite-sha256` version (as returned by
+    /// `complete`), so a client can re-verify `hash`. Omitted for `whole-sha256`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub manifest: Option<String>,
     pub status: String,
     pub is_current: bool,
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
 }
 
-impl From<FileVersion> for VersionDto {
-    fn from(v: FileVersion) -> Self {
+impl VersionDto {
+    /// Build the DTO from the version row plus its stored manifest text (`Some` only for
+    /// `multipart-composite-sha256` versions).
+    #[must_use]
+    pub fn from_parts(v: FileVersion, manifest: Option<String>) -> Self {
         Self {
             version_id: v.version_id,
             mime_type: v.mime_type,
@@ -163,10 +200,17 @@ impl From<FileVersion> for VersionDto {
             hash: hex::encode(&v.hash_value),
             hash_mode: v.hash_mode,
             part_count: v.part_count,
+            manifest,
             status: v.status.as_str().to_owned(),
             is_current: v.is_current,
             created_at: v.created_at,
         }
+    }
+}
+
+impl From<FileVersion> for VersionDto {
+    fn from(v: FileVersion) -> Self {
+        Self::from_parts(v, None)
     }
 }
 
@@ -578,9 +622,6 @@ pub struct InitiateMultipartReq {
     /// backend's minimum part size.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub preferred_part_size: Option<u64>,
-    /// Advisory upload concurrency; does not change the parts plan.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub concurrency: Option<u32>,
 }
 
 /// One part in the parts plan.
@@ -618,8 +659,8 @@ pub struct MultipartPlanDto {
     pub expires_at: time::OffsetDateTime,
 }
 
-/// Response of `POST /files/{id}/multipart/{upload_id}/complete`: the bound version,
-/// its size, and the composite content hash. `manifest` lets a client re-verify the hash.
+/// Response of `POST /files/{id}/multipart/{upload_id}/complete`: the version, its size,
+/// the content hash and the bind outcome. `manifest` lets a client re-verify the hash.
 #[derive(Debug, Clone)]
 #[toolkit_macros::api_dto(response)]
 pub struct MultipartCompleteDto {
@@ -627,13 +668,37 @@ pub struct MultipartCompleteDto {
     pub size: i64,
     /// Always `"SHA-256"`.
     pub hash_algorithm: String,
-    /// Hex-encoded composite hash (`sha256` of the manifest).
+    /// Hex-encoded content hash: `sha256` of the manifest for two or more parts, or of
+    /// the object bytes for a one-part plan.
     pub content_hash: String,
-    /// Always `"multipart-composite-sha256"` for this endpoint.
+    /// `"multipart-composite-sha256"` for two or more parts, `"whole-sha256"` for one part.
     pub hash_mode: String,
     pub part_count: i32,
-    /// Part manifest text the composite hash is computed over.
-    pub manifest: String,
+    /// Part manifest text the composite hash is computed over. Omitted for a one-part
+    /// plan (`whole-sha256` has no manifest).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub manifest: Option<String>,
+    /// Bind outcome, same model as the single-part `X-FS-Bound` header: `"bound"` (`etag`
+    /// is the new content `ETag`), `"conflict"` (auto-bind lost its CAS; the upload
+    /// succeeded and `current_etag` is the `If-Match` for a manual rebind), or `"manual"`
+    /// (the client binds explicitly).
+    pub bind_state: String,
+    /// Content `ETag` after a successful bind (`bind_state == "bound"` only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub etag: Option<String>,
+    /// Current content `ETag` when the bind CAS was lost (`bind_state == "conflict"` only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_etag: Option<String>,
+}
+
+/// `202 Accepted` body of `POST .../complete` while another caller holds the completion
+/// lease; the client re-issues the idempotent `complete` after `retry_after_secs`.
+#[derive(Debug, Clone)]
+#[toolkit_macros::api_dto(response)]
+pub struct MultipartCompletingDto {
+    /// Always `"completing"`.
+    pub state: String,
+    pub retry_after_secs: u64,
 }
 
 /// One already-uploaded part (`GET /files/{id}/multipart/{upload_id}`).

@@ -322,6 +322,7 @@ fn download_token_with_meta(
         request_id: "test-request-id".to_owned(),
         content_type: content_type.to_owned(),
         etag: etag.to_owned(),
+        bind_on_finalize: false,
     };
     issuer
         .issue(claims, OffsetDateTime::now_utc())
@@ -711,6 +712,7 @@ fn upload_token(
         request_id: "test-request-id".to_owned(),
         content_type: String::new(),
         etag: String::new(),
+        bind_on_finalize: false,
     };
     issuer
         .issue(claims, OffsetDateTime::now_utc())
@@ -748,6 +750,7 @@ fn multipart_part_token(
         request_id: "test-request-id".to_owned(),
         content_type: String::new(),
         etag: String::new(),
+        bind_on_finalize: false,
     };
     issuer
         .issue(claims, OffsetDateTime::now_utc())
@@ -933,6 +936,7 @@ async fn write_multipart_part_native_undersized_returns_400() {
         request_id: "test-request-id".to_owned(),
         content_type: String::new(),
         etag: String::new(),
+        bind_on_finalize: false,
     };
 
     let err = write_multipart_part_native(&backend, &claims, 1, Body::from(b"short".to_vec()))
@@ -967,6 +971,7 @@ async fn write_multipart_part_offset_object_undersized_returns_400() {
         request_id: "test-request-id".to_owned(),
         content_type: String::new(),
         etag: String::new(),
+        bind_on_finalize: false,
     };
 
     let err =
@@ -1109,6 +1114,7 @@ fn part_claims(backend_id: &str, backend_path: &str, size: u64, backend_handle: 
         request_id: "test-request-id".to_owned(),
         content_type: String::new(),
         etag: String::new(),
+        bind_on_finalize: false,
     }
 }
 
@@ -1236,6 +1242,93 @@ async fn upload_returns_502_when_finalize_fails() {
         .await
         .expect("router call succeeds");
     assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+}
+
+/// Mock control plane answering every request `204 No Content`; returns its base URL and the
+/// number of requests it received.
+async fn counting_control_plane() -> (String, Arc<AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind mock control plane");
+    let addr = listener.local_addr().expect("local addr");
+    let hits = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&hits);
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let mut buf = [0u8; 4096];
+            if stream.read(&mut buf).await.is_ok() {
+                counter.fetch_add(1, Ordering::SeqCst);
+                stream
+                    .write_all(b"HTTP/1.1 204 No Content\r\nconnection: close\r\n\r\n")
+                    .await
+                    .ok();
+            }
+        }
+    });
+    (format!("http://{addr}"), hits)
+}
+
+/// A replayed `PUT` whose bytes differ from the already-published object is refused before
+/// finalize, so a `pending` version cannot be finalized with a digest of bytes never stored.
+#[tokio::test]
+async fn upload_replay_with_different_bytes_returns_409_without_finalize() {
+    let (mut state, issuer, backend) = test_download_state();
+    let (control_base_url, finalize_calls) = counting_control_plane().await;
+    state.control_base_url = control_base_url;
+    let file_id = Uuid::now_v7();
+    let version_id = Uuid::now_v7();
+    backend
+        .put("/replay-differs", bytes::Bytes::from_static(b"original"))
+        .await
+        .expect("seed the published object");
+    let token = upload_token(&issuer, file_id, version_id, "test", "/replay-differs");
+
+    let response = build_router(state, DEFAULT_MAX_BODY_BYTES)
+        .oneshot(
+            Request::put(format!(
+                "/api/file-storage-data/v1/upload/{file_id}/{version_id}?fs-token={token}"
+            ))
+            .body(Body::from(b"replaced".to_vec()))
+            .expect("valid request"),
+        )
+        .await
+        .expect("router call succeeds");
+
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert_eq!(finalize_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        backend.get("/replay-differs").await.expect("object kept"),
+        bytes::Bytes::from_static(b"original")
+    );
+}
+
+/// A replayed `PUT` with the published object's exact bytes still finalizes (F3 recovery).
+#[tokio::test]
+async fn upload_replay_with_same_bytes_finalizes() {
+    let (mut state, issuer, backend) = test_download_state();
+    let (control_base_url, finalize_calls) = counting_control_plane().await;
+    state.control_base_url = control_base_url;
+    let file_id = Uuid::now_v7();
+    let version_id = Uuid::now_v7();
+    backend
+        .put("/replay-same", bytes::Bytes::from_static(b"original"))
+        .await
+        .expect("seed the published object");
+    let token = upload_token(&issuer, file_id, version_id, "test", "/replay-same");
+
+    let response = build_router(state, DEFAULT_MAX_BODY_BYTES)
+        .oneshot(
+            Request::put(format!(
+                "/api/file-storage-data/v1/upload/{file_id}/{version_id}?fs-token={token}"
+            ))
+            .body(Body::from(b"original".to_vec()))
+            .expect("valid request"),
+        )
+        .await
+        .expect("router call succeeds");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(finalize_calls.load(Ordering::SeqCst), 1);
 }
 
 /// A part the sidecar refuses to write reaches the client with the write's
