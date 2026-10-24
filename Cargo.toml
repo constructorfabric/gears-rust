@@ -151,6 +151,7 @@ members = [
     "gears/system/authn-resolver/authn-resolver-sdk",
     "gears/system/authn-resolver/authn-resolver",
     "gears/system/authn-resolver/plugins/static-authn-plugin",
+    "gears/system/authn-resolver/plugins/firebase-authn-plugin",
     "gears/system/authn-resolver/plugins/oidc-authn-plugin",
     "gears/system/authz-resolver/authz-resolver-sdk",
     "gears/system/authz-resolver/authz-resolver",
@@ -412,6 +413,7 @@ cluster = { package = "cf-gears-cluster", version = "0.2.9", path = "gears/syste
 api-gateway = { package = "cf-gears-api-gateway", version = "0.5.2", path = "gears/system/api-gateway" }
 # Concrete plugins needed to link a standalone-mode binary.
 static-authn-plugin = { package = "cf-gears-static-authn-plugin", version = "0.3.18", path = "gears/system/authn-resolver/plugins/static-authn-plugin" }
+firebase-authn-plugin = { package = "cf-gears-firebase-authn-plugin", version = "0.1.0", path = "gears/system/authn-resolver/plugins/firebase-authn-plugin" }
 static-authz-plugin = { package = "cf-gears-static-authz-plugin", version = "0.1.38", path = "gears/system/authz-resolver/plugins/static-authz-plugin" }
 standalone-cluster-plugin = { package = "cf-gears-standalone-cluster-plugin", version = "0.2.8", path = "gears/system/cluster/plugins/standalone-cluster-plugin" }
 
@@ -791,6 +793,8 @@ hex = "0.4"
 
 # JWT and authentication
 jsonwebtoken = { version = "10.3", default-features = false, features = ["aws_lc_rs", "use_pem"] }
+# Test-only: signs fixture tokens. RUSTSEC-2023-0071 has no fix; see deny.toml.
+rsa = "0.9.10"
 
 # Configuration management
 figment = { version = "0.10", features = ["yaml", "env"] }
