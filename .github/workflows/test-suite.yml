@@ -12,6 +12,12 @@ on:
         description: Runner label, e.g. ubuntu-latest.
         required: true
         type: string
+      cache_namespace:
+        type: string
+        default: linux-v2
+      cache_seed:
+        type: boolean
+        default: false
 
 # A called workflow does not get the caller's env, so set it here.
 env:
@@ -19,6 +25,7 @@ env:
   RUST_BACKTRACE: full
   SCCACHE_CACHE_SIZE: "2G"
   CARGO_INCREMENTAL: "0"
+  CI_PREINSTALLED_TOOLS: nextest
   # sccache release installed by mozilla-actions/sccache-action. Without a
   # `version` the action queries the GitHub releases API on every job, which
   # exhausted the installation rate limit during a Dependabot burst (2026-10-14).
@@ -88,14 +95,26 @@ jobs:
           cache-bin: false
           cache-targets: false
           shared-key: pr-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml') }}
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
-      - name: Install sccache
-        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+      # If sccache does not start, build with plain rustc instead of failing.
+      - name: Configure Linux compilation cache
+        id: sccache
+        if: runner.os == 'Linux'
+        uses: ./.github/actions/sccache
+        with:
+          writer: 'true'
+          namespace: ${{ inputs.cache_namespace }}
+          seed: ${{ inputs.cache_seed }}
+
+      - name: Install sccache on other OSes
+        if: runner.os != 'Linux'
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba
         with:
           version: ${{ env.SCCACHE_VERSION }}
 
-      # If sccache does not start, build with plain rustc instead of failing.
       - name: Probe sccache & set RUSTC_WRAPPER
+        if: runner.os != 'Linux'
         shell: bash
         run: |
           if sccache --start-server >/dev/null 2>&1; then
@@ -119,3 +138,10 @@ jobs:
           path: test-results/*.xml
           if-no-files-found: warn
           retention-days: 14
+
+      - name: Save compilation metrics
+        if: always() && runner.os == 'Linux' && steps.sccache.outputs.enabled == 'true'
+        continue-on-error: true
+        uses: ./.github/actions/sccache-stats
+        with:
+          save: ${{ job.status == 'success' }}

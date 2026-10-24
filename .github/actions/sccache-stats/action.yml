@@ -1,0 +1,33 @@
+name: Compilation cache metrics
+description: Record metrics and save only successful writer jobs.
+inputs:
+  save:
+    default: 'false'
+runs:
+  using: composite
+  steps:
+    - name: Collect metrics
+      shell: bash
+      run: |
+        mkdir -p ci-metrics
+        sccache --show-stats > ci-metrics/sccache.txt
+        sccache --show-stats --stats-format=json > ci-metrics/sccache.json
+        rustc -vV > ci-metrics/toolchain.txt
+        python3 -c 'import json,os; names=["GITHUB_SHA","GITHUB_RUN_ID","GITHUB_RUN_ATTEMPT","RUNNER_OS","RUNNER_ARCH","ImageOS","ImageVersion","SCCACHE_ARCHIVE_KEY","SCCACHE_ARCHIVE_SAVE"]; print(json.dumps({k:os.environ.get(k,"") for k in names},indent=2))' > ci-metrics/environment.json
+        cat ci-metrics/sccache.txt >> "$GITHUB_STEP_SUMMARY"
+    - name: Upload metrics
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      with:
+        name: sccache-${{ github.job }}-${{ runner.os }}-${{ github.run_attempt }}
+        path: ci-metrics/
+        retention-days: 14
+    - name: Stop cache server
+      if: env.SCCACHE_ARCHIVE_SAVE == 'true'
+      shell: bash
+      run: sccache --stop-server
+    - name: Save compilation archive
+      if: success() && inputs.save == 'true' && env.SCCACHE_ARCHIVE_SAVE == 'true'
+      uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830
+      with:
+        path: ${{ env.SCCACHE_DIR }}
+        key: ${{ env.SCCACHE_ARCHIVE_KEY }}

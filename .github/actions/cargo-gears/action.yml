@@ -1,0 +1,29 @@
+name: Cached cargo-gears
+description: Cache the pinned executable for the active compiler and OS.
+runs:
+  using: composite
+  steps:
+    - name: Identify compiler
+      id: compiler
+      shell: bash
+      run: |
+        python3 -c 'import hashlib,os,subprocess; h=hashlib.sha256(subprocess.check_output(["rustc","-vV"])).hexdigest(); open(os.environ["GITHUB_OUTPUT"],"a").write("hash="+h+"\n")'
+    - name: Restore executable
+      id: cache
+      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+      with:
+        path: ${{ runner.temp }}/cargo-gears
+        key: cargo-gears-0.0.8-${{ runner.os }}-${{ runner.arch }}-${{ steps.compiler.outputs.hash }}
+    - name: Install on miss
+      if: steps.cache.outputs.cache-hit != 'true'
+      shell: bash
+      run: cargo install --locked cargo-gears@0.0.8 --root "$RUNNER_TEMP/cargo-gears"
+    - name: Add to PATH
+      shell: bash
+      run: echo "$RUNNER_TEMP/cargo-gears/bin" >> "$GITHUB_PATH"
+    - name: Save executable
+      if: steps.cache.outputs.cache-hit != 'true' && github.event_name == 'push' && github.ref == 'refs/heads/main'
+      uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830
+      with:
+        path: ${{ runner.temp }}/cargo-gears
+        key: cargo-gears-0.0.8-${{ runner.os }}-${{ runner.arch }}-${{ steps.compiler.outputs.hash }}
