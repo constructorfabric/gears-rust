@@ -11,20 +11,28 @@ use std::sync::Arc;
 use axum::Router;
 use axum::http::StatusCode;
 use policy_engine_sdk::management::PolicyManagementClientV1;
+use policy_engine_sdk::management::odata::{AssignmentFilterField, BundleFilterField};
 use toolkit::api::OpenApiRegistry;
-use toolkit::api::operation_builder::OperationBuilder;
+use toolkit::api::operation_builder::{OperationBuilder, OperationBuilderODataExt};
 
 use super::dto::{
     PolicyEngineAssignmentDto, PolicyEngineBundleDto, PolicyEngineCreateAssignmentRequestDto,
     PolicyEngineCreateBundleRequestDto, PolicyEngineCreateDraftVersionRequestDto,
     PolicyEngineReplaceDraftContentRequestDto, PolicyEngineUpdateAssignmentRequestDto,
-    PolicyEngineUpdateBundleRequestDto, PolicyEngineValidationReportDto,
-    PolicyEngineVersionDetailDto, PolicyEngineVersionDto,
+    PolicyEngineUpdateBundleRequestDto, PolicyEngineVersionDetailDto, PolicyEngineVersionDto,
 };
 use super::handlers;
 
 /// `OpenAPI` tag of every route registered here.
 const TAG: &str = "Policy Engine";
+
+/// The `dry_run` query parameter of the publish operations.
+const DRY_RUN: &str = "When `true`, run every check of the operation and write nothing: `204` when \
+     it would succeed now, otherwise the problem it would return. Advisory: the operation \
+     checks again when it runs.";
+
+/// The `204` a passing dry run answers.
+const DRY_RUN_PASSED: &str = "Dry run: the operation would succeed now";
 
 /// Registers the whole Policy Administration REST API and returns `router`
 /// with it attached. The only entry point of this module.
@@ -61,7 +69,9 @@ pub fn register_routes(
         .operation_id("policy_engine.list_bundles")
         .summary("List bundles for the scoped tenant")
         .description(
-            "Lists the bundles of the tenants the caller may manage, opaque-cursor paginated.",
+            "Lists the bundles of the tenants the caller may manage, opaque-cursor paginated. \
+             Filter by `name` and `owner_tenant_id` (for example `name eq 'baseline' and \
+             owner_tenant_id eq <tenant>`) to find a bundle by its name.",
         )
         .tag(TAG)
         .authenticated()
@@ -72,6 +82,8 @@ pub fn register_routes(
             StatusCode::OK,
             "Page of bundles",
         )
+        .with_odata_filter::<BundleFilterField>()
+        .with_odata_orderby::<BundleFilterField>()
         .standard_errors(openapi)
         .error_503(openapi)
         .register(router, openapi);
@@ -201,8 +213,10 @@ pub fn register_routes(
             .operation_id("policy_engine.validate_version")
             .summary("Validate a version without activating")
             .description(
-                "Validates a version and reports every finding against the document that \
-             caused it. Never activates, never changes the version.",
+                "Validates a version's content, in any state, with the checks activation \
+             applies. Never activates, never changes the version. Invalid content is the \
+             `VALIDATION_FAILED` problem activation would return, with every finding \
+             against the document that caused it.",
             )
             .tag(TAG)
             .authenticated()
@@ -210,11 +224,7 @@ pub fn register_routes(
             .path_param("id", "Bundle identity")
             .path_param("version", "Version identity")
             .handler(handlers::validate_version)
-            .json_response_with_schema::<PolicyEngineValidationReportDto>(
-                openapi,
-                StatusCode::OK,
-                "The validation report",
-            )
+            .no_content_response(StatusCode::NO_CONTENT, "The content is valid")
             .standard_errors(openapi)
             .error_503(openapi)
             .register(router, openapi);
@@ -226,19 +236,21 @@ pub fn register_routes(
             .description(
                 "Activates a draft: validates it and supersedes the previously active \
              version in the same transaction. Activating the active version succeeds \
-             without changes.",
+             without changes. With `dry_run=true`, runs every check and activates nothing.",
             )
             .tag(TAG)
             .authenticated()
             .no_license_required()
             .path_param("id", "Bundle identity")
             .path_param("version", "Version identity")
+            .query_param_typed("dry_run", false, DRY_RUN, "boolean")
             .handler(handlers::activate_version)
             .json_response_with_schema::<PolicyEngineVersionDto>(
                 openapi,
                 StatusCode::OK,
                 "The now-active version",
             )
+            .no_content_response(StatusCode::NO_CONTENT, DRY_RUN_PASSED)
             .standard_errors(openapi)
             .error_503(openapi)
             .register(router, openapi);
@@ -266,11 +278,13 @@ pub fn register_routes(
         .operation_id("policy_engine.assign")
         .summary("Assign a bundle to a tenant")
         .description(
-            "Assigns a bundle to a tenant; it governs through whichever version is active.",
+            "Assigns a bundle to a tenant; it governs through whichever version is active. \
+             With `dry_run=true`, runs every check and assigns nothing.",
         )
         .tag(TAG)
         .authenticated()
         .no_license_required()
+        .query_param_typed("dry_run", false, DRY_RUN, "boolean")
         .json_request::<PolicyEngineCreateAssignmentRequestDto>(
             openapi,
             "Bundle, tenant and whether denials are enforced",
@@ -281,6 +295,7 @@ pub fn register_routes(
             StatusCode::CREATED,
             "Assignment created",
         )
+        .no_content_response(StatusCode::NO_CONTENT, DRY_RUN_PASSED)
         .standard_errors(openapi)
         .error_503(openapi)
         .register(router, openapi);
@@ -303,16 +318,42 @@ pub fn register_routes(
         .error_503(openapi)
         .register(router, openapi);
 
+    let router = OperationBuilder::get("/policy-engine/v1/assignments")
+        .operation_id("policy_engine.list_assignments")
+        .summary("List assignments")
+        .description(
+            "Lists the assignments the caller administers and the dormant assignments at its \
+             tenants it may withdraw, opaque-cursor paginated. Filter by `bundle_id` or by \
+             `tenant_id` (the target); a filter naming content the caller cannot see yields \
+             an empty page.",
+        )
+        .tag(TAG)
+        .authenticated()
+        .no_license_required()
+        .handler(handlers::list_assignments)
+        .json_response_with_schema::<toolkit_odata::Page<PolicyEngineAssignmentDto>>(
+            openapi,
+            StatusCode::OK,
+            "Page of assignments",
+        )
+        .with_odata_filter::<AssignmentFilterField>()
+        .with_odata_orderby::<AssignmentFilterField>()
+        .standard_errors(openapi)
+        .error_503(openapi)
+        .register(router, openapi);
+
     let router = OperationBuilder::patch("/policy-engine/v1/assignments/{id}")
         .operation_id("policy_engine.update_assignment")
         .summary("Update an assignment")
         .description(
-            "Sets whether the assignment enforces its bundle's denials or only reports them.",
+            "Sets whether the assignment enforces its bundle's denials or only reports them. \
+             With `dry_run=true`, runs every check and changes nothing.",
         )
         .tag(TAG)
         .authenticated()
         .no_license_required()
         .path_param("id", "Assignment identity")
+        .query_param_typed("dry_run", false, DRY_RUN, "boolean")
         .json_request::<PolicyEngineUpdateAssignmentRequestDto>(openapi, "The fields to change")
         .handler(handlers::update_assignment)
         .json_response_with_schema::<PolicyEngineAssignmentDto>(
@@ -320,6 +361,7 @@ pub fn register_routes(
             StatusCode::OK,
             "The updated assignment",
         )
+        .no_content_response(StatusCode::NO_CONTENT, DRY_RUN_PASSED)
         .standard_errors(openapi)
         .error_503(openapi)
         .register(router, openapi);
@@ -327,13 +369,20 @@ pub fn register_routes(
     let router = OperationBuilder::delete("/policy-engine/v1/assignments/{id}")
         .operation_id("policy_engine.unassign")
         .summary("Remove an assignment")
-        .description("Withdraws an assignment; withdrawing one that does not exist succeeds.")
+        .description(
+            "Withdraws an assignment; withdrawing one that does not exist succeeds. With \
+             `dry_run=true`, runs every check and withdraws nothing.",
+        )
         .tag(TAG)
         .authenticated()
         .no_license_required()
         .path_param("id", "Assignment identity")
+        .query_param_typed("dry_run", false, DRY_RUN, "boolean")
         .handler(handlers::unassign)
-        .no_content_response(StatusCode::NO_CONTENT, "Assignment removed")
+        .no_content_response(
+            StatusCode::NO_CONTENT,
+            "Assignment removed, or with `dry_run` would be",
+        )
         .standard_errors(openapi)
         .error_503(openapi)
         .register(router, openapi);

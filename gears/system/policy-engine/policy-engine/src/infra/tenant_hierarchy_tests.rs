@@ -16,14 +16,15 @@ use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
 use super::TenantResolverHierarchy;
-use crate::domain::ports::{HierarchyPort, PortError};
+use crate::domain::ports::{HierarchyPort, PortError, Subtree};
 use crate::test_support::ctx;
 
 const ROOT: Uuid = Uuid::from_u128(1);
 const PARENT: Uuid = Uuid::from_u128(2);
 const CHILD: Uuid = Uuid::from_u128(3);
 
-/// How the fake resolver answers `get_ancestors` and `is_ancestor`.
+/// How the fake resolver answers `get_ancestors`, `is_ancestor` and
+/// `get_descendants`.
 enum Answer {
     /// Never answers.
     Hang,
@@ -34,6 +35,12 @@ enum Answer {
         tenant: Uuid,
         ancestors: Vec<Uuid>,
         reachable: bool,
+    },
+    /// Answers `get_descendants` for `tenant` with `(id, parent, self_managed)`
+    /// descendants.
+    Descendants {
+        tenant: Uuid,
+        descendants: Vec<(Uuid, Option<Uuid>, bool)>,
     },
 }
 
@@ -60,6 +67,7 @@ impl Resolver {
                 ancestors,
                 reachable,
             } => Ok((*tenant, ancestors.clone(), *reachable)),
+            Answer::Descendants { .. } => unreachable!("answers descendants only"),
         }
     }
 }
@@ -108,9 +116,33 @@ impl TenantResolverClient for Resolver {
         &self,
         _ctx: &SecurityContext,
         _id: TenantId,
-        _options: &GetDescendantsOptions,
+        options: &GetDescendantsOptions,
     ) -> Result<GetDescendantsResponse, TenantResolverError> {
-        unreachable!("the adapter reads ancestry and reachability only")
+        assert_eq!(options.barrier_mode, BarrierMode::Ignore);
+        assert!(options.status.is_empty());
+        assert_eq!(options.max_depth, None);
+        match &self.0 {
+            Answer::Hang => std::future::pending().await,
+            Answer::Fail(err) => Err(err()),
+            Answer::Descendants {
+                tenant,
+                descendants,
+            } => Ok(GetDescendantsResponse {
+                tenant: info(*tenant).into(),
+                descendants: descendants
+                    .iter()
+                    .map(|&(id, parent, self_managed)| {
+                        TenantInfo {
+                            parent_id: parent.map(TenantId),
+                            self_managed,
+                            ..info(id)
+                        }
+                        .into()
+                    })
+                    .collect(),
+            }),
+            Answer::Tree { .. } => unreachable!("answers ancestry only"),
+        }
     }
 
     async fn is_ancestor(
@@ -223,4 +255,63 @@ async fn a_tenant_reaches_itself_without_asking() {
             .await,
         Ok(true)
     );
+}
+
+#[tokio::test]
+async fn the_subtree_carries_each_descendants_parent_and_barrier() {
+    let hierarchy = adapter(Answer::Descendants {
+        tenant: ROOT,
+        descendants: vec![(PARENT, Some(ROOT), true), (CHILD, Some(PARENT), false)],
+    });
+    let tree = hierarchy.subtree(&caller(), TenantId(ROOT)).await.unwrap();
+    assert_eq!(
+        tree,
+        Subtree::new(ROOT, [(PARENT, ROOT, true), (CHILD, PARENT, false)])
+    );
+    // The barrier flag was mapped: the self-managed child cuts off its subtree.
+    assert_eq!(tree.reachable(), vec![ROOT]);
+}
+
+#[tokio::test]
+async fn a_subtree_answer_about_another_tenant_is_unavailable_not_trusted() {
+    let hierarchy = adapter(Answer::Descendants {
+        tenant: PARENT,
+        descendants: Vec::new(),
+    });
+    assert!(matches!(
+        hierarchy.subtree(&caller(), TenantId(ROOT)).await,
+        Err(PortError::Unavailable(_))
+    ));
+}
+
+#[tokio::test]
+async fn a_descendant_without_a_parent_is_unavailable() {
+    let hierarchy = adapter(Answer::Descendants {
+        tenant: ROOT,
+        descendants: vec![(CHILD, None, false)],
+    });
+    assert!(matches!(
+        hierarchy.subtree(&caller(), TenantId(ROOT)).await,
+        Err(PortError::Unavailable(_))
+    ));
+}
+
+#[tokio::test]
+async fn a_slow_resolver_times_out_the_subtree() {
+    let hierarchy = adapter(Answer::Hang);
+    assert_eq!(
+        hierarchy.subtree(&caller(), TenantId(ROOT)).await,
+        Err(PortError::Timeout)
+    );
+}
+
+#[tokio::test]
+async fn an_unknown_subtree_root_is_not_found() {
+    let hierarchy = adapter(Answer::Fail(|| TenantResolverError::TenantNotFound {
+        tenant_id: TenantId(ROOT),
+    }));
+    assert!(matches!(
+        hierarchy.subtree(&caller(), TenantId(ROOT)).await,
+        Err(PortError::NotFound(_))
+    ));
 }

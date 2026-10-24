@@ -9,6 +9,8 @@
 //!   list, update, draft (empty or seeded), replace, validate, activate,
 //!   delete draft.
 //! - [`assignments`]: the [`ManagementService`]'s assignment surface.
+//! - [`dry_run`]: dry runs of the publish operations, over the plans they
+//!   share with the operations.
 //! - [`error`]: the projection of every condition onto the SDK's error table
 //!   ([`policy_engine_sdk::management`] module documentation).
 //!
@@ -28,6 +30,7 @@ use crate::domain::repos::{AssignmentRepository, BundleRepository, VersionReposi
 
 pub mod assignments;
 pub mod authz;
+pub mod dry_run;
 pub mod error;
 pub mod lifecycle;
 pub mod local_client;

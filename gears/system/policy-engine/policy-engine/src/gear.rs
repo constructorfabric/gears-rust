@@ -248,7 +248,10 @@ fn build_services(
         store,
         enforcer: PolicyEnforcer::new(Arc::clone(&clients.authz)),
         validator,
-        hierarchy,
+        hierarchy: Arc::new(TenantResolverHierarchy::new(
+            Arc::clone(&clients.tenant_resolver),
+            config.management_hierarchy_timeout,
+        )),
     }));
     let management_client: Arc<dyn PolicyManagementClientV1> =
         Arc::new(PolicyManagementLocalClient::new(management));
