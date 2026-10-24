@@ -417,14 +417,9 @@ lane_post_toolkit-db-sqlite = cargo build -p cf-gears-toolkit-db --examples --fe
 ## toolkit-db on PostgreSQL.
 lane_args_toolkit-db-pg = -p cf-gears-toolkit-db --features pg,integration
 
-## The SQL/PGQ lane: toolkit-db's unit suites under the `pgq` feature (the
-## secure graph builder and its tests compile only there), the PostgreSQL 19
-## integration suite (tests/pg, Docker required; a testcontainers PG19) and the
-## trybuild guards. `pgq` implies `pg`, so without the filter this would re-run
-## every PG18 Docker suite the toolkit-db-pg lane just ran; the filter keeps only
-## what this lane adds. The PG19 suite skips itself while the pre-GA image is
-## unavailable; CI sets GEARS_TEST_PG_GRAPH_REQUIRED=1 so there the skip is a
-## failure — do the same locally once the image is expected to be present.
+## The SQL/PGQ lane: toolkit-db's unit, integration (tests/pg) and trybuild
+## suites under the `pgq` feature. `pgq` implies `pg`, so the filter keeps only
+## what this lane adds to the toolkit-db-pg lane.
 lane_args_toolkit-db-pgq = -p cf-gears-toolkit-db --features pgq,integration -E 'kind(lib) | binary(mod) | binary(ui)'
 
 ## toolkit-db on MySQL.

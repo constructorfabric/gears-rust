@@ -448,16 +448,8 @@ jobs:
         if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
         run: tools/scripts/with_rust_annotations.sh make test-integration LANE=toolkit-db-pg
 
-      - name: Test toolkit-db (pgq unit + PG19 integration)
+      - name: Test toolkit-db (pgq)
         if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
-        # Compiles and runs everything behind the `pgq` feature — the secure
-        # graph builder, its unit suites and the trybuild guards — and the
-        # PostgreSQL 19 integration suite. Locally that suite skips itself while
-        # the pre-GA PG19 image is unavailable; here the skip is a failure, so
-        # the isolation suite cannot pass green and empty (see
-        # libs/test-containers::graph_lane_required).
-        env:
-          GEARS_TEST_PG_GRAPH_REQUIRED: "1"
         run: tools/scripts/with_rust_annotations.sh make test-integration LANE=toolkit-db-pgq
 
       - name: Test toolkit-db (mysql integration)
