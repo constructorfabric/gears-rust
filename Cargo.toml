@@ -69,6 +69,7 @@ members = [
     "libs/toolkit-gts",
     "libs/toolkit-gts-macros",
     "libs/toolkit-http",
+    "libs/toolkit-http-proxy",
     "libs/toolkit-trace-context",
     "libs/toolkit-http-middleware",
     "libs/toolkit-gateway",
@@ -347,6 +348,7 @@ apalis-postgres = { version = "=1.0.0-rc.9", default-features = false, features 
 # libs
 toolkit = { package = "cf-gears-toolkit", version = "0.10.0", path = "libs/toolkit" }
 toolkit-http = { package = "cf-gears-toolkit-http", version = "0.6.18", path = "libs/toolkit-http" }
+toolkit-http-proxy = { package = "cf-gears-toolkit-http-proxy", version = "0.1.0", path = "libs/toolkit-http-proxy" }
 toolkit-trace-context = { package = "cf-gears-toolkit-trace-context", version = "0.1.0", path = "libs/toolkit-trace-context" }
 toolkit-http-middleware = { package = "cf-gears-toolkit-http-middleware", version = "0.3.2", path = "libs/toolkit-http-middleware" }
 toolkit-gateway = { package = "cf-gears-toolkit-gateway", version = "0.2.8", path = "libs/toolkit-gateway" }
@@ -599,6 +601,11 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
 http-body-util = "0.1"
 http-body = "1"
+# HTTP/2 framing. Direct dependency only to classify h2 errors and to pin the
+# minimum version: >= 0.4.16 fixes RUSTSEC-2026-0258 (unbounded empty DATA
+# frames); MadeYouReset (>= 0.4.11) and CONTINUATION flood (>= 0.4.4) are
+# included.
+h2 = "0.4.16"
 
 # HTTP client (default-tls = rustls + aws-lc-rs in 0.13)
 reqwest = { version = "0.13", features = ["stream"] }

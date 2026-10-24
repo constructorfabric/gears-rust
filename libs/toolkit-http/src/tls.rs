@@ -430,6 +430,17 @@ pub fn webpki_roots_client_config(tls: &TlsConfig) -> Result<rustls::ClientConfi
     build_client_config(root_store, tls)
 }
 
+/// Build a rustls `ClientConfig` trusting exactly `root_store` (e.g. a
+/// private CA for internal upstreams).
+///
+/// Same provider selection and FIPS hardening as the other builders.
+pub fn custom_roots_client_config(
+    root_store: rustls::RootCertStore,
+    tls: &TlsConfig,
+) -> Result<rustls::ClientConfig, TlsConfigError> {
+    build_client_config(root_store, tls)
+}
+
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
