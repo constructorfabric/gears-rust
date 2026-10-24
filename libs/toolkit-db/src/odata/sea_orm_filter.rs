@@ -716,16 +716,7 @@ where
         }
     }
 
-    // Validate cursor consistency (filter hash only)
-    // A cursor issued for a filter carries only its hash, so a continuation
-    // must send the same filter: a missing or different one is a mismatch.
-    // A cursor without a hash is accepted (an added filter only narrows it).
-    if let Some(cur) = &query.cursor
-        && let Some(cf) = cur.f.as_deref()
-        && query.filter_hash.as_deref() != Some(cf)
-    {
-        return Err(ODataError::FilterMismatch);
-    }
+    toolkit_odata::check_cursor_filter(query)?;
 
     let mut s = select.inner;
 
@@ -786,12 +777,13 @@ where
         rows.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
     }
 
-    // Build cursors
+    // Build cursors, stamped with the hash the next request is checked against
+    let filter_hash = query.effective_filter_hash();
     let next_cursor = if is_backward || has_more {
         build_cursor_from_rows::<E, F, M>(
             &rows,
             &effective_order,
-            query.filter_hash.as_deref(),
+            filter_hash.as_deref(),
             "fwd",
             true,
         )?
@@ -804,7 +796,7 @@ where
             build_cursor_from_rows::<E, F, M>(
                 &rows,
                 &effective_order,
-                query.filter_hash.as_deref(),
+                filter_hash.as_deref(),
                 "bwd",
                 false,
             )?
@@ -815,7 +807,7 @@ where
         build_cursor_from_rows::<E, F, M>(
             &rows,
             &effective_order,
-            query.filter_hash.as_deref(),
+            filter_hash.as_deref(),
             "bwd",
             false,
         )?
