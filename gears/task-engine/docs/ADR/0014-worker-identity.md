@@ -56,6 +56,7 @@ How it works:
 * Reassignment names the new holder as such a pair; only a caller authenticated as that subject and sending that `worker_id` can accept the task (ADR-0011).
 * Workers should keep the same `worker_id` across restarts.
 * `worker_id` is not a credential. Access is decided by the PDP, and worker writes are fenced by the lease token together with the authenticated half of the pair, `subject_id` (ADR-0011). `worker_id` alone never grants anything.
+* Which subject a worker runs as (tenant subject or root-tenant service subject) and how it acts for a task is decided in ADR-0016.
 
 ### Consequences
 

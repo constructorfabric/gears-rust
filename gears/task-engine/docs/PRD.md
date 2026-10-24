@@ -897,7 +897,7 @@ Every access **MUST** be authorized by the platform policy decision point (AuthZ
 
 Permissions are GTS permission instances (base type `gts.cf.toolkit.authz.permission.v1~`) in the `task_engine` namespace:
 
-- **Task actions** (resource `gts.cf.core.tasks.task.v1~`): `create`, `read`, `update`, `delete`, `claim`, `cancel`, `admin`, `expedite`. `expedite` allows urgency `critical` (§5.2) and is meant for platform gears and operators.
+- **Task actions** (resource `gts.cf.core.tasks.task.v1~`): `create`, `read`, `update`, `delete`, `claim`, `cancel`, `admin`, `expedite`. `expedite` allows urgency `critical` (§5.2) and is meant for platform gears and operators. A permission on the base type covers every task type; policies can narrow it to one type or a type pattern (below).
 - **Queue actions** (resource `gts.cf.core.tasks.queue.v1~`): `read` (list and inspect queues) and `configure` (runtime configuration, §5.2). Seeing or tuning queues never grants access to task data.
 
 **Least privilege for workers**: every worker call that carries a lease token — claim, start, heartbeat, progress, checkpoint, complete, release, worker wait (arm and park), and worker entries — and accept **MUST** need only `claim`. A worker needs `claim` (and `read` for its own reads), never `update`; to create children of its own task it needs `create` plus the parent's lease (§5.9). `update` covers changes an API consumer makes to a task it does not hold: tags, dependencies, providing input, and setting a wait. Reassignment needs `admin` (§5.6 Reassignment).
@@ -914,14 +914,28 @@ Every task **MUST** have an owner tenant (the isolation boundary) and **MAY** ha
 - **Rationale**: Tenant scoping is the base of multi-tenant isolation; owner subjects give per-user views inside it.
 - **Actors**: All actors
 
-#### Resource-Path Access Policies
+#### Type and Queue Access Policies
 
-- [ ] `p3` - **ID**: `cpt-cf-task-engine-fr-resource-path-access`
+- [ ] `p1` - **ID**: `cpt-cf-task-engine-fr-resource-path-access`
 
-Policies **MUST** be able to limit creators and workers to specific queues. Token scopes **MUST** act as a ceiling on allowed operations.
+Policies **MUST** be able to limit, per subject, which task types and queues it may create in, claim from, read, or change. The engine **MUST** send each task's type and queue to the PDP and apply the returned constraints to the write or query ([ADR-0016](ADR/0016-authorization-model.md)). Token scopes **MUST** act as a ceiling on allowed operations.
 
-- **Rationale**: Teams sharing a tenant can be isolated by queue.
+- **Rationale**: A broad `create` grant must not let a tenant put a platform task type into a queue served by privileged workers. Teams in one tenant can also be kept apart by queue.
 - **Actors**: `cpt-cf-task-engine-actor-worker`, `cpt-cf-task-engine-actor-api-consumer`
+
+#### Worker Principals
+
+- [ ] `p1` - **ID**: `cpt-cf-task-engine-fr-worker-principals`
+
+All task work happens inside a tenant, so every task operation **MUST** use a tenant security context, also for platform services. The platform (workload) context is used only for work without a tenant, such as registering the engine's own GTS entities ([ADR-0016](ADR/0016-authorization-model.md)).
+
+- **Tenant workers** run as a subject of a tenant and see only that tenant's subtree. Tenant barriers apply.
+- **Platform workers** run as a service subject of the root tenant (client credentials). They reach tenants behind a barrier only on queues with `operated_by: platform` (§5.12), and only if the PDP allows it.
+- **Workers act as themselves.** The claim returns the task's owner tenant, creator, and owner. When a worker calls other gears for a task, it names the task's owner tenant as the context tenant, so the PDP limits it to that tenant. The engine **MUST NOT** store or forward the creator's token.
+- **Loss of access stops work.** Every worker call checks `claim` again. On an explicit denial the engine returns the task to the queue as a voluntary release (no budget, attempt, or blacklist change) and answers `403`; the worker **MUST** stop. If the PDP cannot be reached, the call fails with `503` and nothing changes.
+
+- **Rationale**: Shared workers with broad rights are the usual path to privilege escalation in a task engine. Following the platform's two-plane model and the Durable Execution rule ("worker identity does not replace the execution owner") keeps the task's tenant in force for every action.
+- **Actors**: `cpt-cf-task-engine-actor-worker`, `cpt-cf-task-engine-actor-platform-admin`
 
 ### 5.12 GTS Extension Points
 
@@ -958,6 +972,21 @@ A `dispatch` queue **MUST** declare concurrency limits, a default priority, defa
 
 - **Rationale**: Queues as GTS instances are discoverable and self-describing, and their settings are defined once and can be overridden in config.
 - **Actors**: `cpt-cf-task-engine-actor-platform-admin`
+
+#### Task Type and Queue Trust
+
+- [ ] `p1` - **ID**: `cpt-cf-task-engine-fr-type-trust`
+
+Task types, queues, and entry types are registered by other gears and, where the Types Registry allows it, by tenants. The engine **MUST** treat their settings as untrusted input:
+
+- **Who may register** is set by the Types Registry registration policy for each GTS region. Expected setup: task and entry types may be tenant-owned if the deployment allows it; queues are platform-owned only.
+- **Visibility**: a create **MUST** resolve the type with the caller's security context. A type the caller cannot see is unknown (`UNKNOWN_TASK_TYPE`).
+- **Limits**: every value a type or queue declares (lease, timeouts, retry budgets, retention, progress settings) **MUST** be inside engine limits set in config, with tighter limits for tenant-owned types. A type outside the limits cannot be created; a queue outside them refuses new tasks. The error names the setting. The minimum lease is 10 seconds by default.
+- **Platform queues**: a tenant-owned type **MUST NOT** be placed in a queue with `operated_by: platform`. A queue **MAY** list `accepted_types`; other types are rejected (`400`) on create, move, and re-enqueue.
+- **Removed or unavailable type**: new tasks are refused as unknown; existing tasks run to the end. Output is checked against the type revision recorded at creation.
+
+- **Rationale**: Extending the engine must not let a registrant switch off its protections, or let one tenant use another tenant's private type.
+- **Actors**: `cpt-cf-task-engine-actor-platform-admin`, `cpt-cf-task-engine-actor-api-consumer`
 
 #### Task State and Result Code Domain Enums
 
@@ -1461,6 +1490,11 @@ The engine does not process personal data of its own, but it stores caller ident
 - [ ] A parent parked on a children wait resumes exactly once, after its last child finishes, with the count of children per terminal state
 - [ ] On a `round_robin` queue, with tenant A holding 1,000 queued tasks and tenant B holding 10, B's tasks are claimed between A's, not after all of them, even if A uses priority `0` and B `1000`
 - [ ] A `critical` task is claimed before `normal` tasks of its queue; creating one without `expedite` returns `403`
+- [ ] A subject allowed to create only type A gets `403` for type B; a worker allowed to claim only queue Q never receives a task from another queue
+- [ ] A tenant-owned type is unknown to other tenants and is rejected on an `operated_by: platform` queue
+- [ ] A type with a lease below the minimum cannot be created, and a queue with one refuses new tasks; the error names the setting
+- [ ] A platform worker gets no task of a tenant behind a barrier from a queue without `operated_by: platform`
+- [ ] After `claim` is revoked, the worker's next call returns `403` and the task is back in the queue with no budget, attempt, or blacklist change
 - [ ] Re-enqueuing a `dead_lettered` or `failed` task resets both retry budgets, clears the old result, restarts the lifetime timeout, and returns `409` if another task now holds its dedup identity
 
 ## 10. Dependencies
@@ -1468,11 +1502,11 @@ The engine does not process personal data of its own, but it stores caller ident
 | Dependency | Description | Criticality |
 |------------|-------------|-------------|
 | ToolKit framework | REST operations, security context, tenant-scoped data access, client hub, canonical errors | p1 |
-| AuthN Resolver gear | Validates bearer tokens and provides the security context | p1 |
+| AuthN Resolver gear | Validates bearer tokens and provides the security context; client credentials give platform workers and the engine's broker subscription a root-tenant service identity | p1 |
 | AuthZ Resolver gear | Authorization decisions and query constraints (through `authz-resolver-sdk`) | p1 |
 | Tenant Resolver gear | Tenant hierarchy, subtree, and barrier rules | p1 |
 | Resource Group Resolver gear | Resource-group hierarchy for group-scoped policies | p2 |
-| GTS Registry | Registers and resolves task, queue, and entry types and instances | p1 |
+| GTS Registry | Registers and resolves task, queue, and entry types and instances; applies registration policy and per-tenant visibility (§5.12 Task Type and Queue Trust) | p1 |
 | Event Broker gear | Receives lifecycle events and delivers inbound events for event waits. The engine consumes waitable topics as a platform service and needs `consume` grants on them. It keeps running without the broker: events wait in the outbox, but event waits cannot resolve until it is back | p1 |
 | ToolKit DB layer | Database access, connection pools, migrations, and the event outbox | p1 |
 | Cluster gear | Distributed cache for the optional ready-task cache ([Cluster PRD](../../system/cluster/docs/PRD.md)) | p3 |
@@ -1485,6 +1519,7 @@ The engine does not process personal data of its own, but it stores caller ident
 - The AuthZ Resolver (PDP) is available and configured
 - The Tenant Resolver provides tenant hierarchies
 - The GTS registry is available; unknown task types are rejected, and input is validated only when the type registers a schema
+- The Types Registry registration policy keeps instances of `gts.cf.core.tasks.queue.v1~` platform-owned (§5.12 Task Type and Queue Trust)
 - The Event Broker, when available, delivers events at least once
 - The Cluster gear, when configured, provides a distributed cache; the engine does not use Redis directly
 - ToolKit exposes the compiled access scope in a stable, serializable form so it can be hashed; until this is confirmed, the `authz_scope` dedup scope is unavailable and only `subject` and `tenant` work (§5.1 Derived Dedup Identity)
@@ -1502,6 +1537,8 @@ The engine does not process personal data of its own, but it stores caller ident
 | A tenant marks all its work most important | Other tenants starve | Priority is tenant-local; `critical` needs `expedite` (§5.2) |
 | A lease token leaks | Another principal changes the task | Random token bound to the holder (§5.6) |
 | A caller links to someone else's task | Blocked parent, cascaded cancel, probing | Link authorization, uniform `404` (§5.9) |
+| A tenant puts a platform task type into a privileged queue | Privilege escalation through platform workers | Type and queue constraints from the PDP; `operated_by` and `accepted_types` (§5.11, §5.12) |
+| A registrant declares unsafe settings | Endless retries, leases that always expire | Engine limits on every declared value (§5.12) |
 | Many workers race for the head of one queue | Claim throughput collapses | Open design item (DESIGN §4.6, ADR-0008); the throughput NFR measures this case |
 | Stalled ("zombie") worker writes after its lease expired | Double execution, overwritten result | Lease fencing (§5.6); at-least-once contract with idempotent workers |
 | Clients that poll, time out, and resubmit | Unbounded backlog, noisy tenants | Queue depth limits at admission with `429` and `Retry-After` (§5.2) |
@@ -1516,6 +1553,9 @@ The engine does not process personal data of its own, but it stores caller ident
 - What is the maximum depth of parent/child hierarchies?
 - Should retried tasks prefer the same worker ("sticky" assignment)?
 - Does ToolKit expose a stable serialized form of the compiled access scope for the `authz_scope` dedup identity, or must the engine build it from the raw PDP constraints?
+- Will AuthN offer a way to act on behalf of a subject (token exchange)? Until then workers act as themselves (§5.11 Worker Principals).
+- May platform workers cross tenant barriers for task data on `operated_by: platform` queues, and what audit does AuthZ require?
+- When will Types Registry validation hooks be available, so invalid types are rejected at registration instead of at first use?
 
 ## 14. Traceability
 

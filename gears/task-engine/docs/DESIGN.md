@@ -112,6 +112,7 @@ Per [ADR/0001-pluggable-execution-backends.md](ADR/0001-pluggable-execution-back
 - `cpt-cf-task-engine-adr-worker-transport` — Workers use the REST API with capped long-poll claims, batch heartbeats, and a per-node queue watcher for cross-node wake-up; streaming is deferred. See [ADR/0013-worker-transport.md](ADR/0013-worker-transport.md).
 - `cpt-cf-task-engine-adr-worker-identity` — A worker is the pair (authenticated subject, client-supplied `worker_id`), used for assignment, blacklist, and audit, never as a credential. See [ADR/0014-worker-identity.md](ADR/0014-worker-identity.md).
 - `cpt-cf-task-engine-adr-gts-hybrid-model` — GTS for open sets (task types, queues, entry types), closed engine enums for control values, indexed base columns plus opaque compressed payloads. See [ADR/0015-gts-hybrid-model.md](ADR/0015-gts-hybrid-model.md).
+- `cpt-cf-task-engine-adr-authorization-model` — **Proposed** — The PDP sees each task's type and queue; all task work runs on the tenant plane; platform workers are root-tenant service subjects that cross barriers only on `operated_by: platform` queues; workers act as themselves. See [ADR/0016-authorization-model.md](ADR/0016-authorization-model.md).
 
 > Event delivery is **not** an ADR: reusing the platform Event Broker SDK is a mandated platform standard (all gears publish through `event-broker-sdk`), not a Task-Engine decision. The managed-outbox producer surface, dedup mode, and partitioning are documented as design detail in §3.2 Event Producer.
 
@@ -574,7 +575,7 @@ Reference schemas for every entity below live under [`schemas/`](./schemas/) (`t
 | GTS entity | Kind | Usage |
 |---|---|---|
 | `gts.cf.core.tasks.task.v1~` | Base type | Task type base. Concrete task types are **derived at runtime by consuming gears** (not shipped here); determines input/output schemas; may declare concurrency limits, a derived dedup identity (`dedup`) with optional supersession (`supersede`), progress settings (`progress_events`: `none`/`milestones`/`all`, `progress_flush_interval_secs`), and type defaults (`default_queue`, `timeouts`, `retry_policy`, `retention_days`) via traits. |
-| `gts.cf.core.tasks.queue.v1~` | Base type | Queue. `kind` is `dispatch` (default) or `dead_letter`. A `dead_letter` queue (well-known instance `dead_letter`) only holds parked `dead_lettered` tasks: it is never claimable and declares no dispatch settings; the `dead_lettered` state says the task ended and can be re-enqueued, the queue says where it is parked (DLQ listing, metrics, PDP queue constraints). Dispatch queues (well-known instances `default`, `system`) define concurrency, queue depth limit (`queue_max_queue_depth`), timeouts, retry, DLQ, worker blacklist (`blacklist_failure_threshold`, `blacklist_duration_minutes`), and optional default progress settings (`progress_events`, `progress_flush_interval_secs`). |
+| `gts.cf.core.tasks.queue.v1~` | Base type | Queue. `kind` is `dispatch` (default) or `dead_letter`. A `dead_letter` queue (well-known instance `dead_letter`) only holds parked `dead_lettered` tasks: it is never claimable and declares no dispatch settings; the `dead_lettered` state says the task ended and can be re-enqueued, the queue says where it is parked (DLQ listing, metrics, PDP queue constraints). Dispatch queues (well-known instances `default`, `system`; `system` is `operated_by: platform`) declare who runs them (`operated_by`), optional `accepted_types`, concurrency, queue depth limit (`queue_max_queue_depth`), timeouts, retry, DLQ, worker blacklist (`blacklist_failure_threshold`, `blacklist_duration_minutes`), and optional default progress settings (`progress_events`, `progress_flush_interval_secs`). |
 | `gts.cf.core.tasks.entry.v1~` | Base type | Task entry type base, with pre-defined derived kinds `entry_work`/`entry_observation`/`entry_issue`/`entry_note`/`entry_measurement`. |
 | `gts.cf.core.events.event.v1~cf.core.tasks.<event>.v1~` | Derived types (×22) | Lifecycle event types — derived from the Event Broker base event type `gts.cf.core.events.event.v1~`; each narrows `data` to its payload contract and fixes the `topic`, `partition_key`, and `allowed_subject_types` traits. See §3.2 Event Producer. |
 | `gts.cf.core.events.topic.v1~cf.core.tasks.task_events.v1` | Instance | Outbound lifecycle-events topic (instance of the Event Broker topic type). Retention `P30D` is the broker **replay horizon**, deliberately shorter than task retention (100 days): a consumer that falls further behind loses broker events but can recover the authoritative history from `GET /tasks/{id}/events` (`te_events`, kept for the task's full retention). |
@@ -590,7 +591,7 @@ Reference schemas for every entity below live under [`schemas/`](./schemas/) (`t
 
 #### Hybrid Storage Model (GTS + Engine Enums)
 
-Task types use a **hybrid storage model**: base fields (state, priority, queue, timestamps, owner, assignment) live in indexed relational columns for efficient querying. Type-specific extension data (input, context, output) is stored in compressed binary columns (ADR-0006, §3.7 Portable JSON Storage Contract). The `type_id` column stores the deterministic UUID derived from the GTS type identifier via `gts_schema_with_refs_as_string()`. This enables new task types to be registered without DDL changes — only GTS type registration is required.
+Task types use a **hybrid storage model**: base fields (state, priority, queue, timestamps, owner, assignment) live in indexed relational columns for efficient querying. Type-specific extension data (input, context, output) is stored in compressed binary columns (ADR-0006, §3.7 Portable JSON Storage Contract). The `type_id` column stores the type's Registry Reference as returned by the Types Registry SDK; the engine never derives it. `type_revision` records the schema revision used at creation. This enables new task types to be registered without DDL changes — only GTS type registration is required.
 
 Engine-owned finite sets **MUST** use stable SDK enum discriminants and compact numeric database columns (`u8` in domain models; `TINYINT` where supported, `SMALLINT` for PostgreSQL portability). Hot predicates **MUST NOT** store state, result code, urgency, timer type, timer status, wait kind, or dependency mode as strings or GTS UUIDs.
 
@@ -852,7 +853,7 @@ Event **wait conditions** (§3.2 WaitConditionService, §3.6 Event Wait sequence
 
 Design:
 - At startup, `event_consumer.rs` builds a `ConsumerBuilder` (`EventBrokerApi` from `ClientHub`) bound to a **stable consumer group** (`gts.cf.core.events.consumer_group.v1~cf.core.tasks.task_engine.v1`) so exactly one instance in the cluster processes each partition and offsets survive restarts. Parallelism is configurable (`event_consumer.slots`). One group serves all task domains.
-- **Static subscription.** One `Interest` per topic in `event_consumer.waitable_topics` (§4.1; ≤ 64, the broker cap). Each interest uses `tenant_id` = platform root, `max_depth = null`, `barrier_mode = ignore` (allowed for platform services; the engine joins with its workload identity and holds `consume` on these topics), and `types = ["gts.cf.core.events.event.v1~*"]` (patterns are topic-scoped). The subscription is independent of tenants, types, and waits. It changes only with the topic list (config change), never on arm or park, so waits cause no rebalance.
+- **Static subscription.** One `Interest` per topic in `event_consumer.waitable_topics` (§4.1; ≤ 64, the broker cap). Each interest uses `tenant_id` = platform root, `max_depth = null`, `barrier_mode = ignore` (allowed for platform services; the engine joins as its root-tenant service subject from AuthN client credentials, on the tenant plane, and holds `consume` on these topics; §3.3 Authorization Model), and `types = ["gts.cf.core.events.event.v1~*"]` (patterns are topic-scoped). The subscription is independent of tenants, types, and waits. It changes only with the topic list (config change), never on arm or park, so waits cause no rebalance.
 - **Waitable check.** On set or arm, `event_type` is resolved to its `topic` trait. An unresolvable type → `400` `UNKNOWN_EVENT_TYPE`; a topic not listed → `400` `EVENT_TOPIC_NOT_WAITABLE`. Operators list only topics that are actually waited on, because every event of a listed topic is read.
 - **Arm before acting** (PRD §5.4). The topic is already subscribed, so an arm returns once its rows commit. Every later-processed event sees the condition, including events still behind consumer lag. An event admitted just before the arm may also match; conditions that must ignore earlier events narrow by `event_subject_id` or `match_expression`.
 - **Candidates.** One indexed probe per domain on `ix_te_waits_event_subject` (§3.7), per event or one `IN`-list per batch, with `(event_type, owner_tenant_id = event.tenant_id[, event_subject_id])` over pending conditions. Domains without candidates get no transaction. This is never replaced by an in-memory cache, which would miss arms committed on other nodes.
@@ -935,6 +936,36 @@ Permission model (GTS Permission types, `task_engine` resource namespace). Task 
 | `configure` (queue resource) | Change queue runtime configuration | `POST /admin/config`, `GET /admin/config/{version}` |
 
 > **Worker action set** (least privilege, PRD §5.11): a worker identity needs only `claim` (plus `read` for its own reads). Every worker write carries a `lease_token` and is matched against `assignee_subject`, so `claim` is the only action those writes need. A worker never needs `update`, so it cannot change tags or dependencies, resolve input waits, or reassign tasks. To create children of its own task it needs `create` and its lease. Reassignment is `admin` and returns no lease.
+
+#### Authorization Model
+
+**ID**: `cpt-cf-task-engine-design-authz-model`
+
+See [ADR-0016](ADR/0016-authorization-model.md) and PRD §5.11.
+
+**Resource sent to the PDP**:
+
+| Operation | `resource.type` | `resource.id` | `resource.properties` |
+|---|---|---|---|
+| Create | the task's concrete type | — | `owner_tenant_id`, `type_id`, `queue_id`, `owner_id` |
+| One existing task (read, change, cancel, single worker call) | the task's concrete type | task ID | the same, from the task |
+| Search, list, claim, batch heartbeat, bulk | `gts.cf.core.tasks.task.v1~` | — | — |
+| One queue (read, configure) | `gts.cf.core.tasks.queue.v1~` | queue ID | `owner_tenant_id` = root tenant (queues are platform-owned) |
+
+- `supported_properties` for tasks: `owner_tenant_id`, `id`, `owner_id`, `type_id`, `queue_id`, `assignee_subject`, `created_by`. `type_id` and `queue_id` are `pep_prop` columns on `te_task_state` and `te_task_results`.
+- The PDP returns GTS IDs in constraints; the engine maps them to Registry References before building SQL. A pattern the PDP cannot expand to IDs is a denial.
+- A permission on `gts.cf.core.tasks.task.v1~` covers every task type (GTS derived-type coverage), so a policy can grant one type, a pattern, or all.
+- Single-task operations use the ToolKit prefetch pattern: read the task's type and queue, call the PDP, then apply the constraints in the same guarded write.
+
+**Planes** (toolkit ADR-0008): every task operation uses the tenant plane (`SecurityContext`). Platform services (platform workers, the event consumer) get it from AuthN client credentials as a root-tenant service subject. The platform plane (`PlatformSecurityContext`) is used only to register the engine's GTS types, instances, and permissions at startup; it never reaches `PolicyEnforcer`.
+
+**Barriers**: requests send `barrier_mode: all`. A claim whose queues are all `operated_by: platform` sends `barrier_mode: none`; the PDP decides whether the caller may use it.
+
+**Worker calls**: each request is authorized once (a batch heartbeat once for all its leases), and the constraints are added to the fenced `UPDATE`. On an explicit denial the engine releases the task on the system path, like a voluntary release (no budget, attempt, or blacklist change), and returns `403`. An unreachable PDP returns `503` and changes nothing.
+
+**Acting for a task**: the claim response carries `owner_tenant_id`, `created_by`, and `owner_id`, all set by the engine. The SDK helper for downstream calls sets `tenant_context = { root_id: owner_tenant_id, mode: root_only }`. The engine never stores or forwards the creator's bearer token.
+
+**Type and queue checks on create, move, and re-enqueue**: the type is resolved with the caller's context (not visible → `400` `UNKNOWN_TASK_TYPE`); the type and queue must be within `trust_limits` (§4.1); a tenant-owned type cannot enter an `operated_by: platform` queue; a queue with `accepted_types` rejects other types (`400`). A removed or unavailable type refuses new tasks only; its existing tasks run to the end, and output is validated against `te_tasks.type_revision`.
 
 Unauthenticated endpoints (`.anonymous()`, anonymous `SecurityContext`; `.anonymous()` auto-satisfies the license requirement). ToolKit `OperationBuilder` splits *auth* (`.anonymous()`) from *visibility* (`.exposed()`), and the legacy single-axis `.public()` is deprecated — so these routes use the explicit two-axis form:
 - `GET /health` — liveness probe — `.anonymous().exposed()` (edge-reachable)
@@ -1075,7 +1106,9 @@ Mapping of Task-Engine failure conditions to canonical categories (`gts.cf.core.
 | Aggregate payload exceeds 64 KiB / body too large | `invalid_argument` (transport override → 413) | 413 |
 | Input fails registered JSON Schema validation | `invalid_argument` | 400 |
 | Completion result invalid: `output` fails the type's output schema, or `error`/`warnings` break the `TaskError` contract (task unchanged, lease kept) | `invalid_argument` | 400 |
-| Task type does not resolve to a registered GTS task type | `invalid_argument` (`context.reason = "UNKNOWN_TASK_TYPE"`) | 400 |
+| Task type does not resolve to a registered GTS task type, is not visible to the caller, or is removed / unavailable | `invalid_argument` (`context.reason = "UNKNOWN_TASK_TYPE"`) | 400 |
+| Type or queue outside `trust_limits`; tenant-owned type on an `operated_by: platform` queue; type not in the queue's `accepted_types` (field violation names the setting) | `invalid_argument` | 400 |
+| Worker call after `claim` was revoked (task released) | `permission_denied` | 403 |
 | GTS registry unreachable and the type is not cached | `service_unavailable` | 503 |
 | Event condition type unresolvable or its topic not waitable (`UNKNOWN_EVENT_TYPE` / `EVENT_TOPIC_NOT_WAITABLE`) | `invalid_argument` | 400 |
 | Caller may not `consume` the event type of an event condition (§3.2 Event wait authorization) | `permission_denied` | 403 |
@@ -1301,8 +1334,9 @@ The task data is split into two tables — **`te_tasks`** (immutable after creat
 | Column | Type | Notes |
 |---|---|---|
 | `id` | UUID (PK) | Generated via UUID v7 (time-ordered) |
-| `type_id` | UUID | GTS type deterministic UUID |
-| `queue_id` | UUID | GTS queue well-known instance UUID |
+| `type_id` | UUID | Registry Reference of the task type (from the Types Registry SDK) |
+| `type_revision` | VARCHAR(64) | Type schema revision used at creation; output is validated against it |
+| `queue_id` | UUID | Registry Reference of the queue instance |
 | `owner_tenant_id` | UUID | Tenant isolation boundary (Scopable) |
 | `owner_id` | UUID (nullable) | Subject scoping for "my tasks" views |
 | `created_by` | UUID | Creating subject (`SecurityContext.subject_id`), server-set |
@@ -1644,7 +1678,7 @@ Written once at creation. **Partitioned** like `te_tags`; rescued rows move to `
 |---|---|---|
 | `task_id` | UUID | |
 | `task_created_at` | TIMESTAMP | Partition key, from `task_id` |
-| `resource_type_id` | UUID | Deterministic UUID of the resource's GTS type identifier |
+| `resource_type_id` | UUID | Registry Reference of the resource's GTS type |
 | `resource_id` | VARCHAR(256) | Resource identifier within its type |
 | `owner_tenant_id` | UUID | Inherited (Scopable) |
 
@@ -1845,6 +1879,18 @@ gears:
         max_key_fields: 16
         max_key_value_bytes: 4096
 
+      trust_limits:                       # PRD §5.12 Task Type and Queue Trust; a type outside them cannot be created, a queue outside them refuses new tasks
+        min_lease_secs: 10                # effective lease of any type or queue
+        global:                           # platform-owned types and queues
+          max_retries: 100
+          max_liveness_requeues: 100      # 0 (unlimited) only together with a lifetime timeout
+          max_retention_days: 365         # never above retention.hard_retention_days
+        tenant_owned:                     # tenant-owned task types
+          max_retries: 20
+          max_liveness_requeues: 20
+          max_retention_days: 100
+          allow_progress_events_all: false
+
       children_check_sweep_secs: 1        # safety re-check of parked children wait conditions (§4.6 Cascades)
 
       tenant_fairness_overrides:          # PRD §5.2 Tenant Fairness; overrides the queue GTS `tenant_fairness` (example below)
@@ -1893,7 +1939,7 @@ gears:
 
 **Progress data**: Cached in-memory with periodic flush (§3.2 Progress Cache). Latest value wins per task ID.
 
-**GTS type metadata**: Task types, queue definitions, and entry types are resolved from `types_registry` on first use and cached in-memory keyed by type id + registry version, re-resolved (and `dedup`/`supersede` traits re-validated, §4.5) when the registry version changes — consuming gears register types at runtime, so nothing is fixed at startup. An unknown type is rejected `invalid_argument` (`UNKNOWN_TASK_TYPE`); if the registry is unreachable and the type is not cached, creation fails closed with `service_unavailable` `503` (PRD §5.1). Tags are free-form strings and are not loaded from GTS. Engine-owned enum mappings are compiled into the SDK and must not be loaded from GTS.
+**GTS type metadata**: Task types, queue definitions, and entry types are resolved from `types_registry` on first use. Schemas and the trait and `trust_limits` checks (§4.5) are cached by (Registry Reference, revision) and checked again when the revision changes — consuming gears register types at runtime, so nothing is fixed at startup. Visibility is never shared between tenants: a create resolves the type with the caller's context, which may be cached per caller tenant for a short time. Background loops resolve on the platform plane. An unknown type is rejected `invalid_argument` (`UNKNOWN_TASK_TYPE`); if the registry is unreachable and the type is not cached, creation fails closed with `service_unavailable` `503` (PRD §5.1). Tags are free-form strings and are not loaded from GTS. Engine-owned enum mappings are compiled into the SDK and must not be loaded from GTS.
 
 **Ready-task cache** (optional, via Cluster gear): Priority-ordered entries with multi-dimensional routing keys `(tenant, queue, priority)`. Three-state availability model: `Unavailable → NotReady → Ready`. Enqueues accepted in `NotReady` (during warm-up from DB); claims require `Ready`. Graceful degradation to database-only dispatch when unavailable. See [ADR/0005-concurrency-enforcement.md](ADR/0005-concurrency-enforcement.md).
 
@@ -1970,7 +2016,7 @@ Structured JSON to stdout, ingested by centralized logging system.
 
 **Tenant isolation**: All tenant-owned database queries are tenant-scoped via `SecureConn` with `AccessScope` compiled from PDP constraints. `owner_tenant_id` is the isolation boundary on every tenant-owned entity, and those SeaORM entities derive `Scopable` with a `tenant_col`. Per-tenant counters are tenant-owned too. Only tables with **no tenant column** are `#[secure(unrestricted)]`; system loops use `allow_all()` as limited in §2.1 Secure-by-default.
 
-**Authorization enforcement**: All authorization decisions via `PolicyEnforcer` (fail-closed). No raw database access outside migrations. Token scopes act as a capability ceiling. Queue-level access can be restricted via resource-path access constraint predicates from the PDP.
+**Authorization enforcement**: All authorization decisions via `PolicyEnforcer` (fail-closed). No raw database access outside migrations. Token scopes act as a capability ceiling. Type- and queue-level access uses `type_id` / `queue_id` constraints (§3.3 Authorization Model).
 
 **Input validation**: GTS type identifiers validated on all inputs. Task input validated against the registered input schema on create, and completion results validated against the registered output schema plus the fixed `TaskError` contract (§3.2 TaskService), in both cases when a schema exists. Payload size limits enforced before processing. Dependency graphs validated for cycles on every change.
 
@@ -1979,6 +2025,10 @@ Structured JSON to stdout, ingested by centralized logging system.
 **Links between tasks** (PRD §5.9): parent needs its lease or `update`, predecessor needs `read`, same tenant, uniform `404`.
 
 **Cross-tenant precedence** (PRD §5.2): priority is tenant-local; only `critical` (needs `expedite`) ranks tenants.
+
+**Types and queues** (PRD §5.12): resolved with the caller's visibility; declared values bounded by `trust_limits`; tenant-owned types never enter `operated_by: platform` queues.
+
+**Worker principals** (PRD §5.11): all task work on the tenant plane; platform workers are root-tenant service subjects and cross barriers only on `operated_by: platform` queues with PDP consent; workers act as themselves and name the task's tenant downstream; a denial releases the task.
 
 **Payload opacity**: Task payloads (input, context, output) and entry payloads are caller-controlled opaque JSON. The Task Engine does not inspect, index, or log payload contents. Callers are responsible for PII management. Compression is transparent and does not alter the logical content.
 
@@ -1990,7 +2040,7 @@ Structured JSON to stdout, ingested by centralized logging system.
 
 **Queue-depth admission security**: Per-tenant counters are keyed and scoped by the task's `owner_tenant_id`, so tenants cannot use each other's capacity. Parking, delayed release, and dependency add are admissions, so parking cannot grow a backlog without bound. The `429` response names only the full dimension and never returns other tenants' or global usage (side-channel). Checks run authorization → validation → dedup/replay → depth, so an unauthorized caller cannot probe capacity and a replay never consumes it. Limit changes (config override, runtime update) require the queue `configure` action and emit `configUpdated`; queue GTS registrations that raise `queue_max_queue_depth` are bounded by the engine-wide `global_max_queue_depth`, which only config can change. Capacity is shared among a tenant's subjects (no per-subject sub-limit); a hostile subject can exhaust its tenant's allowance but never another tenant's — isolate subjects with separate queues/PDP queue constraints where needed.
 
-**Derived dedup / supersession security**: (1) The identity follows the caller's *effective access*: if a policy change alters the compiled scope, the identity and supersede group change too, so duplicates can briefly coexist across the change (a missed dedup, never a disclosure — differing scopes never merge). The `authz_scope` canonical form is engine-defined (JCS over the normalized compiled constraints) and depends on `AccessScope` exposing a stable serialization (PRD §11 Assumptions); until confirmed, only `subject`/`tenant` are accepted and a type declaring `authz_scope` is non-creatable. The identity hash folds in the type's GTS id (contract version), `owner_tenant_id` (the *target* tenant, not necessarily the caller's), and the scope component — `created_by` (`subject`, default), a digest of the PDP-compiled `AccessScope` canonicalized (sorted, normalized; `authz_scope`), or nothing (`tenant`, only when the registrant opts in). The identity is not a credential. (2) The engine is not in the type-registration path (consuming gears register in the GTS registry directly), so it validates `dedup`/`supersede` traits against the type's input schema (required pointers, integer `order_field`, field-count/size caps) the first time it resolves the type, caches the verdict keyed by type id + registry version, and treats an invalid trait as a non-creatable type (fail closed, `invalid_argument` on create); who may register types is governed by the GTS registry authorization. (3) Identity is computed only from schema-validated input after `PolicyEnforcer` allowed `create`; a hit returns the existing task only if `SecureConn` can read it, else `403` without an identifier. This cannot occur under `subject`/`authz_scope` (scope is in the hash); under the opt-in `tenant` scope the residual disclosure (an identical task exists in the target tenant) is accepted. (4) Supersession additionally requires PDP `cancel` on the superseded task with the caller's scope, evaluated inside the create transaction so a denial leaves no change. (5) Fencing interplay: supersession is an ordinary guarded cancel transition (`WHERE state_code IN non-terminal`): `forced` clears the lease token so the holder's next write is `LEASE_LOST`; `graceful` sets `cancel_requested` and the holder's writes stay fenced by its still-valid token until it acknowledges. The `lease_epoch` is not bumped (no new lease is granted). A race with the holder's completion resolves by the guarded update — whichever transition commits first wins; if the holder wins there is simply nothing to supersede. (6) The cancellation is attributed in `te_events` to the creating subject with `superseded_by`.
+**Derived dedup / supersession security**: (1) The identity follows the caller's *effective access*: if a policy change alters the compiled scope, the identity and supersede group change too, so duplicates can briefly coexist across the change (a missed dedup, never a disclosure — differing scopes never merge). The `authz_scope` canonical form is engine-defined (JCS over the normalized compiled constraints) and depends on `AccessScope` exposing a stable serialization (PRD §11 Assumptions); until confirmed, only `subject`/`tenant` are accepted and a type declaring `authz_scope` is non-creatable. The identity hash folds in the type's GTS id (contract version), `owner_tenant_id` (the *target* tenant, not necessarily the caller's), and the scope component — `created_by` (`subject`, default), a digest of the PDP-compiled `AccessScope` canonicalized (sorted, normalized; `authz_scope`), or nothing (`tenant`, only when the registrant opts in). The identity is not a credential. (2) The engine is not in the type-registration path (consuming gears register in the GTS registry directly), so it validates `dedup`/`supersede` traits against the type's input schema (required pointers, integer `order_field`, field-count/size caps) the first time it resolves the type, caches the verdict keyed by (Registry Reference, revision), and treats an invalid trait as a non-creatable type (fail closed, `invalid_argument` on create); who may register types is governed by the GTS registry authorization. (3) Identity is computed only from schema-validated input after `PolicyEnforcer` allowed `create`; a hit returns the existing task only if `SecureConn` can read it, else `403` without an identifier. This cannot occur under `subject`/`authz_scope` (scope is in the hash); under the opt-in `tenant` scope the residual disclosure (an identical task exists in the target tenant) is accepted. (4) Supersession additionally requires PDP `cancel` on the superseded task with the caller's scope, evaluated inside the create transaction so a denial leaves no change. (5) Fencing interplay: supersession is an ordinary guarded cancel transition (`WHERE state_code IN non-terminal`): `forced` clears the lease token so the holder's next write is `LEASE_LOST`; `graceful` sets `cancel_requested` and the holder's writes stay fenced by its still-valid token until it acknowledges. The `lease_epoch` is not bumped (no new lease is granted). A race with the holder's completion resolves by the guarded update — whichever transition commits first wins; if the holder wins there is simply nothing to supersede. (6) The cancellation is attributed in `te_events` to the creating subject with `superseded_by`.
 
 **Event wait authorization (confused-deputy guard)**: the consumer reads waitable topics with platform rights, across tenants and barriers. Three controls keep that from leaking:
 - events match only waits of their own tenant;
@@ -2024,7 +2074,7 @@ Tenants cannot widen what the engine reads, because `waitable_topics` is operato
 ```
 parse ClaimRequest (worker_id, queues[], timeout)      # worker_id required, [A-Za-z0-9._:-]{1,128} (PRD §5.6)
 worker = (ctx.subject_id, worker_id)                  # worker identity
-authenticate + authorize (claim action)
+authorize(claim) on the base type; barrier_mode = none only if every queue is operated_by: platform   # §3.3 Authorization Model
 deadline = now + timeout
 loop:
   (task, skipped_for_capacity) = try_claim_once(queues)
@@ -2138,10 +2188,12 @@ try_claim_once(queues):
 #### Task Creation Admission (Dedup, Supersession, Queue Depth)
 
 ```
-authenticate; authorize(create) via PolicyEnforcer -> AccessScope        # fail-closed, always first
+type  = registry.resolve(task.type, ctx)                                 # caller's visibility; not visible → 400 UNKNOWN_TASK_TYPE
+queue = request.queue or type.default_queue or default
+authorize(create, type, queue) via PolicyEnforcer -> AccessScope        # fail-closed; §3.3 Authorization Model
 if task.urgency == critical: authorize(expedite) else 403                # PRD §5.2
-validate type + input against GTS schema; validate payload size
-type = registry.get(task.type)
+check trust_limits, operated_by, accepted_types                         # 400, names the setting (PRD §5.12)
+validate input against the type schema; validate payload size
 
 # 1. Identity
 if type.dedup:
@@ -2556,7 +2608,9 @@ Consistent with PRD §4.2:
 | `cpt-cf-task-engine-fr-authn` | §3.3 Authentication & Authorization |
 | `cpt-cf-task-engine-fr-authz` | §3.3 Permission model; §2.1 Fail-closed principle |
 | `cpt-cf-task-engine-fr-tenant-scoping` | §2.1 Tenant scoping principle; §3.3 AuthZ |
-| `cpt-cf-task-engine-fr-resource-path-access` | §3.3 Authentication & Authorization |
+| `cpt-cf-task-engine-fr-resource-path-access` | §3.3 Authorization Model; §4.6 Task Creation Admission; ADR-0016 |
+| `cpt-cf-task-engine-fr-worker-principals` | §3.3 Authorization Model; §3.2 Event Consumer; §4.5; ADR-0016 |
+| `cpt-cf-task-engine-fr-type-trust` | §3.1 GTS Base Types, Hybrid Storage Model; §3.3 Authorization Model; §4.1 `trust_limits`; §4.2; ADR-0015, ADR-0016 |
 | `cpt-cf-task-engine-fr-gts-task-type` | §3.1 GTS Base Types; §3.1 Hybrid Storage Model |
 | `cpt-cf-task-engine-fr-gts-queue` | §3.1 GTS Base Types |
 | `cpt-cf-task-engine-fr-state-result-enums` | §3.1 State Machine (terminal/non-terminal); §3.7 `te_task_state` compact enum storage |
@@ -2606,6 +2660,7 @@ Consistent with PRD §4.2:
 - [ADR/0013-worker-transport.md](ADR/0013-worker-transport.md) — `cpt-cf-task-engine-adr-worker-transport`. REST long-poll worker transport; streaming deferred.
 - [ADR/0014-worker-identity.md](ADR/0014-worker-identity.md) — `cpt-cf-task-engine-adr-worker-identity`. Worker identity as (subject, `worker_id`).
 - [ADR/0015-gts-hybrid-model.md](ADR/0015-gts-hybrid-model.md) — `cpt-cf-task-engine-adr-gts-hybrid-model`. GTS for open sets, closed enums for control values.
+- [ADR/0016-authorization-model.md](ADR/0016-authorization-model.md) — `cpt-cf-task-engine-adr-authorization-model`. Type and queue in the PDP request; tenant plane for all task work; workers act as themselves.
 
 ### 5.3 Standards & External References
 

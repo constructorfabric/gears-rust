@@ -54,8 +54,9 @@ How it works:
 * **GTS entities (open)**: task types derive from `gts.cf.core.tasks.task.v1~`, queues are instances of `gts.cf.core.tasks.queue.v1~`, and entry types derive from `gts.cf.core.tasks.entry.v1~`. A task type declares input and output schemas and optional traits (concurrency limits, dedup and supersession, progress settings, type defaults).
 * **Engine enums (closed)**: task states, result codes, urgency, wait-condition kinds, timer types, dependency modes, and concurrency dimensions are SDK enums with fixed numeric codes. They are stored as small integers and sent on the wire as snake_case names.
 * **Not GTS**: tags are free-form, tenant-scoped strings.
-* **Storage**: base fields (state, urgency, priority, queue, owner, assignment, timestamps) are indexed columns. The task type is stored as the deterministic UUID of its GTS identifier. Input, context, output, and other payloads are opaque compressed columns (ADR-0006), validated against the type's schema at the API boundary.
+* **Storage**: base fields (state, urgency, priority, queue, owner, assignment, timestamps) are indexed columns. The task type is stored as its Registry Reference from the Types Registry SDK, with the schema revision used at creation. Input, context, output, and other payloads are opaque compressed columns (ADR-0006), validated against the type's schema at the API boundary.
 * **Enum evolution**: numeric codes are never reused or renumbered. Clients map unknown values to `Unknown`. Adding a value is a minor change.
+* **Trust**: registered values are untrusted. The Types Registry registration policy decides who may register; queues are platform-owned only. Types are resolved with the caller's visibility, and every declared value must be inside engine `trust_limits` (PRD §5.12 Task Type and Queue Trust).
 
 ### Consequences
 
@@ -63,7 +64,8 @@ How it works:
 * The engine must resolve types from the GTS registry and cache them. If the registry is down and a type is not cached, creation fails closed.
 * Payload search is not possible: the database cannot read inside opaque payloads. Search uses base fields, tags, and resource references only.
 * Adding a state or result code is an engine change, follows the enum evolution rules, and may need an ADR.
-* Type traits such as `dedup` must be validated when the engine first resolves the type, because consuming gears register types directly.
+* Type traits such as `dedup` must be validated when the engine first resolves the type, because consuming gears register types directly. Types Registry validation hooks, when available, move this check to registration.
+* A removed or unavailable type refuses new tasks; existing tasks run to the end.
 
 ### Confirmation
 
@@ -110,3 +112,4 @@ This decision directly addresses the following requirements or design elements:
 * `cpt-cf-task-engine-fr-tags` — tags are not GTS entities.
 * `cpt-cf-task-engine-fr-structured-io` — payloads validated against the type's schema.
 * `cpt-cf-task-engine-design-gts-types` — the GTS entities the engine registers.
+* `cpt-cf-task-engine-fr-type-trust` — registered values treated as untrusted.
