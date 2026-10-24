@@ -76,6 +76,7 @@ fn each_planner_reason_is_logged_by_its_own_name() {
         (DropReason::RoundCap, "round_cap"),
         (DropReason::TokenCap, "token_cap"),
         (DropReason::ModelFailed, "model_failed"),
+        (DropReason::RerunLimit, "rerun_limit"),
     ];
     let mut expected = Vec::new();
     for (reason, name) in cases {

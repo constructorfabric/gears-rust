@@ -1,4 +1,5 @@
 use toolkit_canonical_errors::{CanonicalError, Http, resource_error};
+use uuid::Uuid;
 
 use crate::domain::error::DomainError;
 use crate::domain::record_intake::Refusal;
@@ -70,6 +71,39 @@ pub fn for_settings(e: DomainError) -> CanonicalError {
         // @cpt-end:cpt-cf-construct-algo-subject-settings-owner-only:p1:inst-owner-refuse-return
         // The settings routes refuse no record; a refusal here is mapped like
         // any other error.
+        e @ (DomainError::Refused(_)
+        | DomainError::Unavailable(_)
+        | DomainError::Internal(_)
+        | DomainError::Database(_)) => e.into(),
+    }
+}
+
+/// Errors about a subject's facts.
+#[resource_error(gts_id!("cf.construct.subject.facts.v1~"))]
+pub struct SubjectFactsError;
+
+/// A manage-facts field longer than its limit, as an invalid-argument problem that names the field.
+#[must_use]
+pub fn too_long(field: &str, limit: usize) -> CanonicalError {
+    SubjectFactsError::invalid_argument()
+        .with_field_violation(field, format!("at most {limit} characters"), "too_long")
+        .create()
+}
+
+/// The REST answer for a domain error on the manage-facts route. A subject the caller may not act for answers as a
+/// subject that does not exist, so the answer reveals nothing about it. The gear's own failures are mapped as
+/// everywhere else.
+///
+/// @cpt-dod:cpt-cf-construct-dod-planner-manage-route:p1
+#[must_use]
+pub fn for_facts(e: DomainError, subject_id: Uuid) -> CanonicalError {
+    match e {
+        DomainError::Forbidden(msg) => {
+            tracing::warn!(msg = %msg, "construct subject facts access refused");
+            SubjectFactsError::not_found("no such subject")
+                .with_resource(subject_id.to_string())
+                .create()
+        }
         e @ (DomainError::Refused(_)
         | DomainError::Unavailable(_)
         | DomainError::Internal(_)

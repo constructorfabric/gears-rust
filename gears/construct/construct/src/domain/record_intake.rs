@@ -171,6 +171,10 @@ pub enum DropReason {
     TokenCap,
     /// Planner: a model call failed, reported no usage, or answered in a form the planner cannot use.
     ModelFailed,
+    /// Writer: the profile changed under every rerun the planner was allowed.
+    RerunLimit,
+    /// Processing: the planner does not decide on this record, because of its type or because it has no subject.
+    NotPlanned,
     /// A sensitive-data check failed, or answered outside the plan.
     CheckFailed,
     /// Admission: personalization is off for the subject.
@@ -204,6 +208,8 @@ impl DropReason {
             Self::BelowConfidenceFloor => "below_confidence_floor",
             Self::EntityKindNotAllowed => "entity_kind_not_allowed",
             Self::WriteCapExceeded => "write_cap_exceeded",
+            Self::RerunLimit => "rerun_limit",
+            Self::NotPlanned => "not_planned",
         }
     }
 }
