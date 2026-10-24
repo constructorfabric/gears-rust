@@ -20,6 +20,11 @@ pub struct ProxyClientConfig {
     /// connection, and for each response body frame after that.
     /// `None` disables both (callers then own all timeouts).
     pub read_timeout: Option<Duration>,
+    /// Upload stall budget: when the request body makes no progress for
+    /// this long after the response head arrived (e.g. the upstream holds
+    /// the flow-control window at zero), the connection is torn down.
+    /// `None` disables the watchdog.
+    pub write_timeout: Option<Duration>,
     /// How long a negotiated protocol is remembered per host. Zero disables
     /// the cache (every new TLS connection offers `h2` and `http/1.1`).
     pub protocol_cache_ttl: Duration,
@@ -38,6 +43,7 @@ impl Default for ProxyClientConfig {
         Self {
             connect_timeout: Duration::from_secs(10),
             read_timeout: Some(Duration::from_secs(30)),
+            write_timeout: Some(Duration::from_secs(30)),
             protocol_cache_ttl: Duration::from_secs(3600),
             pool: PoolConfig::default(),
             h1: H1Limits::default(),
@@ -115,9 +121,12 @@ pub struct H2Limits {
     /// Remotely reset streams pending accept before the connection errors.
     pub max_pending_accept_reset_streams: usize,
     /// Streams we reset because of peer errors before the connection is
-    /// torn down with `ENHANCE_YOUR_CALM` (MadeYouReset).
+    /// torn down with `ENHANCE_YOUR_CALM` (the "`MadeYouReset`" attack).
     pub max_local_error_reset_streams: usize,
-    /// Maximum buffered outbound data per stream.
+    /// Maximum buffered outbound data per stream. h2 buffers up to this
+    /// much regardless of the peer's flow-control window, and the upload
+    /// stall watchdog can only see a stall once the buffer is full, so this
+    /// also bounds what a zero-window peer can park per stream.
     pub max_send_buf_size: usize,
     /// Ping interval for liveness; `None` disables keep-alive pings.
     pub keep_alive_interval: Option<Duration>,
@@ -136,7 +145,7 @@ impl Default for H2Limits {
             max_concurrent_reset_streams: 64,
             max_pending_accept_reset_streams: 32,
             max_local_error_reset_streams: 128,
-            max_send_buf_size: 1024 * 1024,
+            max_send_buf_size: 64 * 1024,
             keep_alive_interval: Some(Duration::from_secs(30)),
             keep_alive_timeout: Duration::from_secs(10),
         }

@@ -71,7 +71,10 @@ async fn changed_endpoints_rebuild_without_invalidate() {
     assert!(!Arc::ptr_eq(&pool_v1, &pool_v2), "a changed list rebuilds");
 
     assert_eq!(selector.select(id, &v2).await.unwrap().endpoint.port, 20012);
-    assert!(Arc::ptr_eq(&pool_v2, &cached_pool()), "the same list reuses");
+    assert!(
+        Arc::ptr_eq(&pool_v2, &cached_pool()),
+        "the same list reuses"
+    );
 }
 
 #[tokio::test]
@@ -111,7 +114,10 @@ async fn select_empty_endpoints_returns_err() {
 async fn select_unresolvable_endpoints_returns_no_backends() {
     let selector = PoolEndpointSelector::new(ssrf_off());
     let endpoints = vec![ep("this.host.does.not.exist.invalid", 443, Scheme::Https)];
-    let err = selector.select(Uuid::new_v4(), &endpoints).await.unwrap_err();
+    let err = selector
+        .select(Uuid::new_v4(), &endpoints)
+        .await
+        .unwrap_err();
     assert!(matches!(err, SelectionError::NoBackendsResolved));
 }
 
@@ -188,7 +194,10 @@ async fn idle_sweeper_drops_idle_pools_and_stops_on_cancel() {
 async fn selector_ssrf_blocks_loopback() {
     let selector = PoolEndpointSelector::new(ssrf_on());
     let endpoints = vec![ep("127.0.0.1", 30001, Scheme::Http)];
-    let err = selector.select(Uuid::new_v4(), &endpoints).await.unwrap_err();
+    let err = selector
+        .select(Uuid::new_v4(), &endpoints)
+        .await
+        .unwrap_err();
     assert!(matches!(err, SelectionError::NoBackendsResolved));
 }
 
@@ -196,7 +205,10 @@ async fn selector_ssrf_blocks_loopback() {
 async fn selector_ssrf_blocks_localhost_hostname() {
     let selector = PoolEndpointSelector::new(ssrf_on());
     let endpoints = vec![ep("localhost", 9999, Scheme::Https)];
-    let err = selector.select(Uuid::new_v4(), &endpoints).await.unwrap_err();
+    let err = selector
+        .select(Uuid::new_v4(), &endpoints)
+        .await
+        .unwrap_err();
     assert!(matches!(err, SelectionError::NoBackendsResolved));
 }
 

@@ -10,7 +10,10 @@ use arc_swap::ArcSwap;
 use tokio::time::{Instant, Interval, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
 
-use super::{AddressFilter, AllowAll, Balancer, DnsResolver, HealthCheck, Resolver, RoundRobin, TcpHealthCheck};
+use super::{
+    AddressFilter, AllowAll, Balancer, DnsResolver, HealthCheck, Resolver, RoundRobin,
+    TcpHealthCheck,
+};
 
 /// A logical endpoint: the caller's descriptor plus the name to resolve.
 #[derive(Debug, Clone)]

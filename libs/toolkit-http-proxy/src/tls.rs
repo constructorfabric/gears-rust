@@ -9,7 +9,7 @@ use crate::error::{ErrorKind, ProxyError};
 
 /// What the client offers via ALPN.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum AlpnOffer {
+pub enum AlpnOffer {
     H2AndH1,
     H1,
     H2,
@@ -17,14 +17,14 @@ pub(crate) enum AlpnOffer {
 
 /// Connectors sharing one base `ClientConfig` (and thus one TLS session
 /// cache per ALPN variant).
-pub(crate) struct TlsConnectors {
+pub struct TlsConnectors {
     h2_and_h1: TlsConnector,
     h1: TlsConnector,
     h2: TlsConnector,
 }
 
 impl TlsConnectors {
-    pub(crate) fn build(opts: &TlsOptions) -> Result<Self, ProxyError> {
+    pub fn build(opts: &TlsOptions) -> Result<Self, ProxyError> {
         let mut base = base_config(opts)?;
         apply_verification(&mut base, opts.verification)?;
 
@@ -42,7 +42,7 @@ impl TlsConnectors {
         })
     }
 
-    pub(crate) fn get(&self, offer: AlpnOffer) -> &TlsConnector {
+    pub fn get(&self, offer: AlpnOffer) -> &TlsConnector {
         match offer {
             AlpnOffer::H2AndH1 => &self.h2_and_h1,
             AlpnOffer::H1 => &self.h1,
@@ -53,11 +53,19 @@ impl TlsConnectors {
 
 fn base_config(opts: &TlsOptions) -> Result<rustls::ClientConfig, ProxyError> {
     let config_err = |e: toolkit_http::TlsConfigError| {
-        ProxyError::new(ErrorKind::Configuration, "failed to build TLS client config").with_source(e)
+        ProxyError::new(
+            ErrorKind::Configuration,
+            "failed to build TLS client config",
+        )
+        .with_source(e)
     };
     match &opts.roots {
-        RootStore::Native => toolkit_http::native_roots_client_config(&opts.settings).map_err(config_err),
-        RootStore::WebPki => toolkit_http::webpki_roots_client_config(&opts.settings).map_err(config_err),
+        RootStore::Native => {
+            toolkit_http::native_roots_client_config(&opts.settings).map_err(config_err)
+        }
+        RootStore::WebPki => {
+            toolkit_http::webpki_roots_client_config(&opts.settings).map_err(config_err)
+        }
         RootStore::Custom(roots) => {
             toolkit_http::custom_roots_client_config((**roots).clone(), &opts.settings)
                 .map_err(config_err)
@@ -72,6 +80,7 @@ fn base_config(opts: &TlsOptions) -> Result<rustls::ClientConfig, ProxyError> {
 }
 
 #[allow(clippy::unnecessary_wraps)] // fallible only with `test-utils`
+#[cfg_attr(not(feature = "test-utils"), allow(unused_variables))]
 fn apply_verification(
     cfg: &mut rustls::ClientConfig,
     mode: CertVerification,
@@ -141,7 +150,12 @@ mod danger {
             cert: &CertificateDer<'_>,
             dss: &DigitallySignedStruct,
         ) -> Result<HandshakeSignatureValid, rustls::Error> {
-            verify_tls12_signature(message, cert, dss, &self.0.signature_verification_algorithms)
+            verify_tls12_signature(
+                message,
+                cert,
+                dss,
+                &self.0.signature_verification_algorithms,
+            )
         }
 
         fn verify_tls13_signature(
@@ -150,7 +164,12 @@ mod danger {
             cert: &CertificateDer<'_>,
             dss: &DigitallySignedStruct,
         ) -> Result<HandshakeSignatureValid, rustls::Error> {
-            verify_tls13_signature(message, cert, dss, &self.0.signature_verification_algorithms)
+            verify_tls13_signature(
+                message,
+                cert,
+                dss,
+                &self.0.signature_verification_algorithms,
+            )
         }
 
         fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {

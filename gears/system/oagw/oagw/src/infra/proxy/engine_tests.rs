@@ -56,7 +56,9 @@ fn authority_uses_the_endpoint_port_not_the_resolved_one() {
 
 #[test]
 fn ssrf_filter_reports_reason() {
-    let on = SsrfFilter(Arc::new(SsrfGuard::from_config(&Default::default()).unwrap()));
+    let on = SsrfFilter(Arc::new(
+        SsrfGuard::from_config(&Default::default()).unwrap(),
+    ));
     assert!(on.check(&addr(80)).is_err());
     assert!(on.check(&"93.184.216.34:443".parse().unwrap()).is_ok());
     let off = SsrfFilter(Arc::new(SsrfGuard::disabled()));
@@ -82,25 +84,42 @@ async fn resolve_fallback_applies_ssrf_policy() {
         resolved_addr: None,
     };
     let err = guarded.target(&selected, "/i").await.unwrap_err();
-    assert!(matches!(err, DomainError::LinkUnavailable { .. }), "{err:?}");
+    assert!(
+        matches!(err, DomainError::LinkUnavailable { .. }),
+        "{err:?}"
+    );
 
     let open = ProxyEngine::new(&settings, Arc::new(SsrfGuard::disabled())).unwrap();
     let t = open.target(&selected, "/i").await.unwrap();
     assert!(t.addr().ip().is_loopback());
 }
 
+type Check = fn(&DomainError) -> bool;
+
 #[test]
 fn error_mapping_matches_the_previous_engine() {
     use toolkit_http_proxy::ErrorKind as K;
-    let cases: [(K, fn(&DomainError) -> bool); 8] = [
-        (K::ConnectTimeout, |e| matches!(e, DomainError::ConnectionTimeout { .. })),
-        (K::ReadTimeout, |e| matches!(e, DomainError::RequestTimeout { .. })),
+    let cases: [(K, Check); 8] = [
+        (K::ConnectTimeout, |e| {
+            matches!(e, DomainError::ConnectionTimeout { .. })
+        }),
+        (K::ReadTimeout, |e| {
+            matches!(e, DomainError::RequestTimeout { .. })
+        }),
         (K::Http2, |e| matches!(e, DomainError::ProtocolError { .. })),
         (K::Read, |e| matches!(e, DomainError::StreamAborted { .. })),
-        (K::Connect, |e| matches!(e, DomainError::LinkUnavailable { .. })),
-        (K::ConnectNoRoute, |e| matches!(e, DomainError::LinkUnavailable { .. })),
-        (K::ConnectRefused, |e| matches!(e, DomainError::DownstreamError { .. })),
-        (K::InvalidCertificate, |e| matches!(e, DomainError::DownstreamError { .. })),
+        (K::Connect, |e| {
+            matches!(e, DomainError::LinkUnavailable { .. })
+        }),
+        (K::ConnectNoRoute, |e| {
+            matches!(e, DomainError::LinkUnavailable { .. })
+        }),
+        (K::ConnectRefused, |e| {
+            matches!(e, DomainError::DownstreamError { .. })
+        }),
+        (K::InvalidCertificate, |e| {
+            matches!(e, DomainError::DownstreamError { .. })
+        }),
     ];
     for (kind, check) in cases {
         let err = map_proxy_error(&test_error(kind), "/x");

@@ -22,13 +22,13 @@ pub enum CachedProtocol {
 
 /// Remembers the negotiated protocol per `scheme://host:port` for `ttl`.
 /// A zero `ttl` disables the cache.
-pub(crate) struct ProtocolCache {
+pub struct ProtocolCache {
     entries: DashMap<String, (CachedProtocol, Instant)>,
     ttl: Duration,
 }
 
 impl ProtocolCache {
-    pub(crate) fn new(ttl: Duration) -> Self {
+    pub fn new(ttl: Duration) -> Self {
         Self {
             entries: DashMap::new(),
             ttl,
@@ -39,7 +39,7 @@ impl ProtocolCache {
         !self.ttl.is_zero()
     }
 
-    pub(crate) fn get(&self, target: &Target) -> Option<CachedProtocol> {
+    pub fn get(&self, target: &Target) -> Option<CachedProtocol> {
         if !self.enabled() {
             return None;
         }
@@ -55,7 +55,7 @@ impl ProtocolCache {
         }
     }
 
-    pub(crate) fn record(&self, target: &Target, proto: CachedProtocol) {
+    pub fn record(&self, target: &Target, proto: CachedProtocol) {
         if !self.enabled() {
             return;
         }
@@ -71,7 +71,7 @@ impl ProtocolCache {
             .insert(target.protocol_key(), (proto, Instant::now()));
     }
 
-    pub(crate) fn evict(&self, target: &Target) {
+    pub fn evict(&self, target: &Target) {
         if self.enabled() {
             self.entries.remove(&target.protocol_key());
         }
@@ -87,7 +87,11 @@ mod tests {
     use crate::target::Transport;
 
     fn target(host: &str, port: u16) -> Target {
-        Target::new(SocketAddr::from(([127, 0, 0, 1], port)), host, Transport::Tls)
+        Target::new(
+            SocketAddr::from(([127, 0, 0, 1], port)),
+            host,
+            Transport::Tls,
+        )
     }
 
     #[tokio::test]

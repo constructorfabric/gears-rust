@@ -1,5 +1,12 @@
 //! Functional tests of the proxy engine against real local upstreams.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::let_underscore_must_use,
+    clippy::use_debug
+)]
+
 mod support;
 
 use std::sync::Arc;
@@ -14,8 +21,8 @@ use hyper::body::{Frame, Incoming};
 use support::{Wire, body_string, client, echo, test_config, text, upstream};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use toolkit_http_proxy::{
-    CachedProtocol, ConnectionInfo, ErrorKind, Observer, ProxyClient, RootStore, Target,
-    Transport, UpgradeOutcome, empty_body, full_body, stream_body,
+    CachedProtocol, ConnectionInfo, ErrorKind, Observer, ProxyClient, RootStore, Target, Transport,
+    UpgradeOutcome, empty_body, full_body, stream_body,
 };
 
 fn get(path: &str) -> Request<toolkit_http_proxy::ProxyBody> {
@@ -36,7 +43,10 @@ async fn h1_round_trip_and_keep_alive_reuse() {
         let body = body_string(resp).await;
         assert_eq!(
             body,
-            format!("POST /items/{i}?q=1 HTTP/1.1 host=localhost:{} len=5", up.addr.port())
+            format!(
+                "POST /items/{i}?q=1 HTTP/1.1 host=localhost:{} len=5",
+                up.addr.port()
+            )
         );
     }
     assert_eq!(up.accepted(), 1, "keep-alive connection is reused");
@@ -67,13 +77,18 @@ async fn h2_over_tls_multiplexes_one_connection() {
     let tasks: Vec<_> = (0..20)
         .map(|_| {
             let (c, t) = (c.clone(), t.clone());
-            tokio::spawn(async move { body_string(c.send(&t, get("/v1/models")).await.unwrap()).await })
+            tokio::spawn(
+                async move { body_string(c.send(&t, get("/v1/models")).await.unwrap()).await },
+            )
         })
         .collect();
     for task in tasks {
         let body = task.await.unwrap();
         assert!(
-            body.starts_with(&format!("GET https://localhost:{}/v1/models HTTP/2.0", up.addr.port())),
+            body.starts_with(&format!(
+                "GET https://localhost:{}/v1/models HTTP/2.0",
+                up.addr.port()
+            )),
             "{body}"
         );
     }
@@ -88,14 +103,26 @@ async fn alpn_negotiates_and_caches_per_host() {
     let c = client();
 
     let tb = both.target(Wire::TlsBoth);
-    assert!(body_string(c.send(&tb, get("/")).await.unwrap()).await.contains("HTTP/2.0"));
+    assert!(
+        body_string(c.send(&tb, get("/")).await.unwrap())
+            .await
+            .contains("HTTP/2.0")
+    );
     assert_eq!(c.cached_protocol(&tb), Some(CachedProtocol::Http2));
 
     let t1 = h1.target(Wire::TlsH1);
-    assert!(body_string(c.send(&t1, get("/")).await.unwrap()).await.contains("HTTP/1.1"));
+    assert!(
+        body_string(c.send(&t1, get("/")).await.unwrap())
+            .await
+            .contains("HTTP/1.1")
+    );
     assert_eq!(c.cached_protocol(&t1), Some(CachedProtocol::Http1Only));
     // Cached HTTP/1.1 keeps using the pooled connection.
-    assert!(body_string(c.send(&t1, get("/")).await.unwrap()).await.contains("HTTP/1.1"));
+    assert!(
+        body_string(c.send(&t1, get("/")).await.unwrap())
+            .await
+            .contains("HTTP/1.1")
+    );
     assert_eq!(h1.accepted(), 1);
 }
 
@@ -107,7 +134,11 @@ async fn disabled_protocol_cache_still_pools() {
     let c = ProxyClient::new(cfg).unwrap();
     let t = up.target(Wire::TlsH1);
     for _ in 0..3 {
-        assert!(body_string(c.send(&t, get("/")).await.unwrap()).await.contains("HTTP/1.1"));
+        assert!(
+            body_string(c.send(&t, get("/")).await.unwrap())
+                .await
+                .contains("HTTP/1.1")
+        );
     }
     assert_eq!(c.cached_protocol(&t), None);
     assert_eq!(up.accepted(), 1);
@@ -126,9 +157,8 @@ async fn streaming_request_bodies_are_forwarded() {
     for wire in [Wire::Plain, Wire::TlsH2] {
         let up = echo(wire).await;
         let c = client();
-        let chunks = stream::iter(
-            (0..10).map(|_| Ok::<_, std::io::Error>(Bytes::from(vec![b'x'; 1000]))),
-        );
+        let chunks =
+            stream::iter((0..10).map(|_| Ok::<_, std::io::Error>(Bytes::from(vec![b'x'; 1000]))));
         let req = Request::post("/upload").body(stream_body(chunks)).unwrap();
         let body = body_string(c.send(&up.target(wire), req).await.unwrap()).await;
         assert!(body.ends_with("len=10000"), "{wire:?}: {body}");
@@ -166,7 +196,10 @@ async fn body_idle_timeout() {
     let up = upstream(Wire::Plain, |_req: Request<Incoming>| async {
         let frames = stream::unfold(0u8, |n| async move {
             if n == 0 {
-                Some((Ok::<_, std::convert::Infallible>(Frame::data(Bytes::from_static(b"first"))), 1))
+                Some((
+                    Ok::<_, std::convert::Infallible>(Frame::data(Bytes::from_static(b"first"))),
+                    1,
+                ))
             } else {
                 tokio::time::sleep(Duration::from_secs(5)).await;
                 None
@@ -204,7 +237,10 @@ async fn untrusted_certificate_is_rejected() {
     let mut cfg = test_config();
     cfg.tls.roots = RootStore::WebPki;
     let c = ProxyClient::new(cfg).unwrap();
-    let err = c.send(&up.target(Wire::TlsBoth), get("/")).await.unwrap_err();
+    let err = c
+        .send(&up.target(Wire::TlsBoth), get("/"))
+        .await
+        .unwrap_err();
     assert_eq!(err.kind(), ErrorKind::InvalidCertificate, "{err}");
 }
 
@@ -252,7 +288,10 @@ async fn half_read_body_closes_the_connection() {
     let mut body = resp.into_body();
     let _ = body.frame().await;
     drop(body);
-    assert_eq!(body_string(c.send(&t, get("/s")).await.unwrap()).await, "small");
+    assert_eq!(
+        body_string(c.send(&t, get("/s")).await.unwrap()).await,
+        "small"
+    );
     assert_eq!(up.accepted(), 2, "a half-read connection is never reused");
 }
 
@@ -262,10 +301,32 @@ async fn pool_is_keyed_by_server_name() {
     let c = client();
     let a = Target::new(up.addr, "localhost", Transport::Tls);
     let b = Target::new(up.addr, "127.0.0.1", Transport::Tls);
-    c.send(&a, get("/")).await.unwrap().into_body().collect().await.unwrap();
-    c.send(&b, get("/")).await.unwrap().into_body().collect().await.unwrap();
-    c.send(&a, get("/")).await.unwrap().into_body().collect().await.unwrap();
-    assert_eq!(up.accepted(), 2, "same address, different SNI: separate connections");
+    c.send(&a, get("/"))
+        .await
+        .unwrap()
+        .into_body()
+        .collect()
+        .await
+        .unwrap();
+    c.send(&b, get("/"))
+        .await
+        .unwrap()
+        .into_body()
+        .collect()
+        .await
+        .unwrap();
+    c.send(&a, get("/"))
+        .await
+        .unwrap()
+        .into_body()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(
+        up.accepted(),
+        2,
+        "same address, different SNI: separate connections"
+    );
 }
 
 #[derive(Default)]
@@ -318,8 +379,10 @@ async fn ws_echo(wire: Wire) -> support::Upstream {
         });
         let mut resp = text("");
         *resp.status_mut() = StatusCode::SWITCHING_PROTOCOLS;
-        resp.headers_mut().insert("upgrade", "websocket".parse().unwrap());
-        resp.headers_mut().insert("connection", "upgrade".parse().unwrap());
+        resp.headers_mut()
+            .insert("upgrade", "websocket".parse().unwrap());
+        resp.headers_mut()
+            .insert("connection", "upgrade".parse().unwrap());
         resp
     })
     .await
@@ -339,7 +402,10 @@ fn ws_request() -> Request<toolkit_http_proxy::ProxyBody> {
 async fn websocket_upgrade_tunnels_after_101() {
     for wire in [Wire::Plain, Wire::TlsBoth] {
         let up = ws_echo(wire).await;
-        let outcome = client().upgrade(&up.target(wire), ws_request()).await.unwrap();
+        let outcome = client()
+            .upgrade(&up.target(wire), ws_request())
+            .await
+            .unwrap();
         let UpgradeOutcome::Switched { response, io } = outcome else {
             panic!("{wire:?}: expected a switch");
         };
@@ -356,7 +422,10 @@ async fn websocket_upgrade_tunnels_after_101() {
 #[tokio::test]
 async fn websocket_rejection_is_a_plain_response() {
     let up = echo(Wire::Plain).await;
-    let outcome = client().upgrade(&up.target(Wire::Plain), ws_request()).await.unwrap();
+    let outcome = client()
+        .upgrade(&up.target(Wire::Plain), ws_request())
+        .await
+        .unwrap();
     let UpgradeOutcome::Rejected(resp) = outcome else {
         panic!("expected rejection");
     };
@@ -374,7 +443,10 @@ async fn invalid_upgrade_requests_never_leave() {
         .body(empty_body())
         .unwrap();
     assert_eq!(
-        c.upgrade(&up.target(Wire::Plain), post).await.unwrap_err().kind(),
+        c.upgrade(&up.target(Wire::Plain), post)
+            .await
+            .unwrap_err()
+            .kind(),
         ErrorKind::InvalidRequest
     );
     let h2c = Request::get("/")
@@ -383,7 +455,10 @@ async fn invalid_upgrade_requests_never_leave() {
         .body(empty_body())
         .unwrap();
     assert_eq!(
-        c.upgrade(&up.target(Wire::Plain), h2c).await.unwrap_err().kind(),
+        c.upgrade(&up.target(Wire::Plain), h2c)
+            .await
+            .unwrap_err()
+            .kind(),
         ErrorKind::InvalidRequest
     );
     assert_eq!(up.accepted(), 0);
@@ -392,6 +467,9 @@ async fn invalid_upgrade_requests_never_leave() {
 #[tokio::test]
 async fn http_version_of_response_is_reported() {
     let up = echo(Wire::TlsH2).await;
-    let resp = client().send(&up.target(Wire::TlsH2), get("/")).await.unwrap();
+    let resp = client()
+        .send(&up.target(Wire::TlsH2), get("/"))
+        .await
+        .unwrap();
     assert_eq!(resp.version(), Version::HTTP_2);
 }

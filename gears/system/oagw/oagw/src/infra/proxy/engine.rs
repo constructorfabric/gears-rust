@@ -207,12 +207,10 @@ pub(crate) fn map_proxy_error(err: &ProxyError, instance: &str) -> DomainError {
             detail: "upstream connection refused".into(),
             instance,
         },
-        ErrorKind::TlsHandshake | ErrorKind::TlsHandshakeTimeout => {
-            DomainError::DownstreamError {
-                detail: "upstream TLS handshake failed".into(),
-                instance,
-            }
-        }
+        ErrorKind::TlsHandshake | ErrorKind::TlsHandshakeTimeout => DomainError::DownstreamError {
+            detail: "upstream TLS handshake failed".into(),
+            instance,
+        },
         ErrorKind::InvalidCertificate => DomainError::DownstreamError {
             detail: "upstream certificate invalid".into(),
             instance,
@@ -236,10 +234,7 @@ pub(crate) fn map_proxy_error(err: &ProxyError, instance: &str) -> DomainError {
 
 /// Adapt an engine response body to the SDK body stream.
 pub(crate) fn into_body_stream(body: ResponseBody) -> BodyStream {
-    Box::pin(
-        body.into_data_stream()
-            .map_err(|e| Box::new(e) as BoxError),
-    )
+    Box::pin(body.into_data_stream().map_err(|e| Box::new(e) as BoxError))
 }
 
 /// Logs connection reuse at debug level.

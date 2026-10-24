@@ -128,7 +128,10 @@ impl ProxyError {
 
     /// Classify a TLS handshake failure surfaced by `tokio-rustls`.
     pub(crate) fn from_tls_io(err: io::Error) -> Self {
-        let kind = match err.get_ref().and_then(|e| e.downcast_ref::<rustls::Error>()) {
+        let kind = match err
+            .get_ref()
+            .and_then(|e| e.downcast_ref::<rustls::Error>())
+        {
             Some(
                 rustls::Error::InvalidCertificate(_) | rustls::Error::InvalidCertRevocationList(_),
             ) => ErrorKind::InvalidCertificate,
@@ -246,7 +249,10 @@ mod tests {
             io::ErrorKind::InvalidData,
             rustls::Error::HandshakeNotComplete,
         );
-        assert_eq!(ProxyError::from_tls_io(other).kind(), ErrorKind::TlsHandshake);
+        assert_eq!(
+            ProxyError::from_tls_io(other).kind(),
+            ErrorKind::TlsHandshake
+        );
         let reset = io::Error::from(io::ErrorKind::ConnectionReset);
         assert_eq!(
             ProxyError::from_tls_io(reset).kind(),

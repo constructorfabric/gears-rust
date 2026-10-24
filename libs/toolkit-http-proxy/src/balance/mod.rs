@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 
-pub use pool::{BackendPool, BackendPoolOptions, Member, SelectError, Seed};
+pub use pool::{BackendPool, BackendPoolOptions, Member, Seed, SelectError};
 pub use resolve::{DnsResolver, Resolver};
 
 /// Decides whether a resolved address may be connected to (SSRF policy).

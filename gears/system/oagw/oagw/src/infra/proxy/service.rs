@@ -11,8 +11,8 @@ use http::{HeaderMap, HeaderValue};
 use oagw_sdk::body::{Body, BodyStream};
 use oagw_sdk::{field, reason};
 use tokio::sync::watch;
-use toolkit_http_proxy::{UpgradeOutcome, empty_body, full_body, stream_body};
 use tokio_util::sync::CancellationToken;
+use toolkit_http_proxy::{UpgradeOutcome, empty_body, full_body, stream_body};
 use toolkit_security::SecurityContext;
 
 use uuid::Uuid;
@@ -945,16 +945,16 @@ impl DataPlaneServiceImpl {
         let req = build_outbound_request(method, url, headers, empty_body(), instance_uri)?;
 
         let upgrade_timeout = self.request_timeout;
-        let outcome = tokio::time::timeout(
-            upgrade_timeout,
-            self.engine.client().upgrade(target, req),
-        )
-        .await
-        .map_err(|_| DomainError::RequestTimeout {
-            detail: format!("WebSocket upgrade to {url} timed out after {upgrade_timeout:?}"),
-            instance: instance_uri.to_string(),
-        })?
-        .map_err(|e| map_proxy_error(&e, instance_uri))?;
+        let outcome =
+            tokio::time::timeout(upgrade_timeout, self.engine.client().upgrade(target, req))
+                .await
+                .map_err(|_| DomainError::RequestTimeout {
+                    detail: format!(
+                        "WebSocket upgrade to {url} timed out after {upgrade_timeout:?}"
+                    ),
+                    instance: instance_uri.to_string(),
+                })?
+                .map_err(|e| map_proxy_error(&e, instance_uri))?;
 
         let (response, io) = match outcome {
             UpgradeOutcome::Switched { response, io } => (response, io),
@@ -1037,19 +1037,16 @@ impl DataPlaneServiceImpl {
     ) -> Result<http::Response<Body>, DomainError> {
         let body_state = Arc::new(StreamedBodyState::default());
         let body = match body_stream {
-            Some(stream) => stream_body(limit_body_stream(
-                stream,
-                max_body,
-                Arc::clone(&body_state),
-            )),
+            Some(stream) => {
+                stream_body(limit_body_stream(stream, max_body, Arc::clone(&body_state)))
+            }
             None => full_body(body_bytes),
         };
         let req =
             build_outbound_request(method, url, outbound_headers.clone(), body, instance_uri)?;
 
         let timeout = self.request_timeout;
-        let outcome =
-            tokio::time::timeout(timeout, self.engine.client().send(target, req)).await;
+        let outcome = tokio::time::timeout(timeout, self.engine.client().send(target, req)).await;
 
         // A failure on our side of the body wins over whatever the upstream
         // made of the aborted request.
@@ -1126,10 +1123,12 @@ impl StreamedBodyState {
                 instance: instance_uri.to_string(),
             });
         }
-        self.failed.get().map(|reason| DomainError::DownstreamError {
-            detail: format!("streaming request body failed mid-stream: {reason}"),
-            instance: instance_uri.to_string(),
-        })
+        self.failed
+            .get()
+            .map(|reason| DomainError::DownstreamError {
+                detail: format!("streaming request body failed mid-stream: {reason}"),
+                instance: instance_uri.to_string(),
+            })
     }
 }
 

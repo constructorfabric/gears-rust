@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use dashmap::DashMap;
 use tokio_util::sync::CancellationToken;
 use toolkit_http_proxy::balance::{
-    BackendPool, BackendPoolOptions, DnsResolver, SelectError, Seed, TcpHealthCheck,
+    BackendPool, BackendPoolOptions, DnsResolver, Seed, SelectError, TcpHealthCheck,
 };
 use tracing::debug;
 use uuid::Uuid;

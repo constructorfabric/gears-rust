@@ -75,9 +75,14 @@ pub fn sanitize_request_headers(headers: &mut HeaderMap, kind: RequestKind) {
 /// Sanitize upstream response headers in place.
 ///
 /// A `101` keeps `Connection` and `Upgrade` (but nothing else they
-/// nominate); every other status loses all hop-by-hop headers. Framing
-/// (`Content-Length`) is kept: it describes the body the caller relays.
+/// nominate); every other status loses all hop-by-hop headers.
+/// `Content-Length` is kept when it is the framing the body was decoded
+/// with, and dropped when `Transfer-Encoding` was present too: the body was
+/// then decoded as chunked and the length is a lie (RFC 9112 §6.3).
 pub fn sanitize_response_headers(headers: &mut HeaderMap, status: StatusCode) {
+    if headers.contains_key(header::TRANSFER_ENCODING) {
+        headers.remove(header::CONTENT_LENGTH);
+    }
     if status == StatusCode::SWITCHING_PROTOCOLS {
         strip_connection_nominated(headers, &["upgrade"]);
         for name in HOP_BY_HOP_HEADERS {

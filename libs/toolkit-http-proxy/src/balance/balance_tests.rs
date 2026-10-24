@@ -165,7 +165,10 @@ async fn refresh_picks_up_dns_changes_and_keeps_health() {
     pool.refresh().await;
     let members = pool.members();
     assert_eq!(members.len(), 2);
-    let old = members.iter().find(|m| m.addr().ip() == IpAddr::from([10, 0, 0, 1])).unwrap();
+    let old = members
+        .iter()
+        .find(|m| m.addr().ip() == IpAddr::from([10, 0, 0, 1]))
+        .unwrap();
     assert!(!old.is_healthy(), "health carries over");
     assert_eq!(pool.select().unwrap().1, "10.0.0.2:80".parse().unwrap());
 }
@@ -183,9 +186,15 @@ async fn health_checks_drive_selection() {
         assert_eq!(pool.select().unwrap().1, "10.0.0.2:80".parse().unwrap());
     }
 
-    *down.0.lock() = vec!["10.0.0.1:80".parse().unwrap(), "10.0.0.2:80".parse().unwrap()];
+    *down.0.lock() = vec![
+        "10.0.0.1:80".parse().unwrap(),
+        "10.0.0.2:80".parse().unwrap(),
+    ];
     pool.run_health_checks().await;
-    assert_eq!(pool.select().unwrap_err(), SelectError::AllBackendsUnhealthy);
+    assert_eq!(
+        pool.select().unwrap_err(),
+        SelectError::AllBackendsUnhealthy
+    );
 
     down.0.lock().clear();
     pool.run_health_checks().await;
@@ -207,7 +216,11 @@ async fn background_task_refreshes_and_stops_on_drop() {
 
     drop(pool);
     tokio::time::sleep(Duration::from_secs(120)).await;
-    assert_eq!(resolver.calls.load(Ordering::Relaxed), 2, "no refresh after drop");
+    assert_eq!(
+        resolver.calls.load(Ordering::Relaxed),
+        2,
+        "no refresh after drop"
+    );
 }
 
 #[tokio::test]
@@ -239,7 +252,11 @@ async fn dns_resolver_short_circuits_ip_literals() {
 async fn dns_resolver_resolves_localhost() {
     let r = DnsResolver { backoff: vec![] };
     let addrs = r.resolve("localhost", 9001).await.unwrap();
-    assert!(addrs.iter().all(|a| a.ip().is_loopback() && a.port() == 9001));
+    assert!(
+        addrs
+            .iter()
+            .all(|a| a.ip().is_loopback() && a.port() == 9001)
+    );
     assert!(!addrs.is_empty());
 }
 

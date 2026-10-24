@@ -5,8 +5,8 @@
 use std::convert::Infallible;
 use std::future::Future;
 use std::net::SocketAddr;
-use std::sync::{Arc, OnceLock};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use bytes::Bytes;
 use http_body_util::combinators::BoxBody;
@@ -95,6 +95,8 @@ pub enum Wire {
     TlsH1,
     TlsH2,
     TlsBoth,
+    /// TLS without any ALPN support.
+    TlsNoAlpn,
 }
 
 /// A running upstream; counts accepted TCP connections.
@@ -135,6 +137,7 @@ where
         Wire::TlsH1 => Some(server_tls(&[b"http/1.1"])),
         Wire::TlsH2 => Some(server_tls(&[b"h2"])),
         Wire::TlsBoth => Some(server_tls(&[b"h2", b"http/1.1"])),
+        Wire::TlsNoAlpn => Some(server_tls(&[])),
         Wire::Plain | Wire::PlainH2 => None,
     }
     .map(|cfg| TlsAcceptor::from(Arc::new(cfg)));
@@ -142,7 +145,9 @@ where
     let counter = connections.clone();
     tokio::spawn(async move {
         loop {
-            let Ok((tcp, _)) = listener.accept().await else { continue };
+            let Ok((tcp, _)) = listener.accept().await else {
+                continue;
+            };
             counter.fetch_add(1, Ordering::SeqCst);
             let (handler, acceptor) = (handler.clone(), acceptor.clone());
             tokio::spawn(async move {
@@ -159,10 +164,15 @@ where
                             .await;
                     }
                     (Wire::PlainH2, None) => {
-                        let _ = builder.http2_only().serve_connection(TokioIo::new(tcp), svc).await;
+                        let _ = builder
+                            .http2_only()
+                            .serve_connection(TokioIo::new(tcp), svc)
+                            .await;
                     }
                     (_, Some(acceptor)) => {
-                        let Ok(tls) = acceptor.accept(tcp).await else { return };
+                        let Ok(tls) = acceptor.accept(tcp).await else {
+                            return;
+                        };
                         if wire == Wire::TlsH2 {
                             builder = builder.http2_only();
                         }
@@ -192,7 +202,11 @@ pub async fn echo(wire: Wire) -> Upstream {
             .get(http::header::HOST)
             .map(|h| h.to_str().unwrap_or("").to_owned())
             .unwrap_or_default();
-        let n = req.into_body().collect().await.map(|b| b.to_bytes().len()).unwrap_or(0);
+        let n = req
+            .into_body()
+            .collect()
+            .await
+            .map_or(0, |b| b.to_bytes().len());
         text(format!("{line} host={host} len={n}"))
     })
     .await

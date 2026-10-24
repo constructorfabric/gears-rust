@@ -4,33 +4,40 @@
 //! address, the TLS server name and the transport. Two upstreams that share
 //! an IP but present different SNI never share a TLS connection.
 //!
-//! - HTTP/1.1: a LIFO stack of idle senders per key. A sender is put back
-//!   only when the previous response body reached its clean end; a
+//! - HTTP/1.1: a LIFO stack of idle connections per key. A connection is put
+//!   back only when the previous response body reached its clean end; a
 //!   half-read or failed exchange closes the connection instead.
-//! - HTTP/2: one multiplexed sender per key, replaced when closed.
+//! - HTTP/2: one multiplexed connection per key. Each connection carries a
+//!   generation number, so a failure observed on an old connection never
+//!   evicts its replacement, and an active-stream count, so the reaper never
+//!   detaches a connection that is still serving responses.
+//!
+//! Every connection task can be killed through its [`ConnHandle`]; the
+//! engine uses that to tear down connections whose request upload stalled.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use dashmap::DashMap;
 use hyper::client::conn::{http1, http2};
 use tokio::time::Instant;
+use tokio_util::sync::CancellationToken;
 
 use crate::body::ProxyBody;
 use crate::config::PoolConfig;
 use crate::target::{Target, Transport};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) struct PoolKey {
+pub struct PoolKey {
     addr: SocketAddr,
     server_name: Arc<str>,
     transport: Transport,
 }
 
 impl PoolKey {
-    pub(crate) fn of(target: &Target) -> Self {
+    pub fn of(target: &Target) -> Self {
         Self {
             addr: target.addr(),
             server_name: Arc::from(target.server_name()),
@@ -39,33 +46,65 @@ impl PoolKey {
     }
 }
 
+/// Identity of one upstream connection and the switch that kills its task.
+#[derive(Debug, Clone)]
+pub struct ConnHandle {
+    pub generation: u64,
+    pub kill: CancellationToken,
+}
+
 struct IdleH1 {
     sender: http1::SendRequest<ProxyBody>,
+    conn: ConnHandle,
     since: Instant,
+}
+
+struct H2Entry {
+    sender: http2::SendRequest<ProxyBody>,
+    conn: ConnHandle,
 }
 
 /// The HTTP/2 connection for one key plus a lock that serialises
 /// establishing it, so a burst of first requests opens one connection.
-pub(crate) struct H2Slot {
-    sender: parking_lot::Mutex<Option<http2::SendRequest<ProxyBody>>>,
-    pub(crate) connecting: tokio::sync::Mutex<()>,
+pub struct H2Slot {
+    entry: parking_lot::Mutex<Option<H2Entry>>,
+    pub connecting: tokio::sync::Mutex<()>,
     last_used: AtomicU64,
+    active: AtomicUsize,
 }
 
-pub(crate) struct Pool {
+/// An HTTP/2 sender checked out for one exchange.
+pub struct H2Lease {
+    pub sender: http2::SendRequest<ProxyBody>,
+    pub conn: ConnHandle,
+    pub active: ActiveStream,
+}
+
+/// Counts one in-flight exchange on an HTTP/2 slot until dropped.
+pub struct ActiveStream(Arc<H2Slot>);
+
+impl Drop for ActiveStream {
+    fn drop(&mut self) {
+        self.0.active.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+pub struct Pool {
     h1: DashMap<PoolKey, Vec<IdleH1>>,
     h2: DashMap<PoolKey, Arc<H2Slot>>,
     cfg: PoolConfig,
     epoch: Instant,
+    generations: AtomicU64,
 }
 
 impl Pool {
-    pub(crate) fn new(cfg: PoolConfig) -> Self {
+    pub fn new(cfg: PoolConfig) -> Self {
         Self {
             h1: DashMap::new(),
             h2: DashMap::new(),
             cfg,
             epoch: Instant::now(),
+            generations: AtomicU64::new(0),
         }
     }
 
@@ -73,21 +112,40 @@ impl Pool {
         self.epoch.elapsed().as_secs()
     }
 
-    /// Most recently idled HTTP/1.1 sender that is still open. It may need
-    /// a moment to become ready (see `ProxyClient::checkout_h1`).
-    pub(crate) fn checkout_h1(&self, key: &PoolKey) -> Option<http1::SendRequest<ProxyBody>> {
+    /// A fresh handle for a new connection.
+    pub fn new_handle(&self) -> ConnHandle {
+        ConnHandle {
+            generation: self.generations.fetch_add(1, Ordering::Relaxed) + 1,
+            kill: CancellationToken::new(),
+        }
+    }
+
+    /// Most recently idled HTTP/1.1 connection that is still open. It may
+    /// need a moment to become ready (see `ProxyClient::checkout_h1`).
+    pub fn checkout_h1(
+        &self,
+        key: &PoolKey,
+    ) -> Option<(http1::SendRequest<ProxyBody>, ConnHandle)> {
         let mut stack = self.h1.get_mut(key)?;
         while let Some(idle) = stack.pop() {
-            if !idle.sender.is_closed() && idle.since.elapsed() < self.cfg.idle_timeout {
-                return Some(idle.sender);
+            if !idle.sender.is_closed()
+                && !idle.conn.kill.is_cancelled()
+                && idle.since.elapsed() < self.cfg.idle_timeout
+            {
+                return Some((idle.sender, idle.conn));
             }
         }
         None
     }
 
-    /// Park a sender whose previous response body was read to the end.
-    pub(crate) fn checkin_h1(&self, key: PoolKey, sender: http1::SendRequest<ProxyBody>) {
-        if sender.is_closed() || self.cfg.max_idle_per_host == 0 {
+    /// Park a connection whose previous response body was read to the end.
+    pub fn checkin_h1(
+        &self,
+        key: PoolKey,
+        sender: http1::SendRequest<ProxyBody>,
+        conn: ConnHandle,
+    ) {
+        if sender.is_closed() || conn.kill.is_cancelled() || self.cfg.max_idle_per_host == 0 {
             return;
         }
         let mut stack = self.h1.entry(key).or_default();
@@ -97,79 +155,116 @@ impl Pool {
         }
         stack.push(IdleH1 {
             sender,
+            conn,
             since: Instant::now(),
         });
     }
 
-    pub(crate) fn h2_slot(&self, key: &PoolKey) -> Arc<H2Slot> {
+    pub fn h2_slot(&self, key: &PoolKey) -> Arc<H2Slot> {
         if let Some(slot) = self.h2.get(key) {
             return Arc::clone(&slot);
         }
         Arc::clone(&self.h2.entry(key.clone()).or_insert_with(|| {
             Arc::new(H2Slot {
-                sender: parking_lot::Mutex::new(None),
+                entry: parking_lot::Mutex::new(None),
                 connecting: tokio::sync::Mutex::new(()),
                 last_used: AtomicU64::new(0),
+                active: AtomicUsize::new(0),
             })
         }))
     }
 
-    /// Live HTTP/2 sender for `key`, if any.
-    pub(crate) fn live_h2(&self, key: &PoolKey) -> Option<http2::SendRequest<ProxyBody>> {
-        let slot = self.h2.get(key)?;
-        self.slot_sender(&slot)
+    /// Lease the live HTTP/2 connection for `key`, if any.
+    pub fn live_h2(&self, key: &PoolKey) -> Option<H2Lease> {
+        let slot = Arc::clone(&*self.h2.get(key)?);
+        self.lease(&slot, None)
     }
 
-    pub(crate) fn slot_sender(&self, slot: &H2Slot) -> Option<http2::SendRequest<ProxyBody>> {
-        let mut guard = slot.sender.lock();
-        match guard.as_ref() {
-            Some(sender) if !sender.is_closed() => {
-                slot.last_used.store(self.now_secs(), Ordering::Relaxed);
-                Some(sender.clone())
-            }
-            Some(_) => {
-                *guard = None;
-                None
-            }
-            None => None,
+    /// Lease the slot's live connection unless it is generation `not_gen`
+    /// (the connection a retry just failed on).
+    pub fn lease(&self, slot: &Arc<H2Slot>, not_gen: Option<u64>) -> Option<H2Lease> {
+        let mut guard = slot.entry.lock();
+        let entry = guard.as_ref()?;
+        if entry.sender.is_closed() || entry.conn.kill.is_cancelled() {
+            *guard = None;
+            return None;
+        }
+        if not_gen == Some(entry.conn.generation) {
+            return None;
+        }
+        slot.last_used.store(self.now_secs(), Ordering::Relaxed);
+        slot.active.fetch_add(1, Ordering::Relaxed);
+        Some(H2Lease {
+            sender: entry.sender.clone(),
+            conn: entry.conn.clone(),
+            active: ActiveStream(Arc::clone(slot)),
+        })
+    }
+
+    /// Install a new HTTP/2 connection in `slot` and lease it.
+    pub fn store_h2(
+        &self,
+        slot: &Arc<H2Slot>,
+        sender: http2::SendRequest<ProxyBody>,
+        conn: ConnHandle,
+    ) -> H2Lease {
+        slot.last_used.store(self.now_secs(), Ordering::Relaxed);
+        slot.active.fetch_add(1, Ordering::Relaxed);
+        *slot.entry.lock() = Some(H2Entry {
+            sender: sender.clone(),
+            conn: conn.clone(),
+        });
+        H2Lease {
+            sender,
+            conn,
+            active: ActiveStream(Arc::clone(slot)),
         }
     }
 
-    pub(crate) fn store_h2(&self, slot: &H2Slot, sender: http2::SendRequest<ProxyBody>) {
-        slot.last_used.store(self.now_secs(), Ordering::Relaxed);
-        *slot.sender.lock() = Some(sender);
-    }
-
-    /// Forget the HTTP/2 connection for `key` (after a protocol error), so
-    /// the next request opens a fresh one.
-    pub(crate) fn drop_h2(&self, key: &PoolKey) {
+    /// Forget the HTTP/2 connection for `key` if it is still generation
+    /// `generation`; a newer replacement is left alone.
+    pub fn drop_h2(&self, key: &PoolKey, generation: u64) {
         if let Some(slot) = self.h2.get(key) {
-            *slot.sender.lock() = None;
+            let mut guard = slot.entry.lock();
+            if guard
+                .as_ref()
+                .is_some_and(|e| e.conn.generation == generation)
+            {
+                *guard = None;
+            }
         }
     }
 
     /// Close idle and dead connections.
-    pub(crate) fn reap(&self) {
+    pub fn reap(&self) {
         let idle = self.cfg.idle_timeout;
         self.h1.retain(|_, stack| {
-            stack.retain(|c| !c.sender.is_closed() && c.since.elapsed() < idle);
+            stack.retain(|c| {
+                !c.sender.is_closed() && !c.conn.kill.is_cancelled() && c.since.elapsed() < idle
+            });
             !stack.is_empty()
         });
         let now = self.now_secs();
         self.h2.retain(|_, slot| {
-            let mut guard = slot.sender.lock();
-            let unused = now.saturating_sub(slot.last_used.load(Ordering::Relaxed)) >= idle.as_secs();
-            if guard.as_ref().is_some_and(|s| s.is_closed() || unused) {
+            let mut guard = slot.entry.lock();
+            let busy = slot.active.load(Ordering::Relaxed) > 0;
+            let unused =
+                now.saturating_sub(slot.last_used.load(Ordering::Relaxed)) >= idle.as_secs();
+            if guard
+                .as_ref()
+                .is_some_and(|e| e.sender.is_closed() || (unused && !busy))
+            {
                 *guard = None;
             }
-            // Keep slots that are mid-connect.
-            guard.is_some() || slot.connecting.try_lock().is_err()
+            // Keep slots someone still holds (mid-connect or mid-exchange):
+            // detaching them would orphan the connection they install.
+            guard.is_some() || busy || Arc::strong_count(slot) > 1
         });
     }
 }
 
 /// Reaper loop; ends when the pool is dropped.
-pub(crate) async fn reap_loop(pool: std::sync::Weak<Pool>, every: Duration) {
+pub async fn reap_loop(pool: std::sync::Weak<Pool>, every: Duration) {
     let mut tick = tokio::time::interval(every);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {

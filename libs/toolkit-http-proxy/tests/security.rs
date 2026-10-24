@@ -4,6 +4,13 @@
 //! Each test drives the engine against a raw-socket upstream that writes
 //! exact bytes, so behaviour does not depend on a well-behaved server.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::let_underscore_must_use,
+    clippy::use_debug
+)]
+
 mod support;
 
 use std::future::Future;
@@ -20,8 +27,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use toolkit_http_proxy::{
-    ErrorKind, ProtocolPolicy, ProxyClient, Target, Transport, empty_body, full_body,
-    stream_body,
+    ErrorKind, ProtocolPolicy, ProxyClient, Target, Transport, empty_body, full_body, stream_body,
 };
 
 // ---------------------------------------------------------------------------
@@ -40,7 +46,9 @@ where
     let c = count.clone();
     tokio::spawn(async move {
         loop {
-            let Ok((s, _)) = listener.accept().await else { continue };
+            let Ok((s, _)) = listener.accept().await else {
+                continue;
+            };
             let n = c.fetch_add(1, Ordering::SeqCst) + 1;
             tokio::spawn(f.clone()(s, n));
         }
@@ -116,7 +124,10 @@ async fn ambiguous_inbound_framing_is_never_forwarded() {
         .header("content-length", "29")
         .header("transfer-encoding", "identity, chunked")
         .header("expect", "100-continue")
-        .header("connection", "keep-alive, x-secret, Upgrade, HTTP2-Settings")
+        .header(
+            "connection",
+            "keep-alive, x-secret, Upgrade, HTTP2-Settings",
+        )
         .header("x-secret", "internal")
         .header("upgrade", "h2c")
         .header("http2-settings", "AAMAAABkAARAAAAAAAIAAAAA")
@@ -163,13 +174,18 @@ async fn streaming_bodies_use_chunked_framing_only() {
     let lower = wire.to_ascii_lowercase();
     assert!(lower.contains("transfer-encoding: chunked"), "{wire}");
     assert!(!lower.contains("content-length"), "{wire}");
-    assert!(wire.ends_with("3\r\nabc\r\n3\r\ndef\r\n0\r\n\r\n"), "{wire:?}");
+    assert!(
+        wire.ends_with("3\r\nabc\r\n3\r\ndef\r\n0\r\n\r\n"),
+        "{wire:?}"
+    );
 }
 
 #[tokio::test]
 async fn percent_encoded_crlf_reaches_the_wire_encoded() {
     let (addr, mut rx) = capture().await;
-    let req = Request::get("/a%0d%0aInjected:%20x%00").body(empty_body()).unwrap();
+    let req = Request::get("/a%0d%0aInjected:%20x%00")
+        .body(empty_body())
+        .unwrap();
     client().send(&plain(addr), req).await.unwrap();
     let wire = String::from_utf8(rx.recv().await.unwrap()).unwrap();
     let request_line = wire.lines().next().unwrap();
@@ -196,7 +212,10 @@ async fn upgrade_without_101_tunnels_nothing() {
                 .await;
             // Anything the client sends after this would be a smuggled,
             // already-"upgraded" byte stream.
-            seen.fetch_add(drain(&mut s, Duration::from_millis(300)).await.len(), Ordering::SeqCst);
+            seen.fetch_add(
+                drain(&mut s, Duration::from_millis(300)).await.len(),
+                Ordering::SeqCst,
+            );
         }
     })
     .await;
@@ -218,7 +237,11 @@ async fn upgrade_without_101_tunnels_nothing() {
         .unwrap();
     tokio::time::sleep(Duration::from_millis(400)).await;
     assert_eq!(conns.load(Ordering::SeqCst), 2);
-    assert_eq!(extra.load(Ordering::SeqCst), 0, "no bytes after the rejected upgrade");
+    assert_eq!(
+        extra.load(Ordering::SeqCst),
+        0,
+        "no bytes after the rejected upgrade"
+    );
 }
 
 #[tokio::test]
@@ -226,7 +249,9 @@ async fn bogus_101_is_rejected() {
     let (addr, _) = raw(|mut s, _| async move {
         read_head(&mut s).await;
         let _ = s
-            .write_all(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: h2c\r\nConnection: Upgrade\r\n\r\n")
+            .write_all(
+                b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: h2c\r\nConnection: Upgrade\r\n\r\n",
+            )
             .await;
         drain(&mut s, Duration::from_millis(300)).await;
     })
@@ -274,7 +299,7 @@ async fn malformed_response_heads_are_rejected() {
     let too_many: &'static [u8] = Box::leak(
         format!(
             "HTTP/1.1 200 OK\r\n{}Content-Length: 0\r\n\r\n",
-            (0..200).map(|i| format!("x-h{i}: v\r\n")).collect::<String>()
+            "x-h: v\r\n".repeat(200)
         )
         .into_bytes()
         .into_boxed_slice(),
@@ -291,10 +316,22 @@ async fn malformed_response_heads_are_rejected() {
         .into_boxed_slice(),
     );
     let cases: [(&str, &'static [u8]); 6] = [
-        ("conflicting content-length", b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nContent-Length: 5\r\n\r\ngood"),
-        ("space before colon", b"HTTP/1.1 200 OK\r\nContent-Length : 4\r\n\r\ngood"),
-        ("obs-fold", b"HTTP/1.1 200 OK\r\nX-A: a\r\n b\r\nContent-Length: 4\r\n\r\ngood"),
-        ("bad status line", b"HTTP/1.1 2OO OK\r\nContent-Length: 4\r\n\r\ngood"),
+        (
+            "conflicting content-length",
+            b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nContent-Length: 5\r\n\r\ngood",
+        ),
+        (
+            "space before colon",
+            b"HTTP/1.1 200 OK\r\nContent-Length : 4\r\n\r\ngood",
+        ),
+        (
+            "obs-fold",
+            b"HTTP/1.1 200 OK\r\nX-A: a\r\n b\r\nContent-Length: 4\r\n\r\ngood",
+        ),
+        (
+            "bad status line",
+            b"HTTP/1.1 2OO OK\r\nContent-Length: 4\r\n\r\ngood",
+        ),
         ("too many headers", too_many),
         ("oversized head", too_big),
     ];
@@ -318,19 +355,31 @@ async fn malformed_chunked_bodies_fail_and_are_not_pooled() {
         b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\nabcd\r\n0\r\n\r\n",
     ];
     for bytes in cases {
-        let (addr, conns) = scripted(Box::leak(Box::new([bytes, b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nnext"]))).await;
+        let (addr, conns) = scripted(Box::leak(Box::new([
+            bytes,
+            b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nnext",
+        ])))
+        .await;
         let c = client();
         let resp = c
             .send(&plain(addr), Request::get("/").body(empty_body()).unwrap())
             .await
             .unwrap();
-        assert!(resp.into_body().collect().await.is_err(), "{:?}", String::from_utf8_lossy(bytes));
+        assert!(
+            resp.into_body().collect().await.is_err(),
+            "{:?}",
+            String::from_utf8_lossy(bytes)
+        );
         let resp = c
             .send(&plain(addr), Request::get("/").body(empty_body()).unwrap())
             .await
             .unwrap();
         let _ = resp.into_body().collect().await;
-        assert_eq!(conns.load(Ordering::SeqCst), 2, "a failed connection is never reused");
+        assert_eq!(
+            conns.load(Ordering::SeqCst),
+            2,
+            "a failed connection is never reused"
+        );
     }
 }
 
@@ -345,12 +394,23 @@ async fn injected_pipelined_response_is_never_served() {
     let c = client();
     let get = || Request::get("/").body(empty_body()).unwrap();
     let first = c.send(&plain(addr), get()).await.unwrap();
-    assert_eq!(first.into_body().collect().await.unwrap().to_bytes(), "good");
+    assert_eq!(
+        first.into_body().collect().await.unwrap().to_bytes(),
+        "good"
+    );
     tokio::time::sleep(Duration::from_millis(50)).await;
     match c.send(&plain(addr), get()).await {
         Ok(second) => {
-            let body = second.into_body().collect().await.map(|b| b.to_bytes());
-            assert_ne!(body.ok().as_deref(), Some(&b"evil"[..]), "desynced response served");
+            let body = second
+                .into_body()
+                .collect()
+                .await
+                .map(http_body_util::Collected::to_bytes);
+            assert_ne!(
+                body.ok().as_deref(),
+                Some(&b"evil"[..]),
+                "desynced response served"
+            );
         }
         Err(e) => assert_ne!(e.kind(), ErrorKind::InvalidRequest),
     }
@@ -458,7 +518,11 @@ async fn hpack_indexed_reference_bomb_is_contained() {
         let first = chunks.next().unwrap();
         let mut out = frame(HEADERS, 0, 1, first);
         while let Some(c) = chunks.next() {
-            let flags = if chunks.peek().is_none() { END_HEADERS } else { 0 };
+            let flags = if chunks.peek().is_none() {
+                END_HEADERS
+            } else {
+                0
+            };
             out.extend(frame(CONTINUATION, flags, 1, c));
         }
         let _ = s.write_all(&out).await;
@@ -467,12 +531,18 @@ async fn hpack_indexed_reference_bomb_is_contained() {
     .await;
     let res = within(
         Duration::from_secs(3),
-        client().send(&h2_target(addr), Request::get("/").body(empty_body()).unwrap()),
+        client().send(
+            &h2_target(addr),
+            Request::get("/").body(empty_body()).unwrap(),
+        ),
     )
     .await;
     let err = res.expect_err("bomb must not produce a response");
     assert!(
-        matches!(err.kind(), ErrorKind::Http2 | ErrorKind::Protocol | ErrorKind::ConnectionClosed),
+        matches!(
+            err.kind(),
+            ErrorKind::Http2 | ErrorKind::Protocol | ErrorKind::ConnectionClosed
+        ),
         "{err}"
     );
 }
@@ -494,7 +564,10 @@ async fn continuation_flood_is_contained() {
     .await;
     let res = within(
         Duration::from_secs(3),
-        client().send(&h2_target(addr), Request::get("/").body(empty_body()).unwrap()),
+        client().send(
+            &h2_target(addr),
+            Request::get("/").body(empty_body()).unwrap(),
+        ),
     )
     .await;
     assert!(res.is_err(), "flood must not produce a response");
@@ -542,7 +615,10 @@ async fn empty_data_frame_flood_is_contained() {
     let c = client_with_timeout(Duration::from_secs(2));
     within(Duration::from_secs(5), async {
         if let Ok(resp) = c
-            .send(&h2_target(addr), Request::get("/").body(empty_body()).unwrap())
+            .send(
+                &h2_target(addr),
+                Request::get("/").body(empty_body()).unwrap(),
+            )
             .await
         {
             // Either the body completes or the flood is cut off; both are
@@ -551,4 +627,150 @@ async fn empty_data_frame_flood_is_contained() {
         }
     })
     .await;
+}
+
+// ---------------------------------------------------------------------------
+// Review regressions
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn ambiguous_response_framing_drops_length_and_connection() {
+    let (addr, conns) = scripted(&[
+        b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nTransfer-Encoding: chunked\r\n\r\n4\r\ngood\r\n0\r\n\r\n",
+        b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nnext",
+    ])
+    .await;
+    let c = client();
+    let get = || Request::get("/").body(empty_body()).unwrap();
+    let resp = c.send(&plain(addr), get()).await.unwrap();
+    assert!(
+        resp.headers().get("content-length").is_none(),
+        "a lying length must not be relayed"
+    );
+    assert_eq!(resp.into_body().collect().await.unwrap().to_bytes(), "good");
+    let resp = c.send(&plain(addr), get()).await.unwrap();
+    let _ = resp.into_body().collect().await;
+    assert_eq!(
+        conns.load(Ordering::SeqCst),
+        2,
+        "never reuse an ambiguously framed connection"
+    );
+}
+
+#[tokio::test]
+async fn early_h2_response_with_zero_window_upload_is_torn_down() {
+    // The upstream answers immediately but never opens the window, so the
+    // upload would hang forever after the response.
+    let closed = Arc::new(tokio::sync::Notify::new());
+    let notify = closed.clone();
+    let addr = h2_server(&[0x00, 0x04, 0, 0, 0, 0], move |mut s| {
+        let notify = notify.clone();
+        async move {
+            let _ = s
+                .write_all(&frame(HEADERS, END_HEADERS | END_STREAM, 1, &[0x88]))
+                .await;
+            // Returns once the client drops the connection.
+            drain(&mut s, Duration::from_secs(5)).await;
+            notify.notify_one();
+        }
+    })
+    .await;
+    let mut cfg = support::test_config();
+    cfg.write_timeout = Some(Duration::from_millis(300));
+    let c = ProxyClient::new(cfg).unwrap();
+    let req = Request::post("/")
+        .body(full_body(Bytes::from(vec![b'x'; 256 * 1024])))
+        .unwrap();
+    let resp = within(Duration::from_secs(2), c.send(&h2_target(addr), req))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    drop(resp);
+    within(Duration::from_secs(3), closed.notified()).await;
+}
+
+#[tokio::test]
+async fn http2_only_requires_negotiated_h2() {
+    // An HTTP/1.1-only server rejects the `h2` offer during the handshake.
+    let up = support::echo(support::Wire::TlsH1).await;
+    let t = up
+        .target(support::Wire::TlsH1)
+        .with_policy(ProtocolPolicy::Http2Only);
+    let err = client()
+        .send(&t, Request::get("/").body(empty_body()).unwrap())
+        .await
+        .unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::TlsHandshake, "{err}");
+
+    // A server without ALPN completes the handshake; the engine refuses to
+    // fall back to HTTP/1.1.
+    let up = support::echo(support::Wire::TlsNoAlpn).await;
+    let t = up
+        .target(support::Wire::TlsNoAlpn)
+        .with_policy(ProtocolPolicy::Http2Only);
+    let err = client()
+        .send(&t, Request::get("/").body(empty_body()).unwrap())
+        .await
+        .unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::Protocol, "{err}");
+}
+
+#[tokio::test]
+async fn unknown_length_get_bodies_are_framed_not_dropped() {
+    let (addr, mut rx) = capture().await;
+    let chunks = stream::iter(vec![Ok::<_, std::io::Error>(Bytes::from_static(b"query"))]);
+    let req = Request::get("/search").body(stream_body(chunks)).unwrap();
+    client().send(&plain(addr), req).await.unwrap();
+    let wire = String::from_utf8(rx.recv().await.unwrap()).unwrap();
+    assert!(
+        wire.to_ascii_lowercase()
+            .contains("transfer-encoding: chunked"),
+        "{wire}"
+    );
+    assert!(wire.ends_with("5\r\nquery\r\n0\r\n\r\n"), "{wire:?}");
+}
+
+#[tokio::test]
+async fn body_idle_timeout_is_terminal_and_not_pooled() {
+    let (addr, conns) = raw(|mut s, n| async move {
+        if read_head(&mut s).await.is_none() {
+            return;
+        }
+        if n == 1 {
+            let _ = s
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nfirst")
+                .await;
+            tokio::time::sleep(Duration::from_millis(600)).await;
+            // Resumes after the client timed out; must not revive the exchange.
+            let _ = s.write_all(b"later").await;
+            drain(&mut s, Duration::from_secs(1)).await;
+        } else {
+            let _ = s
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nnext")
+                .await;
+            drain(&mut s, Duration::from_millis(300)).await;
+        }
+    })
+    .await;
+    let c = client_with_timeout(Duration::from_millis(200));
+    let resp = c
+        .send(&plain(addr), Request::get("/").body(empty_body()).unwrap())
+        .await
+        .unwrap();
+    let mut body = resp.into_body();
+    let first = body.frame().await.unwrap().unwrap().into_data().unwrap();
+    assert_eq!(&first[..], b"first");
+    assert_eq!(
+        body.frame().await.unwrap().unwrap_err().kind(),
+        ErrorKind::ReadTimeout
+    );
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert!(body.frame().await.is_none(), "a timed-out body stays ended");
+    drop(body);
+    let resp = c
+        .send(&plain(addr), Request::get("/").body(empty_body()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.into_body().collect().await.unwrap().to_bytes(), "next");
+    assert_eq!(conns.load(Ordering::SeqCst), 2);
 }

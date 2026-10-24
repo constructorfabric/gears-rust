@@ -67,7 +67,7 @@ fn response_hop_by_hop_and_nominated_are_dropped() {
     let mut h = map(&[
         ("connection", "close, x-internal"),
         ("x-internal", "1"),
-        ("transfer-encoding", "chunked"),
+        ("trailer", "x-checksum"),
         ("keep-alive", "timeout=5"),
         ("content-length", "12"),
         ("content-type", "application/json"),
@@ -75,10 +75,18 @@ fn response_hop_by_hop_and_nominated_are_dropped() {
     sanitize_response_headers(&mut h, StatusCode::OK);
     assert!(h.get("connection").is_none());
     assert!(h.get("x-internal").is_none());
-    assert!(h.get("transfer-encoding").is_none());
+    assert!(h.get("trailer").is_none());
     assert!(h.get("keep-alive").is_none());
     assert_eq!(h["content-length"], "12");
     assert_eq!(h["content-type"], "application/json");
+}
+
+#[test]
+fn response_content_length_is_dropped_next_to_transfer_encoding() {
+    let mut h = map(&[("transfer-encoding", "chunked"), ("content-length", "100")]);
+    sanitize_response_headers(&mut h, StatusCode::OK);
+    assert!(h.get("content-length").is_none());
+    assert!(h.get("transfer-encoding").is_none());
 }
 
 #[test]
@@ -123,7 +131,10 @@ fn upgrade_validation_allowlist() {
     assert_eq!(body.kind(), ErrorKind::InvalidRequest);
 
     for bad in [
-        map(&[("upgrade", "h2c"), ("connection", "Upgrade, HTTP2-Settings")]),
+        map(&[
+            ("upgrade", "h2c"),
+            ("connection", "Upgrade, HTTP2-Settings"),
+        ]),
         map(&[("upgrade", "websocket, h2c"), ("connection", "Upgrade")]),
         map(&[
             ("upgrade", "websocket"),
@@ -141,11 +152,10 @@ fn upgrade_validation_allowlist() {
 
 #[test]
 fn switch_validation_requires_websocket() {
-    assert!(validate_websocket_switch(&map(&[
-        ("upgrade", "websocket"),
-        ("connection", "Upgrade")
-    ]))
-    .is_ok());
+    assert!(
+        validate_websocket_switch(&map(&[("upgrade", "websocket"), ("connection", "Upgrade")]))
+            .is_ok()
+    );
     let err = validate_websocket_switch(&map(&[("upgrade", "foo"), ("connection", "Upgrade")]))
         .unwrap_err();
     assert_eq!(err.kind(), ErrorKind::Protocol);

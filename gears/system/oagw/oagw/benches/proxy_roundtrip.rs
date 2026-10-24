@@ -40,7 +40,9 @@ enum Wire {
 /// Upstream that answers `GET /r/{n}` with `n` bytes and echoes the size of
 /// any request body as a short JSON document.
 async fn start_upstream(wire: Wire) -> SocketAddr {
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind upstream");
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind upstream");
     let addr = listener.local_addr().expect("local addr");
     let small = Bytes::from(vec![b'a'; SMALL]);
     let large = Bytes::from(vec![b'b'; LARGE]);
@@ -145,7 +147,12 @@ async fn one(router: &axum::Router, alias: &str, case: &str, body: &Bytes) -> us
         .await
         .expect("router");
     assert!(resp.status().is_success(), "status {}", resp.status());
-    resp.into_body().collect().await.expect("body").to_bytes().len()
+    resp.into_body()
+        .collect()
+        .await
+        .expect("body")
+        .to_bytes()
+        .len()
 }
 
 fn percentile(sorted: &[Duration], p: f64) -> Duration {
@@ -153,7 +160,14 @@ fn percentile(sorted: &[Duration], p: f64) -> Duration {
     sorted[idx.min(sorted.len() - 1)]
 }
 
-async fn run_case(router: &axum::Router, alias: &str, case: &str, body: Bytes, iters: usize, secs: u64) {
+async fn run_case(
+    router: &axum::Router,
+    alias: &str,
+    case: &str,
+    body: Bytes,
+    iters: usize,
+    secs: u64,
+) {
     for _ in 0..200 {
         one(router, alias, case, &body).await;
     }
@@ -169,8 +183,13 @@ async fn run_case(router: &axum::Router, alias: &str, case: &str, body: Bytes, i
     let deadline = Instant::now() + Duration::from_secs(secs);
     let mut tasks = Vec::with_capacity(CONCURRENCY);
     for _ in 0..CONCURRENCY {
-        let (router, alias, case, body, done) =
-            (router.clone(), alias.to_owned(), case.to_owned(), body.clone(), done.clone());
+        let (router, alias, case, body, done) = (
+            router.clone(),
+            alias.to_owned(),
+            case.to_owned(),
+            body.clone(),
+            done.clone(),
+        );
         tasks.push(tokio::spawn(async move {
             while Instant::now() < deadline {
                 one(&router, &alias, &case, &body).await;
@@ -193,7 +212,10 @@ async fn run_case(router: &axum::Router, alias: &str, case: &str, body: Bytes, i
 }
 
 fn env_or(name: &str, default: u64) -> u64 {
-    std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
 }
 
 fn main() {

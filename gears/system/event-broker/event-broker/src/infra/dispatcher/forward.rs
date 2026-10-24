@@ -42,25 +42,31 @@ pub struct DispatcherState {
 /// Build the pooled client: `connect_timeout` bounds the TCP connect,
 /// `idle_timeout` the response head and every body read (design.md D9).
 ///
-/// # Panics
-/// Only if no TLS trust anchors can be loaded at all; the dispatcher only
-/// speaks cleartext HTTP/1, but the engine builds its TLS configuration up
-/// front.
-fn build_client(connect_timeout: Duration, idle_timeout: Duration) -> ProxyClient {
+/// # Errors
+/// When the engine cannot build its TLS configuration (e.g. no crypto
+/// provider installed in a FIPS build). The dispatcher only speaks cleartext
+/// HTTP/1, but the engine builds its TLS configuration up front.
+fn build_client(
+    connect_timeout: Duration,
+    idle_timeout: Duration,
+) -> Result<ProxyClient, toolkit_http_proxy::ProxyError> {
     let mut cfg = ProxyClientConfig::default();
     cfg.connect_timeout = connect_timeout;
     cfg.read_timeout = Some(idle_timeout);
-    ProxyClient::new(cfg).expect("dispatcher upstream client")
+    ProxyClient::new(cfg)
 }
 
 impl DispatcherState {
-    #[must_use]
-    pub fn new(directory: Arc<dyn DirectoryClient>) -> Self {
-        Self {
+    /// # Errors
+    /// When the pooled upstream client cannot be built (see `build_client`).
+    pub fn new(
+        directory: Arc<dyn DirectoryClient>,
+    ) -> Result<Self, toolkit_http_proxy::ProxyError> {
+        Ok(Self {
             directory,
-            client: build_client(UPSTREAM_CONNECT_TIMEOUT, IDLE_READ_TIMEOUT),
+            client: build_client(UPSTREAM_CONNECT_TIMEOUT, IDLE_READ_TIMEOUT)?,
             max_request_body_bytes: MAX_REQUEST_BODY_BYTES,
-        }
+        })
     }
 
     /// Overrides the upstream connect timeout - test-only, so the
@@ -68,8 +74,12 @@ impl DispatcherState {
     #[cfg(test)]
     #[must_use]
     pub(crate) fn with_connect_timeout(mut self, connect_timeout: Duration) -> Self {
-        let idle_timeout = self.client.config().read_timeout.unwrap_or(IDLE_READ_TIMEOUT);
-        self.client = build_client(connect_timeout, idle_timeout);
+        let idle_timeout = self
+            .client
+            .config()
+            .read_timeout
+            .unwrap_or(IDLE_READ_TIMEOUT);
+        self.client = build_client(connect_timeout, idle_timeout).expect("test client");
         self
     }
 
@@ -80,7 +90,7 @@ impl DispatcherState {
     #[must_use]
     pub(crate) fn with_idle_timeout(mut self, idle_timeout: Duration) -> Self {
         let connect_timeout = self.client.config().connect_timeout;
-        self.client = build_client(connect_timeout, idle_timeout);
+        self.client = build_client(connect_timeout, idle_timeout).expect("test client");
         self
     }
 

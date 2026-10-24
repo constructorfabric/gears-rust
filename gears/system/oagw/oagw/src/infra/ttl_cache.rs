@@ -11,13 +11,16 @@ use tokio::time::Instant;
 /// Shards spread lock contention; capacity is split evenly across them.
 const SHARDS: usize = 16;
 
+/// One shard: values with their optional expiry instant.
+type Shard<K, V> = Mutex<LruCache<K, (V, Option<Instant>)>>;
+
 /// Least-recently-used cache whose entries also expire after their TTL.
 ///
 /// Memory is bounded by the capacity given at construction; the oldest
 /// entries are evicted (dropped) first. Expired entries are dropped when
 /// looked up.
 pub(crate) struct TtlCache<K, V> {
-    shards: Vec<Mutex<LruCache<K, (V, Option<Instant>)>>>,
+    shards: Vec<Shard<K, V>>,
     hasher: std::collections::hash_map::RandomState,
 }
 
@@ -27,7 +30,9 @@ impl<K: Hash + Eq, V: Clone> TtlCache<K, V> {
     pub(crate) fn new(capacity: usize) -> Self {
         let per_shard = capacity.div_ceil(SHARDS);
         let shards = match NonZeroUsize::new(per_shard) {
-            Some(cap) => (0..SHARDS).map(|_| Mutex::new(LruCache::new(cap))).collect(),
+            Some(cap) => (0..SHARDS)
+                .map(|_| Mutex::new(LruCache::new(cap)))
+                .collect(),
             None => Vec::new(),
         };
         Self {
@@ -36,7 +41,7 @@ impl<K: Hash + Eq, V: Clone> TtlCache<K, V> {
         }
     }
 
-    fn shard(&self, key: &K) -> Option<&Mutex<LruCache<K, (V, Option<Instant>)>>> {
+    fn shard(&self, key: &K) -> Option<&Shard<K, V>> {
         if self.shards.is_empty() {
             return None;
         }

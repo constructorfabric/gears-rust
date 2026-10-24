@@ -143,7 +143,13 @@ impl fmt::Debug for Target {
 
 impl fmt::Display for Target {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}://{} ({})", self.scheme(), self.authority(), self.addr)
+        write!(
+            f,
+            "{}://{} ({})",
+            self.scheme(),
+            self.authority(),
+            self.addr
+        )
     }
 }
 
@@ -174,7 +180,11 @@ mod tests {
 
     #[test]
     fn authority_brackets_ipv6() {
-        let t = Target::new(SocketAddr::from(([0u16, 0, 0, 0, 0, 0, 0, 1], 8080)), "::1", Transport::Plain);
+        let t = Target::new(
+            SocketAddr::from(([0u16, 0, 0, 0, 0, 0, 0, 1], 8080)),
+            "::1",
+            Transport::Plain,
+        );
         assert_eq!(t.authority(), "[::1]:8080");
     }
 
