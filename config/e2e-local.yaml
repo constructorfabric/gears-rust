@@ -254,6 +254,16 @@ gears:
     config:
       listen_addr: "uds:///tmp/cf-gears-grpc-e2e"
 
+  # Linked by --features oagw-embedded. OAGW on a database keeps its proxy
+  # cache's change log in the `oagw` profile (ADR-0019); standalone suffices
+  # for one process.
+  cluster:
+    config:
+      profiles:
+        oagw:
+          cache:
+            provider: standalone
+
   users-info:
     # Gear-specific database configuration
     database:

@@ -313,6 +313,49 @@ fn auth_phase_recorded_into_request_duration_histogram() {
     );
 }
 
+// ── Resolve-phase timing ────────────────────────────────────────────────
+
+/// Sum of the observation counts of the `oagw_request_duration_seconds`
+/// data points whose `phase` label is `phase`.
+fn duration_count_for_phase(exporter: &InMemoryMetricExporter, phase: &str) -> u64 {
+    let metrics = exporter.get_finished_metrics().unwrap();
+    let mut count = 0;
+    for rm in &metrics {
+        for sm in rm.scope_metrics() {
+            for m in sm.metrics() {
+                if m.name() == "oagw_request_duration_seconds"
+                    && let AggregatedMetrics::F64(MetricData::Histogram(h)) = m.data()
+                {
+                    count += h
+                        .data_points()
+                        .filter(|dp| {
+                            dp.attributes()
+                                .any(|kv| kv.key.as_str() == "phase" && kv.value.as_str() == phase)
+                        })
+                        .map(|dp| dp.count())
+                        .sum::<u64>();
+                }
+            }
+        }
+    }
+    count
+}
+
+#[test]
+fn resolve_phase_recorded_under_its_own_phase_label() {
+    let (provider, exporter) = local_provider();
+    let m = make_meter(&provider, "oagw");
+
+    m.record_request_duration_seconds("openai", "/v1/chat", phase::RESOLVE, 0.002);
+    m.record_request_duration_seconds("openai", "/v1/chat", phase::RESOLVE, 0.004);
+    m.record_request_duration_seconds("openai", "/v1/chat", phase::TOTAL, 0.300);
+
+    provider.force_flush().unwrap();
+
+    assert_eq!(duration_count_for_phase(&exporter, "resolve"), 2);
+    assert_eq!(duration_count_for_phase(&exporter, "total"), 1);
+}
+
 // ── WebSocket session metrics ───────────────────────────────────────────
 
 #[test]
@@ -489,5 +532,223 @@ fn registry_provisioning_runs_carry_the_outcome() {
     assert_eq!(
         attr(&attrs, "outcome").as_deref(),
         Some(provisioning_outcome::NOT_CLEAN)
+    );
+}
+
+// ── Proxy configuration cache ───────────────────────────────────────────
+
+/// The value of each `u64` counter data point named `name`, by its string
+/// attributes (sorted `key=value` pairs, joined by `,`).
+fn counter_points(exporter: &InMemoryMetricExporter, name: &str) -> Vec<(String, u64)> {
+    let metrics = exporter.get_finished_metrics().unwrap();
+    let mut points = Vec::new();
+    for rm in &metrics {
+        for sm in rm.scope_metrics() {
+            for m in sm.metrics() {
+                if m.name() == name
+                    && let AggregatedMetrics::U64(MetricData::Sum(sum)) = m.data()
+                {
+                    points.extend(
+                        sum.data_points()
+                            .map(|dp| (labels(dp.attributes()), dp.value())),
+                    );
+                }
+            }
+        }
+    }
+    points.sort();
+    points
+}
+
+/// The last value of each `u64` gauge data point named `name`, by its
+/// string attributes.
+fn gauge_points(exporter: &InMemoryMetricExporter, name: &str) -> Vec<(String, u64)> {
+    let metrics = exporter.get_finished_metrics().unwrap();
+    let mut points = Vec::new();
+    for rm in &metrics {
+        for sm in rm.scope_metrics() {
+            for m in sm.metrics() {
+                if m.name() == name
+                    && let AggregatedMetrics::U64(MetricData::Gauge(g)) = m.data()
+                {
+                    points.extend(
+                        g.data_points()
+                            .map(|dp| (labels(dp.attributes()), dp.value())),
+                    );
+                }
+            }
+        }
+    }
+    points.sort();
+    points
+}
+
+fn labels<'a>(attrs: impl Iterator<Item = &'a opentelemetry::KeyValue>) -> String {
+    let mut pairs: Vec<String> = attrs
+        .map(|kv| format!("{}={}", kv.key.as_str(), kv.value.as_str()))
+        .collect();
+    pairs.sort();
+    pairs.join(",")
+}
+
+fn points(expected: &[(&str, u64)]) -> Vec<(String, u64)> {
+    expected
+        .iter()
+        .map(|(l, n)| ((*l).to_owned(), *n))
+        .collect()
+}
+
+#[test]
+fn proxy_cache_lookups_carry_the_map_and_the_result() {
+    use crate::domain::ports::metric_labels::{CacheLookup, CacheMap};
+
+    let (provider, exporter) = local_provider();
+    let m = make_meter(&provider, "oagw");
+
+    m.record_proxy_cache_lookup(CacheMap::Alias, CacheLookup::Hit);
+    m.record_proxy_cache_lookup(CacheMap::Alias, CacheLookup::Hit);
+    m.record_proxy_cache_lookup(CacheMap::Alias, CacheLookup::Joined);
+    m.record_proxy_cache_lookup(CacheMap::Route, CacheLookup::Miss);
+
+    provider.force_flush().unwrap();
+
+    assert_eq!(
+        counter_points(&exporter, "oagw_proxy_cache_lookups"),
+        points(&[
+            ("map=alias,result=hit", 2),
+            ("map=alias,result=joined", 1),
+            ("map=route,result=miss", 1),
+        ])
+    );
+}
+
+#[test]
+fn proxy_cache_entries_record_the_last_count_per_map() {
+    use crate::domain::ports::metric_labels::CacheMap;
+
+    let (provider, exporter) = local_provider();
+    let m = make_meter(&provider, "oagw");
+
+    m.record_proxy_cache_entries(CacheMap::Alias, 3);
+    m.record_proxy_cache_entries(CacheMap::Alias, 2);
+    m.record_proxy_cache_entries(CacheMap::Route, 7);
+
+    provider.force_flush().unwrap();
+
+    assert_eq!(
+        gauge_points(&exporter, "oagw_proxy_cache_entries"),
+        points(&[("map=alias", 2), ("map=route", 7)])
+    );
+}
+
+#[test]
+fn proxy_cache_evictions_add_their_count_by_map_and_reason() {
+    use crate::domain::ports::metric_labels::{CacheEviction, CacheMap};
+
+    let (provider, exporter) = local_provider();
+    let m = make_meter(&provider, "oagw");
+
+    m.record_proxy_cache_evictions(CacheMap::Alias, CacheEviction::Change, 3);
+    m.record_proxy_cache_evictions(CacheMap::Alias, CacheEviction::Change, 2);
+    m.record_proxy_cache_evictions(CacheMap::Route, CacheEviction::Ttl, 1);
+    m.record_proxy_cache_evictions(CacheMap::Route, CacheEviction::Capacity, 4);
+
+    provider.force_flush().unwrap();
+
+    assert_eq!(
+        counter_points(&exporter, "oagw_proxy_cache_evictions"),
+        points(&[
+            ("map=alias,reason=change", 5),
+            ("map=route,reason=capacity", 4),
+            ("map=route,reason=ttl", 1),
+        ])
+    );
+}
+
+#[test]
+fn proxy_cache_changes_carry_the_source() {
+    use crate::domain::ports::metric_labels::cache_change_source;
+
+    let (provider, exporter) = local_provider();
+    let m = make_meter(&provider, "oagw");
+
+    m.record_proxy_cache_change(cache_change_source::LOCAL);
+    m.record_proxy_cache_change(cache_change_source::REMOTE);
+    m.record_proxy_cache_change(cache_change_source::REMOTE);
+
+    provider.force_flush().unwrap();
+
+    assert_eq!(
+        counter_points(&exporter, "oagw_proxy_cache_changes"),
+        points(&[("source=local", 1), ("source=remote", 2)])
+    );
+}
+
+#[test]
+fn proxy_cache_flushes_carry_the_cause() {
+    use crate::domain::ports::metric_labels::cache_flush;
+
+    let (provider, exporter) = local_provider();
+    let m = make_meter(&provider, "oagw");
+
+    for cause in [
+        cache_flush::WATCH_RESET,
+        cache_flush::LOG_GAP,
+        cache_flush::LOG_RESET,
+        cache_flush::LOG_UNREADABLE,
+        cache_flush::WATCH_CLOSED,
+        cache_flush::LOG_GAP,
+    ] {
+        m.record_proxy_cache_flush(cause);
+    }
+
+    provider.force_flush().unwrap();
+
+    assert_eq!(
+        counter_points(&exporter, "oagw_proxy_cache_flushes"),
+        points(&[
+            ("cause=log_gap", 2),
+            ("cause=log_reset", 1),
+            ("cause=log_unreadable", 1),
+            ("cause=watch_closed", 1),
+            ("cause=watch_reset", 1),
+        ])
+    );
+}
+
+#[test]
+fn proxy_cache_discarded_loads_carry_the_map() {
+    use crate::domain::ports::metric_labels::CacheMap;
+
+    let (provider, exporter) = local_provider();
+    let m = make_meter(&provider, "oagw");
+
+    m.record_proxy_cache_load_discarded(CacheMap::Route);
+    m.record_proxy_cache_load_discarded(CacheMap::Route);
+
+    provider.force_flush().unwrap();
+
+    assert_eq!(
+        counter_points(&exporter, "oagw_proxy_cache_loads_discarded"),
+        points(&[("map=route", 2)])
+    );
+}
+
+#[test]
+fn proxy_cache_publish_failures_count_changes_by_reason() {
+    use crate::domain::ports::metric_labels::cache_publish_failure as reason;
+
+    let (provider, exporter) = local_provider();
+    let m = make_meter(&provider, "oagw");
+
+    m.record_proxy_cache_publish_failures(reason::APPEND_FAILED, 3);
+    m.record_proxy_cache_publish_failures(reason::APPEND_FAILED, 1);
+    m.record_proxy_cache_publish_failures(reason::PUBLISHER_STOPPED, 2);
+
+    provider.force_flush().unwrap();
+
+    assert_eq!(
+        counter_points(&exporter, "oagw_proxy_cache_publish_failures"),
+        points(&[("reason=append_failed", 4), ("reason=publisher_stopped", 2)])
     );
 }

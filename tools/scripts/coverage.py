@@ -582,7 +582,8 @@ def collect_unit_coverage(
     output_dir,
     config_file=None,
     test_filter=None,
-    skip_build=False
+    skip_build=False,
+    features=None,
 ):
     """Collect coverage from unit tests.
 
@@ -591,6 +592,7 @@ def collect_unit_coverage(
         config_file: Optional config file path
         test_filter: Optional package filter (e.g., 'toolkit-db')
         skip_build: If True, skip clean and test execution
+        features: Optional comma-separated Cargo features for the package
 
     Returns:
         int: process exit code from the test run (0 means success)
@@ -627,6 +629,8 @@ def collect_unit_coverage(
     # Branch coverage will be 0 without it, but region coverage
     # provides good coverage metrics for Rust code
     append_local_coverage_features(cmd, include_server_features)
+    if features:
+        cmd.extend(["--features", features])
     cmd.append("--no-report")
 
     # Keep local coverage independent from Docker-backed integration tests.
@@ -1091,7 +1095,8 @@ def generate_reports(output_dir, mode, threshold=COVERAGE_THRESHOLD, use_color=F
     return custom_report
 
 
-def run_coverage_workflow(mode, output_dir, config_file, test_filter, skip_build, threshold):
+def run_coverage_workflow(mode, output_dir, config_file, test_filter, skip_build, threshold,
+                          features=None):
     """Common workflow for running coverage collection and report generation.
 
     Args:
@@ -1101,12 +1106,13 @@ def run_coverage_workflow(mode, output_dir, config_file, test_filter, skip_build
         test_filter: Optional test filter
         skip_build: Whether to skip build/test execution
         threshold: Coverage threshold percentage
+        features: Optional comma-separated Cargo features (unit mode only)
     """
     use_color = supports_color()  # Auto-detect color support
 
     if mode == "unit":
         tests_rc = collect_unit_coverage(
-            output_dir, config_file, test_filter, skip_build
+            output_dir, config_file, test_filter, skip_build, features
         )
         report_mode = "unit tests"
     elif mode == "e2e-local":
@@ -1132,7 +1138,9 @@ def cmd_coverage_unit(args):
     skip_build = args.skip_build if hasattr(args, 'skip_build') else False
     threshold = args.threshold if hasattr(args, 'threshold') else COVERAGE_THRESHOLD
 
-    run_coverage_workflow("unit", output_dir, config_file, test_filter, skip_build, threshold)
+    run_coverage_workflow(
+        "unit", output_dir, config_file, test_filter, skip_build, threshold, args.features
+    )
 
 
 def cmd_coverage_e2e(args):
@@ -1175,6 +1183,8 @@ def cmd_coverage_combined(args):
     else:
         unit_cmd.append("--workspace")
     append_local_coverage_features(unit_cmd, include_server_features=package is None)
+    if args.features:
+        unit_cmd.extend(["--features", args.features])
     unit_cmd.extend(["--no-report", "--"])
     for test_name in LOCAL_COVERAGE_SKIPPED_TESTS:
         unit_cmd.extend(["--skip", test_name])
@@ -1329,6 +1339,14 @@ Examples:
         action="store_true",
         help="Skip environment prerequisite validation (not recommended)"
     )
+    p_unit.add_argument(
+        "--features",
+        help=(
+            "Comma-separated Cargo features for the unit tests "
+            "(Makefile GEAR_FEATURES=, plus the gear's own, e.g. oagw's cluster)"
+        ),
+        default=None
+    )
     p_unit.set_defaults(func=cmd_coverage_unit)
 
     # E2E coverage
@@ -1404,6 +1422,14 @@ Examples:
         "--skip-env-check",
         action="store_true",
         help="Skip environment prerequisite validation (not recommended)"
+    )
+    p_combined.add_argument(
+        "--features",
+        help=(
+            "Comma-separated Cargo features for the unit tests "
+            "(Makefile GEAR_FEATURES=, plus the gear's own, e.g. oagw's cluster)"
+        ),
+        default=None
     )
     p_combined.set_defaults(func=cmd_coverage_combined)
 

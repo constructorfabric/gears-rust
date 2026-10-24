@@ -472,6 +472,10 @@ jobs:
         if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
         run: tools/scripts/with_rust_annotations.sh make test-integration LANE=oagw-db
 
+      - name: Test oagw (cluster feature)
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        run: tools/scripts/with_rust_annotations.sh make test-integration LANE=oagw-cluster
+
       # Published as GitHub Checks by test-report.yml (workflow_run), which has
       # the `checks: write` this job lacks on fork PRs. `!cancelled()` so a
       # failing run still ships its report; a missing report (build failure)
@@ -1080,10 +1084,12 @@ jobs:
       #      the `cluster-pg` lane of `make test-integration`.
       #   4. The k8s-cluster-plugin L2/L3 k3s suites. These live behind
       #      `required-features = ["integration"]`.
-      #
       #   5. The durable-execution PostgreSQL suites behind the integration
       #      feature, including subprocess recovery. A single test binary
       #      shares the workspace-pinned PostgreSQL container.
+      #   6. OAGW with its `cluster` feature, which pass 1 lacks: the proxy
+      #      cache's change log, publisher and watcher. Keep in sync with
+      #      the `oagw-cluster` lane of `make test-integration`.
       #
       # The per-binary k3s loop (one container per binary, cleaned between —
       # nextest's process-per-test would start ~70 of them) lives in the
@@ -1125,6 +1131,9 @@ jobs:
           # (cargo test: no JUnit).
           fresh_report
           "$W" make coverage-durable-execution-pg
+          # Pass 6: OAGW with the `cluster` feature.
+          fresh_report
+          "$W" cargo llvm-cov nextest --no-report -p cf-gears-oagw --features cluster
           # Merge into the single report that gets uploaded.
           cargo llvm-cov report --lcov --output-path lcov.info
 
@@ -1198,4 +1207,4 @@ jobs:
         run: cargo install --locked cargo-gears@0.0.8
 
       - name: Run architecture lints
-        run: tools/scripts/with_rust_annotations.sh cargo gears lint --dylint
+        run: tools/scripts/with_rust_annotations.sh make dylint

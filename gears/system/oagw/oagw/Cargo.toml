@@ -33,7 +33,20 @@ test-utils = [
     "tokio/rt",
 ]
 mysql = ["toolkit-db/mysql"]
-integration = ["mysql"]
+# The database tier (`make test-oagw-db`), with the proxy cache's change log.
+integration = ["mysql", "cluster"]
+# The proxy configuration cache's change log on the platform cluster gear
+# (ADR-0019 *Cluster Setup*), which OAGW on a database requires. Off, OAGW
+# links no cluster SDK and runs in memory only: on a database `init` fails.
+# Not default, so an in-memory binary (mini-chat) does not link the SDK, whose
+# proxy wiring fails startup without a cluster gear once a workspace build
+# unifies its `grpc-client` feature in.
+cluster = ["dep:cluster-sdk"]
+# For an image that runs OAGW without a co-located cluster gear (cluster
+# DESIGN section 3.17.7): the SDK reaches the cluster pod over gRPC. The
+# embedded binary leaves it off; the `cluster` gear turns
+# `cluster-sdk/grpc-client` on itself.
+grpc-client = ["cluster", "cluster-sdk/grpc-client"]
 
 [dependencies]
 oagw-sdk = { path = "../oagw-sdk", package="cf-gears-oagw-sdk", version = "0.5.15", features = ["axum"] }
@@ -68,11 +81,15 @@ tenant-resolver-sdk = { workspace = true }
 tenant-resolver = { workspace = true }
 credstore-sdk = { workspace = true }
 credstore = { workspace = true }
+# The proxy cache's change log (ADR-0019), with the `cluster` feature. The SDK
+# only: no `deps = [cluster]` edge and no cluster gear dependency.
+cluster-sdk = { workspace = true, optional = true }
 # Metrics / OpenTelemetry
 opentelemetry = { workspace = true }
 heck = { workspace = true }
 # CP deps
 dashmap = { workspace = true }
+lru = { workspace = true }
 parking_lot = { workspace = true }
 psl = { workspace = true }
 thiserror = { workspace = true }
@@ -125,3 +142,11 @@ toolkit-db = { workspace = true, features = ["sqlite", "pg", "test-support"] }
 testcontainers = { workspace = true }
 test-containers = { workspace = true }
 tracing-test = { workspace = true }
+# Seeded random writes for the proxy cache's model test (ADR-0019).
+rand = { workspace = true }
+# Properties of the proxy cache's change-log decoder (ADR-0019).
+proptest = { workspace = true }
+# A real standalone cluster for the change-log and gear tests. Path only, no
+# version: a versioned internal dev-dep breaks release-plz publish ordering.
+cluster = { package = "cf-gears-cluster", path = "../../cluster/cluster" }
+standalone-cluster-plugin = { package = "cf-gears-standalone-cluster-plugin", path = "../../cluster/plugins/standalone-cluster-plugin" }
