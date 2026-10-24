@@ -87,7 +87,8 @@ pub struct ProxyError {
 }
 
 impl ProxyError {
-    pub(crate) fn new(kind: ErrorKind, message: impl Into<Cow<'static, str>>) -> Self {
+    /// An error of `kind` (for custom balancers, filters and tests).
+    pub fn new(kind: ErrorKind, message: impl Into<Cow<'static, str>>) -> Self {
         Self {
             kind,
             message: message.into(),

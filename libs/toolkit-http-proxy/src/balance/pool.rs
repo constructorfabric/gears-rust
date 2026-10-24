@@ -228,8 +228,10 @@ async fn background<K: Clone + Send + Sync + 'static>(
     refresh_every: Option<Duration>,
     health_every: Option<Duration>,
 ) {
-    let mut refresh = refresh_every.map(ticker);
-    let mut health = health_every.map(ticker);
+    // The first resolution already happened in `build`; the first probe runs
+    // right away so dead backends leave rotation within one connect timeout.
+    let mut refresh = refresh_every.map(|every| ticker(Instant::now() + every, every));
+    let mut health = health_every.map(|every| ticker(Instant::now(), every));
     loop {
         tokio::select! {
             () = cancel.cancelled() => return,
@@ -245,8 +247,8 @@ async fn background<K: Clone + Send + Sync + 'static>(
     }
 }
 
-fn ticker(every: Duration) -> Interval {
-    let mut interval = tokio::time::interval_at(Instant::now() + every, every);
+fn ticker(start: Instant, every: Duration) -> Interval {
+    let mut interval = tokio::time::interval_at(start, every);
     interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
     interval
 }

@@ -25,8 +25,8 @@ pub trait AddressFilter: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Returns a static reason when the address must not be used.
-    fn check(&self, addr: &SocketAddr) -> Result<(), &'static str>;
+    /// Returns the reason when the address must not be used.
+    fn check<'a>(&'a self, addr: &SocketAddr) -> Result<(), &'a str>;
 }
 
 /// Filter that allows every address.
@@ -34,7 +34,7 @@ pub trait AddressFilter: Send + Sync {
 pub struct AllowAll;
 
 impl AddressFilter for AllowAll {
-    fn check(&self, _addr: &SocketAddr) -> Result<(), &'static str> {
+    fn check<'a>(&'a self, _addr: &SocketAddr) -> Result<(), &'a str> {
         Ok(())
     }
 }

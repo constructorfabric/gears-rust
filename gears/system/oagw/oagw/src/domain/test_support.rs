@@ -761,23 +761,24 @@ impl TestDpBuilder {
             .unwrap_or_else(|| Arc::new(MockAuthZResolverClient));
         let policy_enforcer = PolicyEnforcer::new(authz_client);
 
-        let server_conf = Arc::new(pingora_core::server::configuration::ServerConf::default());
-        let pingora_proxy = crate::infra::proxy::pingora_proxy::PingoraProxy::new(
-            Duration::from_secs(10),
-            Duration::from_secs(30),
-            Duration::from_secs(3600),
-            Arc::new(SsrfGuard::disabled()),
-        )
-        .with_skip_upstream_tls_verify(self.skip_upstream_tls_verify);
-        let proxy = Arc::new(crate::infra::proxy::pingora_proxy::new_http_proxy(
-            &server_conf,
-            pingora_proxy,
-        ));
+        let engine = Arc::new(
+            crate::infra::proxy::engine::ProxyEngine::new(
+                &crate::infra::proxy::engine::EngineSettings {
+                    connect_timeout: Duration::from_secs(10),
+                    read_timeout: Duration::from_secs(30),
+                    protocol_cache_ttl: Duration::from_secs(3600),
+                    #[cfg(feature = "test-utils")]
+                    skip_upstream_tls_verify: self.skip_upstream_tls_verify,
+                },
+                Arc::new(SsrfGuard::disabled()),
+            )
+            .expect("test proxy engine"),
+        );
 
         let backend_selector: Arc<dyn EndpointSelector> =
             self.backend_selector.unwrap_or_else(|| {
                 Arc::new(
-                    crate::infra::proxy::pingora_proxy::PingoraEndpointSelector::new(Arc::new(
+                    crate::infra::proxy::endpoint_selector::PoolEndpointSelector::new(Arc::new(
                         SsrfGuard::disabled(),
                     )),
                 )
@@ -790,7 +791,7 @@ impl TestDpBuilder {
             self.token_http_config,
             self.token_cache_config,
             backend_selector,
-            proxy,
+            engine,
             std::sync::Arc::new(crate::domain::ports::NoopMetrics),
         )
         .with_allow_http_upstream(true);
@@ -835,7 +836,7 @@ pub fn build_test_app_state(
     dp_builder: TestDpBuilder,
 ) -> TestAppState {
     let backend_selector: Arc<dyn EndpointSelector> = Arc::new(
-        crate::infra::proxy::pingora_proxy::PingoraEndpointSelector::new(Arc::new(
+        crate::infra::proxy::endpoint_selector::PoolEndpointSelector::new(Arc::new(
             SsrfGuard::disabled(),
         )),
     );
@@ -879,7 +880,7 @@ pub fn build_test_gateway(
     let backend_selector: Arc<dyn EndpointSelector> =
         dp_builder.backend_selector.clone().unwrap_or_else(|| {
             Arc::new(
-                crate::infra::proxy::pingora_proxy::PingoraEndpointSelector::new(Arc::new(
+                crate::infra::proxy::endpoint_selector::PoolEndpointSelector::new(Arc::new(
                     SsrfGuard::disabled(),
                 )),
             )

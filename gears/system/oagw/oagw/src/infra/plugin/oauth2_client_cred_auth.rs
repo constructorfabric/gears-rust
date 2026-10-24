@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use pingora_memory_cache::MemoryCache;
+use crate::infra::ttl_cache::TtlCache;
 use toolkit_auth::oauth2::types::{ClientAuthMethod, SecretString};
 use toolkit_auth::oauth2::{OAuthClientConfig, fetch_token};
 use url::Url;
@@ -122,7 +122,7 @@ pub struct OAuth2ClientCredAuthPlugin {
     credstore: Arc<dyn CredStoreClientV1>,
     auth_method: ClientAuthMethod,
     http_config: Option<toolkit_http::HttpClientConfig>,
-    cache: MemoryCache<String, CachedToken>,
+    cache: TtlCache<String, CachedToken>,
     cache_ttl: Duration,
 }
 
@@ -139,7 +139,7 @@ impl OAuth2ClientCredAuthPlugin {
             credstore,
             auth_method,
             http_config: None,
-            cache: MemoryCache::new(cache_capacity),
+            cache: TtlCache::new(cache_capacity),
             cache_ttl,
         }
     }
@@ -179,8 +179,7 @@ impl AuthPlugin for OAuth2ClientCredAuthPlugin {
         let key = build_cache_key(ctx, self.auth_method);
 
         // Cache hit — verify key matches to prevent hash-collision leakage.
-        let (cached, _status) = self.cache.get(&key);
-        if let Some(entry) = cached
+        if let Some(entry) = self.cache.get(&key)
             && entry.key == key
         {
             ctx.headers.insert(
@@ -225,7 +224,7 @@ impl AuthPlugin for OAuth2ClientCredAuthPlugin {
 
         // Cache with key for verification — ZeroizeOnDrop fires on eviction.
         self.cache.put(
-            &key,
+            key.clone(),
             CachedToken {
                 key: key.clone(),
                 token: fetched.bearer.clone(),
@@ -951,7 +950,7 @@ mod tests {
             then.status(200)
                 .header("content-type", "application/json")
                 // expires_in=20 → ttl = min(3600, 20-30) = min(3600, 0) = 0
-                // pingora-memory-cache skips zero-TTL puts → not cached.
+                // The token cache skips zero-TTL puts → not cached.
                 .body(mock_token_response("tok-ephemeral", 20));
         });
 
@@ -1016,11 +1015,11 @@ mod tests {
     #[tokio::test]
     async fn hash_collision_does_not_leak_token() {
         // Directly test CachedToken key verification.
-        let cache: MemoryCache<String, CachedToken> = MemoryCache::new(100);
+        let cache: TtlCache<String, CachedToken> = TtlCache::new(100);
 
         let key_a = "tenant-a:subject-a:form:12345".to_string();
         cache.put(
-            &key_a,
+            key_a.clone(),
             CachedToken {
                 key: key_a.clone(),
                 token: SecretString::new("secret-token-a"),
@@ -1029,7 +1028,7 @@ mod tests {
         );
 
         // Look up with the correct key — should hit.
-        let (hit, _) = cache.get(&key_a);
+        let hit = cache.get(&key_a);
         assert!(hit.is_some());
         let entry = hit.unwrap();
         assert_eq!(entry.key, key_a);
@@ -1039,7 +1038,7 @@ mod tests {
         // to collide at the u64 level (no collision here, but we verify the
         // key-verification logic).
         let key_b = "tenant-b:subject-b:form:99999".to_string();
-        let (hit_b, _) = cache.get(&key_b);
+        let hit_b = cache.get(&key_b);
         // Either None (no collision) or key mismatch (collision).
         if let Some(entry_b) = hit_b {
             assert_ne!(
