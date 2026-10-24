@@ -1,4 +1,5 @@
-//! Retention: what a pass removes, what it leaves, and what it counts.
+//! Persist and retention: what a write stores, and what a retention pass
+//! removes, what it leaves, and what it counts.
 //!
 //! Every pass is driven directly rather than waited for. The backend owns no
 //! timer, so a test that wants three passes calls `maintain` three times and
@@ -641,4 +642,103 @@ async fn a_partition_is_still_listed_as_led_after_retention_empties_it() {
         vec![PARTITION],
         "an emptied partition remains listed as led"
     );
+}
+
+// Outbox-retry dedup.
+
+/// `event` carrying a producer chain position.
+fn chained(producer_id: Uuid, sequence: i64) -> Event {
+    Event {
+        meta: Some(event_broker_sdk::models::ProducerMeta {
+            version: 1,
+            producer_id: Some(producer_id),
+            previous: None,
+            sequence: Some(sequence),
+            partition_hint: None,
+        }),
+        ..event(8)
+    }
+}
+
+async fn persist_events(backend: &SqliteEventBackend, events: &[Event]) {
+    backend
+        .persist(&SecurityContext::anonymous(), TOPIC, PARTITION, events)
+        .await
+        .expect("persist succeeds");
+}
+
+fn ids(events: &[Event]) -> Vec<Uuid> {
+    events.iter().map(|e| e.id).collect()
+}
+
+#[tokio::test]
+async fn a_retried_persist_appends_nothing() {
+    let backend = backend().await;
+    let batch = vec![chained(Uuid::now_v7(), 1), event(8)];
+    persist_events(&backend, &batch).await;
+    persist_events(&backend, &batch).await;
+    assert_eq!(ids(&stored(&backend).await), ids(&batch));
+}
+
+#[tokio::test]
+async fn a_retry_larger_than_one_lookup_chunk_is_deduplicated_whole() {
+    let backend = backend().await;
+    // More ids than SQLite's oldest bound-variable limit (999), so the lookup
+    // has to run in chunks to work at all.
+    let batch: Vec<Event> = (0..1_200).map(|_| event(1)).collect();
+    persist_events(&backend, &batch).await;
+    let mut retry = batch.clone();
+    let late = event(1);
+    retry.push(late.clone());
+    persist_events(&backend, &retry).await;
+    let stored = stored(&backend).await;
+    assert_eq!(stored.len(), 1_201, "only the late event is new");
+    assert_eq!(stored.last().map(|e| e.id), Some(late.id));
+}
+
+#[tokio::test]
+async fn a_retry_overlapping_new_events_stores_only_the_new_ones() {
+    let backend = backend().await;
+    let first = event(8);
+    persist_events(&backend, std::slice::from_ref(&first)).await;
+    let second = event(8);
+    persist_events(&backend, &[first.clone(), second.clone()]).await;
+    assert_eq!(ids(&stored(&backend).await), vec![first.id, second.id]);
+}
+
+#[tokio::test]
+async fn producers_whose_sequences_overlap_are_all_stored() {
+    let backend = backend().await;
+    // One producer far along its chain - the watermark a partition written
+    // before relay-wide dedup could hold - then another starting at 1.
+    let far_along = chained(Uuid::now_v7(), 1000);
+    let fresh = chained(Uuid::now_v7(), 1);
+    let next = chained(Uuid::now_v7(), 2);
+    for event in [&far_along, &fresh, &next] {
+        persist_events(&backend, std::slice::from_ref(event)).await;
+    }
+    assert_eq!(
+        ids(&stored(&backend).await),
+        vec![far_along.id, fresh.id, next.id]
+    );
+}
+
+#[tokio::test]
+async fn a_retry_of_an_event_retention_removed_is_appended_again() {
+    let backend = backend().await;
+    let original = event(8);
+    persist_events(&backend, std::slice::from_ref(&original)).await;
+    prune(
+        &backend,
+        &RetentionRequest::for_partition(topic(), PARTITION, Utc::now()).build(),
+    )
+    .await;
+    assert!(stored(&backend).await.is_empty(), "retention removed it");
+
+    // The outbox retries after the ack was lost: the dedup sees no retained
+    // row, so delivery is at-least-once - same id, a new sequence.
+    persist_events(&backend, std::slice::from_ref(&original)).await;
+    let after = stored(&backend).await;
+    assert_eq!(ids(&after), vec![original.id]);
+    assert_eq!(sequences(&after), vec![2]);
 }

@@ -408,7 +408,7 @@ test-graph-storage-pg: install-tools
 TOOLKIT_DB_LANES := toolkit-db-sqlite toolkit-db-pg toolkit-db-pgq toolkit-db-mysql
 INTEGRATION_LANES := $(TOOLKIT_DB_LANES) users-info-pg usage-collector-pg usage-collector-ch \
 	types-registry-db oagw-db cluster-pg cluster-redis rg-pg settings-service-pg \
-	pricing-pg coord-pg products-pg ledger-pg
+	pricing-pg coord-pg products-pg ledger-pg event-broker-server
 
 ## toolkit-db on SQLite; the examples must still build after the tests.
 lane_args_toolkit-db-sqlite = -p cf-gears-toolkit-db --features sqlite,integration
@@ -584,6 +584,12 @@ lane_args_products-pg = -p cf-gears-bss-products --run-ignored ignored-only -E '
 ## prints a cost. It is excluded by name, so do not add it back.
 ## `--no-fail-fast` for the reason the pricing lane gives.
 lane_args_ledger-pg = -p cf-gears-bss-ledger --run-ignored ignored-only -E 'not test(grain_fold_timing)' --no-fail-fast
+
+## Event Broker's suites that need its standalone server's gears: the ones
+## that spawn the `cf-gears-event-broker-server` binary, and the cluster
+## backend scenarios (the cluster gear linked, or served over gRPC). They are
+## `required-features = ["server"]`, so the workspace run skips them. No Docker.
+lane_args_event-broker-server = -p cf-gears-event-broker --features server -E 'kind(test)'
 
 # run_lane(lane): the lane's nextest run, then its post command if it has one.
 run_lane = $(call nextest_run,$(1),$(lane_args_$(1)),$(lane_env_$(1)))$(if $(lane_post_$(1)),$(newline)$(lane_post_$(1)))
@@ -912,7 +918,7 @@ e2e-usage-collector: py-env
 ## Run event-broker E2E tests (its own standalone binary, not a cf-gears-example-server feature)
 e2e-event-broker: py-env
 	$(call print_target_banner)
-	cargo build -p cf-gears-event-broker --bin cf-gears-event-broker-server
+	cargo build -p cf-gears-event-broker --features server --bin cf-gears-event-broker-server
 	E2E_BINARY=target/debug/cf-gears-event-broker-server \
 		$(PYTHON) -m pytest testing/e2e/suites/event_broker/ -vv
 

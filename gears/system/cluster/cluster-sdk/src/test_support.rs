@@ -1,4 +1,4 @@
-//! A configurable [`ClusterClient`] stub for the SDK's own tests.
+//! A configurable [`ClusterClient`] stub: the SDK's own tests, and consumers' tests through the `test-util` feature.
 //!
 //! Since `K4` the resolvers bind through the process's single `dyn ClusterClient`
 //! rather than through per-profile hub registrations, so a test that wants a
@@ -25,6 +25,11 @@ use crate::dto::{
 use crate::error::{ClusterError, ProviderErrorKind};
 use crate::leader::{LeaderElectionBackend, LeaderElectionFeatures};
 use crate::lock::{DistributedLockBackend, LockFeatures};
+
+/// The backends a facade holds for a primitive nobody bound, for a stub that
+/// binds only the primitive its test exercises: resolution succeeds, and use
+/// fails with `ProfileNotBound`.
+pub use crate::binding::{unbound_cache, unbound_leader_election, unbound_lock};
 
 /// The provider name a derived descriptor reports: the backend's own where there
 /// is one, and a placeholder where the primitive is unbound.
@@ -56,6 +61,7 @@ pub struct StubClusterClient {
 impl StubClusterClient {
     /// A client binding `profile` and nothing else: every primitive is unbound
     /// until a `with_*` call supplies it.
+    #[must_use]
     pub fn for_profile(profile: &'static str) -> Self {
         Self {
             profile,
@@ -192,6 +198,7 @@ impl ClusterClient for StubClusterClient {
     }
 }
 
+#[cfg(test)]
 /// Runs `f` in a process where no cluster endpoint can be derived.
 ///
 /// **Not a convenience — a race fix.** With `grpc-client` on, the resolve path reads

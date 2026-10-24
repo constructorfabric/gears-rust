@@ -72,9 +72,11 @@ impl<S: EventSource + Send + Sync + 'static> ShardLoader<S> {
                 );
             }
 
-            // A round that fetched something is likely to find more immediately,
-            // so only an idle round pays the tick.
-            if report.fetches_issued() == 0 {
+            if pays_tick(
+                report.fetches_issued(),
+                report.events_fetched(),
+                report.failures(),
+            ) {
                 tokio::select! {
                     () = tokio::time::sleep(self.tick) => {}
                     () = shutdown.cancelled() => return,
@@ -107,4 +109,16 @@ impl<S: EventSource + Send + Sync + 'static> ShardLoader<S> {
     pub fn spawn(self, shutdown: CancellationToken) -> JoinHandle<()> {
         tokio::spawn(self.run(shutdown))
     }
+}
+
+/// Whether a round waits out the tick before the next one.
+///
+/// An idle round waits. A round with failures waits only when it also
+/// delivered nothing: a persistently failing partition must not spin the loop,
+/// but it must not throttle the healthy partitions fetched in the same round
+/// either. A round whose fetches all came back empty does not wait: a
+/// notification can precede the sequence being assigned, and the empty-tail
+/// backoff already spaces those partitions.
+pub(super) fn pays_tick(fetches_issued: usize, events_fetched: usize, failures: usize) -> bool {
+    fetches_issued == 0 || (failures > 0 && events_fetched == 0)
 }

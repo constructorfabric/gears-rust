@@ -1,8 +1,10 @@
 //! The `SQLite` implementation of the SDK's `EventBrokerBackend` trait.
 //!
-//! Implements the outbox-retry dedup the gear's `docs/DESIGN.md` specifies:
-//! one `last_chain_sequence` per `(topic, partition)`, compared against the
-//! producer chain-sequence field on each incoming event - not `event.id`.
+//! Implements the outbox-retry dedup the gear's `docs/DESIGN.md` specifies: a
+//! retried persist is recognised by `event.id`, which is the event table's
+//! primary key, so a retry of a retained event never appends twice and never
+//! drops a new event. A retry whose original retention already removed is
+//! appended again: persistence is at-least-once, as the outbox is.
 //!
 //! Knows nothing about specifications, the broker's `Storage` facade, cluster
 //! coordination, or idempotency beyond its own outbox-retry safety net,
@@ -38,6 +40,17 @@ use crate::sizing::stored_bytes;
 /// Removal is a prefix either way, so a partial pass leaves the partition in
 /// exactly the shape a complete one would, only less far along.
 const MAX_ROWS_PER_RETENTION_PASS: u64 = 4096;
+
+/// Event ids per dedup lookup: one bound variable each, kept well under
+/// SQLite's `SQLITE_MAX_VARIABLE_NUMBER` (999 on older builds) whatever batch
+/// the outbox hands `persist`.
+const DEDUP_LOOKUP_CHUNK: usize = 500;
+
+/// The one column the dedup lookup reads back.
+#[derive(sea_orm::FromQueryResult)]
+struct StoredEventId {
+    id: uuid::Uuid,
+}
 
 fn persist_failed(reason: impl std::fmt::Display) -> StorageBackendError {
     StorageBackendError::PersistFailed {
@@ -115,22 +128,37 @@ impl EventBrokerBackend for SqliteEventBackend {
                         None => (1, None),
                     };
 
-                    // Outbox-retry dedup: compare every incoming event's
-                    // producer chain sequence against the stored
-                    // `last_chain_sequence` - not `event.id`. Events with no
-                    // chain sequence (stateless mode) are never deduped here,
-                    // matching stateless mode's documented "no broker-side
-                    // dedup".
-                    let chain_sequences: Vec<i64> = events
+                    // Outbox-retry dedup: an event already stored in this
+                    // `(topic, partition)` under its id is a retried persist
+                    // and is skipped. The id is the table's primary key, so a
+                    // retry can never append twice, and an event not yet
+                    // stored is never mistaken for one - whatever producer,
+                    // chain mode or sequence it carries. Only retained rows
+                    // count: an event `maintain` already removed is appended
+                    // again under its id.
+                    let mut already_stored = std::collections::HashSet::new();
+                    for chunk in events.chunks(DEDUP_LOOKUP_CHUNK) {
+                        let ids: Vec<uuid::Uuid> = chunk.iter().map(|e| e.id).collect();
+                        let stored: Vec<StoredEventId> = event_entity::Entity::find()
+                            .filter(event_entity::Column::Topic.eq(topic.clone()))
+                            .filter(event_entity::Column::Partition.eq(partition_i32))
+                            .filter(event_entity::Column::Id.is_in(ids))
+                            .secure()
+                            .scope_with(&AccessScope::allow_all())
+                            .project_all(tx, |q| {
+                                q.select_only()
+                                    .column(event_entity::Column::Id)
+                                    .into_model::<StoredEventId>()
+                            })
+                            .await
+                            .map_err(|e| db_err_from_scope(&e))?;
+                        already_stored.extend(stored.into_iter().map(|row| row.id));
+                    }
+                    let events: Vec<&Event> = events
                         .iter()
-                        .filter_map(|e| e.meta.as_ref().and_then(|m| m.sequence))
+                        .filter(|e| !already_stored.contains(&e.id))
                         .collect();
-                    let is_retry = last_chain_sequence.is_some_and(|last| {
-                        !chain_sequences.is_empty() && chain_sequences.iter().all(|&s| s <= last)
-                    });
-                    if is_retry {
-                        // Every chained/monotonic event in this batch was
-                        // already durably applied - a retried persist call.
+                    if events.is_empty() {
                         return Ok(());
                     }
 
@@ -141,7 +169,7 @@ impl EventBrokerBackend for SqliteEventBackend {
                     let mut added_events: i64 = 0;
                     let mut added_bytes: i64 = 0;
                     let mut models = Vec::with_capacity(events.len());
-                    for event in &events {
+                    for event in events {
                         let sequence = next_sequence;
                         next_sequence += 1;
                         if let Some(chain_sequence) = event.meta.as_ref().and_then(|m| m.sequence) {

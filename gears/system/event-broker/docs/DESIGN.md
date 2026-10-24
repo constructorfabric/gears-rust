@@ -881,12 +881,16 @@ pub trait StorageBackend: Send + Sync {
     ///
     /// **Outbox-retry idempotency**: the outbox processor may retry the same
     /// persist call after a network timeout. The backend MUST be idempotent on
-    /// retry. It tracks its own `last_sequence` per `(topic, partition)` (where
-    /// `sequence` is the producer-set chain field on the event). On retry, if
-    /// every incoming event's `sequence` is `<=` the stored `last_sequence`,
-    /// the call is a duplicate and the backend returns `Ok(())` without
-    /// writing. Mismatched chain (e.g., the first new event's `previous` does
-    /// not match stored `last_sequence`) surfaces as `SequenceViolation`.
+    /// retry, keyed on `event.id`: an event already stored in the
+    /// `(topic, partition)` is skipped, and a call whose events are all stored
+    /// returns `Ok(())` without writing. Producer chain sequences are not a
+    /// retry key: one partition carries several producers' chains, and their
+    /// numbers overlap. The check reads the stored log, so it holds while the
+    /// original rows are retained: a retry whose events retention has already
+    /// removed appends them again, under the same `event.id` and a new
+    /// sequence. That stays within the ingest outbox's at-least-once boundary
+    /// (§ "Two outboxes — intentional layering"), and consumers already
+    /// process events at least once.
     ///
     /// Producer-level dedup (across producer client retries) is the
     /// IngestService's responsibility via `evbk_producer_state` and is already

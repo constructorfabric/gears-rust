@@ -7,7 +7,8 @@
 //! (D5's component-boundary rule: "we always work with backend out-of-tx")
 //! -> acks/retries/rejects based on the outcome, and - on success - publishes
 //! a `domain::notify` wake-up notification (design.md D6) for delivery's
-//! stream loop to pick up on its next iteration.
+//! retained notification consumers. Current stream delivery uses the partition
+//! loader and its local readiness notifications; it does not watch these keys.
 //! `LeasedMessageHandler::handle`'s own signature (`&self, msg:
 //! &OutboxMessage) -> MessageResult`, with no DB handle at all) is what
 //! makes that rule structurally true here, not just conventional.
@@ -60,7 +61,7 @@ impl IngestOutboxHandler {
     /// `Reject` - the event is already durably persisted by this point, and
     /// the notification is only a wake-up hint (design.md D6), not part of
     /// this handler's durability contract. A missed notification costs
-    /// delivery's stream loop one extra heartbeat-interval wait, not a
+    /// an optional notification consumer an extra timeout, not a
     /// correctness bug.
     async fn notify(&self, topic_id: &toolkit_gts::GtsInstanceId, partition: i32) {
         // Derived from the identifier, not looked up: the key has to be the
@@ -292,8 +293,7 @@ mod tests {
     /// crash between `persist()` succeeding and the row being marked done
     /// - must not double-append, because `SqliteEventBackend::persist`'s
     /// own outbox-retry dedup (design.md D4, task 5.4) compares the
-    /// event's producer chain sequence against the stored
-    /// `last_chain_sequence` for the partition, not `event.id`.
+    /// event's id against the events already stored in the partition.
     #[tokio::test]
     async fn redelivery_after_persist_is_a_safe_noop() {
         let (handler, backend) = test_handler().await;
@@ -330,6 +330,68 @@ mod tests {
             1,
             "redelivery must not durably append the event a second time"
         );
+        assert_eq!(events[0].id, event.id);
+    }
+
+    #[tokio::test]
+    async fn independent_producers_starting_at_one_are_both_persisted() {
+        let (handler, backend) = test_handler().await;
+        let first = test_event(1);
+        let second = test_event(1);
+        assert_ne!(
+            first.meta.as_ref().unwrap().producer_id,
+            second.meta.as_ref().unwrap().producer_id
+        );
+        let first_message = test_message(&first);
+        let mut second_message = test_message(&second);
+        second_message.seq = 2;
+        assert!(matches!(
+            handler.handle(&first_message).await,
+            MessageResult::Ok
+        ));
+        assert!(matches!(
+            handler.handle(&second_message).await,
+            MessageResult::Ok
+        ));
+        assert!(matches!(
+            handler.handle(&second_message).await,
+            MessageResult::Ok
+        ));
+        let events = backend
+            .read(
+                &SecurityContext::anonymous(),
+                TOPIC_ID,
+                0,
+                Sequence::assigned(0),
+                100,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            events.iter().map(|event| event.id).collect::<Vec<_>>(),
+            vec![first.id, second.id]
+        );
+    }
+
+    #[tokio::test]
+    async fn stateless_event_redelivery_is_a_safe_noop() {
+        let (handler, backend) = test_handler().await;
+        let mut event = test_event(1);
+        event.meta = None;
+        let message = test_message(&event);
+        assert!(matches!(handler.handle(&message).await, MessageResult::Ok));
+        assert!(matches!(handler.handle(&message).await, MessageResult::Ok));
+        let events = backend
+            .read(
+                &SecurityContext::anonymous(),
+                TOPIC_ID,
+                0,
+                Sequence::assigned(0),
+                100,
+            )
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 1);
         assert_eq!(events[0].id, event.id);
     }
 

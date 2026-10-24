@@ -1,8 +1,9 @@
-//! Delivery wake-up notifications (design.md D6): a `ClusterCacheV1`-backed,
-//! payload-free "something changed, go re-check" signal, replacing
-//! `domain/delivery.rs`'s old temporary polling loop. The consumer wakes on
-//! the bare notification and re-queries the backend directly - the
-//! notification itself carries no payload and is never the source of truth.
+//! Retained payload-free Cluster notification port (design.md D6).
+//!
+//! Ingest still writes the notification keys. Current streams do not call this
+//! port: their partition loader uses bounded tail polling and local readiness
+//! notifications. The implementation remains available to optional consumers;
+//! notification hints never replace authoritative reads from the event backend.
 //!
 //! **Correction against design.md D6's literal wording**: D6 (and task 7.2)
 //! describe watching one exact key per `(topic, partition)` a subscription

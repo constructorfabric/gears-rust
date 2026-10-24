@@ -91,7 +91,7 @@ impl DeploymentMode {
 #[toolkit::consumes(contract = authz_resolver_sdk::AuthZResolverApi, from = "authz-resolver")]
 #[toolkit::gear(
     name = "event-broker",
-    deps = [cluster, types_registry],
+    deps = [types_registry],
     capabilities = [db, rest, stateful],
     lifecycle(entry = "serve", stop_timeout = "30s")
 )]
@@ -548,13 +548,14 @@ impl EventBrokerModule {
             self.start_specification_refresh(sup).await?;
         }
 
-        // Must happen before anything else that follows: `cluster`'s own
-        // `start()` (which actually registers its backends into the
-        // `ClientHub`) is guaranteed to have already run by the time
-        // `serve()` is invoked (topo-sorted dependency order within the
-        // platform's start phase - `EventBrokerModule`'s `deps = [cluster,
-        // ...]`), but nothing before `serve()` is. See `Storage::set_cache`'s
-        // doc comment. Returns the resolved cache so `start_outbox_pipeline`
+        // Must happen before anything else that follows: a co-located
+        // `cluster`'s own `start()` (which actually registers its backends
+        // into the `ClientHub`) is guaranteed to have already run by the time
+        // `serve()` is invoked, because the start phase runs every `system`
+        // gear ahead of every application gear - not through `deps`, which
+        // must not name `cluster` (cluster DESIGN.md section 3.17.7: a process
+        // that reaches cluster remotely links no cluster gear). Nothing before
+        // `serve()` is guaranteed. See `Storage::set_cache`'s doc comment. Returns the resolved cache so `start_outbox_pipeline`
         // can hand the same handle to `IngestOutboxHandler` (design.md D6's
         // delivery-wake-up notification) without re-resolving it.
         let cluster_cache = self.wire_cluster_cache().await?;

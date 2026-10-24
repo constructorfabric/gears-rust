@@ -210,6 +210,43 @@ pub fn new_http_proxy(
 /// domain-level `Endpoint` (which carries scheme, original hostname, port).
 type AddrMap = Arc<ArcSwap<HashMap<String, Endpoint>>>;
 
+/// Why the `upstream_peer` fallback found no address to connect to.
+#[derive(Debug, PartialEq, Eq)]
+enum NoPermittedAddr {
+    /// DNS answered with no addresses at all.
+    NoneResolved,
+    /// Every resolved address was refused by the SSRF policy; the reason given
+    /// for the last one.
+    Refused(String),
+}
+
+/// The first of `addrs` the SSRF guard permits for `host`, logging each one it
+/// refuses. The fallback path of `upstream_peer`, which resolves outside
+/// [`DnsDiscovery`].
+fn first_permitted_addr(
+    guard: &SsrfGuard,
+    host: &str,
+    addrs: impl IntoIterator<Item = std::net::SocketAddr>,
+    upstream_id: Option<Uuid>,
+) -> Result<std::net::SocketAddr, NoPermittedAddr> {
+    let mut refused = None;
+    for sock in addrs {
+        if !guard.is_resolved_ip_blocked(host, sock.ip()) {
+            return Ok(sock);
+        }
+        let reason = guard.resolved_block_reason(host, sock.ip());
+        warn!(
+            upstream_id = ?upstream_id,
+            host = %host,
+            resolved_ip = %sock.ip(),
+            reason,
+            "SSRF protection: blocked DNS-resolved private IP in upstream_peer"
+        );
+        refused = Some(reason.to_owned());
+    }
+    Err(refused.map_or(NoPermittedAddr::NoneResolved, NoPermittedAddr::Refused))
+}
+
 /// Resolve a hostname with retry and exponential backoff.
 ///
 /// Retries up to 3 times with 100ms / 500ms / 2500ms delays. This handles
@@ -289,11 +326,11 @@ impl DnsDiscovery {
             match resolved {
                 Ok(addrs) => {
                     for sock in addrs {
-                        if self.ssrf_guard.is_ip_blocked(sock.ip()) {
+                        if self.ssrf_guard.is_resolved_ip_blocked(&ep.host, sock.ip()) {
                             warn!(
                                 addr = %addr_str,
                                 resolved_ip = %sock.ip(),
-                                reason = self.ssrf_guard.ip_block_reason(sock.ip()),
+                                reason = self.ssrf_guard.resolved_block_reason(&ep.host, sock.ip()),
                                 "SSRF protection: blocked DNS-resolved private IP"
                             );
                             continue;
@@ -732,30 +769,18 @@ impl ProxyHttp for PingoraProxy {
                             e,
                         )
                     })?;
-                // Filter resolved IPs through the SSRF guard.
-                let filtered: Vec<_> = addrs
-                    .into_iter()
-                    .filter(|sock| {
-                        if self.ssrf_guard.is_ip_blocked(sock.ip()) {
-                            warn!(
-                                upstream_id = ?ctx.upstream_id,
-                                host = %ep.host,
-                                resolved_ip = %sock.ip(),
-                                reason = self.ssrf_guard.ip_block_reason(sock.ip()),
-                                "SSRF protection: blocked DNS-resolved private IP in upstream_peer"
-                            );
-                            false
-                        } else {
-                            true
-                        }
-                    })
-                    .collect();
-                filtered.into_iter().next()
-                    .ok_or_else(|| {
-                        let detail = format!(
-                            "DNS returned no usable addresses for {}:{}",
-                            ep.host, ep.port
-                        );
+                first_permitted_addr(&self.ssrf_guard, &ep.host, addrs, ctx.upstream_id)
+                    .map_err(|why| {
+                        let detail = match why {
+                            NoPermittedAddr::NoneResolved => format!(
+                                "DNS returned no usable addresses for {}:{}",
+                                ep.host, ep.port
+                            ),
+                            NoPermittedAddr::Refused(reason) => format!(
+                                "SSRF policy refused every address {}:{} resolved to ({reason})",
+                                ep.host, ep.port
+                            ),
+                        };
                         warn!(upstream_id = ?ctx.upstream_id, host = %ep.host, port = ep.port, "{detail}");
                         pingora_core::Error::explain(
                             pingora_core::ErrorType::ConnectError,
@@ -1861,6 +1886,85 @@ mod tests {
             "localhost resolves to 127.0.0.1 which should be blocked"
         );
         assert!(map.is_empty());
+    }
+
+    /// A hostname exemption does not reach loopback; `allow_cidrs` does.
+    #[tokio::test]
+    async fn dns_discovery_exemption_needs_allow_cidrs_for_loopback() {
+        let resolve = |policy: crate::domain::ssrf::SsrfPolicy| async move {
+            let guard = SsrfGuard::from_config(&policy).unwrap();
+            assert!(guard.is_enabled());
+            DnsDiscovery::new(
+                vec![ep("localhost", 9999, Scheme::Http)],
+                make_addr_map(),
+                Arc::new(guard),
+            )
+            .resolve()
+            .await
+        };
+        let (backends, _) = resolve(crate::domain::ssrf::SsrfPolicy {
+            allow_hostnames: vec!["localhost".into()],
+            ..Default::default()
+        })
+        .await;
+        assert!(
+            backends.is_empty(),
+            "the exemption alone does not admit loopback"
+        );
+
+        let (backends, map) = resolve(crate::domain::ssrf::SsrfPolicy {
+            allow_hostnames: vec!["localhost".into()],
+            allow_cidrs: vec!["127.0.0.0/8".into(), "::1/128".into()],
+            ..Default::default()
+        })
+        .await;
+        assert!(!backends.is_empty());
+        assert!(map.values().all(|endpoint| endpoint.host == "localhost"));
+    }
+
+    /// The `upstream_peer` fallback honours an explicit hostname exemption and
+    /// still refuses the same address for any other name.
+    #[test]
+    fn upstream_peer_fallback_honours_a_hostname_exemption() {
+        let guard = SsrfGuard::from_config(&crate::domain::ssrf::SsrfPolicy {
+            allow_hostnames: vec!["trusted.internal".into()],
+            ..Default::default()
+        })
+        .unwrap();
+        let private: std::net::SocketAddr = "10.0.0.7:9999".parse().unwrap();
+        assert_eq!(
+            first_permitted_addr(&guard, "trusted.internal", [private], None),
+            Ok(private)
+        );
+        assert!(matches!(
+            first_permitted_addr(&guard, "other.internal", [private], None),
+            Err(NoPermittedAddr::Refused(_))
+        ));
+    }
+
+    /// The fallback skips a refused address and takes the next permitted one;
+    /// with nothing resolved it says so rather than blaming the policy.
+    #[test]
+    fn upstream_peer_fallback_takes_the_first_permitted_address() {
+        let guard = SsrfGuard::from_config(&crate::domain::ssrf::SsrfPolicy {
+            allow_hostnames: vec!["trusted.internal".into()],
+            ..Default::default()
+        })
+        .unwrap();
+        let metadata: std::net::SocketAddr = "169.254.169.254:80".parse().unwrap();
+        let private: std::net::SocketAddr = "10.0.0.7:80".parse().unwrap();
+        assert_eq!(
+            first_permitted_addr(&guard, "trusted.internal", [metadata, private], None),
+            Ok(private)
+        );
+        assert_eq!(
+            first_permitted_addr(&guard, "trusted.internal", [], None),
+            Err(NoPermittedAddr::NoneResolved)
+        );
+        assert!(matches!(
+            first_permitted_addr(&guard, "trusted.internal", [metadata], None),
+            Err(NoPermittedAddr::Refused(reason)) if reason.contains("allow_hostnames")
+        ));
     }
 
     /// With ssrf_protection=true, selector returns Err(NoBackendsResolved) for loopback.

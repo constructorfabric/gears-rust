@@ -104,18 +104,21 @@ async fn make_ctx_with_hub(mode: &str, hub: Arc<ClientHub>) -> GearCtx {
         .await
         .is_err()
     {
-        let config: cluster::ClusterConfig = serde_json::from_value(json!({
-            "profiles": { "event-broker": { "cache": { "provider": "standalone" } } }
-        }))
-        .expect("valid test cluster config");
-        let providers = cluster::ProviderRegistry::new()
-            .with_cache_provider(Arc::new(standalone_cluster_plugin::StandaloneCacheProvider));
-        let handle = cluster::ClusterWiring::from_config(Arc::clone(&hub), &config, &providers)
+        use cluster_sdk::ClusterCacheProvider as _;
+        let (cache, stop) = standalone_cluster_plugin::StandaloneCacheProvider
+            .build_cache(&serde_json::Map::new())
             .await
-            .expect("standalone provider wires cleanly");
+            .expect("the standalone cache builds with default options");
         // Intentionally leaked - matches `standalone_event_broker_cluster()`'s
         // own "no graceful shutdown needed in tests" precedent.
-        std::mem::forget(handle);
+        std::mem::forget(stop);
+        cluster_sdk::test_support::StubClusterClient::for_profile("event-broker")
+            .with_cache(cache)
+            .with_lock(cluster_sdk::test_support::unbound_lock("event-broker"))
+            .with_leader_election(cluster_sdk::test_support::unbound_leader_election(
+                "event-broker",
+            ))
+            .register(&hub);
     }
     let cfg = json!({
         "event-broker": {

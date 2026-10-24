@@ -50,5 +50,6 @@ secrecy = { workspace = true }
 inventory = { workspace = true }
 
 [dev-dependencies]
+temp-env = { workspace = true }
 secrecy = { workspace = true }
 tokio = { workspace = true, features = ["rt", "macros"] }

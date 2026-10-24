@@ -22,8 +22,27 @@ autobins = false
 # `sea-orm-migration`, `tokio-util`) are already regular dependencies; the
 # router-driving side modules (`request`/`response`) additionally need `http`
 # + `tower`, and the fixtures need `types-registry-sdk`'s `test-util`, so the
-# feature pulls those in (they are otherwise dev-only).
-test-utils = ["dep:http", "dep:tower", "types-registry-sdk/test-util"]
+# feature pulls those in (they are otherwise dev-only). The harness's cache is
+# the standalone provider bound through `cluster-sdk`'s stub client, so the
+# feature links no gear: `standalone-cluster-plugin` is a provider library, and
+# the cluster gear itself stays behind `server`.
+test-utils = ["dep:http", "dep:tower", "types-registry-sdk/test-util", "cluster-sdk/test-util", "dep:standalone-cluster-plugin"]
+# The standalone `cf-gears-event-broker-server` binary and the tests that spawn
+# it. Its gears are optional so the library never links them: a gear crate in
+# the dependency graph registers itself (`inventory`) in every binary that links
+# the broker, and an out-of-process broker unit then ran the cluster gear, with
+# no hub for its gRPC services.
+server = [
+    "dep:clap",
+    "dep:cluster",
+    "dep:authz-resolver",
+    "dep:api-gateway",
+    "dep:grpc_hub",
+    "dep:authn-resolver",
+    "dep:static-authn-plugin",
+    "dep:static-authz-plugin",
+    "dep:standalone-cluster-plugin",
+]
 
 [lib]
 name = "event_broker"
@@ -31,6 +50,19 @@ name = "event_broker"
 [[bin]]
 name = "cf-gears-event-broker-server"
 path = "src/bin/server.rs"
+required-features = ["server"]
+
+[[test]]
+name = "standalone_integration_tests"
+required-features = ["server"]
+
+[[test]]
+name = "consumer_group_rebalance_integration_tests"
+required-features = ["server"]
+
+[[test]]
+name = "cluster_backends"
+required-features = ["server"]
 
 [lints]
 workspace = true
@@ -49,7 +81,7 @@ event-broker-sdk = { workspace = true }
 gts = { workspace = true }
 types-registry-sdk = { workspace = true }
 
-cluster = { workspace = true }
+cluster = { workspace = true, optional = true }
 cluster-sdk = { workspace = true }
 
 anyhow = { workspace = true }
@@ -84,7 +116,7 @@ toolkit-odata = { workspace = true, features = ["with-utoipa"] }
 toolkit-macros = { workspace = true }
 utoipa = { workspace = true }
 authz-resolver-sdk = { workspace = true, features = ["rest-client"] }
-authz-resolver = { workspace = true }
+authz-resolver = { workspace = true, optional = true }
 types-registry = { workspace = true }
 # `domain/authz.rs`'s `TOPIC_RESOURCE`/`EVENT_TYPE_RESOURCE` consts invoke
 # `gts_id!(...)` for real (unlike `api/rest/error.rs`'s
@@ -126,7 +158,7 @@ tower = { workspace = true, optional = true }
 
 # CLI for the standalone binary (src/bin/server.rs), mirroring
 # apps/cf-gears-example-server's Cli shape.
-clap = { workspace = true }
+clap = { workspace = true, optional = true }
 
 # `src/bin/server.rs`-only: linked so their `inventory::submit!` gear/plugin
 # registrations are present in the binary. `event_broker` itself needs
@@ -136,11 +168,12 @@ clap = { workspace = true }
 # have no compile-time API surface this crate's library code calls, so they
 # (and the concrete plugins) are declared here but only ever referenced from
 # `src/bin/server.rs`, never from `src/`.
-api-gateway = { workspace = true }
-authn-resolver = { workspace = true }
-static-authn-plugin = { workspace = true }
-static-authz-plugin = { workspace = true }
-standalone-cluster-plugin = { workspace = true }
+api-gateway = { workspace = true, optional = true }
+grpc_hub = { workspace = true, optional = true }
+authn-resolver = { workspace = true, optional = true }
+static-authn-plugin = { workspace = true, optional = true }
+static-authz-plugin = { workspace = true, optional = true }
+standalone-cluster-plugin = { workspace = true, optional = true }
 # The SQLite storage backend, injected at wiring as a provider (`module.rs`),
 # the same way the cluster gear injects its cache providers. The gear links it
 # but knows only the `EventBrokerBackend` trait behind it.
@@ -155,10 +188,13 @@ name = "delivery"
 harness = false
 
 [dev-dependencies]
+# `tests/cluster_backends.rs` serves the cluster gear's gRPC services to prove
+# the broker needs no linked cluster.
+tonic = { workspace = true }
 # `benches/partition_cache.rs` - the two hot paths of the per-partition cache
 # were each once wrong in a way only a curve over a swept parameter reveals.
 criterion = { workspace = true, features = ["html_reports"] }
-tokio = { workspace = true, features = ["macros", "rt", "process"] }
+tokio = { workspace = true, features = ["macros", "rt", "process", "test-util"] }
 tower = { workspace = true }
 http = { workspace = true }
 tracing-test = { workspace = true }
@@ -171,6 +207,10 @@ tempfile = { workspace = true }
 # ready-made in-memory test double, reused rather than hand-rolled
 # (`eb-gts-type-registration`).
 types-registry-sdk = { workspace = true, features = ["test-util"] }
-# `cf-gears-standalone-cluster-plugin` moved to [dependencies] above (also
-# needed by src/bin/server.rs); regular dependencies are available to tests
-# too, so no separate dev-dependency entry is needed here anymore.
+# The unit tests bind the standalone cache through the SDK's stub client
+# (`test_support`); only `tests/cluster_backends.rs` needs the cluster gear, and
+# it gets it from `server`.
+cluster-sdk = { workspace = true, features = ["test-util"] }
+standalone-cluster-plugin = { workspace = true }
+# `tests/library_links_no_gear.rs` reads this manifest.
+toml = { workspace = true }
