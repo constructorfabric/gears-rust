@@ -65,6 +65,19 @@
               "description": "Current attempt counter.",
               "type": "integer",
               "minimum": 0
+            },
+            "reason": {
+              "description": "Set only when the task re-entered the queue by an explicit action: `released` (worker voluntary release, PRD §5.6) or `reenqueued` (admin re-enqueue of a dead-lettered or failed task, PRD §5.8). Absent otherwise.",
+              "type": "string",
+              "enum": [
+                "released",
+                "reenqueued"
+              ]
+            },
+            "actor": {
+              "description": "Subject that performed the release or re-enqueue. Present when `reason` is set.",
+              "type": "string",
+              "maxLength": 256
             }
           },
           "required": [

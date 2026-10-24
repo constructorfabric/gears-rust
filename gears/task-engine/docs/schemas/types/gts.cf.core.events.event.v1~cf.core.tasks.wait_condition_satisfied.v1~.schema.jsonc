@@ -67,7 +67,8 @@
               "enum": [
                 "timer",
                 "event",
-                "input"
+                "input",
+                "children"
               ]
             }
           },

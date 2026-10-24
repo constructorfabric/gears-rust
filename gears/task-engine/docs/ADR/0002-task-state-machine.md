@@ -49,7 +49,7 @@ We must decide how task state is represented and changed, so that every actor se
 
 Chosen option: **Option 3 — Explicit 10-state machine with a transition matrix.**
 
-Every task is in exactly one of ten states, stored as a stable `TaskState` enum discriminant (`te_task_state.state_code`). Four states are terminal: `completed`, `failed`, `cancelled`, and `dead_lettered`. A terminal task never changes state again, with one exception: an administrator may re-enqueue a `dead_lettered` task back to `queued`.
+Every task is in exactly one of ten states, stored as a stable `TaskState` enum discriminant (`te_task_state.state_code`). Four states are terminal: `completed`, `failed`, `cancelled`, and `dead_lettered`. A terminal task never changes state again, with one exception: an administrator may re-enqueue a `dead_lettered` or `failed` task back to `queued` (retry budgets reset, previous result cleared). A worker may also give a `claimed` or `running` task back with a voluntary release (`→ queued`, or `→ scheduled` with a delay) without failing it.
 
 Every transition is listed in the DESIGN state transition table and is executed as one guarded conditional update that names the expected source state. The same transaction applies the transition's side effects: concurrency slot release, queue-depth counter changes, timer creation or deletion, and the lifecycle event written to the outbox. If the guard matches zero rows, another actor won the race and the caller re-reads the task.
 
@@ -69,7 +69,8 @@ We confirm this decision through design review of the transition table and throu
 Tests MUST check that:
 
 * every transition in the table succeeds from its source state and is rejected from any other state;
-* terminal states accept no transition except admin re-enqueue of `dead_lettered`;
+* terminal states accept no transition except admin re-enqueue of `dead_lettered` or `failed`;
+* a voluntary release changes neither retry budget nor the worker blacklist;
 * two concurrent transitions on one task produce exactly one winner;
 * each transition performs its side effects (slots, counters, timers, events) atomically.
 
@@ -114,7 +115,8 @@ States: `scheduled`, `blocked`, `queued`, `claimed`, `running`, `waiting` (non-t
 ```text
 non-terminal: scheduled, blocked, queued, claimed, running, waiting
 terminal:     completed, failed, cancelled, dead_lettered
-exception:    dead_lettered --> queued (admin re-enqueue)
+exception:    dead_lettered | failed --> queued (admin re-enqueue)
+release:      claimed | running --> queued | scheduled (worker gives the task back)
 ```
 
 The full diagram and the per-transition side effects are in DESIGN §3.1 Task State Machine and the State Transition Table.
@@ -130,6 +132,7 @@ This decision supports these requirements and design elements:
 * `cpt-cf-task-engine-fr-task-create` — initial state is `queued`, `scheduled`, or `blocked`.
 * `cpt-cf-task-engine-fr-task-cancel` — cancellation is a terminal lifecycle state.
 * `cpt-cf-task-engine-fr-retry` — retryable failures go to `scheduled`, never `failed`.
-* `cpt-cf-task-engine-fr-dead-letter` — `dead_lettered` is terminal with admin re-enqueue.
+* `cpt-cf-task-engine-fr-dead-letter` — `dead_lettered` and `failed` are terminal with admin re-enqueue.
+* `cpt-cf-task-engine-fr-release` — voluntary release returns a leased task to the queue.
 * `cpt-cf-task-engine-fr-wait-conditions` — `waiting` is a non-terminal state.
 * `cpt-cf-task-engine-fr-dependencies` — `blocked` holds tasks with unmet predecessors.

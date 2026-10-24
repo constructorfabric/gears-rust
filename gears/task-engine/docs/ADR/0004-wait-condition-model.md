@@ -1,10 +1,10 @@
 ---
 status: accepted
 date: 2026-10-24
-description: "Support exactly three wait-condition kinds (timer, event, input) as engine-owned domain types with ALL/ANY groups, instead of a GTS-extensible condition type."
+description: "Support exactly four wait-condition kinds (timer, event, input, children) as engine-owned domain types with ALL/ANY groups and an arm-then-park option, instead of a GTS-extensible condition type."
 ---
 
-# Model Wait Conditions as Fixed Domain Elements with Three Built-in Kinds
+# Model Wait Conditions as Fixed Domain Elements with Four Built-in Kinds
 
 <!-- toc -->
 
@@ -16,7 +16,7 @@ description: "Support exactly three wait-condition kinds (timer, event, input) a
   - [Confirmation](#confirmation)
 - [Pros and Cons of the Options](#pros-and-cons-of-the-options)
   - [Option 1: GTS-extensible wait-condition type](#option-1-gts-extensible-wait-condition-type)
-  - [Option 2: Fixed kinds: timer, event, input](#option-2-fixed-kinds-timer-event-input)
+  - [Option 2: Fixed kinds: timer, event, input, children](#option-2-fixed-kinds-timer-event-input-children)
 - [More Information](#more-information)
 - [Traceability](#traceability)
 
@@ -26,7 +26,7 @@ description: "Support exactly three wait-condition kinds (timer, event, input) a
 
 ## Context and Problem Statement
 
-A running task can park itself until something happens: a point in time, an external event, or input from a person or another system. While parked the task is in `waiting`, holds no concurrency slot, and must resume exactly once, even across crashes and duplicate event delivery.
+A running task can park itself until something happens: a point in time, an external event, input from a person or another system, or the end of its child tasks. While parked the task is in `waiting`, holds no concurrency slot, and must resume exactly once, even across crashes and duplicate event delivery.
 
 We must decide whether wait conditions are an open, extensible type (for example a GTS base type that other gears derive from) or a fixed part of the Task Engine domain model.
 
@@ -36,21 +36,24 @@ We must decide whether wait conditions are an open, extensible type (for example
 * The engine must understand every condition kind well enough to index, time out, and resolve it.
 * Durable suspension must survive restarts.
 * Keep the model small and testable; avoid a plugin surface for wait semantics.
+* An event that arrives just before the wait is registered must not be missed.
 
 ## Considered Options
 
 1. **GTS-extensible wait-condition type** — a GTS base type that gears derive new wait kinds from, with their own matching logic.
-2. **Fixed kinds: timer, event, input** — three engine-owned kinds stored as a stable enum, combined in ALL/ANY groups.
+2. **Fixed kinds: timer, event, input, children** — four engine-owned kinds stored as a stable enum, combined in ALL/ANY groups.
 
 ## Decision Outcome
 
-Chosen option: **Option 2 — Fixed kinds: timer, event, input.**
+Chosen option: **Option 2 — Fixed kinds: timer, event, input, children.**
 
-Wait conditions are rows in `te_wait_conditions` with a stable `WaitConditionKind` discriminant (`timer`, `event`, `input`) and state (`pending`, `satisfied`, `timed_out`, `cancelled`). They are not GTS types.
+Wait conditions are rows in `te_wait_conditions` with a stable `WaitConditionKind` discriminant (`timer`, `event`, `input`, `children`) and state (`pending`, `satisfied`, `timed_out`, `cancelled`). They are not GTS types.
 
 A task sets one group of conditions with `all` or `any` semantics. In `any` mode the first satisfied condition wakes the task and cancels its siblings; in `all` mode every condition must be satisfied. A group may have a timeout whose `on_timeout` action fails or resumes the task.
 
-Resolution (timer fire, matching event, input resolve) marks the condition `satisfied` and, when the group is complete, moves the task `waiting → queued` in the same transaction and writes `WaitConditionSatisfied` and `TaskResumed` to the outbox. For event waits, the consumer offset is committed in that same transaction, so a duplicate event can never satisfy a wait twice.
+Resolution (timer fire, matching event, input resolve, last child reaching a terminal state) marks the condition `satisfied` and, when the group is complete, moves the task `waiting → queued` in the same transaction and writes `WaitConditionSatisfied` and `TaskResumed` to the outbox. For event waits, the consumer offset is committed in that same transaction, so a duplicate event can never satisfy a wait twice.
+
+**Arm, then park.** A worker that triggers the event itself (for example, it calls a service whose reply comes back as an event) could miss the reply if the reply arrives before the wait exists. So a worker may first **arm** the group (`park = false`): the conditions start matching and the event subscription is extended before the call returns, while the task keeps running. The worker then starts its action and calls **park**. If the group is already satisfied, the task is not parked and continues under the same lease; otherwise it parks as usual. Wait timeouts start at park.
 
 ### Consequences
 
@@ -58,7 +61,9 @@ Resolution (timer fire, matching event, input resolve) marks the condition `sati
 * A waiting task releases its concurrency slot and holds no lease.
 * Event waits drive the inbound Event Broker consumer subscription (DESIGN §3.2 Event Consumer).
 * Each kind has its own validation, indexes, and timeout handling.
-* Adding a fourth kind requires a new ADR and a schema change.
+* No event is missed when the worker arms the wait before it acts.
+* A parent can wait for its children without holding a lease or polling.
+* Adding a fifth kind requires a new ADR and a schema change.
 
 ### Confirmation
 
@@ -68,7 +73,9 @@ Tests MUST check that:
 * `any` groups cancel remaining siblings and `all` groups wait for every member;
 * a group timeout applies `on_timeout` correctly;
 * a duplicate event does not satisfy a wait twice;
-* pending waits survive a restart.
+* pending waits survive a restart;
+* an event published after an arm call returns satisfies the armed condition, and park then returns it without parking the task;
+* a children condition is satisfied once, after the last child reaches a terminal state, with the per-state counts.
 
 ## Pros and Cons of the Options
 
@@ -83,13 +90,13 @@ New kinds are registered at runtime with their own schema and resolver.
 
 **Rejected.**
 
-### Option 2: Fixed kinds: timer, event, input
+### Option 2: Fixed kinds: timer, event, input, children
 
-`timer` waits until a time; `event` matches an incoming broker event by `event_type`, optional subject filters, and an optional CEL expression (ADR-0007); `input` waits for a resolve call carrying a payload. Conditions are grouped with `all` or `any` semantics and an optional group timeout with `on_timeout = fail | resume`.
+`timer` waits until a time; `event` matches an incoming broker event by `event_type`, optional subject filters, and an optional CEL expression (ADR-0007); `input` waits for a resolve call carrying a payload; `children` waits until the task has no non-terminal child tasks. Conditions are grouped with `all` or `any` semantics and an optional group timeout with `on_timeout = fail | resume`.
 
 * Good, because every kind has dedicated columns and indexes.
 * Good, because resolution runs in the same transaction as the `waiting → queued` transition.
-* Good, because the three kinds cover time, external events, and human/system input.
+* Good, because the four kinds cover time, external events, human/system input, and fan-in of child tasks.
 * Bad, because a genuinely new kind needs an engine change and a new ADR.
 
 **Chosen.**
@@ -109,4 +116,5 @@ This decision supports these requirements and design elements:
 * `cpt-cf-task-engine-fr-wait-timer` — the `timer` kind.
 * `cpt-cf-task-engine-fr-wait-event` — the `event` kind.
 * `cpt-cf-task-engine-fr-wait-input` — the `input` kind.
+* `cpt-cf-task-engine-fr-wait-children` — the `children` kind.
 * `cpt-cf-task-engine-usecase-event-wait` — a task parks until an external event arrives.

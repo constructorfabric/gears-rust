@@ -57,8 +57,14 @@
               }
             },
             "assignee": {
-              "description": "Worker identity running the task.",
-              "type": "string"
+              "description": "Worker running the task (`worker_id`). Worker ID sent by the worker on claim (PRD §5.6 Worker identity). Together with the subject field it forms the worker identity.",
+              "type": "string",
+              "pattern": "^[A-Za-z0-9._:-]{1,128}$"
+            },
+            "assignee_subject": {
+              "description": "Principal (`subject_id`) the worker authenticated as.",
+              "type": "string",
+              "maxLength": 256
             },
             "attempt": {
               "description": "Current attempt counter.",
@@ -68,7 +74,8 @@
           },
           "required": [
             "task_id",
-            "assignee"
+            "assignee",
+            "assignee_subject"
           ]
         }
       }

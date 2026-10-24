@@ -173,6 +173,15 @@
       "type": "integer",
       "minimum": 1
     },
+    "tenant_fairness": {  // round_robin | fifo
+      "description": "How tasks of the same priority from different tenants are ordered (PRD cpt-cf-task-engine-fr-tenant-fairness). 'round_robin' (default): tenants take turns, each tenant's own tasks stay FIFO. 'fifo': strict FIFO across tenants. Priority always comes first. Overridable in config by queue pattern.",
+      "type": "string",
+      "enum": [
+        "round_robin",
+        "fifo"
+      ],
+      "default": "round_robin"
+    },
     "dead_letter_queue": {
       "description": "Optional GTS identifier of the queue that tasks are dead-lettered into when they exhaust retries or exceed their lifetime. MUST resolve to the same task domain as this queue. Absent means failing tasks transition to 'failed' instead of being dead-lettered.",
       "type": [

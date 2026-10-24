@@ -57,19 +57,37 @@
               }
             },
             "previous_assignee": {
-              "description": "Worker that previously held the lease.",
+              "description": "Worker that previously held the lease (`worker_id`).",
               "type": [
                 "string",
                 "null"
               ],
               "default": null
             },
-            "new_assignee": {
-              "description": "New worker, if assigned immediately.",
+            "previous_assignee_subject": {
+              "description": "Principal (`subject_id`) of the previous worker.",
               "type": [
                 "string",
                 "null"
               ],
+              "maxLength": 256,
+              "default": null
+            },
+            "new_assignee": {
+              "description": "New worker (`worker_id`), if assigned immediately.",
+              "type": [
+                "string",
+                "null"
+              ],
+              "default": null
+            },
+            "new_assignee_subject": {
+              "description": "Principal (`subject_id`) of the new worker.",
+              "type": [
+                "string",
+                "null"
+              ],
+              "maxLength": 256,
               "default": null
             },
             "reason": {

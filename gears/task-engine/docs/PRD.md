@@ -88,7 +88,7 @@ Distributed systems that need to orchestrate real work execution across services
 
 - Provide a single, reusable distributed task execution engine for the entire CF/Gears platform, eliminating per-gear ad-hoc job-queue implementations
 - Enable multi-tenant task isolation with configurable retention, queue access policies, and tenant-hierarchy-aware scoping
-- Support durable task suspension via first-class wait conditions (timer, event, input) so tasks can pause and resume without polling or callback chains
+- Support durable task suspension via first-class wait conditions (timer, event, input, children) so tasks can pause and resume without polling or callback chains
 - Deliver an extensible task type model via GTS so that new task types, input/output schemas, and entry types can be introduced by vendors and plugins without API or DB schema changes
 - Ensure reliable execution through configurable retry policies with backoff, dead-letter handling, and structured failure classification
 - Provide queue-based dispatch with concurrency/semaphore control, atomic claim/lease semantics, and heartbeat-based liveness detection
@@ -105,7 +105,7 @@ Distributed systems that need to orchestrate real work execution across services
 | Task Entry | A fine-grained execution record within a task: work performed, checks, observations, measurements, notes, or issues encountered during execution |
 | Queue | A GTS well-known instance (base type `gts.cf.core.tasks.queue.v1~`) defining a named channel with concurrency limits (global and per-tenant), default priority, timeout values, retry policy, and optional dead-letter queue. Tasks are enqueued into queues and workers claim work from them |
 | Worker | A service or process that claims tasks from queues, executes work, reports progress, and completes tasks with structured results |
-| Wait Condition | A durable suspension point — a first-class domain model element defining a condition that must be satisfied before a waiting task resumes. Three built-in kinds: timer, event, input |
+| Wait Condition | A durable suspension point — a first-class domain model element defining a condition that must be satisfied before a waiting task resumes. Four built-in kinds: timer, event, input, children |
 | Assignment | The binding of a task to a worker, including atomic claim, lease expiry, heartbeat tracking, and attempt counter |
 | Lease | A time-bounded lock on an assigned task; if the worker fails to heartbeat before the lease expires, the task is returned to the queue |
 | Lease Token | An opaque value issued with each lease (claim or reassignment) that identifies that specific lease; every worker-side mutation must carry it, and a stale token is rejected (§5.6 Lease Fencing) |
@@ -182,7 +182,7 @@ Distributed systems that need to orchestrate real work execution across services
 
 **Definition layer**:
 - Task types as GTS extension points with structured input/output schemas
-- Wait condition kinds as first-class domain model elements (timer, event, input)
+- Wait condition kinds as first-class domain model elements (timer, event, input, children)
 - Custom fields via GTS hybrid storage (base columns + JSONB extension)
 
 **Execution layer**:
@@ -385,10 +385,24 @@ The system **MUST** accept checkpoint data (JSON) and merge it into the task's c
 
 - [ ] `p1` - **ID**: `cpt-cf-task-engine-fr-priority-dispatch`
 
-The system **MUST** dispatch tasks from queues in priority order (lowest numeric value = highest priority). When multiple tasks share the same priority, the system **MUST** use FIFO ordering (earliest enqueued first).
+The system **MUST** dispatch tasks from queues in priority order (lowest numeric value = highest priority). When multiple tasks share the same priority, the order between them is set by the queue's tenant fairness mode (below); within one tenant it is always FIFO (earliest enqueued first).
 
 - **Rationale**: Priority ordering ensures critical tasks are processed first; FIFO tiebreaking prevents starvation within the same priority level.
 - **Actors**: `cpt-cf-task-engine-actor-worker`
+
+#### Tenant Fairness
+
+- [ ] `p1` - **ID**: `cpt-cf-task-engine-fr-tenant-fairness`
+
+Many tenants share one queue, so plain FIFO lets one tenant's burst delay every other tenant's work at the same priority. Each queue **MUST** declare a tenant fairness mode in its registration (§5.12), overridable in config by queue pattern:
+
+- `round_robin` (default) — among queued tasks of the **same priority**, tenants take turns: each claim takes the oldest task of the **next tenant in turn** that has a queued task at that priority, so every active tenant is served once per cycle. Priority always comes before fairness, and each tenant's own tasks stay FIFO. The turn order **MAY** be kept per node, so across nodes the rotation is approximate, but no active tenant is skipped for more than one cycle per node.
+- `fifo` — strict FIFO across tenants at the same priority (earliest enqueued first).
+
+Fairness decides only the **order** of eligible tasks. It does not limit how many tasks a tenant may run; per-tenant concurrency limits (§5.2) do that.
+
+- **Rationale**: A multi-tenant queue needs a fair share at equal priority, or one noisy tenant starves the rest (the "noisy neighbor" problem; cf. per-tenant fair queuing in Hatchet and Oban Pro). Round-robin between tenants gives every active tenant a turn without per-tenant queues or configuration.
+- **Actors**: `cpt-cf-task-engine-actor-worker`, `cpt-cf-task-engine-actor-platform-admin`
 
 #### Queue Concurrency Limits
 
@@ -520,13 +534,20 @@ The system **SHOULD** support automatic priority boosting for tasks that have wa
 
 - [ ] `p1` - **ID**: `cpt-cf-task-engine-fr-wait-conditions`
 
-The system **MUST** support durable wait conditions that transition a task to a `waiting` state. Wait conditions are first-class elements of the Task Engine domain model (like task state), not GTS-typed entities. Each wait condition has a **kind** — one of the three built-in kinds defined below (timer, event, input).
+The system **MUST** support durable wait conditions that transition a task to a `waiting` state. Wait conditions are first-class elements of the Task Engine domain model (like task state), not GTS-typed entities. Each wait condition has a **kind** — one of the four built-in kinds defined below (timer, event, input, children).
 
 When a worker or API consumer sets a wait condition on a task, the task transitions to `waiting`. The task resumes (transitions back to `queued`) when the condition is satisfied.
 
 **Waiting parks the task** (it does not suspend a live execution): the `running` → `waiting` transition **MUST**, in the same transaction, release the task's concurrency slots (§5.2), clear the lease (`lease_token`, `lease_until`) and `assignee`, and end the worker's ownership — the worker is free to claim other work, and any later call with the old lease token fails `LEASE_LOST`. A wait set by an API consumer on a leased task revokes the lease the same way. Resumption always goes `waiting` → `queued` (never refused by queue depth limits, §5.2) and requires a new claim, which issues a new lease token and lease epoch (§5.6). A waiting task therefore holds no worker, slot, or lease, however long it waits. Because in-memory worker state does not survive the wait, the set-wait call **MAY** carry checkpoint data (§5.1 Task Checkpoint) applied in the same transaction; the worker that claims the resumed task reads the checkpointed context and the resolved wait data (event payload, provided input, or timeout indication) from the task. Wait conditions **MUST** support an optional timeout — if the condition is not satisfied within the timeout, the system **MUST** publish a `waitTimedOut` event and either fail the task (with a `timedOut` result, routed by the terminal rule of §5.8) or resume it with a timeout indication, as configured per condition.
 
 Multiple wait conditions on a single task **MUST** support `ALL` (all must be satisfied) and `ANY` (first satisfied resumes the task) semantics. All conditions of a wait, with their mode, are set in **one** set-wait call — the call parks the task, so conditions cannot be added afterwards.
+
+**Arm before acting (no missed events)**: A worker often starts an action (for example, calls another service) and then waits for the event that reports its result. If the event arrives before the wait exists, it would be missed. To prevent this, a worker holding the lease **MAY** set the wait group in two steps:
+
+1. **Arm** — set the group with `park = false`. The conditions start matching at once, but the task keeps running and keeps its lease. The call **MUST** return only after the engine is able to receive the referenced events (for event conditions, the inbound subscription covers them). Matches while armed are recorded on the condition and do not change the task state.
+2. **Park** — call park for the armed group (with optional checkpoint). If the group is already satisfied, the task **MUST NOT** be parked: the call returns the resolved data and the task stays `running` under the same lease. Otherwise the task moves to `waiting` exactly as for a one-step set-wait.
+
+The worker arms the group, then starts the action, then parks. An armed group is cancelled when the task leaves `running` without parking (completion, failure, release, lease loss, cancellation). Wait timeouts start when the group is parked, not when it is armed. A task has at most one wait group, armed or parked.
 
 **Timeouts within a group**: each member that times out publishes its own `waitTimedOut` event. In an `ALL` group, the first member timeout makes the group unsatisfiable: the group resolves immediately with that member's configured timeout outcome (fail, or resume with a timeout indication), and the remaining members are cancelled. In an `ANY` group, a timed-out member only drops out; the group times out when every member has timed out without one being satisfied, and then resolves to fail if any member is configured to fail, otherwise to resume with a timeout indication. A task therefore never stays `waiting` on a group that can no longer resolve.
 
@@ -569,6 +590,15 @@ The system **MUST** support an **input** wait condition kind with fields: `input
 - **Rationale**: Input waits enable tasks to request structured data from external actors — configuration values, user decisions, or computed parameters — without completing and re-creating the task.
 - **Actors**: `cpt-cf-task-engine-actor-api-consumer`
 
+#### Children Wait Condition
+
+- [ ] `p2` - **ID**: `cpt-cf-task-engine-fr-wait-children`
+
+The system **MUST** support a **children** wait condition kind with no fields. It is satisfied when the task has no non-terminal child tasks (§5.9). If no child is non-terminal when the wait is parked, it is satisfied at once. While the parent is `waiting` it cannot create children, so the set of children cannot grow. When the condition is satisfied, the resolved data **MUST** contain the number of children in each terminal state (`completed`, `failed`, `cancelled`, `dead_lettered`), so the resumed parent can decide what to do without listing its children. The check **MUST** run when a child reaches a terminal state, without polling. It **MAY** run shortly after that child's transaction commits, as long as a lost check is repaired by a background sweep within the timer-accuracy bound (§6.1).
+
+- **Rationale**: Without this kind, a parent that must wait for its children either keeps its lease and slot for the whole time or polls, which is what wait conditions exist to remove. It is the same pattern as fan-out/fan-in in other task systems (Celery chords, Temporal child workflows).
+- **Actors**: `cpt-cf-task-engine-actor-worker`
+
 > **Note on retry/back-off**: A separate "retry/back-off" wait condition type is **not** needed. Retry backoff delays are handled natively by the retry policy (§5.8), which re-enqueues tasks with a `run_after` timestamp corresponding to the backoff delay. The timer wait condition (§5.4) can serve the same purpose for manual in-execution pauses. This avoids concept overlap.
 
 ### 5.5 Task Entries
@@ -602,13 +632,15 @@ Task entries **MUST** be queryable and filterable by type, time range, and creat
 
 The system **MUST** support atomic task claiming: a worker requests a task from one or more queues, and the system atomically assigns the highest-priority eligible task, sets a lease expiry (`lease_until`), records `claimed_at`, increments the `attempt` counter, issues a new lease token and lease epoch (§5.6 Lease Fencing), reserves the required concurrency slots (§5.2), and returns the task. Two workers **MUST NOT** be able to claim the same task. When a request names several queues, "highest-priority" is evaluated across all of them: eligible tasks are ordered by priority, then creation time (oldest first), then task ID, and the order in which the worker lists the queues **MUST NOT** affect the result. The number of queues in one claim request **MAY** be capped by configuration; a request above the cap is rejected with `400 Bad Request` (`invalid_argument`). Slot reservation and the task-state transition to `claimed` **MUST** occur in the same atomic operation (see §5.2). The system **MUST** support long-poll claiming: if no tasks are immediately available and a timeout is specified, the worker waits and retries when new work or released capacity is signalled. The long-poll timeout **MUST** be capped by configuration (`claim_max_wait_secs`, default 50 seconds — below common 60-second proxy idle timeouts); a larger requested timeout is clamped to the cap, not rejected. Clients **SHOULD** use a timeout at or below the cap and re-issue the claim immediately on an empty response. The claim response **MUST** include `heartbeat_interval_secs` — the interval at which the worker is expected to heartbeat, equal to one third of the lease duration (rounded down, minimum 1 second) — so a single delayed heartbeat never expires the lease. Signals are wake-up hints: in a multi-node deployment a task enqueued, resumed, or released on another node **MUST** become claimable by a waiting worker within a bounded, configurable poll interval, without requiring the Cluster gear.
 
-The `attempt` counter is the single authoritative count of execution attempts and **MUST** be incremented in exactly one place — on a successful claim. Retry re-enqueue (§5.8) and lease-expiry requeue (below) **MUST NOT** increment `attempt` themselves; the increment happens when the requeued task is next claimed. A claim that picks up a task resumed from `waiting` (§5.4) continues the same attempt and **MUST NOT** increment `attempt`.
+The `attempt` counter is the single authoritative count of execution attempts and **MUST** be incremented in exactly one place — on a successful claim. Retry re-enqueue (§5.8) and lease-expiry requeue (below) **MUST NOT** increment `attempt` themselves; the increment happens when the requeued task is next claimed. A claim that picks up a task resumed from `waiting` (§5.4) or given back by a voluntary release (§5.6 Voluntary Release) continues the same attempt and **MUST NOT** increment `attempt`.
 
 **Single-domain claim** (§5.19): all queues named in a single claim request **MUST** resolve to the same task domain. A claim request whose queues span multiple task domains **MUST** be rejected with `400 Bad Request` (`invalid_argument`). This preserves atomic, highest-priority-across-queues assignment within one database; a worker that wants to consume from queues in different domains issues one claim request per domain.
 
 The assignment record **MUST** include: `assignee` (worker identity), `claimed_at`, `lease_until`, `heartbeat_at`, `attempt`, `lease_token`, and `lease_epoch`.
 
-- **Rationale**: Atomic claiming with leases is the foundation of distributed task execution; it prevents double-dispatch and enables automatic recovery of abandoned tasks. Bundling slot reservation into the same atomic step prevents two concurrent claims from both observing an available slot. A single authoritative `attempt` increment avoids double-counting across claim and retry paths.
+**Worker identity**: Many worker processes often run under one service principal, so the principal alone cannot tell them apart. Every claim request **MUST** carry a `worker_id` — a string of 1–128 characters from `[A-Za-z0-9._:-]` that names one worker process (for example, pod name plus process ID). The worker **SHOULD** keep the same `worker_id` across restarts. A missing or malformed `worker_id` **MUST** be rejected with `400 Bad Request` (`invalid_argument`). The **worker identity** is the pair (`subject_id` of the caller, `worker_id`). The system records both on the assignment and uses this pair for the worker blacklist (§5.6 Worker Blacklisting), events, and audit. Because the pair includes the authenticated subject, one principal cannot act as, or blacklist, another principal's workers. `worker_id` is not a credential: worker-side writes are still fenced by the lease token (§5.6 Lease Fencing), and access is still decided by the PDP.
+
+- **Rationale**: Atomic claiming with leases is the foundation of distributed task execution; it prevents double-dispatch and enables automatic recovery of abandoned tasks. Bundling slot reservation into the same atomic step prevents two concurrent claims from both observing an available slot. A single authoritative `attempt` increment avoids double-counting across claim and retry paths. A per-process `worker_id` lets the engine blacklist one faulty replica without blacklisting the whole fleet that shares its principal.
 - **Actors**: `cpt-cf-task-engine-actor-worker`
 
 #### Heartbeat / Lease Renewal
@@ -622,11 +654,27 @@ The system **MUST** accept heartbeat signals from workers, extend the lease, upd
 - **Rationale**: Heartbeats provide worker liveness detection and a bidirectional control channel. Reusing the retry-policy backoff on lease expiry avoids a divergence where unhealthy workers thrash a task with no delay.
 - **Actors**: `cpt-cf-task-engine-actor-worker`
 
+#### Voluntary Release
+
+- [ ] `p1` - **ID**: `cpt-cf-task-engine-fr-release`
+
+A worker **MUST** be able to give a `claimed` or `running` task back without failing it — for example when it shuts down, loses a local resource, or is over capacity. The release call carries the lease token (§5.6 Lease Fencing) and **MAY** carry checkpoint data (§5.1 Task Checkpoint) and a `delay_secs` value. In one transaction the system **MUST**:
+
+- end the lease (clear `lease_token`, `lease_until`, and `assignee`) and release the task's concurrency slots (§5.2);
+- apply the checkpoint, if any;
+- move the task to `queued`, or to `scheduled` with `run_after = now + delay_secs` when a delay is given;
+- publish a `taskQueued` event with reason `released`.
+
+A release **MUST NOT** consume `max_retries` or `max_liveness_requeues` (§5.8), **MUST NOT** count toward the worker blacklist, and **MUST NOT** be refused by queue depth limits (it is a re-entry, §5.2). The next claim of a released task **MUST NOT** increment `attempt`. A release with a stale lease token is rejected with `LEASE_LOST`.
+
+- **Rationale**: Without a release, a worker that stops early must let its lease expire. That delays the task by a full lease, spends a liveness requeue, and adds a blacklist strike to a healthy worker. Lease-based queues offer the same operation (SQS `ChangeMessageVisibility` to 0, Azure Service Bus abandon).
+- **Actors**: `cpt-cf-task-engine-actor-worker`
+
 #### Worker Blacklisting
 
 - [ ] `p3` - **ID**: `cpt-cf-task-engine-fr-worker-blacklist`
 
-The system **MUST** maintain a per-queue temporary worker blacklist keyed by consecutive failures. A worker is blacklisted for a queue once it accumulates a configurable number of **consecutive failures** on that queue (default: 10). Only failures attributable to the worker count: a "consecutive failure" **MUST** include an explicit failure reported with `fault=worker` (§5.1 Structured Input/Output) and an engine-observed liveness failure — lease expiry (missed heartbeat) or assignment timeout (§5.3) — each counting as **one** failure toward the same threshold, not an immediate blacklist. **Liveness failures are coalesced per outage**: all lease expiries and assignment timeouts of the same worker on the same queue that are detected within one lease duration of the last *counted* liveness failure for that (worker, queue) **MUST** count as a single failure, because a worker holding many leases loses all of them to one connectivity loss — the threshold measures repeated incidents, not the number of tasks held. Explicit `fault=worker` failures are never coalesced. Failures with `fault=task` or `fault=dependency`, and execution timeouts, **MUST NOT** count and **MUST NOT** reset the counter, so a healthy worker is never blacklisted for receiving bad input or hitting a broken downstream service. The counter **MUST** reset to zero on the worker's next successful task completion on that queue. Once the threshold is reached, the worker **MUST** be blacklisted for that queue for a configurable duration (default: 60 minutes). Blacklisted workers **MUST** be skipped during task assignment for the affected queue. Blacklist thresholds and durations **MUST** be configurable per queue. Each blacklisting **MUST** be recorded in the event history via a `workerBlacklisted` event (§5.10).
+The system **MUST** maintain a per-queue temporary worker blacklist keyed by consecutive failures. A "worker" here is the worker identity (`subject_id`, `worker_id`) defined in §5.6 Atomic Claim. A worker is blacklisted for a queue once it accumulates a configurable number of **consecutive failures** on that queue (default: 10). Only failures attributable to the worker count: a "consecutive failure" **MUST** include an explicit failure reported with `fault=worker` (§5.1 Structured Input/Output) and an engine-observed liveness failure — lease expiry (missed heartbeat) or assignment timeout (§5.3) — each counting as **one** failure toward the same threshold, not an immediate blacklist. **Liveness failures are coalesced per outage**: all lease expiries and assignment timeouts of the same worker on the same queue that are detected within one lease duration of the last *counted* liveness failure for that (worker, queue) **MUST** count as a single failure, because a worker holding many leases loses all of them to one connectivity loss — the threshold measures repeated incidents, not the number of tasks held. Explicit `fault=worker` failures are never coalesced. Failures with `fault=task` or `fault=dependency`, and execution timeouts, **MUST NOT** count and **MUST NOT** reset the counter, so a healthy worker is never blacklisted for receiving bad input or hitting a broken downstream service. The counter **MUST** reset to zero on the worker's next successful task completion on that queue. Once the threshold is reached, the worker **MUST** be blacklisted for that queue for a configurable duration (default: 60 minutes). Blacklisted workers **MUST** be skipped during task assignment for the affected queue. Blacklist thresholds and durations **MUST** be configurable per queue. Each blacklisting **MUST** be recorded in the event history via a `workerBlacklisted` event (§5.10).
 
 - **Rationale**: Blacklisting with testable thresholds prevents repeated assignment to failing workers while allowing recovery after the cooldown period. Treating a missed heartbeat as one failure (rather than an immediate blacklist) avoids ejecting workers on a single transient network blip. Counting only worker-attributed failures keeps worker health separate from task health: bad input or a failing downstream dependency says nothing about the worker.
 - **Actors**: `cpt-cf-task-engine-actor-worker`, `cpt-cf-task-engine-actor-platform-admin`
@@ -635,7 +683,7 @@ The system **MUST** maintain a per-queue temporary worker blacklist keyed by con
 
 - [ ] `p3` - **ID**: `cpt-cf-task-engine-fr-reassignment`
 
-The system **MUST** support explicit task reassignment from one worker (or worker pool) to another without losing history. The reassignment **MUST** be recorded in the event history via a `taskReassigned` event (§5.10) carrying the previous and new assignee. Reassignment **MUST** issue a new lease token and lease epoch, fencing off the previous assignee (§5.6 Lease Fencing).
+The system **MUST** support explicit task reassignment from one worker (or worker pool) to another without losing history. The reassignment **MUST** be recorded in the event history via a `taskReassigned` event (§5.10) carrying the previous and new assignee. The request names the new assignee as a worker identity (`subject_id`, `worker_id`, §5.6 Atomic Claim). Reassignment **MUST** issue a new lease token and lease epoch, fencing off the previous assignee (§5.6 Lease Fencing).
 
 - **Rationale**: Reassignment supports escalation, shift handoff, and skill-based routing without task cancellation and re-creation.
 - **Actors**: `cpt-cf-task-engine-actor-api-consumer`, `cpt-cf-task-engine-actor-platform-admin`
@@ -649,7 +697,7 @@ Every lease grant (claim, §5.6 Atomic Claim; reassignment, §5.6 Reassignment) 
 - a **lease token** — opaque, unguessable, unique per lease;
 - a **lease epoch** — a per-task integer incremented on every lease grant, never decreasing.
 
-Both **MUST** be returned to the worker with the task. Every worker-side mutation — start, heartbeat, progress, checkpoint, complete/fail, set wait condition, and task entries created by the worker — **MUST** carry the lease token. The system **MUST** apply a mutation only if its token matches the task's current lease; otherwise it **MUST** reject it with `409 Conflict` (`aborted`, reason `LEASE_LOST`) and leave the task unchanged. `LEASE_LOST` is final for that lease: workers **MUST NOT** retry the rejected call and **MUST** treat it as loss of the task. A progress update accepted before the lease changed but not yet persisted (§5.7) **MUST** be discarded, never applied.
+Both **MUST** be returned to the worker with the task. Every worker-side mutation — start, heartbeat, progress, checkpoint, complete/fail, release, set wait condition, and task entries created by the worker — **MUST** carry the lease token. The system **MUST** apply a mutation only if its token matches the task's current lease; otherwise it **MUST** reject it with `409 Conflict` (`aborted`, reason `LEASE_LOST`) and leave the task unchanged. `LEASE_LOST` is final for that lease: workers **MUST NOT** retry the rejected call and **MUST** treat it as loss of the task. A progress update accepted before the lease changed but not yet persisted (§5.7) **MUST** be discarded, never applied.
 
 Once a lease is lost (expiry, requeue, retry, reassignment, forced cancellation), its token **MUST NOT** become valid again. Operations by non-worker actors (create, cancel, reassign, resolve input, bulk/admin) do not carry a token and are governed by authorization only.
 
@@ -725,6 +773,18 @@ The system **MUST** support configurable retry policies per task (or inherited f
 
 Tasks that exhaust their retry budget or exceed their lifetime (§5.3) **MUST**, when a dead-letter queue is configured on their queue, be moved to that dead-letter queue rather than being silently discarded (tasks with no DLQ configured transition to `failed` instead — see the single terminal routing rule in §5.8 Retry and §5.3). Dead-lettering moves the task into the configured dead-letter queue and records the queue it came from; re-enqueue returns it to that queue, admitted against its queue depth limits (§5.2). A queue and its dead-letter queue **MUST** resolve to the same task domain (§5.19). DLQ tasks **MUST** be queryable, inspectable, and manually re-enqueueable. Re-enqueue (single or bulk retry, §5.18) requires the `admin` action (§5.11).
 
+**Re-enqueue rules**: An administrator **MAY** re-enqueue a `dead_lettered` task (back to the queue it came from) or a `failed` task (to its current queue), so failed work can be retried even on a queue with no DLQ. `completed` and `cancelled` tasks cannot be re-enqueued. A re-enqueue **MUST**, in one transaction:
+
+- reset `retry_count` and `liveness_requeues` to 0, so the task gets its full retry budgets again; `attempt` keeps counting;
+- clear the previous result (result code, output, error, warnings) and keep the context, so the next attempt can resume from the last checkpoint;
+- re-arm the lifetime timeout from the re-enqueue time (the lifetime budget starts again), and re-arm the SLA timer only if `sla_deadline` is still in the future;
+- for a type with a derived dedup identity (§5.1): take the identity again; if another task now holds it, reject with `409 Conflict` (`already_exists`) naming that task (subject to the same read check as on creation);
+- for a type with supersession (§5.1): reject with `400` (`failed_precondition`, reason `STALE_ORDER`) if the group has a newer order value;
+- pass queue depth admission (§5.2), which **MAY** refuse it with `429`;
+- move the task to `queued` and publish a `taskQueued` event with reason `reenqueued` and the acting subject.
+
+Successors already cancelled with `dependencyFailed` are not revived (§5.9).
+
 **Task-domain scope of DLQ inspection** (§5.19): DLQ inspection is a read/inspection path. When the caller does not specify a task type (and therefore does not pin a single domain), DLQ inspection **MUST** fan out across all task domains and merge results with consistent sorting and pagination — the same cross-domain fan-out behavior defined for generic listing queries in §5.19. When a task type or domain is specified, inspection is scoped to that domain.
 
 - **Rationale**: DLQs prevent silent data loss and are standard in enterprise task systems. Fanning out DLQ inspection across domains by default ensures operators see all parked failures rather than missing dead letters in domains they did not think to query.
@@ -736,7 +796,7 @@ Tasks that exhaust their retry budget or exceed their lifetime (§5.3) **MUST**,
 
 - [ ] `p2` - **ID**: `cpt-cf-task-engine-fr-parent-child`
 
-The system **MUST** support parent/child task relationships. A parent task **MAY** create child tasks during execution. The system **MUST** track child completion status and, when the parent sets `wait_for_children`, reject the parent's successful completion while any child is non-terminal (`400`, `failed_precondition`, reason `CHILDREN_PENDING`). Cancelling a parent **MUST** cancel its non-terminal children unless the parent sets `propagate_cancel=false` (default `true`).
+The system **MUST** support parent/child task relationships. A parent task **MAY** create child tasks during execution. The system **MUST** track child completion status and, when the parent sets `wait_for_children`, reject the parent's successful completion while any child is non-terminal (`400`, `failed_precondition`, reason `CHILDREN_PENDING`). A parent that must wait for its children **SHOULD** park on a **children** wait condition (§5.4) instead of holding its lease or polling. Cancelling a parent **MUST** cancel its non-terminal children unless the parent sets `propagate_cancel=false` (default `true`).
 
 **Single-domain constraint** (§5.19): a parent and all of its children **MUST** reside in the same task domain (database). If a child's GTS type would route it to a different domain than its parent, child creation **MUST** be rejected with `400 Bad Request` (`invalid_argument`). This keeps completion tracking and cancellation propagation within one database.
 
@@ -751,7 +811,7 @@ The system **MUST** support parent/child task relationships. A parent task **MAY
 
 The system **MUST** support predecessor/successor dependency declarations: a task specifies prerequisite tasks that must complete successfully before it becomes eligible for assignment. Dependencies **MUST** support `ALL` (all predecessors must succeed) and `ANY` (first predecessor to succeed unblocks) modes.
 
-**Predecessor failure**: a predecessor that ends in `failed`, `cancelled`, or `dead_lettered` counts as failed for dependency purposes (a later administrative re-enqueue of a dead-lettered predecessor does not revive successors). When a dependency set can no longer be satisfied — in `ALL` mode, any predecessor failed; in `ANY` mode, every predecessor failed — the successor **MUST** transition from `blocked` to `cancelled` with result code `dependencyFailed` — in the same transaction as the predecessor's terminal transition for small fan-outs, and otherwise through the same guaranteed, durable cascade as child cancellation (§5.9 Parent/Child), so no transaction is unbounded and no successor is ever skipped. This cascades: the cancelled successor is in turn a failed predecessor for its own successors. A creation or dependency mutation that would make the set unsatisfiable at once (e.g., an `ALL` dependency on an already-failed task) **MUST** be rejected with `400 Bad Request` (`failed_precondition`).
+**Predecessor failure**: a predecessor that ends in `failed`, `cancelled`, or `dead_lettered` counts as failed for dependency purposes (a later administrative re-enqueue of a dead-lettered or failed predecessor does not revive successors). When a dependency set can no longer be satisfied — in `ALL` mode, any predecessor failed; in `ANY` mode, every predecessor failed — the successor **MUST** transition from `blocked` to `cancelled` with result code `dependencyFailed` — in the same transaction as the predecessor's terminal transition for small fan-outs, and otherwise through the same guaranteed, durable cascade as child cancellation (§5.9 Parent/Child), so no transaction is unbounded and no successor is ever skipped. This cascades: the cancelled successor is in turn a failed predecessor for its own successors. A creation or dependency mutation that would make the set unsatisfiable at once (e.g., an `ALL` dependency on an already-failed task) **MUST** be rejected with `400 Bad Request` (`failed_precondition`).
 
 **Mutability and cycle validation**: Dependencies **MAY** be declared at task creation (see §5.1) and **MAY** be added or removed after creation via the dependency-management API (§5.13) while the task is still non-terminal and not yet running. Adding an unmet predecessor moves a `queued` or `scheduled` task to `blocked` (an admission against `tenant_max_deferred_tasks`, §5.2); removing the last unmet one unblocks it as in §5.1. The dependency graph **MUST** be validated to prevent cycles on **every** mutation — both at creation time and on every post-creation dependency change — not only at creation. A mutation that would introduce a cycle **MUST** be rejected with `400 Bad Request` (`invalid_argument`, reason `CYCLE_DETECTED`).
 
@@ -872,7 +932,7 @@ The system **MUST** define a GTS base type for queues:
 gts.cf.core.tasks.queue.v1~
 ```
 
-Each queue **MUST** be registered as a GTS well-known instance derived from this base type. The queue registration **MUST** include: `global_concurrency_limit`, `per_tenant_concurrency_limit`, default priority, default timeout values (queue, assignment, execution, heartbeat, lifetime), default retry policy, optional default progress settings (progress event mode and progress flush interval, §5.7 Progress Events), optional `queue_max_queue_depth` (§5.2 Queue Depth Limits; falls back to the configured default when omitted), optional worker-blacklist threshold and duration (§5.6 Worker Blacklisting; fall back to config defaults), and optional dead-letter queue reference (another queue GTS instance). Queue names used in task creation and claiming **MUST** reference registered GTS queue instances. New queues **MUST** be registerable via GTS without DDL changes.
+Each queue **MUST** be registered as a GTS well-known instance derived from this base type. The queue registration **MUST** include: `global_concurrency_limit`, `per_tenant_concurrency_limit`, default priority, default timeout values (queue, assignment, execution, heartbeat, lifetime), default retry policy, optional default progress settings (progress event mode and progress flush interval, §5.7 Progress Events), optional `queue_max_queue_depth` (§5.2 Queue Depth Limits; falls back to the configured default when omitted), optional worker-blacklist threshold and duration (§5.6 Worker Blacklisting; fall back to config defaults), optional tenant fairness mode (§5.2 Tenant Fairness; default `round_robin`), and optional dead-letter queue reference (another queue GTS instance). Queue names used in task creation and claiming **MUST** reference registered GTS queue instances. New queues **MUST** be registerable via GTS without DDL changes.
 
 - **Rationale**: Modeling queues as GTS instances makes them discoverable, self-documenting, and consistent with the platform type system. Queue parameters (concurrency, timeouts, retry) are defined once in the registration and overridable in config.
 - **Actors**: `cpt-cf-task-engine-actor-platform-admin`
@@ -883,7 +943,7 @@ Each queue **MUST** be registered as a GTS well-known instance derived from this
 
 Task states (`scheduled`, `queued`, `blocked`, `claimed`, `running`, `waiting`, `completed`, `failed`, `cancelled`, `dead_lettered`) and result codes (`success`, `warning`, `error`, `cancelled`, `timedOut`, `forciblyCancelled`, `superseded`, `dependencyFailed`) **MUST** be modeled as closed SDK/domain enums managed by Task Engine, not as GTS well-known instances.
 
-The following states are **terminal**: `completed`, `failed`, `cancelled`, `dead_lettered`. Tasks in terminal states **MUST NOT** transition to any other state except via explicit administrative re-enqueue (which transitions `dead_lettered` → `queued`). The following states are **non-terminal**: `scheduled`, `queued`, `blocked`, `claimed`, `running`, `waiting`. Non-terminal states participate in timeout enforcement, retention hard-limit cleanup, and lifecycle event publishing. The `cancelled` state **MUST** be used when cancellation ends the lifecycle; the cancellation result code records the cancellation outcome or mode.
+The following states are **terminal**: `completed`, `failed`, `cancelled`, `dead_lettered`. Tasks in terminal states **MUST NOT** transition to any other state except via explicit administrative re-enqueue (which transitions `dead_lettered` or `failed` → `queued`, §5.8 Re-enqueue rules). The following states are **non-terminal**: `scheduled`, `queued`, `blocked`, `claimed`, `running`, `waiting`. Non-terminal states participate in timeout enforcement, retention hard-limit cleanup, and lifecycle event publishing. The `cancelled` state **MUST** be used when cancellation ends the lifecycle; the cancellation result code records the cancellation outcome or mode.
 
 State and result-code persistence **MUST** use compact numeric enum codes (`u8` in SDK/domain types; `TINYINT` or the backend's smallest portable integer type in storage), not strings and not GTS UUIDs.
 
@@ -914,7 +974,7 @@ The system **MUST** define a GTS base type for task entry types (`gts.cf.core.ta
 
 The system **MUST** expose a REST API at `/api/task_engine/v1` with endpoints for:
 
-- Task CRUD, claim, start, heartbeat, progress, checkpoint, complete, cancel (worker-side operations carry the lease token, §5.6 Lease Fencing)
+- Task CRUD, claim, start, heartbeat, progress, checkpoint, complete, release, cancel (worker-side operations carry the lease token, §5.6 Lease Fencing)
 - Task entry create, read, list (entries are immutable; no update/delete on the client path — see §5.5)
 - Wait condition set, query, resolve (provide input). There are no dedicated approve/reject endpoints: approval gates compose with the `approval-service` gear via an **event** wait condition (§4.2), and ad-hoc structured decisions use the **input** wait condition.
 - Queue configuration and introspection
@@ -999,7 +1059,7 @@ The system **MUST** provide paginated search for tasks with: **response detail l
 
 - [ ] `p2` - **ID**: `cpt-cf-task-engine-fr-bulk-ops`
 
-The system **MUST** support bulk operations in a single API call: batch cancel, batch reprioritize, batch retry (re-enqueue from DLQ), and batch move (transfer tasks between queues).
+The system **MUST** support bulk operations in a single API call: batch cancel, batch reprioritize, batch retry (re-enqueue `dead_lettered` or `failed` tasks, §5.8 Re-enqueue rules), and batch move (transfer tasks between queues).
 
 **Per-task authorization and partial success**: Authorization for bulk operations **MUST** be evaluated **per task** (not once for the whole batch), consistent with the fail-closed model in §5.11 applied at the `SecureConn`/`AccessScope` level. A bulk request **MUST** return a **partial-success** response that reports each task's outcome individually — `succeeded`, `unauthorized` (403-equivalent for that task), `not_found`, or `invalid_state` — so that authorized tasks proceed while unauthorized ones are reported without failing the whole request. The response shape is a per-task result list keyed by task ID.
 
@@ -1313,7 +1373,7 @@ Although the Task Engine treats task/entry payloads as opaque and does not proce
 - [ ] On a multi-node deployment, a task enqueued on one node is claimed by a long-poll worker parked on another node within the configured poll interval
 - [ ] Retry policy re-enqueues with correct backoff delay; `attempt` is incremented exactly once per lifecycle (on the subsequent claim, not on the retry re-enqueue)
 - [ ] Dead-letter queue captures tasks that exhaust retries; DLQ tasks are re-enqueueable
-- [ ] Wait conditions (timer, event, input) correctly suspend and resume tasks; a `waiting` task holds no concurrency slot, lease, or assignee, resumes via `queued` and a new claim, and that claim does not increment `attempt`
+- [ ] Wait conditions (timer, event, input, children) correctly suspend and resume tasks; a `waiting` task holds no concurrency slot, lease, or assignee, resumes via `queued` and a new claim, and that claim does not increment `attempt`
 - [ ] Ten consecutive `fault=task` failures do not blacklist a worker; ten consecutive lease expiries or `fault=worker` failures do
 - [ ] Event wait condition evaluates match expressions against incoming events
 - [ ] Concurrency limits are enforced atomically on claim across every dimension — queue global, queue per-tenant, type global, and type per-tenant — with no more than the configured N tasks executing per dimension, verified under concurrent claims
@@ -1346,6 +1406,12 @@ Although the Task Engine treats task/entry payloads as opaque and does not proce
 - [ ] After reassignment, the previous assignee's heartbeat is rejected with `409` (`LEASE_LOST`) and the lease epoch has increased
 - [ ] A progress update buffered under a lease that is subsequently lost is never persisted
 - [ ] Repeating a successful complete with the same lease token and identical result returns `200` with the stored outcome; a different result returns `400`
+- [ ] A claim without a valid `worker_id` is rejected with `400`; two worker processes under the same principal with different `worker_id`s are blacklisted independently
+- [ ] A voluntary release returns the task to `queued` (or `scheduled` with a delay) at once, releases its slots, and changes neither `retry_count`, `liveness_requeues`, `attempt`, nor the worker's blacklist counter
+- [ ] An event published after an arm call returns satisfies the armed condition; the following park returns the resolved data and the task stays `running` under the same lease
+- [ ] A parent parked on a children wait condition resumes exactly once, after its last child reaches a terminal state, with the count of children per terminal state
+- [ ] On a `round_robin` queue, with tenant A holding 1,000 queued tasks and tenant B holding 10 at the same priority, B's tasks are claimed interleaved with A's rather than after all of A's
+- [ ] Re-enqueuing a `dead_lettered` or `failed` task resets both retry budgets, clears the previous result, restarts the lifetime timeout, and is rejected `409` if another task now holds its dedup identity
 
 ## 10. Dependencies
 

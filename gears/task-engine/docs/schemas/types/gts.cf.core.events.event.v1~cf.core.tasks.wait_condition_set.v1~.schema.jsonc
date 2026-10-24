@@ -67,7 +67,8 @@
               "enum": [
                 "timer",
                 "event",
-                "input"
+                "input",
+                "children"
               ]
             },
             "timeout_at": {
@@ -78,6 +79,11 @@
               ],
               "format": "date-time",
               "default": null
+            },
+            "parked": {
+              "description": "`false` when the group was armed and the task keeps running (PRD §5.4 Arm before acting); `true` when the task was parked.",
+              "type": "boolean",
+              "default": true
             }
           },
           "required": [
