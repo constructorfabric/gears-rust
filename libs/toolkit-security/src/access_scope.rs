@@ -89,7 +89,7 @@ impl From<bool> for ScopeValue {
 /// Well-known authorization property names.
 ///
 /// These constants are shared between the PEP compiler and the ORM condition
-/// builder (`ScopableEntity::resolve_property()`), ensuring a single source of
+/// builder (`ScopeProperties::resolve_property()`), ensuring a single source of
 /// truth for property names.
 pub mod pep_properties {
     /// Tenant-ownership property. Typically maps to the `tenant_id` column.
@@ -105,7 +105,7 @@ pub mod pep_properties {
 /// A single scope filter — a typed predicate on a named resource property.
 ///
 /// The property name (e.g., `"owner_tenant_id"`, `"id"`) is an authorization
-/// concept. Mapping to DB columns is done by `ScopableEntity::resolve_property()`.
+/// concept. Mapping to DB columns is done by `ScopeProperties::resolve_property()`.
 ///
 /// Variants mirror the predicate types from the PDP response:
 /// - [`ScopeFilter::Eq`] — equality (`property = value`)

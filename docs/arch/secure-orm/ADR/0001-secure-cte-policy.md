@@ -16,10 +16,10 @@ scope condition**. This is guaranteed mechanically, not by convention:
 
 - A typestate transition `Unscoped → Scoped` — a query physically cannot be executed
   until `.scope_with()` is called
-  ([select.rs:151-188](../../../../libs/toolkit-db/src/secure/select.rs#L151-L188)).
+  ([select.rs:153-190](../../../../libs/toolkit-db/src/secure/select.rs#L153-L190)).
   The `Scoped` marker carries an `Arc<AccessScope>` so related-entity queries inherit
   the same scope
-  ([select.rs:22-25](../../../../libs/toolkit-db/src/secure/select.rs#L22-L25)).
+  ([select.rs:24-27](../../../../libs/toolkit-db/src/secure/select.rs#L24-L27)).
 - `build_scope_condition::<E>()` attaches a `WHERE` for the concrete entity `E` via
   `E::resolve_property()`
   ([cond.rs:54-83](../../../../libs/toolkit-db/src/secure/cond.rs#L54-L83)).
@@ -32,7 +32,7 @@ inside `WITH` stay unfiltered — a direct tenant-isolation hole.
 
 The naive workaround — "expose `into_inner()` and assemble the CTE by hand on
 sea_query"
-([select.rs:415-418](../../../../libs/toolkit-db/src/secure/select.rs#L415-L418)) —
+([select.rs:417-420](../../../../libs/toolkit-db/src/secure/select.rs#L417-L420)) —
 also violates the platform guardrails. The rule **"No plain SQL in
 handlers/services/repos. Raw SQL is allowed only in migration infrastructure"** is
 explicit and repeated in
@@ -182,7 +182,7 @@ The invariant this yields:
 - The outer query is itself `Scoped` on its own root entity.
 - The `Scopable` requirement is not a separate check: `SecureSelect<E, Scoped>` is only
   reachable through `scope_with`/`scope_with_arc`, which are bounded `E: ScopableEntity`
-  ([select.rs:151-155](../../../../libs/toolkit-db/src/secure/select.rs#L151-L155)). So
+  ([select.rs:153-157](../../../../libs/toolkit-db/src/secure/select.rs#L153-L157)). So
   `with_ctes` is reachable only from a `Scoped` select, and `cte`/`recursive_cte` carry
   `J: ScopableEntity` for the body entity, so a non-`Scopable` entity can never reach a
   CTE.
@@ -258,11 +258,11 @@ and *not* taken, recorded so they are not revisited:
 ### Feasibility constraint (must be honored by the implementation)
 
 `SecureSelect.inner` is a **`sea_orm::Select<E>`**, not a `sea_query::SelectStatement`
-([select.rs:60-65](../../../../libs/toolkit-db/src/secure/select.rs#L60-L65)).
+([select.rs:62-67](../../../../libs/toolkit-db/src/secure/select.rs#L62-L67)).
 Execution goes through `self.inner.all()/one()/count()`
-([select.rs:200-232](../../../../libs/toolkit-db/src/secure/select.rs#L200-L232)), and
+([select.rs:202-234](../../../../libs/toolkit-db/src/secure/select.rs#L202-L234)), and
 the only public unwrap is `into_inner() -> Select<E>`
-([select.rs:415-418](../../../../libs/toolkit-db/src/secure/select.rs#L415-L418)) —
+([select.rs:417-420](../../../../libs/toolkit-db/src/secure/select.rs#L417-L420)) —
 there is no `into_query()`. Critically, **`sea_orm::Select<E>` has no `.with()`
 method**; `WithClause`/`CommonTableExpression` live on `sea_query`. Therefore
 the CTE API cannot be a drop-in over `inner`. This still holds in sea-orm 2.0.2. How the
