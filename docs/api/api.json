@@ -11188,7 +11188,9 @@
           "ref_type": {
             "type": "string"
           },
-          "snapshot": {},
+          "snapshot": {
+            "description": "The content the review reads, as stored at submit. Each price of a prices snapshot, in\n`before` and `after`, carries its `currency` and `currency_scale` (D-539), so a review\nrenders its money from the unit alone; `book { id, code, name, currency }` is put beside\neach book id at read (D-516)."
+          },
           "state": {
             "$ref": "#/components/schemas/PricingUnitState"
           },
@@ -39021,7 +39023,7 @@
     },
     "/bss-pricing/v1/currencies": {
       "get": {
-        "description": "Returns every currency a price book can use, with the number of decimal places a new price in that currency uses: the active ISO 4217 codes, and the codes the deployment's currency_scales config adds (iso false). The list is sorted by code and is the same for every tenant; the settings' currencies limit only which currency a new book can use (D-438, D-529, D-537). A saved price keeps the scale it was saved with (D-531). A caller without config read gets 403.",
+        "description": "Returns every currency a price book can use, with the number of decimal places a new price in that currency uses: the active ISO 4217 codes, and the codes the deployment's currency_scales config adds (iso false). The list is sorted by code and is the same for every tenant; the settings' currencies limit only which currency a new book can use (D-438, D-529, D-537). A saved price keeps the scale it was saved with (D-531). Any authenticated caller reads the table: it holds no tenant data, so no permission is asked.",
         "operationId": "bss_pricing.list_currencies",
         "responses": {
           "200": {

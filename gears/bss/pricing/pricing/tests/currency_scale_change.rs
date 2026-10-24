@@ -767,7 +767,7 @@ async fn a_temporary_price_over_a_fee_off_the_narrowed_scale_names_where_its_fee
 /// D-537: `GET /currencies` lists today's table, in code order: the active ISO 4217 codes and the
 /// deployment's own, each with the scale a new price takes. A changed table answers the changed
 /// scale, and a new price takes it. Every tenant reads the same table, whatever its settings
-/// offer.
+/// offer, and no grant is asked for it.
 #[tokio::test]
 async fn the_currency_table_read_answers_todays_table() {
     let iso_only = Fixture::new(Arc::new(Script::default())).await;
@@ -846,7 +846,7 @@ async fn the_currency_table_read_answers_todays_table() {
     let elsewhere = SecurityContext::builder()
         .subject_id(Uuid::new_v4())
         .subject_tenant_id(Uuid::new_v4())
-        .subject_type("config:read")
+        .subject_type("user")
         .build()
         .unwrap();
     let (status, theirs, _) = request(
@@ -862,6 +862,6 @@ async fn the_currency_table_read_answers_todays_table() {
     assert_eq!(status, 200, "{theirs}");
     assert_eq!(
         theirs, before,
-        "every tenant reads the same table, whatever its settings offer"
+        "every authenticated caller reads the same table, whatever its tenant's settings offer"
     );
 }
