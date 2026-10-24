@@ -967,6 +967,14 @@ coverage-e2e-local: check-prereq-e2e-local
 
 .PHONY: mini-chat-docker mini-chat-helm mini-chat-helm-template mini-chat-up mini-chat-down mini-chat-port-forward
 
+# Dockerfiles that use BuildKit cache mounts need the Buildx CLI plugin. Without
+# it `docker build` stops at "BuildKit is enabled but the buildx component is
+# missing or broken", which does not say which plugin to install. $(1) is the
+# Dockerfile that needs it.
+define check_docker_buildx
+    @docker buildx version >/dev/null 2>&1 || (echo "ERROR: 'docker buildx' is not available, and $(1) uses BuildKit cache mounts. Install the Buildx plugin for your Docker distribution - see 'Prepare environment > Docker' in docs/web-docs/build-with-gears/index.mdx." && exit 1)
+endef
+
 ## Build mini-chat Docker image for K8s (dev build by default, RELEASE=1 for optimized)
 ## On linux: builds on host (reuses local target/), then packages the binary.
 ## On other OS: full multi-stage Docker build with BuildKit caching.
@@ -988,6 +996,7 @@ ifeq ($(shell uname -s),Linux)
 	@rm -rf .docker-stage
 else
 	@echo "==> Non-linux host: full Docker build"
+	$(call check_docker_buildx,mini-chat.Dockerfile)
 	DOCKER_BUILDKIT=1 docker build \
 		-f gears/mini-chat/deploy/docker/mini-chat.Dockerfile \
 		--build-arg CARGO_FEATURES="$(MINI_CHAT_K8S_FEATURES)" \
