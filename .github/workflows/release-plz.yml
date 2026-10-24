@@ -98,7 +98,7 @@ jobs:
           cache: false
 
       - name: Install protoc
-        uses: taiki-e/install-action@861a07ce7084f55488e375df125cdc99bba60eb7 # v2.87.23
+        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
         with:
           tool: protoc@3.34.1
 
@@ -114,7 +114,7 @@ jobs:
 
       - name: release-plz release
         id: release-plz
-        uses: release-plz/action@f393a7b38aca9d9b4c58447b291dbac963901df6 # v0.3.155
+        uses: release-plz/action@8921286633dfa0c4020f7f30bd1c14fe19cbb10e # v0.3.155
         with:
           command: release
         env:
@@ -169,7 +169,7 @@ jobs:
           cache: false
 
       - name: Install protoc
-        uses: taiki-e/install-action@861a07ce7084f55488e375df125cdc99bba60eb7 # v2.87.23
+        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
         with:
           tool: protoc@3.34.1
 
@@ -179,7 +179,7 @@ jobs:
           rustup show
 
       - name: release-plz release-pr
-        uses: release-plz/action@f393a7b38aca9d9b4c58447b291dbac963901df6 # v0.3.155
+        uses: release-plz/action@8921286633dfa0c4020f7f30bd1c14fe19cbb10e # v0.3.155
         with:
           command: release-pr
         env:
