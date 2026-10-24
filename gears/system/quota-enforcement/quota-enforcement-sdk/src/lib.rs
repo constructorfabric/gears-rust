@@ -48,8 +48,9 @@ pub use gts::{
     RESOURCE_BASE, SCOPE_TENANT, SCOPE_TYPE, SCOPE_USER, SUBJECT_BASE, owned_definitions,
 };
 pub use models::{
-    ActiveQuotaCounts, ApplicableQuotas, AppliedMutation, AttributionDigest, BatchDebitItem,
-    BootstrapBundle, CapPatch, ConfigDefaults, ContractRef, CounterSnapshot, CreditRequest,
+    AcquireLeaseOutcome, AcquireLeaseRequest, ActiveQuotaCounts, ApplicableQuotas, AppliedMutation,
+    ApportionError, AttributionDigest, BatchDebitItem, BootstrapBundle, CapPatch,
+    CommitLeaseRequest, ConfigDefaults, ContractRef, CounterSnapshot, CreditRequest,
     DECISION_BLOB_VERSION, DeactivateOutcome, DebitPlan, DebitRequest, Decision, DecisionPreview,
     DecisionResult, EnforcementMode, EvaluatedDebit, EvaluatedLease, EvaluationAttribution,
     EventId, ExpiredLease, IdempotencyRecord, IdempotencyScope, IdempotencySubjectKey,
@@ -59,10 +60,11 @@ pub use models::{
     PeriodType, PeriodWindow, PolicyDraft, PolicyId, PolicyPatch, PolicyScope, PolicySpec,
     PolicyUpdate, PolicyVersion, PolicyVersionMeta, PolicyVersionState, PreviewRequest,
     ProjectionBinding, Quota, QuotaDebitPlan, QuotaDraft, QuotaFilter, QuotaId, QuotaPatch,
-    QuotaSnapshot, QuotaSource, QuotaSpec, QuotaStatus, QuotaType, QuotaView, ResourceProjection,
-    Retention, RollbackRequest, RollbackTarget, ScopeError, SubjectClaim, SubjectRef, SubjectScope,
-    TenantId, ThresholdCrossing, TransitionOutcome, UnknownValue, ValidityWindow,
-    ValidityWindowPatch, positive_amount,
+    QuotaSnapshot, QuotaSource, QuotaSpec, QuotaStatus, QuotaType, QuotaView, ReleaseLeaseRequest,
+    ResourceProjection, Retention, RollbackRequest, RollbackTarget, RollbackableOperation,
+    ScopeError, SubjectClaim, SubjectRef, SubjectScope, TenantId, ThresholdCrossing,
+    TransitionOutcome, UnknownValue, ValidityWindow, ValidityWindowPatch, apportion,
+    positive_amount,
 };
 pub use storage_plugin::{
     CONTRACT_MAJOR, EvaluatedBatch, EvaluatedMutation, QuotaEnforcementStoragePluginV1,

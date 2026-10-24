@@ -438,6 +438,10 @@ impl DomainError {
 impl From<StorageError> for DomainError {
     fn from(err: StorageError) -> Self {
         match err {
+            StorageError::LeaseNotFound { token } => Self::NotFound {
+                kind: ResourceKind::Lease,
+                id: token.to_string(),
+            },
             StorageError::LeaseNotActive { token } => Self::LeaseNotActive { token },
             StorageError::LeaseInflightLimitExceeded => Self::LeaseInflightLimitExceeded,
             StorageError::LeaseContentionTimeout => Self::LeaseContentionTimeout,

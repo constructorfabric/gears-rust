@@ -23,7 +23,7 @@ use toolkit_db::secure::SecureUpdateExt;
 use toolkit_security::{AccessScope, SecurityContext};
 
 use super::SqlConsumptionStore;
-use crate::domain::ports::{ConsumptionStore, QuotaStore};
+use crate::domain::ports::{ConsumptionStore, LeaseStore, QuotaStore};
 use crate::infra::storage::entity::{
     quota_allocation_counter as alloc, quota_consumption_counter as counter,
 };
@@ -275,6 +275,35 @@ impl Harness {
                     evaluate: self.callback(),
                 },
                 &[],
+            )
+            .await
+    }
+
+    async fn acquire(
+        &self,
+        subject_id: &str,
+        amount: u64,
+        ttl: std::time::Duration,
+        idempotency: &IdempotencyWrite,
+    ) -> Result<TransitionOutcome<quota_enforcement_sdk::EvaluatedLease>, StorageError> {
+        let applicable = applicable(subject_id);
+        let null = serde_json::Value::Null;
+        self.store
+            .acquire_lease(
+                &ctx(),
+                &scope_for(tenant()),
+                &EvaluatedMutation {
+                    applicable: &applicable,
+                    amount,
+                    request: &null,
+                    resource: &null,
+                    user_projection: None,
+                    limits: limits(),
+                    idempotency,
+                    authorized: authorized(),
+                    evaluate: self.callback(),
+                },
+                ttl,
             )
             .await
     }
@@ -1113,6 +1142,299 @@ async fn a_debit_that_waits_out_a_boundary_charges_the_period_it_commits_in() {
         h.consumed("u1", id).await,
         7,
         "the closing period keeps its own total"
+    );
+    h.down().await;
+}
+
+// --- lease accounting (I4, I5) ---------------------------------------------
+
+/// One hour, comfortably inside the platform's TTL window.
+const TTL: std::time::Duration = std::time::Duration::from_hours(1);
+
+#[tokio::test]
+async fn an_expired_hold_stops_counting_against_capacity_before_any_sweep() {
+    let h = Harness::up().await;
+    let id = h.allocation_quota("u1", Some(100)).await;
+
+    h.acquire("u1", 100, TTL, &write(OperationType::Reserve, "r1", 1))
+        .await
+        .expect("the whole cap is held");
+    assert_eq!(h.consumed("u1", id).await, 100);
+
+    // Past the TTL, with no sweeper anywhere near it.
+    h.set_now(DAY_ONE + time::Duration::hours(2));
+    assert_eq!(
+        h.consumed("u1", id).await,
+        0,
+        "a read subtracts what an expired hold still occupies (I4)"
+    );
+    let admitted = h
+        .debit("u1", 100, &write(OperationType::Debit, "d1", 2))
+        .await
+        .expect("debit");
+    assert!(
+        matches!(
+            admitted.get().decision.result,
+            quota_enforcement_sdk::DecisionResult::Allowed
+        ),
+        "an unreclaimed expired hold blocks nothing"
+    );
+    assert_eq!(h.consumed("u1", id).await, 100, "only the debit counts");
+    h.down().await;
+}
+
+#[tokio::test]
+async fn the_first_writer_returns_an_expired_hold_and_a_later_sweep_moves_nothing() {
+    // The sequence a read-side correction alone gets wrong: a credit that
+    // floors, a debit after it, and only then the sweeper. Returning the hold
+    // twice would erase the debit that arrived in between.
+    let h = Harness::up().await;
+    let id = h.allocation_quota("u1", Some(1000)).await;
+
+    h.debit("u1", 20, &write(OperationType::Debit, "d1", 1))
+        .await
+        .expect("debit");
+    h.acquire("u1", 80, TTL, &write(OperationType::Reserve, "r1", 2))
+        .await
+        .expect("acquire");
+    assert_eq!(h.consumed("u1", id).await, 100, "20 debited plus 80 held");
+
+    h.set_now(DAY_ONE + time::Duration::hours(2));
+    assert_eq!(h.consumed("u1", id).await, 20, "the hold expired");
+
+    h.store
+        .apply_credit(&ctx(), &scope_for(tenant()), id, 50, &partial("c1", 3), &[])
+        .await
+        .expect("credit");
+    assert_eq!(h.consumed("u1", id).await, 0, "a credit floors at zero");
+
+    h.debit("u1", 30, &write(OperationType::Debit, "d2", 4))
+        .await
+        .expect("debit after the credit");
+    assert_eq!(h.consumed("u1", id).await, 30);
+
+    let reclaimed = h
+        .store
+        .reclaim_expired_leases(10, DAY_ONE + time::Duration::hours(2))
+        .await
+        .expect("sweep");
+    assert_eq!(reclaimed.len(), 1);
+    assert_eq!(
+        h.consumed("u1", id).await,
+        30,
+        "the hold was already returned, so the sweep moves nothing"
+    );
+    h.down().await;
+}
+
+#[tokio::test]
+async fn a_period_holding_a_live_lease_is_not_settled() {
+    let h = Harness::up().await;
+    let id = h.consumption_quota("u1", Some(1000), Vec::new()).await;
+    // A TTL that outlives the boundary, which is what opens a settlement
+    // window at all. The store takes the TTL as given; bounding it to
+    // `[min_lease_ttl, max_lease_ttl]` is the gear's job.
+    let across_the_boundary = std::time::Duration::from_hours(48);
+    h.acquire(
+        "u1",
+        10,
+        across_the_boundary,
+        &write(OperationType::Reserve, "r1", 1),
+    )
+    .await
+    .expect("acquire inside day one");
+
+    // Day two: the debit would normally settle day one and emit its rollover.
+    h.set_now(DAY_ONE + time::Duration::days(1));
+    h.debit("u1", 5, &write(OperationType::Debit, "d1", 2))
+        .await
+        .expect("debit in the new period");
+    assert!(
+        !h.events()
+            .await
+            .iter()
+            .any(|kind| kind == "period-rollover"),
+        "a period a live lease can still settle against stays open (I5)"
+    );
+
+    // Once the lease has resolved, the next writer closes the period.
+    h.set_now(DAY_ONE + time::Duration::days(3));
+    h.store
+        .reclaim_expired_leases(10, DAY_ONE + time::Duration::days(3))
+        .await
+        .expect("sweep");
+    h.debit("u1", 5, &write(OperationType::Debit, "d2", 3))
+        .await
+        .expect("debit after the lease resolved");
+    assert!(
+        h.events()
+            .await
+            .iter()
+            .any(|kind| kind == "period-rollover"),
+        "with no live lease left the closing period settles"
+    );
+    let _ = id;
+    h.down().await;
+}
+
+#[tokio::test]
+async fn a_zero_commit_reverses_as_a_no_op_while_a_denied_debit_stays_irreversible() {
+    let h = Harness::up().await;
+    let id = h.allocation_quota("u1", Some(100)).await;
+    let acquired = h
+        .acquire("u1", 40, TTL, &write(OperationType::Reserve, "r1", 1))
+        .await
+        .expect("acquire");
+    let token = acquired.get().token.expect("an allowed acquisition holds");
+
+    h.store
+        .commit_lease(
+            &ctx(),
+            &scope_for(tenant()),
+            token,
+            Some(0),
+            &partial("c1", 2),
+            &[],
+        )
+        .await
+        .expect("a job that used nothing commits nothing");
+    assert_eq!(h.consumed("u1", id).await, 0, "every hold came back");
+
+    // The commit is a real operation, so its rollback succeeds with nothing to
+    // move. The subject key is the acquisition's, which the commit reused.
+    let commit_scope = IdempotencyScope {
+        tenant_id: tenant(),
+        subject_key: IdempotencySubjectKey::of(&[user("u1")]),
+        operation_type: OperationType::Commit,
+        key: "c1".to_owned(),
+    };
+    h.store
+        .apply_rollback(
+            &ctx(),
+            &scope_for(tenant()),
+            &RollbackTarget {
+                original: commit_scope,
+                authorized: authorized(),
+            },
+            &write(OperationType::Rollback, "rb", 3),
+            &[],
+        )
+        .await
+        .expect("a zero commit reverses as a no-op");
+
+    // A debit that moved nothing is not a committed debit.
+    let denied = h
+        .debit("u1", 1_000, &write(OperationType::Debit, "d1", 4))
+        .await
+        .expect("a denial is a successful call");
+    assert!(matches!(
+        denied.get().decision.result,
+        quota_enforcement_sdk::DecisionResult::Denied { .. }
+    ));
+    let refused = h
+        .store
+        .apply_rollback(
+            &ctx(),
+            &scope_for(tenant()),
+            &RollbackTarget {
+                original: write(OperationType::Debit, "d1", 4).scope,
+                authorized: authorized(),
+            },
+            &write(OperationType::Rollback, "rb2", 5),
+            &[],
+        )
+        .await
+        .expect_err("a denied debit is not reversible");
+    assert!(matches!(refused, StorageError::OperationNotFound { .. }));
+    h.down().await;
+}
+
+#[tokio::test]
+async fn an_expired_hold_does_not_hold_a_cap_reduction_hostage() {
+    // The cap guard is a writer on the counter row, so it reconciles before it
+    // judges: capacity an expired lease no longer holds must not block a
+    // reduction until some sweeper happens to run (I4, I6). What it must still
+    // see is the usage that is real.
+    let h = Harness::up().await;
+    let id = h.allocation_quota("u1", Some(100)).await;
+    h.debit("u1", 30, &write(OperationType::Debit, "d1", 9))
+        .await
+        .expect("debit");
+    h.acquire("u1", 40, TTL, &write(OperationType::Reserve, "r1", 1))
+        .await
+        .expect("acquire");
+    assert_eq!(h.consumed("u1", id).await, 70, "30 debited plus 40 held");
+
+    let blocked = h
+        .quotas
+        .update_quota(
+            &actor(),
+            &scope_for(tenant()),
+            id,
+            quota_enforcement_sdk::QuotaPatch {
+                cap: Some(quota_enforcement_sdk::CapPatch::Bounded(50)),
+                ..quota_enforcement_sdk::QuotaPatch::default()
+            },
+            &[],
+        )
+        .await
+        .expect_err("a live hold does block a reduction below it");
+    assert!(matches!(
+        blocked,
+        crate::domain::ports::StoreError::CapBelowConsumed {
+            new_cap: 50,
+            consumed: 70
+        }
+    ));
+
+    // The TTL passes; nothing sweeps.
+    h.set_now(DAY_ONE + time::Duration::hours(2));
+
+    // This is the call that reconciles, and it must judge against the 30 that
+    // is really used — not against the reconciled counter minus the returned
+    // amount a second time, which would read zero and let this through. It has
+    // to come first: once the hold is stamped returned, a later call has
+    // nothing left to subtract twice and the fault hides.
+    let below_usage = h
+        .quotas
+        .update_quota(
+            &actor(),
+            &scope_for(tenant()),
+            id,
+            quota_enforcement_sdk::QuotaPatch {
+                cap: Some(quota_enforcement_sdk::CapPatch::Bounded(20)),
+                ..quota_enforcement_sdk::QuotaPatch::default()
+            },
+            &[],
+        )
+        .await
+        .expect_err("a cap below the real usage is refused");
+    assert!(matches!(
+        below_usage,
+        crate::domain::ports::StoreError::CapBelowConsumed {
+            new_cap: 20,
+            consumed: 30
+        }
+    ));
+
+    // And the reduction the expired hold was wrongly blocking now goes through.
+    h.quotas
+        .update_quota(
+            &actor(),
+            &scope_for(tenant()),
+            id,
+            quota_enforcement_sdk::QuotaPatch {
+                cap: Some(quota_enforcement_sdk::CapPatch::Bounded(50)),
+                ..quota_enforcement_sdk::QuotaPatch::default()
+            },
+            &[],
+        )
+        .await
+        .expect("an expired hold holds nothing hostage");
+    assert_eq!(
+        h.consumed("u1", id).await,
+        30,
+        "the hold came back, the debit stayed"
     );
     h.down().await;
 }

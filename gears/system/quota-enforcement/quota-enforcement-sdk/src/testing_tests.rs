@@ -61,6 +61,17 @@ fn idem(op: OperationType, key: &str, payload: u8) -> IdempotencyWrite {
     }
 }
 
+/// The caller's half of a settlement's key. Commit and release cannot name a
+/// subject key: storage completes the scope from the one the acquisition
+/// persisted.
+fn partial_idem(key: &str, payload: u8) -> PartialIdempotencyWrite {
+    PartialIdempotencyWrite {
+        tenant_id: test_tenant(),
+        key: key.to_owned(),
+        payload_hash: PayloadHash::from_bytes([payload; 32]),
+    }
+}
+
 fn limits() -> EvaluationLimits {
     EvaluationLimits {
         upper_timeout_ms: std::num::NonZeroU64::new(5).expect("nonzero"),
@@ -397,7 +408,7 @@ async fn storage_lease_lifecycle_commit_release_expiry_and_deactivation() {
             &scope(),
             token,
             Some(31),
-            &idem(OperationType::Commit, "c0", 1),
+            &partial_idem("c0", 1),
             &[],
         )
         .await
@@ -416,7 +427,7 @@ async fn storage_lease_lifecycle_commit_release_expiry_and_deactivation() {
             &scope(),
             token,
             Some(20),
-            &idem(OperationType::Commit, "c1", 1),
+            &partial_idem("c1", 1),
             &[],
         )
         .await
@@ -424,13 +435,7 @@ async fn storage_lease_lifecycle_commit_release_expiry_and_deactivation() {
     assert_eq!(storage.consumed(id), 20, "unused reservation is returned");
     assert_eq!(storage.lease_state(token), Some(LeaseState::Committed));
     let again = storage
-        .release_lease(
-            &ctx(),
-            &scope(),
-            token,
-            &idem(OperationType::Release, "x", 1),
-            &[],
-        )
+        .release_lease(&ctx(), &scope(), token, &partial_idem("x", 1), &[])
         .await
         .expect_err("terminal lease");
     assert_eq!(again, StorageError::LeaseNotActive { token });
@@ -442,14 +447,7 @@ async fn storage_lease_lifecycle_commit_release_expiry_and_deactivation() {
     let token2 = token_of(&expiring_lease);
     storage.expire_leases();
     let expired = storage
-        .commit_lease(
-            &ctx(),
-            &scope(),
-            token2,
-            None,
-            &idem(OperationType::Commit, "c2", 1),
-            &[],
-        )
+        .commit_lease(&ctx(), &scope(), token2, None, &partial_idem("c2", 1), &[])
         .await
         .expect_err("expired leases are released lazily (I4)");
     assert_eq!(expired, StorageError::LeaseNotActive { token: token2 });
@@ -894,7 +892,9 @@ async fn storage_deactivation_is_terminal_returns_held_capacity_and_skips_expire
         .await
         .expect("live lease");
     let live = token_of(&live_outcome);
-    assert_eq!(storage.consumed(id), 35);
+    // The second acquisition is a writer on this row, so it gives back the
+    // expired hold before adding its own: 30 returned, 5 held (I4).
+    assert_eq!(storage.consumed(id), 5);
 
     let outcome = storage
         .deactivate_quota(&ctx(), &scope(), id, &[])
@@ -906,7 +906,7 @@ async fn storage_deactivation_is_terminal_returns_held_capacity_and_skips_expire
         "expired leases are not resolved (I4)"
     );
     assert_eq!(storage.lease_state(expired), Some(LeaseState::Active));
-    assert_eq!(storage.consumed(id), 30, "the live hold was returned");
+    assert_eq!(storage.consumed(id), 0, "the live hold was returned");
     let row = storage.quota(id).expect("row");
     assert_eq!(row.status, QuotaStatus::Deactivated);
     assert_eq!(row.record_version, 2);
@@ -2393,4 +2393,285 @@ async fn a_failed_batch_item_discards_every_effect_of_the_items_before_it() {
         storage.period_rows(id).iter().all(|row| row.consumed == 0),
         "the period row the first item filled was rolled back"
     );
+}
+
+// --- lease accounting under expiry -----------------------------------------
+
+#[tokio::test]
+async fn an_expired_hold_is_returned_once_by_whoever_touches_the_counter_first() {
+    // The sequence that a read-side correction alone gets wrong: a credit that
+    // floors, a fresh debit, and only then the sweeper. If the sweeper returned
+    // the hold a second time it would erase the debit that came after it.
+    let storage = storage_with_policy().await;
+    let id = seeded_quota(&storage, Some(1000)).await;
+
+    storage
+        .apply_debit_plan_for(20, &idem(OperationType::Debit, "d1", 1))
+        .await
+        .expect("debit");
+    let held = storage
+        .acquire_lease_for(
+            80,
+            Duration::from_mins(1),
+            &idem(OperationType::Reserve, "r1", 1),
+        )
+        .await
+        .expect("acquire");
+    let token = token_of(&held);
+    assert_eq!(storage.consumed(id), 100, "20 debited plus 80 held");
+
+    storage.expire_leases();
+    assert_eq!(
+        storage.consumed(id),
+        20,
+        "an expired hold stops counting the moment its TTL passes (I4)"
+    );
+
+    storage
+        .apply_credit(&ctx(), &scope(), id, 50, &partial("c1", 2), &[])
+        .await
+        .expect("credit");
+    assert_eq!(storage.consumed(id), 0, "a credit floors at zero");
+
+    storage
+        .apply_debit_plan_for(30, &idem(OperationType::Debit, "d2", 3))
+        .await
+        .expect("debit after the credit");
+    assert_eq!(storage.consumed(id), 30);
+
+    let reclaimed = storage
+        .reclaim_expired_leases(10, OffsetDateTime::now_utc())
+        .await
+        .expect("sweep");
+    assert_eq!(reclaimed.len(), 1);
+    assert_eq!(storage.lease_state(token), Some(LeaseState::AutoReleased));
+    assert_eq!(
+        storage.consumed(id),
+        30,
+        "the hold was already returned, so the sweep moves nothing"
+    );
+    assert!(kinds(&storage).contains(&NotificationEventKind::LeaseAutoReleased));
+}
+
+#[tokio::test]
+async fn an_expired_hold_frees_the_cap_and_the_capacity_without_a_sweep() {
+    let storage = storage_with_policy().await;
+    let id = seeded_quota(&storage, Some(100)).await;
+    let ttl = Duration::from_mins(1);
+
+    storage
+        .acquire_lease_for(100, ttl, &idem(OperationType::Reserve, "r1", 1))
+        .await
+        .expect("the whole cap is held");
+    assert_eq!(storage.consumed(id), 100);
+    storage.expire_leases();
+
+    // No sweeper has run: the row still reads active, and the capacity is free.
+    let after = storage
+        .acquire_lease_for(100, ttl, &idem(OperationType::Reserve, "r2", 2))
+        .await
+        .expect("acquire against the expired hold's capacity");
+    assert!(
+        after.get().token.is_some(),
+        "an unreclaimed expired hold blocks nothing"
+    );
+    assert_eq!(storage.consumed(id), 100, "only the live hold is counted");
+}
+
+#[tokio::test]
+async fn a_denial_is_a_verdict_even_when_the_active_lease_cap_is_full() {
+    let storage = storage_with_policy().await;
+    let id = seeded_quota(&storage, Some(10)).await;
+    storage
+        .bootstrap(&crate::models::BootstrapBundle {
+            config_defaults: ConfigDefaults {
+                max_active_leases: 1,
+                ..ConfigDefaults::default()
+            },
+            ..crate::models::BootstrapBundle::foundation()
+        })
+        .await
+        .expect("seed a cap of one");
+    let ttl = Duration::from_mins(1);
+
+    storage
+        .acquire_lease_for(10, ttl, &idem(OperationType::Reserve, "r1", 1))
+        .await
+        .expect("the one lease the cap allows");
+
+    // The engine refuses this on capacity. The cap is full too, but the caller
+    // is owed the verdict it asked for, not a 429 about a different limit.
+    let denied = storage
+        .acquire_lease_for(5, ttl, &idem(OperationType::Reserve, "r2", 2))
+        .await
+        .expect("a denial is a successful call");
+    assert!(matches!(
+        denied.get().decision.result,
+        DecisionResult::Denied { .. }
+    ));
+    assert!(denied.get().token.is_none());
+    assert_eq!(storage.consumed(id), 10, "a denial holds nothing");
+}
+
+#[tokio::test]
+async fn a_commit_of_zero_returns_every_hold_and_still_reverses_as_a_no_op() {
+    let storage = storage_with_policy().await;
+    let id = seeded_quota(&storage, Some(100)).await;
+    let acquired = storage
+        .acquire_lease_for(
+            40,
+            Duration::from_mins(1),
+            &idem(OperationType::Reserve, "r1", 1),
+        )
+        .await
+        .expect("acquire");
+    let token = token_of(&acquired);
+
+    let committed = storage
+        .commit_lease(
+            &ctx(),
+            &scope(),
+            token,
+            Some(0),
+            &partial_idem("c1", 5),
+            &[],
+        )
+        .await
+        .expect("a job that used nothing commits nothing");
+    assert!(matches!(committed, TransitionOutcome::Applied(_)));
+    assert_eq!(storage.consumed(id), 0, "every hold came back");
+    assert_eq!(storage.lease_state(token), Some(LeaseState::Committed));
+
+    let replay = storage
+        .commit_lease(
+            &ctx(),
+            &scope(),
+            token,
+            Some(0),
+            &partial_idem("c1", 5),
+            &[],
+        )
+        .await
+        .expect("the same key replays its success");
+    assert!(matches!(replay, TransitionOutcome::NoOp(_)));
+
+    // The commit is a real operation, so its rollback succeeds; it simply has
+    // nothing to move. A denied debit, which also records no movement, stays
+    // irreversible.
+    let reversed = storage
+        .apply_rollback(
+            &ctx(),
+            &scope(),
+            &RollbackTarget {
+                original: IdempotencyScope {
+                    tenant_id: test_tenant(),
+                    subject_key: IdempotencySubjectKey::from_bytes([1; 32]),
+                    operation_type: OperationType::Commit,
+                    key: "c1".to_owned(),
+                },
+                authorized: authorized(),
+            },
+            &idem(OperationType::Rollback, "rb", 6),
+            &[],
+        )
+        .await
+        .expect("a zero commit reverses as a no-op");
+    assert!(matches!(reversed, TransitionOutcome::Applied(_)));
+    assert_eq!(storage.consumed(id), 0);
+}
+
+#[tokio::test]
+async fn a_rollback_reverses_the_namespace_it_names_not_the_other() {
+    // A debit and a lease commit under the same key, subjects and tenant. Only
+    // the operation type on the target tells the plugin which one to reverse.
+    let storage = storage_with_policy().await;
+    let id = seeded_quota(&storage, Some(100)).await;
+    // The key the acquisition persisted: the commit reuses it, and the debit
+    // under the same client key resolves to the same one.
+    let subject_key = IdempotencySubjectKey::from_bytes([1; 32]);
+
+    let acquired = storage
+        .acquire_lease_for(
+            30,
+            Duration::from_mins(1),
+            &idem(OperationType::Reserve, "shared", 1),
+        )
+        .await
+        .expect("acquire");
+    let token = token_of(&acquired);
+    storage
+        .commit_lease(
+            &ctx(),
+            &scope(),
+            token,
+            Some(30),
+            &partial_idem("shared", 5),
+            &[],
+        )
+        .await
+        .expect("commit the whole hold");
+    storage
+        .apply_debit_plan_for(20, &idem(OperationType::Debit, "shared", 7))
+        .await
+        .expect("a debit under the same key");
+    assert_eq!(storage.consumed(id), 50, "30 committed plus 20 debited");
+
+    let scope_for = |operation| RollbackTarget {
+        original: IdempotencyScope {
+            tenant_id: test_tenant(),
+            subject_key,
+            operation_type: operation,
+            key: "shared".to_owned(),
+        },
+        authorized: authorized(),
+    };
+    storage
+        .apply_rollback(
+            &ctx(),
+            &scope(),
+            &scope_for(OperationType::Commit),
+            &idem(OperationType::Rollback, "rb-commit", 8),
+            &[],
+        )
+        .await
+        .expect("reverse the commit");
+    assert_eq!(storage.consumed(id), 20, "only the commit was reversed");
+
+    storage
+        .apply_rollback(
+            &ctx(),
+            &scope(),
+            &scope_for(OperationType::Debit),
+            &idem(OperationType::Rollback, "rb-debit", 9),
+            &[],
+        )
+        .await
+        .expect("reverse the debit");
+    assert_eq!(storage.consumed(id), 0);
+}
+
+#[tokio::test]
+async fn a_settlement_refuses_a_token_outside_the_callers_tenant() {
+    let storage = storage_with_policy().await;
+    seeded_quota(&storage, Some(100)).await;
+    let acquired = storage
+        .acquire_lease_for(
+            10,
+            Duration::from_mins(1),
+            &idem(OperationType::Reserve, "r1", 1),
+        )
+        .await
+        .expect("acquire");
+    let token = token_of(&acquired);
+
+    let foreign = PartialIdempotencyWrite {
+        tenant_id: crate::models::TenantId::from(Uuid::from_u128(0xdead_beef)),
+        key: "c1".to_owned(),
+        payload_hash: PayloadHash::from_bytes([5; 32]),
+    };
+    let refused = storage
+        .commit_lease(&ctx(), &scope(), token, None, &foreign, &[])
+        .await
+        .expect_err("another tenant's token is simply absent");
+    assert_eq!(refused, StorageError::LeaseNotFound { token });
 }

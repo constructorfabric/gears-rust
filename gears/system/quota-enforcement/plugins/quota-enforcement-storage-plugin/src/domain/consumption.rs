@@ -3,8 +3,8 @@
 //!
 //! Like the Quota primitives, these are inherent methods rather than a trait
 //! implementation: the `ClientHub` client stays unpublished until every primitive
-//! of the contract exists, so leases, batch debit and the bulk snapshot read
-//! are still missing.
+//! of the contract exists, and batch debit and the bulk snapshot read are still
+//! missing.
 
 use quota_enforcement_sdk::{
     ApplicableQuotas, AppliedMutation, EvaluatedDebit, EvaluatedMutation, IdempotencyRecord,

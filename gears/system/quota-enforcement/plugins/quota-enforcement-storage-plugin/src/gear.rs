@@ -78,10 +78,22 @@ impl Gear for StoragePluginGear {
             Arc::new(SqlFoundationStore::new(db.db())),
             Arc::new(SqlQuotaStore::new(db.db(), self.notification_enqueuer())),
             Arc::new(SqlPolicyStore::new(db.db(), self.notification_enqueuer())),
-            Arc::new(SqlConsumptionStore::new(
-                db.db(),
-                self.notification_enqueuer(),
-            )),
+            {
+                // Leases settle against the counters and records the
+                // consumption store owns, so one adapter serves both ports.
+                let consumption = Arc::new(SqlConsumptionStore::new(
+                    db.db(),
+                    self.notification_enqueuer(),
+                ));
+                Arc::clone(&consumption) as Arc<dyn crate::domain::ports::ConsumptionStore>
+            },
+            {
+                let leases = Arc::new(SqlConsumptionStore::new(
+                    db.db(),
+                    self.notification_enqueuer(),
+                ));
+                leases as Arc<dyn crate::domain::ports::LeaseStore>
+            },
         ));
         self.plugin
             .set(plugin)
