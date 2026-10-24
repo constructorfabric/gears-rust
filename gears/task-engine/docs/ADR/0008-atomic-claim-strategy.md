@@ -30,7 +30,7 @@ description: "Claim tasks with a plain scoped read plus a guarded conditional up
 
 ## Context and Problem Statement
 
-Many workers on many nodes claim tasks from shared queues at the same time. Two workers must never claim the same task, the highest-priority eligible task across all requested queues must win, and slot reservation must be atomic with the claim (ADR-0005). The engine runs on PostgreSQL, MariaDB/MySQL, and SQLite through the ToolKit secure ORM.
+Many workers on many nodes claim tasks from shared queues at the same time. Two workers must never claim the same task, the best eligible task across all requested queues (PRD §5.2 order) must win, and slot reservation must be atomic with the claim (ADR-0005). The engine runs on PostgreSQL, MariaDB/MySQL, and SQLite through the ToolKit secure ORM.
 
 Scoped `SecureSelect` offers `lock_shared()` / `lock_exclusive()` (`FOR UPDATE`), but no `SKIP LOCKED`, which exists only inside the toolkit-db outbox. Plain `FOR UPDATE` does not fix head-row contention.
 
@@ -49,7 +49,7 @@ Scoped `SecureSelect` offers `lock_shared()` / `lock_exclusive()` (`FOR UPDATE`)
 ## Decision Drivers
 
 * No double claim, on any backend.
-* Exact claim order `(priority, created_at, task_id)` across all requested queues.
+* Exact claim order (PRD §5.2): per queue urgency, then tenant fairness, then the tenant's `(priority, created_at, task_id)`; across queues `(urgency, created_at, task_id)`.
 * No dialect-specific SQL; must work through the secure ORM and on SQLite.
 * Claim latency within the PRD targets (p50 50 ms, p99 200 ms).
 * Claim throughput on one queue must grow with the number of workers, not collapse.
@@ -66,11 +66,11 @@ Scoped `SecureSelect` offers `lock_shared()` / `lock_exclusive()` (`FOR UPDATE`)
 
 Chosen option: **Option 3 — Optimistic guarded update with k-way merge**, as a provisional choice that works with today's ToolKit. It is expected to be replaced by Option 1 (where ToolKit allows) or combined with Option 4 once the TODO above is resolved.
 
-Claims use lock-free optimistic concurrency. The engine reads candidate heads with plain scoped `SELECT`s, merges them in claim order, and attempts each candidate with one guarded update that requires `state_code = queued`, reserves concurrency slots with `used = used + 1 WHERE used < limit_value`, sets the lease (`lease_token`, `lease_epoch + 1`, `lease_until`), and increments `attempt`, all in one transaction and in the fixed lock order of DESIGN §3.7. A guard matching zero rows means another worker won; the engine tries the next candidate.
+Claims use lock-free optimistic concurrency. The engine reads candidate heads with plain scoped `SELECT`s, merges them in claim order, and attempts each candidate with one guarded update that requires `state_code = queued`, reserves concurrency slots with `used = used + 1 WHERE used < limit_value`, sets the lease (a random `lease_token` bound to `assignee_subject`, `lease_epoch + 1`, `lease_until`; ADR-0011), and increments `attempt`, all in one transaction and in the fixed lock order of DESIGN §3.7. A guard matching zero rows means another worker won; the engine tries the next candidate.
 
 All queues in one claim must resolve to one task domain, so the claim runs inside one database. The number of queues per claim is capped by `claim_max_queues`.
 
-Hot rows are sharded: with `concurrency_shards = S > 1`, a slot or backlog row is split into S shards whose sub-limits sum to at most N, and a claim reserves against one shard. Background loops (timer wheel, lease scan) are split into `bg_shards` shards guarded by advisory locks; low-frequency maintenance runs under a single advisory-lock leader.
+Hot rows are sharded: with `counter_shards = S > 1`, a cross-tenant slot or backlog row (`te_concurrency_slots`, `te_queue_backlog`) is split into S shards whose sub-limits sum to at most N, and a claim reserves against one shard. Background loops (timer wheel, lease scan) are split into `bg_shards` shards guarded by advisory locks; low-frequency maintenance runs under a single advisory-lock leader.
 
 ### Consequences
 
@@ -86,7 +86,7 @@ Hot rows are sharded: with `concurrency_shards = S > 1`, a slot or backlog row i
 Tests MUST check that:
 
 * concurrent claims never assign one task twice, on every backend;
-* the claimed task is the highest-priority eligible task across all requested queues, regardless of queue order;
+* the claimed task is the first eligible task in the PRD §5.2 order across all requested queues, regardless of queue order;
 * slot reservation and the state change commit or roll back together;
 * sharded limits never admit more than N;
 * claim latency meets the PRD targets under the reference load.
@@ -117,7 +117,7 @@ A single node assigns tasks in order.
 
 ### Option 3: Optimistic guarded update with k-way merge
 
-Each requested queue's head page (`claim_scan_limit` rows, index-ordered by `(priority, created_at, task_id)`) is read through the secure ORM; a k-way merge yields candidates in global order; the claim and slot reservation run in one transaction with guarded conditional updates. Losers move to the next candidate within `claim_candidate_budget`.
+Each requested queue's next candidates (index-ordered, no DB sort: a head page for `fifo` queues, one next-tenant probe for `round_robin` queues) are read through the secure ORM; a k-way merge yields candidates in global order; the claim and slot reservation run in one transaction with guarded conditional updates. Losers move to the next candidate within `claim_candidate_budget`.
 
 * Good, because it behaves identically on every backend, including SQLite.
 * Good, because it uses only the secure ORM surface.
@@ -141,11 +141,14 @@ Workers aim at different rows, so most guarded updates succeed on the first try.
 ## More Information
 
 ```text
-1. per queue: SELECT head page ORDER BY (priority, created_at, task_id) LIMIT claim_scan_limit
-2. k-way merge across queues
+1. per queue: fifo     -> SELECT head page ORDER BY (urgency, priority, created_at, task_id) LIMIT claim_scan_limit
+               round_robin -> SELECT next tenant's best task ORDER BY (owner_tenant_id, priority, created_at, task_id)
+                              WHERE urgency = u AND owner_tenant_id > cursor LIMIT 1
+2. k-way merge across queues by (urgency, created_at, task_id)
 3. per candidate (within claim_candidate_budget):
      UPDATE te_task_state SET state=claimed, lease... WHERE task_id=? AND state=queued
-     UPDATE te_concurrency_slots SET used=used+1 WHERE ... AND used < limit_value
+     UPDATE te_concurrency_slots SET used=used+1 WHERE ... AND used < limit_value          (cross-tenant)
+     UPDATE te_tenant_concurrency_slots SET used=used+1 WHERE ... AND used < limit_value   (per tenant)
      rows_affected == 1 on all -> commit; else rollback and try next
 ```
 
@@ -159,7 +162,7 @@ See DESIGN §3.8 multi-instance coordination and §4.6 Task Assignment.
 This decision supports these requirements and design elements:
 
 * `cpt-cf-task-engine-fr-assignment` — atomic claim with exact cross-queue order.
-* `cpt-cf-task-engine-fr-priority-dispatch` — claim order `(priority, created_at, task_id)`.
+* `cpt-cf-task-engine-fr-priority-dispatch` — claim order: urgency, tenant fairness, tenant-local priority.
 * `cpt-cf-task-engine-fr-lease-fencing` — lease token and epoch set in the claim update.
 * `cpt-cf-task-engine-fr-queue-concurrency` — slot reservation in the claim transaction.
 * `cpt-cf-task-engine-nfr-latency` — claim latency targets.

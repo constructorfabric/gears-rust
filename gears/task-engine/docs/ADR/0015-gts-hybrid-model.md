@@ -52,9 +52,9 @@ Chosen option: "Hybrid: GTS for open sets, closed enums for control values", bec
 How it works:
 
 * **GTS entities (open)**: task types derive from `gts.cf.core.tasks.task.v1~`, queues are instances of `gts.cf.core.tasks.queue.v1~`, and entry types derive from `gts.cf.core.tasks.entry.v1~`. A task type declares input and output schemas and optional traits (concurrency limits, dedup and supersession, progress settings, type defaults).
-* **Engine enums (closed)**: task states, result codes, wait-condition kinds, timer types, dependency modes, and concurrency dimensions are SDK enums with fixed numeric codes. They are stored as small integers and sent on the wire as snake_case names.
+* **Engine enums (closed)**: task states, result codes, urgency, wait-condition kinds, timer types, dependency modes, and concurrency dimensions are SDK enums with fixed numeric codes. They are stored as small integers and sent on the wire as snake_case names.
 * **Not GTS**: tags are free-form, tenant-scoped strings.
-* **Storage**: base fields (state, priority, queue, owner, assignment, timestamps) are indexed columns. The task type is stored as the deterministic UUID of its GTS identifier. Input, context, output, and other payloads are opaque compressed columns (ADR-0006), validated against the type's schema at the API boundary.
+* **Storage**: base fields (state, urgency, priority, queue, owner, assignment, timestamps) are indexed columns. The task type is stored as the deterministic UUID of its GTS identifier. Input, context, output, and other payloads are opaque compressed columns (ADR-0006), validated against the type's schema at the API boundary.
 * **Enum evolution**: numeric codes are never reused or renumbered. Clients map unknown values to `Unknown`. Adding a value is a minor change.
 
 ### Consequences

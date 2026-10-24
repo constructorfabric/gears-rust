@@ -101,13 +101,13 @@ Per [ADR/0001-pluggable-execution-backends.md](ADR/0001-pluggable-execution-back
 - `cpt-cf-task-engine-adr-state-machine` — Task state machine design with 10 states, terminal/non-terminal classification, and valid transition matrix. See [ADR/0002-task-state-machine.md](ADR/0002-task-state-machine.md).
 - `cpt-cf-task-engine-adr-timer-architecture` — Persistent timer wheel with database-backed timers and multi-worker processing. See [ADR/0003-timer-architecture.md](ADR/0003-timer-architecture.md).
 - `cpt-cf-task-engine-adr-wait-condition-model` — Wait conditions as fixed domain model elements (not GTS-extensible), with four built-in kinds (timer, event, input, children) and an arm-then-park option. See [ADR/0004-wait-condition-model.md](ADR/0004-wait-condition-model.md).
-- `cpt-cf-task-engine-adr-concurrency-enforcement` — Multi-dimensional concurrency enforcement via database-level atomic counting (optionally hot-row sharded, ADR-0008); no Cluster dependency (PRD §1.4). See [ADR/0005-concurrency-enforcement.md](ADR/0005-concurrency-enforcement.md).
+- `cpt-cf-task-engine-adr-concurrency-enforcement` — Database-level atomic counters, in a cross-tenant table and a tenant-scoped table (optionally hot-row sharded, ADR-0008); no Cluster dependency (PRD §1.4). See [ADR/0005-concurrency-enforcement.md](ADR/0005-concurrency-enforcement.md).
 - `cpt-cf-task-engine-adr-blob-compression` — Transparent JSON blob compression for storage efficiency using zstd behind a magic prefix and codec byte. See [ADR/0006-blob-compression.md](ADR/0006-blob-compression.md).
 - `cpt-cf-task-engine-adr-event-wait-matching` — CEL-based match expression evaluation for event wait conditions with complexity limits and precompilation. See [ADR/0007-event-wait-matching.md](ADR/0007-event-wait-matching.md).
 - `cpt-cf-task-engine-adr-atomic-claim-strategy` — **Proposed** — DB-agnostic optimistic guarded-update claim via the ToolKit secure ORM, chosen provisionally; `SKIP LOCKED` (if ToolKit can expose it) or candidate spreading is expected to replace it to remove head-row contention (§4.6 TODO). Single-statement conditional slot reservation with optional hot-row sharding. See [ADR/0008-atomic-claim-strategy.md](ADR/0008-atomic-claim-strategy.md).
-- `cpt-cf-task-engine-adr-retention-partitioning` — Unpartitioned live table for non-terminal tasks; history partitioned by task creation time; retention measured from terminal time; rescue-then-drop of history partitions; SQLite `DELETE` fallback. See [ADR/0009-retention-partitioning.md](ADR/0009-retention-partitioning.md).
+- `cpt-cf-task-engine-adr-retention-partitioning` — Unpartitioned live tables; history (including tags and resource references) partitioned by task creation time; no DB foreign keys; retention from terminal time; rescue-then-drop; SQLite `DELETE` fallback. See [ADR/0009-retention-partitioning.md](ADR/0009-retention-partitioning.md).
 - `cpt-cf-task-engine-adr-task-domains` — Route each task type or queue to one configured database with a config-order first-match rule; atomic operations (claim, dependencies, parent/child) stay inside one domain. See [ADR/0010-task-domains.md](ADR/0010-task-domains.md).
-- `cpt-cf-task-engine-adr-lease-fencing` — Every worker write carries a per-lease token checked in the same guarded update; a per-task lease epoch lets workers fence external systems. See [ADR/0011-lease-fencing.md](ADR/0011-lease-fencing.md).
+- `cpt-cf-task-engine-adr-lease-fencing` — Every worker write carries a random per-lease token bound to the holder's subject; reassignment hands over no token; a lease epoch lets workers fence external systems. See [ADR/0011-lease-fencing.md](ADR/0011-lease-fencing.md).
 - `cpt-cf-task-engine-adr-task-deduplication` — Required caller idempotency key scoped to tenant and subject, or a type-declared engine identity, with optional supersession by a newer order value. See [ADR/0012-task-deduplication.md](ADR/0012-task-deduplication.md).
 - `cpt-cf-task-engine-adr-worker-transport` — Workers use the REST API with capped long-poll claims, batch heartbeats, and a per-node queue watcher for cross-node wake-up; streaming is deferred. See [ADR/0013-worker-transport.md](ADR/0013-worker-transport.md).
 - `cpt-cf-task-engine-adr-worker-identity` — A worker is the pair (authenticated subject, client-supplied `worker_id`), used for assignment, blacklist, and audit, never as a credential. See [ADR/0014-worker-identity.md](ADR/0014-worker-identity.md).
@@ -199,7 +199,15 @@ graph TB
 
 **Secure-by-default DB access**: All database access uses `SecureConn` with `AccessScope` compiled from PDP constraints. No raw database connections in handler, service, or repository code.
 
-Tenant-owned tables (`te_tasks`, `te_task_state`, `te_task_entries`, `te_wait_conditions`, `te_events`, `te_tags`, `te_resource_refs`, `te_timers`, `te_event_inbox`) derive `Scopable` with a `tenant_col`. Every **request path** (REST or SDK call made for a subject) accesses them only under the PDP-derived tenant scope. **Engine-internal system tables** that hold cross-tenant aggregates or engine-owned coordination state (`te_concurrency_slots`, `te_queue_backlog`, `te_worker_blacklist`, `te_runtime_config`) have no tenant column and are declared `#[secure(unrestricted)]`. Per [`06_authn_authz_secure_orm.md` §Unrestricted entities](../../../docs/toolkit_unified_system/06_authn_authz_secure_orm.md), a scope carrying tenant IDs is *denied* against an `unrestricted` entity, so these tables MUST only be touched on an **engine system code path with `AccessScope::allow_all()`** — never with a subject/tenant scope. This mirrors the platform capability pattern (e.g. `chat-engine` share-token access): when the operation is an engine invariant rather than a subject-authorized row operation, `PolicyEnforcer` is **not** called for that table and the repository reads/writes under an internal `allow_all()`. Authorization for the surrounding action (e.g. `claim`) is still enforced on the tenant-owned task rows in the same transaction.
+Tenant-owned tables (`te_tasks`, `te_task_state`, `te_task_results`, `te_task_entries`, `te_wait_conditions`, `te_events`, `te_tags`, `te_resource_refs`, `te_dependencies`, `te_timers`, `te_event_inbox`, `te_dedup`, `te_supersede_heads`, and the per-tenant counter tables `te_tenant_concurrency_slots` and `te_tenant_queue_backlog`) derive `Scopable` with a `tenant_col`. Every **request path** (REST or SDK call made for a subject) accesses them only under the PDP-derived tenant scope.
+
+**Per-tenant counters are tenant-scoped** (per [`06_authn_authz_secure_orm.md` §Unrestricted entities](../../../docs/toolkit_unified_system/06_authn_authz_secure_orm.md)). Request paths write them under `scope.tenant_only()`, after the task row was authorized with the full scope in the same transaction (the mini-chat pattern). A wrong-tenant write then fails in the ORM.
+
+**`unrestricted` entities** have no tenant column: `te_concurrency_slots` and `te_queue_backlog` (cross-tenant counts only), `te_worker_blacklist`, and `te_runtime_config`. The two counter tables are still touched in tenant requests, so they are a **declared exception** to the guide, with these controls ([`16_defect_class_to_control_map.md` §Globally scoped tables](../../../docs/toolkit_unified_system/16_defect_class_to_control_map.md)):
+
+- Access only through `GlobalCounterRepo`: a guarded `+n`/`−n` on a key taken from an already-authorized task row; no read or list on request paths.
+- Each `allow_all()` call site carries a justification; the lint gate rejects any other `allow_all()` on a request path.
+- `GET /queues` reads them only after a queue `read` decision.
 
 **System background loops (the only exception)**: the timer wheel, lease scan, retention, slot reconciliation, priority aging, and the event consumer act for the engine, not for a subject, so they have no PDP scope. They read and write tenant-owned tables (for example `te_timers`, `te_task_state`, `te_wait_conditions`) under `AccessScope::allow_all()`. This is allowed only in these named loops, which never take input from an API caller. Each row they change keeps its own `owner_tenant_id`, and any event they write carries that tenant. No request handler may use `allow_all()` on a tenant-owned table.
 
@@ -209,7 +217,7 @@ Tenant-owned tables (`te_tasks`, `te_task_state`, `te_task_entries`, `te_wait_co
 
 **ID**: `cpt-cf-task-engine-principle-gts-typed`
 
-**GTS-typed extensibility**: Task types, entry types, and queues are GTS entities. New extensible types are registerable without DDL changes. Engine-owned finite sets such as task states, result codes, wait condition kinds, timer types, timer statuses, dependency modes, and concurrency dimensions are closed SDK/domain enums, not GTS entities. Tags are free-form tenant-scoped strings, not GTS entities (PRD §5.1). Extension data (input, context, output) lives in compressed binary columns (ADR-0006, §3.7 Portable JSON Storage Contract).
+**GTS-typed extensibility**: Task types, entry types, and queues are GTS entities. New extensible types are registerable without DDL changes. Engine-owned finite sets such as task states, result codes, urgency, wait condition kinds, timer types, timer statuses, dependency modes, and concurrency dimensions are closed SDK/domain enums, not GTS entities. Tags are free-form tenant-scoped strings, not GTS entities (PRD §5.1). Extension data (input, context, output) lives in compressed binary columns (ADR-0006, §3.7 Portable JSON Storage Contract).
 
 **ID**: `cpt-cf-task-engine-principle-tenant-scope`
 
@@ -229,7 +237,7 @@ Tenant-owned tables (`te_tasks`, `te_task_state`, `te_task_entries`, `te_wait_co
 
 **ID**: `cpt-cf-task-engine-principle-fenced-execution`
 
-**Fenced, at-least-once execution**: Execution is at-least-once (PRD §5.6 Execution Semantics). Task state is fenced by the per-lease `lease_token`: every worker-side write is a single guarded update matching the current token, so a superseded lease can never mutate the task. External systems are fenced by the monotonic `lease_epoch`, which workers pass along. The token is a correctness fence, not a credential — authorization still runs through `PolicyEnforcer` first.
+**Fenced, at-least-once execution**: Execution is at-least-once (PRD §5.6 Execution Semantics). Every worker-side write is one guarded update on `lease_token` **and** `assignee_subject = SecurityContext.subject_id`, so neither an old lease nor a copied token can change the task. Tokens are random UUID v4, returned only to the holder, never logged. External systems are fenced by the monotonic `lease_epoch`. `PolicyEnforcer` still runs first.
 
 ### 2.2 Constraints
 
@@ -268,7 +276,8 @@ classDiagram
         +Option~Uuid~ owner_id
         +Uuid created_by
         +TaskState state
-        +i32 priority
+        +Urgency urgency (normal | critical)
+        +i32 priority (tenant-local)
         +JsonValue input
         +Option~JsonValue~ context
         +Option~TaskResult~ result
@@ -317,7 +326,7 @@ classDiagram
         +Option~DateTime~ assignment_deadline
         +Option~DateTime~ execution_deadline
         +i32 attempt
-        +Option~Uuid~ lease_token
+        +Option~Uuid~ lease_token (v4, holder-bound; NULL while a hand-off awaits accept)
         +i64 lease_epoch
     }
 
@@ -392,6 +401,7 @@ classDiagram
     class TaskDependency {
         +Uuid task_id
         +Uuid predecessor_id
+        +Uuid owner_tenant_id (same for both ends)
         +DependencyMode mode
     }
 
@@ -507,8 +517,8 @@ stateDiagram-v2
 | `blocked` | `cancelled` | Dependencies unsatisfiable — `ALL`: any predecessor failed; `ANY`: every predecessor failed (`failed`/`cancelled`/`dead_lettered`, PRD §5.9); applied through the cascade mechanism (§4.6 Cascades: inline in the predecessor's terminal transaction up to `cascade_inline_limit`, durably continued beyond it), cascading to own successors | Delete all timers; release queue-depth capacity; result code = `dependency_failed` |
 | `queued` | `claimed` | Worker atomic claim | Delete queue timeout; set `lease_until = now + lease duration` (the task's `heartbeat_timeout` if set, else `default_lease_duration_secs`); set `assignment_deadline = now + assignment_timeout` (if configured). Heartbeat, assignment and execution timeouts are enforced by the lease scan (§3.2 TimerService) |
 | `claimed` | `running` | Worker start | Keep/extend `lease_until`; clear `assignment_deadline`; set `execution_deadline = now + execution_timeout` (if configured; set again on every start, so time spent `waiting` is never counted) |
-| `running` (worker, or API consumer); `claimed` / `queued` (API consumer) | `waiting` | Wait condition set (task is **parked**, PRD §5.4) | Release slots (if leased); clear `lease_token`, `lease_until`, `assignee`, `assignment_deadline`, `execution_deadline`; from `queued`: delete queue timeout and decrement the queued backlog; apply optional checkpoint; set wait condition timeout timer (if configured) |
-| `waiting` | `queued` | Condition satisfied, or wait timeout configured to resume | Delete wait timeout; set `resume_pending = true`; set queue timeout; emit `newTask` signal (hand-over, never refused by queue depth) |
+| `running` (worker, or API consumer); `claimed` / `queued` (API consumer) | `waiting` | Wait condition set (task is **parked**, PRD §5.4) | Admission into `tenant_deferred` (full → `429`, nothing changes); release slots (if leased); clear `lease_token`, `lease_until`, `assignee`, `assignment_deadline`, `execution_deadline`; from `queued`: delete queue timeout and decrement the queued backlog; apply optional checkpoint; set wait condition timeout timer (if configured) |
+| `waiting` | `queued` | Condition satisfied, or wait timeout configured to resume | Delete wait timeout; set `resume_pending = true`; set queue timeout; emit `newTask` signal (hand-over, never refused) |
 | `running` | `completed` | Worker completes successfully | Delete all timers |
 | `running` | `cancelled` | Worker completes after graceful cancellation | Delete all timers; result code = `cancelled` |
 | `running` | `failed` | Terminal failure, or retries exhausted, and no DLQ configured | Delete all timers; release slots |
@@ -520,7 +530,9 @@ stateDiagram-v2
 | `running` | `dead_lettered`/`failed` | **Execution timeout** (`execution_deadline` passed; PRD §5.3 — terminal, task-attributed, never retried) | Release slots; delete all timers; terminal routing (DLQ if configured else `failed`) with `timed_out` result; **not** counted toward the worker blacklist |
 | Any non-terminal | `dead_lettered`/`failed` | **Lifetime timeout** (terminal; overrides retry/lease handling) | Delete all timers; release slots; force-complete with `timed_out` result; DLQ if configured else `failed` |
 | `dead_lettered` / `failed` | `queued` | Admin re-enqueue (PRD §5.8 Re-enqueue rules) | Move the row from `te_task_results` back to `te_task_state`; DLQ case: set `queue_id = dead_lettered_from` and clear it; reset `retry_count` and `liveness_requeues`; clear the previous result, keep `context`; re-take the dedup identity / check supersession; queue-depth admission; set queue timeout; re-arm lifetime timer from now, SLA timer only if still in the future; emit `newTask` signal |
-| `claimed` / `running` | `queued` / `scheduled` | **Voluntary release** by the lease holder (PRD §5.6); `scheduled` when `delay_secs` is given | Release slots; clear lease, `assignee`, and deadlines; set `resume_pending = true`; cancel an armed wait group; apply optional checkpoint; `queued`: set queue timeout, emit `newTask`; `scheduled`: set scheduled timer. Re-entry, never refused by queue depth; no change to retry budgets or the blacklist |
+| `claimed` / `running` | `queued` / `scheduled` | **Voluntary release** by the lease holder (PRD §5.6); `scheduled` when `delay_secs` is given | Release slots; clear lease, `assignee`, and deadlines; set `resume_pending = true`; cancel an armed wait group; apply optional checkpoint; `queued`: set queue timeout, emit `newTask`; `scheduled`: set scheduled timer. To `queued`: re-entry, never refused; to `scheduled`: admission into `tenant_deferred` (full → `429`). No change to retry budgets or the blacklist |
+| `claimed` / `running` | (unchanged) | **Reassignment** (admin) to (`subject_id`, `worker_id`) | Set the new assignee, clear `lease_token`, `lease_epoch + 1`, `lease_until = now + lease` (accept window); enqueue `TaskReassigned`. The old holder gets `LEASE_LOST` |
+| `claimed` / `running` | (unchanged) | **Accept** by the new assignee | Guarded update `WHERE lease_token IS NULL AND assignee_subject = ctx.subject_id AND assignee = :worker_id`: new random `lease_token`, extend `lease_until`, return the `Lease`; no match → `404`. An expired accept window is requeued by the lease scan, with no blacklist strike |
 | Any non-terminal | `cancelled` | Forced cancel (overrides `cancellable=false`) | Delete all timers; release slots; result code = `forcibly_cancelled`; propagate cancel to children |
 | `queued`/`scheduled`/`blocked`/`waiting` | `cancelled` | `requested` or `graceful` cancel — no lease, so nothing to acknowledge | Delete all timers; release queue-depth capacity; result code = `cancelled`; propagate cancel to children |
 | `claimed`/`running` | (unchanged) | `requested` / `graceful` cancel | Set `cancel_requested` (worker learns via heartbeat); `graceful` also sets a `cancel_grace` timer at `now + cancel_grace_period_secs`, which on expiry applies the forced-cancel row |
@@ -528,13 +540,22 @@ stateDiagram-v2
 
 **Timer lifecycle across requeues** (PRD §5.3 *Deadlines survive requeues*): the lifetime and SLA timers are armed at creation and are removed only by a terminal transition. Retry re-enqueue, lease-expiry/assignment-timeout requeue, parking in `waiting`, and resumption never delete them; the state-specific timers (queue timeout, scheduled enqueue, wait timeout) are removed or re-armed on each transition, and the state-specific deadlines (`lease_until`, `assignment_deadline`, `execution_deadline`) are cleared whenever the task leaves `claimed`/`running`.
 
-**Queue-depth accounting** (PRD §5.2 Queue Depth Limits): two disjoint counted sets: **queued** (`queued`) feeds the `queue_global` and `queue_tenant` dimensions of `te_queue_backlog` (§3.7; `domain_global` is a sampled ceiling, not a counter — §3.7 Hot-row rules); **deferred** (`scheduled`, `blocked`) feeds the `tenant_deferred` dimension. Counters change in the same transaction as the state change: **admission** — creation, bulk move, admin re-enqueue (`dead_lettered` / `failed` → `queued`), recurring spawn (once PRD §5.22 is added), dependency add (`queued`/`scheduled` → `blocked`) — increments the dimensions of the task's initial state with the guarded `used < limit` predicate and **may be refused**; **re-entry** — retry / lease-expiry requeue (`running`/`claimed` → `scheduled`), voluntary release (`claimed`/`running` → `queued`/`scheduled`), `waiting` → `queued` — and **hand-over** — `scheduled`/`blocked` → `queued` (decrement deferred, increment queued) — increment unconditionally and are **never refused**; **exit** — claim, any cancel, lifetime/queue timeout, wait set on a `queued` task — decrements whichever set the task was in.
+**Queue-depth accounting** (PRD §5.2): two counted sets, changed in the same transaction as the state. **Queued** (`queued`) feeds `queue_global` (`te_queue_backlog`) and `queue_tenant` (`te_tenant_queue_backlog`); `domain_global` is a sampled ceiling (§3.7 Hot-row rules). **Deferred** (`scheduled`, `blocked`, `waiting`) feeds `tenant_deferred`.
+
+- **Admission** (guarded, may get `429`): creation, bulk move, admin re-enqueue, recurring spawn (once PRD §5.22 exists), and deferral by choice — dependency add (→ `blocked`), park (→ `waiting`), release with delay (→ `scheduled`). Leaving `queued` this way also decrements queued.
+- **Re-entry** (never refused): retry and lease-expiry requeue (→ `scheduled`), release without delay (→ `queued`).
+- **Hand-over** (never refused): `scheduled`/`blocked`/`waiting` → `queued`.
+- **Exit**: claim, cancel, lifetime/queue timeout, terminal wait timeout.
+
+Running tasks are in neither set. Re-entry happens at most once per claim with a delay capped by `max_interval`, so only engine moves can pass the deferred limit, and only briefly.
 
 **Lease token / epoch handling** (PRD §5.6 Lease Fencing), applied in the same guarded update as the transition:
 
 | Transition | `lease_token` | `lease_epoch` |
 |---|---|---|
-| Claim (`queued` → `claimed`); reassignment | New `uuid_v7()` | `+1` |
+| Claim (`queued` → `claimed`) | New (random UUID v4) | `+1` |
+| Reassignment | Cleared until accepted | `+1` |
+| Accept | New (random UUID v4) | Kept |
 | `claimed` → `running` | Kept | Kept |
 | `running` → `waiting` (task parked; the next claim issues a new token and `+1` epoch) | Cleared (`NULL`) | Kept |
 | → `queued` / `scheduled` (lease expiry, retry, voluntary release) | Cleared (`NULL`) | Kept |
@@ -558,7 +579,7 @@ Reference schemas for every entity below live under [`schemas/`](./schemas/) (`t
 | `gts.cf.core.events.event.v1~cf.core.tasks.<event>.v1~` | Derived types (×22) | Lifecycle event types — derived from the Event Broker base event type `gts.cf.core.events.event.v1~`; each narrows `data` to its payload contract and fixes the `topic`, `partition_key`, and `allowed_subject_types` traits. See §3.2 Event Producer. |
 | `gts.cf.core.events.topic.v1~cf.core.tasks.task_events.v1` | Instance | Outbound lifecycle-events topic (instance of the Event Broker topic type). Retention `P30D` is the broker **replay horizon**, deliberately shorter than task retention (100 days): a consumer that falls further behind loses broker events but can recover the authoritative history from `GET /tasks/{id}/events` (`te_events`, kept for the task's full retention). |
 | `gts.cf.core.events.consumer_group.v1~cf.core.tasks.task_engine.v1` | Instance | Named inbound consumer group for event wait conditions. |
-| `gts.cf.toolkit.authz.permission.v1~cf.task_engine._.<name>.v1` | Instances (×9) | Permission instances: task permissions (`task_create/read/update/delete/claim/cancel`, `tasks_admin`; resource type `gts.cf.core.tasks.task.v1~`) and queue permissions (`queue_read`, `queue_configure`; resource type `gts.cf.core.tasks.queue.v1~`) per [PERMISSION_GTS_TYPE.md](../../../docs/arch/authorization/PERMISSION_GTS_TYPE.md); fields `id`/`resource_type`/`action`/`display_name`. |
+| `gts.cf.toolkit.authz.permission.v1~cf.task_engine._.<name>.v1` | Instances (×10) | Permission instances: task permissions (`task_create/read/update/delete/claim/cancel/expedite`, `tasks_admin`; resource type `gts.cf.core.tasks.task.v1~`) and queue permissions (`queue_read`, `queue_configure`; resource type `gts.cf.core.tasks.queue.v1~`) per [PERMISSION_GTS_TYPE.md](../../../docs/arch/authorization/PERMISSION_GTS_TYPE.md); fields `id`/`resource_type`/`action`/`display_name`. |
 
 **GTS entities reused / derived from other subsystems** (not owned here):
 
@@ -571,7 +592,7 @@ Reference schemas for every entity below live under [`schemas/`](./schemas/) (`t
 
 Task types use a **hybrid storage model**: base fields (state, priority, queue, timestamps, owner, assignment) live in indexed relational columns for efficient querying. Type-specific extension data (input, context, output) is stored in compressed binary columns (ADR-0006, §3.7 Portable JSON Storage Contract). The `type_id` column stores the deterministic UUID derived from the GTS type identifier via `gts_schema_with_refs_as_string()`. This enables new task types to be registered without DDL changes — only GTS type registration is required.
 
-Engine-owned finite sets **MUST** use stable SDK enum discriminants and compact numeric database columns (`u8` in domain models; `TINYINT` where supported, `SMALLINT` for PostgreSQL portability). Hot predicates **MUST NOT** store state, result code, timer type, timer status, wait kind, or dependency mode as strings or GTS UUIDs.
+Engine-owned finite sets **MUST** use stable SDK enum discriminants and compact numeric database columns (`u8` in domain models; `TINYINT` where supported, `SMALLINT` for PostgreSQL portability). Hot predicates **MUST NOT** store state, result code, urgency, timer type, timer status, wait kind, or dependency mode as strings or GTS UUIDs.
 
 **Enum evolution contract** (PRD §5.12, §7.1): discriminants are **stable and never renumbered/reused**; storage and SDK use the numeric discriminant while the **REST/JSON wire form is the stable lowercase snake_case name** for every engine enum, result codes included (e.g. `"queued"`, `"timed_out"`, `"forcibly_cancelled"`) — both map 1:1 to the same variant. SDK/REST decoders that encounter an unrecognized discriminant/name (older client ↔ newer server) **surface an explicit `Unknown` value rather than coercing or panicking**, and a server reading an unknown stored code **fails closed** (treats it as non-actionable). Consequently **adding** a variant (new discriminant) is a **minor/backward-compatible** change given the unknown-value handling, whereas **renumbering/removing/repurposing** a discriminant is **breaking** — this holds across rolling upgrades (mixed nodes) and already-persisted values.
 
@@ -666,7 +687,7 @@ let task = te.create_task(&security_ctx, task_def).await?;
 
 The caller is responsible for providing a valid `SecurityContext` (typically propagated from its own inbound request). The Task Engine does not trust or skip any security check based on the entry point.
 
-**Worker lease handle** (PRD §5.6 Lease Fencing / Execution Semantics): `claim()` returns the task together with a `Lease { task_id, lease_token, lease_epoch, attempt, deadline, lost: CancellationToken }`. All worker-side SDK methods (`start`, `heartbeat`, `progress`, `checkpoint`, `complete`, `fail`, `release`, `arm_wait`, `park`, `set_wait`, worker `create_entry`) take `&Lease`, so the token cannot be omitted. `set_wait` and `release` consume the `Lease` (ownership ends, PRD §5.4 / §5.6 Voluntary Release); the handler returns after them, and the task arrives later as a fresh claim. `park` consumes the `Lease` only when the task is actually parked; if the armed group is already satisfied it returns the resolved data and the `Lease` stays valid. The SDK worker runtime is configured with one `worker_id` per process and sends it on every claim (PRD §5.6 Worker identity); on graceful shutdown it calls `release` for every task it has not started, instead of letting the leases expire. The SDK worker runtime runs the heartbeat loop and fires `lease.lost` when any call returns `LEASE_LOST`, or when `deadline` (last successful renewal + lease duration, measured on the local monotonic clock) passes without a successful renewal; task handlers observe `lease.lost` and stop. `lease_epoch` is exposed for fencing writes to external systems. **`LEASE_LOST` is never retried**: the canonical `aborted` category is generally retryable, so the SDK HTTP client and any retry middleware **MUST** exclude `context.reason = "LEASE_LOST"` from automatic retries — the correct "higher-level retry" (gRPC ABORTED semantics) is to abandon the task, not to re-send the call.
+**Worker lease handle** (PRD §5.6 Lease Fencing / Execution Semantics): `claim()` returns the task together with a `Lease { task_id, lease_token, lease_epoch, attempt, deadline, lost: CancellationToken }`. All worker-side SDK methods (`start`, `heartbeat`, `progress`, `checkpoint`, `complete`, `fail`, `release`, `arm_wait`, `park`, `set_wait`, worker `create_entry`) take `&Lease`, so the token cannot be omitted. `set_wait` and `release` consume the `Lease` (ownership ends, PRD §5.4 / §5.6 Voluntary Release); the handler returns after them, and the task arrives later as a fresh claim. `park` consumes the `Lease` only when the task is actually parked; if the armed group is already satisfied it returns the resolved data and the `Lease` stays valid. The SDK worker runtime is configured with one `worker_id` per process and sends it on every claim (PRD §5.6 Worker identity); on graceful shutdown it calls `release` for every task it has not started, instead of letting the leases expire. The SDK worker runtime runs the heartbeat loop and fires `lease.lost` when any call returns `LEASE_LOST`, or when `deadline` (last successful renewal + lease duration, measured on the local monotonic clock) passes without a successful renewal; task handlers observe `lease.lost` and stop. `lease_epoch` is exposed for fencing writes to external systems. A `Lease` works only under the `SecurityContext` that obtained it; under another principal it fails `LEASE_LOST`. A reassigned task is taken over with `accept_reassignment(ctx, task_id, worker_id)`; `reassign()` returns no `Lease`. `Debug` output redacts the token. **`LEASE_LOST` is never retried**: the canonical `aborted` category is generally retryable, so the SDK HTTP client and any retry middleware **MUST** exclude `context.reason = "LEASE_LOST"` from automatic retries — the correct "higher-level retry" (gRPC ABORTED semantics) is to abandon the task, not to re-send the call.
 
 #### Internal Services
 
@@ -684,14 +705,19 @@ Responsibilities:
 - Enforce idempotency via the caller-supplied key (REST `Idempotency-Key` header → `idempotency_key`; SDK `CreateTaskRequest.idempotency_key`), unique within `(owner_tenant_id, created_by)`. Missing key → `invalid_argument` with transport override `428`. Duplicate key, equal payload (canonical-JSON compare of type/queue/input/context), task in **any** state → `already_exists` `409` with `context.resource_name` = existing task ID; the SDK surfaces this as `CreateTaskOutcome::Existing(task)`. Same key, **different** payload → `invalid_argument` `400` (field violation on `idempotency_key`). Dedup bounded by retention (§4.5)
 - **Derived dedup identity** (types declaring the `dedup` trait): compute the identity from the *validated* input after authorization (§4.6 Task Creation Admission); the `Idempotency-Key` header is not required and, if present, is **ignored** (not stored, not checked; SDKs and gateways attach it automatically). Occupancy lives in `te_dedup` (§3.7); a hit returns `already_exists` `409` + `resource_name`, but only if the caller's `AccessScope` can read the existing task (else `permission_denied` `403`, no identifier)
 - **Supersession** (types declaring `supersede`): in the create transaction, compare the order value with `te_supersede_heads`; newer → cancel the group's non-terminal task via the cancel path (PDP `cancel` check on that task with the caller's scope first), equal → dedup, older → `failed_precondition` / `STALE_ORDER` (§4.6). Reject `cancellable=false` on these types
-- **Queue-depth admission**: reserve capacity on every applicable `te_queue_backlog` dimension in the same transaction as the insert; full → `resource_exhausted` `429` (`QUEUE_DEPTH_LIMIT`) (§4.6)
+- **Urgency** (PRD §5.2): default `normal`; `critical` needs a PEP check for `expedite` (else `403`)
+- **Queue-depth admission**: reserve capacity on every applicable dimension (`te_queue_backlog` for `queue_global`, `te_tenant_queue_backlog` for `queue_tenant` / `tenant_deferred`) in the same transaction as the insert; full → `resource_exhausted` `429` (`QUEUE_DEPTH_LIMIT`) (§4.6)
 - Validate payload size limits on **every payload-changing write** (create, checkpoint/context-update, complete with output, set-wait with checkpoint): aggregate `input + context + output` ≤ 64 KiB measured as **uncompressed canonical JSON** before compression; reject `413` leaving stored payload unchanged. The size check and the payload write are one **revision-guarded** update (`te_task_state.revision`, §4.6 Payload-Changing Writes); a write that loses the guard to a concurrent payload write is rejected `409` `aborted` / `CONCURRENT_MODIFICATION` and may be retried by the caller
-- Validate cross-references: parent and dependencies must resolve to the **same task domain** as the task (§3.8); dependency graph acyclic on every mutation (§4.6); reject `invalid_argument` `400` otherwise
+- **Authorize links** (PRD §5.9 Link Authorization), first, in the same transaction:
+  - **Parent**: must exist under the caller's scope, be unfinished, not `waiting`, and in the same tenant. Then either `parent_lease_token` matches the parent's lease held by the caller, or a PEP check allows `update` on it.
+  - **Predecessors**: each readable under the caller's `read` scope and in the same tenant. Dependency changes also need `update` on the successor.
+  - Any failure → the same `not_found` `404` (field violation), never `403` ([`16_defect_class_to_control_map.md` §Information disclosure](../../../docs/toolkit_unified_system/16_defect_class_to_control_map.md)).
+- Validate cross-references after that: same **task domain** (§3.8), no cycle (§4.6), not already unsatisfiable; else `400`
 - Manage state transitions per the state machine (§3.1); `attempt` is bumped only on claim (not on retry/lease requeue, and not on the claim of a task resumed from `waiting`, marked by `resume_pending`)
-- **Voluntary release** (PRD §5.6): fenced like any worker write; in one transaction move `claimed`/`running` → `queued` (or `scheduled` with `run_after = now + delay_secs`), release slots, clear lease and `assignee`, set `resume_pending = true` (the next claim does not bump `attempt`), apply the optional checkpoint, cancel an armed wait group (§3.2 WaitConditionService), and enqueue `TaskQueued { reason: released }`. It touches neither `retry_count`, `liveness_requeues`, nor the worker blacklist, and the queue-depth change is a re-entry (never refused)
+- **Voluntary release** (PRD §5.6): fenced like any worker write; in one transaction move `claimed`/`running` → `queued` (or `scheduled` with `run_after = now + delay_secs`), release slots, clear lease and `assignee`, set `resume_pending = true` (the next claim does not bump `attempt`), apply the optional checkpoint, cancel an armed wait group (§3.2 WaitConditionService), and enqueue `TaskQueued { reason: released }`. It touches neither `retry_count`, `liveness_requeues`, nor the worker blacklist. Without a delay it is a re-entry; with a delay an admission into `tenant_deferred` (§3.1)
 - **Re-enqueue** (`dead_lettered` or `failed` → `queued`, PRD §5.8 Re-enqueue rules, `admin`): in one transaction move the row from `te_task_results` back to `te_task_state`; set `queue_id` to `dead_lettered_from` (DLQ case) or keep it (`failed` case); reset `retry_count` and `liveness_requeues` to 0; clear result code, output, error and warnings, keep `context`; re-arm the lifetime timer at `now + lifetime_timeout` and the SLA timer only if `sla_deadline > now`; re-take the dedup identity in `te_dedup` (held by another task → `already_exists` `409`) and check `te_supersede_heads` (newer order → `failed_precondition` / `STALE_ORDER`); run queue-depth admission (may be refused `429`); set queue timeout; enqueue `TaskQueued { reason: reenqueued }` with the acting subject; emit `newTask`
-- **Fence every worker-side write** (start, progress accept, checkpoint, complete/fail, release, set/arm/park wait, worker entries): one guarded `update_many … WHERE task_id = ? AND lease_token = ? AND state_code IN (claimed, running)`; `rows_affected == 0` → `409` `aborted` / `LEASE_LOST` (§3.3 Error Response Format). The state write and its `te_events`/outbox rows share the transaction, so a rejected write leaves no trace
-- Handle task completion with structured results (result code, output, error, warnings); terminal routing for failure/timeout is DLQ-if-configured-else-`failed`; a `wait_for_children` parent's successful completion is rejected `CHILDREN_PENDING` while a child is non-terminal. **Idempotent completion replay**: if the fenced update matches nothing but the task is terminal with the same `lease_token` and a canonical-JSON-equal result, return `200` with the stored outcome and the platform `Idempotency-Replayed: true` header (no write); a different result → `failed_precondition` `400`
+- **Fence every worker-side write** (start, progress accept, checkpoint, complete/fail, release, set/arm/park wait, worker entries): one guarded `update_many … WHERE task_id = ? AND lease_token = ? AND assignee_subject = ctx.subject_id AND state_code IN (claimed, running)`; `rows_affected == 0` → `409` `aborted` / `LEASE_LOST` (§3.3 Error Response Format). The state write and its `te_events`/outbox rows share the transaction, so a rejected write leaves no trace
+- Handle task completion with structured results (result code, output, error, warnings); terminal routing for failure/timeout is DLQ-if-configured-else-`failed`; a `wait_for_children` parent's successful completion is rejected `CHILDREN_PENDING` while a child is non-terminal. **Idempotent completion replay**: if the fenced update matches nothing but the task is terminal with the same `lease_token` and `assignee_subject` and a canonical-JSON-equal result, return `200` with the stored outcome and the platform `Idempotency-Replayed: true` header (no write); a different result → `failed_precondition` `400`
 - **Validate the result on completion** (PRD §5.1 Structured Input/Output: schemas "validated at boundaries"), before the fenced write: (1) `output`, when present, against the task type's registered output schema — resolved from the task's own versioned `type_id`, so a task is always checked against the schema it was created with; (2) `error` and each `warnings` item against the fixed SDK `TaskError` contract (`domain`, `code`, `message` required; `retryable` boolean; `fault` ∈ `task`/`dependency`/`worker`; `context` a JSON object); (3) `result_code` consistent with the payload (`success`/`warning` carry no `error`; failure codes carry one) and allowed for a worker: only `success`, `warning`, `error`, or `cancelled` (the last only while `cancel_requested` is set). The terminal state is derived from the code per the PRD §5.12 pairing table: `success`/`warning` → `completed`, `cancelled` → `cancelled`, `error` → retry or `failed`/`dead_lettered`. `timed_out`, `forcibly_cancelled`, `superseded`, and `dependency_failed` are engine-only. A failure is rejected `invalid_argument` `400` with field violations and changes nothing: the task stays `running`, the lease stays valid, and the worker can resend a corrected result or report a failure. No output schema registered → only the size limit applies. Compiled schemas are cached per `type_id`
 - Process cancellation (requested, graceful, forced): `requested`/`graceful` honor `cancellable=false`, `forced` overrides it; `requested`/`graceful` cancel an unleased task immediately and only flag a leased one (§3.1, graceful escalates via the `cancel_grace` timer); every terminal cancel of a parent with `propagate_cancel` (the "propagate cancel to children" in §3.1) cancels its non-terminal children through the **durable cascade** (§4.6 Cascades) — guaranteed and crash-safe, never best-effort; a forced parent cancel transitions the parent immediately without waiting for its children to finish
 - Checkpoint intermediate state (key-level merge into context; revalidated against the aggregate payload limit)
@@ -710,20 +736,22 @@ Key methods:
 Dispatch engine. Owns priority-ordered task dispatch, atomic claiming, concurrency enforcement, and long-poll support.
 
 Responsibilities:
-- Atomic claim: select the highest-priority eligible task **across all requested queues** — ordered by `(priority, created_at, task_id)`; the order in which the worker lists the queues has no effect (k-way merge of per-queue heads, §4.6 Task Assignment) — atomically assign with lease (state transition + slot reservation in one transaction, in the lock order of §3.7 Lock ordering), return task. Two workers cannot claim the same task. All queues in one claim request **MUST** resolve to a single task domain (§3.8); a multi-domain claim is rejected `invalid_argument` `400` — atomic highest-priority ordering is preserved within one database. `attempt` is incremented here (the single authoritative increment point). The same guarded update sets `lease_token = uuid_v7()` and `lease_epoch = lease_epoch + 1`; the claim response returns both (SDK `Lease`, §3.2 SDK Security Model).
-- Resolve and maintain effective queue-depth limits (config override → queue GTS `queue_max_queue_depth` → config default `queue_max_queue_depth`; `tenant_max_queue_depth`, `tenant_max_deferred_tasks` and `global_max_queue_depth` from config) into `te_queue_backlog.limit_value`, and keep the counters consistent on every pending-set transition (§3.1 Queue-depth accounting); bulk move re-admits against the destination queue per task
+- Atomic claim: each queue yields its next task in PRD §5.2 order, and candidates are merged across queues by `(urgency, created_at, task_id)`; queue listing order has no effect (k-way merge, §4.6 Task Assignment) — atomically assign with lease (state transition + slot reservation in one transaction, in the lock order of §3.7 Lock ordering), return task. Two workers cannot claim the same task. All queues in one claim request **MUST** resolve to a single task domain (§3.8); a multi-domain claim is rejected `invalid_argument` `400` — exact claim ordering is preserved within one database. `attempt` is incremented here (the single authoritative increment point). The same guarded update sets a random UUID v4 `lease_token` (not v7: its timestamp part is predictable), `assignee_subject = ctx.subject_id`, and `lease_epoch + 1` (SDK `Lease`, §3.2 SDK Security Model).
+- Resolve and maintain effective queue-depth limits (config override → queue GTS `queue_max_queue_depth` → config default `queue_max_queue_depth`; `tenant_max_queue_depth`, `tenant_max_deferred_tasks` and `global_max_queue_depth` from config) into `te_queue_backlog.limit_value` (global) and `te_tenant_queue_backlog.limit_value` (per tenant), and keep the counters consistent on every pending-set transition (§3.1 Queue-depth accounting); bulk move re-admits against the destination queue per task
 - Enforce multi-dimensional concurrency limits: per-queue global, per-queue per-tenant, per-type global, per-type per-tenant — a candidate is assigned only if **every** dimension has capacity. A dimension at capacity blocks only the tasks it governs: the candidate is skipped, the saturated scope is excluded from the rest of the scan, and the claim proceeds to other tenants'/types' tasks (§4.6 Task Assignment). The claim returns `429 CONCURRENCY_LIMIT` only when nothing could be assigned and at least one eligible task was skipped for capacity
 - Support long-poll claiming: if no tasks available and timeout specified (clamped to `claim_max_wait_secs`, default 50 s), park (no DB connection, no admission permit) and retry on a `newTask` or `slotReleased` signal **or** on the node's queue-watcher tick, so wake-up works across nodes (§3.2 Signal System)
-- Heartbeat processing: fenced on `lease_token` (mismatch → `409` `LEASE_LOST`); extend lease, update `heartbeat_at`, return control response (cancel flag, current state). Workers holding several leases **SHOULD** use the batch heartbeat endpoint (one request and one multi-row fenced `UPDATE` per domain for all their leases); the SDK worker runtime does this automatically. Lease expiry (missed heartbeat) requeues via the **same retry-policy backoff** as an explicit failure (transition to `scheduled` with computed `run_after`, not immediate `queued`) — see §4.6 leaseScan
-- **Worker identity** (PRD §5.6): every claim carries `worker_id` (1–128 chars, `[A-Za-z0-9._:-]`; missing or malformed → `invalid_argument` `400`). The engine stores the pair (`assignee_subject` = `SecurityContext.subject_id`, `assignee` = `worker_id`) on the claimed task, and uses the same pair as the worker key in `te_worker_blacklist`, events, and logs. The pair is not a credential; worker writes are fenced by `lease_token`
+- Heartbeat processing: fenced on `lease_token` and `assignee_subject` (mismatch → `409` `LEASE_LOST`); extend lease, update `heartbeat_at`, return control response (cancel flag, current state). Workers holding several leases **SHOULD** use the batch heartbeat endpoint (one request and one multi-row fenced `UPDATE` per domain for all their leases); the SDK worker runtime does this automatically. Lease expiry (missed heartbeat) requeues via the **same retry-policy backoff** as an explicit failure (transition to `scheduled` with computed `run_after`, not immediate `queued`) — see §4.6 leaseScan
+- **Worker identity** (PRD §5.6): every claim carries `worker_id` (1–128 chars, `[A-Za-z0-9._:-]`; missing or malformed → `invalid_argument` `400`). The engine stores the pair (`assignee_subject` = `SecurityContext.subject_id`, `assignee` = `worker_id`) on the claimed task, and uses the same pair as the worker key in `te_worker_blacklist`, events, and logs. The pair is not a credential; worker writes are fenced by `lease_token` and `assignee_subject`
 - Worker blacklist management: track consecutive **worker-attributed** failures per (worker identity, queue) — explicit failures with `error.fault = worker`, lease expiry (missed heartbeat), and assignment timeout each count as **one** failure toward the same threshold (no single-miss blacklist); liveness failures are **coalesced per outage** — one detected within one lease duration of `te_worker_blacklist.last_liveness_failure_at` for the same (worker, queue) does not increment the counter (PRD §5.6), so a worker that loses many leases at once records one failure; `fault = task | dependency` failures and execution timeouts neither count nor reset (PRD §5.6); reset on next success; blacklist after threshold and emit `workerBlacklisted`
-- Reassignment (`POST /tasks/{id}/reassign`): the request names the new assignee as (`subject_id`, `worker_id`); a guarded update sets it with a fresh `lease_token` and `lease_epoch + 1`, fencing the previous assignee, and returns the new lease to the caller for hand-off
+- Reassignment and accept: see §3.1 State Transition Table. Reassignment never returns a lease token
 - Queue introspection: depth, executing count, per-state counts
 
 Key methods:
 - `claim_task(ctx, worker_id, queues, timeout) → Result<Option<(Task, Lease)>>`
 - `heartbeat(ctx, lease) → Result<HeartbeatResponse>`
 - `release(ctx, lease, delay, checkpoint) → Result<()>`
+- `reassign(ctx, task_id, subject_id, worker_id) → Result<Task>`
+- `accept_reassignment(ctx, task_id, worker_id) → Result<(Task, Lease)>`
 - `get_queue_stats(ctx, queue_id) → Result<QueueStats>`
 
 ##### TimerService (`domain/timer_service.rs`)
@@ -757,14 +785,14 @@ state_code = claimed             AND assignment_deadline < NOW()
 state_code = running             AND execution_deadline < NOW()
 ```
 
-Heartbeat is a single fenced `UPDATE te_task_state SET lease_until = NOW() + lease_duration, heartbeat_at = NOW() WHERE task_id = ? AND lease_token = ?` — no timer row churn, and it touches **only** `lease_until`, so it can never push out the assignment or execution deadline. The action depends on the cause (§4.6 leaseScan): a missed heartbeat or assignment timeout is a **liveness failure** (requeue with retry-policy backoff while the `max_liveness_requeues` budget remains — independent of `max_retries` — and counts toward the blacklist, coalesced per outage); an execution timeout is **task-attributed and terminal** (force-complete with `timed_out`, DLQ if configured else `failed`, never retried, not counted toward the blacklist — PRD §5.3). The scan interval is bounded by the timer-accuracy NFR (default ≤ 1s). All other deadlines — `queue`, `scheduled` (delayed enqueue / retry backoff), `lifetime`, `sla`, `wait`, and `cancel_grace` — remain durable `te_timers` rows processed by the timer wheel (the same list as the `te_timers.timer_type_code` values that are actually stored, §3.7). This preserves crash durability (every deadline is persisted on `te_task_state`) while eliminating the dominant write hotspot.
+Heartbeat is a single fenced `UPDATE te_task_state SET lease_until = NOW() + lease_duration, heartbeat_at = NOW() WHERE task_id = ? AND lease_token = ? AND assignee_subject = ?` — no timer row churn, and it touches **only** `lease_until`, so it can never push out the assignment or execution deadline. The action depends on the cause (§4.6 leaseScan): a missed heartbeat or assignment timeout is a **liveness failure** (requeue with retry-policy backoff while the `max_liveness_requeues` budget remains — independent of `max_retries` — and counts toward the blacklist, coalesced per outage); an execution timeout is **task-attributed and terminal** (force-complete with `timed_out`, DLQ if configured else `failed`, never retried, not counted toward the blacklist — PRD §5.3). The scan interval is bounded by the timer-accuracy NFR (default ≤ 1s). All other deadlines — `queue`, `scheduled` (delayed enqueue / retry backoff), `lifetime`, `sla`, `wait`, and `cancel_grace` — remain durable `te_timers` rows processed by the timer wheel (the same list as the `te_timers.timer_type_code` values that are actually stored, §3.7). This preserves crash durability (every deadline is persisted on `te_task_state`) while eliminating the dominant write hotspot.
 
 ##### WaitConditionService (`domain/wait_service.rs`)
 
 Durable suspension manager. Owns wait condition lifecycle and resolution. See [ADR/0004-wait-condition-model.md](ADR/0004-wait-condition-model.md).
 
 Responsibilities:
-- Set wait conditions on running tasks, or — API consumer only — on `queued`/`claimed` tasks (transitions task to `waiting` and **parks** it: releases slots, clears lease and assignee, applies an optional checkpoint in the same transaction — PRD §5.4)
+- Set wait conditions on running tasks, or — API consumer only — on `queued`/`claimed` tasks (transitions task to `waiting` and **parks** it: releases slots, clears lease and assignee, applies an optional checkpoint in the same transaction — PRD §5.4). Parking is an admission into `tenant_deferred` (§3.1): if full, `429` and nothing changes. Arming does not count
 - Resume by transitioning `waiting` → `queued` with `resume_pending = true`; resolved wait data (event header, input, child counts, timeout indication) is stored on the wait condition and returned with the next claim
 - Manage four built-in wait condition kinds:
   - **Timer**: set `resume_at`, auto-satisfy when time reached (via TimerService)
@@ -792,20 +820,20 @@ On the PostgreSQL/MySQL production profile, retention is realized primarily by *
 Maintenance sequence (per domain):
 1. **Provision ahead**: ensure future history partitions exist before data lands in them.
 2. **Hard limit**: force-cancel non-terminal tasks older than `hard_retention_days` (they then become terminal history like any other).
-3. **Rescue, then drop**: for each history partition whose whole range is older than `drop_horizon_days`, copy into the matching `te_*_retained` tables (same transaction per batch, idempotent on primary key) every row of a task that must outlive the partition:
-   - the task is still **non-terminal** (its immutable `te_tasks` row, events, and entries live in the partition even though its state is in `te_task_state`); or
+3. **Rescue, then drop**: all partitioned tables (§3.7 Live / history split) share one layout. For each partition range older than `drop_horizon_days`, copy into `te_*_retained` (batched, idempotent) every row of a task that must outlive it:
+   - the task is still **non-terminal**; or
    - the task is terminal and `terminal_at + effective_retention > now` — late completions, longer type policies, and **tenant legal holds**.
-   Then `DROP` the partition and delete the dropped tasks' `te_dedup` / `te_supersede_heads` rows. The rescued set is small by construction (long-lived tasks and long-retention tenants/types only).
-4. **Expire rescued and short-lived rows**: bounded `DELETE` from the `_retained` tables of tasks whose `terminal_at + effective_retention` has passed, and bounded `DELETE` from live partitions for type/tenant policies **shorter** than the drop horizon (together with their `te_dedup` rows).
-5. Capacity reconciliation: read the latest runtime configuration version, update the local concurrency and queue-depth limits for this domain in one transaction, save the applied version number, and retry if this step fails. Then recalculate `te_concurrency_slots.used` from the actual number of tasks in `claimed` and `running` states and fix any drift (see §3.7)
+   Then `DROP` the range in every partitioned table. The rescued set is small (long-lived tasks and long-retention tenants/types). Live-only tables need no step here.
+4. **Expire leftovers**: bounded `DELETE` of expired `_retained` rows, of rows under policies **shorter** than the drop horizon, and of `te_dedup` / `te_supersede_heads` rows of removed tasks (by `created_at` range, minus rescued IDs). These are the only row deletes, on narrow rows at the create rate.
+5. Capacity reconciliation: read the latest runtime configuration version, update the local concurrency and queue-depth limits for this domain in one transaction, save the applied version number, and retry if this step fails. Then recount `used` in the four counter tables (§3.7) and report orphan rows (`te_orphan_rows_total`; there are no DB foreign keys)
 
 Outbox row pruning is handled by the Event Broker SDK producer / `toolkit_db::outbox` vacuum stage, not the Retention Service. All Retention Service loops run under the advisory-lock leader (§3.8) so only one instance performs maintenance.
 
 **Legal hold at scale**: if a tenant or type with a long policy produces a large share of the data, rescuing it on every drop becomes expensive. Such workloads **SHOULD** be routed to their own task domain (§3.8) whose `drop_horizon_days` equals that policy, so the rescue set stays near-empty everywhere.
 
-On SQLite (dev/test/low-volume) partitioning is unavailable, so retention falls back to batched `DELETE` of expired terminal tasks (same `terminal_at`-based clock), entries, events, and orphaned wait conditions/timers. Each step runs in a loop with configurable batch size and retry logic.
+On SQLite (dev/test/low-volume) partitioning is unavailable, so retention falls back to batched `DELETE` of expired terminal tasks (same `terminal_at`-based clock), entries, events, tags, resource references, and identity rows. Each step runs in a loop with configurable batch size and retry logic.
 
-**Priority aging** (PRD §5.2 `fr-priority-aging`): when `priority_aging.enabled`, a singleton maintenance loop (under the `te-maintenance` leader, §3.8) periodically raises the effective `priority` of `queued` tasks whose queued age exceeds `threshold_minutes`, by `boost_amount` per pass, bounded to the highest priority. It writes `te_task_state.priority` in a bounded guarded batch per tick and emits no event; because claim ordering is `(priority, created_at, task_id)` (§4.6), boosted tasks dispatch sooner, preventing starvation. Disabled by default (`enabled: false`).
+**Priority aging** (PRD §5.2 `fr-priority-aging`): when `priority_aging.enabled`, a singleton maintenance loop (under the `te-maintenance` leader, §3.8) periodically raises the effective `priority` of `queued` tasks whose queued age exceeds `threshold_minutes`, by `boost_amount` per pass, bounded to the highest priority. It writes `te_task_state.priority` in a bounded guarded batch per tick and emits no event. Priority is tenant-local, so aging never passes another tenant's work; it never changes `urgency_code`. Disabled by default (`enabled: false`).
 
 ##### Event Producer (`event_broker_sdk::DbProducer`)
 
@@ -847,7 +875,7 @@ Consumer-group offset tables are provisioned by the SDK/`toolkit-db` (via `Local
 In-memory progress batching to reduce database write pressure.
 
 Design:
-- **Fencing on accept**: the progress endpoint checks `lease_token` with a primary-key read of `te_task_state` and rejects a mismatch with `409` `LEASE_LOST` before buffering
+- **Fencing on accept**: the progress endpoint checks `lease_token` and `assignee_subject` with a primary-key read of `te_task_state` and rejects a mismatch with `409` `LEASE_LOST` before buffering
 - Progress updates pushed to an incoming channel (latest value wins per task ID); each entry carries its `lease_token`
 - **Effective progress settings** (`progress_events` mode, flush interval) are resolved per task per PRD §5.7 precedence: `progress_policies.per_type` → `progress_policies.per_queue` → task type traits → queue registration → global default (`none`, `progress_flush_interval_secs`). Resolution results are cached per `(type_id, queue_id)` and invalidated on GTS registration or runtime config change. Effective intervals are clamped to `progress_min_flush_interval_secs`
 - Each cache entry carries `due_at = first_buffered_at + effective_flush_interval`. Background `commitLoop` ticks every `progress_min_flush_interval_secs` and flushes only due entries (swap-out under the mutex, then write outside it)
@@ -896,16 +924,17 @@ Permission model (GTS Permission types, `task_engine` resource namespace). Task 
 | Action | Description | Required for |
 |---|---|---|
 | `create` | Create tasks; create entries as an API consumer | Task creation, API-consumer entry creation |
-| `read` | Read tasks, entries, events | GET endpoints on tasks (task, entries, events, wait conditions, search) |
-| `update` | Change a task the caller does not hold (no lease token) | Tags, dependency add/remove, wait condition resolve (provide input), API-consumer wait set |
+| `read` | Read tasks, entries, events | GET endpoints on tasks (task, entries, events, wait conditions, search); naming the task as a predecessor |
+| `update` | Change a task the caller does not hold (no lease token) | Tags, dependency add/remove (on the successor), wait condition resolve (provide input), API-consumer wait set, adding a child without the parent's lease |
+| `expedite` | Urgency `critical` | Create or raise a task to `critical` (PRD §5.2) |
 | `delete` | Reserved for administrative hard-deletion. Task/entry rows are removed **only** by engine-internal retention (§3.2 RetentionService), never by a client verb, so no client endpoint currently maps to `delete`; it is retained in the action set for forward compatibility and PDP policy authoring. | — (no client endpoint) |
-| `claim` | Claim tasks and drive the execution path (every lease-fenced call) | Worker claim, start, heartbeat (single and batch), progress, checkpoint, complete, release, worker wait set and park, worker entry creation |
+| `claim` | Claim tasks and drive the execution path (every lease-fenced call) | Worker claim, accept of a reassignment, start, heartbeat (single and batch), progress, checkpoint, complete, release, worker wait set and park, worker entry creation |
 | `cancel` | Cancel tasks (single and bulk) | `/tasks/{id}/cancel`, `/tasks/bulk/cancel` |
 | `admin` | Administrative operations on tasks | DLQ inspection and re-enqueue, reassignment, bulk reprioritize/retry/move |
 | `read` (queue resource) | Read queues | `GET /queues`, `GET /queues/{id}` |
 | `configure` (queue resource) | Change queue runtime configuration | `POST /admin/config`, `GET /admin/config/{version}` |
 
-> **Worker action set** (least privilege, PRD §5.11): a worker identity needs only `claim` (plus `read` for its own reads). Every worker write carries a `lease_token`, so the lease already proves the worker holds the task; `claim` is the only action those writes need. A worker never needs `update`, so it cannot change tags or dependencies, resolve input waits, or reassign tasks. Reassignment is `admin`, because it returns a live lease to the caller.
+> **Worker action set** (least privilege, PRD §5.11): a worker identity needs only `claim` (plus `read` for its own reads). Every worker write carries a `lease_token` and is matched against `assignee_subject`, so `claim` is the only action those writes need. A worker never needs `update`, so it cannot change tags or dependencies, resolve input waits, or reassign tasks. To create children of its own task it needs `create` and its lease. Reassignment is `admin` and returns no lease.
 
 Unauthenticated endpoints (`.anonymous()`, anonymous `SecurityContext`; `.anonymous()` auto-satisfies the license requirement). ToolKit `OperationBuilder` splits *auth* (`.anonymous()`) from *visibility* (`.exposed()`), and the legacy single-axis `.public()` is deprecated — so these routes use the explicit two-axis form:
 - `GET /health` — liveness probe — `.anonymous().exposed()` (edge-reachable)
@@ -918,7 +947,7 @@ All authenticated endpoints below use `.authenticated()` + `.require_license_fea
 
 | Method | Path | Description | Auth Action |
 |---|---|---|---|
-| `POST` | `/tasks` | Create task | `create` |
+| `POST` | `/tasks` | Create task. `urgency: critical` also needs `expedite`; `parent_task_id` needs `parent_lease_token` or `update` on the parent; each predecessor needs `read` (PRD §5.9) | `create` |
 | `GET` | `/tasks/{id}` | Get task by ID | `read` |
 | `POST` | `/tasks/claim` | Claim task from queue(s) (long-poll). Body carries `worker_id` (required, PRD §5.6 Worker identity), `queues[]`, `timeout` | `claim` |
 | `POST` | `/tasks/{id}/start` | Start claimed task | `claim` |
@@ -929,14 +958,15 @@ All authenticated endpoints below use `.authenticated()` + `.require_license_fea
 | `POST` | `/tasks/{id}/complete` | Complete with result | `claim` |
 | `POST` | `/tasks/{id}/release` | **Voluntary release** (PRD §5.6): give the task back without failing it. Body: `lease_token`, optional `delay_secs`, optional `checkpoint`. No retry-budget or blacklist effect | `claim` |
 | `POST` | `/tasks/{id}/cancel` | Cancel task | `cancel` |
-| `POST` | `/tasks/{id}/reassign` | Hand a `claimed`/`running` task to another assignee: guarded update issues a fresh `lease_token` and `lease_epoch + 1` (fencing the previous holder) and returns the new lease, which the caller hands to the new assignee; state, `attempt`, slots and deadlines are unchanged | `admin` |
+| `POST` | `/tasks/{id}/reassign` | Hand a `claimed`/`running` task to another identity (body `subject_id`, `worker_id`); fences the old holder (§3.1). Returns the task, **never** a lease token | `admin` |
+| `POST` | `/tasks/{id}/accept` | New assignee takes over a reassigned task (body `worker_id`) and gets a lease; anyone else → `404` | `claim` |
 | `PATCH` | `/tasks/{id}/tags` | Add, change, or remove tags on an existing task. Takes `set` (tags to add or replace) and `remove` (tag keys to delete). Fails if the same key appears in both `set` and `remove`. Any key not listed is left unchanged. Returns the updated task | `update` |
-| `POST` | `/tasks/{id}/dependencies` | Add predecessors (cycle and domain re-validation, §4.6) | `update` |
-| `DELETE` | `/tasks/{id}/dependencies/{predecessor_id}` | Remove a predecessor | `update` |
+| `POST` | `/tasks/{id}/dependencies` | Add predecessors (link, cycle, and domain checks, §4.6; deferred admission when the task becomes `blocked`) | `update` (successor) + `read` (each predecessor) |
+| `DELETE` | `/tasks/{id}/dependencies/{predecessor_id}` | Remove a predecessor | `update` (successor) |
 
 **Idempotent create**: `POST /tasks` requires the platform `Idempotency-Key` header (PRD §5.1; error mapping in §3.3 Error Response Format) — except for task types declaring a derived dedup identity (`dedup` trait), where the header is optional and ignored if present, and the engine computes the identity (PRD §5.1 Derived Dedup Identity; §4.6 Task Creation Admission). `POST /tasks` may return `429` `QUEUE_DEPTH_LIMIT` (PRD §5.2 Queue Depth Limits) or `400` `STALE_ORDER`.
 
-**Lease fencing on worker endpoints** (PRD §5.6): the claim response carries `lease_token`, `lease_epoch`, `attempt`, and `heartbeat_interval_secs` (= `max(1, floor(lease_duration / 3))`, also returned on every heartbeat response; PRD §5.6) so a single delayed heartbeat never expires the lease. `start`, `heartbeat`, `progress`, `checkpoint`, `complete`, `release`, worker wait-condition set / arm / park, and worker-created entries require `lease_token` in the request body; a mismatch returns `409` `aborted` / `LEASE_LOST` (§3.3 Error Response Format). Non-worker operations (create, cancel, reassign, resolve input, API-consumer wait set, bulk/admin) take no token.
+**Lease fencing on worker endpoints** (PRD §5.6): the claim response carries `lease_token`, `lease_epoch`, `attempt`, and `heartbeat_interval_secs` (= `max(1, floor(lease_duration / 3))`, also returned on every heartbeat response; PRD §5.6) so a single delayed heartbeat never expires the lease. `start`, `heartbeat`, `progress`, `checkpoint`, `complete`, `release`, worker wait-condition set / arm / park, and worker-created entries require `lease_token` in the request body and must come from the lease holder; otherwise `409` `aborted` / `LEASE_LOST` (§3.3 Error Response Format). Tokens appear only in claim/accept responses and the holder's requests, never in logs or events. Non-worker operations (create, cancel, reassign, resolve input, API-consumer wait set, bulk/admin) and `accept` take no token.
 
 #### Task Entry Endpoints
 
@@ -969,7 +999,7 @@ All authenticated endpoints below use `.authenticated()` + `.require_license_fea
 | Method | Path | Description | Auth Action |
 |---|---|---|---|
 | `POST` | `/tasks/bulk/cancel` | Batch cancel | `cancel` |
-| `POST` | `/tasks/bulk/reprioritize` | Batch reprioritize | `admin` |
+| `POST` | `/tasks/bulk/reprioritize` | Batch change of `priority` and/or `urgency`; raising to `critical` also needs `expedite` per task (else `unauthorized`) | `admin` |
 | `POST` | `/tasks/bulk/retry` | Batch re-enqueue of `dead_lettered` or `failed` tasks (PRD §5.8 Re-enqueue rules) | `admin` |
 | `POST` | `/tasks/bulk/move` | Batch move between queues | `admin` |
 
@@ -992,7 +1022,7 @@ All authenticated endpoints below use `.authenticated()` + `.require_license_fea
 
 Search is exposed through the platform **OData** surface (`toolkit_odata_macros::ODataFilterable` derive on the search entity; the handler takes the `OData` extractor and returns a `JsonPage`), per [`07_odata_pagination_select_filter.md`](../../../docs/toolkit_unified_system/07_odata_pagination_select_filter.md). Standard query options map as follows:
 
-**Filtering** (`$filter`): `ODataFilterable` fields on the search entity: `state`, `assignee`, `queue`, `type`, `priority`, `created_at` (age range), plus `tags` (key/value), `resource_refs` (`resource_type` + `resource_id`, backed by `te_resource_refs`), and `dependencies` (unmet / all-met) via dedicated filterable projections. Example: `$filter=state eq 'queued' and priority le 5`.
+**Filtering** (`$filter`): `ODataFilterable` fields on the search entity: `state`, `assignee`, `queue`, `type`, `urgency`, `priority`, `created_at` (age range), plus `tags` (key/value), `resource_refs` (`resource_type` + `resource_id`, backed by `te_resource_refs`), and `dependencies` (unmet / all-met) via dedicated filterable projections. Example: `$filter=state eq 'queued' and priority le 5`.
 
 **Sorting** (`$orderby`): standard OData multi-field ordering, e.g. `$orderby=priority asc,created_at asc`. Nullable fields follow nulls-last for `asc`, nulls-first for `desc`. The engine appends an `id asc` tiebreaker when the client `$orderby` does not end on a unique field (deviation note below).
 
@@ -1001,7 +1031,7 @@ Search is exposed through the platform **OData** surface (`toolkit_odata_macros:
 | LOD preset | Expands to (`$select`) |
 |---|---|
 | `tiny` | `id`, `state`, `type` |
-| `short` | + `priority`, `queue`, `assignee`, `created_at`, `updated_at` |
+| `short` | + `urgency`, `priority`, `queue`, `assignee`, `created_at`, `updated_at` |
 | `long` | + `input`, `output`, `context`, `progress`, `tags` |
 | `full` | + event history (**capped**, see below), wait conditions, entries, dependencies (expanded relations) |
 
@@ -1033,12 +1063,15 @@ Mapping of Task-Engine failure conditions to canonical categories (`gts.cf.core.
 | Task-Engine condition | Canonical category | Typical HTTP |
 |---|---|---|
 | Task/entry/wait-condition not found | `not_found` | 404 |
+| Parent or predecessor missing, foreign, or not usable by the caller (PRD §5.9) | `not_found` (field violation) | 404 |
+| Accept by anyone but the new assignee, or nothing to accept | `not_found` | 404 |
+| Urgency `critical` requested without the `expedite` action | `permission_denied` | 403 |
 | Idempotent create, duplicate key with equal payload (replay) | `already_exists` (`resource_name` = existing task ID) | 409 |
 | Idempotent create, same key + different payload | `invalid_argument` (field violation on `idempotency_key`) | 400 |
 | Idempotent create without `Idempotency-Key` | `invalid_argument` (transport override → 428) | 428 |
 | Concurrent-claim race / lost guarded update | `aborted` | 409 |
 | Payload-changing write lost the optimistic `revision` guard to a concurrent payload write on the same task (`context.reason = "CONCURRENT_MODIFICATION"`; stored payload unchanged, caller may retry) | `aborted` | 409 |
-| Stale or unknown lease token on a worker-side write (lease lost) | `aborted` (`context.reason = "LEASE_LOST"`) | 409 |
+| Stale or unknown lease token on a worker-side write, or a call not from the lease holder | `aborted` (`context.reason = "LEASE_LOST"`) | 409 |
 | Aggregate payload exceeds 64 KiB / body too large | `invalid_argument` (transport override → 413) | 413 |
 | Input fails registered JSON Schema validation | `invalid_argument` | 400 |
 | Completion result invalid: `output` fails the type's output schema, or `error`/`warnings` break the `TaskError` contract (task unchanged, lease kept) | `invalid_argument` | 400 |
@@ -1048,7 +1081,7 @@ Mapping of Task-Engine failure conditions to canonical categories (`gts.cf.core.
 | Caller may not `consume` the event type of an event condition (§3.2 Event wait authorization) | `permission_denied` | 403 |
 | Cross-domain claim / parent-child / dependency; dependency cycle | `invalid_argument` | 400 |
 | Claim assigned nothing and ≥ 1 eligible task was skipped because a concurrency dimension was at capacity (`context.reason = "CONCURRENCY_LIMIT"`, `Retry-After`) | `resource_exhausted` | 429 |
-| Queue depth limit reached on creation / move / re-enqueue (dimension `queue`, `tenant`, `domain_global`, or `deferred`; no usage figures disclosed) | `resource_exhausted` (`context.reason = "QUEUE_DEPTH_LIMIT"`, `Retry-After`) | 429 |
+| Queue depth limit reached on creation / move / re-enqueue / deferral by choice (task unchanged) (dimension `queue`, `tenant`, `domain_global`, or `deferred`; no usage figures disclosed) | `resource_exhausted` (`context.reason = "QUEUE_DEPTH_LIMIT"`, `Retry-After`) | 429 |
 | `cancellable=false` on a supersede type; `authz_scope` requested but `AccessScope` not canonicalizable → `internal` | `invalid_argument` | 400 |
 | Dedup hit but existing task not readable by caller | `permission_denied` (no task identifier) | 403 |
 | Supersede submission with a lower order value than the group's latest | `failed_precondition` (`context.reason = "STALE_ORDER"`) | 400 |
@@ -1114,37 +1147,37 @@ sequenceDiagram
 
     W->>TE: POST /tasks/claim {queues, timeout}
     Note over TE: Long-poll: wait on signal if empty
-    TE->>DB: Read each queue's head page (priority, created_at, task_id) — no locking; k-way merge across queues (§4.6)
-    TE->>DB: BEGIN; update_many te_task_state SET state=claimed,assignee,lease_until,lease_token=new,lease_epoch+1 WHERE state=queued (rows_affected==1 wins)
-    TE->>DB: Reserve slots in canonical order: update_many ... used=used+1 WHERE used<limit (guarded; 0 rows → ROLLBACK, next candidate)
+    TE->>DB: Read each queue's next candidates (urgency → next tenant → that tenant's priority, created_at, task_id) — no locking; k-way merge across queues by (urgency, created_at, task_id) (§4.6)
+    TE->>DB: BEGIN; update_many te_task_state SET state=claimed,assignee_subject=ctx.subject,assignee,lease_until,lease_token=random_v4,lease_epoch+1 WHERE state=queued (rows_affected==1 wins)
+    TE->>DB: Reserve slots in canonical order: global rows (te_concurrency_slots) then tenant rows (te_tenant_concurrency_slots, tenant_only scope): used=used+1 WHERE used<limit (guarded; 0 rows → ROLLBACK, next candidate)
     TE->>DB: DELETE queue_timeout; producer_outbox.enqueue(TaskClaimed); COMMIT
     TE-->>W: 200 OK {task, lease_token, lease_epoch, attempt}
 
     W->>TE: POST /tasks/{id}/start {lease_token}
-    TE->>DB: UPDATE state=running WHERE lease_token=?; keep/extend lease_until; producer_outbox.enqueue(TaskStarted)
+    TE->>DB: UPDATE state=running WHERE lease_token=? AND assignee_subject=ctx.subject; keep/extend lease_until; producer_outbox.enqueue(TaskStarted)
     TE-->>W: 200 OK
 
     loop Heartbeat (lease renewal — no timer rows)
         W->>TE: POST /tasks/{id}/heartbeat {lease_token}
-        TE->>DB: UPDATE te_task_state SET lease_until=NOW()+lease, heartbeat_at=NOW() WHERE lease_token=?
+        TE->>DB: UPDATE te_task_state SET lease_until=NOW()+lease, heartbeat_at=NOW() WHERE lease_token=? AND assignee_subject=ctx.subject
         TE-->>W: 200 OK {cancel_requested, resolved_waits}
     end
     Note over TE,DB: leaseScan detects lease_until<NOW() → timeout action
 
     W->>TE: POST /tasks/{id}/progress {lease_token, percent, milestone}
-    TE->>DB: PK read: lease_token matches?
+    TE->>DB: PK read: lease_token and assignee_subject match?
     TE-->>TE: Buffer in progress cache (with lease_token)
     TE-->>W: 200 OK
 
     W->>TE: POST /tasks/{id}/complete {lease_token, result_code, output}
-    TE->>DB: UPDATE state=completed, result WHERE lease_token=? AND state=running; release concurrency slots
-    TE->>DB: DELETE remaining timers; producer_outbox.enqueue(TaskCompleted); COMMIT
+    TE->>DB: UPDATE state=completed, result WHERE lease_token=? AND assignee_subject=ctx.subject AND state=running; release concurrency slots
+    TE->>DB: move row te_task_state → te_task_results; DELETE live-only rows (timers, wait conditions); producer_outbox.enqueue(TaskCompleted); COMMIT
     TE-->>W: 200 OK {task}
 
     Note over W,TE: Zombie worker (lease expired, task re-claimed by W2 with a new token)
     W->>TE: POST /tasks/{id}/complete {stale lease_token, ...}
-    TE->>DB: UPDATE ... WHERE lease_token=? → 0 rows
-    TE-->>W: 409 aborted (LEASE_LOST) — task unchanged
+    TE->>DB: UPDATE ... WHERE lease_token=? AND assignee_subject=ctx.subject → 0 rows
+    TE-->>W: 409 aborted (LEASE_LOST) — task unchanged (same answer if another principal presents W2's valid token)
 ```
 
 #### Wait Condition Flow (Event)
@@ -1250,14 +1283,18 @@ The task data is split into two tables — **`te_tasks`** (immutable after creat
 | `te_task_state` | **Non-terminal tasks only** (the live set, ≤ ~100K rows at the §6.1 profile) | **No** | Claim heads, lease scan, and heartbeats hit one small table with global indexes; no per-partition fan-out on the hot path |
 | `te_task_results` | Final mutable state of **terminal** tasks (state, result, output, error, lease token for completion replay, `terminal_at`) | By **task creation time** | Written once, at the terminal transition |
 | `te_tasks`, `te_events`, `te_task_entries` | Immutable task data and history | By **task creation time** | Append-only |
+| `te_tags`, `te_resource_refs` | Search attributes, kept for the task's whole retention | By **task creation time** | Dropped with the task's partition, not row by row |
+| `te_wait_conditions`, `te_dependencies`, `te_timers` | **Live-only** rows of non-terminal tasks (for dependencies: the successor) | **No** | Deleted at the terminal transition, so they stay as small as the live set; history is in `te_events` and `te_task_results.predecessors` |
 | `te_*_retained` (one per partitioned table, same columns) | Rows **rescued** from a partition before it is dropped (see RetentionService) | **No** | Holds the rare rows that must outlive their partition |
+| `te_dedup`, `te_supersede_heads` | Creation identities | **No** | Primary key must be globally unique; narrow rows deleted in batches |
 
-- **Terminal transition** (worker complete/fail, cancel, timeout, dead-letter): in the same transaction as the state change, `INSERT` the final row into `te_task_results` and `DELETE` it from `te_task_state`. Admin re-enqueue (`dead_lettered` → `queued`) moves the row back. Idempotent completion replay (§3.2 TaskService) reads `te_task_results`.
-- **Partition key = task creation time, derived from the task's UUID v7 id** (also for `te_events` / `te_task_entries`, which carry `task_id`). All rows of one task land in the same partition, and any lookup by `task_id` prunes to one partition without knowing `created_at`. Engine-scoped events with no task (`configUpdated`, `workerBlacklisted`) use their own event id timestamp.
+- **Terminal transition** (worker complete/fail, cancel, timeout, dead-letter): in one transaction, move the row from `te_task_state` to `te_task_results` (copying the predecessor list into `predecessors`) and delete the task's live-only rows. A `cascade` timer created in that transaction stays until its cascade ends (§4.6 Cascades). Admin re-enqueue moves the state row back but does not restore dependencies. Idempotent completion replay (§3.2 TaskService) reads `te_task_results`.
+- **Partition key = task creation time, derived from the task's UUID v7 id**, for every partitioned table above. All rows of one task land in one partition, and a lookup by `task_id` prunes to it. Engine-scoped events with no task (`configUpdated`, `workerBlacklisted`) use their own event id timestamp.
+- **No database foreign keys between task tables** (ADR-0009): PostgreSQL needs the partition key in a foreign key to a partitioned table, MySQL does not support them at all, and rescue moves rows to `_retained` tables. Rows that refer to a task are written and removed in that task's transactions; reconciliation reports orphans (`te_orphan_rows_total`).
 - **Reads** of a task: `te_task_state` (live) or `te_task_results` (terminal), joined with `te_tasks`; history/entries read the partitioned table `UNION ALL` its `_retained` table (the retained side is small and indexed by `task_id`).
 - **SQLite**: no partitioning; the same tables exist unpartitioned, the `_retained` tables are unused, and retention is a bounded `DELETE` (§3.2 RetentionService).
 
-**Authoritative home for mutable dispatch columns**: `priority` and `queue_id` are **mutable** — priority aging and `/tasks/bulk/reprioritize` change priority, and `/tasks/bulk/move` changes the queue. Their authoritative copy therefore lives in **`te_task_state`** (which carries the covering claim dispatch index), not in `te_tasks`. `te_tasks.queue_id` is retained only as the immutable *original* queue-at-creation for auditing; dispatch, concurrency, and search always read `te_task_state.queue_id`/`priority`. This avoids the divergence that would occur if a mutable value were duplicated into the immutable table and updated in only one place.
+**Authoritative home for mutable dispatch columns**: `urgency_code`, `priority`, and `queue_id` are **mutable** — priority aging and `/tasks/bulk/reprioritize` change them, and `/tasks/bulk/move` changes the queue. Their authoritative copy therefore lives in **`te_task_state`** (which carries the covering claim dispatch index), not in `te_tasks`. `te_tasks.queue_id` is retained only as the immutable *original* queue-at-creation for auditing; dispatch, concurrency, and search always read `te_task_state.queue_id`/`urgency_code`/`priority`. This avoids the divergence that would occur if a mutable value were duplicated into the immutable table and updated in only one place.
 
 #### `te_tasks` — immutable data (written once at creation, updated rarely)
 
@@ -1271,7 +1308,7 @@ The task data is split into two tables — **`te_tasks`** (immutable after creat
 | `created_by` | UUID | Creating subject (`SecurityContext.subject_id`), server-set |
 | `idempotency_key` | VARCHAR(256) (nullable) | Caller key, kept for reference; `NULL` for derived-dedup types. Uniqueness within `(owner_tenant_id, created_by)` is enforced in the non-partitioned `te_dedup` table, not here |
 | `cancellable` | BOOLEAN | Default true |
-| `parent_task_id` | UUID (nullable) | Parent task reference |
+| `parent_task_id` | UUID (nullable) | Parent task reference; same tenant (link authorization) |
 | `wait_for_children` | BOOLEAN | Default false; successful completion rejected `CHILDREN_PENDING` while a child (`ix_te_tasks_parent`) is non-terminal |
 | `propagate_cancel` | BOOLEAN | Default true; cancelling this task cancels its non-terminal children |
 | `input` | BLOB | Compressed JSON (see ADR-0006) |
@@ -1281,7 +1318,7 @@ The task data is split into two tables — **`te_tasks`** (immutable after creat
 | `created_at` | TIMESTAMP | |
 
 **Indexes**:
-- No unique index on `idempotency_key`: `te_tasks` is partitioned by task creation time (ADR-0009), and a unique index on a partitioned table must include the partition key, so it could not guarantee uniqueness across partitions. Idempotency is enforced by the `te_dedup` primary key instead. For the same reason the physical primary keys of the partitioned tables (`te_tasks`, `te_task_results`, `te_events`, `te_task_entries`) include `created_at` on partitioned backends; `id` uniqueness comes from UUID v7 generation, and `created_at` is derived from the id so a lookup by id alone still prunes to one partition. `te_task_state` is not partitioned (§3.7 Live / history split) and keeps a plain `task_id` primary key
+- No unique index on `idempotency_key`: `te_tasks` is partitioned by task creation time (ADR-0009), and a unique index on a partitioned table must include the partition key, so it could not guarantee uniqueness across partitions. Idempotency is enforced by the `te_dedup` primary key instead. For the same reason the physical primary keys of the partitioned tables (`te_tasks`, `te_task_results`, `te_events`, `te_task_entries`, `te_tags`, `te_resource_refs`) include the creation time on partitioned backends; `id` uniqueness comes from UUID v7 generation, and `created_at` is derived from the id so a lookup by id alone still prunes to one partition. `te_task_state` is not partitioned (§3.7 Live / history split) and keeps a plain `task_id` primary key
 - `ix_te_tasks_parent` — `(parent_task_id)` — parent/child lookups
 - `ix_te_tasks_type` — `(type_id)` — type-based queries and concurrency counting
 
@@ -1289,11 +1326,12 @@ The task data is split into two tables — **`te_tasks`** (immutable after creat
 
 | Column | Type | Notes |
 |---|---|---|
-| `task_id` | UUID (PK, FK → te_tasks.id) | 1:1 with te_tasks |
+| `task_id` | UUID (PK) | 1:1 with `te_tasks.id` |
 | `owner_tenant_id` | UUID | Denormalized from te_tasks (Scopable; required for tenant-scoped indexes) |
 | `queue_id` | UUID | **Authoritative** current queue (mutable via `/tasks/bulk/move`); drives claim dispatch index |
 | `type_id` | UUID | Denormalized from te_tasks (required for type concurrency checks during claim) |
-| `priority` | INT | **Authoritative** current priority (mutable via priority aging / `/tasks/bulk/reprioritize`); lower = higher priority |
+| `urgency_code` | TINYINT / SMALLINT | `Urgency` discriminant (`critical` = 0, `normal` = 1, so ascending order serves `critical` first); default `normal`; **authoritative** |
+| `priority` | INT | **Authoritative** current priority (mutable via priority aging / `/tasks/bulk/reprioritize`); lower = higher priority; tenant-local (PRD §5.2) |
 | `created_at` | TIMESTAMP | Denormalized from te_tasks for covering claim dispatch order (this table is not partitioned) |
 | `state_code` | TINYINT / SMALLINT | Indexed stable `TaskState` enum discriminant; one of the 10 states |
 | `cancel_requested` | BOOLEAN | Default false |
@@ -1308,13 +1346,13 @@ The task data is split into two tables — **`te_tasks`** (immutable after creat
 | `result_code` | TINYINT / SMALLINT (nullable) | Stable `TaskResultCode` enum discriminant |
 | `error_json` | BLOB (nullable) | Compressed JSON error details |
 | `warnings_json` | BLOB (nullable) | Compressed JSON warnings list |
-| `assignee_subject` | UUID (nullable) | Principal of the current worker (`SecurityContext.subject_id` of the claim) |
+| `assignee_subject` | UUID (nullable) | Principal of the lease holder (or the reassignment target); part of every fenced write |
 | `assignee` | VARCHAR(128) (nullable) | `worker_id` of the current worker; (`assignee_subject`, `assignee`) is the worker identity (PRD §5.6) |
 | `parent_task_id` | UUID (nullable) | Denormalized from `te_tasks`; lets the children wait check "any non-terminal child?" on this small, unpartitioned table |
 | `claimed_at` | TIMESTAMP (nullable) | |
 | `lease_until` | TIMESTAMP (nullable) | |
-| `lease_token` | UUID (nullable) | Current lease fencing token (§3.1 Lease token / epoch handling); never logged |
-| `lease_epoch` | BIGINT | Default 0; `+1` on every lease grant (claim, reassignment); never decreases |
+| `lease_token` | UUID (nullable) | Current lease token, random UUID v4 (§3.1); `NULL` when no lease is live; never logged |
+| `lease_epoch` | BIGINT | Default 0; `+1` on every claim and every reassignment; never decreases |
 | `heartbeat_at` | TIMESTAMP (nullable) | |
 | `assignment_deadline` | TIMESTAMP (nullable) | Absolute deadline for the worker to `start` after a claim; set at claim, cleared at start; never extended by heartbeat |
 | `execution_deadline` | TIMESTAMP (nullable) | Absolute deadline for the current claimed run; set at every `start`, cleared on leaving `running`; never extended by heartbeat |
@@ -1326,8 +1364,8 @@ The task data is split into two tables — **`te_tasks`** (immutable after creat
 
 **Indexes**:
 - `ix_te_task_state_tenant_state` — `(owner_tenant_id, state_code)` — tenant-scoped state queries (no JOIN needed)
-- `ix_te_task_state_tenant_dispatch` — `(queue_id, state_code, priority, owner_tenant_id, created_at, task_id)` — tenant round-robin probe for `round_robin` queues (§4.6 Task Assignment, PRD §5.2 Tenant Fairness)
-- `ix_te_task_state_queue_dispatch` — `(queue_id, state_code, priority, created_at, task_id)` — covering claim dispatch scan without joining `te_tasks` before candidate selection. The column order returns one queue's `queued` tasks already sorted by the claim order `(priority, created_at, task_id)`, so a per-queue head read is a bounded index range scan with no sort, whatever the queue depth (§4.6 Task Assignment). `run_after` is deliberately not in the key: it would sit before `priority` and break that ordering, and it is never needed for `queued` rows (invariant above)
+- `ix_te_task_state_tenant_dispatch` — `(queue_id, state_code, urgency_code, owner_tenant_id, priority, created_at, task_id)` — `round_robin` probe: one range read returns the next tenant and its best task (§4.6 Task Assignment)
+- `ix_te_task_state_queue_dispatch` — `(queue_id, state_code, urgency_code, priority, created_at, task_id)` — `fifo` dispatch scan and queue-watcher probe, already in claim order, so a head read never sorts, whatever the queue depth (§4.6). `run_after` is not in the key: it would break the order and is never needed for `queued` rows (invariant above)
 - `ix_te_task_state_lease` — `(lease_until)` WHERE `state_code IN (claimed, running)` — heartbeat timeout scan
 - `ix_te_task_state_assignment_deadline` — `(assignment_deadline)` WHERE `state_code = claimed` — assignment timeout scan
 - `ix_te_task_state_execution_deadline` — `(execution_deadline)` WHERE `state_code = running` — execution timeout scan
@@ -1342,26 +1380,42 @@ Same columns as `te_task_state` minus the live-only dispatch/lease columns (`run
 | Column | Type | Notes |
 |---|---|---|
 | `terminal_at` | TIMESTAMP | When the task reached its terminal state; **retention is measured from this value** (ADR-0009) |
-| `lease_token` | UUID (nullable) | Final holder's token, kept for idempotent completion replay (§3.2 TaskService) |
+| `lease_token` | UUID (nullable) | Final holder's token, for idempotent completion replay (§3.2 TaskService) |
+| `predecessors` | JSON (nullable) | Predecessor list and mode, copied from `te_dependencies` at the terminal transition |
 
 **Partitioning**: range by task creation time (derived from the UUID v7 `task_id`), aligned with `te_tasks`. **Indexes**: PK `(task_id, created_at)`; `(owner_tenant_id, state_code, terminal_at)` for tenant-scoped search and DLQ inspection; `(terminal_at)` for retention.
 
-#### `te_concurrency_slots`
+#### `te_concurrency_slots` and `te_tenant_concurrency_slots`
+
+Cross-tenant counters live in an unscoped table, per-tenant counters in a tenant-scoped one (§2.1). All key columns are `NOT NULL` (the dimension says what `scope_id` is), so each primary key is a real uniqueness constraint on every backend; a nullable key column would be rejected or would allow duplicate rows.
+
+`te_concurrency_slots` — cross-tenant (`#[secure(unrestricted)]`, no tenant column):
 
 | Column | Type | Notes |
 |---|---|---|
-| `dimension_code` | TINYINT / SMALLINT | Stable `ConcurrencyDimension` enum discriminant (`queue_global`, `queue_tenant`, `type_global`, `type_tenant`) |
-| `queue_id` | UUID (nullable) | Set for `queue_global` / `queue_tenant` dimensions |
-| `type_id` | UUID (nullable) | Set for `type_global` / `type_tenant` dimensions |
-| `tenant_id` | UUID (nullable) | Set for `queue_tenant` / `type_tenant` dimensions |
-| `shard` | SMALLINT | Hot-row shard index (default 0; see ADR-0008 hot-row sharding) |
+| `dimension_code` | TINYINT / SMALLINT | `queue_global` or `type_global` |
+| `scope_id` | UUID NOT NULL | Queue ID or task type ID |
+| `shard` | SMALLINT NOT NULL | Hot-row shard index (default 0; see ADR-0008 hot-row sharding) |
 | `limit_value` | INT | Effective limit after config/GTS resolution (per-shard when sharded) |
 | `used` | INT | Reserved slots consumed by `claimed` or `running` tasks |
 | `updated_at` | TIMESTAMP | |
 
-**Indexes**: PK `(dimension_code, queue_id, type_id, tenant_id, shard)`. Typed nullable scope columns replace a stringly-typed composite key so scopes cannot be built inconsistently and can be reasoned about in queries.
+**Indexes**: PK `(dimension_code, scope_id, shard)`.
 
-**Scoping**: This is a cross-tenant aggregate table (the `queue_global`/`type_global` dimensions count across all tenants) and therefore has **no `owner_tenant_id`** column. The SeaORM entity is `#[secure(unrestricted)]` and slot reservation/release is executed on the engine claim/complete code path with `AccessScope::allow_all()` (§2.1 Secure-by-default). The `tenant_id` column here is the *counting dimension* for per-tenant limits, not a `Scopable` security column. Callers cannot reach this table directly; only the tenant-scoped task-row transitions that wrap the reservation are subject-authorized.
+`te_tenant_concurrency_slots` — per tenant (`Scopable`, `tenant_col = owner_tenant_id`):
+
+| Column | Type | Notes |
+|---|---|---|
+| `owner_tenant_id` | UUID NOT NULL | The task's owner tenant |
+| `dimension_code` | TINYINT / SMALLINT | `queue_tenant` or `type_tenant` |
+| `scope_id` | UUID NOT NULL | Queue ID or task type ID |
+| `limit_value` | INT | Effective limit after config/GTS resolution |
+| `used` | INT | This tenant's `claimed` + `running` tasks |
+| `updated_at` | TIMESTAMP | |
+
+**Indexes**: PK `(owner_tenant_id, dimension_code, scope_id)`. Unsharded.
+
+**Scoping**: see §2.1 (`GlobalCounterRepo` for the global table, `scope.tenant_only()` for the tenant table). Callers never read either table directly.
 
 Concurrency enforcement **MUST** reserve slots via a single atomic conditional statement (`UPDATE ... SET used = used + 1 WHERE ... AND used < limit_value`) before moving a task to `claimed`, and **MUST** release slots when a task leaves `claimed` or `running` for a state that no longer consumes execution capacity — including `running` → `waiting` (a parked task holds no slot; PRD §5.4). See [ADR/0008-atomic-claim-strategy.md](ADR/0008-atomic-claim-strategy.md).
 
@@ -1369,9 +1423,11 @@ Concurrency enforcement **MUST** reserve slots via a single atomic conditional s
 
 **Lock ordering (deadlock freedom)**: every guarded `UPDATE` holds its row lock until commit, so two transactions that lock the same rows in opposite orders can deadlock. All transactions — claim, complete/fail, cancel, timeouts, retry, wait, create, bulk — **MUST** take row locks in this one global order:
 
-1. **`te_task_state` rows** first. When a transaction transitions several tasks it locks them in a deterministic order: ascending `task_id` for bulk operations; for cascades, the task that triggered the cascade before its dependents (predecessor → successors, parent → children), never the reverse.
-2. **`te_concurrency_slots` rows** next, sorted by `(dimension_code, queue_id, type_id, tenant_id, shard)`. `dimension_code` follows the enum order `queue_global` → `queue_tenant` → `type_global` → `type_tenant`.
-3. **`te_queue_backlog` rows** last, sorted by `(dimension_code, queue_id, tenant_id, shard)` with enum order `queue_global` → `queue_tenant` → `tenant_deferred` (`domain_global` has no row, §3.7 Hot-row rules).
+1. **`te_task_state` rows** first, in a fixed order: ascending `task_id` for bulk operations; for cascades and links, predecessor before successors and parent before children.
+2. **`te_concurrency_slots`**, by `(dimension_code, scope_id, shard)`.
+3. **`te_tenant_concurrency_slots`**, by `(owner_tenant_id, dimension_code, scope_id)`.
+4. **`te_queue_backlog`**, by `(dimension_code, queue_id, shard)`.
+5. **`te_tenant_queue_backlog`** last, by `(owner_tenant_id, dimension_code, queue_id)`.
 
 A transaction that changes counters for several tasks (bulk cancel, cancel propagation, dependency cascade) **MUST** first sum the deltas per counter row and then apply each row once, in the sorted order above. That rule is what makes the claim do its guarded task `UPDATE` **before** reserving slots (§4.6). The reverse order — slots first — deadlocks against a completion: claim A reserves slot S and then waits for task T's row, which it read as `queued` a moment earlier; meanwhile T was claimed by another worker and its completion B holds T's row and waits to release S.
 
@@ -1385,32 +1441,46 @@ Safety net: the database may still report a deadlock that this ordering does not
 
 **Drift reconciliation**: A periodic reconciliation job (owned by the Retention/maintenance task) recomputes `used` per scope from the authoritative count of `claimed` + `running` tasks and corrects the conservative drift described above. Reconciliation runs on a configurable interval and on startup; an underflow (`used < 0`) or large positive drift raises a warning metric. Because drift can only over-count, reconciliation restores lost capacity — it is a liveness (utilisation) mechanism, not a safety mechanism, so it can never cause the cap to be exceeded even between runs.
 
-#### `te_queue_backlog`
+#### `te_queue_backlog` and `te_tenant_queue_backlog`
 
-Queue-depth counters (PRD §5.2 Queue Depth Limits). Same mechanism as `te_concurrency_slots`, separate table because the counted sets (`queued`; deferred = `scheduled` + `blocked`) and the refusal semantics (admission only) differ.
+Queue-depth counters (PRD §5.2), with the same mechanism and scope split as the concurrency counters. Separate tables because the counted sets (`queued`; deferred = `scheduled` + `blocked` + `waiting`) and the refusal rules (admission only) differ.
+
+`te_queue_backlog` — cross-tenant (`#[secure(unrestricted)]`, no tenant column):
 
 | Column | Type | Notes |
 |---|---|---|
-| `dimension_code` | TINYINT / SMALLINT | Stable `BacklogDimension` enum discriminant (`queue_global`, `queue_tenant`, `domain_global`, `tenant_deferred`) |
-| `queue_id` | UUID (nullable) | Set for `queue_global` / `queue_tenant` |
-| `tenant_id` | UUID (nullable) | Set for `queue_tenant` and `tenant_deferred` (the task's `owner_tenant_id`); for `tenant_deferred` `queue_id` is `NULL` (all queues of the domain) |
-| `shard` | SMALLINT | Hot-row shard index (`queue_global` is sharded by default, see Hot-row rules below; per-shard limits sum to ≤ N) |
-| `limit_value` | INT | Effective limit after config/GTS resolution (`0` = unlimited) |
-| `used` | INT | `queued` tasks (`tenant_deferred`: `scheduled` + `blocked` tasks) counted against this scope |
+| `dimension_code` | TINYINT / SMALLINT | `queue_global` (`domain_global` is a sampled gauge with no row) |
+| `queue_id` | UUID NOT NULL | The queue |
+| `shard` | SMALLINT NOT NULL | Hot-row shard index (sharded by default, Hot-row rules below) |
+| `limit_value` | INT | Effective limit after config/GTS resolution |
+| `used` | INT | `queued` tasks of the queue, all tenants |
 | `updated_at` | TIMESTAMP | |
 
-**Indexes**: PK `(dimension_code, queue_id, tenant_id, shard)`. Rows are created lazily on first admission for a scope.
+**Indexes**: PK `(dimension_code, queue_id, shard)`.
 
-**Hot-row rules** (apply to `te_queue_backlog` and `te_concurrency_slots`):
+`te_tenant_queue_backlog` — per tenant (`Scopable`, `tenant_col = owner_tenant_id`):
+
+| Column | Type | Notes |
+|---|---|---|
+| `owner_tenant_id` | UUID NOT NULL | The task's owner tenant |
+| `dimension_code` | TINYINT / SMALLINT | `queue_tenant` or `tenant_deferred` |
+| `queue_id` | UUID NOT NULL | The queue, or the nil UUID for `tenant_deferred` (all queues of the domain) |
+| `limit_value` | INT | Effective limit after config resolution |
+| `used` | INT | `queue_tenant`: the tenant's `queued` tasks in the queue; `tenant_deferred`: its deferred tasks in the domain |
+| `updated_at` | TIMESTAMP | |
+
+**Indexes**: PK `(owner_tenant_id, dimension_code, queue_id)`. Rows are created on first admission (`INSERT … ON CONFLICT DO NOTHING`, then the guarded increment).
+
+**Hot-row rules** (apply to all four counter tables):
 
 1. **Unlimited means untouched.** A dimension whose effective limit is `0` has **no counter row** and is skipped on the create/claim/release path entirely. When a runtime config change sets a non-zero limit, the maintenance job (§3.2 RetentionService step 5) creates the row(s) from a recount before enforcement starts; setting a limit back to `0` deletes them.
 2. **`domain_global` is a sampled ceiling, not a transactional counter.** It would otherwise be one row updated by every create and claim in the domain. Instead the maintenance leader samples the domain's `queued` count every `queue_depth.domain_sample_secs` (default 5 s, an index-only count on `te_task_state`) into an in-memory gauge shared via `te_runtime_config`; creation is refused `429` `QUEUE_DEPTH_LIMIT` (dimension `domain_global`) while the latest sample is ≥ the limit. Overshoot is bounded by one sampling interval of admissions — acceptable for a last-line safety ceiling.
 3. **Wide scopes are sharded by default.** `queue_global` backlog rows and `queue_global` / `type_global` concurrency rows use `effective_shards = min(counter_shards, max(1, limit / 32))` (`counter_shards` default 8). Large limits spread across shards; small limits stay on one row so they are not fragmented into unusable per-shard slices. A reservation picks a shard at random and, on refusal, tries the remaining shards before reporting the dimension full, so sharding never refuses while capacity exists elsewhere.
 4. Per-tenant dimensions (`queue_tenant`, `type_tenant`, `tenant_deferred`) are naturally spread across tenants and stay unsharded.
 
-**Scoping**: Cross-tenant aggregate, no `owner_tenant_id` column; `#[secure(unrestricted)]` entity reachable only on engine create/transition paths under `AccessScope::allow_all()` (§2.1 Secure-by-default), exactly like `te_concurrency_slots`. API callers can never read it directly; introspection exposes only values the caller's scope permits.
+**Scoping**: as for the concurrency counters (§2.1). Introspection shows only what the caller's scope permits.
 
-**Admission** reserves each applicable dimension, in the lock order of `te_concurrency_slots` → Lock ordering (backlog rows are always locked last), with `UPDATE … SET used = used + 1 WHERE … AND (limit_value = 0 OR used < limit_value)` in the create transaction; any `rows_affected == 0` aborts the transaction (rolling back the other dimensions and the insert). **Re-entry** (retry, lease requeue, wait resume) increments unconditionally; **exit** decrements. Because every counter change shares a transaction with the state change, drift can only come from bugs or manual edits and is corrected by the same periodic reconciliation job as concurrency slots (recount of `queued` / deferred tasks per scope; warning metric on non-trivial drift).
+**Admission** reserves each applicable dimension in the Lock ordering above with `UPDATE … SET used = used + 1 WHERE … AND (limit_value = 0 OR used < limit_value)`; any `rows_affected == 0` aborts the transaction. Re-entry, hand-over, and exit change counters unconditionally (§3.1 Queue-depth accounting). Because every counter change shares a transaction with the state change, drift can only come from bugs or manual edits and is corrected by the same periodic reconciliation job as concurrency slots (recount of `queued` / deferred tasks per scope; warning metric on non-trivial drift).
 
 **Task-domain scope**: each task domain stores its own counters in its own database (§3.8), and every limit is enforced per domain (PRD §5.2). During startup, `domain_router` checks queue routing and task-type routing rules together. If a queue could route to multiple domains, or if its task types would split across domains, startup stops with an error naming the bad queue, task types, and domains. This guarantees each queue lives in one domain only, with one clear set of queue-depth and concurrency counters.
 
@@ -1424,9 +1494,9 @@ Occupied creation identities: derived dedup identities (PRD §5.1 Derived Dedup 
 | `dedup_key` | BINARY(32) | SHA-256 identity (§4.6) |
 | `task_id` | UUID | Holder |
 | `window` | TINYINT | `active` / `active_or_succeeded` (snapshot of the type's `window` policy), or `retention` for caller idempotency keys |
-| `created_at` | TIMESTAMP | |
+| `created_at` | TIMESTAMP | Holder's creation time, for retention |
 
-**Indexes**: PK `(owner_tenant_id, dedup_key)` — the portable uniqueness constraint (no partial index needed, so it works on PostgreSQL, MariaDB/MySQL, and SQLite); `ix_te_dedup_task` `(task_id)` — release on terminal transition. Insert happens in the create transaction (conflict → replay path); the row is deleted in the same transaction as the holder's transition to a terminal state: under `window = active` on **any** terminal state; under `active_or_succeeded` on every terminal state except `completed` with result code `success` or `warning` (those rows persist until retention removes the task); under `retention` never on a transition — the RetentionService deletes the row together with its task.
+**Indexes**: PK `(owner_tenant_id, dedup_key)` — the portable uniqueness constraint (no partial index needed, so it works on PostgreSQL, MariaDB/MySQL, and SQLite); `ix_te_dedup_task` `(task_id)` — release on terminal transition; `ix_te_dedup_created` `(created_at)` — retention deletes rows in batches by creation range. Insert happens in the create transaction (conflict → replay path); the row is deleted in the same transaction as the holder's transition to a terminal state: under `window = active` on **any** terminal state; under `active_or_succeeded` on every terminal state except `completed` with result code `success` or `warning` (those rows persist until retention removes the task); under `retention` never on a transition — the RetentionService deletes the row together with its task.
 
 #### `te_supersede_heads`
 
@@ -1438,15 +1508,16 @@ Latest order value per supersede group (PRD §5.1 Task Supersession). Tenant-sco
 | `group_key` | BINARY(32) | Identity hash **excluding** the order value |
 | `latest_order` | BIGINT | Highest order value admitted |
 | `latest_task_id` | UUID | Task that carries it |
+| `latest_created_at` | TIMESTAMP | Creation time of `latest_task_id`, for retention |
 
-**Indexes**: PK `(owner_tenant_id, group_key)`. Removed by retention together with `latest_task_id`'s task, bounding growth.
+**Indexes**: PK `(owner_tenant_id, group_key)`; `(latest_created_at)`. Removed by retention with `latest_task_id`'s task, bounding growth.
 
 #### `te_task_entries`
 
 | Column | Type | Notes |
 |---|---|---|
 | `id` | UUID (PK) | |
-| `task_id` | UUID (FK) | Parent task |
+| `task_id` | UUID | Owning task |
 | `type_id` | UUID | GTS entry type |
 | `creator` | VARCHAR(256) | Worker or user identity |
 | `payload` | BLOB | Compressed JSON |
@@ -1455,10 +1526,12 @@ Latest order value per supersede group (PRD §5.1 Task Supersession). Tenant-sco
 
 #### `te_wait_conditions`
 
+**Live-only** (§3.7): deleted at the terminal transition; wait history stays in `te_events`, and `GET /tasks/{id}/wait-conditions` on a terminal task returns an empty list.
+
 | Column | Type | Notes |
 |---|---|---|
 | `id` | UUID (PK) | |
-| `task_id` | UUID (FK) | |
+| `task_id` | UUID | Owning task |
 | `kind_code` | TINYINT / SMALLINT | Stable `WaitConditionKind` enum discriminant (`timer`, `event`, `input`, `children`) |
 | `state_code` | TINYINT / SMALLINT | Stable `WaitConditionState` enum discriminant (`pending`, `satisfied`, `timed_out`, `cancelled` — member of an `all` group made unsatisfiable by another member's timeout) |
 | `on_timeout_code` | TINYINT / SMALLINT | Stable `WaitTimeoutAction` enum discriminant (`fail`, `resume`) |
@@ -1486,10 +1559,12 @@ Latest order value per supersede group (PRD §5.1 Task Supersession). Tenant-sco
 
 #### `te_timers`
 
+**Live-only** (§3.7): deleted at the terminal transition, except a `cascade` timer, which is deleted when its cascade ends (§4.6 Cascades).
+
 | Column | Type | Notes |
 |---|---|---|
 | `id` | UUID (PK) | |
-| `task_id` | UUID (FK) | |
+| `task_id` | UUID | Owning task |
 | `owner_tenant_id` | UUID | Inherited from task (Scopable); request-path timer writes are tenant-scoped, leader loop uses a system `allow_all()` scope |
 | `timer_type_code` | TINYINT / SMALLINT | Stable `TimerType` enum discriminant (queue, assignment, execution, heartbeat, lifetime, sla, scheduled, wait, cancel_grace, cascade, children_check). `assignment`/`execution`/`heartbeat` are reserved discriminants only: those timeouts are enforced via the `te_task_state` deadline columns, never as `te_timers` rows |
 | `fires_at` | TIMESTAMP | |
@@ -1511,7 +1586,7 @@ Latest order value per supersede group (PRD §5.1 Task Supersession). Tenant-sco
 | Column | Type | Notes |
 |---|---|---|
 | `id` | UUID (PK) | **Stable unique event ID** (UUID v7); the same ID travels on the published event so consumers dedup on it |
-| `task_id` | UUID (FK, nullable) | `NULL` for engine-scoped events not tied to one task (`configUpdated`, `workerBlacklisted`) |
+| `task_id` | UUID (nullable) | `NULL` for engine-scoped events not tied to one task (`configUpdated`, `workerBlacklisted`) |
 | `event_type` | VARCHAR(50) | e.g., `taskCreated`, `taskClaimed`, `taskReassigned`, `workerBlacklisted`, `configUpdated` |
 | `actor_identity` | VARCHAR(256) | |
 | `payload` | BLOB | Compressed JSON event details |
@@ -1535,38 +1610,45 @@ Schema, indexes, claiming, dedup, leasing, and vacuum are owned by the Event Bro
 
 #### `te_dependencies`
 
+**Live-only** (§3.7): a row exists while its successor is non-terminal. The table stays small, and cascades find successors through one global index without scanning partitions. At the successor's terminal transition its list is copied to `te_task_results.predecessors` and its rows are deleted.
+
 | Column | Type | Notes |
 |---|---|---|
-| `task_id` | UUID (FK) | The dependent task |
-| `predecessor_id` | UUID (FK) | The prerequisite task |
+| `task_id` | UUID | The successor |
+| `predecessor_id` | UUID | The predecessor (may already be terminal) |
+| `owner_tenant_id` | UUID | Tenant of both tasks (PRD §5.9); `Scopable` |
 | `mode_code` | TINYINT / SMALLINT | Stable dependency mode enum discriminant (`all`, `any`) |
 | `satisfied` | BOOLEAN | Whether this dep is met |
 
-**Indexes**: PK `(task_id, predecessor_id)`; `ix_te_deps_predecessor` on `(predecessor_id)`
+**Indexes**: PK `(task_id, predecessor_id)`; `ix_te_deps_predecessor` on `(owner_tenant_id, predecessor_id)`
 
 #### `te_tags`
 
+**Partitioned by task creation time** like `te_tasks`, so tags are dropped with their task; rescued rows move to `te_tags_retained`.
+
 | Column | Type | Notes |
 |---|---|---|
-| `task_id` | UUID (FK) | |
+| `task_id` | UUID | |
+| `task_created_at` | TIMESTAMP | Partition key, from `task_id` |
 | `key` | VARCHAR(128) | Free-form, tenant-scoped tag key (not GTS-typed) |
 | `value` | VARCHAR(256) | |
 | `owner_tenant_id` | UUID | Inherited (Scopable) |
 
-**Indexes**: PK `(task_id, key)`; `ix_te_tags_key_value` on `(owner_tenant_id, key, value)` — tenant-scoped tag filtering
+**Indexes**: PK `(task_id, key, task_created_at)`; `ix_te_tags_key_value` on `(owner_tenant_id, key, value)` (per partition) — tenant-scoped tag filtering.
 
 #### `te_resource_refs`
 
-Written once at task creation (immutable, like `te_tasks`).
+Written once at creation. **Partitioned** like `te_tags`; rescued rows move to `te_resource_refs_retained`.
 
 | Column | Type | Notes |
 |---|---|---|
-| `task_id` | UUID (FK) | |
+| `task_id` | UUID | |
+| `task_created_at` | TIMESTAMP | Partition key, from `task_id` |
 | `resource_type_id` | UUID | Deterministic UUID of the resource's GTS type identifier |
 | `resource_id` | VARCHAR(256) | Resource identifier within its type |
 | `owner_tenant_id` | UUID | Inherited (Scopable) |
 
-**Indexes**: PK `(task_id, resource_type_id, resource_id)`; `ix_te_resource_refs_lookup` on `(owner_tenant_id, resource_type_id, resource_id)` — tenant-scoped "all tasks touching this resource" filtering. Max rows per task: `max_resource_refs_per_task` (§4.1); excess rejected with `invalid_argument` `400`.
+**Indexes**: PK `(task_id, resource_type_id, resource_id, task_created_at)`; `ix_te_resource_refs_lookup` on `(owner_tenant_id, resource_type_id, resource_id)` (per partition) — tenant-scoped "all tasks touching this resource" filtering. Max rows per task: `max_resource_refs_per_task` (§4.1); excess rejected with `invalid_argument` `400`.
 
 #### `te_worker_blacklist`
 
@@ -1606,7 +1688,7 @@ Multiple instances share the database and coordinate **without any DB-specific S
 
 **Backend suitability**: PostgreSQL is the recommended production backend. MySQL/MariaDB 8.0+ is fully supported. **SQLite is supported for development, testing, and low-volume single-node embedded use only** — its single-writer model serializes writes and it lacks native partitioning. This is a `toolkit-db` framework property, not a consequence of any Task-Engine-specific SQL. Consistent with ADR-0008 and ADR-0009.
 
-**Recovery and upgrades** (PRD §6.1 Service Availability and Recovery, Rolling Upgrade): all state is in the domain databases, so backup and point-in-time recovery are database operations. On start after a restore, each instance re-reads `te_timers` and the deadline columns of `te_task_state`, and the maintenance leader recomputes `te_concurrency_slots.used` and `te_queue_backlog.used` from task rows (the same reconciliation as §3.2 RetentionService step 5) before claims are served. Migrations use expand/contract: a release only adds columns, tables, and enum values; it removes them one release later, once no older instance is running. New enum values follow the evolution contract in §3.1.
+**Recovery and upgrades** (PRD §6.1 Service Availability and Recovery, Rolling Upgrade): all state is in the domain databases, so backup and point-in-time recovery are database operations. On start after a restore, each instance re-reads `te_timers` and the deadline columns of `te_task_state`, and the maintenance leader recomputes `used` in the four counter tables (`te_concurrency_slots`, `te_tenant_concurrency_slots`, `te_queue_backlog`, `te_tenant_queue_backlog`) from task rows (the same reconciliation as §3.2 RetentionService step 5) before claims are served. Migrations use expand/contract: a release only adds columns, tables, and enum values; it removes them one release later, once no older instance is running. New enum values follow the evolution contract in §3.1.
 
 **Task Domains**: When configured, different task type groups are routed to different databases. Each domain has its own connection pool, migrations, retention schedule, event outbox, and `te_event_inbox` (§3.2). A `default` domain catches unmatched types and holds `te_runtime_config` and the consumer offsets.
 
@@ -1616,7 +1698,7 @@ Multiple instances share the database and coordinate **without any DB-specific S
 
 **Single-domain operation boundary** (independent databases cannot be joined or transactionally spanned):
 
-- **Claim**: all queues in one claim request must resolve to one domain (rejected `invalid_argument` `400` otherwise) — the atomic guarded-update claim and highest-priority ordering run within one DB. A worker consuming from queues in different domains issues one claim per domain.
+- **Claim**: all queues in one claim request must resolve to one domain (rejected `invalid_argument` `400` otherwise) — the atomic guarded-update claim and its exact ordering run within one DB. A worker consuming from queues in different domains issues one claim per domain.
 - **Parent/child** and **predecessor/successor dependencies**: both endpoints must reside in the same domain (rejected `invalid_argument` `400` at creation otherwise). Child-completion tracking, cancellation propagation, cycle validation, and `ALL`/`ANY` unblocking therefore never cross a database boundary.
 - **Cross-domain fan-out** applies only to non-atomic **read** paths (untyped list/search §4.6, DLQ inspection §3.3), never to claim/dependency/parent-child.
 - **Events**: outbound events commit in the task's domain; an inbound event is applied once per domain via its inbox (§3.2 Event Consumer).
@@ -1721,7 +1803,7 @@ gears:
       claim_max_wait_secs: 50             # cap on the long-poll timeout a claim may request (larger values are clamped); below common 60 s proxy idle timeouts
       claim_poll_interval_ms: 1000        # cross-node long-poll wake-up: per-node queue-watcher probe interval, jittered ±20% (§3.2 Signal System)
       counter_shards: 8                   # max shards for wide counter rows (queue_global, type_global); effective = min(8, limit/32) (§3.7 Hot-row rules)
-      slot_reconcile_interval_secs: 300   # recompute te_concurrency_slots.used from claimed+running
+      slot_reconcile_interval_secs: 300   # recompute the counter tables' used values from task rows (§3.7)
 
       max_payload_size_bytes: 65536       # 64 KiB per task/entry (uncompressed canonical JSON, aggregate input+context+output)
       max_request_body_bytes: 1048576     # 1 MiB HTTP body (streaming-counted for chunked/HTTP2 bodies)
@@ -1751,7 +1833,7 @@ gears:
         queue_max_queue_depth: 1000000            # per queue, when its GTS registration omits queue_max_queue_depth
         tenant_max_queue_depth: 100000            # `queued` tasks per queue, per tenant
         global_max_queue_depth: 5000000           # `queued` tasks across all queues, per task domain
-        tenant_max_deferred_tasks: 100000         # `scheduled` + `blocked` tasks per tenant, per task domain
+        tenant_max_deferred_tasks: 100000         # `scheduled` + `blocked` + `waiting` tasks per tenant, per task domain
         retry_after_secs: 30                      # base Retry-After on QUEUE_DEPTH_LIMIT (jittered)
         domain_sample_secs: 5                     # sampling interval of the soft domain_global ceiling (§3.7 Hot-row rules)
         overrides:                                # most specific pattern wins; overrides GTS registration; runtime-updatable (admin)
@@ -1817,7 +1899,7 @@ gears:
 
 **Worker blacklist**: In-memory with database persistence. Loaded on startup, updated on heartbeat timeout / consecutive failures, expired entries cleaned by background task. Each node re-reads `te_worker_blacklist` every `runtime_config_poll_secs`, so a blacklisting recorded on another node takes effect within that interval.
 
-**Concurrency slots**: Stored in `te_concurrency_slots` and updated atomically during claim and release paths. `claimed` and `running` tasks consume slots. Slots never use the Cluster cache (PRD §1.4 limits Cluster to ready-task caching).
+**Concurrency slots**: Stored in `te_concurrency_slots` (cross-tenant dimensions) and `te_tenant_concurrency_slots` (per-tenant dimensions) and updated atomically during claim and release paths. `claimed` and `running` tasks consume slots. Slots never use the Cluster cache (PRD §1.4 limits Cluster to ready-task caching).
 
 ### 4.3 Metrics and Observability
 
@@ -1852,6 +1934,7 @@ gears:
 | `te_lease_expired_total` | Counter | `cause` | Tasks reclaimed by lease scan (`cause` = `heartbeat` / `assignment` / `execution`) |
 | `te_claim_capacity_skipped_total` | Counter | `queue`, `dimension` | Claim candidates skipped because a concurrency dimension was at capacity (§4.6 Task Assignment) |
 | `te_slot_drift_corrected_total` | Counter | `dimension` | Concurrency-slot reconciliation corrections |
+| `te_orphan_rows_total` | Counter | `table` | Rows whose task no longer exists (no DB foreign keys, §3.7) |
 | `te_txn_deadlock_retries_total` | Counter | `op` | Transactions rolled back and retried after a database-reported deadlock (§3.7 Lock ordering) |
 | `te_progress_flush_duration` | Histogram | — | Progress cache flush time |
 | `te_blob_compression_ratio` | Histogram | — | Compression ratio |
@@ -1885,11 +1968,17 @@ Structured JSON to stdout, ingested by centralized logging system.
 
 ### 4.5 Security Considerations
 
-**Tenant isolation**: All tenant-owned database queries are tenant-scoped via `SecureConn` with `AccessScope` compiled from PDP constraints. `owner_tenant_id` is the isolation boundary on every tenant-owned entity, and those SeaORM entities derive `Scopable` with a `tenant_col`. The engine-internal system tables (`te_concurrency_slots`, `te_queue_backlog`, `te_worker_blacklist`, `te_runtime_config`) hold cross-tenant aggregates/coordination state, are declared `#[secure(unrestricted)]`, and are reachable only on engine code paths under `AccessScope::allow_all()` — never via a subject/tenant scope. System background loops also use `allow_all()` on tenant-owned tables, as limited in §2.1 (§2.1 Secure-by-default, aligned with [`06_authn_authz_secure_orm.md` §Unrestricted entities](../../../docs/toolkit_unified_system/06_authn_authz_secure_orm.md)).
+**Tenant isolation**: All tenant-owned database queries are tenant-scoped via `SecureConn` with `AccessScope` compiled from PDP constraints. `owner_tenant_id` is the isolation boundary on every tenant-owned entity, and those SeaORM entities derive `Scopable` with a `tenant_col`. Per-tenant counters are tenant-owned too. Only tables with **no tenant column** are `#[secure(unrestricted)]`; system loops use `allow_all()` as limited in §2.1 Secure-by-default.
 
 **Authorization enforcement**: All authorization decisions via `PolicyEnforcer` (fail-closed). No raw database access outside migrations. Token scopes act as a capability ceiling. Queue-level access can be restricted via resource-path access constraint predicates from the PDP.
 
-**Input validation**: GTS type identifiers validated on all inputs. Task input validated against the registered input schema on create, and completion results validated against the registered output schema plus the fixed `TaskError` contract (§3.2 TaskService), in both cases when a schema exists. Payload size limits enforced before processing. Dependency graphs validated for cycles at creation time.
+**Input validation**: GTS type identifiers validated on all inputs. Task input validated against the registered input schema on create, and completion results validated against the registered output schema plus the fixed `TaskError` contract (§3.2 TaskService), in both cases when a schema exists. Payload size limits enforced before processing. Dependency graphs validated for cycles on every change.
+
+**Lease tokens** (PRD §5.6): random UUID v4, bound to the holder's subject, returned only to the holder, never logged or published. A leaked token is useless to anyone else.
+
+**Links between tasks** (PRD §5.9): parent needs its lease or `update`, predecessor needs `read`, same tenant, uniform `404`.
+
+**Cross-tenant precedence** (PRD §5.2): priority is tenant-local; only `critical` (needs `expedite`) ranks tenants.
 
 **Payload opacity**: Task payloads (input, context, output) and entry payloads are caller-controlled opaque JSON. The Task Engine does not inspect, index, or log payload contents. Callers are responsible for PII management. Compression is transparent and does not alter the logical content.
 
@@ -1899,7 +1988,7 @@ Structured JSON to stdout, ingested by centralized logging system.
 
 **Idempotency window**: Per the platform's permanent (uniqueness-constraint) idempotency tier, the `te_dedup` row for `(owner_tenant_id, created_by, idempotency_key)` deduplicates task creation only while the original task exists (retention deletes both together). After a task is removed by retention (partition drop or delete), a replayed idempotency key will create a new task — idempotency is therefore bounded by the retention horizon, not permanent. Callers must not rely on dedup beyond retention.
 
-**Queue-depth admission security**: Counters are keyed by the task's `owner_tenant_id`, so tenants cannot consume each other's capacity; `te_queue_backlog` is an engine-internal unrestricted table (like `te_concurrency_slots`) never reachable through a subject scope. The `429` response names only the full dimension and never returns other tenants' or global usage (side-channel). Checks run authorization → validation → dedup/replay → depth, so an unauthorized caller cannot probe capacity and a replay never consumes it. Limit changes (config override, runtime update) require the queue `configure` action and emit `configUpdated`; queue GTS registrations that raise `queue_max_queue_depth` are bounded by the engine-wide `global_max_queue_depth`, which only config can change. Capacity is shared among a tenant's subjects (no per-subject sub-limit); a hostile subject can exhaust its tenant's allowance but never another tenant's — isolate subjects with separate queues/PDP queue constraints where needed.
+**Queue-depth admission security**: Per-tenant counters are keyed and scoped by the task's `owner_tenant_id`, so tenants cannot use each other's capacity. Parking, delayed release, and dependency add are admissions, so parking cannot grow a backlog without bound. The `429` response names only the full dimension and never returns other tenants' or global usage (side-channel). Checks run authorization → validation → dedup/replay → depth, so an unauthorized caller cannot probe capacity and a replay never consumes it. Limit changes (config override, runtime update) require the queue `configure` action and emit `configUpdated`; queue GTS registrations that raise `queue_max_queue_depth` are bounded by the engine-wide `global_max_queue_depth`, which only config can change. Capacity is shared among a tenant's subjects (no per-subject sub-limit); a hostile subject can exhaust its tenant's allowance but never another tenant's — isolate subjects with separate queues/PDP queue constraints where needed.
 
 **Derived dedup / supersession security**: (1) The identity follows the caller's *effective access*: if a policy change alters the compiled scope, the identity and supersede group change too, so duplicates can briefly coexist across the change (a missed dedup, never a disclosure — differing scopes never merge). The `authz_scope` canonical form is engine-defined (JCS over the normalized compiled constraints) and depends on `AccessScope` exposing a stable serialization (PRD §11 Assumptions); until confirmed, only `subject`/`tenant` are accepted and a type declaring `authz_scope` is non-creatable. The identity hash folds in the type's GTS id (contract version), `owner_tenant_id` (the *target* tenant, not necessarily the caller's), and the scope component — `created_by` (`subject`, default), a digest of the PDP-compiled `AccessScope` canonicalized (sorted, normalized; `authz_scope`), or nothing (`tenant`, only when the registrant opts in). The identity is not a credential. (2) The engine is not in the type-registration path (consuming gears register in the GTS registry directly), so it validates `dedup`/`supersede` traits against the type's input schema (required pointers, integer `order_field`, field-count/size caps) the first time it resolves the type, caches the verdict keyed by type id + registry version, and treats an invalid trait as a non-creatable type (fail closed, `invalid_argument` on create); who may register types is governed by the GTS registry authorization. (3) Identity is computed only from schema-validated input after `PolicyEnforcer` allowed `create`; a hit returns the existing task only if `SecureConn` can read it, else `403` without an identifier. This cannot occur under `subject`/`authz_scope` (scope is in the hash); under the opt-in `tenant` scope the residual disclosure (an identical task exists in the target tenant) is accepted. (4) Supersession additionally requires PDP `cancel` on the superseded task with the caller's scope, evaluated inside the create transaction so a denial leaves no change. (5) Fencing interplay: supersession is an ordinary guarded cancel transition (`WHERE state_code IN non-terminal`): `forced` clears the lease token so the holder's next write is `LEASE_LOST`; `graceful` sets `cancel_requested` and the holder's writes stay fenced by its still-valid token until it acknowledges. The `lease_epoch` is not bumped (no new lease is granted). A race with the holder's completion resolves by the guarded update — whichever transition commits first wins; if the holder wins there is simply nothing to supersede. (6) The cancellation is attributed in `te_events` to the creating subject with `superseded_by`.
 
@@ -1916,7 +2005,7 @@ Tenants cannot widen what the engine reads, because `waitable_topics` is operato
 
 #### Task Assignment (Long-Poll Claim)
 
-> **TODO (claim contention — must be resolved before implementation)**: every concurrent claimer computes the same global minimum `(priority, created_at, task_id)` and issues its guarded `UPDATE` against the **same head row**. With N workers on one busy queue, N−1 block on that row lock and then match 0 rows, so claims serialize through one row per queue and throughput collapses as workers are added; `claim_candidate_budget` only bounds the wasted work. Explore and decide (then update ADR-0008 and this algorithm):
+> **TODO (claim contention — must be resolved before implementation)**: every concurrent claimer computes the same next candidate (the head of the same stream) and issues its guarded `UPDATE` against the **same head row**. With N workers on one busy queue, N−1 block on that row lock and then match 0 rows, so claims serialize through one row per queue and throughput collapses as workers are added; `claim_candidate_budget` only bounds the wasted work. Explore and decide (then update ADR-0008 and this algorithm):
 > 1. **`FOR UPDATE SKIP LOCKED`** on PostgreSQL / MySQL 8 (the standard PG-queue answer: River, Oban, graphile-worker, pgmq) — requires exposing a row-locking clause through the ToolKit secure ORM (`SecureSelect`) or a sanctioned, scoped escape hatch; SQLite keeps the optimistic path (single writer, no contention).
 > 2. **Candidate spreading** without row locks — each claimer picks a random (or `hash(worker_id)`-offset) candidate within the first `claim_scan_limit` rows of the merged head, trading strict head order for parallelism; quantify the ordering relaxation against PRD §5.2 / §5.6.
 > 3. **Batch claim** (`max_tasks = k` per call) to amortize the scan and transaction cost per task; define how slots, queue-depth exits, and leases are taken per task in one transaction.
@@ -1951,27 +2040,39 @@ return 204 No Content                                                           
 
 try_claim_once(queues):
   # All statements use the secure ORM (SecureConn + SeaORM). No FOR UPDATE, no SKIP LOCKED, no dialect SQL —
-  # claim is lock-free optimistic concurrency (ADR-0008). Ordering is GLOBAL across the requested queues:
-  # (priority ASC, created_at ASC, task_id ASC); the order in which the worker lists queues is irrelevant.
+  # claim is lock-free optimistic concurrency (ADR-0008). Each queue yields candidates in PRD §5.2 order;
+  # candidates are merged by (urgency_code, created_at, task_id). Queue listing order is irrelevant.
   reject 400 invalid_argument if any queue has kind = dead_letter         # DLQs are never dispatched (PRD §5.8)
   queues = dedupe(queues) minus queues `worker` is blacklisted on    # ≤ claim_max_queues (checked at parse: 400)
   skipped_for_capacity = false
   ex = Exclusions{}            # scopes found saturated during THIS claim, all keyed so they apply across queues:
                                #   queues{q} · queue_tenants{(q, tenant)} · types{type} · type_tenants{(tenant, type)}
 
-  # 1. One ordered stream per queue. A stream reads its queue's head in pages of claim_scan_limit with
-  #    keyset pagination on ix_te_task_state_queue_dispatch (rows come out pre-sorted, no DB sort).
-  stream(q).next_page():
+  # 1. One ordered stream per queue (no DB sort in either mode).
+  #    fifo queue: keyset pages of claim_scan_limit on ix_te_task_state_queue_dispatch.
+  stream_fifo(q).next_page():
     TaskState::find()
       .filter(queue_id = q AND state_code = Queued
-              AND (priority, created_at, task_id) > stream.cursor            # expanded to OR/AND for portability
-              AND NOT ex.blocks_in_query(q))                                 # tenant / type exclusions known so far
-      .order_by_asc(priority).order_by_asc(created_at).order_by_asc(task_id)
+              AND (urgency_code, priority, created_at, task_id) > stream.cursor   # expanded to OR/AND for portability
+              AND NOT ex.blocks_in_query(q))                                      # tenant / type exclusions known so far
+      .order_by_asc(urgency_code).order_by_asc(priority).order_by_asc(created_at).order_by_asc(task_id)
       .limit(claim_scan_limit)
-      .secure().scope_with(scope)                                            # plain read, no locking clause
+      .secure().scope_with(scope)                                                 # plain read, no locking clause
 
-  # 2. K-way merge: a min-heap holds the current head of every stream.
-  heap = min-heap by (priority, created_at, task_id)
+  #    round_robin queue: one candidate per tenant in turn, via ix_te_task_state_tenant_dispatch.
+  #    u = the most urgent class with a queued task (critical first). Wraps to the lowest tenant id at the
+  #    end; within one claim pass a lost race moves on to the next tenant.
+  stream_rr(q).next():
+    TaskState::find()
+      .filter(queue_id = q AND state_code = Queued AND urgency_code = u
+              AND owner_tenant_id > stream.tenant_cursor
+              AND NOT ex.blocks_in_query(q))
+      .order_by_asc(owner_tenant_id).order_by_asc(priority).order_by_asc(created_at).order_by_asc(task_id)
+      .limit(1)
+      .secure().scope_with(scope)
+
+  # 2. K-way merge: a min-heap holds the current candidate of every stream.
+  heap = min-heap by (urgency_code, created_at, task_id)
   for q in queues: push stream(q).head() into heap                           # one indexed range read per queue
   attempts = 0
   while heap not empty and attempts < claim_candidate_budget:
@@ -1980,21 +2081,25 @@ try_claim_once(queues):
     attempts += 1
 
     # 3. One short transaction per candidate, locks taken in the global order of §3.7 Lock ordering:
-    #    task row → concurrency slots (canonical order) → backlog counters.
+    #    task row → global slots → tenant slots → global backlog → tenant backlog.
     BEGIN
       r = TaskState::update_many()                                           # guarded claim FIRST
         .col_expr(state_code, Claimed).col_expr(assignee_subject, worker.subject).col_expr(assignee, worker.id).col_expr(claimed_at, now)
         .col_expr(lease_until, now + lease_duration)
         .col_expr(assignment_deadline, now + assignment_timeout)             # NULL when not configured
         .col_expr(attempt, attempt + if resume_pending {0} else {1}).col_expr(resume_pending, false)
-        .col_expr(lease_token, uuid_v7()).col_expr(lease_epoch, lease_epoch + 1)
+        .col_expr(lease_token, random_uuid_v4()).col_expr(lease_epoch, lease_epoch + 1)
         .filter(task_id = c.task_id AND state_code = Queued)
         .secure().scope_with(scope).exec()
       if r.rows_affected == 0: ROLLBACK; continue                            # lost race: someone else claimed c
-      for dim in canonical_order(applicable_dimensions(c)):                  # queue_global, queue_tenant, type_global, type_tenant
-        r = ConcurrencySlot::update_many().col_expr(used, used + 1)
-              .filter(dimension_code = dim AND <typed scope cols> AND shard = pick_shard() AND used < limit_value)
-              .exec()
+      for dim in canonical_order(applicable_dimensions(c)):                  # queue_global, type_global, then queue_tenant, type_tenant
+        r = if dim.is_global():
+              GlobalCounterRepo::reserve(ConcurrencySlot, dim, scope_id(c, dim), pick_shard())
+            else:
+              TenantConcurrencySlot::update_many().col_expr(used, used + 1)
+                .filter(owner_tenant_id = c.owner_tenant_id AND dimension_code = dim
+                        AND scope_id = scope_id(c, dim) AND used < limit_value)
+                .secure().scope_with(scope.tenant_only()).exec()
         if r.rows_affected == 0:                                             # at capacity → skip THIS candidate only
           ROLLBACK                                                           # undoes the claim and earlier reservations
           skipped_for_capacity = true; metric te_claim_capacity_skipped_total{queue, dim}
@@ -2011,29 +2116,31 @@ try_claim_once(queues):
   return (none, skipped_for_capacity)
 ```
 
-**Why this algorithm** (PRD §5.6: the highest-priority eligible task **across all requested queues**):
+**Why this algorithm** (PRD §5.2 Priority-Ordered Dispatch, §5.6 Order across queues):
 
-- **Exact global order.** Each stream yields one queue's `queued` tasks in claim order straight from `ix_te_task_state_queue_dispatch`. Merging the stream heads with a min-heap therefore produces the requested queues' tasks in exact `(priority, created_at, task_id)` order. Equal priorities are served FIFO by `created_at` whatever queue they are in, and `task_id` (UUIDv7) breaks the last ties deterministically. The order is evaluated on what the claim reads; a higher-priority task committed a moment later is picked up by the next claim, which is all a non-blocking dispatcher can promise.
+- **Exact order.** Each stream yields its queue's tasks in claim order straight from an index; the min-heap merge by `(urgency_code, created_at, task_id)` serves `critical` first, then the oldest candidate. Priority never enters the merge. A more urgent task committed a moment later is picked up by the next claim, which is all a non-blocking dispatcher can promise.
 - **Cost independent of queue depth.** The first attempt costs one bounded index range read per requested queue (`claim_scan_limit` rows each) plus the guarded updates. Further pages are read only for a stream that runs out while candidates are being skipped. Total work per claim is bounded by `claim_candidate_budget` attempts and `claim_max_queues` streams, not by queue length.
 - **Capacity skips stay local.** A full dimension removes exactly the tasks it governs from the merge — the whole stream for `queue_global`, one (queue, tenant) pair for `queue_tenant`, one type in every queue for `type_global`. Already-fetched rows are dropped locally and later page reads exclude the scope in the query. One tenant at its cap can never block the others.
 - **Short locks, no deadlocks.** Each candidate gets its own transaction. A lost race or a full dimension is a plain `ROLLBACK`, with no compensating decrements. Taking the task row before the counters follows the global lock order (§3.7 Lock ordering). As a side effect, two workers racing for the same task serialize on that task's row, and the loser sees `rows_affected = 0` before it ever touches the hot counter rows.
-- **Tenant round-robin** (PRD §5.2 Tenant Fairness, queue mode `round_robin`, the default): inside one queue, tasks of the same priority are served one tenant at a time. Each node keeps, in memory, a cursor per queue: the `owner_tenant_id` it served last. For a `round_robin` queue the stream's next candidate at the stream's current best priority `p` is read with one probe on `ix_te_task_state_tenant_dispatch` — `WHERE queue_id = q AND state_code = queued AND priority = p AND owner_tenant_id > cursor ORDER BY owner_tenant_id, created_at, task_id LIMIT 1`, wrapping to the lowest tenant id when nothing is found — and the cursor moves to that tenant after a successful claim. The cursor is soft state: it is lost on restart and differs between nodes, which only makes the rotation approximate; it never skips a priority level or breaks FIFO inside a tenant, and it adds no shared hot row. The k-way merge across queues is unchanged (it compares streams by priority first). `fifo` queues keep the plain `(priority, created_at, task_id)` stream.
-- **Fairness.** Priority is strict across queues, so a stream of high-priority work can starve lower-priority tasks in other queues. Remedies are priority aging (PRD §5.2, P3), or separate claim requests per queue for workers that need a fixed split. The optional ready-task cache (§4.2, P2) **MUST** serve claims in the same merged order.
+- **Tenant round-robin** (PRD §5.2, default mode): each node keeps an in-memory cursor per queue (the last tenant served). One probe (`stream_rr`) returns the next tenant and its best task, wrapping around at the end; the cursor moves on after a successful claim. The cursor is soft state, so rotation is approximate across nodes and restarts, but it never skips an urgency class or breaks a tenant's own order, and adds no shared hot row. `fifo` queues use the plain `(urgency_code, priority, created_at, task_id)` stream.
+- **Why priority is tenant-local.** Otherwise one tenant could send everything at `0` and starve the rest. Starvation inside one tenant is handled by priority aging (PRD §5.3). The optional ready-task cache (§4.2) **MUST** serve claims in the same order.
 
 **Alternatives considered**:
 
 | Option | Why not |
 |---|---|
-| Try queues in the order the worker lists them, return the first hit (previous DESIGN) | Violates PRD §5.6: a low-priority task in the first queue wins over a high-priority task in the second |
-| One query `WHERE queue_id IN (…) ORDER BY priority, created_at LIMIT k` | Simplest to write, but no index returns rows sorted by `priority` across several `queue_id` values, so the database collects and sorts every `queued` row of those queues — O(queue depth) per claim, unusable for queues with millions of tasks |
-| A dispatch index keyed on `(state_code, priority, created_at)` without `queue_id` | Global order comes for free, but the index scan then has to skip the queued tasks of every other queue on the way |
-| Per-queue heads + k-way merge (chosen) | Exact order, cost bounded by `claim_max_queues × claim_scan_limit`, portable through the secure ORM |
+| Try queues in the order the worker lists them, return the first hit (previous DESIGN) | Violates PRD §5.6: a `normal` task in the first queue wins over a `critical` task in the second |
+| One query `WHERE queue_id IN (…) ORDER BY urgency_code, created_at LIMIT k` | Simplest to write, but no index returns rows in that order across several `queue_id` values, so the database collects and sorts every `queued` row of those queues — O(queue depth) per claim, unusable for queues with millions of tasks |
+| A dispatch index keyed on `(state_code, urgency_code, created_at)` without `queue_id` | Global order comes for free, but the index scan then has to skip the queued tasks of every other queue on the way |
+| Priority bands per queue (priority stays cross-tenant) | A band per queue and policy, and every tenant still crowds the top of its band |
+| Per-queue streams + k-way merge (chosen) | Exact order, cost bounded by `claim_max_queues × claim_scan_limit`, portable through the secure ORM |
 
 #### Task Creation Admission (Dedup, Supersession, Queue Depth)
 
 ```
 authenticate; authorize(create) via PolicyEnforcer -> AccessScope        # fail-closed, always first
-validate type + input against GTS schema; validate payload size; validate cross-refs
+if task.urgency == critical: authorize(expedite) else 403                # PRD §5.2
+validate type + input against GTS schema; validate payload size
 type = registry.get(task.type)
 
 # 1. Identity
@@ -2054,6 +2161,18 @@ else:
   dedup_key = sha256(len-prefixed(["idempotency-key", created_by, Idempotency-Key]))   # 428 if missing; window = retention
 
 BEGIN
+  # 1b. Link authorization (PRD §5.9). Every failure → the same 404, never 403.
+  if task.parent_task_id:
+      p = TaskState::find(task.parent_task_id).secure().scope_with(scope)   # full caller scope
+      require p and p.owner_tenant_id == owner_tenant_id and p.state not in (waiting) and p non-terminal
+      require (task.parent_lease_token and p.lease_token == task.parent_lease_token
+                 and p.assignee_subject == ctx.subject_id and p.state in (claimed, running))
+              or authorize(update, p)
+  for pred in task.predecessors:
+      t = find task (live or terminal) under authorize(read) scope
+      require t and t.owner_tenant_id == owner_tenant_id
+  validate cross-refs: same task domain; no cycle; not already unsatisfiable                # 400
+
   # 2. Supersession check (only when type.supersede) — reads and cancels, does NOT write the head yet
   head = SupersedeHead::find(owner_tenant_id, group_key).secure()
   if head and O < head.latest_order:  ROLLBACK; return 400 failed_precondition STALE_ORDER
@@ -2086,13 +2205,19 @@ BEGIN
       if r.rows_affected == 0: ROLLBACK; retry from the top            # lost race to a concurrent submission
 
   # 4. Queue-depth admission (after replay/supersede so neither is penalized)
-  #    queued initial state   -> [queue_global, queue_tenant]   (domain_global: sampled ceiling, checked before BEGIN)
-  #    scheduled / blocked    -> [tenant_deferred]
+  #    queued initial state   -> [queue_global (te_queue_backlog), queue_tenant (te_tenant_queue_backlog)]
+  #                              (domain_global: sampled ceiling, checked before BEGIN)
+  #    scheduled / blocked    -> [tenant_deferred (te_tenant_queue_backlog, queue_id = nil UUID)]
   #    dimensions with limit 0 have no row and are skipped (Hot-row rules, §3.7)
-  for dim in dims_for(initial_state) where limit(dim) != 0:
-      r = QueueBacklog::update_many().col_expr(used, used + 1)
-            .filter(dimension_code = dim AND <typed scope cols> AND shard = pick_shard()
-                    AND (limit_value = 0 OR used < limit_value)).exec()
+  for dim in dims_for(initial_state) where limit(dim) != 0:                 # Lock ordering: global rows, then tenant rows
+      r = if dim.is_global():
+            GlobalCounterRepo::admit(QueueBacklog, dim, queue_id, pick_shard())
+          else:
+            TenantQueueBacklog::update_many().col_expr(used, used + 1)
+              .filter(owner_tenant_id = owner_tenant_id AND dimension_code = dim
+                      AND queue_id = (dim == tenant_deferred ? NIL_UUID : queue_id)
+                      AND used < limit_value)
+              .secure().scope_with(scope.tenant_only()).exec()
       if r.rows_affected == 0: ROLLBACK; return 429 resource_exhausted QUEUE_DEPTH_LIMIT(dim), Retry-After
   INSERT te_tasks + te_task_state (queued | scheduled | blocked); timers; outbox events (TaskCreated, TaskCancelled{superseded_by})
 COMMIT
@@ -2117,7 +2242,8 @@ write_payload(task_id, change, lease_token?):          # lease_token present for
       .col_expr(context | output, compress(new)).col_expr(payload_bytes, P').col_expr(revision, r + 1)
       .col_expr(<the transition's other columns, e.g. state_code, result_code>)
       .filter(task_id = ? AND revision = r
-              [AND lease_token = ? AND state_code IN (claimed, running)])   # fence for worker-side writes
+              [AND lease_token = ? AND assignee_subject = ctx.subject_id
+               AND state_code IN (claimed, running)])                      # fence for worker-side writes
       .secure().scope_with(scope).exec()
     if r2.rows_affected == 0:
       s2 = re-read task
@@ -2188,10 +2314,12 @@ leaseScan (per shard held by this instance; replaces per-heartbeat timers — se
     for each expired task t:
       # cause precedence: an execution timeout is task-attributed and terminal, so it wins over liveness
       cause = execution if (t.state == running AND t.execution_deadline < now) else liveness  # missed heartbeat / assignment timeout
-      # ONE guarded update per transition: repeats the cause's own predicate AND the observed lease_token,
-      # so a concurrent heartbeat that renewed the lease, or a completion that won the race, matches 0 rows.
-      guard = filter(task_id = ? AND lease_token = t.lease_token AND state_code IN (claimed, running)
-                     AND <predicate of cause>)
+      # ONE guarded update per transition: repeats the cause's predicate and the observed epoch and token
+      # (NULL-safe), so a concurrent heartbeat, accept, reassignment, or completion matches 0 rows.
+      guard = filter(task_id = ? AND lease_epoch = t.lease_epoch
+                     AND (lease_token = t.lease_token OR (lease_token IS NULL AND t.lease_token IS NULL))
+                     AND state_code IN (claimed, running) AND <predicate of cause>)
+      handoff = (t.lease_token IS NULL)              # unaccepted reassignment
       if cause == liveness AND (max_liveness_requeues == 0 OR t.liveness_requeues < max_liveness_requeues):
         # requeue uses the SAME retry-policy backoff curve as an explicit failure (§3.2 Heartbeat), on its own counter: scheduled, NOT immediate queued
         run_after = now + compute_backoff(retry_policy, t.liveness_requeues, ...)
@@ -2205,7 +2333,7 @@ leaseScan (per shard held by this instance; replaces per-heartbeat timers — se
         release slots
         delete queue/wait timers; set scheduled timer at run_after   # lifetime + SLA timers are KEPT (PRD §5.3)
         # attempt NOT incremented (bumped on next claim)
-        record_liveness_failure(worker, queue, lease_duration)
+        if not handoff: record_liveness_failure(worker, queue, lease_duration)
       else:
         # execution timeout (never retried), or liveness failure with max_liveness_requeues exhausted → terminal routing
         r = TaskState::update_many()
@@ -2217,7 +2345,7 @@ leaseScan (per shard held by this instance; replaces per-heartbeat timers — se
         release slots; delete all timers
         if DLQ configured: outbox.enqueue(taskDeadLettered) else outbox.enqueue(taskFailed)
         # a liveness failure still counts toward the blacklist; an execution timeout is attributed to the task and is not counted
-        if cause == liveness: record_liveness_failure(worker, queue, lease_duration)
+        if cause == liveness and not handoff: record_liveness_failure(worker, queue, lease_duration)
       outbox.enqueue(taskTimedOut)
 
   record_liveness_failure(worker, queue, lease_duration):
@@ -2273,6 +2401,7 @@ compute_backoff(strategy, attempt, base_interval, max_interval, jitter_factor):
 
 ```
 validate_dependencies(task_id, predecessors[]):
+  # runs after link authorization (§4.6 Task Creation Admission, step 1b)
   build adjacency list of all dependencies
   run DFS from task_id:
     if visit a node already in current path → cycle detected → reject with `invalid_argument` `400`
@@ -2305,7 +2434,8 @@ cascade(source_task, kind):                            # inside the source task'
 COMMIT
 
 cascade timer fires (timer wheel, sharded like every timer, §4.6 Timer Wheel):
-  same body as cascade(): next batch after after_task_id, guarded updates, re-arm the timer if more remain
+  same body as cascade(): next batch after after_task_id, guarded updates, re-arm the timer if more remain,
+  else DELETE the cascade timer
 ```
 
 - Each dependent transition is a guarded update on its expected state, so a replay after a crash, or a dependent that changed state concurrently, matches zero rows and is skipped — the cascade is idempotent.
@@ -2388,7 +2518,7 @@ Consistent with PRD §4.2:
 | `cpt-cf-task-engine-fr-tags` | §3.1 Tag entity; §3.2 TaskService (`update_tags`); §3.3 tag mutation endpoint; §3.7 `te_tags` table |
 | `cpt-cf-task-engine-fr-resource-refs` | §3.1 ResourceRef entity; §3.3 Search Parameters (`resource_refs` filter); §3.7 `te_resource_refs`; §3.2 Event Producer (payload); §4.1 `max_resource_refs_per_task` |
 | `cpt-cf-task-engine-fr-task-checkpoint` | §3.2 TaskService (checkpoint); §3.6 Interactions |
-| `cpt-cf-task-engine-fr-priority-dispatch` | §3.2 QueueService; §4.6 Task Assignment algorithm |
+| `cpt-cf-task-engine-fr-priority-dispatch` | §3.2 QueueService, TaskService; §3.7 dispatch indexes; §4.6 Task Assignment algorithm |
 | `cpt-cf-task-engine-fr-tenant-fairness` | §4.6 Task Assignment (Tenant round-robin); §3.7 `ix_te_task_state_tenant_dispatch`; §4.1 `tenant_fairness_overrides` |
 | `cpt-cf-task-engine-fr-queue-concurrency` | §3.2 QueueService (concurrency enforcement); ADR-0005 |
 | `cpt-cf-task-engine-fr-queue-depth` | §3.1 Queue-depth accounting; §3.2 QueueService / TaskService; §3.7 `te_queue_backlog`; §3.9 Admission control; §4.1 `queue_depth`; §4.3 metrics; §4.5 Queue-depth admission security; §4.6 Task Creation Admission |
@@ -2410,7 +2540,7 @@ Consistent with PRD §4.2:
 | `cpt-cf-task-engine-fr-heartbeat` | §3.2 QueueService (heartbeat); §3.3 Heartbeat endpoint |
 | `cpt-cf-task-engine-fr-release` | §3.1 State Transition Table (voluntary release); §3.2 TaskService; §3.3 `POST /tasks/{id}/release` |
 | `cpt-cf-task-engine-fr-worker-blacklist` | §3.2 QueueService (blacklist); §3.7 `te_worker_blacklist` |
-| `cpt-cf-task-engine-fr-reassignment` | §3.3 Task Lifecycle Endpoints; §3.2 QueueService (reassignment re-fences) |
+| `cpt-cf-task-engine-fr-reassignment` | §3.1 State Transition Table; §3.3 Task Lifecycle Endpoints; §3.2 SDK Security Model |
 | `cpt-cf-task-engine-fr-lease-fencing` | §2.1 `principle-fenced-execution`; §3.1 Lease token / epoch handling; §3.2 TaskService / QueueService (fenced writes, idempotent completion replay), Progress Cache (fenced accept + flush), SDK Security Model (`Lease`); §3.3 Lease fencing, Error Response Format; §3.6 Create → Claim sequence; §3.7 `te_task_state`; §4.6 Task Assignment / leaseScan |
 | `cpt-cf-task-engine-fr-execution-semantics` | §2.1 `principle-fenced-execution`; §3.2 SDK Security Model (`Lease.lost`, `lease_epoch`) |
 | `cpt-cf-task-engine-fr-progress` | §3.2 Progress Cache; §3.3 Progress endpoint |
@@ -2419,6 +2549,7 @@ Consistent with PRD §4.2:
 | `cpt-cf-task-engine-fr-dead-letter` | §3.1 State Machine (dead_lettered, re-enqueue); §3.2 TaskService (Re-enqueue); §3.3 Admin Endpoints |
 | `cpt-cf-task-engine-fr-parent-child` | §3.1 Domain Model (parent_task_id); §3.2 TaskService |
 | `cpt-cf-task-engine-fr-dependencies` | §3.1 TaskDependency, State Machine (block/unblock); §3.3 dependency endpoints; §3.7 `te_dependencies`; §4.6 Cycle validation |
+| `cpt-cf-task-engine-fr-link-authz` | §3.2 TaskService; §3.3; §3.7 `te_dependencies`; §4.6 Task Creation Admission |
 | `cpt-cf-task-engine-fr-event-history` | §3.1 TaskEvent; §3.7 `te_events` |
 | `cpt-cf-task-engine-fr-event-publishing` | §3.2 Event Producer (`event_broker_sdk::DbProducer`, one outbox per task domain); §3.8 Task Domains; ADR-0010 |
 | `cpt-cf-task-engine-fr-event-publishing-config` | §4.1 Configuration (event_policies) |

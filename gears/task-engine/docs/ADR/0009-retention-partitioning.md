@@ -54,11 +54,17 @@ Chosen option: **Option 4 — Live/history split with rescue-then-drop.**
 
 **Live set.** `te_task_state` holds non-terminal tasks only and is not partitioned. At the terminal transition, in the same transaction, the final state is inserted into `te_task_results` and deleted from `te_task_state` (admin re-enqueue moves it back).
 
-**History.** `te_tasks`, `te_task_results`, `te_events`, and `te_task_entries` are range-partitioned by **task creation time**, derived from the UUID v7 task id, so all rows of one task share a partition and lookups by id prune to one partition.
+**Live-only side tables.** `te_wait_conditions`, `te_dependencies` (keyed by the successor), and `te_timers` are needed only while their task is non-terminal. They stay unpartitioned and their rows are deleted in the task's terminal transaction, so they are as small as the live set and never need a retention step. Their history survives elsewhere: wait and timer activity in `te_events`, and the predecessor list copied into `te_task_results.predecessors`. The one exception is a `cascade` timer created in the terminal transaction, which is engine work and is deleted when its cascade completes.
+
+**History.** `te_tasks`, `te_task_results`, `te_events`, `te_task_entries`, `te_tags`, and `te_resource_refs` are range-partitioned by **task creation time**, derived from the UUID v7 task id, so all rows of one task share a partition, lookups by id prune to one partition, and one drop removes a task's tags and resource references (up to `max_resource_refs_per_task` rows per task) together with the task.
+
+**Identity tables.** `te_dedup` and `te_supersede_heads` must stay unpartitioned, because their primary keys are global uniqueness constraints and a partitioned key would have to include the partition key. Their rows are narrow; retention deletes them in bounded batches by creation-time range at the rate they were inserted.
+
+**No foreign keys between task tables.** PostgreSQL requires a foreign key into a partitioned table to include the partition key, MySQL/InnoDB supports no foreign keys on partitioned tables, and rescue moves rows to `_retained` tables a foreign key could not follow. Every row that refers to a task is written and removed in the same transaction as that task's transitions, and the maintenance reconciliation reports orphans as a metric.
 
 **Retention clock.** A task's data expires at `terminal_at + effective_retention` (tenant → type → global). Non-terminal tasks never expire by retention; they are bounded by their lifetime timeout and by `hard_retention_days`.
 
-**Rescue, then drop.** A singleton maintenance loop per domain (advisory lock `te-maintenance`) provisions future partitions, force-cancels tasks beyond `hard_retention_days`, and for each partition older than `drop_horizon_days` (default = global retention) copies into `te_*_retained` tables every row of a task that is still non-terminal or whose `terminal_at + effective_retention` is in the future. It then drops the partition and the matching `te_dedup` rows. Retained rows, and policies shorter than the drop horizon, are removed by bounded `DELETE`.
+**Rescue, then drop.** A singleton maintenance loop per domain (advisory lock `te-maintenance`) provisions future partitions, force-cancels tasks beyond `hard_retention_days`, and for each partition older than `drop_horizon_days` (default = global retention) copies into `te_*_retained` tables every row of a task that is still non-terminal or whose `terminal_at + effective_retention` is in the future. It then drops the partition range in every partitioned table. Retained rows, policies shorter than the drop horizon, and the identity rows of dropped tasks are removed by bounded `DELETE`.
 
 **Large long-retention workloads.** A tenant or type whose long policy covers a large share of the data is routed to its own task domain with a matching `drop_horizon_days`, so rescue sets stay small everywhere.
 
@@ -71,8 +77,11 @@ Chosen option: **Option 4 — Live/history split with rescue-then-drop.**
 * Live tasks and data under longer policies are never lost by a drop.
 * A late completion keeps its full retention.
 * One tenant's legal hold no longer blocks cleanup for the domain.
-* Idempotency and dedup windows are bounded by retention; `te_dedup` stays unpartitioned and is cleaned with its tasks.
-* The terminal transition writes one extra row (move to `te_task_results`).
+* Idempotency and dedup windows are bounded by retention; `te_dedup` stays unpartitioned and is cleaned with its tasks in bounded batches.
+* No table that grows with stored history needs row-by-row deletion except the narrow identity tables.
+* The terminal transition writes one extra row (move to `te_task_results`) and deletes the task's live-only rows.
+* After a task ends, its wait conditions and dependency rows are no longer listable as rows; they are read from `te_events` and `te_task_results.predecessors`.
+* Integrity between task tables is enforced by the engine's transactions, not by database foreign keys.
 * History reads union the partitioned table with its retained table.
 
 ### Confirmation
@@ -83,7 +92,10 @@ Tests MUST check that:
 * a task completing late keeps its full retention from `terminal_at`;
 * a tenant with a long policy is rescued and does not block drops for other tenants;
 * claim and heartbeat latency are independent of history volume;
-* `te_dedup` rows are removed with their tasks;
+* `te_dedup` and `te_supersede_heads` rows are removed with their tasks;
+* a partition drop also removes the dropped tasks' tags and resource references, and rescue keeps those of rescued tasks;
+* a terminal transition leaves no `te_wait_conditions`, `te_dependencies`, or `te_timers` rows for the task (except an in-progress `cascade` timer);
+* the migrations contain no foreign key between task tables on any backend, and reconciliation reports injected orphan rows;
 * the SQLite fallback removes the same set of data as the partitioned path.
 
 ## Pros and Cons of the Options
@@ -132,11 +144,15 @@ Same database, separate tables, so every transition stays atomic.
 ## More Information
 
 ```text
-live     : te_task_state (non-terminal, unpartitioned)
-history  : te_tasks, te_task_results, te_events, te_task_entries (partitioned by task creation time)
-retained : te_*_retained (unpartitioned, rescued rows only)
-expiry   : terminal_at + effective_retention
-drop     : partition older than drop_horizon_days, after rescue
+live      : te_task_state (non-terminal, unpartitioned)
+live-only : te_wait_conditions, te_dependencies, te_timers (unpartitioned, deleted at the terminal transition)
+history   : te_tasks, te_task_results, te_events, te_task_entries, te_tags, te_resource_refs
+            (partitioned by task creation time)
+identity  : te_dedup, te_supersede_heads (unpartitioned, bounded batch deletes)
+retained  : te_*_retained (unpartitioned, rescued rows only)
+expiry    : terminal_at + effective_retention
+drop      : partition range older than drop_horizon_days, after rescue
+FKs       : none between task tables
 ```
 
 See DESIGN §3.7 Live / history split, §3.2 RetentionService, and §4.1 Configuration (`retention`).

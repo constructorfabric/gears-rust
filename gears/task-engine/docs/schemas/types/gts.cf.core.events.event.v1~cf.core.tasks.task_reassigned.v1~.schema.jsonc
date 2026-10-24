@@ -84,7 +84,7 @@
               "default": null
             },
             "new_assignee": {
-              "description": "New worker (`worker_id`), if assigned immediately.",
+              "description": "New worker (`worker_id`) named by the reassignment. It takes the task over with an accept call under its own credentials; no lease token is ever carried in this event (PRD cpt-cf-task-engine-fr-reassignment, cpt-cf-task-engine-fr-lease-fencing).",
               "type": [
                 "string",
                 "null"
@@ -99,6 +99,11 @@
               ],
               "maxLength": 256,
               "default": null
+            },
+            "lease_epoch": {
+              "description": "Lease epoch after the reassignment (increased by one); the previous holder's epoch is now stale.",
+              "type": "integer",
+              "minimum": 1
             },
             "reason": {
               "description": "Why the task was reassigned (e.g. lease_expiry, assignment_timeout, manual).",

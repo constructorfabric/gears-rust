@@ -40,7 +40,7 @@
       "minimum": 0
     },
     "default_priority": {
-      "description": "Default task priority for tasks enqueued to this queue when the creator supplies none. Range 0 (highest) to 1000 (lowest), the same range as task priority (PRD cpt-cf-task-engine-fr-priority-dispatch).",
+      "description": "Default task priority for tasks enqueued to this queue when the creator supplies none. Range 0 (highest) to 1000 (lowest), the same range as task priority (PRD cpt-cf-task-engine-fr-priority-dispatch). Priority orders one tenant's own tasks only; it never ranks one tenant above another.",
       "type": "integer",
       "minimum": 0,
       "maximum": 1000
@@ -189,7 +189,7 @@
       "default": 5
     },
     "tenant_fairness": {  // round_robin | fifo
-      "description": "How tasks of the same priority from different tenants are ordered (PRD cpt-cf-task-engine-fr-tenant-fairness). 'round_robin' (default): tenants take turns, each tenant's own tasks stay FIFO. 'fifo': strict FIFO across tenants. Priority always comes first. Overridable in config by queue pattern.",
+      "description": "How tasks of different tenants are ordered within one urgency class (PRD cpt-cf-task-engine-fr-tenant-fairness, cpt-cf-task-engine-fr-priority-dispatch). 'round_robin' (default): tenants take turns; each turn takes that tenant's best task (highest priority, then oldest), so priority only reorders a tenant's own tasks. 'fifo': all tenants' tasks ordered together by priority, then age; because priority then ranks tenants against each other, use it only for single-tenant or trusted queues. Urgency 'critical' always comes first. Overridable in config by queue pattern.",
       "type": "string",
       "enum": [
         "round_robin",

@@ -24,6 +24,6 @@
   },
   "queue_max_queue_depth": 100000,  // max 'queued' tasks across all tenants; 0 = unlimited
   "progress_events": "none",  // default progress event mode: none | milestones | all
-  "tenant_fairness": "round_robin",  // same-priority tasks from different tenants take turns; fifo = strict FIFO across tenants
+  "tenant_fairness": "round_robin",  // tenants take turns within an urgency class; priority orders only a tenant's own tasks; fifo = one order across tenants
   "dead_letter_queue": "gts.cf.core.tasks.queue.v1~cf.core.tasks.dead_letter.v1"  // queue tasks are dead-lettered into on retry-exhaustion/lifetime; null = transition to 'failed' instead
 }

@@ -53,9 +53,9 @@ How it works:
 
 * Every claim carries a `worker_id`: 1–128 characters from `[A-Za-z0-9._:-]`, for example pod name plus process ID. A missing or invalid value is rejected with `400`.
 * The worker identity is (`subject_id`, `worker_id`). The engine stores both on the assignment and uses the pair for the blacklist, events, and audit.
-* Reassignment names the new holder as such a pair.
+* Reassignment names the new holder as such a pair; only a caller authenticated as that subject and sending that `worker_id` can accept the task (ADR-0011).
 * Workers should keep the same `worker_id` across restarts.
-* `worker_id` is not a credential. Access is decided by the PDP, and worker writes are fenced by the lease token (ADR-0011).
+* `worker_id` is not a credential. Access is decided by the PDP, and worker writes are fenced by the lease token together with the authenticated half of the pair, `subject_id` (ADR-0011). `worker_id` alone never grants anything.
 
 ### Consequences
 
