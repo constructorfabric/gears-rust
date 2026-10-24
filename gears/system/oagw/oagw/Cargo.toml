@@ -124,3 +124,7 @@ toolkit-db = { workspace = true, features = ["sqlite", "pg", "test-support"] }
 testcontainers = { workspace = true }
 test-containers = { workspace = true }
 tracing-test = { workspace = true }
+
+[[bench]]
+name = "proxy_roundtrip"
+harness = false
