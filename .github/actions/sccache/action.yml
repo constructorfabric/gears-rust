@@ -1,0 +1,55 @@
+name: Linux compilation cache
+description: Restore a bounded local sccache archive; only main writes.
+inputs:
+  writer:
+    description: Whether this job owns the shared archive
+    default: 'false'
+  namespace:
+    default: linux-v2
+  seed:
+    description: Allow an isolated manual benchmark to seed its cache
+    default: 'false'
+outputs:
+  enabled:
+    value: ${{ steps.start.outputs.enabled }}
+runs:
+  using: composite
+  steps:
+    - name: Install sccache
+      uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba
+      with:
+        version: v0.18.0
+    - name: Configure local cache
+      id: key
+      shell: bash
+      env:
+        NAMESPACE: ${{ inputs.namespace }}
+        TOOLCHAIN: ${{ hashFiles('rust-toolchain.toml') }}
+        SAVE: ${{ inputs.writer == 'true' && ((github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'workflow_dispatch' && inputs.seed == 'true' && startsWith(inputs.namespace, 'bench-'))) }}
+      run: |
+        prefix="sccache-${NAMESPACE}-${RUNNER_OS}-${RUNNER_ARCH}-${TOOLCHAIN}-"
+        echo "prefix=$prefix" >> "$GITHUB_OUTPUT"
+        echo "SCCACHE_DIR=${RUNNER_TEMP}/gears-sccache" >> "$GITHUB_ENV"
+        echo "SCCACHE_IDLE_TIMEOUT=0" >> "$GITHUB_ENV"
+        echo "SCCACHE_CACHE_SIZE=3.5G" >> "$GITHUB_ENV"
+        echo "SCCACHE_ARCHIVE_SAVE=$SAVE" >> "$GITHUB_ENV"
+        echo "SCCACHE_ARCHIVE_KEY=${prefix}${GITHUB_SHA}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_ENV"
+    - name: Restore compilation archive
+      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+      with:
+        path: ${{ runner.temp }}/gears-sccache
+        key: ${{ env.SCCACHE_ARCHIVE_KEY }}
+        restore-keys: ${{ steps.key.outputs.prefix }}
+    - name: Start local sccache
+      id: start
+      shell: bash
+      run: |
+        unset SCCACHE_GHA_ENABLED SCCACHE_GHA_VERSION
+        export SCCACHE_IDLE_TIMEOUT=0
+        if sccache --start-server; then
+          echo 'RUSTC_WRAPPER=sccache' >> "$GITHUB_ENV"
+          echo 'enabled=true' >> "$GITHUB_OUTPUT"
+          sccache --show-stats
+        else
+          echo '::warning::sccache unavailable; building with rustc'
+        fi

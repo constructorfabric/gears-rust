@@ -706,6 +706,9 @@ lint:
 	RUSTFLAGS="-D warnings" cargo check $(if $(GEAR),$(GEAR_PKGS),--workspace) --all-targets --all-features
 
 install-tools:
+ifneq ($(strip $(CI_PREINSTALLED_TOOLS)),)
+	$(foreach tool,$(CI_PREINSTALLED_TOOLS),$(call check_tool,cargo-$(tool)))
+else
 	$(call print_target_banner)
 	@cargo gears tools check-version cargo-gears '>=$(CARGO_GEARS_VERSION)' >/dev/null 2>&1 \
 	|| (echo "Installing cargo-gears >= $(CARGO_GEARS_VERSION)..." && cargo install --locked cargo-gears@$(CARGO_GEARS_VERSION))
@@ -713,6 +716,7 @@ install-tools:
 	|| (echo "Installing cargo-nextest >= $(NEXTEST_MIN_VERSION)..." && cargo install --locked cargo-nextest)
 	@cargo gears tools check-version cargo-deny '>=$(DENY_MIN_VERSION)' >/dev/null 2>&1 \
 	|| (echo "Installing cargo-deny >= $(DENY_MIN_VERSION)..." && cargo install --locked cargo-deny)
+endif
 
 # Run architecture lints via cargo-gears (see Gears.toml for configuration).
 dylint:
