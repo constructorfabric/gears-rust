@@ -19,6 +19,7 @@ pub mod profile;
 pub mod record_intake;
 pub mod refusal;
 pub mod sensitive_data;
+pub mod settings_scope;
 pub mod subject_settings;
 
 #[cfg(test)]

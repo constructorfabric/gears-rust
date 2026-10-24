@@ -78,7 +78,7 @@ The DESIGN's largest component, subject control, is split across four features. 
 - One-step plan path: the Review Queue owns the path that turns an add or an edit into a plan with one add or replace step, and Administrator Fact Management uses it.
 - Root node of a new subject: the Profile Writer owns writing the root node, including creating it for a new subject, in the same write as the facts.
 - Drop audit event (with the review hooks, one of the two choices closest to a design call): Record Intake owns the shape of the content-free drop audit event, and the Planner, the Sensitive-Data Checks, Admission and the Profile Writer reuse it.
-- Placeholder retirement: Record Intake, the first feature that adds a real route, replaces the foundation's placeholder route, client operations and table. Subject Settings adds the first of Construct's own tables and leaves the placeholder in place.
+- Placeholder retirement: Record Intake replaces the foundation's placeholder route, client operations and table, in the same migration that creates its own table. Subject Settings comes first with Construct's first own table and routes, and leaves the placeholder in place.
 - Node keys: the Planner gives new node keys, including to a returning deleted entity, and the one-step path of the Review Queue gives them the same way. The Profile Writer stores the keys the plan carries and finds the new root key after an erasure.
 - Erase route: Erasure owns the erase route and the call into Deletion, although the DESIGN credits the hand-off to the Subject control component, because Subject Control is built earlier.
 - Closing call from retention: Retention owns the closing call into the Review Queue for the facts it removes.
@@ -106,7 +106,7 @@ The DESIGN's largest component, subject control, is split across four features. 
   - Any DESIGN table, entity, component or sequence. The note table and entity are a placeholder that Construct's own model replaces; they have no DESIGN id
   - Construct's own permissions and routes for records, profiles and subjects
   - The Rust SDK interface of the full design (`cpt-cf-construct-interface-rust-sdk`), which grows with each later feature; the foundation owns the client trait of the shell only
-  - Retiring the placeholder route, client operations and table: the first feature that adds a real route replaces them, which is Record Intake (`cpt-cf-construct-feature-record-intake`)
+  - Retiring the placeholder route, client operations and table: Record Intake (`cpt-cf-construct-feature-record-intake`) replaces them
 
 - **Requirements Covered**:
 
