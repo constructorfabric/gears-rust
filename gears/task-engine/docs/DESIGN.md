@@ -102,6 +102,12 @@ Per [ADR/0001-pluggable-execution-backends.md](ADR/0001-pluggable-execution-back
 - `cpt-cf-task-engine-adr-event-wait-matching` — CEL-based match expression evaluation for event wait conditions with complexity limits and precompilation. See [ADR/0007-event-wait-matching.md](ADR/0007-event-wait-matching.md).
 - `cpt-cf-task-engine-adr-atomic-claim-strategy` — **Proposed** — DB-agnostic optimistic guarded-update claim via the ToolKit secure ORM, chosen provisionally; `SKIP LOCKED` (if ToolKit can expose it) or candidate spreading is expected to replace it to remove head-row contention (§4.6 TODO). Single-statement conditional slot reservation with optional hot-row sharding. See [ADR/0008-atomic-claim-strategy.md](ADR/0008-atomic-claim-strategy.md).
 - `cpt-cf-task-engine-adr-retention-partitioning` — Unpartitioned live table for non-terminal tasks; history partitioned by task creation time; retention measured from terminal time; rescue-then-drop of history partitions; SQLite `DELETE` fallback. See [ADR/0009-retention-partitioning.md](ADR/0009-retention-partitioning.md).
+- `cpt-cf-task-engine-adr-task-domains` — Route each task type or queue to one configured database with a config-order first-match rule; atomic operations (claim, dependencies, parent/child) stay inside one domain. See [ADR/0010-task-domains.md](ADR/0010-task-domains.md).
+- `cpt-cf-task-engine-adr-lease-fencing` — Every worker write carries a per-lease token checked in the same guarded update; a per-task lease epoch lets workers fence external systems. See [ADR/0011-lease-fencing.md](ADR/0011-lease-fencing.md).
+- `cpt-cf-task-engine-adr-task-deduplication` — Required caller idempotency key scoped to tenant and subject, or a type-declared engine identity, with optional supersession by a newer order value. See [ADR/0012-task-deduplication.md](ADR/0012-task-deduplication.md).
+- `cpt-cf-task-engine-adr-worker-transport` — Workers use the REST API with capped long-poll claims, batch heartbeats, and a per-node queue watcher for cross-node wake-up; streaming is deferred. See [ADR/0013-worker-transport.md](ADR/0013-worker-transport.md).
+- `cpt-cf-task-engine-adr-worker-identity` — A worker is the pair (authenticated subject, client-supplied `worker_id`), used for assignment, blacklist, and audit, never as a credential. See [ADR/0014-worker-identity.md](ADR/0014-worker-identity.md).
+- `cpt-cf-task-engine-adr-gts-hybrid-model` — GTS for open sets (task types, queues, entry types), closed engine enums for control values, indexed base columns plus opaque compressed payloads. See [ADR/0015-gts-hybrid-model.md](ADR/0015-gts-hybrid-model.md).
 
 > Event delivery is **not** an ADR: reusing the platform Event Broker SDK is a mandated platform standard (all gears publish through `event-broker-sdk`), not a Task-Engine decision. The managed-outbox producer surface, dedup mode, and partitioning are documented as design detail in §3.2 Event Producer.
 
@@ -2430,6 +2436,12 @@ Consistent with PRD §4.2:
 - [ADR/0007-event-wait-matching.md](ADR/0007-event-wait-matching.md) — `cpt-cf-task-engine-adr-event-wait-matching`. CEL-based match expression evaluation with safety constraints.
 - [ADR/0008-atomic-claim-strategy.md](ADR/0008-atomic-claim-strategy.md) — `cpt-cf-task-engine-adr-atomic-claim-strategy`. DB-agnostic optimistic guarded-update claim via the ToolKit secure ORM with single-statement conditional slot reservation and optional sharding.
 - [ADR/0009-retention-partitioning.md](ADR/0009-retention-partitioning.md) — `cpt-cf-task-engine-adr-retention-partitioning`. Live/history split with terminal-time retention and rescue-then-drop of history partitions.
+- [ADR/0010-task-domains.md](ADR/0010-task-domains.md) — `cpt-cf-task-engine-adr-task-domains`. Task domains with first-match routing and a single-domain rule for atomic operations.
+- [ADR/0011-lease-fencing.md](ADR/0011-lease-fencing.md) — `cpt-cf-task-engine-adr-lease-fencing`. Per-lease token for engine writes and a monotonic lease epoch for external fencing.
+- [ADR/0012-task-deduplication.md](ADR/0012-task-deduplication.md) — `cpt-cf-task-engine-adr-task-deduplication`. Caller keys or type-declared identities with supersession.
+- [ADR/0013-worker-transport.md](ADR/0013-worker-transport.md) — `cpt-cf-task-engine-adr-worker-transport`. REST long-poll worker transport; streaming deferred.
+- [ADR/0014-worker-identity.md](ADR/0014-worker-identity.md) — `cpt-cf-task-engine-adr-worker-identity`. Worker identity as (subject, `worker_id`).
+- [ADR/0015-gts-hybrid-model.md](ADR/0015-gts-hybrid-model.md) — `cpt-cf-task-engine-adr-gts-hybrid-model`. GTS for open sets, closed enums for control values.
 
 ### 5.3 Standards & External References
 
