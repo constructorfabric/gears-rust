@@ -1291,6 +1291,9 @@ jobs:
 
       - name: Install cargo-gears
         uses: ./.github/actions/cargo-gears
+        with:
+          seed: ${{ inputs.benchmark_seed || false }}
+          namespace: ${{ inputs.benchmark_namespace || 'linux-v2' }}
 
       - name: Run architecture lints
         run: tools/scripts/with_rust_annotations.sh cargo gears lint --dylint
