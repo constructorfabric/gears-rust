@@ -69,8 +69,11 @@ The `#[toolkit::rest_contract]` macro now emits, inside each generated client me
 `toolkit-http`'s `OtelLayer` injects **this span's** W3C `traceparent`, so `trace_id`/`span_id`
 propagate downstream automatically. The binding introduces no request-id of its own: a client→server
 call is correlated by its `trace_id`, and the platform's `x-request-id` (the gateway's per-request
-id, used by the access log, audit records, and response headers) is a *distinct* identifier the
-client neither reads nor forwards.
+id, used by the access log, audit records, and response headers) is a *distinct* identifier that is
+*also* forwarded: inbound middleware installs it as a task-local
+(`toolkit_trace_context::with_request_id`) and `toolkit-http` re-attaches it on egress
+(`inject_request_id`). So a contract hop joins both the span tree (via `traceparent`) and the
+edge request id — the latter even when `otel` is off.
 
 The span path is routed through a `#[doc(hidden)] pub use tracing as __tracing;` re-export in
 `toolkit-contract`, so SDK crates need no direct `tracing` dependency.

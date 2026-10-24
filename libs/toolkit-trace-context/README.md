@@ -20,6 +20,13 @@ keep their own drifting copies of:
 - `extract_trace_id` — resolve the wire trace-id: live OTel span → validated
   inbound `traceparent`. `cf-gears-toolkit` re-exports it as
   `toolkit::api::extract_trace_id`.
+- `with_request_id` / `current_request_id` / `extract_request_id` /
+  `inject_request_id` — the `x-request-id` carrier: inbound middleware scopes
+  the edge-minted id as a task-local, and `toolkit-http` re-attaches it to
+  outbound requests (caller-set header wins; nothing is minted outside a
+  request scope). Unlike `traceparent` this works with or without `otel` —
+  `x-request-id` is chain-scoped (the external request's id) while
+  `trace_id`/`span_id` are per-hop.
 
 Keeping one authoritative implementation means the gateway and the gears cannot
 drift on what counts as a valid `traceparent`, on which ids a request span

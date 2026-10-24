@@ -21,6 +21,10 @@
 //!   matching the in-process (`api-gateway`) path. The drain guard also catches
 //!   panics so a panic can neither drop the client connection nor leak the
 //!   in-flight counter (which would otherwise stall graceful drain).
+//! - **Request/trace context** — the outermost `trace_context_middleware`
+//!   continues the inbound W3C `traceparent` and scopes the inbound
+//!   `x-request-id` (`toolkit_trace_context::with_request_id`), so the gear's
+//!   span carries the edge id and outbound `toolkit-http` calls forward it.
 //!
 //! The server is driven by [`OopHttpServer`], invoked from the `HostRuntime`
 //! `OoP` path: it binds and serves the probes **before** the gear's `start()`
@@ -529,23 +533,20 @@ async fn trace_context_middleware(req: Request, next: Next) -> Response {
     use tracing::Instrument as _;
     use tracing::field::Empty;
 
-    // Record the gateway-supplied `x-request-id` (forwarded to this gear, absent
-    // when the gear is reached without the gateway) and the wire `trace_id` /
+    // Record the inbound `x-request-id` — the edge-minted id, forwarded
+    // hop-to-hop by the gateway proxy and by `toolkit-http` clients, absent
+    // when the gear is reached without one — and the wire `trace_id` /
     // `parent.trace_id` on the span, so an OoP gear's log lines join to the
     // gateway access log and the wire trace even with the text console format,
-    // without OTel, or with the log-correlation splice off. The id is the
-    // gateway's; this gear does not mint one.
-    let request_id = req
-        .headers()
-        .get("x-request-id")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("n/a");
+    // without OTel, or with the log-correlation splice off. This gear does not
+    // mint one.
+    let request_id = toolkit_trace_context::extract_request_id(req.headers());
 
     let span = tracing::info_span!(
         "http_request",
         method = %req.method(),
         uri = %req.uri().path(),
-        request_id = %request_id,
+        request_id = %request_id.as_deref().unwrap_or("n/a"),
         trace_id = Empty,
         parent.trace_id = Empty,
     );
@@ -555,7 +556,9 @@ async fn trace_context_middleware(req: Request, next: Next) -> Response {
     // `toolkit_trace_context`; without `otel` it records the ids from the header.
     toolkit_trace_context::set_parent_from_headers(&span, req.headers());
 
-    next.run(req).instrument(span).await
+    // Install the edge request id as the task-local carrier so outbound
+    // `toolkit-http` calls (generated contract clients) forward it.
+    toolkit_trace_context::with_request_id(request_id, next.run(req).instrument(span)).await
 }
 
 // ---------------------------------------------------------------------------

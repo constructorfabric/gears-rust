@@ -21,19 +21,18 @@ impl MakeRequestId for MakeReqId {
     }
 }
 
-/// Middleware that stores `request_id` in Request.extensions and records it in the current span
+/// Middleware that stores `request_id` in Request.extensions, records it in the
+/// current span, and scopes it as the task-local carrier so outbound
+/// `toolkit-http` calls forward it.
 pub async fn push_req_id_to_extensions(mut req: Request<Body>, next: Next) -> Response {
-    let hdr = header();
-    if let Some(rid) = req
-        .headers()
-        .get(&hdr)
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_owned)
-    {
+    if let Some(rid) = toolkit::api::extract_request_id(req.headers()) {
         // Save for business logic usage
         req.extensions_mut().insert(XRequestId(rid.clone()));
         // Record into the current http span (created by TraceLayer)
         tracing::Span::current().record("request_id", rid.as_str());
+        // Install as the task-local carrier so outbound `toolkit-http` calls
+        // (generated contract clients, proxied gears) forward the edge id.
+        return toolkit::api::with_request_id(Some(rid), next.run(req)).await;
     }
 
     next.run(req).await
