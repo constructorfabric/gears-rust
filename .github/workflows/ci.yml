@@ -432,6 +432,13 @@ jobs:
         if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
         run: tools/scripts/with_rust_annotations.sh make test-integration LANE=ledger-pg
 
+      # bss-orders' Postgres tier: the engine, sealed audit, idempotency, claims, role-isolation
+      # and gear-boot proofs all run against a real PostgreSQL. Without this step the tier
+      # compiles here and runs nowhere.
+      - name: Test bss-orders with Postgres (integration)
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        run: tools/scripts/with_rust_annotations.sh make test-integration LANE=orders-pg
+
       - name: Test redis-cluster-plugin (redis integration)
         if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
         run: tools/scripts/with_rust_annotations.sh make test-integration LANE=cluster-redis

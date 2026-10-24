@@ -183,6 +183,8 @@ members = [
     "gears/bss/pricing/pricing-sdk",
     "gears/bss/products/products",
     "gears/bss/products/products-sdk",
+    "gears/bss/orders/orders",
+    "gears/bss/orders/orders-sdk",
     "gears/bss/approvals/approvals",
     "gears/bss/approvals/approvals-sdk",
     "gears/bss/rate-provider/rate-provider-sdk",
@@ -430,6 +432,7 @@ usage-collector-sdk = { package = "cf-gears-usage-collector-sdk", version = "0.3
 quota-enforcement-engine-most-restrictive = { package = "cf-gears-quota-enforcement-engine-most-restrictive", version = "0.1.0", path = "gears/system/quota-enforcement/plugins/quota-enforcement-engine-most-restrictive" }
 quota-enforcement-sdk = { package = "cf-gears-quota-enforcement-sdk", version = "0.1.0", path = "gears/system/quota-enforcement/quota-enforcement-sdk" }
 event-broker-sdk = { package = "cf-gears-event-broker-sdk", version = "0.2.6", path = "gears/system/event-broker/event-broker-sdk" }
+event-broker = { package = "cf-gears-event-broker", path = "gears/system/event-broker/event-broker" }
 sqlite-event-broker-plugin = { package = "cf-gears-sqlite-event-broker-plugin", version = "0.1.0", path = "gears/system/event-broker/plugins/sqlite-event-broker-plugin" }
 
 # BSS gears (ported from vhp-core)
@@ -453,6 +456,7 @@ bss-pricing = { package = "cf-gears-bss-pricing", path = "gears/bss/pricing/pric
 # because neither crate is a release artifact and the gear that consumes it is
 # not published either.
 bss-products-sdk = { package = "cf-gears-bss-products-sdk", path = "gears/bss/products/products-sdk" }
+bss-orders-sdk = { package = "cf-gears-bss-orders-sdk", path = "gears/bss/orders/orders-sdk" }
 # The approvals inbox. Same WIP posture as pricing: no `version`, because neither
 # crate is a release artifact yet.
 bss-approvals-sdk = { package = "cf-gears-bss-approvals-sdk", path = "gears/bss/approvals/approvals-sdk" }

@@ -1,0 +1,222 @@
+{
+  "schema_version": 2,
+  "assessment_id": "00000000-0000-0000-0000-00000000001e",
+  "assessed_at": "2026-10-01T10:28:00.987654321Z",
+  "resolve_date": "2026-10-01",
+  "accepted_version_ref": {
+    "order_id": "00000000-0000-0000-0000-00000000000b",
+    "order_version": 2,
+    "line_id": "00000000-0000-0000-0000-00000000000c"
+  },
+  "receipt": {
+    "acceptance_id": "00000000-0000-0000-0000-000000000014",
+    "request_digest": "fa43630bc27ba50e07dfd4b93f140bed30e68c064e63f028fdd7440de4bb5d40",
+    "terms_digest": "5ecffe5acffb16099d45ffa10c41f8fffd4ea7b68be820bd0e8bb50c3e5dde1f",
+    "query": {
+      "tenant_axes": {
+        "seller_tenant_id": "00000000-0000-0000-0000-000000000008",
+        "payer_tenant_id": "00000000-0000-0000-0000-000000000009",
+        "resource_tenant_id": "00000000-0000-0000-0000-00000000000a"
+      },
+      "order_id": "00000000-0000-0000-0000-00000000000b",
+      "order_version": "2",
+      "line_id": "00000000-0000-0000-0000-00000000000c",
+      "plan_id": "00000000-0000-0000-0000-000000000006",
+      "plan_revision_id": "00000000-0000-0000-0000-000000000007",
+      "selections": [
+        {
+          "item_id": "00000000-0000-0000-0000-000000000001",
+          "dimension_value": null
+        },
+        {
+          "item_id": "00000000-0000-0000-0000-000000000002",
+          "dimension_value": "default"
+        },
+        {
+          "item_id": "00000000-0000-0000-0000-000000000003",
+          "dimension_value": "eu"
+        }
+      ],
+      "quantity": "123456789.1234567890123456789",
+      "market": {
+        "currency": "EUR",
+        "region": "eu"
+      },
+      "start_at": "2026-10-01T10:30:00.000000001Z",
+      "term": {
+        "kind": "fixed_periods",
+        "count": 18
+      },
+      "billing_terms": {
+        "schema_version": 1,
+        "cycle": "month",
+        "anchor": "calendar",
+        "anchor_at": "2026-10-01T00:00:00.000000000Z",
+        "timezone": "utc",
+        "source": {
+          "kind": "explicit_order"
+        },
+        "digest": "8bbd1652e172dcb1c4498d7dec92af3b6d7f727d34bb7ffebc8aed1181bda983"
+      },
+      "hold_policy_version": "18446744073709551615",
+      "resolved_bindings_digest": "1a21429ae66940fd8d6d8243d6b6b6e2a091e14a40c80fa0408f221824129b31"
+    },
+    "accepted_at": "2026-10-01T10:29:00.123456789Z",
+    "hold_until": "2026-10-02T10:29:00.123456789Z",
+    "bindings": [
+      {
+        "item_id": "00000000-0000-0000-0000-000000000001",
+        "price_book_entry_id": "00000000-0000-0000-0000-0000000000c9",
+        "dimension_key": null,
+        "dimension_value": null,
+        "sku_id": "00000000-0000-0000-0000-00000000012d",
+        "sku_version": "9223372036854775807",
+        "sku_code": "SKU-1",
+        "sku_name": "Frozen SKU 1",
+        "unit": null,
+        "meter": null,
+        "price": {
+          "price_id": "00000000-0000-0000-0000-000000000065",
+          "price_book_entry_id": "00000000-0000-0000-0000-0000000000c9",
+          "currency": {
+            "code": "EUR",
+            "scale": 2
+          },
+          "model": {
+            "kind": "flat",
+            "amount": "1.23"
+          },
+          "minimum_fee": null,
+          "effective_from": "2026-09-01",
+          "ends_on": null,
+          "state": "approved",
+          "money_digest": "d64a9c36ac7903a52d4ac3228b7d5308ab15e76b475c1d3e531037e3787a9cfd"
+        },
+        "kind": "recurring",
+        "recurring_period": "month",
+        "via_default": false,
+        "usage_rating_policy": null,
+        "invoice": {
+          "template": "Usage {sku} — café\n",
+          "template_source": "sku_version",
+          "gl_code": "REVENUE",
+          "tax_category": "cloud",
+          "timing": "advance",
+          "rounding": "half_even",
+          "template_digest": "bd2dc3e291bd73005db8cfb421d113725884a289a2e383f69d49ffe9438970d2"
+        }
+      },
+      {
+        "item_id": "00000000-0000-0000-0000-000000000002",
+        "price_book_entry_id": "00000000-0000-0000-0000-0000000000ca",
+        "dimension_key": "tier",
+        "dimension_value": "default",
+        "sku_id": "00000000-0000-0000-0000-00000000012e",
+        "sku_version": "9223372036854775807",
+        "sku_code": "SKU-2",
+        "sku_name": "Frozen SKU 2",
+        "unit": "VM·hour",
+        "meter": null,
+        "price": {
+          "price_id": "00000000-0000-0000-0000-000000000066",
+          "price_book_entry_id": "00000000-0000-0000-0000-0000000000ca",
+          "currency": {
+            "code": "EUR",
+            "scale": 2
+          },
+          "model": {
+            "kind": "per_unit",
+            "unit_amount": "2.5"
+          },
+          "minimum_fee": null,
+          "effective_from": "2026-09-01",
+          "ends_on": null,
+          "state": "approved",
+          "money_digest": "a55a47c50e0aeb307b1ca1bd0020234d2fb4869963011e5f389e066e9519e402"
+        },
+        "kind": "one_time",
+        "recurring_period": null,
+        "via_default": true,
+        "usage_rating_policy": null,
+        "invoice": {
+          "template": "Usage {sku} — café\n",
+          "template_source": "sku_version",
+          "gl_code": "REVENUE",
+          "tax_category": "cloud",
+          "timing": "advance",
+          "rounding": "half_even",
+          "template_digest": "bd2dc3e291bd73005db8cfb421d113725884a289a2e383f69d49ffe9438970d2"
+        }
+      },
+      {
+        "item_id": "00000000-0000-0000-0000-000000000003",
+        "price_book_entry_id": "00000000-0000-0000-0000-0000000000cb",
+        "dimension_key": "region",
+        "dimension_value": "eu",
+        "sku_id": "00000000-0000-0000-0000-00000000012f",
+        "sku_version": "9223372036854775807",
+        "sku_code": "SKU-3",
+        "sku_name": "Frozen SKU 3",
+        "unit": "VM·hour",
+        "meter": {
+          "usage_type_id": "vm-hours",
+          "version": "v1"
+        },
+        "price": {
+          "price_id": "00000000-0000-0000-0000-000000000067",
+          "price_book_entry_id": "00000000-0000-0000-0000-0000000000cb",
+          "currency": {
+            "code": "EUR",
+            "scale": 2
+          },
+          "model": {
+            "kind": "volume",
+            "tiers": [
+              {
+                "up_to": "100",
+                "rate": "0.047"
+              },
+              {
+                "up_to": null,
+                "rate": "0.025"
+              }
+            ]
+          },
+          "minimum_fee": null,
+          "effective_from": "2026-09-01",
+          "ends_on": null,
+          "state": "approved",
+          "money_digest": "11967806d3ca9fccc34eed341a2dcaecf339ae6bcfa35440763f26a1dff2ddcd"
+        },
+        "kind": "usage",
+        "recurring_period": null,
+        "via_default": false,
+        "usage_rating_policy": {
+          "policy_id": "00000000-0000-0000-0000-000000000190",
+          "version": "18446744073709551615",
+          "digest": "2bf1fcebb5742b520e2162b6ab65bcad5d04dc8c1100055d77757eaa87a60abc",
+          "content": {
+            "rating_window": {
+              "kind": "calendar_hour",
+              "timezone": "utc"
+            },
+            "aggregation_scope": "subscription_line",
+            "reset": "rating_window_start",
+            "partial_window": "actual_quantity_full_thresholds",
+            "fold": "sum"
+          }
+        },
+        "invoice": {
+          "template": "Usage {sku} — café\n",
+          "template_source": "sku_version",
+          "gl_code": "REVENUE",
+          "tax_category": "cloud",
+          "timing": "arrears",
+          "rounding": "half_even",
+          "template_digest": "bd2dc3e291bd73005db8cfb421d113725884a289a2e383f69d49ffe9438970d2"
+        }
+      }
+    ]
+  },
+  "activation_deadline": "2026-10-02T10:29:00.123456789Z"
+}
