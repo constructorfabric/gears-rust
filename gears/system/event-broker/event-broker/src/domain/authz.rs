@@ -1,11 +1,16 @@
 //! Shared authz primitives for `IngestServiceImpl::publish_event` and
 //! `DeliveryServiceImpl::join` (`eb-authz-enforcement`, `gears-rust#4516`).
-//! `TOPIC_RESOURCE`/`EVENT_TYPE_RESOURCE` reuse `event-broker-sdk::gts`'s
-//! `TopicV1::TYPE_ID`/`EVENT_TYPE_RESOURCE_TYPE` constants - the same GTS
-//! strings `api/rest/error.rs`'s `#[resource_error(...)]` macros use for
-//! `TopicResourceError`/`EventTypeResourceError`, though that file keeps its
-//! own literal (a round-trip test asserts they stay equal - see
-//! `eb-gts-type-registration`'s design.md "cannot be centralized").
+//!
+//! Every check on a concrete broker resource - an event type, a topic, a
+//! named consumer group - names that resource's own GTS id as the PEP
+//! resource type (`docs/DESIGN.md` §3.3 "Permission grammar"): a grant on
+//! `gts.cf.core.events.event.v1~vendor.audit.*` or on
+//! `gts.cf.core.events.topic.v1~vendor.events.tenants.v1` can then be matched
+//! by any policy decision point against the type string alone, the way it
+//! matches every other gear's resources. Asking about a fixed family label
+//! instead would make every `produce` grant cover every producer's events.
+//! The same id is still sent as a resource property (`event_type_id`,
+//! `topic_id`, `consumer_group_id`) for decision points that read it.
 //!
 //! Tenant scope (`TENANT_SCOPE_RESOURCE`) is *also* a `PolicyEnforcer` call,
 //! not a `tenant-resolver-sdk` call - `oagw`'s
@@ -17,27 +22,64 @@
 //! re-implements against a second SDK.
 
 use authz_resolver_sdk::{AccessRequest, PolicyEnforcer, ResourceType};
-use event_broker_sdk::gts::{
-    CONSUMER_GROUP_RESOURCE_TYPE, EVENT_TYPE_RESOURCE_TYPE, REQUEST_RESOURCE_TYPE, TopicV1,
-};
-use toolkit_gts::GtsSchema;
+use event_broker_sdk::gts::{CONSUMER_GROUP_RESOURCE_TYPE, EventV1, REQUEST_RESOURCE_TYPE};
+use gts::{GtsIdPattern, GtsTypeId};
+use toolkit_gts::{GtsInstanceId, GtsSchema};
 use toolkit_security::{SecurityContext, pep_properties};
 use uuid::Uuid;
 
 use crate::domain::error::{DomainError, ErrorCode};
 
-pub const TOPIC_RESOURCE: ResourceType = ResourceType::from_static(TopicV1::TYPE_ID, &[]);
-pub const EVENT_TYPE_RESOURCE: ResourceType =
-    ResourceType::from_static(EVENT_TYPE_RESOURCE_TYPE, &[]);
-/// `Named` consumer-group authorization (`docs/DESIGN.md`'s Consumer Group
-/// Lifecycle: `consumer_group:define`/`:consume`/`:manage` via PEP) -
+/// The consumer-group family, for the one check that has no concrete group
+/// yet: `consumer_group:define` when a caller creates an anonymous group
+/// (`docs/DESIGN.md`'s Consumer Group Lifecycle). Checks on an existing named
+/// group use [`consumer_group_resource`] instead.
+pub const CONSUMER_GROUP_FAMILY_RESOURCE: ResourceType =
+    ResourceType::from_static(CONSUMER_GROUP_RESOURCE_TYPE, &[]);
+
+/// PEP resource for one concrete event type: `produce` on publish, `consume`
+/// on a JOIN interest that names the type exactly.
+#[must_use]
+pub fn event_type_resource(event_type: &GtsTypeId) -> ResourceType {
+    ResourceType::new(event_type.as_ref().to_owned(), &[])
+}
+
+/// PEP resource for one JOIN event-type interest.
+///
+/// A pattern without a wildcard names one event type (or the event base type
+/// itself), so it is checked as that type. A wildcard pattern such as
+/// `gts.cf.core.events.event.v1~vendor.audit.*` is not a GTS identifier - a
+/// decision point that parses the resource type as one would reject it - so it
+/// is checked on the event base type `gts.cf.core.events.event.v1~`, with the
+/// pattern itself in the `event_type_id` property for a decision point that
+/// can tell whether a grant covers it. Either way the check is at least as
+/// strict as before: the base type is what a family grant on events covers.
+#[must_use]
+pub fn event_type_interest_resource(pattern: &GtsIdPattern) -> ResourceType {
+    let pattern = pattern.pattern();
+    if pattern.contains('*') {
+        ResourceType::from_static(EventV1::TYPE_ID, &[])
+    } else {
+        ResourceType::new(pattern.to_owned(), &[])
+    }
+}
+
+/// PEP resource for one concrete topic (`topic:consume` on JOIN).
+#[must_use]
+pub fn topic_resource(topic: &GtsInstanceId) -> ResourceType {
+    ResourceType::new(topic.as_ref().to_owned(), &[])
+}
+
+/// PEP resource for one existing named consumer group (`consume` on JOIN) -
 /// `Anonymous` groups use `TENANT_SCOPE_RESOURCE` instead (owner-tenant
 /// equality), never this (`eb-tenant-isolation-fix`).
-pub const CONSUMER_GROUP_RESOURCE: ResourceType =
-    ResourceType::from_static(CONSUMER_GROUP_RESOURCE_TYPE, &[]);
+#[must_use]
+pub fn consumer_group_resource(group: &GtsInstanceId) -> ResourceType {
+    ResourceType::new(group.as_ref().to_owned(), &[])
+}
 /// Generic resource for the platform-tenant-scope check
 /// (`docs/openapi.yaml`'s `TenantIdNotAuthorized`) - deliberately distinct
-/// from `TOPIC_RESOURCE`/`EVENT_TYPE_RESOURCE`: this call is about the
+/// from the topic/event-type resources: this call is about the
 /// calling principal's authority over the *target tenant*, not the
 /// topic/event type being acted on, so it stays its own `PolicyEnforcer`
 /// call (and therefore its own denial code, independent of whichever of
@@ -90,3 +132,7 @@ pub async fn tenant_authorized(
         .map_err(|e| with_forbidden_code(e.into(), ErrorCode::TenantIdNotAuthorized))?;
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "authz_tests.rs"]
+mod authz_tests;

@@ -197,3 +197,36 @@ fn a_filter_spec_compiles_and_does_not_yet_decide() {
     // compile would fail a JOIN that the scenarios require to succeed.
     assert!(filter.matches(&event(tenant, topic(), CREATED)));
 }
+
+/// An open stream must not keep using an earlier allow after policy changes.
+#[tokio::test]
+async fn concrete_type_permission_is_rechecked_for_each_event() {
+    use super::filter::AuthorizedInterestFilter;
+    use crate::test_support::DenyingAuthZ;
+    use authz_resolver_sdk::{EvaluationRequest, PolicyEnforcer};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let denied = Arc::new(AtomicBool::new(false));
+    let policy_denied = Arc::clone(&denied);
+    let tenant = Uuid::new_v4();
+    let filter = AuthorizedInterestFilter::new(
+        &[interest(tenant, &[CREATED])],
+        PolicyEnforcer::new(Arc::new(DenyingAuthZ {
+            deny_if: move |request: &EvaluationRequest| {
+                assert_eq!(request.action.name, "consume");
+                assert_eq!(request.resource.resource_type, CREATED);
+                policy_denied.load(Ordering::Relaxed)
+            },
+        })),
+        toolkit_security::SecurityContext::builder()
+            .subject_tenant_id(tenant)
+            .subject_id(Uuid::new_v4())
+            .build()
+            .expect("valid stream caller"),
+    );
+    let candidate = event(tenant, topic(), CREATED);
+    assert!(filter.allows(&candidate).await.unwrap());
+    denied.store(true, Ordering::Relaxed);
+    assert!(!filter.allows(&candidate).await.unwrap());
+}
