@@ -7,7 +7,9 @@ use serde::{Deserialize, Serialize};
 use tokio::time::{Instant, sleep};
 use uuid::Uuid;
 
-use event_broker::test_support::{EventBrokerHarness, StaticTypesRegistry};
+use event_broker::test_support::{
+    EventBrokerHarness, FaultInjectingBroker, StaticTypesRegistry, TransientFault,
+};
 use event_broker_sdk::api::EventBrokerApi;
 use event_broker_sdk::error::EventBrokerError;
 use event_broker_sdk::models::{Event, ProducerMeta, ResetScope};
@@ -625,6 +627,59 @@ async fn outbox_processor_retries_transient_rate_limit() {
         .await;
 
     assert_message_retry(result);
+}
+
+/// A chained producer's processor starts with an empty cursor cache, so its first message
+/// reads the broker cursor before publishing. A transient transport or rate-limit failure of
+/// that initial read must be a `Retry` - never a `Reject`, which would dead-letter the message
+/// and advance the queue cursor - and nothing may reach the broker without a cursor. Once the
+/// read succeeds, the same envelope publishes with its original event id. Dedicated regression
+/// for the initial-cursor Retry branch (`c7de7b80ae`); the publish-path rate limit above does
+/// not exercise this read.
+#[tokio::test]
+async fn outbox_processor_retries_transient_initial_cursor_read_with_empty_cache() {
+    let (db, broker, harness) = fixture().await;
+    let faulty = FaultInjectingBroker::new(Arc::clone(&broker));
+    let producer = managed_producer(db, faulty.clone() as Arc<dyn EventBrokerApi>).await;
+    let envelope = managed_envelope_payload(&producer).await;
+    let event_id: Uuid =
+        serde_json::from_value(envelope_json_from_bytes(&envelope)["event_id"].clone()).unwrap();
+
+    for fault in [TransientFault::Transport, TransientFault::RateLimited] {
+        faulty.fail_cursor_reads([fault]);
+        let reads = faulty.cursor_reads();
+        let result = producer
+            .process_outbox_payload_for_test(envelope.clone(), 1)
+            .await;
+        assert_message_retry(result);
+        assert_eq!(
+            faulty.cursor_reads(),
+            reads + 1,
+            "the empty cache read the cursor"
+        );
+        assert_eq!(faulty.publishes(), 0, "nothing publishes without a cursor");
+        assert_eq!(stored_count(&harness, TOPIC).await, 0);
+    }
+
+    let result = producer.process_outbox_payload_for_test(envelope, 1).await;
+    assert_message_ok(result);
+    wait_for_stored(&harness, TOPIC, 1).await;
+    let ctx = harness.security_context();
+    let mut stored = Vec::new();
+    for partition in 0..FIXTURE_BROKER_PARTITIONS {
+        stored.extend(
+            harness
+                .backend()
+                .read(ctx, TOPIC, partition, Sequence::NONE, 16)
+                .await
+                .unwrap(),
+        );
+    }
+    assert_eq!(stored.len(), 1);
+    assert_eq!(
+        stored[0].id, event_id,
+        "recovery keeps the original event identity"
+    );
 }
 
 #[tokio::test]
