@@ -56,6 +56,16 @@
                 ]
               }
             },
+            "queue": {
+              "description": "The task's current queue at the time of the event, so consumers can route by queue without reading the task. The task type is the event's subject_type.",
+              "type": "string",
+              "x-gts-instance-ref": "gts.cf.core.tasks.queue.v1~"
+            },
+            "actor": {
+              "description": "Authenticated subject whose API or worker call caused this event. Absent when the engine itself caused it (timer, lease scan, retention, cascade from another task).",
+              "type": "string",
+              "maxLength": 256
+            },
             "progress": {
               "description": "Latest progress snapshot.",
               "type": "object",

@@ -1,10 +1,10 @@
 ---
 status: accepted
 date: 2026-10-24
-description: "Store task payloads as opaque binary blobs, S2-compressed above a size threshold and marked with a 4-byte magic prefix so reads decompress transparently on every backend."
+description: "Store task payloads as opaque binary blobs, zstd-compressed above a size threshold and marked with a magic prefix plus a codec byte, so reads decompress transparently on every backend and the codec can change later."
 ---
 
-# Compress JSON Payload Blobs Transparently with S2 and a Magic Header
+# Compress JSON Payload Blobs Transparently with zstd and a Codec Header
 
 <!-- toc -->
 
@@ -49,11 +49,15 @@ We must decide how to store payloads so that storage stays small, behavior is id
 
 ## Decision Outcome
 
-Chosen option: **Option 3 — Application-level S2 compression with a magic header.**
+Chosen option: **Option 4 — Application-level zstd with a format byte.**
 
-All payload columns are opaque `Binary` columns (`BYTEA` / `LONGBLOB` / `BLOB`). On write, a value larger than `compression_threshold_bytes` is stored as the magic prefix followed by its S2 encoding; otherwise it is stored raw. On read, a value that starts with the prefix is decompressed; any other value is returned as-is.
+All payload columns are opaque `Binary` columns (`BYTEA` / `LONGBLOB` / `BLOB`). On write, a value larger than `compression_threshold_bytes` is stored as a 5-byte header — the magic prefix `0xDEADBEEF` (little-endian) and one **codec byte** — followed by the compressed bytes. The first codec is `0x01` = zstd level 1, from the Rust `zstd` crate that the workspace already uses. Smaller values are stored raw. On read, a value that starts with the magic prefix is decoded with the codec its codec byte names; any other value is returned as-is. An unknown codec byte is a data error: the read fails closed and is logged, it is never returned as raw bytes.
 
-> **TODO (verify before implementation)**: (1) S2 is mainly a Go library — confirm a maintained Rust implementation exists, or use plain Snappy (`snap` crate) or zstd (Option 4). (2) Benchmark S2/Snappy against zstd level 1 on real payloads, on PostgreSQL with TOAST compression on and off. (3) Consider adding a codec byte after the magic prefix so the codec can change without a migration.
+A raw value can never look like a header: raw values are canonical JSON, which starts with an ASCII character, while the header starts with byte `0xEF` followed by `0xBE`.
+
+**Why not S2**: S2 is mainly a Go library and has no maintained Rust crate, and the earlier 4-byte header had no codec byte, so any later change of codec would need a data migration.
+
+**PostgreSQL TOAST**: PostgreSQL may try to compress large values again (TOAST). Bytes that zstd already compressed do not shrink further, so TOAST mostly gives up after a short test. The Confirmation benchmark below measures this cost; the design keeps the default column storage unless the benchmark shows a real cost.
 
 The PRD payload size limit (64 KB) is measured on the uncompressed canonical JSON, before compression, so the limit does not depend on how well a payload compresses.
 
@@ -72,7 +76,10 @@ Tests MUST check that:
 * values above the threshold are compressed and carry the prefix, and smaller values are stored raw;
 * reads round-trip both forms exactly;
 * rows written under one threshold read correctly after the threshold changes;
-* the payload size limit is enforced on the uncompressed size.
+* the payload size limit is enforced on the uncompressed size;
+* a value whose codec byte is unknown fails the read instead of being returned as raw bytes.
+
+Before the first release, a benchmark on real payloads MUST compare zstd level 1 with LZ4 (`lz4_flex`) for ratio and CPU, on PostgreSQL with TOAST compression on and off, and confirm the NFR (≥ 40% smaller, < 1 ms per blob each way). If LZ4 wins clearly, it becomes codec `0x02` with no change to the format.
 
 ## Pros and Cons of the Options
 
@@ -104,10 +111,11 @@ Blobs are stored in `Binary` columns. Values above the threshold (default 1 KiB)
 * Good, because behavior is identical on every backend.
 * Good, because S2 is very fast and gives good ratios on JSON.
 * Good, because small payloads skip compression entirely.
-* Good, because the threshold can change without migrating old rows.
+* Bad, because S2 has no maintained Rust crate (it is mainly a Go library).
+* Bad, because the 4-byte header has no codec byte, so changing the codec later needs a data migration.
 * Bad, because the database cannot inspect or redact fields inside payloads.
 
-**Chosen.**
+**Rejected.**
 
 ### Option 4: Application-level zstd with a format byte
 
@@ -117,18 +125,21 @@ Same opaque binary column; the prefix carries a codec id so the codec can change
 * Good, because the Rust `zstd` crate is mature and widely used.
 * Good, because a codec byte makes later changes cheap.
 * Bad, because it costs more CPU than S2 at higher levels (level 1 is close).
-* Neutral, because PostgreSQL TOAST may already compress large values, so the gain must be measured per backend.
+* Good, because small payloads skip compression and the threshold can change without migrating old rows.
+* Neutral, because PostgreSQL TOAST may try to compress the values again; the benchmark in Confirmation measures this.
+* Bad, because the database cannot inspect or redact fields inside payloads.
 
-**Rejected for now — see the TODO in Decision Outcome.**
+**Chosen.**
 
 ## More Information
 
 ```text
-write: len(blob) > threshold ? [EF BE AD DE] + s2_encode(blob) : blob
-read : starts_with([EF BE AD DE]) ? s2_decode(rest) : blob
+write: len(blob) > threshold ? [EF BE AD DE] + [01] + zstd_encode(blob, level 1) : blob
+read : starts_with([EF BE AD DE]) ? decode(codec = byte[4], rest = bytes[5..]) : blob
+       unknown codec byte -> error (fail closed)
 ```
 
-See DESIGN §3.7 Portable JSON Storage Contract and §4.6 S2 Blob Compression.
+See DESIGN §3.7 Portable JSON Storage Contract and §4.6 Blob Compression.
 
 ## Traceability
 

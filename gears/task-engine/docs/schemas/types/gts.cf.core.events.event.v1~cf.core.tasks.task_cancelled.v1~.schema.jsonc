@@ -56,18 +56,24 @@
                 ]
               }
             },
+            "queue": {
+              "description": "The task's current queue at the time of the event, so consumers can route by queue without reading the task. The task type is the event's subject_type.",
+              "type": "string",
+              "x-gts-instance-ref": "gts.cf.core.tasks.queue.v1~"
+            },
+            "actor": {
+              "description": "Authenticated subject whose API or worker call caused this event. Absent when the engine itself caused it (timer, lease scan, retention, cascade from another task).",
+              "type": "string",
+              "maxLength": 256
+            },
             "result_code": {
-              "description": "Terminal result code (cancelled, forciblyCancelled, or superseded).",
+              "description": "Terminal result code (cancelled, forcibly_cancelled, or superseded).",
               "type": "string",
               "enum": [
-                "success",
-                "warning",
-                "error",
                 "cancelled",
-                "timedOut",
-                "forciblyCancelled",
+                "forcibly_cancelled",
                 "superseded",
-                "dependencyFailed"
+                "dependency_failed"
               ]
             },
             "superseded_by": {

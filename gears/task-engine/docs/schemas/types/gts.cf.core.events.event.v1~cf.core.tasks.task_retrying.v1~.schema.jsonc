@@ -56,6 +56,16 @@
                 ]
               }
             },
+            "queue": {
+              "description": "The task's current queue at the time of the event, so consumers can route by queue without reading the task. The task type is the event's subject_type.",
+              "type": "string",
+              "x-gts-instance-ref": "gts.cf.core.tasks.queue.v1~"
+            },
+            "actor": {
+              "description": "Authenticated subject whose API or worker call caused this event. Absent when the engine itself caused it (timer, lease scan, retention, cascade from another task).",
+              "type": "string",
+              "maxLength": 256
+            },
             "attempt": {
               "description": "Attempt that failed (the next claim increments the counter).",
               "type": "integer",
@@ -67,7 +77,7 @@
               "format": "date-time"
             },
             "error": {
-              "description": "The retryable error that triggered the retry.",
+              "description": "Classification of the retryable error that triggered the retry. The error `message` and `context` are never published (they may echo payload data); read them from the task via the API.",
               "type": [
                 "object",
                 "null"
@@ -75,11 +85,23 @@
               "additionalProperties": false,
               "default": null,
               "properties": {
+                "domain": {
+                  "type": "string"
+                },
                 "code": {
                   "type": "string"
                 },
-                "message": {
-                  "type": "string"
+                "fault": {
+                  "description": "Error attribution.",
+                  "type": "string",
+                  "enum": [
+                    "task",
+                    "dependency",
+                    "worker"
+                  ]
+                },
+                "retryable": {
+                  "type": "boolean"
                 }
               }
             }

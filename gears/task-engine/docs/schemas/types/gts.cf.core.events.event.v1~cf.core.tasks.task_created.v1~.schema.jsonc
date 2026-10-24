@@ -43,8 +43,10 @@
               "x-gts-instance-ref": "gts.cf.core.tasks.queue.v1~"
             },
             "priority": {
-              "description": "Effective task priority (lower = higher priority).",
-              "type": "integer"
+              "description": "Effective task priority, 0 (highest) to 1000 (lowest).",
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 1000
             },
             "created_by": {
               "description": "Authenticated subject that created the task.",

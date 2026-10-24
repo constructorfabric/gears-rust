@@ -56,6 +56,11 @@
                 ]
               }
             },
+            "actor": {
+              "description": "Authenticated subject whose API or worker call caused this event. Absent when the engine itself caused it (timer, lease scan, retention, cascade from another task).",
+              "type": "string",
+              "maxLength": 256
+            },
             "dead_letter_queue": {
               "description": "Queue the task was dead-lettered into.",
               "type": "string",
@@ -70,14 +75,8 @@
               "description": "Terminal result code recorded at dead-lettering.",
               "type": "string",
               "enum": [
-                "success",
-                "warning",
                 "error",
-                "cancelled",
-                "timedOut",
-                "forciblyCancelled",
-                "superseded",
-                "dependencyFailed"
+                "timed_out"
               ]
             }
           },

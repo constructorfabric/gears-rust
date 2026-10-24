@@ -80,7 +80,7 @@ The Task Engine runs these jobs directly in its own core and its own database:
 * task entries;
 * lifecycle event history and Event Broker integration;
 * resource references and tags;
-* recurring schedules;
+* recurring schedules, once added (deferred, PRD §5.22);
 * retention policy;
 * task-domain routing;
 * REST API and Rust SDK.

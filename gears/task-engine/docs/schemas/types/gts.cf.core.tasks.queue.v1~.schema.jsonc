@@ -40,11 +40,13 @@
       "minimum": 0
     },
     "default_priority": {
-      "description": "Default task priority for tasks enqueued to this queue when the creator supplies none. Lower numeric value = higher priority.",
-      "type": "integer"
+      "description": "Default task priority for tasks enqueued to this queue when the creator supplies none. Range 0 (highest) to 1000 (lowest), the same range as task priority (PRD cpt-cf-task-engine-fr-priority-dispatch).",
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 1000
     },
-    "timeouts": {  // all values are seconds; null/absent = no timeout of that kind
-      "description": "Default timeout values applied to tasks on this queue when the task itself declares none. All values are in seconds; null/absent means no timeout of that kind.",
+    "timeouts": {  // all values are seconds; null = no timeout, except heartbeat (null = default lease)
+      "description": "Default timeout values applied to tasks on this queue when the task itself declares none. All values are in seconds. null/absent means 'no timeout of that kind' for every field except heartbeat_timeout_secs: a claimed task always has a lease, so null there means 'use the engine default lease' (default_lease_duration_secs).",
       "type": "object",
       "additionalProperties": false,
       "properties": {
@@ -106,7 +108,7 @@
           "minimum": 0
         },
         "max_liveness_requeues": {  // lease-expiry / assignment-timeout requeues; 0 = unlimited
-          "description": "Maximum number of liveness requeues (lease expiry or assignment timeout) before the task is routed terminally with a timedOut result. Counted separately from max_retries so losing the worker never burns the failure-retry budget. Backoff uses this policy's strategy and intervals, applied to the liveness-requeue count. 0 means unlimited (bounded only by the lifetime timeout, if any).",
+          "description": "Maximum number of liveness requeues (lease expiry or assignment timeout) before the task is routed terminally with a timed_out result. Counted separately from max_retries so losing the worker never burns the failure-retry budget. Backoff uses this policy's strategy and intervals, applied to the liveness-requeue count. 0 means unlimited (bounded only by the lifetime timeout, if any).",
           "type": "integer",
           "minimum": 0,
           "default": 20
@@ -126,7 +128,7 @@
           "minimum": 0
         },
         "max_interval_secs": {
-          "description": "Maximum backoff interval in seconds (caps exponential/linear growth).",
+          "description": "Maximum backoff interval in seconds (caps exponential/linear growth). MUST be greater than or equal to base_interval_secs; the engine rejects a queue whose policy breaks this rule when it resolves the queue (JSON Schema cannot compare two fields).",
           "type": "integer",
           "minimum": 0
         },
@@ -154,23 +156,26 @@
       ]
     },
     "queue_max_queue_depth": {
-      "description": "Maximum 'queued' tasks in this queue across all tenants. 0 means unlimited. Falls back to the configured default when omitted; overridable in config.",
+      "description": "Maximum 'queued' tasks in this queue across all tenants. 0 means unlimited. When omitted, the config default queue_depth.queue_max_queue_depth applies (shipped value 1,000,000); overridable in config. The name matches that config key and its siblings tenant_max_queue_depth and global_max_queue_depth.",
       "type": "integer",
       "minimum": 0
     },
     "blacklist_failure_threshold": {
-      "description": "Consecutive worker failures on this queue that trigger a worker blacklisting (PRD cpt-cf-task-engine-fr-worker-blacklist). Falls back to the config default when omitted.",
+      "description": "Consecutive worker failures on this queue that trigger a worker blacklisting (PRD cpt-cf-task-engine-fr-worker-blacklist). When omitted, the config default blacklist_failure_threshold applies; the schema default shows the shipped value.",
       "type": "integer",
-      "minimum": 1
+      "minimum": 1,
+      "default": 10
     },
     "blacklist_duration_minutes": {
-      "description": "How long a blacklisted worker is excluded from claiming on this queue. Falls back to the config default when omitted.",
+      "description": "How long a blacklisted worker is excluded from claiming on this queue. When omitted, the config default blacklist_duration_minutes applies; the schema default shows the shipped value.",
       "type": "integer",
-      "minimum": 1
+      "minimum": 1,
+      "default": 60
     },
     "progress_events": {
-      "description": "Default progress event mode for tasks on this queue (PRD cpt-cf-task-engine-fr-progress-events): 'none', 'milestones', or 'all'. Lower precedence than task-type traits and config overrides.",
+      "description": "Default progress event mode for tasks on this queue (PRD cpt-cf-task-engine-fr-progress-events): 'none', 'milestones', or 'all'. Lower precedence than task-type traits and config overrides. When omitted, the global default applies ('none').",
       "type": "string",
+      "default": "none",
       "enum": [
         "none",
         "milestones",
@@ -178,9 +183,10 @@
       ]
     },
     "progress_flush_interval_secs": {
-      "description": "Default progress flush interval (seconds) for tasks on this queue. Effective value is clamped to progress_min_flush_interval_secs.",
+      "description": "Default progress flush interval (seconds) for tasks on this queue. Effective value is clamped to progress_min_flush_interval_secs. When omitted, the config default progress_flush_interval_secs applies; the schema default shows the shipped value.",
       "type": "integer",
-      "minimum": 1
+      "minimum": 1,
+      "default": 5
     },
     "tenant_fairness": {  // round_robin | fifo
       "description": "How tasks of the same priority from different tenants are ordered (PRD cpt-cf-task-engine-fr-tenant-fairness). 'round_robin' (default): tenants take turns, each tenant's own tasks stay FIFO. 'fifo': strict FIFO across tenants. Priority always comes first. Overridable in config by queue pattern.",

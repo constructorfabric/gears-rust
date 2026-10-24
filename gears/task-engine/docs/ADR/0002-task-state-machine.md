@@ -60,7 +60,7 @@ Every transition is listed in the DESIGN state transition table and is executed 
 * There is one lifecycle for all actors; the REST API, SDK, timers, and event consumer cannot disagree about a task's state.
 * Illegal transitions are rejected by construction (`failed_precondition`), not by convention.
 * Retryable failures go `running → scheduled`, never through `failed`; `failed` is always terminal.
-* Cancellation is a first-class terminal state; `cancelled`, `forciblyCancelled`, and `superseded` result codes record how it happened.
+* Cancellation is a first-class terminal state; `cancelled`, `forcibly_cancelled`, and `superseded` result codes record how it happened.
 * Claim dispatch, search, and retention all filter on one indexed column.
 * Adding or removing a state requires a new ADR, an enum migration, and an update of the transition table.
 
