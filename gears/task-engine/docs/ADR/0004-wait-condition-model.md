@@ -1,0 +1,112 @@
+---
+status: accepted
+date: 2026-10-24
+description: "Support exactly three wait-condition kinds (timer, event, input) as engine-owned domain types with ALL/ANY groups, instead of a GTS-extensible condition type."
+---
+
+# Model Wait Conditions as Fixed Domain Elements with Three Built-in Kinds
+
+<!-- toc -->
+
+- [Context and Problem Statement](#context-and-problem-statement)
+- [Decision Drivers](#decision-drivers)
+- [Considered Options](#considered-options)
+- [Decision Outcome](#decision-outcome)
+  - [Consequences](#consequences)
+  - [Confirmation](#confirmation)
+- [Pros and Cons of the Options](#pros-and-cons-of-the-options)
+  - [Option 1: GTS-extensible wait-condition type](#option-1-gts-extensible-wait-condition-type)
+  - [Option 2: Fixed kinds: timer, event, input](#option-2-fixed-kinds-timer-event-input)
+- [More Information](#more-information)
+- [Traceability](#traceability)
+
+<!-- /toc -->
+
+**ID**: `cpt-cf-task-engine-adr-wait-condition-model`
+
+## Context and Problem Statement
+
+A running task can park itself until something happens: a point in time, an external event, or input from a person or another system. While parked the task is in `waiting`, holds no concurrency slot, and must resume exactly once, even across crashes and duplicate event delivery.
+
+We must decide whether wait conditions are an open, extensible type (for example a GTS base type that other gears derive from) or a fixed part of the Task Engine domain model.
+
+## Decision Drivers
+
+* Resumption must be exactly-once and transactional with the task state change.
+* The engine must understand every condition kind well enough to index, time out, and resolve it.
+* Durable suspension must survive restarts.
+* Keep the model small and testable; avoid a plugin surface for wait semantics.
+
+## Considered Options
+
+1. **GTS-extensible wait-condition type** — a GTS base type that gears derive new wait kinds from, with their own matching logic.
+2. **Fixed kinds: timer, event, input** — three engine-owned kinds stored as a stable enum, combined in ALL/ANY groups.
+
+## Decision Outcome
+
+Chosen option: **Option 2 — Fixed kinds: timer, event, input.**
+
+Wait conditions are rows in `te_wait_conditions` with a stable `WaitConditionKind` discriminant (`timer`, `event`, `input`) and state (`pending`, `satisfied`, `timed_out`, `cancelled`). They are not GTS types.
+
+A task sets one group of conditions with `all` or `any` semantics. In `any` mode the first satisfied condition wakes the task and cancels its siblings; in `all` mode every condition must be satisfied. A group may have a timeout whose `on_timeout` action fails or resumes the task.
+
+Resolution (timer fire, matching event, input resolve) marks the condition `satisfied` and, when the group is complete, moves the task `waiting → queued` in the same transaction and writes `WaitConditionSatisfied` and `TaskResumed` to the outbox. For event waits, the consumer offset is committed in that same transaction, so a duplicate event can never satisfy a wait twice.
+
+### Consequences
+
+* Wait resolution is exactly-once on the engine side.
+* A waiting task releases its concurrency slot and holds no lease.
+* Event waits drive the inbound Event Broker consumer subscription (DESIGN §3.2 Event Consumer).
+* Each kind has its own validation, indexes, and timeout handling.
+* Adding a fourth kind requires a new ADR and a schema change.
+
+### Confirmation
+
+Tests MUST check that:
+
+* each kind resolves and resumes the task exactly once;
+* `any` groups cancel remaining siblings and `all` groups wait for every member;
+* a group timeout applies `on_timeout` correctly;
+* a duplicate event does not satisfy a wait twice;
+* pending waits survive a restart.
+
+## Pros and Cons of the Options
+
+### Option 1: GTS-extensible wait-condition type
+
+New kinds are registered at runtime with their own schema and resolver.
+
+* Good, because new kinds need no engine release.
+* Bad, because the engine cannot index or validate unknown kinds.
+* Bad, because resolution logic would run outside engine transactions, breaking exactly-once resume.
+* Bad, because it adds a plugin ABI (contradicts ADR-0001).
+
+**Rejected.**
+
+### Option 2: Fixed kinds: timer, event, input
+
+`timer` waits until a time; `event` matches an incoming broker event by `event_type`, optional subject filters, and an optional CEL expression (ADR-0007); `input` waits for a resolve call carrying a payload. Conditions are grouped with `all` or `any` semantics and an optional group timeout with `on_timeout = fail | resume`.
+
+* Good, because every kind has dedicated columns and indexes.
+* Good, because resolution runs in the same transaction as the `waiting → queued` transition.
+* Good, because the three kinds cover time, external events, and human/system input.
+* Bad, because a genuinely new kind needs an engine change and a new ADR.
+
+**Chosen.**
+
+## More Information
+
+See DESIGN §3.1 WaitCondition entity, §3.2 WaitConditionService, §3.6 Event Wait sequence, and §3.7 `te_wait_conditions`.
+
+## Traceability
+
+- **PRD**: [PRD.md](../PRD.md)
+- **DESIGN**: [DESIGN.md](../DESIGN.md)
+
+This decision supports these requirements and design elements:
+
+* `cpt-cf-task-engine-fr-wait-conditions` — durable suspension with ALL/ANY semantics.
+* `cpt-cf-task-engine-fr-wait-timer` — the `timer` kind.
+* `cpt-cf-task-engine-fr-wait-event` — the `event` kind.
+* `cpt-cf-task-engine-fr-wait-input` — the `input` kind.
+* `cpt-cf-task-engine-usecase-event-wait` — a task parks until an external event arrives.

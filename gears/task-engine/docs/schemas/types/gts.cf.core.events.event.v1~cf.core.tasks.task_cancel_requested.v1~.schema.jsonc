@@ -1,0 +1,81 @@
+// JSONC: // comments annotate field semantics for readers. Strip comments
+// before feeding this file to a strict JSON / JSON-Schema consumer.
+{
+  "$id": "gts://gts.cf.core.events.event.v1~cf.core.tasks.task_cancel_requested.v1~",
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "description": "Task Engine lifecycle event type 'taskCancelRequested'. Published when cancellation is requested on a task (requested/graceful/forced). Derived from the Event Broker base event type; routed to the task_events topic and partitioned by subject (the task ID) for per-task ordering.",
+  "x-gts-traits": {
+    "topic": "gts.cf.core.events.topic.v1~cf.core.tasks.task_events.v1",
+    "partition_key": "/subject",
+    "allowed_subject_types": [
+      "gts.cf.core.tasks.task.v1~"
+    ]
+  },
+  "type": "object",
+  "allOf": [
+    {
+      "$ref": "gts://gts.cf.core.events.event.v1~"
+    },
+    {
+      "type": "object",
+      "properties": {
+        "type": {
+          "const": "gts.cf.core.events.event.v1~cf.core.tasks.task_cancel_requested.v1~",
+          "$comment": "Pins the event-type identifier so an editor can validate a payload against this schema alone."
+        },
+        "data": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "task_id": {
+              "description": "The task.",
+              "type": "string",
+              "format": "uuid"
+            },
+            "resource_refs": {
+              "description": "The task's resource references (PRD cpt-cf-task-engine-fr-resource-refs), carried on task-scoped events so consumers can route per resource without a read-back.",
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "resource_type": {
+                    "description": "GTS type identifier of the referenced resource.",
+                    "type": "string",
+                    "x-gts-type-ref": "gts.*"
+                  },
+                  "resource_id": {
+                    "description": "Identifier of the referenced resource.",
+                    "type": "string",
+                    "maxLength": 1024
+                  }
+                },
+                "required": [
+                  "resource_type",
+                  "resource_id"
+                ]
+              }
+            },
+            "mode": {
+              "description": "Cancellation mode requested.",
+              "type": "string",
+              "enum": [
+                "requested",
+                "graceful",
+                "forced"
+              ]
+            },
+            "requested_by": {
+              "description": "Subject that requested cancellation.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "task_id",
+            "mode"
+          ]
+        }
+      }
+    }
+  ]
+}

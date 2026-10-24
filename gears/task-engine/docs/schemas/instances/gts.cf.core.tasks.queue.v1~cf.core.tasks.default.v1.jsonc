@@ -1,0 +1,27 @@
+// JSONC: // comments annotate field semantics for readers. Strip comments
+// before feeding this file to a strict JSON / JSON-Schema consumer.
+{
+  "id": "gts.cf.core.tasks.queue.v1~cf.core.tasks.default.v1",
+  "description": "Default general-purpose task queue. Used when a task creation request names no specific queue.",
+  "global_concurrency_limit": 0,  // max concurrent (claimed+running) tasks across all tenants; 0 = unlimited
+  "per_tenant_concurrency_limit": 0,  // max concurrent (claimed+running) tasks per tenant; 0 = unlimited
+  "default_priority": 100,  // default priority when the creator supplies none; lower number = higher priority
+  "timeouts": {
+    "queue_timeout_secs": null,  // seconds a task may sit in 'queued' before it is force-timed-out (terminal); null = no limit
+    "assignment_timeout_secs": 300,  // seconds a claimed task may stay 'claimed' before it starts; on expiry it is requeued against max_liveness_requeues; null = no limit
+    "execution_timeout_secs": 86400,  // running seconds per attempt (re-armed on each start); terminal, never retried; null = no limit
+    "heartbeat_timeout_secs": 30,  // lease duration; workers heartbeat every heartbeat_interval_secs (= 1/3 of this, returned on claim); expiry requeues against max_liveness_requeues; null = default_lease_duration_secs
+    "lifetime_timeout_secs": null  // absolute seconds from creation to terminal, surviving requeues; on expiry force-timed-out; null = no limit
+  },
+  "retry_policy": {
+    "max_retries": 3,  // retries after explicit retryable failures (liveness requeues not counted); 0 = no retries
+    "max_liveness_requeues": 20,  // lease-expiry / assignment-timeout requeues allowed; separate from max_retries; 0 = unlimited (bounded only by lifetime)
+    "strategy": "exponential",  // backoff curve for run_after: fixed | linear | exponential
+    "base_interval_secs": 5,  // base backoff interval in seconds
+    "max_interval_secs": 300,  // cap on backoff growth in seconds
+    "jitter_factor": 0.2,  // fractional jitter 0.0-1.0 applied to each backoff to de-sync retries
+    "non_retryable_codes": []  // error codes always terminal regardless of the worker's retryable flag
+  },
+  "progress_events": "none",  // default progress event mode: none | milestones | all
+  "dead_letter_queue": "gts.cf.core.tasks.queue.v1~cf.core.tasks.dead_letter.v1"  // queue tasks are dead-lettered into on retry-exhaustion/lifetime; null = transition to 'failed' instead
+}

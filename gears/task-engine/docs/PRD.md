@@ -1,3 +1,7 @@
+---
+description: "Product requirements for the Task Engine gear: durable, multi-tenant task lifecycle with queues, leases, retries, waits, dependencies, and lifecycle events."
+---
+
 # PRD — Task Engine
 
 <!-- toc -->
@@ -46,6 +50,9 @@
   - [7.1 Public API Surface](#71-public-api-surface)
   - [7.2 External Integration Contracts](#72-external-integration-contracts)
 - [8. Use Cases](#8-use-cases)
+  - [Create, Claim, and Execute a Task](#create-claim-and-execute-a-task)
+  - [Task Waits for External Event](#task-waits-for-external-event)
+  - [Retry with Backoff After Transient Failure](#retry-with-backoff-after-transient-failure)
 - [9. Acceptance Criteria](#9-acceptance-criteria)
 - [10. Dependencies](#10-dependencies)
 - [11. Assumptions](#11-assumptions)
@@ -407,10 +414,10 @@ Concurrency limits bound the *executing* set; nothing else bounds how many tasks
 
 - `queue_max_queue_depth` — maximum `queued` tasks in one queue across all tenants. A **queue GTS trait** (§5.12), overridable in config.
 - `tenant_max_queue_depth` — maximum `queued` tasks in one queue per tenant (the task's `owner_tenant_id`). Config setting with a default, overridable per queue pattern.
-- `global_max_queue_depth` — maximum `queued` tasks across **all queues** of a task domain (§5.19). Config setting with a default; a safety ceiling that always applies. This is the `domain_global` dimension reported in `429` bodies and metrics.
+- `global_max_queue_depth` — maximum `queued` tasks across **all queues** of a task domain (§5.19). Config setting with a default; a last-line safety ceiling that always applies. Unlike the other dimensions it **MAY** be enforced against a periodically sampled count (overshoot bounded by one sampling interval) rather than atomically, because an exact domain-wide counter would serialize every create and claim of the domain. This is the `domain_global` dimension reported in `429` bodies and metrics.
 - `tenant_max_deferred_tasks` — maximum **deferred** tasks (`scheduled` with a future `run_after`, and `blocked` on dependencies) per tenant across all queues of a task domain. Config setting with a default. Delayed work and large dependency fan-outs are legitimate, so they are bounded generously and independently of the dispatch backlog instead of consuming the queue limits.
 
-`0` means unlimited for a dimension. Default values (config): `tenant_max_queue_depth` = 10,000; `queue_max_queue_depth` (applied to queues whose registration omits the trait) = 1,000,000; `global_max_queue_depth` = 5,000,000; `tenant_max_deferred_tasks` = 100,000 — sized to stay well inside the reference capacity profile (§6.1, 500 million stored tasks) while being generous versus typical worker throughput. The effective per-queue value resolves in this order (highest first): config override for the most specific matching queue pattern, queue GTS registration, config default.
+`0` means unlimited for a dimension. Default values (config): `tenant_max_queue_depth` = 100,000; `queue_max_queue_depth` (applied to queues whose registration omits the trait) = 1,000,000; `global_max_queue_depth` = 5,000,000; `tenant_max_deferred_tasks` = 100,000 — sized to stay well inside the reference capacity profile (§6.1, 500 million stored tasks) while being generous enough to absorb a backlog that accumulates while dispatch is slow or paused, rather than pushing back on producers early. The effective per-queue value resolves in this order (highest first): config override for the most specific matching queue pattern, queue GTS registration, config default.
 
 Enforcement:
 
@@ -483,9 +490,9 @@ The system **MUST** support deferred task enqueue: a task definition may include
 The system **MUST** enforce the following timeout types, persisted in the database and rebuilt on restart:
 
 - **Queue timeout** — task waited too long in queue without being claimed → terminal force-complete with a `timedOut` result, routed by the terminal rule below
-- **Assignment timeout** — worker claimed but didn't start within the limit (measured from the claim; heartbeats do not extend it) → return to the queue with retry-policy backoff, as for a lease expiry (§5.6); counts as one consecutive failure toward the worker blacklist (§5.6)
+- **Assignment timeout** — worker claimed but didn't start within the limit (measured from the claim; heartbeats do not extend it) → a **liveness failure**: return to the queue with retry-policy backoff, as for a lease expiry (§5.6), against the liveness-requeue budget (`max_liveness_requeues`, §5.8) rather than `max_retries`; counts toward the worker blacklist (§5.6)
 - **Execution timeout** — a single claimed run exceeded its time limit (measured from the worker's `start` of that claim; time spent `waiting` is not counted, §5.4) → terminal force-complete with a `timedOut` result, routed by the terminal rule below (never retried); attributed to the task, so it does **not** count toward the worker blacklist. The deadline is absolute: heartbeats renew the lease but **MUST NOT** extend it
-- **Heartbeat timeout** — worker stopped sending heartbeats (the lease, whose duration is the task's heartbeat timeout, expired) → return to queue or force-complete; counts as one consecutive failure toward the worker blacklist (§5.6)
+- **Heartbeat timeout** — worker stopped sending heartbeats (the lease, whose duration is the task's heartbeat timeout, expired) → a **liveness failure**: return to queue while the liveness-requeue budget (`max_liveness_requeues`, §5.8) remains, else force-complete with `timedOut`; counts toward the worker blacklist (§5.6)
 - **Lifetime timeout** — task exceeded maximum total lifetime → **terminal force-completion** with a `timedOut` result (see terminal precedence below)
 - **SLA deadline** — task did not reach a terminal state by the deadline → publish `slaBreached` event (task continues executing; SLA is **non-terminal** and never changes task state)
 
@@ -593,7 +600,7 @@ Task entries **MUST** be queryable and filterable by type, time range, and creat
 
 - [ ] `p1` - **ID**: `cpt-cf-task-engine-fr-assignment`
 
-The system **MUST** support atomic task claiming: a worker requests a task from one or more queues, and the system atomically assigns the highest-priority eligible task, sets a lease expiry (`lease_until`), records `claimed_at`, increments the `attempt` counter, issues a new lease token and lease epoch (§5.6 Lease Fencing), reserves the required concurrency slots (§5.2), and returns the task. Two workers **MUST NOT** be able to claim the same task. When a request names several queues, "highest-priority" is evaluated across all of them: eligible tasks are ordered by priority, then creation time (oldest first), then task ID, and the order in which the worker lists the queues **MUST NOT** affect the result. The number of queues in one claim request **MAY** be capped by configuration; a request above the cap is rejected with `400 Bad Request` (`invalid_argument`). Slot reservation and the task-state transition to `claimed` **MUST** occur in the same atomic operation (see §5.2). The system **MUST** support long-poll claiming: if no tasks are immediately available and a timeout is specified, the worker waits and retries when new work or released capacity is signalled. Signals are wake-up hints: in a multi-node deployment a task enqueued, resumed, or released on another node **MUST** become claimable by a waiting worker within a bounded, configurable poll interval, without requiring the Cluster gear.
+The system **MUST** support atomic task claiming: a worker requests a task from one or more queues, and the system atomically assigns the highest-priority eligible task, sets a lease expiry (`lease_until`), records `claimed_at`, increments the `attempt` counter, issues a new lease token and lease epoch (§5.6 Lease Fencing), reserves the required concurrency slots (§5.2), and returns the task. Two workers **MUST NOT** be able to claim the same task. When a request names several queues, "highest-priority" is evaluated across all of them: eligible tasks are ordered by priority, then creation time (oldest first), then task ID, and the order in which the worker lists the queues **MUST NOT** affect the result. The number of queues in one claim request **MAY** be capped by configuration; a request above the cap is rejected with `400 Bad Request` (`invalid_argument`). Slot reservation and the task-state transition to `claimed` **MUST** occur in the same atomic operation (see §5.2). The system **MUST** support long-poll claiming: if no tasks are immediately available and a timeout is specified, the worker waits and retries when new work or released capacity is signalled. The long-poll timeout **MUST** be capped by configuration (`claim_max_wait_secs`, default 50 seconds — below common 60-second proxy idle timeouts); a larger requested timeout is clamped to the cap, not rejected. Clients **SHOULD** use a timeout at or below the cap and re-issue the claim immediately on an empty response. The claim response **MUST** include `heartbeat_interval_secs` — the interval at which the worker is expected to heartbeat, equal to one third of the lease duration (rounded down, minimum 1 second) — so a single delayed heartbeat never expires the lease. Signals are wake-up hints: in a multi-node deployment a task enqueued, resumed, or released on another node **MUST** become claimable by a waiting worker within a bounded, configurable poll interval, without requiring the Cluster gear.
 
 The `attempt` counter is the single authoritative count of execution attempts and **MUST** be incremented in exactly one place — on a successful claim. Retry re-enqueue (§5.8) and lease-expiry requeue (below) **MUST NOT** increment `attempt` themselves; the increment happens when the requeued task is next claimed. A claim that picks up a task resumed from `waiting` (§5.4) continues the same attempt and **MUST NOT** increment `attempt`.
 
@@ -608,9 +615,9 @@ The assignment record **MUST** include: `assignee` (worker identity), `claimed_a
 
 - [ ] `p1` - **ID**: `cpt-cf-task-engine-fr-heartbeat`
 
-The system **MUST** accept heartbeat signals from workers, extend the lease, update `heartbeat_at`, and return a control response containing: cancel-requested flag and current task state. If the lease expires without a heartbeat, the task **MUST** be returned to the queue (if retries remain) or force-completed with a timeout result. A heartbeat carrying a stale lease token **MUST** be rejected as `LEASE_LOST` (§5.6 Lease Fencing) — this is the worker's signal to stop executing.
+The system **MUST** accept heartbeat signals from workers, extend the lease, update `heartbeat_at`, and return a control response containing: cancel-requested flag, current task state, and `heartbeat_interval_secs` (as on claim, §5.6 Task Assignment). Workers **MUST** heartbeat at least every `heartbeat_interval_secs`. The system **MUST** also accept a **batch heartbeat** renewing many leases held by one caller in a single request, with a per-lease result (renewed with its control response, or `LEASE_LOST`), so a worker running many tasks does not issue one request per task. If the lease expires without a heartbeat, the task **MUST** be returned to the queue (if the liveness-requeue budget remains, §5.8) or force-completed with a timeout result. A heartbeat carrying a stale lease token **MUST** be rejected as `LEASE_LOST` (§5.6 Lease Fencing) — this is the worker's signal to stop executing.
 
-**Lease-expiry requeue uses backoff**: When a lease expires and the task is returned to the queue, the system **MUST** apply the same backoff computation as an explicit worker-reported failure (§5.8) — it transitions the task to `scheduled` with a `run_after` derived from the retry policy and the current attempt number, rather than re-enqueueing immediately. This prevents a slow-but-alive worker from being re-assigned the same task in a tight retry storm and keeps the two failure paths (explicit failure vs lease expiry) consistent. A lease expiry also counts as one consecutive failure toward the worker-blacklist threshold (§5.6 Worker Blacklisting).
+**Lease-expiry requeue uses backoff**: When a lease expires and the task is returned to the queue, the system **MUST** apply the same backoff computation as an explicit worker-reported failure (§5.8) — it transitions the task to `scheduled` with a `run_after` derived from the retry policy (strategy and intervals) applied to the task's liveness-requeue count, rather than re-enqueueing immediately. This prevents a slow-but-alive worker from being re-assigned the same task in a tight retry storm and keeps the two failure paths (explicit failure vs lease expiry) consistent. A lease expiry also counts as one consecutive failure toward the worker-blacklist threshold (§5.6 Worker Blacklisting).
 
 - **Rationale**: Heartbeats provide worker liveness detection and a bidirectional control channel. Reusing the retry-policy backoff on lease expiry avoids a divergence where unhealthy workers thrash a task with no delay.
 - **Actors**: `cpt-cf-task-engine-actor-worker`
@@ -619,7 +626,7 @@ The system **MUST** accept heartbeat signals from workers, extend the lease, upd
 
 - [ ] `p3` - **ID**: `cpt-cf-task-engine-fr-worker-blacklist`
 
-The system **MUST** maintain a per-queue temporary worker blacklist keyed by consecutive failures. A worker is blacklisted for a queue once it accumulates a configurable number of **consecutive failures** on that queue (default: 10). Only failures attributable to the worker count: a "consecutive failure" **MUST** include an explicit failure reported with `fault=worker` (§5.1 Structured Input/Output) and an engine-observed liveness failure — lease expiry (missed heartbeat) or assignment timeout (§5.3) — each counting as **one** failure toward the same threshold, not an immediate blacklist. Failures with `fault=task` or `fault=dependency`, and execution timeouts, **MUST NOT** count and **MUST NOT** reset the counter, so a healthy worker is never blacklisted for receiving bad input or hitting a broken downstream service. The counter **MUST** reset to zero on the worker's next successful task completion on that queue. Once the threshold is reached, the worker **MUST** be blacklisted for that queue for a configurable duration (default: 60 minutes). Blacklisted workers **MUST** be skipped during task assignment for the affected queue. Blacklist thresholds and durations **MUST** be configurable per queue. Each blacklisting **MUST** be recorded in the event history via a `workerBlacklisted` event (§5.10).
+The system **MUST** maintain a per-queue temporary worker blacklist keyed by consecutive failures. A worker is blacklisted for a queue once it accumulates a configurable number of **consecutive failures** on that queue (default: 10). Only failures attributable to the worker count: a "consecutive failure" **MUST** include an explicit failure reported with `fault=worker` (§5.1 Structured Input/Output) and an engine-observed liveness failure — lease expiry (missed heartbeat) or assignment timeout (§5.3) — each counting as **one** failure toward the same threshold, not an immediate blacklist. **Liveness failures are coalesced per outage**: all lease expiries and assignment timeouts of the same worker on the same queue that are detected within one lease duration of the last *counted* liveness failure for that (worker, queue) **MUST** count as a single failure, because a worker holding many leases loses all of them to one connectivity loss — the threshold measures repeated incidents, not the number of tasks held. Explicit `fault=worker` failures are never coalesced. Failures with `fault=task` or `fault=dependency`, and execution timeouts, **MUST NOT** count and **MUST NOT** reset the counter, so a healthy worker is never blacklisted for receiving bad input or hitting a broken downstream service. The counter **MUST** reset to zero on the worker's next successful task completion on that queue. Once the threshold is reached, the worker **MUST** be blacklisted for that queue for a configurable duration (default: 60 minutes). Blacklisted workers **MUST** be skipped during task assignment for the affected queue. Blacklist thresholds and durations **MUST** be configurable per queue. Each blacklisting **MUST** be recorded in the event history via a `workerBlacklisted` event (§5.10).
 
 - **Rationale**: Blacklisting with testable thresholds prevents repeated assignment to failing workers while allowing recovery after the cooldown period. Treating a missed heartbeat as one failure (rather than an immediate blacklist) avoids ejecting workers on a single transient network blip. Counting only worker-attributed failures keeps worker health separate from task health: bad input or a failing downstream dependency says nothing about the worker.
 - **Actors**: `cpt-cf-task-engine-actor-worker`, `cpt-cf-task-engine-actor-platform-admin`
@@ -701,12 +708,13 @@ Consumers needing progress beyond what events deliver (e.g., percentage on `none
 
 - [ ] `p1` - **ID**: `cpt-cf-task-engine-fr-retry`
 
-The system **MUST** support configurable retry policies per task (or inherited from queue defaults): max retry count, backoff strategy (`fixed`, `linear`, `exponential`), base interval, maximum interval, jitter factor, and optional `non_retryable_codes`. On task failure, the system **MUST** classify the error as retryable or terminal: it is retryable only if the worker marks it `retryable` and its `code` is not in the policy's `non_retryable_codes`.
+The system **MUST** support configurable retry policies per task (or inherited from queue defaults): max retry count, max liveness-requeue count (`max_liveness_requeues`), backoff strategy (`fixed`, `linear`, `exponential`), base interval, maximum interval, jitter factor, and optional `non_retryable_codes`. On task failure, the system **MUST** classify the error as retryable or terminal: it is retryable only if the worker marks it `retryable` and its `code` is not in the policy's `non_retryable_codes`.
 
 **Retry lifecycle** (aligns with the state machine and `attempt` counting in §5.6):
 
-- A **retryable** failure with attempts remaining transitions the task `running → scheduled` with a `run_after` timestamp computed from the backoff strategy and the current attempt number. It **MUST NOT** transition to `failed`; `failed` is a terminal state and retryable failures never enter it. The `attempt` counter is **not** incremented here — it is incremented only when the requeued task is next claimed (§5.6).
-- A **terminal** failure, or a retryable failure that has exhausted its retry budget, ends the lifecycle via the single terminal routing rule: if the queue has a dead-letter queue configured the task transitions to `dead_lettered` (with `taskDeadLettered` published), otherwise it transitions to `failed`. This is the same rule applied to lifetime-timeout expiry (§5.3).
+- A **retryable** failure with `retry_count < max_retries` transitions the task `running → scheduled` (incrementing `retry_count`) with a `run_after` timestamp computed from the backoff strategy and the current `retry_count`. It **MUST NOT** transition to `failed`; `failed` is a terminal state and retryable failures never enter it. The `attempt` counter is **not** incremented here — it is incremented only when the requeued task is next claimed (§5.6).
+- **Two independent budgets**: `max_retries` bounds retries after **explicit retryable failures** reported by a worker (counted in the task's `retry_count`); `max_liveness_requeues` bounds requeues after **liveness failures** — lease expiry and assignment timeout (§5.3, §5.6) — counted in `liveness_requeues`. A liveness failure **MUST NOT** consume `max_retries`, and an explicit failure **MUST NOT** consume `max_liveness_requeues`, so losing a worker never burns the failure-retry budget of a healthy task. Each path computes its backoff from its own counter. `max_liveness_requeues = 0` means unlimited (bounded only by the lifetime timeout, if any); the queue default is 20. `attempt` keeps counting claims and is not used for either budget check.
+- A **terminal** failure, a retryable failure that has exhausted `max_retries`, or a liveness failure that has exhausted `max_liveness_requeues`, ends the lifecycle via the single terminal routing rule: if the queue has a dead-letter queue configured the task transitions to `dead_lettered` (with `taskDeadLettered` published), otherwise it transitions to `failed`. This is the same rule applied to lifetime-timeout expiry (§5.3).
 
 - **Rationale**: Structured retry with backoff is the industry standard for transient failure recovery. Keeping retryable failures on the `running → scheduled` path (never `failed`) and incrementing `attempt` in a single place (on claim) removes the double-count and illegal-terminal-transition ambiguities.
 - **Actors**: `cpt-cf-task-engine-actor-worker`
@@ -732,7 +740,7 @@ The system **MUST** support parent/child task relationships. A parent task **MAY
 
 **Single-domain constraint** (§5.19): a parent and all of its children **MUST** reside in the same task domain (database). If a child's GTS type would route it to a different domain than its parent, child creation **MUST** be rejected with `400 Bad Request` (`invalid_argument`). This keeps completion tracking and cancellation propagation within one database.
 
-**Interaction with forced cancellation** (§5.1): when a parent configured to wait for children is **force-cancelled**, the parent **MUST** transition to `cancelled` immediately (forced cancellation is unconditional, see §5.1), and the system **MUST** propagate cancellation to all in-flight children as part of the same operation so no orphaned children continue running. Children are cancelled asynchronously (best-effort per child) while the parent's terminal transition is not blocked on their completion.
+**Interaction with forced cancellation** (§5.1): when a parent configured to wait for children is **force-cancelled**, the parent **MUST** transition to `cancelled` immediately (forced cancellation is unconditional, see §5.1), and the system **MUST** propagate cancellation to all in-flight children as part of the same operation so no orphaned children continue running. The parent's terminal transition is not blocked on its children finishing, but child cancellation **MUST** be guaranteed: every non-terminal child **MUST** eventually be cancelled exactly once, durably across crashes and restarts (small fan-outs in the parent's transaction, larger ones continued by a durable background cascade).
 
 - **Rationale**: Parent/child hierarchies enable decomposition of complex work into independently executable sub-tasks. Constraining a hierarchy to one domain avoids cross-database tracking; propagating cancellation on forced parent cancel prevents orphaned children.
 - **Actors**: `cpt-cf-task-engine-actor-worker`
@@ -743,7 +751,7 @@ The system **MUST** support parent/child task relationships. A parent task **MAY
 
 The system **MUST** support predecessor/successor dependency declarations: a task specifies prerequisite tasks that must complete successfully before it becomes eligible for assignment. Dependencies **MUST** support `ALL` (all predecessors must succeed) and `ANY` (first predecessor to succeed unblocks) modes.
 
-**Predecessor failure**: a predecessor that ends in `failed`, `cancelled`, or `dead_lettered` counts as failed for dependency purposes (a later administrative re-enqueue of a dead-lettered predecessor does not revive successors). When a dependency set can no longer be satisfied — in `ALL` mode, any predecessor failed; in `ANY` mode, every predecessor failed — the successor **MUST** transition from `blocked` to `cancelled` with result code `dependencyFailed` in the same transaction as the predecessor's terminal transition. This cascades: the cancelled successor is in turn a failed predecessor for its own successors. A creation or dependency mutation that would make the set unsatisfiable at once (e.g., an `ALL` dependency on an already-failed task) **MUST** be rejected with `400 Bad Request` (`failed_precondition`).
+**Predecessor failure**: a predecessor that ends in `failed`, `cancelled`, or `dead_lettered` counts as failed for dependency purposes (a later administrative re-enqueue of a dead-lettered predecessor does not revive successors). When a dependency set can no longer be satisfied — in `ALL` mode, any predecessor failed; in `ANY` mode, every predecessor failed — the successor **MUST** transition from `blocked` to `cancelled` with result code `dependencyFailed` — in the same transaction as the predecessor's terminal transition for small fan-outs, and otherwise through the same guaranteed, durable cascade as child cancellation (§5.9 Parent/Child), so no transaction is unbounded and no successor is ever skipped. This cascades: the cancelled successor is in turn a failed predecessor for its own successors. A creation or dependency mutation that would make the set unsatisfiable at once (e.g., an `ALL` dependency on an already-failed task) **MUST** be rejected with `400 Bad Request` (`failed_precondition`).
 
 **Mutability and cycle validation**: Dependencies **MAY** be declared at task creation (see §5.1) and **MAY** be added or removed after creation via the dependency-management API (§5.13) while the task is still non-terminal and not yet running. Adding an unmet predecessor moves a `queued` or `scheduled` task to `blocked` (an admission against `tenant_max_deferred_tasks`, §5.2); removing the last unmet one unblocks it as in §5.1. The dependency graph **MUST** be validated to prevent cycles on **every** mutation — both at creation time and on every post-creation dependency change — not only at creation. A mutation that would introduce a cycle **MUST** be rejected with `400 Bad Request` (`invalid_argument`, reason `CYCLE_DETECTED`).
 
@@ -792,7 +800,7 @@ Which events are actually emitted **MUST** be configurable in the Task Engine co
 - A list of enabled event types (or `all` / `none` shorthand)
 - An optional list of state transitions that trigger events (e.g., only emit `taskCompleted` and `taskFailed` for lightweight system tasks, but emit all events for user-visible tasks)
 
-A `default` policy **MUST** apply to task types not matched by any specific pattern. If no configuration is provided, the default **MUST** be to emit all event types for all task types.
+A `default` policy **MUST** apply to task types not matched by any specific pattern. If no configuration is provided, the default **MUST** be the `lifecycle` preset: every event type except the high-frequency execution-path events `taskQueued`, `taskClaimed`, `taskStarted`, `taskCheckpointed`, and `taskProgressed`; operators opt into `all` explicitly. The local event log (§5.10 Immutable Event Log) always records everything regardless of this policy.
 
 - **Rationale**: Not all task types need the same event verbosity — high-volume system tasks may only need terminal-state events, while user-visible tasks benefit from full lifecycle visibility. Config-driven event policies avoid unnecessary event throughput and storage overhead.
 - **Actors**: `cpt-cf-task-engine-actor-platform-admin`
@@ -929,7 +937,7 @@ All mutating endpoints **MUST** use ToolKit `OperationBuilder`, and all error re
 
 - [ ] `p1` - **ID**: `cpt-cf-task-engine-fr-retention`
 
-The system **MUST** run scheduled cleanup performing batched deletion of completed/failed tasks, task entries, and event history older than retention thresholds. Retention **MUST** be configurable at three levels with an **explicit precedence order** (highest precedence first):
+The system **MUST** run scheduled cleanup removing terminal tasks, their task entries, and their event history once their retention has elapsed. Retention **MUST** be measured from the moment a task reached its terminal state (not from its creation), and non-terminal tasks **MUST NOT** be removed by retention — they are bounded only by their lifetime timeout and by the hard retention threshold below. Removal of one tenant's or type's data **MUST NOT** depend on the longest policy of another tenant or type (e.g., one tenant's legal hold must not prevent cleanup of everyone else's data). Retention **MUST** be configurable at three levels with an **explicit precedence order** (highest precedence first):
 
 1. **Per tenant** — tenant-specific overrides for compliance requirements. A matching tenant policy takes precedence over any task-type policy and the global default, because compliance/legal-hold obligations are tenant-scoped and must not be overridden by a type rule.
 2. **Per GTS task type** — configurable in the Task Engine config file using GTS type patterns with wildcard support (e.g., `gts.cf.core.tasks.task.v1~cf.vendor.*` matches all vendor task types). Each pattern specifies its own retention duration. When multiple type patterns match, the **most specific** (longest non-wildcard prefix) pattern wins.
@@ -1228,7 +1236,7 @@ Although the Task Engine treats task/entry payloads as opaque and does not proce
 
 ## 8. Use Cases
 
-#### Create, Claim, and Execute a Task
+### Create, Claim, and Execute a Task
 
 - [ ] `p1` - **ID**: `cpt-cf-task-engine-usecase-create-execute`
 
@@ -1254,7 +1262,7 @@ Although the Task Engine treats task/entry payloads as opaque and does not proce
 - **Cancellation requested**: Worker detects via heartbeat, transitions task to `cancelled` with `cancelled` result code
 - **Max retries exhausted**: Task moved to dead-letter queue
 
-#### Task Waits for External Event
+### Task Waits for External Event
 
 - [ ] `p2` - **ID**: `cpt-cf-task-engine-usecase-event-wait`
 
@@ -1272,7 +1280,7 @@ Although the Task Engine treats task/entry payloads as opaque and does not proce
 
 **Postconditions**: Task resumed with event data; wait resolved in event history.
 
-#### Retry with Backoff After Transient Failure
+### Retry with Backoff After Transient Failure
 
 - [ ] `p1` - **ID**: `cpt-cf-task-engine-usecase-retry`
 
@@ -1309,7 +1317,7 @@ Although the Task Engine treats task/entry payloads as opaque and does not proce
 - [ ] Ten consecutive `fault=task` failures do not blacklist a worker; ten consecutive lease expiries or `fault=worker` failures do
 - [ ] Event wait condition evaluates match expressions against incoming events
 - [ ] Concurrency limits are enforced atomically on claim across every dimension — queue global, queue per-tenant, type global, and type per-tenant — with no more than the configured N tasks executing per dimension, verified under concurrent claims
-- [ ] Queue depth is enforced atomically at admission on every dimension (queue global, per-tenant, engine-wide) under concurrent creates: no more than the configured N `queued` tasks are ever admitted (and no more than `tenant_max_deferred_tasks` deferred tasks per tenant); a full dimension returns `429` (`QUEUE_DEPTH_LIMIT`) with `Retry-After` and discloses no other tenant's usage; idempotent replays and retry/requeue transitions are never refused for depth
+- [ ] Queue depth is enforced atomically at admission on the per-queue and per-tenant dimensions under concurrent creates (the engine-wide `domain_global` ceiling within one sampling interval): no more than the configured N `queued` tasks are ever admitted (and no more than `tenant_max_deferred_tasks` deferred tasks per tenant); a full dimension returns `429` (`QUEUE_DEPTH_LIMIT`) with `Retry-After` and discloses no other tenant's usage; idempotent replays and retry/requeue transitions are never refused for depth
 - [ ] A task type with a derived dedup identity accepts creation with or without an `Idempotency-Key` (a supplied key has no effect on identity), answers a duplicate identity with `409`, and gives two callers with different `authz_scope` (or different subjects under `subject` scope) independent tasks
 - [ ] Under supersession: a newer order value cancels the in-flight task (result `superseded`, `supersededBy` recorded, capacity released) in the same transaction as the new insert; an equal value is a replay; a lower value is rejected `STALE_ORDER`, including after the newer task completed; a caller lacking `cancel` on the superseded task is rejected `403` with no state change
 - [ ] Multi-tenant isolation: tenant A cannot see or modify tenant B's tasks
@@ -1330,6 +1338,9 @@ Although the Task Engine treats task/entry payloads as opaque and does not proce
 - [ ] Search filtered by resource reference returns exactly the tasks carrying that reference within the caller's tenant scope
 - [ ] SLA breach detection publishes `slaBreached` event when deadline passes (task continues executing)
 - [ ] Lifetime timeout and retry-exhaustion converge on one terminal rule (dead-lettered if DLQ configured, else failed)
+- [ ] Lease expiries and assignment timeouts consume only `max_liveness_requeues`: a task on a queue with `max_retries = 3` survives more than 3 lease expiries and is still retried 3 times after explicit retryable failures
+- [ ] A worker that loses N leases on one queue in a single outage (all detected within one lease duration) records exactly one consecutive failure toward the blacklist threshold
+- [ ] A claim requesting a long-poll timeout above `claim_max_wait_secs` is clamped to the cap; claim and heartbeat responses carry `heartbeat_interval_secs` = one third of the lease duration (min 1)
 - [ ] Graceful shutdown completes within 30 seconds
 - [ ] After a lease expires and the task is re-claimed, the former worker's complete, checkpoint, progress, and heartbeat calls are rejected with `409` (`LEASE_LOST`); the new holder's result is the one persisted
 - [ ] After reassignment, the previous assignee's heartbeat is rejected with `409` (`LEASE_LOST`) and the lease epoch has increased
@@ -1394,5 +1405,4 @@ Although the Task Engine treats task/entry payloads as opaque and does not proce
 
 - **Design**: [DESIGN.md](./DESIGN.md)
 - **ADRs**: [ADR/](./ADR/)
-- **Features**: [features/](./features/)
 

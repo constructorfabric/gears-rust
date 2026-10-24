@@ -1,0 +1,8 @@
+// JSONC: // comments annotate field semantics for readers. Strip comments
+// before feeding this file to a strict JSON / JSON-Schema consumer.
+{
+  "id": "gts.cf.toolkit.authz.permission.v1~cf.task_engine._.tasks_admin.v1",
+  "resource_type": "gts.cf.core.tasks.task.v1~",
+  "action": "admin",
+  "display_name": "Administer the Task Engine (DLQ management, runtime config, re-enqueue, bulk operations)"
+}
