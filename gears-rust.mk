@@ -714,8 +714,8 @@ coverage-durable-execution-pg:
 ## compiles once.
 test-fips: install-tools
 	$(call print_target_banner)
-	cargo nextest run -p cf-gears-toolkit -p cf-gears-toolkit-http -p cf-gears-oagw -p cf-gears-clickhouse-usage-collector-plugin \
-		--features cf-gears-toolkit/bootstrap,cf-gears-toolkit/fips,cf-gears-toolkit-http/fips,cf-gears-oagw/fips
+	cargo nextest run -p cf-gears-toolkit -p cf-gears-toolkit-http -p cf-gears-toolkit-http-proxy -p cf-gears-oagw -p cf-gears-clickhouse-usage-collector-plugin \
+		--features cf-gears-toolkit/bootstrap,cf-gears-toolkit/fips,cf-gears-toolkit-http/fips,cf-gears-toolkit-http-proxy/fips,cf-gears-oagw/fips
 
 GM_PG_TAG := $(shell sed -n 's/^pub const POSTGRES_TAG: &str = "\(.*\)";/\1/p' libs/test-containers/src/lib.rs)
 GM_MARIADB_TAG := $(shell sed -n 's/^pub const MARIADB_TAG: &str = "\(.*\)";/\1/p' libs/test-containers/src/lib.rs)

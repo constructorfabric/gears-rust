@@ -105,6 +105,7 @@ jobs:
             fips:
               - 'libs/toolkit/**'
               - 'libs/toolkit-http/**'
+              - 'libs/toolkit-http-proxy/**'
               - 'libs/rustls-*/**'
             magika:
               - 'gears/file-parser/**'

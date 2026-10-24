@@ -157,8 +157,7 @@ harness = false
 # `benches/partition_cache.rs` - the two hot paths of the per-partition cache
 # were each once wrong in a way only a curve over a swept parameter reveals.
 criterion = { workspace = true, features = ["html_reports"] }
-# `test-util` backs the paused-clock session tests; it used to arrive
-# transitively through Pingora.
+# `test-util` backs the paused-clock session tests.
 tokio = { workspace = true, features = ["macros", "rt", "process", "test-util"] }
 tower = { workspace = true }
 http = { workspace = true }

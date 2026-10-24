@@ -56,7 +56,7 @@ static INIT_RESULT: OnceLock<Result<(), CryptoProviderError>> = OnceLock::new();
 ///   different providers.
 /// - **Standard mode** (no `fips` feature): installs the `aws-lc-rs` provider
 ///   explicitly. This is required because both `ring` and `aws-lc-rs` are
-///   compiled into the binary (ring via `pingora-rustls`), and rustls
+///   compiled into the binary (ring via `sqlx-core`'s rustls features), and rustls
 ///   0.23 panics when it cannot auto-detect a single provider. Conflicts here
 ///   are non-fatal: if another provider was installed first, it stays active,
 ///   the conflict is logged at `warn!`, and `Ok(())` is returned.
