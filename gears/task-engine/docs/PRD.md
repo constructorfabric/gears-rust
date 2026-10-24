@@ -683,10 +683,10 @@ The system **MUST** maintain a per-queue temporary worker blacklist keyed by con
 
 - [ ] `p3` - **ID**: `cpt-cf-task-engine-fr-reassignment`
 
-The system **MUST** support explicit task reassignment from one worker (or worker pool) to another without losing history. The reassignment **MUST** be recorded in the event history via a `taskReassigned` event (§5.10) carrying the previous and new assignee. The request names the new assignee as a worker identity (`subject_id`, `worker_id`, §5.6 Atomic Claim). Reassignment **MUST** issue a new lease token and lease epoch, fencing off the previous assignee (§5.6 Lease Fencing).
+The system **MUST** support explicit task reassignment from one worker (or worker pool) to another without losing history. The reassignment **MUST** be recorded in the event history via a `taskReassigned` event (§5.10) carrying the previous and new assignee. The request names the new assignee as a worker identity (`subject_id`, `worker_id`, §5.6 Atomic Claim). Reassignment **MUST** issue a new lease token and lease epoch, fencing off the previous assignee (§5.6 Lease Fencing). Reassignment **MUST** require the `admin` action (§5.11): the caller receives the new lease, so it can take over a running task.
 
 - **Rationale**: Reassignment supports escalation, shift handoff, and skill-based routing without task cancellation and re-creation.
-- **Actors**: `cpt-cf-task-engine-actor-api-consumer`, `cpt-cf-task-engine-actor-platform-admin`
+- **Actors**: `cpt-cf-task-engine-actor-platform-admin`
 
 #### Lease Fencing
 
@@ -883,6 +883,8 @@ Every protected request **MUST** be authenticated via the API Gateway AuthN midd
 All authorization decisions **MUST** be obtained by calling the `PolicyEnforcer` from `authz-resolver-sdk`, which delegates to the AuthZ Resolver gear (PDP). The PDP returns access decisions with structured access constraints (predicates). The Task Engine **MUST** compile these constraints into an `AccessScope` and pass it to `SecureConn` for SQL-level enforcement. Fail-closed: denied decisions, unreachable PDP, and missing constraints **MUST** result in 403 Forbidden. PDP internals **MUST NOT** be exposed to clients.
 
 Permissions **MUST** be modeled as GTS Permission types (base type `gts.cf.toolkit.authz.permission.v1~`) with actions scoped to the `task_engine` resource namespace. Core actions include: `create`, `read`, `update`, `delete`, `claim`, `cancel`, `admin`.
+
+**Least privilege for workers**: every lease-fenced worker call — claim, start, heartbeat, progress, checkpoint, complete, release, worker wait-condition set and park, and worker-created entries — **MUST** require only the `claim` action. A worker identity therefore needs `claim` (and `read` for its own reads), never `update`. `update` covers changes an API consumer makes to a task it does not hold: tags, dependencies, input-wait resolution, and an API-consumer wait set. Reassignment **MUST** require `admin`, because it hands a live lease to the caller (§5.6 Reassignment).
 
 - **Rationale**: The PDP/PEP model ensures authorization is policy-driven, externalized, and enforceable at the query level via `SecureConn` WHERE clauses. This aligns with the platform authorization architecture (per [docs/arch/authorization/DESIGN.md](../../../docs/arch/authorization/DESIGN.md) and [docs/toolkit_unified_system/06_authn_authz_secure_orm.md](../../../docs/toolkit_unified_system/06_authn_authz_secure_orm.md)).
 - **Actors**: All actors

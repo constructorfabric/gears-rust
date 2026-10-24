@@ -874,15 +874,15 @@ Permission model (GTS Permission types, `task_engine` resource namespace):
 
 | Action | Description | Required for |
 |---|---|---|
-| `create` | Create tasks, task entries | Task creation, entry creation |
+| `create` | Create tasks; create entries as an API consumer | Task creation, API-consumer entry creation |
 | `read` | Read tasks, entries, events, queues | All GET endpoints |
-| `update` | Update tasks (progress, checkpoint), manage dependencies, reassignment | Progress, checkpoint, dependency add/remove, reassignment, wait condition resolve (provide input) |
+| `update` | Change a task the caller does not hold (no lease token) | Tags, dependency add/remove, wait condition resolve (provide input), API-consumer wait set |
 | `delete` | Reserved for administrative hard-deletion. Task/entry rows are removed **only** by engine-internal retention (§3.2 RetentionService), never by a client verb, so no client endpoint currently maps to `delete`; it is retained in the action set for forward compatibility and PDP policy authoring. | — (no client endpoint) |
-| `claim` | Claim tasks from queues and drive the execution path | Worker claim, start, heartbeat, complete |
+| `claim` | Claim tasks and drive the execution path (every lease-fenced call) | Worker claim, start, heartbeat (single and batch), progress, checkpoint, complete, release, worker wait set and park, worker entry creation |
 | `cancel` | Cancel tasks (single and bulk) | `/tasks/{id}/cancel`, `/tasks/bulk/cancel` |
-| `admin` | Administrative operations | DLQ management, runtime config, re-enqueue, bulk reprioritize/retry/move |
+| `admin` | Administrative operations | DLQ management, runtime config, re-enqueue, reassignment, bulk reprioritize/retry/move |
 
-> **Worker action set**: a worker identity needs both `claim` and `update` — the execution lifecycle (claim/start/heartbeat/complete) is gated by `claim`, while progress and checkpoint writes are gated by `update`. This is called out explicitly so PDP policies for worker principals grant both.
+> **Worker action set** (least privilege, PRD §5.11): a worker identity needs only `claim` (plus `read` for its own reads). Every worker write carries a `lease_token`, so the lease already proves the worker holds the task; `claim` is the only action those writes need. A worker never needs `update`, so it cannot change tags or dependencies, resolve input waits, or reassign tasks. Reassignment is `admin`, because it returns a live lease to the caller.
 
 Unauthenticated endpoints (`.anonymous()`, anonymous `SecurityContext`; `.anonymous()` auto-satisfies the license requirement). ToolKit `OperationBuilder` splits *auth* (`.anonymous()`) from *visibility* (`.exposed()`), and the legacy single-axis `.public()` is deprecated — so these routes use the explicit two-axis form:
 - `GET /health` — liveness probe — `.anonymous().exposed()` (edge-reachable)
@@ -901,12 +901,12 @@ All authenticated endpoints below use `.authenticated()` + `.require_license_fea
 | `POST` | `/tasks/{id}/start` | Start claimed task | `claim` |
 | `POST` | `/tasks/{id}/heartbeat` | Heartbeat / lease renewal | `claim` |
 | `POST` | `/tasks/heartbeat` | **Batch heartbeat**: renew up to `heartbeat_batch_max` (default 500) leases held by the caller in one request — body `[{task_id, lease_token}]`, one fenced multi-row `UPDATE` per domain; per-task result (`ok` + control response, or `LEASE_LOST`) | `claim` |
-| `POST` | `/tasks/{id}/progress` | Update progress | `update` |
-| `POST` | `/tasks/{id}/checkpoint` | Save checkpoint | `update` |
+| `POST` | `/tasks/{id}/progress` | Update progress | `claim` |
+| `POST` | `/tasks/{id}/checkpoint` | Save checkpoint | `claim` |
 | `POST` | `/tasks/{id}/complete` | Complete with result | `claim` |
 | `POST` | `/tasks/{id}/release` | **Voluntary release** (PRD §5.6): give the task back without failing it. Body: `lease_token`, optional `delay_secs`, optional `checkpoint`. No retry-budget or blacklist effect | `claim` |
 | `POST` | `/tasks/{id}/cancel` | Cancel task | `cancel` |
-| `POST` | `/tasks/{id}/reassign` | Hand a `claimed`/`running` task to another assignee: guarded update issues a fresh `lease_token` and `lease_epoch + 1` (fencing the previous holder) and returns the new lease, which the caller hands to the new assignee; state, `attempt`, slots and deadlines are unchanged | `update` |
+| `POST` | `/tasks/{id}/reassign` | Hand a `claimed`/`running` task to another assignee: guarded update issues a fresh `lease_token` and `lease_epoch + 1` (fencing the previous holder) and returns the new lease, which the caller hands to the new assignee; state, `attempt`, slots and deadlines are unchanged | `admin` |
 | `PATCH` | `/tasks/{id}/tags` | Add, change, or remove tags on an existing task. Takes `set` (tags to add or replace) and `remove` (tag keys to delete). Fails if the same key appears in both `set` and `remove`. Any key not listed is left unchanged. Returns the updated task | `update` |
 | `POST` | `/tasks/{id}/dependencies` | Add predecessors (cycle and domain re-validation, §4.6) | `update` |
 | `DELETE` | `/tasks/{id}/dependencies/{predecessor_id}` | Remove a predecessor | `update` |
@@ -919,7 +919,7 @@ All authenticated endpoints below use `.authenticated()` + `.require_license_fea
 
 | Method | Path | Description | Auth Action |
 |---|---|---|---|
-| `POST` | `/tasks/{id}/entries` | Create task entry | `create` |
+| `POST` | `/tasks/{id}/entries` | Create task entry | `claim` (worker, with `lease_token`) or `create` (API consumer, no token) |
 | `GET` | `/tasks/{id}/entries` | List task entries | `read` |
 | `GET` | `/tasks/{id}/entries/{entry_id}` | Get entry by ID | `read` |
 
