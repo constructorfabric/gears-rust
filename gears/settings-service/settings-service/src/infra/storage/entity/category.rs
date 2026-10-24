@@ -1,4 +1,3 @@
-// Created: 2026-08-13 by Virtuozzo International GmbH
 //! The `categories` table.
 
 use sea_orm::entity::prelude::*;

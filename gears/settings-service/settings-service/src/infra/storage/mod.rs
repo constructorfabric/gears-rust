@@ -1,4 +1,3 @@
-// Created: 2026-08-12 by Virtuozzo International GmbH
 //! Persistence.
 //!
 //! Holds the migration harness today. Entities and repositories arrive with the

@@ -1,4 +1,3 @@
-// Created: 2026-10-08 by Virtuozzo International GmbH
 //! One page and the size of the set it was cut from, read under one predicate.
 //!
 //! Every listing of this gear answers with a `total_count` beside its

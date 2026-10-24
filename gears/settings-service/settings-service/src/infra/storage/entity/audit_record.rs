@@ -1,4 +1,3 @@
-// Created: 2026-09-07 by Virtuozzo International GmbH
 //! `audit_records`: the gear-local audit store. Append-only by contract — no
 //! code path updates a row, and the only delete is retention pruning.
 
@@ -32,6 +31,11 @@ pub struct Model {
     pub actor: String,
     /// Whether the actor identity is `public` or `pii`, as the wire string of `ActorClassification`.
     pub actor_classification: String,
+    /// The tenant the actor acted from, set once at insert; `NULL` for a
+    /// machine act with no security context and on a record written before
+    /// the column existed.
+    #[sea_orm(nullable)]
+    pub actor_tenant_id: Option<Uuid>,
     /// The value before the operation, if any.
     #[sea_orm(nullable)]
     pub pre_value: Option<Json>,

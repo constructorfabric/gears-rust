@@ -1,4 +1,3 @@
-// Created: 2026-09-17 by Virtuozzo International GmbH
 //! The search queries, in the dialect of the database in use.
 //!
 //! Two dialects, one shape. On `PostgreSQL` every predicate is `ILIKE` over
@@ -26,7 +25,7 @@ use uuid::Uuid;
 
 use crate::domain::category::Category;
 use crate::domain::category::visibility::DomainVisibility;
-use crate::domain::declaration::Declaration;
+use crate::domain::declaration::{Declaration, DeclarationStatus};
 use crate::domain::error::DomainError;
 use crate::domain::odata::Listing;
 use crate::domain::search::{Corpus, Needle, SearchRepository, SearchRequest};
@@ -131,6 +130,12 @@ impl SearchRepo {
         }
     }
 
+    /// Bind to a dialect already decided.
+    #[must_use]
+    pub const fn with_dialect(dialect: Dialect) -> Self {
+        Self { dialect }
+    }
+
     /// `column_expr <op> <param> ESCAPE '\'` as a custom expression, the
     /// pattern bound as a parameter; `ESCAPE` names the backslash
     /// `like_escape` used, which `SQLite` has no default for.
@@ -165,6 +170,63 @@ impl SearchRepo {
             .add(setting_value::Column::TenantId.is_in(tenant_ids.iter().copied()))
             .add(self.contains(&self.dialect.text_of("setting_values.value"), pattern))
     }
+
+    /// The declaration-text half of a match: `key`, `display_name`,
+    /// `description`, the name of the category (within the domains the caller
+    /// may see), or the Schema Default within the corpus and not JSON `null`.
+    ///
+    /// Stated once for the search's page query and the browse narrowing's
+    /// read over a candidate batch, so the two cannot drift apart.
+    pub(crate) fn declaration_text_matches(
+        self,
+        needle: &Needle,
+        corpus: Corpus,
+        visibility: &DomainVisibility,
+    ) -> Condition {
+        let pattern = needle.like_pattern();
+
+        // Categories whose name matches. Domain visibility applies to them as
+        // it applies to a category listing.
+        let mut categories = CategoryEntity::find()
+            .select_only()
+            .column(category::Column::Id)
+            .filter(self.contains("categories.name", &pattern));
+        if let DomainVisibility::Restricted(domains) = visibility {
+            categories = categories.filter(
+                category::Column::DomainAffinity
+                    .is_null()
+                    .or(category::Column::DomainAffinity.is_in(domains.clone())),
+            );
+        }
+
+        // @cpt-begin:cpt-cf-settings-service-algo-search-discoverability-corpus:p2:inst-sd-corpus-3
+        // @cpt-begin:cpt-cf-settings-service-algo-search-discoverability-corpus:p2:inst-sd-corpus-4
+        // The Schema Default, within the corpus and not JSON null: the column
+        // is NOT NULL, so a setting with no meaningful default holds `null`,
+        // whose text projection is the word.
+        let default_matches = Condition::all()
+            .add(
+                declaration::Column::DataClassification
+                    .is_in(corpus.classifications().iter().copied()),
+            )
+            .add(Expr::cust(
+                self.dialect
+                    .not_json_null("setting_declarations.default_value"),
+            ))
+            .add(self.contains(
+                &self.dialect.text_of("setting_declarations.default_value"),
+                &pattern,
+            ));
+        // @cpt-end:cpt-cf-settings-service-algo-search-discoverability-corpus:p2:inst-sd-corpus-4
+        // @cpt-end:cpt-cf-settings-service-algo-search-discoverability-corpus:p2:inst-sd-corpus-3
+
+        Condition::any()
+            .add(self.contains("setting_declarations.key", &pattern))
+            .add(self.contains("setting_declarations.display_name", &pattern))
+            .add(self.contains("setting_declarations.description", &pattern))
+            .add(declaration::Column::CategoryId.in_subquery(categories.into_query()))
+            .add(default_matches)
+    }
 }
 
 fn db_error(err: impl std::fmt::Display) -> DomainError {
@@ -184,20 +246,6 @@ impl SearchRepository for SearchRepo {
         // @cpt-begin:cpt-cf-settings-service-flow-search-discoverability-search:p2:inst-sd-search-7
         let pattern = request.needle.like_pattern();
 
-        // Categories whose name matches. Domain visibility applies to them as
-        // it applies to a category listing.
-        let mut categories = CategoryEntity::find()
-            .select_only()
-            .column(category::Column::Id)
-            .filter(self.contains("categories.name", &pattern));
-        if let DomainVisibility::Restricted(domains) = request.visibility {
-            categories = categories.filter(
-                category::Column::DomainAffinity
-                    .is_null()
-                    .or(category::Column::DomainAffinity.is_in(domains.clone())),
-            );
-        }
-
         // @cpt-begin:cpt-cf-settings-service-algo-search-discoverability-corpus:p2:inst-sd-corpus-1
         // @cpt-begin:cpt-cf-settings-service-algo-search-discoverability-corpus:p2:inst-sd-corpus-2
         // Overrides that match, as the declarations they belong to.
@@ -208,40 +256,15 @@ impl SearchRepository for SearchRepo {
         // @cpt-end:cpt-cf-settings-service-algo-search-discoverability-corpus:p2:inst-sd-corpus-2
         // @cpt-end:cpt-cf-settings-service-algo-search-discoverability-corpus:p2:inst-sd-corpus-1
 
-        // @cpt-begin:cpt-cf-settings-service-algo-search-discoverability-corpus:p2:inst-sd-corpus-3
-        // @cpt-begin:cpt-cf-settings-service-algo-search-discoverability-corpus:p2:inst-sd-corpus-4
-        // The Schema Default, within the corpus and not JSON null: the column
-        // is NOT NULL, so a setting with no meaningful default holds `null`,
-        // whose text projection is the word.
-        let default_matches = Condition::all()
-            .add(
-                declaration::Column::DataClassification
-                    .is_in(request.corpus.classifications().iter().copied()),
-            )
-            .add(Expr::cust(
-                self.dialect
-                    .not_json_null("setting_declarations.default_value"),
-            ))
-            .add(self.contains(
-                &self.dialect.text_of("setting_declarations.default_value"),
-                &pattern,
-            ));
-        // @cpt-end:cpt-cf-settings-service-algo-search-discoverability-corpus:p2:inst-sd-corpus-4
-        // @cpt-end:cpt-cf-settings-service-algo-search-discoverability-corpus:p2:inst-sd-corpus-3
-
         let matched = Condition::any()
-            .add(self.contains("setting_declarations.key", &pattern))
-            .add(self.contains("setting_declarations.display_name", &pattern))
-            .add(self.contains("setting_declarations.description", &pattern))
-            .add(declaration::Column::CategoryId.in_subquery(categories.into_query()))
-            .add(default_matches)
+            .add(self.declaration_text_matches(request.needle, request.corpus, request.visibility))
             .add(declaration::Column::Id.in_subquery(overrides.into_query()));
 
         let mut base = declaration_repo::exclude_hidden_for(
             declaration_repo::apply_visibility(DeclarationEntity::find(), request.visibility),
             request.hidden_for,
         )
-        .filter(declaration::Column::Status.eq("active"))
+        .filter(declaration::Column::Status.eq(DeclarationStatus::Active.as_str()))
         .filter(matched);
         // `needs_review eq true`, in the query: only settings whose own
         // override at the target is flagged for review — the same narrowing the

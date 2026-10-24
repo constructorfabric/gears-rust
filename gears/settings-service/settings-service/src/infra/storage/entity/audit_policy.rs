@@ -1,4 +1,3 @@
-// Created: 2026-09-25 by Virtuozzo International GmbH
 //! The `settings_audit_policy` table.
 
 use sea_orm::entity::prelude::*;

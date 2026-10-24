@@ -1,4 +1,3 @@
-// Created: 2026-08-12 by Virtuozzo International GmbH
 //! Tests for the gear scaffold's startup contract.
 //!
 //! `Gear::init` needs a live `GearCtx` (database capability, config provider),
@@ -644,7 +643,7 @@ async fn a_retention_pass_prunes_what_is_past_its_horizon_and_nothing_younger() 
     // The pass the lifecycle runs once a day: records past the configured
     // default leave, a fresh record stays. `now` is passed in, so the test
     // moves the clock instead of waiting a year.
-    use crate::audit::{AuditOperation, AuditRecord, AuditSink as _};
+    use crate::audit::{ActorTenant, AuditOperation, AuditRecord, AuditSink as _};
     let db = crate::test_support::sqlite_provider().await;
     let tenant = uuid::Uuid::new_v4();
     {
@@ -653,7 +652,14 @@ async fn a_retention_pass_prunes_what_is_past_its_horizon_and_nothing_younger() 
             .append(
                 &conn,
                 &toolkit_security::AccessScope::allow_all(),
-                AuditRecord::new("k", Some(tenant), "admin", AuditOperation::Change, "req"),
+                AuditRecord::new(
+                    "k",
+                    Some(tenant),
+                    "admin",
+                    ActorTenant::machine(),
+                    AuditOperation::Change,
+                    "req",
+                ),
             )
             .await
             .expect("append");
@@ -689,7 +695,7 @@ async fn a_retention_pass_prunes_what_is_past_its_horizon_and_nothing_younger() 
 
 #[tokio::test]
 async fn a_retention_pass_works_in_batches_up_to_its_cap_and_stops_when_cancelled() {
-    use crate::audit::{AuditOperation, AuditRecord, AuditSink as _};
+    use crate::audit::{ActorTenant, AuditOperation, AuditRecord, AuditSink as _};
     let db = crate::test_support::sqlite_provider().await;
     {
         let conn = db.conn().expect("connection");
@@ -698,7 +704,14 @@ async fn a_retention_pass_works_in_batches_up_to_its_cap_and_stops_when_cancelle
                 .append(
                     &conn,
                     &toolkit_security::AccessScope::allow_all(),
-                    AuditRecord::new("k", None, "admin", AuditOperation::Change, format!("r{i}")),
+                    AuditRecord::new(
+                        "k",
+                        None,
+                        "admin",
+                        ActorTenant::machine(),
+                        AuditOperation::Change,
+                        format!("r{i}"),
+                    ),
                 )
                 .await
                 .expect("append");
@@ -734,7 +747,14 @@ async fn a_retention_pass_works_in_batches_up_to_its_cap_and_stops_when_cancelle
             .append(
                 &conn,
                 &toolkit_security::AccessScope::allow_all(),
-                AuditRecord::new("k", None, "admin", AuditOperation::Change, "late"),
+                AuditRecord::new(
+                    "k",
+                    None,
+                    "admin",
+                    ActorTenant::machine(),
+                    AuditOperation::Change,
+                    "late",
+                ),
             )
             .await
             .expect("append");

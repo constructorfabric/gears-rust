@@ -1,4 +1,3 @@
-// Created: 2026-09-06 by Virtuozzo International GmbH
 //! Tests for the starter value-type catalogue.
 
 use std::collections::HashSet;

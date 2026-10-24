@@ -1,4 +1,3 @@
-// Created: 2026-08-12 by Virtuozzo International GmbH
 // @cpt-dod:cpt-cf-settings-service-dod-gear-foundation-error-taxonomy:p1
 //! The reader degradation contract, as a typed projection over `CanonicalError`.
 //!

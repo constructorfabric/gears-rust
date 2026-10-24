@@ -1,4 +1,3 @@
-// Created: 2026-09-07 by Virtuozzo International GmbH
 //! The repository over an in-memory database, through the resolution harness.
 
 use serde_json::json;
@@ -17,6 +16,7 @@ fn draft(declaration: Uuid, tenant: Uuid, access: TenantAccess) -> RestrictionDr
         tenant_id: tenant,
         access,
         set_by: "root-admin".to_owned(),
+        set_by_tenant: None,
     }
 }
 

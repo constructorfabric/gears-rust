@@ -1,4 +1,3 @@
-// Created: 2026-10-08 by Virtuozzo International GmbH
 //! The envelope every listing of this gear answers with.
 //!
 //! The platform's shared page carries `items` and a `page_info` of cursors

@@ -1,4 +1,3 @@
-// Created: 2026-09-07 by Virtuozzo International GmbH
 // @cpt-dod:cpt-cf-settings-service-dod-value-writes-operations:p1
 //! Handlers of the write surface.
 
@@ -19,8 +18,8 @@ use uuid::Uuid;
 
 use crate::api::authz::{self, resource};
 use crate::api::rest::if_match;
-use crate::api::rest::setting_dto::render;
-use crate::api::rest::setting_handlers::TenantParam;
+use crate::api::rest::setting_dto::{Reader, render};
+use crate::api::rest::setting_handlers::{TenantParam, target_chain};
 use crate::api::rest::value_dto::{
     BatchChangeRequest, BatchRequest, BatchResultDto, CloneRequest, FallbackResultDto,
     ImpactRequest, SetValueRequest, StageSecretRequest, ValidateRequest, render_batch_item,
@@ -227,9 +226,21 @@ async fn fall_back(
     let target = crate::domain::resolution::ScopeTarget::parse(&committed.scope)?;
     let effective = writes.effective_after(&key, target).await?;
     let pii = may_read_pii(enforcer, ctx).await;
+    // @cpt-begin:cpt-cf-settings-service-flow-value-writes-revert:p1:inst-vw-rev-6
+    // @cpt-begin:cpt-cf-settings-service-flow-value-writes-remove:p1:inst-vw-rm-5
+    // Rendered for the reader, as the single read renders it: what lies above
+    // the caller's tenant collapses and each setter is shown only where it
+    // belongs.
+    let reader = Reader::new(
+        ctx.subject_tenant_id(),
+        writes.writer().resolver().root_tenant().await?,
+    );
+    let chain = target_chain(writes.writer().resolver(), reader, effective.tenant_id).await?;
+    // @cpt-end:cpt-cf-settings-service-flow-value-writes-remove:p1:inst-vw-rm-5
+    // @cpt-end:cpt-cf-settings-service-flow-value-writes-revert:p1:inst-vw-rev-6
     Ok(Json(FallbackResultDto {
         change: render_committed(&committed, pii),
-        effective: render(&effective, pii),
+        effective: render(&effective, pii, reader, &chain),
     })
     .into_response())
     // @cpt-end:cpt-cf-settings-service-flow-value-writes-remove:p1:inst-vw-rm-4
@@ -473,7 +484,21 @@ pub async fn validate_value(
         .await?;
     // @cpt-begin:cpt-cf-settings-service-flow-value-writes-validate:p1:inst-vw-val-8
     let pii = may_read_pii(&enforcer, &ctx).await;
-    Ok(Json(render_validation(&report, pii)).into_response())
+    // @cpt-begin:cpt-cf-settings-service-flow-value-writes-validate:p1:inst-vw-val-9
+    // The embedded effective value is rendered for the reader, as the single
+    // read renders it.
+    let reader = Reader::new(
+        ctx.subject_tenant_id(),
+        writes.writer().resolver().root_tenant().await?,
+    );
+    let chain = target_chain(
+        writes.writer().resolver(),
+        reader,
+        report.effective.tenant_id,
+    )
+    .await?;
+    // @cpt-end:cpt-cf-settings-service-flow-value-writes-validate:p1:inst-vw-val-9
+    Ok(Json(render_validation(&report, pii, reader, &chain)).into_response())
     // @cpt-end:cpt-cf-settings-service-flow-value-writes-validate:p1:inst-vw-val-8
 }
 

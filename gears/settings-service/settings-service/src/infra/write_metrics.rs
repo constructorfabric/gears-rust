@@ -1,4 +1,3 @@
-// Created: 2026-09-07 by Virtuozzo International GmbH
 // @cpt-dod:cpt-cf-settings-service-dod-value-writes-observability:p1
 //! The write path's counters, and the Change Publisher binding of this
 //! release.
