@@ -2,14 +2,14 @@
 //! [`ConsumptionStore`] port with the contract's own signatures.
 //!
 //! Like the Quota primitives, these are inherent methods rather than a trait
-//! implementation: the `ClientHub` client stays unpublished until every primitive
-//! of the contract exists, so leases, batch debit and the bulk snapshot read
-//! are still missing.
+//! implementation: the `ClientHub` client stays unpublished until the plugin
+//! implements the whole contract as one trait, policy primitives included.
 
 use quota_enforcement_sdk::{
     ApplicableQuotas, AppliedMutation, EvaluatedDebit, EvaluatedMutation, IdempotencyRecord,
-    IdempotencyScope, IdempotencyWrite, NotificationEvent, PartialIdempotencyWrite, QuotaId,
-    QuotaSnapshot, RollbackTarget, StorageError, TransitionOutcome,
+    IdempotencyScope, IdempotencyWrite, NotificationEvent, PageRequest, PageResult,
+    PartialIdempotencyWrite, QuotaId, QuotaSnapshot, RollbackTarget, StorageError,
+    TransitionOutcome,
 };
 use time::OffsetDateTime;
 use toolkit_security::{AccessScope, SecurityContext};
@@ -38,6 +38,23 @@ impl StoragePlugin {
     ) -> Result<TransitionOutcome<EvaluatedDebit>, StorageError> {
         self.consumption
             .apply_debit_plan(ctx, scope, mutation, events)
+            .await
+    }
+
+    /// Evaluate and apply an atomic batch under one envelope key.
+    ///
+    /// # Errors
+    ///
+    /// As the contract documents for `apply_batch_debit`.
+    pub async fn apply_batch_debit(
+        &self,
+        ctx: &SecurityContext,
+        scope: &AccessScope,
+        batch: &quota_enforcement_sdk::EvaluatedBatch<'_>,
+        events: &[NotificationEvent],
+    ) -> Result<TransitionOutcome<Vec<EvaluatedDebit>>, StorageError> {
+        self.consumption
+            .apply_batch_debit(ctx, scope, batch, events)
             .await
     }
 
@@ -91,6 +108,24 @@ impl StoragePlugin {
     ) -> Result<Vec<QuotaSnapshot>, StorageError> {
         self.consumption
             .read_quota_snapshot(ctx, scope, applicable)
+            .await
+    }
+
+    /// One page of the per-Quota state of many applicable sets.
+    ///
+    /// # Errors
+    ///
+    /// `InvalidCursor` for a cursor this plugin did not issue; `Unavailable`
+    /// when the backend cannot answer.
+    pub async fn bulk_read_quota_snapshot(
+        &self,
+        ctx: &SecurityContext,
+        scope: &AccessScope,
+        pairs: &[ApplicableQuotas],
+        page: PageRequest,
+    ) -> Result<PageResult<QuotaSnapshot>, StorageError> {
+        self.consumption
+            .bulk_read_quota_snapshot(ctx, scope, pairs, page)
             .await
     }
 

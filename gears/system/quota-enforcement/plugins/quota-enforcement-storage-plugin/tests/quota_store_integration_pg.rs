@@ -33,7 +33,9 @@ use uuid::Uuid;
 use quota_enforcement_storage_plugin::infra::storage::Migrator;
 use quota_enforcement_storage_plugin::infra::storage::entity::quota_allocation_counter;
 use quota_enforcement_storage_plugin::infra::storage::quota_mapping::QuotaUpdate;
-use quota_enforcement_storage_plugin::infra::storage::repo::{operation_log_repo, quota_repo};
+use quota_enforcement_storage_plugin::infra::storage::repo::{
+    RowWait, operation_log_repo, quota_repo,
+};
 use quota_enforcement_storage_plugin::{
     Actor, NotificationEnqueuer, QeOutbox, QuotaStore, SqlQuotaStore, StoreError, start_outbox,
 };
@@ -197,10 +199,11 @@ impl PgHarness {
         let handle = tokio::spawn(async move {
             db.transaction_ref_mapped(move |tx| {
                 Box::pin(async move {
-                    let row = quota_repo::find_by_id(tx, &scope(), id.as_uuid(), true)
-                        .await
-                        .map_err(|e| DbError::Sea(sea_orm::DbErr::Custom(e.to_string())))?
-                        .expect("row exists");
+                    let row =
+                        quota_repo::find_by_id(tx, &scope(), id.as_uuid(), Some(RowWait::Wait))
+                            .await
+                            .map_err(|e| DbError::Sea(sea_orm::DbErr::Custom(e.to_string())))?
+                            .expect("row exists");
                     locked_tx.send(()).expect("test waits");
                     release_rx.await.expect("test releases");
                     body(tx, row).await?;

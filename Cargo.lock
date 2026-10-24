@@ -3927,6 +3927,7 @@ dependencies = [
  "sea-orm-migration",
  "serde",
  "serde_json",
+ "tempfile",
  "testcontainers",
  "testcontainers-modules",
  "thiserror 2.0.20",

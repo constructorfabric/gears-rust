@@ -67,7 +67,9 @@ use crate::domain::ports::lifecycle_gauges::{LifecycleCounts, LifecycleGaugeSink
 use crate::domain::ports::metric_registry::{
     Classified, Freshness, MetricDescriptor, MetricMode, MetricRegistry,
 };
-use crate::domain::ports::metrics::{DenialReason, QeMetrics, ValidationReason, ValidationSurface};
+use crate::domain::ports::metrics::{
+    DenialReason, MetricLabel, QeMetrics, ValidationReason, ValidationSurface,
+};
 use crate::infra::cluster_coordination::QuotaEnforcementProfile;
 use crate::infra::metric_registry::contract as metric_contract;
 
@@ -188,6 +190,88 @@ impl AuthZResolverApi for TupleMatchingPdp {
                     constraints: Vec::new(),
                     deny_reason: Some(DenyReason {
                         error_code: "TUPLE_NOT_AUTHORIZED".to_owned(),
+                        details: None,
+                    }),
+                },
+            });
+        }
+        Ok(EvaluationResponse {
+            decision: true,
+            context: EvaluationResponseContext {
+                constraints: vec![Constraint {
+                    predicates: vec![Predicate::In(InPredicate::new(
+                        pep_properties::OWNER_TENANT_ID,
+                        self.tenants.clone(),
+                    ))],
+                }],
+                ..EvaluationResponseContext::default()
+            },
+        })
+    }
+}
+
+/// A snapshot policy that inspects every target: it permits only when the
+/// target tenant is one of `tenants` and each `{kind, id, metric}` of the
+/// `filters` property is on its allow list, so one target outside the grant
+/// denies the whole request.
+pub struct PermitFiltersPdp {
+    allowed: Vec<Value>,
+    tenants: Vec<Uuid>,
+    calls: AtomicUsize,
+}
+
+impl PermitFiltersPdp {
+    /// Permit exactly the `(kind, id, metric)` targets in `allowed`.
+    pub fn new(allowed: &[(&str, &str, &str)], tenants: Vec<Uuid>) -> Self {
+        Self {
+            allowed: allowed
+                .iter()
+                .map(|(kind, id, metric)| serde_json::json!({ "kind": kind, "id": id, "metric": metric }))
+                .collect(),
+            tenants,
+            calls: AtomicUsize::new(0),
+        }
+    }
+
+    pub fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl AuthZResolverApi for PermitFiltersPdp {
+    async fn evaluate(
+        &self,
+        _ctx: PlatformSecurityContext,
+        request: EvaluationRequest,
+    ) -> Result<EvaluationResponse, CanonicalError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let tenant_allowed = request
+            .resource
+            .properties
+            .get(pep_properties::OWNER_TENANT_ID)
+            .is_some_and(|owner| {
+                self.tenants
+                    .iter()
+                    .any(|tenant| serde_json::to_value(tenant).ok().as_ref() == Some(owner))
+            });
+        let every_target_allowed = tenant_allowed
+            && request
+                .resource
+                .properties
+                .get(crate::domain::pep::properties::FILTERS)
+                .and_then(Value::as_array)
+                .is_some_and(|filters| {
+                    !filters.is_empty()
+                        && filters.iter().all(|filter| self.allowed.contains(filter))
+                });
+        if !every_target_allowed {
+            return Ok(EvaluationResponse {
+                decision: false,
+                context: EvaluationResponseContext {
+                    constraints: Vec::new(),
+                    deny_reason: Some(DenyReason {
+                        error_code: "TARGET_NOT_AUTHORIZED".to_owned(),
                         details: None,
                     }),
                 },
@@ -341,9 +425,27 @@ pub struct RecordingMetrics {
     replays: Mutex<Vec<OperationKind>>,
     reclaimed: Mutex<Vec<(RetentionTable, u64)>>,
     retention_failures: Mutex<Vec<RetentionTable>>,
+    lease_waits: Mutex<Vec<String>>,
+    lease_contention: Mutex<Vec<String>>,
+    lease_cap: Mutex<Vec<String>>,
 }
 
 impl RecordingMetrics {
+    /// Metrics whose lease acquisition latency was observed, in order.
+    pub fn lease_waits(&self) -> Vec<String> {
+        self.lease_waits.lock().expect("lock").clone()
+    }
+
+    /// Metrics of lease operations refused on contention, in order.
+    pub fn lease_contention(&self) -> Vec<String> {
+        self.lease_contention.lock().expect("lock").clone()
+    }
+
+    /// Metrics of acquisitions refused on the active-lease cap, in order.
+    pub fn lease_cap(&self) -> Vec<String> {
+        self.lease_cap.lock().expect("lock").clone()
+    }
+
     pub fn denials(&self) -> Vec<DenialReason> {
         self.denials.lock().expect("lock").clone()
     }
@@ -441,6 +543,27 @@ impl QeMetrics for RecordingMetrics {
 
     fn record_retention_failure(&self, table: RetentionTable) {
         self.retention_failures.lock().expect("lock").push(table);
+    }
+
+    fn record_lease_acquisition_wait(&self, metric: &MetricLabel, _elapsed: std::time::Duration) {
+        self.lease_waits
+            .lock()
+            .expect("lock")
+            .push(metric.as_str().to_owned());
+    }
+
+    fn record_lease_contention_rejected(&self, metric: &MetricLabel) {
+        self.lease_contention
+            .lock()
+            .expect("lock")
+            .push(metric.as_str().to_owned());
+    }
+
+    fn record_lease_inflight_limit_exceeded(&self, metric: &MetricLabel) {
+        self.lease_cap
+            .lock()
+            .expect("lock")
+            .push(metric.as_str().to_owned());
     }
 }
 
@@ -1504,6 +1627,9 @@ pub fn unbound_service(pdp: Arc<dyn AuthZResolverApi>) -> Arc<crate::domain::Ser
             cache_entries: 16,
             cache_ttl: std::time::Duration::from_secs(5),
             preparation_max_attempts: std::num::NonZeroU32::new(3).expect("attempts"),
+            leases: crate::domain::operations::LeaseLimits::default(),
+            batch: crate::domain::operations::BatchLimits::default(),
+            snapshot: crate::domain::operations::SnapshotLimits::default(),
         },
     ))
 }

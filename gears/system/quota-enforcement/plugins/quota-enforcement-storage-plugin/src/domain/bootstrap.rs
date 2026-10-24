@@ -18,7 +18,7 @@ use toolkit_macros::domain_model;
 use toolkit_security::SecurityContext;
 
 use super::ports::{
-    ConsumptionStore, FoundationStore, PolicyStore, QuotaStore, SeedReport, StoreError,
+    ConsumptionStore, FoundationStore, LeaseStore, PolicyStore, QuotaStore, SeedReport, StoreError,
 };
 
 const LOG_TARGET: &str = "qe.storage";
@@ -31,6 +31,7 @@ pub struct StoragePlugin {
     pub(super) quotas: Arc<dyn QuotaStore>,
     pub(super) policies: Arc<dyn PolicyStore>,
     pub(super) consumption: Arc<dyn ConsumptionStore>,
+    pub(super) leases: Arc<dyn LeaseStore>,
 }
 
 impl StoragePlugin {
@@ -41,12 +42,14 @@ impl StoragePlugin {
         quotas: Arc<dyn QuotaStore>,
         policies: Arc<dyn PolicyStore>,
         consumption: Arc<dyn ConsumptionStore>,
+        leases: Arc<dyn LeaseStore>,
     ) -> Self {
         Self {
             store,
             quotas,
             policies,
             consumption,
+            leases,
         }
     }
 
