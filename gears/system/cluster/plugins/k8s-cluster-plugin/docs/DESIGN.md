@@ -46,6 +46,7 @@
   - [5.4 Renew and Release Are Token-Fenced](#54-renew-and-release-are-token-fenced)
   - [5.5 Release Clears; It Does Not Delete](#55-release-clears-it-does-not-delete)
   - [5.6 Inspecting Locks (operators)](#56-inspecting-locks-operators)
+  - [5.7 Failover Timing (operators)](#57-failover-timing-operators)
 - [6. Cache Implementation](#6-cache-implementation)
   - [6.1 Operation Contract per Method](#61-operation-contract-per-method)
   - [6.2 TTL: Enforced on Read, Reclaimed by a Deadline-Armed Sweeper](#62-ttl-enforced-on-read-reclaimed-by-a-deadline-armed-sweeper)
@@ -1107,8 +1108,8 @@ This is the **one** place the plugin makes a remote release call, and it is not 
 contradiction of `cpt-cf-clst-fr-shutdown-ttl-cleanup`: that requirement forbids
 *best-effort cleanup during shutdown*, whereas `resign` is an explicit, awaited
 consumer request whose whole purpose is
-`cpt-cf-clst-fr-leader-resign`'s "releasing the claim immediately so a successor
-can be elected within a backend round-trip rather than waiting for TTL expiry".
+`cpt-cf-clst-fr-leader-resign`'s "release the claim at once, so that a successor is
+elected without waiting for TTL expiry".
 The distinction is that `resign` reports its failure to the caller; shutdown
 cleanup would have nobody to report to.
 
@@ -1310,6 +1311,30 @@ The holder column reads `oagw-5f4c7d-9pm2q#0f8a…`, so the pod is identifiable
 directly from the output — that is what §5.1's compound token buys, and it is why
 `cluster.lock.acquired` (DEBUG, §9) logs the same token: a token seen in
 `kubectl` can be grepped back to the acquiring task's log line.
+
+### 5.7 Failover Timing (operators)
+
+Takeover is judged on each replica's own monotonic clock, as in `client-go`, never
+by comparing `renewTime` with local wall time (§2.8, D4). A replica takes a lock or
+election only after seeing the same `(holderIdentity, renewTime)` unchanged for a
+full lease duration, counted from its own first sighting of that pair.
+
+- **Replicas that observed the claim since its last renewal** take over ≈1×TTL
+  after that renewal. Elections add up to one follower tick
+  (`ttl / (max_missed_renewals + 1)`) and `leaseDurationSeconds` rounded up to
+  whole seconds; a blocking `lock()` waiter wakes on the observed-expiry deadline
+  (§5.3). In-process the election task's watch does the observing; in Profile 3
+  there is no watch, and a replica observes only when it serves a `join`.
+- **If no surviving replica saw the last renewal** — a simultaneous restart, a
+  rollout replacing every candidate, or in Profile 3 a restarted cluster-gear
+  replica serving the joins (the observed map is per process) — the wait starts at
+  first sight: 1×TTL after the restart completes, which can approach **2×TTL**
+  after the last renewal.
+
+Clock skew never changes these bounds. Size TTLs for the 2×TTL worst case: the
+default 30 s election TTL means up to ~60 s without a leader after a full restart.
+A lower TTL shortens failover but raises the renewal write rate against the API
+server; election TTLs below `min_election_ttl_ms` (default 5000) are refused.
 
 ## 6. Cache Implementation
 

@@ -17,6 +17,7 @@ use std::collections::{HashMap, HashSet};
 use std::future::pending;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use authz_resolver_sdk::AuthZResolverApi;
@@ -29,7 +30,7 @@ use authz_resolver_sdk::models::{
 use cluster::{ClusterHandle, ClusterWiring, ProfileBackends};
 use cluster_sdk::{
     ClusterError, ClusterProfile, ElectionConfig, LeaderElectionBackend, LeaderElectionFeatures,
-    LeaderStatus, LeaderWatch,
+    LeaderStatus, LeaderWatch, LeaseToken,
 };
 use gts::{
     GTS_ID_URI_PREFIX, GtsId, GtsInstanceId, GtsRefValidation, GtsStore, GtsTypeId,
@@ -659,6 +660,27 @@ impl LeaderElectionBackend for AdvisoryOnlyLeader {
         _config: ElectionConfig,
     ) -> Result<LeaderWatch, ClusterError> {
         self.elect(name).await
+    }
+
+    // Never elects, so `join` never grants a token and `renew` / `resign` only
+    // ever see one this backend did not mint.
+    async fn join(
+        &self,
+        _name: &str,
+        _owner: &str,
+        _config: ElectionConfig,
+    ) -> Result<Option<LeaseToken>, ClusterError> {
+        Ok(None)
+    }
+
+    async fn renew(&self, token: &LeaseToken, _ttl: Duration) -> Result<(), ClusterError> {
+        Err(ClusterError::LockExpired {
+            name: token.name.clone(),
+        })
+    }
+
+    async fn resign(&self, _token: &LeaseToken) -> Result<(), ClusterError> {
+        Ok(())
     }
 }
 

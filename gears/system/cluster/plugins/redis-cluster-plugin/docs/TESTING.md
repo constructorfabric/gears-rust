@@ -1,7 +1,7 @@
 # Testing Strategy — Redis Cluster Plugin
 
 > **Status: implemented, with §8 as the register of what is not.** The suite is
-> **280 tests** — 211 unit, three conformance suites, and the 63 Layer 3 scenarios
+> **296 tests** — 215 unit, five conformance suites, and the 68 Layer 3 scenarios
 > of §4.2–§4.6 — running green in about ten seconds of test time via
 > `make test-integration LANE=cluster-redis`, which is wired into `ci.yml`'s `integration` job. This
 > is the test plan for `cf-redis-cluster-plugin`, paired with
@@ -187,6 +187,10 @@ produce a suite that asserts guarantees the backend does not claim, which is a t
 that fails for the right reason at the wrong layer. The flag's own path is
 `RD-SPEC-004b` instead.
 
+`lock_token_conformance` and `leader_token_conformance` run the lease-token scenarios
+([`SC-LTOK-*`](../../../docs/scenarios/lease-token.md)) against the native lock and the
+CAS leader.
+
 Each scenario runs on a shared container under **both** isolations rather than
 either: its own logical Redis database *and* its own `key_prefix`. Database
 isolation alone runs out at 15, and prefix isolation alone leaves a scenario able to
@@ -367,7 +371,7 @@ actual keyspace.
 |---|---|---|
 | `RD-LOCK-001` | `try_lock` acquires and `release` frees | The lease key exists with the holder token as its value and a `PTTL` in range; a second `try_lock` — **from the same instance**, refused by the same `SET NX` a foreign one would be — returns `LockContended`; after `release` the key is gone and the name is acquirable |
 | `RD-LOCK-002` | `lock` with timeout | A blocked `lock` returns `LockTimeout` (not `Provider`) after the budget elapses, and leaves nothing behind: the name is acquirable the moment the holder releases |
-| `RD-LOCK-003` | `lock` wakes on an explicit release | A blocked `lock` acquires well under the 250 ms heartbeat after the holder calls `release`, confirming the publish-driven wake. A wake measured at ~one heartbeat means the notification was *missed*, not merely slow, which is what makes this assertion sharp rather than a latency check — and it is why DESIGN §3.2 step 4 awaits the initial subscribe before `build_and_start` returns: a release landing in that startup window would otherwise have no subscriber |
+| `RD-LOCK-003` | `lock` wakes on an explicit release | A blocked `lock` acquires after the holder calls `release` with a **median** latency under 20 ms over 11 cycles (publish-driven wakes measure 1.4–5.3 ms). The bound is tight and the sample count high because a missed notification is *not* reliably slow: it wakes after the remainder of a jittered heartbeat sleep (with the `PUBLISH` removed, 25 of 45 wakes landed under 60 ms). It is also why DESIGN §3.2 step 4 awaits the initial subscribe before `build_and_start` returns: a release landing in that startup window would otherwise have no subscriber |
 | `RD-LOCK-004` | An expired lease is reclaimed with no reaper and no cooperation | A holds a 500 ms lock and never renews or releases; B acquires it purely on Redis expiry. The sharpest statement of what native TTL buys: there is no sweep in this plugin to be stalled (DESIGN §5.1). A's subsequent `renew` reports `LockExpired` |
 | `RD-LOCK-005` | `renew` extends the lease | `PTTL` after `renew(new_ttl)` reflects the new deadline; the lock is still held past the original one |
 | `RD-LOCK-006` | `renew` and `release` are token-fenced | A's lease lapses and B acquires the same name. A's `renew` → `LockExpired`; A's `release` → a no-op that leaves **B's** key intact (the release-if-still-holder contract, DESIGN §5.2). The one test that would fail on the classic bare-`DEL`-on-release bug |
@@ -380,6 +384,11 @@ actual keyspace.
 | `RD-LOCK-013` | `stop()` leaves held leases to expire, and says so | Hold three locks with a 10 s TTL, `stop()`, then assert the three keys are **still present** and then expire on their own deadlines. Deliberately asserts that leases are *left behind*: `cpt-cf-clst-fr-shutdown-ttl-cleanup` forbids best-effort remote cleanup on shutdown, and a lease needs no drain because it reaps itself (DESIGN §11). A future "tidy up on stop" change would fail here, which is the point |
 | `RD-LOCK-015` | The **standalone** plugin observes an evicted lease | The half of DESIGN §3.7 that a cache-scoped pattern cannot reach at all rather than merely narrowly: without its own keyspace subscription a lock-only deployment has every lease evicted out from under it and reports nothing — and it is the shape likeliest to be pointed at a *shared* Redis, having no cache working set to argue for its own instance. Memory pressure comes from a **raw client**, since there is no cache here to write filler through, which is why the fixture returns a URL. Asserts the WARN, its `primitive="lock"`, and the counter. Asserts no behaviour change: the lock keeps working through the eviction, and still asks for no `x` flag |
 | `RD-LOCK-014` | `WAIT` is applied when configured, and a short count surfaces | On the Sentinel fixture with `wait_replicas: 1`: an acquire succeeds while the replica acknowledges, then the replica is **stopped** and the next acquire surfaces `Provider { ResourceExhausted }` rather than reporting a success that is not yet replicated. Stopped rather than partitioned — partitioning is fault injection (§8), and the short count is the same observable either way, since the plugin cannot tell a gone replica from an unreachable one and is not meant to. Also asserts what `WAIT` does **not** do: `features().linearizable` is unchanged, because `WAIT` narrows the window a failover can lose a write in and does not close it (ADR-009, DESIGN §3.6) |
+| `RD-LOCK-016` | The store-owned-leases **token path** works end to end | `acquire` writes a real lease stored as `<owner>:<fence>` under the caller's owner, `renew` leaves a live deadline, a second `acquire` returns `LockContended`, `release` removes the key, and a repeated `release` is `Ok` by absence (§6.10). The cluster gear serves every remote lock RPC through this path (`api/grpc/lock.rs`), which guard-path tests do not exercise |
+| `RD-LOCK-017` | A stale token cannot touch a re-acquired lease | The token-path analogue of `RD-LOCK-006`: once A's lease lapses and the name is re-acquired, even under the **same owner** (so only the fresh fence tells the two apart), the stale token's `renew` → `LockExpired` and its `release` is a no-op that leaves the successor's value under the key intact |
+| `RD-LOCK-018` | The **blocking token path** waits, then acquires | A contended `acquire_waiting` waits its whole budget and reports `LockTimeout`, not a token; a blocked `acquire_waiting` wakes on the holder's release and yields a token that carries the *waiting* caller's owner and is live under the key (`renew`/`release` act on it). The wake is pinned as publish-driven with the `RD-LOCK-003` median bound |
+| `RD-LOCK-019` | A token renews and releases **across independent handles** | Invariant I7: a token minted on instance A is renewed (visibly extending the `PTTL`) and released (removing the key) through instance B, which never saw the acquire, since `renew`/`release` fence only on the `<owner>:<fence>` rebuilt from the token |
+| `RD-LOCK-020` | The **guard path and token path contend on one name** | The one scenario that mixes both halves on one name. Guard-held: `acquire` → `LockContended`, `acquire_waiting` → `LockTimeout`, and the stored value is still the guard's. Token-held: `try_lock` → `LockContended`, `lock` → `LockTimeout`, and the stored value is still the token's. A release on either path wakes a waiter blocked on the *other* path within the `RD-LOCK-003` median bound, proving the release channel is shared as well as the key (the heartbeat fallback would let a waiter in within budget either way). Would fail on a key-format drift between `guard_from` and the token path that let both hold the lock |
 
 ### 4.4 Watch Integration Scenarios
 
@@ -548,18 +557,19 @@ with the rest of the suite, so they cost no wall clock against the run as a whol
 
 | Layer | Trigger | Approx. duration |
 |---|---|---|
-| L1 unit tests | Every PR — `cargo test -p cf-redis-cluster-plugin --lib`, no Docker | 211 tests, sub-second |
-| L2 conformance + L3 integration, over eight single-node shapes plus two multi-node topologies | Every PR touching Rust — `make test-integration LANE=cluster-redis`, in `ci.yml`'s `integration` job | 280 tests total in ~10 s of test time, ~35 s including the build |
+| L1 unit tests | Every PR — `cargo test -p cf-redis-cluster-plugin --lib`, no Docker | 215 tests, sub-second |
+| L2 conformance + L3 integration, over eight single-node shapes plus two multi-node topologies | Every PR touching Rust — `make test-integration LANE=cluster-redis`, in `ci.yml`'s `integration` job | 296 tests total in ~10 s of test time, ~35 s including the build |
 | L3 Sentinel and Cluster topologies (`RD-SPEC-002`, `008..010`, `RD-LOCK-014`) | Every PR, in the same `make test-integration LANE=cluster-redis` run | 5 tests, and **no wall-clock cost** — `nextest` overlaps their containers with the single-node ones, so the suite still finishes in about ten seconds |
 | ~~L4 fault injection and failover~~ (`RD-FAULT-001..008`) | **Never — not built**; §5 and §8 | — |
 
-The 280 are 211 unit tests, 66 Layer 3 test functions, and the three conformance
-suites. Note that the 66 functions cover the **63** scenarios of §4.2–§4.6 (10
-`RD-CACHE-*`, 15 `RD-LOCK-*`, 10 `RD-WATCH-*`, 10 `RD-LIFE-*`, 18 `RD-SPEC-*`) and
-not 66 of them: a scenario whose halves must fail distinguishably is split across
-two functions — `RD-LIFE-006`'s silent-drop and panicking-drop halves are the
-worked example — so scenario count and test count are deliberately different
-numbers, and this is the only place either is written down.
+The 296 are 215 unit tests, 73 Layer 3 test functions, and 8 conformance tests
+(the cache, lock, leader, lock-token and leader-token suites, plus three
+`watch_mode`/CAS variants). Note that the 73 functions cover the **68** scenarios of
+§4.2–§4.6 (10 `RD-CACHE-*`, 20 `RD-LOCK-*`, 10 `RD-WATCH-*`, 10 `RD-LIFE-*`,
+18 `RD-SPEC-*`) and not 73 of them: a scenario whose halves must fail
+distinguishably is split across two functions — `RD-LIFE-006`'s silent-drop and
+panicking-drop halves are the worked example — so scenario count and test count are
+deliberately different numbers, and this is the only place either is written down.
 
 `make test-integration LANE=cluster-redis` passes `--retries 1`, for the reason
 `make test-integration LANE=cluster-pg` does: container setup is load-sensitive on a busy CI host,

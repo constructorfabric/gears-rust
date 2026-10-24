@@ -24,10 +24,10 @@
 - *Done-when:* asserts leadership persists across ≥3 renewal intervals.
 
 **SC-LEAD-004 — graceful step-down** · L2 · ☐
-- *Intent:* explicit resignation hands off within a round-trip rather than waiting for TTL.
-- *Steps:* leader A `resign()`; a waiting candidate B awaits its next `Status`.
-- *Expected:* A's `resign()` returns `Ok`; B observes `Leader` well within one TTL.
-- *Done-when:* asserts B is promoted promptly after A resigns.
+- *Intent:* explicit resignation hands off without waiting for the TTL to lapse.
+- *Steps:* A and B `elect_with_config` on a short config (3 s TTL, 2 missed renewals → 1 s renewal interval); leader A `resign()`; B awaits its next `Status`.
+- *Expected:* A's `resign()` returns `Ok`; B observes `Leader` within one renewal interval plus 2 s of slack (a 3 s budget). That is the bound both profiles meet: in Profile 3 the follower learns of the vacancy only on its next re-`join`, on the renewal cadence (the server pushes no vacancy).
+- *Done-when:* asserts B is promoted within `renewal_interval() + 2 s` after A resigns, in-process and through the remote client.
 
 **SC-LEAD-005 — synchronous status snapshot** · L2 · ☐
 - *Intent:* timer-driven workers need a non-async gate (`is_leader()`/`status()`) usable inside select arms.

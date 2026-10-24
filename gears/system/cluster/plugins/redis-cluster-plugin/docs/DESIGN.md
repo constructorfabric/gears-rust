@@ -237,12 +237,13 @@ Two ceilings and one caveat:
 
 ### 2.4 The Lock Entry
 
-A lock is one string key whose *value is the holder token* — a per-acquisition
-random UUID:
+A lock is one string key whose *value is the holder token* — `<owner>:<fence>`,
+where `owner` is the caller's identity and `fence` is a fresh random `u64` per
+acquisition (§5.1):
 
 ```
 GET cluster:l:tenant-42/rate-limit
-"9f1c…"          # holder token; PTTL is the remaining lease
+"9f1c34a2-…:14251603…"    # holder token <owner>:<fence>; PTTL is the remaining lease
 ```
 
 The key's presence is the lock; its TTL is the lease deadline, enforced by Redis
@@ -1144,13 +1145,28 @@ section.
 Acquisition is one command:
 
 ```
-SET <prefix>:l:<name> <holder_token> NX PX <ttl_ms>
+SET <prefix>:l:<name> <owner>:<fence> NX PX <ttl_ms>
 ```
 
 `OK` → acquired, `nil` → held by someone else (`ClusterError::LockContended`). The
-holder token is a fresh `uuid::Uuid` per acquisition. That is the entire mutual
-exclusion mechanism: `NX` is atomic on a single primary, and `PX` makes the entry
-its own reaper.
+value is the store-owned-lease token `<owner>:<fence>`, the whole authority a
+`renew` or `release` fences on (§5.2). `owner` is a fresh per-acquisition id on the
+guard path (`try_lock`/`lock`) or the brokered caller's `ClientId` on the token path
+(`acquire`/`acquire_waiting`, §5.4). `fence` is a fresh random `u64` per acquisition
+— Redis's substitute for the monotonic column Postgres reads, since a single
+`SET NX PX` has no counter to increment — so a name that lapsed and was re-acquired,
+even under the same owner, will not match the previous holder's token: a
+probabilistic bound (2⁻⁶⁴ collision aside), not the monotonic column's certainty
+(§5.8.1). The value is **composed, never parsed**: rebuilt from a token's fields, so
+any replica fences on it identically (invariant I7), and an `owner` containing `:` is
+no hazard. That is the entire mutual exclusion mechanism: `NX` is atomic on a single
+primary, and `PX` makes the entry its own reaper.
+
+**Two halves, one lease.** `try_lock`/`lock` return a `LockGuard`;
+`acquire`/`acquire_waiting` return a `LeaseToken`, which, unlike a guard, can cross a
+process boundary, so a gear serving lock RPCs can use it. Both are built over one
+internal `acquire_lease` (the guard path adds a guard task), so both fence on the
+same value.
 
 **Nothing else participates in exclusion.** There is no liveness proxy, no
 reclamation sweep, and no in-process registry of what this instance holds — none is
@@ -1306,16 +1322,16 @@ believed to be lint-enforced gets less review attention than one known not to be
 ```
 # What is held right now, and for how long
 SCAN 0 MATCH 'cluster:l:*' COUNT 500
-GET  cluster:l:tenant-42/rate-limit    # → the holder token
+GET  cluster:l:tenant-42/rate-limit    # → the holder token <owner>:<fence>
 PTTL cluster:l:tenant-42/rate-limit    # → ms remaining on the lease
 ```
 
-The token identifies an *acquisition*, not a human-meaningful instance: a random UUID
-does not resolve to a pod, host, or process on its own. It is greppable, though — the
-token is a log field on `cluster.lock.acquired` (§9), so a token read out of Redis
-leads back to the acquiring instance's logs. Storing a `holder_instance` value
-alongside it would duplicate identity already present in log context, and is
-deliberately not done.
+The token identifies an *acquisition*, not a human-meaningful instance: neither the
+`owner` (a random id on the guard path) nor the `fence` resolves to a pod, host, or
+process on its own. It is greppable, though — the token is a log field on
+`cluster.lock.acquired` (§9), so a token read out of Redis leads back to the
+acquiring instance's logs. Storing a `holder_instance` value alongside it would
+duplicate identity already present in log context, and is deliberately not done.
 
 `SCAN`, never `KEYS` (§4.4) — including in operator runbooks, since a `KEYS
 cluster:l:*` on a production instance blocks the server for the duration.
