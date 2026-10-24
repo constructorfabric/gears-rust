@@ -133,14 +133,114 @@
         "x-gts-instance-ref": "gts.cf.core.tasks.queue.v1~"
       },
       "timeouts": {  // per field: request > this trait > queue
-        "description": "Default timeouts for tasks of this type. Each field resolves on its own: task creation request, then this trait, then the queue's effective value. Same shape as the queue's timeouts.",
-        "$ref": "gts://gts.cf.core.tasks.queue.v1~#/properties/timeouts",
-        "$comment": "TODO(toolkit): confirm the GTS / types_registry resolver supports JSON Pointer fragments in cross-schema $ref; if not, inline a copy of the queue timeouts object."
+        "description": "Default timeouts for tasks of this type. Each field resolves on its own: task creation request, then this trait, then the queue's effective value. Copy of the queue base type's timeouts object (GTS $ref does not allow JSON Pointer fragments); keep the two in sync.",
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "queue_timeout_secs": {  // cap on time spent 'queued'; terminal on expiry
+            "description": "Maximum time a task may wait in 'queued' before it is force-completed as timed out (terminal).",
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 1,
+            "default": null
+          },
+          "assignment_timeout_secs": {  // cap on 'claimed'->started; liveness requeue on expiry
+            "description": "Maximum time a claimed task may remain 'claimed' before it starts (assignment_deadline); on expiry it is a liveness failure and the task is requeued with backoff against max_liveness_requeues (not max_retries).",
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 1,
+            "default": null
+          },
+          "execution_timeout_secs": {  // cap on running time per attempt; terminal, never retried
+            "description": "Maximum running time per attempt (execution_deadline, re-armed on each start so time spent waiting is never counted). Terminal, task-attributed, never retried.",
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 1,
+            "default": null
+          },
+          "heartbeat_timeout_secs": {  // lease duration; workers heartbeat every 1/3 of it
+            "description": "Lease duration: the maximum interval between worker heartbeats before the lease expires; falls back to default_lease_duration_secs when null. Workers MUST heartbeat at the heartbeat_interval_secs returned on claim (one third of this value, rounded down, minimum 1) so a single delayed heartbeat does not expire the lease. An expired lease is a liveness failure: the task is requeued with backoff against max_liveness_requeues (not max_retries).",
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 1,
+            "default": null
+          },
+          "lifetime_timeout_secs": {  // absolute create->terminal budget; overrides retry/lease
+            "description": "Absolute wall-clock budget from creation to terminal state, surviving requeues. On expiry the task is force-completed as timed out (overrides retry/lease handling).",
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 1,
+            "default": null
+          }
+        }
       },
       "retry_policy": {  // whole policy: request > this trait > queue
-        "description": "Default retry policy for tasks of this type. Taken as a whole from the first level that declares one: task creation request, then this trait, then the queue's effective value. Same shape as the queue's retry_policy.",
-        "$ref": "gts://gts.cf.core.tasks.queue.v1~#/properties/retry_policy",
-        "$comment": "TODO(toolkit): same $ref fragment question as timeouts."
+        "description": "Default retry policy for tasks of this type. Taken as a whole from the first level that declares one: task creation request, then this trait, then the queue's effective value. Copy of the queue base type's retry_policy object (GTS $ref does not allow JSON Pointer fragments); keep the two in sync.",
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "max_retries": {  // explicit retryable failures; liveness requeues do not count
+            "description": "Maximum number of retries after explicit retryable failures reported by a worker. Liveness requeues (lease expiry, assignment timeout) do not consume this budget; see max_liveness_requeues.",
+            "type": "integer",
+            "minimum": 0
+          },
+          "max_liveness_requeues": {  // lease-expiry / assignment-timeout requeues; 0 = unlimited
+            "description": "Maximum number of liveness requeues (lease expiry or assignment timeout) before the task is routed terminally with a timed_out result. Counted separately from max_retries so losing the worker never burns the failure-retry budget. Backoff uses this policy's strategy and intervals, applied to the liveness-requeue count. 0 means unlimited (bounded only by the lifetime timeout, if any).",
+            "type": "integer",
+            "minimum": 0,
+            "default": 20
+          },
+          "strategy": {  // fixed | linear | exponential
+            "description": "Backoff strategy used to compute run_after for a retry.",
+            "type": "string",
+            "enum": [
+              "fixed",
+              "linear",
+              "exponential"
+            ]
+          },
+          "base_interval_secs": {
+            "description": "Base backoff interval in seconds.",
+            "type": "integer",
+            "minimum": 0
+          },
+          "max_interval_secs": {
+            "description": "Maximum backoff interval in seconds (caps exponential/linear growth). MUST be greater than or equal to base_interval_secs; the engine rejects a queue whose policy breaks this rule when it resolves the queue (JSON Schema cannot compare two fields).",
+            "type": "integer",
+            "minimum": 0
+          },
+          "jitter_factor": {  // 0.0-1.0, de-syncs retries
+            "description": "Fractional jitter (0.0-1.0) applied to each computed backoff to de-synchronize retries.",
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1,
+            "default": 0
+          },
+          "non_retryable_codes": {
+            "description": "Error codes that are always terminal regardless of the worker's retryable flag.",
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "default": []
+          }
+        },
+        "required": [
+          "max_retries",
+          "strategy",
+          "base_interval_secs",
+          "max_interval_secs"
+        ]
       },
       "retention_days": {
         "description": "Retention for terminal tasks of this type, measured from the terminal time (PRD cpt-cf-task-engine-fr-retention). Precedence: tenant policy > matching config type pattern > this trait > global default.",
