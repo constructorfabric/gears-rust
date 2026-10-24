@@ -64,6 +64,12 @@ pub struct PoolConfig {
     pub idle_timeout: Duration,
     /// How often the background reaper runs.
     pub reap_interval: Duration,
+    /// Exchanges an HTTP/2 connection carries before another connection to
+    /// the same host is opened (spreads TLS and framing work over cores).
+    pub h2_streams_per_connection: usize,
+    /// Upper bound on HTTP/2 connections per host; beyond it, exchanges share
+    /// the least loaded connection.
+    pub h2_max_connections_per_host: usize,
 }
 
 impl Default for PoolConfig {
@@ -72,6 +78,8 @@ impl Default for PoolConfig {
             max_idle_per_host: 128,
             idle_timeout: Duration::from_secs(90),
             reap_interval: Duration::from_secs(30),
+            h2_streams_per_connection: 8,
+            h2_max_connections_per_host: 32,
         }
     }
 }

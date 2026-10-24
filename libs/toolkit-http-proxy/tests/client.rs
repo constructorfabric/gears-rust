@@ -72,7 +72,9 @@ async fn h1_concurrent_requests_open_parallel_connections() {
 #[tokio::test]
 async fn h2_over_tls_multiplexes_one_connection() {
     let up = echo(Wire::TlsH2).await;
-    let c = client();
+    let mut cfg = test_config();
+    cfg.pool.h2_streams_per_connection = 64;
+    let c = ProxyClient::new(cfg).unwrap();
     let t = up.target(Wire::TlsH2);
     let tasks: Vec<_> = (0..20)
         .map(|_| {
@@ -94,6 +96,30 @@ async fn h2_over_tls_multiplexes_one_connection() {
     }
     assert_eq!(up.accepted(), 1, "one multiplexed HTTP/2 connection");
     assert_eq!(c.cached_protocol(&t), Some(CachedProtocol::Http2));
+}
+
+#[tokio::test]
+async fn h2_load_spreads_over_a_bounded_set_of_connections() {
+    let up = upstream(Wire::TlsH2, |_req: Request<Incoming>| async {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        text("slow")
+    })
+    .await;
+    let mut cfg = test_config();
+    cfg.pool.h2_streams_per_connection = 4;
+    cfg.pool.h2_max_connections_per_host = 3;
+    let c = ProxyClient::new(cfg).unwrap();
+    let t = up.target(Wire::TlsH2);
+    let tasks: Vec<_> = (0..20)
+        .map(|_| {
+            let (c, t) = (c.clone(), t.clone());
+            tokio::spawn(async move { body_string(c.send(&t, get("/")).await.unwrap()).await })
+        })
+        .collect();
+    for task in tasks {
+        assert_eq!(task.await.unwrap(), "slow");
+    }
+    assert_eq!(up.accepted(), 3, "grows to the cap, then shares");
 }
 
 #[tokio::test]

@@ -7,10 +7,13 @@
 //! - HTTP/1.1: a LIFO stack of idle connections per key. A connection is put
 //!   back only when the previous response body reached its clean end; a
 //!   half-read or failed exchange closes the connection instead.
-//! - HTTP/2: one multiplexed connection per key. Each connection carries a
-//!   generation number, so a failure observed on an old connection never
-//!   evicts its replacement, and an active-stream count, so the reaper never
-//!   detaches a connection that is still serving responses.
+//! - HTTP/2: a small set of multiplexed connections per key. A request uses
+//!   the least loaded one; another connection opens once every connection
+//!   carries `h2_streams_per_connection` exchanges (up to
+//!   `h2_max_connections_per_host`), which spreads TLS and framing work over
+//!   cores. Each connection carries a generation number, so a failure
+//!   observed on an old connection never evicts its replacement, and an
+//!   active-exchange count, so the reaper never detaches a busy connection.
 //!
 //! Every connection task can be killed through its [`ConnHandle`]; the
 //! engine uses that to tear down connections whose request upload stalled.
@@ -63,12 +66,13 @@ struct IdleH1 {
 struct H2Entry {
     sender: H2Sender,
     conn: ConnHandle,
+    active: Arc<AtomicUsize>,
 }
 
-/// The HTTP/2 connection for one key plus a lock that serialises
-/// establishing it, so a burst of first requests opens one connection.
+/// The HTTP/2 connections for one key plus a lock that serialises
+/// establishing them, so a burst of first requests opens one connection.
 pub struct H2Slot {
-    entry: parking_lot::Mutex<Option<H2Entry>>,
+    entries: parking_lot::Mutex<Vec<H2Entry>>,
     pub connecting: tokio::sync::Mutex<()>,
     last_used: AtomicU64,
     active: AtomicUsize,
@@ -95,12 +99,17 @@ pub struct H2Lease {
     pub active: ActiveStream,
 }
 
-/// Counts one in-flight exchange on an HTTP/2 slot until dropped.
-pub struct ActiveStream(Arc<H2Slot>);
+/// Counts one in-flight exchange on an HTTP/2 connection (and its slot)
+/// until dropped.
+pub struct ActiveStream {
+    slot: Arc<H2Slot>,
+    conn: Arc<AtomicUsize>,
+}
 
 impl Drop for ActiveStream {
     fn drop(&mut self) {
-        self.0.active.fetch_sub(1, Ordering::Relaxed);
+        self.conn.fetch_sub(1, Ordering::Relaxed);
+        self.slot.active.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -181,7 +190,7 @@ impl Pool {
         }
         Arc::clone(&self.h2.entry(key.clone()).or_insert_with(|| {
             Arc::new(H2Slot {
-                entry: parking_lot::Mutex::new(None),
+                entries: parking_lot::Mutex::new(Vec::new()),
                 connecting: tokio::sync::Mutex::new(()),
                 last_used: AtomicU64::new(0),
                 active: AtomicUsize::new(0),
@@ -196,53 +205,63 @@ impl Pool {
         self.lease(&slot, None)
     }
 
-    /// Lease the slot's live connection unless it is generation `not_gen`
-    /// (the connection a retry just failed on).
+    /// Lease a live connection of the slot, skipping generation `not_gen`
+    /// (the connection a retry just failed on). Returns `None` when there is
+    /// none, or when every connection is at `h2_streams_per_connection` and
+    /// another one may still be opened.
     pub fn lease(&self, slot: &Arc<H2Slot>, not_gen: Option<u64>) -> Option<H2Lease> {
-        let mut guard = slot.entry.lock();
-        let entry = guard.as_ref()?;
-        if entry.conn.kill.is_cancelled() {
-            *guard = None;
+        let mut entries = slot.entries.lock();
+        entries.retain(|e| !e.conn.kill.is_cancelled());
+        let best = entries
+            .iter()
+            .filter(|e| not_gen != Some(e.conn.generation))
+            .min_by_key(|e| e.active.load(Ordering::Relaxed))?;
+        let saturated = best.active.load(Ordering::Relaxed) >= self.cfg.h2_streams_per_connection;
+        if saturated && entries.len() < self.cfg.h2_max_connections_per_host {
             return None;
         }
-        if not_gen == Some(entry.conn.generation) {
-            return None;
-        }
+        let lease = H2Lease {
+            sender: best.sender.clone(),
+            conn: best.conn.clone(),
+            active: Self::activate(slot, &best.active),
+        };
         slot.last_used.store(self.now_secs(), Ordering::Relaxed);
-        slot.active.fetch_add(1, Ordering::Relaxed);
-        Some(H2Lease {
-            sender: entry.sender.clone(),
-            conn: entry.conn.clone(),
-            active: ActiveStream(Arc::clone(slot)),
-        })
+        Some(lease)
     }
 
-    /// Install a new HTTP/2 connection in `slot` and lease it.
+    fn activate(slot: &Arc<H2Slot>, conn: &Arc<AtomicUsize>) -> ActiveStream {
+        conn.fetch_add(1, Ordering::Relaxed);
+        slot.active.fetch_add(1, Ordering::Relaxed);
+        ActiveStream {
+            slot: Arc::clone(slot),
+            conn: Arc::clone(conn),
+        }
+    }
+
+    /// Add a new HTTP/2 connection to `slot` and lease it.
     pub fn store_h2(&self, slot: &Arc<H2Slot>, sender: H2Sender, conn: ConnHandle) -> H2Lease {
         slot.last_used.store(self.now_secs(), Ordering::Relaxed);
-        slot.active.fetch_add(1, Ordering::Relaxed);
-        *slot.entry.lock() = Some(H2Entry {
+        let active = Arc::new(AtomicUsize::new(0));
+        let lease = H2Lease {
             sender: sender.clone(),
             conn: conn.clone(),
-        });
-        H2Lease {
+            active: Self::activate(slot, &active),
+        };
+        slot.entries.lock().push(H2Entry {
             sender,
             conn,
-            active: ActiveStream(Arc::clone(slot)),
-        }
+            active,
+        });
+        lease
     }
 
-    /// Forget the HTTP/2 connection for `key` if it is still generation
-    /// `generation`; a newer replacement is left alone.
+    /// Forget the HTTP/2 connection of generation `generation` for `key`;
+    /// its siblings and any newer replacement are left alone.
     pub fn drop_h2(&self, key: &PoolKey, generation: u64) {
         if let Some(slot) = self.h2.get(key) {
-            let mut guard = slot.entry.lock();
-            if guard
-                .as_ref()
-                .is_some_and(|e| e.conn.generation == generation)
-            {
-                *guard = None;
-            }
+            slot.entries
+                .lock()
+                .retain(|e| e.conn.generation != generation);
         }
     }
 
@@ -257,19 +276,16 @@ impl Pool {
         });
         let now = self.now_secs();
         self.h2.retain(|_, slot| {
-            let mut guard = slot.entry.lock();
-            let busy = slot.active.load(Ordering::Relaxed) > 0;
+            let mut entries = slot.entries.lock();
             let unused =
                 now.saturating_sub(slot.last_used.load(Ordering::Relaxed)) >= idle.as_secs();
-            if guard
-                .as_ref()
-                .is_some_and(|e| e.conn.kill.is_cancelled() || (unused && !busy))
-            {
-                *guard = None;
-            }
+            entries.retain(|e| {
+                !e.conn.kill.is_cancelled() && (!unused || e.active.load(Ordering::Relaxed) > 0)
+            });
+            let busy = slot.active.load(Ordering::Relaxed) > 0;
             // Keep slots someone still holds (mid-connect or mid-exchange):
             // detaching them would orphan the connection they install.
-            guard.is_some() || busy || Arc::strong_count(slot) > 1
+            !entries.is_empty() || busy || Arc::strong_count(slot) > 1
         });
     }
 }

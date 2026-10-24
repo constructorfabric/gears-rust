@@ -153,7 +153,16 @@ Every `rustls::ClientConfig` comes from `toolkit_http::{native,webpki,custom}_ro
 * HTTP/2 Bomb: CVE-2026-49975 (HAProxy, NGINX, Apache, Envoy, IIS and Pingora reports).
 * RustSec: RUSTSEC-2026-0258 (h2 empty DATA), RUSTSEC-2024-0332 (CONTINUATION flood).
 * J. Kettle, "HTTP/1.1 must die: the desync endgame", Black Hat USA 2025.
-* Benchmark (Windows 11, local upstreams, `proxy_roundtrip`, before/after) is recorded in the change's pull request.
+* Benchmark: `cargo bench -p cf-gears-oagw --bench proxy_roundtrip` (full OAGW pipeline, local upstreams, Windows 11, 2000 sequential requests for latency, 64 concurrent clients for 3 s for throughput):
+
+  | Scenario | p50 Pingora → engine | p99 Pingora → engine | c64 req/s Pingora → engine |
+  |---|---|---|---|
+  | HTTP/1.1, 1 KiB response | 287 → 75 µs | 469 → 201 µs | 18.5k → 87.4k |
+  | HTTP/1.1, 256 KiB response | 518 → 168 µs | 1.2 ms → 399 µs | 10.2k → 33.2k |
+  | HTTP/1.1, 64 KiB upload | 343 → 119 µs | 1.1 ms → 264 µs | 12.9k → 67.8k |
+  | HTTP/2 + TLS, 1 KiB response | 193 → 91 µs | 374 → 239 µs | 56.4k → 162.3k |
+  | HTTP/2 + TLS, 256 KiB response | 346 → 367 µs | 708 → 640 µs | 15.8k → 17.3k |
+  | HTTP/2 + TLS, 64 KiB upload | 218 → 194 µs | 545 → 368 µs | 19.7k → 56.5k |
 
 ## Traceability
 
