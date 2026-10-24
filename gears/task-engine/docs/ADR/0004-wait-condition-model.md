@@ -53,15 +53,15 @@ Wait conditions are rows in `te_wait_conditions` with a stable `WaitConditionKin
 
 A task sets one group of conditions with `all` or `any` semantics. In `any` mode the first satisfied condition wakes the task and cancels its siblings; in `all` mode every condition must be satisfied. A group may have a timeout whose `on_timeout` action fails or resumes the task.
 
-Resolution (timer fire, matching event, input resolve, last child reaching a terminal state) marks the condition `satisfied` and, when the group is complete, moves the task `waiting → queued` in the same transaction and writes `WaitConditionSatisfied` and `TaskResumed` to the outbox. For event waits, the consumer offset is committed in that same transaction, so a duplicate event can never satisfy a wait twice.
+Resolution (timer fire, matching event, input resolve, last child reaching a terminal state) marks the condition `satisfied` and, when the group is complete, moves the task `waiting → queued` in the same transaction and writes `WaitConditionSatisfied` and `TaskResumed` to the outbox. For event waits, each task domain records the event in its own inbox in that transaction, and the consumer offset is committed after all domains, so a duplicate event never satisfies a wait twice.
 
-**Arm, then park.** A worker that triggers the event itself (for example, it calls a service whose reply comes back as an event) could miss the reply if the reply arrives before the wait exists. So a worker may first **arm** the group (`park = false`): the conditions start matching and the event subscription is extended before the call returns, while the task keeps running. The worker then starts its action and calls **park**. If the group is already satisfied, the task is not parked and continues under the same lease; otherwise it parks as usual. Wait timeouts start at park.
+**Arm, then park.** A worker that triggers the event itself (for example, it calls a service whose reply comes back as an event) could miss the reply if the reply arrives before the wait exists. So a worker may first **arm** the group (`park = false`): the conditions start matching as soon as the call commits (the broker subscription is static), while the task keeps running. The worker then starts its action and calls **park**. If the group is already satisfied, the task is not parked and continues under the same lease; otherwise it parks as usual. Wait timeouts start at park.
 
 ### Consequences
 
 * Wait resolution is exactly-once on the engine side.
 * A waiting task releases its concurrency slot and holds no lease.
-* Event waits drive the inbound Event Broker consumer subscription (DESIGN §3.2 Event Consumer).
+* Event waits use one static subscription over operator-listed waitable topics. Setting one requires the caller's own `consume` right, and only the matched event's header is stored (DESIGN §3.2).
 * Each kind has its own validation, indexes, and timeout handling.
 * No event is missed when the worker arms the wait before it acts.
 * A parent can wait for its children without holding a lease or polling.
@@ -74,7 +74,8 @@ Tests MUST check that:
 * each kind resolves and resumes the task exactly once;
 * `any` groups cancel remaining siblings and `all` groups wait for every member;
 * a group timeout applies `on_timeout` correctly;
-* a duplicate event does not satisfy a wait twice;
+* a duplicate event does not satisfy a wait twice, even across task domains;
+* a caller without `consume` on the event type cannot set an event wait;
 * pending waits survive a restart;
 * an event published after an arm call returns satisfies the armed condition, and park then returns it without parking the task;
 * a children condition is satisfied once, after the last child reaches a terminal state, with the per-state counts.

@@ -199,7 +199,7 @@ graph TB
 
 **Secure-by-default DB access**: All database access uses `SecureConn` with `AccessScope` compiled from PDP constraints. No raw database connections in handler, service, or repository code.
 
-Tenant-owned tables (`te_tasks`, `te_task_state`, `te_task_entries`, `te_wait_conditions`, `te_events`, `te_tags`, `te_resource_refs`, `te_timers`) derive `Scopable` with a `tenant_col`. Every **request path** (REST or SDK call made for a subject) accesses them only under the PDP-derived tenant scope. **Engine-internal system tables** that hold cross-tenant aggregates or engine-owned coordination state (`te_concurrency_slots`, `te_queue_backlog`, `te_worker_blacklist`, `te_runtime_config`) have no tenant column and are declared `#[secure(unrestricted)]`. Per [`06_authn_authz_secure_orm.md` §Unrestricted entities](../../../docs/toolkit_unified_system/06_authn_authz_secure_orm.md), a scope carrying tenant IDs is *denied* against an `unrestricted` entity, so these tables MUST only be touched on an **engine system code path with `AccessScope::allow_all()`** — never with a subject/tenant scope. This mirrors the platform capability pattern (e.g. `chat-engine` share-token access): when the operation is an engine invariant rather than a subject-authorized row operation, `PolicyEnforcer` is **not** called for that table and the repository reads/writes under an internal `allow_all()`. Authorization for the surrounding action (e.g. `claim`) is still enforced on the tenant-owned task rows in the same transaction.
+Tenant-owned tables (`te_tasks`, `te_task_state`, `te_task_entries`, `te_wait_conditions`, `te_events`, `te_tags`, `te_resource_refs`, `te_timers`, `te_event_inbox`) derive `Scopable` with a `tenant_col`. Every **request path** (REST or SDK call made for a subject) accesses them only under the PDP-derived tenant scope. **Engine-internal system tables** that hold cross-tenant aggregates or engine-owned coordination state (`te_concurrency_slots`, `te_queue_backlog`, `te_worker_blacklist`, `te_runtime_config`) have no tenant column and are declared `#[secure(unrestricted)]`. Per [`06_authn_authz_secure_orm.md` §Unrestricted entities](../../../docs/toolkit_unified_system/06_authn_authz_secure_orm.md), a scope carrying tenant IDs is *denied* against an `unrestricted` entity, so these tables MUST only be touched on an **engine system code path with `AccessScope::allow_all()`** — never with a subject/tenant scope. This mirrors the platform capability pattern (e.g. `chat-engine` share-token access): when the operation is an engine invariant rather than a subject-authorized row operation, `PolicyEnforcer` is **not** called for that table and the repository reads/writes under an internal `allow_all()`. Authorization for the surrounding action (e.g. `claim`) is still enforced on the tenant-owned task rows in the same transaction.
 
 **System background loops (the only exception)**: the timer wheel, lease scan, retention, slot reconciliation, priority aging, and the event consumer act for the engine, not for a subject, so they have no PDP scope. They read and write tenant-owned tables (for example `te_timers`, `te_task_state`, `te_wait_conditions`) under `AccessScope::allow_all()`. This is allowed only in these named loops, which never take input from an API caller. Each row they change keeps its own `owner_tenant_id`, and any event they write carries that tenant. No request handler may use `allow_all()` on a tenant-owned table.
 
@@ -765,16 +765,19 @@ Durable suspension manager. Owns wait condition lifecycle and resolution. See [A
 
 Responsibilities:
 - Set wait conditions on running tasks, or — API consumer only — on `queued`/`claimed` tasks (transitions task to `waiting` and **parks** it: releases slots, clears lease and assignee, applies an optional checkpoint in the same transaction — PRD §5.4)
-- Resume by transitioning `waiting` → `queued` with `resume_pending = true`; resolved wait data (event payload, input, timeout indication) is stored on the wait condition and returned with the next claim
+- Resume by transitioning `waiting` → `queued` with `resume_pending = true`; resolved wait data (event header, input, child counts, timeout indication) is stored on the wait condition and returned with the next claim
 - Manage four built-in wait condition kinds:
   - **Timer**: set `resume_at`, auto-satisfy when time reached (via TimerService)
   - **Event**: match incoming events by `event_type`, optional `subject_id`/`subject_type`, optional CEL `match_expression`
   - **Input**: accept structured JSON input validated against declared schema
   - **Children**: satisfied when the task has no non-terminal children (`te_task_state.parent_task_id`). Checked at park time (no live child → satisfied at once) and after each child's terminal transition (§4.6 Cascades); `resolved_payload` holds the count of children per terminal state
 - Support ALL/ANY semantics for multiple wait conditions on a single task
-- **Arm, then park** (PRD §5.4 Arm before acting): `POST /tasks/{id}/wait-conditions` with `park = false` (worker, fenced by `lease_token`, task stays `running`) inserts the group with `parked_at = NULL` (**armed**). For event conditions, the call adds the `(event_type, owner_tenant_id)` interest to the inbound subscription (§3.2 Event Consumer) and returns only after the consumer has re-joined with it; if that does not happen within `event_consumer.arm_timeout_ms`, the arm is rolled back and the call fails `service_unavailable` `503`. Matches while armed set the condition `satisfied` and store `resolved_payload`, but never change task state. `POST /tasks/{id}/wait-conditions/park` (fenced, optional checkpoint): if the armed group is already complete, delete it, return the resolved data, and keep the task `running` under the same lease; otherwise set `parked_at = now`, start the wait timeouts, and park the task as for a one-step set-wait. Any transition out of `running` other than park (complete, fail, release, lease loss, cancel) sets the armed conditions to `cancelled` in the same transaction. A task has at most one wait group (armed or parked); a second set or arm is rejected `failed_precondition` `400`
+- **Arm, then park** (PRD §5.4 Arm before acting): `POST /tasks/{id}/wait-conditions` with `park = false` (worker, fenced by `lease_token`, task stays `running`) inserts the group with `parked_at = NULL` (**armed**). For event conditions no subscription change is needed: the consumer already covers every waitable topic (§3.2 Event Consumer), so the condition starts matching as soon as the arm commits, and the call returns then. Matches while armed set the condition `satisfied` and store `resolved_payload`, but never change task state. `POST /tasks/{id}/wait-conditions/park` (fenced, optional checkpoint): if the armed group is already complete, delete it, return the resolved data, and keep the task `running` under the same lease; otherwise set `parked_at = now`, start the wait timeouts, and park the task as for a one-step set-wait. Any transition out of `running` other than park (complete, fail, release, lease loss, cancel) sets the armed conditions to `cancelled` in the same transaction. A task has at most one wait group (armed or parked); a second set or arm is rejected `failed_precondition` `400`
 - Handle wait condition timeouts per member `on_timeout` and the group rule of PRD §5.4: `all` — the first member timeout resolves the group with that member's `on_timeout` and sets the other pending members to `cancelled`; `any` — a timed-out member drops out, and once every member has timed out the group resolves to `fail` if any member says `fail`, else `resume`. `fail` uses terminal routing with `timed_out` (DLQ if configured, else `failed`); `resume` stores a timeout indication in `resolved_payload`
 - Evaluate incoming events against active event wait conditions
+- **Event wait authorization** (PRD §5.4). The engine reads events with platform rights, so it must not become a way around event authorization:
+  - **Set / arm**: a PEP check with the **caller's** `SecurityContext` for `consume` on `gts.cf.core.events.event.v1~` (the condition's `event_type`) and, if set, on `gts.cf.core.events.subject_type.v1~`, in the task's tenant. Denied or PDP unavailable → `permission_denied` `403`, nothing stored. This is in addition to the task `claim` / `update` check, and is evaluated once, at set time.
+  - **Header only**: an event condition's `resolved_payload` holds only the matched event's header: `id`, `type`, `subject`, `subject_type`, `time`, and the broker position `topic` / `partition` / `offset`. The event `data` is never stored or returned. The match expression sees `data` only in memory while matching. A resumed worker that needs the data reads it from the event's source with its own permissions; once the broker supports offset reads (post-MVP `GET /v1/events`), it can also re-read the event by position.
 
 ##### RetentionService (`domain/retention_service.rs`)
 
@@ -810,8 +813,8 @@ Lifecycle events are published via the **Event Broker SDK managed outbox produce
 
 Design:
 - Lifecycle events are `TypedEvent` structs covering the full PRD §5.10 event-type set: `TaskCreated`, `TaskQueued`, `TaskClaimed`, `TaskStarted`, `TaskCompleted`, `TaskFailed`, `TaskCancelRequested`, `TaskCancelled`, `TaskCheckpointed`, `TaskProgressed`, `TaskWaiting`, `TaskResumed`, `TaskRetrying`, `TaskReassigned`, `TaskDeadLettered`, `TaskTimedOut`, `SlaBreached`, `WaitConditionSet`, `WaitConditionSatisfied`, `WaitTimedOut`, `WorkerBlacklisted`, `ConfigUpdated`. Naming: the struct name is PascalCase (`TaskCreated`), the short name used in this document and in `te_events.event_type` is camelCase (`taskCreated`), and the GTS type-name segment is its snake_case form (`…cf.core.tasks.task_created.v1~`). Each event's `type` is a Task-Engine **derived event type** of the Event Broker base event type — `gts.cf.core.events.event.v1~cf.core.tasks.<event>.v1~` (e.g. `…cf.core.tasks.task_claimed.v1~`) — registered in `types_registry` at startup. Each type narrows `data` to its payload contract and fixes its traits: `topic` (`gts.cf.core.events.topic.v1~cf.core.tasks.task_events.v1`), `partition_key` (`/subject`), and `allowed_subject_types`; see [`schemas/types/`](./schemas/types/). The Task Engine does **not** define an event/topic base type of its own — these derive from the Event Broker base types. Each emitted event also carries a **stable unique event ID** (the `te_events.id` assigned in the same transaction) and `subject = task_id` with `subject_type` = the task's GTS type (task-scoped events allow any type derived from `gts.cf.core.tasks.task.v1~`). Queue-scoped events (`ConfigUpdated` — one per affected queue per config save, see §3.3 `/admin/config` — and `WorkerBlacklisted`) use the queue ID as `subject` and the queue type `gts.cf.core.tasks.queue.v1~` as `subject_type`; `WorkerBlacklisted` carries the worker identity in `data.worker`. `TaskReassigned`, `WorkerBlacklisted`, and `ConfigUpdated` back the "MUST be recorded in the event history" requirements in PRD §5.6 and §5.2. `TaskProgressed` is emitted only by the Progress Cache flush (§3.2 Progress Cache). Task-scoped events also carry the task's current `queue` and, when a subject's API or worker call caused the event, that subject as `actor` (absent for engine-caused events such as timeouts and cascades), so consumers can route and audit without reading the task back. Published events never carry a task error's `message` or `context`, because they are free text that may echo payload data (PRD §6.1 Data Protection); `taskFailed` and `taskRetrying` carry only `domain`, `code`, `fault`, and `retryable`. Task-scoped event payloads carry the task's `resource_refs` (PRD §5.1 Resource References) so consumers can route per resource without a read-back. Consumers dedup on the stable event ID (at-least-once delivery); wait-condition resolution is idempotent so a duplicate event cannot satisfy a wait twice
-- At startup, `event_producer.rs` runs the SDK producer-registration migrations + toolkit-db outbox migrations, builds a `DbProducer` (`EventBrokerApi` from `ClientHub`, `DbDeduplication::managed(ProducerMode::Monotonic)`), and binds one `ProducerOutboxQueue` (`register(Outbox::builder(db)).start()` → `bind(&handle)`)
-- Domain services **enqueue** each lifecycle event inside the same transaction as the state change: `producer_outbox.enqueue(&txn, TaskClaimed { .. })` — emission is atomic with the state change; the SDK does not call the broker while the txn is open
+- **One producer and outbox per task domain** (§3.8), since an event can commit with its state change only in the task's own database. At startup, in each domain database, `event_producer.rs` runs the SDK producer-registration and toolkit-db outbox migrations, builds a `DbProducer` (`EventBrokerApi` from `ClientHub`, `DbDeduplication::managed(ProducerMode::Monotonic)`, identity `task-engine/<domain>`) and binds a `ProducerOutboxQueue` named `<outbox_queue>-<domain>`
+- Domain services **enqueue** each event in the state-change transaction on the task's domain producer: `producers[domain].enqueue(&txn, TaskClaimed { .. })`. The SDK does not call the broker while the txn is open. `ConfigUpdated` uses the `default` domain (home of `te_runtime_config`); `WorkerBlacklisted` uses the queue's domain. Per-task order holds, because a task never changes domain; queue-scoped events from different domains have no mutual order
 - The SDK owns delivery, idempotent-producer dedup, `(topic, broker_partition)` → outbox-partition mapping (per-task ordering via subject), leasing, backoff, retries, dead-lettering, and vacuum. All backend-specific claiming (`SKIP LOCKED` / single-writer) lives inside the SDK / `toolkit-db`, not the Task Engine
 - The gear owns only the producer/outbox lifecycle (build, register, start, stop) per the SDK contract
 
@@ -820,20 +823,24 @@ Design:
 Event **wait conditions** (§3.2 WaitConditionService, §3.6 Event Wait sequence) require the Task Engine to **receive** events from the Event Broker, so the gear runs an inbound consumer alongside the outbound producer. This uses the Event Broker SDK **consumer** runtime (`event_broker_sdk::ConsumerBuilder` + consumer group + offset manager) — the Task Engine does not poll the broker or manage subscriptions by hand.
 
 Design:
-- At startup, `event_consumer.rs` builds a `ConsumerBuilder` (`EventBrokerApi` from `ClientHub`) bound to a **stable consumer group** (`gts.cf.core.events.consumer_group.v1~cf.core.tasks.task_engine.v1`) so exactly one instance in the cluster processes each partition and offsets survive restarts. Parallelism is configurable (`event_consumer.slots`).
-- Subscription interest is **narrow**: the subscription's `interests[]` cover only the event types that active event wait conditions reference. The set is derived at startup from distinct `(event_type, owner_tenant_id)` pairs in `te_wait_conditions` (kind = event, state = pending) and refreshed when a new event-wait references a previously unseen pair. Each `event_type` is resolved via `types_registry` to its `topic` trait (an event type is published to exactly one topic; an unresolvable type rejects the wait with `invalid_argument`). The pairs are then grouped into one broker `Interest` per `(topic, tenant_id)`, with `types` = the distinct event types for that topic and tenant, `max_depth = 0` (the wait's owning tenant only, consistent with the `owner_tenant_id` = event tenant match below) and `barrier_mode = respect`. Broker caps apply (≤ 64 interests per subscription, ≤ 32 `types` per interest): on overflow, types sharing a vendor/package prefix are collapsed into a wildcard pattern (single trailing `*`, GTS §10), and the handler's exact `event_type` match below discards the surplus events.
-- **Interest is ready before the worker acts** (PRD §5.4 Arm before acting): arming an event wait with a new `(event_type, owner_tenant_id)` pair triggers the refresh **synchronously** — the arm call waits until the consumer has re-joined with the new interest. A topic added by the refresh starts at the current end of its stream, which is not earlier than the arm. Every event published after the arm returns is therefore delivered to the handler. Pairs are removed from the interest only when no pending (armed or parked) condition references them.
-- The consumer handler runs inside one database transaction using the Event Broker SDK `TxConsumerHandler` (`LocalDbOffsetManager`, `WithTx` mode). First, it finds candidate conditions using `event_type` and checks that `owner_tenant_id` equals the event tenant (events from one tenant never match another tenant's wait). Next, it checks subject filters: if `event_subject_id` is set, it must equal the event subject; if `event_subject_type` is set, it must equal the event subject type. If the condition also defines a CEL `match_expression` (ADR-0007), that expression is evaluated. When a condition matches, the engine marks that condition row `satisfied` and saves the event payload into `resolved_payload`.
+- At startup, `event_consumer.rs` builds a `ConsumerBuilder` (`EventBrokerApi` from `ClientHub`) bound to a **stable consumer group** (`gts.cf.core.events.consumer_group.v1~cf.core.tasks.task_engine.v1`) so exactly one instance in the cluster processes each partition and offsets survive restarts. Parallelism is configurable (`event_consumer.slots`). One group serves all task domains.
+- **Static subscription.** One `Interest` per topic in `event_consumer.waitable_topics` (§4.1; ≤ 64, the broker cap). Each interest uses `tenant_id` = platform root, `max_depth = null`, `barrier_mode = ignore` (allowed for platform services; the engine joins with its workload identity and holds `consume` on these topics), and `types = ["gts.cf.core.events.event.v1~*"]` (patterns are topic-scoped). The subscription is independent of tenants, types, and waits. It changes only with the topic list (config change), never on arm or park, so waits cause no rebalance.
+- **Waitable check.** On set or arm, `event_type` is resolved to its `topic` trait. An unresolvable type → `400` `UNKNOWN_EVENT_TYPE`; a topic not listed → `400` `EVENT_TOPIC_NOT_WAITABLE`. Operators list only topics that are actually waited on, because every event of a listed topic is read.
+- **Arm before acting** (PRD §5.4). The topic is already subscribed, so an arm returns once its rows commit. Every later-processed event sees the condition, including events still behind consumer lag. An event admitted just before the arm may also match; conditions that must ignore earlier events narrow by `event_subject_id` or `match_expression`.
+- **Candidates.** One indexed probe per domain on `ix_te_waits_event_subject` (§3.7), per event or one `IN`-list per batch, with `(event_type, owner_tenant_id = event.tenant_id[, event_subject_id])` over pending conditions. Domains without candidates get no transaction. This is never replaced by an in-memory cache, which would miss arms committed on other nodes.
+- **Matching.** Apply the `event_subject_id` / `event_subject_type` filters, then the CEL `match_expression` (ADR-0007; it sees `data` in memory only). A match sets the condition `satisfied` and stores **only the event header** in `resolved_payload` (§3.2 WaitConditionService, *Event wait authorization*).
 
-  If the condition is **armed** (`parked_at IS NULL`, task still `running`), the transaction only saves `WaitConditionSatisfied` and commits the offset; the task is not touched, and the result is picked up by the later park call. Otherwise `WaitConditionService` checks whether the task can wake up:
+  If the condition is **armed** (`parked_at IS NULL`, task still `running`), the transaction only saves `WaitConditionSatisfied`; the task is not touched, and the later park call picks up the result. Otherwise `WaitConditionService` checks whether the task can wake up:
   - In `any` mode: the first satisfied condition wakes the task. Any sibling conditions still waiting are marked `cancelled`.
   - In `all` mode: all conditions in the group must be satisfied before the task wakes up.
 
-  If the group is now complete, the transaction moves the task from `waiting` to `queued` (with `resume_pending = true`), saves `WaitConditionSatisfied` and `TaskResumed` into the outbox, commits the consumer offset, and signals `newTask`. If other conditions are still pending (for example in `all` mode), the transaction only saves `WaitConditionSatisfied` and commits the offset; the task stays safely in `waiting`. This keeps event processing exactly-once on the engine side.
+  If the group is now complete, the transaction moves the task from `waiting` to `queued` (with `resume_pending = true`), saves `WaitConditionSatisfied` and `TaskResumed` into **that domain's** outbox (§3.2 Event Producer), and signals `newTask` after commit. If other conditions are still pending (for example in `all` mode), the transaction only saves `WaitConditionSatisfied`, and the task stays in `waiting`.
+
+- **Exactly once per domain** (no cross-database transaction, §3.8). Each domain with candidates is applied in its own transaction, which first inserts the event `id` into that domain's `te_event_inbox` (§3.7) with `ON CONFLICT DO NOTHING`; if the row exists, the event was already applied there and is skipped. Non-`default` domains go first. The `default` domain goes last, inside the SDK `TxConsumerHandler` transaction (`LocalDbOffsetManager`, `WithTx`), which also commits the offset. A crash in between means redelivery, which the inboxes absorb. Only matched events write inbox rows; they are pruned after `event_consumer.inbox_retention_days`.
 - Handler outcomes drive redelivery: transient failures return `Retry` (SDK backoff); a non-matching event advances the offset (`Success`) without side effects.
 - The consumer runs under `WithLifecycle` with a `CancellationToken`; on shutdown it stops the `ConsumerHandle` (drain in-flight, commit offsets) before DB pools close.
 
-Consumer-group offset tables are provisioned by the SDK/`toolkit-db` (via `LocalDbOffsetManager`), analogous to the outbox tables in §3.7 — the Task Engine defines no consumer-side DDL of its own.
+Consumer-group offset tables are provisioned by the SDK/`toolkit-db` (via `LocalDbOffsetManager`) in the `default` domain database; the Task Engine adds only `te_event_inbox` (§3.7).
 
 ##### Progress Cache (`domain/progress_cache.rs`)
 
@@ -1037,6 +1044,8 @@ Mapping of Task-Engine failure conditions to canonical categories (`gts.cf.core.
 | Completion result invalid: `output` fails the type's output schema, or `error`/`warnings` break the `TaskError` contract (task unchanged, lease kept) | `invalid_argument` | 400 |
 | Task type does not resolve to a registered GTS task type | `invalid_argument` (`context.reason = "UNKNOWN_TASK_TYPE"`) | 400 |
 | GTS registry unreachable and the type is not cached | `service_unavailable` | 503 |
+| Event condition type unresolvable or its topic not waitable (`UNKNOWN_EVENT_TYPE` / `EVENT_TOPIC_NOT_WAITABLE`) | `invalid_argument` | 400 |
+| Caller may not `consume` the event type of an event condition (§3.2 Event wait authorization) | `permission_denied` | 403 |
 | Cross-domain claim / parent-child / dependency; dependency cycle | `invalid_argument` | 400 |
 | Claim assigned nothing and ≥ 1 eligible task was skipped because a concurrency dimension was at capacity (`context.reason = "CONCURRENCY_LIMIT"`, `Retry-After`) | `resource_exhausted` | 429 |
 | Queue depth limit reached on creation / move / re-enqueue (dimension `queue`, `tenant`, `domain_global`, or `deferred`; no usage figures disclosed) | `resource_exhausted` (`context.reason = "QUEUE_DEPTH_LIMIT"`, `Retry-After`) | 429 |
@@ -1146,39 +1155,35 @@ sequenceDiagram
 sequenceDiagram
     participant W as Worker
     participant TE as Task Engine
-    participant DB as Database
+    participant PDP as AuthZ Resolver (PDP)
+    participant DB as Task-domain DB(s)
     participant EB as Event Broker
 
     W->>TE: POST /tasks/{id}/wait-conditions {kind=event, event_type, subject_id}
-    TE->>DB: INSERT wait_condition
-    TE->>DB: UPDATE task state=waiting
-    TE->>DB: Release slots; clear lease_token/lease_until/assignee; apply checkpoint (if any); INSERT wait_timeout timer (if configured)
-    TE->>DB: producer_outbox.enqueue(WaitConditionSet)
-    TE-->>W: 200 OK {wait_condition} (lease ended; worker is free)
+    TE->>TE: topic(event_type) ∉ waitable_topics → 400
+    TE->>PDP: claim on task + consume on event_type [/subject_type], caller's context (deny → 403)
+    TE->>DB: BEGIN; INSERT wait_condition; task → waiting; release slots, clear lease; checkpoint; wait timer
+    TE->>DB: producers[domain].enqueue(WaitConditionSet); COMMIT
+    TE-->>W: 200 OK {wait_condition} (lease ended)
 
-    Note over TE,EB: TE Event Consumer joined via stable consumer group (event_broker_sdk::ConsumerBuilder)
-    EB->>TE: Deliver event {type, tenant, subject, subject_type} (TxConsumerHandler, at-least-once)
-    Note over TE,DB: Single transaction (wait resolution + offset commit)
-    TE->>DB: SELECT pending event waits WHERE event_type matches AND owner_tenant_id = event tenant
-    TE->>TE: Keep rows where event_subject_id / event_subject_type match (when set); evaluate CEL match_expression (if present)
-    TE->>DB: UPDATE matched wait_condition state=satisfied, resolved_payload=event
-    alt wait group now complete (any: first match; all: every condition satisfied)
-        TE->>DB: (any mode) UPDATE sibling conditions state=cancelled
-        TE->>DB: UPDATE task state=queued, resume_pending=true
-        TE->>DB: producer_outbox.enqueue(WaitConditionSatisfied, TaskResumed)
-        TE->>DB: commit offset (LocalDbOffsetManager); COMMIT
-        TE-->>TE: Signal newTask
-    else group still has pending conditions (all mode)
-        TE->>DB: producer_outbox.enqueue(WaitConditionSatisfied)
-        TE->>DB: commit offset (LocalDbOffsetManager); COMMIT
+    Note over TE,EB: Static subscription over waitable topics; no re-join on arm/park
+    EB->>TE: Deliver event (TxConsumerHandler, at-least-once)
+    TE->>DB: Probe pending waits (event_type, tenant[, subject]) per domain
+    loop each domain with candidates (default last)
+        TE->>DB: BEGIN; INSERT te_event_inbox(event_id) ON CONFLICT DO NOTHING (exists → skip)
+        TE->>TE: Subject filters; CEL match_expression
+        TE->>DB: wait_condition → satisfied, resolved_payload = event header (no data)
+        TE->>DB: group complete → siblings cancelled (any), task → queued (resume_pending); enqueue WaitConditionSatisfied [+ TaskResumed]
+        TE->>DB: COMMIT (default domain: + offset commit, LocalDbOffsetManager)
     end
-    Note over TE,EB: event_broker_sdk DbProducer delivers to EB (at-least-once, deduped)
+    TE-->>TE: Signal newTask for resumed tasks
+    Note over TE,EB: Crash before offset commit → redelivery; inbox rows skip applied domains
 ```
 
 **Arm before acting** (PRD §5.4): when the worker itself triggers the event (for example, it calls another service whose reply arrives as an event), it uses two calls so the reply cannot be missed:
 
 ```text
-1. POST /tasks/{id}/wait-conditions {park=false, conditions, mode}   -> armed; returns after the subscription covers the event
+1. POST /tasks/{id}/wait-conditions {park=false, conditions, mode}   -> armed; returns once committed (topic already subscribed)
 2. worker calls the other service
 3. POST /tasks/{id}/wait-conditions/park {lease_token, checkpoint?}  -> satisfied already: 200 + resolved data, task keeps running
                                                                      -> not yet: task parked, flow continues as above
@@ -1465,7 +1470,7 @@ Latest order value per supersede group (PRD §5.1 Task Supersession). Tenant-sco
 | `event_match_expression` | TEXT (nullable) | Event kind: CEL expression |
 | `input_schema` | JSON (nullable) | Input kind |
 | `input_prompt` | TEXT (nullable) | Input kind |
-| `resolved_payload` | BLOB (nullable) | Compressed resolution data read by the next claim: provided input (input kind), matched event payload (event kind), or timeout indication |
+| `resolved_payload` | BLOB (nullable) | Compressed resolution data read by the next claim: provided input (input kind), matched event **header only** — `id`, `type`, `subject`, `subject_type`, `time`, `topic`/`partition`/`offset`, never `data` (event kind), child counts, or timeout indication |
 | `timeout_at` | TIMESTAMP (nullable) | Set at park time (`parked_at + timeout`); `NULL` while armed |
 | `parked_at` | TIMESTAMP (nullable) | `NULL` = **armed** (task still `running`, PRD §5.4 Arm before acting); set when the group parks the task |
 | `owner_tenant_id` | UUID | Inherited from task (Scopable) |
@@ -1474,7 +1479,7 @@ Latest order value per supersede group (PRD §5.1 Task Supersession). Tenant-sco
 
 **Indexes**:
 - `ix_te_waits_task` — `(task_id)` — per-task lookups
-- `ix_te_waits_event_type` — `(event_type, owner_tenant_id)` WHERE `kind_code = event AND state_code = pending` — event matching, restricted to the event's tenant
+- `ix_te_waits_event_subject` — `(event_type, owner_tenant_id, event_subject_id)` WHERE `kind_code = event AND state_code = pending` — consumer candidate probe (§3.2 Event Consumer)
 - `ix_te_waits_timeout` — `(timeout_at)` WHERE `state_code = pending` — timeout scan
 
 > **ALL/ANY is a task-level property, not a per-condition one** (PRD §5.4): the `all`/`any` combine mode governs how the **set** of a task's pending wait conditions resolves the task (ALL = every condition must be satisfied; ANY = the first satisfied condition resumes the task). It is therefore a property of the task's wait *group*, and `mode_code` **MUST** be identical across all pending wait rows of a single task. This holds by construction: a task's whole wait group is inserted by one set-wait call, which parks the task, so rows of one task are never added separately. The column is denormalized onto each row (rather than a separate `te_wait_groups` table) purely so the event-matcher can read the mode from the row it already matched without an extra join; it is not an invitation for rows of one task to disagree. The `WaitConditionService` (§3.2) evaluates resolution against the whole pending set for the task, using this shared mode.
@@ -1515,9 +1520,13 @@ Latest order value per supersede group (PRD §5.1 Task Supersession). Tenant-sco
 
 `te_events` is the **immutable local audit log** and is **always** written (including `taskCreated`) in the same transaction as the state change that produced the event, regardless of the external event-publishing policy (PRD §5.10). The publishing policy (§4.1 `event_policies`, which may be `none`) governs only whether an event is additionally `enqueue`d to the outbox for external delivery — it never suppresses the local log write. `id` is the stable event ID reused by the outbound `TypedEvent` (§3.2 Event Producer), so at-least-once external delivery is safely deduplicated downstream.
 
+#### `te_event_inbox`
+
+Per-domain record of inbound events already applied in this domain, so redelivery never applies one twice (§3.2 Event Consumer). Columns: `event_id` UUID (PK, broker event `id`), `owner_tenant_id` UUID (Scopable; touched only by the event-consumer loop under `allow_all()`, §2.1), `received_at` TIMESTAMP (indexed; pruned after `event_consumer.inbox_retention_days`).
+
 #### Event producer/outbox tables — owned by the Event Broker SDK + `toolkit-db`
 
-Lifecycle event delivery does **not** use any Task-Engine-defined table. It reuses the Event Broker SDK managed outbox producer (see §3.2 Event Producer). Two migration sets, run at startup and owned by the platform, provision the schema:
+Lifecycle event delivery does **not** use any Task-Engine-defined table. It reuses the Event Broker SDK managed outbox producer (see §3.2 Event Producer). They exist in **every task-domain database** (one outbox per domain). Two migration sets, run at startup and owned by the platform, provision the schema:
 
 - **SDK producer-registration tables** via `event_broker_sdk::producer_registration_migrations()` (producer identity / dedup bookkeeping).
 - **toolkit-db outbox table family** (body, incoming, outgoing, partitions, dead-letters, and backend-specific sequence tables) via the SDK/`toolkit-db` outbox migrations under the configured queue prefix.
@@ -1586,7 +1595,7 @@ The Task Engine runs as a single-binary Gears gear. In the default deployment:
 
 Multiple instances share the database and coordinate **without any DB-specific SQL in the Task Engine** (see [ADR/0008-atomic-claim-strategy.md](ADR/0008-atomic-claim-strategy.md)):
 - **Atomic claim**: lock-free optimistic concurrency via the secure ORM — a plain scoped `SELECT` of candidates plus a guarded conditional `UPDATE ... WHERE state_code = queued` where exactly one racing worker observes `rows_affected == 1`. No dialect branching; identical on all backends. **Provisional** (ADR-0008 `proposed`, see the §4.6 claim-contention TODO): scoped `SecureSelect` offers `lock_shared()` / `lock_exclusive()` but no `SKIP LOCKED`, which today exists only inside the toolkit-db outbox.
-- **Event delivery**: the Event Broker SDK `DbProducer` managed outbox (over `toolkit_db::outbox`) owns cross-instance message claiming, delivery, and idempotent-producer dedup; the Task Engine only defines typed events and enqueues them in the state-change transaction (see §3.2 Event Producer).
+- **Events**: the Event Broker SDK `DbProducer` managed outbox (over `toolkit_db::outbox`, one per task domain) owns cross-instance claiming, delivery, and dedup; the Task Engine only enqueues typed events in the state-change transaction. Inbound events come through one static consumer group (§3.2 Event Producer / Event Consumer).
 - **Sharded background loops** (timer wheel, lease scan): to avoid a single-leader throughput ceiling (see below), the hot control-plane loops are **partitioned into `bg_shards` shards** rather than run on one global leader. Each shard `i ∈ 0..bg_shards` is guarded by its own advisory lock (`toolkit_db::advisory_locks`, key `te-bg-shard-{i}`); an instance runs the loop for every shard whose lock it currently holds, and a shard owns exactly the tasks/timers where `hash(task_id) % bg_shards == i`. Every scan (timer claim, lease scan) adds the shard predicate to its `WHERE` clause. With `N` instances and `S = bg_shards ≥ N`, timer/lease processing scales horizontally to `N` nodes; if an instance dies, its shard locks release and surviving instances re-acquire them (crash-safety still backed by per-row guarded updates + `claim_until`). Per-row guarded updates mean no cross-instance `SKIP LOCKED` is needed even within a shard.
 - **Low-frequency singleton loops** (retention/partition maintenance, slot reconciliation): these are cheap and idempotent, so they remain a **single** global leader (advisory lock `te-maintenance`) — sharding them would add coordination cost for no throughput benefit.
 - Signal propagation: in-process tokio channels give immediate same-node wake-ups; cross-node wake-up for long-poll claims is provided by the per-node queue watcher (§3.2 Signal System), which needs no Cluster dependency, so multi-instance deployments claim new work within `claim_poll_interval_ms` of it becoming claimable.
@@ -1599,7 +1608,7 @@ Multiple instances share the database and coordinate **without any DB-specific S
 
 **Recovery and upgrades** (PRD §6.1 Service Availability and Recovery, Rolling Upgrade): all state is in the domain databases, so backup and point-in-time recovery are database operations. On start after a restore, each instance re-reads `te_timers` and the deadline columns of `te_task_state`, and the maintenance leader recomputes `te_concurrency_slots.used` and `te_queue_backlog.used` from task rows (the same reconciliation as §3.2 RetentionService step 5) before claims are served. Migrations use expand/contract: a release only adds columns, tables, and enum values; it removes them one release later, once no older instance is running. New enum values follow the evolution contract in §3.1.
 
-**Task Domains**: When configured, different task type groups are routed to different databases. Each domain has its own connection pool, migrations, and retention schedule. A `default` domain catches unmatched types.
+**Task Domains**: When configured, different task type groups are routed to different databases. Each domain has its own connection pool, migrations, retention schedule, event outbox, and `te_event_inbox` (§3.2). A `default` domain catches unmatched types and holds `te_runtime_config` and the consumer offsets.
 
 **Deterministic routing (`infra/domain_router.rs`)**: A task resolves to exactly one domain via a single **config-order first-match** rule — domain patterns (type or queue) are evaluated top-to-bottom and the first match wins; `default` is the terminal fallback. This one resolver is used identically by create, claim, search, retention, and the ready-task cache, so a task never maps to two databases across operations. Because a queue's registered task types and a domain's patterns are known at config time, queue→domain and type→domain resolution must agree, and a queue and its DLQ must resolve to the same domain; a contradictory config is **rejected at startup** (PRD §5.8, §5.19).
 
@@ -1610,6 +1619,7 @@ Multiple instances share the database and coordinate **without any DB-specific S
 - **Claim**: all queues in one claim request must resolve to one domain (rejected `invalid_argument` `400` otherwise) — the atomic guarded-update claim and highest-priority ordering run within one DB. A worker consuming from queues in different domains issues one claim per domain.
 - **Parent/child** and **predecessor/successor dependencies**: both endpoints must reside in the same domain (rejected `invalid_argument` `400` at creation otherwise). Child-completion tracking, cancellation propagation, cycle validation, and `ALL`/`ANY` unblocking therefore never cross a database boundary.
 - **Cross-domain fan-out** applies only to non-atomic **read** paths (untyped list/search §4.6, DLQ inspection §3.3), never to claim/dependency/parent-child.
+- **Events**: outbound events commit in the task's domain; an inbound event is applied once per domain via its inbox (§3.2 Event Consumer).
 
 ### 3.9 Load Management, Admission Control & Backpressure
 
@@ -1687,10 +1697,10 @@ gears:
       lease_scan_limit: 1000              # max expired tasks handled per scan
       default_lease_duration_secs: 30     # lease duration when the task sets no heartbeat_timeout; renewed on each heartbeat; workers are told to heartbeat every lease/3
 
-      event_producer:                     # event_broker_sdk::DbProducer (feature: outbox → toolkit-db/preview-outbox)
+      event_producer:                     # event_broker_sdk::DbProducer (feature: outbox → toolkit-db/preview-outbox); one per task domain
         topic: "gts.cf.core.events.topic.v1~cf.core.tasks.task_events.v1"
         dedup_mode: monotonic             # monotonic | stateless
-        outbox_queue: task-engine-events
+        outbox_queue: task-engine-events  # per domain: "<outbox_queue>-<domain>"
         partitions: 16                    # producer outbox partitions; drives delivery parallelism
         lease_duration_secs: 30
         lease_headroom_secs: 2
@@ -1701,7 +1711,9 @@ gears:
         session_timeout_secs: 60
         retry_base_secs: 1
         retry_max_secs: 60
-        arm_timeout_ms: 5000              # max wait for the subscription refresh when a worker arms an event wait (PRD §5.4); else 503
+        waitable_topics:                  # static subscription, one interest per topic (≤ 64); waits on other topics → 400 (§3.2 Event Consumer)
+          - "gts.cf.core.events.topic.v1~fabrikam.shop._.orders.v1"   # example (Event Broker sample topic)
+        inbox_retention_days: 30          # te_event_inbox pruning; ≥ the longest possible redelivery window
 
       claim_scan_limit: 32                # page size of each per-queue head read in the claim merge (§4.6, ADR-0008)
       claim_max_queues: 16                # max distinct queues in one claim request (more → 400 invalid_argument); bounds the k-way merge (§4.6)
@@ -1833,8 +1845,9 @@ gears:
 | `te_timer_channel_size` | Gauge | — | Pending timers in channel |
 | `te_signal_channel_size` | Gauge | `type` | Pending signals per type |
 | `te_dlq_size` | Gauge | `queue` | Dead-letter queue depth |
-| `te_outbox_pending` | Gauge | — | Undelivered outbox messages (from `toolkit_db::outbox`) |
-| `te_outbox_dead_letters` | Gauge | — | Outbox messages in the dead-letter table |
+| `te_outbox_pending` | Gauge | `domain` | Undelivered outbox messages (from `toolkit_db::outbox`) |
+| `te_outbox_dead_letters` | Gauge | `domain` | Outbox messages in the dead-letter table |
+| `te_event_consumer_lag` | Gauge | `topic` | Waitable-topic events not yet processed |
 | `te_is_leader` | Gauge | — | 1 if this instance holds the advisory-lock leader for background loops |
 | `te_lease_expired_total` | Counter | `cause` | Tasks reclaimed by lease scan (`cause` = `heartbeat` / `assignment` / `execution`) |
 | `te_claim_capacity_skipped_total` | Counter | `queue`, `dimension` | Claim candidates skipped because a concurrency dimension was at capacity (§4.6 Task Assignment) |
@@ -1889,6 +1902,13 @@ Structured JSON to stdout, ingested by centralized logging system.
 **Queue-depth admission security**: Counters are keyed by the task's `owner_tenant_id`, so tenants cannot consume each other's capacity; `te_queue_backlog` is an engine-internal unrestricted table (like `te_concurrency_slots`) never reachable through a subject scope. The `429` response names only the full dimension and never returns other tenants' or global usage (side-channel). Checks run authorization → validation → dedup/replay → depth, so an unauthorized caller cannot probe capacity and a replay never consumes it. Limit changes (config override, runtime update) require the queue `configure` action and emit `configUpdated`; queue GTS registrations that raise `queue_max_queue_depth` are bounded by the engine-wide `global_max_queue_depth`, which only config can change. Capacity is shared among a tenant's subjects (no per-subject sub-limit); a hostile subject can exhaust its tenant's allowance but never another tenant's — isolate subjects with separate queues/PDP queue constraints where needed.
 
 **Derived dedup / supersession security**: (1) The identity follows the caller's *effective access*: if a policy change alters the compiled scope, the identity and supersede group change too, so duplicates can briefly coexist across the change (a missed dedup, never a disclosure — differing scopes never merge). The `authz_scope` canonical form is engine-defined (JCS over the normalized compiled constraints) and depends on `AccessScope` exposing a stable serialization (PRD §11 Assumptions); until confirmed, only `subject`/`tenant` are accepted and a type declaring `authz_scope` is non-creatable. The identity hash folds in the type's GTS id (contract version), `owner_tenant_id` (the *target* tenant, not necessarily the caller's), and the scope component — `created_by` (`subject`, default), a digest of the PDP-compiled `AccessScope` canonicalized (sorted, normalized; `authz_scope`), or nothing (`tenant`, only when the registrant opts in). The identity is not a credential. (2) The engine is not in the type-registration path (consuming gears register in the GTS registry directly), so it validates `dedup`/`supersede` traits against the type's input schema (required pointers, integer `order_field`, field-count/size caps) the first time it resolves the type, caches the verdict keyed by type id + registry version, and treats an invalid trait as a non-creatable type (fail closed, `invalid_argument` on create); who may register types is governed by the GTS registry authorization. (3) Identity is computed only from schema-validated input after `PolicyEnforcer` allowed `create`; a hit returns the existing task only if `SecureConn` can read it, else `403` without an identifier. This cannot occur under `subject`/`authz_scope` (scope is in the hash); under the opt-in `tenant` scope the residual disclosure (an identical task exists in the target tenant) is accepted. (4) Supersession additionally requires PDP `cancel` on the superseded task with the caller's scope, evaluated inside the create transaction so a denial leaves no change. (5) Fencing interplay: supersession is an ordinary guarded cancel transition (`WHERE state_code IN non-terminal`): `forced` clears the lease token so the holder's next write is `LEASE_LOST`; `graceful` sets `cancel_requested` and the holder's writes stay fenced by its still-valid token until it acknowledges. The `lease_epoch` is not bumped (no new lease is granted). A race with the holder's completion resolves by the guarded update — whichever transition commits first wins; if the holder wins there is simply nothing to supersede. (6) The cancellation is attributed in `te_events` to the creating subject with `superseded_by`.
+
+**Event wait authorization (confused-deputy guard)**: the consumer reads waitable topics with platform rights, across tenants and barriers. Three controls keep that from leaking:
+- events match only waits of their own tenant;
+- setting or arming a wait requires the caller's own `consume` on the event type;
+- only the event header is stored, never its data.
+
+Tenants cannot widen what the engine reads, because `waitable_topics` is operator config (§3.2 WaitConditionService).
 
 **CEL expression safety**: Event wait condition match expressions are parsed and validated at creation time. Evaluation is time-bounded (configurable timeout, default 10ms). Expression AST complexity is limited (max nodes, max depth). See [ADR/0007-event-wait-matching.md](ADR/0007-event-wait-matching.md).
 
@@ -2381,7 +2401,7 @@ Consistent with PRD §4.2:
 | `cpt-cf-task-engine-fr-priority-aging` | §3.2 RetentionService (Priority aging); §4.1 Configuration (priority_aging) |
 | `cpt-cf-task-engine-fr-wait-conditions` | §3.1 WaitCondition entity; §3.2 WaitConditionService; ADR-0004 |
 | `cpt-cf-task-engine-fr-wait-timer` | §3.1 TimerWait; §3.2 WaitConditionService |
-| `cpt-cf-task-engine-fr-wait-event` | §3.1 EventWait; §3.2 WaitConditionService; §3.6 Event Wait sequence |
+| `cpt-cf-task-engine-fr-wait-event` | §3.1 EventWait; §3.2 WaitConditionService (Event wait authorization); §3.2 Event Consumer (waitable topics, per-domain inbox); §3.6 Event Wait sequence; §3.7 `te_event_inbox`; §4.5 Event wait authorization |
 | `cpt-cf-task-engine-fr-wait-event-expression` | §3.1 EventWait (match_expression); ADR-0007 |
 | `cpt-cf-task-engine-fr-wait-input` | §3.1 InputWait; §3.2 WaitConditionService |
 | `cpt-cf-task-engine-fr-wait-children` | §3.1 ChildrenWait; §3.2 WaitConditionService; §4.6 Cascades (Children wait check) |
@@ -2400,7 +2420,7 @@ Consistent with PRD §4.2:
 | `cpt-cf-task-engine-fr-parent-child` | §3.1 Domain Model (parent_task_id); §3.2 TaskService |
 | `cpt-cf-task-engine-fr-dependencies` | §3.1 TaskDependency, State Machine (block/unblock); §3.3 dependency endpoints; §3.7 `te_dependencies`; §4.6 Cycle validation |
 | `cpt-cf-task-engine-fr-event-history` | §3.1 TaskEvent; §3.7 `te_events` |
-| `cpt-cf-task-engine-fr-event-publishing` | §3.2 Event Producer (`event_broker_sdk::DbProducer`); ADR-0009 |
+| `cpt-cf-task-engine-fr-event-publishing` | §3.2 Event Producer (`event_broker_sdk::DbProducer`, one outbox per task domain); §3.8 Task Domains; ADR-0010 |
 | `cpt-cf-task-engine-fr-event-publishing-config` | §4.1 Configuration (event_policies) |
 | `cpt-cf-task-engine-fr-authn` | §3.3 Authentication & Authorization |
 | `cpt-cf-task-engine-fr-authz` | §3.3 Permission model; §2.1 Fail-closed principle |
@@ -2416,7 +2436,7 @@ Consistent with PRD §4.2:
 | `cpt-cf-task-engine-fr-sdk` | §3.2 Module Structure (task-engine-sdk); §1.3 Architecture Layers |
 | `cpt-cf-task-engine-fr-search` | §3.3 Search Parameters; §4.6 Multi-Shard Search algorithm |
 | `cpt-cf-task-engine-fr-bulk-ops` | §3.3 Bulk Operation Endpoints |
-| `cpt-cf-task-engine-fr-task-domains` | §3.8 Deployment Topology; §4.1 Configuration (task_domains) |
+| `cpt-cf-task-engine-fr-task-domains` | §3.8 Deployment Topology; §3.2 Event Producer / Event Consumer (per-domain outbox and inbox); §4.1 Configuration (task_domains) |
 | `cpt-cf-task-engine-fr-cluster-cache` | §4.2 Caching Strategy (Ready-task cache) |
 | `cpt-cf-task-engine-fr-rate-limiting` | §4.1 Configuration (rate_limiting) |
 | `cpt-cf-task-engine-fr-recurring` | §4.8 Future Developments |

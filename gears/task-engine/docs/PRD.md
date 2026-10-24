@@ -535,13 +535,13 @@ The system **SHOULD** raise the priority of tasks that have waited in a queue lo
 
 A task **MUST** be able to wait durably for a condition. Wait conditions are fixed engine concepts, not GTS types, with four kinds: timer, event, input, and children ([ADR-0004](ADR/0004-wait-condition-model.md)). A worker or an API consumer sets the conditions; the task moves to `waiting` and goes back to `queued` when they are satisfied.
 
-**Waiting parks the task**: while `waiting`, a task holds no worker, lease, or concurrency slot, however long it waits. Setting a wait ends the worker's lease (a later call with the old token fails `LEASE_LOST`), and resuming needs a new claim with a new lease. A wait set by an API consumer on a claimed task ends that lease too. The set-wait call **MAY** include a checkpoint, so the worker that resumes the task can continue from it; the resumed worker also receives the wait result (event payload, provided input, child counts, or a timeout note). Resuming is never refused by queue depth limits.
+**Waiting parks the task**: while `waiting`, a task holds no worker, lease, or concurrency slot, however long it waits. Setting a wait ends the worker's lease (a later call with the old token fails `LEASE_LOST`), and resuming needs a new claim with a new lease. A wait set by an API consumer on a claimed task ends that lease too. The set-wait call **MAY** include a checkpoint, so the worker that resumes the task can continue from it; the resumed worker also receives the wait result (event header, provided input, child counts, or a timeout note). Resuming is never refused by queue depth limits.
 
 **Groups**: all conditions of a wait are set in one call, with mode `ALL` (every condition must be satisfied) or `ANY` (the first satisfied one resumes the task). Conditions cannot be added later.
 
 **Arm before acting (no missed events)**: a worker often starts an action and then waits for the event that reports its result. If the event comes before the wait exists, it would be lost. So a worker that holds the lease **MAY** set the group in two steps:
 
-1. **Arm** — set the group without parking. The conditions start matching at once; the task keeps running and keeps its lease. The call returns only when the engine is ready to receive the referenced events. Matches while armed are recorded and do not change the task state.
+1. **Arm** — set the group without parking. The conditions start matching at once; the task keeps running and keeps its lease. The call returns only when the engine is ready to receive the referenced events; an event admitted shortly before it **MAY** also match. Matches while armed are recorded and do not change the task state.
 2. **Park** — park the armed group (optionally with a checkpoint). If the group is already satisfied, the task is not parked: the call returns the result and the task keeps running under the same lease. Otherwise the task moves to `waiting` as usual.
 
 The worker arms, then starts its action, then parks. An armed group is dropped when the task stops running without parking. Wait timeouts start at park time. A task has at most one wait group.
@@ -564,9 +564,13 @@ A **timer** condition has a `resume_at` time and is satisfied when that time is 
 
 - [ ] `p2` - **ID**: `cpt-cf-task-engine-fr-wait-event`
 
-An **event** condition names an `event_type` (GTS identifier) and optionally a `subject_id` and `subject_type`. It is satisfied by a matching event from the Event Broker. An event **MUST** only match conditions of tasks in the event's own tenant, so one tenant's events can never resume or inject data into another tenant's tasks. A repeated delivery of the same event **MUST NOT** satisfy a condition twice.
+An **event** condition names an `event_type` (GTS identifier) and optionally a `subject_id` and `subject_type`. It is satisfied by a matching event from the Event Broker. An event **MUST** only match conditions of tasks in the event's own tenant, so one tenant's events can never resume or inject data into another tenant's tasks. A repeated delivery of the same event **MUST NOT** satisfy a condition twice, even across task domains (§5.19).
 
-- **Rationale**: Event waits let a task react to other systems without polling.
+- **Waitable topics**: only topics the operator lists as waitable are received. A condition on another topic's event type is rejected (`400`). Setting a wait **MUST NOT** change the engine's broker subscription.
+- **Authorization**: setting or arming an event condition **MUST** require the caller's own Event Broker `consume` permission on the event type (and `subject_type`) in the task's tenant; otherwise `403`, fail closed.
+- **Header only**: the engine **MUST** store and return only the matched event's header (ID, type, subject, subject type, time, broker position), never its data. A resumed worker that needs the data reads it from the source with its own permissions.
+
+- **Rationale**: Event waits let a task react to other systems without polling. The engine reads events with platform rights; the caller check and header-only storage keep waits from bypassing event authorization.
 - **Actors**: `cpt-cf-task-engine-actor-worker`, `cpt-cf-task-engine-actor-event-broker`
 
 #### Event Wait Condition — Match Expression
@@ -830,7 +834,7 @@ The system **MUST** publish lifecycle events to the platform Event Broker. Suppo
 **Delivery contract**:
 
 - Each event carries the stable event ID from the history.
-- A state change and its events **MUST** be recorded atomically, even when the Event Broker is down; events are delivered later.
+- A state change and its events **MUST** be recorded atomically in the database of the task's domain (§5.19), even when the Event Broker is down; events are delivered later, in order per task.
 - Delivery is **at-least-once**. Consumers, including the engine's own event-wait matcher, **MUST** deduplicate on the event ID.
 
 **When the Event Broker is unavailable**: the task history stays readable through the API (`GET /tasks/{id}/events`). Undelivered events wait in the platform outbox and are delivered when the broker is back. Retention and back-pressure of undelivered events are governed by the platform outbox, not by the engine.
@@ -1083,6 +1087,8 @@ The system **MUST** support **task domains** that send different task classes to
 **Routing changes**: a change applies only to new tasks; existing tasks never move between databases. A change that would leave unfinished tasks in their old domain **MUST** stop startup with an error naming them. Moving a live type or queue to another domain needs draining its unfinished tasks first.
 
 **One domain per atomic operation**: a claim, a parent with its children, and a predecessor with its successor **MUST** each stay in one domain; requests that cross domains are rejected (`400`).
+
+**Events per domain**: each domain keeps its own outgoing events (§5.10). An incoming event that satisfies waits in several domains **MUST** be applied exactly once in each, without a cross-database transaction.
 
 **Reads across domains**: a read without a task type filter **SHOULD** cover all domains with consistent sorting and paging. Untyped DLQ inspection **MUST** cover all domains (§5.8).
 
@@ -1343,12 +1349,12 @@ The engine does not process personal data of its own, but it stores caller ident
 3. The task moves to `waiting` and the worker is free
 4. The external system publishes a matching event through the Event Broker
 5. The condition is satisfied and the task goes back to `queued`
-6. A worker claims it and continues from the checkpoint, with the event data (§5.4)
+6. A worker claims it and continues from the checkpoint, with the event header (§5.4)
 
-**Postconditions**: The task resumed with the event data; the wait is recorded in its history.
+**Postconditions**: The task resumed with the event header; the wait is recorded in its history.
 
 **Alternative Flows**:
-- **Event arrives before parking**: park returns the event data at once and the task keeps running
+- **Event arrives before parking**: park returns the event header at once and the task keeps running
 
 ### Retry with Backoff After Transient Failure
 
@@ -1385,6 +1391,9 @@ The engine does not process personal data of its own, but it stores caller ident
 - [ ] All four wait kinds suspend and resume tasks; a waiting task holds no slot, lease, or assignee, resumes through `queued` and a new claim, and that claim does not start a new attempt
 - [ ] Ten `fault=task` failures in a row do not blacklist a worker; ten lease expiries or `fault=worker` failures do
 - [ ] Event waits apply their match expressions
+- [ ] A caller without `consume` on an event type cannot set or arm a wait on it (`403`); a satisfied event condition stores and returns only the event header
+- [ ] A wait on a non-waitable topic is rejected (`400`); waits in ≥ 1,000 tenants never change the broker subscription
+- [ ] With two task domains, an event matching waits in both is applied exactly once in each, also after a crash and redelivery, and each domain's outgoing events commit with its state changes
 - [ ] Concurrency limits (queue and type, global and per tenant) are never exceeded under concurrent claims
 - [ ] Queue depth limits are never exceeded at admission under concurrent creates (the domain ceiling within one sampling interval), and no tenant ever has more than `tenant_max_deferred_tasks` deferred tasks; a full limit returns `429` (`QUEUE_DEPTH_LIMIT`) with `Retry-After` and shows no other tenant's usage; replays and requeues are never refused
 - [ ] A type with a derived dedup identity accepts creates with or without a key (a sent key has no effect on the identity), answers a duplicate with `409`, and gives callers with different `authz_scope` values (or different subjects under `subject` scope) independent tasks
@@ -1432,7 +1441,7 @@ The engine does not process personal data of its own, but it stores caller ident
 | Tenant Resolver gear | Tenant hierarchy, subtree, and barrier rules | p1 |
 | Resource Group Resolver gear | Resource-group hierarchy for group-scoped policies | p2 |
 | GTS Registry | Registers and resolves task, queue, and entry types and instances | p1 |
-| Event Broker gear | Receives lifecycle events and delivers inbound events for event waits. The engine keeps running without it: events wait in the outbox, but event waits cannot resolve until it is back | p1 |
+| Event Broker gear | Receives lifecycle events and delivers inbound events for event waits. The engine consumes waitable topics as a platform service and needs `consume` grants on them. It keeps running without the broker: events wait in the outbox, but event waits cannot resolve until it is back | p1 |
 | ToolKit DB layer | Database access, connection pools, migrations, and the event outbox | p1 |
 | Cluster gear | Distributed cache for the optional ready-task cache ([Cluster PRD](../../system/cluster/docs/PRD.md)) | p3 |
 | CEL evaluator | Evaluates match expressions for event waits | p2 |
@@ -1454,7 +1463,8 @@ The engine does not process personal data of its own, but it stores caller ident
 |------|--------|------------|
 | Background timer processing falls behind under load | Tasks time out late | Timer work is split across instances; backlog metrics and alerts |
 | Ready-task cache is stale after a Cluster outage | Wasted claim attempts | Cache is only a hint; rebuilt on reconnect; database fallback |
-| High event volume slows event-wait matching | Waiting tasks resume late | Matching narrowed by event type and tenant before any expression runs |
+| High event volume slows event-wait matching | Waiting tasks resume late | Only waitable topics consumed; indexed probe (type, tenant, subject) before any expression; consumer lag alert |
+| Event waits used to read events the caller may not see | Disclosure across authorization boundaries | Caller's `consume` check on set/arm; only the event header is stored (§5.4) |
 | Expensive match expressions | Slow event processing | Expressions checked when set, with complexity and time limits |
 | Dead-letter queues grow unnoticed | Unbounded storage | DLQ size metrics and alerts; retention applies to dead-lettered tasks |
 | Many workers race for the head of one queue | Claim throughput collapses | Open design item (DESIGN §4.6, ADR-0008); the throughput NFR measures this case |
@@ -1466,7 +1476,8 @@ The engine does not process personal data of its own, but it stores caller ident
 
 ## 13. Open Questions
 
-- How should event-wait matching scale when thousands of tasks wait for many different event types?
+- Is one indexed probe per event (or batch) enough for the volume of the waitable topics, or is broker-side filtering needed?
+- When will the Event Broker offer reads by position (post-MVP `GET /v1/events`), so a resumed worker can fetch a matched event's data with its own rights?
 - What is the maximum depth of parent/child hierarchies?
 - Should retried tasks prefer the same worker ("sticky" assignment)?
 - Does ToolKit expose a stable serialized form of the compiled access scope for the `authz_scope` dedup identity, or must the engine build it from the raw PDP constraints?

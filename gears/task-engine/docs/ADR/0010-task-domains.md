@@ -55,7 +55,7 @@ How it works:
 * Patterns are checked in config order. The first domain that matches wins. The same resolver is used for every operation: create, claim, search, retention, and cache.
 * Operations that need atomicity stay inside one domain: a claim may name only queues of one domain, and a parent and its children, or a predecessor and its successor, must be in the same domain. Cross-domain requests are rejected.
 * Read-only lists without a type filter, and DLQ inspection, fan out to all domains and merge the results.
-* Each domain has its own migrations, connection pool, counters, and retention loop.
+* Each domain has its own migrations, connection pool, counters, retention loop, event outbox, and event inbox. Outgoing events commit with the task's state; an incoming event is applied once per domain via its inbox, and the consumer offset is committed last.
 
 ### Consequences
 
@@ -70,6 +70,7 @@ How it works:
 * Tests check that create, claim, search, and retention resolve the same domain for the same task.
 * Tests check that cross-domain claims, dependencies, and parent/child links are rejected.
 * Tests check that startup fails on conflicting routes and on routes that would strand live tasks.
+* Tests check that an event matching waits in two domains is applied exactly once in each, also after a crash and redelivery.
 
 ## Pros and Cons of the Options
 
