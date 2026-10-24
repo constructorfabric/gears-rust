@@ -33,6 +33,7 @@ fn cluster_config_applies_documented_defaults() {
     assert_eq!(config.wait_timeout_ms, 1_000);
     assert_eq!(config.watch_mode, WatchMode::Publish);
     assert!(!config.manage_keyspace_notifications);
+    assert_eq!(config.subscriber_buffer_capacity, 4_096);
 }
 
 #[test]
@@ -47,6 +48,7 @@ fn lock_config_applies_the_same_defaults_for_the_fields_it_shares() {
     assert_eq!(config.durability, None);
     assert_eq!(config.wait_replicas, None);
     assert_eq!(config.wait_timeout_ms, 1_000);
+    assert_eq!(config.subscriber_buffer_capacity, 4_096);
 }
 
 #[test]
@@ -63,6 +65,7 @@ fn cluster_config_round_trips_every_field() {
         "wait_timeout_ms": 2_500,
         "watch_mode": "disabled",
         "manage_keyspace_notifications": true,
+        "subscriber_buffer_capacity": 512,
     }))
     .expect("full config deserializes");
     assert_eq!(config.url, "rediss://:pw@redis-primary:6379/3");
@@ -76,6 +79,7 @@ fn cluster_config_round_trips_every_field() {
     assert_eq!(config.wait_timeout_ms, 2_500);
     assert_eq!(config.watch_mode, WatchMode::Disabled);
     assert!(config.manage_keyspace_notifications);
+    assert_eq!(config.subscriber_buffer_capacity, 512);
 }
 
 #[test]
@@ -231,6 +235,7 @@ fn the_shared_fields_deserialize_identically_in_both_types() {
         "durability": "fsync_always",
         "wait_replicas": 2,
         "wait_timeout_ms": 222,
+        "subscriber_buffer_capacity": 333,
     });
     let cluster: RedisClusterConfig =
         serde_json::from_value(shared.clone()).expect("cluster config deserializes");
@@ -246,6 +251,10 @@ fn the_shared_fields_deserialize_identically_in_both_types() {
     assert_eq!(cluster.durability, lock.durability);
     assert_eq!(cluster.wait_replicas, lock.wait_replicas);
     assert_eq!(cluster.wait_timeout_ms, lock.wait_timeout_ms);
+    assert_eq!(
+        cluster.subscriber_buffer_capacity,
+        lock.subscriber_buffer_capacity
+    );
 }
 
 #[test]
@@ -343,6 +352,7 @@ fn debug_still_renders_every_other_field() {
         "wait_timeout_ms",
         "watch_mode",
         "manage_keyspace_notifications",
+        "subscriber_buffer_capacity",
     ] {
         assert!(
             rendered.contains(field),
@@ -414,4 +424,37 @@ fn the_duration_accessors_agree_with_their_millisecond_fields() {
     .expect("lock config deserializes");
     assert_eq!(lock.command_timeout(), Duration::from_millis(250));
     assert_eq!(lock.wait_timeout(), Duration::from_millis(750));
+}
+
+#[test]
+fn validate_bounds_the_subscriber_buffer_capacity_in_both_types() {
+    // Zero would panic inside `fred`'s client constructor; past the ceiling is a
+    // typo.
+    for value in [0, MAX_SUBSCRIBER_BUFFER_CAPACITY + 1] {
+        let overrides = minimal(json!({ "subscriber_buffer_capacity": value }));
+        let cluster: RedisClusterConfig =
+            serde_json::from_value(overrides.clone()).expect("cluster config deserializes");
+        let lock: RedisLockConfig =
+            serde_json::from_value(overrides).expect("lock config deserializes");
+        for err in [
+            cluster.validate().expect_err("out of range"),
+            lock.validate().expect_err("out of range"),
+        ] {
+            assert!(
+                matches!(err, ClusterError::InvalidConfig { ref reason }
+                    if reason.contains("subscriber_buffer_capacity")),
+                "{value} must be an InvalidConfig naming the key, got {err}"
+            );
+        }
+    }
+    for value in [1, MAX_SUBSCRIBER_BUFFER_CAPACITY] {
+        let config: RedisClusterConfig =
+            serde_json::from_value(minimal(json!({ "subscriber_buffer_capacity": value })))
+                .expect("config deserializes");
+        config.validate().expect("the bounds themselves are valid");
+        assert_eq!(
+            config.subscriber_buffer_capacity(),
+            usize::try_from(value).expect("fits")
+        );
+    }
 }
