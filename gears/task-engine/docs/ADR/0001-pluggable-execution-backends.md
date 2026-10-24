@@ -183,6 +183,8 @@ Build one core engine in one database. Keep execution native. Scale with shardin
 
 ## More Information
 
+"Execution in the core" means execution *state*; task code never runs in the Task Engine. Workers are separate processes, and in-gear execution on a local worker belongs to [Durable Execution](../../../system/durable-execution/docs/PRD.md) (DESIGN `cpt-cf-task-engine-design-positioning`).
+
 The design keeps execution and the true state in one place:
 
 ```text

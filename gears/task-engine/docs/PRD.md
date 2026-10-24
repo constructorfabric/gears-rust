@@ -66,7 +66,9 @@ description: "Product requirements for the Task Engine gear: durable, multi-tena
 
 ### 1.1 Purpose
 
-**Task Engine** is a CF/Gears gear that runs units of work ("tasks") for many tenants across a cluster. API clients create tasks; workers claim them, run them, and report results. The engine owns the full task lifecycle: queues with priorities and concurrency limits, safe claiming with leases, timeouts, retries, durable waits, dependencies, progress, and an audit trail. Task types are extensible through the Global Type System (GTS).
+**Task Engine** is a CF/Gears gear that orchestrates units of work ("tasks") for many tenants across a cluster. API clients create tasks; workers claim them, run them, and report results. The engine owns the full task lifecycle: queues with priorities and concurrency limits, safe claiming with leases, timeouts, retries, durable waits, dependencies, progress, and an audit trail. Task types are extensible through the Global Type System (GTS).
+
+The engine is a **control plane only**: it runs no task code and hosts no workers. Running a gear's own activities and workflows in-process, on a local worker, is the job of the [Durable Execution](../../system/durable-execution/docs/PRD.md) gear.
 
 This PRD states **what** the engine must do and **why**. **How** it is built is in [DESIGN.md](./DESIGN.md) and the [ADRs](./ADR/).
 
@@ -83,7 +85,7 @@ Teams that run background work across services and tenants keep hitting the same
 
 ### 1.3 Goals (Business Outcomes)
 
-- One reusable task engine for the whole CF/Gears platform, replacing per-gear job queues
+- One reusable task orchestration control plane for the whole CF/Gears platform, replacing per-gear job queues
 - Strong tenant isolation with per-tenant limits, retention, and access policies
 - Durable waits (timer, event, input, children) so tasks can pause without polling
 - New task types, schemas, and entry types without engine releases or database migrations
@@ -208,6 +210,7 @@ Teams that run background work across services and tenants keep hitting the same
 
 ### 4.2 Out of Scope
 
+- **Executing task code** — the engine never runs task handlers or hosts workers; workers pull work through the API (§5.6). In-gear execution on a local worker belongs to the Durable Execution gear (§1.1)
 - **Workflow orchestration** — the engine supports dependencies, parent/child links, and waits, but it does not run user-defined control flow (branches, loops, sagas, arbitrary DAGs). Control flow belongs to the worker or caller
 - **UI or dashboard** — consumers build them on the REST API
 - **Message broker replacement** — the engine manages tasks, not pub/sub messaging

@@ -45,7 +45,11 @@ description: "Technical design of the Task Engine gear: state machine, services,
 
 ### 1.1 Architectural Vision
 
-The Task Engine is a distributed, multi-tenant task execution engine implemented as a gear. It manages the full lifecycle of structured work units — creation, queuing, atomic claiming with leases, execution with heartbeat monitoring, durable suspension via wait conditions, retry with backoff, parent/child hierarchies, and structured completion — across a cluster of workers.
+The Task Engine is a distributed, multi-tenant task orchestration control plane implemented as a gear. It manages the full lifecycle of structured work units — creation, queuing, atomic claiming with leases, execution tracking with heartbeat monitoring, durable suspension via wait conditions, retry with backoff, parent/child hierarchies, and structured completion — across a cluster of workers.
+
+**ID**: `cpt-cf-task-engine-design-positioning`
+
+**Control plane, not an executor.** The Task Engine owns task state, queues, leases, timers, waits and history, but **runs no task code and hosts no workers**. Workers are separate processes that claim tasks through the REST API or SDK. Running a gear's own activities and workflows in-process, on a local worker, is the job of the [Durable Execution](../../system/durable-execution/docs/PRD.md) gear. A Durable Execution activity may be a Task Engine client or worker; the reverse never applies.
 
 The architecture follows a **DDD-Light layered design** (SDK → API/Transport → Domain → Infrastructure) consistent with the ToolKit framework. The system is decomposed into five internal subsystems:
 
