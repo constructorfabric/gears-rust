@@ -738,7 +738,7 @@ file-rotate = "0.8"
 chrono = { version = "0.4", default-features = false, features = ["serde"] }
 
 # Enum helpers (variant iteration)
-strum = { version = "0.27", features = ["derive"] }
+strum = { version = "0.28", features = ["derive"] }
 
 # Kubernetes client (optional, for k8s feature gate)
 kube = { version = "4.2", default-features = false }
