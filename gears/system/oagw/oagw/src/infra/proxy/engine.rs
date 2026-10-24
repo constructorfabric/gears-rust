@@ -85,6 +85,11 @@ impl ProxyEngine {
         if settings.skip_upstream_tls_verify {
             cfg.tls.verification = toolkit_http_proxy::CertVerification::DangerAcceptAny;
         }
+        // In-crate unit tests skip the runtime bootstrap that installs the
+        // process crypto provider; under `fips` the engine fails closed
+        // without one.
+        #[cfg(all(test, feature = "fips"))]
+        drop(toolkit::bootstrap::init_crypto_provider());
         let client = ProxyClient::with_observer(cfg, Arc::new(LogObserver))?;
         Ok(Self {
             client,
