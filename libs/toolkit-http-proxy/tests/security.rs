@@ -888,6 +888,91 @@ async fn h2_upload_stall_after_the_head_still_fails_the_exchange() {
     assert_eq!(err.kind(), ErrorKind::WriteTimeout, "{err}");
 }
 
+/// A well-behaved h2 server that never opens its upload window and streams
+/// response DATA as fast as flow control allows, forever.
+async fn flooding_h2_upstream() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((sock, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let Ok(mut conn) = h2::server::Builder::new()
+                    .initial_window_size(0)
+                    .handshake::<_, Bytes>(sock)
+                    .await
+                else {
+                    return;
+                };
+                let Some(Ok((_req, mut respond))) = conn.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let Ok(mut out) = respond.send_response(http::Response::new(()), false) else {
+                        return;
+                    };
+                    loop {
+                        out.reserve_capacity(16 * 1024);
+                        match std::future::poll_fn(|cx| out.poll_capacity(cx)).await {
+                            Some(Ok(0)) => {}
+                            Some(Ok(n)) => {
+                                if out.send_data(Bytes::from(vec![b'x'; n]), false).is_err() {
+                                    return;
+                                }
+                            }
+                            _ => return,
+                        }
+                    }
+                });
+                while conn.accept().await.is_some() {}
+            });
+        }
+    });
+    addr
+}
+
+#[tokio::test]
+async fn h2_upload_stall_is_not_hidden_by_a_response_flood() {
+    // The upstream keeps the receive queue full: draining after the abort
+    // must still end, bounded by the window the engine stops replenishing.
+    let addr = flooding_h2_upstream().await;
+    let mut cfg = support::test_config();
+    cfg.write_timeout = Some(Duration::from_millis(300));
+    cfg.read_timeout = Some(Duration::from_secs(5));
+    let window = cfg.h2.initial_stream_window_size as usize;
+    let c = ProxyClient::new(cfg).unwrap();
+    let req = Request::post("/")
+        .body(full_body(Bytes::from(vec![b'x'; 256 * 1024])))
+        .unwrap();
+    let resp = within(Duration::from_secs(2), c.send(&h2_target(addr), req))
+        .await
+        .unwrap();
+    let mut body = resp.into_body();
+    let started = Instant::now();
+    let mut after_abort = 0usize;
+    let err = within(Duration::from_secs(5), async {
+        loop {
+            match body.frame().await {
+                Some(Ok(frame)) => {
+                    if started.elapsed() > Duration::from_millis(400) {
+                        after_abort += frame.into_data().map_or(0, |d| d.len());
+                    }
+                    // Consume slower than the upstream sends, so the
+                    // receive queue never runs empty on its own.
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                }
+                Some(Err(e)) => break e,
+                None => panic!("the flood never ends"),
+            }
+        }
+    })
+    .await;
+    assert_eq!(err.kind(), ErrorKind::WriteTimeout, "{err}");
+    assert!(
+        after_abort <= window,
+        "{after_abort} bytes drained after the abort"
+    );
+}
+
 #[tokio::test]
 async fn completed_h2_response_stops_the_upload_while_still_held() {
     // Once the response is complete the upload is pointless: it must stop

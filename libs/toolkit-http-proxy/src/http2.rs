@@ -254,7 +254,10 @@ async fn wait_capacity(out: &mut SendStream<Bytes>, stall: Option<Duration>) -> 
 
 /// Upload task: runs [`upload`] until it ends or the exchange is cancelled
 /// (then the stream is reset). If the upload gives up, the owner is told and
-/// the reset waits for its decision.
+/// the reset waits for its decision, unless the peer resets the stream or the
+/// connection goes away first (nothing left to reset then). A response body
+/// kept without being polled keeps its stream, as an unread HTTP/1.1 body
+/// keeps its connection.
 async fn pump(
     mut body: ProxyBody,
     mut out: SendStream<Bytes>,
@@ -273,7 +276,10 @@ async fn pump(
     if let Some(cause) = gave_up {
         drop(body);
         exchange.give_up(cause);
-        exchange.cancel.cancelled().await;
+        tokio::select! {
+            () = exchange.cancel.cancelled() => {}
+            _ = poll_fn(|cx| out.poll_reset(cx)) => return,
+        }
     }
     out.send_reset(Reason::CANCEL);
 }
@@ -419,8 +425,13 @@ impl H2Body {
         if !self.data_done {
             match self.recv.poll_data(cx) {
                 Poll::Ready(Some(Ok(data))) => {
-                    // Credit the window now that the caller has the bytes.
-                    let _released = self.recv.flow_control().release_capacity(data.len());
+                    // Credit the window now that the caller has the bytes,
+                    // unless the upload gave up: then the upstream gets no
+                    // more credit, so what it can still send (and the drain
+                    // before the abort surfaces) is bounded by the window.
+                    if !self.exchange.abort.is_cancelled() {
+                        let _released = self.recv.flow_control().release_capacity(data.len());
+                    }
                     if self.recv.is_end_stream() {
                         self.finish();
                     }
