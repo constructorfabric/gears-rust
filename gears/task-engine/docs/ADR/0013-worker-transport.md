@@ -52,17 +52,17 @@ Chosen option: "REST long-poll claims", because it gives near-instant delivery w
 
 How it works:
 
-* A worker calls `POST /tasks/claim` with a timeout. If no task is ready, the request waits. The wait is capped by `claim_max_wait_secs` (default 50 seconds, below the common 60-second proxy idle timeout); a longer request is shortened, not rejected.
+* A worker calls `POST /tasks/claim` with a timeout and may ask for up to `max_tasks` tasks (ADR-0008). If no task is ready, the request waits. The wait is capped by `claim_max_wait_secs` (default 50 seconds, below the common 60-second proxy idle timeout); a longer request is shortened, not rejected.
 * A waiting request holds no database connection. It is woken by an in-process signal when work arrives on the same instance.
-* For work created on another instance, each instance runs one queue watcher. It checks each queue that has waiting workers once per `claim_poll_interval_ms` (default 1 second) and wakes them on a hit. The cost depends on the number of queues with waiters, not on the number of workers.
-* The claim response includes `heartbeat_interval_secs` (one third of the lease). A worker running many tasks renews all its leases with one batch heartbeat request.
+* For work created on another instance, each instance runs one queue watcher. It checks each queue that has waiting workers once per `claim_poll_interval_ms` (default 1 second) and, on a hit, wakes one claim per waiter group (node-local coalescing, ADR-0008). The cost depends on the number of queues with waiters, not on the number of workers.
+* The claim response includes a `session_id` and `heartbeat_interval_secs` (one third of the session lease). A worker renews all its leases in a domain with one heartbeat of its worker session (ADR-0017).
 * A dropped connection loses nothing: an unclaimed task stays queued, and a claimed task is recovered by lease expiry.
 
 ### Consequences
 
 * Each instance must handle many idle connections (target 5,000 per node). The request path keeps waiting claims away from the database pool and admission permits.
 * Cross-instance delivery can take up to one poll interval.
-* Workers send one claim request per task (batch claims are still open, DESIGN §4.6) and one batch heartbeat for all their leases.
+* Workers claim several tasks per request when they have free capacity (`max_tasks`) and send one heartbeat per worker session for all their leases.
 * A streaming transport can be added later as an extra transport beside REST (DESIGN §4.8). That needs a new ADR.
 
 ### Confirmation

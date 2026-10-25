@@ -112,6 +112,7 @@ Teams that run background work across services and tenants keep hitting the same
 | Lease Token | A random value issued with each lease. Every worker write must carry it and come from the lease holder; otherwise it is rejected (§5.6 Lease Fencing) |
 | Lease Epoch | A per-task counter that grows with every new lease. Workers pass it to external systems to reject writes from old leases |
 | Heartbeat | A periodic worker call that renews the lease and returns control signals such as a cancel request |
+| Worker Session | The liveness record of one worker process in one task domain. A heartbeat renews the session, and so every lease it holds (§5.6) |
 | Checkpoint | Saved intermediate state that lets a task resume after an interruption |
 | Dependency | A predecessor/successor link: a task stays blocked until its predecessors finish successfully |
 | Retry Policy | Per task, or inherited from the task type or queue (§5.12 Type defaults resolution): two budgets — `max_retries` for reported failures and `max_liveness_requeues` for lost workers — plus backoff, jitter, and error codes that are never retried |
@@ -646,7 +647,9 @@ gts.cf.core.tasks.entry.v1~cf.core.tasks.entry_measurement.v1~ — measurement /
 
 - [ ] `p1` - **ID**: `cpt-cf-task-engine-fr-assignment`
 
-A worker **MUST** be able to claim a task from one or more queues. The claim assigns the best eligible task across all named queues, gives the worker a lease (§5.6 Lease Fencing), counts the task against concurrency limits, and returns the task — all as one atomic step. Two workers **MUST NOT** claim the same task. All named queues **MUST** be in one task domain (§5.19); the number of queues per claim **MAY** be capped. Requests that break these rules are rejected (`400`); a worker that consumes queues in several domains sends one claim per domain.
+A worker **MUST** be able to claim a task from one or more queues. The claim assigns the best eligible task across all named queues, gives the worker a lease (§5.6 Lease Fencing), counts the task against concurrency limits, and returns the task — all as one atomic step. Two workers **MUST NOT** claim the same task. A task that another claim is taking at that moment is skipped; the claim takes the best task that no other claim holds.
+
+**Batch claim**: a claim **MAY** ask for up to `max_tasks` tasks (capped by config). Each task is chosen, leased, and counted as in a single claim, with its own lease token; the claim returns between 0 and `max_tasks` tasks. All named queues **MUST** be in one task domain (§5.19); the number of queues per claim **MAY** be capped. Requests that break these rules are rejected (`400`); a worker that consumes queues in several domains sends one claim per domain.
 
 **Order across queues**: each queue offers its next task (§5.2); the claim takes the most urgent, then the oldest, then the lowest task ID. Priority is not compared across queues. The order in which queues are listed does not matter.
 
@@ -656,7 +659,7 @@ A worker **MUST** be able to claim a task from one or more queues. The claim ass
 
 **Worker identity**: many worker processes often share one service principal. Every claim **MUST** carry a `worker_id`: 1–128 characters from `[A-Za-z0-9._:-]`, naming one worker process (for example pod name plus process ID), and kept across restarts where possible. A missing or invalid `worker_id` is rejected (`400`). The **worker identity** is the pair (caller's `subject_id`, `worker_id`). It is recorded on the assignment and used for the blacklist, events, and audit. Because it includes the authenticated subject, one principal cannot act as, or blacklist, another principal's workers. `worker_id` is not a credential ([ADR-0014](ADR/0014-worker-identity.md)).
 
-The assignment **MUST** record the worker identity, claim time, lease expiry, last heartbeat, attempt, lease token, and lease epoch.
+The assignment **MUST** record the worker identity, claim time, worker session (whose record holds the lease expiry and last heartbeat), attempt, lease token, and lease epoch.
 
 - **Rationale**: Atomic, lease-based claiming is the base of safe distributed execution: no double dispatch, and abandoned tasks are recovered automatically. A per-process `worker_id` lets the engine blacklist one faulty replica instead of a whole fleet.
 - **Actors**: `cpt-cf-task-engine-actor-worker`
@@ -666,6 +669,8 @@ The assignment **MUST** record the worker identity, claim time, lease expiry, la
 - [ ] `p1` - **ID**: `cpt-cf-task-engine-fr-heartbeat`
 
 A heartbeat **MUST** renew the lease and return the cancel-requested flag, the task state, and `heartbeat_interval_secs`. Workers **MUST** heartbeat at least that often. A **batch heartbeat** **MUST** renew many leases of one caller in one request, with a result per lease (renewed, or `LEASE_LOST`). A heartbeat with a stale token returns `LEASE_LOST`, which tells the worker to stop.
+
+**Worker sessions**: leases are kept alive per worker process, not per task ([ADR-0017](ADR/0017-worker-session-leases.md)). The first claim of a worker process in a task domain opens a **worker session**; every lease the process holds in that domain belongs to it. A heartbeat renews the session, and so all of its leases; the cost of a heartbeat **MUST NOT** grow with the number of tasks the process holds. As a result, a task stays leased while its worker process keeps heartbeating, even if the task's own handler is stuck; the execution timeout (§5.3) bounds that case, and a worker that stops working on a task **MUST** release it. When a session expires, all of its leases expire together and count as one outage for the blacklist (below).
 
 If a lease expires, it is a liveness failure (§5.3): the task goes back to the queue with backoff while the `max_liveness_requeues` budget remains (§5.8), otherwise it ends with `timed_out`. Lease expiry **MUST** use the retry policy's backoff, not an immediate requeue, and counts toward the worker blacklist (below).
 
@@ -1569,7 +1574,8 @@ The engine does not process personal data of its own, but it stores caller ident
 | A caller links to someone else's task | Blocked parent, cascaded cancel, probing | Link authorization, uniform `404` (§5.9) |
 | A tenant puts a platform task type into a privileged queue | Privilege escalation through platform workers | Type and queue constraints from the PDP; `operated_by` and `accepted_types` (§5.11, §5.12) |
 | A registrant declares unsafe settings | Endless retries, leases that always expire | Engine limits on every declared value (§5.12) |
-| Many workers race for the head of one queue | Claim throughput collapses | Open design item (DESIGN §4.6, ADR-0008); the throughput NFR measures this case |
+| Many workers race for the head of one queue | Claim throughput collapses | `SKIP LOCKED` per-queue streams, batch claims, and node-local claim coalescing (DESIGN §4.6, ADR-0008, `proposed` until the ToolKit API exists and the benchmark passes); the throughput NFR measures this case |
+| Heartbeat writes grow with running tasks | Write load and table bloat on the live table | Worker-session leases: one heartbeat write per worker process and domain (ADR-0017) |
 | Stalled ("zombie") worker writes after its lease expired | Double execution, overwritten result | Lease fencing (§5.6); at-least-once contract with idempotent workers |
 | Clients that poll, time out, and resubmit | Unbounded backlog, noisy tenants | Queue depth limits at admission with `429` and `Retry-After` (§5.2) |
 | Deduplication or supersession crosses an access boundary | Disclosure or unauthorized cancellation | Scope inside the identity; explicit opt-in for `tenant` scope; `cancel` check on the replaced task (§5.1) |

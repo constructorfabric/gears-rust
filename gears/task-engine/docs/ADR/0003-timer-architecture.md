@@ -55,18 +55,18 @@ Chosen option: **Option 4 — Persistent sharded timer wheel plus lease scan.**
 
 Absolute, low-frequency deadlines are stored as `te_timers` rows. A timer wheel per shard sleeps until the nearest expiry, claims due timers with a guarded update and a claim token, and hands them to N worker tasks that apply the timeout action from the state transition table. Abandoned claims are recovered through `claim_until`.
 
-Assignment, heartbeat, and execution deadlines are persisted as columns on `te_task_state` and enforced by a lease scan that runs every `lease_scan_interval_ms` (default 1 second). A heartbeat only extends `lease_until`; it can never extend the assignment or execution deadline.
+Assignment and execution deadlines (and the accept window of a hand-off) are persisted as columns on `te_task_state` and enforced by a deadline scan that runs every `lease_scan_interval_ms` (default 1 second). The heartbeat deadline is the worker session's `lease_until` (ADR-0017), enforced by a session scan on the same interval. A heartbeat only renews the session; it can never extend the assignment or execution deadline.
 
-Both loops are partitioned into `bg_shards` shards. Shard `i` owns the tasks where `hash(task_id) % bg_shards == i` and is guarded by advisory lock `te-bg-shard-{i}`. When an instance dies, its locks are released and another instance takes the shard over.
+All loops are partitioned into `bg_shards` shards. Every row stores a fixed `bg_slot` (0–1023, computed once in Rust from the task or session ID). Shard `i` of `S` owns a contiguous slot range and is guarded by advisory lock `te-bg-{S}-{i}`. Scans filter on the stored slot with plain comparisons, so no SQL hash function is needed, and changing `bg_shards` moves no data. When an instance dies, its locks are released and another instance takes the shard over.
 
 ### Consequences
 
 * No deadline is lost on crash or restart; timers are rebuilt from the database.
-* Heartbeats cost one indexed `UPDATE` and never write timer rows.
-* Timer and lease processing scale with the number of nodes when `bg_shards ≥ node_count`.
+* Heartbeats cost one `UPDATE` of a small session row and never write timer rows or `te_task_state` rows (ADR-0017).
+* Timer and lease processing scale with the number of nodes when `bg_shards ≥ node_count`; changing `bg_shards` needs no data migration.
 * The lifetime and SLA timers survive retries, requeues, and waits; state-specific timers are re-armed on each transition.
 * `assignment`, `execution`, and `heartbeat` remain reserved `TimerType` discriminants but never appear as `te_timers` rows.
-* The sizing rule `lease_scan_limit ≥ (active_tasks / bg_shards) × (lease_scan_interval_ms / lease_ttl_ms)` must hold for the scan to keep up.
+* `lease_scan_limit` must cover the due rows of one shard per scan interval for the scans to keep up.
 
 ### Confirmation
 
@@ -77,7 +77,8 @@ Tests MUST check that:
 * 99% of timers fire within 1 second of expiry with 10,000 active timers;
 * timers survive a process restart and fire afterwards;
 * a heartbeat never extends the assignment or execution deadline;
-* when a shard-holding instance dies, another instance takes over its shard and its timers still fire.
+* when a shard-holding instance dies, another instance takes over its shard and its timers still fire;
+* during a change of `bg_shards`, every slot keeps an owner and no timer fires twice.
 
 ## Pros and Cons of the Options
 
@@ -112,10 +113,10 @@ All deadlines are rows; claim, start, and every heartbeat delete and insert time
 
 ### Option 4: Persistent sharded timer wheel plus lease scan
 
-`scheduled`, `lifetime`, `sla`, `wait`, `queue`, and `cancel_grace` deadlines are `te_timers` rows processed by a timer wheel (`tickTimers` + N `procTimers` workers). Assignment, heartbeat, and execution deadlines are columns (`assignment_deadline`, `lease_until`, `execution_deadline`) checked by a lease scan. Both loops are split into `bg_shards` shards, each guarded by its own advisory lock.
+`scheduled`, `lifetime`, `sla`, `wait`, `queue`, and `cancel_grace` deadlines are `te_timers` rows processed by a timer wheel (`tickTimers` + N `procTimers` workers). Assignment and execution deadlines are columns (`assignment_deadline`, `execution_deadline`, plus `handoff_until`) checked by a deadline scan; the heartbeat deadline is the worker session's `lease_until` (ADR-0017), checked by a session scan. All loops are split into `bg_shards` shards over a stored `bg_slot`, each shard guarded by its own advisory lock.
 
 * Good, because every deadline is persisted and rebuilt on restart.
-* Good, because a heartbeat is a single fenced `UPDATE` with no timer-row churn.
+* Good, because a heartbeat is one small session-row `UPDATE` with no timer-row or task-row churn.
 * Good, because sharding spreads timer and lease work across nodes.
 * Neutral, because there are two mechanisms instead of one.
 * Bad, because the scan interval bounds accuracy, so it must be sized against the NFR.
@@ -138,8 +139,10 @@ Lifetime, SLA, scheduled, queue, cancel-grace, and wait deadlines become columns
 
 ```text
 te_timers rows : scheduled, lifetime, sla, wait, queue, cancel_grace
-te_task_state  : assignment_deadline, lease_until (heartbeat), execution_deadline
-loops          : tickTimers + procTimers (xN) and leaseScan, per shard (te-bg-shard-{i})
+te_task_state  : assignment_deadline, execution_deadline, handoff_until, bg_slot
+te_worker_sessions : lease_until (heartbeat, ADR-0017), bg_slot
+loops          : tickTimers + procTimers (xN), sessionScan, deadlineScan, per shard (te-bg-{S}-{i})
+shard i of S   : bg_slot in [floor(i*1024/S), floor((i+1)*1024/S))
 ```
 
 See DESIGN §3.2 TimerService and §4.6 Timer Wheel algorithm.
@@ -153,7 +156,7 @@ This decision supports these requirements and design elements:
 
 * `cpt-cf-task-engine-fr-timeouts` — all timeout types are persisted and rebuilt on restart.
 * `cpt-cf-task-engine-fr-delayed-enqueue` — `run_after` is a `scheduled` timer.
-* `cpt-cf-task-engine-fr-heartbeat` — heartbeat is a single fenced update of `lease_until`.
+* `cpt-cf-task-engine-fr-heartbeat` — heartbeat renews the worker session; lost sessions are found by the session scan (ADR-0017).
 * `cpt-cf-task-engine-fr-wait-timer` — wait timeouts are `wait` timers.
 * `cpt-cf-task-engine-nfr-timer-accuracy` — timers fire within 1 second.
 * `cpt-cf-task-engine-nfr-capacity` — sharded loops keep up with 100,000 active tasks.

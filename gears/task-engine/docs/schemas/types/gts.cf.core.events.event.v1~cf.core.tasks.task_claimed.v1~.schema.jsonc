@@ -87,7 +87,7 @@
               "minimum": 1
             },
             "lease_until": {
-              "description": "Lease expiry timestamp.",
+              "description": "Lease expiry at claim time: the worker session's lease_until right after the claim renewed it (ADR-0017). Later heartbeats renew the session, not this value.",
               "type": "string",
               "format": "date-time"
             }
