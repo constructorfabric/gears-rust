@@ -10,6 +10,8 @@
 
 use std::future::poll_fn;
 use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -17,7 +19,7 @@ use h2::client::{ResponseFuture, SendRequest};
 use h2::{Reason, RecvStream, SendStream};
 use http::{Request, Version};
 use http_body::Body as _;
-use tokio_util::sync::CancellationToken;
+use tokio_util::sync::{CancellationToken, DropGuard};
 
 use crate::body::{Hold, ProxyBody};
 use crate::config::H2Limits;
@@ -119,15 +121,53 @@ pub enum Started {
     Unsent(Box<Request<ProxyBody>>, ProxyError),
 }
 
+/// Shared state of one HTTP/2 exchange (request upload + response).
+///
+/// The exchange is cancelled when its owner goes away: the dispatch future
+/// before a response head arrives, or the response body afterwards. The
+/// upload task then resets the stream and ends, so abandoned exchanges never
+/// keep uploading or hold the connection busy.
+#[derive(Debug, Default)]
+pub struct Exchange {
+    cancel: CancellationToken,
+    stalled: AtomicBool,
+}
+
+impl Exchange {
+    /// A new exchange and the guard that cancels it on drop.
+    pub fn new() -> (Arc<Self>, DropGuard) {
+        let exchange = Arc::new(Self::default());
+        let guard = exchange.cancel.clone().drop_guard();
+        (exchange, guard)
+    }
+
+    /// The upload was reset because the window stayed closed.
+    pub fn stalled(&self) -> bool {
+        self.stalled.load(Ordering::Acquire)
+    }
+
+    /// The error to report for a failed exchange: a reset we sent because
+    /// the upload stalled is a write timeout, anything else is classified
+    /// from the h2 error.
+    pub fn error(&self, e: &h2::Error, message: &'static str) -> ProxyError {
+        if self.stalled() {
+            return stall_error();
+        }
+        from_h2(e, message)
+    }
+}
+
 /// Open a stream for `req` and start uploading its body.
 ///
 /// The body is uploaded by a spawned task that holds `hold` until the
-/// upload ends, so the connection counts as busy while it runs.
+/// upload ends (so the connection counts as busy while it runs) and stops
+/// when `exchange` is cancelled.
 pub async fn start(
     sender: H2Sender,
     req: Request<ProxyBody>,
     write_timeout: Option<Duration>,
     hold: Option<Hold>,
+    exchange: Arc<Exchange>,
 ) -> Started {
     let mut sender = match sender.ready().await {
         Ok(sender) => sender,
@@ -146,7 +186,7 @@ pub async fn start(
     match sender.send_request(head, end_of_stream) {
         Ok((response, upload)) => {
             if !end_of_stream {
-                tokio::spawn(pump(body, upload, write_timeout, hold));
+                tokio::spawn(pump(body, upload, write_timeout, hold, exchange));
             }
             Started::Sent(response)
         }
@@ -185,12 +225,31 @@ async fn wait_capacity(out: &mut SendStream<Bytes>, stall: Option<Duration>) -> 
     }
 }
 
-/// Upload `body` on `out`, never queueing more than the window allows.
+/// Upload task: runs [`upload`] until it ends or the exchange is
+/// cancelled, in which case the stream is reset.
 async fn pump(
     mut body: ProxyBody,
     mut out: SendStream<Bytes>,
     stall: Option<Duration>,
     _hold: Option<Hold>,
+    exchange: Arc<Exchange>,
+) {
+    let cancelled = tokio::select! {
+        biased;
+        () = exchange.cancel.cancelled() => true,
+        () = upload(&mut body, &mut out, stall, &exchange) => false,
+    };
+    if cancelled {
+        out.send_reset(Reason::CANCEL);
+    }
+}
+
+/// Upload `body` on `out`, never queueing more than the window allows.
+async fn upload(
+    body: &mut ProxyBody,
+    out: &mut SendStream<Bytes>,
+    stall: Option<Duration>,
+    exchange: &Exchange,
 ) {
     loop {
         // Stop as soon as the peer resets the stream, even while the body
@@ -199,7 +258,7 @@ async fn pump(
             if out.poll_reset(cx).is_ready() {
                 return std::task::Poll::Ready(None);
             }
-            Pin::new(&mut body).poll_frame(cx).map(Some)
+            Pin::new(&mut *body).poll_frame(cx).map(Some)
         })
         .await;
         let Some(frame) = next else { return };
@@ -222,7 +281,7 @@ async fn pump(
                     }
                     while !data.is_empty() {
                         out.reserve_capacity(data.len().min(MAX_UPLOAD_CHUNK));
-                        match wait_capacity(&mut out, stall).await {
+                        match wait_capacity(out, stall).await {
                             Capacity::Granted(n) => {
                                 let chunk = data.split_to(n.min(data.len()).min(MAX_UPLOAD_CHUNK));
                                 if out.send_data(chunk, last && data.is_empty()).is_err() {
@@ -230,6 +289,7 @@ async fn pump(
                                 }
                             }
                             Capacity::Stalled => {
+                                exchange.stalled.store(true, Ordering::Release);
                                 tracing::warn!(
                                     ?stall,
                                     "upstream kept the HTTP/2 flow-control window closed; resetting the stream"
@@ -255,18 +315,37 @@ async fn pump(
     }
 }
 
-/// Response body half of an HTTP/2 exchange.
+fn stall_error() -> ProxyError {
+    ProxyError::new(
+        ErrorKind::WriteTimeout,
+        "upstream kept the HTTP/2 flow-control window closed",
+    )
+}
+
+/// Response body half of an HTTP/2 exchange. Dropping it cancels the
+/// exchange (and with it any upload still running).
 pub struct H2Body {
     recv: RecvStream,
     data_done: bool,
+    exchange: Arc<Exchange>,
+    _owner: DropGuard,
 }
 
 impl H2Body {
-    pub fn new(recv: RecvStream) -> Self {
+    pub fn new(recv: RecvStream, exchange: Arc<Exchange>, owner: DropGuard) -> Self {
         Self {
             recv,
             data_done: false,
+            exchange,
+            _owner: owner,
         }
+    }
+
+    fn error(&self, e: &h2::Error) -> ProxyError {
+        if self.exchange.stalled() {
+            return stall_error();
+        }
+        from_h2_body(e)
     }
 
     pub fn is_end_stream(&self) -> bool {
@@ -286,7 +365,7 @@ impl H2Body {
                     return Poll::Ready(Some(Ok(http_body::Frame::data(data))));
                 }
                 Poll::Ready(Some(Err(e))) => {
-                    let err = from_h2_body(&e).with_source(e);
+                    let err = self.error(&e).with_source(e);
                     return Poll::Ready(Some(Err(err)));
                 }
                 Poll::Ready(None) => self.data_done = true,
@@ -299,7 +378,7 @@ impl H2Body {
             }
             Poll::Ready(Ok(None)) => Poll::Ready(None),
             Poll::Ready(Err(e)) => {
-                let err = from_h2_body(&e).with_source(e);
+                let err = self.error(&e).with_source(e);
                 Poll::Ready(Some(Err(err)))
             }
             Poll::Pending => Poll::Pending,

@@ -99,11 +99,14 @@ type Check = fn(&DomainError) -> bool;
 #[test]
 fn error_mapping_matches_the_previous_engine() {
     use toolkit_http_proxy::ErrorKind as K;
-    let cases: [(K, Check); 8] = [
+    let cases: [(K, Check); 9] = [
         (K::ConnectTimeout, |e| {
             matches!(e, DomainError::ConnectionTimeout { .. })
         }),
         (K::ReadTimeout, |e| {
+            matches!(e, DomainError::RequestTimeout { .. })
+        }),
+        (K::WriteTimeout, |e| {
             matches!(e, DomainError::RequestTimeout { .. })
         }),
         (K::Http2, |e| matches!(e, DomainError::ProtocolError { .. })),

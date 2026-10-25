@@ -598,11 +598,12 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
 http-body-util = "0.1"
 http-body = "1"
-# HTTP/2 framing. Direct dependency only to classify h2 errors and to pin the
-# minimum version: >= 0.4.16 fixes RUSTSEC-2026-0258 (unbounded empty DATA
-# frames); MadeYouReset (>= 0.4.11) and CONTINUATION flood (>= 0.4.4) are
-# included.
-h2 = "0.4.16"
+# HTTP/2 (toolkit-http-proxy drives it directly). The floor is a security
+# floor: 0.4.20 rejects conflicting `content-length` values and responses
+# without `:status`; 0.4.17 caps the HPACK encoder table a peer can enlarge
+# via SETTINGS; 0.4.16 fixes RUSTSEC-2026-0258 (empty DATA flood); MadeYouReset
+# (0.4.11) and the CONTINUATION flood (0.4.4) are included.
+h2 = "0.4.20"
 
 # HTTP client (default-tls = rustls + aws-lc-rs in 0.13)
 reqwest = { version = "0.13", features = ["stream"] }

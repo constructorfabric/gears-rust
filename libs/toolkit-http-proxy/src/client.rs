@@ -10,6 +10,7 @@ use hyper::body::Incoming;
 use hyper::client::conn::http1;
 use hyper::upgrade::Upgraded;
 use hyper_util::rt::TokioIo;
+use tokio_util::sync::DropGuard;
 
 use crate::body::{Hold, OnEnd, ProxyBody, ResponseBody};
 use crate::config::ProxyClientConfig;
@@ -290,12 +291,18 @@ impl ProxyClient {
         &self,
         resp: Response<h2::RecvStream>,
         hold: Option<Hold>,
+        exchange: Arc<http2::Exchange>,
+        owner: DropGuard,
     ) -> Response<ResponseBody> {
         let (mut head, body) = resp.into_parts();
         sanitize::sanitize_response_headers(&mut head.headers, head.status);
         Response::from_parts(
             head,
-            ResponseBody::http2(H2Body::new(body), self.inner.cfg.read_timeout, hold),
+            ResponseBody::http2(
+                H2Body::new(body, exchange, owner),
+                self.inner.cfg.read_timeout,
+                hold,
+            ),
         )
     }
 
@@ -458,8 +465,8 @@ impl ProxyClient {
         if use_h2 {
             let sender = http2::handshake(io, &inner.cfg.h2, &handle.kill).await?;
             let slot = inner.pool.h2_slot(key);
-            let lease = inner.pool.store_h2(&slot, sender, handle);
-            Ok(leased(lease, false, connect_time))
+            let (lease, reused) = inner.pool.store_h2(&slot, sender, handle);
+            Ok(leased(lease, reused, connect_time))
         } else {
             let (tx, conn) = inner
                 .h1
@@ -528,8 +535,18 @@ impl ProxyClient {
                 }
             }
             Sender::H2(tx) => {
+                // `owner` cancels the exchange (resetting the stream and
+                // stopping the upload) if this future is dropped or fails
+                // before the response body takes it over.
+                let (exchange, owner) = http2::Exchange::new();
                 let started = self
-                    .read_timeout(http2::start(tx, req, inner.cfg.write_timeout, hold.clone()))
+                    .read_timeout(http2::start(
+                        tx,
+                        req,
+                        inner.cfg.write_timeout,
+                        hold.clone(),
+                        exchange.clone(),
+                    ))
                     .await
                     .map_err(DispatchError::Failed)?;
                 let response = match started {
@@ -542,7 +559,7 @@ impl ProxyClient {
                     }
                 };
                 match self.read_timeout(response).await {
-                    Ok(Ok(resp)) => Ok(self.finish_h2(resp, hold)),
+                    Ok(Ok(resp)) => Ok(self.finish_h2(resp, hold, exchange, owner)),
                     Ok(Err(e)) => {
                         // Only a dead connection is forgotten (and only this
                         // generation of it); a stream-level reset leaves the
@@ -551,8 +568,9 @@ impl ProxyClient {
                             inner.pool.drop_h2(key, conn.generation);
                             inner.protocols.evict(target);
                         }
-                        let err =
-                            http2::from_h2(&e, "upstream HTTP/2 exchange failed").with_source(e);
+                        let err = exchange
+                            .error(&e, "upstream HTTP/2 exchange failed")
+                            .with_source(e);
                         Err(DispatchError::Failed(err))
                     }
                     Err(timeout) => Err(DispatchError::Failed(timeout)),

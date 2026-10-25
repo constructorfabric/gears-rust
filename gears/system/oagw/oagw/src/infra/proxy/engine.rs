@@ -184,6 +184,10 @@ pub(crate) fn map_proxy_error(err: &ProxyError, instance: &str) -> DomainError {
             detail: "upstream read timed out".into(),
             instance,
         },
+        ErrorKind::WriteTimeout => DomainError::RequestTimeout {
+            detail: "upstream write timed out".into(),
+            instance,
+        },
         ErrorKind::Http2 => DomainError::ProtocolError {
             detail: "upstream HTTP/2 error".into(),
             instance,

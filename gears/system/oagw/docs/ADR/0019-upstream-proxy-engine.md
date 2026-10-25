@@ -65,7 +65,7 @@ The internal context headers (`x-oagw-internal-*`) are gone; inbound `x-oagw-*` 
 | Engine error kind | `DomainError` |
 |---|---|
 | `ConnectTimeout` | `ConnectionTimeout` |
-| `ReadTimeout` | `RequestTimeout` |
+| `ReadTimeout`, `WriteTimeout` | `RequestTimeout` |
 | `Http2` | `ProtocolError` (the engine also evicts the host's ALPN hint) |
 | `Read`, `Write` | `StreamAborted` |
 | `ConnectNoRoute`, `Connect` | `LinkUnavailable` |

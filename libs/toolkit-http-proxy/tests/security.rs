@@ -20,7 +20,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use futures_util::stream;
+use futures_util::{StreamExt as _, stream};
 use http::Request;
 use http_body_util::BodyExt;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -500,6 +500,26 @@ fn h2_target(addr: SocketAddr) -> Target {
     plain(addr).with_policy(ProtocolPolicy::Http2Only)
 }
 
+/// Read frames until the client resets stream 1. `false` if the connection
+/// ends first.
+async fn reset_of_stream_1(s: &mut TcpStream) -> bool {
+    loop {
+        let mut h = [0u8; 9];
+        if s.read_exact(&mut h).await.is_err() {
+            return false;
+        }
+        let len = usize::from(h[0]) << 16 | usize::from(h[1]) << 8 | usize::from(h[2]);
+        let mut payload = vec![0u8; len];
+        if s.read_exact(&mut payload).await.is_err() {
+            return false;
+        }
+        let stream = u32::from_be_bytes([h[5], h[6], h[7], h[8]]) & 0x7fff_ffff;
+        if h[3] == RST_STREAM && stream == 1 {
+            return true;
+        }
+    }
+}
+
 async fn within<T>(limit: Duration, fut: impl Future<Output = T>) -> T {
     let started = Instant::now();
     let out = tokio::time::timeout(limit, fut)
@@ -671,21 +691,8 @@ async fn early_h2_response_with_zero_window_upload_is_torn_down() {
             let _ = s
                 .write_all(&frame(HEADERS, END_HEADERS | END_STREAM, 1, &[0x88]))
                 .await;
-            loop {
-                let mut h = [0u8; 9];
-                if s.read_exact(&mut h).await.is_err() {
-                    return;
-                }
-                let len = usize::from(h[0]) << 16 | usize::from(h[1]) << 8 | usize::from(h[2]);
-                let mut payload = vec![0u8; len];
-                if s.read_exact(&mut payload).await.is_err() {
-                    return;
-                }
-                let stream = u32::from_be_bytes([h[5], h[6], h[7], h[8]]) & 0x7fff_ffff;
-                if h[3] == RST_STREAM && stream == 1 {
-                    notify.notify_one();
-                    return;
-                }
+            if reset_of_stream_1(&mut s).await {
+                notify.notify_one();
             }
         }
     })
@@ -702,6 +709,118 @@ async fn early_h2_response_with_zero_window_upload_is_torn_down() {
     assert_eq!(resp.status(), 200);
     drop(resp);
     within(Duration::from_secs(3), reset.notified()).await;
+}
+
+#[tokio::test]
+async fn h2_upload_stall_is_reported_as_a_write_timeout() {
+    // The window never opens and no response comes: the upload's stall
+    // budget runs out first and that, not a protocol error, is the cause.
+    let addr = h2_server(&[0x00, 0x04, 0, 0, 0, 0], |mut s| async move {
+        drain(&mut s, Duration::from_secs(3)).await;
+    })
+    .await;
+    let mut cfg = support::test_config();
+    cfg.write_timeout = Some(Duration::from_millis(300));
+    cfg.read_timeout = Some(Duration::from_secs(5));
+    let c = ProxyClient::new(cfg).unwrap();
+    // Larger than the default window the client may use before it sees the
+    // upstream's SETTINGS.
+    let req = Request::post("/")
+        .body(full_body(Bytes::from(vec![b'x'; 256 * 1024])))
+        .unwrap();
+    let err = within(Duration::from_secs(2), c.send(&h2_target(addr), req))
+        .await
+        .unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::WriteTimeout, "{err}");
+}
+
+/// Upstream that never answers and reports whether the client reset
+/// stream 1.
+async fn silent_h2_upstream() -> (SocketAddr, Arc<tokio::sync::Notify>) {
+    let reset = Arc::new(tokio::sync::Notify::new());
+    let notify = reset.clone();
+    let addr = h2_server(&[], move |mut s| {
+        let notify = notify.clone();
+        async move {
+            if reset_of_stream_1(&mut s).await {
+                notify.notify_one();
+            }
+        }
+    })
+    .await;
+    (addr, reset)
+}
+
+/// A request body that yields one chunk and then never ends.
+fn endless_upload() -> toolkit_http_proxy::ProxyBody {
+    let chunks =
+        stream::iter([Ok::<_, std::io::Error>(Bytes::from_static(b"x"))]).chain(stream::pending());
+    stream_body(chunks)
+}
+
+#[tokio::test]
+async fn h2_head_timeout_resets_the_stream_and_stops_the_upload() {
+    let (addr, reset) = silent_h2_upstream().await;
+    let c = client_with_timeout(Duration::from_millis(300));
+    let req = Request::post("/").body(endless_upload()).unwrap();
+    let err = within(Duration::from_secs(2), c.send(&h2_target(addr), req))
+        .await
+        .unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::ReadTimeout, "{err}");
+    within(Duration::from_secs(2), reset.notified()).await;
+}
+
+#[tokio::test]
+async fn dropping_an_h2_send_resets_the_stream_and_stops_the_upload() {
+    let (addr, reset) = silent_h2_upstream().await;
+    let c = client();
+    let req = Request::post("/").body(endless_upload()).unwrap();
+    let target = h2_target(addr);
+    let send = c.send(&target, req);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), send)
+            .await
+            .is_err(),
+        "the upstream never answers"
+    );
+    within(Duration::from_secs(2), reset.notified()).await;
+}
+
+/// HPACK: `content-length` (static index 28) literal, not indexed.
+fn content_length(value: u8) -> [u8; 4] {
+    [0x0F, 0x0D, 0x01, value]
+}
+
+#[tokio::test]
+async fn malformed_h2_response_heads_are_rejected() {
+    // Conflicting content-length values, and a head without `:status`.
+    let duplicate: Vec<u8> = [&[0x88][..], &content_length(b'1'), &content_length(b'2')].concat();
+    let no_status = content_length(b'0').to_vec();
+    for (block, data) in [(duplicate, &b"x"[..]), (no_status, &b""[..])] {
+        let addr = h2_server(&[], move |mut s| {
+            let block = block.clone();
+            async move {
+                let mut out = frame(HEADERS, END_HEADERS, 1, &block);
+                out.extend(frame(DATA, END_STREAM, 1, data));
+                let _ = s.write_all(&out).await;
+                drain(&mut s, Duration::from_secs(2)).await;
+            }
+        })
+        .await;
+        let res = within(
+            Duration::from_secs(2),
+            client().send(
+                &h2_target(addr),
+                Request::get("/").body(empty_body()).unwrap(),
+            ),
+        )
+        .await;
+        let err = res.expect_err("a malformed head must not become a response");
+        assert!(
+            matches!(err.kind(), ErrorKind::Http2 | ErrorKind::Protocol),
+            "{err}"
+        );
+    }
 }
 
 #[tokio::test]

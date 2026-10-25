@@ -239,20 +239,45 @@ impl Pool {
     }
 
     /// Add a new HTTP/2 connection to `slot` and lease it.
-    pub fn store_h2(&self, slot: &Arc<H2Slot>, sender: H2Sender, conn: ConnHandle) -> H2Lease {
+    ///
+    /// Connections negotiated outside the slot's setup lock (HTTP/1 fallback
+    /// attempts that got h2) can race past `h2_max_connections_per_host`: at
+    /// the cap the new connection is closed and the least-loaded existing one
+    /// is leased instead. The flag is `true` in that case.
+    pub fn store_h2(
+        &self,
+        slot: &Arc<H2Slot>,
+        sender: H2Sender,
+        conn: ConnHandle,
+    ) -> (H2Lease, bool) {
         slot.last_used.store(self.now_secs(), Ordering::Relaxed);
+        let mut entries = slot.entries.lock();
+        entries.retain(|e| !e.conn.kill.is_cancelled());
+        if entries.len() >= self.cfg.h2_max_connections_per_host.max(1)
+            && let Some(best) = entries
+                .iter()
+                .min_by_key(|e| e.active.load(Ordering::Relaxed))
+        {
+            conn.kill.cancel();
+            let lease = H2Lease {
+                sender: best.sender.clone(),
+                conn: best.conn.clone(),
+                active: Self::activate(slot, &best.active),
+            };
+            return (lease, true);
+        }
         let active = Arc::new(AtomicUsize::new(0));
         let lease = H2Lease {
             sender: sender.clone(),
             conn: conn.clone(),
             active: Self::activate(slot, &active),
         };
-        slot.entries.lock().push(H2Entry {
+        entries.push(H2Entry {
             sender,
             conn,
             active,
         });
-        lease
+        (lease, false)
     }
 
     /// Forget the HTTP/2 connection of generation `generation` for `key`;
@@ -300,5 +325,47 @@ pub async fn reap_loop(pool: std::sync::Weak<Pool>, every: Duration) {
             return;
         };
         pool.reap();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn h2_sender() -> H2Sender {
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        tokio::spawn(async move {
+            if let Ok(mut conn) = h2::server::handshake(server).await {
+                while conn.accept().await.is_some() {}
+            }
+        });
+        let (tx, conn) = h2::client::handshake(client).await.unwrap();
+        tokio::spawn(conn);
+        tx
+    }
+
+    #[tokio::test]
+    async fn store_h2_never_exceeds_the_connection_cap() {
+        // Connections negotiated outside the setup lock (HTTP/1 fallback that
+        // got h2) all end up in `store_h2`; the cap must still hold.
+        let pool = Pool::new(PoolConfig {
+            h2_max_connections_per_host: 2,
+            ..PoolConfig::default()
+        });
+        let target = Target::new(([127, 0, 0, 1], 1).into(), "localhost", Transport::Plain);
+        let slot = pool.h2_slot(&PoolKey::of(&target));
+        let mut handles = Vec::new();
+        let mut leases = Vec::new();
+        for _ in 0..4 {
+            let handle = pool.new_handle();
+            handles.push(handle.clone());
+            leases.push(pool.store_h2(&slot, h2_sender().await, handle));
+        }
+        assert_eq!(slot.entries.lock().len(), 2);
+        let reused: Vec<bool> = leases.iter().map(|(_, reused)| *reused).collect();
+        assert_eq!(reused, [false, false, true, true]);
+        let killed: Vec<bool> = handles.iter().map(|h| h.kill.is_cancelled()).collect();
+        assert_eq!(killed, [false, false, true, true]);
+        assert_eq!(slot.active.load(Ordering::Relaxed), 4);
     }
 }
