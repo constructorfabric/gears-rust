@@ -1587,7 +1587,7 @@ The engine does not process personal data of its own, but it stores caller ident
 | A caller links to someone else's task | Blocked parent, cascaded cancel, probing | Link authorization, uniform `404` (§5.9) |
 | A tenant puts a platform task type into a privileged queue | Privilege escalation through platform workers | Type and queue constraints from the PDP; `operated_by` and `accepted_types` (§5.11, §5.12) |
 | A registrant declares unsafe settings | Endless retries, leases that always expire | Engine limits on every declared value (§5.12) |
-| Many workers race for the head of one queue | Claim throughput collapses | `SKIP LOCKED` per-queue streams, batch claims, and node-local claim coalescing (DESIGN §4.6, ADR-0008, `proposed` until the ToolKit API exists and the benchmark passes); the throughput NFR measures this case |
+| Many workers race for the head of one queue | Claim throughput collapses | ToolKit secure claim primitive (counter-first guarded updates, no task write for a full scope), batch claims, node-local claim coalescing, and sharded counter rows (DESIGN §4.6, ADR-0008, `proposed` until the ToolKit primitive exists and the benchmark passes); the throughput NFR measures this case |
 | Heartbeat writes grow with running tasks | Write load and table bloat on the live table | Worker-session leases: one heartbeat write per worker process and domain (ADR-0017) |
 | Stalled ("zombie") worker writes after its lease expired | Double execution, overwritten result | Lease fencing (§5.6); at-least-once contract with idempotent workers |
 | Clients that poll, time out, and resubmit | Unbounded backlog, noisy tenants | Queue depth limits at admission with `429` and `Retry-After` (§5.2) |

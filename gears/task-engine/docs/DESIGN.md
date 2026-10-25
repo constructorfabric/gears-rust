@@ -104,7 +104,7 @@ Per [ADR/0001-pluggable-execution-backends.md](ADR/0001-pluggable-execution-back
 - `cpt-cf-task-engine-adr-concurrency-enforcement` — Database-level atomic counters, in a cross-tenant table and a tenant-scoped table (optionally hot-row sharded, ADR-0008); no Cluster dependency (PRD §1.4). See [ADR/0005-concurrency-enforcement.md](ADR/0005-concurrency-enforcement.md).
 - `cpt-cf-task-engine-adr-blob-compression` — Transparent JSON blob compression for storage efficiency using zstd behind a magic prefix and codec byte. See [ADR/0006-blob-compression.md](ADR/0006-blob-compression.md).
 - `cpt-cf-task-engine-adr-event-wait-matching` — CEL-based match expression evaluation for event wait conditions with creation-time checks, a cost budget enforced inside the evaluator, per-tenant condition limits, and a defined outcome for budget failures. See [ADR/0007-event-wait-matching.md](ADR/0007-event-wait-matching.md).
-- `cpt-cf-task-engine-adr-atomic-claim-strategy` — **Proposed** (until the ToolKit `SKIP LOCKED` API and the benchmark pass) — per-queue streams locked with `SKIP LOCKED` through the secure ORM, k-way merge, batch claims, node-local claim coalescing, and counters checked under lock before any task write. See [ADR/0008-atomic-claim-strategy.md](ADR/0008-atomic-claim-strategy.md).
+- `cpt-cf-task-engine-adr-atomic-claim-strategy` — **Proposed** (until the ToolKit secure claim primitive exists and the benchmark passes) — claims run through `toolkit_db::secure::claim`: plain scoped candidate streams with a k-way merge, guarded slot reservation **before** any task write, guarded state transition, settle; batch claims and node-local coalescing in the gear; counters before task rows as the engine-wide lock order; no `SKIP LOCKED` and no dialect SQL in the Task Engine. See [ADR/0008-atomic-claim-strategy.md](ADR/0008-atomic-claim-strategy.md).
 - `cpt-cf-task-engine-adr-retention-partitioning` — Unpartitioned live tables; history (including tags and resource references) partitioned by task creation time; no DB foreign keys; retention from terminal time; rescue-then-drop; SQLite `DELETE` fallback. See [ADR/0009-retention-partitioning.md](ADR/0009-retention-partitioning.md).
 - `cpt-cf-task-engine-adr-task-domains` — Route each queue to one configured database with a config-order first-match rule; a task lives in its queue's domain; optional type rules are checked at create time; dead-letter queues are not routed; atomic operations (claim, dependencies, parent/child) stay inside one domain. See [ADR/0010-task-domains.md](ADR/0010-task-domains.md).
 - `cpt-cf-task-engine-adr-lease-fencing` — Every worker write carries a random per-lease token bound to the holder's subject; reassignment hands over no token; a lease epoch lets workers fence external systems. See [ADR/0011-lease-fencing.md](ADR/0011-lease-fencing.md).
@@ -133,7 +133,7 @@ Per [ADR/0001-pluggable-execution-backends.md](ADR/0001-pluggable-execution-back
 | Technology | Purpose |
 |---|---|
 | Rust / Axum | HTTP transport, async runtime (tokio) |
-| SeaORM + `toolkit-db` | Database persistence (PostgreSQL, MySQL/MariaDB, SQLite) via `DbManager` + `SecureConn`; all claiming/dialect handling stays in this layer |
+| SeaORM + `toolkit-db` | Database persistence (PostgreSQL, MySQL/MariaDB, SQLite) via `DbManager` + `SecureConn`; claims through the secure claim primitive `toolkit_db::secure::claim` (ADR-0008, TODO(toolkit)); all dialect handling stays in this layer |
 | `event-broker-sdk` (`outbox` feature) | `DbProducer` managed outbox for lossless, deduped Event Broker delivery (§3.2 Event Producer); the `toolkit-db` outbox pipeline it uses is always compiled in |
 | `toolkit-db` advisory locks | Portable leader election for singleton background loops (ADR-0008 §No DB-Specific SQL) |
 | `toolkit-security` | Bearer token authentication & authorization |
@@ -744,7 +744,7 @@ Key methods:
 Dispatch engine. Owns priority-ordered task dispatch, atomic claiming, concurrency enforcement, and long-poll support.
 
 Responsibilities:
-- Atomic claim (ADR-0008): each queue yields its next free tasks in PRD §5.2 order, locked with `SKIP LOCKED` as they are read, and candidates are merged across queues by `(urgency, created_at, task_id)`; queue listing order has no effect (k-way merge, §4.6 Task Assignment). Counters are checked under lock before any task write; then the transaction assigns up to `max_tasks` tasks, each with its own lease (state transition + slot reservation in one transaction, in the lock order of §3.7 Lock ordering), and returns them. Two workers cannot claim the same task. Waiters on one node with the same subject, compiled scope, and queue set share one database claim (node-local coalescing). All queues in one claim request **MUST** resolve to a single task domain (§3.8); a multi-domain claim is rejected `invalid_argument` `400` — exact claim ordering is preserved within one database. `attempt` is incremented here (the single authoritative increment point). The same guarded update sets a random UUID v4 `lease_token` (not v7: its timestamp part is predictable), `assignee_subject = ctx.subject_id`, and `lease_epoch + 1` (SDK `Lease`, §3.2 SDK Security Model).
+- Atomic claim (ADR-0008, through `toolkit_db::secure::claim`): each queue yields its next candidates in PRD §5.2 order with a plain scoped read, and candidates are merged across queues by `(urgency, created_at, task_id)`; queue listing order has no effect (k-way merge, §4.6 Task Assignment). Concurrency slots are reserved with guarded `+k` updates before any task write; then guarded `queued → claimed` updates assign up to `max_tasks` tasks, each with its own lease, unused reservations are settled, and all of it commits in one transaction in the lock order of §3.7 Lock ordering. Two workers cannot claim the same task. Waiters on one node with the same subject, compiled scope, and queue set share one database claim (node-local coalescing). All queues in one claim request **MUST** resolve to a single task domain (§3.8); a multi-domain claim is rejected `invalid_argument` `400` — exact claim ordering is preserved within one database. `attempt` is incremented here (the single authoritative increment point). The same guarded update sets a random UUID v4 `lease_token` (not v7: its timestamp part is predictable), `assignee_subject = ctx.subject_id`, and `lease_epoch + 1` (SDK `Lease`, §3.2 SDK Security Model).
 - Resolve and maintain effective queue-depth limits (config override → queue GTS `queue_max_queue_depth` → config default `queue_max_queue_depth`; `tenant_max_queue_depth`, `tenant_max_deferred_tasks` and `global_max_queue_depth` from config) into `te_queue_backlog.limit_value` (global) and `te_tenant_queue_backlog.limit_value` (per tenant), and keep the counters consistent on every pending-set transition (§3.1 Queue-depth accounting); bulk move re-admits against the destination queue per task
 - Enforce multi-dimensional concurrency limits: per-queue global, per-queue per-tenant, per-type global, per-type per-tenant — a candidate is assigned only if **every** dimension has capacity. A dimension at capacity blocks only the tasks it governs: the candidate is skipped, the saturated scope is excluded from the rest of the scan, and the claim proceeds to other tenants'/types' tasks (§4.6 Task Assignment). The claim returns `429 CONCURRENCY_LIMIT` only when nothing could be assigned and at least one eligible task was skipped for capacity
 - Support long-poll claiming: if no tasks available and timeout specified (clamped to `claim_max_wait_secs`, default 50 s), park (no DB connection, no admission permit) and retry on a `newTask` or `slotReleased` signal **or** on the node's queue-watcher tick, so wake-up works across nodes (§3.2 Signal System)
@@ -1203,7 +1203,7 @@ Mapping of Task-Engine failure conditions to canonical categories (`gts.cf.core.
 | Dependency | Crate | Purpose |
 |---|---|---|
 | ToolKit framework | `cf-gears-toolkit` | OperationBuilder, SecureConn, SecurityContext, AccessScope, Scopable, pep_properties, ClientHub, RFC 9457 canonical errors, WithLifecycle, CancellationToken |
-| ToolKit DB | `cf-gears-toolkit-db` | DbManager, SecureConn, SeaORM integration, connection pooling, migrations, `outbox` (transactional event delivery), `advisory_locks` (leader election) |
+| ToolKit DB | `cf-gears-toolkit-db` | DbManager, SecureConn, SeaORM integration, connection pooling, migrations, `outbox` (transactional event delivery), `advisory_locks` (leader election), `secure::claim` (claim primitive, ADR-0008, TODO(toolkit)), `contention` (retry classification) |
 | ToolKit OData macros | `toolkit-odata-macros` | ODataFilterable derive for search entities |
 | ToolKit domain macros | `toolkit-macros` | `#[domain_model]` enforcement |
 | Event Broker SDK | `cf-gears-event-broker-sdk` (`outbox`, `db` features) | Producer: `EventBrokerApi`, `DbProducer`, `ProducerOutboxQueue`, `TypedEvent`, `ProducerIdentity`, `DbDeduplication`/`ProducerMode` — managed outbox event delivery (§3.2 Event Producer). Consumer: `ConsumerBuilder`, `TxConsumerHandler`, `LocalDbOffsetManager`, `ConsumerHandle` — inbound event delivery for event wait conditions (§3.2 Event Consumer) |
@@ -1251,10 +1251,10 @@ sequenceDiagram
 
     W->>TE: POST /tasks/claim {worker_id, session_id?, queues, max_tasks, timeout}
     Note over TE: Long-poll: wait on signal if empty; one DB claim per waiter group per node
-    TE->>DB: BEGIN; per queue: lock the next free candidates (SKIP LOCKED); k-way merge by (urgency, created_at, task_id) (§4.6)
-    TE->>DB: Lock the picks' counter rows sorted by key; keep the picks that fit; used=used+n once per row
-    TE->>DB: update_many te_task_state SET state=claimed,assignee_subject=ctx.subject,assignee,session_id,lease_token=random_v4,lease_epoch+1 WHERE state=queued (kept picks only)
-    TE->>DB: DELETE queue_timeout; producer_outbox.enqueue(TaskClaimed); renew te_worker_sessions; COMMIT
+    TE->>DB: toolkit_db::secure::claim — BEGIN (READ COMMITTED); per queue: plain scoped read of the next candidates; k-way merge by (urgency, created_at, task_id) (§4.6)
+    TE->>DB: Reserve: UPDATE counters SET used=used+k WHERE used+k<=limit (sorted keys); backlog −k
+    TE->>DB: Win (ascending task_id): UPDATE te_task_state SET state=claimed,assignee_subject=ctx.subject,assignee,session_id,lease_token=random_v4,lease_epoch+1 WHERE task_id=? AND state=queued
+    TE->>DB: Settle unused reservations; DELETE queue_timeout; producer_outbox.enqueue(TaskClaimed); renew te_worker_sessions; COMMIT
     TE-->>W: 200 OK {session_id, heartbeat_interval_secs, claims: [{task, lease_token, lease_epoch, attempt}]}
 
     W->>TE: POST /tasks/{id}/start {lease_token}
@@ -1534,24 +1534,26 @@ Cross-tenant counters live in an unscoped table, per-tenant counters in a tenant
 
 **Scoping**: see §2.1 (`GlobalCounterRepo` for the global table, `scope.tenant_only()` for the tenant table). Callers never read either table directly.
 
-Concurrency enforcement **MUST** reserve slots atomically before moving a task to `claimed`: either a single guarded statement (`UPDATE ... SET used = used + 1 WHERE ... AND used < limit_value`) or, in a claim, a check of `used + n ≤ limit_value` under the counter row's lock followed by one `+n` write in the same transaction (§4.6 Task Assignment). It **MUST** release slots when a task leaves `claimed` or `running` for a state that no longer consumes execution capacity — including `running` → `waiting` (a parked task holds no slot; PRD §5.4). See [ADR/0008-atomic-claim-strategy.md](ADR/0008-atomic-claim-strategy.md).
+Concurrency enforcement **MUST** reserve slots atomically before moving a task to `claimed`, with one guarded statement per counter row (`UPDATE ... SET used = used + k WHERE ... AND used + k <= limit_value`; `k = 1` for a single task, `k` = the planned batch in a claim), applied **before** the task rows are written, and settled on the same row if fewer tasks were won (§4.6 Task Assignment, ADR-0008). It **MUST** release slots when a task leaves `claimed` or `running` for a state that no longer consumes execution capacity — including `running` → `waiting` (a parked task holds no slot; PRD §5.4). See [ADR/0008-atomic-claim-strategy.md](ADR/0008-atomic-claim-strategy.md).
 
 **ID**: `cpt-cf-task-engine-design-lock-order`
 
-**Lock ordering (deadlock freedom)**: every guarded `UPDATE` holds its row lock until commit, so two transactions that lock the same rows in opposite orders can deadlock. All transactions — claim, complete/fail, cancel, timeouts, retry, wait, create, bulk, reconciliation — **MUST** take row locks in this one global order:
+**Lock ordering (deadlock freedom)**: every guarded `UPDATE` holds its row lock until commit, so two transactions that lock the same rows in opposite orders can deadlock. All transactions — claim, complete/fail, release, cancel, timeouts, retry, wait (park and resume), create, bulk, cascades, reconciliation — **MUST** take row locks in this one global order (ADR-0008: **counters first, then task rows**):
 
 0. **`te_dependency_locks`** (the tenant's dependency-graph lock), only in dependency-add transactions, and always first (§4.6 Dependency Graph Validation).
-1. **`te_task_state` rows**, in a fixed order: ascending `task_id` for bulk operations; for cascades and links, predecessor before successors and parent before children (a link locks the linked parent or predecessors before it inserts or changes the dependent task).
-2. **`te_concurrency_slots`**, by `(dimension_code, scope_id, shard)`.
-3. **`te_tenant_concurrency_slots`**, by `(owner_tenant_id, dimension_code, scope_id)`.
-4. **`te_queue_backlog`**, by `(dimension_code, queue_id, shard)`.
-5. **`te_tenant_queue_backlog`**, by `(owner_tenant_id, dimension_code, queue_id)`.
-6. **`te_tenant_wait_counters`**, by `(owner_tenant_id, dimension_code, scope_id)`.
+1. **`te_concurrency_slots`**, by `(dimension_code, scope_id, shard)`.
+2. **`te_tenant_concurrency_slots`**, by `(owner_tenant_id, dimension_code, scope_id)`.
+3. **`te_queue_backlog`**, by `(dimension_code, queue_id, shard)`.
+4. **`te_tenant_queue_backlog`**, by `(owner_tenant_id, dimension_code, queue_id)`.
+5. **`te_tenant_wait_counters`**, by `(owner_tenant_id, dimension_code, scope_id)`.
+6. **`te_task_state` rows**, in a fixed order: ascending `task_id` for claims and bulk operations; for cascades and links, predecessor before successors and parent before children (a link locks the linked parent or predecessors before it inserts or changes the dependent task).
 7. **`te_worker_sessions`** last, by `session_id` (claims and accepts renew the session at the end of their transaction). Session expiry locks **only** the session row in its own transaction and requeues the session's tasks in later transactions, so it never holds a session row while waiting for a task row (ADR-0017).
 
-**Reads that decide a write are locking reads.** When a transaction reads rows that another transaction may change concurrently and then writes based on what it saw — the dependents a cascade will transition, the parent or predecessor of a new link, the counter rows reconciliation rewrites — it reads them with `SecureSelect::lock_exclusive()` (`FOR UPDATE`). A locking read returns the latest committed version on PostgreSQL and on MySQL/MariaDB alike, so the result does not depend on the backend's default isolation level (MySQL's `REPEATABLE READ` snapshot would otherwise hide rows committed after the transaction's first read). SQLite has a single writer, so the call is a no-op there.
+**Plan → counters → transition → settle.** A transaction first reads the tasks it will change without a lock (state, queue, tenant, type, recorded shards), sums the counter deltas per row, and applies them in the order above (admissions and claim reservations with their guard). Then it runs each task transition as a guarded update on the **expected** state. A guard that matches zero rows means the task changed after the plan: a single-task call rolls back and reports the lost race (`LEASE_LOST`, `CONCURRENT_MODIFICATION`, or a retry, as today); a multi-task transaction skips that task and redoes it in a fresh transaction (bulk: within the same request; cascades: the next cascade batch). Finally it settles the difference on counter rows it **already holds** — a transaction never locks a counter row after it has locked a task row.
 
-A transaction that changes counters for several tasks (bulk cancel, cancel propagation, dependency cascade) **MUST** first sum the deltas per counter row and then apply each row once, in the sorted order above. This is why a claim locks its task rows **first** (with `SKIP LOCKED`, at read time, §4.6) and only then locks and writes the counter rows, sorted, each once — also in a batch claim. The reverse order — slots first — deadlocks against a completion: claim A reserves slot S and then waits for task T's row; meanwhile T was claimed by another worker and its completion B holds T's row and waits to release S.
+**Reads that decide a write are locking reads.** When a transaction reads rows that another transaction may change concurrently and then writes based on what it saw — the dependents a cascade will transition, the parent or predecessor of a new link, the counter rows reconciliation rewrites — it reads them with `SecureSelect::lock_exclusive()` (`FOR UPDATE`). A locking read returns the latest committed version on PostgreSQL and on MySQL/MariaDB alike, so the result does not depend on the backend's default isolation level (MySQL's `REPEATABLE READ` snapshot would otherwise hide rows committed after the transaction's first read). SQLite has a single writer, so the call is a no-op there. Claims are the exception: they decide with guarded updates re-checked on the latest committed row (ADR-0008), never with locking reads.
+
+A transaction that changes counters for several tasks (bulk cancel, cancel propagation, dependency cascade, batch claim) **MUST** first sum the deltas per counter row and then apply each row once, in the sorted order above. Because every transaction takes counters before task rows, a claim that holds slot S and waits for task T's row can only be waiting for another transaction that already holds its counters, never for one that holds T and waits for S. Claims additionally rely on `READ COMMITTED` (the `toolkit_db::secure::claim` transaction sets it on MySQL/MariaDB): a guarded `UPDATE … WHERE state_code = queued` re-checks the latest committed row, so a loser moves on instead of failing with a serialization error.
 
 Safety net: the database may still report a deadlock that this ordering does not cover (PostgreSQL `40P01`, MySQL `1213`, SQLite `SQLITE_BUSY`). The engine rolls back and retries the whole transaction a bounded number of times with jitter. For a claim this counts as a lost race and the scan moves on. Retries are counted in `te_txn_deadlock_retries_total`.
 
@@ -1583,7 +1585,7 @@ BEGIN
 COMMIT
 ```
 
-Why this is safe on every backend: a claim or admission takes its task row first and the counter row second (Lock ordering). A change that already updated the counter **and committed** is counted in step 2; a change that updated the counter but has **not committed** holds the counter lock, so step 1 waits until it commits and step 2 then counts it; a change that has **not yet reached** the counter waits behind step 1 and applies its `±1` after the corrected value is written. No change is lost or counted twice. Step 2 must be a separate statement after the lock: on PostgreSQL `READ COMMITTED` takes a fresh snapshot per statement; on MySQL/MariaDB, whose `REPEATABLE READ` snapshot would predate the lock, the reconciliation transaction runs with `TxConfig` isolation `ReadCommitted` (`toolkit_db::secure::TxIsolationLevel`). Reconciliation locks only counter rows, never task rows, so it cannot deadlock with the task-first order. A counter that needs an upward correction means a release was missed elsewhere — a defect — and pages operators.
+Why this is safe on every backend: every change takes the counter row before it writes the task row and holds it to commit (Lock ordering). A change that already updated the counter **and committed** is counted in step 2; a change that updated the counter but has **not committed** holds the counter lock, so step 1 waits until it commits and step 2 then counts it; a change that has **not yet reached** the counter waits behind step 1 and applies its `±1` after the corrected value is written. No change is lost or counted twice. Step 2 must be a separate statement after the lock: on PostgreSQL `READ COMMITTED` takes a fresh snapshot per statement; on MySQL/MariaDB, whose `REPEATABLE READ` snapshot would predate the lock, the reconciliation transaction runs with `TxConfig` isolation `ReadCommitted` (`toolkit_db::secure::TxIsolationLevel`). Reconciliation locks only one counter row and never a task row, so it cannot deadlock with the counters-first order. A counter that needs an upward correction means a release was missed elsewhere — a defect — and pages operators.
 
 **Shard count changes**: when a limit change alters `effective_shards`, the maintenance job creates the new shard rows and gives every shard index `≥` the new count `limit_value = 0` (**draining**: guarded reservations skip it, releases still decrement it). A draining row is deleted once its `used` reaches 0. The new shards' sub-limits sum to at most `N − Σ used(draining)`, so the total never exceeds `N` during the change.
 
@@ -1918,7 +1920,7 @@ The Task Engine runs as a single-binary Gears gear. In the default deployment:
 - Optional Cluster gear integration for distributed ready-task cache
 
 Multiple instances share the database and coordinate **without any DB-specific SQL in the Task Engine** (see [ADR/0008-atomic-claim-strategy.md](ADR/0008-atomic-claim-strategy.md)):
-- **Atomic claim** (ADR-0008, `proposed`): per-queue candidates are locked with `SKIP LOCKED` through the scoped secure ORM, so concurrent claimers spread over the head rows instead of waiting on one; counters are checked under lock before any task write; a claim may take up to `max_tasks` tasks; and each node runs at most one database claim per waiter group. SQLite (single writer) runs the same steps with plain reads. The only new ToolKit dependency is `SecureSelect::lock_exclusive_skip_locked()` (not yet available; exit criterion of ADR-0008).
+- **Atomic claim** (ADR-0008, `proposed`): the ToolKit secure claim primitive (`toolkit_db::secure::claim`) reads per-queue candidates with plain scoped reads, reserves counters with guarded updates before any task write, and claims with guarded `queued → claimed` updates; a claim may take up to `max_tasks` tasks, and each node runs at most one database claim per waiter group. The same protocol runs on PostgreSQL, MySQL/MariaDB (at `READ COMMITTED`), and SQLite. The new ToolKit dependency is `toolkit_db::secure::claim` (not yet available; exit criterion of ADR-0008).
 - **Events**: the Event Broker SDK `DbProducer` managed outbox (over `toolkit_db::outbox`, one per task domain) owns cross-instance claiming, delivery, and dedup; the Task Engine only enqueues typed events in the state-change transaction. Inbound events come through one static consumer group (§3.2 Event Producer / Event Consumer).
 - **Sharded background loops** (timer wheel, session scan, deadline scan): to avoid a single-leader throughput ceiling (see below), the hot control-plane loops are **partitioned into `bg_shards` shards** rather than run on one global leader.
   - **Stored slot, not a SQL hash.** Every `te_task_state`, `te_timers`, and `te_worker_sessions` row stores `bg_slot SMALLINT` in `0..1023`, computed once in Rust when the row is created (`murmur3(id) mod 1024`, where `id` is the task ID for task and timer rows and the session ID for session rows) and never changed. The slot count 1024 is a fixed constant, not configuration. Scans filter with plain column comparisons, so there is no database-specific hash function and the predicate is checked inside the index (§3.7).
@@ -2230,7 +2232,7 @@ gears:
 | `te_worker_sessions_expired_total` | Counter | `domain` | Sessions that expired (lost worker processes) |
 | `te_claim_batch_size` | Histogram | — | Tasks assigned per database claim (batch and coalesced claims) |
 | `te_claim_coalesced_waiters` | Histogram | — | Waiters served by one coalesced claim |
-| `te_claim_locked_skipped_total` | Counter | `queue` | Candidate rows skipped because another claim held them (`SKIP LOCKED`) |
+| `te_claim_lost_races_total` | Counter | `queue` | Picked candidates whose guarded `queued → claimed` update matched no row because another transaction took them first |
 | `te_claim_capacity_skipped_total` | Counter | `queue`, `dimension` | Claim candidates skipped because a concurrency dimension was at capacity (§4.6 Task Assignment); such skips cause no task-row write |
 | `te_slot_drift_corrected_total` | Counter | `dimension`, `direction` | Counter reconciliation corrections (`direction` = `up` / `down`); any `up` means a missed release and pages operators (§3.7 Counter reconciliation) |
 | `te_creator_checks_total` | Counter | `outcome` | Creator-authority checks (`verified`, `denied`, `unverifiable`, `pdp_unavailable`; §3.3 Creator authority) |
@@ -2319,18 +2321,17 @@ Tenants cannot widen what the engine reads, because `waitable_topics` is operato
 
 #### Task Assignment (Long-Poll Claim)
 
-Design per [ADR-0008](ADR/0008-atomic-claim-strategy.md): per-queue streams locked with `SKIP LOCKED`, a k-way merge across queues, batch claims, node-local claim coalescing, and **no task-row write for a candidate that does not fit its limits**.
+Design per [ADR-0008](ADR/0008-atomic-claim-strategy.md): the database part of a claim is the **ToolKit secure claim primitive** (`toolkit_db::secure::claim`), which runs the counter-first guarded-update protocol — plain scoped candidate reads, guarded slot reservation, guarded state transition, settle, commit. The Task Engine supplies the candidate streams, the counter keys, and the transition, and owns long-poll, waiter groups, and node-local coalescing. There is no `SKIP LOCKED` and no dialect SQL in the Task Engine, and **no task-row write for a candidate that does not fit its limits**.
 
 > **ADR-0008 stays `proposed` until both exit criteria pass:**
-> - **ToolKit API:** `SecureSelect<E, Scoped>::lock_exclusive_skip_locked()`. Only on scoped queries, so the tenant/PDP predicate can never be dropped. sea-orm has `lock_with_behavior(…, SkipLocked)`. PostgreSQL, MySQL 8, MariaDB 10.6+; a no-op on SQLite. Not yet filed; it is on the critical path.
-> - **Benchmark matrix:** PostgreSQL and MySQL 8 × {1, 10, 100, 500} workers × {1, 10} queues × {`fifo`, `round_robin`} × `max_tasks` {1, 16}, plus one run where a single tenant holds 100K `queued` tasks at its `per_tenant_concurrency_limit`. Record p50/p99 claim latency, claims/s, rows skipped as locked per claim, `te_txn_deadlock_retries_total`, and (PostgreSQL) new row versions on `te_task_state` per 1K claims. **Pass:** the `cpt-cf-task-engine-nfr-latency` and `cpt-cf-task-engine-nfr-throughput` thresholds on PostgreSQL with ≥ 100 workers on one queue; claims/s do not drop from 10 to 100 workers; capacity skips cause no `te_task_state` write.
-> - **Fallback** if ToolKit cannot expose `SKIP LOCKED`: candidate spreading (ADR-0008 Option 4), with PRD sign-off on the relaxed order.
+> - **ToolKit API:** `toolkit_db::secure::claim` (TODO(toolkit), critical path; also intended for Durable Execution). Every candidate read and every guarded write carries the caller's `AccessScope`; the primitive owns the transaction and its isolation level (`READ COMMITTED`, set explicitly on MySQL/MariaDB), the canonical counter lock order, reservation and settlement, and contention retry (`toolkit_db::contention::is_retryable_contention`). Backend acceleration (for example `SKIP LOCKED` candidate selection on PostgreSQL/MySQL, as the `toolkit-db` outbox already uses internally) is a ToolKit strategy behind the same contract, enabled only if the benchmark needs it.
+> - **Benchmark matrix:** see ADR-0008 Confirmation. **Pass:** the `cpt-cf-task-engine-nfr-latency` and `cpt-cf-task-engine-nfr-throughput` thresholds on PostgreSQL with ≥ 100 workers on one queue; claims/s do not drop from 10 to 100 workers; capacity skips cause no `te_task_state` write.
 
 ```
 parse ClaimRequest (worker_id, session_id?, queues[], max_tasks = 1, timeout)
   # worker_id required, [A-Za-z0-9._:-]{1,128} (PRD §5.6); 1 ≤ max_tasks ≤ claim_max_batch, else 400
 worker = (ctx.subject_id, worker_id)
-authorize(claim) on the base type; barrier_mode = Ignore only if every queue is operated_by: platform, else Respect   # §3.3
+scope  = authorize(claim) on the base type; barrier_mode = Ignore only if every queue is operated_by: platform, else Respect   # §3.3
 session = open_or_reuse_session(ctx, worker, session_id, domain)   # ADR-0017, after authorization; a bad or expired id opens a new one
 group = (domain, ctx.subject_id, sha256(compiled scope), sorted(queues))   # waiter group for coalescing
 deadline = now + timeout
@@ -2351,107 +2352,104 @@ coalesced_claim(group, waiter):
   if a claim for group is running: wait for it; take my share if it had one for me, else run the next round
   waiters = this waiter + the group's other parked waiters, in arrival order
   want = min(Σ waiters.max_tasks, claim_max_batch)
-  picks = try_claim_once(group.queues, want, waiters)       # each pick is already assigned to one waiter
+  picks = try_claim_once(group.queues, want, waiters, scope)   # each pick is already assigned to one waiter
   hand the picks to their waiters; return my share
 
-try_claim_once(queues, want, waiters):
-  # Secure ORM only. On PostgreSQL / MySQL rows are locked with lock_exclusive_skip_locked(); on SQLite
-  # (one writer) the same steps run with plain reads. Lock order (§3.7): task rows → concurrency counters
-  # → backlog counters → worker sessions.
+try_claim_once(queues, want, waiters, scope):
   reject 400 invalid_argument if any queue has kind = dead_letter         # DLQs are never dispatched (PRD §5.8)
   queues = dedupe(queues) minus queues every waiter is blacklisted on      # ≤ claim_max_queues (checked at parse: 400)
   ex = Exclusions::from(saturation_cache)   # scopes this node found full in the last claim_saturation_ttl_ms:
                                             #   queues{q} · queue_tenants{(q, tenant)} · types{type} · type_tenants{(tenant, type)}
-  skipped_for_capacity = false
 
-  BEGIN
-    # 1. Streams: up to `want` free candidates per queue, locked as they are taken.
-    #    fifo: plain keyset pages of claim_scan_limit rows (task_id, owner_tenant_id, type_id) are filtered locally against `ex`,
-    #    then the first free survivors are locked by id. At most claim_scan_rows_max index rows are read per
-    #    claim, so a saturated tenant's backlog is never walked to the end.
-    stream_fifo(q):
-      for page in keyset pages on ix_te_task_state_queue_dispatch (plain read, .secure().scope_with(scope)):
-        ids = [r.task_id for r in page if not ex.blocks(r)]
-        got += TaskState::find()
-                 .filter(task_id IN ids AND state_code = Queued)
-                 .order_by(urgency_code, priority, created_at, task_id).limit(want − |got|)
-                 .secure().scope_with(scope).lock_exclusive_skip_locked()
-        stop when |got| = want or claim_scan_rows_max rows were read
+  toolkit_db::secure::claim(conn, scope)                                  # BEGIN, READ COMMITTED (ADR-0008)
+    # 1. Candidate streams: plain, SCOPED keyset reads in claim order. No locks, no writes.
+    .stream(q, for each fifo q):
+        keyset pages of claim_scan_limit rows on ix_te_task_state_queue_dispatch
+          WHERE queue_id = q AND state_code = Queued, ORDER BY (urgency_code, priority, created_at, task_id)
+          .secure().scope_with(scope)
+        rows blocked by `ex` are skipped locally; at most claim_scan_rows_max index rows per claim,
+        so a saturated tenant's backlog is never walked to the end
+    .stream(q, for each round_robin q):
+        one candidate per tenant in turn; u = the most urgent class with a queued task
+        while probes < claim_candidate_budget:
+          t = TaskState::find()                                             # "next tenant" probe — SCOPED
+                .filter(queue_id = q AND state_code = Queued AND urgency_code = u AND owner_tenant_id > cursor)
+                .order_by(owner_tenant_id).limit(1)
+                .secure().scope_with(scope)                                 # PDP tenant / type / queue constraints apply,
+                                                                            # so only tenants the caller may claim from are visited
+          cursor = t.owner_tenant_id                                        # wraps once to the lowest visible tenant
+          if (q, t) in ex.queue_tenants: continue                           # skipped by seek, its backlog is never read
+          candidate = TaskState::find()
+                .filter(queue_id = q AND state_code = Queued AND urgency_code = u AND owner_tenant_id = t
+                        AND type_id NOT IN ex.types ∪ ex.type_tenants(t))
+                .order_by(priority, created_at, task_id).limit(1)
+                .secure().scope_with(scope)
+    .merge_by((urgency_code, created_at, task_id))                          # k-way merge across queues
+    .want(want)
 
-    #    round_robin: one candidate per tenant in turn. A tenant in `ex` is skipped by moving the cursor
-    #    past it (a seek), never by filtering, so its backlog is never read. u = the most urgent class
-    #    with a queued task. Wraps once to the lowest tenant id.
-    stream_rr(q):
-      while |got| < want and probes < claim_candidate_budget:
-        t = next owner_tenant_id after cursor with a queued task of urgency u   # index-only read, no lock
-        cursor = t
-        if (q, t) in ex.queue_tenants: continue
-        c = TaskState::find()
-              .filter(queue_id = q AND state_code = Queued AND urgency_code = u AND owner_tenant_id = t
-                      AND type_id NOT IN ex.types ∪ ex.type_tenants(t))
-              .order_by(priority, created_at, task_id).limit(1)
-              .secure().scope_with(scope).lock_exclusive_skip_locked()
-        if c: got += c                       # none: t's free rows are all held by other claims, move on
+    # 2. Plan (no locks): plain read of every counter row of the candidates' scopes (all shards). For each
+    #    sharded scope choose one shard at random among the shards with room. A scope with no room at all →
+    #    drop its candidates, ex += scope, saturation_cache.put(scope, claim_saturation_ttl_ms),
+    #    skipped_for_capacity = true, metric te_claim_capacity_skipped_total{queue, dimension}.
+    #    picks = the first `want` candidates in merge order that fit the plan; give each pick to the next
+    #    waiter that is not blacklisted on its queue (waiters in arrival order).
+    .counters(|c| [queue_global(c.queue, shard), type_global(c.type, shard),
+                   queue_tenant(c.queue, c.tenant), type_tenant(c.type, c.tenant)]   # limit 0 → no row, skipped
+              + backlog [queue_global(c.queue, c.backlog_shard), queue_tenant(c.queue, c.tenant)])
 
-    # 2. Merge: k-way by (urgency_code, created_at, task_id); keep the best `want`. Locked rows that are
-    #    not kept are released at COMMIT. Give each kept pick to the next waiter that is not blacklisted
-    #    on its queue (waiters in arrival order).
-    picks = merge(streams).take(want)
+    # 3. Reserve, in the canonical counter order of §3.7 (concurrency, then backlog), each row once:
+    #      concurrency: UPDATE … SET used = used + k WHERE <key> AND used + k <= limit_value
+    #                   0 rows → re-read the row, lower k or drop the scope (skipped_for_capacity)
+    #      backlog:     UPDATE … SET used = used − k WHERE <key>                     # `queued` exit, §3.1
+    #    Row locks are held to COMMIT. No task row has been written yet.
 
-    # 3. Counters before any task write. No task row is written for a pick that does not fit.
-    #    a) plain read of every counter row of the picks' scopes (all shards); for each sharded scope choose
-    #       one shard at random among the shards with room. A scope with no room at all → drop its picks,
-    #       ex += scope, saturation_cache.put(scope, claim_saturation_ttl_ms), skipped_for_capacity = true,
-    #       metric te_claim_capacity_skipped_total{queue, dimension}.
-    #    b) lock the chosen counter rows with lock_exclusive(), sorted in the canonical order
-    #       (te_concurrency_slots, then te_tenant_concurrency_slots, each by its key).
-    #    c) in merge order, keep a pick only if each of its rows still has room (used + taken < limit_value);
-    #       drop the rest (a race since step a). No database write happens in this step.
-    #    d) apply the summed +n per counter row, once per row, in the same sorted order (§3.7).
-    kept = decide(picks, counters)
-
-    # 4. Write the kept task rows (already locked), ascending task_id.
-    for c in kept:
-      TaskState::update_many()
+    # 4. Win: picks in ascending task_id (the SET was chosen in merge order; only the write order is by id)
+    .transition(|c| TaskState::update_many()
         .col_expr(state_code, Claimed).col_expr(assignee_subject, c.waiter.subject).col_expr(assignee, c.waiter.worker_id)
         .col_expr(session_id, c.waiter.session_id).col_expr(claimed_at, now)
         .col_expr(assignment_deadline, now + assignment_timeout)                 # NULL when not configured
         .col_expr(attempt, attempt + if resume_pending {0} else {1}).col_expr(resume_pending, false)
         .col_expr(lease_token, random_uuid_v4()).col_expr(lease_epoch, lease_epoch + 1)
         .col_expr(queue_slot_shard, c.queue_shard).col_expr(type_slot_shard, c.type_shard).col_expr(backlog_shard, NULL)
-        .filter(task_id = c.task_id AND state_code = Queued)                     # always matches on PG/MySQL (row locked)
-        .secure().scope_with(scope).exec()
-      delete queue_timeout timer; producer_outbox.enqueue(&txn, TaskClaimed { task_id, .. })
-    decrement queue-depth counters of the `queued` set, summed per row, canonical order   # exit, §3.1
+        .filter(task_id = c.task_id AND state_code = Queued)                     # the guard
+        .secure().scope_with(scope))
+    #    1 row → won. 0 rows → lost race (another claim, a cancel, a move, a timeout): take the next candidate of
+    #    the same scope if its task_id is greater than every row already written, else leave the slot to a new
+    #    transaction. Counted in te_claim_lost_races_total{queue}.
 
-    # 5. Renew each waiter's session last (ADR-0017): lease_until = now + min(lease_secs, task lease),
+    # 5. Settle, on counter rows already held only: used −= (k − won) on concurrency rows, used += (k − won) on
+    #    backlog rows. For each won task: delete its queue_timeout timer; producer_outbox.enqueue(&txn, TaskClaimed).
+    .on_won(|txn, won| ...)
+    #    Renew each waiter's session last (ADR-0017): lease_until = now + min(lease_secs, task lease),
     #    guarded status = active. 0 rows (expired meanwhile) → ROLLBACK, open a new session, retry once.
-  COMMIT; fire the outbox Wake
-  return (kept, skipped_for_capacity)
+  COMMIT; fire the outbox Wake                                              # contention error → bounded retry
+  return (won, skipped_for_capacity)
 ```
 
 **Why this algorithm** (PRD §5.2 Priority-Ordered Dispatch, §5.6 Order across queues):
 
-- **Order.** Each stream yields its queue's tasks in claim order straight from an index; the min-heap merge by `(urgency_code, created_at, task_id)` serves `critical` first, then the oldest candidate. Priority never enters the merge. The order is exact among free rows: a row that another in-flight claim holds is skipped, and if that claim rolls back, the next claim takes it (the same guarantee as River, Oban, and pgmq). A more urgent task committed a moment later is picked up by the next claim.
-- **Throughput grows with workers.** `SKIP LOCKED` spreads concurrent claimers over the head rows instead of queuing them on one row. Batch claims take up to `max_tasks` tasks per transaction. Coalescing keeps the database load at about one claim per waiter group per node, so it grows with nodes, not with parked workers, and a watcher tick wakes one claim per group instead of a herd.
+- **Order.** Each stream yields its queue's tasks in claim order straight from an index; the min-heap merge by `(urgency_code, created_at, task_id)` serves `critical` first, then the oldest candidate. Priority never enters the merge. The order is exact among claimable rows: a candidate that another in-flight claim takes is lost by the guard and replaced by the next one; if that claim rolls back, the next claim takes it. A more urgent task committed a moment later is picked up by the next claim.
+- **Limits before writes.** Concurrency rows are reserved with a guarded `+k` before any task row is written, so the limit is checked inside one `UPDATE` under the row lock and can never be exceeded, and a full scope never causes a task-row write.
+- **Throughput.** Claims that need the same counter row serialize on it for one short transaction, and claims that race for the same head row wait for the winner's commit and move on. Batch claims (up to `max_tasks` per transaction, one `+k` per row), node-local coalescing (about one claim per waiter group per node, so load grows with nodes, not with parked workers; a watcher tick wakes one claim per group instead of a herd), hot-row shards, and "limit 0 = no row" bound that cost. Whether the ToolKit also selects candidates with `SKIP LOCKED` internally is decided by the benchmark, not by the Task Engine.
 - **Cost independent of queue depth.** A `fifo` stream reads at most `claim_scan_rows_max` index rows per claim; a `round_robin` stream makes at most `claim_candidate_budget` probes and seeks past excluded tenants. Total work per claim is bounded by these limits and `claim_max_queues`, not by queue length.
-- **No wasted writes on saturated scopes.** Saturated scopes are excluded up front (node saturation cache), checked again with a plain read, and finally decided under the counter-row locks before anything is written. A pick that does not fit is dropped without a task-row write and without a counter write (it only held a row lock), so a full tenant or type costs reads only. The saturation cache can only skip work; the locked counter check still decides.
+- **No wasted writes on saturated scopes.** Saturated scopes are excluded up front (node saturation cache), checked again with a plain read, and finally decided by the guarded reservation before anything is written. A full tenant or type costs reads only. The saturation cache can only skip work; the guarded reservation still decides.
 - **Capacity skips stay local.** A full dimension removes exactly the tasks it governs — the whole stream for `queue_global`, one (queue, tenant) pair for `queue_tenant`, one type in every queue for `type_global`. One tenant at its cap can never block the others. `fifo` queues with per-tenant limits still pay a bounded scan per claim, which is why `round_robin` is the default for multi-tenant queues.
-- **No deadlocks.** One transaction per claim takes locks in the global order of §3.7: task rows (at read time, never waiting, because `SKIP LOCKED` skips held rows), then the chosen counter rows sorted by key with each row written once, then backlog counters, then worker sessions.
-- **Tenant round-robin** (PRD §5.2, default mode): each node keeps an in-memory cursor per queue (the last tenant served). The probe returns the next tenant, skips it by seek if it is saturated, and otherwise locks its best free task. The cursor is soft state, so rotation is approximate across nodes and restarts, but it never skips an urgency class or breaks a tenant's own order among free rows, and adds no shared hot row. `fifo` queues use the plain `(urgency_code, priority, created_at, task_id)` stream.
+- **No deadlocks.** The claim follows the global order of §3.7: counter rows (sorted, each once), then task rows in ascending `task_id`, then settlement on rows it already holds, then worker sessions. Every other transaction also takes counters before task rows, so no cycle can form (ADR-0008 *Why it cannot deadlock*).
+- **Tenant round-robin** (PRD §5.2, default mode): each node keeps an in-memory cursor per queue (the last tenant served). The "next tenant" probe is a **scoped** read: it carries the caller's PDP constraints, so it visits only tenants (and types and queues) the caller may claim from. A tenant-plane worker therefore never spends `claim_candidate_budget` on other tenants' backlogs and cannot starve on a shared queue with many tenants, and no unscoped read exists on the claim path. The cursor is soft state, so rotation is approximate across nodes and restarts, but it never skips an urgency class or breaks a tenant's own order, and adds no shared hot row. `fifo` queues use the plain `(urgency_code, priority, created_at, task_id)` stream.
 - **Why priority is tenant-local.** Otherwise one tenant could send everything at `0` and starve the rest. Starvation inside one tenant is handled by priority aging (PRD §5.3). The optional ready-task cache (§4.2) **MUST** serve claims in the same order.
 
-**Alternatives considered**:
+**Alternatives considered** (details in ADR-0008):
 
 | Option | Why not |
 |---|---|
-| Try queues in the order the worker lists them, return the first hit (previous DESIGN) | Violates PRD §5.6: a `normal` task in the first queue wins over a `critical` task in the second |
+| Try queues in the order the worker lists them, return the first hit (earlier DESIGN) | Violates PRD §5.6: a `normal` task in the first queue wins over a `critical` task in the second |
 | One query `WHERE queue_id IN (…) ORDER BY urgency_code, created_at LIMIT k` | Simplest to write, but no index returns rows in that order across several `queue_id` values, so the database collects and sorts every `queued` row of those queues — O(queue depth) per claim, unusable for queues with millions of tasks |
 | A dispatch index keyed on `(state_code, urgency_code, created_at)` without `queue_id` | Global order comes for free, but the index scan then has to skip the queued tasks of every other queue on the way |
 | Priority bands per queue (priority stays cross-tenant) | A band per queue and policy, and every tenant still crowds the top of its band |
-| Plain head read + guarded `UPDATE … WHERE state_code = queued` per candidate (previous design) | Every claimer targets the same head row, so claims serialize per queue; a full counter is found only after the task row was written, so every capacity skip is a rolled-back write on the hottest table |
-| Candidate spreading: start at a random row of the head page, no row locks | Order is relaxed by up to `k − 1` tasks and the saturated-scope waste stays; fallback only if ToolKit cannot expose `SKIP LOCKED` (ADR-0008) |
-| Per-queue `SKIP LOCKED` streams + k-way merge + batch claim + coalescing (chosen) | Exact order among free rows, throughput grows with workers, no task write for capacity skips, cost bounded by the claim limits, portable through the secure ORM |
+| Guarded task `UPDATE` first, counters afterwards (earlier ADR-0008) | A full counter is found only after the task row was written, so every capacity skip is a rolled-back write on the hottest table |
+| Gear-level `SKIP LOCKED` streams through a new `SecureSelect::lock_exclusive_skip_locked()` (earlier DESIGN) | Puts backend locking behavior into the gear and locks task rows before counters; the same speed-up stays available as an internal ToolKit strategy |
+| Candidate spreading: start at a random row of the head page | Order is relaxed by up to `k − 1` tasks; opt-in ToolKit strategy only with PRD sign-off |
+| ToolKit secure claim, counter-first guarded updates + k-way merge + batch claim + coalescing (chosen) | Exact order among claimable rows, limits checked before any task write, deadlock-free by construction, portable, no dialect SQL in the gear, reusable by other gears |
 
 #### Task Creation Admission (Dedup, Supersession, Queue Depth)
 
@@ -2503,10 +2501,54 @@ else:
                              input: request.input, context: request.context or null}))
 
 BEGIN
-  # 1b. Link authorization (PRD §5.9). Every failure → the same 404, never 403.
-  #     Linked live rows are LOCKED (lock_exclusive), parent / predecessors in ascending task_id, before
-  #     the new task is inserted (§3.7 Lock ordering), so the link serializes with the linked task's
-  #     terminal transition: either we see it ended, or its finalize() sees our new rows (PRD §5.9).
+  # Lock order (§3.7, ADR-0008): plan → identity → counters → task rows → settle. No counter row is locked
+  # after a task row.
+
+  # 1. Dedup / idempotency (uniqueness via the te_dedup PK, for derived identities and caller keys alike).
+  # Use INSERT … ON CONFLICT DO NOTHING (SeaORM on_conflict().do_nothing(); MariaDB/SQLite equivalents),
+  # never a bare INSERT: on PostgreSQL a unique violation aborts the whole transaction. It runs first, so a
+  # replay never takes capacity and never locks another task.
+  r = INSERT te_dedup (owner_tenant_id, dedup_key, task_id, request_hash /* NULL for derived */) ON CONFLICT DO NOTHING
+  if r.rows_affected == 0:                                                # identity already held
+      existing = TeDedup::find(owner_tenant_id, dedup_key).secure().scope_with(scope.tenant_only())
+      ROLLBACK
+      # Caller key: compare with the ORIGINAL request, never with the holder's current row —
+      # context changes on checkpoint, queue_id on bulk move / dead-lettering.
+      if not type.dedup and existing.request_hash != request_hash:
+          return 400 invalid_argument (field violation on idempotency_key)  # caller's own key: no disclosure
+      holder = find_task_any(existing.task_id, scope)                     # live, terminal, or rescued (below)
+      return 409 already_exists(holder.id) if holder else 403 permission_denied (no identifier)
+
+  # 2. Plan (plain reads, no locks).
+  #    a) Supersession (only when type.supersede): head = SupersedeHead::find(owner_tenant_id, group_key).secure()
+  #       if head and O < head.latest_order: ROLLBACK; return 400 failed_precondition STALE_ORDER
+  #       if head and O > head.latest_order: old = TaskState::find(head.latest_task_id) (plain);
+  #          if old is non-terminal: authorize(cancel, old) with the caller's AccessScope (else ROLLBACK, 403)
+  #          and plan its cancel (mode = type.supersede.mode, superseded_by = new_id) and its counter deltas.
+  #       (O == head.latest_order: ordinary dedup, already handled in step 1)
+  #    b) Links (PRD §5.9): the parent and each predecessor are read with the caller's scope (parent: full
+  #       scope; predecessors: read_scope); a missing, foreign, or forbidden one → the same 404, never 403.
+  #    c) Queue-depth dimensions of the new task's initial state:
+  #       queued              -> [queue_global (te_queue_backlog), queue_tenant (te_tenant_queue_backlog)]
+  #                              (domain_global: sampled ceiling, checked before BEGIN)
+  #       scheduled / blocked -> [tenant_deferred (te_tenant_queue_backlog, queue_id = nil UUID)]
+  #       dimensions with limit 0 have no row and are skipped (Hot-row rules, §3.7)
+
+  # 3. Counters, in the canonical order of §3.7, each row once with its NET delta: the superseded task's
+  #    releases (if planned) and the new task's admission (+1) are summed per row, so a replacement is never
+  #    refused for capacity its own predecessor was holding.
+  for row in counter_rows(plan) sorted canonically:
+      r = if row.is_global():
+            GlobalCounterRepo::apply(row, net_delta, pick_shard())          # admission shard stored as backlog_shard
+          else:
+            TenantQueueBacklog::update_many().col_expr(used, used + net_delta)
+              .filter(<row key> AND (net_delta <= 0 OR used + net_delta <= limit_value))
+              .secure().scope_with(scope.tenant_only()).exec()
+      if r.rows_affected == 0: ROLLBACK; return 429 resource_exhausted QUEUE_DEPTH_LIMIT(dim), Retry-After
+
+  # 4. Task rows, in the §3.7 order (parent / predecessors first, ascending task_id).
+  #    Linked live rows are LOCKED (lock_exclusive) before the new task is inserted, so the link serializes
+  #    with the linked task's terminal transition: either we see it ended, or its finalize() sees our new rows.
   if task.parent_task_id:
       p = TaskState::find(task.parent_task_id).secure().scope_with(scope).lock_exclusive()   # full caller scope
       require p and p.owner_tenant_id == owner_tenant_id and p.state not in (waiting) and p non-terminal
@@ -2520,41 +2562,14 @@ BEGIN
       require t and t.owner_tenant_id == owner_tenant_id
   validate cross-refs: same task domain; not already unsatisfiable (terminal predecessors evaluated now)   # 400
       # no cycle check needed: the new task has no successors yet (§4.6 Dependency Graph Validation)
+  if old planned:
+      cancel(old, mode, superseded_by = new_id)  # guarded on its planned state; result stamped `superseded` at the
+                                                 # terminal transition; propagates to children (cascade)
+      # 0 rows => old changed since the plan (ended or got leased): ROLLBACK and retry from the top, because
+      # the counter deltas of step 3 assumed its planned state
 
-  # 2. Supersession check (only when type.supersede) — reads and cancels, does NOT write the head yet
-  head = SupersedeHead::find(owner_tenant_id, group_key).secure()
-  if head and O < head.latest_order:  ROLLBACK; return 400 failed_precondition STALE_ORDER
-  if head and O > head.latest_order:
-      old = TaskState::find(head.latest_task_id)
-      if old.state non-terminal:
-          authorize(cancel, old) with caller AccessScope                  # else ROLLBACK, 403
-          cancel(old, mode=type.supersede.mode, superseded_by=new_id)     # result stamped `superseded` at the terminal transition
-              # guarded update WHERE state_code IN non-terminal; 0 rows => already terminal, continue
-              # releases concurrency slots + backlog capacity + dedup row; propagates to children
-  # (O == head.latest_order: ordinary dedup in step 3)
-
-  # 3. Dedup / idempotency (uniqueness via the te_dedup PK, for derived identities and caller keys alike).
-  # Use INSERT … ON CONFLICT DO NOTHING (SeaORM on_conflict().do_nothing(); MariaDB/SQLite equivalents),
-  # never a bare INSERT: on PostgreSQL a unique violation aborts the whole transaction.
-  r = INSERT te_dedup (owner_tenant_id, dedup_key, task_id, request_hash /* NULL for derived */) ON CONFLICT DO NOTHING
-  if r.rows_affected == 0:                                                # identity already held
-      existing = TeDedup::find(owner_tenant_id, dedup_key).secure().scope_with(scope.tenant_only())
-      ROLLBACK                                                            # head and cancels roll back too
-      # Caller key: compare with the ORIGINAL request, never with the holder's current row —
-      # context changes on checkpoint, queue_id on bulk move / dead-lettering.
-      if not type.dedup and existing.request_hash != request_hash:
-          return 400 invalid_argument (field violation on idempotency_key)  # caller's own key: no disclosure
-      holder = find_task_any(existing.task_id, scope)                     # live, terminal, or rescued (below)
-      return 409 already_exists(holder.id) if holder else 403 permission_denied (no identifier)
-
-find_task_any(task_id, scope):                                            # holder may be in ANY state (PRD §5.1)
-  # task_id is UUID v7 → its creation time selects the history partition (§3.7), so each probe is a PK read.
-  return TaskState::find(task_id).secure().scope_with(scope)              # non-terminal
-      or TaskResult::find(task_id, created_at_of(task_id)).secure().scope_with(scope)   # terminal
-      or TaskResultRetained::find(task_id).secure().scope_with(scope)     # rescued before a partition drop (ADR-0009)
-
-  # 3b. Record the group's newest task (every admission, including an equal-order recreate after the
-  #     previous holder failed — otherwise a later supersede would target the dead task, not the live one)
+  # 5. Record the group's newest task (every admission, including an equal-order recreate after the
+  #    previous holder failed — otherwise a later supersede would target the dead task, not the live one)
   if type.supersede:
       if head is None:
           r = INSERT te_supersede_heads (owner_tenant_id, group_key, O, new_id) ON CONFLICT DO NOTHING
@@ -2563,28 +2578,19 @@ find_task_any(task_id, scope):                                            # hold
                 WHERE owner_tenant_id=? AND group_key=? AND latest_order <= O
       if r.rows_affected == 0: ROLLBACK; retry from the top            # lost race to a concurrent submission
 
-  # 4. Queue-depth admission (after replay/supersede so neither is penalized)
-  #    queued initial state   -> [queue_global (te_queue_backlog), queue_tenant (te_tenant_queue_backlog)]
-  #                              (domain_global: sampled ceiling, checked before BEGIN)
-  #    scheduled / blocked    -> [tenant_deferred (te_tenant_queue_backlog, queue_id = nil UUID)]
-  #    dimensions with limit 0 have no row and are skipped (Hot-row rules, §3.7)
-  for dim in dims_for(initial_state) where limit(dim) != 0:                 # Lock ordering: global rows, then tenant rows
-      r = if dim.is_global():
-            GlobalCounterRepo::admit(QueueBacklog, dim, queue_id, pick_shard())   # shard stored as backlog_shard
-          else:
-            TenantQueueBacklog::update_many().col_expr(used, used + 1)
-              .filter(owner_tenant_id = owner_tenant_id AND dimension_code = dim
-                      AND queue_id = (dim == tenant_deferred ? NIL_UUID : queue_id)
-                      AND used < limit_value)
-              .secure().scope_with(scope.tenant_only()).exec()
-      if r.rows_affected == 0: ROLLBACK; return 429 resource_exhausted QUEUE_DEPTH_LIMIT(dim), Retry-After
   INSERT te_tasks (with authority_json) + te_task_state (queued | scheduled | blocked)
   INSERT te_resource_refs (verified = refs_verified[ref]); te_dependencies (satisfied = predecessor already completed)
   timers; outbox events (TaskCreated, TaskCancelled{superseded_by})
 COMMIT
+
+find_task_any(task_id, scope):                                            # holder may be in ANY state (PRD §5.1)
+  # task_id is UUID v7 → its creation time selects the history partition (§3.7), so each probe is a PK read.
+  return TaskState::find(task_id).secure().scope_with(scope)              # non-terminal
+      or TaskResult::find(task_id, created_at_of(task_id)).secure().scope_with(scope)   # terminal
+      or TaskResultRetained::find(task_id).secure().scope_with(scope)     # rescued before a partition drop (ADR-0009)
 ```
 
-Lost-race handling rolls back (undoing any cancel and dedup row) and re-runs the transaction (bounded retries, then `409` `aborted`), so concurrent submissions of the same group always converge on the highest order value, and `latest_task_id` always names the group's newest admitted task. Cancelling the superseded task *before* the depth reservation means a replacement is not rejected for capacity its own predecessor was holding: an unleased predecessor is cancelled immediately in either mode, and a leased (`graceful`) one holds no queue-depth capacity — only concurrency slots, released when it acknowledges or its `cancel_grace` timer fires.
+Lost-race handling rolls back (undoing any cancel, counter delta, and dedup row) and re-runs the transaction (bounded retries, then `409` `aborted`), so concurrent submissions of the same group always converge on the highest order value, and `latest_task_id` always names the group's newest admitted task. The superseded task's releases and the new task's admission are applied as one net delta per counter row, so a replacement is not rejected for capacity its own predecessor was holding: an unleased predecessor is cancelled immediately in either mode, and a leased (`graceful`) one holds no queue-depth capacity — only concurrency slots, released when it acknowledges or its `cancel_grace` timer fires.
 
 #### Payload-Changing Writes (Checkpoint, Complete with Output, Set-Wait with Checkpoint)
 
@@ -2703,14 +2709,15 @@ liveness_failure(t, guard_extra):
       if max_liveness_requeues == 0 OR t.liveness_requeues < max_liveness_requeues:
         # requeue uses the SAME retry-policy backoff curve as an explicit failure (§3.2 Heartbeat), on its own counter: scheduled, NOT immediate queued
         run_after = now + compute_backoff(retry_policy, n = t.liveness_requeues + 1)
+        # one transaction:
+        release slots (recorded shards) and admit to tenant_deferred as a re-entry   # counters first (§3.7)
         r = TaskState::update_many()
           .col_expr(state_code, Scheduled).col_expr(run_after, run_after)
           .col_expr(liveness_requeues, liveness_requeues + 1)            # never touches retry_count
           .col_expr(lease_token, NULL).col_expr(session_id, NULL).col_expr(handoff_until, NULL)
           .col_expr(assignment_deadline, NULL).col_expr(execution_deadline, NULL)
           .filter(guard).exec()
-        if r.rows_affected == 0: return             # the task moved on concurrently
-        release slots
+        if r.rows_affected == 0: ROLLBACK; return   # the task moved on concurrently; counter deltas undone
         delete queue/wait timers; set scheduled timer at run_after   # lifetime + SLA timers are KEPT (PRD §5.3)
         # attempt NOT incremented (bumped on next claim)
         if not handoff: record_liveness_failure(worker, queue, lease_duration)
@@ -2793,6 +2800,11 @@ add_dependencies(ctx, successor_id, predecessors[], mode):        # POST /tasks/
     # 0. Tenant graph lock FIRST (§3.7 Lock ordering step 0): one dependency addition per tenant at a time
     INSERT te_dependency_locks(owner_tenant_id) ON CONFLICT DO NOTHING
     UPDATE te_dependency_locks SET version = version + 1 WHERE owner_tenant_id = ?        # holds the lock until COMMIT
+    # 0b. Plan with plain reads (successor state, which predecessors are still live), then counters BEFORE task
+    #     rows (§3.7): if the successor will become `blocked`, admit it to tenant_deferred (may be 429) and, when
+    #     it is `queued`, release its queued backlog. If the locked rows below differ from the plan (a predecessor
+    #     ended meanwhile), the difference is settled on these already-held rows; if the successor's state differs,
+    #     ROLLBACK and retry.
     # 1. Link authorization and locks (PRD §5.9; uniform 404): predecessors in ascending task_id, then the successor
     for p in sorted(predecessors):
       live[p] = TaskState::find(p).secure().scope_with(read_scope).lock_exclusive()
@@ -2812,11 +2824,11 @@ add_dependencies(ctx, successor_id, predecessors[], mode):        # POST /tasks/
     if unsatisfiable(mode, term):       # ALL: any ended without success; ANY: every predecessor ended without success
       ROLLBACK; return 400 failed_precondition
     INSERT te_dependencies(successor_id, p, mode, satisfied[p]) for p
-    if any unmet: s → blocked (deferred admission into tenant_deferred, may be 429; delete queue/scheduled timer)
+    if any unmet: s → blocked (guarded on its planned state; delete queue/scheduled timer; counters already applied in 0b)
   COMMIT
 ```
 
-Why no successor is left `blocked` on an ended predecessor: a live predecessor's row is locked before the dependency row is inserted. If the predecessor's `finalize()` runs first, its `te_task_state` row is gone when our lock returns, so step 1 finds it in `te_task_results` and step 3 applies its outcome. If our transaction runs first, the predecessor's `finalize()` waits on the row lock and then reads successors with a locking read (§4.6 Cascades), which sees our committed rows. Task creation with predecessors and child creation follow the same lock-then-insert rule (§4.6 Task Creation Admission, step 1b). The graph lock serializes only dependency additions inside one tenant, an infrequent administrative call; `te_dependency_lock_wait_seconds` tracks the cost.
+Why no successor is left `blocked` on an ended predecessor: a live predecessor's row is locked before the dependency row is inserted. If the predecessor's `finalize()` runs first, its `te_task_state` row is gone when our lock returns, so step 1 finds it in `te_task_results` and step 3 applies its outcome. If our transaction runs first, the predecessor's `finalize()` waits on the row lock and then reads successors with a locking read (§4.6 Cascades), which sees our committed rows. Task creation with predecessors and child creation follow the same lock-then-insert rule (§4.6 Task Creation Admission, step 4). The graph lock serializes only dependency additions inside one tenant, an infrequent administrative call; `te_dependency_lock_wait_seconds` tracks the cost.
 
 ```
 on_predecessor_terminal(pred_id, outcome):            # called through cascade() below
@@ -2831,22 +2843,25 @@ on_predecessor_terminal(pred_id, outcome):            # called through cascade()
 
 **ID**: `cpt-cf-task-engine-design-terminal-transition`
 
-Every transition into `completed`, `failed`, `dead_lettered`, or `cancelled` — worker completion or failure, every cancel mode, supersession, `cancel_grace` expiry, queue / execution / lifetime timeout, liveness budget exhausted, wait group failure (including `eval_budget_exceeded`), `dependency_failed`, and the hard retention limit — runs this one procedure, inside the transaction of its trigger. No other code path deletes a `te_task_state` row or writes `te_task_results`. Steps run in this order (the lock order of §3.7 holds because the task row is taken first and counters last):
+Every transition into `completed`, `failed`, `dead_lettered`, or `cancelled` — worker completion or failure, every cancel mode, supersession, `cancel_grace` expiry, queue / execution / lifetime timeout, liveness budget exhausted, wait group failure (including `eval_budget_exceeded`), `dependency_failed`, and the hard retention limit — runs this one procedure, inside the transaction of its trigger. No other code path deletes a `te_task_state` row or writes `te_task_results`. Steps run in this order, which is the plan → counters → transition → settle order of §3.7 Lock ordering (ADR-0008):
 
 ```
 finalize(t, result_code, route = none, guard = default_guard(t), extra = []) -> ok | lost_race:
-  1. Guarded update of t's te_task_state row on its expected state (and the lease fence for worker calls);
-     rows_affected == 0 → return lost_race (another actor won; the caller re-reads or skips).
-  2. Result: result_code; `superseded` overrides `cancelled` / `forcibly_cancelled` when superseded_by is set.
+  0. Plan (plain reads, no locks): t's state, queue, tenant, type, recorded shards and pending event
+     conditions; for an inline cascade (step 8) also the first cascade_inline_limit dependents and theirs.
+  1. Counters, from the recorded shards (§3.7), in the canonical counter order, each row once with the
+     summed delta: release concurrency slots if t held a lease (queue_slot_shard / type_slot_shard and the
+     tenant rows); release queue-depth capacity of the set t leaves (queued: queue_global via backlog_shard +
+     queue_tenant; scheduled / blocked / waiting: tenant_deferred); release te_tenant_wait_counters places of
+     t's pending event conditions; the same for the planned inline dependents.
+  2. Guarded update of t's te_task_state row on its expected (planned) state (and the lease fence for worker
+     calls); rows_affected == 0 → return lost_race: the caller rolls back the transaction, so the counter
+     deltas of step 1 are undone (another actor won; the caller re-reads or skips).
+  3. Result: result_code; `superseded` overrides `cancelled` / `forcibly_cancelled` when superseded_by is set.
      route = dlq_or_failed: DLQ configured → state dead_lettered, dead_lettered_from = queue_id,
      queue_id = the queue's DLQ; else state failed. Otherwise the state follows from the code (PRD §5.12 pairing).
-  3. Progress: if this node holds a buffered progress entry for t under t's lease token, flush it now, before
+  4. Progress: if this node holds a buffered progress entry for t under t's lease token, flush it now, before
      the terminal event. Entries on other nodes are dropped at their next flush by the lease guard.
-  4. Counters, from the recorded shards (§3.7): release concurrency slots if t held a lease
-     (queue_slot_shard / type_slot_shard and the tenant rows); release queue-depth capacity of the set t
-     leaves (queued: queue_global via backlog_shard + queue_tenant; scheduled / blocked / waiting:
-     tenant_deferred); release te_tenant_wait_counters places of t's pending event conditions.
-     Per-row deltas are summed first when one transaction finalizes several tasks (§3.7 Lock ordering).
   5. Live-only rows: delete t's te_timers (except a cascade timer created in this transaction), its
      te_wait_conditions (armed or parked), and its te_dependencies rows as successor after copying them
      into te_task_results.predecessors.
@@ -2856,7 +2871,9 @@ finalize(t, result_code, route = none, guard = default_guard(t), extra = []) -> 
      te_supersede_heads is left untouched.
   7. Move: INSERT te_task_results (terminal_at = now; lease_token kept only for a worker completion,
      cleared otherwise — §3.1 Lease token / epoch handling); DELETE the te_task_state row.
-  8. Dependents (§4.6 Cascades), with locking reads of the dependents:
+  8. Dependents (§4.6 Cascades), with locking reads of the dependents, guarded on their planned state; a
+     dependent that changed after the plan is skipped here and handled by the durable cascade batch, and
+     the counter difference is settled on rows already held (never a new counter row):
      - successors: on_predecessor_terminal(t, outcome) — always;
      - children: cancel through cascade(t, children) when state = cancelled and t.propagate_cancel;
      - parent: if t.parent_task_id and the parent is live, INSERT a children_check timer for the parent.
@@ -2866,7 +2883,7 @@ finalize(t, result_code, route = none, guard = default_guard(t), extra = []) -> 
   After COMMIT: fire the outbox Wake handle; signal slotReleased if slots were freed.
 ```
 
-The State Transition Table (§3.1) lists only what each terminal row adds to this procedure. A test fixture runs every terminal trigger and asserts the post-state of steps 4–9 (PRD §9).
+The State Transition Table (§3.1) lists only what each terminal row adds to this procedure. A test fixture runs every terminal trigger and asserts the post-state of steps 1 and 5–9 (PRD §9).
 
 #### Cascades (Child Cancellation, Dependency Resolution)
 
@@ -2988,7 +3005,7 @@ Consistent with PRD §4.2:
 | `cpt-cf-task-engine-fr-wait-input` | §3.1 InputWait; §3.2 WaitConditionService |
 | `cpt-cf-task-engine-fr-wait-children` | §3.1 ChildrenWait; §3.2 WaitConditionService; §4.6 Cascades (Children wait check) |
 | `cpt-cf-task-engine-fr-task-entries` | §3.1 TaskEntry entity; §3.3 Entry Endpoints; §3.7 `te_task_entries` |
-| `cpt-cf-task-engine-fr-assignment` | §3.1 Assignment; §3.2 QueueService; §4.6 Task Assignment algorithm (SKIP LOCKED streams, batch claim, coalescing); ADR-0008 |
+| `cpt-cf-task-engine-fr-assignment` | §3.1 Assignment; §3.2 QueueService; §4.6 Task Assignment algorithm (ToolKit secure claim, counter-first guarded updates, batch claim, coalescing); ADR-0008 |
 | `cpt-cf-task-engine-fr-heartbeat` | §3.2 QueueService (heartbeat), TimerService (deadline scans); §3.3 Heartbeat endpoints; §3.7 `te_worker_sessions`; §4.6 sessionScan; ADR-0017 |
 | `cpt-cf-task-engine-fr-release` | §3.1 State Transition Table (voluntary release); §3.2 TaskService; §3.3 `POST /tasks/{id}/release` |
 | `cpt-cf-task-engine-fr-worker-blacklist` | §3.2 QueueService (blacklist); §3.7 `te_worker_blacklist` |
@@ -3028,7 +3045,7 @@ Consistent with PRD §4.2:
 
 | PRD NFR | Realized in DESIGN.md |
 |---|---|
-| `cpt-cf-task-engine-nfr-latency` | §4.6 Task Assignment (SKIP LOCKED streams, counters checked under lock); §4.2 Ready-task cache; ADR-0008 |
+| `cpt-cf-task-engine-nfr-latency` | §4.6 Task Assignment (ToolKit secure claim, slots reserved before any task write); §4.2 Ready-task cache; ADR-0008 |
 | `cpt-cf-task-engine-nfr-throughput` | §4.6 Task Assignment (batch claim, coalescing); §3.7 Index design, Partial indexes on MySQL/MariaDB; §3.9 Write budget; ADR-0008, ADR-0017 |
 | `cpt-cf-task-engine-nfr-availability` | §4.2 Caching Strategy (graceful degradation) |
 | `cpt-cf-task-engine-nfr-timer-accuracy` | §4.6 Timer Wheel algorithm; ADR-0003 |
@@ -3052,7 +3069,7 @@ Consistent with PRD §4.2:
 - [ADR/0005-concurrency-enforcement.md](ADR/0005-concurrency-enforcement.md) — `cpt-cf-task-engine-adr-concurrency-enforcement`. Multi-dimensional concurrency enforcement strategy.
 - [ADR/0006-blob-compression.md](ADR/0006-blob-compression.md) — `cpt-cf-task-engine-adr-blob-compression`. Transparent JSON blob compression with magic-header marker.
 - [ADR/0007-event-wait-matching.md](ADR/0007-event-wait-matching.md) — `cpt-cf-task-engine-adr-event-wait-matching`. CEL-based match expression evaluation under a cost budget, with per-tenant condition limits.
-- [ADR/0008-atomic-claim-strategy.md](ADR/0008-atomic-claim-strategy.md) — `cpt-cf-task-engine-adr-atomic-claim-strategy` (proposed). `SKIP LOCKED` per-queue streams through the secure ORM, k-way merge, batch claims, node-local coalescing, and counters checked under lock before any task write.
+- [ADR/0008-atomic-claim-strategy.md](ADR/0008-atomic-claim-strategy.md) — `cpt-cf-task-engine-adr-atomic-claim-strategy` (proposed). ToolKit secure claim primitive with counter-first guarded updates, k-way merge, batch claims, and node-local coalescing; counters before task rows as the engine-wide lock order.
 - [ADR/0009-retention-partitioning.md](ADR/0009-retention-partitioning.md) — `cpt-cf-task-engine-adr-retention-partitioning`. Live/history split with terminal-time retention and rescue-then-drop of history partitions.
 - [ADR/0010-task-domains.md](ADR/0010-task-domains.md) — `cpt-cf-task-engine-adr-task-domains`. Task domains with first-match routing and a single-domain rule for atomic operations.
 - [ADR/0011-lease-fencing.md](ADR/0011-lease-fencing.md) — `cpt-cf-task-engine-adr-lease-fencing`. Per-lease token for engine writes and a monotonic lease epoch for external fencing.

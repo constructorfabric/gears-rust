@@ -1,10 +1,10 @@
 ---
 status: proposed
-date: 2026-10-24
-description: "Claim tasks with a plain scoped read plus a guarded conditional update through the ToolKit secure ORM, reserve slots with single-statement conditional updates, and shard hot rows and background loops instead of using row locks or dialect SQL."
+date: 2026-10-25
+description: "Claim tasks through a ToolKit secure claim primitive that runs a counter-first, guarded-update protocol: plain scoped candidate reads, guarded slot reservation, guarded state transition, settle, commit. No SKIP LOCKED and no dialect SQL in the Task Engine."
 ---
 
-# Claim Tasks with a DB-Agnostic Optimistic Guarded Update
+# Claim Tasks Through a ToolKit Secure Claim Primitive (Counter-First Guarded Updates)
 
 <!-- toc -->
 
@@ -12,13 +12,18 @@ description: "Claim tasks with a plain scoped read plus a guarded conditional up
 - [Decision Drivers](#decision-drivers)
 - [Considered Options](#considered-options)
 - [Decision Outcome](#decision-outcome)
+  - [The claim protocol](#the-claim-protocol)
+  - [Why it cannot deadlock](#why-it-cannot-deadlock)
+  - [Throughput](#throughput)
+  - [ToolKit contract](#toolkit-contract)
   - [Consequences](#consequences)
   - [Confirmation](#confirmation)
 - [Pros and Cons of the Options](#pros-and-cons-of-the-options)
-  - [Option 1: SELECT ... FOR UPDATE SKIP LOCKED](#option-1-select--for-update-skip-locked)
+  - [Option 1: Gear-level SELECT ... FOR UPDATE SKIP LOCKED](#option-1-gear-level-select--for-update-skip-locked)
   - [Option 2: Leader-serialized claims](#option-2-leader-serialized-claims)
-  - [Option 3: Optimistic guarded update with k-way merge](#option-3-optimistic-guarded-update-with-k-way-merge)
+  - [Option 3: Gear-level optimistic guarded update, task row first](#option-3-gear-level-optimistic-guarded-update-task-row-first)
   - [Option 4: Candidate spreading without row locks](#option-4-candidate-spreading-without-row-locks)
+  - [Option 5: ToolKit secure claim primitive, counter-first guarded updates](#option-5-toolkit-secure-claim-primitive-counter-first-guarded-updates)
 - [More Information](#more-information)
 - [Traceability](#traceability)
 
@@ -26,126 +31,178 @@ description: "Claim tasks with a plain scoped read plus a guarded conditional up
 
 **ID**: `cpt-cf-task-engine-adr-atomic-claim-strategy`
 
-> **TODO (must be resolved before implementation; this ADR stays `proposed` until then)**: this decision does not yet handle **head-row contention**. All concurrent claimers target the same global-minimum candidate, so on a busy queue N−1 workers block on one row lock and then lose the race; claims effectively serialize per queue. It also wastes writes on saturated scopes: the task row is updated first and rolled back when a counter is full. The rejection of `SKIP LOCKED` rests on a ToolKit limitation, not on its merits.
->
-> - **Impact while open:** `cpt-cf-task-engine-nfr-throughput` (≥ 100 workers on one queue) is not reachable.
-> - **TODO(toolkit):** request a scoped `SecureSelect<E, Scoped>::lock_exclusive_skip_locked()`, available only on scoped queries so the tenant/PDP predicate can never be dropped. sea-orm already has `lock_with_behavior(…, SkipLocked)`, so the change is small. Target PG, MySQL 8, MariaDB 10.6+; no-op on SQLite. Not yet filed; it is on the critical path.
-> - **Options** (details, notes, and exit criteria in DESIGN §4.6 Task Assignment — the single source for this TODO): (A) `SKIP LOCKED` per queue stream — preferred; (B) candidate spreading (Option 4) — needs PRD sign-off on relaxed order; fallback; (C) node-local claim coalescing; (D) batch claim; (E) virtual sub-queues — last resort; (F) ready-task cache — optimization only; plus a counter pre-check / per-node saturation cache for saturated scopes.
-> - **Suggested:** A + D + C, plus the saturated-scope fix. Run the DESIGN §4.6 benchmark matrix, record the results here, then set this ADR to `accepted` and remove this TODO.
-
 ## Context and Problem Statement
 
-Many workers on many nodes claim tasks from shared queues at the same time. Two workers must never claim the same task, the best eligible task across all requested queues (PRD §5.2 order) must win, and slot reservation must be atomic with the claim (ADR-0005). The engine runs on PostgreSQL, MariaDB/MySQL, and SQLite through the ToolKit secure ORM.
+Many workers on many nodes claim tasks from shared queues at the same time. Two workers must never claim the same task, the best eligible task across all requested queues (PRD §5.2 order) must win, and slot reservation must be atomic with the claim (ADR-0005). The engine runs on PostgreSQL, MariaDB/MySQL, and SQLite through the ToolKit secure ORM, and the gear contains no dialect-specific SQL.
 
-Scoped `SecureSelect` offers `lock_shared()` / `lock_exclusive()` (`FOR UPDATE`), but no `SKIP LOCKED`, which exists only inside the toolkit-db outbox. Plain `FOR UPDATE` does not fix head-row contention.
+The same problem exists elsewhere on the platform. The `toolkit-db` outbox claims partitions and messages with its own internal, backend-specific statements (`outbox/dialect.rs`), and the Durable Execution gear claims activity instances with CAS, fences, and leases and enforces stage concurrency the same way. Claiming is therefore a platform primitive, not Task-Engine logic.
+
+Where does the claim algorithm live, and which protocol does it run so that it is correct on every backend, deadlock-free, and fast enough for the throughput NFR?
 
 ## Decision Drivers
 
 * No double claim, on any backend.
-* Exact claim order (PRD §5.2): per queue urgency, then tenant fairness, then the tenant's `(priority, created_at, task_id)`; across queues `(urgency, created_at, task_id)`.
-* No dialect-specific SQL; must work through the secure ORM and on SQLite.
-* Claim latency within the PRD targets (p50 50 ms, p99 200 ms).
-* Claim throughput on one queue must grow with the number of workers, not collapse.
-* Hot rows (counters) and background loops must not become single bottlenecks.
+* A concurrency limit is a hard upper bound, never exceeded across nodes.
+* Exact claim order among claimable rows (PRD §5.2): per queue urgency, then tenant fairness, then the tenant's `(priority, created_at, task_id)`; across queues `(urgency, created_at, task_id)`.
+* No `SKIP LOCKED` and no dialect SQL in the Task Engine; only the secure ORM surface.
+* Deadlock-free by construction, not by retry.
+* No task-row write for a candidate whose limits are full.
+* Claim latency within the PRD targets (p50 50 ms, p99 200 ms); throughput on one queue grows with batch size and nodes, not with parked workers.
+* Reusable by other gears (Durable Execution, future job-style gears).
 
 ## Considered Options
 
-1. **SELECT ... FOR UPDATE SKIP LOCKED** — lock candidate rows and skip locked ones.
+1. **Gear-level `SELECT ... FOR UPDATE SKIP LOCKED`** — a new `SecureSelect::lock_exclusive_skip_locked()`; the gear locks candidate rows per queue stream, then counters.
 2. **Leader-serialized claims** — route all claims through one leader node.
-3. **Optimistic guarded update with k-way merge** — read per-queue heads without locks, merge them by claim order, then claim with `UPDATE ... WHERE state_code = queued`; exactly one racing worker sees `rows_affected == 1`.
-4. **Candidate spreading without row locks** — keep the optimistic guarded update, but each claimer starts at a random (or `hash(worker_id)`-based) position within the first `claim_scan_limit` candidates instead of the head.
+3. **Gear-level optimistic guarded update, task row first** — read candidates, `UPDATE task ... WHERE state = queued`, then reserve counters; roll back the task write when a counter is full.
+4. **Candidate spreading without row locks** — like Option 3, but each claimer starts at a random position in the head page.
+5. **ToolKit secure claim primitive, counter-first guarded updates** — the protocol of the Task Engine overview deck ("two workers race for T42"): plain candidate read → guarded slot reservation → guarded state transition → settle → commit, owned by `toolkit-db`, with batch claims and node-local coalescing in the gear.
 
 ## Decision Outcome
 
-Chosen option: **Option 3 — Optimistic guarded update with k-way merge**, as a provisional choice that works with today's ToolKit. It is expected to be replaced by Option 1 (where ToolKit allows) or combined with Option 4 once the TODO above is resolved.
+Chosen option: **Option 5 — ToolKit secure claim primitive, counter-first guarded updates.**
 
-Claims use lock-free optimistic concurrency. The engine reads candidate heads with plain scoped `SELECT`s, merges them in claim order, and attempts each candidate with one guarded update that requires `state_code = queued`, reserves concurrency slots with `used = used + 1 WHERE used < limit_value`, sets the lease (a random `lease_token` bound to `assignee_subject`, `lease_epoch + 1`, `lease_until`; ADR-0011), and increments `attempt`, all in one transaction and in the fixed lock order of DESIGN §3.7. A guard matching zero rows means another worker won; the engine tries the next candidate.
+Every step is a plain scoped read or a guarded conditional `UPDATE` whose `WHERE` clause is the guard, re-checked by the database on the latest committed row. No step uses `SELECT ... FOR UPDATE` or `SKIP LOCKED`. The protocol lives in `toolkit-db` (`toolkit_db::secure::claim`, TODO(toolkit)); the Task Engine supplies only its candidate streams, counter keys, and the state transition.
 
-All queues in one claim must resolve to one task domain, so the claim runs inside one database. The number of queues per claim is capped by `claim_max_queues`.
+### The claim protocol
 
-Hot rows are sharded: with `counter_shards = S > 1`, a cross-tenant slot or backlog row (`te_concurrency_slots`, `te_queue_backlog`) is split into S shards whose sub-limits sum to at most N, and a claim reserves against one shard. Background loops (timer wheel, lease scan) are split into `bg_shards` shards guarded by advisory locks; low-frequency maintenance runs under a single advisory-lock leader.
+One transaction per claim (or per coalesced claim of a waiter group), at `READ COMMITTED`: the PostgreSQL default; set explicitly through `TxConfig` on MySQL/MariaDB, whose default `REPEATABLE READ` would make a loser wait instead of moving on; SQLite has one writer.
+
+1. **Pick candidates (no locks).** Each requested queue yields its next candidates in claim order from its dispatch index with a plain, scoped keyset read: a head page for `fifo` queues, one best task per tenant in turn for `round_robin` queues. Every read, including the round-robin "next tenant" probe, carries the caller's compiled `AccessScope`. A k-way merge orders the candidates across queues by `(urgency, created_at, task_id)`. Work is bounded by `claim_scan_rows_max`, `claim_candidate_budget`, and `claim_max_queues`.
+2. **Plan capacity (no locks).** A plain read of the counter rows the candidates need (all shards of a sharded scope). Scopes with no room are excluded before any write (node saturation cache plus this read); for each remaining concurrency counter row the claim computes `k` = the slots it wants there, at most `max_tasks`. The picks are the first candidates in merge order that fit the plan.
+3. **Reserve slots.** For each counter row, in the canonical key order (concurrency rows, then the queued-backlog rows of the picks): concurrency rows take `UPDATE counter SET used = used + k WHERE <key> AND used + k <= limit_value`; backlog rows take their planned `−k`. One row → applied, and the row lock is held to commit. Zero rows on a concurrency row → re-read it, lower `k` to what is free, or drop the scope (`skipped_for_capacity`). The limit is checked inside the `UPDATE`, under the row lock, so it can never be exceeded.
+4. **Win the race.** For the picks in **ascending `task_id`** (which tasks are picked is decided by merge order; only the write order is by id): `UPDATE task SET state = claimed, assignee…, lease_token = <random v4>, lease_epoch = lease_epoch + 1, attempt… WHERE task_id = ? AND state = queued` (scoped). One row → won. Zero rows → another claim (or a cancel, move, timeout) won; the claim takes the next candidate of the same scope if its `task_id` is greater than every row it already wrote, otherwise it leaves the slot for a fresh transaction. The loser never sees an error.
+5. **Settle.** On the counter rows it already holds — never a new one — the claim returns unused reservations (`used = used − (k − won)`) and corrects the backlog delta to the tasks it actually won. Then it deletes the won tasks' queue-timeout timers, enqueues `TaskClaimed`, and renews the worker sessions last (ADR-0017).
+6. **Commit.** Reservation, state changes, backlog, timers, outbox, and sessions commit together or not at all. A database-reported contention error (`toolkit_db::contention::is_retryable_contention`) retries the whole transaction a bounded number of times; for a claim it counts as a lost race.
+
+Nothing is claimed and at least one candidate was skipped for capacity → `429 CONCURRENCY_LIMIT`; nothing eligible → `204`.
+
+### Why it cannot deadlock
+
+The claim's order — counters first, then task rows — becomes the **one global lock order of the engine** (DESIGN §3.7), for every transaction, not only for claims:
+
+1. `te_dependency_locks` (dependency additions only);
+2. **counter rows**, all kinds, each kind by key: concurrency (cross-tenant, then per tenant), queued backlog (cross-tenant, then per tenant), event-wait counters — with the deltas the transaction planned from a plain read;
+3. **task rows**, ascending `task_id` (cascades and links: parent or predecessor first, then dependents ascending);
+4. settlement of deltas on counter rows the transaction **already holds**;
+5. worker sessions.
+
+Every transaction follows **plan → counters → guarded task transitions → settle**. Completion, failure, release, liveness requeue, cancel, park, resume, bulk operations, and cascades all read the task (and its recorded shards) first without a lock, apply their counter deltas, and then run the transition guarded on the expected state. If the guard matches zero rows, the task changed since the plan: the transition is skipped and redone in a fresh transaction (single-task calls roll back and report the lost race as today). A transaction never locks a counter row after it has locked a task row, so no cycle can form between counters and tasks; counters among themselves and task rows among themselves are taken in one sorted order. Reconciliation locks one counter row and then counts with a plain read (DESIGN §3.7).
+
+`READ COMMITTED` is still required for claims: a loser re-checks the guard on the latest committed row and moves on instead of failing with a serialization error (PostgreSQL `REPEATABLE READ`) or taking gap locks (InnoDB `REPEATABLE READ`).
+
+Deadlock retry stays only as a safety net for orders the analysis does not cover.
+
+### Throughput
+
+A counter row with a non-zero limit is held from step 3 to commit, so claims that need the same row serialize on it; a claim that loses the head row waits for the winner's commit and then moves on. Both waits last one short transaction. The design keeps that cost low:
+
+* **Batch claims**: one transaction claims up to `max_tasks` tasks with one `+k` per counter row.
+* **Node-local coalescing**: parked waiters with the same subject, compiled scope, and queue set share one database claim, so database load grows with nodes, not with workers.
+* **Hot-row sharding**: a wide `queue_global` / `type_global` row is split into shards whose sub-limits sum to at most N; a claim reserves on one shard with room.
+* **Unlimited means untouched**: a dimension with limit `0` has no counter row and is never locked.
+
+Estimate to be confirmed by the benchmark: a claim transaction of 2–5 ms on PostgreSQL serializes at 200–500 transactions per second per counter shard; with batches of up to 32 and coalescing this is well above the 500 claims/s NFR on one queue.
+
+**Backend acceleration is a ToolKit strategy, not a gear decision.** If the benchmark shows that head-row waits dominate, `toolkit-db` may select candidates internally with `FOR UPDATE SKIP LOCKED` on PostgreSQL/MySQL (as its outbox already does), under the same contract and the same exact order among free rows. An opt-in `Spread` strategy (candidate spreading, Option 4) exists only with PRD sign-off on the relaxed order. The Task Engine never names either.
+
+### ToolKit contract
+
+`toolkit_db::secure::claim` (TODO(toolkit), critical path; also intended for Durable Execution) owns:
+
+* the transaction and its isolation level per backend;
+* scoped candidate streams (keyset pages and per-key probes) and the k-way merge, with the caller's `AccessScope` on every statement — there is no unscoped claim path;
+* guarded counter reservation (`+k`, shard choice, re-plan on refusal), the guarded state transition, settlement of unused reservations, and the canonical lock order;
+* contention retry, and metrics (`claims`, `lost_races`, `capacity_skips`, `contention_retries`).
+
+The gear supplies: the candidate streams (entity, index order, filters), the counter keys of a candidate, the transition (columns and guard), extra writes for won rows (timers, outbox, backlog, sessions) through a callback inside the same transaction, and the batch size. Long-poll, waiter groups, and coalescing stay in the gear.
 
 ### Consequences
 
-* There is no double claim and no dialect branching anywhere in the Task Engine.
-* SQLite is supported for development, test, and low-volume single-node use.
-* Claim order is exact across queues.
-* Concurrency limits stay hard upper bounds even when sharded; sharding may leave some capacity unused on one shard.
-* Lease fencing (`lease_token`, `lease_epoch`) is set by the same guarded update, so stale workers are rejected with `LEASE_LOST`.
-* A cross-domain claim is rejected with `invalid_argument`.
+* The Task Engine contains no `SKIP LOCKED`, no `FOR UPDATE` on claims, and no dialect SQL; only the secure claim API.
+* The claim protocol and its correctness proof are reviewed once, in `toolkit-db`, and reused by other gears.
+* No double claim and no exceeded limit on any backend; no task-row write for a scope that is full.
+* Claim order is exact among claimable rows across queues and independent of the order the worker lists them.
+* MySQL/MariaDB claim transactions run at `READ COMMITTED`.
+* The engine-wide lock order changes from "task rows, then counters" to "counters, then task rows" (plan → counters → transition → settle) for every transaction; DESIGN §3.7 and the terminal transition (`finalize()`) follow it.
+* Per-row serialization is the price of the hard limit; batches, coalescing, and shards bound it, and the benchmark decides whether the ToolKit enables `SKIP LOCKED` internally.
+* Until `toolkit_db::secure::claim` exists the Task Engine cannot implement claims; this is a critical-path ToolKit item.
+* A cross-domain claim is rejected (`invalid_argument`); all queues of one claim are in one database (ADR-0010).
 
 ### Confirmation
 
-Tests MUST check that:
+Tests MUST check, on PostgreSQL, MySQL/MariaDB, and SQLite, that:
 
-* concurrent claims never assign one task twice, on every backend;
+* concurrent claims never assign one task twice;
+* no concurrency dimension ever exceeds its limit under concurrent claims, releases, and reconciliation;
 * the claimed task is the first eligible task in the PRD §5.2 order across all requested queues, regardless of queue order;
-* slot reservation and the state change commit or roll back together;
-* sharded limits never admit more than N;
-* claim latency meets the PRD targets under the reference load.
+* a full scope causes no task-row write, and the claim moves on to other tenants and types;
+* reservation, state changes, backlog, timers, outbox, and sessions commit or roll back together;
+* concurrent claims and completions on the same queue never deadlock (no `40P01` / `1213` under the stress test).
+
+Benchmark (exit criterion for `accepted`): PostgreSQL and MySQL 8 × {1, 10, 100, 500} workers × {1, 10} queues × {`fifo`, `round_robin`} × `max_tasks` {1, 16} × queue limit {0, 100, 10 000}, plus one run where a single tenant holds 100K `queued` tasks at its `per_tenant_concurrency_limit`. Record p50/p99 claim latency, claims/s, lost races per claim, counter-row wait time, and contention retries. **Pass:** `cpt-cf-task-engine-nfr-latency` and `cpt-cf-task-engine-nfr-throughput` on PostgreSQL with ≥ 100 workers on one queue, and claims/s do not drop from 10 to 100 workers.
 
 ## Pros and Cons of the Options
 
-### Option 1: SELECT ... FOR UPDATE SKIP LOCKED
+### Option 1: Gear-level SELECT ... FOR UPDATE SKIP LOCKED
 
-The classic PostgreSQL/MySQL queue pattern.
+* Good, because claimers spread over the head rows (River, Oban, graphile-worker, pgmq).
+* Bad, because the gear must lock task rows before counters, so a full counter is found only after rows were locked.
+* Bad, because it needs a new, gear-visible locking API and puts backend behavior into the gear.
+* Neutral, because the same speed-up remains available as an internal ToolKit strategy under Option 5.
 
-* Good, because it is the standard PostgreSQL queue pattern (River, Oban, graphile-worker, pgmq).
-* Good, because claimers skip rows that others hold, so workers spread over the head and claims do not serialize on one row.
-* Good, because it keeps exact head order for the rows that are free.
-* Bad, because the secure ORM does not expose it to gears today (see TODO(toolkit) above).
-* Bad, because SQLite has no equivalent, so SQLite keeps the optimistic path (one writer, so no contention there).
-
-**Preferred if ToolKit can expose it — see the TODO above.**
+**Rejected as a gear-level mechanism.**
 
 ### Option 2: Leader-serialized claims
 
-A single node assigns tasks in order.
-
 * Good, because ordering is trivially exact.
-* Bad, because throughput is capped by one node.
-* Bad, because leader failover adds claim downtime.
+* Bad, because throughput is capped by one node and failover adds claim downtime.
 
 **Rejected.**
 
-### Option 3: Optimistic guarded update with k-way merge
+### Option 3: Gear-level optimistic guarded update, task row first
 
-Each requested queue's next candidates (index-ordered, no DB sort: a head page for `fifo` queues, one next-tenant probe for `round_robin` queues) are read through the secure ORM; a k-way merge yields candidates in global order; the claim and slot reservation run in one transaction with guarded conditional updates. Losers move to the next candidate within `claim_candidate_budget`.
+* Good, because it works on every backend through the secure ORM.
+* Bad, because a full counter is discovered after the task row was written, so every capacity skip is a rolled-back write on the hottest table.
+* Bad, because the protocol and its proof would be re-implemented by every gear that claims work.
 
-* Good, because it behaves identically on every backend, including SQLite.
-* Good, because it uses only the secure ORM surface.
-* Good, because ordering is exact across queues and independent of the order queues are listed.
-* Bad, because every claimer targets the same head row: on a busy queue N−1 workers wait for one row lock and then lose, so claims serialize per queue (head-row contention).
-* Bad, because the cost is bounded by `claim_max_queues × claim_scan_limit`, so those limits must exist.
-
-**Chosen for now (works today); not final.**
+**Rejected.**
 
 ### Option 4: Candidate spreading without row locks
 
-Workers aim at different rows, so most guarded updates succeed on the first try. Strict head order becomes "one of the first k".
+* Good, because most guarded updates succeed on the first try.
+* Bad, because claim order is no longer exact (up to `k − 1` tasks).
 
-* Good, because it removes most head-row contention with no ToolKit change and works on every backend.
-* Good, because it combines well with batch claims.
-* Bad, because claim order is no longer exact: a task may be claimed before up to k−1 older or higher-priority tasks; this must be checked against PRD §5.2 / §5.6.
-* Neutral, because SQLite (single writer) gains nothing and can keep head order.
+**Rejected as default; opt-in ToolKit strategy only with PRD sign-off.**
 
-**Candidate — see the TODO above.**
+### Option 5: ToolKit secure claim primitive, counter-first guarded updates
+
+* Good, because the limit is checked inside one guarded `UPDATE` before any task write.
+* Good, because it is deadlock-free by construction and needs no locking reads.
+* Good, because it is portable (PostgreSQL, MySQL/MariaDB, SQLite) and the gear stays free of dialect SQL.
+* Good, because the protocol is reviewed and tested once and reused by other gears.
+* Neutral, because the ToolKit may later accelerate candidate selection internally without changing the contract.
+* Bad, because claims that need the same counter row serialize on it for one transaction; batches, coalescing, and shards bound the cost.
+* Bad, because it adds a critical-path ToolKit dependency.
+
+**Chosen.**
 
 ## More Information
 
 ```text
-1. per queue: fifo     -> SELECT head page ORDER BY (urgency, priority, created_at, task_id) LIMIT claim_scan_limit
-               round_robin -> SELECT next tenant's best task ORDER BY (owner_tenant_id, priority, created_at, task_id)
-                              WHERE urgency = u AND owner_tenant_id > cursor LIMIT 1
-2. k-way merge across queues by (urgency, created_at, task_id)
-3. per candidate (within claim_candidate_budget):
-     UPDATE te_task_state SET state=claimed, lease... WHERE task_id=? AND state=queued
-     UPDATE te_concurrency_slots SET used=used+1 WHERE ... AND used < limit_value          (cross-tenant)
-     UPDATE te_tenant_concurrency_slots SET used=used+1 WHERE ... AND used < limit_value   (per tenant)
-     rows_affected == 1 on all -> commit; else rollback and try next
+BEGIN (READ COMMITTED)
+1. candidates : per queue, plain scoped keyset read in claim order; k-way merge by (urgency, created_at, task_id)
+2. plan       : plain read of the candidates' counter rows; drop full scopes; picks in merge order
+3. reserve    : UPDATE counter SET used = used + k WHERE key AND used + k <= limit   (sorted keys; lock held)
+                backlog rows of the picks: used -= k                                   (sorted keys; lock held)
+4. win        : picks in ascending task_id:
+                UPDATE task SET state = claimed, lease... WHERE id = ? AND state = queued
+                (0 rows -> next candidate with a greater task_id, else leave it to a new transaction)
+5. settle     : on held rows only: used -= (k - won); backlog += (k - won); timers; outbox TaskClaimed; renew sessions
+COMMIT        (contention error -> bounded retry of the whole transaction)
 ```
 
-See DESIGN §3.8 multi-instance coordination and §4.6 Task Assignment.
+See DESIGN §3.7 Lock ordering and §4.6 Task Assignment.
 
 ## Traceability
 
@@ -154,9 +211,10 @@ See DESIGN §3.8 multi-instance coordination and §4.6 Task Assignment.
 
 This decision supports these requirements and design elements:
 
-* `cpt-cf-task-engine-fr-assignment` — atomic claim with exact cross-queue order.
+* `cpt-cf-task-engine-fr-assignment` — atomic claim with exact cross-queue order and batch claims.
 * `cpt-cf-task-engine-fr-priority-dispatch` — claim order: urgency, tenant fairness, tenant-local priority.
-* `cpt-cf-task-engine-fr-lease-fencing` — lease token and epoch set in the claim update.
-* `cpt-cf-task-engine-fr-queue-concurrency` — slot reservation in the claim transaction.
+* `cpt-cf-task-engine-fr-tenant-fairness` — scoped round-robin candidate streams.
+* `cpt-cf-task-engine-fr-lease-fencing` — lease token and epoch set in the guarded transition.
+* `cpt-cf-task-engine-fr-queue-concurrency` — guarded slot reservation before any task write.
 * `cpt-cf-task-engine-nfr-latency` — claim latency targets.
-* `cpt-cf-task-engine-nfr-throughput` — no leader bottleneck on claims.
+* `cpt-cf-task-engine-nfr-throughput` — batch claims, coalescing, sharded counters.
