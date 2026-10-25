@@ -58,7 +58,9 @@ Each concurrency dimension scope has one counter row holding `used` and `limit_v
 
 Every key column is `NOT NULL` (the dimension says whether `scope_id` is a queue or a task type), so each primary key is a real uniqueness constraint on every backend. A claim reserves every applicable dimension with a single guarded conditional update per row, in the fixed lock order defined in DESIGN §3.7 (global rows before tenant rows), inside the claim transaction. If any dimension is full the candidate is skipped, partial reservations roll back, and the claim moves on to tasks governed by other scopes.
 
-Slots are released whenever a task leaves `claimed` or `running` for a state that consumes no capacity, including `running → waiting`. A singleton maintenance loop recomputes `used` from the actual `claimed`+`running` count and fixes drift.
+Slots are released whenever a task leaves `claimed` or `running` for a state that consumes no capacity, including `running → waiting`. A reservation on a sharded row records its shard on the task, and the release decrements exactly that shard.
+
+A singleton maintenance loop reconciles each counter row from the live tasks charged to it, in either direction. It locks the counter row first and counts in a new statement afterwards, so a claim or release running at the same time is either counted or applied after the correction — never lost or counted twice (DESIGN §3.7 Counter reconciliation). On MySQL/MariaDB the reconciliation transaction runs at `READ COMMITTED`.
 
 With `counter_shards = S > 1`, a hot cross-tenant row is split into S shards whose sub-limits sum to at most N (ADR-0008); per-tenant rows are naturally spread and stay unsharded. The optional Cluster ready-task cache may pre-sort candidates, but the database reservation always decides.
 
@@ -68,7 +70,8 @@ With `counter_shards = S > 1`, a hot cross-tenant row is split into S shards who
 * The Cluster gear is optional; without it dispatch falls back to database-only and stays correct.
 * A claim returns `429 CONCURRENCY_LIMIT` only when nothing could be assigned and capacity was the reason.
 * Limits can change at runtime; each task domain applies new limits in its maintenance loop.
-* Slot reconciliation must run regularly (`slot_reconcile_interval_secs`).
+* Slot reconciliation must run regularly (`slot_reconcile_interval_secs`); it locks only counter rows, never task rows, so it cannot deadlock with claims.
+* Each leased task carries the shards it reserved (`queue_slot_shard`, `type_slot_shard`).
 * Per-tenant counters get the same ORM tenant isolation as task rows; the cross-tenant table is a declared, lint-gated exception to the ToolKit `unrestricted` guidance (DESIGN §2.1), justified because it has no tenant column and is reachable only through `GlobalCounterRepo`.
 
 ### Confirmation
@@ -79,7 +82,9 @@ Tests MUST check that:
 * a full dimension blocks only the tasks it governs;
 * slots are released on every exit from `claimed`/`running`;
 * sharded limits never admit more than N in total;
-* reconciliation corrects an artificially drifted counter;
+* reconciliation corrects an artificially drifted counter, upward and downward;
+* reconciliation that runs during concurrent claims and releases never lets a limit be exceeded, on PostgreSQL and MySQL/MariaDB;
+* every release decrements the shard recorded at reservation, and a shard-count change never admits more than N;
 * a per-tenant reservation attempted with a scope that does not cover the counter's tenant is rejected by the ORM;
 * the counter migrations create their primary keys on PostgreSQL, MySQL/MariaDB, and SQLite (no nullable key column);
 * the engine stays correct with the ready-task cache unavailable.

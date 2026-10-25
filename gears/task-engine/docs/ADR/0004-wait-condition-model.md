@@ -64,6 +64,7 @@ Resolution (timer fire, matching event, input resolve, last child reaching a ter
 * A waiting task counts against its tenant's deferred limit (PRD §5.2 Queue Depth Limits), so parking is an admission that may be refused with `429`; resuming never is. Otherwise parking would free queue capacity without bound.
 * Wait condition rows are live-only: they are deleted in the task's terminal transaction, and the wait history stays in the task's event log (ADR-0009).
 * Event waits use one static subscription over operator-listed waitable topics. Setting one requires the caller's own `consume` right, and only the matched event's header is stored (DESIGN §3.2).
+* Pending event conditions are limited per tenant, per tenant and event type, and per tenant and event type without a subject, because one consumer serves every tenant (ADR-0007).
 * Each kind has its own validation, indexes, and timeout handling.
 * No event is missed when the worker arms the wait before it acts.
 * A parent can wait for its children without holding a lease or polling.

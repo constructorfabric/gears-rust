@@ -370,7 +370,9 @@ The system **MUST** support key-value tags on tasks. Keys (up to 128 characters)
 
 A task **MAY** carry a bounded list of resource references, each naming a platform resource by type (GTS identifier) and ID. References **MUST** be filterable in search (§5.17), included in task-scoped lifecycle events (§5.10), and tenant-scoped like all task data. The maximum number per task is configurable.
 
-- **Rationale**: Consumers need "all tasks touching this resource" views. Payload search is out of scope, so a standard field is the only way to offer them.
+**Verified or not**: a reference is a claim made by the creator, not a proof of access. Each reference carries a `verified` flag. It is `true` only when a creator-authority check of the task type (§5.11 Creator authority) confirmed, at creation, that the creator may act on that resource; otherwise it is `false`. Search, events, and the claim response show the flag. Consumers and workers **MUST NOT** treat an unverified reference as proof that the creator may access the resource.
+
+- **Rationale**: Consumers need "all tasks touching this resource" views. Payload search is out of scope, so a standard field is the only way to offer them. An explicit flag keeps a creator from using a reference to point privileged workers or downstream consumers at a resource the creator cannot reach.
 - **Actors**: `cpt-cf-task-engine-actor-api-consumer`, `cpt-cf-task-engine-actor-event-broker`
 
 #### Task Checkpoint
@@ -578,8 +580,9 @@ An **event** condition names an `event_type` (GTS identifier) and optionally a `
 - **Waitable topics**: only topics the operator lists as waitable are received. A condition on another topic's event type is rejected (`400`). Setting a wait **MUST NOT** change the engine's broker subscription.
 - **Authorization**: setting or arming an event condition **MUST** require the caller's own Event Broker `consume` permission on the event type (and `subject_type`) in the task's tenant; otherwise `403`, fail closed.
 - **Header only**: the engine **MUST** store and return only the matched event's header (ID, type, subject, subject type, time, broker position), never its data. A resumed worker that needs the data reads it from the source with its own permissions.
+- **Bounded per tenant**: one consumer serves all tenants, so the matching work one tenant can cause **MUST** be bounded. The number of pending event conditions (armed or parked) **MUST** be limited per tenant, per tenant and event type, and — tighter — per tenant and event type for conditions without a `subject_id`, which every event of that type must be checked against. Defaults: 100,000, 10,000, and 100 per task domain; `0` means unlimited. Setting or arming a wait over a limit is refused (`429`, `EVENT_WAIT_LIMIT`, naming only the full limit); nothing changes and a worker keeps its lease. Resolving, timing out, or cancelling a condition frees its place.
 
-- **Rationale**: Event waits let a task react to other systems without polling. The engine reads events with platform rights; the caller check and header-only storage keep waits from bypassing event authorization.
+- **Rationale**: Event waits let a task react to other systems without polling. The engine reads events with platform rights; the caller check and header-only storage keep waits from bypassing event authorization. Without per-tenant bounds one tenant could arm enough broad waits to slow event matching, and so wake-ups, for every other tenant.
 - **Actors**: `cpt-cf-task-engine-actor-worker`, `cpt-cf-task-engine-actor-event-broker`
 
 #### Event Wait Condition — Match Expression
@@ -588,7 +591,12 @@ An **event** condition names an `event_type` (GTS identifier) and optionally a `
 
 An event condition **SHOULD** support an optional `match_expression` that is checked against the event (for example against payload fields) after the field match succeeds. The expression language and its safety limits are defined in [ADR-0007](ADR/0007-event-wait-matching.md). An invalid expression **MUST** be rejected when the wait is set, not when an event arrives.
 
-- **Rationale**: Many waits depend on a value inside the event, not only on its type and subject.
+**Bounded evaluation**: every evaluation **MUST** run under a fixed cost budget that the evaluator enforces while it runs (a wall-clock timeout cannot stop a synchronous evaluation). Outcomes:
+
+- an expression that evaluates to anything but `true`, or fails at run time (for example a missing field), does not match that event;
+- an evaluation that runs out of budget does not match either, and counts as an **evaluation failure** of the condition. After a configured number of consecutive failures (default 10) the condition is resolved like a timeout, with reason `eval_budget_exceeded`, and its `on_timeout` action applies, so a task never waits for ever on an expression that cannot finish.
+
+- **Rationale**: Many waits depend on a value inside the event, not only on its type and subject. A cost budget enforced inside the evaluator bounds the work per event; the failure rule keeps a pathological expression from parking a task with no way out.
 - **Actors**: `cpt-cf-task-engine-actor-worker`, `cpt-cf-task-engine-actor-event-broker`
 
 #### Input Wait Condition
@@ -820,9 +828,11 @@ A task **MAY** name predecessors that must **succeed** — end as `completed` (r
 
 **Predecessor failure**: a predecessor that ends `failed`, `cancelled`, or `dead_lettered` counts as failed (a later re-enqueue does not revive its successors). When a successor can no longer be unblocked — any failure in `ALL` mode, all failed in `ANY` mode — it **MUST** be cancelled with `dependency_failed`, and this cascades to its own successors. Every affected successor **MUST** be cancelled exactly once, even for large fan-outs and across crashes. A creation or change that would be unsatisfiable at once (for example `ALL` on an already failed task) is rejected (`400`).
 
-**Changes and cycles**: dependencies **MAY** be added or removed while the task is unfinished and not yet running. Adding an unmet predecessor moves a `queued` or `scheduled` task to `blocked` (counted against `tenant_max_deferred_tasks`); removing the last one unblocks it. Every change **MUST** be checked for cycles; a change that would create one is rejected (`400`, `CYCLE_DETECTED`).
+**Changes and cycles**: dependencies **MAY** be added or removed while the task is unfinished and not yet running. Adding an unmet predecessor moves a `queued` or `scheduled` task to `blocked` (counted against `tenant_max_deferred_tasks`); removing the last one unblocks it. Every change **MUST** be checked for cycles; a change that would create one is rejected (`400`, `CYCLE_DETECTED`). The check **MUST** also hold when several changes run at the same time: concurrent additions that would together form a cycle **MUST NOT** all succeed. The number of predecessors per task (default 64) and the size of the graph a cycle check may walk (default 10,000 tasks) are bounded; a change over either bound is rejected (`400`, `DEPENDENCY_GRAPH_TOO_LARGE`).
 
-- **Rationale**: Dependencies give multi-step pipelines without an external orchestrator. Checking cycles on every change, not only at creation, keeps the graph valid.
+**Concurrent end of a predecessor**: a dependency added, or a task created with predecessors, at the same moment a predecessor ends **MUST** see that outcome — it is satisfied, cancelled with the successor rules above, or rejected as unsatisfiable. A successor **MUST NEVER** stay `blocked` on a predecessor that has already ended.
+
+- **Rationale**: Dependencies give multi-step pipelines without an external orchestrator. Checking cycles on every change, not only at creation, keeps the graph valid; two checks that each look correct can still create a cycle together, so the guarantee must cover concurrency.
 - **Actors**: `cpt-cf-task-engine-actor-api-consumer`
 
 #### Link Authorization
@@ -832,7 +842,7 @@ A task **MAY** name predecessors that must **succeed** — end as `completed` (r
 A link affects the task it points at, so the system **MUST** authorize that task too:
 
 - **Same tenant**: parent and children, and predecessor and successors, **MUST** have the same owner tenant.
-- **Parent**: creating a child needs the parent's lease (the caller holds it and sends its token, §5.6) or `update` on the parent. The parent **MUST** be unfinished and not `waiting`.
+- **Parent**: creating a child needs the parent's lease (the caller holds it and sends its token, §5.6) or `update` on the parent. The parent **MUST** be unfinished and not `waiting`. A child created at the same moment its parent ends is either rejected or reached by the parent's cancellation (§5.9 Parent/Child) — never left orphaned.
 - **Predecessor**: naming one needs `read` on it. Adding or removing a dependency also needs `update` on the successor.
 - **No existence oracle**: a missing, foreign, or forbidden linked task gets the same `404`, never `403`. State checks (unsatisfiable, `CYCLE_DETECTED`) run only after this.
 
@@ -866,7 +876,9 @@ The system **MUST** publish lifecycle events to the platform Event Broker. Suppo
 
 **When the Event Broker is unavailable**: the task history stays readable through the API (`GET /tasks/{id}/events`). Undelivered events wait in the platform outbox and are delivered when the broker is back. Retention and back-pressure of undelivered events are governed by the platform outbox, not by the engine.
 
-- **Rationale**: Other gears react to task changes without polling, and event waits get their input. Atomic recording means state and events never disagree and no event is lost.
+**Publishing identity**: events are published by the engine itself, never on behalf of the caller that caused them. The engine **MUST** publish as a dedicated root-tenant service subject (client credentials, tenant plane, §5.11), separate from the subject it uses to consume waitable topics. Each event names the task's owner tenant as its tenant (queue-scoped events: the tenant recorded in the history). That subject **MUST** hold Event Broker `produce` on the Task Engine topic, on the Task Engine event types, and on the task and queue subject types, for every tenant that can own tasks — including tenants behind a barrier — and nothing more. A publish the broker refuses for authorization is a deployment fault: it **MUST NOT** change task state, the event stays in the history, and it **MUST** raise an alert.
+
+- **Rationale**: Other gears react to task changes without polling, and event waits get their input. Atomic recording means state and events never disagree and no event is lost. A fixed, narrowly granted publishing identity lets operators see and limit exactly what the engine may emit, and keeps a caller from emitting events into tenants it cannot reach.
 - **Actors**: `cpt-cf-task-engine-actor-event-broker`
 
 #### Event Publishing Configuration
@@ -932,9 +944,13 @@ All task work happens inside a tenant, so every task operation **MUST** use a te
 - **Tenant workers** run as a subject of a tenant and see only that tenant's subtree. Tenant barriers apply.
 - **Platform workers** run as a service subject of the root tenant (client credentials). They reach tenants behind a barrier only on queues with `operated_by: platform` (§5.12), and only if the PDP allows it.
 - **Workers act as themselves.** The claim returns the task's owner tenant, creator, and owner. When a worker calls other gears for a task, it names the task's owner tenant as the context tenant, so the PDP limits it to that tenant. The engine **MUST NOT** store or forward the creator's token.
+- **Creator authority.** The tenant limit does not stop a creator from naming, in the task, a resource of its own tenant that only the worker may reach. Each task type therefore declares an `authority` mode (§5.12):
+  - `creator_verified` (default): the type lists **creator checks** — each names where a resource is referenced (a resource reference type pattern, or a required string field of the input) and the action the work will perform on it. At creation the engine **MUST** ask the PDP, with the creating caller's own security context and the task's owner tenant as context tenant, whether that action is allowed on every referenced resource. A denial, an unreachable PDP, or a decision the engine cannot fully evaluate (constraints on properties only the resource's owning gear knows) rejects the create (`403`, fail closed; `503` when the PDP is unreachable) and stores nothing. Checked references are stored as `verified`. A worker of such a type **MUST** act downstream only on resources that passed a check, and **MUST NOT** use its own wider rights to reach any other resource named in the task.
+  - `worker`: the work uses only the worker's own authority. Allowed only for platform-owned types. It fits work that acts on no creator-chosen resource, and **gear-mediated creation**, where the gear that owns the resources authorizes the user with its own PEP and then creates the task as its own service subject.
+  - Checks run once, at creation; the engine holds no creator credential to repeat them later. A right revoked after creation is therefore not seen by tasks already created. Types that need a short window **SHOULD** set a short lifetime timeout.
 - **Loss of access stops work.** Every worker call checks `claim` again. On an explicit denial the engine returns the task to the queue as a voluntary release (no budget, attempt, or blacklist change) and answers `403`; the worker **MUST** stop. If the PDP cannot be reached, the call fails with `503` and nothing changes.
 
-- **Rationale**: Shared workers with broad rights are the usual path to privilege escalation in a task engine. Following the platform's two-plane model and the Durable Execution rule ("worker identity does not replace the execution owner") keeps the task's tenant in force for every action.
+- **Rationale**: Shared workers with broad rights are the usual path to privilege escalation in a task engine. Following the platform's two-plane model and the Durable Execution rule ("worker identity does not replace the execution owner") keeps the task's tenant in force for every action. Creator checks close the remaining gap inside a tenant: the platform has no token exchange, so the only moment the engine can prove the creator's own rights is the create request, which carries the creator's context.
 - **Actors**: `cpt-cf-task-engine-actor-worker`, `cpt-cf-task-engine-actor-platform-admin`
 
 ### 5.12 GTS Extension Points
@@ -949,7 +965,7 @@ The system **MUST** define a GTS base type for task types:
 gts.cf.core.tasks.task.v1~
 ```
 
-Other gears register derived task types with input and output JSON Schemas ([ADR-0015](ADR/0015-gts-hybrid-model.md)). A task type **MAY** declare, as GTS traits: concurrency limits, `dedup` and `supersede` policies (§5.1), progress settings (§5.7), and **type defaults** — `default_queue`, `timeouts`, `retry_policy`, and `retention_days`. A new task type **MUST NOT** need a database migration or an engine release.
+Other gears register derived task types with input and output JSON Schemas ([ADR-0015](ADR/0015-gts-hybrid-model.md)). A task type **MAY** declare, as GTS traits: concurrency limits, `dedup` and `supersede` policies (§5.1), progress settings (§5.7), the `authority` mode and creator checks (§5.11 Creator authority), and **type defaults** — `default_queue`, `timeouts`, `retry_policy`, and `retention_days`. A new task type **MUST NOT** need a database migration or an engine release.
 
 **Type defaults resolution**: for each setting the engine uses the first value found: (1) the create request, (2) the task type trait, (3) the queue's effective value (config override, then queue registration). The queue itself comes from the request, then the type's `default_queue`, then the `default` queue. Each timeout resolves on its own, so a request may set one timeout and inherit the rest; a retry policy is taken whole from the first level that has one. `retention_days` follows §5.14.
 
@@ -983,6 +999,7 @@ Task types, queues, and entry types are registered by other gears and, where the
 - **Visibility**: a create **MUST** resolve the type with the caller's security context. A type the caller cannot see is unknown (`UNKNOWN_TASK_TYPE`).
 - **Limits**: every value a type or queue declares (lease, timeouts, retry budgets, retention, progress settings) **MUST** be inside engine limits set in config, with tighter limits for tenant-owned types. A type outside the limits cannot be created; a queue outside them refuses new tasks. The error names the setting. The minimum lease is 10 seconds by default.
 - **Platform queues**: a tenant-owned type **MUST NOT** be placed in a queue with `operated_by: platform`. A queue **MAY** list `accepted_types`; other types are rejected (`400`) on create, move, and re-enqueue.
+- **Authority mode**: a tenant-owned type **MUST NOT** declare `authority.mode = worker` (§5.11 Creator authority); such a type cannot be created. Creator checks are bounded in number (default 16 per type) and their pointers **MUST** name required string fields of the input schema.
 - **Removed or unavailable type**: new tasks are refused as unknown; existing tasks run to the end. Output is checked against the type revision recorded at creation.
 
 - **Rationale**: Extending the engine must not let a registrant switch off its protections, or let one tenant use another tenant's private type.
@@ -1496,6 +1513,15 @@ The engine does not process personal data of its own, but it stores caller ident
 - [ ] A platform worker gets no task of a tenant behind a barrier from a queue without `operated_by: platform`
 - [ ] After `claim` is revoked, the worker's next call returns `403` and the task is back in the queue with no budget, attempt, or blacklist change
 - [ ] Re-enqueuing a `dead_lettered` or `failed` task resets both retry budgets, clears the old result, restarts the lifetime timeout, and returns `409` if another task now holds its dedup identity
+- [ ] For a `creator_verified` type, a creator who may not perform a checked action on a referenced resource gets `403` and no task is stored, even when the type's workers may perform it; a PDP decision the engine cannot fully evaluate is also refused; references not covered by a check are stored and published with `verified = false`
+- [ ] A tenant-owned type declaring `authority.mode = worker` cannot be created
+- [ ] With the per-tenant event-wait limits full, arming or setting another event wait returns `429` (`EVENT_WAIT_LIMIT`) and the worker keeps its lease; one tenant at its limits does not raise event-wait resume latency for another tenant above the timer-accuracy bound
+- [ ] A match expression that exceeds its evaluation budget never matches; after the configured number of consecutive failures its condition resolves with reason `eval_budget_exceeded` and applies `on_timeout`
+- [ ] Lifecycle events of a task in a tenant behind a barrier are published under the engine's publishing subject with that tenant; with the publishing grant removed, task operations keep working, the history stays complete, and an alert fires
+- [ ] Concurrent dependency additions that would together form a cycle (including cycles longer than two tasks) never all succeed
+- [ ] A dependency added, a task created with predecessors, or a child created while the linked task ends concurrently is never left `blocked` on an ended predecessor and never orphaned under an ended parent
+- [ ] Counter reconciliation that runs during concurrent claims, releases, and admissions never lets a concurrency or queue-depth limit be exceeded
+- [ ] Every terminal path (completion, failure, every cancel mode, supersession, each timeout, liveness exhaustion, wait failure, `dependency_failed`, hard-retention cancel) leaves no live-only rows, frees all counters and the dedup identity per its window, records `terminal_at`, and reaches children and successors
 
 ## 10. Dependencies
 
@@ -1507,10 +1533,10 @@ The engine does not process personal data of its own, but it stores caller ident
 | Tenant Resolver gear | Tenant hierarchy, subtree, and barrier rules | p1 |
 | Resource Group Resolver gear | Resource-group hierarchy for group-scoped policies | p2 |
 | GTS Registry | Registers and resolves task, queue, and entry types and instances; applies registration policy and per-tenant visibility (§5.12 Task Type and Queue Trust) | p1 |
-| Event Broker gear | Receives lifecycle events and delivers inbound events for event waits. The engine consumes waitable topics as a platform service and needs `consume` grants on them. It keeps running without the broker: events wait in the outbox, but event waits cannot resolve until it is back | p1 |
+| Event Broker gear | Receives lifecycle events and delivers inbound events for event waits. The engine publishes as its publishing subject, which needs `produce` grants on its topic, event types, and subject types for every tenant that can own tasks, including tenants behind a barrier (§5.10 Publishing identity). It consumes waitable topics as a separate platform service subject with `consume` grants on them. It keeps running without the broker: events wait in the outbox, but event waits cannot resolve until it is back | p1 |
 | ToolKit DB layer | Database access, connection pools, migrations, and the event outbox | p1 |
 | Cluster gear | Distributed cache for the optional ready-task cache ([Cluster PRD](../../system/cluster/docs/PRD.md)) | p3 |
-| CEL evaluator | Evaluates match expressions for event waits | p2 |
+| CEL evaluator | Evaluates match expressions for event waits under a cost budget enforced inside the evaluator | p2 |
 
 ## 11. Assumptions
 
@@ -1532,7 +1558,11 @@ The engine does not process personal data of its own, but it stores caller ident
 | Ready-task cache is stale after a Cluster outage | Wasted claim attempts | Cache is only a hint; rebuilt on reconnect; database fallback |
 | High event volume slows event-wait matching | Waiting tasks resume late | Only waitable topics consumed; indexed probe (type, tenant, subject) before any expression; consumer lag alert |
 | Event waits used to read events the caller may not see | Disclosure across authorization boundaries | Caller's `consume` check on set/arm; only the event header is stored (§5.4) |
-| Expensive match expressions | Slow event processing | Expressions checked when set, with complexity and time limits |
+| Expensive match expressions | Slow event processing | Expressions checked when set; a cost budget enforced inside the evaluator; repeated budget failures resolve the condition (§5.4) |
+| One tenant arms many broad event waits | Event matching, and so wake-ups, slow down for every tenant | Per-tenant, per-type, and subject-less condition limits (§5.4 Event Wait Condition) |
+| A worker acts with more rights than the task's creator | Disclosure or change of a resource the creator cannot reach, inside the tenant | Creator checks at creation, `verified` references, `worker` mode only for platform-owned types (§5.11 Creator authority) |
+| The publishing subject lacks a grant, or a barrier blocks it | Lifecycle events missing for some tenants | Dedicated publishing subject with documented grants; history unaffected; alert on refused publishes (§5.10) |
+| Concurrent links race with each other or with a task ending | Dependency cycles, successors blocked for ever, orphaned children | Serialized dependency changes per tenant; links lock the linked task (DESIGN §4.6) |
 | Dead-letter queues grow unnoticed | Unbounded storage | DLQ size metrics and alerts; retention applies to dead-lettered tasks |
 | A tenant marks all its work most important | Other tenants starve | Priority is tenant-local; `critical` needs `expedite` (§5.2) |
 | A lease token leaks | Another principal changes the task | Random token bound to the holder (§5.6) |
@@ -1553,7 +1583,8 @@ The engine does not process personal data of its own, but it stores caller ident
 - What is the maximum depth of parent/child hierarchies?
 - Should retried tasks prefer the same worker ("sticky" assignment)?
 - Does ToolKit expose a stable serialized form of the compiled access scope for the `authz_scope` dedup identity, or must the engine build it from the raw PDP constraints?
-- Will AuthN offer a way to act on behalf of a subject (token exchange)? Until then workers act as themselves (§5.11 Worker Principals).
+- Will AuthN offer a way to act on behalf of a subject (token exchange)? Until then workers act as themselves, and creator rights are proven only at creation (§5.11 Worker Principals, Creator authority).
+- Will the Event Broker let a root-tenant producer publish into tenants behind a barrier by policy alone, or does its tenant check need an explicit barrier option for platform producers (§5.10 Publishing identity)?
 - May platform workers cross tenant barriers for task data on `operated_by: platform` queues, and what audit does AuthZ require?
 - When will Types Registry validation hooks be available, so invalid types are rejected at registration instead of at first use?
 

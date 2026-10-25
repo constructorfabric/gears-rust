@@ -113,6 +113,54 @@
           "order_field"
         ]
       },
+      "authority": {  // whose rights bound the work: creator checks at creation, or the worker alone
+        "description": "Creator authority (PRD cpt-cf-task-engine-fr-worker-principals, Creator authority; DESIGN cpt-cf-task-engine-design-creator-authority). Workers act as themselves, so this trait states whose rights bound what they do for a task. 'creator_verified' (default): at creation the engine asks the PDP, with the creator's own security context and the task's owner tenant, whether each check's action is allowed on each referenced resource; a denial, an unreachable PDP, or a result the engine cannot fully evaluate rejects the create. Checked resource references are stored and published as verified. 'worker': the work uses only the worker's authority; allowed only for platform-owned types (a tenant-owned type declaring it cannot be created). Absent means 'creator_verified' with no checks: nothing is verified and every resource reference is stored with verified = false.",
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "mode": {
+            "type": "string",
+            "enum": [
+              "creator_verified",
+              "worker"
+            ],
+            "default": "creator_verified"
+          },
+          "checks": {
+            "description": "Creator checks, only with mode 'creator_verified'. At most trust_limits.max_creator_checks (default 16) entries.",
+            "type": "array",
+            "maxItems": 16,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "source": {  // "resource_refs", or an RFC 6901 pointer to a required string input field
+                  "description": "Where the checked resources are named: 'resource_refs' (every resource reference whose type matches resource_type), or an RFC 6901 JSON Pointer to a field the input schema declares required and of type string, whose value is a resource ID of resource_type.",
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 512
+                },
+                "resource_type": {
+                  "description": "GTS type identifier, or a GTS pattern with a trailing '*' when source is 'resource_refs', of the referenced resources. With a pointer source it MUST be a concrete type.",
+                  "type": "string",
+                  "maxLength": 512
+                },
+                "action": {
+                  "description": "Action the work performs on the resource, as known to the PDP for that resource type (for example 'read', 'update').",
+                  "type": "string",
+                  "pattern": "^[a-z][a-z0-9_]{0,63}$"
+                }
+              },
+              "required": [
+                "source",
+                "resource_type",
+                "action"
+              ]
+            },
+            "default": []
+          }
+        }
+      },
       "progress_events": {
         "description": "Progress event mode for tasks of this type (PRD cpt-cf-task-engine-fr-progress-events): 'none' (default), 'milestones' (event only when milestone/current_stage changed), or 'all' (event when any progress dimension changed). Overridable in config by task-type pattern; config override > queue override > this trait > queue registration > global default.",
         "type": "string",

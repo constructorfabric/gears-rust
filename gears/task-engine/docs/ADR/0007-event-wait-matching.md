@@ -1,7 +1,7 @@
 ---
 status: accepted
 date: 2026-10-24
-description: "Match incoming events to event wait conditions by type, tenant, and subject first, then by an optional CEL expression that is validated at creation and evaluated with time and complexity limits."
+description: "Match incoming events to event wait conditions by type, tenant, and subject first, then by an optional CEL expression that is validated at creation and evaluated under a cost budget enforced inside the evaluator, with per-tenant limits on pending event conditions."
 ---
 
 # Match Event Wait Conditions with Bounded, Precompiled CEL Expressions
@@ -40,29 +40,42 @@ We must decide how callers express payload conditions and how the engine evaluat
 * Invalid expressions must be rejected when the wait is created, not when an event arrives.
 * Matching must never cross tenants.
 * Evaluation must be fast enough for the consumer hot path.
+* One tenant's waits must not slow event matching for other tenants; the consumer is shared.
+* A task must never wait for ever on an expression that cannot finish.
 
 ## Considered Options
 
 1. **Type and subject matching only** — match only on `event_type` and optional subject id/type.
 2. **JSONPath / equality filter maps** — a list of field-path equality checks.
 3. **Embedded scripting language** — run caller scripts (for example Lua or JavaScript).
-4. **CEL with creation-time validation and evaluation limits** — an optional CEL `match_expression`, parsed and checked at creation, evaluated after the cheap filters with a time limit and AST limits.
+4. **CEL with creation-time validation and evaluation limits** — an optional CEL `match_expression`, parsed and checked at creation, evaluated after the cheap filters under a cost budget and AST limits.
 5. **JSON Logic or JMESPath filters** — a JSON-encoded filter language evaluated against the event.
 
 ## Decision Outcome
 
 Chosen option: **Option 4 — CEL with creation-time validation and evaluation limits.**
 
-An event wait condition stores `event_type`, optional `event_subject_id` and `event_subject_type`, and an optional CEL `match_expression`. The expression is parsed and validated when the wait is created; an invalid or over-complex expression is rejected with `invalid_argument`. Complexity is bounded by maximum AST node count and depth.
+An event wait condition stores `event_type`, optional `event_subject_id` and `event_subject_type`, and an optional CEL `match_expression`. The expression is parsed and checked when the wait is created, with the workspace `cel-core` parser and checker; an invalid or over-complex expression is rejected with `invalid_argument`. Size and complexity are bounded by expression length (4 KiB, the Event Broker filter limit), AST node count, and AST depth.
 
-When an event arrives, the consumer selects pending event waits by `event_type`, keeps only those whose `owner_tenant_id` equals the event tenant, applies the subject filters, and evaluates the expression last. Evaluation is time-bounded (default 10 ms).
+When an event arrives, the consumer selects pending event waits by `event_type`, keeps only those whose `owner_tenant_id` equals the event tenant, applies the subject filters, and evaluates the expression last.
 
-> **TODO (decide)**: DESIGN does not yet say what happens when evaluation times out or fails. Options: treat it as no match (the offset advances and the event is lost for this wait), or fail the wait condition so the task is not left waiting for an event it can never match. Pick one and update DESIGN §4.5 CEL expression safety. A matching condition is marked `satisfied` in the consumer transaction (ADR-0004).
+**Evaluation budget.** Each evaluation runs under a fixed cost budget (`cel.max_eval_cost`), charged per node and per byte copied and enforced from **inside** the evaluator, as the workspace `quota-enforcement-engine-cel` runtime does. A wall-clock timeout is not used: it cannot preempt a synchronous evaluation, so it would bound nothing.
+
+**Outcomes** (this resolves the open point of the earlier draft):
+
+* `true` → match; the condition is marked `satisfied` in the consumer transaction (ADR-0004).
+* Any other value, or a run-time error (missing field, type mismatch) → no match, nothing recorded. Events of one type often differ in shape, so an error is not evidence of a broken expression.
+* Budget exceeded → no match, and the condition's evaluation-failure counter goes up by one; a matching evaluation resets it. After `event_waits.max_eval_failures` consecutive failures (default 10) the condition resolves as if it had timed out, with reason `eval_budget_exceeded`, and its `on_timeout` applies. A task is never left waiting for ever on an expression that cannot finish, and one slow event never fails a wait on its own.
+
+**Bounded work per tenant.** One consumer serves all tenants, so the engine limits pending event conditions per tenant, per tenant and event type, and — tighter — per tenant and event type for conditions without a subject, which every event of the type must be checked against (PRD §5.4). Setting or arming over a limit is refused with `429` `EVENT_WAIT_LIMIT`. With these limits and the per-evaluation budget, the worst-case matching work for one event is fixed by configuration, whatever a tenant does.
 
 ### Consequences
 
 * Callers can express payload conditions without custom engine code.
-* Expressions can never run unbounded or cause side effects.
+* Expressions can never run unbounded or cause side effects; their cost is bounded by the evaluator itself.
+* The matching work one event can cause is bounded by configuration, so one tenant cannot slow event waits for others.
+* An expression that keeps running out of budget resolves its condition instead of parking the task for ever.
+* The engine and the Event Broker use the same expression language and the same expression-size limit.
 * Events from one tenant never match another tenant's wait.
 * Most events are discarded by indexed filters before any expression runs.
 * The CEL dialect and its limits become part of the public API contract.
@@ -72,7 +85,10 @@ When an event arrives, the consumer selects pending event waits by `event_type`,
 Tests MUST check that:
 
 * invalid and over-complex expressions are rejected at creation;
-* evaluation stops at the time limit and is treated as no match;
+* evaluation stops when the cost budget is spent and is treated as no match;
+* a run-time error is treated as no match and does not count as an evaluation failure;
+* after the configured number of consecutive budget failures the condition resolves with reason `eval_budget_exceeded` and applies `on_timeout`;
+* setting or arming an event wait over a per-tenant limit returns `429` `EVENT_WAIT_LIMIT` and changes nothing;
 * events never match waits of another tenant;
 * subject filters and expressions combine correctly.
 
@@ -114,7 +130,7 @@ CEL is a non-Turing-complete, side-effect-free expression language. The engine f
 * Good, because CEL is designed for safe evaluation of untrusted expressions.
 * Good, because invalid expressions fail at creation.
 * Good, because cheap indexed filters run before any expression.
-* Bad, because it adds the `cel-interpreter` dependency.
+* Bad, because it needs a budgeted evaluator; the workspace already pins `cel-core` and has one in `quota-enforcement-engine-cel`, which should be shared rather than copied.
 
 **Chosen.**
 

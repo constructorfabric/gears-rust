@@ -48,11 +48,16 @@
                     "description": "Identifier of the referenced resource.",
                     "type": "string",
                     "maxLength": 1024
+                  },
+                  "verified": {
+                    "description": "True only if a creator check of the task type confirmed, at creation, that the creator may act on this resource (PRD cpt-cf-task-engine-fr-resource-refs). False means the reference is the creator's unverified claim; consumers MUST NOT treat it as proof of access.",
+                    "type": "boolean"
                   }
                 },
                 "required": [
                   "resource_type",
-                  "resource_id"
+                  "resource_id",
+                  "verified"
                 ]
               }
             },
