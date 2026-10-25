@@ -1080,6 +1080,7 @@ All authenticated endpoints below use `.authenticated()` + `.require_license_fea
 | Method | Path | Description | Auth Action |
 |---|---|---|---|
 | `GET` | `/tasks` | Search tasks (paginated, filtered, sorted) | `read` |
+| `GET` | `/tasks/count` | Capped count of the tasks a search would return (same `$filter` and bounds; §3.3 Search Parameters) | `read` |
 | `GET` | `/queues` | List queues with stats | `read` on queues (`queue_read`) |
 | `GET` | `/queues/{id}` | Queue detail with depth/counts | `read` on queues (`queue_read`) |
 | `GET` | `/tasks/{id}/events` | Task event history | `read` |
@@ -1110,7 +1111,7 @@ All authenticated endpoints below use `.authenticated()` + `.require_license_fea
 
 #### Search Parameters
 
-Search is exposed through the platform **OData** surface (`toolkit_odata_macros::ODataFilterable` derive on the search entity; the handler takes the `OData` extractor and returns a `JsonPage`), per [`07_odata_pagination_select_filter.md`](../../../docs/toolkit_unified_system/07_odata_pagination_select_filter.md). Standard query options map as follows:
+Search uses the ToolKit **OData** surface exactly as the platform implements it, per [`07_odata_pagination_select_filter.md`](../../../docs/toolkit_unified_system/07_odata_pagination_select_filter.md): `toolkit_odata_macros::ODataFilterable` on the search entity, the handler takes the `OData` extractor and returns a `JsonPage`. The extractor accepts only `$filter`, `$orderby`, `$select`, `$top` (alias `limit`), and `$skiptoken` (alias `cursor`); every other `$` option — `$count`, `$skip`, `$expand`, `$search` — is rejected `400` (`UNSUPPORTED_QUERY_PARAM`) by the extractor, so the Task Engine never relies on them.
 
 **Filtering** (`$filter`): `ODataFilterable` fields on the search entity: `state`, `assignee`, `queue`, `type`, `urgency`, `priority`, `created_at` (age range), plus `tags` (key/value), `resource_refs` (`resource_type` + `resource_id`, backed by `te_resource_refs`), and `dependencies` (unmet / all-met) via dedicated filterable projections. Example: `$filter=state eq 'queued' and priority le 5`.
 
@@ -1123,24 +1124,24 @@ Search is exposed through the platform **OData** surface (`toolkit_odata_macros:
 
 Any other key → `invalid_argument` `400` naming the allowed keys. The engine always appends `id` in the same direction as the tiebreaker. Other fields (state, queue, type, assignee, urgency, priority) are filters, applied inside the bounded index range.
 
-**Bounds** (PRD §5.17): a search that can return terminal tasks must have a `created_at` range of at most `search_max_window_days`; without one the engine adds `created_at ge now − search_default_window_days`. A wider range → `invalid_argument` `400`. The range prunes history partitions (§3.7), so the cost does not grow with stored history. A search whose `state` filter allows only non-terminal states reads only the live table and has no window. `$top` is capped at `search_max_top` (`search_max_top_full` at `full`).
+**Bounds** (PRD §5.17): a search that can return terminal tasks must have a `created_at` range of at most `search_max_window_days`; without one the engine adds `created_at ge now − search_default_window_days`. A wider range → `invalid_argument` `400`. The range becomes a `ring_slot IN (…)` filter on the history ring (§3.7), so the cost does not grow with stored history and touches at most the slots that cover the window. A search whose `state` filter allows only non-terminal states reads only the live table and has no window. The extractor rejects `$top=0` and does not cap page size, so the handler clamps `$top` to `search_max_top` (`search_max_top_full` at `view=full`).
 
-**Field projection** (`$select`): drives which columns are read/serialized. For ergonomics the engine also accepts named **LOD presets** that expand to a fixed `$select` set (a Task-Engine convenience layered on top of `$select`, not a replacement for it):
+**Detail level** (`view`, a plain query parameter, not a `$` option): `tiny`, `short` (default), `long`, or `full`; any other value → `400`. The view decides which fields and relations are loaded; `$select` then narrows the item's top-level fields within that view (a field outside the view → `400`). Relations are embedded by the Task Engine at `view=full`, never through `$expand`:
 
-| LOD preset | Expands to (`$select`) |
+| `view` | Item fields |
 |---|---|
 | `tiny` | `id`, `state`, `type` |
 | `short` | + `urgency`, `priority`, `queue`, `assignee`, `created_at`, `updated_at` |
 | `long` | + `input`, `output`, `context`, `progress`, `tags` |
-| `full` | + event history (**capped**, see below), wait conditions, entries, dependencies (expanded relations) |
+| `full` | + embedded event history (**capped**, see below), wait conditions, entries, dependencies |
 
 **Bounded event history at `full`** (PRD §5.17): because the event log is append-only and `full` applies to paginated *bulk* results, the embedded event history per item is capped at the most-recent `search_full_event_cap` events (default **50**), not the complete log. Callers needing the full log use the dedicated `GET /tasks/{id}/events` endpoint. This bounds a `full`-page response to `$top × (fixed base + capped history)`. The `full`/`long` levels decompress blob columns (input/context/output) on read; the search-latency NFR (`cpt-cf-task-engine-nfr-search-latency`) accounts for this decompression cost.
 
-Match-count-only queries use the standard OData `$count`/`$top=0` convention rather than a bespoke `count` LOD. A count stops at `search_max_count` + 1 rows: a larger result returns `search_max_count` and the page marks the count as capped (`count_capped: true`).
+**Count** (`GET /tasks/count`): a separate endpoint, because a page carries no total (`PageInfo` is `{next_cursor, prev_cursor, limit}`). It takes the same `$filter` with the same bounds and authorization as `GET /tasks`; `$orderby`, `$select`, `$top`, `$skiptoken`, and `view` are rejected `400`. It counts at most `search_max_count` + 1 rows per table and returns `{ "count": n, "capped": bool }`; above the cap, `count = search_max_count` and `capped = true`.
 
-**Pagination** (`$top` + server-driven `@odata.nextLink`): framework cursor pagination. The `nextLink` skip token is an opaque base64 cursor carrying the `$orderby` field values (§4.6 Multi-Shard Search); clients treat it as opaque and never construct it.
+**Pagination**: ToolKit keyset pagination. The response is a `JsonPage` — `{ "items": [...], "page_info": { "next_cursor", "prev_cursor", "limit" } }`. The client passes `page_info.next_cursor` back as `$skiptoken` (or `cursor`). The cursor is an opaque, versioned base64 value carrying the `$orderby` field values and, with several task domains, the per-domain positions (§4.6 Multi-Shard Search); clients never construct it.
 
-**Deliberate deviations from stock OData** (documented so reviewers don't flag them as accidental): (1) **LOD presets** as a shorthand over `$select`; (2) the **automatic `id` tiebreaker** appended to `$orderby` to guarantee a stable cursor; (3) the **cross-shard cursor decomposition** in §4.6, required only when multi-database task domains are enabled; (4) the **allowed `$orderby` keys**, the **default time window**, and the **capped count** above. Everything else uses stock OData `$filter`/`$orderby`/`$select`/`$top`/`nextLink`.
+**Task-Engine-specific rules on top of the ToolKit surface** (documented so reviewers don't flag them as accidental): (1) the `view` parameter; (2) the **automatic `id` tiebreaker** appended to `$orderby` to guarantee a stable cursor; (3) the **cross-domain cursor decomposition** in §4.6, required only when multi-database task domains are enabled; (4) the **allowed `$orderby` keys**, the **default time window**, the page-size clamp, and the separate capped count endpoint.
 
 #### Error Response Format
 
@@ -1186,7 +1187,7 @@ Mapping of Task-Engine failure conditions to canonical categories (`gts.cf.core.
 | Caller may not `consume` the event type of an event condition (§3.2 Event wait authorization) | `permission_denied` | 403 |
 | Cross-domain claim / parent-child / dependency; dependency cycle | `invalid_argument` | 400 |
 | Type placed in a queue outside its domain type rule, on create, move, or re-enqueue (`context.reason = "TASK_DOMAIN_MISMATCH"`, §3.8) | `invalid_argument` | 400 |
-| Search with an unsupported `$orderby` key or a `created_at` range over `search_max_window_days` (§3.3 Search Parameters) | `invalid_argument` | 400 |
+| Search with an unsupported `$orderby` key, an unknown `view`, a `$select` field outside the view, or a `created_at` range over `search_max_window_days`; a `$` option the ToolKit extractor does not accept (`UNSUPPORTED_QUERY_PARAM`) (§3.3 Search Parameters) | `invalid_argument` | 400 |
 | Claim assigned nothing and ≥ 1 eligible task was skipped because a concurrency dimension was at capacity (`context.reason = "CONCURRENCY_LIMIT"`, `Retry-After`) | `resource_exhausted` | 429 |
 | Queue depth limit reached on creation / move / re-enqueue / deferral by choice (task unchanged) (dimension `queue`, `tenant`, `domain_global`, or `deferred`; no usage figures disclosed) | `resource_exhausted` (`context.reason = "QUEUE_DEPTH_LIMIT"`, `Retry-After`) | 429 |
 | `cancellable=false` on a supersede type; `authz_scope` requested but `AccessScope` not canonicalizable → `internal` | `invalid_argument` | 400 |
@@ -2091,10 +2092,10 @@ gears:
       max_request_body_bytes: 1048576     # 1 MiB HTTP body (streaming-counted for chunked/HTTP2 bodies)
       request_body_warn_bytes: 262144     # 256 KiB warning threshold
       compression_threshold_bytes: 1024   # Compress blobs > 1 KiB
-      search_full_event_cap: 50           # max events embedded per item at `full` search LOD (§3.3)
+      search_full_event_cap: 50           # max events embedded per item at search view=full (§3.3)
       search_default_window_days: 7       # created_at window added when a search that can return terminal tasks names none (§3.3)
       search_max_window_days: 31          # widest created_at range such a search may ask for; wider → 400
-      search_max_count: 10000             # exact $count up to this; above it the count is returned capped
+      search_max_count: 10000             # GET /tasks/count is exact up to this; above it the count is returned capped
       search_max_top: 100                 # page size cap
       search_max_top_full: 20             # page size cap at `full`
       idempotency_key_window_days: 7      # caller keys are held while the task is unfinished and at least this long after creation; capped at the task's retention (§4.5)
@@ -2757,33 +2758,35 @@ liveness_failure(t, guard_extra):
 #### Multi-Shard Search (Cursor-Based Pagination)
 
 ```
-parse OData query ($filter, $orderby, $select|lod-preset, $top, skiptoken from @odata.nextLink)
+parse the ToolKit OData query ($filter, $orderby, $select, $top | limit, $skiptoken | cursor) and `view`
+  # other `$` options were already rejected by the extractor (UNSUPPORTED_QUERY_PARAM)
 check bounds (§3.3 Search Parameters):
   $orderby must be created_at or (terminal states only) terminal_at   → else 400
   if the state filter allows terminal states:
     no created_at range → add created_at ge now - search_default_window_days
     range wider than search_max_window_days → 400
-  clamp $top to search_max_top (search_max_top_full at `full`)
+  clamp $top to search_max_top (search_max_top_full at view=full)
 append `id` in the same direction as the tiebreaker
-if skiptoken present:
-  decode cursor from skiptoken
-  decompose cursor into lightweight sub-queries:
+if cursor present:
+  decode the versioned cursor (per-domain positions)
+  decompose it into lightweight sub-queries:
     e.g., for $orderby (terminal_at desc, id desc) with cursor (T, 42):
       sub-query 1: terminal_at = T AND id < 42
       sub-query 2: terminal_at < T
 domains = the queue's domain (queue filter), or the type rule's domain (type filter), else all
 for each domain:
   for each table the state filter allows: te_task_state (live), te_task_results and its
-      _retained table (terminal; history partitions pruned by the created_at range):
-    execute sub-queries with $filter, tenant scope, $select/LOD projection, index order, LIMIT $top
+      _retained table (terminal; ring slots limited to those covering the created_at range):
+    execute sub-queries with $filter, tenant scope, view / $select projection, index order, LIMIT $top
   merge the tables' results maintaining sort order
-if count-only ($count / $top=0):
-  count with LIMIT search_max_count + 1 per table; sum; above the cap → return the cap, count_capped = true
-else:
-  merge all domain results via k-way merge (min-heap by comparator)
-  truncate to $top
-  generate skiptoken from last returned row's $orderby field values → @odata.nextLink
-  return JsonPage(results, nextLink)
+merge all domain results via k-way merge (min-heap by comparator)
+truncate to $top
+next_cursor = encode(last returned row's $orderby values + per-domain positions)
+return JsonPage { items, page_info: { next_cursor, prev_cursor, limit } }
+
+count(query):                                   # GET /tasks/count
+  same parsing, bounds, domains, and tables; count with LIMIT search_max_count + 1 per table; sum
+  return { count: min(sum, search_max_count), capped: sum > search_max_count }
 ```
 
 #### Backoff Computation

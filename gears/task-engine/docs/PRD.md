@@ -1067,7 +1067,7 @@ The system **MUST** expose a REST API at `/api/task_engine/v1` covering:
 - wait conditions: set (arm and park), list, and provide input — approvals use an event wait on the `approval-service` gear (§4.3), not dedicated endpoints;
 - queues: list, inspect, and configure;
 - dependencies: add and remove;
-- search with filters, sorting, detail levels, and cursor paging (§5.17);
+- search with filters, sorting, detail levels, and cursor paging, plus a capped count query (§5.17);
 - bulk operations (§5.18), DLQ inspection and re-enqueue (§5.8);
 - task event history, paged — the complete history of a task;
 - no health or metrics endpoints of its own: health and readiness go through the platform health endpoints, metrics through platform telemetry (§5.15).
@@ -1133,7 +1133,7 @@ The system **MUST** provide paged search over tasks with:
 - **detail levels**: `tiny` (ID, state, type), `short` (adds priority, queue, assignee, times), `long` (adds input, output, context, progress, tags), `full` (adds a **bounded** event history, waits, entries, dependencies);
 - filters on standard fields: state, assignee, queue, type, tags, resource references, age, urgency, priority, dependencies;
 - sorting by creation time (default, newest first) or, for finished tasks only, by finish time, always with the task ID as tie-breaker so paging is stable. Other sort keys are rejected (`400`), because only these orders are served by an index at the capacity profile;
-- cursor-based paging and a count-only query.
+- cursor-based paging that follows the platform query conventions (ToolKit OData: `$filter`, `$orderby`, `$select`, `$top`, opaque cursor; no offset paging and no totals on a page), and a separate count-only query.
 
 **Bounds**: search **MUST** stay bounded, whatever the number of stored tasks:
 
