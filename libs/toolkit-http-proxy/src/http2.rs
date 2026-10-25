@@ -8,18 +8,18 @@
 //! response side releases receive capacity as the caller consumes data and
 //! forwards trailers.
 
+use std::future::Future as _;
 use std::future::poll_fn;
 use std::pin::Pin;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use bytes::Bytes;
 use h2::client::{ResponseFuture, SendRequest};
 use h2::{Reason, RecvStream, SendStream};
-use http::{Request, Version};
+use http::{Request, Response, Version};
 use http_body::Body as _;
-use tokio_util::sync::{CancellationToken, DropGuard};
+use tokio_util::sync::{CancellationToken, DropGuard, WaitForCancellationFutureOwned};
 
 use crate::body::{Hold, ProxyBody};
 use crate::config::H2Limits;
@@ -121,17 +121,29 @@ pub enum Started {
     Unsent(Box<Request<ProxyBody>>, ProxyError),
 }
 
+/// Why the upload task gave up before the exchange's owner did.
+#[derive(Debug, Clone, Copy)]
+enum Abort {
+    /// The flow-control window stayed closed for `write_timeout`.
+    Stalled,
+    /// The request body failed.
+    Body,
+}
+
 /// Shared state of one HTTP/2 exchange (request upload + response).
 ///
-/// The exchange is cancelled when its owner goes away: the dispatch future
-/// before a response head arrives, or the response body afterwards. The
-/// upload task then resets the stream and ends, so abandoned exchanges never
-/// keep uploading or hold the connection busy.
+/// Only the exchange's owner ends it: the dispatch future until the response
+/// head arrives, the response body afterwards. Cancelling (owner dropped,
+/// failed or finished) makes the upload task reset the stream. The upload
+/// task never resets on its own: h2 lets a local reset erase a response that
+/// was already complete, so when it gives up (stalled window, failed request
+/// body) it only signals `abort` and the owner decides: a complete response
+/// is still delivered, anything else fails.
 #[derive(Debug, Default)]
 pub struct Exchange {
     cancel: CancellationToken,
-    stalled: AtomicBool,
-    responded: AtomicBool,
+    abort: CancellationToken,
+    cause: OnceLock<Abort>,
 }
 
 impl Exchange {
@@ -142,31 +154,33 @@ impl Exchange {
         (exchange, guard)
     }
 
-    /// The upload was reset because the window stayed closed.
-    pub fn stalled(&self) -> bool {
-        self.stalled.load(Ordering::Acquire)
+    fn give_up(&self, cause: Abort) {
+        let _first = self.cause.set(cause);
+        self.abort.cancel();
     }
 
-    /// The response head arrived. From then on the caller owns the
-    /// exchange's lifetime (body idle timeout, dropping the body), so a
-    /// closed upload window no longer resets the stream: a reset would
-    /// overwrite a response the upstream may already have completed.
-    pub fn set_responded(&self) {
-        self.responded.store(true, Ordering::Release);
-    }
-
-    fn responded(&self) -> bool {
-        self.responded.load(Ordering::Acquire)
-    }
-
-    /// The error to report for a failed exchange: a reset we sent because
-    /// the upload stalled is a write timeout, anything else is classified
-    /// from the h2 error.
-    pub fn error(&self, e: &h2::Error, message: &'static str) -> ProxyError {
-        if self.stalled() {
-            return stall_error();
+    fn abort_error(&self) -> ProxyError {
+        match self.cause.get() {
+            Some(Abort::Body) => {
+                ProxyError::new(ErrorKind::Write, "request body failed; upload aborted")
+            }
+            Some(Abort::Stalled) | None => ProxyError::new(
+                ErrorKind::WriteTimeout,
+                "upstream kept the HTTP/2 flow-control window closed",
+            ),
         }
-        from_h2(e, message)
+    }
+}
+
+/// Wait for the response head; fails first if the upload gives up.
+pub async fn response(
+    head: ResponseFuture,
+    exchange: &Exchange,
+) -> Result<Result<Response<RecvStream>, h2::Error>, ProxyError> {
+    tokio::select! {
+        biased;
+        head = head => Ok(head),
+        () = exchange.abort.cancelled() => Err(exchange.abort_error()),
     }
 }
 
@@ -216,11 +230,7 @@ enum Capacity {
     Closed,
 }
 
-async fn wait_capacity(
-    out: &mut SendStream<Bytes>,
-    stall: Option<Duration>,
-    exchange: &Exchange,
-) -> Capacity {
+async fn wait_capacity(out: &mut SendStream<Bytes>, stall: Option<Duration>) -> Capacity {
     loop {
         let available = out.capacity();
         if available > 0 {
@@ -228,12 +238,11 @@ async fn wait_capacity(
         }
         let next = poll_fn(|cx| out.poll_capacity(cx));
         let polled = match stall {
-            Some(limit) if !exchange.responded() => match tokio::time::timeout(limit, next).await {
+            Some(limit) => match tokio::time::timeout(limit, next).await {
                 Ok(polled) => polled,
-                Err(_) if exchange.responded() => continue,
                 Err(_) => return Capacity::Stalled,
             },
-            _ => next.await,
+            None => next.await,
         };
         match polled {
             Some(Ok(0)) => {}
@@ -243,8 +252,9 @@ async fn wait_capacity(
     }
 }
 
-/// Upload task: runs [`upload`] until it ends or the exchange is
-/// cancelled, in which case the stream is reset.
+/// Upload task: runs [`upload`] until it ends or the exchange is cancelled
+/// (then the stream is reset). If the upload gives up, the owner is told and
+/// the reset waits for its decision.
 async fn pump(
     mut body: ProxyBody,
     mut out: SendStream<Bytes>,
@@ -252,23 +262,29 @@ async fn pump(
     _hold: Option<Hold>,
     exchange: Arc<Exchange>,
 ) {
-    let cancelled = tokio::select! {
+    let gave_up = tokio::select! {
         biased;
-        () = exchange.cancel.cancelled() => true,
-        () = upload(&mut body, &mut out, stall, &exchange) => false,
+        () = exchange.cancel.cancelled() => None,
+        outcome = upload(&mut body, &mut out, stall) => match outcome {
+            Ok(()) => return,
+            Err(cause) => Some(cause),
+        },
     };
-    if cancelled {
-        out.send_reset(Reason::CANCEL);
+    if let Some(cause) = gave_up {
+        drop(body);
+        exchange.give_up(cause);
+        exchange.cancel.cancelled().await;
     }
+    out.send_reset(Reason::CANCEL);
 }
 
 /// Upload `body` on `out`, never queueing more than the window allows.
+/// `Ok` when the upload ended (or the stream did), `Err` when it gave up.
 async fn upload(
     body: &mut ProxyBody,
     out: &mut SendStream<Bytes>,
     stall: Option<Duration>,
-    exchange: &Exchange,
-) {
+) -> Result<(), Abort> {
     loop {
         // Stop as soon as the peer resets the stream, even while the body
         // is idle.
@@ -279,53 +295,50 @@ async fn upload(
             Pin::new(&mut *body).poll_frame(cx).map(Some)
         })
         .await;
-        let Some(frame) = next else { return };
+        let Some(frame) = next else { return Ok(()) };
         match frame {
             None => {
                 let _sent = out.send_data(Bytes::new(), true);
-                return;
+                return Ok(());
             }
             Some(Err(e)) => {
-                tracing::debug!(error = %e, "request body failed; resetting the upstream stream");
-                out.send_reset(Reason::CANCEL);
-                return;
+                tracing::debug!(error = %e, "request body failed; aborting the upstream exchange");
+                return Err(Abort::Body);
             }
             Some(Ok(frame)) => match frame.into_data() {
                 Ok(mut data) => {
                     let last = body.is_end_stream();
                     if data.is_empty() && last {
                         let _sent = out.send_data(Bytes::new(), true);
-                        return;
+                        return Ok(());
                     }
                     while !data.is_empty() {
                         out.reserve_capacity(data.len().min(MAX_UPLOAD_CHUNK));
-                        match wait_capacity(out, stall, exchange).await {
+                        match wait_capacity(out, stall).await {
                             Capacity::Granted(n) => {
                                 let chunk = data.split_to(n.min(data.len()).min(MAX_UPLOAD_CHUNK));
                                 if out.send_data(chunk, last && data.is_empty()).is_err() {
-                                    return;
+                                    return Ok(());
                                 }
                             }
                             Capacity::Stalled => {
-                                exchange.stalled.store(true, Ordering::Release);
                                 tracing::warn!(
                                     ?stall,
-                                    "upstream kept the HTTP/2 flow-control window closed; resetting the stream"
+                                    "upstream kept the HTTP/2 flow-control window closed; aborting the exchange"
                                 );
-                                out.send_reset(Reason::CANCEL);
-                                return;
+                                return Err(Abort::Stalled);
                             }
-                            Capacity::Closed => return,
+                            Capacity::Closed => return Ok(()),
                         }
                     }
                     if last {
-                        return;
+                        return Ok(());
                     }
                 }
                 Err(frame) => {
                     if let Ok(trailers) = frame.into_trailers() {
                         let _sent = out.send_trailers(trailers);
-                        return;
+                        return Ok(());
                     }
                 }
             },
@@ -333,46 +346,39 @@ async fn upload(
     }
 }
 
-fn stall_error() -> ProxyError {
-    ProxyError::new(
-        ErrorKind::WriteTimeout,
-        "upstream kept the HTTP/2 flow-control window closed",
-    )
-}
-
-/// Response body half of an HTTP/2 exchange. Dropping it cancels the
-/// exchange (and with it any upload still running).
+/// Response body half of an HTTP/2 exchange; it owns the exchange once the
+/// head arrived. Its clean end, a failure or dropping it ends the exchange
+/// (stopping any upload still running).
 pub struct H2Body {
     recv: RecvStream,
     data_done: bool,
-    /// The clean end was observed; nothing after it can turn it into an
-    /// error.
+    /// The clean end was observed; nothing after it can turn into an error.
     finished: bool,
     exchange: Arc<Exchange>,
+    aborted: Option<Pin<Box<WaitForCancellationFutureOwned>>>,
     _owner: DropGuard,
 }
 
 impl H2Body {
     pub fn new(recv: RecvStream, exchange: Arc<Exchange>, owner: DropGuard) -> Self {
-        Self {
+        let mut body = Self {
             recv,
             data_done: false,
             finished: false,
             exchange,
+            aborted: None,
             _owner: owner,
+        };
+        // A head with END_STREAM: the response is already complete.
+        if body.recv.is_end_stream() {
+            body.finish();
         }
-    }
-
-    fn error(&self, e: &h2::Error) -> ProxyError {
-        if self.exchange.stalled() {
-            return stall_error();
-        }
-        from_h2_body(e)
+        body
     }
 
     /// The response is complete: an upload still running has no use any
-    /// more and is stopped (its stream reset), so a caller holding on to a
-    /// finished body never keeps the stream busy.
+    /// more and is stopped, so a caller holding on to a finished body never
+    /// keeps the stream busy.
     fn finish(&mut self) {
         self.finished = true;
         self.exchange.cancel.cancel();
@@ -382,6 +388,24 @@ impl H2Body {
     /// handed out; a reset before that never counts as an end.
     pub fn is_end_stream(&self) -> bool {
         self.finished || self.recv.is_end_stream()
+    }
+
+    /// Nothing to deliver right now: fail if the upload gave up, else wait.
+    /// Everything the upstream already sent is delivered first, so a
+    /// response completed despite a stalled upload is never lost.
+    fn poll_abort(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<Bytes>, ProxyError>>> {
+        use std::task::Poll;
+        let exchange = &self.exchange;
+        let aborted = self
+            .aborted
+            .get_or_insert_with(|| Box::pin(exchange.abort.clone().cancelled_owned()));
+        match aborted.as_mut().poll(cx) {
+            Poll::Ready(()) => Poll::Ready(Some(Err(self.exchange.abort_error()))),
+            Poll::Pending => Poll::Pending,
+        }
     }
 
     pub fn poll_frame(
@@ -397,14 +421,17 @@ impl H2Body {
                 Poll::Ready(Some(Ok(data))) => {
                     // Credit the window now that the caller has the bytes.
                     let _released = self.recv.flow_control().release_capacity(data.len());
+                    if self.recv.is_end_stream() {
+                        self.finish();
+                    }
                     return Poll::Ready(Some(Ok(http_body::Frame::data(data))));
                 }
                 Poll::Ready(Some(Err(e))) => {
-                    let err = self.error(&e).with_source(e);
+                    let err = from_h2_body(&e).with_source(e);
                     return Poll::Ready(Some(Err(err)));
                 }
                 Poll::Ready(None) => self.data_done = true,
-                Poll::Pending => return Poll::Pending,
+                Poll::Pending => return self.poll_abort(cx),
             }
         }
         match self.recv.poll_trailers(cx) {
@@ -417,10 +444,10 @@ impl H2Body {
                 Poll::Ready(None)
             }
             Poll::Ready(Err(e)) => {
-                let err = self.error(&e).with_source(e);
+                let err = from_h2_body(&e).with_source(e);
                 Poll::Ready(Some(Err(err)))
             }
-            Poll::Pending => Poll::Pending,
+            Poll::Pending => self.poll_abort(cx),
         }
     }
 }

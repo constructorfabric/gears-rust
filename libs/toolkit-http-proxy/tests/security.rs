@@ -858,6 +858,81 @@ async fn complete_h2_response_survives_an_upload_stall() {
 }
 
 #[tokio::test]
+async fn h2_upload_stall_after_the_head_still_fails_the_exchange() {
+    // Zero window, a head without END_STREAM, then a trickle of DATA that
+    // keeps the read timeout from ever firing: the stalled upload still
+    // bounds the exchange.
+    let addr = h2_server(&[0x00, 0x04, 0, 0, 0, 0], |mut s| async move {
+        let _ = s.write_all(&frame(HEADERS, END_HEADERS, 1, &[0x88])).await;
+        for _ in 0..100 {
+            if s.write_all(&frame(DATA, 0, 1, b"x")).await.is_err() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await;
+    let mut cfg = support::test_config();
+    cfg.write_timeout = Some(Duration::from_millis(300));
+    cfg.read_timeout = Some(Duration::from_secs(5));
+    let c = ProxyClient::new(cfg).unwrap();
+    let req = Request::post("/")
+        .body(full_body(Bytes::from(vec![b'x'; 256 * 1024])))
+        .unwrap();
+    let resp = within(Duration::from_secs(2), c.send(&h2_target(addr), req))
+        .await
+        .unwrap();
+    let err = within(Duration::from_secs(3), resp.into_body().collect())
+        .await
+        .unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::WriteTimeout, "{err}");
+}
+
+#[tokio::test]
+async fn completed_h2_response_stops_the_upload_while_still_held() {
+    // Once the response is complete the upload is pointless: it must stop
+    // even though the caller keeps the response (or its body) alive.
+    for with_body in [false, true] {
+        let reset = Arc::new(tokio::sync::Notify::new());
+        let notify = reset.clone();
+        let addr = h2_server(&[0x00, 0x04, 0, 0, 0, 0], move |mut s| {
+            let notify = notify.clone();
+            async move {
+                let out = if with_body {
+                    let mut out = frame(HEADERS, END_HEADERS, 1, &[0x88]);
+                    out.extend(frame(DATA, END_STREAM, 1, b"ok"));
+                    out
+                } else {
+                    frame(HEADERS, END_HEADERS | END_STREAM, 1, &[0x88])
+                };
+                let _ = s.write_all(&out).await;
+                if reset_of_stream_1(&mut s).await {
+                    notify.notify_one();
+                }
+            }
+        })
+        .await;
+        let mut cfg = support::test_config();
+        cfg.write_timeout = None;
+        let c = ProxyClient::new(cfg).unwrap();
+        let req = Request::post("/")
+            .body(full_body(Bytes::from(vec![b'x'; 256 * 1024])))
+            .unwrap();
+        let resp = within(Duration::from_secs(2), c.send(&h2_target(addr), req))
+            .await
+            .unwrap();
+        let mut body = resp.into_body();
+        if with_body {
+            let data = body.frame().await.unwrap().unwrap().into_data().unwrap();
+            assert_eq!(data, "ok");
+            assert!(http_body::Body::is_end_stream(&body));
+        }
+        within(Duration::from_secs(2), reset.notified()).await;
+        drop(body);
+    }
+}
+
+#[tokio::test]
 async fn h2_body_cut_by_a_reset_never_reports_its_end() {
     // A truncated body must not look complete: consumers that trust
     // `is_end_stream` would otherwise terminate it cleanly downstream.

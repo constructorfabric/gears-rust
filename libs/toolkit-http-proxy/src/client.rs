@@ -531,7 +531,7 @@ impl ProxyClient {
                         ),
                         None => DispatchError::Failed(ProxyError::from_hyper(e.into_error())),
                     }),
-                    Err(timeout) => Err(DispatchError::Failed(timeout)),
+                    Err(err) => Err(DispatchError::Failed(err)),
                 }
             }
             Sender::H2(tx) => {
@@ -558,11 +558,12 @@ impl ProxyClient {
                         return Err(DispatchError::Unsent(back, err));
                     }
                 };
-                match self.read_timeout(response).await {
-                    Ok(Ok(resp)) => {
-                        exchange.set_responded();
-                        Ok(self.finish_h2(resp, hold, exchange, owner))
-                    }
+                let head = self
+                    .read_timeout(http2::response(response, &exchange))
+                    .await
+                    .and_then(|head| head);
+                match head {
+                    Ok(Ok(resp)) => Ok(self.finish_h2(resp, hold, exchange, owner)),
                     Ok(Err(e)) => {
                         // Only a dead connection is forgotten (and only this
                         // generation of it); a stream-level reset leaves the
@@ -571,9 +572,8 @@ impl ProxyClient {
                             inner.pool.drop_h2(key, conn.generation);
                             inner.protocols.evict(target);
                         }
-                        let err = exchange
-                            .error(&e, "upstream HTTP/2 exchange failed")
-                            .with_source(e);
+                        let err =
+                            http2::from_h2(&e, "upstream HTTP/2 exchange failed").with_source(e);
                         Err(DispatchError::Failed(err))
                     }
                     Err(timeout) => Err(DispatchError::Failed(timeout)),
