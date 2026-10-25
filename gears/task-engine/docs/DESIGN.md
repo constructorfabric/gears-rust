@@ -227,7 +227,7 @@ Tenant-owned tables (`te_tasks`, `te_task_state`, `te_task_results`, `te_task_en
 
 **ID**: `cpt-cf-task-engine-principle-operation-builder`
 
-**Type-safe REST**: All endpoints use `OperationBuilder`. Protected routes declare `.authenticated()` followed by a license posture (`.require_license_features::<License>([])` or `.no_license_required()`); unauthenticated routes (health/readiness/metrics) declare `.anonymous()`, which auto-satisfies the license requirement. All routes register `.standard_errors()`.
+**Type-safe REST**: All endpoints use `OperationBuilder`. Protected routes declare `.authenticated()` followed by a license posture (`.require_license_features::<License>([])` or `.no_license_required()`); the gear registers **no** unauthenticated routes: liveness and readiness come from the ToolKit `Healthcheck` capability and metrics from the platform OpenTelemetry meter (§3.3 Health and metrics). All routes register `.standard_errors()`.
 
 **ID**: `cpt-cf-task-engine-principle-domain-model`
 
@@ -1024,10 +1024,12 @@ Checks are not repeated: the engine holds no creator credential after the create
 
 **Type and queue checks on create, move, and re-enqueue**: the type is resolved with the caller's context (not visible → `400` `UNKNOWN_TASK_TYPE`); the type and queue must be within `trust_limits` (§4.1); a tenant-owned type cannot enter an `operated_by: platform` queue; a queue with `accepted_types` rejects other types (`400`). A removed or unavailable type refuses new tasks only; its existing tasks run to the end, and output is validated against `te_tasks.type_revision`.
 
-Unauthenticated endpoints (`.anonymous()`, anonymous `SecurityContext`; `.anonymous()` auto-satisfies the license requirement). ToolKit `OperationBuilder` splits *auth* (`.anonymous()`) from *visibility* (`.exposed()`), and the legacy single-axis `.public()` is deprecated — so these routes use the explicit two-axis form:
-- `GET /health` — liveness probe — `.anonymous().exposed()` (edge-reachable)
-- `GET /ready` — readiness probe — `.anonymous().exposed()` (edge-reachable)
-- `GET /metrics` — Prometheus metrics — `.anonymous()` (internal scrape target; not edge-exposed)
+**ID**: `cpt-cf-task-engine-design-health-metrics`
+
+**Health and metrics** — the gear registers **no** `.anonymous()` route of its own:
+
+- **Liveness and readiness** use the ToolKit healthcheck infrastructure (`toolkit::healthcheck`). The gear implements `RestApiCapability::healthcheck()` and returns one `Healthcheck` (`"task-engine-readiness"`). The API Gateway serves `/healthz` (liveness: shallow, never runs gear checks), `/readyz` (readiness: runs the gear check and takes the pod out of rotation without a restart), and `/health` (detailed diagnostics), on the main listener or on the separate health listener as configured by `api-gateway` `health.serve`. The gear check reports **not ready** while any of these hold: a task-domain database is unreachable or its migrations are not applied; startup recovery has not finished (timers re-read, counters reconciled, §3.8 Recovery); the domain router found a routing change that strands live tasks (§3.8). Event Broker publishing and the ready-task cache are **not** readiness inputs — they are off the correctness path (PRD §5.10, §5.20) and are reported as metrics instead.
+- **Metrics** are OpenTelemetry instruments from the platform meter provider (`toolkit::telemetry`, `opentelemetry::global::meter_with_scope("task-engine")`), exported by the platform's configured exporter (OTLP). The gear exposes no `/metrics` endpoint, so nothing about queues, task types, or tenants is readable without authentication. Label sets are bounded and contain no tenant-private values (§4.3).
 
 All authenticated endpoints below use `.authenticated()` + `.require_license_features::<License>([])` (or `.no_license_required()` where no feature gate applies) + `.standard_errors()` on the `OperationBuilder`.
 
@@ -1940,7 +1942,7 @@ Multiple instances share the database and coordinate **without any DB-specific S
 
 **Backend suitability**: PostgreSQL is the recommended production backend. MySQL/MariaDB 8.0+ is fully supported. **SQLite is supported for development, testing, and low-volume single-node embedded use only** — its single-writer model serializes writes and it lacks native partitioning. This is a `toolkit-db` framework property, not a consequence of any Task-Engine-specific SQL. Consistent with ADR-0008 and ADR-0009.
 
-**Recovery and upgrades** (PRD §6.1 Service Availability and Recovery, Rolling Upgrade): all state is in the domain databases, so backup and point-in-time recovery are database operations. On start after a restore, each instance re-reads `te_timers`, the deadline columns of `te_task_state`, and `te_worker_sessions` (sessions whose `lease_until` passed during the outage expire on the first scan), and the maintenance leader reconciles `used` in the five counter tables (`te_concurrency_slots`, `te_tenant_concurrency_slots`, `te_queue_backlog`, `te_tenant_queue_backlog`, `te_tenant_wait_counters`) from task and wait-condition rows (§3.7 Counter reconciliation) before claims are served. Migrations use expand/contract: a release only adds columns, tables, and enum values; it removes them one release later, once no older instance is running. New enum values follow the evolution contract in §3.1.
+**Recovery and upgrades** (PRD §6.1 Service Availability and Recovery, Rolling Upgrade): all state is in the domain databases, so backup and point-in-time recovery are database operations. On start after a restore, each instance re-reads `te_timers`, the deadline columns of `te_task_state`, `te_worker_sessions` (sessions whose `lease_until` passed during the outage expire on the first scan), and `te_ring_state` (which buckets are retained, §3.7), and the maintenance leader reconciles `used` in the five counter tables (`te_concurrency_slots`, `te_tenant_concurrency_slots`, `te_queue_backlog`, `te_tenant_queue_backlog`, `te_tenant_wait_counters`) from task and wait-condition rows (§3.7 Counter reconciliation) before claims are served; until then the readiness check reports not ready (§3.3 Health and metrics). Migrations use expand/contract: a release only adds columns, tables, and enum values; it removes them one release later, once no older instance is running. New enum values follow the evolution contract in §3.1.
 
 **Task Domains**: When configured, different queues are routed to different databases. Each domain has its own connection pool, migrations, retention schedule, event outbox, and `te_event_inbox` (§3.2). A `default` domain catches unmatched queues and holds `te_runtime_config` and the consumer offsets.
 
@@ -2208,9 +2210,11 @@ gears:
 
 **ID**: `cpt-cf-task-engine-design-metrics`
 
+All instruments are OpenTelemetry metrics exported through the platform meter provider (§3.3 Health and metrics); there is no scrape endpoint. **Label rules** (bounded cardinality, no cross-tenant disclosure): no tenant, subject, task ID, or worker ID label; `queue` is a platform-owned queue ID (bounded by configuration); `type` is the task type ID **only for platform-owned types** and the literal `tenant_owned` for every tenant-owned type, so tenant-private type IDs never appear in telemetry and runtime type registration cannot grow the series count; `route` is the `OperationBuilder` path template, never the concrete path.
+
 | Metric | Type | Labels | Description |
 |---|---|---|---|
-| `te_tasks_created_total` | Counter | `queue`, `type` | Tasks created |
+| `te_tasks_created_total` | Counter | `queue`, `type` | Tasks created (`type` per the label rules) |
 | `te_tasks_claimed_total` | Counter | `queue` | Tasks claimed |
 | `te_tasks_completed_total` | Counter | `queue`, `result_code` | Tasks completed |
 | `te_tasks_failed_total` | Counter | `queue` | Tasks failed |
@@ -2222,9 +2226,9 @@ gears:
 | `te_queue_executing` | Gauge | `queue` | Running tasks per queue |
 | `te_queue_depth_rejections_total` | Counter | `queue`, `dimension` | Admissions refused with `QUEUE_DEPTH_LIMIT` (`dimension` = `queue`/`tenant`/`domain_global`/`deferred`; no tenant label — bounded cardinality) |
 | `te_queue_depth_limit` | Gauge | `queue` | Effective per-queue `queue_max_queue_depth` (alerting on `te_queue_depth / te_queue_depth_limit`) |
-| `te_dedup_hits_total` | Counter | `type` | Creations answered by an existing derived identity |
-| `te_tasks_superseded_total` | Counter | `type`, `mode` | Tasks cancelled by supersession |
-| `te_supersede_stale_rejections_total` | Counter | `type` | Submissions rejected `STALE_ORDER` |
+| `te_dedup_hits_total` | Counter | `type` | Creations answered by an existing derived identity (`type` per the label rules) |
+| `te_tasks_superseded_total` | Counter | `type`, `mode` | Tasks cancelled by supersession (`type` per the label rules) |
+| `te_supersede_stale_rejections_total` | Counter | `type` | Submissions rejected `STALE_ORDER` (`type` per the label rules) |
 | `te_wait_conditions_active` | Gauge | `kind` | Active wait conditions by kind |
 | `te_sla_breached_total` | Counter | `queue` | SLA deadline breaches |
 | `te_timer_channel_size` | Gauge | — | Pending timers in channel |
@@ -2252,7 +2256,11 @@ gears:
 | `te_progress_flush_duration` | Histogram | — | Progress cache flush time |
 | `te_blob_compression_ratio` | Histogram | — | Compression ratio |
 | `te_db_pool_active` | Gauge | `domain` | Active DB connections per domain |
-| `te_request_duration_seconds` | Histogram | `method`, `path`, `status` | HTTP request latency |
+| `te_request_duration_seconds` | Histogram | `method`, `route`, `status` | HTTP request latency (`route` = path template) |
+| `te_retention_removed_total` | Counter | `domain`, `table`, `how` | Rows removed by retention (`how` = `truncate` / `delete`), per sweep like the Event Broker retention worker's report (§3.2 RetentionService) |
+| `te_retention_rescued_total` | Counter | `domain`, `table` | Rows rescued into `_retained` tables before a slot was truncated |
+| `te_retention_pass_failures_total` | Counter | `domain` | Retention passes that failed (nothing removed; repeated on the next tick) |
+| `te_readiness` | Gauge | `domain` | 1 when the domain passes the readiness check of §3.3 Health and metrics |
 | `te_blacklisted_workers` | Gauge | `queue` | Blacklisted workers per queue |
 | `te_lease_fencing_rejections_total` | Counter | `op` | Worker-side writes rejected as `LEASE_LOST` (zombie-worker indicator) |
 | `te_progress_stale_dropped_total` | Counter | — | Buffered progress snapshots dropped at flush because their lease was lost |
@@ -3041,7 +3049,7 @@ Consistent with PRD §4.2:
 | `cpt-cf-task-engine-fr-gts-entry-type` | §3.1 GTS Base Types |
 | `cpt-cf-task-engine-fr-rest-api` | §3.3 API Contracts (all endpoint tables) |
 | `cpt-cf-task-engine-fr-retention` | §3.2 RetentionService (partition maintenance); §4.1 Configuration (retention); ADR-0009 |
-| `cpt-cf-task-engine-fr-observability` | §4.3 Metrics and Observability |
+| `cpt-cf-task-engine-fr-observability` | §3.3 Health and metrics (`cpt-cf-task-engine-design-health-metrics`); §4.3 Metrics and Observability |
 | `cpt-cf-task-engine-fr-sdk` | §3.2 Module Structure (task-engine-sdk); §1.3 Architecture Layers |
 | `cpt-cf-task-engine-fr-search` | §3.3 Search Parameters; §4.6 Multi-Shard Search algorithm |
 | `cpt-cf-task-engine-fr-bulk-ops` | §3.3 Bulk Operation Endpoints |

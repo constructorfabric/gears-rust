@@ -903,7 +903,7 @@ Operators **MUST** be able to choose which events are published, per task type p
 
 - [ ] `p1` - **ID**: `cpt-cf-task-engine-fr-authn`
 
-Every protected request **MUST** be authenticated by the platform (API Gateway and AuthN Resolver), which gives the engine the caller's security context (subject, tenant, token scopes). Only health, readiness, and metrics endpoints are anonymous.
+Every protected request **MUST** be authenticated by the platform (API Gateway and AuthN Resolver), which gives the engine the caller's security context (subject, tenant, token scopes). The engine exposes no anonymous endpoint of its own: health and readiness are served by the platform health endpoints, and metrics are exported through the platform telemetry pipeline (§5.15).
 
 - **Rationale**: The engine follows the platform model: the AuthN Resolver checks tokens and gears act as policy enforcement points ([docs/arch/authorization/DESIGN.md](../../../docs/arch/authorization/DESIGN.md)).
 - **Actors**: All actors
@@ -1070,7 +1070,7 @@ The system **MUST** expose a REST API at `/api/task_engine/v1` covering:
 - search with filters, sorting, detail levels, and cursor paging (§5.17);
 - bulk operations (§5.18), DLQ inspection and re-enqueue (§5.8);
 - task event history, paged — the complete history of a task;
-- health probes and Prometheus metrics.
+- no health or metrics endpoints of its own: health and readiness go through the platform health endpoints, metrics through platform telemetry (§5.15).
 
 Errors **MUST** use RFC 9457 Problem Details with the platform's canonical error types.
 
@@ -1106,7 +1106,7 @@ Before cleanup, tasks still unfinished after the **hard retention limit** **MUST
 
 - [ ] `p1` - **ID**: `cpt-cf-task-engine-fr-observability`
 
-The system **MUST** expose Prometheus metrics for: request counts and latency, queue depth and running counts, retries, DLQ sizes, wait conditions by kind, SLA breaches, timer and signal backlog, and database pool usage. Liveness and readiness probes **MUST** reflect database connectivity and overall health.
+The system **MUST** emit metrics through the platform telemetry pipeline (OpenTelemetry) for: request counts and latency, queue depth and running counts, retries, DLQ sizes, wait conditions by kind, SLA breaches, timer and signal backlog, retention, and database pool usage. Metrics **MUST NOT** be readable without authentication and **MUST NOT** carry tenant-private values (tenant or subject IDs, tenant-owned task type IDs) or unbounded labels. Readiness **MUST** be reported through the platform healthcheck mechanism and reflect database connectivity, applied migrations, and completed startup recovery; liveness stays shallow.
 
 - **Rationale**: Operators need these signals for capacity planning, alerts, and health checks.
 - **Actors**: `cpt-cf-task-engine-actor-platform-admin`
