@@ -1136,6 +1136,60 @@ async fn cancelled_h1_checkout_closes_the_connection_it_took() {
     within(Duration::from_secs(2), closed.notified()).await;
 }
 
+// Windows loopback buffers the whole head whatever the receive buffer, so
+// the write never stalls there.
+#[cfg(not(windows))]
+#[tokio::test]
+async fn timed_out_upgrade_handshake_closes_its_connection() {
+    // The upstream does not read, so the oversized handshake head cannot be
+    // flushed. Once the handshake times out the connection must close,
+    // discarding the rest of the head, rather than keep flushing it in a
+    // detached task.
+    const PAD: usize = 16 * 1024 * 1024;
+    // A small receive buffer, so the head really cannot be flushed.
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.set_recv_buffer_size(4096).unwrap();
+    socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let addr = socket.local_addr().unwrap();
+    let listener = socket.listen(1).unwrap();
+    let (received_tx, mut received) = mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        let Ok((mut s, _)) = listener.accept().await else {
+            return;
+        };
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let mut total = 0usize;
+        let mut buf = vec![0u8; 64 * 1024];
+        while let Ok(n) = s.read(&mut buf).await {
+            if n == 0 {
+                break;
+            }
+            total += n;
+        }
+        let _ = received_tx.send(total);
+    });
+    let c = client_with_timeout(Duration::from_millis(300));
+    let req = Request::get("/ws")
+        .header("upgrade", "websocket")
+        .header("connection", "Upgrade")
+        .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+        .header("sec-websocket-version", "13")
+        .header("x-pad", "a".repeat(PAD))
+        .body(empty_body())
+        .unwrap();
+    let err = within(Duration::from_secs(2), c.upgrade(&plain(addr), req))
+        .await
+        .unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::ReadTimeout, "{err}");
+    let total = within(Duration::from_secs(5), received.recv())
+        .await
+        .unwrap();
+    assert!(
+        total < PAD,
+        "the abandoned head was still flushed ({total} bytes)"
+    );
+}
+
 #[tokio::test]
 async fn early_h1_response_with_unread_upload_severs_the_connection() {
     // The upstream answers right away and never reads the body: once the

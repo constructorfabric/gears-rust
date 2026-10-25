@@ -233,20 +233,23 @@ impl ProxyClient {
         // No write-stall budget: an upgraded tunnel's pace belongs to its
         // peers (the WebSocket relay has its own idle handling).
         let io = TokioIo::new(KillableIo::new(connected.stream, &handle.kill, None));
-        let (mut tx, conn) = self
+        let (tx, conn) = self
             .inner
             .h1
             .handshake::<_, ProxyBody>(io)
             .await
             .map_err(ProxyError::from_hyper)?;
-        // The connection task ends when hyper hands the socket to `Upgraded`;
-        // the handle must stay alive (not cancelled) for the tunnel's sake.
+        // The connection task ends when hyper hands the socket to `Upgraded`,
+        // so it never cancels the handle itself. `h1` owns the connection
+        // until then: a failed, timed-out or cancelled handshake (or a
+        // rejected answer, once its body ends) closes it; only a validated
+        // switch lets it go to the tunnel.
         tokio::spawn(async move {
             if let Err(e) = conn.with_upgrades().await {
                 tracing::debug!(error = %e, "upstream upgrade connection closed with error");
             }
-            drop(handle);
         });
+        let mut h1 = H1Conn::new(tx, handle);
         self.inner.observer.on_connection(&ConnectionInfo {
             target,
             reused: false,
@@ -255,16 +258,17 @@ impl ProxyClient {
         });
 
         let mut resp = self
-            .read_timeout(tx.send_request(req))
+            .read_timeout(h1.sender.send_request(req))
             .await?
             .map_err(ProxyError::from_hyper)?;
         if resp.status() != StatusCode::SWITCHING_PROTOCOLS {
-            return Ok(UpgradeOutcome::Rejected(self.finish_h1(resp, None)));
+            return Ok(UpgradeOutcome::Rejected(self.finish_h1(resp, h1, None)));
         }
         sanitize::validate_websocket_switch(resp.headers())?;
         let io = hyper::upgrade::on(&mut resp)
             .await
             .map_err(ProxyError::from_hyper)?;
+        h1.into_tunnel();
         let (mut head, _) = resp.into_parts();
         sanitize::sanitize_response_headers(&mut head.headers, head.status);
         Ok(UpgradeOutcome::Switched {
@@ -273,13 +277,14 @@ impl ProxyClient {
         })
     }
 
-    /// `conn` (with its pool key) owns the connection until the body ends:
-    /// a clean end returns it to the pool, a dropped or failed body drops it
-    /// and with it the connection.
+    /// `conn` owns the connection until the body ends: a clean end returns
+    /// it to the pool under `pool_key` (if any), a dropped or failed body
+    /// drops it and with it the connection.
     fn finish_h1(
         &self,
         resp: Response<Incoming>,
-        conn: Option<(PoolKey, H1Conn)>,
+        conn: H1Conn,
+        pool_key: Option<PoolKey>,
     ) -> Response<ResponseBody> {
         let (mut head, body) = resp.into_parts();
         // RFC 9112 §6.3: a response carrying both framings must not leave
@@ -287,18 +292,17 @@ impl ProxyClient {
         // connection until the body ends, so the body is not cut short.
         let ambiguous = head.headers.contains_key(header::TRANSFER_ENCODING)
             && head.headers.contains_key(header::CONTENT_LENGTH);
-        let on_end = conn.map(|(key, conn)| -> OnEnd {
-            if ambiguous {
-                Box::new(move || drop(conn))
-            } else {
+        let on_end: OnEnd = match pool_key {
+            Some(key) if !ambiguous => {
                 let pool = Arc::clone(&self.inner.pool);
                 Box::new(move || pool.checkin_h1(key, conn))
             }
-        });
+            _ => Box::new(move || drop(conn)),
+        };
         sanitize::sanitize_response_headers(&mut head.headers, head.status);
         Response::from_parts(
             head,
-            ResponseBody::http1(body, self.inner.cfg.read_timeout, on_end),
+            ResponseBody::http1(body, self.inner.cfg.read_timeout, Some(on_end)),
         )
     }
 
@@ -488,10 +492,7 @@ impl ProxyClient {
                 .map_err(ProxyError::from_hyper)?;
             tokio::spawn(drive("http1", conn, handle.clone()));
             Ok(Acquired {
-                sender: Sender::H1(H1Conn {
-                    sender: tx,
-                    handle: handle.clone(),
-                }),
+                sender: Sender::H1(H1Conn::new(tx, handle.clone())),
                 conn: handle,
                 hold: None,
                 reused: false,
@@ -533,7 +534,7 @@ impl ProxyClient {
                 // cancellation below it is dropped, closing the connection.
                 let res = self.read_timeout(h1.sender.try_send_request(req)).await;
                 match res {
-                    Ok(Ok(resp)) => Ok(self.finish_h1(resp, Some((key.clone(), h1)))),
+                    Ok(Ok(resp)) => Ok(self.finish_h1(resp, h1, Some(key.clone()))),
                     Ok(Err(mut e)) => Err(match e.take_message() {
                         Some(back) => DispatchError::Unsent(
                             Box::new(back),

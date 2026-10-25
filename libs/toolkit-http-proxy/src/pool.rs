@@ -66,9 +66,24 @@ pub struct ConnHandle {
 pub struct H1Conn {
     pub sender: http1::SendRequest<ProxyBody>,
     pub handle: ConnHandle,
+    armed: bool,
 }
 
 impl H1Conn {
+    pub fn new(sender: http1::SendRequest<ProxyBody>, handle: ConnHandle) -> Self {
+        Self {
+            sender,
+            handle,
+            armed: true,
+        }
+    }
+
+    /// Let go without closing: the socket now belongs to an upgraded
+    /// tunnel.
+    pub fn into_tunnel(mut self) {
+        self.armed = false;
+    }
+
     fn is_open(&self) -> bool {
         !self.sender.is_closed() && !self.handle.kill.is_cancelled()
     }
@@ -76,7 +91,9 @@ impl H1Conn {
 
 impl Drop for H1Conn {
     fn drop(&mut self) {
-        self.handle.kill.cancel();
+        if self.armed {
+            self.handle.kill.cancel();
+        }
     }
 }
 
