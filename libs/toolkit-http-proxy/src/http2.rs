@@ -131,6 +131,7 @@ pub enum Started {
 pub struct Exchange {
     cancel: CancellationToken,
     stalled: AtomicBool,
+    responded: AtomicBool,
 }
 
 impl Exchange {
@@ -144,6 +145,18 @@ impl Exchange {
     /// The upload was reset because the window stayed closed.
     pub fn stalled(&self) -> bool {
         self.stalled.load(Ordering::Acquire)
+    }
+
+    /// The response head arrived. From then on the caller owns the
+    /// exchange's lifetime (body idle timeout, dropping the body), so a
+    /// closed upload window no longer resets the stream: a reset would
+    /// overwrite a response the upstream may already have completed.
+    pub fn set_responded(&self) {
+        self.responded.store(true, Ordering::Release);
+    }
+
+    fn responded(&self) -> bool {
+        self.responded.load(Ordering::Acquire)
     }
 
     /// The error to report for a failed exchange: a reset we sent because
@@ -203,7 +216,11 @@ enum Capacity {
     Closed,
 }
 
-async fn wait_capacity(out: &mut SendStream<Bytes>, stall: Option<Duration>) -> Capacity {
+async fn wait_capacity(
+    out: &mut SendStream<Bytes>,
+    stall: Option<Duration>,
+    exchange: &Exchange,
+) -> Capacity {
     loop {
         let available = out.capacity();
         if available > 0 {
@@ -211,11 +228,12 @@ async fn wait_capacity(out: &mut SendStream<Bytes>, stall: Option<Duration>) -> 
         }
         let next = poll_fn(|cx| out.poll_capacity(cx));
         let polled = match stall {
-            Some(limit) => match tokio::time::timeout(limit, next).await {
+            Some(limit) if !exchange.responded() => match tokio::time::timeout(limit, next).await {
                 Ok(polled) => polled,
+                Err(_) if exchange.responded() => continue,
                 Err(_) => return Capacity::Stalled,
             },
-            None => next.await,
+            _ => next.await,
         };
         match polled {
             Some(Ok(0)) => {}
@@ -281,7 +299,7 @@ async fn upload(
                     }
                     while !data.is_empty() {
                         out.reserve_capacity(data.len().min(MAX_UPLOAD_CHUNK));
-                        match wait_capacity(out, stall).await {
+                        match wait_capacity(out, stall, exchange).await {
                             Capacity::Granted(n) => {
                                 let chunk = data.split_to(n.min(data.len()).min(MAX_UPLOAD_CHUNK));
                                 if out.send_data(chunk, last && data.is_empty()).is_err() {
@@ -327,6 +345,9 @@ fn stall_error() -> ProxyError {
 pub struct H2Body {
     recv: RecvStream,
     data_done: bool,
+    /// The clean end was observed; nothing after it can turn it into an
+    /// error.
+    finished: bool,
     exchange: Arc<Exchange>,
     _owner: DropGuard,
 }
@@ -336,6 +357,7 @@ impl H2Body {
         Self {
             recv,
             data_done: false,
+            finished: false,
             exchange,
             _owner: owner,
         }
@@ -348,8 +370,18 @@ impl H2Body {
         from_h2_body(e)
     }
 
+    /// The response is complete: an upload still running has no use any
+    /// more and is stopped (its stream reset), so a caller holding on to a
+    /// finished body never keeps the stream busy.
+    fn finish(&mut self) {
+        self.finished = true;
+        self.exchange.cancel.cancel();
+    }
+
+    /// h2 reports the end only once `END_STREAM` arrived and every frame was
+    /// handed out; a reset before that never counts as an end.
     pub fn is_end_stream(&self) -> bool {
-        self.recv.is_end_stream()
+        self.finished || self.recv.is_end_stream()
     }
 
     pub fn poll_frame(
@@ -357,6 +389,9 @@ impl H2Body {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Result<http_body::Frame<Bytes>, ProxyError>>> {
         use std::task::Poll;
+        if self.finished {
+            return Poll::Ready(None);
+        }
         if !self.data_done {
             match self.recv.poll_data(cx) {
                 Poll::Ready(Some(Ok(data))) => {
@@ -374,9 +409,13 @@ impl H2Body {
         }
         match self.recv.poll_trailers(cx) {
             Poll::Ready(Ok(Some(trailers))) => {
+                self.finish();
                 Poll::Ready(Some(Ok(http_body::Frame::trailers(trailers))))
             }
-            Poll::Ready(Ok(None)) => Poll::Ready(None),
+            Poll::Ready(Ok(None)) => {
+                self.finish();
+                Poll::Ready(None)
+            }
             Poll::Ready(Err(e)) => {
                 let err = self.error(&e).with_source(e);
                 Poll::Ready(Some(Err(err)))

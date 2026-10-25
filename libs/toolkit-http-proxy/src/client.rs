@@ -559,7 +559,10 @@ impl ProxyClient {
                     }
                 };
                 match self.read_timeout(response).await {
-                    Ok(Ok(resp)) => Ok(self.finish_h2(resp, hold, exchange, owner)),
+                    Ok(Ok(resp)) => {
+                        exchange.set_responded();
+                        Ok(self.finish_h2(resp, hold, exchange, owner))
+                    }
                     Ok(Err(e)) => {
                         // Only a dead connection is forgotten (and only this
                         // generation of it); a stream-level reset leaves the

@@ -57,6 +57,12 @@ hyper-util = { workspace = true, features = ["server", "server-auto", "http1", "
 proptest = { workspace = true }
 rcgen = { workspace = true }
 tokio = { workspace = true, features = ["full", "test-util"] }
+# FIPS test builds install the platform provider `toolkit-http` uses (see
+# tests/support): corecrypto on macOS (empty lib elsewhere), CNG on Windows.
+rustls-corecrypto-provider = { workspace = true }
+
+[target.'cfg(target_os = "windows")'.dev-dependencies]
+rustls-cng-crypto = { workspace = true }
 
 [[bench]]
 name = "client"

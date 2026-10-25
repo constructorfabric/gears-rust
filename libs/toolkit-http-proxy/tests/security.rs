@@ -824,6 +824,70 @@ async fn malformed_h2_response_heads_are_rejected() {
 }
 
 #[tokio::test]
+async fn complete_h2_response_survives_an_upload_stall() {
+    // RFC 9113 §8.1: a complete response before the request finished is
+    // valid. A closed upload window must not turn it into an error, however
+    // long the caller holds it before reading.
+    for with_body in [false, true] {
+        let addr = h2_server(&[0x00, 0x04, 0, 0, 0, 0], move |mut s| async move {
+            let out = if with_body {
+                let mut out = frame(HEADERS, END_HEADERS, 1, &[0x88]);
+                out.extend(frame(DATA, END_STREAM, 1, b"ok"));
+                out
+            } else {
+                frame(HEADERS, END_HEADERS | END_STREAM, 1, &[0x88])
+            };
+            let _ = s.write_all(&out).await;
+            drain(&mut s, Duration::from_secs(3)).await;
+        })
+        .await;
+        let mut cfg = support::test_config();
+        cfg.write_timeout = Some(Duration::from_millis(200));
+        let c = ProxyClient::new(cfg).unwrap();
+        let req = Request::post("/")
+            .body(full_body(Bytes::from(vec![b'x'; 256 * 1024])))
+            .unwrap();
+        let resp = within(Duration::from_secs(2), c.send(&h2_target(addr), req))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        let body = resp.into_body().collect().await.expect("complete response");
+        let expected: &[u8] = if with_body { b"ok" } else { b"" };
+        assert_eq!(body.to_bytes(), expected);
+    }
+}
+
+#[tokio::test]
+async fn h2_body_cut_by_a_reset_never_reports_its_end() {
+    // A truncated body must not look complete: consumers that trust
+    // `is_end_stream` would otherwise terminate it cleanly downstream.
+    let addr = h2_server(&[], |mut s| async move {
+        let mut out = frame(HEADERS, END_HEADERS, 1, &[0x88]);
+        out.extend(frame(DATA, 0, 1, b"part"));
+        out.extend(frame(RST_STREAM, 0, 1, &2u32.to_be_bytes()));
+        let _ = s.write_all(&out).await;
+        drain(&mut s, Duration::from_secs(2)).await;
+    })
+    .await;
+    let resp = within(
+        Duration::from_secs(2),
+        client().send(
+            &h2_target(addr),
+            Request::get("/").body(empty_body()).unwrap(),
+        ),
+    )
+    .await
+    .unwrap();
+    let mut body = resp.into_body();
+    let first = body.frame().await.unwrap().unwrap();
+    assert_eq!(first.into_data().unwrap(), "part");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(!http_body::Body::is_end_stream(&body));
+    let next = body.frame().await;
+    assert!(matches!(next, Some(Err(_))), "{next:?}");
+}
+
+#[tokio::test]
 async fn early_h1_response_with_unread_upload_severs_the_connection() {
     // The upstream answers right away and never reads the body: once the
     // socket buffers fill, the upload's writes stay pending.
