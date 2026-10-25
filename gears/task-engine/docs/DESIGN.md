@@ -847,6 +847,19 @@ Design:
 - The SDK owns delivery, idempotent-producer dedup, `(topic, broker_partition)` → outbox-partition mapping (per-task ordering via subject), leasing, backoff, retries, dead-lettering, and vacuum. All backend-specific claiming (`SKIP LOCKED` / single-writer) lives inside the SDK / `toolkit-db`, not the Task Engine
 - The gear owns only the producer/outbox lifecycle (build, register, start, stop) per the SDK contract
 
+> **TODO (event-broker-sdk gap — must be resolved before implementation)**: two promises above cannot be kept with today's `event_broker_sdk` producer:
+>
+> 1. **Event ID.** `prepare_event` stamps `id = Uuid::now_v7()` itself (`event-broker-sdk/src/producer/event_factory.rs`), and `TypedEvent` has no way to pass an ID in. The published `id` therefore cannot equal `te_events.id`, which breaks the PRD §5.10 delivery contract ("each event carries the stable event ID from the history") and the consumer-side dedup and history correlation built on it. `ProducerOutbox::enqueue` returns only a `Wake` handle, so the SDK-stamped ID cannot be read back and stored in `te_events` either.
+> 2. **Subject type.** `TypedEvent::SUBJECT_TYPE` is a `const`, so every event struct has one fixed subject type. Task-scoped events would all carry the base `gts.cf.core.tasks.task.v1~` instead of the task's concrete type. Consequences: consumers can no longer learn the task type (the event schemas omit it because they rely on `subject_type`), and broker `subject_type:consume` grants (Event Broker DESIGN §3.3) cannot be narrowed to particular task types.
+>
+> Options:
+>
+> - **(A) Extend the SDK — preferred.** Add two `TypedEvent` methods with backward-compatible defaults: `fn event_id(&self) -> Option<Uuid> { None }` (`None` keeps today's `now_v7()`), and `fn subject_type(&self) -> Cow<'_, str> { Cow::Borrowed(Self::SUBJECT_TYPE) }`. The broker already validates `subject_type` against the type's `allowed_subject_types` (base type covers derived types) and checks `subject_type:produce` at publish, so no broker change is needed. Owner: Event Broker team.
+> - **(B) Carry both values in `data` — interim fallback.** Add a required `event_id` (= `te_events.id`) and `task_type` to every task-scoped event schema. Publish the base `subject_type`. Consumers dedup on `data.event_id`, not on the envelope `id`. Costs: two IDs per event (easy to misuse), and no per-task-type consume authorization.
+> - **(C) Let the SDK ID be the history ID.** `enqueue` returns the stamped ID and the engine writes it into `te_events.id`. The SDK change is the same size as (A) but solves only problem 1.
+>
+> **Suggested path:** (A). If the SDK change slips past the first release, ship (B) and record it as a dated deviation. Either way, update this section, §3.7 `te_events`, the event schemas under [`schemas/types/`](./schemas/types/), and PRD §5.10 (only if (B) changes the consumer dedup rule), then remove this TODO.
+
 ##### Event Consumer (`domain/event_consumer.rs`)
 
 Event **wait conditions** (§3.2 WaitConditionService, §3.6 Event Wait sequence) require the Task Engine to **receive** events from the Event Broker, so the gear runs an inbound consumer alongside the outbound producer. This uses the Event Broker SDK **consumer** runtime (`event_broker_sdk::ConsumerBuilder` + consumer group + offset manager) — the Task Engine does not poll the broker or manage subscriptions by hand.
@@ -1628,7 +1641,7 @@ Latest order value per supersede group (PRD §5.1 Task Supersession). Tenant-sco
 | `owner_tenant_id` | UUID | Inherited from task (Scopable); for engine-scoped events the acting subject's tenant (`configUpdated`: the admin; `workerBlacklisted`: the worker) |
 | `timestamp` | TIMESTAMP | |
 
-`te_events` is the **immutable local audit log** and is **always** written (including `taskCreated`) in the same transaction as the state change that produced the event, regardless of the external event-publishing policy (PRD §5.10). The publishing policy (§4.1 `event_policies`, which may be `none`) governs only whether an event is additionally `enqueue`d to the outbox for external delivery — it never suppresses the local log write. `id` is the stable event ID reused by the outbound `TypedEvent` (§3.2 Event Producer), so at-least-once external delivery is safely deduplicated downstream.
+`te_events` is the **immutable local audit log** and is **always** written (including `taskCreated`) in the same transaction as the state change that produced the event, regardless of the external event-publishing policy (PRD §5.10). The publishing policy (§4.1 `event_policies`, which may be `none`) governs only whether an event is additionally `enqueue`d to the outbox for external delivery — it never suppresses the local log write. `id` is the stable event ID reused by the outbound `TypedEvent` (§3.2 Event Producer), so at-least-once external delivery is safely deduplicated downstream. (Not yet possible with today's SDK, which stamps its own ID — see the TODO in §3.2 Event Producer.)
 
 #### `te_event_inbox`
 
