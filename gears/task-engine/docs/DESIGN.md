@@ -520,7 +520,7 @@ Every transition into a terminal state (`completed`, `failed`, `dead_lettered`, 
 | `queued` / `scheduled` | `blocked` | Unmet predecessor added (dependency API, PRD §5.9) | Delete queue/scheduled timer; queue-depth admission into `tenant_deferred` (may be refused `429`) |
 | `blocked` | `cancelled` | Dependencies unsatisfiable — `ALL`: any predecessor failed; `ANY`: every predecessor failed (`failed`/`cancelled`/`dead_lettered`, PRD §5.9); applied through the cascade mechanism (§4.6 Cascades: inline in the predecessor's terminal transaction up to `cascade_inline_limit`, durably continued beyond it), cascading to own successors | `finalize()`; result code = `dependency_failed` |
 | `queued` | `claimed` | Worker atomic claim | Delete queue timeout; set `session_id` to the worker's session and renew it, lowering the session lease to the task's lease (the task's `heartbeat_timeout` if set, else `default_lease_duration_secs`) if shorter (ADR-0017); set `assignment_deadline = now + assignment_timeout` (if configured). Session expiry, assignment and execution timeouts are enforced by the deadline scans (§3.2 TimerService) |
-| `claimed` | `running` | Worker start | Clear `assignment_deadline`; set `execution_deadline = now + execution_timeout` (if configured; set again on every start, so time spent `waiting` is never counted) |
+| `claimed` | `running` | Worker start | Clear `assignment_deadline`; set `execution_deadline = now + effective execution_timeout` (always set — every task has one, PRD §5.3; set again on every start, so time spent `waiting` is never counted) |
 | `running` (worker, or API consumer); `claimed` / `queued` (API consumer) | `waiting` | Wait condition set (task is **parked**, PRD §5.4) | Admission into `tenant_deferred` (full → `429`, nothing changes); release slots (if leased); clear `lease_token`, `session_id`, `assignee`, `assignment_deadline`, `execution_deadline`; from `queued`: delete queue timeout and decrement the queued backlog; apply optional checkpoint; set wait condition timeout timer (if configured) |
 | `waiting` | `queued` | Condition satisfied, or wait timeout configured to resume | Delete wait timeout; set `resume_pending = true`; set queue timeout; emit `newTask` signal (hand-over, never refused) |
 | `running` | `completed` | Worker completes successfully | `finalize()`; result code = `success` / `warning` |
@@ -704,7 +704,7 @@ Core lifecycle orchestrator. Owns task creation, validation, state transitions, 
 
 Responsibilities:
 - Accept task definitions, validate against GTS registry, generate IDs, persist
-- Resolve type defaults (PRD §5.12 Type defaults resolution) before admission and store the result on the task: queue = request → type `default_queue` → `default`; each timeout field = request → type `timeouts` → queue effective value; retry policy (whole) = request → type `retry_policy` → queue effective value. Later trait or queue changes do not affect existing tasks. A type that declares `dedup.scope = authz_scope` is non-creatable until the ToolKit item below is resolved
+- Resolve type defaults (PRD §5.12 Type defaults resolution) before admission and store the result on the task: queue = request → type `default_queue` → `default`; each timeout field = request → type `timeouts` → queue effective value; the execution timeout then falls back to `default_execution_timeout_secs` if still unset, so **every task has one** (PRD §5.3), and must be ≤ `trust_limits.<global|tenant_owned>.max_execution_timeout_secs` (a request above it → `invalid_argument` `400` naming the setting); retry policy (whole) = request → type `retry_policy` → queue effective value. Later trait or queue changes do not affect existing tasks. A type that declares `dedup.scope = authz_scope` is non-creatable until the ToolKit item below is resolved
   - TODO(toolkit): confirm `AccessScope` exposes a stable serialized form of its compiled constraints (PRD §11 Assumptions, §13 Open Questions); until then `authz_scope` is rejected `invalid_argument`
 - Record `created_by` = `SecurityContext.subject_id` of the create request (server-set, never caller-supplied)
 - Enforce idempotency via the caller-supplied key (REST `Idempotency-Key` header → `idempotency_key`; SDK `CreateTaskRequest.idempotency_key`), unique within `(owner_tenant_id, created_by)`. Missing key → `invalid_argument` with transport override `428`. The create transaction stores a **request fingerprint** with the key (`te_dedup.request_hash`, §3.7): SHA-256 over the canonical JSON (JCS) of the request **as sent** — task type, `queue` (or `null` when the request named none), `input`, and `context`. A replay is compared against this fingerprint, never against the task's current row: `context` changes on every checkpoint, and `queue_id` changes on bulk move and dead-lettering, so comparing with the live task would turn a genuine retry into a `400`. Duplicate key with an equal fingerprint, task in **any** state (live, terminal, or rescued, §4.6 `find_task_any`) → `already_exists` `409` with `context.resource_name` = existing task ID; the SDK surfaces this as `CreateTaskOutcome::Existing(task)`. Same key, **different** fingerprint → `invalid_argument` `400` (field violation on `idempotency_key`). The key is held per the key window (§4.5 Idempotency window)
@@ -784,7 +784,7 @@ Timer persistence: every deadline is stored in the database — as a `te_timers`
 | Heartbeat (lease) | `te_worker_sessions.lease_until` | session open / claim / heartbeat: `now + lease_secs` (`lease_secs` = the shortest effective lease of any task the session held) | **Yes** (one write per session) | session expiry |
 | Hand-off accept window | `te_task_state.handoff_until` | reassignment: `now + lease` | No | on accept, or on leaving `claimed`/`running` |
 | Assignment | `te_task_state.assignment_deadline` | claim: `now + assignment_timeout` (if configured) | No | on `start`, or on leaving `claimed` |
-| Execution | `te_task_state.execution_deadline` | start: `now + execution_timeout` (if configured) | No | on leaving `running` |
+| Execution | `te_task_state.execution_deadline` | start: `now + effective execution_timeout` (always; engine default when no level sets one) | No | on leaving `running` |
 
 Two scans run per background shard (§3.8), each on its own index (§3.7):
 
@@ -1470,7 +1470,7 @@ The task data is split into two tables — **`te_tasks`** (immutable after creat
 | `lease_epoch` | BIGINT | Default 0; `+1` on every claim and every reassignment; never decreases |
 | `bg_slot` | SMALLINT NOT NULL | Background slot `0..1023`, computed once at creation from `task_id` (§3.8 Sharded background loops); never changes |
 | `assignment_deadline` | TIMESTAMP (nullable) | Absolute deadline for the worker to `start` after a claim; set at claim, cleared at start; never extended by heartbeat |
-| `execution_deadline` | TIMESTAMP (nullable) | Absolute deadline for the current claimed run; set at every `start`, cleared on leaving `running`; never extended by heartbeat |
+| `execution_deadline` | TIMESTAMP (nullable) | Absolute deadline for the current claimed run; set at every `start` from the task's effective execution timeout (never `NULL` while `running`), cleared on leaving `running`; never extended by heartbeat. With worker-session leases (ADR-0017) this is what bounds a hung handler in a live worker process |
 | `superseded_by` | UUID (nullable) | Set in the supersession transaction (PRD §5.1 Task Supersession); when set, the terminal `cancelled` transition stamps `result_code = superseded` regardless of the result a `graceful`-mode worker reports, and the `taskCancelled` event carries `superseded_by` |
 | `run_after` | TIMESTAMP (nullable) | Set only in `scheduled`; cleared when the task leaves `scheduled`. Invariant: a task enters `queued` only when `run_after` is `NULL` or has passed (§3.1 transition table), so dispatch never filters on it |
 | `dead_lettered_from` | UUID (nullable) | Set on every transition to `dead_lettered`, which also sets `queue_id` to the queue's DLQ; admin re-enqueue moves the task back to this queue |
@@ -2039,6 +2039,7 @@ gears:
       lease_scan_limit: 1000              # max expired sessions or due tasks handled per shard per scan
       session_requeue_batch: 500          # tasks of one expired session requeued per transaction (ADR-0017)
       default_lease_duration_secs: 30     # lease when the task sets no heartbeat_timeout; a session's lease is the shortest lease of its tasks; workers heartbeat every lease/3
+      default_execution_timeout_secs: 3600  # execution timeout when neither request, type, nor queue sets one; every task has one (PRD §5.3, ADR-0017)
 
       event_producer:                     # event_broker_sdk::DbProducer (feature: outbox); one per task domain
         topic: "gts.cf.core.events.topic.v1~cf.core.tasks.task_events.v1"
@@ -2143,12 +2144,14 @@ gears:
         global:                           # platform-owned types and queues (the only ones that may declare authority.mode = worker)
           max_retries: 100
           max_liveness_requeues: 100      # 0 (unlimited) only together with a lifetime timeout
+          max_execution_timeout_secs: 86400   # cap on any effective execution timeout (request, type, queue, default)
           max_retention_days: 365         # never above retention.hard_retention_days
         tenant_owned:                     # tenant-owned task types
           max_retries: 20
           max_liveness_requeues: 20
           max_retention_days: 100
           allow_progress_events_all: false
+          max_execution_timeout_secs: 3600    # tenant-owned types: tighter cap on the effective execution timeout
 
       children_check_sweep_secs: 1        # safety re-check of parked children wait conditions (§4.6 Cascades)
 

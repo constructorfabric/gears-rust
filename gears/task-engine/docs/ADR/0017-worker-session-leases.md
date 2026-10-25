@@ -64,7 +64,7 @@ How it works:
 ### Consequences
 
 * Heartbeat writes become about `worker processes × domains ÷ heartbeat interval`. Example: 100K running tasks over 2,000 processes at a 10 s interval is about 200 writes/s instead of 10K. A process that runs one task at a time gains nothing, so worker SDKs should run many tasks per process.
-* **Behavior change:** a heartbeat renews every lease of the session. A task stays leased while its worker process is alive, even if its handler hangs. The execution timeout bounds that case. A worker that drops a task must release it.
+* **Behavior change:** a heartbeat renews every lease of the session. A task stays leased while its worker process is alive, even if its handler hangs. The execution timeout bounds that case, so **every task has one**: when neither the request, the type, nor the queue sets it, the engine default (`default_execution_timeout_secs`) applies, and every value is capped by `trust_limits` (PRD §5.3, §5.12). A worker that drops a task must release it.
 * All tasks of one session expire together, which matches how a process actually fails.
 * `te_task_state.lease_until` and `heartbeat_at` are removed. New columns: `session_id` and `handoff_until`.
 * `te_worker_sessions` is small (one row per process and domain) and is reached only with the caller's subject as a predicate (an `unrestricted` table, like `te_worker_blacklist`).
@@ -99,7 +99,7 @@ Tests MUST check that:
 * Good, because writes grow with worker processes, not tasks.
 * Good, because one session expiry is naturally one outage.
 * Good, because fencing is unchanged.
-* Neutral, because a hung handler in a live process keeps its lease until the execution timeout.
+* Neutral, because a hung handler in a live process keeps its lease until the execution timeout, which every task has and which is capped by the trust limits.
 * Bad, because there is one more table and one more scan.
 
 ## More Information

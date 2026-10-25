@@ -45,8 +45,8 @@
       "minimum": 0,
       "maximum": 1000
     },
-    "timeouts": {  // all values are seconds; null = no timeout, except heartbeat (null = default lease)
-      "description": "Default timeout values applied to tasks on this queue when the task itself declares none. All values are in seconds. null/absent means 'no timeout of that kind' for every field except heartbeat_timeout_secs: a claimed task always has a lease, so null there means 'use the engine default lease' (default_lease_duration_secs).",
+    "timeouts": {  // all values are seconds; null = no timeout, except heartbeat (null = default lease) and execution (null = engine default)
+      "description": "Default timeout values applied to tasks on this queue when the task itself declares none. All values are in seconds. null/absent means 'no timeout of that kind' for every field except heartbeat_timeout_secs and execution_timeout_secs: a claimed task always has a lease, so null there means 'use the engine default lease' (default_lease_duration_secs); and every task has an execution timeout, so null there means 'use the engine default' (default_execution_timeout_secs).",
       "type": "object",
       "additionalProperties": false,
       "properties": {
@@ -68,8 +68,8 @@
           "minimum": 1,
           "default": null
         },
-        "execution_timeout_secs": {  // cap on running time per attempt; terminal, never retried
-          "description": "Maximum running time per attempt (execution_deadline, re-armed on each start so time spent waiting is never counted). Terminal, task-attributed, never retried.",
+        "execution_timeout_secs": {  // cap on running time per attempt; terminal, never retried; null = engine default
+          "description": "Maximum running time per attempt (execution_deadline, re-armed on each start so time spent waiting is never counted). Terminal, task-attributed, never retried. Every task has an execution timeout: null/absent here falls through to the next level (task request, then type trait, then queue) and finally to the engine default default_execution_timeout_secs; it never means 'no limit'. Values above the engine trust limit (trust_limits max_execution_timeout_secs, tighter for tenant-owned types) make the type non-creatable or the queue refuse new tasks (PRD cpt-cf-task-engine-fr-timeouts, cpt-cf-task-engine-fr-type-trust).",
           "type": [
             "integer",
             "null"
