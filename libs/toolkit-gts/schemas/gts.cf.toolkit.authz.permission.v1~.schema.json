@@ -1,0 +1,38 @@
+{
+  "$id": "gts://gts.cf.toolkit.authz.permission.v1~",
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "additionalProperties": false,
+  "description": "Gears authorization permission",
+  "properties": {
+    "action": {
+      "description": "Concrete action name (lowercase `snake_case`). No wildcard, no list.\nExamples: `create`, `read`, `list`, `retry_turn`, `upload_attachment`.",
+      "type": "string"
+    },
+    "display_name": {
+      "description": "Human-readable label for admin UIs. Examples: \"Create tenant\",\n\"Retry chat turn\".",
+      "type": "string"
+    },
+    "id": {
+      "allOf": [
+        {
+          "description": "GTS instance identifier",
+          "title": "GTS Instance ID",
+          "type": "string",
+          "x-gts-instance-ref": "gts.*"
+        }
+      ],
+      "description": "Full GTS Instance Identifier of this permission (e.g.\n`gts.cf.toolkit.authz.permission.v1~cf.mini_chat._.chat_read.v1`)."
+    },
+    "resource_type": {
+      "description": "GTS expression identifying the set of resources this permission\napplies to. Accepts concrete IDs, wildcard patterns (GTS §3.5), or\nQuery Language predicates (GTS §3.3).",
+      "type": "string"
+    }
+  },
+  "required": [
+    "id",
+    "resource_type",
+    "action",
+    "display_name"
+  ],
+  "type": "object"
+}
