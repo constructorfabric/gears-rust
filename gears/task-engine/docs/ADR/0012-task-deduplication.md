@@ -68,6 +68,7 @@ How it works:
 ### Confirmation
 
 * Tests check replay, payload mismatch, missing key, and subject isolation for caller keys.
+* Tests check that a replay is compared with the original request (stored as a fingerprint), not with the task's current state: a retry sent after the task checkpointed, was moved, was dead-lettered, or finished still returns `409` with the task ID.
 * Tests check that different scopes never share a derived identity.
 * Tests check that newer, equal, and older order values give supersede, replay, and stale rejection, including after the newer task finished.
 

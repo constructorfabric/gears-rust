@@ -278,7 +278,7 @@ A create request for a task type without a derived dedup identity (below) **MUST
 
 - **Subject-scoped keys**: two subjects using the same key get two independent tasks. One subject can never see, collide with, or block another subject's task through a key.
 - **Replay**: if a task with the same key already exists — in any state, terminal or not — no new task is created and the request returns `409 Conflict` (`already_exists`) with the existing task's ID. The caller treats this as success and reads the task.
-- **Different request, same key**: if the stored task differs in type, queue, input, or context, the request is rejected (`400`, `invalid_argument` on the key).
+- **Different request, same key**: if the request differs in type, queue, input, or context from the request the key was **first accepted with**, it is rejected (`400`, `invalid_argument` on the key). The comparison is with the original request, never with the task's current state, which checkpoints, moves, and dead-lettering change; so a retry sent after the task has progressed is still a replay.
 - **Window**: deduplication lasts as long as the original task is kept (§5.14). After retention removes it, the same key creates a new task.
 
 **Deliberate differences from common practice**: Stripe-style APIs and the IETF `Idempotency-Key` draft make the key optional, answer a replay with the original `201`, and answer a reused key with `422`. This engine differs on purpose, and clients **MUST NOT** assume the common behavior:
@@ -1469,7 +1469,7 @@ The engine does not process personal data of its own, but it stores caller ident
 - [ ] Without the parent's lease or `update`, a caller cannot add a child; without `read`, it cannot name a predecessor; both get the same `404` as a missing task
 - [ ] Cross-domain claims, parent/child links, and dependencies are rejected (`400`)
 - [ ] Cursor paging stays stable while tasks are being added
-- [ ] A duplicate key returns `409` with the existing task (in any state); the same key with a different request returns `400`; a missing key returns `428`
+- [ ] A duplicate key returns `409` with the existing task (in any state, including after it checkpointed, was moved or dead-lettered, or finished); the same key with a request different from the original returns `400`; a missing key returns `428`
 - [ ] Two subjects in one tenant using the same key get two independent tasks; neither receives the other's task
 - [ ] With mode `milestones`, a percent-only update publishes no `taskProgressed` and a stage change publishes exactly one at the next flush; with mode `none`, none are published
 - [ ] Search by resource reference returns exactly the matching tasks in the caller's tenant scope

@@ -703,8 +703,8 @@ Responsibilities:
 - Resolve type defaults (PRD §5.12 Type defaults resolution) before admission and store the result on the task: queue = request → type `default_queue` → `default`; each timeout field = request → type `timeouts` → queue effective value; retry policy (whole) = request → type `retry_policy` → queue effective value. Later trait or queue changes do not affect existing tasks. A type that declares `dedup.scope = authz_scope` is non-creatable until the ToolKit item below is resolved
   - TODO(toolkit): confirm `AccessScope` exposes a stable serialized form of its compiled constraints (PRD §11 Assumptions, §13 Open Questions); until then `authz_scope` is rejected `invalid_argument`
 - Record `created_by` = `SecurityContext.subject_id` of the create request (server-set, never caller-supplied)
-- Enforce idempotency via the caller-supplied key (REST `Idempotency-Key` header → `idempotency_key`; SDK `CreateTaskRequest.idempotency_key`), unique within `(owner_tenant_id, created_by)`. Missing key → `invalid_argument` with transport override `428`. Duplicate key, equal payload (canonical-JSON compare of type/queue/input/context), task in **any** state → `already_exists` `409` with `context.resource_name` = existing task ID; the SDK surfaces this as `CreateTaskOutcome::Existing(task)`. Same key, **different** payload → `invalid_argument` `400` (field violation on `idempotency_key`). Dedup bounded by retention (§4.5)
-- **Derived dedup identity** (types declaring the `dedup` trait): compute the identity from the *validated* input after authorization (§4.6 Task Creation Admission); the `Idempotency-Key` header is not required and, if present, is **ignored** (not stored, not checked; SDKs and gateways attach it automatically). Occupancy lives in `te_dedup` (§3.7); a hit returns `already_exists` `409` + `resource_name`, but only if the caller's `AccessScope` can read the existing task (else `permission_denied` `403`, no identifier)
+- Enforce idempotency via the caller-supplied key (REST `Idempotency-Key` header → `idempotency_key`; SDK `CreateTaskRequest.idempotency_key`), unique within `(owner_tenant_id, created_by)`. Missing key → `invalid_argument` with transport override `428`. The create transaction stores a **request fingerprint** with the key (`te_dedup.request_hash`, §3.7): SHA-256 over the canonical JSON (JCS) of the request **as sent** — task type, `queue` (or `null` when the request named none), `input`, and `context`. A replay is compared against this fingerprint, never against the task's current row: `context` changes on every checkpoint, and `queue_id` changes on bulk move and dead-lettering, so comparing with the live task would turn a genuine retry into a `400`. Duplicate key with an equal fingerprint, task in **any** state (live, terminal, or rescued, §4.6 `find_task_any`) → `already_exists` `409` with `context.resource_name` = existing task ID; the SDK surfaces this as `CreateTaskOutcome::Existing(task)`. Same key, **different** fingerprint → `invalid_argument` `400` (field violation on `idempotency_key`). Dedup bounded by retention (§4.5)
+- **Derived dedup identity** (types declaring the `dedup` trait): compute the identity from the *validated* input after authorization (§4.6 Task Creation Admission); the `Idempotency-Key` header is not required and, if present, is **ignored** (not stored, not checked; SDKs and gateways attach it automatically). Occupancy lives in `te_dedup` (§3.7); a hit returns `already_exists` `409` + `resource_name`, but only if the caller's `AccessScope` can read the existing task, wherever it is stored (live, terminal, or rescued — under `active_or_succeeded` the holder is usually terminal) (else `permission_denied` `403`, no identifier)
 - **Supersession** (types declaring `supersede`): in the create transaction, compare the order value with `te_supersede_heads`; newer → cancel the group's non-terminal task via the cancel path (PDP `cancel` check on that task with the caller's scope first), equal → dedup, older → `failed_precondition` / `STALE_ORDER` (§4.6). Reject `cancellable=false` on these types
 - **Urgency** (PRD §5.2): default `normal`; `critical` needs a PEP check for `expedite` (else `403`)
 - **Queue-depth admission**: reserve capacity on every applicable dimension (`te_queue_backlog` for `queue_global`, `te_tenant_queue_backlog` for `queue_tenant` / `tenant_deferred`) in the same transaction as the insert; full → `resource_exhausted` `429` (`QUEUE_DEPTH_LIMIT`) (§4.6)
@@ -1098,7 +1098,7 @@ Mapping of Task-Engine failure conditions to canonical categories (`gts.cf.core.
 | Accept by anyone but the new assignee, or nothing to accept | `not_found` | 404 |
 | Urgency `critical` requested without the `expedite` action | `permission_denied` | 403 |
 | Idempotent create, duplicate key with equal payload (replay) | `already_exists` (`resource_name` = existing task ID) | 409 |
-| Idempotent create, same key + different payload | `invalid_argument` (field violation on `idempotency_key`) | 400 |
+| Idempotent create, same key + different request (fingerprint over type, queue as sent, input, context as sent differs from `te_dedup.request_hash`) | `invalid_argument` (field violation on `idempotency_key`) | 400 |
 | Idempotent create without `Idempotency-Key` | `invalid_argument` (transport override → 428) | 428 |
 | Concurrent-claim race / lost guarded update | `aborted` | 409 |
 | Payload-changing write lost the optimistic `revision` guard to a concurrent payload write on the same task (`context.reason = "CONCURRENT_MODIFICATION"`; stored payload unchanged, caller may retry) | `aborted` | 409 |
@@ -1526,7 +1526,8 @@ Occupied creation identities: derived dedup identities (PRD §5.1 Derived Dedup 
 |---|---|---|
 | `owner_tenant_id` | UUID | Part of PK; also folded into the identity hash |
 | `dedup_key` | BINARY(32) | SHA-256 identity (§4.6) |
-| `task_id` | UUID | Holder |
+| `task_id` | UUID | Holder (UUID v7, so its creation time — and therefore its history partition — is known without a lookup) |
+| `request_hash` | BINARY(32) (nullable) | Caller keys only: request fingerprint, `sha256(jcs({type, queue_as_sent, input, context_as_sent}))` (§3.2 TaskService). Replays are compared against it, never against the task's current, mutable state. `NULL` for derived identities, where fields outside `key_fields` are not compared (PRD §5.1) |
 | `window` | TINYINT | `active` / `active_or_succeeded` (snapshot of the type's `window` policy), or `retention` for caller idempotency keys |
 | `created_at` | TIMESTAMP | Holder's creation time, for retention |
 
@@ -2211,6 +2212,9 @@ if type.dedup:
   else: dedup_key = group_key
 else:
   dedup_key = sha256(len-prefixed(["idempotency-key", created_by, Idempotency-Key]))   # 428 if missing; window = retention
+  # Fingerprint of the request AS SENT (not of resolved defaults, not of the task's later state):
+  request_hash = sha256(jcs({type: request.type, queue: request.queue or null,
+                             input: request.input, context: request.context or null}))
 
 BEGIN
   # 1b. Link authorization (PRD §5.9). Every failure → the same 404, never 403.
@@ -2240,11 +2244,22 @@ BEGIN
   # 3. Dedup / idempotency (uniqueness via the te_dedup PK, for derived identities and caller keys alike).
   # Use INSERT … ON CONFLICT DO NOTHING (SeaORM on_conflict().do_nothing(); MariaDB/SQLite equivalents),
   # never a bare INSERT: on PostgreSQL a unique violation aborts the whole transaction.
-  r = INSERT te_dedup (owner_tenant_id, dedup_key, task_id) ON CONFLICT DO NOTHING
+  r = INSERT te_dedup (owner_tenant_id, dedup_key, task_id, request_hash /* NULL for derived */) ON CONFLICT DO NOTHING
   if r.rows_affected == 0:                                                # identity already held
-      holder = TaskState::find(existing.task_id).secure().scope_with(scope)
-      ROLLBACK; return 409 already_exists(holder.id)  or 403 if not readable   # head and cancels roll back too
-      # caller key: 400 invalid_argument instead if holder's type/queue/input/context differ (canonical JSON)
+      existing = TeDedup::find(owner_tenant_id, dedup_key).secure().scope_with(scope.tenant_only())
+      ROLLBACK                                                            # head and cancels roll back too
+      # Caller key: compare with the ORIGINAL request, never with the holder's current row —
+      # context changes on checkpoint, queue_id on bulk move / dead-lettering.
+      if not type.dedup and existing.request_hash != request_hash:
+          return 400 invalid_argument (field violation on idempotency_key)  # caller's own key: no disclosure
+      holder = find_task_any(existing.task_id, scope)                     # live, terminal, or rescued (below)
+      return 409 already_exists(holder.id) if holder else 403 permission_denied (no identifier)
+
+find_task_any(task_id, scope):                                            # holder may be in ANY state (PRD §5.1)
+  # task_id is UUID v7 → its creation time selects the history partition (§3.7), so each probe is a PK read.
+  return TaskState::find(task_id).secure().scope_with(scope)              # non-terminal
+      or TaskResult::find(task_id, created_at_of(task_id)).secure().scope_with(scope)   # terminal
+      or TaskResultRetained::find(task_id).secure().scope_with(scope)     # rescued before a partition drop (ADR-0009)
 
   # 3b. Record the group's newest task (every admission, including an equal-order recreate after the
   #     previous holder failed — otherwise a later supersede would target the dead task, not the live one)
