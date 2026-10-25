@@ -1558,8 +1558,11 @@ Safety net: the database may still report a deadlock that this ordering does not
 **The configured limit is a hard upper bound, not an approximation** (this reconciles the "no more than the configured N" acceptance criterion, PRD §9, with the sharding and drift-reconciliation mechanisms below):
 
 - **Safety (never exceed N).** The guarded `used < limit_value` predicate is evaluated atomically inside the reservation `UPDATE`; a claim can only proceed if it observes free capacity, so concurrent claims can never collectively push `used` past `limit_value`. The cap is therefore an exact upper bound at all times, on all backends.
+
 - **Sharding preserves the upper bound.** With `S = effective_shards > 1` (§3.7 Hot-row rules, ADR-0008 hot-row sharding), the configured limit `N` is partitioned into `S` per-shard sub-limits whose **sum is ≤ N** (the remainder `N mod S` is distributed so no rounding pushes the total above `N`). Because a claim reserves against exactly one shard, the cluster-wide maximum concurrent tasks is `Σ per_shard_limit ≤ N`. Sharding trades perfectly-even utilisation (a shard may reject while another has spare capacity, so effective concurrency can dip **below** `N`) for reduced hot-row contention — it never admits **more** than `N`.
+
 - **Shards are recorded, never guessed.** A reservation on a sharded row stores the shard it took on the task (`te_task_state.queue_slot_shard`, `type_slot_shard`, `backlog_shard`), and every release decrements exactly that shard with `used = used − 1 WHERE … AND used > 0`. So each shard's `used` equals the number of live tasks holding it, and a release can never drive another shard negative or let it admit beyond its sub-limit.
+
 - **Drift comes only from bugs or manual edits.** Every counter change shares a transaction with the state change it accounts for, so `used` equals the true count except after a defect. Drift may go either way; an upward drift makes the limiter stricter, a downward one would make it laxer.
 
 **ID**: `cpt-cf-task-engine-design-counter-reconciliation`
@@ -1617,8 +1620,11 @@ Queue-depth counters (PRD §5.2), with the same mechanism and scope split as the
 **Hot-row rules** (apply to all counter tables, including `te_tenant_wait_counters`):
 
 1. **Unlimited means untouched.** A dimension whose effective limit is `0` has **no counter row** and is skipped on the create/claim/release path entirely. When a runtime config change sets a non-zero limit, the maintenance job (§3.2 RetentionService step 5) creates the row(s) from a recount before enforcement starts; setting a limit back to `0` deletes them.
+
 2. **`domain_global` is a sampled ceiling, not a transactional counter.** It would otherwise be one row updated by every create and claim in the domain. Instead the maintenance leader samples the domain's `queued` count every `queue_depth.domain_sample_secs` (default 5 s, an index-only count on `te_task_state`) into an in-memory gauge shared via `te_runtime_config`; creation is refused `429` `QUEUE_DEPTH_LIMIT` (dimension `domain_global`) while the latest sample is ≥ the limit. Overshoot is bounded by one sampling interval of admissions — acceptable for a last-line safety ceiling.
+
 3. **Wide scopes are sharded by default.** `queue_global` backlog rows and `queue_global` / `type_global` concurrency rows use `effective_shards = min(counter_shards, max(1, limit / 32))` (`counter_shards` default 8). Large limits spread across shards; small limits stay on one row so they are not fragmented into unusable per-shard slices. A claim reads all shards of a scope (plain read), picks one at random among those with room, and then locks only that one; it reports the dimension full only when no shard had room, so sharding never refuses while capacity exists elsewhere (§4.6 Task Assignment). Single-task admissions keep the guarded `+1` on a random shard and try the remaining shards on refusal. The shard taken is stored on the task row and released exactly (§3.7 Counter reconciliation).
+
 4. Per-tenant dimensions (`queue_tenant`, `type_tenant`, `tenant_deferred`) are naturally spread across tenants and stay unsharded.
 
 **Scoping**: as for the concurrency counters (§2.1). Introspection shows only what the caller's scope permits.
