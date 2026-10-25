@@ -55,9 +55,9 @@ We must decide how callers express payload conditions and how the engine evaluat
 
 Chosen option: **Option 4 — CEL with creation-time validation and evaluation limits.**
 
-An event wait condition stores `event_type`, optional `event_subject_id` and `event_subject_type`, and an optional CEL `match_expression`. The expression is parsed and checked when the wait is created, with the workspace `cel-core` parser and checker; an invalid or over-complex expression is rejected with `invalid_argument`. Size and complexity are bounded by expression length (4 KiB, the Event Broker filter limit), AST node count, and AST depth.
+An event wait condition stores `event_type`, an optional `event_subject_id`, an effective `event_subject_type` (explicit, or the event type's single allowed subject type), the `event_consume_filter` kept from the caller's set-time `consume` checks (DESIGN §3.2 *Event wait authorization*), and an optional CEL `match_expression`. The expression is parsed and checked when the wait is created, with the workspace `cel-core` parser and checker; an invalid or over-complex expression is rejected with `invalid_argument`. Size and complexity are bounded by expression length (4 KiB, the Event Broker filter limit), AST node count, and AST depth.
 
-When an event arrives, the consumer selects pending event waits by `event_type`, keeps only those whose `owner_tenant_id` equals the event tenant, applies the subject filters, and evaluates the expression last.
+When an event arrives, the consumer selects pending event waits by `event_type`, keeps only those whose `owner_tenant_id` equals the event tenant, applies the subject filters and the consume filter, and evaluates the expression last. The expression therefore only ever sees the `data` of events the caller could consume through its own broker subscription, so a match reveals nothing beyond the caller's rights.
 
 **Evaluation budget.** Each evaluation runs under a fixed cost budget (`cel.max_eval_cost`), charged per node and per byte copied and enforced from **inside** the evaluator, as the workspace `quota-enforcement-engine-cel` runtime does. A wall-clock timeout is not used: it cannot preempt a synchronous evaluation, so it would bound nothing.
 

@@ -63,7 +63,7 @@ Resolution (timer fire, matching event, input resolve, last child reaching a ter
 * A waiting task releases its concurrency slot and holds no lease.
 * A waiting task counts against its tenant's deferred limit (PRD §5.2 Queue Depth Limits), so parking is an admission that may be refused with `429`; resuming never is. Otherwise parking would free queue capacity without bound.
 * Wait condition rows are live-only: they are deleted in the task's terminal transaction, and the wait history stays in the task's event log (ADR-0009).
-* Event waits use one static subscription over operator-listed waitable topics. Setting one requires the caller's own `consume` right, and only the matched event's header is stored (DESIGN §3.2).
+* Event waits use one static subscription over operator-listed waitable topics. Setting or arming one runs the Event Broker's subscribe checks with the caller's own context (`consume` on the topic, the event type, and the condition's subject type, which is always known); PDP constraints are applied to every candidate event, and constraints the engine cannot apply refuse the wait. Each event condition's timeout is capped, so the set-time checks expire. Only the matched event's header is stored (DESIGN §3.2).
 * Pending event conditions are limited per tenant, per tenant and event type, and per tenant and event type without a subject, because one consumer serves every tenant (ADR-0007).
 * Each kind has its own validation, indexes, and timeout handling.
 * No event is missed when the worker arms the wait before it acts.
@@ -78,7 +78,8 @@ Tests MUST check that:
 * `any` groups cancel remaining siblings and `all` groups wait for every member;
 * a group timeout applies `on_timeout` correctly;
 * a duplicate event does not satisfy a wait twice, even across task domains;
-* a caller without `consume` on the event type cannot set an event wait;
+* a caller without `consume` on the topic, the event type, or the subject type cannot set or arm an event wait; constraints returned by the PDP keep events outside them from matching, and unenforceable constraints refuse the wait;
+* an event condition never waits longer than `event_waits.max_wait_secs`;
 * pending waits survive a restart;
 * an event published after an arm call returns satisfies the armed condition, and park then returns it without parking the task;
 * a children condition is satisfied once, after the last child reaches a terminal state, with the per-state counts.
