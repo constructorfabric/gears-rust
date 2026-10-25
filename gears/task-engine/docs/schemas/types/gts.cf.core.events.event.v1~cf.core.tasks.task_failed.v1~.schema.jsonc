@@ -75,9 +75,9 @@
               ]
             },
             "attempt": {
-              "description": "Attempt on which the task failed.",
+              "description": "Attempt on which the task failed. 0 when the task failed before its first claim (queue timeout, or lifetime timeout while scheduled, blocked, or queued).",
               "type": "integer",
-              "minimum": 1
+              "minimum": 0
             },
             "error": {
               "description": "Terminal error classification. Only the machine-readable fields are published. The error `message` and `context` are free text that may echo payload data, so they are never sent to the Event Broker; read them from the task via the API.",
