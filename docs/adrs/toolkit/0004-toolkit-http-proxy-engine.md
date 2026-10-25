@@ -155,16 +155,18 @@ Every `rustls::ClientConfig` comes from `toolkit_http::{native,webpki,custom}_ro
 * HTTP/2 Bomb: CVE-2026-49975 (HAProxy, NGINX, Apache, Envoy, IIS and Pingora reports).
 * RustSec: RUSTSEC-2026-0258 (h2 empty DATA), RUSTSEC-2024-0332 (CONTINUATION flood).
 * J. Kettle, "HTTP/1.1 must die: the desync endgame", Black Hat USA 2025.
-* Benchmark: `cargo bench -p cf-gears-oagw --bench proxy_roundtrip` (full OAGW pipeline, local upstreams, Windows 11, 2000 sequential requests for latency, 64 concurrent clients for 3 s for throughput):
+* Benchmark: `cargo bench -p cf-gears-oagw --bench proxy_roundtrip` (full OAGW pipeline, local upstreams, Windows 11, 2000 sequential requests for latency, 64 concurrent clients for 3 s for throughput). Engine numbers are the median of three runs of the final code:
 
   | Scenario | p50 Pingora → engine | p99 Pingora → engine | c64 req/s Pingora → engine |
   |---|---|---|---|
-  | HTTP/1.1, 1 KiB response | 287 → 75 µs | 469 → 201 µs | 18.5k → 87.4k |
-  | HTTP/1.1, 256 KiB response | 518 → 168 µs | 1.2 ms → 399 µs | 10.2k → 33.2k |
-  | HTTP/1.1, 64 KiB upload | 343 → 119 µs | 1.1 ms → 264 µs | 12.9k → 67.8k |
-  | HTTP/2 + TLS, 1 KiB response | 193 → 91 µs | 374 → 239 µs | 56.4k → 162.3k |
-  | HTTP/2 + TLS, 256 KiB response | 346 → 367 µs | 708 → 640 µs | 15.8k → 17.3k |
-  | HTTP/2 + TLS, 64 KiB upload | 218 → 194 µs | 545 → 368 µs | 19.7k → 56.5k |
+  | HTTP/1.1, 1 KiB response | 287 → 69 µs | 469 → 177 µs | 18.5k → 69.9k |
+  | HTTP/1.1, 256 KiB response | 518 → 163 µs | 1.2 → 5.3 ms | 10.2k → 30.2k |
+  | HTTP/1.1, 64 KiB upload | 343 → 93 µs | 1.1 ms → 209 µs | 12.9k → 59.2k |
+  | HTTP/2 + TLS, 1 KiB response | 193 → 92 µs | 374 → 229 µs | 56.4k → 167.4k |
+  | HTTP/2 + TLS, 256 KiB response | 346 → 381 µs | 708 → 806 µs | 15.8k → 17.6k |
+  | HTTP/2 + TLS, 64 KiB upload | 218 → 171 µs | 545 → 371 µs | 19.7k → 57.8k |
+
+  Throughput varies by about ±10% between runs on this machine. The p99 of the 256 KiB HTTP/1.1 case is unstable: 2.3 to 5.3 ms across the three runs, and 2.8 to 9.3 ms for an earlier engine build measured in the same session, so it is not caused by the final changes. In the same session, HTTP/1.1 throughput for the 1 KiB and upload cases was about 10% lower than that earlier build; the cause is not known yet.
 
 ## Traceability
 
