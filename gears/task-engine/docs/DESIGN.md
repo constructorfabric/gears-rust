@@ -105,7 +105,7 @@ Per [ADR/0001-pluggable-execution-backends.md](ADR/0001-pluggable-execution-back
 - `cpt-cf-task-engine-adr-blob-compression` — Transparent JSON blob compression for storage efficiency using zstd behind a magic prefix and codec byte. See [ADR/0006-blob-compression.md](ADR/0006-blob-compression.md).
 - `cpt-cf-task-engine-adr-event-wait-matching` — CEL-based match expression evaluation for event wait conditions with creation-time checks, a cost budget enforced inside the evaluator, per-tenant condition limits, and a defined outcome for budget failures. See [ADR/0007-event-wait-matching.md](ADR/0007-event-wait-matching.md).
 - `cpt-cf-task-engine-adr-atomic-claim-strategy` — **Proposed** (until the ToolKit secure claim primitive exists and the benchmark passes) — claims run through `toolkit_db::secure::claim`: plain scoped candidate streams with a k-way merge, guarded slot reservation **before** any task write, guarded state transition, settle; batch claims and node-local coalescing in the gear; counters before task rows as the engine-wide lock order; no `SKIP LOCKED` and no dialect SQL in the Task Engine. See [ADR/0008-atomic-claim-strategy.md](ADR/0008-atomic-claim-strategy.md).
-- `cpt-cf-task-engine-adr-retention-partitioning` — Unpartitioned live tables; history (including tags and resource references) partitioned by task creation time; no DB foreign keys; retention from terminal time; rescue-then-drop; SQLite `DELETE` fallback. See [ADR/0009-retention-partitioning.md](ADR/0009-retention-partitioning.md).
+- `cpt-cf-task-engine-adr-retention-partitioning` — Unpartitioned live tables; history (including tags and resource references) in a fixed ring of `N` list partitions keyed by a time-bucket `ring_slot`; no DB foreign keys; retention from terminal time; rescue-then-truncate of the oldest slot, no runtime partition DDL; SQLite `DELETE` fallback. See [ADR/0009-retention-partitioning.md](ADR/0009-retention-partitioning.md).
 - `cpt-cf-task-engine-adr-task-domains` — Route each queue to one configured database with a config-order first-match rule; a task lives in its queue's domain; optional type rules are checked at create time; dead-letter queues are not routed; atomic operations (claim, dependencies, parent/child) stay inside one domain. See [ADR/0010-task-domains.md](ADR/0010-task-domains.md).
 - `cpt-cf-task-engine-adr-lease-fencing` — Every worker write carries a random per-lease token bound to the holder's subject; reassignment hands over no token; a lease epoch lets workers fence external systems. See [ADR/0011-lease-fencing.md](ADR/0011-lease-fencing.md).
 - `cpt-cf-task-engine-adr-task-deduplication` — Required caller idempotency key scoped to tenant and subject, or a type-declared engine identity, with optional supersession by a newer order value. See [ADR/0012-task-deduplication.md](ADR/0012-task-deduplication.md).
@@ -822,27 +822,28 @@ Responsibilities:
 
 Background cleanup. Runs as a `WithLifecycle` stateful task with `CancellationToken`.
 
-On the PostgreSQL/MySQL production profile, retention is realized primarily by **dropping whole history partitions** rather than row deletion, on the live / history layout of §3.7 (live non-terminal tasks are never in a partition). See [ADR/0009-retention-partitioning.md](ADR/0009-retention-partitioning.md).
+On the PostgreSQL/MySQL production profile, retention is realized primarily by **truncating one slot of a fixed partition ring** rather than by row deletion, on the live / history layout of §3.7 (live non-terminal tasks are never in the ring). See [ADR/0009-retention-partitioning.md](ADR/0009-retention-partitioning.md). The loop follows the Event Broker retention worker's model: a paced tick computes the bounds and runs bounded, idempotent passes; a failed pass removes nothing and the next tick repeats it; each sweep reports what it removed (`te_retention_*` metrics).
 
 **Retention clock**: a task's data expires at `terminal_at + effective_retention` (tenant policy → most-specific config type pattern → type `retention_days` trait → global default, PRD §5.14). Non-terminal tasks never expire by retention; they are bounded only by their lifetime timeout and by `hard_retention_days`.
 
-**Drop horizon** (`drop_horizon_days`, default = `global_retention_days`): the age, measured on the task creation time of the partition range, after which a history partition is dropped. It is deliberately the **common** retention, not the longest one, so one long policy can never block dropping for the whole domain.
+**Ring geometry** (fixed at installation, §4.1 `retention.ring`): `bucket_days` `W` (default 7) and `ring_slots` `N = ⌈drop_horizon_days / W⌉ + 2` (default 17). Every history row stores `ring_slot = ⌊days_since_epoch(task_created_at) / W⌋ mod N`. The drop horizon (`drop_horizon_days`, default = `global_retention_days`) is deliberately the **common** retention, not the longest one, so one long policy can never block recycling for the whole domain. Changing `W` or `N` is a schema migration that builds a new ring.
 
-Maintenance sequence (per domain):
-1. **Provision ahead**: ensure future history partitions exist before data lands in them.
+Maintenance sequence (per domain), during bucket `c`, for slot `s = (c + 1) mod N` holding bucket `B = c + 1 − N` (its newest rows are at least `(N − 2) × W ≥ drop_horizon_days` old):
+1. **Mark**: set `s` to `recycling` for bucket `B` in `te_ring_state` (§3.7). From then on every write for a task of bucket `B` goes to the `_retained` tables. Wait at least `runtime_config_poll_secs` plus the longest transaction time, so no node or in-flight transaction still writes into `s`.
 2. **Hard limit**: force-cancel non-terminal tasks older than `hard_retention_days` through `finalize()` with `forcibly_cancelled` (§4.6 Terminal Transition), in bounded batches; they then become terminal history like any other.
-3. **Rescue, then drop**: all partitioned tables (§3.7 Live / history split) share one layout. For each partition range older than `drop_horizon_days`, copy into `te_*_retained` (batched, idempotent) every row of a task that must outlive it:
+3. **Rescue**: copy into `te_*_retained` (batched, idempotent) every row in slot `s` of a task that must outlive it:
    - the task is still **non-terminal**; or
    - the task is terminal and `terminal_at + effective_retention > now` — late completions, longer type policies, and **tenant legal holds**.
-   Then `DROP` the range in every partitioned table. The rescued set is small (long-lived tasks and long-retention tenants/types). Live-only tables need no step here.
-4. **Expire leftovers**: bounded `DELETE` of expired `_retained` rows, of rows under policies **shorter** than the drop horizon, of `te_dedup` rows with `expires_at < now` (§3.7 `te_dedup`), and of `te_supersede_heads` rows of removed tasks (by `created_at` range, minus rescued IDs). These are the only row deletes, on narrow rows at the create rate.
-5. Capacity reconciliation: read the latest runtime configuration version, update the local concurrency and queue-depth limits for this domain in one transaction, save the applied version number, and retry if this step fails. Then reconcile `used` in the five counter tables with the lock-then-count procedure (§3.7 Counter reconciliation) and report orphan rows (`te_orphan_rows_total`; there are no DB foreign keys)
+   The rescued set is small (long-lived tasks and long-retention tenants/types). Live-only tables need no step here.
+4. **Truncate** slot `s` in every history table through the ToolKit helper `truncate_partition(table, slot)` (TODO(toolkit); PostgreSQL `TRUNCATE` of the partition, MySQL `ALTER TABLE … TRUNCATE PARTITION`), with a short lock timeout and retry. Then set `s` free for bucket `B + N`.
+5. **Expire leftovers**: bounded `DELETE` of expired `_retained` rows, of rows under policies **shorter** than the drop horizon (by `ring_slot` and `terminal_at`), of `te_dedup` rows with `expires_at < now` (§3.7 `te_dedup`), and of `te_supersede_heads` rows of removed tasks (by `latest_created_at`, minus rescued IDs). These are the only row deletes, on narrow rows at the create rate.
+6. Capacity reconciliation: read the latest runtime configuration version, update the local concurrency and queue-depth limits for this domain in one transaction, save the applied version number, and retry if this step fails. Then reconcile `used` in the five counter tables with the lock-then-count procedure (§3.7 Counter reconciliation) and report orphan rows (`te_orphan_rows_total`; there are no DB foreign keys)
 
-Outbox row pruning is handled by the Event Broker SDK producer / `toolkit_db::outbox` vacuum stage, not the Retention Service. All Retention Service loops run under the advisory-lock leader (§3.8) so only one instance performs maintenance.
+There is no partition provisioning and no runtime `CREATE` / `DROP PARTITION`: the `N` partitions per history table are created once by the migrations. Outbox row pruning is handled by the Event Broker SDK producer / `toolkit_db::outbox` vacuum stage, not the Retention Service. All Retention Service loops run under the advisory-lock leader (§3.8) so only one instance performs maintenance.
 
-**Legal hold at scale**: if a tenant or type with a long policy produces a large share of the data, rescuing it on every drop becomes expensive. Such workloads **SHOULD** be routed to their own task domain (§3.8) whose `drop_horizon_days` equals that policy, so the rescue set stays near-empty everywhere.
+**Legal hold at scale**: if a tenant or type with a long policy produces a large share of the data, rescuing it on every recycle becomes expensive. Such workloads **SHOULD** be routed to their own task domain (§3.8) whose ring is sized for that policy, so the rescue set stays near-empty everywhere.
 
-On SQLite (dev/test/low-volume) partitioning is unavailable, so retention falls back to batched `DELETE` of expired terminal tasks (same `terminal_at`-based clock), entries, events, tags, resource references, and identity rows. Each step runs in a loop with configurable batch size and retry logic.
+On SQLite (dev/test/low-volume) partitioning is unavailable: the same tables are unpartitioned with `ring_slot` indexed, and step 4 is a bounded `DELETE … WHERE ring_slot = s` (the Event Broker backend's bounded-pass pattern). Each step runs in a loop with configurable batch size and retry logic.
 
 **Priority aging** (PRD §5.2 `fr-priority-aging`): when `priority_aging.enabled`, a singleton maintenance loop (under the `te-maintenance` leader, §3.8) periodically raises the effective `priority` of `queued` tasks whose queued age exceeds `threshold_minutes`, by `boost_amount` per pass, bounded to the highest priority. It writes `te_task_state.priority` in a bounded guarded batch per tick and emits no event. Priority is tenant-local, so aging never passes another tenant's work; it never changes `urgency_code`. Disabled by default (`enabled: false`).
 
@@ -1203,7 +1204,7 @@ Mapping of Task-Engine failure conditions to canonical categories (`gts.cf.core.
 | Dependency | Crate | Purpose |
 |---|---|---|
 | ToolKit framework | `cf-gears-toolkit` | OperationBuilder, SecureConn, SecurityContext, AccessScope, Scopable, pep_properties, ClientHub, RFC 9457 canonical errors, WithLifecycle, CancellationToken |
-| ToolKit DB | `cf-gears-toolkit-db` | DbManager, SecureConn, SeaORM integration, connection pooling, migrations, `outbox` (transactional event delivery), `advisory_locks` (leader election), `secure::claim` (claim primitive, ADR-0008, TODO(toolkit)), `contention` (retry classification) |
+| ToolKit DB | `cf-gears-toolkit-db` | DbManager, SecureConn, SeaORM integration, connection pooling, migrations, `outbox` (transactional event delivery), `advisory_locks` (leader election), `secure::claim` (claim primitive, ADR-0008, TODO(toolkit)), `contention` (retry classification), fixed partition ring helpers (ADR-0009, TODO(toolkit)) |
 | ToolKit OData macros | `toolkit-odata-macros` | ODataFilterable derive for search entities |
 | ToolKit domain macros | `toolkit-macros` | `#[domain_model]` enforcement |
 | Event Broker SDK | `cf-gears-event-broker-sdk` (`outbox`, `db` features) | Producer: `EventBrokerApi`, `DbProducer`, `ProducerOutboxQueue`, `TypedEvent`, `ProducerIdentity`, `DbDeduplication`/`ProducerMode` — managed outbox event delivery (§3.2 Event Producer). Consumer: `ConsumerBuilder`, `TxConsumerHandler`, `LocalDbOffsetManager`, `ConsumerHandle` — inbound event delivery for event wait conditions (§3.2 Event Consumer) |
@@ -1381,23 +1382,25 @@ The task data is split into two tables — **`te_tasks`** (immutable after creat
 
 **ID**: `cpt-cf-task-engine-design-live-history-split`
 
-**Live / history split (retention-safe storage layout)**: partitioning is applied only to append-only history, never to the hot dispatch set, and a partition is only ever dropped when nothing in it is still needed.
+**Live / history split (retention-safe storage layout)**: partitioning is applied only to append-only history, never to the hot dispatch set. History lives in a **fixed ring of `N` list partitions** keyed by `ring_slot` (ADR-0009), and a slot is only ever truncated after everything in it that is still needed was rescued.
 
 | Table | Holds | Partitioned? | Why |
 |---|---|---|---|
 | `te_task_state` | **Non-terminal tasks only** (the live set, ≤ ~100K rows at the §6.1 profile) | **No** | Claim heads and deadline scans hit one small table with global indexes; no per-partition fan-out on the hot path (heartbeats write `te_worker_sessions`, ADR-0017) |
-| `te_task_results` | Final mutable state of **terminal** tasks (state, result, output, error, lease token for completion replay, `terminal_at`) | By **task creation time** | Written once, at the terminal transition |
-| `te_tasks`, `te_events`, `te_task_entries` | Immutable task data and history | By **task creation time** | Append-only |
-| `te_tags`, `te_resource_refs` | Search attributes, kept for the task's whole retention | By **task creation time** | Dropped with the task's partition, not row by row |
+| `te_task_results` | Final mutable state of **terminal** tasks (state, result, output, error, lease token for completion replay, `terminal_at`) | Ring (`ring_slot`) | Written once, at the terminal transition |
+| `te_tasks`, `te_events`, `te_task_entries` | Immutable task data and history | Ring (`ring_slot`) | Append-only |
+| `te_tags`, `te_resource_refs` | Search attributes, kept for the task's whole retention | Ring (`ring_slot`) | Truncated with the task's slot, not row by row |
 | `te_wait_conditions`, `te_dependencies`, `te_timers` | **Live-only** rows of non-terminal tasks (for dependencies: the successor) | **No** | Deleted at the terminal transition, so they stay as small as the live set; history is in `te_events` and `te_task_results.predecessors` |
-| `te_*_retained` (one per partitioned table, same columns) | Rows **rescued** from a partition before it is dropped (see RetentionService) | **No** | Holds the rare rows that must outlive their partition |
+| `te_*_retained` (one per ring table, same columns) | Rows **rescued** from a slot before it is truncated, and new rows of **retained** tasks (see RetentionService) | **No** | Holds the rare rows that must outlive their slot |
+| `te_ring_state` | One row per slot: `ring_slot`, `bucket`, `status` (`active` / `recycling` / `free`), `changed_at` | **No** | Tells every node which buckets are retained, so no write lands in a slot being recycled |
 | `te_dedup`, `te_supersede_heads` | Creation identities | **No** | Primary key must be globally unique; narrow rows deleted in batches |
 
 - **Terminal transition** (worker complete/fail, cancel, timeout, dead-letter): in one transaction, move the row from `te_task_state` to `te_task_results` (copying the predecessor list into `predecessors`) and delete the task's live-only rows. A `cascade` timer created in that transaction stays until its cascade ends (§4.6 Cascades). Admin re-enqueue moves the state row back but does not restore dependencies. Idempotent completion replay (§3.2 TaskService) reads `te_task_results`.
-- **Partition key = task creation time, derived from the task's UUID v7 id**, for every partitioned table above. All rows of one task land in one partition, and a lookup by `task_id` prunes to it. Engine-scoped events with no task (`configUpdated`, `workerBlacklisted`) use their own event id timestamp.
+- **Partition key = `ring_slot SMALLINT NOT NULL`** = `⌊days_since_epoch(task_created_at) / bucket_days⌋ mod ring_slots`, computed once in Rust from the task's UUID v7 id, for every ring table above (PostgreSQL / MySQL `PARTITION BY LIST (ring_slot)`, exactly `ring_slots` partitions created by the migrations through a ToolKit helper, TODO(toolkit)). All rows of one task land in one slot, a lookup by `task_id` filters `ring_slot = slot_of(id)`, and a `created_at` window filters `ring_slot IN (slots covering it)`. Engine-scoped events with no task (`configUpdated`, `workerBlacklisted`) use their own event id timestamp.
+- **Retained tasks**: a task whose bucket's slot is `recycling` or was recycled (`te_ring_state`, cached per node and re-read every `runtime_config_poll_secs`) is **retained**: its reads and all its new rows (events, entries, tag changes, terminal result) use the `te_*_retained` tables, never the ring.
 - **No database foreign keys between task tables** (ADR-0009): PostgreSQL needs the partition key in a foreign key to a partitioned table, MySQL does not support them at all, and rescue moves rows to `_retained` tables. Rows that refer to a task are written and removed in that task's transactions; reconciliation reports orphans (`te_orphan_rows_total`).
-- **Reads** of a task: `te_task_state` (live) or `te_task_results` (terminal), joined with `te_tasks`; history/entries read the partitioned table `UNION ALL` its `_retained` table (the retained side is small and indexed by `task_id`).
-- **SQLite**: no partitioning; the same tables exist unpartitioned, the `_retained` tables are unused, and retention is a bounded `DELETE` (§3.2 RetentionService).
+- **Reads** of a task: `te_task_state` (live) or `te_task_results` (terminal), joined with `te_tasks`, from the ring or, for a retained task, from the `_retained` tables; history/entries read the ring table `UNION ALL` its `_retained` table (the retained side is small and indexed by `task_id`).
+- **SQLite**: no partitioning; the same tables exist unpartitioned with `ring_slot` indexed, and recycling a slot is a bounded `DELETE … WHERE ring_slot = ?` after the same rescue (§3.2 RetentionService).
 
 **Authoritative home for mutable dispatch columns**: `urgency_code`, `priority`, and `queue_id` are **mutable** — priority aging and `/tasks/bulk/reprioritize` change them, and `/tasks/bulk/move` changes the queue. Their authoritative copy therefore lives in **`te_task_state`** (which carries the covering claim dispatch index), not in `te_tasks`. `te_tasks.queue_id` is retained only as the immutable *original* queue-at-creation for auditing; dispatch, concurrency, and search always read `te_task_state.queue_id`/`urgency_code`/`priority`. This avoids the divergence that would occur if a mutable value were duplicated into the immutable table and updated in only one place.
 
@@ -1423,9 +1426,10 @@ The task data is split into two tables — **`te_tasks`** (immutable after creat
 | `sla_deadline` | TIMESTAMP (nullable) | |
 | `authority_json` | JSON | Creator authority at creation (§3.3 Creator authority): `mode` (`creator_verified` / `worker`), each check with its source and verdict, and `checked_at`. Immutable; returned on claim |
 | `created_at` | TIMESTAMP | |
+| `ring_slot` | SMALLINT NOT NULL | Partition key (ADR-0009), derived from `id`; the same column exists on every ring table |
 
 **Indexes**:
-- No unique index on `idempotency_key`: `te_tasks` is partitioned by task creation time (ADR-0009), and a unique index on a partitioned table must include the partition key, so it could not guarantee uniqueness across partitions. Idempotency is enforced by the `te_dedup` primary key instead. For the same reason the physical primary keys of the partitioned tables (`te_tasks`, `te_task_results`, `te_events`, `te_task_entries`, `te_tags`, `te_resource_refs`) include the creation time on partitioned backends; `id` uniqueness comes from UUID v7 generation, and `created_at` is derived from the id so a lookup by id alone still prunes to one partition. `te_task_state` is not partitioned (§3.7 Live / history split) and keeps a plain `task_id` primary key
+- No unique index on `idempotency_key`: `te_tasks` is partitioned by `ring_slot` (ADR-0009), and a unique index on a partitioned table must include the partition key, so it could not guarantee uniqueness across partitions. Idempotency is enforced by the `te_dedup` primary key instead. For the same reason the physical primary keys of the ring tables (`te_tasks`, `te_task_results`, `te_events`, `te_task_entries`, `te_tags`, `te_resource_refs`) include `ring_slot` on partitioned backends; `id` uniqueness comes from UUID v7 generation, and `ring_slot` is derived from the id so a lookup by id alone still prunes to one partition. `te_task_state` is not partitioned (§3.7 Live / history split) and keeps a plain `task_id` primary key
 - `ix_te_tasks_parent` — `(parent_task_id)` — parent/child lookups
 - `ix_te_tasks_type` — `(type_id)` — type-based queries and concurrency counting
 
@@ -1500,7 +1504,7 @@ Same columns as `te_task_state` minus the live-only dispatch/lease columns (`run
 | `lease_token` | UUID (nullable) | Final holder's token, for idempotent completion replay (§3.2 TaskService) |
 | `predecessors` | JSON (nullable) | Predecessor list and mode, copied from `te_dependencies` at the terminal transition |
 
-**Partitioning**: range by task creation time (derived from the UUID v7 `task_id`), aligned with `te_tasks`. **Indexes** (per partition): PK `(task_id, created_at)`; `ix_te_task_results_tenant_id` `(owner_tenant_id, task_id)` and `(owner_tenant_id, state_code, task_id)` for tenant-scoped search in creation order; `ix_te_task_results_tenant_terminal` `(owner_tenant_id, state_code, terminal_at, task_id)` for search by finish time and DLQ inspection; `(terminal_at)` for retention.
+**Partitioning**: ring slot (`ring_slot`, derived from the UUID v7 `task_id`), aligned with `te_tasks` (ADR-0009). **Indexes** (per partition): PK `(task_id, ring_slot)`; `ix_te_task_results_tenant_id` `(owner_tenant_id, task_id)` and `(owner_tenant_id, state_code, task_id)` for tenant-scoped search in creation order; `ix_te_task_results_tenant_terminal` `(owner_tenant_id, state_code, terminal_at, task_id)` for search by finish time and DLQ inspection; `(terminal_at)` for retention.
 
 #### `te_concurrency_slots` and `te_tenant_concurrency_slots`
 
@@ -1817,17 +1821,17 @@ Schema, indexes, claiming, dedup, leasing, and vacuum are owned by the Event Bro
 
 #### `te_tags`
 
-**Partitioned by task creation time** like `te_tasks`, so tags are dropped with their task; rescued rows move to `te_tags_retained`.
+**In the ring** like `te_tasks`, so tags are truncated with their task's slot; rescued rows (and tag changes of retained tasks) go to `te_tags_retained`.
 
 | Column | Type | Notes |
 |---|---|---|
 | `task_id` | UUID | |
-| `task_created_at` | TIMESTAMP | Partition key, from `task_id` |
+| `ring_slot` | SMALLINT NOT NULL | Partition key, from `task_id` (ADR-0009) |
 | `key` | VARCHAR(128) | Free-form, tenant-scoped tag key (not GTS-typed) |
 | `value` | VARCHAR(256) | |
 | `owner_tenant_id` | UUID | Inherited (Scopable) |
 
-**Indexes**: PK `(task_id, key, task_created_at)`; `ix_te_tags_key_value` on `(owner_tenant_id, key, value)` (per partition) — tenant-scoped tag filtering.
+**Indexes**: PK `(task_id, key, ring_slot)`; `ix_te_tags_key_value` on `(owner_tenant_id, key, value)` (per partition) — tenant-scoped tag filtering.
 
 #### `te_resource_refs`
 
@@ -1836,13 +1840,13 @@ Written once at creation. **Partitioned** like `te_tags`; rescued rows move to `
 | Column | Type | Notes |
 |---|---|---|
 | `task_id` | UUID | |
-| `task_created_at` | TIMESTAMP | Partition key, from `task_id` |
+| `ring_slot` | SMALLINT NOT NULL | Partition key, from `task_id` (ADR-0009) |
 | `resource_type_id` | UUID | Registry Reference of the resource's GTS type |
 | `resource_id` | VARCHAR(256) | Resource identifier within its type |
 | `verified` | BOOLEAN | `true` only if a creator check of the task type confirmed, at creation, that the creator may act on this resource (§3.3 Creator authority); otherwise `false`. Returned in search, on claim, and in task-scoped events |
 | `owner_tenant_id` | UUID | Inherited (Scopable) |
 
-**Indexes**: PK `(task_id, resource_type_id, resource_id, task_created_at)`; `ix_te_resource_refs_lookup` on `(owner_tenant_id, resource_type_id, resource_id)` (per partition) — tenant-scoped "all tasks touching this resource" filtering. Max rows per task: `max_resource_refs_per_task` (§4.1); excess rejected with `invalid_argument` `400`.
+**Indexes**: PK `(task_id, resource_type_id, resource_id, ring_slot)`; `ix_te_resource_refs_lookup` on `(owner_tenant_id, resource_type_id, resource_id)` (per partition) — tenant-scoped "all tasks touching this resource" filtering. Max rows per task: `max_resource_refs_per_task` (§4.1); excess rejected with `invalid_argument` `400`.
 
 #### `te_worker_blacklist`
 
@@ -1993,7 +1997,7 @@ Steady-state write rates at the §6.1 profile (100K running tasks, 1,000 creates
 | Source | Rate | Mitigation |
 |---|---|---|
 | Heartbeats (`te_worker_sessions`, ADR-0017) | ≈ worker processes × domains ÷ 10 s. Example: 100K running tasks over 2,000 processes → ≈ 200 row updates/s (was ≈ 10K/s with per-task leases). Worst case, one task per process: 10K/s on a small table | No `te_task_state` write per heartbeat; the SDK claims with `max_tasks` so processes run many tasks; longer leases reduce the rate linearly |
-| Local audit log (`te_events`) | ≈ 8 rows per task lifecycle → ≈ 8K rows/s; ≈ 4 × 10⁹ rows over the 100-day horizon at 500M tasks | Always written (PRD §5.10); compressed payloads; partition drop is the only bulk removal (ADR-0009). Capacity planning **MUST** include this table |
+| Local audit log (`te_events`) | ≈ 8 rows per task lifecycle → ≈ 8K rows/s; ≈ 4 × 10⁹ rows over the 100-day horizon at 500M tasks | Always written (PRD §5.10); compressed payloads; slot truncation is the only bulk removal (ADR-0009). Capacity planning **MUST** include this table |
 | External events (outbox) | `lifecycle` preset ≈ 4–5 per task → ≈ 5K rows/s; `all` ≈ 8K rows/s | Default event policy is `lifecycle`, not `all`; high-volume system types narrow further via `event_policies.per_type` |
 | Counter rows | 1 update per applicable non-zero dimension per create/claim/release | Hot-row rules (§3.7): unlimited dimensions untouched, `domain_global` sampled, wide scopes sharded |
 
@@ -2102,7 +2106,10 @@ gears:
 
       retention:
         global_retention_days: 100        # measured from terminal_at (ADR-0009)
-        drop_horizon_days: 100            # history partitions older than this (by task creation) are rescued-then-dropped; default = global_retention_days
+        drop_horizon_days: 100            # minimum age (by task creation) before history can be recycled; default = global_retention_days
+        ring:                             # fixed partition ring (ADR-0009); fixed at installation, changing it is a schema migration
+          bucket_days: 7                  # width of one slot's time bucket
+          ring_slots: 17                  # = ceil(drop_horizon_days / bucket_days) + 2; partitions per history table
         cleanup_time: "02:00"
         cleanup_batch_size: 1000
         hard_retention_days: 365
@@ -2586,8 +2593,8 @@ COMMIT
 find_task_any(task_id, scope):                                            # holder may be in ANY state (PRD §5.1)
   # task_id is UUID v7 → its creation time selects the history partition (§3.7), so each probe is a PK read.
   return TaskState::find(task_id).secure().scope_with(scope)              # non-terminal
-      or TaskResult::find(task_id, created_at_of(task_id)).secure().scope_with(scope)   # terminal
-      or TaskResultRetained::find(task_id).secure().scope_with(scope)     # rescued before a partition drop (ADR-0009)
+      or TaskResult::find(task_id, ring_slot_of(task_id)).secure().scope_with(scope)   # terminal
+      or TaskResultRetained::find(task_id).secure().scope_with(scope)     # rescued before its partition was truncated (ADR-0009)
 ```
 
 Lost-race handling rolls back (undoing any cancel, counter delta, and dedup row) and re-runs the transaction (bounded retries, then `409` `aborted`), so concurrent submissions of the same group always converge on the highest order value, and `latest_task_id` always names the group's newest admitted task. The superseded task's releases and the new task's admission are applied as one net delta per counter row, so a replacement is not rejected for capacity its own predecessor was holding: an unleased predecessor is cancelled immediately in either mode, and a leased (`graceful`) one holds no queue-depth capacity — only concurrency slots, released when it acknowledges or its `cancel_grace` timer fires.
@@ -3070,7 +3077,7 @@ Consistent with PRD §4.2:
 - [ADR/0006-blob-compression.md](ADR/0006-blob-compression.md) — `cpt-cf-task-engine-adr-blob-compression`. Transparent JSON blob compression with magic-header marker.
 - [ADR/0007-event-wait-matching.md](ADR/0007-event-wait-matching.md) — `cpt-cf-task-engine-adr-event-wait-matching`. CEL-based match expression evaluation under a cost budget, with per-tenant condition limits.
 - [ADR/0008-atomic-claim-strategy.md](ADR/0008-atomic-claim-strategy.md) — `cpt-cf-task-engine-adr-atomic-claim-strategy` (proposed). ToolKit secure claim primitive with counter-first guarded updates, k-way merge, batch claims, and node-local coalescing; counters before task rows as the engine-wide lock order.
-- [ADR/0009-retention-partitioning.md](ADR/0009-retention-partitioning.md) — `cpt-cf-task-engine-adr-retention-partitioning`. Live/history split with terminal-time retention and rescue-then-drop of history partitions.
+- [ADR/0009-retention-partitioning.md](ADR/0009-retention-partitioning.md) — `cpt-cf-task-engine-adr-retention-partitioning`. Live/history split with terminal-time retention; history in a fixed ring of `N` list partitions, recycled by rescue-then-truncate.
 - [ADR/0010-task-domains.md](ADR/0010-task-domains.md) — `cpt-cf-task-engine-adr-task-domains`. Task domains with first-match routing and a single-domain rule for atomic operations.
 - [ADR/0011-lease-fencing.md](ADR/0011-lease-fencing.md) — `cpt-cf-task-engine-adr-lease-fencing`. Per-lease token for engine writes and a monotonic lease epoch for external fencing.
 - [ADR/0012-task-deduplication.md](ADR/0012-task-deduplication.md) — `cpt-cf-task-engine-adr-task-deduplication`. Caller keys or type-declared identities with supersession.
