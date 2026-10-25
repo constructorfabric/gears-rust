@@ -176,7 +176,7 @@
         "minimum": 1
       },
       "default_queue": {  // used when the creation request names no queue
-        "description": "Queue for tasks of this type when the creation request names none. Absent means the 'default' queue. MUST reference a queue of kind 'dispatch' in the same task domain as the type that accepts the type (accepted_types); a tenant-owned type MUST NOT name an 'operated_by: platform' queue (checked by the engine when it resolves the type, PRD cpt-cf-task-engine-fr-type-trust).",
+        "description": "Queue for tasks of this type when the creation request names none. Absent means the 'default' queue. MUST reference a queue of kind 'dispatch' that accepts the type (accepted_types) and, if a task-domain type rule matches the type, is routed to that domain (otherwise creates without a queue are rejected TASK_DOMAIN_MISMATCH); a tenant-owned type MUST NOT name an 'operated_by: platform' queue (checked by the engine when it resolves the type, PRD cpt-cf-task-engine-fr-type-trust).",
         "type": "string",
         "x-gts-instance-ref": "gts.cf.core.tasks.queue.v1~"
       },
@@ -268,7 +268,7 @@
             "minimum": 0
           },
           "jitter_factor": {  // 0.0-1.0, de-syncs retries
-            "description": "Fractional jitter (0.0-1.0) applied to each computed backoff to de-synchronize retries.",
+            "description": "Fractional jitter (0.0-1.0) to de-synchronize retries. Jitter only shortens a wait: each wait is drawn from [d * (1 - jitter_factor), d], where d is the capped backoff, so it never exceeds max_interval_secs. 1.0 gives full jitter (PRD cpt-cf-task-engine-fr-retry, Backoff).",
             "type": "number",
             "minimum": 0,
             "maximum": 1,

@@ -58,7 +58,7 @@ Chosen option: **Option 4 — Live/history split with rescue-then-drop.**
 
 **History.** `te_tasks`, `te_task_results`, `te_events`, `te_task_entries`, `te_tags`, and `te_resource_refs` are range-partitioned by **task creation time**, derived from the UUID v7 task id, so all rows of one task share a partition, lookups by id prune to one partition, and one drop removes a task's tags and resource references (up to `max_resource_refs_per_task` rows per task) together with the task.
 
-**Identity tables.** `te_dedup` and `te_supersede_heads` must stay unpartitioned, because their primary keys are global uniqueness constraints and a partitioned key would have to include the partition key. Their rows are narrow; retention deletes them in bounded batches by creation-time range at the rate they were inserted.
+**Identity tables.** `te_dedup` and `te_supersede_heads` must stay unpartitioned, because their primary keys are global uniqueness constraints and a partitioned key would have to include the partition key. Their rows are narrow and deleted in bounded batches: `te_dedup` rows by their `expires_at` (set at the holder's terminal transition; caller keys expire after a short key window, ADR-0012), `te_supersede_heads` rows by creation-time range.
 
 **No foreign keys between task tables.** PostgreSQL requires a foreign key into a partitioned table to include the partition key, MySQL/InnoDB supports no foreign keys on partitioned tables, and rescue moves rows to `_retained` tables a foreign key could not follow. Every row that refers to a task is written and removed in the same transaction as that task's transitions, and the maintenance reconciliation reports orphans as a metric.
 
@@ -77,7 +77,7 @@ Chosen option: **Option 4 — Live/history split with rescue-then-drop.**
 * Live tasks and data under longer policies are never lost by a drop.
 * A late completion keeps its full retention.
 * One tenant's legal hold no longer blocks cleanup for the domain.
-* Idempotency and dedup windows are bounded by retention; `te_dedup` stays unpartitioned and is cleaned with its tasks in bounded batches.
+* Dedup windows are at most the retention; `te_dedup` stays unpartitioned, holds only live tasks and identities still in their window, and is cleaned by `expires_at` in bounded batches.
 * No table that grows with stored history needs row-by-row deletion except the narrow identity tables.
 * The terminal transition writes one extra row (move to `te_task_results`) and deletes the task's live-only rows.
 * After a task ends, its wait conditions and dependency rows are no longer listable as rows; they are read from `te_events` and `te_task_results.predecessors`.

@@ -5,7 +5,7 @@
 {
   "$id": "gts://gts.cf.core.tasks.queue.v1~",
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "description": "Queue base type. A queue is a named dispatch channel; every queue is registered as a GTS well-known instance of this type. The registration carries concurrency limits, a default priority, default timeout values, a default retry policy, optional queue-depth and worker-blacklist settings, optional default progress settings, and an optional dead-letter queue reference. A queue of kind 'dead_letter' is not a dispatch channel: it only holds parked dead_lettered tasks, is never claimable, and declares no dispatch settings. A queue and its dead-letter queue MUST resolve to the same task domain (PRD cpt-cf-task-engine-fr-dead-letter). Values declared here are defaults that operators MAY override in the Task Engine config file by GTS queue pattern (most specific pattern wins). Trait/field keys use snake_case per platform GTS convention.",
+  "description": "Queue base type. A queue is a named dispatch channel; every queue is registered as a GTS well-known instance of this type. The registration carries concurrency limits, a default priority, default timeout values, a default retry policy, optional queue-depth and worker-blacklist settings, optional default progress settings, and an optional dead-letter queue reference. A queue of kind 'dead_letter' is not a dispatch channel: it only holds parked dead_lettered tasks, is never claimable, and declares no dispatch settings. Task domains route by queue; dead-letter queues are not routed, so one dead-letter queue can serve queues in several domains (PRD cpt-cf-task-engine-fr-task-domains). Values declared here are defaults that operators MAY override in the Task Engine config file by GTS queue pattern (most specific pattern wins). Trait/field keys use snake_case per platform GTS convention.",
   "type": "object",
   "additionalProperties": false,
   "properties": {
@@ -133,7 +133,7 @@
           "minimum": 0
         },
         "jitter_factor": {  // 0.0-1.0, de-syncs retries
-          "description": "Fractional jitter (0.0-1.0) applied to each computed backoff to de-synchronize retries.",
+          "description": "Fractional jitter (0.0-1.0) to de-synchronize retries. Jitter only shortens a wait: each wait is drawn from [d * (1 - jitter_factor), d], where d is the capped backoff, so it never exceeds max_interval_secs. 1.0 gives full jitter (PRD cpt-cf-task-engine-fr-retry, Backoff).",
           "type": "number",
           "minimum": 0,
           "maximum": 1,
@@ -198,7 +198,7 @@
       "default": "round_robin"
     },
     "dead_letter_queue": {
-      "description": "Optional GTS identifier of the queue that tasks are dead-lettered into when they exhaust retries or exceed their lifetime. MUST reference a queue of kind 'dead_letter' (checked by the engine when it resolves the queue) and MUST resolve to the same task domain as this queue. Absent means failing tasks transition to 'failed' instead of being dead-lettered.",
+      "description": "Optional GTS identifier of the queue that tasks are dead-lettered into when they exhaust retries or exceed their lifetime. MUST reference a queue of kind 'dead_letter' (checked by the engine when it resolves the queue). It may be shared by queues in different task domains: a dead-lettered task stays in its source queue's database. Absent means failing tasks transition to 'failed' instead of being dead-lettered.",
       "type": [
         "string",
         "null"

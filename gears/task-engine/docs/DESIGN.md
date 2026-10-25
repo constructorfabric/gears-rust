@@ -49,7 +49,7 @@ The Task Engine is a distributed, multi-tenant task orchestration control plane 
 
 **ID**: `cpt-cf-task-engine-design-positioning`
 
-**Control plane, not an executor.** The Task Engine owns task state, queues, leases, timers, waits and history, but **runs no task code and hosts no workers**. Workers are separate processes that claim tasks through the REST API or SDK. Running a gear's own activities and workflows in-process, on a local worker, is the job of the [Durable Execution](../../system/durable-execution/docs/PRD.md) gear. A Durable Execution activity may be a Task Engine client or worker; the reverse never applies.
+**Control plane, not an executor.** The Task Engine owns task state, queues, leases, timers, waits and history, but **runs no task code and hosts no workers**. Workers are separate processes that claim tasks through the REST API or SDK. Running a gear's own activities and workflows in-process, on a local worker, is the job of the [Durable Execution](../../system/durable-execution/docs/PRD.md) gear. A Durable Execution activity may be a Task Engine client or worker; the reverse never applies. The two gears share no tables, queues, or state; PRD §1.1 *Boundary with Durable Execution* says which one to use for which work.
 
 The architecture follows a **DDD-Light layered design** (SDK → API/Transport → Domain → Infrastructure) consistent with the ToolKit framework. The system is decomposed into five internal subsystems:
 
@@ -106,7 +106,7 @@ Per [ADR/0001-pluggable-execution-backends.md](ADR/0001-pluggable-execution-back
 - `cpt-cf-task-engine-adr-event-wait-matching` — CEL-based match expression evaluation for event wait conditions with creation-time checks, a cost budget enforced inside the evaluator, per-tenant condition limits, and a defined outcome for budget failures. See [ADR/0007-event-wait-matching.md](ADR/0007-event-wait-matching.md).
 - `cpt-cf-task-engine-adr-atomic-claim-strategy` — **Proposed** (until the ToolKit `SKIP LOCKED` API and the benchmark pass) — per-queue streams locked with `SKIP LOCKED` through the secure ORM, k-way merge, batch claims, node-local claim coalescing, and counters checked under lock before any task write. See [ADR/0008-atomic-claim-strategy.md](ADR/0008-atomic-claim-strategy.md).
 - `cpt-cf-task-engine-adr-retention-partitioning` — Unpartitioned live tables; history (including tags and resource references) partitioned by task creation time; no DB foreign keys; retention from terminal time; rescue-then-drop; SQLite `DELETE` fallback. See [ADR/0009-retention-partitioning.md](ADR/0009-retention-partitioning.md).
-- `cpt-cf-task-engine-adr-task-domains` — Route each task type or queue to one configured database with a config-order first-match rule; atomic operations (claim, dependencies, parent/child) stay inside one domain. See [ADR/0010-task-domains.md](ADR/0010-task-domains.md).
+- `cpt-cf-task-engine-adr-task-domains` — Route each queue to one configured database with a config-order first-match rule; a task lives in its queue's domain; optional type rules are checked at create time; dead-letter queues are not routed; atomic operations (claim, dependencies, parent/child) stay inside one domain. See [ADR/0010-task-domains.md](ADR/0010-task-domains.md).
 - `cpt-cf-task-engine-adr-lease-fencing` — Every worker write carries a random per-lease token bound to the holder's subject; reassignment hands over no token; a lease epoch lets workers fence external systems. See [ADR/0011-lease-fencing.md](ADR/0011-lease-fencing.md).
 - `cpt-cf-task-engine-adr-task-deduplication` — Required caller idempotency key scoped to tenant and subject, or a type-declared engine identity, with optional supersession by a newer order value. See [ADR/0012-task-deduplication.md](ADR/0012-task-deduplication.md).
 - `cpt-cf-task-engine-adr-worker-transport` — Workers use the REST API with capped long-poll claims, batch heartbeats, and a per-node queue watcher for cross-node wake-up; streaming is deferred. See [ADR/0013-worker-transport.md](ADR/0013-worker-transport.md).
@@ -707,7 +707,7 @@ Responsibilities:
 - Resolve type defaults (PRD §5.12 Type defaults resolution) before admission and store the result on the task: queue = request → type `default_queue` → `default`; each timeout field = request → type `timeouts` → queue effective value; retry policy (whole) = request → type `retry_policy` → queue effective value. Later trait or queue changes do not affect existing tasks. A type that declares `dedup.scope = authz_scope` is non-creatable until the ToolKit item below is resolved
   - TODO(toolkit): confirm `AccessScope` exposes a stable serialized form of its compiled constraints (PRD §11 Assumptions, §13 Open Questions); until then `authz_scope` is rejected `invalid_argument`
 - Record `created_by` = `SecurityContext.subject_id` of the create request (server-set, never caller-supplied)
-- Enforce idempotency via the caller-supplied key (REST `Idempotency-Key` header → `idempotency_key`; SDK `CreateTaskRequest.idempotency_key`), unique within `(owner_tenant_id, created_by)`. Missing key → `invalid_argument` with transport override `428`. The create transaction stores a **request fingerprint** with the key (`te_dedup.request_hash`, §3.7): SHA-256 over the canonical JSON (JCS) of the request **as sent** — task type, `queue` (or `null` when the request named none), `input`, and `context`. A replay is compared against this fingerprint, never against the task's current row: `context` changes on every checkpoint, and `queue_id` changes on bulk move and dead-lettering, so comparing with the live task would turn a genuine retry into a `400`. Duplicate key with an equal fingerprint, task in **any** state (live, terminal, or rescued, §4.6 `find_task_any`) → `already_exists` `409` with `context.resource_name` = existing task ID; the SDK surfaces this as `CreateTaskOutcome::Existing(task)`. Same key, **different** fingerprint → `invalid_argument` `400` (field violation on `idempotency_key`). Dedup bounded by retention (§4.5)
+- Enforce idempotency via the caller-supplied key (REST `Idempotency-Key` header → `idempotency_key`; SDK `CreateTaskRequest.idempotency_key`), unique within `(owner_tenant_id, created_by)`. Missing key → `invalid_argument` with transport override `428`. The create transaction stores a **request fingerprint** with the key (`te_dedup.request_hash`, §3.7): SHA-256 over the canonical JSON (JCS) of the request **as sent** — task type, `queue` (or `null` when the request named none), `input`, and `context`. A replay is compared against this fingerprint, never against the task's current row: `context` changes on every checkpoint, and `queue_id` changes on bulk move and dead-lettering, so comparing with the live task would turn a genuine retry into a `400`. Duplicate key with an equal fingerprint, task in **any** state (live, terminal, or rescued, §4.6 `find_task_any`) → `already_exists` `409` with `context.resource_name` = existing task ID; the SDK surfaces this as `CreateTaskOutcome::Existing(task)`. Same key, **different** fingerprint → `invalid_argument` `400` (field violation on `idempotency_key`). The key is held per the key window (§4.5 Idempotency window)
 - **Derived dedup identity** (types declaring the `dedup` trait): compute the identity from the *validated* input after authorization (§4.6 Task Creation Admission); the `Idempotency-Key` header is not required and, if present, is **ignored** (not stored, not checked; SDKs and gateways attach it automatically). Occupancy lives in `te_dedup` (§3.7); a hit returns `already_exists` `409` + `resource_name`, but only if the caller's `AccessScope` can read the existing task, wherever it is stored (live, terminal, or rescued — under `active_or_succeeded` the holder is usually terminal) (else `permission_denied` `403`, no identifier)
 - **Supersession** (types declaring `supersede`): in the create transaction, compare the order value with `te_supersede_heads`; newer → cancel the group's non-terminal task via the cancel path (PDP `cancel` check on that task with the caller's scope first), equal → dedup, older → `failed_precondition` / `STALE_ORDER` (§4.6). Reject `cancellable=false` on these types
 - **Urgency** (PRD §5.2): default `normal`; `critical` needs a PEP check for `expedite` (else `403`)
@@ -835,7 +835,7 @@ Maintenance sequence (per domain):
    - the task is still **non-terminal**; or
    - the task is terminal and `terminal_at + effective_retention > now` — late completions, longer type policies, and **tenant legal holds**.
    Then `DROP` the range in every partitioned table. The rescued set is small (long-lived tasks and long-retention tenants/types). Live-only tables need no step here.
-4. **Expire leftovers**: bounded `DELETE` of expired `_retained` rows, of rows under policies **shorter** than the drop horizon, and of `te_dedup` / `te_supersede_heads` rows of removed tasks (by `created_at` range, minus rescued IDs). These are the only row deletes, on narrow rows at the create rate.
+4. **Expire leftovers**: bounded `DELETE` of expired `_retained` rows, of rows under policies **shorter** than the drop horizon, of `te_dedup` rows with `expires_at < now` (§3.7 `te_dedup`), and of `te_supersede_heads` rows of removed tasks (by `created_at` range, minus rescued IDs). These are the only row deletes, on narrow rows at the create rate.
 5. Capacity reconciliation: read the latest runtime configuration version, update the local concurrency and queue-depth limits for this domain in one transaction, save the applied version number, and retry if this step fails. Then reconcile `used` in the five counter tables with the lock-then-count procedure (§3.7 Counter reconciliation) and report orphan rows (`te_orphan_rows_total`; there are no DB foreign keys)
 
 Outbox row pruning is handled by the Event Broker SDK producer / `toolkit_db::outbox` vacuum stage, not the Retention Service. All Retention Service loops run under the advisory-lock leader (§3.8) so only one instance performs maintenance.
@@ -1103,7 +1103,7 @@ All authenticated endpoints below use `.authenticated()` + `.require_license_fea
 | `POST` | `/admin/config` | Save a new runtime configuration version into `te_runtime_config` in the default domain database, and publish `configUpdated` in the same transaction — one event per queue whose effective settings change (a task-type-pattern override or global default fans out to every affected queue), all carrying the saved `config_version`. Returns `202 Accepted` with the version number. Because each task domain has its own database, the limits cannot update everywhere in one transaction. Instead, each domain's background maintenance job reads new versions and updates its local `te_concurrency_slots` and `te_queue_backlog` limits, records the applied version locally, and retries if a step fails | `configure` on queues (`queue_configure`) |
 | `GET` | `/admin/config/{version}` | Check if a config version has been applied across all domains, showing which domains are updated and which are still pending | `configure` on queues (`queue_configure`) |
 
-**DLQ inspection task-domain scope** (PRD §5.8/§5.19): `GET /admin/dlq` is a read/inspection path. Without a task-type/domain filter it **fans out across all task domains** and merges results (same cross-domain fan-out as untyped listing, §4.6); with a type/domain filter it is scoped to that one domain. `configUpdated` (from `/admin/config`) is written to the local event log/outbox like other events.
+**DLQ inspection task-domain scope** (PRD §5.8/§5.19): `GET /admin/dlq` is a read/inspection path. Dead-letter queues are not routed (§3.8), so it **fans out across all task domains** and merges results (§4.6 Multi-Shard Search), unless it is filtered by a source queue (`dead_lettered_from`), which names one domain. `configUpdated` (from `/admin/config`) is written to the local event log/outbox like other events.
 
 #### Search Parameters
 
@@ -1111,7 +1111,16 @@ Search is exposed through the platform **OData** surface (`toolkit_odata_macros:
 
 **Filtering** (`$filter`): `ODataFilterable` fields on the search entity: `state`, `assignee`, `queue`, `type`, `urgency`, `priority`, `created_at` (age range), plus `tags` (key/value), `resource_refs` (`resource_type` + `resource_id`, backed by `te_resource_refs`), and `dependencies` (unmet / all-met) via dedicated filterable projections. Example: `$filter=state eq 'queued' and priority le 5`.
 
-**Sorting** (`$orderby`): standard OData multi-field ordering, e.g. `$orderby=priority asc,created_at asc`. Nullable fields follow nulls-last for `asc`, nulls-first for `desc`. The engine appends an `id asc` tiebreaker when the client `$orderby` does not end on a unique field (deviation note below).
+**Sorting** (`$orderby`): only orders an index can serve at the capacity profile (PRD §5.17):
+
+| `$orderby` | Allowed when | Served by |
+|---|---|---|
+| `created_at desc` (default) or `asc` | always | the task ID order: IDs are UUID v7, so creation order is ID order (`ix_te_task_state_tenant_id`, `ix_te_task_results_tenant_id`) |
+| `terminal_at desc` or `asc` | `$filter` limits `state` to terminal states | `ix_te_task_results_tenant_terminal` |
+
+Any other key → `invalid_argument` `400` naming the allowed keys. The engine always appends `id` in the same direction as the tiebreaker. Other fields (state, queue, type, assignee, urgency, priority) are filters, applied inside the bounded index range.
+
+**Bounds** (PRD §5.17): a search that can return terminal tasks must have a `created_at` range of at most `search_max_window_days`; without one the engine adds `created_at ge now − search_default_window_days`. A wider range → `invalid_argument` `400`. The range prunes history partitions (§3.7), so the cost does not grow with stored history. A search whose `state` filter allows only non-terminal states reads only the live table and has no window. `$top` is capped at `search_max_top` (`search_max_top_full` at `full`).
 
 **Field projection** (`$select`): drives which columns are read/serialized. For ergonomics the engine also accepts named **LOD presets** that expand to a fixed `$select` set (a Task-Engine convenience layered on top of `$select`, not a replacement for it):
 
@@ -1124,11 +1133,11 @@ Search is exposed through the platform **OData** surface (`toolkit_odata_macros:
 
 **Bounded event history at `full`** (PRD §5.17): because the event log is append-only and `full` applies to paginated *bulk* results, the embedded event history per item is capped at the most-recent `search_full_event_cap` events (default **50**), not the complete log. Callers needing the full log use the dedicated `GET /tasks/{id}/events` endpoint. This bounds a `full`-page response to `$top × (fixed base + capped history)`. The `full`/`long` levels decompress blob columns (input/context/output) on read; the search-latency NFR (`cpt-cf-task-engine-nfr-search-latency`) accounts for this decompression cost.
 
-Match-count-only queries use the standard OData `$count`/`$top=0` convention rather than a bespoke `count` LOD.
+Match-count-only queries use the standard OData `$count`/`$top=0` convention rather than a bespoke `count` LOD. A count stops at `search_max_count` + 1 rows: a larger result returns `search_max_count` and the page marks the count as capped (`count_capped: true`).
 
 **Pagination** (`$top` + server-driven `@odata.nextLink`): framework cursor pagination. The `nextLink` skip token is an opaque base64 cursor carrying the `$orderby` field values (§4.6 Multi-Shard Search); clients treat it as opaque and never construct it.
 
-**Deliberate deviations from stock OData** (documented so reviewers don't flag them as accidental): (1) **LOD presets** as a shorthand over `$select`; (2) the **automatic `id` tiebreaker** appended to `$orderby` to guarantee a stable cursor; (3) the **cross-shard cursor decomposition** in §4.6, required only when multi-database task domains are enabled. Everything else uses stock OData `$filter`/`$orderby`/`$select`/`$top`/`nextLink`.
+**Deliberate deviations from stock OData** (documented so reviewers don't flag them as accidental): (1) **LOD presets** as a shorthand over `$select`; (2) the **automatic `id` tiebreaker** appended to `$orderby` to guarantee a stable cursor; (3) the **cross-shard cursor decomposition** in §4.6, required only when multi-database task domains are enabled; (4) the **allowed `$orderby` keys**, the **default time window**, and the **capped count** above. Everything else uses stock OData `$filter`/`$orderby`/`$select`/`$top`/`nextLink`.
 
 #### Error Response Format
 
@@ -1173,6 +1182,8 @@ Mapping of Task-Engine failure conditions to canonical categories (`gts.cf.core.
 | Event condition type unresolvable or its topic not waitable (`UNKNOWN_EVENT_TYPE` / `EVENT_TOPIC_NOT_WAITABLE`) | `invalid_argument` | 400 |
 | Caller may not `consume` the event type of an event condition (§3.2 Event wait authorization) | `permission_denied` | 403 |
 | Cross-domain claim / parent-child / dependency; dependency cycle | `invalid_argument` | 400 |
+| Type placed in a queue outside its domain type rule, on create, move, or re-enqueue (`context.reason = "TASK_DOMAIN_MISMATCH"`, §3.8) | `invalid_argument` | 400 |
+| Search with an unsupported `$orderby` key or a `created_at` range over `search_max_window_days` (§3.3 Search Parameters) | `invalid_argument` | 400 |
 | Claim assigned nothing and ≥ 1 eligible task was skipped because a concurrency dimension was at capacity (`context.reason = "CONCURRENCY_LIMIT"`, `Retry-After`) | `resource_exhausted` | 429 |
 | Queue depth limit reached on creation / move / re-enqueue / deferral by choice (task unchanged) (dimension `queue`, `tenant`, `domain_global`, or `deferred`; no usage figures disclosed) | `resource_exhausted` (`context.reason = "QUEUE_DEPTH_LIMIT"`, `Retry-After`) | 429 |
 | `cancellable=false` on a supersede type; `authz_scope` requested but `AccessScope` not canonicalizable → `internal` | `invalid_argument` | 400 |
@@ -1329,7 +1340,7 @@ sequenceDiagram
     W->>TE: POST /tasks/{id}/complete {result_code=error, error={retryable, fault}}
     TE->>TE: Classify: retryable iff error.retryable AND code ∉ retry_policy.non_retryable_codes
     TE->>TE: Check retry_count < max_retries (liveness requeues are budgeted separately)
-    TE->>TE: Compute run_after from backoff(strategy, retry_count, base_interval); retry_count += 1
+    TE->>TE: Compute run_after = now + compute_backoff(retry_policy, n = retry_count + 1) (§4.6); retry_count += 1
     TE->>DB: UPDATE state=scheduled, run_after; release concurrency slots (attempt NOT bumped here — see §5.6)
     TE->>DB: DELETE queue/wait timers (lifetime + SLA kept); clear lease/assignment/execution deadlines; INSERT scheduled_timer; producer_outbox.enqueue(TaskRetrying)
     TE-->>W: 200 OK
@@ -1463,7 +1474,8 @@ The task data is split into two tables — **`te_tasks`** (immutable after creat
 | `updated_at` | TIMESTAMP | |
 
 **Indexes**:
-- `ix_te_task_state_tenant_state` — `(owner_tenant_id, state_code)` — tenant-scoped state queries (no JOIN needed)
+- `ix_te_task_state_tenant_state` — `(owner_tenant_id, state_code, task_id)` — tenant-scoped state queries in creation order (no JOIN needed)
+- `ix_te_task_state_tenant_id` — `(owner_tenant_id, task_id)` — tenant-scoped search in creation order (§3.3 Search Parameters)
 - `ix_te_task_state_tenant_dispatch` — `(queue_id, state_code, urgency_code, owner_tenant_id, priority, created_at, task_id)` — `round_robin` probe: one range read returns the next tenant and its best task (§4.6 Task Assignment)
 - `ix_te_task_state_queue_dispatch` — `(queue_id, state_code, urgency_code, priority, created_at, task_id)` — `fifo` dispatch scan and queue-watcher probe, already in claim order, so a head read never sorts, whatever the queue depth (§4.6). `run_after` is not in the key: it would break the order and is never needed for `queued` rows (invariant above)
 - `ix_te_task_state_session` — `(session_id)` WHERE `session_id IS NOT NULL` — requeue the tasks of an expired session; heartbeat lease checks
@@ -1488,7 +1500,7 @@ Same columns as `te_task_state` minus the live-only dispatch/lease columns (`run
 | `lease_token` | UUID (nullable) | Final holder's token, for idempotent completion replay (§3.2 TaskService) |
 | `predecessors` | JSON (nullable) | Predecessor list and mode, copied from `te_dependencies` at the terminal transition |
 
-**Partitioning**: range by task creation time (derived from the UUID v7 `task_id`), aligned with `te_tasks`. **Indexes**: PK `(task_id, created_at)`; `(owner_tenant_id, state_code, terminal_at)` for tenant-scoped search and DLQ inspection; `(terminal_at)` for retention.
+**Partitioning**: range by task creation time (derived from the UUID v7 `task_id`), aligned with `te_tasks`. **Indexes** (per partition): PK `(task_id, created_at)`; `ix_te_task_results_tenant_id` `(owner_tenant_id, task_id)` and `(owner_tenant_id, state_code, task_id)` for tenant-scoped search in creation order; `ix_te_task_results_tenant_terminal` `(owner_tenant_id, state_code, terminal_at, task_id)` for search by finish time and DLQ inspection; `(terminal_at)` for retention.
 
 #### `te_concurrency_slots` and `te_tenant_concurrency_slots`
 
@@ -1613,7 +1625,7 @@ Queue-depth counters (PRD §5.2), with the same mechanism and scope split as the
 
 **Admission** reserves each applicable dimension in the Lock ordering above with `UPDATE … SET used = used + 1 WHERE … AND (limit_value = 0 OR used < limit_value)`; any `rows_affected == 0` aborts the transaction. Re-entry, hand-over, and exit change counters unconditionally (§3.1 Queue-depth accounting). Because every counter change shares a transaction with the state change, drift can only come from bugs or manual edits and is corrected by the same lock-then-count reconciliation as concurrency slots (§3.7 Counter reconciliation).
 
-**Task-domain scope**: each task domain stores its own counters in its own database (§3.8), and every limit is enforced per domain (PRD §5.2). During startup, `domain_router` checks queue routing and task-type routing rules together. If a queue could route to multiple domains, or if its task types would split across domains, startup stops with an error naming the bad queue, task types, and domains. This guarantees each queue lives in one domain only, with one clear set of queue-depth and concurrency counters.
+**Task-domain scope**: each task domain stores its own counters in its own database (§3.8), and every limit is enforced per domain (PRD §5.2). Routing is by queue (§3.8), so each queue lives in exactly one domain, with one clear set of queue-depth and concurrency counters.
 
 #### `te_tenant_wait_counters`
 
@@ -1651,10 +1663,23 @@ Occupied creation identities: derived dedup identities (PRD §5.1 Derived Dedup 
 | `dedup_key` | BINARY(32) | SHA-256 identity (§4.6) |
 | `task_id` | UUID | Holder (UUID v7, so its creation time — and therefore its history partition — is known without a lookup) |
 | `request_hash` | BINARY(32) (nullable) | Caller keys only: request fingerprint, `sha256(jcs({type, queue_as_sent, input, context_as_sent}))` (§3.2 TaskService). Replays are compared against it, never against the task's current, mutable state. `NULL` for derived identities, where fields outside `key_fields` are not compared (PRD §5.1) |
-| `window` | TINYINT | `active` / `active_or_succeeded` (snapshot of the type's `window` policy), or `retention` for caller idempotency keys |
-| `created_at` | TIMESTAMP | Holder's creation time, for retention |
+| `window` | TINYINT | `active` / `active_or_succeeded` (snapshot of the type's `window` policy), or `caller_key` for caller idempotency keys |
+| `created_at` | TIMESTAMP | Holder's creation time |
+| `expires_at` | TIMESTAMP (nullable) | When cleanup may delete the row. `NULL` while the holder is unfinished: a row is never deleted under a live task |
 
-**Indexes**: PK `(owner_tenant_id, dedup_key)` — the portable uniqueness constraint (no partial index needed, so it works on PostgreSQL, MariaDB/MySQL, and SQLite); `ix_te_dedup_task` `(task_id)` — release on terminal transition; `ix_te_dedup_created` `(created_at)` — retention deletes rows in batches by creation range. Insert happens in the create transaction (conflict → replay path); the row is deleted in the same transaction as the holder's transition to a terminal state: under `window = active` on **any** terminal state; under `active_or_succeeded` on every terminal state except `completed` with result code `success` or `warning` (those rows persist until retention removes the task); under `retention` never on a transition — the RetentionService deletes the row together with its task.
+**Indexes**: PK `(owner_tenant_id, dedup_key)` — the portable uniqueness constraint (no partial index needed, so it works on PostgreSQL, MariaDB/MySQL, and SQLite); `ix_te_dedup_task` `(task_id)` — release on terminal transition; `ix_te_dedup_expires` `(expires_at)` — cleanup in bounded batches.
+
+**Row lifetime**: the row is inserted in the create transaction (conflict → replay path). In the holder's terminal transaction (§4.6 `finalize()`):
+
+| `window` | At the terminal transition |
+|---|---|
+| `active` | Delete the row |
+| `active_or_succeeded` | `completed` with `success` / `warning`: `expires_at = terminal_at + effective retention`; otherwise delete the row |
+| `caller_key` | `expires_at = created_at + idempotency_key_window_days`; delete the row at once if that time has passed |
+
+An admin re-enqueue sets `expires_at` back to `NULL` if the row still exists. The RetentionService deletes rows with `expires_at < now` (§3.2 step 4).
+
+**Size**: the table holds the live tasks plus the caller keys of the last key window and the opted-in `active_or_succeeded` successes — not every stored task. At the capacity profile (500 million tasks over 100 days, about 5 million creates a day) a 7-day window keeps about 35 million rows, instead of 500 million if keys were held for the whole retention.
 
 #### `te_supersede_heads`
 
@@ -1905,17 +1930,21 @@ Multiple instances share the database and coordinate **without any DB-specific S
 
 **Recovery and upgrades** (PRD §6.1 Service Availability and Recovery, Rolling Upgrade): all state is in the domain databases, so backup and point-in-time recovery are database operations. On start after a restore, each instance re-reads `te_timers`, the deadline columns of `te_task_state`, and `te_worker_sessions` (sessions whose `lease_until` passed during the outage expire on the first scan), and the maintenance leader reconciles `used` in the five counter tables (`te_concurrency_slots`, `te_tenant_concurrency_slots`, `te_queue_backlog`, `te_tenant_queue_backlog`, `te_tenant_wait_counters`) from task and wait-condition rows (§3.7 Counter reconciliation) before claims are served. Migrations use expand/contract: a release only adds columns, tables, and enum values; it removes them one release later, once no older instance is running. New enum values follow the evolution contract in §3.1.
 
-**Task Domains**: When configured, different task type groups are routed to different databases. Each domain has its own connection pool, migrations, retention schedule, event outbox, and `te_event_inbox` (§3.2). A `default` domain catches unmatched types and holds `te_runtime_config` and the consumer offsets.
+**Task Domains**: When configured, different queues are routed to different databases. Each domain has its own connection pool, migrations, retention schedule, event outbox, and `te_event_inbox` (§3.2). A `default` domain catches unmatched queues and holds `te_runtime_config` and the consumer offsets.
 
-**Deterministic routing (`infra/domain_router.rs`)**: A task resolves to exactly one domain via a single **config-order first-match** rule — domain patterns (type or queue) are evaluated top-to-bottom and the first match wins; `default` is the terminal fallback. This one resolver is used identically by create, claim, search, retention, and the ready-task cache, so a task never maps to two databases across operations. Because a queue's registered task types and a domain's patterns are known at config time, queue→domain and type→domain resolution must agree, and a queue and its DLQ must resolve to the same domain; a contradictory config is **rejected at startup** (PRD §5.8, §5.19).
+**Deterministic routing (`infra/domain_router.rs`)** (PRD §5.19, ADR-0010):
 
-**Routing changes** (PRD §5.19): a routing change applies only to newly created tasks; rows never move between databases. At startup `domain_router` checks, per domain, the distinct task types and queues of non-terminal tasks; if any now resolves to a different domain, startup fails naming the affected types/queues and domains. Re-routing a live type or queue requires draining it first.
+- **By queue.** A queue resolves to exactly one domain by a **config-order first-match** rule over the domains' `queues` patterns; `default` is the terminal fallback. A task lives in its queue's domain. Queues are platform-owned and known from config, so this is fully decided at startup. The same resolver is used by create, claim, search, retention, and the ready-task cache.
+- **Dead-letter queues are not routed.** Dead-lettering only sets `queue_id` to the DLQ; the row stays in its source queue's database. One DLQ (for example the shipped `dead_letter`) can therefore serve queues in several domains.
+- **Type rules, checked at create time.** A domain may list `types` patterns. A type that matches (first matching domain wins) may only be placed in queues of that domain. Task types are registered at runtime, so the rule cannot be checked at startup. It is checked on every create, bulk move, and re-enqueue, after the type is resolved and before the transaction (§4.6 Task Creation Admission); a violation → `invalid_argument` `400` `TASK_DOMAIN_MISMATCH`, naming the type, queue, and domains. A type whose `default_queue` breaks its rule therefore cannot be created without an explicit queue in its domain.
+
+**Routing changes** (PRD §5.19): a routing change applies only to newly created tasks; rows never move between databases. At startup `domain_router` checks, per domain, the distinct queues of non-terminal tasks; if any now resolves to a different domain, startup fails naming the queues and domains. Re-routing a live queue requires draining it first. A change of type rules needs no drain: it affects only new tasks. A re-enqueue into a queue that now routes to another domain is rejected `TASK_DOMAIN_MISMATCH`.
 
 **Single-domain operation boundary** (independent databases cannot be joined or transactionally spanned):
 
 - **Claim**: all queues in one claim request must resolve to one domain (rejected `invalid_argument` `400` otherwise) — the atomic guarded-update claim and its exact ordering run within one DB. A worker consuming from queues in different domains issues one claim per domain.
 - **Parent/child** and **predecessor/successor dependencies**: both endpoints must reside in the same domain (rejected `invalid_argument` `400` at creation otherwise). Child-completion tracking, cancellation propagation, cycle validation, and `ALL`/`ANY` unblocking therefore never cross a database boundary.
-- **Cross-domain fan-out** applies only to non-atomic **read** paths (untyped list/search §4.6, DLQ inspection §3.3), never to claim/dependency/parent-child.
+- **Cross-domain fan-out** applies only to non-atomic **read** paths (list/search not narrowed to one domain §4.6, DLQ inspection §3.3), never to claim/dependency/parent-child.
 - **Events**: outbound events commit in the task's domain; an inbound event is applied once per domain via its inbox (§3.2 Event Consumer).
 
 ### 3.9 Load Management, Admission Control & Backpressure
@@ -2049,6 +2078,12 @@ gears:
       request_body_warn_bytes: 262144     # 256 KiB warning threshold
       compression_threshold_bytes: 1024   # Compress blobs > 1 KiB
       search_full_event_cap: 50           # max events embedded per item at `full` search LOD (§3.3)
+      search_default_window_days: 7       # created_at window added when a search that can return terminal tasks names none (§3.3)
+      search_max_window_days: 31          # widest created_at range such a search may ask for; wider → 400
+      search_max_count: 10000             # exact $count up to this; above it the count is returned capped
+      search_max_top: 100                 # page size cap
+      search_max_top_full: 20             # page size cap at `full`
+      idempotency_key_window_days: 7      # caller keys are held while the task is unfinished and at least this long after creation; capped at the task's retention (§4.5)
       shutdown_deadline_secs: 30
       runtime_config_poll_secs: 5         # reload interval for te_runtime_config and te_worker_blacklist (§3.3 Admin, §4.2)
       cancel_grace_period_secs: 60        # graceful cancel / graceful supersession escalates to forced after this
@@ -2114,12 +2149,13 @@ gears:
           - pattern: "gts.cf.core.tasks.task.v1~cf.system.*"
             events: [taskCompleted, taskFailed]
 
-      task_domains:
+      task_domains:                       # routing by queue, first match wins; dead-letter queues are not routed (§3.8)
         - name: system
-          patterns: ["gts.cf.core.tasks.task.v1~cf.system.*"]
+          queues: ["gts.cf.core.tasks.queue.v1~cf.core.tasks.system.v1"]   # tasks in these queues live in this database
+          types: ["gts.cf.core.tasks.task.v1~cf.system.*"]                  # type rule: these types may only use this domain's queues
           dsn: "postgresql://localhost/te_system"
         - name: default
-          patterns: ["*"]
+          queues: ["*"]
           dsn: "postgresql://localhost/te_default"
 
       cluster_cache:
@@ -2256,7 +2292,7 @@ Structured JSON to stdout, ingested by centralized logging system.
 
 **Idempotency scope**: Uniqueness is keyed on `(owner_tenant_id, created_by, idempotency_key)` (as a `te_dedup` row, §3.7), where `created_by` is server-set from `SecurityContext.subject_id`. Producers (vendors) sharing a tenant therefore cannot squat on, collide with, or read each other's tasks through chosen keys (e.g., a reused artificial UUID); a cross-subject key reuse simply creates an independent task. Keys are held in `te_dedup`, which is not partitioned, so uniqueness spans all `te_tasks` partitions.
 
-**Idempotency window**: Per the platform's permanent (uniqueness-constraint) idempotency tier, the `te_dedup` row for `(owner_tenant_id, created_by, idempotency_key)` deduplicates task creation only while the original task exists (retention deletes both together). After a task is removed by retention (partition drop or delete), a replayed idempotency key will create a new task — idempotency is therefore bounded by the retention horizon, not permanent. Callers must not rely on dedup beyond retention.
+**Idempotency window**: the `te_dedup` row for `(owner_tenant_id, created_by, idempotency_key)` is held while the task is unfinished and until `created_at + idempotency_key_window_days` (default 7, capped at the task's effective retention, §4.1). This is the platform's "important operations" tier (24 h – 7 d, `guidelines/DNA/REST/BATCH.md`), held at least for the life of the task. After the window, a replayed key of a finished task creates a new task; callers that retry later must look for the task first. Holding keys for the whole retention would make `te_dedup` grow with every stored task (§3.7 `te_dedup` Size). Derived identities keep their own `window` policy (PRD §5.1).
 
 **Queue-depth admission security**: Per-tenant counters are keyed and scoped by the task's `owner_tenant_id`, so tenants cannot use each other's capacity. Parking, delayed release, and dependency add are admissions, so parking cannot grow a backlog without bound. The `429` response names only the full dimension and never returns other tenants' or global usage (side-channel). Checks run authorization → validation → dedup/replay → depth, so an unauthorized caller cannot probe capacity and a replay never consumes it. Limit changes (config override, runtime update) require the queue `configure` action and emit `configUpdated`; queue GTS registrations that raise `queue_max_queue_depth` are bounded by the engine-wide `global_max_queue_depth`, which only config can change. Capacity is shared among a tenant's subjects (no per-subject sub-limit); a hostile subject can exhaust its tenant's allowance but never another tenant's — isolate subjects with separate queues/PDP queue constraints where needed.
 
@@ -2419,6 +2455,7 @@ queue = request.queue or type.default_queue or default
 authorize(create, type, queue) via PolicyEnforcer -> AccessScope        # fail-closed; §3.3 Authorization Model
 if task.urgency == critical: authorize(expedite) else 403                # PRD §5.2
 check trust_limits, operated_by, accepted_types, authority mode         # 400, names the setting (PRD §5.12)
+check the type rule of task domains (domain(queue) vs type rule)         # 400 TASK_DOMAIN_MISMATCH (§3.8)
 validate input against the type schema; validate payload size
 
 # 0. Creator authority (PRD §5.11; §3.3 Creator authority) — BEFORE the transaction: no PDP call inside a txn
@@ -2454,7 +2491,7 @@ if type.dedup:
     dedup_key = sha256(len-prefixed(comps + [O]))
   else: dedup_key = group_key
 else:
-  dedup_key = sha256(len-prefixed(["idempotency-key", created_by, Idempotency-Key]))   # 428 if missing; window = retention
+  dedup_key = sha256(len-prefixed(["idempotency-key", created_by, Idempotency-Key]))   # 428 if missing; window = caller_key
   # Fingerprint of the request AS SENT (not of resolved defaults, not of the task's later state):
   request_hash = sha256(jcs({type: request.type, queue: request.queue or null,
                              input: request.input, context: request.context or null}))
@@ -2659,7 +2696,7 @@ liveness_failure(t, guard_extra):
       handoff = (t.lease_token IS NULL)              # unaccepted reassignment
       if max_liveness_requeues == 0 OR t.liveness_requeues < max_liveness_requeues:
         # requeue uses the SAME retry-policy backoff curve as an explicit failure (§3.2 Heartbeat), on its own counter: scheduled, NOT immediate queued
-        run_after = now + compute_backoff(retry_policy, t.liveness_requeues, ...)
+        run_after = now + compute_backoff(retry_policy, n = t.liveness_requeues + 1)
         r = TaskState::update_many()
           .col_expr(state_code, Scheduled).col_expr(run_after, run_after)
           .col_expr(liveness_requeues, liveness_requeues + 1)            # never touches retry_count
@@ -2693,19 +2730,27 @@ liveness_failure(t, guard_extra):
 
 ```
 parse OData query ($filter, $orderby, $select|lod-preset, $top, skiptoken from @odata.nextLink)
-ensure unique-sort guarantee:
-  if $orderby doesn't end on unique field → append `id asc` tiebreaker
+check bounds (§3.3 Search Parameters):
+  $orderby must be created_at or (terminal states only) terminal_at   → else 400
+  if the state filter allows terminal states:
+    no created_at range → add created_at ge now - search_default_window_days
+    range wider than search_max_window_days → 400
+  clamp $top to search_max_top (search_max_top_full at `full`)
+append `id` in the same direction as the tiebreaker
 if skiptoken present:
   decode cursor from skiptoken
   decompose cursor into lightweight sub-queries:
-    e.g., for $orderby (updatedAt asc, id asc) with cursor (T, 42):
-      sub-query 1: updatedAt = T AND id > 42
-      sub-query 2: updatedAt > T
-for each task domain (database):
-  execute sub-queries with $filter, tenant scope, $select/LOD field projection
-  merge domain results maintaining sort order
+    e.g., for $orderby (terminal_at desc, id desc) with cursor (T, 42):
+      sub-query 1: terminal_at = T AND id < 42
+      sub-query 2: terminal_at < T
+domains = the queue's domain (queue filter), or the type rule's domain (type filter), else all
+for each domain:
+  for each table the state filter allows: te_task_state (live), te_task_results and its
+      _retained table (terminal; history partitions pruned by the created_at range):
+    execute sub-queries with $filter, tenant scope, $select/LOD projection, index order, LIMIT $top
+  merge the tables' results maintaining sort order
 if count-only ($count / $top=0):
-  return sum of counts
+  count with LIMIT search_max_count + 1 per table; sum; above the cap → return the cap, count_capped = true
 else:
   merge all domain results via k-way merge (min-heap by comparator)
   truncate to $top
@@ -2716,17 +2761,19 @@ else:
 #### Backoff Computation
 
 ```
-compute_backoff(strategy, attempt, base_interval, max_interval, jitter_factor):
-  match strategy:
-    Fixed       → delay = base_interval
-    Linear      → delay = base_interval * attempt
-    Exponential → delay = base_interval * 2^(attempt - 1)
-  delay = min(delay, max_interval)
-  if jitter_factor > 0:
-    jitter = delay * jitter_factor * random(0.0, 1.0)
-    delay = delay + jitter
+compute_backoff(policy, n):            # n = number of this retry or requeue in its budget, starting at 1
+  base = policy.base_interval; cap = policy.max_interval      # cap >= base (checked when the policy resolves)
+  match policy.strategy:                # saturating integer arithmetic: never overflows
+    Fixed       → delay = base
+    Linear      → delay = base.saturating_mul(n)
+    Exponential → delay = base.saturating_mul(2^min(n - 1, 62))
+  delay = min(delay, cap)
+  # jitter only shortens the delay, so the result is always in [delay × (1 − jitter_factor), delay] ⊆ [0, cap]
+  delay = delay - delay * policy.jitter_factor * random(0.0, 1.0)   # jitter_factor = 1.0 → "full jitter"
   return delay
 ```
+
+Callers pass the count **after** this failure: a reported retry uses `n = retry_count + 1`, a liveness requeue uses `n = liveness_requeues + 1`. So the first retry waits `base`, never `base / 2` or `0`. Because jitter only shortens the delay, every wait is at most `max_interval`; the queue-depth bound "re-entry delay capped by `max_interval`" (§3.1) holds.
 
 #### Dependency Graph Validation
 
@@ -2797,9 +2844,10 @@ finalize(t, result_code, route = none, guard = default_guard(t), extra = []) -> 
   5. Live-only rows: delete t's te_timers (except a cascade timer created in this transaction), its
      te_wait_conditions (armed or parked), and its te_dependencies rows as successor after copying them
      into te_task_results.predecessors.
-  6. Identity: release the te_dedup row per its window (active: always; active_or_succeeded: unless
-     completed with success / warning; caller key: never — retention removes it). te_supersede_heads
-     is left untouched.
+  6. Identity: apply the te_dedup row lifetime (§3.7 te_dedup): active → delete; active_or_succeeded →
+     set expires_at = terminal_at + effective retention if completed with success / warning, else
+     delete; caller_key → set expires_at = created_at + key window, or delete if that has passed.
+     te_supersede_heads is left untouched.
   7. Move: INSERT te_task_results (terminal_at = now; lease_token kept only for a worker completion,
      cleared otherwise — §3.1 Lease token / epoch handling); DELETE the te_task_state row.
   8. Dependents (§4.6 Cascades), with locking reads of the dependents:

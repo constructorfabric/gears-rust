@@ -122,7 +122,7 @@ Teams that run background work across services and tenants keep hitting the same
 | Queue Depth | The number of `queued` tasks waiting for a worker. `scheduled`, `blocked`, and `waiting` tasks are **deferred** and are counted separately |
 | Dedup Identity | A task identity the engine computes from input fields declared by the task type, used instead of a caller key (§5.1 Derived Dedup Identity) |
 | Supersession | Cancelling an in-flight task because a newer submission of the same work (higher order value) was accepted (§5.1 Task Supersession) |
-| Task Domain | A configured database that holds the tasks of matching task types or queues. Each task belongs to exactly one domain (§5.19) |
+| Task Domain | A configured database that holds the tasks of matching queues. Each task belongs to exactly one domain, the domain of its queue (§5.19) |
 | Cluster Gear | The platform coordination gear ([Cluster PRD](../../system/cluster/docs/PRD.md)). The engine uses only its distributed cache, only for an optional ready-task cache. Task correctness never depends on it |
 
 ## 2. Actors
@@ -280,7 +280,7 @@ A create request for a task type without a derived dedup identity (below) **MUST
 - **Subject-scoped keys**: two subjects using the same key get two independent tasks. One subject can never see, collide with, or block another subject's task through a key.
 - **Replay**: if a task with the same key already exists — in any state, terminal or not — no new task is created and the request returns `409 Conflict` (`already_exists`) with the existing task's ID. The caller treats this as success and reads the task.
 - **Different request, same key**: if the request differs in type, queue, input, or context from the request the key was **first accepted with**, it is rejected (`400`, `invalid_argument` on the key). The comparison is with the original request, never with the task's current state, which checkpoints, moves, and dead-lettering change; so a retry sent after the task has progressed is still a replay.
-- **Window**: deduplication lasts as long as the original task is kept (§5.14). After retention removes it, the same key creates a new task.
+- **Window**: a key is held while its task is unfinished, and in any case for `idempotency_key_window_days` after creation (default 7, configurable up to the task's retention, §5.14). After that, the same key creates a new task. A caller that may retry later than the window **MUST** look for the task first (for example by tag or resource reference). A short window keeps the key store small; a key held for the whole retention would grow with every stored task.
 
 **Deliberate differences from common practice**: Stripe-style APIs and the IETF `Idempotency-Key` draft make the key optional, answer a replay with the original `201`, and answer a reused key with `422`. This engine differs on purpose, and clients **MUST NOT** assume the common behavior:
 
@@ -784,6 +784,8 @@ A task **MUST** have a retry policy, set on the task or inherited from the task 
 
 A liveness failure **MUST NOT** use `max_retries`, and a reported failure **MUST NOT** use `max_liveness_requeues`, so losing a worker never eats the retry budget of a healthy task. Each budget computes its backoff from its own count.
 
+**Backoff**: the n-th retry or requeue of a budget (n starts at 1) waits `base` (`fixed`), `base × n` (`linear`), or `base × 2^(n−1)` (`exponential`), capped at the maximum interval. The calculation **MUST NOT** overflow. Jitter only **shortens** the wait, by a random part of up to `jitter_factor` of it, so the wait never exceeds the maximum interval (`jitter_factor = 1` gives "full jitter").
+
 **Lifecycle**: a retryable failure with budget left moves the task to `scheduled` with a backoff delay; it **MUST NOT** pass through `failed`. A terminal failure, or a failure with no budget left, follows the terminal rule (§5.3): `dead_lettered` if the queue has a dead-letter queue, otherwise `failed`.
 
 - **Rationale**: Retries with backoff are the standard answer to transient failures. Separate budgets keep worker loss and task failure from consuming each other's allowance.
@@ -793,7 +795,7 @@ A liveness failure **MUST NOT** use `max_retries`, and a reported failure **MUST
 
 - [ ] `p2` - **ID**: `cpt-cf-task-engine-fr-dead-letter`
 
-A task that ends in failure on a queue with a dead-letter queue **MUST** be moved there instead of being discarded. The engine records the queue it came from. A dead-letter queue is a queue registered with `kind = dead_letter` (§5.12): it only holds `dead_lettered` tasks, it is never dispatched (a claim naming it is rejected, `400`), and it has no dispatch settings. The task state (`dead_lettered`) says the task ended and can be re-enqueued; the queue says where it is parked, which drives DLQ listing, metrics, and PDP queue constraints. A queue and its dead-letter queue **MUST** be in the same task domain. Dead-lettered tasks **MUST** be searchable, inspectable, and re-enqueueable; re-enqueue needs the `admin` action.
+A task that ends in failure on a queue with a dead-letter queue **MUST** be moved there instead of being discarded. The engine records the queue it came from. A dead-letter queue is a queue registered with `kind = dead_letter` (§5.12): it only holds `dead_lettered` tasks, it is never dispatched (a claim naming it is rejected, `400`), and it has no dispatch settings. The task state (`dead_lettered`) says the task ended and can be re-enqueued; the queue says where it is parked, which drives DLQ listing, metrics, and PDP queue constraints. A dead-letter queue is not bound to a task domain: a dead-lettered task stays in the database of the queue it came from (§5.19), so one dead-letter queue can serve queues in several domains. Dead-lettered tasks **MUST** be searchable, inspectable, and re-enqueueable; re-enqueue needs the `admin` action.
 
 **Re-enqueue rules**: an administrator **MAY** re-enqueue a `dead_lettered` task (to the queue it came from) or a `failed` task (to its current queue), so failed work can be retried even without a dead-letter queue. `completed` and `cancelled` tasks cannot be re-enqueued. A re-enqueue **MUST**, as one atomic step:
 
@@ -807,7 +809,7 @@ A task that ends in failure on a queue with a dead-letter queue **MUST** be move
 
 Successors already cancelled with `dependency_failed` are not revived (§5.9).
 
-**Inspection across domains**: listing dead-lettered tasks without a task type filter **MUST** cover all task domains (§5.19), so operators never miss parked failures.
+**Inspection across domains**: listing dead-lettered tasks **MUST** cover all task domains (§5.19), unless it is filtered by a source queue, so operators never miss parked failures.
 
 - **Rationale**: Failed work must never vanish silently. A clean re-enqueue gives the task a full fresh start without reusing stale state.
 - **Actors**: `cpt-cf-task-engine-actor-platform-admin`
@@ -1130,12 +1132,18 @@ The system **MUST** provide paged search over tasks with:
 
 - **detail levels**: `tiny` (ID, state, type), `short` (adds priority, queue, assignee, times), `long` (adds input, output, context, progress, tags), `full` (adds a **bounded** event history, waits, entries, dependencies);
 - filters on standard fields: state, assignee, queue, type, tags, resource references, age, urgency, priority, dependencies;
-- sorting on several fields, with a unique tie-breaker so paging is stable;
+- sorting by creation time (default, newest first) or, for finished tasks only, by finish time, always with the task ID as tie-breaker so paging is stable. Other sort keys are rejected (`400`), because only these orders are served by an index at the capacity profile;
 - cursor-based paging and a count-only query.
 
-At `full` level each item embeds at most the most recent events (configurable, default 50). The complete history is read from the task's event history endpoint. Search inside payloads is out of scope (§4.2).
+**Bounds**: search **MUST** stay bounded, whatever the number of stored tasks:
 
-- **Rationale**: Dashboards, debugging, and bulk management need rich search. Capping embedded history keeps response sizes predictable.
+- **Time window**: a search that can return finished tasks covers at most `search_max_window_days` of creation time (default 31). Without a creation-time filter the last `search_default_window_days` (default 7) are searched. A wider range is rejected (`400`). A search for unfinished tasks only has no window.
+- **Page size**: at most 100 items per page, 20 at `full`.
+- **Count**: exact up to `search_max_count` (default 10,000). A larger result returns the cap and is marked as capped.
+
+At `full` level each item embeds at most the most recent events (configurable, default 50). The complete history is read from the task's event history endpoint. Search inside payloads is out of scope (§4.2); large-scale analytics belongs to other gears fed by lifecycle events (§4.3).
+
+- **Rationale**: Dashboards, debugging, and bulk management need rich search. Fixed sort orders, a time window, and capped counts keep every search on an index and its cost independent of the total number of stored tasks. Capping embedded history keeps response sizes predictable.
 - **Actors**: `cpt-cf-task-engine-actor-api-consumer`, `cpt-cf-task-engine-actor-platform-admin`
 
 ### 5.18 Bulk Operations
@@ -1160,17 +1168,19 @@ The system **MUST** support bulk cancel, bulk reprioritize, bulk retry (re-enque
 
 - [ ] `p3` - **ID**: `cpt-cf-task-engine-fr-task-domains`
 
-The system **MUST** support **task domains** that send different task classes to different databases ([ADR-0010](ADR/0010-task-domains.md)). A domain is configured with a name, a list of task type or queue patterns (with wildcards), and a database. A `default` domain catches everything else. Each domain has its own schema, migrations, connection pool, and retention.
+The system **MUST** support **task domains** that send different task classes to different databases ([ADR-0010](ADR/0010-task-domains.md)). A domain is configured with a name, a list of queue patterns (with wildcards), optional task type patterns, and a database. A `default` domain catches every other queue. Each domain has its own schema, migrations, connection pool, and retention.
 
-**Routing**: each task belongs to exactly one domain. Patterns are checked in config order and the first match wins; every operation (create, claim, search, retention, cache) uses the same rule. A queue's task types and the queue itself **MUST** map to the same domain; a conflicting configuration **MUST** stop startup with an error naming the queue, types, and domains.
+**Routing by queue**: each task belongs to exactly one domain, the domain of its queue. Queue patterns are checked in config order and the first match wins; every operation (create, claim, search, retention, cache) uses the same rule. Dead-letter queues are not routed (§5.8).
 
-**Routing changes**: a change applies only to new tasks; existing tasks never move between databases. A change that would leave unfinished tasks in their old domain **MUST** stop startup with an error naming them. Moving a live type or queue to another domain needs draining its unfinished tasks first.
+**Type rules**: a domain **MAY** list task type patterns. A type that matches them (first matching domain wins) **MUST** only be placed in queues of that domain. Task types are registered at runtime, so this is checked on every create, bulk move, and re-enqueue, not at startup; a violation is rejected (`400`, `TASK_DOMAIN_MISMATCH`, naming the type, queue, and domains).
+
+**Routing changes**: a change applies only to new tasks; existing tasks never move between databases. A queue change that would leave unfinished tasks in their old domain **MUST** stop startup with an error naming the queues. Moving a live queue to another domain needs draining its unfinished tasks first. A re-enqueue into a queue that now routes to another domain is rejected (`400`, `TASK_DOMAIN_MISMATCH`).
 
 **One domain per atomic operation**: a claim, a parent with its children, and a predecessor with its successor **MUST** each stay in one domain; requests that cross domains are rejected (`400`).
 
 **Events per domain**: each domain keeps its own outgoing events (§5.10). An incoming event that satisfies waits in several domains **MUST** be applied exactly once in each, without a cross-database transaction.
 
-**Reads across domains**: a read without a task type filter **SHOULD** cover all domains with consistent sorting and paging. Untyped DLQ inspection **MUST** cover all domains (§5.8).
+**Reads across domains**: a read filtered by queue, or by a type that has a type rule, uses that one domain. Any other read **SHOULD** cover all domains with consistent sorting and paging. DLQ inspection **MUST** cover all domains unless it is filtered by a source queue (§5.8).
 
 - **Rationale**: Heavy system tasks can live apart from user-facing tasks, so they do not compete for I/O, and each class gets its own retention.
 - **Actors**: `cpt-cf-task-engine-actor-platform-admin`
@@ -1278,7 +1288,7 @@ Stored payloads (input, context, output, entry payloads, event payloads) larger 
 
 Search **MUST** stay fast at every detail level, including the cost of decompressing payloads at `long` and `full`.
 
-- **Threshold**: Over 5 minutes at the capacity profile (500 million tasks, 100,000 active) on PostgreSQL, page size 50: `tiny`, `short`, and count p95 ≤ 100 ms; `long` p95 ≤ 300 ms; `full` p95 ≤ 500 ms.
+- **Threshold**: Over 5 minutes at the capacity profile (500 million tasks, 100,000 active) on PostgreSQL, page size 50 (20 at `full`), within the search bounds (§5.17: supported sort keys, default time window, count cap), for a tenant with up to 1 million tasks in the window: `tiny`, `short`, and count p95 ≤ 100 ms; `long` p95 ≤ 300 ms; `full` p95 ≤ 500 ms.
 
 #### Capacity Planning
 
@@ -1467,6 +1477,7 @@ The engine does not process personal data of its own, but it stores caller ident
 - [ ] A tenant at its per-tenant limit does not stop other tenants' tasks from being claimed; a claim returns `429` (`CONCURRENCY_LIMIT`) only when nothing was assignable and a task was skipped for capacity
 - [ ] On several instances, a task created on one instance is claimed by a worker waiting on another within the poll interval
 - [ ] Retries use the right backoff; `attempt` grows only on claims
+- [ ] The first retry waits `base`; no wait ever exceeds the maximum interval, also with jitter and with a very large retry count
 - [ ] Tasks that run out of retries are dead-lettered and can be re-enqueued
 - [ ] All four wait kinds suspend and resume tasks; a waiting task holds no slot, lease, or assignee, resumes through `queued` and a new claim, and that claim does not start a new attempt
 - [ ] Ten `fault=task` failures in a row do not blacklist a worker; ten lease expiries or `fault=worker` failures do
@@ -1490,8 +1501,10 @@ The engine does not process personal data of its own, but it stores caller ident
 - [ ] Blocked tasks cannot be claimed until their predecessors succeed; every dependency change is checked for cycles
 - [ ] Without the parent's lease or `update`, a caller cannot add a child; without `read`, it cannot name a predecessor; both get the same `404` as a missing task
 - [ ] Cross-domain claims, parent/child links, and dependencies are rejected (`400`)
+- [ ] A type with a type rule is rejected (`400`, `TASK_DOMAIN_MISMATCH`) in a queue of another domain, also when the type was registered after startup; one dead-letter queue serves queues of several domains
 - [ ] Cursor paging stays stable while tasks are being added
-- [ ] A duplicate key returns `409` with the existing task (in any state, including after it checkpointed, was moved or dead-lettered, or finished); the same key with a request different from the original returns `400`; a missing key returns `428`
+- [ ] A search with an unsupported sort key or a time range over the window is rejected (`400`); a search without a time range covers the default window; a count over the cap is returned as capped
+- [ ] A duplicate key returns `409` with the existing task (in any state, including after it checkpointed, was moved or dead-lettered, or finished); the same key with a request different from the original returns `400`; a missing key returns `428`; after the key window, the key of a finished task creates a new task, while the key of an unfinished task is never released
 - [ ] Two subjects in one tenant using the same key get two independent tasks; neither receives the other's task
 - [ ] With mode `milestones`, a percent-only update publishes no `taskProgressed` and a stage change publishes exactly one at the next flush; with mode `none`, none are published
 - [ ] Search by resource reference returns exactly the matching tasks in the caller's tenant scope

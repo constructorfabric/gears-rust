@@ -37,7 +37,8 @@ How does the engine detect duplicate creation, and how does it replace outdated 
 * Independent producers of the same work must be able to share one task.
 * One subject or tenant must never collide with, see, or cancel another one's task through deduplication.
 * An older submission must never replace a newer one.
-* Uniqueness must hold across all stored tasks, not only recent ones.
+* Uniqueness must hold across all stored tasks while their identity is held, not only within a cache.
+* The identity store must not grow with every stored task.
 
 ## Considered Options
 
@@ -60,7 +61,7 @@ How it works:
 
 * Clients must always send a key for types without `dedup`. The SDK sends one automatically.
 * A replay returns `409` and the current task, not the original `201` body. This differs from Stripe and the IETF draft on purpose; the SDK hides it.
-* Deduplication lasts only as long as the task's retention. After that, a replayed key creates a new task.
+* A caller key is held while its task is unfinished and for at least `idempotency_key_window_days` after creation (default 7, at most the task's retention). After that, a replayed key of a finished task creates a new task. Holding keys for the whole retention would keep one identity row per stored task (500 million at the capacity profile); the window keeps about 35 million.
 * `authz_scope` works only once ToolKit exposes a stable serialized form of the compiled access scope. Until then it is rejected.
 * Supersession needs the `cancel` permission on the replaced task, and supersede-enabled types cannot accept non-cancellable tasks.
 * The `dedup` and `supersede` traits must be validated against the input schema when the engine first resolves the type. An invalid policy makes the type non-creatable.
