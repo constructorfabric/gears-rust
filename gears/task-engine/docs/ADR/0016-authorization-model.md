@@ -62,7 +62,7 @@ How it works:
 
 * **Resource**: one task → `resource.type` is its concrete type, with `owner_tenant_id`, `type_id`, `queue_id`, `owner_id`. Lists, claims, batch heartbeats, and bulk → the base type, with `type_id` and `queue_id` constraints applied in SQL.
 * **Planes**: all task work uses the tenant plane. Platform workers and the engine's broker subscription are root-tenant service subjects (client credentials). The platform plane only registers the engine's GTS entities.
-* **Barriers**: requests use `barrier_mode: all`. Claims on queues with `operated_by: platform` use `barrier_mode: none`, if the PDP allows it.
+* **Barriers**: requests use `barrier_mode: respect` (`BarrierMode::Respect`, the platform default). A claim whose queues are all `operated_by: platform` uses `barrier_mode: ignore` (`BarrierMode::Ignore`); the PDP decides whether the caller may use it.
 * **Acting for a task**: workers act as themselves. The claim returns the task's owner tenant, creator, and owner; downstream calls name the owner tenant as context tenant. The engine never stores or forwards the creator's token.
 * **Revocation**: every worker request checks `claim` again (a batch heartbeat once). A denial releases the task without budget, attempt, or blacklist change and returns `403`.
 * **Structural guards**: tenant-owned types never enter `operated_by: platform` queues; a queue may limit itself with `accepted_types`.

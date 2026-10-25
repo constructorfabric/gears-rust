@@ -853,7 +853,7 @@ Event **wait conditions** (§3.2 WaitConditionService, §3.6 Event Wait sequence
 
 Design:
 - At startup, `event_consumer.rs` builds a `ConsumerBuilder` (`EventBrokerApi` from `ClientHub`) bound to a **stable consumer group** (`gts.cf.core.events.consumer_group.v1~cf.core.tasks.task_engine.v1`) so exactly one instance in the cluster processes each partition and offsets survive restarts. Parallelism is configurable (`event_consumer.slots`). One group serves all task domains.
-- **Static subscription.** One `Interest` per topic in `event_consumer.waitable_topics` (§4.1; ≤ 64, the broker cap). Each interest uses `tenant_id` = platform root, `max_depth = null`, `barrier_mode = ignore` (allowed for platform services; the engine joins as its root-tenant service subject from AuthN client credentials, on the tenant plane, and holds `consume` on these topics; §3.3 Authorization Model), and `types = ["gts.cf.core.events.event.v1~*"]` (patterns are topic-scoped). The subscription is independent of tenants, types, and waits. It changes only with the topic list (config change), never on arm or park, so waits cause no rebalance.
+- **Static subscription.** One `Interest` per topic in `event_consumer.waitable_topics` (§4.1; ≤ 64, the broker cap). Each interest uses `tenant_id` = platform root, `max_depth = null`, `barrier_mode = BarrierMode::Ignore` (`event_broker_sdk::BarrierMode`; allowed for platform services; the engine joins as its root-tenant service subject from AuthN client credentials, on the tenant plane, and holds `consume` on these topics; §3.3 Authorization Model), and `types = ["gts.cf.core.events.event.v1~*"]` (patterns are topic-scoped). The subscription is independent of tenants, types, and waits. It changes only with the topic list (config change), never on arm or park, so waits cause no rebalance.
 - **Waitable check.** On set or arm, `event_type` is resolved to its `topic` trait. An unresolvable type → `400` `UNKNOWN_EVENT_TYPE`; a topic not listed → `400` `EVENT_TOPIC_NOT_WAITABLE`. Operators list only topics that are actually waited on, because every event of a listed topic is read.
 - **Arm before acting** (PRD §5.4). The topic is already subscribed, so an arm returns once its rows commit. Every later-processed event sees the condition, including events still behind consumer lag. An event admitted just before the arm may also match; conditions that must ignore earlier events narrow by `event_subject_id` or `match_expression`.
 - **Candidates.** One indexed probe per domain on `ix_te_waits_event_subject` (§3.7), per event or one `IN`-list per batch, with `(event_type, owner_tenant_id = event.tenant_id[, event_subject_id])` over pending conditions. Domains without candidates get no transaction. This is never replaced by an in-memory cache, which would miss arms committed on other nodes.
@@ -959,7 +959,7 @@ See [ADR-0016](ADR/0016-authorization-model.md) and PRD §5.11.
 
 **Planes** (toolkit ADR-0008): every task operation uses the tenant plane (`SecurityContext`). Platform services (platform workers, the event consumer) get it from AuthN client credentials as a root-tenant service subject. The platform plane (`PlatformSecurityContext`) is used only to register the engine's GTS types, instances, and permissions at startup; it never reaches `PolicyEnforcer`.
 
-**Barriers**: requests send `barrier_mode: all`. A claim whose queues are all `operated_by: platform` sends `barrier_mode: none`; the PDP decides whether the caller may use it.
+**Barriers**: requests send `barrier_mode: respect` (`authz_resolver_sdk::BarrierMode::Respect`, the platform default). A claim whose queues are all `operated_by: platform` sends `barrier_mode: ignore` (`BarrierMode::Ignore`); the PDP decides whether the caller may use it. The platform enum has exactly these two values (`Respect`, `Ignore`), shared with `tenant_resolver_sdk::BarrierMode`.
 
 **Worker calls**: each request is authorized once (a batch heartbeat once for all its leases), and the constraints are added to the fenced `UPDATE`. On an explicit denial the engine releases the task on the system path, like a voluntary release (no budget, attempt, or blacklist change), and returns `403`. An unreachable PDP returns `503` and changes nothing.
 
@@ -2074,7 +2074,7 @@ Tenants cannot widen what the engine reads, because `waitable_topics` is operato
 ```
 parse ClaimRequest (worker_id, queues[], timeout)      # worker_id required, [A-Za-z0-9._:-]{1,128} (PRD §5.6)
 worker = (ctx.subject_id, worker_id)                  # worker identity
-authorize(claim) on the base type; barrier_mode = none only if every queue is operated_by: platform   # §3.3 Authorization Model
+authorize(claim) on the base type; barrier_mode = Ignore only if every queue is operated_by: platform, else Respect   # §3.3 Authorization Model
 deadline = now + timeout
 loop:
   (task, skipped_for_capacity) = try_claim_once(queues)
