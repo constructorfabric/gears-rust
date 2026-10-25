@@ -1,0 +1,51 @@
+{
+  "$id": "gts://gts.cf.core.tasks.entry.v1~cf.core.tasks.entry_issue.v1~",
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "description": "Pre-built task entry kind: an issue encountered during execution.",
+  "type": "object",
+  "allOf": [
+    {
+      "$ref": "gts://gts.cf.core.tasks.entry.v1~"
+    },
+    {
+      "type": "object",
+      "properties": {
+        "payload": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "severity": {
+              "description": "Issue severity.",
+              "type": "string",
+              "enum": [
+                "info",
+                "warning",
+                "error",
+                "critical"
+              ]
+            },
+            "code": {
+              "description": "Optional machine-readable issue code.",
+              "type": "string",
+              "maxLength": 256
+            },
+            "message": {
+              "description": "Human-readable description of the issue.",
+              "type": "string",
+              "maxLength": 2048
+            },
+            "details": {
+              "description": "Optional structured issue context.",
+              "type": "object",
+              "additionalProperties": true
+            }
+          },
+          "required": [
+            "severity",
+            "message"
+          ]
+        }
+      }
+    }
+  ]
+}

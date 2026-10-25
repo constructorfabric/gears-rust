@@ -1,0 +1,6 @@
+{
+  "id": "gts.cf.toolkit.authz.permission.v1~cf.task_engine._.task_claim.v1",
+  "resource_type": "gts.cf.core.tasks.task.v1~",
+  "action": "claim",
+  "display_name": "Claim tasks and drive the execution path: start, heartbeat, progress, checkpoint, complete, release, worker waits and entries"
+}

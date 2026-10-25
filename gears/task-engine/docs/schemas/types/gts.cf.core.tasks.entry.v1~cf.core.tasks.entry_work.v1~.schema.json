@@ -1,0 +1,40 @@
+{
+  "$id": "gts://gts.cf.core.tasks.entry.v1~cf.core.tasks.entry_work.v1~",
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "description": "Pre-built task entry kind: a record of work performed during execution.",
+  "type": "object",
+  "allOf": [
+    {
+      "$ref": "gts://gts.cf.core.tasks.entry.v1~"
+    },
+    {
+      "type": "object",
+      "properties": {
+        "payload": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "action": {
+              "description": "Short identifier of the action performed.",
+              "type": "string",
+              "maxLength": 256
+            },
+            "summary": {
+              "description": "Human-readable summary of the work.",
+              "type": "string",
+              "maxLength": 2048
+            },
+            "details": {
+              "description": "Optional structured details about the work performed.",
+              "type": "object",
+              "additionalProperties": true
+            }
+          },
+          "required": [
+            "action"
+          ]
+        }
+      }
+    }
+  ]
+}
