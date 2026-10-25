@@ -1047,48 +1047,93 @@ async fn h2_body_cut_by_a_reset_never_reports_its_end() {
     assert!(matches!(next, Some(Err(_))), "{next:?}");
 }
 
+/// Upstream that answers with `response` as soon as it has the request
+/// head, while the request body is still open, then reads until the client
+/// closes the (first) connection and notifies.
+async fn early_answer(response: &'static [u8]) -> (SocketAddr, Arc<tokio::sync::Notify>) {
+    let closed = Arc::new(tokio::sync::Notify::new());
+    let notify = closed.clone();
+    let (addr, _) = raw(move |mut s, n| {
+        let notify = notify.clone();
+        async move {
+            if read_head(&mut s).await.is_none() {
+                return;
+            }
+            let _ = s.write_all(response).await;
+            let mut buf = [0u8; 4096];
+            while let Ok(n) = s.read(&mut buf).await {
+                if n == 0 {
+                    break;
+                }
+            }
+            if n == 1 {
+                notify.notify_one();
+            }
+        }
+    })
+    .await;
+    (addr, closed)
+}
+
+const EARLY_OK: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+
+async fn send_endless_upload(c: &ProxyClient, addr: SocketAddr) -> Bytes {
+    let req = Request::post("/").body(endless_upload()).unwrap();
+    let resp = within(Duration::from_secs(2), c.send(&plain(addr), req))
+        .await
+        .unwrap();
+    resp.into_body().collect().await.unwrap().to_bytes()
+}
+
 #[tokio::test]
 async fn h1_connection_with_an_unfinished_upload_closes_when_the_pool_lets_go() {
     // The upstream answers while the request body is still open. Once the
     // pool discards the connection (pooling disabled here, or the client
     // going away), it must close instead of polling the upload forever.
     for disable_pooling in [true, false] {
-        let closed = Arc::new(tokio::sync::Notify::new());
-        let notify = closed.clone();
-        let (addr, _) = raw(move |mut s, _| {
-            let notify = notify.clone();
-            async move {
-                if read_head(&mut s).await.is_none() {
-                    return;
-                }
-                let _ = s
-                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
-                    .await;
-                let mut buf = [0u8; 4096];
-                while let Ok(n) = s.read(&mut buf).await {
-                    if n == 0 {
-                        break;
-                    }
-                }
-                notify.notify_one();
-            }
-        })
-        .await;
+        let (addr, closed) = early_answer(EARLY_OK).await;
         let mut cfg = support::test_config();
         if disable_pooling {
             cfg.pool.max_idle_per_host = 0;
         }
         let c = ProxyClient::new(cfg).unwrap();
-        let req = Request::post("/").body(endless_upload()).unwrap();
-        let resp = within(Duration::from_secs(2), c.send(&plain(addr), req))
-            .await
-            .unwrap();
-        assert_eq!(resp.into_body().collect().await.unwrap().to_bytes(), "ok");
+        assert_eq!(send_endless_upload(&c, addr).await, "ok");
         if !disable_pooling {
             drop(c);
         }
         within(Duration::from_secs(2), closed.notified()).await;
     }
+}
+
+#[tokio::test]
+async fn h1_ambiguous_response_to_an_unfinished_upload_closes_the_connection() {
+    // TE + CL: never pooled; once the response is consumed the connection
+    // must close rather than keep polling the upload.
+    let (addr, closed) = early_answer(
+        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nok\r\n0\r\n\r\n",
+    )
+    .await;
+    let c = client();
+    assert_eq!(send_endless_upload(&c, addr).await, "ok");
+    within(Duration::from_secs(2), closed.notified()).await;
+}
+
+#[tokio::test]
+async fn cancelled_h1_checkout_closes_the_connection_it_took() {
+    // The pooled connection is still uploading, so checkout waits for it to
+    // become ready; cancelling that wait must not orphan it.
+    let (addr, closed) = early_answer(EARLY_OK).await;
+    let c = client();
+    assert_eq!(send_endless_upload(&c, addr).await, "ok");
+    let target = plain(addr);
+    let get = c.send(&target, Request::get("/").body(empty_body()).unwrap());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(30), get)
+            .await
+            .is_err(),
+        "checkout is still waiting for readiness"
+    );
+    within(Duration::from_secs(2), closed.notified()).await;
 }
 
 #[tokio::test]

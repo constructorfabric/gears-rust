@@ -18,7 +18,7 @@ use crate::connect::{KillableIo, connect};
 use crate::error::{ErrorKind, ProxyError};
 use crate::http2::{self, H2Body, H2Sender, Started};
 use crate::observe::{ConnectionInfo, NoopObserver, Observer};
-use crate::pool::{ConnHandle, H2Lease, Pool, PoolKey, reap_loop};
+use crate::pool::{ConnHandle, H1Conn, H2Lease, Pool, PoolKey, reap_loop};
 use crate::protocol_cache::{CachedProtocol, ProtocolCache};
 use crate::sanitize::{self, RequestKind};
 use crate::target::{ProtocolPolicy, Target, Transport};
@@ -59,7 +59,7 @@ struct Inner {
 }
 
 enum Sender {
-    H1(http1::SendRequest<ProxyBody>),
+    H1(H1Conn),
     H2(H2Sender),
 }
 
@@ -273,13 +273,28 @@ impl ProxyClient {
         })
     }
 
-    fn finish_h1(&self, resp: Response<Incoming>, on_end: Option<OnEnd>) -> Response<ResponseBody> {
+    /// `conn` (with its pool key) owns the connection until the body ends:
+    /// a clean end returns it to the pool, a dropped or failed body drops it
+    /// and with it the connection.
+    fn finish_h1(
+        &self,
+        resp: Response<Incoming>,
+        conn: Option<(PoolKey, H1Conn)>,
+    ) -> Response<ResponseBody> {
         let (mut head, body) = resp.into_parts();
         // RFC 9112 §6.3: a response carrying both framings must not leave
-        // its connection reusable, whatever hyper decided.
+        // its connection reusable, whatever hyper decided. It still owns the
+        // connection until the body ends, so the body is not cut short.
         let ambiguous = head.headers.contains_key(header::TRANSFER_ENCODING)
             && head.headers.contains_key(header::CONTENT_LENGTH);
-        let on_end = if ambiguous { None } else { on_end };
+        let on_end = conn.map(|(key, conn)| -> OnEnd {
+            if ambiguous {
+                Box::new(move || drop(conn))
+            } else {
+                let pool = Arc::clone(&self.inner.pool);
+                Box::new(move || pool.checkin_h1(key, conn))
+            }
+        });
         sanitize::sanitize_response_headers(&mut head.headers, head.status);
         Response::from_parts(
             head,
@@ -346,9 +361,9 @@ impl ProxyClient {
                 return Ok(leased(lease, true, None));
             }
             if matches!(plan, Plan::H1 | Plan::Negotiate)
-                && let Some((tx, conn)) = self.checkout_h1(key).await
+                && let Some(conn) = self.checkout_h1(key).await
             {
-                return Ok(reused_h1(tx, conn));
+                return Ok(reused_h1(conn));
             }
         }
 
@@ -372,9 +387,9 @@ impl ProxyClient {
                 // serialised behind HTTP/1.1 connects.
                 drop(connecting);
                 if retry.is_none()
-                    && let Some((tx, conn)) = self.checkout_h1(key).await
+                    && let Some(conn) = self.checkout_h1(key).await
                 {
-                    return Ok(reused_h1(tx, conn));
+                    return Ok(reused_h1(conn));
                 }
                 let offer = if cached_h1 {
                     AlpnOffer::H1
@@ -397,19 +412,17 @@ impl ProxyClient {
     /// Pop an idle HTTP/1.1 connection. Idle entries were released at the
     /// end of their previous response body, so readiness follows within a
     /// scheduler tick; anything slower is treated as dead.
-    async fn checkout_h1(
-        &self,
-        key: &PoolKey,
-    ) -> Option<(http1::SendRequest<ProxyBody>, ConnHandle)> {
+    async fn checkout_h1(&self, key: &PoolKey) -> Option<H1Conn> {
         const READY_GRACE: Duration = Duration::from_millis(100);
-        while let Some((mut tx, conn)) = self.inner.pool.checkout_h1(key) {
-            if tx.is_ready() {
-                return Some((tx, conn));
+        // A connection that is not ready in time (or whose wait is
+        // cancelled) is dropped, which closes it.
+        while let Some(mut conn) = self.inner.pool.checkout_h1(key) {
+            if conn.sender.is_ready() {
+                return Some(conn);
             }
-            if let Ok(Ok(())) = tokio::time::timeout(READY_GRACE, tx.ready()).await {
-                return Some((tx, conn));
+            if let Ok(Ok(())) = tokio::time::timeout(READY_GRACE, conn.sender.ready()).await {
+                return Some(conn);
             }
-            conn.kill.cancel();
         }
         None
     }
@@ -475,7 +488,10 @@ impl ProxyClient {
                 .map_err(ProxyError::from_hyper)?;
             tokio::spawn(drive("http1", conn, handle.clone()));
             Ok(Acquired {
-                sender: Sender::H1(tx),
+                sender: Sender::H1(H1Conn {
+                    sender: tx,
+                    handle: handle.clone(),
+                }),
                 conn: handle,
                 hold: None,
                 reused: false,
@@ -512,18 +528,12 @@ impl ProxyClient {
         let req = shape(req, target, version).map_err(DispatchError::Failed)?;
 
         match sender {
-            Sender::H1(mut tx) => {
-                let res = self.read_timeout(tx.try_send_request(req)).await;
+            Sender::H1(mut h1) => {
+                // `h1` owns the connection: on any failure, timeout or
+                // cancellation below it is dropped, closing the connection.
+                let res = self.read_timeout(h1.sender.try_send_request(req)).await;
                 match res {
-                    Ok(Ok(resp)) => {
-                        // The connection goes back to the pool when the body
-                        // reaches its clean end; a dropped or failed body
-                        // closes it instead.
-                        let pool = Arc::clone(&inner.pool);
-                        let key = key.clone();
-                        let on_end: OnEnd = Box::new(move || pool.checkin_h1(key, tx, conn));
-                        Ok(self.finish_h1(resp, Some(on_end)))
-                    }
+                    Ok(Ok(resp)) => Ok(self.finish_h1(resp, Some((key.clone(), h1)))),
                     Ok(Err(mut e)) => Err(match e.take_message() {
                         Some(back) => DispatchError::Unsent(
                             Box::new(back),
@@ -593,10 +603,10 @@ fn leased(lease: H2Lease, reused: bool, connect_time: Option<Duration>) -> Acqui
     }
 }
 
-fn reused_h1(sender: http1::SendRequest<ProxyBody>, conn: ConnHandle) -> Acquired {
+fn reused_h1(conn: H1Conn) -> Acquired {
     Acquired {
-        sender: Sender::H1(sender),
-        conn,
+        conn: conn.handle.clone(),
+        sender: Sender::H1(conn),
         hold: None,
         reused: true,
         connect_time: None,

@@ -57,28 +57,37 @@ pub struct ConnHandle {
     pub kill: CancellationToken,
 }
 
-/// An idle HTTP/1.1 connection. Dropping the entry (expiry, eviction,
-/// reaping, the pool going away) closes the connection: hyper's connection
-/// task would otherwise keep running after the pool forgot it, e.g. still
-/// polling a request body the upstream answered before it was complete.
+/// Sole owner of an HTTP/1.1 connection, from its handshake until it is
+/// idle in the pool, leased to one exchange, or waiting for its response
+/// body to end. Dropping it closes the connection: whoever loses it (expiry,
+/// eviction, a timed-out or cancelled exchange, an abandoned or ambiguously
+/// framed response) can never leave hyper's connection task running on its
+/// own, e.g. still polling a request body the upstream answered early.
+pub struct H1Conn {
+    pub sender: http1::SendRequest<ProxyBody>,
+    pub handle: ConnHandle,
+}
+
+impl H1Conn {
+    fn is_open(&self) -> bool {
+        !self.sender.is_closed() && !self.handle.kill.is_cancelled()
+    }
+}
+
+impl Drop for H1Conn {
+    fn drop(&mut self) {
+        self.handle.kill.cancel();
+    }
+}
+
 struct IdleH1 {
-    conn: Option<(http1::SendRequest<ProxyBody>, ConnHandle)>,
+    conn: H1Conn,
     since: Instant,
 }
 
 impl IdleH1 {
     fn usable(&self, idle_timeout: Duration) -> bool {
-        self.conn.as_ref().is_some_and(|(sender, conn)| {
-            !sender.is_closed() && !conn.kill.is_cancelled() && self.since.elapsed() < idle_timeout
-        })
-    }
-}
-
-impl Drop for IdleH1 {
-    fn drop(&mut self) {
-        if let Some((_, conn)) = self.conn.take() {
-            conn.kill.cancel();
-        }
+        self.conn.is_open() && self.since.elapsed() < idle_timeout
     }
 }
 
@@ -165,28 +174,20 @@ impl Pool {
 
     /// Most recently idled HTTP/1.1 connection that is still open. It may
     /// need a moment to become ready (see `ProxyClient::checkout_h1`).
-    pub fn checkout_h1(
-        &self,
-        key: &PoolKey,
-    ) -> Option<(http1::SendRequest<ProxyBody>, ConnHandle)> {
+    pub fn checkout_h1(&self, key: &PoolKey) -> Option<H1Conn> {
         let mut stack = self.h1.get_mut(key)?;
-        while let Some(mut idle) = stack.pop() {
+        while let Some(idle) = stack.pop() {
             if idle.usable(self.cfg.idle_timeout) {
-                return idle.conn.take();
+                return Some(idle.conn);
             }
         }
         None
     }
 
     /// Park a connection whose previous response body was read to the end.
-    pub fn checkin_h1(
-        &self,
-        key: PoolKey,
-        sender: http1::SendRequest<ProxyBody>,
-        conn: ConnHandle,
-    ) {
+    pub fn checkin_h1(&self, key: PoolKey, conn: H1Conn) {
         let idle = IdleH1 {
-            conn: Some((sender, conn)),
+            conn,
             since: Instant::now(),
         };
         if !idle.usable(self.cfg.idle_timeout) || self.cfg.max_idle_per_host == 0 {
