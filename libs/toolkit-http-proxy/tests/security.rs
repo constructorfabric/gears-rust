@@ -1048,6 +1048,50 @@ async fn h2_body_cut_by_a_reset_never_reports_its_end() {
 }
 
 #[tokio::test]
+async fn h1_connection_with_an_unfinished_upload_closes_when_the_pool_lets_go() {
+    // The upstream answers while the request body is still open. Once the
+    // pool discards the connection (pooling disabled here, or the client
+    // going away), it must close instead of polling the upload forever.
+    for disable_pooling in [true, false] {
+        let closed = Arc::new(tokio::sync::Notify::new());
+        let notify = closed.clone();
+        let (addr, _) = raw(move |mut s, _| {
+            let notify = notify.clone();
+            async move {
+                if read_head(&mut s).await.is_none() {
+                    return;
+                }
+                let _ = s
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                    .await;
+                let mut buf = [0u8; 4096];
+                while let Ok(n) = s.read(&mut buf).await {
+                    if n == 0 {
+                        break;
+                    }
+                }
+                notify.notify_one();
+            }
+        })
+        .await;
+        let mut cfg = support::test_config();
+        if disable_pooling {
+            cfg.pool.max_idle_per_host = 0;
+        }
+        let c = ProxyClient::new(cfg).unwrap();
+        let req = Request::post("/").body(endless_upload()).unwrap();
+        let resp = within(Duration::from_secs(2), c.send(&plain(addr), req))
+            .await
+            .unwrap();
+        assert_eq!(resp.into_body().collect().await.unwrap().to_bytes(), "ok");
+        if !disable_pooling {
+            drop(c);
+        }
+        within(Duration::from_secs(2), closed.notified()).await;
+    }
+}
+
+#[tokio::test]
 async fn early_h1_response_with_unread_upload_severs_the_connection() {
     // The upstream answers right away and never reads the body: once the
     // socket buffers fill, the upload's writes stay pending.

@@ -57,10 +57,29 @@ pub struct ConnHandle {
     pub kill: CancellationToken,
 }
 
+/// An idle HTTP/1.1 connection. Dropping the entry (expiry, eviction,
+/// reaping, the pool going away) closes the connection: hyper's connection
+/// task would otherwise keep running after the pool forgot it, e.g. still
+/// polling a request body the upstream answered before it was complete.
 struct IdleH1 {
-    sender: http1::SendRequest<ProxyBody>,
-    conn: ConnHandle,
+    conn: Option<(http1::SendRequest<ProxyBody>, ConnHandle)>,
     since: Instant,
+}
+
+impl IdleH1 {
+    fn usable(&self, idle_timeout: Duration) -> bool {
+        self.conn.as_ref().is_some_and(|(sender, conn)| {
+            !sender.is_closed() && !conn.kill.is_cancelled() && self.since.elapsed() < idle_timeout
+        })
+    }
+}
+
+impl Drop for IdleH1 {
+    fn drop(&mut self) {
+        if let Some((_, conn)) = self.conn.take() {
+            conn.kill.cancel();
+        }
+    }
 }
 
 struct H2Entry {
@@ -151,12 +170,9 @@ impl Pool {
         key: &PoolKey,
     ) -> Option<(http1::SendRequest<ProxyBody>, ConnHandle)> {
         let mut stack = self.h1.get_mut(key)?;
-        while let Some(idle) = stack.pop() {
-            if !idle.sender.is_closed()
-                && !idle.conn.kill.is_cancelled()
-                && idle.since.elapsed() < self.cfg.idle_timeout
-            {
-                return Some((idle.sender, idle.conn));
+        while let Some(mut idle) = stack.pop() {
+            if idle.usable(self.cfg.idle_timeout) {
+                return idle.conn.take();
             }
         }
         None
@@ -169,7 +185,11 @@ impl Pool {
         sender: http1::SendRequest<ProxyBody>,
         conn: ConnHandle,
     ) {
-        if sender.is_closed() || conn.kill.is_cancelled() || self.cfg.max_idle_per_host == 0 {
+        let idle = IdleH1 {
+            conn: Some((sender, conn)),
+            since: Instant::now(),
+        };
+        if !idle.usable(self.cfg.idle_timeout) || self.cfg.max_idle_per_host == 0 {
             return;
         }
         let mut stack = self.h1.entry(key).or_default();
@@ -177,11 +197,7 @@ impl Pool {
             // Drop the oldest; the newest is the warmest.
             stack.remove(0);
         }
-        stack.push(IdleH1 {
-            sender,
-            conn,
-            since: Instant::now(),
-        });
+        stack.push(idle);
     }
 
     pub fn h2_slot(&self, key: &PoolKey) -> Arc<H2Slot> {
@@ -294,9 +310,7 @@ impl Pool {
     pub fn reap(&self) {
         let idle = self.cfg.idle_timeout;
         self.h1.retain(|_, stack| {
-            stack.retain(|c| {
-                !c.sender.is_closed() && !c.conn.kill.is_cancelled() && c.since.elapsed() < idle
-            });
+            stack.retain(|c| c.usable(idle));
             !stack.is_empty()
         });
         let now = self.now_secs();
