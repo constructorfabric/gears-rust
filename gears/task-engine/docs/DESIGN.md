@@ -2073,17 +2073,28 @@ Tenants cannot widen what the engine reads, because `waitable_topics` is operato
 > 1. **`FOR UPDATE SKIP LOCKED`** on PostgreSQL / MySQL 8 (the standard PG-queue answer: River, Oban, graphile-worker, pgmq) — requires exposing a row-locking clause through the ToolKit secure ORM (`SecureSelect`) or a sanctioned, scoped escape hatch; SQLite keeps the optimistic path (single writer, no contention).
 > 2. **Candidate spreading** without row locks — each claimer picks a random (or `hash(worker_id)`-offset) candidate within the first `claim_scan_limit` rows of the merged head, trading strict head order for parallelism; quantify the ordering relaxation against PRD §5.2 / §5.6.
 > 3. **Batch claim** (`max_tasks = k` per call) to amortize the scan and transaction cost per task; define how slots, queue-depth exits, and leases are taken per task in one transaction.
-> 4. Benchmark each against the NFRs (`cpt-cf-task-engine-nfr-latency`, `cpt-cf-task-engine-nfr-throughput`) with ≥ 100 workers on one queue, on PostgreSQL and MySQL.
+> 4. Benchmark each against the NFRs (`cpt-cf-task-engine-nfr-latency`, `cpt-cf-task-engine-nfr-throughput`) with ≥ 100 workers on one queue, on PostgreSQL and MySQL (see *Exit criteria* below).
 > 5. Keep **tenant fairness** (PRD §5.2 Tenant Fairness, see *Tenant round-robin* below) in whatever claim design is chosen.
+> 6. **Fix the waste on saturated scopes.** The claim below takes the task row with a guarded `UPDATE` first and only then finds a full counter and rolls back. On PostgreSQL every such rollback leaves a dead tuple on `te_task_state`, the hottest table. Saturation is also rediscovered by every claim, and in `fifo` mode the `NOT ex.blocks_in_query(…)` filter cannot use the index, so the scan walks a saturated tenant's whole backlog (cost grows with queue depth). Decide on: a read-only counter pre-check before the guarded task update (the atomic `used < limit_value` reservation still decides); a short-lived per-node saturation cache cleared by `slotReleased`; and exclusions that the index can skip (seek past a tenant or type instead of filtering it).
+>
+> **Impact while open:** `cpt-cf-task-engine-nfr-throughput` ("≥ 100 workers claiming from the same queue") is **not reachable** with the current algorithm, and the claim-latency p99 degrades as workers are added. PRD §12 lists this as a risk. Do not treat the throughput NFR as met by any design review until this TODO is closed.
 >
 > **Notes:**
-> - **ToolKit gap for option 1 is small.** Scoped `SecureSelect` already has `lock_exclusive()` (`FOR UPDATE`, tenant predicate kept). Only `SKIP LOCKED` is missing, and sea-orm supports it (`lock_with_behavior(…, SkipLocked)`). Plain `FOR UPDATE` does not help: it still queues on the head row. Supported on PG, MySQL 8, MariaDB 10.6+.
+> - **ToolKit gap for option 1 is small.** Scoped `SecureSelect` has only `lock_shared()` and `lock_exclusive()` today (`libs/toolkit-db/src/secure/select.rs`; `FOR UPDATE`, scope predicate kept). Only `SKIP LOCKED` is missing, and sea-orm supports it (`lock_with_behavior(…, SkipLocked)`). Plain `FOR UPDATE` does not help: it still queues on the head row. Supported on PG, MySQL 8, MariaDB 10.6+. **Ask:** `SecureSelect<E, Scoped>::lock_exclusive_skip_locked()`, available only on scoped queries so the tenant/PDP predicate can never be dropped, and a no-op on SQLite. Status: not yet filed with ToolKit; it is on the critical path, so file it now.
+> - **Option 1 keeps the lock order.** `SKIP LOCKED` locks the task row at read time, which is still step 1 of §3.7 Lock ordering (task rows, then counters). With batch claim (option 3), lock the selected rows in ascending `task_id` and reserve counters once per row afterwards, summing deltas as §3.7 requires.
+> - **Option 1 with `round_robin`.** If a tenant's best task is locked by another claimer, the per-tenant probe takes that tenant's next task. The tenant's own order is relaxed only by rows other claimers already hold, which is the same guarantee River and Oban give. Fairness across tenants is unchanged.
 > - **Option 2 bound.** Starting at `hash(worker_id) mod k` within the head page means a task may jump at most `k − 1` older or higher-priority tasks. This needs explicit PRD sign-off.
 > - **Further options:**
 >   - **Node-local claim coalescing**: at most one in-flight DB claim per queue set per node, serving local waiters. Contention scales with nodes, not workers, and the watcher-tick herd goes away.
 >   - **Virtual sub-queues**: a stored `lane` column; claimers prefer `hash(worker_id) mod S`. Approximate order and a schema change, so last resort.
 >   - **Ready-task cache**: an optimization only, since claims must work without Cluster.
-> - **Suggested path:** 1 + 3 + coalescing, with 2 as the fallback. Record the benchmark in ADR-0008 and accept it.
+> - **Suggested path:** 1 + 3 + coalescing, with 2 as the fallback, plus item 6. Record the benchmark in ADR-0008 and accept it.
+>
+> **Exit criteria** (all required to close this TODO):
+> - Benchmark matrix: PostgreSQL and MySQL 8 × {1, 10, 100, 500} workers × {1, 10} queues × {`fifo`, `round_robin`}, plus one run where a single tenant holds 100K `queued` tasks at its `per_tenant_concurrency_limit`.
+> - Record p50/p99 claim latency, claims/s, lost races per claim, `te_txn_deadlock_retries_total`, and (PostgreSQL) dead tuples created on `te_task_state` per 1K claims.
+> - Pass: the `cpt-cf-task-engine-nfr-latency` and `cpt-cf-task-engine-nfr-throughput` thresholds on PostgreSQL with ≥ 100 workers on one queue, and claims/s not decreasing from 10 to 100 workers.
+> - Then: ADR-0008 status `accepted` with the results, the pseudocode below updated to the chosen design, and this TODO and ADR-0008's TODO removed.
 
 ```
 parse ClaimRequest (worker_id, queues[], timeout)      # worker_id required, [A-Za-z0-9._:-]{1,128} (PRD §5.6)

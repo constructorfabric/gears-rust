@@ -26,25 +26,18 @@ description: "Claim tasks with a plain scoped read plus a guarded conditional up
 
 **ID**: `cpt-cf-task-engine-adr-atomic-claim-strategy`
 
-> **TODO (revisit before implementation)**: this decision does not yet account for **head-row contention**. All concurrent claimers target the same global-minimum candidate, so on a busy queue N−1 workers block on one row lock and then lose the race; claims effectively serialize per queue. The rejection of `SKIP LOCKED` rests on a ToolKit limitation, not on its merits. Explore (a) exposing `FOR UPDATE SKIP LOCKED` for PostgreSQL / MySQL through the secure ORM, keeping the optimistic path for SQLite; (b) randomized or worker-offset candidate selection within the head page, quantifying the ordering relaxation; (c) batch claims. Benchmark with ≥ 100 workers on one queue against the claim latency and throughput NFRs, then update this ADR and DESIGN §4.6 Task Assignment.
+> **TODO (must be resolved before implementation; this ADR stays `proposed` until then)**: this decision does not yet handle **head-row contention**. All concurrent claimers target the same global-minimum candidate, so on a busy queue N−1 workers block on one row lock and then lose the race; claims effectively serialize per queue. It also wastes writes on saturated scopes: the task row is updated first and rolled back when a counter is full. The rejection of `SKIP LOCKED` rests on a ToolKit limitation, not on its merits.
+>
+> - **Impact while open:** `cpt-cf-task-engine-nfr-throughput` (≥ 100 workers on one queue) is not reachable.
+> - **TODO(toolkit):** request a scoped `SecureSelect<E, Scoped>::lock_exclusive_skip_locked()`, available only on scoped queries so the tenant/PDP predicate can never be dropped. sea-orm already has `lock_with_behavior(…, SkipLocked)`, so the change is small. Target PG, MySQL 8, MariaDB 10.6+; no-op on SQLite. Not yet filed; it is on the critical path.
+> - **Options** (details, notes, and exit criteria in DESIGN §4.6 Task Assignment — the single source for this TODO): (A) `SKIP LOCKED` per queue stream — preferred; (B) candidate spreading (Option 4) — needs PRD sign-off on relaxed order; fallback; (C) node-local claim coalescing; (D) batch claim; (E) virtual sub-queues — last resort; (F) ready-task cache — optimization only; plus a counter pre-check / per-node saturation cache for saturated scopes.
+> - **Suggested:** A + D + C, plus the saturated-scope fix. Run the DESIGN §4.6 benchmark matrix, record the results here, then set this ADR to `accepted` and remove this TODO.
 
 ## Context and Problem Statement
 
 Many workers on many nodes claim tasks from shared queues at the same time. Two workers must never claim the same task, the best eligible task across all requested queues (PRD §5.2 order) must win, and slot reservation must be atomic with the claim (ADR-0005). The engine runs on PostgreSQL, MariaDB/MySQL, and SQLite through the ToolKit secure ORM.
 
 Scoped `SecureSelect` offers `lock_shared()` / `lock_exclusive()` (`FOR UPDATE`), but no `SKIP LOCKED`, which exists only inside the toolkit-db outbox. Plain `FOR UPDATE` does not fix head-row contention.
-
-> **TODO(toolkit)**: request a scoped `lock_exclusive_skip_locked()` on `SecureSelect`. sea-orm already has `lock_with_behavior(…, SkipLocked)`, so the change is small. Target PG, MySQL 8, MariaDB 10.6+; no-op on SQLite.
->
-> **Options** (details in DESIGN §4.6):
-> - (A) `SKIP LOCKED` per queue stream — preferred;
-> - (B) candidate spreading (Option 4) — needs PRD sign-off on relaxed order; fallback;
-> - (C) node-local claim coalescing;
-> - (D) batch claim;
-> - (E) virtual sub-queues — last resort;
-> - (F) ready-task cache — optimization only.
->
-> **Suggested:** A + D + C. Benchmark ≥ 100 workers on one queue, then accept this ADR.
 
 ## Decision Drivers
 
