@@ -1,8 +1,12 @@
+use async_trait::async_trait;
 use construct_sdk::gts::{IDENTITY_TYPE, PREFERENCE_TYPE, ROLE_TYPE, SKILL_TYPE};
 use serde_json::Value;
 use toolkit_macros::domain_model;
+use toolkit_security::SecurityContext;
+use uuid::Uuid;
 
-use super::plan::NodeKey;
+use super::error::DomainError;
+use super::plan::{NodeKey, Plan};
 
 /// A category of a person's profile: one person type in graph storage.
 #[domain_model]
@@ -24,6 +28,15 @@ impl Category {
         Self::ALL
             .into_iter()
             .find(|category| category.type_id() == type_id)
+    }
+
+    /// The category whose plain name, the entity kind a plan step carries, is
+    /// `name`, or `None` for any other name.
+    #[must_use]
+    pub fn from_name(name: &str) -> Option<Self> {
+        [Self::Identity, Self::Role, Self::Skill, Self::Preference]
+            .into_iter()
+            .find(|category| category.name() == name)
     }
 
     /// The GTS id of the category's person type.
@@ -66,4 +79,36 @@ pub struct Fact {
 pub struct Profile {
     pub version: Option<u64>,
     pub facts: Vec<Fact>,
+}
+
+/// Reads a subject's profile and its version from graph storage.
+#[async_trait]
+pub trait ProfileSource: Send + Sync {
+    /// # Errors
+    ///
+    /// When the profile cannot be read. The record is then dropped.
+    async fn read(
+        &self,
+        ctx: &SecurityContext,
+        tenant_id: Uuid,
+        subject_id: Uuid,
+    ) -> Result<Profile, DomainError>;
+}
+
+/// What writing an admitted plan gave.
+#[domain_model]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Written {
+    Stored,
+    /// The profile changed after the plan was built on it, and nothing was stored.
+    Conflict,
+}
+
+/// Stores an admitted plan in one write, expecting the profile version the plan was built on.
+#[async_trait]
+pub trait PlanWriter: Send + Sync {
+    /// # Errors
+    ///
+    /// When the write cannot run. The record is then dropped.
+    async fn write(&self, ctx: &SecurityContext, plan: &Plan) -> Result<Written, DomainError>;
 }
