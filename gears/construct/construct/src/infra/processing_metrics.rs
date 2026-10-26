@@ -145,3 +145,71 @@ impl IntakeEvents for CountedDrops {
         self.inner.dropped(event);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::num::NonZeroUsize;
+
+    use uuid::Uuid;
+
+    use super::*;
+    use crate::domain::record_intake::{DropReason, RecordHandOff};
+    use crate::infra::record_queue::record_queue;
+    use crate::test_support::{RecordingEvents, received_chat_record};
+
+    #[tokio::test]
+    async fn a_record_counts_as_in_flight_until_it_ends_also_when_it_is_aborted() {
+        let load = WorkerLoad::new(Weak::new());
+
+        let finished = load.start();
+        assert_eq!(load.in_flight(), 1);
+        drop(finished);
+        assert_eq!(load.in_flight(), 0);
+
+        let held = load.start();
+        let task = tokio::spawn(async move {
+            let _held = held;
+            std::future::pending::<()>().await;
+        });
+        assert_eq!(load.in_flight(), 1);
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert_eq!(
+            load.in_flight(),
+            0,
+            "an aborted record is no longer counted"
+        );
+    }
+
+    #[test]
+    fn the_queue_depth_follows_the_queue_and_reads_zero_once_it_is_gone() {
+        let (hand_off, _queue) = record_queue(NonZeroUsize::new(4).unwrap());
+        let hand_off = Arc::new(hand_off);
+        let load = WorkerLoad::new(Arc::downgrade(&hand_off));
+
+        hand_off
+            .hand_off(received_chat_record(Uuid::new_v4(), Uuid::new_v4()))
+            .unwrap();
+        assert_eq!(load.queued(), 1);
+        drop(hand_off);
+        assert_eq!(load.queued(), 0);
+    }
+
+    #[test]
+    fn a_counted_drop_is_handed_on() {
+        let inner = Arc::new(RecordingEvents::default());
+        let metrics = Arc::new(ProcessingMetrics::new(&WorkerLoad::new(Weak::new())));
+        let events = CountedDrops::new(Arc::clone(&inner) as _, metrics);
+        let record = received_chat_record(Uuid::new_v4(), Uuid::new_v4());
+
+        events.dropped(DropEvent::for_record(
+            &record,
+            DropStage::Checks,
+            DropReason::ProcessingFailed,
+        ));
+
+        let dropped = inner.taken();
+        assert_eq!(dropped.len(), 1);
+        assert_eq!(dropped[0].stage, DropStage::Checks);
+    }
+}

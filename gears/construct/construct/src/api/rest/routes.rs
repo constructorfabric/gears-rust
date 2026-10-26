@@ -1,7 +1,7 @@
 use crate::api::rest::types::{ConcreteIntake, ConcreteProfile, ConcreteSettings};
 use crate::api::rest::{dto, handlers};
 use crate::domain::planner::manage::ManageFacts;
-use axum::http::StatusCode;
+use axum::http::{StatusCode, header};
 use axum::{Extension, Router};
 use std::sync::Arc;
 use toolkit::api::operation_builder::{CORE_GLOBAL_BASE_LICENSE_FEATURE, LicenseFeature};
@@ -63,8 +63,11 @@ pub fn register_routes(
         .register(router, openapi);
     // @cpt-end:cpt-cf-construct-flow-record-intake-submit:p1:inst-submit-send
 
+    // Every route about one subject answers with `no-store`.
+    let mut subject = Router::new();
+
     // @cpt-begin:cpt-cf-construct-flow-subject-settings-view:p1:inst-view-send
-    router = OperationBuilder::get(SUBJECT_SETTINGS_PATH)
+    subject = OperationBuilder::get(SUBJECT_SETTINGS_PATH)
         .operation_id("construct.get_subject_settings")
         .summary("Read the subject's settings")
         .description(
@@ -83,11 +86,11 @@ pub fn register_routes(
             "The subject's settings",
         )
         .standard_errors(openapi)
-        .register(router, openapi);
+        .register(subject, openapi);
     // @cpt-end:cpt-cf-construct-flow-subject-settings-view:p1:inst-view-send
 
     // @cpt-begin:cpt-cf-construct-flow-subject-settings-change:p1:inst-change-send
-    router = OperationBuilder::put(SUBJECT_SETTINGS_PATH)
+    subject = OperationBuilder::put(SUBJECT_SETTINGS_PATH)
         .operation_id("construct.put_subject_settings")
         .summary("Change the subject's settings")
         .description(
@@ -108,11 +111,11 @@ pub fn register_routes(
         )
         .standard_errors(openapi)
         .error_422(openapi)
-        .register(router, openapi);
+        .register(subject, openapi);
     // @cpt-end:cpt-cf-construct-flow-subject-settings-change:p1:inst-change-send
 
     // @cpt-begin:cpt-cf-construct-flow-profile-reader-read:p1:inst-profile-send
-    router = OperationBuilder::get(PROFILE_PATH)
+    subject = OperationBuilder::get(PROFILE_PATH)
         .operation_id("construct.get_profile")
         .summary("Read a subject's profile")
         .description(
@@ -141,10 +144,11 @@ pub fn register_routes(
         )
         .standard_errors(openapi)
         .error_503(openapi)
-        .register(router, openapi);
+        .register(subject, openapi);
     // @cpt-end:cpt-cf-construct-flow-profile-reader-read:p1:inst-profile-send
 
     router
+        .merge(not_stored(subject))
         .layer(Extension(intake))
         .layer(Extension(settings))
         .layer(Extension(profile))
@@ -154,11 +158,11 @@ pub fn register_routes(
 ///
 /// @cpt-dod:cpt-cf-construct-dod-planner-manage-route:p1
 pub fn register_manage_route(
-    mut router: Router,
+    router: Router,
     openapi: &dyn OpenApiRegistry,
     manage: Arc<ManageFacts>,
 ) -> Router {
-    router = OperationBuilder::post(MANAGE_FACTS_PATH)
+    let facts = OperationBuilder::post(MANAGE_FACTS_PATH)
         .operation_id("construct.manage_facts")
         .summary("Store what the subject told an agent")
         .description(
@@ -179,6 +183,22 @@ pub fn register_manage_route(
         )
         .standard_errors(openapi)
         .error_503(openapi)
-        .register(router, openapi);
-    router.layer(Extension(manage))
+        .register(Router::new(), openapi);
+    router.merge(not_stored(facts)).layer(Extension(manage))
+}
+
+/// `routes` with every answer, errors included, marked
+/// `Cache-Control: no-store`, so no proxy or browser cache keeps one
+/// subject's data. Only these routes get the layer: the router they are merged
+/// into holds other gears' routes too.
+fn not_stored(routes: Router) -> Router {
+    routes.layer(axum::middleware::map_response(
+        |mut response: axum::response::Response| async move {
+            response.headers_mut().insert(
+                header::CACHE_CONTROL,
+                header::HeaderValue::from_static("no-store"),
+            );
+            response
+        },
+    ))
 }

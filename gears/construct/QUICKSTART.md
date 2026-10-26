@@ -85,10 +85,10 @@ gears:
         max_value_chars: 1000
         # trusted_connectors: [...]  # connector identities as UUIDs; absent: every connector is trusted
         # entity_kinds: [...]        # absent: every entity kind is allowed
-      profile_category_check: one_call   # or per_category, for a policy plugin without category constraints
+      profile_category_check: per_category   # required with processing_identity; one_call only for a policy plugin that answers with category constraints
 ```
 
-An unknown key, a value in `connectors_off`, `processing_identity` or `trusted_connectors` that is not a UUID, a zero in `processing`, a queue capacity above 100000, more than 256 workers, a confidence floor outside 0 to 1, a step cap outside 1 to 10000, a value cap outside 1 to 100000, or a model upstream alias that is not 1 to 63 letters, digits, `-` or `_`, stops the gear from starting. The processing identity needs graph storage's read, write, delete and type registration permissions, and the settings read, in every tenant.
+An unknown key, a value in `connectors_off`, `processing_identity` or `trusted_connectors` that is not a UUID, a zero in `processing`, a queue capacity above 100000, more than 256 workers, more than 10 reruns, a processing identity without `profile_category_check`, an entity kind that is not one of identity, role, skill or preference, a confidence floor outside 0 to 1, a step cap outside 1 to 10000, a value cap outside 1 to 100000, or a model upstream alias that is not 1 to 63 letters, digits, `-` or `_`, stops the gear from starting. The processing identity needs graph storage's read, write, delete and type registration permissions, and the settings read, in every tenant.
 
 ## Examples
 

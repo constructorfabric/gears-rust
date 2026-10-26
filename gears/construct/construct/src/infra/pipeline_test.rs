@@ -85,8 +85,11 @@ async fn a_record_is_planned_checked_admitted_written_and_read_back() {
     let db = inmem_db().await;
     let cfg = ConstructConfig {
         processing_identity: Some(Uuid::new_v4()),
+        profile_category_check: Some(CategoryCheckConfig::OneCall),
         ..ConstructConfig::default()
-    };
+    }
+    .validated()
+    .unwrap();
     let pipeline = assemble(
         &cfg,
         Some(adds_a_skill()),
@@ -158,8 +161,11 @@ async fn without_a_model_records_are_dropped_with_an_event_and_no_worker_runs() 
     let db = inmem_db().await;
     let cfg = ConstructConfig {
         processing_identity: Some(Uuid::new_v4()),
+        profile_category_check: Some(CategoryCheckConfig::OneCall),
         ..ConstructConfig::default()
-    };
+    }
+    .validated()
+    .unwrap();
     let pipeline = assemble(
         &cfg,
         None,
@@ -198,7 +204,7 @@ async fn without_a_processing_identity_the_profile_read_is_unavailable() {
     let db = inmem_db().await;
 
     let pipeline = assemble(
-        &ConstructConfig::default(),
+        &ConstructConfig::default().validated().unwrap(),
         Some(adds_a_skill()),
         Some(fake_graph_storage()),
         Arc::new(settings_service(&db, Arc::new(AllowResolver), true)),
@@ -230,8 +236,11 @@ async fn with_an_identity_but_no_graph_storage_the_profile_read_is_unavailable()
     let db = inmem_db().await;
     let cfg = ConstructConfig {
         processing_identity: Some(Uuid::new_v4()),
+        profile_category_check: Some(CategoryCheckConfig::OneCall),
         ..ConstructConfig::default()
-    };
+    }
+    .validated()
+    .unwrap();
     let pipeline = assemble(
         &cfg,
         Some(adds_a_skill()),
@@ -291,9 +300,11 @@ async fn the_configured_category_check_reaches_the_profile_read() {
         let asked = Arc::new(CategoriesAsked::default());
         let cfg = ConstructConfig {
             processing_identity: Some(Uuid::new_v4()),
-            profile_category_check: check,
+            profile_category_check: Some(check),
             ..ConstructConfig::default()
-        };
+        }
+        .validated()
+        .unwrap();
         let pipeline = assemble(
             &cfg,
             None,
@@ -316,4 +327,31 @@ async fn the_configured_category_check_reaches_the_profile_read() {
             "{check:?}: {asked:?}"
         );
     }
+}
+
+#[tokio::test]
+async fn without_a_processing_identity_even_an_empty_profile_is_unavailable() {
+    let db = inmem_db().await;
+    let pipeline = assemble(
+        &ConstructConfig::default().validated().unwrap(),
+        None,
+        Some(fake_graph_storage()),
+        // Personalization off by default: the read would serve nothing.
+        Arc::new(settings_service(&db, Arc::new(AllowResolver), false)),
+        PolicyEnforcer::new(Arc::new(AllowResolver)),
+    )
+    .unwrap();
+
+    let result = pipeline
+        .profile
+        .read(&in_tenant(Uuid::new_v4()), None, Uuid::new_v4())
+        .await;
+
+    assert!(
+        matches!(
+            result,
+            Err(crate::domain::error::DomainError::Unavailable(_))
+        ),
+        "{result:?}"
+    );
 }

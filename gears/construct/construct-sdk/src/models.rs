@@ -54,6 +54,30 @@ pub enum FactCategory {
     Preference,
 }
 
+/// A fact's id: its graph node key. A type of its own, so it cannot be
+/// swapped with the fact's property name.
+#[domain_model]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct FactId(String);
+
+impl FactId {
+    #[must_use]
+    pub fn new(id: impl Into<String>) -> Self {
+        Self(id.into())
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for FactId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 /// One fact of a subject's profile: its id (the graph node key), its one
 /// property and that property's value, who it came from, when it was stored,
 /// and when its source asserted it.
@@ -61,7 +85,7 @@ pub enum FactCategory {
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub struct ProfileFact {
-    pub fact_id: String,
+    pub fact_id: FactId,
     pub property: String,
     pub value: serde_json::Value,
     pub origin: FactOrigin,
@@ -75,7 +99,7 @@ impl ProfileFact {
     /// when its source asserted it, when the source said.
     #[must_use]
     pub fn new(
-        fact_id: impl Into<String>,
+        fact_id: FactId,
         property: impl Into<String>,
         value: serde_json::Value,
         origin: FactOrigin,
@@ -83,7 +107,7 @@ impl ProfileFact {
         produced_at: Option<time::OffsetDateTime>,
     ) -> Self {
         Self {
-            fact_id: fact_id.into(),
+            fact_id,
             property: property.into(),
             value,
             origin,

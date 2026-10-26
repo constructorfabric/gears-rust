@@ -122,7 +122,7 @@ async fn a_subject_without_facts_reads_as_no_categories() {
 
 #[tokio::test]
 async fn a_subject_the_caller_may_not_act_for_is_404_like_one_that_does_not_exist() {
-    let (status, _, body) = get(
+    let (status, cache, body) = get(
         Arc::new(DenyResolver),
         vec![rust_skill()],
         &path(Uuid::new_v4()),
@@ -131,6 +131,11 @@ async fn a_subject_the_caller_may_not_act_for_is_404_like_one_that_does_not_exis
 
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert!(body.get("categories").is_none(), "no profile in the answer");
+    assert_eq!(
+        cache.as_deref(),
+        Some("no-store"),
+        "errors are not stored either"
+    );
 }
 
 #[tokio::test]

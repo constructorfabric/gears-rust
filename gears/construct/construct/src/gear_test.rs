@@ -11,7 +11,7 @@ use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
 use super::{ConstructGear, Running, lock};
-use crate::config::ConstructConfig;
+use crate::config::{CategoryCheckConfig, ConstructConfig};
 use crate::domain::model_client::{ModelClient, ModelError, ModelRequest, ModelResponse};
 use crate::domain::record_intake::RecordHandOff;
 use crate::infra::pipeline::assemble;
@@ -35,13 +35,17 @@ impl ModelClient for Unused {
     }
 }
 
-/// A gear holding a processing worker, as `init` leaves it.
-async fn gear_with_worker() -> ConstructGear {
+/// A gear holding a processing worker, as `init` leaves it, and the hand-off
+/// intake would use.
+async fn gear_with_worker() -> (ConstructGear, Arc<dyn RecordHandOff>) {
     let db = inmem_db().await;
     let cfg = ConstructConfig {
         processing_identity: Some(Uuid::new_v4()),
+        profile_category_check: Some(CategoryCheckConfig::OneCall),
         ..ConstructConfig::default()
-    };
+    }
+    .validated()
+    .unwrap();
     let pipeline = assemble(
         &cfg,
         Some(Arc::new(Unused)),
@@ -52,16 +56,31 @@ async fn gear_with_worker() -> ConstructGear {
     .unwrap();
     let gear = ConstructGear::default();
     *lock(&gear.worker) = pipeline.worker;
-    gear
+    (gear, pipeline.hand_off)
 }
 
 #[tokio::test]
 async fn start_runs_the_worker_and_stop_ends_it() {
-    let gear = gear_with_worker().await;
+    let (gear, hand_off) = gear_with_worker().await;
 
     gear.start(CancellationToken::new()).await.unwrap();
-    assert!(lock(&gear.running).is_some(), "the worker runs");
     assert!(lock(&gear.worker).is_none(), "taken by start");
+    let load = lock(&gear.running)
+        .as_ref()
+        .expect("the worker runs")
+        .load
+        .clone();
+    hand_off
+        .hand_off(received_chat_record(Uuid::new_v4(), Uuid::new_v4()))
+        .unwrap();
+    let drained = async {
+        while load.queued() + load.in_flight() > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(5), drained)
+        .await
+        .expect("the started worker takes the record and processes it");
 
     tokio::time::timeout(
         std::time::Duration::from_secs(5),
@@ -130,4 +149,24 @@ async fn without_processing_start_and_stop_do_nothing() {
     gear.start(CancellationToken::new()).await.unwrap();
     assert!(lock(&gear.running).is_none());
     gear.stop(CancellationToken::new()).await.unwrap();
+}
+
+#[tracing_test::traced_test]
+#[tokio::test]
+async fn a_worker_that_panicked_makes_stop_fail() {
+    let gear = ConstructGear::default();
+    let handle = tokio::spawn(async { panic!("the worker broke") });
+    while !handle.is_finished() {
+        tokio::task::yield_now().await;
+    }
+    *lock(&gear.running) = Some(Running {
+        token: CancellationToken::new(),
+        handle,
+        load: WorkerLoad::new(Weak::new()),
+    });
+
+    let stopped = gear.stop(CancellationToken::new()).await;
+
+    assert!(stopped.is_err(), "{stopped:?}");
+    assert!(logs_contain("ended with an error"));
 }

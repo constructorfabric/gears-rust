@@ -326,28 +326,3 @@ fn a_subject_that_is_not_visible_is_404_and_tells_nothing_more() {
         );
     }
 }
-
-#[test]
-fn every_refusal_on_the_profile_route_is_404_naming_no_id() {
-    use crate::api::rest::error::for_profile;
-
-    let (out_of_scope, ids) = out_of_scope();
-    for (what, error) in [
-        ("forbidden", DomainError::forbidden("subject 42 may not")),
-        ("out of scope", out_of_scope),
-        (
-            "not visible",
-            DomainError::NotVisible("subject 42".to_owned()),
-        ),
-    ] {
-        let problem = Problem::from(for_profile(error));
-
-        assert_eq!(problem.status, Some(404), "{what}");
-        assert_eq!(problem.detail, "no such subject", "{what}");
-        let text = visible_text(&problem);
-        assert!(!text.contains("42"), "{what}: {text}");
-        for id in &ids {
-            assert!(!text.contains(&id.to_string()), "{what}: {id} in {text}");
-        }
-    }
-}
