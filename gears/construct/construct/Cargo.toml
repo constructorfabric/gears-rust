@@ -35,6 +35,7 @@ bytes = { workspace = true }
 
 # The profile: graph storage's in-process client
 graph-storage-sdk = { workspace = true }
+rand = { workspace = true }
 
 # Record types: the types registry resolves a record's type and base types
 types-registry-sdk = { workspace = true }

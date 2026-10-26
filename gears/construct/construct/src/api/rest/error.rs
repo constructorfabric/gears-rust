@@ -96,6 +96,7 @@ pub fn for_settings(e: DomainError) -> CanonicalError {
         e @ (DomainError::Refused(_)
         | DomainError::Unavailable(_)
         | DomainError::Internal(_)
+        | DomainError::ProfileFull(_)
         | DomainError::Database(_)) => e.into(),
     }
 }
@@ -135,6 +136,7 @@ pub fn for_facts(e: DomainError, subject_id: Uuid) -> CanonicalError {
         e @ (DomainError::Refused(_)
         | DomainError::Unavailable(_)
         | DomainError::Internal(_)
+        | DomainError::ProfileFull(_)
         | DomainError::Database(_)) => e.into(),
     }
 }
@@ -176,6 +178,10 @@ impl From<DomainError> for CanonicalError {
             // @cpt-begin:cpt-cf-construct-algo-gear-foundation-map-errors:p1:inst-map-internal-return
             DomainError::Internal(msg) => {
                 tracing::error!(msg = %msg, "construct internal error");
+                CanonicalError::internal(msg).create()
+            }
+            DomainError::ProfileFull(msg) => {
+                tracing::error!(msg = %msg, "construct profile full");
                 CanonicalError::internal(msg).create()
             }
             DomainError::Database(db_err) => {

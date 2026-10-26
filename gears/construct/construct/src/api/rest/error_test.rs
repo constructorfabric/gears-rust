@@ -138,6 +138,15 @@ fn internal_maps_to_500_without_leaking_detail() {
 }
 
 #[test]
+fn a_full_profile_maps_to_500_without_leaking_detail() {
+    let problem = wire(DomainError::ProfileFull(
+        "the profile of subject 42 holds 999 facts".to_owned(),
+    ));
+    assert_eq!(problem.status, Some(500));
+    assert!(!problem.detail.contains("subject 42"));
+}
+
+#[test]
 fn database_maps_to_500_without_leaking_detail() {
     let problem = wire(DomainError::Database(DbError::InvalidConfig(
         "password=secret".to_owned(),

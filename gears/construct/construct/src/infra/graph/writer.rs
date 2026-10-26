@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -11,11 +12,12 @@ use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
 use super::fact::fact_node;
-use super::graph_error;
+use super::reader::{MAX_FACTS, read_stored};
 use super::root::{ProfileVersion, Root, root_key};
 use super::types::GraphTypes;
+use super::{DEFAULT_CALL_TIMEOUT, bounded, graph_error, subject_in_context};
 use crate::domain::error::DomainError;
-use crate::domain::plan::{Change, Plan, Property};
+use crate::domain::plan::{Change, NodeKey, Plan};
 use crate::domain::profile::{PlanWriter, Written};
 
 /// The reason graph storage gives a failed compare-and-set.
@@ -26,20 +28,22 @@ const SERIALIZATION: &str = "SERIALIZATION";
 
 /// How many times one write is sent while its result is unknown.
 pub const DEFAULT_ATTEMPTS: u32 = 3;
-/// How long to wait before sending a write again.
-const RETRY_PAUSE: Duration = Duration::from_millis(200);
+/// The pause before the second send; it doubles for every later one, and a
+/// random share of it is added, so writers that failed together do not come
+/// back together.
+const FIRST_PAUSE: Duration = Duration::from_millis(100);
 
 /// Removes a fact from graph storage once the write that dropped it has
-/// committed. Soft delete until graph storage ships a hard delete
-/// (gears-rust #5194); that swap stays inside this interface.
+/// committed. Soft delete until graph storage ships a hard delete (#5194);
+/// that swap stays inside this interface.
 #[async_trait]
 pub trait FactRemoval: Send + Sync {
     /// Remove the fact under `key`. A fact that is already gone is removed.
     ///
     /// # Errors
     ///
-    /// When graph storage cannot remove it now; the key stays listed on the
-    /// root and the next write tries again.
+    /// When graph storage cannot remove it now, or does not answer in time;
+    /// the key stays listed on the root and a later write tries again.
     async fn remove(&self, ctx: &SecurityContext, key: &str) -> Result<(), DomainError>;
 }
 
@@ -47,12 +51,23 @@ pub trait FactRemoval: Send + Sync {
 /// and its edges.
 pub struct SoftDelete {
     client: Arc<dyn GraphStorageClientV1>,
+    timeout: Duration,
 }
 
 impl SoftDelete {
     #[must_use]
     pub fn new(client: Arc<dyn GraphStorageClientV1>) -> Self {
-        Self { client }
+        Self {
+            client,
+            timeout: DEFAULT_CALL_TIMEOUT,
+        }
+    }
+
+    /// Replace [`DEFAULT_CALL_TIMEOUT`] for one delete.
+    #[must_use]
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
     }
 }
 
@@ -60,7 +75,13 @@ impl SoftDelete {
 impl FactRemoval for SoftDelete {
     async fn remove(&self, ctx: &SecurityContext, key: &str) -> Result<(), DomainError> {
         // @cpt-begin:cpt-cf-construct-algo-profile-writer-write:p1:inst-write-remove
-        match self.client.delete_node(ctx, &key.to_owned()).await {
+        match bounded(
+            self.timeout,
+            "fact removal",
+            self.client.delete_node(ctx, &key.to_owned()),
+        )
+        .await?
+        {
             // A fact already tombstoned answers with nothing deleted.
             Ok(_) | Err(CanonicalError::NotFound { .. }) => Ok(()),
             Err(err) => Err(graph_error("fact removal", &err)),
@@ -84,6 +105,8 @@ pub struct WriterPorts {
 pub struct GraphPlanWriter {
     ports: WriterPorts,
     attempts: u32,
+    timeout: Duration,
+    max_facts: usize,
 }
 
 impl GraphPlanWriter {
@@ -92,6 +115,8 @@ impl GraphPlanWriter {
         Self {
             ports,
             attempts: DEFAULT_ATTEMPTS,
+            timeout: DEFAULT_CALL_TIMEOUT,
+            max_facts: MAX_FACTS,
         }
     }
 
@@ -102,71 +127,96 @@ impl GraphPlanWriter {
         self
     }
 
-    /// The stored root of the subject, none for a subject without a profile.
-    async fn root(&self, ctx: &SecurityContext, key: &str) -> Result<Option<Root>, DomainError> {
-        match self
-            .ports
-            .client
-            .get_node(ctx, &key.to_owned(), Some(1))
-            .await
-        {
-            Ok(node) => {
-                let root = Root::from_payload(node.payload.as_ref())?;
-                // The version comes through the interface, so a source that
-                // reads graph storage's own version can replace the counter.
-                let version = self.ports.version.read(node.payload.as_ref())?;
-                Ok(Some(Root { version, ..root }))
-            }
-            Err(CanonicalError::NotFound { .. }) => Ok(None),
-            Err(err) => Err(graph_error("profile root read", &err)),
-        }
+    /// Replace [`DEFAULT_CALL_TIMEOUT`] for the profile read and each send.
+    #[must_use]
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
     }
 
-    /// Remove `keys`, and give back the ones that could not be removed now.
-    async fn remove(&self, ctx: &SecurityContext, keys: Vec<String>) -> Vec<String> {
-        let mut pending = Vec::new();
+    /// Replace [`MAX_FACTS`], the most facts one profile may hold. It cannot
+    /// exceed what one read takes.
+    #[must_use]
+    pub fn with_max_facts(mut self, max_facts: usize) -> Self {
+        self.max_facts = max_facts.min(MAX_FACTS);
+        self
+    }
+
+    /// Remove the facts under `keys`. One that fails stays listed on the root.
+    async fn remove(&self, ctx: &SecurityContext, keys: &BTreeSet<String>) {
+        let mut failed = 0_usize;
         for key in keys {
-            if let Err(err) = self.ports.removal.remove(ctx, &key).await {
-                tracing::warn!(error = %err, "a removed fact stays listed on its root until the next write");
-                pending.push(key);
+            if let Err(err) = self.ports.removal.remove(ctx, key).await {
+                failed += 1;
+                tracing::warn!(%key, error = %err, "a removed fact stays listed on its root");
             }
         }
-        pending
+        if failed > 0 {
+            tracing::warn!(
+                failed,
+                listed = keys.len(),
+                "removed facts stay listed until a later write finishes them"
+            );
+        }
     }
 
     /// Send the ingest, again with the same idempotency key while its result
-    /// is unknown.
+    /// is unknown, with a growing, jittered pause between sends.
     async fn ingest(
         &self,
         ctx: &SecurityContext,
         request: IngestRequest,
     ) -> Result<Written, DomainError> {
         let mut attempt = 1;
+        let mut pause = FIRST_PAUSE;
         loop {
             // @cpt-begin:cpt-cf-construct-algo-profile-writer-write:p1:inst-write-ingest
-            match self.ports.client.ingest(ctx, request.clone()).await {
-                Ok(_) => return Ok(Written::Stored),
-                Err(CanonicalError::Aborted { ctx: aborted, .. })
+            let sent =
+                tokio::time::timeout(self.timeout, self.ports.client.ingest(ctx, request.clone()))
+                    .await;
+            let failed = match sent {
+                Ok(Ok(_)) => return Ok(Written::Stored),
+                Ok(Err(CanonicalError::Aborted { ctx: aborted, .. }))
                     if aborted.reason == CAS_CONFLICT =>
                 {
                     return Ok(Written::Conflict);
                 }
-                Err(err) if attempt < self.attempts && unknown_result(&err) => {
-                    tracing::debug!(attempt, error = %err, "profile write sent again with its key");
-                    attempt += 1;
-                    tokio::time::sleep(RETRY_PAUSE).await;
+                Ok(Err(err)) if !unknown_result(&err) => {
+                    return Err(graph_error("profile write", &err));
                 }
-                Err(err) => return Err(graph_error("profile write", &err)),
+                Ok(Err(err)) => err.to_string(),
+                // No answer in time: the write may or may not have committed.
+                Err(_) => format!("no answer within {:?}", self.timeout),
+            };
+            if attempt >= self.attempts {
+                return Err(DomainError::Unavailable(format!(
+                    "graph storage profile write: result unknown after {attempt} sends: {failed}"
+                )));
             }
+            tracing::warn!(
+                attempt,
+                idempotency_key = ?request.idempotency_key,
+                error = %failed,
+                "profile write sent again with its idempotency key"
+            );
+            tokio::time::sleep(pause + jitter(pause)).await;
+            attempt += 1;
+            pause = pause.saturating_mul(2);
             // @cpt-end:cpt-cf-construct-algo-profile-writer-write:p1:inst-write-ingest
         }
     }
 }
 
+/// A random share of `pause`, up to all of it.
+fn jitter(pause: Duration) -> Duration {
+    let millis = u64::try_from(pause.as_millis()).unwrap_or(u64::MAX);
+    Duration::from_millis(rand::random_range(0..=millis))
+}
+
 /// Whether the write may or may not have committed, or certainly did not and
 /// can be sent as it is: unavailable, out of time, unknown, or a lost
 /// serialization race. Sending it again with its key is safe in each case.
-fn unknown_result(err: &CanonicalError) -> bool {
+pub(super) fn unknown_result(err: &CanonicalError) -> bool {
     match err {
         CanonicalError::Aborted { ctx, .. } => ctx.reason == SERIALIZATION,
         CanonicalError::ServiceUnavailable { .. }
@@ -176,60 +226,37 @@ fn unknown_result(err: &CanonicalError) -> bool {
     }
 }
 
-/// The one property of a fact node's change.
-fn single(properties: &[Property]) -> Result<&Property, DomainError> {
-    match properties {
-        [property] => Ok(property),
-        _ => Err(DomainError::internal(format!(
-            "a fact node holds one property, the plan gives {}",
-            properties.len()
-        ))),
-    }
-}
-
 /// What a plan's steps write: the new fact nodes, their edges from the root,
 /// and the keys of the facts they remove.
 #[derive(Default)]
 struct Changes {
     nodes: Vec<NodeSpec>,
     edges: Vec<EdgeSpec>,
-    removals: Vec<String>,
+    removals: BTreeSet<String>,
 }
 
 /// The changes of a plan's steps.
-fn changes(plan: &Plan, root: &str, now: OffsetDateTime) -> Result<Changes, DomainError> {
+fn changes(plan: &Plan, root: &NodeKey, now: OffsetDateTime) -> Result<Changes, DomainError> {
     let mut changes = Changes::default();
     for step in &plan.steps {
-        let (added, removed) = match &step.change {
-            Change::AddEntity { key, properties } => (Some((key, single(properties)?)), None),
-            Change::ReplaceEntity {
-                old,
-                key,
-                properties,
-            } => (Some((key, single(properties)?)), Some(old)),
-            Change::RemoveEntity { entity } => (None, Some(entity)),
-            // One node holds one fact, so a property is never changed on
-            // its own: the planner replaces the fact's node.
-            other => {
-                return Err(DomainError::internal(format!(
-                    "the writer stores whole facts, not {other:?}"
-                )));
-            }
-        };
-        if let Some((key, property)) = added {
-            changes
-                .nodes
-                .push(fact_node(plan, step, &key.0, property, now)?);
+        if let Some(node) = fact_node(plan, step, now)? {
             changes.edges.push(EdgeSpec {
                 type_id: HAS_FACT_TYPE.to_owned(),
-                src_node_key: root.to_owned(),
-                dst_node_key: key.0.clone(),
+                src_node_key: root.0.clone(),
+                dst_node_key: node.node_key.clone(),
                 discriminator: None,
                 payload: None,
             });
+            changes.nodes.push(node);
         }
-        if let Some(old) = removed {
-            changes.removals.push(old.0.clone());
+        match &step.change {
+            Change::ReplaceEntity { old, .. } | Change::RemoveEntity { entity: old } => {
+                changes.removals.insert(old.0.clone());
+            }
+            Change::AddEntity { .. }
+            | Change::AddProperty { .. }
+            | Change::ReplaceProperty { .. }
+            | Change::RemoveProperty { .. } => {}
         }
     }
     Ok(changes)
@@ -242,51 +269,76 @@ impl PlanWriter for GraphPlanWriter {
         if plan.steps.is_empty() {
             return Ok(Written::Stored);
         }
-        // Graph storage writes into the context's tenant; the root key names
-        // the plan's. They must be the same tenant.
-        if ctx.subject_tenant_id() != plan.tenant_id {
-            return Err(DomainError::internal(
-                "the plan's tenant is not the tenant processing writes for",
-            ));
-        }
+        let subject = subject_in_context(ctx, plan.tenant_id, plan.subject_id)?;
         self.ports.types.ensure(ctx).await?;
 
         // @cpt-begin:cpt-cf-construct-algo-profile-writer-write:p1:inst-write-read-root
-        let root_key = root_key(plan.tenant_id, plan.subject_id);
-        let stored = self.root(ctx, &root_key).await?;
-        let version = stored.as_ref().map(|root| root.version);
-        if version != plan.profile_version {
+        let stored = read_stored(
+            self.ports.client.as_ref(),
+            self.ports.version.as_ref(),
+            self.timeout,
+            ctx,
+            &subject,
+        )
+        .await?;
+        if stored.version != plan.profile_version {
             return Ok(Written::Conflict);
         }
+        let live: BTreeSet<&str> = stored
+            .facts
+            .iter()
+            .map(|node| node.node_key.as_str())
+            .collect();
         // @cpt-end:cpt-cf-construct-algo-profile-writer-write:p1:inst-write-read-root
 
         // @cpt-begin:cpt-cf-construct-algo-profile-writer-write:p1:inst-write-pending
-        // Removals an earlier write committed but could not finish.
-        let pending = match stored {
-            Some(root) => self.remove(ctx, root.removals).await,
-            None => Vec::new(),
-        };
+        // Earlier removals still listed: one whose fact is gone is done and
+        // drops off the list. Only a live fact of this root is ever removed, so
+        // a key that is not one of its facts is never deleted.
+        let pending: BTreeSet<String> = stored
+            .root
+            .removals
+            .into_iter()
+            .filter(|key| live.contains(key.as_str()))
+            .collect();
         // @cpt-end:cpt-cf-construct-algo-profile-writer-write:p1:inst-write-pending
 
         // @cpt-begin:cpt-cf-construct-algo-profile-writer-write:p1:inst-write-batch
+        let root = root_key(&subject);
         let Changes {
             mut nodes,
             edges,
             removals,
-        } = changes(plan, &root_key, OffsetDateTime::now_utc())?;
-        let root = Root {
-            version: self.ports.version.next(version),
-            removals: pending
-                .into_iter()
-                .chain(removals.iter().cloned())
-                .collect(),
-        };
+        } = changes(plan, &root, OffsetDateTime::now_utc())?;
+        if let Some(key) = removals.iter().find(|key| !live.contains(key.as_str())) {
+            return Err(DomainError::internal(format!(
+                "the plan removes {key}, which is not a fact of the profile it was built on"
+            )));
+        }
+        // A fact listed for removal still counts until its delete has run, so
+        // a profile never grows past what one read takes, even when deletes
+        // fail.
+        if live.len() + nodes.len() > self.max_facts {
+            return Err(DomainError::ProfileFull(format!(
+                "the profile of subject {} holds {} facts; {} more would pass the limit of {}",
+                plan.subject_id,
+                live.len(),
+                nodes.len(),
+                self.max_facts
+            )));
+        }
+        let listed: BTreeSet<String> = pending.into_iter().chain(removals).collect();
+        let version = self.ports.version.next(stored.version)?;
+        let payload = Root {
+            removals: listed.iter().cloned().collect(),
+        }
+        .payload(plan.subject_id, self.ports.version.as_ref(), version)?;
         nodes.push(NodeSpec {
-            node_key: root_key,
+            node_key: root.0,
             type_id: PROFILE_ROOT_TYPE.to_owned(),
             name: None,
-            payload: Some(root.payload(plan.subject_id)),
-            expected_version: Some(self.ports.version.expected(version)),
+            payload: Some(payload),
+            expected_version: Some(self.ports.version.expected(stored.version)?),
         });
         let request = IngestRequest {
             nodes,
@@ -300,9 +352,9 @@ impl PlanWriter for GraphPlanWriter {
         let written = self.ingest(ctx, request).await?;
         if written == Written::Stored {
             // @cpt-begin:cpt-cf-construct-algo-profile-writer-write:p1:inst-write-cleanup
-            // Committed: the removed facts are already listed on the root, so
-            // a removal that fails now is finished by the next write.
-            self.remove(ctx, removals).await;
+            // Committed: every listed fact is already left out of reads, so a
+            // removal that fails now is finished by a later write.
+            self.remove(ctx, &listed).await;
             // @cpt-end:cpt-cf-construct-algo-profile-writer-write:p1:inst-write-cleanup
         }
         Ok(written)
