@@ -13,7 +13,7 @@ use uuid::Uuid;
 /// maps its numbered values back to node keys and gives each new entity a new
 /// one.
 #[domain_model]
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct NodeKey(pub String);
 
 /// Who a plan comes from. The connector of a record is the source of the trust

@@ -42,7 +42,7 @@ fn the_root_key_names_tenant_and_subject() {
 fn a_root_payload_reads_back_as_written_with_the_counter_stamped() {
     let subject = Uuid::new_v4();
     let root = Root {
-        removals: vec!["construct:t:a".to_owned()],
+        removals: vec![NodeKey("construct:t:a".to_owned())],
     };
 
     let payload = root.payload(subject, &PayloadCounter, 4).unwrap();

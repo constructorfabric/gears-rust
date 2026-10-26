@@ -1,3 +1,5 @@
+use std::fmt;
+
 use async_trait::async_trait;
 use construct_sdk::gts::{IDENTITY_TYPE, PREFERENCE_TYPE, ROLE_TYPE, SKILL_TYPE};
 use serde_json::Value;
@@ -7,6 +9,7 @@ use uuid::Uuid;
 
 use super::error::DomainError;
 use super::plan::{NodeKey, Plan};
+use super::subject_settings::SubjectKey;
 
 /// A category of a person's profile: one person type in graph storage.
 #[domain_model]
@@ -79,6 +82,29 @@ pub struct Fact {
 pub struct Profile {
     pub version: Option<u64>,
     pub facts: Vec<Fact>,
+}
+
+/// A profile that holds, or would hold, more facts than it may: more than one
+/// read takes.
+#[domain_model]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FullProfile {
+    pub subject: SubjectKey,
+    /// The facts the profile would hold after the write; after a read cut
+    /// short, the least it holds.
+    pub facts: usize,
+    /// The most facts it may hold.
+    pub limit: usize,
+}
+
+impl fmt::Display for FullProfile {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "the profile of subject {} in tenant {} reaches {} facts, past the limit of {}",
+            self.subject.subject_id, self.subject.tenant_id, self.facts, self.limit
+        )
+    }
 }
 
 /// Reads a subject's profile and its version from graph storage.

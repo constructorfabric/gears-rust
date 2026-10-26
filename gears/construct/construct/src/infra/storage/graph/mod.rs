@@ -76,6 +76,18 @@ pub(crate) async fn bounded<T>(
     })
 }
 
+/// A subject in the security context's tenant. Only [`subject_in_context`]
+/// makes one, so a profile read or write that takes it has passed the tenant
+/// check.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ContextSubject(SubjectKey);
+
+impl ContextSubject {
+    pub(crate) fn key(&self) -> &SubjectKey {
+        &self.0
+    }
+}
+
 /// `subject` when it is in the context's tenant. Graph storage reads and
 /// writes in the security context's tenant, and the profile's keys name a
 /// tenant too, so the two must be the same.
@@ -87,7 +99,7 @@ pub(crate) async fn bounded<T>(
 pub(crate) fn subject_in_context(
     ctx: &SecurityContext,
     subject: SubjectKey,
-) -> Result<SubjectKey, DomainError> {
+) -> Result<ContextSubject, DomainError> {
     let context_tenant = ctx.subject_tenant_id();
     if context_tenant != subject.tenant_id {
         return Err(DomainError::internal(format!(
@@ -95,5 +107,5 @@ pub(crate) fn subject_in_context(
             subject.tenant_id
         )));
     }
-    Ok(subject)
+    Ok(ContextSubject(subject))
 }

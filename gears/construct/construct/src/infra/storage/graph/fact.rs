@@ -1,7 +1,7 @@
 use graph_storage_sdk::models::{NodeSpec, NodeView};
 use serde_json::{Map, Number, Value, json};
-use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
+use time::{OffsetDateTime, UtcOffset};
 
 use crate::domain::error::DomainError;
 use crate::domain::plan::{Change, NodeKey, Origin, Plan, Property, Step};
@@ -13,14 +13,21 @@ const METHOD_MCP: &str = "mcp.manage_facts";
 const METHOD_REVIEW: &str = "review.correction";
 const METHOD_ADMIN: &str = "admin.edit";
 
+/// The members of a fact's payload besides its one fact property.
+const ORIGIN: &str = "origin";
+const RECORD: &str = "record";
+const ENVELOPE: [&str; 2] = [ORIGIN, RECORD];
+
 /// The category whose plain name the plan's step carries.
 fn category(entity_kind: &str) -> Result<Category, DomainError> {
     Category::from_name(entity_kind)
         .ok_or_else(|| DomainError::internal(format!("unknown entity kind `{entity_kind}`")))
 }
 
+/// `at` in UTC, so every stored time has the same offset and compares as text.
 fn timestamp(at: OffsetDateTime, what: &str) -> Result<String, DomainError> {
-    at.format(&Rfc3339)
+    at.to_offset(UtcOffset::UTC)
+        .format(&Rfc3339)
         .map_err(|err| DomainError::internal(format!("{what} {at} has no RFC 3339 form: {err}")))
 }
 
@@ -119,7 +126,7 @@ pub fn fact_node(
     let property = single(properties)?;
     let mut payload = Map::new();
     payload.insert(property.name.clone(), property.value.clone());
-    payload.insert("origin".to_owned(), origin(plan, step, now)?);
+    payload.insert(ORIGIN.to_owned(), origin(plan, step, now)?);
     if let Origin::Connector {
         connector,
         provenance,
@@ -128,7 +135,7 @@ pub fn fact_node(
     } = &plan.origin
     {
         payload.insert(
-            "record".to_owned(),
+            RECORD.to_owned(),
             json!({ "connector": connector, "provenance": provenance, "version": version }),
         );
     }
@@ -148,16 +155,30 @@ fn property_change(kind: &str) -> DomainError {
     ))
 }
 
-/// The fact a stored node holds, or `None` for a node that is not a fact of a
-/// person type, or holds no fact property.
-#[must_use]
-pub fn fact_of(node: &NodeView) -> Option<Fact> {
-    let category = Category::from_type_id(&node.type_id)?;
-    let payload = node.payload.as_ref()?.as_object()?;
-    let (property, value) = payload
+/// The fact a stored fact node holds.
+///
+/// # Errors
+///
+/// When the node is of no person type, has no payload, or does not hold
+/// exactly one fact property besides its origin and record. Graph storage's
+/// validation does not rule out the last, so it is a defect of the stored
+/// node, reported with its key and never with a value.
+pub fn fact_of(node: &NodeView) -> Result<Fact, DomainError> {
+    let defect = |what: &str| DomainError::internal(format!("fact {} {what}", node.node_key));
+    let category =
+        Category::from_type_id(&node.type_id).ok_or_else(|| defect("is of no person type"))?;
+    let payload = node
+        .payload
+        .as_ref()
+        .and_then(Value::as_object)
+        .ok_or_else(|| defect("has no payload"))?;
+    let mut properties = payload
         .iter()
-        .find(|(name, _)| *name != "origin" && *name != "record")?;
-    Some(Fact {
+        .filter(|(name, _)| !ENVELOPE.contains(&name.as_str()));
+    let (Some((property, value)), None) = (properties.next(), properties.next()) else {
+        return Err(defect("does not hold exactly one fact property"));
+    };
+    Ok(Fact {
         node_key: NodeKey(node.node_key.clone()),
         category,
         property: property.clone(),

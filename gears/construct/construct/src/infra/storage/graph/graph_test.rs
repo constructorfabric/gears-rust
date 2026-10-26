@@ -38,7 +38,7 @@ use super::reader::{GraphProfileSource, MAX_FACTS, MAX_PROFILE_NODES};
 use super::root::{PayloadCounter, Root, root_key};
 use super::types::GraphTypes;
 use super::writer::{
-    DEFAULT_ATTEMPTS, FactRemoval, GraphPlanWriter, SoftDelete, WriterPorts, unknown_result,
+    DEFAULT_ATTEMPTS, FactRemoval, GraphPlanWriter, SoftDelete, WriterPorts, jitter, resendable,
 };
 use super::{DEFAULT_CALL_TIMEOUT, graph_error};
 use crate::domain::error::DomainError;
@@ -161,6 +161,8 @@ struct Scripted {
     reads: Mutex<Vec<TraverseRequest>>,
     /// Marks every traversal as cut short for this reason.
     cut_reads: Mutex<Option<TruncationReason>>,
+    /// Gives every traversed edge this type instead of its own.
+    retype_edges: Mutex<Option<String>>,
     hang_reads: AtomicBool,
     registrations: AtomicU32,
     fail_next_registration: AtomicBool,
@@ -177,6 +179,7 @@ impl Scripted {
             sent_at: Mutex::default(),
             reads: Mutex::default(),
             cut_reads: Mutex::default(),
+            retype_edges: Mutex::default(),
             hang_reads: AtomicBool::new(false),
             registrations: AtomicU32::new(0),
             fail_next_registration: AtomicBool::new(false),
@@ -302,6 +305,11 @@ impl GraphStorageClientV1 for Scripted {
         let mut response = self.inner.traverse(ctx, request).await?;
         if let Some(reason) = *self.cut_reads.lock().unwrap() {
             response.truncated = Some(reason);
+        }
+        if let Some(type_id) = self.retype_edges.lock().unwrap().clone() {
+            for edge in &mut response.edges {
+                edge.edge_type_id.clone_from(&type_id);
+            }
         }
         Ok(response)
     }
@@ -562,7 +570,7 @@ async fn a_removal_that_is_done_drops_off_the_root_on_the_next_write() {
     profiles.given(Some(1), vec![replace(&old, "Go")]).await;
     assert_eq!(
         profiles.root().await.unwrap().removals,
-        std::slice::from_ref(&old)
+        [FactKey(old.clone())]
     );
 
     let written = profiles.write(Some(2), vec![add_skill("Zig")]).await;
@@ -654,19 +662,46 @@ async fn two_first_writes_create_the_root_once() {
 }
 
 #[tokio::test]
-async fn a_compare_and_set_refused_at_the_ingest_is_a_conflict() {
+async fn a_root_written_outside_construct_refuses_every_write_as_a_defect() {
     let profiles = Profiles::new();
-    let scripted = Scripted::over(Arc::clone(&profiles.client));
-    scripted.script([Ingest::Fail(cas_conflict)]);
+    profiles.given(None, vec![add_skill("Rust")]).await;
+    // Someone else changes the root but not its counter: graph storage's
+    // version moves to 2, the counter stays at 1.
+    let unchanged = Root {
+        removals: vec![FactKey("construct:elsewhere".to_owned())],
+    }
+    .payload(profiles.subject, &PayloadCounter, 1)
+    .unwrap();
+    profiles
+        .ingest_directly(IngestRequest {
+            nodes: vec![NodeSpec {
+                node_key: root_key(&profiles.subject_key()).0,
+                type_id: construct_sdk::gts::PROFILE_ROOT_TYPE.to_owned(),
+                name: None,
+                payload: Some(unchanged),
+                expected_version: Some(1),
+            }],
+            ..IngestRequest::default()
+        })
+        .await;
 
-    let written = profiles
-        .scripted_writer(&scripted)
-        .write(&profiles.ctx, &profiles.plan(None, vec![add_skill("Rust")]))
-        .await
-        .unwrap();
-
-    assert_eq!(written, Written::Conflict);
-    assert_eq!(profiles.read().await.version, None);
+    for attempt in 0..2 {
+        let written = profiles
+            .writer()
+            .write(
+                &profiles.ctx,
+                &profiles.plan(Some(1), vec![add_skill("Go")]),
+            )
+            .await;
+        match written {
+            Err(DomainError::Internal(msg)) => assert!(
+                msg.contains(&root_key(&profiles.subject_key()).0),
+                "names the root: {msg}"
+            ),
+            other => panic!("attempt {attempt}: {other:?}"),
+        }
+    }
+    assert_eq!(profiles.read().await.facts.len(), 1, "nothing landed");
 }
 
 // --- Removals ------------------------------------------------------------------
@@ -676,7 +711,7 @@ struct BrokenRemoval;
 
 #[async_trait]
 impl FactRemoval for BrokenRemoval {
-    async fn remove(&self, _ctx: &SecurityContext, _key: &str) -> Result<(), DomainError> {
+    async fn remove(&self, _ctx: &SecurityContext, _key: &FactKey) -> Result<(), DomainError> {
         Err(DomainError::Unavailable("graph storage is down".to_owned()))
     }
 }
@@ -702,7 +737,7 @@ async fn a_removal_that_fails_stays_listed_and_a_later_write_finishes_it() {
     assert!(profiles.is_live(&old).await, "the soft delete did not run");
     assert_eq!(
         profiles.root().await.unwrap().removals,
-        std::slice::from_ref(&old)
+        [FactKey(old.clone())]
     );
     assert_eq!(
         values(&profiles.read().await),
@@ -726,7 +761,7 @@ async fn a_listed_key_that_is_not_a_fact_of_the_root_is_never_deleted() {
     // Someone else rewrites this subject's root to list the other subject's fact.
     let root = root_key(&profiles.subject_key());
     let planted = Root {
-        removals: vec![their_key.clone()],
+        removals: vec![FactKey(their_key.clone())],
     }
     .payload(profiles.subject, &PayloadCounter, 2)
     .unwrap();
@@ -760,11 +795,12 @@ async fn a_soft_delete_of_a_fact_already_removed_is_done() {
     profiles.given(None, vec![first]).await;
     let removal = SoftDelete::new(Arc::clone(&profiles.client));
 
+    let key = FactKey(key);
     removal.remove(&profiles.ctx, &key).await.unwrap();
     let again = removal.remove(&profiles.ctx, &key).await;
 
     assert!(again.is_ok(), "{again:?}");
-    assert!(!profiles.is_live(&key).await);
+    assert!(!profiles.is_live(&key.0).await);
 }
 
 #[tokio::test]
@@ -772,7 +808,10 @@ async fn a_soft_delete_of_a_fact_graph_storage_does_not_hold_fails_and_names_it(
     let profiles = Profiles::new();
 
     let removed = SoftDelete::new(Arc::clone(&profiles.client))
-        .remove(&profiles.ctx, "construct:never-written")
+        .remove(
+            &profiles.ctx,
+            &FactKey("construct:never-written".to_owned()),
+        )
         .await;
 
     match removed {
@@ -791,7 +830,7 @@ struct CountingBrokenRemoval {
 
 #[async_trait]
 impl FactRemoval for CountingBrokenRemoval {
-    async fn remove(&self, _ctx: &SecurityContext, _key: &str) -> Result<(), DomainError> {
+    async fn remove(&self, _ctx: &SecurityContext, _key: &FactKey) -> Result<(), DomainError> {
         self.asked.fetch_add(1, Ordering::SeqCst);
         Err(DomainError::Unavailable("graph storage is down".to_owned()))
     }
@@ -801,7 +840,7 @@ impl FactRemoval for CountingBrokenRemoval {
 async fn the_cleanup_stops_at_the_first_failed_removal_and_every_key_stays_listed() {
     let profiles = Profiles::new();
     let (rust, go) = (add_skill("Rust"), add_skill("Go"));
-    let mut keys = vec![key_of(&rust), key_of(&go)];
+    let mut keys = [key_of(&rust), key_of(&go)];
     keys.sort();
     profiles.given(None, vec![rust, go]).await;
     let removal = Arc::new(CountingBrokenRemoval::default());
@@ -824,7 +863,10 @@ async fn the_cleanup_stops_at_the_first_failed_removal_and_every_key_stays_liste
         1,
         "no removal after a failed one"
     );
-    assert_eq!(profiles.root().await.unwrap().removals, keys);
+    assert_eq!(
+        profiles.root().await.unwrap().removals,
+        keys.iter().cloned().map(FactKey).collect::<Vec<_>>()
+    );
     assert!(profiles.read().await.facts.is_empty());
 }
 
@@ -857,6 +899,68 @@ async fn a_node_with_an_edge_into_the_root_is_not_read_as_a_fact() {
 }
 
 #[tokio::test]
+async fn a_node_reached_by_an_edge_of_another_type_is_not_read_as_a_fact() {
+    let profiles = Profiles::new();
+    profiles.given(None, vec![add_skill("Go")]).await;
+    let scripted = Scripted::over(Arc::clone(&profiles.client));
+    // The traversal's pattern also matches types derived from has-fact.
+    *scripted.retype_edges.lock().unwrap() = Some(format!(
+        "{}cf.construct.test.derived.v1~",
+        construct_sdk::gts::HAS_FACT_TYPE
+    ));
+
+    let profile = GraphProfileSource::new(
+        Arc::clone(&scripted) as Arc<dyn GraphStorageClientV1>,
+        Arc::new(PayloadCounter),
+    )
+    .read(&profiles.ctx, profiles.tenant, profiles.subject)
+    .await
+    .unwrap();
+
+    assert_eq!(profile.version, Some(1));
+    assert!(profile.facts.is_empty(), "{profile:?}");
+}
+
+/// A removal that never answers.
+struct HangingRemoval;
+
+#[async_trait]
+impl FactRemoval for HangingRemoval {
+    async fn remove(&self, _ctx: &SecurityContext, _key: &FactKey) -> Result<(), DomainError> {
+        std::future::pending().await
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_cleanup_that_runs_out_of_time_leaves_every_key_listed_and_the_write_stored() {
+    let profiles = Profiles::new();
+    let (rust, go) = (add_skill("Rust"), add_skill("Go"));
+    let mut keys = [key_of(&rust), key_of(&go)];
+    keys.sort();
+    profiles.given(None, vec![rust, go]).await;
+    let timeout = Duration::from_secs(1);
+    let writer = Profiles::writer_with(Arc::clone(&profiles.client), Arc::new(HangingRemoval))
+        .with_timeout(timeout);
+    let started = tokio::time::Instant::now();
+
+    let written = writer
+        .write(
+            &profiles.ctx,
+            &profiles.plan(Some(1), vec![remove(&keys[0]), remove(&keys[1])]),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(written, Written::Stored);
+    let waited = started.elapsed();
+    assert!(waited >= timeout && waited < timeout * 2, "{waited:?}");
+    assert_eq!(
+        profiles.root().await.unwrap().removals,
+        keys.iter().cloned().map(FactKey).collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
 async fn a_plan_that_removes_a_fact_not_in_its_profile_is_refused() {
     let profiles = Profiles::new();
     profiles.given(None, vec![add_skill("Rust")]).await;
@@ -884,7 +988,7 @@ async fn a_full_profile_takes_no_new_fact_but_takes_a_removal() {
     let first = add_skill("Rust");
     let old = key_of(&first);
     profiles.given(None, vec![first]).await;
-    let writer = profiles.writer().with_max_facts(1);
+    let writer = profiles.writer().with_max_facts(1).unwrap();
 
     let added = writer
         .write(
@@ -990,7 +1094,7 @@ async fn a_profile_read_asks_for_the_root_and_at_most_its_facts() {
 }
 
 #[tokio::test]
-async fn a_profile_at_the_limit_takes_no_new_fact_whatever_limit_the_writer_is_given() {
+async fn a_profile_at_the_limit_takes_no_new_fact() {
     let profiles = Profiles::new();
     let all: Vec<Step> = (0..MAX_FACTS)
         .map(|n| add_skill(&format!("skill {n}")))
@@ -1004,7 +1108,6 @@ async fn a_profile_at_the_limit_takes_no_new_fact_whatever_limit_the_writer_is_g
 
     let added = profiles
         .writer()
-        .with_max_facts(usize::MAX)
         .write(
             &profiles.ctx,
             &profiles.plan(Some(1), vec![add_skill("one more")]),
@@ -1051,6 +1154,17 @@ async fn a_profile_past_what_one_read_takes_is_full() {
         .await;
 
     assert!(matches!(read, Err(DomainError::ProfileFull(_))), "{read:?}");
+}
+
+#[test]
+fn a_writer_refuses_a_limit_past_what_one_read_takes() {
+    let profiles = Profiles::new();
+
+    assert!(profiles.writer().with_max_facts(MAX_FACTS).is_ok());
+    assert!(matches!(
+        profiles.writer().with_max_facts(MAX_FACTS + 1),
+        Err(DomainError::Internal(_))
+    ));
 }
 
 // --- Retries and timeouts --------------------------------------------------------
@@ -1199,31 +1313,48 @@ async fn a_read_without_an_answer_in_time_is_unavailable() {
     let scripted = Scripted::over(Arc::clone(&profiles.client));
     scripted.hang_reads.store(true, Ordering::SeqCst);
 
+    let started = tokio::time::Instant::now();
+
     let read = GraphProfileSource::new(
         Arc::clone(&scripted) as Arc<dyn GraphStorageClientV1>,
         Arc::new(PayloadCounter),
     )
-    .with_timeout(DEFAULT_CALL_TIMEOUT)
     .read(&profiles.ctx, profiles.tenant, profiles.subject)
     .await;
 
     assert!(matches!(read, Err(DomainError::Unavailable(_))), "{read:?}");
+    let waited = started.elapsed();
+    assert!(
+        waited >= DEFAULT_CALL_TIMEOUT && waited < DEFAULT_CALL_TIMEOUT * 2,
+        "the default bound: {waited:?}"
+    );
 }
 
 #[test]
-fn only_a_write_whose_result_is_unknown_is_sent_again() {
-    assert!(unknown_result(&serialization()));
-    assert!(unknown_result(&unavailable()));
-    assert!(unknown_result(
+fn the_pause_carries_a_random_share_of_up_to_all_of_it() {
+    let pause = Duration::from_millis(100);
+
+    let draws: Vec<Duration> = (0..200).map(|_| jitter(pause)).collect();
+
+    assert!(draws.iter().all(|draw| *draw <= pause), "{draws:?}");
+    let distinct: std::collections::BTreeSet<_> = draws.iter().collect();
+    assert!(distinct.len() > 1, "random, not fixed: {distinct:?}");
+}
+
+#[test]
+fn only_a_write_that_is_safe_to_send_again_is_resent() {
+    assert!(resendable(&serialization()));
+    assert!(resendable(&unavailable()));
+    assert!(resendable(
         &GraphTestError::deadline_exceeded("slow").create()
     ));
     assert!(
-        !unknown_result(&GraphTestError::unknown("lost").create()),
+        !resendable(&GraphTestError::unknown("lost").create()),
         "an unknown error says nothing about the write"
     );
-    assert!(!unknown_result(&cas_conflict()));
-    assert!(!unknown_result(&aborted("IDEMPOTENCY_MISMATCH")));
-    assert!(!unknown_result(
+    assert!(!resendable(&cas_conflict()));
+    assert!(!resendable(&aborted("IDEMPOTENCY_MISMATCH")));
+    assert!(!resendable(
         &GraphTestError::invalid_argument()
             .with_field_violation("payload", "refused", "SCHEMA_VIOLATION")
             .create()

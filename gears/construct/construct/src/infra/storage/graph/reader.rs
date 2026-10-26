@@ -11,10 +11,10 @@ use uuid::Uuid;
 
 use super::fact::fact_of;
 use super::root::{ProfileVersion, Root, root_key};
-use super::{DEFAULT_CALL_TIMEOUT, bounded, graph_error, subject_in_context};
+use super::{ContextSubject, DEFAULT_CALL_TIMEOUT, bounded, graph_error, subject_in_context};
 use crate::domain::error::DomainError;
 use crate::domain::plan::NodeKey;
-use crate::domain::profile::{Category, Profile, ProfileSource};
+use crate::domain::profile::{Category, FullProfile, Profile, ProfileSource};
 use crate::domain::subject_settings::SubjectKey;
 
 /// The most nodes one profile read takes: the root and its facts. Graph
@@ -39,16 +39,18 @@ pub(crate) struct Stored {
 /// # Errors
 ///
 /// [`DomainError::ProfileFull`] when the profile is larger than one read
-/// takes; unavailable when graph storage does not answer in time; any other
+/// takes; internal when graph storage cut the read short for another reason;
+/// unavailable when graph storage does not answer in time; any other
 /// failure as [`super::graph_error`] maps it.
 pub(crate) async fn read_stored(
     client: &dyn GraphStorageClientV1,
     versions: &dyn ProfileVersion,
     timeout: Duration,
     ctx: &SecurityContext,
-    subject: &SubjectKey,
+    subject: &ContextSubject,
 ) -> Result<Stored, DomainError> {
     // @cpt-begin:cpt-cf-construct-algo-profile-writer-read:p1:inst-read-traverse
+    let subject = subject.key();
     let NodeKey(key) = root_key(subject);
     let request = TraverseRequest {
         seeds: vec![key.clone()],
@@ -76,10 +78,13 @@ pub(crate) async fn read_stored(
     match response.truncated {
         None => {}
         Some(TruncationReason::NodeBudget) => {
-            return Err(DomainError::ProfileFull(format!(
-                "the profile of subject {} holds more facts than one read takes",
-                subject.subject_id
-            )));
+            // The read took the root and as many facts as it could, and
+            // there were more.
+            return Err(DomainError::ProfileFull(FullProfile {
+                subject: *subject,
+                facts: response.nodes.len(),
+                limit: MAX_FACTS,
+            }));
         }
         Some(reason) => {
             return Err(DomainError::internal(format!(
@@ -101,12 +106,11 @@ pub(crate) async fn read_stored(
         .collect();
     let facts = response
         .nodes
-        .iter()
+        .into_iter()
         .filter(|node| {
             pointed.contains(node.node_key.as_str())
                 && Category::from_type_id(&node.type_id).is_some()
         })
-        .cloned()
         .collect();
     Ok(Stored {
         version: Some(version),
@@ -170,13 +174,18 @@ impl ProfileSource for GraphProfileSource {
         .await?;
 
         // @cpt-begin:cpt-cf-construct-algo-profile-writer-read:p1:inst-read-facts
-        let listed: BTreeSet<&str> = stored.root.removals.iter().map(String::as_str).collect();
+        let listed: BTreeSet<&str> = stored
+            .root
+            .removals
+            .iter()
+            .map(|key| key.0.as_str())
+            .collect();
         let facts = stored
             .facts
             .iter()
             .filter(|node| !listed.contains(node.node_key.as_str()))
-            .filter_map(fact_of)
-            .collect();
+            .map(fact_of)
+            .collect::<Result<_, _>>()?;
         Ok(Profile {
             version: stored.version,
             facts,
