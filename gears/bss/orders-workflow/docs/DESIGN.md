@@ -289,7 +289,7 @@ remediation code path.
 - [ ] `p2` - **ID**: `cpt-cf-bss-orders-workflow-constraint-no-price-computation`
 
 This gear performs no arithmetic, derivation, aggregation or currency conversion over price data.
-The only price access anywhere in the design is reading the stored TCV figure — Rating-computed,
+The only price access anywhere in the design is reading the stored valuation figure — the TCV, or the figure Lifecycle stores for the basis the approval policy owner chooses (D-230, D-235) — Rating-computed,
 Lifecycle-stored, an integer in minor units with its currency and scale (D-198) — through
 Lifecycle's immutable version read, solely to include it (as an opaque figure) in the
 `OrderApprovalRequest` context passed to the approval policy adapter; `plan_revision_id`,
@@ -1544,7 +1544,7 @@ owner and one release vehicle:
 | Change | Vehicle | Owner |
 |--------|---------|-------|
 | Reorder, insert or drop a `composable` step (except a `p1` composable on its required path); change a re-check tick, a retry policy, a `switch` predicate over returned enums or an escalation arm, inside the nesting rule — the full list is the one table of [`design/10`](./design/10-process-definition.md) §4.7 (D-136) | **A new definition version**, published by the definition publish job after the ADR-0012 fence and the behavioural gate pass; no Orders build or deploy (D-138) | Definition owners (code owners of `definitions/`); the publish job holds the platform-operator publish role (seller-scoped fragments: Q-10) |
-| An approval escalation window, the overdue window, a manual-task SLA class, the partial-failure policy | **A write of the seller's policy**: a promotion of `owf_seller_policy` rows on the policy channel, bounds-checked before commit and recorded in `owf_configuration_revision` (D-160), with no slice build and no definition version; it reaches only records pinned after it (D-134, D-140) | Platform operations, on the seller's request; the foundation's policy load validates and writes (`design/01-foundation.md` §3.7) |
+| An approval escalation window, the overdue window, a manual-task SLA class, the partial-failure policy, the payment wait and its expiry action (D-228) | **A write of the seller's policy**: a promotion of `owf_seller_policy` rows on the policy channel, bounds-checked before commit and recorded in `owf_configuration_revision` (D-160), with no slice build and no definition version; it reaches only records pinned after it (D-134, D-140) | Platform operations, on the seller's request; the foundation's policy load validates and writes (`design/01-foundation.md` §3.7) |
 | What a **step** does — a guard, a seam call, a record change, an input or output schema, a new operation, the `protected` list | **An Orders release** of the slice that owns the operation, plus a definition version that uses it | The owning slice |
 | A **task** — one named `call`, `listen`, `wait` or `switch` in the flow | Belongs to a **definition version**; it is never edited in place — a new version is published | `design/10` |
 | A **process event type** or a **Lifecycle trigger** | A **PRD-level** question, because the PRD enumerates both closed sets; the definition's closed `listen` set follows the PRD, never the reverse | PRD owner |
@@ -1573,8 +1573,8 @@ gear's database. **Operation-side values** — the per-operation deadlines, the 
 floor, the producer-queue partition count and profile, the clock-skew tolerance, the
 circuit-breaker thresholds, the admission caps and the idempotency-key lifetime — are **gear
 configuration promoted through environments with the deployment**. **Per-seller policy values** —
-the partial-failure policy election, the approval escalation window, the overdue window and the
-manual-task SLA classes — live as rows of the foundation's `owf_seller_policy`
+the partial-failure policy election, the approval escalation window, the overdue window, the
+manual-task SLA classes and the payment wait with its expiry action (D-228) — live as rows of the foundation's `owf_seller_policy`
 (`design/01-foundation.md` §3.7, decision D-140): a platform row carrying the defaults and one row
 per seller that overrides any of them. A change is a promotion on the policy channel that
 Lifecycle already uses for its own policy rows, checked against the bounds before it commits and

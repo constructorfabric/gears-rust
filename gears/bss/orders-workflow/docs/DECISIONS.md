@@ -6852,6 +6852,8 @@ closed into review.
 
 ### D-229 (M) The named-user condition travels with the request; generation-bound reassignment; an unresolved assignee parks
 
+> **Amended by D-235 (2026-10-26)**: the named approver comes from the approval policy adapter's routing configuration, never from seller policy.
+
 **Accepted (2026-10-21).** *(PR #4787 proposal item 7, this gear's side; extends D-56, D-197, D-224)*
 
 **Decision**: `open-gates` reads the one named user the seller's tenant-scoped configuration
@@ -6876,6 +6878,8 @@ is this gear's to fix now, and the library ask (D-224) carries only what this ge
 (`assignee-unresolved`, `not-assignee`, `stale-generation`); `UPSTREAM_REQS.md` §2.3; D-56, D-224.
 
 ### D-230 (M) The approval request carries a valuation for the policy's chosen basis, or `unavailable`, in the shared money representation
+
+> **Amended by D-235 (2026-10-26)**: the basis is returned by the approval policy adapter with the routing configuration; `owf_seller_policy.approval_valuation_basis` is withdrawn.
 
 **Accepted (2026-10-21).** *(PR #4787 proposal item 8, this gear's side; extends D-198, D-225)*
 
@@ -6932,6 +6936,122 @@ answer into a settled outcome.
 
 **Propagated**: `DESIGN.md` §3.4 (Orders Lifecycle row); `design/06-saga-and-compensation.md` §4.9;
 Lifecycle `DECISIONS.md` D-219, D-220.
+
+### D-232 (H) A successor draft is authorized by an observed void alone, names its predecessor, and leaves the predecessor a historical success
+
+**Accepted (2026-10-26).** *(PR #4787 comment of 2026-10-23, item 4, rows 1, 2, 3 and 5; the PR author chose "a seen void is always enough")*
+
+**Decision**: the Draft-Liveness Re-reader records `lapsed` only on a read that **observes** the
+draft `voided`, stamping `void_observed_at` and `void_cause`. `rebuild-wave1` refuses a line unless
+its current `draft_create` row is `lapsed` with `void_observed_at` set and no
+`external_activation_observed_at`; a new key, a new attempt or an unevaluable read authorizes
+nothing. A confirmed non-application through `SUB-O17` is **not** required. The successor's
+`draft_create` row carries `predecessor_intent_id`, and the create names the predecessor's
+transition request and subscription, so Subscriptions keeps the acquisition, reservation,
+commercial and benefit references resolved from the order version (new ask `SUB-O18`). A lapsed row
+is a historical success — created, confirmed and later voided — never `failed`, its step-completion
+event stands, and the progress read reports it as created-then-lapsed.
+
+**Rationale**: the rebuild path minted a new attempt on any `lapsed` row and linked nothing, so a
+purchase could be recreated rather than re-materialized. The author accepted the residual risk of
+not waiting for `SUB-O17`: a request for the predecessor delayed past the create's de-duplication
+lifetime may still be applied after the successor. That risk is bounded because only the successor
+is ever activated and any second draft is a subject of a later unwind; waiting for `SUB-O17` would
+block every rebuild until Subscriptions ships it.
+
+**Propagated**: `design/05-provisioning-intents.md` §3.2 (*Draft-Liveness Re-reader*, *Wave-1
+Rebuilder*), §3.3 (`reread-draft-liveness`, `rebuild-wave1`), §3.6 (`inst-rb-verify`,
+`inst-rb-reset`, `inst-pi-pre-dispatch`), §3.7 (`void_observed_at`, `void_cause`,
+`predecessor_intent_id`, `status`), §4.1 (`SUB-O18`), §4.4 (*Lapsed is not voided*, *Rebuild
+authorization*); `UPSTREAM_REQS.md` §2.1 (`SUB-O18`); `PRD.md` §6.3, AC 5d; D-209, D-220.
+
+### D-233 (H) A draft found active is never rebuilt; without an activation of this gear the order fails and the walk cancels it
+
+**Accepted (2026-10-26).** *(PR #4787 comment of 2026-10-23, item 4, row 4; the PR author chose "fail the order and unwind")*
+
+**Decision**: the re-read gains an applied-or-active answer. Where the line carries this gear's
+activation intent under its current `wave2_attempt`, the line is that intent's and
+`reconcile-intent` recovers it. Otherwise the re-reader stamps `external_activation_observed_at` on
+the `draft_create` row and the line is reported in `externallyActivated[]`; the definition routes it
+to the unwind under either policy, first among the answer's cases, with no manual task and no
+rebuild. The fence finds the cause in the record (reason `draft-activated-externally`, mapped to
+Lifecycle's `line-execution-failed` as an interim value), and the freeze lists the subscription,
+because the `draft_create` row carries its `subscription_id`, so the walk cancels it through the
+activated-cancel leg.
+
+**Rationale**: a subscription this gear did not activate is not adopted, because the completion
+report would then assert an activation this gear did not perform; an operator task was the safer
+alternative, and the author chose the consistent automatic path, accepting that a subscription
+which may be correct is cancelled.
+
+**Propagated**: `design/05-provisioning-intents.md` §3.2, §3.3 (`reread-draft-liveness` and
+`dispatch-wave2-activate` outputs), §3.6 (`inst-pi-reread-gate`), §3.7
+(`external_activation_observed_at`), §4.4 (*No rebuild over an active subscription*), §4.5 item 5a;
+`design/06-saga-and-compensation.md` §3.6 (`inst-fence-cause`), §4.8; `design/10-process-definition.md`
+§3.6 (`onWave2`, `wave2ExternallyActivated`); `design/01-foundation.md` §4.9; `PRD.md` §6.3, AC 5g.
+
+### D-234 (M) `OrderFulfillmentAborted` is published on every unwind with its mode and the retained obligations
+
+**Accepted (2026-10-26).** *(PR #4787 comment of 2026-10-23, item 4, row 6; the PR author chose "publish the aborted event on every unwind"; refines D-227, ADR-0008)*
+
+**Decision**: `report-outcome` builds `retainedObligations[]` in every mode — every line's binding
+reference with its subject outcomes and `fulfillmentBegun`, stating that this gear released nothing
+but what it created — and enqueues `OrderFulfillmentAborted` with `mode` ∈ `failed` · `cancelled` ·
+`superseded` · `terminal-event` on every unwind: supersession, an order Lifecycle already holds
+terminal (the D-208 operator-forced unwind included) and any failure or cancel before
+begin-fulfillment, none of which makes a Lifecycle call. The list also travels with the Lifecycle
+call where one is made. Lifecycle and Billing are asked to accept the event in the new cases.
+
+**Rationale**: D-227's list travelled only with the Lifecycle call, so four unwinds built it and
+dropped it. One event on every path is uniform and reaches every consumer; the cost is a consumer
+that never saw the event before `in_fulfillment` now does, which the new ask covers.
+
+**Propagated**: `design/06-saga-and-compensation.md` §3.2 (report table), §3.6 (`inst-ro-mode`);
+`design/01-foundation.md` §4.7 (`OrderFulfillmentAborted` delta); `ADR/0008` (amendment);
+`UPSTREAM_REQS.md` §2.4 (`…-upreq-aborted-event-on-every-unwind`); `PRD.md` §6.4, §6.6, AC 9b; D-227.
+
+### D-235 (M) The valuation basis and the named approver are the approval policy owner's, returned by the adapter; seller policy holds five settings
+
+**Accepted (2026-10-26).** *(Corrects D-229 and D-230; PRD AC 22)*
+
+**Decision**: the valuation basis is not a seller-policy column. The approval policy adapter returns
+it with the routing configuration, together with each gate's named approver for the seller's tenant
+scope; `open-gates` reads both from there. `owf_seller_policy` holds five settings: the four of
+D-134 and D-140 and the payment wait with its expiry action (D-228). AC 22 and PRD §5.3 now say
+five, and AC 22 keeps the valuation basis with routing, thresholds and assignment out of reach of
+seller policy.
+
+**Rationale**: AC 22 reserves routing, thresholds, assignment and eligibility for the approval
+policy owner (R2), and diffora's proposal puts the basis in "the versioned approval policy"; D-230's
+seller-policy column broke both, and D-229's "seller's tenant-scoped configuration" was ambiguous
+about who owns the assignment.
+
+**Propagated**: `design/01-foundation.md` §3.7 (`owf_seller_policy`); `design/03-approval-execution.md`
+§3.3, §3.6 (`open-gates` steps 2 and 4), §3.7; `DESIGN.md` §4.7, §4.8; `design/10-process-definition.md`
+§4; `UPSTREAM_REQS.md` §2.4; `PRD.md` §5.3, §6.2, §9.2, AC 22; D-229, D-230.
+
+### D-236 (H) The PRD states this gear's side of the proposal now and the owners' parts as named assumptions
+
+**Accepted (2026-10-26).** *(PR #4787 comment of 2026-10-23, point 2; the PR author chose "apply everything now, marking the owner parts as assumptions")*
+
+**Decision**: `UPSTREAM_REQS.md` §4 items 22 and 23 are applied to the PRD in one pass. This gear's
+behaviour is a requirement: the four-way readiness answer and its re-read before activation, the
+payment wait and its expiry actions, the named-user condition with its generation and the
+`assignee-unresolved` park, the policy-chosen valuation basis with `unavailable` never zero, the
+past-lifetime not-found rule, the full lookup tuple, the begin-preparation meaning of the scheduled
+date and the three deadlines, the rebuild rules and `OrderFulfillmentAborted` on every unwind. Each
+owner part is stated as an **assumption pending owner agreement**, listed in §14 with the ask that
+confirms or withdraws it and the fallback this gear keeps: Billing as readiness owner, Lifecycle's
+pre-fulfillment cancel and arbitration, the assessment-versus-coverage split, acceptance of the
+aborted event on every unwind, library enforcement and the common inbox, Rating's per-basis
+valuation, and `SUB-O17` and `SUB-O18`.
+
+**Rationale**: the reviewer found the PRD describing the earlier model while the design described
+the new one. The author chose a single pass over the split the reviewer suggested; marking each
+owner part as an assumption keeps the PRD from presenting an unagreed contract as agreed.
+
+**Propagated**: `PRD.md` §3.2, §5.1, §5.3, §6.2, §6.3, §6.4, §6.6, §9.2, §12 (AC 4b, 5d, 5g, 6b, 6d,
+7d, 9b, 22), §13, §14, §15; `UPSTREAM_REQS.md` §4 items 22 and 23.
 
 ## Open Questions
 
@@ -7290,6 +7410,7 @@ register relies on is cited to a serverless-runtime file and line or registered 
 | D-210 | cross-cutting (review findings, 2026-10-12) | `ADR/0011`, `ADR/0012`, `ADR/0013`; `design/01`, `design/08`; `UPSTREAM_REQS.md` §2.9 |
 | D-211 | 05 Provisioning intents (actual start read back, 2026-10-18) | `design/05`; `UPSTREAM_REQS.md` `SUB-O10`; D-195 |
 | D-231 | cross-cutting (Lifecycle D-219, D-220 mirror, 2026-10-22) | `DESIGN.md` §3.4; `design/06` §4.9 |
+| D-232–D-236 | cross-cutting (PR #4787 comment of 2026-10-23, 2026-10-26) | `design/01` §3.7, §4.7, §4.9; `design/03` §3.3, §3.6, §3.7; `design/05` §3.2, §3.3, §3.6, §3.7, §4.1, §4.4, §4.5; `design/06` §3.2, §3.6, §4.8; `design/10` §3.6; `ADR/0008`; `PRD.md`; `UPSTREAM_REQS.md` §2.1, §2.4, §3, §4 |
 | D-226–D-230 | cross-cutting (PR #4787 proposal, this gear's side, 2026-10-21) | `design/01` §3.7, §4.9; `design/03` §3.2, §3.3, §3.6, §3.7; `design/04` §2.1, §3.3, §3.6, §3.7; `design/06` §3.6; `design/07` §3.3, §4.4; `design/08` §3.3; `design/09` §3.1; `design/10` §3.6; `UPSTREAM_REQS.md` §2.1–§2.5 |
 | D-220–D-225 | cross-cutting (PR #4787 proposal of 2026-10-18, received 2026-10-21) | `design/03` §2.2, §3.3; `design/04` §3.5, §3.7; `design/05` §3.2, §3.3, §3.7, §4.1, §4.2, §4.4; `design/09` §3.3; `UPSTREAM_REQS.md` §2.1–§2.5, §4 item 22; Q-11 |
 | D-212–D-219 | cross-cutting (PR #4787 review findings, 2026-10-18) | `design/05` §3.3, §3.6, §3.7, §4.4, §4.5; `design/06` §3.6, §3.7, §4.7; `design/07` §2.2, §3.6, §4.4; `design/08` §2.2, §3.6, §3.7; `design/09` §3.3, §3.7, §4.4; `design/10` §3.6; `UPSTREAM_REQS.md` §2.1 |
@@ -7494,6 +7615,11 @@ register relies on is cited to a serverless-runtime file and line or registered 
 | D-229 | M Named-user condition in the request, `gate_generation`, `approval_gate × assign`, `not-assignee` / `stale-generation`, park on `assignee-unresolved`; projection is the common inbox's source adapter | `design/03` §3.2, §3.3, §3.6, §3.7; `design/09` §3.1; `design/01` §4.9; D-56, D-224 |
 | D-230 | M Valuation for the policy's chosen basis or `unavailable`, shared money representation; `tcv_minor` retired from the approval tables | `design/01` §3.7; `design/03` §3.3, §3.7; D-198, D-225 |
 | D-231 | M Lifecycle SDK answers are the typed `OrdersError` (Lifecycle D-219, D-220); match variant and reason; an unknown variant is the *a 5xx* row, never success | `DESIGN.md` §3.4; `design/06` §4.9; D-111, D-193 |
+| D-232 | H A successor draft needs an observed void alone, names its predecessor (`SUB-O18`); the lapsed predecessor is a historical success | `design/05` §3.2, §3.3, §3.6, §3.7, §4.1, §4.4; `PRD.md` §6.3, AC 5d; D-209, D-220 |
+| D-233 | H A draft found active is never rebuilt; without this gear's activation the order fails and the walk cancels it (`draft-activated-externally`) | `design/05` §3.3, §3.6, §3.7, §4.4, §4.5; `design/06` §3.6, §4.8; `design/10` §3.6; `design/01` §4.9; `PRD.md` AC 5g |
+| D-234 | M `OrderFulfillmentAborted` on every unwind with `mode` and `retainedObligations[]` | `design/06` §3.2, §3.6; `design/01` §4.7; `ADR/0008`; `UPSTREAM_REQS.md` §2.4; `PRD.md` §6.4, §6.6, AC 9b; D-227 |
+| D-235 | M Valuation basis and named approver come from the approval policy adapter; seller policy holds five settings (corrects D-229, D-230) | `design/01` §3.7; `design/03` §3.3, §3.6, §3.7; `DESIGN.md` §4.7, §4.8; `PRD.md` §5.3, AC 22 |
+| D-236 | H PRD states this gear's side now and the owners' parts as named assumptions (§14) | `PRD.md`; `UPSTREAM_REQS.md` §4 items 22, 23 |
 
-Highest decision number used: **D-231**; highest question number: **Q-14**. Numbering is one continuous sequence across the whole
+Highest decision number used: **D-236**; highest question number: **Q-14**. Numbering is one continuous sequence across the whole
 register; there are no parts.

@@ -458,13 +458,31 @@ Owns `reread-draft-liveness` (§3.3), an advisory early read the definition may 
 expected-fulfillment wait so lapsed drafts are rebuilt before wave 2 arrives at them. Is invoked
 in-process by `dispatch-wave2-activate` for each line immediately before its activation submit,
 which is the gate. Reads the line's current `draft_create` intent by its `transition_request_id`
-and confirms the subscription is still `draft`; records a lapsed draft as `status = lapsed` on
-that intent row.
+and classifies the subscription by what the read **observes**, never by inference (decisions
+D-232, D-233):
+
+- **`draft`** — live; nothing is written.
+- **`voided`** — records `status = lapsed` on that intent row with `void_observed_at` (database
+  time) and `void_cause` (the read's cause: `hold`, `platform-ttl` or `other`). The observed void is
+  the **only** authorization `rebuild-wave1` accepts for a successor (§4.4 *Rebuild authorization*).
+  A lapsed draft is a **historical success**: it was created, confirmed and later voided by a cause
+  not this gear's, so its row stays `lapsed` — never `failed` — its `OrderFulfillmentStepCompleted`
+  stands, and the progress read reports it as created-then-lapsed.
+- **applied or active** — the subscription has left `draft` for an active phase. **IF** the line
+  carries an activation intent of this gear under its current `wave2_attempt`, the line is that
+  intent's and `reconcile-intent` recovers it (it is never rebuilt); **ELSE** the activation is not
+  this gear's: the re-reader stamps `external_activation_observed_at` on the `draft_create` row,
+  sends nothing for the line, and reports it in `active[]` with `external = true`. The definition
+  routes that answer to the unwind under either policy (§4.5 item 5a): the order fails, and
+  compensation cancels the subscription through the activated-cancel leg like any other it
+  created (D-233).
+- **unevaluable** — no write; fail-closed as below.
 
 ##### Responsibility boundaries
 
 Does not subscribe to any draft-void notification channel. Does not recover a lapsed draft — that
-is `rebuild-wave1`, which the definition calls. An unevaluable read (dependency outage, timeout)
+is `rebuild-wave1`, which the definition calls. Never rebuilds or adopts an active subscription.
+An unevaluable read (dependency outage, timeout)
 never answers "live": inside `dispatch-wave2-activate` it keeps the line out of the submit and
 the operation answers the canonical 503, fail-closed, consistent with slice 04's pre-activation
 abort rule for `SUB-O5`.
@@ -487,7 +505,7 @@ exists as a draft, and not to skip the line.
 ##### Responsibility scope
 
 Owns `rebuild-wave1` (§3.3). For each line whose current `draft_create` intent is recorded
-`lapsed`, mints the line's next wave-1 attempt (`owf_fulfillment_task.wave1_attempt`, ADR-0006 as
+`lapsed` **with an observed void** (`void_observed_at` set, D-232), mints the line's next wave-1 attempt (`owf_fulfillment_task.wave1_attempt`, ADR-0006 as
 amended; the other minting site is an operator's retry of a `failed` intent, D-119) and returns
 the task to `pending` with reason `draft-voided` through 04's transition rule. It submits nothing:
 the new draft-create is `dispatch-wave1-create`'s, which the definition calls next with the
@@ -497,7 +515,11 @@ rebuilt lines, so the envelope, key and admission are applied in the one place t
 
 Does not change `orderId` or `orderVersion` — the plan freeze from slice 04 is untouched; only the
 wave-1 attempt for the affected line is redone. Refuses a line whose draft is not recorded
-`lapsed`, so the definition cannot rebuild on its own say-so.
+`lapsed` with an observed void, so the definition cannot rebuild on its own say-so, and never
+rebuilds a line whose draft was found active (D-233). Does not carry commercial references itself:
+the successor's create names its predecessor (`predecessor_intent_id`, §3.7), and Subscriptions
+resolves the acquisition, reservation and commercial terms from the referenced order version and
+keeps them on the successor (`SUB-O18`, §4.1).
 
 ##### Related components (by ID)
 
@@ -667,7 +689,7 @@ operation's round. Every step key is recomposed server-side from the body
 | `protection` | `protected` — Waves stage: after `report-spawn-signal` (`10 §4.1`); the only route to `report-outcome` with `outcome: completed` |
 | `input` | `ref`, `planRef`, `lineRefs[]` (the eligible set `evaluate-activation-eligibility` returned; empty is permitted and is the completion check), `dispatchRound`, `attemptKey` (nullable; as for wave 1, this operation's own family, `wave2AttemptKey`) |
 | `intent payload` (per line, resolved inside; decision D-195) | the draft's `subscription_id` and expected draft version from the intent record; the same source tuple `(orderId, orderVersion, orderLineId)` as the initial-binding reference Subscriptions compares against the accepted `chains[]` it reads through `get_version` (Lifecycle D-162); no start instant — Subscriptions stamps it at the `activate` commit (`SUB-O10` as reshaped, D-209); `correlationId`; the intent key below |
-| `output` | `accepted[]`, `activated[]`, `failed[]` (lineRef + reason code), `pending[]`, `lapsed[]`, `deferred[]` (all lineRef; `activated[]` names the lines the record already shows `activated`, reported by recorded state, §3.6 `inst-pi-skip-existing` — this operation never moves a task to `activated`, because an activation submit settles only as an acceptance or a synchronous refusal, `inst-pi-settle`), `deferReason`, `retryAfterMs` (advisory, as for wave 1; never a `wait` value), `due: true\|false` on a non-empty `deferred[]` — database time against the deferral instant this operation records with the round (`now + retryAfterMs`), the answer the definition's `PT1M` deferral re-check loop switches on (`10 §3.6` (b)); a call before that instant re-defers with `due: false`, `nextDispatchRound`. `pending[]` names **every** plan line not yet recorded `activated` or `failed` — in flight, not yet eligible, lapsed or deferred — so an empty `pending[]` and an empty `failed[]` together mean the order is complete; `lapsed[]` and `deferred[]` are subsets of `pending[]` that name why; `bindingExpired: true\|false` — `true` when the guard found the plan's `activation_deadline_at` elapsed (§3.6 `inst-pi-wave2-guard`, decision D-194): nothing was submitted, every list is empty, and the definition routes the answer to the unwind under either policy (`10 §3.6` (b)) |
+| `output` | `accepted[]`, `activated[]`, `failed[]` (lineRef + reason code), `pending[]`, `lapsed[]`, `externallyActivated[]` (lines whose draft the re-read found active without an activation of this gear, D-233; routed to the unwind, never a retry or a rebuild), `deferred[]` (all lineRef; `activated[]` names the lines the record already shows `activated`, reported by recorded state, §3.6 `inst-pi-skip-existing` — this operation never moves a task to `activated`, because an activation submit settles only as an acceptance or a synchronous refusal, `inst-pi-settle`), `deferReason`, `retryAfterMs` (advisory, as for wave 1; never a `wait` value), `due: true\|false` on a non-empty `deferred[]` — database time against the deferral instant this operation records with the round (`now + retryAfterMs`), the answer the definition's `PT1M` deferral re-check loop switches on (`10 §3.6` (b)); a call before that instant re-defers with `due: false`, `nextDispatchRound`. `pending[]` names **every** plan line not yet recorded `activated` or `failed` — in flight, not yet eligible, lapsed or deferred — so an empty `pending[]` and an empty `failed[]` together mean the order is complete; `lapsed[]` and `deferred[]` are subsets of `pending[]` that name why; `bindingExpired: true\|false` — `true` when the guard found the plan's `activation_deadline_at` elapsed (§3.6 `inst-pi-wave2-guard`, decision D-194): nothing was submitted, every list is empty, and the definition routes the answer to the unwind under either policy (`10 §3.6` (b)) |
 | `idempotency_key` | step key, instance-scoped: `{tenant}:{correlationId}:dispatch-wave2-activate:{planRef}:{dispatchRound}[:{attempt}]`; per line, the intent key `{tenant}:{orderId}:{orderVersion}:{orderLineId}:wave2_activate:activation[:{wave_attempt}]`, the line's `owf_fulfillment_task.wave2_attempt` appended when above 1 |
 | `declared_event` | `OrderFulfillmentStepCompleted`, one per line a synchronous refusal moves `draft_created → failed`; none for an accepted line or a line in `activated[]`, whose event was enqueued in the unit of work that recorded its activation (`reconcile-intent`, §3.6 `inst-ri-terminal`, 04's terminal-state rule) |
 | `compensation` | `compensate-order` (06) — the activated-cancel leg for every line whose activation was accepted |
@@ -697,7 +719,7 @@ operation's round. Every step key is recomposed server-side from the body
 |-------|-------|
 | `protection` | `composable` — advisory; the gate is inside `dispatch-wave2-activate` |
 | `input` | `ref`, `planRef`, `lineRefs[]`, `rereadRound` (this operation's own round) |
-| `output` | `live[]`, `lapsed[]`, `unevaluable[]` (all lineRef), `nextRereadRound` |
+| `output` | `live[]`, `lapsed[]`, `active[]` (lineRef + `external`: `false` when the line's own activation intent is live, so the line is `reconcile-intent`'s; `true` when the activation is not this gear's, D-233), `unevaluable[]` (all lineRef), `nextRereadRound` |
 | `idempotency_key` | instance-scoped: `{tenant}:{correlationId}:reread-draft-liveness:{planRef}:{rereadRound}` |
 | `declared_event` | none |
 | `compensation` | none |
@@ -712,7 +734,7 @@ operation's round. Every step key is recomposed server-side from the body
 |-------|-------|
 | `protection` | `composable` |
 | `input` | `ref`, `planRef`, `lineRefs[]` (from a `lapsed[]` output), `rebuildRound` (this operation's own round, never `dispatch-wave1-create`'s) |
-| `output` | `rebuilt[]`, `refused[]` (all lineRef; a line is refused when its current draft is not recorded `lapsed`), `nextRebuildRound`; the next `dispatch-wave1-create` keeps wave 1's own `dispatchRound` |
+| `output` | `rebuilt[]`, `refused[]` (all lineRef; a line is refused when its current draft is not recorded `lapsed` with `void_observed_at` set, D-232), `nextRebuildRound`; the next `dispatch-wave1-create` keeps wave 1's own `dispatchRound` |
 | `idempotency_key` | instance-scoped: `{tenant}:{correlationId}:rebuild-wave1:{planRef}:{rebuildRound}` |
 | `declared_event` | none |
 | `compensation` | none — it submits nothing; the new draft is `dispatch-wave1-create`'s and is compensated there |
@@ -869,8 +891,8 @@ draft-create acceptance.
 3. [ ] - `p1` - Skip every line that already has an intent row of this wave and kind under its current `wave_attempt` (the task row's `wave1_attempt` or `wave2_attempt`), unless that row carries `not_found_at`; report a skipped line by its recorded state (this is what makes the platform's same-key re-run of an `open` key safe). A line an operator retried after its intent was recorded `failed` has a new attempt and no row under it, so it is sent; a line whose row is `submitted` or `unresolved` keeps its attempt and is skipped, because that intent may be live downstream (§4.4) - `inst-pi-skip-existing`
 4. [ ] - `p1` - **IF** `owf_process_instance.suspended` is true for the instance (read under the instance row lock; not `owf_process_suspension`, whose rows are slice 08's record), defer every remaining line with `deferReason = held`; a same-key re-issue of a call already settled is absorbed as usual while suspended - `inst-pi-held`
 5. [ ] - `p1` - For each remaining line, ask Dispatch Admission Control (§4.3); a line not admitted joins `deferred[]` with the hint - `inst-pi-admit`
-6. [ ] - `p1` - **IF** `dispatch-wave2-activate`: for each admitted line, immediately before its row is written and its activation submitted, run the Draft-Liveness Re-reader; `lapsed` → record the line's draft row `lapsed`, send nothing for the line and add it to `lapsed[]`; unevaluable → send nothing further and answer the canonical 503 for the call after settling what was already submitted (fail-closed) - `inst-pi-reread-gate`
-7. [ ] - `p1` - Per admitted line, commit the pre-dispatch unit of work: one `owf_provisioning_intent` row at `status = submitted`, `transition_request_id` null, with intent key, envelope, `attempt_id`, `step_idempotency_key` and the ladder of §4.2 initialised; a line whose existing row carries `not_found_at` (§4.4) reuses that row and clears the marker - `inst-pi-pre-dispatch`
+6. [ ] - `p1` - **IF** `dispatch-wave2-activate`: for each admitted line, immediately before its row is written and its activation submitted, run the Draft-Liveness Re-reader; `lapsed` → record the line's draft row `lapsed` with the observed void, send nothing for the line and add it to `lapsed[]`; active with no activation intent of this gear → stamp `external_activation_observed_at`, send nothing for the line and add it to `externallyActivated[]` (D-233) — a line that carries this gear's activation intent never reaches this step, because step 3 skips it; unevaluable → send nothing further and answer the canonical 503 for the call after settling what was already submitted (fail-closed) - `inst-pi-reread-gate`
+7. [ ] - `p1` - Per admitted line, commit the pre-dispatch unit of work: one `owf_provisioning_intent` row at `status = submitted`, `transition_request_id` null, with intent key, envelope, `attempt_id`, `step_idempotency_key` and the ladder of §4.2 initialised — for a `draft_create` whose line has a `lapsed` predecessor under the previous `wave1_attempt`, with `predecessor_intent_id` set to that row and the create naming the predecessor's `transition_request_id` and `subscription_id` (`SUB-O18`, D-232); a line whose existing row carries `not_found_at` (§4.4) reuses that row and clears the marker - `inst-pi-pre-dispatch`
 8. [ ] - `p1` - Submit to Subscriptions with the effective deadline propagated; at most 8 of the order's intents in flight at once; on a throttle signal stop submitting, defer the rest with `deferReason = throttle` and `retryAfterMs = min(hint, 60 s)` - `inst-pi-submit`
 9. [ ] - `p1` - In the settlement unit of work: record acceptance (`transition_request_id`, `accepted_at`, `execution_seq` from the per-order sequence); apply a synchronous refusal to the intent (`failed`, with `handed_off_at` stamped, because this call's `failed[]` lists it, D-125) and, through 04's rule, to the task, enqueuing `OrderFulfillmentStepCompleted` — a refusal of an activation because the signup resolve on the activation date no longer matches the accepted `chains[]` of the version, or because the accepted SKU roster is no longer protected (Lifecycle D-162, D-164), is such a refusal, recorded `wave2-activation-failed` with Subscriptions' closed refusal kind kept on the row as its cause (`06 §4.8` maps it); on a client-side timeout leave the row `submitted` for the sweep — never infer success - `inst-pi-settle`
 10. [ ] - `p1` - **RETURN** the lists of §3.3 and `nextDispatchRound` - `inst-pi-return`
@@ -912,9 +934,9 @@ pending`, reason `draft-voided`, driven only by `rebuild-wave1`).
 
 **Algorithm: rebuild-wave1**
 
-1. [ ] - `p1` - For each `lineRef`, read the line's current `draft_create` intent; **IF** its status is not `lapsed`, add the line to `refused[]` - `inst-rb-verify`
+1. [ ] - `p1` - For each `lineRef`, read the line's current `draft_create` intent; **IF** its status is not `lapsed`, **OR** `void_observed_at` is null, **OR** `external_activation_observed_at` is set, add the line to `refused[]` — the observed void is the successor's whole authorization (D-232); a new key or attempt authorizes nothing by itself - `inst-rb-verify`
 2. [ ] - `p1` - Set `owf_fulfillment_task.wave1_attempt` to the recorded attempt plus one, read inside the unit of work (never re-minted on replay, `01 §4.14`) - `inst-rb-mint`
-3. [ ] - `p1` - Apply 04's transition `draft_created → pending` with reason `draft-voided` and write the `step-completion` entry - `inst-rb-reset`
+3. [ ] - `p1` - Apply 04's transition `draft_created → pending` with reason `draft-voided` and write the `step-completion` entry naming the lapsed predecessor's `intent_id`, `void_cause` and `void_observed_at`; the predecessor row is not changed — it stays `lapsed`, a historical success (D-232) - `inst-rb-reset`
 4. [ ] - `p1` - **RETURN** `rebuilt[]`, `refused[]`, `nextRebuildRound` - `inst-rb-return`
 
 #### Reconciliation Sweep Cycle
@@ -1022,13 +1044,17 @@ by row locks, not an in-memory controller). It writes no `owf_durable_timer` row
 | `accepted_at` | timestamptz nullable | Database time of acceptance. |
 | `execution_seq` | bigint nullable | Monotonic per-order ordinal assigned at **acceptance**; 06's `compensation_sequence` is fed from it. ADR-0005 says "assigned … when the intent is dispatched"; acceptance is the refinement, because an intent never accepted created nothing to compensate. Where the dispatcher's settlement was lost, `reconcile-intent` assigns it at the read that recovers the acceptance (`inst-ri-read`, D-214); that one row's ordinal then reflects discovery order, which the walk tolerates because acquisition lines are independent (`06`, D-196). |
 | `subscription_id` | text nullable | The subscription created or acted on, from the status read; mirrored onto `owf_fulfillment_task.subscription_id`. |
-| `status` | enum(`submitted`, `draft_created`, `activated`, `voided`, `cancelled`, `lapsed`, `failed`, `unresolved`) | `lapsed` — a `draft_create` whose draft the re-read found voided by a cause not this gear's; `unresolved` — the sweep floor reached with no known outcome, or a not-found answer past the key lifetime (§4.4, D-220); replaces `dead_lettered`. |
+| `status` | enum(`submitted`, `draft_created`, `activated`, `voided`, `cancelled`, `lapsed`, `failed`, `unresolved`) | `lapsed` — a `draft_create` whose draft the re-read **observed** voided by a cause not this gear's: a historical success, created and later voided, never `failed` (D-232); `unresolved` — the sweep floor reached with no known outcome, or a not-found answer past the key lifetime (§4.4, D-220); replaces `dead_lettered`. |
 | `sweep_ladder` | enum(`in_sla`, `general`) | Selected by `(wave, intent_kind)`: `in_sla` only for `intent_kind = activation` (§4.2). |
 | `sweep_tier` | integer | Current rung. |
 | `sweep_reads` | integer | Status reads performed; the floor trips on it. |
 | `next_sweep_at` | timestamptz nullable | Next scheduled read — **the sweep's schedule**; null once terminal or `unresolved`. |
 | `key_expires_at` | timestamptz | `created_at` + 30 days; after it the sweep is read-only for this intent. |
 | `not_found_at` | timestamptz nullable | Set by `reconcile-intent` when the status read answers "no such transition request" inside the key lifetime; tells the next dispatch round to send this never-sent row under its unchanged key (§4.4); cleared by that send. |
+| `void_observed_at` | timestamptz nullable | Database time the Draft-Liveness Re-reader **observed** the draft `voided` and recorded the row `lapsed`; the authorization `rebuild-wave1` requires (D-232). NOT NULL exactly when `status = lapsed`. |
+| `void_cause` | text nullable | The observed void's cause from the read: `hold`, `platform-ttl` or `other`; carried to the rebuild's audit entry. |
+| `external_activation_observed_at` | timestamptz nullable | Database time the re-read found this `draft_create`'s subscription active with no activation intent of this gear; the cause the cancellation fence finds for `draft-activated-externally` (`06 §3.6`, D-233). The row's `subscription_id` makes it a subject of the freeze, so the walk cancels it. |
+| `predecessor_intent_id` | uuid nullable | On a `draft_create` row after a rebuild: the `lapsed` row of the previous `wave1_attempt` for the same line, which this row succeeds; the create names that predecessor to Subscriptions (`SUB-O18`, D-232). Null on a first attempt and on every other kind. |
 | `deferred_failure_reason` | text nullable | A catalogue reason (`wave1-create-failed` or `wave2-activation-failed`) for a terminal failure `reconcile-intent` read while the instance was suspended; the task is not advanced. Taken and cleared through this slice's deferral port by `apply-resume` (slice 08), in its settlement transaction. |
 | `handed_off_at` | timestamptz nullable | Database time a definition-called `reconcile-intent` round, a dispatch operation listing its synchronous refusal in its own `failed[]`, or `apply-resume` through the deferral port first listed this forward intent's failure or floor trip to the definition; null while a `failed` or `unresolved` status has not reached it — the worker's in-process run never sets it (`inst-ri-handoff`, D-125). Cleared by the re-arm port (§3.2) when an operator's retry re-arms an `unresolved` row. |
 | `deferred_observed_at` | timestamptz nullable | Database time the deferred failure was read; `apply-resume` applies deferred failures in this order. NOT NULL exactly when `deferred_failure_reason` is. |
@@ -1158,6 +1184,7 @@ where they differ from the register the register is amended (`UPSTREAM_REQS.md`)
 | `SUB-O14` | Answered in #5131 | `correlationId` propagation along the Subscriptions → Policy Engine → OSS path. | PRD `SUB-O9` |
 | `SUB-O16` | Answered in #5131 (event name still open) | Identity-envelope echo on every confirmation and failure event: the union of the register's list (`correlationId`, the intent idempotency key, the asserting principal) and this slice's (`orderId`, `orderVersion`, `orderLineId`, wave, the opaque binding reference). `subscriptionId` is no longer needed on the echo, because it is taken from the `SUB-O13` read (§2.1). | none — new |
 | `SUB-O17` | **Open** (raised 2026-10-21, D-220; PR #4787 proposal item 3) | Closed-attempt fence and retained terminal lookup: by the full scoped identity (`SUB-O13`'s tuple), close a scoped attempt so that a delayed create or activation for it is refused, answer whether the attempt was applied (with its original result) or confirmed never applied, and retain that answer beyond the de-duplication window. Serialized with application at the point of effect. Prerequisite for recording `never-dispatched` past the key lifetime (§4.4) and for authorizing a successor draft (`rebuild-wave1`). | new |
+| `SUB-O18` | **Open** (raised 2026-10-26, D-232; PR #4787 proposal item 4) | Successor draft preserves the acquisition: a draft-create naming a predecessor (its transition request and subscription, both this gear's, the predecessor observed `voided`) for the same scoped line of the same order version is created with the acquisition, reservation, commercial and benefit references the predecessor held, resolved from the referenced order version, and the link is retained on the subscription record. | new |
 
 `PRD.md:349` states the echo as an obligation ("confirmations and failure events **MUST** echo
 …"), but an obligation on a foreign aggregate is an upstream ask. Under this slice's wake-up rule
@@ -1331,7 +1358,25 @@ throttle-induced delay never extends the per-operation deadline (`01 §4.12`).
   and no task is guessed. Nothing is lost, because the scheduled sweep re-reads every
   non-terminal intent independently.
 - **Lapsed is not voided.** A `draft_create` row found voided by a cause not this gear's is
-  `lapsed`; compensation **MUST NOT** submit a `draft_void` for it.
+  `lapsed`; compensation **MUST NOT** submit a `draft_void` for it. A lapsed row is a **historical
+  success** — created, confirmed and later voided — and **MUST NOT** be reported as a failed create
+  (D-232).
+- **Rebuild authorization** (decision D-232). A successor draft **MUST** be authorized only by an
+  observed void of its predecessor (`void_observed_at`), recorded by the Draft-Liveness Re-reader
+  from a read that returned `voided`; a new key, a new attempt or an unevaluable read authorizes
+  nothing. A confirmed non-application through `SUB-O17` is **not** required: this gear accepts the
+  residual risk that a request for the predecessor delayed past the create's de-duplication
+  lifetime is applied after the successor, and that risk is bounded by the activation gate — the
+  successor alone is activated, and a second draft for the line is a subject of any later unwind.
+  The successor **MUST** name its predecessor (`predecessor_intent_id`, and the predecessor's
+  transition request and subscription on the create), so Subscriptions keeps the acquisition,
+  reservation and commercial terms resolved from the referenced order version (`SUB-O18`).
+- **No rebuild over an active subscription** (decision D-233). A draft the re-read finds applied or
+  active **MUST NOT** be rebuilt. Where this gear's own activation intent for the line exists, the
+  line is that intent's and `reconcile-intent` recovers it. Otherwise the line is reported in
+  `externallyActivated[]`, and the definition **MUST** route it to the unwind under either policy
+  with reason `draft-activated-externally`; the walk cancels that subscription with the other
+  subjects, because a subscription this gear did not activate is not adopted.
 - **Refusal codes.** Only the reasons listed per operation in §3.3 may be raised; the per-line wave
   discriminators ride `failed[]` and the manual task, never free text.
 
@@ -1373,6 +1418,10 @@ slice operations (D-80, D-81).
 5. **Lapsed routes to rebuild, rebuild routes to wave 1.** A non-empty `lapsed[]` **MUST** route to
    `rebuild-wave1`, and its `rebuilt[]` to `dispatch-wave1-create` and back through the barrier;
    never directly to `dispatch-wave2-activate` †.
+5a. **An externally activated draft routes to the unwind** (decision D-233). A non-empty
+   `externallyActivated[]` from `dispatch-wave2-activate` or `reread-draft-liveness` **MUST** route
+   to the unwind under either policy, with no manual task and no rebuild, ahead of every other case
+   of the answer; an `active[]` entry with `external = false` **MUST** route to `reconcile-intent`.
 6. **Failures and unresolved intents route to the failure arm.** A non-empty `failed[]` from any
    operation of this slice, and a non-empty `unresolved[]` from `reconcile-intent`, **MUST** route
    to fragment (c), each line with its reason; a non-empty `redispatch[]` **MUST** route to the

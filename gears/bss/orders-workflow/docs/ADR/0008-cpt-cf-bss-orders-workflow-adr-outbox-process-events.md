@@ -114,6 +114,13 @@ transition is `OrderFulfillmentFailed`; Workflow's process event when order-leve
 fails or the workflow is cancelled is `OrderFulfillmentAborted`. The two names refer to
 related-but-distinct facts owned by different systems of record and are not interchangeable.
 
+> **Amended 2026-10-26 (D-234).** `OrderFulfillmentAborted` is published on **every** unwind —
+> failure, cancel, supersede and terminal-event, before or after fulfillment began — with a
+> `mode` field and `retainedObligations[]`, so the obligations this gear did not release reach
+> Lifecycle and Billing even where no Lifecycle call is made. A consumer that ignored the event
+> before `in_fulfillment` now receives it there too; the Lifecycle consumer ask is
+> `…-upreq-aborted-event-on-every-unwind` (`UPSTREAM_REQS.md` §2.4).
+
 **The PRD delivery target remains governing and compliance requires verification.**
 `cpt-cf-bss-orders-workflow-nfr-owf-event-latency` requires p95 < 30 s from internal state change
 to event delivery. Asynchronous publication does not inherently prevent meeting that target, but

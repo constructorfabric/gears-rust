@@ -1864,9 +1864,11 @@ rows and the release are the history). The validation hook of `10 §3.3` reads i
 
 **ID**: `cpt-cf-bss-orders-workflow-dbtable-seller-policy`
 
-The per-seller policy of `DESIGN.md` §4.8: the partial-failure policy and the three business
+The per-seller policy of `DESIGN.md` §4.8: the partial-failure policy, the three business
 windows of decision D-134 (the approval escalation window, the overdue window, the manual-task SLA
-classes). It is the store the operations that pin those values read (decision D-140).
+classes) and the payment wait of D-228 — five settings (PRD §5.3, AC 22). Approval routing,
+thresholds, assignment and the valuation basis are **not** here: they are the approval policy
+owner's, returned by the adapter (`03 §3.2`, D-235). It is the store the operations that pin those values read (decision D-140).
 
 **Schema**:
 
@@ -1883,7 +1885,6 @@ classes). It is the store the operations that pin those values read (decision D-
 | sla_other_ms | bigint, nullable | The SLA class window of every other task subject (`07 §4.1`) |
 | payment_wait_window_ms | bigint, nullable | The payment-wait window: how long financial readiness may stay `pending` after its first observation before the expiry action runs (`04 §3.6`, D-228). A seller value **MUST NOT** exceed Lifecycle's own expiry of an `approved` order, so the two never compete |
 | payment_wait_expiry_action | enum, nullable | `request-cancel` \| `manual-review` — what elapsing the payment wait does (`10 §3.6` (b), D-228) |
-| approval_valuation_basis | enum, nullable | `annualised-net-pretax` \| `full-term-commitment` \| `first-installment` \| `authorized-budget` \| `forecast` — the valuation basis the seller's approval policy chooses; `open-gates` forwards the figure Lifecycle stores for it, or `unavailable` (`03 §3.3`, D-230) |
 | policy_revision | bigint, NOT NULL | Positive, monotonic; bumped on every promoted change to the row. A deleted seller row that is re-created takes a fresh `policy_id` and a revision above any the scope has carried |
 | updated_by, updated_at | text, timestamptz, NOT NULL | The promotion's change identity and instant (Lifecycle D-133) |
 
@@ -1893,7 +1894,7 @@ classes). It is the store the operations that pin those values read (decision D-
 platform row is impossible; `seller_tenant_id` NOT NULL exactly when `scope = 'seller'`;
 `policy_revision > 0`; every window column, where not NULL, `> 0`; on the platform row every
 value column is NOT NULL. The platform row is created by migration with revision 1 and the
-defaults `remediate`, 72 h, no party windows, 24 h, 4 h, 24 h, a 7-day payment wait ending in `manual-review` (D-228) and the `annualised-net-pretax` valuation basis (D-230); its identity and scope are
+defaults `remediate`, 72 h, no party windows, 24 h, 4 h, 24 h, and a 7-day payment wait ending in `manual-review` (D-228); its identity and scope are
 immutable and it **MUST NOT** be deleted. Startup checks that it exists: a missing platform row is
 a deployment failure, never a permissive or invented default.
 
@@ -2799,7 +2800,7 @@ The **per-event delta** carries only what that event adds:
 | `OrderFulfillmentStarted` | `lineCount`, `policy` (the partial-failure policy the instance executes under) |
 | `OrderFulfillmentStepCompleted` | `stepId`, `orderLineId`, `wave`, `outcome`, `transitionRequestId` where one was accepted, and `provenance` (`automated` \| `operator-override`) so a consumer counting completions can tell a Subscriptions-confirmed activation from a manually confirmed one |
 | `OrderFulfillmentCompleted` | `lineOutcomes[]` and the subscription identifiers the acknowledgement carries |
-| `OrderFulfillmentAborted` | `reason` (catalogue), `failedLines[]`, `compensationOutcome` |
+| `OrderFulfillmentAborted` | `reason` (catalogue), `mode` (`failed` · `cancelled` · `superseded` · `terminal-event`, D-234), `fulfillmentBegun`, `failedLines[]`, `compensationOutcome`, `retainedObligations[]` (every line's binding reference with its subject outcomes: what this gear voided or cancelled, and the statement that it released nothing else, D-227) — published on **every** unwind, including those that make no Lifecycle call (D-234) |
 | `OrderApprovalRequested` | `gateId`, `party`, `escalationDueAt` |
 | `OrderApprovalEscalated` | `gateId`, `party`, `openSince`, `escalationDueAt` |
 
@@ -2984,6 +2985,7 @@ example — and they are stated once so no slice chooses them again.
 | `payment-authorization-stale` | `04-fulfillment-plan` | `PAYMENT_AUTHORIZATION_STALE` | FailedPrecondition | 400 |
 | `financial-readiness-withdrawn` | `04-fulfillment-plan` (D-226) | `FINANCIAL_READINESS_WITHDRAWN` | FailedPrecondition | 400 |
 | `payment-wait-expired` | `04-fulfillment-plan` (D-228) | `PAYMENT_WAIT_EXPIRED` | FailedPrecondition | 400 |
+| `draft-activated-externally` | `05-provisioning-intents` (D-233) | `DRAFT_ACTIVATED_EXTERNALLY` | FailedPrecondition | 400 |
 | `assignee-unresolved` | `03-approval-execution` (D-229) | `ASSIGNEE_UNRESOLVED` | FailedPrecondition | 400 |
 | `not-assignee` | `03-approval-execution` (D-229) | `NOT_ASSIGNEE` | PermissionDenied | 403 |
 | `stale-generation` | `03-approval-execution` (D-229) | `STALE_GENERATION` | Aborted | 409 |

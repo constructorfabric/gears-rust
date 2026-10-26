@@ -517,6 +517,28 @@ external work is retained until its outcome and cleanup are settled.
 - **Source**: PRD §6.3 (retry/duplicate protocol), §6.4 (cancellation fencing). Raised against
   `gears/bss/subscriptions/docs/SEAMS.md`.
 
+#### `SUB-O18` — a successor draft preserves the acquisition (new, D-232; PR #4787 proposal item 4)
+
+- [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-upreq-successor-draft-preserves-acquisition`
+
+When this gear submits a draft-create for a line whose previous draft it observed `voided`, the
+create **names its predecessor** — the predecessor's transition request and subscription, both
+created by this gear for the same scoped line of the same order version. Subscriptions **MUST**
+create the successor with the acquisition, reservation, commercial and benefit references the
+predecessor held, resolved from the referenced order version as every create already is (D-209),
+and **MUST** retain the predecessor link on the subscription record, so the successor is the same
+purchase re-materialized, not a new one.
+
+- **What this gear does already (D-232)**: authorizes a successor only on an observed void, links
+  the intent rows (`predecessor_intent_id`), names the predecessor on the create, keeps the
+  predecessor `lapsed` as a historical success, and never rebuilds a draft found active (D-233).
+- **Consequence if it does not land**: the successor is still bound to the same order version and
+  line, so Subscriptions resolves the same terms, but nothing on the Subscriptions side records that
+  it continues the predecessor's reservation, and a reservation released with the void is not
+  re-attached.
+- **Agreement status**: open; raised 2026-10-26.
+- **Source**: PR #4787 comment of 2026-10-23, item 4; `design/05` §3.6, §4.4.
+
 ### 2.2 Payments
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-upreq-payment-authorization-outcome`
@@ -873,6 +895,24 @@ Escalation* and §6.1 *Process Termination on Terminal Order Events*, acceptance
 corpus as the first consumer; and the D-179 occupancy tuple by the overlap-presence read of §2.1.
 Both D-182 items and the corpus are production release prerequisites on Lifecycle's side.
 
+#### `OrderFulfillmentAborted` on every unwind (new, D-234; PR #4787 proposal item 4)
+
+- [ ] `p2` - **ID**: `cpt-cf-bss-orders-workflow-upreq-aborted-event-on-every-unwind`
+
+This gear now publishes `OrderFulfillmentAborted` on **every** unwind — failure, cancel,
+supersede and terminal-event, before or after fulfillment began — carrying `mode`,
+`fulfillmentBegun` and `retainedObligations[]` (`design/01` §4.7, `design/06` §3.2). Orders
+Lifecycle, and Billing where it consumes the event, **MUST** accept it for an order that never
+entered `in_fulfillment`, for a superseded version and for an order Lifecycle already holds
+terminal, and **MUST** treat it as a statement of what this gear did not release — never as a
+state transition, which stays Lifecycle's alone.
+
+- **Consequence if it does not land**: a consumer that assumes the event only follows
+  `fulfillment_failed` or a workflow-mediated cancel misreads the new cases; the obligations still
+  reach the audit trail and the event stream.
+- **Agreement status**: open; raised 2026-10-26.
+- **Source**: PR #4787 comment of 2026-10-23, item 4, row 6; ADR-0008 as amended.
+
 #### Pre-fulfillment cancellation while waiting on financial readiness (new, D-223; PR #4787 proposal item 5)
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-upreq-prefulfillment-cancel-arbitration`
@@ -943,7 +983,7 @@ follows the existing reassessment and re-approval rules.
 - **What this gear needs, exactly (D-230)**: on `get_version`, a valuation per supported basis —
   `{ basis, amount (shared exact major-unit money), currency, term { kind, months? }, provenance {
   computed_by, computed_at } }` — or an explicit absence for a basis Rating did not compute. This
-  gear's `owf_seller_policy.approval_valuation_basis`, its `valuation_*` columns and its
+  gear's reading of the basis from the adapter's routing configuration (D-235), its `valuation_*` columns and its
   `unavailable` forwarding exist today (`design/01` §3.7, `design/03` §3.3, §3.7); only the
   annualised net pre-tax figure is available until Lifecycle stores more.
 - **Agreement status**: open; raised 2026-10-21.
@@ -1684,7 +1724,7 @@ then have to accept.
 | `p1` (critical) | `…-upreq-overlap-presence-read`, `…-upreq-compensation-cancel-reason`, `…-upreq-explicit-start-instant`, `…-upreq-settle-create`, `…-upreq-in-flight-rejection`, `…-upreq-cancel-accepted-transition`, `…-upreq-nonterminal-status-read`, `…-upreq-provisioning-latency-budget`, `…-upreq-identity-envelope-echo`, `…-upreq-payment-authorization-outcome`, `…-upreq-generic-approval-expectations-contract`, `…-upreq-submitted-ttl-visibility`, `…-upreq-lifecycle-thin-events`, `…-upreq-lifecycle-workflow-key-retention`, `…-upreq-pii-classification-ruling`, `…-upreq-event-broker-shared-prerequisites`, `…-upreq-pdp-policy-integration` |
 | `p1` (critical), platform path | `…-upreq-serverless-runtime-readiness-gate`, `…-upreq-serverless-runtime-event-triggers-gts`, `…-upreq-serverless-runtime-consumed-event-member-storage`, `…-upreq-serverless-runtime-pdp-guarded-call`, `…-upreq-serverless-runtime-attempt-and-deadline-propagation`, `…-upreq-serverless-runtime-history-residency-retention`, `…-upreq-serverless-runtime-definition-versioning-validation-hook`, `…-upreq-serverless-runtime-trigger-version-selection`, `…-upreq-serverless-runtime-signals`, `…-upreq-serverless-runtime-event-retention-between-listens`, `…-upreq-serverless-runtime-history-growth`, `…-upreq-serverless-runtime-invocation-control-restriction`, `…-upreq-serverless-runtime-dead-letter-operator-visibility` |
 | `p2` (important) | `…-upreq-correlation-propagation`, `…-upreq-serverless-runtime-failure-handler-target`, `…-upreq-lifecycle-failure-reason-coverage` |
-| `p1` (critical), **open since 2026-10-21** — the PR #4787 proposal (D-220, D-223–D-225); each has a stated fallback the design keeps until the owner answers | `…-upreq-closed-attempt-fence` (`SUB-O17`), `…-upreq-financial-readiness-through-billing`, `…-upreq-protected-purchase-before-capture`, `…-upreq-cancellation-reaches-payments`, `…-upreq-approval-named-user-criterion`, `…-upreq-prefulfillment-cancel-arbitration`, `…-upreq-assessment-expiry-vs-protected-coverage`, `…-upreq-approval-valuation-basis` |
+| `p1` (critical), **open since 2026-10-21** — the PR #4787 proposal (D-220, D-223–D-225, D-232, D-234); each has a stated fallback the design keeps until the owner answers | `…-upreq-closed-attempt-fence` (`SUB-O17`), `…-upreq-successor-draft-preserves-acquisition` (`SUB-O18`), `…-upreq-aborted-event-on-every-unwind` (`p2`), `…-upreq-financial-readiness-through-billing`, `…-upreq-protected-purchase-before-capture`, `…-upreq-cancellation-reaches-payments`, `…-upreq-approval-named-user-criterion`, `…-upreq-prefulfillment-cancel-arbitration`, `…-upreq-assessment-expiry-vs-protected-coverage`, `…-upreq-approval-valuation-basis` |
 
 `cpt-cf-bss-orders-workflow-upreq-pdp-policy-integration` is `p1` because every caller-driven
 operation fails closed until the catalogue, roles and the `assigned_principal` approver grant are
@@ -1913,13 +1953,27 @@ it would shorten (D-105).
    add-ons, term, auto-renewal and co-term date are resolved by Subscriptions from the referenced
    order version, and point the provisioning contract at Subscriptions' `contract-orders-intents`.
    Applied to the PRD on 2026-10-12.
-22. **§6.1, §6.3, §6.4, §9.2 and §13 — the PR #4787 proposal of 2026-10-18 (D-223…D-225), candidate.**
-   Should the owners accept the asks of §2.2, §2.3 and §2.4 raised on 2026-10-21, the PRD **MUST**
-   name Billing as the owner of financial readiness and its four-way answer (§6.3, §13), add the
-   seller-policy payment-wait deadline and the pre-fulfillment cancellation it requests (§6.4), name
-   the named-user approval criterion and the common Approvals Inbox (§9.2), and state the approval
-   valuation basis as the policy's explicit choice (§9.2). **Not applied**: these are candidates
-   pending the owners' answers, and nothing in the PRD changes until they land.
+22. **§3.2, §5.1, §5.3, §6.2, §6.3, §6.4, §9.2, §12, §13 and §14 — the PR #4787 proposal of
+   2026-10-18 (D-223…D-230, D-236).** The PRD **MUST** state this gear's side of each item and
+   **MUST** state each owner's part as a named **assumption pending owner agreement** (§14): the
+   four-way financial-readiness answer, its re-read before activation, Payments as today's provider
+   and Billing as the assumed owner (§3.2, §6.3, §13); the seller-policy payment wait, its two
+   expiry actions and the review task, with Lifecycle's pre-fulfillment cancel and its arbitration
+   assumed (§5.3, §6.4, AC 22 now five settings); the named-user condition, its generation and the
+   `assignee-unresolved` park, with the library's enforcement and the common Approvals Inbox assumed
+   (§6.2, §9.2); the valuation basis as the approval policy owner's choice, never a seller setting,
+   unavailable never read as zero, with Rating's per-basis figures assumed (§6.2, §9.2). **Applied
+   to the PRD on 2026-10-26** at the PR author's direction: the owner parts are asserted as
+   assumptions, not agreements, and each names the ask that would confirm or withdraw it.
+23. **§6.3, §6.4, §6.6 and §12 — the PR #4787 comment of 2026-10-23 (D-220, D-221, D-232…D-234,
+   D-236).** The PRD **MUST** say that a not-found read past the key lifetime proves nothing and
+   name `SUB-O17` (§6.3, AC 7d), carry the full lookup tuple with `intentKind` and `wave_attempt`
+   (§6.3), say that the scheduled date means begin preparation and that the three deadlines
+   reconcile one operation (§6.3), state the rebuild rules — observed void as the only
+   authorization, a successor that names its predecessor, a lapsed draft as a historical success,
+   no rebuild over an active subscription, which fails the order (§6.3, AC 5d, new AC 5g) — and
+   publish `OrderFulfillmentAborted` on every unwind with the retained obligations (§6.4, §6.6).
+   Applied to the PRD on 2026-10-26.
 
 ## 5. Traceability
 
