@@ -46,6 +46,10 @@ release-plz updates this file in the Release PR.
 
 ### Fixed
 
+- Settings Service resolves tenant hierarchy data before access-restriction
+  transactions, preventing `PUT` and `DELETE` permission requests from failing
+  with HTTP 503 when the tenant resolver uses a database-backed adapter.
+
 - Resource-group filters accept quoted UUIDs and resolve membership GTS type paths
   to storage IDs while preserving exact registered identifiers, including legacy
   codes accepted by type creation outside the stricter GTS grammar. Invalid
