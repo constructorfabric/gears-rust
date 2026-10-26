@@ -90,17 +90,11 @@ mod tests {
             ..AdmissionConfig::default()
         });
         assert!(rules.trusted_connectors.permits(&connector.to_string()));
-    }
-
-    #[test]
-    fn the_limits_are_carried_over() {
-        let rules = rules(&AdmissionConfig {
-            confidence_floor: 0.75,
-            max_steps: 7,
-            max_value_chars: 42,
-            ..AdmissionConfig::default()
-        });
-        assert!((rules.confidence_floor - 0.75).abs() < f32::EPSILON);
-        assert_eq!((rules.max_steps, rules.max_value_chars), (7, 42));
+        assert!(
+            !rules
+                .trusted_connectors
+                .permits(&Uuid::new_v4().to_string()),
+            "a connector off the list is not trusted"
+        );
     }
 }

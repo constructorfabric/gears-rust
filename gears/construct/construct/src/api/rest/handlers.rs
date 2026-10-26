@@ -8,7 +8,7 @@ use toolkit_security::SecurityContext;
 use tracing::Instrument as _;
 use uuid::Uuid;
 
-use crate::api::rest::error::{for_facts, for_rest, for_settings, too_long};
+use crate::api::rest::error::{for_facts, for_profile, for_rest, for_settings, too_long};
 use crate::api::rest::types::{ConcreteIntake, ConcreteProfile, ConcreteSettings};
 use crate::domain::planner::manage::ManageFacts;
 use crate::domain::record_intake::IntakeOutcome;
@@ -89,9 +89,10 @@ pub async fn put_subject_settings(
     // @cpt-end:cpt-cf-construct-flow-subject-settings-change:p1:inst-change-return
 }
 
-/// One subject's settings, marked `Cache-Control: no-store`, so no proxy or
-/// browser cache keeps one subject's privacy state.
-fn not_stored(dto: SubjectSettingsDto) -> impl IntoResponse {
+/// One subject's data, marked `Cache-Control: no-store`, so no proxy or
+/// browser cache keeps it. Every route that answers a subject's settings,
+/// facts or profile answers through this.
+fn not_stored<T: serde::Serialize>(dto: T) -> impl IntoResponse {
     ([(header::CACHE_CONTROL, "no-store")], Json(dto))
 }
 
@@ -112,7 +113,7 @@ pub async fn manage_facts(
         .manage(&ctx, subject_id, req.message, req.conversation)
         .await
         .map_err(|error| for_facts(error, subject_id))?;
-    Ok(Json(ManageFactsResponse::from(managed)))
+    Ok(not_stored(ManageFactsResponse::from(managed)))
 }
 
 /// @cpt-dod:cpt-cf-construct-dod-profile-reader-route:p1
@@ -137,15 +138,12 @@ pub async fn get_profile(
     let profile = async {
         svc.read(&ctx, query.tenant, subject_id)
             .await
-            .map_err(for_rest)
+            .map_err(for_profile)
     }
     .instrument(span)
     .await?;
     // @cpt-end:cpt-cf-construct-flow-profile-reader-read:p1:inst-profile-serve
     // @cpt-begin:cpt-cf-construct-flow-profile-reader-read:p1:inst-profile-return
-    Ok((
-        [(header::CACHE_CONTROL, "no-store")],
-        Json(ProfileDto::from(profile)),
-    ))
+    Ok(not_stored(ProfileDto::from(profile)))
     // @cpt-end:cpt-cf-construct-flow-profile-reader-read:p1:inst-profile-return
 }

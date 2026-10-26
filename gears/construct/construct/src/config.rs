@@ -42,7 +42,7 @@ pub struct ConstructConfig {
     /// read: `one_call` (a category constraint in one policy answer) or
     /// `per_category` (one policy call per category).
     #[serde(default)]
-    pub profile_categories: CategoryCheckConfig,
+    pub profile_category_check: CategoryCheckConfig,
 }
 
 impl Default for ConstructConfig {
@@ -54,7 +54,7 @@ impl Default for ConstructConfig {
             model: None,
             processing: ProcessingConfig::default(),
             admission: AdmissionConfig::default(),
-            profile_categories: CategoryCheckConfig::default(),
+            profile_category_check: CategoryCheckConfig::default(),
         }
     }
 }
@@ -134,6 +134,10 @@ impl Default for AdmissionConfig {
     }
 }
 
+/// The most records the processing queue may hold.
+pub const MAX_QUEUE_CAPACITY: usize = 100_000;
+/// The most records that may be processed at once.
+pub const MAX_WORKERS: usize = 256;
 /// The most steps one plan may be capped at.
 pub const MAX_STEPS_LIMIT: usize = 10_000;
 /// The longest text piece the value cap may allow.
@@ -145,13 +149,26 @@ pub const MAX_VALUE_CHARS_LIMIT: usize = 100_000;
 pub struct InvalidConfig(pub String);
 
 impl ConstructConfig {
-    /// Check the values serde cannot: the admission rules' ranges and the
-    /// model's upstream alias.
+    /// Check the values serde cannot: the processing and admission ranges and
+    /// the model's upstream alias.
     ///
     /// # Errors
     ///
     /// [`InvalidConfig`] naming the first bad value.
     pub fn validate(&self) -> Result<(), InvalidConfig> {
+        let processing = &self.processing;
+        if processing.queue_capacity.get() > MAX_QUEUE_CAPACITY {
+            return Err(InvalidConfig(format!(
+                "processing.queue_capacity must be from 1 to {MAX_QUEUE_CAPACITY}, not {}",
+                processing.queue_capacity
+            )));
+        }
+        if processing.workers.get() > MAX_WORKERS {
+            return Err(InvalidConfig(format!(
+                "processing.workers must be from 1 to {MAX_WORKERS}, not {}",
+                processing.workers
+            )));
+        }
         let admission = &self.admission;
         let floor = admission.confidence_floor;
         if !floor.is_finite() || !(0.0..=1.0).contains(&floor) {
@@ -228,7 +245,7 @@ mod tests {
         assert!(config.processing_identity.is_none() && config.model.is_none());
         assert_eq!(config.processing.max_reruns, 2);
         assert!((config.admission.confidence_floor - 0.6).abs() < f32::EPSILON);
-        assert_eq!(config.profile_categories, CategoryCheckConfig::OneCall);
+        assert_eq!(config.profile_category_check, CategoryCheckConfig::OneCall);
     }
 
     #[test]
@@ -238,7 +255,7 @@ mod tests {
             "model": { "upstream_alias": "llm", "model": "gpt-x" },
             "processing": { "workers": 2 },
             "admission": { "entity_kinds": ["skill"], "max_steps": 10 },
-            "profile_categories": "per_category",
+            "profile_category_check": "per_category",
         }))
         .expect("known keys");
         assert!(config.processing_identity.is_some());
@@ -251,7 +268,10 @@ mod tests {
             Some(vec!["skill".to_owned()])
         );
         assert_eq!(config.admission.max_steps, 10);
-        assert_eq!(config.profile_categories, CategoryCheckConfig::PerCategory);
+        assert_eq!(
+            config.profile_category_check,
+            CategoryCheckConfig::PerCategory
+        );
     }
 
     fn valid(json: serde_json::Value) -> Result<(), InvalidConfig> {
@@ -286,6 +306,39 @@ mod tests {
             assert!(
                 valid(serde_json::json!({ "admission": admission })).is_err(),
                 "{admission}"
+            );
+        }
+        for processing in [
+            serde_json::json!({ "queue_capacity": MAX_QUEUE_CAPACITY + 1 }),
+            serde_json::json!({ "workers": MAX_WORKERS + 1 }),
+        ] {
+            assert!(
+                valid(serde_json::json!({ "processing": processing })).is_err(),
+                "{processing}"
+            );
+        }
+    }
+
+    #[test]
+    fn caps_at_either_end_of_their_range_are_valid() {
+        for admission in [
+            serde_json::json!({ "max_steps": 1 }),
+            serde_json::json!({ "max_steps": MAX_STEPS_LIMIT }),
+            serde_json::json!({ "max_value_chars": 1 }),
+            serde_json::json!({ "max_value_chars": MAX_VALUE_CHARS_LIMIT }),
+        ] {
+            assert!(
+                valid(serde_json::json!({ "admission": admission })).is_ok(),
+                "{admission}"
+            );
+        }
+        for processing in [
+            serde_json::json!({ "queue_capacity": 1, "workers": 1 }),
+            serde_json::json!({ "queue_capacity": MAX_QUEUE_CAPACITY, "workers": MAX_WORKERS }),
+        ] {
+            assert!(
+                valid(serde_json::json!({ "processing": processing })).is_ok(),
+                "{processing}"
             );
         }
     }

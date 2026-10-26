@@ -44,9 +44,13 @@ pub enum FactOrigin {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum FactCategory {
+    /// The identity person type, [`crate::gts::IDENTITY_TYPE`].
     Identity,
+    /// The role person type, [`crate::gts::ROLE_TYPE`].
     Role,
+    /// The skill person type, [`crate::gts::SKILL_TYPE`].
     Skill,
+    /// The preference person type, [`crate::gts::PREFERENCE_TYPE`].
     Preference,
 }
 
@@ -66,18 +70,21 @@ pub struct ProfileFact {
 }
 
 impl ProfileFact {
+    /// A fact with its id (the graph node key), its one property and that
+    /// property's value, who it came from, when graph storage stored it, and
+    /// when its source asserted it, when the source said.
     #[must_use]
     pub fn new(
-        fact_id: String,
-        property: String,
+        fact_id: impl Into<String>,
+        property: impl Into<String>,
         value: serde_json::Value,
         origin: FactOrigin,
         stored_at: time::OffsetDateTime,
         produced_at: Option<time::OffsetDateTime>,
     ) -> Self {
         Self {
-            fact_id,
-            property,
+            fact_id: fact_id.into(),
+            property: property.into(),
             value,
             origin,
             stored_at,
@@ -96,6 +103,7 @@ pub struct ProfileCategory {
 }
 
 impl ProfileCategory {
+    /// The facts of one category.
     #[must_use]
     pub fn new(category: FactCategory, facts: Vec<ProfileFact>) -> Self {
         Self { category, facts }
@@ -113,6 +121,7 @@ pub struct SubjectProfile {
 }
 
 impl SubjectProfile {
+    /// A subject's profile from the categories the caller may read.
     #[must_use]
     pub fn new(subject_id: uuid::Uuid, categories: Vec<ProfileCategory>) -> Self {
         Self {

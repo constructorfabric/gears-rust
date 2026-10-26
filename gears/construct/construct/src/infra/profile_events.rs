@@ -10,14 +10,19 @@ pub struct LogProfileEvents;
 impl ProfileEvents for LogProfileEvents {
     fn read(&self, event: ProfileReadEvent) {
         // @cpt-begin:cpt-cf-construct-algo-profile-reader-read:p1:inst-read-log
-        let categories: Vec<&str> = event.categories.iter().map(|c| c.name()).collect();
+        let categories = event
+            .categories
+            .iter()
+            .map(|category| category.name())
+            .collect::<Vec<_>>()
+            .join(",");
         tracing::info!(
             target: "construct::audit",
             event = "profile_read",
             tenant_id = %event.tenant_id,
             subject_id = %event.subject_id,
             caller = %event.caller,
-            categories = ?categories,
+            categories = %categories,
             "profile read"
         );
         // @cpt-end:cpt-cf-construct-algo-profile-reader-read:p1:inst-read-log
@@ -48,6 +53,6 @@ mod tests {
         assert!(logs_contain(&format!("tenant_id={}", event.tenant_id)));
         assert!(logs_contain(&format!("subject_id={}", event.subject_id)));
         assert!(logs_contain(&format!("caller={}", event.caller)));
-        assert!(logs_contain("categories=[\"identity\", \"skill\"]"));
+        assert!(logs_contain("categories=identity,skill"));
     }
 }

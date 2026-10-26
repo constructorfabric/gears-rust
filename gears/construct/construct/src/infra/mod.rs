@@ -12,6 +12,7 @@ pub mod pipeline;
 mod pipeline_test;
 pub mod planner_stub;
 pub mod processing_contexts;
+pub mod processing_metrics;
 pub mod profile_events;
 pub mod record_queue;
 #[cfg(test)]
