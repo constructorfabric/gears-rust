@@ -33,6 +33,9 @@ oagw-sdk = { workspace = true }
 http = { workspace = true }
 bytes = { workspace = true }
 
+# The profile: graph storage's in-process client
+graph-storage-sdk = { workspace = true }
+
 # Record types: the types registry resolves a record's type and base types
 types-registry-sdk = { workspace = true }
 types-registry = { workspace = true }
@@ -68,6 +71,10 @@ toolkit-gts = { workspace = true }
 toolkit-macros = { workspace = true }
 
 [dev-dependencies]
+# Path-only: graph storage is no normal dependency, so its release need not be
+# published when this crate is.
+graph-storage = { package = "cf-gears-graph-storage", path = "../../graph-storage/graph-storage", features = ["test-support"] }
+toolkit-odata = { workspace = true }
 types-registry-sdk = { workspace = true, features = ["test-util"] }
 toolkit-db = { workspace = true, features = ["sqlite", "test-support"] }
 tower = { workspace = true, features = ["util"] }
