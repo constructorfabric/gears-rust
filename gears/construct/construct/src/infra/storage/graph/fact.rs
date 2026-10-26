@@ -6,6 +6,7 @@ use time::{OffsetDateTime, UtcOffset};
 use crate::domain::error::DomainError;
 use crate::domain::plan::{Change, NodeKey, Origin, Plan, Property, Step};
 use crate::domain::profile::{Category, Fact};
+use crate::domain::profile_read::{OriginKind, StoredFact};
 
 /// What each source puts in a fact's origin: who produced it, how, and the
 /// model when an agent did.
@@ -190,5 +191,67 @@ pub fn fact_of(node: &NodeView) -> Result<Fact, DomainError> {
         category,
         property: property.clone(),
         value: value.clone(),
+    })
+}
+
+/// Who a stored fact came from, from its payload: a record's fact names its
+/// record, and the other sources name their method. `None` for a payload that
+/// names neither, which only a defect writes.
+fn origin_kind(payload: &Map<String, Value>) -> Option<OriginKind> {
+    if payload.contains_key(RECORD) {
+        return Some(OriginKind::Connector);
+    }
+    match payload
+        .get(ORIGIN)
+        .and_then(|origin| origin.get("method"))
+        .and_then(Value::as_str)
+    {
+        Some(METHOD_MCP) => Some(OriginKind::Agent),
+        Some(METHOD_REVIEW) => Some(OriginKind::Reviewer),
+        Some(METHOD_ADMIN) => Some(OriginKind::Administrator),
+        _ => None,
+    }
+}
+
+/// The fact a stored node holds, with its origin kind, when graph storage
+/// stored it, and when its source asserted it. `None` for a node that is not a
+/// fact of a person type, does not hold exactly one fact property, or whose
+/// origin names no known source. A `produced_at` that does not parse is read
+/// as absent and logged.
+#[must_use]
+pub fn stored_fact_of(node: NodeView) -> Option<StoredFact> {
+    let category = Category::from_type_id(&node.type_id)?;
+    let stored_at = node.envelope.created_at;
+    let Value::Object(mut payload) = node.payload? else {
+        return None;
+    };
+    let origin = origin_kind(&payload)?;
+    let produced_at = payload
+        .get(ORIGIN)
+        .and_then(|origin| origin.get("produced_at"))
+        .and_then(Value::as_str)
+        .and_then(|at| {
+            let parsed = OffsetDateTime::parse(at, &Rfc3339).ok();
+            if parsed.is_none() {
+                tracing::warn!(node_key = %node.node_key, "a stored fact's produced_at is not RFC 3339; it is served without it");
+            }
+            parsed
+        });
+    let mut properties = payload
+        .keys()
+        .filter(|name| !ENVELOPE.contains(&name.as_str()));
+    let (Some(property), None) = (properties.next(), properties.next()) else {
+        return None;
+    };
+    let property = property.clone();
+    let value = payload.remove(&property)?;
+    Some(StoredFact {
+        node_key: NodeKey(node.node_key),
+        category,
+        property,
+        value,
+        origin,
+        stored_at,
+        produced_at,
     })
 }

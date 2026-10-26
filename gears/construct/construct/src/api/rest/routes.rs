@@ -1,4 +1,4 @@
-use crate::api::rest::types::{ConcreteIntake, ConcreteSettings};
+use crate::api::rest::types::{ConcreteIntake, ConcreteProfile, ConcreteSettings};
 use crate::api::rest::{dto, handlers};
 use crate::domain::planner::manage::ManageFacts;
 use axum::http::StatusCode;
@@ -11,6 +11,7 @@ const SUBJECT_SETTINGS_PATH: &str = "/construct/v1/subjects/{subject_id}/setting
 const SUBJECT_SETTINGS_TAG: &str = "Subject settings";
 const MANAGE_FACTS_PATH: &str = "/construct/v1/subjects/{subject_id}/facts/manage";
 const SUBJECT_FACTS_TAG: &str = "Subject facts";
+const PROFILE_PATH: &str = "/construct/v1/subjects/{subject_id}/profile";
 
 struct License;
 
@@ -28,6 +29,7 @@ pub fn register_routes(
     openapi: &dyn OpenApiRegistry,
     intake: Arc<ConcreteIntake>,
     settings: Arc<ConcreteSettings>,
+    profile: Arc<ConcreteProfile>,
 ) -> Router {
     // @cpt-begin:cpt-cf-construct-flow-record-intake-submit:p1:inst-submit-send
     router = OperationBuilder::post("/construct/v1/records")
@@ -109,7 +111,43 @@ pub fn register_routes(
         .register(router, openapi);
     // @cpt-end:cpt-cf-construct-flow-subject-settings-change:p1:inst-change-send
 
-    router.layer(Extension(intake)).layer(Extension(settings))
+    // @cpt-begin:cpt-cf-construct-flow-profile-reader-read:p1:inst-profile-send
+    router = OperationBuilder::get(PROFILE_PATH)
+        .operation_id("construct.get_profile")
+        .summary("Read a subject's profile")
+        .description(
+            "Read the facts of a subject by category, for a caller the platform lets act for \
+             the subject: the subject itself, or an application or agent acting for it. The \
+             tenant is the caller's own, or the one named in `tenant`. A category the caller \
+             may not read is not listed, like one without facts; nothing is listed while \
+             personalization is off or an erasure is under way. A subject the caller may not \
+             act for is answered with 404, like one that does not exist.",
+        )
+        .tag("Profiles")
+        .authenticated()
+        .require_license_features::<License>([])
+        .path_param("subject_id", "The subject whose profile is read")
+        .query_param_typed(
+            "tenant",
+            false,
+            "Tenant of the subject, when not the caller's own",
+            "string",
+        )
+        .handler(handlers::get_profile)
+        .json_response_with_schema::<dto::ProfileDto>(
+            openapi,
+            StatusCode::OK,
+            "The subject's profile by category",
+        )
+        .standard_errors(openapi)
+        .error_503(openapi)
+        .register(router, openapi);
+    // @cpt-end:cpt-cf-construct-flow-profile-reader-read:p1:inst-profile-send
+
+    router
+        .layer(Extension(intake))
+        .layer(Extension(settings))
+        .layer(Extension(profile))
 }
 
 /// The synchronous manage-facts route. The gear registers it together with the planner chain it runs on.

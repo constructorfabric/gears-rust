@@ -1,7 +1,10 @@
 use serde::Deserialize;
+use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::domain::planner::processing::{Changes, Managed};
+use crate::domain::profile::Category;
+use crate::domain::profile_read::{OriginKind, ProfileView, StoredFact};
 use crate::domain::record_intake::IntakeOutcome;
 use crate::domain::subject_settings::SubjectSettings;
 
@@ -166,6 +169,137 @@ impl From<Managed> for ManageFactsResponse {
                 replaced: 0,
                 removed: 0,
             },
+        }
+    }
+}
+
+/// The query of the profile read: the tenant, when the caller reads a subject
+/// of a tenant other than its own login's. The platform must authorize the
+/// caller for it.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProfileQuery {
+    #[serde(default)]
+    pub tenant: Option<Uuid>,
+}
+
+/// Who a fact came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[toolkit_macros::api_dto(response)]
+pub enum OriginKindDto {
+    Connector,
+    Agent,
+    Reviewer,
+    Administrator,
+}
+
+impl From<OriginKind> for OriginKindDto {
+    fn from(origin: OriginKind) -> Self {
+        match origin {
+            OriginKind::Connector => Self::Connector,
+            OriginKind::Agent => Self::Agent,
+            OriginKind::Reviewer => Self::Reviewer,
+            OriginKind::Administrator => Self::Administrator,
+        }
+    }
+}
+
+/// Who a fact came from.
+#[derive(Debug)]
+#[toolkit_macros::api_dto(response)]
+pub struct OriginDto {
+    pub kind: OriginKindDto,
+}
+
+/// A category of a person's profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[toolkit_macros::api_dto(response)]
+pub enum EntityKindDto {
+    Identity,
+    Role,
+    Skill,
+    Preference,
+}
+
+impl From<Category> for EntityKindDto {
+    fn from(category: Category) -> Self {
+        match category {
+            Category::Identity => Self::Identity,
+            Category::Role => Self::Role,
+            Category::Skill => Self::Skill,
+            Category::Preference => Self::Preference,
+        }
+    }
+}
+
+/// One fact: its id, its one property with its value, who it came from, when
+/// it was stored, and when its source asserted it.
+#[derive(Debug)]
+#[toolkit_macros::api_dto(response)]
+pub struct ProfileFactDto {
+    /// The fact's id, the graph node key.
+    pub fact_id: String,
+    /// The fact's property, by its plain key, with its value.
+    #[schema(value_type = Object)]
+    pub properties: serde_json::Map<String, serde_json::Value>,
+    pub origin: OriginDto,
+    #[serde(with = "time::serde::rfc3339")]
+    #[schema(value_type = String, format = DateTime)]
+    pub stored_at: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339::option")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<String>, format = DateTime)]
+    pub produced_at: Option<OffsetDateTime>,
+}
+
+/// The facts of one category.
+#[derive(Debug)]
+#[toolkit_macros::api_dto(response)]
+pub struct ProfileCategoryDto {
+    pub entity_kind: EntityKindDto,
+    pub facts: Vec<ProfileFactDto>,
+}
+
+/// A subject's profile by category. A category the caller may not read, or
+/// without facts, is not listed.
+///
+/// @cpt-dod:cpt-cf-construct-dod-profile-reader-route:p1
+#[derive(Debug)]
+#[toolkit_macros::api_dto(response)]
+pub struct ProfileDto {
+    #[schema(value_type = String)]
+    pub subject_id: Uuid,
+    pub categories: Vec<ProfileCategoryDto>,
+}
+
+impl From<StoredFact> for ProfileFactDto {
+    fn from(fact: StoredFact) -> Self {
+        let mut properties = serde_json::Map::new();
+        properties.insert(fact.property, fact.value);
+        Self {
+            fact_id: fact.node_key.0,
+            properties,
+            origin: OriginDto {
+                kind: fact.origin.into(),
+            },
+            stored_at: fact.stored_at,
+            produced_at: fact.produced_at,
+        }
+    }
+}
+
+impl From<ProfileView> for ProfileDto {
+    fn from(view: ProfileView) -> Self {
+        Self {
+            subject_id: view.subject_id,
+            categories: view
+                .categories
+                .into_iter()
+                .map(|group| ProfileCategoryDto {
+                    entity_kind: group.category.into(),
+                    facts: group.facts.into_iter().map(Into::into).collect(),
+                })
+                .collect(),
         }
     }
 }

@@ -7,7 +7,7 @@ use toolkit_canonical_errors::CanonicalError;
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
-use crate::models::RecordOutcome;
+use crate::models::{RecordOutcome, SubjectProfile};
 
 /// Public API trait of the Construct gear (Version 1), registered in
 /// `ClientHub` by the gear:
@@ -31,6 +31,22 @@ pub trait ConstructClientV1: Send + Sync {
         tenant_id: Uuid,
         record: serde_json::Value,
     ) -> Result<RecordOutcome, CanonicalError>;
+
+    /// Read a subject's profile by category, the same operation as
+    /// `GET /construct/v1/subjects/{subject_id}/profile`. The platform must
+    /// let the caller act for the subject; the tenant is the caller's own, or
+    /// `tenant_id` when given.
+    ///
+    /// # Errors
+    ///
+    /// A subject the caller may not act for is not found, like one that does
+    /// not exist. Unavailable when a dependency is down.
+    async fn read_profile(
+        &self,
+        ctx: &SecurityContext,
+        tenant_id: Option<Uuid>,
+        subject_id: Uuid,
+    ) -> Result<SubjectProfile, CanonicalError>;
 }
 
 #[cfg(test)]

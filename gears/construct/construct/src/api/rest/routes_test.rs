@@ -14,7 +14,8 @@ use uuid::Uuid;
 
 use crate::api::rest::routes::register_routes;
 use crate::test_support::{
-    AllowResolver, DenyResolver, IntakeFixture, chat_record, inmem_db, settings_service,
+    AllowResolver, DenyResolver, IntakeFixture, chat_record, idle_profile, inmem_db,
+    settings_service,
 };
 
 const PATH: &str = "/construct/v1/records";
@@ -28,8 +29,15 @@ async fn router_with(fixture: &IntakeFixture) -> Router {
         .build()
         .unwrap();
     let settings = Arc::new(settings_service(&db, Arc::new(AllowResolver), true));
-    register_routes(Router::new(), &OpenApiRegistryImpl::new(), intake, settings)
-        .layer(Extension(ctx))
+    let profile = idle_profile(&db, Arc::new(AllowResolver));
+    register_routes(
+        Router::new(),
+        &OpenApiRegistryImpl::new(),
+        intake,
+        settings,
+        profile,
+    )
+    .layer(Extension(ctx))
 }
 
 struct Answer {

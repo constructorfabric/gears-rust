@@ -1,44 +1,52 @@
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
 use anyhow::Context as _;
 use async_trait::async_trait;
 use axum::Router;
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 use toolkit::api::OpenApiRegistry;
+use toolkit::contracts::RunnableCapability;
 use toolkit::{Gear, GearCtx};
 use toolkit_db::DBProvider;
 use toolkit_db::DbError;
-use tracing::info;
+use tracing::{info, warn};
 
 use authz_resolver_sdk::{AuthZResolverApi, PolicyEnforcer};
 
 use construct_sdk::ConstructClientV1;
+use graph_storage_sdk::GraphStorageClientV1;
 
 use crate::api::rest::routes;
-use crate::api::rest::types::{ConcreteIntake, ConcreteSettings};
+use crate::api::rest::types::{ConcreteIntake, ConcreteProfile, ConcreteSettings};
 use crate::config::ConstructConfig;
 use crate::domain::local_client::LocalClient;
 use crate::domain::record_intake::{IntakePorts, RecordIntakeService};
 use crate::domain::subject_settings::SubjectSettingsService;
 use crate::infra::connector_switch::ConfigConnectorSwitch;
-use crate::infra::intake_events::LogIntakeEvents;
-use crate::infra::planner_stub::DroppingHandOff;
+use crate::infra::pipeline::{self, Worker};
 use crate::infra::record_types::RegistryRecordTypes;
 use crate::infra::storage::record_ids_repo::SeaOrmRecordIdRepository;
 use crate::infra::storage::subject_settings_repo::SeaOrmSubjectSettingsRepository;
 use crate::infra::tenant_defaults::SettingsServiceDefaults;
 
-/// The Construct gear: record intake for connectors, with tenant-scoped
-/// storage and an in-process client.
+/// The Construct gear: record intake for connectors, the processing of
+/// received records into a subject's profile, and the profile read, with
+/// tenant-scoped storage and an in-process client.
 ///
 /// @cpt-dod:cpt-cf-construct-dod-gear-foundation-anatomy:p1
 #[toolkit::gear(
     name = "construct",
-    deps = [authz_resolver, types_registry],
-    capabilities = [rest, db]
+    deps = [authz_resolver, types_registry, graph_storage],
+    capabilities = [rest, db, stateful]
 )]
 pub struct ConstructGear {
     intake: OnceLock<Arc<ConcreteIntake>>,
     settings: OnceLock<Arc<ConcreteSettings>>,
+    profile: OnceLock<Arc<ConcreteProfile>>,
+    /// The processing worker, until `start` takes it.
+    worker: Mutex<Option<Worker>>,
+    running: Mutex<Option<(CancellationToken, JoinHandle<()>)>>,
 }
 
 impl Default for ConstructGear {
@@ -46,6 +54,9 @@ impl Default for ConstructGear {
         Self {
             intake: OnceLock::new(),
             settings: OnceLock::new(),
+            profile: OnceLock::new(),
+            worker: Mutex::new(None),
+            running: Mutex::new(None),
         }
     }
 }
@@ -66,6 +77,7 @@ impl Gear for ConstructGear {
         // @cpt-begin:cpt-cf-construct-algo-gear-foundation-start-gear:p1:inst-start-config
         // @cpt-begin:cpt-cf-construct-algo-gear-foundation-start-gear:p1:inst-start-config-fail
         let cfg: ConstructConfig = ctx.config_or_default()?;
+        cfg.validate()?;
         // @cpt-end:cpt-cf-construct-algo-gear-foundation-start-gear:p1:inst-start-config-fail
         // @cpt-end:cpt-cf-construct-algo-gear-foundation-start-gear:p1:inst-start-config
 
@@ -100,14 +112,28 @@ impl Gear for ConstructGear {
             Arc::new(defaults),
             policy_enforcer.clone(),
         ));
+        let graph = hub.try_get::<dyn GraphStorageClientV1>();
+        let pipeline = pipeline::build(
+            &cfg,
+            &hub,
+            graph,
+            Arc::clone(&settings) as _,
+            policy_enforcer.clone(),
+        )
+        .context("record processing")?;
+        // Nothing below can fail but a second init.
         self.settings
             .set(Arc::clone(&settings))
             .map_err(|_| anyhow::anyhow!("{} gear already initialized", Self::MODULE_NAME))?;
         // @cpt-end:cpt-cf-construct-algo-subject-settings-start:p1:inst-settings-start
+        self.profile
+            .set(pipeline.profile)
+            .map_err(|_| anyhow::anyhow!("{} gear already initialized", Self::MODULE_NAME))?;
+        *lock(&self.worker) = pipeline.worker;
         let ports = IntakePorts {
             types,
             switch: Arc::new(ConfigConnectorSwitch::new(cfg.connectors_off)),
-            hand_off: Arc::new(DroppingHandOff::new(Arc::new(LogIntakeEvents))),
+            hand_off: pipeline.hand_off,
         };
         let intake = Arc::new(RecordIntakeService::new(
             db,
@@ -122,7 +148,12 @@ impl Gear for ConstructGear {
         // @cpt-end:cpt-cf-construct-algo-gear-foundation-start-gear:p1:inst-start-service
 
         // @cpt-begin:cpt-cf-construct-algo-gear-foundation-start-gear:p1:inst-start-client
-        let client: Arc<dyn ConstructClientV1> = Arc::new(LocalClient::new(intake));
+        let profile = self
+            .profile
+            .get()
+            .map(Arc::clone)
+            .ok_or_else(|| anyhow::anyhow!("Profile read not initialized"))?;
+        let client: Arc<dyn ConstructClientV1> = Arc::new(LocalClient::new(intake, profile));
         ctx.client_hub().register(client);
         // @cpt-end:cpt-cf-construct-algo-gear-foundation-start-gear:p1:inst-start-client
 
@@ -153,9 +184,65 @@ impl toolkit::contracts::RestApiCapability for ConstructGear {
             .map(Arc::clone)
             .ok_or_else(|| anyhow::anyhow!("Subject settings service not initialized"))?;
 
-        let router = routes::register_routes(router, openapi, intake, settings);
+        let profile = self
+            .profile
+            .get()
+            .map(Arc::clone)
+            .ok_or_else(|| anyhow::anyhow!("Profile read not initialized"))?;
+
+        let router = routes::register_routes(router, openapi, intake, settings, profile);
         info!("Construct gear: REST routes registered");
         Ok(router)
         // @cpt-end:cpt-cf-construct-algo-gear-foundation-start-gear:p1:inst-start-rest
     }
 }
+
+#[async_trait]
+impl RunnableCapability for ConstructGear {
+    /// Start processing received records, when processing is configured.
+    async fn start(&self, cancel: CancellationToken) -> anyhow::Result<()> {
+        // @cpt-begin:cpt-cf-construct-algo-profile-reader-wire:p1:inst-wire-start
+        let worker = lock(&self.worker).take();
+        let Some(worker) = worker else {
+            return Ok(());
+        };
+        let token = cancel.child_token();
+        let handle = tokio::spawn(worker.run(token.clone()));
+        *lock(&self.running) = Some((token, handle));
+        info!("construct: record processing started");
+        Ok(())
+        // @cpt-end:cpt-cf-construct-algo-profile-reader-wire:p1:inst-wire-start
+    }
+
+    /// Stop processing. Records in flight are stopped; a record still queued
+    /// is lost, as the DESIGN says, and its identity stays, so a resend is a
+    /// repeat.
+    async fn stop(&self, deadline: CancellationToken) -> anyhow::Result<()> {
+        let running = lock(&self.running).take();
+        if let Some((token, mut handle)) = running {
+            token.cancel();
+            tokio::select! {
+                result = &mut handle => {
+                    if let Err(err) = result
+                        && !err.is_cancelled()
+                    {
+                        warn!(error = ?err, "construct record processing ended with an error");
+                    }
+                }
+                () = deadline.cancelled() => handle.abort(),
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The guard of `mutex`, also after a panic while it was held: the worker
+/// slots hold no invariant a panic can break, and dropping the worker or its
+/// handle would leave records queued with nothing to process them.
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+#[cfg(test)]
+#[path = "gear_test.rs"]
+mod gear_test;

@@ -36,9 +36,16 @@ fn router_for(
     tenant_id: Uuid,
 ) -> Router {
     let intake = Arc::new(IntakeFixture::default().build(db));
-    let settings = Arc::new(settings_service(db, resolver, DEFAULT_ON));
-    register_routes(Router::new(), &OpenApiRegistryImpl::new(), intake, settings)
-        .layer(Extension(context_of(subject_id, tenant_id)))
+    let settings = Arc::new(settings_service(db, Arc::clone(&resolver), DEFAULT_ON));
+    let profile = crate::test_support::idle_profile(db, resolver);
+    register_routes(
+        Router::new(),
+        &OpenApiRegistryImpl::new(),
+        intake,
+        settings,
+        profile,
+    )
+    .layer(Extension(context_of(subject_id, tenant_id)))
 }
 
 async fn send(

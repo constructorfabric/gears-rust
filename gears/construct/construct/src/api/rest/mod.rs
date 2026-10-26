@@ -11,6 +11,9 @@ mod error_test;
 mod dto_test;
 
 #[cfg(test)]
+mod profile_routes_test;
+
+#[cfg(test)]
 mod routes_test;
 
 #[cfg(test)]

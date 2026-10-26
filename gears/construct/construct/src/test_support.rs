@@ -521,6 +521,8 @@ pub struct IntakeFixture {
     pub events: Arc<RecordingEvents>,
     /// A deadline for the policy service, shorter than the enforcer's default.
     pub policy_deadline: Option<std::time::Duration>,
+    /// Hand received records here instead, such as the processing queue.
+    pub hand_off_to: Option<Arc<dyn RecordHandOff>>,
 }
 
 impl Default for IntakeFixture {
@@ -536,6 +538,7 @@ impl Default for IntakeFixture {
             dropping: false,
             events: Arc::new(RecordingEvents::default()),
             policy_deadline: None,
+            hand_off_to: None,
         }
     }
 }
@@ -551,7 +554,9 @@ impl IntakeFixture {
         if let Some(deadline) = self.policy_deadline {
             enforcer = enforcer.with_deadline(deadline);
         }
-        let hand_off: Arc<dyn RecordHandOff> = if self.dropping {
+        let hand_off: Arc<dyn RecordHandOff> = if let Some(hand_off) = &self.hand_off_to {
+            Arc::clone(hand_off)
+        } else if self.dropping {
             Arc::new(crate::infra::planner_stub::DroppingHandOff::new(
                 Arc::clone(&self.events) as Arc<dyn IntakeEvents>,
             ))
@@ -843,4 +848,173 @@ impl AdmissionFixture {
 /// The security context and scope processing builds for a tenant.
 pub fn processing_context(tenant_id: Uuid) -> (SecurityContext, AccessScope) {
     (context_in(tenant_id), AccessScope::for_tenant(tenant_id))
+}
+
+// --- The profile read ---
+
+/// Stored facts a test gives, for every subject. It keeps each call: the
+/// subject of the context it was called with, and the tenant and subject read.
+pub struct FixedFacts {
+    facts: Vec<crate::domain::profile_read::StoredFact>,
+    pub calls: std::sync::Mutex<Vec<(Uuid, SubjectKey)>>,
+}
+
+impl FixedFacts {
+    pub fn new(facts: Vec<crate::domain::profile_read::StoredFact>) -> Self {
+        Self {
+            facts,
+            calls: std::sync::Mutex::default(),
+        }
+    }
+}
+
+#[async_trait]
+impl crate::domain::profile_read::StoredProfiles for FixedFacts {
+    async fn stored(
+        &self,
+        ctx: &SecurityContext,
+        key: SubjectKey,
+    ) -> Result<Vec<crate::domain::profile_read::StoredFact>, DomainError> {
+        self.calls.lock().unwrap().push((ctx.subject_id(), key));
+        Ok(self.facts.clone())
+    }
+}
+
+/// Keeps every profile read event.
+#[derive(Default)]
+pub struct RecordingProfileEvents {
+    pub events: std::sync::Mutex<Vec<crate::domain::profile_read::ProfileReadEvent>>,
+}
+
+impl RecordingProfileEvents {
+    pub fn taken(&self) -> Vec<crate::domain::profile_read::ProfileReadEvent> {
+        self.events.lock().unwrap().clone()
+    }
+}
+
+impl crate::domain::profile_read::ProfileEvents for RecordingProfileEvents {
+    fn read(&self, event: crate::domain::profile_read::ProfileReadEvent) {
+        self.events.lock().unwrap().push(event);
+    }
+}
+
+/// The profile read over `facts`, the subject settings in `db` with
+/// personalization on by default, and the policy service `resolver`.
+pub fn profile_service(
+    db: &Db,
+    resolver: Arc<dyn AuthZResolverApi>,
+    facts: Vec<crate::domain::profile_read::StoredFact>,
+    events: Arc<RecordingProfileEvents>,
+    check: crate::domain::profile_read::CategoryCheck,
+) -> crate::domain::profile_read::ProfileReadService {
+    profile_service_over(
+        db,
+        resolver,
+        Arc::new(FixedFacts::new(facts)),
+        Uuid::new_v4(),
+        events,
+        check,
+    )
+}
+
+/// The profile read over `profiles`, read as the processing identity
+/// `identity`.
+pub fn profile_service_over(
+    db: &Db,
+    resolver: Arc<dyn AuthZResolverApi>,
+    profiles: Arc<dyn crate::domain::profile_read::StoredProfiles>,
+    identity: Uuid,
+    events: Arc<RecordingProfileEvents>,
+    check: crate::domain::profile_read::CategoryCheck,
+) -> crate::domain::profile_read::ProfileReadService {
+    use crate::domain::profile_read::{ProfileEvents, ProfileReadPorts, ProfileReadService};
+    ProfileReadService::new(
+        ProfileReadPorts {
+            settings: Arc::new(settings_service(db, Arc::clone(&resolver), true)),
+            profiles,
+            contexts: Arc::new(crate::infra::processing_contexts::ServiceIdentity::new(
+                identity,
+            )),
+            events: events as Arc<dyn ProfileEvents>,
+        },
+        PolicyEnforcer::new(resolver),
+        check,
+    )
+}
+
+/// A profile read with nothing stored, for tests of other routes.
+pub fn idle_profile(
+    db: &Db,
+    resolver: Arc<dyn AuthZResolverApi>,
+) -> Arc<crate::domain::profile_read::ProfileReadService> {
+    Arc::new(profile_service(
+        db,
+        resolver,
+        Vec::new(),
+        Arc::default(),
+        crate::domain::profile_read::CategoryCheck::OneCall,
+    ))
+}
+
+// --- Graph storage ---
+
+/// Admits every call, scoped to the caller's own tenant, like a real PDP.
+pub struct AllowInOwnTenant;
+
+#[async_trait]
+impl AuthZResolverApi for AllowInOwnTenant {
+    async fn evaluate(
+        &self,
+        _ctx: PlatformSecurityContext,
+        request: EvaluationRequest,
+    ) -> Result<EvaluationResponse, CanonicalError> {
+        let tenant = request
+            .subject
+            .properties
+            .get("tenant_id")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|raw| Uuid::parse_str(raw).ok())
+            .unwrap_or_else(Uuid::nil);
+        Ok(EvaluationResponse {
+            decision: true,
+            context: EvaluationResponseContext {
+                constraints: vec![Constraint {
+                    predicates: vec![Predicate::In(InPredicate::new(
+                        pep_properties::OWNER_TENANT_ID,
+                        [tenant],
+                    ))],
+                }],
+                ..Default::default()
+            },
+        })
+    }
+}
+
+/// Graph storage's real service over its in-memory store, with a policy
+/// service that admits every call in the caller's tenant.
+pub fn fake_graph_storage() -> Arc<dyn graph_storage_sdk::GraphStorageClientV1> {
+    use graph_storage::config::GraphStorageConfig;
+    use graph_storage::domain::embedding::{EmbeddingCoordinator, SpaceState};
+    use graph_storage::domain::local_client::GraphStorageLocalClient;
+    use graph_storage::domain::service::GraphServices;
+    use graph_storage::infra::embedding::fake::FakeEmbeddingProvider;
+    use graph_storage::infra::fake_store::{FakeGraphEngine, FakeGraphStore};
+
+    let store = Arc::new(FakeGraphStore::new());
+    let engine = Arc::new(FakeGraphEngine::new(Arc::clone(&store)));
+    let embedding = EmbeddingCoordinator::new(
+        Arc::new(FakeEmbeddingProvider::new(384)),
+        SpaceState::Active { epoch: 1 },
+        8 * 1024,
+    );
+    let services = Arc::new(GraphServices::new(
+        GraphStorageConfig::default()
+            .validated()
+            .expect("the default configuration is valid"),
+        store,
+        engine,
+        PolicyEnforcer::new(Arc::new(AllowInOwnTenant)),
+        embedding,
+    ));
+    Arc::new(GraphStorageLocalClient::new(services))
 }
