@@ -10,7 +10,7 @@ use uuid::Uuid;
 
 use super::fact::{fact_node, fact_of};
 use crate::domain::error::DomainError;
-use crate::domain::plan::{Change, NodeKey, Origin, Plan, Step};
+use crate::domain::plan::{Change, NodeKey, Origin, Plan, Property, Step};
 use crate::domain::profile::Category;
 use crate::test_support::{
     add_entity, add_value, by_a_person, connector_plan, remove_entity, replace_property,
@@ -65,11 +65,31 @@ fn a_records_fact_names_the_connector_its_record_and_when_it_was_observed() {
 
 #[test]
 fn a_confidence_is_stored_as_the_decimal_the_model_gave() {
-    let plan = connector_plan(vec![add_value("skill", "skills", skills())]);
+    for (given, stored) in [
+        (0.9_f32, json!(0.9)),
+        (0.1, json!(0.1)),
+        (0.3, json!(0.3)),
+        (0.7, json!(0.7)),
+        (0.0, json!(0.0)),
+        (1.0, json!(1.0)),
+    ] {
+        let mut plan = connector_plan(vec![add_value("skill", "skills", skills())]);
+        plan.steps[0].confidence = Some(given);
 
-    let payload = node_of(&plan).payload.unwrap();
+        let payload = node_of(&plan).payload.unwrap();
 
-    assert_eq!(payload["origin"]["confidence"], json!(0.9));
+        assert_eq!(payload["origin"]["confidence"], stored, "{given}");
+    }
+}
+
+#[test]
+fn a_confidence_that_is_no_number_is_a_defect() {
+    let mut plan = connector_plan(vec![add_value("skill", "skills", skills())]);
+    plan.steps[0].confidence = Some(f32::NAN);
+
+    let message = internal(fact_node(&plan, &plan.steps[0], now()));
+
+    assert!(message.contains("confidence"), "{message}");
 }
 
 #[test]
@@ -156,18 +176,46 @@ fn a_fact_must_hold_exactly_one_property() {
 
 #[test]
 fn a_property_change_is_refused_without_its_value_in_the_message() {
-    let plan = connector_plan(vec![replace_property("skill", "skills", "a secret value")]);
+    let entity = NodeKey("construct:t:fact".to_owned());
+    let secret = Property::new("skills", json!("a secret value"));
+    for (change, kind) in [
+        (
+            Change::AddProperty {
+                entity: entity.clone(),
+                property: secret.clone(),
+            },
+            "add-property",
+        ),
+        (
+            Change::ReplaceProperty {
+                entity: entity.clone(),
+                property: secret,
+            },
+            "replace-property",
+        ),
+        (
+            Change::RemoveProperty {
+                entity,
+                name: "skills".to_owned(),
+            },
+            "remove-property",
+        ),
+    ] {
+        let mut plan = connector_plan(vec![replace_property("skill", "skills", "a secret value")]);
+        plan.steps[0].change = change;
 
-    let message = internal(fact_node(&plan, &plan.steps[0], now()));
+        let message = internal(fact_node(&plan, &plan.steps[0], now()));
 
-    assert!(message.contains("replace-property"), "{message}");
-    assert!(
-        !message.contains("a secret value"),
-        "no fact value: {message}"
-    );
+        assert!(message.contains(kind), "{message}");
+        assert!(
+            !message.contains("a secret value"),
+            "no fact value: {message}"
+        );
+    }
 }
 
-fn view(type_id: &str, payload: Option<Value>) -> NodeView {
+/// A stored node of `type_id` holding `payload`.
+pub(super) fn view(type_id: &str, payload: Option<Value>) -> NodeView {
     let subject = Subject {
         subject_id: Uuid::new_v4(),
         subject_type: None,

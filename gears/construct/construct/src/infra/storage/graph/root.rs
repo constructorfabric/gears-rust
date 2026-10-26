@@ -17,10 +17,11 @@ pub fn root_key(subject: &SubjectKey) -> NodeKey {
 }
 
 /// The root's payload besides the version, which [`ProfileVersion`] owns.
+/// It borrows the removals when written and owns them when read.
 #[derive(Debug, Serialize, Deserialize)]
-struct RootPayload {
+struct RootPayload<R> {
     subject_id: Uuid,
-    removals: Vec<String>,
+    removals: R,
 }
 
 /// What the root holds besides its subject and its version: the removed facts
@@ -42,7 +43,7 @@ impl Root {
         let payload = payload.ok_or_else(|| {
             DomainError::internal(format!("profile root {} has no payload", key.0))
         })?;
-        let parsed: RootPayload = serde_json::from_value(payload.clone()).map_err(|err| {
+        let parsed = RootPayload::<Vec<String>>::deserialize(payload).map_err(|err| {
             DomainError::internal(format!(
                 "profile root {} has no valid payload: {err}",
                 key.0
@@ -66,7 +67,7 @@ impl Root {
     ) -> Result<Value, DomainError> {
         let payload = RootPayload {
             subject_id,
-            removals: self.removals.clone(),
+            removals: &self.removals,
         };
         let Ok(Value::Object(mut fields)) = serde_json::to_value(payload) else {
             return Err(DomainError::internal(

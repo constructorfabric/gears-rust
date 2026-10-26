@@ -4,6 +4,7 @@
 //! loses answers, fails, hangs or holds calls where a case needs it.
 
 use std::collections::VecDeque;
+use std::num::NonZeroU32;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -22,7 +23,7 @@ use graph_storage::infra::embedding::fake::FakeEmbeddingProvider;
 use graph_storage::infra::fake_store::{FakeGraphEngine, FakeGraphStore};
 use graph_storage_sdk::GraphStorageClientV1;
 use graph_storage_sdk::models::{
-    DeleteOutcome, EdgeKey, GraphRevision, GtsTypeId, IngestOutcome, IngestRequest,
+    DeleteOutcome, EdgeKey, EdgeSpec, GraphRevision, GtsTypeId, IngestOutcome, IngestRequest,
     NeighborhoodRequest, NodeKey, NodeRow, NodeSpec, NodeView, Page, SearchRequest, SearchResponse,
     TraversalResponse, TraverseRequest, TruncationReason, TypeQuery, TypeRecord, TypeRegistration,
 };
@@ -33,7 +34,7 @@ use toolkit_canonical_errors::resource_error;
 use toolkit_security::{PlatformSecurityContext, SecurityContext, pep_properties};
 use uuid::Uuid;
 
-use super::reader::GraphProfileSource;
+use super::reader::{GraphProfileSource, MAX_FACTS, MAX_PROFILE_NODES};
 use super::root::{PayloadCounter, Root, root_key};
 use super::types::GraphTypes;
 use super::writer::{
@@ -154,7 +155,12 @@ struct Scripted {
     /// Holds every ingest until the given number of them wait, so writes that
     /// read the same profile both reach the compare-and-set.
     hold_ingests: Mutex<Option<Arc<Barrier>>>,
-    cut_reads: AtomicBool,
+    /// The time of every ingest, in the order they were sent.
+    sent_at: Mutex<Vec<tokio::time::Instant>>,
+    /// Every traversal asked for.
+    reads: Mutex<Vec<TraverseRequest>>,
+    /// Marks every traversal as cut short for this reason.
+    cut_reads: Mutex<Option<TruncationReason>>,
     hang_reads: AtomicBool,
     registrations: AtomicU32,
     fail_next_registration: AtomicBool,
@@ -168,7 +174,9 @@ impl Scripted {
             ingest_calls: AtomicU32::new(0),
             keys: Mutex::default(),
             hold_ingests: Mutex::default(),
-            cut_reads: AtomicBool::new(false),
+            sent_at: Mutex::default(),
+            reads: Mutex::default(),
+            cut_reads: Mutex::default(),
             hang_reads: AtomicBool::new(false),
             registrations: AtomicU32::new(0),
             fail_next_registration: AtomicBool::new(false),
@@ -217,6 +225,10 @@ impl GraphStorageClientV1 for Scripted {
         request: IngestRequest,
     ) -> Result<IngestOutcome, CanonicalError> {
         self.ingest_calls.fetch_add(1, Ordering::SeqCst);
+        self.sent_at
+            .lock()
+            .unwrap()
+            .push(tokio::time::Instant::now());
         self.keys
             .lock()
             .unwrap()
@@ -283,12 +295,13 @@ impl GraphStorageClientV1 for Scripted {
         ctx: &SecurityContext,
         request: TraverseRequest,
     ) -> Result<TraversalResponse, CanonicalError> {
+        self.reads.lock().unwrap().push(request.clone());
         if self.hang_reads.load(Ordering::SeqCst) {
             return std::future::pending().await;
         }
         let mut response = self.inner.traverse(ctx, request).await?;
-        if self.cut_reads.load(Ordering::SeqCst) {
-            response.truncated = Some(TruncationReason::NodeBudget);
+        if let Some(reason) = *self.cut_reads.lock().unwrap() {
+            response.truncated = Some(reason);
         }
         Ok(response)
     }
@@ -386,6 +399,16 @@ impl Profiles {
             .write(&self.ctx, &self.plan(version, steps))
             .await
             .expect("the write runs")
+    }
+
+    /// A write a case starts from; it has to land.
+    async fn given(&self, version: Option<u64>, steps: Vec<Step>) {
+        assert_eq!(self.write(version, steps).await, Written::Stored);
+    }
+
+    /// Send `request` to graph storage as it is, past the writer.
+    async fn ingest_directly(&self, request: IngestRequest) {
+        self.client.ingest(&self.ctx, request).await.unwrap();
     }
 
     fn subject_key(&self) -> SubjectKey {
@@ -516,7 +539,7 @@ async fn a_replace_stores_the_new_fact_and_removes_the_old_in_one_write() {
     let profiles = Profiles::new();
     let first = add_skill("Rust");
     let old = key_of(&first);
-    profiles.write(None, vec![first]).await;
+    profiles.given(None, vec![first]).await;
 
     let written = profiles.write(Some(1), vec![replace(&old, "Go")]).await;
 
@@ -535,8 +558,8 @@ async fn a_removal_that_is_done_drops_off_the_root_on_the_next_write() {
     let profiles = Profiles::new();
     let first = add_skill("Rust");
     let old = key_of(&first);
-    profiles.write(None, vec![first]).await;
-    profiles.write(Some(1), vec![replace(&old, "Go")]).await;
+    profiles.given(None, vec![first]).await;
+    profiles.given(Some(1), vec![replace(&old, "Go")]).await;
     assert_eq!(
         profiles.root().await.unwrap().removals,
         std::slice::from_ref(&old)
@@ -554,9 +577,9 @@ async fn a_removed_fact_is_gone_from_the_next_read() {
     let profiles = Profiles::new();
     let first = add_skill("Rust");
     let old = key_of(&first);
-    profiles.write(None, vec![first, add_skill("Go")]).await;
+    profiles.given(None, vec![first, add_skill("Go")]).await;
 
-    profiles.write(Some(1), vec![remove(&old)]).await;
+    profiles.given(Some(1), vec![remove(&old)]).await;
 
     assert_eq!(values(&profiles.read().await), skill_values(&["Go"]));
 }
@@ -564,7 +587,7 @@ async fn a_removed_fact_is_gone_from_the_next_read() {
 #[tokio::test]
 async fn a_plan_built_on_an_older_profile_conflicts_and_stores_nothing() {
     let profiles = Profiles::new();
-    profiles.write(None, vec![add_skill("Rust")]).await;
+    profiles.given(None, vec![add_skill("Rust")]).await;
 
     let stale_new_subject = profiles.write(None, vec![add_skill("Go")]).await;
     let stale_version = profiles.write(Some(7), vec![add_skill("Go")]).await;
@@ -608,7 +631,7 @@ async fn two_writes_at_once(profiles: &Profiles, version: Option<u64>) -> [Writt
 #[tokio::test]
 async fn two_plans_on_the_same_profile_never_both_land() {
     let profiles = Profiles::new();
-    profiles.write(None, vec![add_skill("Rust")]).await;
+    profiles.given(None, vec![add_skill("Rust")]).await;
 
     let outcomes = two_writes_at_once(&profiles, Some(1)).await;
 
@@ -663,16 +686,18 @@ async fn a_removal_that_fails_stays_listed_and_a_later_write_finishes_it() {
     let profiles = Profiles::new();
     let first = add_skill("Rust");
     let old = key_of(&first);
-    profiles.write(None, vec![first]).await;
+    profiles.given(None, vec![first]).await;
     let broken = Profiles::writer_with(Arc::clone(&profiles.client), Arc::new(BrokenRemoval));
 
-    broken
+    let written = broken
         .write(
             &profiles.ctx,
             &profiles.plan(Some(1), vec![replace(&old, "Go")]),
         )
         .await
         .unwrap();
+
+    assert_eq!(written, Written::Stored);
 
     assert!(profiles.is_live(&old).await, "the soft delete did not run");
     assert_eq!(
@@ -685,7 +710,7 @@ async fn a_removal_that_fails_stays_listed_and_a_later_write_finishes_it() {
         "a listed fact is not read"
     );
 
-    profiles.write(Some(2), vec![add_skill("Zig")]).await;
+    profiles.given(Some(2), vec![add_skill("Zig")]).await;
 
     assert!(!profiles.is_live(&old).await, "the later write finished it");
 }
@@ -696,8 +721,8 @@ async fn a_listed_key_that_is_not_a_fact_of_the_root_is_never_deleted() {
     let other = profiles.neighbour();
     let theirs = add_skill("Rust");
     let their_key = key_of(&theirs);
-    other.write(None, vec![theirs]).await;
-    profiles.write(None, vec![add_skill("Go")]).await;
+    other.given(None, vec![theirs]).await;
+    profiles.given(None, vec![add_skill("Go")]).await;
     // Someone else rewrites this subject's root to list the other subject's fact.
     let root = root_key(&profiles.subject_key());
     let planted = Root {
@@ -706,24 +731,19 @@ async fn a_listed_key_that_is_not_a_fact_of_the_root_is_never_deleted() {
     .payload(profiles.subject, &PayloadCounter, 2)
     .unwrap();
     profiles
-        .client
-        .ingest(
-            &profiles.ctx,
-            IngestRequest {
-                nodes: vec![NodeSpec {
-                    node_key: root.0.clone(),
-                    type_id: construct_sdk::gts::PROFILE_ROOT_TYPE.to_owned(),
-                    name: None,
-                    payload: Some(planted),
-                    expected_version: Some(1),
-                }],
-                ..IngestRequest::default()
-            },
-        )
-        .await
-        .unwrap();
+        .ingest_directly(IngestRequest {
+            nodes: vec![NodeSpec {
+                node_key: root.0.clone(),
+                type_id: construct_sdk::gts::PROFILE_ROOT_TYPE.to_owned(),
+                name: None,
+                payload: Some(planted),
+                expected_version: Some(1),
+            }],
+            ..IngestRequest::default()
+        })
+        .await;
 
-    profiles.write(Some(2), vec![add_skill("Zig")]).await;
+    profiles.given(Some(2), vec![add_skill("Zig")]).await;
 
     assert!(
         other.is_live(&their_key).await,
@@ -733,9 +753,113 @@ async fn a_listed_key_that_is_not_a_fact_of_the_root_is_never_deleted() {
 }
 
 #[tokio::test]
+async fn a_soft_delete_of_a_fact_already_removed_is_done() {
+    let profiles = Profiles::new();
+    let first = add_skill("Rust");
+    let key = key_of(&first);
+    profiles.given(None, vec![first]).await;
+    let removal = SoftDelete::new(Arc::clone(&profiles.client));
+
+    removal.remove(&profiles.ctx, &key).await.unwrap();
+    let again = removal.remove(&profiles.ctx, &key).await;
+
+    assert!(again.is_ok(), "{again:?}");
+    assert!(!profiles.is_live(&key).await);
+}
+
+#[tokio::test]
+async fn a_soft_delete_of_a_fact_graph_storage_does_not_hold_fails_and_names_it() {
+    let profiles = Profiles::new();
+
+    let removed = SoftDelete::new(Arc::clone(&profiles.client))
+        .remove(&profiles.ctx, "construct:never-written")
+        .await;
+
+    match removed {
+        Err(DomainError::Internal(msg)) => {
+            assert!(msg.contains("construct:never-written"), "{msg}");
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+/// Removes nothing and fails after counting the keys it was asked for.
+#[derive(Default)]
+struct CountingBrokenRemoval {
+    asked: AtomicU32,
+}
+
+#[async_trait]
+impl FactRemoval for CountingBrokenRemoval {
+    async fn remove(&self, _ctx: &SecurityContext, _key: &str) -> Result<(), DomainError> {
+        self.asked.fetch_add(1, Ordering::SeqCst);
+        Err(DomainError::Unavailable("graph storage is down".to_owned()))
+    }
+}
+
+#[tokio::test]
+async fn the_cleanup_stops_at_the_first_failed_removal_and_every_key_stays_listed() {
+    let profiles = Profiles::new();
+    let (rust, go) = (add_skill("Rust"), add_skill("Go"));
+    let mut keys = vec![key_of(&rust), key_of(&go)];
+    keys.sort();
+    profiles.given(None, vec![rust, go]).await;
+    let removal = Arc::new(CountingBrokenRemoval::default());
+    let writer = Profiles::writer_with(
+        Arc::clone(&profiles.client),
+        Arc::clone(&removal) as Arc<dyn FactRemoval>,
+    );
+
+    let written = writer
+        .write(
+            &profiles.ctx,
+            &profiles.plan(Some(1), vec![remove(&keys[0]), remove(&keys[1])]),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(written, Written::Stored);
+    assert_eq!(
+        removal.asked.load(Ordering::SeqCst),
+        1,
+        "no removal after a failed one"
+    );
+    assert_eq!(profiles.root().await.unwrap().removals, keys);
+    assert!(profiles.read().await.facts.is_empty());
+}
+
+#[tokio::test]
+async fn a_node_with_an_edge_into_the_root_is_not_read_as_a_fact() {
+    let profiles = Profiles::new();
+    let other = profiles.neighbour();
+    let theirs = add_skill("Rust");
+    let their_key = key_of(&theirs);
+    other.given(None, vec![theirs]).await;
+    profiles.given(None, vec![add_skill("Go")]).await;
+    // An edge of the has-fact type from the other subject's fact to this root:
+    // the traversal walks it backwards, and it reaches the other fact.
+    profiles
+        .ingest_directly(IngestRequest {
+            edges: vec![EdgeSpec {
+                type_id: construct_sdk::gts::HAS_FACT_TYPE.to_owned(),
+                src_node_key: their_key,
+                dst_node_key: root_key(&profiles.subject_key()).0,
+                discriminator: None,
+                payload: None,
+            }],
+            ..IngestRequest::default()
+        })
+        .await;
+
+    let profile = profiles.read().await;
+
+    assert_eq!(values(&profile), skill_values(&["Go"]));
+}
+
+#[tokio::test]
 async fn a_plan_that_removes_a_fact_not_in_its_profile_is_refused() {
     let profiles = Profiles::new();
-    profiles.write(None, vec![add_skill("Rust")]).await;
+    profiles.given(None, vec![add_skill("Rust")]).await;
 
     let result = profiles
         .writer()
@@ -759,13 +883,19 @@ async fn a_full_profile_takes_no_new_fact_but_takes_a_removal() {
     let profiles = Profiles::new();
     let first = add_skill("Rust");
     let old = key_of(&first);
-    profiles.write(None, vec![first]).await;
+    profiles.given(None, vec![first]).await;
     let writer = profiles.writer().with_max_facts(1);
 
     let added = writer
         .write(
             &profiles.ctx,
             &profiles.plan(Some(1), vec![add_skill("Go")]),
+        )
+        .await;
+    let replaced = writer
+        .write(
+            &profiles.ctx,
+            &profiles.plan(Some(1), vec![replace(&old, "Go")]),
         )
         .await;
     let removed = writer
@@ -777,6 +907,10 @@ async fn a_full_profile_takes_no_new_fact_but_takes_a_removal() {
         matches!(added, Err(DomainError::ProfileFull(_))),
         "{added:?}"
     );
+    assert!(
+        matches!(replaced, Err(DomainError::ProfileFull(_))),
+        "the old fact counts until its delete has run: {replaced:?}"
+    );
     assert_eq!(removed, Written::Stored);
     assert!(profiles.read().await.facts.is_empty());
 }
@@ -784,9 +918,9 @@ async fn a_full_profile_takes_no_new_fact_but_takes_a_removal() {
 #[tokio::test]
 async fn a_profile_cut_short_by_the_read_limit_is_full_not_partial() {
     let profiles = Profiles::new();
-    profiles.write(None, vec![add_skill("Rust")]).await;
+    profiles.given(None, vec![add_skill("Rust")]).await;
     let scripted = Scripted::over(Arc::clone(&profiles.client));
-    scripted.cut_reads.store(true, Ordering::SeqCst);
+    *scripted.cut_reads.lock().unwrap() = Some(TruncationReason::NodeBudget);
 
     let read = GraphProfileSource::new(
         Arc::clone(&scripted) as Arc<dyn GraphStorageClientV1>,
@@ -807,6 +941,116 @@ async fn a_profile_cut_short_by_the_read_limit_is_full_not_partial() {
         matches!(written, Err(DomainError::ProfileFull(_))),
         "{written:?}"
     );
+}
+
+#[tokio::test]
+async fn a_profile_read_cut_short_for_another_reason_is_internal() {
+    let profiles = Profiles::new();
+    profiles.given(None, vec![add_skill("Rust")]).await;
+    let scripted = Scripted::over(Arc::clone(&profiles.client));
+    let reader = GraphProfileSource::new(
+        Arc::clone(&scripted) as Arc<dyn GraphStorageClientV1>,
+        Arc::new(PayloadCounter),
+    );
+
+    for reason in [
+        TruncationReason::FrontierCap,
+        TruncationReason::EdgeScanCap,
+        TruncationReason::ResponseBytes,
+    ] {
+        *scripted.cut_reads.lock().unwrap() = Some(reason);
+        let read = reader
+            .read(&profiles.ctx, profiles.tenant, profiles.subject)
+            .await;
+        assert!(
+            matches!(read, Err(DomainError::Internal(_))),
+            "{reason:?}: {read:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_profile_read_asks_for_the_root_and_at_most_its_facts() {
+    let profiles = Profiles::new();
+    let scripted = Scripted::over(Arc::clone(&profiles.client));
+
+    GraphProfileSource::new(
+        Arc::clone(&scripted) as Arc<dyn GraphStorageClientV1>,
+        Arc::new(PayloadCounter),
+    )
+    .read(&profiles.ctx, profiles.tenant, profiles.subject)
+    .await
+    .unwrap();
+
+    let reads = scripted.reads.lock().unwrap().clone();
+    assert_eq!(reads.len(), 1);
+    assert_eq!(reads[0].max_nodes, Some(MAX_PROFILE_NODES));
+    assert_eq!(reads[0].depth, 1);
+    assert_eq!(reads[0].seeds, [root_key(&profiles.subject_key()).0]);
+}
+
+#[tokio::test]
+async fn a_profile_at_the_limit_takes_no_new_fact_whatever_limit_the_writer_is_given() {
+    let profiles = Profiles::new();
+    let all: Vec<Step> = (0..MAX_FACTS)
+        .map(|n| add_skill(&format!("skill {n}")))
+        .collect();
+    profiles.given(None, all).await;
+    assert_eq!(
+        profiles.read().await.facts.len(),
+        MAX_FACTS,
+        "the whole profile reads"
+    );
+
+    let added = profiles
+        .writer()
+        .with_max_facts(usize::MAX)
+        .write(
+            &profiles.ctx,
+            &profiles.plan(Some(1), vec![add_skill("one more")]),
+        )
+        .await;
+
+    assert!(
+        matches!(added, Err(DomainError::ProfileFull(_))),
+        "{added:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_profile_past_what_one_read_takes_is_full() {
+    let profiles = Profiles::new();
+    let all: Vec<Step> = (0..MAX_FACTS)
+        .map(|n| add_skill(&format!("skill {n}")))
+        .collect();
+    profiles.given(None, all).await;
+    // One more fact on the root, written past the writer's limit.
+    let one_more = add_skill("one more");
+    let one_more_key = key_of(&one_more);
+    let plan = profiles.plan(Some(1), vec![one_more]);
+    let node = super::fact::fact_node(&plan, &plan.steps[0], time::OffsetDateTime::now_utc())
+        .unwrap()
+        .unwrap();
+    profiles
+        .ingest_directly(IngestRequest {
+            nodes: vec![node],
+            edges: vec![EdgeSpec {
+                type_id: construct_sdk::gts::HAS_FACT_TYPE.to_owned(),
+                src_node_key: root_key(&profiles.subject_key()).0,
+                dst_node_key: one_more_key,
+                discriminator: None,
+                payload: None,
+            }],
+            ..IngestRequest::default()
+        })
+        .await;
+
+    let read = profiles
+        .reader()
+        .read(&profiles.ctx, profiles.tenant, profiles.subject)
+        .await;
+
+    assert!(matches!(read, Err(DomainError::ProfileFull(_))), "{read:?}");
 }
 
 // --- Retries and timeouts --------------------------------------------------------
@@ -849,10 +1093,10 @@ async fn a_lost_serialization_race_is_sent_again() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_write_that_never_gets_an_answer_gives_up_after_its_attempts_as_unavailable() {
+async fn a_write_that_stays_unavailable_gives_up_after_its_attempts() {
     let profiles = Profiles::new();
     let scripted = Scripted::over(Arc::clone(&profiles.client));
-    scripted.script((0..DEFAULT_ATTEMPTS).map(|_| Ingest::Fail(unavailable)));
+    scripted.script((0..DEFAULT_ATTEMPTS.get()).map(|_| Ingest::Fail(unavailable)));
 
     let result = profiles
         .scripted_writer(&scripted)
@@ -865,9 +1109,71 @@ async fn a_write_that_never_gets_an_answer_gives_up_after_its_attempts_as_unavai
     );
     assert_eq!(
         scripted.ingest_calls.load(Ordering::SeqCst),
-        DEFAULT_ATTEMPTS
+        DEFAULT_ATTEMPTS.get()
     );
     assert_eq!(profiles.read().await.version, None);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_write_that_never_gets_an_answer_gives_up_after_its_attempts_as_unavailable() {
+    let profiles = Profiles::new();
+    let scripted = Scripted::over(Arc::clone(&profiles.client));
+    scripted.script((0..DEFAULT_ATTEMPTS.get()).map(|_| Ingest::Hang));
+
+    let result = profiles
+        .scripted_writer(&scripted)
+        .with_timeout(Duration::from_secs(1))
+        .write(&profiles.ctx, &profiles.plan(None, vec![add_skill("Rust")]))
+        .await;
+
+    assert!(
+        matches!(result, Err(DomainError::Unavailable(_))),
+        "{result:?}"
+    );
+    assert_eq!(
+        scripted.ingest_calls.load(Ordering::SeqCst),
+        DEFAULT_ATTEMPTS.get()
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_pause_between_sends_grows_and_carries_up_to_as_much_again() {
+    let profiles = Profiles::new();
+    let scripted = Scripted::over(Arc::clone(&profiles.client));
+    scripted.script([Ingest::Fail(unavailable), Ingest::Fail(unavailable)]);
+
+    let written = profiles
+        .scripted_writer(&scripted)
+        .write(&profiles.ctx, &profiles.plan(None, vec![add_skill("Rust")]))
+        .await
+        .unwrap();
+
+    assert_eq!(written, Written::Stored);
+    let sent_at = scripted.sent_at.lock().unwrap().clone();
+    assert_eq!(sent_at.len(), 3);
+    let (first, second) = (sent_at[1] - sent_at[0], sent_at[2] - sent_at[1]);
+    let pause = Duration::from_millis(100);
+    assert!(first >= pause && first <= pause * 2, "{first:?}");
+    assert!(second >= pause * 2 && second <= pause * 4, "{second:?}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_writer_given_one_attempt_sends_once() {
+    let profiles = Profiles::new();
+    let scripted = Scripted::over(Arc::clone(&profiles.client));
+    scripted.script([Ingest::Fail(unavailable)]);
+
+    let result = profiles
+        .scripted_writer(&scripted)
+        .with_attempts(NonZeroU32::MIN)
+        .write(&profiles.ctx, &profiles.plan(None, vec![add_skill("Rust")]))
+        .await;
+
+    assert!(
+        matches!(result, Err(DomainError::Unavailable(_))),
+        "{result:?}"
+    );
+    assert_eq!(scripted.ingest_calls.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test(start_paused = true)]
@@ -911,7 +1217,10 @@ fn only_a_write_whose_result_is_unknown_is_sent_again() {
     assert!(unknown_result(
         &GraphTestError::deadline_exceeded("slow").create()
     ));
-    assert!(unknown_result(&GraphTestError::unknown("lost").create()));
+    assert!(
+        !unknown_result(&GraphTestError::unknown("lost").create()),
+        "an unknown error says nothing about the write"
+    );
     assert!(!unknown_result(&cas_conflict()));
     assert!(!unknown_result(&aborted("IDEMPOTENCY_MISMATCH")));
     assert!(!unknown_result(
@@ -931,6 +1240,8 @@ fn graph_storage_failures_map_to_what_a_caller_can_act_on() {
         graph_error("call", &GraphTestError::deadline_exceeded("slow").create()),
         DomainError::Unavailable(_)
     ));
+    // Construct's own permission is missing: the deployment's defect, not a
+    // refusal of the caller.
     assert!(matches!(
         graph_error(
             "call",
@@ -938,7 +1249,20 @@ fn graph_storage_failures_map_to_what_a_caller_can_act_on() {
                 .with_reason("ACCESS_DENIED")
                 .create()
         ),
-        DomainError::Forbidden(_)
+        DomainError::Internal(_)
+    ));
+    assert!(matches!(
+        graph_error(
+            "call",
+            &CanonicalError::unauthenticated()
+                .with_reason("TOKEN_EXPIRED")
+                .create()
+        ),
+        DomainError::Internal(_)
+    ));
+    assert!(matches!(
+        graph_error("call", &GraphTestError::unknown("lost").create()),
+        DomainError::Internal(_)
     ));
     assert!(matches!(
         graph_error(
@@ -956,12 +1280,26 @@ fn graph_storage_failures_map_to_what_a_caller_can_act_on() {
 #[tokio::test]
 async fn the_types_register_again_after_a_restart_without_conflict() {
     let profiles = Profiles::new();
-    profiles.write(None, vec![add_skill("Rust")]).await;
+    let scripted = Scripted::over(Arc::clone(&profiles.client));
+    let first = profiles
+        .scripted_writer(&scripted)
+        .write(&profiles.ctx, &profiles.plan(None, vec![add_skill("Rust")]))
+        .await
+        .unwrap();
+    assert_eq!(first, Written::Stored);
 
     // A new writer has an empty registration cache, like a restarted instance.
-    let written = profiles.write(Some(1), vec![add_skill("Go")]).await;
+    let written = profiles
+        .scripted_writer(&scripted)
+        .write(
+            &profiles.ctx,
+            &profiles.plan(Some(1), vec![add_skill("Go")]),
+        )
+        .await
+        .unwrap();
 
     assert_eq!(written, Written::Stored);
+    assert_eq!(scripted.registrations.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test]
