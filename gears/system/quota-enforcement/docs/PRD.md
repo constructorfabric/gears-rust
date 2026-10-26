@@ -648,11 +648,11 @@ Each subject projection **MUST** declare a required `scope` trait in the base's 
 `SecurityContext` accessor. QE **MUST** read the registry-validated effective trait and compare instance ids directly.
 Scope **MUST NOT** be inferred from the type-id name segment.
 
-Each projection **MUST** declare its admitted metrics through a typed
-`x-gts-traits` value whose entries are metric instance ids narrowed by `x-gts-ref`. `x-gts-ref` is pattern-level only: it
-validates that a value is a well-formed GTS id under the declared prefix. The system **MUST** therefore itself verify,
-at bootstrap per `cpt-cf-quota-enforcement-fr-contract-validation`, that each referenced metric is registered and is
-genuinely an instance of the metric base. A narrowed `x-gts-ref` is a prefix match, not an instance-of check. The request
+Each projection **MUST** declare its admitted metrics through a typed `x-gts-traits` value whose entries are metric
+instance ids narrowed by `x-gts-instance-ref`. `x-gts-instance-ref` is pattern-level only: it validates that a value is
+a well-formed GTS instance id under the declared prefix. The system **MUST** therefore itself verify, at bootstrap per
+`cpt-cf-quota-enforcement-fr-contract-validation`, that each referenced metric is registered and is genuinely an
+instance of the metric base. A narrowed `x-gts-instance-ref` is a prefix match, not an instance-of check. The request
 may also carry a resource projection for typed resource properties; resource does not enter the P1 counter key. Metric
 identity remains owned by `types-registry` and is not changed by this requirement.
 

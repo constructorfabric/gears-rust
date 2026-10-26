@@ -7,7 +7,7 @@ use crate::domain::type_catalog::oagw_gts_entities;
 use crate::domain::type_provisioning::TypeProvisioningService;
 use crate::infra::type_provisioning::TypeProvisioningServiceImpl;
 use async_trait::async_trait;
-use authz_resolver_sdk::{AuthZResolverApi, PolicyEnforcer};
+use authz_resolver_sdk::PolicyEnforcer;
 use credstore_sdk::CredStoreClientV1;
 use oagw_sdk::api::ServiceGatewayClientV1;
 use sea_orm_migration::MigrationTrait;
@@ -56,9 +56,10 @@ pub struct AppState {
 }
 
 /// Outbound API Gateway gear: wires repos, services, and routes.
+#[toolkit::consumes(contract = authz_resolver_sdk::AuthZResolverApi, from = "authz-resolver")]
 #[toolkit::gear(
     name = "oagw",
-    deps = [types_registry, authz_resolver, credstore, tenant_resolver],
+    deps = [types_registry, credstore, tenant_resolver],
     capabilities = [system, db, rest, stateful]
 )]
 pub struct OutboundApiGatewayGear {
@@ -200,8 +201,9 @@ impl Gear for OutboundApiGatewayGear {
         let credstore = ctx.client_hub().get::<dyn CredStoreClientV1>()?;
 
         // -- AuthZ resolver for permission checks --
-        let authz = ctx.client_hub().get::<dyn AuthZResolverApi>()?;
-        let policy_enforcer = PolicyEnforcer::new(authz);
+        // Consumed, not depended on: wired after `init` (local or remote), so
+        // the enforcer resolves it from the hub per call.
+        let policy_enforcer = PolicyEnforcer::from_hub(ctx.client_hub());
 
         let cp_impl = Arc::new(ControlPlaneServiceImpl::new(
             upstream_repo,

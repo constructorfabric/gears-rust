@@ -216,6 +216,21 @@ async fn a_projection_whose_scope_trait_is_not_a_registered_scope_is_rejected() 
 }
 
 #[tokio::test]
+async fn a_scope_type_id_cannot_be_used_as_a_scope_instance() {
+    let registry = FakeContractRegistry::llm_gateway();
+    let mut projection = resolved(LLM_USER_PROJECTION);
+    projection.effective_traits["scope"] = Value::String(SCOPE_TYPE.to_owned());
+    registry.add_type(projection);
+    let (outcome, metrics) = build(&registry, &llm_config()).await;
+    assert_rejected(
+        outcome,
+        &metrics,
+        ValidationReason::ScopeInvalid,
+        SCOPE_TYPE,
+    );
+}
+
+#[tokio::test]
 async fn admitted_metrics_must_be_registered_instances_of_the_metric_base() {
     let registry = FakeContractRegistry::llm_gateway();
     registry.remove_instance(METRIC_REQUESTS);

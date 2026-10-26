@@ -25,8 +25,7 @@ use std::sync::Arc;
 use authz_resolver_sdk::PolicyEnforcer;
 use policy_engine_sdk::gts::permissions::Capability;
 use policy_engine_sdk::management::{
-    self as sdk, BundlePatch, ManagementError, NewBundle, ValidationReport, VersionContent,
-    VersionDetail,
+    self as sdk, BundlePatch, ManagementError, NewBundle, VersionContent, VersionDetail,
 };
 use time::OffsetDateTime;
 use toolkit_db::secure::{DBRunner, DbConn, DbTx};
@@ -46,7 +45,23 @@ use super::lifecycle::{
 use crate::domain::model::{Bundle, BundleId, BundleVersion, DocumentId, VersionId, VersionState};
 use crate::domain::ports::HierarchyPort;
 use crate::domain::repos::{BundleRepository, RepoError, VersionRepository};
-use crate::domain::validation::{ContentValidator, Finding};
+use crate::domain::validation::ContentValidator;
+
+/// What [`ManagementService::plan_activation`] found.
+#[domain_model]
+#[derive(Debug)]
+pub(super) enum Activation {
+    /// The version is already active: activating it is a no-op.
+    AlreadyActive(BundleVersion),
+    /// A valid draft, to activate under `auth` if its content is still the
+    /// `validated` documents.
+    Draft {
+        /// The publish authorisation.
+        auth: Authorization,
+        /// Its document ids as validated, ascending.
+        validated: Vec<DocumentId>,
+    },
+}
 
 /// The future a mutation's transactional body returns.
 pub(super) type TxFuture<'a, T> =
@@ -433,19 +448,21 @@ impl<S: ContentStore> ManagementService<S> {
         .await
     }
 
-    /// Validates a version; never activates and changes nothing. Capability:
+    /// Validates a version's content, in any state, with the checks
+    /// activation applies; never activates and changes nothing. Capability:
     /// author.
     ///
     /// # Errors
     ///
-    /// Not found; `CAPABILITY_DENIED`; `service_unavailable` when the
-    /// registry cannot answer. Invalid content is a report, not an error.
+    /// `VALIDATION_FAILED` with every finding; not found;
+    /// `CAPABILITY_DENIED`; `service_unavailable` when the registry cannot
+    /// answer.
     pub async fn validate_version(
         &self,
         ctx: &SecurityContext,
         bundle_id: BundleId,
         version_id: VersionId,
-    ) -> Result<ValidationReport, ManagementError> {
+    ) -> Result<(), ManagementError> {
         let bundle = self.prefetch_bundle(bundle_id).await?;
         let owner = bundle.owner_tenant_id;
         let auth = self
@@ -460,16 +477,7 @@ impl<S: ContentStore> ManagementService<S> {
         let version = self
             .load_version(&conn, &auth.scope, bundle_id, version_id)
             .await?;
-        let findings = self
-            .validator
-            .validate(&version.documents)
-            .await
-            .map_err(error::unavailable)?;
-        Ok(ValidationReport {
-            version_id,
-            findings: findings.iter().map(Finding::to_sdk).collect(),
-            validated_at: now(),
-        })
+        self.validate_content(&version).await
     }
 
     /// Activates a draft: validates it and supersedes the previously active
@@ -479,44 +487,18 @@ impl<S: ContentStore> ManagementService<S> {
     /// # Errors
     ///
     /// `VERSION_NOT_DRAFT` for a superseded version; `VALIDATION_FAILED` with
-    /// every finding; not found; `CAPABILITY_DENIED`.
+    /// every finding; not found; `CAPABILITY_DENIED`; `CONCURRENT_CHANGE`
+    /// when the draft changed after it was validated.
     pub async fn activate_version(
         &self,
         ctx: &SecurityContext,
         bundle_id: BundleId,
         version_id: VersionId,
     ) -> Result<sdk::BundleVersion, ManagementError> {
-        let bundle = self.prefetch_bundle(bundle_id).await?;
-        let owner = bundle.owner_tenant_id;
-        let auth = self
-            .mutation_access(
-                ctx,
-                Capability::Publish,
-                AccessTarget::owned_by(owner).resource(version_id),
-                Subject::Version(version_id),
-            )
-            .await?;
-        let conn = self.conn()?;
-        let version = self
-            .load_version(&conn, &auth.scope, bundle_id, version_id)
-            .await?;
-        match version.state {
-            VersionState::Active => return Ok(version_to_sdk(&version)),
-            VersionState::Superseded => return Err(ManagementError::VersionNotDraft),
-            VersionState::Draft => {}
-        }
-        let findings = self
-            .validator
-            .validate(&version.documents)
-            .await
-            .map_err(error::unavailable)?;
-        if !findings.is_empty() {
-            return Err(error::validation_failed(&findings));
-        }
-        // Document ids are fresh on every replace: the same ids are the same
-        // content.
-        let mut validated: Vec<DocumentId> = version.documents.iter().map(|d| d.id).collect();
-        validated.sort_unstable();
+        let (auth, validated) = match self.plan_activation(ctx, bundle_id, version_id).await? {
+            Activation::AlreadyActive(version) => return Ok(version_to_sdk(&version)),
+            Activation::Draft { auth, validated } => (auth, validated),
+        };
         self.commit(ctx, &auth, move |tx, env| {
             Box::pin(async move {
                 let versions = env.store.versions();
@@ -537,6 +519,64 @@ impl<S: ContentStore> ManagementService<S> {
             })
         })
         .await
+    }
+
+    /// Every check [`Self::activate_version`] runs before its transaction,
+    /// shared with its dry run; reads only.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::activate_version`], but for `CONCURRENT_CHANGE`.
+    pub(super) async fn plan_activation(
+        &self,
+        ctx: &SecurityContext,
+        bundle_id: BundleId,
+        version_id: VersionId,
+    ) -> Result<Activation, ManagementError> {
+        let bundle = self.prefetch_bundle(bundle_id).await?;
+        let owner = bundle.owner_tenant_id;
+        let auth = self
+            .mutation_access(
+                ctx,
+                Capability::Publish,
+                AccessTarget::owned_by(owner).resource(version_id),
+                Subject::Version(version_id),
+            )
+            .await?;
+        let conn = self.conn()?;
+        let version = self
+            .load_version(&conn, &auth.scope, bundle_id, version_id)
+            .await?;
+        match version.state {
+            VersionState::Active => return Ok(Activation::AlreadyActive(version)),
+            VersionState::Superseded => return Err(ManagementError::VersionNotDraft),
+            VersionState::Draft => {}
+        }
+        self.validate_content(&version).await?;
+        // Document ids are fresh on every replace: the same ids are the same
+        // content.
+        let mut validated: Vec<DocumentId> = version.documents.iter().map(|d| d.id).collect();
+        validated.sort_unstable();
+        Ok(Activation::Draft { auth, validated })
+    }
+
+    /// The content checks validation and activation share.
+    ///
+    /// # Errors
+    ///
+    /// `VALIDATION_FAILED` with every finding; `service_unavailable` when the
+    /// registry cannot answer.
+    async fn validate_content(&self, version: &BundleVersion) -> Result<(), ManagementError> {
+        let findings = self
+            .validator
+            .validate(&version.documents)
+            .await
+            .map_err(error::unavailable)?;
+        if findings.is_empty() {
+            Ok(())
+        } else {
+            Err(error::validation_failed(&findings))
+        }
     }
 
     /// Deletes a draft with its documents. Capability: author.

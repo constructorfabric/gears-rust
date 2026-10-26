@@ -169,13 +169,13 @@ Base contract for all RG type definitions. Traits define topology rules; propert
       },
       "allowed_parents": {
         "type": "array",
-        "items": { "type": "string", "x-gts-ref": "gts.cf.core.rg.type.v1~" },
-        "description": "Well-known instances of allowed parent RG types.",
+        "items": { "type": "string", "x-gts-type-ref": "gts.cf.core.rg.type.v1~" },
+        "description": "GTS type identifiers of allowed parent RG types.",
         "default": []
       },
       "allowed_memberships": {
         "type": "array",
-        "items": { "type": "string", "x-gts-ref": "gts.*" },
+        "items": { "type": "string", "x-gts-type-ref": "gts.*" },
         "description": "GTS type identifiers of resource types allowed as members.",
         "default": []
       }

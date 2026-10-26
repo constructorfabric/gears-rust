@@ -137,6 +137,14 @@ impl HierarchyPort for SplitHierarchy {
     ) -> Result<bool, PortError> {
         Ok(true)
     }
+
+    async fn subtree(
+        &self,
+        _ctx: &SecurityContext,
+        _root: TenantId,
+    ) -> Result<crate::domain::ports::Subtree, PortError> {
+        unreachable!("the decision path never reads a subtree")
+    }
 }
 
 #[tokio::test]

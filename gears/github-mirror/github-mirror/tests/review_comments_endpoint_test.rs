@@ -55,6 +55,8 @@ fn review_comment_record(id: i64, pull_number: i64, created_at: &str) -> ReviewC
         side: Some("RIGHT".to_owned()),
         start_side: None,
         subject_type: Some("line".to_owned()),
+        snippet_before: None,
+        snippet_after: None,
     }
 }
 

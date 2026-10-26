@@ -50,9 +50,6 @@ toolkit-canonical-errors = { workspace = true, features = ["axum"] }
 # `api_dto` DTOs derive `utoipa::ToSchema` for the OpenAPI registry.
 utoipa = { workspace = true }
 gts = { workspace = true }
-# Contract envelopes are validated against JSON Schema documents compiled once
-# at bootstrap (projection-contracts feature, ADR-0007).
-jsonschema = { workspace = true }
 
 axum = { workspace = true }
 # Repeated list query parameters (`id=a&id=b`) and their OpenAPI declaration.

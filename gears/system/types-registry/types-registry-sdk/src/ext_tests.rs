@@ -923,34 +923,22 @@ mod tenant {
 }
 
 #[tokio::test]
-async fn spellings_of_one_entity_are_read_once_and_each_answered() {
+async fn a_padded_spelling_is_refused_before_any_read() {
     let fake = MockTypesRegistry::new();
     fake.seed(TYPE, json!({}));
-    // Unchecked: parsing trims it to `TYPE`, so both name one entity key.
+    // Unchecked: identifiers are validated as spelled, so padding is not trimmed away.
     let padded = GtsTypeId::new(&format!(" {TYPE}"));
-    assert_ne!(padded, type_id(TYPE));
 
-    let answers = fake
-        .batch_get_type_schemas(
-            &ctx(),
-            &[type_id(TYPE), padded.clone(), type_id(TYPE)],
-            ReadOptions::default(),
-        )
+    let error = fake
+        .batch_get_type_schemas(&ctx(), &[type_id(TYPE), padded], ReadOptions::default())
         .await
-        .expect("the read succeeds");
+        .expect_err("the padded spelling is not a GTS id");
 
-    assert_eq!(
-        answers.len(),
-        2,
-        "each distinct spelling is a key of the answer"
+    assert!(
+        matches!(error, CanonicalError::InvalidArgument { .. }),
+        "{error:?}"
     );
-    assert!(answers[&type_id(TYPE)].is_some());
-    assert_eq!(answers[&padded], answers[&type_id(TYPE)]);
-    assert_eq!(
-        fake.reads(),
-        [crate::models::EntityKey::GtsId(id(TYPE))],
-        "the entity is read once"
-    );
+    assert!(fake.reads().is_empty(), "no identifier is read");
 }
 
 #[tokio::test]

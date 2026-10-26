@@ -1,8 +1,8 @@
 # cf-gears-graph-storage
 
 The Graph Storage gear: a typed, multi-tenant knowledge graph with bounded
-traversal and hybrid (lexical + vector) retrieval, over PostgreSQL 19 with
-SQL/PGQ and pgvector.
+traversal and hybrid (lexical + vector) retrieval, over PostgreSQL with
+pgvector.
 
 The gear is a stateless gateway over a pluggable store. Its public API is the
 `cf-gears-graph-storage-sdk` crate: the `GraphStorageClientV1` trait for
@@ -15,20 +15,20 @@ plugin contracts (`GraphStoreV1`, `GraphEngineV1`, `EmbeddingProviderV1`).
 
 ## Requirements
 
-PostgreSQL 19 with the `vector` extension. `CREATE PROPERTY GRAPH` is probed at
-boot: on a server without it the property-graph migration is skipped and every
-traversal hop is served by the portable two-query backend, with a logged reason.
+PostgreSQL 16 or later with the `vector` extension; 18 is what CI runs. No
+other extension and no SQL/PGQ: every traversal hop is two scoped statements.
+A database created on a 19 beta by an earlier release loses its property graph
+`kb` to migration `m0010` (#5267).
 
 ## Configuration
 
 ```yaml
 graph-storage:
   database:
-    server: "pg_graph"          # the PostgreSQL 19 server alias
+    server: "pg_graph"          # a PostgreSQL 16+ server with pgvector
     dbname: "graph_storage"
   config:
-    traversal_hop: auto         # auto (default) | pgq | two_query -- `pgq` is a
-                                # demand: without SQL/PGQ the gear is not ready
+    traversal_hop: auto         # auto (default) | two_query; `pgq` is refused
     embedding_dimension: 384    # fixed at migration time
     embedding_provider: onnx    # fake | onnx | remote
     # onnx (feature `onnx`)
@@ -61,13 +61,11 @@ Both are off by default: a deployment links the provider it selected.
 # the in-memory store, the domain service, the REST surface.
 make test-graph-storage
 
-# The same conformance suite against a real PostgreSQL 19, plus the cases only
-# a server can answer (the SQL/PGQ hop, its parity with the fallback, the
-# cross-tenant trap). It needs a server with SQL/PGQ *and* pgvector, which no
-# published image carries yet, so build the one this gear pins:
-docker build -f gears/graph-storage/deploy/docker/pg19-pgvector.Dockerfile \
-  -t pg19-pgvector:latest gears/graph-storage/deploy/docker
-GEARS_TEST_PG_GRAPH_IMAGE=pg19-pgvector:latest make test-graph-storage-pg
+# The same conformance suite against a real PostgreSQL, plus the cases only a
+# server can answer (the plans the read paths can use, the cross-tenant trap,
+# the migrations). It needs pgvector, which the platform's graph pin does not
+# carry; CI uses the published image at a pinned version:
+GEARS_TEST_PG_GRAPH_IMAGE=pgvector/pgvector:0.8.7-pg18 make test-graph-storage-pg
 ```
 
 Without `GEARS_TEST_PG_GRAPH_IMAGE` the PostgreSQL lane skips with a named
@@ -83,7 +81,7 @@ pools start timing out, which reads as a flaky gear and is a busy host.
 
 A case that panics can leave its container behind — the removal is
 asynchronous, and nothing awaits it — so after a failed run
-`docker ps --filter ancestor=pg19-pgvector:latest` is worth a glance; a
+`docker ps --filter ancestor=pgvector/pgvector:0.8.7-pg18` is worth a glance; a
 handful of forgotten servers is enough to make the next run look flaky too.
 
 ## Using it from a producer
@@ -183,10 +181,11 @@ Each is the shipped behaviour, with the contract that fixes it.
 - **Nodes and edges in one batch** commit or fail together
   (`fr-bulk-ingest`); an importer that writes nodes in one call and edges in
   another has, between the two, a graph with nodes and no edges.
-- **Migrations are additive** from `v0.1.0`: no shipped migration's DDL has
-  changed since it shipped (later tags add migrations), so a database created
-  by any tag upgrades in place. Only a database from the vendored prototype
-  needs to start empty.
+- **Migrations are additive** from `v0.1.0`, so a database created by any tag
+  upgrades in place. One shipped migration changed, on purpose: `m0002`, which
+  created the SQL/PGQ property graph and could not run on PostgreSQL 19 GA,
+  is a no-op, and `m0010` drops a graph an earlier tag created (#5267). Only a
+  database from the vendored prototype needs to start empty.
 
 ## Known limitations
 
@@ -222,9 +221,9 @@ independently developed implementation can reach the service yet; #4873).
 - *Traversal takes explicit seed keys only*, not search hits. Retention under
   a neighborhood budget *is* degree-ordered, and a traversal *does* echo the
   seeds it admitted.
-- *Traversal has two hop backends*, the SQL/PGQ pattern and the two-query hop
-  (`traversal_hop: auto | pgq | two_query`); the iterative-CTE hop of ADR-0001 was
-  built on the development stand and is not shipped.
+- *Traversal has one hop backend*, the two-query hop. A single-statement CTE
+  hop paid off on the development stand only at a database round trip of 2 ms
+  or more, and is not shipped.
 - *Four specified tables are not created*: `chunk`, `label`, `label_assignment`
   and `ingest_audit` (chunking, labels and the audit record are deferred).
 - *Hybrid search fails, rather than degrading to its lexical arm,* when the
@@ -271,10 +270,9 @@ independently developed implementation can reach the service yet; #4873).
 - *Base-ontology schemas are published once per tenant and have no update
   path*: an edit to a base schema does not reach a database that already
   published it.
-- *No published image carries both PostgreSQL 19 and pgvector*, so the lane
-  builds its own from [`deploy/docker/pg19-pgvector.Dockerfile`](../deploy/docker/pg19-pgvector.Dockerfile);
-  `test-containers` should publish one. PostgreSQL 16, the documented
-  baseline, has no lane at all.
+- *The PostgreSQL lane runs on 18 only*: `pgvector/pgvector:0.8.7-pg18`.
+  PostgreSQL 16, the documented baseline, has no lane, and the platform's
+  `postgres_graph()` pin carries no pgvector (#4666).
 - *Vector search needs two session parameters the gear cannot set for itself.*
   HNSW is an approximate index and pgvector applies filters **after** the
   approximate scan, while every query this gear issues carries a tenant scope,

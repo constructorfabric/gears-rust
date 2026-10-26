@@ -15,8 +15,8 @@
       "type": "string",
       "format": "gts-type-id",
       "pattern": "^gts\\.[a-z_][a-z0-9_]*(\\.[a-z_][a-z0-9_]*){3}\\.v[0-9]+(\\.[0-9]+)?~([a-z_][a-z0-9_]*(\\.[a-z_][a-z0-9_]*){3}\\.v[0-9]+(\\.[0-9]+)?~)+$",
-      "x-gts-ref": "gts.cf.connectors.core.record.v1~",
-      "description": "The derived content type this instance conforms to (x-gts-ref: must derive from this base)."
+      "x-gts-type-ref": "gts.cf.connectors.core.record.v1~",
+      "description": "The derived content type this instance conforms to (x-gts-type-ref: must derive from this base)."
     },
     "provenance": {
       "type": "string",

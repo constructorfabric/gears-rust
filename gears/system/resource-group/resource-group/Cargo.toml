@@ -64,11 +64,10 @@ sea-orm-migration = { workspace = true }
 thiserror = { workspace = true }
 
 # AuthZ
-authz-resolver-sdk = { workspace = true }
+authz-resolver-sdk = { workspace = true, features = ["rest-client"] }
 
 # GTS type system — types registry for schema resolution
 types-registry-sdk = { workspace = true }
-authz-resolver = { workspace = true }
 types-registry = { workspace = true }
 gts = { workspace = true }
 
@@ -84,6 +83,7 @@ toolkit-macros = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 opentelemetry_sdk = { workspace = true, features = ["metrics", "testing"] }
 # "test-support" enables `connect_db_with_metric_callback` and
 # `secure::in_transaction_for_testing`, which the DB-behaviour audit's

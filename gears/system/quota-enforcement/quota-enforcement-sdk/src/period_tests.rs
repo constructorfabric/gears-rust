@@ -1,4 +1,4 @@
-use time::{Duration, OffsetDateTime, UtcOffset};
+use time::{Duration, OffsetDateTime};
 
 use crate::models::{PeriodType, PeriodWindow};
 
@@ -94,12 +94,9 @@ fn a_window_has_elapsed_from_its_end_instant_onwards() {
 #[test]
 fn a_non_utc_input_is_normalized_before_the_calendar_is_read() {
     // 00:30 on March 2nd at +02:00 is 22:30 on March 1st in UTC.
-    let local = at("2026-03-02T00:30:00Z")
-        .to_offset(UtcOffset::from_hms(2, 0, 0).expect("valid offset"))
-        + Duration::hours(2);
-    let window = PeriodType::Day.window_containing(local);
+    let window = PeriodType::Day.window_containing(at("2026-03-02T00:30:00+02:00"));
 
-    assert_eq!(window.start, at("2026-03-02T00:00:00Z"));
+    assert_eq!(window.start, at("2026-03-01T00:00:00Z"));
 }
 
 // --- the one-time sentinel -------------------------------------------------

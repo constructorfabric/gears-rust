@@ -153,6 +153,32 @@ async fn seeded_types_resolve_their_documents_in_any_order() {
 }
 
 #[tokio::test]
+async fn seeded_schema_documents_do_not_require_entity_reference_targets() {
+    let fake = MockTypesRegistry::new();
+    let schema = json!({
+        "$id": format!("gts://{TOY}"),
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+        "properties": {
+            "target": { "type": "string", "x-gts-type-ref": OTHER },
+        },
+    });
+    fake.seed(TOY, schema);
+
+    let lookup = get(&fake, &[key(TOY)], documents())
+        .await
+        .expect("entity-reference targets need not be registered")
+        .remove(0);
+    let EntityLookup::Found { entity, .. } = lookup else {
+        panic!("{lookup:?}");
+    };
+    let resolved = entity.resolved_schema.expect("selected");
+    assert_eq!(resolved["properties"]["target"]["x-gts-type-ref"], OTHER);
+    assert_eq!(entity.effective_traits, Some(json!({})));
+    assert!(entity.effective_traits_schema.is_some());
+}
+
+#[tokio::test]
 async fn a_type_that_does_not_resolve_fails_only_a_read_of_its_documents() {
     let fake = MockTypesRegistry::new();
     fake.seed(TOY, json!({ "not": "a schema" }));

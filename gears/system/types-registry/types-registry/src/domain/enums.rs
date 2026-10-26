@@ -161,7 +161,8 @@ pub enum OperationItemStatus {
 
 /// Why one entity depends on another.
 ///
-/// `x-gts-ref` is excluded because it validates identifier syntax without reading a target.
+/// Entity references (`x-gts-type-ref` / `x-gts-instance-ref`) are excluded because
+/// they validate identifier syntax without reading a target.
 #[domain_model]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum DependencyKind {

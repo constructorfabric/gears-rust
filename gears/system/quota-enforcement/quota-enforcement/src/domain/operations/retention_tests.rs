@@ -171,3 +171,22 @@ async fn unexpired_records_survive_a_sweep() {
 
     assert_eq!(report.idempotency, 0, "nothing had expired yet");
 }
+
+#[tokio::test]
+async fn a_retention_longer_than_the_calendar_reclaims_no_log_and_still_sweeps() {
+    let storage = storage_with(3).await;
+    let metrics = Arc::new(RecordingMetrics::default());
+    let timing = RetentionTiming {
+        operation_log_retention: time::Duration::days(i64::from(u32::MAX)),
+        ..timing(10)
+    };
+    let sweeper = RetentionSweeper::new(storage, Arc::<RecordingMetrics>::clone(&metrics), timing);
+
+    let report = sweeper
+        .sweep_once(&CancellationToken::new(), far_future())
+        .await;
+
+    assert_eq!(report.idempotency, 3);
+    assert_eq!(report.operation_log, 0, "no entry is that old");
+    assert_eq!(metrics.retention_failures(), Vec::new());
+}

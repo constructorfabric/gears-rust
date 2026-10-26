@@ -76,7 +76,7 @@ pub const SCOPE_TENANT: &str = gts_id!("cf.core.qe.scope.v1~cf.core.qe.tenant.v1
 ///
 /// Provisional: PRD section 3.2 names this id pending the platform-wide
 /// metric naming decision (PRD section 13). The QE base schemas pin the same
-/// id in their `x-gts-ref` narrowing, so the two must change together. Metrics
+/// id in their `x-gts-instance-ref` narrowing, so the two must change together. Metrics
 /// are registry-owned; the gear never registers this base, it only checks
 /// admitted metrics against it at bootstrap.
 pub const METRIC_BASE_TYPE: &str = gts_id!("cf.core.qe.metric_type.v1~");

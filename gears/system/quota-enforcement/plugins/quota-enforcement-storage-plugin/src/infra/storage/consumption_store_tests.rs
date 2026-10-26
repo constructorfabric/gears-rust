@@ -13,14 +13,20 @@ use quota_enforcement_sdk::{
     PolicyDraft, PolicyScope, QuotaDebitPlan, QuotaDraft, QuotaId, QuotaType, Retention,
     RollbackTarget, StorageError, TransitionOutcome,
 };
+use sea_orm::sea_query::Expr;
+use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 use time::OffsetDateTime;
 use time::macros::datetime;
 use toolkit_db::Db;
 use toolkit_db::outbox::OutboxHandle;
+use toolkit_db::secure::SecureUpdateExt;
 use toolkit_security::{AccessScope, SecurityContext};
 
 use super::SqlConsumptionStore;
 use crate::domain::ports::{ConsumptionStore, LeaseStore, QuotaStore};
+use crate::infra::storage::entity::{
+    quota_allocation_counter as alloc, quota_consumption_counter as counter,
+};
 use crate::infra::storage::{SqlPolicyStore, SqlQuotaStore};
 use crate::test_support::{
     METRIC_TOKENS, actor, bound_outbox, draft, enqueued_messages, other_tenant, scope_for, tenant,
@@ -325,6 +331,27 @@ impl Harness {
         .expect("read the period row")
         .expect("the period row exists")
         .consumed
+    }
+
+    async fn pin_versions_at_max(&self, id: QuotaId) {
+        let conn = self.db.conn().expect("connection");
+        let consumption = counter::Entity::update_many()
+            .col_expr(counter::Column::RecordVersion, Expr::value(i32::MAX))
+            .filter(counter::Column::QuotaId.eq(id.as_uuid()))
+            .secure()
+            .scope_with(&AccessScope::allow_all())
+            .exec(&conn)
+            .await
+            .expect("pin the period rows");
+        let allocation = alloc::Entity::update_many()
+            .col_expr(alloc::Column::RecordVersion, Expr::value(i32::MAX))
+            .filter(alloc::Column::QuotaId.eq(id.as_uuid()))
+            .secure()
+            .scope_with(&AccessScope::allow_all())
+            .exec(&conn)
+            .await
+            .expect("pin the allocation row");
+        assert_eq!(consumption.rows_affected + allocation.rows_affected, 1);
     }
 
     async fn events(&self) -> Vec<String> {
@@ -1900,5 +1927,33 @@ async fn a_denied_acquisition_holds_nothing_and_returns_no_token() {
         "{lease:?}"
     );
     assert_eq!(h.consumed("u1", id).await, 0);
+    h.down().await;
+}
+
+#[tokio::test]
+async fn a_counter_at_the_last_version_keeps_accepting_writes() {
+    let h = Harness::up().await;
+    let consumption = h.consumption_quota("u1", Some(100), Vec::new()).await;
+    let allocation = h.allocation_quota("u2", Some(100)).await;
+    for subject in ["u1", "u2"] {
+        h.debit(subject, 10, &write(OperationType::Debit, subject, 1))
+            .await
+            .expect("first debit");
+    }
+    h.pin_versions_at_max(consumption).await;
+    h.pin_versions_at_max(allocation).await;
+
+    for (subject, id) in [("u1", consumption), ("u2", allocation)] {
+        let applied = h
+            .debit(
+                subject,
+                10,
+                &write(OperationType::Debit, &format!("{subject}-2"), 2),
+            )
+            .await
+            .expect("a debit past the last version");
+        assert!(matches!(applied, TransitionOutcome::Applied(_)));
+        assert_eq!(h.consumed(subject, id).await, 20);
+    }
     h.down().await;
 }

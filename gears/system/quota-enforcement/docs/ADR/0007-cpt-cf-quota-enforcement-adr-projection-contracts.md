@@ -164,13 +164,13 @@ The resource base retains `type`, optional `id`, and `metadata`.
   type-id name segment would force string parsing, which `guidelines/GTS.md` conventions 14 and
   15 rule out.
 * **Each subject projection declares its admitted metrics** through an inherited
-  `x-gts-traits` value whose entries are `GtsInstanceId`s narrowed via `x-gts-ref` to the platform
-  metric base. `x-gts-ref` is **pattern-level only** — it validates that the value is a
-  well-formed GTS id under the declared prefix, and nothing more. Three checks it does *not*
+  `x-gts-traits` value whose entries are `GtsInstanceId`s narrowed via `x-gts-instance-ref` to the platform
+  metric base. `x-gts-instance-ref` is **pattern-level only** — it validates that the value is a
+  well-formed GTS instance id under the declared prefix, and nothing more. Three checks it does *not*
   perform, all of which QE therefore owns:
   * that the referenced metric is registered — checked at bootstrap when the catalog is built;
   * that the referenced id is genuinely an *instance* of the metric base, since a narrowed
-    `x-gts-ref` is a prefix match, not an instance-of check;
+    `x-gts-instance-ref` is a prefix match, not an instance-of check;
   * that debiting the metric is permitted — checked at Gateway ingress against the catalog.
 
   A request naming an unadmitted metric fails closed. The registry thereby becomes an
@@ -309,7 +309,7 @@ closed consistency set:
   concrete, and derived from its
   QE base;
 * every admitted metric reference resolves to a registered instance of the metric base.
-  `x-gts-ref` covers neither check, because it is pattern-level only;
+  `x-gts-instance-ref` covers neither check, because it is pattern-level only;
 * no two configured projections admit the same metric at the same declared scope;
 * every admitted metric resolves to exactly one concrete request contract, and that contract's
   attached constraint contract is registered, concrete, and derived from the constraint base.
@@ -405,8 +405,9 @@ The naming, one-level derivation, traits, abstract types, and typed-id rules com
 and
 [`license-resolver` ADR-0003](../../../license-resolver/docs/ADR/0003-cpt-cf-license-resolver-adr-typed-licensing-contracts.md).
 The reference SDK in PR #4458 confirms abstract bases, required wire `metadata`, typed GTS id
-fields, and `x-gts-ref` narrowing; QE intentionally differs by accepting a PDP-authorized
-caller-supplied attribution tuple and keeping all registry access off its hot path.
+fields, and `x-gts-type-ref` / `x-gts-instance-ref` narrowing; QE intentionally differs by
+accepting a PDP-authorized caller-supplied attribution tuple and keeping all registry access off
+its hot path.
 
 license-resolver registers a contract through the module that wants enforcement for that
 resource, and it holds no shared state — so it never had to separate the party that declares a

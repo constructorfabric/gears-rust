@@ -12,6 +12,9 @@ keywords = ["constructorfabric", "cf-gears", "settings-service"]
 categories = ["web-programming"]
 metadata.docs.rs.all-features = true
 
+[lib]
+name = "cf_gears_settings_service"
+
 [lints]
 workspace = true
 

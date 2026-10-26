@@ -107,7 +107,7 @@ Nothing else about the relation reaches a v0 entity either: ADR-0003 records the
 * a `$ref` target;
 * the immediate derivation base.
 
-`x-gts-ref` is outside this rule because it validates an Instance value without resolving or inlining the named entity. This includes exact and patterned major-0 identifiers, `gts.*`, and relative JSON pointers. None creates a dependency or guarantee over the target.
+An entity reference (`x-gts-type-ref` / `x-gts-instance-ref`) is outside this rule because it validates an Instance value without resolving or inlining the named entity. This includes exact and patterned major-0 identifiers, `gts.*`, and the `/$id` pointer. None creates a dependency or guarantee over the target.
 
 The whole resolution closure follows by induction. Any transitive path to v0 must contain a stable entity with a direct resolution-bearing dependency on v0, which admission refuses. ADR-0003 uses the same argument shape to derive a whole-history guarantee from candidate-versus-baseline checks.
 
@@ -207,7 +207,7 @@ This decision is confirmed when:
   records a failed item with `stable_refs_major_zero` or
   `stable_derives_from_major_zero` respectively; independent items in
   that batch remain eligible to succeed;
-* admission admits a v1 Type Schema whose `x-gts-ref` names a v0 entity exactly or through a pattern, as well as one using `gts.*` or a relative JSON pointer, proving that instance-value constraints are outside quarantine;
+* admission admits a v1 Type Schema whose entity reference (`x-gts-type-ref` / `x-gts-instance-ref`) names a v0 entity exactly or through a pattern, as well as one using `gts.*` or the `/$id` pointer, proving that instance-value constraints are outside quarantine;
 * admission accepts a v0 Type Schema that references and derives from v1 targets, proving the quarantine relation is one-way;
 * a v0 reshape that would leave a v0 derived type no longer satisfying its base is refused by dependent revalidation;
 * registration of a managed registered Instance whose own last segment carries major 0 is rejected;

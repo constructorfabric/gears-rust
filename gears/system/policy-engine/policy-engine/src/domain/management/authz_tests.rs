@@ -141,3 +141,57 @@ fn a_scope_covers_a_row_only_through_filters_it_can_check() {
         ScopeFilter::in_tenant_subtree(pep_properties::OWNER_TENANT_ID, owner, true, Vec::new()),
     ]))));
 }
+
+#[test]
+fn a_scope_covers_a_whole_tenant_only_through_an_owner_filter_alone() {
+    use toolkit_security::{ScopeConstraint, ScopeFilter, pep_properties};
+
+    let (owner, other) = (Uuid::from_u128(1), Uuid::from_u128(2));
+    let covers = |scope: AccessScope| Authorization { scope }.covers_tenant(owner);
+
+    assert!(covers(AccessScope::allow_all()));
+    assert!(covers(AccessScope::for_tenant(owner)));
+    assert!(!covers(AccessScope::for_tenant(other)));
+    // A constraint that also narrows by resource identity does not admit
+    // every row of the tenant.
+    assert!(!covers(AccessScope::single(ScopeConstraint::new(vec![
+        ScopeFilter::eq(pep_properties::OWNER_TENANT_ID, owner),
+        ScopeFilter::eq(pep_properties::RESOURCE_ID, Uuid::from_u128(3)),
+    ]))));
+    // Any one qualifying constraint suffices.
+    assert!(covers(AccessScope::from_constraints(vec![
+        ScopeConstraint::new(vec![ScopeFilter::eq(
+            pep_properties::OWNER_TENANT_ID,
+            other
+        )]),
+        ScopeConstraint::new(vec![ScopeFilter::eq(
+            pep_properties::OWNER_TENANT_ID,
+            owner
+        )]),
+    ])));
+}
+
+#[test]
+fn an_in_constraint_listing_the_tenant_covers_it() {
+    use toolkit_security::{ScopeConstraint, ScopeFilter, pep_properties};
+
+    let (owner, other) = (Uuid::from_u128(1), Uuid::from_u128(2));
+    let scope = |listed: Vec<Uuid>| {
+        AccessScope::single(ScopeConstraint::new(vec![ScopeFilter::in_uuids(
+            pep_properties::OWNER_TENANT_ID,
+            listed,
+        )]))
+    };
+    assert!(
+        Authorization {
+            scope: scope(vec![other, owner])
+        }
+        .covers_tenant(owner)
+    );
+    assert!(
+        !Authorization {
+            scope: scope(vec![other])
+        }
+        .covers_tenant(owner)
+    );
+}

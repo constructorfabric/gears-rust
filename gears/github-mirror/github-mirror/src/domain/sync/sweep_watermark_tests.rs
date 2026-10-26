@@ -9,6 +9,7 @@ fn stored(last_seen: Option<&str>) -> SyncWatermarkRecord {
         family: "issues".to_owned(),
         last_seen_updated_at: last_seen.map(ToOwned::to_owned),
         page1_etag: None,
+        stage_etags: std::collections::BTreeMap::new(),
         last_head_sha: None,
         sweep_in_progress: false,
         candidate_high_water: None,

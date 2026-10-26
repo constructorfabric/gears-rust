@@ -5,11 +5,18 @@ use serde_json::{Value, json};
 
 use super::*;
 
+/// A cost budget of `limit` units with a timeout no slow CI runner reaches.
+fn budget(limit: u64) -> Result<EvaluationBudget, EngineError> {
+    let nonzero = |value| {
+        NonZeroU64::new(value)
+            .ok_or_else(|| EngineError::Internal("test budget must be nonzero".into()))
+    };
+    EvaluationBudget::new(Some(60_000), nonzero(60_000)?, nonzero(limit)?)
+}
+
 fn runtime() -> Result<Runtime, EngineError> {
-    let limit = NonZeroU64::new(1_000_000)
-        .ok_or_else(|| EngineError::Internal("test budget must be nonzero".into()))?;
     Ok(Runtime {
-        meter: EvaluationBudget::new(None, limit, limit)?.start(),
+        meter: budget(1_000_000)?.start(),
         variables: BTreeMap::new(),
     })
 }
@@ -33,10 +40,8 @@ fn eval(source: &str) -> Result<Value, EngineError> {
 
 /// `source` against one bound `record`, under a budget of `limit` units.
 fn eval_bounded(source: &str, record: Value, limit: u64) -> Result<Value, EngineError> {
-    let limit = NonZeroU64::new(limit)
-        .ok_or_else(|| EngineError::Internal("test budget must be nonzero".into()))?;
     let mut runtime = Runtime {
-        meter: EvaluationBudget::new(None, limit, limit)?.start(),
+        meter: budget(limit)?.start(),
         variables: BTreeMap::from([("record".to_owned(), record)]),
     };
     runtime.eval(&parse(source)?)

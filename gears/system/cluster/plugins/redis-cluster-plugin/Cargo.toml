@@ -113,6 +113,9 @@ testcontainers = { workspace = true, optional = true }
 testcontainers-modules = { workspace = true, optional = true }
 
 [dev-dependencies]
+# The workspace's pinned Redis image (`test_containers::redis()`, docs/TESTING.md
+# 4.4), for the Layer 3 fixtures in `tests/common/mod.rs`.
+test-containers = { workspace = true }
 # `#[tokio::test]`, for the async unit tests that drive `ScriptExecutor` doubles
 # and the provider's pre-connection config failures.
 tokio = { workspace = true, features = ["macros"] }
@@ -165,7 +168,7 @@ cf-gears-standalone-cluster-plugin = { path = "../standalone-cluster-plugin" }
 # ["integration"]` (TESTING.md §7). `cargo test -p cf-redis-cluster-plugin` with
 # no flag then skips *building* these binaries entirely, rather than building them
 # and skipping the test functions inside — which is what keeps a default test run
-# free of both Docker and the testcontainers dependency tree.
+# free of Docker.
 [[test]]
 name = "conformance"
 required-features = ["integration"]

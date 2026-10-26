@@ -1,0 +1,109 @@
+name: Nightly tracking issue
+description: >-
+  Opens or updates an issue when a nightly run fails, and closes it when a run
+  passes. The job needs `issues: write`.
+
+# Nobody notices a failed nightly run on its own, so we open an issue. An open
+# issue means the nightly is broken right now.
+inputs:
+  title:
+    description: >-
+      Issue title. The open issue is found by this exact title, so changing it
+      leaves the old issue open.
+    required: true
+  subject:
+    description: >-
+      What ran, used in "<subject> failed on `main`". Example: "`cargo shear`".
+    required: true
+  result:
+    description: "`failure` opens or updates the issue. `success` closes it."
+    required: true
+  details-file:
+    description: Markdown file added to the issue body on failure.
+    required: false
+    default: ''
+  mention:
+    description: Who to @-mention on failure. Empty means nobody gets pinged.
+    required: false
+    default: ''
+
+runs:
+  using: composite
+  steps:
+    - name: Update tracking issue
+      uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+      env:
+        TITLE: ${{ inputs.title }}
+        SUBJECT: ${{ inputs.subject }}
+        RESULT: ${{ inputs.result }}
+        DETAILS_FILE: ${{ inputs.details-file }}
+        MENTION: ${{ inputs.mention }}
+      with:
+        script: |
+          const fs = require('fs');
+          const { owner, repo } = context.repo;
+          const { TITLE: title, SUBJECT: subject, RESULT: result, DETAILS_FILE: detailsFile } = process.env;
+          const mention = (process.env.MENTION || '').trim();
+          const runUrl = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
+
+          if (result !== 'failure' && result !== 'success') {
+            core.setFailed(`result must be failure or success, got "${result}"`);
+            return;
+          }
+
+          // Find the open issue by its exact title. We use listForRepo, not
+          // search, because search results can lag. It also returns PRs, so
+          // skip those.
+          const candidates = await github.paginate(github.rest.issues.listForRepo, {
+            owner, repo, state: 'open', creator: 'github-actions[bot]', per_page: 100,
+          });
+          const open = candidates.filter((i) => !i.pull_request && i.title === title);
+
+          if (result === 'success') {
+            for (const issue of open) {
+              await github.rest.issues.createComment({
+                owner, repo, issue_number: issue.number,
+                body: `Fixed. ${subject} passed on ${context.sha}.\n\n- Run: ${runUrl}`,
+              });
+              await github.rest.issues.update({
+                owner, repo, issue_number: issue.number, state: 'closed',
+              });
+              core.info(`Closed #${issue.number}`);
+            }
+            return;
+          }
+
+          let details = '';
+          if (detailsFile) {
+            try {
+              details = fs.readFileSync(detailsFile, 'utf8').trim();
+            } catch (e) {
+              core.info(`No details: ${e.message}`);
+            }
+          }
+
+          const lines = [];
+          if (mention) lines.push(mention, '');
+          lines.push(
+            `${subject} failed on \`main\`.`,
+            '',
+            `- Commit: ${context.sha}`,
+            `- Run: ${runUrl}`,
+            '',
+            details || '_No details. Check the run log._',
+          );
+          const body = lines.join('\n');
+
+          if (open.length > 0) {
+            await github.rest.issues.createComment({
+              owner, repo, issue_number: open[0].number, body,
+            });
+            core.info(`Commented on #${open[0].number}`);
+          } else {
+            // Use only labels that already exist. Creating a label needs
+            // extra rights.
+            const created = await github.rest.issues.create({
+              owner, repo, title, body, labels: ['bug', 'ci'],
+            });
+            core.info(`Created #${created.data.number}`);
+          }

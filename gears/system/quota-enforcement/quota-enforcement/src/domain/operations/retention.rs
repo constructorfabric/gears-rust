@@ -89,14 +89,19 @@ impl RetentionSweeper {
         // @cpt-end:cpt-cf-quota-enforcement-algo-idempotency-replay:p1:inst-idem-window
         // @cpt-end:cpt-cf-quota-enforcement-state-idempotency-record:p1:inst-idemst-reclaim
         // @cpt-end:cpt-cf-quota-enforcement-algo-retention-sweep:p1:inst-ret-idem
-        let before = now - self.timing.operation_log_retention;
+        let before = now.checked_sub(self.timing.operation_log_retention);
         // @cpt-begin:cpt-cf-quota-enforcement-algo-retention-sweep:p1:inst-ret-oplog
-        let operation_log = self
-            .drain(cancel, RetentionTable::OperationLog, || {
-                self.storage
-                    .reclaim_operation_log(self.timing.batch_size.get(), before)
-            })
-            .await;
+        // A cutoff before the calendar starts means no entry is old enough yet.
+        let operation_log = match before {
+            Some(before) => {
+                self.drain(cancel, RetentionTable::OperationLog, || {
+                    self.storage
+                        .reclaim_operation_log(self.timing.batch_size.get(), before)
+                })
+                .await
+            }
+            None => 0,
+        };
         // @cpt-end:cpt-cf-quota-enforcement-algo-retention-sweep:p1:inst-ret-oplog
         // @cpt-begin:cpt-cf-quota-enforcement-algo-retention-sweep:p1:inst-ret-return
         SweepReport {

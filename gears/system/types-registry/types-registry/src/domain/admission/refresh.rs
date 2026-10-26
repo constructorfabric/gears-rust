@@ -116,7 +116,7 @@ pub async fn refresh_dependents(
         for (entity_id, gts_id) in blocking_subjects {
             check_resolution_inputs(store.store_mut(), &gts_id, limits.resolution_closure)
                 .map_err(RefreshRefusal::Budget)?;
-            let resolved = store.store_mut().validate_schema(&gts_id);
+            let resolved = store.validate_schema(&gts_id);
             let resolved = match resolved {
                 Ok(resolved) => resolved,
                 Err(error) => {

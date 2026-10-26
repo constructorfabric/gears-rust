@@ -83,7 +83,7 @@ toolkit-canonical-errors = { workspace = true, features = ["axum", "utoipa"] }
 toolkit-odata = { workspace = true, features = ["with-utoipa"] }
 toolkit-macros = { workspace = true }
 utoipa = { workspace = true }
-authz-resolver-sdk = { workspace = true }
+authz-resolver-sdk = { workspace = true, features = ["rest-client"] }
 authz-resolver = { workspace = true }
 types-registry = { workspace = true }
 # `domain/authz.rs`'s `TOPIC_RESOURCE`/`EVENT_TYPE_RESOURCE` consts invoke

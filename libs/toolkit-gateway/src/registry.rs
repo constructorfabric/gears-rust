@@ -88,7 +88,7 @@ struct RegisteredPath {
     /// (the first instance in deterministic order); cross-replica load balancing
     /// is delegated to the gear's k8s Service DNS. The instance-keyed registry
     /// ([`State::instances`]) retains *every* instance, so Profile 2
-    /// (Host + Workers) multi-worker selection — where the proxy is the only
+    /// (Self-Hosted) multi-worker selection — where the proxy is the only
     /// load balancer — and future metadata routing can select differently by
     /// changing [`State::rebuild`]/[`ProxyRegistry::match_path`], without a
     /// change to how routes are stored.

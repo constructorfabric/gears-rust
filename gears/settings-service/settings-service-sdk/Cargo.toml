@@ -12,6 +12,9 @@ keywords = ["constructorfabric", "cf-gears", "settings-service"]
 categories = ["api-bindings"]
 metadata.docs.rs.all-features = true
 
+[lib]
+name = "cf_gears_settings_service_sdk"
+
 [lints]
 workspace = true
 

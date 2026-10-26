@@ -53,8 +53,8 @@ fn key(url: &str) -> CacheKey {
     CacheKey::compute("GET", url, "application/json")
 }
 
-async fn cached(cache: &SeaOrmHttpCache, scope: &AccessScope, url: &str) -> bool {
-    cache.get(scope, &key(url)).await.unwrap().is_some()
+async fn cached(cache: &SeaOrmHttpCache, scope: &AccessScope, tenant: Uuid, url: &str) -> bool {
+    cache.get(scope, tenant, &key(url)).await.unwrap().is_some()
 }
 
 #[tokio::test]
@@ -94,19 +94,19 @@ async fn clearing_one_repository_leaves_its_neighbours_alone() {
     let body = body_json(response).await;
     assert_eq!(body["scope"], "acme/widget");
     assert_eq!(body["entries_removed"], 1);
-    assert!(!cached(&cache, &scope, &urls[0]).await);
+    assert!(!cached(&cache, &scope, tenant, &urls[0]).await);
     assert!(
-        cached(&cache, &scope, &urls[1]).await,
+        cached(&cache, &scope, tenant, &urls[1]).await,
         "widget-fork is not below widget/"
     );
-    assert!(cached(&cache, &scope, &urls[2]).await);
+    assert!(cached(&cache, &scope, tenant, &urls[2]).await);
 
     let response = send(router, Method::DELETE, "/github-mirror/v1/cache?owner=acme").await;
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(body_json(response).await["entries_removed"], 1);
-    assert!(!cached(&cache, &scope, &urls[1]).await);
+    assert!(!cached(&cache, &scope, tenant, &urls[1]).await);
     assert!(
-        cached(&cache, &scope, &urls[2]).await,
+        cached(&cache, &scope, tenant, &urls[2]).await,
         "another owner's entries stay"
     );
 }

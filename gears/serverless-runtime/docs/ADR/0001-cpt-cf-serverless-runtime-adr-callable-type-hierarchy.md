@@ -217,7 +217,7 @@ let record = sless.invoke(ctx, InvokeRequest {
 
 ### GTS Schema Callable References
 
-Schedule, Trigger, and Webhook Trigger schemas use `function_id` with `x-gts-ref: gts.cf.core.sless.function.v1~*`. The description text notes that workflows use `workflow.v1~*`, but the `x-gts-ref` constraint only matches functions. This is a known inconsistency addressed as follows:
+Schedule, Trigger, and Webhook Trigger schemas use `function_id` with `x-gts-type-ref: gts.cf.core.sless.function.v1~*`. The description text notes that workflows use `workflow.v1~*`, but the `x-gts-type-ref` constraint only matches functions. This is a known inconsistency addressed as follows:
 
 - The `function_id` field is renamed to `callable_id` in the Rust SDK models (`models.rs`) to accurately reflect that it accepts both types.
 - The GTS schemas retain `function_id` for backward compatibility but add a `callable_type` discriminator field:

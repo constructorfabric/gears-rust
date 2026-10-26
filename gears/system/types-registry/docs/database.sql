@@ -489,7 +489,7 @@ CREATE TABLE types_registry__instance (
 --
 -- Stored kinds are schema $ref, immediate derivation, and Instance conformance.
 -- Derivation and conformance are materialized although identifier-derived.
--- `x-gts-ref` patterns are constraints, not dependency edges.
+-- Entity references (`x-gts-type-ref` / `x-gts-instance-ref`) are constraints, not dependency edges.
 CREATE TABLE types_registry__dependency (
     from_entity_id bigint      NOT NULL,
     -- 1 schema_ref ($ref), 2 derivation (immediate base),
