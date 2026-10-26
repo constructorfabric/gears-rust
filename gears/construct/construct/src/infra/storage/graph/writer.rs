@@ -81,19 +81,16 @@ impl SoftDelete {
 impl FactRemoval for SoftDelete {
     async fn remove(&self, ctx: &SecurityContext, key: &NodeKey) -> Result<(), DomainError> {
         // @cpt-begin:cpt-cf-construct-algo-profile-writer-write:p1:inst-write-remove
-        match bounded(
+        // A fact already tombstoned answers with nothing deleted. Not found
+        // means graph storage holds no such fact for this context, which a
+        // listed key of a live fact never is, so it is no success.
+        bounded(
             self.timeout,
-            "fact removal",
+            &format!("removal of fact {}", key.0),
             self.client.delete_node(ctx, &key.0),
         )
-        .await?
-        {
-            // A fact already tombstoned answers with nothing deleted. Not found
-            // means graph storage holds no such fact for this context, which a
-            // listed key of a live fact never is, so it is no success.
-            Ok(_) => Ok(()),
-            Err(err) => Err(graph_error(&format!("removal of fact {}", key.0), &err)),
-        }
+        .await?;
+        Ok(())
         // @cpt-end:cpt-cf-construct-algo-profile-writer-write:p1:inst-write-remove
     }
 }
@@ -188,6 +185,13 @@ impl GraphPlanWriter {
 
     /// Send the ingest, again with the same idempotency key while its result
     /// is unknown, with a growing, jittered pause between sends.
+    ///
+    /// A send without an answer keeps running in graph storage, which cannot
+    /// cut off a statement it has started. A later send of the same request
+    /// can miss that send's receipt, wait for the root, and lose the
+    /// compare-and-set to it. So once a result was unknown, a refused
+    /// compare-and-set is sent once more with the same key: when the earlier
+    /// send committed, its receipt now answers stored.
     async fn ingest(
         &self,
         ctx: &SecurityContext,
@@ -195,6 +199,8 @@ impl GraphPlanWriter {
     ) -> Result<Written, DomainError> {
         let mut attempt = 1;
         let mut pause = FIRST_PAUSE;
+        let mut unknown = false;
+        let mut replayed = false;
         loop {
             // @cpt-begin:cpt-cf-construct-algo-profile-writer-write:p1:inst-write-ingest
             let sent =
@@ -205,6 +211,15 @@ impl GraphPlanWriter {
                 Ok(Err(CanonicalError::Aborted { ctx: aborted, .. }))
                     if aborted.reason == CAS_CONFLICT =>
                 {
+                    if unknown && !replayed {
+                        replayed = true;
+                        tracing::warn!(
+                            idempotency_key = ?request.idempotency_key,
+                            "profile write refused after a send without an answer; sent once \
+                             more in case that send committed"
+                        );
+                        continue;
+                    }
                     return Ok(Written::Conflict);
                 }
                 Ok(Err(err)) if !resendable(&err) => {
@@ -214,6 +229,7 @@ impl GraphPlanWriter {
                 // No answer in time: the write may or may not have committed.
                 Err(_) => format!("no answer within {:?}", self.timeout),
             };
+            unknown = true;
             if attempt >= self.attempts.get() {
                 return Err(DomainError::Unavailable(format!(
                     "graph storage profile write: result unknown after {attempt} sends: {failed}"
@@ -396,11 +412,11 @@ impl GraphPlanWriter {
     }
 
     /// A compare-and-set refused after a read that matched the plan. Every
-    /// write of Construct's moves the counter, so a counter that has not moved
-    /// means graph storage's version of the root no longer matches it: the
-    /// root was written outside Construct, or its key is held by a removed
-    /// node. Every later write would be refused too, so that is a defect, not
-    /// a conflict.
+    /// write of Construct's moves the counter, so a moved counter is another
+    /// write, a conflict. A counter that has not moved is a defect: the root
+    /// was written outside Construct or its key is held by a removed node, so
+    /// every later write is refused too, or a key a new fact claims is
+    /// already held.
     async fn refused(
         &self,
         ctx: &SecurityContext,
@@ -410,9 +426,9 @@ impl GraphPlanWriter {
         let now = self.read(ctx, subject).await?.version;
         if now == expected {
             return Err(DomainError::internal(format!(
-                "profile root {} refuses every write: graph storage's version of it does not \
-                 match its counter {expected:?}; it was written outside Construct, or its key is \
-                 held by a removed node",
+                "graph storage refused the write of profile root {} while its counter \
+                 {expected:?} did not move: the root was written outside Construct, its key is \
+                 held by a removed node, or a key a new fact claims is already held",
                 root_key(subject.key()).0
             )));
         }

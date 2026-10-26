@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use construct_sdk::gts::HAS_FACT_TYPE;
+use construct_sdk::gts::{HAS_FACT_TYPE, PROFILE_ROOT_TYPE};
 use graph_storage_sdk::GraphStorageClientV1;
 use graph_storage_sdk::models::{NodeView, TraverseRequest, TruncationReason};
 use toolkit_security::SecurityContext;
@@ -11,10 +11,10 @@ use uuid::Uuid;
 
 use super::fact::fact_of;
 use super::root::{ProfileVersion, Root, root_key};
-use super::{ContextSubject, DEFAULT_CALL_TIMEOUT, bounded, graph_error, subject_in_context};
+use super::{ContextSubject, DEFAULT_CALL_TIMEOUT, bounded, subject_in_context};
 use crate::domain::error::DomainError;
 use crate::domain::plan::NodeKey;
-use crate::domain::profile::{Category, FullProfile, Profile, ProfileSource};
+use crate::domain::profile::{FullProfile, Profile, ProfileSource};
 use crate::domain::subject_settings::SubjectKey;
 
 /// The most nodes one profile read takes: the root and its facts. Graph
@@ -59,9 +59,7 @@ pub(crate) async fn read_stored(
         node_type_patterns: Vec::new(),
         max_nodes: Some(MAX_PROFILE_NODES),
     };
-    let response = bounded(timeout, "profile read", client.traverse(ctx, request))
-        .await?
-        .map_err(|err| graph_error("profile read", &err))?;
+    let response = bounded(timeout, "profile read", client.traverse(ctx, request)).await?;
     // @cpt-end:cpt-cf-construct-algo-profile-writer-read:p1:inst-read-traverse
 
     // @cpt-begin:cpt-cf-construct-algo-profile-writer-read:p1:inst-read-root
@@ -93,11 +91,24 @@ pub(crate) async fn read_stored(
             )));
         }
     }
-    let root = Root::from_payload(&NodeKey(key.clone()), root_node.payload.as_ref())?;
+    // Graph storage keys are unique across types, so another type can hold
+    // the root's key; its node is no root, and its edges decide nothing.
+    if root_node.type_id != PROFILE_ROOT_TYPE {
+        return Err(DomainError::internal(format!(
+            "the key of profile root {key} is held by a node of type {}",
+            root_node.type_id
+        )));
+    }
+    let root = Root::from_payload(
+        &NodeKey(key.clone()),
+        subject.subject_id,
+        root_node.payload.as_ref(),
+    )?;
     let version = versions.read(root_node)?;
     // @cpt-end:cpt-cf-construct-algo-profile-writer-read:p1:inst-read-root
     // The traversal walks edges both ways and matches derived edge types, so a
-    // fact is only a node that a has-fact edge from this root points to.
+    // fact is only a node that a has-fact edge from this root points to. One of
+    // no person type is kept, so the read reports it and the writer counts it.
     let pointed: BTreeSet<&str> = response
         .edges
         .iter()
@@ -107,10 +118,7 @@ pub(crate) async fn read_stored(
     let facts = response
         .nodes
         .into_iter()
-        .filter(|node| {
-            pointed.contains(node.node_key.as_str())
-                && Category::from_type_id(&node.type_id).is_some()
-        })
+        .filter(|node| pointed.contains(node.node_key.as_str()))
         .collect();
     Ok(Stored {
         version: Some(version),

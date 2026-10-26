@@ -57,23 +57,25 @@ pub(crate) fn graph_error(what: &str, err: &CanonicalError) -> DomainError {
     }
 }
 
-/// Await one graph storage call for at most `timeout`. A call with no answer
-/// in time is unavailable.
+/// Await one graph storage call for at most `timeout`.
 ///
 /// # Errors
 ///
-/// [`DomainError::Unavailable`] when the call does not answer in time; the
-/// call's own result is returned as it is.
+/// [`DomainError::Unavailable`] when the call does not answer in time; a
+/// failed call as [`graph_error`] maps it.
 pub(crate) async fn bounded<T>(
     timeout: Duration,
     what: &str,
     call: impl Future<Output = Result<T, CanonicalError>>,
-) -> Result<Result<T, CanonicalError>, DomainError> {
-    tokio::time::timeout(timeout, call).await.map_err(|_| {
-        DomainError::Unavailable(format!(
-            "graph storage {what}: no answer within {timeout:?}"
-        ))
-    })
+) -> Result<T, DomainError> {
+    tokio::time::timeout(timeout, call)
+        .await
+        .map_err(|_| {
+            DomainError::Unavailable(format!(
+                "graph storage {what}: no answer within {timeout:?}"
+            ))
+        })?
+        .map_err(|err| graph_error(what, &err))
 }
 
 /// A subject in the security context's tenant. Only [`subject_in_context`]
