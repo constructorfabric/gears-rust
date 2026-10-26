@@ -42,11 +42,12 @@ use super::writer::{
 };
 use super::{DEFAULT_CALL_TIMEOUT, graph_error};
 use crate::domain::error::DomainError;
-use crate::domain::plan::{Change, NodeKey as FactKey, Plan, Property, Step};
+use crate::domain::plan::{Change, NodeKey as FactKey, Origin, Plan, Property, Step};
 use crate::domain::planner::processing::{PlanWriter, ProfileSource, Written};
 use crate::domain::profile::{Category, Profile};
+use crate::domain::profile_read::{OriginKind, StoredFact, StoredProfiles};
 use crate::domain::subject_settings::SubjectKey;
-use crate::test_support::{add_value, connector_plan, replace_property};
+use crate::test_support::{add_value, by_a_person, connector_plan, replace_property};
 
 /// Builds the canonical errors graph storage answers with.
 #[resource_error(gts_id!("cf.construct.test.graph.v1~"))]
@@ -410,6 +411,13 @@ impl Profiles {
             .read(&self.ctx, self.tenant, self.subject)
             .await
             .expect("the profile reads")
+    }
+
+    async fn stored(&self) -> Vec<StoredFact> {
+        self.reader()
+            .stored(&self.ctx, self.subject_key())
+            .await
+            .expect("the facts read")
     }
 
     /// A record's plan for this subject, built on `version`.
@@ -1841,4 +1849,98 @@ async fn a_profile_of_another_tenant_than_the_context_is_refused() {
     );
     assert!(matches!(read, Err(DomainError::Internal(_))), "{read:?}");
     assert_eq!(profiles.read().await.version, None);
+}
+
+#[tokio::test]
+async fn a_stored_fact_names_who_it_came_from_and_when() {
+    let agent = Uuid::new_v4();
+    for (origin, kind) in [
+        (None, OriginKind::Connector),
+        (Some(Origin::Agent { agent }), OriginKind::Agent),
+        (
+            Some(Origin::Reviewer {
+                reviewer: Uuid::new_v4(),
+            }),
+            OriginKind::Reviewer,
+        ),
+        (
+            Some(Origin::Administrator {
+                administrator: Uuid::new_v4(),
+            }),
+            OriginKind::Administrator,
+        ),
+    ] {
+        let profiles = Profiles::new();
+        let mut plan = profiles.plan(None, vec![add_skill("Rust")]);
+        if let Some(origin) = origin {
+            plan = match origin {
+                Origin::Agent { .. } => {
+                    plan.origin = origin;
+                    plan
+                }
+                person => by_a_person(plan, person),
+            };
+        }
+
+        profiles.writer().write(&profiles.ctx, &plan).await.unwrap();
+
+        let stored = profiles.stored().await;
+        let [fact] = stored.as_slice() else {
+            panic!("one fact, got {stored:?}");
+        };
+        assert_eq!(fact.origin, kind);
+        assert_eq!(
+            (fact.property.as_str(), &fact.value),
+            ("skills", &skills("Rust"))
+        );
+        assert!(fact.produced_at.is_some(), "{kind:?}");
+        assert!(
+            fact.stored_at > time::OffsetDateTime::UNIX_EPOCH,
+            "graph storage's storing time"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_records_fact_was_produced_when_its_record_was_observed() {
+    let profiles = Profiles::new();
+
+    profiles
+        .writer()
+        .write(&profiles.ctx, &profiles.plan(None, vec![add_skill("Rust")]))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        profiles.stored().await[0].produced_at,
+        Some(time::OffsetDateTime::UNIX_EPOCH),
+        "the plan's observed_at"
+    );
+}
+
+#[tokio::test]
+async fn the_stored_facts_leave_out_one_listed_for_removal_and_a_subject_without_a_root_has_none() {
+    let profiles = Profiles::new();
+    assert!(profiles.stored().await.is_empty(), "no root yet");
+    let first = add_skill("Rust");
+    let old = key_of(&first);
+    profiles
+        .writer()
+        .write(&profiles.ctx, &profiles.plan(None, vec![first]))
+        .await
+        .unwrap();
+    let broken = Profiles::writer_with(Arc::clone(&profiles.client), Arc::new(BrokenRemoval));
+
+    broken
+        .write(
+            &profiles.ctx,
+            &profiles.plan(Some(1), vec![replace(&old, "Go")]),
+        )
+        .await
+        .unwrap();
+
+    assert!(profiles.is_live(&old).await, "still stored, but listed");
+    let stored = profiles.stored().await;
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].value, skills("Go"));
 }

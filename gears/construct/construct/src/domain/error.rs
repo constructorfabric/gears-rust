@@ -21,6 +21,11 @@ pub enum DomainError {
     #[error("Access forbidden: {0}")]
     OutOfScope(SettingsOutOfScope),
 
+    /// The caller may not see the resource. Answered like a resource that
+    /// does not exist, so the answer tells nothing about what exists.
+    #[error("Not visible: {0}")]
+    NotVisible(String),
+
     #[error("Service unavailable: {0}")]
     Unavailable(String),
 

@@ -306,3 +306,31 @@ fn an_out_of_scope_error_on_the_facts_route_answers_as_no_such_subject() {
         assert!(!text.contains(&id.to_string()), "{id} in {text}");
     }
 }
+
+#[test]
+fn a_subject_that_is_not_visible_is_404_and_tells_nothing_more() {
+    for problem in [
+        wire(DomainError::NotVisible(
+            "subject 42 has a profile".to_owned(),
+        )),
+        rest(DomainError::NotVisible(
+            "subject 42 has a profile".to_owned(),
+        )),
+    ] {
+        assert_eq!(problem.status, Some(404));
+        assert_eq!(problem.detail, "no such subject");
+        let text = visible_text(&problem);
+        assert!(
+            !text.contains("has a profile"),
+            "the reason stays in the log: {text}"
+        );
+    }
+}
+
+#[test]
+fn an_unavailable_dependency_on_the_profile_read_is_503() {
+    assert_eq!(
+        rest(DomainError::Unavailable("graph storage down".to_owned())).status,
+        Some(503)
+    );
+}

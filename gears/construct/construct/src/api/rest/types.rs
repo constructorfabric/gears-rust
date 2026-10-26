@@ -9,3 +9,6 @@ pub type ConcreteIntake =
 
 /// Concrete subject settings service used by the REST layer.
 pub type ConcreteSettings = SubjectSettingsService<SeaOrmSubjectSettingsRepository>;
+
+/// The profile read used by the REST layer.
+pub type ConcreteProfile = crate::domain::profile_read::ProfileReadService;
