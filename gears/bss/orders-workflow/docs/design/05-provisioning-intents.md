@@ -1366,8 +1366,12 @@ throttle-induced delay never extends the per-operation deadline (`01 §4.12`).
   from a read that returned `voided`; a new key, a new attempt or an unevaluable read authorizes
   nothing. A confirmed non-application through `SUB-O17` is **not** required: this gear accepts the
   residual risk that a request for the predecessor delayed past the create's de-duplication
-  lifetime is applied after the successor, and that risk is bounded by the activation gate — the
-  successor alone is activated, and a second draft for the line is a subject of any later unwind.
+  lifetime is applied after the successor. Such a stray draft is **not in this gear's record**: the
+  predecessor row is `lapsed`, a terminal status, so a late confirmation for it is absorbed
+  (`inst-ri-lock`) and no unwind's freeze lists it. What bounds the risk is that this gear never
+  activates it — wave 2 activates only the successor's subscription — that a draft carries no
+  billable facts, and that Subscriptions' draft expiry voids it. A stray draft that some other
+  actor later activates is outside this gear's record and is Subscriptions' to reconcile.
   The successor **MUST** name its predecessor (`predecessor_intent_id`, and the predecessor's
   transition request and subscription on the create), so Subscriptions keeps the acquisition,
   reservation and commercial terms resolved from the referenced order version (`SUB-O18`).

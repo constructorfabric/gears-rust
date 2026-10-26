@@ -6955,9 +6955,14 @@ event stands, and the progress read reports it as created-then-lapsed.
 **Rationale**: the rebuild path minted a new attempt on any `lapsed` row and linked nothing, so a
 purchase could be recreated rather than re-materialized. The author accepted the residual risk of
 not waiting for `SUB-O17`: a request for the predecessor delayed past the create's de-duplication
-lifetime may still be applied after the successor. That risk is bounded because only the successor
-is ever activated and any second draft is a subject of a later unwind; waiting for `SUB-O17` would
-block every rebuild until Subscriptions ships it.
+lifetime may still be applied after the successor. Such a stray draft is not in this gear's
+record: the predecessor row is terminal (`lapsed`), so a late confirmation for it is absorbed and no
+unwind lists it. The risk is bounded only because this gear never activates it, a draft carries no
+billable facts, and Subscriptions' draft expiry voids it. Waiting for `SUB-O17` would block every
+rebuild until Subscriptions ships it.
+
+> **Corrected 2026-10-26**: the earlier rationale said a stray second draft "is a subject of a later
+> unwind". It is not, for the reason above; the design text of `design/05` §4.4 is corrected with it.
 
 **Propagated**: `design/05-provisioning-intents.md` §3.2 (*Draft-Liveness Re-reader*, *Wave-1
 Rebuilder*), §3.3 (`reread-draft-liveness`, `rebuild-wave1`), §3.6 (`inst-rb-verify`,
