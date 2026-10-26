@@ -36,6 +36,7 @@ fn concrete(no: i16, name: &str, major: i64, minor: Option<i64>, is_type: bool) 
         name: Some(exact(name)),
         major: Some(major),
         minor,
+        minor_required: false,
         is_type: Some(is_type),
     }
 }
@@ -46,6 +47,7 @@ fn wild(no: i16, name: NameFilter, major: Option<i64>) -> SegmentFilter {
         name: Some(name),
         major,
         minor: None,
+        minor_required: major.is_some(),
         is_type: None,
     }
 }

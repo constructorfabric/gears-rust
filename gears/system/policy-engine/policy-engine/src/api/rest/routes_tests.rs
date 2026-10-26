@@ -13,7 +13,7 @@ use axum::http::{Request, StatusCode, header};
 use policy_engine_sdk::management::{
     Assignment, AssignmentId, AssignmentSpec, Bundle, BundleId, BundlePatch, BundleVersion,
     Document, DocumentId, DocumentSpec, ManagementError, ManagementResource, NewBundle,
-    PolicyManagementClientV1, ValidationFinding, ValidationReport, VersionContent, VersionDetail,
+    PolicyManagementClientV1, PublishOperation, ValidationFinding, VersionContent, VersionDetail,
     VersionId, VersionState,
 };
 use time::OffsetDateTime;
@@ -72,6 +72,7 @@ fn assignment(enforce: bool) -> Assignment {
         created_by: Uuid::from_u128(0x5B),
         updated_at: at(),
         updated_by: Uuid::from_u128(0x5B),
+        dormant: false,
     }
 }
 
@@ -98,6 +99,8 @@ fn detail() -> VersionDetail {
 #[derive(Default)]
 struct FakeClient {
     calls: Mutex<Vec<String>>,
+    /// The operations `check_publish` was asked about.
+    checks: Mutex<Vec<PublishOperation>>,
     missing: bool,
 }
 
@@ -152,8 +155,9 @@ impl PolicyManagementClientV1 for FakeClient {
     async fn list_bundles(
         &self,
         _ctx: &SecurityContext,
-        _query: &ODataQuery,
+        query: &ODataQuery,
     ) -> Result<Page<Bundle>, ManagementError> {
+        self.record(format!("list_bundles filtered={}", query.has_filter()));
         Ok(Page::new(
             vec![bundle()],
             PageInfo {
@@ -237,17 +241,26 @@ impl PolicyManagementClientV1 for FakeClient {
         &self,
         _ctx: &SecurityContext,
         _bundle: BundleId,
-        version: VersionId,
-    ) -> Result<ValidationReport, ManagementError> {
-        Ok(ValidationReport {
-            version_id: version,
+        _version: VersionId,
+    ) -> Result<(), ManagementError> {
+        self.record("validate_version");
+        Err(ManagementError::ValidationFailed {
             findings: vec![ValidationFinding {
                 document_name: Some("main".to_owned()),
                 code: "SYNTAX_ERROR".to_owned(),
                 message: "bad".to_owned(),
             }],
-            validated_at: at(),
         })
+    }
+
+    async fn check_publish(
+        &self,
+        _ctx: &SecurityContext,
+        operation: PublishOperation,
+    ) -> Result<(), ManagementError> {
+        self.record("check_publish");
+        self.checks.lock().unwrap().push(operation);
+        self.refuse()
     }
 
     async fn activate_version(
@@ -275,6 +288,25 @@ impl PolicyManagementClientV1 for FakeClient {
         _id: AssignmentId,
     ) -> Result<Assignment, ManagementError> {
         Ok(assignment(true))
+    }
+
+    async fn list_assignments(
+        &self,
+        _ctx: &SecurityContext,
+        query: &ODataQuery,
+    ) -> Result<Page<Assignment>, ManagementError> {
+        self.record(format!("list_assignments filtered={}", query.has_filter()));
+        Ok(Page::new(
+            vec![Assignment {
+                dormant: true,
+                ..assignment(true)
+            }],
+            PageInfo {
+                next_cursor: None,
+                prev_cursor: None,
+                limit: 25,
+            },
+        ))
     }
 
     async fn update_assignment(
@@ -509,10 +541,11 @@ async fn replace_validate_activate_and_delete_a_draft() {
         None,
     )
     .await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["valid"], false);
-    assert_eq!(body["findings"][0]["code"], "SYNTAX_ERROR");
-    assert!(body.get("etag").is_none());
+    // Invalid content is the problem activation would return.
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error_code"], "VALIDATION_FAILED");
+    assert!(body.to_string().contains("SYNTAX_ERROR"), "{body}");
+    assert_eq!(client.last(), "validate_version");
 
     let (status, _, body) = send(
         &router,
@@ -595,6 +628,69 @@ async fn assignments_assign_get_update_unassign() {
     assert_eq!(client.last(), "unassign");
 }
 
+#[tokio::test]
+async fn assignments_are_listed_a_page_at_a_time_with_their_dormant_flag() {
+    let (router, client) = build_router();
+
+    let (status, _, body) = send(&router, "GET", "/policy-engine/v1/assignments", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let items = body["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["id"], ASSIGNMENT.to_string());
+    assert_eq!(items[0]["bundle_id"], BUNDLE.to_string());
+    assert_eq!(items[0]["tenant_id"], TENANT.to_string());
+    assert_eq!(items[0]["dormant"], true);
+    assert_eq!(body["page_info"]["limit"], 25);
+    assert_eq!(client.last(), "list_assignments filtered=false");
+}
+
+#[tokio::test]
+async fn bundles_are_filtered_by_name() {
+    let (router, client) = build_router();
+
+    let (status, _, body) = send(
+        &router,
+        "GET",
+        "/policy-engine/v1/bundles?$filter=name%20eq%20%27baseline%27",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(client.last(), "list_bundles filtered=true");
+}
+
+#[tokio::test]
+async fn assignments_are_filtered_by_bundle_and_target_tenant() {
+    let (router, client) = build_router();
+    let uri = format!(
+        "/policy-engine/v1/assignments?$filter=bundle_id%20eq%20{BUNDLE}%20and%20tenant_id%20eq%20{TENANT}"
+    );
+
+    let (status, _, _) = send(&router, "GET", &uri, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(client.last(), "list_assignments filtered=true");
+}
+
+#[tokio::test]
+async fn an_unsupported_assignment_query_option_is_refused() {
+    let (router, client) = build_router();
+
+    let (status, _, body) = send(
+        &router,
+        "GET",
+        "/policy-engine/v1/assignments?$expand=bundle",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["status"], 400, "a problem body: {body}");
+    assert_eq!(
+        client.last(),
+        "",
+        "a refused query never reaches the client"
+    );
+}
+
 // -- Authentication -----------------------------------------------------------
 
 #[tokio::test]
@@ -622,4 +718,115 @@ async fn unauthenticated_and_anonymous_requests_are_refused() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+// -- Dry runs -----------------------------------------------------------------
+
+#[tokio::test]
+async fn dry_runs_check_and_perform_nothing() {
+    let cases = [
+        (
+            "POST",
+            format!("{}/activate?dry_run=true", version_uri()),
+            None,
+            PublishOperation::Activate {
+                bundle_id: BundleId(BUNDLE),
+                version_id: VersionId(VERSION),
+            },
+        ),
+        (
+            "POST",
+            "/policy-engine/v1/assignments?dry_run=true".to_owned(),
+            Some(serde_json::json!({ "bundle_id": BUNDLE, "tenant_id": TENANT, "enforce": false })),
+            PublishOperation::Assign(AssignmentSpec::new(BundleId(BUNDLE), TENANT).shadow()),
+        ),
+        (
+            "PATCH",
+            format!("{}?dry_run=true", assignment_uri()),
+            Some(serde_json::json!({ "enforce": false })),
+            PublishOperation::UpdateAssignment {
+                assignment_id: AssignmentId(ASSIGNMENT),
+            },
+        ),
+        (
+            "DELETE",
+            format!("{}?dry_run=true", assignment_uri()),
+            None,
+            PublishOperation::Unassign {
+                assignment_id: AssignmentId(ASSIGNMENT),
+            },
+        ),
+    ];
+    for (method, uri, body, operation) in cases {
+        let (router, client) = build_router();
+        let (status, headers, response) = send(&router, method, &uri, body).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{method} {uri}: {response}");
+        assert_eq!(response, serde_json::Value::Null, "{method} {uri}: no body");
+        assert!(headers.get(header::LOCATION).is_none(), "{method} {uri}");
+        assert_eq!(
+            *client.checks.lock().unwrap(),
+            [operation],
+            "{method} {uri}"
+        );
+        assert_eq!(
+            client.calls.lock().unwrap().len(),
+            1,
+            "{method} {uri}: only the check ran"
+        );
+    }
+}
+
+#[tokio::test]
+async fn without_dry_run_the_operation_runs() {
+    let (router, client) = build_router();
+    let (status, _, body) = send(
+        &router,
+        "POST",
+        &format!("{}/activate?dry_run=false", version_uri()),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["state"], "active");
+    assert_eq!(client.last(), "activate_version");
+    assert!(client.checks.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_failing_dry_run_answers_the_operations_problem() {
+    let (router, _) = build_router_with(FakeClient {
+        missing: true,
+        ..FakeClient::default()
+    });
+    let (status, headers, body) = send(
+        &router,
+        "POST",
+        &format!("{}/activate?dry_run=true", version_uri()),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(
+        headers.get(header::CONTENT_TYPE).unwrap(),
+        "application/problem+json"
+    );
+    assert_eq!(body["error_code"], "NOT_FOUND");
+}
+
+#[tokio::test]
+async fn a_malformed_dry_run_flag_is_a_problem() {
+    let (router, client) = build_router();
+    let (status, headers, body) = send(
+        &router,
+        "POST",
+        &format!("{}/activate?dry_run=maybe", version_uri()),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(
+        headers.get(header::CONTENT_TYPE).unwrap(),
+        "application/problem+json"
+    );
+    assert_eq!(client.last(), "", "nothing ran");
 }

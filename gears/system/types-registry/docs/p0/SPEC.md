@@ -377,7 +377,7 @@ out of scope):
    `compat_forced` records the effective waiver; reads report it as
    `provenance.compatibility_check_skipped` (§10.2).
 7. ADR-0015 quarantine — the worker refuses stable candidates whose immediate base,
-   `$ref` target, or conforming type is major 0. `x-gts-ref` is exempt. See below.
+   `$ref` target, or conforming type is major 0. Entity references (`x-gts-type-ref` / `x-gts-instance-ref`) are exempt. See below.
 8. Canonicalize through `gts-rust`, compute the request fingerprint, resolve the
    mandatory `Idempotency-Key`.
 
@@ -676,7 +676,7 @@ for a set that grew in between.
 **Resolution budgets apply to each document.** Before `gts-rust` resolves a candidate,
 `limits.resolution_closure` counts the candidate itself and the distinct documents reached
 through `$ref`, derivation and Instance conformance in the candidate-overlaid store.
-Converging paths count once; `x-gts-ref`, removed outgoing references and unrelated documents
+Converging paths count once; entity references (`x-gts-type-ref` / `x-gts-instance-ref`), removed outgoing references and unrelated documents
 loaded for other refresh subjects do not count. Exceeding the budget yields
 `resolution_closure_exceeded`. Each canonical effective artifact must also fit
 `limits.resolved_document` UTF-8 bytes; exceeding it yields `resolved_document_too_large`.
@@ -742,7 +742,7 @@ dropped when the unit ends.
 The closure is seeded from **both** the candidates' identifiers and their documents. The
 identifier supplies the `~`-chain — every derivation base and an Instance's conforming type
 — and the document supplies its `$ref` targets, which no identifier implies. An
-`x-gts-ref` target is seeded by neither, because validating that keyword never reads the
+entity-reference (`x-gts-type-ref` / `x-gts-instance-ref`) target is seeded by neither, because validating those keywords never reads the
 target document. The document half is not an optimization: a candidate's own edge rows are written
 at commit (step 4.5 above), so during the read that validates it they either do not exist
 yet, on a first admission, or still describe the previous revision. A reference target that
@@ -1194,7 +1194,7 @@ weakest of three reasons.**
    `effective_properties` / `effective_required` walk `parent` alone. A parent chain is not a
    reference closure, so any `$ref` to a type outside the chain stays unresolved. The server
    resolves through `gts-rust`'s `resolve_schema_refs`, which closes over every resolution-bearing
-   reference. An `x-gts-ref` is never inlined and is therefore outside this comparison.
+   reference. An entity reference (`x-gts-type-ref` / `x-gts-instance-ref`) is never inlined and is therefore outside this comparison.
 2. **They are a local approximation of GTS semantics**, which
    `constraint-gts-implementation` forbids outright. The code admits it: `effective_traits`
    carries `TODO(#1723): replace with gts-rust's resolve_schema(...).effective_traits once

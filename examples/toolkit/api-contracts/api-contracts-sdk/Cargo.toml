@@ -9,6 +9,9 @@ description = "SDK for the api-contracts example module — PaymentApi contract,
 rust-version.workspace = true
 publish = false
 
+[lib]
+name = "cf_api_contracts_sdk"
+
 [features]
 default = []
 # Enables both generated clients: the plain `<Trait>RestClient` and its

@@ -1,0 +1,137 @@
+name: macOS and Windows tests
+
+# Runs the Rust unit tests on macOS and Windows once a day. PRs and pushes to
+# main run them on Ubuntu only (ci.yml). The macOS and Windows jobs are the
+# slowest in CI, and OS-specific breaks are rare.
+#
+# A failed nightly run opens an issue, so someone notices. A passing run closes
+# it. Manual runs don't touch the issue.
+#
+# To run it by hand: Actions > macOS and Windows tests > Run workflow.
+on:
+  schedule:
+    - cron: '0 2 * * *'   # 02:00 UTC daily, with the clippy and e2e nightlies
+  workflow_dispatch:
+
+# The event is in the key, so a manual run does not cancel the nightly one.
+concurrency:
+  group: macos-windows-tests-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # Who to @-mention in the issue. Empty means nobody gets pinged.
+  ISSUE_MENTION: ''
+  # The issue steps find the open issue by this exact title.
+  ISSUE_TITLE: 'macOS and Windows tests (nightly) failed'
+
+jobs:
+  test:
+    # test-report.yml looks for this name followed by ` / nextest`.
+    name: Test Suite (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ windows-latest, macos-latest ]
+    uses: ./.github/workflows/test-suite.yml
+    with:
+      os: ${{ matrix.os }}
+    secrets:
+      S3_ACCESS_KEY_ID: ${{ secrets.S3_ACCESS_KEY_ID }}
+      S3_SECRET_ACCESS_KEY: ${{ secrets.S3_SECRET_ACCESS_KEY }}
+
+  issue:
+    name: Update tracking issue
+    needs: test
+    if: ${{ !cancelled() && github.event_name == 'schedule' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: read   # to read this run's jobs and reports
+      contents: read  # to check out the issue action
+      issues: write
+    steps:
+      # Gets only .github/actions, for the issue action. It runs first because
+      # checkout empties the folder.
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/actions
+
+      # Each OS report goes to its own folder, like reports/Windows. A re-run
+      # keeps the old attempt's artifacts, so a name can appear twice. We take
+      # the newest of each by ID and download it once.
+      - name: Download test reports
+        if: needs.test.result == 'failure'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          gh api --paginate "repos/$REPO/actions/runs/$RUN_ID/artifacts" \
+            --jq '.artifacts[] | select(.name | startswith("rust-tests-")) | [.id, .name] | @tsv' |
+          sort -k1,1nr | awk -F '\t' '!seen[$2]++' |
+          while IFS=$'\t' read -r id artifact; do
+            gh api "repos/$REPO/actions/artifacts/$id/zip" > "$RUNNER_TEMP/report.zip"
+            unzip -q "$RUNNER_TEMP/report.zip" -d "reports/${artifact#rust-tests-}"
+          done
+          gh api --paginate "repos/$REPO/actions/runs/$RUN_ID/jobs" \
+            --jq '.jobs[] | select(.name | startswith("Test Suite (")) | [.name, (.conclusion // "")] | @tsv' \
+            > jobs.tsv
+
+      # These tests often flake on macOS and Windows. Listing the failed tests
+      # helps tell a flake from a real break.
+      - name: Summarize failures
+        if: needs.test.result == 'failure'
+        shell: python
+        run: |
+          import glob, os
+          import xml.etree.ElementTree as ET
+
+          MAX = 20
+          lines = []
+          for row in open("jobs.tsv"):
+              job, conclusion = row.rstrip("\n").split("\t")
+              lines.append(f"- {job}: **{conclusion or 'unknown'}**")
+          lines.append("")
+          for report in sorted(glob.glob("reports/*")):
+              failed = []
+              for path in glob.glob(f"{report}/*.xml"):
+                  for case in ET.parse(path).iter("testcase"):
+                      if case.find("failure") is not None or case.find("error") is not None:
+                          failed.append(f"- `{case.get('name')}` ({case.get('classname', '')})")
+              if failed:
+                  more = [f"- ...and {len(failed) - MAX} more"] if len(failed) > MAX else []
+                  lines += [f"Failed on {os.path.basename(report)}:", ""] + failed[:MAX] + more + [""]
+          if not any(l.startswith("Failed on") for l in lines):
+              lines.append("No failed tests in the reports, so the build or setup failed. Check the run log.")
+          lines += [
+              "",
+              'If it looks like a flake, click "Re-run failed jobs" on the run.',
+              "A passing re-run closes this issue.",
+          ]
+          with open(os.path.join(os.environ["RUNNER_TEMP"], "failures.md"), "w") as f:
+              f.write("\n".join(lines))
+
+      # Runs even if a step above failed. The issue matters more than the summary.
+      - name: Open or update issue on nightly failure
+        if: ${{ !cancelled() && needs.test.result == 'failure' }}
+        uses: ./.github/actions/nightly-issue
+        with:
+          title: ${{ env.ISSUE_TITLE }}
+          subject: The macOS and Windows tests
+          result: failure
+          details-file: ${{ runner.temp }}/failures.md
+          mention: ${{ env.ISSUE_MENTION }}
+
+      - name: Close nightly issue on success
+        if: needs.test.result == 'success'
+        uses: ./.github/actions/nightly-issue
+        with:
+          title: ${{ env.ISSUE_TITLE }}
+          subject: The macOS and Windows tests
+          result: success

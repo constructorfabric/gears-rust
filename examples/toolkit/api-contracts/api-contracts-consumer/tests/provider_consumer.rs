@@ -49,6 +49,56 @@ use toolkit_contract::policy::PolicyStack;
 
 const PROVIDER_GEAR: &str = "api-contracts";
 
+// ----- A process with no cluster ---------------------------------------------
+// This crate declares a cluster profile (`src/cluster.rs`), so it links
+// cluster-sdk. In a workspace build that SDK has `grpc-client` on (the cluster
+// gear enables it), and with it comes cluster-sdk's own `ConsumerRegistration`:
+// proxy-wiring then tries to build a *remote* cluster client, which needs
+// `POD_NAMESPACE`, fails, and aborts the phases -- so the charge never lands and
+// the test times out on every CI platform, while `cargo test -p` (feature off,
+// no registration) passes. A co-located cluster client makes that wiring take
+// its local branch, which is the shape of a process with no cluster to reach.
+// Nothing here is bound: these tests never touch cluster.
+
+struct NoCluster;
+
+fn not_bound() -> cluster_sdk::ClusterError {
+    cluster_sdk::ClusterError::ProfileNotBound {
+        profile: "event-broker",
+    }
+}
+
+#[async_trait]
+impl cluster_sdk::ClusterClient for NoCluster {
+    fn cache_backend(
+        &self,
+        _profile: &str,
+    ) -> Result<Arc<dyn cluster_sdk::ClusterCacheBackend>, cluster_sdk::ClusterError> {
+        Err(not_bound())
+    }
+
+    fn lock_backend(
+        &self,
+        _profile: &str,
+    ) -> Result<Arc<dyn cluster_sdk::DistributedLockBackend>, cluster_sdk::ClusterError> {
+        Err(not_bound())
+    }
+
+    fn leader_election_backend(
+        &self,
+        _profile: &str,
+    ) -> Result<Arc<dyn cluster_sdk::LeaderElectionBackend>, cluster_sdk::ClusterError> {
+        Err(not_bound())
+    }
+
+    async fn descriptor(
+        &self,
+        _profile: &str,
+    ) -> Result<cluster_sdk::ProfileDescriptor, cluster_sdk::ClusterError> {
+        Err(not_bound())
+    }
+}
+
 // ----- Minimal mock REST host (ApiGatewayCap + RunnableCap) ------------------
 // Adapted from `api-contracts/tests/runtime_eventual_readiness.rs`: the REST +
 // directory-register phases of `run_gear_phases` expect a gateway host.
@@ -189,6 +239,7 @@ async fn consumer_resolves_provider_local_impl_through_the_hub() {
     let dir: Arc<dyn DirectoryClient> = Arc::new(LocalDirectoryClient::new(gear_mgr));
     let hub = Arc::new(ClientHub::new());
     hub.register::<dyn DirectoryClient>(dir);
+    hub.register::<dyn cluster_sdk::ClusterClient>(Arc::new(NoCluster));
 
     let cancel = CancellationToken::new();
     let runtime = HostRuntime::new(
@@ -299,6 +350,7 @@ async fn consumer_resolves_provider_via_generated_rest_client() {
     let dir: Arc<dyn DirectoryClient> = Arc::new(LocalDirectoryClient::new(gear_mgr));
     let hub = Arc::new(ClientHub::new());
     hub.register::<dyn DirectoryClient>(dir);
+    hub.register::<dyn cluster_sdk::ClusterClient>(Arc::new(NoCluster));
 
     let cancel = CancellationToken::new();
     let runtime = HostRuntime::new(

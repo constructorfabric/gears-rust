@@ -1,0 +1,5 @@
+error: one_per_installation must be a bool, e.g. one_per_installation = true
+ --> tests/ui/fail/one_per_installation_not_bool.rs:3:64
+  |
+3 | #[gear(name="x", capabilities=[stateful], one_per_installation="true")]
+  |                                                                ^^^^^^

@@ -10,7 +10,7 @@ decision-makers: Constructor Fabric Steering Committee
 <!-- toc -->
 
 - [Context and Problem Statement](#context-and-problem-statement)
-  - [Why `fetch_token()` over `Token`](#why-fetch_token-over-token)
+  - [Why `fetch_token()` over `TokenProvider`](#why-fetch_token-over-tokenprovider)
 - [Decision Drivers](#decision-drivers)
 - [Considered Options](#considered-options)
 - [Decision Outcome](#decision-outcome)
@@ -55,11 +55,11 @@ Current built-in auth plugins (`ApiKeyAuthPlugin`, `NoopAuthPlugin`) handle stat
   - `gts.cf.core.oagw.auth_plugin.v1~cf.core.oagw.oauth2_client_cred.v1` (Form)
   - `gts.cf.core.oagw.auth_plugin.v1~cf.core.oagw.oauth2_client_cred_basic.v1` (Basic)
 
-### Why `fetch_token()` over `Token`
+### Why `fetch_token()` over `TokenProvider`
 
-`toolkit-auth` offers two token acquisition APIs. `Token` is a long-lived handle that spawns a `token_watcher::TokenWatcher` background task for automatic refresh — designed for service-level singletons where one identity authenticates to one upstream for the process lifetime. `fetch_token()` performs a single HTTP exchange and returns the bearer value alongside `expires_in`, spawning nothing.
+`toolkit-auth` offers two token acquisition APIs. `TokenProvider` manages acquisition, caching and automatic background refresh for a long-lived service identity. Its synchronous `new(config)` constructor performs no network requests; `get().await` returns a usable cached token or awaits shared acquisition. Clones share one worker, `shutdown().await` stops and joins it, and dropping the final handle cancels it as a fallback. `fetch_token()` performs a single acquisition, including OIDC discovery when configured, and returns the bearer value alongside `expires_in` without creating a background worker.
 
-The OAGW plugin is multi-tenant: each cache miss resolves a different (tenant, subject, config) tuple. Using `Token` here would spawn a background watcher per miss — potentially thousands of orphaned tokio tasks sleeping until their next refresh cycle, each holding `client_id` and `client_secret` in the captured `source_factory` closure. `fetch_token()` avoids both problems: credentials are transient (dropped after the fetch), and no background tasks are created. The plugin manages its own cache with `pingora-memory-cache`, making `Token`'s built-in refresh redundant.
+The OAGW plugin is multi-tenant: each cache miss resolves a different (tenant, subject, config) tuple. Retaining a `TokenProvider` per tuple would require managing a separate background worker and its credentials for every cached identity. Creating and dropping a provider per miss would provide no benefit from its background refresh. OAGW instead uses `fetch_token()` and manages its own token cache with `pingora-memory-cache`; credentials are dropped after acquisition and no provider workers need lifecycle management.
 
 ## Decision Drivers
 

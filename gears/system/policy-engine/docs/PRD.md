@@ -160,7 +160,7 @@ Policy Engine evaluates on the shared Rego facility (`toolkit-policy-evaluation`
 - Any decision API other than the engine plugin; callers reach policy through `admission-control`.
 - Recording decisions, violations, audit export or refusal events: `admission-control` publishes refusal events.
 - Permit-side outcomes: documents can only deny.
-- Policy languages other than Rego, batch evaluation, and dry-run or version comparison tooling.
+- Policy languages other than Rego, batch evaluation, and version comparison tooling.
 - Deferred to p2: administration audit trail, idempotency keys, deprecation, and ancestor guardrails across a barrier
   (5.2, 5.4).
 
@@ -195,10 +195,10 @@ A version **MUST** hold uniquely named documents; each document carries Rego sou
 
 - [ ] `p1` - **ID**: `cpt-cf-policy-engine-fr-content-validation`
 
-Validate and activate **MUST** apply the same checks and report every finding against its document: the source
-compiles and defines `deny`; the shared library's structural guards pass; no determinism or resource-heavy builtin is
-referenced; at least one valid GTS pattern is listed; every concrete type id exists in `types-registry`; the
-version respects the configured document count and document size limits; document names are printable and fit in a
+Validate and activate **MUST** apply the same checks and refuse invalid content alike, reporting every finding
+against its document. The checks: the source compiles and defines `deny`; the shared library's structural guards
+pass; no determinism or resource-heavy builtin is referenced; at least one valid GTS pattern is listed; every
+concrete type id exists in `types-registry`; the version respects the configured document count and document size limits; document names are printable and fit in a
 denial, and resource types and actions are bounded in number and length. Saving an incomplete draft is allowed, but
 not one that breaks a bound or names a document unprintably; activating a failing one is refused. The registry is
 consulted only at validate and activate, never per request.
@@ -231,7 +231,16 @@ becomes self-managed, assignments made by ancestors above the new barrier **MUST
 become dormant and apply again if the barrier is removed. A dormant assignment can be removed by an administrator of the
 target tenant (`publish` on the target tenant, target reachable from the caller with barriers respected); the owner
 above the barrier is refused with `TENANT_BOUNDARY`. Unassigning never reports success for an assignment the caller can
-see but did not delete; one the caller cannot see is reported as absent.
+see but did not delete; one the caller cannot see is reported as absent. Any change the caller may not make to an
+assignment it can see (as the listing shows it) **MUST** be refused with `CAPABILITY_DENIED`, never reported absent.
+
+Assignments **MUST** be listable, filtered by bundle or by target tenant, and every assignment **MUST** say whether it is
+dormant. A caller sees the assignments of bundles it may read at its tenants (barriers ignored) made from its side of
+every barrier, so an owner sees an assignment that stopped applying, and the dormant assignments at tenants it reaches
+on which it holds `publish`, so an administrator of the target tenant can find what it may remove. A listing filter
+naming content the caller cannot see yields no rows; a read of an assignment the caller would not see in the listing
+reports it absent. A listing for a caller whose subtree is too large to evaluate is refused with `SUBTREE_TOO_LARGE`,
+never answered partially; reading one assignment is not limited.
 
 - **Actors**: `cpt-cf-policy-engine-actor-hierarchy-provider`, `cpt-cf-policy-engine-actor-tenant-policy-admin`
 
@@ -389,7 +398,8 @@ internal, invalid request); no failure is ever reported as a permit, and no sett
 
 Every management operation **MUST** be authorized against the caller's own context for exactly one of three
 permissions, none implying another: `read` (read content), `author` (create and update bundles, create, replace,
-delete and validate drafts), `publish` (activate, assign, update assignment, unassign). Assigning needs a target tenant
+delete and validate drafts), `publish` (activate, assign, update assignment, unassign; also listing and reading the
+dormant assignments the caller may remove). Assigning needs a target tenant
 reachable from the caller with barriers respected; unassigning needs `publish` on the target tenant, reachable from the
 caller with barriers respected, so an administrator of the target tenant can remove an assignment whose owner is above a
 barrier; content the caller may not see looks absent. Bundle names must be
@@ -407,6 +417,18 @@ Unassigning succeeds only for an assignment that was deleted, does not exist, or
 caller can see but may not remove is refused.
 
 - **Actors**: `cpt-cf-policy-engine-actor-policy-author`
+
+#### Dry Runs of Publish Operations
+
+- [ ] `p1` - **ID**: `cpt-cf-policy-engine-fr-publish-dry-run`
+
+Activate, assign, update assignment and unassign **MUST** each offer a dry run that runs every check of the operation
+against the same state and writes nothing, so that clients never replicate those checks. A dry run requires the
+permission the operation requires and answers exactly what the operation would: success (a no-op success included), or
+the operation's own error with the same masking, so it never reveals what the operation would hide. It is advisory: it
+reserves nothing, and the operation checks again when it runs, so a concurrent writer can still make it fail.
+
+- **Actors**: `cpt-cf-policy-engine-actor-tenant-policy-admin`
 
 #### Administration Audit
 
@@ -510,9 +532,12 @@ terminates the host.
 
 - **Type**: Rust client trait in ClientHub, in the gear's SDK
 - **Stability**: unstable
-- **Description**: Bundles, versions (draft, replace, delete, validate, activate) and assignments. Errors are typed;
-  each carries a stable code that also travels on the wire. Bundles and versions are cursor-paged
-  (OData `$top` and cursor; default page 25, maximum 100); versions are listed newest ordinal first.
+- **Description**: Bundles, versions (draft, replace, delete, validate, activate) and assignments, and a dry run of
+  each publish operation (`check_publish`). Errors are typed;
+  each carries a stable code that also travels on the wire. Bundles, versions and assignments are cursor-paged
+  (OData `$top` and cursor; default page 25, maximum 100); bundles are filterable by `name` and `owner_tenant_id`, so a
+  bundle can be found by its name; versions are listed newest ordinal first; assignments are filterable by `bundle_id` and `tenant_id` and
+  carry a `dormant` flag.
 
 #### Policy Administration REST API
 
@@ -520,8 +545,9 @@ terminates the host.
 
 - **Type**: Versioned REST API with a published OpenAPI document
 - **Stability**: unstable
-- **Description**: The management client's operations over bundles, versions and assignments; lists, versions included, are cursor-paged. No
-  decision endpoint exists.
+- **Description**: The management client's operations over bundles, versions and assignments; lists, versions included, are cursor-paged. The
+  publish operations take `dry_run=true`, answering `204` when the operation would succeed and its problem
+  otherwise; validation answers the same way. No decision endpoint exists.
 
 ### 7.2 External Integration Contracts
 
@@ -657,7 +683,8 @@ The previous PRD was cut down to the default admission-control engine. Removed o
 - Batch evaluation: removed; the engine answers one request at a time.
 - Trigger, phase and attribute filter matching: removed; documents match on resource type and action only.
 - Subject-based evaluation: removed; the subject is rule input from the security context, not a matching dimension.
-- Dry-run and version comparison tooling: removed; shadow mode is the way to try a rule.
+- Version comparison tooling: removed; shadow mode is the way to try a rule. Dry runs of the publish operations
+  (`cpt-cf-policy-engine-fr-publish-dry-run`) check whether an operation would be accepted, not what a rule denies.
 - Staged rollout beyond shadow mode: removed; an assignment enforces or runs in shadow.
 - Any decision API other than the admission-control plugin: removed; no decision endpoint exists.
 - `cpt-cf-policy-engine-fr-administration-audit`: moved to p2; full trail awaits the platform Audit gear, attribution

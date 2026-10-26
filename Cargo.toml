@@ -50,8 +50,6 @@ debug = true
 
 [workspace]
 members = [
-    "gears/system/durable-execution/durable-execution",
-    "gears/system/durable-execution/durable-execution-sdk",
     "apps/cf-gears-example-server",
     "apps/cf-gears-flight-control",
     "tools/gts-analyze",
@@ -82,6 +80,7 @@ members = [
     "libs/toolkit-stable-hash",
     "libs/toolkit-transport-grpc",
     "libs/toolkit-taskward",
+    "libs/toolkit-durable-execution",
     "libs/toolkit-utils",
     "libs/ai/toolkit-onnx-runtime",
     "libs/rustls-corecrypto-provider",
@@ -107,6 +106,7 @@ members = [
     "gears/file-storage/file-storage",
     "gears/github-mirror/github-mirror-sdk",
     "gears/github-mirror/github-mirror",
+    "gears/github-mirror/github-mirror-cli",
     "gears/system/account-management/account-management",
     "gears/system/account-management/account-management-sdk",
     "gears/system/account-management/plugins/static-idp-plugin",
@@ -336,8 +336,6 @@ verbose_file_reads = "deny"
 [workspace.dependencies]
 cel-core = "=0.5.1"
 quota-enforcement-engine-cel = { package = "cf-gears-quota-enforcement-engine-cel", version = "0.1.0", path = "gears/system/quota-enforcement/plugins/quota-enforcement-engine-cel" }
-durable-execution = { package = "cf-gears-durable-execution", version = "0.1.0", path = "gears/system/durable-execution/durable-execution" }
-durable-execution-sdk = { package = "cf-gears-durable-execution-sdk", version = "0.1.0", path = "gears/system/durable-execution/durable-execution-sdk" }
 apalis = { version = "=1.0.0-rc.10", default-features = false, features = ["tracing", "limit"] }
 apalis-core = "=1.0.0-rc.10"
 # Keep SQLx runtime/TLS settings in the workspace. The adapter's default
@@ -350,7 +348,7 @@ toolkit-trace-context = { package = "cf-gears-toolkit-trace-context", version = 
 toolkit-http-middleware = { package = "cf-gears-toolkit-http-middleware", version = "0.3.2", path = "libs/toolkit-http-middleware" }
 toolkit-gateway = { package = "cf-gears-toolkit-gateway", version = "0.2.8", path = "libs/toolkit-gateway" }
 toolkit-k8s-auth = { package = "cf-gears-toolkit-k8s-auth", version = "0.3.0", path = "libs/toolkit-k8s-auth" }
-toolkit-auth = { package = "cf-gears-toolkit-auth", version = "0.7.11", path = "libs/toolkit-auth" }
+toolkit-auth = { package = "cf-gears-toolkit-auth", version = "0.8.0", path = "libs/toolkit-auth" }
 toolkit-canonical-errors = { package = "cf-gears-toolkit-canonical-errors", version = "0.9.5", path = "libs/toolkit-canonical-errors" }
 toolkit-canonical-errors-macro = { package = "cf-gears-toolkit-canonical-errors-macro", version = "0.6.4", path = "libs/toolkit-canonical-errors-macro" }
 toolkit-db = { package = "cf-gears-toolkit-db", version = "0.16.2", path = "libs/toolkit-db" }
@@ -370,6 +368,7 @@ toolkit-security = { package = "cf-gears-toolkit-security", version = "0.11.0", 
 toolkit-stable-hash = { package = "cf-gears-toolkit-stable-hash", version = "0.1.0", path = "libs/toolkit-stable-hash" }
 toolkit-transport-grpc = { package = "cf-gears-toolkit-transport-grpc", version = "0.9.0", path = "libs/toolkit-transport-grpc" }
 toolkit-taskward = { package = "cf-gears-toolkit-taskward", version = "0.1.0", path = "libs/toolkit-taskward" }
+toolkit-durable-execution = { package = "cf-gears-toolkit-durable-execution", version = "0.1.0", path = "libs/toolkit-durable-execution" }
 toolkit-utils = { package = "cf-gears-toolkit-utils", version = "0.7.2", path = "libs/toolkit-utils" }
 toolkit-onnx-runtime = { package = "cf-gears-toolkit-onnx-runtime", version = "0.1.0", path = "libs/ai/toolkit-onnx-runtime" }
 rustls-corecrypto-provider = { package = "cf-gears-rustls-corecrypto-provider", version = "0.1.3", path = "libs/rustls-corecrypto-provider" }
@@ -797,7 +796,7 @@ inventory = "0.3"
 
 # File system utilities
 tempfile = "3"
-dirs = "6"
+dirs = "7"
 
 # Decimal handling
 bigdecimal = "0.4"
@@ -908,9 +907,9 @@ jsonschema = { version = "0.40", default-features = false }
 walkdir = "2.5"
 
 # GTS library — published on crates.io.
-gts-id = "0.12.1"
-gts = "0.12.1"
-gts-macros = "0.12.1"
+gts-id = "0.16.1"
+gts = "0.16.1"
+gts-macros = "0.16.1"
 
 license-resolver-sdk = { package = "cf-gears-license-resolver-sdk", version = "0.1.4", path = "gears/system/license-resolver/license-resolver-sdk" }
 license-resolver = { package = "cf-gears-license-resolver", version = "0.1.5", path = "gears/system/license-resolver/license-resolver" }

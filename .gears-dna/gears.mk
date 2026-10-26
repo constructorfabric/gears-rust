@@ -148,7 +148,7 @@ endef
 ifndef GITHUB_ACTIONS
 define check_tool_version
     @cargo gears tools check-version $(1) '$(2)' >/dev/null 2>&1 \
-	|| (echo "ERROR: $(1) $(2) is required. Run 'cargo install $(1)' to install/upgrade." && exit 1)
+	|| (echo "ERROR: $(1) $(2) is required. Run: cargo install $(1) --version '$(2)' to install/upgrade." && exit 1)
 endef
 else
 check_tool_version = @true

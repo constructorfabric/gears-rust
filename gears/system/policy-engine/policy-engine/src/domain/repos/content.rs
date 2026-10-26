@@ -32,6 +32,32 @@ pub struct ActivationOutcome {
     pub superseded: Option<VersionId>,
 }
 
+/// Which assignments a caller sees: the rule of
+/// [`AssignmentRepository::list_page`]. A row is visible when either
+///
+/// - the caller administers it: its bundle is within `read`, its target in
+///   `subtree` and its owner in `reaching`; or
+/// - it is dormant at a tenant the caller may withdraw it from: its target
+///   is in `withdrawable` and its owner is not in `reaching`, so the owner
+///   does not reach the target with barriers respected.
+#[domain_model]
+#[derive(Debug, Clone)]
+pub struct AssignmentVisibility {
+    /// The caller's read scope, applied to the row's bundle (assignments
+    /// are read as content of their bundle); `None` when read is not
+    /// granted.
+    pub read: Option<AccessScope>,
+    /// The caller's tenant and all its descendants, barriers ignored.
+    pub subtree: Vec<Uuid>,
+    /// The tenants on the caller's side of every barrier: the descendants
+    /// it reaches and the ancestors that reach it, barriers respected, and
+    /// its own tenant.
+    pub reaching: Vec<Uuid>,
+    /// Tenants the caller reaches with barriers respected on whose content
+    /// it holds publish.
+    pub withdrawable: Vec<Uuid>,
+}
+
 // ---------------------------------------------------------------------------
 // Ports
 // ---------------------------------------------------------------------------
@@ -240,6 +266,37 @@ pub trait AssignmentRepository: Send + Sync {
         scope: &AccessScope,
         id: AssignmentId,
     ) -> Result<Option<Assignment>, RepoError>;
+
+    /// Whether [`Self::insert`] under `scope` would admit `assignment` itself:
+    /// the scope's check of the row about to be written, decided in memory.
+    /// Writes nothing.
+    ///
+    /// # Errors
+    ///
+    /// `Database` for a scope the check cannot evaluate.
+    fn insertable(&self, scope: &AccessScope, assignment: &Assignment) -> Result<bool, RepoError>;
+
+    /// Whether `bundle_id` is assigned to `tenant_id` within `scope`.
+    async fn exists_for<C: DBRunner>(
+        &self,
+        runner: &C,
+        scope: &AccessScope,
+        bundle_id: BundleId,
+        tenant_id: Uuid,
+    ) -> Result<bool, RepoError>;
+
+    /// One `OData` page of the assignments `visibility` admits.
+    ///
+    /// # Errors
+    ///
+    /// `Query` for a refused filter, order, cursor or limit; `TooLarge` when
+    /// the visibility sets would bind more values than the backend accepts.
+    async fn list_page<C: DBRunner>(
+        &self,
+        runner: &C,
+        visibility: &AssignmentVisibility,
+        query: &ODataQuery,
+    ) -> Result<Page<Assignment>, RepoError>;
 
     /// Sets the `enforce` flag, `updated_at = at` and `updated_by = actor`.
     ///

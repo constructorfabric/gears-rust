@@ -1,142 +1,78 @@
 use std::fmt;
 use std::sync::Arc;
 
-use arc_swap::ArcSwap;
-
 use super::config::OAuthClientConfig;
 use super::error::TokenError;
 use super::source::OAuthTokenSource;
 use super::token_watcher::{TokenWatcher, WatcherConfig};
 use toolkit_utils::SecretString;
 
-/// Internal state holding the live watcher.
-///
-/// Wrapped in `Arc<ArcSwap<_>>` so that [`Token::invalidate`] can atomically
-/// swap in a replacement without blocking concurrent [`Token::get`] calls.
-struct TokenInner {
-    watcher: TokenWatcher,
-}
-
-/// Handle for obtaining `OAuth2` bearer tokens.
-///
-/// Internally drives a [`token_watcher::TokenWatcher`] for background refresh
-/// and exposes lock-free reads via `ArcSwap` (same pattern as the JWKS key
-/// provider).
-///
-/// `Token` is [`Clone`] + [`Send`] + [`Sync`] — share freely across tasks.
+/// Shared provider for acquisition, caching, refresh and invalidation of bearer tokens.
+/// Clones share one worker. Dropping the final handle cancels it; use
+/// [`Self::shutdown`] to also wait for completion.
 #[derive(Clone)]
-pub struct Token {
-    inner: Arc<ArcSwap<TokenInner>>,
-    source_factory: Arc<dyn Fn() -> Result<OAuthTokenSource, TokenError> + Send + Sync>,
-    watcher_config: Arc<WatcherConfig>,
+pub struct TokenProvider {
+    inner: Arc<TokenWatcher>,
 }
 
-impl fmt::Debug for Token {
+impl fmt::Debug for TokenProvider {
+    /// Omit credentials and cached bearer values.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Token").finish_non_exhaustive()
+        f.debug_struct("TokenProvider").finish_non_exhaustive()
     }
 }
 
-impl Token {
-    /// Create a new token handle and start background refresh.
-    ///
-    /// This performs an initial token fetch — if the token endpoint is
-    /// unreachable or returns an error, `new` will fail immediately.
+impl TokenProvider {
+    /// Validate configuration and create an idle provider without network requests.
+    /// Call [`Self::get`] during startup when an initial token is required.
     ///
     /// # Errors
-    ///
-    /// Returns [`TokenError::ConfigError`] if the config is invalid.
-    /// Returns [`TokenError::Http`] if the initial token fetch fails.
-    pub async fn new(mut config: OAuthClientConfig) -> Result<Self, TokenError> {
+    /// Returns configuration/client construction errors, including `ConfigError`
+    /// when there is no active Tokio runtime.
+    #[allow(clippy::needless_pass_by_value)] // Consume the credential configuration.
+    pub fn new(config: OAuthClientConfig) -> Result<Self, TokenError> {
+        tokio::runtime::Handle::try_current().map_err(|_| {
+            TokenError::ConfigError("TokenProvider::new requires an active Tokio runtime".into())
+        })?;
         config.validate()?;
-
-        // Resolve issuer_url → token_endpoint via OIDC discovery (one-time).
-        if let Some(issuer_url) = config.issuer_url.take() {
-            let http_config = config
-                .http_config
-                .clone()
-                .unwrap_or_else(toolkit_http::HttpClientConfig::token_endpoint);
-            let client = toolkit_http::HttpClientBuilder::with_config(http_config)
-                .build()
-                .map_err(|e| {
-                    TokenError::Http(crate::http_error::format_http_error(&e, "OIDC discovery"))
-                })?;
-            let resolved = super::discovery::discover_token_endpoint(&client, &issuer_url).await?;
-            config.token_endpoint = Some(resolved);
-        }
-
-        let watcher_config = Arc::new(WatcherConfig::new(
-            config.jitter_max,
-            config.min_refresh_period,
-        )?);
-
+        let policy = WatcherConfig::new(config.jitter_max, config.min_refresh_period)?;
         let source = OAuthTokenSource::new(&config)?;
-        let watcher = spawn_watcher(source, &watcher_config).await?;
-
-        let source_factory: Arc<dyn Fn() -> Result<OAuthTokenSource, TokenError> + Send + Sync> =
-            Arc::new(move || OAuthTokenSource::new(&config));
-
         Ok(Self {
-            inner: Arc::new(ArcSwap::from_pointee(TokenInner { watcher })),
-            source_factory,
-            watcher_config,
+            inner: Arc::new(TokenWatcher::new(source, policy)),
         })
     }
 
-    /// Get the current bearer token.
+    /// Return a valid cached token or await one shared acquisition attempt.
+    /// Initial acquisition starts on first use. During backoff, callers await
+    /// the next permitted attempt. Cancelling a caller only cancels its wait;
+    /// shared acquisition continues. Callers may apply their own timeout.
     ///
-    /// This is a lock-free read from the `ArcSwap`-cached watcher — it never
-    /// blocks on a network call.  The underlying watcher refreshes the token in
-    /// the background before it expires.
-    ///
-    /// The returned [`SecretString`] wraps the raw access-token value so it is
-    /// not accidentally logged.
+    /// A success invalidated or expired before delivery waits for replacement.
     ///
     /// # Errors
-    ///
-    /// Returns [`TokenError::Unavailable`] if the cached token has expired
-    /// (the background watcher has not yet refreshed it).
-    pub fn get(&self) -> Result<SecretString, TokenError> {
-        let guard = self.inner.load();
-        let cached = guard.watcher.valid_token()?;
-        let raw = cached.access_token();
-        Ok(SecretString::new(raw))
+    /// Returns the observed attempt's error or [`TokenError::Shutdown`] once shutdown begins.
+    pub async fn get(&self) -> Result<SecretString, TokenError> {
+        self.inner.get().await
     }
 
-    /// Force-replace the internal watcher with a freshly-spawned one.
+    /// Discard the cached token and wait for its replacement.
+    /// Concurrent invalidations and gets share acquisition. A failed replacement
+    /// does not restore the discarded token. An already pending attempt keeps
+    /// its retry schedule; invalidation does not bypass backoff on an empty cache.
     ///
-    /// Use this after receiving a 401 from a downstream service to immediately
-    /// discard a potentially revoked token.
-    ///
-    /// If recreating the source or the initial token fetch fails, a warning is
-    /// logged and the existing watcher is left in place.
-    pub async fn invalidate(&self) {
-        let source = match (self.source_factory)() {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::warn!("OAuth2 token invalidation: failed to create source: {e}");
-                return;
-            }
-        };
-
-        let watcher = match spawn_watcher(source, &self.watcher_config).await {
-            Ok(w) => w,
-            Err(e) => {
-                tracing::warn!("OAuth2 token invalidation: initial fetch failed: {e}");
-                return;
-            }
-        };
-
-        self.inner.store(Arc::new(TokenInner { watcher }));
+    /// # Errors
+    /// Returns the replacement attempt's error or [`TokenError::Shutdown`].
+    pub async fn invalidate(&self) -> Result<(), TokenError> {
+        self.inner.invalidate().await
     }
-}
 
-/// Spawn a [`TokenWatcher`] from the given source and config.
-async fn spawn_watcher(
-    source: OAuthTokenSource,
-    config: &WatcherConfig,
-) -> Result<TokenWatcher, TokenError> {
-    TokenWatcher::spawn(source, config.clone()).await
+    /// Permanently stop this provider and all clones, waking waiters with
+    /// [`TokenError::Shutdown`], and wait for acquisition/refresh to finish stopping.
+    /// Repeated/concurrent calls are safe; cancelling one shutdown wait does not
+    /// undo cancellation or prevent another caller from joining the task.
+    pub async fn shutdown(&self) {
+        self.inner.shutdown().await;
+    }
 }
 
 #[cfg(test)]
@@ -172,30 +108,34 @@ mod tests {
     #[test]
     fn token_is_send_sync_clone() {
         fn assert_traits<T: Send + Sync + Clone>() {}
-        assert_traits::<Token>();
+        assert_traits::<TokenProvider>();
     }
 
     // -- new ------------------------------------------------------------------
 
+    /// Valid configuration creates an idle provider without an initial exchange.
     #[tokio::test]
     async fn new_with_valid_config() {
         let server = MockServer::start();
 
-        let _mock = server.mock(|when, then| {
+        let mock = server.mock(|when, then| {
             when.method(POST).path("/token");
             then.status(200)
                 .header("content-type", "application/json")
                 .body(token_json("tok-new", 3600));
         });
 
-        let token = Token::new(test_config(&server)).await;
+        let token = TokenProvider::new(test_config(&server));
         assert!(
             token.is_ok(),
-            "Token::new() should succeed: {:?}",
-            token.err()
+            "TokenProvider::new() should succeed: {:?}",
+            token.as_ref().err()
         );
+        tokio::task::yield_now().await;
+        mock.assert_calls(0);
     }
 
+    /// Invalid configuration fails synchronously before acquisition starts.
     #[tokio::test]
     async fn new_validates_config() {
         let cfg = OAuthClientConfig {
@@ -205,7 +145,7 @@ mod tests {
             client_secret: SecretString::new("test-secret"),
             ..Default::default()
         };
-        let err = Token::new(cfg).await.unwrap_err();
+        let err = TokenProvider::new(cfg).unwrap_err();
         assert!(
             matches!(err, TokenError::ConfigError(ref msg) if msg.contains("mutually exclusive")),
             "expected ConfigError, got: {err}"
@@ -214,6 +154,7 @@ mod tests {
 
     // -- get ------------------------------------------------------------------
 
+    /// Async acquisition returns an explicitly exposed secret value.
     #[tokio::test]
     async fn get_returns_secret_string() {
         let server = MockServer::start();
@@ -225,16 +166,18 @@ mod tests {
                 .body(token_json("tok-get-test", 3600));
         });
 
-        let token = Token::new(test_config(&server)).await.unwrap();
-        let secret = token.get().unwrap();
+        let token = TokenProvider::new(test_config(&server)).unwrap();
+        token.get().await.unwrap();
+        let secret = token.get().await.unwrap();
 
         assert_eq!(secret.expose(), "tok-get-test");
     }
 
     // -- invalidate -----------------------------------------------------------
 
+    /// Invalidation fetches a replacement through the shared worker.
     #[tokio::test]
-    async fn invalidate_creates_new_watcher() {
+    async fn invalidate_fetches_replacement() {
         let server = MockServer::start();
 
         let mock = server.mock(|when, then| {
@@ -244,17 +187,19 @@ mod tests {
                 .body(token_json("tok-inv", 3600));
         });
 
-        let token = Token::new(test_config(&server)).await.unwrap();
+        let token = TokenProvider::new(test_config(&server)).unwrap();
+        token.get().await.unwrap();
         assert_eq!(mock.calls(), 1, "initial fetch");
 
-        token.invalidate().await;
+        token.invalidate().await.unwrap();
 
-        // invalidate spawns a new watcher which fetches a fresh token
+        // invalidate uses the shared worker to fetch a fresh token
         assert_eq!(mock.calls(), 2, "after invalidate");
     }
 
     // -- concurrency ----------------------------------------------------------
 
+    /// Cloned providers can read cached credentials concurrently.
     #[tokio::test]
     async fn concurrent_get_no_deadlock() {
         let server = MockServer::start();
@@ -266,15 +211,16 @@ mod tests {
                 .body(token_json("tok-conc", 3600));
         });
 
-        let token = Token::new(test_config(&server)).await.unwrap();
+        let token = TokenProvider::new(test_config(&server)).unwrap();
+        token.get().await.unwrap();
 
         let t1 = {
             let token = token.clone();
-            tokio::spawn(async move { token.get() })
+            tokio::spawn(async move { token.get().await })
         };
         let t2 = {
             let token = token.clone();
-            tokio::spawn(async move { token.get() })
+            tokio::spawn(async move { token.get().await })
         };
 
         let (r1, r2) = tokio::join!(t1, t2);
@@ -284,6 +230,7 @@ mod tests {
 
     // -- OIDC discovery -------------------------------------------------------
 
+    /// First acquisition resolves the token endpoint from the issuer.
     #[tokio::test]
     async fn new_with_issuer_url_discovery() {
         let server = MockServer::start();
@@ -315,11 +262,13 @@ mod tests {
             ..Default::default()
         };
 
-        let token = Token::new(cfg).await.unwrap();
-        let secret = token.get().unwrap();
+        let token = TokenProvider::new(cfg).unwrap();
+        token.get().await.unwrap();
+        let secret = token.get().await.unwrap();
         assert_eq!(secret.expose(), "tok-discovered");
     }
 
+    /// Replacing credentials reuses the successful discovery result.
     #[tokio::test]
     async fn discovery_not_repeated_on_invalidate() {
         let server = MockServer::start();
@@ -351,12 +300,13 @@ mod tests {
             ..Default::default()
         };
 
-        let token = Token::new(cfg).await.unwrap();
+        let token = TokenProvider::new(cfg).unwrap();
+        token.get().await.unwrap();
         assert_eq!(discovery_mock.calls(), 1, "discovery: initial");
         assert_eq!(token_mock.calls(), 1, "token: initial");
 
         // Invalidate should re-fetch the token but NOT re-run discovery.
-        token.invalidate().await;
+        token.invalidate().await.unwrap();
 
         assert_eq!(
             discovery_mock.calls(),
@@ -368,6 +318,7 @@ mod tests {
 
     // -- debug safety ---------------------------------------------------------
 
+    /// Debug output omits credentials and bearer values.
     #[tokio::test]
     async fn debug_does_not_reveal_tokens() {
         let server = MockServer::start();
@@ -379,7 +330,8 @@ mod tests {
                 .body(token_json("super-secret-tok", 3600));
         });
 
-        let token = Token::new(test_config(&server)).await.unwrap();
+        let token = TokenProvider::new(test_config(&server)).unwrap();
+        token.get().await.unwrap();
         let dbg = format!("{token:?}");
         assert!(
             !dbg.contains("super-secret-tok"),

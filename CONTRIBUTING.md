@@ -173,6 +173,14 @@ make e2e-local SUITE=file-parser
 
 Note: CI workflows may not run for PRs that only touch `*.md` files or `docs/**` due to path filters.
 
+PRs run the unit tests on Ubuntu only. macOS and Windows run nightly
+(`.github/workflows/macos-windows-tests.yml`), and a failure opens a tracking issue.
+
+If your change touches platform-specific code (`cfg(windows)`, `cfg(target_os = "macos")`,
+file paths, line endings, file locking), run those tests on your branch before merging:
+Actions > macOS and Windows tests > Run workflow > pick your branch. If you can't run
+workflows in this repo, run it in your fork.
+
 Aim for high test coverage:
 - **Unit tests**: Test individual functions and methods
 - **Integration tests**: Test gear interactions

@@ -35,7 +35,7 @@ async fn a_gzipped_entry_round_trips_through_the_database() {
 
     assert!(
         cache
-            .get(&AccessScope::for_tenant(tenant), &key)
+            .get(&AccessScope::for_tenant(tenant), tenant, &key)
             .await
             .unwrap()
             .is_none()
@@ -46,7 +46,7 @@ async fn a_gzipped_entry_round_trips_through_the_database() {
         .await
         .unwrap();
     let loaded = cache
-        .get(&AccessScope::for_tenant(tenant), &key)
+        .get(&AccessScope::for_tenant(tenant), tenant, &key)
         .await
         .unwrap()
         .expect("entry");
@@ -65,7 +65,7 @@ async fn an_uncompressed_entry_round_trips_too() {
         .unwrap();
     assert_eq!(
         cache
-            .get(&AccessScope::for_tenant(tenant), &key)
+            .get(&AccessScope::for_tenant(tenant), tenant, &key)
             .await
             .unwrap(),
         Some(entry())
@@ -77,6 +77,7 @@ async fn entries_do_not_cross_tenants() {
     let cache = store(Compression::Gzip).await;
     let key = CacheKey::compute("GET", URL, "application/json");
     let owner = Uuid::new_v4();
+    let stranger = Uuid::new_v4();
 
     cache
         .put(&AccessScope::for_tenant(owner), owner, &key, URL, entry())
@@ -84,7 +85,7 @@ async fn entries_do_not_cross_tenants() {
         .unwrap();
     assert!(
         cache
-            .get(&AccessScope::for_tenant(Uuid::new_v4()), &key)
+            .get(&AccessScope::for_tenant(stranger), stranger, &key)
             .await
             .unwrap()
             .is_none(),
@@ -92,7 +93,7 @@ async fn entries_do_not_cross_tenants() {
     );
     assert!(
         cache
-            .get(&AccessScope::for_tenant(owner), &key)
+            .get(&AccessScope::for_tenant(owner), owner, &key)
             .await
             .unwrap()
             .is_some()
@@ -132,6 +133,7 @@ async fn clearing_by_prefix_drops_only_the_matching_repository() {
     let removed = cache
         .clear(
             &AccessScope::for_tenant(tenant),
+            tenant,
             &["https://api.github.com/repos/acme/widget"],
         )
         .await
@@ -139,14 +141,14 @@ async fn clearing_by_prefix_drops_only_the_matching_repository() {
     assert_eq!(removed, 1);
     assert!(
         cache
-            .get(&AccessScope::for_tenant(tenant), &widget)
+            .get(&AccessScope::for_tenant(tenant), tenant, &widget)
             .await
             .unwrap()
             .is_none()
     );
     assert!(
         cache
-            .get(&AccessScope::for_tenant(tenant), &gadget)
+            .get(&AccessScope::for_tenant(tenant), tenant, &gadget)
             .await
             .unwrap()
             .is_some(),
@@ -181,12 +183,12 @@ async fn clearing_a_prefix_stops_at_a_path_or_query_boundary() {
         cache.put(&scope, tenant, &key, url, entry()).await.unwrap();
     }
 
-    let removed = cache.clear(&scope, &[prefix]).await.unwrap();
+    let removed = cache.clear(&scope, tenant, &[prefix]).await.unwrap();
     assert_eq!(removed, 3, "the prefix itself, its child and its query");
 
     for (url, cleared) in urls {
         let key = CacheKey::compute("GET", url, "application/json");
-        let found = cache.get(&scope, &key).await.unwrap().is_some();
+        let found = cache.get(&scope, tenant, &key).await.unwrap().is_some();
         assert_eq!(
             found,
             !cleared,
@@ -218,7 +220,7 @@ async fn a_metacharacter_in_a_prefix_matches_only_itself() {
         cache.put(&scope, tenant, &key, url, entry()).await.unwrap();
     }
 
-    let removed = cache.clear(&scope, &[prefix]).await.unwrap();
+    let removed = cache.clear(&scope, tenant, &[prefix]).await.unwrap();
     assert_eq!(
         removed, 1,
         "only the repository actually named in the prefix"
@@ -226,7 +228,7 @@ async fn a_metacharacter_in_a_prefix_matches_only_itself() {
 
     for (url, cleared) in urls {
         let key = CacheKey::compute("GET", url, "application/json");
-        let found = cache.get(&scope, &key).await.unwrap().is_some();
+        let found = cache.get(&scope, tenant, &key).await.unwrap().is_some();
         assert_eq!(
             found,
             !cleared,
@@ -251,7 +253,7 @@ async fn a_row_keeps_the_compression_it_was_written_with() {
         .await
         .unwrap();
     assert_eq!(
-        reader.get(&scope, &key).await.unwrap(),
+        reader.get(&scope, tenant, &key).await.unwrap(),
         Some(entry()),
         "the row records gzip, so a cache configured for none still decodes it"
     );
@@ -285,7 +287,7 @@ async fn a_tampered_body_is_a_miss_not_an_error() {
         .unwrap();
 
     assert_eq!(
-        cache.get(&scope, &key).await.unwrap(),
+        cache.get(&scope, tenant, &key).await.unwrap(),
         None,
         "a body that fails its integrity check is dropped, not surfaced"
     );
@@ -310,12 +312,12 @@ async fn a_clear_takes_every_prefix_it_is_given_and_an_empty_list_takes_none() {
         cache.put(&scope, tenant, &key, url, entry()).await.unwrap();
     }
 
-    let removed = cache.clear(&scope, &[]).await.unwrap();
+    let removed = cache.clear(&scope, tenant, &[]).await.unwrap();
     assert_eq!(removed, 0, "a clear with no prefix must remove nothing");
     for url in urls {
         let key = CacheKey::compute("GET", url, "application/json");
         assert!(
-            cache.get(&scope, &key).await.unwrap().is_some(),
+            cache.get(&scope, tenant, &key).await.unwrap().is_some(),
             "{url} must survive a clear that named nothing"
         );
     }
@@ -323,6 +325,7 @@ async fn a_clear_takes_every_prefix_it_is_given_and_an_empty_list_takes_none() {
     let removed = cache
         .clear(
             &scope,
+            tenant,
             &[
                 "https://api.github.com/repos/acme/widget",
                 "https://api.github.com/repos/acme/spanner",
@@ -334,12 +337,19 @@ async fn a_clear_takes_every_prefix_it_is_given_and_an_empty_list_takes_none() {
 
     let survivor = CacheKey::compute("GET", urls[1], "application/json");
     assert!(
-        cache.get(&scope, &survivor).await.unwrap().is_some(),
+        cache
+            .get(&scope, tenant, &survivor)
+            .await
+            .unwrap()
+            .is_some(),
         "the repository no prefix named must survive"
     );
     for url in [urls[0], urls[2]] {
         let key = CacheKey::compute("GET", url, "application/json");
-        assert!(cache.get(&scope, &key).await.unwrap().is_none(), "{url}");
+        assert!(
+            cache.get(&scope, tenant, &key).await.unwrap().is_none(),
+            "{url}"
+        );
     }
 }
 
@@ -375,7 +385,7 @@ async fn a_row_whose_compression_column_lies_is_a_miss_not_an_error() {
             .unwrap();
 
         assert_eq!(
-            cache.get(&scope, &key).await.unwrap(),
+            cache.get(&scope, tenant, &key).await.unwrap(),
             None,
             "a body written {wrote_with:?} and stamped {stamped} must read as a miss"
         );
@@ -412,9 +422,48 @@ async fn a_compression_value_this_build_does_not_know_is_refused() {
         .await
         .unwrap();
 
-    let outcome = cache.get(&scope, &key).await;
+    let outcome = cache.get(&scope, tenant, &key).await;
     assert!(
         outcome.is_err() || outcome.is_ok_and(|entry| entry.is_none()),
         "an unknown compression must not be served as a body"
+    );
+}
+
+#[tokio::test]
+async fn size_sums_the_stored_bodies_below_the_prefixes() {
+    let cache = store(Compression::None).await;
+    let tenant = Uuid::new_v4();
+    let scope = AccessScope::for_tenant(tenant);
+    let widget = "https://api.github.com/repos/acme/widget";
+    let other = "https://api.github.com/repos/acme/other";
+    for (url, body) in [
+        (format!("{widget}/issues"), "0123456789"),
+        (format!("{widget}/pulls?page=2"), "01234"),
+        (format!("{other}/issues"), "0123456789012345678901234567890"),
+    ] {
+        let key = CacheKey::compute("GET", &url, "application/json");
+        let stored = CachedResponse {
+            body: body.to_owned(),
+            etag: None,
+            last_modified: None,
+            next_page: None,
+        };
+        cache.put(&scope, tenant, &key, &url, stored).await.unwrap();
+    }
+
+    assert_eq!(cache.size(&scope, tenant, &[widget]).await.unwrap(), 15);
+    assert_eq!(cache.size(&scope, tenant, &[other]).await.unwrap(), 31);
+    assert_eq!(
+        cache.size(&scope, tenant, &[widget, other]).await.unwrap(),
+        46
+    );
+    assert_eq!(cache.size(&scope, tenant, &[]).await.unwrap(), 0);
+    let stranger = Uuid::new_v4();
+    assert_eq!(
+        cache
+            .size(&AccessScope::for_tenant(stranger), stranger, &[widget])
+            .await
+            .unwrap(),
+        0
     );
 }

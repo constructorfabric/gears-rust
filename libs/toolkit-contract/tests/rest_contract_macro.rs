@@ -106,6 +106,13 @@ fn binding_function_is_named_in_snake_case() {
 }
 
 #[test]
+fn client_binding_accessor_reuses_one_ir_instance() {
+    let first = __billing_api_rest_http_binding();
+    let second = __billing_api_rest_http_binding();
+    assert!(std::ptr::eq(first, second));
+}
+
+#[test]
 fn post_method_emits_body_binding() {
     let binding = billing_api_rest_http_binding();
     let charge = binding.find_method("charge").expect("method present");

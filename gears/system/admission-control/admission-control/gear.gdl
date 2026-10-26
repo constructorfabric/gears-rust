@@ -1,0 +1,46 @@
+gdl_version = "1.0"
+
+# Every GDL field: https://github.com/constructorfabric/gearbox/blob/main/docs/gdl.md
+#
+# Gearbox product metadata for the admission-control gear.
+#
+# Projected from #[toolkit::gear] in src/gear.rs: id, runtime_caps (stateful)
+# and lifecycle; deps below is an exact checked mirror (GBX0214).
+
+gear(
+    deps = ["types-registry"],
+    source = git(url = "https://github.com/constructorfabric/gears-rust", path = "gears/system/admission-control/admission-control"),
+    maturity = "experimental",
+    implementation = "in-progress",
+    name = "Admission Control",
+    description = "Admission gate for platform operations, backed by one optional pluggable admission engine.",
+    category = "core-platform-integration",
+    visibility = "internal",
+
+    package = cargo(
+        crate_name = "cf-gears-admission-control",
+        lib = "admission_control",
+        path = ".",
+    ),
+
+    sdk = cargo(
+        crate_name = "cf-gears-admission-control-sdk",
+        lib = "admission_control_sdk",
+        path = "../admission-control-sdk",
+    ),
+
+    # The engine point, one optional engine per installation (policy-engine is
+    # the default). Selected by `engine.vendor`.
+    extension_points = [
+        extension_point(
+            "cf.core.admission_control.engine.v1~",
+            trait = "AdmissionEnginePluginClientV1",
+            selector = "engine.vendor",
+        ),
+    ],
+
+    config_schema = config(exposes = ["engine", "engine_timeout_ms"]),
+
+    # The crate has no [features] section.
+    cargo_features = [],
+)

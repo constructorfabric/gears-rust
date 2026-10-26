@@ -22,7 +22,7 @@
             },
             "subject_type": {
               "type": "string",
-              "format": "gts-type-id",
+              "x-gts-type-ref": "gts.*",
               "description": "GTS type of the acting subject, e.g. gts.cf.core.security.subject_user.v1~. Optional, matching SecurityContext."
             }
           },

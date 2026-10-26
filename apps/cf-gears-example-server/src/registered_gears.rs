@@ -11,8 +11,6 @@ use authn_resolver as _;
 use authz_resolver as _;
 #[cfg(feature = "credstore")]
 use credstore as _;
-#[cfg(feature = "durable-execution")]
-use durable_execution as _;
 #[cfg(all(feature = "file-parser", not(feature = "oop-example")))]
 use file_parser as _;
 #[cfg(feature = "file-storage")]

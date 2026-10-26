@@ -9,7 +9,8 @@ use quota_enforcement_sdk::{
 };
 use toolkit_security::AccessScope;
 
-use super::super::harness_tests::{Harness, attribution, debit, type_id};
+use super::super::harness_tests::{Harness, attribution, debit, evaluation_limits, type_id};
+use super::Operations;
 use crate::domain::error::{DomainError, ResourceKind};
 use crate::domain::ports::metric_registry::MetricMode;
 use crate::domain::ports::metrics::{DenialReason, OperationKind};
@@ -487,6 +488,39 @@ async fn a_preview_resolves_the_same_tier_the_debit_would() {
         planned,
         vec![user],
         "a preview that disagreed with its debit would be worse than none"
+    );
+}
+
+#[tokio::test]
+async fn a_failed_preview_names_the_engine_that_failed() {
+    let h = Harness::new().await;
+    h.quota(Some(1_000)).await;
+    h.tenant_quota(Some(50)).await;
+    let operations = Operations {
+        evaluation: quota_enforcement_sdk::engine::EvaluationLimits {
+            cost_limit: std::num::NonZeroU64::new(1).expect("nonzero"),
+            ..evaluation_limits()
+        },
+        ..h.operations()
+    };
+
+    let error = operations
+        .preview(
+            &ctx(),
+            PreviewRequest {
+                attribution: attribution(),
+                amount: 10,
+            },
+        )
+        .await
+        .expect_err("two quotas cost more than the budget allows");
+
+    assert!(
+        matches!(
+            &error,
+            DomainError::EngineCostExceeded { engine_id } if engine_id == "most-restrictive-wins"
+        ),
+        "{error:?}"
     );
 }
 

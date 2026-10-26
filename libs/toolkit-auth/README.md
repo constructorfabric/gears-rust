@@ -9,26 +9,25 @@ The `cf-gears-toolkit-auth` crate provides:
 - **JWT / JWKS** — `KeyProvider` trait, `JwksKeyProvider` with background key refresh, `ValidationConfig`, standard claim constants
 - **Token validation** — `TokenValidator` trait, `ClaimsError` / `AuthError` error types
 - **Auth configuration** — `AuthConfig` (issuers, audiences, leeway, JWKS endpoint)
-- **Outbound OAuth2 client credentials** — `Token` handle with proactive background refresh and on-demand invalidation, `OAuthClientConfig`, `BearerAuthLayer` (tower), `BearerAuthAutoRefreshLayer` (reactive refresh on 401, port of go-appkit's `AuthBearerRoundTripper`), `HttpClientBuilderExt` for `toolkit-http` integration
+- **Outbound OAuth2 client credentials** — `TokenProvider` handle with proactive background refresh and on-demand invalidation, `OAuthClientConfig`, `BearerAuthLayer` (tower), `BearerAuthAutoRefreshLayer` (reactive refresh on 401, port of go-appkit's `AuthBearerRoundTripper`), `HttpClientBuilderExt` for `toolkit-http` integration
 - **Auth metrics** — `AuthMetrics` trait with `LoggingMetrics` and `NoOpMetrics` implementations
 
 ## Outbound OAuth2 quick start
 
 ```rust
-use toolkit_auth::{HttpClientBuilderExt, OAuthClientConfig, SecretString, Token};
+use toolkit_auth::{HttpClientBuilderExt, OAuthClientConfig, SecretString, TokenProvider};
 use toolkit_http::HttpClientBuilder;
 
-let token = Token::new(OAuthClientConfig {
+let token_provider = TokenProvider::new(OAuthClientConfig {
     token_endpoint: Some("https://idp.example.com/oauth/token".parse()?),
     client_id: "my-service".into(),
     client_secret: SecretString::new("my-secret"),
     scopes: vec!["api.read".into()],
     ..Default::default()
-})
-.await?;
+})?;
 
 let client = HttpClientBuilder::new()
-    .with_bearer_auth(token)
+    .with_bearer_auth(token_provider)
     .build()?;
 
 // Every request gets Authorization: Bearer <token> automatically
@@ -43,13 +42,13 @@ revoked out-of-band by the issuer — those surface only as a 401 from the
 upstream.
 
 `with_bearer_auth_auto_refresh` adds the reactive half: on a 401 response it
-calls `Token::invalidate()`, re-reads the cached token, and replays the
+calls `TokenProvider::invalidate()`, re-reads the cached token, and replays the
 original request once with the refreshed credential. Behavior is a port of
 go-appkit's `AuthBearerRoundTripper`:
 
 - requests that already carry the configured auth header pass through
   untouched (no refresh, no retry);
-- `Token::invalidate()` is throttled per layer instance — default 15 minutes
+- `TokenProvider::invalidate()` is throttled per layer instance — default 15 minutes
   via `toolkit_auth::oauth2::DEFAULT_MIN_INVALIDATION_INTERVAL` — so a burst
   of 401s will not hammer the token endpoint;
 - if the refreshed token equals the previous value, or if the invalidate
@@ -59,17 +58,17 @@ go-appkit's `AuthBearerRoundTripper`:
 
 ```rust
 use toolkit_auth::{
-    BearerAuthAutoRefreshOpts, HttpClientBuilderExt, OAuthClientConfig, SecretString, Token,
+    BearerAuthAutoRefreshOpts, HttpClientBuilderExt, OAuthClientConfig, SecretString, TokenProvider,
 };
 use toolkit_http::HttpClientBuilder;
 use std::sync::Arc;
 use std::time::Duration;
 
-let token = Token::new(OAuthClientConfig { /* … */ ..Default::default() }).await?;
+let token_provider = TokenProvider::new(OAuthClientConfig { /* … */ ..Default::default() })?;
 
 // Defaults: Authorization header, retry on 401 only, 15-min throttle.
 let client = HttpClientBuilder::new()
-    .with_bearer_auth_auto_refresh(token.clone())
+    .with_bearer_auth_auto_refresh(token_provider.clone())
     .build()?;
 
 // Custom predicate / header / throttle:
@@ -79,7 +78,7 @@ let opts = BearerAuthAutoRefreshOpts {
     header_name: http::header::AUTHORIZATION,
 };
 let custom = HttpClientBuilder::new()
-    .with_bearer_auth_auto_refresh_opts(token, opts)
+    .with_bearer_auth_auto_refresh_opts(token_provider, opts)
     .build()?;
 ```
 
@@ -90,6 +89,61 @@ plain `with_bearer_auth` when the upstream is known not to revoke tokens
 out-of-band.
 
 See `examples/` for more patterns (OIDC discovery, token invalidation, shared token, form auth).
+
+## Acquisition and lifecycle
+
+`TokenProvider::new(config)?` validates configuration and creates an idle provider
+without network requests. It requires an active Tokio runtime. The first
+`get().await` or `invalidate().await` starts acquisition. Both HTTP auth layers
+await `get()` before sending a request, so first use waits for a token.
+
+`get().await` immediately returns a usable cached token, or waits for the current
+or next scheduled attempt and returns its result. Concurrent callers share one
+worker, including through clones. A failed attempt is retained for its waiters;
+later retries cannot overwrite their error. A success invalidated or expired
+before delivery waits for replacement. Cancelling one caller's future stops only
+its wait. Use `tokio::time::timeout` for a caller-owned deadline.
+
+Initial discovery/token failures retry after 1, 2, 4, 8, 16, then at most 30
+seconds. These delays are independent of `min_refresh_period`; request duration
+and transport retries are additional. Once acquisition starts, retries continue
+in the background. After success, the configured refresh schedule and backoff
+apply while a usable token exists. A failed proactive refresh leaves the cached
+token usable until expiry; once expired, retries use the bounded 1–30 second
+acquisition schedule.
+Successful discovery is reused across retries and invalidation.
+
+`invalidate().await?` discards the cached credential immediately and waits for
+replacement. Concurrent invalidations and gets share the pending attempt.
+Failure never restores the invalidated token. If the cache is already empty,
+invalidation respects the pending attempt's backoff.
+
+`shutdown().await` permanently stops the shared provider, cancels pending network
+work and retry sleeps, wakes waiters with `TokenError::Shutdown`, and joins the
+worker. It is safe to call repeatedly or concurrently. Dropping a shutdown future
+does not undo cancellation; another shutdown call can still join. Dropping the
+last provider handle cancels work as a fallback.
+
+To require a token during application startup, call `get().await?` explicitly:
+
+```rust
+let token_provider = TokenProvider::new(config)?;
+token_provider.get().await?; // startup check, including OIDC discovery
+// Pass token_provider.clone() to HTTP clients.
+token_provider.shutdown().await; // at application shutdown
+```
+
+## HTTP errors
+
+Rejected HTTP responses return the non-exhaustive
+`TokenError::HttpStatus { operation, status, target_url, .. }` variant.
+Use `TokenError::status()` to inspect the response status.
+`HttpOperation::{Discovery, TokenRequest}` identifies the failed operation.
+`target_url` identifies the requested endpoint with userinfo, query and fragment
+removed. Response bodies and headers are discarded. Transport failures use
+`TokenError::Http` and have no HTTP response status.
+
+See the [changelog](../../CHANGELOG.md#toolkit-auth-080-migration) for migration instructions.
 
 ## License
 

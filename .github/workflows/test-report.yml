@@ -1,9 +1,9 @@
 name: Test Report
 
-# Publishes the JUnit reports that `CI` (nextest) and `e2e` (pytest) upload as
-# artifacts, as one GitHub Check Run per artifact: failing test names,
-# assertion messages, and annotations on the failing source line (the reports
-# carry file/line -- see tools/scripts/junit_enrich.py).
+# Publishes the JUnit reports uploaded by `CI` and `macOS and Windows tests`
+# (nextest) and `e2e` (pytest). Each report gets its own GitHub check with the
+# failed tests, their messages, and annotations on the failing lines (see
+# tools/scripts/junit_enrich.py).
 #
 # Why a separate workflow: those workflows run on `pull_request`, and a PR from
 # a fork gets a read-only token there, so it cannot create Check Runs. A
@@ -17,7 +17,7 @@ name: Test Report
 
 on:
   workflow_run:
-    workflows: ["CI", "e2e"]
+    workflows: ["CI", "macOS and Windows tests", "e2e"]
     types: [completed]
 
 permissions:
@@ -53,8 +53,10 @@ jobs:
         run: |
           paths=() names=() empty=() missing=()
           shopt -s nullglob
+          # Re-runs retain artifacts with the same name. Download each name
+          # once; gh selects its newest non-expired artifact.
           artifacts=$(gh api --paginate "repos/$REPO/actions/runs/$RUN_ID/artifacts" \
-            --jq '.artifacts[] | select(.expired | not) | .name')
+            --jq '.artifacts[] | select(.expired | not) | .name' | sort -u)
           # Read line by line: an unquoted `for` would glob-expand a name.
           while IFS= read -r artifact; do
             [ -n "$artifact" ] || continue
@@ -80,17 +82,19 @@ jobs:
           done <<< "$artifacts"
           # A producer job that ran (passed or failed) must have uploaded its
           # report; one that was skipped by path filters or cancelled need
-          # not. Keep this map in sync with the upload steps in ci.yml/e2e.yml.
+          # not. Keep this map in sync with the upload steps in ci.yml,
+          # test-suite.yml and e2e.yml. Test Suite jobs call test-suite.yml,
+          # so their names end in ` / nextest`.
           jobs=$(gh api --paginate "repos/$REPO/actions/runs/$RUN_ID/jobs" \
             --jq '.jobs[] | [.name, (.conclusion // "")] | @tsv')
           while IFS=$'\t' read -r job conclusion; do
             case "$job" in
-              "Test Suite (ubuntu-latest)")  expected=rust-tests-Linux ;;
-              "Test Suite (windows-latest)") expected=rust-tests-Windows ;;
-              "Test Suite (macos-latest)")   expected=rust-tests-macOS ;;
-              "Integration tests")           expected=rust-tests-integration ;;
-              e2e)                           expected=e2e-tests-local ;;
-              e2e-docker)                    expected=e2e-tests-docker ;;
+              "Test Suite (ubuntu-latest) / nextest")  expected=rust-tests-Linux ;;
+              "Test Suite (windows-latest) / nextest") expected=rust-tests-Windows ;;
+              "Test Suite (macos-latest) / nextest")   expected=rust-tests-macOS ;;
+              "Integration tests")                     expected=rust-tests-integration ;;
+              e2e)                                     expected=e2e-tests-local ;;
+              e2e-docker)                              expected=e2e-tests-docker ;;
               *) continue ;;
             esac
             case "$conclusion" in success|failure) ;; *) continue ;; esac
@@ -121,7 +125,7 @@ jobs:
       - name: Publish JUnit results
         id: publish
         if: steps.plan.outputs.paths != ''
-        uses: mikepenz/action-junit-report@b7b80d7ac5b1da46d6aaff9fb57ad50d8453bcb3 # v6.6.0
+        uses: mikepenz/action-junit-report@6ef3fdcfcd5f0b5d14df3e659ef19b8c6820f93d # v6.6.1
         with:
           report_paths: ${{ steps.plan.outputs.paths }}
           check_name: ${{ steps.plan.outputs.names }}

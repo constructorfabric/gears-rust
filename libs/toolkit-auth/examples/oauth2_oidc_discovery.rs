@@ -5,18 +5,18 @@
 //!
 //! NOTE: Requires a running IDP. Meant as an API reference, not a runnable demo.
 
-use toolkit_auth::{HttpClientBuilderExt, OAuthClientConfig, SecretString, Token};
+use toolkit_auth::{HttpClientBuilderExt, OAuthClientConfig, SecretString, TokenProvider};
 use toolkit_http::HttpClientBuilder;
 
+/// Demonstrate provider construction and authenticated requests to an external service.
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let token = Token::new(OAuthClientConfig {
+    let token = TokenProvider::new(OAuthClientConfig {
         issuer_url: Some("https://idp.example.com".parse()?),
         client_id: "my-service".into(),
         client_secret: SecretString::new("my-secret"),
         ..Default::default()
-    })
-    .await?;
+    })?;
 
     let client = HttpClientBuilder::new().with_bearer_auth(token).build()?;
 

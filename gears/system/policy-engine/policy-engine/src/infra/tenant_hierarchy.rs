@@ -6,13 +6,13 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use tenant_resolver_sdk::{
-    BarrierMode, GetAncestorsOptions, IsAncestorOptions, TenantId, TenantResolverClient,
-    TenantResolverError,
+    BarrierMode, GetAncestorsOptions, GetDescendantsOptions, IsAncestorOptions, TenantId,
+    TenantResolverClient, TenantResolverError,
 };
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
-use crate::domain::ports::{HierarchyPort, PortError};
+use crate::domain::ports::{HierarchyPort, PortError, Subtree};
 
 fn map_error(err: TenantResolverError) -> PortError {
     match err {
@@ -93,6 +93,36 @@ impl HierarchyPort for TenantResolverHierarchy {
         .await
         .map_err(|_| PortError::Timeout)?
         .map_err(map_error)
+    }
+
+    async fn subtree(&self, ctx: &SecurityContext, root: TenantId) -> Result<Subtree, PortError> {
+        let options = GetDescendantsOptions {
+            status: Vec::new(),
+            barrier_mode: BarrierMode::Ignore,
+            max_depth: None,
+        };
+        let response = tokio::time::timeout(
+            self.timeout,
+            self.client.get_descendants(ctx, root, &options),
+        )
+        .await
+        .map_err(|_| PortError::Timeout)?
+        .map_err(map_error)?;
+        if response.tenant.id != root {
+            return Err(PortError::Unavailable(
+                "tenant resolver answered for a different tenant".to_owned(),
+            ));
+        }
+        let mut descendants = Vec::with_capacity(response.descendants.len());
+        for tenant in &response.descendants {
+            let parent = tenant.parent_id.ok_or_else(|| {
+                PortError::Unavailable(
+                    "tenant resolver returned a descendant without parent".to_owned(),
+                )
+            })?;
+            descendants.push((tenant.id.0, parent.0, tenant.self_managed));
+        }
+        Ok(Subtree::new(root.0, descendants))
     }
 }
 

@@ -1068,7 +1068,7 @@ components:
       properties:
         id:
           type: string
-          x-gts-instance: "gts.cf.core.events.topic.v1~"
+          x-gts-instance-ref: "gts.cf.core.events.topic.v1~"
           description: >-
             GTS instance identifier of the topic, chained under
             `gts.cf.core.events.topic.v1~`.
@@ -1101,8 +1101,8 @@ components:
         topic:
           type: string
           description: >-
-            GTS type identifier of the topic events of this type are published to, ending
-            in `~`.
+            GTS instance identifier of the topic events of this type are published to,
+            chained under `gts.cf.core.events.topic.v1~`.
         description:
           type: ["string", "null"]
         partition_key:

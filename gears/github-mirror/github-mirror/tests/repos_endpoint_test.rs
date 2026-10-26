@@ -196,3 +196,52 @@ async fn list_repos_returns_empty_page_on_a_clean_store() {
     let json = body_json(response).await;
     assert!(json["items"].as_array().expect("items").is_empty());
 }
+
+#[tokio::test]
+async fn a_filtered_listing_pages_on_with_its_cursor_and_refuses_it_under_another_filter() {
+    let ctx = common::caller_in(Uuid::new_v4());
+    let service = seeded(common::inmem_db().await, &ctx).await;
+    service
+        .upsert_repo(&ctx, record(103, "gears-ts"))
+        .await
+        .expect("seed must succeed");
+    let router = router_for(service, ctx);
+    let get = |uri: String| Request::builder().uri(uri).body(Body::empty()).unwrap();
+    let by_owner = "$filter=owner%20eq%20'constructorfabric'";
+
+    let first = router
+        .clone()
+        .oneshot(get(format!("/github-mirror/v1/repos?{by_owner}&limit=1")))
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+    let first = body_json(first).await;
+    let cursor = first["page_info"]["next_cursor"]
+        .as_str()
+        .expect("a one-row page of three must point to the next")
+        .to_owned();
+
+    let second = router
+        .clone()
+        .oneshot(get(format!(
+            "/github-mirror/v1/repos?{by_owner}&limit=1&cursor={cursor}"
+        )))
+        .await
+        .unwrap();
+    assert_eq!(second.status(), StatusCode::OK);
+    let second = body_json(second).await;
+    assert_eq!(second["items"].as_array().expect("items").len(), 1);
+    assert_ne!(second["items"][0]["id"], first["items"][0]["id"]);
+
+    let other_filter = router
+        .oneshot(get(format!(
+            "/github-mirror/v1/repos?$filter=name%20eq%20'gears-rust'&limit=1&cursor={cursor}"
+        )))
+        .await
+        .unwrap();
+    assert_eq!(
+        other_filter.status(),
+        StatusCode::BAD_REQUEST,
+        "a cursor minted under one filter must not page another"
+    );
+}

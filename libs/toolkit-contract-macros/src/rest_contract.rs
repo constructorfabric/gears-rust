@@ -303,6 +303,7 @@ fn generate_cleaned_trait(model: &RestContractModel) -> TokenStream {
 fn generate_binding_fn(model: &RestContractModel, support: &TokenStream) -> TokenStream {
     let trait_name_snake = to_snake_case(&model.trait_ident.to_string());
     let fn_ident = format_ident!("{}_http_binding", trait_name_snake);
+    let static_fn_ident = format_ident!("__{}_http_binding", trait_name_snake);
     let trait_doc = format!("Build the HTTP binding IR for [`{}`].", model.trait_ident);
     let base_path = &model.base_path;
 
@@ -312,15 +313,21 @@ fn generate_binding_fn(model: &RestContractModel, support: &TokenStream) -> Toke
         .map(|m| build_method_binding(m, support));
 
     quote! {
-        #[doc = #trait_doc]
-        #[must_use]
-        pub fn #fn_ident() -> #support::ir::binding::HttpBindingIr {
-            #support::ir::binding::HttpBindingIr {
+        fn #static_fn_ident() -> &'static #support::ir::binding::HttpBindingIr {
+            static BINDING: ::std::sync::OnceLock<#support::ir::binding::HttpBindingIr> =
+                ::std::sync::OnceLock::new();
+            BINDING.get_or_init(|| #support::ir::binding::HttpBindingIr {
                 base_path: #base_path.to_owned(),
                 methods: vec![
                     #(#method_entries),*
                 ],
-            }
+            })
+        }
+
+        #[doc = #trait_doc]
+        #[must_use]
+        pub fn #fn_ident() -> #support::ir::binding::HttpBindingIr {
+            #static_fn_ident().clone()
         }
     }
 }
@@ -725,7 +732,7 @@ fn generate_client_method(
     support: &TokenStream,
 ) -> TokenStream {
     let trait_snake = to_snake_case(&trait_ident.to_string());
-    let binding_fn = format_ident!("{}_http_binding", trait_snake);
+    let binding_fn = format_ident!("__{}_http_binding", trait_snake);
     let method_name_str = method.ident.to_string();
     let method_ident = &method.ident;
 

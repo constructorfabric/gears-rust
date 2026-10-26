@@ -16,7 +16,7 @@ use toolkit_db::{ConnectOpts, Db, connect_db};
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
-use crate::domain::ports::{HierarchyPort, PortError};
+use crate::domain::ports::{HierarchyPort, PortError, Subtree};
 use crate::infra::storage::Migrator;
 
 /// A resource type every test registry knows.
@@ -44,8 +44,15 @@ pub struct FakeTree {
     nodes: HashMap<Uuid, (Option<Uuid>, bool)>,
     /// When set, every call fails with this error.
     pub fault: Mutex<Option<PortError>>,
+    /// When set, every call from the given count of calls on fails with the
+    /// error: a dependency that fails part-way through an operation.
+    pub fault_from: Mutex<Option<(usize, PortError)>>,
+    /// Calls of any kind answered or refused so far.
+    pub calls: AtomicUsize,
     /// Reachability calls answered so far.
     pub reach_calls: AtomicUsize,
+    /// Subtree reads answered so far.
+    pub subtree_calls: AtomicUsize,
 }
 
 impl FakeTree {
@@ -57,13 +64,31 @@ impl FakeTree {
                 .map(|&(tenant, parent, managed)| (tenant, (parent, managed)))
                 .collect(),
             fault: Mutex::new(None),
+            fault_from: Mutex::new(None),
+            calls: AtomicUsize::new(0),
             reach_calls: AtomicUsize::new(0),
+            subtree_calls: AtomicUsize::new(0),
         }
     }
 
     /// Makes every later call fail with `fault`.
     pub fn fail_with(&self, fault: PortError) {
         *self.fault.lock() = Some(fault);
+    }
+
+    /// Makes every call from the `nth` one on (counting from 0, over the
+    /// tree's whole life) fail with `fault`.
+    pub fn fail_from(&self, nth: usize, fault: PortError) {
+        *self.fault_from.lock() = Some((nth, fault));
+    }
+
+    /// Counts one call, refusing it when [`Self::fail_from`] says so.
+    fn call(&self) -> Result<(), PortError> {
+        let nth = self.calls.fetch_add(1, Ordering::SeqCst);
+        match &*self.fault_from.lock() {
+            Some((from, fault)) if nth >= *from => Err(fault.clone()),
+            _ => Ok(()),
+        }
     }
 
     fn node(&self, tenant: Uuid) -> Result<(Option<Uuid>, bool), PortError> {
@@ -75,6 +100,25 @@ impl FakeTree {
             .copied()
             .ok_or_else(|| PortError::NotFound(tenant.to_string()))
     }
+
+    /// Whether `from` is `target` or an ancestor of it under `barrier`.
+    fn reaches(&self, from: Uuid, target: Uuid, barrier: BarrierMode) -> Result<bool, PortError> {
+        self.node(from)?;
+        let mut current = target;
+        loop {
+            if current == from {
+                return Ok(true);
+            }
+            let (parent, self_managed) = self.node(current)?;
+            if self_managed && barrier == BarrierMode::Respect {
+                return Ok(false);
+            }
+            match parent {
+                Some(parent) => current = parent,
+                None => return Ok(false),
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -84,6 +128,7 @@ impl HierarchyPort for FakeTree {
         _ctx: &SecurityContext,
         tenant: TenantId,
     ) -> Result<Vec<Uuid>, PortError> {
+        self.call()?;
         let mut chain = Vec::new();
         let mut next = Some(tenant.0);
         while let Some(current) = next {
@@ -101,22 +146,25 @@ impl HierarchyPort for FakeTree {
         target_tenant: TenantId,
         barrier: BarrierMode,
     ) -> Result<bool, PortError> {
+        self.call()?;
         self.reach_calls.fetch_add(1, Ordering::SeqCst);
-        let (from_tenant, mut current) = (from_tenant.0, target_tenant.0);
-        self.node(from_tenant)?;
-        loop {
-            if current == from_tenant {
-                return Ok(true);
-            }
-            let (parent, self_managed) = self.node(current)?;
-            if self_managed && barrier == BarrierMode::Respect {
-                return Ok(false);
-            }
-            match parent {
-                Some(parent) => current = parent,
-                None => return Ok(false),
+        self.reaches(from_tenant.0, target_tenant.0, barrier)
+    }
+
+    async fn subtree(&self, _ctx: &SecurityContext, root: TenantId) -> Result<Subtree, PortError> {
+        self.call()?;
+        self.subtree_calls.fetch_add(1, Ordering::SeqCst);
+        self.node(root.0)?;
+        let mut descendants = Vec::new();
+        for (&tenant, &(parent, self_managed)) in &self.nodes {
+            if let Some(parent) = parent
+                && tenant != root.0
+                && self.reaches(root.0, tenant, BarrierMode::Ignore)?
+            {
+                descendants.push((tenant, parent, self_managed));
             }
         }
+        Ok(Subtree::new(root.0, descendants))
     }
 }
 

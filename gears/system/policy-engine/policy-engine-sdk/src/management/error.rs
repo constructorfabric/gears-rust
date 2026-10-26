@@ -195,6 +195,13 @@ pub enum ManagementError {
         /// What is wrong with it.
         reason: String,
     },
+    /// The caller's tenant subtree is too large for the assignment listing
+    /// to be evaluated; list as an administrator of a tenant lower in the
+    /// tree. Reading one assignment is not limited.
+    #[error("the caller's tenant subtree is too large to list assignments")]
+    #[error_code("SUBTREE_TOO_LARGE")]
+    #[canonical(FailedPrecondition)]
+    SubtreeTooLarge,
     /// The caller does not hold the capability the operation requires.
     #[error("the caller lacks the capability the operation requires")]
     #[error_code("CAPABILITY_DENIED")]

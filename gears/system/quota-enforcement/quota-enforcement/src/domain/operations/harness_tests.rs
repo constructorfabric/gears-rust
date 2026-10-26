@@ -33,7 +33,7 @@ pub(super) fn type_id(raw: &str) -> GtsTypeId {
 
 pub(super) fn evaluation_limits() -> quota_enforcement_sdk::engine::EvaluationLimits {
     quota_enforcement_sdk::engine::EvaluationLimits {
-        upper_timeout_ms: std::num::NonZeroU64::new(50).expect("nonzero"),
+        upper_timeout_ms: std::num::NonZeroU64::new(60_000).expect("nonzero"),
         cost_limit: std::num::NonZeroU64::new(10_000).expect("nonzero"),
     }
 }
@@ -71,6 +71,7 @@ impl Harness {
         let mut bundle = bundle_with_global_policy();
         if let Some(policy) = bundle.global_policy.as_mut() {
             policy.engine_id = "most-restrictive-wins".to_owned();
+            policy.timeout_ms = Some(60_000);
         }
         bundle.config_defaults.max_active_leases = cap;
         storage.bootstrap(&bundle).await.expect("bootstrap");
@@ -101,6 +102,8 @@ impl Harness {
         let mut bundle = bundle_with_global_policy();
         if let Some(policy) = bundle.global_policy.as_mut() {
             policy.engine_id = "most-restrictive-wins".to_owned();
+            // Generous, so a slow runner hits the cost limit and never the 5 ms default.
+            policy.timeout_ms = Some(60_000);
         }
         storage.bootstrap(&bundle).await.expect("bootstrap");
         let classifications = MetricClassifications::from_pairs([(

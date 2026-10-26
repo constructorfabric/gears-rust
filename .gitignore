@@ -588,3 +588,6 @@ testing/e2e/logs/
 # Helm chart artifacts (never committed)
 *.tgz
 Chart.lock
+
+# Local environment files (never committed)
+.env
