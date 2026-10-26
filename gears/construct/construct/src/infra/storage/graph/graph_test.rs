@@ -43,7 +43,8 @@ use super::writer::{
 use super::{DEFAULT_CALL_TIMEOUT, graph_error};
 use crate::domain::error::DomainError;
 use crate::domain::plan::{Change, NodeKey as FactKey, Plan, Property, Step};
-use crate::domain::profile::{Category, PlanWriter, Profile, ProfileSource, Written};
+use crate::domain::planner::processing::{PlanWriter, ProfileSource, Written};
+use crate::domain::profile::{Category, Profile};
 use crate::domain::subject_settings::SubjectKey;
 use crate::test_support::{add_value, connector_plan, replace_property};
 

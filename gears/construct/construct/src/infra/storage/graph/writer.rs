@@ -21,7 +21,8 @@ use super::{
 };
 use crate::domain::error::DomainError;
 use crate::domain::plan::{Change, NodeKey, Plan};
-use crate::domain::profile::{FactCount, FullProfile, PlanWriter, Written};
+use crate::domain::planner::processing::{PlanWriter, Written};
+use crate::domain::profile::{FactCount, FullProfile};
 use crate::domain::subject_settings::SubjectKey;
 
 /// The reason graph storage gives a write that lost a serialization race; it
