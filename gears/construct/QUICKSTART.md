@@ -11,7 +11,7 @@ Record intake for connectors and the profile read for applications and agents. A
 - Records are refused when the connector is off, or when personalization is off or an erasure is under way for the record's subject
 - Errors are RFC 9457 Problem responses
 - The gear supplies its migrations to the runtime, which runs them on boot
-- `GET /construct/v1/subjects/{subject_id}/profile`: the subject's facts by category, for a caller the platform lets act for the subject (`construct.profile` / `read`), in the caller's tenant or the one named in `tenant`. A category the caller may not read is not listed
+- `GET /construct/v1/subjects/{subject_id}/profile`: the subject's facts by category, for the subject itself, or a caller the platform lets act for the subject by naming it (`construct.profile` / `read`), in the caller's tenant or the one named in `tenant`. A category the caller may not read is not listed
 - An in-process client, `ConstructClientV1::submit_record` and `read_profile`, runs the same operations
 - The gear needs graph storage in its host
 
@@ -85,10 +85,10 @@ gears:
         max_value_chars: 1000
         # trusted_connectors: [...]  # connector identities as UUIDs; absent: every connector is trusted
         # entity_kinds: [...]        # absent: every entity kind is allowed
-      profile_categories: one_call   # or per_category, for a policy plugin without category constraints
+      profile_category_check: one_call   # or per_category, for a policy plugin without category constraints
 ```
 
-An unknown key, a value in `connectors_off`, `processing_identity` or `trusted_connectors` that is not a UUID, a zero in `processing`, a confidence floor outside 0 to 1, a step cap outside 1 to 10000, a value cap outside 1 to 100000, or a model upstream alias that is not 1 to 63 letters, digits, `-` or `_`, stops the gear from starting. The processing identity needs graph storage's read, write, delete and type registration permissions, and the settings read, in every tenant.
+An unknown key, a value in `connectors_off`, `processing_identity` or `trusted_connectors` that is not a UUID, a zero in `processing`, a queue capacity above 100000, more than 256 workers, a confidence floor outside 0 to 1, a step cap outside 1 to 10000, a value cap outside 1 to 100000, or a model upstream alias that is not 1 to 63 letters, digits, `-` or `_`, stops the gear from starting. The processing identity needs graph storage's read, write, delete and type registration permissions, and the settings read, in every tenant.
 
 ## Examples
 

@@ -46,3 +46,38 @@ impl ProcessingContexts for ServiceIdentity {
         Ok((self.context(tenant_id)?, AccessScope::for_tenant(tenant_id)))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use toolkit_security::pep_properties;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn the_identity_acts_in_the_tenant_asked_and_its_scope_reaches_only_that_tenant() {
+        let (identity, tenant) = (Uuid::new_v4(), Uuid::new_v4());
+
+        let (ctx, scope) = ServiceIdentity::new(identity)
+            .for_tenant(tenant)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            (ctx.subject_id(), ctx.subject_tenant_id()),
+            (identity, tenant)
+        );
+        let [constraint] = scope.constraints() else {
+            panic!("one constraint, got {scope:?}");
+        };
+        let [filter] = constraint.filters() else {
+            panic!("one filter, got {constraint:?}");
+        };
+        assert_eq!(filter.property(), pep_properties::OWNER_TENANT_ID);
+        let tenants: Vec<_> = filter
+            .values()
+            .iter()
+            .filter_map(toolkit_security::ScopeValue::as_uuid)
+            .collect();
+        assert_eq!(tenants, [tenant]);
+    }
+}

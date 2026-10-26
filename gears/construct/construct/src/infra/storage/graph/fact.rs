@@ -213,19 +213,32 @@ fn origin_kind(payload: &Map<String, Value>) -> Option<OriginKind> {
     }
 }
 
-/// The fact a stored node holds, with its origin kind, when graph storage
-/// stored it, and when its source asserted it. `None` for a node that is not a
-/// fact of a person type, does not hold exactly one fact property, or whose
-/// origin names no known source. A `produced_at` that does not parse is read
-/// as absent and logged.
-#[must_use]
-pub fn stored_fact_of(node: NodeView) -> Option<StoredFact> {
-    let category = Category::from_type_id(&node.type_id)?;
-    let stored_at = node.envelope.created_at;
-    let Value::Object(mut payload) = node.payload? else {
-        return None;
-    };
-    let origin = origin_kind(&payload)?;
+/// The fact a stored node holds, as [`fact_of`] reads it, with its origin
+/// kind, when graph storage stored it, and when its source asserted it. A
+/// `produced_at` that does not parse is read as absent and logged.
+///
+/// # Errors
+///
+/// Every defect [`fact_of`] reports, and an origin that names no known
+/// source; each names the node's key and never a value.
+pub fn stored_fact_of(node: &NodeView) -> Result<StoredFact, DomainError> {
+    let Fact {
+        node_key,
+        category,
+        property,
+        value,
+    } = fact_of(node)?;
+    let payload = node
+        .payload
+        .as_ref()
+        .and_then(Value::as_object)
+        .ok_or_else(|| DomainError::internal(format!("fact {} has no payload", node.node_key)))?;
+    let origin = origin_kind(payload).ok_or_else(|| {
+        DomainError::internal(format!(
+            "fact {} has an origin of no known source",
+            node.node_key
+        ))
+    })?;
     let produced_at = payload
         .get(ORIGIN)
         .and_then(|origin| origin.get("produced_at"))
@@ -237,21 +250,13 @@ pub fn stored_fact_of(node: NodeView) -> Option<StoredFact> {
             }
             parsed
         });
-    let mut properties = payload
-        .keys()
-        .filter(|name| !ENVELOPE.contains(&name.as_str()));
-    let (Some(property), None) = (properties.next(), properties.next()) else {
-        return None;
-    };
-    let property = property.clone();
-    let value = payload.remove(&property)?;
-    Some(StoredFact {
-        node_key: NodeKey(node.node_key),
+    Ok(StoredFact {
+        node_key,
         category,
         property,
         value,
         origin,
-        stored_at,
+        stored_at: node.envelope.created_at,
         produced_at,
     })
 }

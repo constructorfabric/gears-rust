@@ -8,16 +8,18 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use authz_resolver_sdk::PolicyEnforcer;
+use authz_resolver_sdk::models::{EvaluationRequest, EvaluationResponse};
+use authz_resolver_sdk::{AuthZResolverApi, PolicyEnforcer};
 use serde_json::json;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use tokio_util::sync::CancellationToken;
-use toolkit_security::SecurityContext;
+use toolkit::api::canonical_prelude::CanonicalError;
+use toolkit_security::{PlatformSecurityContext, SecurityContext};
 use uuid::Uuid;
 
 use super::pipeline::assemble;
-use crate::config::ConstructConfig;
+use crate::config::{CategoryCheckConfig, ConstructConfig};
 use crate::domain::model_client::{
     ModelClient, ModelError, ModelOutput, ModelRequest, ModelResponse, ToolCall, Usage,
 };
@@ -77,6 +79,7 @@ fn in_tenant(tenant: Uuid) -> SecurityContext {
         .unwrap()
 }
 
+#[tracing_test::traced_test]
 #[tokio::test]
 async fn a_record_is_planned_checked_admitted_written_and_read_back() {
     let db = inmem_db().await;
@@ -142,6 +145,10 @@ async fn a_record_is_planned_checked_admitted_written_and_read_back() {
         fact.produced_at,
         Some(OffsetDateTime::parse("2026-09-10T09:13:05Z", &Rfc3339).unwrap()),
         "the record's observed_at"
+    );
+    assert!(
+        logs_contain("no sensitive-data check"),
+        "the operator is told that no check runs"
     );
 }
 
@@ -216,4 +223,97 @@ async fn without_a_processing_identity_the_profile_read_is_unavailable() {
         ),
         "{result:?}"
     );
+}
+
+#[tokio::test]
+async fn with_an_identity_but_no_graph_storage_the_profile_read_is_unavailable() {
+    let db = inmem_db().await;
+    let cfg = ConstructConfig {
+        processing_identity: Some(Uuid::new_v4()),
+        ..ConstructConfig::default()
+    };
+    let pipeline = assemble(
+        &cfg,
+        Some(adds_a_skill()),
+        None,
+        Arc::new(settings_service(&db, Arc::new(AllowResolver), true)),
+        PolicyEnforcer::new(Arc::new(AllowResolver)),
+    )
+    .unwrap();
+
+    let result = pipeline
+        .profile
+        .read(&in_tenant(Uuid::new_v4()), None, Uuid::new_v4())
+        .await;
+
+    assert!(pipeline.worker.is_none());
+    assert!(
+        matches!(
+            result,
+            Err(crate::domain::error::DomainError::Unavailable(_))
+        ),
+        "{result:?}"
+    );
+}
+
+/// [`AllowResolver`] that records the category each request asks about.
+#[derive(Default)]
+struct CategoriesAsked(Mutex<Vec<Option<String>>>);
+
+#[async_trait]
+impl AuthZResolverApi for CategoriesAsked {
+    async fn evaluate(
+        &self,
+        ctx: PlatformSecurityContext,
+        request: EvaluationRequest,
+    ) -> Result<EvaluationResponse, CanonicalError> {
+        if request.resource.resource_type == "construct.profile" {
+            self.0.lock().unwrap().push(
+                request
+                    .resource
+                    .properties
+                    .get(crate::domain::profile_read::CATEGORY_PROPERTY)
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned),
+            );
+        }
+        AllowResolver.evaluate(ctx, request).await
+    }
+}
+
+#[tokio::test]
+async fn the_configured_category_check_reaches_the_profile_read() {
+    for (check, per_category) in [
+        (CategoryCheckConfig::OneCall, 0),
+        (CategoryCheckConfig::PerCategory, Category::ALL.len()),
+    ] {
+        let db = inmem_db().await;
+        let asked = Arc::new(CategoriesAsked::default());
+        let cfg = ConstructConfig {
+            processing_identity: Some(Uuid::new_v4()),
+            profile_category_check: check,
+            ..ConstructConfig::default()
+        };
+        let pipeline = assemble(
+            &cfg,
+            None,
+            Some(fake_graph_storage()),
+            Arc::new(settings_service(&db, Arc::new(AllowResolver), true)),
+            PolicyEnforcer::new(Arc::clone(&asked) as Arc<dyn AuthZResolverApi>),
+        )
+        .unwrap();
+
+        pipeline
+            .profile
+            .read(&in_tenant(Uuid::new_v4()), None, Uuid::new_v4())
+            .await
+            .unwrap();
+
+        let asked = asked.0.lock().unwrap().clone();
+        assert_eq!(
+            asked.iter().filter(|category| category.is_some()).count(),
+            per_category,
+            "{check:?}: {asked:?}"
+        );
+    }
 }

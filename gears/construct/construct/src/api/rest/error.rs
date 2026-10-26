@@ -147,6 +147,30 @@ pub fn for_facts(e: DomainError, subject_id: Uuid) -> CanonicalError {
     }
 }
 
+/// The REST answer for a domain error on the profile route. Every refusal,
+/// whatever produced it, answers as a subject that does not exist, so the
+/// answer reveals nothing about who has a profile. The gear's own failures are
+/// mapped as everywhere else. Every variant is listed, so a new one has to be
+/// placed here.
+///
+/// @cpt-dod:cpt-cf-construct-dod-profile-reader-route:p1
+#[must_use]
+pub fn for_profile(e: DomainError) -> CanonicalError {
+    match e {
+        DomainError::Forbidden(msg) => DomainError::NotVisible(msg).into(),
+        DomainError::OutOfScope(refused) => {
+            log_out_of_scope(&refused);
+            DomainError::NotVisible("the policy scope does not reach the subject".to_owned()).into()
+        }
+        e @ (DomainError::NotVisible(_)
+        | DomainError::Refused(_)
+        | DomainError::Unavailable(_)
+        | DomainError::Internal(_)
+        | DomainError::ProfileFull(_)
+        | DomainError::Database(_)) => e.into(),
+    }
+}
+
 /// @cpt-dod:cpt-cf-construct-dod-gear-foundation-error-mapping:p1
 impl From<DomainError> for CanonicalError {
     #[expect(

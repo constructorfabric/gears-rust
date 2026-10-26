@@ -22,7 +22,7 @@ use crate::domain::planner::agent::{Planner, PlannerCaps};
 use crate::domain::planner::catalog::PropertyCatalog;
 use crate::domain::planner::processing::{Processing, ProcessingContexts, ProcessingPorts};
 use crate::domain::profile_read::{CategoryCheck, ProfileReadPorts, ProfileReadService};
-use crate::domain::record_intake::RecordHandOff;
+use crate::domain::record_intake::{IntakeEvents, RecordHandOff, RecordKey};
 use crate::domain::sensitive_data::SensitiveDataChecks;
 use crate::domain::subject_settings::SubjectSettingsReader;
 use crate::infra::admission_events::LogAdmissionEvents;
@@ -31,6 +31,7 @@ use crate::infra::intake_events::LogIntakeEvents;
 use crate::infra::model::chat_completions::{ChatCompletionsModel, ChatCompletionsSettings};
 use crate::infra::planner_stub::DroppingHandOff;
 use crate::infra::processing_contexts::ServiceIdentity;
+use crate::infra::processing_metrics::{CountedDrops, ProcessingMetrics, WorkerLoad};
 use crate::infra::profile_events::LogProfileEvents;
 use crate::infra::record_queue::{RecordQueue, record_queue, serve};
 use crate::infra::storage::graph::reader::GraphProfileSource;
@@ -60,9 +61,17 @@ pub struct Worker {
     queue: RecordQueue,
     processing: Arc<Processing>,
     workers: std::num::NonZeroUsize,
+    load: WorkerLoad,
+    metrics: Arc<ProcessingMetrics>,
 }
 
 impl Worker {
+    /// The records the worker has on hand, for the gear's stop to report.
+    #[must_use]
+    pub fn load(&self) -> WorkerLoad {
+        self.load.clone()
+    }
+
     /// Process queued records until `cancel` fires.
     ///
     /// NOT cancel-safe for the records in flight: when `cancel` fires, or the
@@ -72,17 +81,28 @@ impl Worker {
     /// write that lands whole or not at all. A stopped record's identity
     /// stays in intake, so a resend is a repeat, as the DESIGN states.
     pub async fn run(self, cancel: CancellationToken) {
-        let processing = self.processing;
+        let (processing, load, metrics) = (self.processing, self.load, self.metrics);
         serve(
             self.queue,
             move |record| {
                 let processing = Arc::clone(&processing);
+                let metrics = Arc::clone(&metrics);
+                let in_flight = load.start();
                 let span = tracing::info_span!(
                     "construct_process_record",
                     tenant_id = %record.tenant_id,
-                    record_type = %record.envelope.type_id
+                    record_type = %record.envelope.type_id,
+                    record_key = %RecordKey::of_record(&record),
+                    connector = %record.connector,
+                    subject_id = record.envelope.subject_id.map(tracing::field::display),
                 );
-                async move { processing.process(&record).await }.instrument(span)
+                async move {
+                    let started = std::time::Instant::now();
+                    processing.process(&record).await;
+                    metrics.processed(started.elapsed());
+                    drop(in_flight);
+                }
+                .instrument(span)
             },
             self.workers,
             cancel,
@@ -145,12 +165,11 @@ pub fn assemble(
     settings: Arc<dyn SubjectSettingsReader>,
     policy_enforcer: PolicyEnforcer,
 ) -> anyhow::Result<Pipeline> {
-    let events = Arc::new(LogIntakeEvents);
-    let (has_identity, has_graph, has_model) = (
-        cfg.processing_identity.is_some(),
-        graph.is_some(),
-        model.is_some(),
-    );
+    let configured = Configured {
+        identity: Part::of(cfg.processing_identity.as_ref()),
+        graph: Part::of(graph.as_ref()),
+        model: Part::of(model.as_ref()),
+    };
     let identity = cfg.processing_identity.map(ServiceIdentity::new);
     let contexts: Arc<dyn ProcessingContexts> = match identity {
         Some(identity) => Arc::new(identity),
@@ -177,7 +196,7 @@ pub fn assemble(
             events: Arc::new(LogProfileEvents),
         },
         policy_enforcer,
-        match cfg.profile_categories {
+        match cfg.profile_category_check {
             CategoryCheckConfig::OneCall => CategoryCheck::OneCall,
             CategoryCheckConfig::PerCategory => CategoryCheck::PerCategory,
         },
@@ -186,13 +205,21 @@ pub fn assemble(
 
     // @cpt-begin:cpt-cf-construct-algo-profile-reader-wire:p1:inst-wire-processing
     let (Some(client), Some(reader), Some(model)) = (graph, reader, model) else {
-        log_unconfigured(has_identity, has_graph, has_model);
+        configured.log();
         return Ok(Pipeline {
-            hand_off: Arc::new(DroppingHandOff::new(events)),
+            hand_off: Arc::new(DroppingHandOff::new(Arc::new(LogIntakeEvents))),
             worker: None,
             profile,
         });
     };
+    let (hand_off, queue) = record_queue(cfg.processing.queue_capacity);
+    let hand_off = Arc::new(hand_off);
+    let load = WorkerLoad::new(Arc::downgrade(&hand_off));
+    let metrics = Arc::new(ProcessingMetrics::new(&load));
+    let events: Arc<dyn IntakeEvents> = Arc::new(CountedDrops::new(
+        Arc::new(LogIntakeEvents),
+        Arc::clone(&metrics),
+    ));
     let planner = Planner::new(
         model,
         Arc::new(PropertyCatalog::load().context("the planner's property catalog")?),
@@ -202,8 +229,13 @@ pub fn assemble(
             max_tokens: cfg.processing.max_tokens,
         },
     );
-    // No real sensitive-data check exists yet; every value is allowed.
+    // No real sensitive-data check exists yet; every value is allowed, and
+    // the operator is told so at start-up.
     let checks = SensitiveDataChecks::new(Vec::new(), Arc::clone(&events) as _);
+    tracing::warn!(
+        "construct: record processing runs with no sensitive-data check; every planned value \
+         that Admission lets through is stored"
+    );
     let admission = Admission::new(AdmissionPorts {
         settings,
         rules: Arc::new(ConfigAdmissionRules::new(&cfg.admission)),
@@ -228,45 +260,83 @@ pub fn assemble(
         },
         cfg.processing.max_reruns,
     ));
-    let (hand_off, queue) = record_queue(cfg.processing.queue_capacity);
     Ok(Pipeline {
-        hand_off: Arc::new(hand_off),
+        hand_off,
         worker: Some(Worker {
             queue,
             processing,
             workers: cfg.processing.workers,
+            load,
+            metrics,
         }),
         profile,
     })
     // @cpt-end:cpt-cf-construct-algo-profile-reader-wire:p1:inst-wire-processing
 }
 
-/// Say at start-up what is not configured: an info line when processing is
-/// off on purpose (neither identity nor model), a warning when it is only
-/// partly configured, and a warning when the profile read is unavailable.
-#[expect(
-    clippy::cognitive_complexity,
-    reason = "three log lines; the tracing macros count toward the complexity"
-)]
-fn log_unconfigured(has_identity: bool, has_graph: bool, has_model: bool) {
-    if !has_identity && !has_model {
-        tracing::info!(
-            "construct: record processing is not configured; received records are dropped"
-        );
-    } else {
-        tracing::warn!(
-            processing_identity = has_identity,
-            graph_storage = has_graph,
-            model = has_model,
-            "construct: record processing is only partly configured; received records are dropped"
-        );
+/// Whether the deployment has one of the processing's prerequisites.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Part {
+    Present,
+    Missing,
+}
+
+impl Part {
+    fn of<T>(value: Option<&T>) -> Self {
+        if value.is_some() {
+            Self::Present
+        } else {
+            Self::Missing
+        }
     }
-    if !has_identity || !has_graph {
-        tracing::warn!(
-            processing_identity = has_identity,
-            graph_storage = has_graph,
-            "construct: the profile read answers unavailable"
+
+    fn present(self) -> bool {
+        self == Self::Present
+    }
+}
+
+/// Which of the processing's prerequisites the deployment has.
+#[derive(Debug, Clone, Copy)]
+struct Configured {
+    identity: Part,
+    graph: Part,
+    model: Part,
+}
+
+impl Configured {
+    /// Say at start-up what is not configured: an info line when processing
+    /// is off on purpose (neither identity nor model), a warning when it is
+    /// only partly configured, and a warning when the profile read is
+    /// unavailable.
+    #[expect(
+        clippy::cognitive_complexity,
+        reason = "three log lines; the tracing macros count toward the complexity"
+    )]
+    fn log(self) {
+        let (identity, graph, model) = (
+            self.identity.present(),
+            self.graph.present(),
+            self.model.present(),
         );
+        if !identity && !model {
+            tracing::info!(
+                "construct: record processing is not configured; received records are dropped"
+            );
+        } else {
+            tracing::warn!(
+                processing_identity = identity,
+                graph_storage = graph,
+                model = model,
+                "construct: record processing is only partly configured; received records are dropped"
+            );
+        }
+        if !identity || !graph {
+            tracing::warn!(
+                processing_identity = identity,
+                graph_storage = graph,
+                "construct: the profile read answers unavailable"
+            );
+        }
     }
 }
 
