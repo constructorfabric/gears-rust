@@ -6,7 +6,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use construct_sdk::gts::{HAS_FACT_TYPE, PROFILE_ROOT_TYPE};
 use graph_storage_sdk::GraphStorageClientV1;
-use graph_storage_sdk::models::{EdgeSpec, IngestOptions, IngestRequest, NodeSpec};
+use graph_storage_sdk::models::{EdgeSpec, IngestOptions, IngestOutcome, IngestRequest, NodeSpec};
 use time::OffsetDateTime;
 use toolkit_canonical_errors::CanonicalError;
 use toolkit_security::SecurityContext;
@@ -16,14 +16,14 @@ use super::fact::fact_node;
 use super::reader::{MAX_FACTS, Stored, read_stored};
 use super::root::{ProfileVersion, Root, root_key};
 use super::types::GraphTypes;
-use super::{ContextSubject, DEFAULT_CALL_TIMEOUT, bounded, graph_error, subject_in_context};
+use super::{
+    CAS_CONFLICT, ContextSubject, DEFAULT_CALL_TIMEOUT, bounded, graph_error, subject_in_context,
+};
 use crate::domain::error::DomainError;
 use crate::domain::plan::{Change, NodeKey, Plan};
-use crate::domain::profile::{FullProfile, PlanWriter, Written};
+use crate::domain::profile::{FactCount, FullProfile, PlanWriter, Written};
 use crate::domain::subject_settings::SubjectKey;
 
-/// The reason graph storage gives a failed compare-and-set.
-const CAS_CONFLICT: &str = "CAS_CONFLICT";
 /// The reason graph storage gives a write that lost a serialization race; it
 /// committed nothing and can be sent again.
 const SERIALIZATION: &str = "SERIALIZATION";
@@ -158,7 +158,7 @@ impl GraphPlanWriter {
     /// Remove the facts under `keys`, one after another, within one call
     /// timeout. The first that fails ends the cleanup: it and the rest stay
     /// listed on the root, and a later write finishes them.
-    async fn remove(&self, ctx: &SecurityContext, keys: &[NodeKey]) {
+    async fn remove(&self, ctx: &SecurityContext, keys: &BTreeSet<NodeKey>) {
         let cleanup = async {
             for (done, key) in keys.iter().enumerate() {
                 if let Err(err) = self.ports.removal.remove(ctx, key).await {
@@ -169,12 +169,7 @@ impl GraphPlanWriter {
         };
         match tokio::time::timeout(self.timeout, cleanup).await {
             Ok(Ok(())) => {}
-            Ok(Err((done, key, err))) => tracing::warn!(
-                key = %key.0,
-                error = %err,
-                left = keys.len() - done,
-                "removed facts stay listed on the root until a later write finishes them"
-            ),
+            Ok(Err((done, key, err))) => unfinished(key, &err, keys.len() - done),
             Err(_) => tracing::warn!(
                 listed = keys.len(),
                 timeout = ?self.timeout,
@@ -206,28 +201,20 @@ impl GraphPlanWriter {
             let sent =
                 tokio::time::timeout(self.timeout, self.ports.client.ingest(ctx, request.clone()))
                     .await;
-            let failed = match sent {
-                Ok(Ok(_)) => return Ok(Written::Stored),
-                Ok(Err(CanonicalError::Aborted { ctx: aborted, .. }))
-                    if aborted.reason == CAS_CONFLICT =>
-                {
-                    if unknown && !replayed {
-                        replayed = true;
-                        tracing::warn!(
-                            idempotency_key = ?request.idempotency_key,
-                            "profile write refused after a send without an answer; sent once \
-                             more in case that send committed"
-                        );
-                        continue;
-                    }
-                    return Ok(Written::Conflict);
+            let failed = match classify(sent, self.timeout) {
+                Sent::Stored => return Ok(Written::Stored),
+                Sent::Failed(err) => return Err(err),
+                Sent::Refused if unknown && !replayed => {
+                    replayed = true;
+                    tracing::warn!(
+                        idempotency_key = ?request.idempotency_key,
+                        "profile write refused after a send without an answer; sent once more \
+                         in case that send committed"
+                    );
+                    continue;
                 }
-                Ok(Err(err)) if !resendable(&err) => {
-                    return Err(graph_error("profile write", &err));
-                }
-                Ok(Err(err)) => err.to_string(),
-                // No answer in time: the write may or may not have committed.
-                Err(_) => format!("no answer within {:?}", self.timeout),
+                Sent::Refused => return Ok(Written::Conflict),
+                Sent::Unknown(failed) => failed,
             };
             unknown = true;
             if attempt >= self.attempts.get() {
@@ -246,6 +233,55 @@ impl GraphPlanWriter {
             pause = pause.saturating_mul(2);
             // @cpt-end:cpt-cf-construct-algo-profile-writer-write:p1:inst-write-ingest
         }
+    }
+}
+
+/// Log a cleanup that stopped at `key`, with `left` removals not done.
+fn unfinished(key: &NodeKey, err: &DomainError, left: usize) {
+    if matches!(err, DomainError::Internal(_)) {
+        // A defect, such as a missing grant for the delete, is not cured by a
+        // later write, and the listed facts keep counting toward the limit
+        // until it is mended.
+        tracing::error!(
+            key = %key.0,
+            error = %err,
+            left,
+            "removed facts stay listed on the root: their delete fails"
+        );
+    } else {
+        tracing::warn!(
+            key = %key.0,
+            error = %err,
+            left,
+            "removed facts stay listed on the root until a later write finishes them"
+        );
+    }
+}
+
+/// What one send of the ingest gave.
+enum Sent {
+    Stored,
+    /// Graph storage refused the compare-and-set.
+    Refused,
+    /// The write may or may not have committed, or certainly did not and
+    /// can be sent as it is; the reason, for the log.
+    Unknown(String),
+    Failed(DomainError),
+}
+
+fn classify(
+    sent: Result<Result<IngestOutcome, CanonicalError>, tokio::time::error::Elapsed>,
+    timeout: Duration,
+) -> Sent {
+    match sent {
+        Ok(Ok(_)) => Sent::Stored,
+        Ok(Err(CanonicalError::Aborted { ctx: aborted, .. })) if aborted.reason == CAS_CONFLICT => {
+            Sent::Refused
+        }
+        Ok(Err(err)) if resendable(&err) => Sent::Unknown(err.to_string()),
+        Ok(Err(err)) => Sent::Failed(graph_error("profile write", &err)),
+        // No answer in time: the write may or may not have committed.
+        Err(_) => Sent::Unknown(format!("no answer within {timeout:?}")),
     }
 }
 
@@ -307,7 +343,19 @@ fn changes(plan: &Plan, root: &NodeKey, now: OffsetDateTime) -> Result<Changes, 
 /// One plan's ingest, and the removals the root lists after it.
 struct Batch {
     request: IngestRequest,
-    listed: Vec<NodeKey>,
+    listed: BTreeSet<NodeKey>,
+}
+
+/// The removals the root still lists whose fact is live. One whose fact is
+/// gone is done and drops off the list. Only a live fact of this root is
+/// ever removed, so a key that is not one of its facts is never deleted.
+fn pending(stored: &Stored) -> BTreeSet<NodeKey> {
+    stored
+        .facts
+        .iter()
+        .filter(|node| stored.root.removals.contains(node.node_key.as_str()))
+        .map(|node| NodeKey(node.node_key.clone()))
+        .collect()
 }
 
 /// The ingest of `plan` on the profile it was built on: its fact nodes, their
@@ -320,7 +368,7 @@ struct Batch {
 /// internal when the plan removes a key that is no live fact of the profile,
 /// or a fact or the root cannot be built.
 fn batch(
-    stored: Stored,
+    stored: &Stored,
     subject: &SubjectKey,
     plan: &Plan,
     versions: &dyn ProfileVersion,
@@ -334,15 +382,7 @@ fn batch(
         .collect();
 
     // @cpt-begin:cpt-cf-construct-algo-profile-writer-write:p1:inst-write-pending
-    // Earlier removals still listed: one whose fact is gone is done and drops
-    // off the list. Only a live fact of this root is ever removed, so a key
-    // that is not one of its facts is never deleted.
-    let mut listed: BTreeSet<NodeKey> = stored
-        .root
-        .removals
-        .into_iter()
-        .filter(|key| live.contains(key.0.as_str()))
-        .collect();
+    let mut listed = pending(stored);
     // @cpt-end:cpt-cf-construct-algo-profile-writer-write:p1:inst-write-pending
 
     // @cpt-begin:cpt-cf-construct-algo-profile-writer-write:p1:inst-write-batch
@@ -364,15 +404,12 @@ fn batch(
     if facts > max_facts {
         return Err(DomainError::ProfileFull(FullProfile {
             subject: *subject,
-            facts,
+            facts: FactCount::WouldHold(facts),
             limit: max_facts,
         }));
     }
     listed.extend(removals);
-    // Sorted and without duplicates, as the set it comes from.
-    let root_now = Root {
-        removals: listed.into_iter().collect(),
-    };
+    let root_now = Root { removals: listed };
     let payload = root_now.payload(subject.subject_id, versions, versions.next(stored.version)?)?;
     nodes.push(NodeSpec {
         node_key: root.0,
@@ -470,14 +507,33 @@ impl PlanWriter for GraphPlanWriter {
         }
         // @cpt-end:cpt-cf-construct-algo-profile-writer-write:p1:inst-write-read-root
 
-        let Batch { request, listed } = batch(
-            stored,
-            subject.key(),
-            plan,
-            self.ports.version.as_ref(),
-            self.max_facts,
-            OffsetDateTime::now_utc(),
-        )?;
+        let build = |stored: &Stored| {
+            batch(
+                stored,
+                subject.key(),
+                plan,
+                self.ports.version.as_ref(),
+                self.max_facts,
+                OffsetDateTime::now_utc(),
+            )
+        };
+        let waiting = pending(&stored);
+        let Batch { request, listed } = match build(&stored) {
+            // @cpt-begin:cpt-cf-construct-algo-profile-writer-write:p1:inst-write-full
+            // Facts listed for removal count until their delete has run, and
+            // only a stored write runs it. Run those deletes now and build
+            // once more, so failed deletes do not keep the profile full.
+            Err(DomainError::ProfileFull(_)) if !waiting.is_empty() => {
+                self.remove(ctx, &waiting).await;
+                let stored = self.read(ctx, &subject).await?;
+                if stored.version != expected {
+                    return Ok(Written::Conflict);
+                }
+                build(&stored)?
+            }
+            // @cpt-end:cpt-cf-construct-algo-profile-writer-write:p1:inst-write-full
+            built => built?,
+        };
         match self.ingest(ctx, request).await? {
             Written::Stored => {
                 // @cpt-begin:cpt-cf-construct-algo-profile-writer-write:p1:inst-write-cleanup

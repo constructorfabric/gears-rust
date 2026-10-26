@@ -1,6 +1,6 @@
 use crate::api::rest::error::for_rest;
 use crate::domain::error::DomainError;
-use crate::domain::profile::FullProfile;
+use crate::domain::profile::{FactCount, FullProfile};
 use crate::domain::record_intake::{Place, Refusal, RefusalReason};
 use crate::domain::subject_settings::SubjectKey;
 use toolkit_canonical_errors::{CanonicalError, Problem};
@@ -148,7 +148,7 @@ fn a_full_profile_maps_to_a_failed_precondition_without_leaking_detail() {
     };
     let problem = wire(DomainError::ProfileFull(FullProfile {
         subject,
-        facts: 1000,
+        facts: FactCount::WouldHold(1000),
         limit: 999,
     }));
 
