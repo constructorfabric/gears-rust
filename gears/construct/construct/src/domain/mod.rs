@@ -16,6 +16,7 @@ pub mod model_client;
 pub mod plan;
 pub mod planner;
 pub mod profile;
+pub mod profile_read;
 pub mod record_intake;
 pub mod refusal;
 pub mod sensitive_data;
@@ -25,7 +26,11 @@ pub mod subject_settings;
 #[cfg(test)]
 mod admission_test;
 #[cfg(test)]
+mod local_client_test;
+#[cfg(test)]
 mod plan_test;
+#[cfg(test)]
+mod profile_read_test;
 #[cfg(test)]
 mod record_intake_test;
 #[cfg(test)]

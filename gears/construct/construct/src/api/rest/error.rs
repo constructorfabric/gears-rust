@@ -98,6 +98,7 @@ pub fn for_settings(e: DomainError) -> CanonicalError {
         // The settings routes refuse no record; a refusal here is mapped like
         // any other error.
         e @ (DomainError::Refused(_)
+        | DomainError::NotVisible(_)
         | DomainError::Unavailable(_)
         | DomainError::Internal(_)
         | DomainError::ProfileFull(_)
@@ -141,6 +142,7 @@ pub fn for_facts(e: DomainError, subject_id: Uuid) -> CanonicalError {
         | DomainError::Unavailable(_)
         | DomainError::Internal(_)
         | DomainError::ProfileFull(_)
+        | DomainError::NotVisible(_)
         | DomainError::Database(_)) => e.into(),
     }
 }
@@ -170,6 +172,16 @@ impl From<DomainError> for CanonicalError {
             }
             // @cpt-end:cpt-cf-construct-algo-gear-foundation-map-errors:p1:inst-map-forbidden-return
             // @cpt-end:cpt-cf-construct-algo-gear-foundation-map-errors:p1:inst-map-forbidden
+            // @cpt-begin:cpt-cf-construct-algo-profile-reader-read:p1:inst-read-hide
+            // A subject the caller may not see is answered like one that does
+            // not exist, on every transport.
+            DomainError::NotVisible(msg) => {
+                tracing::warn!(msg = %msg, "construct profile read refused");
+                ProfileError::not_found("no such subject")
+                    .with_resource("subject")
+                    .create()
+            }
+            // @cpt-end:cpt-cf-construct-algo-profile-reader-read:p1:inst-read-hide
             // @cpt-begin:cpt-cf-construct-algo-gear-foundation-map-errors:p1:inst-map-unavailable
             // @cpt-begin:cpt-cf-construct-algo-gear-foundation-map-errors:p1:inst-map-unavailable-return
             DomainError::Unavailable(msg) => {

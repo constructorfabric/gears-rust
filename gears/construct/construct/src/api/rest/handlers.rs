@@ -9,13 +9,13 @@ use tracing::Instrument as _;
 use uuid::Uuid;
 
 use crate::api::rest::error::{for_facts, for_rest, for_settings, too_long};
-use crate::api::rest::types::{ConcreteIntake, ConcreteSettings};
+use crate::api::rest::types::{ConcreteIntake, ConcreteProfile, ConcreteSettings};
 use crate::domain::planner::manage::ManageFacts;
 use crate::domain::record_intake::IntakeOutcome;
 
 use super::dto::{
-    ManageFactsRequest, ManageFactsResponse, PutSubjectSettingsRequest, RecordOutcomeDto,
-    RecordQuery, RecordRequest, SubjectSettingsDto,
+    ManageFactsRequest, ManageFactsResponse, ProfileDto, ProfileQuery, PutSubjectSettingsRequest,
+    RecordOutcomeDto, RecordQuery, RecordRequest, SubjectSettingsDto,
 };
 
 /// The answer's status: 202 for a received record, which is processed later,
@@ -113,4 +113,39 @@ pub async fn manage_facts(
         .await
         .map_err(|error| for_facts(error, subject_id))?;
     Ok(Json(ManageFactsResponse::from(managed)))
+}
+
+/// @cpt-dod:cpt-cf-construct-dod-profile-reader-route:p1
+pub async fn get_profile(
+    // @cpt-begin:cpt-cf-construct-flow-profile-reader-read:p1:inst-profile-parse
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(svc): Extension<Arc<ConcreteProfile>>,
+    Path(subject_id): Path<Uuid>,
+    Query(query): Query<ProfileQuery>,
+    // @cpt-end:cpt-cf-construct-flow-profile-reader-read:p1:inst-profile-parse
+) -> ApiResult<impl IntoResponse> {
+    // @cpt-begin:cpt-cf-construct-flow-profile-reader-read:p1:inst-profile-serve
+    // The error is mapped, and so logged, inside this span, so the log names
+    // the caller, the subject and the tenant.
+    let tenant = query.tenant.unwrap_or_else(|| ctx.subject_tenant_id());
+    let span = tracing::info_span!(
+        "profile_read",
+        %subject_id,
+        caller = %ctx.subject_id(),
+        tenant_id = %tenant
+    );
+    let profile = async {
+        svc.read(&ctx, query.tenant, subject_id)
+            .await
+            .map_err(for_rest)
+    }
+    .instrument(span)
+    .await?;
+    // @cpt-end:cpt-cf-construct-flow-profile-reader-read:p1:inst-profile-serve
+    // @cpt-begin:cpt-cf-construct-flow-profile-reader-read:p1:inst-profile-return
+    Ok((
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(ProfileDto::from(profile)),
+    ))
+    // @cpt-end:cpt-cf-construct-flow-profile-reader-read:p1:inst-profile-return
 }
