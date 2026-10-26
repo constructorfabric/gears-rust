@@ -32,14 +32,18 @@ pub struct Root {
 }
 
 impl Root {
-    /// Read a stored root's payload.
+    /// Read the payload of `subject_id`'s stored root.
     ///
     /// # Errors
     ///
     /// When the payload is not a root's, which graph storage's validation
-    /// rules out; it is a defect, not a state to repair. The message names
-    /// the root and what is wrong with it.
-    pub fn from_payload(key: &NodeKey, payload: Option<&Value>) -> Result<Self, DomainError> {
+    /// rules out, or names another subject; either is a defect, not a state
+    /// to repair. The message names the root and what is wrong with it.
+    pub fn from_payload(
+        key: &NodeKey,
+        subject_id: Uuid,
+        payload: Option<&Value>,
+    ) -> Result<Self, DomainError> {
         let payload = payload.ok_or_else(|| {
             DomainError::internal(format!("profile root {} has no payload", key.0))
         })?;
@@ -49,6 +53,12 @@ impl Root {
                 key.0
             ))
         })?;
+        if parsed.subject_id != subject_id {
+            return Err(DomainError::internal(format!(
+                "profile root {} names subject {}, not {subject_id}",
+                key.0, parsed.subject_id
+            )));
+        }
         Ok(Self {
             removals: parsed.removals.into_iter().map(NodeKey).collect(),
         })

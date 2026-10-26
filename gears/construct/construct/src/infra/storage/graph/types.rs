@@ -8,7 +8,7 @@ use graph_storage_sdk::models::TypeRegistration;
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
-use super::{DEFAULT_CALL_TIMEOUT, bounded, graph_error};
+use super::{DEFAULT_CALL_TIMEOUT, bounded};
 use crate::domain::error::DomainError;
 
 /// Registers Construct's graph types in a tenant before the first write there.
@@ -80,8 +80,7 @@ impl GraphTypes {
             "type registration",
             self.client.register_types(ctx, batch),
         )
-        .await?
-        .map_err(|err| graph_error("type registration", &err))?;
+        .await?;
         if let Ok(mut registered) = self.registered.lock() {
             registered.insert(tenant_id);
         }

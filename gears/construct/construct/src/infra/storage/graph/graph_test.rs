@@ -429,7 +429,9 @@ impl Profiles {
     async fn root(&self) -> Option<Root> {
         let key = root_key(&self.subject_key());
         match self.client.get_node(&self.ctx, &key.0, None).await {
-            Ok(node) => Some(Root::from_payload(&key, node.payload.as_ref()).unwrap()),
+            Ok(node) => {
+                Some(Root::from_payload(&key, self.subject, node.payload.as_ref()).unwrap())
+            }
             Err(CanonicalError::NotFound { .. }) => None,
             Err(err) => panic!("root read: {err}"),
         }
@@ -702,6 +704,99 @@ async fn a_root_written_outside_construct_refuses_every_write_as_a_defect() {
         }
     }
     assert_eq!(profiles.read().await.facts.len(), 1, "nothing landed");
+}
+
+#[tokio::test]
+async fn a_new_fact_whose_key_is_held_is_a_defect_and_stores_nothing() {
+    let profiles = Profiles::new();
+    profiles.given(None, vec![add_skill("Rust")]).await;
+    let plan = profiles.plan(Some(1), vec![add_skill("Go")]);
+    // Someone else holds the key the plan's new fact claims.
+    let held = super::fact::fact_node(&plan, &plan.steps[0], time::OffsetDateTime::now_utc())
+        .unwrap()
+        .unwrap();
+    profiles
+        .ingest_directly(IngestRequest {
+            nodes: vec![held],
+            ..IngestRequest::default()
+        })
+        .await;
+
+    let written = profiles.writer().write(&profiles.ctx, &plan).await;
+
+    match written {
+        Err(DomainError::Internal(msg)) => {
+            assert!(msg.contains("a key a new fact claims"), "{msg}");
+        }
+        other => panic!("{other:?}"),
+    }
+    let profile = profiles.read().await;
+    assert_eq!(profile.version, Some(1));
+    assert_eq!(values(&profile), skill_values(&["Rust"]));
+}
+
+// --- Roots that are not Construct's ----------------------------------------------
+
+#[tokio::test]
+async fn a_root_key_held_by_another_type_is_a_defect() {
+    let profiles = Profiles::new();
+    // A neighbour's write registers the types in the tenant.
+    profiles
+        .neighbour()
+        .given(None, vec![add_skill("Go")])
+        .await;
+    // A fact node under the subject's root key.
+    let plan = profiles.plan(None, vec![add_skill("Rust")]);
+    let mut node = super::fact::fact_node(&plan, &plan.steps[0], time::OffsetDateTime::now_utc())
+        .unwrap()
+        .unwrap();
+    node.node_key = root_key(&profiles.subject_key()).0;
+    profiles
+        .ingest_directly(IngestRequest {
+            nodes: vec![node],
+            ..IngestRequest::default()
+        })
+        .await;
+
+    let read = profiles
+        .reader()
+        .read(&profiles.ctx, profiles.tenant, profiles.subject)
+        .await;
+
+    match read {
+        Err(DomainError::Internal(msg)) => assert!(msg.contains("held by a node of type"), "{msg}"),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_has_fact_edge_to_a_node_of_no_person_type_is_a_defect() {
+    let profiles = Profiles::new();
+    let other = profiles.neighbour();
+    other.given(None, vec![add_skill("Rust")]).await;
+    profiles.given(None, vec![add_skill("Go")]).await;
+    profiles
+        .ingest_directly(IngestRequest {
+            edges: vec![EdgeSpec {
+                type_id: construct_sdk::gts::HAS_FACT_TYPE.to_owned(),
+                src_node_key: root_key(&profiles.subject_key()).0,
+                dst_node_key: root_key(&other.subject_key()).0,
+                discriminator: None,
+                payload: None,
+            }],
+            ..IngestRequest::default()
+        })
+        .await;
+
+    let read = profiles
+        .reader()
+        .read(&profiles.ctx, profiles.tenant, profiles.subject)
+        .await;
+
+    match read {
+        Err(DomainError::Internal(msg)) => assert!(msg.contains("no person type"), "{msg}"),
+        other => panic!("{other:?}"),
+    }
 }
 
 // --- Removals ------------------------------------------------------------------
@@ -1191,6 +1286,74 @@ async fn a_write_whose_answer_was_lost_is_sent_again_with_its_key_and_lands_once
 }
 
 #[tokio::test]
+async fn a_refusal_after_a_send_without_an_answer_replays_the_committed_send() {
+    let profiles = Profiles::new();
+    let scripted = Scripted::over(Arc::clone(&profiles.client));
+    // The first send commits but its answer is lost; the resend then loses the
+    // compare-and-set to it, as when it missed the first send's receipt.
+    scripted.script([Ingest::LoseAnswer, Ingest::Fail(cas_conflict)]);
+
+    let written = profiles
+        .scripted_writer(&scripted)
+        .write(&profiles.ctx, &profiles.plan(None, vec![add_skill("Rust")]))
+        .await
+        .unwrap();
+
+    assert_eq!(written, Written::Stored, "the receipt answers stored");
+    let keys = scripted.keys.lock().unwrap().clone();
+    assert_eq!(keys.len(), 3);
+    assert!(
+        keys.iter().all(|key| key.is_some() && *key == keys[0]),
+        "one key"
+    );
+    let profile = profiles.read().await;
+    assert_eq!(profile.version, Some(1), "landed once");
+    assert_eq!(profile.facts.len(), 1);
+}
+
+#[tokio::test]
+async fn a_refusal_is_replayed_once_at_most() {
+    let profiles = Profiles::new();
+    profiles.given(None, vec![add_skill("Rust")]).await;
+    let scripted = Scripted::over(Arc::clone(&profiles.client));
+    scripted.script([
+        Ingest::Fail(unavailable),
+        Ingest::Fail(cas_conflict),
+        Ingest::Fail(cas_conflict),
+    ]);
+
+    let written = profiles
+        .scripted_writer(&scripted)
+        .write(
+            &profiles.ctx,
+            &profiles.plan(Some(1), vec![add_skill("Go")]),
+        )
+        .await;
+
+    assert_eq!(scripted.ingest_calls.load(Ordering::SeqCst), 3);
+    assert!(!matches!(written, Ok(Written::Stored)), "{written:?}");
+}
+
+#[tokio::test]
+async fn a_refusal_without_an_unknown_send_is_not_replayed() {
+    let profiles = Profiles::new();
+    profiles.given(None, vec![add_skill("Zig")]).await;
+    let scripted = Scripted::over(Arc::clone(&profiles.client));
+    scripted.script([Ingest::Fail(cas_conflict)]);
+
+    let written = profiles
+        .scripted_writer(&scripted)
+        .write(
+            &profiles.ctx,
+            &profiles.plan(Some(1), vec![add_skill("Go")]),
+        )
+        .await;
+
+    assert_eq!(scripted.ingest_calls.load(Ordering::SeqCst), 1);
+    assert!(!matches!(written, Ok(Written::Stored)), "{written:?}");
+}
+
+#[tokio::test]
 async fn a_lost_serialization_race_is_sent_again() {
     let profiles = Profiles::new();
     let scripted = Scripted::over(Arc::clone(&profiles.client));
@@ -1204,6 +1367,12 @@ async fn a_lost_serialization_race_is_sent_again() {
 
     assert_eq!(written, Written::Stored);
     assert_eq!(scripted.ingest_calls.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn a_write_is_sent_three_times_at_most_and_each_call_waits_ten_seconds() {
+    assert_eq!(DEFAULT_ATTEMPTS.get(), 3);
+    assert_eq!(DEFAULT_CALL_TIMEOUT, Duration::from_secs(10));
 }
 
 #[tokio::test(start_paused = true)]

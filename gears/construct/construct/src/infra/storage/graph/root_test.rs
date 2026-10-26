@@ -51,16 +51,31 @@ fn a_root_payload_reads_back_as_written_with_the_counter_stamped() {
         payload,
         json!({ "subject_id": subject.to_string(), "version": 4, "removals": ["construct:t:a"] })
     );
-    assert_eq!(Root::from_payload(&key(), Some(&payload)).unwrap(), root);
+    assert_eq!(
+        Root::from_payload(&key(), subject, Some(&payload)).unwrap(),
+        root
+    );
+}
+
+#[test]
+fn a_root_that_names_another_subject_is_a_defect() {
+    let payload = Root::default()
+        .payload(Uuid::new_v4(), &PayloadCounter, 1)
+        .unwrap();
+
+    let message = internal_message(Root::from_payload(&key(), Uuid::new_v4(), Some(&payload)));
+
+    assert!(message.contains("construct:t:root:s"), "{message}");
+    assert!(message.contains("names subject"), "{message}");
 }
 
 #[test]
 fn a_root_without_a_valid_payload_names_the_root_and_what_is_wrong() {
-    let no_payload = internal_message(Root::from_payload(&key(), None));
+    let no_payload = internal_message(Root::from_payload(&key(), Uuid::new_v4(), None));
     assert!(no_payload.contains("construct:t:root:s"), "{no_payload}");
 
     let broken: Value = json!({ "subject_id": Uuid::new_v4().to_string(), "removals": [3] });
-    let message = internal_message(Root::from_payload(&key(), Some(&broken)));
+    let message = internal_message(Root::from_payload(&key(), Uuid::new_v4(), Some(&broken)));
     assert!(message.contains("construct:t:root:s"), "{message}");
     assert!(
         message.contains("invalid type"),

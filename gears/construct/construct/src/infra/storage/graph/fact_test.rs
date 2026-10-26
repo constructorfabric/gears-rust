@@ -84,13 +84,15 @@ fn a_confidence_is_stored_as_the_decimal_the_model_gave() {
 }
 
 #[test]
-fn a_confidence_that_is_no_number_is_a_defect() {
-    let mut plan = connector_plan(vec![add_value("skill", "skills", skills())]);
-    plan.steps[0].confidence = Some(f32::NAN);
+fn a_confidence_that_is_no_finite_number_is_a_defect() {
+    for given in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+        let mut plan = connector_plan(vec![add_value("skill", "skills", skills())]);
+        plan.steps[0].confidence = Some(given);
 
-    let message = internal(fact_node(&plan, &plan.steps[0], now()));
+        let message = internal(fact_node(&plan, &plan.steps[0], now()));
 
-    assert!(message.contains("confidence"), "{message}");
+        assert!(message.contains("confidence"), "{given}: {message}");
+    }
 }
 
 #[test]
@@ -305,16 +307,6 @@ fn a_records_time_is_stored_in_utc() {
     assert_eq!(payload["origin"]["produced_at"], "2026-10-20T12:00:00Z");
 }
 
-#[test]
-fn an_infinite_confidence_is_a_defect() {
-    let mut plan = connector_plan(vec![add_value("skill", "skills", skills())]);
-    plan.steps[0].confidence = Some(f32::INFINITY);
-
-    let message = internal(fact_node(&plan, &plan.steps[0], now()));
-
-    assert!(message.contains("confidence"), "{message}");
-}
-
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(256))]
 
@@ -328,8 +320,41 @@ proptest! {
         let payload = node_of(&plan).payload.unwrap();
 
         let stored = payload["origin"]["confidence"].as_f64().expect("a number");
-        #[allow(clippy::cast_possible_truncation, reason = "the value was an f32")]
+        #[expect(clippy::cast_possible_truncation, reason = "the value was an f32")]
         let back = stored as f32;
         prop_assert_eq!(back.to_bits(), given.to_bits(), "{} came back as {}", given, back);
+    }
+
+    /// Whatever fact a step stores, from whatever source, reads back as the
+    /// same category, property and value.
+    #[test]
+    fn a_stored_fact_reads_back_as_written(
+        category in prop::sample::select(Category::ALL.to_vec()),
+        property in "[a-z_]{1,16}".prop_filter("no envelope member", |name| {
+            name != "origin" && name != "record"
+        }),
+        value in ".*",
+        source in 0_usize..4,
+    ) {
+        let step = add_value(category.name(), &property, json!(value));
+        let plan = connector_plan(vec![step]);
+        let someone = Uuid::new_v4();
+        let plan = match source {
+            0 => plan,
+            1 => {
+                let mut plan = plan;
+                plan.origin = Origin::Agent { agent: someone };
+                plan
+            }
+            2 => by_a_person(plan, Origin::Reviewer { reviewer: someone }),
+            _ => by_a_person(plan, Origin::Administrator { administrator: someone }),
+        };
+        let node = node_of(&plan);
+
+        let fact = fact_of(&view(&node.type_id, node.payload)).expect("a fact");
+
+        prop_assert_eq!(fact.category, category);
+        prop_assert_eq!(fact.property, property);
+        prop_assert_eq!(fact.value, json!(value));
     }
 }
