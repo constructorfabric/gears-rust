@@ -22,6 +22,7 @@ use usage_collector_sdk::{UsageCollectorPluginError, UsageKind, UsageType, Usage
 use super::{ChCatalogStore, RefreshOutcome};
 use crate::domain::ports::CatalogStore;
 use crate::infra::metrics::Metrics;
+use crate::infra::storage::topology::Topology;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -53,6 +54,7 @@ pub(super) fn offline_store(cancel: CancellationToken) -> ChCatalogStore {
         cancel,
         Arc::new(Metrics::new()),
         TEST_DEADLINE,
+        Topology::SingleNode,
     )
 }
 
@@ -146,6 +148,7 @@ async fn worker_exits_when_cancelled_during_an_in_flight_count() {
         cancel.clone(),
         Arc::new(Metrics::new()),
         TEST_DEADLINE,
+        Topology::SingleNode,
     );
 
     store.request_catalog_size_refresh();
@@ -201,6 +204,7 @@ async fn a_black_holed_socket_is_cut_off_by_the_client_side_deadline() {
         CancellationToken::new(),
         Arc::new(Metrics::new()),
         deadline,
+        Topology::SingleNode,
     );
 
     let gts_id =
@@ -260,6 +264,7 @@ async fn delete_surfaces_a_backend_failure_on_its_existence_read() {
         CancellationToken::new(),
         Arc::new(Metrics::new()),
         deadline,
+        Topology::SingleNode,
     );
 
     let gts_id =
@@ -396,6 +401,7 @@ async fn a_stalled_catalog_size_refresh_is_cut_off_by_the_client_side_deadline()
         CancellationToken::new(),
         Arc::new(Metrics::new()),
         deadline,
+        Topology::SingleNode,
     );
 
     let started = std::time::Instant::now();
@@ -696,8 +702,10 @@ mod live {
     use crate::domain::ports::CatalogStore;
     use crate::infra::metrics::Metrics;
     use crate::infra::storage::catalog_store::ChCatalogStore;
-    use crate::infra::storage::pool::{apply_migrations, ensure_retention_ttl};
+    use crate::infra::storage::migrator::{MigrationOptions, run_migrations};
+    use crate::infra::storage::pool::ensure_retention_ttl;
     use crate::infra::storage::test_ch_server;
+    use crate::infra::storage::topology::Topology;
 
     /// Ceiling on [`start`] as a whole: the shared server's boot (or the wait
     /// for a sibling's), the per-test database, and the migrations. Must stay
@@ -721,12 +729,21 @@ mod live {
                 .with_password(test_ch_server::PASSWORD)
                 .with_database(database);
 
-            apply_migrations(&client, super::TEST_DEADLINE)
+            let opts = MigrationOptions {
+                retention_period_secs: 365 * 24 * 3600,
+                statement_timeout_secs: None,
+            };
+            run_migrations(&client, &Topology::SingleNode, opts, super::TEST_DEADLINE)
                 .await
                 .expect("schema migrations must succeed on the live test database");
-            ensure_retention_ttl(&client, 365 * 24 * 3600, super::TEST_DEADLINE)
-                .await
-                .expect("retention TTL reconcile must succeed on the live test database");
+            ensure_retention_ttl(
+                &client,
+                &Topology::SingleNode,
+                365 * 24 * 3600,
+                super::TEST_DEADLINE,
+            )
+            .await
+            .expect("retention TTL reconcile must succeed on the live test database");
             client
         })
         .await
@@ -737,6 +754,7 @@ mod live {
             CancellationToken::new(),
             Arc::new(Metrics::new()),
             super::TEST_DEADLINE,
+            Topology::SingleNode,
         );
         (store, client)
     }

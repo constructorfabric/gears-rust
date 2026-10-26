@@ -62,6 +62,7 @@ use crate::infra::storage::query::translate::{
     SqlCtx, bind_one, translate_usage_type_filter, usage_type_column,
 };
 use crate::infra::storage::query::{DEFAULT_PAGE_SIZE, effective_page_size};
+use crate::infra::storage::topology::Topology;
 
 // ── Static column list ────────────────────────────────────────────────────────
 
@@ -79,16 +80,11 @@ const TYPE_COLUMNS: &str = "gts_id, kind, metadata_fields, version";
 /// reference plugin's `REF_COUNT_CAP`.
 const REF_COUNT_CAP: u64 = 1000;
 
-/// `mutations_sync` value used by both `ALTER TABLE … DELETE` statements.
-///
-/// `1` waits for the mutation to complete on the server that received it,
-/// which is what makes `delete` observable to the caller's next read. `2`
-/// (wait for all replicas) is deliberately not used: the shipped engine is
-/// non-replicated `ReplacingMergeTree`, so there is no replica to wait for,
-/// and on a replicated deployment the cross-node visibility lag is called out
-/// as an accepted residual on [`CatalogStore::delete`] rather than paid for on
-/// every request.
-const MUTATIONS_SYNC: &str = "1";
+// `mutations_sync` for both `ALTER TABLE … DELETE` statements comes from
+// `Topology::mutations_sync`: `1` on a single node (wait for the receiving
+// server, which makes `delete` observable to the caller's next read), `2` on a
+// sharded cluster (wait for every replica, since the next read goes through a
+// `Distributed` table and may land on any of them).
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -126,6 +122,9 @@ pub struct ChCatalogStore {
     metrics: Arc<Metrics>,
     /// Client-side deadline applied to every individual `ClickHouse` await.
     request_timeout: Duration,
+    /// Physical table layout; maps the logical table names onto the tables a
+    /// mutation must target.
+    topology: Topology,
     /// Gear shutdown token; races the background catalog-size refresh so a
     /// shutdown drops the in-flight `count()` promptly.
     cancel: CancellationToken,
@@ -162,6 +161,11 @@ impl ChCatalogStore {
     /// wiring change cannot silently leave a store on a default that disagrees
     /// with the configured budget.
     ///
+    /// `topology` decides which physical table each catalog-delete mutation
+    /// targets; production wiring passes `Topology::from_config`. Explicit for
+    /// the same reason: a store defaulting to single-node on a cluster would
+    /// issue a mutation the `Distributed` table refuses.
+    ///
     /// # Panics
     ///
     /// Panics if called outside the context of a Tokio runtime: the refresh
@@ -174,11 +178,13 @@ impl ChCatalogStore {
         cancel: CancellationToken,
         metrics: Arc<Metrics>,
         request_timeout: Duration,
+        topology: Topology,
     ) -> Self {
         let store = Self {
             client,
             metrics,
             request_timeout,
+            topology,
             cancel,
             refresh_signal: Arc::new(Notify::new()),
             #[cfg(test)]
@@ -434,15 +440,16 @@ impl ChCatalogStore {
         table: &str,
         gts_id: &UsageTypeGtsId,
     ) -> Result<(), UsageCollectorPluginError> {
-        // `table` is a `'static` caller literal, never caller input; `gts_id`
-        // is bound.
-        let sql = format!("ALTER TABLE {table} DELETE WHERE gts_id = ?");
+        // `table` is a `'static` caller literal, never caller input; the
+        // topology maps it to the physical table (the shard-local one
+        // `ON CLUSTER` on a cluster) from validated config; `gts_id` is bound.
+        let sql = self.topology.delete_where_sql(table);
         with_deadline(
             &self.metrics,
             self.request_timeout,
             self.client
                 .query(&sql)
-                .with_setting("mutations_sync", MUTATIONS_SYNC)
+                .with_setting("mutations_sync", self.topology.mutations_sync())
                 .bind(gts_id.as_ref())
                 .execute(),
         )
@@ -716,9 +723,11 @@ impl CatalogStore for ChCatalogStore {
     ///   microseconds to the flush interval.
     /// - Two concurrent deletes for one `gts_id` both pass step 1 and both
     ///   return `Ok(())`; neither sees `UsageTypeNotFound`.
-    /// - `mutations_sync = 1` waits only for the receiving server, so on a
-    ///   replicated deployment another process can briefly still see the type
-    ///   and accept a record for it.
+    /// - On a single node `mutations_sync = 1` waits only for the receiving
+    ///   server, so on an operator-replicated single-shard deployment another
+    ///   process can briefly still see the type and accept a record for it.
+    ///   The cluster topology waits for every replica (`mutations_sync = 2`)
+    ///   instead.
     /// - A step-3 or step-4 timeout abandons the client await while the server
     ///   keeps applying the mutation, leaving the operation half-applied.
     ///

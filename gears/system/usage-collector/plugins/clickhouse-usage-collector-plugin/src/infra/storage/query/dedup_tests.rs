@@ -115,12 +115,11 @@ fn latest_by_orders_version_descending() {
 // ── RECORD_DEDUP_KEY ─────────────────────────────────────────────────────────
 
 #[test]
-fn record_dedup_key_matches_the_migration_order_by() {
-    // Must stay in lock-step with `ORDER BY (gts_id, tenant_id, created_at, id)`
-    // in migrations/0001_init.sql — that tuple is what the engine collapses on,
-    // so a column added or dropped here silently resolves the wrong row. The
-    // column *order* is cosmetic (`LIMIT 1 BY` is order-insensitive), but it is
-    // pinned so the emitted SQL stays readable against the DDL.
+fn record_dedup_key_is_pinned() {
+    // The schema's ORDER BY is this constant, so changing it changes the sort
+    // key of fresh tables — but not of existing ones, which `ORDER BY` cannot
+    // be altered on. That tuple is what the engine collapses on, so a column
+    // added or dropped here silently resolves the wrong row on old tables.
     assert_eq!(
         RECORD_DEDUP_KEY,
         &["gts_id", "tenant_id", "created_at", "id"]

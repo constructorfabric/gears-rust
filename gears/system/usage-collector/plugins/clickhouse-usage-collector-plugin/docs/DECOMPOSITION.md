@@ -34,15 +34,15 @@ The load-bearing difference from the reference plugin's decomposition is that **
 
 - [x] `p1` - **ID**: `cpt-cf-uc-ch-plugin-feature-foundation`
 
-- **Purpose**: Establish the plugin's runtime substrate and its single public surface. At `#[toolkit::gear]` `init`, the Plugin Module loads and validates the typed configuration, builds the `clickhouse` crate client, runs the embedded-SQL schema provisioning (idempotent `CREATE TABLE IF NOT EXISTS` DDL with a fixed 1-year TTL default, no external migration-tracking table) and reconciles `usage_records` TTL to `retention_period_secs` via `ensure_retention_ttl` — the retention semantics are owned by [§2.5](#25-data-retention)), and performs the GTS handshake identical in shape to the reference plugin's. The SPI Storage Adapter is the host's only entry point, delegating to the stores and owning ClickHouse-error-to-`UsageCollectorPluginError` classification.
+- **Purpose**: Establish the plugin's runtime substrate and its single public surface. At `#[toolkit::gear]` `init`, the Plugin Module loads and validates the typed configuration, builds the `clickhouse` crate client, runs the pending versioned schema migrations (tracked steps over idempotent `CREATE TABLE IF NOT EXISTS` DDL with the configured TTL, one step list for both topologies) and reconciles `usage_records` TTL to `retention_period_secs` via `ensure_retention_ttl` — the retention semantics are owned by [§2.5](#25-data-retention)), and performs the GTS handshake identical in shape to the reference plugin's. The SPI Storage Adapter is the host's only entry point, delegating to the stores and owning ClickHouse-error-to-`UsageCollectorPluginError` classification.
 
 - **Depends On**: None
 
 - **Scope**:
   - Overall backend design node and tech stack (`toolkit::gear` + `types-registry-sdk` wiring, `usage-collector-sdk` domain types, `clickhouse`/`opentelemetry` infrastructure).
-  - Plugin Module lifecycle: config load, ClickHouse client construction (via `build_client` — parses `database_url` into a bare base URL plus separate user/password/database via `ParsedEndpoint`), schema migration invocation plus `ensure_retention_ttl` (DDL bakes a 1-year default; startup `ALTER TABLE … MODIFY TTL` when config differs) and `ensure_insert_dedup_window` (retrofits `non_replicated_deduplication_window` onto pre-existing tables), and GTS + ClientHub registration. Foundation owns the call sites; [§2.5](#25-data-retention) owns the retention semantics.
+  - Plugin Module lifecycle: config load, ClickHouse client construction (via `build_client` — parses `database_url` into a bare base URL plus separate user/password/database via `ParsedEndpoint`), schema migration invocation (`run_migrations`, whose step `m0002_insert_dedup_window` retrofits `non_replicated_deduplication_window` onto pre-existing tables) plus `ensure_retention_ttl` (DDL bakes a 1-year default; startup `ALTER TABLE … MODIFY TTL` when config differs), and GTS + ClientHub registration. Foundation owns the call sites; [§2.5](#25-data-retention) owns the retention semantics.
   - SPI Storage Adapter: pure delegation, no business logic, owns backend-error classification (realizing `cpt-cf-uc-ch-plugin-fr-error-classification`) and keyset cursor encoding.
-  - Schema Migration: the embedded `migrations/0001_init.sql` DDL runner (idempotent, re-runnable as a no-op; fixed 1-year TTL default) plus `ensure_retention_ttl`; `--` comment lines stripped and statements split while respecting single-quoted string literals before execution; no versioned-migration framework for non-TTL schema evolution (PRD.md §13 Open Questions).
+  - Schema Migration: the versioned migration runner (`infra/storage/migrator.rs`; named steps recorded in `usage_collector_migrations`, every step idempotent since there is no lock) with one step list for both topologies: each step (`infra/storage/migrator/mNNNN_*.rs`) declares logical tables and the migrator renders them per topology via the `ddl.rs` builder, with the configured retention as TTL, plus `ensure_retention_ttl`; each statement is rendered and executed on its own, so no SQL text is parsed or split. The cluster steps (`cluster.manage_schema`) live alongside them.
   - TLS-defaulted, secret-wrapped DSN (`secrecy::SecretString` with redacted `Debug`, no `Display`/`Serialize`, zeroized on drop).
   - Published (narrower, numerically-bounded) consistency profile per DESIGN.md §3.8.
 
@@ -50,7 +50,7 @@ The load-bearing difference from the reference plugin's decomposition is that **
   - Record insert/dedup/deactivate — [§2.2](#22-record-persistence--lifecycle).
   - Aggregation/list execution and query translation — [§2.3](#23-query--aggregation).
   - Usage-type CRUD and the delete-emulation protocol — [§2.4](#24-usage-type-catalog--referential-integrity).
-  - `TTL` clause ownership, the `retention_period_secs` config field, and retention/key-reuse semantics — [§2.5](#25-data-retention) in full; Foundation owns the fixed 1-year DDL default and the `ensure_retention_ttl` call site that reconciles the live clause to config on every `init`.
+  - `TTL` clause ownership, the `retention_period_secs` config field, and retention/key-reuse semantics — [§2.5](#25-data-retention) in full; Foundation owns the TTL in the migration DDL and the `ensure_retention_ttl` call site that reconciles the live clause to config on every `init`.
   - The `uc_clickhouse_*` metric inventory — [§2.6](#26-backend-observability--metrics).
   - ClickHouse cluster topology, sizing, HA — operator deployment guide.
 
@@ -234,7 +234,7 @@ The load-bearing difference from the reference plugin's decomposition is that **
 
 - [x] `p2` - **ID**: `cpt-cf-uc-ch-plugin-feature-retention`
 
-- **Purpose**: Own `usage_records` storage-growth bounding via ClickHouse's native `TTL` clause — both the `retention_period_secs` config field and the mechanism by which it takes effect at runtime. Foundation's Schema Migration creates `usage_records` with a fixed 1-year TTL default; on every `init`, `ensure_retention_ttl` compares the live TTL to `retention_period_secs` and issues `ALTER TABLE … MODIFY TTL` when they differ. The `usage_type_catalog` is reference data and is never retention-bounded.
+- **Purpose**: Own `usage_records` storage-growth bounding via ClickHouse's native `TTL` clause — both the `retention_period_secs` config field and the mechanism by which it takes effect at runtime. Foundation's Schema Migration creates `usage_records` with a TTL of `retention_period_secs`; on every `init`, `ensure_retention_ttl` compares the live TTL to `retention_period_secs` and issues `ALTER TABLE … MODIFY TTL` when they differ. The `usage_type_catalog` is reference data and is never retention-bounded.
 
 - **Depends On**: `cpt-cf-uc-ch-plugin-feature-foundation`
 
@@ -244,7 +244,7 @@ The load-bearing difference from the reference plugin's decomposition is that **
   - Documentation of the retention-vs-dedup-preservation coupling, mirroring the reference plugin's already-accepted risk class, and of the open gear-level reconciliation this narrowing shares with the reference plugin (PRD.md §13).
 
 - **Out of scope**:
-  - Creation of the `usage_records` table — [§2.1](#21-foundation-bootstrap-schema--spi-wiring); Foundation's `apply_migrations` / `ensure_retention_ttl` own the DDL and reconcile call sites; this feature owns the config field and retention semantics.
+  - Creation of the `usage_records` table — [§2.1](#21-foundation-bootstrap-schema--spi-wiring); Foundation's `run_migrations` / `ensure_retention_ttl` own the DDL and reconcile call sites; this feature owns the config field and retention semantics.
   - The dedup-write behavior itself — [§2.2](#22-record-persistence--lifecycle) (coupled here via key-reuse-after-expiry).
   - A general versioned-migration framework for non-TTL schema evolution — not in v1 scope (PRD.md §13); TTL itself is reconciled on every `init` via `ensure_retention_ttl`.
 
@@ -258,7 +258,7 @@ The load-bearing difference from the reference plugin's decomposition is that **
 
 - **Domain Model Entities**: `UsageRecord` (TTL-expired subject; not re-owned)
 
-- **Design Components**: None (Foundation's Schema Migration bakes a fixed 1-year TTL default at first provisioning and reconciles it to `retention_period_secs` on every `init` via `ensure_retention_ttl`; this feature owns the retention/key-reuse constraint, referencing those call sites rather than re-owning them).
+- **Design Components**: None (Foundation's Schema Migration bakes the configured TTL at first provisioning and reconciles it to `retention_period_secs` on every `init` via `ensure_retention_ttl`; this feature owns the retention/key-reuse constraint, referencing those call sites rather than re-owning them).
 
 - **API**: None (declarative backend policy; no SPI method).
 
@@ -302,7 +302,7 @@ The load-bearing difference from the reference plugin's decomposition is that **
 
 ### 2.7 Deliberate Omissions
 
-- **Multi-shard distributed-table topology and ClickHouse's own replication coordination** — governed by the operator's ClickHouse deployment guide, not by plugin features (PRD.md §4.2).
+- **Provisioning the multi-shard topology and ClickHouse's own replication coordination** — governed by the operator's ClickHouse deployment guide, not by plugin features (PRD.md §4.2). The plugin's opt-in cluster mode consumes that topology (`Distributed` tables over replicated local tables) and validates its schema at startup, but never provisions it.
 - **Product-level gear concerns** (authentication, PDP authorization, attribution/shape validation, idempotency-key presence, counter/gauge semantics, data classification) — owned by the parent Usage Collector gear, surfaced only as the pure-persistence boundary in [§2.1](#21-foundation-bootstrap-schema--spi-wiring).
 - **DB-enforced serializable dedup** — structurally unavailable on ClickHouse; not a deferred feature, a permanent architectural constraint documented in DESIGN.md §2.2/§3.6/§3.8 rather than assigned to a feature to "complete" later. (Referential integrity is in the same position: with no foreign key, [§2.4](#24-usage-type-catalog--referential-integrity)'s delete side bounds its concurrent-reference window via the probe/sweep protocol and [§2.2](#22-record-persistence--lifecycle)'s insert-time check, rather than closing it.)
 - **Read/write pool split for workload isolation** — noted as a possible future, additive revision in DESIGN.md §3.5 if production experience shows contention; not committed to v1 scope.

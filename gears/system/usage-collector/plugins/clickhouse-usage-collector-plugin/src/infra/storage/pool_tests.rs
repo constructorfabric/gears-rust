@@ -2,11 +2,10 @@ use std::time::Duration;
 
 use secrecy::ExposeSecret;
 
-use super::{
-    DEFAULT_RETENTION_SECS, MIGRATION_SQL, parse_endpoint, parse_ttl_seconds, split_sql_statements,
-    strip_line_comments,
-};
+use super::{DEFAULT_RETENTION_SECS, parse_endpoint, parse_ttl_seconds};
 use crate::config::is_plaintext_url;
+use crate::infra::storage::migrator::render_ddl;
+use crate::infra::storage::topology::Topology;
 
 /// Install a rustls `CryptoProvider` for this test process.
 ///
@@ -23,145 +22,6 @@ use crate::config::is_plaintext_url;
 /// `let _ =` satisfies `clippy::let_underscore_must_use`.
 fn install_test_crypto_provider() {
     drop(toolkit_security::tls::configured_provider().install_default());
-}
-
-// ---------------------------------------------------------------------------
-// Comment stripping ahead of `;`-splitting
-//
-// Regression coverage for the bug where a semicolon inside prose comment text
-// (this migration file literally has one: "...pg_advisory_lock equivalent;
-// unlike the reference plugin...") was treated as a statement boundary by a
-// naive `sql.split(';')`, producing a comment fragment (missing its `--`
-// prefix, left behind in the previous chunk) that ClickHouse then rejected as
-// a syntax error.
-// ---------------------------------------------------------------------------
-
-#[test]
-fn strip_line_comments_removes_full_comment_lines() {
-    let sql = "-- a comment\nCREATE TABLE t (x Int32);\n-- trailing comment";
-    let stripped = strip_line_comments(sql);
-    assert!(!stripped.contains("comment"));
-    assert!(stripped.contains("CREATE TABLE t (x Int32);"));
-}
-
-#[test]
-fn strip_line_comments_removes_semicolon_hidden_in_prose() {
-    // The exact sentence from this migration file's header, verbatim.
-    let sql = "-- ClickHouse has no pg_advisory_lock\n\
-               -- equivalent; unlike the reference plugin (TimescaleDB), no advisory-lock\n\
-               CREATE TABLE t (x Int32);";
-    let stripped = strip_line_comments(sql);
-    assert_eq!(
-        stripped.matches(';').count(),
-        1,
-        "the only semicolon left after stripping comments must be the real \
-         statement terminator, not the one in \"equivalent; unlike\": {stripped:?}"
-    );
-}
-
-/// A `--` comment trailing executable text on the same line must be stripped
-/// too: a semicolon inside such a comment would otherwise split the statement
-/// it trails and fail the startup DDL.
-#[test]
-fn strip_line_comments_removes_trailing_inline_comment() {
-    let sql = "CREATE TABLE t (x Int32) ENGINE = Memory; -- one; two\nSELECT 1;";
-    let stripped = strip_line_comments(sql);
-    assert!(!stripped.contains("one"), "got: {stripped:?}");
-    let statements = split_sql_statements(&stripped);
-    assert_eq!(
-        statements,
-        vec![
-            "CREATE TABLE t (x Int32) ENGINE = Memory".to_owned(),
-            "SELECT 1".to_owned(),
-        ]
-    );
-}
-
-/// A `--` inside a `COMMENT '...'` column annotation is string content, not a
-/// comment marker, and must survive stripping.
-#[test]
-fn strip_line_comments_keeps_double_dash_inside_string_literal() {
-    let sql = "CREATE TABLE t (x String COMMENT 'a -- b') ENGINE = Memory;";
-    assert_eq!(strip_line_comments(sql), sql);
-}
-
-#[test]
-fn migration_sql_after_comment_strip_yields_exactly_two_statements() {
-    let stripped = strip_line_comments(MIGRATION_SQL);
-    let statements = split_sql_statements(&stripped);
-    assert_eq!(
-        statements.len(),
-        2,
-        "expected exactly 2 executable DDL statements after stripping comments (2 CREATE TABLE), \
-         got: {statements:#?}"
-    );
-    for stmt in &statements {
-        assert!(
-            stmt.starts_with("CREATE TABLE IF NOT EXISTS"),
-            "unexpected statement kind: {stmt}"
-        );
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Quote-aware statement splitting -- `COMMENT '...'` column annotations in
-// this migration are prose that itself contains semicolons as punctuation
-// (e.g. "Usage type; application-enforced reference to..."), which must NOT
-// be treated as statement boundaries.
-// ---------------------------------------------------------------------------
-
-#[test]
-fn split_sql_statements_ignores_semicolon_inside_string_literal() {
-    let sql = "CREATE TABLE t (x String COMMENT 'a; b') ENGINE = Memory;";
-    let statements = split_sql_statements(sql);
-    assert_eq!(statements, vec![sql.trim_end_matches(';').to_owned()]);
-}
-
-#[test]
-fn split_sql_statements_splits_on_real_terminators() {
-    let sql =
-        "CREATE TABLE a (x Int32) ENGINE = Memory;\nCREATE TABLE b (y Int32) ENGINE = Memory;";
-    let statements = split_sql_statements(sql);
-    assert_eq!(statements.len(), 2);
-    assert!(statements[0].starts_with("CREATE TABLE a"));
-    assert!(statements[1].starts_with("CREATE TABLE b"));
-}
-
-#[test]
-fn split_sql_statements_handles_escaped_quote_inside_string() {
-    let sql = "CREATE TABLE t (x String COMMENT 'it''s; fine') ENGINE = Memory;";
-    let statements = split_sql_statements(sql);
-    assert_eq!(
-        statements.len(),
-        1,
-        "escaped '' must not end the string early"
-    );
-    assert!(statements[0].contains("it''s; fine"));
-}
-
-#[test]
-fn split_sql_statements_trims_and_skips_empty_segments() {
-    let sql = "  ;  CREATE TABLE t (x Int32) ENGINE = Memory;  ;  ";
-    let statements = split_sql_statements(sql);
-    assert_eq!(
-        statements,
-        vec!["CREATE TABLE t (x Int32) ENGINE = Memory".to_owned()]
-    );
-}
-
-/// A trailing statement without a terminating `;` still executes — dropping it
-/// would silently skip the last DDL statement of a migration file.
-#[test]
-fn split_sql_statements_keeps_unterminated_trailing_statement() {
-    let sql = "CREATE TABLE a (x Int32) ENGINE = Memory;\nCREATE TABLE b (y Int32) ENGINE = Memory";
-    let statements = split_sql_statements(sql);
-    assert_eq!(
-        statements,
-        vec![
-            "CREATE TABLE a (x Int32) ENGINE = Memory".to_owned(),
-            "CREATE TABLE b (y Int32) ENGINE = Memory".to_owned(),
-        ]
-    );
 }
 
 // ---------------------------------------------------------------------------
@@ -369,136 +229,6 @@ fn parse_ttl_seconds_returns_none_when_missing() {
 }
 
 #[test]
-fn migration_sql_contains_both_table_names() {
-    assert!(
-        MIGRATION_SQL.contains("usage_type_catalog"),
-        "migration SQL must create the usage_type_catalog table"
-    );
-    assert!(
-        MIGRATION_SQL.contains("usage_records"),
-        "migration SQL must create the usage_records table"
-    );
-}
-
-#[test]
-fn migration_sql_uses_replacingmergetree() {
-    assert!(
-        MIGRATION_SQL.contains("ReplacingMergeTree(version)"),
-        "both tables must use ReplacingMergeTree(version) engine"
-    );
-}
-
-#[test]
-fn migration_sql_uses_create_table_if_not_exists() {
-    // Count only the DDL statement lines (non-comment lines starting with CREATE).
-    let statement_count = MIGRATION_SQL
-        .lines()
-        .filter(|l| l.trim_start().starts_with("CREATE TABLE IF NOT EXISTS"))
-        .count();
-    assert_eq!(
-        statement_count, 2,
-        "migration must have exactly 2 idempotent CREATE TABLE IF NOT EXISTS DDL statements \
-         (comments that mention the phrase are intentionally excluded from this count)"
-    );
-}
-
-/// The records table must be partitioned on the TTL column, and TTL must run in
-/// whole-partition mode.
-///
-/// Both halves are one decision: `PARTITION BY toYYYYMM(created_at)` is what
-/// gives TTL whole parts to drop and time-range reads partitions to prune, and
-/// `ttl_only_drop_parts = 1` is what stops expiry from rewriting a part's every
-/// column to delete rows out of it. Partitioning on any column other than the
-/// TTL column would leave expired rows scattered across every partition, so
-/// nothing could ever be dropped whole.
-#[test]
-fn migration_sql_partitions_records_on_the_ttl_column() {
-    // Comments are stripped first: this file's own prose discusses the clause
-    // at length, so asserting against the raw text would pass on the
-    // explanation alone even if the DDL had lost the clause.
-    let stripped = strip_line_comments(MIGRATION_SQL);
-    let ddl = stripped
-        .split("CREATE TABLE IF NOT EXISTS usage_records")
-        .last()
-        .expect("migration must declare usage_records")
-        .to_owned();
-    assert!(
-        ddl.contains("PARTITION BY toYYYYMM(created_at)"),
-        "usage_records must partition monthly on created_at, the TTL column"
-    );
-    assert!(
-        ddl.contains("SETTINGS ttl_only_drop_parts = 1"),
-        "usage_records TTL must drop whole partitions rather than rewriting parts"
-    );
-}
-
-/// A partition key naming a column the TTL clause does not use would silently
-/// cost the whole-partition drop; `usage_type_catalog` has no TTL and stays
-/// unpartitioned.
-#[test]
-fn migration_sql_leaves_the_catalog_unpartitioned() {
-    let stripped = strip_line_comments(MIGRATION_SQL);
-    let catalog = stripped
-        .split("CREATE TABLE IF NOT EXISTS usage_records")
-        .next()
-        .expect("migration must declare usage_type_catalog first")
-        .to_owned();
-    assert!(
-        !catalog.contains("PARTITION BY"),
-        "usage_type_catalog carries no TTL and no time column, so partitioning it buys nothing"
-    );
-}
-
-#[test]
-fn migration_sql_has_default_one_year_ttl() {
-    assert!(
-        !MIGRATION_SQL.contains("{retention_period_secs}"),
-        "migration SQL must not contain a retention placeholder"
-    );
-    assert!(
-        MIGRATION_SQL.contains(&format!("INTERVAL {DEFAULT_RETENTION_SECS} SECOND")),
-        "migration SQL must bake the 1-year default TTL ({DEFAULT_RETENTION_SECS}s)"
-    );
-    assert!(
-        MIGRATION_SQL.contains("TTL created_at + INTERVAL"),
-        "migration TTL must use DateTime64 created_at directly, not toDateTime"
-    );
-    assert!(
-        !MIGRATION_SQL.contains("TTL toDateTime(created_at)"),
-        "migration TTL must not cast created_at through 32-bit toDateTime"
-    );
-    assert_eq!(DEFAULT_RETENTION_SECS, 31_536_000);
-}
-
-#[test]
-fn migration_sql_has_correct_order_by_for_catalog() {
-    // The catalog table uses a single-column sort key on gts_id.
-    // Verify the clause appears in the catalog table section.
-    let after_catalog = MIGRATION_SQL
-        .split("usage_type_catalog")
-        .nth(1)
-        .unwrap_or("");
-    let before_records = after_catalog
-        .split("usage_records")
-        .next()
-        .unwrap_or(after_catalog);
-    assert!(
-        before_records.contains("ORDER BY (gts_id)"),
-        "usage_type_catalog must use ORDER BY (gts_id)"
-    );
-}
-
-#[test]
-fn migration_sql_has_correct_order_by_for_records() {
-    // The records table uses the 4-tuple dedup key as ORDER BY.
-    let after_records = MIGRATION_SQL.split("usage_records").last().unwrap_or("");
-    assert!(
-        after_records.contains("ORDER BY (gts_id, tenant_id, created_at, id)"),
-        "usage_records must use the 4-tuple dedup key as ORDER BY"
-    );
-}
-
-#[test]
 fn build_client_accepts_https_url_with_auth_and_database() {
     use super::build_client;
     use secrecy::SecretString;
@@ -679,31 +409,6 @@ async fn configure_insert_with_async_insert_disabled_applies_only_timeouts() {
 
 // ── insert dedup window ───────────────────────────────────────────────────────
 
-/// Fresh deployments get the window from the DDL itself. Comments are stripped
-/// first for the same reason as the partition test: this file's prose names the
-/// setting too.
-#[test]
-fn migration_sql_enables_the_insert_dedup_window() {
-    let stripped = strip_line_comments(MIGRATION_SQL);
-    let ddl = stripped
-        .split("CREATE TABLE IF NOT EXISTS usage_records")
-        .last()
-        .expect("migration must declare usage_records")
-        .to_owned();
-    assert!(
-        ddl.contains(&format!(
-            "non_replicated_deduplication_window = {}",
-            super::INSERT_DEDUP_WINDOW_BLOCKS
-        )),
-        "usage_records must keep an insert dedup window matching INSERT_DEDUP_WINDOW_BLOCKS \
-         so ensure_insert_dedup_window is a no-op on a fresh table: {ddl}"
-    );
-    assert!(
-        ddl.contains("SETTINGS ttl_only_drop_parts = 1, non_replicated_deduplication_window"),
-        "the window joins the existing SETTINGS clause rather than adding a second one: {ddl}"
-    );
-}
-
 /// The live `create_table_query` interleaves server defaults into `SETTINGS`;
 /// the parser must find the window wherever it sits in that list.
 #[test]
@@ -723,30 +428,6 @@ fn parse_dedup_window_returns_none_when_missing() {
     let live = "CREATE TABLE default.usage_records (...) ENGINE = ReplacingMergeTree(version) \
                 SETTINGS ttl_only_drop_parts = 1, index_granularity = 8192";
     assert_eq!(super::parse_dedup_window(live), None);
-}
-// ── strip_line_comments: escaped quote pairs ─────────────────────────────────
-
-/// A doubled `''` inside a string literal is SQL's escape for a literal quote,
-/// not a string terminator. Treating it as one would flip the scanner's quote
-/// state and make the *rest* of the statement look like comment-eligible text:
-/// a following `--` inside the same literal would then be stripped, and the
-/// `;` that terminates the statement would be swallowed with it.
-#[test]
-fn strip_line_comments_keeps_an_escaped_quote_pair_inside_a_string_literal() {
-    let sql = "CREATE TABLE t (x Int32 COMMENT 'it''s -- not a comment');";
-    assert_eq!(
-        strip_line_comments(sql),
-        sql,
-        "`''` must stay inside the literal so the trailing `--` is not treated as a comment"
-    );
-}
-
-/// The escape must not leave the scanner inside a string either: text after the
-/// closing quote is ordinary source again, so a `--` there is a real comment.
-#[test]
-fn strip_line_comments_resumes_comment_stripping_after_an_escaped_quote_literal() {
-    let sql = "SELECT 'it''s' -- a real comment\nFROM t;";
-    assert_eq!(strip_line_comments(sql), "SELECT 'it''s' \nFROM t;");
 }
 
 // ── parse_ttl_seconds / parse_dedup_window: rejection paths ──────────────────
@@ -895,8 +576,11 @@ async fn black_holed_client() -> clickhouse::Client {
 const OFFLINE_DEADLINE: Duration = Duration::from_millis(300);
 
 #[tokio::test]
-async fn apply_migrations_fails_and_names_the_statement_when_the_backend_is_unreachable() {
-    let err = super::apply_migrations(&offline_client(), Duration::from_secs(5))
+async fn exec_statement_fails_and_names_the_statement_when_the_backend_is_unreachable() {
+    let ddl = render_ddl(&Topology::SingleNode, DEFAULT_RETENTION_SECS)
+        .await
+        .unwrap();
+    let err = super::exec_statement(&offline_client(), &ddl[0], Duration::from_secs(5))
         .await
         .expect_err("migrations cannot succeed against an unreachable backend");
 
@@ -913,9 +597,12 @@ async fn apply_migrations_fails_and_names_the_statement_when_the_backend_is_unre
 }
 
 #[tokio::test]
-async fn apply_migrations_reports_the_client_side_deadline_on_a_stalled_statement() {
+async fn exec_statement_reports_the_client_side_deadline_on_a_stalled_statement() {
+    let ddl = render_ddl(&Topology::SingleNode, DEFAULT_RETENTION_SECS)
+        .await
+        .unwrap();
     let started = std::time::Instant::now();
-    let err = super::apply_migrations(&black_holed_client().await, OFFLINE_DEADLINE)
+    let err = super::exec_statement(&black_holed_client().await, &ddl[0], OFFLINE_DEADLINE)
         .await
         .expect_err("a statement that never answers must not report success");
     let elapsed = started.elapsed();
@@ -934,9 +621,14 @@ async fn apply_migrations_reports_the_client_side_deadline_on_a_stalled_statemen
 
 #[tokio::test]
 async fn ensure_retention_ttl_fails_when_the_create_table_query_cannot_be_read() {
-    let err = super::ensure_retention_ttl(&offline_client(), 3600, Duration::from_secs(5))
-        .await
-        .expect_err("retention reconciliation cannot succeed without reading the live table");
+    let err = super::ensure_retention_ttl(
+        &offline_client(),
+        &Topology::SingleNode,
+        3600,
+        Duration::from_secs(5),
+    )
+    .await
+    .expect_err("retention reconciliation cannot succeed without reading the live table");
 
     let msg = format!("{err:#}");
     assert!(
@@ -948,9 +640,14 @@ async fn ensure_retention_ttl_fails_when_the_create_table_query_cannot_be_read()
 #[tokio::test]
 async fn ensure_retention_ttl_reports_the_client_side_deadline_on_a_stalled_metadata_read() {
     let started = std::time::Instant::now();
-    let err = super::ensure_retention_ttl(&black_holed_client().await, 3600, OFFLINE_DEADLINE)
-        .await
-        .expect_err("a metadata read that never answers must not report success");
+    let err = super::ensure_retention_ttl(
+        &black_holed_client().await,
+        &Topology::SingleNode,
+        3600,
+        OFFLINE_DEADLINE,
+    )
+    .await
+    .expect_err("a metadata read that never answers must not report success");
     let elapsed = started.elapsed();
 
     let msg = format!("{err:#}");
@@ -1004,12 +701,14 @@ mod integration {
     use secrecy::ExposeSecret;
 
     use super::super::{
-        DEFAULT_RETENTION_SECS, INSERT_DEDUP_WINDOW_BLOCKS, apply_migrations, build_client,
-        ensure_insert_dedup_window, ensure_retention_ttl, parse_dedup_window, parse_endpoint,
-        parse_ttl_seconds,
+        DEFAULT_RETENTION_SECS, INSERT_DEDUP_WINDOW_BLOCKS, build_client,
+        ensure_insert_dedup_window, ensure_retention_ttl, exec_statement, parse_dedup_window,
+        parse_endpoint, parse_ttl_seconds,
     };
     use crate::config::ClickHousePluginConfig;
+    use crate::infra::storage::migrator::render_ddl;
     use crate::infra::storage::test_ch_server;
+    use crate::infra::storage::topology::Topology;
 
     /// Ceiling on bringing up this test's database on the shared server. Must
     /// stay below the 300s per-test kill in the workspace `.config/nextest.toml`.
@@ -1034,7 +733,7 @@ mod integration {
 
     #[tokio::test]
     #[ignore = "requires Docker (testcontainers)"]
-    async fn apply_migrations_creates_tables() {
+    async fn rendered_single_node_ddl_creates_tables() {
         let (port, database) = tokio::time::timeout(START_BUDGET, async {
             let port = test_ch_server::server_port()
                 .await
@@ -1075,9 +774,14 @@ mod integration {
 
         super::install_test_crypto_provider();
         let client = build_client(&cfg).expect("client builds once a provider is installed");
-        apply_migrations(&client, cfg.client_deadline())
+        for stmt in render_ddl(&Topology::SingleNode, DEFAULT_RETENTION_SECS)
             .await
-            .expect("migration must succeed against a live ClickHouse instance");
+            .expect("render")
+        {
+            exec_statement(&client, &stmt, cfg.client_deadline())
+                .await
+                .expect("migration must succeed against a live ClickHouse instance");
+        }
 
         // The server accepted the partition key and stores it as the table's
         // own metadata — not merely that our DDL text contained the clause.
@@ -1113,9 +817,14 @@ mod integration {
             legacy_sql.contains("toDateTime(created_at)"),
             "precondition: live TTL must still wrap created_at: {legacy_sql}"
         );
-        ensure_retention_ttl(&client, DEFAULT_RETENTION_SECS, cfg.client_deadline())
-            .await
-            .expect("ensure_retention_ttl must rewrite a toDateTime TTL even when seconds match");
+        ensure_retention_ttl(
+            &client,
+            &Topology::SingleNode,
+            DEFAULT_RETENTION_SECS,
+            cfg.client_deadline(),
+        )
+        .await
+        .expect("ensure_retention_ttl must rewrite a toDateTime TTL even when seconds match");
         let rewritten = live_create_sql(&client).await;
         assert!(
             !rewritten.contains("toDateTime(created_at)"),
@@ -1129,9 +838,14 @@ mod integration {
 
         // Default DDL TTL is 1 year; ensure with a different window must alter.
         let ten_years = 10 * 365 * 86_400;
-        ensure_retention_ttl(&client, ten_years, cfg.client_deadline())
-            .await
-            .expect("ensure_retention_ttl must alter when config differs from default");
+        ensure_retention_ttl(
+            &client,
+            &Topology::SingleNode,
+            ten_years,
+            cfg.client_deadline(),
+        )
+        .await
+        .expect("ensure_retention_ttl must alter when config differs from default");
 
         let create_sql = live_create_sql(&client).await;
         assert_eq!(
@@ -1145,9 +859,14 @@ mod integration {
         );
 
         // Idempotent when already matched.
-        ensure_retention_ttl(&client, ten_years, cfg.client_deadline())
-            .await
-            .expect("ensure_retention_ttl must no-op when TTL already matches");
+        ensure_retention_ttl(
+            &client,
+            &Topology::SingleNode,
+            ten_years,
+            cfg.client_deadline(),
+        )
+        .await
+        .expect("ensure_retention_ttl must no-op when TTL already matches");
 
         // The DDL carries the insert dedup window and the server stores it as
         // table metadata.
@@ -1225,5 +944,178 @@ mod integration {
             remaining, 1,
             "post-2106 created_at plus a 10-year TTL must not expire on merge"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Cluster schema validation
+// ---------------------------------------------------------------------------
+
+mod cluster_schema {
+    use super::super::{SystemTableRow, check_cluster_schema, distributed_engine_args};
+    use crate::infra::storage::topology::Topology;
+
+    fn topology() -> Topology {
+        Topology::Cluster {
+            name: "uc".to_owned(),
+            records_local: "usage_records_local".to_owned(),
+            catalog_local: "usage_type_catalog_local".to_owned(),
+            insert_quorum: None,
+        }
+    }
+
+    fn row(
+        name: &str,
+        engine: &str,
+        engine_full: &str,
+        sorting: &str,
+        partition: &str,
+    ) -> SystemTableRow {
+        SystemTableRow {
+            name: name.to_owned(),
+            engine: engine.to_owned(),
+            engine_full: engine_full.to_owned(),
+            sorting_key: sorting.to_owned(),
+            partition_key: partition.to_owned(),
+            create_table_query: String::new(),
+        }
+    }
+
+    /// The rows `system.tables` reports for the reference cluster DDL.
+    fn good_rows() -> Vec<SystemTableRow> {
+        vec![
+            row(
+                "usage_records_local",
+                "ReplicatedReplacingMergeTree",
+                "ReplicatedReplacingMergeTree('/clickhouse/tables/{uuid}/{shard}', '{replica}', version) \
+                 PARTITION BY toYYYYMM(created_at) ORDER BY (gts_id, tenant_id, created_at, id)",
+                "gts_id, tenant_id, created_at, id",
+                "toYYYYMM(created_at)",
+            ),
+            row(
+                "usage_type_catalog_local",
+                "ReplicatedReplacingMergeTree",
+                "ReplicatedReplacingMergeTree('/clickhouse/tables/{uuid}/{shard}', '{replica}', version) ORDER BY gts_id",
+                "gts_id",
+                "",
+            ),
+            row(
+                "usage_records",
+                "Distributed",
+                "Distributed('uc', 'db', 'usage_records_local', cityHash64(tenant_id))",
+                "",
+                "",
+            ),
+            row(
+                "usage_type_catalog",
+                "Distributed",
+                "Distributed('uc', 'db', 'usage_type_catalog_local', cityHash64(gts_id))",
+                "",
+                "",
+            ),
+        ]
+    }
+
+    #[test]
+    fn reference_schema_passes() {
+        assert_eq!(
+            check_cluster_schema(&good_rows(), &topology(), "db"),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn single_node_is_never_checked() {
+        assert!(check_cluster_schema(&[], &Topology::SingleNode, "db").is_empty());
+    }
+
+    #[test]
+    fn missing_tables_are_each_reported() {
+        let problems = check_cluster_schema(&[], &topology(), "db");
+        assert_eq!(problems.len(), 4, "{problems:?}");
+    }
+
+    /// A non-replicated local table loses the async/insert dedup guarantees the
+    /// cluster mode is built on.
+    #[test]
+    fn non_replicated_local_engine_is_rejected() {
+        let mut rows = good_rows();
+        rows[0].engine = "ReplacingMergeTree".to_owned();
+        let problems = check_cluster_schema(&rows, &topology(), "db");
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains("ReplicatedReplacingMergeTree")),
+            "{problems:?}"
+        );
+    }
+
+    #[test]
+    fn wrong_sort_key_is_rejected() {
+        let mut rows = good_rows();
+        rows[0].sorting_key = "tenant_id, created_at".to_owned();
+        let problems = check_cluster_schema(&rows, &topology(), "db");
+        assert!(
+            problems.iter().any(|p| p.contains("ORDER BY")),
+            "{problems:?}"
+        );
+    }
+
+    /// Sharding by anything but `tenant_id` breaks the shard-colocation
+    /// invariant that `distributed_product_mode = 'local'` relies on.
+    #[test]
+    fn wrong_sharding_key_is_rejected() {
+        let mut rows = good_rows();
+        rows[2].engine_full = "Distributed('uc', 'db', 'usage_records_local', rand())".to_owned();
+        let problems = check_cluster_schema(&rows, &topology(), "db");
+        assert!(
+            problems.iter().any(|p| p.contains("cityHash64(tenant_id)")),
+            "{problems:?}"
+        );
+    }
+
+    #[test]
+    fn distributed_over_the_wrong_cluster_or_table_is_rejected() {
+        for engine_full in [
+            "Distributed('other', 'db', 'usage_records_local', cityHash64(tenant_id))",
+            "Distributed('uc', 'other_db', 'usage_records_local', cityHash64(tenant_id))",
+            "Distributed('uc', 'db', 'usage_type_catalog_local', cityHash64(tenant_id))",
+        ] {
+            let mut rows = good_rows();
+            rows[2].engine_full = engine_full.to_owned();
+            assert_eq!(
+                check_cluster_schema(&rows, &topology(), "db").len(),
+                1,
+                "{engine_full}"
+            );
+        }
+    }
+
+    #[test]
+    fn logical_table_that_is_not_distributed_is_rejected() {
+        let mut rows = good_rows();
+        rows[3].engine = "ReplacingMergeTree".to_owned();
+        let problems = check_cluster_schema(&rows, &topology(), "db");
+        assert!(
+            problems.iter().any(|p| p.contains("expected Distributed")),
+            "{problems:?}"
+        );
+    }
+
+    #[test]
+    fn engine_args_are_split_at_top_level_only() {
+        assert_eq!(
+            distributed_engine_args(
+                "Distributed('uc', 'db', 't', cityHash64(tenant_id, gts_id)) SETTINGS fsync_after_insert = 0"
+            ),
+            Some(vec![
+                "uc".to_owned(),
+                "db".to_owned(),
+                "t".to_owned(),
+                "cityHash64(tenant_id,gts_id)".to_owned(),
+            ])
+        );
+        assert_eq!(distributed_engine_args("MergeTree ORDER BY id"), None);
+        assert_eq!(distributed_engine_args("Distributed('uc', 'db'"), None);
     }
 }

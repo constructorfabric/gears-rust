@@ -14,10 +14,10 @@ use crate::domain::adapter::StorageAdapter;
 use crate::domain::ports::{CatalogStore, RecordStore};
 use crate::infra::metrics::Metrics;
 use crate::infra::storage::catalog_store::ChCatalogStore;
-use crate::infra::storage::pool::{
-    apply_migrations, build_client, ensure_insert_dedup_window, ensure_retention_ttl,
-};
+use crate::infra::storage::migrator::{MigrationOptions, run_migrations};
+use crate::infra::storage::pool::{build_client, ensure_retention_ttl, validate_cluster_schema};
 use crate::infra::storage::record_store::ChRecordStore;
+use crate::infra::storage::topology::Topology;
 
 /// `ClickHouse` Usage Collector storage backend plugin module.
 ///
@@ -61,6 +61,7 @@ impl Gear for ClickHouseUsageCollectorPlugin {
         // cancellation drops the future and is not counted as a failure. The
         // block yields the `client` it built.
         let client_deadline = cfg.client_deadline();
+        let topology = Topology::from_config(&cfg);
         let client = tokio::select! {
             biased;
             () = cancel.cancelled() => {
@@ -75,20 +76,67 @@ impl Gear for ClickHouseUsageCollectorPlugin {
                 // the `clickhouse` crate's hardcoded provider.
                 let client = build_client(&cfg)?;
 
-                // Step B: Run the embedded idempotent schema migration, then
-                // reconcile usage_records TTL with the configured retention
-                // window. Both are bounded by the same client-side deadline the
-                // request path uses: a hung init is worse than a failed one,
-                // since it never surfaces.
-                apply_migrations(&client, client_deadline)
-                    .await
-                    .inspect_err(|_| metrics.inc_migration_failure())?;
-                ensure_retention_ttl(&client, cfg.retention_period_secs, client_deadline)
-                    .await
-                    .inspect_err(|_| metrics.inc_migration_failure())?;
-                ensure_insert_dedup_window(&client, client_deadline)
-                    .await
-                    .inspect_err(|_| metrics.inc_migration_failure())?;
+                // Step B: Provision the schema. Every step is bounded by a
+                // client-side deadline — the request path's, or the cluster
+                // migration budget for `ON CLUSTER` DDL: a hung init is worse than a failed one, since it
+                // never surfaces.
+                match (&topology, &cfg.cluster) {
+                    // Single node: run the pending versioned migrations, then
+                    // reconcile usage_records TTL with the configured
+                    // retention window.
+                    (Topology::SingleNode, _) => {
+                        let opts = MigrationOptions {
+                            retention_period_secs: cfg.retention_period_secs,
+                            statement_timeout_secs: None,
+                        };
+                        run_migrations(&client, &topology, opts, client_deadline)
+                            .await
+                            .inspect_err(|_| metrics.inc_migration_failure())?;
+                        ensure_retention_ttl(
+                            &client,
+                            &topology,
+                            cfg.retention_period_secs,
+                            client_deadline,
+                        )
+                        .await
+                        .inspect_err(|_| metrics.inc_migration_failure())?;
+                    }
+                    // Cluster, plugin-managed schema: the same, `ON CLUSTER`,
+                    // under the longer migration budget; validation stays the
+                    // final gate.
+                    (Topology::Cluster { .. }, Some(cluster)) if cluster.manage_schema => {
+                        let opts = MigrationOptions {
+                            retention_period_secs: cfg.retention_period_secs,
+                            statement_timeout_secs: Some(cluster.migration_statement_timeout_secs),
+                        };
+                        let deadline = cluster.migration_deadline();
+                        run_migrations(&client, &topology, opts, deadline)
+                            .await
+                            .inspect_err(|_| metrics.inc_migration_failure())?;
+                        ensure_retention_ttl(&client, &topology, cfg.retention_period_secs, deadline)
+                            .await
+                            .inspect_err(|_| metrics.inc_migration_failure())?;
+                        validate_cluster_schema(
+                            &client,
+                            &topology,
+                            cfg.retention_period_secs,
+                            client_deadline,
+                        )
+                        .await
+                        .inspect_err(|_| metrics.inc_migration_failure())?;
+                    }
+                    // Cluster, operator-provisioned schema: only check it.
+                    (Topology::Cluster { .. }, _) => {
+                        validate_cluster_schema(
+                            &client,
+                            &topology,
+                            cfg.retention_period_secs,
+                            client_deadline,
+                        )
+                        .await
+                        .inspect_err(|_| metrics.inc_migration_failure())?;
+                    }
+                }
                 Ok::<_, anyhow::Error>(client)
             } => res?,
         };
@@ -110,6 +158,7 @@ impl Gear for ClickHouseUsageCollectorPlugin {
             cancel.clone(),
             Arc::clone(&metrics),
             client_deadline,
+            topology,
         ));
 
         // Construct the SPI adapter over the real stores.

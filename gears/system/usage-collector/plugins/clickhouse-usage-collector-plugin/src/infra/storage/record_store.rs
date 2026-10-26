@@ -1658,7 +1658,7 @@ impl RecordStore for ChRecordStore {
         // not retried or compensated for; it joins the races DESIGN.md §3.6
         // enumerates rather than being closed here, and it is the price of the
         // partition pruning and whole-partition TTL drops the partition key
-        // buys (migrations/0001_init.sql).
+        // buys (`migrator::m0001_init::RECORDS_PARTITION_KEY`).
         self.insert_records(&markers, Instant::now(), InsertKind::Marker)
             .await?;
 

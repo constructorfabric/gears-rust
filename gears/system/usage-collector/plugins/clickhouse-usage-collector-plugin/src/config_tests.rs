@@ -414,3 +414,103 @@ fn debug_does_not_leak_database_url_password() {
         "Debug of the config must not leak the URL password; got: {dump}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Cluster topology block
+// ---------------------------------------------------------------------------
+
+fn cluster_cfg(cluster_json: &str) -> ClickHousePluginConfig {
+    let json = format!(
+        r#"{{ "database_url": "https://u:p@h/db", "async_insert": false, "cluster": {cluster_json} }}"#
+    );
+    serde_json::from_str(&json).unwrap()
+}
+
+#[test]
+fn cluster_is_off_by_default() {
+    let cfg: ClickHousePluginConfig = serde_json::from_str("{}").unwrap();
+    assert!(cfg.cluster.is_none());
+}
+
+#[test]
+fn cluster_block_defaults_the_local_table_names() {
+    let cfg = cluster_cfg(r#"{ "name": "uc" }"#);
+    cfg.validate()
+        .expect("a named cluster with defaults is valid");
+    let c = cfg.cluster.unwrap();
+    assert_eq!(c.records_local_table, "usage_records_local");
+    assert_eq!(c.catalog_local_table, "usage_type_catalog_local");
+    assert!(c.insert_quorum.is_none());
+    assert!(
+        !c.manage_schema,
+        "the operator owns the cluster DDL by default"
+    );
+    assert_eq!(c.migration_statement_timeout_secs, 3600);
+    assert_eq!(c.migration_deadline(), std::time::Duration::from_secs(3605));
+}
+
+#[test]
+fn cluster_migration_timeout_must_be_positive() {
+    let err = cluster_cfg(r#"{ "name": "uc", "migration_statement_timeout_secs": 0 }"#)
+        .validate()
+        .unwrap_err();
+    assert!(err.contains("migration_statement_timeout_secs"), "{err}");
+}
+
+/// Identifiers are interpolated into `ON CLUSTER` / `ALTER TABLE`, so anything
+/// beyond a plain identifier — including the empty default name — is refused.
+#[test]
+fn cluster_identifiers_must_be_plain() {
+    for bad in [
+        "{ }",
+        r#"{ "name": "uc; DROP TABLE x" }"#,
+        r#"{ "name": "1uc" }"#,
+        r#"{ "name": "uc", "records_local_table": "db.t" }"#,
+        r#"{ "name": "uc", "catalog_local_table": "t`" }"#,
+    ] {
+        let err = cluster_cfg(bad).validate().unwrap_err();
+        assert!(err.contains("plain ClickHouse identifier"), "{bad}: {err}");
+    }
+}
+
+#[test]
+fn cluster_local_tables_must_differ() {
+    let err =
+        cluster_cfg(r#"{ "name": "uc", "records_local_table": "t", "catalog_local_table": "t" }"#)
+            .validate()
+            .unwrap_err();
+    assert!(err.contains("must differ"), "{err}");
+}
+
+#[test]
+fn cluster_insert_quorum_accepts_auto_or_a_positive_count() {
+    for ok in ["auto", "2"] {
+        cluster_cfg(&format!(r#"{{ "name": "uc", "insert_quorum": "{ok}" }}"#))
+            .validate()
+            .unwrap_or_else(|e| panic!("{ok}: {e}"));
+    }
+    for bad in ["0", "majority", "-1"] {
+        let err = cluster_cfg(&format!(r#"{{ "name": "uc", "insert_quorum": "{bad}" }}"#))
+            .validate()
+            .unwrap_err();
+        assert!(err.contains("insert_quorum"), "{bad}: {err}");
+    }
+}
+
+/// Async inserts into a `Distributed` table bypass the shard's dedup token and
+/// durability ack, so the default `async_insert = true` must be turned off
+/// explicitly rather than silently ignored.
+#[test]
+fn cluster_rejects_async_insert() {
+    let json = r#"{ "database_url": "https://u:p@h/db", "cluster": { "name": "uc" } }"#;
+    let cfg: ClickHousePluginConfig = serde_json::from_str(json).unwrap();
+    let err = cfg.validate().unwrap_err();
+    assert!(err.contains("async_insert = false"), "{err}");
+}
+
+#[test]
+fn cluster_block_rejects_unknown_keys() {
+    let json = r#"{ "database_url": "https://u:p@h/db", "async_insert": false,
+                    "cluster": { "name": "uc", "shards": 2 } }"#;
+    assert!(serde_json::from_str::<ClickHousePluginConfig>(json).is_err());
+}
