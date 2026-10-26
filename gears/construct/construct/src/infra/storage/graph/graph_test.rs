@@ -1353,6 +1353,14 @@ async fn a_profile_past_what_one_read_takes_is_full() {
         .await;
 
     assert!(matches!(read, Err(DomainError::ProfileFull(_))), "{read:?}");
+    let stored = profiles
+        .reader()
+        .stored(&profiles.ctx, profiles.subject_key())
+        .await;
+    assert!(
+        matches!(stored, Err(DomainError::ProfileFull(_))),
+        "the application read is cut off the same way: {stored:?}"
+    );
 }
 
 #[test]
@@ -1925,8 +1933,13 @@ async fn a_stored_fact_names_who_it_came_from_and_when() {
             ("skills", &skills("Rust"))
         );
         assert!(fact.produced_at.is_some(), "{kind:?}");
-        assert!(
-            fact.stored_at > time::OffsetDateTime::UNIX_EPOCH,
+        let node = profiles
+            .client
+            .get_node(&profiles.ctx, &fact.node_key.0, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            fact.stored_at, node.envelope.created_at,
             "graph storage's storing time"
         );
     }

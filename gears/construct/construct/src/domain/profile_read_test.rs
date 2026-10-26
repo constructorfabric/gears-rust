@@ -9,7 +9,7 @@ use authz_resolver_sdk::constraints::{
     Constraint, InPredicate, InTenantSubtreePredicate, Predicate,
 };
 use authz_resolver_sdk::models::{
-    EvaluationRequest, EvaluationResponse, EvaluationResponseContext,
+    DenyReason, EvaluationRequest, EvaluationResponse, EvaluationResponseContext,
 };
 use serde_json::json;
 use time::OffsetDateTime;
@@ -19,9 +19,9 @@ use uuid::Uuid;
 
 use crate::domain::error::DomainError;
 use crate::domain::plan::NodeKey;
-use crate::domain::profile::Category;
+use crate::domain::profile::{Category, FactCount, FullProfile};
 use crate::domain::profile_read::{
-    CATEGORY_PROPERTY, CategoryCheck, OriginKind, ProfileView, StoredFact,
+    CATEGORY_PROPERTY, CategoryCheck, OriginKind, ProfileView, StoredFact, StoredProfiles,
 };
 use crate::domain::subject_settings::{SubjectKey, SubjectSettings};
 use crate::test_support::{
@@ -773,6 +773,7 @@ impl AuthZResolverApi for UncompilableFor {
     }
 }
 
+#[tracing_test::traced_test]
 #[tokio::test]
 async fn per_category_an_answer_that_cannot_be_compiled_hides_its_category() {
     let db = inmem_db().await;
@@ -791,6 +792,10 @@ async fn per_category_an_answer_that_cannot_be_compiled_hides_its_category() {
         .unwrap();
 
     assert_eq!(kinds(&view), [(Category::Identity, 1)]);
+    assert!(
+        logs_contain("cannot be compiled"),
+        "a plugin defect is said where an operator looks"
+    );
 }
 
 #[tokio::test]
@@ -812,6 +817,139 @@ async fn a_grant_the_settings_scope_cannot_cover_is_not_visible_rather_than_forb
 
     assert!(
         matches!(result, Err(DomainError::NotVisible(_))),
+        "{result:?}"
+    );
+}
+
+/// Names the subject on the profile, but answers each category with a
+/// tenant clamp alone.
+struct SubjectOnTheProfileOnly;
+
+#[async_trait]
+impl AuthZResolverApi for SubjectOnTheProfileOnly {
+    async fn evaluate(
+        &self,
+        _ctx: PlatformSecurityContext,
+        request: EvaluationRequest,
+    ) -> Result<EvaluationResponse, CanonicalError> {
+        let tenant = tenant_of(&request);
+        if request.resource.properties.contains_key(CATEGORY_PROPERTY) {
+            return Ok(allowed(vec![tenant_is(tenant)]));
+        }
+        let subject = request.resource.id.expect("the subject is the resource");
+        Ok(allowed(vec![tenant_is(tenant), subject_is(subject)]))
+    }
+}
+
+#[tokio::test]
+async fn per_category_another_caller_needs_each_category_answer_to_name_the_subject() {
+    let db = inmem_db().await;
+    let service = profile_service(
+        &db,
+        Arc::new(SubjectOnTheProfileOnly),
+        facts(),
+        Arc::default(),
+        CategoryCheck::PerCategory,
+    );
+    let (tenant, subject) = (Uuid::new_v4(), Uuid::new_v4());
+
+    let agent = service
+        .read(&caller_in(Uuid::new_v4()), Some(tenant), subject)
+        .await
+        .unwrap();
+    let itself = service
+        .read(&subject_in(tenant, subject), None, subject)
+        .await
+        .unwrap();
+
+    assert!(agent.categories.is_empty(), "{agent:?}");
+    assert_eq!(
+        kinds(&itself),
+        [(Category::Identity, 1), (Category::Skill, 2)]
+    );
+}
+
+/// Denies every request with a reason.
+struct DenyWithReason;
+
+#[async_trait]
+impl AuthZResolverApi for DenyWithReason {
+    async fn evaluate(
+        &self,
+        _ctx: PlatformSecurityContext,
+        _request: EvaluationRequest,
+    ) -> Result<EvaluationResponse, CanonicalError> {
+        Ok(EvaluationResponse {
+            decision: false,
+            context: EvaluationResponseContext {
+                deny_reason: Some(DenyReason {
+                    error_code: "not_a_delegate".to_owned(),
+                    details: Some("no delegation on file".to_owned()),
+                }),
+                ..Default::default()
+            },
+        })
+    }
+}
+
+#[tokio::test]
+async fn the_platforms_reason_for_a_refusal_is_kept_for_the_log() {
+    let db = inmem_db().await;
+    let service = profile_service(
+        &db,
+        Arc::new(DenyWithReason),
+        facts(),
+        Arc::default(),
+        CategoryCheck::OneCall,
+    );
+
+    let result = service
+        .read(&caller_in(Uuid::new_v4()), None, Uuid::new_v4())
+        .await;
+
+    let Err(DomainError::NotVisible(reason)) = result else {
+        panic!("not visible, got {result:?}");
+    };
+    assert!(reason.contains("not_a_delegate"), "{reason}");
+    assert!(reason.contains("no delegation on file"), "{reason}");
+}
+
+/// Stored facts past what one read takes.
+struct FullProfileStore;
+
+#[async_trait]
+impl StoredProfiles for FullProfileStore {
+    async fn stored(
+        &self,
+        _ctx: &SecurityContext,
+        key: SubjectKey,
+    ) -> Result<Vec<StoredFact>, DomainError> {
+        Err(DomainError::ProfileFull(FullProfile {
+            subject: key,
+            facts: FactCount::AtLeast(1000),
+            limit: 999,
+        }))
+    }
+}
+
+#[tokio::test]
+async fn a_profile_too_large_to_read_is_the_gears_own_failure_not_a_precondition() {
+    let db = inmem_db().await;
+    let service = profile_service_over(
+        &db,
+        Arc::new(AllowResolver),
+        Arc::new(FullProfileStore),
+        Uuid::new_v4(),
+        Arc::default(),
+        CategoryCheck::OneCall,
+    );
+
+    let result = service
+        .read(&caller_in(Uuid::new_v4()), None, Uuid::new_v4())
+        .await;
+
+    assert!(
+        matches!(result, Err(DomainError::Internal(_))),
         "{result:?}"
     );
 }

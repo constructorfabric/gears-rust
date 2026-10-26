@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use construct_sdk::{
-    ConstructClientV1, FactCategory, FactOrigin, ProfileCategory, ProfileFact, RecordOutcome,
-    SubjectProfile,
+    ConstructClientV1, FactCategory, FactId, FactOrigin, ProfileCategory, ProfileFact,
+    RecordOutcome, SubjectProfile,
 };
 use toolkit_canonical_errors::CanonicalError;
 use toolkit_macros::domain_model;
@@ -76,7 +76,7 @@ where
             "profile_read",
             %subject_id,
             caller = %ctx.subject_id(),
-            tenant_id = %tenant_id.unwrap_or_else(|| ctx.subject_tenant_id())
+            tenant_id = %ProfileReadService::tenant_of(ctx, tenant_id)
         );
         let view = async {
             self.profile
@@ -123,7 +123,7 @@ fn subject_profile(view: ProfileView) -> SubjectProfile {
                         .into_iter()
                         .map(|fact| {
                             ProfileFact::new(
-                                fact.node_key.0,
+                                FactId::new(fact.node_key.0),
                                 fact.property,
                                 fact.value,
                                 fact_origin(fact.origin),

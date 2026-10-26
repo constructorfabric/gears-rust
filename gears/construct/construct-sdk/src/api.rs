@@ -33,14 +33,16 @@ pub trait ConstructClientV1: Send + Sync {
     ) -> Result<RecordOutcome, CanonicalError>;
 
     /// Read a subject's profile by category, the same operation as
-    /// `GET /construct/v1/subjects/{subject_id}/profile`. The platform must
-    /// let the caller act for the subject; the tenant is the caller's own, or
-    /// `tenant_id` when given.
+    /// `GET /construct/v1/subjects/{subject_id}/profile`. The subject reads
+    /// itself; anyone else needs the platform to let it act for the subject.
+    /// The tenant is the caller's own, or `tenant_id` when given.
     ///
     /// # Errors
     ///
     /// A subject the caller may not act for is not found, like one that does
-    /// not exist. Unavailable when a dependency is down.
+    /// not exist. Unavailable when a dependency is down or no processing
+    /// identity is configured. Internal when the profile is larger than one
+    /// read takes.
     async fn read_profile(
         &self,
         ctx: &SecurityContext,
