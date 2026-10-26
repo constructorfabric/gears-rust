@@ -13,7 +13,9 @@ use crate::domain::local_client::LocalClient;
 use crate::domain::plan::NodeKey;
 use crate::domain::profile::Category;
 use crate::domain::profile_read::{CategoryCheck, OriginKind, StoredFact};
-use crate::test_support::{AllowResolver, DenyResolver, IntakeFixture, inmem_db, profile_service};
+use crate::test_support::{
+    AllowResolver, DenyResolver, IntakeFixture, RecordingResolver, inmem_db, profile_service,
+};
 
 fn caller() -> SecurityContext {
     SecurityContext::builder()
@@ -71,7 +73,7 @@ async fn read_profile_answers_the_profile_in_the_sdk_shape() {
     let [fact] = skills.facts.as_slice() else {
         panic!("one fact: {skills:?}");
     };
-    assert_eq!(fact.fact_id, "construct:t:fact-1");
+    assert_eq!(fact.fact_id.as_str(), "construct:t:fact-1");
     assert_eq!(
         (fact.property.as_str(), &fact.value),
         ("skills", &json!({ "name": "Rust" }))
@@ -91,4 +93,26 @@ async fn read_profile_answers_a_subject_the_caller_may_not_act_for_as_not_found(
         matches!(result, Err(CanonicalError::NotFound { .. })),
         "{result:?}"
     );
+}
+
+#[tokio::test]
+async fn read_profile_asks_about_the_named_tenant() {
+    let resolver = Arc::new(RecordingResolver::default());
+    let tenant = Uuid::new_v4();
+
+    client(Arc::clone(&resolver) as _)
+        .await
+        .read_profile(&caller(), Some(tenant), Uuid::new_v4())
+        .await
+        .unwrap();
+
+    let asked: Vec<_> = resolver
+        .asked
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(resource, ..)| resource == "construct.profile")
+        .map(|(_, _, context, owner)| (*context, owner.clone()))
+        .collect();
+    assert_eq!(asked, [(Some(tenant), Some(tenant.to_string()))]);
 }

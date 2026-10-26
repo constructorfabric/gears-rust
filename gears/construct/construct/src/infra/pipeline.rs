@@ -14,7 +14,7 @@ use toolkit_security::{AccessScope, SecurityContext};
 use tracing::Instrument as _;
 use uuid::Uuid;
 
-use crate::config::{CategoryCheckConfig, ConstructConfig};
+use crate::config::{CategoryCheckConfig, ValidConfig};
 use crate::domain::admission::{Admission, AdmissionPorts};
 use crate::domain::error::DomainError;
 use crate::domain::model_client::ModelClient;
@@ -133,7 +133,7 @@ pub struct Pipeline {
 ///
 /// @cpt-dod:cpt-cf-construct-dod-profile-reader-wiring:p1
 pub fn build(
-    cfg: &ConstructConfig,
+    cfg: &ValidConfig,
     hub: &Arc<ClientHub>,
     graph: Option<Arc<dyn GraphStorageClientV1>>,
     settings: Arc<dyn SubjectSettingsReader>,
@@ -159,7 +159,7 @@ pub fn build(
 ///
 /// When the person types cannot be read, a defect in the gear.
 pub fn assemble(
-    cfg: &ConstructConfig,
+    cfg: &ValidConfig,
     model: Option<Arc<dyn ModelClient>>,
     graph: Option<Arc<dyn GraphStorageClientV1>>,
     settings: Arc<dyn SubjectSettingsReader>,
@@ -196,9 +196,11 @@ pub fn assemble(
             events: Arc::new(LogProfileEvents),
         },
         policy_enforcer,
+        // Validation requires the check with an identity; without one the
+        // read answers unavailable, and the safer check is taken.
         match cfg.profile_category_check {
-            CategoryCheckConfig::OneCall => CategoryCheck::OneCall,
-            CategoryCheckConfig::PerCategory => CategoryCheck::PerCategory,
+            Some(CategoryCheckConfig::OneCall) => CategoryCheck::OneCall,
+            Some(CategoryCheckConfig::PerCategory) | None => CategoryCheck::PerCategory,
         },
     ));
     // @cpt-end:cpt-cf-construct-algo-profile-reader-wire:p1:inst-wire-read

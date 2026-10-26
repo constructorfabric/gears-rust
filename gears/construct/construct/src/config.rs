@@ -3,6 +3,8 @@ use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 use serde::Deserialize;
 use uuid::Uuid;
 
+use crate::domain::profile::Category;
+
 /// Default for [`ConstructConfig::personalization_default`]: on, so a host
 /// without the settings service takes records for new subjects. A deployment
 /// that wants new subjects to start with personalization off sets it to false.
@@ -40,9 +42,12 @@ pub struct ConstructConfig {
     pub admission: AdmissionConfig,
     /// How the profile read asks the platform which categories a caller may
     /// read: `one_call` (a category constraint in one policy answer) or
-    /// `per_category` (one policy call per category).
+    /// `per_category` (one policy call per category). It has no default: a
+    /// deployment with a processing identity sets it for its policy plugin,
+    /// since `one_call` with a plugin that answers without a category
+    /// constraint lets every category be read.
     #[serde(default)]
-    pub profile_category_check: CategoryCheckConfig,
+    pub profile_category_check: Option<CategoryCheckConfig>,
 }
 
 impl Default for ConstructConfig {
@@ -54,7 +59,7 @@ impl Default for ConstructConfig {
             model: None,
             processing: ProcessingConfig::default(),
             admission: AdmissionConfig::default(),
-            profile_category_check: CategoryCheckConfig::default(),
+            profile_category_check: None,
         }
     }
 }
@@ -134,6 +139,8 @@ impl Default for AdmissionConfig {
     }
 }
 
+/// The most times a record may be planned again after a write conflict.
+pub const MAX_RERUNS: u32 = 10;
 /// The most records the processing queue may hold.
 pub const MAX_QUEUE_CAPACITY: usize = 100_000;
 /// The most records that may be processed at once.
@@ -148,14 +155,33 @@ pub const MAX_VALUE_CHARS_LIMIT: usize = 100_000;
 #[error("construct config: {0}")]
 pub struct InvalidConfig(pub String);
 
+/// A [`ConstructConfig`] that passed [`ConstructConfig::validated`]. The gear
+/// builds only from one, so no unchecked value reaches the pipeline.
+#[derive(Debug, Clone)]
+pub struct ValidConfig(ConstructConfig);
+
+impl std::ops::Deref for ValidConfig {
+    type Target = ConstructConfig;
+
+    fn deref(&self) -> &ConstructConfig {
+        &self.0
+    }
+}
+
 impl ConstructConfig {
-    /// Check the values serde cannot: the processing and admission ranges and
-    /// the model's upstream alias.
+    /// The config, once the values serde cannot check are checked: the
+    /// processing and admission ranges, the entity kinds, the category check
+    /// a processing identity needs, and the model's upstream alias.
     ///
     /// # Errors
     ///
     /// [`InvalidConfig`] naming the first bad value.
-    pub fn validate(&self) -> Result<(), InvalidConfig> {
+    pub fn validated(self) -> Result<ValidConfig, InvalidConfig> {
+        self.check()?;
+        Ok(ValidConfig(self))
+    }
+
+    fn check(&self) -> Result<(), InvalidConfig> {
         let processing = &self.processing;
         if processing.queue_capacity.get() > MAX_QUEUE_CAPACITY {
             return Err(InvalidConfig(format!(
@@ -169,7 +195,30 @@ impl ConstructConfig {
                 processing.workers
             )));
         }
+        if processing.max_reruns > MAX_RERUNS {
+            return Err(InvalidConfig(format!(
+                "processing.max_reruns must be at most {MAX_RERUNS}, not {}",
+                processing.max_reruns
+            )));
+        }
+        if self.processing_identity.is_some() && self.profile_category_check.is_none() {
+            return Err(InvalidConfig(
+                "profile_category_check must be set with a processing identity: one_call when the \
+                 policy plugin answers with category constraints, per_category otherwise"
+                    .to_owned(),
+            ));
+        }
         let admission = &self.admission;
+        if let Some(unknown) = admission
+            .entity_kinds
+            .iter()
+            .flatten()
+            .find(|kind| Category::from_name(kind).is_none())
+        {
+            return Err(InvalidConfig(format!(
+                "admission.entity_kinds names {unknown:?}, which is not an entity kind"
+            )));
+        }
         let floor = admission.confidence_floor;
         if !floor.is_finite() || !(0.0..=1.0).contains(&floor) {
             return Err(InvalidConfig(format!(
@@ -245,7 +294,7 @@ mod tests {
         assert!(config.processing_identity.is_none() && config.model.is_none());
         assert_eq!(config.processing.max_reruns, 2);
         assert!((config.admission.confidence_floor - 0.6).abs() < f32::EPSILON);
-        assert_eq!(config.profile_category_check, CategoryCheckConfig::OneCall);
+        assert_eq!(config.profile_category_check, None);
     }
 
     #[test]
@@ -270,17 +319,42 @@ mod tests {
         assert_eq!(config.admission.max_steps, 10);
         assert_eq!(
             config.profile_category_check,
-            CategoryCheckConfig::PerCategory
+            Some(CategoryCheckConfig::PerCategory)
         );
     }
 
     fn valid(json: serde_json::Value) -> Result<(), InvalidConfig> {
-        parse(json).expect("parses").validate()
+        parse(json).expect("parses").validated().map(|_| ())
     }
 
     #[test]
     fn the_defaults_are_valid() {
-        assert_eq!(ConstructConfig::default().validate(), Ok(()));
+        assert!(ConstructConfig::default().validated().is_ok());
+    }
+
+    #[test]
+    fn a_processing_identity_needs_the_category_check_set() {
+        let identity = "8b0b4c4e-0000-4000-8000-000000000001";
+        assert!(valid(serde_json::json!({ "processing_identity": identity })).is_err());
+        for check in ["one_call", "per_category"] {
+            assert!(
+                valid(serde_json::json!({
+                    "processing_identity": identity,
+                    "profile_category_check": check,
+                }))
+                .is_ok(),
+                "{check}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_entity_kind_that_is_not_one_is_refused() {
+        assert!(valid(serde_json::json!({ "admission": { "entity_kinds": ["skills"] } })).is_err());
+        assert!(
+            valid(serde_json::json!({ "admission": { "entity_kinds": ["skill", "role"] } }))
+                .is_ok()
+        );
     }
 
     #[test]
@@ -311,6 +385,7 @@ mod tests {
         for processing in [
             serde_json::json!({ "queue_capacity": MAX_QUEUE_CAPACITY + 1 }),
             serde_json::json!({ "workers": MAX_WORKERS + 1 }),
+            serde_json::json!({ "max_reruns": MAX_RERUNS + 1 }),
         ] {
             assert!(
                 valid(serde_json::json!({ "processing": processing })).is_err(),
@@ -333,8 +408,12 @@ mod tests {
             );
         }
         for processing in [
-            serde_json::json!({ "queue_capacity": 1, "workers": 1 }),
-            serde_json::json!({ "queue_capacity": MAX_QUEUE_CAPACITY, "workers": MAX_WORKERS }),
+            serde_json::json!({ "queue_capacity": 1, "workers": 1, "max_reruns": 0 }),
+            serde_json::json!({
+                "queue_capacity": MAX_QUEUE_CAPACITY,
+                "workers": MAX_WORKERS,
+                "max_reruns": MAX_RERUNS,
+            }),
         ] {
             assert!(
                 valid(serde_json::json!({ "processing": processing })).is_ok(),

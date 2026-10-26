@@ -242,14 +242,7 @@ pub fn stored_fact_of(node: &NodeView) -> Result<StoredFact, DomainError> {
     let produced_at = payload
         .get(ORIGIN)
         .and_then(|origin| origin.get("produced_at"))
-        .and_then(Value::as_str)
-        .and_then(|at| {
-            let parsed = OffsetDateTime::parse(at, &Rfc3339).ok();
-            if parsed.is_none() {
-                tracing::warn!(node_key = %node.node_key, "a stored fact's produced_at is not RFC 3339; it is served without it");
-            }
-            parsed
-        });
+        .and_then(|at| produced_at(&node.node_key, at));
     Ok(StoredFact {
         node_key,
         category,
@@ -259,4 +252,18 @@ pub fn stored_fact_of(node: &NodeView) -> Result<StoredFact, DomainError> {
         stored_at: node.envelope.created_at,
         produced_at,
     })
+}
+
+/// A stored `produced_at`, none when it is not an RFC 3339 string; that is
+/// logged with why, as only a defect writes it.
+fn produced_at(node_key: &str, at: &Value) -> Option<OffsetDateTime> {
+    let Some(text) = at.as_str() else {
+        tracing::warn!(%node_key, "a stored fact's produced_at is not a string; it is served without it");
+        return None;
+    };
+    OffsetDateTime::parse(text, &Rfc3339)
+        .inspect_err(|error| {
+            tracing::warn!(%node_key, %error, "a stored fact's produced_at is not RFC 3339; it is served without it");
+        })
+        .ok()
 }

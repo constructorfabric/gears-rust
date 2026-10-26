@@ -420,5 +420,23 @@ fn a_produced_at_that_does_not_parse_is_served_as_absent_and_logged() {
     assert_eq!(fact.origin, OriginKind::Administrator);
     assert_eq!(fact.produced_at, None);
     assert!(logs_contain("not RFC 3339"));
+    assert!(logs_contain("error="), "the parse error is logged");
     assert!(logs_contain(&node.node_key));
+}
+
+#[tracing_test::traced_test]
+#[test]
+fn a_produced_at_that_is_not_a_string_is_served_as_absent_and_logged() {
+    let node = view(
+        SKILL_TYPE,
+        Some(json!({
+            "skills": skills(),
+            "origin": { "method": "admin.edit", "produced_at": 1_700_000_000 },
+        })),
+    );
+
+    let fact = stored_fact_of(&node).expect("the fact is still served");
+
+    assert_eq!(fact.produced_at, None);
+    assert!(logs_contain("not a string"));
 }

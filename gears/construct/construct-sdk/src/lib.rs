@@ -3,7 +3,7 @@
 //! The public API of the Construct gear:
 //! - `ConstructClientV1` trait for inter-gear communication
 //! - Model types: `RecordOutcome`, and a subject's profile as `SubjectProfile`
-//!   (`ProfileCategory`, `ProfileFact`, `FactCategory`, `FactOrigin`)
+//!   (`ProfileCategory`, `ProfileFact`, `FactId`, `FactCategory`, `FactOrigin`)
 //! - The connector record types Construct takes at intake ([`gts`])
 //! - The reason codes of a refused record ([`reason`])
 //! - The person types (`person_types`): one GTS graph node type per category of a person's profile
@@ -31,5 +31,5 @@ pub mod reason;
 
 pub use api::ConstructClientV1;
 pub use models::{
-    FactCategory, FactOrigin, ProfileCategory, ProfileFact, RecordOutcome, SubjectProfile,
+    FactCategory, FactId, FactOrigin, ProfileCategory, ProfileFact, RecordOutcome, SubjectProfile,
 };

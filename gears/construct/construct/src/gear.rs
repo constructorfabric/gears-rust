@@ -10,7 +10,7 @@ use toolkit::contracts::RunnableCapability;
 use toolkit::{Gear, GearCtx};
 use toolkit_db::DBProvider;
 use toolkit_db::DbError;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use authz_resolver_sdk::{AuthZResolverApi, PolicyEnforcer};
 
@@ -84,8 +84,7 @@ impl Gear for ConstructGear {
     async fn init(&self, ctx: &GearCtx) -> anyhow::Result<()> {
         // @cpt-begin:cpt-cf-construct-algo-gear-foundation-start-gear:p1:inst-start-config
         // @cpt-begin:cpt-cf-construct-algo-gear-foundation-start-gear:p1:inst-start-config-fail
-        let cfg: ConstructConfig = ctx.config_or_default()?;
-        cfg.validate()?;
+        let cfg = ctx.config_or_default::<ConstructConfig>()?.validated()?;
         // @cpt-end:cpt-cf-construct-algo-gear-foundation-start-gear:p1:inst-start-config-fail
         // @cpt-end:cpt-cf-construct-algo-gear-foundation-start-gear:p1:inst-start-config
 
@@ -140,7 +139,7 @@ impl Gear for ConstructGear {
         *lock(&self.worker) = pipeline.worker;
         let ports = IntakePorts {
             types,
-            switch: Arc::new(ConfigConnectorSwitch::new(cfg.connectors_off)),
+            switch: Arc::new(ConfigConnectorSwitch::new(cfg.connectors_off.clone())),
             hand_off: pipeline.hand_off,
         };
         let intake = Arc::new(RecordIntakeService::new(
@@ -252,7 +251,11 @@ impl RunnableCapability for ConstructGear {
                     if let Err(err) = result
                         && !err.is_cancelled()
                     {
-                        warn!(error = ?err, "construct record processing ended with an error");
+                        // A worker that panicked lost the records it held; the
+                        // host is told the stop was not clean.
+                        error!(error = ?err, "construct record processing ended with an error");
+                        return Err(anyhow::Error::new(err)
+                            .context("construct record processing ended with an error"));
                     }
                 }
                 () = deadline.cancelled() => {

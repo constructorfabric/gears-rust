@@ -12,7 +12,7 @@ use futures::future::join_all;
 use serde_json::Value;
 use time::OffsetDateTime;
 use toolkit_macros::domain_model;
-use toolkit_security::{AccessScope, ScopeConstraint, SecurityContext, pep_properties};
+use toolkit_security::{AccessScope, ScopeConstraint, ScopeValue, SecurityContext, pep_properties};
 use uuid::Uuid;
 
 use super::error::DomainError;
@@ -140,13 +140,13 @@ pub struct ProfileReadService {
     check: CategoryCheck,
 }
 
-/// The request for the profile of `subject_id` in `tenant_id`, with the
-/// category when one is asked about.
-fn profile_request(tenant_id: Uuid, category: Option<Category>) -> AccessRequest {
+/// The request for the profile of the subject at `key`, with the category
+/// when one is asked about.
+fn profile_request(key: SubjectKey, category: Option<Category>) -> AccessRequest {
     let request = AccessRequest::new()
-        .context_tenant_id(tenant_id)
+        .context_tenant_id(key.tenant_id)
         .tenant_mode(TenantMode::RootOnly)
-        .resource_property(pep_properties::OWNER_TENANT_ID, tenant_id);
+        .resource_property(pep_properties::OWNER_TENANT_ID, key.tenant_id);
     match category {
         Some(category) => request.resource_property(CATEGORY_PROPERTY, category.name()),
         None => request,
@@ -162,8 +162,8 @@ enum Reader {
 }
 
 impl Reader {
-    fn of(ctx: &SecurityContext, tenant_id: Uuid, subject_id: Uuid) -> Self {
-        if ctx.subject_id() == subject_id && ctx.subject_tenant_id() == tenant_id {
+    fn of(ctx: &SecurityContext, key: SubjectKey) -> Self {
+        if ctx.subject_id() == key.subject_id && ctx.subject_tenant_id() == key.tenant_id {
             Self::Owner
         } else {
             Self::Other
@@ -171,11 +171,23 @@ impl Reader {
     }
 }
 
-/// What one constraint of a policy scope grants on the profile of `subject_id`
-/// in `tenant_id`: nothing when it does not reach them, otherwise the
-/// categories it names, or every category when it names none. A filter that
-/// cannot be decided in memory (a group or tenant-subtree filter) grants
-/// nothing, and so does a filter on a property the profile has not.
+/// The categories a category filter names; a value that names no category
+/// names nothing.
+fn named_categories<'a>(values: impl IntoIterator<Item = &'a ScopeValue>) -> HashSet<Category> {
+    values
+        .into_iter()
+        .filter_map(|value| match value {
+            ScopeValue::String(name) => Category::from_name(name),
+            _ => None,
+        })
+        .collect()
+}
+
+/// What one constraint of a policy scope grants on the profile at `key`:
+/// nothing when it does not reach it, otherwise the categories it names, or
+/// every category when it names none. A filter that cannot be decided in
+/// memory (a group or tenant-subtree filter) grants nothing, and so does a
+/// filter on a property the profile has not.
 ///
 /// Only the subject reads its profile on a constraint that limits the tenant
 /// alone. Anyone else needs a constraint that names the subject: a tenant
@@ -184,8 +196,7 @@ impl Reader {
 fn granted_by(
     constraint: &ScopeConstraint,
     reader: Reader,
-    tenant_id: Uuid,
-    subject_id: Uuid,
+    key: SubjectKey,
 ) -> Option<HashSet<Category>> {
     let mut named: Option<HashSet<Category>> = None;
     let mut names_subject = false;
@@ -196,19 +207,12 @@ fn granted_by(
         let values = filter.values();
         let holds = |id: Uuid| values.iter().any(|value| value.as_uuid() == Some(id));
         match filter.property() {
-            pep_properties::OWNER_TENANT_ID if !holds(tenant_id) => return None,
-            pep_properties::RESOURCE_ID if !holds(subject_id) => return None,
+            pep_properties::OWNER_TENANT_ID if !holds(key.tenant_id) => return None,
+            pep_properties::RESOURCE_ID if !holds(key.subject_id) => return None,
             pep_properties::OWNER_TENANT_ID => {}
             pep_properties::RESOURCE_ID => names_subject = true,
             CATEGORY_PROPERTY => {
-                let these: HashSet<Category> = Category::ALL
-                    .into_iter()
-                    .filter(|category| {
-                        values
-                            .iter()
-                            .any(|value| value.to_string() == category.name())
-                    })
-                    .collect();
+                let these = named_categories(&values);
                 named = Some(match named {
                     Some(before) => before.intersection(&these).copied().collect(),
                     None => these,
@@ -223,37 +227,47 @@ fn granted_by(
     Some(named.unwrap_or_else(|| Category::ALL.into_iter().collect()))
 }
 
-/// What a policy scope grants on the profile of `subject_id` in `tenant_id`:
-/// nothing when no constraint reaches them, otherwise the categories of the
-/// constraints that do. Each constraint is one path to the profile, so the
-/// tenant, the subject and the categories must all come from the same one.
-/// An unconstrained scope is the platform allowing everything, so it grants
-/// every category to any reader.
-fn granted(
-    scope: &AccessScope,
-    reader: Reader,
-    tenant_id: Uuid,
-    subject_id: Uuid,
-) -> Option<HashSet<Category>> {
+/// What a policy scope grants on the profile at `key`: nothing when no
+/// constraint reaches it, otherwise the categories of the constraints that
+/// do. Each constraint is one path to the profile, so the tenant, the subject
+/// and the categories must all come from the same one.
+///
+/// The read asks with constraints required, so the enforcer never answers
+/// with an unconstrained scope; one that does is the platform allowing
+/// everything, and grants every category to any reader.
+fn granted(scope: &AccessScope, reader: Reader, key: SubjectKey) -> Option<HashSet<Category>> {
     if scope.is_unconstrained() {
         return Some(Category::ALL.into_iter().collect());
     }
     scope
         .constraints()
         .iter()
-        .filter_map(|constraint| granted_by(constraint, reader, tenant_id, subject_id))
+        .filter_map(|constraint| granted_by(constraint, reader, key))
         .reduce(|mut all, these| {
             all.extend(these);
             all
         })
 }
 
+/// The scope the subject settings are read under: the profile scope's tenant
+/// filters, as the settings rows are scoped by tenant only. An unconstrained
+/// scope stays as it is, since `tenant_only` would turn it into deny-all.
+fn settings_scope(scope: &AccessScope) -> AccessScope {
+    if scope.is_unconstrained() {
+        scope.clone()
+    } else {
+        scope.tenant_only()
+    }
+}
+
 /// What a failed policy call means for the read.
 enum PolicyFailure {
-    /// The platform refused, or answered with a scope Construct cannot
-    /// compile; either way the caller is not allowed. The reason is for the
-    /// log only.
-    Refused(String),
+    /// The platform refused; the caller is not allowed. The reason is for
+    /// the log only.
+    Denied(String),
+    /// The platform answered with a scope Construct cannot compile, a defect
+    /// of the policy plugin or its config; the caller is not allowed either.
+    Uncompilable(String),
     /// The policy service could not answer; the read fails.
     Failed(DomainError),
 }
@@ -262,12 +276,22 @@ enum PolicyFailure {
 /// each category alike.
 fn policy_failure(err: EnforcerError) -> PolicyFailure {
     match err {
-        EnforcerError::Denied { .. } => {
-            PolicyFailure::Refused("the platform refuses the read".to_owned())
+        EnforcerError::Denied {
+            deny_reason: Some(reason),
+        } => PolicyFailure::Denied(format!(
+            "the platform refuses the read: {}{}",
+            reason.error_code,
+            reason
+                .details
+                .map(|details| format!(" ({details})"))
+                .unwrap_or_default()
+        )),
+        EnforcerError::Denied { deny_reason: None } => {
+            PolicyFailure::Denied("the platform refuses the read".to_owned())
         }
-        EnforcerError::CompileFailed(cause) => {
-            PolicyFailure::Refused(format!("the platform's answer cannot be compiled: {cause}"))
-        }
+        EnforcerError::CompileFailed(cause) => PolicyFailure::Uncompilable(format!(
+            "the platform's answer cannot be compiled: {cause}"
+        )),
         other @ EnforcerError::EvaluationFailed(_) => PolicyFailure::Failed(other.into()),
     }
 }
@@ -276,21 +300,29 @@ fn policy_failure(err: EnforcerError) -> PolicyFailure {
 /// visible, any other failure as the gear's own error.
 fn not_visible(err: EnforcerError) -> DomainError {
     match policy_failure(err) {
-        PolicyFailure::Refused(reason) => DomainError::NotVisible(reason),
+        PolicyFailure::Denied(reason) | PolicyFailure::Uncompilable(reason) => {
+            DomainError::NotVisible(reason)
+        }
         PolicyFailure::Failed(err) => err,
     }
 }
 
-/// A refusal of the settings read as a subject that is not visible: the
-/// profile read has already decided that the caller reaches the subject, so a
-/// settings scope that does not is the same answer, not a different error.
-fn settings_refusal(err: DomainError) -> DomainError {
+/// The read's own answer for a failure of the settings read or the facts
+/// read. A refusal is not visible: the read has already decided that the
+/// caller reaches the subject, so a scope that does not reach its settings is
+/// the same answer. A profile too large to read is the gear's own limit, not
+/// something the reader can change. The read answers with nothing else, so
+/// both transports map one set of errors.
+fn read_failure(err: DomainError) -> DomainError {
     match err {
         DomainError::OutOfScope(refused) => DomainError::NotVisible(format!(
             "the policy scope does not reach the subject's settings ({:?})",
             refused.refusal
         )),
         DomainError::Forbidden(reason) => DomainError::NotVisible(reason),
+        DomainError::ProfileFull(full) => DomainError::internal(format!(
+            "the profile is larger than one read takes: {full:?}"
+        )),
         other => other,
     }
 }
@@ -309,14 +341,22 @@ impl ProfileReadService {
         }
     }
 
-    /// The profile of `subject_id`, for a caller the platform lets act for
-    /// the subject. The tenant is the one named, or the caller's own.
+    /// The tenant a read is about: the one named, or else the caller's own.
+    #[must_use]
+    pub fn tenant_of(ctx: &SecurityContext, tenant: Option<Uuid>) -> Uuid {
+        tenant.unwrap_or_else(|| ctx.subject_tenant_id())
+    }
+
+    /// The profile of `subject_id`, for the subject itself or a caller the
+    /// platform lets act for the subject. The tenant is
+    /// [`Self::tenant_of`].
     ///
     /// # Errors
     ///
     /// [`DomainError::NotVisible`] when the caller may not act for the subject
     /// in the tenant, which both transports answer like a subject that does
-    /// not exist. Unavailable or internal when a dependency fails.
+    /// not exist. Unavailable or internal when a dependency fails, also when
+    /// no processing identity is configured. No other error.
     #[tracing::instrument(skip_all, fields(%subject_id, caller = %ctx.subject_id()))]
     pub async fn read(
         &self,
@@ -325,8 +365,11 @@ impl ProfileReadService {
         subject_id: Uuid,
     ) -> Result<ProfileView, DomainError> {
         // @cpt-begin:cpt-cf-construct-algo-profile-reader-read:p1:inst-read-authorize
-        let tenant_id = tenant.unwrap_or_else(|| ctx.subject_tenant_id());
-        let reader = Reader::of(ctx, tenant_id, subject_id);
+        let key = SubjectKey {
+            tenant_id: Self::tenant_of(ctx, tenant),
+            subject_id,
+        };
+        let reader = Reader::of(ctx, key);
         let scope = self
             .policy_enforcer
             .access_scope_with(
@@ -334,34 +377,50 @@ impl ProfileReadService {
                 &PROFILE_RESOURCE,
                 actions::READ,
                 Some(subject_id),
-                &profile_request(tenant_id, None),
+                &profile_request(key, None),
             )
             .await
             .map_err(not_visible)?;
-        let Some(granted) = granted(&scope, reader, tenant_id, subject_id) else {
+        let Some(granted) = granted(&scope, reader, key) else {
             return Err(DomainError::NotVisible(
                 "the policy scope does not reach the subject".to_owned(),
             ));
         };
         // @cpt-end:cpt-cf-construct-algo-profile-reader-read:p1:inst-read-authorize
 
+        // @cpt-begin:cpt-cf-construct-algo-profile-reader-read:p1:inst-read-settings
+        // The facts are Construct's own, so graph storage is read as
+        // Construct, not as the caller. Without an identity the read is
+        // unavailable, whatever it would serve.
+        let (construct, _) = self.ports.contexts.for_tenant(key.tenant_id).await?;
+        let settings = self
+            .ports
+            .settings
+            .read(ctx, &settings_scope(&scope), key)
+            .await
+            .map_err(read_failure)?;
+        let served = settings.personalization_enabled && !settings.erasure_in_progress;
+        // @cpt-end:cpt-cf-construct-algo-profile-reader-read:p1:inst-read-settings
+
         // @cpt-begin:cpt-cf-construct-algo-profile-reader-read:p1:inst-read-categories
-        let readable = match self.check {
-            CategoryCheck::OneCall => granted,
-            CategoryCheck::PerCategory => {
-                self.readable_one_by_one(ctx, reader, tenant_id, subject_id)
-                    .await?
+        let readable = match (served, self.check) {
+            (false, _) => HashSet::new(),
+            (true, CategoryCheck::OneCall) => granted,
+            (true, CategoryCheck::PerCategory) => {
+                self.readable_one_by_one(ctx, reader, key).await?
             }
         };
         // @cpt-end:cpt-cf-construct-algo-profile-reader-read:p1:inst-read-categories
 
-        let categories = self
-            .facts(ctx, &scope, tenant_id, subject_id, &readable)
-            .await?;
+        let categories = if readable.is_empty() {
+            Vec::new()
+        } else {
+            self.facts(&construct, key, &readable).await?
+        };
 
         // @cpt-begin:cpt-cf-construct-algo-profile-reader-read:p1:inst-read-event
         self.ports.events.read(ProfileReadEvent {
-            tenant_id,
+            tenant_id: key.tenant_id,
             subject_id,
             caller: ctx.subject_id(),
             categories: categories.iter().map(|group| group.category).collect(),
@@ -381,18 +440,17 @@ impl ProfileReadService {
         &self,
         ctx: &SecurityContext,
         reader: Reader,
-        tenant_id: Uuid,
-        subject_id: Uuid,
+        key: SubjectKey,
     ) -> Result<HashSet<Category>, DomainError> {
         let decisions = join_all(Category::ALL.into_iter().map(|category| async move {
-            let request = profile_request(tenant_id, Some(category));
+            let request = profile_request(key, Some(category));
             let decided = self
                 .policy_enforcer
                 .access_scope_with(
                     ctx,
                     &PROFILE_RESOURCE,
                     actions::READ,
-                    Some(subject_id),
+                    Some(key.subject_id),
                     &request,
                 )
                 .await;
@@ -403,15 +461,20 @@ impl ProfileReadService {
         for (category, decided) in decisions {
             match decided {
                 Ok(scope) => {
-                    if granted(&scope, reader, tenant_id, subject_id)
+                    if granted(&scope, reader, key)
                         .is_some_and(|categories| categories.contains(&category))
                     {
                         readable.insert(category);
                     }
                 }
                 Err(err) => match policy_failure(err) {
-                    PolicyFailure::Refused(reason) => {
+                    PolicyFailure::Denied(reason) => {
                         tracing::debug!(category = category.name(), %reason, "category not readable");
+                    }
+                    // A plugin that cannot be compiled hides the category for
+                    // every reader, so it is said where an operator looks.
+                    PolicyFailure::Uncompilable(reason) => {
+                        tracing::warn!(category = category.name(), %reason, "category not readable");
                     }
                     PolicyFailure::Failed(err) => return Err(err),
                 },
@@ -420,58 +483,21 @@ impl ProfileReadService {
         Ok(readable)
     }
 
-    /// The readable facts by category, or none while personalization is off
-    /// or an erasure is under way.
+    /// The facts of the readable categories, read as `construct`, grouped in
+    /// category order, without categories that hold none.
     async fn facts(
         &self,
-        ctx: &SecurityContext,
-        scope: &AccessScope,
-        tenant_id: Uuid,
-        subject_id: Uuid,
+        construct: &SecurityContext,
+        key: SubjectKey,
         readable: &HashSet<Category>,
     ) -> Result<Vec<CategoryFacts>, DomainError> {
-        // @cpt-begin:cpt-cf-construct-algo-profile-reader-read:p1:inst-read-settings
-        // The settings rows are scoped by tenant only; an unconstrained scope
-        // stays as it is, since `tenant_only` would turn it into deny-all.
-        let settings_scope = if scope.is_unconstrained() {
-            scope.clone()
-        } else {
-            scope.tenant_only()
-        };
-        let settings = self
-            .ports
-            .settings
-            .read(
-                ctx,
-                &settings_scope,
-                SubjectKey {
-                    tenant_id,
-                    subject_id,
-                },
-            )
-            .await
-            .map_err(settings_refusal)?;
-        if !settings.personalization_enabled || settings.erasure_in_progress || readable.is_empty()
-        {
-            return Ok(Vec::new());
-        }
-        // @cpt-end:cpt-cf-construct-algo-profile-reader-read:p1:inst-read-settings
-
         // @cpt-begin:cpt-cf-construct-algo-profile-reader-read:p1:inst-read-facts
-        // The facts are Construct's own, so graph storage is read as
-        // Construct, not as the caller.
-        let (construct, _) = self.ports.contexts.for_tenant(tenant_id).await?;
         let stored = self
             .ports
             .profiles
-            .stored(
-                &construct,
-                SubjectKey {
-                    tenant_id,
-                    subject_id,
-                },
-            )
-            .await?;
+            .stored(construct, key)
+            .await
+            .map_err(read_failure)?;
         let mut groups: Vec<CategoryFacts> = Category::ALL
             .into_iter()
             .filter(|category| readable.contains(category))
@@ -491,5 +517,39 @@ impl ProfileReadService {
         groups.retain(|group| !group.facts.is_empty());
         Ok(groups)
         // @cpt-end:cpt-cf-construct-algo-profile-reader-read:p1:inst-read-facts
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key() -> SubjectKey {
+        SubjectKey {
+            tenant_id: Uuid::new_v4(),
+            subject_id: Uuid::new_v4(),
+        }
+    }
+
+    #[test]
+    fn an_unconstrained_scope_grants_every_category_to_any_reader() {
+        for reader in [Reader::Owner, Reader::Other] {
+            let categories = granted(&AccessScope::allow_all(), reader, key());
+
+            assert_eq!(
+                categories,
+                Some(Category::ALL.into_iter().collect()),
+                "{reader:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_settings_scope_keeps_an_unconstrained_scope_and_the_tenant_filters_of_others() {
+        let tenant = Uuid::new_v4();
+
+        assert!(settings_scope(&AccessScope::allow_all()).is_unconstrained());
+        let narrowed = settings_scope(&AccessScope::for_tenant(tenant));
+        assert!(!narrowed.is_deny_all() && !narrowed.is_unconstrained());
     }
 }
