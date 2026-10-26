@@ -14,7 +14,7 @@ use super::root::{ProfileVersion, Root, root_key};
 use super::{ContextSubject, DEFAULT_CALL_TIMEOUT, bounded, subject_in_context};
 use crate::domain::error::DomainError;
 use crate::domain::plan::NodeKey;
-use crate::domain::profile::{FullProfile, Profile, ProfileSource};
+use crate::domain::profile::{FactCount, FullProfile, Profile, ProfileSource};
 use crate::domain::subject_settings::SubjectKey;
 
 /// The most nodes one profile read takes: the root and its facts. Graph
@@ -80,7 +80,7 @@ pub(crate) async fn read_stored(
             // there were more.
             return Err(DomainError::ProfileFull(FullProfile {
                 subject: *subject,
-                facts: response.nodes.len(),
+                facts: FactCount::AtLeast(response.nodes.len()),
                 limit: MAX_FACTS,
             }));
         }
@@ -182,12 +182,7 @@ impl ProfileSource for GraphProfileSource {
         .await?;
 
         // @cpt-begin:cpt-cf-construct-algo-profile-writer-read:p1:inst-read-facts
-        let listed: BTreeSet<&str> = stored
-            .root
-            .removals
-            .iter()
-            .map(|key| key.0.as_str())
-            .collect();
+        let listed = &stored.root.removals;
         let facts = stored
             .facts
             .iter()

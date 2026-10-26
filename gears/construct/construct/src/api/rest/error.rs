@@ -185,7 +185,7 @@ impl From<DomainError> for CanonicalError {
                 tracing::warn!(
                     tenant_id = %full.subject.tenant_id,
                     subject_id = %full.subject.subject_id,
-                    facts = full.facts,
+                    facts = %full.facts,
                     limit = full.limit,
                     "construct profile full"
                 );

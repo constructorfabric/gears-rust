@@ -4,6 +4,8 @@
 //! through [`Plan::values`], [`Origin::written_by_a_person`], and each step's
 //! entity kind, confidence and [`Change::stores_values`].
 
+use std::borrow::Borrow;
+
 use serde_json::Value;
 use time::OffsetDateTime;
 use toolkit_macros::domain_model;
@@ -15,6 +17,13 @@ use uuid::Uuid;
 #[domain_model]
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct NodeKey(pub String);
+
+/// A key compares as its text, so a set of keys is looked up by `&str`.
+impl Borrow<str> for NodeKey {
+    fn borrow(&self) -> &str {
+        &self.0
+    }
+}
 
 /// Who a plan comes from. The connector of a record is the source of the trust
 /// check.

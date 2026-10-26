@@ -178,6 +178,17 @@ fn a_fact_must_hold_exactly_one_property() {
 }
 
 #[test]
+fn a_fact_property_named_as_the_envelope_is_a_defect() {
+    for name in ["origin", "record"] {
+        let plan = connector_plan(vec![add_value("skill", name, skills())]);
+
+        let message = internal(fact_node(&plan, &plan.steps[0], now()));
+
+        assert!(message.contains(name), "{message}");
+    }
+}
+
+#[test]
 fn a_property_change_is_refused_without_its_value_in_the_message() {
     let entity = NodeKey("construct:t:fact".to_owned());
     let secret = Property::new("skills", json!("a secret value"));

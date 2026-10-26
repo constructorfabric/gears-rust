@@ -8,7 +8,9 @@ use graph_storage_sdk::models::TypeRegistration;
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
-use super::{DEFAULT_CALL_TIMEOUT, bounded};
+use toolkit_canonical_errors::CanonicalError;
+
+use super::{CAS_CONFLICT, DEFAULT_CALL_TIMEOUT, bounded, graph_error, unanswered};
 use crate::domain::error::DomainError;
 
 /// Registers Construct's graph types in a tenant before the first write there.
@@ -75,12 +77,27 @@ impl GraphTypes {
                     })
             })
             .collect::<Result<Vec<_>, _>>()?;
-        bounded(
-            self.timeout,
-            "type registration",
-            self.client.register_types(ctx, batch),
-        )
-        .await?;
+        let first =
+            tokio::time::timeout(self.timeout, self.client.register_types(ctx, batch.clone()))
+                .await;
+        match first {
+            Ok(Ok(_)) => {}
+            // Two first registrations in a tenant race, and the one that
+            // loses is refused as a conflict. The same schemas registered
+            // again converge, so it is sent once more.
+            Ok(Err(CanonicalError::Aborted { ctx: aborted, .. }))
+                if aborted.reason == CAS_CONFLICT =>
+            {
+                bounded(
+                    self.timeout,
+                    "type registration",
+                    self.client.register_types(ctx, batch),
+                )
+                .await?;
+            }
+            Ok(Err(err)) => return Err(graph_error("type registration", &err)),
+            Err(_) => return Err(unanswered("type registration", self.timeout)),
+        }
         if let Ok(mut registered) = self.registered.lock() {
             registered.insert(tenant_id);
         }

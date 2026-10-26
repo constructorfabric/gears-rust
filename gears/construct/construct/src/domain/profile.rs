@@ -90,18 +90,35 @@ pub struct Profile {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FullProfile {
     pub subject: SubjectKey,
-    /// The facts the profile would hold after the write; after a read cut
-    /// short, the least it holds.
-    pub facts: usize,
+    pub facts: FactCount,
     /// The most facts it may hold.
     pub limit: usize,
+}
+
+/// How many facts a full profile has.
+#[domain_model]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FactCount {
+    /// What a write would leave it holding.
+    WouldHold(usize),
+    /// The least it holds, after a read cut short by its limit.
+    AtLeast(usize),
+}
+
+impl fmt::Display for FactCount {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::WouldHold(facts) => write!(f, "would hold {facts} facts"),
+            Self::AtLeast(facts) => write!(f, "holds at least {facts} facts"),
+        }
+    }
 }
 
 impl fmt::Display for FullProfile {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "the profile of subject {} in tenant {} reaches {} facts, past the limit of {}",
+            "the profile of subject {} in tenant {} {}, past the limit of {}",
             self.subject.subject_id, self.subject.tenant_id, self.facts, self.limit
         )
     }

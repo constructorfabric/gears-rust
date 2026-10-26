@@ -124,6 +124,13 @@ pub fn fact_node(
         Change::RemoveProperty { .. } => return Err(property_change("remove-property")),
     };
     let property = single(properties)?;
+    // The envelope would overwrite it, and the node would hold no fact.
+    if ENVELOPE.contains(&property.name.as_str()) {
+        return Err(DomainError::internal(format!(
+            "a fact property cannot be named `{}`",
+            property.name
+        )));
+    }
     let mut payload = Map::new();
     payload.insert(property.name.clone(), property.value.clone());
     payload.insert(ORIGIN.to_owned(), origin(plan, step, now)?);

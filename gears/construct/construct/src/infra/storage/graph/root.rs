@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use graph_storage_sdk::models::NodeView;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -28,7 +30,7 @@ struct RootPayload<R> {
 /// removed facts whose soft delete may still be pending.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Root {
-    pub removals: Vec<NodeKey>,
+    pub removals: BTreeSet<NodeKey>,
 }
 
 impl Root {

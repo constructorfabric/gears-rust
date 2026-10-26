@@ -12,16 +12,17 @@ use std::future::Future;
 use std::time::Duration;
 
 use toolkit_canonical_errors::CanonicalError;
-use toolkit_security::SecurityContext;
 
 use crate::domain::error::{DomainError, is_retryable};
-use crate::domain::subject_settings::SubjectKey;
 
+mod context;
 pub mod fact;
 pub mod reader;
 pub mod root;
 pub mod types;
 pub mod writer;
+
+pub(crate) use context::{ContextSubject, subject_in_context};
 
 #[cfg(test)]
 mod fact_test;
@@ -29,6 +30,10 @@ mod fact_test;
 mod graph_test;
 #[cfg(test)]
 mod root_test;
+
+/// The reason graph storage gives a refused compare-and-set, and a
+/// registration that lost to another of the same type.
+pub(crate) const CAS_CONFLICT: &str = "CAS_CONFLICT";
 
 /// How long one graph storage call may take before it counts as unanswered.
 /// Graph storage checks its own budget only when it admits a call, and cannot
@@ -70,44 +75,13 @@ pub(crate) async fn bounded<T>(
 ) -> Result<T, DomainError> {
     tokio::time::timeout(timeout, call)
         .await
-        .map_err(|_| {
-            DomainError::Unavailable(format!(
-                "graph storage {what}: no answer within {timeout:?}"
-            ))
-        })?
+        .map_err(|_| unanswered(what, timeout))?
         .map_err(|err| graph_error(what, &err))
 }
 
-/// A subject in the security context's tenant. Only [`subject_in_context`]
-/// makes one, so a profile read or write that takes it has passed the tenant
-/// check.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct ContextSubject(SubjectKey);
-
-impl ContextSubject {
-    pub(crate) fn key(&self) -> &SubjectKey {
-        &self.0
-    }
-}
-
-/// `subject` when it is in the context's tenant. Graph storage reads and
-/// writes in the security context's tenant, and the profile's keys name a
-/// tenant too, so the two must be the same.
-///
-/// # Errors
-///
-/// [`DomainError::Internal`] when the subject's tenant is not the context's:
-/// the caller built the context for another tenant, which is a defect.
-pub(crate) fn subject_in_context(
-    ctx: &SecurityContext,
-    subject: SubjectKey,
-) -> Result<ContextSubject, DomainError> {
-    let context_tenant = ctx.subject_tenant_id();
-    if context_tenant != subject.tenant_id {
-        return Err(DomainError::internal(format!(
-            "the profile's tenant {} is not the context's tenant {context_tenant}",
-            subject.tenant_id
-        )));
-    }
-    Ok(ContextSubject(subject))
+/// A graph storage call that did not answer within `timeout`.
+pub(crate) fn unanswered(what: &str, timeout: Duration) -> DomainError {
+    DomainError::Unavailable(format!(
+        "graph storage {what}: no answer within {timeout:?}"
+    ))
 }
