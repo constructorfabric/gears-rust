@@ -181,8 +181,14 @@ impl From<DomainError> for CanonicalError {
             // A full profile takes no new fact until facts are removed: the
             // caller's state, not the gear's failure. The subject stays in the
             // log, out of the answer.
-            DomainError::ProfileFull(msg) => {
-                tracing::warn!(msg = %msg, "construct profile full");
+            DomainError::ProfileFull(full) => {
+                tracing::warn!(
+                    tenant_id = %full.subject.tenant_id,
+                    subject_id = %full.subject.subject_id,
+                    facts = full.facts,
+                    limit = full.limit,
+                    "construct profile full"
+                );
                 ProfileError::failed_precondition()
                     .with_precondition_violation(
                         "profile",

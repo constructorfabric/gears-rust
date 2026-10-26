@@ -3,6 +3,7 @@
 
 use construct_sdk::gts::{IDENTITY_TYPE, PROFILE_ROOT_TYPE, SKILL_TYPE};
 use graph_storage_sdk::models::{ElementEnvelope, GraphRevision, NodeSpec, NodeView, Subject};
+use proptest::prelude::*;
 use serde_json::{Value, json};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
@@ -261,18 +262,74 @@ fn a_stored_fact_reads_back_as_its_property_and_value() {
 }
 
 #[test]
-fn a_node_that_holds_no_fact_is_no_fact() {
-    assert!(fact_of(&view(SKILL_TYPE, None)).is_none(), "no payload");
-    assert!(
-        fact_of(&view(
+fn a_fact_node_that_holds_no_single_fact_is_a_defect_named_by_its_key() {
+    for (type_id, payload, what) in [
+        (SKILL_TYPE, None, "has no payload"),
+        (
             SKILL_TYPE,
-            Some(json!({ "origin": {}, "record": {} }))
-        ))
-        .is_none(),
-        "no fact property"
-    );
-    assert!(
-        fact_of(&view(PROFILE_ROOT_TYPE, Some(json!({ "removals": [] })))).is_none(),
-        "not a person type"
-    );
+            Some(json!({ "origin": {}, "record": {} })),
+            "exactly one fact property",
+        ),
+        (
+            SKILL_TYPE,
+            Some(json!({ "skills": skills(), "other": "a secret value", "origin": {} })),
+            "exactly one fact property",
+        ),
+        (
+            PROFILE_ROOT_TYPE,
+            Some(json!({ "removals": [] })),
+            "no person type",
+        ),
+    ] {
+        match fact_of(&view(type_id, payload)) {
+            Err(DomainError::Internal(message)) => {
+                assert!(message.contains("construct:t:fact"), "{message}");
+                assert!(message.contains(what), "{message}");
+                assert!(!message.contains("a secret value"), "{message}");
+            }
+            other => panic!("{what}: {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn a_records_time_is_stored_in_utc() {
+    let mut plan = connector_plan(vec![add_value("skill", "skills", skills())]);
+    let Origin::Connector { observed_at, .. } = &mut plan.origin else {
+        panic!("a record's plan");
+    };
+    *observed_at = OffsetDateTime::parse("2026-10-20T14:00:00+02:00", &Rfc3339).unwrap();
+
+    let payload = node_of(&plan).payload.unwrap();
+
+    assert_eq!(payload["origin"]["produced_at"], "2026-10-20T12:00:00Z");
+}
+
+#[test]
+fn an_infinite_confidence_is_a_defect() {
+    let mut plan = connector_plan(vec![add_value("skill", "skills", skills())]);
+    plan.steps[0].confidence = Some(f32::INFINITY);
+
+    let message = internal(fact_node(&plan, &plan.steps[0], now()));
+
+    assert!(message.contains("confidence"), "{message}");
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    /// Any confidence a model gives is stored as a number that reads back as
+    /// the same `f32`.
+    #[test]
+    fn a_confidence_reads_back_as_the_value_given(given in 0.0_f32..=1.0) {
+        let mut plan = connector_plan(vec![add_value("skill", "skills", skills())]);
+        plan.steps[0].confidence = Some(given);
+
+        let payload = node_of(&plan).payload.unwrap();
+
+        let stored = payload["origin"]["confidence"].as_f64().expect("a number");
+        #[allow(clippy::cast_possible_truncation, reason = "the value was an f32")]
+        let back = stored as f32;
+        prop_assert_eq!(back.to_bits(), given.to_bits(), "{} came back as {}", given, back);
+    }
 }

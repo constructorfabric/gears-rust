@@ -24,11 +24,11 @@ struct RootPayload<R> {
     removals: R,
 }
 
-/// What the root holds besides its subject and its version: the removed facts
-/// whose soft delete may still be pending.
+/// What the root holds besides its subject and its version: the keys of the
+/// removed facts whose soft delete may still be pending.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Root {
-    pub removals: Vec<String>,
+    pub removals: Vec<NodeKey>,
 }
 
 impl Root {
@@ -50,7 +50,7 @@ impl Root {
             ))
         })?;
         Ok(Self {
-            removals: parsed.removals,
+            removals: parsed.removals.into_iter().map(NodeKey).collect(),
         })
     }
 
@@ -67,7 +67,11 @@ impl Root {
     ) -> Result<Value, DomainError> {
         let payload = RootPayload {
             subject_id,
-            removals: &self.removals,
+            removals: self
+                .removals
+                .iter()
+                .map(|key| key.0.as_str())
+                .collect::<Vec<_>>(),
         };
         let Ok(Value::Object(mut fields)) = serde_json::to_value(payload) else {
             return Err(DomainError::internal(

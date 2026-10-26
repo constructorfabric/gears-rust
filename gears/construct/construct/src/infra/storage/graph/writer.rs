@@ -13,13 +13,13 @@ use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
 use super::fact::fact_node;
-use super::reader::{MAX_FACTS, read_stored};
+use super::reader::{MAX_FACTS, Stored, read_stored};
 use super::root::{ProfileVersion, Root, root_key};
 use super::types::GraphTypes;
-use super::{DEFAULT_CALL_TIMEOUT, bounded, graph_error, subject_in_context};
+use super::{ContextSubject, DEFAULT_CALL_TIMEOUT, bounded, graph_error, subject_in_context};
 use crate::domain::error::DomainError;
 use crate::domain::plan::{Change, NodeKey, Plan};
-use crate::domain::profile::{PlanWriter, Written};
+use crate::domain::profile::{FullProfile, PlanWriter, Written};
 use crate::domain::subject_settings::SubjectKey;
 
 /// The reason graph storage gives a failed compare-and-set.
@@ -47,7 +47,10 @@ pub trait FactRemoval: Send + Sync {
     /// When graph storage cannot remove it now, does not answer in time, or
     /// finds no fact under `key`; the key stays listed on the root and a
     /// later write tries again.
-    async fn remove(&self, ctx: &SecurityContext, key: &str) -> Result<(), DomainError>;
+    // cancel-safe: the writer drops a removal that runs past its timeout. A
+    // dropped removal has either tombstoned the fact or not; its key stays
+    // listed on the root either way, and removing it again is safe.
+    async fn remove(&self, ctx: &SecurityContext, key: &NodeKey) -> Result<(), DomainError>;
 }
 
 /// [`FactRemoval`] as graph storage's soft delete, which tombstones the node
@@ -76,12 +79,12 @@ impl SoftDelete {
 
 #[async_trait]
 impl FactRemoval for SoftDelete {
-    async fn remove(&self, ctx: &SecurityContext, key: &str) -> Result<(), DomainError> {
+    async fn remove(&self, ctx: &SecurityContext, key: &NodeKey) -> Result<(), DomainError> {
         // @cpt-begin:cpt-cf-construct-algo-profile-writer-write:p1:inst-write-remove
         match bounded(
             self.timeout,
             "fact removal",
-            self.client.delete_node(ctx, &key.to_owned()),
+            self.client.delete_node(ctx, &key.0),
         )
         .await?
         {
@@ -89,7 +92,7 @@ impl FactRemoval for SoftDelete {
             // means graph storage holds no such fact for this context, which a
             // listed key of a live fact never is, so it is no success.
             Ok(_) => Ok(()),
-            Err(err) => Err(graph_error(&format!("removal of fact {key}"), &err)),
+            Err(err) => Err(graph_error(&format!("removal of fact {}", key.0), &err)),
         }
         // @cpt-end:cpt-cf-construct-algo-profile-writer-write:p1:inst-write-remove
     }
@@ -139,18 +142,26 @@ impl GraphPlanWriter {
         self
     }
 
-    /// Replace [`MAX_FACTS`], the most facts one profile may hold. It cannot
-    /// exceed what one read takes.
-    #[must_use]
-    pub fn with_max_facts(mut self, max_facts: usize) -> Self {
-        self.max_facts = max_facts.min(MAX_FACTS);
-        self
+    /// Replace [`MAX_FACTS`], the most facts one profile may hold.
+    ///
+    /// # Errors
+    ///
+    /// When `max_facts` is more than one read takes, [`MAX_FACTS`]: such a
+    /// profile could not be read whole.
+    pub fn with_max_facts(mut self, max_facts: usize) -> Result<Self, DomainError> {
+        if max_facts > MAX_FACTS {
+            return Err(DomainError::internal(format!(
+                "a profile of {max_facts} facts is more than one read takes ({MAX_FACTS})"
+            )));
+        }
+        self.max_facts = max_facts;
+        Ok(self)
     }
 
     /// Remove the facts under `keys`, one after another, within one call
     /// timeout. The first that fails ends the cleanup: it and the rest stay
     /// listed on the root, and a later write finishes them.
-    async fn remove(&self, ctx: &SecurityContext, keys: &[String]) {
+    async fn remove(&self, ctx: &SecurityContext, keys: &[NodeKey]) {
         let cleanup = async {
             for (done, key) in keys.iter().enumerate() {
                 if let Err(err) = self.ports.removal.remove(ctx, key).await {
@@ -162,7 +173,7 @@ impl GraphPlanWriter {
         match tokio::time::timeout(self.timeout, cleanup).await {
             Ok(Ok(())) => {}
             Ok(Err((done, key, err))) => tracing::warn!(
-                %key,
+                key = %key.0,
                 error = %err,
                 left = keys.len() - done,
                 "removed facts stay listed on the root until a later write finishes them"
@@ -196,7 +207,7 @@ impl GraphPlanWriter {
                 {
                     return Ok(Written::Conflict);
                 }
-                Ok(Err(err)) if !unknown_result(&err) => {
+                Ok(Err(err)) if !resendable(&err) => {
                     return Err(graph_error("profile write", &err));
                 }
                 Ok(Err(err)) => err.to_string(),
@@ -223,17 +234,17 @@ impl GraphPlanWriter {
 }
 
 /// A random share of `pause`, up to all of it.
-fn jitter(pause: Duration) -> Duration {
+pub(super) fn jitter(pause: Duration) -> Duration {
     let millis = u64::try_from(pause.as_millis()).unwrap_or(u64::MAX);
     Duration::from_millis(rand::random_range(0..=millis))
 }
 
-/// Whether the write may or may not have committed, or certainly did not and
-/// can be sent as it is: unavailable, out of time, or a lost serialization
-/// race. Sending it again with its key is safe in each case. An unknown error
-/// is not among them: it says nothing about the write, so it is a defect to
-/// report, not a state to wait out.
-pub(super) fn unknown_result(err: &CanonicalError) -> bool {
+/// Whether a failed send can be sent again as it is, with its key: graph
+/// storage was unavailable or out of time, so the write may or may not have
+/// committed, or it lost a serialization race and certainly did not. An
+/// unknown error is not among them: it says nothing about the write, so it is
+/// a defect to report, not a state to wait out.
+pub(super) fn resendable(err: &CanonicalError) -> bool {
     match err {
         CanonicalError::Aborted { ctx, .. } => ctx.reason == SERIALIZATION,
         CanonicalError::ServiceUnavailable { .. } | CanonicalError::DeadlineExceeded { .. } => true,
@@ -247,7 +258,7 @@ pub(super) fn unknown_result(err: &CanonicalError) -> bool {
 struct Changes {
     nodes: Vec<NodeSpec>,
     edges: Vec<EdgeSpec>,
-    removals: BTreeSet<String>,
+    removals: BTreeSet<NodeKey>,
 }
 
 /// The changes of a plan's steps.
@@ -266,7 +277,7 @@ fn changes(plan: &Plan, root: &NodeKey, now: OffsetDateTime) -> Result<Changes, 
         }
         match &step.change {
             Change::ReplaceEntity { old, .. } | Change::RemoveEntity { entity: old } => {
-                changes.removals.insert(old.0.clone());
+                changes.removals.insert(old.clone());
             }
             Change::AddEntity { .. }
             | Change::AddProperty { .. }
@@ -275,6 +286,143 @@ fn changes(plan: &Plan, root: &NodeKey, now: OffsetDateTime) -> Result<Changes, 
         }
     }
     Ok(changes)
+}
+
+/// One plan's ingest, and the removals the root lists after it.
+struct Batch {
+    request: IngestRequest,
+    listed: Vec<NodeKey>,
+}
+
+/// The ingest of `plan` on the profile it was built on: its fact nodes, their
+/// edges from the root, and the root with the next version and every removal
+/// still to run.
+///
+/// # Errors
+///
+/// [`DomainError::ProfileFull`] when the new facts would pass `max_facts`;
+/// internal when the plan removes a key that is no live fact of the profile,
+/// or a fact or the root cannot be built.
+fn batch(
+    stored: Stored,
+    subject: &SubjectKey,
+    plan: &Plan,
+    versions: &dyn ProfileVersion,
+    max_facts: usize,
+    now: OffsetDateTime,
+) -> Result<Batch, DomainError> {
+    let live: BTreeSet<&str> = stored
+        .facts
+        .iter()
+        .map(|node| node.node_key.as_str())
+        .collect();
+
+    // @cpt-begin:cpt-cf-construct-algo-profile-writer-write:p1:inst-write-pending
+    // Earlier removals still listed: one whose fact is gone is done and drops
+    // off the list. Only a live fact of this root is ever removed, so a key
+    // that is not one of its facts is never deleted.
+    let mut listed: BTreeSet<NodeKey> = stored
+        .root
+        .removals
+        .into_iter()
+        .filter(|key| live.contains(key.0.as_str()))
+        .collect();
+    // @cpt-end:cpt-cf-construct-algo-profile-writer-write:p1:inst-write-pending
+
+    // @cpt-begin:cpt-cf-construct-algo-profile-writer-write:p1:inst-write-batch
+    let root = root_key(subject);
+    let Changes {
+        mut nodes,
+        edges,
+        removals,
+    } = changes(plan, &root, now)?;
+    if let Some(key) = removals.iter().find(|key| !live.contains(key.0.as_str())) {
+        return Err(DomainError::internal(format!(
+            "the plan removes {}, which is not a fact of the profile it was built on",
+            key.0
+        )));
+    }
+    // A fact listed for removal still counts until its delete has run, so a
+    // profile never grows past what one read takes, even when deletes fail.
+    let facts = live.len() + nodes.len();
+    if facts > max_facts {
+        return Err(DomainError::ProfileFull(FullProfile {
+            subject: *subject,
+            facts,
+            limit: max_facts,
+        }));
+    }
+    listed.extend(removals);
+    // Sorted and without duplicates, as the set it comes from.
+    let root_now = Root {
+        removals: listed.into_iter().collect(),
+    };
+    let payload = root_now.payload(subject.subject_id, versions, versions.next(stored.version)?)?;
+    nodes.push(NodeSpec {
+        node_key: root.0,
+        type_id: PROFILE_ROOT_TYPE.to_owned(),
+        name: None,
+        payload: Some(payload),
+        expected_version: Some(versions.expected(stored.version)?),
+    });
+    Ok(Batch {
+        request: IngestRequest {
+            nodes,
+            edges,
+            options: IngestOptions::default(),
+            replace_scope: None,
+            idempotency_key: Some(Uuid::now_v7().to_string()),
+        },
+        listed: root_now.removals,
+    })
+    // @cpt-end:cpt-cf-construct-algo-profile-writer-write:p1:inst-write-batch
+}
+
+impl GraphPlanWriter {
+    /// The profile as graph storage holds it now.
+    async fn read(
+        &self,
+        ctx: &SecurityContext,
+        subject: &ContextSubject,
+    ) -> Result<Stored, DomainError> {
+        read_stored(
+            self.ports.client.as_ref(),
+            self.ports.version.as_ref(),
+            self.timeout,
+            ctx,
+            subject,
+        )
+        .await
+    }
+
+    /// A compare-and-set refused after a read that matched the plan. Every
+    /// write of Construct's moves the counter, so a counter that has not moved
+    /// means graph storage's version of the root no longer matches it: the
+    /// root was written outside Construct, or its key is held by a removed
+    /// node. Every later write would be refused too, so that is a defect, not
+    /// a conflict.
+    async fn refused(
+        &self,
+        ctx: &SecurityContext,
+        subject: &ContextSubject,
+        expected: Option<u64>,
+    ) -> Result<Written, DomainError> {
+        let now = self.read(ctx, subject).await?.version;
+        if now == expected {
+            return Err(DomainError::internal(format!(
+                "profile root {} refuses every write: graph storage's version of it does not \
+                 match its counter {expected:?}; it was written outside Construct, or its key is \
+                 held by a removed node",
+                root_key(subject.key()).0
+            )));
+        }
+        tracing::warn!(
+            expected = ?expected,
+            stored = ?now,
+            "the profile changed between its read and its write"
+        );
+        Ok(Written::Conflict)
+    }
 }
 
 #[async_trait]
@@ -294,108 +442,36 @@ impl PlanWriter for GraphPlanWriter {
         self.ports.types.ensure(ctx).await?;
 
         // @cpt-begin:cpt-cf-construct-algo-profile-writer-write:p1:inst-write-read-root
-        let stored = read_stored(
-            self.ports.client.as_ref(),
-            self.ports.version.as_ref(),
-            self.timeout,
-            ctx,
-            &subject,
-        )
-        .await?;
-        let stored_version = stored.version;
-        if stored.version != plan.profile_version {
+        let stored = self.read(ctx, &subject).await?;
+        let expected = stored.version;
+        if expected != plan.profile_version {
             tracing::debug!(
-                stored = ?stored.version,
+                stored = ?expected,
                 planned = ?plan.profile_version,
                 "the plan was built on an older profile"
             );
             return Ok(Written::Conflict);
         }
-        let live: BTreeSet<&str> = stored
-            .facts
-            .iter()
-            .map(|node| node.node_key.as_str())
-            .collect();
         // @cpt-end:cpt-cf-construct-algo-profile-writer-write:p1:inst-write-read-root
 
-        // @cpt-begin:cpt-cf-construct-algo-profile-writer-write:p1:inst-write-pending
-        // Earlier removals still listed: one whose fact is gone is done and
-        // drops off the list. Only a live fact of this root is ever removed, so
-        // a key that is not one of its facts is never deleted.
-        let pending: BTreeSet<String> = stored
-            .root
-            .removals
-            .into_iter()
-            .filter(|key| live.contains(key.as_str()))
-            .collect();
-        // @cpt-end:cpt-cf-construct-algo-profile-writer-write:p1:inst-write-pending
-
-        // @cpt-begin:cpt-cf-construct-algo-profile-writer-write:p1:inst-write-batch
-        let root = root_key(&subject);
-        let Changes {
-            mut nodes,
-            edges,
-            removals,
-        } = changes(plan, &root, OffsetDateTime::now_utc())?;
-        if let Some(key) = removals.iter().find(|key| !live.contains(key.as_str())) {
-            return Err(DomainError::internal(format!(
-                "the plan removes {key}, which is not a fact of the profile it was built on"
-            )));
-        }
-        // A fact listed for removal still counts until its delete has run, so
-        // a profile never grows past what one read takes, even when deletes
-        // fail.
-        if live.len() + nodes.len() > self.max_facts {
-            return Err(DomainError::ProfileFull(format!(
-                "the profile of subject {} holds {} facts; {} more would pass the limit of {}",
-                plan.subject_id,
-                live.len(),
-                nodes.len(),
-                self.max_facts
-            )));
-        }
-        let version = self.ports.version.next(stored_version)?;
-        let mut listed = pending;
-        listed.extend(removals);
-        // Sorted and without duplicates, as the set it comes from.
-        let root_now = Root {
-            removals: listed.into_iter().collect(),
-        };
-        let payload = root_now.payload(plan.subject_id, self.ports.version.as_ref(), version)?;
-        nodes.push(NodeSpec {
-            node_key: root.0,
-            type_id: PROFILE_ROOT_TYPE.to_owned(),
-            name: None,
-            payload: Some(payload),
-            expected_version: Some(self.ports.version.expected(stored_version)?),
-        });
-        let request = IngestRequest {
-            nodes,
-            edges,
-            options: IngestOptions::default(),
-            replace_scope: None,
-            idempotency_key: Some(Uuid::now_v7().to_string()),
-        };
-        // @cpt-end:cpt-cf-construct-algo-profile-writer-write:p1:inst-write-batch
-
+        let Batch { request, listed } = batch(
+            stored,
+            subject.key(),
+            plan,
+            self.ports.version.as_ref(),
+            self.max_facts,
+            OffsetDateTime::now_utc(),
+        )?;
         match self.ingest(ctx, request).await? {
             Written::Stored => {
                 // @cpt-begin:cpt-cf-construct-algo-profile-writer-write:p1:inst-write-cleanup
                 // Committed: every listed fact is already left out of reads, so
                 // a removal that fails now is finished by a later write.
-                self.remove(ctx, &root_now.removals).await;
+                self.remove(ctx, &listed).await;
                 // @cpt-end:cpt-cf-construct-algo-profile-writer-write:p1:inst-write-cleanup
                 Ok(Written::Stored)
             }
-            Written::Conflict => {
-                // The read matched, so the root moved between the read and the
-                // write: a concurrent write, or a write from outside Construct.
-                tracing::warn!(
-                    expected = ?stored_version,
-                    "graph storage refused the profile write's compare-and-set"
-                );
-                Ok(Written::Conflict)
-            }
+            Written::Conflict => self.refused(ctx, &subject, expected).await,
         }
     }
 }
