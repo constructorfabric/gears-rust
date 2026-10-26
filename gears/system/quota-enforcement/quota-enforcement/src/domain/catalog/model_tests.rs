@@ -1,6 +1,8 @@
 #![allow(clippy::expect_used)]
 
-use gts::GtsTypeId;
+use gts::{
+    GtsTypeId, ResolvedType, SELF_ID_REF, X_GTS_INSTANCE_REF, X_GTS_PATTERN_REF, X_GTS_TYPE_REF,
+};
 use quota_enforcement_sdk::{METRIC_BASE_TYPE, SCOPE_USER};
 use serde_json::{Value, json};
 
@@ -19,7 +21,23 @@ fn compiled(id: &str, documents: &[serde_json::Value]) -> CompiledContract {
         .into_iter()
         .find(|r| r.id.as_ref() == id)
         .expect("fixture resolves");
-    CompiledContract::compile(registered.id.clone(), registered.schema).expect("compiles")
+    CompiledContract::new(registered.payload.expect("compiles"), registered.schema)
+}
+
+/// Compiles `schema` as the resolved body of the concrete type `id`.
+fn compile(id: &str, schema: Value) -> Result<CompiledContract, String> {
+    let resolved = ResolvedType {
+        id: GtsTypeId::new(id),
+        is_abstract: false,
+        is_final: false,
+        schema,
+        effective_traits: Value::Null,
+        effective_traits_schema: Value::Null,
+    };
+    resolved
+        .compile_payload_validator()
+        .map(|validator| CompiledContract::new(validator, resolved.schema))
+        .map_err(|e| e.to_string())
 }
 
 #[test]
@@ -44,7 +62,7 @@ fn the_token_request_contract_validates_the_envelope_not_the_inner_object() {
 }
 
 #[test]
-fn gts_formats_and_x_gts_ref_are_enforced_on_metadata_values() {
+fn entity_refs_and_formats_are_enforced_on_metadata_values() {
     let contract = compiled(TYPED_REQUEST, &[typed_request_document(METRIC_TOKENS)]);
     let envelope = |model: &str| json!({ "type": TYPED_REQUEST, "metadata": { "model": model } });
 
@@ -55,11 +73,15 @@ fn gts_formats_and_x_gts_ref_are_enforced_on_metadata_values() {
         .expect("an instance under the declared base");
     let malformed = contract
         .validate(&envelope("not-an-id"))
-        .expect_err("gts-instance-id format is asserted");
+        .expect_err("x-gts-instance-ref rejects a value that is no GTS id");
     assert!(!malformed.is_empty());
+    let a_type = contract
+        .validate(&envelope(TYPED_MODEL_BASE))
+        .expect_err("x-gts-instance-ref rejects a type id");
+    assert!(!a_type.is_empty());
     let other_base = contract
         .validate(&envelope(METRIC_TOKENS))
-        .expect_err("a well-formed id under another base fails x-gts-ref");
+        .expect_err("a well-formed id under another base fails x-gts-instance-ref");
     assert!(
         other_base
             .iter()
@@ -103,8 +125,8 @@ fn local_and_mixin_references_apply_after_resolution() {
 
 #[test]
 fn a_schema_that_does_not_compile_is_reported() {
-    let err = CompiledContract::compile(
-        GtsTypeId::new(LLM_TOKEN_REQUEST),
+    let err = compile(
+        LLM_TOKEN_REQUEST,
         json!({ "$schema": crate::test_support::DRAFT7, "type": "object", "properties": 5 }),
     )
     .expect_err("properties must be an object");
@@ -113,8 +135,8 @@ fn a_schema_that_does_not_compile_is_reported() {
 
 /// A one-field contract whose `value` carries the schema under test.
 fn contract_over(value_schema: &Value) -> CompiledContract {
-    CompiledContract::compile(
-        GtsTypeId::new(TYPED_REQUEST),
+    compile(
+        TYPED_REQUEST,
         json!({
             "$schema": DRAFT7,
             "type": "object",
@@ -139,10 +161,10 @@ fn one_of_branches_without_gts_constraints_are_judged_by_their_own_schema() {
 }
 
 #[test]
-fn one_of_branches_are_told_apart_by_their_x_gts_ref() {
+fn one_of_branches_are_told_apart_by_their_entity_ref() {
     let contract = contract_over(&json!({ "oneOf": [
-        { "type": "string", "format": "gts-instance-id", "x-gts-ref": TYPED_MODEL_BASE },
-        { "type": "string", "format": "gts-instance-id", "x-gts-ref": METRIC_BASE_TYPE },
+        { "type": "string", X_GTS_INSTANCE_REF: TYPED_MODEL_BASE },
+        { "type": "string", X_GTS_INSTANCE_REF: METRIC_BASE_TYPE },
     ] }));
     check(&contract, &json!(MODEL_GPT)).expect("exactly the model branch");
     check(&contract, &json!(METRIC_TOKENS)).expect("exactly the metric branch");
@@ -151,9 +173,45 @@ fn one_of_branches_are_told_apart_by_their_x_gts_ref() {
 }
 
 #[test]
+fn one_of_branches_are_told_apart_by_the_reference_kind() {
+    let contract = contract_over(&json!({ "oneOf": [
+        { "type": "string", X_GTS_TYPE_REF: TYPED_MODEL_BASE },
+        { "type": "string", X_GTS_INSTANCE_REF: TYPED_MODEL_BASE },
+    ] }));
+    check(&contract, &json!(TYPED_MODEL_BASE)).expect("exactly the type branch");
+    check(&contract, &json!(MODEL_GPT)).expect("exactly the instance branch");
+}
+
+#[test]
+fn each_keyword_admits_only_its_kind() {
+    let types = contract_over(&json!({ "type": "string", X_GTS_TYPE_REF: "gts.cf.*" }));
+    check(&types, &json!(TYPED_MODEL_BASE)).expect("a type id");
+    let wrong = check(&types, &json!(MODEL_GPT)).expect_err("an instance id");
+    assert!(
+        wrong.iter().any(|m| m.contains(X_GTS_TYPE_REF)),
+        "{wrong:?}"
+    );
+
+    let instances = contract_over(&json!({ "type": "string", X_GTS_INSTANCE_REF: "gts.cf.*" }));
+    check(&instances, &json!(MODEL_GPT)).expect("an instance id");
+    let wrong = check(&instances, &json!(TYPED_MODEL_BASE)).expect_err("a type id");
+    assert!(
+        wrong.iter().any(|m| m.contains(X_GTS_INSTANCE_REF)),
+        "{wrong:?}"
+    );
+}
+
+#[test]
+fn an_instance_ref_may_name_one_concrete_instance() {
+    let contract = contract_over(&json!({ "type": "string", X_GTS_INSTANCE_REF: MODEL_GPT }));
+    check(&contract, &json!(MODEL_GPT)).expect("the named instance");
+    check(&contract, &json!(MODEL_CLAUDE)).expect_err("a sibling instance");
+}
+
+#[test]
 fn any_of_falls_back_to_a_branch_without_gts_constraints() {
     let contract = contract_over(&json!({ "anyOf": [
-        { "type": "string", "x-gts-ref": TYPED_MODEL_BASE },
+        { "type": "string", X_GTS_INSTANCE_REF: TYPED_MODEL_BASE },
         { "type": "string", "maxLength": 5 },
     ] }));
     check(&contract, &json!(MODEL_GPT)).expect("the GTS branch");
@@ -162,14 +220,16 @@ fn any_of_falls_back_to_a_branch_without_gts_constraints() {
 }
 
 #[test]
-fn all_of_combines_x_gts_ref_with_ordinary_keywords() {
+fn all_of_combines_an_entity_ref_with_ordinary_keywords() {
     let contract = contract_over(&json!({ "allOf": [
-        { "type": "string", "x-gts-ref": TYPED_MODEL_BASE },
+        { "type": "string", X_GTS_INSTANCE_REF: TYPED_MODEL_BASE },
         { "pattern": "gpt" },
     ] }));
     check(&contract, &json!(MODEL_GPT)).expect("both hold");
     check(&contract, &json!(MODEL_CLAUDE)).expect_err("the pattern fails");
-    let wrong_base = check(&contract, &json!(METRIC_TOKENS)).expect_err("x-gts-ref fails");
+    // GTS reference violations are reported once every other constraint holds.
+    let gpt_metric = format!("{METRIC_BASE_TYPE}cf.qetest.models.gpt.v1");
+    let wrong_base = check(&contract, &json!(gpt_metric)).expect_err("the reference fails");
     assert!(
         wrong_base.iter().any(|m| m.contains(TYPED_MODEL_BASE)),
         "{wrong_base:?}"
@@ -177,47 +237,84 @@ fn all_of_combines_x_gts_ref_with_ordinary_keywords() {
 }
 
 #[test]
-fn the_x_gts_ref_pointer_form_resolves_against_the_root_schema() {
-    let contract = CompiledContract::compile(
-        GtsTypeId::new(TYPED_REQUEST),
+fn the_self_id_operand_resolves_to_the_validated_type() {
+    let contract = compile(
+        TYPED_MODEL_BASE,
         json!({
             "$schema": DRAFT7,
             "$id": format!("gts://{TYPED_MODEL_BASE}"),
             "type": "object",
-            "properties": { "value": { "type": "string", "x-gts-ref": "/$id" } },
+            "properties": {
+                "value": { "type": "string", X_GTS_INSTANCE_REF: SELF_ID_REF },
+                "kind": { "type": "string", X_GTS_TYPE_REF: SELF_ID_REF },
+            },
         }),
     )
     .expect("compiles");
-    check(&contract, &json!(MODEL_GPT)).expect("under the schema's own id");
+    check(&contract, &json!(MODEL_GPT)).expect("under the validated type");
     check(&contract, &json!(METRIC_TOKENS)).expect_err("another base");
+    contract
+        .validate(&json!({ "kind": TYPED_MODEL_BASE }))
+        .expect("the validated type itself");
+    contract
+        .validate(&json!({ "kind": MODEL_GPT }))
+        .expect_err("an instance is not a type");
 }
 
 #[test]
-fn x_gts_ref_constrains_strings_and_leaves_other_values_to_type() {
-    let untyped = contract_over(&json!({ "x-gts-ref": TYPED_MODEL_BASE }));
+fn a_pattern_ref_admits_only_the_patterns_its_operand_covers() {
+    let contract = contract_over(
+        &json!({ "type": "string", X_GTS_PATTERN_REF: format!("{TYPED_MODEL_BASE}*") }),
+    );
+    check(&contract, &json!(MODEL_GPT)).expect("a concrete id under the operand");
+    check(&contract, &json!(format!("{TYPED_MODEL_BASE}cf.qetest.*"))).expect("a narrower pattern");
+    check(&contract, &json!("gts.cf.*")).expect_err("a wider pattern");
+    check(&contract, &json!("plain")).expect_err("not a GTS pattern");
+}
+
+#[test]
+fn an_entity_ref_constrains_strings_and_leaves_other_values_to_type() {
+    let untyped = contract_over(&json!({ X_GTS_INSTANCE_REF: TYPED_MODEL_BASE }));
     check(&untyped, &json!(3)).expect("no string to match, no type keyword to fail");
     check(&untyped, &json!(METRIC_BASE_TYPE)).expect_err("a string must match");
-    let typed = contract_over(&json!({ "type": "string", "x-gts-ref": TYPED_MODEL_BASE }));
+    let typed = contract_over(&json!({ "type": "string", X_GTS_INSTANCE_REF: TYPED_MODEL_BASE }));
     check(&typed, &json!(3)).expect_err("type rejects the integer");
 }
 
 #[test]
-fn a_malformed_x_gts_ref_fails_compilation() {
-    for bad in [
+fn a_malformed_entity_ref_fails_compilation() {
+    let bad_operands = [
         json!(5),
         json!("not.a.pattern"),
         json!("/nowhere"),
         json!("gts.cf.*.qe.*"),
-    ] {
-        let err = CompiledContract::compile(
-            GtsTypeId::new(TYPED_REQUEST),
-            json!({
-                "$schema": DRAFT7,
-                "type": "object",
-                "properties": { "value": { "x-gts-ref": bad } },
-            }),
-        )
-        .expect_err("the constraint is rejected at compile time");
-        assert!(err.contains("x-gts-ref"), "{err}");
+    ];
+    for keyword in [X_GTS_TYPE_REF, X_GTS_INSTANCE_REF] {
+        for bad in &bad_operands {
+            let err = compile(
+                TYPED_REQUEST,
+                json!({
+                    "$schema": DRAFT7,
+                    "type": "object",
+                    "properties": { "value": { keyword: bad } },
+                }),
+            )
+            .expect_err("the constraint is rejected at compile time");
+            assert!(err.contains(keyword), "{keyword} {bad}: {err}");
+        }
     }
+}
+
+#[test]
+fn a_type_ref_naming_an_instance_fails_compilation() {
+    let err = compile(
+        TYPED_REQUEST,
+        json!({
+            "$schema": DRAFT7,
+            "type": "object",
+            "properties": { "value": { X_GTS_TYPE_REF: MODEL_GPT } },
+        }),
+    )
+    .expect_err("an instance id selects no types");
+    assert!(err.contains(X_GTS_TYPE_REF), "{err}");
 }

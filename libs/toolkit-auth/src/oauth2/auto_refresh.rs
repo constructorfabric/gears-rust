@@ -2,7 +2,7 @@
 //!
 //! Wraps an outbound HTTP service with bearer-header injection plus a single
 //! retry triggered by a configurable response predicate (default: HTTP 401).
-//! On a triggering response the layer invalidates the cached [`Token`],
+//! On a triggering response the layer invalidates the provider's cached token,
 //! re-reads it, and re-issues the original request once with the refreshed
 //! credential.
 //!
@@ -20,10 +20,11 @@
 //! than [`super::layer::BearerAuthLayer`]. Pick the plain layer when the
 //! upstream is known not to revoke tokens out-of-band.
 
+use parking_lot::Mutex;
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
@@ -32,28 +33,33 @@ use http::{HeaderValue, Request, Response, StatusCode};
 use tower::{Layer, Service, ServiceExt};
 
 use super::error::TokenError;
-use super::token::Token;
+use super::token::TokenProvider;
 use toolkit_http::HttpError;
 use toolkit_utils::SecretString;
 
-/// Closure pulling the currently cached bearer credential.
+/// Closure awaiting a cached credential or shared acquisition.
 ///
-/// Implemented by wrapping [`Token::get`] in production; tests substitute a
+/// Implemented by wrapping [`TokenProvider::get`] in production; tests substitute a
 /// closure backed by an in-memory state machine to drive the layer's
 /// expiration / invalidation branches without waiting on
-/// [`Token`]'s background watcher.
-type GetTokenFn = Arc<dyn Fn() -> Result<SecretString, TokenError> + Send + Sync>;
+/// [`TokenProvider`]'s background watcher.
+type GetTokenFn = Arc<
+    dyn Fn() -> Pin<Box<dyn Future<Output = Result<SecretString, TokenError>> + Send>>
+        + Send
+        + Sync,
+>;
 
 /// Closure forcing the cached credential to be discarded and re-fetched.
 ///
-/// Implemented by wrapping [`Token::invalidate`] in production. The boxed
-/// future allows the layer to stay generic over the concrete `Token` type
+/// Implemented by wrapping [`TokenProvider::invalidate`] in production. The boxed
+/// future allows the layer to stay generic over the concrete `TokenProvider` type
 /// without exposing it as a type parameter, which keeps the public API
 /// (`BearerAuthAutoRefreshLayer`, `BearerAuthAutoRefreshService<S>`)
 /// monomorphic and stable.
-type InvalidateTokenFn = Arc<dyn Fn() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
+type InvalidateTokenFn =
+    Arc<dyn Fn() -> Pin<Box<dyn Future<Output = Result<(), TokenError>> + Send>> + Send + Sync>;
 
-/// Default minimum interval between [`Token::invalidate`] calls.
+/// Default minimum interval between [`TokenProvider::invalidate`] calls.
 ///
 /// Mirrors go-appkit's `DefaultAuthProviderMinInvalidationInterval`. Throttles
 /// bursts of 401 responses so the token endpoint is not hammered when many
@@ -72,13 +78,13 @@ pub type ShouldRefreshFn = Arc<dyn Fn(StatusCode) -> bool + Send + Sync>;
 /// callers can spread-update via [`BearerAuthAutoRefreshOpts::default`].
 #[derive(Clone)]
 pub struct BearerAuthAutoRefreshOpts {
-    /// Minimum interval between `Token::invalidate` calls.
+    /// Minimum interval between `TokenProvider::invalidate` calls.
     ///
     /// The slot is consumed at the moment a triggering response arrives,
     /// before the invalidate completes - so a transient token-endpoint
     /// failure also burns the slot. Subsequent triggering responses inside
     /// the window will surface the original failure status without retrying
-    /// `Token::invalidate`. Lower this value (e.g. 30-60 seconds) when
+    /// `TokenProvider::invalidate`. Lower this value (e.g. 30-60 seconds) when
     /// faster recovery from token-endpoint blips matters more than burst
     /// protection.
     ///
@@ -123,7 +129,7 @@ impl Default for BearerAuthAutoRefreshOpts {
 ///
 /// Behaves like [`super::layer::BearerAuthLayer`] on the happy path. On a
 /// response matching [`BearerAuthAutoRefreshOpts::should_refresh`] it
-/// invalidates the cached [`Token`] (throttled by
+/// invalidates the provider's cached token (throttled by
 /// [`BearerAuthAutoRefreshOpts::min_invalidation_interval`]), re-reads the
 /// token, and re-sends the request once.
 ///
@@ -131,19 +137,19 @@ impl Default for BearerAuthAutoRefreshOpts {
 ///
 /// * If the request already carries the configured auth header, the layer is
 ///   a passthrough - no token is read and no retry is performed.
-/// * If `Token::get` fails before the first send, the call returns
+/// * If `TokenProvider::get` fails before the first send, the call returns
 ///   [`HttpError::Transport`] immediately.
-/// * If `Token::get` fails after invalidation, or the new token equals the
+/// * If `TokenProvider::get` fails after invalidation, or the new token equals the
 ///   previous one, the original triggering response is surfaced unchanged.
 /// * Concurrent triggering responses share the throttle; only the first one
-///   in the window calls `Token::invalidate`. Other concurrent calls re-read
+///   in the window calls `TokenProvider::invalidate`. Other concurrent calls re-read
 ///   the token and either retry with the refreshed credential (if it has
 ///   become available) or surface their original response.
 /// * The throttle scope is per-layer-instance: two separate
-///   `BearerAuthAutoRefreshLayer::new(...)` calls against the same `Token`
+///   `BearerAuthAutoRefreshLayer::new(...)` calls against the same `TokenProvider`
 ///   keep independent throttle state. Build one layer per upstream and
 ///   share it across clients to keep the throttle effective.
-/// * If `Token::invalidate` itself fails or returns the same value, the
+/// * If replacement fails or produces the same credential, the
 ///   slot is still consumed (see
 ///   [`BearerAuthAutoRefreshOpts::min_invalidation_interval`]).
 #[derive(Clone)]
@@ -166,15 +172,18 @@ impl BearerAuthAutoRefreshLayer {
     /// Create a layer with default options (`Authorization` header,
     /// 401-triggers-refresh, 15-minute throttle).
     #[must_use]
-    pub fn new(token: Token) -> Self {
+    pub fn new(token: TokenProvider) -> Self {
         Self::with_opts(token, BearerAuthAutoRefreshOpts::default())
     }
 
     /// Create a layer with explicit options.
     #[must_use]
-    pub fn with_opts(token: Token, opts: BearerAuthAutoRefreshOpts) -> Self {
+    pub fn with_opts(token: TokenProvider, opts: BearerAuthAutoRefreshOpts) -> Self {
         let token_for_get = token.clone();
-        let get_token: GetTokenFn = Arc::new(move || token_for_get.get());
+        let get_token: GetTokenFn = Arc::new(move || {
+            let token = token_for_get.clone();
+            Box::pin(async move { token.get().await })
+        });
         let invalidate_token: InvalidateTokenFn = Arc::new(move || {
             let t = token.clone();
             Box::pin(async move { t.invalidate().await })
@@ -246,18 +255,16 @@ fn build_bearer_value(token: &str) -> Result<HeaderValue, http::header::InvalidH
 }
 
 /// Try to acquire the throttle slot. Returns `true` if the caller should
-/// proceed with `Token::invalidate`, `false` if a recent invalidation is
+/// proceed with `TokenProvider::invalidate`, `false` if a recent invalidation is
 /// still inside the configured window.
 ///
-/// Holds an `std::sync::Mutex` guard for one read+write - never across an
+/// Holds a `parking_lot::Mutex` guard for one read+write - never across an
 /// `.await`.
 fn try_acquire_invalidation_slot(
     last_invalidation: &Mutex<Option<Instant>>,
     min_interval: Duration,
 ) -> bool {
-    let mut guard = last_invalidation
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner);
+    let mut guard = last_invalidation.lock();
     let invalidate = match *guard {
         Some(last) => last.elapsed() >= min_interval,
         None => true,
@@ -295,25 +302,6 @@ where
             return Box::pin(async move { inner.call(req).await });
         }
 
-        // No credential available means we cannot legitimately send the
-        // request at all - surface as Transport, matching `BearerAuthLayer`.
-        let initial_secret = match (self.get_token)() {
-            Ok(s) => s,
-            Err(e) => return Box::pin(async move { Err(HttpError::Transport(Box::new(e))) }),
-        };
-
-        let bearer_value = match build_bearer_value(initial_secret.expose()) {
-            Ok(v) => v,
-            Err(e) => return Box::pin(async move { Err(HttpError::InvalidHeaderValue(e)) }),
-        };
-
-        // Snapshot the request before stamping the auth header so the retry
-        // does not carry the stale credential. Cheap when `B` is a
-        // refcounted body like `Full<Bytes>`.
-        let retry_req = req.clone();
-        req.headers_mut()
-            .insert(self.opts.header_name.clone(), bearer_value);
-
         // Clone-swap: `inner` is the clone already polled ready by the
         // outer caller and is consumed for the first send; `retry_inner`
         // is a separate clone whose readiness is re-established via
@@ -326,12 +314,16 @@ where
         let invalidate_token = Arc::clone(&self.invalidate_token);
         let opts = self.opts.clone();
         let last_invalidation = Arc::clone(&self.last_invalidation);
-        // Move the initial SecretString into the future so its buffer is
-        // zeroized on drop. A bare `String` would survive the request
-        // future unzeroed and is reachable from a heap dump on panic.
-        let initial_secret_for_compare = initial_secret;
-
         Box::pin(async move {
+            let initial_secret = get_token()
+                .await
+                .map_err(|e| HttpError::Transport(Box::new(e)))?;
+            let bearer_value = build_bearer_value(initial_secret.expose())
+                .map_err(HttpError::InvalidHeaderValue)?;
+            let retry_req = req.clone();
+            req.headers_mut()
+                .insert(opts.header_name.clone(), bearer_value);
+            let initial_secret_for_compare = initial_secret;
             let response = inner.call(req).await?;
 
             if !(opts.should_refresh)(response.status()) {
@@ -339,7 +331,7 @@ where
             }
 
             // Throttle so a burst of triggering responses produces at most
-            // one `Token::invalidate` call per window. Later concurrent
+            // one `TokenProvider::invalidate` call per window. Later concurrent
             // callers skip the invalidate but still re-read the token in
             // case the first invalidator already swapped a fresh one in.
             let did_invalidate =
@@ -350,14 +342,15 @@ where
                     header = %opts.header_name,
                     "OAuth2 auto-refresh: invalidating token after auth-failure response"
                 );
-                invalidate_token().await;
+                if let Err(error) = invalidate_token().await {
+                    tracing::warn!(%error, "OAuth2 auto-refresh: replacement failed");
+                    return Ok(response);
+                }
             }
 
-            // If the cache is empty (e.g. token endpoint is down, or the
-            // freshly spawned watcher has not received its first token
-            // yet) surface the original response - the caller cannot do
-            // better with a stale credential.
-            let new_secret = match get_token() {
+            // Join pending replacement if another caller invalidated the token.
+            // If acquisition fails, preserve the original upstream response.
+            let new_secret = match get_token().await {
                 Ok(s) => s,
                 Err(e) => {
                     tracing::warn!(
@@ -371,8 +364,7 @@ where
             };
 
             // Avoid a 401 loop when the token endpoint keeps minting the
-            // same value (or when invalidate failed and the cache was
-            // left untouched).
+            // same value (or the throttle prevented another invalidation).
             if new_secret.expose() == initial_secret_for_compare.expose() {
                 if did_invalidate {
                     tracing::warn!(
@@ -487,7 +479,7 @@ mod tests {
                 .headers()
                 .get(&self.header_name)
                 .map(|v| v.to_str().unwrap().to_owned());
-            let mut script = self.script.lock().unwrap();
+            let mut script = self.script.lock();
             assert!(
                 !script.is_empty(),
                 "ScriptedService called more times than scripted"
@@ -514,6 +506,7 @@ mod tests {
 
     // -- happy path -----------------------------------------------------------
 
+    /// A successful upstream response needs no invalidation or replay.
     #[tokio::test]
     async fn happy_path_no_401() {
         let server = MockServer::start();
@@ -524,7 +517,7 @@ mod tests {
                 .body(token_json("tok-A", 3600));
         });
 
-        let token = Token::new(test_config(&server)).await.unwrap();
+        let token = TokenProvider::new(test_config(&server)).unwrap();
         let inner =
             ScriptedService::new(AUTHORIZATION, vec![(Some("Bearer tok-A"), StatusCode::OK)]);
         let calls = Arc::clone(&inner.calls);
@@ -540,6 +533,7 @@ mod tests {
 
     // -- main refresh-on-401 path --------------------------------------------
 
+    /// An unauthorized response triggers replacement and one authenticated replay.
     #[tokio::test]
     async fn refresh_on_401_then_success() {
         let server = MockServer::start();
@@ -552,7 +546,8 @@ mod tests {
                 .body(token_json("tok-A", 3600));
         });
 
-        let token = Token::new(test_config(&server)).await.unwrap();
+        let token = TokenProvider::new(test_config(&server)).unwrap();
+        token.get().await.unwrap();
         assert_eq!(initial_mock.calls(), 1, "initial fetch");
 
         // Swap in tok-B for the post-401 invalidate fetch.
@@ -584,6 +579,7 @@ mod tests {
 
     // -- pre-set Authorization header -> passthrough --------------------------
 
+    /// Caller-provided authorization bypasses provider acquisition and refresh.
     #[tokio::test]
     async fn existing_authorization_header_passes_through() {
         let server = MockServer::start();
@@ -594,8 +590,8 @@ mod tests {
                 .body(token_json("tok-unused", 3600));
         });
 
-        let token = Token::new(test_config(&server)).await.unwrap();
-        assert_eq!(token_mock.calls(), 1, "only the initial fetch");
+        let token = TokenProvider::new(test_config(&server)).unwrap();
+        assert_eq!(token_mock.calls(), 0, "construction is idle");
 
         let inner = ScriptedService::new(
             AUTHORIZATION,
@@ -614,11 +610,16 @@ mod tests {
         // Layer must NOT retry: passthrough surfaces the inner 401 verbatim.
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
         assert_eq!(calls.load(Ordering::SeqCst), 1, "passthrough - no retry");
-        assert_eq!(token_mock.calls(), 1, "no invalidate when passthrough");
+        assert_eq!(
+            token_mock.calls(),
+            0,
+            "passthrough never starts acquisition"
+        );
     }
 
     // -- token did not change after invalidate -> no retry --------------------
 
+    /// An identical replacement credential does not trigger another upstream request.
     #[tokio::test]
     async fn unchanged_token_after_invalidate_does_not_loop() {
         let server = MockServer::start();
@@ -630,7 +631,8 @@ mod tests {
                 .body(token_json("tok-same", 3600));
         });
 
-        let token = Token::new(test_config(&server)).await.unwrap();
+        let token = TokenProvider::new(test_config(&server)).unwrap();
+        token.get().await.unwrap();
         let inner = ScriptedService::new(
             AUTHORIZATION,
             vec![(Some("Bearer tok-same"), StatusCode::UNAUTHORIZED)],
@@ -687,6 +689,7 @@ mod tests {
         }
     }
 
+    /// Concurrent failures respect the shared invalidation throttle.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn throttle_blocks_burst_invalidations() {
         const BURST: usize = 5;
@@ -699,7 +702,8 @@ mod tests {
                 .body(token_json("tok-burst", 3600));
         });
 
-        let token = Token::new(test_config(&server)).await.unwrap();
+        let token = TokenProvider::new(test_config(&server)).unwrap();
+        token.get().await.unwrap();
 
         // All 5 inner calls block at the barrier until the last one arrives,
         // forcing the burst to be observed concurrently by the layer.
@@ -742,6 +746,7 @@ mod tests {
 
     // -- custom predicate variants -------------------------------------------
 
+    /// A custom refresh predicate can handle forbidden responses.
     #[tokio::test]
     async fn custom_predicate_retries_on_403() {
         let server = MockServer::start();
@@ -751,7 +756,8 @@ mod tests {
                 .header("content-type", "application/json")
                 .body(token_json("tok-A", 3600));
         });
-        let token = Token::new(test_config(&server)).await.unwrap();
+        let token = TokenProvider::new(test_config(&server)).unwrap();
+        token.get().await.unwrap();
 
         initial_mock.delete();
         let _refreshed_mock = server.mock(|when, then| {
@@ -780,6 +786,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
+    /// Responses outside the refresh predicate are returned unchanged.
     #[tokio::test]
     async fn custom_predicate_does_not_retry_on_500() {
         let server = MockServer::start();
@@ -789,7 +796,8 @@ mod tests {
                 .header("content-type", "application/json")
                 .body(token_json("tok-A", 3600));
         });
-        let token = Token::new(test_config(&server)).await.unwrap();
+        let token = TokenProvider::new(test_config(&server)).unwrap();
+        token.get().await.unwrap();
 
         let inner = ScriptedService::new(
             AUTHORIZATION,
@@ -808,6 +816,7 @@ mod tests {
 
     // -- custom header name --------------------------------------------------
 
+    /// Both initial and retried requests use the configured authorization header.
     #[tokio::test]
     async fn custom_header_name_is_used() {
         let server = MockServer::start();
@@ -817,7 +826,8 @@ mod tests {
                 .header("content-type", "application/json")
                 .body(token_json("tok-A", 3600));
         });
-        let token = Token::new(test_config(&server)).await.unwrap();
+        let token = TokenProvider::new(test_config(&server)).unwrap();
+        token.get().await.unwrap();
 
         initial_mock.delete();
         let _refreshed_mock = server.mock(|when, then| {
@@ -849,7 +859,7 @@ mod tests {
 
     // -- token unavailable on initial get ------------------------------------
 
-    /// Deterministic fake `Token` used by tests that need to drive
+    /// Deterministic fake `TokenProvider` used by tests that need to drive
     /// `get`/`invalidate` outcomes without waiting on a real `TokenWatcher`
     /// and its TTL clock.
     ///
@@ -878,7 +888,7 @@ mod tests {
         }
 
         fn invalidate_calls(&self) -> usize {
-            self.state.lock().unwrap().invalidate_calls
+            self.state.lock().invalidate_calls
         }
 
         fn build_layer(&self) -> BearerAuthAutoRefreshLayer {
@@ -892,26 +902,29 @@ mod tests {
             let s_get = Arc::clone(&self.state);
             let s_inv = Arc::clone(&self.state);
             let get_token: GetTokenFn = Arc::new(move || {
-                let s = s_get.lock().unwrap();
-                match &s.current {
+                let s = s_get.lock();
+                let result = match &s.current {
                     Some(t) => Ok(SecretString::new(t)),
                     None => Err(TokenError::Unavailable("fake token unavailable".into())),
-                }
+                };
+                Box::pin(std::future::ready(result))
             });
             let invalidate_token: InvalidateTokenFn = Arc::new(move || {
                 let state = Arc::clone(&s_inv);
                 Box::pin(async move {
-                    let mut s = state.lock().unwrap();
+                    let mut s = state.lock();
                     s.invalidate_calls += 1;
                     if let Some(next) = s.next_swaps.pop_front() {
                         s.current = next;
                     }
+                    Ok(())
                 })
             });
             BearerAuthAutoRefreshLayer::from_fns(get_token, invalidate_token, opts)
         }
     }
 
+    /// Acquisition failure prevents sending an unauthenticated request.
     #[tokio::test]
     async fn token_unavailable_on_first_get() {
         // Cache empty from the start - the layer must surface Transport
@@ -934,19 +947,12 @@ mod tests {
 
     // -- failed invalidate, token unchanged ----------------------------------
 
-    /// When `Token::invalidate` cannot mint a replacement, the existing
-    /// watcher is left in place and the layer's post-401 `Token::get`
-    /// returns the *same* secret as the initial read - exercising the
-    /// "unchanged token after invalidate" branch.
-    ///
-    /// (For the orthogonal case where the post-invalidate `Token::get`
-    /// returns `Err(Unavailable)` because the cached token has expired,
-    /// see `token_expired_after_invalidate_surfaces_original_response`.)
+    /// Failed replacement surfaces the original response without using the discarded token.
     #[tokio::test]
     async fn failed_invalidate_surfaces_original_response() {
         let server = MockServer::start();
 
-        // Initial token has a long TTL so the layer's first `Token::get`
+        // Initial token has a long TTL so the layer's first `TokenProvider::get`
         // succeeds; the failure we want to model is that the *invalidate*
         // call cannot fetch a replacement.
         let mut success_mock = server.mock(|when, then| {
@@ -955,12 +961,13 @@ mod tests {
                 .header("content-type", "application/json")
                 .body(token_json("tok-A", 3600));
         });
-        let token = Token::new(test_config(&server)).await.unwrap();
+        let token = TokenProvider::new(test_config(&server)).unwrap();
+        token.get().await.unwrap();
 
         // Swap the endpoint to fail so the layer's post-401 invalidate
-        // cannot mint a new credential. Per `Token::invalidate` semantics,
-        // the existing watcher stays in place on failure; the layer's
-        // re-read will see the same `tok-A` and surface the original 401.
+        // cannot mint a new credential. Per `TokenProvider::invalidate` semantics,
+        // the cached credential is discarded and the layer surfaces the
+        // original 401 without retrying with the rejected credential.
         success_mock.delete();
         let fail_mock = server.mock(|when, then| {
             when.method(POST).path("/token");
@@ -1020,9 +1027,10 @@ mod tests {
 
     // -- single-retry contract: retry response is also 401 -------------------
 
+    /// A rejected replay is returned without another refresh cycle.
     #[tokio::test]
     async fn retry_response_also_401_surfaces_without_second_invalidate() {
-        // Token rotates A -> B on invalidate, but the upstream rejects
+        // TokenProvider rotates A -> B on invalidate, but the upstream rejects
         // tok-B too. The layer must surface the second 401 verbatim and
         // must NOT fire a second invalidate from inside the same call.
         let token = FakeToken::new(Some("tok-A"), vec![Some("tok-B")]);
@@ -1054,6 +1062,7 @@ mod tests {
 
     // -- debug safety --------------------------------------------------------
 
+    /// Debug output omits credentials and bearer values.
     #[tokio::test]
     async fn debug_does_not_reveal_tokens() {
         let server = MockServer::start();
@@ -1063,7 +1072,8 @@ mod tests {
                 .header("content-type", "application/json")
                 .body(token_json("super-secret-auto", 3600));
         });
-        let token = Token::new(test_config(&server)).await.unwrap();
+        let token = TokenProvider::new(test_config(&server)).unwrap();
+        token.get().await.unwrap();
         let layer = BearerAuthAutoRefreshLayer::new(token);
         let dbg = format!("{layer:?}");
         assert!(

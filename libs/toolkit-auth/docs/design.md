@@ -15,13 +15,15 @@ Gears use a long-lived token capability:
 
 ```rust
 #[derive(Clone)]
-pub struct Token {
-    inner: std::sync::Arc<TokenInner>,
+pub struct TokenProvider {
+    inner: std::sync::Arc<TokenWatcher>,
 }
 
-impl Token {
-    pub fn get(&self) -> Result<SecretString, TokenError>;
-    pub async fn invalidate(&self);
+impl TokenProvider {
+    pub fn new(config: OAuthClientConfig) -> Result<Self, TokenError>;
+    pub async fn get(&self) -> Result<SecretString, TokenError>;
+    pub async fn invalidate(&self) -> Result<(), TokenError>;
+    pub async fn shutdown(&self);
 }
 ```
 
@@ -97,17 +99,20 @@ In-house implementation (`src/oauth2/token_watcher.rs`) with:
 - `tokio::spawn` background refresh loop
 - Random early jitter (via `rand`, non-crypto)
 - Exponential backoff on consecutive errors
-- Graceful shutdown via `oneshot` channel (dropped with watcher)
+- Explicit shutdown via `CancellationToken` and a joined task; final drop cancels as a fallback
 - Three-state token lifecycle: `Fresh` → `Stale` → `Expired`
 
 ### Invalidate semantics
 
-Implementation:
+- clear the cached credential under the publication mutex
+- share the current or next acquisition attempt across invalidations and gets
+- never restore an invalidated token after a failed replacement
+- preserve backoff when the cache is already empty
+- reuse successful OIDC discovery and the same worker
 
-- store the active watcher behind `ArcSwap`
-- `Token::invalidate()` creates a new watcher (same config) and swaps it in
-- old watcher is dropped when no longer referenced (shutdown signal cancels loop)
-- next `get()` reads from the freshly-spawned watcher
+Construction is synchronous and performs no network I/O. Async `get()` starts
+acquisition lazily and respects backoff. See the [lifecycle guide](../README.md#acquisition-and-lifecycle)
+and [migration notes](../../../CHANGELOG.md#toolkit-auth-080-migration).
 
 ### Outbound auth layer (tower)
 
@@ -116,7 +121,7 @@ Implement a tower layer that injects the `Authorization` header.
 **Behavior:**
 
 - on each request:
-    - call `Token::get()`
+    - await `TokenProvider::get()`
     - set `Authorization: Bearer <token>`
     - forward request
 - configurable header name if a vendor requires a non-standard header

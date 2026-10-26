@@ -130,7 +130,7 @@ Serialization to/from GTS JSON flattens the `base` fields into the top-level obj
       "type": "array",
       "items": {
         "type": "string",
-        "x-gts-ref": "gts.*"
+        "x-gts-type-ref": "gts.*"
       },
       "description": "GTS error type IDs.",
       "default": []
@@ -283,7 +283,7 @@ Serialization to/from GTS JSON flattens the `base` fields into the top-level obj
       "type": "array",
       "items": {
         "type": "string",
-        "x-gts-ref": "gts.*"
+        "x-gts-type-ref": "gts.*"
       }
     }
   },
@@ -365,7 +365,7 @@ Serialization to/from GTS JSON flattens the `base` fields into the top-level obj
   "properties": {
     "adapter": {
       "type": "string",
-      "x-gts-ref": "gts.cf.core.sless.runtime.*",
+      "x-gts-type-ref": "gts.cf.core.sless.runtime.*",
       "description": "GTS type ID of the runtime (e.g., gts.cf.core.sless.runtime.starlark.v1~)."
     }
   },
@@ -478,7 +478,7 @@ Serialization to/from GTS JSON flattens the `base` fields into the top-level obj
           "oneOf": [
             {
               "type": "string",
-              "x-gts-ref": "gts.cf.core.sless.function.v1~*",
+              "x-gts-type-ref": "gts.cf.core.sless.function.v1~*",
               "description": "GTS ID of function to invoke on workflow failure. Receives CompensationContext as input."
             },
             {
@@ -492,7 +492,7 @@ Serialization to/from GTS JSON flattens the `base` fields into the top-level obj
           "oneOf": [
             {
               "type": "string",
-              "x-gts-ref": "gts.cf.core.sless.function.v1~*",
+              "x-gts-type-ref": "gts.cf.core.sless.function.v1~*",
               "description": "GTS ID of function to invoke on workflow cancellation. Receives CompensationContext as input."
             },
             {
@@ -625,7 +625,7 @@ Serialization to/from GTS JSON flattens the `base` fields into the top-level obj
       "properties": {
         "function_id": {
           "type": "string",
-          "x-gts-ref": "gts.cf.core.sless.workflow.v1~*",
+          "x-gts-type-ref": "gts.cf.core.sless.workflow.v1~*",
           "description": "GTS ID of the workflow that failed."
         },
         "original_input": {
@@ -906,7 +906,7 @@ The lifecycle status field references concrete GTS instances rather than a raw s
     },
     "replaced_by": {
       "type": ["string", "null"],
-      "x-gts-ref": "gts.cf.core.sless.func_lifecycle_status.v1~*",
+      "x-gts-instance-ref": "gts.cf.core.sless.func_lifecycle_status.v1~*",
       "description": "Optional GTS instance ID of the status that supersedes this one (used for deprecated/archived statuses).",
       "default": null
     }
@@ -919,12 +919,12 @@ The lifecycle status field references concrete GTS instances rather than a raw s
 
 | Instance ID | Description | replaced_by |
 |---|---|---|
-| `gts.cf.core.sless.func_lifecycle_status.v1~cf.core.sless.func_lifecycle_status.draft.v1~` | Function is being authored and has not been published. Not externally invocable. | — |
-| `gts.cf.core.sless.func_lifecycle_status.v1~cf.core.sless.func_lifecycle_status.active.v1~` | Function is published and accepting invocations. | — |
-| `gts.cf.core.sless.func_lifecycle_status.v1~cf.core.sless.func_lifecycle_status.deprecated.v1~` | Function is still invocable but discouraged. Callers should migrate to a replacement. | active |
-| `gts.cf.core.sless.func_lifecycle_status.v1~cf.core.sless.func_lifecycle_status.disabled.v1~` | Function is temporarily suspended. No new invocations are accepted; existing in-flight invocations complete normally. | — |
-| `gts.cf.core.sless.func_lifecycle_status.v1~cf.core.sless.func_lifecycle_status.archived.v1~` | Function is read-only. No invocations accepted. Definition is retained for audit and lineage purposes. | — |
-| `gts.cf.core.sless.func_lifecycle_status.v1~cf.core.sless.func_lifecycle_status.deleted.v1~` | Function has been logically deleted. Retained only for audit trail; no operations permitted. | archived |
+| `gts.cf.core.sless.func_lifecycle_status.v1~cf.core.sless.draft.v1` | Function is being authored and has not been published. Not externally invocable. | — |
+| `gts.cf.core.sless.func_lifecycle_status.v1~cf.core.sless.active.v1` | Function is published and accepting invocations. | — |
+| `gts.cf.core.sless.func_lifecycle_status.v1~cf.core.sless.deprecated.v1` | Function is still invocable but discouraged. Callers should migrate to a replacement. | `gts.cf.core.sless.func_lifecycle_status.v1~cf.core.sless.active.v1` |
+| `gts.cf.core.sless.func_lifecycle_status.v1~cf.core.sless.disabled.v1` | Function is temporarily suspended. No new invocations are accepted; existing in-flight invocations complete normally. | — |
+| `gts.cf.core.sless.func_lifecycle_status.v1~cf.core.sless.archived.v1` | Function is read-only. No invocations accepted. Definition is retained for audit and lineage purposes. | — |
+| `gts.cf.core.sless.func_lifecycle_status.v1~cf.core.sless.deleted.v1` | Function has been logically deleted. Retained only for audit trail; no operations permitted. | `gts.cf.core.sless.func_lifecycle_status.v1~cf.core.sless.archived.v1` |
 
 ### Function (Base Type)
 
@@ -935,7 +935,7 @@ The lifecycle status field references concrete GTS instances rather than a raw s
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "gts://gts.cf.core.sless.function.v1~",
   "title": "Serverless Function",
-  "description": "Base schema for serverless functions. Identity is the GTS instance address.",
+  "description": "Base schema for serverless functions. Identity is the registered GTS type ID (ending in `~`).",
   "type": "object",
   "properties": {
     "version": {
@@ -950,9 +950,9 @@ The lifecycle status field references concrete GTS instances rather than a raw s
     },
     "status": {
       "type": "string",
-      "x-gts-ref": "gts.cf.core.sless.func_lifecycle_status.v1~*",
+      "x-gts-instance-ref": "gts.cf.core.sless.func_lifecycle_status.v1~*",
       "description": "Lifecycle status. References a concrete GTS instance of gts.cf.core.sless.func_lifecycle_status.v1~.",
-      "default": "gts.cf.core.sless.func_lifecycle_status.v1~cf.core.sless.func_lifecycle_status.draft.v1~"
+      "default": "gts.cf.core.sless.func_lifecycle_status.v1~cf.core.sless.draft.v1"
     },
     "tags": {
       "type": "array",
@@ -1113,9 +1113,9 @@ Workflow is a sibling peer of Function — an independent base type, not derived
     },
     "status": {
       "type": "string",
-      "x-gts-ref": "gts.cf.core.sless.func_lifecycle_status.v1~*",
+      "x-gts-instance-ref": "gts.cf.core.sless.func_lifecycle_status.v1~*",
       "description": "Lifecycle status. References a concrete GTS instance of gts.cf.core.sless.func_lifecycle_status.v1~.",
-      "default": "gts.cf.core.sless.func_lifecycle_status.v1~cf.core.sless.func_lifecycle_status.draft.v1~"
+      "default": "gts.cf.core.sless.func_lifecycle_status.v1~cf.core.sless.draft.v1"
     },
     "tags": {
       "type": "array",
@@ -1333,7 +1333,7 @@ Workflow is a sibling peer of Function — an independent base type, not derived
           "properties": {
             "error_type_id": {
               "type": "string",
-              "x-gts-ref": "gts.*"
+              "x-gts-type-ref": "gts.*"
             },
             "message": {
               "type": "string"
@@ -1639,8 +1639,8 @@ Workflow is a sibling peer of Function — an independent base type, not derived
     },
     "event_type_id": {
       "type": "string",
-      "x-gts-ref": "gts.cf.core.events.*",
-      "description": "GTS ID of the event type to listen for."
+      "x-gts-type-ref": "gts.cf.core.events.event.v1~*",
+      "description": "GTS Type ID of the event type to listen for; must derive from gts.cf.core.events.event.v1~."
     },
     "event_filter_query": {
       "type": "string",
@@ -1663,8 +1663,8 @@ Workflow is a sibling peer of Function — an independent base type, not derived
           "oneOf": [
             {
               "type": "string",
-              "x-gts-ref": "gts.cf.core.*",
-              "description": "GTS type ID of the topic to publish dead-lettered events to."
+              "x-gts-instance-ref": "gts.cf.core.events.topic.v1~",
+              "description": "GTS instance ID of the topic (gts.cf.core.events.topic.v1~) to publish dead-lettered events to."
             },
             {
               "type": "null"
@@ -1879,7 +1879,7 @@ Workflow is a sibling peer of Function — an independent base type, not derived
           "type": "array",
           "items": {
             "type": "string",
-            "x-gts-ref": "gts.cf.core.sless.runtime.*"
+            "x-gts-type-ref": "gts.cf.core.sless.runtime.*"
           },
           "description": "List of allowed runtime GTS type IDs (e.g., gts.cf.core.sless.runtime.starlark.v1~). Validated against implementation.adapter at registration time."
         },

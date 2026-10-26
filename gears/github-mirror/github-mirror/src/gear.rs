@@ -10,37 +10,107 @@ use toolkit::{Gear, GearCtx, Healthcheck, HealthcheckResult, RestApiCapability};
 use tracing::{info, warn};
 
 use authz_resolver_sdk::{AuthZResolverApi, PolicyEnforcer};
+use credstore_sdk::{CredStoreClientV1, SecretRef};
 use github_mirror_sdk::GithubMirrorClientV1;
+use toolkit_security::SecurityContext;
+use toolkit_utils::SecretString;
+use uuid::Uuid;
 
 use crate::api::rest::routes;
-use crate::config::GithubMirrorConfig;
+use crate::config::{GithubMirrorConfig, GithubTokenSecret};
+use crate::domain::error::DomainError;
 use crate::domain::local_client::LocalClient;
 use crate::domain::ports::github::GithubPort;
 use crate::domain::service::{ACTIVE_SYNC_TOUCH_EVERY, SWEEP_AGAIN_AFTER, Service, ServiceConfig};
 use crate::domain::sync::SyncPoolRunner;
-use crate::infra::github::client::GithubClient;
+use crate::infra::github::cache::HttpCache;
+use crate::infra::github::client::{GithubClient, TokenSource};
+use crate::infra::storage::fs_cache::FilesystemHttpCache;
 use crate::infra::storage::sea_orm_repo::{
     SeaOrmActiveSyncRepository, SeaOrmBranchRepository, SeaOrmCheckRunRepository,
     SeaOrmCommentRepository, SeaOrmCommitCommentRepository, SeaOrmCommitFileRepository,
     SeaOrmCommitRepository, SeaOrmCommitStatusRepository, SeaOrmContributorRepository,
-    SeaOrmDeploymentRepository, SeaOrmEntityFingerprintRepository, SeaOrmHttpCache,
-    SeaOrmIssueEventRepository, SeaOrmIssueReactionRepository, SeaOrmIssueRepository,
-    SeaOrmIssueTimelineRepository, SeaOrmLabelRepository, SeaOrmMilestoneRepository,
-    SeaOrmPullRequestCommitRepository, SeaOrmPullRequestFileRepository,
+    SeaOrmConversationRepository, SeaOrmDeploymentRepository, SeaOrmEntityFingerprintRepository,
+    SeaOrmHttpCache, SeaOrmIssueEventRepository, SeaOrmIssueReactionRepository,
+    SeaOrmIssueRepository, SeaOrmIssueTimelineRepository, SeaOrmLabelRepository,
+    SeaOrmMilestoneRepository, SeaOrmPullRequestCommitRepository, SeaOrmPullRequestFileRepository,
     SeaOrmPullRequestRepository, SeaOrmReleaseRepository, SeaOrmRepoRepository,
     SeaOrmRepoSyncStatusRepository, SeaOrmReviewCommentRepository, SeaOrmReviewRepository,
     SeaOrmReviewThreadRepository, SeaOrmSyncSessionRepository, SeaOrmSyncWatermarkRepository,
     SeaOrmSyncWriter, SeaOrmTagRepository, SeaOrmWorkflowJobRepository,
     SeaOrmWorkflowRunRepository,
 };
+use crate::infra::telemetry_sink::JsonlTelemetrySink;
 
 type ConcreteService = Service;
+
+const GEAR_ACTOR_ID: Uuid = uuid::uuid!("00000000-0000-cf01-0000-676d73797374");
+const SERVICE_SUBJECT_TYPE: &str = toolkit_gts::gts_id!("cf.core.security.subject_service.v1~");
+
+struct CredstoreToken {
+    credstore: Arc<dyn CredStoreClientV1>,
+    secret: GithubTokenSecret,
+    key: SecretRef,
+}
+
+impl CredstoreToken {
+    fn new(ctx: &GearCtx, secret: GithubTokenSecret) -> anyhow::Result<Self> {
+        let credstore = ctx
+            .client_hub()
+            .get::<dyn CredStoreClientV1>()
+            .map_err(|e| anyhow::anyhow!("failed to get the credential store: {e}"))?;
+        let key = SecretRef::new(secret.key.clone())
+            .map_err(|e| anyhow::anyhow!("invalid github_token_secret key: {e}"))?;
+        Ok(Self {
+            credstore,
+            secret,
+            key,
+        })
+    }
+}
+
+#[async_trait]
+impl TokenSource for CredstoreToken {
+    async fn token(&self) -> Result<Option<SecretString>, DomainError> {
+        github_token(self.credstore.as_ref(), &self.secret, &self.key)
+            .await
+            .map_err(|e| DomainError::internal(e.to_string()))
+    }
+}
+
+async fn github_token(
+    credstore: &dyn CredStoreClientV1,
+    secret: &GithubTokenSecret,
+    key: &SecretRef,
+) -> anyhow::Result<Option<SecretString>> {
+    let system_ctx = SecurityContext::builder()
+        .subject_id(GEAR_ACTOR_ID)
+        .subject_type(SERVICE_SUBJECT_TYPE)
+        .subject_tenant_id(secret.tenant_id)
+        .build()?;
+    let found = credstore
+        .get(&system_ctx, key)
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!("failed to read the GitHub token from the credential store: {e}")
+        })?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "the credential store has no secret `{}` for tenant {}",
+                secret.key,
+                secret.tenant_id
+            )
+        })?;
+    let token = std::str::from_utf8(found.value.as_bytes())
+        .map_err(|e| anyhow::anyhow!("the GitHub token secret is not UTF-8: {e}"))?;
+    Ok((!token.is_empty()).then(|| SecretString::new(token)))
+}
 
 // This attribute is the one place the gear's name is written:
 // `service::GEAR_NAME` aliases the `MODULE_NAME` const it generates.
 #[toolkit::gear(
     name = "github-mirror",
-    deps = [authz_resolver],
+    deps = [authz_resolver, credstore],
     capabilities = [rest, db, stateful]
 )]
 #[derive(Default)]
@@ -90,6 +160,7 @@ impl Gear for GithubMirrorGear {
         let tags = Arc::new(SeaOrmTagRepository::new(Arc::clone(&db)));
         let commit_files = Arc::new(SeaOrmCommitFileRepository::new(Arc::clone(&db)));
         let review_threads = Arc::new(SeaOrmReviewThreadRepository::new(Arc::clone(&db)));
+        let conversations = Arc::new(SeaOrmConversationRepository::new(Arc::clone(&db)));
         let commit_comments = Arc::new(SeaOrmCommitCommentRepository::new(Arc::clone(&db)));
         let issue_events = Arc::new(SeaOrmIssueEventRepository::new(Arc::clone(&db)));
         let deployments = Arc::new(SeaOrmDeploymentRepository::new(Arc::clone(&db)));
@@ -105,11 +176,16 @@ impl Gear for GithubMirrorGear {
         // Conditional requests: a stored ETag replayed as If-None-Match turns a
         // repeat sync into 304s, which GitHub does not charge against the rate
         // limit (#4630).
-        let http_cache = Arc::new(SeaOrmHttpCache::new(Arc::clone(&db), cfg.cache_compression));
-        let github: Arc<dyn GithubPort> = Arc::new(
-            GithubClient::with_cache(cfg.api_base_url.clone(), cfg.resolved_token()?, http_cache)?
-                .with_max_concurrent_requests(cfg.max_concurrent_requests),
-        );
+        let http_cache: Arc<dyn HttpCache> = match cfg.cache_dir {
+            Some(dir) => Arc::new(FilesystemHttpCache::new(dir, cfg.cache_compression)),
+            None => Arc::new(SeaOrmHttpCache::new(Arc::clone(&db), cfg.cache_compression)),
+        };
+        let client = GithubClient::with_cache(cfg.api_base_url.clone(), None, http_cache)?
+            .with_max_concurrent_requests(cfg.max_concurrent_requests);
+        if let Some(secret) = cfg.github_token_secret {
+            client.set_token_source(Arc::new(CredstoreToken::new(ctx, secret)?))?;
+        }
+        let github: Arc<dyn GithubPort> = Arc::new(client);
 
         let authz = ctx
             .client_hub()
@@ -136,6 +212,7 @@ impl Gear for GithubMirrorGear {
             tags,
             commit_files,
             review_threads,
+            conversations,
             commit_comments,
             issue_events,
             deployments,
@@ -161,13 +238,25 @@ impl Gear for GithubMirrorGear {
                 sync_deadline: std::time::Duration::from_secs(
                     cfg.sync_deadline_minutes.get().saturating_mul(60),
                 ),
+                telemetry_dir: cfg.telemetry_dir,
+                cache_max_age_days: cfg.cache_max_age_days,
+                tenant_cache_max_age_days: cfg
+                    .tenants
+                    .into_iter()
+                    .filter_map(|(tenant_id, tenant)| {
+                        tenant.cache_max_age_days.map(|days| (tenant_id, days))
+                    })
+                    .collect(),
             },
+            Arc::new(JsonlTelemetrySink::start()?),
         ));
 
         self.service
             .set(service.clone())
             .map_err(|_| anyhow::anyhow!("{} gear already initialized", Self::MODULE_NAME))?;
 
+        ctx.client_hub()
+            .register::<ConcreteService>(Arc::clone(&service));
         let client: Arc<dyn GithubMirrorClientV1> = Arc::new(LocalClient::new(service));
         ctx.client_hub()
             .register::<dyn GithubMirrorClientV1>(client);
@@ -381,6 +470,6 @@ mod tests {
     fn gear_provides_all_migrations() {
         use toolkit::contracts::DatabaseCapability;
         let gear = GithubMirrorGear::default();
-        assert_eq!(gear.migrations().len(), 43);
+        assert_eq!(gear.migrations().len(), 1);
     }
 }

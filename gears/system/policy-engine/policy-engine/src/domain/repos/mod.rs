@@ -29,8 +29,8 @@ use toolkit_macros::domain_model;
 pub mod content;
 
 pub use content::{
-    ActivationOutcome, ActiveContentLoader, AssignmentRepository, BundleRepository,
-    VersionRepository,
+    ActivationOutcome, ActiveContentLoader, AssignmentRepository, AssignmentVisibility,
+    BundleRepository, VersionRepository,
 };
 
 /// Reasons carried by [`RepoError::Conflict`]. Where the management surface
@@ -68,6 +68,9 @@ pub enum RepoError {
     /// The listing query (order, cursor, limit) was refused.
     #[error("invalid query: {0}")]
     Query(toolkit_odata::Error),
+    /// The statement would bind more values than the backend accepts.
+    #[error("too many values to bind")]
+    TooLarge,
     /// Storage failure or a stored row that does not decode; never a caller
     /// error.
     #[error("database error: {0}")]

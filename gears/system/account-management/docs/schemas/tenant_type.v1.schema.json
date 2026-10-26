@@ -10,10 +10,9 @@
       "allOf": [
         {
           "description": "GTS instance identifier",
-          "format": "gts-instance-id",
           "title": "GTS Instance ID",
           "type": "string",
-          "x-gts-ref": "gts.*"
+          "x-gts-instance-ref": "gts.*"
         }
       ]
     },
@@ -30,11 +29,11 @@
     "additionalProperties": false,
     "properties": {
       "allowed_parent_types": {
-        "description": "GTS instance identifiers of tenant types allowed as parent. Empty array means the type is root-only or leaf-only. The root tenant type has allowed_parent_types: [] by convention.",
+        "description": "GTS type identifiers of tenant types allowed as parent. Empty array means no parent tenant type is allowed, so a tenant of this type cannot be created under any parent; it does not restrict which types may list this type as their parent. The root tenant type has allowed_parent_types: [] by convention.",
         "type": "array",
         "items": {
           "type": "string",
-          "x-gts-ref": "gts.cf.core.am.tenant_type.v1~"
+          "x-gts-type-ref": "gts.cf.core.am.tenant_type.v1~"
         },
         "default": []
       },

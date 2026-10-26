@@ -159,23 +159,7 @@ impl From<DomainError> for CanonicalError {
                 .create(),
 
             // --- 404 NotFound ---
-            DomainError::NotFound { kind, id } => {
-                let detail = format!("{kind} {id} not found");
-                match kind {
-                    ResourceKind::Quota => {
-                        QuotaResource::not_found(detail).with_resource(id).create()
-                    }
-                    ResourceKind::Policy => {
-                        PolicyResource::not_found(detail).with_resource(id).create()
-                    }
-                    ResourceKind::Lease => {
-                        LeaseResource::not_found(detail).with_resource(id).create()
-                    }
-                    ResourceKind::Operation => OperationResource::not_found(detail)
-                        .with_resource(id)
-                        .create(),
-                }
-            }
+            DomainError::NotFound { kind, id } => not_found(kind, id),
 
             // --- 409 Aborted (safe to retry) ---
             DomainError::IdempotencyPayloadMismatch => {
@@ -264,6 +248,27 @@ impl From<DomainError> for CanonicalError {
 mod canonical_mapping_tests;
 
 /// The lifts of the quota-lifecycle rejections decided before storage.
+/// A Quota or operation `detail` leads with its `UNKNOWN_*` token.
+fn not_found(kind: ResourceKind, id: String) -> CanonicalError {
+    let detail = format!("{kind} {id} not found");
+    match kind {
+        ResourceKind::Quota => QuotaResource::not_found(format!(
+            "{}: {detail}",
+            crate::domain::tokens::UNKNOWN_QUOTA
+        ))
+        .with_resource(id)
+        .create(),
+        ResourceKind::Policy => PolicyResource::not_found(detail).with_resource(id).create(),
+        ResourceKind::Lease => LeaseResource::not_found(detail).with_resource(id).create(),
+        ResourceKind::Operation => OperationResource::not_found(format!(
+            "{}: {detail}",
+            crate::domain::tokens::UNKNOWN_OPERATION
+        ))
+        .with_resource(id)
+        .create(),
+    }
+}
+
 fn quota_lifecycle(err: DomainError) -> CanonicalError {
     match err {
         // --- 400 InvalidArgument ---

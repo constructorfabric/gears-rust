@@ -1,4 +1,3 @@
-// Created: 2026-09-07 by Virtuozzo International GmbH
 //! `tenant_permissions`: one sparse restriction per `(declaration, tenant)`.
 
 use sea_orm::entity::prelude::*;

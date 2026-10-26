@@ -15,10 +15,13 @@ pub enum Category {
 }
 
 impl Category {
+    /// Every category, in the order the planner lists them.
+    pub const ALL: [Self; 4] = [Self::Identity, Self::Role, Self::Skill, Self::Preference];
+
     /// The category whose person type is `type_id`, or `None` for any other type.
     #[must_use]
     pub fn from_type_id(type_id: &str) -> Option<Self> {
-        [Self::Identity, Self::Role, Self::Skill, Self::Preference]
+        Self::ALL
             .into_iter()
             .find(|category| category.type_id() == type_id)
     }

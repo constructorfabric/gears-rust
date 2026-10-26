@@ -47,7 +47,7 @@ Outcome and evidence: the criteria below. The per-task report was folded into th
 **Acceptance criteria:**
 - [x] `gts`, `gts-id` and `gts-macros` are all three at **`0.12.0`** from crates.io — they move together, and `gts-dylint` / `gts-macros-cli` must not lag (SPEC §7, D8)
 - [x] Every declared GTS identifier still admits; any that does not is fixed or explicitly waived in writing. **The figure "202" is not reproducible** and is replaced by three measured populations: 118/118 entities admitted at runtime under the e2e feature set (34 Type Schemas + 84 Instances), 797 doc/JSON files validated by the 0.12.0 validator, and every macro literal compiled by the workspace test run
-- [x] Every difference in `#[gts_type_schema]`-generated schema documents versus 0.11.0 is enumerated and accounted for — none silent. 9 of 118 documents differ, all by one change (a doc-commented GTS-identifier field's subschema preserved under `allOf` instead of having its `description` overwritten); shown semantically inert, including `x-gts-ref`, which `XGtsRefValidator` still enforces by recursing through `allOf`
+- [x] Every difference in `#[gts_type_schema]`-generated schema documents versus 0.11.0 is enumerated and accounted for — none silent. 9 of 118 documents differ, all by one change (a doc-commented GTS-identifier field's subschema preserved under `allOf` instead of having its `description` overwritten); shown semantically inert, including entity references (`x-gts-type-ref` / `x-gts-instance-ref`), which `XGtsRefValidator` still enforces by recursing through `allOf`
 
 **Verification:**
 - [x] `make gts-docs` — 797 files, 0 errors
@@ -303,7 +303,7 @@ T21's shapes:
 
 - [x] `resolution_closure` bounds each candidate or refreshed schema's distinct authored
   resolution graph, including its own document and the candidate overlay. Converging paths
-  count once; `x-gts-ref` and unrelated documents in the shared refresh store do not count
+  count once; entity references (`x-gts-type-ref` / `x-gts-instance-ref`) and unrelated documents in the shared refresh store do not count
 - [x] `resolved_document` bounds the canonical UTF-8 bytes of each effective artifact,
   including the conforming schema used by an Instance. Exactly-at-bound passes; exceeding
   either budget refuses admission and rolls back any revision and dependent refresh
@@ -531,7 +531,7 @@ the last `~`, and the immutable schema-revision pair.
    currently asserts that a derived Type Schema **fails**, and the comment blames T13's missing
    edges — half right, since `validate_schema` walks `chain_ids()` and would have found the base
    with no edge table involved. T13 supplies the `$ref` targets needed by the forward closure and
-   the three direct edge kinds needed by T14's reverse walk. `x-gts-ref` is neither resolved nor
+   the three direct edge kinds needed by T14's reverse walk. An entity reference (`x-gts-type-ref` / `x-gts-instance-ref`) is neither resolved nor
    represented by an edge.
 2. **`instance` and `instance_revision` acquire their four edits** — entity, repository with its
    mapper, port trait and types, and the forwarding block in `store.rs`. T2's migration already
@@ -551,7 +551,7 @@ the last `~`, and the immutable schema-revision pair.
 - [x] The transient store carries both kinds: both `UnsupportedKind` refusals are deleted and the dialect gate is keyed on the identifier's `~`. `type_id` is passed to `GtsEntity::new` **explicitly** from `GtsId::get_type_id()` with a `None` config — letting content name the conforming type would allow a value to claim conformance to a type it was not registered under, which is a validation bypass, not a convenience
 - [x] The closure reaches a candidate's derivation chain with **no `dependency` row present** — `closure` seeds its worklist with `GtsId::chain_ids()`, and `missing_roots` is still computed over the original roots so a chain member the seed added is not reported as one. The Phase 1 test is inverted, and its old comment was half wrong: it blamed T13's missing edges, but a derivation base is a pure function of the identifier
 - [x] A family holds one kind — `family_kind_conflict`, checked under the family lock and only for a family that already existed. Distinct from `already_exists` because the identifier *is* free; saying otherwise sends a caller looking for a conflicting entity that does not exist. Both orders are tested
-- [x] No `$ref` target is expected to resolve in T10; document-reference support belongs to T13 and is verified there by `a_ref_outside_the_chain_is_admitted`. An `x-gts-ref` target is never resolved or seeded because validating the keyword reads no target document.
+- [x] No `$ref` target is expected to resolve in T10; document-reference support belongs to T13 and is verified there by `a_ref_outside_the_chain_is_admitted`. An entity-reference (`x-gts-type-ref` / `x-gts-instance-ref`) target is never resolved or seeded because validating the keyword reads no target document.
 - [x] **An admitted Instance reads back with its value.** *Added after the task was marked done — see the correction below.* `GET /v2/entities/{entity_key}` returns either kind's authored document under the single public field `content`. The immutable `revision_no` remains an internal current-pointer and provenance detail; the public entity exposes `resource_version`, which is the token future writes accept. The three `effective_*` artifacts stay absent for an Instance, and that is the contract rather than the same omission: an Instance has no derived state, so there is nothing to materialize
 
 **The read path was missed, and the task's criteria are why.** Every criterion above is about
@@ -838,7 +838,7 @@ its ordering are already there.
 **Description:** Extract the edge kinds from authored content — `$ref`, immediate derivation
 base, Instance conformance — and replace the admitted entity's outgoing rows on each admission.
 
-`x-gts-ref` is not a dependency edge. Validation matches the value string against the pattern
+An entity reference (`x-gts-type-ref` / `x-gts-instance-ref`) is not a dependency edge. Validation matches the value string against the pattern
 without consulting the registry, the target is not inlined into an effective artifact, and the
 keyword gives no deletion-safety guarantee. The managed–external boundary will classify candidate
 content when federation is introduced. The three stored edge kinds are `$ref`, immediate
@@ -863,22 +863,22 @@ extractor, called over the candidate document *before* the closure read, its tar
 closure roots beside the candidate's `chain_ids()`. Found at the PR #4641 review.
 
 **Acceptance criteria:**
-- [x] `x-gts-ref` creates no edge and has no reader in the P0 dependency implementation
+- [x] An entity reference (`x-gts-type-ref` / `x-gts-instance-ref`) creates no edge and has no reader in the P0 dependency implementation
 - [x] Admission replaces only the admitted entity's outgoing rows, through the existing `DependencyRepo::replace_outgoing` — written and unit-tested at T4, with no caller until this task
 - [x] Derivation and conformance are materialized even though derivable from the identifier
 - [x] `$ref` extraction uses `gts-rust`'s extractor, never a local scan
 - [x] Extraction is exposed as a pure function over authored content, callable without a database — `domain::dependency::extract_edges(&GtsId, &Value)`, no clock and no ports in its signature, which is what lets the same call serve both sides of the admission
-- [x] `load_unit_store` seeds the closure with the `$ref` targets extracted from each candidate **document**, alongside the candidate's `chain_ids()` — a first admission has no stored edges of its own, so the identifier-derived seed is the only thing the closure would otherwise see. An `x-gts-ref` target is not seeded because validating the keyword never reads the target document
+- [x] `load_unit_store` seeds the closure with the `$ref` targets extracted from each candidate **document**, alongside the candidate's `chain_ids()` — a first admission has no stored edges of its own, so the identifier-derived seed is the only thing the closure would otherwise see. An entity-reference target is not seeded because validating the keyword never reads the target document
 - [x] For a revision the roots come from the candidate document's references, never from the previous revision's stored edge set: the overlay wins for edges as it already does for documents. **With one honest limit,** stated at `load_unit_store`: the candidate's *stale* rows are still walked, because `closure` cannot tell a candidate root from any other, so a reference a revision dropped may still be loaded. That is inert — resolution follows the document, and an extra registered schema answers no question — while the direction that is not inert holds: a reference the candidate **added** resolves
 - [x] A reference target that genuinely does not exist is distinguishable from a candidate that is not stored yet — `UnitStore::missing_references` beside `missing_candidates`. **No port change was needed.** `closure` already reports every root with no entity row; which of those roots is a candidate is `load_unit_store`'s own knowledge, so the split is one `partition` over the existing result rather than a second list crossing the seam. `missing_candidates` still has no production reader, so T19 inherits both lists and no ambiguity
 - [x] The `CLOSURE_BOUND` accounting covers the added roots: `ensure_within_bound` charges `roots.len()` before the first hop, and the seed *is* that vector — reference targets are pushed into it, not passed beside it, so no accounting change was possible to forget
 
 **The dependency reader is `gts-rust`.** `$ref` goes through `gts::extract_gts_refs`, the
 canonical definition shared with the resolution that validates the candidate. No local scan
-interprets either `$ref` or `x-gts-ref` as a dependency.
+interprets either `$ref` or an entity reference as a dependency.
 
 **An Instance carries exactly one edge, and that is a rule rather than an omission.** `$ref`
-and `x-gts-ref` are schema keywords, so the same strings inside a *value* are data.
+and the entity-reference keywords are schema keywords, so the same strings inside a *value* are data.
 Extracting them would invent an edge from a coincidence, and a malformed one would refuse a
 valid value — `an_instance_values_ref_shaped_data_is_data_and_not_an_edge` pins it.
 
@@ -893,11 +893,11 @@ fails at extraction as `invalid_schema`.
 
 **Verification:**
 - [x] Gear tests, all three backends (see [Commands](#commands)) — 531 on `SQLite`, six consecutive full-suite runs green; `make test-integration LANE=types-registry-db` green on `PostgreSQL` and `MySQL`. No new backend cases: the writes go through `replace_outgoing` and the resolution through `find_by_gts_ids`, both already exercised on both container backends by T4's `closure_walks_a_chain`. T13 adds no new SQL shape
-- [x] Table-driven test over edge-kind fixtures, including a derived schema carrying both schema edge kinds, a reference-free schema, and an Instance of a derived type; focused no-edge tests cover `x-gts-ref`
+- [x] Table-driven test over edge-kind fixtures, including a derived schema carrying both schema edge kinds, a reference-free schema, and an Instance of a derived type; focused no-edge tests cover `x-gts-type-ref` and `x-gts-instance-ref`
 - [x] Test: re-admission removes an edge the new revision dropped — `a_revision_removes_the_edge_it_dropped_and_adds_the_one_it_gained`, with `a_revision_that_keeps_its_reference_keeps_the_edge` for the other direction, because "replace" could otherwise be read as "clear and forget"
 - [x] Test: a new schema whose `$ref` names an existing schema **outside its identifier chain** is admitted — the case that failed with `invalid_schema`. It was already pinned, inverted, as `admission_worker_test::a_ref_outside_the_chain_still_fails`; that test is now `a_ref_outside_the_chain_is_admitted` and its flip is the RED→GREEN record. `dependency_test.rs` pins the rows the same admission writes
 - [x] Test: a revision that adds one reference and drops another resolves against the new set, not the stored one — `gts_store_test::a_revision_resolves_against_the_reference_it_now_carries`. All three new store tests were verified RED with the one seeding line disabled
-- [x] Test: a reference to an identifier no entity carries is reported as a missing reference, distinct from the candidate's own absence — `a_reference_no_entity_carries_is_a_missing_reference_not_a_missing_candidate`, and end to end `an_x_gts_ref_writes_no_row_whether_its_target_exists_or_not` against `a_ref_naming_no_entity_fails_the_candidate`: same absent identifier, two outcomes, because a pattern is satisfiable before anything matches it while a `$ref` is not
+- [x] Test: a reference to an identifier no entity carries is reported as a missing reference, distinct from the candidate's own absence — `a_reference_no_entity_carries_is_a_missing_reference_not_a_missing_candidate`, and end to end `an_entity_ref_writes_no_row_whether_its_target_exists_or_not` against `a_ref_naming_no_entity_fails_the_candidate`: same absent identifier, two outcomes, because a pattern is satisfiable before anything matches it while a `$ref` is not
 
 **Two existing tests had to be inverted, and both were boundary markers rather than
 regressions.** `admission_worker_test::a_ref_outside_the_chain_still_fails` asserted the gap
@@ -1442,7 +1442,7 @@ rows, and `database.sql` include the column. `compat_forced` avoids MySQL's rese
 **Description:** Identifier-derived chain validation against every managed base, the
 Draft-07 dialect pin across a major, and the ADR-0015 quarantine: a stable candidate may not
 derive from or `$ref` a major-0 identifier, and a major-0 schema may not carry a registered
-Instance. `x-gts-ref` is an instance-value constraint and is outside the quarantine.
+Instance. An entity reference (`x-gts-type-ref` / `x-gts-instance-ref`) is an instance-value constraint and is outside the quarantine.
 
 **No preflight scan.** ADR-0015 and DESIGN were simplified to drop it (O4): the rule's base case
 comes from the release boundary — T2's migration creates the storage in the same release this task
@@ -1452,7 +1452,7 @@ but not the check. A dev database can be exactly that between T10 and T18; delet
 reasoning about it.
 
 **Acceptance criteria:**
-- [x] Reuse `dependency::extract_edges`, which calls `chain_ids()`, for chain bases and quarantine. `x-gts-ref` produces no edge
+- [x] Reuse `dependency::extract_edges`, which calls `chain_ids()`, for chain bases and quarantine. An entity reference produces no edge
 - [x] A stable candidate whose immediate base or `$ref` targets include a major-0 identifier is refused. The base comes from `chain_ids()` and `$ref` targets come from `dependency::extract_edges`; no target document is needed to read its major
 - [x] Refuse Instances conforming to major 0 via the `instance_of` edge from `get_type_id()`
 - [x] Pin the dialect across intra-entity revisions and new minors, using the preceding minor's current definition
@@ -1468,7 +1468,7 @@ reasoning about it.
 - [~] Gear tests, all three backends (see [Commands](#commands)) — 739/739 SQLite tests pass.
       The target now selects 10 tests across four backend binaries, including the new T17/T18
       PostgreSQL/MySQL scenarios; their Docker execution remains to be recorded
-- [x] Tests: each quarantine path — a stable candidate deriving from a v0 base and one `$ref`-ing a v0 target; plus stable candidates whose `x-gts-ref` names a v0 entity exactly or through a pattern, which must be admitted because the keyword is outside quarantine. Refusal tests register the v0 target first and assert that no entity row was written
+- [x] Tests: each quarantine path — a stable candidate deriving from a v0 base and one `$ref`-ing a v0 target; plus stable candidates whose entity reference (`x-gts-type-ref` / `x-gts-instance-ref`) names a v0 entity exactly or through a pattern, which must be admitted because the keyword is outside quarantine. Refusal tests register the v0 target first and assert that no entity row was written
 - [x] Test: dialect change across revisions is refused — both edges, the intra-entity one and the cross-minor one
 - [x] Test: the four refusals appear in `refusals_total{stage="admission"}` under those exact
       label values — asserted as label values, not as counts:
@@ -1505,7 +1505,7 @@ MySQL's integer boolean, and the SQLite insert chunk accounts for all 15 columns
 ### Checkpoint 4
 - [x] Compatibility matrix passes including the `Unknown` tier
 - [x] Provenance persisted on every revision
-- [x] Quarantine and dialect rules hold, including admission of stable schemas whose `x-gts-ref` names a major-0 entity (no preflight — O4)
+- [x] Quarantine and dialect rules hold, including admission of stable schemas whose entity reference names a major-0 entity (no preflight — O4)
 - [x] Every verdict is counted, with `Unknown` and a forced waiver each distinguishable in the
       metrics and not only in a refusal reason (T17, P16)
 - [x] Quarantine and dialect refusals each carry their own counted reason, none collapsed into
@@ -1590,8 +1590,8 @@ deletion, predicting the whole batch against one coherent snapshot without entit
   claim-order tests matching creation/revision/`unchanged`
 - [x] Live direct registered dependants block deletion; report count only
 - [x] Transitive-only dependants do not block
-- [x] `x-gts-ref` creates no edge and does not block
-- [x] Paired service tests vary only `$ref`/`x-gts-ref` on a string property: the former
+- [x] An entity reference (`x-gts-type-ref` / `x-gts-instance-ref`) creates no edge and does not block
+- [x] Paired service tests vary only `$ref`/entity reference on a string property: the former
   blocks deletion; the latter permits it and remains readable. Tenant availability is deferred
 - [x] Tombstones remain exact-readable and are excluded from lists
 - [x] Dry run issues no entity writes/claims; its mode enters the fingerprint and outcomes persist
@@ -2429,12 +2429,12 @@ Commits inside the task: (1) tenant contract and extension helpers; (2) tenant l
 Implement sequentially in four S/M slices; do not land a client before its seed barrier works. Every slice clears the standing bar.
 
 **Slice 1 — seed audit and deployment limits (S, three primary files):**
-- [ ] Audit derivation/`$ref`/Instance-of dependencies of the actual linked inventory and `cfg.entities`, including registry control-plane and `toolkit-gts` base types. Record and resolve dependencies previously supplied only by a later legacy `init` call before enabling immediate seed validation; do not defer unresolved inline seeds to `post_init` or wait for a later registrant. Keep the fleet-wide lifecycle audit in T38. `x-gts-ref` is syntax/pattern validation, not target existence (P14): e2e's customer `allowed_parent_types` does not require the later AM root type, so do not duplicate AM publication or pull T40/T41 forward for that value
+- [ ] Audit derivation/`$ref`/Instance-of dependencies of the actual linked inventory and `cfg.entities`, including registry control-plane and `toolkit-gts` base types. Record and resolve dependencies previously supplied only by a later legacy `init` call before enabling immediate seed validation; do not defer unresolved inline seeds to `post_init` or wait for a later registrant. Keep the fleet-wide lifecycle audit in T38. An entity reference (`x-gts-type-ref` / `x-gts-instance-ref`) is syntax/pattern validation, not target existence (P14): e2e's customer `allowed_parent_types` does not require the later AM root type, so do not duplicate AM publication or pull T40/T41 forward for that value
 - [ ] Measure the actual combined inventory/configured count for the quickstart, example and e2e feature sets; record counts and feature sets in the audit. Set explicit deployment `limits.batch_candidates` values that fit these sets and check their other admission budgets. The current default is 100 and a source-level macro count is not a linked-population measurement; preserve a deliberately smaller limit in the refusal test rather than weakening enforcement or assuming the default fits
 - [ ] Validate the audit against cold-start seed fixtures before publishing a client. If a genuine dependency requires declaring-crate changes, record and implement those as prerequisite commits of at most five files; do not silently broaden a slice or downgrade the full-seed/green-e2e criteria
 
 **Verification — slice 1:**
-- [ ] Record reproducible collection/count commands for each real feature set and the chosen deployment budgets. In slice 2, admit the actual configured customer schema with its linked base but without the later AM root schema; assert that a genuine missing derivation/`$ref` target, unlike `x-gts-ref`, is refused
+- [ ] Record reproducible collection/count commands for each real feature set and the chosen deployment budgets. In slice 2, admit the actual configured customer schema with its linked base but without the later AM root schema; assert that a genuine missing derivation/`$ref` target, unlike an entity reference, is refused
 
 **Files likely touched — slice 1:** `config/quickstart.yaml`, `config/e2e-local.yaml`, the seed audit in this file. Configuration paths for a distinct example feature set are included only if that composition uses another configuration
 
@@ -2446,7 +2446,7 @@ Implement sequentially in four S/M slices; do not land a client before its seed 
 **Verification — slice 2 / intermediate review:**
 - [ ] `cargo nextest run -p cf-gears-types-registry --test seeding_test`; `make test-integration LANE=types-registry-db` — seed/restart/refusal and concurrent same-version seeding behaviour on SQLite, PostgreSQL and MySQL, using existing shared delivery helpers. Put container cases in `seeding_backends_test.rs` behind the existing `integration` feature so the make target actually selects them
 - [ ] At least two linked crates, a cross-crate dependency, real `toolkit-gts` base declarations, registry declarations and a configured dependent entity are readable through database-backed reads; a second boot preserves revisions/artifacts, and a permitted configured-content change updates through CAS
-- [ ] Invalid/unresolved seeds and an oversized combined set fail before either new client is published; a seed failure/cancellation leaves no running worker owned by the failed startup. The configured customer schema succeeds without its `x-gts-ref` target being stored, and a real missing parent/`$ref` fails; concurrent seeders both succeed with one admitted version of each equal document. Review the audit, budgets and seed barrier before slice 3
+- [ ] Invalid/unresolved seeds and an oversized combined set fail before either new client is published; a seed failure/cancellation leaves no running worker owned by the failed startup. The configured customer schema succeeds without its entity-reference target being stored, and a real missing parent/`$ref` fails; concurrent seeders both succeed with one admitted version of each equal document. Review the audit, budgets and seed barrier before slice 3
 
 **Files likely touched — slice 2:** `TR/src/gear.rs`, `TR/src/domain/mod.rs`, `TR/src/domain/seeding.rs` (new), `TR/tests/seeding_test.rs` (new), `TR/tests/seeding_backends_test.rs` (new). Reuse existing DB/outbox fixtures
 
@@ -2673,6 +2673,8 @@ Commits inside the task: (1) resolving wrappers, `rest-server` and `provides` wi
 
 **Description:** Add `TypeSchema::validate_value(&serde_json::Value)` as a thin adapter to `gts::ResolvedType::validate_payload`, so consumers can use the common GTS validation rules without building a store or configuring their own `jsonschema` validator. The upstream helper is implemented locally in `gts-rust`, branch `feat/resolved-payload-validation`, commit `0b5b7b1`; merge and a compatible published release are prerequisites, not completed dependency adoption. Any GTS/spec migration required by that release must be planned and verified separately before this task, rather than hidden in the wrapper change. One implementation commit after the prerequisite is satisfied; consumer migration stays in T38.
 
+**QE consumer note (T38):** QE already wraps `gts::PayloadValidator` in `CompiledContract` and compiles each selected contract once at catalogue bootstrap. Review the SDK wrapper against this use case: a convenience `validate_value` method that recompiles on every call is insufficient for replacing QE's request-path validator. Preserve a reusable compiled-validator path over the materialized Type Schema; keep the thin QE wrapper if the SDK offers only one-shot validation. The main migration saving is in registry resolution, as recorded under T38, rather than in `domain/catalog/model.rs`.
+
 **Acceptance criteria:**
 - [ ] The public method delegates payload validation to the upstream helper, using the returned resolved schema and the selected leaf's authored metadata for abstractness. It neither reconstructs effective artifacts nor reimplements dialect, format, regex or reference rules; it creates no registry client or local store
 - [ ] Rustdoc and the SDK README state the required projection fields (including `content` and `resolved_schema`) and define the error mapping for missing fields and upstream failures without parsing diagnostic strings. Missing fields or unavailable schema resources fail explicitly; validation never silently succeeds. The wrapper does not modify the payload or insert defaults
@@ -2800,6 +2802,8 @@ Commits inside the task: (1) the hook; (2) generic supervision moved from the SD
 
 Switch every remaining legacy consumer to `PlatformTypesRegistryApi` atomically, deleting the old trait without a shim. Mechanical changes: add `#[consumes]` beside `deps`, pass `PlatformSecurityContext::outbound_marker()`, use extension helpers, read materialized fields and replace `register` with local reconciliation. Registration remains synchronous in `init` until Phase 8. Validation changes from staging until `post_init` to immediate admission, which requires the startup audit.
 
+**QE migration note — consume resolved artifacts:** In `gears/system/quota-enforcement/quota-enforcement/src/infra/types_registry.rs`, `reference_closure`, `enqueue_chain` and `resolve` currently load parent/transitive `$ref` dependencies into a local `GtsStore` and recompute the resolved schema and traits. Replace this roughly 80-line block with reads of the new SDK's materialized `resolved_schema` and `effective_traits`, selecting `content` for the leaf's authored metadata, including abstractness. This is an expected simplification, not a net line-count target: projections, error handling and registration migration still need code. Keep QE's metric/scope membership, contract uniqueness and active-Quota compatibility checks, bounded registry calls, and process-local catalogue; the new SDK does not replace those responsibilities. T29/T30 supply the materialized reads; T35a supplies the payload-validation API review above.
+
 **Operator-configured entities (`cfg.entities`).** Preserve `gears.types-registry.config.entities` for deployment-specific identifiers (e.g. the customer tenant type in `e2e-local.yaml`). T31 already seeds it through the outbox/database path; remove only the legacy copy here. Invalid or oversized combined sets still fail boot.
 
 **Acceptance criteria — audit:**
@@ -2809,6 +2813,8 @@ Switch every remaining legacy consumer to `PlatformTypesRegistryApi` atomically,
 - [ ] The toolkit documentation no longer recommends registry calls from `init` for remote-capable consumers
 
 **Acceptance criteria — cutover:**
+- [ ] QE consumes materialized artifacts without a local `GtsStore`, transitive reference fetches or effective-artifact recomputation; discovery still follows no references, so an unrelated broken contract cannot fail its bootstrap. Missing required projection fields fail explicitly
+- [ ] QE compiles selected payload validators once at catalogue bootstrap and reuses them without registry calls or schema compilation on ingress. Adopt T35a's wrapper only if it preserves this property; retain `CompiledContract` otherwise
 - [ ] T31's seeding/local-publication guarantees and tests still pass after legacy deletion: all linked inventory + `cfg.entities`, idempotent restart, no publisher stamp, worker before admission, all seeds settled before publication and explicit combined-set limit refusal. No per-gear filter or dependency-separating split is introduced; T42 later narrows the seed set
 - [ ] The legacy v1 routes T9a restored are deleted **together with** the repository they read — `POST /v1/entities` (`types_registry.register`), `GET /v1/entities/{gts_id}` (`types_registry.get`) and the in-memory `GET /v1/entities` list. A route left pointing at a deleted repository is the failure mode; T38 then promotes v2 onto those paths
 - [ ] **Every remaining legacy consumer moves onto the new SDK in this task**, mechanically; T31's new consumers and all seven T32 gears already use it. Record/recheck T32's API migration and ID/config audit rather than translating those crates again; keep their outstanding lifecycle calls on the Phase 8 audit. The remaining assignment is derived by grep and recorded
@@ -2826,6 +2832,7 @@ Switch every remaining legacy consumer to `PlatformTypesRegistryApi` atomically,
 
 **Verification:**
 - [ ] The audit list is reviewed against the `rg` output recorded in its commit
+- [ ] QE: `cargo test -p cf-gears-quota-enforcement --lib domain::catalog::`, `cargo test -p cf-gears-quota-enforcement --lib infra::types_registry::` and `cargo check -p cf-gears-quota-enforcement --all-targets`; adapter tests cover materialized local/mixin references and missing projection fields, and a request-path test proves validation makes no registry calls or repeated schema compilations
 - [ ] Gear tests, all three backends (see [Commands](#commands))
 - [ ] Re-run T31's seeding and real-host local-client boot suites after removing legacy, including restart/update, two-crate dependencies, configured entities and the over-limit/failed-seed barriers
 - [ ] Boot T35's production registry host again after authn consumers migrate and legacy is deleted: linked authentication, canonical tenant refusal without a valid credential and platform-token admission still work. Do not wait for T41 to discover a regression in the standalone registry entry

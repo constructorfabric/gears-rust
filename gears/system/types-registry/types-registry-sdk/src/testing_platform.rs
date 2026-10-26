@@ -876,7 +876,7 @@ impl Resolver {
             store
         });
         let resolution = store
-            .validate_schema(gts_id)
+            .validate_schema_with(gts_id, gts::GtsRefValidation::None)
             .map(|resolved| Documents {
                 resolved_schema: resolved.schema,
                 effective_traits: resolved.effective_traits,

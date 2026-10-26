@@ -9,8 +9,7 @@
     "type": {
       "description": "GTS identifier of this fragment's attribute type. Producer-authored, like type on a node or an edge, so a payload can be read without resolving the embedding schema. Optional: the pointer the embedding type declares is what selects the schema to validate against, and it remains authoritative when the two disagree.",
       "type": "string",
-      "format": "gts-type-id",
-      "x-gts-ref": "gts.cf.core.graph.attribute.v1~"
+      "x-gts-type-ref": "gts.cf.core.graph.attribute.v1~"
     }
   }
 }

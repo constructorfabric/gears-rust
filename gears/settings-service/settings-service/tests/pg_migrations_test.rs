@@ -1,5 +1,4 @@
 #![cfg(feature = "integration")]
-// Created: 2026-10-02 by Virtuozzo International GmbH
 // The fixture, the seed and the reader are plain helpers, which
 // `allow-expect-in-tests` does not reach; a failed expectation there is the
 // test failing, as in the sibling PostgreSQL suites.

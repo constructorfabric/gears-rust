@@ -14,6 +14,39 @@ slow-timeout = { period = "60s", terminate-after = 5 }
 filter = 'package(cf-gears-quota-enforcement-storage-plugin)'
 slow-timeout = { period = "60s", terminate-after = 3 }
 
+# Flaky-test quarantine: each entry below retries a known-flaky test twice. This
+# hides the flake, it does not fix it; remove the entry once the test is fixed.
+
+# Seen failing on #5395 (Windows), #5349 (Windows) and #5220 (coverage): the
+# rebalance cases two_subscribers_baseline_then_third_joins_mid_stream,
+# scale_down_via_disconnect, rolling_replacement_via_delete and
+# scale_down_via_delete. Quarantine for exactly these four, to be fixed; the
+# binary's fifth case, rolling_replacement_via_disconnect, has not been seen
+# failing and runs without retries.
+[[profile.default.overrides]]
+filter = '''package(cf-gears-event-broker) & binary(consumer_group_rebalance_integration_tests) & (
+  test(=two_subscribers_baseline_then_third_joins_mid_stream)
+  | test(=scale_down_via_disconnect)
+  | test(=rolling_replacement_via_delete)
+  | test(=scale_down_via_delete)
+)'''
+retries = 2
+
+# Seen failing on #5354 (Integration tests). Quarantine, to be fixed.
+[[profile.default.overrides]]
+filter = 'package(cf-gears-bss-ledger) & binary(postgres_chargeback_concurrency) & test(=concurrent_lost_on_one_dispute_claws_back_once)'
+retries = 2
+
+# Seen failing on #4899 (coverage). Quarantine, to be fixed.
+[[profile.default.overrides]]
+filter = 'package(cf-gears-cluster-sdk) & test(=lease::lease_tests::the_clock_follows_virtual_time)'
+retries = 2
+
+# Seen failing on #5349 (Windows). Quarantine, to be fixed.
+[[profile.default.overrides]]
+filter = 'package(cf-gears-toolkit-security) & test(=internal_auth_cache::tests::invalid_token_rejections_are_briefly_negative_cached)'
+retries = 2
+
 # CI profile: every run writes target/nextest/ci/junit.xml, which the CI jobs
 # upload and .github/workflows/test-report.yml publishes as GitHub Check Runs.
 # The default profile's overrides above still apply under this profile.

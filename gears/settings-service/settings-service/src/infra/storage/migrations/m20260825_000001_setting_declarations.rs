@@ -1,4 +1,3 @@
-// Created: 2026-08-25 by Virtuozzo International GmbH
 // @cpt-dod:cpt-cf-settings-service-dod-setting-declarations-entity-schema:p1
 //! The `setting_declarations` table.
 //!

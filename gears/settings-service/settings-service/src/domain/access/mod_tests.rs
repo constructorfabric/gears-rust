@@ -1,4 +1,3 @@
-// Created: 2026-09-07 by Virtuozzo International GmbH
 //! The effective-access rule, the state tag, the target check and eviction.
 
 use std::sync::Arc;

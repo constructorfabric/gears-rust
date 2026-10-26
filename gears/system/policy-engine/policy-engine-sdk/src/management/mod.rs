@@ -3,7 +3,8 @@
 //! - [`PolicyManagementClientV1`] - content lifecycle and assignments. It
 //!   backs every endpoint of the policy administration REST API.
 //! - [`models`] - bundles, versions, documents and assignments.
-//! - [`odata`] - the `OData` paging schema of the bundle listing.
+//! - [`odata`] - the `OData` schemas of the bundle, version and assignment
+//!   listings.
 //! - [`error`] - the typed [`ManagementError`] and the content limits.
 //! - [`finding`] - stable codes of validation findings.
 //!
@@ -18,9 +19,10 @@
 //! # Authorisation
 //!
 //! Each method is authorised against the caller's own `SecurityContext` for
-//! exactly one of the capabilities of
-//! [`Capability`](crate::gts::permissions::Capability); no capability implies
-//! another.
+//! the capability of [`Capability`](crate::gts::permissions::Capability) its
+//! documentation names - one per method, except the assignment reads, which
+//! take read or, for dormant assignments at the caller's tenants, publish. No
+//! capability implies another.
 
 pub mod client;
 pub mod error;
@@ -33,7 +35,7 @@ pub use error::{
 };
 pub use models::{
     Assignment, AssignmentId, AssignmentSpec, Bundle, BundleId, BundlePatch, BundleVersion,
-    Document, DocumentId, DocumentSpec, NewBundle, ValidationFinding, ValidationReport,
+    Document, DocumentId, DocumentSpec, NewBundle, PublishOperation, ValidationFinding,
     VersionContent, VersionDetail, VersionId, VersionState,
 };
 

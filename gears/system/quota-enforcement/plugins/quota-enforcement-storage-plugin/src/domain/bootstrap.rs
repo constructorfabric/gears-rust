@@ -17,7 +17,9 @@ use quota_enforcement_sdk::{BootstrapBundle, ConfigDefaults, PolicyScope, Storag
 use toolkit_macros::domain_model;
 use toolkit_security::SecurityContext;
 
-use super::ports::{FoundationStore, PolicyStore, QuotaStore, SeedReport, StoreError};
+use super::ports::{
+    ConsumptionStore, FoundationStore, PolicyStore, QuotaStore, SeedReport, StoreError,
+};
 
 const LOG_TARGET: &str = "qe.storage";
 
@@ -28,6 +30,7 @@ pub struct StoragePlugin {
     store: Arc<dyn FoundationStore>,
     pub(super) quotas: Arc<dyn QuotaStore>,
     pub(super) policies: Arc<dyn PolicyStore>,
+    pub(super) consumption: Arc<dyn ConsumptionStore>,
 }
 
 impl StoragePlugin {
@@ -37,11 +40,13 @@ impl StoragePlugin {
         store: Arc<dyn FoundationStore>,
         quotas: Arc<dyn QuotaStore>,
         policies: Arc<dyn PolicyStore>,
+        consumption: Arc<dyn ConsumptionStore>,
     ) -> Self {
         Self {
             store,
             quotas,
             policies,
+            consumption,
         }
     }
 
@@ -119,10 +124,7 @@ impl StoragePlugin {
         {
             return Ok(());
         }
-        // The audit actor of a seed is the system, not a principal: bootstrap
-        // runs before any request. The nil subject is that absence, and since
-        // policy rows are platform-plane (`no_tenant`, `no_owner`) it invents
-        // no synthetic tenant to stand in for one.
+        // Bootstrap has no principal; the nil subject records that absence.
         match self
             .policies
             .create_policy(&SecurityContext::anonymous(), draft, &[])

@@ -1,10 +1,10 @@
 //! The plan: the steps that change one subject's profile.
 //!
-//! This shape is agreed with Story 5.2 (the Planner, ROL-17080), which builds
-//! plans on it. The Sensitive-Data Checks and Admission read a plan only
+//! The Planner builds plans in this shape. The Sensitive-Data Checks and Admission read a plan only
 //! through [`Plan::values`], [`Origin::written_by_a_person`], and each step's
 //! entity kind, confidence and [`Change::stores_values`].
 
+use serde_json::Value;
 use time::OffsetDateTime;
 use toolkit_macros::domain_model;
 use uuid::Uuid;
@@ -71,16 +71,17 @@ impl Origin {
     }
 }
 
-/// One property of an entity: its plain key and its value.
+/// One property of an entity: its plain key and its value, as the JSON the
+/// node stores. An entry such as a skill is an object of its fields.
 #[domain_model]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Property {
     pub name: String,
-    pub value: String,
+    pub value: Value,
 }
 
 impl Property {
-    pub fn new(name: impl Into<String>, value: impl Into<String>) -> Self {
+    pub fn new(name: impl Into<String>, value: impl Into<Value>) -> Self {
         Self {
             name: name.into(),
             value: value.into(),
@@ -140,7 +141,7 @@ impl Change {
     }
 
     /// The value of the `index`th property the change would store.
-    pub(crate) fn value_mut(&mut self, index: usize) -> Option<&mut String> {
+    pub(crate) fn value_mut(&mut self, index: usize) -> Option<&mut Value> {
         match self {
             Self::AddEntity { properties, .. } | Self::ReplaceEntity { properties, .. } => {
                 properties.get_mut(index).map(|p| &mut p.value)
@@ -198,15 +199,38 @@ pub struct Plan {
     pub steps: Vec<Step>,
 }
 
-/// Where a value sits in a plan: the step and the property within it.
+/// Where a text piece sits in a plan: the step, the property within it, and
+/// the piece within the property's value, counted as [`text_pieces`] walks it.
 #[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ValueRef {
     pub step: usize,
     pub property: usize,
+    pub piece: usize,
 }
 
-/// One value a plan would store, as the sensitive-data checks see it.
+impl ValueRef {
+    /// The property whose value the piece belongs to.
+    #[must_use]
+    pub fn property_ref(self) -> PropertyRef {
+        PropertyRef {
+            step: self.step,
+            property: self.property,
+        }
+    }
+}
+
+/// Where a property sits in a plan: the step and the property within it.
+#[domain_model]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct PropertyRef {
+    pub step: usize,
+    pub property: usize,
+}
+
+/// One text piece a plan would store, as the sensitive-data checks see it: a
+/// string or a number inside a value. The keys of an object are its type's
+/// field names and are not checked.
 #[domain_model]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlanValue {
@@ -215,22 +239,121 @@ pub struct PlanValue {
 }
 
 impl Plan {
-    /// Every value the plan would store. Removals store nothing and have none.
+    /// Every text piece the plan would store. Removals store nothing and have
+    /// none.
     #[must_use]
     pub fn values(&self) -> Vec<PlanValue> {
-        self.steps
-            .iter()
-            .enumerate()
-            .flat_map(|(step, s)| {
-                s.change
-                    .properties()
-                    .iter()
-                    .enumerate()
-                    .map(move |(property, p)| PlanValue {
-                        at: ValueRef { step, property },
-                        text: p.value.clone(),
-                    })
-            })
-            .collect()
+        let mut values = Vec::new();
+        for (step, s) in self.steps.iter().enumerate() {
+            for (property, p) in s.change.properties().iter().enumerate() {
+                values.extend(text_pieces(&p.value).into_iter().enumerate().map(
+                    |(piece, text)| PlanValue {
+                        at: ValueRef {
+                            step,
+                            property,
+                            piece,
+                        },
+                        text,
+                    },
+                ));
+            }
+        }
+        values
+    }
+}
+
+/// One text piece of a value: where it sits, as a JSON pointer into the value
+/// (RFC 6901), and its text.
+struct Piece {
+    pointer: String,
+    text: String,
+}
+
+/// The one walk that numbers the text pieces of a value, depth first: every
+/// string, and every number as its text. Booleans and nulls carry no text.
+/// [`text_pieces`] and [`text_piece_mut`] both use it, so a piece index means
+/// the same piece in both.
+fn pieces(value: &Value) -> Vec<Piece> {
+    fn walk(value: &Value, pointer: &mut String, out: &mut Vec<Piece>) {
+        match value {
+            Value::String(text) => out.push(Piece {
+                pointer: pointer.clone(),
+                text: text.clone(),
+            }),
+            Value::Number(number) => out.push(Piece {
+                pointer: pointer.clone(),
+                text: number.to_string(),
+            }),
+            Value::Array(items) => {
+                for (index, item) in items.iter().enumerate() {
+                    let len = pointer.len();
+                    pointer.push('/');
+                    pointer.push_str(&index.to_string());
+                    walk(item, pointer, out);
+                    pointer.truncate(len);
+                }
+            }
+            Value::Object(fields) => {
+                for (key, field) in fields {
+                    let len = pointer.len();
+                    pointer.push('/');
+                    pointer.push_str(&key.replace('~', "~0").replace('/', "~1"));
+                    walk(field, pointer, out);
+                    pointer.truncate(len);
+                }
+            }
+            Value::Bool(_) | Value::Null => {}
+        }
+    }
+    let mut out = Vec::new();
+    walk(value, &mut String::new(), &mut out);
+    out
+}
+
+/// The text pieces of a value, in the order of the one walk that numbers them.
+#[must_use]
+pub fn text_pieces(value: &Value) -> Vec<String> {
+    pieces(value).into_iter().map(|piece| piece.text).collect()
+}
+
+/// The number of characters in all text pieces of a value together, counted
+/// without copying them, and only as far as `limit`: the count stops once it
+/// passes it.
+#[must_use]
+pub fn text_chars_up_to(value: &Value, limit: usize) -> usize {
+    fn walk(value: &Value, limit: usize, count: &mut usize) {
+        if *count > limit {
+            return;
+        }
+        match value {
+            Value::String(text) => *count += text.chars().count(),
+            Value::Number(number) => *count += number.to_string().len(),
+            Value::Array(items) => items.iter().for_each(|item| walk(item, limit, count)),
+            Value::Object(fields) => fields.values().for_each(|field| walk(field, limit, count)),
+            Value::Bool(_) | Value::Null => {}
+        }
+    }
+    let mut count = 0;
+    walk(value, limit, &mut count);
+    count
+}
+
+/// One text piece, open for redaction: a string can be edited, a number
+/// cannot. A caller gets no handle that could change the shape of the value,
+/// so the numbering of the other pieces stays put.
+#[domain_model]
+#[derive(Debug)]
+pub(crate) enum PieceMut<'v> {
+    Text(&'v mut String),
+    Number,
+}
+
+/// The `index`th text piece of a value, as the one walk numbers it.
+pub(crate) fn text_piece_mut(value: &mut Value, index: usize) -> Option<PieceMut<'_>> {
+    let pointer = pieces(value).into_iter().nth(index)?.pointer;
+    match value.pointer_mut(&pointer)? {
+        Value::String(text) => Some(PieceMut::Text(text)),
+        Value::Number(_) => Some(PieceMut::Number),
+        _ => None,
     }
 }

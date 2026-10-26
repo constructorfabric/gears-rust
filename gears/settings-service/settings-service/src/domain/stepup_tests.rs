@@ -1,4 +1,3 @@
-// Created: 2026-09-23 by Virtuozzo International GmbH
 //! The unverified payload reader: the compact shape and the size come before
 //! any decoding, and anything else is simply not a JWT.
 

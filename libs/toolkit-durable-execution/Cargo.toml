@@ -1,0 +1,69 @@
+[package]
+name = "cf-gears-toolkit-durable-execution"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "ToolKit library for typed durable workflows: checkpoints, fan-out, retries and saga compensation"
+readme = "README.md"
+keywords = ["constructorfabric", "cf-gears", "cf-gears-toolkit"]
+categories = ["asynchronous"]
+metadata.docs.rs.all-features = true
+
+[lib]
+name = "toolkit_durable_execution"
+
+[features]
+default = []
+# In-memory `testing::TestRuntime` for unit tests of consumer workflows.
+test-util = ["tokio/rt"]
+# PostgreSQL and subprocess recovery tests (testcontainers).
+integration = []
+
+[lints]
+workspace = true
+
+[dependencies]
+secrecy.workspace = true
+async-trait.workspace = true
+chrono.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+aws-lc-rs.workspace = true
+hex.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["macros", "time", "rt", "sync"] }
+tokio-util.workspace = true
+futures-util.workspace = true
+toolkit-db = { workspace = true, features = ["sqlite", "pg"] }
+toolkit-db-macros.workspace = true
+toolkit-security.workspace = true
+sea-orm.workspace = true
+sea-orm-migration.workspace = true
+uuid = { workspace = true, features = ["v4"] }
+parking_lot.workspace = true
+tracing.workspace = true
+anyhow.workspace = true
+apalis.workspace = true
+apalis-core.workspace = true
+apalis-postgres.workspace = true
+sqlx.workspace = true
+
+[dev-dependencies]
+# Examples host the engine in a hand-driven gear.
+toolkit = { package = "cf-gears-toolkit", path = "../toolkit" }
+toolkit-db = { workspace = true, features = ["test-support"] }
+test-containers.workspace = true
+testcontainers.workspace = true
+testcontainers-modules.workspace = true
+temp-env.workspace = true
+proptest.workspace = true
+trybuild.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
+
+[[example]]
+name = "contract_and_bindings"
+# Runs the exported-contract check with `cargo test`.
+test = true

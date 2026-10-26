@@ -439,8 +439,9 @@ async fn an_active_quota_on_a_removed_metric_is_flagged_and_bootstrap_completes(
     assert!(h.readiness.is_ready());
     assert_eq!(
         h.metric_registry.calls(),
-        1,
-        "each distinct bound metric is looked up once"
+        2,
+        "each distinct metric is looked up once: the one the catalogue admits, \
+         and the removed one an active Quota is still bound to"
     );
 }
 

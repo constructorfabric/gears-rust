@@ -1,0 +1,34 @@
+gdl_version = "1.0"
+
+# Every GDL field: https://github.com/constructorfabric/gearbox/blob/main/docs/gdl.md
+#
+# Gearbox product metadata for the quota-enforcement storage plugin.
+#
+# Fills quota-enforcement's storage point. The point is declared by
+# `implements`; this plugin's vendor and priority are read from source.
+
+gear(
+    deps = [],
+    source = git(url = "https://github.com/constructorfabric/gears-rust", path = "gears/system/quota-enforcement/plugins/quota-enforcement-storage-plugin"),
+    maturity = "experimental",
+    name = "Quota Enforcement Storage Plugin",
+    description = "Stores quota counters, reservations and policies in the gear's database.",
+    category = "core-functionality",
+    visibility = "internal",
+
+    package = cargo(
+        crate_name = "cf-gears-quota-enforcement-storage-plugin",
+        lib = "quota_enforcement_storage_plugin",
+        path = ".",
+    ),
+
+    # The role this crate is built for. Its `impl QuotaEnforcementStoragePluginV1`
+    # is wired once every storage primitive lands (docs/features/foundation.md),
+    # so Gearbox notes the missing impl (GBX0526) until then.
+    implements = "cf.core.qe.storage_plugin.v1~",
+
+    config_schema = config(exposes = ["vendor", "priority"]),
+
+    # `postgres` gates the PostgreSQL concurrency test suite only.
+    cargo_features = [],
+)

@@ -16,7 +16,7 @@ build whenever feasible.
 
 | Layer | Scope | Tooling | Feature gate | Runs in CI |
 |-------|-------|---------|--------------|------------|
-| **Unit** | Single function / struct / gear in isolation | `cargo test --workspace` | none (always compiled) | Every PR (`ci.yml` — `test` job, all OS) |
+| **Unit** | Single function / struct / gear in isolation | `cargo test --workspace` | none (always compiled) | Every PR on Ubuntu (`ci.yml` — `test` job); macOS and Windows nightly (`macos-windows-tests.yml`) |
 | **Integration** | Cross-crate or DB-backed logic (SQLite, Postgres, MySQL) | `cargo test -p <pkg> --features integration` | `#[cfg(feature = "integration")]` | Every PR (`ci.yml` — `integration` job, Ubuntu) |
 | **E2E** | Full HTTP request → response through a running server | pytest + httpx against `cf-gears-example-server` | n/a (Python tests) | PRs to `main`, nightly schedule (`e2e.yml`) |
 | **Fuzz** | Parser / validator robustness against arbitrary input | `cargo-fuzz` (libFuzzer) | nightly toolchain | PRs + nightly (`clusterfuzzlite.yml`) |
@@ -199,7 +199,7 @@ let container = test_containers::postgres_tagged("16-alpine").start().await?;
 ```
 
 Helpers: `postgres()`, `postgres_named()`, `postgres_tagged()`, `postgres_graph()`, `mysql()`,
-`timescaledb()`, `mariadb()`, `clickhouse()`.
+`redis()`, `timescaledb()`, `mariadb()`, `clickhouse()`.
 
 `timescaledb()`, `mariadb()` and `clickhouse()` return a `GenericImage` rather than a
 `ContainerRequest`: there is no `testcontainers-modules` image module for them, so the caller
@@ -220,6 +220,7 @@ An unset *or empty* variable means "use the pinned constant".
 | `GEARS_TEST_TIMESCALEDB_TAG` | `TIMESCALEDB_TAG` |
 | `GEARS_TEST_MARIADB_TAG` | `MARIADB_TAG` |
 | `GEARS_TEST_CLICKHOUSE_TAG` | `CLICKHOUSE_TAG` |
+| `GEARS_TEST_REDIS_TAG` | `REDIS_TAG` |
 
 ```bash
 GEARS_TEST_PG_TAG=16-alpine cargo nextest run -p cf-gears-toolkit-db --features pg,integration
@@ -456,7 +457,9 @@ Gear runtime settings are YAML-driven under `gears:<gear_name>:` with a `config`
 ```
 PR opened / updated
   ├── ci.yml
-  │     ├── test          — fmt + clippy + unit tests (Ubuntu, macOS, Windows)
+  │     ├── clippy        — clippy
+  │     ├── repo-checks   — repo file checks (gear names, release config)
+  │     ├── test          — unit tests (Ubuntu)
   │     ├── integration   — DB integration tests (Ubuntu)
   │     ├── test-fips     — FIPS verification / platform-specific FIPS test lanes
   │     ├── security      — cargo-deny
@@ -477,12 +480,74 @@ Additional quality workflows
   └── pr-reviewer-check.yml — reviewer assignment hygiene
 
 Nightly (schedule)
+  ├── macos-windows-tests.yml — unit tests on macOS and Windows (auto-creates issue on failure)
   ├── e2e.yml              — full E2E + specialized E2E lanes (auto-creates issue on failure)
   ├── clusterfuzzlite      — fuzz testing
   ├── codeql.yml           — scheduled code scanning
   ├── pr-governance.yml    — governance / follow-up automation
   └── pr-reviewer-check.yml — reviewer assignment checks
 ```
+
+### 7.4 CI build cache (sccache)
+
+CI jobs compile with sccache, set up by `.github/actions/sccache`. It uses the first of
+these that works:
+
+1. S3-compatible storage (AWS S3, Cloudflare R2, MinIO and others), if set up as below.
+2. The GitHub Actions cache. This is the default.
+3. No cache. The job builds with plain rustc. Cache problems never fail a job.
+
+Only runs on `main` write to the cache. Other runs, PRs included, only read it, so PRs
+don't fill the 10 GB GitHub Actions cache. Each job log has a `sccache backend:` line with
+the backend and its mode. A `main` run that can't write (for example, with a wrong key)
+also shows a warning.
+
+#### S3 setup
+
+Add these repository variables (Settings > Secrets and variables > Actions > Variables):
+
+| Variable | Value |
+|----------|-------|
+| `S3_BUCKET` | bucket name |
+| `S3_ENDPOINT` | empty for AWS S3, else the provider URL, like `https://<account>.r2.cloudflarestorage.com` for R2 |
+| `S3_REGION` | AWS S3: the bucket region. R2: `auto`. Default: `us-east-1` |
+
+Put the keys in two environments (Settings > Environments), each with the secrets
+`S3_ACCESS_KEY_ID` and `S3_SECRET_ACCESS_KEY`:
+
+| Environment | Key | Deployment branches |
+|-------------|-----|---------------------|
+| `ci-cache-write` | read and write | `main` only |
+| `ci-cache-read` | read only, same bucket | any |
+
+Jobs on `main` use `ci-cache-write`. Other runs use `ci-cache-read`. PR code can read its
+job's key, so only the branch rule keeps the write key out of PRs.
+
+Jobs use these environments only when `S3_BUCKET` is set. Create both environments
+first, then set `S3_BUCKET`. A job that names a missing environment fails before it starts.
+
+- Don't add reviewers or a wait timer to `ci-cache-read`. Every PR job would wait.
+- Don't add the keys as repository or organization secrets. Then every job could read them.
+
+Treat the write key like a deploy key. CI builds binaries from cached crates, so anyone
+with this key can change what later CI runs execute. To rotate a key, put a new one with
+the same access in the environment. Revoke the old one after a green run.
+
+PRs from forks and Dependabot get no secrets, so they use the GitHub Actions cache. With S3
+set up, `main` doesn't write to that cache, so these runs compile everything.
+
+sccache never deletes objects. Add a bucket rule that deletes objects under
+`gears-rust/sccache/` 30 days after they were written. Each crate then misses the cache
+once a month and is written again.
+
+On Linux with S3, the action turns off TCP timestamps. Some S3 servers close each
+connection after one request. Behind the runners' shared NAT, about 3% of new connections
+then stalled for about 20 s. Turning timestamps off halved Ubuntu test job time.
+
+#### Keep the cache keys stable
+
+sccache puts every `CARGO_*` environment variable and `RUSTFLAGS` in its Rust cache keys.
+Adding or changing one makes the job's next run compile everything.
 
 ---
 

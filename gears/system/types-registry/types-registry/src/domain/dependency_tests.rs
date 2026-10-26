@@ -2,7 +2,7 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-use gts::GtsId;
+use gts::{GtsId, SELF_ID_REF, X_GTS_INSTANCE_REF, X_GTS_TYPE_REF};
 use serde_json::{Value, json};
 use toolkit_gts::gts_id;
 
@@ -94,32 +94,46 @@ fn a_malformed_ref_is_reported_rather_than_silently_dropped() {
 }
 
 #[test]
-fn an_x_gts_ref_is_not_a_dependency_edge_in_any_of_its_forms() {
-    for value in [
-        OTHER,                // an exact identifier
-        &format!("{OTHER}*"), // a wildcard pattern over it
-        "gts.*",              // a pattern naming nothing valid
-        "/$id",               // a GTS §9.6 relative pointer
-    ] {
+fn an_entity_ref_is_not_a_dependency_edge_in_any_of_its_forms() {
+    let pattern = format!("{OTHER}*");
+    let type_operands = [
+        OTHER,       // an exact identifier
+        &pattern,    // a wildcard pattern over it
+        "gts.*",     // a pattern naming nothing valid
+        SELF_ID_REF, // the self-id operand
+    ];
+    let cases = type_operands
+        .iter()
+        .map(|value| (X_GTS_TYPE_REF, *value))
+        .chain(
+            type_operands
+                .iter()
+                .map(|value| (X_GTS_INSTANCE_REF, *value)),
+        )
+        // Only an instance reference may name a concrete Instance.
+        .chain([(X_GTS_INSTANCE_REF, INSTANCE)]);
+    for (keyword, value) in cases {
         let doc = schema(
             ROOT,
-            json!({ "properties": { "role": { "type": "string", "x-gts-ref": value } } }),
+            json!({ "properties": { "role": { "type": "string", keyword: value } } }),
         );
         assert!(
             edges(ROOT, &doc).is_empty(),
-            "`x-gts-ref: {value}` must produce no edge: the keyword is enforced by \
+            "`{keyword}: {value}` must produce no edge: the keyword is enforced by \
              matching the value string, so it never consults the registry",
         );
     }
 }
 
 #[test]
-fn an_x_gts_ref_inside_a_data_valued_keyword_is_data() {
-    let doc = schema(
-        ROOT,
-        json!({ "properties": { "a": { "const": { "x-gts-ref": OTHER } } } }),
-    );
-    assert!(edges(ROOT, &doc).is_empty());
+fn an_entity_ref_inside_a_data_valued_keyword_is_data() {
+    for keyword in [X_GTS_TYPE_REF, X_GTS_INSTANCE_REF] {
+        let doc = schema(
+            ROOT,
+            json!({ "properties": { "a": { "const": { keyword: OTHER } } } }),
+        );
+        assert!(edges(ROOT, &doc).is_empty(), "{keyword}");
+    }
 }
 
 #[test]
@@ -159,7 +173,7 @@ fn an_instance_values_ref_shaped_data_is_data_and_not_an_edge() {
     // Schema keywords inside an Instance value create no edges.
     let value = json!({
         "$ref": OTHER,
-        "x-gts-ref": "not-an-identifier",
+        X_GTS_INSTANCE_REF: "not-an-identifier",
         "nested": { "$ref": format!("gts://{THIRD}") },
     });
     assert_eq!(
@@ -183,14 +197,14 @@ fn the_edge_kinds_over_their_fixtures() {
     let cases = vec![
         Case {
             what: "a derived schema with a `$ref`: both kinds a schema can carry, and the \
-                   `x-gts-ref` beside them adding neither",
+                   entity reference beside them adding neither",
             gts_id: DERIVED,
             content: schema(
                 DERIVED,
                 json!({
                     "properties": {
                         "shape": { "$ref": format!("gts://{OTHER}") },
-                        "role": { "type": "string", "x-gts-ref": THIRD },
+                        "role": { "type": "string", X_GTS_INSTANCE_REF: THIRD },
                     },
                 }),
             ),
@@ -240,7 +254,7 @@ fn only_the_ref_targets_seed_the_closure() {
         json!({
             "properties": {
                 "shape": { "$ref": format!("gts://{OTHER}") },
-                "role": { "type": "string", "x-gts-ref": THIRD },
+                "role": { "type": "string", X_GTS_INSTANCE_REF: THIRD },
             },
         }),
     );

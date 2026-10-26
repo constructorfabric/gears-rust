@@ -15,7 +15,8 @@ use super::{
 use crate::config::MetricsConfig;
 use crate::domain::ports::lifecycle_gauges::{LifecycleCounts, LifecycleGaugeSink};
 use crate::domain::ports::metrics::{
-    DenialReason, QeMetrics, REASON_LABEL, SURFACE_LABEL, ValidationReason, ValidationSurface,
+    DenialReason, OperationKind, QeMetrics, REASON_LABEL, RetentionTable, SURFACE_LABEL,
+    ValidationReason, ValidationSurface,
 };
 use crate::infra::lifecycle_gauges::{
     LifecycleGaugeCell, QUOTA_CAP_UNBOUNDED_TOTAL, QUOTA_CAP_ZERO_TOTAL,
@@ -213,6 +214,20 @@ fn every_reason_label_is_a_distinct_snake_case_token() {
     );
     let reasons: Vec<&str> = ValidationReason::ALL.iter().map(|r| r.as_label()).collect();
     assert_distinct_snake_case(&reasons);
+    // The hot path's two label sets are closed for the same reason: a denial
+    // reason authored in a CEL policy, or an operation kind, must never widen
+    // the cardinality of an instrument.
+    let operations: Vec<&str> = OperationKind::ALL.iter().map(|o| o.as_label()).collect();
+    assert_distinct_snake_case(&operations);
+    assert_eq!(operations, ["debit", "credit", "rollback", "preview"]);
+    let tables: Vec<&str> = RetentionTable::ALL.iter().map(|t| t.as_str()).collect();
+    assert_distinct_snake_case(&tables);
+    assert_eq!(tables, ["idempotency", "operation_log"]);
+    assert_eq!(
+        DenialReason::from_decision_reason("SOMETHING_A_POLICY_AUTHORED").as_label(),
+        "engine_denied",
+        "an engine-authored reason collapses instead of opening the label set"
+    );
 }
 
 #[test]

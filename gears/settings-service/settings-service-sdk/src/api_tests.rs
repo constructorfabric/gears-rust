@@ -1,4 +1,3 @@
-// Created: 2026-08-25 by Virtuozzo International GmbH
 //! Tests for the client trait contracts.
 //!
 //! These pin promises the signatures make but cannot enforce: that a bulk read

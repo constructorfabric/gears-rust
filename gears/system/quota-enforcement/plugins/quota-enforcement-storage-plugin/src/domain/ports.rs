@@ -5,11 +5,14 @@ use std::collections::HashSet;
 
 use async_trait::async_trait;
 use quota_enforcement_sdk::{
-    ActiveQuotaCounts, ConfigDefaults, DeactivateOutcome, NotificationEvent, PageRequest,
-    PageResult, PolicyDraft, PolicyId, PolicyScope, PolicyUpdate, PolicyVersion, PolicyVersionMeta,
-    ProjectionBinding, Quota, QuotaDraft, QuotaFilter, QuotaId, QuotaPatch, StorageError,
+    ActiveQuotaCounts, ApplicableQuotas, AppliedMutation, ConfigDefaults, DeactivateOutcome,
+    EvaluatedDebit, EvaluatedMutation, IdempotencyRecord, IdempotencyScope, IdempotencyWrite,
+    NotificationEvent, PageRequest, PageResult, PartialIdempotencyWrite, PolicyDraft, PolicyId,
+    PolicyScope, PolicyUpdate, PolicyVersion, PolicyVersionMeta, ProjectionBinding, Quota,
+    QuotaDraft, QuotaFilter, QuotaId, QuotaPatch, QuotaSnapshot, RollbackTarget, StorageError,
     TransitionOutcome,
 };
+use time::OffsetDateTime;
 use toolkit_macros::domain_model;
 use toolkit_security::{AccessScope, SecurityContext};
 use uuid::Uuid;
@@ -192,6 +195,105 @@ pub trait QuotaStore: Send + Sync {
 
     /// Active-Quota counts behind the lifecycle gauges.
     async fn read_active_quota_counts(&self) -> Result<ActiveQuotaCounts, StoreError>;
+}
+
+/// The consumption primitives: counter mutations, their replay records, and the
+/// snapshot read.
+///
+/// Like [`PolicyStore`], this port speaks the contract's own `StorageError`
+/// rather than [`StoreError`]: its failure modes are the contract's, so a
+/// translation layer would only restate them.
+#[async_trait]
+pub trait ConsumptionStore: Send + Sync {
+    /// Evaluate the applicable policy against the locked rows and apply the
+    /// plan it produced, atomically with the record and the events.
+    ///
+    /// # Errors
+    ///
+    /// The contract's variants for `apply_debit_plan`.
+    async fn apply_debit_plan(
+        &self,
+        ctx: &SecurityContext,
+        scope: &AccessScope,
+        mutation: &EvaluatedMutation<'_>,
+        events: &[NotificationEvent],
+    ) -> Result<TransitionOutcome<EvaluatedDebit>, StorageError>;
+
+    /// Return consumption to one Quota, deriving the idempotency scope under
+    /// the row lock.
+    ///
+    /// # Errors
+    ///
+    /// The contract's variants for `apply_credit`.
+    async fn apply_credit(
+        &self,
+        ctx: &SecurityContext,
+        scope: &AccessScope,
+        quota_id: QuotaId,
+        amount: u64,
+        idempotency: &PartialIdempotencyWrite,
+        events: &[NotificationEvent],
+    ) -> Result<TransitionOutcome<AppliedMutation>, StorageError>;
+
+    /// Reverse the committed debit the target names, against its acquisition
+    /// period.
+    ///
+    /// # Errors
+    ///
+    /// The contract's variants for `apply_rollback`.
+    async fn apply_rollback(
+        &self,
+        ctx: &SecurityContext,
+        scope: &AccessScope,
+        target: &RollbackTarget,
+        idempotency: &IdempotencyWrite,
+        events: &[NotificationEvent],
+    ) -> Result<TransitionOutcome<AppliedMutation>, StorageError>;
+
+    /// Per-Quota state of one applicable set, materializing a missing current
+    /// period row and nothing else (the I3 exception).
+    ///
+    /// # Errors
+    ///
+    /// `Unavailable` when the backend cannot answer.
+    async fn read_quota_snapshot(
+        &self,
+        ctx: &SecurityContext,
+        scope: &AccessScope,
+        applicable: &ApplicableQuotas,
+    ) -> Result<Vec<QuotaSnapshot>, StorageError>;
+
+    /// The unexpired record under `scope_of`, if one exists.
+    ///
+    /// # Errors
+    ///
+    /// `Unavailable` when the backend cannot answer.
+    async fn lookup_idempotency(
+        &self,
+        scope_of: &IdempotencyScope,
+    ) -> Result<Option<IdempotencyRecord>, StorageError>;
+
+    /// Delete up to `batch_size` records expired before `before`.
+    ///
+    /// # Errors
+    ///
+    /// `Unavailable` when the backend cannot answer.
+    async fn reclaim_expired_idempotency(
+        &self,
+        batch_size: u32,
+        before: OffsetDateTime,
+    ) -> Result<u64, StorageError>;
+
+    /// Delete up to `batch_size` operation-log rows older than `before`.
+    ///
+    /// # Errors
+    ///
+    /// `Unavailable` when the backend cannot answer.
+    async fn reclaim_operation_log(
+        &self,
+        batch_size: u32,
+        before: OffsetDateTime,
+    ) -> Result<u64, StorageError>;
 }
 
 /// Versioned platform policies. Every mutation is one transaction that moves

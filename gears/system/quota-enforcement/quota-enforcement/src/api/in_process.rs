@@ -1,5 +1,6 @@
 //! The in-process `QuotaManagerClientV1`: the SDK client trait over the domain
-//! service, registered in `ClientHub` at `init`.
+//! service, registered in `ClientHub` at `init`. It carries Quota management
+//! and credit, the management-plane counter correction.
 //!
 //! It enters the domain exactly where REST does (`Service::quotas`), so both
 //! transports share one admission boundary. Before bootstrap binds the
@@ -74,6 +75,14 @@ impl QuotaManagerClientV1 for InProcessQuotaManager {
         Ok(quotas
             .list(ctx, ListQuotasRequest::from((filter, page)))
             .await?)
+    }
+
+    async fn credit(
+        &self,
+        ctx: &SecurityContext,
+        request: quota_enforcement_sdk::CreditRequest,
+    ) -> Result<quota_enforcement_sdk::Decision, QuotaEnforcementError> {
+        Ok(self.service.operations()?.credit(ctx, request).await?)
     }
 }
 
@@ -150,5 +159,48 @@ impl quota_enforcement_sdk::QuotaOperatorClientV1 for InProcessQuotaOperator {
             .policies()?
             .list(ctx, &id, Some(page.limit), page.cursor)
             .await?)
+    }
+}
+
+/// The gear's own implementation of the consumer client.
+///
+/// It enters the domain at the same admission step the REST surface does, so
+/// an in-process caller and an HTTP caller share one authorization boundary.
+pub struct InProcessQuotaEnforcement {
+    service: Arc<Service>,
+}
+
+impl InProcessQuotaEnforcement {
+    /// Wrap the domain service.
+    #[must_use]
+    pub fn new(service: Arc<Service>) -> Self {
+        Self { service }
+    }
+}
+
+#[async_trait]
+impl quota_enforcement_sdk::QuotaEnforcementClientV1 for InProcessQuotaEnforcement {
+    async fn debit(
+        &self,
+        ctx: &SecurityContext,
+        request: quota_enforcement_sdk::DebitRequest,
+    ) -> Result<quota_enforcement_sdk::Decision, QuotaEnforcementError> {
+        Ok(self.service.operations()?.debit(ctx, request).await?)
+    }
+
+    async fn rollback(
+        &self,
+        ctx: &SecurityContext,
+        request: quota_enforcement_sdk::RollbackRequest,
+    ) -> Result<quota_enforcement_sdk::Decision, QuotaEnforcementError> {
+        Ok(self.service.operations()?.rollback(ctx, request).await?)
+    }
+
+    async fn evaluate_preview(
+        &self,
+        ctx: &SecurityContext,
+        request: quota_enforcement_sdk::PreviewRequest,
+    ) -> Result<quota_enforcement_sdk::DecisionPreview, QuotaEnforcementError> {
+        Ok(self.service.operations()?.preview(ctx, request).await?)
     }
 }

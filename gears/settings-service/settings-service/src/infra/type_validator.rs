@@ -1,4 +1,3 @@
-// Created: 2026-09-06 by Virtuozzo International GmbH
 // @cpt-dod:cpt-cf-settings-service-dod-typed-value-validation-component:p1
 // @cpt-dod:cpt-cf-settings-service-dod-typed-value-validation-traits:p1
 //! The Type Validator over the types registry.

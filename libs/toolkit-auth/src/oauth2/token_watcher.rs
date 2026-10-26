@@ -1,17 +1,23 @@
 //! Background token refresh with jitter and exponential backoff.
 //!
-//! [`TokenWatcher`] performs an initial token fetch, then spawns a background
-//! `tokio` task that proactively refreshes the token before it goes stale.
-//! The latest token is stored in an [`ArcSwap`] for lock-free reads.
+//! [`TokenWatcher`] starts acquisition lazily on first use.
+//! One background task retries acquisition and refreshes cached tokens.
+//! The latest token is stored in an `ArcSwapOption` for lock-free reads.
 //!
 //! The public surface is intentionally minimal — only [`CachedToken`],
 //! [`TokenWatcher`], and [`TokenStatus`] are used by the rest of the crate.
 
 use std::fmt;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use tokio::time::Instant;
 
-use arc_swap::ArcSwap;
+use arc_swap::ArcSwapOption;
+use parking_lot::Mutex;
+use tokio::sync::watch;
+use tokio_util::sync::CancellationToken;
+
+use super::error::TokenError;
 use rand::RngExt as _;
 use toolkit_utils::SecretString;
 
@@ -125,7 +131,7 @@ impl CachedToken {
 // ---------------------------------------------------------------------------
 
 /// Configuration for the background refresh watcher.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct WatcherConfig {
     /// Maximum random jitter subtracted from the normal pre-stale refresh
     /// delay. Not applied to retry backoff after refresh failures.
@@ -173,159 +179,249 @@ pub struct FetchedToken {
     pub freshness_ratio: f64,
 }
 
-/// A handle to the background-refreshed token cache.
-///
-/// Internally stores the latest [`CachedToken`] in an `ArcSwap` for lock-free
-/// reads, and drives a `tokio::spawn`ed loop that refreshes the token before
-/// it goes stale.
+/// One acquisition result retained independently for each group of waiters.
+type AttemptResult = Option<Result<Arc<CachedToken>, TokenError>>;
+
+/// State serialized between invalidation and publication by the worker.
+struct Control {
+    attempt: watch::Sender<AttemptResult>,
+    refresh_now: bool,
+}
+
+/// Shared token worker. The task owns fields, never this handle, so final drop cancels it.
 pub struct TokenWatcher {
-    current: Arc<ArcSwap<CachedToken>>,
-    /// Held so dropping the watcher signals the background task to shut down.
-    _shutdown: tokio::sync::oneshot::Sender<()>,
+    current: Arc<ArcSwapOption<CachedToken>>,
+    control: Arc<Mutex<Control>>,
+    start: Arc<tokio::sync::Notify>,
+    wake: watch::Sender<()>,
+    cancel: CancellationToken,
+    task: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
+
+impl Drop for TokenWatcher {
+    /// Best-effort cancellation; explicit shutdown also joins the task.
+    fn drop(&mut self) {
+        self.cancel.cancel();
+    }
 }
 
 impl TokenWatcher {
-    /// Perform the initial fetch, cache the token, and spawn the background
-    /// refresh loop.
-    ///
-    /// `source` is moved into the background task and used for all subsequent
-    /// refreshes. The initial fetch is performed inline so that startup errors
-    /// propagate to the caller.
-    ///
-    /// # Errors
-    ///
-    /// Propagates the error from the initial `source.request_token()` call —
-    /// the watcher is not created if the first token cannot be obtained.
-    pub(crate) async fn spawn(
-        mut source: super::source::OAuthTokenSource,
-        config: WatcherConfig,
-    ) -> Result<Self, super::error::TokenError> {
-        // Initial fetch — fail fast if the token endpoint is unreachable.
-        let initial = source.request_token().await?;
-        let cached = CachedToken::new(
-            initial.access_token,
-            initial.lifetime_secs,
-            initial.freshness_ratio,
-        )?;
-        let current = Arc::new(ArcSwap::from_pointee(cached));
+    /// Create an idle worker using the shared HTTP source and discovery cache.
+    pub(crate) fn new(source: super::source::OAuthTokenSource, config: WatcherConfig) -> Self {
+        Self::run_with_fetch(
+            move || {
+                let mut source = source.clone();
+                async move { source.request_token().await }
+            },
+            config,
+        )
+    }
 
-        let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-
-        let current_for_task = Arc::clone(&current);
-        tokio::spawn(async move {
-            let mut consecutive_errors: u32 = 0;
-
+    /// Run one acquisition task with an injectable source for deterministic tests.
+    fn run_with_fetch<F, Fut>(mut fetch: F, config: WatcherConfig) -> Self
+    where
+        F: FnMut() -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = Result<FetchedToken, TokenError>> + Send,
+    {
+        let current = Arc::new(ArcSwapOption::empty());
+        let (attempt, _) = watch::channel(None);
+        let control = Arc::new(Mutex::new(Control {
+            attempt,
+            refresh_now: false,
+        }));
+        let start = Arc::new(tokio::sync::Notify::new());
+        let (wake, mut wake_rx) = watch::channel(());
+        let cancel = CancellationToken::new();
+        let task_cache = current.clone();
+        let task_control = control.clone();
+        let task_start = start.clone();
+        let task_cancel = cancel.clone();
+        let task = tokio::spawn(async move {
+            // Also wakes waiters if the worker exits unexpectedly.
+            let _cancel_on_exit = task_cancel.clone().drop_guard();
+            tokio::select! {
+                biased;
+                () = task_cancel.cancelled() => return,
+                () = task_start.notified() => {}
+            }
+            let mut errors = 0_u32;
             loop {
-                let guard = current_for_task.load();
-                let base_delay = guard.time_until_stale();
-                let until_expired = guard.time_until_expired();
-
-                // Cap jitter to base_delay so it never creates a zero-delay
-                // refresh for short-lived tokens.
-                let jitter_cap = config.jitter_max.min(base_delay);
-                let jitter = random_jitter(jitter_cap);
-                let delay = base_delay.saturating_sub(jitter);
-
-                let sleep_dur = if consecutive_errors > 0 {
-                    let backoff = compute_backoff(
-                        config.min_refresh_period,
-                        config.max_backoff,
-                        config.backoff_multiplier,
-                        consecutive_errors,
-                    );
-                    // Use backoff directly — but cap to time-until-expired so
-                    // we don't sleep past expiry.
-                    if until_expired.is_zero() {
-                        tracing::warn!(
-                            "OAuth2 token watcher: cached token has expired, refresh still failing"
-                        );
-                        backoff
+                let delay = {
+                    let mut state = task_control.lock();
+                    wake_rx.borrow_and_update();
+                    if std::mem::take(&mut state.refresh_now) {
+                        errors = 0;
+                        Duration::ZERO
                     } else {
-                        backoff.min(until_expired)
+                        refresh_delay(task_cache.load().as_deref(), &config, errors)
                     }
-                } else {
-                    delay
                 };
-
-                // Drop the ArcSwap guard before sleeping.
-                drop(guard);
-
                 tokio::select! {
-                    () = tokio::time::sleep(sleep_dur) => {}
-                    _ = &mut shutdown_rx => {
-                        tracing::debug!("OAuth2 token watcher: shutdown signal received");
-                        return;
-                    }
+                    biased;
+                    () = task_cancel.cancelled() => return,
+                    _ = wake_rx.changed() => {},
+                    () = tokio::time::sleep(delay) => {}
                 }
-
-                // Attempt refresh — also listen for shutdown so a long
-                // request_token() doesn't block drop.
-                let refresh_result = tokio::select! {
-                    result = source.request_token() => result,
-                    _ = &mut shutdown_rx => {
-                        tracing::debug!("OAuth2 token watcher: shutdown signal received");
-                        return;
+                {
+                    let mut state = task_control.lock();
+                    if std::mem::take(&mut state.refresh_now) {
+                        errors = 0;
                     }
+                    wake_rx.borrow_and_update();
+                }
+                let result = tokio::select! {
+                    biased;
+                    () = task_cancel.cancelled() => return,
+                    result = fetch() => result.and_then(cache_fetched),
                 };
-
-                match refresh_result {
-                    Ok(fetched) => {
-                        match CachedToken::new(
-                            fetched.access_token,
-                            fetched.lifetime_secs,
-                            fetched.freshness_ratio,
-                        ) {
-                            Ok(new_cached) => {
-                                consecutive_errors = 0;
-                                current_for_task.store(Arc::new(new_cached));
-                                tracing::debug!(
-                                    "OAuth2 token watcher: refreshed token successfully"
-                                );
-                            }
-                            Err(e) => {
-                                consecutive_errors = consecutive_errors.saturating_add(1);
-                                tracing::warn!(
-                                    error = %e,
-                                    consecutive_errors,
-                                    "OAuth2 token watcher: server returned invalid token"
-                                );
-                            }
-                        }
+                let mut state = task_control.lock();
+                // Invalidation during a fetch joins that fetch. Do not let its
+                // wakeup trigger a second exchange after this one completes.
+                state.refresh_now = false;
+                wake_rx.borrow_and_update();
+                match &result {
+                    Ok(token) => {
+                        errors = 0;
+                        task_cache.store(Some(token.clone()));
                     }
-                    Err(e) => {
-                        consecutive_errors = consecutive_errors.saturating_add(1);
-                        tracing::warn!(
-                            error = %e,
-                            consecutive_errors,
-                            "OAuth2 token watcher: refresh failed"
-                        );
+                    Err(error) => {
+                        errors = errors.saturating_add(1);
+                        tracing::warn!(%error, errors, "OAuth2 token acquisition failed");
                     }
                 }
+                let (next, _) = watch::channel(None);
+                let finished = std::mem::replace(&mut state.attempt, next);
+                finished.send_replace(Some(result));
             }
         });
-
-        Ok(Self {
+        Self {
             current,
-            _shutdown: shutdown_tx,
-        })
+            control,
+            start,
+            wake,
+            cancel,
+            task: tokio::sync::Mutex::new(Some(task)),
+        }
     }
 
-    /// Read the current cached token (lock-free).
-    ///
-    /// Returns the token if it is [`Fresh`](TokenStatus::Fresh) or
-    /// [`Stale`](TokenStatus::Stale). Returns an error if the token has
-    /// [`Expired`](TokenStatus::Expired).
-    pub(crate) fn valid_token(
-        &self,
-    ) -> Result<arc_swap::Guard<Arc<CachedToken>>, super::error::TokenError> {
-        let guard = self.current.load();
-        if matches!(guard.token_status(), TokenStatus::Expired) {
-            return Err(super::error::TokenError::Unavailable(
-                "token expired, refresh pending".into(),
-            ));
+    /// Return a usable cache entry or await one shared attempt, respecting backoff.
+    pub(crate) async fn get(&self) -> Result<SecretString, TokenError> {
+        if self.cancel.is_cancelled() {
+            return Err(TokenError::Shutdown);
         }
-        Ok(guard)
+        if let Some(token) = self.current.load().as_ref()
+            && token.token_status() != TokenStatus::Expired
+        {
+            return Ok(SecretString::new(token.access_token()));
+        }
+        let receiver = {
+            let state = self.control.lock();
+            // A fetch may have finished while this caller took the lock.
+            if let Some(token) = self.current.load().as_ref()
+                && token.token_status() != TokenStatus::Expired
+            {
+                return Ok(SecretString::new(token.access_token()));
+            }
+            state.attempt.subscribe()
+        };
+        self.start.notify_one();
+        self.wait_attempt(receiver).await
     }
+
+    /// Discard the cached credential and share the current or next acquisition.
+    /// An empty cache means invalidation/acquisition is already pending; its
+    /// backoff is preserved. Failed replacement never restores the discarded token.
+    pub(crate) async fn invalidate(&self) -> Result<(), TokenError> {
+        if self.cancel.is_cancelled() {
+            return Err(TokenError::Shutdown);
+        }
+        let receiver = {
+            let mut state = self.control.lock();
+            if self.current.load().is_some() {
+                self.current.store(None);
+                state.refresh_now = true;
+                self.wake.send_replace(());
+            }
+            state.attempt.subscribe()
+        };
+        self.start.notify_one();
+        self.wait_attempt(receiver).await.map(|_| ())
+    }
+
+    /// Await exactly one attempt, prioritizing shutdown over cached results.
+    async fn wait_attempt(
+        &self,
+        mut receiver: watch::Receiver<AttemptResult>,
+    ) -> Result<SecretString, TokenError> {
+        loop {
+            let outcome = tokio::select! {
+                biased;
+                () = self.cancel.cancelled() => return Err(TokenError::Shutdown),
+                outcome = receiver.wait_for(Option::is_some) => outcome.map_err(|_| TokenError::Shutdown)?.clone(),
+            };
+            match outcome {
+                Some(Ok(_)) => {
+                    let state = self.control.lock();
+                    // A completed success may have been invalidated while this
+                    // waiter was asleep. Only deliver a currently usable token.
+                    if let Some(token) = self.current.load().as_ref()
+                        && token.token_status() != TokenStatus::Expired
+                    {
+                        return Ok(SecretString::new(token.access_token()));
+                    }
+                    receiver = state.attempt.subscribe();
+                }
+                Some(Err(error)) => return Err(error),
+                None => return Err(TokenError::Shutdown),
+            }
+        }
+    }
+
+    /// Stop all clones and wait for the task to exit. Joining is cancellation-safe:
+    /// the handle stays in the mutex if this particular shutdown future is dropped.
+    pub(crate) async fn shutdown(&self) {
+        self.cancel.cancel();
+        let mut task = self.task.lock().await;
+        if let Some(handle) = task.as_mut() {
+            if let Err(error) = handle.await {
+                tracing::error!(%error, "OAuth2 token worker failed during shutdown");
+            }
+            *task = None;
+        }
+    }
+}
+
+/// Validate a fetched token before publishing it to readers and waiters.
+fn cache_fetched(fetched: FetchedToken) -> Result<Arc<CachedToken>, TokenError> {
+    CachedToken::new(
+        fetched.access_token,
+        fetched.lifetime_secs,
+        fetched.freshness_ratio,
+    )
+    .map(Arc::new)
+}
+
+/// Use bounded acquisition retries without a usable token, otherwise the refresh policy.
+fn refresh_delay(token: Option<&CachedToken>, config: &WatcherConfig, errors: u32) -> Duration {
+    let Some(token) = token.filter(|token| token.token_status() != TokenStatus::Expired) else {
+        return if errors == 0 {
+            Duration::ZERO
+        } else {
+            compute_backoff(Duration::from_secs(1), Duration::from_secs(30), 2, errors)
+        };
+    };
+    if errors > 0 {
+        let backoff = compute_backoff(
+            config.min_refresh_period,
+            config.max_backoff,
+            config.backoff_multiplier,
+            errors,
+        );
+        let until_expired = token.time_until_expired();
+        return backoff.min(until_expired);
+    }
+    let delay = token.time_until_stale();
+    delay.saturating_sub(random_jitter(config.jitter_max.min(delay)))
 }
 
 /// Compute a random jitter duration in `[0, max)`.
@@ -504,10 +600,15 @@ mod tests {
         assert_eq!(b, Duration::from_secs(30));
     }
 
-    // -- TokenWatcher::spawn --------------------------------------------------
+    // -- TokenWatcher::new --------------------------------------------------
     //
-    // Integration tests for TokenWatcher::spawn live in token.rs (they use
+    // Integration tests for TokenWatcher::new live in token.rs (they use
     // httpmock to provide a real OAuthTokenSource). The tests here cover
-    // the unit-level helpers; the token.rs tests cover the full spawn +
+    // the unit-level helpers; the token.rs tests cover the full acquisition +
     // refresh + invalidate lifecycle.
 }
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+#[path = "token_watcher_lifecycle_tests.rs"]
+mod lifecycle_tests;

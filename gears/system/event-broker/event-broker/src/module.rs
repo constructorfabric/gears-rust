@@ -88,9 +88,10 @@ impl DeploymentMode {
     }
 }
 
+#[toolkit::consumes(contract = authz_resolver_sdk::AuthZResolverApi, from = "authz-resolver")]
 #[toolkit::gear(
     name = "event-broker",
-    deps = [cluster, authz_resolver, types_registry],
+    deps = [cluster, types_registry],
     capabilities = [db, rest, stateful],
     lifecycle(entry = "serve", stop_timeout = "30s")
 )]

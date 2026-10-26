@@ -271,12 +271,12 @@ async def test_only_the_current_revisions_references_protect_a_target(
 
 
 @pytest.mark.scenario("TR-DEL-211")
-async def test_an_x_gts_ref_constraint_does_not_protect_its_named_entity(
+async def test_an_entity_reference_does_not_protect_its_named_entity(
     registry_http, registry_api_path, deletion_fixture, given_registered
 ):
-    """`x-gts-ref` validates a value's spelling; it is no edge and causes no refresh."""
+    """`x-gts-instance-ref` validates a value's spelling; it is no edge and causes no refresh."""
     person = deletion_fixture("person_schema")
-    holder = deletion_fixture("person_x_gts_ref_schema")
+    holder = deletion_fixture("person_entity_ref_schema")
     await given_registered(person, holder)
     before = await assert_exact_entity(
         registry_http, registry_api_path, holder, schema_entity(holder, 1)

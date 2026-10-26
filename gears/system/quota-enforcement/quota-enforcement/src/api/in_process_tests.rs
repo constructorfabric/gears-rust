@@ -16,7 +16,7 @@ use super::InProcessQuotaManager;
 use crate::domain::Service;
 use crate::domain::admission::Admission;
 use crate::domain::bootstrap::Bound;
-use crate::domain::catalog::{CatalogBuilder, CatalogConfig};
+use crate::domain::catalog::{CatalogBuilder, CatalogConfig, MetricClassifications};
 use crate::domain::quotas::QuotaLimits;
 use crate::domain::readiness::Readiness;
 use crate::test_support::{
@@ -63,6 +63,11 @@ fn unbound_service() -> Arc<Service> {
             list_max_ids: 100,
         },
         crate::test_support::policy_limits(),
+        crate::domain::service::OperationsRuntime {
+            cache_entries: 16,
+            cache_ttl: std::time::Duration::from_secs(5),
+            preparation_max_attempts: std::num::NonZeroU32::new(3).expect("attempts"),
+        },
     ))
 }
 
@@ -89,6 +94,7 @@ async fn bound_service() -> Arc<Service> {
             catalog: Arc::new(catalog),
             registry,
             metric_registry: Arc::new(FakeMetricRegistry::classified()),
+            classifications: Arc::new(MetricClassifications::default()),
         })
         .expect("bind");
     service
@@ -201,4 +207,41 @@ async fn a_caller_supplied_constraint_contract_is_rejected_before_the_lookup() {
         "{err:?}"
     );
     assert_eq!(status(err), 400);
+}
+
+#[tokio::test]
+async fn credit_is_a_manager_operation_through_the_same_domain_path() {
+    let client = InProcessQuotaManager::new(unbound_service());
+    let err = client
+        .credit(
+            &ctx(),
+            quota_enforcement_sdk::CreditRequest {
+                tenant_id: tenant(),
+                quota_id: quota_enforcement_sdk::QuotaId::generate(),
+                amount: 1,
+                idempotency_key: "c1".to_owned(),
+            },
+        )
+        .await
+        .expect_err("not ready");
+    assert_eq!(status(err), 503);
+
+    let client = InProcessQuotaManager::new(bound_service().await);
+    let id = client.create_quota(&ctx(), spec()).await.expect("create");
+    let decision = client
+        .credit(
+            &ctx(),
+            quota_enforcement_sdk::CreditRequest {
+                tenant_id: tenant(),
+                quota_id: id,
+                amount: 1,
+                idempotency_key: "c1".to_owned(),
+            },
+        )
+        .await
+        .expect("credit");
+    assert_eq!(
+        decision.result,
+        quota_enforcement_sdk::DecisionResult::Allowed
+    );
 }

@@ -12,7 +12,7 @@
     reason = "test support"
 )]
 
-use crate::domain::ports::metrics::{EngineLabel, PolicyTransition};
+use crate::domain::ports::metrics::{EngineLabel, OperationKind, PolicyTransition, RetentionTable};
 use std::collections::{HashMap, HashSet};
 use std::future::pending;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -31,7 +31,10 @@ use cluster_sdk::{
     ClusterError, ClusterProfile, ElectionConfig, LeaderElectionBackend, LeaderElectionFeatures,
     LeaderStatus, LeaderWatch,
 };
-use gts::{GTS_ID_URI_PREFIX, GtsId, GtsInstanceId, GtsStore, GtsTypeId};
+use gts::{
+    GTS_ID_URI_PREFIX, GtsId, GtsInstanceId, GtsRefValidation, GtsStore, GtsTypeId,
+    X_GTS_INSTANCE_REF,
+};
 use quota_enforcement_sdk::testing::InMemoryStorage;
 use quota_enforcement_sdk::{
     METRIC_BASE_TYPE, MetricId, MetricKind, OwnedDefinition, QuotaEnforcementStoragePluginSpecV1,
@@ -334,11 +337,40 @@ pub struct RecordingMetrics {
     denials: Mutex<Vec<DenialReason>>,
     contract_failures: Mutex<Vec<(ValidationSurface, ValidationReason)>>,
     admitted_violations: Mutex<Vec<ValidationSurface>>,
+    evaluations: Mutex<Vec<(OperationKind, std::time::Duration)>>,
+    replays: Mutex<Vec<OperationKind>>,
+    reclaimed: Mutex<Vec<(RetentionTable, u64)>>,
+    retention_failures: Mutex<Vec<RetentionTable>>,
 }
 
 impl RecordingMetrics {
     pub fn denials(&self) -> Vec<DenialReason> {
         self.denials.lock().expect("lock").clone()
+    }
+
+    /// Operations whose latency was observed, in order.
+    pub fn evaluations(&self) -> Vec<OperationKind> {
+        self.evaluations
+            .lock()
+            .expect("lock")
+            .iter()
+            .map(|(operation, _)| *operation)
+            .collect()
+    }
+
+    /// Operations that answered from a stored record.
+    pub fn replays(&self) -> Vec<OperationKind> {
+        self.replays.lock().expect("lock").clone()
+    }
+
+    /// Rows reclaimed per table, in order.
+    pub fn reclaimed(&self) -> Vec<(RetentionTable, u64)> {
+        self.reclaimed.lock().expect("lock").clone()
+    }
+
+    /// Tables whose sweep failed.
+    pub fn retention_failures(&self) -> Vec<RetentionTable> {
+        self.retention_failures.lock().expect("lock").clone()
     }
 
     /// `contract_validation_failures_total` emissions as `(surface, reason)`.
@@ -390,6 +422,25 @@ impl QeMetrics for RecordingMetrics {
 
     fn record_admitted_metric_violation(&self, surface: ValidationSurface) {
         self.admitted_violations.lock().expect("lock").push(surface);
+    }
+
+    fn record_evaluation(&self, operation: OperationKind, elapsed: std::time::Duration) {
+        self.evaluations
+            .lock()
+            .expect("lock")
+            .push((operation, elapsed));
+    }
+
+    fn record_idempotency_replay(&self, operation: OperationKind) {
+        self.replays.lock().expect("lock").push(operation);
+    }
+
+    fn record_retention_reclaimed(&self, table: RetentionTable, rows: u64) {
+        self.reclaimed.lock().expect("lock").push((table, rows));
+    }
+
+    fn record_retention_failure(&self, table: RetentionTable) {
+        self.retention_failures.lock().expect("lock").push(table);
     }
 }
 
@@ -792,7 +843,7 @@ pub fn mixin_request_document(metric: &str) -> Value {
 }
 
 /// A request contract whose metadata declares a GTS-typed field narrowed by
-/// `x-gts-ref` and a `date-time` field.
+/// `x-gts-instance-ref` and a `date-time` field.
 pub fn typed_request_document(metric: &str) -> Value {
     json!({
         "$id": format!("{GTS_ID_URI_PREFIX}{TYPED_REQUEST}"),
@@ -810,8 +861,7 @@ pub fn typed_request_document(metric: &str) -> Value {
                         "properties": {
                             "model": {
                                 "type": "string",
-                                "format": "gts-instance-id",
-                                "x-gts-ref": TYPED_MODEL_BASE
+                                X_GTS_INSTANCE_REF: TYPED_MODEL_BASE
                             },
                             "when": { "type": "string", "format": "date-time" }
                         },
@@ -915,8 +965,8 @@ pub fn plugin_instance_document(fixture: &PluginFixture) -> Value {
 }
 
 /// Resolves `documents` the way the production adapter does: a local
-/// `GtsStore` holding the QE bases plus every document, then `validate_schema`
-/// per type document. Instances are skipped.
+/// `GtsStore` holding the QE bases plus every document, then validation with
+/// the registry's pattern-only entity-reference policy. Instances are skipped.
 pub fn resolve_documents(documents: &[Value]) -> Vec<RegisteredType> {
     let mut store = GtsStore::new();
     let mut ids = Vec::new();
@@ -932,7 +982,7 @@ pub fn resolve_documents(documents: &[Value]) -> Vec<RegisteredType> {
     ids.into_iter()
         .map(|id| {
             let resolved = store
-                .validate_schema(&id)
+                .validate_schema_with(&id, GtsRefValidation::None)
                 .unwrap_or_else(|e| panic!("{id}: {e}"));
             let mut ancestors: Vec<GtsTypeId> = GtsId::try_new(&id)
                 .expect("type id")
@@ -942,12 +992,14 @@ pub fn resolve_documents(documents: &[Value]) -> Vec<RegisteredType> {
                 .map(|c| GtsTypeId::new(&c))
                 .collect();
             ancestors.reverse();
+            let payload = resolved.compile_payload_validator();
             RegisteredType {
                 id: GtsTypeId::new(&id),
                 is_abstract: resolved.is_abstract,
                 ancestors,
                 effective_traits: resolved.effective_traits,
                 schema: resolved.schema,
+                payload,
             }
         })
         .collect()
@@ -1448,12 +1500,26 @@ pub fn unbound_service(pdp: Arc<dyn AuthZResolverApi>) -> Arc<crate::domain::Ser
         Arc::new(crate::domain::Readiness::new()),
         test_limits(),
         policy_limits(),
+        crate::domain::service::OperationsRuntime {
+            cache_entries: 16,
+            cache_ttl: std::time::Duration::from_secs(5),
+            preparation_max_attempts: std::num::NonZeroU32::new(3).expect("attempts"),
+        },
     ))
 }
 
 /// A service bound to the in-memory storage, the `llm_gateway` catalogue with
 /// both subject projections, and classified metrics.
 pub async fn bound_service(pdp: Arc<dyn AuthZResolverApi>) -> Arc<crate::domain::Service> {
+    bound_service_over(pdp, Arc::new(InMemoryStorage::new())).await
+}
+
+/// The same service over a caller-supplied storage double, so a test can seed
+/// Quotas and read counters through it.
+pub async fn bound_service_over(
+    pdp: Arc<dyn AuthZResolverApi>,
+    storage: Arc<InMemoryStorage>,
+) -> Arc<crate::domain::Service> {
     let service = unbound_service(pdp);
     let registry = Arc::new(FakeContractRegistry::llm_gateway());
     let metrics = RecordingMetrics::default();
@@ -1474,11 +1540,20 @@ pub async fn bound_service(pdp: Arc<dyn AuthZResolverApi>) -> Arc<crate::domain:
                 std::num::NonZeroUsize::new(256).expect("capacity"),
                 std::num::NonZeroUsize::new(2).expect("permits"),
             )),
-            storage: Arc::new(InMemoryStorage::new()),
+            storage,
             coordinator: Arc::new(NoopCoordinator),
             catalog: Arc::new(catalog),
             registry,
             metric_registry: Arc::new(FakeMetricRegistry::classified()),
+            classifications: Arc::new(crate::domain::catalog::MetricClassifications::from_pairs([
+                (
+                    quota_enforcement_sdk::MetricId::parse(METRIC_TOKENS).expect("metric"),
+                    crate::domain::ports::metric_registry::MetricDescriptor {
+                        kind: quota_enforcement_sdk::MetricKind::Counter,
+                        mode: crate::domain::ports::metric_registry::MetricMode::QuotaGated,
+                    },
+                ),
+            ])),
         })
         .expect("bind");
     service

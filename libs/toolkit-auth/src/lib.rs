@@ -37,6 +37,6 @@ pub use validation::{ValidationConfig, validate_claims};
 // API.
 pub use oauth2::{
     BearerAuthAutoRefreshLayer, BearerAuthAutoRefreshOpts, BearerAuthLayer, ClientAuthMethod,
-    FetchedToken, HttpClientBuilderExt, OAuthClientConfig, SecretString, Token, TokenError,
-    fetch_token,
+    FetchedToken, HttpClientBuilderExt, HttpOperation, OAuthClientConfig, SecretString, TokenError,
+    TokenProvider, fetch_token,
 };

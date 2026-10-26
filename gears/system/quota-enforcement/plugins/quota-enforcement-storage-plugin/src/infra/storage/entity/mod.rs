@@ -8,11 +8,13 @@
 //! PDP scope to every row of every table.
 
 pub mod contention_timeout_config;
+pub mod idempotency_record;
 pub mod idempotency_retention_config;
 pub mod lease_capacity_config;
 pub mod operation_log;
 pub mod quota;
 pub mod quota_allocation_counter;
+pub mod quota_consumption_counter;
 pub mod schema_meta;
 
 /// Sentinel key of the platform-default row in the configuration tables.

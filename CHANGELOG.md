@@ -9,6 +9,41 @@ release-plz updates this file in the Release PR.
 
 ## [Unreleased]
 
+### Added
+
+- `toolkit-auth`: shared asynchronous OAuth2 acquisition, explicit shutdown and
+  typed HTTP failures with sanitized target URLs.
+
+### Breaking
+
+- `toolkit-auth` (0.8.0): rename `Token` to `TokenProvider`; construction becomes
+  synchronous and makes no network requests. Replace `new(config).await?` with
+  `TokenProvider::new(config)?`, then call `get().await?` when an initial token is
+  needed. `get()` is now async.
+  `invalidate().await` now returns `Result<(), TokenError>` and immediately clears
+  the old credential, sharing replacement across callers. `shutdown().await`
+  stops all clones and joins the worker. See [migration notes](#toolkit-auth-080-migration).
+- `toolkit-auth`: rejected HTTP responses now return non-exhaustive
+  `TokenError::HttpStatus { operation, status, target_url, .. }` instead of
+  `TokenError::Http(String)`. Match both variants or use `TokenError::status()`;
+  transport failures remain `Http`. URLs omit userinfo, query and fragment.
+
+#### toolkit-auth 0.8.0 migration
+
+- Replace `Token` imports and type annotations with `TokenProvider`.
+- Replace `Token::new(config).await?` with `TokenProvider::new(config)?`.
+  Construction no longer contacts the identity provider. If startup requires a
+  token, call `token_provider.get().await?` after construction.
+- Replace synchronous `get()` calls with `get().await`.
+- Handle the result of `invalidate().await`; it returns `Result<(), TokenError>`.
+  It clears the old credential before replacement. Failure does not restore it.
+- Call `shutdown().await` when the owning application stops. This stops all
+  clones, including those retained by HTTP clients, and joins the worker.
+- Update error handling: HTTP response failures use `TokenError::HttpStatus`
+  instead of `TokenError::Http(String)`. Existing matches on `Http(..)` still
+  compile but no longer catch response failures. Match both variants or use
+  `TokenError::status()` when classification depends on the HTTP status.
+
 ### Fixed
 
 - Resource-group filters accept quoted UUIDs and resolve membership GTS type paths

@@ -29,6 +29,7 @@ async fn plugin_over(store: FakeQuotaStore) -> (StoragePlugin, Arc<FakeQuotaStor
         Arc::new(SqlFoundationStore::new(db)),
         store.clone(),
         Arc::new(crate::test_support::FakePolicyStore::default()),
+        Arc::new(crate::test_support::FakeConsumptionStore),
     );
     (plugin, store)
 }

@@ -15,7 +15,9 @@ use quota_enforcement_sdk::{
 };
 use serde_json::json;
 
-use crate::domain::catalog::{CatalogBuilder, CatalogConfig, ProjectionContractCatalog};
+use crate::domain::catalog::{
+    CatalogBuilder, CatalogConfig, MetricClassifications, ProjectionContractCatalog,
+};
 use crate::domain::engines::{PolicyArtifactCache, linked_registry};
 use crate::domain::error::DomainError;
 use crate::domain::policies::schemas::CatalogPolicySchemas;
@@ -47,6 +49,11 @@ async fn harness_with(pdp: Arc<dyn AuthZResolverApi>, limits: PolicyRuntimeLimit
         Arc::new(Readiness::new()),
         test_limits(),
         limits,
+        crate::domain::service::OperationsRuntime {
+            cache_entries: 16,
+            cache_ttl: std::time::Duration::from_secs(5),
+            preparation_max_attempts: std::num::NonZeroU32::new(3).expect("attempts"),
+        },
     ));
     let registry = Arc::new(FakeContractRegistry::llm_gateway());
     let catalog = CatalogBuilder::new(registry.as_ref(), metrics.as_ref())
@@ -74,6 +81,7 @@ async fn harness_with(pdp: Arc<dyn AuthZResolverApi>, limits: PolicyRuntimeLimit
             catalog: Arc::clone(&catalog),
             registry,
             metric_registry: Arc::new(FakeMetricRegistry::classified()),
+            classifications: Arc::new(MetricClassifications::default()),
         })
         .expect("bind");
     Harness {

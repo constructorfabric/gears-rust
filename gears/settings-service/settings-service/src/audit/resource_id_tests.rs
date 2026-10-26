@@ -1,4 +1,3 @@
-// Created: 2026-08-13 by Virtuozzo International GmbH
 //! Tests for the canonical audit resource id.
 //!
 //! DESIGN.md §4.2 requires one formatter shared by the audit write and the

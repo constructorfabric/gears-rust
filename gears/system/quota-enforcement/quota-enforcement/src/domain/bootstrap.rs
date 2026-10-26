@@ -11,12 +11,11 @@
 //! the write path needs. Later features extend [`Bootstrap::run`] with their
 //! own steps.
 
-use std::collections::HashSet;
 use std::sync::Arc;
 
 use quota_enforcement_sdk::{
     BootstrapBundle, EnvironmentInputs, PolicyDraft, PolicySchemaSnapshot, PolicyScope,
-    ProjectionBinding, QuotaEnforcementStoragePluginV1, StorageError, owned_definitions,
+    QuotaEnforcementStoragePluginV1, StorageError, owned_definitions,
 };
 use toolkit_macros::domain_model;
 
@@ -34,6 +33,7 @@ use super::ports::metrics::EngineLabel;
 use super::ports::metrics::QeMetrics;
 use super::ports::pdp::PdpProbe;
 use super::readiness::Readiness;
+use quota_enforcement_sdk::MetricId;
 
 const LOG_TARGET: &str = "qe.bootstrap";
 
@@ -54,8 +54,12 @@ pub struct Bound {
     pub catalog: Arc<ProjectionContractCatalog>,
     /// The contract registry the write path snapshots projections from.
     pub registry: Arc<dyn ContractRegistry>,
-    /// The metric identity and classification registry.
+    /// The metric identity and classification registry. The Quota and Policy
+    /// write paths read it; the evaluation path never does.
     pub metric_registry: Arc<dyn MetricRegistry>,
+    /// Classification of every admitted metric, frozen here so the evaluation
+    /// path answers from process memory.
+    pub classifications: Arc<super::catalog::MetricClassifications>,
 }
 
 /// The registry the catalogue is built from and the projections to build it
@@ -156,35 +160,6 @@ impl Bootstrap {
         }
     }
 
-    /// Flag active Quotas whose metric the registry no longer knows or
-    /// cannot classify; only a registry that does not answer is fatal.
-    async fn flag_bound_metrics(
-        &self,
-        bindings: &HashSet<ProjectionBinding>,
-    ) -> Result<(), DomainError> {
-        let mut seen = HashSet::new();
-        for metric in bindings.iter().map(|b| &b.metric) {
-            if !seen.insert(metric.clone()) {
-                continue;
-            }
-            match self.metric_registry.describe(metric).await {
-                Ok(Some(_)) => {}
-                Ok(None) => tracing::warn!(
-                    target: LOG_TARGET,
-                    metric = %metric,
-                    "active Quotas reference a metric the types registry no longer knows"
-                ),
-                Err(DomainError::MetricClassificationInvalid { .. }) => tracing::warn!(
-                    target: LOG_TARGET,
-                    metric = %metric,
-                    "active Quotas reference a metric with no usable classification"
-                ),
-                Err(e) => return Err(e),
-            }
-        }
-        Ok(())
-    }
-
     /// Run the bootstrap steps, naming the dependency that failed.
     // @cpt-algo:cpt-cf-quota-enforcement-algo-engine-bootstrap-seed:p1
     async fn run_steps(&self) -> Result<Bound, (Dependency, DomainError)> {
@@ -193,8 +168,7 @@ impl Bootstrap {
         // @cpt-end:cpt-cf-quota-enforcement-algo-engine-bootstrap-seed:p1:inst-ebs-register
 
         // @cpt-begin:cpt-cf-quota-enforcement-flow-gear-bootstrap:p1:inst-boot-start
-        // Exactly one active storage plugin: the instance the configured vendor
-        // selects.
+        // Resolve the configured storage implementation.
         let storage = self
             .binding
             .resolve_storage()
@@ -202,11 +176,9 @@ impl Bootstrap {
             .map_err(|e| (Dependency::Storage, e))?;
         // @cpt-end:cpt-cf-quota-enforcement-flow-gear-bootstrap:p1:inst-boot-start
 
-        // Schema check and default seeding are the plugin's steps.
         // @cpt-begin:cpt-cf-quota-enforcement-algo-engine-bootstrap-seed:p1:inst-ebs-seed
         // @cpt-begin:cpt-cf-quota-enforcement-algo-engine-bootstrap-seed:p1:inst-ebs-order
-        // Engines are registered above, before this seed runs, so the seeded
-        // policy can never name an engine this binary does not link.
+        // Engine registration precedes policy seeding.
         let mut bundle = BootstrapBundle::foundation();
         bundle.global_policy = Some(global_policy_seed());
         storage
@@ -218,9 +190,7 @@ impl Bootstrap {
 
         // @cpt-begin:cpt-cf-quota-enforcement-flow-owner-projection-publication:p1:inst-pub-boot
         // @cpt-begin:cpt-cf-quota-enforcement-algo-catalog-bootstrap:p1:inst-cat-bases
-        // The QE-owned GTS definitions: the four abstract bases, the scope
-        // type, and its two well-known instances. Idempotent; a byte-identical
-        // definition already present is a success, a different one a conflict.
+        // Reasserting identical definitions is idempotent; conflicts fail.
         let definitions = owned_definitions().map_err(|e| {
             (
                 Dependency::Catalog,
@@ -234,9 +204,7 @@ impl Bootstrap {
             .map_err(|e| (catalog_dependency(&e), e))?;
         // @cpt-end:cpt-cf-quota-enforcement-algo-catalog-bootstrap:p1:inst-cat-bases
 
-        // The consistency set over the configured projections, then the
-        // compatibility check against the Quotas storage holds. The catalogue
-        // is published only after both pass; a failure serves nothing.
+        // Publish only after the catalogue and stored bindings agree.
         let builder = CatalogBuilder::new(self.catalog.registry.as_ref(), self.metrics.as_ref());
         let catalog = builder
             .build(&self.catalog.config)
@@ -251,14 +219,21 @@ impl Bootstrap {
             .map_err(|e| (Dependency::Catalog, e))?;
         // @cpt-end:cpt-cf-quota-enforcement-flow-owner-projection-publication:p1:inst-pub-boot
 
-        self.flag_bound_metrics(&bindings)
-            .await
-            .map_err(|e| (Dependency::TypesRegistry, e))?;
+        // Resolve every admitted or stored metric once before serving traffic.
+        // Collect first to avoid borrowing the catalogue across an await.
+        let to_classify: Vec<MetricId> = catalog
+            .admitted_metrics()
+            .cloned()
+            .chain(bindings.iter().map(|binding| binding.metric.clone()))
+            .collect();
+        let classifications = Arc::new(
+            super::catalog::MetricClassifications::load(to_classify, self.metric_registry.as_ref())
+                .await
+                .map_err(|e| (Dependency::TypesRegistry, e))?,
+        );
 
         // @cpt-begin:cpt-cf-quota-enforcement-flow-gear-bootstrap:p1:inst-boot-cluster-resolve
-        // The cluster resolver validates the operator's binding of the
-        // `quota-enforcement` profile: an unbound profile or a backend without a
-        // linearizable election fails here. There is no probe of our own.
+        // Resolution validates the profile and linearizable-election support.
         let coordinator = self
             .coordinator
             .resolve()
@@ -267,9 +242,7 @@ impl Bootstrap {
         // @cpt-end:cpt-cf-quota-enforcement-flow-gear-bootstrap:p1:inst-boot-cluster-resolve
 
         // @cpt-begin:cpt-cf-quota-enforcement-flow-gear-bootstrap:p1:inst-boot-pdp-probe
-        // One round trip to the PDP. `init` already proved the client is
-        // registered; a registered client over an unreachable PDP would still
-        // deny every request, so the gear must not report ready behind it.
+        // Registration alone does not prove that the PDP is reachable.
         self.pdp.probe().await.map_err(|e| (Dependency::Pdp, e))?;
         // @cpt-end:cpt-cf-quota-enforcement-flow-gear-bootstrap:p1:inst-boot-pdp-probe
 
@@ -286,6 +259,7 @@ impl Bootstrap {
             catalog,
             registry: self.catalog.registry.clone(),
             metric_registry: self.metric_registry.clone(),
+            classifications,
         })
     }
 

@@ -38,23 +38,13 @@ use toolkit_gts::{GtsTraitsSchema, PluginV1, gts_id, gts_type_schema};
 pub struct LicenseResolverPluginSpecV1;
 
 // Narrows the emitted `type` property from `GtsTypeId`'s own open
-// `x-gts-ref: "gts.*"` to the licensing base the id must derive from. The field
-// must stay a `GtsTypeId`, so the override goes through schemars.
-fn contract_type_schema(
-    generator: &mut schemars::SchemaGenerator,
-    base_type_id: &str,
-) -> schemars::Schema {
+// `x-gts-type-ref: "gts.*"` to `/$id`, the contract being validated: an object
+// names the derived contract it instantiates. The field must stay a `GtsTypeId`,
+// so the override goes through schemars.
+fn contract_type_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
     let mut schema = <gts::GtsTypeId as JsonSchema>::json_schema(generator);
-    schema.insert("x-gts-ref".to_owned(), base_type_id.into());
+    schema.insert(gts::X_GTS_TYPE_REF.to_owned(), gts::SELF_ID_REF.into());
     schema
-}
-
-fn subject_contract_type_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
-    contract_type_schema(generator, gts_id!("cf.core.lic.subj.v1~"))
-}
-
-fn resource_contract_type_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
-    contract_type_schema(generator, gts_id!("cf.core.lic.res.v1~"))
 }
 
 /// Base **Subject** licensing type — `gts.cf.core.lic.subj.v1~`.
@@ -78,7 +68,7 @@ fn resource_contract_type_schema(generator: &mut schemars::SchemaGenerator) -> s
 pub struct LicenseSubjectV1<M: gts::GtsSchema> {
     /// The derived Subject contract type this object instantiates — what the resolver resolves the schema from. Wire key `type`.
     #[serde(rename = "type")]
-    #[schemars(schema_with = "subject_contract_type_schema")]
+    #[schemars(schema_with = "contract_type_schema")]
     pub gts_type: gts::GtsTypeId,
     /// Optional instance id — a well-known name or a UUID; absent for a type-level subject.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -90,12 +80,12 @@ pub struct LicenseSubjectV1<M: gts::GtsSchema> {
     pub metadata: M,
 }
 
-// A single admitted Subject contract type. `x-gts-ref` validates the shape of
+// A single admitted Subject contract type. `x-gts-type-ref` validates the shape of
 // the id, not that the type is registered.
 #[allow(dead_code)]
 #[derive(serde::Serialize, JsonSchema)]
 #[serde(transparent)]
-#[schemars(transparent, extend("x-gts-ref" = gts_id!("cf.core.lic.subj.v1~")))]
+#[schemars(transparent, extend("x-gts-type-ref" = gts_id!("cf.core.lic.subj.v1~")))]
 pub struct SubjectTypeRef(pub String);
 
 // Behavioral traits for `gts.cf.core.lic.res.v1~` — emitted as the base Resource
@@ -138,7 +128,7 @@ pub struct ResourceTraits {
 pub struct LicenseResourceV1<M: gts::GtsSchema> {
     /// The derived Resource contract type this object instantiates — what the resolver resolves the schema and `admitted_subjects` from. Wire key `type`.
     #[serde(rename = "type")]
-    #[schemars(schema_with = "resource_contract_type_schema")]
+    #[schemars(schema_with = "contract_type_schema")]
     pub gts_type: gts::GtsTypeId,
     /// Optional instance id — a well-known name or a UUID; absent for a whole-type check.
     #[serde(default, skip_serializing_if = "Option::is_none")]

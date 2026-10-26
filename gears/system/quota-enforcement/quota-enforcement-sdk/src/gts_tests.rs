@@ -1,6 +1,6 @@
 #![allow(clippy::expect_used)]
 
-use gts::{GTS_ID_PREFIX, GTS_ID_URI_PREFIX, GtsSchema, GtsStore};
+use gts::{GTS_ID_PREFIX, GTS_ID_URI_PREFIX, GtsRefValidation, GtsSchema, GtsStore};
 use serde_json::Value;
 use toolkit_gts::{InventoryInstance, InventoryTypeSchema};
 
@@ -190,7 +190,8 @@ fn the_inventory_carries_the_same_seven_definitions() {
 
 /// A store holding the QE definitions and the `llm_gateway` examples: the
 /// repository's semantic check of the reviewed schema files. The registry
-/// validates with the same `gts` library at admission time.
+/// validates with the same `gts` library and pattern-only entity-reference policy
+/// at admission time.
 fn store_with_examples() -> GtsStore {
     let mut store = GtsStore::new();
     for def in definitions().iter().filter(|d| d.id.ends_with('~')) {
@@ -211,12 +212,12 @@ fn the_qe_bases_validate_as_abstract_types_with_required_value_less_traits() {
     let mut store = store_with_examples();
     for base in [SUBJECT_BASE, RESOURCE_BASE, REQUEST_BASE, CONSTRAINT_BASE] {
         let resolved = store
-            .validate_schema(base)
+            .validate_schema_with(base, GtsRefValidation::None)
             .unwrap_or_else(|e| panic!("{base}: {e}"));
         assert!(resolved.is_abstract, "{base} is abstract");
     }
     let scope = store
-        .validate_schema(SCOPE_TYPE)
+        .validate_schema_with(SCOPE_TYPE, GtsRefValidation::None)
         .expect("scope type validates");
     assert!(!scope.is_abstract, "the scope type is concrete");
 }
@@ -226,7 +227,7 @@ fn the_owner_examples_validate_as_concrete_derived_contracts_with_their_traits()
     let mut store = store_with_examples();
     for (id, _) in EXAMPLES {
         let resolved = store
-            .validate_schema(id)
+            .validate_schema_with(id, GtsRefValidation::None)
             .unwrap_or_else(|e| panic!("{id}: {e}"));
         assert!(!resolved.is_abstract, "{id} is concrete");
         assert!(
@@ -235,7 +236,10 @@ fn the_owner_examples_validate_as_concrete_derived_contracts_with_their_traits()
         );
     }
     let user = store
-        .validate_schema("gts.cf.core.qe.subj.v1~cf.genai.llm_gateway.user.v1~")
+        .validate_schema_with(
+            "gts.cf.core.qe.subj.v1~cf.genai.llm_gateway.user.v1~",
+            GtsRefValidation::None,
+        )
         .expect("user projection");
     assert_eq!(user.effective_traits["scope"], SCOPE_USER);
     assert_eq!(
@@ -245,7 +249,10 @@ fn the_owner_examples_validate_as_concrete_derived_contracts_with_their_traits()
         Some(2)
     );
     let token = store
-        .validate_schema("gts.cf.core.qe.request.v1~cf.genai.llm_gateway.token.v1~")
+        .validate_schema_with(
+            "gts.cf.core.qe.request.v1~cf.genai.llm_gateway.token.v1~",
+            GtsRefValidation::None,
+        )
         .expect("token request contract");
     assert_eq!(
         token.effective_traits["metric"],
@@ -262,11 +269,15 @@ fn scope_instances_validate_against_the_scope_type_and_bases_take_no_instances()
     let mut store = store_with_examples();
     for def in definitions().iter().filter(|d| !d.id.ends_with('~')) {
         store
-            .validate_payload(SCOPE_TYPE, &def.document)
+            .validate_payload_with(SCOPE_TYPE, &def.document, GtsRefValidation::None)
             .unwrap_or_else(|e| panic!("{}: {e}", def.id));
     }
     let err = store
-        .validate_payload(SUBJECT_BASE, &serde_json::json!({ "type": SUBJECT_BASE }))
+        .validate_payload_with(
+            SUBJECT_BASE,
+            &serde_json::json!({ "type": SUBJECT_BASE }),
+            GtsRefValidation::None,
+        )
         .expect_err("an abstract base takes no direct instances");
     assert!(err.to_string().contains("abstract"), "{err}");
 }
@@ -276,15 +287,17 @@ fn the_token_request_envelope_validates_against_its_resolved_contract() {
     let mut store = store_with_examples();
     let contract = "gts.cf.core.qe.request.v1~cf.genai.llm_gateway.token.v1~";
     store
-        .validate_payload(
+        .validate_payload_with(
             contract,
             &serde_json::json!({ "type": contract, "metadata": { "region": "eu-west-1" } }),
+            GtsRefValidation::None,
         )
         .expect("a conforming envelope validates");
     let missing_region = store
-        .validate_payload(
+        .validate_payload_with(
             contract,
             &serde_json::json!({ "type": contract, "metadata": {} }),
+            GtsRefValidation::None,
         )
         .expect_err("region is required by the owner contract");
     assert!(
@@ -292,7 +305,11 @@ fn the_token_request_envelope_validates_against_its_resolved_contract() {
         "{missing_region}"
     );
     let bare_metadata = store
-        .validate_payload(contract, &serde_json::json!({ "region": "eu-west-1" }))
+        .validate_payload_with(
+            contract,
+            &serde_json::json!({ "region": "eu-west-1" }),
+            GtsRefValidation::None,
+        )
         .expect_err("the inner object alone is not the contract envelope");
     assert!(
         bare_metadata.to_string().contains("type"),

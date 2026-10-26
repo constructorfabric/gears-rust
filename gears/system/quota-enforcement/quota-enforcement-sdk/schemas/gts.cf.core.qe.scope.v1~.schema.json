@@ -7,14 +7,12 @@
   "properties": {
     "id": {
       "type": "string",
-      "format": "gts-instance-id",
-      "x-gts-ref": "gts.cf.core.qe.scope.v1~",
+      "x-gts-instance-ref": "/$id",
       "description": "The well-known scope instance id."
     },
     "type": {
       "type": "string",
-      "format": "gts-type-id",
-      "x-gts-ref": "gts.cf.core.qe.scope.v1~",
+      "x-gts-type-ref": "/$id",
       "description": "Always the scope-discriminator type itself."
     }
   },

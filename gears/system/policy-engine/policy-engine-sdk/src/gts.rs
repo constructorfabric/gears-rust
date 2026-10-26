@@ -1,17 +1,62 @@
-//! GTS identifiers and well-known instances owned by the policy engine: the
-//! resource types and the management permission catalog (registered through
-//! the `toolkit-gts` inventory).
+//! GTS types and well-known instances owned by the policy engine: the
+//! resource types and the management permission catalog, all registered
+//! through the `toolkit-gts` inventory. The engine plugin instance is not
+//! here: its vendor and priority come from configuration, so the gear
+//! registers it at init.
 
-use toolkit_gts::gts_id;
+use gts::{GtsInstanceId, GtsSchema};
+use toolkit_gts::gts_type_schema;
 
 /// Resource type of a policy bundle.
-pub const BUNDLE_RESOURCE: &str = gts_id!("cf.core.policy_engine.bundle.v1~");
+pub const BUNDLE_RESOURCE: &str = PolicyBundleV1::TYPE_ID;
 
 /// Resource type of a policy bundle version.
-pub const BUNDLE_VERSION_RESOURCE: &str = gts_id!("cf.core.policy_engine.bundle_version.v1~");
+pub const BUNDLE_VERSION_RESOURCE: &str = PolicyBundleVersionV1::TYPE_ID;
 
 /// Resource type of a bundle-to-tenant assignment.
-pub const ASSIGNMENT_RESOURCE: &str = gts_id!("cf.core.policy_engine.assignment.v1~");
+pub const ASSIGNMENT_RESOURCE: &str = PolicyAssignmentV1::TYPE_ID;
+
+/// Type schema of [`BUNDLE_RESOURCE`]. The body is `id`-only: the registry
+/// needs the type identifier known (permissions name it, and policies may
+/// target it) and nothing from the schema body.
+#[gts_type_schema(
+    dir_path = "schemas",
+    base = true,
+    type_id = gts_id!("cf.core.policy_engine.bundle.v1~"),
+    description = "Policy engine bundle: a named set of policy versions, resource type of the management permissions",
+    properties = "id",
+)]
+pub struct PolicyBundleV1 {
+    /// Required by the `gts-macros` base-struct contract; inert.
+    pub id: GtsInstanceId,
+}
+
+/// Type schema of [`BUNDLE_VERSION_RESOURCE`]; `id`-only, as
+/// [`PolicyBundleV1`].
+#[gts_type_schema(
+    dir_path = "schemas",
+    base = true,
+    type_id = gts_id!("cf.core.policy_engine.bundle_version.v1~"),
+    description = "Policy engine bundle version: one draft, active or superseded content of a bundle",
+    properties = "id",
+)]
+pub struct PolicyBundleVersionV1 {
+    /// Required by the `gts-macros` base-struct contract; inert.
+    pub id: GtsInstanceId,
+}
+
+/// Type schema of [`ASSIGNMENT_RESOURCE`]; `id`-only, as [`PolicyBundleV1`].
+#[gts_type_schema(
+    dir_path = "schemas",
+    base = true,
+    type_id = gts_id!("cf.core.policy_engine.assignment.v1~"),
+    description = "Policy engine assignment: a bundle bound to a tenant and its descendants",
+    properties = "id",
+)]
+pub struct PolicyAssignmentV1 {
+    /// Required by the `gts-macros` base-struct contract; inert.
+    pub id: GtsInstanceId,
+}
 
 /// Entrypoint rule every policy document defines: a boolean rule that is
 /// `true` when the document denies the operation; `false` or undefined when
@@ -113,3 +158,8 @@ pub mod permissions {
         }
     }
 }
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+#[path = "gts_tests.rs"]
+mod gts_tests;

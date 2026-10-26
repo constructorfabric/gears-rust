@@ -20,15 +20,14 @@
 //! the consuming crate, which turned a forgotten feature into a gear that
 //! started fine and never found its provider.
 //!
-//! **Gear name is derived from the struct ident.** The emitted `owner_gear` is
-//! the kebab-case of the annotated struct's name, because the runtime uses it
-//! as a config key for the ADR-0004 static-endpoint override
-//! (`gears.<owner_gear>.config.consumer_wiring.<dep>`) and in log/error fields.
-//! A separate attribute cannot read the `name = "..."` given to
-//! `#[toolkit::gear]`, so `#[toolkit::gear(name = ...)]` MUST be the kebab form
-//! of the struct ident for the override to resolve — the convention everywhere
-//! in this repo, but load-bearing here. A mismatch is reported at `warn!` by the
-//! proxy-wiring phase rather than failing silently.
+//! **Gear name.** The emitted `owner_gear` is the gear's name, because the
+//! runtime uses it as a config key for the ADR-0004 static-endpoint override and
+//! the criticality flag (`gears.<owner_gear>.config.consumer_wiring.<dep>`) and
+//! in log/error fields. When this attribute sits **above** `#[toolkit::gear]`,
+//! the gear attribute is still on the item and its `name = "..."` is used, so a
+//! struct named `CredStoreGear` for gear `credstore` keys correctly. Otherwise
+//! (gear attribute already expanded, or absent) the kebab-case of the struct
+//! ident is used, and `#[toolkit::gear(name = ...)]` must match it.
 //!
 //! **Topology:** `#[toolkit::consumes]` does NOT inject a topo-sort dependency.
 //! A separate attribute cannot mutate the `&'static` deps baked by
@@ -143,6 +142,38 @@ fn expr_into_string(e: Expr, key: &Ident) -> SynResult<String> {
     }
 }
 
+/// The `name = "..."` of a `#[toolkit::gear(...)]` (or `#[gear(...)]`) still on
+/// the item, i.e. one written below this attribute.
+fn declared_gear_name(item: &ItemStruct) -> Option<String> {
+    item.attrs.iter().find_map(|attr| {
+        let path = attr.path();
+        let is_gear = path.segments.last().is_some_and(|s| s.ident == "gear")
+            && (path.segments.len() == 1
+                || path.segments.first().is_some_and(|s| s.ident == "toolkit"));
+        if !is_gear {
+            return None;
+        }
+        let mut name = None;
+        // An attribute this cannot parse falls back to the struct ident.
+        let parsed = attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("name") {
+                let value: syn::LitStr = meta.value()?.parse()?;
+                name = Some(value.value());
+            } else if meta.input.peek(syn::Token![=]) {
+                let _: syn::Expr = meta.value()?.parse()?;
+            } else if meta.input.peek(syn::token::Paren) {
+                // Consume the group whole: syn reports a buffer dropped with
+                // tokens left as a parse error, which would discard `name`.
+                let content;
+                syn::parenthesized!(content in meta.input);
+                let _: proc_macro2::TokenStream = content.parse()?;
+            }
+            Ok(())
+        });
+        parsed.ok().and(name)
+    })
+}
+
 /// Top-level entry point invoked by the proc-macro shim in `lib.rs`.
 pub fn generate(attr: &ConsumesAttr, item: &ItemStruct) -> SynResult<TokenStream> {
     let struct_ident = &item.ident;
@@ -182,7 +213,8 @@ pub fn generate(attr: &ConsumesAttr, item: &ItemStruct) -> SynResult<TokenStream
     // emitting `stringify!` — `stringify!(ApiContractsConsumer)` would look up
     // `gears.ApiContractsConsumer`, which no config declares, and the override
     // would silently never fire.
-    let owner_gear = struct_ident.to_string().to_kebab_case();
+    let owner_gear =
+        declared_gear_name(item).unwrap_or_else(|| struct_ident.to_string().to_kebab_case());
 
     Ok(quote! {
         #item
@@ -264,6 +296,62 @@ mod tests {
             !out.contains("stringify ! (ApiContractsConsumer)"),
             "owner_gear must not be the Rust type name"
         );
+    }
+
+    /// With `#[toolkit::gear]` written below, its declared `name` is the key, even
+    /// when it is not the kebab-case of the struct (`CredStoreGear` / `credstore`).
+    #[test]
+    fn declared_gear_name_wins_over_the_struct_ident() {
+        let attr: ConsumesAttr =
+            syn::parse_quote!(contract = authz::AuthZResolverApi, from = "authz-resolver");
+        let item: syn::ItemStruct = syn::parse_quote! {
+            #[toolkit::gear(name = "credstore", deps = [tenant_resolver], capabilities = [system, db], lifecycle(entry = "serve"))]
+            pub struct CredStoreGear;
+        };
+        let out = generate(&attr, &item).unwrap().to_string();
+        assert!(out.contains(r#"owner_gear : "credstore""#), "got:\n{out}");
+    }
+
+    #[test]
+    fn an_unqualified_gear_attribute_names_the_gear() {
+        let out = expand(&parse_quote! {
+            #[gear(name = "billing-core")]
+            pub struct BillingGear;
+        });
+        assert!(
+            out.contains(r#"owner_gear : "billing-core""#),
+            "got:\n{out}"
+        );
+    }
+
+    /// `lifecycle(...)` is a parenthesised group; consuming it whole is what lets
+    /// a `name` written after it still be read.
+    #[test]
+    fn a_name_after_a_lifecycle_group_is_read() {
+        let out = expand(&parse_quote! {
+            #[toolkit::gear(deps = [tenant_resolver], lifecycle(entry = "serve"), name = "credstore")]
+            pub struct CredStoreGear;
+        });
+        assert!(out.contains(r#"owner_gear : "credstore""#), "got:\n{out}");
+    }
+
+    /// An attribute this cannot parse, or one that only ends in `gear`, falls
+    /// back to the struct ident rather than failing the expansion.
+    #[test]
+    fn an_unreadable_or_foreign_gear_attribute_falls_back_to_the_ident() {
+        for item in [
+            parse_quote! {
+                #[toolkit::gear(name = 42)]
+                pub struct OrdersGear;
+            },
+            parse_quote! {
+                #[other::gear(name = "billing")]
+                pub struct OrdersGear;
+            },
+        ] {
+            let out = expand(&item);
+            assert!(out.contains(r#"owner_gear : "orders-gear""#), "got:\n{out}");
+        }
     }
 
     #[test]

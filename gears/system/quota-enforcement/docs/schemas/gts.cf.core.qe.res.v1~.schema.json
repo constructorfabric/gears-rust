@@ -8,8 +8,7 @@
   "properties": {
     "type": {
       "type": "string",
-      "format": "gts-type-id",
-      "x-gts-ref": "gts.cf.core.qe.res.v1~",
+      "x-gts-type-ref": "/$id",
       "description": "The concrete owner-declared resource projection."
     },
     "id": {

@@ -1047,7 +1047,7 @@ Identifiers under the `gts.cf.core.qe.*` package:
 | Contract lifecycle preconditions: `ProjectionNotResolvable`, `ContractSnapshotUnavailable`, `ConstraintContractMismatch`, `PolicyContractPairIncompatible`                                                                                                                                       | `FailedPrecondition` | 400  | stable precondition reason; Quota/Policy write rejected before persistence                                                                         |
 | Semantic precondition: `ThresholdsRequireBoundedCap`, `CapBelowConsumed`, `LeaseNotActive`, `OverCommitNotAuthorized`, `PeriodClosed`, `MetricNotQuotaGated`, `MetricNotRegistered`, `QuotaDeactivated`, `UnknownEngine`, `CannotDeleteSeededGlobalPolicy`, `UnknownPolicyVersion`, `VersionRolledBack` | `FailedPrecondition` | 400  | matching `UPPER_SNAKE` token (precondition violation)                                                                                              |
 | `PdpDenied`                                                                                                                                                                                                                                                                                             | `PermissionDenied`   | 403  | —                                                                                                                                                  |
-| `NotFound { kind, id }`                                                                                                                                                                                                                                                                                 | `NotFound`           | 404  | `kind` selects `type` and its `UNKNOWN_*` token (`UNKNOWN_QUOTA`, `UNKNOWN_OPERATION`); `id` populates `resource_name`                              |
+| `NotFound { kind, id }`                                                                                                                                                                                                                                                                                 | `NotFound`           | 404  | `kind` selects `type`; a Quota or operation `detail` leads with its token (`UNKNOWN_QUOTA`, `UNKNOWN_OPERATION`); `id` populates `resource_name`    |
 | Concurrency conflict: `IdempotencyPayloadMismatch`, `VersionConflict`, `LeaseContentionTimeout`                                                                                                                                                                                                         | `Aborted`            | 409  | matching `UPPER_SNAKE` token; safe to retry                                                                                                        |
 | `LeaseInflightLimitExceeded`, `EngineCostExceeded`                                                                                                                                                                                                                                                      | `ResourceExhausted`  | 429  | `LEASE_INFLIGHT_LIMIT_EXCEEDED` (`subject = "(tenant, metric)"`); `ENGINE_COST_EXCEEDED` (`subject = "engine"`)                                    |
 | `NotYetImplemented`                                                                                                                                                                                                                                                                                     | `Unimplemented`      | 501  | —                                                                                                                                                  |
@@ -2274,7 +2274,8 @@ plugin chooses physical layout.
    `ProjectionContractCatalog`.
 1. Checking derivation of every configured concrete owner projection from the QE base, concrete (non-abstract) status,
    and that every admitted metric reference resolves to a registered instance of the metric base (a narrowed
-   `x-gts-ref` is a prefix match only, so neither registration nor the instance-of relationship is covered by it),
+   `x-gts-instance-ref` is a kind and prefix match only, so neither registration nor the instance-of relationship is
+   covered by it),
    uniqueness of every admitted `(metric, scope)` pair across the configured projection set, exactly one concrete
    request contract per admitted metric, and a registered concrete constraint contract attached by that request
    contract. QE reads
@@ -2285,9 +2286,9 @@ plugin chooses physical layout.
    that reference them. The immutable catalogue is published to Gateway only after all checks pass. Resolution
    re-derives each selected contract with the `gts` library the registry validates with: the type, its parent chain,
    and every type reached through a `gts://` reference are loaded into a local store, and the resolved body keeps its
-   Draft-07 dialect and `x-gts-ref` constraints for the compiled contract to assert at ingress. Request contracts are
-   discovered from the registry listing under `gts.cf.core.qe.request.v1~` and filtered to the admitted metrics, so an
-   unrelated owner's contract cannot fail bootstrap. The active-Quota compatibility check reads the distinct
+   Draft-07 dialect and entity-reference constraints for the compiled contract to assert at ingress. Request contracts
+   are discovered from the registry listing under `gts.cf.core.qe.request.v1~` and filtered to the admitted metrics, so
+   an unrelated owner's contract cannot fail bootstrap. The active-Quota compatibility check reads the distinct
    `(metric, projection_type)` pairs through the caller-less, bootstrap-only storage primitive
    `read_active_projection_bindings()`, realised by the reference plugin as a distinct query over `qe_quotas`. After
    the compatibility check, every distinct bound metric is classified once: a metric the registry no longer knows is

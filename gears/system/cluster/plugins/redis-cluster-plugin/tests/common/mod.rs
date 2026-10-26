@@ -73,20 +73,13 @@ use testcontainers::runners::AsyncRunner;
 use testcontainers::{ContainerAsync, ImageExt};
 use testcontainers_modules::redis::{REDIS_PORT, Redis};
 
-/// The Redis image tag every per-PR fixture runs, pinned rather than `latest` so
-/// a scenario asserting on server *behaviour* (keyspace notification wording,
-/// eviction accounting, `PTTL` sentinels) cannot start failing because Docker Hub
-/// moved a tag. `alpine` for start-up time: the fixtures are per-PR and TESTING
-/// §7 budgets the whole suite at 20–30 s.
-///
-/// The `testcontainers_modules::redis::Redis` image defaults to tag `5.0`, which
-/// predates sharded pub/sub and several `INFO` fields, so every fixture below
-/// overrides it explicitly.
-pub const REDIS_TAG: &str = "7-alpine";
-
 /// The Redis 6 tag, for `RD-SPEC-014`'s negative half — a server that supports
 /// neither `SPUBLISH` nor `SSUBSCRIBE`, so the plugin must log no
 /// `sharded_pubsub_available` and issue no sharded command.
+///
+/// Every other fixture runs the workspace pin (`test_containers::redis()`). This
+/// one is fixed on purpose: the scenario's subject is the server version, so it
+/// must not follow `GEARS_TEST_REDIS_TAG`.
 pub const REDIS_6_TAG: &str = "6-alpine";
 
 /// The minimal correct `notify-keyspace-events` set — see this module's header
@@ -108,9 +101,9 @@ pub const KEYSPACE_FLAGS: &str = "Kxe";
 /// of them.
 #[derive(Debug, Clone)]
 pub struct RedisRecipe {
-    /// Image tag. [`REDIS_TAG`] for everything except `RD-SPEC-014`'s negative
-    /// half.
-    pub tag: &'static str,
+    /// Image tag override. `None` (the workspace pin) for everything except
+    /// `RD-SPEC-014`'s negative half.
+    pub tag: Option<&'static str>,
     /// `--notify-keyspace-events`. `None` leaves the server at its default of
     /// *no* notifications, which is what `RD-SPEC-005`/`005b` and `RD-LOCK-009`
     /// need.
@@ -142,7 +135,7 @@ impl RedisRecipe {
     #[must_use]
     pub fn stock() -> Self {
         Self {
-            tag: REDIS_TAG,
+            tag: None,
             keyspace_flags: Some(KEYSPACE_FLAGS),
             appendfsync: None,
             maxmemory: None,
@@ -194,7 +187,7 @@ impl RedisRecipe {
     /// A different image tag.
     #[must_use]
     pub fn with_tag(mut self, tag: &'static str) -> Self {
-        self.tag = tag;
+        self.tag = Some(tag);
         self
     }
 
@@ -293,9 +286,11 @@ pub async fn start(recipe: &RedisRecipe) -> (ContainerAsync<Redis>, String) {
     let attempts = backoffs.len() + 1;
     let mut last_error = String::new();
     for attempt in 1..=attempts {
-        let request = Redis::default()
-            .with_tag(recipe.tag)
-            .with_cmd(recipe.command());
+        let mut request = test_containers::redis();
+        if let Some(tag) = recipe.tag {
+            request = request.with_tag(tag);
+        }
+        let request = request.with_cmd(recipe.command());
         let container = match request.start().await {
             Ok(container) => container,
             Err(error) => {
@@ -356,8 +351,7 @@ async fn start_multinode(
         // same race, so re-probing is the whole point.
         let base = free_port_base(port_count);
         let (script, ports) = build(base);
-        let mut request = Redis::default()
-            .with_tag(REDIS_TAG)
+        let mut request = test_containers::redis()
             // The official image's `docker-entrypoint.sh` prepends `redis-server`
             // only when the first argument is a flag or a `.conf`, and `exec "$@"`s
             // anything else — so a shell command passes through untouched.

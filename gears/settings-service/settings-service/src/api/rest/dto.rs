@@ -1,4 +1,3 @@
-// Created: 2026-08-13 by Virtuozzo International GmbH
 //! Wire shapes for the category endpoints.
 //!
 //! Separate from the domain [`Category`](crate::domain::category::Category) on

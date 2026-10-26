@@ -112,12 +112,23 @@ fn with_policy_id(events: &[NotificationEvent], id: &PolicyId) -> Vec<Notificati
         .collect()
 }
 
-fn scope_key(scope: &PolicyScope) -> String {
+/// The `scope_key` column value of a policy scope. Shared with the
+/// consumption store, which selects the policy inside its own transaction.
+pub(super) fn scope_key(scope: &PolicyScope) -> String {
     match scope {
         PolicyScope::Global => "global".into(),
         PolicyScope::Metric { metric } => format!("metric={metric}"),
     }
 }
+/// One stored version row as its `PolicyVersion`. Shared with the consumption
+/// store for the same reason as [`scope_key`].
+pub(super) fn decode_version(row: &policy_version::Model) -> Result<PolicyVersion, StorageError> {
+    decode(row).map_err(|error| match error {
+        TxError::Storage(error) => error,
+        other => StorageError::Internal(other.to_string()),
+    })
+}
+
 fn decode(row: &policy_version::Model) -> Result<PolicyVersion, TxError> {
     let mut value: PolicyVersion = serde_json::from_str(&row.payload)?;
     if value.policy_id.as_str() != row.policy_id || i64::from(value.version) != row.version {
