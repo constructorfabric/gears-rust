@@ -3,6 +3,9 @@
 use serde_json::{Value, json};
 use uuid::Uuid;
 
+use construct_sdk::gts::PROFILE_ROOT_TYPE;
+
+use super::fact_test::view;
 use super::root::{PayloadCounter, ProfileVersion, Root, root_key};
 use crate::domain::error::DomainError;
 use crate::domain::plan::NodeKey;
@@ -90,4 +93,34 @@ fn a_version_beyond_graph_storages_range_is_a_defect_not_a_conflict() {
 
     assert!(message.contains(&beyond.to_string()), "{message}");
     internal_message(counter.next(Some(u64::MAX)));
+}
+
+#[test]
+fn the_counter_reads_the_version_a_root_carries() {
+    let root = view(
+        PROFILE_ROOT_TYPE,
+        Some(json!({ "subject_id": Uuid::new_v4().to_string(), "version": 7, "removals": [] })),
+    );
+
+    assert_eq!(PayloadCounter.read(&root).unwrap(), 7);
+}
+
+#[test]
+fn a_root_without_a_readable_version_is_a_defect() {
+    for payload in [
+        None,
+        Some(json!({ "removals": [] })),
+        Some(json!({ "version": -1 })),
+        Some(json!({ "version": "1" })),
+        Some(json!({ "version": 1.5 })),
+    ] {
+        let root = view(PROFILE_ROOT_TYPE, payload.clone());
+
+        let message = internal_message(PayloadCounter.read(&root));
+
+        assert!(
+            message.contains("construct:t:fact"),
+            "{payload:?}: {message}"
+        );
+    }
 }

@@ -98,6 +98,7 @@ pub trait ProfileSource: Send + Sync {
 /// What writing an admitted plan gave.
 #[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use = "a conflict means the plan was not stored"]
 pub enum Written {
     Stored,
     /// The profile changed after the plan was built on it, and nothing was stored.

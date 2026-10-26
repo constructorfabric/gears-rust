@@ -1,10 +1,11 @@
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use construct_sdk::gts::HAS_FACT_TYPE;
 use graph_storage_sdk::GraphStorageClientV1;
-use graph_storage_sdk::models::{NodeView, TraverseRequest};
+use graph_storage_sdk::models::{NodeView, TraverseRequest, TruncationReason};
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
@@ -69,20 +70,43 @@ pub(crate) async fn read_stored(
             facts: Vec::new(),
         });
     };
-    // A cut profile would let the planner add what is already stored.
-    if let Some(reason) = response.truncated {
-        return Err(DomainError::ProfileFull(format!(
-            "the profile of subject {} holds more than one read takes ({reason:?})",
-            subject.subject_id
-        )));
+    // A cut profile would let the planner add what is already stored. Only a
+    // node budget means the profile holds too many facts; a cut for any other
+    // reason is a limit of graph storage's, not a full profile.
+    match response.truncated {
+        None => {}
+        Some(TruncationReason::NodeBudget) => {
+            return Err(DomainError::ProfileFull(format!(
+                "the profile of subject {} holds more facts than one read takes",
+                subject.subject_id
+            )));
+        }
+        Some(reason) => {
+            return Err(DomainError::internal(format!(
+                "graph storage cut the profile read of subject {} short: {reason:?}",
+                subject.subject_id
+            )));
+        }
     }
     let root = Root::from_payload(&NodeKey(key.clone()), root_node.payload.as_ref())?;
     let version = versions.read(root_node)?;
     // @cpt-end:cpt-cf-construct-algo-profile-writer-read:p1:inst-read-root
+    // The traversal walks edges both ways and matches derived edge types, so a
+    // fact is only a node that a has-fact edge from this root points to.
+    let pointed: BTreeSet<&str> = response
+        .edges
+        .iter()
+        .filter(|edge| edge.src == key && edge.edge_type_id == HAS_FACT_TYPE)
+        .map(|edge| edge.dst.as_str())
+        .collect();
     let facts = response
         .nodes
-        .into_iter()
-        .filter(|node| node.node_key != key && Category::from_type_id(&node.type_id).is_some())
+        .iter()
+        .filter(|node| {
+            pointed.contains(node.node_key.as_str())
+                && Category::from_type_id(&node.type_id).is_some()
+        })
+        .cloned()
         .collect();
     Ok(Stored {
         version: Some(version),
@@ -129,7 +153,13 @@ impl ProfileSource for GraphProfileSource {
         tenant_id: Uuid,
         subject_id: Uuid,
     ) -> Result<Profile, DomainError> {
-        let subject = subject_in_context(ctx, tenant_id, subject_id)?;
+        let subject = subject_in_context(
+            ctx,
+            SubjectKey {
+                tenant_id,
+                subject_id,
+            },
+        )?;
         let stored = read_stored(
             self.client.as_ref(),
             self.version.as_ref(),
@@ -140,10 +170,11 @@ impl ProfileSource for GraphProfileSource {
         .await?;
 
         // @cpt-begin:cpt-cf-construct-algo-profile-writer-read:p1:inst-read-facts
+        let listed: BTreeSet<&str> = stored.root.removals.iter().map(String::as_str).collect();
         let facts = stored
             .facts
             .iter()
-            .filter(|node| !stored.root.removals.contains(&node.node_key))
+            .filter(|node| !listed.contains(node.node_key.as_str()))
             .filter_map(fact_of)
             .collect();
         Ok(Profile {

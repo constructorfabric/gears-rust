@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -19,6 +20,7 @@ use super::{DEFAULT_CALL_TIMEOUT, bounded, graph_error, subject_in_context};
 use crate::domain::error::DomainError;
 use crate::domain::plan::{Change, NodeKey, Plan};
 use crate::domain::profile::{PlanWriter, Written};
+use crate::domain::subject_settings::SubjectKey;
 
 /// The reason graph storage gives a failed compare-and-set.
 const CAS_CONFLICT: &str = "CAS_CONFLICT";
@@ -27,7 +29,7 @@ const CAS_CONFLICT: &str = "CAS_CONFLICT";
 const SERIALIZATION: &str = "SERIALIZATION";
 
 /// How many times one write is sent while its result is unknown.
-pub const DEFAULT_ATTEMPTS: u32 = 3;
+pub const DEFAULT_ATTEMPTS: NonZeroU32 = NonZeroU32::MIN.saturating_add(2);
 /// The pause before the second send; it doubles for every later one, and a
 /// random share of it is added, so writers that failed together do not come
 /// back together.
@@ -38,12 +40,13 @@ const FIRST_PAUSE: Duration = Duration::from_millis(100);
 /// that swap stays inside this interface.
 #[async_trait]
 pub trait FactRemoval: Send + Sync {
-    /// Remove the fact under `key`. A fact that is already gone is removed.
+    /// Remove the fact under `key`. A fact already removed is removed.
     ///
     /// # Errors
     ///
-    /// When graph storage cannot remove it now, or does not answer in time;
-    /// the key stays listed on the root and a later write tries again.
+    /// When graph storage cannot remove it now, does not answer in time, or
+    /// finds no fact under `key`; the key stays listed on the root and a
+    /// later write tries again.
     async fn remove(&self, ctx: &SecurityContext, key: &str) -> Result<(), DomainError>;
 }
 
@@ -82,9 +85,11 @@ impl FactRemoval for SoftDelete {
         )
         .await?
         {
-            // A fact already tombstoned answers with nothing deleted.
-            Ok(_) | Err(CanonicalError::NotFound { .. }) => Ok(()),
-            Err(err) => Err(graph_error("fact removal", &err)),
+            // A fact already tombstoned answers with nothing deleted. Not found
+            // means graph storage holds no such fact for this context, which a
+            // listed key of a live fact never is, so it is no success.
+            Ok(_) => Ok(()),
+            Err(err) => Err(graph_error(&format!("removal of fact {key}"), &err)),
         }
         // @cpt-end:cpt-cf-construct-algo-profile-writer-write:p1:inst-write-remove
     }
@@ -104,7 +109,7 @@ pub struct WriterPorts {
 /// @cpt-dod:cpt-cf-construct-dod-profile-writer-write:p1
 pub struct GraphPlanWriter {
     ports: WriterPorts,
-    attempts: u32,
+    attempts: NonZeroU32,
     timeout: Duration,
     max_facts: usize,
 }
@@ -122,8 +127,8 @@ impl GraphPlanWriter {
 
     /// Replace [`DEFAULT_ATTEMPTS`].
     #[must_use]
-    pub fn with_attempts(mut self, attempts: u32) -> Self {
-        self.attempts = attempts.max(1);
+    pub fn with_attempts(mut self, attempts: NonZeroU32) -> Self {
+        self.attempts = attempts;
         self
     }
 
@@ -142,21 +147,31 @@ impl GraphPlanWriter {
         self
     }
 
-    /// Remove the facts under `keys`. One that fails stays listed on the root.
-    async fn remove(&self, ctx: &SecurityContext, keys: &BTreeSet<String>) {
-        let mut failed = 0_usize;
-        for key in keys {
-            if let Err(err) = self.ports.removal.remove(ctx, key).await {
-                failed += 1;
-                tracing::warn!(%key, error = %err, "a removed fact stays listed on its root");
+    /// Remove the facts under `keys`, one after another, within one call
+    /// timeout. The first that fails ends the cleanup: it and the rest stay
+    /// listed on the root, and a later write finishes them.
+    async fn remove(&self, ctx: &SecurityContext, keys: &[String]) {
+        let cleanup = async {
+            for (done, key) in keys.iter().enumerate() {
+                if let Err(err) = self.ports.removal.remove(ctx, key).await {
+                    return Err((done, key, err));
+                }
             }
-        }
-        if failed > 0 {
-            tracing::warn!(
-                failed,
+            Ok(())
+        };
+        match tokio::time::timeout(self.timeout, cleanup).await {
+            Ok(Ok(())) => {}
+            Ok(Err((done, key, err))) => tracing::warn!(
+                %key,
+                error = %err,
+                left = keys.len() - done,
+                "removed facts stay listed on the root until a later write finishes them"
+            ),
+            Err(_) => tracing::warn!(
                 listed = keys.len(),
-                "removed facts stay listed until a later write finishes them"
-            );
+                timeout = ?self.timeout,
+                "removed facts stay listed on the root until a later write finishes them"
+            ),
         }
     }
 
@@ -188,7 +203,7 @@ impl GraphPlanWriter {
                 // No answer in time: the write may or may not have committed.
                 Err(_) => format!("no answer within {:?}", self.timeout),
             };
-            if attempt >= self.attempts {
+            if attempt >= self.attempts.get() {
                 return Err(DomainError::Unavailable(format!(
                     "graph storage profile write: result unknown after {attempt} sends: {failed}"
                 )));
@@ -214,14 +229,14 @@ fn jitter(pause: Duration) -> Duration {
 }
 
 /// Whether the write may or may not have committed, or certainly did not and
-/// can be sent as it is: unavailable, out of time, unknown, or a lost
-/// serialization race. Sending it again with its key is safe in each case.
+/// can be sent as it is: unavailable, out of time, or a lost serialization
+/// race. Sending it again with its key is safe in each case. An unknown error
+/// is not among them: it says nothing about the write, so it is a defect to
+/// report, not a state to wait out.
 pub(super) fn unknown_result(err: &CanonicalError) -> bool {
     match err {
         CanonicalError::Aborted { ctx, .. } => ctx.reason == SERIALIZATION,
-        CanonicalError::ServiceUnavailable { .. }
-        | CanonicalError::DeadlineExceeded { .. }
-        | CanonicalError::Unknown { .. } => true,
+        CanonicalError::ServiceUnavailable { .. } | CanonicalError::DeadlineExceeded { .. } => true,
         _ => false,
     }
 }
@@ -269,7 +284,13 @@ impl PlanWriter for GraphPlanWriter {
         if plan.steps.is_empty() {
             return Ok(Written::Stored);
         }
-        let subject = subject_in_context(ctx, plan.tenant_id, plan.subject_id)?;
+        let subject = subject_in_context(
+            ctx,
+            SubjectKey {
+                tenant_id: plan.tenant_id,
+                subject_id: plan.subject_id,
+            },
+        )?;
         self.ports.types.ensure(ctx).await?;
 
         // @cpt-begin:cpt-cf-construct-algo-profile-writer-write:p1:inst-write-read-root
@@ -281,7 +302,13 @@ impl PlanWriter for GraphPlanWriter {
             &subject,
         )
         .await?;
+        let stored_version = stored.version;
         if stored.version != plan.profile_version {
+            tracing::debug!(
+                stored = ?stored.version,
+                planned = ?plan.profile_version,
+                "the plan was built on an older profile"
+            );
             return Ok(Written::Conflict);
         }
         let live: BTreeSet<&str> = stored
@@ -327,18 +354,20 @@ impl PlanWriter for GraphPlanWriter {
                 self.max_facts
             )));
         }
-        let listed: BTreeSet<String> = pending.into_iter().chain(removals).collect();
-        let version = self.ports.version.next(stored.version)?;
-        let payload = Root {
-            removals: listed.iter().cloned().collect(),
-        }
-        .payload(plan.subject_id, self.ports.version.as_ref(), version)?;
+        let version = self.ports.version.next(stored_version)?;
+        let mut listed = pending;
+        listed.extend(removals);
+        // Sorted and without duplicates, as the set it comes from.
+        let root_now = Root {
+            removals: listed.into_iter().collect(),
+        };
+        let payload = root_now.payload(plan.subject_id, self.ports.version.as_ref(), version)?;
         nodes.push(NodeSpec {
             node_key: root.0,
             type_id: PROFILE_ROOT_TYPE.to_owned(),
             name: None,
             payload: Some(payload),
-            expected_version: Some(self.ports.version.expected(stored.version)?),
+            expected_version: Some(self.ports.version.expected(stored_version)?),
         });
         let request = IngestRequest {
             nodes,
@@ -349,14 +378,24 @@ impl PlanWriter for GraphPlanWriter {
         };
         // @cpt-end:cpt-cf-construct-algo-profile-writer-write:p1:inst-write-batch
 
-        let written = self.ingest(ctx, request).await?;
-        if written == Written::Stored {
-            // @cpt-begin:cpt-cf-construct-algo-profile-writer-write:p1:inst-write-cleanup
-            // Committed: every listed fact is already left out of reads, so a
-            // removal that fails now is finished by a later write.
-            self.remove(ctx, &listed).await;
-            // @cpt-end:cpt-cf-construct-algo-profile-writer-write:p1:inst-write-cleanup
+        match self.ingest(ctx, request).await? {
+            Written::Stored => {
+                // @cpt-begin:cpt-cf-construct-algo-profile-writer-write:p1:inst-write-cleanup
+                // Committed: every listed fact is already left out of reads, so
+                // a removal that fails now is finished by a later write.
+                self.remove(ctx, &root_now.removals).await;
+                // @cpt-end:cpt-cf-construct-algo-profile-writer-write:p1:inst-write-cleanup
+                Ok(Written::Stored)
+            }
+            Written::Conflict => {
+                // The read matched, so the root moved between the read and the
+                // write: a concurrent write, or a write from outside Construct.
+                tracing::warn!(
+                    expected = ?stored_version,
+                    "graph storage refused the profile write's compare-and-set"
+                );
+                Ok(Written::Conflict)
+            }
         }
-        Ok(written)
     }
 }

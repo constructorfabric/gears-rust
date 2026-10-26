@@ -35,9 +35,11 @@ mod root_test;
 /// cut off a statement once it is sent, so the bound has to be the caller's.
 pub const DEFAULT_CALL_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// A failed graph storage call as a domain error: forbidden when graph storage
-/// refuses Construct's permission, unavailable when a retry may cure it,
-/// internal otherwise. `what` names the call.
+/// A failed graph storage call as a domain error: unavailable when a retry may
+/// cure it, internal otherwise. A refusal of Construct's own permission is
+/// internal too: it is the deployment's grant that is missing, not the
+/// caller's right, so it is no `Forbidden`, which means the caller was denied.
+/// `what` names the call.
 #[allow(unknown_lints, reason = "dylint lint names are unknown to rustc")]
 #[allow(
     de1302_error_from_to_string,
@@ -46,7 +48,9 @@ pub const DEFAULT_CALL_TIMEOUT: Duration = Duration::from_secs(10);
 pub(crate) fn graph_error(what: &str, err: &CanonicalError) -> DomainError {
     match err {
         CanonicalError::PermissionDenied { .. } | CanonicalError::Unauthenticated { .. } => {
-            DomainError::forbidden(format!("graph storage {what}: {err}"))
+            DomainError::internal(format!(
+                "graph storage refused Construct's own permission for {what}: {err}"
+            ))
         }
         _ if is_retryable(err) => DomainError::Unavailable(format!("graph storage {what}: {err}")),
         _ => DomainError::internal(format!("graph storage {what}: {err}")),
@@ -72,27 +76,24 @@ pub(crate) async fn bounded<T>(
     })
 }
 
-/// The profile of `subject_id` in the context's tenant. Graph storage reads
-/// and writes in the security context's tenant, and the profile's keys name a
+/// `subject` when it is in the context's tenant. Graph storage reads and
+/// writes in the security context's tenant, and the profile's keys name a
 /// tenant too, so the two must be the same.
 ///
 /// # Errors
 ///
-/// [`DomainError::Internal`] when `tenant_id` is not the context's tenant: the
-/// caller built the context for another tenant, which is a defect.
+/// [`DomainError::Internal`] when the subject's tenant is not the context's:
+/// the caller built the context for another tenant, which is a defect.
 pub(crate) fn subject_in_context(
     ctx: &SecurityContext,
-    tenant_id: uuid::Uuid,
-    subject_id: uuid::Uuid,
+    subject: SubjectKey,
 ) -> Result<SubjectKey, DomainError> {
     let context_tenant = ctx.subject_tenant_id();
-    if context_tenant != tenant_id {
+    if context_tenant != subject.tenant_id {
         return Err(DomainError::internal(format!(
-            "the profile's tenant {tenant_id} is not the context's tenant {context_tenant}"
+            "the profile's tenant {} is not the context's tenant {context_tenant}",
+            subject.tenant_id
         )));
     }
-    Ok(SubjectKey {
-        tenant_id,
-        subject_id,
-    })
+    Ok(subject)
 }
