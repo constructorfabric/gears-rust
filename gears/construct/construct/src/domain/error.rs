@@ -26,6 +26,12 @@ pub enum DomainError {
     #[error("Internal error: {0}")]
     Internal(String),
 
+    /// The subject's profile holds as many facts as one read takes: it takes
+    /// no new fact, and a profile past that cannot be read whole. Not a
+    /// defect, and not cured by a retry.
+    #[error("Profile full: {0}")]
+    ProfileFull(String),
+
     #[error("Database error: {0}")]
     Database(#[from] DbError),
 }

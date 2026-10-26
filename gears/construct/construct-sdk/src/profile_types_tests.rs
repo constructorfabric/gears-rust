@@ -34,7 +34,7 @@ impl Retrieve for GraphStorageSchemas {
     }
 }
 
-fn schema(graph_type: PersonType) -> Value {
+fn schema(graph_type: GraphType) -> Value {
     serde_json::from_str(graph_type.schema).expect("a JSON schema")
 }
 
@@ -102,9 +102,39 @@ fn a_root_refuses_what_it_does_not_declare() {
         "unique keys"
     );
     assert!(refused(&|p| p["removals"] = json!([""])), "no empty key");
-    assert!(refused(&|p| {
-        p.as_object_mut().unwrap().remove("removals");
-    }));
+    for member in ["subject_id", "version", "removals"] {
+        assert!(
+            refused(&|p| {
+                p.as_object_mut().unwrap().remove(member);
+            }),
+            "{member} is required"
+        );
+    }
+    assert!(
+        refused(&|p| p["removals"] = json!((0..1001).map(|i| format!("k{i}")).collect::<Vec<_>>())),
+        "at most 1000 removals"
+    );
+    assert!(
+        refused(&|p| p["removals"] = json!(["k".repeat(2049)])),
+        "a key of at most 2048 characters"
+    );
+}
+
+#[test]
+fn a_root_takes_as_many_removals_and_as_long_a_key_as_its_bounds_allow() {
+    let validator = root_validator();
+    let mut payload = valid_payload();
+    payload["removals"] = json!(
+        (0..1000)
+            .map(|i| if i == 0 {
+                "k".repeat(2048)
+            } else {
+                format!("k{i}")
+            })
+            .collect::<Vec<_>>()
+    );
+
+    assert!(validator.is_valid(&root(&payload)));
 }
 
 #[test]

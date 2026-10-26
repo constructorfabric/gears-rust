@@ -34,7 +34,7 @@ impl Category {
     /// `name`, or `None` for any other name.
     #[must_use]
     pub fn from_name(name: &str) -> Option<Self> {
-        [Self::Identity, Self::Role, Self::Skill, Self::Preference]
+        Self::ALL
             .into_iter()
             .find(|category| category.name() == name)
     }

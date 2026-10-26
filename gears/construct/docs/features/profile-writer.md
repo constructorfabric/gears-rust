@@ -169,41 +169,21 @@ security context's is refused.
 
 - [x] `p1` - **ID**: `cpt-cf-construct-algo-profile-writer-write`
 
-**Input**: Processing's security context for the tenant, and an admitted plan with the profile version it was built
-on.
+**Input**: Processing's security context for the tenant, and an admitted plan with the profile version it was built on.
 
-**Output**: Stored, or a conflict when the profile changed after the plan was built on it. Or an error when graph
-storage refuses the write or cannot take it.
+**Output**: Stored, or a conflict when the profile changed after the plan was built on it. Or an error: the profile is full, graph storage is unavailable or does not answer in time, Construct's permission is refused, or the plan or the stored root is defective.
 
 **Steps**:
-1. [x] - `p1` - A plan without steps stores nothing and answers stored. Otherwise make sure Construct's graph types
-   exist in the tenant: register the root, the edge and the person types the first time this process writes there.
-   Registering the same schemas again converges, so a restart or a second instance is safe - `inst-write-register`
-2. [x] - `p1` - Read the subject's root, by its key `construct:{tenant}:root:{subject}`. **IF** its version, none for
-   a subject without a root, is not the plan's, **RETURN** conflict: the profile changed after the plan was built -
-   `inst-write-read-root`
-3. [x] - `p1` - Remove the facts the root still lists from earlier writes, and keep listed the ones that cannot be
-   removed now - `inst-write-pending`
-4. [x] - `p1` - Build one ingest: a node and a has-fact edge from the root for each added fact and each replacing
-   fact; the key of each replaced or removed fact on the root's removal list, beside the ones still pending; and the
-   root with the next version. A step that changes one property of a node, rather than a whole fact, is a defect: a
-   node holds one fact - `inst-write-batch`
-5. [x] - `p1` - A fact node is its category's person type, with the one property, its `origin` and, for a record's
-   fact, its `record`. It claims its new key with `expected_version = 0`, so a key in use is a conflict, never an
-   overwrite - `inst-write-fact`
-6. [x] - `p1` - The origin names the producer, the method, the model for an agent, `produced_at` (the record's
-   `observed_at`, or the time of the write for a person or an agent) and the step's confidence, as the table in
-   Origin of a Fact says - `inst-write-origin`
-7. [x] - `p1` - The root's expected version is its version, or 0 for a subject without one: 0 claims a key no node
-   holds, so two first writes cannot both create the root - `inst-write-expected`
-8. [x] - `p1` - Send the ingest with a new idempotency key. **IF** graph storage answers `CAS_CONFLICT`, **RETURN**
-   conflict; nothing was stored. **IF** the result is unknown (unavailable, out of time, unknown, or a lost
-   serialization race), send the same request with the same key again, up to 3 times in all. Any other refusal is an
-   error - `inst-write-ingest`
-9. [x] - `p1` - Once stored, remove the facts this write listed. A removal that fails stays listed on the root; the
-   read already leaves it out, and the next write finishes it. **RETURN** stored - `inst-write-cleanup`
-10. [x] - `p1` - A removal is graph storage's soft delete of the fact's node, which also tombstones its edge. A fact
-    already gone counts as removed - `inst-write-remove`
+1. [x] - `p1` - A plan without steps stores nothing and answers stored. A plan for another tenant than the security context's is refused. Otherwise make sure Construct's graph types exist in the tenant: register the root, the edge and the person types the first time this process writes there, and remember the tenant only when the registration succeeded. Registering the same schemas again converges, so a restart or a second instance is safe - `inst-write-register`
+2. [x] - `p1` - Read the profile as Read a Profile does: the root and every live fact one has-fact edge from it, also the facts the root lists for removal whose delete has not run yet. **IF** the root's version, none for a subject without a root, is not the plan's, **RETURN** conflict: the profile changed after the plan was built - `inst-write-read-root`
+3. [x] - `p1` - Of the removals the root still lists, keep only those that are live facts of this root. A listed fact that is gone was removed and drops off the list; a listed key that is not a fact of this root is never deleted, so a root someone else rewrote cannot make Construct delete another node - `inst-write-pending`
+4. [x] - `p1` - Build one ingest: a node and a has-fact edge from the root for each added fact and each replacing fact, and the root, listing the kept removals and the facts this plan replaces or removes. **IF** the plan removes a key that is not a live fact of the profile, the plan is defective. **IF** the live facts, those still listed included, plus the new ones would pass the limit (999 facts, what one read takes), **RETURN** profile full: a full profile takes removals, and new facts once its deletes have run - `inst-write-batch`
+5. [x] - `p1` - A fact node is its category's person type, with the one property, its `origin` and, for a record's fact, its `record`. It claims its new key with `expected_version = 0`, so a key in use is a conflict, never an overwrite. A step that changes one property of a node rather than a whole fact, or a fact without exactly one property, is a defect; the message names the kind of change, never a value - `inst-write-fact`
+6. [x] - `p1` - The origin names the producer, the method, the model for an agent, `produced_at` (the record's `observed_at`, or the time of the write for a person or an agent) and the step's confidence as the decimal the model gave, as the table in Origin of a Fact says - `inst-write-origin`
+7. [x] - `p1` - The root's expected version is its version, or 0 for a subject without one: 0 claims a key no node holds, so two first writes cannot both create the root. A stored version beyond graph storage's range is a defect of the root, not a conflict - `inst-write-expected`
+8. [x] - `p1` - Send the ingest with a new idempotency key, waiting at most 10 seconds by default. **IF** graph storage answers `CAS_CONFLICT`, **RETURN** conflict; nothing was stored. **IF** the result is unknown (no answer in time, unavailable, deadline exceeded, unknown, or a lost serialization race), send the same request with the same key again after a pause that doubles each time, plus a random share of it, logged at warn, up to 3 sends in all; after the last one **RETURN** unavailable. Any other refusal is an error - `inst-write-ingest`
+9. [x] - `p1` - Once stored, remove every fact the root now lists. A removal that fails stays listed and is logged with its key; reads already leave it out, and a later write finishes it. **RETURN** stored - `inst-write-cleanup`
+10. [x] - `p1` - A removal is graph storage's soft delete of the fact's node, which also tombstones its edge, waiting at most 10 seconds by default. A fact already gone counts as removed - `inst-write-remove`
 
 ### Read a Profile
 
@@ -214,8 +194,8 @@ storage refuses the write or cannot take it.
 **Output**: The profile: the root's version, none for a subject without a profile, and its facts. Or an error.
 
 **Steps**:
-1. [x] - `p1` - Traverse one has-fact edge from the subject's root, taking at most 1000 nodes - `inst-read-traverse`
-2. [x] - `p1` - **IF** there is no root, **RETURN** no version and no facts. **IF** the traversal was cut short, **RETURN** an error, because a partial profile would let the planner add what is already stored. Otherwise read the version and the removal list from the root - `inst-read-root`
+1. [x] - `p1` - A tenant other than the security context's is refused. Traverse one has-fact edge from the subject's root, taking at most 1000 nodes and waiting at most 10 seconds by default; no answer in time is unavailable - `inst-read-traverse`
+2. [x] - `p1` - **IF** there is no root, **RETURN** no version and no facts. **IF** the traversal was cut short, **RETURN** profile full, because a partial profile would let the planner add what is already stored. Otherwise read the version and the removal list from the root - `inst-read-root`
 3. [x] - `p1` - **RETURN** every fact node of a person type that the root does not list for removal, as its category, its property and its value - `inst-read-facts`
 
 ## 4. States (CDSL)
@@ -297,12 +277,7 @@ registration before the person types.
 
 - [x] `p1` - **ID**: `cpt-cf-construct-dod-profile-writer-version`
 
-The profile version **MUST** sit behind one interface that reads it from a stored root and gives the root write's
-expected version and the next version, opaque to the planner. Graph storage returns no node version on read,
-so the first implementation **MUST** keep a counter in the root's payload: the root is created at 1 and
-every write adds one, so every root write changes the node and the counter equals graph storage's stored version.
-Construct is the root's only writer. An implementation that reads graph storage's version **MAY** replace it without
-changing the writer or the planner.
+The profile version **MUST** sit behind one interface that reads it from a stored root, gives the root write's expected version and the next version, and stamps it on the root being written, opaque to the planner. Graph storage returns no node version on read, so the first implementation **MUST** keep a counter in the root's payload: the root is created at 1 and every write adds one, so every root write changes the node and the counter equals graph storage's stored version. Construct is the root's only writer. The rest of the root's payload **MUST NOT** depend on the counter, so an implementation that reads graph storage's version **MAY** replace it with a root type that drops the counter, without changing the writer or the read. A version the counter cannot carry into graph storage's range **MUST** be an error, not a conflict.
 
 **Implements**:
 - `cpt-cf-construct-algo-profile-writer-write`
@@ -310,16 +285,13 @@ changing the writer or the planner.
 **Touches**:
 - Code: `infra::graph::root::{ProfileVersion, PayloadCounter, Root}`
 
-**Verified by**: `a_new_subject_creates_its_root_at_version_one_and_every_write_adds_one`,
-`a_root_payload_reads_back_as_written`, `a_root_without_a_valid_payload_is_a_defect` (unit), and the version read back
-in `a_first_plan_creates_the_root_and_reads_back_whole` and `a_replace_stores_the_new_fact_and_removes_the_old_in_one_write`.
+**Verified by**: `a_new_subject_creates_its_root_at_version_one_and_every_write_adds_one`, `a_version_beyond_graph_storages_range_is_a_defect_not_a_conflict`, `a_root_payload_reads_back_as_written_with_the_counter_stamped`, `a_root_without_a_valid_payload_names_the_root_and_what_is_wrong` (unit), and the version read back in `a_first_plan_creates_the_root_and_reads_back_whole` and `a_replace_stores_the_new_fact_and_removes_the_old_in_one_write`.
 
 ### Fact Node from a Plan
 
 - [x] `p1` - **ID**: `cpt-cf-construct-dod-profile-writer-fact-payload`
 
-The writer **MUST** store each new fact as a node of its category's person type, with the one property, the origin
-of the table in Origin of a Fact, and the record for a record's fact, and **MUST** claim the node's new key.
+The writer **MUST** store each new fact as a node of its category's person type, with the one property, the origin of the table in Origin of a Fact, the step's confidence as the decimal the model gave, and the record for a record's fact, and **MUST** claim the node's new key. It **MUST** take the key and the property from the step's own change, and **MUST** refuse a change of one property of a node without naming its value.
 
 **Implements**:
 - `cpt-cf-construct-algo-profile-writer-write`
@@ -328,18 +300,13 @@ of the table in Origin of a Fact, and the record for a record's fact, and **MUST
 **Touches**:
 - Code: `infra::graph::fact::{fact_node, fact_of}`
 
-**Verified by**: `a_records_fact_names_the_connector_its_record_and_when_it_was_observed`,
-`an_agents_fact_names_the_subject_and_the_agent_as_model`, `a_persons_fact_names_the_person_and_carries_no_confidence`,
-`a_step_of_no_known_category_is_a_defect` (unit), and graph storage's validation of every written node in the
-integration tests, including `a_value_its_type_refuses_stores_nothing`.
+**Verified by**: `a_records_fact_names_the_connector_its_record_and_when_it_was_observed`, `a_confidence_is_stored_as_the_decimal_the_model_gave`, `an_agents_fact_names_the_subject_and_the_agent_as_model`, `a_persons_fact_names_the_person_and_a_step_without_confidence_stores_none`, `a_removal_stores_no_node`, `a_step_of_no_known_category_is_a_defect`, `a_fact_must_hold_exactly_one_property`, `a_property_change_is_refused_without_its_value_in_the_message`, `a_stored_fact_reads_back_as_its_property_and_value`, `a_node_that_holds_no_fact_is_no_fact` (unit), and graph storage's validation of every written node in the integration tests, including `a_value_its_type_refuses_stores_nothing`.
 
 ### Type Registration
 
 - [x] `p1` - **ID**: `cpt-cf-construct-dod-profile-writer-registration`
 
-Construct's graph types **MUST** be registered with graph storage in each tenant before the first write there, cached
-per process. A restart against a tenant that has them **MUST** converge rather than conflict. Registration needs the
-`admin` action on graph storage's type resource, so the deployment grants it to Construct's processing identity.
+Construct's graph types **MUST** be registered with graph storage in each tenant before the first write there, cached per process; a registration that failed **MUST NOT** be remembered. A restart against a tenant that has them **MUST** converge rather than conflict. Registration needs the `admin` action on graph storage's type resource, so the deployment grants it to Construct's processing identity.
 
 **Implements**:
 - `cpt-cf-construct-algo-profile-writer-write`
@@ -347,17 +314,13 @@ per process. A restart against a tenant that has them **MUST** converge rather t
 **Touches**:
 - Code: `infra::graph::types::GraphTypes`
 
-**Verified by**: `the_types_register_again_after_a_restart_without_conflict`, and the first write of every
-integration test, which registers in a new tenant.
+**Verified by**: `the_types_register_again_after_a_restart_without_conflict`, `registration_is_remembered_per_tenant_and_a_failed_one_is_not`, and the first write of every integration test, which registers in a new tenant.
 
 ### One Write per Plan
 
 - [x] `p1` - **ID**: `cpt-cf-construct-dod-profile-writer-write`
 
-The writer **MUST** store an admitted plan in one ingest that lands whole or not at all, with the root's expected
-version as the compare-and-set, so two plans on one profile never both land. A replaced or removed fact **MUST** be
-listed on the root in that ingest and **MUST** be removed after it; a removal that fails **MUST** stay listed until a
-later write finishes it. A write whose result is unknown **MUST** be sent again with the same idempotency key.
+The writer **MUST** store an admitted plan in one ingest that lands whole or not at all, with the root's expected version as the compare-and-set, so two plans on one profile never both land. A replaced or removed fact **MUST** be listed on the root in that ingest and **MUST** be removed after it; a removal that fails **MUST** stay listed until a later write finishes it, and only a live fact of the root **MUST** ever be removed. The writer **MUST NOT** let a profile grow past what one read takes. Every graph storage call **MUST** be bounded in time, and a write whose result is unknown **MUST** be sent again with the same idempotency key, a bounded number of times.
 
 **Implements**:
 - `cpt-cf-construct-algo-profile-writer-write`
@@ -366,20 +329,13 @@ later write finishes it. A write whose result is unknown **MUST** be sent again 
 - Sequences: `cpt-cf-construct-seq-record-in`, `cpt-cf-construct-seq-entity-replaced`
 - Code: `infra::graph::writer::{GraphPlanWriter, FactRemoval, SoftDelete}`, the `domain::profile::PlanWriter` port
 
-**Verified by**: `a_first_plan_creates_the_root_and_reads_back_whole`,
-`a_replace_stores_the_new_fact_and_removes_the_old_in_one_write`, `a_removed_fact_is_gone_from_the_next_read`,
-`a_plan_built_on_an_older_profile_conflicts_and_stores_nothing`, `two_plans_on_the_same_profile_never_both_land`,
-`a_removal_that_fails_stays_listed_and_the_next_write_finishes_it`,
-`a_write_whose_answer_was_lost_is_sent_again_with_its_key_and_lands_once`, `a_value_its_type_refuses_stores_nothing`,
-`an_empty_plan_writes_nothing` and `a_plan_for_another_tenant_than_the_context_is_refused_and_stores_nothing`. They run against graph storage's own service over its in-memory store, with a
-stub policy service; Postgres and the real AuthZ resolver were not run.
+**Verified by**: `a_first_plan_creates_the_root_and_reads_back_whole`, `a_replace_stores_the_new_fact_and_removes_the_old_in_one_write`, `a_removal_that_is_done_drops_off_the_root_on_the_next_write`, `a_removed_fact_is_gone_from_the_next_read`, `a_plan_built_on_an_older_profile_conflicts_and_stores_nothing`, `two_plans_on_the_same_profile_never_both_land`, `two_first_writes_create_the_root_once` (both hold the two writes until both reach the ingest), `a_compare_and_set_refused_at_the_ingest_is_a_conflict`, `a_removal_that_fails_stays_listed_and_a_later_write_finishes_it`, `a_listed_key_that_is_not_a_fact_of_the_root_is_never_deleted`, `a_plan_that_removes_a_fact_not_in_its_profile_is_refused`, `a_full_profile_takes_no_new_fact_but_takes_a_removal`, `a_write_whose_answer_was_lost_is_sent_again_with_its_key_and_lands_once`, `a_lost_serialization_race_is_sent_again`, `a_write_that_never_gets_an_answer_gives_up_after_its_attempts_as_unavailable`, `a_send_without_an_answer_in_time_is_sent_again`, `only_a_write_whose_result_is_unknown_is_sent_again`, `graph_storage_failures_map_to_what_a_caller_can_act_on`, `a_value_its_type_refuses_stores_nothing`, `a_property_change_is_refused_and_stores_nothing`, `an_empty_plan_writes_nothing` and `a_profile_of_another_tenant_than_the_context_is_refused`. They run against graph storage's own service over its in-memory store, with a stub policy service; Postgres and the real AuthZ resolver were not run.
 
 ### Profile Read
 
 - [x] `p1` - **ID**: `cpt-cf-construct-dod-profile-writer-read`
 
-The profile read **MUST** return the root's version and every fact one has-fact edge from the root, in one call,
-**MUST** leave out a fact the root lists for removal, and **MUST** fail rather than return a cut profile.
+The profile read **MUST** return the root's version and every fact one has-fact edge from the root, in one call bounded in time, **MUST** leave out a fact the root lists for removal, **MUST** answer profile full rather than return a cut profile, and **MUST** refuse a tenant other than the security context's.
 
 **Implements**:
 - `cpt-cf-construct-algo-profile-writer-read`
@@ -387,9 +343,7 @@ The profile read **MUST** return the root's version and every fact one has-fact 
 **Touches**:
 - Code: `infra::graph::reader::GraphProfileSource`, the `domain::profile::ProfileSource` port
 
-**Verified by**: `a_subject_without_a_profile_reads_empty`, `a_first_plan_creates_the_root_and_reads_back_whole`, and
-the listed fact left out in `a_removal_that_fails_stays_listed_and_the_next_write_finishes_it`. No test cuts a
-profile at the node limit.
+**Verified by**: `a_subject_without_a_profile_reads_empty`, `a_first_plan_creates_the_root_and_reads_back_whole`, `a_profile_cut_short_by_the_read_limit_is_full_not_partial`, `a_read_without_an_answer_in_time_is_unavailable`, `a_profile_of_another_tenant_than_the_context_is_refused`, and the listed fact left out in `a_removal_that_fails_stays_listed_and_a_later_write_finishes_it`.
 
 ## 6. Acceptance Criteria
 
@@ -403,8 +357,11 @@ profile at the node limit.
 - [ ] A plan lands whole or not at all (`a_value_its_type_refuses_stores_nothing`,
       `a_replace_stores_the_new_fact_and_removes_the_old_in_one_write`).
 - [ ] Two records for one subject at the same moment never mix: the second write conflicts and is planned again
-      (`two_plans_on_the_same_profile_never_both_land`, `a_plan_built_on_an_older_profile_conflicts_and_stores_nothing`),
-      including a retried write (`a_write_whose_answer_was_lost_is_sent_again_with_its_key_and_lands_once`).
+      (`two_plans_on_the_same_profile_never_both_land`, `two_first_writes_create_the_root_once`,
+      `a_plan_built_on_an_older_profile_conflicts_and_stores_nothing`), including a retried write
+      (`a_write_whose_answer_was_lost_is_sent_again_with_its_key_and_lands_once`).
+- [ ] Only a live fact of the subject's root is ever deleted (`a_listed_key_that_is_not_a_fact_of_the_root_is_never_deleted`).
+- [ ] A profile never grows past what one read takes (`a_full_profile_takes_no_new_fact_but_takes_a_removal`).
 
 ## 7. Non-Functional Considerations
 
@@ -415,8 +372,6 @@ profile at the node limit.
   payload and embedding as a tombstone, and an erasure by scope replacement skips tombstones. When #5194 ships, the
   facts soft-deleted before it need a one-off hard delete; whether #5194 can hard-delete an already tombstoned node is
   open with graph storage.
-- **Reliability**: a write is one transaction in graph storage. A write whose result is unknown is sent again with
-  its idempotency key, which replays the recorded result. Graph storage's embedding is on by default, so an
-  embedding provider that fails fails the write; processing then drops the record.
-- **Limits**: one read takes at most 1000 nodes, graph storage's default traversal ceiling, so a profile holds at most
-  999 facts; a larger one fails the read rather than being cut.
+- **Reliability**: a write is one transaction in graph storage. Every graph storage call waits at most 10 seconds by default, because graph storage cannot cut off a statement it has started. A write whose result is unknown is sent again with its idempotency key, which replays the recorded result, after a doubling pause with a random share added, so writers that failed together do not retry together; after 3 sends it is unavailable and processing drops the record. Graph storage's embedding is on by default, so an embedding provider that fails fails the write.
+- **Errors**: a refusal of Construct's permission by graph storage is forbidden, a failure a retry may cure is unavailable, a full profile has its own error, and everything else is internal. No error message holds a fact value.
+- **Limits**: one read takes at most 1000 nodes, graph storage's default traversal ceiling, so a profile holds at most 999 facts. The writer counts a fact listed for removal until its delete has run, so a profile never passes the limit even while deletes fail; at the limit it takes plans that remove, and new facts once the deletes have run. A profile cut short by the read fails as full rather than being returned partially.

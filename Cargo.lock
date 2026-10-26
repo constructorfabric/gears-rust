@@ -2543,6 +2543,7 @@ dependencies = [
  "inventory",
  "jsonschema 0.40.2",
  "proptest",
+ "rand 0.10.3",
  "sea-orm",
  "sea-orm-migration",
  "serde",
