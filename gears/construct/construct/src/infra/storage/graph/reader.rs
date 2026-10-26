@@ -218,20 +218,22 @@ impl StoredProfiles for GraphProfileSource {
             &subject,
         )
         .await?;
+        // A malformed fact is left out here, while the planner's read fails
+        // on it: an application is better served by the rest of the profile,
+        // whereas a plan built on a partial profile could add what is stored.
         let listed = &stored.root.removals;
         Ok(stored
             .facts
-            .into_iter()
+            .iter()
             .filter(|node| !listed.contains(node.node_key.as_str()))
             .filter_map(|node| {
-                let node_key = node.node_key.clone();
-                let fact = stored_fact_of(node);
-                if fact.is_none() {
-                    // Only Construct writes these nodes, so this is a defect,
-                    // not a state a reader should see in silence.
-                    tracing::warn!(node_key = %node_key, "a stored fact has no readable payload; it is not served");
-                }
-                fact
+                stored_fact_of(node)
+                    .inspect_err(|defect| {
+                        // Only Construct writes these nodes, so this is a
+                        // defect, not a state a reader should see in silence.
+                        tracing::warn!(%defect, "a stored fact cannot be read; it is not served");
+                    })
+                    .ok()
             })
             .collect())
         // @cpt-end:cpt-cf-construct-algo-profile-reader-read:p1:inst-read-stored

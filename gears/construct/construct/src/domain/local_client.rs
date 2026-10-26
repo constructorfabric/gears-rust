@@ -8,6 +8,7 @@ use construct_sdk::{
 use toolkit_canonical_errors::CanonicalError;
 use toolkit_macros::domain_model;
 use toolkit_security::SecurityContext;
+use tracing::Instrument as _;
 use uuid::Uuid;
 
 use crate::domain::profile::Category;
@@ -69,11 +70,22 @@ where
         subject_id: Uuid,
     ) -> Result<SubjectProfile, CanonicalError> {
         // @cpt-begin:cpt-cf-construct-flow-profile-reader-read:p1:inst-profile-client
-        let view = self
-            .profile
-            .read(ctx, tenant_id, subject_id)
-            .await
-            .map_err(CanonicalError::from)?;
+        // The error is mapped, and so logged, inside this span, so the log
+        // names the caller, the subject and the tenant, as on REST.
+        let span = tracing::info_span!(
+            "profile_read",
+            %subject_id,
+            caller = %ctx.subject_id(),
+            tenant_id = %tenant_id.unwrap_or_else(|| ctx.subject_tenant_id())
+        );
+        let view = async {
+            self.profile
+                .read(ctx, tenant_id, subject_id)
+                .await
+                .map_err(CanonicalError::from)
+        }
+        .instrument(span)
+        .await?;
         Ok(subject_profile(view))
         // @cpt-end:cpt-cf-construct-flow-profile-reader-read:p1:inst-profile-client
     }

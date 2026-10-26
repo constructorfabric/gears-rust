@@ -5,7 +5,9 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use authz_resolver_sdk::AuthZResolverApi;
-use authz_resolver_sdk::constraints::{Constraint, InPredicate, Predicate};
+use authz_resolver_sdk::constraints::{
+    Constraint, InPredicate, InTenantSubtreePredicate, Predicate,
+};
 use authz_resolver_sdk::models::{
     EvaluationRequest, EvaluationResponse, EvaluationResponseContext,
 };
@@ -23,8 +25,9 @@ use crate::domain::profile_read::{
 };
 use crate::domain::subject_settings::{SubjectKey, SubjectSettings};
 use crate::test_support::{
-    AllowResolver, DenyResolver, FixedFacts, OwnTenantOnlyResolver, RecordingProfileEvents,
-    RecordingResolver, inmem_db, profile_service, profile_service_over, seed_subject_settings,
+    AllowResolver, DenyResolver, ErroringResolver, FixedFacts, OwnTenantOnlyResolver,
+    RecordingProfileEvents, RecordingResolver, inmem_db, profile_service, profile_service_over,
+    seed_subject_settings,
 };
 
 fn fact(category: Category, property: &str, value: serde_json::Value) -> StoredFact {
@@ -50,6 +53,15 @@ fn facts() -> Vec<StoredFact> {
 fn caller_in(tenant: Uuid) -> SecurityContext {
     SecurityContext::builder()
         .subject_id(Uuid::new_v4())
+        .subject_tenant_id(tenant)
+        .build()
+        .unwrap()
+}
+
+/// The subject itself, logged in to `tenant`.
+fn subject_in(tenant: Uuid, subject: Uuid) -> SecurityContext {
+    SecurityContext::builder()
+        .subject_id(subject)
         .subject_tenant_id(tenant)
         .build()
         .unwrap()
@@ -273,7 +285,19 @@ async fn a_category_the_scope_leaves_out_is_not_listed() {
     );
 
     let view = service
-        .read(&caller_in(Uuid::new_v4()), None, Uuid::new_v4())
+        .read(
+            &subject_in(Uuid::new_v4(), Uuid::new_v4()),
+            None,
+            Uuid::nil(),
+        )
+        .await;
+    assert!(
+        matches!(view, Err(DomainError::NotVisible(_))),
+        "a tenant-only answer reaches no one else: {view:?}"
+    );
+    let subject = Uuid::new_v4();
+    let view = service
+        .read(&subject_in(Uuid::new_v4(), subject), None, subject)
         .await
         .unwrap();
 
@@ -291,9 +315,10 @@ async fn per_category_the_policy_service_is_asked_for_each_category() {
         Arc::default(),
         CategoryCheck::PerCategory,
     );
+    let subject = Uuid::new_v4();
 
     let view = service
-        .read(&caller_in(Uuid::new_v4()), None, Uuid::new_v4())
+        .read(&subject_in(Uuid::new_v4(), subject), None, subject)
         .await
         .unwrap();
 
@@ -427,7 +452,7 @@ async fn categories_come_only_from_the_constraints_that_reach_the_subject() {
     );
 
     let view = service
-        .read(&caller_in(tenant), Some(tenant), subject)
+        .read(&subject_in(tenant, subject), Some(tenant), subject)
         .await
         .unwrap();
 
@@ -496,9 +521,10 @@ async fn per_category_a_failed_policy_call_fails_the_read_instead_of_hiding_the_
         Arc::default(),
         CategoryCheck::PerCategory,
     );
+    let subject = Uuid::new_v4();
 
     let result = service
-        .read(&caller_in(Uuid::new_v4()), None, Uuid::new_v4())
+        .read(&subject_in(Uuid::new_v4(), subject), None, subject)
         .await;
 
     assert!(
@@ -527,8 +553,9 @@ async fn the_facts_are_read_as_the_processing_identity_for_the_subject_and_tenan
         .await
         .unwrap();
 
+    let calls = profiles.calls.lock().unwrap().clone();
     assert_eq!(
-        *profiles.calls.lock().unwrap(),
+        calls,
         [(
             identity,
             SubjectKey {
@@ -536,5 +563,255 @@ async fn the_facts_are_read_as_the_processing_identity_for_the_subject_and_tenan
                 subject_id: subject
             }
         )]
+    );
+}
+
+/// Allows every request with only a clamp to the tenant it is about, as the
+/// static policy plugin does.
+struct TenantClampOnly;
+
+#[async_trait]
+impl AuthZResolverApi for TenantClampOnly {
+    async fn evaluate(
+        &self,
+        _ctx: PlatformSecurityContext,
+        request: EvaluationRequest,
+    ) -> Result<EvaluationResponse, CanonicalError> {
+        Ok(allowed(vec![tenant_is(tenant_of(&request))]))
+    }
+}
+
+#[tokio::test]
+async fn a_tenant_only_answer_lets_the_subject_read_itself_and_no_one_else() {
+    let db = inmem_db().await;
+    let service = profile_service(
+        &db,
+        Arc::new(TenantClampOnly),
+        facts(),
+        Arc::default(),
+        CategoryCheck::OneCall,
+    );
+    let (tenant, subject) = (Uuid::new_v4(), Uuid::new_v4());
+
+    let itself = service
+        .read(&subject_in(tenant, subject), None, subject)
+        .await;
+    let colleague = service.read(&caller_in(tenant), None, subject).await;
+    let outsider = service
+        .read(&caller_in(Uuid::new_v4()), Some(tenant), subject)
+        .await;
+    let itself_elsewhere = service
+        .read(&subject_in(tenant, subject), Some(Uuid::new_v4()), subject)
+        .await;
+
+    assert!(itself.is_ok(), "{itself:?}");
+    for (who, result) in [
+        ("a colleague", colleague),
+        ("a caller naming the tenant", outsider),
+        ("the subject in another tenant", itself_elsewhere),
+    ] {
+        assert!(
+            matches!(result, Err(DomainError::NotVisible(_))),
+            "{who}: {result:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn another_caller_reads_on_a_constraint_that_names_the_subject() {
+    let db = inmem_db().await;
+    let (tenant, subject) = (Uuid::new_v4(), Uuid::new_v4());
+    let service = profile_service(
+        &db,
+        Arc::new(FixedScope(vec![vec![
+            tenant_is(tenant),
+            subject_is(subject),
+        ]])),
+        facts(),
+        Arc::default(),
+        CategoryCheck::OneCall,
+    );
+
+    let view = service
+        .read(&caller_in(Uuid::new_v4()), Some(tenant), subject)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        kinds(&view),
+        [(Category::Identity, 1), (Category::Skill, 2)]
+    );
+}
+
+#[tokio::test]
+async fn a_filter_construct_cannot_decide_or_does_not_know_grants_nothing() {
+    let (tenant, subject) = (Uuid::new_v4(), Uuid::new_v4());
+    for (what, predicate) in [
+        (
+            "a tenant subtree",
+            Predicate::InTenantSubtree(InTenantSubtreePredicate::new(
+                pep_properties::OWNER_TENANT_ID,
+                tenant,
+            )),
+        ),
+        (
+            "an owner",
+            Predicate::In(InPredicate::new(pep_properties::OWNER_ID, [subject])),
+        ),
+    ] {
+        let db = inmem_db().await;
+        let service = profile_service(
+            &db,
+            Arc::new(FixedScope(vec![vec![
+                tenant_is(tenant),
+                subject_is(subject),
+                predicate,
+            ]])),
+            facts(),
+            Arc::default(),
+            CategoryCheck::OneCall,
+        );
+
+        let result = service
+            .read(&subject_in(tenant, subject), None, subject)
+            .await;
+
+        assert!(
+            matches!(result, Err(DomainError::NotVisible(_))),
+            "{what}: {result:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn two_category_filters_in_one_constraint_grant_only_their_overlap() {
+    let db = inmem_db().await;
+    let (tenant, subject) = (Uuid::new_v4(), Uuid::new_v4());
+    let service = profile_service(
+        &db,
+        Arc::new(FixedScope(vec![vec![
+            tenant_is(tenant),
+            Predicate::In(InPredicate::new(
+                CATEGORY_PROPERTY,
+                ["skill".to_owned(), "identity".to_owned()],
+            )),
+            category_is("skill"),
+        ]])),
+        facts(),
+        Arc::default(),
+        CategoryCheck::OneCall,
+    );
+
+    let view = service
+        .read(&subject_in(tenant, subject), None, subject)
+        .await
+        .unwrap();
+
+    assert_eq!(kinds(&view), [(Category::Skill, 2)]);
+}
+
+#[tokio::test]
+async fn a_policy_service_that_fails_is_unavailable_and_an_answer_that_cannot_be_compiled_is_not_visible()
+ {
+    let (tenant, subject) = (Uuid::new_v4(), Uuid::new_v4());
+    let db = inmem_db().await;
+    let failing = profile_service(
+        &db,
+        Arc::new(ErroringResolver(|| {
+            CanonicalError::service_unavailable().create()
+        })),
+        facts(),
+        Arc::default(),
+        CategoryCheck::OneCall,
+    );
+    // Allowed, but with no constraint where the read requires one.
+    let uncompilable = profile_service(
+        &db,
+        Arc::new(FixedScope(Vec::new())),
+        facts(),
+        Arc::default(),
+        CategoryCheck::OneCall,
+    );
+    let caller = subject_in(tenant, subject);
+
+    let failed = failing.read(&caller, None, subject).await;
+    let refused = uncompilable.read(&caller, None, subject).await;
+
+    assert!(
+        matches!(failed, Err(DomainError::Unavailable(_))),
+        "{failed:?}"
+    );
+    assert!(
+        matches!(refused, Err(DomainError::NotVisible(_))),
+        "{refused:?}"
+    );
+}
+
+/// Allows every category but one, whose answer has no constraint where the
+/// read requires one.
+struct UncompilableFor(&'static str);
+
+#[async_trait]
+impl AuthZResolverApi for UncompilableFor {
+    async fn evaluate(
+        &self,
+        _ctx: PlatformSecurityContext,
+        request: EvaluationRequest,
+    ) -> Result<EvaluationResponse, CanonicalError> {
+        let category = request
+            .resource
+            .properties
+            .get(CATEGORY_PROPERTY)
+            .and_then(|v| v.as_str());
+        if category == Some(self.0) {
+            return Ok(EvaluationResponse {
+                decision: true,
+                context: EvaluationResponseContext::default(),
+            });
+        }
+        Ok(allowed(vec![tenant_is(tenant_of(&request))]))
+    }
+}
+
+#[tokio::test]
+async fn per_category_an_answer_that_cannot_be_compiled_hides_its_category() {
+    let db = inmem_db().await;
+    let service = profile_service(
+        &db,
+        Arc::new(UncompilableFor("skill")),
+        facts(),
+        Arc::default(),
+        CategoryCheck::PerCategory,
+    );
+    let subject = Uuid::new_v4();
+
+    let view = service
+        .read(&subject_in(Uuid::new_v4(), subject), None, subject)
+        .await
+        .unwrap();
+
+    assert_eq!(kinds(&view), [(Category::Identity, 1)]);
+}
+
+#[tokio::test]
+async fn a_grant_the_settings_scope_cannot_cover_is_not_visible_rather_than_forbidden() {
+    let db = inmem_db().await;
+    let subject = Uuid::new_v4();
+    // Names the subject but no tenant, so nothing of it scopes the settings.
+    let service = profile_service(
+        &db,
+        Arc::new(FixedScope(vec![vec![subject_is(subject)]])),
+        facts(),
+        Arc::default(),
+        CategoryCheck::OneCall,
+    );
+
+    let result = service
+        .read(&caller_in(Uuid::new_v4()), None, subject)
+        .await;
+
+    assert!(
+        matches!(result, Err(DomainError::NotVisible(_))),
+        "{result:?}"
     );
 }

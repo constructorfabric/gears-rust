@@ -826,6 +826,37 @@ async fn a_has_fact_edge_to_a_node_of_no_person_type_is_a_defect() {
     }
 }
 
+#[tracing_test::traced_test]
+#[tokio::test]
+async fn the_application_read_leaves_out_a_fact_it_cannot_read_and_serves_the_rest() {
+    let profiles = Profiles::new();
+    let other = profiles.neighbour();
+    other.given(None, vec![add_skill("Rust")]).await;
+    profiles.given(None, vec![add_skill("Go")]).await;
+    let foreign = root_key(&other.subject_key()).0;
+    profiles
+        .ingest_directly(IngestRequest {
+            edges: vec![EdgeSpec {
+                type_id: construct_sdk::gts::HAS_FACT_TYPE.to_owned(),
+                src_node_key: root_key(&profiles.subject_key()).0,
+                dst_node_key: foreign.clone(),
+                discriminator: None,
+                payload: None,
+            }],
+            ..IngestRequest::default()
+        })
+        .await;
+
+    let stored = profiles.stored().await;
+
+    let [fact] = stored.as_slice() else {
+        panic!("only the readable fact, got {stored:?}");
+    };
+    assert_eq!(fact.value, skills("Go"));
+    assert!(logs_contain("cannot be read"));
+    assert!(logs_contain(&foreign), "the log names the node");
+}
+
 // --- Removals ------------------------------------------------------------------
 
 /// A removal that cannot run.

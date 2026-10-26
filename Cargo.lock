@@ -2631,6 +2631,7 @@ dependencies = [
  "http",
  "inventory",
  "jsonschema 0.60.2",
+ "opentelemetry",
  "proptest",
  "rand 0.10.3",
  "reqwest",

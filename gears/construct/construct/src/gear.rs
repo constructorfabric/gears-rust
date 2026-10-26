@@ -25,6 +25,7 @@ use crate::domain::record_intake::{IntakePorts, RecordIntakeService};
 use crate::domain::subject_settings::SubjectSettingsService;
 use crate::infra::connector_switch::ConfigConnectorSwitch;
 use crate::infra::pipeline::{self, Worker};
+use crate::infra::processing_metrics::WorkerLoad;
 use crate::infra::record_types::RegistryRecordTypes;
 use crate::infra::storage::record_ids_repo::SeaOrmRecordIdRepository;
 use crate::infra::storage::subject_settings_repo::SeaOrmSubjectSettingsRepository;
@@ -46,7 +47,14 @@ pub struct ConstructGear {
     profile: OnceLock<Arc<ConcreteProfile>>,
     /// The processing worker, until `start` takes it.
     worker: Mutex<Option<Worker>>,
-    running: Mutex<Option<(CancellationToken, JoinHandle<()>)>>,
+    running: Mutex<Option<Running>>,
+}
+
+/// The started worker: its stop token, its task, and what it has on hand.
+struct Running {
+    token: CancellationToken,
+    handle: JoinHandle<()>,
+    load: WorkerLoad,
 }
 
 impl Default for ConstructGear {
@@ -207,8 +215,13 @@ impl RunnableCapability for ConstructGear {
             return Ok(());
         };
         let token = cancel.child_token();
+        let load = worker.load();
         let handle = tokio::spawn(worker.run(token.clone()));
-        *lock(&self.running) = Some((token, handle));
+        *lock(&self.running) = Some(Running {
+            token,
+            handle,
+            load,
+        });
         info!("construct: record processing started");
         Ok(())
         // @cpt-end:cpt-cf-construct-algo-profile-reader-wire:p1:inst-wire-start
@@ -216,10 +229,23 @@ impl RunnableCapability for ConstructGear {
 
     /// Stop processing. Records in flight are stopped; a record still queued
     /// is lost, as the DESIGN says, and its identity stays, so a resend is a
-    /// repeat.
+    /// repeat. How many were lost is logged.
     async fn stop(&self, deadline: CancellationToken) -> anyhow::Result<()> {
         let running = lock(&self.running).take();
-        if let Some((token, mut handle)) = running {
+        if let Some(Running {
+            token,
+            mut handle,
+            load,
+        }) = running
+        {
+            let (queued, in_flight) = (load.queued(), load.in_flight());
+            if queued + in_flight > 0 {
+                warn!(
+                    queued,
+                    in_flight,
+                    "construct: stopping record processing; these records are lost, and a resend counts as a repeat"
+                );
+            }
             token.cancel();
             tokio::select! {
                 result = &mut handle => {
@@ -229,7 +255,13 @@ impl RunnableCapability for ConstructGear {
                         warn!(error = ?err, "construct record processing ended with an error");
                     }
                 }
-                () = deadline.cancelled() => handle.abort(),
+                () = deadline.cancelled() => {
+                    warn!(
+                        in_flight = load.in_flight(),
+                        "construct: record processing did not stop by the deadline and is aborted"
+                    );
+                    handle.abort();
+                }
             }
         }
         Ok(())

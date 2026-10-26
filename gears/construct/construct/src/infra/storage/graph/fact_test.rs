@@ -9,10 +9,11 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use uuid::Uuid;
 
-use super::fact::{fact_node, fact_of};
+use super::fact::{fact_node, fact_of, stored_fact_of};
 use crate::domain::error::DomainError;
 use crate::domain::plan::{Change, NodeKey, Origin, Plan, Property, Step};
 use crate::domain::profile::Category;
+use crate::domain::profile_read::OriginKind;
 use crate::test_support::{
     add_entity, add_value, by_a_person, connector_plan, remove_entity, replace_property,
 };
@@ -368,4 +369,56 @@ proptest! {
         prop_assert_eq!(fact.property, property);
         prop_assert_eq!(fact.value, json!(value));
     }
+}
+
+#[test]
+fn a_stored_node_that_breaks_the_fact_shape_is_reported_with_its_key() {
+    let skill = |payload: Value| view(SKILL_TYPE, Some(payload));
+    for (what, node) in [
+        (
+            "of no person type",
+            view(PROFILE_ROOT_TYPE, Some(json!({}))),
+        ),
+        ("without a payload", view(SKILL_TYPE, None)),
+        ("with a payload that is no object", skill(json!(["skills"]))),
+        (
+            "without a fact property",
+            skill(json!({ "origin": { "method": "admin.edit" } })),
+        ),
+        (
+            "with two fact properties",
+            skill(json!({ "skills": skills(), "name": "x", "origin": { "method": "admin.edit" } })),
+        ),
+        (
+            "with an origin of no known source",
+            skill(json!({ "skills": skills(), "origin": { "method": "somewhere.else" } })),
+        ),
+    ] {
+        let result = stored_fact_of(&node);
+
+        let Err(DomainError::Internal(message)) = result else {
+            panic!("{what}: an internal error, got {result:?}");
+        };
+        assert!(message.contains(&node.node_key), "{what}: {message}");
+        assert!(!message.contains("Rust"), "{what}: no value in {message}");
+    }
+}
+
+#[tracing_test::traced_test]
+#[test]
+fn a_produced_at_that_does_not_parse_is_served_as_absent_and_logged() {
+    let node = view(
+        SKILL_TYPE,
+        Some(json!({
+            "skills": skills(),
+            "origin": { "method": "admin.edit", "produced_at": "yesterday" },
+        })),
+    );
+
+    let fact = stored_fact_of(&node).expect("the fact is still served");
+
+    assert_eq!(fact.origin, OriginKind::Administrator);
+    assert_eq!(fact.produced_at, None);
+    assert!(logs_contain("not RFC 3339"));
+    assert!(logs_contain(&node.node_key));
 }

@@ -30,6 +30,14 @@ pub fn record_queue(capacity: NonZeroUsize) -> (QueuedHandOff, RecordQueue) {
     (QueuedHandOff { sender }, RecordQueue { receiver })
 }
 
+impl QueuedHandOff {
+    /// Records waiting in the queue.
+    #[must_use]
+    pub fn queued(&self) -> usize {
+        self.sender.max_capacity() - self.sender.capacity()
+    }
+}
+
 impl RecordHandOff for QueuedHandOff {
     fn hand_off(&self, record: ReceivedRecord) -> Result<(), DomainError> {
         self.sender.try_send(record).map_err(|error| {
