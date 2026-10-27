@@ -11,12 +11,13 @@
 //! re-verify under the lock, instead of locking the lease before it knows
 //! whether it may.
 
-use sea_orm::sea_query::{LockBehavior, LockType};
+use sea_orm::sea_query::{Expr, LockBehavior, LockType};
 
 pub use super::RowWait;
 use sea_orm::sea_query::OnConflict;
 use sea_orm::{
-    ActiveValue, ColumnTrait, DbErr, EntityTrait, Order, QueryFilter, QueryOrder, QuerySelect,
+    ActiveValue, ColumnTrait, DbErr, EntityTrait, FromQueryResult, Order, QueryFilter, QueryOrder,
+    QuerySelect, QueryTrait,
 };
 use time::OffsetDateTime;
 use toolkit_db::secure::{
@@ -277,20 +278,19 @@ pub async fn unreturned_expired_holds(
     period_id: Option<Uuid>,
     now: OffsetDateTime,
 ) -> Result<Vec<lease_hold::Model>, ScopeError> {
+    // A subquery, not a bound token list: the expired backlog has no upper bound.
     let expired = lease::Entity::find()
         .filter(lease::Column::State.eq(STATE_ACTIVE))
         .filter(lease::Column::ExpiryAt.lte(now))
         .secure()
         .scope_with(scope)
-        .all(runner)
-        .await?;
-    if expired.is_empty() {
-        return Ok(Vec::new());
-    }
-    let tokens: Vec<Uuid> = expired.into_iter().map(|lease| lease.token).collect();
+        .into_inner()
+        .select_only()
+        .column(lease::Column::Token)
+        .into_query();
     let mut query = lease_hold::Entity::find()
         .filter(lease_hold::Column::QuotaId.eq(quota_id))
-        .filter(lease_hold::Column::LeaseToken.is_in(tokens))
+        .filter(lease_hold::Column::LeaseToken.in_subquery(expired))
         .filter(lease_hold::Column::ReturnedAt.is_null());
     query = match period_id {
         Some(period_id) => query.filter(lease_hold::Column::PeriodId.eq(period_id)),
@@ -364,7 +364,15 @@ pub async fn expired_for_update(
         .await
 }
 
-/// Expired, unreclaimed leases by metric, behind the backlog gauge.
+/// One metric's expired backlog.
+#[derive(Debug, FromQueryResult)]
+struct MetricBacklog {
+    metric: String,
+    total: i64,
+}
+
+/// Expired, unreclaimed leases by metric, behind the backlog gauge. Counted in
+/// SQL, so a large backlog costs one row per metric.
 ///
 /// # Errors
 ///
@@ -374,21 +382,24 @@ pub async fn expired_by_metric(
     scope: &AccessScope,
     before: OffsetDateTime,
 ) -> Result<Vec<(String, u64)>, ScopeError> {
-    let expired = lease::Entity::find()
+    use sea_orm::sea_query::ExprTrait as _;
+    let rows = lease::Entity::find()
         .filter(lease::Column::State.eq(STATE_ACTIVE))
         .filter(lease::Column::ExpiryAt.lte(before))
         .secure()
         .scope_with(scope)
-        .all(runner)
+        .project_all(runner, |q| {
+            q.select_only()
+                .column(lease::Column::Metric)
+                .column_as(Expr::col(lease::Column::Token).count(), "total")
+                .group_by(lease::Column::Metric)
+                .into_model::<MetricBacklog>()
+        })
         .await?;
-    let mut by_metric: Vec<(String, u64)> = Vec::new();
-    for lease in expired {
-        match by_metric.iter_mut().find(|(m, _)| *m == lease.metric) {
-            Some((_, count)) => *count += 1,
-            None => by_metric.push((lease.metric, 1)),
-        }
-    }
-    Ok(by_metric)
+    Ok(rows
+        .into_iter()
+        .map(|row| (row.metric, u64::try_from(row.total).unwrap_or(0)))
+        .collect())
 }
 
 /// Make sure the capacity row of `(tenant, metric)` exists.

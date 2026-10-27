@@ -33,8 +33,10 @@ use crate::domain::ports::{Actor, QuotaStore, StoreError};
 use crate::infra::outbox::{
     AttemptWakes, EnqueueError, NotificationEnqueuer, NotificationOutbox, SettleWakes,
 };
+use crate::infra::storage::consumption_store::{TxError as CounterTxError, credit_counter};
 use crate::infra::storage::cursor::{self, MAX_FILTER_IDS};
 use crate::infra::storage::entity::quota;
+use crate::infra::storage::lease_store::counter_value_of;
 use crate::infra::storage::quota_mapping::{
     self, MappingError, QuotaUpdate, STATUS_ACTIVE, status_name,
 };
@@ -132,6 +134,17 @@ fn corrupt(operation: &'static str, err: &dyn std::fmt::Display) -> StoreError {
     StoreError::Corrupt {
         operation,
         detail: err.to_string(),
+    }
+}
+
+/// A failure of the shared counter helpers, in this store's terms.
+fn counter_failure(operation: &'static str, err: CounterTxError) -> TxError {
+    match err {
+        CounterTxError::Db(err) => TxError::Db(err),
+        CounterTxError::Scope(err) => TxError::Scope(err),
+        CounterTxError::Map(err) => TxError::Map(err),
+        CounterTxError::Enqueue(err) => TxError::Enqueue(err),
+        other => TxError::Store(corrupt(operation, &other)),
     }
 }
 
@@ -247,55 +260,35 @@ impl SqlQuotaStore {
         row: &quota::Model,
         now: OffsetDateTime,
     ) -> Result<u64, TxError> {
-        let negative = |column: &'static str, value: i64| -> TxError {
-            MappingError::Column {
-                column,
-                detail: format!("negative counter amount {value}"),
-            }
-            .into()
-        };
-        // This transaction holds the counter row, so it gives back the expired
-        // holds still sitting in it before judging the cap (I4): capacity an
-        // expired lease no longer holds must not block a legitimate reduction
-        // until a sweeper happens to run.
-        //
-        // `return_expired_for` *writes* the reconciled counter, so both arms
-        // below read it afterwards and take the value as it stands. Subtracting
-        // the returned amount from a value read after that write would remove
-        // it twice and let a cap below the real usage through.
-        if row.quota_type == QuotaType::Allocation.as_gts_id() {
-            return_expired_for(runner, scope, row.id, None, now).await?;
-            let in_flight = allocation_counter_repo::read_in_flight_for_update(
+        const OPERATION: &str = "update quota";
+        // Returning expired holds first keeps them from blocking a legitimate reduction (I4).
+        let period_id = if row.quota_type == QuotaType::Allocation.as_gts_id() {
+            None
+        } else {
+            let current = consumption_counter_repo::find_latest_for_update(
                 runner,
                 scope,
                 row.id,
                 lease_repo::RowWait::Wait,
             )
             .await?
-            .unwrap_or(0);
-            return u64::try_from(in_flight).map_err(|_| negative("in_flight", in_flight));
-        }
-        let current = consumption_counter_repo::find_latest_for_update(
+            .filter(|period| period.period_start <= now && now < period.period_end);
+            let Some(period) = current else {
+                return Ok(0);
+            };
+            Some(period.period_id)
+        };
+        credit_counter(
             runner,
             scope,
             row.id,
+            period_id,
+            0,
+            now,
             lease_repo::RowWait::Wait,
         )
-        .await?
-        .filter(|period| period.period_start <= now && now < period.period_end);
-        let Some(period) = current else {
-            return Ok(0);
-        };
-        return_expired_for(runner, scope, row.id, Some(period.period_id), now).await?;
-        let settled = consumption_counter_repo::find_by_period_id_for_update(
-            runner,
-            scope,
-            period.period_id,
-            lease_repo::RowWait::Wait,
-        )
-        .await?
-        .map_or(period.consumed, |row| row.consumed);
-        u64::try_from(settled).map_err(|_| negative("consumed", settled))
+        .await
+        .map_err(|err| counter_failure(OPERATION, err))
     }
 
     /// Insert one prepared Quota with its capacity row, counter row,
@@ -451,10 +444,32 @@ impl SqlQuotaStore {
             let mut released = 0_u64;
             for hold in &holds {
                 let amount = u64::try_from(hold.held_amount).unwrap_or(0);
+                // Rank 5 before 5b: lock the counter, then stamp its hold.
+                counter_value_of(
+                    tx,
+                    scope,
+                    hold.quota_id,
+                    hold.period_id,
+                    lease_repo::RowWait::Wait,
+                )
+                .await
+                .map_err(|err| counter_failure("deactivate quota", err))?;
                 if lease_repo::mark_hold_returned(tx, scope, lease.token, hold.quota_id, now)
                     .await?
                 {
-                    return_capacity(tx, scope, hold.quota_id, hold.period_id, amount).await?;
+                    if amount > 0 {
+                        credit_counter(
+                            tx,
+                            scope,
+                            hold.quota_id,
+                            hold.period_id,
+                            amount,
+                            now,
+                            lease_repo::RowWait::Wait,
+                        )
+                        .await
+                        .map_err(|err| counter_failure("deactivate quota", err))?;
+                    }
                     released = released.saturating_add(amount);
                 }
             }
@@ -817,99 +832,3 @@ mod bulk;
 #[cfg_attr(coverage_nightly, coverage(off))]
 #[path = "quota_store_tests.rs"]
 mod quota_store_tests;
-
-/// Give a hold's capacity back to the counter it was taken from.
-///
-/// The acquisition period, not the current one: a lease resolved after a
-/// boundary still settles where it was acquired (I5). Flooring at zero keeps a
-/// double return — which the `returned_at` stamp already prevents — from
-/// driving a counter negative.
-async fn return_capacity(
-    tx: &impl DBRunner,
-    scope: &AccessScope,
-    quota_id: Uuid,
-    period_id: Option<Uuid>,
-    amount: u64,
-) -> Result<(), TxError> {
-    if amount == 0 {
-        return Ok(());
-    }
-    if let Some(period_id) = period_id {
-        let Some(row) = consumption_counter_repo::find_by_period_id_for_update(
-            tx,
-            scope,
-            period_id,
-            lease_repo::RowWait::Wait,
-        )
-        .await?
-        else {
-            return Ok(());
-        };
-        let value = u64::try_from(row.consumed)
-            .unwrap_or(0)
-            .saturating_sub(amount);
-        consumption_counter_repo::write_counter(
-            tx,
-            scope,
-            period_id,
-            row.record_version,
-            i64::try_from(value).unwrap_or(i64::MAX),
-            row.highest_crossed_threshold_pct,
-            row.updated_at,
-        )
-        .await?;
-    } else {
-        let Some(row) = consumption_counter_repo::find_allocation_for_update(
-            tx,
-            scope,
-            quota_id,
-            lease_repo::RowWait::Wait,
-        )
-        .await?
-        else {
-            return Ok(());
-        };
-        let value = u64::try_from(row.in_flight)
-            .unwrap_or(0)
-            .saturating_sub(amount);
-        consumption_counter_repo::write_allocation(
-            tx,
-            scope,
-            quota_id,
-            row.record_version,
-            i64::try_from(value).unwrap_or(i64::MAX),
-            row.highest_crossed_threshold_pct,
-            row.updated_at,
-        )
-        .await?;
-    }
-    Ok(())
-}
-
-/// Return every expired hold on one counter row that nobody has given back
-/// yet, and report the total.
-///
-/// The same rule the consumption store applies on its own writers (I4): the
-/// transaction that holds the row reconciles it, stamps each hold, and moves
-/// the counter once, so a later sweep finds nothing left to credit.
-async fn return_expired_for(
-    runner: &impl DBRunner,
-    scope: &AccessScope,
-    quota_id: Uuid,
-    period_id: Option<Uuid>,
-    now: OffsetDateTime,
-) -> Result<u64, TxError> {
-    let holds =
-        lease_repo::unreturned_expired_holds(runner, scope, quota_id, period_id, now).await?;
-    let mut total = 0_u64;
-    for hold in holds {
-        if lease_repo::mark_hold_returned(runner, scope, hold.lease_token, hold.quota_id, now)
-            .await?
-        {
-            let amount = u64::try_from(hold.held_amount).unwrap_or(0);
-            return_capacity(runner, scope, quota_id, period_id, amount).await?;
-            total = total.saturating_add(amount);
-        }
-    }
-    Ok(total)
-}

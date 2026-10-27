@@ -593,3 +593,50 @@ async fn a_replica_with_a_cold_cache_replays_or_refuses_from_the_stored_record()
     );
     assert_eq!(h.consumed(id), 10);
 }
+
+#[tokio::test]
+async fn a_rollback_key_cannot_be_reused_to_reverse_another_operation() {
+    let h = Harness::new().await;
+    h.quota(Some(100)).await;
+    h.operations()
+        .debit(&ctx(), debit(30, "k1"))
+        .await
+        .expect("debit");
+    h.operations()
+        .rollback(&ctx(), rollback("k1", "r1"))
+        .await
+        .expect("rollback");
+    let mut commit = rollback("k1", "r1");
+    commit.original_operation = quota_enforcement_sdk::RollbackableOperation::LeaseCommit;
+
+    // The replica that served the rollback replays from memory, another from the record.
+    let replica = Harness::new_over(&h).await;
+    for operations in [h.operations(), replica.operations()] {
+        let error = operations
+            .rollback(&ctx(), commit.clone())
+            .await
+            .expect_err("the same key now names another operation");
+        assert!(
+            matches!(error, DomainError::IdempotencyPayloadMismatch),
+            "{error:?}"
+        );
+    }
+}
+
+#[test]
+fn a_debit_rollback_keeps_the_payload_hash_it_had_before_leases() {
+    let attribution = attribution();
+    let legacy = serde_json::json!({
+        "attribution": &attribution,
+        "original_idempotency_key": "k1",
+    });
+    let payload = super::RollbackPayload {
+        attribution: &attribution,
+        original_idempotency_key: "k1",
+        original_operation: quota_enforcement_sdk::RollbackableOperation::Debit,
+    };
+    assert_eq!(
+        super::digest(&payload).expect("digest"),
+        super::digest(&legacy).expect("digest")
+    );
+}

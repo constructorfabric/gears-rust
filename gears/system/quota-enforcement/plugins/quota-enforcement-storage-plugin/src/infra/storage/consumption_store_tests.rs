@@ -19,11 +19,11 @@ use time::OffsetDateTime;
 use time::macros::datetime;
 use toolkit_db::Db;
 use toolkit_db::outbox::OutboxHandle;
-use toolkit_db::secure::SecureUpdateExt;
+use toolkit_db::secure::{SecureDeleteExt, SecureUpdateExt};
 use toolkit_security::{AccessScope, SecurityContext};
 
 use super::SqlConsumptionStore;
-use crate::domain::ports::{ConsumptionStore, LeaseStore, QuotaStore};
+use crate::domain::ports::{ConsumptionStore, LeaseStore, QuotaStore, StoreError};
 use crate::infra::storage::entity::{
     quota_allocation_counter as alloc, quota_consumption_counter as counter,
 };
@@ -1955,5 +1955,180 @@ async fn a_counter_at_the_last_version_keeps_accepting_writes() {
         assert!(matches!(applied, TransitionOutcome::Applied(_)));
         assert_eq!(h.consumed(subject, id).await, 20);
     }
+    h.down().await;
+}
+
+#[tokio::test]
+async fn a_commit_refuses_a_hold_a_faster_clock_already_returned() {
+    let h = Harness::up().await;
+    let id = h.allocation_quota("u1", Some(100)).await;
+    let acquired = h
+        .acquire("u1", 40, TTL, &write(OperationType::Reserve, "r1", 1))
+        .await
+        .expect("acquire");
+    let token = acquired.get().token.expect("an allowed acquisition holds");
+    let expiry = DAY_ONE + time::Duration::hours(1);
+
+    // A replica whose clock is past the expiry returns the hold first.
+    h.set_now(expiry + time::Duration::seconds(1));
+    h.debit("u1", 10, &write(OperationType::Debit, "d1", 2))
+        .await
+        .expect("debit");
+    assert_eq!(h.consumed("u1", id).await, 10);
+
+    h.set_now(expiry - time::Duration::seconds(1));
+    let committed = h
+        .store
+        .commit_lease(
+            &ctx(),
+            &scope_for(tenant()),
+            token,
+            Some(25),
+            &partial("c1", 3),
+            &[],
+        )
+        .await;
+    assert!(
+        matches!(committed, Err(StorageError::LeaseNotActive { token: refused }) if refused == token),
+        "{committed:?}"
+    );
+    assert_eq!(h.consumed("u1", id).await, 10, "nothing was charged");
+    h.down().await;
+}
+
+#[tokio::test]
+async fn a_deactivation_that_returns_a_hold_stamps_the_counter_with_its_own_time() {
+    let h = Harness::up().await;
+    let id = h.allocation_quota("u1", Some(100)).await;
+    h.acquire("u1", 40, TTL, &write(OperationType::Reserve, "r1", 1))
+        .await
+        .expect("acquire");
+    let later = DAY_ONE + time::Duration::minutes(10);
+    h.set_now(later);
+
+    h.quotas
+        .deactivate_quota(&actor(), &scope_for(tenant()), id, &[])
+        .await
+        .expect("deactivate");
+
+    let conn = h.db.conn().expect("connection");
+    let row = crate::infra::storage::repo::consumption_counter_repo::find_allocation(
+        &conn,
+        &AccessScope::allow_all(),
+        id.as_uuid(),
+    )
+    .await
+    .expect("read the counter")
+    .expect("the counter row exists");
+    assert_eq!(row.in_flight, 0, "the hold came back");
+    assert_eq!(row.updated_at, later);
+    h.down().await;
+}
+
+#[tokio::test]
+async fn a_deactivation_refuses_to_return_a_hold_to_a_missing_counter() {
+    let h = Harness::up().await;
+    let id = h.allocation_quota("u1", Some(100)).await;
+    h.acquire("u1", 40, TTL, &write(OperationType::Reserve, "r1", 1))
+        .await
+        .expect("acquire");
+    let conn = h.db.conn().expect("connection");
+    alloc::Entity::delete_many()
+        .filter(alloc::Column::QuotaId.eq(id.as_uuid()))
+        .secure()
+        .scope_with(&AccessScope::allow_all())
+        .exec(&conn)
+        .await
+        .expect("drop the counter row");
+
+    let refused = h
+        .quotas
+        .deactivate_quota(&actor(), &scope_for(tenant()), id, &[])
+        .await
+        .expect_err("the held capacity has nowhere to go");
+    assert!(matches!(refused, StoreError::Corrupt { .. }), "{refused:?}");
+    h.down().await;
+}
+
+#[tokio::test]
+async fn the_backlog_gauge_counts_only_expired_leases_still_active() {
+    let h = Harness::up().await;
+    h.allocation_quota("u1", Some(100)).await;
+    let committed = h
+        .acquire("u1", 10, TTL, &write(OperationType::Reserve, "r1", 1))
+        .await
+        .expect("acquire")
+        .get()
+        .token
+        .expect("held");
+    for key in ["r2", "r3"] {
+        h.acquire("u1", 10, TTL, &write(OperationType::Reserve, key, 1))
+            .await
+            .expect("acquire");
+    }
+    h.acquire(
+        "u1",
+        10,
+        std::time::Duration::from_hours(48),
+        &write(OperationType::Reserve, "r4", 1),
+    )
+    .await
+    .expect("acquire a lease that outlives the sample");
+    h.store
+        .commit_lease(
+            &ctx(),
+            &scope_for(tenant()),
+            committed,
+            Some(5),
+            &partial("c1", 2),
+            &[],
+        )
+        .await
+        .expect("commit");
+
+    let backlog = h
+        .store
+        .count_expired_unreclaimed_leases_impl(DAY_ONE + time::Duration::hours(2))
+        .await
+        .expect("count");
+    let metric = quota_enforcement_sdk::MetricId::parse(METRIC_TOKENS).expect("metric");
+    assert_eq!(backlog, vec![(metric, 2)]);
+    h.down().await;
+}
+
+#[tokio::test]
+async fn a_full_commit_refuses_a_hold_whose_counter_row_is_missing() {
+    let h = Harness::up().await;
+    let id = h.allocation_quota("u1", Some(100)).await;
+    let acquired = h
+        .acquire("u1", 40, TTL, &write(OperationType::Reserve, "r1", 1))
+        .await
+        .expect("acquire");
+    let token = acquired.get().token.expect("an allowed acquisition holds");
+    let conn = h.db.conn().expect("connection");
+    alloc::Entity::delete_many()
+        .filter(alloc::Column::QuotaId.eq(id.as_uuid()))
+        .secure()
+        .scope_with(&AccessScope::allow_all())
+        .exec(&conn)
+        .await
+        .expect("drop the counter row");
+
+    // Nothing comes back on a full commit, so no credit runs to notice the gap.
+    let committed = h
+        .store
+        .commit_lease(
+            &ctx(),
+            &scope_for(tenant()),
+            token,
+            None,
+            &partial("c1", 2),
+            &[],
+        )
+        .await;
+    assert!(
+        matches!(committed, Err(StorageError::Internal(_))),
+        "{committed:?}"
+    );
     h.down().await;
 }

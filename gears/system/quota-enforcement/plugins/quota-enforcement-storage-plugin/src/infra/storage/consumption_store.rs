@@ -600,6 +600,9 @@ pub(super) async fn credit_counter(
     // carries an expired hold would lose the difference when the sweep arrives.
     let expired = return_expired_holds(tx, scope, quota_id, period_id, now).await?;
     let pre = u64::try_from(value).unwrap_or(0).saturating_sub(expired);
+    if expired == 0 && amount == 0 {
+        return Ok(pre);
+    }
     let post = pre.saturating_sub(amount);
     let stored = i64::try_from(post).unwrap_or(0);
     let written = match period_id {
