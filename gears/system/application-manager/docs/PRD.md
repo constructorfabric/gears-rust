@@ -24,7 +24,7 @@ The Application Manager must give every environment one trusted entry point wher
   - [5.1 Manifest and Validation](#51-manifest-and-validation)
   - [5.2 Dispatch and Outcomes](#52-dispatch-and-outcomes)
   - [5.3 Lifecycle](#53-lifecycle)
-  - [5.4 Discovery and Operation Reads](#54-discovery-and-operation-reads)
+  - [5.4 Discovery, Operation Reads, and Installed Applications](#54-discovery-operation-reads-and-installed-applications)
   - [5.5 Access Control and Operation History](#55-access-control-and-operation-history)
 - [6. Non-Functional Requirements](#6-non-functional-requirements)
   - [6.1 Gear-Specific NFRs](#61-gear-specific-nfrs)
@@ -131,6 +131,8 @@ There is no formal user-satisfaction metric, because the user group is small, kn
 | Outcome category | The single overall result of a seed or uninstall request that is not interrupted, such as succeeded or invalid manifest (`cpt-cf-application-manager-fr-outcome-categories`). |
 | Run window | The time an operation may run before it is interrupted. It is bounded and follows from the operator-set section-plugin time limit and the number of section plugins. |
 | Request id | The id that links a refusal or an operation report to its history events; for an accepted request it is the operation id. |
+| Allowed callers | The configured list of platform workload identities, each with the actions it may take: seed, uninstall, read schemas, and read operations. |
+| Installed application | An application with a record in the system: its last seed reached a final state, including interrupted, and no uninstall of it has succeeded since. |
 | Operation history | The append-only table that holds the history events of every seed and uninstall request (`cpt-cf-application-manager-fr-history-event`). Reads are not recorded. |
 
 ## 2. Actors
@@ -143,8 +145,8 @@ There is no formal user-satisfaction metric, because the user group is small, kn
 
 **ID**: `cpt-cf-application-manager-actor-operator`
 
-- **Role**: Runs the platform, deploys section-plugin changes, and sets configuration. Can also act as a seeding caller by hand, for example to re-seed or to uninstall an application.
-- **Needs**: To follow an operation and read how it ended. To list history events, or those of one operation. To know which section keys a manifest needs. To get a clear signal when something in the gear fails.
+- **Role**: Runs the platform, deploys section-plugin changes, and sets configuration, including the allowed callers. Can also act as a seeding caller by hand with an allowed platform identity, for example to re-seed or to uninstall an application. Reads history events and installed applications with their own login through the platform's standard authentication.
+- **Needs**: To follow an operation and read how it ended. To list history events, or those of one operation. To list installed applications. To know which section keys a manifest needs. To get a clear signal when something in the gear fails.
 
 ### 2.2 System Actors
 
@@ -152,7 +154,7 @@ There is no formal user-satisfaction metric, because the user group is small, kn
 
 **ID**: `cpt-cf-application-manager-actor-seeding-caller`
 
-- **Role**: An authenticated subject, either a service or an operator, that acts for an application. It sends manifests and uninstall requests, reads discovery and operations when permitted, and never receives calls from the system.
+- **Role**: An authenticated platform workload, or an operator using one, listed in the allowed callers, that acts for an application. It sends manifests and uninstall requests, reads discovery and operations when allowed, and never receives calls from the system.
 
 #### Section Plugin
 
@@ -164,16 +166,16 @@ There is no formal user-satisfaction metric, because the user group is small, kn
 
 **ID**: `cpt-cf-application-manager-actor-platform-access-control`
 
-- **Role**: Decides whether a caller may seed, uninstall, read schemas, read operations, or read history events. Called by the system.
+- **Role**: Decides whether a caller may read history events or list installed applications. Called by the system.
 
 ### 2.3 Actor Context
 
 ```mermaid
 flowchart LR
     SC["Seeding Caller"] -->|"seed, uninstall, discover, read operation"| AM["Application Manager"]
-    OP["Operator"] -->|"seed, uninstall, discover, read operation, read history"| AM
+    OP["Operator"] -->|"seed, uninstall, discover, read operation, read history, list applications"| AM
     AM -->|"get schema, apply, remove"| SP["Section Plugin"]
-    AM -->|"check permission"| PAC["Platform Access Control"]
+    AM -->|"check permission for history and applications"| PAC["Platform Access Control"]
 ```
 
 ## 3. Operational Concept & Environment
@@ -200,7 +202,8 @@ flowchart LR
 - Discovery of section keys and schemas.
 - Clear outcome categories for every request.
 - An operation history of every seed and uninstall request.
-- Access control on seed, uninstall, discovery, and operation reads.
+- A record of installed applications, and listing it.
+- Access control: allowed callers for seed, uninstall, discovery, and operation reads; platform access control for history reads and the application list.
 - Failing to start on any plugin-set or configuration problem.
 
 ### 4.2 Out of Scope
@@ -215,9 +218,8 @@ flowchart LR
 - Idempotency keys on seed and uninstall requests.
 - Retry rules after a failed, partly failed, or interrupted request.
 - Validation rules for adding or removing a section plugin.
-- A registry of seeded applications, and listing it.
 - Reconciliation of section-plugin state with what is seeded.
-- Deciding who may read history events; platform access control owns that.
+- Deciding who may read history events or list installed applications; platform access control owns that.
 - Resuming or cancelling operations.
 
 ## 5. Functional Requirements
@@ -374,7 +376,7 @@ The system **MUST** report every seed and uninstall request that is not interrup
 - succeeded: every section, or every section plugin for uninstall, succeeded;
 - invalid manifest: the manifest failed validation, and nothing is dispatched;
 - plugin rejected: a section plugin refused its section as unacceptable;
-- not permitted: platform access control refuses the caller, or a section plugin refuses it for an extra permission of its own;
+- not permitted: the caller is not allowed for the action, or a section plugin refuses it for an extra permission of its own;
 - conflict: another operation for the same application is accepted or running;
 - internal failure: a section plugin failed unexpectedly or exceeded the time limit, or the system itself failed unexpectedly;
 - temporarily unavailable: a needed dependency could not answer, nothing is dispatched, and the caller can retry.
@@ -414,7 +416,7 @@ The system **MUST** apply one configurable time limit to every section-plugin ca
 
 - [ ] `p1` - **ID**: `cpt-cf-application-manager-fr-dependency-failures`
 
-The system **MUST** fail closed when platform access control cannot answer: it **MUST** refuse the request as temporarily unavailable and call no section plugin. When storage cannot answer, the system **MUST** refuse the request as temporarily unavailable and dispatch nothing.
+The system **MUST** fail closed when platform access control cannot answer a history read or an application list: it **MUST** refuse the read as temporarily unavailable. When storage cannot answer, the system **MUST** refuse the request as temporarily unavailable and dispatch nothing.
 
 - **Rationale**: An outage of a platform service must never let a request through unchecked or leave half-applied changes.
 - **Actors**: `cpt-cf-application-manager-actor-seeding-caller`, `cpt-cf-application-manager-actor-operator`
@@ -430,7 +432,7 @@ The system **MUST** let an authorized caller uninstall an application by its id,
 - **Rationale**: Retiring an application must clean up every section plugin's data from a single request.
 - **Actors**: `cpt-cf-application-manager-actor-seeding-caller`, `cpt-cf-application-manager-actor-operator`
 
-### 5.4 Discovery and Operation Reads
+### 5.4 Discovery, Operation Reads, and Installed Applications
 
 #### Discovery of Section Keys and Schemas
 
@@ -450,15 +452,24 @@ The system **MUST** let a caller with the read operations permission read an ope
 - **Rationale**: An accepted request ends in the background, so callers need a way to learn how it ended. A separate permission lets operators decide who may see results without granting the right to seed.
 - **Actors**: `cpt-cf-application-manager-actor-seeding-caller`, `cpt-cf-application-manager-actor-operator`
 
+#### Listing Installed Applications
+
+- [ ] `p1` - **ID**: `cpt-cf-application-manager-fr-list-applications`
+
+The system **MUST** keep one record per installed application. A seed operation that reaches a final state **MUST** record its application, or update the record, with the version, the operation id, the outcome category or the interrupted marker, and the finish time, in the same change that finishes the operation. An uninstall that completes as succeeded **MUST** remove the record in the same change; any other uninstall outcome **MUST** leave it unchanged. The system **MUST** let a caller with the read applications permission list the records page by page, and **MUST** give them no meaning beyond this rule. A list **MUST NOT** call any section plugin. Lists end as invalid query, not permitted, or temporarily unavailable.
+
+- **Rationale**: Services such as a navigation menu need one trusted answer to which applications are installed.
+- **Actors**: `cpt-cf-application-manager-actor-operator`
+
 ### 5.5 Access Control and Operation History
 
 #### Caller Authentication
 
 - [ ] `p1` - **ID**: `cpt-cf-application-manager-fr-authentication`
 
-The system **MUST** accept requests only from subjects authenticated through the platform's standard authentication. It **MUST NOT** offer a bypass, a shared secret, or a login of its own, for any actor.
+The system **MUST** accept seed, uninstall, discovery, and operation read requests only from platform workloads authenticated through the platform's workload authentication, and history reads and the application list only from subjects authenticated through the platform's standard authentication. It **MUST NOT** offer a bypass, a shared secret, or a login of its own, for any actor.
 
-- **Rationale**: Seeding changes what other services believe is installed, so every request must be traceable to a known subject.
+- **Rationale**: Seeding changes what other services believe is installed, so every request must be traceable to a known workload or subject.
 - **Actors**: `cpt-cf-application-manager-actor-seeding-caller`, `cpt-cf-application-manager-actor-operator`
 - **Verification Method**: Inspection: no route or setting skips platform authentication.
 
@@ -466,9 +477,9 @@ The system **MUST** accept requests only from subjects authenticated through the
 
 - [ ] `p1` - **ID**: `cpt-cf-application-manager-fr-authorization`
 
-The system **MUST** have platform access control decide, separately for each of five permissions, whether the caller may act: seed, uninstall, read schemas, read operations, and read history. It holds no tenant scope and no access rules of its own. A section plugin that needs an extra permission **MUST** be able to refuse a request as not permitted.
+The system **MUST** decide each of six permissions separately. Seed, uninstall, read schemas, and read operations **MUST** be granted only by the allowed callers in its configuration, per caller and per action. Read history and read applications **MUST** be decided by platform access control. The system holds no tenant scope. A section plugin that needs an extra permission **MUST** be able to refuse a request as not permitted.
 
-- **Rationale**: Seeding and uninstalling change what other services believe is installed, so they must be tightly controlled.
+- **Rationale**: Seeding and uninstalling change what other services believe is installed, so they are granted only to known workloads in reviewed configuration. History and the application list are operator reads, governed like other operator access.
 - **Actors**: `cpt-cf-application-manager-actor-seeding-caller`, `cpt-cf-application-manager-actor-operator`
 
 #### Operation History
@@ -521,9 +532,9 @@ Every seed and uninstall request that reaches the system **MUST** have its histo
 
 - [ ] `p1` - **ID**: `cpt-cf-application-manager-nfr-platform-scope`
 
-The system **MUST** treat all seeded applications as one platform-wide set, **MUST NOT** make operation records and history events owned by or visible per tenant, and **MUST** make them reachable only through the platform's access checks.
+The system **MUST** treat all seeded applications as one platform-wide set, **MUST NOT** make operation records, history events, and application records owned by or visible per tenant, and **MUST** make them reachable only through the system's access checks.
 
-- **Threshold**: No read or write of an operation record or history event made on behalf of a caller skips the access check. No per-tenant copy of operation records or history events exists.
+- **Threshold**: No read or write of an operation record, history event, or application record made on behalf of a caller skips the access check. No per-tenant copy of them exists.
 - **Rationale**: Installed applications are a property of the environment, not of a tenant.
 - **Verification Method**: Inspection of the public surface and of data ownership, plus tests on every action.
 
@@ -533,7 +544,7 @@ The system **MUST** treat all seeded applications as one platform-wide set, **MU
 
 The system **MUST NOT** call any section plugin, for schema, dispatch, or removal, for a caller who is not authorized for that action.
 
-- **Threshold**: Zero section-plugin calls for requests that platform access control refuses or cannot check, in tests on every action.
+- **Threshold**: Zero section-plugin calls for requests from callers not allowed for the action, in tests on every action.
 - **Rationale**: Callers without permission must not trigger section-plugin work or probe section-plugin schemas.
 
 #### Bounded Plugin Call Time
@@ -626,6 +637,15 @@ The system **MUST** give operators a visible signal for history events that fail
 - **Description**: Lets an authorized caller list section keys, read one section schema, and read the combined schema.
 - **Breaking Change Policy**: Additive changes are backward compatible. Removing or renaming returned information needs a major version bump and notice to application teams.
 
+#### Applications Interface
+
+- [ ] `p1` - **ID**: `cpt-cf-application-manager-interface-applications`
+
+- **Type**: REST API
+- **Stability**: unstable, until the first stable release.
+- **Description**: Lets a caller with the read applications permission list installed applications page by page, each with its version, the operation id and outcome of its last seed, and when that seed finished.
+- **Breaking Change Policy**: Additive changes are backward compatible. Removing or renaming returned information needs a major version bump and notice to its readers.
+
 ### 7.2 External Integration Contracts
 
 #### Section Plugin Contract
@@ -639,7 +659,7 @@ The system **MUST** give operators a visible signal for history events that fail
   - serves the schema for its section, with a schema version that changes whenever the schema content changes;
   - applies its section for an application, and removes an application on uninstall;
   - reports failures as plugin rejected, not permitted, or internal failure;
-  - uses its own service credentials, never the caller's.
+  - receives the caller's platform identity with every call, and uses its own service credentials, never the caller's.
 - **Compatibility**: Changes to the contract need coordinated updates of all section plugins. A schema change applies from the next seed, with no restart.
 
 ## 8. Use Cases
@@ -757,14 +777,16 @@ The system **MUST** give operators a visible signal for history events that fail
 - [ ] A section plugin that exceeds the time limit is an internal failure and does not block the remaining sections.
 - [ ] A request to which several outcome categories apply always gets the same single category (`cpt-cf-application-manager-fr-outcome-precedence`).
 - [ ] When permission or running operations cannot be checked, the answer is temporarily unavailable, never not permitted or conflict.
-- [ ] A section plugin that refuses its section as unacceptable gives plugin rejected, and a section plugin that refuses for an extra permission of its own gives not permitted, after platform access control has permitted the request (`cpt-cf-application-manager-fr-outcome-categories`).
+- [ ] A section plugin that refuses its section as unacceptable gives plugin rejected, and a section plugin that refuses for an extra permission of its own gives not permitted, after the allowed callers have permitted the request (`cpt-cf-application-manager-fr-outcome-categories`).
 - [ ] An uninstall asks every section plugin to remove the application, in priority order, even one never seeded, and continues after failures (`cpt-cf-application-manager-fr-uninstall`).
-- [ ] A caller refused by access control causes no section-plugin call, and each of the seed, uninstall, read schemas, read operations, and read history permissions is separate.
+- [ ] A caller not allowed for the action causes no section-plugin call, and each of the seed, uninstall, read schemas, read operations, read history, and read applications permissions is separate (`cpt-cf-application-manager-fr-authorization`).
+- [ ] Seed, uninstall, discovery, and operation reads are granted only to platform identities in the allowed callers, for their listed actions, and history reads and the application list only by platform access control.
+- [ ] A finished seed records or updates its application, a succeeded uninstall removes it, any other uninstall outcome leaves it, and listing applications returns the records page by page with no section-plugin call (`cpt-cf-application-manager-fr-list-applications`).
 - [ ] A second request for an application with an accepted or running operation is refused as conflict naming that operation, while other applications proceed.
 - [ ] Reading an operation returns its status and, once final, its report, ends as not found for an unknown or purged id, and makes no section-plugin call.
 - [ ] Listing history events returns them page by page, narrowing by an operation id or a refusal's request id returns only that request's events, an id with no events gives an empty list, and no read makes a section-plugin call (`cpt-cf-application-manager-fr-history-read`).
 - [ ] An operation that is not final at the end of its run window is reported as interrupted and is not resumed.
-- [ ] When access control or storage cannot answer, the request is refused as temporarily unavailable and nothing is dispatched.
+- [ ] When storage cannot answer, the request is refused as temporarily unavailable and nothing is dispatched; when platform access control cannot answer, a history read or an application list is refused as temporarily unavailable.
 - [ ] Every seed and uninstall request that reaches the system, including a refused one, has its history events in the operation history (except a refusal whose history event could not be recorded), and no history event exists for a change that did not commit (`cpt-cf-application-manager-nfr-history-completeness`).
 - [ ] History events are only ever appended to the operation history, and no other place keeps them (`cpt-cf-application-manager-fr-history-event`).
 - [ ] Nothing is dispatched until the accepted event is recorded in the operation history, the finished event is recorded together with the final report, and a refusal whose event cannot be recorded still returns its category and is logged and signalled (`cpt-cf-application-manager-fr-history-ordering`).
@@ -784,18 +806,19 @@ The system **MUST** give operators a visible signal for history events that fail
 | Dependency | Description | Criticality |
 |------------|-------------|-------------|
 | Section plugins | Each provides its current schema with a schema version, application of its section on seed, and removal of an application on uninstall, and answers with success, plugin rejected, not permitted, or internal failure. | p1 |
-| Platform access control | A permit or deny for each seed, uninstall, read schemas, read operations, and read history request, given the caller subject and the action. | p1 |
+| Platform workload authentication | A validated platform identity for every seed, uninstall, discovery, and operation read request. | p1 |
+| Platform access control | A permit or deny for each read history and read applications request, given the caller subject and the action. | p1 |
 | Plugin registration facility | The list of section plugins with their priorities and section types at startup. | p1 |
-| Platform storage | Storage for operation records and the operation history. | p1 |
+| Platform storage | Storage for operation records, the operation history, and application records. | p1 |
 | Platform error format | The standard format for failed responses, able to carry the outcome category, what to fix, the running operation id, and the request id. | p1 |
 | Platform observability facility | A place to send operational logs, metrics, and operator signals. | p2 |
 
 ## 11. Assumptions
 
 - The set of section keys is small and bounded, and fixed while the Application Manager runs.
-- Seeding callers authenticate through the platform, and their credentials are provisioned outside this gear.
+- Seeding callers authenticate as platform workloads, and their credentials are provisioned outside this gear. Operators list them in the allowed callers.
 - Seeding happens at deploy time and not on user request paths.
-- Seeding callers read an operation at a moderate pace and hold the read operations permission.
+- Seeding callers read an operation at a moderate pace and are allowed the read operations action.
 - Operators set the operation retention long enough for callers to read each operation after it ends.
 - Seeding callers keep secrets, such as passwords or keys, out of manifests. The system does not detect or remove them.
 
