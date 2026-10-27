@@ -83,5 +83,6 @@ types-registry-sdk = { workspace = true, features = ["test-util"] }
 toolkit-db = { workspace = true, features = ["sqlite", "test-support"] }
 tower = { workspace = true, features = ["util"] }
 proptest = { workspace = true }
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
 tracing-test = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }

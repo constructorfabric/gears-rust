@@ -163,6 +163,7 @@ A subject without facts answers `{"subject_id":"…","categories":[]}`; a subjec
 |-------|----------|
 | The gear does not start | Check that the config has no unknown key and that every entry in `connectors_off` is a UUID. |
 | A received record changes nothing | Without `processing_identity` and `model`, every received record is dropped, with a drop event in the log. With them, look for a drop event naming the stage and the reason. |
-| The profile read answers `503` | No `processing_identity` is configured, or graph storage or the settings service cannot answer. |
+| The profile read answers `501` | No `processing_identity` is configured. |
+| The profile read answers `503` | Graph storage, the settings service or the policy service cannot answer. |
 | `404` on `/cf/construct/...` | The example server was started without `--features construct`. |
 | Every record is `UNKNOWN_TYPE` | The record's `type` is not one of the registered connector record types; the SDK registers the base and four derived types. |

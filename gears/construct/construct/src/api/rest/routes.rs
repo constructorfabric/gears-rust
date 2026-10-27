@@ -63,7 +63,8 @@ pub fn register_routes(
         .register(router, openapi);
     // @cpt-end:cpt-cf-construct-flow-record-intake-submit:p1:inst-submit-send
 
-    // Every route about one subject answers with `no-store`.
+    // Every route about one subject answers with `no-store` and the
+    // security headers.
     let mut subject = Router::new();
 
     // @cpt-begin:cpt-cf-construct-flow-subject-settings-view:p1:inst-view-send
@@ -144,6 +145,11 @@ pub fn register_routes(
         )
         .standard_errors(openapi)
         .error_503(openapi)
+        .problem_response(
+            openapi,
+            StatusCode::NOT_IMPLEMENTED,
+            "The deployment does not provide the profile read",
+        )
         .register(subject, openapi);
     // @cpt-end:cpt-cf-construct-flow-profile-reader-read:p1:inst-profile-send
 
@@ -189,15 +195,25 @@ pub fn register_manage_route(
 
 /// `routes` with every answer, errors included, marked
 /// `Cache-Control: no-store`, so no proxy or browser cache keeps one
-/// subject's data. Only these routes get the layer: the router they are merged
+/// subject's data, and with the response headers OWASP names for a JSON API:
+/// no content sniffing, no framing, no content to run. HSTS belongs to the
+/// TLS ingress. Only these routes get the layer: the router they are merged
 /// into holds other gears' routes too.
 fn not_stored(routes: Router) -> Router {
     routes.layer(axum::middleware::map_response(
         |mut response: axum::response::Response| async move {
-            response.headers_mut().insert(
-                header::CACHE_CONTROL,
-                header::HeaderValue::from_static("no-store"),
-            );
+            let headers = response.headers_mut();
+            for (name, value) in [
+                (header::CACHE_CONTROL, "no-store"),
+                (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+                (header::X_FRAME_OPTIONS, "DENY"),
+                (
+                    header::CONTENT_SECURITY_POLICY,
+                    "default-src 'none'; frame-ancestors 'none'",
+                ),
+            ] {
+                headers.insert(name, header::HeaderValue::from_static(value));
+            }
             response
         },
     ))

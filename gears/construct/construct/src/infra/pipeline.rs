@@ -30,7 +30,7 @@ use crate::domain::record_intake::{
 use crate::domain::sensitive_data::SensitiveDataChecks;
 use crate::domain::subject_settings::SubjectSettingsReader;
 use crate::infra::admission_events::LogAdmissionEvents;
-use crate::infra::admission_rules::ConfigAdmissionRules;
+use crate::infra::admission_rules::{ConfigAdmissionRules, warn_open_lists};
 use crate::infra::intake_events::LogIntakeEvents;
 use crate::infra::model::chat_completions::{ChatCompletionsModel, ChatCompletionsSettings};
 use crate::infra::planner_stub::DroppingHandOff;
@@ -53,7 +53,7 @@ impl ProcessingContexts for NoIdentity {
         &self,
         _tenant_id: Uuid,
     ) -> Result<(SecurityContext, AccessScope), DomainError> {
-        Err(DomainError::Unavailable(
+        Err(DomainError::NotConfigured(
             "no processing identity is configured".to_owned(),
         ))
     }
@@ -234,7 +234,10 @@ pub fn assemble(
     let (hand_off, queue) = record_queue(cfg.processing.queue_capacity);
     let hand_off = Arc::new(hand_off);
     let load = WorkerLoad::new(Arc::downgrade(&hand_off));
-    let metrics = Arc::new(ProcessingMetrics::new(&load));
+    let metrics = Arc::new(ProcessingMetrics::new(
+        &load,
+        &opentelemetry::global::meter("construct"),
+    ));
     let events: Arc<dyn IntakeEvents> = Arc::new(CountedDrops::new(
         Arc::new(LogIntakeEvents),
         Arc::clone(&metrics),
@@ -255,6 +258,7 @@ pub fn assemble(
         "construct: record processing runs with no sensitive-data check; every planned value \
          that Admission lets through is stored"
     );
+    warn_open_lists(&cfg.admission);
     let admission = Admission::new(AdmissionPorts {
         settings,
         rules: Arc::new(ConfigAdmissionRules::new(&cfg.admission)),

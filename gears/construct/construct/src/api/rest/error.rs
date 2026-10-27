@@ -100,6 +100,7 @@ pub fn for_settings(e: DomainError) -> CanonicalError {
         e @ (DomainError::Refused(_)
         | DomainError::NotVisible(_)
         | DomainError::Unavailable(_)
+        | DomainError::NotConfigured(_)
         | DomainError::Internal(_)
         | DomainError::ProfileFull(_)
         | DomainError::Database(_)) => e.into(),
@@ -140,6 +141,7 @@ pub fn for_facts(e: DomainError, subject_id: Uuid) -> CanonicalError {
         }
         e @ (DomainError::Refused(_)
         | DomainError::Unavailable(_)
+        | DomainError::NotConfigured(_)
         | DomainError::Internal(_)
         | DomainError::ProfileFull(_)
         | DomainError::NotVisible(_)
@@ -190,6 +192,12 @@ impl From<DomainError> for CanonicalError {
             }
             // @cpt-end:cpt-cf-construct-algo-gear-foundation-map-errors:p1:inst-map-unavailable-return
             // @cpt-end:cpt-cf-construct-algo-gear-foundation-map-errors:p1:inst-map-unavailable
+            // A deployment without what the call needs answers 501, which a
+            // caller does not retry, and the operator sees an error.
+            DomainError::NotConfigured(msg) => {
+                tracing::error!(msg = %msg, "construct is not configured for this call");
+                ProfileError::unimplemented("this deployment does not provide this call").create()
+            }
             // A full profile takes no new fact until facts are removed: the
             // caller's state, not the gear's failure. The subject stays in the
             // log, out of the answer.

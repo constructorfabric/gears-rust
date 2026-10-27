@@ -6,7 +6,7 @@ use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use opentelemetry::KeyValue;
-use opentelemetry::metrics::{Counter, Histogram, ObservableGauge};
+use opentelemetry::metrics::{Counter, Histogram, Meter, ObservableGauge};
 
 use crate::domain::record_intake::{DropEvent, DropStage, IntakeEvents};
 use crate::infra::intake_events::stage;
@@ -60,7 +60,7 @@ impl Drop for InFlight {
 }
 
 /// `construct_records_processed_total`, `construct_record_processing_seconds`,
-/// `construct_records_dropped_total` and the queue gauges, on the gear's meter.
+/// `construct_records_dropped_total` and the queue gauges.
 pub struct ProcessingMetrics {
     processed: Counter<u64>,
     duration: Histogram<f64>,
@@ -70,10 +70,10 @@ pub struct ProcessingMetrics {
 }
 
 impl ProcessingMetrics {
-    /// The metrics of the worker with `load`.
+    /// The metrics of the worker with `load`, on `meter`: the gear's own,
+    /// `opentelemetry::global::meter("construct")`.
     #[must_use]
-    pub fn new(load: &WorkerLoad) -> Self {
-        let meter = opentelemetry::global::meter("construct");
+    pub fn new(load: &WorkerLoad, meter: &Meter) -> Self {
         let queued = load.clone();
         let in_flight = load.clone();
         Self {
@@ -198,7 +198,10 @@ mod tests {
     #[test]
     fn a_counted_drop_is_handed_on() {
         let inner = Arc::new(RecordingEvents::default());
-        let metrics = Arc::new(ProcessingMetrics::new(&WorkerLoad::new(Weak::new())));
+        let metrics = Arc::new(ProcessingMetrics::new(
+            &WorkerLoad::new(Weak::new()),
+            &opentelemetry::global::meter("construct"),
+        ));
         let events = CountedDrops::new(Arc::clone(&inner) as _, metrics);
         let record = received_chat_record(Uuid::new_v4(), Uuid::new_v4());
 
@@ -211,5 +214,148 @@ mod tests {
         let dropped = inner.taken();
         assert_eq!(dropped.len(), 1);
         assert_eq!(dropped[0].stage, DropStage::Checks);
+    }
+
+    mod exported {
+        use opentelemetry::metrics::MeterProvider as _;
+        use opentelemetry_sdk::metrics::data::{
+            AggregatedMetrics, GaugeDataPoint, MetricData, ResourceMetrics, ScopeMetrics,
+        };
+        use opentelemetry_sdk::metrics::{
+            InMemoryMetricExporter, PeriodicReader, SdkMeterProvider,
+        };
+
+        use super::*;
+
+        fn provider() -> (SdkMeterProvider, InMemoryMetricExporter) {
+            let exporter = InMemoryMetricExporter::default();
+            let provider = SdkMeterProvider::builder()
+                .with_reader(PeriodicReader::builder(exporter.clone()).build())
+                .build();
+            (provider, exporter)
+        }
+
+        /// `read` applied to the last export of the metric `name`.
+        fn last<R>(
+            exporter: &InMemoryMetricExporter,
+            name: &str,
+            read: impl FnOnce(&AggregatedMetrics) -> R,
+        ) -> R {
+            let finished = exporter.get_finished_metrics().unwrap();
+            let metric = finished
+                .iter()
+                .rev()
+                .flat_map(ResourceMetrics::scope_metrics)
+                .flat_map(ScopeMetrics::metrics)
+                .find(|metric| metric.name() == name)
+                .unwrap_or_else(|| panic!("{name} was not exported"));
+            read(metric.data())
+        }
+
+        /// Each data point of the u64 sum `name`, with its attributes by key.
+        fn sum(exporter: &InMemoryMetricExporter, name: &str) -> Vec<(Vec<KeyValue>, u64)> {
+            last(exporter, name, |metric| {
+                let AggregatedMetrics::U64(MetricData::Sum(sum)) = metric else {
+                    panic!("{name} is not a u64 sum");
+                };
+                sum.data_points()
+                    .map(|point| {
+                        let mut attributes: Vec<KeyValue> = point.attributes().cloned().collect();
+                        attributes.sort_by(|a, b| a.key.as_str().cmp(b.key.as_str()));
+                        (attributes, point.value())
+                    })
+                    .collect()
+            })
+        }
+
+        /// The value of the u64 gauge `name`.
+        fn gauge(exporter: &InMemoryMetricExporter, name: &str) -> u64 {
+            last(exporter, name, |metric| {
+                let AggregatedMetrics::U64(MetricData::Gauge(gauge)) = metric else {
+                    panic!("{name} is not a u64 gauge");
+                };
+                gauge.data_points().map(GaugeDataPoint::value).sum()
+            })
+        }
+
+        /// The count and the sum of the f64 histogram `name`.
+        fn histogram(exporter: &InMemoryMetricExporter, name: &str) -> (u64, f64) {
+            last(exporter, name, |metric| {
+                let AggregatedMetrics::F64(MetricData::Histogram(histogram)) = metric else {
+                    panic!("{name} is not an f64 histogram");
+                };
+                histogram
+                    .data_points()
+                    .fold((0, 0.0), |(count, sum), point| {
+                        (count + point.count(), sum + point.sum())
+                    })
+            })
+        }
+
+        #[test]
+        fn a_processed_record_counts_once_with_its_duration() {
+            let (provider, exporter) = provider();
+            let metrics =
+                ProcessingMetrics::new(&WorkerLoad::new(Weak::new()), &provider.meter("construct"));
+
+            metrics.processed(Duration::from_millis(250));
+            metrics.processed(Duration::from_millis(750));
+            provider.force_flush().unwrap();
+
+            assert_eq!(
+                sum(&exporter, "construct_records_processed_total"),
+                [(Vec::new(), 2)]
+            );
+            let (count, seconds) = histogram(&exporter, "construct_record_processing_seconds");
+            assert_eq!(count, 2);
+            assert!((seconds - 1.0).abs() < 1e-9, "{seconds}");
+        }
+
+        #[test]
+        fn a_drop_counts_by_its_stage_and_reason() {
+            let (provider, exporter) = provider();
+            let metrics = Arc::new(ProcessingMetrics::new(
+                &WorkerLoad::new(Weak::new()),
+                &provider.meter("construct"),
+            ));
+            let events = CountedDrops::new(Arc::new(RecordingEvents::default()), metrics);
+            let record = received_chat_record(Uuid::new_v4(), Uuid::new_v4());
+
+            events.dropped(DropEvent::for_record(
+                &record,
+                DropStage::Worker,
+                DropReason::ProcessingFailed,
+            ));
+            provider.force_flush().unwrap();
+
+            assert_eq!(
+                sum(&exporter, "construct_records_dropped_total"),
+                [(
+                    vec![
+                        KeyValue::new("reason", "processing_failed"),
+                        KeyValue::new("stage", "worker"),
+                    ],
+                    1
+                )]
+            );
+        }
+
+        #[test]
+        fn the_gauges_read_the_queue_and_the_records_in_flight() {
+            let (provider, exporter) = provider();
+            let (hand_off, _queue) = record_queue(NonZeroUsize::new(4).unwrap());
+            let hand_off = Arc::new(hand_off);
+            let load = WorkerLoad::new(Arc::downgrade(&hand_off));
+            let _metrics = ProcessingMetrics::new(&load, &provider.meter("construct"));
+            hand_off
+                .hand_off(received_chat_record(Uuid::new_v4(), Uuid::new_v4()))
+                .unwrap();
+            let _in_flight = (load.start(), load.start());
+
+            provider.force_flush().unwrap();
+
+            assert_eq!(gauge(&exporter, "construct_processing_queue_depth"), 1);
+            assert_eq!(gauge(&exporter, "construct_processing_in_flight"), 2);
+        }
     }
 }
