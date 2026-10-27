@@ -40,9 +40,9 @@ How the Application Manager runs each seed and uninstall as an operation: quick 
 
 ### 1.1 Architectural Vision
 
-The Application Manager is a thin orchestrating gear on the ToolKit gear model. It owns one manifest envelope, one operations table, one append-only operation history, and one fixed sequence of checks, history inserts, and plugin calls. All domain meaning lives in section plugins, and the gear never talks to the systems they provision.
+The Application Manager is a thin orchestrating gear on the ToolKit gear model. It owns one manifest envelope, one operations table, one append-only operation history, one table of installed applications, and one fixed sequence of checks, history inserts, and plugin calls. All domain meaning lives in section plugins, and the gear never talks to the systems they provision.
 
-The plugin set is fixed at startup ([ADR 0001](./ADR/0001-cpt-cf-application-manager-adr-section-plugin-fan-out.md)). Every seed fetches live schemas and validates the whole manifest before it dispatches anything ([ADR 0002](./ADR/0002-cpt-cf-application-manager-adr-plugin-served-section-schemas.md)). Seed and uninstall run as background operations within a run window ([ADR 0003](./ADR/0003-cpt-cf-application-manager-adr-async-operations.md)). History events go to the append-only operation history in the transaction of the change they describe ([ADR 0004](./ADR/0004-cpt-cf-application-manager-adr-operation-history.md)). Permission is platform-level and records are unrestricted ([ADR 0005](./ADR/0005-cpt-cf-application-manager-adr-platform-level-access.md)).
+The plugin set is fixed at startup ([ADR 0001](./ADR/0001-cpt-cf-application-manager-adr-section-plugin-fan-out.md)). Every seed fetches live schemas and validates the whole manifest before it dispatches anything ([ADR 0002](./ADR/0002-cpt-cf-application-manager-adr-plugin-served-section-schemas.md)). Seed and uninstall run as background operations within a run window ([ADR 0003](./ADR/0003-cpt-cf-application-manager-adr-async-operations.md)). History events go to the append-only operation history in the transaction of the change they describe ([ADR 0004](./ADR/0004-cpt-cf-application-manager-adr-operation-history.md)). Allowed callers in configuration grant the seeding actions on the platform plane, the PDP decides the operator reads, and records are unrestricted ([ADR 0005](./ADR/0005-cpt-cf-application-manager-adr-platform-level-access.md)).
 
 ### 1.2 Architecture Drivers
 
@@ -73,14 +73,16 @@ The plugin set is fixed at startup ([ADR 0001](./ADR/0001-cpt-cf-application-man
 | `cpt-cf-application-manager-fr-uninstall` | `cpt-cf-application-manager-seq-uninstall`. |
 | `cpt-cf-application-manager-fr-discovery` | `cpt-cf-application-manager-component-read-service`. |
 | `cpt-cf-application-manager-fr-operation-read` | `cpt-cf-application-manager-component-read-service`, `cpt-cf-application-manager-component-operation-sweeper`. |
-| `cpt-cf-application-manager-fr-authentication` | Every route is `.authenticated()`; plugins get a token-less caller identity (`cpt-cf-application-manager-entity-caller-identity`). |
-| `cpt-cf-application-manager-fr-authorization` | Gear-level and plugin-level authorization in [§3.3](#33-api-contracts). |
+| `cpt-cf-application-manager-fr-authentication` | Seeding, discovery, and operation-read routes are `.platform_authenticated()`; the history read and the application list are `.authenticated()`; plugins get the caller's platform identity (`cpt-cf-application-manager-entity-caller-identity`). |
+| `cpt-cf-application-manager-fr-authorization` | `cpt-cf-application-manager-component-allowed-callers` and the PDP, with plugin-level authorization, in [§3.3](#33-api-contracts). |
+| `cpt-cf-application-manager-fr-list-applications` | `cpt-cf-application-manager-dbtable-applications`, written in the final transactions; `cpt-cf-application-manager-seq-list-applications`. |
 | `cpt-cf-application-manager-fr-history-event` | `cpt-cf-application-manager-dbtable-operation-history`, `cpt-cf-application-manager-component-operation-repository`. |
 | `cpt-cf-application-manager-fr-history-read` | `cpt-cf-application-manager-component-read-service`. |
 | `cpt-cf-application-manager-fr-history-ordering` | `cpt-cf-application-manager-principle-trace-before-change`. |
 | `cpt-cf-application-manager-interface-seeding` | `cpt-cf-application-manager-interface-rest-api`. |
 | `cpt-cf-application-manager-interface-operations` | `cpt-cf-application-manager-interface-rest-api`. |
 | `cpt-cf-application-manager-interface-discovery` | `cpt-cf-application-manager-interface-rest-api`. |
+| `cpt-cf-application-manager-interface-applications` | `cpt-cf-application-manager-interface-rest-api`. |
 | `cpt-cf-application-manager-contract-section-plugin` | `cpt-cf-application-manager-interface-section-plugin-api`. |
 
 #### NFR Allocation
@@ -89,7 +91,7 @@ The plugin set is fixed at startup ([ADR 0001](./ADR/0001-cpt-cf-application-man
 |---|---|---|
 | `cpt-cf-application-manager-nfr-history-completeness` | `cpt-cf-application-manager-component-operation-repository` | Every path ends in a refused event or in the acceptance transaction, and every final state writes its finished event with the report ([§3.7](#37-database-schemas--tables)). |
 | `cpt-cf-application-manager-nfr-platform-scope` | `cpt-cf-application-manager-component-operation-repository` | Unrestricted entities with no tenant column, reached only through the gear ([ADR 0005](./ADR/0005-cpt-cf-application-manager-adr-platform-level-access.md)). |
-| `cpt-cf-application-manager-nfr-authorized-before-plugin` | `cpt-cf-application-manager-component-request-orchestrator`, `cpt-cf-application-manager-component-read-service` | The gear-level decision precedes the conflict read, the acceptance, and every plugin call. |
+| `cpt-cf-application-manager-nfr-authorized-before-plugin` | `cpt-cf-application-manager-component-request-orchestrator`, `cpt-cf-application-manager-component-read-service` | The allowed-callers check precedes the conflict read, the acceptance, and every plugin call. |
 | `cpt-cf-application-manager-nfr-bounded-call-time` | `cpt-cf-application-manager-component-plugin-call-guard` | Every plugin call goes through the guard ([§4.2](#42-configuration)). |
 | `cpt-cf-application-manager-nfr-bounded-request-time` | `cpt-cf-application-manager-component-request-orchestrator`, `cpt-cf-application-manager-component-operation-sweeper` | A checked synchronous budget and a run deadline per operation ([§4.2](#42-configuration)). |
 | `cpt-cf-application-manager-nfr-no-partial-on-invalid` | `cpt-cf-application-manager-component-request-orchestrator` | Dispatch is reachable only after acceptance, usable schemas, and a valid manifest. |
@@ -104,7 +106,7 @@ The plugin set is fixed at startup ([ADR 0001](./ADR/0001-cpt-cf-application-man
 | `cpt-cf-application-manager-adr-plugin-served-section-schemas` | Plugins serve live schemas, fetched on every seed; the whole manifest is validated before dispatch. |
 | `cpt-cf-application-manager-adr-async-operations` | Background operations with a bounded synchronous phase and a run window; a plugin call is stopped at its time limit. |
 | `cpt-cf-application-manager-adr-operation-history` | An append-only history table written in the transaction of the change it describes. |
-| `cpt-cf-application-manager-adr-platform-level-access` | Platform-level permission with no tenant; unrestricted records. |
+| `cpt-cf-application-manager-adr-platform-level-access` | Allowed callers in configuration grant the seeding actions on the platform plane; the PDP decides history reads and the application list; unrestricted records. |
 
 ### 1.3 Architecture Layers
 
@@ -113,8 +115,8 @@ flowchart TB
     GW["API gateway"] --> API["api/rest"] --> DOM["domain"]
     INF["infra"] -.->|"implements domain ports"| DOM
     INF --> SP["Section plugins"]
-    INF --> PDP["Platform access control"]
-    INF --> DB[("Platform database: operations and operation history")]
+    INF -->|"operator reads only"| PDP["Platform access control"]
+    INF --> DB[("Platform database: operations, operation history, applications")]
     INF -->|"startup only"| TR["Types registry"]
     SP -. implements .-> SDK["application-manager-sdk"]
     DOM -. uses .-> SDK
@@ -127,7 +129,7 @@ The gear uses the platform layer model ([gear layout and SDK pattern](../../../.
 | Layer | Responsibility | Technology |
 |---|---|---|
 | API (`api/rest/`) | Routes, DTOs, Problem bodies, the not-ready gate | OperationBuilder; canonical errors (RFC 9457) |
-| Domain (`domain/`) | Orchestration, operation lifecycle, reads, validation, dispatch order, outcome ranking; owns the ports | `#[domain_model]`; JSON Schema Draft 2020-12 through `jsonschema` |
+| Domain (`domain/`) | Orchestration, operation lifecycle, reads, the allowed-callers check, validation, dispatch order, outcome ranking; owns the ports | `#[domain_model]`; JSON Schema Draft 2020-12 through `jsonschema` |
 | Infrastructure (`infra/`) | Call guard, ClientHub and policy adapters, operation repository, sweeper, startup, telemetry | ClientHub; types registry; PolicyEnforcer; SeaORM through SecureConn; OpenTelemetry |
 | SDK (`application-manager-sdk`) | Section plugin interface, models, error kinds, GTS types | Rust traits; GTS |
 
@@ -187,7 +189,7 @@ The gear drops a plugin call at the time limit and dispatches the next section. 
 
 - [ ] `p2` - **ID**: `cpt-cf-application-manager-principle-minimal-state`
 
-The gear keeps only operation records and the operation history, and neither holds manifest content. The operation history is a record for people who debug a request; the gear serves it through the history read and never decides from it.
+The gear keeps only operation records, the operation history, and application records, and none holds manifest content. The operation history is a record for people who debug a request, and application records answer which applications are installed; the gear serves both through their reads and never decides from them.
 
 **ADRs**: `cpt-cf-application-manager-adr-operation-history`, `cpt-cf-application-manager-adr-platform-level-access`
 
@@ -205,7 +207,7 @@ The section plugin type and the section base type `gts.cf.core.application_manag
 
 - [ ] `p2` - **ID**: `cpt-cf-application-manager-constraint-platform-auth`
 
-Authentication belongs to the platform pipeline, and the gear is supported only with gateway authentication enabled. Authorization uses PolicyEnforcer ([AuthN, AuthZ and secure ORM](../../../../docs/toolkit_unified_system/06_authn_authz_secure_orm.md)), and caller credentials never reach plugins.
+Authentication belongs to the platform pipeline, and the gear is supported only with gateway authentication and platform-plane authentication enabled. Seed, uninstall, discovery, and the operation read are platform-plane routes, granted by the allowed callers (`cpt-cf-adr-two-plane-auth`). The history read and the application list are tenant-plane routes, decided by PolicyEnforcer ([AuthN, AuthZ and secure ORM](../../../../docs/toolkit_unified_system/06_authn_authz_secure_orm.md)). Caller credentials never reach plugins.
 
 **ADRs**: `cpt-cf-application-manager-adr-platform-level-access`
 
@@ -213,7 +215,7 @@ Authentication belongs to the platform pipeline, and the gear is supported only 
 
 - [ ] `p2` - **ID**: `cpt-cf-application-manager-constraint-secure-orm`
 
-All storage access goes through SecureConn, with both entities declared unrestricted ([database patterns](../../../../docs/toolkit_unified_system/11_database_patterns.md)). Raw SQL appears only in migrations.
+All storage access goes through SecureConn, with all three entities declared unrestricted ([database patterns](../../../../docs/toolkit_unified_system/11_database_patterns.md)). Raw SQL appears only in migrations.
 
 **ADRs**: `cpt-cf-application-manager-adr-platform-level-access`
 
@@ -235,7 +237,7 @@ Manifest content lives only in memory. Operation records, history rows, logs, tr
 
 - [ ] `p2` - **ID**: `cpt-cf-application-manager-constraint-restart-for-plugin-change`
 
-A change to the section plugin set or its priorities takes effect only after a restart.
+A change to the section plugin set, its priorities, or the allowed callers takes effect only after a restart.
 
 **ADRs**: `cpt-cf-application-manager-adr-section-plugin-fan-out`
 
@@ -279,7 +281,7 @@ The plugin-call time limit is `plugin_call_timeout`, exactly as configured, for 
 | `application` | Seed: `id` and `version`. Uninstall: `id`. |
 | `sections` | Per plugin with a recorded outcome, in priority order: `key`, `outcome`, `schema_version` for a validated seed section, and for `rejected` and `not_permitted` the plugin's `detail` (cut at `PLUGIN_DETAIL_MAX_BYTES`) and optional `location` |
 | `problems` | Section validation problems: `location` (JSON Pointer), `rule` (a JSON Schema keyword, `missing_section`, or `unknown_section`), `message` |
-| `unavailable` | Items with a `dependency` (`access_control`, `operation_storage`, `section_schema`, `application_manager`), a `key` for a section schema, and a `reason` (`unreachable`, `timed_out`, `unusable`, `not_sent`, `not_ready`, `at_capacity`) |
+| `unavailable` | Items with a `dependency` (`operation_storage`, `section_schema`, `application_manager`), a `key` for a section schema, and a `reason` (`unreachable`, `timed_out`, `unusable`, `not_sent`, `not_ready`, `at_capacity`) |
 
 - [ ] `p2` - **ID**: `cpt-cf-application-manager-entity-operation`
 
@@ -298,13 +300,13 @@ stateDiagram-v2
 
 - **Run deadline.** Set at acceptance ([§4.2](#42-configuration)). A plugin call starts only when `plugin_call_timeout` + `storage_call_timeout` still fit before it, so the call and its outcome write end by the deadline.
 - **Status guard.** Writes match only an open record before its deadline; the interruption step matches only one past it. The first final write wins.
-- **Interruption step.** One transaction sets interrupted, keeps the section outcomes so far, and inserts the finished event. The sweeper, the operation read, and the acceptance run it on an expired open operation, which covers a lost task and a failed final transaction.
+- **Interruption step.** One transaction sets interrupted, keeps the section outcomes so far, and inserts the finished event. For a seed, the same transaction writes the application record. The sweeper, the operation read, and the acceptance run it on an expired open operation, which covers a lost task and a failed final transaction.
 - **Supervisor completion.** When a request task fails after acceptance, the operation goes Running, then Completed as internal failure, with `not_dispatched` for plugins not yet called.
 - **Retention.** The sweeper purges a final record `operation_retention` after it finished.
 
 - [ ] `p2` - **ID**: `cpt-cf-application-manager-entity-caller-identity`
 
-**Caller identity.** Subject id, subject type, subject tenant id, and token scopes from the `SecurityContext`, with no bearer token. Every plugin call receives it. The SDK turns it back into a token-less `SecurityContext` for a plugin's own PolicyEnforcer check.
+**Caller identity.** The validated platform identity from the caller's `PlatformSecurityContext`, with no credential: its kind and, for a Kubernetes service account, the namespace, service-account name, and pod when known; for SPIFFE, the trust domain, name, and version. Every plugin call receives it. A plugin's own permission check is a rule of the plugin on this identity, because the PDP never evaluates a platform identity.
 
 - [ ] `p2` - **ID**: `cpt-cf-application-manager-entity-history-event-content`
 
@@ -340,8 +342,9 @@ graph LR
     RS --> SPR
     ORC --> REP[Operation repository]
     RS --> REP
-    ORC --> PDP[Platform access control]
-    RS --> PDP
+    ORC --> AC[Allowed callers]
+    RS --> AC
+    RS -->|"operator reads"| PDP[Platform access control]
     SWP[Operation sweeper] --> REP
     SPR --> GUARD[Plugin call guard]
     GUARD --> SP[Section plugins]
@@ -382,11 +385,23 @@ graph LR
 
 **Why**: Reads record no history event and decide no category, so they stay apart from the orchestrator.
 
-**Scope**: After a `read_schema` or `read_operation` permit, it lists keys from memory, fetches live schemas, or reads one operation record, interrupting it first when expired. After a `read_history` permit, it reads one page of history events, narrowed to one operation when the filter names it.
+**Scope**: When the allowed callers allow `read_schema` or `read_operation`, it lists keys from memory, fetches live schemas, or reads one operation record, interrupting it first when expired. After a PDP permit for `read_history` or `read_applications`, it reads one page of history events, narrowed to one operation when the filter names it, or one page of application records.
 
 **Boundaries**: It caches no schema and returns no manifest content or caller subject.
 
 **Related**: `cpt-cf-application-manager-component-operation-repository`, `cpt-cf-application-manager-component-section-plugin-router`, `cpt-cf-application-manager-component-schema-validator`.
+
+#### Allowed Callers
+
+- [ ] `p1` - **ID**: `cpt-cf-application-manager-component-allowed-callers`
+
+**Why**: Every platform-plane route needs one rule for who may take which action.
+
+**Scope**: Built in `init` from `allowed_callers` ([§4.2](#42-configuration)). It answers whether a validated platform identity may take one of `seed`, `uninstall`, `read_schema`, and `read_operation`, matching a service account by namespace and name and a SPIFFE identity by trust domain and name.
+
+**Boundaries**: It is in memory, has no unavailable answer, never consults the PDP, and does not change before the next start.
+
+**Related**: `cpt-cf-application-manager-component-request-orchestrator`, `cpt-cf-application-manager-component-read-service`.
 
 #### Schema Validator
 
@@ -428,7 +443,7 @@ graph LR
 
 - [ ] `p2` - **ID**: `cpt-cf-application-manager-component-operation-repository`
 
-**Why**: The only writer of operation records and of the operation history, and the owner of the status guard.
+**Why**: The only writer of operation records, the operation history, and application records, and the owner of the status guard.
 
 **Scope**: Runs every storage step and transaction of [§3.6](#36-interactions--sequences) and [§3.7](#37-database-schemas--tables), each bounded by `storage_call_timeout`, and reports "storage cannot answer", "index violated", and "operation final" as distinct results.
 
@@ -444,7 +459,7 @@ graph LR
 
 **Scope**: On every replica, every `SWEEP_INTERVAL` it interrupts up to `MAINTENANCE_BATCH_SIZE` expired open operations, and every `PURGE_INTERVAL` it purges final records past `operation_retention`. A failed step is logged and runs again next interval.
 
-**Boundaries**: It makes no plugin call, never deletes an open record, and never purges the operation history.
+**Boundaries**: It makes no plugin call, never deletes an open record, and never purges the operation history or application records.
 
 **Related**: `cpt-cf-application-manager-component-operation-repository`.
 
@@ -464,30 +479,33 @@ graph LR
 
 - [ ] `p2` - **ID**: `cpt-cf-application-manager-interface-rest-api`
 
-- **Contracts**: `cpt-cf-application-manager-interface-seeding`, `cpt-cf-application-manager-interface-operations`, `cpt-cf-application-manager-interface-discovery`
+- **Contracts**: `cpt-cf-application-manager-interface-seeding`, `cpt-cf-application-manager-interface-operations`, `cpt-cf-application-manager-interface-discovery`, `cpt-cf-application-manager-interface-applications`
 - **Technology**: REST with JSON bodies, canonical Problem errors, OpenAPI from OperationBuilder ([REST OperationBuilder](../../../../docs/toolkit_unified_system/04_rest_operation_builder.md))
 
-| Method | Path | Description | Permission |
-|---|---|---|---|
-| `POST` | `/application-manager/v1/applications` | Seed: submit a manifest | `seed` |
-| `DELETE` | `/application-manager/v1/applications/{application_id}` | Uninstall by id in one percent-encoded segment | `uninstall` |
-| `POST` | `/application-manager/v1/applications:uninstall` | Uninstall with `application_id` in the body | `uninstall` |
-| `GET` | `/application-manager/v1/operations/{operation_id}` | Read one operation | `read_operation` |
-| `GET` | `/application-manager/v1/operation-history?$filter=operation_id eq {operation_id}` | List history events; `$filter` is optional | `read_history` |
-| `GET` | `/application-manager/v1/section-keys` | List section keys in priority order | `read_schema` |
-| `GET` | `/application-manager/v1/section-keys/{section_key}/schema` | One live schema with its schema version | `read_schema` |
-| `GET` | `/application-manager/v1/manifest-schema` | The live combined schema with every schema version | `read_schema` |
+| Method | Path | Description | Permission | Plane |
+|---|---|---|---|---|
+| `POST` | `/application-manager/v1/applications` | Seed: submit a manifest | `seed` | Platform |
+| `DELETE` | `/application-manager/v1/applications/{application_id}` | Uninstall by id in one percent-encoded segment | `uninstall` | Platform |
+| `POST` | `/application-manager/v1/applications:uninstall` | Uninstall with `application_id` in the body | `uninstall` | Platform |
+| `GET` | `/application-manager/v1/applications` | List installed applications | `read_applications` | Tenant |
+| `GET` | `/application-manager/v1/operations/{operation_id}` | Read one operation | `read_operation` | Platform |
+| `GET` | `/application-manager/v1/operation-history?$filter=operation_id eq {operation_id}` | List history events; `$filter` is optional | `read_history` | Tenant |
+| `GET` | `/application-manager/v1/section-keys` | List section keys in priority order | `read_schema` | Platform |
+| `GET` | `/application-manager/v1/section-keys/{section_key}/schema` | One live schema with its schema version | `read_schema` | Platform |
+| `GET` | `/application-manager/v1/manifest-schema` | The live combined schema with every schema version | `read_schema` | Platform |
 
-All routes are unstable, `.authenticated()`, and `.no_license_required()`; seed, uninstall, the operation read, the history read, and the combined-schema read are bound to gateway rate-limit and in-flight zones. An accepted request gets 202 with `operation_id`, `status` `accepted`, and a `Location` header. The operation read returns the record and, once final, the outcome report.
+All routes are unstable and `.no_license_required()`. Platform-plane routes are `.platform_authenticated()` and tenant-plane routes are `.authenticated()`. Seed, uninstall, the operation read, the history read, the application list, and the combined-schema read are bound to gateway rate-limit and in-flight zones. An accepted request gets 202 with `operation_id`, `status` `accepted`, and a `Location` header. The operation read returns the record and, once final, the outcome report.
 
 **History read.** A paged OData list on the toolkit's pager ([OData and pagination](../../../../docs/toolkit_unified_system/07_odata_pagination_select_filter.md)) that returns `Page<T>` of history events in `event_id` order. `$filter` is optional and takes only `operation_id` (Uuid, `eq` or `in`), which matches `correlation_id`; the request id of a refusal matches the same way. Without `$filter`, the read lists every history event. `limit` defaults to `HISTORY_PAGE_MAX_LIMIT` and may not exceed it; `cursor` comes from `page_info`. `$orderby`, `$select`, and any other filter field are 400. An id with no events gives an empty page. Query errors use the platform OData reason codes ([Pagination](../../../../guidelines/DNA/REST/PAGINATION.md)).
+
+**Application list.** A paged OData list on the same pager that returns `Page<T>` of application records in `application_id` order: `application_id`, `version`, `operation_id`, `category` or `interrupted`, and `finished_at`. `$filter` is optional and takes only `application_id` (`eq` or `in`). `limit` defaults to `APPLICATION_PAGE_MAX_LIMIT` and may not exceed it; other query options are 400, as for the history read.
 
 **Outcome table.** The one normative statement of outcome categories, precedence, and HTTP mapping. The first matching rank decides.
 
 | Rank | Outcome category | Decided in | Canonical error | HTTP | Retriable |
 |---|---|---|---|---|---|
-| 1 | Temporarily unavailable: not ready or at the request-task cap (the gear's own temporary inability), access control cannot answer, or storage cannot answer for a permitted caller | Synchronous refusal | `service_unavailable` | 503 | Yes, after the retry delay |
-| 2 | Not permitted by platform access control | Synchronous refusal | `permission_denied` | 403 | No; obtain the permission |
+| 1 | Temporarily unavailable: not ready or at the request-task cap (the gear's own temporary inability), or storage cannot answer for a permitted caller | Synchronous refusal | `service_unavailable` | 503 | Yes, after the retry delay |
+| 2 | Not permitted: the caller is not allowed for the action | Synchronous refusal | `permission_denied` | 403 | No; obtain the permission |
 | 3 | Conflict: an open operation of the application before its run deadline | Synchronous refusal | `aborted` | 409 | Yes, once the named operation is final |
 | 4 | Invalid manifest: an envelope problem, or an uninstall id outside the limits | Synchronous refusal | `invalid_argument` | 400 | No; fix the request |
 | Acceptance | Temporarily unavailable: the operation and accepted event cannot commit, or the winner of a lost index race cannot be read | Synchronous refusal | `service_unavailable` | 503 | Yes, after the retry delay |
@@ -502,20 +520,22 @@ All routes are unstable, `.authenticated()`, and `.no_license_required()`; seed,
 
 Storage is consulted only for a permitted caller. Sections are checked only inside the operation, so a seed with envelope and section problems ends at rank 4 and lists the section problems once the envelope is valid. An interrupted operation has no category. A gear defect is not ranked: the refused event records internal failure. The seeding documentation publishes the Retriable column as the guidance of `cpt-cf-application-manager-fr-response-content`.
 
-**Refusal bodies.** Canonical Problems with no extension member. The `detail` carries the request id; temporarily unavailable carries `REFUSAL_RETRY_AFTER_SECONDS`; not permitted names the action; conflict has reason `application_busy` and names the open operation; invalid manifest lists field violations (location, rule token, message). Reads end as 400 (a history query the read does not take), 403, 404 (unknown key, or unknown, malformed, or purged operation id), or 503. Plugin `Internal` text, PDP internals, and storage errors are only logged; plugin `Rejected` and `NotPermitted` detail is returned cut at `PLUGIN_DETAIL_MAX_BYTES`.
+**Refusal bodies.** Canonical Problems with no extension member. The `detail` carries the request id; temporarily unavailable carries `REFUSAL_RETRY_AFTER_SECONDS`; not permitted names the action; conflict has reason `application_busy` and names the open operation; invalid manifest lists field violations (location, rule token, message). Reads end as 400 (a history or application query the read does not take), 403, 404 (unknown key, or unknown, malformed, or purged operation id), or 503. Plugin `Internal` text, PDP internals, and storage errors are only logged; plugin `Rejected` and `NotPermitted` detail is returned cut at `PLUGIN_DETAIL_MAX_BYTES`.
 
 **Authorization.** Two levels:
 
-- **Gear level.** PolicyEnforcer decides the resource type `gts.cf.core.application_manager.application.v1~` with no tenant ([ADR 0005](./ADR/0005-cpt-cf-application-manager-adr-platform-level-access.md)), within `pdp_call_timeout`, sending `application_id` for seed and uninstall when it is within the limits. `EvaluationFailed` or no answer is rank 1; `Denied`, `CompileFailed`, or a permit with any constraint is rank 2. `cpt-cf-application-manager-nfr-authorized-before-plugin` concerns this level.
+- **Gear level, platform plane.** The allowed callers (`cpt-cf-application-manager-component-allowed-callers`) decide `seed`, `uninstall`, `read_schema`, and `read_operation` from the caller's platform identity ([ADR 0005](./ADR/0005-cpt-cf-application-manager-adr-platform-level-access.md)). A caller not allowed for the action is rank 2, or 403 for a read; the check has no unavailable answer. `cpt-cf-application-manager-nfr-authorized-before-plugin` concerns this level.
+- **Gear level, tenant plane.** PolicyEnforcer decides `read_history` and `read_applications` on the resource type `gts.cf.core.application_manager.application.v1~` with no tenant, within `pdp_call_timeout`. `EvaluationFailed` or no answer is 503; `Denied`, `CompileFailed`, or a permit with any constraint is 403.
 - **Plugin level.** A plugin that needs a permission of its own refuses with `NotPermitted`: After dispatch 1 from `apply` or `remove`, rank 6 from `schema` in a seed, 403 from `schema` in a read.
 
-| Action | PRD permission | Operations |
-|---|---|---|
-| `seed` | Seed | Seed |
-| `uninstall` | Uninstall | Both uninstall forms |
-| `read_operation` | Read operations | Read an operation |
-| `read_schema` | Read schemas | The three discovery reads |
-| `read_history` | Read history | Read history events |
+| Action | PRD permission | Operations | Decided by |
+|---|---|---|---|
+| `seed` | Seed | Seed | Allowed callers |
+| `uninstall` | Uninstall | Both uninstall forms | Allowed callers |
+| `read_operation` | Read operations | Read an operation | Allowed callers |
+| `read_schema` | Read schemas | The three discovery reads | Allowed callers |
+| `read_history` | Read history | Read history events | PDP |
+| `read_applications` | Read applications | List installed applications | PDP |
 
 - [ ] `p2` - **ID**: `cpt-cf-application-manager-interface-section-plugin-api`
 
@@ -549,17 +569,17 @@ Additive changes within `v1` are compatible; any other change is a new GTS type 
 | Dependency Gear | Interface Used | Purpose |
 |---|---|---|
 | types-registry | `TypesRegistryClient` | Register the plugin GTS type and the section base type in `init`; list instances and resolve section types once at `start` |
-| authz-resolver | PolicyEnforcer | Decisions for the five actions |
-| api-gateway | Platform REST host | Authentication, `SecurityContext`, request protection, readiness, routing |
+| authz-resolver | PolicyEnforcer | Decisions for `read_history` and `read_applications` |
+| api-gateway | Platform REST host | Authentication on both planes, `SecurityContext` or `PlatformSecurityContext`, request protection, readiness, routing |
 | Section plugin gears | `cpt-cf-application-manager-interface-section-plugin-api` | Schemas, `apply`, `remove` |
 
-The gear declares `deps = [types_registry, authz_resolver]` and the capabilities `db`, `rest`, and `stateful`, and never depends on plugin crates. Plugins receive the caller identity without a bearer token.
+The gear declares `deps = [types_registry, authz_resolver]` and the capabilities `db`, `rest`, and `stateful`, and never depends on plugin crates. Plugins receive the caller's platform identity without a credential.
 
 ### 3.5 External Dependencies
 
 | Dependency | Interface Used | Purpose |
 |---|---|---|
-| Platform database | SeaORM through SecureConn, migrations | The operations and operation history tables |
+| Platform database | SeaORM through SecureConn, migrations | The operations, operation history, and applications tables |
 | Platform telemetry | ToolKit tracing, metrics, structured logging | Logs, metrics, traces, signals |
 
 ### 3.6 Interactions & Sequences
@@ -576,14 +596,14 @@ At `start`, the startup component lists plugin instances once, reads their prior
 
 **Use cases**: `cpt-cf-application-manager-usecase-first-seed`, `cpt-cf-application-manager-usecase-reseed`, `cpt-cf-application-manager-usecase-uninstall`, `cpt-cf-application-manager-usecase-seed-failed`
 
-**Actors**: `cpt-cf-application-manager-actor-seeding-caller`, `cpt-cf-application-manager-actor-operator`, `cpt-cf-application-manager-actor-platform-access-control`
+**Actors**: `cpt-cf-application-manager-actor-seeding-caller`, `cpt-cf-application-manager-actor-operator`
 
 ```mermaid
 sequenceDiagram
     participant C as Caller
     participant API as REST API
     participant O as Request orchestrator
-    participant PDP as Platform access control
+    participant AC as Allowed callers
     participant R as Repository and operation history
     C ->> API: seed or uninstall
     Note over API: request id, event ids, receive time
@@ -593,7 +613,7 @@ sequenceDiagram
     else permit taken
         API ->> O: start the detached request task
         Note over O: envelope or id checks
-        O ->> PDP: decide (bounded)
+        O ->> AC: check the platform identity and action
         opt permitted
             O ->> R: storage step: open operation of the application
         end
@@ -652,7 +672,7 @@ sequenceDiagram
     end
 ```
 
-A re-seed takes the same path. A failed section-outcome update keeps the outcome in memory for the final transaction.
+A re-seed takes the same path. A failed section-outcome update keeps the outcome in memory for the final transaction. Every final transaction of a seed, including the interruption step and the supervisor completion, also writes the application record.
 
 #### Uninstall Operation
 
@@ -662,15 +682,15 @@ A re-seed takes the same path. A failed section-outcome update keeps the outcome
 
 **Actors**: `cpt-cf-application-manager-actor-operator`, `cpt-cf-application-manager-actor-seeding-caller`, `cpt-cf-application-manager-actor-section-plugin`
 
-Like the seed dispatch loop with `remove(identity, operation id, application id)` and no schema step: every plugin receives `remove`, whether or not the application was seeded, and an empty key set gives a succeeded uninstall.
+Like the seed dispatch loop with `remove(identity, operation id, application id)` and no schema step: every plugin receives `remove`, whether or not the application was seeded, and an empty key set gives a succeeded uninstall. A final transaction that completes the uninstall as succeeded also deletes the application record; any other final state leaves it.
 
 #### Read an Operation
 
 **ID**: `cpt-cf-application-manager-seq-operation-read`
 
-**Actors**: `cpt-cf-application-manager-actor-seeding-caller`, `cpt-cf-application-manager-actor-operator`, `cpt-cf-application-manager-actor-platform-access-control`
+**Actors**: `cpt-cf-application-manager-actor-seeding-caller`, `cpt-cf-application-manager-actor-operator`
 
-After a `read_operation` permit, the read service interrupts an expired open operation, then returns the status and, once final, the report.
+When the allowed callers allow `read_operation`, the read service interrupts an expired open operation, then returns the status and, once final, the report.
 
 #### Interrupted Sweep and Purge
 
@@ -684,15 +704,23 @@ The sweeper interrupts expired open operations and purges old final records in g
 
 **Use cases**: `cpt-cf-application-manager-usecase-discovery`
 
-**Actors**: `cpt-cf-application-manager-actor-seeding-caller`, `cpt-cf-application-manager-actor-operator`, `cpt-cf-application-manager-actor-platform-access-control`, `cpt-cf-application-manager-actor-section-plugin`
+**Actors**: `cpt-cf-application-manager-actor-seeding-caller`, `cpt-cf-application-manager-actor-operator`, `cpt-cf-application-manager-actor-section-plugin`
 
-After a `read_schema` permit, the read service returns the key list from memory, or one or every live schema with its schema version; the combined read fails when any plugin cannot answer.
+When the allowed callers allow `read_schema`, the read service returns the key list from memory, or one or every live schema with its schema version; the combined read fails when any plugin cannot answer.
+
+#### List Installed Applications
+
+**ID**: `cpt-cf-application-manager-seq-list-applications`
+
+**Actors**: `cpt-cf-application-manager-actor-operator`, `cpt-cf-application-manager-actor-platform-access-control`
+
+After a PDP permit for `read_applications`, the read service returns one page of application records. It makes no plugin call, and an access-control or storage failure ends the read as 503.
 
 ### 3.7 Database schemas & tables
 
 - [ ] `p3` - **ID**: `cpt-cf-application-manager-db-operations`
 
-Both tables are created by the gear's migrations on PostgreSQL, MySQL, and SQLite. Text columns use a binary, no-pad collation.
+All three tables are created by the gear's migrations on PostgreSQL, MySQL, and SQLite. Text columns use a binary, no-pad collation.
 
 #### Table: operations
 
@@ -733,6 +761,24 @@ The table is insert-only, unrestricted, and kept without a purge. The operation 
 - the finished event, in the final transaction with the report, including the interruption step and the supervisor completion;
 - a refused event, in its own transaction before the refusal answers.
 
+#### Table: applications
+
+**ID**: `cpt-cf-application-manager-dbtable-applications`
+
+| Column | Type | Description |
+|---|---|---|
+| `application_id` | text, at most `APPLICATION_ID_MAX_BYTES` | Exact application id; PK |
+| `version` | text, at most `APPLICATION_ID_MAX_BYTES` | Version of the last finished seed, as sent |
+| `operation_id` | UUID | That seed's operation |
+| `category` | enum, nullable | That seed's category; null when it was interrupted |
+| `interrupted` | boolean | True when that seed was interrupted |
+| `finished_at` | timestamp | When that seed finished |
+
+The table is unrestricted and kept without a purge. The operation repository is its only writer, in the final transactions that insert a finished event:
+
+- every final transaction of a seed upserts the row of its application;
+- the final transaction of an uninstall that completes as succeeded deletes it.
+
 ### 3.8 Deployment Topology
 
 - [ ] `p3` - **ID**: `cpt-cf-application-manager-topology-replicas`
@@ -751,9 +797,9 @@ Replicas share only the database, and each runs its own sweeper under the status
 
 ### 4.1 Observability
 
-**Logs** carry the correlation id, trace id, action, category, section key, and call kind, never section, manifest, or schema content. For application ids and versions, logs carry only the byte length and SHA-256 digest; spans follow the same rule.
+**Logs** carry the correlation id, trace id, action, category, section key, and call kind, never section, manifest, or schema content. A refusal by the allowed callers logs the identity kind, namespace or trust domain, and name. For application ids and versions, logs carry only the byte length and SHA-256 digest; spans follow the same rule.
 
-**Metrics** count synchronous answers, operations by category and interruption, durations, plugin call timeouts and cap refusals, request tasks in flight, history events recorded and not recorded, unavailable dependencies, unusable schemas, sweeps and purges, and startup failures. Section keys are labels; application and operation ids never are.
+**Metrics** count synchronous answers, operations by category and interruption, durations, plugin call timeouts and cap refusals, allowed-callers refusals by action, request tasks in flight, history events recorded and not recorded, unavailable dependencies, unusable schemas, sweeps and purges, and startup failures. Section keys are labels; application and operation ids never are.
 
 **Signals** for operator thresholds: history events not recorded, rising interruptions, repeated timeouts or cap refusals per key, an unusable schema, an unavailable dependency, failing sweeps, request tasks at the cap, a run window margin warning, and a startup failure.
 
@@ -773,19 +819,28 @@ Settings live under `gears.application-manager.config`. Each is required with no
 | `plugin_max_in_flight` | Calls in flight per plugin instance | Positive integer |
 | `max_request_tasks` | Seed and uninstall request tasks per replica | Positive integer |
 | `max_envelope_text_length` | Maximum bytes of the application id and version | Positive, at most `APPLICATION_ID_MAX_BYTES` |
-| `pdp_call_timeout` | Deadline of one PDP decision | Positive duration |
+| `pdp_call_timeout` | Deadline of one PDP decision, for the history read and the application list | Positive duration |
+| `allowed_callers` | Platform identities, each with its `actions` (`seed`, `uninstall`, `read_schema`, `read_operation`) | See below |
 | `storage_call_timeout` | Bound of every storage access | Positive duration |
 
-Constants: `APPLICATION_ID_MAX_BYTES`, `SCHEMA_VERSION_MAX_BYTES`, `SERVED_SCHEMA_MAX_BYTES`, `SCHEMA_REGEX_SIZE_LIMIT`, `SCHEMA_REGEX_DFA_SIZE_LIMIT`, `LOG_TEXT_MAX_BYTES`, `PLUGIN_DETAIL_MAX_BYTES`, `REFUSAL_RETRY_AFTER_SECONDS`, `HISTORY_PAGE_MAX_LIMIT`, `SWEEP_INTERVAL`, `PURGE_INTERVAL`, `MAINTENANCE_BATCH_SIZE`, `GATEWAY_REQUEST_DEADLINE` (30s).
+Constants: `APPLICATION_ID_MAX_BYTES`, `SCHEMA_VERSION_MAX_BYTES`, `SERVED_SCHEMA_MAX_BYTES`, `SCHEMA_REGEX_SIZE_LIMIT`, `SCHEMA_REGEX_DFA_SIZE_LIMIT`, `LOG_TEXT_MAX_BYTES`, `PLUGIN_DETAIL_MAX_BYTES`, `REFUSAL_RETRY_AFTER_SECONDS`, `HISTORY_PAGE_MAX_LIMIT`, `APPLICATION_PAGE_MAX_LIMIT`, `SWEEP_INTERVAL`, `PURGE_INTERVAL`, `MAINTENANCE_BATCH_SIZE`, `GATEWAY_REQUEST_DEADLINE` (30s).
 
-**Synchronous time budget.** At most `pdp_call_timeout` + 3 × `storage_call_timeout` (storage step, acceptance, and refusal or lost-race transaction); `init` fails when this exceeds `GATEWAY_REQUEST_DEADLINE`.
+**Allowed callers.** Each entry has an `identity` and a non-empty list of `actions`. A `KubernetesServiceAccount` identity names `namespace` and `service_account` and matches any pod; a `Spiffe` identity names `trust_domain` and `name` and matches any version. Any other identity kind is invalid in an entry and never matches a caller. `init` fails with `invalid_setting` on an unknown action, an empty `actions` list, or two entries with the same identity. An empty list is valid and allows nobody.
+
+```yaml
+allowed_callers:
+  - identity: { type: KubernetesServiceAccount, namespace: deploy, service_account: app-seeder }
+    actions: [seed, uninstall, read_schema, read_operation]
+```
+
+**Synchronous time budget.** At most 3 × `storage_call_timeout` (storage step, acceptance, and refusal or lost-race transaction); `init` fails when this exceeds `GATEWAY_REQUEST_DEADLINE`.
 
 **Run window.** The run deadline is the acceptance commit time plus (N + 1) × `plugin_call_timeout` for a seed, or N × `plugin_call_timeout` for an uninstall, plus `run_window_margin`, with N the number of plugins. `start` logs a margin warning when the margin is below (N + 2) × `storage_call_timeout`.
 
 ### 4.3 Platform Deviations
 
 - **Eager plugin discovery**: every plugin instance is discovered once at `start`, with no lazy resolution or `choose_plugin_instance` ([ADR 0001](./ADR/0001-cpt-cf-application-manager-adr-section-plugin-fan-out.md); platform plugin model owners).
-- **Platform-level access**: unrestricted entities and tenant-free PDP decisions ([ADR 0005](./ADR/0005-cpt-cf-application-manager-adr-platform-level-access.md); authz-resolver and secure ORM owners).
+- **Platform-level access**: unrestricted entities, allowed callers in configuration for the seeding actions, and tenant-free PDP decisions for the operator reads ([ADR 0005](./ADR/0005-cpt-cf-application-manager-adr-platform-level-access.md); authz-resolver and secure ORM owners).
 - **Detached work**: request tasks do not take the shutdown token, so an accepted operation is not cut short by a stop (ToolKit lifecycle owners).
 - **Hand-implemented lifecycle**: the gear implements `RunnableCapability`, so a failed startup check fails the start phase (ToolKit lifecycle owners).
 - **In-process plugins only**, until the platform guarantees plugins register before dependants start (platform plugin model owners).
