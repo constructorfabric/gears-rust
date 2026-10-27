@@ -14,6 +14,7 @@ pub(crate) fn stage(stage: DropStage) -> &'static str {
         DropStage::Checks => "checks",
         DropStage::Admission => "admission",
         DropStage::Writer => "writer",
+        DropStage::Worker => "worker",
     }
 }
 

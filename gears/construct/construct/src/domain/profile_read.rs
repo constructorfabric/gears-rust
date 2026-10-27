@@ -110,13 +110,13 @@ pub trait ProfileEvents: Send + Sync {
     fn read(&self, event: ProfileReadEvent);
 }
 
-/// How the readable categories are asked of the platform.
+/// How the readable categories are asked of the platform. It has no
+/// default, because the two differ in what an unconstrained answer grants.
 #[domain_model]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CategoryCheck {
     /// One policy call, whose scope names the readable categories. A scope
     /// that names none lets every category be read.
-    #[default]
     OneCall,
     /// One policy call per category, for a policy plugin that cannot answer
     /// with a category constraint.
@@ -315,15 +315,38 @@ fn not_visible(err: EnforcerError) -> DomainError {
 /// both transports map one set of errors.
 fn read_failure(err: DomainError) -> DomainError {
     match err {
-        DomainError::OutOfScope(refused) => DomainError::NotVisible(format!(
-            "the policy scope does not reach the subject's settings ({:?})",
-            refused.refusal
-        )),
+        DomainError::OutOfScope(refused) => {
+            tracing::warn!(
+                caller = %refused.caller,
+                caller_tenant = %refused.caller_tenant,
+                tenant_id = %refused.tenant_id,
+                subject_id = %refused.subject_id,
+                refusal = ?refused.refusal,
+                "construct profile read: the subject's settings are out of the policy scope"
+            );
+            DomainError::NotVisible(format!(
+                "the policy scope does not reach the subject's settings ({:?})",
+                refused.refusal
+            ))
+        }
         DomainError::Forbidden(reason) => DomainError::NotVisible(reason),
-        DomainError::ProfileFull(full) => DomainError::internal(format!(
-            "the profile is larger than one read takes: {full:?}"
-        )),
-        other => other,
+        DomainError::ProfileFull(full) => {
+            tracing::warn!(
+                tenant_id = %full.subject.tenant_id,
+                subject_id = %full.subject.subject_id,
+                facts = ?full.facts,
+                limit = full.limit,
+                "construct profile read: the profile is larger than one read takes"
+            );
+            DomainError::internal(format!(
+                "the profile is larger than one read takes: {full:?}"
+            ))
+        }
+        err @ (DomainError::Refused(_)
+        | DomainError::NotVisible(_)
+        | DomainError::Unavailable(_)
+        | DomainError::Internal(_)
+        | DomainError::Database(_)) => err,
     }
 }
 
@@ -522,6 +545,8 @@ impl ProfileReadService {
 
 #[cfg(test)]
 mod tests {
+    use toolkit_security::ScopeFilter;
+
     use super::*;
 
     fn key() -> SubjectKey {
@@ -544,12 +569,49 @@ mod tests {
         }
     }
 
+    /// One path to the profile at `key`, granting `categories`.
+    fn path_to(key: SubjectKey, categories: &[Category]) -> ScopeConstraint {
+        ScopeConstraint::new(vec![
+            ScopeFilter::eq(pep_properties::OWNER_TENANT_ID, key.tenant_id),
+            ScopeFilter::eq(pep_properties::RESOURCE_ID, key.subject_id),
+            ScopeFilter::r#in(
+                CATEGORY_PROPERTY,
+                categories
+                    .iter()
+                    .map(|c| ScopeValue::from(c.name()))
+                    .collect(),
+            ),
+        ])
+    }
+
     #[test]
-    fn the_settings_scope_keeps_an_unconstrained_scope_and_the_tenant_filters_of_others() {
-        let tenant = Uuid::new_v4();
+    fn several_paths_to_the_profile_grant_the_union_of_their_categories() {
+        let key = key();
+        let scope = AccessScope::from_constraints(vec![
+            path_to(key, &[Category::Skill]),
+            path_to(key, &[Category::Role]),
+        ]);
+
+        assert_eq!(
+            granted(&scope, Reader::Other, key),
+            Some([Category::Skill, Category::Role].into_iter().collect())
+        );
+    }
+
+    #[test]
+    fn the_settings_scope_keeps_an_unconstrained_scope_and_only_the_tenant_filters_of_others() {
+        let key = key();
 
         assert!(settings_scope(&AccessScope::allow_all()).is_unconstrained());
-        let narrowed = settings_scope(&AccessScope::for_tenant(tenant));
-        assert!(!narrowed.is_deny_all() && !narrowed.is_unconstrained());
+        let narrowed = settings_scope(&AccessScope::single(path_to(key, &[Category::Skill])));
+        let [constraint] = narrowed.constraints() else {
+            panic!("one constraint: {narrowed:?}");
+        };
+        let properties: Vec<&str> = constraint
+            .filters()
+            .iter()
+            .map(ScopeFilter::property)
+            .collect();
+        assert_eq!(properties, [pep_properties::OWNER_TENANT_ID]);
     }
 }

@@ -61,11 +61,13 @@ pub enum FactCategory {
 pub struct FactId(String);
 
 impl FactId {
+    /// The fact id with the node key `id`.
     #[must_use]
     pub fn new(id: impl Into<String>) -> Self {
         Self(id.into())
     }
 
+    /// The node key, as stored in graph storage.
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0

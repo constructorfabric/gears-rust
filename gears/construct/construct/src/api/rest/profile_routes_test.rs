@@ -194,3 +194,17 @@ async fn a_fact_without_a_produced_at_has_no_such_key() {
     assert!(served.get("produced_at").is_none(), "{served}");
     assert!(served.get("stored_at").is_some());
 }
+
+#[tokio::test]
+#[tracing_test::traced_test]
+async fn a_refused_read_is_logged_with_the_caller_the_subject_and_the_tenant() {
+    let subject = Uuid::new_v4();
+
+    let (status, _, _) = get(Arc::new(DenyResolver), vec![rust_skill()], &path(subject)).await;
+
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(logs_contain("construct profile read refused"));
+    assert!(logs_contain(&format!("subject_id={subject}")));
+    assert!(logs_contain("caller="));
+    assert!(logs_contain("tenant_id="));
+}
