@@ -110,7 +110,7 @@ Answer Section 4. Any “no” or “unsure” returns the relevant area to Step
 
 In the `explore` flow, map DESIGN behavior to PRD use cases instead of individual requirements. In other flows, map every PRD requirement, starting with p1, to a DESIGN component. Every business logic behavior added by DESIGN must have a PRD requirement (a PRD use case in the `explore` flow). If PRD and DESIGN change in the same pull request, update both.
 
-Within the scope required by the current maturity level and implementation flow, report a deferred item when it affects a public contract (REST, SDK, GTS, MCP), the authoritative state owner, data crossing to another system, tenant isolation, database keys or names, changes that must succeed together, a cross-Gear dependency, or a release-blocking NFR. Decide these items in DESIGN, not during feature implementation.
+Within the scope required by the current maturity level and implementation flow, report a deferred item when it affects a public contract (REST, SDK, GTS, MCP), the authoritative state owner, data crossing to another system, tenant isolation, database keys or names, changes that must succeed together, a cross-Gear dependency, or a release-blocking NFR. Decide these items in DESIGN. In the `iterative` flow, implementation may refine them later ([MATURITY.md](MATURITY.md) §5).
 
 ### C2. ADR quality
 
@@ -352,7 +352,7 @@ severity of step 1.
 
 ## 4. Recall check (answer before writing)
 
-1. Does every PRD requirement (use case in the `explore` flow) map to DESIGN, and did every deferral pass C1?
+1. Do PRD and DESIGN map to each other as C1 requires, and did every deferral pass C1?
 2. Did I compare every required capability with the actual responsibilities in `docs/GEARS.md`, not only by name?
 3. Did I trace sensitive data to its first external boundary?
 4. Did I apply authorization and tenant-isolation rules to every entry point and stored entity?
