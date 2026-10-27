@@ -794,7 +794,7 @@ The system **MUST** ingest a batch of 10,000 nodes and 20,000 edges (validation 
 
 Hybrid search **MUST** answer within 500 ms at p95 (query embedding time excluded) on a tenant graph of 100,000 nodes and 500,000 edges with default limits.
 
-> **Found while building the prototype.** Not claimed as met: `tests/perf.rs` asserts this threshold only at full scale (`GEARS_GRAPH_PERF_SCALE=1.0`, 100k nodes / 500k edges), which CI does not run. Pending a recorded run at that scale.
+> **Found while building the prototype.** Not claimed as met: `tests/perf.rs` asserts this threshold only at full scale (`GEARS_GRAPH_PERF_SCALE=1.0`, 100k nodes / 500k edges), which CI does not run. Recorded at that scale on 2026-10-26 at the store level (hybrid p95 ≤ 54 ms; [docs/PERF.md](./PERF.md), gears-rust#5517); query embedding and the REST path are not in that number.
 
 - **Threshold**: p95 <= 500 ms, 100k nodes / 500k edges / 300k chunks, arm limit 50, warm indexes
 - **Rationale**: Search is interactive; it fronts every exploration scenario.
@@ -806,7 +806,7 @@ Hybrid search **MUST** answer within 500 ms at p95 (query embedding time exclude
 
 Depth-3 neighborhood projection **MUST** answer within 1 second at p95 on a tenant graph of 100,000 nodes and 500,000 edges with a 1,000-node budget.
 
-> **Found while building the prototype.** Not claimed as met: `tests/perf.rs` asserts this threshold only at full scale (`GEARS_GRAPH_PERF_SCALE=1.0`), which CI does not run. Pending a recorded run at that scale.
+> **Found while building the prototype.** Not claimed as met: `tests/perf.rs` asserts this threshold only at full scale (`GEARS_GRAPH_PERF_SCALE=1.0`), which CI does not run. Recorded at that scale on 2026-10-26 at the engine and store level (neighbourhood p95 ≤ 192 ms, with degrees and hydration; [docs/PERF.md](./PERF.md), gears-rust#5517); ordering, serialization and the REST path are not in that number.
 
 - **Threshold**: p95 <= 1 s, depth 3, node budget 1,000, same reference graph as search latency
 - **Rationale**: The UI neighborhood scenario is interactive and hits dense regions of the graph.
