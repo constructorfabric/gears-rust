@@ -75,6 +75,48 @@ impl Default for QueryProfile {
     }
 }
 
+/// GTS type-path prefixes that classify a resource-group type as a tenant
+/// type.
+///
+/// A type whose code starts with **any** of these prefixes opens a new tenant
+/// scope (`tenant_id = group.id`) and takes part in the tenant-root
+/// uniqueness invariant. Defaults to [`TENANT_RG_TYPE_PATH`]; a deployment
+/// overrides the list through the gear config (`tenant_type_paths`).
+#[allow(unknown_lints, de0309_must_have_domain_model)]
+#[derive(Debug, Clone)]
+pub struct TenantTypes {
+    prefixes: Arc<[String]>,
+}
+
+impl TenantTypes {
+    /// Build from an explicit prefix list. The caller is responsible for
+    /// rejecting an empty list (see `ResourceGroupConfig::validate`).
+    #[must_use]
+    pub fn new(prefixes: Vec<String>) -> Self {
+        Self {
+            prefixes: prefixes.into(),
+        }
+    }
+
+    /// Whether `code` belongs to a tenant type.
+    #[must_use]
+    pub fn is_tenant(&self, code: &str) -> bool {
+        self.prefixes.iter().any(|p| code.starts_with(p.as_str()))
+    }
+
+    /// The configured prefixes.
+    #[must_use]
+    pub fn prefixes(&self) -> &[String] {
+        &self.prefixes
+    }
+}
+
+impl Default for TenantTypes {
+    fn default() -> Self {
+        Self::new(vec![TENANT_RG_TYPE_PATH.to_owned()])
+    }
+}
+
 // @cpt-dod:cpt-cf-resource-group-dod-entity-hier-entity-service:p1
 // @cpt-dod:cpt-cf-resource-group-dod-integration-auth-tenant-scope:p1
 // @cpt-dod:cpt-cf-resource-group-dod-integration-auth-jwt:p1
@@ -94,6 +136,9 @@ pub struct GroupService<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> {
     /// keeping it out of the constructor. An uninstrumented run -- including
     /// every test here -- records nothing and pays nothing.
     metrics: Arc<dyn RgMetricsPort>,
+    /// Defaults to [`TenantTypes::default`]; overridden from the gear config
+    /// through `with_tenant_types`.
+    tenant_types: TenantTypes,
 }
 
 /// The isolation level one `update_group` attempt opens its transaction at.
@@ -193,6 +238,7 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
             type_repo,
             types_registry,
             metrics: Arc::new(NoopMetrics),
+            tenant_types: TenantTypes::default(),
         }
     }
 
@@ -229,6 +275,14 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
     #[must_use]
     pub fn with_metrics(mut self, metrics: Arc<dyn RgMetricsPort>) -> Self {
         self.metrics = metrics;
+        self
+    }
+
+    /// Install the tenant-type prefixes. Kept out of `new` for the same
+    /// reason as `with_metrics`: only the composition root reads the config.
+    #[must_use]
+    pub fn with_tenant_types(mut self, tenant_types: TenantTypes) -> Self {
+        self.tenant_types = tenant_types;
         self
     }
 
@@ -271,8 +325,9 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         // @cpt-end:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-5b
 
         // Derive `is_tenant` for AuthZ properties from the code prefix: any type
-        // whose path starts with `TENANT_RG_TYPE_PATH` opens a new tenant scope.
-        let is_tenant = req.code.starts_with(TENANT_RG_TYPE_PATH);
+        // whose path starts with a configured tenant-type prefix opens a new
+        // tenant scope.
+        let is_tenant = self.tenant_types.is_tenant(&req.code);
 
         // Reject a caller-supplied `tenant_id` on tenant-typed groups: the
         // effective tenant is always the group's own (generated) id.
@@ -341,6 +396,7 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         }
 
         let profile = self.profile.clone();
+        let tenant_types = self.tenant_types.clone();
         let db = self.db.db();
         let group_repo = self.group_repo.clone();
         let type_repo = self.type_repo.clone();
@@ -353,6 +409,7 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
             .transaction_with_retry(TxConfig::serializable(), DomainError::db_err, |tx| {
                 let req = req.clone();
                 let profile = profile.clone();
+                let tenant_types = tenant_types.clone();
                 let group_repo = group_repo.clone();
                 let type_repo = type_repo.clone();
                 Box::pin(async move {
@@ -363,6 +420,7 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
                         &req,
                         target_tenant_id,
                         &profile,
+                        &tenant_types,
                     )
                     .await
                 })
@@ -465,6 +523,7 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         // @cpt-end:cpt-cf-resource-group-flow-entity-hier-update-group:p1:inst-update-group-1
 
         let profile = self.profile.clone();
+        let tenant_types = self.tenant_types.clone();
         let db = self.db.db();
         let group_repo = self.group_repo.clone();
         let type_repo = self.type_repo.clone();
@@ -551,6 +610,7 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
             group_id,
             &req,
             &profile,
+            &tenant_types,
             hinted_isolation,
         )
         .await?;
@@ -567,6 +627,7 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
                     group_id,
                     &req,
                     &profile,
+                    &tenant_types,
                     WriteIsolation::Serializable,
                 )
                 .await?
@@ -598,12 +659,14 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         group_id: Uuid,
         req: &UpdateGroupRequest,
         profile: &QueryProfile,
+        tenant_types: &TenantTypes,
         isolation: WriteIsolation,
     ) -> Result<UpdateGroupOutcome, DomainError> {
         db.transaction_with_retry(isolation.tx_config(), DomainError::db_err, |tx| {
             let req = req.clone();
             let scope = scope.clone();
             let profile = profile.clone();
+            let tenant_types = tenant_types.clone();
             let group_repo = group_repo.clone();
             let type_repo = type_repo.clone();
             Box::pin(async move {
@@ -615,6 +678,7 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
                     group_id,
                     &req,
                     &profile,
+                    &tenant_types,
                     isolation,
                 )
                 .await
@@ -638,6 +702,7 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         // Actor sends PUT /api/resource-group/v1/groups/{group_id} with new hierarchy.parent_id
         // @cpt-end:cpt-cf-resource-group-flow-entity-hier-move-group:p1:inst-move-group-1
         let profile = self.profile.clone();
+        let tenant_types = self.tenant_types.clone();
         let db = self.db.db();
         let group_repo = self.group_repo.clone();
         let type_repo = self.type_repo.clone();
@@ -649,6 +714,7 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         let result = db
             .transaction_with_retry(TxConfig::serializable(), DomainError::db_err, |tx| {
                 let profile = profile.clone();
+                let tenant_types = tenant_types.clone();
                 let group_repo = group_repo.clone();
                 let type_repo = type_repo.clone();
                 Box::pin(async move {
@@ -659,6 +725,7 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
                         group_id,
                         new_parent_id,
                         &profile,
+                        &tenant_types,
                     )
                     .await
                 })
@@ -901,7 +968,7 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         validation::validate_type_code(&req.code)?;
         Self::validate_name(&req.name)?;
 
-        let is_tenant = req.code.starts_with(TENANT_RG_TYPE_PATH);
+        let is_tenant = self.tenant_types.is_tenant(&req.code);
         Self::reject_tenant_id_on_tenant_type(is_tenant, req.tenant_id)?;
 
         if let Some(req_tenant_id) = req.tenant_id
@@ -923,6 +990,7 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         .await?;
 
         let profile = self.profile.clone();
+        let tenant_types = self.tenant_types.clone();
         let db = self.db.db();
         let group_repo = self.group_repo.clone();
         let type_repo = self.type_repo.clone();
@@ -930,11 +998,20 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         db.transaction_with_retry(TxConfig::serializable(), DomainError::db_err, |tx| {
             let req = req.clone();
             let profile = profile.clone();
+            let tenant_types = tenant_types.clone();
             let group_repo = group_repo.clone();
             let type_repo = type_repo.clone();
             Box::pin(async move {
-                Self::create_group_inner(&*group_repo, &*type_repo, tx, &req, tenant_id, &profile)
-                    .await
+                Self::create_group_inner(
+                    &*group_repo,
+                    &*type_repo,
+                    tx,
+                    &req,
+                    tenant_id,
+                    &profile,
+                    &tenant_types,
+                )
+                .await
             })
         })
         .await
@@ -956,6 +1033,7 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         req: &CreateGroupRequest,
         tenant_id: Uuid,
         profile: &QueryProfile,
+        tenant_types: &TenantTypes,
     ) -> Result<ResourceGroup, DomainError> {
         // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-3
         // One lookup for both the surrogate id and the type itself. Asking
@@ -969,10 +1047,10 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         // @cpt-end:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-3
 
         // Determine effective tenant_id by code-prefix rule:
-        // - code starts with TENANT_RG_TYPE_PATH → tenant_id = group.id (new scope)
-        // - otherwise                           → tenant_id from caller / parent
+        // - code starts with a tenant-type prefix → tenant_id = group.id (new scope)
+        // - otherwise                            → tenant_id from caller / parent
         let group_id = req.id.unwrap_or_else(Uuid::now_v7);
-        let is_tenant_type = req.code.starts_with(TENANT_RG_TYPE_PATH);
+        let is_tenant_type = tenant_types.is_tenant(&req.code);
         let effective_tenant_id = if is_tenant_type { group_id } else { tenant_id };
 
         // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-4
@@ -1115,7 +1193,7 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
             // forest root. `cpt-cf-resource-group-fr-enforce-tenant-root-uniqueness`.
             if is_tenant_type
                 && let Some(existing_root_id) = group_repo
-                    .find_root_id_with_type_prefix(tx, TENANT_RG_TYPE_PATH)
+                    .find_root_id_with_type_prefixes(tx, tenant_types.prefixes())
                     .await?
             {
                 return Err(DomainError::tenant_root_already_exists(
@@ -1190,6 +1268,7 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         group_id: Uuid,
         req: &UpdateGroupRequest,
         profile: &QueryProfile,
+        tenant_types: &TenantTypes,
         isolation: WriteIsolation,
     ) -> Result<UpdateGroupOutcome, DomainError> {
         // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-update-group:p1:inst-update-group-2
@@ -1342,6 +1421,7 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
                 new_parent_snapshot,
                 &rg_type,
                 profile,
+                tenant_types,
             )
             .await?;
         }
@@ -1400,6 +1480,7 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         group_id: Uuid,
         new_parent_id: Option<Uuid>,
         profile: &QueryProfile,
+        tenant_types: &TenantTypes,
     ) -> Result<(ResourceGroup, u64), DomainError> {
         // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-move-group:p1:inst-move-group-3
         // Load group and new parent in transaction
@@ -1447,6 +1528,7 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
             new_parent_snapshot,
             &rg_type,
             profile,
+            tenant_types,
         )
         .await?;
         // @cpt-end:cpt-cf-resource-group-flow-entity-hier-move-group:p1:inst-move-group-9
@@ -1631,7 +1713,7 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
     /// when `new_parent_id` is; a caller passing `Some(new_parent_id)` with
     /// no snapshot behind it (which should not happen given the two callers
     /// above) is treated the same as the read this replaces finding nothing.
-    #[allow(clippy::cognitive_complexity)]
+    #[allow(clippy::cognitive_complexity, clippy::too_many_arguments)]
     async fn move_group_internal_impl(
         group_repo: &GR,
         conn: &impl DBRunner,
@@ -1640,6 +1722,7 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         parent: Option<ParentSnapshot>,
         rg_type: &resource_group_sdk::ResourceGroupType,
         profile: &QueryProfile,
+        tenant_types: &TenantTypes,
     ) -> Result<MoveOutcome, DomainError> {
         let mut parent_tenant_id: Option<Uuid> = None;
         if let Some(new_pid) = new_parent_id {
@@ -1743,9 +1826,9 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
             // `cpt-cf-resource-group-fr-enforce-tenant-root-uniqueness`. We
             // exclude the moved group itself so a no-op move (already root)
             // does not falsely fire.
-            if rg_type.code.starts_with(TENANT_RG_TYPE_PATH)
+            if tenant_types.is_tenant(&rg_type.code)
                 && let Some(existing_root_id) = group_repo
-                    .find_root_id_with_type_prefix(conn, TENANT_RG_TYPE_PATH)
+                    .find_root_id_with_type_prefixes(conn, tenant_types.prefixes())
                     .await?
                 && existing_root_id != group_id
             {

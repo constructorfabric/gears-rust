@@ -381,18 +381,25 @@ impl GroupRepositoryTrait for GroupRepository {
     }
 
     /// Return the id of any existing root group (`parent_id IS NULL`) whose
-    /// `gts_type.schema_id` starts with the given prefix, or `None` when no
-    /// such root exists. Used to enforce tenant-root uniqueness.
+    /// `gts_type.schema_id` starts with any of the given prefixes, or `None`
+    /// when no such root exists. Used to enforce tenant-root uniqueness.
     ///
     /// Bypasses `SecureORM` because this check is a system invariant that
     /// must see every tenant — the caller's `AccessScope` is irrelevant for
     /// correctness here.
-    async fn find_root_id_with_type_prefix<C: DBRunner>(
+    async fn find_root_id_with_type_prefixes<C: DBRunner>(
         &self,
         db: &C,
-        type_prefix: &str,
+        type_prefixes: &[String],
     ) -> Result<Option<Uuid>, DomainError> {
-        use sea_orm::{JoinType, QuerySelect};
+        use sea_orm::{Condition, JoinType, QuerySelect};
+
+        if type_prefixes.is_empty() {
+            return Ok(None);
+        }
+        let prefix_match = type_prefixes.iter().fold(Condition::any(), |cond, prefix| {
+            cond.add(gts_type::Column::SchemaId.starts_with(prefix.as_str()))
+        });
 
         // Bypass SecureORM: tenant-root uniqueness is a system invariant that
         // must see every tenant, not only the caller's scope.
@@ -406,7 +413,7 @@ impl GroupRepositoryTrait for GroupRepository {
                     .into(),
             )
             .filter(rg_entity::Column::ParentId.is_null())
-            .filter(gts_type::Column::SchemaId.starts_with(type_prefix))
+            .filter(prefix_match)
             .secure()
             .scope_with(&scope)
             .one(db)

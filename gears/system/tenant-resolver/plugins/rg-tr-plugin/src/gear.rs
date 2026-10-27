@@ -42,8 +42,13 @@ impl Gear for RgTrPlugin {
         info!(
             vendor = %cfg.vendor,
             priority = cfg.priority,
+            tenant_types = ?cfg.tenant_types,
             "Loaded RG tenant resolver plugin configuration"
         );
+
+        if cfg.tenant_types.is_empty() {
+            anyhow::bail!("{}: tenant_types must not be empty", Self::MODULE_NAME);
+        }
 
         // Resolve RG hierarchy read contract from ClientHub
         let rg: Arc<dyn ResourceGroupReadHierarchy> =
@@ -68,7 +73,7 @@ impl Gear for RgTrPlugin {
         RegisterResult::ensure_all_ok(&results)?;
 
         // Create service
-        let service = Arc::new(Service::new(rg));
+        let service = Arc::new(Service::new(rg, cfg.tenant_types));
         self.service
             .set(service.clone())
             .map_err(|_| anyhow::anyhow!("{} gear already initialized", Self::MODULE_NAME))?;

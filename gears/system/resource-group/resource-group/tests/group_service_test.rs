@@ -21,7 +21,7 @@ use serde_json::json;
 use uuid::Uuid;
 
 use resource_group::domain::error::DomainError;
-use resource_group::domain::group_service::{GroupService, QueryProfile};
+use resource_group::domain::group_service::{GroupService, QueryProfile, TenantTypes};
 use resource_group::domain::metrics::{Operation, Outcome, RgMetricsPort};
 use resource_group::domain::repo::GroupRepositoryTrait;
 use resource_group::domain::type_service::TypeService;
@@ -2515,6 +2515,102 @@ async fn create_tenant_sub_type(
     .expect("create tenant sub-type")
 }
 
+/// Vendor-specific tenant-type prefix used by the configurable-tenant-type tests.
+const CUSTOM_TENANT_RG_TYPE_PATH: &str = "gts.cf.core.rg.type.v1~acme.core._.tenant.v1~";
+
+/// Create a root-capable RG type whose code starts with `prefix`.
+async fn create_root_type_with_prefix(
+    svc: &TypeService<TypeRepository>,
+    prefix: &str,
+) -> resource_group_sdk::models::ResourceGroupType {
+    svc.create_type_unscoped(resource_group_sdk::CreateTypeRequest {
+        code: format!("{prefix}test{}.v1~", Uuid::now_v7().as_simple()),
+        can_be_root: true,
+        allowed_parent_types: vec![],
+        allowed_membership_types: vec![],
+        metadata_schema: None,
+    })
+    .await
+    .expect("create root type")
+}
+
+/// TC-TRU-CFG-01: With a custom tenant-type prefix configured, groups of that
+/// type open a new tenant scope, and the built-in `TENANT_RG_TYPE_PATH` no
+/// longer does.
+#[tokio::test]
+async fn configured_tenant_type_prefix_replaces_default() {
+    let db = common::test_db().await;
+    let type_svc = common::make_type_service(db.clone());
+    let group_svc =
+        common::make_group_service(db.clone()).with_tenant_types(TenantTypes::new(vec![
+            CUSTOM_TENANT_RG_TYPE_PATH.to_owned(),
+        ]));
+    let tenant_id = Uuid::now_v7();
+    let ctx = common::make_ctx(tenant_id);
+
+    let custom_type = create_root_type_with_prefix(&type_svc, CUSTOM_TENANT_RG_TYPE_PATH).await;
+    let custom_root = group_svc
+        .create_group(
+            &ctx,
+            CreateGroupRequest::new(custom_type.code.clone(), "CustomTenant".to_owned()),
+            tenant_id,
+        )
+        .await
+        .expect("custom tenant root");
+    assert_eq!(custom_root.hierarchy.tenant_id, custom_root.id);
+
+    // The default prefix is not configured, so this is a plain root that
+    // inherits the caller's tenant and does not collide with the tenant root.
+    let default_type = create_tenant_type(&type_svc).await;
+    let plain_root = group_svc
+        .create_group(
+            &ctx,
+            CreateGroupRequest::new(default_type.code.clone(), "PlainRoot".to_owned()),
+            tenant_id,
+        )
+        .await
+        .expect("default-prefix type is not a tenant type here");
+    assert_eq!(plain_root.hierarchy.tenant_id, tenant_id);
+}
+
+/// TC-TRU-CFG-02: Tenant-root uniqueness spans every configured prefix.
+#[tokio::test]
+async fn tenant_root_uniqueness_spans_all_configured_prefixes() {
+    let db = common::test_db().await;
+    let type_svc = common::make_type_service(db.clone());
+    let group_svc =
+        common::make_group_service(db.clone()).with_tenant_types(TenantTypes::new(vec![
+            resource_group_sdk::TENANT_RG_TYPE_PATH.to_owned(),
+            CUSTOM_TENANT_RG_TYPE_PATH.to_owned(),
+        ]));
+    let tenant_id = Uuid::now_v7();
+    let ctx = common::make_ctx(tenant_id);
+
+    let default_type = create_tenant_type(&type_svc).await;
+    group_svc
+        .create_group(
+            &ctx,
+            CreateGroupRequest::new(default_type.code.clone(), "First".to_owned()),
+            tenant_id,
+        )
+        .await
+        .expect("first tenant root");
+
+    let custom_type = create_root_type_with_prefix(&type_svc, CUSTOM_TENANT_RG_TYPE_PATH).await;
+    let err = group_svc
+        .create_group(
+            &ctx,
+            CreateGroupRequest::new(custom_type.code.clone(), "Second".to_owned()),
+            Uuid::now_v7(),
+        )
+        .await
+        .expect_err("second tenant root under another prefix must be rejected");
+    assert!(
+        matches!(err, DomainError::TenantRootAlreadyExists { .. }),
+        "expected TenantRootAlreadyExists, got: {err:?}"
+    );
+}
+
 /// TC-TRU-01: First tenant-type root is accepted.
 #[tokio::test]
 async fn tenant_root_first_create_allowed() {
@@ -3139,13 +3235,13 @@ impl GroupRepositoryTrait for ParentFlippingGroupRepo {
         self.inner.find_model_by_id_for_update(db, id).await
     }
 
-    async fn find_root_id_with_type_prefix<C: DBRunner>(
+    async fn find_root_id_with_type_prefixes<C: DBRunner>(
         &self,
         db: &C,
-        type_prefix: &str,
+        type_prefixes: &[String],
     ) -> Result<Option<Uuid>, DomainError> {
         self.inner
-            .find_root_id_with_type_prefix(db, type_prefix)
+            .find_root_id_with_type_prefixes(db, type_prefixes)
             .await
     }
 
