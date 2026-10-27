@@ -444,8 +444,14 @@ impl SqlConsumptionStore {
                             // only then is its hold stamped. Stamping under a row
                             // this transaction does not hold would let a sweeper
                             // returning the same hold interleave between the two.
-                            let value =
-                                counter_value_of(tx, scope, hold.quota_id, hold.period_id).await?;
+                            let value = counter_value_of(
+                                tx,
+                                scope,
+                                hold.quota_id,
+                                hold.period_id,
+                                RowWait::Nowait,
+                            )
+                            .await?;
                             // The hold is settled here whatever its state: stamping
                             // it keeps a later sweep from returning it again.
                             let owed = lease_repo::mark_hold_returned(
@@ -456,8 +462,12 @@ impl SqlConsumptionStore {
                                 now,
                             )
                             .await?;
+                            // Already stamped: a writer on a later clock expired this lease.
+                            if !owed {
+                                return Err(StorageError::LeaseNotActive { token }.into());
+                            }
                             // @cpt-begin:cpt-cf-quota-enforcement-flow-lease-commit:p1:inst-lcm-boundary
-                            let value = if owed && returned > 0 {
+                            let value = if returned > 0 {
                                 credit_counter(
                                     tx,
                                     scope,
@@ -615,6 +625,15 @@ impl SqlConsumptionStore {
                         let mut returned = Vec::with_capacity(holds.len());
                         for hold in &holds {
                             let amount = u64::try_from(hold.held_amount).unwrap_or(0);
+                            // Rank 5 before 5b, as every writer takes them.
+                            counter_value_of(
+                                tx,
+                                &scope,
+                                hold.quota_id,
+                                hold.period_id,
+                                RowWait::Wait,
+                            )
+                            .await?;
                             // Only what nobody has given back: a writer that met
                             // this hold first already returned it.
                             if lease_repo::mark_hold_returned(
@@ -817,30 +836,33 @@ impl SqlConsumptionStore {
     }
 }
 
-/// The counter value of one row, for a settlement's mutation result.
-async fn counter_value_of(
+/// The counter value of one row, read under its rank-5 lock, which a hold stamp must follow.
+pub(super) async fn counter_value_of(
     tx: &impl DBRunner,
     scope: &AccessScope,
     quota_id: Uuid,
     period_id: Option<Uuid>,
+    wait: RowWait,
 ) -> Result<u64, TxError> {
+    let missing = |what: &str| {
+        TxError::Storage(StorageError::Internal(format!(
+            "the {what} of a hold on quota {quota_id} is missing"
+        )))
+    };
     let value = match period_id {
-        Some(period_id) => super::repo::consumption_counter_repo::find_by_period_id_for_update(
-            tx,
-            scope,
-            period_id,
-            RowWait::Nowait,
-        )
-        .await?
-        .map_or(0, |row| row.consumed),
+        Some(period_id) => {
+            super::repo::consumption_counter_repo::find_by_period_id_for_update(
+                tx, scope, period_id, wait,
+            )
+            .await?
+            .ok_or_else(|| missing("period row"))?
+            .consumed
+        }
         None => super::repo::allocation_counter_repo::read_in_flight_for_update(
-            tx,
-            scope,
-            quota_id,
-            RowWait::Nowait,
+            tx, scope, quota_id, wait,
         )
         .await?
-        .unwrap_or(0),
+        .ok_or_else(|| missing("allocation counter"))?,
     };
     Ok(u64::try_from(value).unwrap_or(0))
 }

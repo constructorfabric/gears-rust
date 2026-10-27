@@ -35,6 +35,7 @@ use quota_enforcement_sdk::{
     QuotaDebitPlan, QuotaDraft, QuotaId, StorageError, SubjectRef, TenantId, TransitionOutcome,
 };
 use sea_orm_migration::MigratorTrait;
+use testcontainers::core::ExecCommand;
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{ContainerAsync, ImageExt};
 use testcontainers_modules::postgres::Postgres;
@@ -178,7 +179,7 @@ struct PgHarness {
     /// expiry at once.
     clock: Arc<Mutex<OffsetDateTime>>,
     outbox: OutboxHandle,
-    _container: ContainerAsync<Postgres>,
+    container: ContainerAsync<Postgres>,
 }
 
 type Acquired = Result<TransitionOutcome<EvaluatedLease>, StorageError>;
@@ -255,7 +256,7 @@ impl PgHarness {
             ),
             clock,
             outbox,
-            _container: container,
+            container,
         }
     }
 
@@ -371,6 +372,42 @@ impl PgHarness {
                 )
                 .await
         })
+    }
+
+    /// `count` active leases an hour past their expiry, as a stalled sweeper leaves them.
+    async fn seed_expired_leases(&self, count: u32) {
+        let sql = format!(
+            "INSERT INTO qe_leases (token, tenant_id, metric, subject_key, attribution_hash, \
+             idem_key, state, reserved_amount, acquired_at, expiry_at, record_version, \
+             created_at, updated_at) \
+             SELECT gen_random_uuid(), '{tenant}', '{METRIC_TOKENS}', '\\x00', '\\x00', \
+             'backlog-' || n, 'active', 1, now() - interval '2 hours', \
+             now() - interval '1 hour', 1, now(), now() \
+             FROM generate_series(1, {count}) AS n",
+            tenant = tenant().as_uuid(),
+        );
+        let args = [
+            "psql",
+            "-v",
+            "ON_ERROR_STOP=1",
+            "-U",
+            "user",
+            "-d",
+            "app",
+            "-c",
+            &sql,
+        ];
+        let mut output = self
+            .container
+            .exec(ExecCommand::new(args.map(str::to_owned)))
+            .await
+            .expect("psql runs in the container");
+        let stdout = output.stdout_to_vec().await.expect("psql output");
+        assert!(
+            String::from_utf8_lossy(&stdout).contains(&format!("INSERT 0 {count}")),
+            "seeding failed: {}",
+            String::from_utf8_lossy(&stdout)
+        );
     }
 
     /// Acquire and return the token, failing the test on anything else.
@@ -765,5 +802,17 @@ async fn an_acquisition_that_loses_the_record_key_to_another_payload_is_a_mismat
         "the same key under another payload is the caller's conflict"
     );
     assert_eq!(h.consumed("u1", id).await, 0);
+    h.down().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_expired_backlog_beyond_one_statement_of_parameters_does_not_block_a_writer() {
+    let h = PgHarness::up().await;
+    let id = h.quota("u1", Some(100)).await;
+    // Postgres binds at most 65,535 parameters in one statement.
+    h.seed_expired_leases(70_000).await;
+
+    h.held(&["u1"], 10, "a1").await;
+    assert_eq!(h.consumed("u1", id).await, 10);
     h.down().await;
 }

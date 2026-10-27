@@ -106,6 +106,18 @@ struct CreditPayload {
 struct RollbackPayload<'a> {
     attribution: &'a quota_enforcement_sdk::EvaluationAttribution,
     original_idempotency_key: &'a str,
+    // Omitted for a debit, so a record stored before leases still replays.
+    #[serde(skip_serializing_if = "reverses_a_debit")]
+    original_operation: quota_enforcement_sdk::RollbackableOperation,
+}
+
+// Serde passes the field by reference.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn reverses_a_debit(operation: &quota_enforcement_sdk::RollbackableOperation) -> bool {
+    matches!(
+        operation,
+        quota_enforcement_sdk::RollbackableOperation::Debit
+    )
 }
 
 // @cpt-dod:cpt-cf-quota-enforcement-dod-evaluation-orchestrator:p1
@@ -361,6 +373,7 @@ impl Operations<'_> {
         let payload_hash = digest(&RollbackPayload {
             attribution: &request.attribution,
             original_idempotency_key: &request.original_idempotency_key,
+            original_operation: request.original_operation,
         })?;
         // @cpt-end:cpt-cf-quota-enforcement-flow-rollback:p1:inst-rlb-request
         // Re-authorize the original debit attribution before reversing it.

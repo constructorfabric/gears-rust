@@ -97,7 +97,8 @@ pub trait QuotaManagerApi: Send + Sync {
     /// two are indistinguishable); `PermissionDenied` when the caller may not
     /// credit, or for a Quota the scope shows but that belongs to another
     /// tenant; `FailedPrecondition` for a deactivated Quota or a closed period;
-    /// `Aborted` on a payload mismatch.
+    /// `Aborted` on a payload mismatch, and `Aborted`
+    /// (`LEASE_CONTENTION_TIMEOUT`) as for [`QuotaEnforcementClientV1::debit`].
     #[idempotency(IdempotentWrite)]
     async fn credit(
         &self,
@@ -166,8 +167,11 @@ pub trait QuotaEnforcementApi: Send + Sync {
     /// `InvalidArgument` for a non-positive amount, a missing idempotency key,
     /// or a metric that is not quota-gated; `PermissionDenied` when the PDP
     /// refuses the attribution; `Aborted` (`IDEMPOTENCY_PAYLOAD_MISMATCH`)
-    /// when the key was used for a different payload; the canonical error of
-    /// any failed evaluation or storage step.
+    /// when the key was used for a different payload; `Aborted`
+    /// (`LEASE_CONTENTION_TIMEOUT`) when another writer held a needed row past
+    /// the metric's contention budget, 0 ms by default; nothing was written,
+    /// so the call is safe to retry; the canonical error of any failed
+    /// evaluation or storage step.
     #[idempotency(IdempotentWrite)]
     async fn debit(
         &self,
@@ -187,7 +191,8 @@ pub trait QuotaEnforcementApi: Send + Sync {
     /// `NotFound` (`UNKNOWN_OPERATION`) when no committed debit answers the
     /// original key under the recomputed scope and authorized attribution;
     /// `FailedPrecondition` (`PERIOD_CLOSED`) once the attribution period has
-    /// settled; `Aborted` on a payload mismatch.
+    /// settled; `Aborted` on a payload mismatch, and `Aborted`
+    /// (`LEASE_CONTENTION_TIMEOUT`) as for [`Self::debit`].
     #[idempotency(IdempotentWrite)]
     async fn rollback(
         &self,
@@ -220,9 +225,7 @@ pub trait QuotaEnforcementApi: Send + Sync {
     /// The errors of [`Self::debit`], plus `InvalidArgument`
     /// (`TTL_OUT_OF_BOUNDS`) for a missing TTL or one outside the operator's
     /// window, `ResourceExhausted` (`LEASE_INFLIGHT_LIMIT_EXCEEDED`) when the
-    /// `(tenant, metric)` active-lease cap is reached, and `Aborted`
-    /// (`LEASE_CONTENTION_TIMEOUT`) when the acquisition waited too long on a
-    /// contended row.
+    /// `(tenant, metric)` active-lease cap is reached.
     #[idempotency(IdempotentWrite)]
     async fn acquire_lease(
         &self,
@@ -243,7 +246,8 @@ pub trait QuotaEnforcementApi: Send + Sync {
     /// `NotFound` for a token outside the caller's tenant; `FailedPrecondition`
     /// (`LEASE_NOT_ACTIVE`) for an expired or resolved lease, and
     /// (`OVER_COMMIT_NOT_AUTHORIZED`) when more than the reserved amount is
-    /// committed; `Aborted` on a payload mismatch.
+    /// committed; `Aborted` on a payload mismatch, and `Aborted`
+    /// (`LEASE_CONTENTION_TIMEOUT`) as for [`Self::debit`].
     #[idempotency(IdempotentWrite)]
     async fn commit_lease(
         &self,
