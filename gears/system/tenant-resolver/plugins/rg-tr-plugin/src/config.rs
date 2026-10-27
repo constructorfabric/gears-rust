@@ -34,7 +34,8 @@ impl Default for RgTrPluginConfig {
 }
 
 impl RgTrPluginConfig {
-    /// Reject an empty `tenant_types` list and malformed entries.
+    /// Reject an empty `tenant_types` list, malformed entries, and instance
+    /// IDs (no trailing `~`).
     ///
     /// Entries must be canonical (trimmed, lowercase) RG type paths: RG
     /// matches `type` filter values against stored type codes verbatim, and
@@ -52,6 +53,11 @@ impl RgTrPluginConfig {
             if t.is_empty() || t.trim() != t || t.to_lowercase() != *t {
                 anyhow::bail!(
                     "rg-tr-plugin: tenant_types entry '{t}' must be non-empty, trimmed and lowercase"
+                );
+            }
+            if !t.ends_with('~') {
+                anyhow::bail!(
+                    "rg-tr-plugin: tenant_types entry '{t}' must be a GTS type path ending in '~'"
                 );
             }
             if !t.starts_with(TYPE_RESOURCE_TYPE) {
@@ -84,6 +90,17 @@ mod tests {
             ..RgTrPluginConfig::default()
         };
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn instance_id_is_rejected() {
+        // A well-formed GTS instance ID, not a type path (no trailing `~`).
+        let cfg = RgTrPluginConfig {
+            tenant_types: vec![format!("{TYPE_RESOURCE_TYPE}acme.core._.tenant.v1")],
+            ..RgTrPluginConfig::default()
+        };
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("ending in '~'"), "{err}");
     }
 
     #[test]

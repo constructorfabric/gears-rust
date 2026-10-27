@@ -27,8 +27,8 @@ impl Default for ResourceGroupConfig {
 }
 
 impl ResourceGroupConfig {
-    /// Reject an empty list, non-canonical entries, and paths outside the RG
-    /// type namespace.
+    /// Reject an empty list, non-canonical entries, instance IDs (no trailing
+    /// `~`), and paths outside the RG type namespace.
     ///
     /// Entries must already be canonical (trimmed, lowercase): tenant
     /// classification is a case-sensitive `starts_with` against stored type
@@ -45,6 +45,11 @@ impl ResourceGroupConfig {
             if path.trim() != path || path.to_lowercase() != *path {
                 anyhow::bail!(
                     "resource-group: tenant_type_paths entry '{path}' must be trimmed and lowercase"
+                );
+            }
+            if !path.ends_with('~') {
+                anyhow::bail!(
+                    "resource-group: tenant_type_paths entry '{path}' must be a GTS type path ending in '~'"
                 );
             }
             validation::validate_type_code(path).map_err(|e| {
@@ -113,6 +118,19 @@ mod tests {
             tenant_type_paths: vec![format!("{}not-a-gts-type", gts_id!("cf.core.rg.type.v1~"))],
         };
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn instance_id_is_rejected() {
+        // A well-formed GTS instance ID, not a type path (no trailing `~`).
+        let cfg = ResourceGroupConfig {
+            tenant_type_paths: vec![format!(
+                "{}acme.core._.tenant.v1",
+                gts_id!("cf.core.rg.type.v1~")
+            )],
+        };
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("ending in '~'"), "{err}");
     }
 
     #[test]
