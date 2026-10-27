@@ -101,7 +101,7 @@ The plugin set is fixed at startup ([ADR 0001](./ADR/0001-cpt-cf-application-man
 | ADR ID | Decision Summary |
 |---|---|
 | `cpt-cf-application-manager-adr-section-plugin-fan-out` | Every section plugin takes part; plugins are discovered once at startup. |
-| `cpt-cf-application-manager-adr-plugin-served-section-schemas` | Plugins serve live schemas, fetched on every seed; the whole manifest is validated before dispatch. |
+| `cpt-cf-application-manager-adr-registered-section-schemas` | Section schemas are registered section types read once at startup; the whole manifest is validated before dispatch. |
 | `cpt-cf-application-manager-adr-async-operations` | Background operations with a bounded synchronous phase and a run window; a plugin call is stopped at its time limit. |
 | `cpt-cf-application-manager-adr-operation-history` | An append-only history table written in the transaction of the change it describes. |
 | `cpt-cf-application-manager-adr-platform-level-access` | Platform-level permission with no tenant; unrestricted records. |

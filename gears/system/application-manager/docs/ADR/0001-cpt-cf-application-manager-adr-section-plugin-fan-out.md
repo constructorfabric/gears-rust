@@ -1,6 +1,6 @@
 ---
 status: accepted
-date: 2026-10-20
+date: 2026-10-27
 description: Every section plugin takes part in each seed and uninstall, and section plugins are discovered once at startup into a key map and priority order fixed for the process lifetime
 ---
 <!-- Created: 2026-10-05 by Constructor Tech -->
@@ -27,7 +27,7 @@ description: Every section plugin takes part in each seed and uninstall, and sec
 
 ## Context and Problem Statement
 
-Each kind of seeded data is owned by a section plugin, and every section plugin takes part in each seed and uninstall in a fixed order. The platform plugin model usually selects one plugin instance per request, or looks plugins up in the types registry when needed. How should the Application Manager find and route to its section plugins so that key and priority conflicts show up at deploy time?
+Each kind of seeded data is owned by a section plugin, and every section plugin takes part in each seed and uninstall in a fixed order. The platform plugin model usually selects one plugin instance per request, or looks plugins up in the types registry when needed. Each plugin's registration carries its priority and the section type it owns. How should the Application Manager find and route to its section plugins so that key and priority conflicts show up at deploy time?
 
 ## Decision Drivers
 
@@ -48,14 +48,15 @@ Each kind of seeded data is owned by a section plugin, and every section plugin 
 
 Chosen option: "Discovery at startup into a fixed set", because it gives one plugin set for the process lifetime, makes conflicts and discovery failures fail at deploy time, and keeps the types registry off the seed and uninstall paths.
 
-* At `start`, the gear lists the instances of the section plugin GTS type, resolves each client in ClientHub by exact GTS id, and reads each `key` through the plugin call guard. The registered instance priority orders the plugins.
-* The key map and priority order stay fixed until the next start; an empty set is a valid start.
+* At `start`, the gear lists the instances of the section plugin GTS type and reads each instance's `priority` and `section_type`. The key is the section type id without its minor version, and the priority orders the plugins.
+* The gear resolves each section type and compiles its schema ([ADR 0002](./0002-cpt-cf-application-manager-adr-registered-section-schemas.md)), and resolves each client in ClientHub by exact GTS id. Startup makes no plugin call.
+* The key map, priority order and compiled schemas stay fixed until the next start; an empty set is a valid start.
 * Startup fails with no retry on any condition of `cpt-cf-application-manager-fr-startup-checks`, naming a reason from [DESIGN §4.1](../DESIGN.md#41-observability).
 * Seed calls `apply` and uninstall calls `remove` on every plugin, one at a time in priority order.
 
 ### Consequences
 
-* Each plugin registers its instance, priority, and scoped client in its own `init`.
+* Each plugin registers its section type, its instance with priority and section type, and its scoped client in its own `init`.
 * A manifest cannot select or add a plugin; a key no plugin owns makes it invalid.
 * One broken registration blocks startup for the whole gear.
 * A plugin change needs a restart (`cpt-cf-application-manager-constraint-restart-for-plugin-change`).
@@ -64,7 +65,7 @@ Chosen option: "Discovery at startup into a fixed set", because it gives one plu
 
 * One startup test per startup check, each ending with its named reason and no retry; an empty registry starts with an empty key set.
 * Seed and uninstall dispatch in priority order; uninstall reaches every plugin after a failure.
-* No types-registry call after startup, and listing keys makes no plugin call.
+* Startup makes no plugin call, and no types-registry call follows startup.
 * A manifest with an unowned key is invalid with an `unknown_section` problem naming it.
 
 ## Pros and Cons of the Options
