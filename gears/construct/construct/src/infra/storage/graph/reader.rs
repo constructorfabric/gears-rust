@@ -231,7 +231,7 @@ impl StoredProfiles for GraphProfileSource {
                     .inspect_err(|defect| {
                         // Only Construct writes these nodes, so this is a
                         // defect, not a state a reader should see in silence.
-                        tracing::warn!(%defect, "a stored fact cannot be read; it is not served");
+                        tracing::error!(%defect, "a stored fact cannot be read; it is not served");
                     })
                     .ok()
             })

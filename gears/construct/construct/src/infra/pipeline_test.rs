@@ -93,7 +93,7 @@ async fn a_record_is_planned_checked_admitted_written_and_read_back() {
     let pipeline = assemble(
         &cfg,
         Some(adds_a_skill()),
-        Some(fake_graph_storage()),
+        fake_graph_storage(),
         Arc::new(settings_service(&db, Arc::new(AllowResolver), true)),
         PolicyEnforcer::new(Arc::new(AllowResolver)),
     )
@@ -155,6 +155,74 @@ async fn a_record_is_planned_checked_admitted_written_and_read_back() {
     );
 }
 
+/// A model whose call panics.
+struct Panics;
+
+#[async_trait]
+impl ModelClient for Panics {
+    async fn complete(
+        &self,
+        _ctx: &SecurityContext,
+        _request: &ModelRequest,
+    ) -> Result<ModelResponse, ModelError> {
+        panic!("the model client broke")
+    }
+}
+
+#[tracing_test::traced_test]
+#[tokio::test]
+async fn a_record_whose_processing_panics_is_dropped_and_the_worker_goes_on() {
+    let db = inmem_db().await;
+    let cfg = ConstructConfig {
+        processing_identity: Some(Uuid::new_v4()),
+        profile_category_check: Some(CategoryCheckConfig::OneCall),
+        ..ConstructConfig::default()
+    }
+    .validated()
+    .unwrap();
+    let pipeline = assemble(
+        &cfg,
+        Some(Arc::new(Panics)),
+        fake_graph_storage(),
+        Arc::new(settings_service(&db, Arc::new(AllowResolver), true)),
+        PolicyEnforcer::new(Arc::new(AllowResolver)),
+    )
+    .expect("the pipeline assembles");
+    let worker = pipeline.worker.expect("processing is wired");
+    let load = worker.load();
+    let intake = IntakeFixture {
+        hand_off_to: Some(Arc::clone(&pipeline.hand_off)),
+        ..IntakeFixture::default()
+    }
+    .build(&db);
+    let cancel = CancellationToken::new();
+    let running = tokio::spawn(worker.run(cancel.clone()));
+
+    intake
+        .submit(
+            &in_tenant(Uuid::new_v4()),
+            Uuid::new_v4(),
+            chat_record(Uuid::new_v4(), "chat/t/1", "v1"),
+        )
+        .await
+        .expect("intake answers");
+    let dropped = async {
+        while !logs_contain("processing a record panicked") || load.in_flight() > 0 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(30), dropped)
+        .await
+        .expect("the panic is caught");
+
+    assert!(logs_contain("the model client broke"));
+    assert!(logs_contain(r#"stage="worker""#));
+    assert!(logs_contain(r#"reason="processing_failed""#));
+    assert!(!running.is_finished(), "the worker goes on");
+    cancel.cancel();
+    running.await.unwrap();
+}
+
 #[tracing_test::traced_test]
 #[tokio::test]
 async fn without_a_model_records_are_dropped_with_an_event_and_no_worker_runs() {
@@ -169,7 +237,7 @@ async fn without_a_model_records_are_dropped_with_an_event_and_no_worker_runs() 
     let pipeline = assemble(
         &cfg,
         None,
-        Some(fake_graph_storage()),
+        fake_graph_storage(),
         Arc::new(settings_service(&db, Arc::new(AllowResolver), true)),
         PolicyEnforcer::new(Arc::new(AllowResolver)),
     )
@@ -206,7 +274,7 @@ async fn without_a_processing_identity_the_profile_read_is_unavailable() {
     let pipeline = assemble(
         &ConstructConfig::default().validated().unwrap(),
         Some(adds_a_skill()),
-        Some(fake_graph_storage()),
+        fake_graph_storage(),
         Arc::new(settings_service(&db, Arc::new(AllowResolver), true)),
         PolicyEnforcer::new(Arc::new(AllowResolver)),
     )
@@ -222,40 +290,6 @@ async fn without_a_processing_identity_the_profile_read_is_unavailable() {
         pipeline.worker.is_none(),
         "no processing without an identity"
     );
-    assert!(
-        matches!(
-            result,
-            Err(crate::domain::error::DomainError::Unavailable(_))
-        ),
-        "{result:?}"
-    );
-}
-
-#[tokio::test]
-async fn with_an_identity_but_no_graph_storage_the_profile_read_is_unavailable() {
-    let db = inmem_db().await;
-    let cfg = ConstructConfig {
-        processing_identity: Some(Uuid::new_v4()),
-        profile_category_check: Some(CategoryCheckConfig::OneCall),
-        ..ConstructConfig::default()
-    }
-    .validated()
-    .unwrap();
-    let pipeline = assemble(
-        &cfg,
-        Some(adds_a_skill()),
-        None,
-        Arc::new(settings_service(&db, Arc::new(AllowResolver), true)),
-        PolicyEnforcer::new(Arc::new(AllowResolver)),
-    )
-    .unwrap();
-
-    let result = pipeline
-        .profile
-        .read(&in_tenant(Uuid::new_v4()), None, Uuid::new_v4())
-        .await;
-
-    assert!(pipeline.worker.is_none());
     assert!(
         matches!(
             result,
@@ -308,7 +342,7 @@ async fn the_configured_category_check_reaches_the_profile_read() {
         let pipeline = assemble(
             &cfg,
             None,
-            Some(fake_graph_storage()),
+            fake_graph_storage(),
             Arc::new(settings_service(&db, Arc::new(AllowResolver), true)),
             PolicyEnforcer::new(Arc::clone(&asked) as Arc<dyn AuthZResolverApi>),
         )
@@ -335,7 +369,7 @@ async fn without_a_processing_identity_even_an_empty_profile_is_unavailable() {
     let pipeline = assemble(
         &ConstructConfig::default().validated().unwrap(),
         None,
-        Some(fake_graph_storage()),
+        fake_graph_storage(),
         // Personalization off by default: the read would serve nothing.
         Arc::new(settings_service(&db, Arc::new(AllowResolver), false)),
         PolicyEnforcer::new(Arc::new(AllowResolver)),

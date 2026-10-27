@@ -10,7 +10,7 @@ use toolkit::contracts::RunnableCapability;
 use toolkit::{Gear, GearCtx};
 use toolkit_db::DBProvider;
 use toolkit_db::DbError;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 use authz_resolver_sdk::{AuthZResolverApi, PolicyEnforcer};
 
@@ -119,7 +119,9 @@ impl Gear for ConstructGear {
             Arc::new(defaults),
             policy_enforcer.clone(),
         ));
-        let graph = hub.try_get::<dyn GraphStorageClientV1>();
+        let graph = hub
+            .get::<dyn GraphStorageClientV1>()
+            .context("failed to get graph storage")?;
         let pipeline = pipeline::build(
             &cfg,
             &hub,
@@ -246,30 +248,42 @@ impl RunnableCapability for ConstructGear {
                 );
             }
             token.cancel();
-            tokio::select! {
-                result = &mut handle => {
-                    if let Err(err) = result
-                        && !err.is_cancelled()
-                    {
-                        // A worker that panicked lost the records it held; the
-                        // host is told the stop was not clean.
-                        error!(error = ?err, "construct record processing ended with an error");
-                        return Err(anyhow::Error::new(err)
-                            .context("construct record processing ended with an error"));
-                    }
-                }
+            // The worker's own end is looked at first, so a worker that ended
+            // with a panic by the deadline is reported, not aborted.
+            let result = tokio::select! {
+                biased;
+                result = &mut handle => result,
                 () = deadline.cancelled() => {
                     warn!(
                         in_flight = load.in_flight(),
                         "construct: record processing did not stop by the deadline and is aborted"
                     );
                     handle.abort();
+                    // An aborted task ends at its next await. This waits for the
+                    // worker to end; the record tasks it holds are aborted as it
+                    // drops them.
+                    let Ok(result) = tokio::time::timeout(ABORT_GRACE, &mut handle).await else {
+                        warn!("construct: record processing did not end after it was aborted");
+                        return Ok(());
+                    };
+                    result
                 }
+            };
+            if let Err(err) = result
+                && !err.is_cancelled()
+            {
+                // A worker that panicked lost the records it held; the host is
+                // told the stop was not clean, and logs it.
+                return Err(anyhow::Error::new(err)
+                    .context("construct record processing ended with an error"));
             }
         }
         Ok(())
     }
 }
+
+/// How long `stop` waits for an aborted worker to end.
+const ABORT_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// The guard of `mutex`, also after a panic while it was held: the worker
 /// slots hold no invariant a panic can break, and dropping the worker or its

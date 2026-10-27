@@ -1,12 +1,14 @@
 //! Assembles what the gear runs: the processing of received records (planner,
 //! checks, Admission, writer) behind a queue, and the profile read.
 
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context as _;
 use async_trait::async_trait;
 use authz_resolver_sdk::PolicyEnforcer;
+use futures::FutureExt as _;
 use graph_storage_sdk::GraphStorageClientV1;
 use tokio_util::sync::CancellationToken;
 use toolkit::client_hub::ClientHub;
@@ -22,7 +24,9 @@ use crate::domain::planner::agent::{Planner, PlannerCaps};
 use crate::domain::planner::catalog::PropertyCatalog;
 use crate::domain::planner::processing::{Processing, ProcessingContexts, ProcessingPorts};
 use crate::domain::profile_read::{CategoryCheck, ProfileReadPorts, ProfileReadService};
-use crate::domain::record_intake::{IntakeEvents, RecordHandOff, RecordKey};
+use crate::domain::record_intake::{
+    DropEvent, DropReason, DropStage, IntakeEvents, RecordHandOff, RecordKey,
+};
 use crate::domain::sensitive_data::SensitiveDataChecks;
 use crate::domain::subject_settings::SubjectSettingsReader;
 use crate::infra::admission_events::LogAdmissionEvents;
@@ -63,6 +67,7 @@ pub struct Worker {
     workers: std::num::NonZeroUsize,
     load: WorkerLoad,
     metrics: Arc<ProcessingMetrics>,
+    events: Arc<dyn IntakeEvents>,
 }
 
 impl Worker {
@@ -80,13 +85,18 @@ impl Worker {
     /// Graph storage is left consistent, because a plan is stored in one
     /// write that lands whole or not at all. A stopped record's identity
     /// stays in intake, so a resend is a repeat, as the DESIGN states.
+    ///
+    /// A record whose processing panics is dropped with an event and an error
+    /// log; the worker goes on with the next.
     pub async fn run(self, cancel: CancellationToken) {
-        let (processing, load, metrics) = (self.processing, self.load, self.metrics);
+        let (processing, load, metrics, events) =
+            (self.processing, self.load, self.metrics, self.events);
         serve(
             self.queue,
             move |record| {
                 let processing = Arc::clone(&processing);
                 let metrics = Arc::clone(&metrics);
+                let events = Arc::clone(&events);
                 let in_flight = load.start();
                 let span = tracing::info_span!(
                     "construct_process_record",
@@ -98,7 +108,20 @@ impl Worker {
                 );
                 async move {
                     let started = std::time::Instant::now();
-                    processing.process(&record).await;
+                    let processed = AssertUnwindSafe(processing.process(&record))
+                        .catch_unwind()
+                        .await;
+                    if let Err(panic) = processed {
+                        tracing::error!(
+                            panic = panic_message(panic.as_ref()),
+                            "construct: processing a record panicked; the record is dropped"
+                        );
+                        events.dropped(DropEvent::for_record(
+                            &record,
+                            DropStage::Worker,
+                            DropReason::ProcessingFailed,
+                        ));
+                    }
                     metrics.processed(started.elapsed());
                     drop(in_flight);
                 }
@@ -135,7 +158,7 @@ pub struct Pipeline {
 pub fn build(
     cfg: &ValidConfig,
     hub: &Arc<ClientHub>,
-    graph: Option<Arc<dyn GraphStorageClientV1>>,
+    graph: Arc<dyn GraphStorageClientV1>,
     settings: Arc<dyn SubjectSettingsReader>,
     policy_enforcer: PolicyEnforcer,
 ) -> anyhow::Result<Pipeline> {
@@ -161,13 +184,12 @@ pub fn build(
 pub fn assemble(
     cfg: &ValidConfig,
     model: Option<Arc<dyn ModelClient>>,
-    graph: Option<Arc<dyn GraphStorageClientV1>>,
+    graph: Arc<dyn GraphStorageClientV1>,
     settings: Arc<dyn SubjectSettingsReader>,
     policy_enforcer: PolicyEnforcer,
 ) -> anyhow::Result<Pipeline> {
     let configured = Configured {
         identity: Part::of(cfg.processing_identity.as_ref()),
-        graph: Part::of(graph.as_ref()),
         model: Part::of(model.as_ref()),
     };
     let identity = cfg.processing_identity.map(ServiceIdentity::new);
@@ -177,21 +199,16 @@ pub fn assemble(
     };
 
     // @cpt-begin:cpt-cf-construct-algo-profile-reader-wire:p1:inst-wire-read
-    let graph = graph.filter(|_| identity.is_some());
-    let reader = graph.as_ref().map(|client| {
-        Arc::new(GraphProfileSource::new(
-            Arc::clone(client),
-            Arc::new(PayloadCounter),
-        ))
-    });
-    let profiles: Arc<dyn crate::domain::profile_read::StoredProfiles> = match &reader {
-        Some(reader) => Arc::clone(reader) as _,
-        None => Arc::new(NoProfiles),
-    };
+    // Without an identity the read answers unavailable at the identity, before
+    // it reaches graph storage.
+    let reader = Arc::new(GraphProfileSource::new(
+        Arc::clone(&graph),
+        Arc::new(PayloadCounter),
+    ));
     let profile = Arc::new(ProfileReadService::new(
         ProfileReadPorts {
             settings: Arc::clone(&settings),
-            profiles,
+            profiles: Arc::clone(&reader) as _,
             contexts: Arc::clone(&contexts),
             events: Arc::new(LogProfileEvents),
         },
@@ -206,7 +223,7 @@ pub fn assemble(
     // @cpt-end:cpt-cf-construct-algo-profile-reader-wire:p1:inst-wire-read
 
     // @cpt-begin:cpt-cf-construct-algo-profile-reader-wire:p1:inst-wire-processing
-    let (Some(client), Some(reader), Some(model)) = (graph, reader, model) else {
+    let (true, Some(model)) = (identity.is_some(), model) else {
         configured.log();
         return Ok(Pipeline {
             hand_off: Arc::new(DroppingHandOff::new(Arc::new(LogIntakeEvents))),
@@ -245,10 +262,10 @@ pub fn assemble(
         drops: Arc::clone(&events) as _,
     });
     let writer = GraphPlanWriter::new(WriterPorts {
-        client: Arc::clone(&client),
-        types: Arc::new(GraphTypes::new(Arc::clone(&client))),
+        client: Arc::clone(&graph),
+        types: Arc::new(GraphTypes::new(Arc::clone(&graph))),
         version: Arc::new(PayloadCounter),
-        removal: Arc::new(SoftDelete::new(client)),
+        removal: Arc::new(SoftDelete::new(graph)),
     });
     let processing = Arc::new(Processing::new(
         planner,
@@ -258,7 +275,7 @@ pub fn assemble(
             contexts,
             profiles: reader,
             writer: Arc::new(writer),
-            events,
+            events: Arc::clone(&events),
         },
         cfg.processing.max_reruns,
     ));
@@ -270,10 +287,20 @@ pub fn assemble(
             workers: cfg.processing.workers,
             load,
             metrics,
+            events,
         }),
         profile,
     })
     // @cpt-end:cpt-cf-construct-algo-profile-reader-wire:p1:inst-wire-processing
+}
+
+/// The message a panic was raised with, when it is a string.
+fn panic_message(panic: &(dyn std::any::Any + Send)) -> &str {
+    panic
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("a panic without a message")
 }
 
 /// Whether the deployment has one of the processing's prerequisites.
@@ -301,7 +328,6 @@ impl Part {
 #[derive(Debug, Clone, Copy)]
 struct Configured {
     identity: Part,
-    graph: Part,
     model: Part,
 }
 
@@ -315,11 +341,7 @@ impl Configured {
         reason = "three log lines; the tracing macros count toward the complexity"
     )]
     fn log(self) {
-        let (identity, graph, model) = (
-            self.identity.present(),
-            self.graph.present(),
-            self.model.present(),
-        );
+        let (identity, model) = (self.identity.present(), self.model.present());
         if !identity && !model {
             tracing::info!(
                 "construct: record processing is not configured; received records are dropped"
@@ -327,34 +349,12 @@ impl Configured {
         } else {
             tracing::warn!(
                 processing_identity = identity,
-                graph_storage = graph,
                 model = model,
                 "construct: record processing is only partly configured; received records are dropped"
             );
         }
-        if !identity || !graph {
-            tracing::warn!(
-                processing_identity = identity,
-                graph_storage = graph,
-                "construct: the profile read answers unavailable"
-            );
+        if !identity {
+            tracing::warn!("construct: the profile read answers unavailable");
         }
-    }
-}
-
-/// [`crate::domain::profile_read::StoredProfiles`] for a deployment without
-/// graph storage or a processing identity.
-struct NoProfiles;
-
-#[async_trait]
-impl crate::domain::profile_read::StoredProfiles for NoProfiles {
-    async fn stored(
-        &self,
-        _ctx: &SecurityContext,
-        _key: crate::domain::subject_settings::SubjectKey,
-    ) -> Result<Vec<crate::domain::profile_read::StoredFact>, DomainError> {
-        Err(DomainError::Unavailable(
-            "no profile store is configured".to_owned(),
-        ))
     }
 }
