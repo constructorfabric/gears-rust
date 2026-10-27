@@ -15,6 +15,7 @@ use tenant_resolver_sdk::{
     TenantId, TenantResolverError, TenantResolverPluginClient, TenantStatus,
 };
 use toolkit_canonical_errors::CanonicalError;
+use toolkit_gts::gts_id;
 use toolkit_odata::ast::{CompareOperator, Expr, Value};
 use toolkit_odata::{ODataQuery, Page, PageInfo};
 use toolkit_security::SecurityContext;
@@ -571,7 +572,7 @@ async fn get_descendants_drops_non_tenant_types() {
     let root = Uuid::now_v7();
     let tenant_child = Uuid::now_v7();
     let mut dept = make_group(Uuid::now_v7(), "Dept", Some(root), 1, None);
-    dept.code = "gts.cf.core.rg.type.v1~x.test._.dept.v1~".to_owned();
+    dept.code = gts_id!("cf.core.rg.type.v1~x.test._.dept.v1~").to_owned();
     let mock = MockRgHierarchy::descendants_only(vec![
         make_group(root, "Root", None, 0, None),
         dept,
@@ -1284,7 +1285,7 @@ fn type_in_values(expr: &Expr, out: &mut Vec<Vec<String>>) {
 
 #[tokio::test]
 async fn configured_tenant_types_are_sent_as_type_in_filter() {
-    const CUSTOM: &str = "gts.cf.core.rg.type.v1~acme.core._.tenant.v1~";
+    const CUSTOM: &str = gts_id!("cf.core.rg.type.v1~acme.core._.tenant.v1~");
     let tenant_types = vec![CUSTOM.to_owned(), TENANT_RG_TYPE_PATH.to_owned()];
     let rg = Arc::new(CapturingRg::default());
     let svc = Service::new(rg.clone(), tenant_types.clone());

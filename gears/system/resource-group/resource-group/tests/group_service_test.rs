@@ -2516,7 +2516,7 @@ async fn create_tenant_sub_type(
 }
 
 /// Vendor-specific tenant-type prefix used by the configurable-tenant-type tests.
-const CUSTOM_TENANT_RG_TYPE_PATH: &str = "gts.cf.core.rg.type.v1~acme.core._.tenant.v1~";
+const CUSTOM_TENANT_RG_TYPE_PATH: &str = gts_id!("cf.core.rg.type.v1~acme.core._.tenant.v1~");
 
 /// Create a root-capable RG type whose code starts with `prefix`.
 async fn create_root_type_with_prefix(

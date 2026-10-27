@@ -58,6 +58,8 @@ impl ResourceGroupConfig {
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
+    use toolkit_gts::gts_id;
+
     use super::*;
 
     #[test]
@@ -77,7 +79,7 @@ mod tests {
     fn custom_tenant_types_are_accepted() {
         let cfg: ResourceGroupConfig = serde_json::from_value(serde_json::json!({
             "tenant_type_paths": [
-                "gts.cf.core.rg.type.v1~acme.core._.tenant.v1~",
+                gts_id!("cf.core.rg.type.v1~acme.core._.tenant.v1~"),
                 TENANT_RG_TYPE_PATH,
             ]
         }))
@@ -97,7 +99,7 @@ mod tests {
     #[test]
     fn path_outside_rg_namespace_is_rejected() {
         let cfg = ResourceGroupConfig {
-            tenant_type_paths: vec!["gts.acme.core._.tenant.v1~".to_owned()],
+            tenant_type_paths: vec![gts_id!("acme.core._.tenant.v1~").to_owned()],
         };
         assert!(cfg.validate().is_err());
     }

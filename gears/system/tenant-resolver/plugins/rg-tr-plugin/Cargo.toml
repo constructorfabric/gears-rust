@@ -56,3 +56,5 @@ tokio = { workspace = true, features = ["rt", "macros"] }
 # returns (ADR 0005). Production code only projects it via the SDK's
 # `ResourceGroupError::from`, so this is dev-only.
 toolkit-canonical-errors = { workspace = true }
+# `gts_id!` for GTS literals in tests (DE0904).
+toolkit-gts = { workspace = true }
