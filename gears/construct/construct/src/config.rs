@@ -461,6 +461,30 @@ mod tests {
         }
     }
 
+    proptest::proptest! {
+        #[test]
+        fn a_plain_name_up_to_63_characters_is_an_alias(
+            alias in "[A-Za-z0-9][A-Za-z0-9_-]{0,62}",
+        ) {
+            proptest::prop_assert!(is_upstream_alias(&alias));
+        }
+
+        #[test]
+        fn a_name_with_any_other_character_is_not_an_alias(
+            head in "[A-Za-z0-9]{1,20}",
+            other in "[^A-Za-z0-9_-]",
+            tail in "[A-Za-z0-9_-]{0,20}",
+        ) {
+            let alias = format!("{head}{other}{tail}");
+            proptest::prop_assert!(!is_upstream_alias(&alias), "{:?}", alias);
+        }
+
+        #[test]
+        fn a_name_past_63_characters_is_not_an_alias(alias in "[A-Za-z0-9]{64,100}") {
+            proptest::prop_assert!(!is_upstream_alias(&alias));
+        }
+    }
+
     #[test]
     fn a_model_name_with_a_space_a_control_character_or_too_long_is_refused() {
         for name in ["", "gpt 4o", "gpt\n4o", "gpt\u{7f}", &"m".repeat(129)] {

@@ -345,6 +345,7 @@ fn read_failure(err: DomainError) -> DomainError {
         err @ (DomainError::Refused(_)
         | DomainError::NotVisible(_)
         | DomainError::Unavailable(_)
+        | DomainError::NotConfigured(_)
         | DomainError::Internal(_)
         | DomainError::Database(_)) => err,
     }

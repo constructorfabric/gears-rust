@@ -187,7 +187,7 @@ async fn an_unreachable_profile_answers_unavailable() {
 }
 
 #[tokio::test]
-async fn every_answer_of_the_route_is_no_store() {
+async fn every_answer_of_the_route_is_no_store_with_the_security_headers() {
     let chain = Chain::new(adding_rust(1), &[Ok(Written::Stored)]);
 
     for (resolver, expected) in [
@@ -209,13 +209,20 @@ async fn every_answer_of_the_route_is_no_store() {
             .expect("a response");
 
         assert_eq!(response.status(), expected);
-        assert_eq!(
-            response
-                .headers()
-                .get(header::CACHE_CONTROL)
-                .and_then(|v| v.to_str().ok()),
-            Some("no-store"),
-            "{expected}"
-        );
+        for (name, value) in [
+            (header::CACHE_CONTROL, "no-store"),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+            (header::X_FRAME_OPTIONS, "DENY"),
+            (
+                header::CONTENT_SECURITY_POLICY,
+                "default-src 'none'; frame-ancestors 'none'",
+            ),
+        ] {
+            assert_eq!(
+                response.headers().get(&name).and_then(|v| v.to_str().ok()),
+                Some(value),
+                "{name} on {expected}"
+            );
+        }
     }
 }

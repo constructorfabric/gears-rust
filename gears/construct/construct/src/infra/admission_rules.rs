@@ -48,6 +48,19 @@ impl ConfigAdmissionRules {
     }
 }
 
+/// Warn at start for each admission list the config leaves out: Admission
+/// then trusts every connector, or takes every entity kind.
+pub fn warn_open_lists(config: &AdmissionConfig) {
+    if config.trusted_connectors.is_none() {
+        tracing::warn!(
+            "construct: admission.trusted_connectors is not set; every connector is trusted"
+        );
+    }
+    if config.entity_kinds.is_none() {
+        tracing::warn!("construct: admission.entity_kinds is not set; every entity kind is taken");
+    }
+}
+
 #[async_trait]
 impl AdmissionRulesSource for ConfigAdmissionRules {
     async fn rules(
@@ -96,5 +109,24 @@ mod tests {
                 .permits(&Uuid::new_v4().to_string()),
             "a connector off the list is not trusted"
         );
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn an_absent_list_is_warned_about() {
+        warn_open_lists(&AdmissionConfig::default());
+        assert!(logs_contain("every connector is trusted"));
+        assert!(logs_contain("every entity kind is taken"));
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn set_lists_are_not_warned_about() {
+        warn_open_lists(&AdmissionConfig {
+            trusted_connectors: Some(Vec::new()),
+            entity_kinds: Some(Vec::new()),
+            ..AdmissionConfig::default()
+        });
+        assert!(!logs_contain("is not set"));
     }
 }

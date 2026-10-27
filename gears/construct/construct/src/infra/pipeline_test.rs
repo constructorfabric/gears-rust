@@ -268,7 +268,7 @@ async fn without_a_model_records_are_dropped_with_an_event_and_no_worker_runs() 
 }
 
 #[tokio::test]
-async fn without_a_processing_identity_the_profile_read_is_unavailable() {
+async fn without_a_processing_identity_the_profile_read_is_not_configured() {
     let db = inmem_db().await;
 
     let pipeline = assemble(
@@ -293,7 +293,7 @@ async fn without_a_processing_identity_the_profile_read_is_unavailable() {
     assert!(
         matches!(
             result,
-            Err(crate::domain::error::DomainError::Unavailable(_))
+            Err(crate::domain::error::DomainError::NotConfigured(_))
         ),
         "{result:?}"
     );
@@ -364,7 +364,7 @@ async fn the_configured_category_check_reaches_the_profile_read() {
 }
 
 #[tokio::test]
-async fn without_a_processing_identity_even_an_empty_profile_is_unavailable() {
+async fn without_a_processing_identity_even_an_empty_profile_is_not_configured() {
     let db = inmem_db().await;
     let pipeline = assemble(
         &ConstructConfig::default().validated().unwrap(),
@@ -384,7 +384,7 @@ async fn without_a_processing_identity_even_an_empty_profile_is_unavailable() {
     assert!(
         matches!(
             result,
-            Err(crate::domain::error::DomainError::Unavailable(_))
+            Err(crate::domain::error::DomainError::NotConfigured(_))
         ),
         "{result:?}"
     );
