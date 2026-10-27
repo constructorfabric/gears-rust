@@ -1,7 +1,7 @@
 ---
 status: accepted
 date: 2026-10-20
-description: Operation records and request history rows are unrestricted entities with no tenant column, and the PDP decides every gear-level action as a platform-level permission with no context tenant
+description: Operation records and operation history rows are unrestricted entities with no tenant column, and the PDP decides every gear-level action as a platform-level permission with no context tenant
 ---
 <!-- Created: 2026-10-05 by Constructor Tech -->
 # Platform-Level Permission and Unrestricted Operation Records
@@ -45,7 +45,7 @@ The gear manages applications installed into the whole environment, so its recor
 
 Chosen option: "Platform-level permission with unrestricted records", because startup depends only on the types registry and the authz resolver, and platform-level permission stays with the one component that owns permission decisions.
 
-* Operation records and request history rows are unrestricted secure-ORM entities with no tenant column.
+* Operation records and operation history rows are unrestricted secure-ORM entities with no tenant column.
 * Every gear-level action is a PDP decision with no context tenant, as a platform-level permission; decision handling is in [DESIGN §3.3](../DESIGN.md#33-api-contracts).
 * Plugin-level `NotPermitted` is a separate mechanism outside this decision.
 
