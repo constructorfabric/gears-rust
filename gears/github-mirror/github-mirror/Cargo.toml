@@ -23,7 +23,7 @@ workspace = true
 integration = ["toolkit-db/pg", "toolkit-db/mysql"]
 
 [dependencies]
-github-mirror-sdk = { package = "cf-gears-github-mirror-sdk", version = "0.1.0", path = "../github-mirror-sdk" }
+github-mirror-sdk = { package = "cf-gears-github-mirror-sdk", version = "0.2.0", path = "../github-mirror-sdk" }
 
 authz-resolver-sdk = { workspace = true }
 authz-resolver = { workspace = true }

@@ -23,7 +23,7 @@ workspace = true
 construct-sdk = { package = "cf-gears-construct-sdk", version = "0.1.0", path = "../construct-sdk" }
 
 # AuthZ resolver for authorization (PEP flow)
-authz-resolver-sdk = { package = "cf-gears-authz-resolver-sdk", version = "0.5.2", path = "../../../gears/system/authz-resolver/authz-resolver-sdk" }
+authz-resolver-sdk = { package = "cf-gears-authz-resolver-sdk", version = "0.6.0", path = "../../../gears/system/authz-resolver/authz-resolver-sdk" }
 authz-resolver = { workspace = true }
 
 # Tenant settings (the personalization default for new subjects)
