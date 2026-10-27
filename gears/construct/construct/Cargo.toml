@@ -33,7 +33,8 @@ oagw-sdk = { workspace = true }
 http = { workspace = true }
 bytes = { workspace = true }
 
-# The profile: graph storage's in-process client
+# The profile: graph storage's in-process client. The gear crate itself is a
+# normal dependency: the gear macro's `deps` names it, which links it in.
 graph-storage-sdk = { workspace = true }
 graph-storage = { workspace = true }
 opentelemetry = { workspace = true }
@@ -74,8 +75,8 @@ toolkit-gts = { workspace = true }
 toolkit-macros = { workspace = true }
 
 [dev-dependencies]
-# Path-only: graph storage is no normal dependency, so its release need not be
-# published when this crate is.
+# Path-only: this adds only the test-support feature, so publishing this crate
+# needs no release of graph storage that has it.
 graph-storage = { package = "cf-gears-graph-storage", path = "../../graph-storage/graph-storage", features = ["test-support"] }
 toolkit-odata = { workspace = true }
 types-registry-sdk = { workspace = true, features = ["test-util"] }

@@ -245,6 +245,14 @@ impl ConstructConfig {
                 model.upstream_alias
             )));
         }
+        if let Some(model) = &self.model
+            && !is_model_name(&model.model)
+        {
+            return Err(InvalidConfig(format!(
+                "model.model {:?} must be 1 to {MAX_MODEL_NAME_CHARS} printable characters with no space",
+                model.model
+            )));
+        }
         Ok(())
     }
 }
@@ -261,11 +269,21 @@ fn is_upstream_alias(alias: &str) -> bool {
         && chars.all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
+/// The longest model name the config takes.
+const MAX_MODEL_NAME_CHARS: usize = 128;
+
+/// Whether `name` is a plausible model name: 1 to [`MAX_MODEL_NAME_CHARS`]
+/// printable ASCII characters with no space, such as `gpt-4o`,
+/// `openai/gpt-4o` or `llama3:8b`. It is sent in every model call's body.
+fn is_model_name(name: &str) -> bool {
+    (1..=MAX_MODEL_NAME_CHARS).contains(&name.len()) && name.bytes().all(|b| b.is_ascii_graphic())
+}
+
 /// The config spelling of [`crate::domain::profile_read::CategoryCheck`].
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+/// It has no default: a deployment picks one when it configures an identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CategoryCheckConfig {
-    #[default]
     OneCall,
     PerCategory,
 }
@@ -437,9 +455,22 @@ mod tests {
             let model = serde_json::json!({ "model": { "upstream_alias": alias, "model": "m" } });
             assert!(valid(model).is_err(), "{alias:?}");
         }
-        let model =
-            serde_json::json!({ "model": { "upstream_alias": "llm_gateway-1", "model": "m" } });
-        assert!(valid(model).is_ok());
+        for alias in ["llm_gateway-1", &"x".repeat(63)] {
+            let model = serde_json::json!({ "model": { "upstream_alias": alias, "model": "m" } });
+            assert!(valid(model).is_ok(), "{alias:?}");
+        }
+    }
+
+    #[test]
+    fn a_model_name_with_a_space_a_control_character_or_too_long_is_refused() {
+        for name in ["", "gpt 4o", "gpt\n4o", "gpt\u{7f}", &"m".repeat(129)] {
+            let model = serde_json::json!({ "model": { "upstream_alias": "llm", "model": name } });
+            assert!(valid(model).is_err(), "{name:?}");
+        }
+        for name in ["gpt-4o", "openai/gpt-4o", "llama3:8b", &"m".repeat(128)] {
+            let model = serde_json::json!({ "model": { "upstream_alias": "llm", "model": name } });
+            assert!(valid(model).is_ok(), "{name:?}");
+        }
     }
 
     #[test]

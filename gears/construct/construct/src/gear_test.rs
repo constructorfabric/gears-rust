@@ -49,7 +49,7 @@ async fn gear_with_worker() -> (ConstructGear, Arc<dyn RecordHandOff>) {
     let pipeline = assemble(
         &cfg,
         Some(Arc::new(Unused)),
-        Some(fake_graph_storage()),
+        fake_graph_storage(),
         Arc::new(settings_service(&db, Arc::new(AllowResolver), true)),
         PolicyEnforcer::new(Arc::new(AllowResolver)),
     )
@@ -111,9 +111,11 @@ async fn stop_after_its_deadline_aborts_a_worker_that_does_not_end() {
         .await
         .expect("stop returns at the deadline, not when the worker ends")
         .unwrap();
-    tokio::task::yield_now().await;
 
-    assert!(aborted.is_finished(), "the worker is aborted");
+    assert!(
+        aborted.is_finished(),
+        "the worker is aborted before stop returns"
+    );
     assert!(logs_contain("did not stop by the deadline"));
 }
 
@@ -151,7 +153,6 @@ async fn without_processing_start_and_stop_do_nothing() {
     gear.stop(CancellationToken::new()).await.unwrap();
 }
 
-#[tracing_test::traced_test]
 #[tokio::test]
 async fn a_worker_that_panicked_makes_stop_fail() {
     let gear = ConstructGear::default();
@@ -167,6 +168,10 @@ async fn a_worker_that_panicked_makes_stop_fail() {
 
     let stopped = gear.stop(CancellationToken::new()).await;
 
-    assert!(stopped.is_err(), "{stopped:?}");
-    assert!(logs_contain("ended with an error"));
+    // The host logs the error stop returns; stop does not log it again.
+    let err = stopped.unwrap_err();
+    assert!(
+        format!("{err:#}").contains("ended with an error"),
+        "{err:#}"
+    );
 }
