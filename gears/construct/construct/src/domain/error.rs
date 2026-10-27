@@ -29,6 +29,11 @@ pub enum DomainError {
     #[error("Service unavailable: {0}")]
     Unavailable(String),
 
+    /// The deployment does not configure what the call needs, such as the
+    /// processing identity. Not cured by a retry, so it is not `Unavailable`.
+    #[error("Not configured: {0}")]
+    NotConfigured(String),
+
     #[error("Internal error: {0}")]
     Internal(String),
 

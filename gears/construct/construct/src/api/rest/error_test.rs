@@ -186,6 +186,16 @@ fn database_maps_to_500_without_leaking_detail() {
 }
 
 #[test]
+fn not_configured_maps_to_501_which_is_not_retried() {
+    let problem = wire(DomainError::NotConfigured(
+        "no processing identity is configured".to_owned(),
+    ));
+
+    assert_eq!(problem.status, Some(501));
+    assert!(!visible_text(&problem).contains("processing identity"));
+}
+
+#[test]
 fn unavailable_maps_to_503_without_leaking_detail() {
     let problem = wire(DomainError::Unavailable(
         "pdp at 10.0.0.7 timed out".to_owned(),
