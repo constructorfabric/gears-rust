@@ -1216,7 +1216,7 @@ Until the Generic Approval service exists, criteria **1–4a** (including **2a**
 | Subscriptions PRD | `docs/bss/prd/PRD-subscriptions-entitlements-202601120119/` | Architecture-repo artifact; intent target and SoR for subscription lifecycle post-creation — canonical evidence base is the gears subscriptions PRD below |
 | Contracts PRD | `docs/bss/prd/PRD-contracts-agreements-202601120119/` | Informative only for approval-routing vocabulary; **MUST NOT** be read as authorizing a module-local approval policy owner (that would undo Lifecycle R2) |
 | gears / approval-service (informative) | [`gears/approval-service/docs/PRD.md`](../../../approval-service/docs/PRD.md) — content is still a stub | Canonical spec absent: the expectations contract in §9.2 is the normative interface until one exists. The gear does carry an [`UPSTREAM_REQS.md`](../../../approval-service/docs/UPSTREAM_REQS.md) register for consumer-declared requirements; recording the §9.2 expectations there is tracked in §15. |
-| gears / bss / subscriptions PRD (canonical, informative) | [`gears/bss/subscriptions/docs/PRD.md`](../../subscriptions/docs/PRD.md) | Source for: subscription `draft`/void semantics (two-phase fulfillment), TransitionRequest/Approval pattern, overlap rule. Its [`SEAMS.md`](../../subscriptions/docs/SEAMS.md) carries the consumer-side obligation register the `SUB-O*` asks in this PRD target. Re-verify at sign-off. |
+| gears / bss / subscriptions PRD (canonical, informative) | [`gears/bss/subscriptions/docs/PRD.md`](../../subscriptions/docs/PRD.md) | Source for: subscription `draft`/void semantics (two-phase fulfillment), TransitionRequest/Approval pattern, overlap rule. Re-verify at sign-off. |
 
 ### 17.1 Process Flow Diagram
 

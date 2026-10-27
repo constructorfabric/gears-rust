@@ -1,4 +1,5 @@
 ---
+description: "Decision to keep the subscription status enum closed and represent orthogonal lifecycle concerns as attributes."
 status: proposed
 date: 2026-07-15
 decision-makers: "BSS Subscriptions team"
@@ -7,7 +8,7 @@ decision-makers: "BSS Subscriptions team"
 Created:  2026-08-24 by Virtuozzo International GmbH
 Updated:  2026-08-24 by Virtuozzo International GmbH
 
-# ADR-0001: Keep the Manifest Status Enum Closed (Trials, Pause, and Intents Are Attributes)
+# ADR-0001: Keep the Manifest Status Enum Closed
 
 <!-- toc -->
 
@@ -28,85 +29,70 @@ Updated:  2026-08-24 by Virtuozzo International GmbH
 
 **ID**: `cpt-cf-bss-subscriptions-adr-manifest-closed-status-machine`
 
-> **Status: proposed / flagged for veto.** Autonomous design decision recording the rationale behind
-> [`../DECISIONS.md`](../DECISIONS.md) SUB-D-03 and SUB-D-05; ratified when Product/Architecture
-> confirms.
-
 ## Context and Problem Statement
 
-The BSS manifest §4.3 fixes `Subscription.status` to exactly **`draft | active | suspended |
-cancelled | archived`**. Real commercial lifecycles need more distinctions than five states name
-directly: a **trial** period, a **billing-only pause** (service running, collection stopped for
-hardship/dispute), a **scheduled cancel** ("cancel at period end"), and enterprise **acceptance**
-timing (booking vs service vs customer acceptance). The naïve response is to grow the enum
-(`trial`, `paused`, `pending_activation`, …). Every added status multiplies the transition/guard
-matrix, breaks manifest conformance, and forces every downstream consumer keying on `status` to
-learn the new value fail-closed.
-
-How do we represent trials, billing-only pause, scheduled intents, and acceptance timing **without**
-adding a status?
+`Subscription.status` has exactly five values: `draft | active | suspended | cancelled | archived`. Trial eligibility, preparation progress, pending cancellation and observed provider delivery describe different concerns. Combining them into subscription statuses would make commercial transitions depend on the progress states of every integration.
 
 ## Decision Drivers
 
-* Manifest conformance: the enum is normative and closed; a new status requires a manifest change **first**, which we do not own on this branch.
-* A closed, terminal state machine is what makes lifecycle audit and replay tractable — each added state roughly squares the edge/guard surface.
-* Downstream consumers (rating, Billing, OSS, Analytics) key on `status`; an additive status silently breaks a fail-closed consumer until it is taught the value.
-* The needed distinctions are **orthogonal to** the commercial state: a trial subscription is genuinely `active`; a collection-paused one is genuinely `active`; a scheduled cancel is genuinely `active` until it fires.
+- Keep the commercial state machine closed and consistent across consumers.
+- Preserve immutable operation outcomes and replay independently of current status.
+- Distinguish an accepted request, usable initial readiness, commercial activation and later provider observations.
+- Represent trial terms without adding a trial status.
 
 ## Considered Options
 
-1. Add `trial` / `paused` / `pending_*` statuses to the enum.
-2. Model them as **attributes, postures, and pending intents** on the closed enum (chosen).
-3. Split the state across two machines (a commercial machine + a billing machine).
+1. Add separate subscription statuses for trial and pending work.
+2. Keep the five statuses and model episodes, operation receipts and supported intents separately.
+3. Introduce independently authoritative commercial and billing state machines.
 
 ## Decision Outcome
 
-Chosen option: **model every extra distinction as an attribute/posture/pending-intent on the closed
-manifest enum.** A **trial** is the leading plan **phase** on a manifest status (`draft` pre-paid-
-activation, `active` under trial service) — SUB-D-05's sibling, §6.1 `fr-trials-not-a-status`.
-**Billing-only pause** is the `collectionPaused` posture attribute on `active` (SUB-D-03). A
-**scheduled cancel/resume** is a `ScheduledIntent` (`cancelMode`/`resumeAt`) pending on the aggregate
-(SUB-D-01). The **activation trio** (`contractEffectiveAt`/`serviceActivatedAt`/`customerAcceptedAt`)
-are attributes, not `pending_activation`/`pending_acceptance` states (SUB-D-05). Adding a status
-value is out of scope until the manifest enum is amended.
+Keep the five-value status enum. An acquisition creates a `draft`; its activation operation remains pending/approved until every required initial capability is usable and the final local guards pass. Subscriptions then records `active`, actual `serviceActivatedAt` T, the applied receipt, commercial revision, facts and outbox atomically. Preparation and readiness do not add statuses or establish service time.
+
+A trial is an explicit episode under accepted Pricing PlanRevision terms: either a free period or monetary credit. It uses ordinary subscription statuses and retains its own immutable start, expiry and conversion outcome. Billing owns promotional grants and accounting; Entitlements owns fulfillment and provider execution. Subscription status alone proves neither available bonus nor observed access.
+
+A supported scheduled cancellation is a durable intent on the aggregate. Its financial confirmation, eventual applied cancellation and resource disposition are distinct records. Pending, failed or unknown work cannot be reported as completed cancellation. Applied cancellation is terminal for service; archive follows the separate retention guards.
+
+`contractEffectiveAt` and `serviceActivatedAt` retain their distinct commercial meanings. Existing customer acceptance evidence remains part of the acquisition; a separate `confirmAcceptance` operation is unavailable. Collection pause and scheduled resume are outside the supported profile.
 
 ### Consequences
 
-* Manifest conformance is preserved; the state machine stays five states with a bounded edge/guard matrix (Foundation slice §4.1).
-* Downstream `status` consumers are unaffected by trials/pause/intents — those ride attributes + events the consumers already parse.
-* The cost moves to attribute/event modelling: trial phase, `collectionPaused` window, and pending intents each need clear semantics and events (owned by slices 06, 04, 01).
-* If a genuine new *state* is ever required, it is a deliberate manifest change — not an ad-hoc gear extension.
+- Lifecycle consumers handle the same five statuses for paid and trial subscriptions.
+- Operation, trial, cancellation and materialization records carry their own identity, version and recoverable outcomes.
+- Initial activation consumes held Entitlements readiness through the local activation/non-activation fence. A provider callback never changes commercial status directly.
+- A new subscription status requires an explicit domain contract change.
 
 ### Confirmation
 
-* The `status` domain type is a closed enum in code; a `trial`/`paused`/`pending` value is unrepresentable (compile-time).
-* A conformance fixture: a trial subscription, a `collectionPaused` subscription, and one with a pending end-of-term cancel all report a manifest status and never a bespoke value; downstream consumers route them without a new status branch.
+- The domain enum accepts only the five declared values.
+- A preparing acquisition remains draft; successful initial activation records one fresh T and applied outcome.
+- An active trial reports active plus its trial episode. Pending cancellation reports the current status plus its intent and any confirmed financial cutoff.
+- Reordered delivery observations cannot revive a cancelled subscription or rewrite an applied outcome.
 
 ## Pros and Cons of the Options
 
 ### Add trial / paused / pending statuses to the enum
 
-* Good: each distinction is directly visible in `status`.
-* Bad: breaks manifest conformance; squares the guard matrix; forces every consumer to learn each value fail-closed; a manifest change we do not own.
+- Makes progress visible in one field.
+- Couples all consumers to independent episode and provider states and expands the transition matrix.
 
 ### Model them as attributes, postures, and pending intents on the closed enum (chosen)
 
-* Good: manifest-conformant; bounded state machine; consumers unaffected; audit/replay stay tractable; distinctions are orthogonal to commercial state and belong on attributes.
-* Bad: attribute/event semantics must be specified carefully (a posture is not a state); a reader must consult attributes, not `status` alone, to see "on trial" / "collection paused".
+- Preserves a bounded commercial machine and explicit authority for each independent outcome.
+- Requires readers to inspect the relevant episode, intent or observation instead of inferring everything from status.
 
 ### Split the state across two machines (commercial vs billing)
 
-* Good: separates collection concerns from commercial state.
-* Bad: two machines to keep consistent; not what the manifest models; over-engineered for a single `collectionPaused` posture.
+- Separates commercial and financial concerns.
+- Introduces another subscription-state authority without replacing Billing's own financial records or resolving provider progress.
 
 ## More Information
 
-Cross-gear seam analysis and the neighbour impact are in [`../SEAMS.md`](../SEAMS.md) (SUB-D
-decisions surface in seams SUB-B2, SUB-C4, SUB-N1). Decisions: [`../DECISIONS.md`](../DECISIONS.md)
-SUB-D-01/03/05.
+[Lifecycle Foundation](../features/01-foundation.md), [commercial posture and readiness](../features/05-entitlements.md) and [trial lifecycle](../features/06-trials.md) define the corresponding records and guards.
 
 ## Traceability
 
-- **PRD**: [`../PRD.md`](../PRD.md) §6.1 (`fr-status-enum`, `fr-trials-not-a-status`, `fr-scheduled-intents`, `fr-activation-instants`), §6.4 (`fr-collection-pause`), §15.
-- **Decisions**: [`../DECISIONS.md`](../DECISIONS.md) SUB-D-01, SUB-D-03, SUB-D-05.
-- **Design**: [`../design/01-foundation-lifecycle.md`](../design/01-foundation-lifecycle.md) §4.1–§4.4.
+- **PRD:** [PRD.md](../PRD.md), `fr-status-enum`, `fr-trials-not-a-status`, `fr-scheduled-intents`, `fr-activation-instants`.
+- **Decisions:** [DECISIONS.md](../DECISIONS.md), SUB-D-01, SUB-D-05, SUB-D-55, SUB-D-56, SUB-D-57.
+- **Design:** [DESIGN.md](../DESIGN.md).
