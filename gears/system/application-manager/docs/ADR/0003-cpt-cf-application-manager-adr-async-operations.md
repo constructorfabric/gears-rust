@@ -58,7 +58,7 @@ The steps, states, and formulas are in [DESIGN §3.6](../DESIGN.md#36-interactio
 * The gear owns an operations table, a status guard, a supervisor, and a sweeper.
 * Plugins keep their data consistent when a call is stopped, for example by doing the work in one transaction.
 * Plugins tolerate repeated `apply` and `remove`, because callers retry with a new request.
-* A call started just before the run deadline can overlap the next operation of its application by up to `plugin_call_timeout`; plugins tolerate it like a repeated call.
+* A call starts only when `plugin_call_timeout` + `storage_call_timeout` still fit before the run deadline. Clock skew between replicas, or a remote plugin still working after the gear drops the call, can still overlap the next operation of its application; plugins tolerate it like a repeated call.
 * An operation whose replica stops blocks its application until its run deadline.
 
 ### Confirmation
@@ -67,6 +67,7 @@ The steps, states, and formulas are in [DESIGN §3.6](../DESIGN.md#36-interactio
 * A table-driven test over the synchronous rows of the outcome table, including the 503 gate and the 202 shape.
 * A run-deadline arithmetic test for seed and uninstall.
 * An operation past its deadline ends interrupted, no call starts after it, and no replica resumes it.
+* No plugin call starts unless `plugin_call_timeout` + `storage_call_timeout` fit before the run deadline.
 * A timed-out call is dropped and dispatch proceeds.
 
 ## Pros and Cons of the Options

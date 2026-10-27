@@ -64,7 +64,7 @@ The plugin set is fixed at startup ([ADR 0001](./ADR/0001-cpt-cf-application-man
 | `cpt-cf-application-manager-fr-one-operation-per-application` | A unique index on open operations (`cpt-cf-application-manager-dbtable-operations`). |
 | `cpt-cf-application-manager-fr-ordered-dispatch` | `cpt-cf-application-manager-component-section-plugin-router`. |
 | `cpt-cf-application-manager-fr-pass-through` | `cpt-cf-application-manager-principle-pass-through`, `cpt-cf-application-manager-principle-minimal-state`. |
-| `cpt-cf-application-manager-fr-plugin-owned-semantics` | The plugin interface offers `key`, `schema`, `apply`, and `remove` only (`cpt-cf-application-manager-interface-section-plugin-api`). |
+| `cpt-cf-application-manager-fr-plugin-owned-semantics` | The plugin interface offers `schema`, `apply`, and `remove` only (`cpt-cf-application-manager-interface-section-plugin-api`). |
 | `cpt-cf-application-manager-fr-outcome-categories` | The outcome table in [§3.3](#33-api-contracts). |
 | `cpt-cf-application-manager-fr-outcome-precedence` | The outcome table in [§3.3](#33-api-contracts). |
 | `cpt-cf-application-manager-fr-response-content` | Refusal bodies and the outcome report; the Retriable column of the outcome table says what to fix, retry, or request ([§3.3](#33-api-contracts)). |
@@ -101,7 +101,7 @@ The plugin set is fixed at startup ([ADR 0001](./ADR/0001-cpt-cf-application-man
 | ADR ID | Decision Summary |
 |---|---|
 | `cpt-cf-application-manager-adr-section-plugin-fan-out` | Every section plugin takes part; plugins are discovered once at startup. |
-| `cpt-cf-application-manager-adr-registered-section-schemas` | Section schemas are registered section types read once at startup; the whole manifest is validated before dispatch. |
+| `cpt-cf-application-manager-adr-plugin-served-section-schemas` | Plugins serve live schemas, fetched on every seed; the whole manifest is validated before dispatch. |
 | `cpt-cf-application-manager-adr-async-operations` | Background operations with a bounded synchronous phase and a run window; a plugin call is stopped at its time limit. |
 | `cpt-cf-application-manager-adr-operation-history` | An append-only history table written in the transaction of the change it describes. |
 | `cpt-cf-application-manager-adr-platform-level-access` | Platform-level permission with no tenant; unrestricted records. |
@@ -197,7 +197,7 @@ The gear keeps only operation records and the operation history, and neither hol
 
 - [ ] `p2` - **ID**: `cpt-cf-application-manager-constraint-toolkit-plugin-model`
 
-The section plugin type is a GTS type, instances are listed from the types registry, and clients are looked up in ClientHub by exact GTS id ([ClientHub and plugins](../../../../docs/toolkit_unified_system/03_clienthub_and_plugins.md)).
+The section plugin type and the section base type `gts.cf.core.application_manager.section.v1~` are GTS types. Instances are listed and section types are resolved in the types registry, and clients are looked up in ClientHub by exact GTS id ([ClientHub and plugins](../../../../docs/toolkit_unified_system/03_clienthub_and_plugins.md)).
 
 **ADRs**: `cpt-cf-application-manager-adr-section-plugin-fan-out`
 
@@ -249,7 +249,7 @@ The plugin-call time limit is `plugin_call_timeout`, exactly as configured, for 
 
 ### 3.1 Domain Model
 
-**Technology**: Rust types marked `#[domain_model]`; GTS types for the section plugin, the authorization resource, and the outcome report; JSON Schema Draft 2020-12.
+**Technology**: Rust types marked `#[domain_model]`; GTS types for the section plugin, the section base type, the authorization resource, and the outcome report; JSON Schema Draft 2020-12.
 
 **Location**: `application-manager-sdk/src/models.rs`, `application-manager-sdk/src/gts.rs`, and `application-manager/src/domain/`.
 
@@ -296,7 +296,7 @@ stateDiagram-v2
     Interrupted --> [*]
 ```
 
-- **Run deadline.** Set at acceptance ([§4.2](#42-configuration)). No plugin call starts after it; a call started before it can run up to `plugin_call_timeout` past it, and can overlap the next operation of the same application.
+- **Run deadline.** Set at acceptance ([§4.2](#42-configuration)). A plugin call starts only when `plugin_call_timeout` + `storage_call_timeout` still fit before it, so the call and its outcome write end by the deadline.
 - **Status guard.** Writes match only an open record before its deadline; the interruption step matches only one past it. The first final write wins.
 - **Interruption step.** One transaction sets interrupted, keeps the section outcomes so far, and inserts the finished event. The sweeper, the operation read, and the acceptance run it on an expired open operation, which covers a lost task and a failed final transaction.
 - **Supervisor completion.** When a request task fails after acceptance, the operation goes Running, then Completed as internal failure, with `not_dispatched` for plugins not yet called.
@@ -347,8 +347,7 @@ graph LR
     GUARD --> SP[Section plugins]
     REP --> DB[(Platform database)]
     START[Startup and registration] -->|"plugin set"| SPR
-    START -->|"key calls"| GUARD
-    START -->|"lists instances"| TR[Types registry]
+    START -->|"lists instances, resolves section types"| TR[Types registry]
     START -->|"starts and stops"| SWP
     REST -->|"readiness and stopping flag"| START
 ```
@@ -455,7 +454,7 @@ graph LR
 
 **Why**: Configuration and plugin-set problems must stop the gear at deploy time.
 
-**Scope**: In `init` it validates settings and registers the section plugin GTS type. A hand-implemented `start` makes each check of `cpt-cf-application-manager-fr-startup-checks` once, with `key` calls through the guard, then publishes the startup result; a failure exits the host with a reason from [§4.1](#41-observability). An empty plugin list gives an empty key set.
+**Scope**: In `init` it validates settings and registers the section plugin GTS type and the section base type. A hand-implemented `start` makes each check of `cpt-cf-application-manager-fr-startup-checks` once: it reads each instance's `priority` and `section_type`, resolves the section type, and derives the key, with no plugin call. It then publishes the startup result; a failure exits the host with a reason from [§4.1](#41-observability). An empty plugin list gives an empty key set.
 
 **Boundaries**: It never runs again after startup and never selects plugin instances by vendor.
 
@@ -526,14 +525,22 @@ Storage is consulted only for a permitted caller. Sections are checked only insi
 
 | Operation | Called | Receives | Returns |
 |---|---|---|---|
-| `key` | Once, at `start` | Nothing | One key: lower-case letters, digits, `-`, `_`, `.` |
 | `schema` | Each seed operation and schema read | Caller identity | A self-contained Draft 2020-12 schema and its schema version |
 | `apply` | Seed operation, priority order | Caller identity, operation id, envelope, its section | Success or an error kind |
 | `remove` | Uninstall operation, priority order | Caller identity, operation id, application id | Success or an error kind |
 
-Error kinds: `Rejected` (detail and optional JSON Pointer location) gives `rejected`; `NotPermitted` (detail) gives `not_permitted`; `Internal` (logged only) gives `internal_failure`. A timeout gives `timed_out` and dispatch continues; a `key` timeout fails startup.
+Error kinds: `Rejected` (detail and optional JSON Pointer location) gives `rejected`; `NotPermitted` (detail) gives `not_permitted`; `Internal` (logged only) gives `internal_failure`. A timeout gives `timed_out` and dispatch continues.
 
 For `schema`, `NotPermitted` is plugin-level not permitted; any other error or a transport error gives the unavailable reason `unreachable`; then `timed_out`, `unusable`, and `not_sent` as named. A schema read follows the seed precedence, so unavailable (503) wins over not permitted (403).
+
+**Registration.** Each plugin registers a derived type of `gts.cf.core.application_manager.section.v1~` and one instance of the section plugin type:
+
+| Field | Holds |
+|---|---|
+| `priority` | The dispatch and removal priority |
+| `properties.section_type` | An `x-gts-ref` to the exact version of the plugin's derived section type |
+
+The section type must be derived directly from the base type, as one segment `<vendor>.<package>.<namespace>.<type>.v<major>[.<minor>]`; any other shape fails startup with `invalid_section_type`. The section key is that segment without its version: `gts.cf.core.application_manager.section.v1~acme.iam.roles.v1.2` gives `acme.iam.roles`. Two instances whose section types differ only in version share a key and fail startup with `duplicate_section_key`. The derived section type carries no content rules; the section schema comes from `schema`.
 
 Additive changes within `v1` are compatible; any other change is a new GTS type version.
 
@@ -541,10 +548,10 @@ Additive changes within `v1` are compatible; any other change is a new GTS type 
 
 | Dependency Gear | Interface Used | Purpose |
 |---|---|---|
-| types-registry | `TypesRegistryClient` | Register the plugin GTS type in `init`; list instances once at `start` |
+| types-registry | `TypesRegistryClient` | Register the plugin GTS type and the section base type in `init`; list instances and resolve section types once at `start` |
 | authz-resolver | PolicyEnforcer | Decisions for the five actions |
 | api-gateway | Platform REST host | Authentication, `SecurityContext`, request protection, readiness, routing |
-| Section plugin gears | `cpt-cf-application-manager-interface-section-plugin-api` | Keys, schemas, `apply`, `remove` |
+| Section plugin gears | `cpt-cf-application-manager-interface-section-plugin-api` | Schemas, `apply`, `remove` |
 
 The gear declares `deps = [types_registry, authz_resolver]` and the capabilities `db`, `rest`, and `stateful`, and never depends on plugin crates. Plugins receive the caller identity without a bearer token.
 
@@ -561,7 +568,7 @@ The gear declares `deps = [types_registry, authz_resolver]` and the capabilities
 
 **ID**: `cpt-cf-application-manager-seq-startup`
 
-At `start`, the startup component lists plugin instances once, resolves their clients, reads every key, starts the sweeper, and publishes the startup result (`cpt-cf-application-manager-component-startup-registration`).
+At `start`, the startup component lists plugin instances once, reads their priorities and section types, resolves the section types and the clients, derives every key, starts the sweeper, and publishes the startup result (`cpt-cf-application-manager-component-startup-registration`).
 
 #### Synchronous Checks and Acceptance
 
@@ -636,7 +643,7 @@ sequenceDiagram
         alt invalid
             O ->> R: final transaction: report (rank 7), finished event
         else valid
-            loop each plugin in priority order, before the run deadline
+            loop each plugin in priority order, while a full call fits before the run deadline
                 O ->> P: apply(identity, operation id, envelope, section)
                 O ->> R: record the section outcome
             end
@@ -750,7 +757,7 @@ Replicas share only the database, and each runs its own sweeper under the status
 
 **Signals** for operator thresholds: history events not recorded, rising interruptions, repeated timeouts or cap refusals per key, an unusable schema, an unavailable dependency, failing sweeps, request tasks at the cap, a run window margin warning, and a startup failure.
 
-**Startup failure reasons**: `types_registry_unreachable`, `priority_unreadable`, `plugin_client_unresolved`, `section_key_unavailable`, `invalid_section_key`, `duplicate_section_key`, `equal_priority`, `invalid_setting`.
+**Startup failure reasons**: `types_registry_unreachable`, `plugin_properties_unreadable`, `section_type_unresolved`, `invalid_section_type`, `plugin_client_unresolved`, `duplicate_section_key`, `equal_priority`, `invalid_setting`.
 
 **Traces**: a span per synchronous phase linked to a span per operation, with child spans for plugin calls and guarded writes.
 
