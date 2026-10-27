@@ -198,6 +198,25 @@ async fn init_then_serve_bootstraps_signals_ready_and_stops_on_cancel() {
     }
     let sample = cell.load().expect("sample");
     assert_eq!(sample.cap_zero, 0);
+
+    // The third election: the lease sweeper leads too, and its first cycle
+    // publishes the (empty) unreclaimed backlog.
+    let backlog = gear.lease_backlog().expect("backlog cell after init");
+    while backlog.load().is_none() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the lease sweeper never published a backlog sample"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(
+        backlog
+            .load()
+            .expect("sample")
+            .iter()
+            .all(|(_, unreclaimed)| *unreclaimed == 0),
+        "nothing has expired, so every metric reports zero"
+    );
     assert_eq!(sample.cap_unbounded, 0);
 
     // One REST round trip through the gear's own route registration.

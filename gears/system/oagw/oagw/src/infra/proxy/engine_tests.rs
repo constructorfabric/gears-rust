@@ -59,10 +59,68 @@ fn ssrf_filter_reports_reason() {
     let on = SsrfFilter(Arc::new(
         SsrfGuard::from_config(&Default::default()).unwrap(),
     ));
-    assert!(on.check(&addr(80)).is_err());
-    assert!(on.check(&"93.184.216.34:443".parse().unwrap()).is_ok());
+    assert!(on.check("example.com", &addr(80)).is_err());
+    assert!(
+        on.check("example.com", &"93.184.216.34:443".parse().unwrap())
+            .is_ok()
+    );
     let off = SsrfFilter(Arc::new(SsrfGuard::disabled()));
-    assert!(off.check(&addr(80)).is_ok());
+    assert!(off.check("example.com", &addr(80)).is_ok());
+}
+
+fn exempting(host: &str) -> SsrfGuard {
+    SsrfGuard::from_config(&crate::domain::ssrf::SsrfPolicy {
+        allow_hostnames: vec![host.into()],
+        ..Default::default()
+    })
+    .unwrap()
+}
+
+/// The pool's filter honours an explicit hostname exemption for a private
+/// address and still refuses the same address for any other name.
+#[test]
+fn ssrf_filter_honours_a_hostname_exemption() {
+    let filter = SsrfFilter(Arc::new(exempting("trusted.internal")));
+    let private: SocketAddr = "10.0.0.7:9999".parse().unwrap();
+    assert!(filter.check("trusted.internal", &private).is_ok());
+    assert!(filter.check("other.internal", &private).is_err());
+}
+
+/// The fallback honours an explicit hostname exemption and still refuses the
+/// same address for any other name.
+#[test]
+fn fallback_honours_a_hostname_exemption() {
+    let guard = exempting("trusted.internal");
+    let private: SocketAddr = "10.0.0.7:9999".parse().unwrap();
+    assert_eq!(
+        first_permitted_addr(&guard, "trusted.internal", [private]),
+        Ok(private)
+    );
+    assert!(matches!(
+        first_permitted_addr(&guard, "other.internal", [private]),
+        Err(NoPermittedAddr::Refused(_))
+    ));
+}
+
+/// The fallback skips a refused address and takes the next permitted one;
+/// with nothing resolved it says so rather than blaming the policy.
+#[test]
+fn fallback_takes_the_first_permitted_address() {
+    let guard = exempting("trusted.internal");
+    let metadata: SocketAddr = "169.254.169.254:80".parse().unwrap();
+    let private: SocketAddr = "10.0.0.7:80".parse().unwrap();
+    assert_eq!(
+        first_permitted_addr(&guard, "trusted.internal", [metadata, private]),
+        Ok(private)
+    );
+    assert_eq!(
+        first_permitted_addr(&guard, "trusted.internal", []),
+        Err(NoPermittedAddr::NoneResolved)
+    );
+    assert!(matches!(
+        first_permitted_addr(&guard, "trusted.internal", [metadata]),
+        Err(NoPermittedAddr::Refused(reason)) if reason.contains("allow_hostnames")
+    ));
 }
 
 #[tokio::test]

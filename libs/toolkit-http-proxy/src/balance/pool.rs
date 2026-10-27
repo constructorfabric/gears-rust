@@ -263,7 +263,7 @@ impl<K: Clone + Send + Sync + 'static> BackendPool<K> {
                 }
             };
             for addr in addrs {
-                if let Err(reason) = self.opts.filter.check(&addr) {
+                if let Err(reason) = self.opts.filter.check(&seed.host, &addr) {
                     tracing::warn!(host = %seed.host, resolved = %addr, reason, "resolved address blocked by policy");
                     continue;
                 }

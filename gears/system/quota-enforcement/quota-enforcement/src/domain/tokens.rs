@@ -83,3 +83,9 @@ pub const IDEMPOTENCY_KEY_REQUIRED: &str = "IDEMPOTENCY_KEY_REQUIRED";
 pub const UNKNOWN_OPERATION: &str = "UNKNOWN_OPERATION";
 /// No Quota exists under the identifier the caller named.
 pub const UNKNOWN_QUOTA: &str = "UNKNOWN_QUOTA";
+
+// --- lease operations ---
+
+/// A lease `ttl` is missing or outside the configured `[min, max]` window. It
+/// is never clamped: the holder is entitled to exactly the TTL it asked for.
+pub const TTL_OUT_OF_BOUNDS: &str = "TTL_OUT_OF_BOUNDS";

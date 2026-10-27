@@ -54,7 +54,7 @@ impl Resolver for TableResolver {
 struct BlockLoopback;
 
 impl AddressFilter for BlockLoopback {
-    fn check<'a>(&'a self, addr: &SocketAddr) -> Result<(), &'a str> {
+    fn check<'a>(&'a self, _host: &str, addr: &SocketAddr) -> Result<(), &'a str> {
         if addr.ip().is_loopback() {
             Err("loopback")
         } else {

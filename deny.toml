@@ -40,7 +40,7 @@ yanked = "warn"
 # List of advisory IDs to ignore (RUSTSEC-YYYY-XXXX, etc.)
 ignore = [
   # "RUSTSEC-0000-0000",
-  "RUSTSEC-2023-0071", # Marvin Attack timing sidechannel in rsa 0.9 — dev-only dep of rustls-corecrypto-provider; used solely for RSA-PSS *verification* (public-key op, no private key involved) in rsa_pss_apple_salt_length_matches_rfc8017 test; no safe upgrade available; advisory itself permits "local use on a non-compromised computer"
+  "RUSTSEC-2023-0071", # Marvin Attack timing sidechannel in rsa 0.9 — dev-only dep of rustls-corecrypto-provider; used solely for RSA-PSS *verification* (public-key op, no private key involved) in rsa_pss_apple_salt_length_matches_rfc8017 test; also a dev-only dep of cf-gears-firebase-authn-plugin, whose tests sign fixture tokens with a throwaway key generated per run (no secret is at stake, no production code links it); no safe upgrade available; advisory itself permits "local use on a non-compromised computer"
   # RUSTSEC-2026-0173 (proc-macro-error2 unmaintained) was removed: the crate is no
   # longer in the dependency graph at all. Our own proc-macro crates emit diagnostics
   # via syn::Error -> compile_error!, and sea-bae 0.2.2 dropped proc-macro-error2.

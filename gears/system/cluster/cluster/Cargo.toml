@@ -72,6 +72,8 @@ tokio-stream = { workspace = true }
 # credential off the metadata, `toolkit-security` validates it into a
 # `PlatformSecurityContext` (§4.6).
 toolkit-transport-grpc = { workspace = true }
+# Referenced by the code `#[toolkit::provides]` generates for the four contracts.
+toolkit-contract = { workspace = true }
 toolkit-security = { workspace = true }
 # `bootstrap` is what carries `toolkit::bootstrap::oop::run_oop_with_options` -
 # the whole of `src/main.rs`. The feature is unconditional because the `[[bin]]`

@@ -17,8 +17,9 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use quota_enforcement_sdk::{
-    ActiveQuotaCounts, DeactivateOutcome, MetricId, NotificationEvent, PageRequest, PageResult,
-    ProjectionBinding, Quota, QuotaDraft, QuotaFilter, QuotaId, QuotaPatch, QuotaType, TenantId,
+    ActiveQuotaCounts, DeactivateOutcome, EventId, LeaseToken, MetricId, NotificationEvent,
+    NotificationEventKind, NotificationScope, PageRequest, PageResult, ProjectionBinding, Quota,
+    QuotaDraft, QuotaFilter, QuotaId, QuotaPatch, QuotaType, TenantId,
 };
 use time::OffsetDateTime;
 use toolkit_db::secure::{DBRunner, ScopeError, validate_tenant_in_scope};
@@ -28,15 +29,19 @@ use uuid::Uuid;
 
 use crate::domain::ports::{Actor, QuotaStore, StoreError};
 use crate::infra::outbox::{EnqueueError, NotificationEnqueuer};
+use crate::infra::storage::consumption_store::{TxError as CounterTxError, credit_counter};
 use crate::infra::storage::cursor::{self, MAX_FILTER_IDS};
 use crate::infra::storage::entity::quota;
+use crate::infra::storage::lease_store::counter_value_of;
 use crate::infra::storage::quota_mapping::{
     self, MappingError, QuotaUpdate, STATUS_ACTIVE, status_name,
 };
 use crate::infra::storage::repo::operation_log_repo::{
     self, Entry, OP_QUOTA_CREATE, OP_QUOTA_DEACTIVATE, OP_QUOTA_UPDATE,
 };
-use crate::infra::storage::repo::{allocation_counter_repo, consumption_counter_repo, quota_repo};
+use crate::infra::storage::repo::{
+    allocation_counter_repo, consumption_counter_repo, lease_repo, quota_repo,
+};
 
 const LOG_TARGET: &str = "qe.storage";
 
@@ -121,6 +126,17 @@ fn corrupt(operation: &'static str, err: &dyn std::fmt::Display) -> StoreError {
     }
 }
 
+/// A failure of the shared counter helpers, in this store's terms.
+fn counter_failure(operation: &'static str, err: CounterTxError) -> TxError {
+    match err {
+        CounterTxError::Db(err) => TxError::Db(err),
+        CounterTxError::Scope(err) => TxError::Scope(err),
+        CounterTxError::Map(err) => TxError::Map(err),
+        CounterTxError::Enqueue(err) => TxError::Enqueue(err),
+        other => TxError::Store(corrupt(operation, &other)),
+    }
+}
+
 /// The events of a creation with the assigned id filled in.
 fn with_quota_id(events: &[NotificationEvent], id: QuotaId) -> Vec<NotificationEvent> {
     events
@@ -176,9 +192,14 @@ impl SqlQuotaStore {
         scope: &AccessScope,
         quota_id: QuotaId,
     ) -> Result<quota::Model, TxError> {
-        let row = quota_repo::find_by_id(runner, scope, quota_id.as_uuid(), true)
-            .await?
-            .ok_or(StoreError::QuotaNotFound { id: quota_id })?;
+        let row = quota_repo::find_by_id(
+            runner,
+            scope,
+            quota_id.as_uuid(),
+            Some(lease_repo::RowWait::Wait),
+        )
+        .await?
+        .ok_or(StoreError::QuotaNotFound { id: quota_id })?;
         if row.status != STATUS_ACTIVE {
             return Err(StoreError::QuotaDeactivated { id: quota_id }.into());
         }
@@ -198,29 +219,35 @@ impl SqlQuotaStore {
         row: &quota::Model,
         now: OffsetDateTime,
     ) -> Result<u64, TxError> {
-        let negative = |column: &'static str, value: i64| -> TxError {
-            MappingError::Column {
-                column,
-                detail: format!("negative counter amount {value}"),
-            }
-            .into()
-        };
-        if row.quota_type == QuotaType::Allocation.as_gts_id() {
-            let in_flight =
-                allocation_counter_repo::read_in_flight_for_update(runner, scope, row.id)
-                    .await?
-                    .unwrap_or(0);
-            return u64::try_from(in_flight).map_err(|_| negative("in_flight", in_flight));
-        }
-        let current = consumption_counter_repo::find_latest_for_update(runner, scope, row.id)
+        const OPERATION: &str = "update quota";
+        // Returning expired holds first keeps them from blocking a legitimate reduction (I4).
+        let period_id = if row.quota_type == QuotaType::Allocation.as_gts_id() {
+            None
+        } else {
+            let current = consumption_counter_repo::find_latest_for_update(
+                runner,
+                scope,
+                row.id,
+                lease_repo::RowWait::Wait,
+            )
             .await?
             .filter(|period| period.period_start <= now && now < period.period_end);
-        match current {
-            None => Ok(0),
-            Some(period) => {
-                u64::try_from(period.consumed).map_err(|_| negative("consumed", period.consumed))
-            }
-        }
+            let Some(period) = current else {
+                return Ok(0);
+            };
+            Some(period.period_id)
+        };
+        credit_counter(
+            runner,
+            scope,
+            row.id,
+            period_id,
+            0,
+            now,
+            lease_repo::RowWait::Wait,
+        )
+        .await
+        .map_err(|err| counter_failure(OPERATION, err))
     }
 
     /// Invariants I6 and I14 on the merged row.
@@ -245,6 +272,10 @@ impl SqlQuotaStore {
 }
 
 #[async_trait]
+// @cpt-flow:cpt-cf-quota-enforcement-flow-quota-deactivate:p1
+// @cpt-state:cpt-cf-quota-enforcement-state-quota-lifecycle:p1
+// @cpt-state:cpt-cf-quota-enforcement-state-lease:p1
+// @cpt-dod:cpt-cf-quota-enforcement-dod-deactivation-cascade:p1
 impl QuotaStore for SqlQuotaStore {
     async fn create_quota(
         &self,
@@ -262,6 +293,7 @@ impl QuotaStore for SqlQuotaStore {
             quota_mapping::draft_to_row(id, &draft, now).map_err(|e| lift(OPERATION, e.into()))?;
         let events = with_quota_id(events, id);
         let tenant_id = draft.tenant_id.as_uuid();
+        let metric = draft.metric.as_str().to_owned();
         let with_counter = draft.quota_type == QuotaType::Allocation;
         let scope = scope.clone();
         let actor = actor.clone();
@@ -270,6 +302,10 @@ impl QuotaStore for SqlQuotaStore {
             .transaction_ref_mapped(move |tx| {
                 Box::pin(async move {
                     quota_repo::insert(tx, &scope, row).await?;
+                    // The pair's capacity row exists before its first lease, so
+                    // an acquisition only ever locks it and never meets another
+                    // transaction's uncommitted insert (I8).
+                    lease_repo::ensure_capacity_row(tx, &scope, tenant_id, &metric, now).await?;
                     if with_counter {
                         allocation_counter_repo::insert_initial(
                             tx,
@@ -329,6 +365,7 @@ impl QuotaStore for SqlQuotaStore {
                     let now = clock();
                     let consumed = Self::consumed_under_lock(tx, &scope, &row, now).await?;
                     Self::check_merged(&row, &update, consumed)?;
+                    // @cpt-begin:cpt-cf-quota-enforcement-state-quota-lifecycle:p1:inst-qst-update
                     let applied = quota_repo::apply_update(
                         tx,
                         &scope,
@@ -338,6 +375,7 @@ impl QuotaStore for SqlQuotaStore {
                         now,
                     )
                     .await?;
+                    // @cpt-end:cpt-cf-quota-enforcement-state-quota-lifecycle:p1:inst-qst-update
                     if !applied {
                         return Err(StoreError::Corrupt {
                             operation: OPERATION,
@@ -345,7 +383,7 @@ impl QuotaStore for SqlQuotaStore {
                         }
                         .into());
                     }
-                    let committed = quota_repo::find_by_id(tx, &scope, row.id, false)
+                    let committed = quota_repo::find_by_id(tx, &scope, row.id, None)
                         .await?
                         .ok_or_else(|| StoreError::Corrupt {
                             operation: OPERATION,
@@ -389,10 +427,13 @@ impl QuotaStore for SqlQuotaStore {
         self.db
             .transaction_ref_mapped(move |tx| {
                 Box::pin(async move {
+                    // @cpt-begin:cpt-cf-quota-enforcement-flow-quota-deactivate:p1:inst-qde-cascade
                     let row = Self::lock_active_row(tx, &scope, quota_id).await?;
+                    // @cpt-begin:cpt-cf-quota-enforcement-state-quota-lifecycle:p1:inst-qst-deactivate
                     let flipped =
                         quota_repo::mark_deactivated(tx, &scope, row.id, row.record_version, now)
                             .await?;
+                    // @cpt-end:cpt-cf-quota-enforcement-state-quota-lifecycle:p1:inst-qst-deactivate
                     if !flipped {
                         return Err(StoreError::Corrupt {
                             operation: OPERATION,
@@ -400,10 +441,120 @@ impl QuotaStore for SqlQuotaStore {
                         }
                         .into());
                     }
-                    // 2.6: lock the Quota's active leases here, resolve them,
-                    // return their held capacity, and append one
-                    // `lease-resolved-by-deactivation` event per lease.
-                    let outcome = DeactivateOutcome::default();
+                    // Rank 3: the leases still holding this Quota. Expired
+                    // ones are already released (I4) and belong to the sweeper,
+                    // so the cascade neither resolves nor re-credits them.
+                    let holders = lease_repo::active_on_quota_for_update(
+                        tx,
+                        &scope,
+                        row.id,
+                        now,
+                        lease_repo::RowWait::Wait,
+                    )
+                    .await?;
+                    let mut resolved = Vec::with_capacity(holders.len());
+                    let mut lease_events = Vec::new();
+                    for lease in holders {
+                        // Rank 4, then 5 and 5b: every hold of this lease, on
+                        // this Quota and on any other it spans, ascending.
+                        let capacity = lease_repo::lock_capacity_row(
+                            tx,
+                            &scope,
+                            lease.tenant_id,
+                            &lease.metric,
+                            lease_repo::RowWait::Wait,
+                        )
+                        .await?;
+                        let holds = lease_repo::holds_of(tx, &scope, lease.token).await?;
+                        let mut released = 0_u64;
+                        for hold in &holds {
+                            let amount = u64::try_from(hold.held_amount).unwrap_or(0);
+                            // Rank 5 before 5b: lock the counter, then stamp its hold.
+                            counter_value_of(
+                                tx,
+                                &scope,
+                                hold.quota_id,
+                                hold.period_id,
+                                lease_repo::RowWait::Wait,
+                            )
+                            .await
+                            .map_err(|err| counter_failure(OPERATION, err))?;
+                            if lease_repo::mark_hold_returned(
+                                tx,
+                                &scope,
+                                lease.token,
+                                hold.quota_id,
+                                now,
+                            )
+                            .await?
+                            {
+                                if amount > 0 {
+                                    credit_counter(
+                                        tx,
+                                        &scope,
+                                        hold.quota_id,
+                                        hold.period_id,
+                                        amount,
+                                        now,
+                                        lease_repo::RowWait::Wait,
+                                    )
+                                    .await
+                                    .map_err(|err| counter_failure(OPERATION, err))?;
+                                }
+                                released = released.saturating_add(amount);
+                            }
+                        }
+                        // @cpt-begin:cpt-cf-quota-enforcement-state-lease:p1:inst-lst-deactivate
+                        if !lease_repo::mark_state(
+                            tx,
+                            &scope,
+                            lease.token,
+                            lease_repo::STATE_RESOLVED_BY_DEACTIVATION,
+                            now,
+                        )
+                        .await?
+                        {
+                            continue;
+                        }
+                        // @cpt-end:cpt-cf-quota-enforcement-state-lease:p1:inst-lst-deactivate
+                        // Diagnostic only, so a missing row costs the count, not the
+                        // transition.
+                        if let Some(capacity) = &capacity {
+                            lease_repo::bump_active_count(
+                                tx,
+                                &scope,
+                                lease.tenant_id,
+                                &lease.metric,
+                                capacity.active_count,
+                                -1,
+                                now,
+                            )
+                            .await?;
+                        }
+                        resolved.push(LeaseToken::from(lease.token));
+                        // Only the transaction knows which leases it resolved,
+                        // so it builds their events itself (I11).
+                        lease_events.push(NotificationEvent {
+                            event_id: EventId::generate(),
+                            kind: NotificationEventKind::LeaseResolvedByDeactivation,
+                            scope: NotificationScope::Tenant {
+                                tenant_id: TenantId::from(lease.tenant_id),
+                            },
+                            quota_id: Some(QuotaId::from(row.id)),
+                            policy_id: None,
+                            subject: None,
+                            payload: serde_json::json!({
+                                "lease_token": LeaseToken::from(lease.token),
+                                "held_amount": released,
+                                "quota_id": QuotaId::from(row.id),
+                            }),
+                            emitted_at: now,
+                        });
+                    }
+                    // @cpt-end:cpt-cf-quota-enforcement-flow-quota-deactivate:p1:inst-qde-cascade
+                    let outcome = DeactivateOutcome {
+                        resolved_leases: resolved,
+                    };
                     operation_log_repo::append(
                         tx,
                         &scope,
@@ -418,8 +569,15 @@ impl QuotaStore for SqlQuotaStore {
                         },
                     )
                     .await?;
+                    // @cpt-begin:cpt-cf-quota-enforcement-flow-quota-deactivate:p1:inst-qde-events
                     enqueuer.enqueue_all(tx, &events).await?;
+                    if !lease_events.is_empty() {
+                        enqueuer.enqueue_all(tx, &lease_events).await?;
+                    }
+                    // @cpt-end:cpt-cf-quota-enforcement-flow-quota-deactivate:p1:inst-qde-events
+                    // @cpt-begin:cpt-cf-quota-enforcement-flow-quota-deactivate:p1:inst-qde-atomic
                     Ok::<DeactivateOutcome, TxError>(outcome)
+                    // @cpt-end:cpt-cf-quota-enforcement-flow-quota-deactivate:p1:inst-qde-atomic
                 })
             })
             .await

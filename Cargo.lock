@@ -1570,6 +1570,7 @@ dependencies = [
  "cf-api-contracts-sdk",
  "cf-gears-authn-resolver",
  "cf-gears-cluster-sdk",
+ "cf-gears-standalone-cluster-plugin",
  "cf-gears-static-authn-plugin",
  "cf-gears-toolkit",
  "cf-gears-toolkit-canonical-errors",
@@ -2509,6 +2510,7 @@ dependencies = [
  "cf-gears-test-containers",
  "cf-gears-toolkit",
  "cf-gears-toolkit-canonical-errors",
+ "cf-gears-toolkit-contract",
  "cf-gears-toolkit-security",
  "cf-gears-toolkit-transport-grpc",
  "cf-gears-toolkit-utils",
@@ -2614,6 +2616,7 @@ dependencies = [
  "inventory",
  "jsonschema 0.40.2",
  "proptest",
+ "reqwest",
  "sea-orm",
  "sea-orm-migration",
  "serde",
@@ -3033,6 +3036,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "cf-gears-firebase-authn-plugin"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "base64 0.22.1",
+ "cf-gears-authn-resolver-sdk",
+ "cf-gears-toolkit",
+ "cf-gears-toolkit-gts",
+ "cf-gears-toolkit-http",
+ "cf-gears-toolkit-macros",
+ "cf-gears-toolkit-security",
+ "cf-gears-types-registry",
+ "cf-gears-types-registry-sdk",
+ "chrono",
+ "http",
+ "inventory",
+ "jsonwebtoken",
+ "rsa",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "cf-gears-flight-control"
 version = "0.1.0"
 dependencies = [
@@ -3268,6 +3300,7 @@ dependencies = [
  "http",
  "inventory",
  "parking_lot",
+ "rustix",
  "secrecy",
  "serde",
  "serde_json",
@@ -4179,6 +4212,7 @@ dependencies = [
  "inventory",
  "secrecy",
  "serde",
+ "temp-env",
  "tokio",
  "tracing",
  "uuid",
@@ -6043,6 +6077,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e7c1832837b905bbfb5101e07cc24c8deddf52f93225eee6ead5f4d63d53ddcb"
 dependencies = [
  "const-oid 0.9.6",
+ "pem-rfc7468",
  "zeroize",
 ]
 
@@ -9813,6 +9848,15 @@ checksum = "d354a98a3d1251555de99e8fdd8afda05573c31b82f59063a7b0a29b5527f120"
 dependencies = [
  "base64 0.23.1",
  "serde_core",
+]
+
+[[package]]
+name = "pem-rfc7468"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "88b39c9bfcfc231068454382784bb460aae594343fb030d46e9f50a645418412"
+dependencies = [
+ "base64ct",
 ]
 
 [[package]]

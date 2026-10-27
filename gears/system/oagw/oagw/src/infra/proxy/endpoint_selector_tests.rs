@@ -212,6 +212,36 @@ async fn selector_ssrf_blocks_localhost_hostname() {
     assert!(matches!(err, SelectionError::NoBackendsResolved));
 }
 
+/// A hostname exemption does not reach loopback; `allow_cidrs` does.
+#[tokio::test]
+async fn selector_exemption_needs_allow_cidrs_for_loopback() {
+    let guarded = |policy: crate::domain::ssrf::SsrfPolicy| {
+        PoolEndpointSelector::new(Arc::new(SsrfGuard::from_config(&policy).unwrap()))
+    };
+    let endpoints = vec![ep("localhost", 9999, Scheme::Https)];
+
+    let selector = guarded(crate::domain::ssrf::SsrfPolicy {
+        allow_hostnames: vec!["localhost".into()],
+        ..Default::default()
+    });
+    let err = selector
+        .select(Uuid::new_v4(), &endpoints)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, SelectionError::NoBackendsResolved),
+        "the exemption alone does not admit loopback"
+    );
+
+    let selector = guarded(crate::domain::ssrf::SsrfPolicy {
+        allow_hostnames: vec!["localhost".into()],
+        allow_cidrs: vec!["127.0.0.0/8".into(), "::1/128".into()],
+        ..Default::default()
+    });
+    let selected = selector.select(Uuid::new_v4(), &endpoints).await.unwrap();
+    assert_eq!(selected.endpoint.host, "localhost");
+}
+
 #[tokio::test]
 async fn selector_ssrf_off_allows_loopback() {
     let selector = PoolEndpointSelector::new(ssrf_off());

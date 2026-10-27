@@ -21,12 +21,13 @@ pub use resolve::{DnsResolver, Resolver};
 
 /// Decides whether a resolved address may be connected to (SSRF policy).
 pub trait AddressFilter: Send + Sync {
-    /// `Err(reason)` blocks the address.
+    /// `Err(reason)` blocks `addr`, which `host` resolved to. The host lets a
+    /// policy exempt a name it trusts.
     ///
     /// # Errors
     ///
     /// Returns the reason when the address must not be used.
-    fn check<'a>(&'a self, addr: &SocketAddr) -> Result<(), &'a str>;
+    fn check<'a>(&'a self, host: &str, addr: &SocketAddr) -> Result<(), &'a str>;
 }
 
 /// Filter that allows every address.
@@ -34,7 +35,7 @@ pub trait AddressFilter: Send + Sync {
 pub struct AllowAll;
 
 impl AddressFilter for AllowAll {
-    fn check<'a>(&'a self, _addr: &SocketAddr) -> Result<(), &'a str> {
+    fn check<'a>(&'a self, _host: &str, _addr: &SocketAddr) -> Result<(), &'a str> {
         Ok(())
     }
 }

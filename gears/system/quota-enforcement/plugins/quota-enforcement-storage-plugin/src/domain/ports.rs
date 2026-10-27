@@ -6,11 +6,11 @@ use std::collections::HashSet;
 use async_trait::async_trait;
 use quota_enforcement_sdk::{
     ActiveQuotaCounts, ApplicableQuotas, AppliedMutation, ConfigDefaults, DeactivateOutcome,
-    EvaluatedDebit, EvaluatedMutation, IdempotencyRecord, IdempotencyScope, IdempotencyWrite,
-    NotificationEvent, PageRequest, PageResult, PartialIdempotencyWrite, PolicyDraft, PolicyId,
-    PolicyScope, PolicyUpdate, PolicyVersion, PolicyVersionMeta, ProjectionBinding, Quota,
-    QuotaDraft, QuotaFilter, QuotaId, QuotaPatch, QuotaSnapshot, RollbackTarget, StorageError,
-    TransitionOutcome,
+    EvaluatedDebit, EvaluatedLease, EvaluatedMutation, ExpiredLease, IdempotencyRecord,
+    IdempotencyScope, IdempotencyWrite, LeaseToken, MetricId, NotificationEvent, PageRequest,
+    PageResult, PartialIdempotencyWrite, PolicyDraft, PolicyId, PolicyScope, PolicyUpdate,
+    PolicyVersion, PolicyVersionMeta, ProjectionBinding, Quota, QuotaDraft, QuotaFilter, QuotaId,
+    QuotaPatch, QuotaSnapshot, RollbackTarget, StorageError, TransitionOutcome,
 };
 use time::OffsetDateTime;
 use toolkit_macros::domain_model;
@@ -405,4 +405,77 @@ pub trait PolicyStore: Send + Sync {
         policy_id: &PolicyId,
         page: PageRequest,
     ) -> Result<PageResult<PolicyVersionMeta>, StorageError>;
+}
+
+/// The lease primitives: the two-phase hold, its settlements, and the
+/// reclamation of the holds that outlived their TTL.
+///
+/// Separate from [`ConsumptionStore`] because these are a different contract
+/// group, and implemented by the same adapter because they settle against the
+/// same counters and idempotency records.
+#[async_trait]
+pub trait LeaseStore: Send + Sync {
+    /// Evaluate the policy under the Quota locks and hold the resulting plan.
+    ///
+    /// # Errors
+    ///
+    /// The contract's variants for `acquire_lease`.
+    async fn acquire_lease(
+        &self,
+        ctx: &SecurityContext,
+        scope: &AccessScope,
+        mutation: &EvaluatedMutation<'_>,
+        ttl: std::time::Duration,
+    ) -> Result<TransitionOutcome<EvaluatedLease>, StorageError>;
+
+    /// Convert an active lease into a debit for what was used, returning the
+    /// rest to the acquisition period.
+    ///
+    /// # Errors
+    ///
+    /// The contract's variants for `commit_lease`.
+    async fn commit_lease(
+        &self,
+        ctx: &SecurityContext,
+        scope: &AccessScope,
+        token: LeaseToken,
+        actual_amount: Option<u64>,
+        idempotency: &PartialIdempotencyWrite,
+        events: &[NotificationEvent],
+    ) -> Result<TransitionOutcome<AppliedMutation>, StorageError>;
+
+    /// Return an active lease's full held capacity, committing no debit.
+    ///
+    /// # Errors
+    ///
+    /// The contract's variants for `release_lease`.
+    async fn release_lease(
+        &self,
+        ctx: &SecurityContext,
+        scope: &AccessScope,
+        token: LeaseToken,
+        idempotency: &PartialIdempotencyWrite,
+        events: &[NotificationEvent],
+    ) -> Result<TransitionOutcome<AppliedMutation>, StorageError>;
+
+    /// Transition expired leases and give back whatever they still hold.
+    ///
+    /// # Errors
+    ///
+    /// `Unavailable` when the backend cannot answer.
+    async fn reclaim_expired_leases(
+        &self,
+        batch_size: u32,
+        before: OffsetDateTime,
+    ) -> Result<Vec<ExpiredLease>, StorageError>;
+
+    /// Expired leases nobody has reclaimed, by metric, behind the gauge.
+    ///
+    /// # Errors
+    ///
+    /// `Unavailable` when the backend cannot answer.
+    async fn count_expired_unreclaimed_leases(
+        &self,
+        before: OffsetDateTime,
+    ) -> Result<Vec<(MetricId, u64)>, StorageError>;
 }

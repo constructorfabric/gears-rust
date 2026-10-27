@@ -37,13 +37,48 @@ pub(crate) struct SsrfFilter(
 );
 
 impl AddressFilter for SsrfFilter {
-    fn check<'a>(&'a self, addr: &SocketAddr) -> Result<(), &'a str> {
-        if self.0.is_ip_blocked(addr.ip()) {
-            Err(self.0.ip_block_reason(addr.ip()))
+    fn check<'a>(&'a self, host: &str, addr: &SocketAddr) -> Result<(), &'a str> {
+        if self.0.is_resolved_ip_blocked(host, addr.ip()) {
+            Err(self.0.resolved_block_reason(host, addr.ip()))
         } else {
             Ok(())
         }
     }
+}
+
+/// Why the fallback resolution found no address to connect to.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum NoPermittedAddr {
+    /// DNS answered with no addresses at all.
+    NoneResolved,
+    /// Every resolved address was refused by the SSRF policy; the reason given
+    /// for the last one.
+    Refused(String),
+}
+
+/// The first of `addrs` the SSRF guard permits for `host`, logging each one it
+/// refuses. The fallback path of [`ProxyEngine::target`], which resolves
+/// outside the load balancer.
+pub(crate) fn first_permitted_addr(
+    guard: &SsrfGuard,
+    host: &str,
+    addrs: impl IntoIterator<Item = SocketAddr>,
+) -> Result<SocketAddr, NoPermittedAddr> {
+    let mut refused = None;
+    for addr in addrs {
+        if !guard.is_resolved_ip_blocked(host, addr.ip()) {
+            return Ok(addr);
+        }
+        let reason = guard.resolved_block_reason(host, addr.ip());
+        warn!(
+            host = %host,
+            resolved_ip = %addr.ip(),
+            reason,
+            "SSRF protection: blocked DNS-resolved private IP"
+        );
+        refused = Some(reason.to_owned());
+    }
+    Err(refused.map_or(NoPermittedAddr::NoneResolved, NoPermittedAddr::Refused))
 }
 
 /// Engine settings derived from the gear configuration.
@@ -128,27 +163,20 @@ impl ProxyEngine {
                 instance: instance.to_string(),
             }
         })?;
-        addrs
-            .into_iter()
-            .find(|addr| {
-                let blocked = self.ssrf_guard.is_ip_blocked(addr.ip());
-                if blocked {
-                    warn!(
-                        host = %ep.host,
-                        resolved_ip = %addr.ip(),
-                        reason = self.ssrf_guard.ip_block_reason(addr.ip()),
-                        "SSRF protection: blocked DNS-resolved private IP"
-                    );
+        first_permitted_addr(&self.ssrf_guard, &ep.host, addrs).map_err(|why| {
+            match why {
+                NoPermittedAddr::NoneResolved => {
+                    warn!(host = %ep.host, port = ep.port, "DNS returned no usable addresses");
                 }
-                !blocked
-            })
-            .ok_or_else(|| {
-                warn!(host = %ep.host, port = ep.port, "DNS returned no usable addresses");
-                DomainError::LinkUnavailable {
-                    detail: "upstream connection error".into(),
-                    instance: instance.to_string(),
+                NoPermittedAddr::Refused(reason) => {
+                    warn!(host = %ep.host, port = ep.port, reason, "SSRF policy refused every resolved address");
                 }
-            })
+            }
+            DomainError::LinkUnavailable {
+                detail: "upstream connection error".into(),
+                instance: instance.to_string(),
+            }
+        })
     }
 }
 

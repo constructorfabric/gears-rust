@@ -47,6 +47,7 @@ async fn plugin_over(store: Arc<RecordingConsumptionStore>) -> StoragePlugin {
         Arc::new(FakeQuotaStore::default()),
         Arc::new(FakePolicyStore::default()),
         store,
+        Arc::new(crate::test_support::FakeLeaseStore) as Arc<dyn crate::domain::ports::LeaseStore>,
     )
 }
 
