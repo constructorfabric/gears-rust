@@ -1,3 +1,4 @@
+pub mod graph;
 pub mod mapper;
 pub mod migrations;
 pub mod record_ids_entity;

@@ -7,12 +7,14 @@ use crate::domain::record_intake::{DropEvent, DropStage, IntakeEvents};
 #[derive(Debug, Default)]
 pub struct LogIntakeEvents;
 
-fn stage(stage: DropStage) -> &'static str {
+/// The name of a drop stage in the log and in metrics.
+pub(crate) fn stage(stage: DropStage) -> &'static str {
     match stage {
         DropStage::Planner => "planner",
         DropStage::Checks => "checks",
         DropStage::Admission => "admission",
         DropStage::Writer => "writer",
+        DropStage::Worker => "worker",
     }
 }
 

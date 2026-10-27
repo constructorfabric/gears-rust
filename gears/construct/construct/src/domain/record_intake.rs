@@ -227,6 +227,9 @@ pub enum DropStage {
     Admission,
     /// The profile writer.
     Writer,
+    /// The processing worker, outside any one stage: the record's processing
+    /// panicked.
+    Worker,
 }
 
 /// Why processing dropped a received record.

@@ -1,11 +1,14 @@
 use crate::api::rest::error::for_rest;
 use crate::domain::error::DomainError;
+use crate::domain::profile::{FactCount, FullProfile};
 use crate::domain::record_intake::{Place, Refusal, RefusalReason};
+use crate::domain::subject_settings::SubjectKey;
 use toolkit_canonical_errors::{CanonicalError, Problem};
 use toolkit_db::DbError;
 use toolkit_gts::gts_id;
 
 const RECORD_RESOURCE_TYPE: &str = gts_id!("cf.connectors.core.record.v1~");
+const PROFILE_RESOURCE_TYPE: &str = gts_id!("cf.construct.subject.profile.v1~");
 const CHAT: &str = "gts.cf.connectors.core.record.v1~cf.construct.chat.message.v1~";
 
 fn wire(err: DomainError) -> Problem {
@@ -138,6 +141,41 @@ fn internal_maps_to_500_without_leaking_detail() {
 }
 
 #[test]
+fn a_full_profile_maps_to_a_failed_precondition_without_leaking_detail() {
+    let subject = SubjectKey {
+        tenant_id: uuid::Uuid::new_v4(),
+        subject_id: uuid::Uuid::new_v4(),
+    };
+    let problem = wire(DomainError::ProfileFull(FullProfile {
+        subject,
+        facts: FactCount::WouldHold(1000),
+        limit: 999,
+    }));
+
+    assert_eq!(problem.status, Some(400));
+    assert!(problem.problem_type.contains("failed_precondition"));
+    assert_eq!(
+        problem
+            .context
+            .get("resource_type")
+            .and_then(|v| v.as_str()),
+        Some(PROFILE_RESOURCE_TYPE),
+    );
+    let violation = &problem.context["violations"][0];
+    assert_eq!(violation["type"], "PROFILE_FULL");
+    assert_eq!(violation["subject"], "profile");
+    assert!(
+        violation["description"]
+            .as_str()
+            .is_some_and(|description| description.contains("remove facts")),
+        "{violation}"
+    );
+    let text = visible_text(&problem);
+    assert!(!text.contains(&subject.subject_id.to_string()));
+    assert!(!text.contains(&subject.tenant_id.to_string()));
+}
+
+#[test]
 fn database_maps_to_500_without_leaking_detail() {
     let problem = wire(DomainError::Database(DbError::InvalidConfig(
         "password=secret".to_owned(),
@@ -145,6 +183,16 @@ fn database_maps_to_500_without_leaking_detail() {
 
     assert_eq!(problem.status, Some(500));
     assert!(!problem.detail.contains("secret"));
+}
+
+#[test]
+fn not_configured_maps_to_501_which_is_not_retried() {
+    let problem = wire(DomainError::NotConfigured(
+        "no processing identity is configured".to_owned(),
+    ));
+
+    assert_eq!(problem.status, Some(501));
+    assert!(!visible_text(&problem).contains("processing identity"));
 }
 
 #[test]
@@ -266,5 +314,25 @@ fn an_out_of_scope_error_on_the_facts_route_answers_as_no_such_subject() {
     let text = visible_text(&problem);
     for id in &ids[..3] {
         assert!(!text.contains(&id.to_string()), "{id} in {text}");
+    }
+}
+
+#[test]
+fn a_subject_that_is_not_visible_is_404_and_tells_nothing_more() {
+    for problem in [
+        wire(DomainError::NotVisible(
+            "subject 42 has a profile".to_owned(),
+        )),
+        rest(DomainError::NotVisible(
+            "subject 42 has a profile".to_owned(),
+        )),
+    ] {
+        assert_eq!(problem.status, Some(404));
+        assert_eq!(problem.detail, "no such subject");
+        let text = visible_text(&problem);
+        assert!(
+            !text.contains("has a profile"),
+            "the reason stays in the log: {text}"
+        );
     }
 }

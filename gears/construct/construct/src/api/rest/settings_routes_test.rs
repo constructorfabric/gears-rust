@@ -36,9 +36,16 @@ fn router_for(
     tenant_id: Uuid,
 ) -> Router {
     let intake = Arc::new(IntakeFixture::default().build(db));
-    let settings = Arc::new(settings_service(db, resolver, DEFAULT_ON));
-    register_routes(Router::new(), &OpenApiRegistryImpl::new(), intake, settings)
-        .layer(Extension(context_of(subject_id, tenant_id)))
+    let settings = Arc::new(settings_service(db, Arc::clone(&resolver), DEFAULT_ON));
+    let profile = crate::test_support::idle_profile(db, resolver);
+    register_routes(
+        Router::new(),
+        &OpenApiRegistryImpl::new(),
+        intake,
+        settings,
+        profile,
+    )
+    .layer(Extension(context_of(subject_id, tenant_id)))
 }
 
 async fn send(
@@ -214,7 +221,7 @@ async fn the_owner_never_sees_its_row_of_another_tenant() {
 }
 
 #[tokio::test]
-async fn both_routes_answer_no_store() {
+async fn both_routes_answer_no_store_with_the_security_headers() {
     let db = inmem_db().await;
     let (tenant, subject) = (Uuid::new_v4(), Uuid::new_v4());
 
@@ -235,13 +242,21 @@ async fn both_routes_answer_no_store() {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(
-            response
-                .headers()
-                .get(header::CACHE_CONTROL)
-                .and_then(|v| v.to_str().ok()),
-            Some("no-store")
-        );
+        for (name, value) in [
+            (header::CACHE_CONTROL, "no-store"),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+            (header::X_FRAME_OPTIONS, "DENY"),
+            (
+                header::CONTENT_SECURITY_POLICY,
+                "default-src 'none'; frame-ancestors 'none'",
+            ),
+        ] {
+            assert_eq!(
+                response.headers().get(&name).and_then(|v| v.to_str().ok()),
+                Some(value),
+                "{name}"
+            );
+        }
     }
 }
 

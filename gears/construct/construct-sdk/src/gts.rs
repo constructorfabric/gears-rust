@@ -48,6 +48,13 @@ pub const SKILL_TYPE: &str =
 pub const PREFERENCE_TYPE: &str =
     gts_id!("cf.core.graph.node.v1~cf.core.graph.owned_node.v1~cf.construct.person.preference.v1~");
 
+/// The root of one subject's profile, from which every fact hangs.
+pub const PROFILE_ROOT_TYPE: &str =
+    gts_id!("cf.core.graph.node.v1~cf.core.graph.owned_node.v1~cf.construct.profile.root.v1~");
+/// The edge from a profile's root to one of its facts.
+pub const HAS_FACT_TYPE: &str =
+    gts_id!("cf.core.graph.edge.v1~cf.core.graph.static_edge.v1~cf.construct.profile.has_fact.v1~");
+
 /// The abstract base every connector record type derives from. It fixes the
 /// envelope: `type`, `provenance`, `version`, `observed_at`, the optional
 /// `subject_id`, and the `payload` a derived type refines.

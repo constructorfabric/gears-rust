@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
 use axum::extract::Extension;
-use axum::http::header;
 use toolkit::api::canonical_prelude::*;
 use toolkit::api::rest::extract::{Json, Path, Query};
 use toolkit_security::SecurityContext;
@@ -9,13 +8,13 @@ use tracing::Instrument as _;
 use uuid::Uuid;
 
 use crate::api::rest::error::{for_facts, for_rest, for_settings, too_long};
-use crate::api::rest::types::{ConcreteIntake, ConcreteSettings};
+use crate::api::rest::types::{ConcreteIntake, ConcreteProfile, ConcreteSettings};
 use crate::domain::planner::manage::ManageFacts;
 use crate::domain::record_intake::IntakeOutcome;
 
 use super::dto::{
-    ManageFactsRequest, ManageFactsResponse, PutSubjectSettingsRequest, RecordOutcomeDto,
-    RecordQuery, RecordRequest, SubjectSettingsDto,
+    ManageFactsRequest, ManageFactsResponse, ProfileDto, ProfileQuery, PutSubjectSettingsRequest,
+    RecordOutcomeDto, RecordQuery, RecordRequest, SubjectSettingsDto,
 };
 
 /// The answer's status: 202 for a received record, which is processed later,
@@ -68,7 +67,7 @@ pub async fn get_subject_settings(
         .await
         .map_err(for_settings)?;
     // @cpt-begin:cpt-cf-construct-flow-subject-settings-view:p1:inst-view-return
-    Ok(not_stored(SubjectSettingsDto::new(subject_id, settings)))
+    Ok(Json(SubjectSettingsDto::new(subject_id, settings)))
     // @cpt-end:cpt-cf-construct-flow-subject-settings-view:p1:inst-view-return
 }
 
@@ -85,14 +84,8 @@ pub async fn put_subject_settings(
         .await
         .map_err(for_settings)?;
     // @cpt-begin:cpt-cf-construct-flow-subject-settings-change:p1:inst-change-return
-    Ok(not_stored(SubjectSettingsDto::new(subject_id, settings)))
+    Ok(Json(SubjectSettingsDto::new(subject_id, settings)))
     // @cpt-end:cpt-cf-construct-flow-subject-settings-change:p1:inst-change-return
-}
-
-/// One subject's settings, marked `Cache-Control: no-store`, so no proxy or
-/// browser cache keeps one subject's privacy state.
-fn not_stored(dto: SubjectSettingsDto) -> impl IntoResponse {
-    ([(header::CACHE_CONTROL, "no-store")], Json(dto))
 }
 
 /// Plans what the subject told an agent, stores it and answers what changed.
@@ -113,4 +106,36 @@ pub async fn manage_facts(
         .await
         .map_err(|error| for_facts(error, subject_id))?;
     Ok(Json(ManageFactsResponse::from(managed)))
+}
+
+/// @cpt-dod:cpt-cf-construct-dod-profile-reader-route:p1
+pub async fn get_profile(
+    // @cpt-begin:cpt-cf-construct-flow-profile-reader-read:p1:inst-profile-parse
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(svc): Extension<Arc<ConcreteProfile>>,
+    Path(subject_id): Path<Uuid>,
+    Query(query): Query<ProfileQuery>,
+    // @cpt-end:cpt-cf-construct-flow-profile-reader-read:p1:inst-profile-parse
+) -> ApiResult<impl IntoResponse> {
+    // @cpt-begin:cpt-cf-construct-flow-profile-reader-read:p1:inst-profile-serve
+    // The error is mapped, and so logged, inside this span, so the log names
+    // the caller, the subject and the tenant.
+    let tenant = ConcreteProfile::tenant_of(&ctx, query.tenant);
+    let span = tracing::info_span!(
+        "profile_read",
+        %subject_id,
+        caller = %ctx.subject_id(),
+        tenant_id = %tenant
+    );
+    let profile = async {
+        svc.read(&ctx, query.tenant, subject_id)
+            .await
+            .map_err(CanonicalError::from)
+    }
+    .instrument(span)
+    .await?;
+    // @cpt-end:cpt-cf-construct-flow-profile-reader-read:p1:inst-profile-serve
+    // @cpt-begin:cpt-cf-construct-flow-profile-reader-read:p1:inst-profile-return
+    Ok(Json(ProfileDto::from(profile)))
+    // @cpt-end:cpt-cf-construct-flow-profile-reader-read:p1:inst-profile-return
 }
