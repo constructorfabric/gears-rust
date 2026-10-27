@@ -312,7 +312,11 @@ impl Service {
                 other => TenantResolverError::Internal(other.to_string()),
             })?;
 
-            all_items.extend(page.items);
+            all_items.extend(
+                page.items
+                    .into_iter()
+                    .filter(|g| self.is_tenant_type(&g.code)),
+            );
 
             match page.page_info.next_cursor {
                 Some(cursor_str) => {
@@ -326,6 +330,15 @@ impl Service {
         }
 
         Ok(all_items)
+    }
+
+    /// Whether `code` is one of the configured tenant types.
+    ///
+    /// Applied to every row RG returns, on top of the `type in (...)`
+    /// filter: an RG build whose hierarchy reads ignore that predicate would
+    /// otherwise leak non-tenant groups into tenant results.
+    fn is_tenant_type(&self, code: &str) -> bool {
+        self.tenant_types.iter().any(|t| t == code)
     }
 
     /// Drain all pages from `list_groups` for the given query. Mirrors
@@ -347,7 +360,11 @@ impl Service {
                 .await
                 .map_err(|e| TenantResolverError::Internal(e.to_string()))?;
 
-            all_items.extend(page.items);
+            all_items.extend(
+                page.items
+                    .into_iter()
+                    .filter(|g| self.is_tenant_type(&g.code)),
+            );
 
             match page.page_info.next_cursor {
                 Some(cursor_str) => {

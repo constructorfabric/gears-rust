@@ -301,6 +301,19 @@ impl GroupRepository {
                     None
                 }
             }
+            FilterNode::InList {
+                field: HierarchyFilterField::Type,
+                values,
+            } => {
+                let types: Vec<String> = values
+                    .iter()
+                    .filter_map(|v| match v {
+                        toolkit_odata::filter::ODataValue::String(s) => Some(s.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                Some(TypeFilter::In(types))
+            }
             FilterNode::Composite {
                 op: FilterOp::And,
                 children,
@@ -1360,12 +1373,14 @@ impl DepthFilter {
 /// Type filter for hierarchy queries.
 enum TypeFilter {
     Eq(String),
+    In(Vec<String>),
 }
 
 impl TypeFilter {
     fn matches(&self, type_path: &str) -> bool {
         match self {
             Self::Eq(s) => type_path == s,
+            Self::In(types) => types.iter().any(|t| t == type_path),
         }
     }
 }

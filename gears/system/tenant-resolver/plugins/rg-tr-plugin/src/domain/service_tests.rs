@@ -564,6 +564,30 @@ async fn get_descendants_returns_subtree() {
     assert_eq!(resp.descendants.len(), 2);
 }
 
+/// Rows whose type is not a configured tenant type are dropped even when RG
+/// returns them (the mock ignores the `type` predicate).
+#[tokio::test]
+async fn get_descendants_drops_non_tenant_types() {
+    let root = Uuid::now_v7();
+    let tenant_child = Uuid::now_v7();
+    let mut dept = make_group(Uuid::now_v7(), "Dept", Some(root), 1, None);
+    dept.code = "gts.cf.core.rg.type.v1~x.test._.dept.v1~".to_owned();
+    let mock = MockRgHierarchy::descendants_only(vec![
+        make_group(root, "Root", None, 0, None),
+        dept,
+        make_group(tenant_child, "Child", Some(root), 1, None),
+    ]);
+    let svc = service_with(mock);
+
+    let resp = svc
+        .get_descendants(&ctx(), TenantId(root), &GetDescendantsOptions::default())
+        .await
+        .unwrap();
+
+    let ids: Vec<TenantId> = resp.descendants.iter().map(|d| d.id).collect();
+    assert_eq!(ids, vec![TenantId(tenant_child)]);
+}
+
 #[tokio::test]
 async fn get_descendants_barrier_excludes_subtree() {
     let root = Uuid::now_v7();

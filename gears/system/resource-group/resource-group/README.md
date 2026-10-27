@@ -51,7 +51,9 @@ gears:
         - "gts.cf.core.rg.type.v1~acme.core._.tenant.v1~"
 ```
 
-Keep `rg-tr-plugin`'s `tenant_types` in sync with this list.
+Entries must be canonical (trimmed, lowercase). `rg-tr-plugin`'s `tenant_types`
+takes exact type paths, not prefixes: list there every concrete tenant type
+that falls under these prefixes.
 
 ## Usage (in-process)
 

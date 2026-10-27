@@ -2940,6 +2940,68 @@ fn filter_query(expr: &str) -> ODataQuery {
     ODataQuery::new().with_filter(parsed.into_expr())
 }
 
+/// Hierarchy reads honour `type in (...)`, alone and combined with a depth
+/// predicate, in both directions.
+#[tokio::test]
+async fn hierarchy_filters_by_type_in_list() {
+    let db = common::test_db().await;
+    let type_svc = common::make_type_service(db.clone());
+    let group_svc = common::make_group_service(db.clone());
+    let tenant_id = Uuid::now_v7();
+    let ctx = common::make_ctx(tenant_id);
+
+    let org = common::create_root_type(&type_svc, "org").await;
+    let dept = common::create_child_type(&type_svc, "dept", &[&org.code], &[]).await;
+    let team = common::create_child_type(&type_svc, "team", &[&dept.code], &[]).await;
+
+    let a = common::create_root_group(&group_svc, &ctx, &org.code, "A", tenant_id).await;
+    let b = common::create_child_group(&group_svc, &ctx, &dept.code, a.id, "B", tenant_id).await;
+    let c = common::create_child_group(&group_svc, &ctx, &team.code, b.id, "C", tenant_id).await;
+
+    let ids = |page: Page<ResourceGroupWithDepth>| {
+        let mut ids: Vec<Uuid> = page.items.into_iter().map(|g| g.id).collect();
+        ids.sort();
+        ids
+    };
+    let sorted = |mut v: Vec<Uuid>| {
+        v.sort();
+        v
+    };
+
+    let desc = group_svc
+        .get_group_descendants(
+            &ctx,
+            a.id,
+            &filter_query(&format!("type in ('{}', '{}')", dept.code, team.code)),
+        )
+        .await
+        .expect("descendants");
+    assert_eq!(ids(desc), sorted(vec![b.id, c.id]));
+
+    let desc_depth = group_svc
+        .get_group_descendants(
+            &ctx,
+            a.id,
+            &filter_query(&format!(
+                "type in ('{}', '{}') and hierarchy/depth eq 1",
+                dept.code, team.code
+            )),
+        )
+        .await
+        .expect("descendants at depth 1");
+    assert_eq!(ids(desc_depth), vec![b.id]);
+
+    let anc = group_svc
+        .get_group_ancestors(
+            &ctx,
+            c.id,
+            &filter_query(&format!("type in ('{}')", org.code)),
+        )
+        .await
+        .expect("ancestors");
+    assert_eq!(ids(anc), vec![a.id]);
+}
+
 #[tokio::test]
 async fn list_groups_filters_by_a_single_type() {
     let db = common::test_db().await;

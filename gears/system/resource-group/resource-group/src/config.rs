@@ -27,7 +27,12 @@ impl Default for ResourceGroupConfig {
 }
 
 impl ResourceGroupConfig {
-    /// Reject an empty list and paths outside the RG type namespace.
+    /// Reject an empty list, non-canonical entries, and paths outside the RG
+    /// type namespace.
+    ///
+    /// Entries must already be canonical (trimmed, lowercase): tenant
+    /// classification is a case-sensitive `starts_with` against stored type
+    /// codes, so a non-canonical prefix would silently match nothing.
     ///
     /// # Errors
     ///
@@ -37,6 +42,11 @@ impl ResourceGroupConfig {
             anyhow::bail!("resource-group: tenant_type_paths must not be empty");
         }
         for path in &self.tenant_type_paths {
+            if path.trim() != path || path.to_lowercase() != *path {
+                anyhow::bail!(
+                    "resource-group: tenant_type_paths entry '{path}' must be trimmed and lowercase"
+                );
+            }
             validation::validate_type_code(path).map_err(|e| {
                 anyhow::anyhow!("resource-group: invalid tenant_type_paths entry '{path}': {e}")
             })?;
@@ -90,6 +100,20 @@ mod tests {
             tenant_type_paths: vec!["gts.acme.core._.tenant.v1~".to_owned()],
         };
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn non_canonical_path_is_rejected() {
+        for path in [
+            format!(" {TENANT_RG_TYPE_PATH}"),
+            format!("{TENANT_RG_TYPE_PATH} "),
+            TENANT_RG_TYPE_PATH.to_uppercase(),
+        ] {
+            let cfg = ResourceGroupConfig {
+                tenant_type_paths: vec![path.clone()],
+            };
+            assert!(cfg.validate().is_err(), "{path:?} must be rejected");
+        }
     }
 
     #[test]

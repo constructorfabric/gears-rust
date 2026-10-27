@@ -46,9 +46,7 @@ impl Gear for RgTrPlugin {
             "Loaded RG tenant resolver plugin configuration"
         );
 
-        if cfg.tenant_types.is_empty() {
-            anyhow::bail!("{}: tenant_types must not be empty", Self::MODULE_NAME);
-        }
+        cfg.validate()?;
 
         // Resolve RG hierarchy read contract from ClientHub
         let rg: Arc<dyn ResourceGroupReadHierarchy> =

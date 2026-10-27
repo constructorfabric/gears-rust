@@ -33,10 +33,10 @@ gears:
     config:
       vendor: "constructorfabric"
       priority: 50
-      # RG type paths treated as tenants. Default: [TENANT_RG_TYPE_PATH].
-      # Every entry must be registered in resource-group (RG rejects a
-      # `$filter` on an unknown type). Keep in sync with resource-group's
-      # `tenant_type_paths`.
+      # Exact RG type paths treated as tenants. Default: [TENANT_RG_TYPE_PATH].
+      # Unlike resource-group's `tenant_type_paths` (prefixes), list every
+      # concrete tenant type. Every entry must be registered in resource-group
+      # (RG rejects a `$filter` on an unknown type).
       tenant_types:
         - "gts.cf.core.rg.type.v1~acme.core._.tenant.v1~"
 ```
