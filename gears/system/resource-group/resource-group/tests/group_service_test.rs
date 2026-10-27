@@ -2991,6 +2991,20 @@ async fn hierarchy_filters_by_type_in_list() {
         .expect("descendants at depth 1");
     assert_eq!(ids(desc_depth), vec![b.id]);
 
+    // Every type predicate of a conjunction applies, not just the first.
+    let desc_and = group_svc
+        .get_group_descendants(
+            &ctx,
+            a.id,
+            &filter_query(&format!(
+                "type in ('{}', '{}') and type eq '{}'",
+                dept.code, team.code, team.code
+            )),
+        )
+        .await
+        .expect("descendants with two type predicates");
+    assert_eq!(ids(desc_and), vec![c.id]);
+
     let anc = group_svc
         .get_group_ancestors(
             &ctx,

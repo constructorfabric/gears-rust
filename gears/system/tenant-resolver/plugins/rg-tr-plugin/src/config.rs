@@ -1,6 +1,6 @@
 //! Configuration for the RG tenant resolver plugin.
 
-use resource_group_sdk::TENANT_RG_TYPE_PATH;
+use resource_group_sdk::{GtsTypePath, TENANT_RG_TYPE_PATH, TYPE_RESOURCE_TYPE};
 use serde::Deserialize;
 
 /// Plugin configuration.
@@ -34,10 +34,12 @@ impl Default for RgTrPluginConfig {
 }
 
 impl RgTrPluginConfig {
-    /// Reject an empty `tenant_types` list and non-canonical entries.
+    /// Reject an empty `tenant_types` list and malformed entries.
     ///
-    /// Entries must be trimmed and lowercase: RG matches `type` filter values
-    /// against stored type codes verbatim.
+    /// Entries must be canonical (trimmed, lowercase) RG type paths: RG
+    /// matches `type` filter values against stored type codes verbatim, and
+    /// rejects the whole `$filter` when one value is not a valid type path —
+    /// failing every lookup instead of failing once at init.
     ///
     /// # Errors
     ///
@@ -52,6 +54,14 @@ impl RgTrPluginConfig {
                     "rg-tr-plugin: tenant_types entry '{t}' must be non-empty, trimmed and lowercase"
                 );
             }
+            if !t.starts_with(TYPE_RESOURCE_TYPE) {
+                anyhow::bail!(
+                    "rg-tr-plugin: tenant_types entry '{t}' must start with '{TYPE_RESOURCE_TYPE}'"
+                );
+            }
+            GtsTypePath::new(t.as_str()).map_err(|e| {
+                anyhow::anyhow!("rg-tr-plugin: invalid tenant_types entry '{t}': {e}")
+            })?;
         }
         Ok(())
     }
@@ -82,6 +92,10 @@ mod tests {
             format!(" {TENANT_RG_TYPE_PATH}"),
             TENANT_RG_TYPE_PATH.to_uppercase(),
             String::new(),
+            "not-a-gts-type".to_owned(),
+            format!("{TYPE_RESOURCE_TYPE}not-a-gts-type"),
+            // Valid GTS id, but outside the RG type namespace.
+            toolkit_gts::gts_id!("acme.core._.tenant.v1~").to_owned(),
         ] {
             let cfg = RgTrPluginConfig {
                 tenant_types: vec![t.clone()],

@@ -318,12 +318,18 @@ impl GroupRepository {
                 op: FilterOp::And,
                 children,
             } => {
-                for child in children {
-                    if let Some(f) = Self::extract_type_from_hierarchy_node(child) {
-                        return Some(f);
-                    }
+                // Keep every type predicate of the conjunction: dropping all
+                // but the first would let `type in ('A', 'B') and type eq 'B'`
+                // return `A` rows.
+                let mut filters: Vec<TypeFilter> = children
+                    .iter()
+                    .filter_map(Self::extract_type_from_hierarchy_node)
+                    .collect();
+                match filters.len() {
+                    0 => None,
+                    1 => filters.pop(),
+                    _ => Some(TypeFilter::All(filters)),
                 }
-                None
             }
             _ => None,
         }
@@ -1374,6 +1380,8 @@ impl DepthFilter {
 enum TypeFilter {
     Eq(String),
     In(Vec<String>),
+    /// Conjunction: every inner filter must match.
+    All(Vec<TypeFilter>),
 }
 
 impl TypeFilter {
@@ -1381,6 +1389,7 @@ impl TypeFilter {
         match self {
             Self::Eq(s) => type_path == s,
             Self::In(types) => types.iter().any(|t| t == type_path),
+            Self::All(filters) => filters.iter().all(|f| f.matches(type_path)),
         }
     }
 }

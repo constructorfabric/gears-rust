@@ -1,6 +1,6 @@
 //! Configuration for the resource-group gear.
 
-use resource_group_sdk::TENANT_RG_TYPE_PATH;
+use resource_group_sdk::{GtsTypePath, TENANT_RG_TYPE_PATH};
 use serde::Deserialize;
 
 use crate::domain::validation;
@@ -48,6 +48,9 @@ impl ResourceGroupConfig {
                 );
             }
             validation::validate_type_code(path).map_err(|e| {
+                anyhow::anyhow!("resource-group: invalid tenant_type_paths entry '{path}': {e}")
+            })?;
+            GtsTypePath::new(path.as_str()).map_err(|e| {
                 anyhow::anyhow!("resource-group: invalid tenant_type_paths entry '{path}': {e}")
             })?;
         }
@@ -100,6 +103,14 @@ mod tests {
     fn path_outside_rg_namespace_is_rejected() {
         let cfg = ResourceGroupConfig {
             tenant_type_paths: vec![gts_id!("acme.core._.tenant.v1~").to_owned()],
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn malformed_gts_path_is_rejected() {
+        let cfg = ResourceGroupConfig {
+            tenant_type_paths: vec![format!("{}not-a-gts-type", gts_id!("cf.core.rg.type.v1~"))],
         };
         assert!(cfg.validate().is_err());
     }
