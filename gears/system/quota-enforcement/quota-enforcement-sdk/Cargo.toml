@@ -21,10 +21,27 @@ workspace = true
 [features]
 # Exposes `pub mod testing`: a complete in-memory double of the storage plugin
 # contract. Test-only; never enable in a production build.
-test-util = ["dep:parking_lot"]
+test-util = ["dep:parking_lot", "dep:tokio"]
+# Generated REST clients of the three contracts (`*RestClient` + resolving wrapper).
+rest-client = ["toolkit-contract/rest-client", "dep:toolkit-http", "dep:secrecy"]
+# Generated server route registration, used by the quota-enforcement gear.
+rest-server = ["toolkit-contract/rest-server", "dep:axum"]
+
+# `#[toolkit::contract]` emits `#[async_trait]`, which cargo-shear cannot see.
+[package.metadata.cargo-shear]
+ignored = ["async-trait"]
 
 [dependencies]
 async-trait = { workspace = true }
+toolkit = { workspace = true }
+toolkit-contract = { workspace = true }
+# OpenAPI schemas of the contract types; `time` for the RFC 3339 timestamps.
+utoipa = { workspace = true, features = ["time"] }
+# Emitted into the generated REST client (rest-client).
+toolkit-http = { workspace = true, optional = true }
+secrecy = { workspace = true, optional = true }
+# Emitted into the generated server route registration (rest-server).
+axum = { workspace = true, optional = true }
 thiserror = { workspace = true }
 uuid = { workspace = true, features = ["v7"] }
 serde = { workspace = true }
@@ -47,6 +64,10 @@ toolkit-security = { workspace = true }
 toolkit-canonical-errors = { workspace = true }
 
 parking_lot = { workspace = true, optional = true }
+# The in-memory double's drain lock, held across a delivery callback.
+tokio = { workspace = true, features = ["sync"], optional = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt", "macros"] }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "sync", "time", "net"] }
+axum = { workspace = true }
+toolkit-http-middleware = { workspace = true }

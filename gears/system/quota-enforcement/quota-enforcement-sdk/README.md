@@ -17,9 +17,24 @@ Singleton coordination for the sweepers is not a contract of this SDK. The
 gear consumes the platform `cluster` gear's leader election, and the operator
 selects the backend in the cluster profile YAML (ADR-0006).
 
-The consumer, manager, and operator client traits land with their features.
-This crate ships the plugin side first, so plugin authors implement against a
-single dependency.
+## Client contracts
+
+Three `#[toolkit::contract]` traits serve callers: `QuotaManagerApi` (Quota
+lifecycle and credit), `QuotaEnforcementApi` (consumption, leases, snapshots)
+and `QuotaOperatorApi` (policies). Resolve one from `ClientHub`; whether it is
+the in-process implementation or a REST client is the deployment's wiring,
+not the caller's concern:
+
+```rust
+let quotas = hub.get::<dyn QuotaManagerApi>()?;
+let id = quotas.create_quota(&ctx, spec).await?;
+```
+
+Feature `rest-client` adds the generated REST clients (`*RestClient`, plus a
+directory-resolving wrapper); `rest-server` adds the route registration the
+gear hosts under `/quota-enforcement/v1` (internal, authenticated, one `POST`
+per method). Over REST the caller's bearer token travels with the call, so QE
+authorizes the original caller.
 
 ## Test support
 

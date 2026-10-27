@@ -62,7 +62,7 @@ seeding; the Engine contract (`id`/`validate_config`/`evaluate`) with the `Valid
 `(policy_id, policy_version)`; Debit-Plan invariant enforcement at the Engine boundary with violation telemetry; the
 `most-restrictive-wins` binding-Quota selection with validity-window prefilter; the sandboxed cost-bounded `cel`
 Engine with static checking against snapshotted request and constraint schemas; the operator-only Policy surface
-(`QuotaOperatorClientV1`).
+(`QuotaOperatorApi`).
 
 **Out of scope**: applying Debit Plans to counters and the `EvaluationOrchestrator` pipeline that invokes the boundary
 defined here (consumption-operations feature), additional Engine languages (P2-or-later per PRD §13), ingress
@@ -312,9 +312,9 @@ with version-based optimistic concurrency (`VERSION_CONFLICT` on `if_match_versi
 version-plus-latest-pointer transitions, most-specific-scope selection (per-metric over `global`) with the latest-version pointer read authoritatively from
 storage per evaluation, Engine-delegated config validation with registry-snapshotted schemas, the
 projection-contracts membership check on every Policy write, and `policy-changed` events enqueued in the same
-transaction as the mutation. The surface is operator-only: the REST endpoints and the `QuotaOperatorClientV1` methods
+transaction as the mutation. The surface is operator-only: the REST endpoints and the `QuotaOperatorApi` methods
 (`create_policy`, `update_policy`, `rollback_policy`, `delete_policy`, `list_policy_versions`) are deliberately absent
-from `QuotaManagerClientV1` per PRD §2.3.
+from `QuotaManagerApi` per PRD §2.3.
 
 **Implements**:
 - `cpt-cf-quota-enforcement-flow-policy-write`
@@ -328,7 +328,7 @@ from `QuotaManagerClientV1` per PRD §2.3.
 - API: `POST /v1/quota-enforcement/policies`, `GET /v1/quota-enforcement/policies/{id}`,
   `GET /v1/quota-enforcement/policies/{id}/versions`, `PATCH /v1/quota-enforcement/policies/{id}`,
   `POST /v1/quota-enforcement/policies/{id}/rollback`, `DELETE /v1/quota-enforcement/policies/{id}`;
-  `QuotaOperatorClientV1` Policy methods
+  `QuotaOperatorApi` Policy methods
 - DB: `cpt-cf-quota-enforcement-db-schema`
 - Entities: `QuotaResolutionPolicy`, `QuotaResolutionPolicyVersion`
 

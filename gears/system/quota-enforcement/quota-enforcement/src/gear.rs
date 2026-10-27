@@ -2,8 +2,9 @@
 //!
 //! `init` wires the PEP boundary, the domain service, the in-process manager
 //! client, and the cluster coordination binding. The lifecycle entry runs the
-//! fail-closed bootstrap before the ready signal, then hosts the leader-only
-//! lifecycle-gauge refresh under a child token. The REST surface mounts into
+//! fail-closed bootstrap before the ready signal, which ends by starting
+//! notification delivery, then hosts the leader-only sweepers under child
+//! tokens, and stops delivery on shutdown. The REST surface mounts into
 //! the platform `api-gateway`; the readiness check reports the bootstrap state
 //! and the cluster requirements verdict.
 //!
@@ -18,18 +19,21 @@ use std::time::Duration;
 use anyhow::Context as _;
 use async_trait::async_trait;
 use authz_resolver_sdk::{AuthZResolverApi, PolicyEnforcer};
-use quota_enforcement_sdk::QuotaManagerClientV1;
+use quota_enforcement_sdk::{QuotaEnforcementApi, QuotaManagerApi, QuotaOperatorApi};
 use tokio_util::sync::CancellationToken;
 use toolkit::api::OpenApiRegistry;
 use toolkit::client_hub::ClientHub;
 use toolkit::context::GearCtx;
 use toolkit::lifecycle::ReadySignal;
 use toolkit::{Gear, Healthcheck, RestApiCapability};
+use toolkit_contract::policy::PolicyStack;
 use tracing::info;
 use types_registry_sdk::TypesRegistryClient;
 
 use crate::api::healthcheck::ReadinessCheck;
-use crate::api::in_process::InProcessQuotaManager;
+use crate::api::in_process::{
+    InProcessQuotaEnforcement, InProcessQuotaManager, InProcessQuotaOperator,
+};
 use crate::api::rest::routes;
 use crate::config::QuotaEnforcementConfig;
 use crate::domain::ports::{LifecycleGaugeSink, MetricRegistry, QeMetrics};
@@ -38,6 +42,7 @@ use crate::domain::{
     LifecycleGaugeRefresher, PluginBinding, Readiness, Service, SingletonScope,
 };
 use crate::infra::cluster_coordination::{ClusterCoordinationBinding, ElectionTiming};
+use crate::infra::lease_backlog::LeaseBacklogCell;
 use crate::infra::lifecycle_gauges::LifecycleGaugeCell;
 use crate::infra::metric_registry::CachedMetricRegistry;
 use crate::infra::metrics;
@@ -58,6 +63,21 @@ const LOG_TARGET: &str = "qe.lifecycle";
     capabilities = [rest, stateful],
     lifecycle(entry = "serve", stop_timeout = "30s", await_ready)
 )]
+#[toolkit::provides(
+    contract = quota_enforcement_sdk::QuotaManagerApi,
+    local = Self::build_manager,
+    transports = [local, rest],
+)]
+#[toolkit::provides(
+    contract = quota_enforcement_sdk::QuotaEnforcementApi,
+    local = Self::build_enforcement,
+    transports = [local, rest],
+)]
+#[toolkit::provides(
+    contract = quota_enforcement_sdk::QuotaOperatorApi,
+    local = Self::build_operator,
+    transports = [local, rest],
+)]
 pub struct QuotaEnforcementGear {
     service: OnceLock<Arc<Service>>,
     bootstrap: OnceLock<Bootstrap>,
@@ -74,6 +94,10 @@ struct GaugeWiring {
     metrics: Arc<dyn QeMetrics>,
     /// Timing of the retention sweeper.
     retention: crate::domain::operations::RetentionTiming,
+    /// The sample cell of `lease_unreclaimed_expired`.
+    lease_backlog: Arc<LeaseBacklogCell>,
+    /// Timing of the lease sweeper.
+    lease_sweep: crate::domain::operations::LeaseSweepTiming,
 }
 
 impl Default for QuotaEnforcementGear {
@@ -101,6 +125,13 @@ impl QuotaEnforcementGear {
         self.gauges.get().map(|wiring| wiring.cell.clone())
     }
 
+    /// The lease backlog sample cell, once `init` ran. Holds a sample only
+    /// while this replica leads the lease sweeper.
+    #[must_use]
+    pub fn lease_backlog(&self) -> Option<Arc<LeaseBacklogCell>> {
+        self.gauges.get().map(|wiring| wiring.lease_backlog.clone())
+    }
+
     /// Lifecycle entry: bootstrap, signal ready, host the leader-only gauge
     /// refresh, then stop on shutdown.
     ///
@@ -120,7 +151,8 @@ impl QuotaEnforcementGear {
         ready: ReadySignal,
     ) -> anyhow::Result<()> {
         let (service, bootstrap, gauges) = self.initialised()?;
-        let bound = bootstrap_or_shutdown(bootstrap, &cancel).await?;
+        let delivery = bootstrap.delivery();
+        let bound = bootstrap_or_stop(bootstrap, &cancel, gauges.stop_timeout).await?;
         let refresher = LifecycleGaugeRefresher::new(
             bound.storage.clone(),
             bound.metric_registry.clone(),
@@ -131,6 +163,12 @@ impl QuotaEnforcementGear {
             bound.storage.clone(),
             Arc::clone(&gauges.metrics),
             gauges.retention,
+        ));
+        let lease_sweeper = Arc::new(crate::domain::operations::LeaseSweeper::new(
+            bound.storage.clone(),
+            Arc::clone(&bound.classifications),
+            gauges.lease_backlog.clone() as Arc<dyn crate::domain::ports::LeaseBacklogSink>,
+            gauges.lease_sweep,
         ));
         let coordinator = bound.coordinator.clone();
         service
@@ -148,16 +186,32 @@ impl QuotaEnforcementGear {
         );
         // @cpt-begin:cpt-cf-quota-enforcement-algo-retention-sweep:p1:inst-ret-elect
         let retention_task = spawn_leader_task(
-            coordinator,
+            coordinator.clone(),
             SingletonScope::RetentionSweeper,
             sweeper.leader_work(),
             cancel.child_token(),
         );
         // @cpt-end:cpt-cf-quota-enforcement-algo-retention-sweep:p1:inst-ret-elect
+        // @cpt-begin:cpt-cf-quota-enforcement-algo-lease-sweep:p1:inst-swp-elect
+        let lease_task = spawn_leader_task(
+            coordinator,
+            SingletonScope::LeaseSweeper,
+            lease_sweeper.leader_work(),
+            cancel.child_token(),
+        );
+        // @cpt-end:cpt-cf-quota-enforcement-algo-lease-sweep:p1:inst-swp-elect
         cancel.cancelled().await;
         info!(target: LOG_TARGET, "quota-enforcement is stopping");
-        join_leader_task("lifecycle gauge", gauge_task, gauges.stop_timeout).await;
-        join_leader_task("retention sweeper", retention_task, gauges.stop_timeout).await;
+        stop_background(
+            [
+                ("lifecycle gauge", gauge_task),
+                ("retention sweeper", retention_task),
+                ("lease sweeper", lease_task),
+            ],
+            &delivery,
+            gauges.stop_timeout,
+        )
+        .await;
         Ok(())
     }
 }
@@ -188,6 +242,23 @@ async fn bootstrap_or_shutdown(
     }
 }
 
+/// [`bootstrap_or_shutdown`], stopping notification delivery when it fails: a
+/// shutdown can interrupt bootstrap after delivery started.
+async fn bootstrap_or_stop(
+    bootstrap: &Bootstrap,
+    cancel: &CancellationToken,
+    stop_timeout: Duration,
+) -> anyhow::Result<Bound> {
+    let outcome = bootstrap_or_shutdown(bootstrap, cancel).await;
+    if outcome.is_err() {
+        stop_delivery(&bootstrap.delivery(), stop_timeout).await;
+    }
+    outcome
+}
+
+/// A leader-only task: its election's outcome once it stops.
+type LeaderTask = tokio::task::JoinHandle<Result<(), crate::domain::DomainError>>;
+
 /// Leader-only: the elected replica refreshes and publishes the gauge sample;
 /// every other replica publishes nothing. Leadership loss cancels the child
 /// token and the refresher withdraws its sample.
@@ -196,17 +267,13 @@ fn spawn_leader_task(
     scope: SingletonScope,
     work: crate::domain::ports::coordination::LeaderWork,
     shutdown: CancellationToken,
-) -> tokio::task::JoinHandle<Result<(), crate::domain::DomainError>> {
+) -> LeaderTask {
     tokio::spawn(async move { coordinator.run_while_leader(scope, shutdown, work).await })
 }
 
 /// Wait for a leader task to stop within `budget`; a slow or failed stop is
 /// logged, never an error of the lifecycle entry.
-async fn join_leader_task(
-    name: &str,
-    task: tokio::task::JoinHandle<Result<(), crate::domain::DomainError>>,
-    budget: Duration,
-) {
+async fn join_leader_task(name: &str, task: LeaderTask, budget: Duration) {
     let failure = match tokio::time::timeout(budget, task).await {
         Ok(Ok(Ok(()))) => return,
         Ok(Ok(Err(err))) => format!("{name} election ended with an error: {err}"),
@@ -214,6 +281,33 @@ async fn join_leader_task(
         Err(_elapsed) => format!("{name} task did not stop within {budget:?}"),
     };
     tracing::warn!(target: LOG_TARGET, "{failure}");
+}
+
+/// Stop the leader tasks, then notification delivery, each within `budget`.
+async fn stop_background(
+    tasks: [(&str, LeaderTask); 3],
+    delivery: &crate::domain::notifications::DeliveryLifecycle,
+    budget: Duration,
+) {
+    for (name, task) in tasks {
+        join_leader_task(name, task, budget).await;
+    }
+    stop_delivery(delivery, budget).await;
+}
+
+/// Stop notification delivery within `budget`; events it did not finish stay
+/// queued for the next processor. A slow stop is logged, never an error of
+/// the lifecycle entry.
+async fn stop_delivery(
+    delivery: &crate::domain::notifications::DeliveryLifecycle,
+    budget: Duration,
+) {
+    if tokio::time::timeout(budget, delivery.stop()).await.is_err() {
+        tracing::warn!(
+            target: LOG_TARGET,
+            "notification delivery did not stop within {budget:?}"
+        );
+    }
 }
 
 #[async_trait]
@@ -255,8 +349,9 @@ impl Gear for QuotaEnforcementGear {
         ));
 
         let gauge_cell = Arc::new(LifecycleGaugeCell::default());
+        let lease_backlog = Arc::new(LeaseBacklogCell::default());
         let metrics: Arc<dyn QeMetrics> =
-            metrics::build_default_adapter(&cfg.metrics, gauge_cell.clone());
+            metrics::build_default_adapter(&cfg.metrics, gauge_cell.clone(), lease_backlog.clone());
         let readiness = Arc::new(Readiness::new());
         let admission = Admission::new(enforcer, metrics.clone());
         let policy_limits = cfg
@@ -272,18 +367,16 @@ impl Gear for QuotaEnforcementGear {
                 cache_entries: cfg.operations.idempotency_cache_entries,
                 cache_ttl: cfg.operations.idempotency_cache_ttl(),
                 preparation_max_attempts: policy_limits.preparation_max_attempts,
+                leases: cfg.leases.to_limits(),
+                batch: cfg.operations.to_batch_limits(),
+                snapshot: cfg.snapshot.to_limits(),
             },
         ));
-        // In-process clients share the REST domain boundary.
-        hub.register::<dyn quota_enforcement_sdk::QuotaOperatorClientV1>(Arc::new(
-            crate::api::in_process::InProcessQuotaOperator::new(service.clone()),
-        ));
-        hub.register::<dyn quota_enforcement_sdk::QuotaEnforcementClientV1>(Arc::new(
-            crate::api::in_process::InProcessQuotaEnforcement::new(service.clone()),
-        ));
-        hub.register::<dyn QuotaManagerClientV1>(Arc::new(InProcessQuotaManager::new(
-            service.clone(),
-        )));
+        // The local builders find the service here; the key is crate-private.
+        hub.register::<LocalService>(Arc::new(LocalService(service.clone())));
+        self.wire_quota_manager_api(ctx).await?;
+        self.wire_quota_enforcement_api(ctx).await?;
+        self.wire_quota_operator_api(ctx).await?;
 
         let timing = ElectionTiming::new(
             cfg.election.ttl(),
@@ -304,7 +397,8 @@ impl Gear for QuotaEnforcementGear {
                 readiness,
             },
             policy_limits,
-        );
+        )
+        .with_dispatch(cfg.notifications.to_limits());
 
         let gauges = GaugeWiring {
             cell: gauge_cell,
@@ -315,6 +409,11 @@ impl Gear for QuotaEnforcementGear {
                 .retention
                 .to_timing()
                 .context("[quota-enforcement.retention] is not a valid sweeper timing")?,
+            lease_backlog,
+            lease_sweep: cfg
+                .leases
+                .to_sweep_timing()
+                .context("[quota-enforcement.leases] is not a valid sweeper timing")?,
         };
         set_once(&self.gauges, gauges)?;
         set_once(&self.hub, hub)?;
@@ -336,6 +435,46 @@ fn set_once<T>(cell: &OnceLock<T>, value: T) -> anyhow::Result<()> {
     })
 }
 
+/// The shared service, keyed by a type no other crate can name.
+pub(crate) struct LocalService(Arc<Service>);
+
+impl LocalService {
+    fn of(ctx: &GearCtx) -> anyhow::Result<Arc<Service>> {
+        let local = ctx
+            .client_hub()
+            .get::<Self>()
+            .context("quota-enforcement: the local service is registered before wiring")?;
+        Ok(local.0.clone())
+    }
+}
+
+impl QuotaEnforcementGear {
+    fn build_manager(
+        ctx: &GearCtx,
+        _policies: Arc<PolicyStack>,
+    ) -> anyhow::Result<Arc<dyn QuotaManagerApi>> {
+        Ok(Arc::new(InProcessQuotaManager::new(LocalService::of(ctx)?)))
+    }
+
+    fn build_enforcement(
+        ctx: &GearCtx,
+        _policies: Arc<PolicyStack>,
+    ) -> anyhow::Result<Arc<dyn QuotaEnforcementApi>> {
+        Ok(Arc::new(InProcessQuotaEnforcement::new(LocalService::of(
+            ctx,
+        )?)))
+    }
+
+    fn build_operator(
+        ctx: &GearCtx,
+        _policies: Arc<PolicyStack>,
+    ) -> anyhow::Result<Arc<dyn QuotaOperatorApi>> {
+        Ok(Arc::new(InProcessQuotaOperator::new(LocalService::of(
+            ctx,
+        )?)))
+    }
+}
+
 impl RestApiCapability for QuotaEnforcementGear {
     // @cpt-flow:cpt-cf-quota-enforcement-flow-gear-bootstrap:p1
     fn register_rest(
@@ -350,7 +489,26 @@ impl RestApiCapability for QuotaEnforcementGear {
             .get()
             .cloned()
             .context("quota-enforcement: register_rest invoked before init")?;
-        Ok(routes::register_routes(router, openapi, service))
+        let router = routes::register_routes(router, openapi, service.clone());
+        // Served from the local service, never the hub: a REST-wired hub client would forward.
+        let router = quota_enforcement_sdk::rest::register_quota_manager_api_rest_routes(
+            router,
+            openapi,
+            Arc::new(InProcessQuotaManager::new(service.clone())) as Arc<dyn QuotaManagerApi>,
+        );
+        let router = quota_enforcement_sdk::rest::register_quota_enforcement_api_rest_routes(
+            router,
+            openapi,
+            Arc::new(InProcessQuotaEnforcement::new(service.clone()))
+                as Arc<dyn QuotaEnforcementApi>,
+        );
+        Ok(
+            quota_enforcement_sdk::rest::register_quota_operator_api_rest_routes(
+                router,
+                openapi,
+                Arc::new(InProcessQuotaOperator::new(service)) as Arc<dyn QuotaOperatorApi>,
+            ),
+        )
         // @cpt-end:cpt-cf-quota-enforcement-flow-gear-bootstrap:p1:inst-boot-rest
     }
 

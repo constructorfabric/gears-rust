@@ -48,6 +48,9 @@ pub mod properties {
     pub const SUBJECTS: &str = "subjects";
     /// The optional resource projection, as its `{type, id?, metadata}` document.
     pub const RESOURCE: &str = "resource";
+    /// Every target of a snapshot read, as an array of `{kind, id, metric}`.
+    /// The PDP policy must authorize each one.
+    pub const FILTERS: &str = "filters";
 }
 
 /// Actions.

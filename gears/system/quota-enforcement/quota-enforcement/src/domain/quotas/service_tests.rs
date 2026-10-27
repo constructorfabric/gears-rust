@@ -42,6 +42,7 @@ fn limits() -> QuotaLimits {
         metadata_max_bytes: 4096,
         list_max_limit: 500,
         list_max_ids: 100,
+        bulk_max_items: 50,
     }
 }
 
@@ -1050,9 +1051,9 @@ async fn the_in_process_conversions_keep_caps_in_range() {
         .await
         .expect("accepted end to end");
     assert_eq!(view.quota.cap, Some(quota_enforcement_sdk::Quota::MAX_CAP));
-    let patch = quota_enforcement_sdk::QuotaPatch {
+    let patch = quota_enforcement_sdk::QuotaUpdate {
         cap: Some(CapPatch::Bounded(u64::MAX)),
-        ..quota_enforcement_sdk::QuotaPatch::default()
+        ..quota_enforcement_sdk::QuotaUpdate::default()
     };
     let err = UpdateQuotaRequest::try_from(patch).expect_err("above i64::MAX");
     assert_eq!(

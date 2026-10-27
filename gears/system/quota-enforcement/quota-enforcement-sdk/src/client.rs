@@ -1,25 +1,33 @@
-//! Client traits for quota enforcement.
+//! Client contracts for quota enforcement.
 //!
 //! Every method is async, takes the caller's [`SecurityContext`] first, and
-//! returns the same canonical error exposed by REST. In-process and REST
-//! clients share the same authorization boundary.
+//! returns the same canonical error exposed by REST. Each trait is a
+//! `#[toolkit::contract]`: the gear registers a local implementation in
+//! `ClientHub`, and the [`rest`](crate::rest) projection generates a REST
+//! client for out-of-process callers that forwards the caller's bearer token.
 
-use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use toolkit_canonical_errors::CanonicalError;
 use toolkit_security::SecurityContext;
+use utoipa::ToSchema;
 
+use crate::bulk::{
+    BulkCreateQuotasRequest, BulkCreated, BulkDeactivateQuotasRequest, BulkDeactivated,
+    BulkUpdateQuotasRequest, BulkUpdated,
+};
 use crate::models::{
+    AcquireLeaseOutcome, AcquireLeaseRequest, BatchDebitRequest, BatchDecision, CommitLeaseRequest,
     CreditRequest, DeactivateOutcome, DebitRequest, Decision, DecisionPreview, PageRequest,
-    PageResult, PreviewRequest, QuotaFilter, QuotaId, QuotaPatch, QuotaSpec, QuotaView,
-    RollbackRequest,
+    PageResult, PolicyId, PolicyPatch, PreviewRequest, QuotaFilter, QuotaId, QuotaSnapshot,
+    QuotaSpec, QuotaUpdate, QuotaView, ReleaseLeaseRequest, RollbackRequest, SnapshotRequest,
 };
 
 /// Error of every client method: the platform canonical error.
 pub type QuotaEnforcementError = CanonicalError;
 
 /// Manages Quotas within the caller's PDP scope.
-#[async_trait]
-pub trait QuotaManagerClientV1: Send + Sync + 'static {
+#[toolkit::contract(gear = "quota-enforcement", version = "v1")]
+pub trait QuotaManagerApi: Send + Sync {
     /// Create a Quota. The gear validates `spec`, resolves the metric owner's
     /// constraint contract, and returns the server-assigned identifier.
     ///
@@ -27,6 +35,7 @@ pub trait QuotaManagerClientV1: Send + Sync + 'static {
     ///
     /// The canonical error of the failed validation, authorization, or
     /// storage step; `Unimplemented` for the reserved `rate` type.
+    #[idempotency(NonIdempotentWrite)]
     async fn create_quota(
         &self,
         ctx: &SecurityContext,
@@ -41,11 +50,11 @@ pub trait QuotaManagerClientV1: Send + Sync + 'static {
     /// `NotFound` for an unknown or out-of-scope Quota, `FailedPrecondition`
     /// for a deactivated Quota or a cap below the consumed amount, and the
     /// canonical error of any other failed step.
+    #[idempotency(NonIdempotentWrite)]
     async fn update_quota(
         &self,
         ctx: &SecurityContext,
-        quota_id: QuotaId,
-        patch: QuotaPatch,
+        request: UpdateQuotaRequest,
     ) -> Result<(), QuotaEnforcementError>;
 
     /// Deactivate a Quota. The record stays readable; its active leases are
@@ -55,6 +64,7 @@ pub trait QuotaManagerClientV1: Send + Sync + 'static {
     ///
     /// `NotFound` for an unknown or out-of-scope Quota, `FailedPrecondition`
     /// when it is already deactivated.
+    #[idempotency(NonIdempotentWrite)]
     async fn deactivate_quota(
         &self,
         ctx: &SecurityContext,
@@ -67,11 +77,11 @@ pub trait QuotaManagerClientV1: Send + Sync + 'static {
     /// # Errors
     ///
     /// The canonical error of a failed authorization or storage step.
+    #[idempotency(SafeRead)]
     async fn read_quotas(
         &self,
         ctx: &SecurityContext,
-        filter: QuotaFilter,
-        page: PageRequest,
+        request: ReadQuotasRequest,
     ) -> Result<PageResult<QuotaView>, QuotaEnforcementError>;
 
     /// Return `amount` to one named Quota. Corrective, never evaluated against
@@ -88,11 +98,55 @@ pub trait QuotaManagerClientV1: Send + Sync + 'static {
     /// credit, or for a Quota the scope shows but that belongs to another
     /// tenant; `FailedPrecondition` for a deactivated Quota or a closed period;
     /// `Aborted` on a payload mismatch.
+    #[idempotency(IdempotentWrite)]
     async fn credit(
         &self,
         ctx: &SecurityContext,
         request: CreditRequest,
     ) -> Result<Decision, QuotaEnforcementError>;
+
+    /// Create every listed Quota of one tenant in one transaction, or none.
+    /// A replay of the envelope key returns the original outcome.
+    ///
+    /// # Errors
+    ///
+    /// `InvalidArgument` (`BULK_TOO_LARGE`) for too many items; the canonical
+    /// error of the first failing item, pointing at `items[index]`; `Aborted`
+    /// (`IDEMPOTENCY_PAYLOAD_MISMATCH`) when the key was used for other items.
+    #[idempotency(IdempotentWrite)]
+    async fn bulk_create_quotas(
+        &self,
+        ctx: &SecurityContext,
+        request: BulkCreateQuotasRequest,
+    ) -> Result<BulkCreated, QuotaEnforcementError>;
+
+    /// Apply every listed patch to one tenant's Quotas in one transaction, or
+    /// none.
+    ///
+    /// # Errors
+    ///
+    /// As [`QuotaManagerApi::bulk_create_quotas`], with the item errors
+    /// of [`QuotaManagerApi::update_quota`].
+    #[idempotency(IdempotentWrite)]
+    async fn bulk_update_quotas(
+        &self,
+        ctx: &SecurityContext,
+        request: BulkUpdateQuotasRequest,
+    ) -> Result<BulkUpdated, QuotaEnforcementError>;
+
+    /// Deactivate every listed Quota of one tenant in one transaction, or
+    /// none, resolving their active leases with it.
+    ///
+    /// # Errors
+    ///
+    /// As [`QuotaManagerApi::bulk_create_quotas`], with the item errors
+    /// of [`QuotaManagerApi::deactivate_quota`].
+    #[idempotency(IdempotentWrite)]
+    async fn bulk_deactivate_quotas(
+        &self,
+        ctx: &SecurityContext,
+        request: BulkDeactivateQuotasRequest,
+    ) -> Result<BulkDeactivated, QuotaEnforcementError>;
 }
 
 /// Performs guarded consumption operations.
@@ -102,8 +156,8 @@ pub trait QuotaManagerClientV1: Send + Sync + 'static {
 ///
 /// Write keys are scoped by tenant, subjects, and operation. A replay returns
 /// the stored decision without re-evaluation.
-#[async_trait]
-pub trait QuotaEnforcementClientV1: Send + Sync + 'static {
+#[toolkit::contract(gear = "quota-enforcement", version = "v1")]
+pub trait QuotaEnforcementApi: Send + Sync {
     /// Charge `amount` against every Quota applicable to the attribution, and
     /// commit the resulting plan atomically.
     ///
@@ -114,6 +168,7 @@ pub trait QuotaEnforcementClientV1: Send + Sync + 'static {
     /// refuses the attribution; `Aborted` (`IDEMPOTENCY_PAYLOAD_MISMATCH`)
     /// when the key was used for a different payload; the canonical error of
     /// any failed evaluation or storage step.
+    #[idempotency(IdempotentWrite)]
     async fn debit(
         &self,
         ctx: &SecurityContext,
@@ -133,6 +188,7 @@ pub trait QuotaEnforcementClientV1: Send + Sync + 'static {
     /// original key under the recomputed scope and authorized attribution;
     /// `FailedPrecondition` (`PERIOD_CLOSED`) once the attribution period has
     /// settled; `Aborted` on a payload mismatch.
+    #[idempotency(IdempotentWrite)]
     async fn rollback(
         &self,
         ctx: &SecurityContext,
@@ -145,21 +201,115 @@ pub trait QuotaEnforcementClientV1: Send + Sync + 'static {
     ///
     /// The errors of [`Self::debit`], minus the idempotency ones: a preview
     /// carries no key.
+    #[idempotency(SafeRead)]
     async fn evaluate_preview(
         &self,
         ctx: &SecurityContext,
         request: PreviewRequest,
     ) -> Result<DecisionPreview, QuotaEnforcementError>;
+
+    /// Hold capacity on every applicable Quota for the requested TTL, to be
+    /// settled later by [`Self::commit_lease`] or [`Self::release_lease`].
+    ///
+    /// A denied acquisition is a successful call carrying the verdict, not an
+    /// error; an expired lease is released semantically the moment its TTL
+    /// passes, whether or not a sweeper has reclaimed its row.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Self::debit`], plus `InvalidArgument`
+    /// (`TTL_OUT_OF_BOUNDS`) for a missing TTL or one outside the operator's
+    /// window, `ResourceExhausted` (`LEASE_INFLIGHT_LIMIT_EXCEEDED`) when the
+    /// `(tenant, metric)` active-lease cap is reached, and `Aborted`
+    /// (`LEASE_CONTENTION_TIMEOUT`) when the acquisition waited too long on a
+    /// contended row.
+    #[idempotency(IdempotentWrite)]
+    async fn acquire_lease(
+        &self,
+        ctx: &SecurityContext,
+        request: AcquireLeaseRequest,
+    ) -> Result<AcquireLeaseOutcome, QuotaEnforcementError>;
+
+    /// Settle a lease for what was actually used, charging the acquisition
+    /// period whatever the wall clock now says (I5) and returning the rest.
+    ///
+    /// The resulting debit is addressable by this call's idempotency key, so it
+    /// reverses through [`Self::rollback`] with `original_operation` set to
+    /// [`crate::models::RollbackableOperation::LeaseCommit`].
+    ///
+    /// # Errors
+    ///
+    /// `InvalidArgument` for a negative `actual_amount` or a missing key;
+    /// `NotFound` for a token outside the caller's tenant; `FailedPrecondition`
+    /// (`LEASE_NOT_ACTIVE`) for an expired or resolved lease, and
+    /// (`OVER_COMMIT_NOT_AUTHORIZED`) when more than the reserved amount is
+    /// committed; `Aborted` on a payload mismatch.
+    #[idempotency(IdempotentWrite)]
+    async fn commit_lease(
+        &self,
+        ctx: &SecurityContext,
+        request: CommitLeaseRequest,
+    ) -> Result<Decision, QuotaEnforcementError>;
+
+    /// Return a lease's full held capacity to the acquisition period, without
+    /// committing a debit.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Self::commit_lease`], minus the over-commit.
+    #[idempotency(IdempotentWrite)]
+    async fn release_lease(
+        &self,
+        ctx: &SecurityContext,
+        request: ReleaseLeaseRequest,
+    ) -> Result<Decision, QuotaEnforcementError>;
+
+    /// Debit several metrics as one logical operation, all or nothing. A
+    /// denied batch is a verdict, not an error.
+    ///
+    /// # Errors
+    ///
+    /// `InvalidArgument` for an empty batch, a non-positive amount (naming the
+    /// item), a missing key, mixed tenants, duplicate item keys, or a batch
+    /// over the configured size; `Unimplemented` for `independent` mode;
+    /// `DeadlineExceeded` when the batch timeout runs out; the canonical error
+    /// of any item's admission or evaluation, with nothing written.
+    #[idempotency(IdempotentWrite)]
+    async fn batch_debit(
+        &self,
+        ctx: &SecurityContext,
+        request: BatchDebitRequest,
+    ) -> Result<BatchDecision, QuotaEnforcementError>;
+
+    /// Read the per-Quota state of explicit targets: every active Quota the
+    /// targets select, once each, ordered by `quota_id`, with no policy
+    /// attribution and no aggregate figure. A target matching nothing is an
+    /// empty page, not an error.
+    ///
+    /// # Errors
+    ///
+    /// `InvalidArgument` for no subjects, too many, a bad `limit`, a malformed
+    /// target (naming the subject), a `tenant` subject naming another tenant,
+    /// a metric or kind the catalogue does not admit, or a cursor the service
+    /// did not issue; `PermissionDenied` when the PDP refuses any target;
+    /// `ServiceUnavailable` when the PDP or storage cannot answer.
+    #[idempotency(SafeRead)]
+    async fn snapshot(
+        &self,
+        ctx: &SecurityContext,
+        request: SnapshotRequest,
+    ) -> Result<PageResult<QuotaSnapshot>, QuotaEnforcementError>;
 }
 
 /// Platform operator policy surface. Every method requires explicit PDP admission.
 /// Identity and trusted schema snapshots are supplied by the service, not callers.
-#[async_trait]
-pub trait QuotaOperatorClientV1: Send + Sync + 'static {
+#[toolkit::contract(gear = "quota-enforcement", version = "v1")]
+pub trait QuotaOperatorApi: Send + Sync {
     /// Create and activate version one at an unoccupied scope.
     ///
     /// # Errors
     /// Authorization/configuration errors, or `AlreadyExists` for an occupied scope.
+    #[idempotency(NonIdempotentWrite)]
     async fn create_policy(
         &self,
         ctx: &SecurityContext,
@@ -170,55 +320,187 @@ pub trait QuotaOperatorClientV1: Send + Sync + 'static {
     ///
     /// # Errors
     /// Authorization/validation errors, unknown/deleted policy, or version conflict.
+    #[idempotency(NonIdempotentWrite)]
     async fn update_policy(
         &self,
         ctx: &SecurityContext,
-        id: crate::PolicyId,
-        patch: crate::PolicyPatch,
+        request: UpdatePolicyRequest,
     ) -> Result<crate::PolicyVersion, QuotaEnforcementError>;
 
     /// Activate a permissible historical version; retrying the active target is a no-op.
     ///
     /// # Errors
     /// Authorization errors, unknown/terminal version, or incompatible saved schemas.
+    #[idempotency(NonIdempotentWrite)]
     async fn rollback_policy(
         &self,
         ctx: &SecurityContext,
-        id: crate::PolicyId,
-        target_version: u32,
-        comment: Option<String>,
+        request: RollbackPolicyRequest,
     ) -> Result<crate::PolicyVersion, QuotaEnforcementError>;
 
     /// Soft-delete a metric policy, preserving history. A repeated delete is a no-op.
     ///
     /// # Errors
     /// Authorization errors, unknown policy, or attempted deletion of the global policy.
+    #[idempotency(NonIdempotentWrite)]
     async fn delete_policy(
         &self,
         ctx: &SecurityContext,
-        id: crate::PolicyId,
-        comment: Option<String>,
+        request: DeletePolicyRequest,
     ) -> Result<(), QuotaEnforcementError>;
 
     /// Read the active version, or a specific retained historical version.
     ///
     /// # Errors
     /// Authorization errors or an unknown policy/version; a deleted policy has no active version.
+    #[idempotency(SafeRead)]
     async fn read_policy(
         &self,
         ctx: &SecurityContext,
-        id: crate::PolicyId,
-        version: Option<u32>,
+        request: ReadPolicyRequest,
     ) -> Result<crate::PolicyVersion, QuotaEnforcementError>;
 
     /// Read one page of immutable policy history.
     ///
     /// # Errors
     /// Authorization errors, an unknown policy or invalid pagination input.
+    #[idempotency(SafeRead)]
     async fn list_policy_versions(
         &self,
         ctx: &SecurityContext,
-        id: crate::PolicyId,
-        page: PageRequest,
+        request: ListPolicyVersionsRequest,
     ) -> Result<PageResult<crate::PolicyVersionMeta>, QuotaEnforcementError>;
+}
+
+/// Input of [`QuotaManagerApi::update_quota`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateQuotaRequest {
+    /// The Quota to patch.
+    pub quota_id: QuotaId,
+    /// The non-breaking changes to apply.
+    pub patch: QuotaUpdate,
+}
+
+/// Input of [`QuotaManagerApi::read_quotas`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ReadQuotasRequest {
+    /// Which Quotas to read.
+    pub filter: QuotaFilter,
+    /// Which page of them.
+    pub page: PageRequest,
+}
+
+/// Input of [`QuotaOperatorApi::update_policy`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct UpdatePolicyRequest {
+    /// The policy to update.
+    pub id: PolicyId,
+    /// The new version, conditional on the active one.
+    pub patch: PolicyPatch,
+}
+
+/// Input of [`QuotaOperatorApi::rollback_policy`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RollbackPolicyRequest {
+    /// The policy to roll back.
+    pub id: PolicyId,
+    /// The version to activate again.
+    pub target_version: u32,
+    /// Version comment.
+    #[serde(default)]
+    pub comment: Option<String>,
+}
+
+/// Input of [`QuotaOperatorApi::delete_policy`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DeletePolicyRequest {
+    /// The policy to delete.
+    pub id: PolicyId,
+    /// Version comment.
+    #[serde(default)]
+    pub comment: Option<String>,
+}
+
+/// Input of [`QuotaOperatorApi::read_policy`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ReadPolicyRequest {
+    /// The policy to read.
+    pub id: PolicyId,
+    /// A retained historical version; the active one when absent.
+    #[serde(default)]
+    pub version: Option<u32>,
+}
+
+/// Input of [`QuotaOperatorApi::list_policy_versions`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ListPolicyVersionsRequest {
+    /// The policy whose history to read.
+    pub id: PolicyId,
+    /// Page size; the server's default, within its configured bound, when absent.
+    #[serde(default)]
+    pub limit: Option<u32>,
+    /// Opaque continuation cursor from a previous page.
+    #[serde(default)]
+    pub cursor: Option<String>,
+}
+
+// Tag traits `#[toolkit::rest_contract]` requires on the HTTP body types.
+mod api_dto_markers {
+    use toolkit::api::api_dto::{RequestApiDto, ResponseApiDto};
+
+    use crate::bulk::{
+        BulkCreateQuotasRequest, BulkCreated, BulkDeactivateQuotasRequest, BulkDeactivated,
+        BulkUpdateQuotasRequest, BulkUpdated,
+    };
+    use crate::models::{
+        AcquireLeaseOutcome, AcquireLeaseRequest, BatchDebitRequest, BatchDecision,
+        CommitLeaseRequest, CreditRequest, DeactivateOutcome, DebitRequest, Decision,
+        DecisionPreview, PageResult, PolicySpec, PolicyVersion, PolicyVersionMeta, PreviewRequest,
+        QuotaId, QuotaSnapshot, QuotaSpec, QuotaView, ReleaseLeaseRequest, RollbackRequest,
+        SnapshotRequest,
+    };
+
+    impl RequestApiDto for QuotaSpec {}
+    impl RequestApiDto for super::UpdateQuotaRequest {}
+    impl RequestApiDto for QuotaId {}
+    impl RequestApiDto for super::ReadQuotasRequest {}
+    impl RequestApiDto for CreditRequest {}
+    impl RequestApiDto for BulkCreateQuotasRequest {}
+    impl RequestApiDto for BulkUpdateQuotasRequest {}
+    impl RequestApiDto for BulkDeactivateQuotasRequest {}
+    impl RequestApiDto for DebitRequest {}
+    impl RequestApiDto for RollbackRequest {}
+    impl RequestApiDto for PreviewRequest {}
+    impl RequestApiDto for AcquireLeaseRequest {}
+    impl RequestApiDto for CommitLeaseRequest {}
+    impl RequestApiDto for ReleaseLeaseRequest {}
+    impl RequestApiDto for BatchDebitRequest {}
+    impl RequestApiDto for SnapshotRequest {}
+    impl RequestApiDto for PolicySpec {}
+    impl RequestApiDto for super::UpdatePolicyRequest {}
+    impl RequestApiDto for super::RollbackPolicyRequest {}
+    impl RequestApiDto for super::DeletePolicyRequest {}
+    impl RequestApiDto for super::ReadPolicyRequest {}
+    impl RequestApiDto for super::ListPolicyVersionsRequest {}
+
+    impl ResponseApiDto for QuotaId {}
+    impl ResponseApiDto for DeactivateOutcome {}
+    impl ResponseApiDto for Decision {}
+    impl ResponseApiDto for DecisionPreview {}
+    impl ResponseApiDto for AcquireLeaseOutcome {}
+    impl ResponseApiDto for BatchDecision {}
+    impl ResponseApiDto for BulkCreated {}
+    impl ResponseApiDto for BulkUpdated {}
+    impl ResponseApiDto for BulkDeactivated {}
+    impl ResponseApiDto for PolicyVersion {}
+    impl ResponseApiDto for PageResult<QuotaView> {}
+    impl ResponseApiDto for PageResult<QuotaSnapshot> {}
+    impl ResponseApiDto for PageResult<PolicyVersionMeta> {}
 }

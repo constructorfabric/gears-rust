@@ -1,9 +1,8 @@
-//! Atomic platform policy version transitions. This adapter remains unpublished
-//! until the full storage plugin contract is implemented.
+//! Atomic platform policy version transitions.
 use super::cursor;
 use super::entity::{policy, policy_operation_log, policy_version};
 use super::repo::policy_repo as repo;
-use crate::infra::outbox::{EnqueueError, NotificationEnqueuer};
+use crate::infra::outbox::{AttemptWakes, EnqueueError, NotificationOutbox, SettleWakes};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use quota_enforcement_sdk::{
@@ -23,7 +22,7 @@ const LOG_TARGET: &str = "qe.storage";
 #[derive(Clone)]
 pub struct SqlPolicyStore {
     db: Db,
-    enqueuer: Arc<dyn NotificationEnqueuer>,
+    enqueuer: Arc<dyn NotificationOutbox>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -228,7 +227,7 @@ fn decode_cursor(cursor: &str) -> Result<u32, StorageError> {
 impl SqlPolicyStore {
     /// Bind the database and same-transaction event enqueuer.
     #[must_use]
-    pub fn new(db: Db, enqueuer: Arc<dyn NotificationEnqueuer>) -> Self {
+    pub fn new(db: Db, enqueuer: Arc<dyn NotificationOutbox>) -> Self {
         Self { db, enqueuer }
     }
 
@@ -243,7 +242,8 @@ impl SqlPolicyStore {
         events: &[NotificationEvent],
     ) -> Result<PolicyVersion, StorageError> {
         let actor = ctx.subject_id().to_string();
-        let enqueuer = self.enqueuer.clone();
+        let wakes = AttemptWakes::begin(&self.enqueuer);
+        let enqueuer = wakes.enqueuer();
         let events = events.to_vec();
         self.db
             .transaction_ref_mapped(move |tx| {
@@ -300,6 +300,7 @@ impl SqlPolicyStore {
                     Ok(value)
                 })
             })
+            .settling(wakes)
             .await
             .map_err(|error| lift("create policy", error))
     }
@@ -316,7 +317,8 @@ impl SqlPolicyStore {
         events: &[NotificationEvent],
     ) -> Result<PolicyVersion, StorageError> {
         let actor = ctx.subject_id().to_string();
-        let enqueuer = self.enqueuer.clone();
+        let wakes = AttemptWakes::begin(&self.enqueuer);
+        let enqueuer = wakes.enqueuer();
         let events = events.to_vec();
         self.db
             .transaction_ref_mapped(move |tx| {
@@ -373,6 +375,7 @@ impl SqlPolicyStore {
                     Ok(value)
                 })
             })
+            .settling(wakes)
             .await
             .map_err(|error| lift("update policy", error))
     }
@@ -394,7 +397,8 @@ impl SqlPolicyStore {
         events: &[NotificationEvent],
     ) -> Result<TransitionOutcome<PolicyVersion>, StorageError> {
         let actor = ctx.subject_id().to_string();
-        let enqueuer = self.enqueuer.clone();
+        let wakes = AttemptWakes::begin(&self.enqueuer);
+        let enqueuer = wakes.enqueuer();
         let events = events.to_vec();
         self.db
             .transaction_ref_mapped(move |tx| {
@@ -458,6 +462,7 @@ impl SqlPolicyStore {
                     Ok(TransitionOutcome::Applied(value))
                 })
             })
+            .settling(wakes)
             .await
             .map_err(|error| lift("roll back policy", error))
     }
@@ -485,7 +490,8 @@ impl SqlPolicyStore {
         }
         // @cpt-end:cpt-cf-quota-enforcement-flow-policy-delete:p1:inst-prd-global-if
         let actor = ctx.subject_id().to_string();
-        let enqueuer = self.enqueuer.clone();
+        let wakes = AttemptWakes::begin(&self.enqueuer);
+        let enqueuer = wakes.enqueuer();
         let events = events.to_vec();
         self.db
             .transaction_ref_mapped(move |tx| {
@@ -514,6 +520,7 @@ impl SqlPolicyStore {
                     Ok(TransitionOutcome::Applied(()))
                 })
             })
+            .settling(wakes)
             .await
             .map_err(|error| lift("delete policy", error))
     }

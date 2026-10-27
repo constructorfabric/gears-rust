@@ -15,26 +15,39 @@
 //! Singleton coordination for the sweepers is not a contract of this SDK: the
 //! gear consumes the platform `cluster` gear's leader election (ADR-0006).
 //!
-//! The manager client trait ([`QuotaManagerClientV1`]) carries the Quota
-//! lifecycle; the consumer and operator traits land with their features.
+//! Three client contracts serve callers, in process or over REST ([`rest`]):
+//! [`QuotaManagerApi`] (Quota lifecycle and credit), [`QuotaEnforcementApi`]
+//! (consumption, leases, snapshots) and [`QuotaOperatorApi`] (policies).
 //!
 //! Enable the `test-util` feature for a complete in-memory double of the
 //! storage contract in [`testing`].
 #![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 
+pub mod bulk;
 pub mod client;
 pub mod engine;
 pub mod gts;
 pub mod models;
+pub mod notifications;
 pub mod period;
+pub mod rest;
 pub mod storage_plugin;
 pub mod thresholds;
 
 #[cfg(feature = "test-util")]
 pub mod testing;
 
+pub use bulk::{
+    BulkCreateEntry, BulkCreateEnvelope, BulkCreateItem, BulkCreateQuotasRequest, BulkCreated,
+    BulkCreatedItem, BulkDeactivateEntry, BulkDeactivateEnvelope, BulkDeactivateItem,
+    BulkDeactivateQuotasRequest, BulkDeactivated, BulkDeactivatedItem, BulkRecord, BulkUpdateEntry,
+    BulkUpdateEnvelope, BulkUpdateItem, BulkUpdateQuotasRequest, BulkUpdated, BulkUpdatedItem,
+};
 pub use client::{
-    QuotaEnforcementClientV1, QuotaEnforcementError, QuotaManagerClientV1, QuotaOperatorClientV1,
+    DeletePolicyRequest, ListPolicyVersionsRequest, QuotaEnforcementApi, QuotaEnforcementError,
+    QuotaManagerApi, QuotaOperatorApi, ReadPolicyRequest, ReadQuotasRequest, RollbackPolicyRequest,
+    UpdatePolicyRequest, UpdateQuotaRequest, quota_enforcement_api_ir, quota_manager_api_ir,
+    quota_operator_api_ir,
 };
 pub use engine::{
     EngineConfigError, EngineError, EngineRegistration, EngineValidationInput, EnvironmentInputs,
@@ -44,12 +57,15 @@ pub use engine::{
 };
 pub use gts::{
     CONSTRAINT_BASE, LEASE_RESOURCE, METRIC_BASE_TYPE, OPERATION_RESOURCE, OwnedDefinition,
-    POLICY_RESOURCE, QUOTA_RESOURCE, QuotaEnforcementStoragePluginSpecV1, REQUEST_BASE,
-    RESOURCE_BASE, SCOPE_TENANT, SCOPE_TYPE, SCOPE_USER, SUBJECT_BASE, owned_definitions,
+    POLICY_RESOURCE, QUOTA_RESOURCE, QuotaEnforcementStoragePluginSpecV1,
+    QuotaNotificationSinkSpecV1, REQUEST_BASE, RESOURCE_BASE, SCOPE_TENANT, SCOPE_TYPE, SCOPE_USER,
+    SUBJECT_BASE, owned_definitions,
 };
 pub use models::{
-    ActiveQuotaCounts, ApplicableQuotas, AppliedMutation, AttributionDigest, BatchDebitItem,
-    BootstrapBundle, CapPatch, ConfigDefaults, ContractRef, CounterSnapshot, CreditRequest,
+    AcquireLeaseOutcome, AcquireLeaseRequest, ActiveQuotaCounts, ApplicableQuotas, AppliedMutation,
+    ApportionError, AttributionDigest, BatchDebitItem, BatchDebitRequest, BatchDecision,
+    BatchItemOutcome, BatchItemRequest, BatchMode, BatchRecord, BatchResult, BootstrapBundle,
+    CapPatch, CommitLeaseRequest, ConfigDefaults, ContractRef, CounterSnapshot, CreditRequest,
     DECISION_BLOB_VERSION, DeactivateOutcome, DebitPlan, DebitRequest, Decision, DecisionPreview,
     DecisionResult, EnforcementMode, EvaluatedDebit, EvaluatedLease, EvaluationAttribution,
     EventId, ExpiredLease, IdempotencyRecord, IdempotencyScope, IdempotencySubjectKey,
@@ -59,14 +75,30 @@ pub use models::{
     PeriodType, PeriodWindow, PolicyDraft, PolicyId, PolicyPatch, PolicyScope, PolicySpec,
     PolicyUpdate, PolicyVersion, PolicyVersionMeta, PolicyVersionState, PreviewRequest,
     ProjectionBinding, Quota, QuotaDebitPlan, QuotaDraft, QuotaFilter, QuotaId, QuotaPatch,
-    QuotaSnapshot, QuotaSource, QuotaSpec, QuotaStatus, QuotaType, QuotaView, ResourceProjection,
-    Retention, RollbackRequest, RollbackTarget, ScopeError, SubjectClaim, SubjectRef, SubjectScope,
-    TenantId, ThresholdCrossing, TransitionOutcome, UnknownValue, ValidityWindow,
-    ValidityWindowPatch, positive_amount,
+    QuotaSnapshot, QuotaSource, QuotaSpec, QuotaStatus, QuotaType, QuotaUpdate, QuotaView,
+    ReleaseLeaseRequest, ResourceProjection, Retention, RollbackRequest, RollbackTarget,
+    RollbackableOperation, ScopeError, SnapshotRequest, SnapshotSubject, SubjectClaim, SubjectRef,
+    SubjectScope, TenantId, ThresholdCrossing, TransitionOutcome, UnknownValue, ValidityWindow,
+    ValidityWindowPatch, apportion, positive_amount,
+};
+pub use notifications::{
+    DeliveryOutcome, DispatchError, NotificationDeliveryHandle, NotificationDeliveryV1, QuotaEvent,
+    QuotaNotificationSinkV1,
+};
+pub use rest::{
+    QuotaEnforcementApiRest, QuotaManagerApiRest, QuotaOperatorApiRest,
+    quota_enforcement_api_rest_http_binding, quota_manager_api_rest_http_binding,
+    quota_operator_api_rest_http_binding,
+};
+#[cfg(feature = "rest-client")]
+pub use rest::{
+    QuotaEnforcementApiRestClient, QuotaEnforcementApiRestResolvingClient,
+    QuotaManagerApiRestClient, QuotaManagerApiRestResolvingClient, QuotaOperatorApiRestClient,
+    QuotaOperatorApiRestResolvingClient,
 };
 pub use storage_plugin::{
-    CONTRACT_MAJOR, EvaluatedBatch, EvaluatedMutation, QuotaEnforcementStoragePluginV1,
-    StorageError,
+    BatchEntry, BatchTimer, CONTRACT_MAJOR, EvaluatedBatch, EvaluatedMutation,
+    QuotaEnforcementStoragePluginV1, StorageError,
 };
 pub use thresholds::threshold_crossings;
 

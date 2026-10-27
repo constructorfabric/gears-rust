@@ -57,6 +57,17 @@ impl EvaluationBudget {
         })
     }
 
+    /// The budget of one batch item: whatever remains of the batch timer,
+    /// which supersedes the policy's own timeout. `None` once nothing
+    /// remains.
+    #[must_use]
+    pub fn within(remaining: Duration, cost_limit: NonZeroU64) -> Option<Self> {
+        (!remaining.is_zero()).then_some(Self {
+            timeout: remaining,
+            cost_limit,
+        })
+    }
+
     /// Maximum engine wall time for this invocation.
     #[must_use]
     pub const fn timeout(self) -> Duration {
@@ -177,7 +188,9 @@ mod tests {
 }
 
 /// Persistable, engine-dependent schema closure. MRW uses an empty closure.
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize, utoipa::ToSchema,
+)]
 #[serde(deny_unknown_fields)]
 pub struct PolicySchemaSnapshot {
     /// Fully resolved documents keyed by canonical schema identifier.
@@ -216,7 +229,9 @@ pub struct EngineConfigError {
 /// schemas its version persists and which catalogue changes can invalidate a
 /// later activation: a policy that never reads `resource` is not touched by a
 /// resource projection being added.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, utoipa::ToSchema,
+)]
 #[serde(deny_unknown_fields)]
 #[allow(
     clippy::struct_excessive_bools,
@@ -378,7 +393,7 @@ macro_rules! register_engine {
 }
 
 /// One metric's persisted CEL environment schema.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct MetricEnvironmentSchema {
     /// Admitted metric identifier.

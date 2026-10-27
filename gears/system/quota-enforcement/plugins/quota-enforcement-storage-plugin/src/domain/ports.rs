@@ -5,11 +5,13 @@ use std::collections::HashSet;
 
 use async_trait::async_trait;
 use quota_enforcement_sdk::{
-    ActiveQuotaCounts, ApplicableQuotas, AppliedMutation, ConfigDefaults, DeactivateOutcome,
-    EvaluatedDebit, EvaluatedMutation, IdempotencyRecord, IdempotencyScope, IdempotencyWrite,
-    NotificationEvent, PageRequest, PageResult, PartialIdempotencyWrite, PolicyDraft, PolicyId,
-    PolicyScope, PolicyUpdate, PolicyVersion, PolicyVersionMeta, ProjectionBinding, Quota,
-    QuotaDraft, QuotaFilter, QuotaId, QuotaPatch, QuotaSnapshot, RollbackTarget, StorageError,
+    ActiveQuotaCounts, ApplicableQuotas, AppliedMutation, BulkCreateEnvelope, BulkCreated,
+    BulkDeactivateEnvelope, BulkDeactivated, BulkUpdateEnvelope, BulkUpdated, ConfigDefaults,
+    DeactivateOutcome, EvaluatedDebit, EvaluatedLease, EvaluatedMutation, ExpiredLease,
+    IdempotencyRecord, IdempotencyScope, IdempotencyWrite, LeaseToken, MetricId, NotificationEvent,
+    PageRequest, PageResult, PartialIdempotencyWrite, PolicyDraft, PolicyId, PolicyScope,
+    PolicyUpdate, PolicyVersion, PolicyVersionMeta, ProjectionBinding, Quota, QuotaDraft,
+    QuotaFilter, QuotaId, QuotaPatch, QuotaSnapshot, RollbackTarget, StorageError,
     TransitionOutcome,
 };
 use time::OffsetDateTime;
@@ -119,6 +121,34 @@ pub enum StoreError {
         /// What did not add up.
         detail: String,
     },
+
+    // --- bulk envelopes ---
+    /// One item of a bulk envelope failed; the envelope rolled back.
+    #[error("bulk item {index}: {cause}")]
+    BulkItem {
+        /// Position of the failing item in the request.
+        index: usize,
+        /// What failed, as the single-item operation reports it.
+        cause: Box<Self>,
+    },
+    /// The envelope key was already used for other items (I2).
+    #[error("the idempotency key was used for a different payload")]
+    IdempotencyPayloadMismatch,
+    /// A concurrent writer of the envelope's scope held its stripe past the
+    /// contention budget (I8).
+    #[error("contention on the idempotency scope outlasted the budget")]
+    ContentionTimeout,
+}
+
+impl StoreError {
+    /// `self` as the failure of the bulk envelope's item at `index`.
+    #[must_use]
+    pub fn at_item(self, index: usize) -> Self {
+        Self::BulkItem {
+            index,
+            cause: Box::new(self),
+        }
+    }
 }
 
 /// Who performed a mutation, for the operation log.
@@ -132,6 +162,22 @@ pub struct Actor {
 }
 
 /// Schema metadata and the platform-default configuration rows.
+/// The plugin's one notification outbox pipeline.
+#[async_trait]
+pub trait NotificationPipeline: Send + Sync {
+    /// Start the pipeline, handing every claimed event to `delivery`, and bind
+    /// it for enqueueing.
+    ///
+    /// # Errors
+    ///
+    /// `Internal` when it was already started; `Unavailable` when the backend
+    /// cannot start it.
+    async fn start(
+        &self,
+        delivery: std::sync::Arc<dyn quota_enforcement_sdk::NotificationDeliveryV1>,
+    ) -> Result<Box<dyn quota_enforcement_sdk::NotificationDeliveryHandle>, StorageError>;
+}
+
 #[async_trait]
 pub trait FoundationStore: Send + Sync {
     /// The installed contract major, if the schema was ever bootstrapped.
@@ -195,6 +241,28 @@ pub trait QuotaStore: Send + Sync {
 
     /// Active-Quota counts behind the lifecycle gauges.
     async fn read_active_quota_counts(&self) -> Result<ActiveQuotaCounts, StoreError>;
+
+    /// Create every draft of `envelope` in one transaction, or none, with the
+    /// envelope's record.
+    async fn bulk_create_quotas(
+        &self,
+        actor: &Actor,
+        envelope: &BulkCreateEnvelope,
+    ) -> Result<TransitionOutcome<BulkCreated>, StoreError>;
+
+    /// Apply every patch of `envelope` in one transaction, or none.
+    async fn bulk_update_quotas(
+        &self,
+        actor: &Actor,
+        envelope: &BulkUpdateEnvelope,
+    ) -> Result<TransitionOutcome<BulkUpdated>, StoreError>;
+
+    /// Deactivate every Quota of `envelope` in one transaction, or none.
+    async fn bulk_deactivate_quotas(
+        &self,
+        actor: &Actor,
+        envelope: &BulkDeactivateEnvelope,
+    ) -> Result<TransitionOutcome<BulkDeactivated>, StoreError>;
 }
 
 /// The consumption primitives: counter mutations, their replay records, and the
@@ -218,6 +286,19 @@ pub trait ConsumptionStore: Send + Sync {
         mutation: &EvaluatedMutation<'_>,
         events: &[NotificationEvent],
     ) -> Result<TransitionOutcome<EvaluatedDebit>, StorageError>;
+
+    /// Evaluate and apply an atomic batch under one envelope key.
+    ///
+    /// # Errors
+    ///
+    /// The contract's variants for `apply_batch_debit`.
+    async fn apply_batch_debit(
+        &self,
+        ctx: &SecurityContext,
+        scope: &AccessScope,
+        batch: &quota_enforcement_sdk::EvaluatedBatch<'_>,
+        events: &[NotificationEvent],
+    ) -> Result<TransitionOutcome<Vec<quota_enforcement_sdk::EvaluatedDebit>>, StorageError>;
 
     /// Return consumption to one Quota, deriving the idempotency scope under
     /// the row lock.
@@ -250,8 +331,9 @@ pub trait ConsumptionStore: Send + Sync {
         events: &[NotificationEvent],
     ) -> Result<TransitionOutcome<AppliedMutation>, StorageError>;
 
-    /// Per-Quota state of one applicable set, materializing a missing current
-    /// period row and nothing else (the I3 exception).
+    /// Per-Quota state of one applicable set, creating the current window's
+    /// row of a valid consumption Quota that lacks one and nothing else (the
+    /// I3 exception).
     ///
     /// # Errors
     ///
@@ -262,6 +344,21 @@ pub trait ConsumptionStore: Send + Sync {
         scope: &AccessScope,
         applicable: &ApplicableQuotas,
     ) -> Result<Vec<QuotaSnapshot>, StorageError>;
+
+    /// One page of the per-Quota state of many applicable sets, each Quota
+    /// once, in `quota_id` order, under the same I3 exception.
+    ///
+    /// # Errors
+    ///
+    /// `InvalidCursor` for a cursor this plugin did not issue; `Unavailable`
+    /// when the backend cannot answer.
+    async fn bulk_read_quota_snapshot(
+        &self,
+        ctx: &SecurityContext,
+        scope: &AccessScope,
+        pairs: &[ApplicableQuotas],
+        page: PageRequest,
+    ) -> Result<PageResult<QuotaSnapshot>, StorageError>;
 
     /// The unexpired record under `scope_of`, if one exists.
     ///
@@ -405,4 +502,77 @@ pub trait PolicyStore: Send + Sync {
         policy_id: &PolicyId,
         page: PageRequest,
     ) -> Result<PageResult<PolicyVersionMeta>, StorageError>;
+}
+
+/// The lease primitives: the two-phase hold, its settlements, and the
+/// reclamation of the holds that outlived their TTL.
+///
+/// Separate from [`ConsumptionStore`] because these are a different contract
+/// group, and implemented by the same adapter because they settle against the
+/// same counters and idempotency records.
+#[async_trait]
+pub trait LeaseStore: Send + Sync {
+    /// Evaluate the policy under the Quota locks and hold the resulting plan.
+    ///
+    /// # Errors
+    ///
+    /// The contract's variants for `acquire_lease`.
+    async fn acquire_lease(
+        &self,
+        ctx: &SecurityContext,
+        scope: &AccessScope,
+        mutation: &EvaluatedMutation<'_>,
+        ttl: std::time::Duration,
+    ) -> Result<TransitionOutcome<EvaluatedLease>, StorageError>;
+
+    /// Convert an active lease into a debit for what was used, returning the
+    /// rest to the acquisition period.
+    ///
+    /// # Errors
+    ///
+    /// The contract's variants for `commit_lease`.
+    async fn commit_lease(
+        &self,
+        ctx: &SecurityContext,
+        scope: &AccessScope,
+        token: LeaseToken,
+        actual_amount: Option<u64>,
+        idempotency: &PartialIdempotencyWrite,
+        events: &[NotificationEvent],
+    ) -> Result<TransitionOutcome<AppliedMutation>, StorageError>;
+
+    /// Return an active lease's full held capacity, committing no debit.
+    ///
+    /// # Errors
+    ///
+    /// The contract's variants for `release_lease`.
+    async fn release_lease(
+        &self,
+        ctx: &SecurityContext,
+        scope: &AccessScope,
+        token: LeaseToken,
+        idempotency: &PartialIdempotencyWrite,
+        events: &[NotificationEvent],
+    ) -> Result<TransitionOutcome<AppliedMutation>, StorageError>;
+
+    /// Transition expired leases and give back whatever they still hold.
+    ///
+    /// # Errors
+    ///
+    /// `Unavailable` when the backend cannot answer.
+    async fn reclaim_expired_leases(
+        &self,
+        batch_size: u32,
+        before: OffsetDateTime,
+    ) -> Result<Vec<ExpiredLease>, StorageError>;
+
+    /// Expired leases nobody has reclaimed, by metric, behind the gauge.
+    ///
+    /// # Errors
+    ///
+    /// `Unavailable` when the backend cannot answer.
+    async fn count_expired_unreclaimed_leases(
+        &self,
+        before: OffsetDateTime,
+    ) -> Result<Vec<(MetricId, u64)>, StorageError>;
 }
