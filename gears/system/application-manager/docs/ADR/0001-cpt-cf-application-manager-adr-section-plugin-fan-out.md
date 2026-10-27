@@ -48,9 +48,9 @@ Each kind of seeded data is owned by a section plugin, and every section plugin 
 
 Chosen option: "Discovery at startup into a fixed set", because it gives one plugin set for the process lifetime, makes conflicts and discovery failures fail at deploy time, and keeps the types registry off the seed and uninstall paths.
 
-* At `start`, the gear lists the instances of the section plugin GTS type and reads each instance's `priority` and `section_type`. The key is the section type id without its minor version, and the priority orders the plugins.
-* The gear resolves each section type and compiles its schema ([ADR 0002](./0002-cpt-cf-application-manager-adr-registered-section-schemas.md)), and resolves each client in ClientHub by exact GTS id. Startup makes no plugin call.
-* The key map, priority order and compiled schemas stay fixed until the next start; an empty set is a valid start.
+* At `start`, the gear lists the instances of the section plugin GTS type and reads each instance's `priority` and `section_type`. The key is the section type's own segment without its version, for example `acme.iam.roles`, and the priority orders the plugins.
+* The gear resolves each section type and resolves each client in ClientHub by exact GTS id. Startup makes no plugin call.
+* The key map and priority order stay fixed until the next start; an empty set is a valid start.
 * Startup fails with no retry on any condition of `cpt-cf-application-manager-fr-startup-checks`, naming a reason from [DESIGN §4.1](../DESIGN.md#41-observability).
 * Seed calls `apply` and uninstall calls `remove` on every plugin, one at a time in priority order.
 
