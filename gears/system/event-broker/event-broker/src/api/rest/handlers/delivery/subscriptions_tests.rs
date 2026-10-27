@@ -820,6 +820,7 @@ async fn join_rejected_for_missing_topic_consume_permission_returns_403() {
 
 #[tokio::test]
 async fn join_checks_consume_on_the_concrete_topic_and_types() {
+    let target_tenant = Uuid::new_v4();
     let asked = Arc::new(std::sync::Mutex::new(Vec::<(String, String)>::new()));
     let recorder = Arc::clone(&asked);
     let harness = EventBrokerHarness::builder()
@@ -828,6 +829,14 @@ async fn join_checks_consume_on_the_concrete_topic_and_types() {
         ])))
         .with_policy_enforcer(PolicyEnforcer::new(Arc::new(DenyingAuthZ {
             deny_if: move |req: &EvaluationRequest| {
+                if req.resource.properties.contains_key("event_type_id")
+                    || req.resource.properties.contains_key("topic_id")
+                {
+                    assert_eq!(
+                        req.resource.properties.get("owner_tenant_id"),
+                        Some(&json!(target_tenant))
+                    );
+                }
                 recorder
                     .lock()
                     .unwrap()
@@ -851,7 +860,7 @@ async fn join_checks_consume_on_the_concrete_topic_and_types() {
             "client_agent": "test-agent",
             "interests": [{
                 "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
-                "tenant_id": Uuid::new_v4(),
+                "tenant_id": target_tenant,
                 "types": [
                     "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
                     "gts.cf.core.events.event.v1~x.eb.t1.*",

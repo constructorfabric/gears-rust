@@ -443,6 +443,10 @@ where
                     None,
                     &AccessRequest::new()
                         .resource_property("topic_id", interest.topic.as_ref())
+                        .resource_property(
+                            toolkit_security::pep_properties::OWNER_TENANT_ID,
+                            interest.tenant_id,
+                        )
                         .require_constraints(false),
                 )
                 .await
@@ -459,6 +463,10 @@ where
                         None,
                         &AccessRequest::new()
                             .resource_property("event_type_id", pattern_str)
+                            .resource_property(
+                                toolkit_security::pep_properties::OWNER_TENANT_ID,
+                                interest.tenant_id,
+                            )
                             .require_constraints(false),
                     )
                     .await

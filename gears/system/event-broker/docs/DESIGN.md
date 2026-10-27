@@ -1726,11 +1726,11 @@ Wildcards are supported in granted resource patterns.
 
 | Operation | Action | PEP resource type | Resource property |
 |---|---|---|---|
-| Publish | `produce` | Event type | `event_type_id` |
-| JOIN a topic | `consume` | Topic id | `topic_id` |
-| JOIN an exact event-type interest | `consume` | Event type | `event_type_id` |
-| JOIN a wildcard interest | `consume` | `gts.cf.core.events.event.v1~` | `event_type_id` (the pattern) |
-| Deliver a matching event | `consume` | Event type | `event_type_id` |
+| Publish | `produce` | Event type | `event_type_id`, `owner_tenant_id` |
+| JOIN a topic | `consume` | Topic id | `topic_id`, `owner_tenant_id` |
+| JOIN an exact event-type interest | `consume` | Event type | `event_type_id`, `owner_tenant_id` |
+| JOIN a wildcard interest | `consume` | `gts.cf.core.events.event.v1~` | `event_type_id` (the pattern), `owner_tenant_id` |
+| Deliver a matching event | `consume` | Tenant request, topic id, event type (three checks) | `owner_tenant_id` on all; `topic_id` / `event_type_id` on their respective checks |
 | JOIN, get or list a named group | `consume` | Group id | `consumer_group_id` |
 | Delete a named group | `manage` | Group id | `consumer_group_id` |
 | Create a group | `define` | `gts.cf.core.events.consumer_group.v1~` | — |
@@ -1740,16 +1740,28 @@ valid GTS id. They currently require a grant covering the whole event family.
 Checking whether a narrower grant covers the requested pattern is not yet
 implemented. Tenant scope is checked separately on `gts.cf.core.events.request.v1~`.
 
+Every topic and event-type descriptor advertises `owner_tenant_id`. Publish
+checks carry the input event's tenant; JOIN topic and type checks carry the
+interest's tenant. These properties describe the requested event-data scope,
+not ownership of a global type schema. The policy must evaluate the named
+permission in that target tenant and deny if its scope does not include it;
+a separate tenant-authority allow never broadens an event or topic grant.
+Named consumer groups remain shared resources identified by their globally
+unique GTS instance and are checked independently of event-data tenant scope.
+
 Before authorization, publishing a type outside the event family returns
 `404 EventTypeNotFound`. A JOIN pattern that neither covers nor is covered by
 the event family returns `400 BadTypePattern`.
 
-Delivery checks `consume` for each matching event using the stream caller's
-security context, including derived types matched by a parent selector.
+Delivery checks `consume` independently on the tenant request, topic, and
+concrete event type for each matching event, using the stream caller's security
+context and the stored event's `tenant_id` as `owner_tenant_id` on all three.
+This includes derived types matched by a parent selector.
 Denied events count as examined but are not delivered. If evaluation returns an error,
 the stream closes with `teardown`; the current batch is neither emitted nor
 reported as progress, so it can be replayed. Decisions are not cached: each
-matching event requires one PEP evaluation.
+matching event requires all three PEP evaluations to allow. Revoking any of
+the three permissions takes effect on subsequent matching events.
 
 **Subject_type is enforced on two independent dimensions**:
 1. **Authorization** (the `subject_type:produce` / `subject_type:consume` permission above) — *capability*: can the principal write or read events whose subject is of this type?
@@ -1783,7 +1795,7 @@ Both must pass on publish; both must pass at subscribe. They cover different con
   - `(subject_type_resource, "consume", subject_type_pattern)` — for each entry in `subscription.subject_types` (if present)
 - Combined `AccessScope` from the group + topic + event_type + subject_type checks is cached with the subscription. Every subsequent poll applies these constraints to the read query.
 
-**Stream / seek / leave** — no re-check. Authorization is done at JOIN; the cached AccessScope governs all subsequent reads. `subscription_id` is the bearer of authority for follow-up operations. There is no separate `manage` permission — subscription create / list / read / seek / leave are gated by the same `consume` permission.
+**Stream / seek / leave** — follow-up operations check the caller's authority over the subscription tenant. During streaming, each matching event additionally passes the independent tenant, topic, and concrete event-type consume checks described above. JOIN decisions are not cached as enduring delivery authority. There is no separate `manage` permission for subscriptions.
 
 **Current implementation status** (`gears-rust#4516`, `eb-authz-enforcement`): the publish and JOIN
 paths above are implemented exactly to the subset `docs/openapi.yaml` documents — `event_type:produce`
@@ -1798,8 +1810,9 @@ tracked as its own follow-up. Tenant scope is enforced via its own `authz-resolv
 allowing) is entirely the deployed authz-resolver plugin/policy's concern, mirroring `oagw`'s
 `bind.rs::validate_bind_constraints` precedent. The cached-`AccessScope`-on-JOIN / row-level-read-filtering model
 described above is also not yet implemented: today's checks are a pass/fail gate only
-(`require_constraints(false)`), and `stream`/`seek`/`leave` genuinely do no re-check, matching this
-section's "no re-check" line, but with no `AccessScope` to constrain them either.
+(`require_constraints(false)`). Delivery rechecks tenant, topic, and concrete
+event permissions per matching event as described above; it does not rely on
+cached JOIN decisions or SQL predicates for those checks.
 
 **Define path** — ABI / operator registration time:
 - `(topic_resource, "define", topic.id)` for each topic being registered

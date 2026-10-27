@@ -855,6 +855,7 @@ async fn publish_rejected_for_unauthorized_tenant_id_returns_403() {
 
 #[tokio::test]
 async fn publish_checks_produce_on_the_events_own_type_not_a_family_label() {
+    let target_tenant = Uuid::new_v4();
     let asked = Arc::new(std::sync::Mutex::new(Vec::<(String, String)>::new()));
     let recorder = Arc::clone(&asked);
     let harness = EventBrokerHarness::builder()
@@ -868,6 +869,14 @@ async fn publish_checks_produce_on_the_events_own_type_not_a_family_label() {
         ])))
         .with_policy_enforcer(PolicyEnforcer::new(Arc::new(DenyingAuthZ {
             deny_if: move |req: &EvaluationRequest| {
+                if req.resource.properties.contains_key("event_type_id")
+                    || req.resource.properties.contains_key("topic_id")
+                {
+                    assert_eq!(
+                        req.resource.properties.get("owner_tenant_id"),
+                        Some(&json!(target_tenant))
+                    );
+                }
                 recorder
                     .lock()
                     .unwrap()
@@ -884,7 +893,7 @@ async fn publish_checks_produce_on_the_events_own_type_not_a_family_label() {
         .with_body(Json(&json!({
             "id": Uuid::new_v4(),
             "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
-            "tenant_id": Uuid::new_v4(),
+            "tenant_id": target_tenant,
             "source": "test-publish_checks_produce_on_the_events_own_type",
             "subject": "s-publish_checks_produce_on_the_events_own_type",
             "subject_type": "gts.x.eb.t1.subject.v1~",
@@ -1739,4 +1748,76 @@ async fn publish_event_envelope_encoding_is_checked_before_event_type_lookup() {
             "ascii_only",
         )
     );
+}
+
+/// A type grant in another tenant must not enqueue or advance producer state.
+#[tokio::test]
+async fn tenant_scoped_produce_denial_has_no_persistence_side_effects() {
+    let target = Uuid::new_v4();
+    let harness = EventBrokerHarness::builder()
+        .with_type_registry(StaticTypesRegistry::of(json!([
+            { "id": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1", "partitions": 1 },
+            { "id": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~", "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1", "allowed_subject_types": ["gts.x.eb.t1.subject.v1~"] },
+        ])))
+        .with_policy_enforcer(PolicyEnforcer::new(Arc::new(DenyingAuthZ {
+            deny_if: move |req: &EvaluationRequest| {
+                req.resource.resource_type == "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~"
+                    && req.resource.properties.get("owner_tenant_id") == Some(&json!(target))
+            },
+        })))
+        .build().await;
+    let producer = register_test_producer(&harness).await;
+    let result = harness
+        .ingest()
+        .publish_event(
+            harness.security_context(),
+            PublishRequest {
+                id: Uuid::new_v4(),
+                r#type: crate::test_support::event_type_id(
+                    "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
+                ),
+                tenant_id: target,
+                source: "denied".to_owned(),
+                subject: "s".to_owned(),
+                subject_type: gts::GtsTypeId::new("gts.x.eb.t1.subject.v1~"),
+                occurred_at: Utc::now(),
+                trace_parent: None,
+                data: json!({}),
+                meta: Some(crate::domain::model::Meta {
+                    version: 1,
+                    producer_id: producer,
+                    previous: Some(0),
+                    sequence: 1,
+                }),
+            },
+        )
+        .await;
+    assert!(matches!(
+        result,
+        Err(DomainError::Forbidden {
+            code: ErrorCode::NotAuthorizedToProduce,
+            ..
+        })
+    ));
+    let cursors = harness
+        .ingest()
+        .get_producer_cursors(harness.security_context(), producer)
+        .await
+        .unwrap();
+    assert!(
+        cursors.topics.is_empty(),
+        "denial must not advance producer state"
+    );
+    let events = harness
+        .backend()
+        .read(
+            harness.security_context(),
+            "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
+            0,
+            event_broker_sdk::Sequence::NONE,
+            10,
+        )
+        .await
+        .unwrap();
+    assert!(events.is_empty(), "denial must not persist an event");
 }
