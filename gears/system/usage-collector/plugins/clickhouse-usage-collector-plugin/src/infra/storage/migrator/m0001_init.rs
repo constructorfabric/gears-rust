@@ -96,11 +96,11 @@ fn catalog() -> Table {
             "Closed list of allowed metadata key names; stored verbatim",
         )
         .column(
-            "version",
+            VERSION_COLUMN,
             "UInt64",
             "ReplacingMergeTree version column; higher value wins on merge / FINAL resolution",
         )
-        .version("version")
+        .version(VERSION_COLUMN)
         .order_by(CATALOG_ORDER_BY)
         .sharding_key(CATALOG_SHARDING_KEY)
 }
@@ -109,6 +109,10 @@ fn catalog() -> Table {
 /// `gts_id`. The table carries no TTL and no time column, so it is not
 /// partitioned.
 pub const CATALOG_ORDER_BY: &[&str] = &["gts_id"];
+
+/// The `ReplacingMergeTree` version column of both tables. Merges and `FINAL`
+/// keep the row with the highest value; without it they keep the last insert.
+pub const VERSION_COLUMN: &str = "version";
 
 // ── usage_records ────────────────────────────────────────────────────────────
 
@@ -194,12 +198,12 @@ fn records() -> Table {
         )
         .column("ingested_at", "DateTime64(6)", "Server insert timestamp")
         .column(
-            "version",
+            VERSION_COLUMN,
             "UInt64",
             "ReplacingMergeTree version column; higher value wins on merge / FINAL resolution",
         )
         .indexes(&RECORDS_INDEXES)
-        .version("version")
+        .version(VERSION_COLUMN)
         .partition_by(RECORDS_PARTITION_KEY)
         .order_by(RECORDS_ORDER_BY)
         .ttl_delete_after("created_at")

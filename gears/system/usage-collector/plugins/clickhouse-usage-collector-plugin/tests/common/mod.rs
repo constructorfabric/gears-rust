@@ -105,7 +105,6 @@ async fn bring_up_inner() -> anyhow::Result<ChHarness> {
     for _ in 0..20u8 {
         let opts = MigrationOptions {
             retention_period_secs: cfg.retention_period_secs,
-            statement_timeout_secs: None,
         };
         match run_migrations(&client, &Topology::SingleNode, opts, TEST_REQUEST_TIMEOUT).await {
             Ok(_) => {

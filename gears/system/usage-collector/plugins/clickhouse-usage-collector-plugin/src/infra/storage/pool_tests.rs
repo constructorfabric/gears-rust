@@ -952,7 +952,7 @@ mod integration {
 // ---------------------------------------------------------------------------
 
 mod cluster_schema {
-    use super::super::{SystemTableRow, check_cluster_schema, distributed_engine_args};
+    use super::super::{SystemTableRow, check_cluster_schema, engine_args};
     use crate::infra::storage::topology::Topology;
 
     fn topology() -> Topology {
@@ -1105,8 +1105,9 @@ mod cluster_schema {
     #[test]
     fn engine_args_are_split_at_top_level_only() {
         assert_eq!(
-            distributed_engine_args(
-                "Distributed('uc', 'db', 't', cityHash64(tenant_id, gts_id)) SETTINGS fsync_after_insert = 0"
+            engine_args(
+                "Distributed('uc', 'db', 't', cityHash64(tenant_id, gts_id)) SETTINGS fsync_after_insert = 0",
+                "Distributed",
             ),
             Some(vec![
                 "uc".to_owned(),
@@ -1115,7 +1116,57 @@ mod cluster_schema {
                 "cityHash64(tenant_id,gts_id)".to_owned(),
             ])
         );
-        assert_eq!(distributed_engine_args("MergeTree ORDER BY id"), None);
-        assert_eq!(distributed_engine_args("Distributed('uc', 'db'"), None);
+        assert_eq!(
+            engine_args(
+                "ReplicatedReplacingMergeTree('/clickhouse/tables/{uuid}/{shard}', '{replica}', version) ORDER BY gts_id",
+                "ReplicatedReplacingMergeTree",
+            ),
+            Some(vec![
+                "/clickhouse/tables/{uuid}/{shard}".to_owned(),
+                "{replica}".to_owned(),
+                "version".to_owned(),
+            ])
+        );
+        assert_eq!(engine_args("MergeTree ORDER BY id", "Distributed"), None);
+        assert_eq!(engine_args("Distributed('uc', 'db'", "Distributed"), None);
+    }
+
+    /// Without the version column, merges keep the last inserted row instead
+    /// of the highest version, undoing version-based state resolution.
+    #[test]
+    fn local_engine_without_version_is_rejected() {
+        for args in [
+            "",
+            "'/clickhouse/tables/{uuid}/{shard}', '{replica}'",
+            "'/clickhouse/tables/{uuid}/{shard}', '{replica}', ingested_at",
+            "'/clickhouse/tables/{uuid}/{shard}', '{replica}', version, is_deleted",
+        ] {
+            for i in [0, 1] {
+                let mut rows = good_rows();
+                rows[i].engine_full =
+                    format!("ReplicatedReplacingMergeTree({args}) ORDER BY gts_id");
+                let problems = check_cluster_schema(&rows, &topology(), "db");
+                assert_eq!(problems.len(), 1, "{args}: {problems:?}");
+                assert!(problems[0].contains("version"), "{problems:?}");
+            }
+        }
+
+        let mut rows = good_rows();
+        rows[1].engine_full = "ReplicatedReplacingMergeTree ORDER BY gts_id".to_owned();
+        assert_eq!(
+            check_cluster_schema(&rows, &topology(), "db").len(),
+            1,
+            "an engine with no arguments at all has no version column"
+        );
+    }
+
+    #[test]
+    fn local_engine_with_version_only_argument_passes() {
+        let mut rows = good_rows();
+        rows[1].engine_full = "ReplicatedReplacingMergeTree(version) ORDER BY gts_id".to_owned();
+        assert_eq!(
+            check_cluster_schema(&rows, &topology(), "db"),
+            Vec::<String>::new()
+        );
     }
 }

@@ -4,6 +4,9 @@ use percent_encoding::percent_decode_str;
 use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 
+use crate::infra::storage::migrator::MIGRATIONS_TRACKER;
+use crate::infra::storage::topology::{CATALOG_TABLE, RECORDS_TABLE};
+
 /// Return `true` when `url` uses a plaintext `http` connection (no TLS).
 ///
 /// Used by [`ClickHousePluginConfig::validate`] to fail closed on an
@@ -200,10 +203,13 @@ pub struct ClickHouseClusterConfig {
     /// Cluster name as declared in the server's `remote_servers` config.
     pub name: String,
     /// Shard-local `ReplicatedReplacingMergeTree` table behind the
-    /// `usage_records` `Distributed` table.
+    /// `usage_records` `Distributed` table. Must not be a name the plugin
+    /// creates itself (`usage_records`, `usage_type_catalog`,
+    /// `usage_collector_migrations`).
     pub records_local_table: String,
     /// Shard-local `ReplicatedReplacingMergeTree` table behind the
-    /// `usage_type_catalog` `Distributed` table.
+    /// `usage_type_catalog` `Distributed` table. Same reserved names as
+    /// [`Self::records_local_table`].
     pub catalog_local_table: String,
     /// Optional `insert_quorum` sent with every insert: a replica count, or
     /// `auto` (majority). Unset leaves the server default (no quorum), so an
@@ -213,9 +219,11 @@ pub struct ClickHouseClusterConfig {
     /// expecting an operator-provisioned schema. Off by default: the plugin's
     /// user then needs `CREATE` / `ALTER` and the `CLUSTER` privilege.
     pub manage_schema: bool,
-    /// Client-side budget for one cluster migration statement, in seconds.
-    /// `ON CLUSTER` DDL waits for every host, so it does not fit the
-    /// request-path deadline.
+    /// Budget for one cluster migration statement (the migrations and the TTL
+    /// reconciliation), in seconds. `ON CLUSTER` DDL waits for every host, so
+    /// it does not fit the request-path deadline. Sets the server-side
+    /// `send_timeout`, `receive_timeout` and `distributed_ddl_task_timeout`
+    /// (`migrator::migration_client`); the client-side deadline adds a grace.
     pub migration_statement_timeout_secs: u64,
 }
 
@@ -231,6 +239,10 @@ impl Default for ClickHouseClusterConfig {
         }
     }
 }
+
+/// Tables the plugin creates under fixed names, which a configured local
+/// table must not reuse.
+const RESERVED_TABLE_NAMES: [&str; 3] = [RECORDS_TABLE, CATALOG_TABLE, MIGRATIONS_TRACKER];
 
 /// Whether `s` is a plain `ClickHouse` identifier (`[A-Za-z_][A-Za-z0-9_]*`),
 /// safe to interpolate unquoted into SQL.
@@ -258,8 +270,8 @@ impl ClickHouseClusterConfig {
     /// # Errors
     ///
     /// Returns an error string for an identifier that is not a plain
-    /// `ClickHouse` identifier, two local tables sharing a name, an
-    /// `insert_quorum` that is neither `auto` nor a positive integer, or a
+    /// `ClickHouse` identifier, two local tables sharing a name, a local table
+    /// named after a table the plugin creates itself, an `insert_quorum` that is neither `auto` nor a positive integer, or a
     /// zero migration statement timeout.
     fn validate(&self) -> Result<(), String> {
         for (field, value) in [
@@ -279,6 +291,17 @@ impl ClickHouseClusterConfig {
                 "cluster.records_local_table and cluster.catalog_local_table must differ"
                     .to_owned(),
             );
+        }
+        // Exact match: `ClickHouse` table names are case-sensitive.
+        for (field, value) in [
+            ("cluster.records_local_table", &self.records_local_table),
+            ("cluster.catalog_local_table", &self.catalog_local_table),
+        ] {
+            if RESERVED_TABLE_NAMES.contains(&value.as_str()) {
+                return Err(format!(
+                    "{field} = `{value}` is reserved: the plugin creates a table of that name itself"
+                ));
+            }
         }
         if let Some(quorum) = &self.insert_quorum
             && quorum != "auto"

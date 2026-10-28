@@ -633,12 +633,12 @@ fn squash(s: &str) -> String {
     s.chars().filter(|c| !c.is_whitespace()).collect()
 }
 
-/// Top-level arguments of the first `Distributed(...)` call in `engine_full`,
+/// Top-level arguments of the first `<engine>(...)` call in `engine_full`,
 /// whitespace-squashed and with surrounding quotes removed; `None` when the
 /// text holds no well-formed call.
-pub(crate) fn distributed_engine_args(engine_full: &str) -> Option<Vec<String>> {
-    const HEAD: &str = "Distributed(";
-    let body = &engine_full[engine_full.find(HEAD)? + HEAD.len()..];
+pub(crate) fn engine_args(engine_full: &str, engine: &str) -> Option<Vec<String>> {
+    let head = format!("{engine}(");
+    let body = &engine_full[engine_full.find(&head)? + head.len()..];
     let mut args = Vec::new();
     let mut current = String::new();
     let mut depth = 0_u32;
@@ -670,6 +670,16 @@ pub(crate) fn distributed_engine_args(engine_full: &str) -> Option<Vec<String>> 
         }
     }
     None
+}
+
+/// Whether a `ReplacingMergeTree`-family `engine_full` names exactly the
+/// plugin's version column: `(version)` or, with Keeper arguments (which
+/// `ClickHouse` stores even when defaulted), `('path', 'replica', version)`.
+/// A missing version, another column, or an extra `is_deleted` argument fails.
+fn has_version_column(engine_full: &str, engine: &str) -> bool {
+    engine_args(engine_full, engine).is_some_and(
+        |args| matches!(args.as_slice(), [v] | [_, _, v] if v == m0001_init::VERSION_COLUMN),
+    )
 }
 
 /// Check the operator-provisioned cluster schema seen on the connected node.
@@ -715,6 +725,14 @@ pub(crate) fn check_cluster_schema(
                 "local table `{local}` uses engine {}, expected {local_engine}",
                 row.engine
             ));
+        } else if !has_version_column(&row.engine_full, local_engine) {
+            problems.push(format!(
+                "local table `{local}` is `{}`, expected {local_engine}(..., {version}): \
+                 without the version column merges keep the last insert instead of the \
+                 highest version",
+                row.engine_full,
+                version = m0001_init::VERSION_COLUMN,
+            ));
         }
         if squash(&row.sorting_key) != sorting_key {
             problems.push(format!(
@@ -745,7 +763,7 @@ pub(crate) fn check_cluster_schema(
             ));
             continue;
         }
-        let ok = distributed_engine_args(&row.engine_full).is_some_and(|args| {
+        let ok = engine_args(&row.engine_full, "Distributed").is_some_and(|args| {
             matches!(
                 args.as_slice(),
                 [c, db, l, key, ..]
@@ -793,7 +811,8 @@ pub(crate) async fn timed<T>(
 ///
 /// * the cluster is not declared in `system.clusters`;
 /// * a table is missing or has the wrong engine, sort key, partition key, or
-///   `Distributed` target / sharding key ([`check_cluster_schema`]);
+///   `Distributed` target / sharding key, or a local table's engine lacks the
+///   `version` column ([`check_cluster_schema`]);
 /// * any replica of the cluster lacks one of the four tables — the plugin
 ///   may be pointed at any node, and an `ON CLUSTER` mutation needs the local
 ///   tables everywhere. An unreachable replica fails this probe too, which is

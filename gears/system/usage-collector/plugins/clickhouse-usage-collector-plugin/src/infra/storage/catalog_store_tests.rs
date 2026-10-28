@@ -731,7 +731,6 @@ mod live {
 
             let opts = MigrationOptions {
                 retention_period_secs: 365 * 24 * 3600,
-                statement_timeout_secs: None,
             };
             run_migrations(&client, &Topology::SingleNode, opts, super::TEST_DEADLINE)
                 .await

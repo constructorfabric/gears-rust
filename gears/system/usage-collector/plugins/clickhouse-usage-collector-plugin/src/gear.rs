@@ -14,7 +14,7 @@ use crate::domain::adapter::StorageAdapter;
 use crate::domain::ports::{CatalogStore, RecordStore};
 use crate::infra::metrics::Metrics;
 use crate::infra::storage::catalog_store::ChCatalogStore;
-use crate::infra::storage::migrator::{MigrationOptions, run_migrations};
+use crate::infra::storage::migrator::{MigrationOptions, migration_client, run_migrations};
 use crate::infra::storage::pool::{build_client, ensure_retention_ttl, validate_cluster_schema};
 use crate::infra::storage::record_store::ChRecordStore;
 use crate::infra::storage::topology::Topology;
@@ -87,7 +87,6 @@ impl Gear for ClickHouseUsageCollectorPlugin {
                     (Topology::SingleNode, _) => {
                         let opts = MigrationOptions {
                             retention_period_secs: cfg.retention_period_secs,
-                            statement_timeout_secs: None,
                         };
                         run_migrations(&client, &topology, opts, client_deadline)
                             .await
@@ -107,13 +106,19 @@ impl Gear for ClickHouseUsageCollectorPlugin {
                     (Topology::Cluster { .. }, Some(cluster)) if cluster.manage_schema => {
                         let opts = MigrationOptions {
                             retention_period_secs: cfg.retention_period_secs,
-                            statement_timeout_secs: Some(cluster.migration_statement_timeout_secs),
                         };
                         let deadline = cluster.migration_deadline();
-                        run_migrations(&client, &topology, opts, deadline)
+                        let migration_client =
+                            migration_client(&client, cluster.migration_statement_timeout_secs);
+                        run_migrations(&migration_client, &topology, opts, deadline)
                             .await
                             .inspect_err(|_| metrics.inc_migration_failure())?;
-                        ensure_retention_ttl(&client, &topology, cfg.retention_period_secs, deadline)
+                        ensure_retention_ttl(
+                            &migration_client,
+                            &topology,
+                            cfg.retention_period_secs,
+                            deadline,
+                        )
                             .await
                             .inspect_err(|_| metrics.inc_migration_failure())?;
                         validate_cluster_schema(

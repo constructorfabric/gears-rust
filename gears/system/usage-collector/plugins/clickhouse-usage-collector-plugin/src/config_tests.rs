@@ -482,6 +482,27 @@ fn cluster_local_tables_must_differ() {
     assert!(err.contains("must differ"), "{err}");
 }
 
+/// A local table named after a `Distributed` table or the migration tracker
+/// would collide with the plugin's own DDL.
+#[test]
+fn cluster_local_tables_must_not_take_a_reserved_name() {
+    for reserved in [
+        "usage_records",
+        "usage_type_catalog",
+        "usage_collector_migrations",
+    ] {
+        for field in ["records_local_table", "catalog_local_table"] {
+            let err = cluster_cfg(&format!(r#"{{ "name": "uc", "{field}": "{reserved}" }}"#))
+                .validate()
+                .unwrap_err();
+            assert!(
+                err.contains("reserved") && err.contains(field),
+                "{field} = {reserved}: {err}"
+            );
+        }
+    }
+}
+
 #[test]
 fn cluster_insert_quorum_accepts_auto_or_a_positive_count() {
     for ok in ["auto", "2"] {

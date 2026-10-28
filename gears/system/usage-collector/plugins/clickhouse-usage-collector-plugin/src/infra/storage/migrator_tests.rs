@@ -108,7 +108,9 @@ fn cluster_tracker_is_replicated_to_every_host() {
 mod live {
     use std::time::Duration;
 
-    use super::super::{MIGRATIONS_TRACKER, MigrationOptions, render_ddl, run_migrations};
+    use super::super::{
+        MIGRATIONS_TRACKER, MigrationOptions, migration_client, render_ddl, run_migrations,
+    };
     use crate::infra::storage::pool::exec_statement;
     use crate::infra::storage::test_ch_server;
     use crate::infra::storage::topology::Topology;
@@ -117,7 +119,6 @@ mod live {
     const START_BUDGET: Duration = Duration::from_secs(240);
     const OPTS: MigrationOptions = MigrationOptions {
         retention_period_secs: 31_536_000,
-        statement_timeout_secs: None,
     };
     const ALL: [&str; 2] = ["m0001_init", "m0002_insert_dedup_window"];
 
@@ -147,6 +148,28 @@ mod live {
             .fetch_all()
             .await
             .expect("tracking table is readable")
+    }
+
+    /// Every timeout the migration budget must cover reaches the server; a
+    /// misspelt setting name would be rejected here rather than silently
+    /// leave `ON CLUSTER` DDL on the 180 s default.
+    #[tokio::test]
+    #[ignore = "requires Docker (testcontainers)"]
+    async fn migration_client_raises_every_server_timeout() {
+        let client = migration_client(&fresh_client().await, 1234);
+        let got: (String, String, String) = client
+            .query(
+                "SELECT toString(getSetting('send_timeout')), \
+                        toString(getSetting('receive_timeout')), \
+                        toString(getSetting('distributed_ddl_task_timeout'))",
+            )
+            .fetch_one()
+            .await
+            .expect("reading the effective settings");
+        assert_eq!(
+            got,
+            ("1234".to_owned(), "1234".to_owned(), "1234".to_owned())
+        );
     }
 
     #[tokio::test]

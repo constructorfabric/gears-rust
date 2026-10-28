@@ -68,10 +68,25 @@ pub(crate) trait ChMigration: Send + Sync {
 pub struct MigrationOptions {
     /// Configured `usage_records` retention, baked into the TTL of new tables.
     pub retention_period_secs: u64,
-    /// Server-side `send_timeout` / `receive_timeout` for migration
-    /// statements; `None` keeps the client's request-path values. Cluster
-    /// migrations raise it, since `ON CLUSTER` DDL outlasts a request.
-    pub statement_timeout_secs: Option<u64>,
+}
+
+/// `client` with the server-side timeouts of a cluster migration statement:
+/// `send_timeout` / `receive_timeout` for the HTTP exchange, and
+/// `distributed_ddl_task_timeout` for how long the initiator waits on every
+/// host of an `ON CLUSTER` query (180 s by default, which would otherwise cut
+/// the budget short). Used for every migration-time statement on a cluster:
+/// [`run_migrations`] and `pool::ensure_retention_ttl`.
+#[must_use]
+pub fn migration_client(
+    client: &clickhouse::Client,
+    statement_timeout_secs: u64,
+) -> clickhouse::Client {
+    let secs = statement_timeout_secs.to_string();
+    client
+        .clone()
+        .with_setting("send_timeout", secs.clone())
+        .with_setting("receive_timeout", secs.clone())
+        .with_setting("distributed_ddl_task_timeout", secs)
 }
 
 /// Where a step's statements go.
@@ -253,7 +268,9 @@ async fn apply_step(
 /// Creates the tracking table if missing, skips the steps it records, and
 /// records each step after it succeeds. A deployment that predates the
 /// tracking table runs every step, which is a no-op on its existing schema
-/// since all steps are idempotent. Each statement is bounded by `deadline`.
+/// since all steps are idempotent. Each statement is bounded by `deadline`
+/// on the client side; the server-side timeouts are `client`'s own, so a
+/// cluster caller passes a [`migration_client`].
 ///
 /// Returns the names of the steps it ran.
 ///
@@ -267,27 +284,17 @@ pub async fn run_migrations(
     opts: MigrationOptions,
     deadline: Duration,
 ) -> anyhow::Result<Vec<&'static str>> {
-    let client = match opts.statement_timeout_secs {
-        Some(secs) => client
-            .clone()
-            .with_setting("send_timeout", secs.to_string())
-            .with_setting("receive_timeout", secs.to_string()),
-        None => client.clone(),
-    };
     let m = SchemaManager {
-        sink: Sink::Live {
-            client: &client,
-            deadline,
-        },
+        sink: Sink::Live { client, deadline },
         topology,
         retention_period_secs: opts.retention_period_secs,
     };
 
-    let applied = applied_steps(&client, topology, deadline).await?;
+    let applied = applied_steps(client, topology, deadline).await?;
     let mut ran = Vec::new();
     for step in migrations() {
         if !applied.iter().any(|a| a == step.name()) {
-            apply_step(&m, &client, deadline, step.as_ref()).await?;
+            apply_step(&m, client, deadline, step.as_ref()).await?;
             ran.push(step.name());
         }
     }
